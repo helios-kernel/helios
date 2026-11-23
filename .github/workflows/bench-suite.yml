@@ -1,7 +1,7 @@
 name: bench-suite
 
 # Full measurements run nightly, on demand, and for release tags.
-# Pull requests and dev pushes run only the affected tooling checks.
+# Pull requests and `main` pushes run only the affected tooling checks.
 # A dispatched baseline_ref measures both revisions on the same host.
 
 on:
@@ -49,7 +49,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   push:
-    branches: [dev]
+    branches: [main]
     tags: ["v*"]
   schedule:
     - cron: "17 5 * * *"
@@ -217,7 +217,7 @@ jobs:
           revision=""
           if [ -n "$PAIRING_REF" ]; then
             if [ "$PAIRING_REF" = merge-base ]; then
-              sha="$(git merge-base HEAD origin/dev)"
+              sha="$(git merge-base HEAD origin/main)"
             else
               sha="$(git rev-parse --verify "$PAIRING_REF^{commit}")"
             fi
@@ -478,7 +478,7 @@ jobs:
             args+=(--iterations "${{ inputs.iterations }}")
           fi
           # The baseline is the commit the tooling job resolved: a
-          # dispatch's `baseline_ref`, or the dev commit a pull request is
+          # dispatch's `baseline_ref`, or the `main` commit a pull request is
           # merged against. It is in the checkout because this job
           # fetched the history.
           if [ -n "${BENCH_BASELINE_REF}" ]; then
@@ -786,23 +786,23 @@ jobs:
         with:
           name: bench-report-${{ matrix.lane }}
           path: candidate
-      - name: Fetch the latest dev baseline for this lane
+      - name: Fetch the latest main baseline for this lane
         id: baseline
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # The baseline is the newest successful bench-suite run on dev that
+          # The baseline is the newest successful bench-suite run on main that
           # published a report for this lane. Advisory candidates compare
           # against it informationally; the gate only enforces when both
           # reports came from dedicated runners.
-          for run_id in $(gh run list --workflow bench-suite.yml --branch dev --status success \
+          for run_id in $(gh run list --workflow bench-suite.yml --branch main --status success \
                             --json databaseId --jq '.[].databaseId' --limit 20); do
             if gh run download "$run_id" --name "bench-report-${{ matrix.lane }}" --dir baseline 2>/dev/null; then
               echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
               exit 0
             fi
           done
-          echo "no dev baseline with a bench-report-${{ matrix.lane }} artifact yet"
+          echo "no main baseline with a bench-report-${{ matrix.lane }} artifact yet"
       - name: Compare
         shell: bash
         if: hashFiles('candidate/report.json') != ''
@@ -811,7 +811,7 @@ jobs:
           uv sync --quiet
           # The paired table comes out of the candidate report itself: it
           # is the second image this run timed on this runner. The
-          # cross-run table needs the dev report, and there may be none.
+          # cross-run table needs the main report, and there may be none.
           args=(gate --candidate "$GITHUB_WORKSPACE/candidate/report.json"
                 --out "$GITHUB_WORKSPACE/gate.md")
           if [ -n "${{ steps.baseline.outputs.run_id }}" ]; then
@@ -824,7 +824,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ ! -f "$GITHUB_WORKSPACE/gate.md" ]; then
-            printf "### Benchmark gate, lane %s\n\nNeither a paired nor a dev baseline was available for this lane; the candidate tables are in the run artifacts.\n" \
+            printf "### Benchmark gate, lane %s\n\nNeither a paired nor a main baseline was available for this lane; the candidate tables are in the run artifacts.\n" \
               "${{ matrix.lane }}" > "$GITHUB_WORKSPACE/gate.md"
           fi
           gh pr comment "${{ github.event.pull_request.number }}" \

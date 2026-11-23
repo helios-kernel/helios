@@ -5,7 +5,7 @@ on:
     # `ready_for_review` runs the full selection a draft skipped.
     types: [opened, synchronize, reopened, ready_for_review]
   push:
-    branches: [dev]
+    branches: [main]
   workflow_dispatch:
     inputs:
       check_lane:
@@ -21,9 +21,9 @@ concurrency:
   # the older run. `opened`, `reopened` and `ready_for_review` carry the
   # head a run is already building and queue behind it, because a run
   # cancelled before its matrix expands leaves a failed check named after
-  # the unexpanded expression that nothing replaces. A `dev` push runs to
+  # the unexpanded expression that nothing replaces. A `main` push runs to
   # completion: merges land faster than a run finishes, and a completed
-  # `dev` run is the only writer of the host lanes' caches.
+  # `main` run is the only writer of the host lanes' caches.
   cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' }}
 
 permissions:
@@ -39,10 +39,10 @@ jobs:
   # by path. A lane also runs on `shared` and `pin` changes unless it is
   # `exclusive`, which reads only its own surfaces. A skipped lane
   # reports as skipped, which a required check counts as passing; no
-  # ruleset on `dev` requires a lane of this workflow. The nightly schedule
+  # ruleset on `main` requires a lane of this workflow. The nightly schedule
   # runs every lane; a dispatch names a required `check_lane` from
   # `.github/ci-lanes.json` and runs only that lane.
-  # PR and dev pushes omit heavy suites,
+  # PR and `main` pushes omit heavy suites,
   # and Btrfs lanes filter pushes by surface. A draft pull request is not a merge
   # candidate and runs `lint-fmt` alone; marking it ready for review runs
   # the rest.
@@ -499,7 +499,7 @@ jobs:
           save-if: "false"
       # Pinned `wasi-sdk-34` used by `helios-cli wasm-build` to cross-compile
       # BoringSSL for `programs/http-client`; restored read-only on PRs and
-      # populated on `dev` pushes.
+      # populated on `main` pushes.
       - name: Restore wasi-sdk-34 toolchain cache
         uses: ./helios/.github/actions/shared-cache
         with:
@@ -601,7 +601,7 @@ jobs:
           ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
         run: tools/wasi-apps/build.sh
       # Compile, lint and test lanes restore their default-branch Rust
-      # cache. Only a dev push writes one; other caches follow the same
+      # cache. Only a `main` push writes one; other caches follow the same
       # single-writer policy through shared-cache.
       # rust-cache hashes `rustc -vV` and `rustup run <t> rustc -vV` for
       # every installed toolchain (src/config.ts `getRustVersions`), run
@@ -625,7 +625,7 @@ jobs:
         with:
           workspaces: helios
           key: ${{ matrix.name }}
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       # Download the prebuilt `helios-cli` artifact directly without compiling.
       - uses: ./helios/.github/actions/helios-cli
         if: matrix.helios-cli != ''

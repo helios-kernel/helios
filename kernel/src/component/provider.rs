@@ -156,13 +156,20 @@ impl<M> ProviderSender<M> {
     /// a plugin that is already behind, and the caller says what losing
     /// it costs at its own call site.
     pub fn try_send(&self, message: M) -> Result<(), ProviderError> {
+        self.try_push(message).map_err(|(error, _)| error)
+    }
+
+    /// Queue `message` if there is room, handing `message` back untouched
+    /// when there is not so a caller parking in [`Self::room`] need not
+    /// rebuild or clone it.
+    pub fn try_push(&self, message: M) -> Result<(), (ProviderError, M)> {
         match self.channel.queue.push(message) {
             Ok(()) => {
                 self.channel.ready.notify_all();
                 Ok(())
             }
-            Err(PushError::Full(_)) => Err(ProviderError::Full),
-            Err(PushError::Closed(_)) => Err(ProviderError::Closed),
+            Err(PushError::Full(message)) => Err((ProviderError::Full, message)),
+            Err(PushError::Closed(message)) => Err((ProviderError::Closed, message)),
         }
     }
 }

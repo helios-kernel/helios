@@ -91,7 +91,7 @@ def repository_with_two_commits(root: Path, candidate_fork: str = BASE_FORK) -> 
     """A base and a candidate commit; the candidate moves the fork pin
     to `candidate_fork` when that differs from the base's."""
     root.mkdir()
-    git("init", "-q", "-b", "dev", cwd=root)
+    git("init", "-q", "-b", "main", cwd=root)
     git("config", "user.email", "bench@helios.test", cwd=root)
     git("config", "user.name", "bench", cwd=root)
     git("config", "commit.gpgsign", "false", cwd=root)
@@ -205,7 +205,7 @@ def test_a_baseline_pinning_another_fork_builds_against_its_own(tmp_path, monkey
 
     # At the pinned commit: the baseline checkout's `../wasmtime` is it.
     pinned = baseline.Baseline(
-        ref="dev",
+        ref="main",
         sha=base,
         worktree=resolved.worktree,
         wasmtime=baseline.WasmtimePin(repository="lexoliu/wasmtime", revision=head),

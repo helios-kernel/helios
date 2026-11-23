@@ -334,3 +334,20 @@ def test_helios_cli_producer_covers_every_selected_consumer_and_consumers_only_d
         if selected["linux_suite_mode"] != "none":
             expected.update({("release", "X64"), ("release", "ARM64")})
         assert cli_builds == expected, (changed, draft, heavy)
+
+
+def test_workflows_target_single_main_branch():
+    workflows_dir = REPO_ROOT / ".github/workflows"
+    assert not (workflows_dir / "pr-base-gate.yml").exists()
+    for name in ("ci.yml", "ci-image.yml", "bench-suite.yml"):
+        workflow = yaml.load((workflows_dir / name).read_text(), Loader=yaml.BaseLoader)
+        assert workflow["on"]["push"]["branches"] == ["main"], name
+    release = yaml.load((workflows_dir / "release.yml").read_text(), Loader=yaml.BaseLoader)
+    assert "push" not in release["on"]
+    assert release["on"]["workflow_run"]["branches"] == ["main"]
+    assert release["on"]["workflow_run"]["workflows"] == ["CI"]
+    assert "refs/heads/dev" not in (workflows_dir / "ci.yml").read_text()
+    assert "refs/heads/dev" not in (workflows_dir / "ci-image.yml").read_text()
+    assert "'dev'" not in (workflows_dir / "bench-lane.yml").read_text()
+    assert "origin/dev" not in (workflows_dir / "bench-suite.yml").read_text()
+    assert "--branch dev" not in (workflows_dir / "bench-suite.yml").read_text()

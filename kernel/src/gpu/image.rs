@@ -5,7 +5,8 @@
 use helios_hal::display::{BlobScanout, DisplayMode, PixelFormat};
 use triomphe::Arc;
 
-use super::{BlobHold, BlobShared, Gpu3dServiceError};
+use super::service::BlobShared;
+use super::{BlobHold, Gpu3dServiceError};
 
 #[derive(Clone)]
 pub struct GpuImage {
@@ -14,7 +15,7 @@ pub struct GpuImage {
 }
 
 impl GpuImage {
-    pub fn new(
+    pub(crate) fn new(
         blob: &Arc<BlobShared>,
         mode: DisplayMode,
         format: PixelFormat,
@@ -51,15 +52,21 @@ impl GpuImage {
 mod tests {
     use super::*;
     use crate::exec::Notify;
-    use helios_hal::display::BlobId;
+    use helios_hal::display::{BlobId, BlobMemory, BlobUsage};
+
+    fn test_blob(size: u64) -> Arc<BlobShared> {
+        Arc::new(BlobShared::new(
+            BlobId::new(1),
+            size,
+            BlobMemory::Host3d,
+            BlobUsage::SHAREABLE,
+            Arc::new(Notify::new()),
+        ))
+    }
 
     #[test]
     fn image_clones_keep_the_blob_until_the_last_consumer_releases_it() {
-        let blob = Arc::new(BlobShared::new(
-            BlobId::new(1),
-            128,
-            Arc::new(Notify::new()),
-        ));
+        let blob = test_blob(128);
         let image = GpuImage::new(
             &blob,
             DisplayMode {
@@ -84,11 +91,7 @@ mod tests {
 
     #[test]
     fn invalid_layouts_take_no_hold() {
-        let blob = Arc::new(BlobShared::new(
-            BlobId::new(1),
-            128,
-            Arc::new(Notify::new()),
-        ));
+        let blob = test_blob(128);
         for (width, height, offset, stride) in [(0, 4, 0, 32), (4, 4, 0, 15), (4, 4, 1, 32)] {
             assert!(matches!(
                 GpuImage::new(
