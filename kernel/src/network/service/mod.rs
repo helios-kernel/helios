@@ -5284,9 +5284,7 @@ mod tests {
 
         // The peer takes the first write, then shuts its window, long
         // after the pacing time that write set.
-        let mut first = Bytes::from_static(FIRST_WRITE);
-        service
-            .tcp_try_write(stream, &mut first)
+        block_on(service.tcp_write_some_bytes(stream, Bytes::from_static(FIRST_WRITE), u64::MAX))
             .expect("the established stream should take a write");
         cpu.advance(SECOND);
         from_peer(1, 1 + FIRST_WRITE.len() as u32, TcpFlags::ACK, 0);
@@ -5308,10 +5306,13 @@ mod tests {
         let drives_parked = device.receive_drains() - drives_before;
         assert!(drives_parked <= DRIVES_UNTIL_PARKED);
         // The window opens: the wake the ACK raises is the one drive
-        // that sends again.
+        // that sends again. Once the window drains the transmit queue,
+        // the remaining 4 KiB either finishes on this poll or stays parked.
         let frames_before = device.transmitted_frames().len();
         from_peer(1, 1 + FIRST_WRITE.len() as u32, TcpFlags::ACK, u16::MAX);
-        assert!(block_on(poll_once(writer.as_mut())).is_none());
+        if let Some(result) = block_on(poll_once(writer.as_mut())) {
+            result.expect("the opened window write succeeds rather than failing");
+        }
         let wire = device.transmitted_frames()[frames_before..]
             .iter()
             .map(|frame| family.classify(frame))
