@@ -37,6 +37,42 @@ pub fn parity_source(an: &Analysis) -> Result<String, EmitError> {
     format_tokens(parity::parity_tokens(an)?)
 }
 
+/// Vulkan ABI forwards for commands without guest-side lifetime policy.
+pub fn entry_source(an: &Analysis) -> Result<String, EmitError> {
+    let wire = Wire::new(an);
+    let mut functions = TokenStream::new();
+    let mut arms = TokenStream::new();
+    for &id in &an.generated_commands {
+        let Some(function) = wire.command_entry(id)? else {
+            continue;
+        };
+        functions.extend(function);
+        let function_name = names::ident(&an.reg.types[id].name);
+        let first = &an.reg.types[id].variables[0];
+        let instance_command = matches!(
+            an.reg.types[first.ty.base].name.as_str(),
+            "VkInstance" | "VkPhysicalDevice"
+        );
+        let guard = if instance_command {
+            quote!(if !device_only)
+        } else {
+            TokenStream::new()
+        };
+        for name in an.reg.all_names(id) {
+            let bytes = proc_macro2::Literal::byte_string(name.as_bytes());
+            arms.extend(quote!(#bytes #guard => #function_name::<F> as *const (),));
+        }
+    }
+    format_tokens(quote! {
+        #functions
+        pub(super) fn lookup<F: Factory>(name: &[u8], device_only: bool) -> Option<unsafe extern "system" fn()> {
+            let pointer = match name { #arms _ => return None };
+            // SAFETY: Vulkan resolves the erased pointer by its command name.
+            Some(unsafe { core::mem::transmute::<*const (), unsafe extern "system" fn()>(pointer) })
+        }
+    })
+}
+
 fn format_tokens(tokens: TokenStream) -> Result<String, EmitError> {
     let file: syn::File = syn::parse2(tokens).map_err(|error| EmitError::Syntax {
         message: error.to_string(),
@@ -52,6 +88,7 @@ pub fn protocol_tokens(an: &Analysis) -> Result<TokenStream, RegistryError> {
     let aggregates = items::aggregate_items(an, &set)?;
     let assertions = items::layout_assertions(an, &set)?;
     let info = items::info_items(an)?;
+    let layouts = items::struct_layout_items(an)?;
 
     let mut functions = TokenStream::new();
     for &id in an
@@ -73,6 +110,7 @@ pub fn protocol_tokens(an: &Analysis) -> Result<TokenStream, RegistryError> {
     }
     for &id in &an.generated_commands {
         functions.extend(wire.command_functions(id)?);
+        functions.extend(wire.command_call(id)?);
     }
     Ok(quote! {
         #scalars
@@ -80,6 +118,7 @@ pub fn protocol_tokens(an: &Analysis) -> Result<TokenStream, RegistryError> {
         #aggregates
         #assertions
         #info
+        #layouts
         #functions
     })
 }

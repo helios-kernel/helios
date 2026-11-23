@@ -61,8 +61,7 @@ pub const MAX_PINNED_FRAMES: usize = 16;
 
 pub(crate) use service::{ControlRequest, CursorRequest};
 pub use service::{
-    DisplayClaim, DisplaySender, DisplayService, FrameToken, REQUEST_QUEUE_DEPTH, SequenceSignal,
-    SurfaceSource,
+    DisplayClaim, DisplaySender, DisplayService, FrameToken, REQUEST_QUEUE_DEPTH, SurfaceSource,
 };
 
 /// Why a display request was refused.
@@ -112,10 +111,6 @@ pub enum DisplayServiceError {
     /// scan a blob out.
     #[error("this display engine cannot scan out a blob")]
     NoBlobScanout,
-    /// The blob was made under a gpu session its instance has since
-    /// ended.
-    #[error("the blob's gpu session has ended")]
-    StaleBlob,
     /// The display engine failed rather than refused.
     #[error("the display engine faulted")]
     DeviceFault,

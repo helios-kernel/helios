@@ -20,9 +20,11 @@ mod lifecycle;
 mod observer;
 pub(crate) mod phases;
 mod ready;
-mod sync;
+mod sequence;
+use helios_sync as sync;
 mod task;
 mod time;
+mod timeline;
 mod timer;
 
 pub use compaction::{
@@ -32,8 +34,8 @@ pub use compaction::{
 #[cfg(test)]
 pub(crate) use executor::executor_test_guard;
 pub use executor::{
-    Executor, ExecutorRunStats, InstanceSpawner, JoinHandle, LocalJoinHandle, PinnedTasks,
-    READY_BATCH_TASKS, Spawner, TaskCapacityError, TaskFunding,
+    Executor, ExecutorRunStats, InstanceSpawner, JoinHandle, LocalJoinHandle, PinnedSpawnError,
+    PinnedTasks, READY_BATCH_TASKS, Spawner, TaskCapacityError, TaskFunding,
 };
 pub(crate) use executor::{TaskHome, task_arena_bytes};
 pub use freeze::{FreezeError, FrozenMachine};
@@ -53,6 +55,7 @@ pub use observer::{
     matches_perf_metric_filter, matches_profile_filter, matches_trace_filter, parse_console_text,
 };
 pub use ready::ReadyLink;
+pub use sequence::SequenceSignal;
 pub use sync::{
     Mutex, MutexGuard, Notified, Notify, NotifyWaiter, OwnedRawMutexLease, OwnedRawRwLockReadLease,
     OwnedRawRwLockWriteLease, ProgressChanged, ProgressMark, ProgressSignal, RawMutex,
@@ -64,3 +67,8 @@ pub use time::{
     KernelClock, UptimeClock, WallClock, elapsed_millis, monotonic_nanos, wall_clock_offset_nanos,
 };
 pub use timer::{GUEST_TIME_SLICE, Sleep, Timer};
+
+pub use timeline::{
+    SharedTimeline, SignalTimeline, Timeline, TimelineError, TimelinePoint, TimelineSource,
+    wait_timelines,
+};

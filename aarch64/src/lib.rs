@@ -102,6 +102,7 @@ global_asm!(
     exception_stack_bytes = const EXCEPTION_STACK_BYTES,
     irq_frame_bytes = const IRQ_FRAME_BYTES,
     sync_frame_bytes = const SYNC_FRAME_BYTES,
+    native_users = const cfg!(feature = "native-users") as u8,
 );
 
 unsafe extern "C" {
@@ -189,7 +190,10 @@ mod host_fs;
 #[cfg(feature = "hv")]
 pub mod hv;
 mod input;
+mod isolation;
 mod lifecycle;
+#[cfg(feature = "native-users")]
+mod native;
 mod net;
 mod platform;
 mod rtc;
@@ -347,6 +351,10 @@ struct ProcessorRuntime {
     hand_over_probe: hand_over::HandOverProbe,
     /// Selected at bring-up, so IRQ dispatch does not probe the exception level.
     timer_interrupt: IntId,
+    /// The record of this processor's check that EL1 can neither fetch
+    /// from nor access a user page (`native::verify_user_isolation`).
+    #[cfg(feature = "native-users")]
+    isolation_probe: native::IsolationProbe,
 }
 
 impl ProcessorRuntime {
@@ -366,6 +374,8 @@ impl ProcessorRuntime {
             device_interrupts: Once::new(),
             hand_over_probe: hand_over::HandOverProbe::new(),
             timer_interrupt: gic::host_timer_interrupt(),
+            #[cfg(feature = "native-users")]
+            isolation_probe: native::IsolationProbe::new(),
         }
     }
 }
@@ -419,6 +429,9 @@ struct Aarch64PlatformState {
     /// The bootstrap processor's answer to every ISA level feature. Written
     /// once before any secondary starts; each secondary compares its own.
     isa_answers: ProbeAnswers,
+    /// The bootstrap processor's kernel isolation, which every processor
+    /// enables and matches (`isolation`). Immutable.
+    user_isolation: isolation::UserIsolation,
 }
 
 /// What `detect_aarch64_native_feature` answers for every ISA level feature
@@ -468,6 +481,7 @@ impl Aarch64PlatformState {
             #[cfg(helios_hv_self_test)]
             hv_test: hv::self_test::Remote::new(),
             isa_answers: probe_isa_answers(),
+            user_isolation: isolation::UserIsolation::probe(),
         }))
     }
 
@@ -864,6 +878,9 @@ extern "C" fn aarch64_kernel_main() -> ! {
         cfi::install_bootstrap_key(&platform_state.instruction_key, &root_entropy);
         cfi::enable_instruction_key_a();
     }
+    platform_state.user_isolation.enable_on_current_processor();
+    #[cfg(feature = "native-users")]
+    native::enable_user_cache_maintenance();
     // The calendar is read once, here, before any component can ask
     // what time it is. The processor's timer carries wall time forward
     // from that reading; only a machine restore re-reads it, which the
@@ -1067,6 +1084,8 @@ extern "C" fn aarch64_kernel_main() -> ! {
     // here, so an arriving interrupt now finds a handler.
     unsafe { unmask_irq() };
     hand_over::verify_trap_hand_over(platform_state.bootstrap_mpidr());
+    #[cfg(feature = "native-users")]
+    native::verify_user_isolation(platform_state.user_isolation);
 
     for processor in helios_kernel::component_host_processors_to_start(
         cpu.processor_count(),
@@ -1131,6 +1150,15 @@ impl Cpu for Aarch64Cpu {
     type Hypervisor = hv::Hypervisor;
     #[cfg(not(feature = "hv"))]
     type Hypervisor = core::convert::Infallible;
+    #[cfg(feature = "native-users")]
+    type Native = native::Aarch64Native;
+    #[cfg(not(feature = "native-users"))]
+    type Native = core::convert::Infallible;
+    #[cfg(feature = "native-users")]
+    fn native(&self) -> Result<&Self::Native, helios_hal::native::NativeUnavailable> {
+        self.state.user_isolation.require()?;
+        Ok(&native::Aarch64Native)
+    }
     #[cfg(feature = "hv")]
     fn hv(&self) -> Option<&Self::Hypervisor> {
         self.state.hypervisor.get()
@@ -1220,6 +1248,7 @@ impl Cpu for Aarch64Cpu {
             slot.mp_info.mpidr,
             self.state.gic(),
             &runtime.wake_pending,
+            self.state.user_isolation,
         );
     }
 
@@ -1501,6 +1530,9 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
         );
         cfi::enable_instruction_key_a();
     }
+    state.user_isolation.enable_on_current_processor();
+    #[cfg(feature = "native-users")]
+    native::enable_user_cache_maintenance();
     activate_processor_runtime(&slot.runtime);
     state.gic().attach_current_processor(mp_info.mpidr);
 
@@ -1531,6 +1563,8 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     // bootstrap processor, so only private interrupts arrive here.
     unsafe { unmask_irq() };
     hand_over::verify_trap_hand_over(mp_info.mpidr);
+    #[cfg(feature = "native-users")]
+    native::verify_user_isolation(state.user_isolation);
     #[cfg(helios_hv_self_test)]
     if helios_hal::cpu::current_processor() == ProcessorId::new(1) {
         kernel.spawn_local_detached(state.hv_test.serve());
@@ -1600,6 +1634,19 @@ extern "C" fn aarch64_handle_sync_exception(
     // SAFETY: the entry wrote a complete frame at `frame`, and nothing else
     // touches it while this handler runs.
     cfi::refuse_authentication_failure(esr_el1, far_el1, unsafe { (*frame).elr });
+    // The isolation check reaches each user page through a branch with
+    // link, so the refused access resumes its caller as a return would.
+    #[cfg(feature = "native-users")]
+    if let Some(runtime) = installed_processor_runtime()
+        && runtime.isolation_probe.claim(esr_el1, far_el1)
+    {
+        // SAFETY: the entry wrote a complete frame at `frame`, and nothing
+        // else touches it while this handler runs; its x30 is the return
+        // address of the check's branch.
+        let frame = unsafe { &mut *frame };
+        frame.elr = frame.x[30];
+        return;
+    }
     let (cause, faulting_address) = match exception_class {
         0b100000 | 0b100001 => (KernelExceptionCause::InstructionFault, Some(far_el1)),
         0b100100 | 0b100101 => (KernelExceptionCause::DataFault, Some(far_el1)),
@@ -1751,11 +1798,20 @@ extern "C" fn swap_fault_trampoline(frame: *mut SyncTrapFrame, faulting_address:
 extern "C" fn aarch64_handle_irq(frame: *const IrqTrapFrame) {
     let runtime = current_processor_runtime();
     runtime.hand_over_probe.record_interrupt(frame as usize);
+    handle_pending_interrupts();
+}
+
+/// Handles every interrupt pending at this processor's CPU interface, with
+/// IRQs masked, and reports whether its timer interrupt was among them.
+fn handle_pending_interrupts() -> bool {
+    let runtime = current_processor_runtime();
+    let mut timer = false;
     while let Some(intid) = gic::acknowledge_interrupt() {
         if intid == gic::WAKE_SGI {
             // The wake carries no payload: returning from `wfi` is the
             // whole message, and `park_current` owns the flag.
         } else if intid == runtime.timer_interrupt {
+            timer = true;
             // Every processor's timer interrupt ends the slice of every
             // guest on the machine that has run one.
             if let Some(program_service) = runtime.program_service.get() {
@@ -1779,6 +1835,7 @@ extern "C" fn aarch64_handle_irq(frame: *const IrqTrapFrame) {
         }
         gic::end_interrupt(intid);
     }
+    timer
 }
 
 /// Masks IRQ delivery on the calling processor. Debug, SError and FIQ

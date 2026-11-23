@@ -2,36 +2,15 @@
 """Build and run the ARM hardware-virtualization self-test under QEMU TCG."""
 
 import argparse
-import json
 import logging
 import os
 from pathlib import Path
 import selectors
-import socket
 import subprocess
 import time
 
 
-def quit_vm(runtime_dir):
-    endpoint = runtime_dir / "sockets" / "qmp.sock"
-    if not endpoint.exists():
-        return
-    with socket.socket(socket.AF_UNIX) as connection:
-        connection.settimeout(5)
-        connection.connect(str(endpoint))
-        with connection.makefile("rwb", buffering=0) as stream:
-            greeting = stream.readline()
-            if not greeting:
-                return  # QEMU exited while its socket was still present.
-            json.loads(greeting)
-            for command in ("qmp_capabilities", "quit"):
-                stream.write(json.dumps({"execute": command}).encode() + b"\n")
-                while True:
-                    reply = json.loads(stream.readline())
-                    if "error" in reply:
-                        raise RuntimeError(reply["error"])
-                    if "return" in reply:
-                        break
+from qemu_test import quit_vm
 
 
 def main():

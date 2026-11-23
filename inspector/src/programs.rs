@@ -69,6 +69,17 @@ pub async fn exec(
     outcome.map_err(ProgramError::from)
 }
 
+pub async fn exec_in_container(
+    client: &RpcClient,
+    mut request: debugger_programs::ExecInContainerRequest,
+) -> Result<ExecResult, ProgramError> {
+    request.path = normalize_absolute(&request.path)?;
+    let outcome = debugger_programs::exec_in_container(client, &request)
+        .await
+        .map_err(|source| ProgramError::Invoke { source })?;
+    outcome.map_err(ProgramError::from)
+}
+
 fn normalize_absolute(input: &str) -> Result<String, ProgramError> {
     let mut segments = Vec::new();
     for component in Path::new(input).components() {

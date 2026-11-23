@@ -30,6 +30,7 @@ mod frame_slab;
 mod irq_safe;
 mod locality;
 mod mapping_cost;
+mod native_pages;
 mod owner;
 mod per_processor;
 mod policy;
@@ -63,6 +64,7 @@ pub(crate) use frame_reserve::{
 pub(crate) use irq_safe::IrqSafeMutex;
 pub use locality::{Locality, NodeRun};
 pub use mapping_cost::user_mapping_kernel_heap_bytes;
+pub use native_pages::{NativePage, NativePages, NativeSlice, NativeSpace, UserTranslation};
 pub use owner::{
     MemoryOwner, UserMemoryOwnerScope, UserMemoryOwners, configure_user_memory_owner_processors,
     current_user_memory_owner, enter_user_memory_owner,
@@ -87,6 +89,8 @@ pub use swap::{
 };
 #[cfg(test)]
 pub(crate) use swap::{GUEST_SWAP_PAGE, GuestSwap};
+#[cfg(test)]
+pub(crate) use user::installed_user_memory_pool;
 pub use user::{
     MemoryNodeStats, UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on,
     allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,

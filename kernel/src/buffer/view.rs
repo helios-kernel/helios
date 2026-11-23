@@ -81,13 +81,12 @@ impl GuestMemory {
 /// Why a view could not be shown or ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum ViewError {
-    /// The instance has no single unshared linear memory: its component
-    /// lowers through a shared (threads) memory, through more than one
-    /// memory, or through none. A shared memory is read by other
-    /// processors while a substitution would rewrite it, which the
-    /// address space's contract forbids, so nothing is ever shown in
-    /// one.
-    #[error("this instance has no unshared linear memory to show anything in")]
+    /// The memory a span names is not an unshared linear memory: the call
+    /// was lowered through a shared (threads) memory or through none. A
+    /// shared memory is read by other processors while a substitution
+    /// would rewrite it, which the address space's contract forbids, so
+    /// nothing is ever shown in one.
+    #[error("this call has no unshared linear memory to show anything in")]
     NoUnsharedMemory,
     /// The span is empty, or its offset or length is not a whole number
     /// of wasm pages.

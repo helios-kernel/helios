@@ -45,6 +45,7 @@ use smccc::psci::{self, AffinityState, LowestAffinityLevel};
 use smccc::{Call, Hvc, Smc};
 
 use crate::gic::Gic;
+use crate::isolation::UserIsolation;
 use crate::platform::PsciConduit;
 
 const PAGE_BYTES: usize = 4096;
@@ -69,8 +70,8 @@ const TABLE_DESCRIPTOR: u64 = 0b11;
 /// `TCR_EL1` fields of the TTBR0 half the identity map uses: a 48-bit
 /// address space, 4 KiB granule, write-back write-allocate inner
 /// shareable table walks, walks enabled.
-const IDMAP_TCR_TTBR0_MASK: u64 = 0xffff;
-const IDMAP_TCR_TTBR0: u64 = 16 | (0b01 << 8) | (0b01 << 10) | (0b11 << 12);
+pub(crate) const IDMAP_TCR_TTBR0_MASK: u64 = 0xffff;
+pub(crate) const IDMAP_TCR_TTBR0: u64 = 16 | (0b01 << 8) | (0b01 << 10) | (0b11 << 12);
 
 const RUNNING: u8 = 0;
 const STOPPING: u8 = 1;
@@ -231,7 +232,14 @@ impl ProcessorPower {
     /// `mpidr` is the calling processor's own `MPIDR_EL1`. Returns at
     /// once, stopping nothing, when [`ProcessorPower::restart`] already
     /// ran for this stop.
-    pub(crate) fn stop(&self, psci: Psci, mpidr: u64, gic: &Gic, wake_pending: &AtomicBool) {
+    pub(crate) fn stop(
+        &self,
+        psci: Psci,
+        mpidr: u64,
+        gic: &Gic,
+        wake_pending: &AtomicBool,
+        isolation: UserIsolation,
+    ) {
         let daif = crate::read_daif();
         crate::mask_irq();
         let context = self.context.get();
@@ -277,7 +285,10 @@ impl ProcessorPower {
 
         // Restarted: the entry code restored the translation regime, the
         // vectors, the runtime pointer and the callee-saved registers. What
-        // is left is the processor's own hardware state.
+        // is left is the processor's own hardware state: SCTLR_EL1 came
+        // back with SPAN clear, but PSTATE.PAN is not part of what the
+        // entry restores.
+        isolation.enable_on_current_processor();
         crate::enable_pmu_for_current_processor();
         gic.attach_current_processor(mpidr);
         wake_pending.store(false, Ordering::Release);

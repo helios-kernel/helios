@@ -60,13 +60,16 @@ where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
 {
     let discovered = discover_block_devices(cpu, fdt);
-    let devices = discovered
+    let devices: Vec<_> = discovered
         .iter()
         .map(|interrupt| interrupt.device.inner.clone())
         .collect();
     let state = debug_state.clone();
     // Swap is not wired on this backend, so the scratch disk is proved
     // and counted but nothing writes to it yet.
+    if !devices.is_empty() {
+        debug_state.begin_block_discovery();
+    }
     helios_kernel::install_block_devices(
         kernel,
         root,
@@ -76,6 +79,7 @@ where
             if let Some(cache) = mount_sources {
                 state.install_mount_sources(cache);
             }
+            state.finish_block_discovery();
         },
     );
     for interrupt in &discovered {

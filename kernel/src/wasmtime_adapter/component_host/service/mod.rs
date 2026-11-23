@@ -9,6 +9,7 @@ mod memory;
 use memory::*;
 mod descriptor;
 use descriptor::*;
+pub(crate) use descriptor::{Preview1SignalExit, WasixSignalState};
 mod display;
 pub(super) use display::add_display_to_linker;
 pub use display::{DisplayHandle, SurfaceHandle};
@@ -21,8 +22,8 @@ mod input;
 pub use input::InputDeviceHandle;
 pub(super) use input::add_input_to_linker;
 mod surface;
-pub use surface::ClientSurfaceHandle;
 pub(super) use surface::add_surface_to_linker;
+pub use surface::{ClientImageSurfaceHandle, ClientSurfaceHandle};
 mod audio;
 pub use audio::PlaybackHandle;
 pub(super) use audio::add_audio_to_linker;
@@ -30,12 +31,16 @@ mod hv;
 pub(super) use hv::add_hv_to_linker;
 mod processors;
 pub(super) use processors::add_processors_to_linker;
-mod compile_session;
-use compile_session::*;
+mod btrfs;
+pub(super) use btrfs::add_btrfs_to_linker;
+mod shared_memory_plugin;
+use shared_memory_plugin::*;
 mod compiler;
 use compiler::*;
 mod exec;
 use exec::*;
+mod component_plugin;
+use component_plugin::*;
 mod http_plugin;
 use http_plugin::*;
 mod network_step;
@@ -44,18 +49,31 @@ mod compositor_plugin;
 use compositor_plugin::*;
 mod preview1;
 use preview1::*;
+#[cfg(test)]
+mod path_lookup_tests;
 mod wasix_proc;
 use wasix_proc::*;
 mod wasix_thread;
 use wasix_thread::*;
 mod wasix_net;
+#[cfg(test)]
+mod wasix_shared_state_tests;
+#[cfg(test)]
+mod wasix_signal_tests;
 use wasix_net::*;
 mod wasix_epoll;
 use wasix_epoll::*;
+#[cfg(feature = "linux")]
+mod linux;
+#[cfg(test)]
+mod stdin_inheritance_tests;
+#[cfg(feature = "linux")]
+use linux::*;
+#[cfg(test)]
+mod child_exit_tests;
 
 use super::*;
 use crate::isa::GuestIsa;
-use crate::process::{DescriptorLimit, FreeDescriptorSlots};
 use crate::wasmtime_adapter::artifact_profile::{self, ArtifactProfileError};
 use crate::wasmtime_adapter::code_map::{CodeMap, CodeRegistration};
 use crate::wasmtime_adapter::config::AotCompileHint;
@@ -70,10 +88,9 @@ use crate::wasmtime_adapter::{
     },
 };
 use crate::{
-    BootfsBytes, ComponentStdioRefusal, GuestAddress, ProgramExecErrorDetail, RuntimeMessage,
-    UnbindableStdio,
+    BootfsBytes, ComponentStdioRefusal, ProgramExecErrorDetail, RuntimeMessage, UnbindableStdio,
 };
-use crate::{FileContents, MemoryFs, Namespace};
+use crate::{FileContents, FsDescriptorFlags, MemoryFs, Namespace};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -81,7 +98,7 @@ use alloc::vec;
 use bytes::Bytes;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
+use core::sync::atomic::Ordering as AtomicOrdering;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use hashbrown::HashMap;
@@ -94,6 +111,8 @@ use helios_compiler_abi::{
 use helios_hal::fs::WritePosition;
 use helios_hal::measured_boot::{MeasuredBoot, Sha256Digest};
 use helios_hal::watchdog::Watchdog;
+use helios_unix::OpenFile;
+use helios_unix::{DescriptorLimit, GuestAddress};
 use smallvec::SmallVec;
 use thiserror::Error;
 use wasmtime::component::{Component, InstancePre as ComponentInstancePre};
@@ -109,20 +128,8 @@ const SHARED_MEMORY_POOL_FRACTION: usize = 16;
 const WASIX_ASYNCIFY_DATA_SIZE: u32 = 8;
 const WASIX_STACK_SNAPSHOT_SIZE: usize = 24;
 const WASIX_THREAD_START_SIZE: usize = 64;
-const WASIX_NO_PENDING_SIGNAL: u32 = u32::MAX;
 const WASIX_MODULE: &str = "wasix_32v1";
 const WASIX_NULL_DEVICE_PATH: &str = "/dev/null";
-const DEFAULT_WASIX_SOCKET_BUFFER_BYTES: u64 = 64 * 1024;
-const DEFAULT_WASIX_SOCKET_LOW_WATER_BYTES: u64 = 1;
-const DEFAULT_WASIX_SOCKET_TTL: u64 = helios_netstack::DEFAULT_HOP_LIMIT as u64;
-/// Ceiling for `SO_RCVBUF`: the receive window the netstack really reserves.
-/// A larger request is clamped so a read-back reports the effective size.
-const WASIX_SOCKET_RECEIVE_BUFFER_CEILING: u64 = helios_netstack::TCP_RECEIVE_WINDOW_BYTES as u64;
-/// Ceiling for `SO_SNDBUF`: the netstack's per-socket transmit buffer.
-const WASIX_SOCKET_SEND_BUFFER_CEILING: u64 = helios_netstack::TCP_TRANSMIT_BUFFER_BYTES as u64;
-const DEFAULT_WASIX_SOCKET_MULTICAST_TTL: u64 = 1;
-const WASIX_IPPROTO_TCP: u64 = 6;
-const WASIX_IPPROTO_UDP: u64 = 17;
 const WASIX_IPPROTO_TCP_I32: i32 = 6;
 const WASIX_IPPROTO_UDP_I32: i32 = 17;
 const WASIX_STREAM_SECURITY_UNENCRYPTED: u8 = 1 << 0;
@@ -131,8 +138,8 @@ const WASIX_STREAM_SECURITY_CLASSIC_ENCRYPTION: u8 = 1 << 2;
 const WASIX_STREAM_SECURITY_DOUBLE_ENCRYPTION: u8 = 1 << 3;
 const DEFAULT_WASIX_EXEC_SEARCH_PATHS: &[&str] = &["/usr/local/bin", "/bin", "/usr/bin"];
 type Preview1Iovs = SmallVec<[(u32, u32); 8]>;
-type CompilerThreadTasks = SmallVec<[crate::JoinHandle<CompilerThreadReport>; 8]>;
-type CompilerThreadReports = SmallVec<[CompilerThreadReport; 8]>;
+type CompilerThreadTasks = SmallVec<[crate::JoinHandle<SharedMemoryThreadReport>; 8]>;
+type CompilerThreadReports = SmallVec<[SharedMemoryThreadReport; 8]>;
 type CompilerPluginHandle<CpuImpl, Net, StorageImpl> =
     Arc<CompilerPluginRuntime<CpuImpl, Net, StorageImpl>>;
 
@@ -145,9 +152,10 @@ struct CompileJob {
     profile: bool,
 }
 
-/// How a compile's body ended, with the phase timestamps it filled in.
+/// How a compile's body ended, with the phase timestamps and live worker count.
 struct CompileEnd {
     result: Result<(Vec<u8>, CompilerThreadReports), ProgramExecError>,
+    worker_threads: u32,
     phases: CompilerPhaseTimestamps,
 }
 
@@ -155,9 +163,9 @@ struct CompileEnd {
 pub(crate) struct AotArtifact {
     /// The signed `cwasm` artifact.
     pub(crate) signed: Vec<u8>,
-    /// The worker count the compiler plugin was told to compile with
-    /// (`compiler_plugin_worker_threads`), reported so a caller comparing
-    /// this compile with another can hold the count fixed.
+    /// The live worker count the compiler plugin was told to compile with,
+    /// reported so a caller comparing this compile with another can hold the
+    /// count fixed.
     pub(crate) worker_threads: u32,
 }
 
@@ -232,6 +240,12 @@ where
 /// Distinct from [`ProgramExecContext`], which is the host the program
 /// runs *in*, and from [`ChildStdio`], which is how the caller talks to
 /// it once it is running.
+#[cfg(feature = "linux")]
+pub(super) struct LinuxContainerLaunch<StorageImpl: crate::Storage> {
+    pub(super) container: Arc<crate::LinuxContainer<StorageImpl>>,
+    pub(super) credentials: Option<helios_linux::syscall::Credentials>,
+}
+
 pub(super) struct ProgramLaunch<Net: ComponentHostNetwork, StorageImpl: crate::Storage> {
     argv: ProgramArgv,
     env: LaunchEnvironment,
@@ -245,6 +259,11 @@ pub(super) struct ProgramLaunch<Net: ComponentHostNetwork, StorageImpl: crate::S
     /// descriptor table; a component ignores one.
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_dispositions: Vec<WasixSignalDisposition>,
+    /// Explicit Linux container for launches started through a container
+    /// handle. Direct Linux ELF launches wrap themselves in an ephemeral
+    /// container bounded by `authority`.
+    #[cfg(feature = "linux")]
+    container: Option<LinuxContainerLaunch<StorageImpl>>,
     /// The launch's phase timeline: [`phases::Timeline::disabled`]
     /// when the launch-phase target is off or the launcher is not a
     /// launch call (plugin loads record nothing).
@@ -269,6 +288,31 @@ impl<Net: ComponentHostNetwork, StorageImpl: crate::Storage> ProgramLaunch<Net, 
             filesystem,
             descriptors: None,
             signal_dispositions: Vec::new(),
+            #[cfg(feature = "linux")]
+            container: None,
+            timeline: phases::Timeline::disabled(),
+        }
+    }
+
+    #[cfg(feature = "linux")]
+    pub(super) fn in_container(
+        argv: ProgramArgv,
+        env: Vec<(String, String)>,
+        container: Arc<crate::LinuxContainer<StorageImpl>>,
+        credentials: Option<helios_linux::syscall::Credentials>,
+    ) -> Self {
+        let authority = container.authority().clone();
+        Self {
+            argv,
+            env: LaunchEnvironment::from_guest(env),
+            authority,
+            filesystem: None,
+            descriptors: None,
+            signal_dispositions: Vec::new(),
+            container: Some(LinuxContainerLaunch {
+                container,
+                credentials,
+            }),
             timeline: phases::Timeline::disabled(),
         }
     }
@@ -363,11 +407,24 @@ where
     /// buffers. The slot is held only on the kernel side; the rayon
     /// worker pool inside the plugin still parallelises a single
     /// compile across all cores.
-    compile_slot: CompilerCompileSlot,
+    compile_slot: SharedMemorySessionSlot,
     /// Every wasm image this service loaded, by address, for the
     /// instruction sampler to name.
     code_map: CodeMap,
     clock_cpu: CpuImpl,
+    /// Shared precompiled `http-client` plugin component, instantiated lazily
+    /// per processor on every core hosting [`NetworkStep`].
+    http_client_pre: spin::Once<Option<PreparedComponent<CpuImpl, Net, StorageImpl>>>,
+    plugin_read_serial: crate::SerialReader,
+    plugin_write_serial: crate::DebugSerialWriter,
+    #[cfg(feature = "linux")]
+    next_container_id: core::sync::atomic::AtomicU64,
+    #[cfg(feature = "linux")]
+    containers: Mutex<
+        alloc::collections::BTreeMap<crate::ContainerId, Arc<crate::LinuxContainer<StorageImpl>>>,
+    >,
+    #[cfg(feature = "linux")]
+    retired_containers: Arc<Mutex<Vec<NonZeroU64>>>,
     _marker: core::marker::PhantomData<fn() -> StorageImpl>,
 }
 
@@ -386,6 +443,8 @@ struct ProgramSpawnRequest<Net: ComponentHostNetwork, StorageImpl: crate::Storag
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
+    #[cfg(feature = "linux")]
+    container: Option<LinuxContainerLaunch<StorageImpl>>,
 }
 
 /// A program's bytes, classified by how far the kernel trusts them.
@@ -400,17 +459,26 @@ pub(crate) enum ProgramSource {
     RawWasm(Bytes),
     SignedArtifact(Bytes),
     BootfsArtifact(BootfsBytes),
+    /// A Linux executable. It runs natively in an address space of its
+    /// own, so no provenance is asked of its bytes.
+    #[cfg(feature = "linux")]
+    LinuxElf(Bytes),
 }
 
 impl ProgramSource {
     /// Classifies a program file by the provenance the filesystem layer
     /// that produced its bytes gave them.
     pub(crate) fn from_file(contents: FileContents) -> Self {
+        // A Wasmtime artifact is an ELF file too, so it is recognised first.
         match contents {
             FileContents::Boot(bytes)
                 if WasmtimePrecompiledKind::detect(bytes.as_slice()).is_some() =>
             {
                 Self::BootfsArtifact(bytes)
+            }
+            #[cfg(feature = "linux")]
+            FileContents::Boot(bytes) if is_linux_elf(bytes.as_slice()) => {
+                Self::LinuxElf(bytes.to_bytes())
             }
             FileContents::Boot(bytes) => Self::RawWasm(bytes.to_bytes()),
             FileContents::Written(bytes) => Self::from_untrusted(bytes),
@@ -421,10 +489,16 @@ impl ProgramSource {
     /// wrote, on whichever mount, or one a host shared.
     fn from_untrusted(bytes: Bytes) -> Self {
         if cwasm::is_cwasm(&bytes) {
-            Self::SignedArtifact(bytes)
-        } else {
-            Self::RawWasm(bytes)
+            return Self::SignedArtifact(bytes);
         }
+        // A Wasmtime artifact is an ELF file too, so one without a
+        // signature is raw bytes for the wasm validator to refuse, never
+        // a Linux program.
+        #[cfg(feature = "linux")]
+        if WasmtimePrecompiledKind::detect(&bytes).is_none() && is_linux_elf(&bytes) {
+            return Self::LinuxElf(bytes);
+        }
+        Self::RawWasm(bytes)
     }
 
     /// Byte length of the payload the source carries, whichever
@@ -432,7 +506,108 @@ impl ProgramSource {
     pub(crate) fn payload_len(&self) -> usize {
         match self {
             Self::RawWasm(bytes) | Self::SignedArtifact(bytes) => bytes.len(),
+            #[cfg(feature = "linux")]
+            Self::LinuxElf(bytes) => bytes.len(),
             Self::BootfsArtifact(bytes) => bytes.as_slice().len(),
+        }
+    }
+}
+
+#[cfg(feature = "linux")]
+fn map_container_error(error: crate::ContainerError) -> ProgramExecError {
+    let kind = match &error {
+        crate::ContainerError::InvalidRootTarget(_)
+        | crate::ContainerError::InvalidMountTarget(_)
+        | crate::ContainerError::DuplicateMountTarget(_)
+        | crate::ContainerError::NotADirectory { .. }
+        | crate::ContainerError::TooManyMounts => ProgramExecErrorKind::InvalidPath,
+        crate::ContainerError::Authority { .. }
+        | crate::ContainerError::MountSharingMismatch { .. }
+        | crate::ContainerError::PrivateMountBusy { .. }
+        | crate::ContainerError::ReadOnlyMount { .. } => ProgramExecErrorKind::PermissionDenied,
+        crate::ContainerError::Filesystem { error: fs, .. } => {
+            return ProgramExecError::from_source_read_error(*fs);
+        }
+    };
+    ProgramExecError {
+        kind,
+        detail: ProgramExecErrorDetail::ContainerRefused(crate::RuntimeMessage::of(error)),
+    }
+}
+
+#[cfg(feature = "linux")]
+async fn load_container_executable<CpuImpl, StorageImpl>(
+    cpu: &CpuImpl,
+    container: &crate::LinuxContainer<StorageImpl>,
+    path: &str,
+    timeline: &phases::Timeline,
+) -> Result<LinuxExecutable, ProgramExecError>
+where
+    CpuImpl: Cpu,
+    StorageImpl: crate::Storage,
+{
+    let contents = container
+        .filesystem()
+        .read_executable(path)
+        .await
+        .map_err(ProgramExecError::from_source_read_error)?;
+    let bytes = match contents {
+        FileContents::Boot(boot) => Bytes::copy_from_slice(boot.as_slice()),
+        FileContents::Written(written) => written,
+    };
+    timeline.record(cpu, LaunchPhase::SourceRead);
+    if !is_linux_elf(&bytes) {
+        return Err(ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidBinary,
+            detail: ProgramExecErrorDetail::LinuxImageInvalid(crate::LinuxImageRefusal::Malformed),
+        });
+    }
+    timeline.record(cpu, LaunchPhase::LoadBegin);
+    let loaded = LinuxExecutable::load(cpu, bytes)?;
+    timeline.record(cpu, LaunchPhase::LoadComplete);
+    Ok(loaded)
+}
+
+/// Handle to a kernel Linux container stored in a component's resource table.
+///
+/// Kept non-generic so `wasmtime::component::bindgen!` maps
+/// `helios:system/programs.container` directly to it; the underlying
+/// [`crate::LinuxContainer`] lives in [`UserProgramService`] keyed by `id`.
+/// Dropping the handle (either explicitly or on store teardown) retires `id`
+/// so the service drops the container and releases any private mount claims.
+pub struct ContainerHandle {
+    id: NonZeroU64,
+    retired: Arc<Mutex<Vec<NonZeroU64>>>,
+    active: bool,
+}
+
+impl ContainerHandle {
+    #[cfg(feature = "linux")]
+    fn new(id: crate::ContainerId, retired: Arc<Mutex<Vec<NonZeroU64>>>) -> Self {
+        Self {
+            id: NonZeroU64::new(id.raw()).expect("container id is nonzero"),
+            retired,
+            active: true,
+        }
+    }
+
+    #[cfg(feature = "linux")]
+    pub(super) fn id(&self) -> crate::ContainerId {
+        crate::ContainerId::new(self.id)
+    }
+
+    #[cfg(feature = "linux")]
+    fn disarm(&mut self) -> crate::ContainerId {
+        self.active = false;
+        crate::ContainerId::new(self.id)
+    }
+}
+
+impl Drop for ContainerHandle {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            self.retired.lock().push(self.id);
         }
     }
 }
@@ -499,7 +674,7 @@ impl ChildHandle {
 #[derive(Clone, Debug)]
 pub struct ChildExit {
     pub instance_id: crate::InstanceId,
-    pub exit_code: u32,
+    pub termination: helios_unix::ChildTermination,
     filesystem: Option<MemoryFs>,
 }
 
@@ -618,12 +793,23 @@ where
             cwasm_signing_key,
             guest_isa,
             compiler_plugin: Mutex::new(None),
-            compile_slot: CompilerCompileSlot::new(),
+            compile_slot: SharedMemorySessionSlot::new(),
             code_map: CodeMap::new(),
             clock_cpu: cpu.clone(),
+            http_client_pre: spin::Once::new(),
+            plugin_read_serial: read_serial,
+            plugin_write_serial: write_serial,
+            #[cfg(feature = "linux")]
+            next_container_id: core::sync::atomic::AtomicU64::new(1),
+            #[cfg(feature = "linux")]
+            containers: Mutex::new(alloc::collections::BTreeMap::new()),
+            #[cfg(feature = "linux")]
+            retired_containers: Arc::new(Mutex::new(Vec::new())),
             _marker: core::marker::PhantomData,
         }),
     };
+    let http_pre = provision_http_client_plugin(&service, cpu, debug_state, write_serial);
+    service.inner.http_client_pre.call_once(|| http_pre);
     debug_state.install_program_service(service.clone());
     spawn_instruction_sample_drain(kernel, &service, debug_state);
     let plugin_context = ProgramExecContext {
@@ -636,7 +822,6 @@ where
         read_serial,
         write_serial,
     };
-    install_http_client_plugin(&service, plugin_context.clone());
     install_compositor_plugin(&service, plugin_context);
     service
 }
@@ -698,6 +883,7 @@ where
     );
     write_serial.emit_stage_marker("component-host:run-local-begin");
     let stack = system_component_profile_stack(component_name);
+    let namespace = debug_state.root_namespace().clone();
     kernel
         .run_local_future(ProfiledSystemComponentFuture::new(
             run_system_component(
@@ -726,6 +912,9 @@ where
         component = component_name,
         "embedded system component exited cleanly"
     );
+    // As Linux syncs and unmounts before it powers off: what the writable
+    // mounts hold reaches their devices before the machine goes down.
+    kernel.run_local_future(async move { namespace.sync_writable_mounts().await });
     report_fiber_stack_demand_commits(&cpu);
     cpu.shutdown()
 }
@@ -791,7 +980,7 @@ where
 }
 
 pub fn run_program_workers_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
-    _cpu: CpuImpl,
+    cpu: CpuImpl,
     kernel: crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
 ) -> !
@@ -802,11 +991,13 @@ where
     WatchdogImpl: Watchdog + Clone,
     MeasuredBootImpl: MeasuredBoot,
 {
-    // The packet pump has to be this processor's own task, because the
-    // pair it drains has its interrupt routed here; the step owns it and
-    // hands the pair off when the processor goes offline.
+    // The packet pump and per-processor WASI 0.3 plugin shards live on this
+    // processor as local tasks: the plugins come up after `NetworkStep` and
+    // go down before it on processor offline.
     let network = NetworkStep::start(&kernel, &debug_state);
-    kernel.run_with_steps(&network)
+    let http_client = PerProcessorPluginStep::start(&cpu, &kernel, &debug_state, HttpClientPlugin);
+    let steps = (network, http_client);
+    kernel.run_with_steps(&steps)
 }
 
 pub fn run_component_host_processor_forever<
@@ -830,11 +1021,12 @@ where
     MeasuredBootImpl: MeasuredBoot,
 {
     // Started before the role dispatch decides what else the processor
-    // does: every processor's pump is its own local task. A processor
-    // that goes on to run an embedded component keeps the step alive
-    // for good without lending it to a lifecycle — its component is
-    // pinned local work, so it never goes offline.
+    // does: every processor's pump and lazy WASI 0.3 plugin shards run locally
+    // here. A processor running an embedded component keeps the steps alive
+    // without lending them to a lifecycle, since it never goes offline.
     let network = NetworkStep::start(&kernel, &debug_state);
+    let http_client = PerProcessorPluginStep::start(&cpu, &kernel, &debug_state, HttpClientPlugin);
+    let steps = (network, http_client);
     let topology = kernel.topology();
     // Every backend's bootstrap processor reaches here only after starting
     // its secondaries, and a backend enables its mechanisms on a processor
@@ -850,7 +1042,7 @@ where
         topology.bootstrap_processor,
     ) {
         ComponentHostProcessorRole::Kernel => {
-            run_kernel_processor_forever(cpu, kernel, debug_state, &network);
+            run_kernel_processor_forever(cpu, kernel, debug_state, &steps);
         }
         ComponentHostProcessorRole::SharedRuntime | ComponentHostProcessorRole::SystemComponent => {
             match debug_state.system_component() {
@@ -871,7 +1063,7 @@ where
                     if cfg!(feature = "embedded-debugger") {
                         panic!("embedded init bootfs is missing the system component");
                     }
-                    run_kernel_processor_forever(cpu, kernel, debug_state, &network);
+                    run_kernel_processor_forever(cpu, kernel, debug_state, &steps);
                 }
             }
         }
@@ -918,11 +1110,11 @@ fn report_fiber_stack_demand_commits<CpuImpl: Cpu>(cpu: &CpuImpl) {
     );
 }
 
-fn run_kernel_processor_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
+fn run_kernel_processor_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl, Steps>(
     cpu: CpuImpl,
     kernel: crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
-    network: &NetworkStep<CpuImpl, Net, StorageImpl>,
+    steps: &Steps,
 ) -> !
 where
     CpuImpl: Cpu + Clone,
@@ -930,6 +1122,7 @@ where
     StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
     MeasuredBootImpl: MeasuredBoot,
+    Steps: crate::exec::ProcessorStep,
 {
     let processor = helios_hal::cpu::current_processor().id();
     let stack = kernel_processor_profile_stack(processor);
@@ -937,16 +1130,14 @@ where
         let progress = if debug_state.profiling_enabled() {
             let started = cpu.now().ticks();
             let counters = cpu.hardware_perf_counters();
-            let stats = kernel.run_until_stalled_with_steps(network);
+            let stats = kernel.run_until_stalled_with_steps(steps);
             let progress = stats.progress_count();
             if progress != 0 {
                 record_executor_metrics(&cpu, &debug_state, &stack, started, counters, stats);
             }
             progress
         } else {
-            kernel
-                .run_until_stalled_with_steps(network)
-                .progress_count()
+            kernel.run_until_stalled_with_steps(steps).progress_count()
         };
 
         if progress != 0 {
@@ -1304,6 +1495,143 @@ where
         &self.inner.code_map
     }
 
+    #[cfg(feature = "linux")]
+    fn drain_retired_containers(&self) {
+        let retired: Vec<NonZeroU64> = {
+            let mut queue = self.inner.retired_containers.lock();
+            core::mem::take(&mut *queue)
+        };
+        if retired.is_empty() {
+            return;
+        }
+        let mut table = self.inner.containers.lock();
+        for id in retired {
+            table.remove(&crate::ContainerId::new(id));
+        }
+    }
+
+    #[cfg(feature = "linux")]
+    pub(super) fn allocate_container_id(&self) -> crate::ContainerId {
+        let raw = self
+            .inner
+            .next_container_id
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        crate::ContainerId::new(NonZeroU64::new(raw).expect("container id counter starts at 1"))
+    }
+
+    /// Creates a new isolated Linux container owned by this service and returns
+    /// its resource handle.
+    #[cfg(feature = "linux")]
+    pub(super) async fn create_container(
+        &self,
+        caller_authority: &ProcessAuthority,
+        caller_namespace: &Namespace<StorageImpl>,
+        non_fs_authority: ProcessAuthority,
+        config: crate::ContainerConfig,
+    ) -> Result<ContainerHandle, ProgramExecError> {
+        self.drain_retired_containers();
+        let id = self.allocate_container_id();
+        let container = crate::LinuxContainer::create(
+            id,
+            caller_authority,
+            caller_namespace,
+            non_fs_authority,
+            config,
+        )
+        .await
+        .map_err(map_container_error)?;
+        self.inner.containers.lock().insert(id, Arc::new(container));
+        Ok(ContainerHandle::new(
+            id,
+            self.inner.retired_containers.clone(),
+        ))
+    }
+
+    /// Looks up a live container by handle.
+    #[cfg(feature = "linux")]
+    pub(super) fn get_container(
+        &self,
+        handle: &ContainerHandle,
+    ) -> Result<Arc<crate::LinuxContainer<StorageImpl>>, ProgramExecError> {
+        self.drain_retired_containers();
+        self.inner
+            .containers
+            .lock()
+            .get(&handle.id())
+            .cloned()
+            .ok_or_else(|| ProgramExecError {
+                kind: ProgramExecErrorKind::Unavailable,
+                detail: ProgramExecErrorDetail::ContainerRefused(crate::RuntimeMessage::of(
+                    "container handle is no longer active",
+                )),
+            })
+    }
+
+    /// Immediately removes a dropped container handle from the service so any
+    /// private mount claims it held are released right away.
+    pub(super) fn remove_container(&self, handle: &mut ContainerHandle) {
+        #[cfg(feature = "linux")]
+        {
+            let id = handle.disarm();
+            self.inner.containers.lock().remove(&id);
+            self.drain_retired_containers();
+        }
+        #[cfg(not(feature = "linux"))]
+        {
+            let _ = handle;
+        }
+    }
+
+    /// Loads a Linux executable strictly from `container`'s own filesystem and
+    /// spawns it inside `container`.
+    #[cfg(feature = "linux")]
+    pub(super) async fn spawn_in_container(
+        &self,
+        exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        path: &str,
+        launch: ProgramLaunch<Net, StorageImpl>,
+    ) -> Result<ChildHandle, ProgramExecError> {
+        let container = launch
+            .container
+            .as_ref()
+            .expect("container spawn carries a container")
+            .container
+            .clone();
+        let executable =
+            load_container_executable(&exec_context.cpu, &container, path, &launch.timeline)
+                .await?;
+        self.spawn_loaded(exec_context, ProgramExecutable::Linux(executable), launch)
+    }
+
+    /// Loads a Linux executable strictly from `container`'s own filesystem,
+    /// runs it to completion inside `container`, and returns buffered output.
+    #[cfg(feature = "linux")]
+    pub(super) async fn exec_in_container(
+        &self,
+        exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        path: &str,
+        stdin: Vec<u8>,
+        launch: ProgramLaunch<Net, StorageImpl>,
+    ) -> Result<ExecResult, ProgramExecError> {
+        let container = launch
+            .container
+            .as_ref()
+            .expect("container exec carries a container")
+            .container
+            .clone();
+        let executable =
+            load_container_executable(&exec_context.cpu, &container, path, &launch.timeline)
+                .await?;
+        self.exec_loaded_buffered(
+            exec_context,
+            ProgramExecutable::Linux(executable),
+            stdin,
+            launch,
+        )
+        .await
+        .map(|(result, _)| result)
+    }
+
     /// Spawn a new child program. The returned handle gives the caller
     /// direct access to the child's stdin/stdout/stderr channels and a
     /// future resolving with its exit status.
@@ -1401,8 +1729,33 @@ where
             filesystem,
             descriptors,
             signal_dispositions,
+            #[cfg(feature = "linux")]
+            container,
             timeline,
         } = launch;
+        #[cfg(feature = "linux")]
+        let container = match (&executable, container) {
+            (ProgramExecutable::Linux(_), Some(explicit)) => Some(explicit),
+            (ProgramExecutable::Linux(_), None) => {
+                // Every Linux process runs inside a container; direct ELF
+                // launches (e.g. from WASIX `/bin/dash` or `programs.exec`)
+                // receive a dedicated container bounded by their launch
+                // authority and namespace.
+                let namespace = filesystem
+                    .as_ref()
+                    .unwrap_or_else(|| exec_context.runtime_state.root_namespace());
+                let ephemeral = Arc::new(crate::LinuxContainer::ephemeral(
+                    self.allocate_container_id(),
+                    authority.clone(),
+                    namespace,
+                ));
+                Some(LinuxContainerLaunch {
+                    container: ephemeral,
+                    credentials: None,
+                })
+            }
+            (_, other) => other,
+        };
         let started_at = exec_context
             .runtime_state
             .uptime_nanos(exec_context.cpu.now().ticks());
@@ -1420,6 +1773,8 @@ where
             descriptors,
             signal_state: signal_state.clone(),
             signal_dispositions,
+            #[cfg(feature = "linux")]
+            container,
         };
 
         let (exit_tx, exit_rx) = futures::channel::oneshot::channel();
@@ -1449,6 +1804,8 @@ where
                 request.descriptors,
                 request.signal_state,
                 request.signal_dispositions,
+                #[cfg(feature = "linux")]
+                request.container,
                 run_spawner,
                 progress,
                 executable,
@@ -1578,13 +1935,33 @@ where
         let (stdout, (stderr, exit)) =
             futures::future::join(stdout_task, futures::future::join(stderr_task, wait_task)).await;
         let exit = exit?;
+        let exit_code = match exit.termination {
+            helios_unix::ChildTermination::Exited(code) => code,
+            helios_unix::ChildTermination::Signaled(sig) => {
+                128u32.saturating_add(u32::from(sig.signal))
+            }
+            helios_unix::ChildTermination::Trapped => {
+                return Err(ProgramExecError {
+                    kind: ProgramExecErrorKind::Internal,
+                    detail: ProgramExecErrorDetail::ChildTrapped,
+                });
+            }
+            helios_unix::ChildTermination::Killed => {
+                return Err(ProgramExecError {
+                    kind: ProgramExecErrorKind::Internal,
+                    detail: ProgramExecErrorDetail::ChildKilled,
+                });
+            }
+        };
 
-        Ok(ExecResult {
-            instance_id: exit.instance_id,
-            exit_code: exit.exit_code,
-            output: crate::ExecOutput { stdout, stderr },
-        })
-        .map(|result| (result, exit.filesystem))
+        Ok((
+            ExecResult {
+                instance_id: exit.instance_id,
+                exit_code,
+                output: crate::ExecOutput { stdout, stderr },
+            },
+            exit.filesystem,
+        ))
     }
 
     pub(crate) async fn aot(
@@ -1595,13 +1972,8 @@ where
         hint: AotCompileHint,
         profile: bool,
     ) -> Result<AotArtifact, ProgramExecError> {
-        let signed = self
-            .compile_raw_component_to_signed_artifact(compile, exec_context, wasm, hint, profile)
-            .await?;
-        Ok(AotArtifact {
-            signed,
-            worker_threads: compiler_plugin_worker_threads(&exec_context.cpu),
-        })
+        self.compile_raw_component_to_signed_artifact(compile, exec_context, wasm, hint, profile)
+            .await
     }
 
     async fn load_executable(
@@ -1617,6 +1989,19 @@ where
         let started_at = monotonic_nanos(&self.inner.clock_cpu);
         timeline.record(&self.inner.clock_cpu, LaunchPhase::LoadBegin);
         let payload = match source {
+            #[cfg(feature = "linux")]
+            ProgramSource::LinuxElf(image) => {
+                if hint.is_some() {
+                    return Err(ProgramExecError {
+                        kind: ProgramExecErrorKind::InvalidHint,
+                        detail: ProgramExecErrorDetail::HintNotAllowedForPrecompiledArtifact,
+                    });
+                }
+                let loaded = LinuxExecutable::load(&exec_context.cpu, image.clone())
+                    .map(ProgramExecutable::Linux);
+                timeline.record(&self.inner.clock_cpu, LaunchPhase::LoadComplete);
+                return loaded;
+            }
             ProgramSource::SignedArtifact(bytes) => {
                 if hint.is_some() {
                     return Err(ProgramExecError {
@@ -1639,7 +2024,7 @@ where
                 let _profile = artifact_profile::classify_raw_wasm(wasm)
                     .map_err(map_artifact_profile_error)?;
                 let hint = hint.unwrap_or(AotCompileHint::Performance);
-                let signed = self
+                let compiled = self
                     .compile_raw_component_to_signed_artifact(
                         compile,
                         exec_context,
@@ -1648,7 +2033,7 @@ where
                         false,
                     )
                     .await?;
-                let signed = Bytes::from(signed);
+                let signed = Bytes::from(compiled.signed);
                 trusted_signed_payload(&signed, &self.inner.cwasm_signing_key)?
             }
         };
@@ -1868,7 +2253,7 @@ where
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
-    ) -> Result<Vec<u8>, ProgramExecError> {
+    ) -> Result<AotArtifact, ProgramExecError> {
         let phases = CompilerPhaseTimestamps {
             processor: if profile {
                 helios_hal::cpu::current_processor().id()
@@ -1892,7 +2277,7 @@ where
         // The compile runs in a task of its own, whichever route asked for
         // it, and this call holds only the receiving half of its reply: the
         // compile outlives a requester that stops waiting, and stops itself
-        // when that happens (`run_compile_session`).
+        // when that happens (`run_shared_memory_session`).
         let (reply, artifact) = futures::channel::oneshot::channel();
         exec_context.spawner.spawn_detached({
             let service = self.clone();
@@ -1912,18 +2297,18 @@ where
         }
     }
 
-    /// The compile session task: waits for the compile slot, runs the compile
-    /// with the slot held until every worker is joined, condemns the compile
+    /// The compile session task: waits for the session slot, runs the compile
+    /// with core affinity until every worker is joined, condemns the compile
     /// if its requester leaves, and replies with the signed artifact.
     async fn compile_session(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         job: CompileJob,
         phases: CompilerPhaseTimestamps,
-        reply: futures::channel::oneshot::Sender<Result<Vec<u8>, ProgramExecError>>,
+        reply: futures::channel::oneshot::Sender<Result<AotArtifact, ProgramExecError>>,
     ) {
         let profile = job.profile;
-        run_compile_session(
+        run_shared_memory_session(
             &self.inner.compile_slot,
             reply,
             || {
@@ -1942,7 +2327,7 @@ where
                     let runtime_state = exec_context.runtime_state.clone();
                     let id = instance.id();
                     move || {
-                        condemn_compile(
+                        condemn_session(
                             &registry,
                             &interrupts,
                             id,
@@ -1968,8 +2353,12 @@ where
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         profile: bool,
         end: CompileEnd,
-    ) -> Result<Vec<u8>, ProgramExecError> {
-        let CompileEnd { result, mut phases } = end;
+    ) -> Result<AotArtifact, ProgramExecError> {
+        let CompileEnd {
+            result,
+            worker_threads,
+            mut phases,
+        } = end;
         let (payload, thread_reports) = result?;
         let signed = cwasm::sign_artifact_payload(&payload, &self.inner.cwasm_signing_key)
             .map_err(map_artifact_trust_error)?;
@@ -1993,12 +2382,15 @@ where
                 signed.len(),
             );
         }
-        Ok(signed)
+        Ok(AotArtifact {
+            signed,
+            worker_threads,
+        })
     }
 
     /// The compile proper, run with the compile slot held: the plugin's call,
-    /// then the join of every worker task the plugin spawned, so the slot is
-    /// never released while one still runs on the plugin's memory.
+    /// then the join of every core-pinned worker task the plugin spawned, so the
+    /// slot is never released while one still runs on the plugin's memory.
     async fn run_compile(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
@@ -2017,17 +2409,24 @@ where
         } else {
             0
         };
+        let affinity_plan = CoreAffinityPlan::capture(
+            &exec_context.cpu,
+            exec_context.spawner.processor_control().online_set(),
+            helios_hal::cpu::current_processor(),
+        );
+        let worker_threads = affinity_plan.worker_count();
         let result = self
             .invoke_compiler_inner(
                 exec_context,
                 &compiler_payload,
                 instance,
                 CompileRequest {
-                    wasm: &wasm,
+                    wasm,
                     guest_isa: self.inner.guest_isa,
                     hint,
                     profile,
                 },
+                affinity_plan,
                 &mut phases,
             )
             .await;
@@ -2058,6 +2457,7 @@ where
         }
         CompileEnd {
             result: result.map(|payload| (payload, thread_reports)),
+            worker_threads,
             phases,
         }
     }
@@ -2094,13 +2494,15 @@ where
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         compiler_payload: &Bytes,
         compiler_instance: crate::RegisteredInstance,
-        request: CompileRequest<'_>,
+        request: CompileRequest,
+        affinity_plan: CoreAffinityPlan,
         phases: &mut CompilerPhaseTimestamps,
     ) -> Result<Vec<u8>, ProgramExecError> {
         let profile = request.profile;
         let (plugin, plugin_cached) = self
-            .ensure_compiler_plugin(exec_context, compiler_payload)
+            .ensure_compiler_plugin(exec_context, compiler_payload, affinity_plan.worker_count())
             .await?;
+        plugin.shared.begin_session(&affinity_plan);
         phases.plugin_cached = plugin_cached;
         phases.plugin_ready_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
@@ -2114,14 +2516,34 @@ where
             instance: compiler_instance,
             registry: exec_context.instance_registry.clone(),
             shared: plugin.shared.clone(),
+            affinity_plan: affinity_plan.clone(),
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,
         };
-        // The main thread's part ends here, before the workers are joined, so
-        // a failure condemns the compile while they can still be ended.
-        let result = self
-            .run_main_thread(exec_context, &plugin, context.clone(), request, phases)
+        // Pin the compile's main store to `affinity_plan.main()` so main and all
+        // workers execute deterministically across the live `Kernel` cores.
+        let main_core = affinity_plan.main();
+        let (result, updated_phases) = affinity_plan
+            .spawn_pinned(&exec_context.spawner, main_core, {
+                let service = self.clone();
+                let exec_context = exec_context.clone();
+                let context = context.clone();
+                let mut local_phases = *phases;
+                async move {
+                    let result = service
+                        .run_main_thread(
+                            &exec_context,
+                            &plugin,
+                            context,
+                            request,
+                            &mut local_phases,
+                        )
+                        .await;
+                    (result, local_phases)
+                }
+            })
             .await;
+        *phases = updated_phases;
         context.end_main_part(result)
     }
 
@@ -2132,7 +2554,7 @@ where
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         plugin: &CompilerPluginHandle<CpuImpl, Net, StorageImpl>,
         context: CompilerCompileContext<CpuImpl, Net, StorageImpl>,
-        request: CompileRequest<'_>,
+        request: CompileRequest,
         phases: &mut CompilerPhaseTimestamps,
     ) -> Result<Vec<u8>, ProgramExecError> {
         let profile = request.profile;
@@ -2224,7 +2646,7 @@ where
         store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
         exports: &CompilerExports,
         allocations: &mut CompilerAllocations,
-        request: CompileRequest<'_>,
+        request: CompileRequest,
         phases: &mut CompilerPhaseTimestamps,
     ) -> CompilerCallOutcome {
         let CompileRequest {
@@ -2279,7 +2701,7 @@ where
         let memory = Preview1AsyncMemory::of_shared(store.data().memory());
         let written = in_guest_turn(store.data().guest_turns(), async {
             memory
-                .write_bytes(GuestAddress::wasm32(wasm_ptr), wasm)
+                .write_bytes(GuestAddress::wasm32(wasm_ptr), &wasm)
                 .await?;
             memory
                 .write_bytes(GuestAddress::wasm32(target_ptr), target)
@@ -2350,6 +2772,7 @@ where
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         compiler_payload: &Bytes,
+        worker_threads: u32,
     ) -> Result<(CompilerPluginHandle<CpuImpl, Net, StorageImpl>, bool), ProgramExecError> {
         let cached = self.inner.compiler_plugin.lock().clone();
         if let Some(plugin) = cached {
@@ -2368,7 +2791,6 @@ where
             });
         }
 
-        let worker_threads = compiler_plugin_worker_threads(&exec_context.cpu);
         tracing::info!(
             worker_threads,
             "building cached compiler plugin runtime (one-time per kernel boot)"
@@ -2382,17 +2804,12 @@ where
             .code_map
             .register_module(COMPILER_PLUGIN_PATH, &module);
         let shared_memory = compiler_shared_memory(engine, &module)?;
-        let shared = Arc::new(CompilerCoreShared {
-            memory: shared_memory.clone(),
-            entropy: Mutex::new(crate::EntropyPool::derive(
-                exec_context.runtime_state.root_entropy(),
-                0,
-            )),
-            instance_pre: spin::Once::new(),
-            next_thread_id: AtomicI32::new(0),
-            thread_tasks: Mutex::new(Vec::new()),
-            interrupts: self.inner.engine.interrupts().clone(),
-        });
+        let shared = Arc::new(SharedMemoryCoreShared::new(
+            shared_memory.clone(),
+            crate::EntropyPool::derive(exec_context.runtime_state.root_entropy(), 0),
+            self.inner.engine.interrupts().clone(),
+            worker_threads,
+        ));
         let mut linker: CoreLinker<CompilerCoreStore<CpuImpl, Net, StorageImpl>> =
             CoreLinker::new(engine);
         add_compiler_core_imports(&mut linker, shared_memory.clone())?;
@@ -2417,6 +2834,7 @@ where
             instance: scratch_instance,
             registry: exec_context.instance_registry.clone(),
             shared: shared.clone(),
+            affinity_plan: CoreAffinityPlan::single(exec_context.cpu.bootstrap_processor()),
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,
         });
@@ -2581,9 +2999,14 @@ const WASIX_JOIN_FLAG_NON_BLOCKING: u32 = 1 << 0;
 const WASIX_JOIN_FLAGS_SUPPORTED: u32 = WASIX_JOIN_FLAG_NON_BLOCKING | (1 << 1);
 const WASIX_JOIN_STATUS_NOTHING: u8 = 0;
 const WASIX_JOIN_STATUS_EXIT_NORMAL: u8 = 1;
+const WASIX_JOIN_STATUS_EXIT_SIGNAL: u8 = 2;
 const WASIX_JOIN_STATUS_UNION_OFFSET: u32 = 2;
+const WASIX_ERRNO_SIGNAL_SIGNAL_OFFSET: u32 = 4;
+const WASIX_SIGABRT: u8 = 6;
+const WASIX_SIGKILL: u8 = 9;
 const WASIX_SOCK_TYPE_STREAM: i32 = 1;
 const WASIX_SOCK_TYPE_DGRAM: i32 = 2;
+const WASIX_SOCK_TYPE_RAW: i32 = 3;
 const WASIX_SOCK_STATUS_OPENED: u8 = 1;
 const WASIX_SOCK_OPTION_REUSE_PORT: i32 = 1;
 const WASIX_SOCK_OPTION_REUSE_ADDR: i32 = 2;
@@ -2610,7 +3033,10 @@ const WASIX_SOCK_OPTION_TTL: i32 = 23;
 const WASIX_SOCK_OPTION_MULTICAST_TTL_V4: i32 = 24;
 const WASIX_SOCK_OPTION_TYPE: i32 = 25;
 const WASIX_SOCK_OPTION_PROTO: i32 = 26;
-const WASIX_RIFLAGS_DATA_TRUNCATED: u16 = 1 << 2;
+const WASIX_RIFLAGS_RECV_PEEK: u16 = 1 << 0;
+const WASIX_RIFLAGS_RECV_DONT_WAIT: u16 = 1 << 3;
+const WASIX_RIFLAGS_SUPPORTED: u16 = WASIX_RIFLAGS_RECV_PEEK | WASIX_RIFLAGS_RECV_DONT_WAIT;
+const WASIX_ROFLAGS_DATA_TRUNCATED: u16 = 1 << 0;
 const WASIX_ADDRESS_FAMILY_UNSPEC: u8 = 0;
 const WASIX_ADDRESS_FAMILY_IP_INET4: u8 = 1;
 const WASIX_ADDRESS_FAMILY_IP_INET6: u8 = 2;
@@ -2737,7 +3163,7 @@ mod tests {
     type TestDescriptor = Preview1Descriptor<TestNet>;
     type TestDescriptorTable = Preview1DescriptorTable<TestNet>;
     type TestSpawnFdSnapshot = WasixSpawnFdSnapshot<TestNet>;
-    type TestSocketDescriptor = WasixSocketDescriptor<TestNet>;
+    type TestSocketDescriptor = UnixSocket<TestNet>;
 
     #[test]
     fn preview1_program_linked_imports_match_manifest() {
@@ -2825,7 +3251,7 @@ mod tests {
         let code =
             crate::wasmtime_adapter::wasi::fs_error_code(helios_hal::fs::FsError::NameTooLong);
 
-        // Preview 2 and 3 return the code itself; preview 1 and WASIX
+        // Preview 3 returns the code itself; preview 1 and WASIX
         // answer its errno.
         assert!(matches!(code, fs_types::ErrorCode::NameTooLong));
         assert_eq!(
@@ -2839,16 +3265,18 @@ mod tests {
         let root = FsDescriptor {
             path: "/".into(),
             kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ,
+            flags: FsDescriptorFlags::READ,
             identity: None,
             mount: None,
+            open: None,
         };
         let work = FsDescriptor {
             path: "/work".into(),
             kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ,
+            flags: FsDescriptorFlags::READ,
             identity: None,
             mount: None,
+            open: None,
         };
 
         assert_eq!(
@@ -2891,17 +3319,14 @@ mod tests {
 
     #[test]
     fn fd_renumber_replaces_stdio_descriptor() {
-        let file: TestDescriptor = Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/redirected".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::WRITE,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: 0,
-        };
+        let file: TestDescriptor = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/redirected".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::WRITE,
+            identity: None,
+            mount: None,
+            open: None,
+        }));
         let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
             Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Stdin {
@@ -2922,8 +3347,8 @@ mod tests {
 
         assert_eq!(table.renumber(3, 1), p1::errno::SUCCESS);
         match table.get(1) {
-            Some(Preview1Descriptor::File { descriptor, .. }) => {
-                assert_eq!(descriptor.path, "/redirected");
+            Some(Preview1Descriptor::File(file)) => {
+                assert_eq!(file.node().path, "/redirected");
             }
             _ => panic!("fd 1 should be redirected to the file descriptor"),
         }
@@ -3020,7 +3445,10 @@ mod tests {
         let (pipe_tx, pipe_rx) = crate::byte_channel();
         let mut table = stdio_table();
         let pipe = table
-            .insert(Preview1Descriptor::PipeWrite { writer: pipe_tx })
+            .insert(Preview1Descriptor::PipeWrite {
+                writer: pipe_tx,
+                inode: helios_unix::PipeInode::default(),
+            })
             .expect("a free slot");
         let pipe = i32::try_from(pipe).expect("small fd");
         assert_eq!(table.dup2(pipe, 1), p1::errno::SUCCESS);
@@ -3105,28 +3533,28 @@ mod tests {
         let mode = table
             .component_output_mode(&session)
             .expect("closed slots are closed streams");
-        let OutputMode::RoutedChild { stdin_rx, .. } = &mode else {
+        let OutputMode::RoutedChild { stdin, .. } = &mode else {
             panic!("a redirected table routes each stream");
         };
-        assert!(matches!(stdin_rx.try_read(), crate::io::TryRead::Eof));
+        assert!(matches!(stdin, crate::ComponentInputRoute::Closed));
         let stdout = component_channel(&mode, crate::ComponentOutputStreamKind::Stdout);
         assert!(matches!(
             stdout.try_write(Bytes::from_static(b"lost\n")),
             crate::TryWrite::Closed
         ));
 
-        let file: TestDescriptor = Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/redirected".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::WRITE,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: 0,
-        };
-        assert_eq!(table.insert_at(1, file, false), Ok(1));
+        let file: TestDescriptor = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/redirected".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::WRITE,
+            identity: None,
+            mount: None,
+            open: None,
+        }));
+        assert_eq!(
+            table.insert_entry_at(1, Preview1DescriptorEntry::new(file, false)),
+            Ok(1)
+        );
         assert_eq!(
             table.component_output_mode(&session).err(),
             Some(ComponentStdioRefusal {
@@ -3176,7 +3604,10 @@ mod tests {
             Err(p1::errno::BADF)
         );
         assert_eq!(
-            snapshot.insert_at(i32::MAX - 1, Preview1Descriptor::NullDevice, false),
+            snapshot.insert_entry_at(
+                i32::MAX - 1,
+                Preview1DescriptorEntry::new(Preview1Descriptor::NullDevice, false)
+            ),
             Err(p1::errno::BADF)
         );
         assert_eq!(snapshot.target_index(i32::MAX - 1), Err(p1::errno::BADF));
@@ -3250,17 +3681,14 @@ mod tests {
 
     #[test]
     fn fd_dup2_replaces_exact_target_descriptor() {
-        let file: TestDescriptor = Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/redirected".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::WRITE,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: 0,
-        };
+        let file: TestDescriptor = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/redirected".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::WRITE,
+            identity: None,
+            mount: None,
+            open: None,
+        }));
         let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
             Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Stdin {
@@ -3281,8 +3709,8 @@ mod tests {
 
         assert_eq!(table.dup_to(3, 1, true), Ok(1));
         match table.get(1) {
-            Some(Preview1Descriptor::File { descriptor, .. }) => {
-                assert_eq!(descriptor.path, "/redirected");
+            Some(Preview1Descriptor::File(file)) => {
+                assert_eq!(file.node().path, "/redirected");
             }
             _ => panic!("fd 1 should be duplicated to the file descriptor"),
         }
@@ -3291,20 +3719,18 @@ mod tests {
 
     #[test]
     fn descriptor_table_preserves_fdflags_across_dup_and_exec_snapshot() {
-        let file: TestDescriptor = Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/nonblock".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::READ,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: P1_FDFLAG_NONBLOCK,
-        };
-        let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![Some(
-            Preview1DescriptorEntry::new(file, false),
-        )]);
+        let file: TestDescriptor = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/nonblock".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::READ,
+            identity: None,
+            mount: None,
+            open: None,
+        }));
+        let entry = Preview1DescriptorEntry::new(file, false);
+        entry.set_fdflags(P1_FDFLAG_NONBLOCK);
+        let mut table: TestDescriptorTable =
+            Preview1DescriptorTable::from_entries(vec![Some(entry)]);
 
         assert_eq!(table.fdflags(0), Ok(P1_FDFLAG_NONBLOCK));
         assert_eq!(table.dup(0), Ok(1));
@@ -3325,14 +3751,7 @@ mod tests {
 
     #[test]
     fn socket_descriptor_accepts_only_nonblock_fdflag() {
-        let (writer, reader) = crate::byte_channel();
-        let socket = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
-            reader,
-            writer,
-            carry: Bytes::new(),
-            options: WasixSocketOptions::default(),
-            socket_type: WASIX_SOCK_TYPE_STREAM,
-        });
+        let socket = Preview1Descriptor::Socket(UnixSocket::<TestNet>::pair(SocketKind::Stream).0);
         let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![Some(
             Preview1DescriptorEntry::new(socket, false),
         )]);
@@ -3398,9 +3817,10 @@ mod tests {
             descriptor: FsDescriptor {
                 path: "/mnt/workspace".into(),
                 kind: FsNodeKind::Directory,
-                flags: fs_types::DescriptorFlags::READ,
+                flags: FsDescriptorFlags::READ,
                 identity: None,
                 mount: None,
+                open: None,
             },
         };
 
@@ -3517,34 +3937,28 @@ mod tests {
             .expect("guest path should resolve inside chroot root");
 
         assert_eq!(source, "/mnt/workspace/app/bin/tool");
-        assert!(flags.contains(fs_types::DescriptorFlags::READ));
-        assert!(flags.contains(fs_types::DescriptorFlags::WRITE));
+        assert!(flags.contains(FsDescriptorFlags::READ));
+        assert!(flags.contains(FsDescriptorFlags::WRITE));
     }
 
     #[test]
     fn exec_descriptor_snapshot_drops_close_on_exec_entries() {
-        let closed = Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/closed-on-exec".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::READ,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: 0,
-        };
-        let retained = Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/retained".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::READ,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: 0,
-        };
+        let closed = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/closed-on-exec".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::READ,
+            identity: None,
+            mount: None,
+            open: None,
+        }));
+        let retained = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/retained".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::READ,
+            identity: None,
+            mount: None,
+            open: None,
+        }));
         let table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
             Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Stdin {
@@ -3560,8 +3974,8 @@ mod tests {
 
         assert!(exec_table.get(1).is_none());
         match exec_table.get(2) {
-            Some(Preview1Descriptor::File { descriptor, .. }) => {
-                assert_eq!(descriptor.path, "/retained");
+            Some(Preview1Descriptor::File(file)) => {
+                assert_eq!(file.node().path, "/retained");
             }
             _ => panic!("fd 2 should be retained across exec"),
         }
@@ -3577,9 +3991,10 @@ mod tests {
                         descriptor: FsDescriptor {
                             path: "/mnt/workspace".into(),
                             kind: FsNodeKind::Directory,
-                            flags: fs_types::DescriptorFlags::READ,
+                            flags: FsDescriptorFlags::READ,
                             identity: None,
                             mount: None,
+                            open: None,
                         },
                     },
                     false,
@@ -3606,9 +4021,10 @@ mod tests {
             descriptor: FsDescriptor {
                 path: "/mnt/workspace".into(),
                 kind: FsNodeKind::Directory,
-                flags: fs_types::DescriptorFlags::READ,
+                flags: FsDescriptorFlags::READ,
                 identity: None,
                 mount: None,
+                open: None,
             },
         };
         let mut authority = ProcessAuthority::empty();
@@ -3649,9 +4065,10 @@ mod tests {
                         descriptor: FsDescriptor {
                             path: "/source/root".into(),
                             kind: FsNodeKind::Directory,
-                            flags: fs_types::DescriptorFlags::READ,
+                            flags: FsDescriptorFlags::READ,
                             identity: None,
                             mount: None,
+                            open: None,
                         },
                     },
                     false,
@@ -3663,9 +4080,10 @@ mod tests {
                 descriptor: FsDescriptor {
                     path: "/source/workspace".into(),
                     kind: FsNodeKind::Directory,
-                    flags: fs_types::DescriptorFlags::READ,
+                    flags: FsDescriptorFlags::READ,
                     identity: None,
                     mount: None,
+                    open: None,
                 },
             }),
         };
@@ -3687,9 +4105,10 @@ mod tests {
                         descriptor: FsDescriptor {
                             path: "/source/workspace".into(),
                             kind: FsNodeKind::Directory,
-                            flags: fs_types::DescriptorFlags::READ,
+                            flags: FsDescriptorFlags::READ,
                             identity: None,
                             mount: None,
+                            open: None,
                         },
                     },
                     false,
@@ -3756,36 +4175,31 @@ mod tests {
 
     #[test]
     fn wasix_socket_operations_select_network_authority_by_socket_kind() {
-        let tcp =
-            Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
-                family: WasixSocketFamily::Ipv4,
-                stream: WasixOwnedTcpStream::new(crate::test_support::test_network_service(), 1),
-                peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
-                    127, 0, 0, 1,
-                ])),
-                peer_port: 80,
-                options: WasixSocketOptions::default(),
-            }));
-        let udp_bound =
-            Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
-                family: WasixSocketFamily::Ipv4,
-                socket: WasixOwnedUdpSocket::new(crate::test_support::test_network_service(), 2),
-                local_port: 5353,
-                options: WasixSocketOptions::default(),
-            }));
+        let tcp = Preview1Descriptor::Socket(UnixSocket::from_tcp(UnixTcpSocket::Connected {
+            family: SocketFamily::Ipv4,
+            stream: OwnedTcpStream::new(
+                crate::UnixNetwork::new(crate::test_support::test_network_service()),
+                1,
+            ),
+            peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
+            peer_port: 80,
+            options: unix_socket_options::<TestNet>(),
+        }));
+        let udp_bound = Preview1Descriptor::Socket(UnixSocket::from_udp(UnixUdpSocket::Bound {
+            family: SocketFamily::Ipv4,
+            socket: OwnedUdpSocket::new(
+                crate::UnixNetwork::new(crate::test_support::test_network_service()),
+                2,
+            ),
+            local_address: crate::unix::unspecified_address(SocketFamily::Ipv4),
+            local_port: 5353,
+            peer: None,
+            options: unix_socket_options::<TestNet>(),
+        }));
         let udp_unbound: TestDescriptor =
-            Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
-                family: WasixSocketFamily::Ipv4,
-                options: WasixSocketOptions::default(),
-            }));
-        let (left_writer, right_reader) = crate::byte_channel();
-        let pair: TestDescriptor = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
-            reader: right_reader,
-            writer: left_writer,
-            carry: Bytes::new(),
-            options: WasixSocketOptions::default(),
-            socket_type: WASIX_SOCK_TYPE_STREAM,
-        });
+            Preview1Descriptor::Socket(UnixSocket::udp(SocketFamily::Ipv4));
+        let pair: TestDescriptor =
+            Preview1Descriptor::Socket(TestSocketDescriptor::pair(SocketKind::Stream).0);
         let nonsocket: TestDescriptor = Preview1Descriptor::Stdout;
 
         assert_eq!(
@@ -3864,16 +4278,8 @@ mod tests {
 
     #[test]
     fn wasix_multicast_preflight_accepts_udp_sockets_only() {
-        let udp: TestDescriptor =
-            Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
-                family: WasixSocketFamily::Ipv4,
-                options: WasixSocketOptions::default(),
-            }));
-        let tcp: TestDescriptor =
-            Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-                family: WasixSocketFamily::Ipv4,
-                options: WasixSocketOptions::default(),
-            }));
+        let udp: TestDescriptor = Preview1Descriptor::Socket(UnixSocket::udp(SocketFamily::Ipv4));
+        let tcp: TestDescriptor = Preview1Descriptor::Socket(UnixSocket::tcp(SocketFamily::Ipv4));
         let file: TestDescriptor = Preview1Descriptor::Stdout;
 
         assert_eq!(
@@ -3998,30 +4404,6 @@ mod tests {
     }
 
     #[test]
-    fn wasix_socket_family_pins_wildcard_address_and_rejects_cross_family_peers() {
-        let v4 = crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([192, 0, 2, 1]));
-        let v6 = crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::new([
-            0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
-        ]));
-
-        // A wildcard bind means 0.0.0.0 on AF_INET and :: on AF_INET6.
-        assert_eq!(
-            WasixSocketFamily::Ipv4.unspecified_address(),
-            crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0]))
-        );
-        assert_eq!(
-            WasixSocketFamily::Ipv6.unspecified_address(),
-            crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::UNSPECIFIED)
-        );
-
-        // There is no v4-mapped-v6 path: each family accepts only its own.
-        assert!(WasixSocketFamily::Ipv4.accepts(v4));
-        assert!(!WasixSocketFamily::Ipv4.accepts(v6));
-        assert!(WasixSocketFamily::Ipv6.accepts(v6));
-        assert!(!WasixSocketFamily::Ipv6.accepts(v4));
-    }
-
-    #[test]
     fn wasix_socket_creation_validates_family_and_protocol() {
         assert_eq!(
             wasix_validate_network_socket_request(
@@ -4097,7 +4479,7 @@ mod tests {
                 WASIX_SOCK_TYPE_STREAM,
                 0,
             ),
-            Ok(())
+            Ok(SocketKind::Stream)
         );
         assert_eq!(
             wasix_validate_socket_pair_request(
@@ -4166,7 +4548,7 @@ mod tests {
         let (pipe_writer, pipe_reader) = crate::byte_channel();
         let pipe = Preview1Descriptor::PipeRead {
             reader: pipe_reader,
-            carry: Bytes::new(),
+            inode: helios_unix::PipeInode::default(),
         };
         assert_eq!(local_epoll_mask(Some(&pipe), WASIX_EPOLL_TYPE_EPOLLIN), 0);
         assert_eq!(
@@ -4179,14 +4561,9 @@ mod tests {
             WASIX_EPOLL_TYPE_EPOLLIN
         );
 
-        let (pair_writer, pair_reader) = crate::byte_channel();
-        let pair: TestDescriptor = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
-            reader: pair_reader,
-            writer: pair_writer.clone(),
-            carry: Bytes::new(),
-            options: WasixSocketOptions::default(),
-            socket_type: WASIX_SOCK_TYPE_STREAM,
-        });
+        let (pair_socket, pair_peer) = TestSocketDescriptor::pair(SocketKind::Stream);
+        let pair_writer = pair_peer.pair_writer().expect("pair peer has writer");
+        let pair: TestDescriptor = Preview1Descriptor::Socket(pair_socket);
         assert_eq!(local_epoll_mask(Some(&pair), WASIX_EPOLL_TYPE_EPOLLIN), 0);
         assert_eq!(
             pair_writer.try_write(Bytes::from_static(b"pair")),
@@ -4215,7 +4592,7 @@ mod tests {
             maximum_pages: 1,
         };
         let mut pool = SharedMemoryPool::new(spec.byte_size() * 2);
-        let memory = SharedMemory::new(&engine, spec.memory_type()).unwrap();
+        let memory = SharedMemory::new(&engine, spec.memory_type().unwrap()).unwrap();
         let ptr = memory.data().as_ptr().cast::<u8>() as *mut u8;
         unsafe {
             ptr.write(0xa5);
@@ -4246,7 +4623,7 @@ mod tests {
             maximum_pages: 1,
         };
         let mut pool = SharedMemoryPool::new(spec.byte_size() * 2);
-        let memory = SharedMemory::new(&engine, spec.memory_type()).unwrap();
+        let memory = SharedMemory::new(&engine, spec.memory_type().unwrap()).unwrap();
         assert!(pool.reserve_for_recycle(spec, &memory));
         futures_lite::future::block_on(scrub_shared_memory(&memory));
         pool.finish_recycle(spec, memory);
@@ -4260,118 +4637,99 @@ mod tests {
 
     #[test]
     fn wasix_socket_size_options_are_descriptor_local_state() {
-        let mut descriptor: TestSocketDescriptor =
-            WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-                family: WasixSocketFamily::Ipv4,
-                options: WasixSocketOptions::default(),
-            });
+        let descriptor: TestSocketDescriptor = UnixSocket::tcp(SocketFamily::Ipv4);
 
+        // The defaults a WASIX program reads back before setting anything.
         assert_eq!(
-            descriptor.options().receive_buffer_size,
-            DEFAULT_WASIX_SOCKET_BUFFER_BYTES
+            descriptor.options().size(SocketSize::ReceiveBuffer),
+            64 * 1024
+        );
+        assert_eq!(descriptor.options().size(SocketSize::SendBuffer), 64 * 1024);
+        assert_eq!(
+            wasix_socket_size(&descriptor, WASIX_SOCK_OPTION_RECV_LOWAT),
+            Ok(1)
         );
         assert_eq!(
-            descriptor.options().send_buffer_size,
-            DEFAULT_WASIX_SOCKET_BUFFER_BYTES
-        );
-        assert_eq!(
-            descriptor.options().size(WASIX_SOCK_OPTION_RECV_LOWAT),
-            Ok(DEFAULT_WASIX_SOCKET_LOW_WATER_BYTES)
-        );
-        assert_eq!(
-            descriptor.options().size(WASIX_SOCK_OPTION_TTL),
-            Ok(DEFAULT_WASIX_SOCKET_TTL)
+            wasix_socket_size(&descriptor, WASIX_SOCK_OPTION_TTL),
+            Ok(u64::from(helios_netstack::DEFAULT_HOP_LIMIT))
         );
 
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_size(WASIX_SOCK_OPTION_RECV_BUF_SIZE, 4096),
+            wasix_socket_set_size(&descriptor, WASIX_SOCK_OPTION_RECV_BUF_SIZE, 4096),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_size(WASIX_SOCK_OPTION_SEND_BUF_SIZE, 8192),
+            wasix_socket_set_size(&descriptor, WASIX_SOCK_OPTION_SEND_BUF_SIZE, 8192),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_size(WASIX_SOCK_OPTION_RECV_LOWAT, 2),
+            wasix_socket_set_size(&descriptor, WASIX_SOCK_OPTION_RECV_LOWAT, 2),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_size(WASIX_SOCK_OPTION_TTL, 128),
+            wasix_socket_set_size(&descriptor, WASIX_SOCK_OPTION_TTL, 128),
             p1::errno::SUCCESS
         );
 
-        assert_eq!(descriptor.options().receive_buffer_size, 4096);
-        assert_eq!(descriptor.options().send_buffer_size, 8192);
+        assert_eq!(descriptor.options().size(SocketSize::ReceiveBuffer), 4096);
+        assert_eq!(descriptor.options().size(SocketSize::SendBuffer), 8192);
         assert_eq!(
-            descriptor.options().size(WASIX_SOCK_OPTION_RECV_LOWAT),
+            wasix_socket_size(&descriptor, WASIX_SOCK_OPTION_RECV_LOWAT),
             Ok(2)
         );
-        assert_eq!(descriptor.options().size(WASIX_SOCK_OPTION_TTL), Ok(128));
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_size(WASIX_SOCK_OPTION_TYPE, WASIX_SOCK_TYPE_STREAM as u64),
+            wasix_socket_size(&descriptor, WASIX_SOCK_OPTION_TTL),
+            Ok(128)
+        );
+        assert_eq!(
+            wasix_socket_set_size(
+                &descriptor,
+                WASIX_SOCK_OPTION_TYPE,
+                WASIX_SOCK_TYPE_STREAM as u64
+            ),
             p1::errno::INVAL
         );
         assert_eq!(
-            descriptor.options().size(WASIX_SOCK_OPTION_RECV_TIMEOUT),
+            wasix_socket_size(&descriptor, WASIX_SOCK_OPTION_RECV_TIMEOUT),
             Err(p1::errno::INVAL)
         );
     }
 
     #[test]
     fn wasix_socket_flag_options_are_descriptor_local_state() {
-        let mut descriptor: TestSocketDescriptor =
-            WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
-                family: WasixSocketFamily::Ipv4,
-                options: WasixSocketOptions::default(),
-            });
+        let descriptor: TestSocketDescriptor = UnixSocket::udp(SocketFamily::Ipv4);
 
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_flag(WASIX_SOCK_OPTION_BROADCAST, true),
+            wasix_socket_set_flag(&descriptor, WASIX_SOCK_OPTION_BROADCAST, true),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_flag(WASIX_SOCK_OPTION_REUSE_ADDR, true),
+            wasix_socket_set_flag(&descriptor, WASIX_SOCK_OPTION_REUSE_ADDR, true),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor.options().flag(WASIX_SOCK_OPTION_BROADCAST),
+            wasix_socket_flag(&descriptor, WASIX_SOCK_OPTION_BROADCAST),
             Ok(true)
         );
         assert_eq!(
-            descriptor.options().flag(WASIX_SOCK_OPTION_REUSE_ADDR),
+            wasix_socket_flag(&descriptor, WASIX_SOCK_OPTION_REUSE_ADDR),
             Ok(true)
         );
         assert_eq!(
-            descriptor.options().flag(WASIX_SOCK_OPTION_KEEP_ALIVE),
+            wasix_socket_flag(&descriptor, WASIX_SOCK_OPTION_KEEP_ALIVE),
             Ok(false)
         );
 
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_flag(WASIX_SOCK_OPTION_BROADCAST, false),
+            wasix_socket_set_flag(&descriptor, WASIX_SOCK_OPTION_BROADCAST, false),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor.options().flag(WASIX_SOCK_OPTION_BROADCAST),
+            wasix_socket_flag(&descriptor, WASIX_SOCK_OPTION_BROADCAST),
             Ok(false)
         );
         assert_eq!(
-            descriptor.options().flag(WASIX_SOCK_OPTION_RECV_BUF_SIZE),
+            wasix_socket_flag(&descriptor, WASIX_SOCK_OPTION_RECV_BUF_SIZE),
             Err(p1::errno::INVAL)
         );
     }
@@ -4384,47 +4742,35 @@ mod tests {
     /// connections are being probed or coalesced when they are not.
     #[test]
     fn wasix_socket_rejects_flags_the_netstack_cannot_honour() {
-        let mut descriptor: TestSocketDescriptor =
-            WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-                family: WasixSocketFamily::Ipv4,
-                options: WasixSocketOptions::default(),
-            });
+        let descriptor: TestSocketDescriptor = UnixSocket::tcp(SocketFamily::Ipv4);
 
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_flag(WASIX_SOCK_OPTION_KEEP_ALIVE, true),
+            wasix_socket_set_flag(&descriptor, WASIX_SOCK_OPTION_KEEP_ALIVE, true),
             p1::errno::NOTSUP
         );
         assert_eq!(
-            descriptor.options().flag(WASIX_SOCK_OPTION_KEEP_ALIVE),
+            wasix_socket_flag(&descriptor, WASIX_SOCK_OPTION_KEEP_ALIVE),
             Ok(false)
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_flag(WASIX_SOCK_OPTION_KEEP_ALIVE, false),
+            wasix_socket_set_flag(&descriptor, WASIX_SOCK_OPTION_KEEP_ALIVE, false),
             p1::errno::SUCCESS
         );
 
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_flag(WASIX_SOCK_OPTION_NO_DELAY, true),
+            wasix_socket_set_flag(&descriptor, WASIX_SOCK_OPTION_NO_DELAY, true),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor.options().flag(WASIX_SOCK_OPTION_NO_DELAY),
+            wasix_socket_flag(&descriptor, WASIX_SOCK_OPTION_NO_DELAY),
             Ok(true)
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_flag(WASIX_SOCK_OPTION_NO_DELAY, false),
+            wasix_socket_set_flag(&descriptor, WASIX_SOCK_OPTION_NO_DELAY, false),
             p1::errno::NOTSUP
         );
         assert_eq!(
-            descriptor.options().flag(WASIX_SOCK_OPTION_NO_DELAY),
+            wasix_socket_flag(&descriptor, WASIX_SOCK_OPTION_NO_DELAY),
             Ok(true)
         );
     }
@@ -4433,49 +4779,39 @@ mod tests {
     /// a TTL outside the IP header's range is rejected instead of truncated.
     #[test]
     fn wasix_socket_size_options_clamp_to_netstack_capacity() {
-        let mut descriptor: TestSocketDescriptor =
-            WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-                family: WasixSocketFamily::Ipv4,
-                options: WasixSocketOptions::default(),
-            });
+        let descriptor: TestSocketDescriptor = UnixSocket::tcp(SocketFamily::Ipv4);
 
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_size(WASIX_SOCK_OPTION_RECV_BUF_SIZE, u64::MAX),
+            wasix_socket_set_size(&descriptor, WASIX_SOCK_OPTION_RECV_BUF_SIZE, u64::MAX),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor.options().receive_buffer_size,
-            WASIX_SOCKET_RECEIVE_BUFFER_CEILING
+            descriptor.options().size(SocketSize::ReceiveBuffer),
+            helios_netstack::TCP_RECEIVE_WINDOW_BYTES as u64
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_size(WASIX_SOCK_OPTION_SEND_BUF_SIZE, u64::MAX),
+            wasix_socket_set_size(&descriptor, WASIX_SOCK_OPTION_SEND_BUF_SIZE, u64::MAX),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor.options().send_buffer_size,
-            WASIX_SOCKET_SEND_BUFFER_CEILING
+            descriptor.options().size(SocketSize::SendBuffer),
+            helios_netstack::TCP_TRANSMIT_BUFFER_BYTES as u64
         );
 
         assert_eq!(
-            descriptor.options_mut().set_size(WASIX_SOCK_OPTION_TTL, 0),
+            wasix_socket_set_size(&descriptor, WASIX_SOCK_OPTION_TTL, 0),
             p1::errno::INVAL
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_size(WASIX_SOCK_OPTION_TTL, 256),
+            wasix_socket_set_size(&descriptor, WASIX_SOCK_OPTION_TTL, 256),
             p1::errno::INVAL
         );
         assert_eq!(
             descriptor.options().hop_limit(),
-            DEFAULT_WASIX_SOCKET_TTL as u8
+            helios_netstack::DEFAULT_HOP_LIMIT
         );
         assert_eq!(
-            descriptor.options_mut().set_size(WASIX_SOCK_OPTION_TTL, 9),
+            wasix_socket_set_size(&descriptor, WASIX_SOCK_OPTION_TTL, 9),
             p1::errno::SUCCESS
         );
         assert_eq!(descriptor.options().hop_limit(), 9);
@@ -4496,41 +4832,62 @@ mod tests {
     }
 
     #[test]
+    fn stdio_and_pipe_descriptors_report_character_device_filestat() {
+        let (writer, reader) = crate::byte_channel();
+        let descriptors: [TestDescriptor; 5] = [
+            Preview1Descriptor::Stdin {
+                carry: Bytes::new(),
+            },
+            Preview1Descriptor::Stdout,
+            Preview1Descriptor::Stderr,
+            Preview1Descriptor::PipeRead {
+                reader,
+                inode: helios_unix::PipeInode::default(),
+            },
+            Preview1Descriptor::PipeWrite {
+                writer,
+                inode: helios_unix::PipeInode::default(),
+            },
+        ];
+        for descriptor in &descriptors {
+            let (identity, stat) =
+                p1_synthetic_descriptor_stat(descriptor).expect("stdio/pipe must have filestat");
+            assert_eq!(identity.domain(), crate::AuthorityDomain::GUEST_DEVICES);
+            assert_ne!(identity.local(), 0);
+            assert_ne!(identity, p1_null_device_identity());
+            assert!(matches!(
+                stat.type_,
+                fs_types::DescriptorType::CharacterDevice
+            ));
+        }
+    }
+
+    #[test]
     fn wasix_socket_time_options_are_descriptor_local_state() {
-        let mut descriptor: TestSocketDescriptor =
-            WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-                family: WasixSocketFamily::Ipv4,
-                options: WasixSocketOptions::default(),
-            });
+        let descriptor: TestSocketDescriptor = UnixSocket::tcp(SocketFamily::Ipv4);
 
         assert_eq!(
-            descriptor.options().time(WASIX_SOCK_OPTION_RECV_TIMEOUT),
+            wasix_socket_time(&descriptor, WASIX_SOCK_OPTION_RECV_TIMEOUT),
             Ok(None)
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_time(WASIX_SOCK_OPTION_RECV_TIMEOUT, Some(1_000)),
+            wasix_socket_set_time(&descriptor, WASIX_SOCK_OPTION_RECV_TIMEOUT, Some(1_000)),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor.options().time(WASIX_SOCK_OPTION_RECV_TIMEOUT),
+            wasix_socket_time(&descriptor, WASIX_SOCK_OPTION_RECV_TIMEOUT),
             Ok(Some(1_000))
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_time(WASIX_SOCK_OPTION_LINGER, Some(2_000)),
+            wasix_socket_set_time(&descriptor, WASIX_SOCK_OPTION_LINGER, Some(2_000)),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor.options().time(WASIX_SOCK_OPTION_LINGER),
+            wasix_socket_time(&descriptor, WASIX_SOCK_OPTION_LINGER),
             Ok(Some(2_000))
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_time(WASIX_SOCK_OPTION_SEND_BUF_SIZE, None),
+            wasix_socket_set_time(&descriptor, WASIX_SOCK_OPTION_SEND_BUF_SIZE, None),
             p1::errno::INVAL
         );
     }
@@ -4541,10 +4898,11 @@ mod tests {
     /// guest reads `ENOENT`.
     #[test]
     fn wasix_exec_of_a_missing_program_file_is_not_found() {
-        let namespace = Namespace::<crate::UnsupportedStorage>::new(crate::MountTable::new(
-            crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
-            1,
-        ));
+        let namespace =
+            Namespace::<crate::test_support::UnsupportedStorage>::new(crate::MountTable::new(
+                crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
+                1,
+            ));
         let authority = ProcessAuthority::root();
 
         let error = futures_lite::future::block_on(read_program_source_from(

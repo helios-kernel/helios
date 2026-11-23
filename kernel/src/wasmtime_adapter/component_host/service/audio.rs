@@ -429,7 +429,7 @@ impl<T: 'static> StreamConsumer<T> for SampleStreamConsumer {
         mut source: Source<'_, Self::Item>,
         _finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
-        if source.remaining(&mut store) == 0 {
+        if source.remaining(&mut store)? == 0 {
             return Poll::Ready(Ok(StreamResult::Completed));
         }
         let mut cursor = match self.writer.poll_cursor(cx) {

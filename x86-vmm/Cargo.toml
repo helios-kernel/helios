@@ -1,0 +1,21 @@
+[package]
+name = "helios-x86-vmm"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+helios-hal.workspace = true
+# The backend that links this crate selects the kernel's runtime feature.
+helios-kernel.workspace = true
+spin = { version = "0.9.8", default-features = false, features = ["mutex", "spin_mutex"] }
+# Only the page-table structures: every instruction the address space
+# needs (`INVLPG`, the shootdown IPI, `CR3`) is the machine's.
+x86_64 = { version = "0.15.3", default-features = false }
+
+[dev-dependencies]
+# The kernel builds only with a runtime selected; the host tests take the
+# one its own unit tests run with.
+helios-kernel = { workspace = true, features = ["wasmtime-host", "embedded-debugger"] }
+
+[lints]
+workspace = true
