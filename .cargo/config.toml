@@ -29,5 +29,5 @@ rustflags = [
   # Justfile's `check-target` and `clippy-target`, the inspector's kernel
   # build). `aarch64/build.rs` refuses to compile the backend without this
   # flag.
-  "-Zbranch-protection=pac-ret+bti",
+  "-Zbranch-protection=bti,pac-ret",
 ]

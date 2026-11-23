@@ -1,7 +1,7 @@
 use std::env;
 
 /// The rustflag `.cargo/config.toml` sets for this target, as one argument.
-const BRANCH_PROTECTION_FLAG: &str = "-Zbranch-protection=pac-ret+bti";
+const BRANCH_PROTECTION_FLAG: &str = "-Zbranch-protection=bti,pac-ret";
 
 /// Cargo separates the arguments of `CARGO_ENCODED_RUSTFLAGS` with this byte
 /// (the Cargo book, "Environment variables Cargo sets for build scripts").

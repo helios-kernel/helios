@@ -1,7 +1,7 @@
 //! Return-address signing (Arm FEAT_PAuth, key A) and Branch Target
 //! Identification (Arm FEAT_BTI) on every processor.
 //!
-//! The image is compiled with `-Zbranch-protection=pac-ret+bti`
+//! The image is compiled with `-Zbranch-protection=bti,pac-ret`
 //! (`.cargo/config.toml`, checked by `build.rs`), so every function that saves
 //! `LR` signs it with `paciasp` and authenticates it with `autiasp`, and every
 //! indirect-branch target begins with a `bti` landing pad. All of those are
@@ -141,7 +141,7 @@ impl IdRegisters {
 
 /// The control-flow integrity capabilities of the bootstrap processor.
 ///
-/// An image compiled with `-Zbranch-protection=pac-ret+bti` and run without
+/// An image compiled with `-Zbranch-protection=bti,pac-ret` and run without
 /// address authentication would sign nothing, so the machine does not boot.
 /// `FEAT_BTI` is enabled wherever the processor implements it; on processors
 /// without it, the HINT-space `bti` instructions execute as no-ops and `GP`
