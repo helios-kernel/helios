@@ -91,7 +91,7 @@ where
         write_serial: crate::DebugSerialWriter,
         imported_memory: Option<SharedMemory>,
         filesystem: Option<Namespace<StorageImpl>>,
-        descriptors: Option<Preview1DescriptorTable<Net>>,
+        descriptors: DescriptorOrigin<Net>,
         signal_state: WasixSignalState,
         thread_signals: WasixSignalState,
         signal_dispositions: Vec<WasixSignalDisposition>,
@@ -104,9 +104,11 @@ where
             core::num::NonZeroU64::new(instance.id().raw()).expect("live instance ID is nonzero"),
         );
         let entropy = crate::EntropyPool::derive(runtime_state.root_entropy(), instance.id().raw());
-        let descriptors = SharedDescriptorTable::new(
-            descriptors.unwrap_or_else(|| Preview1DescriptorTable::from_authority(&authority)),
-        );
+        let descriptors = SharedDescriptorTable::new(process_descriptors(
+            descriptors,
+            &authority,
+            runtime_state.settings(),
+        ));
         let clock = crate::KernelClock::new(cpu.clone(), runtime_state.clone());
         let wall_clock_cap = authority.derive_set_wall_clock_cap().ok();
         let cwd = SharedCwd::new(preview1_cwd_from_authority(&authority));
@@ -1234,6 +1236,9 @@ where
     // the call that drives this store is polled, and signals and kills
     // reach the guest at its interrupt checks.
     store.interrupt_callback(|mut caller| caller.data_mut().on_interrupt());
+    // A program store has no OOM-kill route: a stack reserve the pool
+    // cannot back ends the program with its typed out-of-memory failure.
+    crate::wasmtime_adapter::store::install_stack_reserve(store, |_, _| {});
     let interrupts = store.data().interrupts.clone();
     let instance = store.data().instance().id();
     let registration = interrupts.register(instance, store, store.data().cpu.clone());

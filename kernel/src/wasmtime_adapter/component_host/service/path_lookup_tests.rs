@@ -52,7 +52,7 @@ fn test_program_store(
         crate::DebugSerialWriter::of::<test_store::DiscardPort>(),
         None,
         Some(runtime_state.root_namespace().descend()),
-        Some(descriptors),
+        DescriptorOrigin::SameProcess(descriptors),
         WasixSignalState::new(),
         WasixSignalState::new(),
         Vec::new(),
