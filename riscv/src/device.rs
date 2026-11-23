@@ -38,8 +38,9 @@ use helios_hal::iommu::{DmaTranslation, PhysicalRange};
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{AddressSpace, AddressSpaceError, PageFlags, VirtAddr, VirtRange};
 use helios_kernel::{
-    DEFAULT_DMA_BUDGET_BYTES, DeviceGrant, DeviceGrantRegistry, DeviceInterruptHooks,
-    DeviceInterruptRoute, DeviceName, DeviceVmHooks, DmaBudget, GrantError, GrantInterrupt,
+    DEFAULT_DMA_BUDGET_BYTES, DeviceDmaHooks, DeviceGrant, DeviceGrantRegistry,
+    DeviceInterruptHooks, DeviceInterruptRoute, DeviceName, DeviceVmHooks, DmaBudget, DmaBuffer,
+    GrantError, GrantInterrupt,
 };
 
 use crate::net::{InterruptDomains, PlicInterrupt};
@@ -105,7 +106,18 @@ fn unmask(raw: u32) {
     domain.set_source_enabled(source, true);
 }
 
+/// Device-tree MMIO grants on RISC-V currently sit outside an IOMMU
+/// and carry no generic bus-master disable bit the kernel can toggle
+/// without device-specific registers, so reclaimed DMA buffers stay
+/// quarantined until a replacement driver resets the hardware.
+fn quiesce_dma(_grant: &DeviceGrant, _buffers: &[DmaBuffer]) -> bool {
+    false
+}
+
 static INTERRUPT_HOOKS: DeviceInterruptHooks = DeviceInterruptHooks { mask, unmask };
+static DMA_HOOKS: DeviceDmaHooks = DeviceDmaHooks {
+    quiesce: quiesce_dma,
+};
 
 /// Install the backend's half of the device path.
 ///
@@ -115,6 +127,7 @@ static INTERRUPT_HOOKS: DeviceInterruptHooks = DeviceInterruptHooks { mask, unma
 pub(crate) fn install_hooks() {
     helios_kernel::install_device_vm_hooks(&VM_HOOKS);
     helios_kernel::install_device_interrupt_hooks(&INTERRUPT_HOOKS);
+    helios_kernel::install_device_dma_hooks(&DMA_HOOKS);
 }
 
 /// One device the kernel has no driver for.

@@ -29,8 +29,9 @@ use helios_hal::iommu::{DmaTranslation, PhysicalRange};
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{AddressSpace, AddressSpaceError, PageFlags, VirtAddr, VirtRange};
 use helios_kernel::{
-    DeviceGrant, DeviceInterruptHooks, DeviceName, DeviceVmHooks, DmaBudget, GrantError,
-    GrantInterrupt, install_device_interrupt_hooks, install_device_vm_hooks,
+    DeviceDmaHooks, DeviceGrant, DeviceInterruptHooks, DeviceName, DeviceVmHooks, DmaBudget,
+    DmaBuffer, GrantError, GrantInterrupt, install_device_dma_hooks,
+    install_device_interrupt_hooks, install_device_vm_hooks,
 };
 
 use crate::vmm::{HostedAddressSpace, host_mapping_granule, shared_backing_file};
@@ -145,6 +146,7 @@ struct HostedDevicePlatform {
     memory: HostedDeviceMemory,
     masked: AtomicU64,
     unmasked: AtomicU64,
+    quiesced: AtomicU64,
 }
 
 static PLATFORM: OnceLock<HostedDevicePlatform> = OnceLock::new();
@@ -155,6 +157,7 @@ fn platform() -> &'static HostedDevicePlatform {
         memory: HostedDeviceMemory::new(register_bytes()),
         masked: AtomicU64::new(0),
         unmasked: AtomicU64::new(0),
+        quiesced: AtomicU64::new(0),
     })
 }
 
@@ -249,7 +252,24 @@ static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {
     kernel_alias,
 };
 
+/// How many times a reclaimed lease asked the platform to quiesce DMA
+/// on the hosted device.
+#[cfg(test)]
+pub fn dma_quiesce_count() -> u64 {
+    platform().quiesced.load(Ordering::Relaxed)
+}
+
+fn quiesce_dma(_grant: &DeviceGrant, _buffers: &[DmaBuffer]) -> bool {
+    platform().quiesced.fetch_add(1, Ordering::Relaxed);
+    // The hosted device has no hardware bus master issuing asynchronous
+    // DMA into pinned runs, so reclaim can release its buffers at once.
+    true
+}
+
 static INTERRUPT_HOOKS: DeviceInterruptHooks = DeviceInterruptHooks { mask, unmask };
+static DMA_HOOKS: DeviceDmaHooks = DeviceDmaHooks {
+    quiesce: quiesce_dma,
+};
 
 /// Install the hosted machine's device surface and build the one grant
 /// it publishes.
@@ -261,6 +281,7 @@ static INTERRUPT_HOOKS: DeviceInterruptHooks = DeviceInterruptHooks { mask, unma
 pub fn hosted_device_grants() -> Result<[DeviceGrant; 1], GrantError> {
     install_device_vm_hooks(&VM_HOOKS);
     install_device_interrupt_hooks(&INTERRUPT_HOOKS);
+    install_device_dma_hooks(&DMA_HOOKS);
     let platform = platform();
     let grant = DeviceGrant::new(
         DeviceName::new(HOSTED_DEVICE_NAME)?,
