@@ -115,7 +115,7 @@ impl SignalHarness {
             crate::DebugSerialWriter::of::<test_store::DiscardPort>(),
             Some(memory.clone()),
             None,
-            None,
+            DescriptorOrigin::Fresh,
             signal_state,
             threads.main_mailbox(),
             dispositions,

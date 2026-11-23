@@ -75,6 +75,8 @@ mod boot_init_tests;
 mod child_exit_tests;
 
 use super::*;
+use crate::DescriptorLimitSetting;
+use crate::Settings;
 use crate::isa::GuestIsa;
 use crate::wasmtime_adapter::artifact_profile::{self, ArtifactProfileError};
 use crate::wasmtime_adapter::code_map::{CodeMap, CodeRegistration};
@@ -257,9 +259,9 @@ pub(super) struct ProgramLaunch<Net: ComponentHostNetwork, StorageImpl: crate::S
     /// program the kernel launches, which runs in a tree descending from
     /// the root namespace.
     filesystem: Option<Namespace<StorageImpl>>,
-    /// Inherited preview1 descriptors. Only core modules have a
-    /// descriptor table; a component ignores one.
-    descriptors: Option<Preview1DescriptorTable<Net>>,
+    /// Where the process's preview1 descriptors come from. Only core
+    /// modules have a descriptor table; a component ignores one.
+    descriptors: DescriptorOrigin<Net>,
     signal_dispositions: Vec<WasixSignalDisposition>,
     /// Explicit Linux container for launches started through a container
     /// handle. Direct Linux ELF launches wrap themselves in an ephemeral
@@ -288,7 +290,7 @@ impl<Net: ComponentHostNetwork, StorageImpl: crate::Storage> ProgramLaunch<Net, 
             env: LaunchEnvironment::from_guest(env),
             authority,
             filesystem,
-            descriptors: None,
+            descriptors: DescriptorOrigin::Fresh,
             signal_dispositions: Vec::new(),
             #[cfg(feature = "linux")]
             container: None,
@@ -309,7 +311,7 @@ impl<Net: ComponentHostNetwork, StorageImpl: crate::Storage> ProgramLaunch<Net, 
             env: LaunchEnvironment::from_guest(env),
             authority,
             filesystem: None,
-            descriptors: None,
+            descriptors: DescriptorOrigin::Fresh,
             signal_dispositions: Vec::new(),
             container: Some(LinuxContainerLaunch {
                 container,
@@ -442,7 +444,7 @@ struct ProgramSpawnRequest<Net: ComponentHostNetwork, StorageImpl: crate::Storag
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<Namespace<StorageImpl>>,
-    descriptors: Option<Preview1DescriptorTable<Net>>,
+    descriptors: DescriptorOrigin<Net>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
     #[cfg(feature = "linux")]
@@ -1886,7 +1888,7 @@ where
             )
             .await?;
         if matches!(executable, ProgramExecutable::Component(_)) {
-            launch.descriptors = None;
+            launch.descriptors = DescriptorOrigin::Fresh;
         }
         self.spawn_loaded_with_output_mode(exec_context, executable, launch, output_mode, stdio)
     }
@@ -3834,6 +3836,89 @@ mod tests {
         assert_eq!(table.dup(0), Ok(1));
     }
 
+    /// A process created after the operator changes the descriptor-limit
+    /// setting takes the new value; a running process keeps the limit it
+    /// was created with, and so does a process that only changes its image.
+    #[test]
+    fn a_process_created_after_a_change_takes_the_new_limit_and_a_running_one_keeps_its_own() {
+        let machine = test_store::store_data_authorized(ProcessAuthority::empty(), |_| {});
+        let settings = machine.runtime_state.settings();
+        let mut operator = ProcessAuthority::empty();
+        operator.grant_settings_rights(crate::SettingsAuthorityRights::WRITE);
+        let proof = operator
+            .derive_write_settings_cap()
+            .expect("an authority granted the right derives its proof");
+        let authority = ProcessAuthority::empty();
+
+        // 1. A process created before the change has the default.
+        let mut running: TestDescriptorTable =
+            process_descriptors(DescriptorOrigin::Fresh, &authority, settings);
+        assert_eq!(running.limit, DescriptorLimit::DEFAULT);
+
+        // 2. The operator lowers the setting and is told what it was.
+        assert_eq!(
+            settings.set::<DescriptorLimitSetting>(&proof, DescriptorLimit::new(64)),
+            DescriptorLimit::DEFAULT
+        );
+
+        // 3. A process created after it takes the new value.
+        let mut created: TestDescriptorTable =
+            process_descriptors(DescriptorOrigin::Fresh, &authority, settings);
+        assert_eq!(created.limit, DescriptorLimit::new(64));
+
+        // 4. The running process still hands out numbers up to its own.
+        assert_eq!(
+            running.insert_entry_at(
+                100,
+                Preview1DescriptorEntry::new(Preview1Descriptor::NullDevice, false),
+            ),
+            Ok(100)
+        );
+
+        // 5. The new process refuses a number at its limit.
+        assert_eq!(
+            created.insert_entry_at(
+                64,
+                Preview1DescriptorEntry::new(Preview1Descriptor::NullDevice, false),
+            ),
+            Err(p1::errno::BADF)
+        );
+
+        // 6. Its lowest-free allocation runs out at the limit.
+        for expected in 3..64 {
+            assert_eq!(created.insert(Preview1Descriptor::NullDevice), Ok(expected));
+        }
+        assert_eq!(
+            created.insert(Preview1Descriptor::NullDevice),
+            Err(p1::errno::MFILE)
+        );
+
+        // 7. An exec is the same process: it keeps the limit it has.
+        let exec = process_descriptors(
+            DescriptorOrigin::SameProcess(running.clone_for_exec()),
+            &authority,
+            settings,
+        );
+        assert_eq!(exec.limit, DescriptorLimit::DEFAULT);
+
+        // 8. A fork or spawn child is a new process: it takes the setting,
+        // and the descriptors it inherits at or past the limit stay open.
+        let mut child = process_descriptors(
+            DescriptorOrigin::NewProcess(running.clone()),
+            &authority,
+            settings,
+        );
+        assert_eq!(child.limit, DescriptorLimit::new(64));
+        assert!(child.get(100).is_some());
+        assert_eq!(
+            child.insert_entry_at(
+                65,
+                Preview1DescriptorEntry::new(Preview1Descriptor::NullDevice, false),
+            ),
+            Err(p1::errno::BADF)
+        );
+    }
+
     #[test]
     fn fd_close_can_close_stdio_slots() {
         let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
@@ -4065,6 +4150,7 @@ mod tests {
             crate::DeviceClassRights::DISPLAY | crate::DeviceClassRights::AUDIO,
         );
         parent.grant_diagnostic_rights(crate::DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        parent.grant_settings_rights(crate::SettingsAuthorityRights::WRITE);
         parent.grant_machine_rights(crate::MachineAuthorityRights::CONTROL_PROCESSORS);
 
         let child = wasix_proc_spawn_inherited_non_directory_authority(&parent);
@@ -4091,6 +4177,10 @@ mod tests {
         assert_eq!(
             child.diagnostic_rights(),
             crate::DiagnosticAuthorityRights::OBSERVE_MACHINE
+        );
+        assert_eq!(
+            child.settings_rights(),
+            crate::SettingsAuthorityRights::WRITE
         );
         assert_eq!(
             child.machine_rights(),
