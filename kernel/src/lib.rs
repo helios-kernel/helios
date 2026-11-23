@@ -130,9 +130,11 @@ pub use exec::{
     online_processor_count, parse_console_text, wait_timelines, wall_clock_offset_nanos, yield_now,
 };
 pub use gpu::{
-    ContextRecord, ContextShared, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
-    Gpu3dSession, MAX_EXECUTE_BYTES, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_VIEWS,
-    MAX_MACHINE_GPU_BLOBS, MAX_MACHINE_GPU_CONTEXTS, RingTimeline, SessionId, install_gpu3d_device,
+    BlobCreate, BlobHold, BlobMapping, CompletionSignal, Gpu3dOwnership, Gpu3dService,
+    Gpu3dServiceError, GpuBlob, GpuClient, GpuContext, GpuFenceReader, GpuImage, GpuSession,
+    InlineCommands, MAX_EXECUTE_BYTES, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_VIEWS,
+    MAX_MACHINE_GPU_BLOBS, MAX_MACHINE_GPU_CONTEXTS, SessionId, SubmitCommands, SubmitCompletion,
+    install_gpu3d_device,
 };
 pub use helios_hal::Platform;
 pub use helios_netstack::{

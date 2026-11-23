@@ -101,13 +101,12 @@ pub const MAX_EXECUTE_BYTES: usize = 256;
 pub use image::GpuImage;
 pub use instance::Gpu3dOwnership;
 pub use owner::install_gpu3d_device;
+#[cfg(test)]
+pub(crate) use service::BlobShared;
 pub use service::{
-    BlobHold, BlobShared, ContextRecord, ContextShared, Gpu3dSender, Gpu3dService, Gpu3dSession,
-    RingTimeline, SessionId,
-};
-pub(crate) use service::{
-    BlobSpec, CompletionSignal, Gpu3dRequest, InlineCommands, SubmitCommands, SubmitCompletion,
-    SubmitRequest,
+    BlobCreate, BlobHold, BlobMapping, CompletionSignal, Gpu3dService, GpuBlob, GpuClient,
+    GpuContext, GpuFenceReader, GpuSession, InlineCommands, SessionId, SubmitCommands,
+    SubmitCompletion,
 };
 
 /// Why a 3D request was refused.

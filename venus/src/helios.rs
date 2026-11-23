@@ -25,7 +25,7 @@ mod bindings {
         path: "../wit",
         world: "venus-host",
         generate_all,
-        async: false,
+        sync: true,
         // Resource methods come from the SDK; only suspension-capable imports
         // need this Vulkan ABI's synchronous lowering.
         skip: [

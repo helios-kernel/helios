@@ -124,14 +124,21 @@ impl SharedTimeline {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), TimelineError>> {
         let notified = self.shared.progress.poll_wake(cx, waiter).is_ready();
-        let reached = self.shared.progress.sequence() >= value;
         if self.shared.failed.load(Ordering::Acquire) {
             return Poll::Ready(Err(TimelineError::Failed));
         }
-        if reached {
+        if self.shared.progress.sequence() >= value {
             return Poll::Ready(Ok(()));
         }
         if self.shared.producers.load(Ordering::Acquire) == 0 {
+            // Observing the last producer's AcqRel drop establishes
+            // happens-before with every final `signal` or `fail`.
+            if self.shared.failed.load(Ordering::Acquire) {
+                return Poll::Ready(Err(TimelineError::Failed));
+            }
+            if self.shared.progress.sequence() >= value {
+                return Poll::Ready(Ok(()));
+            }
             return Poll::Ready(Err(TimelineError::Closed));
         }
         // Consuming a broadcast rearms its generation but removes its
@@ -331,5 +338,30 @@ mod tests {
             });
         });
         assert_eq!(source.reader().value(), Ok(300));
+    }
+
+    #[test]
+    fn signaling_then_dropping_the_last_producer_never_reports_closed() {
+        for _ in 0..20_000 {
+            let source = TimelineSource::new(0);
+            let timeline = source.reader();
+            let wakes = StdArc::new(Wakes::default());
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    source.signal(1).unwrap();
+                    drop(source);
+                });
+                let mut wait = pin!(timeline.wait(1));
+                loop {
+                    match poll(wait.as_mut(), &wakes) {
+                        Poll::Ready(result) => {
+                            assert_eq!(result, Ok(()));
+                            break;
+                        }
+                        Poll::Pending => core::hint::spin_loop(),
+                    }
+                }
+            });
+        }
     }
 }
