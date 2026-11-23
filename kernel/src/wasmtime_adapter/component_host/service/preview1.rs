@@ -6678,11 +6678,11 @@ mod tests {
     }
 
     /// A gathered write copies guest memory in chunks no larger than
-    /// [`P1_IO_CHUNK_BYTES`], in iovec order, across overlapping and empty
+    /// [`GUEST_IO_CHUNK_BYTES`], in iovec order, across overlapping and empty
     /// iovecs, and hands the sink every byte once.
     #[test]
     fn gathered_writes_move_in_bounded_chunks() {
-        let guest: Vec<u8> = (0..3 * P1_IO_CHUNK_BYTES)
+        let guest: Vec<u8> = (0..3 * GUEST_IO_CHUNK_BYTES)
             .map(|index| index as u8)
             .collect();
         let table = iovec_table(&[(0, 150_000), (7, 0), (50_000, 40_000)]);
@@ -6710,7 +6710,11 @@ mod tests {
         .expect("every chunk is taken");
         assert_eq!(sent as usize, expected.len());
         assert!(chunks.len() > 1);
-        assert!(chunks.iter().all(|chunk| chunk.len() <= P1_IO_CHUNK_BYTES));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.len() <= GUEST_IO_CHUNK_BYTES)
+        );
         assert_eq!(chunks.concat(), expected);
     }
 
@@ -6719,8 +6723,8 @@ mod tests {
     /// went is the error.
     #[test]
     fn a_refusal_after_some_chunks_reports_what_went() {
-        let guest = vec![1_u8; 3 * P1_IO_CHUNK_BYTES];
-        let table = iovec_table(&[(0, (3 * P1_IO_CHUNK_BYTES) as u32)]);
+        let guest = vec![1_u8; 3 * GUEST_IO_CHUNK_BYTES];
+        let table = iovec_table(&[(0, (3 * GUEST_IO_CHUNK_BYTES) as u32)]);
         let mut memory = guest.clone();
         memory[..table.len()].copy_from_slice(&table);
         let memory = async_memory_of(&memory);
@@ -6741,7 +6745,7 @@ mod tests {
                 Err(p1::errno::AGAIN)
             })
         }));
-        assert_eq!(sent, Ok(P1_IO_CHUNK_BYTES as u32));
+        assert_eq!(sent, Ok(GUEST_IO_CHUNK_BYTES as u32));
 
         let mut gather = Preview1Gather::new(&memory, &layout).expect("fits");
         let sent = run(p1_send_gathered(&memory, &mut gather, |_| {
@@ -6827,7 +6831,7 @@ mod tests {
     /// carries is `EMSGSIZE` with nothing taken.
     #[test]
     fn a_datagram_is_gathered_whole_or_refused() {
-        let max = P1_IO_CHUNK_BYTES + 7;
+        let max = GUEST_IO_CHUNK_BYTES + 7;
         let mut guest: Vec<u8> = (0..max + 1).map(|index| index as u8).collect();
         let table = guest.len() as u32;
         guest.extend(iovec_table(&[(0, 9), (9, max as u32 - 9), (max as u32, 1)]));
@@ -6928,7 +6932,7 @@ mod tests {
     /// are still there afterwards.
     #[test]
     fn a_chunked_append_never_lands_on_another_writers_bytes() {
-        let len = 2 * P1_IO_CHUNK_BYTES + 10;
+        let len = 2 * GUEST_IO_CHUNK_BYTES + 10;
         let (guest, layout) = one_iovec(len);
         let memory = async_memory_of(&guest);
         let mut gather = Preview1Gather::new(&memory, &layout).expect("buffers fit");
@@ -6943,9 +6947,9 @@ mod tests {
         .expect("the guest's pages are present");
         let expected: Vec<u8> = b"head"
             .iter()
-            .chain(&guest[..P1_IO_CHUNK_BYTES])
+            .chain(&guest[..GUEST_IO_CHUNK_BYTES])
             .chain(b"other")
-            .chain(&guest[P1_IO_CHUNK_BYTES..len])
+            .chain(&guest[GUEST_IO_CHUNK_BYTES..len])
             .copied()
             .collect();
         assert_eq!(landed, Ok((expected.len() as u64, len as u32)));
@@ -6957,7 +6961,7 @@ mod tests {
     /// it was given.
     #[test]
     fn a_chunked_positioned_write_continues_where_the_last_chunk_ended() {
-        let len = 2 * P1_IO_CHUNK_BYTES + 10;
+        let len = 2 * GUEST_IO_CHUNK_BYTES + 10;
         let (guest, layout) = one_iovec(len);
         let memory = async_memory_of(&guest);
         let mut gather = Preview1Gather::new(&memory, &layout).expect("buffers fit");
@@ -6974,8 +6978,8 @@ mod tests {
             file.positions,
             [
                 WritePosition::At(3),
-                WritePosition::At(3 + P1_IO_CHUNK_BYTES as u64),
-                WritePosition::At(3 + 2 * P1_IO_CHUNK_BYTES as u64),
+                WritePosition::At(3 + GUEST_IO_CHUNK_BYTES as u64),
+                WritePosition::At(3 + 2 * GUEST_IO_CHUNK_BYTES as u64),
             ]
         );
         assert_eq!(file.bytes[..3], [0xEE; 3]);
@@ -6987,7 +6991,7 @@ mod tests {
     /// chunk is the error, and an empty write reaches the file once.
     #[test]
     fn a_refused_file_chunk_is_a_short_write() {
-        let (guest, layout) = one_iovec(3 * P1_IO_CHUNK_BYTES);
+        let (guest, layout) = one_iovec(3 * GUEST_IO_CHUNK_BYTES);
         let memory = async_memory_of(&guest);
         let write = |accepts: usize| {
             let mut gather = Preview1Gather::new(&memory, &layout).expect("buffers fit");
@@ -7001,7 +7005,7 @@ mod tests {
             .expect("the guest's pages are present");
             (landed, file.positions.len())
         };
-        let two = 2 * P1_IO_CHUNK_BYTES;
+        let two = 2 * GUEST_IO_CHUNK_BYTES;
         assert_eq!(write(2), (Ok((two as u64, two as u32)), 3));
         assert_eq!(write(0), (Err(p1::errno::IO), 1));
 
@@ -7024,11 +7028,11 @@ mod tests {
     /// guest is told how many bytes landed, and no later chunk is tried.
     #[test]
     fn a_chunk_stored_in_part_ends_the_write_after_the_prefix() {
-        let (guest, layout) = one_iovec(3 * P1_IO_CHUNK_BYTES);
+        let (guest, layout) = one_iovec(3 * GUEST_IO_CHUNK_BYTES);
         let memory = async_memory_of(&guest);
         let mut gather = Preview1Gather::new(&memory, &layout).expect("buffers fit");
         let mut file = ChunkedFile::new(b"", usize::MAX);
-        let prefix = P1_IO_CHUNK_BYTES + 5;
+        let prefix = GUEST_IO_CHUNK_BYTES + 5;
         file.room = prefix;
         let landed = run(p1_write_gathered(
             &memory,
