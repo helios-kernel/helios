@@ -52,7 +52,7 @@ pub use entropy::{
 };
 pub use fiber_stack::{
     AllocationTagHooks, FIBER_STACK_GUARD_BYTES, FiberStack, FiberStackArenaStats, FiberStackError,
-    FiberStackVmHooks, StackFault, claim_fiber_stack, fiber_stack_arena_stats,
+    FiberStackVmHooks, InterruptedContext, StackFault, claim_fiber_stack, fiber_stack_arena_stats,
     fiber_stack_demand_commits_on, install_fiber_stack_arena, install_fiber_stack_hooks,
     resolve_stack_fault,
 };
