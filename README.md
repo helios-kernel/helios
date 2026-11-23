@@ -1,3 +1,5 @@
+<p align="center"><img src="logo.svg" alt="Helios" width="160"></p>
+
 # Helios
 
 An experimental Rust kernel that runs user programs as WebAssembly components.
