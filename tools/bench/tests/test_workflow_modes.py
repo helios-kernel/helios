@@ -118,18 +118,18 @@ def git(repo: Path, *arguments: str) -> str:
 
 @pytest.fixture
 def history(tmp_path: Path) -> tuple[Path, str, str]:
-    """A repository with a `dev` the candidate branched from: the merge
+    """A repository with a `main` the candidate branched from: the merge
     base and its short SHA are what the columns step has to resolve."""
     repo = tmp_path / "repo"
     repo.mkdir()
-    git(repo, "init", "-q", "-b", "dev")
+    git(repo, "init", "-q", "-b", "main")
     git(repo, "config", "user.email", "bench@helios.test")
     git(repo, "config", "user.name", "bench")
     (repo / "a").write_text("base\n")
     git(repo, "add", "a")
     git(repo, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "base")
     base = git(repo, "rev-parse", "HEAD")
-    git(repo, "update-ref", "refs/remotes/origin/dev", base)
+    git(repo, "update-ref", "refs/remotes/origin/main", base)
     git(repo, "checkout", "-q", "-b", "topic")
     (repo / "a").write_text("topic\n")
     git(repo, "-c", "commit.gpgsign=false", "commit", "-q", "-am", "topic")
@@ -230,17 +230,17 @@ def test_profile_columns_resolve_the_pairing_ref_to_its_commit(
 
 def test_dispatch_can_pair_a_merge_against_its_first_parent(jobs, history, tmp_path: Path):
     """#773: run 43091069072 timed a pull request's merge commit against
-    the tip `dev` had when the pull request was opened, 21 merges behind
+    the tip `main` had when the pull request was opened, 21 merges behind
     the one it was built on. The baseline is the merge commit's first
     parent — neither that stale tip nor the merge base — and the suite
     job reads the commit the collections were given."""
     repo, base, head = history
-    git(repo, "checkout", "-q", "dev")
-    (repo / "b").write_text("dev moved\n")
+    git(repo, "checkout", "-q", "main")
+    (repo / "b").write_text("main moved\n")
     git(repo, "add", "b")
-    git(repo, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "dev moved")
+    git(repo, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "main moved")
     merged_against = git(repo, "rev-parse", "HEAD")
-    git(repo, "update-ref", "refs/remotes/origin/dev", merged_against)
+    git(repo, "update-ref", "refs/remotes/origin/main", merged_against)
     git(repo, "-c", "commit.gpgsign=false", "merge", "-q", "--no-ff", "-m", "merge", head)
     merge = git(repo, "rev-parse", "HEAD")
 
@@ -788,7 +788,7 @@ PULL_REQUEST_ACTIONS = ["opened", "synchronize", "reopened", "ready_for_review"]
         ("pull_request", "labeled", False),
         ("pull_request", "ready_for_review", False),
         # The suite's push and dispatch supersede their predecessors; the
-        # CI workflow's `dev` push runs to completion.
+        # CI workflow's `main` push runs to completion.
         ("push", "", None),
         ("workflow_dispatch", "", None),
     ],
@@ -836,3 +836,48 @@ def test_release_signs_the_boot_payload_with_the_secret_key_and_removes_it_last(
     upload = steps[attach]["run"]
     assert "bootfs-path" in upload
     assert "assets/helios-bootfs-x86-64 \\" in upload
+
+
+@pytest.mark.parametrize(
+    ("pulls_json", "expected"),
+    [
+        ("[]", "false"),
+        ('[{"merged_at": "2026-11-22T00:00:00Z", "head": {"ref": "feat/something"}}]', "false"),
+        ('[{"merged_at": null, "head": {"ref": "release-plz-2026-11-22T00-00-00Z"}}]', "false"),
+        (
+            '[{"merged_at": "2026-11-22T00:00:00Z", "head": {"ref": "release-plz-2026-11-22T00-00-00Z"}}]',
+            "true",
+        ),
+    ],
+)
+def test_release_classify_distinguishes_regular_merges_from_release_prs(
+    tmp_path: Path, pulls_json: str, expected: str
+):
+    workflow = yaml.load((REPO_ROOT / ".github/workflows/release.yml").read_text(), Loader=yaml.BaseLoader)
+    jobs = workflow["jobs"]
+    assert jobs["release"]["if"] == "needs.classify.outputs.is_release_pr == 'true'"
+    assert jobs["release-pr"]["if"] == "needs.classify.outputs.is_release_pr == 'false'"
+    assert jobs["kernel-release-tag"]["needs"] == "release"
+    assert jobs["release"]["steps"][-1]["with"]["command"] == "release"
+    assert jobs["release-pr"]["steps"][2]["with"]["command"] == "release-pr"
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "gh").write_text(f"#!/bin/sh\nprintf '%s\\n' '{pulls_json}'\n")
+    (bin_dir / "gh").chmod(0o755)
+    output = tmp_path / "outputs"
+    script = jobs["classify"]["steps"][0]["run"]
+    subprocess.run(
+        ["bash", "-eu", "-c", script],
+        check=True,
+        env=os.environ
+        | {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "GITHUB_REPOSITORY": "lexoliu/helios",
+            "HEAD_SHA": "a" * 40,
+            "GITHUB_OUTPUT": str(output),
+        },
+    )
+    outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert outputs["head_sha"] == "a" * 40
+    assert outputs["is_release_pr"] == expected

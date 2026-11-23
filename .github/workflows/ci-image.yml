@@ -3,7 +3,7 @@ name: CI Image
 on:
   push:
     branches:
-      - dev
+      - main
     paths:
       - '.github/ci-image/**'
       - '.github/workflows/ci-image.yml'
@@ -15,7 +15,7 @@ permissions:
 
 concurrency:
   group: ci-image-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/dev' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   build:

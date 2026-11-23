@@ -580,12 +580,12 @@ failed run. Release-triggered benchmarks also remain enabled.
 A pull request runs only non-heavy lanes whose surfaces its change touches
 (`.github/ci-lanes.json`), and a draft runs `lint-fmt` alone until it is
 marked ready for review. Compile, lint and test lanes keep a Rust cache,
-written only by a `dev` push. Other shared caches are written only from
+written only by a `main` push. Other shared caches are written only from
 the default branch. Guest wasm is built once per profile and reused by
 every test and smoke lane that runs a kernel prebuild. A consumer compiles
 its tests while the wasm builds and runs them once its profile is ready.
 The CI result job requires every selected lane to succeed. Every job run by
-a pull request or dev push has a 15-minute timeout. A pull request's run
+a pull request or `main` push has a 15-minute timeout. A pull request's run
 finishes within 15 minutes. Linux compatibility is measured by gVisor's
 syscall suite, in a lane that runs only when a change touches the Linux
 subsystem.
@@ -603,24 +603,26 @@ the gate for §3.2's `async fn` rule.
 `dep-check.yml` runs on a schedule and on demand. `kernel-profile.yml`
 collects the x86-64 kernel profile every release build spends, nightly and
 on demand (`docs/pgo.md`); `bench-suite.yml`'s `profile-generate` job
-calls it. `release.yml` runs `release-plz` on every push to `main`: it
-owns version numbers, the changelog and tags, so commits follow the
-conventional format (`feat:`, `fix:`, `feat!:`, `BREAKING CHANGE:`) and
+calls it. `release.yml` runs `release-plz` after `CI` succeeds on `main`:
+regular merges open or update the release pull request, and merging a
+release pull request cuts tags, changelogs and releases, so commits follow
+the conventional format (`feat:`, `fix:`, `feat!:`, `BREAKING CHANGE:`) and
 nobody edits a version or a changelog by hand.
 
 ## 8. Branches, pull requests, evidence
 
-- Nobody pushes to `dev` or `main`. Work lives on a topic branch and lands
-  through a pull request against `dev`. `main` is the release trigger, and
-  merging into it is a maintainer decision.
+- `main` is the only long-lived branch. Nobody pushes to `main`. Work lives
+  on a topic branch and lands through a pull request against `main`;
+  merging a `release-plz` pull request cuts the release and is a maintainer
+  decision.
 - A problem becomes an issue before it becomes a branch; one issue, one
   branch, one PR, with `Fixes #N` on its own line in the body. A PR that
   advances an issue without closing it says `Part of #N`.
-- Commits on `dev` are signed; the branch ruleset rejects unsigned ones.
+- Commits on `main` are signed; the branch ruleset rejects unsigned ones.
   Commit messages and PR bodies carry no attribution trailers, generated-by
   footers, or session identifiers.
 - A PR merges when every check it can affect is green. A red lane that is
-  already red on `dev` and untouched by the PR is named in the PR body with
+  already red on `main` and untouched by the PR is named in the PR body with
   the issue that tracks it (filed by the PR if none exists yet) and does not
   block. Evidence in the PR body is concrete:
   the run id, the lane, the median, the negotiated feature line, the log
@@ -634,7 +636,7 @@ Several agents and developers work on this tree at once. The rules that keep
 them from colliding:
 
 - One checkout per task. A delegated agent works in its own git worktree
-  branched from `origin/dev`, with a cloned `target/` for a warm cache, and
+  branched from `origin/main`, with a cloned `target/` for a warm cache, and
   never edits, cleans, or builds inside another worktree or another project.
   Nothing outside the worktree is modified for any reason: not another
   project's `target/`, not a tool's cache under the home directory, not a
