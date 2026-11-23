@@ -6,15 +6,18 @@
 /// this crate is the one both ends already share.
 pub const VSOCK_RPC_PORT: u32 = 1024;
 
+#[cfg(feature = "system")]
 pub mod debugger;
 pub mod error;
-mod wire;
-
+pub mod mux;
+#[cfg(feature = "system")]
 pub mod system;
-#[cfg(feature = "host")]
 pub mod transport;
+pub mod wire;
 
+#[cfg(feature = "system")]
 pub use error::DispatchError;
+#[cfg(feature = "system")]
 pub use error::RpcError;
-#[cfg(feature = "host")]
 pub use error::TransportError;
+pub use error::WireError;
