@@ -441,13 +441,14 @@ pub async fn write_with<F, S>(
     position: WritePosition,
     len: usize,
     now: u64,
+    payer: &F::Payer,
     mut source: S,
 ) -> FsResult<Landed>
 where
     F: FileSystem,
     S: FnMut(usize, &mut [u8]),
 {
-    let mut write = fs.prepare_write(path, position, len, now).await?;
+    let mut write = fs.prepare_write(path, position, len, now, payer).await?;
     loop {
         match write.fill(&mut source).submit().await? {
             WriteProgress::More(next) => write = next,
@@ -465,13 +466,16 @@ pub async fn write_handle_with<F, S>(
     position: WritePosition,
     len: usize,
     now: u64,
+    payer: &F::Payer,
     mut source: S,
 ) -> FsResult<Landed>
 where
     F: FileSystem,
     S: FnMut(usize, &mut [u8]),
 {
-    let mut write = fs.prepare_write_handle(handle, position, len, now).await?;
+    let mut write = fs
+        .prepare_write_handle(handle, position, len, now, payer)
+        .await?;
     loop {
         match write.fill(&mut source).submit().await? {
             WriteProgress::More(next) => write = next,
@@ -618,9 +622,21 @@ impl OwnedFsPath {
 /// Mutating operations take `now`, the caller's wall-clock time in
 /// nanoseconds since the Unix epoch, which a filesystem without a clock of
 /// its own stamps on what it changes; one that keeps its own time (a host
-/// share) ignores it. Symbolic links are never followed here: `stat`
-/// describes the link itself, and resolving a link is the caller's job.
+/// share) ignores it. They also take the [`FileSystem::Payer`] of the
+/// requester, so no mutation reaches a filesystem without naming who pays
+/// for the storage it commits. Symbolic links are never followed here:
+/// `stat` describes the link itself, and resolving a link is the caller's
+/// job.
 pub trait FileSystem: Clone + Send + Sync + 'static {
+    /// Who pays for storage a mutation commits. A filesystem whose
+    /// storage is not this machine's memory (a host share or block disk)
+    /// ignores it.
+    ///
+    /// Every mutating operation takes one, because every one of them can
+    /// create an object on a layered filesystem (a copy-up), and the
+    /// object's creator is who the storage is attributed to.
+    type Payer: Send + Sync;
+
     /// An open reference to a filesystem object, keeping unlinked or unnamed
     /// files alive until the final clone is dropped.
     type OpenHandle: Clone + Send + Sync + 'static;
@@ -643,6 +659,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         path: FsPath<'a>,
         flags: OpenFlags,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<Opened<Self::OpenHandle>>> + Send + 'a;
 
     /// Creates and opens an unnamed temporary regular file within the
@@ -654,6 +671,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         _directory: FsPath<'a>,
         _exclusive: bool,
         _now: u64,
+        _payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<Opened<Self::OpenHandle>>> + Send + 'a {
         core::future::ready(Err(FsError::Unsupported))
     }
@@ -692,6 +710,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         position: WritePosition,
         len: usize,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<Self::Write>> + Send + 'a;
 
     /// Stages a write of `len` bytes at `position` on the open object `handle`.
@@ -701,6 +720,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         position: WritePosition,
         len: usize,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<Self::Write>> + Send + 'a;
 
     /// Truncates or zero-extends a regular file to `size` bytes.
@@ -709,6 +729,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         path: FsPath<'a>,
         size: u64,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Truncates or zero-extends the open regular file `handle` to `size` bytes.
@@ -717,6 +738,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         handle: &'a Self::OpenHandle,
         size: u64,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Sets the access and modification times; `None` leaves one as it is.
@@ -726,6 +748,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         access_nanos: Option<u64>,
         modified_nanos: Option<u64>,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Sets the access and modification times of the open object `handle`.
@@ -735,6 +758,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         access_nanos: Option<u64>,
         modified_nanos: Option<u64>,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// The directory stream [`Self::open_dir`] opens.
@@ -759,6 +783,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         &'a self,
         path: FsPath<'a>,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Removes an empty directory.
@@ -766,6 +791,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         &'a self,
         path: FsPath<'a>,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Removes a non-directory name.
@@ -773,6 +799,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         &'a self,
         path: FsPath<'a>,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Moves `source` to `destination` within this filesystem, treating a
@@ -789,6 +816,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         destination: FsPath<'a>,
         mode: RenameMode,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Gives the non-directory at `existing` the further name `link`.
@@ -797,6 +825,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         existing: FsPath<'a>,
         link: FsPath<'a>,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Gives the open non-directory `handle` the name `link` (including
@@ -806,6 +835,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         handle: &'a Self::OpenHandle,
         link: FsPath<'a>,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Creates a symbolic link at `link` whose target text is `target`.
@@ -814,6 +844,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         target: &'a str,
         link: FsPath<'a>,
         now: u64,
+        payer: &'a Self::Payer,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// The target text of the symbolic link at `path`.

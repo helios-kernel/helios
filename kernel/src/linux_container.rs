@@ -454,7 +454,12 @@ impl<'a, S: Storage> ContainerResolved<'a, S> {
     /// Strips `S_ISUID`/`S_ISGID` (without `CAP_FSETID`) and
     /// `security.capability` on writes and truncates of regular files on a
     /// private mount (`fs/inode.c` `file_remove_privs`, Linux v6.12).
-    async fn strip_privs_on_write(&self, creds: &Credentials, now: u64) -> Result<(), FsOpError> {
+    async fn strip_privs_on_write(
+        &self,
+        creds: &Credentials,
+        now: u64,
+        payer: &crate::StoragePayer,
+    ) -> Result<(), FsOpError> {
         if !self.is_private() {
             return Ok(());
         }
@@ -464,7 +469,7 @@ impl<'a, S: Storage> ContainerResolved<'a, S> {
         }
         if let Some(new_mode) = permissions::stripped_mode_on_write(creds, meta) {
             self.fs()
-                .set_permissions(self.fs_path(), new_mode, now)
+                .set_permissions(self.fs_path(), new_mode, now, payer)
                 .await
                 .map_err(unix_to_op)?;
         }
@@ -955,6 +960,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         request: OpenRequest,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(ContainerNodeInfo, String, Option<MountHold>), FsOpError> {
         let follow_final = !(request.nofollow || (request.create && request.exclusive));
         let (resolved, trailing_slash) = self
@@ -1035,13 +1041,16 @@ impl<S: Storage> ContainerFilesystem<S> {
                     }
                     resolved.check_permission(creds, want).await?;
                     if request.truncate {
-                        resolved.strip_privs_on_write(creds, now).await?;
+                        resolved.strip_privs_on_write(creds, now, payer).await?;
                     }
                     let mut flags = OpenFlags::empty();
                     if request.truncate {
                         flags |= OpenFlags::TRUNCATE;
                     }
-                    resolved.fs().open(resolved.fs_path(), flags, now).await?;
+                    resolved
+                        .fs()
+                        .open(resolved.fs_path(), flags, now, payer)
+                        .await?;
                 }
             }
             Err(FsError::NoEntry) => {
@@ -1081,11 +1090,14 @@ impl<S: Storage> ContainerFilesystem<S> {
                     };
                     resolved
                         .fs()
-                        .open_unix(resolved.fs_path(), flags, attrs, now)
+                        .open_unix(resolved.fs_path(), flags, attrs, now, payer)
                         .await
                         .map_err(unix_to_op)?;
                 } else {
-                    resolved.fs().open(resolved.fs_path(), flags, now).await?;
+                    resolved
+                        .fs()
+                        .open(resolved.fs_path(), flags, now, payer)
+                        .await?;
                     resolved.fs().apply_created_permissions(
                         resolved.fs_path(),
                         (request.mode & 0o777) & !request.umask,
@@ -1129,6 +1141,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         bytes: &[u8],
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<Landed, FsOpError> {
         let resolved = self.resolve(container_path)?;
         resolved.require_write()?;
@@ -1138,13 +1151,14 @@ impl<S: Storage> ContainerFilesystem<S> {
             position,
             bytes.len(),
             now,
+            payer,
             |at, destination| {
                 destination.copy_from_slice(&bytes[at..at + destination.len()]);
             },
         )
         .await?;
         if landed.len > 0 {
-            resolved.strip_privs_on_write(creds, now).await?;
+            resolved.strip_privs_on_write(creds, now, payer).await?;
         }
         Ok(landed)
     }
@@ -1156,13 +1170,14 @@ impl<S: Storage> ContainerFilesystem<S> {
         size: u64,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         let resolved = self.resolve(container_path)?;
         resolved.require_write()?;
-        resolved.strip_privs_on_write(creds, now).await?;
+        resolved.strip_privs_on_write(creds, now, payer).await?;
         Ok(resolved
             .fs()
-            .set_size(resolved.fs_path(), size, now)
+            .set_size(resolved.fs_path(), size, now, payer)
             .await?)
     }
 
@@ -1174,16 +1189,17 @@ impl<S: Storage> ContainerFilesystem<S> {
         size: u64,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         let (resolved, _) = self.walk_path_for(base_dir, raw_path, true, creds).await?;
         resolved.require_write()?;
         resolved
             .check_permission(creds, permissions::MAY_WRITE)
             .await?;
-        resolved.strip_privs_on_write(creds, now).await?;
+        resolved.strip_privs_on_write(creds, now, payer).await?;
         Ok(resolved
             .fs()
-            .set_size(resolved.fs_path(), size, now)
+            .set_size(resolved.fs_path(), size, now, payer)
             .await?)
     }
 
@@ -1198,6 +1214,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         modified: TimeUpdate,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         let (resolved, _) = self
             .walk_path_for(base_dir, raw_path, follow_final, creds)
@@ -1219,6 +1236,7 @@ impl<S: Storage> ContainerFilesystem<S> {
                 resolve_time_update(access, now),
                 resolve_time_update(modified, now),
                 now,
+                payer,
             )
             .await?)
     }
@@ -1231,6 +1249,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         modified: TimeUpdate,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         let resolved = self.resolve(container_path)?;
         if access == TimeUpdate::Omit && modified == TimeUpdate::Omit {
@@ -1249,6 +1268,7 @@ impl<S: Storage> ContainerFilesystem<S> {
                 resolve_time_update(access, now),
                 resolve_time_update(modified, now),
                 now,
+                payer,
             )
             .await?)
     }
@@ -1288,6 +1308,7 @@ impl<S: Storage> ContainerFilesystem<S> {
     }
 
     /// Creates a directory at `raw_path` relative to `base_dir`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn mkdir_at(
         &self,
         base_dir: &str,
@@ -1296,6 +1317,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         umask: u32,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         if matches!(last_raw_component(raw_path), None | Some(".") | Some("..")) {
             return Err(FsError::Exists.into());
@@ -1317,13 +1339,13 @@ impl<S: Storage> ContainerFilesystem<S> {
             };
             resolved
                 .fs()
-                .create_directory_unix(resolved.fs_path(), attrs, now)
+                .create_directory_unix(resolved.fs_path(), attrs, now, payer)
                 .await
                 .map_err(unix_to_op)?;
         } else {
             resolved
                 .fs()
-                .create_directory(resolved.fs_path(), now)
+                .create_directory(resolved.fs_path(), now, payer)
                 .await?;
             resolved.fs().apply_created_permissions(
                 resolved.fs_path(),
@@ -1346,6 +1368,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         rdev: u64,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         if matches!(last_raw_component(raw_path), None | Some(".") | Some("..")) {
             return Err(FsError::Exists.into());
@@ -1384,6 +1407,7 @@ impl<S: Storage> ContainerFilesystem<S> {
                             OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
                             attrs,
                             now,
+                            payer,
                         )
                         .await
                         .map_err(unix_to_op)?;
@@ -1394,6 +1418,7 @@ impl<S: Storage> ContainerFilesystem<S> {
                             resolved.fs_path(),
                             OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
                             now,
+                            payer,
                         )
                         .await?;
                     resolved.fs().apply_created_permissions(
@@ -1447,6 +1472,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         remove_dir: bool,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         match last_raw_component(raw_path) {
             None => {
@@ -1495,7 +1521,7 @@ impl<S: Storage> ContainerFilesystem<S> {
             }
             Ok(resolved
                 .fs()
-                .remove_directory(resolved.fs_path(), now)
+                .remove_directory(resolved.fs_path(), now, payer)
                 .await?)
         } else {
             resolved.require_mutate_dir()?;
@@ -1514,7 +1540,7 @@ impl<S: Storage> ContainerFilesystem<S> {
                 let child_meta = resolved.inode_meta().await?;
                 permissions::check_sticky(creds, parent_meta, child_meta.uid)?;
             }
-            Ok(resolved.fs().unlink(resolved.fs_path(), now).await?)
+            Ok(resolved.fs().unlink(resolved.fs_path(), now, payer).await?)
         }
     }
 
@@ -1530,6 +1556,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         mode: RenameMode,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         if matches!(last_raw_component(old_raw), None | Some(".") | Some(".."))
             || matches!(last_raw_component(new_raw), None | Some(".") | Some(".."))
@@ -1603,7 +1630,13 @@ impl<S: Storage> ContainerFilesystem<S> {
         }
         Ok(old_resolved
             .fs()
-            .rename(old_resolved.fs_path(), new_resolved.fs_path(), mode, now)
+            .rename(
+                old_resolved.fs_path(),
+                new_resolved.fs_path(),
+                mode,
+                now,
+                payer,
+            )
             .await?)
     }
 
@@ -1620,6 +1653,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         empty_old: bool,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         if matches!(last_raw_component(new_raw), None | Some(".") | Some("..")) {
             return Err(FsError::Exists.into());
@@ -1657,7 +1691,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         }
         Ok(old_resolved
             .fs()
-            .link(old_resolved.fs_path(), new_resolved.fs_path(), now)
+            .link(old_resolved.fs_path(), new_resolved.fs_path(), now, payer)
             .await?)
     }
 
@@ -1670,6 +1704,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         raw_path: &str,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         if target.is_empty() {
             return Err(FsError::NoEntry.into());
@@ -1701,13 +1736,13 @@ impl<S: Storage> ContainerFilesystem<S> {
             };
             resolved
                 .fs()
-                .symlink_unix(target, resolved.fs_path(), attrs, now)
+                .symlink_unix(target, resolved.fs_path(), attrs, now, payer)
                 .await
                 .map_err(unix_to_op)
         } else {
             Ok(resolved
                 .fs()
-                .symlink(target, resolved.fs_path(), now)
+                .symlink(target, resolved.fs_path(), now, payer)
                 .await?)
         }
     }
@@ -1724,6 +1759,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         mode: u32,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         let resolved = if raw_path.is_empty() {
             self.resolve(base_dir)?
@@ -1732,7 +1768,7 @@ impl<S: Storage> ContainerFilesystem<S> {
                 .await?
                 .0
         };
-        self.apply_chmod(&resolved, mode, creds, now).await
+        self.apply_chmod(&resolved, mode, creds, now, payer).await
     }
 
     /// Changes permission bits on an already-resolved container path (`fchmod`).
@@ -1742,9 +1778,10 @@ impl<S: Storage> ContainerFilesystem<S> {
         mode: u32,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         let resolved = self.resolve(container_path)?;
-        self.apply_chmod(&resolved, mode, creds, now).await
+        self.apply_chmod(&resolved, mode, creds, now, payer).await
     }
 
     async fn apply_chmod(
@@ -1753,6 +1790,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         mode: u32,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         resolved.require_write()?;
         if !resolved.is_private() {
@@ -1769,7 +1807,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         let effective = permissions::check_chmod(creds, meta, mode)?;
         resolved
             .fs()
-            .set_permissions(resolved.fs_path(), effective, now)
+            .set_permissions(resolved.fs_path(), effective, now, payer)
             .await
             .map_err(unix_to_op)
     }
@@ -1787,6 +1825,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         gid: Option<u32>,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         let resolved = if raw_path.is_empty() {
             self.resolve(base_dir)?
@@ -1795,7 +1834,8 @@ impl<S: Storage> ContainerFilesystem<S> {
                 .await?
                 .0
         };
-        self.apply_chown(&resolved, uid, gid, creds, now).await
+        self.apply_chown(&resolved, uid, gid, creds, now, payer)
+            .await
     }
 
     /// Changes owner/group on an already-resolved container path (`fchown`).
@@ -1806,9 +1846,11 @@ impl<S: Storage> ContainerFilesystem<S> {
         gid: Option<u32>,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         let resolved = self.resolve(container_path)?;
-        self.apply_chown(&resolved, uid, gid, creds, now).await
+        self.apply_chown(&resolved, uid, gid, creds, now, payer)
+            .await
     }
 
     async fn apply_chown(
@@ -1818,6 +1860,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         gid: Option<u32>,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         resolved.require_write()?;
         if !resolved.is_private() {
@@ -1836,7 +1879,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         if plan.uid.is_some() || plan.gid.is_some() {
             resolved
                 .fs()
-                .set_owner(resolved.fs_path(), plan.uid, plan.gid, now)
+                .set_owner(resolved.fs_path(), plan.uid, plan.gid, now, payer)
                 .await
                 .map_err(unix_to_op)?;
         }
@@ -1904,15 +1947,17 @@ impl<S: Storage> ContainerFilesystem<S> {
         mode: LinuxXattrSetMode,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         let (resolved, _) = self
             .walk_path_for(base_dir, raw_path, follow_final, creds)
             .await?;
-        self.set_xattr_inner(&resolved, name, value, mode, creds, now)
+        self.set_xattr_inner(&resolved, name, value, mode, creds, now, payer)
             .await
     }
 
     /// Sets extended attribute `name` on an already-resolved container path.
+    #[allow(clippy::too_many_arguments)]
     pub async fn set_xattr_resolved(
         &self,
         container_path: &str,
@@ -1921,12 +1966,14 @@ impl<S: Storage> ContainerFilesystem<S> {
         mode: LinuxXattrSetMode,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         let resolved = self.resolve(container_path)?;
-        self.set_xattr_inner(&resolved, name, value, mode, creds, now)
+        self.set_xattr_inner(&resolved, name, value, mode, creds, now, payer)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn set_xattr_inner(
         &self,
         resolved: &ContainerResolved<'_, S>,
@@ -1935,6 +1982,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         mode: LinuxXattrSetMode,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         resolved.require_write()?;
         if !resolved.is_private() {
@@ -1955,6 +2003,7 @@ impl<S: Storage> ContainerFilesystem<S> {
                 Bytes::copy_from_slice(value),
                 to_vfs_xattr_mode(mode),
                 now,
+                payer,
             )
             .await
             .map_err(unix_to_op)?;
@@ -1973,6 +2022,7 @@ impl<S: Storage> ContainerFilesystem<S> {
                         resolved.fs_path(),
                         refreshed.mode & !permissions::S_ISGID,
                         now,
+                        payer,
                     )
                     .await
                     .map_err(unix_to_op)?;
@@ -2765,7 +2815,12 @@ mod tests {
     async fn create_file(fs: &MemoryFs, path: &str, data: &[u8]) {
         let path = FsPath::new(path).unwrap();
         let _ = fs
-            .open(path, helios_hal::fs::OpenFlags::CREATE, 0)
+            .open(
+                path,
+                helios_hal::fs::OpenFlags::CREATE,
+                0,
+                &crate::StoragePayer::for_test(),
+            )
             .await
             .unwrap();
         write_bytes(fs, path, helios_hal::fs::WritePosition::At(0), data, 0)
@@ -3250,6 +3305,7 @@ mod tests {
         let fs = container.filesystem();
 
         let root = Credentials::root();
+        let payer = crate::StoragePayer::for_test();
         block_on(async {
             // Component walker catches missing and non-directory intermediate components.
             assert!(matches!(
@@ -3266,8 +3322,10 @@ mod tests {
             ));
 
             // Intermediate symlink expands before `..`, and symlink loop returns `Loop`.
-            fs.mkdir_at("/", "sub", 0o755, 0, &root, 1).await.unwrap();
-            fs.symlink_at("sub", "/", "sym_sub", &root, 1)
+            fs.mkdir_at("/", "sub", 0o755, 0, &root, 1, &payer)
+                .await
+                .unwrap();
+            fs.symlink_at("sub", "/", "sym_sub", &root, 1, &payer)
                 .await
                 .unwrap();
             let (_, resolved) = fs
@@ -3294,16 +3352,16 @@ mod tests {
                 umask: 0,
             };
             let (_, sym_path, _) = fs
-                .open_at("/", "sym_sub", path_nofollow, &root, 1)
+                .open_at("/", "sym_sub", path_nofollow, &root, 1, &payer)
                 .await
                 .unwrap();
             assert_eq!(sym_path, "/sym_sub");
             assert_eq!(fs.read_link_resolved(&sym_path).await.unwrap(), "sub");
 
-            fs.symlink_at("loop_b", "/", "loop_a", &root, 1)
+            fs.symlink_at("loop_b", "/", "loop_a", &root, 1, &payer)
                 .await
                 .unwrap();
-            fs.symlink_at("loop_a", "/", "loop_b", &root, 1)
+            fs.symlink_at("loop_a", "/", "loop_b", &root, 1, &payer)
                 .await
                 .unwrap();
             assert!(matches!(
@@ -3312,7 +3370,7 @@ mod tests {
             ));
 
             // Dangling symlink with O_CREAT | O_EXCL fails with Exists.
-            fs.symlink_at("missing_target", "/", "dangling", &root, 1)
+            fs.symlink_at("missing_target", "/", "dangling", &root, 1, &payer)
                 .await
                 .unwrap();
             let excl = OpenRequest {
@@ -3331,7 +3389,7 @@ mod tests {
                 umask: 0,
             };
             assert!(matches!(
-                fs.open_at("/", "dangling", excl, &root, 1).await,
+                fs.open_at("/", "dangling", excl, &root, 1, &payer).await,
                 Err(FsOpError::Fs(FsError::Exists))
             ));
 
@@ -3344,23 +3402,35 @@ mod tests {
                     "/ro/moved",
                     RenameMode::Replace,
                     &root,
-                    1
+                    1,
+                    &payer
                 )
                 .await,
                 Err(FsOpError::Fs(FsError::CrossDevice))
             ));
             assert!(matches!(
-                fs.link_at("/", "alpha", "/", "/ro/linked", false, false, &root, 1)
-                    .await,
+                fs.link_at(
+                    "/",
+                    "alpha",
+                    "/",
+                    "/ro/linked",
+                    false,
+                    false,
+                    &root,
+                    1,
+                    &payer
+                )
+                .await,
                 Err(FsOpError::Fs(FsError::CrossDevice))
             ));
             assert!(matches!(
-                fs.write_at("/ro/fixed", WritePosition::At(0), b"x", &root, 1)
+                fs.write_at("/ro/fixed", WritePosition::At(0), b"x", &root, 1, &payer)
                     .await,
                 Err(FsOpError::Fs(FsError::ReadOnly))
             ));
             assert!(matches!(
-                fs.unlink_at("/", "/ro/fixed", false, &root, 1).await,
+                fs.unlink_at("/", "/ro/fixed", false, &root, 1, &payer)
+                    .await,
                 Err(FsOpError::Fs(FsError::ReadOnly))
             ));
         });
@@ -3764,7 +3834,14 @@ mod private_btrfs_tests {
             let (info, container_path, _) = self
                 .container
                 .filesystem()
-                .open_at(base_dir, path, request, creds, self.now)
+                .open_at(
+                    base_dir,
+                    path,
+                    request,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await?;
             let access = match (request.read, request.write) {
                 (true, true) => FileAccess::ReadWrite,
@@ -3846,7 +3923,14 @@ mod private_btrfs_tests {
         ) -> Result<Landed, FsOpError> {
             self.container
                 .filesystem()
-                .write_at(&file.path, position, bytes, creds, self.now)
+                .write_at(
+                    &file.path,
+                    position,
+                    bytes,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await
         }
         async fn list_dir(
@@ -3879,7 +3963,13 @@ mod private_btrfs_tests {
         ) -> Result<(), FsOpError> {
             self.container
                 .filesystem()
-                .set_size(&file.path, size, creds, self.now)
+                .set_size(
+                    &file.path,
+                    size,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await
         }
         async fn set_size_path(
@@ -3891,7 +3981,14 @@ mod private_btrfs_tests {
         ) -> Result<(), FsOpError> {
             self.container
                 .filesystem()
-                .set_size_at(cwd, path, size, creds, self.now)
+                .set_size_at(
+                    cwd,
+                    path,
+                    size,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await
         }
         async fn sync(&self, file: &TestFile, data_only: bool) -> Result<(), FsOpError> {
@@ -3925,7 +4022,15 @@ mod private_btrfs_tests {
             let base_dir = base.map_or(cwd, |f| f.path.as_str());
             self.container
                 .filesystem()
-                .mkdir_at(base_dir, path, mode, umask, creds, self.now)
+                .mkdir_at(
+                    base_dir,
+                    path,
+                    mode,
+                    umask,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await
         }
         async fn mknod(
@@ -3942,7 +4047,17 @@ mod private_btrfs_tests {
             let base_dir = base.map_or(cwd, |f| f.path.as_str());
             self.container
                 .filesystem()
-                .mknod_at(base_dir, path, kind, mode, umask, rdev, creds, self.now)
+                .mknod_at(
+                    base_dir,
+                    path,
+                    kind,
+                    mode,
+                    umask,
+                    rdev,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await
         }
         async fn unlink(
@@ -3956,7 +4071,14 @@ mod private_btrfs_tests {
             let base_dir = base.map_or(cwd, |f| f.path.as_str());
             self.container
                 .filesystem()
-                .unlink_at(base_dir, path, remove_dir, creds, self.now)
+                .unlink_at(
+                    base_dir,
+                    path,
+                    remove_dir,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await
         }
         async fn rename(
@@ -3973,7 +4095,16 @@ mod private_btrfs_tests {
             let new_dir = new_base.map_or(cwd, |f| f.path.as_str());
             self.container
                 .filesystem()
-                .rename_at(old_dir, old_path, new_dir, new_path, mode, creds, self.now)
+                .rename_at(
+                    old_dir,
+                    old_path,
+                    new_dir,
+                    new_path,
+                    mode,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await
         }
         async fn link(
@@ -3999,6 +4130,7 @@ mod private_btrfs_tests {
                     options.empty_path,
                     creds,
                     self.now,
+                    &crate::StoragePayer::for_test(),
                 )
                 .await
         }
@@ -4013,7 +4145,14 @@ mod private_btrfs_tests {
             let base_dir = base.map_or(cwd, |f| f.path.as_str());
             self.container
                 .filesystem()
-                .symlink_at(target, base_dir, link_path, creds, self.now)
+                .symlink_at(
+                    target,
+                    base_dir,
+                    link_path,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await
         }
         async fn set_times_path(
@@ -4029,7 +4168,16 @@ mod private_btrfs_tests {
             let base_dir = base.map_or(cwd, |f| f.path.as_str());
             self.container
                 .filesystem()
-                .set_times_at(base_dir, path, follow, access, modified, creds, self.now)
+                .set_times_at(
+                    base_dir,
+                    path,
+                    follow,
+                    access,
+                    modified,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await
         }
         async fn set_times_file(
@@ -4041,7 +4189,14 @@ mod private_btrfs_tests {
         ) -> Result<(), FsOpError> {
             self.container
                 .filesystem()
-                .set_times_resolved(&file.path, access, modified, creds, self.now)
+                .set_times_resolved(
+                    &file.path,
+                    access,
+                    modified,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await
         }
         async fn chmod_path(
@@ -4056,7 +4211,15 @@ mod private_btrfs_tests {
             let base_dir = base.map_or(cwd, |f| f.path.as_str());
             self.container
                 .filesystem()
-                .chmod_at(base_dir, path, follow, mode, creds, self.now)
+                .chmod_at(
+                    base_dir,
+                    path,
+                    follow,
+                    mode,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await
         }
         async fn chmod_file(
@@ -4067,7 +4230,13 @@ mod private_btrfs_tests {
         ) -> Result<(), FsOpError> {
             self.container
                 .filesystem()
-                .chmod_resolved(&file.path, mode, creds, self.now)
+                .chmod_resolved(
+                    &file.path,
+                    mode,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await
         }
         async fn chown_path(
@@ -4083,7 +4252,16 @@ mod private_btrfs_tests {
             let base_dir = base.map_or(cwd, |f| f.path.as_str());
             self.container
                 .filesystem()
-                .chown_at(base_dir, path, follow, uid, gid, creds, self.now)
+                .chown_at(
+                    base_dir,
+                    path,
+                    follow,
+                    uid,
+                    gid,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await
         }
         async fn chown_file(
@@ -4095,7 +4273,14 @@ mod private_btrfs_tests {
         ) -> Result<(), FsOpError> {
             self.container
                 .filesystem()
-                .chown_resolved(&file.path, uid, gid, creds, self.now)
+                .chown_resolved(
+                    &file.path,
+                    uid,
+                    gid,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await
         }
         async fn get_xattr_path(
@@ -4134,7 +4319,17 @@ mod private_btrfs_tests {
         ) -> Result<(), FsOpError> {
             self.container
                 .filesystem()
-                .set_xattr_at(cwd, path, follow, name, value, mode, creds, self.now)
+                .set_xattr_at(
+                    cwd,
+                    path,
+                    follow,
+                    name,
+                    value,
+                    mode,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await
         }
         async fn set_xattr_file(
@@ -4147,7 +4342,15 @@ mod private_btrfs_tests {
         ) -> Result<(), FsOpError> {
             self.container
                 .filesystem()
-                .set_xattr_resolved(&file.path, name, value, mode, creds, self.now)
+                .set_xattr_resolved(
+                    &file.path,
+                    name,
+                    value,
+                    mode,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await
         }
         async fn list_xattrs_path(

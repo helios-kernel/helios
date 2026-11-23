@@ -728,6 +728,7 @@ impl ChargedPages {
 #[derive(Debug, Error)]
 pub(super) enum PageCaptureError {
     /// The range is not inside the guest's memory.
+    #[cfg(test)]
     #[error("the captured range lies outside guest memory: {0}")]
     OutOfBounds(ProgramExecError),
     /// The user pool refused the frames. Nothing is held: what the
@@ -806,6 +807,7 @@ fn capture_sparse_slice(
 ///
 /// The frames are reserved first, so a shortfall answers with nothing
 /// copied and nothing held.
+#[cfg(test)]
 pub(super) fn capture_window(
     pool: &'static UserMemoryPool,
     instance: &crate::RegisteredInstance,
@@ -828,6 +830,7 @@ pub(super) fn capture_window(
 /// the frames held are those of the non-zero pages and their index, and a
 /// shortfall at any page drops what was taken so far and answers with
 /// nothing held. The length is the memory's, so holes read back as zeros.
+#[cfg(test)]
 pub(super) fn capture_memory_sparse(
     pool: &'static UserMemoryPool,
     instance: &crate::RegisteredInstance,
@@ -841,6 +844,7 @@ pub(super) fn capture_memory_sparse(
 
 /// Writes `pages` into guest memory at `ptr`, page runs straight from the
 /// frames into the destination: no intermediate buffer holds them.
+#[cfg(test)]
 pub(super) fn restore_pages(
     pages: &PagedBytes,
     memory: Preview1Memory,

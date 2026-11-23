@@ -1155,11 +1155,12 @@ where
     ) -> Result<FsDescriptor, syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         let opened = self
             .shared
             .container
             .filesystem()
-            .open_at(base_dir, path, request, creds, now)
+            .open_at(base_dir, path, request, creds, now, &payer)
             .await;
         let (info, container_path, mount_hold) = match opened {
             Ok(ok) => ok,
@@ -1356,10 +1357,11 @@ where
         creds: &syscall::Credentials,
     ) -> Result<Landed, syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
-            .write_at(&file.path, position, bytes, creds, now)
+            .write_at(&file.path, position, bytes, creds, now, &payer)
             .await
     }
 
@@ -1391,10 +1393,11 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
-            .set_size(&file.path, size, creds, now)
+            .set_size(&file.path, size, creds, now, &payer)
             .await
     }
 
@@ -1406,10 +1409,11 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
-            .set_size_at(cwd, path, size, creds, now)
+            .set_size_at(cwd, path, size, creds, now, &payer)
             .await
     }
 
@@ -1461,10 +1465,11 @@ where
     ) -> Result<(), syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
-            .mkdir_at(base_dir, path, mode, umask, creds, now)
+            .mkdir_at(base_dir, path, mode, umask, creds, now, &payer)
             .await
     }
 
@@ -1481,10 +1486,11 @@ where
     ) -> Result<(), syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
-            .mknod_at(base_dir, path, kind, mode, umask, rdev, creds, now)
+            .mknod_at(base_dir, path, kind, mode, umask, rdev, creds, now, &payer)
             .await
     }
 
@@ -1498,10 +1504,11 @@ where
     ) -> Result<(), syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
-            .unlink_at(base_dir, path, remove_dir, creds, now)
+            .unlink_at(base_dir, path, remove_dir, creds, now, &payer)
             .await
     }
 
@@ -1518,10 +1525,13 @@ where
         let old_dir = old_base.map_or(cwd, |f| f.path.as_str());
         let new_dir = new_base.map_or(cwd, |f| f.path.as_str());
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
-            .rename_at(old_dir, old_path, new_dir, new_path, mode, creds, now)
+            .rename_at(
+                old_dir, old_path, new_dir, new_path, mode, creds, now, &payer,
+            )
             .await
     }
 
@@ -1541,6 +1551,7 @@ where
         let old_dir = old_base.map_or(cwd, |f| f.path.as_str());
         let new_dir = new_base.map_or(cwd, |f| f.path.as_str());
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
@@ -1553,6 +1564,7 @@ where
                 options.empty_path,
                 creds,
                 now,
+                &payer,
             )
             .await
     }
@@ -1570,10 +1582,11 @@ where
         }
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
-            .symlink_at(target, base_dir, link_path, creds, now)
+            .symlink_at(target, base_dir, link_path, creds, now, &payer)
             .await
     }
 
@@ -1589,10 +1602,11 @@ where
     ) -> Result<(), syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
-            .set_times_at(base_dir, path, follow, access, modified, creds, now)
+            .set_times_at(base_dir, path, follow, access, modified, creds, now, &payer)
             .await
     }
 
@@ -1604,10 +1618,11 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
-            .set_times_resolved(&file.path, access, modified, creds, now)
+            .set_times_resolved(&file.path, access, modified, creds, now, &payer)
             .await
     }
 
@@ -1622,10 +1637,11 @@ where
     ) -> Result<(), syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
-            .chmod_at(base_dir, path, follow, mode, creds, now)
+            .chmod_at(base_dir, path, follow, mode, creds, now, &payer)
             .await
     }
 
@@ -1636,10 +1652,11 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
-            .chmod_resolved(&file.path, mode, creds, now)
+            .chmod_resolved(&file.path, mode, creds, now, &payer)
             .await
     }
 
@@ -1655,10 +1672,11 @@ where
     ) -> Result<(), syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
-            .chown_at(base_dir, path, follow, uid, gid, creds, now)
+            .chown_at(base_dir, path, follow, uid, gid, creds, now, &payer)
             .await
     }
 
@@ -1670,10 +1688,11 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
-            .chown_resolved(&file.path, uid, gid, creds, now)
+            .chown_resolved(&file.path, uid, gid, creds, now, &payer)
             .await
     }
 
@@ -1716,10 +1735,11 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
-            .set_xattr_at(cwd, path, follow, name, value, mode, creds, now)
+            .set_xattr_at(cwd, path, follow, name, value, mode, creds, now, &payer)
             .await
     }
 
@@ -1732,10 +1752,11 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
-            .set_xattr_resolved(&file.path, name, value, mode, creds, now)
+            .set_xattr_resolved(&file.path, name, value, mode, creds, now, &payer)
             .await
     }
 

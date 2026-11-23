@@ -207,6 +207,7 @@ impl MemoryFs {
         unix: UnixAttributes,
         contents: Bytes,
         original: &Metadata,
+        _payer: Option<&crate::StoragePayer>,
     ) -> FsResult<()> {
         let mut state = self.state.lock();
         if state.inode_of(path).is_ok() {
@@ -473,6 +474,7 @@ impl MemoryFs {
         flags: OpenFlags,
         attributes: Attributes,
         now: u64,
+        _payer: &crate::StoragePayer,
     ) -> Result<Opened<OwnedFsPath>, UnixFsError> {
         let mut state = self.state.lock();
         let metadata = match state.metadata(self.device, path) {
@@ -1162,6 +1164,7 @@ pub struct MemoryWrite {
     position: WritePosition,
     len: usize,
     now: u64,
+    payer: crate::StoragePayer,
 }
 
 impl MemoryWrite {
@@ -1173,6 +1176,7 @@ impl MemoryWrite {
         position: WritePosition,
         len: usize,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> FsResult<Self> {
         fs.state.lock().inode(path)?.1.kind.require_regular()?;
         Ok(Self {
@@ -1181,6 +1185,7 @@ impl MemoryWrite {
             position,
             len,
             now,
+            payer: payer.clone(),
         })
     }
 
@@ -1193,6 +1198,7 @@ impl MemoryWrite {
             self.position,
             self.len,
             self.now,
+            &self.payer,
             |destination| fill(0, destination),
         )
     }
@@ -1223,6 +1229,7 @@ impl MemoryFs {
         position: WritePosition,
         len: usize,
         now: u64,
+        _payer: &crate::StoragePayer,
         fill: impl FnOnce(&mut [u8]),
     ) -> FsResult<Landed> {
         let mut landed = 0;
@@ -1293,6 +1300,7 @@ impl MemoryFs {
 }
 
 impl FileSystem for MemoryFs {
+    type Payer = crate::StoragePayer;
     super::delegate_path_handles!();
     type Write = MemoryWrite;
     type Dir = MemoryDir;
@@ -1306,6 +1314,7 @@ impl FileSystem for MemoryFs {
         path: FsPath<'_>,
         flags: OpenFlags,
         now: u64,
+        _payer: &crate::StoragePayer,
     ) -> FsResult<helios_hal::fs::Opened<OwnedFsPath>> {
         let mut state = self.state.lock();
         match state.inode(path) {
@@ -1368,11 +1377,18 @@ impl FileSystem for MemoryFs {
         position: WritePosition,
         len: usize,
         now: u64,
+        payer: &'a crate::StoragePayer,
     ) -> impl Future<Output = FsResult<MemoryWrite>> + Send + 'a {
-        core::future::ready(MemoryWrite::prepare(self, path, position, len, now))
+        core::future::ready(MemoryWrite::prepare(self, path, position, len, now, payer))
     }
 
-    async fn set_size(&self, path: FsPath<'_>, size: u64, now: u64) -> FsResult<()> {
+    async fn set_size(
+        &self,
+        path: FsPath<'_>,
+        size: u64,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         let size = usize::try_from(size).map_err(|_| FsError::Overflow)?;
         self.state.lock().edit_contents(path, now, |contents| {
             contents.resize(size, 0);
@@ -1386,6 +1402,7 @@ impl FileSystem for MemoryFs {
         access_nanos: Option<u64>,
         modified_nanos: Option<u64>,
         now: u64,
+        _payer: &crate::StoragePayer,
     ) -> FsResult<()> {
         let mut state = self.state.lock();
         let inode = state.inode_mut(path)?;
@@ -1412,7 +1429,12 @@ impl FileSystem for MemoryFs {
         })
     }
 
-    async fn create_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn create_directory(
+        &self,
+        path: FsPath<'_>,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         let mut state = self.state.lock();
         state.require_new_name(path)?;
         let unix = state.inherited_unix(path, NodeKind::Directory)?;
@@ -1427,11 +1449,21 @@ impl FileSystem for MemoryFs {
         Ok(())
     }
 
-    async fn remove_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn remove_directory(
+        &self,
+        path: FsPath<'_>,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         self.remove(path, true, false, now)
     }
 
-    async fn unlink(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn unlink(
+        &self,
+        path: FsPath<'_>,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         self.remove(path, false, false, now)
     }
 
@@ -1441,11 +1473,18 @@ impl FileSystem for MemoryFs {
         destination: FsPath<'_>,
         mode: RenameMode,
         now: u64,
+        _payer: &crate::StoragePayer,
     ) -> FsResult<()> {
         self.rename_over(source, destination, mode, now, false)
     }
 
-    async fn link(&self, existing: FsPath<'_>, link: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn link(
+        &self,
+        existing: FsPath<'_>,
+        link: FsPath<'_>,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         let mut state = self.state.lock();
         let (number, inode) = state.inode(existing)?;
         if inode.kind == NodeKind::Directory {
@@ -1463,7 +1502,13 @@ impl FileSystem for MemoryFs {
         Ok(())
     }
 
-    async fn symlink(&self, target: &str, link: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn symlink(
+        &self,
+        target: &str,
+        link: FsPath<'_>,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         let mut state = self.state.lock();
         state.require_new_name(link)?;
         let unix = state.inherited_unix(link, NodeKind::Symlink)?;
@@ -1543,26 +1588,32 @@ mod tests {
         const ROUNDS: usize = 200;
 
         let fs = tree();
-        block_on(fs.open(path("existing"), OpenFlags::CREATE, 0)).expect("creates");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.open(path("existing"), OpenFlags::CREATE, 0, &payer)).expect("creates");
         for round in 0..ROUNDS {
             let name = alloc::format!("raced-{round}");
             let barrier = Barrier::new(RACERS);
             let outcomes: Vec<Result<(), FsError>> = thread::scope(|scope| {
                 let racers: Vec<_> = (0..RACERS)
                     .map(|racer| {
-                        let (fs, name, barrier) = (&fs, &name, &barrier);
+                        let (fs, name, barrier, payer) = (&fs, &name, &barrier, &payer);
                         scope.spawn(move || {
                             let new = path(name);
                             barrier.wait();
                             block_on(async {
                                 match racer % 4 {
                                     0 => fs
-                                        .open(new, OpenFlags::CREATE | OpenFlags::EXCLUSIVE, 1)
+                                        .open(
+                                            new,
+                                            OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                                            1,
+                                            payer,
+                                        )
                                         .await
                                         .map(drop),
-                                    1 => fs.create_directory(new, 1).await,
-                                    2 => fs.symlink("existing", new, 1).await,
-                                    _ => fs.link(path("existing"), new, 1).await,
+                                    1 => fs.create_directory(new, 1, payer).await,
+                                    2 => fs.symlink("existing", new, 1, payer).await,
+                                    _ => fs.link(path("existing"), new, 1, payer).await,
                                 }
                             })
                         })
@@ -1588,8 +1639,9 @@ mod tests {
     #[test]
     fn a_write_is_refused_while_staging_and_a_dropped_one_changes_nothing() {
         let fs = tree();
-        block_on(fs.create_directory(path("d"), 1)).expect("creates the directory");
-        block_on(fs.open(path("f"), OpenFlags::CREATE, 1)).expect("creates the file");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.create_directory(path("d"), 1, &payer)).expect("creates the directory");
+        block_on(fs.open(path("f"), OpenFlags::CREATE, 1, &payer)).expect("creates the file");
         block_on(write_bytes(
             &fs,
             path("f"),
@@ -1600,16 +1652,16 @@ mod tests {
         .expect("writes");
 
         assert!(matches!(
-            block_on(fs.prepare_write(path("d"), WritePosition::At(0), 1, 3)),
+            block_on(fs.prepare_write(path("d"), WritePosition::At(0), 1, 3, &payer)),
             Err(FsError::IsDirectory)
         ));
         assert!(matches!(
-            block_on(fs.prepare_write(path("missing"), WritePosition::End, 1, 3)),
+            block_on(fs.prepare_write(path("missing"), WritePosition::End, 1, 3, &payer)),
             Err(FsError::NoEntry)
         ));
         // Staged, then dropped at the end of the statement.
         assert_eq!(
-            block_on(fs.prepare_write(path("f"), WritePosition::At(0), 4, 3))
+            block_on(fs.prepare_write(path("f"), WritePosition::At(0), 4, 3, &payer))
                 .expect("stages")
                 .staged_len(),
             4
@@ -1626,7 +1678,8 @@ mod tests {
     #[test]
     fn creates_writes_and_reads_back_positionally() {
         let fs = tree();
-        block_on(fs.open(path("f"), OpenFlags::CREATE, 5)).expect("creates");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.open(path("f"), OpenFlags::CREATE, 5, &payer)).expect("creates");
         assert_eq!(
             block_on(write_bytes(&fs, path("f"), WritePosition::At(2), b"cd", 6)),
             Ok(2),
@@ -1634,8 +1687,8 @@ mod tests {
         );
         // The filesystem stages the whole write in one round and hands its
         // own storage to the filler.
-        let staged =
-            block_on(fs.prepare_write(path("f"), WritePosition::End, 2, 7)).expect("stages");
+        let staged = block_on(fs.prepare_write(path("f"), WritePosition::End, 2, 7, &payer))
+            .expect("stages");
         assert_eq!(staged.staged_len(), 2);
         assert!(matches!(
             block_on(
@@ -1652,14 +1705,15 @@ mod tests {
         assert_eq!(read.as_ref(), b"\0\0cdef");
         let stat = block_on(fs.stat(path("f"))).expect("stats");
         assert_eq!((stat.size, stat.modified_nanos), (6, 7));
-        block_on(fs.open(path("f"), OpenFlags::TRUNCATE, 8)).expect("truncates");
+        block_on(fs.open(path("f"), OpenFlags::TRUNCATE, 8, &payer)).expect("truncates");
         assert_eq!(block_on(fs.stat(path("f"))).expect("stats").size, 0);
     }
 
     #[test]
     fn a_filled_write_outlives_its_source() {
         let fs = tree();
-        block_on(fs.open(path("f"), OpenFlags::CREATE, 0)).expect("creates");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.open(path("f"), OpenFlags::CREATE, 0, &payer)).expect("creates");
         let source = "文件・ファイル・파일".as_bytes().to_vec();
         let staged = {
             let preparing_fs = fs.clone();
@@ -1669,6 +1723,7 @@ mod tests {
                 WritePosition::At(0),
                 source.len(),
                 1,
+                &payer,
             ))
             .expect("stages")
         };
@@ -1688,8 +1743,9 @@ mod tests {
     #[test]
     fn a_hard_link_shares_the_inode_until_the_last_name_goes() {
         let fs = tree();
-        block_on(fs.open(path("a"), OpenFlags::CREATE, 0)).expect("creates");
-        block_on(fs.link(path("a"), path("b"), 1)).expect("links");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.open(path("a"), OpenFlags::CREATE, 0, &payer)).expect("creates");
+        block_on(fs.link(path("a"), path("b"), 1, &payer)).expect("links");
         block_on(write_bytes(
             &fs,
             path("b"),
@@ -1709,31 +1765,45 @@ mod tests {
             (a.link_count, a.id),
             (2, block_on(fs.stat(path("b"))).expect("stats").id)
         );
-        block_on(fs.unlink(path("a"), 7_000_000_000)).expect("unlinks");
+        block_on(fs.unlink(path("a"), 7_000_000_000, &payer)).expect("unlinks");
         assert_eq!(block_on(fs.stat(path("b"))).expect("stats").link_count, 1);
     }
 
     #[test]
     fn rename_noreplace_refuses_any_destination_and_exchange_needs_both() {
         let fs = tree();
-        block_on(fs.create_directory(path("d"), 0)).expect("creates");
-        block_on(fs.open(path("f"), OpenFlags::CREATE, 0)).expect("creates");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.create_directory(path("d"), 0, &payer)).expect("creates");
+        block_on(fs.open(path("f"), OpenFlags::CREATE, 0, &payer)).expect("creates");
         for (source, destination) in [("d", "f"), ("f", "d"), ("f", "f")] {
             assert_eq!(
-                block_on(fs.rename(path(source), path(destination), RenameMode::NoReplace, 1)),
+                block_on(fs.rename(
+                    path(source),
+                    path(destination),
+                    RenameMode::NoReplace,
+                    1,
+                    &payer,
+                )),
                 Err(FsError::Exists),
                 "{source} over {destination}"
             );
         }
         assert_eq!(
-            block_on(fs.rename(path("none"), path("f"), RenameMode::NoReplace, 1)),
+            block_on(fs.rename(path("none"), path("f"), RenameMode::NoReplace, 1, &payer)),
             Err(FsError::NoEntry)
         );
-        block_on(fs.rename(path("f"), path("g"), RenameMode::NoReplace, 1)).expect("renames");
+        block_on(fs.rename(path("f"), path("g"), RenameMode::NoReplace, 1, &payer))
+            .expect("renames");
         assert_eq!(names(&fs, ""), ["d", "g"]);
         for (source, destination) in [("g", "none"), ("none", "g"), ("none", "never")] {
             assert_eq!(
-                block_on(fs.rename(path(source), path(destination), RenameMode::Exchange, 1)),
+                block_on(fs.rename(
+                    path(source),
+                    path(destination),
+                    RenameMode::Exchange,
+                    1,
+                    &payer,
+                )),
                 Err(FsError::NoEntry),
                 "{source} with {destination}"
             );
@@ -1743,37 +1813,46 @@ mod tests {
     #[test]
     fn rename_exchange_swaps_subtrees_and_refuses_an_ancestor() {
         let fs = tree();
-        block_on(fs.create_directory(path("a"), 0)).expect("creates");
-        block_on(fs.open(path("a/inner"), OpenFlags::CREATE, 0)).expect("creates");
-        block_on(fs.create_directory(path("b"), 0)).expect("creates");
-        block_on(fs.create_directory(path("b/deeper"), 0)).expect("creates");
-        block_on(fs.open(path("b/deeper/leaf"), OpenFlags::CREATE, 0)).expect("creates");
-        block_on(fs.open(path("file"), OpenFlags::CREATE, 0)).expect("creates");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.create_directory(path("a"), 0, &payer)).expect("creates");
+        block_on(fs.open(path("a/inner"), OpenFlags::CREATE, 0, &payer)).expect("creates");
+        block_on(fs.create_directory(path("b"), 0, &payer)).expect("creates");
+        block_on(fs.create_directory(path("b/deeper"), 0, &payer)).expect("creates");
+        block_on(fs.open(path("b/deeper/leaf"), OpenFlags::CREATE, 0, &payer)).expect("creates");
+        block_on(fs.open(path("file"), OpenFlags::CREATE, 0, &payer)).expect("creates");
         let identity = |name: &str| block_on(fs.stat(path(name))).expect("stats").id;
         let (a, b, file) = (identity("a"), identity("b"), identity("file"));
         assert_eq!(
-            block_on(fs.rename(path("a"), path("a/inner"), RenameMode::Exchange, 1)),
+            block_on(fs.rename(path("a"), path("a/inner"), RenameMode::Exchange, 1, &payer)),
             Err(FsError::Invalid)
         );
         assert_eq!(
-            block_on(fs.rename(path("b/deeper"), path("b"), RenameMode::Exchange, 1)),
+            block_on(fs.rename(path("b/deeper"), path("b"), RenameMode::Exchange, 1, &payer)),
             Err(FsError::Invalid)
         );
-        block_on(fs.rename(path("a"), path("b"), RenameMode::Exchange, 2)).expect("exchanges");
+        block_on(fs.rename(path("a"), path("b"), RenameMode::Exchange, 2, &payer))
+            .expect("exchanges");
         assert_eq!((identity("a"), identity("b")), (b, a));
         assert_eq!(names(&fs, "a"), ["deeper"]);
         assert_eq!(names(&fs, "a/deeper"), ["leaf"]);
         assert_eq!(names(&fs, "b"), ["inner"]);
         // A file against a directory, and an object against itself.
-        block_on(fs.rename(path("file"), path("a/deeper"), RenameMode::Exchange, 3))
-            .expect("exchanges");
+        block_on(fs.rename(
+            path("file"),
+            path("a/deeper"),
+            RenameMode::Exchange,
+            3,
+            &payer,
+        ))
+        .expect("exchanges");
         assert_eq!(names(&fs, "file"), ["leaf"]);
         assert_eq!(
             block_on(fs.stat(path("a/deeper"))).expect("stats").kind,
             NodeKind::File
         );
         assert_eq!(identity("a/deeper"), file);
-        block_on(fs.rename(path("b"), path("b"), RenameMode::Exchange, 4)).expect("a no-op");
+        block_on(fs.rename(path("b"), path("b"), RenameMode::Exchange, 4, &payer))
+            .expect("a no-op");
         assert_eq!(names(&fs, "b"), ["inner"]);
         assert_eq!(names(&fs, ""), ["a", "b", "file"]);
     }
@@ -1781,31 +1860,34 @@ mod tests {
     #[test]
     fn rename_replace_overwrites_existing_file_and_empty_directory() {
         let fs = tree();
-        block_on(fs.open(path("a"), OpenFlags::CREATE, 0)).expect("creates a");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.open(path("a"), OpenFlags::CREATE, 0, &payer)).expect("creates a");
         block_on(write_bytes(&fs, path("a"), WritePosition::At(0), b"new", 1)).expect("writes a");
-        block_on(fs.open(path("b"), OpenFlags::CREATE, 0)).expect("creates b");
+        block_on(fs.open(path("b"), OpenFlags::CREATE, 0, &payer)).expect("creates b");
         block_on(write_bytes(&fs, path("b"), WritePosition::At(0), b"old", 1)).expect("writes b");
-        block_on(fs.create_directory(path("d1"), 0)).expect("creates d1");
-        block_on(fs.create_directory(path("d2"), 0)).expect("creates d2");
-        block_on(fs.open(path("d2/child"), OpenFlags::CREATE, 0)).expect("creates d2/child");
-        block_on(fs.create_directory(path("empty"), 0)).expect("creates empty");
+        block_on(fs.create_directory(path("d1"), 0, &payer)).expect("creates d1");
+        block_on(fs.create_directory(path("d2"), 0, &payer)).expect("creates d2");
+        block_on(fs.open(path("d2/child"), OpenFlags::CREATE, 0, &payer))
+            .expect("creates d2/child");
+        block_on(fs.create_directory(path("empty"), 0, &payer)).expect("creates empty");
 
         // File over dir -> IsDirectory; dir over file -> NotDirectory; dir over non-empty -> NotEmpty.
         assert_eq!(
-            block_on(fs.rename(path("a"), path("d1"), RenameMode::Replace, 2)),
+            block_on(fs.rename(path("a"), path("d1"), RenameMode::Replace, 2, &payer)),
             Err(FsError::IsDirectory)
         );
         assert_eq!(
-            block_on(fs.rename(path("d1"), path("a"), RenameMode::Replace, 2)),
+            block_on(fs.rename(path("d1"), path("a"), RenameMode::Replace, 2, &payer)),
             Err(FsError::NotDirectory)
         );
         assert_eq!(
-            block_on(fs.rename(path("d1"), path("d2"), RenameMode::Replace, 2)),
+            block_on(fs.rename(path("d1"), path("d2"), RenameMode::Replace, 2, &payer)),
             Err(FsError::NotEmpty)
         );
 
         // File replaces existing file atomically.
-        block_on(fs.rename(path("a"), path("b"), RenameMode::Replace, 3)).expect("replaces file");
+        block_on(fs.rename(path("a"), path("b"), RenameMode::Replace, 3, &payer))
+            .expect("replaces file");
         assert_eq!(block_on(fs.stat(path("a"))), Err(FsError::NoEntry));
         assert_eq!(
             block_on(fs.read_at(path("b"), 0, 16))
@@ -1815,7 +1897,7 @@ mod tests {
         );
 
         // Directory replaces existing empty directory.
-        block_on(fs.rename(path("d2"), path("empty"), RenameMode::Replace, 4))
+        block_on(fs.rename(path("d2"), path("empty"), RenameMode::Replace, 4, &payer))
             .expect("replaces empty dir");
         assert_eq!(block_on(fs.stat(path("d2"))), Err(FsError::NoEntry));
         assert_eq!(names(&fs, "empty"), ["child"]);
@@ -1824,20 +1906,21 @@ mod tests {
     #[test]
     fn rename_moves_a_subtree_and_refuses_moving_into_itself() {
         let fs = tree();
-        block_on(fs.create_directory(path("d"), 0)).expect("creates");
-        block_on(fs.open(path("d/f"), OpenFlags::CREATE, 0)).expect("creates");
-        block_on(fs.create_directory(path("dx"), 0)).expect("creates a prefix sibling");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.create_directory(path("d"), 0, &payer)).expect("creates");
+        block_on(fs.open(path("d/f"), OpenFlags::CREATE, 0, &payer)).expect("creates");
+        block_on(fs.create_directory(path("dx"), 0, &payer)).expect("creates a prefix sibling");
         // Sorts between `d` and `d/f`.
-        block_on(fs.open(path("d.x"), OpenFlags::CREATE, 0)).expect("creates");
+        block_on(fs.open(path("d.x"), OpenFlags::CREATE, 0, &payer)).expect("creates");
         assert_eq!(
-            block_on(fs.rename(path("d"), path("d/inner"), RenameMode::Replace, 1)),
+            block_on(fs.rename(path("d"), path("d/inner"), RenameMode::Replace, 1, &payer)),
             Err(FsError::NotPermitted)
         );
-        block_on(fs.rename(path("d"), path("e"), RenameMode::Replace, 1)).expect("renames");
+        block_on(fs.rename(path("d"), path("e"), RenameMode::Replace, 1, &payer)).expect("renames");
         assert_eq!(names(&fs, ""), ["d.x", "dx", "e"]);
         assert_eq!(names(&fs, "e"), ["f"]);
         assert_eq!(
-            block_on(fs.remove_directory(path("e"), 7_000_000_000)),
+            block_on(fs.remove_directory(path("e"), 7_000_000_000, &payer)),
             Err(FsError::NotEmpty)
         );
     }
@@ -1845,10 +1928,11 @@ mod tests {
     #[test]
     fn listing_skips_grandchildren_and_resumes() {
         let fs = tree();
+        let payer = crate::StoragePayer::for_test();
         for directory in ["a", "a/b", "c"] {
-            block_on(fs.create_directory(path(directory), 0)).expect("creates");
+            block_on(fs.create_directory(path(directory), 0, &payer)).expect("creates");
         }
-        block_on(fs.symlink("a", path("l"), 0)).expect("links");
+        block_on(fs.symlink("a", path("l"), 0, &payer)).expect("links");
         assert_eq!(names(&fs, ""), ["a", "c", "l"]);
         let dir = block_on(fs.open_dir(FsPath::ROOT)).expect("opens");
         let first = block_on(dir.read(DirCookie::START, 1)).expect("lists");
@@ -1863,6 +1947,7 @@ mod tests {
         use crate::UnixAttributes;
 
         let fs = tree();
+        let payer = crate::StoragePayer::for_test();
         let directories = [
             ("中文目录", 0o2775, 1000, 100),
             ("日本語のディレクトリ", 0o1777, 0, 0),
@@ -1880,11 +1965,11 @@ mod tests {
             )
             .expect("creates directory");
             let file = alloc::format!("{name}/ファイル");
-            block_on(fs.open(path(&file), OpenFlags::CREATE, 20)).expect("creates file");
+            block_on(fs.open(path(&file), OpenFlags::CREATE, 20, &payer)).expect("creates file");
             let child = alloc::format!("{name}/하위");
-            block_on(fs.create_directory(path(&child), 20)).expect("creates subdirectory");
+            block_on(fs.create_directory(path(&child), 20, &payer)).expect("creates subdirectory");
             let link = alloc::format!("{name}/链接");
-            block_on(fs.symlink("ファイル", path(&link), 20)).expect("creates symlink");
+            block_on(fs.symlink("ファイル", path(&link), 20, &payer)).expect("creates symlink");
 
             assert_eq!(
                 fs.unix_metadata(path(&file)).expect("file").attributes,
@@ -1982,7 +2067,13 @@ mod tests {
             assert_eq!(meta.rdev, expected_rdev, "{name}");
             assert_eq!(meta.attributes, owner(0o6640), "{name}");
             assert_eq!(
-                block_on(fs.open(path(name), OpenFlags::empty(), 3)).map(drop),
+                block_on(fs.open(
+                    path(name),
+                    OpenFlags::empty(),
+                    3,
+                    &crate::StoragePayer::for_test(),
+                ))
+                .map(drop),
                 Err(open_err),
                 "{name}"
             );
@@ -2148,9 +2239,16 @@ mod tests {
             6,
         ))
         .expect("writes");
-        block_on(fs.link(path("suid"), path("suid-hard"), 7)).expect("links");
-        block_on(fs.rename(path("chr"), path("chr-moved"), RenameMode::Replace, 8))
-            .expect("renames device node");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.link(path("suid"), path("suid-hard"), 7, &payer)).expect("links");
+        block_on(fs.rename(
+            path("chr"),
+            path("chr-moved"),
+            RenameMode::Replace,
+            8,
+            &payer,
+        ))
+        .expect("renames device node");
         assert_eq!(
             fs.unix_metadata(path("suid-hard")).unwrap().attributes,
             owner(0o4755)

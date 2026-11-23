@@ -851,8 +851,13 @@ fn held_user_memory_makes_an_instance_the_user_pool_victim() {
     assert_eq!(holder.memory_bytes(), 0);
     let charge = holder.charge_user_memory(HELD_BYTES);
 
-    let decision =
-        registry.condemn_for_oom(requester.id(), MemoryPool::User, REQUESTED_BYTES, 0, &residency);
+    let decision = registry.condemn_for_oom(
+        requester.id(),
+        MemoryPool::User,
+        REQUESTED_BYTES,
+        0,
+        &residency,
+    );
     let OomKillOutcome::Condemned(victim) = decision.outcome else {
         panic!("a holder of {HELD_BYTES} bytes is a user-pool victim: {decision:?}");
     };

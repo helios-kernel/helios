@@ -564,11 +564,17 @@ where
     // The window is copied into charged pages before anything is written
     // to the guest or the unwind starts, so a pool that cannot hold it
     // answers `NOMEM` with the phase still `Idle`.
-    let memory_stack =
-        match wasix_capture_stack_window(caller.data(), &memory, stack_pointer, stack_upper).await {
-            Ok(pages) => pages,
-            Err(stop) => return p1_finish_async_call(caller, Err(stop)).await,
-        };
+    let memory_stack = match wasix_capture_stack_window(
+        caller.data(),
+        &memory,
+        stack_pointer,
+        stack_upper,
+    )
+    .await
+    {
+        Ok(pages) => pages,
+        Err(stop) => return p1_finish_async_call(caller, Err(stop)).await,
+    };
     let setup = async {
         memory
             .write_u32(stack_lower_address, unwind_stack_begin)

@@ -1740,11 +1740,17 @@ where
     // The window is copied into charged pages before the guest is written
     // or the unwind starts: a pool that cannot hold it forks nothing and
     // the phase stays `Idle`.
-    let memory_stack =
-        match wasix_capture_stack_window(caller.data(), &memory, stack_pointer, stack_upper).await {
-            Ok(pages) => pages,
-            Err(stop) => return p1_finish_async_call(caller, Err(stop)).await,
-        };
+    let memory_stack = match wasix_capture_stack_window(
+        caller.data(),
+        &memory,
+        stack_pointer,
+        stack_upper,
+    )
+    .await
+    {
+        Ok(pages) => pages,
+        Err(stop) => return p1_finish_async_call(caller, Err(stop)).await,
+    };
     let setup = async {
         memory.write_u32(GuestAddress::wasm32(ret_pid), 0).await?;
         memory
@@ -2737,11 +2743,17 @@ where
     // The window is copied into charged pages before the guest is written
     // or the unwind starts: a pool that cannot hold it takes no snapshot
     // and the phase stays `Idle`.
-    let memory_stack =
-        match wasix_capture_stack_window(caller.data(), &memory, stack_pointer, stack_upper).await {
-            Ok(pages) => pages,
-            Err(stop) => return p1_finish_async_call(caller, Err(stop)).await,
-        };
+    let memory_stack = match wasix_capture_stack_window(
+        caller.data(),
+        &memory,
+        stack_pointer,
+        stack_upper,
+    )
+    .await
+    {
+        Ok(pages) => pages,
+        Err(stop) => return p1_finish_async_call(caller, Err(stop)).await,
+    };
     let setup = async {
         memory
             .write_u32(stack_lower_address, unwind_stack_begin)

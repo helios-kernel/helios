@@ -84,7 +84,8 @@ fn owner(namespace: &TestNamespace, absolute: &str) -> (String, String) {
 fn create(namespace: &TestNamespace, absolute: &str, bytes: &[u8]) {
     let resolved = namespace.resolve(absolute).expect("resolves");
     let fs = resolved.writable().expect("writable mount");
-    block_on(fs.open(resolved.path(), OpenFlags::CREATE, 1)).expect("creates");
+    let payer = crate::StoragePayer::for_test();
+    block_on(fs.open(resolved.path(), OpenFlags::CREATE, 1, &payer)).expect("creates");
     block_on(super::write_bytes(
         fs,
         resolved.path(),
@@ -107,13 +108,14 @@ fn the_longest_mount_point_owns_a_path() {
     let namespace = namespace();
     mount_memory(&namespace, "/mnt");
     let mnt = resolve_child_path("/", "mnt").expect("normalizes");
+    let payer = crate::StoragePayer::for_test();
     block_on(
         namespace
             .resolve(&mnt)
             .expect("resolves")
             .writable()
             .expect("writable")
-            .create_directory(FsPath::new("data").expect("valid"), 1),
+            .create_directory(FsPath::new("data").expect("valid"), 1, &payer),
     )
     .expect("creates the inner mount point");
     mount_memory(&namespace, "/mnt/data");
@@ -172,12 +174,13 @@ fn rename_and_link_across_mounts_are_refused_with_exdev() {
     mount_memory(&namespace, "/mnt");
     create(&namespace, "/mnt/file", b"payload");
 
+    let payer = crate::StoragePayer::for_test();
     assert_eq!(
-        block_on(namespace.rename("/mnt/file", "/file", RenameMode::Replace, 2)),
+        block_on(namespace.rename("/mnt/file", "/file", RenameMode::Replace, 2, &payer)),
         Err(FsError::CrossDevice)
     );
     assert_eq!(
-        block_on(namespace.link("/mnt/file", "/file", 2)),
+        block_on(namespace.link("/mnt/file", "/file", 2, &payer)),
         Err(FsError::CrossDevice)
     );
     // Nothing moved.
@@ -187,8 +190,9 @@ fn rename_and_link_across_mounts_are_refused_with_exdev() {
         Err(FsError::NoEntry)
     );
     // Within the mount, both work.
-    block_on(namespace.rename("/mnt/file", "/mnt/moved", RenameMode::Replace, 2)).expect("renames");
-    block_on(namespace.link("/mnt/moved", "/mnt/linked", 2)).expect("links");
+    block_on(namespace.rename("/mnt/file", "/mnt/moved", RenameMode::Replace, 2, &payer))
+        .expect("renames");
+    block_on(namespace.link("/mnt/moved", "/mnt/linked", 2, &payer)).expect("links");
     assert_eq!(read(&namespace, "/mnt/linked"), b"payload");
 }
 
@@ -301,13 +305,14 @@ fn a_colliding_point_hash_is_ruled_out() {
 fn unmount_refuses_a_mount_with_mounts_below_it() {
     let namespace = namespace();
     mount_memory(&namespace, "/mnt");
+    let payer = crate::StoragePayer::for_test();
     block_on(
         namespace
             .resolve("/mnt")
             .expect("resolves")
             .writable()
             .expect("writable")
-            .create_directory(FsPath::new("inner").expect("valid"), 1),
+            .create_directory(FsPath::new("inner").expect("valid"), 1, &payer),
     )
     .expect("creates");
     mount_memory(&namespace, "/mnt/inner");
@@ -466,11 +471,12 @@ fn a_symbolic_link_is_followed_across_mounts_only_when_asked() {
     mount_memory(&namespace, "/mnt");
     create(&namespace, "/mnt/target", b"followed");
     let resolved = namespace.resolve("/mnt/link").expect("resolves");
+    let payer = crate::StoragePayer::for_test();
     block_on(
         resolved
             .writable()
             .expect("writable")
-            .symlink("target", resolved.path(), 1),
+            .symlink("target", resolved.path(), 1, &payer),
     )
     .expect("links");
     let followed =

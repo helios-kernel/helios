@@ -145,8 +145,9 @@ macro_rules! delegate_path_handles {
             position: helios_hal::fs::WritePosition,
             len: usize,
             now: u64,
+            payer: &Self::Payer,
         ) -> helios_hal::fs::FsResult<Self::Write> {
-            self.prepare_write(handle.as_path(), position, len, now)
+            self.prepare_write(handle.as_path(), position, len, now, payer)
                 .await
         }
 
@@ -155,8 +156,9 @@ macro_rules! delegate_path_handles {
             handle: &Self::OpenHandle,
             size: u64,
             now: u64,
+            payer: &Self::Payer,
         ) -> helios_hal::fs::FsResult<()> {
-            self.set_size(handle.as_path(), size, now).await
+            self.set_size(handle.as_path(), size, now, payer).await
         }
 
         async fn set_times_handle(
@@ -165,8 +167,9 @@ macro_rules! delegate_path_handles {
             access_nanos: Option<u64>,
             modified_nanos: Option<u64>,
             now: u64,
+            payer: &Self::Payer,
         ) -> helios_hal::fs::FsResult<()> {
-            self.set_times(handle.as_path(), access_nanos, modified_nanos, now)
+            self.set_times(handle.as_path(), access_nanos, modified_nanos, now, payer)
                 .await
         }
 
@@ -182,8 +185,9 @@ macro_rules! delegate_path_handles {
             handle: &Self::OpenHandle,
             link: helios_hal::fs::FsPath<'_>,
             now: u64,
+            payer: &Self::Payer,
         ) -> helios_hal::fs::FsResult<()> {
-            self.link(handle.as_path(), link, now).await
+            self.link(handle.as_path(), link, now, payer).await
         }
 
         async fn sync_handle(&self, handle: &Self::OpenHandle) -> helios_hal::fs::FsResult<()> {
@@ -226,6 +230,7 @@ macro_rules! mount_kinds {
         }
 
         impl<S: Storage> FileSystem for MountedFs<S> {
+            type Payer = crate::StoragePayer;
             type OpenHandle = MountedOpenHandle;
             type Write = MountedWrite<S>;
             type Dir = MountedDir<S>;
@@ -246,9 +251,10 @@ macro_rules! mount_kinds {
                 path: FsPath<'_>,
                 flags: OpenFlags,
                 now: u64,
+                payer: &crate::StoragePayer,
             ) -> FsResult<Opened<MountedOpenHandle>> {
                 match self {
-                    $(Self::$kind(fs) => fs.open(path, flags, now).await.map(|opened| Opened {
+                    $(Self::$kind(fs) => fs.open(path, flags, now, payer).await.map(|opened| Opened {
                         metadata: opened.metadata,
                         handle: MountedOpenHandle::$kind(opened.handle),
                     }),)+
@@ -260,10 +266,11 @@ macro_rules! mount_kinds {
                 directory: FsPath<'_>,
                 exclusive: bool,
                 now: u64,
+                payer: &crate::StoragePayer,
             ) -> FsResult<Opened<MountedOpenHandle>> {
                 match self {
                     $(Self::$kind(fs) => fs
-                        .open_tmpfile(directory, exclusive, now)
+                        .open_tmpfile(directory, exclusive, now, payer)
                         .await
                         .map(|opened| Opened {
                             metadata: opened.metadata,
@@ -301,10 +308,11 @@ macro_rules! mount_kinds {
                 position: WritePosition,
                 len: usize,
                 now: u64,
+                payer: &'a crate::StoragePayer,
             ) -> FsResult<MountedWrite<S>> {
                 match self {
                     $(Self::$kind(fs) => {
-                        fs.prepare_write(path, position, len, now).await.map(MountedWrite::$kind)
+                        fs.prepare_write(path, position, len, now, payer).await.map(MountedWrite::$kind)
                     })+
                 }
             }
@@ -315,10 +323,11 @@ macro_rules! mount_kinds {
                 position: WritePosition,
                 len: usize,
                 now: u64,
+                payer: &'a crate::StoragePayer,
             ) -> FsResult<MountedWrite<S>> {
                 match (self, handle) {
                     $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
-                        fs.prepare_write_handle(handle, position, len, now)
+                        fs.prepare_write_handle(handle, position, len, now, payer)
                             .await
                             .map(MountedWrite::$kind)
                     })+
@@ -326,8 +335,14 @@ macro_rules! mount_kinds {
                 }
             }
 
-            async fn set_size(&self, path: FsPath<'_>, size: u64, now: u64) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.set_size(path, size, now).await,)+ }
+            async fn set_size(
+                &self,
+                path: FsPath<'_>,
+                size: u64,
+                now: u64,
+                payer: &crate::StoragePayer,
+            ) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.set_size(path, size, now, payer).await,)+ }
             }
 
             async fn set_size_handle(
@@ -335,10 +350,11 @@ macro_rules! mount_kinds {
                 handle: &MountedOpenHandle,
                 size: u64,
                 now: u64,
+                payer: &crate::StoragePayer,
             ) -> FsResult<()> {
                 match (self, handle) {
                     $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
-                        fs.set_size_handle(handle, size, now).await
+                        fs.set_size_handle(handle, size, now, payer).await
                     })+
                     _ => Err(FsError::CrossDevice),
                 }
@@ -350,10 +366,11 @@ macro_rules! mount_kinds {
                 access_nanos: Option<u64>,
                 modified_nanos: Option<u64>,
                 now: u64,
+                payer: &crate::StoragePayer,
             ) -> FsResult<()> {
                 match self {
                     $(Self::$kind(fs) => {
-                        fs.set_times(path, access_nanos, modified_nanos, now).await
+                        fs.set_times(path, access_nanos, modified_nanos, now, payer).await
                     })+
                 }
             }
@@ -364,10 +381,11 @@ macro_rules! mount_kinds {
                 access_nanos: Option<u64>,
                 modified_nanos: Option<u64>,
                 now: u64,
+                payer: &crate::StoragePayer,
             ) -> FsResult<()> {
                 match (self, handle) {
                     $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
-                        fs.set_times_handle(handle, access_nanos, modified_nanos, now).await
+                        fs.set_times_handle(handle, access_nanos, modified_nanos, now, payer).await
                     })+
                     _ => Err(FsError::CrossDevice),
                 }
@@ -388,16 +406,31 @@ macro_rules! mount_kinds {
                 }
             }
 
-            async fn create_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.create_directory(path, now).await,)+ }
+            async fn create_directory(
+                &self,
+                path: FsPath<'_>,
+                now: u64,
+                payer: &crate::StoragePayer,
+            ) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.create_directory(path, now, payer).await,)+ }
             }
 
-            async fn remove_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.remove_directory(path, now).await,)+ }
+            async fn remove_directory(
+                &self,
+                path: FsPath<'_>,
+                now: u64,
+                payer: &crate::StoragePayer,
+            ) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.remove_directory(path, now, payer).await,)+ }
             }
 
-            async fn unlink(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.unlink(path, now).await,)+ }
+            async fn unlink(
+                &self,
+                path: FsPath<'_>,
+                now: u64,
+                payer: &crate::StoragePayer,
+            ) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.unlink(path, now, payer).await,)+ }
             }
 
             async fn rename(
@@ -406,12 +439,19 @@ macro_rules! mount_kinds {
                 destination: FsPath<'_>,
                 mode: RenameMode,
                 now: u64,
+                payer: &crate::StoragePayer,
             ) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.rename(source, destination, mode, now).await,)+ }
+                match self { $(Self::$kind(fs) => fs.rename(source, destination, mode, now, payer).await,)+ }
             }
 
-            async fn link(&self, existing: FsPath<'_>, link: FsPath<'_>, now: u64) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.link(existing, link, now).await,)+ }
+            async fn link(
+                &self,
+                existing: FsPath<'_>,
+                link: FsPath<'_>,
+                now: u64,
+                payer: &crate::StoragePayer,
+            ) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.link(existing, link, now, payer).await,)+ }
             }
 
             async fn link_handle(
@@ -419,17 +459,24 @@ macro_rules! mount_kinds {
                 handle: &MountedOpenHandle,
                 link: FsPath<'_>,
                 now: u64,
+                payer: &crate::StoragePayer,
             ) -> FsResult<()> {
                 match (self, handle) {
                     $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
-                        fs.link_handle(handle, link, now).await
+                        fs.link_handle(handle, link, now, payer).await
                     })+
                     _ => Err(FsError::CrossDevice),
                 }
             }
 
-            async fn symlink(&self, target: &str, link: FsPath<'_>, now: u64) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.symlink(target, link, now).await,)+ }
+            async fn symlink(
+                &self,
+                target: &str,
+                link: FsPath<'_>,
+                now: u64,
+                payer: &crate::StoragePayer,
+            ) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.symlink(target, link, now, payer).await,)+ }
             }
 
             async fn read_link(&self, path: FsPath<'_>) -> FsResult<String> {
@@ -563,18 +610,26 @@ macro_rules! mount_kinds {
 /// and resolves with the offset it landed at: the filesystem tests'
 /// write. It asserts that every byte landed.
 #[cfg(test)]
-pub(crate) async fn write_bytes<F: FileSystem>(
+pub(crate) async fn write_bytes<F: FileSystem<Payer = crate::StoragePayer>>(
     fs: &F,
     path: FsPath<'_>,
     position: WritePosition,
     data: &[u8],
     now: u64,
 ) -> FsResult<u64> {
-    let landed =
-        helios_hal::fs::write_with(fs, path, position, data.len(), now, |at, destination| {
+    let payer = crate::StoragePayer::for_test();
+    let landed = helios_hal::fs::write_with(
+        fs,
+        path,
+        position,
+        data.len(),
+        now,
+        &payer,
+        |at, destination| {
             destination.copy_from_slice(&data[at..at + destination.len()]);
-        })
-        .await?;
+        },
+    )
+    .await?;
     assert_eq!(landed.len, data.len(), "the write landed in full");
     Ok(landed.offset)
 }
@@ -686,6 +741,7 @@ impl<S: Storage> MountedFs<S> {
         flags: OpenFlags,
         attributes: helios_btrfs::write::Attributes,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<Opened<MountedOpenHandle>, UnixFsError> {
         match self {
             Self::Btrfs(fs) => fs
@@ -695,17 +751,22 @@ impl<S: Storage> MountedFs<S> {
                     metadata: o.metadata,
                     handle: MountedOpenHandle::Btrfs(o.handle),
                 }),
-            Self::Memory(fs) => fs.open_unix(path, flags, attributes, now).map(|o| Opened {
-                metadata: o.metadata,
-                handle: MountedOpenHandle::Memory(o.handle),
-            }),
-            Self::Root(fs) => fs.open_unix(path, flags, attributes, now).map(|o| Opened {
-                metadata: o.metadata,
-                handle: MountedOpenHandle::Root(o.handle),
-            }),
-            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => {
-                self.open(path, flags, now).await.map_err(UnixFsError::Fs)
-            }
+            Self::Memory(fs) => fs
+                .open_unix(path, flags, attributes, now, payer)
+                .map(|o| Opened {
+                    metadata: o.metadata,
+                    handle: MountedOpenHandle::Memory(o.handle),
+                }),
+            Self::Root(fs) => fs
+                .open_unix(path, flags, attributes, now, payer)
+                .map(|o| Opened {
+                    metadata: o.metadata,
+                    handle: MountedOpenHandle::Root(o.handle),
+                }),
+            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => self
+                .open(path, flags, now, payer)
+                .await
+                .map_err(UnixFsError::Fs),
         }
     }
 
@@ -714,13 +775,14 @@ impl<S: Storage> MountedFs<S> {
         path: FsPath<'_>,
         attributes: helios_btrfs::write::Attributes,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), UnixFsError> {
         match self {
             Self::Btrfs(fs) => fs.create_directory_unix(path, attributes, now).await,
             Self::Memory(fs) => fs.create_directory_unix(path, attributes, now),
             Self::Root(fs) => fs.create_directory_unix(path, attributes, now),
             Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => self
-                .create_directory(path, now)
+                .create_directory(path, now, payer)
                 .await
                 .map_err(UnixFsError::Fs),
         }
@@ -732,13 +794,14 @@ impl<S: Storage> MountedFs<S> {
         path: FsPath<'_>,
         attributes: helios_btrfs::write::Attributes,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), UnixFsError> {
         match self {
             Self::Btrfs(fs) => fs.symlink_unix(target, path, attributes, now).await,
             Self::Memory(fs) => fs.symlink_unix(target, path, attributes, now),
             Self::Root(fs) => fs.symlink_unix(target, path, attributes, now),
             Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => self
-                .symlink(target, path, now)
+                .symlink(target, path, now, payer)
                 .await
                 .map_err(UnixFsError::Fs),
         }
@@ -765,11 +828,12 @@ impl<S: Storage> MountedFs<S> {
         path: FsPath<'_>,
         permissions: u32,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), UnixFsError> {
         match self {
             Self::Btrfs(fs) => fs.set_permissions(path, permissions, now).await,
             Self::Memory(fs) => Ok(fs.set_permissions(path, permissions, now)?),
-            Self::Root(fs) => fs.set_permissions(path, permissions, now),
+            Self::Root(fs) => fs.set_permissions(path, permissions, now, payer),
             Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
             Self::Host(_) => Err(FsError::Unsupported.into()),
         }
@@ -780,6 +844,7 @@ impl<S: Storage> MountedFs<S> {
         handle: &MountedOpenHandle,
         permissions: u32,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), UnixFsError> {
         match (self, handle) {
             (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => {
@@ -789,7 +854,7 @@ impl<S: Storage> MountedFs<S> {
                 Ok(fs.set_permissions(p.as_path(), permissions, now)?)
             }
             (Self::Root(fs), MountedOpenHandle::Root(p)) => {
-                fs.set_permissions(p.as_path(), permissions, now)
+                fs.set_permissions(p.as_path(), permissions, now, payer)
             }
             (Self::Boot(_), MountedOpenHandle::Boot(_))
             | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
@@ -804,11 +869,12 @@ impl<S: Storage> MountedFs<S> {
         uid: Option<u32>,
         gid: Option<u32>,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), UnixFsError> {
         match self {
             Self::Btrfs(fs) => fs.set_owner(path, uid, gid, now).await,
             Self::Memory(fs) => Ok(fs.set_owner(path, uid, gid, now)?),
-            Self::Root(fs) => fs.set_owner(path, uid, gid, now),
+            Self::Root(fs) => fs.set_owner(path, uid, gid, now, payer),
             Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
             Self::Host(_) => Err(FsError::Unsupported.into()),
         }
@@ -820,6 +886,7 @@ impl<S: Storage> MountedFs<S> {
         uid: Option<u32>,
         gid: Option<u32>,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), UnixFsError> {
         match (self, handle) {
             (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => {
@@ -829,7 +896,7 @@ impl<S: Storage> MountedFs<S> {
                 Ok(fs.set_owner(p.as_path(), uid, gid, now)?)
             }
             (Self::Root(fs), MountedOpenHandle::Root(p)) => {
-                fs.set_owner(p.as_path(), uid, gid, now)
+                fs.set_owner(p.as_path(), uid, gid, now, payer)
             }
             (Self::Boot(_), MountedOpenHandle::Boot(_))
             | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
@@ -894,11 +961,12 @@ impl<S: Storage> MountedFs<S> {
         value: Bytes,
         mode: XattrSetMode,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), UnixFsError> {
         match self {
             Self::Btrfs(fs) => fs.set_xattr(path, name, value, mode, now).await,
             Self::Memory(fs) => fs.set_xattr_unix(path, name, value, mode, now),
-            Self::Root(fs) => fs.set_xattr(path, name, value, mode, now),
+            Self::Root(fs) => fs.set_xattr(path, name, value, mode, now, payer),
             Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
             Self::Host(_) => Err(FsError::Unsupported.into()),
         }
@@ -911,6 +979,7 @@ impl<S: Storage> MountedFs<S> {
         value: Bytes,
         mode: XattrSetMode,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), UnixFsError> {
         match (self, handle) {
             (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => {
@@ -920,7 +989,7 @@ impl<S: Storage> MountedFs<S> {
                 fs.set_xattr_unix(p.as_path(), name, value, mode, now)
             }
             (Self::Root(fs), MountedOpenHandle::Root(p)) => {
-                fs.set_xattr(p.as_path(), name, value, mode, now)
+                fs.set_xattr(p.as_path(), name, value, mode, now, payer)
             }
             (Self::Boot(_), MountedOpenHandle::Boot(_))
             | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
@@ -2166,14 +2235,19 @@ impl<S: Storage> Namespace<S> {
     /// Removes the empty directory `absolute`. A mount point, or a
     /// directory with a mount point below it, is in use:
     /// [`FsError::Busy`].
-    pub async fn remove_directory(&self, absolute: &str, now: u64) -> FsResult<()> {
+    pub async fn remove_directory(
+        &self,
+        absolute: &str,
+        now: u64,
+        payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         let resolved = self.resolve(absolute)?;
         if resolved.is_mount_root() || self.holds_mounts(absolute) {
             return Err(FsError::Busy);
         }
         resolved
             .writable()?
-            .remove_directory(resolved.path(), now)
+            .remove_directory(resolved.path(), now, payer)
             .await
     }
 
@@ -2186,6 +2260,7 @@ impl<S: Storage> Namespace<S> {
         destination: &str,
         mode: RenameMode,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> FsResult<()> {
         if self.holds_mounts(source) {
             return Err(FsError::Busy);
@@ -2200,12 +2275,18 @@ impl<S: Storage> Namespace<S> {
         }
         source
             .writable()?
-            .rename(source.path(), destination.path(), mode, now)
+            .rename(source.path(), destination.path(), mode, now, payer)
             .await
     }
 
     /// Links within one mount; across two, [`FsError::CrossDevice`].
-    pub async fn link(&self, existing: &str, link: &str, now: u64) -> FsResult<()> {
+    pub async fn link(
+        &self,
+        existing: &str,
+        link: &str,
+        now: u64,
+        payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         let existing = self.resolve(existing)?;
         let link = self.resolve(link)?;
         if !existing.same_mount(&link) {
@@ -2216,7 +2297,7 @@ impl<S: Storage> Namespace<S> {
         }
         existing
             .writable()?
-            .link(existing.path(), link.path(), now)
+            .link(existing.path(), link.path(), now, payer)
             .await
     }
 
@@ -2227,11 +2308,12 @@ impl<S: Storage> Namespace<S> {
         directory: &str,
         exclusive: bool,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> FsResult<(Opened<MountedOpenHandle>, Option<MountHold>)> {
         let resolved = self.resolve(directory)?;
         let opened = resolved
             .writable()?
-            .open_tmpfile(resolved.path(), exclusive, now)
+            .open_tmpfile(resolved.path(), exclusive, now, payer)
             .await?;
         Ok((opened, resolved.hold()))
     }
@@ -2245,6 +2327,7 @@ impl<S: Storage> Namespace<S> {
         handle: &MountedOpenHandle,
         link: &str,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> FsResult<()> {
         let source = self.resolve(source_mount_path)?;
         let link = self.resolve(link)?;
@@ -2256,7 +2339,7 @@ impl<S: Storage> Namespace<S> {
         }
         source
             .writable()?
-            .link_handle(handle, link.path(), now)
+            .link_handle(handle, link.path(), now, payer)
             .await
     }
 

@@ -3405,12 +3405,14 @@ mod tests {
         let bytes = patterned(chunk * 2 + 3);
         let mut regions = Vec::new();
 
+        let payer = crate::StoragePayer::for_test();
         let landed = block_on(helios_hal::fs::write_with(
             &share,
             helios_hal::fs::FsPath::new("alpha").expect("valid path"),
             WritePosition::At(0),
             bytes.len(),
             0,
+            &payer,
             |at, destination| {
                 regions.push((at, destination.len()));
                 destination.copy_from_slice(&bytes[at..at + destination.len()]);
@@ -4645,7 +4647,8 @@ mod tests {
 
             // The path-level open answers for symlinks, which resolution
             // follows; the report-only kinds are refused.
-            let opened = block_on(share.open(path, OpenFlags::empty(), 0));
+            let payer = crate::StoragePayer::for_test();
+            let opened = block_on(share.open(path, OpenFlags::empty(), 0, &payer));
             match kind.open_refusal() {
                 Some(refusal) => assert_eq!(opened.map(|_| ()), Err(refusal), "mode {mode:o}"),
                 None => assert_eq!(opened.expect("opens").metadata.kind, kind),
@@ -4662,12 +4665,12 @@ mod tests {
                 "read of mode {mode:o}"
             );
             assert_eq!(
-                block_on(share.prepare_write(path, WritePosition::At(0), 4, 0)).err(),
+                block_on(share.prepare_write(path, WritePosition::At(0), 4, 0, &payer)).err(),
                 Some(refusal),
                 "write of mode {mode:o}"
             );
             assert_eq!(
-                block_on(share.prepare_write(path, WritePosition::End, 4, 0)).err(),
+                block_on(share.prepare_write(path, WritePosition::End, 4, 0, &payer)).err(),
                 Some(refusal),
                 "append of mode {mode:o}"
             );
@@ -4755,8 +4758,9 @@ mod tests {
     #[test]
     fn unlinking_a_host_device_node_sends_no_open() {
         let (share, transport) = share_over(S_IFCHR);
+        let payer = crate::StoragePayer::for_test();
 
-        block_on(share.unlink(share_path("tty"), 0)).expect("unlink works on the entry");
+        block_on(share.unlink(share_path("tty"), 0, &payer)).expect("unlink works on the entry");
 
         assert_eq!(transport.log().opens, 0);
     }

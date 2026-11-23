@@ -168,6 +168,7 @@ pub(super) enum WasixAsyncifyPhase {
 }
 
 /// Why a call could not start its unwind.
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum UnwindRefusal {
     /// The call answers this errno.
@@ -179,6 +180,7 @@ pub(super) enum UnwindRefusal {
 
 /// The shadow-stack window `[stack_pointer, stack_upper)` of guest
 /// `memory` an unwind captures.
+#[cfg(test)]
 #[derive(Clone, Copy)]
 pub(super) struct StackWindow {
     pub(super) memory: Preview1Memory,
@@ -212,6 +214,7 @@ where
         .await?
     {
         Ok(pages) => Ok(pages),
+        #[cfg(test)]
         Err(PageCaptureError::OutOfBounds(_)) => Err(P1Stop::Errno(p1::errno::FAULT)),
         Err(PageCaptureError::OutOfMemory {
             requested_bytes, ..
@@ -231,6 +234,7 @@ where
 /// with the phase still `Idle` and nothing written to the guest. `prepare`
 /// answers an errno, and a failure of it drops the copy and leaves the
 /// phase alone too.
+#[cfg(test)]
 pub(super) fn arm_unwind(
     phase: &mut WasixAsyncifyPhase,
     pool: &'static crate::UserMemoryPool,
@@ -1611,13 +1615,9 @@ where
             mut memory_stack,
             stack_pointer,
         } => {
-            let (unwind, rewind_stack) = wasix_capture_unwound_stack(
-                store,
-                stack_lower,
-                unwind_stack_begin,
-                stack_pointer,
-            )
-            .await?;
+            let (unwind, rewind_stack) =
+                wasix_capture_unwound_stack(store, stack_lower, unwind_stack_begin, stack_pointer)
+                    .await?;
             wasix_call_instance_func0(store, interrupts, "asyncify_stop_unwind").await?;
             let Some(rewind_stack) = rewind_stack else {
                 // The pool could not hold the records. They are still where
@@ -1730,13 +1730,9 @@ where
             memory_stack,
             stack_pointer,
         } => {
-            let (unwind, rewind_stack) = wasix_capture_unwound_stack(
-                store,
-                stack_lower,
-                unwind_stack_begin,
-                stack_pointer,
-            )
-            .await?;
+            let (unwind, rewind_stack) =
+                wasix_capture_unwound_stack(store, stack_lower, unwind_stack_begin, stack_pointer)
+                    .await?;
             wasix_call_instance_func0(store, interrupts, "asyncify_stop_unwind").await?;
             let memory_stack = SharedPages::new(memory_stack);
             let Some(rewind_stack) = rewind_stack else {
@@ -1796,13 +1792,9 @@ where
             memory_stack,
             stack_pointer,
         } => {
-            let (unwind, rewind_stack) = wasix_capture_unwound_stack(
-                store,
-                stack_lower,
-                unwind_stack_begin,
-                stack_pointer,
-            )
-            .await?;
+            let (unwind, rewind_stack) =
+                wasix_capture_unwound_stack(store, stack_lower, unwind_stack_begin, stack_pointer)
+                    .await?;
             wasix_call_instance_func0(store, interrupts, "asyncify_stop_unwind").await?;
             let memory_stack = SharedPages::new(memory_stack);
             let Some(rewind_stack) = rewind_stack else {
@@ -1927,6 +1919,7 @@ where
     };
     match pages {
         Ok(records) => Ok((unwind, Some(records))),
+        #[cfg(test)]
         Err(PageCaptureError::OutOfBounds(error)) => Err(AsyncifyError::Exec(error)),
         Err(PageCaptureError::OutOfMemory {
             requested_bytes, ..
@@ -2070,6 +2063,7 @@ where
     .await?
     {
         Ok(pages) => pages,
+        #[cfg(test)]
         Err(PageCaptureError::OutOfBounds(error)) => return Err(AsyncifyError::Exec(error)),
         Err(PageCaptureError::OutOfMemory {
             requested_bytes, ..
