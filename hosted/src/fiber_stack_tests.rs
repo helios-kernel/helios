@@ -11,7 +11,7 @@
 
 #![cfg(test)]
 
-use std::alloc::{Layout, alloc_zeroed};
+use std::alloc::Layout;
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
 use std::sync::Mutex;
@@ -22,9 +22,9 @@ use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{AddressSpaceError, VirtAddr, VirtRange};
 use helios_kernel::{
     FiberStackError, FiberStackVmHooks, InterruptedContext, StackFault, allocate_user_frame_zeroed,
-    allocate_user_memory_pool, allocate_user_run_zeroed_on, claim_fiber_stack,
-    deallocate_user_frame, deallocate_user_run_on, install_fiber_stack_arena,
-    install_fiber_stack_hooks, install_user_memory_pool, resolve_stack_fault,
+    allocate_user_run_zeroed_on, claim_fiber_stack, deallocate_user_frame, deallocate_user_run_on,
+    install_fiber_stack_arena, install_fiber_stack_hooks, install_user_memory_pool,
+    resolve_stack_fault,
 };
 
 use crate::cpu::set_current_processor;
@@ -34,7 +34,6 @@ use crate::cpu::set_current_processor;
 const STACK_BYTES: usize = 96 * PhysFrame::SIZE;
 const SLOTS: usize = 2;
 const PROCESSORS: usize = 2;
-const POOL_BYTES: usize = 16 * 1024 * 1024;
 const ARENA_BASE: usize = 0x0000_4000_0000_0000;
 
 /// The fake page table: every mapped page and the frame behind it. A real
@@ -75,15 +74,9 @@ static HOOKS: FiberStackVmHooks = FiberStackVmHooks {
 /// install-once statics are fresh.
 fn arena() {
     set_current_processor(ProcessorId::new(0));
-    let layout = Layout::from_size_align(POOL_BYTES, PhysFrame::SIZE).expect("pool layout");
-    // SAFETY: the layout has a non-zero size.
-    let base = unsafe { alloc_zeroed(layout) } as usize;
-    assert!(base != 0, "pool backing");
-    let pool = install_user_memory_pool(allocate_user_memory_pool());
-    pool.initialize(&[(base, base + POOL_BYTES)]);
-    pool.configure_processors(PROCESSORS);
+    install_user_memory_pool(crate::test_pool::single_node_machine(PROCESSORS));
     install_fiber_stack_hooks(&HOOKS);
-    install_fiber_stack_arena(SLOTS, STACK_BYTES, PROCESSORS, 0);
+    install_fiber_stack_arena(SLOTS, STACK_BYTES, 0);
 }
 
 fn enabled() -> InterruptedContext {
