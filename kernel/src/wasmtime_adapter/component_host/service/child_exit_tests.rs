@@ -90,6 +90,75 @@ fn await_debugger_wit_wait(
 }
 
 #[test]
+fn buffered_exec_kills_an_endless_writer_at_the_configured_output_limit() {
+    let data = test_store::store_data_authorized(ProcessAuthority::empty(), |_| {});
+    let child_instance = data.instance_registry.register("endless-writer", 1);
+    let child_id = child_instance.id();
+
+    let (stdin_tx, _stdin_rx) = crate::byte_channel();
+    let (stdout_tx, stdout_rx) = crate::byte_channel();
+    let (stderr_tx, stderr_rx) = crate::byte_channel();
+    let (exit_tx, exit_rx) = futures::channel::oneshot::channel();
+    let child = ChildHandle {
+        instance_id: child_id,
+        signal_state: WasixSignalState::new(),
+        stdin: Some(stdin_tx),
+        stdout: Some(stdout_rx),
+        stderr: Some(stderr_rx),
+        exit: Some(exit_rx),
+    };
+
+    let limit = 4096_usize;
+    let outcome = block_on(async {
+        let producer = async {
+            let chunk = alloc::vec![b'x'; 1024];
+            let mut sent = 0usize;
+            // Write endlessly until the kernel closes stdout or condemns the child.
+            while child_instance.pending_kill().is_none()
+                && stdout_tx.write(chunk.clone()).await.is_ok()
+            {
+                sent += chunk.len();
+                crate::yield_now().await;
+            }
+            drop(stdout_tx);
+            drop(stderr_tx);
+            let _ = exit_tx.send(Ok(ChildExit {
+                instance_id: child_id,
+                termination: ChildTermination::Killed,
+                filesystem: None,
+            }));
+            sent
+        };
+        let drain = drain_child_output_bounded(
+            child,
+            limit,
+            &data.runtime_state,
+            &data.instance_registry,
+            &data.cpu,
+        );
+        futures::future::join(producer, drain).await
+    });
+
+    assert_eq!(
+        outcome.1.err(),
+        Some(ProgramExecError {
+            kind: ProgramExecErrorKind::OutOfMemory,
+            detail: ProgramExecErrorDetail::OutputLimitExceeded,
+        })
+    );
+    assert_eq!(
+        child_instance.pending_kill(),
+        Some(crate::KillReason::OutOfMemory),
+        "the endless writer is condemned when buffered output exceeds the limit"
+    );
+    assert!(
+        outcome.0 <= limit + 2 * 1024,
+        "output stopped promptly at the configured bound, sent={}",
+        outcome.0
+    );
+}
+
+#[test]
 fn child_wait_reports_each_of_the_four_endings_distinctly() {
     use super::super::debugger_bindings::helios::system::programs as dbg_wit;
     use super::super::program_bindings::helios::system::programs as prog_wit;

@@ -675,6 +675,114 @@ impl ChildHandle {
     }
 }
 
+/// Drain `child`'s stdout and stderr into kernel buffers bounded by
+/// `max_output_bytes` (combined across both streams). If the child writes past
+/// the bound, it is condemned and interrupted immediately, the pipe readers are
+/// dropped so the child observes closed streams, the child is reaped, and the
+/// caller receives [`ProgramExecErrorDetail::OutputLimitExceeded`].
+async fn drain_child_output_bounded<CpuImpl, Net, StorageImpl>(
+    mut child: ChildHandle,
+    max_output_bytes: usize,
+    runtime_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
+    instance_registry: &crate::InstanceRegistry,
+    cpu: &CpuImpl,
+) -> Result<(ExecResult, Option<MemoryFs>), ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let child_id = child.instance_id;
+    let stdout_reader = child.take_stdout();
+    let stderr_reader = child.take_stderr();
+    let remaining_budget = core::sync::atomic::AtomicUsize::new(max_output_bytes);
+    let overflowed = core::sync::atomic::AtomicBool::new(false);
+
+    let reserve_or_kill = |chunk_len: usize| -> bool {
+        if overflowed.load(AtomicOrdering::Acquire) {
+            return false;
+        }
+        let admitted = remaining_budget
+            .try_update(
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+                |remaining| remaining.checked_sub(chunk_len),
+            )
+            .is_ok();
+        if !admitted {
+            if !overflowed.swap(true, AtomicOrdering::AcqRel) {
+                let residency = super::super::store::user_residency();
+                let now = monotonic_nanos(cpu);
+                instance_registry.request_kill(
+                    child_id,
+                    crate::KillReason::OutOfMemory,
+                    now,
+                    &residency,
+                );
+                super::deliver_kill(runtime_state, child_id);
+            }
+            return false;
+        }
+        true
+    };
+
+    let drain = |reader: Option<crate::ByteReader>| async {
+        let mut bytes = Vec::new();
+        if let Some(reader) = reader {
+            while let Some(chunk) = reader.read().await {
+                if !reserve_or_kill(chunk.len()) {
+                    drop(reader);
+                    break;
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+        }
+        bytes
+    };
+
+    let stdout_task = drain(stdout_reader);
+    let stderr_task = drain(stderr_reader);
+    let wait_task = child.wait();
+    let (stdout, (stderr, exit)) =
+        futures::future::join(stdout_task, futures::future::join(stderr_task, wait_task)).await;
+
+    if overflowed.load(AtomicOrdering::Acquire) {
+        return Err(ProgramExecError {
+            kind: ProgramExecErrorKind::OutOfMemory,
+            detail: ProgramExecErrorDetail::OutputLimitExceeded,
+        });
+    }
+
+    let exit = exit?;
+    let exit_code = match exit.termination {
+        helios_unix::ChildTermination::Exited(code) => code,
+        helios_unix::ChildTermination::Signaled(sig) => {
+            128u32.saturating_add(u32::from(sig.signal))
+        }
+        helios_unix::ChildTermination::Trapped => {
+            return Err(ProgramExecError {
+                kind: ProgramExecErrorKind::Internal,
+                detail: ProgramExecErrorDetail::ChildTrapped,
+            });
+        }
+        helios_unix::ChildTermination::Killed => {
+            return Err(ProgramExecError {
+                kind: ProgramExecErrorKind::Internal,
+                detail: ProgramExecErrorDetail::ChildKilled,
+            });
+        }
+    };
+
+    Ok((
+        ExecResult {
+            instance_id: exit.instance_id,
+            exit_code,
+            output: crate::ExecOutput { stdout, stderr },
+        },
+        exit.filesystem,
+    ))
+}
+
 #[derive(Clone, Debug)]
 pub struct ChildExit {
     pub instance_id: crate::InstanceId,
@@ -2101,6 +2209,12 @@ where
         stdin: Vec<u8>,
         launch: ProgramLaunch<Net, StorageImpl>,
     ) -> Result<(ExecResult, Option<MemoryFs>), ProgramExecError> {
+        let runtime_state = exec_context.runtime_state.clone();
+        let instance_registry = exec_context.instance_registry.clone();
+        let cpu = exec_context.cpu.clone();
+        let max_output_bytes = runtime_state
+            .settings()
+            .get::<crate::process::BufferedExecOutputLimitSetting>();
         let mut child = self.spawn_loaded(exec_context, executable, launch)?;
 
         // Feed stdin in one shot, then close the writer to signal EOF.
@@ -2113,59 +2227,14 @@ where
             drop(writer);
         }
 
-        let stdout_reader = child.take_stdout();
-        let stderr_reader = child.take_stderr();
-
-        let stdout_task = async move {
-            let mut bytes = Vec::new();
-            if let Some(reader) = stdout_reader {
-                while let Some(chunk) = reader.read().await {
-                    bytes.extend_from_slice(&chunk);
-                }
-            }
-            bytes
-        };
-        let stderr_task = async move {
-            let mut bytes = Vec::new();
-            if let Some(reader) = stderr_reader {
-                while let Some(chunk) = reader.read().await {
-                    bytes.extend_from_slice(&chunk);
-                }
-            }
-            bytes
-        };
-
-        let wait_task = child.wait();
-        let (stdout, (stderr, exit)) =
-            futures::future::join(stdout_task, futures::future::join(stderr_task, wait_task)).await;
-        let exit = exit?;
-        let exit_code = match exit.termination {
-            helios_unix::ChildTermination::Exited(code) => code,
-            helios_unix::ChildTermination::Signaled(sig) => {
-                128u32.saturating_add(u32::from(sig.signal))
-            }
-            helios_unix::ChildTermination::Trapped => {
-                return Err(ProgramExecError {
-                    kind: ProgramExecErrorKind::Internal,
-                    detail: ProgramExecErrorDetail::ChildTrapped,
-                });
-            }
-            helios_unix::ChildTermination::Killed => {
-                return Err(ProgramExecError {
-                    kind: ProgramExecErrorKind::Internal,
-                    detail: ProgramExecErrorDetail::ChildKilled,
-                });
-            }
-        };
-
-        Ok((
-            ExecResult {
-                instance_id: exit.instance_id,
-                exit_code,
-                output: crate::ExecOutput { stdout, stderr },
-            },
-            exit.filesystem,
-        ))
+        drain_child_output_bounded(
+            child,
+            max_output_bytes,
+            &runtime_state,
+            &instance_registry,
+            &cpu,
+        )
+        .await
     }
 
     pub(crate) async fn aot(

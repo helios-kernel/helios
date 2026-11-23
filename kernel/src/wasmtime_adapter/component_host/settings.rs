@@ -316,19 +316,20 @@ mod tests {
     fn list_shows_the_descriptor_limit_with_its_unit_and_value() {
         let program = ordinary();
 
-        assert_eq!(
-            list(&program),
-            [SettingEntry {
-                name: "process.descriptor-limit",
-                description: DescriptorLimitSetting::DESCRIPTION,
-                value: SettingValue::Count(1024),
-            }]
-        );
+        let expected = SettingEntry {
+            name: "process.descriptor-limit",
+            description: DescriptorLimitSetting::DESCRIPTION,
+            value: SettingValue::Count(1024),
+        };
+        assert!(list(&program).contains(&expected));
         let views = listing(&program);
-        assert_eq!(views.len(), 1);
-        assert_eq!(views[0].name, "process.descriptor-limit");
-        assert_eq!(views[0].description, DescriptorLimitSetting::DESCRIPTION);
-        assert!(matches!(views[0].value, ValueView::Count(1024)));
+        assert_eq!(views.len(), SETTING_COUNT);
+        let view = views
+            .iter()
+            .find(|view| view.name == "process.descriptor-limit")
+            .expect("descriptor limit appears in listing");
+        assert_eq!(view.description, DescriptorLimitSetting::DESCRIPTION);
+        assert!(matches!(view.value, ValueView::Count(1024)));
     }
 
     #[test]

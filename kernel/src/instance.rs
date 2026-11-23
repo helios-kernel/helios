@@ -1039,11 +1039,30 @@ impl RegisteredInstance {
     /// Charge `bytes` of kernel heap to this instance for as long as
     /// the returned charge is alive.
     pub fn charge_kernel_heap(&self, bytes: u64) -> KernelHeapCharge {
-        self.entry().kernel_bytes.fetch_add(bytes, Ordering::AcqRel);
+        self.add_kernel_heap_bytes(bytes);
         KernelHeapCharge {
             instance: self.clone(),
             bytes,
         }
+    }
+
+    /// Add `bytes` to this instance's attributed kernel-heap footprint.
+    ///
+    /// Callers that maintain a running ledger (such as a store's
+    /// resource-table limiter) pair every addition with a matching
+    /// [`Self::sub_kernel_heap_bytes`].
+    pub fn add_kernel_heap_bytes(&self, bytes: u64) {
+        self.entry().kernel_bytes.fetch_add(bytes, Ordering::AcqRel);
+    }
+
+    /// Subtract `bytes` previously attributed via
+    /// [`Self::add_kernel_heap_bytes`].
+    pub fn sub_kernel_heap_bytes(&self, bytes: u64) {
+        self.entry()
+            .kernel_bytes
+            .update(Ordering::AcqRel, Ordering::Acquire, |charged| {
+                charged.saturating_sub(bytes)
+            });
     }
 
     /// Returns `Some(reason)` when the instance has been condemned by
@@ -1094,13 +1113,7 @@ impl KernelHeapCharge {
 
 impl Drop for KernelHeapCharge {
     fn drop(&mut self) {
-        let bytes = self.bytes;
-        self.instance
-            .entry()
-            .kernel_bytes
-            .update(Ordering::AcqRel, Ordering::Acquire, |charged| {
-                charged.saturating_sub(bytes)
-            });
+        self.instance.sub_kernel_heap_bytes(self.bytes);
     }
 }
 

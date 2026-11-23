@@ -328,10 +328,15 @@ macro_rules! settings {
 #[cfg(feature = "unix")]
 settings! {
     descriptor_limit: crate::DescriptorLimitSetting,
+    component_handle_limit: crate::process::ComponentHandleLimitSetting,
+    buffered_exec_output_limit: crate::process::BufferedExecOutputLimitSetting,
 }
 
 #[cfg(not(feature = "unix"))]
-settings! {}
+settings! {
+    component_handle_limit: crate::process::ComponentHandleLimitSetting,
+    buffered_exec_output_limit: crate::process::BufferedExecOutputLimitSetting,
+}
 
 #[cfg(test)]
 mod tests {
@@ -412,17 +417,33 @@ mod tests {
 
     #[cfg(feature = "unix")]
     #[test]
-    fn the_machine_lists_the_descriptor_limit_and_nothing_else() {
+    fn the_machine_lists_its_registered_settings() {
+        use crate::process::{BufferedExecOutputLimitSetting, ComponentHandleLimitSetting};
+
         let settings = Settings::default();
 
-        assert_eq!(SETTING_COUNT, 1);
+        assert_eq!(SETTING_COUNT, 3);
         assert_eq!(
             settings.entries(),
-            [SettingEntry {
-                name: "process.descriptor-limit",
-                description: DescriptorLimitSetting::DESCRIPTION,
-                value: SettingValue::Count(1024),
-            }]
+            [
+                SettingEntry {
+                    name: "process.descriptor-limit",
+                    description: DescriptorLimitSetting::DESCRIPTION,
+                    value: SettingValue::Count(1024),
+                },
+                SettingEntry {
+                    name: "wasi.max-component-handles",
+                    description: ComponentHandleLimitSetting::DESCRIPTION,
+                    value: SettingValue::Count(ComponentHandleLimitSetting::DEFAULT_LIMIT as u64),
+                },
+                SettingEntry {
+                    name: "programs.max-buffered-exec-bytes",
+                    description: BufferedExecOutputLimitSetting::DESCRIPTION,
+                    value: SettingValue::Bytes(
+                        BufferedExecOutputLimitSetting::DEFAULT_LIMIT as u64
+                    ),
+                },
+            ]
         );
     }
 

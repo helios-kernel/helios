@@ -18,6 +18,7 @@ pub use authority::{
     TtyControlCap, UdpCap, UnmountCap, WriteSettingsCap,
 };
 pub use program_service::{
-    ComponentStdioRefusal, LinuxImageRefusal, ProgramExecError, ProgramExecErrorDetail,
-    ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, UnbindableStdio,
+    BufferedExecOutputLimitSetting, ComponentHandleLimitSetting, ComponentStdioRefusal,
+    LinuxImageRefusal, ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind,
+    ProgramOutOfMemory, RuntimeMessage, UnbindableStdio,
 };
