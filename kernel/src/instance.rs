@@ -276,6 +276,10 @@ pub struct InstanceSnapshot {
     /// User-pool bytes the instance holds: linear memory plus the
     /// memory its stores hold through [`UserMemoryCharge`]s.
     pub memory_bytes: u64,
+    /// User-pool bytes held by in-memory filesystems for files this instance
+    /// created (reported separately from `memory_bytes` because killing an
+    /// instance does not unlink its files).
+    pub storage_bytes: u64,
     pub cpu_busy: u16,
 }
 
@@ -831,6 +835,7 @@ impl InstanceRegistry {
                 started_at: entry.started_at,
                 uptime: now_nanos.saturating_sub(entry.started_at),
                 memory_bytes: entry.user_pool_bytes(),
+                storage_bytes: entry.storage.bytes(),
                 cpu_busy,
             });
         }
@@ -2046,5 +2051,21 @@ mod tests {
 
         drop(clone);
         assert!(registry.snapshot(2).is_empty());
+    }
+
+    #[test]
+    fn snapshot_reports_storage_bytes_separately_from_memory_bytes() {
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("writer-中文-日本語-한국어", 0);
+        let payer = instance.storage_payer();
+        payer.share().add(16_384);
+
+        let snapshots = registry.snapshot(1);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].memory_bytes, 0);
+        assert_eq!(snapshots[0].storage_bytes, 16_384);
+
+        payer.share().sub(4_096);
+        assert_eq!(registry.snapshot(2)[0].storage_bytes, 12_288);
     }
 }
