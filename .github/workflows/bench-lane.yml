@@ -6,7 +6,7 @@ name: bench-lane
 # there is and buys no performance evidence on a pull request, because two
 # runs land on different CPU models and only a paired `bench-suite.yml`
 # run is a before/after claim (AGENTS.md §3.6), so it runs nightly against
-# `dev` and on demand for any ref instead of on every change (#733).
+# `main` and on demand for any ref instead of on every change (#733).
 
 on:
   schedule:
@@ -107,18 +107,24 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: helios
-          # A scheduled run measures `dev`; a dispatch measures its `ref`
+          # A scheduled run measures `main`; a dispatch measures its `ref`
           # input, or the ref it was dispatched on.
-          ref: ${{ inputs.ref || (github.event_name == 'schedule' && 'dev') || github.ref }}
+          ref: ${{ inputs.ref || (github.event_name == 'schedule' && 'main') || github.ref }}
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # The boot payload the guest below boots is signed with CI's key
+      # (#1023); the release key is never used here.
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
-            qemu-system-x86 ovmf \
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build
+            qemu-system-x86 ovmf
             iproute2 nftables dnsmasq-base
+      - name: Grant KVM access
+        run: |
           # GitHub's x86-64 runners expose /dev/kvm; the inspector picks
           # the accelerator by capability, this only fixes permissions.
           if [ -e /dev/kvm ]; then
@@ -128,7 +134,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
+      - uses: ./helios/.github/actions/setup-zig
         with:
           version: 0.13.0
       - name: Stage Limine bootloader share
@@ -146,13 +152,13 @@ jobs:
           make -C "$GITHUB_WORKSPACE/limine"
       - name: Restore WASI tooling artifacts
         id: artifact-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: |
             helios/artifacts/wasi-tools
             helios/artifacts/python3-root
             helios/artifacts/wasix
-          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
+          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/tools/branch-hints/**', 'helios/docs/wasmtime.md', 'helios/api/**', 'helios/api-macro/**', 'helios/wit/**', 'helios/Cargo.toml', 'helios/Cargo.lock', 'helios/rust-toolchain.toml', 'helios/.cargo/config.toml') }}
       - name: Stage WASI tooling artifacts
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios

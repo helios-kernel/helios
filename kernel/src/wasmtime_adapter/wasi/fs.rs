@@ -5,17 +5,19 @@
 //! directory listing order. They resolve every path through the store's
 //! [`Namespace`], so the mount that owns a path decides which filesystem
 //! answers; no surface knows which filesystems exist. Preview3 below,
-//! preview2 (`preview2.rs`) and preview1 (`component_host::service`) call
-//! them and only translate types.
+//! and preview1 (`component_host::service`) call them and only translate
+//! types.
 
 use helios_hal::fs::{
-    FileSystem, FsError as VfsError, FsResult, Metadata, NodeKind, OpenFlags, WritePosition,
+    FileSystem, FilledWrite, FsError as VfsError, FsResult, Landed, Metadata, NodeKind, OpenFlags,
+    Opened, PreparedWrite, RenameMode, WritePosition, WriteProgress,
 };
 use pin_project_lite::pin_project;
 
+use super::fs_types::DescriptorFlags as WasiDescriptorFlags;
 use crate::{
-    ComponentHostNetwork, FileContents, Follow, HeldPath, MountHold, Namespace, Resolved,
-    object_identity,
+    ComponentHostNetwork, FileContents, Follow, HeldPath, MountedOpenHandle, MountedWrite,
+    Namespace, Resolved, object_identity,
 };
 
 use super::*;
@@ -71,23 +73,47 @@ pub(super) fn record_component_fs_profile<CpuImpl, Net, StorageImpl>(
     }
 }
 
-/// An open guest descriptor: the guest path it names, what it named when
-/// it was opened, and the rights it was opened with.
-#[derive(Clone)]
-pub struct FsDescriptor {
-    pub(crate) path: String,
-    pub(crate) kind: FsNodeKind,
-    pub(crate) flags: fs_types::DescriptorFlags,
-    pub(crate) identity: Option<ObjectIdentity>,
-    /// The hold on the mount `open-at` resolved this through, which keeps
-    /// that mount from being unmounted while the descriptor lives. `None`
-    /// for a preopen or a working directory, which the process's authority
-    /// names rather than an open, and for the namespace's root.
-    #[expect(
-        dead_code,
-        reason = "held for its effect: a live share is what makes unmount busy"
-    )]
-    pub(crate) mount: Option<MountHold>,
+/// The `wasi:filesystem` `descriptor-flags` bit that names each
+/// [`FsDescriptorFlags`] bit; the node handle's flags carry the same set.
+const WASI_DESCRIPTOR_FLAGS: [(WasiDescriptorFlags, FsDescriptorFlags); 6] = [
+    (WasiDescriptorFlags::READ, FsDescriptorFlags::READ),
+    (WasiDescriptorFlags::WRITE, FsDescriptorFlags::WRITE),
+    (
+        WasiDescriptorFlags::FILE_INTEGRITY_SYNC,
+        FsDescriptorFlags::FILE_INTEGRITY_SYNC,
+    ),
+    (
+        WasiDescriptorFlags::DATA_INTEGRITY_SYNC,
+        FsDescriptorFlags::DATA_INTEGRITY_SYNC,
+    ),
+    (
+        WasiDescriptorFlags::REQUESTED_WRITE_SYNC,
+        FsDescriptorFlags::REQUESTED_WRITE_SYNC,
+    ),
+    (
+        WasiDescriptorFlags::MUTATE_DIRECTORY,
+        FsDescriptorFlags::MUTATE_DIRECTORY,
+    ),
+];
+
+/// The node-handle flags a `wasi:filesystem` caller asked for.
+pub(crate) fn descriptor_flags_from_wasi(flags: WasiDescriptorFlags) -> FsDescriptorFlags {
+    WASI_DESCRIPTOR_FLAGS
+        .iter()
+        .filter(|(wasi, _)| flags.contains(*wasi))
+        .fold(FsDescriptorFlags::empty(), |result, (_, node)| {
+            result | *node
+        })
+}
+
+/// A node handle's flags as `wasi:filesystem` reports them.
+pub(crate) fn descriptor_flags_to_wasi(flags: FsDescriptorFlags) -> WasiDescriptorFlags {
+    WASI_DESCRIPTOR_FLAGS
+        .iter()
+        .filter(|(_, node)| flags.contains(*node))
+        .fold(WasiDescriptorFlags::empty(), |result, (wasi, _)| {
+            result | *wasi
+        })
 }
 
 /// What every filesystem operation here resolves with.
@@ -110,6 +136,7 @@ pub(crate) fn fs_error_code(error: VfsError) -> fs_types::ErrorCode {
         VfsError::IllegalByteSequence => fs_types::ErrorCode::IllegalByteSequence,
         VfsError::NameTooLong => fs_types::ErrorCode::NameTooLong,
         VfsError::Unsupported => fs_types::ErrorCode::Unsupported,
+        VfsError::NoSpace => fs_types::ErrorCode::InsufficientSpace,
         VfsError::Io => fs_types::ErrorCode::Io,
     }
 }
@@ -119,6 +146,10 @@ pub(crate) fn node_kind(kind: NodeKind) -> FsNodeKind {
         NodeKind::Directory => FsNodeKind::Directory,
         NodeKind::File => FsNodeKind::File,
         NodeKind::Symlink => FsNodeKind::Symlink,
+        NodeKind::CharacterDevice => FsNodeKind::CharacterDevice,
+        NodeKind::BlockDevice => FsNodeKind::BlockDevice,
+        NodeKind::Fifo => FsNodeKind::Fifo,
+        NodeKind::Socket => FsNodeKind::Socket,
     }
 }
 
@@ -127,6 +158,10 @@ pub(crate) fn descriptor_type_from_node_kind(kind: FsNodeKind) -> fs_types::Desc
         FsNodeKind::Directory => fs_types::DescriptorType::Directory,
         FsNodeKind::File => fs_types::DescriptorType::RegularFile,
         FsNodeKind::Symlink => fs_types::DescriptorType::SymbolicLink,
+        FsNodeKind::CharacterDevice => fs_types::DescriptorType::CharacterDevice,
+        FsNodeKind::BlockDevice => fs_types::DescriptorType::BlockDevice,
+        FsNodeKind::Fifo => fs_types::DescriptorType::Fifo,
+        FsNodeKind::Socket => fs_types::DescriptorType::Socket,
     }
 }
 
@@ -193,36 +228,53 @@ pub(crate) async fn open_at<StorageImpl>(
     path_flags: fs_types::PathFlags,
     path: &str,
     open_flags: fs_types::OpenFlags,
-    requested: fs_types::DescriptorFlags,
+    requested: FsDescriptorFlags,
     now: u64,
 ) -> FsOpResult<FsDescriptor>
 where
     StorageImpl: crate::Storage,
 {
-    let base = base.descriptor();
-    // Every right the flags need is proved before the path is resolved, so a
-    // refusal reaches no filesystem, a host share included, and holds
-    // whether or not the file exists.
-    let truncate = open_flags
-        .contains(fs_types::OpenFlags::TRUNCATE)
-        .then(|| Ok::<_, fs_types::ErrorCode>((base.grant()?, base.grant()?)))
-        .transpose()?;
-    let create = open_flags
-        .contains(fs_types::OpenFlags::CREATE)
-        .then(|| base.grant())
-        .transpose()?;
-    let absolute = child_path(base, path)?;
+    let grant = base.prepare_open(open_flags)?;
+    let absolute = child_path(grant.base().descriptor(), path)?;
+    open_prepared(
+        namespace, &grant, path_flags, &absolute, open_flags, requested, now,
+    )
+    .await
+}
+
+async fn open_prepared<StorageImpl, D>(
+    namespace: &Namespace<StorageImpl>,
+    grant: &OpenGrant<D>,
+    path_flags: fs_types::PathFlags,
+    absolute: &str,
+    open_flags: fs_types::OpenFlags,
+    requested: FsDescriptorFlags,
+    now: u64,
+) -> FsOpResult<FsDescriptor>
+where
+    StorageImpl: crate::Storage,
+    D: core::borrow::Borrow<FsDescriptor>,
+{
+    let base = grant.base().descriptor();
+    let truncate = grant.truncate();
+    let create = grant.create();
     let resolved = namespace
-        .resolve_following(&absolute, follow_within(base, path_flags))
+        .resolve_following(absolute, follow_within(base, path_flags))
         .await
         .map_err(fs_error_code)?;
     let fs = resolved.fs();
-    let (metadata, flags) = match fs.stat(resolved.path()).await {
+    let (opened, flags) = match fs.stat(resolved.path()).await {
         Ok(existing) => {
             if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
                 && open_flags.contains(fs_types::OpenFlags::CREATE)
             {
                 return Err(fs_types::ErrorCode::Exist);
+            }
+            if existing.kind == NodeKind::Symlink {
+                return Err(fs_types::ErrorCode::Loop);
+            }
+            if let Some(refusal) = existing.kind.open_refusal() {
+                return Err(fs_error_code(refusal));
             }
             let directory = existing.kind == NodeKind::Directory;
             if open_flags.contains(fs_types::OpenFlags::DIRECTORY) && !directory {
@@ -234,7 +286,18 @@ where
             let flags =
                 effective_open_descriptor_flags(base.flags, requested, node_kind(existing.kind))?;
             match truncate {
-                None => (existing, flags),
+                None => {
+                    let open_mode = if directory {
+                        OpenFlags::DIRECTORY
+                    } else {
+                        OpenFlags::empty()
+                    };
+                    let opened = fs
+                        .open(resolved.path(), open_mode, now)
+                        .await
+                        .map_err(fs_error_code)?;
+                    (opened, flags)
+                }
                 Some(rights) => {
                     if existing.kind != NodeKind::File {
                         return Err(fs_types::ErrorCode::IsDirectory);
@@ -248,21 +311,89 @@ where
                 return Err(fs_types::ErrorCode::NoEntry);
             };
             if open_flags.contains(fs_types::OpenFlags::DIRECTORY) {
-                return Err(fs_types::ErrorCode::Unsupported);
+                return Err(fs_types::ErrorCode::Invalid);
             }
             let flags = effective_open_descriptor_flags(base.flags, requested, FsNodeKind::File)?;
             (create_file(&resolved, mutate, now).await?, flags)
         }
         Err(error) => return Err(fs_error_code(error)),
     };
-    let kind = node_kind(metadata.kind);
+    let kind = node_kind(opened.metadata.kind);
     Ok(FsDescriptor {
         path: String::from(resolved.absolute()),
         kind,
         flags,
-        identity: Some(object_identity(&metadata)),
+        identity: Some(object_identity(&opened.metadata)),
         mount: resolved.hold(),
+        open: Some(opened.handle),
     })
+}
+
+pub struct PreparedOpenAt<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    target: FsOpResult<(OpenGrant<FsDescriptor>, Namespace<StorageImpl>, String)>,
+    path_flags: fs_types::PathFlags,
+    open_flags: fs_types::OpenFlags,
+    flags: FsDescriptorFlags,
+    now: u64,
+    profile: Option<ComponentFsProfile<CpuImpl, Net, StorageImpl>>,
+}
+
+pub(crate) fn prepare_open<CpuImpl, Net, StorageImpl>(
+    store: &mut StoreData<CpuImpl, Net, StorageImpl>,
+    descriptor: Resource<FsDescriptor>,
+    path_flags: fs_types::PathFlags,
+    path: &str,
+    open_flags: fs_types::OpenFlags,
+    flags: FsDescriptorFlags,
+) -> PreparedOpenAt<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let profile = component_fs_profile(store);
+    let now = store.now_nanos();
+    let target = descriptor_in(store, &descriptor).and_then(|(base, namespace)| {
+        let grant = base.prepare_open(open_flags)?;
+        let absolute = child_path(grant.base().descriptor(), path)?;
+        Ok((grant, namespace, absolute))
+    });
+    PreparedOpenAt {
+        target,
+        path_flags,
+        open_flags,
+        flags,
+        now,
+        profile,
+    }
+}
+
+pub(crate) async fn execute_open<CpuImpl, Net, StorageImpl>(
+    prepared: PreparedOpenAt<CpuImpl, Net, StorageImpl>,
+) -> FsOpResult<FsDescriptor>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let (grant, namespace, absolute) = prepared.target?;
+    let opened = open_prepared(
+        &namespace,
+        &grant,
+        prepared.path_flags,
+        &absolute,
+        prepared.open_flags,
+        prepared.flags,
+        prepared.now,
+    )
+    .await?;
+    record_component_fs_profile(prepared.profile, "open-at");
+    Ok(opened)
 }
 
 /// Creates the file `resolved` names, in the directory `_mutate` proves the
@@ -271,7 +402,7 @@ async fn create_file<StorageImpl>(
     resolved: &Resolved<'_, StorageImpl>,
     _mutate: Granted<'_, Directory, Mutate>,
     now: u64,
-) -> FsOpResult<Metadata>
+) -> FsOpResult<Opened<MountedOpenHandle>>
 where
     StorageImpl: crate::Storage,
 {
@@ -292,7 +423,7 @@ async fn truncate_file<StorageImpl>(
         Granted<'_, Directory, Write>,
     ),
     now: u64,
-) -> FsOpResult<Metadata>
+) -> FsOpResult<Opened<MountedOpenHandle>>
 where
     StorageImpl: crate::Storage,
 {
@@ -304,14 +435,20 @@ where
         .map_err(fs_error_code)
 }
 
-/// How a path below `base` follows a final symbolic link: when the guest
-/// asks it to, and then never out of `base`.
-pub(crate) fn follow_within(base: &FsDescriptor, path_flags: fs_types::PathFlags) -> Follow<'_> {
+/// How a path below `floor` follows a final symbolic link: when the guest
+/// asks it to, and then never out of `floor`.
+pub(crate) fn follow_within_path(floor: &str, path_flags: fs_types::PathFlags) -> Follow<'_> {
     if path_flags.contains(fs_types::PathFlags::SYMLINK_FOLLOW) {
-        Follow::Within(&base.path)
+        Follow::Within(floor)
     } else {
         Follow::No
     }
+}
+
+/// How a path below `base` follows a final symbolic link: when the guest
+/// asks it to, and then never out of `base`.
+pub(crate) fn follow_within(base: &FsDescriptor, path_flags: fs_types::PathFlags) -> Follow<'_> {
+    follow_within_path(&base.path, path_flags)
 }
 
 /// Describes the object `absolute` names, following a final symbolic link
@@ -330,6 +467,26 @@ where
         .map_err(fs_error_code)
 }
 
+/// Describes an open descriptor, using its open handle when present so
+/// unlinked or unnamed files still report live metadata (`nlink == 0`).
+pub(crate) async fn stat_descriptor<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    descriptor: &FsDescriptor,
+) -> FsOpResult<Metadata>
+where
+    StorageImpl: crate::Storage,
+{
+    if let Some(handle) = descriptor.open.as_ref() {
+        let resolved = resolve(namespace, &descriptor.path)?;
+        return resolved
+            .fs()
+            .stat_handle(handle)
+            .await
+            .map_err(fs_error_code);
+    }
+    stat_path(namespace, &descriptor.path, Follow::No).await
+}
+
 /// The metadata of `path` below `base`, which must be readable.
 pub(crate) async fn stat_at<StorageImpl>(
     namespace: &Namespace<StorageImpl>,
@@ -343,6 +500,61 @@ where
     let base = base.descriptor();
     let absolute = child_path(base, path)?;
     stat_path(namespace, &absolute, follow_within(base, path_flags)).await
+}
+
+pub struct PreparedStat<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    target: FsOpResult<(FsDescriptor, Namespace<StorageImpl>, String)>,
+    path_flags: fs_types::PathFlags,
+    profile: Option<ComponentFsProfile<CpuImpl, Net, StorageImpl>>,
+}
+
+pub(crate) fn prepare_stat<CpuImpl, Net, StorageImpl>(
+    store: &mut StoreData<CpuImpl, Net, StorageImpl>,
+    descriptor: Resource<FsDescriptor>,
+    path_flags: fs_types::PathFlags,
+    path: &str,
+) -> PreparedStat<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let profile = component_fs_profile(store);
+    let target = descriptor_in(store, &descriptor).and_then(|(base, namespace)| {
+        let read = base.grant::<Directory, Read>()?;
+        let absolute = child_path(read.descriptor(), path)?;
+        Ok((base, namespace, absolute))
+    });
+    PreparedStat {
+        target,
+        path_flags,
+        profile,
+    }
+}
+
+pub(crate) async fn stat_prepared<CpuImpl, Net, StorageImpl>(
+    prepared: PreparedStat<CpuImpl, Net, StorageImpl>,
+    operation: &'static str,
+) -> FsOpResult<Metadata>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let (base, namespace, absolute) = prepared.target?;
+    let result = stat_path(
+        &namespace,
+        &absolute,
+        follow_within(&base, prepared.path_flags),
+    )
+    .await;
+    record_component_fs_profile(prepared.profile, operation);
+    result
 }
 
 /// The path below `base` that `path` names, refused when it names `base`
@@ -367,8 +579,9 @@ pub(crate) async fn read<StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
+    let descriptor = file.descriptor();
     read_resolved(
-        &resolve(namespace, &file.descriptor().path)?,
+        &resolve(namespace, &descriptor.path)?.with_open(descriptor.open.as_ref()),
         offset,
         max_bytes,
     )
@@ -383,7 +596,8 @@ pub(crate) fn read_stream_target<StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
-    resolve(namespace, &file.descriptor().path).map(|resolved| resolved.held())
+    let descriptor = file.descriptor();
+    resolve(namespace, &descriptor.path).map(|resolved| resolved.held_open(descriptor.open.clone()))
 }
 
 /// The file a stream writes across polls.
@@ -394,7 +608,8 @@ pub(crate) fn write_stream_target<StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
-    resolve(namespace, &file.descriptor().path).map(|resolved| resolved.held())
+    let descriptor = file.descriptor();
+    resolve(namespace, &descriptor.path).map(|resolved| resolved.held_open(descriptor.open.clone()))
 }
 
 /// One positional read through `resolved`.
@@ -406,11 +621,21 @@ pub(crate) async fn read_resolved<StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
-    resolved
-        .fs()
-        .read_at(resolved.path(), offset, max_bytes)
-        .await
-        .map_err(fs_error_code)
+    let result = match resolved.open() {
+        Some(handle) => {
+            resolved
+                .fs()
+                .read_handle_at(handle, offset, max_bytes)
+                .await
+        }
+        None => {
+            resolved
+                .fs()
+                .read_at(resolved.path(), offset, max_bytes)
+                .await
+        }
+    };
+    result.map_err(fs_error_code)
 }
 
 /// One positional read through a held path, for a stream that must own
@@ -426,15 +651,20 @@ where
     read_resolved(&held.resolved(), offset, max_bytes).await
 }
 
-/// Writes `bytes` to the file `descriptor` names, and resolves with the
-/// offset just past them: where a sequential writer continues.
+/// Writes `bytes` to the file `descriptor` names, and resolves with where
+/// they landed and how many did: fewer than `bytes` only when the
+/// filesystem ran out of space after storing a prefix.
+///
+/// The guests' write paths are streams over [`write_resolved`]; this is
+/// the one-shot form the filesystem tests drive.
+#[cfg(test)]
 pub(crate) async fn write<StorageImpl>(
     namespace: &Namespace<StorageImpl>,
     file: Granted<'_, RegularFile, Write>,
     position: WritePosition,
     bytes: &[u8],
     now: u64,
-) -> FsOpResult<u64>
+) -> FsOpResult<Landed>
 where
     StorageImpl: crate::Storage,
 {
@@ -449,17 +679,19 @@ pub(crate) fn writable_file<'a, StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
-    resolve(namespace, &file.descriptor().path)
+    let descriptor = file.descriptor();
+    resolve(namespace, &descriptor.path)
+        .map(|resolved| resolved.with_open(descriptor.open.as_ref()))
 }
 
-/// Writes `bytes` through `resolved`, and resolves with the offset just
-/// past them.
+/// Writes `bytes` through `resolved`, and resolves with where they landed
+/// and how many did ([`Landed`]).
 pub(crate) async fn write_resolved<StorageImpl>(
     resolved: &Resolved<'_, StorageImpl>,
     position: WritePosition,
     bytes: &[u8],
     now: u64,
-) -> FsOpResult<u64>
+) -> FsOpResult<Landed>
 where
     StorageImpl: crate::Storage,
 {
@@ -469,9 +701,33 @@ where
     .await
 }
 
+/// Stages a write of `len` bytes at `position` through `resolved`, for a
+/// caller that fills each round itself straight from where its bytes are
+/// ([`helios_hal::fs::PreparedWrite::fill`]) and has to wait before a
+/// round for those bytes to be readable, as guest pages back from swap.
+/// The rounds land at consecutive offsets from the one the write begins
+/// at, which the last submit answers.
+pub(crate) async fn prepare_resolved_write<'a, StorageImpl>(
+    resolved: &'a Resolved<'_, StorageImpl>,
+    position: WritePosition,
+    len: usize,
+    now: u64,
+) -> FsOpResult<impl helios_hal::fs::PreparedWrite + 'a>
+where
+    StorageImpl: crate::Storage,
+{
+    let fs = resolved.writable().map_err(fs_error_code)?;
+    let result = match resolved.open() {
+        Some(handle) => fs.prepare_write_handle(handle, position, len, now).await,
+        None => fs.prepare_write(resolved.path(), position, len, now).await,
+    };
+    result.map_err(fs_error_code)
+}
+
 /// Writes `len` bytes that `source` copies straight into the
 /// filesystem's destination ([`helios_hal::fs::write_with`]), and
-/// resolves with the offset just past them. An append lands at the end of
+/// resolves with where they landed and how many did ([`Landed::end`] is
+/// where a sequential writer continues). An append lands at the end of
 /// the file as the filesystem sees it when the write arrives, so its end
 /// is the filesystem's answer, never the caller's idea of where the file
 /// ended.
@@ -486,18 +742,19 @@ pub(crate) async fn write_resolved_with<StorageImpl, S>(
     len: usize,
     now: u64,
     source: S,
-) -> FsOpResult<u64>
+) -> FsOpResult<Landed>
 where
     StorageImpl: crate::Storage,
     S: FnMut(usize, &mut [u8]),
 {
     let fs = resolved.writable().map_err(fs_error_code)?;
-    let landed = helios_hal::fs::write_with(fs, resolved.path(), position, len, now, source)
-        .await
-        .map_err(fs_error_code)?;
-    landed
-        .checked_add(len as u64)
-        .ok_or(fs_types::ErrorCode::Overflow)
+    let result = match resolved.open() {
+        Some(handle) => {
+            helios_hal::fs::write_handle_with(fs, handle, position, len, now, source).await
+        }
+        None => helios_hal::fs::write_with(fs, resolved.path(), position, len, now, source).await,
+    };
+    result.map_err(fs_error_code)
 }
 
 pub(crate) async fn set_size<StorageImpl>(
@@ -509,13 +766,14 @@ pub(crate) async fn set_size<StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
-    let resolved = resolve(namespace, &file.descriptor().path)?;
-    resolved
-        .writable()
-        .map_err(fs_error_code)?
-        .set_size(resolved.path(), size, now)
-        .await
-        .map_err(fs_error_code)
+    let descriptor = file.descriptor();
+    let resolved = resolve(namespace, &descriptor.path)?;
+    let fs = resolved.writable().map_err(fs_error_code)?;
+    let result = match descriptor.open.as_ref() {
+        Some(handle) => fs.set_size_handle(handle, size, now).await,
+        None => fs.set_size(resolved.path(), size, now).await,
+    };
+    result.map_err(fs_error_code)
 }
 
 /// Sets the times of the object `target` names; `None` leaves one alone.
@@ -529,9 +787,20 @@ pub(crate) async fn set_times<StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
+    let descriptor = target.descriptor();
+    if let Some(handle) = descriptor.open.as_ref() {
+        let resolved = resolve(namespace, &descriptor.path)?;
+        return resolved
+            .writable()
+            .map_err(fs_error_code)?
+            .set_times_handle(handle, access_nanos, modified_nanos, now)
+            .await
+            .map_err(fs_error_code);
+    }
     set_times_of(
         namespace,
-        &target.descriptor().path,
+        &descriptor.path,
+        Follow::No,
         access_nanos,
         modified_nanos,
         now,
@@ -541,24 +810,78 @@ where
 
 /// Sets the times of the object at `path` below `base`; `None` leaves one
 /// alone.
-pub(crate) async fn set_times_at<StorageImpl>(
+pub struct PreparedSetTimesAt<StorageImpl: crate::Storage> {
+    namespace: Namespace<StorageImpl>,
+    floor: String,
+    path_flags: fs_types::PathFlags,
+    absolute: String,
+    access_nanos: Option<u64>,
+    modified_nanos: Option<u64>,
+    now: u64,
+}
+
+impl<StorageImpl: crate::Storage> PreparedSetTimesAt<StorageImpl> {
+    pub(crate) fn new(
+        namespace: Namespace<StorageImpl>,
+        base: Granted<'_, Directory, Retime>,
+        path_flags: fs_types::PathFlags,
+        path: &str,
+        access_nanos: Option<u64>,
+        modified_nanos: Option<u64>,
+        now: u64,
+    ) -> FsOpResult<Self> {
+        let floor = base.descriptor().path.clone();
+        let absolute = child_path(base.descriptor(), path)?;
+        Ok(Self {
+            namespace,
+            floor,
+            path_flags,
+            absolute,
+            access_nanos,
+            modified_nanos,
+            now,
+        })
+    }
+
+    pub(crate) async fn execute(self) -> FsOpResult<()> {
+        set_times_of(
+            &self.namespace,
+            &self.absolute,
+            follow_within_path(&self.floor, self.path_flags),
+            self.access_nanos,
+            self.modified_nanos,
+            self.now,
+        )
+        .await
+    }
+}
+
+pub(crate) async fn set_times_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     base: Granted<'_, Directory, Retime>,
+    path_flags: fs_types::PathFlags,
     path: &str,
     access_nanos: Option<u64>,
     modified_nanos: Option<u64>,
     now: u64,
-) -> FsOpResult<()>
-where
-    StorageImpl: crate::Storage,
-{
-    let absolute = child_path(base.descriptor(), path)?;
-    set_times_of(namespace, &absolute, access_nanos, modified_nanos, now).await
+) -> FsOpResult<()> {
+    PreparedSetTimesAt::new(
+        namespace.clone(),
+        base,
+        path_flags,
+        path,
+        access_nanos,
+        modified_nanos,
+        now,
+    )?
+    .execute()
+    .await
 }
 
 async fn set_times_of<StorageImpl>(
     namespace: &Namespace<StorageImpl>,
     absolute: &str,
+    follow: Follow<'_>,
     access_nanos: Option<u64>,
     modified_nanos: Option<u64>,
     now: u64,
@@ -566,7 +889,10 @@ async fn set_times_of<StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
-    let resolved = resolve(namespace, absolute)?;
+    let resolved = namespace
+        .resolve_following(absolute, follow)
+        .await
+        .map_err(fs_error_code)?;
     resolved
         .writable()
         .map_err(fs_error_code)?
@@ -584,9 +910,12 @@ pub(crate) async fn read_directory<StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
-    let mut entries: Vec<fs_types::DirectoryEntry> = namespace
-        .list(&directory.descriptor().path)
-        .await
+    let descriptor = directory.descriptor();
+    let listed = match descriptor.open.as_ref() {
+        Some(handle) => namespace.list_open(&descriptor.path, handle).await,
+        None => namespace.list(&descriptor.path).await,
+    };
+    let mut entries: Vec<fs_types::DirectoryEntry> = listed
         .map_err(fs_error_code)?
         .into_iter()
         .map(|entry| fs_types::DirectoryEntry {
@@ -602,145 +931,332 @@ where
     Ok(entries)
 }
 
-pub(crate) async fn create_directory_at<StorageImpl>(
+pub struct PreparedCreateDirectoryAt<StorageImpl: crate::Storage> {
+    namespace: Namespace<StorageImpl>,
+    absolute: String,
+    now: u64,
+}
+
+impl<StorageImpl: crate::Storage> PreparedCreateDirectoryAt<StorageImpl> {
+    pub(crate) fn new(
+        namespace: Namespace<StorageImpl>,
+        base: Granted<'_, Directory, Mutate>,
+        path: &str,
+        now: u64,
+    ) -> FsOpResult<Self> {
+        let absolute = child_path(base.descriptor(), path)?;
+        Ok(Self {
+            namespace,
+            absolute,
+            now,
+        })
+    }
+
+    pub(crate) async fn execute(self) -> FsOpResult<()> {
+        let resolved = resolve(&self.namespace, &self.absolute)?;
+        if resolved.is_mount_root() {
+            return Err(fs_types::ErrorCode::Exist);
+        }
+        resolved
+            .writable()
+            .map_err(fs_error_code)?
+            .create_directory(resolved.path(), self.now)
+            .await
+            .map_err(fs_error_code)
+    }
+}
+
+pub(crate) async fn create_directory_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     base: Granted<'_, Directory, Mutate>,
     path: &str,
     now: u64,
-) -> FsOpResult<()>
-where
-    StorageImpl: crate::Storage,
-{
-    let absolute = child_path(base.descriptor(), path)?;
-    let resolved = resolve(namespace, &absolute)?;
-    if resolved.is_mount_root() {
-        return Err(fs_types::ErrorCode::Exist);
-    }
-    resolved
-        .writable()
-        .map_err(fs_error_code)?
-        .create_directory(resolved.path(), now)
+) -> FsOpResult<()> {
+    PreparedCreateDirectoryAt::new(namespace.clone(), base, path, now)?
+        .execute()
         .await
-        .map_err(fs_error_code)
 }
 
-pub(crate) async fn remove_directory_at<StorageImpl>(
+pub struct PreparedRemoveDirectoryAt<StorageImpl: crate::Storage> {
+    namespace: Namespace<StorageImpl>,
+    absolute: String,
+    now: u64,
+}
+
+impl<StorageImpl: crate::Storage> PreparedRemoveDirectoryAt<StorageImpl> {
+    pub(crate) fn new(
+        namespace: Namespace<StorageImpl>,
+        base: Granted<'_, Directory, Mutate>,
+        path: &str,
+        now: u64,
+    ) -> FsOpResult<Self> {
+        let absolute = child_below(base.descriptor(), path)?;
+        Ok(Self {
+            namespace,
+            absolute,
+            now,
+        })
+    }
+
+    pub(crate) async fn execute(self) -> FsOpResult<()> {
+        self.namespace
+            .remove_directory(&self.absolute, self.now)
+            .await
+            .map_err(fs_error_code)
+    }
+}
+
+pub(crate) async fn remove_directory_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     base: Granted<'_, Directory, Mutate>,
     path: &str,
-) -> FsOpResult<()>
-where
-    StorageImpl: crate::Storage,
-{
-    let absolute = child_below(base.descriptor(), path)?;
-    namespace
-        .remove_directory(&absolute)
+    now: u64,
+) -> FsOpResult<()> {
+    PreparedRemoveDirectoryAt::new(namespace.clone(), base, path, now)?
+        .execute()
         .await
-        .map_err(fs_error_code)
 }
 
-pub(crate) async fn unlink_file_at<StorageImpl>(
+pub struct PreparedUnlinkFileAt<StorageImpl: crate::Storage> {
+    namespace: Namespace<StorageImpl>,
+    absolute: String,
+    now: u64,
+}
+
+impl<StorageImpl: crate::Storage> PreparedUnlinkFileAt<StorageImpl> {
+    pub(crate) fn new(
+        namespace: Namespace<StorageImpl>,
+        base: Granted<'_, Directory, Mutate>,
+        path: &str,
+        now: u64,
+    ) -> FsOpResult<Self> {
+        let absolute = child_below(base.descriptor(), path)?;
+        Ok(Self {
+            namespace,
+            absolute,
+            now,
+        })
+    }
+
+    pub(crate) async fn execute(self) -> FsOpResult<()> {
+        let resolved = resolve(&self.namespace, &self.absolute)?;
+        if resolved.is_mount_root() {
+            return Err(fs_types::ErrorCode::IsDirectory);
+        }
+        resolved
+            .writable()
+            .map_err(fs_error_code)?
+            .unlink(resolved.path(), self.now)
+            .await
+            .map_err(fs_error_code)
+    }
+}
+
+pub(crate) async fn unlink_file_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     base: Granted<'_, Directory, Mutate>,
     path: &str,
-) -> FsOpResult<()>
-where
-    StorageImpl: crate::Storage,
-{
-    let absolute = child_below(base.descriptor(), path)?;
-    let resolved = resolve(namespace, &absolute)?;
-    if resolved.is_mount_root() {
-        return Err(fs_types::ErrorCode::IsDirectory);
-    }
-    resolved
-        .writable()
-        .map_err(fs_error_code)?
-        .unlink(resolved.path())
+    now: u64,
+) -> FsOpResult<()> {
+    PreparedUnlinkFileAt::new(namespace.clone(), base, path, now)?
+        .execute()
         .await
-        .map_err(fs_error_code)
 }
 
 /// Renames within one mount; across two, `cross-device`. A rename is a link
 /// that also removes the source entry, so it follows the link's rule.
-pub(crate) async fn rename_at<StorageImpl>(
+pub struct PreparedRenameAt<StorageImpl: crate::Storage> {
+    namespace: Namespace<StorageImpl>,
+    absolute: String,
+    destination: String,
+    now: u64,
+}
+
+impl<StorageImpl: crate::Storage> PreparedRenameAt<StorageImpl> {
+    pub(crate) fn new(
+        namespace: Namespace<StorageImpl>,
+        rename: RenameGrant<'_, '_>,
+        source_path: &str,
+        destination_path: &str,
+        now: u64,
+    ) -> FsOpResult<Self> {
+        let absolute = child_below(rename.source(), source_path)?;
+        let destination = child_below(rename.destination(), destination_path)?;
+        Ok(Self {
+            namespace,
+            absolute,
+            destination,
+            now,
+        })
+    }
+
+    pub(crate) async fn execute(self) -> FsOpResult<()> {
+        self.namespace
+            .rename(
+                &self.absolute,
+                &self.destination,
+                RenameMode::Replace,
+                self.now,
+            )
+            .await
+            .map_err(fs_error_code)
+    }
+}
+
+pub(crate) async fn rename_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     rename: RenameGrant<'_, '_>,
     source_path: &str,
     destination_path: &str,
     now: u64,
-) -> FsOpResult<()>
-where
-    StorageImpl: crate::Storage,
-{
-    let source = child_below(rename.source(), source_path)?;
-    let destination = child_below(rename.destination(), destination_path)?;
-    namespace
-        .rename(&source, &destination, now)
-        .await
-        .map_err(fs_error_code)
+) -> FsOpResult<()> {
+    PreparedRenameAt::new(
+        namespace.clone(),
+        rename,
+        source_path,
+        destination_path,
+        now,
+    )?
+    .execute()
+    .await
 }
 
 /// Links within one mount; across two, `cross-device`.
-pub(crate) async fn link_at<StorageImpl>(
+pub struct PreparedLinkAt<StorageImpl: crate::Storage> {
+    namespace: Namespace<StorageImpl>,
+    absolute: String,
+    destination: String,
+    now: u64,
+}
+
+impl<StorageImpl: crate::Storage> PreparedLinkAt<StorageImpl> {
+    pub(crate) fn new(
+        namespace: Namespace<StorageImpl>,
+        link: AliasGrant<'_, '_>,
+        source_path: &str,
+        destination_path: &str,
+        now: u64,
+    ) -> FsOpResult<Self> {
+        let absolute = child_path(link.source(), source_path)?;
+        let destination = child_path(link.destination(), destination_path)?;
+        Ok(Self {
+            namespace,
+            absolute,
+            destination,
+            now,
+        })
+    }
+
+    pub(crate) async fn execute(self) -> FsOpResult<()> {
+        self.namespace
+            .link(&self.absolute, &self.destination, self.now)
+            .await
+            .map_err(fs_error_code)
+    }
+}
+
+pub(crate) async fn link_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     link: AliasGrant<'_, '_>,
     source_path: &str,
     destination_path: &str,
     now: u64,
-) -> FsOpResult<()>
-where
-    StorageImpl: crate::Storage,
-{
-    let source = child_path(link.source(), source_path)?;
-    let destination = child_path(link.destination(), destination_path)?;
-    namespace
-        .link(&source, &destination, now)
+) -> FsOpResult<()> {
+    PreparedLinkAt::new(namespace.clone(), link, source_path, destination_path, now)?
+        .execute()
         .await
-        .map_err(fs_error_code)
 }
 
 /// Creates a symbolic link at `path` below `base` whose target text is
 /// `target`. The target must name something inside the link's directory.
-pub(crate) async fn symlink_at<StorageImpl>(
+pub struct PreparedSymlinkAt<StorageImpl: crate::Storage> {
+    namespace: Namespace<StorageImpl>,
+    absolute: String,
+    target: String,
+    now: u64,
+}
+
+impl<StorageImpl: crate::Storage> PreparedSymlinkAt<StorageImpl> {
+    pub(crate) fn new(
+        namespace: Namespace<StorageImpl>,
+        base: Granted<'_, Directory, Mutate>,
+        target: &str,
+        path: &str,
+        now: u64,
+    ) -> FsOpResult<Self> {
+        let absolute = child_below(base.descriptor(), path)?;
+        crate::symlink_target(&absolute, target).map_err(fs_error_code)?;
+        Ok(Self {
+            namespace,
+            absolute,
+            target: target.to_owned(),
+            now,
+        })
+    }
+
+    pub(crate) async fn execute(self) -> FsOpResult<()> {
+        let resolved = resolve(&self.namespace, &self.absolute)?;
+        resolved
+            .writable()
+            .map_err(fs_error_code)?
+            .symlink(&self.target, resolved.path(), self.now)
+            .await
+            .map_err(fs_error_code)
+    }
+}
+
+pub(crate) async fn symlink_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     base: Granted<'_, Directory, Mutate>,
     target: &str,
     path: &str,
     now: u64,
-) -> FsOpResult<()>
-where
-    StorageImpl: crate::Storage,
-{
-    let absolute = child_below(base.descriptor(), path)?;
-    crate::symlink_target(&absolute, target).map_err(fs_error_code)?;
-    let resolved = resolve(namespace, &absolute)?;
-    resolved
-        .writable()
-        .map_err(fs_error_code)?
-        .symlink(target, resolved.path(), now)
+) -> FsOpResult<()> {
+    PreparedSymlinkAt::new(namespace.clone(), base, target, path, now)?
+        .execute()
         .await
-        .map_err(fs_error_code)
 }
 
 /// The target text of the symbolic link at `path` below `base`, refused
 /// when it would name something outside the link's directory.
-pub(crate) async fn readlink_at<StorageImpl>(
+pub struct PreparedReadlinkAt<StorageImpl: crate::Storage> {
+    namespace: Namespace<StorageImpl>,
+    absolute: String,
+}
+
+impl<StorageImpl: crate::Storage> PreparedReadlinkAt<StorageImpl> {
+    pub(crate) fn new(
+        namespace: Namespace<StorageImpl>,
+        base: Granted<'_, Directory, Read>,
+        path: &str,
+    ) -> FsOpResult<Self> {
+        let absolute = child_path(base.descriptor(), path)?;
+        Ok(Self {
+            namespace,
+            absolute,
+        })
+    }
+
+    pub(crate) async fn execute(self) -> FsOpResult<String> {
+        let resolved = resolve(&self.namespace, &self.absolute)?;
+        let target = resolved
+            .fs()
+            .read_link(resolved.path())
+            .await
+            .map_err(fs_error_code)?;
+        crate::symlink_target(resolved.absolute(), &target).map_err(fs_error_code)?;
+        Ok(target)
+    }
+}
+
+pub(crate) async fn readlink_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     base: Granted<'_, Directory, Read>,
     path: &str,
-) -> FsOpResult<String>
-where
-    StorageImpl: crate::Storage,
-{
-    let absolute = child_path(base.descriptor(), path)?;
-    let resolved = resolve(namespace, &absolute)?;
-    let target = resolved
-        .fs()
-        .read_link(resolved.path())
+) -> FsOpResult<String> {
+    PreparedReadlinkAt::new(namespace.clone(), base, path)?
+        .execute()
         .await
-        .map_err(fs_error_code)?;
-    crate::symlink_target(resolved.absolute(), &target).map_err(fs_error_code)?;
-    Ok(target)
 }
 
 /// Makes the descriptor's object durable: its data, and its metadata
@@ -755,10 +1271,11 @@ where
 {
     let resolved = resolve(namespace, &descriptor.path)?;
     let fs = resolved.fs();
-    if data_only {
-        fs.sync_data(resolved.path()).await
-    } else {
-        fs.sync(resolved.path()).await
+    match (descriptor.open.as_ref(), data_only) {
+        (Some(handle), true) => fs.sync_data_handle(handle).await,
+        (Some(handle), false) => fs.sync_handle(handle).await,
+        (None, true) => fs.sync_data(resolved.path()).await,
+        (None, false) => fs.sync(resolved.path()).await,
     }
     .map_err(fs_error_code)
 }
@@ -804,29 +1321,37 @@ where
     )
     .await
     .map_err(fs_error_code)?;
-    write_resolved(&resolved, WritePosition::At(0), bytes, now)
-        .await
-        .map(drop)
+    let landed = write_resolved(&resolved, WritePosition::At(0), bytes, now).await?;
+    // A file replaced in part is not the file the caller asked for.
+    if landed.len != bytes.len() {
+        return Err(fs_types::ErrorCode::InsufficientSpace);
+    }
+    Ok(())
 }
 
 /// What one bounded read resolves with.
 type ChunkReadResult = FsOpResult<Bytes>;
 
-/// What one write resolves with: the number of bytes handed over.
-type ChunkWriteResult = FsOpResult<usize>;
-
-/// One write of a stream's batch, as a future the consumer owns by value.
-async fn write_chunk<StorageImpl>(
-    held: HeldPath<StorageImpl>,
+/// Prepares destinations without taking bytes from the stream.
+async fn prepare_stream_write<S: crate::Storage>(
+    held: HeldPath<S>,
     mode: WritePosition,
-    bytes: Vec<u8>,
+    len: usize,
     now: u64,
-) -> ChunkWriteResult
-where
-    StorageImpl: crate::Storage,
-{
-    write_resolved(&held.resolved(), mode, &bytes, now).await?;
-    Ok(bytes.len())
+) -> FsOpResult<MountedWrite<S>> {
+    let resolved = held.resolved();
+    let fs = resolved.writable().map_err(fs_error_code)?;
+    let result = match resolved.open() {
+        Some(handle) => fs.prepare_write_handle(handle, mode, len, now).await,
+        None => fs.prepare_write(resolved.path(), mode, len, now).await,
+    };
+    result.map_err(fs_error_code)
+}
+
+async fn submit_stream_write<S: crate::Storage>(
+    filled: <MountedWrite<S> as PreparedWrite>::Filled,
+) -> FsOpResult<WriteProgress<MountedWrite<S>>> {
+    filled.submit().await.map_err(fs_error_code)
 }
 
 /// Answers the `future<result>` a `read-via-stream`, `write-via-stream`,
@@ -907,7 +1432,7 @@ where
             return Poll::Ready(Ok(StreamResult::Cancelled));
         }
         if this.pending.is_none() {
-            let capacity = destination.remaining(&mut store);
+            let capacity = destination.remaining(&mut store)?;
             if capacity == Some(0) {
                 return Poll::Ready(Ok(StreamResult::Completed));
             }
@@ -945,34 +1470,45 @@ where
 }
 
 pin_project! {
-    /// The `write-via-stream` and `append-via-stream` sink for one file,
-    /// the mirror of [`FileReadStreamProducer`]. `mode` decides whether
-    /// each batch lands at the stream's own offset or at the end of file.
-    pub(super) struct FileWriteConsumer<T, CpuImpl, Net, StorageImpl, Fut>
+    #[project = FileWriteStateProjection]
+    enum FileWriteState<Prepare, Submit> {
+        Idle,
+        Preparing { #[pin] future: Prepare },
+        /// `len` is the round being submitted, `taken` the bytes of the whole
+        /// write the stream has handed over so far, this round's included.
+        Submitting { #[pin] future: Submit, len: usize, taken: usize },
+    }
+}
+
+pin_project! {
+    /// A file stream fills filesystem-owned destinations between awaits.
+    /// The held resolution keeps its mount busy throughout the stream.
+    pub(super) struct FileWriteConsumer<T, CpuImpl, Net, StorageImpl, W, Prepare, Submit>
     where
-        // `pin_project!` parses each where-clause bound as one path, so
-        // `Cpu` and `Clone` are two predicates here rather than `Cpu + Clone`.
         CpuImpl: Cpu,
         CpuImpl: Clone,
         Net: ComponentHostNetwork,
         StorageImpl: crate::Storage,
+        W: PreparedWrite,
     {
-        pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, StorageImpl>,
-        pub(super) held: HeldPath<StorageImpl>,
-        pub(super) mode: WritePosition,
-        pub(super) start: fn(HeldPath<StorageImpl>, WritePosition, Vec<u8>, u64) -> Fut,
+        getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, StorageImpl>,
+        held: HeldPath<StorageImpl>,
+        mode: WritePosition,
+        prepare: fn(HeldPath<StorageImpl>, WritePosition, usize, u64) -> Prepare,
+        submit: fn(W::Filled) -> Submit,
         #[pin]
-        pub(super) pending: Option<Fut>,
-        pub(super) result: Option<oneshot::Sender<FsOpResult<()>>>,
+        state: FileWriteState<Prepare, Submit>,
+        result: Option<oneshot::Sender<FsOpResult<()>>>,
     }
 
-    impl<T, CpuImpl, Net, StorageImpl, Fut> PinnedDrop
-        for FileWriteConsumer<T, CpuImpl, Net, StorageImpl, Fut>
+    impl<T, CpuImpl, Net, StorageImpl, W, Prepare, Submit> PinnedDrop
+        for FileWriteConsumer<T, CpuImpl, Net, StorageImpl, W, Prepare, Submit>
     where
         CpuImpl: Cpu,
         CpuImpl: Clone,
         Net: ComponentHostNetwork,
         StorageImpl: crate::Storage,
+        W: PreparedWrite,
     {
         fn drop(this: Pin<&mut Self>) {
             complete_file_transfer(this.project().result, Ok(()));
@@ -986,13 +1522,7 @@ pub(super) fn file_write_consumer<T, CpuImpl, Net, StorageImpl>(
     held: HeldPath<StorageImpl>,
     mode: WritePosition,
     result: oneshot::Sender<FsOpResult<()>>,
-) -> FileWriteConsumer<
-    T,
-    CpuImpl,
-    Net,
-    StorageImpl,
-    impl core::future::Future<Output = ChunkWriteResult> + Send,
->
+) -> impl StreamConsumer<T, Item = u8>
 where
     T: 'static,
     CpuImpl: Cpu + Clone,
@@ -1003,19 +1533,22 @@ where
         getter,
         held,
         mode,
-        start: write_chunk::<StorageImpl>,
-        pending: None,
+        prepare: prepare_stream_write::<StorageImpl>,
+        submit: submit_stream_write::<StorageImpl>,
+        state: FileWriteState::Idle,
         result: Some(result),
     }
 }
 
-impl<T: 'static, CpuImpl, Net, StorageImpl, Fut> StreamConsumer<T>
-    for FileWriteConsumer<T, CpuImpl, Net, StorageImpl, Fut>
+impl<T: 'static, CpuImpl, Net, StorageImpl, W, Prepare, Submit> StreamConsumer<T>
+    for FileWriteConsumer<T, CpuImpl, Net, StorageImpl, W, Prepare, Submit>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
-    Fut: core::future::Future<Output = ChunkWriteResult> + Send + 'static,
+    W: PreparedWrite + 'static,
+    Prepare: core::future::Future<Output = FsOpResult<W>> + Send + 'static,
+    Submit: core::future::Future<Output = FsOpResult<WriteProgress<W>>> + Send + 'static,
 {
     type Item = u8;
 
@@ -1023,42 +1556,101 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         mut store: wasmtime::StoreContextMut<'_, T>,
-        mut source: Source<'_, Self::Item>,
-        _: bool,
+        source: Source<'_, Self::Item>,
+        finish: bool,
     ) -> Poll<Result<StreamResult>> {
         let mut this = self.project();
-        if this.pending.is_none() {
-            let available = source.remaining(&mut store);
-            if available == 0 {
-                return Poll::Ready(Ok(StreamResult::Completed));
-            }
-            let mut bytes = Vec::with_capacity(available);
-            source.read(&mut store, &mut bytes)?;
-            let now = (*this.getter)(store.data_mut()).now_nanos();
-            let write = (*this.start)(this.held.clone(), *this.mode, bytes, now);
-            this.pending.set(Some(write));
-        }
-        let written = match this.pending.as_mut().as_pin_mut() {
-            Some(pending) => match pending.poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(result) => result,
-            },
-            None => unreachable!("a write future was started above"),
-        };
-        this.pending.set(None);
-        match written {
-            Ok(written) => {
-                if let WritePosition::At(offset) = this.mode {
-                    *offset = offset.checked_add(written as u64).ok_or_else(|| {
-                        wasmtime::Error::new(WasiAdapterTrap::FileWriteOffsetOverflow)
-                    })?;
+        let now = (*this.getter)(store.data_mut()).now_nanos();
+        let mut source = source.as_direct(store);
+        // The bytes of the write in flight the earlier rounds took.
+        let mut taken = 0;
+        loop {
+            let staged = match this.state.as_mut().project() {
+                FileWriteStateProjection::Idle => {
+                    if finish {
+                        return Poll::Ready(Ok(StreamResult::Cancelled));
+                    }
+                    let available = source.remaining()?.len();
+                    if available == 0 {
+                        return Poll::Ready(Ok(StreamResult::Completed));
+                    }
+                    let future = (*this.prepare)(this.held.clone(), *this.mode, available, now);
+                    this.state.set(FileWriteState::Preparing { future });
+                    continue;
                 }
-                Poll::Ready(Ok(StreamResult::Completed))
-            }
-            Err(error) => {
-                complete_file_transfer(this.result, Err(error));
-                Poll::Ready(Ok(StreamResult::Dropped))
-            }
+                FileWriteStateProjection::Preparing { future } => {
+                    if finish {
+                        this.state.set(FileWriteState::Idle);
+                        return Poll::Ready(Ok(StreamResult::Cancelled));
+                    }
+                    let result = match future.poll(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result,
+                    };
+                    this.state.set(FileWriteState::Idle);
+                    result
+                }
+                FileWriteStateProjection::Submitting {
+                    future,
+                    len,
+                    taken: submitted,
+                } => {
+                    let result = match future.poll(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result,
+                    };
+                    let len = *len;
+                    taken = *submitted;
+                    this.state.set(FileWriteState::Idle);
+                    match result {
+                        Ok(progress) => {
+                            if let WritePosition::At(offset) = this.mode {
+                                *offset = offset.checked_add(len as u64).ok_or_else(|| {
+                                    wasmtime::Error::new(WasiAdapterTrap::FileWriteOffsetOverflow)
+                                })?;
+                            }
+                            match progress {
+                                WriteProgress::More(next) if !finish => Ok(next),
+                                // A write that ran out of space stored a prefix of
+                                // bytes the stream already took, so the stream can
+                                // only end with the out-of-space error.
+                                WriteProgress::Done(landed) if landed.len != taken => {
+                                    Err(fs_types::ErrorCode::InsufficientSpace)
+                                }
+                                // Cancellation completes the consumed round and drops any
+                                // unfilled next round without taking more guest bytes.
+                                _ => return Poll::Ready(Ok(StreamResult::Completed)),
+                            }
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+            let staged = match staged {
+                Ok(staged) => staged,
+                Err(error) => {
+                    complete_file_transfer(this.result, Err(error));
+                    return Poll::Ready(Ok(StreamResult::Dropped));
+                }
+            };
+            let len = staged.staged_len();
+            let filled = {
+                let bytes = source.remaining()?;
+                let mut cursor = 0;
+                let filled = staged.fill(|_, destination| {
+                    let end = cursor + destination.len();
+                    destination.copy_from_slice(&bytes[cursor..end]);
+                    cursor = end;
+                });
+                source.mark_read(cursor);
+                filled
+            };
+            let future = (*this.submit)(filled);
+            this.state.set(FileWriteState::Submitting {
+                future,
+                len,
+                taken: taken + len,
+            });
         }
     }
 }
@@ -1147,32 +1739,32 @@ pub(crate) fn preopen_descriptor(preopen: &crate::DirectoryPreopen) -> FsDescrip
         flags: descriptor_flags_from_authority(preopen.rights()),
         identity: None,
         mount: None,
+        open: None,
     }
 }
 
 pub(super) fn descriptor_flags_from_authority(
     rights: crate::DirectoryAuthorityRights,
-) -> fs_types::DescriptorFlags {
-    let mut flags = fs_types::DescriptorFlags::empty();
+) -> FsDescriptorFlags {
+    let mut flags = FsDescriptorFlags::empty();
     if rights.contains(crate::DirectoryAuthorityRights::READ) {
-        flags |= fs_types::DescriptorFlags::READ;
+        flags |= FsDescriptorFlags::READ;
     }
     if rights.contains(crate::DirectoryAuthorityRights::WRITE) {
-        flags |= fs_types::DescriptorFlags::WRITE;
+        flags |= FsDescriptorFlags::WRITE;
     }
     if rights.contains(crate::DirectoryAuthorityRights::MUTATE_DIRECTORY) {
-        flags |= fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+        flags |= FsDescriptorFlags::MUTATE_DIRECTORY;
     }
     flags
 }
 
 pub(crate) fn validate_descriptor_flags_within_base(
-    base_flags: fs_types::DescriptorFlags,
-    requested: fs_types::DescriptorFlags,
+    base_flags: FsDescriptorFlags,
+    requested: FsDescriptorFlags,
 ) -> FsOpResult<()> {
-    let authority_flags = fs_types::DescriptorFlags::READ
-        | fs_types::DescriptorFlags::WRITE
-        | fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+    let authority_flags =
+        FsDescriptorFlags::READ | FsDescriptorFlags::WRITE | FsDescriptorFlags::MUTATE_DIRECTORY;
     if !base_flags.contains(requested & authority_flags) {
         return Err(fs_types::ErrorCode::ReadOnly);
     }
@@ -1180,21 +1772,19 @@ pub(crate) fn validate_descriptor_flags_within_base(
 }
 
 pub(crate) fn effective_open_descriptor_flags(
-    base_flags: fs_types::DescriptorFlags,
-    requested: fs_types::DescriptorFlags,
+    base_flags: FsDescriptorFlags,
+    requested: FsDescriptorFlags,
     kind: FsNodeKind,
-) -> FsOpResult<fs_types::DescriptorFlags> {
-    let mut effective = fs_types::DescriptorFlags::empty();
-    if requested.contains(fs_types::DescriptorFlags::READ) {
-        effective |= fs_types::DescriptorFlags::READ;
+) -> FsOpResult<FsDescriptorFlags> {
+    let mut effective = FsDescriptorFlags::empty();
+    if requested.contains(FsDescriptorFlags::READ) {
+        effective |= FsDescriptorFlags::READ;
     }
-    if requested.contains(fs_types::DescriptorFlags::WRITE) {
-        effective |= fs_types::DescriptorFlags::WRITE;
+    if requested.contains(FsDescriptorFlags::WRITE) {
+        effective |= FsDescriptorFlags::WRITE;
     }
-    if kind == FsNodeKind::Directory
-        && requested.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-    {
-        effective |= fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+    if kind == FsNodeKind::Directory && requested.contains(FsDescriptorFlags::MUTATE_DIRECTORY) {
+        effective |= FsDescriptorFlags::MUTATE_DIRECTORY;
     }
     validate_descriptor_flags_within_base(base_flags, effective)?;
     Ok(effective)
@@ -1369,10 +1959,10 @@ where
     async fn get_flags(
         accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
-    ) -> Result<fs_types::DescriptorFlags, FsError> {
+    ) -> Result<WasiDescriptorFlags, FsError> {
         accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            Ok(descriptor.flags)
+            Ok(descriptor_flags_to_wasi(descriptor.flags))
         })
     }
 
@@ -1464,16 +2054,25 @@ where
         Ok(self::sync(&namespace, &descriptor, false).await?)
     }
 
-    async fn create_directory_at(
-        accessor: &Accessor<U, Self>,
+    type CreateDirectoryAtPrepared = FsOpResult<PreparedCreateDirectoryAt<StorageImpl>>;
+    fn prepare_create_directory_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
         descriptor: Resource<FsDescriptor>,
-        path: String,
+        path: &str,
+    ) -> Result<Self::CreateDirectoryAtPrepared> {
+        Ok((|| -> FsOpResult<_> {
+            let (base, namespace, now) = (|| {
+                let (base, namespace) = descriptor_in(store, &descriptor)?;
+                Ok::<_, fs_types::ErrorCode>((base, namespace, store.now_nanos()))
+            })()?;
+            PreparedCreateDirectoryAt::new(namespace, base.grant()?, path, now)
+        })())
+    }
+    async fn create_directory_at(
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::CreateDirectoryAtPrepared,
     ) -> Result<(), FsError> {
-        let (base, namespace, now) = accessor.with(|mut access| {
-            let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
-            Ok::<_, fs_types::ErrorCode>((base, namespace, access.get().now_nanos()))
-        })?;
-        Ok(self::create_directory_at(&namespace, base.grant()?, &path, now).await?)
+        Ok(prepared?.execute().await?)
     }
 
     async fn stat(
@@ -1483,198 +2082,252 @@ where
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
         let (descriptor, namespace) =
             accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        let result = stat_path(&namespace, &descriptor.path, Follow::No)
+        let result = stat_descriptor(&namespace, &descriptor)
             .await
             .map(|metadata| descriptor_stat(&metadata));
         record_component_fs_profile(profile, "stat");
         Ok(result?)
     }
 
-    async fn stat_at(
-        accessor: &Accessor<U, Self>,
+    type StatAtPrepared = PreparedStat<CpuImpl, Net, StorageImpl>;
+
+    fn prepare_stat_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
         descriptor: Resource<FsDescriptor>,
         path_flags: fs_types::PathFlags,
-        path: String,
-    ) -> Result<fs_types::DescriptorStat, FsError> {
-        let profile = accessor.with(|mut access| component_fs_profile(access.get()));
-        let (base, namespace) =
-            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        let result = self::stat_at(&namespace, base.grant()?, path_flags, &path)
-            .await
-            .map(|metadata| descriptor_stat(&metadata));
-        record_component_fs_profile(profile, "stat-at");
-        Ok(result?)
+        path: &str,
+    ) -> Result<Self::StatAtPrepared> {
+        Ok(prepare_stat(store, descriptor, path_flags, path))
     }
 
-    async fn set_times_at(
-        accessor: &Accessor<U, Self>,
+    async fn stat_at(
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::StatAtPrepared,
+    ) -> Result<fs_types::DescriptorStat, FsError> {
+        Ok(descriptor_stat(&stat_prepared(prepared, "stat-at").await?))
+    }
+
+    type SetTimesAtPrepared = FsOpResult<PreparedSetTimesAt<StorageImpl>>;
+    fn prepare_set_times_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
         descriptor: Resource<FsDescriptor>,
-        _: fs_types::PathFlags,
-        path: String,
+        path_flags: fs_types::PathFlags,
+        path: &str,
         data_access_timestamp: fs_types::NewTimestamp,
         data_modification_timestamp: fs_types::NewTimestamp,
-    ) -> Result<(), FsError> {
-        let (base, namespace, access_nanos, modified_nanos, now) =
-            accessor.with(|mut access| {
-                let now = access.get().system_time_nanos();
+    ) -> Result<Self::SetTimesAtPrepared> {
+        Ok((|| -> FsOpResult<_> {
+            let (base, namespace, access_nanos, modified_nanos, now) = (|| {
+                let now = store.system_time_nanos();
                 let access_nanos = p3_new_timestamp_nanos(data_access_timestamp, now)?;
                 let modified_nanos = p3_new_timestamp_nanos(data_modification_timestamp, now)?;
-                let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
+                let (base, namespace) = descriptor_in(store, &descriptor)?;
                 Ok::<_, fs_types::ErrorCode>((base, namespace, access_nanos, modified_nanos, now))
-            })?;
-        Ok(self::set_times_at(
-            &namespace,
-            base.grant()?,
-            &path,
-            access_nanos,
-            modified_nanos,
-            now,
-        )
-        .await?)
+            })()?;
+            PreparedSetTimesAt::new(
+                namespace,
+                base.grant()?,
+                path_flags,
+                path,
+                access_nanos,
+                modified_nanos,
+                now,
+            )
+        })())
+    }
+    async fn set_times_at(
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::SetTimesAtPrepared,
+    ) -> Result<(), FsError> {
+        Ok(prepared?.execute().await?)
     }
 
-    async fn link_at(
-        accessor: &Accessor<U, Self>,
+    type LinkAtPrepared = FsOpResult<PreparedLinkAt<StorageImpl>>;
+    fn prepare_link_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
         source_descriptor: Resource<FsDescriptor>,
         _: fs_types::PathFlags,
-        source_path: String,
+        source_path: &str,
         destination_descriptor: Resource<FsDescriptor>,
-        destination_path: String,
+        destination_path: &str,
+    ) -> Result<Self::LinkAtPrepared> {
+        Ok((|| -> FsOpResult<_> {
+            let (source_base, destination_base, namespace, now) = (|| {
+                let authority = store.process_authority();
+                if authority.derive_link_source_cap().is_err()
+                    || authority.derive_link_target_directory_cap().is_err()
+                {
+                    return Err(fs_types::ErrorCode::NotPermitted);
+                }
+                let (source, destination, namespace) =
+                    descriptor_pair_in(store, &source_descriptor, &destination_descriptor)?;
+                Ok((source, destination, namespace, store.now_nanos()))
+            })()?;
+            PreparedLinkAt::new(
+                namespace,
+                source_base.grant()?.alias_into(destination_base.grant()?)?,
+                source_path,
+                destination_path,
+                now,
+            )
+        })())
+    }
+    async fn link_at(
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::LinkAtPrepared,
     ) -> Result<(), FsError> {
-        let (source_base, destination_base, namespace, now) = accessor.with(|mut access| {
-            let authority = access.get().process_authority();
-            if authority.derive_link_source_cap().is_err()
-                || authority.derive_link_target_directory_cap().is_err()
-            {
-                return Err(fs_types::ErrorCode::NotPermitted);
-            }
-            let (source, destination, namespace) =
-                descriptor_pair_in(access.get(), &source_descriptor, &destination_descriptor)?;
-            Ok((source, destination, namespace, access.get().now_nanos()))
-        })?;
-        Ok(self::link_at(
-            &namespace,
-            source_base.grant()?.alias_into(destination_base.grant()?)?,
-            &source_path,
-            &destination_path,
-            now,
-        )
-        .await?)
+        Ok(prepared?.execute().await?)
+    }
+
+    type OpenAtPrepared = PreparedOpenAt<CpuImpl, Net, StorageImpl>;
+
+    fn prepare_open_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
+        descriptor: Resource<FsDescriptor>,
+        path_flags: fs_types::PathFlags,
+        path: &str,
+        open_flags: fs_types::OpenFlags,
+        flags: WasiDescriptorFlags,
+    ) -> Result<Self::OpenAtPrepared> {
+        Ok(prepare_open(
+            store,
+            descriptor,
+            path_flags,
+            path,
+            open_flags,
+            descriptor_flags_from_wasi(flags),
+        ))
     }
 
     async fn open_at(
         accessor: &Accessor<U, Self>,
-        descriptor: Resource<FsDescriptor>,
-        path_flags: fs_types::PathFlags,
-        path: String,
-        open_flags: fs_types::OpenFlags,
-        flags: fs_types::DescriptorFlags,
+        prepared: Self::OpenAtPrepared,
     ) -> Result<Resource<FsDescriptor>, FsError> {
-        let profile = accessor.with(|mut access| component_fs_profile(access.get()));
-        let (base, namespace, now) = accessor.with(|mut access| {
-            let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
-            Ok::<_, fs_types::ErrorCode>((base, namespace, access.get().now_nanos()))
-        })?;
-        let opened = self::open_at(
-            &namespace,
-            base.grant()?,
-            path_flags,
-            &path,
-            open_flags,
-            flags,
-            now,
-        )
-        .await?;
-        let result = accessor
+        let opened = execute_open(prepared).await?;
+        accessor
             .with(|mut access| access.get().table.push(opened))
-            .map_err(FsError::trap);
-        record_component_fs_profile(profile, "open-at");
-        result
+            .map_err(FsError::trap)
     }
 
+    type ReadlinkAtPrepared = FsOpResult<PreparedReadlinkAt<StorageImpl>>;
+    fn prepare_readlink_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
+        descriptor: Resource<FsDescriptor>,
+        path: &str,
+    ) -> Result<Self::ReadlinkAtPrepared> {
+        Ok((|| -> FsOpResult<_> {
+            let (base, namespace) = (|| {
+                if store.process_authority().derive_symlink_read_cap().is_err() {
+                    return Err(fs_types::ErrorCode::NotPermitted);
+                }
+                descriptor_in(store, &descriptor)
+            })()?;
+            PreparedReadlinkAt::new(namespace, base.grant()?, path)
+        })())
+    }
     async fn readlink_at(
-        accessor: &Accessor<U, Self>,
-        descriptor: Resource<FsDescriptor>,
-        path: String,
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::ReadlinkAtPrepared,
     ) -> Result<String, FsError> {
-        let (base, namespace) = accessor.with(|mut access| {
-            if access
-                .get()
-                .process_authority()
-                .derive_symlink_read_cap()
-                .is_err()
-            {
-                return Err(fs_types::ErrorCode::NotPermitted);
-            }
-            descriptor_in(access.get(), &descriptor)
-        })?;
-        Ok(self::readlink_at(&namespace, base.grant()?, &path).await?)
+        Ok(prepared?.execute().await?)
     }
 
+    type RemoveDirectoryAtPrepared = FsOpResult<PreparedRemoveDirectoryAt<StorageImpl>>;
+    fn prepare_remove_directory_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
+        descriptor: Resource<FsDescriptor>,
+        path: &str,
+    ) -> Result<Self::RemoveDirectoryAtPrepared> {
+        Ok((|| -> FsOpResult<_> {
+            let (base, namespace) = descriptor_in(store, &descriptor)?;
+            PreparedRemoveDirectoryAt::new(namespace, base.grant()?, path, store.now_nanos())
+        })())
+    }
     async fn remove_directory_at(
-        accessor: &Accessor<U, Self>,
-        descriptor: Resource<FsDescriptor>,
-        path: String,
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::RemoveDirectoryAtPrepared,
     ) -> Result<(), FsError> {
-        let (base, namespace) =
-            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        Ok(self::remove_directory_at(&namespace, base.grant()?, &path).await?)
+        Ok(prepared?.execute().await?)
     }
 
-    async fn rename_at(
-        accessor: &Accessor<U, Self>,
+    type RenameAtPrepared = FsOpResult<PreparedRenameAt<StorageImpl>>;
+    fn prepare_rename_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
         source_descriptor: Resource<FsDescriptor>,
-        source_path: String,
+        source_path: &str,
         destination_descriptor: Resource<FsDescriptor>,
-        destination_path: String,
+        destination_path: &str,
+    ) -> Result<Self::RenameAtPrepared> {
+        Ok((|| -> FsOpResult<_> {
+            let (source_base, destination_base, namespace, now) = (|| {
+                let (source, destination, namespace) =
+                    descriptor_pair_in(store, &source_descriptor, &destination_descriptor)?;
+                Ok::<_, fs_types::ErrorCode>((source, destination, namespace, store.now_nanos()))
+            })()?;
+            PreparedRenameAt::new(
+                namespace,
+                source_base
+                    .grant()?
+                    .alias_into(destination_base.grant()?)?
+                    .removing_source()?,
+                source_path,
+                destination_path,
+                now,
+            )
+        })())
+    }
+    async fn rename_at(
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::RenameAtPrepared,
     ) -> Result<(), FsError> {
-        let (source_base, destination_base, namespace, now) = accessor.with(|mut access| {
-            let (source, destination, namespace) =
-                descriptor_pair_in(access.get(), &source_descriptor, &destination_descriptor)?;
-            Ok::<_, fs_types::ErrorCode>((source, destination, namespace, access.get().now_nanos()))
-        })?;
-        Ok(self::rename_at(
-            &namespace,
-            source_base
-                .grant()?
-                .alias_into(destination_base.grant()?)?
-                .removing_source()?,
-            &source_path,
-            &destination_path,
-            now,
-        )
-        .await?)
+        Ok(prepared?.execute().await?)
     }
 
+    type SymlinkAtPrepared = FsOpResult<PreparedSymlinkAt<StorageImpl>>;
+    fn prepare_symlink_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
+        descriptor: Resource<FsDescriptor>,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<Self::SymlinkAtPrepared> {
+        Ok((|| -> FsOpResult<_> {
+            let (base, namespace, now) = (|| {
+                if store
+                    .process_authority()
+                    .derive_symlink_create_cap()
+                    .is_err()
+                {
+                    return Err(fs_types::ErrorCode::NotPermitted);
+                }
+                let (base, namespace) = descriptor_in(store, &descriptor)?;
+                Ok((base, namespace, store.now_nanos()))
+            })()?;
+            PreparedSymlinkAt::new(namespace, base.grant()?, old_path, new_path, now)
+        })())
+    }
     async fn symlink_at(
-        accessor: &Accessor<U, Self>,
-        descriptor: Resource<FsDescriptor>,
-        old_path: String,
-        new_path: String,
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::SymlinkAtPrepared,
     ) -> Result<(), FsError> {
-        let (base, namespace, now) = accessor.with(|mut access| {
-            if access
-                .get()
-                .process_authority()
-                .derive_symlink_create_cap()
-                .is_err()
-            {
-                return Err(fs_types::ErrorCode::NotPermitted);
-            }
-            let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
-            Ok((base, namespace, access.get().now_nanos()))
-        })?;
-        Ok(self::symlink_at(&namespace, base.grant()?, &old_path, &new_path, now).await?)
+        Ok(prepared?.execute().await?)
     }
 
-    async fn unlink_file_at(
-        accessor: &Accessor<U, Self>,
+    type UnlinkFileAtPrepared = FsOpResult<PreparedUnlinkFileAt<StorageImpl>>;
+    fn prepare_unlink_file_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
         descriptor: Resource<FsDescriptor>,
-        path: String,
+        path: &str,
+    ) -> Result<Self::UnlinkFileAtPrepared> {
+        Ok((|| -> FsOpResult<_> {
+            let (base, namespace) = descriptor_in(store, &descriptor)?;
+            PreparedUnlinkFileAt::new(namespace, base.grant()?, path, store.now_nanos())
+        })())
+    }
+    async fn unlink_file_at(
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::UnlinkFileAtPrepared,
     ) -> Result<(), FsError> {
-        let (base, namespace) =
-            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        Ok(self::unlink_file_at(&namespace, base.grant()?, &path).await?)
+        Ok(prepared?.execute().await?)
     }
 
     async fn is_same_object(
@@ -1699,27 +2352,31 @@ where
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
         let (descriptor, namespace) =
             accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        let result = stat_path(&namespace, &descriptor.path, Follow::No)
+        let result = stat_descriptor(&namespace, &descriptor)
             .await
             .map(|metadata| self::metadata_hash(&metadata));
         record_component_fs_profile(profile, "metadata-hash");
         Ok(result?)
     }
 
-    async fn metadata_hash_at(
-        accessor: &Accessor<U, Self>,
+    type MetadataHashAtPrepared = PreparedStat<CpuImpl, Net, StorageImpl>;
+
+    fn prepare_metadata_hash_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
         descriptor: Resource<FsDescriptor>,
         path_flags: fs_types::PathFlags,
-        path: String,
+        path: &str,
+    ) -> Result<Self::MetadataHashAtPrepared> {
+        Ok(prepare_stat(store, descriptor, path_flags, path))
+    }
+
+    async fn metadata_hash_at(
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::MetadataHashAtPrepared,
     ) -> Result<fs_types::MetadataHashValue, FsError> {
-        let profile = accessor.with(|mut access| component_fs_profile(access.get()));
-        let (base, namespace) =
-            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        let result = self::stat_at(&namespace, base.grant()?, path_flags, &path)
-            .await
-            .map(|metadata| self::metadata_hash(&metadata));
-        record_component_fs_profile(profile, "metadata-hash-at");
-        Ok(result?)
+        Ok(self::metadata_hash(
+            &stat_prepared(prepared, "metadata-hash-at").await?,
+        ))
     }
 }
 
@@ -1806,5 +2463,499 @@ pub(super) fn map_component_fs_path_error(
     match error {
         crate::ComponentFsPathError::InvalidBasePath => fs_types::ErrorCode::Invalid,
         crate::ComponentFsPathError::NotPermitted => fs_types::ErrorCode::NotPermitted,
+    }
+}
+
+#[cfg(test)]
+mod direct_write_tests {
+    use super::*;
+    use crate::test_support::UnsupportedStorage;
+    use crate::wasmtime_adapter::component_host::service::test_store;
+    use crate::wasmtime_adapter::wasi::stream::test_source::{Reads, TrackedBuffer};
+    use core::sync::atomic::Ordering;
+    use futures_lite::future::{block_on, yield_now};
+    use std::sync::Arc;
+
+    type TestHeld = HeldPath<UnsupportedStorage>;
+
+    struct RoundWrite {
+        offset: usize,
+        len: usize,
+    }
+
+    struct FilledRound(RoundWrite);
+
+    impl PreparedWrite for RoundWrite {
+        type Filled = FilledRound;
+
+        fn staged_len(&self) -> usize {
+            // Two-byte test destinations force three rounds for the test source.
+            (self.len - self.offset).min(2)
+        }
+
+        fn fill<F>(mut self, mut fill: F) -> Self::Filled
+        where
+            F: FnMut(usize, &mut [u8]),
+        {
+            let mut destination = [0; 2];
+            let len = self.staged_len();
+            fill(self.offset, &mut destination[..len]);
+            assert_eq!(
+                &destination[..len],
+                &b"abcdef"[self.offset..self.offset + len]
+            );
+            self.offset += len;
+            FilledRound(self)
+        }
+    }
+
+    impl FilledWrite for FilledRound {
+        type Next = RoundWrite;
+
+        async fn submit(self) -> FsResult<WriteProgress<Self::Next>> {
+            yield_now().await;
+            Ok(if self.0.offset == self.0.len {
+                WriteProgress::Done(Landed {
+                    offset: 0,
+                    len: self.0.len,
+                })
+            } else {
+                WriteProgress::More(self.0)
+            })
+        }
+    }
+
+    async fn prepare_ready(
+        _: TestHeld,
+        _: WritePosition,
+        len: usize,
+        _: u64,
+    ) -> FsOpResult<RoundWrite> {
+        Ok(RoundWrite { offset: 0, len })
+    }
+
+    async fn prepare_pending(
+        held: TestHeld,
+        mode: WritePosition,
+        len: usize,
+        now: u64,
+    ) -> FsOpResult<RoundWrite> {
+        yield_now().await;
+        prepare_ready(held, mode, len, now).await
+    }
+
+    async fn submit(filled: FilledRound) -> FsOpResult<WriteProgress<RoundWrite>> {
+        filled.submit().await.map_err(fs_error_code)
+    }
+
+    /// A filesystem that stores one byte less than the write staged, as a
+    /// device that ran out of space part way does.
+    async fn submit_short(filled: FilledRound) -> FsOpResult<WriteProgress<RoundWrite>> {
+        match filled.submit().await.map_err(fs_error_code)? {
+            WriteProgress::Done(landed) => Ok(WriteProgress::Done(Landed {
+                offset: landed.offset,
+                len: landed.len - 1,
+            })),
+            more => Ok(more),
+        }
+    }
+
+    pin_project! {
+        struct FinishAfterPending<C> {
+            #[pin]
+            consumer: C,
+            cancel: bool,
+            finish: bool,
+        }
+    }
+
+    impl<C: StreamConsumer<test_store::TestStoreData, Item = u8>>
+        StreamConsumer<test_store::TestStoreData> for FinishAfterPending<C>
+    {
+        type Item = u8;
+
+        fn poll_consume(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            store: wasmtime::StoreContextMut<'_, test_store::TestStoreData>,
+            source: Source<'_, u8>,
+            _: bool,
+        ) -> Poll<Result<StreamResult>> {
+            let this = self.project();
+            let result = this.consumer.poll_consume(cx, store, source, *this.finish);
+            match result {
+                Poll::Pending => {
+                    *this.finish = *this.cancel;
+                    Poll::Pending
+                }
+                Poll::Ready(Ok(result)) if *this.finish => {
+                    assert!(matches!(
+                        result,
+                        StreamResult::Cancelled | StreamResult::Completed
+                    ));
+                    Poll::Ready(Ok(StreamResult::Dropped))
+                }
+                result => result,
+            }
+        }
+    }
+
+    fn exercise<P>(
+        prepare: fn(TestHeld, WritePosition, usize, u64) -> P,
+        cancel: bool,
+        consumed: usize,
+    ) where
+        P: core::future::Future<Output = FsOpResult<RoundWrite>> + Send + 'static,
+    {
+        let (outcome, skipped) = run(prepare, submit, cancel);
+        outcome.expect("write completed");
+        assert_eq!(skipped, consumed);
+    }
+
+    /// Pipes `abcdef` into a file write consumer, and returns how the
+    /// stream ended and how many source bytes it took.
+    fn run<P, S>(
+        prepare: fn(TestHeld, WritePosition, usize, u64) -> P,
+        submit: fn(FilledRound) -> S,
+        cancel: bool,
+    ) -> (FsOpResult<()>, usize)
+    where
+        P: core::future::Future<Output = FsOpResult<RoundWrite>> + Send + 'static,
+        S: core::future::Future<Output = FsOpResult<WriteProgress<RoundWrite>>> + Send + 'static,
+    {
+        let mut config = wasmtime::Config::new();
+        config
+            .wasm_component_model(true)
+            .wasm_component_model_async(true);
+        let engine = wasmtime::Engine::new(&config).expect("stream engine");
+        let mut store = wasmtime::Store::new(&engine, test_store::store_data_with(|_| {}));
+        let held = store
+            .data()
+            .runtime_state
+            .root_namespace()
+            .resolve("/file")
+            .expect("resolution")
+            .held();
+        let (tx, rx) = oneshot::channel();
+        let consumer = FileWriteConsumer {
+            getter: |state| state,
+            held,
+            mode: WritePosition::At(0),
+            prepare,
+            submit,
+            state: FileWriteState::Idle,
+            result: Some(tx),
+        };
+        let consumer = FinishAfterPending {
+            consumer,
+            cancel,
+            finish: false,
+        };
+        let reads = Arc::new(Reads::default());
+        let source = TrackedBuffer {
+            bytes: b"abcdef",
+            reads: reads.clone(),
+        };
+        let outcome = block_on(store.run_concurrent(async |accessor| {
+            accessor
+                .with(|mut store| StreamReader::new(&mut store, source)?.pipe(store, consumer))
+                .expect("connect stream");
+            rx.await.expect("completion sent")
+        }))
+        .expect("stream event loop");
+        assert_eq!(reads.moved.load(Ordering::Relaxed), 0);
+        (outcome, reads.skipped.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn a_short_write_ends_the_stream_with_insufficient_space() {
+        let (outcome, skipped) = run(prepare_ready, submit_short, false);
+        assert!(matches!(
+            outcome,
+            Err(fs_types::ErrorCode::InsufficientSpace)
+        ));
+        assert_eq!(skipped, 6);
+    }
+
+    #[test]
+    fn pending_rounds_consume_each_source_byte_once() {
+        exercise(prepare_ready, false, 6);
+    }
+
+    #[test]
+    fn cancellation_while_preparing_leaves_source_unconsumed() {
+        exercise(prepare_pending, true, 0);
+    }
+
+    #[test]
+    fn cancellation_while_submitting_finishes_only_the_consumed_round() {
+        exercise(prepare_ready, true, 2);
+    }
+}
+
+#[cfg(test)]
+mod borrowed_request_tests {
+    use super::*;
+    use crate::wasmtime_adapter::component_host::service::test_store;
+    use futures_lite::future::block_on;
+
+    #[test]
+    fn prepared_mutations_own_names_and_preserve_link_semantics() {
+        let store = test_store::store_data_with(|_| {});
+        let namespace = store.filesystem().clone();
+        let root = FsDescriptor {
+            path: String::from("/"),
+            kind: FsNodeKind::Directory,
+            flags: FsDescriptorFlags::READ
+                | FsDescriptorFlags::WRITE
+                | FsDescriptorFlags::MUTATE_DIRECTORY,
+            identity: None,
+            mount: None,
+            open: None,
+        };
+        let directory = String::from("中文-日本語-한국어");
+        let create =
+            PreparedCreateDirectoryAt::new(namespace.clone(), root.grant().unwrap(), &directory, 1)
+                .unwrap();
+        drop(directory);
+        block_on(create.execute()).unwrap();
+        let opened = block_on(open_at(
+            &namespace,
+            root.grant().unwrap(),
+            fs_types::PathFlags::empty(),
+            "中文-日本語-한국어/file",
+            fs_types::OpenFlags::CREATE,
+            FsDescriptorFlags::READ,
+            2,
+        ))
+        .unwrap();
+        let source = String::from("中文-日本語-한국어/file");
+        let destination = String::from("中文-日本語-한국어/linked");
+        let link = PreparedLinkAt::new(
+            namespace.clone(),
+            root.grant()
+                .unwrap()
+                .alias_into(root.grant().unwrap())
+                .unwrap(),
+            &source,
+            &destination,
+            3,
+        )
+        .unwrap();
+        drop(source);
+        drop(destination);
+        block_on(link.execute()).unwrap();
+        let rename = PreparedRenameAt::new(
+            namespace.clone(),
+            root.grant()
+                .unwrap()
+                .alias_into(root.grant().unwrap())
+                .unwrap()
+                .removing_source()
+                .unwrap(),
+            "中文-日本語-한국어/linked",
+            "中文-日本語-한국어/renamed",
+            4,
+        )
+        .unwrap();
+        block_on(rename.execute()).unwrap();
+        let metadata = block_on(stat_path(
+            &namespace,
+            "/中文-日本語-한국어/renamed",
+            Follow::No,
+        ))
+        .unwrap();
+        assert_eq!(object_identity(&metadata), opened.identity.unwrap());
+        let times = PreparedSetTimesAt::new(
+            namespace.clone(),
+            root.grant().unwrap(),
+            fs_types::PathFlags::empty(),
+            "中文-日本語-한국어/renamed",
+            Some(5),
+            Some(6),
+            7,
+        )
+        .unwrap();
+        block_on(times.execute()).unwrap();
+        let target = String::from("renamed");
+        let path = String::from("中文-日本語-한국어/symbolic");
+        let symbolic =
+            PreparedSymlinkAt::new(namespace.clone(), root.grant().unwrap(), &target, &path, 8)
+                .unwrap();
+        drop(target);
+        drop(path);
+        block_on(symbolic.execute()).unwrap();
+        let readlink = PreparedReadlinkAt::new(
+            namespace.clone(),
+            root.grant().unwrap(),
+            "中文-日本語-한국어/symbolic",
+        )
+        .unwrap();
+        assert_eq!(block_on(readlink.execute()).unwrap(), "renamed");
+        for path in [
+            "中文-日本語-한국어/file",
+            "中文-日本語-한국어/renamed",
+            "中文-日本語-한국어/symbolic",
+        ] {
+            block_on(
+                PreparedUnlinkFileAt::new(namespace.clone(), root.grant().unwrap(), path, 7)
+                    .unwrap()
+                    .execute(),
+            )
+            .unwrap();
+        }
+        block_on(
+            PreparedRemoveDirectoryAt::new(
+                namespace.clone(),
+                root.grant().unwrap(),
+                "中文-日本語-한국어",
+                7,
+            )
+            .unwrap()
+            .execute(),
+        )
+        .unwrap();
+        assert!(matches!(
+            block_on(stat_path(&namespace, "/中文-日本語-한국어", Follow::No)),
+            Err(fs_types::ErrorCode::NoEntry)
+        ));
+    }
+
+    #[test]
+    fn cancelling_prepared_mutations_does_not_modify_the_namespace() {
+        let store = test_store::store_data_with(|_| {});
+        let namespace = store.filesystem().clone();
+        let root = FsDescriptor {
+            path: String::from("/"),
+            kind: FsNodeKind::Directory,
+            flags: FsDescriptorFlags::READ
+                | FsDescriptorFlags::WRITE
+                | FsDescriptorFlags::MUTATE_DIRECTORY,
+            identity: None,
+            mount: None,
+            open: None,
+        };
+        drop(
+            PreparedCreateDirectoryAt::new(
+                namespace.clone(),
+                root.grant().unwrap(),
+                "cancelled",
+                1,
+            )
+            .unwrap(),
+        );
+        drop(
+            PreparedSymlinkAt::new(
+                namespace.clone(),
+                root.grant().unwrap(),
+                "target",
+                "cancelled-link",
+                1,
+            )
+            .unwrap(),
+        );
+        for path in ["/cancelled", "/cancelled-link"] {
+            assert!(matches!(
+                block_on(stat_path(&namespace, path, Follow::No)),
+                Err(fs_types::ErrorCode::NoEntry)
+            ));
+        }
+        assert!(matches!(
+            PreparedCreateDirectoryAt::new(
+                namespace.clone(),
+                root.grant().unwrap(),
+                "../outside",
+                1
+            ),
+            Err(fs_types::ErrorCode::NotPermitted)
+        ));
+        assert!(matches!(
+            PreparedSymlinkAt::new(namespace, root.grant().unwrap(), "../outside", "link", 1),
+            Err(fs_types::ErrorCode::NotPermitted)
+        ));
+        let readonly = FsDescriptor {
+            flags: FsDescriptorFlags::READ,
+            ..root
+        };
+        assert!(matches!(
+            readonly.grant::<Directory, Mutate>(),
+            Err(fs_types::ErrorCode::ReadOnly)
+        ));
+    }
+
+    #[test]
+    fn prepared_paths_own_resolved_names_and_preserve_directory_rights() {
+        let mut store = test_store::store_data_with(|_| {});
+        let root = store
+            .table
+            .push(FsDescriptor {
+                path: String::from("/"),
+                kind: FsNodeKind::Directory,
+                flags: FsDescriptorFlags::READ
+                    | FsDescriptorFlags::WRITE
+                    | FsDescriptorFlags::MUTATE_DIRECTORY,
+                identity: None,
+                mount: None,
+                open: None,
+            })
+            .unwrap();
+        let path = String::from("中文-日本語-한국어");
+        let request = prepare_open(
+            &mut store,
+            Resource::new_borrow(root.rep()),
+            fs_types::PathFlags::empty(),
+            &path,
+            fs_types::OpenFlags::CREATE,
+            FsDescriptorFlags::READ,
+        );
+        drop(path);
+        let opened = block_on(execute_open(request)).unwrap();
+        assert_eq!(opened.path, "/中文-日本語-한국어");
+        let stat = prepare_stat(
+            &mut store,
+            Resource::new_borrow(root.rep()),
+            fs_types::PathFlags::empty(),
+            "中文-日本語-한국어",
+        );
+        assert_eq!(
+            object_identity(&block_on(stat_prepared(stat, "stat-at")).unwrap()),
+            opened.identity.unwrap()
+        );
+
+        let escaped = prepare_open(
+            &mut store,
+            Resource::new_borrow(root.rep()),
+            fs_types::PathFlags::empty(),
+            "../outside",
+            fs_types::OpenFlags::CREATE,
+            FsDescriptorFlags::READ,
+        );
+        assert!(matches!(
+            block_on(execute_open(escaped)),
+            Err(fs_types::ErrorCode::NotPermitted)
+        ));
+        store.table.get_mut(&root).unwrap().flags = FsDescriptorFlags::READ;
+        let denied = prepare_open(
+            &mut store,
+            Resource::new_borrow(root.rep()),
+            fs_types::PathFlags::empty(),
+            "refused",
+            fs_types::OpenFlags::CREATE,
+            FsDescriptorFlags::READ,
+        );
+        assert!(matches!(
+            block_on(execute_open(denied)),
+            Err(fs_types::ErrorCode::ReadOnly)
+        ));
+        let absent = prepare_stat(
+            &mut store,
+            Resource::new_borrow(root.rep()),
+            fs_types::PathFlags::empty(),
+            "refused",
+        );
+        assert!(matches!(
+            block_on(stat_prepared(absent, "stat-at")),
+            Err(fs_types::ErrorCode::NoEntry)
+        ));
     }
 }

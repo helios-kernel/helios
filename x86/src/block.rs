@@ -23,7 +23,7 @@ use pci_types::PciAddress;
 use crate::X86Cpu;
 use crate::exceptions::BLOCK_INTERRUPT_VECTORS;
 use crate::iommu::X86DmaPool;
-use crate::pci::PciRoot;
+use crate::pci::{PciRoot, VirtioFunctions};
 
 pub(crate) type X86VirtioBlockDevice =
     VirtioBlockResource<VirtioPciTransport<X86DmaPool>, X86Cpu, helios_kernel::BlockPages>;
@@ -48,8 +48,8 @@ impl ExternalInterruptHandler for VirtioBlockDevice {
 
 /// Every PCI function that carries a block device, up to the block
 /// interrupt vectors this backend has; the rest are refused by name.
-pub(crate) fn discover(pci: &PciRoot) -> Vec<PciAddress> {
-    helios_kernel::admit_block_devices(pci.find_virtio_functions(DeviceType::Block).collect())
+pub(crate) fn discover(virtio: &VirtioFunctions) -> Vec<PciAddress> {
+    helios_kernel::admit_block_devices(virtio.find_virtio_functions(DeviceType::Block).collect())
 }
 
 /// Brings up every block function and hands them to the kernel, which
@@ -94,13 +94,16 @@ where
         })
         .collect();
 
-    let devices = discovered
+    let devices: Vec<_> = discovered
         .iter()
         .map(|interrupt| interrupt.device.device.clone())
         .collect();
     let state = debug_state.clone();
     // Swap is not wired on this backend (see the caller), so the scratch
     // disk is proved and counted but nothing writes to it yet.
+    if !devices.is_empty() {
+        debug_state.begin_block_discovery();
+    }
     helios_kernel::install_block_devices(
         kernel,
         root,
@@ -110,6 +113,7 @@ where
             if let Some(cache) = mount_sources {
                 state.install_mount_sources(cache);
             }
+            state.finish_block_discovery();
         },
     );
     discovered

@@ -1,6 +1,38 @@
 package helios:system@0.1.0;
 
 interface sync {
+  use wasi:clocks/monotonic-clock@0.3.0.{mark};
+
+  enum error { closed, failed }
+
+  /// Read-only completion capability.
+  resource timeline {
+    value: func() -> result<u64, error>;
+  }
+
+  /// The timeline closes when its last producer is dropped.
+  resource signal-source {
+    constructor(initial: u64);
+    reader: func() -> timeline;
+    signal: func(value: u64) -> result<_, error>;
+    /// Fail outstanding and future waits on this timeline.
+    fail: func();
+  }
+
+  record timeline-point {
+    timeline: borrow<timeline>,
+    value: u64,
+  }
+
+  record signal-point {
+    source: borrow<signal-source>,
+    value: u64,
+  }
+
+  /// True means completion; false means the monotonic deadline expired.
+  wait: async func(points: list<timeline-point>, wait-all: bool,
+                   deadline: option<mark>) -> result<bool, error>;
+
   /// Kernel-managed mutex capability.
   resource raw-mutex {
     constructor();

@@ -4,9 +4,14 @@
 //! test that needs one should not have to spell a whole `Cpu`
 //! implementation out again.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt};
+use helios_hal::numa::{MemoryAffinity, NodeDistance, NodeId, NumaTopology};
+
+use crate::memory::{Locality, NodeRun, UserMemoryPool};
 
 /// The processor-local interrupt mask for the kernel's own unit tests.
 ///
@@ -76,6 +81,8 @@ impl TestCpu {
 }
 
 impl Cpu for TestCpu {
+    type Hypervisor = core::convert::Infallible;
+    type Native = core::convert::Infallible;
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
     fn has_lazy_commit_virtual_memory(&self) -> bool {
@@ -171,10 +178,177 @@ pub(crate) fn test_root_entropy() -> crate::RootEntropyHandle {
 pub(crate) fn test_timer<CpuImpl: Cpu + Clone>(cpu: CpuImpl) -> crate::Timer<CpuImpl> {
     crate::Executor::isolated(
         helios_hal::watchdog::ProgressCounter::new(),
-        cpu.processor_count(),
+        single_node_pool(cpu.processor_count()),
         helios_hal::cpu::current_processor(),
     )
     .timer(cpu)
+}
+
+/// Host memory each node of a test pool owns: enough for the per-processor
+/// tables and task arenas of a few processors, and for the largest arena
+/// the executor tests size, which is all the kernel's unit tests carve
+/// from it.
+pub(crate) const TEST_POOL_NODE_BYTES: usize = 256 << 20;
+
+/// A user pool over a machine of `processors` processors on one node.
+///
+/// One pool per processor count for the whole test process: a test that
+/// builds its executor or per-processor tables from it shares the host
+/// block with the others that do, instead of leaking one per call.
+pub(crate) fn single_node_pool(processors: usize) -> &'static UserMemoryPool {
+    static POOLS: std::sync::Mutex<Vec<(usize, &'static UserMemoryPool)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut pools = POOLS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, pool)) = pools.iter().find(|(count, _)| *count == processors) {
+        return pool;
+    }
+    let pool = TestMachine::round_robin(processors, 1).pool(TEST_POOL_NODE_BYTES);
+    pools.push((processors, pool));
+    pool
+}
+
+/// Node memory over one leaked, naturally aligned host block per node,
+/// lent from the bottom, recording what comes back.
+pub(crate) struct HostNodeMemory {
+    /// Per node: `(next, end)`.
+    nodes: core::cell::RefCell<Vec<(usize, usize)>>,
+    /// Every `(start, bytes)` given back.
+    returned: core::cell::RefCell<Vec<(usize, usize)>>,
+    /// Per node: where its block starts and ends.
+    regions: Vec<(usize, usize)>,
+}
+
+impl HostNodeMemory {
+    pub(crate) fn new(nodes: usize, bytes_per_node: usize) -> Self {
+        let regions: Vec<(usize, usize)> = (0..nodes)
+            .map(|_| {
+                let layout = core::alloc::Layout::from_size_align(bytes_per_node, bytes_per_node)
+                    .expect("host node memory layout");
+                // SAFETY: `layout` has a non-zero size; the block is
+                // leaked, which is the life a test machine's memory has.
+                let start = unsafe { alloc::alloc::alloc(layout) } as usize;
+                assert!(start != 0, "host allocation for node memory failed");
+                (start, start + bytes_per_node)
+            })
+            .collect();
+        Self {
+            nodes: core::cell::RefCell::new(regions.clone()),
+            returned: core::cell::RefCell::new(Vec::new()),
+            regions,
+        }
+    }
+
+    /// Per node, the block its memory is in.
+    pub(crate) fn regions(&self) -> &[(usize, usize)] {
+        &self.regions
+    }
+
+    pub(crate) fn returned(&self) -> Vec<(usize, usize)> {
+        self.returned.borrow().clone()
+    }
+}
+
+impl crate::memory::NodeMemory for HostNodeMemory {
+    fn lend(&self, node: NodeId, bytes: usize) -> Option<usize> {
+        let mut nodes = self.nodes.borrow_mut();
+        let (next, end) = &mut nodes[node.index()];
+        let start = next.next_multiple_of(bytes);
+        (start + bytes <= *end).then(|| {
+            *next = start + bytes;
+            start
+        })
+    }
+
+    unsafe fn give_back(&self, start: usize, bytes: usize) {
+        assert!(bytes.is_power_of_two(), "a piece is a power of two");
+        self.returned.borrow_mut().push((start, bytes));
+    }
+}
+
+/// A machine a test spells out: which node each processor is on and
+/// the distance matrix. It names no memory affinity.
+pub(crate) struct TestMachine {
+    /// Index: processor.
+    pub(crate) processor_nodes: Vec<usize>,
+    /// Row-major, `node_count²`.
+    pub(crate) distances: Vec<u8>,
+}
+
+impl TestMachine {
+    /// `processors` processors spread round-robin over `nodes` nodes,
+    /// every remote distance equal.
+    pub(crate) fn round_robin(processors: usize, nodes: usize) -> Self {
+        Self {
+            processor_nodes: (0..processors).map(|processor| processor % nodes).collect(),
+            distances: (0..nodes * nodes)
+                .map(|cell| {
+                    if cell / nodes == cell % nodes {
+                        NodeDistance::LOCAL.get()
+                    } else {
+                        NodeDistance::UNIFORM_REMOTE.get()
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// A user pool over this machine with `bytes_per_node` of host
+    /// memory on every node, leaked because the kernel holds the
+    /// machine's pool for the machine's life and a test process is that
+    /// life. Per-processor tables and executors carve from it.
+    pub(crate) fn pool(&self, bytes_per_node: usize) -> &'static UserMemoryPool {
+        let runs: Vec<NodeRun> = (0..self.node_count())
+            .map(|node| {
+                let layout = core::alloc::Layout::from_size_align(bytes_per_node, bytes_per_node)
+                    .expect("host pool layout");
+                // SAFETY: a non-zero layout, leaked for the test machine's life.
+                let start = unsafe { alloc::alloc::alloc(layout) } as usize;
+                assert!(start != 0, "host allocation for the test pool failed");
+                NodeRun {
+                    start,
+                    end: start + bytes_per_node,
+                    node: NodeId::new(node),
+                }
+            })
+            .collect();
+        Box::leak(Box::new(UserMemoryPool::new(
+            self,
+            ProcessorId::new(0),
+            &runs,
+        )))
+    }
+
+    /// The machine's locality, leaked like [`Self::pool`]'s pool, with
+    /// no user memory.
+    pub(crate) fn locality(&self) -> &'static Locality {
+        Box::leak(Box::new(Locality::new(self, &[])))
+    }
+}
+
+impl NumaTopology for TestMachine {
+    type MemoryAffinities<'a> = core::iter::Empty<MemoryAffinity>;
+
+    fn node_count(&self) -> usize {
+        self.distances.len().isqrt()
+    }
+
+    fn processor_count(&self) -> usize {
+        self.processor_nodes.len()
+    }
+
+    fn processor_node(&self, processor: ProcessorId) -> NodeId {
+        NodeId::new(self.processor_nodes[usize::from(processor.id())])
+    }
+
+    fn distance(&self, from: NodeId, to: NodeId) -> NodeDistance {
+        NodeDistance::new(self.distances[from.index() * self.node_count() + to.index()])
+    }
+
+    fn memory_affinity(&self) -> Self::MemoryAffinities<'_> {
+        core::iter::empty()
+    }
 }
 
 /// A CPU whose clock a test moves by hand.
@@ -203,6 +377,8 @@ impl ManualClockCpu {
 }
 
 impl Cpu for ManualClockCpu {
+    type Hypervisor = core::convert::Infallible;
+    type Native = core::convert::Infallible;
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
     fn processor_count(&self) -> usize {
@@ -317,6 +493,8 @@ impl RecordingSmpCpu {
 }
 
 impl Cpu for RecordingSmpCpu {
+    type Hypervisor = core::convert::Infallible;
+    type Native = core::convert::Infallible;
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
     fn processor_count(&self) -> usize {
@@ -609,6 +787,13 @@ struct RecordingInterfaceState {
     /// Every frame the transmit ring took, headers and payload joined,
     /// in the order it took them.
     transmitted: spin::Mutex<alloc::vec::Vec<alloc::vec::Vec<u8>>>,
+    /// The pair each taken frame was submitted on, in the same order.
+    transmitted_on: spin::Mutex<alloc::vec::Vec<usize>>,
+    /// The live pair count the device was last told.
+    live_pairs: AtomicUsize,
+    /// Every pair whose interrupt was steered, with its destination, in
+    /// order.
+    steered: spin::Mutex<alloc::vec::Vec<(usize, helios_hal::cpu::ProcessorId)>>,
 }
 
 impl RecordingNetworkInterface {
@@ -640,6 +825,9 @@ impl RecordingNetworkInterface {
                 device_signal: crate::ProgressSignal::new(),
                 accept_transmissions,
                 transmitted: spin::Mutex::new(alloc::vec::Vec::new()),
+                transmitted_on: spin::Mutex::new(alloc::vec::Vec::new()),
+                live_pairs: AtomicUsize::new(queue_pairs),
+                steered: spin::Mutex::new(alloc::vec::Vec::new()),
             }),
         }
     }
@@ -648,6 +836,22 @@ impl RecordingNetworkInterface {
     /// built, each with its scatter payload appended to its headers.
     pub(crate) fn transmitted_frames(&self) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
         self.inner.transmitted.lock().clone()
+    }
+
+    /// The pair each frame in [`Self::transmitted_frames`] was
+    /// submitted on.
+    pub(crate) fn transmitted_pairs(&self) -> alloc::vec::Vec<usize> {
+        self.inner.transmitted_on.lock().clone()
+    }
+
+    /// The live pair count the device was last told.
+    pub(crate) fn live_pairs(&self) -> usize {
+        self.inner.live_pairs.load(Ordering::Acquire)
+    }
+
+    /// Every steering the interface was asked for, in order.
+    pub(crate) fn steered(&self) -> alloc::vec::Vec<(usize, helios_hal::cpu::ProcessorId)> {
+        self.inner.steered.lock().clone()
     }
 
     /// Puts a frame in one queue pair's receive ring, where the next
@@ -829,21 +1033,47 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
         Some(drain)
     }
 
+    fn set_active_queue_pairs(&self, pairs: usize) -> helios_hal::io::IoResult<()> {
+        assert!(
+            (1..=self.inner.queues.len()).contains(&pairs),
+            "{pairs} live pairs out of {}",
+            self.inner.queues.len()
+        );
+        self.inner.live_pairs.store(pairs, Ordering::Release);
+        Ok(())
+    }
+
+    fn steer_queue_pair(&self, pair: usize, processor: helios_hal::cpu::ProcessorId) {
+        assert!(
+            pair < self.inner.queues.len(),
+            "pair {pair} was never brought up"
+        );
+        self.inner.steered.lock().push((pair, processor));
+    }
+
     fn try_transmit_scatter_immediate_on(
         &self,
-        _: usize,
+        queue_idx: usize,
         frames: &[helios_netstack::TxFrameRef<'_>],
     ) -> helios_hal::io::IoResult<Option<usize>> {
         if !self.inner.accept_transmissions {
             return Ok(Some(0));
         }
+        let pair = self.inner.pair(queue_idx);
+        assert!(
+            pair < self.live_pairs(),
+            "a frame was submitted on pair {pair}, which the device does not read: {} pairs are live",
+            self.live_pairs()
+        );
         let mut transmitted = self.inner.transmitted.lock();
+        let mut transmitted_on = self.inner.transmitted_on.lock();
         for frame in frames {
             let mut bytes = frame.bytes.to_vec();
             if let Some(payload) = frame.payload {
                 bytes.extend_from_slice(payload);
             }
             transmitted.push(bytes);
+            transmitted_on.push(pair);
         }
         Ok(Some(frames.len()))
     }
@@ -915,7 +1145,7 @@ mod network {
 
     use bytes::Bytes;
 
-    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use triomphe::Arc;
 
@@ -952,48 +1182,11 @@ mod network {
         closed: Arc<TestClosedStreams>,
         closed_udp: Arc<TestClosedStreams>,
         closed_listeners: Arc<TestClosedStreams>,
-        /// The failure switch a stream test arms: once set, the calls a
-        /// device poll sits behind — `tcp_read`, `tcp_write_all_bytes`,
-        /// `tcp_write_ready` — fail the way a device fault fails them,
-        /// while the synchronous probes keep answering: `tcp_try_read`
-        /// still drains and the send side reports a full queue, since a
-        /// device that cannot be polled also cannot drain one.
-        drive_failure: Arc<AtomicBool>,
-        /// Bytes `tcp_write_all` accepted — the evidence a parked batch
-        /// was retried rather than dropped.
-        bytes_written: Arc<AtomicU64>,
     }
 
     impl TestNetworkService {
         pub(crate) fn new() -> Self {
             Self::default()
-        }
-
-        /// Arm the driving calls to fail — see `drive_failure`.
-        pub(crate) fn fail_drives(&self) {
-            self.drive_failure.store(true, Ordering::Release);
-        }
-
-        /// Disarm the switch, so a retried write can show what a parked
-        /// batch kept.
-        pub(crate) fn heal_drives(&self) {
-            self.drive_failure.store(false, Ordering::Release);
-        }
-
-        /// Total bytes `tcp_write_all` has accepted.
-        pub(crate) fn bytes_written(&self) -> u64 {
-            self.bytes_written.load(Ordering::Acquire)
-        }
-
-        /// The error a real device fault surfaces as from a driving
-        /// call, when the switch is armed.
-        fn drive_error(&self) -> Option<crate::TcpError> {
-            self.drive_failure
-                .load(Ordering::Acquire)
-                .then_some(crate::TcpError {
-                    kind: crate::TcpErrorKind::Internal,
-                    detail: crate::NetworkErrorDetail::VirtioAdvanceFailed,
-                })
         }
 
         /// The TCP retirement log this service writes to, which is
@@ -1059,6 +1252,10 @@ mod network {
             [2, 0, 0, 0, 0, 1]
         }
 
+        fn owns_ip_address(&self, address: crate::NetworkIpAddress) -> bool {
+            address == crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1]))
+        }
+
         fn revalidate_lease(&self) -> impl Future<Output = ()> + Send + '_ {
             core::future::ready(())
         }
@@ -1098,6 +1295,24 @@ mod network {
             )]))
         }
 
+        fn dns_resolve_https(
+            &self,
+            _: &str,
+            _: u16,
+            _: u64,
+        ) -> impl core::future::Future<
+            Output = Result<Option<crate::HttpsRecord>, crate::DnsError>,
+        > + Send
+        + '_ {
+            core::future::ready(Ok(None))
+        }
+
+        fn dns_servers(&self) -> Vec<crate::NetworkIpAddress> {
+            vec![crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
+                10, 0, 2, 3,
+            ]))]
+        }
+
         fn tcp_connect(
             &self,
             _: &str,
@@ -1134,6 +1349,42 @@ mod network {
             } else {
                 u64::from(local_port)
             }))
+        }
+
+        fn tcp_connect_start(
+            &self,
+            _: crate::NetworkIpAddress,
+            _: u16,
+            local_port: u16,
+            _: u8,
+        ) -> impl core::future::Future<
+            Output = Result<(Self::TcpStream, crate::TcpConnectPoll), crate::TcpError>,
+        > + Send
+        + '_ {
+            let id = if local_port == 0 {
+                7
+            } else {
+                u64::from(local_port)
+            };
+            core::future::ready(Ok((id, crate::TcpConnectPoll::Connected)))
+        }
+
+        fn tcp_connect_poll(
+            &self,
+            _: Self::TcpStream,
+        ) -> impl core::future::Future<Output = Result<crate::TcpConnectPoll, crate::TcpError>> + Send + '_
+        {
+            core::future::ready(Ok(crate::TcpConnectPoll::Connected))
+        }
+
+        fn tcp_local_endpoint(
+            &self,
+            _: Self::TcpStream,
+        ) -> Result<Option<(crate::NetworkIpAddress, u16)>, crate::TcpError> {
+            Ok(Some((
+                crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
+                40000,
+            )))
         }
 
         fn tcp_listen(
@@ -1182,18 +1433,10 @@ mod network {
         fn tcp_write_all(
             &self,
             _: Self::TcpStream,
-            bytes: &[u8],
+            _: &[u8],
             _: u64,
         ) -> impl core::future::Future<Output = Result<(), crate::TcpError>> + Send + '_ {
-            let written = bytes.len() as u64;
-            let failure = self.drive_error();
-            core::future::ready(match failure {
-                Some(error) => Err(error),
-                None => {
-                    self.bytes_written.fetch_add(written, Ordering::AcqRel);
-                    Ok(())
-                }
-            })
+            core::future::ready(Ok(()))
         }
 
         fn tcp_read(
@@ -1203,55 +1446,31 @@ mod network {
             _: u64,
         ) -> impl core::future::Future<Output = Result<Option<Bytes>, crate::TcpError>> + Send + '_
         {
-            let failure = self.drive_error();
-            core::future::ready(match failure {
-                Some(error) => Err(error),
-                None => Ok(Some(Bytes::from_static(&[4, 2]))),
-            })
+            core::future::ready(Ok(Some(Bytes::from_static(&[4, 2]))))
         }
 
-        fn tcp_try_read(
-            &self,
+        /// The same reply as [`Self::tcp_read`], as much of it as the
+        /// buffer takes: the peer this models always has it to send.
+        fn tcp_read_into<'a>(
+            &'a self,
             _: Self::TcpStream,
-            _: usize,
-        ) -> Result<crate::TcpReadProgress, crate::TcpError> {
-            Ok(crate::TcpReadProgress::Data(Bytes::from_static(&[4, 2])))
+            buffer: &'a mut crate::RegisteredTcpReadBuffer<'_>,
+            _: u64,
+        ) -> impl core::future::Future<Output = Result<crate::TcpReadInto, crate::TcpError>> + Send + 'a
+        {
+            core::future::ready(Ok(crate::TcpReadInto::Data(
+                helios_netstack::TcpReceiveBuffer::write_from(buffer, &[4, 2]),
+            )))
         }
 
-        fn tcp_send_room(
-            &self,
-            _: Self::TcpStream,
-        ) -> Result<crate::TcpWriteProgress, crate::TcpError> {
-            Ok(match self.drive_failure.load(Ordering::Acquire) {
-                // A device whose polls fail drains nothing: the send
-                // queue reads as full.
-                true => crate::TcpWriteProgress::Pending,
-                false => crate::TcpWriteProgress::Room(usize::MAX),
-            })
-        }
-
-        fn tcp_try_write(
-            &self,
-            _: Self::TcpStream,
-            bytes: &mut Bytes,
-        ) -> Result<crate::TcpWriteProgress, crate::TcpError> {
-            if self.drive_failure.load(Ordering::Acquire) {
-                return Ok(crate::TcpWriteProgress::Pending);
-            }
-            let written = bytes.len();
-            bytes.clear();
-            Ok(crate::TcpWriteProgress::Room(written))
-        }
-
-        fn tcp_write_ready(
-            &self,
-            _: Self::TcpStream,
-        ) -> impl core::future::Future<Output = Result<(), crate::TcpError>> + Send + '_ {
-            let failure = self.drive_error();
-            core::future::ready(match failure {
-                Some(error) => Err(error),
-                None => Ok(()),
-            })
+        fn tcp_peek_into<'a>(
+            &'a self,
+            stream: Self::TcpStream,
+            buffer: &'a mut crate::RegisteredTcpReadBuffer<'_>,
+            timeout_nanos: u64,
+        ) -> impl core::future::Future<Output = Result<crate::TcpReadInto, crate::TcpError>> + Send + 'a
+        {
+            self.tcp_read_into(stream, buffer, timeout_nanos)
         }
 
         fn tcp_shutdown_send(
@@ -1271,6 +1490,7 @@ mod network {
 
         fn udp_bind(
             &self,
+            _: crate::NetworkIpAddress,
             local_port: u16,
         ) -> impl core::future::Future<
             Output = Result<crate::UdpBinding<Self::UdpSocket>, crate::UdpError>,
@@ -1332,6 +1552,18 @@ mod network {
         > + Send
         + '_ {
             core::future::ready(Ok(None))
+        }
+
+        fn udp_peek(
+            &self,
+            socket: Self::UdpSocket,
+            max_bytes: u32,
+            timeout_nanos: u64,
+        ) -> impl core::future::Future<
+            Output = Result<Option<crate::UdpDatagram>, crate::UdpError>,
+        > + Send
+        + '_ {
+            self.udp_receive(socket, max_bytes, timeout_nanos)
         }
 
         fn udp_join_multicast_v4(
@@ -1488,6 +1720,13 @@ mod network {
         /// pump to own — whichever processor calls, the answer is that
         /// there is nothing to drive.
         async fn run_packet_pump(&self, _: helios_hal::cpu::ProcessorId) {}
+
+        /// No pairs, so a departing processor has none to hand off.
+        fn hand_off_queue_pair(&self, _: helios_hal::cpu::ProcessorId, _: &crate::exec::OnlineSet) {
+        }
+
+        /// No pairs, so an arriving processor has none to take up.
+        fn take_up_queue_pair(&self, _: helios_hal::cpu::ProcessorId) {}
     }
 }
 
@@ -1568,6 +1807,168 @@ pub(crate) fn recording_udp_network_service()
     let service = TestNetworkService::new();
     let closed = service.closed_udp_sockets();
     (service, closed)
+}
+
+/// A [`crate::HostFileSystem`] for a test that needs a host share type
+/// but never reaches one: every operation answers
+/// [`helios_hal::io::IoError::Unsupported`].
+#[derive(Clone)]
+pub(crate) struct UnsupportedHostFileSystem;
+
+fn unsupported_host_fs<T>() -> core::future::Ready<Result<T, crate::HostFsError>> {
+    core::future::ready(Err(crate::HostFsError::Transport(
+        helios_hal::io::IoError::Unsupported,
+    )))
+}
+
+impl crate::HostFileSystem for UnsupportedHostFileSystem {
+    type Write = core::convert::Infallible;
+
+    /// There is no share here, so there is nothing to have cached.
+    fn cache_stats(&self) -> Option<crate::HostFsCacheStats> {
+        None
+    }
+
+    /// No session and no cache, so a restore leaves nothing to drop.
+    fn after_machine_restore(
+        &self,
+        _restore: crate::HostShareRestore,
+    ) -> impl core::future::Future<Output = ()> + Send + '_ {
+        core::future::ready(())
+    }
+
+    /// No session, so nothing to release for a snapshot.
+    fn prepare_snapshot(&self) -> impl core::future::Future<Output = ()> + Send + '_ {
+        core::future::ready(())
+    }
+
+    fn snapshot_finished(&self) {}
+
+    fn stat_path(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<crate::HostMetadata, crate::HostFsError>> + Send + '_
+    {
+        unsupported_host_fs()
+    }
+    fn read_dir(
+        &self,
+        _path: &str,
+        _limit: crate::HostDirLimit,
+    ) -> impl core::future::Future<Output = Result<Vec<crate::HostDirEntry>, crate::HostFsError>>
+    + Send
+    + '_ {
+        unsupported_host_fs()
+    }
+    fn read_file(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<Vec<u8>, crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn read_file_range(
+        &self,
+        _path: &str,
+        _offset: u64,
+        _max_bytes: u32,
+    ) -> impl core::future::Future<Output = Result<Vec<u8>, crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn prepare_write(
+        &self,
+        _path: &str,
+        _position: helios_hal::fs::WritePosition,
+        _len: usize,
+    ) -> impl core::future::Future<Output = Result<Self::Write, crate::HostFsError>> + Send + '_
+    {
+        unsupported_host_fs()
+    }
+    fn sync_file(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn truncate_file(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn set_file_size(
+        &self,
+        _path: &str,
+        _size: u64,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn set_times(
+        &self,
+        _path: &str,
+        _access_nanos: Option<u64>,
+        _modified_nanos: Option<u64>,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn create_file(
+        &self,
+        _path: &str,
+        _creation: crate::HostCreation,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn create_directory(
+        &self,
+        _path: &str,
+        _creation: crate::HostCreation,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn remove(
+        &self,
+        _path: &str,
+        _directory: bool,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn rename(
+        &self,
+        _source: &str,
+        _destination: &str,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn hard_link(
+        &self,
+        _source: &str,
+        _destination: &str,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn symlink(
+        &self,
+        _target: &str,
+        _link_path: &str,
+        _gid: u32,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn read_link(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<alloc::string::String, crate::HostFsError>> + Send + '_
+    {
+        unsupported_host_fs()
+    }
+}
+
+/// The storage of a test machine with neither a host share nor a disk.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UnsupportedStorage;
+
+impl crate::Storage for UnsupportedStorage {
+    type HostShare = UnsupportedHostFileSystem;
+    type Disk = crate::NoDisks;
 }
 
 #[test]

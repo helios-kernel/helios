@@ -14,6 +14,7 @@ from helios_bench.baseline import resolve as resolve_baseline
 from helios_bench.gate import gate_report
 from helios_bench.manifest import host_deviations, load_manifest
 from helios_bench.plots import plot_report
+from helios_bench.profile import collect_workloads
 from helios_bench.render import (
     marked_section,
     render_docs_results,
@@ -43,6 +44,10 @@ def parse_sides(raw: str) -> frozenset[Side]:
 def command_run(args: argparse.Namespace) -> int:
     manifest = load_manifest()
     lane = manifest.lane(args.lane)
+    if args.memory is not None:
+        lane = lane.model_copy(
+            update={"memory": args.memory, "linux_vm_memory": args.memory, "memory_differs_because": None}
+        )
     ref = MERGE_BASE if args.baseline_merge_base else args.baseline_ref
     baseline = resolve_baseline(ref) if ref else None
     sides = parse_sides(args.sides)
@@ -106,6 +111,19 @@ def command_lanes(args: argparse.Namespace) -> int:
     else:
         for lane in lanes:
             print(lane.name)
+    return 0
+
+
+def command_collect_profile(args: argparse.Namespace) -> int:
+    collect_workloads(
+        load_manifest().lane(args.lane),
+        args.checkout_path.resolve(),
+        args.output.resolve(),
+        args.net_ifname,
+        args.net_bridge,
+        args.net_queues,
+        args.timeout_seconds,
+    )
     return 0
 
 
@@ -199,17 +217,11 @@ def command_gate(args: argparse.Namespace) -> int:
     candidate = load_report(args.candidate)
     baseline = load_report(args.baseline) if args.baseline else None
     report = gate_report(candidate, baseline)
-    if not report.results:
-        if report.cross_run_refused is not None:
-            # The one comparison there was is refused, and an empty gate
-            # would read as a pass.
-            raise SystemExit(
-                f"{args.candidate}: the run was not paired and the cross-run comparison "
-                f"is refused: {report.cross_run_refused.reason}"
-            )
+    if not report.results and report.cross_run_refused is not None:
+        # A requested comparison was refused; this is not a standalone run.
         raise SystemExit(
-            f"{args.candidate}: the run was not paired and no --baseline was given, "
-            "so there is nothing to compare it against"
+            f"{args.candidate}: the run was not paired and the cross-run comparison "
+            f"is refused: {report.cross_run_refused.reason}"
         )
     text = render_gate(report, candidate.run.lane)
     if args.out:
@@ -228,6 +240,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="helios-bench", description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
 
+    profile = subcommands.add_parser("collect-profile", help="collect all workload instrumentation")
+    profile.add_argument("--lane", required=True)
+    profile.add_argument("--checkout-path", type=Path, required=True)
+    profile.add_argument("--output", type=Path, required=True)
+    profile.add_argument("--net-ifname", required=True)
+    profile.add_argument("--net-bridge", required=True)
+    profile.add_argument("--net-queues", type=int, required=True)
+    profile.add_argument("--timeout-seconds", type=int, required=True)
+    profile.set_defaults(func=command_collect_profile)
+
     run = subcommands.add_parser("run", help="time every side on one lane and write report.json")
     run.add_argument("--lane", required=True)
     run.add_argument("--out-dir", type=Path, required=True)
@@ -238,6 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--sides", default="helios,linux_native,linux_wasmtime")
     run.add_argument("--workload", dest="workloads", action="append", default=[])
     run.add_argument("--iterations", type=int)
+    run.add_argument("--memory", help="guest memory for both Helios and Linux (defaults to the lane)")
     run.add_argument(
         "--rounds",
         type=int,

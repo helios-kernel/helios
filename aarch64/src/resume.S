@@ -7,6 +7,7 @@
 // touches only that context until the MMU is on. The offsets are pinned
 // by assertions in `lifecycle.rs`.
 .section .text.cpu_resume, "ax"
+.arch armv8.3-a
 .global __helios_aarch64_cpu_resume
 .type __helios_aarch64_cpu_resume, %function
 __helios_aarch64_cpu_resume:
@@ -15,6 +16,16 @@ __helios_aarch64_cpu_resume:
     lsr x1, x1, #2
     cmp x1, #2
     b.ne 2f
+    ldr x1, [x0, #304]
+    cmp x1, #8
+    b.ne 1f
+    // Restore VHE before using the EL1 accessors that alias host EL2
+    // registers. The saved translation regime must stay at its owner EL.
+    ldr x1, [x0, #312]
+    msr hcr_el2, x1
+    isb
+    b 2f
+1:
     // Entered at EL2: configure it to run EL1 as AArch64 with the
     // generic timer, FP/SIMD and the identification registers visible,
     // then drop to EL1 at the next instruction.
@@ -41,6 +52,13 @@ __helios_aarch64_cpu_resume:
     isb
     eret
 2:
+    // CPU_OFF loses the signing key. Existing stack frames retain signed
+    // return addresses, so restore the same key before enabling SCTLR.EnIA.
+    ldr x1, [x0, #320]
+    msr apiakeylo_el1, x1
+    ldr x1, [x0, #328]
+    msr apiakeyhi_el1, x1
+    isb
     msr spsel, #1
     // Install the translation regime. TTBR0 is the context's identity
     // map of this very code, so the instruction after the SCTLR write

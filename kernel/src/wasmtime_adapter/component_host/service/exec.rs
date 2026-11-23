@@ -20,6 +20,9 @@ where
         /// executable itself is moved through every launch path.
         restore: Box<CoreModuleRestore<Net>>,
     },
+    /// A static Linux executable the native host runs.
+    #[cfg(feature = "linux")]
+    Linux(LinuxExecutable),
 }
 
 pub(super) struct CoreModuleRestore<Net: ComponentHostNetwork> {
@@ -27,6 +30,7 @@ pub(super) struct CoreModuleRestore<Net: ComponentHostNetwork> {
     pub(super) memory_spec: SharedMemorySpec,
     pub(super) descriptors: Preview1DescriptorTable<Net>,
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
+    pub(super) signal_callback: Option<Arc<str>>,
     pub(super) rewind: WasixRewind,
 }
 
@@ -199,6 +203,39 @@ impl<Net: ComponentHostNetwork> WasixAsyncifyState<Net> {
             process_snapshot_rewinding: false,
         }
     }
+
+    /// True when the guest is neither unwinding out of Wasm nor rewinding back
+    /// to a checkpointed host call, so invoking a `callback_signal` export is
+    /// safe.
+    pub(super) const fn is_idle(&self) -> bool {
+        matches!(self.phase, WasixAsyncifyPhase::Idle)
+            && self.rewind_value.is_none()
+            && !self.process_snapshot_rewinding
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AsyncifyOutcome {
+    Idle,
+    Rewinding,
+}
+
+#[derive(Debug)]
+pub(super) enum AsyncifyError {
+    /// A stop or runtime trap (`WasixThreadEnded`, `WasixThreadSignalExit`,
+    /// `Preview1SignalExit`, `InstanceKilled`, `Trap`, `SwapFaultError`) met
+    /// during an asyncify turn or helper call, classified identically to an
+    /// error returned directly by the guest's entry point.
+    GuestStop(wasmtime::Error),
+    /// A structural binary or launch failure (`StackBoundsInvalid`,
+    /// `UnwindExportInvalid`, `OutOfMemory` spawning a fork child).
+    Exec(ProgramExecError),
+}
+
+impl From<ProgramExecError> for AsyncifyError {
+    fn from(error: ProgramExecError) -> Self {
+        Self::Exec(error)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -211,6 +248,7 @@ pub(super) async fn run_program_executable<CpuImpl, Net, StorageImpl>(
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
+    #[cfg(feature = "linux")] container: Option<LinuxContainerLaunch<StorageImpl>>,
     spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     executable: ProgramExecutable<CpuImpl, Net, StorageImpl>,
@@ -233,24 +271,39 @@ where
     // handle `for_task`.
     let task_trace = timeline.task_guard(exec_context.cpu.clone());
     let outcome = match executable {
+        // A component has no descriptor table of its own: the table a
+        // WASIX parent hands down becomes its stdio, and is dropped here
+        // so that no pipe end it held outlives the launch.
         ProgramExecutable::Component(compiled) => {
-            run_program_component(
-                exec_context,
-                argv,
-                env,
-                authority,
-                filesystem,
-                signal_state,
-                spawner,
-                progress,
-                compiled,
-                engine,
-                runtime,
-                launched_instance,
-                output_mode,
-                &timeline,
-            )
-            .await
+            let stdio = match descriptors {
+                Some(table) => table.component_output_mode(&output_mode),
+                None => Ok(output_mode),
+            };
+            match stdio {
+                Ok(output_mode) => {
+                    run_program_component(
+                        exec_context,
+                        argv,
+                        env,
+                        authority,
+                        filesystem,
+                        signal_state,
+                        spawner,
+                        progress,
+                        compiled,
+                        engine,
+                        runtime,
+                        launched_instance,
+                        output_mode,
+                        &timeline,
+                    )
+                    .await
+                }
+                Err(refusal) => Err(ProgramExecError {
+                    kind: ProgramExecErrorKind::Unavailable,
+                    detail: ProgramExecErrorDetail::ComponentStdioUnbindable(refusal),
+                }),
+            }
         }
         ProgramExecutable::CoreModule(compiled) => {
             run_program_core_module(
@@ -272,6 +325,40 @@ where
                 core_module_instance_pre_cache,
                 launched_instance,
                 output_mode,
+                &timeline,
+            )
+            .await
+        }
+        // A Linux process holds the descriptor table it is handed as its
+        // own, runs inside its container, and its standard streams lead where
+        // the launch routes them.
+        #[cfg(feature = "linux")]
+        ProgramExecutable::Linux(executable) => {
+            let launch = container.expect("every Linux launch carries a container");
+            let exec_runtime = LinuxExecRuntime {
+                exec_context: exec_context.clone(),
+                wasm: Some(LinuxWasmRuntime {
+                    filesystem,
+                    progress,
+                    engine: engine.clone(),
+                    runtime: runtime.clone(),
+                    preview1_core_linker,
+                    shared_memory_pool,
+                    core_module_instance_pre_cache,
+                }),
+            };
+            run_linux_process(
+                exec_runtime,
+                argv,
+                env,
+                launch.container,
+                launch.credentials,
+                descriptors,
+                signal_state,
+                spawner,
+                launched_instance,
+                output_mode,
+                executable,
                 &timeline,
             )
             .await
@@ -416,11 +503,23 @@ where
                 "core-shared-memory-define",
             );
 
+            super::emit_program_stage_marker(write_serial, "program:instantiate-core-pre-begin");
+            let instantiate_pre_profile =
+                start_program_kernel_profile(&profile_runtime_state, &run_cpu);
+            let instance_pre = Arc::new(
+                linker
+                    .instantiate_pre(&compiled.module)
+                    .map_err(map_program_runtime_error)?,
+            );
+            record_program_kernel_profile_sample(instantiate_pre_profile, "instantiate-core-pre");
+            super::emit_program_stage_marker(write_serial, "program:instantiate-core-pre-end");
+            store.data_mut().thread_instance_pre = Some(instance_pre.clone());
+
             super::emit_program_stage_marker(write_serial, "program:instantiate-core-begin");
             let instantiate_started = run_cpu.now().ticks();
             let turns = store.data().guest_turns();
             let instance = interrupts
-                .drive(turns.drive(linker.instantiate_async(&mut store, &compiled.module)))
+                .drive(turns.drive(instance_pre.instantiate_async(&mut store)))
                 .await;
             record_named_program_kernel_profile(
                 &profile_runtime_state,
@@ -504,7 +603,26 @@ where
             );
             instance
         };
-        let instance = instance.map_err(map_program_runtime_error)?;
+        let instance = match instance {
+            Ok(instance) => instance,
+            Err(error) => match instantiate_termination(&error) {
+                Some(termination) => {
+                    return Ok(CoreModuleImageEnd {
+                        completion: CoreModuleRunCompletion::Exit(Ok(ChildExit {
+                            instance_id,
+                            termination,
+                            filesystem: Some(store.data().filesystem.root_layer()),
+                        })),
+                        store_teardown_profile: start_program_kernel_profile(
+                            &profile_runtime_state,
+                            &run_cpu,
+                        ),
+                    });
+                }
+                None => return Err(map_program_runtime_error(error)),
+            },
+        };
+        store.data_mut().guest_instance = Some(instance);
         super::emit_program_stage_marker(write_serial, "program:instantiate-core-ok");
         timeline.record(&run_cpu, LaunchPhase::Instantiate);
 
@@ -516,7 +634,6 @@ where
         let completion = run_core_module_image(
             &mut store,
             &interrupts,
-            &instance,
             start,
             CoreModuleImageRun {
                 spawner: &spawner,
@@ -641,6 +758,10 @@ where
                 threads.clone(),
             ),
         );
+        store
+            .data()
+            .process_signals
+            .set_callback(restore.signal_callback);
         let interrupts = configure_preview1_program_store(&mut store);
         record_program_kernel_profile_sample(store_prepare_profile, "core-store-prepare-rewind");
         timeline.record(&run_cpu, LaunchPhase::StorePrepare);
@@ -655,11 +776,24 @@ where
         );
         timeline.record(&run_cpu, LaunchPhase::SharedMemory);
 
+        let instantiate_pre_profile =
+            start_program_kernel_profile(&profile_runtime_state, &run_cpu);
+        let instance_pre = Arc::new(
+            linker
+                .instantiate_pre(&compiled.module)
+                .map_err(map_program_runtime_error)?,
+        );
+        record_program_kernel_profile_sample(
+            instantiate_pre_profile,
+            "instantiate-core-pre-rewind",
+        );
+        store.data_mut().thread_instance_pre = Some(instance_pre.clone());
+
         super::emit_program_stage_marker(write_serial, "program:instantiate-core-begin");
         let instantiate_started = run_cpu.now().ticks();
         let turns = store.data().guest_turns();
         let instance = interrupts
-            .drive(turns.drive(linker.instantiate_async(&mut store, &compiled.module)))
+            .drive(turns.drive(instance_pre.instantiate_async(&mut store)))
             .await;
         record_named_program_kernel_profile(
             &profile_runtime_state,
@@ -674,12 +808,47 @@ where
             "instantiate-core-rewind",
             instantiate_started,
         );
-        let instance = instance.map_err(map_program_runtime_error)?;
+        let instance = match instance {
+            Ok(instance) => instance,
+            Err(error) => match instantiate_termination(&error) {
+                Some(termination) => {
+                    return Ok(CoreModuleImageEnd {
+                        completion: CoreModuleRunCompletion::Exit(Ok(ChildExit {
+                            instance_id,
+                            termination,
+                            filesystem: Some(store.data().filesystem.root_layer()),
+                        })),
+                        store_teardown_profile: start_program_kernel_profile(
+                            &profile_runtime_state,
+                            &run_cpu,
+                        ),
+                    });
+                }
+                None => return Err(map_program_runtime_error(error)),
+            },
+        };
+        store.data_mut().guest_instance = Some(instance);
         timeline.record(&run_cpu, LaunchPhase::Instantiate);
         super::emit_program_stage_marker(write_serial, "program:instantiate-core-ok");
 
         let rewind_profile = start_program_kernel_profile(&profile_runtime_state, &run_cpu);
-        wasix_begin_rewind(&mut store, &interrupts, &instance, restore.rewind).await?;
+        if let Err(error) = wasix_begin_rewind(&mut store, &interrupts, restore.rewind).await {
+            let termination = match error {
+                AsyncifyError::GuestStop(stop) => store.data_mut().take_process_end(stop)?,
+                AsyncifyError::Exec(exec) => return Err(exec),
+            };
+            return Ok(CoreModuleImageEnd {
+                completion: CoreModuleRunCompletion::Exit(Ok(ChildExit {
+                    instance_id,
+                    termination,
+                    filesystem: Some(store.data().filesystem.root_layer()),
+                })),
+                store_teardown_profile: start_program_kernel_profile(
+                    &profile_runtime_state,
+                    &run_cpu,
+                ),
+            });
+        }
         record_program_kernel_profile_sample(rewind_profile, "core-begin-rewind");
 
         let resolve_start_profile = start_program_kernel_profile(&profile_runtime_state, &run_cpu);
@@ -690,7 +859,6 @@ where
         let completion = run_core_module_image(
             &mut store,
             &interrupts,
-            &instance,
             start,
             CoreModuleImageRun {
                 spawner: &spawner,
@@ -782,7 +950,6 @@ where
 async fn run_core_module_image<CpuImpl, Net, StorageImpl>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     interrupts: &StoreInterrupts<CpuImpl>,
-    instance: &wasmtime::Instance,
     start: wasmtime::TypedFunc<(), ()>,
     run: CoreModuleImageRun<'_, CpuImpl, Net, StorageImpl>,
 ) -> Result<CoreModuleRunCompletion<CpuImpl, Net, StorageImpl>, ProgramExecError>
@@ -811,19 +978,15 @@ where
         let result = interrupts
             .drive(turns.drive(start.call_async(&mut *store, ())))
             .await;
-        // A spawned thread ended the process: no unwind is completed.
-        if result.as_ref().is_err_and(WasixThreadEnded::is) {
+        if result.is_err() {
+            store.data_mut().asyncify.phase = WasixAsyncifyPhase::Idle;
             break result;
         }
-        match handle_wasix_asyncify_completion(store, interrupts, instance).await {
-            Ok(true) => continue,
-            Ok(false) => break result,
-            // A spawned thread ended the process while main was between
-            // an unwind and its rewind; the rewind's call met the end.
-            Err(_) if store.data().thread_signals.thread_ended() => {
-                break Err(wasmtime::Error::new(WasixThreadEnded));
-            }
-            Err(error) => return Err(error),
+        match finish_wasix_guest_call(store, interrupts).await {
+            Ok(AsyncifyOutcome::Rewinding) => continue,
+            Ok(AsyncifyOutcome::Idle) => break Ok(()),
+            Err(AsyncifyError::GuestStop(error)) => break Err(error),
+            Err(AsyncifyError::Exec(error)) => return Err(error),
         }
     };
     run.timeline.record(run.cpu, LaunchPhase::GuestEnd);
@@ -842,20 +1005,20 @@ where
     let completion = match result {
         Ok(()) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
             instance_id: run.instance_id,
-            exit_code: 0,
+            termination: helios_unix::ChildTermination::Exited(0),
             filesystem: Some(store.data().filesystem.root_layer()),
         })),
         // Main's call stopped because a spawned thread ended the process;
-        // the process ends the way that thread's call ended it: it exits
-        // with its status, runs the image its exec asked for, or fails
-        // with the failure a trap on main would have reported.
+        // the process ends the way that thread's call ended it: it ends
+        // with its termination, runs the image its exec asked for, or
+        // fails with the failure main would have reported.
         Err(error) if WasixThreadEnded::is(&error) => {
             match store.data().threads.take_process_end().expect(
                 "main's image is ended only by a spawned thread that recorded the process's end first",
             ) {
-                WasixProcessEnd::Exit(code) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
+                WasixProcessEnd::Exit(termination) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
                     instance_id: run.instance_id,
-                    exit_code: code,
+                    termination,
                     filesystem: Some(store.data().filesystem.root_layer()),
                 })),
                 WasixProcessEnd::Exec(replacement) => CoreModuleRunCompletion::Exec(replacement),
@@ -867,9 +1030,9 @@ where
                 CoreModuleRunCompletion::Exec(Box::new(replacement))
             } else {
                 let end = store.data_mut().take_process_end(error);
-                CoreModuleRunCompletion::Exit(end.map(|exit_code| ChildExit {
+                CoreModuleRunCompletion::Exit(end.map(|termination| ChildExit {
                     instance_id: run.instance_id,
-                    exit_code,
+                    termination,
                     filesystem: Some(store.data().filesystem.root_layer()),
                 }))
             }
@@ -959,6 +1122,36 @@ where
         CoreModuleRunCompletion::Exec(replacement) => {
             let replacement_state = replacement_state
                 .expect("core module without WASIX imports requested exec replacement");
+            #[cfg(feature = "linux")]
+            let replacement_container =
+                if matches!(replacement.executable, ProgramExecutable::Linux(_)) {
+                    let id = replacement_state
+                        .exec_context
+                        .runtime_state
+                        .program_service()
+                        .map(|service| service.allocate_container_id())
+                        .unwrap_or_else(|| {
+                            crate::ContainerId::new(
+                                core::num::NonZeroU64::new(1).expect("nonzero container id"),
+                            )
+                        });
+                    let namespace = replacement.filesystem.as_ref().unwrap_or_else(|| {
+                        replacement_state
+                            .exec_context
+                            .runtime_state
+                            .root_namespace()
+                    });
+                    Some(LinuxContainerLaunch {
+                        container: Arc::new(crate::LinuxContainer::ephemeral(
+                            id,
+                            replacement.authority.clone(),
+                            namespace,
+                        )),
+                        credentials: None,
+                    })
+                } else {
+                    None
+                };
             Box::pin(run_program_executable(
                 replacement_state.exec_context,
                 replacement.argv,
@@ -968,6 +1161,8 @@ where
                 replacement.descriptors,
                 replacement.signal_state,
                 replacement.signal_dispositions,
+                #[cfg(feature = "linux")]
+                replacement_container,
                 spawner,
                 progress,
                 replacement.executable,
@@ -994,7 +1189,7 @@ pub(super) async fn run_program_component<CpuImpl, Net, StorageImpl>(
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<Namespace<StorageImpl>>,
-    _signal_state: WasixSignalState,
+    signal_state: WasixSignalState,
     spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     instance_pre: PreparedComponent<CpuImpl, Net, StorageImpl>,
@@ -1012,6 +1207,10 @@ where
     use crate::ComponentExecutor;
 
     let instance_id = launched_instance.id();
+    signal_state.attach(SignalTarget {
+        interrupts: engine.interrupts().clone(),
+        instance: instance_id,
+    });
 
     let argv = argv.into_vec();
     let run_started_at = monotonic_nanos(&exec_context.cpu);
@@ -1031,7 +1230,7 @@ where
         .then(|| profile_cpu.now().ticks());
     let filesystem =
         filesystem.unwrap_or_else(|| exec_context.runtime_state.root_namespace().descend());
-    let (mut store, interrupts) = crate::wasmtime_adapter::store_with_state(
+    let (mut store, interrupts) = super::super::store_with_signal_state(
         engine,
         StoreData::<CpuImpl, Net, StorageImpl>::new(
             wasmtime::component::ResourceTable::new(),
@@ -1050,6 +1249,7 @@ where
             exec_context.read_serial,
             exec_context.write_serial,
         ),
+        Some(signal_state.clone()),
     );
     if let Some(store_prepare_started) = store_prepare_started {
         record_program_kernel_profile(
@@ -1063,7 +1263,12 @@ where
         .profiling_enabled()
         .then(|| profile_cpu.now().ticks());
     timeline.record(&run_cpu, LaunchPhase::StorePrepare);
-    let turns = store.data().guest_turns();
+    let turns = store
+        .data()
+        .guest_turns_with_epilogue(super::super::ComponentStoreEpilogue::new(
+            store.data().retirement.turn_queue(),
+            Some(signal_state.clone()),
+        ));
     let instance = interrupts
         .drive(turns.drive(instance_pre.instantiate_async(&mut store)))
         .await;
@@ -1076,34 +1281,49 @@ where
             instantiate_instance_started,
         );
     }
-    let instance = instance.inspect(|instance| {
-        // Every call that shows a view checks its span against this
-        // instance's linear memory, so the store records the memory's
-        // handle here, the first moment the runtime can name it.
-        crate::wasmtime_adapter::component_host::record_linear_memory(&mut store, instance);
-    });
-    let executor = instance.and_then(|instance| {
-        let resolve_started = profile_runtime_state
-            .profiling_enabled()
-            .then(|| profile_cpu.now().ticks());
-        let resolved = crate::wasmtime_adapter::engine::resolve_wasi_cli_run(
-            instance_pre.component(),
-            &instance,
-            &mut store,
-        );
-        if let Some(resolve_started) = resolve_started {
+    let instance = match instance {
+        Ok(instance) => instance,
+        Err(error) => {
             record_program_kernel_profile(
                 &profile_runtime_state,
                 &profile_cpu,
-                "resolve-component-run",
-                resolve_started,
+                "instantiate-component",
+                instantiate_started,
             );
+            match instantiate_termination(&error) {
+                Some(termination) => {
+                    timeline.record(&run_cpu, LaunchPhase::Completion);
+                    return Ok(ChildExit {
+                        instance_id,
+                        termination,
+                        filesystem: None,
+                    });
+                }
+                None => return Err(map_program_runtime_error(error)),
+            }
         }
-        resolved.map(|run_func| crate::wasmtime_adapter::WasmtimeExecutor {
-            store,
-            interrupts,
-            run_func,
-        })
+    };
+    let resolve_started = profile_runtime_state
+        .profiling_enabled()
+        .then(|| profile_cpu.now().ticks());
+    let resolved = crate::wasmtime_adapter::engine::resolve_wasi_cli_run(
+        instance_pre.component(),
+        &instance,
+        &mut store,
+    );
+    if let Some(resolve_started) = resolve_started {
+        record_program_kernel_profile(
+            &profile_runtime_state,
+            &profile_cpu,
+            "resolve-component-run",
+            resolve_started,
+        );
+    }
+    let executor = resolved.map(|run_func| crate::wasmtime_adapter::WasmtimeExecutor {
+        store,
+        interrupts,
+        run_func,
+        signal_state: Some(signal_state),
     });
     record_program_kernel_profile(
         &profile_runtime_state,
@@ -1139,22 +1359,75 @@ where
         run_phase_started,
     );
     drop(run_heartbeat);
-    let result = result.map_err(map_program_runtime_error)?;
+    let termination = match result {
+        Ok(result) => helios_unix::ChildTermination::Exited(result.exit_code),
+        Err(error) => preview1_process_end(error, None)?,
+    };
     super::emit_program_stage_marker(exec_context.write_serial, "program:run-end");
     timeline.record(&run_cpu, LaunchPhase::Completion);
 
     Ok(ChildExit {
-        instance_id: result.instance_id,
-        exit_code: result.exit_code,
+        instance_id,
+        termination,
         filesystem: None,
     })
+}
+
+async fn in_wasix_guest_turn<CpuImpl, RuntimeStateImpl, Epilogue, Value>(
+    turns: crate::component::GuestTurns<CpuImpl, RuntimeStateImpl, Epilogue>,
+    access: impl Future<Output = Result<Value, GuestAccessError>>,
+) -> Result<Value, AsyncifyError>
+where
+    CpuImpl: Cpu + Clone,
+    RuntimeStateImpl: crate::ComponentRuntimeState,
+    Epilogue: crate::component::TurnEpilogue<RuntimeStateImpl, wasmtime::Error>,
+{
+    let driven = turns
+        .drive(async { Ok::<_, wasmtime::Error>(access.await) })
+        .await
+        .map_err(AsyncifyError::GuestStop)?;
+    driven.map_err(|error| match error {
+        GuestAccessError::OutOfBounds => AsyncifyError::Exec(ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidBinary,
+            detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
+        }),
+        GuestAccessError::Swap(error) => AsyncifyError::GuestStop(wasmtime::Error::new(error)),
+    })
+}
+
+/// Completes any asyncify transition left by a guest entry point, then
+/// delivers pending signals when idle. If a post-return signal handler itself
+/// starts an asyncify unwind (such as `stack_restore`), loops so that unwind
+/// is processed through [`handle_wasix_asyncify_completion`] before rewinding
+/// back into the entry point.
+pub(super) async fn finish_wasix_guest_call<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    interrupts: &StoreInterrupts<CpuImpl>,
+) -> Result<AsyncifyOutcome, AsyncifyError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    loop {
+        match handle_wasix_asyncify_completion(store, interrupts).await? {
+            AsyncifyOutcome::Rewinding => return Ok(AsyncifyOutcome::Rewinding),
+            AsyncifyOutcome::Idle => {
+                wasix_deliver_pending_signals_on_store(store, interrupts)
+                    .await
+                    .map_err(AsyncifyError::GuestStop)?;
+                if matches!(store.data().asyncify.phase, WasixAsyncifyPhase::Idle) {
+                    return Ok(AsyncifyOutcome::Idle);
+                }
+            }
+        }
+    }
 }
 
 pub(super) async fn handle_wasix_asyncify_completion<CpuImpl, Net, StorageImpl>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     interrupts: &StoreInterrupts<CpuImpl>,
-    instance: &wasmtime::Instance,
-) -> Result<bool, ProgramExecError>
+) -> Result<AsyncifyOutcome, AsyncifyError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -1165,7 +1438,7 @@ where
         WasixAsyncifyPhase::Idle,
     );
     match phase {
-        WasixAsyncifyPhase::Idle => Ok(false),
+        WasixAsyncifyPhase::Idle => Ok(AsyncifyOutcome::Idle),
         WasixAsyncifyPhase::Capturing {
             snapshot,
             ret_value,
@@ -1175,27 +1448,10 @@ where
             mut memory_stack,
             stack_pointer,
         } => {
-            let memory = p1_memory_from_instance(store, instance).ok_or(ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidBinary,
-                detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-            })?;
-            let unwind_stack_finish = preview1_read_u32(memory, GuestAddress::wasm32(stack_lower))?;
-            if unwind_stack_finish < unwind_stack_begin || unwind_stack_finish > stack_pointer {
-                return Err(ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: ProgramExecErrorDetail::StackBoundsInvalid,
-                });
-            }
-            let unwind_len =
-                usize::try_from(unwind_stack_finish - unwind_stack_begin).map_err(|_| {
-                    ProgramExecError {
-                        kind: ProgramExecErrorKind::InvalidBinary,
-                        detail: ProgramExecErrorDetail::StackBoundsInvalid,
-                    }
-                })?;
             let rewind_stack =
-                preview1_read_memory(memory, GuestAddress::wasm32(unwind_stack_begin), unwind_len)?;
-            wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
+                wasix_read_unwound_stack(store, stack_lower, unwind_stack_begin, stack_pointer)
+                    .await?;
+            wasix_call_instance_func0(store, interrupts, "asyncify_stop_unwind").await?;
 
             let hash = wasix_next_stack_hash(store);
             let snapshot_bytes = wasix_stack_snapshot_bytes(ret_value, hash);
@@ -1212,18 +1468,12 @@ where
                     memory_stack[offset..end].copy_from_slice(&snapshot_bytes);
                 }
             } else {
-                let memory = p1_memory_from_instance(store, instance).ok_or(ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-                })?;
-                if preview1_write_memory(memory, GuestAddress::wasm32(snapshot), &snapshot_bytes)
-                    != p1::errno::SUCCESS
-                {
-                    return Err(ProgramExecError {
-                        kind: ProgramExecErrorKind::InvalidBinary,
-                        detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-                    });
-                }
+                let memory = Preview1AsyncMemory::of_store(store)?;
+                in_wasix_guest_turn(
+                    store.data().guest_turns(),
+                    memory.write_bytes(GuestAddress::wasm32(snapshot), &snapshot_bytes),
+                )
+                .await?;
             }
 
             store
@@ -1239,7 +1489,6 @@ where
             wasix_begin_rewind(
                 store,
                 interrupts,
-                instance,
                 WasixRewind {
                     stack_lower,
                     stack_upper,
@@ -1250,14 +1499,14 @@ where
                 },
             )
             .await?;
-            Ok(true)
+            Ok(AsyncifyOutcome::Rewinding)
         }
         WasixAsyncifyPhase::Restoring {
             hash,
             value,
             stack_lower,
         } => {
-            wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
+            wasix_call_instance_func0(store, interrupts, "asyncify_stop_unwind").await?;
             let snapshot = store
                 .data()
                 .asyncify
@@ -1269,11 +1518,10 @@ where
                     kind: ProgramExecErrorKind::InvalidBinary,
                     detail: ProgramExecErrorDetail::StackSnapshotMissing,
                 })?;
-            let stack_upper = wasix_global_u32_from_instance(store, instance, "__heap_base")?;
+            let stack_upper = wasix_global_u32_from_store(store, "__heap_base")?;
             wasix_begin_rewind(
                 store,
                 interrupts,
-                instance,
                 WasixRewind {
                     stack_lower,
                     stack_upper,
@@ -1284,7 +1532,7 @@ where
                 },
             )
             .await?;
-            Ok(true)
+            Ok(AsyncifyOutcome::Rewinding)
         }
         WasixAsyncifyPhase::Forking {
             ret_pid,
@@ -1294,27 +1542,10 @@ where
             mut memory_stack,
             stack_pointer,
         } => {
-            let memory = p1_memory_from_instance(store, instance).ok_or(ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidBinary,
-                detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-            })?;
-            let unwind_stack_finish = preview1_read_u32(memory, GuestAddress::wasm32(stack_lower))?;
-            if unwind_stack_finish < unwind_stack_begin || unwind_stack_finish > stack_pointer {
-                return Err(ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: ProgramExecErrorDetail::StackBoundsInvalid,
-                });
-            }
-            let unwind_len =
-                usize::try_from(unwind_stack_finish - unwind_stack_begin).map_err(|_| {
-                    ProgramExecError {
-                        kind: ProgramExecErrorKind::InvalidBinary,
-                        detail: ProgramExecErrorDetail::StackBoundsInvalid,
-                    }
-                })?;
             let rewind_stack =
-                preview1_read_memory(memory, GuestAddress::wasm32(unwind_stack_begin), unwind_len)?;
-            wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
+                wasix_read_unwound_stack(store, stack_lower, unwind_stack_begin, stack_pointer)
+                    .await?;
+            wasix_call_instance_func0(store, interrupts, "asyncify_stop_unwind").await?;
             let child_pid = spawn_wasix_fork_child(
                 store,
                 stack_lower,
@@ -1336,23 +1567,16 @@ where
                     memory_stack[offset..end].copy_from_slice(&snapshot_bytes);
                 }
             } else {
-                let memory = p1_memory_from_instance(store, instance).ok_or(ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-                })?;
-                if preview1_write_memory(memory, GuestAddress::wasm32(ret_pid), &snapshot_bytes)
-                    != p1::errno::SUCCESS
-                {
-                    return Err(ProgramExecError {
-                        kind: ProgramExecErrorKind::InvalidBinary,
-                        detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-                    });
-                }
+                let memory = Preview1AsyncMemory::of_store(store)?;
+                in_wasix_guest_turn(
+                    store.data().guest_turns(),
+                    memory.write_bytes(GuestAddress::wasm32(ret_pid), &snapshot_bytes),
+                )
+                .await?;
             }
             wasix_begin_rewind(
                 store,
                 interrupts,
-                instance,
                 WasixRewind {
                     stack_lower,
                     stack_upper,
@@ -1363,7 +1587,7 @@ where
                 },
             )
             .await?;
-            Ok(true)
+            Ok(AsyncifyOutcome::Rewinding)
         }
         WasixAsyncifyPhase::ProcessSnapshot {
             stack_lower,
@@ -1372,27 +1596,10 @@ where
             memory_stack,
             stack_pointer,
         } => {
-            let memory = p1_memory_from_instance(store, instance).ok_or(ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidBinary,
-                detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-            })?;
-            let unwind_stack_finish = preview1_read_u32(memory, GuestAddress::wasm32(stack_lower))?;
-            if unwind_stack_finish < unwind_stack_begin || unwind_stack_finish > stack_pointer {
-                return Err(ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: ProgramExecErrorDetail::StackBoundsInvalid,
-                });
-            }
-            let unwind_len =
-                usize::try_from(unwind_stack_finish - unwind_stack_begin).map_err(|_| {
-                    ProgramExecError {
-                        kind: ProgramExecErrorKind::InvalidBinary,
-                        detail: ProgramExecErrorDetail::StackBoundsInvalid,
-                    }
-                })?;
             let rewind_stack =
-                preview1_read_memory(memory, GuestAddress::wasm32(unwind_stack_begin), unwind_len)?;
-            wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
+                wasix_read_unwound_stack(store, stack_lower, unwind_stack_begin, stack_pointer)
+                    .await?;
+            wasix_call_instance_func0(store, interrupts, "asyncify_stop_unwind").await?;
             let snapshot = wasix_capture_process_snapshot(
                 store,
                 stack_lower,
@@ -1400,7 +1607,8 @@ where
                 stack_pointer,
                 memory_stack.clone(),
                 rewind_stack.clone(),
-            )?;
+            )
+            .await?;
             store.data_mut().asyncify.process_snapshots.push(snapshot);
             let snapshot_count = store.data().asyncify.process_snapshots.len();
             if let Some(snapshot) = store.data().asyncify.process_snapshots.last() {
@@ -1410,7 +1618,6 @@ where
             wasix_begin_rewind(
                 store,
                 interrupts,
-                instance,
                 WasixRewind {
                     stack_lower,
                     stack_upper,
@@ -1421,17 +1628,50 @@ where
                 },
             )
             .await?;
-            Ok(true)
+            Ok(AsyncifyOutcome::Rewinding)
         }
     }
+}
+
+/// The stack an asyncify unwind wrote between `unwind_stack_begin` and
+/// the end the guest recorded at `stack_lower`, read during one of the
+/// store's turns.
+async fn wasix_read_unwound_stack<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    stack_lower: u32,
+    unwind_stack_begin: u32,
+    stack_pointer: u32,
+) -> Result<Vec<u8>, AsyncifyError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let bounds_invalid = ProgramExecError {
+        kind: ProgramExecErrorKind::InvalidBinary,
+        detail: ProgramExecErrorDetail::StackBoundsInvalid,
+    };
+    let memory = Preview1AsyncMemory::of_store(store)?;
+    let unwound = in_wasix_guest_turn(store.data().guest_turns(), async {
+        let unwind_stack_finish = memory.read_u32(GuestAddress::wasm32(stack_lower)).await?;
+        if unwind_stack_finish < unwind_stack_begin || unwind_stack_finish > stack_pointer {
+            return Ok(None);
+        }
+        let unwind_len = (unwind_stack_finish - unwind_stack_begin) as usize;
+        memory
+            .read_bytes(GuestAddress::wasm32(unwind_stack_begin), unwind_len)
+            .await
+            .map(Some)
+    })
+    .await?;
+    unwound.ok_or_else(|| AsyncifyError::Exec(bounds_invalid))
 }
 
 pub(super) async fn wasix_begin_rewind<CpuImpl, Net, StorageImpl>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     interrupts: &StoreInterrupts<CpuImpl>,
-    instance: &wasmtime::Instance,
     rewind: WasixRewind,
-) -> Result<(), ProgramExecError>
+) -> Result<(), AsyncifyError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -1446,24 +1686,18 @@ where
         value,
     } = rewind;
     if stack_lower >= stack_pointer || stack_pointer > stack_upper {
-        return Err(ProgramExecError {
+        return Err(AsyncifyError::Exec(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::StackBoundsInvalid,
-        });
+        }));
     }
-    let memory = p1_memory_from_instance(store, instance).ok_or(ProgramExecError {
-        kind: ProgramExecErrorKind::InvalidBinary,
-        detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-    })?;
-    if preview1_write_memory(memory, GuestAddress::wasm32(stack_pointer), &memory_stack)
-        != p1::errno::SUCCESS
-    {
-        return Err(ProgramExecError {
-            kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-        });
-    }
-    wasix_set_global_u32_from_instance(store, instance, "__stack_pointer", stack_pointer)?;
+    let memory = Preview1AsyncMemory::of_store(store)?;
+    in_wasix_guest_turn(
+        store.data().guest_turns(),
+        memory.write_bytes(GuestAddress::wasm32(stack_pointer), &memory_stack),
+    )
+    .await?;
+    wasix_set_global_u32_from_store(store, "__stack_pointer", stack_pointer)?;
 
     let rewind_stack_begin =
         stack_lower
@@ -1483,53 +1717,38 @@ where
             detail: ProgramExecErrorDetail::StackBoundsInvalid,
         })?;
     if rewind_stack_end > stack_upper {
-        return Err(ProgramExecError {
+        return Err(AsyncifyError::Exec(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::StackBoundsInvalid,
-        });
+        }));
     }
-    let memory = p1_memory_from_instance(store, instance).ok_or(ProgramExecError {
-        kind: ProgramExecErrorKind::InvalidBinary,
-        detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-    })?;
+    let memory = Preview1AsyncMemory::of_store(store)?;
     let stack_lower_address = GuestAddress::wasm32(stack_lower);
-    let status = preview1_write_u32(memory, stack_lower_address, rewind_stack_end)
-        .max(preview1_write_u32(
-            memory,
-            stack_lower_address.offset(4),
-            stack_upper,
-        ))
-        .max(preview1_write_memory(
-            memory,
-            GuestAddress::wasm32(rewind_stack_begin),
-            &rewind_stack,
-        ));
-    if status != p1::errno::SUCCESS {
-        return Err(ProgramExecError {
-            kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-        });
-    }
-    store.data_mut().asyncify.rewind_value = value;
-    wasix_call_instance_func1(
-        store,
-        interrupts,
-        instance,
-        "asyncify_start_rewind",
-        stack_lower,
-    )
+    in_wasix_guest_turn(store.data().guest_turns(), async {
+        memory
+            .write_u32(stack_lower_address, rewind_stack_end)
+            .await?;
+        memory
+            .write_u32(stack_lower_address.offset(4), stack_upper)
+            .await?;
+        memory
+            .write_bytes(GuestAddress::wasm32(rewind_stack_begin), &rewind_stack)
+            .await
+    })
     .await?;
+    store.data_mut().asyncify.rewind_value = value;
+    wasix_call_instance_func1(store, interrupts, "asyncify_start_rewind", stack_lower).await?;
     Ok(())
 }
 
-pub(super) fn wasix_capture_process_snapshot<CpuImpl, Net, StorageImpl>(
+pub(super) async fn wasix_capture_process_snapshot<CpuImpl, Net, StorageImpl>(
     store: &wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     stack_lower: u32,
     stack_upper: u32,
     stack_pointer: u32,
     memory_stack: Vec<u8>,
     rewind_stack: Vec<u8>,
-) -> Result<WasixProcessSnapshot<Net>, ProgramExecError>
+) -> Result<WasixProcessSnapshot<Net>, AsyncifyError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -1548,17 +1767,18 @@ where
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::ImportedSharedMemoryContractInvalid,
         })?;
-    let memory = memory.data();
+    let memory = Preview1AsyncMemory::of_shared(memory);
     let memory_len = memory.len();
     let memory_pages = memory_len.div_ceil(WASM_PAGE_SIZE);
     let memory_pages = u32::try_from(memory_pages).map_err(|_| ProgramExecError {
         kind: ProgramExecErrorKind::OutOfMemory,
         detail: ProgramExecErrorDetail::ImportedSharedMemoryBudgetExceeded,
     })?;
-    // SAFETY: `memory` is the guest's live linear memory, so its first
-    // `memory_len` bytes are readable for the duration of this borrow.
-    let memory_bytes =
-        unsafe { core::slice::from_raw_parts(memory.as_ptr().cast::<u8>(), memory_len) }.to_vec();
+    let memory_bytes = in_wasix_guest_turn(
+        store.data().guest_turns(),
+        memory.read_bytes(GuestAddress::wasm32(0), memory_len),
+    )
+    .await?;
     if let Some(snapshot_started) = snapshot_started {
         record_program_kernel_profile(
             &store.data().runtime_state,
@@ -1570,10 +1790,10 @@ where
     Ok(WasixProcessSnapshot {
         memory: memory_bytes,
         memory_pages,
-        descriptors: store.data().descriptors.clone(),
+        descriptors: store.data().descriptors.snapshot(),
         filesystem: store.data().filesystem.root_layer(),
-        authority: store.data().authority.clone(),
-        cwd: store.data().cwd.clone(),
+        authority: store.data().effective_authority(),
+        cwd: store.data().cwd.get(),
         arguments: store.data().arguments.clone(),
         environment: store.data().environment.clone(),
         signal_dispositions: store.data().signal_dispositions.clone(),
@@ -1621,7 +1841,7 @@ pub(super) async fn spawn_wasix_fork_child<CpuImpl, Net, StorageImpl>(
     stack_pointer: u32,
     memory_stack: Vec<u8>,
     rewind_stack: Vec<u8>,
-) -> Result<u32, ProgramExecError>
+) -> Result<u32, AsyncifyError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -1658,10 +1878,10 @@ where
     // front the ceiling is unallocatable once the parent holds one.
     let maximum_pages = user_shared_memory_budget_pages();
     if maximum_pages < current_pages {
-        return Err(ProgramExecError {
+        return Err(AsyncifyError::Exec(ProgramExecError {
             kind: ProgramExecErrorKind::OutOfMemory,
             detail: ProgramExecErrorDetail::ImportedSharedMemoryBudgetExceeded,
-        });
+        }));
     }
     let memory_spec = SharedMemorySpec {
         initial_pages: current_pages,
@@ -1676,25 +1896,34 @@ where
         memory_spec,
     )
     .await?;
-    let fork_data = fork_memory.data();
-    if fork_data.len() < current_bytes {
-        return Err(ProgramExecError {
+    if fork_memory.data_size() < current_bytes {
+        return Err(AsyncifyError::Exec(ProgramExecError {
             kind: ProgramExecErrorKind::OutOfMemory,
             detail: ProgramExecErrorDetail::ImportedSharedMemoryBudgetExceeded,
-        });
+        }));
     }
     let copy_started = store
         .data()
         .runtime_state
         .profiling_enabled()
         .then(|| store.data().cpu.now().ticks());
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            parent_memory.data().as_ptr().cast::<u8>(),
-            fork_data.as_ptr().cast::<u8>().cast_mut(),
-            current_bytes,
-        );
-    }
+    let parent = Preview1AsyncMemory::of_shared(&parent_memory);
+    in_wasix_guest_turn(
+        store.data().guest_turns(),
+        parent.read(GuestAddress::wasm32(0), current_bytes, |source| {
+            // SAFETY: the fork's memory came out of the pool for this
+            // fork alone and holds at least `current_bytes` (checked
+            // above); no instance runs over it yet.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    source.as_ptr(),
+                    fork_memory.data().as_ptr().cast::<u8>().cast_mut(),
+                    current_bytes,
+                );
+            }
+        }),
+    )
+    .await?;
     if let Some(copy_started) = copy_started {
         record_program_kernel_profile(
             &store.data().runtime_state,
@@ -1714,8 +1943,9 @@ where
     let restore = Box::new(CoreModuleRestore {
         memory: fork_memory,
         memory_spec,
-        descriptors: store.data().descriptors.clone(),
+        descriptors: store.data().descriptors.snapshot(),
         signal_dispositions: store.data().signal_dispositions.clone(),
+        signal_callback: store.data().process_signals.callback(),
         rewind: WasixRewind {
             stack_lower,
             stack_upper,
@@ -1731,23 +1961,14 @@ where
         detail: ProgramExecErrorDetail::InvalidEntryPoint,
     })?;
     let environment = store.data().environment.clone();
-    let (_, stdin_reader) = crate::byte_channel();
-    let output_mode = OutputMode::RoutedChild {
-        stdin_rx: stdin_reader,
-        stdout: store
-            .data()
-            .output_route(crate::ComponentOutputStreamKind::Stdout),
-        stderr: store
-            .data()
-            .output_route(crate::ComponentOutputStreamKind::Stderr),
-    };
+    let output_mode = store.data().fork_output_mode();
     let mut child = service.spawn_loaded_with_output_mode(
         store.data().exec_context(),
         ProgramExecutable::ForkedCoreModule { compiled, restore },
         ProgramLaunch::new(
             argv,
             environment,
-            store.data().authority.clone(),
+            store.data().effective_authority(),
             Some(store.data().filesystem.clone()),
         ),
         output_mode,
@@ -1796,55 +2017,54 @@ pub(super) fn wasix_stack_snapshot_bytes(user: u32, hash: u128) -> [u8; WASIX_ST
 pub(super) async fn wasix_call_instance_func0<CpuImpl, Net, StorageImpl>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     interrupts: &StoreInterrupts<CpuImpl>,
-    instance: &wasmtime::Instance,
     name: &str,
-) -> Result<(), ProgramExecError>
+) -> Result<(), AsyncifyError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let function = instance
-        .get_typed_func::<(), ()>(&mut *store, name)
-        .map_err(|_| ProgramExecError {
+    let function = p1_store_export(store, name)
+        .and_then(wasmtime::Extern::into_func)
+        .and_then(|func| func.typed::<(), ()>(&mut *store).ok())
+        .ok_or(AsyncifyError::Exec(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::UnwindExportInvalid,
-        })?;
+        }))?;
     let turns = store.data().guest_turns();
     interrupts
         .drive(turns.drive(function.call_async(&mut *store, ())))
         .await
-        .map_err(map_program_runtime_error)
+        .map_err(AsyncifyError::GuestStop)
 }
 
 pub(super) async fn wasix_call_instance_func1<CpuImpl, Net, StorageImpl>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     interrupts: &StoreInterrupts<CpuImpl>,
-    instance: &wasmtime::Instance,
     name: &str,
     value: u32,
-) -> Result<(), ProgramExecError>
+) -> Result<(), AsyncifyError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let function = instance
-        .get_typed_func::<i32, ()>(&mut *store, name)
-        .map_err(|_| ProgramExecError {
+    let function = p1_store_export(store, name)
+        .and_then(wasmtime::Extern::into_func)
+        .and_then(|func| func.typed::<i32, ()>(&mut *store).ok())
+        .ok_or(AsyncifyError::Exec(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::UnwindExportInvalid,
-        })?;
+        }))?;
     let turns = store.data().guest_turns();
     interrupts
         .drive(turns.drive(function.call_async(&mut *store, value as i32)))
         .await
-        .map_err(map_program_runtime_error)
+        .map_err(AsyncifyError::GuestStop)
 }
 
-pub(super) fn wasix_global_u32_from_instance<CpuImpl, Net, StorageImpl>(
+pub(super) fn wasix_global_u32_from_store<CpuImpl, Net, StorageImpl>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    instance: &wasmtime::Instance,
     name: &str,
 ) -> Result<u32, ProgramExecError>
 where
@@ -1852,8 +2072,8 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let global = instance
-        .get_global(&mut *store, name)
+    let global = p1_store_export(store, name)
+        .and_then(wasmtime::Extern::into_global)
         .ok_or(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::UnwindExportInvalid,
@@ -1867,9 +2087,8 @@ where
     }
 }
 
-pub(super) fn wasix_set_global_u32_from_instance<CpuImpl, Net, StorageImpl>(
+pub(super) fn wasix_set_global_u32_from_store<CpuImpl, Net, StorageImpl>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    instance: &wasmtime::Instance,
     name: &str,
     value: u32,
 ) -> Result<(), ProgramExecError>
@@ -1878,8 +2097,8 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let global = instance
-        .get_global(&mut *store, name)
+    let global = p1_store_export(store, name)
+        .and_then(wasmtime::Extern::into_global)
         .ok_or(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::UnwindExportInvalid,
@@ -1957,10 +2176,27 @@ pub(super) fn plugin_runtime_should_be_recycled(error: &ProgramExecError) -> boo
 /// arrives through `SharedMemory::new` was being classified as an internal
 /// failure. Walking the chain is what tells a caller it ran out of memory
 /// rather than hitting a bug (#62).
-fn caused_by_out_of_memory(error: &wasmtime::Error) -> bool {
+pub(super) fn caused_by_out_of_memory(error: &wasmtime::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.is::<crate::ProgramOutOfMemory>())
+}
+
+/// Classifies an error met during `instantiate_async`: a signal, an owner
+/// kill, or a trap inside the module's start function is the child's own
+/// termination; link/instantiation or OOM errors stay launch failures.
+fn instantiate_termination(error: &wasmtime::Error) -> Option<helios_unix::ChildTermination> {
+    if let Some(termination) = preview1_exit_status(error, None) {
+        return Some(termination);
+    }
+    if error.downcast_ref::<wasmtime::Trap>().is_some()
+        || error
+            .downcast_ref::<crate::memory::SwapFaultError>()
+            .is_some()
+    {
+        return Some(helios_unix::ChildTermination::Trapped);
+    }
+    None
 }
 
 /// A task the executor refused to place for this instance.

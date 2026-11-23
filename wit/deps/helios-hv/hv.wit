@@ -1,0 +1,113 @@
+package helios:hv@0.1.0;
+
+/// Hardware virtual machines. Resources belong to the calling component.
+/// Dropping a VM stops its vCPUs; mapped RAM remains owned until every vCPU
+/// detaches and every retained memory-region handle is dropped.
+interface virtualization {
+  variant hv-error {
+    unavailable,
+    invalid-range,
+    address-width,
+    overlap,
+    not-mapped,
+    out-of-memory,
+    invalid-permissions,
+    invalid-vcpu,
+    invalid-register,
+    invalid-interrupt,
+    interrupt-queue-full,
+    stopped,
+    invalid-completion,
+    entry-failed(u64),
+    memory-budget,
+    bounds,
+    busy,
+  }
+
+  flags permissions { read, write, execute }
+  enum io-width { byte, word, dword, qword }
+  record io-write { width: io-width, value: u64 }
+  variant io-access { read(io-width), write(io-write) }
+  record mmio-exit { address: u64, access: io-access }
+  record port-exit { port: u16, access: io-access }
+  record register-exit { register: u32, access: io-access }
+  record memory-fault { address: u64, access: permissions }
+  variant vm-exit {
+    preempted,
+    halt,
+    irq-window,
+    mmio(mmio-exit),
+    io-port(port-exit),
+    stage2-fault(memory-fault),
+    system-register(register-exit),
+    msr(register-exit),
+    hypercall(u64),
+    shutdown,
+  }
+
+  /// Architectural identifiers, independent of a host pointer or layout.
+  /// An unsupported identifier fails without changing the vCPU.
+  variant register-id {
+    aarch64-x(u8),
+    aarch64-sp,
+    aarch64-pc,
+    aarch64-pstate,
+    x86-gpr(u8),
+    x86-rip,
+    x86-rflags,
+    x86-control(u8),
+    x86-msr(u32),
+  }
+  record register-value { id: register-id, value: u64 }
+  enum irq-level { assert, deassert, pulse }
+
+  resource vm {
+    create: static func(memory-limit: u64) -> result<vm, hv-error>;
+    allocate-memory: func(address: u64, size: u64, access: permissions)
+      -> result<memory-region, hv-error>;
+    unmap-memory: async func(address: u64, size: u64) -> result<_, hv-error>;
+    protect-memory: async func(address: u64, size: u64, access: permissions)
+      -> result<_, hv-error>;
+    create-vcpu: func(id: u32, pending-interrupts: u32) -> result<vcpu, hv-error>;
+    set-irq-line: func(vcpu-id: u32, number: u32, level: irq-level)
+      -> result<_, hv-error>;
+    /// A matching MMIO write completes in the kernel and wakes this event.
+    /// Dropping the event unregisters it. Overlapping registrations fail.
+    register-ioevent: func(address: u64, width: io-width, value: option<u64>)
+      -> result<ioevent, hv-error>;
+  }
+
+  /// Kernel-owned user-domain frames, entirely outside Wasm linear memory.
+  /// Only the requested transfer buffer crosses the component boundary.
+  /// Naturally aligned 1/2/4/8-byte accesses are atomic, with acquire reads
+  /// and release writes. Larger or unaligned transfers are not snapshots.
+  /// A partial 8-byte cell write returns busy if it races with another writer;
+  /// a prefix may already be written. Device protocols own synchronization.
+  resource memory-region {
+    read: func(offset: u64, length: u32) -> result<list<u8>, hv-error>;
+    write: func(offset: u64, bytes: list<u8>) -> result<_, hv-error>;
+    /// Publish completed writes before guest instruction fetch. Required
+    /// after loading code or restoring a memory image, before running vCPUs.
+    publish: func(offset: u64, length: u64) -> result<_, hv-error>;
+  }
+
+  resource vcpu {
+    /// Hardware enforces a time slice independently of guest interrupt masks.
+    /// Other calls can kick or inject IRQs while this call is suspended.
+    run: async func() -> result<vm-exit, hv-error>;
+    /// Reset all architectural state while detached. Returns busy during
+    /// run; discards pending interrupts and emulation completion state.
+    reset: func() -> result<_, hv-error>;
+    get-regs: func(ids: list<register-id>) -> result<list<register-value>, hv-error>;
+    /// Validate the entire snapshot before publishing any register update.
+    set-regs: func(values: list<register-value>) -> result<_, hv-error>;
+    complete-exit: func(value: u64) -> result<_, hv-error>;
+    kick: func();
+  }
+
+  resource ioevent {
+    /// One completion per matching write; cancellation preserves unconsumed
+    /// notifications. The caller reads device state through memory-region.
+    wait: async func() -> result<_, hv-error>;
+  }
+}

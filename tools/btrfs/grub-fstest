@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Save each populated image before upstream's cleanup, then forward every
+# assertion unchanged to the Helios reader's GRUB command adapter.
+python3 "$HELIOS_BTRFS_ROOT/tools/btrfs/run.py" capture "$3"
+exec "$HELIOS_BTRFS_ROOT/target/debug/examples/grub-fstest" "$@"

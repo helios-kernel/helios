@@ -8,35 +8,49 @@
 //! lives out here, and none of it lives in the kernel.
 //!
 //! The plugin carries no protocol code of its own. It hosts zenwave's native
-//! backend (HTTP/1.1 framing, TLS through rustls with the Mozilla roots
-//! compiled in) over `helios_api::http_kit::HeliosNet`, which is
-//! `http-kit-io` on `wasi:sockets` and the monotonic clock. What is left
+//! backend (HTTP/1.1, HTTP/2 over ALPN, and HTTP/3 over QUIC discovered via
+//! RFC 9460 `HTTPS` DNS records and `Alt-Svc`, with TLS through rustls and the
+//! Mozilla roots compiled in) over `helios_api::http_kit::HeliosNet`, which is
+//! `http-kit-io` on `wasi:sockets` and the monotonic clock, paired with
+//! `helios_api::net::resolve_https` for `HTTPS` record lookups. What is left
 //! here is the translation between `wasi:http` and `http` messages, the
 //! `request-options` timeouts, and the choice of `wasi:http` error code for
 //! each failure.
 //!
-//! One connection per exchange, closed when the response body ends. There is
-//! no pool: the kernel dispatches exchanges concurrently into this one
-//! instance, so concurrency comes from having several handlers in flight
-//! rather than from reusing sockets.
+//! One persistent connection pool (`NativeBackend`) is lazily built per shard
+//! on the first exchange (loading the Mozilla roots plus optional
+//! `/etc/ssl/certs/ca-certificates.crt` once) and retained across requests on
+//! that processor core so HTTP/1.1 keep-alive sockets, multiplexed HTTP/2
+//! connections, HTTP/3 QUIC connections, and TLS sessions are reused.
 
 mod error;
 mod fields;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod h2_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod h3_tests;
 mod request;
 mod response;
 
+use std::cell::RefCell;
+use std::future::Future;
+use std::io::{self, ErrorKind};
 use std::time::Duration;
 
 use futures_channel::oneshot;
+use futures_lite::stream::Stream;
 use helios_api::http::handler::Guest;
 use helios_api::http::types;
 use helios_api::http::{ErrorCode, RequestOptions, Scheme};
 use helios_api::http_kit::{HeliosExecutor, HeliosNet};
+use helios_api::net;
 use helios_api::task::spawn;
 use http::StatusCode;
+use http_kit_io::{Answer, Resolve};
 use zenwave::backend::NativeBackend;
+use zenwave::dns::{HttpsRecord, ResolveHttps};
 use zenwave::transport::Proxy;
-use zenwave::{Body, Endpoint, Timeouts, Transport};
+use zenwave::{Body, Cause, Endpoint, ResolveError, Timeouts, Transport};
 
 use crate::error::code;
 use crate::request::BodyOutcome;
@@ -49,6 +63,9 @@ mod bindings {
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(600);
 const DEFAULT_BETWEEN_BYTES_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The system's optional PEM bundle, added to Mozilla's built-in roots.
+const SYSTEM_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 
 struct HttpClient;
 
@@ -102,6 +119,177 @@ async fn handle(request: types::Request) -> Result<types::Response, ErrorCode> {
     exchanged
 }
 
+enum BackendState<T> {
+    Empty,
+    Initializing(Vec<oneshot::Sender<()>>),
+    Ready(T),
+}
+
+struct ShardBackendCell<T> {
+    state: RefCell<BackendState<T>>,
+}
+
+struct InitGuard<'a, T> {
+    cell: &'a ShardBackendCell<T>,
+    completed: bool,
+}
+
+impl<T> Drop for InitGuard<'_, T> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let waiters = {
+            let mut state = self.cell.state.borrow_mut();
+            match std::mem::replace(&mut *state, BackendState::Empty) {
+                BackendState::Initializing(waiters) => waiters,
+                other => {
+                    *state = other;
+                    Vec::new()
+                }
+            }
+        };
+        for tx in waiters {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl<T: Clone> ShardBackendCell<T> {
+    const fn new() -> Self {
+        Self {
+            state: RefCell::new(BackendState::Empty),
+        }
+    }
+
+    async fn get_or_init<F, Fut, E>(&self, mut init: F) -> Result<T, E>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        loop {
+            let waiter = {
+                let mut state = self.state.borrow_mut();
+                match &mut *state {
+                    BackendState::Ready(value) => return Ok(value.clone()),
+                    BackendState::Initializing(waiters) => {
+                        let (tx, rx) = oneshot::channel();
+                        waiters.push(tx);
+                        Some(rx)
+                    }
+                    BackendState::Empty => {
+                        *state = BackendState::Initializing(Vec::new());
+                        None
+                    }
+                }
+            };
+            if let Some(rx) = waiter {
+                let _ = rx.await;
+                continue;
+            }
+            let mut guard = InitGuard {
+                cell: self,
+                completed: false,
+            };
+            let result = init().await;
+            guard.completed = true;
+            let waiters = {
+                let mut state = self.state.borrow_mut();
+                let previous = match &result {
+                    Ok(value) => std::mem::replace(&mut *state, BackendState::Ready(value.clone())),
+                    Err(_) => std::mem::replace(&mut *state, BackendState::Empty),
+                };
+                match previous {
+                    BackendState::Initializing(waiters) => waiters,
+                    _ => unreachable!("single initializer owns Initializing state"),
+                }
+            };
+            for tx in waiters {
+                let _ = tx.send(());
+            }
+            return result;
+        }
+    }
+}
+
+/// The plugin's resolver: delegates address lookups to [`HeliosNet`] over
+/// `wasi:sockets/ip-name-lookup` and queries RFC 9460 `HTTPS` records over
+/// `helios:system/net` for HTTP/3 discovery.
+#[derive(Clone, Copy, Debug, Default)]
+struct HeliosResolver;
+
+impl Resolve for HeliosResolver {
+    fn lookup(&self, host: &str) -> impl Stream<Item = Answer> {
+        HeliosNet.lookup(host)
+    }
+}
+
+impl ResolveHttps for HeliosResolver {
+    async fn https_record(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<Option<HttpsRecord>, ResolveError> {
+        map_https_lookup(net::resolve_https(host, port).await)
+    }
+}
+
+fn convert_https_record(record: net::HttpsRecord) -> HttpsRecord {
+    HttpsRecord {
+        alpn: record.alpn,
+        port: record.port,
+        ttl: record.ttl,
+    }
+}
+
+fn map_https_lookup(
+    result: io::Result<Option<net::HttpsRecord>>,
+) -> Result<Option<HttpsRecord>, ResolveError> {
+    match result {
+        Ok(record) => Ok(record.map(convert_https_record)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ResolveError::Lookup(Cause::from(error))),
+    }
+}
+
+thread_local! {
+    static SHARD_BACKEND: std::rc::Rc<ShardBackendCell<NativeBackend>> =
+        std::rc::Rc::new(ShardBackendCell::new());
+}
+
+async fn init_shard_backend(outcome: &BodyOutcome) -> Result<NativeBackend, ErrorCode> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls_pure::provider().install_default();
+    }
+    // No proxy: a guest reaches the network directly.
+    let mut transport = Transport::builder().proxy(Proxy::none());
+    match helios_api::fs::read(SYSTEM_CA_BUNDLE).await {
+        Ok(pem) => {
+            transport = transport
+                .extra_root_certificates_pem(&pem)
+                .map_err(|error| code(&error, outcome))?;
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ErrorCode::InternalError(Some(format!(
+                "reading {SYSTEM_CA_BUNDLE}: {error}"
+            ))));
+        }
+    }
+    let transport = transport.build().map_err(|error| code(&error, outcome))?;
+    Ok(NativeBackend::on_current_thread(
+        transport,
+        HeliosNet,
+        HeliosResolver,
+        &HeliosExecutor,
+    ))
+}
+
+async fn shard_backend(outcome: &BodyOutcome) -> Result<NativeBackend, ErrorCode> {
+    let cell = SHARD_BACKEND.with(std::rc::Rc::clone);
+    cell.get_or_init(|| init_shard_backend(outcome)).await
+}
+
 /// Send the request and turn the response head into the caller's response,
 /// leaving its body to stream in a task of its own.
 async fn exchange(
@@ -109,13 +297,7 @@ async fn exchange(
     scheme: Scheme,
     outcome: &BodyOutcome,
 ) -> Result<types::Response, ErrorCode> {
-    // No proxy: a guest reaches the network directly.
-    let transport = Transport::builder()
-        .proxy(Proxy::none())
-        .build()
-        .map_err(|error| code(&error, outcome))?;
-    let mut backend =
-        NativeBackend::on_current_thread(transport, HeliosNet, HeliosNet, &HeliosExecutor);
+    let mut backend = shard_backend(outcome).await?;
     let response = backend
         .respond(&mut http)
         .await
@@ -137,4 +319,105 @@ async fn exchange(
         trailers_writer,
     ));
     Ok(wasi)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use futures_lite::future::{block_on, poll_once, yield_now, zip};
+
+    use super::*;
+
+    #[test]
+    fn concurrent_cold_starts_initialize_shard_once() {
+        let cell = ShardBackendCell::<u32>::new();
+        let calls = Cell::new(0usize);
+
+        let (first, second) = block_on(zip(
+            cell.get_or_init(|| async {
+                calls.set(calls.get() + 1);
+                yield_now().await;
+                Ok::<u32, &'static str>(42)
+            }),
+            cell.get_or_init(|| async {
+                calls.set(calls.get() + 1);
+                Ok::<u32, &'static str>(99)
+            }),
+        ));
+
+        assert_eq!(first, Ok(42));
+        assert_eq!(second, Ok(42));
+        assert_eq!(calls.get(), 1);
+
+        // Subsequent calls hit the cached value directly without re-running init.
+        let third = block_on(cell.get_or_init(|| async {
+            calls.set(calls.get() + 1);
+            Ok::<u32, &'static str>(7)
+        }));
+        assert_eq!(third, Ok(42));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn failed_or_cancelled_init_resets_and_wakes_waiters() {
+        let cell = ShardBackendCell::<u32>::new();
+        let calls = Cell::new(0usize);
+
+        // Cancelled cold start resets back to Empty so the waiter can initialize.
+        {
+            let pending_leader = std::pin::pin!(cell.get_or_init(|| async {
+                calls.set(calls.get() + 1);
+                yield_now().await;
+                Ok::<u32, &'static str>(1)
+            }));
+            assert!(block_on(poll_once(pending_leader)).is_none());
+        }
+
+        // First real attempt fails; second retries and succeeds.
+        let failed = block_on(cell.get_or_init(|| async {
+            calls.set(calls.get() + 1);
+            Err::<u32, &'static str>("boom")
+        }));
+        assert_eq!(failed, Err("boom"));
+
+        let succeeded = block_on(cell.get_or_init(|| async {
+            calls.set(calls.get() + 1);
+            Ok::<u32, &'static str>(77)
+        }));
+        assert_eq!(succeeded, Ok(77));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn map_https_lookup_preserves_records_absence_and_errors() {
+        let converted = map_https_lookup(Ok(Some(net::HttpsRecord {
+            alpn: vec!["h3".to_owned(), "h2".to_owned()],
+            port: Some(8443),
+            ttl: Duration::from_secs(300),
+        })))
+        .expect("record converts")
+        .expect("record present");
+        assert_eq!(converted.alpn, ["h3", "h2"]);
+        assert_eq!(converted.port, Some(8443));
+        assert_eq!(converted.ttl, Duration::from_secs(300));
+
+        assert!(
+            map_https_lookup(Ok(None))
+                .expect("none maps to Ok(None)")
+                .is_none()
+        );
+        assert!(
+            map_https_lookup(Err(io::Error::new(ErrorKind::NotFound, "nxdomain")))
+                .expect("NotFound maps to absent HTTPS record")
+                .is_none()
+        );
+
+        let error = map_https_lookup(Err(io::Error::new(ErrorKind::TimedOut, "dns timeout")))
+            .expect_err("lookup failure propagates as ResolveError::Lookup");
+        assert!(
+            matches!(error, ResolveError::Lookup(Cause::Io(ref io)) if io.kind() == ErrorKind::TimedOut),
+            "unexpected resolve error: {error:?}"
+        );
+    }
 }

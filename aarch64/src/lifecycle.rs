@@ -34,6 +34,7 @@
 
 use alloc::alloc::{Layout, alloc_zeroed, handle_alloc_error};
 use alloc::boxed::Box;
+use arm_sysregs::el1::accessors::{read_apiakeyhi_el1, read_apiakeylo_el1};
 use core::arch::{asm, global_asm, naked_asm};
 use core::cell::UnsafeCell;
 use core::mem::{offset_of, size_of};
@@ -44,6 +45,7 @@ use smccc::psci::{self, AffinityState, LowestAffinityLevel};
 use smccc::{Call, Hvc, Smc};
 
 use crate::gic::Gic;
+use crate::isolation::UserIsolation;
 use crate::platform::PsciConduit;
 
 const PAGE_BYTES: usize = 4096;
@@ -68,8 +70,8 @@ const TABLE_DESCRIPTOR: u64 = 0b11;
 /// `TCR_EL1` fields of the TTBR0 half the identity map uses: a 48-bit
 /// address space, 4 KiB granule, write-back write-allocate inner
 /// shareable table walks, walks enabled.
-const IDMAP_TCR_TTBR0_MASK: u64 = 0xffff;
-const IDMAP_TCR_TTBR0: u64 = 16 | (0b01 << 8) | (0b01 << 10) | (0b11 << 12);
+pub(crate) const IDMAP_TCR_TTBR0_MASK: u64 = 0xffff;
+pub(crate) const IDMAP_TCR_TTBR0: u64 = 16 | (0b01 << 8) | (0b01 << 10) | (0b11 << 12);
 
 const RUNNING: u8 = 0;
 const STOPPING: u8 = 1;
@@ -120,6 +122,11 @@ pub(crate) struct ResumeContext {
     continuation: u64,
     /// Physical address of the entry code, `CPU_ON`'s entry point.
     entry_physical: u64,
+    /// The host may run at EL1 or EL2; PSCI resumes at the highest level.
+    exception_level: u64,
+    hcr: u64,
+    apia_lo: u64,
+    apia_hi: u64,
     idmap: [Table; 3],
 }
 
@@ -141,6 +148,10 @@ const _: () = {
     assert!(offset_of!(ResumeContext, idmap_ttbr0) == 272);
     assert!(offset_of!(ResumeContext, self_virtual) == 280);
     assert!(offset_of!(ResumeContext, continuation) == 288);
+    assert!(offset_of!(ResumeContext, exception_level) == 304);
+    assert!(offset_of!(ResumeContext, hcr) == 312);
+    assert!(offset_of!(ResumeContext, apia_lo) == 320);
+    assert!(offset_of!(ResumeContext, apia_hi) == 328);
 };
 
 impl ResumeContext {
@@ -221,7 +232,14 @@ impl ProcessorPower {
     /// `mpidr` is the calling processor's own `MPIDR_EL1`. Returns at
     /// once, stopping nothing, when [`ProcessorPower::restart`] already
     /// ran for this stop.
-    pub(crate) fn stop(&self, psci: Psci, mpidr: u64, gic: &Gic, wake_pending: &AtomicBool) {
+    pub(crate) fn stop(
+        &self,
+        psci: Psci,
+        mpidr: u64,
+        gic: &Gic,
+        wake_pending: &AtomicBool,
+        isolation: UserIsolation,
+    ) {
         let daif = crate::read_daif();
         crate::mask_irq();
         let context = self.context.get();
@@ -267,7 +285,10 @@ impl ProcessorPower {
 
         // Restarted: the entry code restored the translation regime, the
         // vectors, the runtime pointer and the callee-saved registers. What
-        // is left is the processor's own hardware state.
+        // is left is the processor's own hardware state: SCTLR_EL1 came
+        // back with SPAN clear, but PSTATE.PAN is not part of what the
+        // entry restores.
+        isolation.enable_on_current_processor();
         crate::enable_pmu_for_current_processor();
         gic.attach_current_processor(mpidr);
         wake_pending.store(false, Ordering::Release);
@@ -418,6 +439,14 @@ unsafe fn prepare_context(context: *mut ResumeContext, psci: Psci) {
     context.sp_el0 = read_system_register!("sp_el0");
     context.fpcr = read_system_register!("fpcr");
     context.conduit = psci.conduit as u64;
+    context.apia_lo = read_apiakeylo_el1().bits();
+    context.apia_hi = read_apiakeyhi_el1().bits();
+    context.exception_level = crate::current_exception_level();
+    context.hcr = if context.exception_level == 2 << 2 {
+        read_system_register!("hcr_el2")
+    } else {
+        0
+    };
 
     // The identity map needs a Normal write-back attribute and the one
     // that is there is whichever index the live MAIR gives it.

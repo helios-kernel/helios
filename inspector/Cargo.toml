@@ -13,7 +13,7 @@ async-io = "2.6.0"
 async-signal = "0.2.13"
 # Runs the blocking QMP capture of a wedged guest off the executor thread.
 blocking = "1.7.0"
-clap = { version = "4.5.48", features = ["derive"] }
+clap = { version = "4.5.48", features = ["derive", "env"] }
 crossterm = "0.29.0"
 console = "0.16.1"
 directories = "6.0.0"
@@ -23,6 +23,7 @@ ed25519-dalek = { version = "3.0.0", default-features = false, features = ["hazm
 indicatif = "0.18.0"
 ipnet = "2.11.0"
 libc = "0.2.177"
+rustix = { version = "1.1.6", default-features = false, features = ["std", "event"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tempfile.workspace = true
@@ -43,6 +44,8 @@ object = { version = "0.39", default-features = false, features = ["elf", "read"
 # Decodes executable x86 kernel sections to enforce legacy encodings.
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "instr_info"] }
 ratatui = "0.30.0"
+# Encodes the frame the VNC capture reads as the `screendump` PNG.
+png = { version = "0.18.1", default-features = false }
 # Names the function each vCPU of a wedged guest was executing.
 rustc-demangle = "0.1.28"
 rustyline = "14.0.0"

@@ -62,15 +62,24 @@ pub const MAX_CORE_INSTANCES_PER_COMPONENT: u32 = 8;
 /// so it is deliberately tight.
 pub const MAX_MEMORIES_PER_COMPONENT: u32 = 2;
 
-/// The most tables one component may hold.
+/// The tables the pool sets aside for each of [`MAX_CONCURRENT_INSTANCES`].
 ///
-/// Measured at exactly two for every component this tree builds: the
-/// main module's function table and the shim's. There is no headroom
+/// Measured at exactly two for every single component this tree builds:
+/// the main module's function table and the shim's. There is no headroom
 /// here on purpose — the table pool is the one pool the runtime commits
 /// up front rather than reserving, so this number is paid in user pages
 /// per live slot whether or not any component uses it. See
 /// [`MAX_POOLED_USER_MEMORY`].
-pub const MAX_TABLES_PER_COMPONENT: u32 = 2;
+pub const TABLES_PER_INSTANCE: u32 = 2;
+
+/// The most tables one component may hold.
+///
+/// A component the build composed from others holds the sum of theirs: a
+/// program with the WebGPU provider plugged in carries its own two and
+/// the provider's two. The pool is sized by [`TABLES_PER_INSTANCE`], not
+/// by this, so a composed program draws more of the shared pool rather
+/// than growing what every slot commits.
+pub const MAX_TABLES_PER_COMPONENT: u32 = 4;
 
 /// The virtual address space the kernel will let the runtime's instance
 /// pools reserve.
@@ -242,6 +251,14 @@ impl LocalOutputSink {
     }
 }
 
+/// Where a component's standard input bytes arrive from.
+#[derive(Clone)]
+pub enum ComponentInputRoute {
+    Serial,
+    Closed,
+    Child(ByteReader),
+}
+
 #[derive(Clone)]
 pub enum ComponentOutputMode {
     Serial,
@@ -252,13 +269,26 @@ pub enum ComponentOutputMode {
         stderr_tx: ByteWriter,
     },
     RoutedChild {
-        stdin_rx: ByteReader,
+        stdin: ComponentInputRoute,
         stdout: ComponentOutputRoute,
         stderr: ComponentOutputRoute,
     },
 }
 
 impl ComponentOutputMode {
+    /// Where standard input arrives from, as a route a child launched from
+    /// this mode can inherit.
+    pub fn stdin_route(&self) -> ComponentInputRoute {
+        match self {
+            ComponentOutputMode::Serial => ComponentInputRoute::Serial,
+            ComponentOutputMode::Trace => ComponentInputRoute::Closed,
+            ComponentOutputMode::Child { stdin_rx, .. } => {
+                ComponentInputRoute::Child(stdin_rx.clone())
+            }
+            ComponentOutputMode::RoutedChild { stdin, .. } => stdin.clone(),
+        }
+    }
+
     /// Obtain a cloneable writer for the requested child stream, when
     /// this mode has one. Returns `None` for `Serial`/`Trace`; callers
     /// that need every route should use [`Self::sink`] instead.
@@ -285,6 +315,30 @@ impl ComponentOutputMode {
                 ComponentOutputStreamKind::Stderr,
             ) => Some(writer.clone()),
             _ => None,
+        }
+    }
+
+    /// Where `kind` goes, as a route a child launched from this mode can
+    /// inherit: the same destination, with a cloned writer handle when
+    /// it is a channel.
+    pub fn route(&self, kind: ComponentOutputStreamKind) -> ComponentOutputRoute {
+        match (self, kind) {
+            (ComponentOutputMode::Serial, _) => ComponentOutputRoute::Serial,
+            (ComponentOutputMode::Trace, _) => ComponentOutputRoute::Trace,
+            (ComponentOutputMode::Child { stdout_tx, .. }, ComponentOutputStreamKind::Stdout) => {
+                ComponentOutputRoute::Child(stdout_tx.clone())
+            }
+            (ComponentOutputMode::Child { stderr_tx, .. }, ComponentOutputStreamKind::Stderr) => {
+                ComponentOutputRoute::Child(stderr_tx.clone())
+            }
+            (
+                ComponentOutputMode::RoutedChild { stdout, .. },
+                ComponentOutputStreamKind::Stdout,
+            ) => stdout.clone(),
+            (
+                ComponentOutputMode::RoutedChild { stderr, .. },
+                ComponentOutputStreamKind::Stderr,
+            ) => stderr.clone(),
         }
     }
 
@@ -322,7 +376,10 @@ impl ComponentOutputMode {
     pub fn child_stdin(&self) -> Option<&ByteReader> {
         match self {
             ComponentOutputMode::Child { stdin_rx, .. }
-            | ComponentOutputMode::RoutedChild { stdin_rx, .. } => Some(stdin_rx),
+            | ComponentOutputMode::RoutedChild {
+                stdin: ComponentInputRoute::Child(stdin_rx),
+                ..
+            } => Some(stdin_rx),
             _ => None,
         }
     }
@@ -434,17 +491,11 @@ pub(crate) struct ComponentExecutionContext<FileSystem> {
 
 /// One instance's store data.
 ///
-/// `LinearMemoryImpl` is the runtime's handle on the instance's one
-/// unshared linear memory: the kernel never looks inside it, and the
-/// runtime adapter reads the memory's current extent through it each
-/// time a guest names a span.
-pub struct ComponentStoreData<
-    CpuImpl,
-    RuntimeStateImpl,
-    FileSystem,
-    ResourceTableImpl,
-    LinearMemoryImpl,
-> where
+/// It holds no linear memory: a span a guest names is in the memory of
+/// the call that names it, which the runtime adapter takes from that
+/// call.
+pub struct ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
+where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
 {
@@ -466,11 +517,6 @@ pub struct ComponentStoreData<
     execution_context: ComponentExecutionContext<FileSystem>,
     serial_reader: crate::SerialReader,
     serial_writer: crate::DebugSerialWriter,
-    /// The runtime's handle on this instance's linear memory, once the
-    /// instance is built. Absent when its component lowers through a
-    /// shared memory, or through more than one: nothing is ever shown
-    /// in such a memory.
-    pub linear_memory: Option<LinearMemoryImpl>,
     /// Every buffer and device region shown in this instance's linear
     /// memory.
     ///
@@ -494,17 +540,6 @@ pub struct ComponentStoreData<
     /// traps; the executor reads it to distinguish a clean requested
     /// exit (turn into an exit code) from an actual runtime error.
     requested_exit: Option<u8>,
-}
-
-pub struct DeadlinePollable<CpuImpl, RuntimeStateImpl>
-where
-    CpuImpl: Cpu + Clone,
-    RuntimeStateImpl: ComponentRuntimeState,
-{
-    cpu: CpuImpl,
-    timer: Timer<CpuImpl>,
-    runtime_state: RuntimeStateImpl,
-    deadline_nanos: u64,
 }
 
 impl<FileSystem> ComponentExecutionContext<FileSystem> {
@@ -531,8 +566,8 @@ impl<FileSystem> ComponentExecutionContext<FileSystem> {
     }
 }
 
-impl<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl, LinearMemoryImpl>
-    ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl, LinearMemoryImpl>
+impl<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
+    ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
@@ -580,7 +615,6 @@ where
             ),
             serial_reader,
             serial_writer,
-            linear_memory: None,
             views: crate::buffer::ViewTable::new(),
             device: crate::device::DeviceOwnership::new(),
             input: crate::input::InputOwnership::new(),
@@ -606,11 +640,21 @@ where
     pub fn guest_turns(
         &self,
     ) -> super::GuestTurns<CpuImpl, RuntimeStateImpl, super::SocketRetirementQueue> {
+        self.guest_turns_with_epilogue(self.retirement.turn_queue())
+    }
+
+    pub(crate) fn guest_turns_with_epilogue<Epilogue>(
+        &self,
+        epilogue: Epilogue,
+    ) -> super::GuestTurns<CpuImpl, RuntimeStateImpl, Epilogue>
+    where
+        Epilogue: super::StopWake,
+    {
         super::GuestTurns::new(
             self.execution_context.activity.turns(),
             self.cpu.clone(),
             self.runtime_state.clone(),
-            self.retirement.turn_queue(),
+            epilogue,
         )
     }
 
@@ -780,34 +824,29 @@ where
     /// call and park on it.  For `Child` mode, the reader half of the
     /// parent-provided channel is polled once.
     pub fn try_read_stdin(&self, max_bytes: u32) -> Vec<u8> {
-        match &self.execution_context.output_mode {
-            ComponentOutputMode::Serial => {
+        match self.execution_context.output_mode.stdin_route() {
+            ComponentInputRoute::Serial => {
                 let mut bytes = Vec::new();
                 (self.serial_reader)(&mut bytes, max_bytes);
                 bytes
             }
-            ComponentOutputMode::Trace => Vec::new(),
-            ComponentOutputMode::Child { stdin_rx, .. }
-            | ComponentOutputMode::RoutedChild { stdin_rx, .. } => match stdin_rx.try_read() {
-                TryRead::Ready(mut bytes) => {
-                    let cap = max_bytes as usize;
-                    if bytes.len() > cap {
-                        bytes = bytes.slice(..cap);
-                    }
-                    bytes.to_vec()
+            ComponentInputRoute::Closed => Vec::new(),
+            ComponentInputRoute::Child(stdin_rx) => {
+                match stdin_rx.try_read_limit(max_bytes as usize) {
+                    TryRead::Ready(bytes) => bytes.to_vec(),
+                    TryRead::Pending | TryRead::Eof => Vec::new(),
                 }
-                TryRead::Pending | TryRead::Eof => Vec::new(),
-            },
+            }
         }
     }
 
     /// Await the next stdin chunk, parking on the debug console's
     /// receive signal between polls. Returns `None` on EOF (Child mode
-    /// after parent closes stdin, or for Trace mode which never
+    /// after parent closes stdin, or for Trace/Closed mode which never
     /// produces bytes).
     pub async fn await_stdin_chunk(&self) -> Option<Vec<u8>> {
-        match &self.execution_context.output_mode {
-            ComponentOutputMode::Serial => {
+        match self.execution_context.output_mode.stdin_route() {
+            ComponentInputRoute::Serial => {
                 // Arm the wait before testing the FIFO so a byte that
                 // lands between the two still completes it.
                 loop {
@@ -820,9 +859,8 @@ where
                     wait.await;
                 }
             }
-            ComponentOutputMode::Trace => None,
-            ComponentOutputMode::Child { stdin_rx, .. }
-            | ComponentOutputMode::RoutedChild { stdin_rx, .. } => {
+            ComponentInputRoute::Closed => None,
+            ComponentInputRoute::Child(stdin_rx) => {
                 stdin_rx.read().await.map(|bytes| bytes.to_vec())
             }
         }
@@ -843,41 +881,6 @@ where
     /// instance's stores makes immediate.
     pub fn pending_kill(&self) -> Option<KillReason> {
         self.execution_context.activity.pending_kill()
-    }
-}
-
-impl<CpuImpl, RuntimeStateImpl> DeadlinePollable<CpuImpl, RuntimeStateImpl>
-where
-    CpuImpl: Cpu + Clone,
-    RuntimeStateImpl: ComponentRuntimeState,
-{
-    pub fn new(
-        cpu: CpuImpl,
-        timer: Timer<CpuImpl>,
-        runtime_state: RuntimeStateImpl,
-        deadline_nanos: u64,
-    ) -> Self {
-        Self {
-            cpu,
-            timer,
-            runtime_state,
-            deadline_nanos,
-        }
-    }
-
-    pub fn uptime_nanos(&self) -> u64 {
-        self.runtime_state.uptime_nanos(self.cpu.now().ticks())
-    }
-
-    pub fn deadline_nanos(&self) -> u64 {
-        self.deadline_nanos
-    }
-
-    pub async fn ready(&mut self) {
-        let timer = self.timer.clone();
-        let cpu = self.cpu.clone();
-        let runtime_state = self.runtime_state.clone();
-        wait_until_runtime_deadline(timer, cpu, runtime_state, self.deadline_nanos).await;
     }
 }
 

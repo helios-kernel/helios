@@ -33,8 +33,8 @@ use erofs_rs::r#async::EroFS;
 use erofs_rs::backend::AsyncImage;
 use erofs_rs::types::{DirentFileType, FeatureCompat, FileType, Inode, SUPER_BLOCK_OFFSET};
 use helios_hal::fs::{
-    BlockDevice, BlockSerial, DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult,
-    Metadata, NodeId, NodeKind, OpenFlags, WritePosition,
+    BlockDevice, BlockSerial, DeviceId, DirCookie, DirEntry, DirStream, FileSystem, FsError,
+    FsPath, FsResult, Metadata, NodeId, NodeKind, OpenFlags, RenameMode, WritePosition,
 };
 use thiserror::Error;
 use triomphe::Arc;
@@ -174,7 +174,12 @@ where
             kind,
             link_count: u64::from(inode.nlink()),
             size: match kind {
-                NodeKind::Directory => 0,
+                // A device inode's data field holds its device number.
+                NodeKind::Directory
+                | NodeKind::CharacterDevice
+                | NodeKind::BlockDevice
+                | NodeKind::Fifo
+                | NodeKind::Socket => 0,
                 NodeKind::File | NodeKind::Symlink => inode.data_size(),
             },
             access_nanos: modified_nanos,
@@ -214,19 +219,19 @@ where
     }
 }
 
-/// The kernel's kind for an inode's type. The kernel's filesystem
-/// contract names no device, FIFO or socket node, so an image's are
-/// refused rather than passed off as something they are not.
+/// The kernel's kind for an inode's type. Device, FIFO and socket nodes
+/// are reported as what they are and never opened (see [`NodeKind`]); a
+/// type the image does not name is refused.
 fn node_kind(file_type: FileType) -> FsResult<NodeKind> {
     match file_type {
         FileType::Directory => Ok(NodeKind::Directory),
         FileType::RegularFile => Ok(NodeKind::File),
         FileType::Symlink => Ok(NodeKind::Symlink),
-        FileType::Fifo
-        | FileType::Socket
-        | FileType::CharacterDevice
-        | FileType::BlockDevice
-        | FileType::Unknown => Err(FsError::Unsupported),
+        FileType::Fifo => Ok(NodeKind::Fifo),
+        FileType::Socket => Ok(NodeKind::Socket),
+        FileType::CharacterDevice => Ok(NodeKind::CharacterDevice),
+        FileType::BlockDevice => Ok(NodeKind::BlockDevice),
+        FileType::Unknown => Err(FsError::Unsupported),
     }
 }
 
@@ -271,16 +276,122 @@ where
     Ok(())
 }
 
+trait ErofsPermissionBits {
+    fn permission_bits(self) -> u32;
+}
+
+impl ErofsPermissionBits for u16 {
+    fn permission_bits(self) -> u32 {
+        u32::from(self) & 0o7777
+    }
+}
+
+#[cfg(unix)]
+impl ErofsPermissionBits for std::fs::Permissions {
+    fn permission_bits(self) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        self.mode() & 0o7777
+    }
+}
+
+impl<Device> ErofsFs<Device>
+where
+    Device: BlockDevice<Buffer = BlockPages> + 'static,
+{
+    /// The stored Unix ownership and mode bits of the inode at `path`.
+    pub async fn unix_attributes(&self, path: FsPath<'_>) -> FsResult<super::UnixAttributes> {
+        let inode = self.inode(path).await?;
+        Ok(super::UnixAttributes {
+            permissions: inode.permissions().permission_bits(),
+            uid: inode.uid(),
+            gid: inode.gid(),
+        })
+    }
+}
+
+/// An open directory stream over a read-only EROFS image.
+pub struct ErofsDir<Device: BlockDevice<Buffer = BlockPages>> {
+    fs: ErofsFs<Device>,
+    inode: Inode,
+}
+
+impl<Device> DirStream for ErofsDir<Device>
+where
+    Device: BlockDevice<Buffer = BlockPages> + 'static,
+{
+    async fn read(&self, cookie: DirCookie, max_entries: usize) -> FsResult<Vec<DirEntry>> {
+        let mut listing = self
+            .fs
+            .reader()
+            .read_dir_inode_at(self.inode, DirPosition::new(cookie.raw()))
+            .await
+            .map_err(|error| match error {
+                // A cookie this directory never handed out.
+                erofs_rs::Error::OutOfRange(..) => FsError::Invalid,
+                error => self.fs.fs_error(error),
+            })?;
+        let mut entries = Vec::new();
+        while entries.len() < max_entries {
+            let Some(entry) = listing
+                .next_entry()
+                .await
+                .map_err(|error| self.fs.fs_error(error))?
+            else {
+                break;
+            };
+            let name = String::from_utf8(entry.file_name().to_vec())
+                .map_err(|_| FsError::IllegalByteSequence)?;
+            let kind = match entry.file_type() {
+                DirentFileType::Directory => NodeKind::Directory,
+                DirentFileType::RegularFile => NodeKind::File,
+                DirentFileType::Symlink => NodeKind::Symlink,
+                DirentFileType::CharacterDevice => NodeKind::CharacterDevice,
+                DirentFileType::BlockDevice => NodeKind::BlockDevice,
+                DirentFileType::Fifo => NodeKind::Fifo,
+                DirentFileType::Socket => NodeKind::Socket,
+                // The entry carries no type of its own; the inode does.
+                DirentFileType::Unknown => {
+                    let inode = self
+                        .fs
+                        .reader()
+                        .get_inode(entry.nid())
+                        .await
+                        .map_err(|error| self.fs.fs_error(error))?;
+                    node_kind(inode.file_type())?
+                }
+            };
+            entries.push(DirEntry {
+                name,
+                kind,
+                inode: entry.nid(),
+                next: DirCookie::new(listing.position().raw()),
+            });
+        }
+        Ok(entries)
+    }
+
+    async fn rewind(&mut self) -> FsResult<()> {
+        Ok(())
+    }
+}
+
 impl<Device> FileSystem for ErofsFs<Device>
 where
     Device: BlockDevice<Buffer = BlockPages> + 'static,
 {
+    super::delegate_path_handles!();
+    type Dir = ErofsDir<Device>;
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         let inode = self.inode(path).await?;
         self.metadata(&inode)
     }
 
-    async fn open(&self, path: FsPath<'_>, flags: OpenFlags, _now: u64) -> FsResult<Metadata> {
+    async fn open(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        _now: u64,
+    ) -> FsResult<helios_hal::fs::Opened<helios_hal::fs::OwnedFsPath>> {
         let metadata = match self.stat(path).await {
             Ok(metadata) => metadata,
             Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
@@ -291,22 +402,24 @@ where
         if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
             return Err(FsError::Exists);
         }
+        if let Some(refusal) = metadata.kind.open_refusal() {
+            return Err(refusal);
+        }
         if flags.contains(OpenFlags::DIRECTORY) && metadata.kind != NodeKind::Directory {
             return Err(FsError::NotDirectory);
         }
         if flags.contains(OpenFlags::TRUNCATE) {
             return Err(FsError::ReadOnly);
         }
-        Ok(metadata)
+        Ok(helios_hal::fs::Opened {
+            metadata,
+            handle: helios_hal::fs::OwnedFsPath::from(path),
+        })
     }
 
     async fn read_at(&self, path: FsPath<'_>, offset: u64, max_bytes: usize) -> FsResult<Bytes> {
         let inode = self.inode(path).await?;
-        match node_kind(inode.file_type())? {
-            NodeKind::File => {}
-            NodeKind::Directory => return Err(FsError::IsDirectory),
-            NodeKind::Symlink => return Err(FsError::Invalid),
-        }
+        node_kind(inode.file_type())?.require_regular()?;
         let size = inode.data_size();
         if offset >= size {
             return Ok(Bytes::new());
@@ -340,7 +453,7 @@ where
         Ok(buffer.freeze())
     }
 
-    type Write<'a> = Infallible;
+    type Write = Infallible;
 
     async fn prepare_write(
         &self,
@@ -366,77 +479,30 @@ where
         Err(FsError::ReadOnly)
     }
 
-    async fn read_dir(
-        &self,
-        path: FsPath<'_>,
-        cookie: DirCookie,
-        max_entries: usize,
-    ) -> FsResult<Vec<DirEntry>> {
+    async fn open_dir(&self, path: FsPath<'_>) -> FsResult<ErofsDir<Device>> {
         let inode = self.inode(path).await?;
         if node_kind(inode.file_type())? != NodeKind::Directory {
             return Err(FsError::NotDirectory);
         }
-        let mut listing = self
-            .reader()
-            .read_dir_inode_at(inode, DirPosition::new(cookie.raw()))
-            .await
-            .map_err(|error| match error {
-                // A cookie this directory never handed out.
-                erofs_rs::Error::OutOfRange(..) => FsError::Invalid,
-                error => self.fs_error(error),
-            })?;
-        let mut entries = Vec::new();
-        while entries.len() < max_entries {
-            let Some(entry) = listing
-                .next_entry()
-                .await
-                .map_err(|error| self.fs_error(error))?
-            else {
-                break;
-            };
-            let name = String::from_utf8(entry.file_name().to_vec())
-                .map_err(|_| FsError::IllegalByteSequence)?;
-            let kind = match entry.file_type() {
-                DirentFileType::Directory => NodeKind::Directory,
-                DirentFileType::RegularFile => NodeKind::File,
-                DirentFileType::Symlink => NodeKind::Symlink,
-                // The entry carries no type of its own; the inode does.
-                DirentFileType::Unknown => {
-                    let inode = self
-                        .reader()
-                        .get_inode(entry.nid())
-                        .await
-                        .map_err(|error| self.fs_error(error))?;
-                    node_kind(inode.file_type())?
-                }
-                DirentFileType::CharacterDevice
-                | DirentFileType::BlockDevice
-                | DirentFileType::Fifo
-                | DirentFileType::Socket => return Err(FsError::Unsupported),
-            };
-            entries.push(DirEntry {
-                name,
-                kind,
-                inode: entry.nid(),
-                next: DirCookie::new(listing.position().raw()),
-            });
-        }
-        Ok(entries)
+        Ok(ErofsDir {
+            fs: self.clone(),
+            inode,
+        })
     }
 
     async fn create_directory(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn remove_directory(&self, _: FsPath<'_>) -> FsResult<()> {
+    async fn remove_directory(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn unlink(&self, _: FsPath<'_>) -> FsResult<()> {
+    async fn unlink(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn rename(&self, _: FsPath<'_>, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn rename(&self, _: FsPath<'_>, _: FsPath<'_>, _: RenameMode, _: u64) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 

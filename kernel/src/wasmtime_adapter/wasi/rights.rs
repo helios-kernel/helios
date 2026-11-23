@@ -22,7 +22,7 @@ mod sealed {
 /// A right an operation needs from a descriptor.
 pub(crate) trait Right: sealed::Sealed {
     /// Holding any one of these grants the right.
-    const ANY_OF: &'static [fs_types::DescriptorFlags];
+    const ANY_OF: &'static [FsDescriptorFlags];
     /// What the operation answers a descriptor without it.
     const REFUSED: fs_types::ErrorCode;
 }
@@ -64,25 +64,24 @@ impl sealed::Sealed for RegularFile {}
 impl sealed::Sealed for AnyKind {}
 
 impl Right for Read {
-    const ANY_OF: &'static [fs_types::DescriptorFlags] = &[fs_types::DescriptorFlags::READ];
+    const ANY_OF: &'static [FsDescriptorFlags] = &[FsDescriptorFlags::READ];
     const REFUSED: fs_types::ErrorCode = fs_types::ErrorCode::NotPermitted;
 }
 
 impl Right for Write {
-    const ANY_OF: &'static [fs_types::DescriptorFlags] = &[fs_types::DescriptorFlags::WRITE];
+    const ANY_OF: &'static [FsDescriptorFlags] = &[FsDescriptorFlags::WRITE];
     const REFUSED: fs_types::ErrorCode = fs_types::ErrorCode::ReadOnly;
 }
 
 impl Right for Mutate {
-    const ANY_OF: &'static [fs_types::DescriptorFlags] =
-        &[fs_types::DescriptorFlags::MUTATE_DIRECTORY];
+    const ANY_OF: &'static [FsDescriptorFlags] = &[FsDescriptorFlags::MUTATE_DIRECTORY];
     const REFUSED: fs_types::ErrorCode = fs_types::ErrorCode::ReadOnly;
 }
 
 impl Right for Retime {
-    const ANY_OF: &'static [fs_types::DescriptorFlags] = &[
-        fs_types::DescriptorFlags::WRITE,
-        fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+    const ANY_OF: &'static [FsDescriptorFlags] = &[
+        FsDescriptorFlags::WRITE,
+        FsDescriptorFlags::MUTATE_DIRECTORY,
     ];
     const REFUSED: fs_types::ErrorCode = fs_types::ErrorCode::ReadOnly;
 }
@@ -169,13 +168,8 @@ impl<'s> Granted<'s, Directory, Read> {
         let writable = destination
             .descriptor()
             .flags
-            .contains(fs_types::DescriptorFlags::WRITE);
-        if writable
-            && !self
-                .descriptor()
-                .flags
-                .contains(fs_types::DescriptorFlags::WRITE)
-        {
+            .contains(FsDescriptorFlags::WRITE);
+        if writable && !self.descriptor().flags.contains(FsDescriptorFlags::WRITE) {
             return Err(fs_types::ErrorCode::NotPermitted);
         }
         Ok(AliasGrant {
@@ -229,13 +223,93 @@ impl FsDescriptor {
     /// refusal is `read-only`.
     pub(crate) fn grant_touch(&self) -> FsOpResult<Granted<'_, AnyKind, Touch>> {
         let needed = if self.kind == FsNodeKind::Directory {
-            fs_types::DescriptorFlags::MUTATE_DIRECTORY
+            FsDescriptorFlags::MUTATE_DIRECTORY
         } else {
-            fs_types::DescriptorFlags::WRITE
+            FsDescriptorFlags::WRITE
         };
         if !self.flags.contains(needed) {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
         Ok(Granted::new(self))
+    }
+}
+
+/// The rights checked for one open operation, held with its descriptor snapshot.
+/// The owner is either the caller's borrow or an owned snapshot crossing an await.
+/// No other task can narrow this snapshot after the proof is constructed.
+pub(crate) struct OpenGrant<D> {
+    descriptor: D,
+    create: Option<CreatePermission>,
+    truncate: Option<TruncatePermission>,
+}
+
+struct CreatePermission;
+struct TruncatePermission;
+
+impl<D: core::borrow::Borrow<FsDescriptor>> OpenGrant<D> {
+    // Callers in this module have already proved Directory + Read.
+    fn new(descriptor: D, flags: fs_types::OpenFlags) -> FsOpResult<Self> {
+        let base = descriptor.borrow();
+        let truncate = if flags.contains(fs_types::OpenFlags::TRUNCATE) {
+            base.grant::<Directory, Mutate>()?;
+            base.grant::<Directory, Write>()?;
+            Some(TruncatePermission)
+        } else {
+            None
+        };
+        let create = if flags.contains(fs_types::OpenFlags::CREATE) {
+            base.grant::<Directory, Mutate>()?;
+            Some(CreatePermission)
+        } else {
+            None
+        };
+        if flags.contains(fs_types::OpenFlags::CREATE | fs_types::OpenFlags::DIRECTORY) {
+            return Err(fs_types::ErrorCode::Invalid);
+        }
+        Ok(Self {
+            descriptor,
+            create,
+            truncate,
+        })
+    }
+
+    pub(crate) fn base(&self) -> Granted<'_, Directory, Read> {
+        Granted::new(self.descriptor.borrow())
+    }
+
+    pub(crate) fn create(&self) -> Option<Granted<'_, Directory, Mutate>> {
+        self.create
+            .as_ref()
+            .map(|_| Granted::new(self.descriptor.borrow()))
+    }
+
+    pub(crate) fn truncate(
+        &self,
+    ) -> Option<(
+        Granted<'_, Directory, Mutate>,
+        Granted<'_, Directory, Write>,
+    )> {
+        self.truncate.as_ref().map(|_| {
+            (
+                Granted::new(self.descriptor.borrow()),
+                Granted::new(self.descriptor.borrow()),
+            )
+        })
+    }
+}
+
+impl<'d> Granted<'d, Directory, Read> {
+    pub(crate) fn prepare_open(
+        self,
+        flags: fs_types::OpenFlags,
+    ) -> FsOpResult<OpenGrant<&'d FsDescriptor>> {
+        OpenGrant::new(self.descriptor, flags)
+    }
+}
+
+impl FsDescriptor {
+    pub(crate) fn prepare_open(self, flags: fs_types::OpenFlags) -> FsOpResult<OpenGrant<Self>> {
+        self.grant::<Directory, Read>()?;
+        OpenGrant::new(self, flags)
     }
 }

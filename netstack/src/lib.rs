@@ -5,6 +5,7 @@ extern crate alloc;
 mod address;
 mod checksum;
 mod congestion;
+mod delivery_rate;
 mod dhcp;
 mod dns;
 mod hash;
@@ -12,6 +13,8 @@ mod icmp_rate;
 mod isn;
 mod ndp;
 mod packet;
+#[cfg(test)]
+mod path_sim;
 mod stack;
 mod tcp;
 mod types;
@@ -31,8 +34,8 @@ pub use checksum::{
     tcpv4_checksum, tcpv6_checksum, udp_checksum, udp_checksum_valid, udp_pseudo_header_checksum,
 };
 pub use congestion::{
-    AckSample, BbrV3, CongestionControl, CongestionEvent, CongestionWindow, Cubic, NewReno,
-    PacingRate, RecoveryAction,
+    AckSample, BbrV3, CongestionControl, CongestionEvent, CongestionWindow, Cubic, LostPacket,
+    NewReno, PacingRate, PacketSent, RateSample, RecoveryAction, RecoveryTrigger, SendSnapshot,
 };
 pub use dhcp::{
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpAction, DhcpClient, DhcpClientMessage, DhcpDestination,
@@ -40,12 +43,13 @@ pub use dhcp::{
     DhcpServerMessage, DhcpState, DhcpTransmit, MAX_DHCP_DNS_SERVERS, next_transaction_id,
 };
 pub use dns::{
-    DNS_MAX_ADDRESS_RECORDS, DNS_MAX_CNAME_CHAIN, DNS_PORT, DnsMessage, DnsQuery,
-    DnsQuestionWriter, DnsRecordType, DnsResponse,
+    DNS_MAX_ADDRESS_RECORDS, DNS_MAX_ALPN_IDS, DNS_MAX_CNAME_CHAIN, DNS_PORT, DnsHttpsOutcome,
+    DnsHttpsRecord, DnsMessage, DnsQuery, DnsQuestionWriter, DnsRcode, DnsRecordType, DnsResponse,
+    DnsWireName, HTTPS_DEFAULT_PORT,
 };
 pub use hash::{
-    FlowHash, FlowTuple, RSS_INDIRECTION_ENTRIES, RSS_KEY_BYTES, STANDARD_RSS_KEY, flow_hash,
-    rss_indirection_entry, toeplitz,
+    DestinationPortHashes, FlowHash, FlowTuple, RSS_INDIRECTION_ENTRIES, RSS_KEY_BYTES,
+    STANDARD_RSS_KEY, flow_hash, rss_indirection_entry, toeplitz,
 };
 pub use isn::{IsnSecret, initial_sequence_number};
 pub use ndp::{
@@ -613,6 +617,32 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     fn queue_pair_count(&self) -> usize {
         1
     }
+
+    /// Makes queue pairs `0..pairs` the ones the device delivers
+    /// received frames on and reads transmissions from.
+    ///
+    /// A multiqueue device activates its pairs by count, never one by
+    /// one, so the live pairs are always a prefix of the
+    /// [`Self::queue_pair_count`] pairs brought up. Every pair keeps its
+    /// rings and buffers while it is not live, so raising the count
+    /// again resumes it where it stopped. `pairs` is at least one and at
+    /// most [`Self::queue_pair_count`].
+    ///
+    /// Synchronous: the device answers a control command in the time a
+    /// descriptor completes, and the caller polls for the answer. The
+    /// caller serialises calls; two in flight at once is a caller bug.
+    /// An `Err` means the device refused the count and kept the one it
+    /// had.
+    fn set_active_queue_pairs(&self, pairs: usize) -> IoResult<()>;
+
+    /// Delivers `pair`'s completion interrupts to `processor` from the
+    /// next one on.
+    ///
+    /// No interrupt is lost across the change: one already raised is
+    /// handled where it was sent, and one raised while the delivery is
+    /// being changed arrives at the new destination. The caller
+    /// serialises calls and names an online processor.
+    fn steer_queue_pair(&self, pair: usize, processor: helios_hal::cpu::ProcessorId);
 
     /// Returns hardware capabilities used to select stack data paths.
     fn capabilities(&self) -> InterfaceCapabilities {

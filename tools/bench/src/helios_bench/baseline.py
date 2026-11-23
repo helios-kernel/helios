@@ -92,7 +92,7 @@ WORKTREES = REPO_ROOT / "target" / "perf-baselines" / "worktrees"
 BUILD_DIR = "target"
 # What `--baseline-ref` means when it is given without a value.
 MERGE_BASE = "merge-base"
-MERGE_BASE_AGAINST = "origin/dev"
+MERGE_BASE_AGAINST = "origin/main"
 ARTIFACTS = "artifacts"
 # The vendored fork the kernel builds against, as a workspace path
 # dependency on `../wasmtime/crates/wasmtime` (docs/wasmtime.md): the
@@ -151,7 +151,7 @@ def git(*arguments: str, cwd: Path | None = None) -> str:
 def resolve_sha(ref: str) -> str:
     """The commit a `--baseline-ref` names.
 
-    Without a value the flag means the merge base with `dev`: the commit
+    Without a value the flag means the merge base with `main`: the commit
     the branch is a change to, which is the only ref that makes the
     paired columns differ by the pull request and nothing else.
     """

@@ -8,7 +8,7 @@ use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 
 use crate::bindings::helios::system::sync::{
-    RawMutex, RawMutexGuard, RawRwLock, RawRwLockReadGuard, RawRwLockWriteGuard,
+    self as host_sync, RawMutex, RawMutexGuard, RawRwLock, RawRwLockReadGuard, RawRwLockWriteGuard,
 };
 
 /// Async mutex using kernel-managed scheduling.
@@ -166,3 +166,136 @@ unsafe impl<T: Send> Sync for Mutex<T> {}
 
 unsafe impl<T: Send + Sync> Send for RwLock<T> {}
 unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
+
+/// Absolute nanoseconds in the WASI monotonic clock's epoch.
+pub type Deadline = crate::bindings::wasi::clocks::monotonic_clock::Mark;
+
+/// A completion producer closed or reported failure.
+pub use crate::bindings::helios::system::sync::Error as TimelineError;
+
+/// Read-only access to a shared completion timeline.
+pub struct Timeline {
+    raw: host_sync::Timeline,
+}
+
+/// Authority to advance a timeline. Dropping the last producer closes it.
+pub struct SignalSource {
+    raw: host_sync::SignalSource,
+}
+
+/// A value to await on a timeline.
+pub struct TimelinePoint<'a> {
+    pub timeline: &'a Timeline,
+    pub value: u64,
+}
+
+/// A producer value to attach to an asynchronous operation.
+pub struct SignalPoint<'a> {
+    pub source: &'a SignalSource,
+    pub value: u64,
+}
+
+#[cfg(feature = "gpu")]
+impl SignalPoint<'_> {
+    pub(crate) fn raw(&self) -> host_sync::SignalPoint<'_> {
+        host_sync::SignalPoint {
+            source: &self.source.raw,
+            value: self.value,
+        }
+    }
+}
+
+impl From<host_sync::Timeline> for Timeline {
+    fn from(raw: host_sync::Timeline) -> Self {
+        Self { raw }
+    }
+}
+
+impl From<host_sync::SignalSource> for SignalSource {
+    fn from(raw: host_sync::SignalSource) -> Self {
+        Self { raw }
+    }
+}
+
+#[cfg(feature = "surface")]
+impl TimelinePoint<'_> {
+    pub(crate) fn raw(&self) -> host_sync::TimelinePoint<'_> {
+        host_sync::TimelinePoint {
+            timeline: &self.timeline.raw,
+            value: self.value,
+        }
+    }
+}
+
+impl SignalSource {
+    pub fn new(initial: u64) -> Self {
+        Self {
+            raw: host_sync::SignalSource::new(initial),
+        }
+    }
+
+    pub fn point(&self, value: u64) -> SignalPoint<'_> {
+        SignalPoint {
+            source: self,
+            value,
+        }
+    }
+
+    pub fn reader(&self) -> Timeline {
+        Timeline {
+            raw: self.raw.reader(),
+        }
+    }
+
+    pub fn signal(&self, value: u64) -> Result<(), TimelineError> {
+        self.raw.signal(value)
+    }
+
+    pub fn fail(&self) {
+        self.raw.fail();
+    }
+}
+
+impl Timeline {
+    pub fn value(&self) -> Result<u64, TimelineError> {
+        self.raw.value()
+    }
+
+    pub fn point(&self, value: u64) -> TimelinePoint<'_> {
+        TimelinePoint {
+            timeline: self,
+            value,
+        }
+    }
+}
+
+/// Wait for every point, returning false if the absolute deadline expires.
+pub async fn wait_all(
+    points: &[TimelinePoint<'_>],
+    deadline: Option<Deadline>,
+) -> Result<bool, TimelineError> {
+    wait_points(points, true, deadline).await
+}
+
+/// Wait for any point, returning false if the absolute deadline expires.
+pub async fn wait_any(
+    points: &[TimelinePoint<'_>],
+    deadline: Option<Deadline>,
+) -> Result<bool, TimelineError> {
+    wait_points(points, false, deadline).await
+}
+
+async fn wait_points(
+    points: &[TimelinePoint<'_>],
+    all: bool,
+    deadline: Option<Deadline>,
+) -> Result<bool, TimelineError> {
+    let points: Vec<_> = points
+        .iter()
+        .map(|point| host_sync::TimelinePoint {
+            timeline: &point.timeline.raw,
+            value: point.value,
+        })
+        .collect();
+    host_sync::wait(points, all, deadline).await
+}
