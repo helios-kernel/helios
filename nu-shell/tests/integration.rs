@@ -648,3 +648,108 @@ fn parse_and_runtime_errors_surface_typed() {
         assert_eq!(val.as_int().unwrap(), 100);
     });
 }
+
+#[test]
+fn save_unknown_extension_stderr_redirection_do_env_tilde_and_cancellation() {
+    block_on(async {
+        let env = TestHeliosEnv::new();
+        let mut session = ShellSession::new(env.clone()).await;
+
+        // 1. `save` with unknown extension preserves data instead of dropping it
+        let _ = session
+            .eval(r#"[1 2 3] | save /tmp/out.unknownext"#)
+            .await
+            .unwrap();
+        let saved = env.read_vfs_bytes("/tmp/out.unknownext").unwrap();
+        assert!(
+            !saved.is_empty(),
+            "save with unknown extension must not lose data"
+        );
+
+        // 2. `e>`, `e>>`, `o+e>`, and `o> ... e> ...` stderr/stdout file redirections
+        let _ = session
+            .eval(r#"run-external "fail-ext" e> /tmp/err.txt | ignore"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            env.read_vfs_bytes("/tmp/err.txt").as_deref(),
+            Some(b"boom-stderr".as_slice())
+        );
+
+        let _ = session
+            .eval(r#"run-external "fail-ext" e>> /tmp/err.txt | ignore"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            env.read_vfs_bytes("/tmp/err.txt").as_deref(),
+            Some(b"boom-stderrboom-stderr".as_slice())
+        );
+
+        let _ = session
+            .eval(r#"run-external "fail-ext" o+e> /tmp/both.txt"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            env.read_vfs_bytes("/tmp/both.txt").as_deref(),
+            Some(b"partial-outboom-stderr".as_slice())
+        );
+
+        let _ = session
+            .eval(r#"run-external "fail-ext" o> /tmp/sep-out.txt e> /tmp/sep-err.txt"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            env.read_vfs_bytes("/tmp/sep-out.txt").as_deref(),
+            Some(b"partial-out".as_slice())
+        );
+        assert_eq!(
+            env.read_vfs_bytes("/tmp/sep-err.txt").as_deref(),
+            Some(b"boom-stderr".as_slice())
+        );
+
+        // 3. `do --env` propagates env changes; plain `do` isolates them
+        let _ = session
+            .eval(r#"do { $env.ISOLATED_VAR = "hidden" }"#)
+            .await
+            .unwrap();
+        let isolated = session.eval("$env.ISOLATED_VAR?").await.unwrap();
+        assert!(isolated.is_nothing());
+
+        let _ = session
+            .eval(r#"do --env { $env.CAPTURED_VAR = "persisted" }"#)
+            .await
+            .unwrap();
+        let captured = session.eval("$env.CAPTURED_VAR").await.unwrap();
+        assert_eq!(captured.as_str().unwrap(), "persisted");
+
+        // 4. `~` expands strictly from `$env.HOME`, never ambient host OS HOME
+        env.insert_file("/custom-home/hello.txt", b"vfs-home-ok".to_vec());
+        let _ = session.eval(r#"$env.HOME = "/custom-home""#).await.unwrap();
+        let tilde_content = session.eval("open ~/hello.txt").await.unwrap();
+        assert_eq!(tilde_content.as_str().unwrap(), "vfs-home-ok");
+
+        // 5. Dropping a pending `with-grants` / `with-scope` future mid-await leaks no frames
+        {
+            let fut = session.eval(
+                r#"with-grants "virtualize" { with-scope "/plugins/http-client" { sleep 10ms; "done" } }"#,
+            );
+            let mut fut = Box::pin(fut);
+            let waker = futures_lite::future::block_on(futures_lite::future::poll_fn(|cx| {
+                core::task::Poll::Ready(cx.waker().clone())
+            }));
+            let mut cx = core::task::Context::from_waker(&waker);
+            // First poll advances into `sleep` (which yields once), then drop `fut` mid-await.
+            let poll = fut.as_mut().poll(&mut cx);
+            assert!(poll.is_pending(), "sleep must yield before cancellation");
+            drop(fut);
+        }
+        assert!(
+            session.runtime_scope().active_grants().is_empty(),
+            "cancelled with-grants must not leak grants onto session"
+        );
+        assert!(
+            session.runtime_scope().current_scope().is_none(),
+            "cancelled with-scope must not leak scope onto session"
+        );
+    });
+}

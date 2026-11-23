@@ -10,7 +10,6 @@ test-support = []
 [dependencies]
 async-channel = { version = "2.5.0", default-features = false }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
-futures-core = { version = "0.3.34", default-features = false }
 futures-lite = { version = "2.6.1", default-features = false, features = ["alloc"] }
 getrandom = { version = "0.4.2", default-features = false }
 nu-cmd-lang = { version = "=0.117.0", default-features = false }

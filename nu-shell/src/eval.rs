@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use nu_engine::env::{is_automatic_env_var, var};
 use nu_engine::{convert_env_vars, eval_ir_call};
-use nu_path::{dots::expand_ndots_safe, expand_path, expand_tilde};
+use nu_path::dots::expand_ndots_safe;
 use nu_protocol::ast::{Bits, Block, Boolean, CellPath, Comparison, Math, Operator, PathMember};
 use nu_protocol::engine::named_flags::{
     list_spread_before_required_error, normalize_engine_arguments,
@@ -36,13 +36,14 @@ use nu_protocol::{
 
 use crate::command::{AsyncCommandContext, AsyncCommandRegistry, EvalRuntime, RuntimeScope};
 use crate::env::{HeliosEnv, normalize_vfs_path};
-use crate::pipeline::{AsyncExecutionData, AsyncPipelineData};
+use crate::pipeline::{AsyncExecutionData, AsyncPipelineData, collect_byte_receiver};
 
 /// Open redirection file slot backed by [`HeliosEnv`] rather than ambient host `std::fs`.
 #[derive(Debug, Clone)]
 struct RedirectFile {
     path: String,
     append: bool,
+    written: bool,
 }
 
 /// Evaluate a compiled Nushell [`Block`] asynchronously against `rt`.
@@ -146,6 +147,50 @@ pub async fn eval_closure_async<E: HeliosEnv>(
     rt: &mut EvalRuntime<'_, E>,
     call_span: Span,
 ) -> Result<AsyncPipelineData, ShellError> {
+    eval_closure_inner(
+        engine_state,
+        caller_stack,
+        closure,
+        (args, input),
+        rt,
+        call_span,
+        false,
+    )
+    .await
+}
+
+/// Evaluate a Nushell [`Closure`] asynchronously and propagate environment
+/// variable mutations back into `caller_stack` (used by `do --env`).
+pub async fn eval_closure_redirect_env_async<E: HeliosEnv>(
+    engine_state: &EngineState,
+    caller_stack: &mut Stack,
+    closure: &Closure,
+    args: Vec<Value>,
+    input: AsyncPipelineData,
+    rt: &mut EvalRuntime<'_, E>,
+    call_span: Span,
+) -> Result<AsyncPipelineData, ShellError> {
+    eval_closure_inner(
+        engine_state,
+        caller_stack,
+        closure,
+        (args, input),
+        rt,
+        call_span,
+        true,
+    )
+    .await
+}
+
+async fn eval_closure_inner<E: HeliosEnv>(
+    engine_state: &EngineState,
+    caller_stack: &mut Stack,
+    closure: &Closure,
+    (args, input): (Vec<Value>, AsyncPipelineData),
+    rt: &mut EvalRuntime<'_, E>,
+    call_span: Span,
+    force_redirect_env: bool,
+) -> Result<AsyncPipelineData, ShellError> {
     let block = engine_state.get_block(closure.block_id);
     let mut callee_stack = caller_stack
         .captures_to_stack(closure.captures.clone())
@@ -182,7 +227,7 @@ pub async fn eval_closure_async<E: HeliosEnv>(
         .await
         .map(|exec| exec.body);
 
-    if block.redirect_env {
+    if force_redirect_env || block.redirect_env {
         redirect_env(engine_state, caller_stack, &callee_stack);
     }
     result
@@ -291,8 +336,8 @@ struct AsyncEvalContext<'a, E: HeliosEnv> {
     finally_resumes: Vec<Option<Unwind>>,
     redirect_out: Option<Redirection>,
     redirect_err: Option<Redirection>,
-    redirect_out_file: Option<RedirectFile>,
-    redirect_err_file: Option<RedirectFile>,
+    redirect_out_file: Option<u32>,
+    redirect_err_file: Option<u32>,
     matches: Vec<(VarId, Value)>,
     registers: &'a mut [AsyncExecutionData],
     files: &'a mut [Option<RedirectFile>],
@@ -852,6 +897,7 @@ async fn eval_instruction_async<E: HeliosEnv>(
             ctx.files[*file_num as usize] = Some(RedirectFile {
                 path: resolved,
                 append: *append,
+                written: false,
             });
             Ok(Continue)
         }
@@ -860,25 +906,34 @@ async fn eval_instruction_async<E: HeliosEnv>(
             src: src_reg,
         } => {
             let src = ctx.take_reg(*src_reg);
-            let file = ctx
+            let already_written = ctx
                 .files
                 .get(*file_num as usize)
-                .cloned()
-                .flatten()
+                .and_then(Option::as_ref)
                 .ok_or_else(|| ShellError::IrEvalError {
                     msg: format!("Tried to write to file #{file_num}, but it is not open"),
                     span: Some(*span),
-                })?;
+                })?
+                .written;
+            if matches!(src.body, AsyncPipelineData::Empty) && already_written {
+                ctx.put_reg(*src_reg, AsyncExecutionData::empty());
+                return Ok(Continue);
+            }
             let bytes = src.body.into_bytes_async(*span).await?;
-            ctx.env
-                .write_file(&file.path, &bytes, file.append, true)
-                .await
-                .map_err(|err| err.into_shell_error("failed to write redirection file", *span))?;
+            write_redirect_slot(ctx, *file_num, &bytes, *span).await?;
             ctx.put_reg(*src_reg, AsyncExecutionData::empty());
             Ok(Continue)
         }
         Instruction::CloseFile { file_num } => {
-            if ctx.files[*file_num as usize].take().is_some() {
+            if let Some(file) = ctx.files[*file_num as usize].take() {
+                if !file.written {
+                    ctx.env
+                        .write_file(&file.path, &[], file.append, true)
+                        .await
+                        .map_err(|err| {
+                            err.into_shell_error("failed to create redirection file", *span)
+                        })?;
+                }
                 Ok(Continue)
             } else {
                 Err(ShellError::IrEvalError {
@@ -1360,8 +1415,8 @@ async fn literal_value_async<E: HeliosEnv>(
             if *no_expand {
                 Value::string(path, span)
             } else {
-                let path = expand_path(path, true);
-                Value::string(path.to_string_lossy(), span)
+                let home = stack_home_dir(ctx.engine_state, ctx.stack);
+                Value::string(expand_vfs_tilde_and_ndots(path, home.as_deref()), span)
             }
         }
         Literal::Directory {
@@ -1374,8 +1429,8 @@ async fn literal_value_async<E: HeliosEnv>(
             } else if *no_expand {
                 Value::string(path, span)
             } else {
-                let path = expand_path(path, true);
-                Value::string(path.to_string_lossy(), span)
+                let home = stack_home_dir(ctx.engine_state, ctx.stack);
+                Value::string(expand_vfs_tilde_and_ndots(path, home.as_deref()), span)
             }
         }
         Literal::GlobPattern { val, no_expand } => {
@@ -1482,8 +1537,8 @@ async fn eval_call_async<E: HeliosEnv>(
     );
     let redir_out = ctx.redirect_out.take();
     let redir_err = ctx.redirect_err.take();
-    let out_file = ctx.redirect_out_file.take();
-    let _err_file = ctx.redirect_err_file.take();
+    let out_file_num = ctx.redirect_out_file.take();
+    let err_file_num = ctx.redirect_err_file.take();
 
     let result = {
         let mut caller_stack = ctx.stack.push_redirection(redir_out, redir_err);
@@ -1515,17 +1570,124 @@ async fn eval_call_async<E: HeliosEnv>(
         other => other,
     }?;
 
-    // If stdout was redirected to a VFS file via `o>` / `o>>`, flush it through HeliosEnv.
-    if let Some(file) = out_file {
-        let bytes = result.into_bytes_async(head).await?;
-        ctx.env
-            .write_file(&file.path, &bytes, file.append, true)
-            .await
-            .map_err(|err| err.into_shell_error("failed to write redirected stdout", head))?;
-        return Ok(AsyncPipelineData::Empty);
-    }
+    // Handle file redirections (`o>`, `o>>`, `e>`, `e>>`, `o+e>`, `o+e>>`) through HeliosEnv.
+    match (out_file_num, err_file_num) {
+        (Some(out_num), Some(err_num)) if out_num == err_num => {
+            if let AsyncPipelineData::ByteStream {
+                stream,
+                stderr,
+                exit_code,
+                ..
+            } = result
+            {
+                let (out_res, err_res) =
+                    futures_lite::future::zip(collect_byte_receiver(stream), async move {
+                        match stderr {
+                            Some(rx) => collect_byte_receiver(rx).await,
+                            None => Ok(Vec::new()),
+                        }
+                    })
+                    .await;
+                let mut combined = out_res?;
+                combined.extend_from_slice(&err_res?);
+                if let Some(exit_rx) = exit_code {
+                    let _ = exit_rx.recv().await;
+                }
+                write_redirect_slot(ctx, out_num, &combined, head).await?;
+                return Ok(AsyncPipelineData::Empty);
+            }
+            let bytes = result.into_bytes_async(head).await?;
+            write_redirect_slot(ctx, out_num, &bytes, head).await?;
+            Ok(AsyncPipelineData::Empty)
+        }
+        (out_opt, Some(err_num)) => {
+            if let AsyncPipelineData::ByteStream {
+                stream,
+                stderr,
+                exit_code,
+                span,
+                stream_type,
+                metadata,
+            } = result
+            {
+                if let Some(out_num) = out_opt {
+                    let (out_res, err_res) =
+                        futures_lite::future::zip(collect_byte_receiver(stream), async move {
+                            match stderr {
+                                Some(rx) => collect_byte_receiver(rx).await,
+                                None => Ok(Vec::new()),
+                            }
+                        })
+                        .await;
+                    let out_bytes = out_res?;
+                    let err_bytes = err_res?;
+                    if let Some(exit_rx) = exit_code {
+                        let _ = exit_rx.recv().await;
+                    }
+                    write_redirect_slot(ctx, out_num, &out_bytes, head).await?;
+                    write_redirect_slot(ctx, err_num, &err_bytes, head).await?;
+                    return Ok(AsyncPipelineData::Empty);
+                }
 
-    Ok(result)
+                if let Some(err_rx) = stderr {
+                    let err_bytes = collect_byte_receiver(err_rx).await?;
+                    write_redirect_slot(ctx, err_num, &err_bytes, head).await?;
+                }
+                return Ok(AsyncPipelineData::ByteStream {
+                    stream,
+                    stderr: None,
+                    exit_code,
+                    span,
+                    stream_type,
+                    metadata,
+                });
+            }
+
+            if let Some(out_num) = out_opt {
+                let bytes = result.into_bytes_async(head).await?;
+                write_redirect_slot(ctx, out_num, &bytes, head).await?;
+                return Ok(AsyncPipelineData::Empty);
+            }
+            Ok(result)
+        }
+        (Some(out_num), None) => {
+            let bytes = result.into_bytes_async(head).await?;
+            write_redirect_slot(ctx, out_num, &bytes, head).await?;
+            Ok(AsyncPipelineData::Empty)
+        }
+        (None, None) => Ok(result),
+    }
+}
+
+async fn write_redirect_slot<E: HeliosEnv>(
+    ctx: &mut AsyncEvalContext<'_, E>,
+    file_num: u32,
+    bytes: &[u8],
+    span: Span,
+) -> Result<(), ShellError> {
+    let (path, append) = {
+        let slot = ctx
+            .files
+            .get(file_num as usize)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| ShellError::IrEvalError {
+                msg: format!("Tried to write to file #{file_num}, but it is not open"),
+                span: Some(span),
+            })?;
+        (slot.path.clone(), slot.append || slot.written)
+    };
+    ctx.env
+        .write_file(&path, bytes, append, true)
+        .await
+        .map_err(|err| err.into_shell_error("failed to write redirection file", span))?;
+    if let Some(slot) = ctx
+        .files
+        .get_mut(file_num as usize)
+        .and_then(Option::as_mut)
+    {
+        slot.written = true;
+    }
+    Ok(())
 }
 
 async fn eval_call_frame_async<E: HeliosEnv>(
@@ -1707,7 +1869,7 @@ fn eval_redirection<E: HeliosEnv>(
     mode: &RedirectMode,
     span: Span,
     which: RedirectionStream,
-) -> Result<(Option<Redirection>, Option<RedirectFile>), ShellError> {
+) -> Result<(Option<Redirection>, Option<u32>), ShellError> {
     match mode {
         RedirectMode::Pipe => Ok((Some(Redirection::Pipe(OutDest::Pipe)), None)),
         RedirectMode::PipeRaw => Ok((Some(Redirection::Pipe(OutDest::PipeRaw)), None)),
@@ -1717,16 +1879,18 @@ fn eval_redirection<E: HeliosEnv>(
         RedirectMode::Inherit => Ok((Some(Redirection::Pipe(OutDest::Inherit)), None)),
         RedirectMode::Print => Ok((Some(Redirection::Pipe(OutDest::Print)), None)),
         RedirectMode::File { file_num } => {
-            let file = ctx
+            if ctx
                 .files
                 .get(*file_num as usize)
-                .cloned()
-                .flatten()
-                .ok_or_else(|| ShellError::IrEvalError {
+                .and_then(Option::as_ref)
+                .is_none()
+            {
+                return Err(ShellError::IrEvalError {
                     msg: format!("Tried to redirect to file #{file_num}, but it is not open"),
                     span: Some(span),
-                })?;
-            Ok((Some(Redirection::Pipe(OutDest::Pipe)), Some(file)))
+                });
+            }
+            Ok((Some(Redirection::Pipe(OutDest::Pipe)), Some(*file_num)))
         }
         RedirectMode::Caller => Ok((
             match which {
@@ -1738,7 +1902,52 @@ fn eval_redirection<E: HeliosEnv>(
     }
 }
 
-fn expand_external_glob_arg(val: Value) -> Value {
+pub(crate) fn stack_home_dir(engine_state: &EngineState, stack: &Stack) -> Option<String> {
+    stack
+        .get_env_var(engine_state, "HOME")
+        .and_then(|val| val.as_str().ok())
+        .map(ToOwned::to_owned)
+}
+
+/// Expand leading `~` strictly from Helios's `$env.HOME` (never host OS `HOME`/passwd)
+/// and normalize Nushell `...` ndots segments.
+pub(crate) fn expand_vfs_tilde_and_ndots(raw: &str, home: Option<&str>) -> String {
+    let tilde_expanded = if raw == "~" {
+        home.unwrap_or("/").to_owned()
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        let base = home.unwrap_or("/");
+        if base == "/" {
+            format!("/{rest}")
+        } else {
+            format!("{}/{rest}", base.trim_end_matches('/'))
+        }
+    } else {
+        raw.to_owned()
+    };
+    expand_ndots_safe(tilde_expanded)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Resolve a user-supplied VFS path against `cwd`, expanding leading `~` from
+/// `$env.HOME` (never ambient host OS `HOME`) when `expand` is `true`.
+pub(crate) fn resolve_vfs_path(
+    engine_state: &EngineState,
+    stack: &Stack,
+    cwd: &str,
+    raw: &str,
+    expand: bool,
+) -> String {
+    if expand {
+        let home = stack_home_dir(engine_state, stack);
+        let expanded = expand_vfs_tilde_and_ndots(raw, home.as_deref());
+        normalize_vfs_path(cwd, &expanded)
+    } else {
+        normalize_vfs_path(cwd, raw)
+    }
+}
+
+fn expand_external_glob_arg(val: Value, home: Option<&str>) -> Value {
     if let Value::Glob {
         val: ref s,
         no_expand,
@@ -1748,8 +1957,7 @@ fn expand_external_glob_arg(val: Value) -> Value {
         && !no_expand
         && !nu_glob::is_glob(s)
     {
-        let expanded = expand_ndots_safe(expand_tilde(s.as_str()));
-        return Value::string(expanded.to_string_lossy().into_owned(), internal_span);
+        return Value::string(expand_vfs_tilde_and_ndots(s, home), internal_span);
     }
     val
 }
@@ -1837,6 +2045,9 @@ fn gather_arguments(
     let mut rest = Vec::new();
     let mut rest_span: Option<Span> = None;
     let expand_glob_args = block.signature.allows_unknown_args;
+    let home = expand_glob_args
+        .then(|| stack_home_dir(engine_state, caller_stack))
+        .flatten();
     let mut always_spread = false;
     let mut remaining_required = block.signature.required_positional.len();
 
@@ -1855,7 +2066,7 @@ fn gather_arguments(
                 } else {
                     rest_span = Some(rest_span.map_or(span, |s| s.append(span)));
                     let val = if expand_glob_args {
-                        expand_external_glob_arg(val)
+                        expand_external_glob_arg(val, home.as_deref())
                     } else {
                         val
                     };

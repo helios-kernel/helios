@@ -184,4 +184,9 @@ impl<E: HeliosEnv> ShellSession<E> {
     pub fn stack_mut(&mut self) -> &mut Stack {
         &mut self.stack
     }
+
+    #[must_use]
+    pub const fn runtime_scope(&self) -> &RuntimeScope {
+        &self.runtime_scope
+    }
 }

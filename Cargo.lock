@@ -3561,7 +3561,6 @@ dependencies = [
  "async-channel",
  "async-net",
  "chrono",
- "futures-core",
  "futures-lite",
  "getrandom 0.4.3",
  "helios-nu",

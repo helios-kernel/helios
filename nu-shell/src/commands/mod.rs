@@ -503,6 +503,7 @@ impl<E: HeliosEnv> AsyncCommand<E> for AsyncDo {
         let ignore_errors = ctx
             .call
             .has_flag(ctx.engine_state, ctx.stack, "ignore-errors")?;
+        let capture_env = ctx.call.has_flag(ctx.engine_state, ctx.stack, "env")?;
         let closure: Closure = ctx.call.req(ctx.engine_state, ctx.stack, 0)?;
         let args: Vec<Value> = ctx.call.rest(ctx.engine_state, ctx.stack, 1)?;
 
@@ -511,16 +512,29 @@ impl<E: HeliosEnv> AsyncCommand<E> for AsyncDo {
             registry: ctx.registry,
             runtime_scope: ctx.runtime_scope,
         };
-        let result = eval_closure_async(
-            ctx.engine_state,
-            ctx.stack,
-            &closure,
-            args,
-            input,
-            &mut rt,
-            head,
-        )
-        .await;
+        let result = if capture_env {
+            crate::eval::eval_closure_redirect_env_async(
+                ctx.engine_state,
+                ctx.stack,
+                &closure,
+                args,
+                input,
+                &mut rt,
+                head,
+            )
+            .await
+        } else {
+            eval_closure_async(
+                ctx.engine_state,
+                ctx.stack,
+                &closure,
+                args,
+                input,
+                &mut rt,
+                head,
+            )
+            .await
+        };
 
         match result {
             Ok(out) => Ok(out),

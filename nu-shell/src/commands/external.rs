@@ -172,13 +172,14 @@ impl<E: HeliosEnv> AsyncCommand<E> for WithGrants {
         let closure: Closure = ctx.call.req(ctx.engine_state, ctx.stack, 1)?;
         let parsed = parse_grants(&grants_val, head)?;
 
-        ctx.runtime_scope.grant_frames.push(parsed);
+        let mut child_scope = ctx.runtime_scope.clone();
+        child_scope.grant_frames.push(parsed);
         let mut rt = crate::command::EvalRuntime {
             env: ctx.env,
             registry: ctx.registry,
-            runtime_scope: ctx.runtime_scope,
+            runtime_scope: &mut child_scope,
         };
-        let result = eval_closure_async(
+        eval_closure_async(
             ctx.engine_state,
             ctx.stack,
             &closure,
@@ -187,9 +188,7 @@ impl<E: HeliosEnv> AsyncCommand<E> for WithGrants {
             &mut rt,
             head,
         )
-        .await;
-        ctx.runtime_scope.grant_frames.pop();
-        result
+        .await
     }
 }
 

@@ -14,7 +14,9 @@ use nu_protocol::{
 use crate::command::{AsyncCommand, AsyncCommandContext};
 use crate::env::{FileMetadata, FileType, HeliosEnv, normalize_vfs_path};
 use crate::error::generic_error;
-use crate::eval::{current_cwd_async, eval_call_by_name_async, eval_closure_async};
+use crate::eval::{
+    current_cwd_async, eval_call_by_name_async, eval_closure_async, resolve_vfs_path,
+};
 use crate::pipeline::AsyncPipelineData;
 
 /// `cd`: change current working directory through [`HeliosEnv::set_cwd`].
@@ -146,12 +148,13 @@ impl<E: HeliosEnv> AsyncCommand<E> for Ls {
                 .map_err(|e| e.into_shell_error("ls failed", head))?,
             Some(glob_arg) => {
                 let raw = glob_arg.item.as_ref().to_owned();
-                let is_glob = glob_arg.item.is_expand() && nu_glob::is_glob(&raw);
+                let expand = glob_arg.item.is_expand();
+                let is_glob = expand && nu_glob::is_glob(&raw);
                 if is_glob {
-                    let full_pat = normalize_vfs_path(&cwd, &raw);
+                    let full_pat = resolve_vfs_path(ctx.engine_state, ctx.stack, &cwd, &raw, true);
                     glob_walk(ctx.env, &cwd, &full_pat, None, head).await?
                 } else {
-                    let target = normalize_vfs_path(&cwd, &raw);
+                    let target = resolve_vfs_path(ctx.engine_state, ctx.stack, &cwd, &raw, expand);
                     let meta = ctx
                         .env
                         .stat(&target)
@@ -277,8 +280,9 @@ impl<E: HeliosEnv> AsyncCommand<E> for Open {
         let mut resolved_paths = Vec::new();
         for p in paths {
             let raw_str = p.item.as_ref().to_owned();
-            if p.item.is_expand() && nu_glob::is_glob(&raw_str) {
-                let full_pat = normalize_vfs_path(&cwd, &raw_str);
+            let expand = p.item.is_expand();
+            if expand && nu_glob::is_glob(&raw_str) {
+                let full_pat = resolve_vfs_path(ctx.engine_state, ctx.stack, &cwd, &raw_str, true);
                 let matched = glob_walk(ctx.env, &cwd, &full_pat, None, p.span).await?;
                 if matched.is_empty() {
                     return Err(generic_error(
@@ -291,7 +295,10 @@ impl<E: HeliosEnv> AsyncCommand<E> for Open {
                     resolved_paths.push((m.path, p.span));
                 }
             } else {
-                resolved_paths.push((normalize_vfs_path(&cwd, &raw_str), p.span));
+                resolved_paths.push((
+                    resolve_vfs_path(ctx.engine_state, ctx.stack, &cwd, &raw_str, expand),
+                    p.span,
+                ));
             }
         }
 
@@ -317,7 +324,12 @@ impl<E: HeliosEnv> AsyncCommand<E> for Open {
                 continue;
             }
 
-            if let Some(converter) = format_converter_for_path(&path, "from") {
+            if let Some(converter) = format_converter_for_path(&path, "from")
+                && ctx
+                    .engine_state
+                    .find_decl(converter.as_bytes(), &[])
+                    .is_some()
+            {
                 let input_val = match String::from_utf8(bytes.clone()) {
                     Ok(s) => Value::string(s, span),
                     Err(_) => Value::binary(bytes.clone(), span),
@@ -408,6 +420,10 @@ impl<E: HeliosEnv> AsyncCommand<E> for Save {
 
         let prepared = if !raw_flag
             && let Some(converter) = format_converter_for_path(&resolved, "to")
+            && ctx
+                .engine_state
+                .find_decl(converter.as_bytes(), &[])
+                .is_some()
             && !matches!(
                 &input,
                 AsyncPipelineData::Value(Value::String { .. } | Value::Binary { .. }, _)
@@ -536,8 +552,9 @@ impl<E: HeliosEnv> AsyncCommand<E> for Rm {
         let cwd = current_cwd_async(ctx.engine_state, ctx.stack, ctx.env).await;
         for target in targets {
             let raw = target.item.as_ref().to_owned();
-            if target.item.is_expand() && nu_glob::is_glob(&raw) {
-                let full_pat = normalize_vfs_path(&cwd, &raw);
+            let expand = target.item.is_expand();
+            if expand && nu_glob::is_glob(&raw) {
+                let full_pat = resolve_vfs_path(ctx.engine_state, ctx.stack, &cwd, &raw, true);
                 let matched = glob_walk(ctx.env, &cwd, &full_pat, None, target.span).await?;
                 for entry in matched {
                     ctx.env
@@ -546,7 +563,7 @@ impl<E: HeliosEnv> AsyncCommand<E> for Rm {
                         .map_err(|e| e.into_shell_error("rm failed", target.span))?;
                 }
             } else {
-                let resolved = normalize_vfs_path(&cwd, &raw);
+                let resolved = resolve_vfs_path(ctx.engine_state, ctx.stack, &cwd, &raw, expand);
                 ctx.env
                     .remove(&resolved, recursive, force)
                     .await

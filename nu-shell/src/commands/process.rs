@@ -382,12 +382,13 @@ impl<E: HeliosEnv> AsyncCommand<E> for WithScope {
             .enter_scope(&scope)
             .await
             .map_err(|e| e.into_shell_error("with-scope enter failed", head))?;
-        ctx.runtime_scope.scope_frames.push(active.clone());
+        let mut child_scope = ctx.runtime_scope.clone();
+        child_scope.scope_frames.push(active.clone());
 
         let mut rt = crate::command::EvalRuntime {
             env: ctx.env,
             registry: ctx.registry,
-            runtime_scope: ctx.runtime_scope,
+            runtime_scope: &mut child_scope,
         };
         let result = eval_closure_async(
             ctx.engine_state,
@@ -400,7 +401,6 @@ impl<E: HeliosEnv> AsyncCommand<E> for WithScope {
         )
         .await;
 
-        ctx.runtime_scope.scope_frames.pop();
         let leave_res = ctx.env.leave_scope(&active).await;
         if let Err(err) = leave_res
             && result.is_ok()
