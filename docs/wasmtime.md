@@ -5,11 +5,44 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/sync-main-52`):
+The local checkout must be at (branch `helios/stack-reserve-52`):
 
 ```text
-56131f786d90a136fec6e80e143de18e5b38e8de
+e3e02d3d7aaaf3317d6211ae61a942983fea8aa2
 ```
+
+That revision is `helios/sync-main-52` at
+`56131f786d90a136fec6e80e143de18e5b38e8de` plus six additive commits, which
+let an embedder that commits fiber stacks lazily commit the stack host code
+needs before anything touches it (#535):
+
+- A store keeps a reserve limit beside its real stack limit and publishes
+  the higher of the two, so the resumable check compiled code already makes
+  fails at a stack pointer between them. `Store::stack_reserve_callback`
+  installs the embedder's answer: called with the stack pointer, it commits
+  what host code needs below it and returns the new limit. It runs from
+  `stack_limit_interrupt` before the interrupt callback, and at a wasm entry
+  whose stack pointer is already below the limit. The limit is kept per
+  fiber. An error from the callback ends the call.
+- Cranelift functions can declare `resumable_stack_limit`: a prologue check
+  for a frame above a threshold that calls a `preserve_all` function with
+  `vmctx` and the frame's lowest address instead of trapping, after the
+  frame record is set up and before a byte of the frame is touched. x86-64,
+  AArch64 and RISC-V 64 emit it; s390x and Pulley refuse a function that
+  declares it.
+- `Config::stack_limit_large_frame(Some(threshold))` sets that check on
+  every compiled function, reading the limit from the place
+  `stack_limit_location` names. It is a tunable compared exactly when a
+  module is loaded. `Engine::new` refuses it without stack-limit
+  interruption, under Winch, and with a collector other than the null one.
+
+Helios needs it because wasm descends a lazily committed fiber stack
+without faulting, and a host call from the bottom, or a frame larger than
+what is committed past the limit, then ran on stack nothing had committed.
+The kernel's callback is `install_stack_reserve` in
+`kernel/src/wasmtime_adapter/store.rs`, and the threshold is
+`helios_artifact::CWASM_STACK_LIMIT_LARGE_FRAME`, set by the kernel engine
+and by every producer of a cwasm.
 
 `56131f786d90a136fec6e80e143de18e5b38e8de` cherry-picks upstream
 `bytecodealliance/wasmtime#15350` (`6f943d5b0a`, "deliver `dropped` events as
