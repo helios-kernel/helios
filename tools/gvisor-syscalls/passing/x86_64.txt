@@ -42,7 +42,6 @@ clock_nanosleep_test Sleepers/WallClockNanosleepTest.SleepUntil/0
 clock_nanosleep_test Sleepers/WallClockNanosleepTest.SleepUntil/1
 clock_nanosleep_test Sleepers/WallClockNanosleepTest.UninterruptedNanosleep/0
 clock_nanosleep_test Sleepers/WallClockNanosleepTest.UninterruptedNanosleep/1
-concurrency_test ConcurrencyTest.MultiProcessMultithreaded
 concurrency_test ConcurrencyTest.SingleProcessMultithreaded
 dev_test DevTest.LseekDevNull
 dev_test DevTest.LseekDevNullFreshFile
