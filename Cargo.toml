@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "linux", "unix", "sync",
-    "aarch64", "acpi", "api", "api-macro", "artifact", "btrfs", "cli", "compiler-abi", "compiler-host", "compiler-plugin", "compiler-support", "firmware", "hal", "i6300esb", "hosted", "kernel", "netstack", "profdata", "programs/audio-test", "programs/compositor", "programs/compositor/render", "programs/cpu", "programs/date", "programs/debugger", "programs/display-test", "programs/gpu-test", "programs/http-client", "programs/init", "programs/input-test", "programs/oob-load", "programs/perf", "programs/ping", "programs/pride-flag", "programs/procbench", "programs/sched-tasks", "programs/surface-test", "programs/vmm", "programs/webgpu", "riscv", "tools/branch-hints", "tools/desktop/check-text", "tpm", "venus", "venus-gen", "webgpu", "x86", "x86-vmm", "inspector", "inspector-protocol", "virtio", "workspace-root",
+    "aarch64", "acpi", "api", "api-macro", "artifact", "btrfs", "cli", "compiler-abi", "compiler-host", "compiler-plugin", "compiler-support", "firmware", "hal", "i6300esb", "hosted", "kernel", "netstack", "profdata", "programs/audio-test", "programs/compositor", "programs/compositor/render", "programs/cpu", "programs/date", "programs/debugger", "programs/display-test", "programs/gpu-test", "programs/http-client", "programs/init", "programs/input-test", "programs/oob-load", "programs/perf", "programs/ping", "programs/pride-flag", "programs/procbench", "programs/sched-tasks", "programs/surface-test", "programs/vmm", "programs/webgpu", "riscv", "tools/branch-hints", "tools/desktop/check-text", "tpm", "venus", "venus-gen", "webgpu", "wit-rpc", "wit-rpc-macro", "x86", "x86-vmm", "inspector", "inspector-protocol", "virtio", "workspace-root",
 ]
 resolver = "2"
 
@@ -56,6 +56,8 @@ helios-netstack = { path = "netstack" }
 helios-profdata = { path = "profdata" }
 helios-venus-gen = { path = "venus-gen", default-features = false }
 helios-virtio = { path = "virtio" }
+helios-wit-rpc = { path = "wit-rpc" }
+helios-wit-rpc-macro = { path = "wit-rpc-macro" }
 helios-tpm = { path = "tpm" }
 helios-workspace-root = { path = "workspace-root" }
 helios-x86 = { path = "x86" }
@@ -82,6 +84,7 @@ helios-x86.workspace = true
 
 [dev-dependencies]
 helios-inspector-protocol.workspace = true
+helios-wit-rpc.workspace = true
 wasmtime = { path = "../wasmtime/crates/wasmtime", default-features = false, features = ["component-model", "cranelift", "gc-null", "runtime", "std"] }
 
 [profile.dev]
@@ -104,6 +107,10 @@ debug = 0
 opt-level = "z"
 
 [profile.dev.package.helios-inspector-protocol]
+debug = 0
+opt-level = "z"
+
+[profile.dev.package.helios-wit-rpc]
 debug = 0
 opt-level = "z"
 
