@@ -217,7 +217,9 @@ def main() -> int:
         raise SystemExit(f"TLS smoke guest exited with {result.returncode}")
     if "tls-smoke:ok" not in result.stdout.splitlines():
         raise SystemExit("TLS smoke did not accept both valid HTTP and TLS responses")
-    certificate_error = "http request failed: ErrorCode::TlsCertificateError"
+    certificate_error = (
+        "the server's certificate did not verify: ErrorCode::TlsCertificateError"
+    )
     if transcript.count(certificate_error) != 3:
         raise SystemExit(
             "TLS smoke expected expired, wrong-host and self-signed certificate refusals"
