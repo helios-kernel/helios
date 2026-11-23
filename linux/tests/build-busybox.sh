@@ -61,6 +61,27 @@ tar -xjf "$tarball" -C "$work_dir/src" --strip-components=1
 
 jobs="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 host_cc="${HOSTCC:-cc}"
+cc_wrapper="$work_dir/zig-cc-wrapper.sh"
+cat > "$cc_wrapper" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+# Zig 0.13's clang driver fails with FileNotFound on BusyBox's \`-Wp,-MD,<file>\`
+# because it expects the depfile under its own tmp dir; standard \`-MD -MF <file>\`
+# works across Zig 0.13 and newer releases.
+args=()
+for arg in "\$@"; do
+    case "\$arg" in
+        -Wp,-MD,*)
+            args+=(-MD -MF "\${arg#-Wp,-MD,}")
+            ;;
+        *)
+            args+=("\$arg")
+            ;;
+    esac
+done
+exec zig cc -target "${arch}-linux-musl" "\${args[@]}"
+EOF
+chmod +x "$cc_wrapper"
 (
     cd "$work_dir/src"
     export ZIG_LOCAL_CACHE_DIR="$work_dir/zig-local-cache"
@@ -97,9 +118,9 @@ PY
     (set +o pipefail; yes "" | make oldconfig HOSTCC="$host_cc" >/dev/null)
     make -j"$jobs" \
         HOSTCC="$host_cc" \
-        CC="zig cc -target ${arch}-linux-musl" \
+        CC="$cc_wrapper" \
         AR="zig ar" \
-        LD="zig cc -target ${arch}-linux-musl" \
+        LD="$cc_wrapper" \
         SKIP_STRIP=y \
         EXTRA_CFLAGS="-Os -fno-PIE -Wno-ignored-optimization-argument" \
         EXTRA_LDFLAGS="-static -no-pie -s -Wl,--build-id=none" \
