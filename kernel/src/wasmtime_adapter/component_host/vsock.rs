@@ -195,8 +195,10 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let authority = store.process_authority();
-    authority.derive_terminal_input_cap().is_ok() && authority.derive_terminal_output_cap().is_ok()
+    store
+        .process_authority()
+        .derive_machine_control_cap()
+        .is_ok()
 }
 
 fn authorise<Bindings, CpuImpl, Net, StorageImpl>(
@@ -472,4 +474,52 @@ where
         },
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DebuggerVsock, ProgramVsock, authorise, debugger_bindings, program_bindings};
+    use crate::wasmtime_adapter::component_host::service::test_store::store_data_authorized;
+    use crate::{MachineAuthorityRights, ProcessAuthority, TerminalAuthorityRights};
+
+    #[test]
+    fn vsock_denies_root_and_terminal_authorities_and_requires_machine_control() {
+        let root_store = store_data_authorized(ProcessAuthority::root(), |_| {});
+        assert!(matches!(
+            authorise::<DebuggerVsock, _, _, _>(&root_store),
+            Err(debugger_bindings::helios::system::vsock::VsockError {
+                kind: debugger_bindings::helios::system::vsock::VsockErrorKind::PermissionDenied,
+                ..
+            })
+        ));
+        assert!(matches!(
+            authorise::<ProgramVsock, _, _, _>(&root_store),
+            Err(program_bindings::helios::system::vsock::VsockError {
+                kind: program_bindings::helios::system::vsock::VsockErrorKind::PermissionDenied,
+                ..
+            })
+        ));
+
+        let mut terminal_only = ProcessAuthority::empty();
+        terminal_only.grant_terminal_rights(TerminalAuthorityRights::all());
+        let terminal_store = store_data_authorized(terminal_only, |_| {});
+        assert!(matches!(
+            authorise::<ProgramVsock, _, _, _>(&terminal_store),
+            Err(program_bindings::helios::system::vsock::VsockError {
+                kind: program_bindings::helios::system::vsock::VsockErrorKind::PermissionDenied,
+                ..
+            })
+        ));
+
+        let mut machine_control = ProcessAuthority::empty();
+        machine_control.grant_machine_rights(MachineAuthorityRights::CONTROL);
+        let control_store = store_data_authorized(machine_control, |_| {});
+        assert!(matches!(
+            authorise::<ProgramVsock, _, _, _>(&control_store),
+            Err(program_bindings::helios::system::vsock::VsockError {
+                kind: program_bindings::helios::system::vsock::VsockErrorKind::Unavailable,
+                ..
+            })
+        ));
+    }
 }

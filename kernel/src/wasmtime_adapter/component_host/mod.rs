@@ -2944,9 +2944,9 @@ where
         if !self.retirement.is_empty() {
             runtime_state.retire_network_handles(&self.retirement);
         }
-        if self.retirement.take_snapshot_release() {
-            runtime_state.release_snapshot_hold();
-        }
+        self.retirement.drain_snapshot_releases(|token| {
+            runtime_state.release_snapshot_hold(token);
+        });
     }
 
     fn take_stop(&self) -> Option<wasmtime::Error> {
@@ -6267,5 +6267,163 @@ mod tests {
             fixture.drain();
             assert_eq!(fixture.timer.registered_sleeps(), 0);
         }
+    }
+
+    #[test]
+    fn serial_debug_port_enforces_terminal_input_and_output_rights_independently() {
+        use super::debugger_wit::serial::{HostSerialPortWithStore, HostWithStore, SerialRights};
+        use crate::wasmtime_adapter::component_host::service::test_store::{
+            TestStoreData, store_data_authorized,
+        };
+        use crate::wasmtime_adapter::engine::build_component_engine_for_platform;
+        use crate::{ProcessAuthority, TerminalAuthorityRights};
+        use futures_lite::future::block_on;
+        use wasmtime::Store;
+        use wasmtime::component::{HasSelf, Resource};
+
+        let engine =
+            build_component_engine_for_platform(&crate::test_support::TestCpu::with_entropy(0x66))
+                .unwrap();
+
+        // 1. Empty authority gets no serial port.
+        let mut empty_store = Store::new(
+            &engine,
+            store_data_authorized(ProcessAuthority::empty(), |_| {}),
+        );
+        let none_port = block_on(empty_store.run_concurrent(async |accessor| {
+            accessor.with(<HasSelf<TestStoreData> as HostWithStore<_>>::debug_port)
+        }))
+        .unwrap()
+        .unwrap();
+        assert!(none_port.is_none());
+
+        // 2. `INPUT`-only authority gets READ right only; write and flush are refused.
+        let mut input_only = ProcessAuthority::empty();
+        input_only.grant_terminal_rights(TerminalAuthorityRights::INPUT);
+        let mut input_store = Store::new(&engine, store_data_authorized(input_only, |_| {}));
+        block_on(input_store.run_concurrent(async |accessor| {
+            let port = accessor
+                .with(<HasSelf<TestStoreData> as HostWithStore<_>>::debug_port)
+                .unwrap()
+                .expect("INPUT authority must obtain a read-only serial port");
+            let rights = accessor
+                .with(|access| {
+                    <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::rights(
+                        access,
+                        Resource::new_borrow(port.rep()),
+                    )
+                })
+                .unwrap();
+            assert_eq!(rights, SerialRights::READ);
+            assert!(
+                <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::write(
+                    accessor,
+                    Resource::new_borrow(port.rep()),
+                    b"blocked".to_vec(),
+                )
+                .await
+                .is_err(),
+                "INPUT-only serial port must refuse write"
+            );
+            assert!(
+                accessor
+                    .with(|access| {
+                        <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::flush(
+                            access,
+                            Resource::new_borrow(port.rep()),
+                        )
+                    })
+                    .is_err(),
+                "INPUT-only serial port must refuse flush"
+            );
+            accessor
+                .with(|access| {
+                    <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::drop(access, port)
+                })
+                .unwrap();
+        }))
+        .unwrap();
+
+        // 3. `OUTPUT`-only authority gets WRITE | FLUSH only; read is refused, write & flush succeed.
+        let mut output_only = ProcessAuthority::empty();
+        output_only.grant_terminal_rights(TerminalAuthorityRights::OUTPUT);
+        let mut output_store = Store::new(&engine, store_data_authorized(output_only, |_| {}));
+        block_on(output_store.run_concurrent(async |accessor| {
+            let port = accessor
+                .with(<HasSelf<TestStoreData> as HostWithStore<_>>::debug_port)
+                .unwrap()
+                .expect("OUTPUT authority must obtain a write-only serial port");
+            let rights = accessor
+                .with(|access| {
+                    <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::rights(
+                        access,
+                        Resource::new_borrow(port.rep()),
+                    )
+                })
+                .unwrap();
+            assert_eq!(rights, SerialRights::WRITE | SerialRights::FLUSH);
+            assert!(
+                <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::read(
+                    accessor,
+                    Resource::new_borrow(port.rep()),
+                    16,
+                )
+                .await
+                .is_err(),
+                "OUTPUT-only serial port must refuse read"
+            );
+            <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::write(
+                accessor,
+                Resource::new_borrow(port.rep()),
+                b"ok".to_vec(),
+            )
+            .await
+            .expect("OUTPUT-only serial port must allow write");
+            accessor
+                .with(|access| {
+                    <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::flush(
+                        access,
+                        Resource::new_borrow(port.rep()),
+                    )
+                })
+                .expect("OUTPUT-only serial port must allow flush");
+            accessor
+                .with(|access| {
+                    <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::drop(access, port)
+                })
+                .unwrap();
+        }))
+        .unwrap();
+
+        // 4. `INPUT | OUTPUT` gets READ | WRITE | FLUSH.
+        let mut both = ProcessAuthority::empty();
+        both.grant_terminal_rights(
+            TerminalAuthorityRights::INPUT | TerminalAuthorityRights::OUTPUT,
+        );
+        let mut both_store = Store::new(&engine, store_data_authorized(both, |_| {}));
+        block_on(both_store.run_concurrent(async |accessor| {
+            let port = accessor
+                .with(<HasSelf<TestStoreData> as HostWithStore<_>>::debug_port)
+                .unwrap()
+                .expect("INPUT | OUTPUT authority must obtain a full serial port");
+            let rights = accessor
+                .with(|access| {
+                    <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::rights(
+                        access,
+                        Resource::new_borrow(port.rep()),
+                    )
+                })
+                .unwrap();
+            assert_eq!(
+                rights,
+                SerialRights::READ | SerialRights::WRITE | SerialRights::FLUSH
+            );
+            accessor
+                .with(|access| {
+                    <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::drop(access, port)
+                })
+                .unwrap();
+        }))
+        .unwrap();
     }
 }

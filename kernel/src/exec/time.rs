@@ -305,7 +305,7 @@ mod tests {
     }
 
     impl ComponentRuntimeState for TestRuntimeState {
-        fn release_snapshot_hold(&self) {}
+        fn release_snapshot_hold(&self, _: u64) {}
 
         fn uptime_nanos(&self, current_ticks: u64) -> u64 {
             current_ticks

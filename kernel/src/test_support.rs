@@ -726,7 +726,7 @@ impl crate::component::ComponentRuntimeState for TestRuntimeState {
         }
     }
 
-    fn release_snapshot_hold(&self) {}
+    fn release_snapshot_hold(&self, _: u64) {}
 }
 
 /// A network interface that moves no frames and does nothing but report

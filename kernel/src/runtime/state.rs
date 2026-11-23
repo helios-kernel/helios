@@ -55,9 +55,12 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// This boot's Ed25519 machine identity key, settled alongside the
     /// compiler-signing key from the measured-boot or ephemeral seed.
     machine_identity: Once<crate::MachineIdentityKey>,
-    /// True while a `snapshot-hold` resource holds the 9p share quiet
-    /// for a VM snapshot.
-    snapshot_hold_active: AtomicBool,
+    /// Nonzero token of the active `snapshot-hold` keeping the 9p share quiet
+    /// for a VM snapshot, or `0` when no hold is in force.
+    snapshot_hold_token: AtomicU64,
+    /// Monotonic token generator for `snapshot_hold_token` (starts at `1`;
+    /// skips `0` on wrap).
+    next_snapshot_hold_token: AtomicU64,
     /// Nanoseconds between the monotonic clock and wall time, as the
     /// platform's real-time clock last set them: at bring-up, and again
     /// after each machine restore. Unseeded on a machine that carries no
@@ -363,7 +366,8 @@ where
                 root_entropy: Once::new(),
                 machine_generation: Once::new(),
                 machine_identity: Once::new(),
-                snapshot_hold_active: AtomicBool::new(false),
+                snapshot_hold_token: AtomicU64::new(0),
+                next_snapshot_hold_token: AtomicU64::new(1),
                 wall_clock: crate::exec::WallClock::new(),
                 http_client: PerProcessorProvider::new(),
                 host_fs_service: Mutex::new(None),
@@ -1045,16 +1049,27 @@ where
     pub async fn prepare_snapshot_hold(
         &self,
     ) -> Result<SnapshotHold<ProgramService, NetworkService, StorageImpl>, SnapshotHoldBusy> {
+        let mut token = self
+            .inner
+            .next_snapshot_hold_token
+            .fetch_add(1, Ordering::Relaxed);
+        if token == 0 {
+            token = self
+                .inner
+                .next_snapshot_hold_token
+                .fetch_add(1, Ordering::Relaxed);
+        }
         if self
             .inner
-            .snapshot_hold_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .snapshot_hold_token
+            .compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return Err(SnapshotHoldBusy);
         }
         let hold = SnapshotHold {
             state: self.clone(),
+            token,
             active: true,
         };
         if let Some(host_fs) = self.host_fs_service() {
@@ -1392,8 +1407,8 @@ where
         crate::retire_queued_handles(retired, &service);
     }
 
-    fn release_snapshot_hold(&self) {
-        self.finish_snapshot_hold();
+    fn release_snapshot_hold(&self, token: u64) {
+        self.finish_snapshot_hold(token);
     }
 
     fn uptime_nanos(&self, current_ticks: u64) -> u64 {
@@ -1471,13 +1486,19 @@ where
 impl<ProgramService, NetworkService, StorageImpl: Storage>
     RuntimeState<ProgramService, NetworkService, StorageImpl>
 {
-    /// Releases an active snapshot hold and reopens the 9p host share.
-    /// Idempotent when no hold is active.
-    pub fn finish_snapshot_hold(&self) {
+    /// Releases the snapshot hold identified by `token` and reopens the 9p
+    /// host share. Stale tokens (such as a pre-restore hold dropped after a
+    /// VM restore cleared the gate) are ignored so they can never cancel a
+    /// newer hold.
+    pub fn finish_snapshot_hold(&self, token: u64) {
+        if token == 0 {
+            return;
+        }
         if self
             .inner
-            .snapshot_hold_active
-            .swap(false, Ordering::AcqRel)
+            .snapshot_hold_token
+            .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
         {
             let host_fs = self.inner.host_fs_service.lock().clone();
             if let Some(host_fs) = host_fs {
@@ -1486,8 +1507,16 @@ impl<ProgramService, NetworkService, StorageImpl: Storage>
         }
     }
 
+    /// Clears any pre-snapshot hold token after a VM restore advances the
+    /// machine generation (`reset_host_share` has already re-attached the
+    /// host share). Any surviving pre-restore hold carries an older token
+    /// and becomes a no-op on drop.
+    pub fn clear_snapshot_hold_on_restore(&self) {
+        self.inner.snapshot_hold_token.store(0, Ordering::Release);
+    }
+
     pub fn snapshot_hold_active(&self) -> bool {
-        self.inner.snapshot_hold_active.load(Ordering::Acquire)
+        self.inner.snapshot_hold_token.load(Ordering::Acquire) != 0
     }
 }
 
@@ -1500,6 +1529,7 @@ pub struct SnapshotHoldBusy;
 #[must_use = "dropping a SnapshotHold reopens the host-share gate"]
 pub struct SnapshotHold<ProgramService, NetworkService, StorageImpl: Storage> {
     state: RuntimeState<ProgramService, NetworkService, StorageImpl>,
+    token: u64,
     active: bool,
 }
 
@@ -1510,6 +1540,11 @@ where
     NetworkService: Clone,
     StorageImpl: Storage,
 {
+    /// Monotonic hold token identifying this specific lease.
+    pub const fn token(&self) -> u64 {
+        self.token
+    }
+
     /// Whether this boot exposes a VM generation ID window so a snapshot
     /// restore can tell itself apart from the continuing machine.
     pub fn has_generation_id(&self) -> bool {
@@ -1529,7 +1564,7 @@ impl<ProgramService, NetworkService, StorageImpl: Storage> Drop
 {
     fn drop(&mut self) {
         if self.active {
-            self.state.finish_snapshot_hold();
+            self.state.finish_snapshot_hold(self.token);
         }
     }
 }

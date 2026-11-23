@@ -479,8 +479,8 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
     fn retire_network_handles(&self, retired: &super::SocketRetirementQueue);
 
     /// Reopens the host-share snapshot gate when a dying store still held an
-    /// active `snapshot-hold` resource.
-    fn release_snapshot_hold(&self);
+    /// active `snapshot-hold` resource identified by `token`.
+    fn release_snapshot_hold(&self, token: u64);
 }
 
 pub(crate) struct ComponentExecutionContext<FileSystem> {

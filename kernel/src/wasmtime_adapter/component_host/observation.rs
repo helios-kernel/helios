@@ -727,4 +727,78 @@ mod observation_authority_tests {
         );
         assert_eq!(metric_samples(&holder, &any_metric(), 0).len(), 2);
     }
+
+    #[test]
+    fn sampling_session_enforces_exclusivity_and_stops_on_explicit_drop_or_store_teardown() {
+        let engine = crate::wasmtime_adapter::engine::build_component_engine_for_platform(
+            &crate::test_support::TestCpu::with_entropy(0x55),
+        )
+        .unwrap();
+
+        let mut control_auth = ProcessAuthority::empty();
+        control_auth.grant_diagnostic_rights(DiagnosticAuthorityRights::CONTROL);
+        let data = store_data_authorized(control_auth, |state| {
+            state
+                .instruction_sampler()
+                .install_capture(crate::SampleCapture {
+                    period_nanos: 1_000_000,
+                    kernel_image_base: 0,
+                });
+        });
+        let sampler = data.runtime_state.instruction_sampler().clone();
+        let mut store = wasmtime::Store::new(&engine, data);
+
+        // 1. Start sampling and push the RAII resource into the component's table.
+        let session = start_instruction_sampling(store.data())
+            .expect("diagnostics.control with installed capture must start sampling");
+        let handle = store
+            .data_mut()
+            .table
+            .push(session)
+            .expect("table push succeeds");
+        assert!(sampler.sampling());
+
+        // 2. Concurrent second start returns `Busy`.
+        assert!(matches!(
+            start_instruction_sampling(store.data()),
+            Err(Refused::Failed(InstructionProfileError::Busy))
+        ));
+
+        // 3. Explicit resource drop stops sampling immediately.
+        let removed = store
+            .data_mut()
+            .table
+            .delete(handle)
+            .expect("table delete succeeds");
+        drop(removed);
+        assert!(
+            !sampler.sampling(),
+            "dropping ComponentSamplingSession must stop instruction sampling"
+        );
+
+        // 4. Re-acquire and drop the entire `Store` WITHOUT explicit resource drop
+        //    (simulating guest trap/condemnation while holding the lease).
+        let leaked = start_instruction_sampling(store.data())
+            .expect("re-acquiring after explicit drop must succeed");
+        let _leaked_handle = store
+            .data_mut()
+            .table
+            .push(leaked)
+            .expect("table push succeeds");
+        assert!(sampler.sampling());
+
+        drop(store);
+        assert!(
+            !sampler.sampling(),
+            "store teardown with an open ComponentSamplingSession must stop sampling"
+        );
+
+        // 5. Sampler is available again for a fresh session.
+        let next = sampler
+            .start_sampling()
+            .expect("sampler must accept a new session after store teardown");
+        assert!(sampler.sampling());
+        drop(next);
+        assert!(!sampler.sampling());
+    }
 }

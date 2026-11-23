@@ -153,6 +153,7 @@ where
             host_fs.after_machine_restore(restore).await;
             tracing::info!(?restore, "machine restored: host share reset");
         }
+        self.runtime_state.clear_snapshot_hold_on_restore();
     }
 
     async fn revalidate_lease(&mut self) {

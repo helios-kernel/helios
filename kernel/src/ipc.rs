@@ -113,7 +113,9 @@ impl IpcEndpointInner {
 
     fn close_both(&self) {
         self.close_write();
-        let _ = self.reader.lock().take();
+        if let Some(reader) = self.reader.lock().take() {
+            reader.close();
+        }
     }
 }
 
@@ -335,6 +337,61 @@ mod tests {
             futures_lite::future::block_on(left.write(b"orphan")),
             Err(IpcError::Closed)
         );
+    }
+
+    #[test]
+    fn dropping_endpoint_wakes_parked_local_reader_clone_and_backpressured_peer_writer() {
+        // Case 1: parked local `IpcEndpointRef::read` wakes with EOF when the
+        // owning `IpcEndpoint` drops even though the read future cloned `ByteReader`.
+        let (left, right) = ipc_channel();
+        let left_ref = left.shared();
+        let reader_waker = Arc::new(CountingWaker::default());
+        let waker = Waker::from(reader_waker.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut read_fut = pin!(left_ref.read(64));
+        assert_eq!(read_fut.as_mut().poll(&mut cx), Poll::Pending);
+
+        drop(left);
+        assert!(
+            reader_waker.wakes() >= 1,
+            "closing the endpoint must wake its own parked read future"
+        );
+        assert_eq!(read_fut.as_mut().poll(&mut cx), Poll::Ready(Ok(None)));
+        assert_eq!(
+            futures_lite::future::block_on(right.write(b"after-drop")),
+            Err(IpcError::Closed)
+        );
+        drop(right);
+
+        // Case 2: a backpressured peer `write` wakes with `IpcError::Closed`
+        // when the receiver `IpcEndpoint` drops while a local `IpcEndpointRef::read`
+        // holds a live `ByteReader` clone.
+        let (rx_end, tx_end) = ipc_channel();
+        let rx_ref = rx_end.shared();
+        // Hold a parked read future on an initially empty channel? No: first park
+        // the peer writer on a full queue while a live `ByteReader` clone exists
+        // inside a second future, then drop `rx_end`.
+        let payload = vec![0x3c_u8; IPC_MAX_CHUNK_BYTES * 260];
+        let writer_waker = Arc::new(CountingWaker::default());
+        let w_waker = Waker::from(writer_waker.clone());
+        let mut w_cx = Context::from_waker(&w_waker);
+        let mut write_fut = pin!(tx_end.write(&payload));
+        assert_eq!(write_fut.as_mut().poll(&mut w_cx), Poll::Pending);
+
+        // Also hold a cloned `ByteReader` via `rx_end.inner` (simulating an in-flight
+        // `IpcEndpointRef::read` task that cloned `ByteReader` before `rx_end` dropped).
+        let extra_reader_clone = rx_end.inner.reader.lock().clone().expect("reader is open");
+        drop(rx_end);
+        assert!(
+            writer_waker.wakes() >= 1,
+            "closing the endpoint must wake a backpressured peer writer even with live reader clones"
+        );
+        assert_eq!(
+            write_fut.as_mut().poll(&mut w_cx),
+            Poll::Ready(Err(IpcError::Closed))
+        );
+        assert_eq!(futures_lite::future::block_on(rx_ref.read(64)), Ok(None));
+        drop(extra_reader_clone);
     }
 
     #[test]

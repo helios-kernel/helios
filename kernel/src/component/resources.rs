@@ -21,14 +21,20 @@ pub struct ComponentSamplingSession(pub crate::SamplingSession);
 /// marks [`crate::SnapshotRetirementSender`], which [`crate::StoreSocketRetirement`]
 /// drains right after the resource table drops.
 pub struct ComponentSnapshotHold {
+    token: u64,
     has_generation_id: bool,
     retirement: crate::SnapshotRetirementSender,
     released: bool,
 }
 
 impl ComponentSnapshotHold {
-    pub fn new(has_generation_id: bool, retirement: crate::SnapshotRetirementSender) -> Self {
+    pub fn new(
+        token: u64,
+        has_generation_id: bool,
+        retirement: crate::SnapshotRetirementSender,
+    ) -> Self {
         Self {
+            token,
             has_generation_id,
             retirement,
             released: false,
@@ -39,12 +45,12 @@ impl ComponentSnapshotHold {
         self.has_generation_id
     }
 
-    pub fn release_now(&mut self) -> bool {
+    pub fn release_now(&mut self) -> Option<u64> {
         if self.released {
-            return false;
+            return None;
         }
         self.released = true;
-        true
+        Some(self.token)
     }
 }
 
@@ -52,7 +58,7 @@ impl Drop for ComponentSnapshotHold {
     fn drop(&mut self) {
         if !self.released {
             self.released = true;
-            self.retirement.mark_released();
+            self.retirement.mark_released(self.token);
         }
     }
 }
