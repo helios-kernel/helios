@@ -101,7 +101,7 @@ pub use service::{
     BlobHandle, ChildExit, ChildHandle, ClientImageSurfaceHandle, ClientSurfaceHandle,
     CommandBufferHandle, ContainerHandle, ContextHandle, DisplayHandle, GpuHandle,
     InputDeviceHandle, PlaybackHandle, SurfaceHandle, UserProgramService,
-    install_component_host_program_service, install_program_service,
+    install_component_host_program_service, install_program_service, launch_boot_init,
     run_component_host_processor_forever, run_embedded_component_forever,
     run_program_workers_forever,
 };
@@ -2725,6 +2725,10 @@ where
     } = host;
 
     let component_name = component.name();
+    // Wait for the payload's boot `init` to finish its mounts, console
+    // banner, and `/etc/rc` before emitting debugger stage markers or
+    // claiming the serial line for RPC framing.
+    debug_state.wait_for_boot_init().await;
     let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu.clone());
 
     write_serial.emit_stage_marker("engine:new");

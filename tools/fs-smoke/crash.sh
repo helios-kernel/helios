@@ -46,11 +46,12 @@ boot() {
     --disk "$runtime/image.btrfs,serial=btrfs-smoke" \
     --shared-dir "$runtime/share" --shared-dir-writable \
     --boot-program dash --boot-program debugger \
-    --boot-program ls --boot-program cat --boot-program init --boot-program python3 \
+    --boot-program ls --boot-program cat --boot-program python3 \
     --no-compiler-plugin \
     "$@" \
-    shell -c init 2>&1 > "$runtime/$name.out" | tee "$runtime/$name.log"
+    shell -c true 2>&1 > "$runtime/$name.out" | tee "$runtime/$name.log"
   boot_status="${PIPESTATUS[0]}"
+  sed '/^\[KDBG run:begin\]$/q' "$runtime/$name/debug-serial.log" | tr -d '\r' > "$runtime/$name-boot.out"
   set -e
 }
 
@@ -58,11 +59,12 @@ boot() {
 printf 'burst %s\n' "$seed" > "$runtime/share/phase"
 boot burst --kill-after-lines "$ledger:$kill_lines"
 cat "$runtime/burst.out"
+cat "$runtime/burst-boot.out"
 grep -Fq 'kill-after-lines: SIGKILL sent to QEMU' "$runtime/burst.out"
 test "$boot_status" -ne 0
 # The kill is what ended the session: a burst that ran to its end was not
 # interrupted at all.
-if grep -Fq 'btrfs-crash:completed' "$runtime/burst.out"; then
+if grep -Fq 'btrfs-crash:completed' "$runtime/burst-boot.out"; then
   echo 'btrfs-crash: the burst finished before the kill landed' >&2
   exit 1
 fi
@@ -83,9 +85,10 @@ trap - EXIT
 # Boot 2: the same image, the same ledger, read back by the guest.
 printf 'verify\n' > "$runtime/share/phase"
 boot verify
-cat "$runtime/verify.out"
+cat "$runtime/verify-boot.out"
 test "$boot_status" -eq 0
-verified="$(sed -n 's/^btrfs-crash:guest-verified //p' "$runtime/verify.out")"
+grep -Fqx 'helios init: online root=/' "$runtime/verify-boot.out"
+verified="$(sed -n 's/^btrfs-crash:guest-verified //p' "$runtime/verify-boot.out")"
 test "$verified" -eq "$(python3 -I "$script" count "$ledger")"
 btrfs check --readonly "$runtime/image.btrfs" 2>&1 | tee "$runtime/btrfs-check-rebooted.log"
 echo "btrfs-crash: seed=$seed ok, $verified synced files intact on Linux and Helios"

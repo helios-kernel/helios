@@ -330,7 +330,11 @@ where
             })?;
             Ok(FrameAction::Dispatch(invocation, request))
         }
-        Frame::Accept { .. } | Frame::Reject { .. } => Err(DispatchError::protocol(
+        Frame::Accept { .. }
+        | Frame::Reject { .. }
+        | Frame::Credit { .. }
+        | Frame::ResourceDrop { .. }
+        | Frame::Fault { .. } => Err(DispatchError::protocol(
             "unexpected control frame on the debugger request stream",
         )),
     }

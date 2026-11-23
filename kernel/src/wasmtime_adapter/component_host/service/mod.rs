@@ -70,6 +70,8 @@ mod stdin_inheritance_tests;
 #[cfg(feature = "linux")]
 use linux::*;
 #[cfg(test)]
+mod boot_init_tests;
+#[cfg(test)]
 mod child_exit_tests;
 
 use super::*;
@@ -895,6 +897,190 @@ fn spawn_instruction_sample_drain<CpuImpl, Net, StorageImpl, WatchdogImpl, Measu
     });
 }
 
+struct BootInitCompletionGuard<CpuImpl, Net, StorageImpl>(
+    HostRuntimeState<CpuImpl, Net, StorageImpl>,
+)
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage;
+
+impl<CpuImpl, Net, StorageImpl> Drop for BootInitCompletionGuard<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn drop(&mut self) {
+        self.0.mark_boot_init_completed();
+    }
+}
+
+/// Selects stdio routing for the payload's boot `init` component.
+///
+/// When a system component (`bin/debugger`) is provisioned, `init`'s
+/// standard output and error still write to the debug UART as line-framed
+/// console segments before the debugger enters `wasi:cli/run`, while
+/// standard input stays closed so `init` never consumes incoming bytes
+/// meant for the debugger's serial RPC transport. Without a system
+/// component, `init` owns the full serial console when the platform
+/// exposes a debug UART, and falls back to observer trace output on
+/// platforms with no UART.
+pub(crate) fn boot_init_output_mode(
+    has_debug_serial: bool,
+    has_system_component: bool,
+) -> OutputMode {
+    if !has_debug_serial {
+        OutputMode::Trace
+    } else if has_system_component {
+        OutputMode::RoutedChild {
+            stdin: crate::ComponentInputRoute::Closed,
+            stdout: crate::ComponentOutputRoute::Serial,
+            stderr: crate::ComponentOutputRoute::Serial,
+        }
+    } else {
+        OutputMode::Serial
+    }
+}
+
+/// Schedules the payload's `EmbeddedInit::component()` to run on the
+/// calling bootstrap processor.
+///
+/// Shared across every backend (`aarch64`, `riscv`, `x86`, `hosted`) so
+/// bare-metal and hosted boots run the same bring-up orchestration, with
+/// or without `embedded-debugger`.
+pub fn launch_boot_init<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
+    cpu: &CpuImpl,
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    debug_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
+    read_serial: crate::SerialReader,
+    write_serial: crate::DebugSerialWriter,
+    has_system_component: bool,
+) where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+    WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
+{
+    let service = debug_state
+        .program_service()
+        .expect("program service must be installed before launching boot init");
+    debug_state.mark_boot_init_launched();
+    let completion = BootInitCompletionGuard(debug_state.clone());
+    let output_mode =
+        boot_init_output_mode(kernel.devices().has_debug_serial, has_system_component);
+    let exec_context = ProgramExecContext {
+        cpu: cpu.clone(),
+        timer: kernel.timer(),
+        spawner: kernel.spawner(),
+        runtime_state: debug_state.clone(),
+        instance_registry: debug_state.instance_registry(),
+        parent_instance_id: None,
+        read_serial,
+        write_serial,
+    };
+    let debug_state = debug_state.clone();
+    kernel.spawn_local_detached(async move {
+        let _completion = completion;
+        run_boot_init(service, exec_context, debug_state, output_mode).await;
+    });
+}
+
+async fn run_boot_init<CpuImpl, Net, StorageImpl>(
+    service: UserProgramService<CpuImpl, Net, StorageImpl>,
+    exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
+    debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
+    output_mode: OutputMode,
+) where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let init = debug_state.embedded_init();
+    let component = init.component();
+    let component_name = component.name();
+    let argv0 = init.argv0();
+    tracing::info!(
+        component = component_name,
+        argv0,
+        "launching boot init component"
+    );
+    let authority = ProcessAuthority::root();
+    let spawn_authority = authority
+        .derive_spawn_authority()
+        .expect("root process authority grants spawn");
+    let compile_authority = CompileAuthority::from(&spawn_authority);
+    let source = ProgramSource::from_file(FileContents::Boot(component.bootfs_bytes()));
+    let launch = ProgramLaunch::new(
+        ProgramArgv::launched(argv0, Vec::new()),
+        Vec::new(),
+        authority,
+        None,
+    );
+    let child = match service
+        .spawn_with_output_mode(
+            &compile_authority,
+            exec_context,
+            source,
+            launch,
+            output_mode,
+            ChildStdio {
+                stdin: None,
+                stdout: None,
+                stderr: None,
+            },
+        )
+        .await
+    {
+        Ok(child) => child,
+        Err(error) => {
+            tracing::error!(
+                component = component_name,
+                argv0,
+                ?error,
+                "failed to launch boot init component"
+            );
+            return;
+        }
+    };
+
+    match child.wait().await {
+        Ok(exit) => match exit.termination {
+            helios_unix::ChildTermination::Exited(0) => {
+                tracing::info!(
+                    component = component_name,
+                    argv0,
+                    instance = exit.instance_id.raw(),
+                    "boot init component exited cleanly"
+                );
+            }
+            termination => {
+                tracing::error!(
+                    component = component_name,
+                    argv0,
+                    instance = exit.instance_id.raw(),
+                    ?termination,
+                    "boot init component exited unsuccessfully"
+                );
+            }
+        },
+        Err(error) => {
+            tracing::error!(
+                component = component_name,
+                argv0,
+                ?error,
+                "boot init component wait failed"
+            );
+        }
+    }
+
+    // Settle any writable mounts `init` created before its namespace
+    // dropped, so on-disk mutations from `/etc/rc` are durable before
+    // the system component opens inspector sessions.
+    debug_state.root_namespace().sync_writable_mounts().await;
+}
+
 pub fn run_embedded_component_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
     component: EmbeddedComponent,
     world: ComponentBindingSet,
@@ -912,6 +1098,14 @@ where
     MeasuredBootImpl: MeasuredBoot,
 {
     let component_name = component.name();
+    // Wait for the payload's boot `init` to complete before emitting any
+    // debugger stage markers or tracing records onto the shared serial
+    // console, so SMP boots never interleave debugger bring-up lines with
+    // `init` or `/etc/rc` output.
+    let wait_state = debug_state.clone();
+    kernel.run_local_future(async move {
+        wait_state.wait_for_boot_init().await;
+    });
     write_serial.emit_stage_marker("boot");
     write_serial.emit_stage_marker("component-host:trace-begin");
     tracing::info!(
@@ -1072,6 +1266,14 @@ where
     if helios_hal::cpu::current_processor() == topology.bootstrap_processor {
         crate::control_flow::ReturnAddressCoverage::of(&cpu, env!("HELIOS_BUILD_TARGET"))
             .log(topology.configured_processors);
+        launch_boot_init(
+            &cpu,
+            &kernel,
+            &debug_state,
+            read_serial,
+            write_serial,
+            debug_state.has_system_component(),
+        );
     }
     match component_host_processor_role(
         helios_hal::cpu::current_processor(),
