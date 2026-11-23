@@ -4,8 +4,8 @@ pub use super::bindings::helios::system::programs::{
     AotHint, AotRequest, AotResult, AuthorityScope, ClockGrant, ClockRight, DeviceClass,
     DeviceGrant, DiagnosticsGrant, DirectoryGrant, ExecError, ExecErrorKind, ExecOutput,
     ExecResult, FilesystemRight, InstanceId, LinkGrant, LinkRight, MachineGrant, MachineRight,
-    MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight, TerminalGrant,
-    TerminalRight,
+    MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight, SettingsGrant,
+    SettingsRight, TerminalGrant, TerminalRight,
 };
 
 /// Wire-serializable subset of `helios:system/programs.capability-grant` for
@@ -22,6 +22,7 @@ pub enum CapabilityGrant {
     Device(DeviceGrant),
     Diagnostics(DiagnosticsGrant),
     InstanceControl(AuthorityScope),
+    Settings(SettingsGrant),
     Machine(MachineGrant),
 }
 

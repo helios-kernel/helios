@@ -1204,6 +1204,7 @@ fn real_workspace_inspector_system_wit_world_generates_and_streams_child_stdio()
     impl programs::Handler for MockProgramsServer {
         type Child = MockChild;
         type Container = ();
+        type Endpoint = ();
 
         async fn child_stdin(
             &self,
@@ -1260,17 +1261,23 @@ fn real_workspace_inspector_system_wit_world_generates_and_streams_child_stdio()
 
         async fn create_container(
             &self,
-            _config: ContainerConfig,
+            _config: ContainerConfig<Self::Endpoint>,
         ) -> Result<Self::Container, SpawnError> {
             Ok(())
         }
 
-        async fn spawn(&self, request: SpawnRequest) -> Result<Self::Child, SpawnError> {
+        async fn spawn(
+            &self,
+            request: SpawnRequest<Self::Endpoint>,
+        ) -> Result<Self::Child, SpawnError> {
             assert_eq!(request.name, "nu");
             Ok(MockChild { id: 42 })
         }
 
-        async fn exec(&self, _request: ExecRequest) -> Result<ExecResult, ExecError> {
+        async fn exec(
+            &self,
+            _request: ExecRequest<Self::Endpoint>,
+        ) -> Result<ExecResult, ExecError> {
             Ok(ExecResult {
                 instance_id: 1,
                 exit_code: 0,

@@ -171,6 +171,7 @@ mod guest {
                         host_programs::instance_control_grant(
                             host_programs::AuthorityScope::Machine,
                         ),
+                        host_programs::write_settings_grant(),
                         host_programs::machine_control_grant(),
                     ],
                 })
