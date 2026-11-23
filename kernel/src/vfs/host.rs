@@ -294,6 +294,9 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
     }
 
     async fn read_at(&self, path: FsPath<'_>, offset: u64, max_bytes: usize) -> FsResult<Bytes> {
+        if max_bytes == 0 {
+            return Ok(Bytes::new());
+        }
         let max_bytes = u32::try_from(max_bytes).unwrap_or(u32::MAX);
         self.client
             .read_file_range(host_path(path), offset, max_bytes)
@@ -628,5 +631,159 @@ mod tests {
                 gid: 5678,
             }
         );
+    }
+
+    #[test]
+    fn read_all_gathers_chunked_host_reads_without_zero_length_tail() {
+        use alloc::string::String;
+        use alloc::vec::Vec;
+        use helios_hal::fs::{FileSystem as _, FsPath, WritePosition};
+
+        use super::{HostCreation, HostFileSystem, HostShare};
+        use crate::runtime::{HostDirEntry, HostDirLimit, HostShareRestore};
+
+        #[derive(Clone)]
+        struct ChunkedHost {
+            data: Vec<u8>,
+            chunk_limit: usize,
+        }
+
+        impl HostFileSystem for ChunkedHost {
+            type Write = core::convert::Infallible;
+
+            fn cache_stats(&self) -> Option<crate::HostFsCacheStats> {
+                None
+            }
+            async fn after_machine_restore(&self, _restore: HostShareRestore) {}
+            async fn prepare_snapshot(&self) {}
+            fn snapshot_finished(&self) {}
+            async fn stat_path(&self, _path: &str) -> Result<HostMetadata, HostFsError> {
+                let mut meta = host_metadata(
+                    ObjectIdentity::new(AuthorityDomain::HOST_SHARE_9P, 88),
+                    0,
+                    0o100_644,
+                );
+                meta.size = self.data.len() as u64;
+                Ok(meta)
+            }
+            async fn read_dir(
+                &self,
+                _path: &str,
+                _limit: HostDirLimit,
+            ) -> Result<Vec<HostDirEntry>, HostFsError> {
+                unreachable!()
+            }
+            async fn read_file(&self, _path: &str) -> Result<Vec<u8>, HostFsError> {
+                unreachable!()
+            }
+            async fn read_file_range(
+                &self,
+                _path: &str,
+                offset: u64,
+                max_bytes: u32,
+            ) -> Result<Vec<u8>, HostFsError> {
+                assert_ne!(
+                    max_bytes, 0,
+                    "read_all / HostShare::read_at must never issue a zero-length 9p read"
+                );
+                let start = offset as usize;
+                let len = (max_bytes as usize)
+                    .min(self.chunk_limit)
+                    .min(self.data.len() - start);
+                Ok(self.data[start..start + len].to_vec())
+            }
+            async fn prepare_write(
+                &self,
+                _path: &str,
+                _position: WritePosition,
+                _len: usize,
+            ) -> Result<Self::Write, HostFsError> {
+                unreachable!()
+            }
+            async fn sync_file(&self, _path: &str) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn truncate_file(&self, _path: &str) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn set_file_size(&self, _path: &str, _size: u64) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn set_times(
+                &self,
+                _path: &str,
+                _access_nanos: Option<u64>,
+                _modified_nanos: Option<u64>,
+            ) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn create_file(
+                &self,
+                _path: &str,
+                _creation: HostCreation,
+            ) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn create_directory(
+                &self,
+                _path: &str,
+                _creation: HostCreation,
+            ) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn remove(&self, _path: &str, _directory: bool) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn rename(&self, _source: &str, _destination: &str) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn hard_link(
+                &self,
+                _source: &str,
+                _destination: &str,
+            ) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn symlink(
+                &self,
+                _target: &str,
+                _link_path: &str,
+                _gid: u32,
+            ) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn read_link(&self, _path: &str) -> Result<String, HostFsError> {
+                unreachable!()
+            }
+        }
+
+        let empty = HostShare::new(ChunkedHost {
+            data: Vec::new(),
+            chunk_limit: 4,
+        });
+        let got_empty = futures_lite::future::block_on(crate::vfs::read_all(
+            &empty,
+            FsPath::new("empty").unwrap(),
+        ))
+        .expect("empty read_all");
+        assert!(got_empty.is_empty());
+
+        let expected: Vec<u8> = (0u8..12).collect();
+        let multi = HostShare::new(ChunkedHost {
+            data: expected.clone(),
+            chunk_limit: 4,
+        });
+        let got_multi = futures_lite::future::block_on(crate::vfs::read_all(
+            &multi,
+            FsPath::new("multi").unwrap(),
+        ))
+        .expect("multi-chunk read_all");
+        assert_eq!(got_multi.as_ref(), expected.as_slice());
+
+        // Direct zero-length `HostShare::read_at` must also short-circuit cleanly.
+        let zero =
+            futures_lite::future::block_on(multi.read_at(FsPath::new("multi").unwrap(), 12, 0))
+                .expect("zero-length read_at");
+        assert!(zero.is_empty());
     }
 }

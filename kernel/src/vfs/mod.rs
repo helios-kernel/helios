@@ -1799,15 +1799,18 @@ pub(crate) async fn read_all<F: FileSystem>(fs: &F, path: FsPath<'_>) -> FsResul
     let metadata = fs.stat(path).await?;
     metadata.kind.require_regular()?;
     let size = usize::try_from(metadata.size).map_err(|_| FsError::Overflow)?;
+    if size == 0 {
+        return Ok(Bytes::new());
+    }
     let first = fs.read_at(path, 0, size).await?;
-    if first.len() == size {
+    if first.len() >= size {
         return Ok(first);
     }
     // A filesystem may answer in pieces (9p bounds one read by its
     // message size): gather the rest.
     let mut gathered = BytesMut::with_capacity(size);
     gathered.extend_from_slice(&first);
-    loop {
+    while gathered.len() < size {
         let chunk = fs
             .read_at(path, gathered.len() as u64, size - gathered.len())
             .await?;

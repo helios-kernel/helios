@@ -2517,7 +2517,7 @@ pub(crate) async fn sendfile<
                     }
                 }
             }
-            Descriptor::<R>::PipeWrite { writer } => {
+            Descriptor::<R>::PipeWrite { writer, .. } => {
                 let len = chunk.len();
                 if out_nonblocking {
                     match writer.try_write(chunk) {
@@ -2576,7 +2576,7 @@ pub(crate) async fn sendfile<
                 }
             },
             Descriptor::<R>::File(out_open) => {
-                let creds = process.shared.credentials.lock().clone();
+                let creds = process.credentials.lock().clone();
                 let landed = {
                     let mut out_pos = out_open.lock_position().await;
                     let pos = WritePosition::At(out_pos.get());

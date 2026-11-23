@@ -1045,3 +1045,75 @@ fn inherited_stdin_carry_is_delivered_before_requesting_more_input() {
     memory.read(0x2000, &mut out).unwrap();
     assert_eq!(out, "中文 日本語 한국어".as_bytes());
 }
+
+#[test]
+fn clone_thread_gives_child_independent_credentials_copy() {
+    for abi in [Abi::X86_64, Abi::Aarch64] {
+        let mut main = Process::new(abi, NonZeroU32::new(1).unwrap(), PROGRAM_BREAK);
+        let mut memory = SharedMemory::new(0x10_000);
+        let mut main_thread = HostThread::new();
+        let mut platform = Platform::default();
+
+        let flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+        let tid = match drive(dispatch(
+            &mut main,
+            Call {
+                number: number(abi, Operation::Clone),
+                arguments: [flags, 0x8000, 0, 0, 0, 0],
+            },
+            &mut memory,
+            &mut main_thread,
+            &mut platform,
+        )) {
+            ControlFlow::Continue(value) => value,
+            other => panic!("unexpected clone outcome: {other:?}"),
+        };
+        assert_eq!(tid, 2);
+        let (mut child, _) = main_thread.spawned.pop().expect("spawned child thread");
+        let mut child_thread = HostThread::new();
+
+        // Raw `setresuid(-1, 1000, -1)` in the child thread updates only the
+        // child thread's credentials (`kernel/cred.c` `copy_creds`).
+        assert_eq!(
+            drive(dispatch(
+                &mut child,
+                Call {
+                    number: number(abi, Operation::Setresuid),
+                    arguments: [u32::MAX as u64, 1000, u32::MAX as u64, 0, 0, 0],
+                },
+                &mut memory,
+                &mut child_thread,
+                &mut platform,
+            )),
+            ControlFlow::Continue(0)
+        );
+        assert_eq!(
+            drive(dispatch(
+                &mut child,
+                Call {
+                    number: number(abi, Operation::Geteuid),
+                    arguments: [0; 6],
+                },
+                &mut memory,
+                &mut child_thread,
+                &mut platform,
+            )),
+            ControlFlow::Continue(1000)
+        );
+        assert_eq!(
+            drive(dispatch(
+                &mut main,
+                Call {
+                    number: number(abi, Operation::Geteuid),
+                    arguments: [0; 6],
+                },
+                &mut memory,
+                &mut main_thread,
+                &mut platform,
+            )),
+            ControlFlow::Continue(0)
+        );
+        assert_ne!(main.credentials_handle().lock().capabilities.effective, 0);
+        assert_eq!(child.credentials_handle().lock().capabilities.effective, 0);
+    }
+}

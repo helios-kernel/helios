@@ -304,6 +304,18 @@ impl PidNamespace {
         );
     }
 
+    /// Replaces the credential handle recorded for process `pid` (used when a
+    /// non-leader thread takes over as leader during `execve`).
+    pub(super) fn update_process_credentials(
+        &self,
+        pid: NonZeroU32,
+        credentials: Arc<spin::Mutex<Credentials>>,
+    ) {
+        if let Some(record) = self.inner.state.lock().processes.get_mut(&pid.get()) {
+            record.credentials = credentials;
+        }
+    }
+
     /// Marks `pid` as having completed `execve` (so its parent may no longer
     /// change its process group with `setpgid`).
     pub fn mark_execed(&self, pid: NonZeroU32) {
@@ -1146,15 +1158,19 @@ fn spawn_parsed_clone<R: Resources, M: UserMemory, T: Thread<R>>(
         .shared
         .signals
         .register_thread(tid, process.signals.current_mask());
-    process.shared.pids.register_thread(
-        process.pid(),
-        thread_signals.clone(),
-        process.shared.credentials.clone(),
-    );
+    // Child thread inherits a copy of the caller's credentials (`kernel/cred.c`
+    // `copy_creds`) so per-thread raw `setresuid`/`capset`/`prctl` syscalls do
+    // not mutate sibling threads.
+    let child_creds = Arc::new(spin::Mutex::new(process.credentials.lock().clone()));
+    process
+        .shared
+        .pids
+        .register_thread(process.pid(), thread_signals.clone(), child_creds.clone());
     let child = Process {
         shared: process.shared.clone(),
         tid,
         signals: thread_signals,
+        credentials: child_creds,
         clear_child_tid: if parsed.flags & CLONE_CHILD_CLEARTID != 0 {
             parsed.child_tid
         } else {

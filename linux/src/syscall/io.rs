@@ -67,17 +67,27 @@ pub(super) fn pipe<R: Resources, M: UserMemory>(
     args: [u64; 6],
     memory: &mut M,
     has_flags: bool,
+    uid: u32,
+    gid: u32,
 ) -> u64 {
     let flags = if has_flags { args[1] as u32 as u64 } else { 0 };
     if flags & !(CLOEXEC | O_NONBLOCK_LINUX) != 0 {
         return errno(EINVAL);
     }
     let (writer, reader) = byte_channel();
-    let read = insert::<R>(table, FileDescriptor::PipeRead { reader }, flags);
+    let inode = helios_unix::PipeInode::new(uid, gid);
+    let read = insert::<R>(
+        table,
+        FileDescriptor::PipeRead {
+            reader,
+            inode: inode.clone(),
+        },
+        flags,
+    );
     if read > i32::MAX as u64 {
         return read;
     }
-    let write = insert::<R>(table, FileDescriptor::PipeWrite { writer }, flags);
+    let write = insert::<R>(table, FileDescriptor::PipeWrite { writer, inode }, flags);
     if write > i32::MAX as u64 {
         let _ = table.close(read as i32);
         return write;
@@ -222,7 +232,7 @@ pub(super) async fn write_resource<R: Resources, M: UserMemory>(
                 }
             }
         }
-        FileDescriptor::PipeWrite { writer } => {
+        FileDescriptor::PipeWrite { writer, .. } => {
             let mut total = 0;
             let mut bytes = [0; 4096];
             while total < args[2].min(MAX_RW_COUNT) {
@@ -315,7 +325,7 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory>(
             }
             SyscallOutcome::Return(8)
         }
-        FileDescriptor::PipeRead { reader } => {
+        FileDescriptor::PipeRead { reader, .. } => {
             let limit = args[2].min(MAX_RW_COUNT) as usize;
             if memory.check_writable(args[1], limit).is_err() {
                 return SyscallOutcome::Return(errno(EFAULT));

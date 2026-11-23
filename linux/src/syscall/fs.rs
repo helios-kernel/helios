@@ -924,7 +924,7 @@ fn synthetic_dev_null_stat() -> FileStat {
 }
 
 fn process_creds<R: Resources>(process: &Process<R>) -> Credentials {
-    process.shared.credentials.lock().clone()
+    process.credentials.lock().clone()
 }
 
 /// Reads a NUL-terminated xattr name from user memory (`fs/xattr.c`: empty or
@@ -1080,35 +1080,36 @@ pub(super) async fn creat<R: Resources, M: UserMemory, F: Filesystem<R>>(
 }
 
 fn synthetic_stat<R: Resources, T: tty::Tty>(entry: &Entry<R>, tty: &T) -> FileStat {
-    let (kind, permissions) = match &entry.descriptor {
-        FileDescriptor::PipeRead { .. } | FileDescriptor::PipeWrite { .. } => {
-            (NodeKind::Fifo, 0o600)
+    let (kind, permissions, uid, gid) = match &entry.descriptor {
+        FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } => {
+            let attrs = inode.attrs();
+            (NodeKind::Fifo, attrs.mode, attrs.uid, attrs.gid)
         }
         FileDescriptor::Stdin { .. } => {
             if tty.is_tty(tty::TtyStream::Stdin) {
-                (NodeKind::CharacterDevice, 0o620)
+                (NodeKind::CharacterDevice, 0o620, 0, 0)
             } else {
-                (NodeKind::Fifo, 0o600)
+                (NodeKind::Fifo, 0o600, 0, 0)
             }
         }
         FileDescriptor::Stdout => {
             if tty.is_tty(tty::TtyStream::Stdout) {
-                (NodeKind::CharacterDevice, 0o620)
+                (NodeKind::CharacterDevice, 0o620, 0, 0)
             } else {
-                (NodeKind::Fifo, 0o600)
+                (NodeKind::Fifo, 0o600, 0, 0)
             }
         }
         FileDescriptor::Stderr => {
             if tty.is_tty(tty::TtyStream::Stderr) {
-                (NodeKind::CharacterDevice, 0o620)
+                (NodeKind::CharacterDevice, 0o620, 0, 0)
             } else {
-                (NodeKind::Fifo, 0o600)
+                (NodeKind::Fifo, 0o600, 0, 0)
             }
         }
-        FileDescriptor::NullDevice => (NodeKind::CharacterDevice, 0o666),
-        FileDescriptor::Socket(_) => (NodeKind::Socket, 0o777),
-        FileDescriptor::Event(_) | FileDescriptor::Epoll(_) => (NodeKind::File, 0o600),
-        FileDescriptor::File(_) | FileDescriptor::Preopen { .. } => (NodeKind::File, 0o644),
+        FileDescriptor::NullDevice => (NodeKind::CharacterDevice, 0o666, 0, 0),
+        FileDescriptor::Socket(_) => (NodeKind::Socket, 0o777, 0, 0),
+        FileDescriptor::Event(_) | FileDescriptor::Epoll(_) => (NodeKind::File, 0o600, 0, 0),
+        FileDescriptor::File(_) | FileDescriptor::Preopen { .. } => (NodeKind::File, 0o644, 0, 0),
     };
     FileStat {
         dev: 1,
@@ -1116,8 +1117,8 @@ fn synthetic_stat<R: Resources, T: tty::Tty>(entry: &Entry<R>, tty: &T) -> FileS
         kind,
         permissions,
         nlink: 1,
-        uid: 0,
-        gid: 0,
+        uid,
+        gid,
         rdev: 0,
         size: 0,
         access_nanos: 0,
@@ -2882,10 +2883,28 @@ pub(super) async fn fchmod<R: Resources, F: Filesystem<R>>(
     if entry.fdflags() & FDFLAG_PATH != 0 {
         return errno(EBADF);
     }
+    let creds = process_creds(process);
+    if let FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } =
+        &entry.descriptor
+    {
+        let attrs = inode.attrs();
+        let meta = permissions::InodeMeta {
+            kind: NodeKind::Fifo,
+            uid: attrs.uid,
+            gid: attrs.gid,
+            mode: attrs.mode,
+        };
+        return match permissions::check_chmod(&creds, meta, mode) {
+            Ok(new_mode) => {
+                inode.set_mode(new_mode);
+                0
+            }
+            Err(error) => fs_errno(error),
+        };
+    }
     let Some(open) = entry_file::<R>(&entry) else {
         return errno(EINVAL);
     };
-    let creds = process_creds(process);
     match fs.chmod_file(open.node(), mode, &creds).await {
         Ok(()) => 0,
         Err(error) => fs_errno(error),
@@ -2982,10 +3001,39 @@ pub(super) async fn fchown<R: Resources, F: Filesystem<R>>(
     if entry.fdflags() & FDFLAG_PATH != 0 {
         return errno(EBADF);
     }
+    let creds = process_creds(process);
+    if let FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } =
+        &entry.descriptor
+    {
+        let attrs = inode.attrs();
+        let meta = permissions::InodeMeta {
+            kind: NodeKind::Fifo,
+            uid: attrs.uid,
+            gid: attrs.gid,
+            mode: attrs.mode,
+        };
+        return match permissions::check_chown(&creds, meta, uid, gid) {
+            Ok(result) => {
+                let mut new_mode = attrs.mode;
+                if result.kill_privs {
+                    new_mode &= !permissions::S_ISUID;
+                    if new_mode & permissions::S_IXGRP != 0 {
+                        new_mode &= !permissions::S_ISGID;
+                    }
+                }
+                inode.set_owner_and_mode(
+                    result.uid.unwrap_or(attrs.uid),
+                    result.gid.unwrap_or(attrs.gid),
+                    new_mode,
+                );
+                0
+            }
+            Err(error) => fs_errno(error),
+        };
+    }
     let Some(open) = entry_file::<R>(&entry) else {
         return errno(EINVAL);
     };
-    let creds = process_creds(process);
     match fs.chown_file(open.node(), uid, gid, &creds).await {
         Ok(()) => 0,
         Err(error) => fs_errno(error),
@@ -3067,6 +3115,11 @@ pub(super) async fn setxattr_path<R: Resources, M: UserMemory, F: Filesystem<R>>
     if path.is_empty() {
         return errno(ENOENT);
     }
+    // `fs/xattr.c` `setxattr_copy`: validate `flags` before copying `name`.
+    let mode = match parse_xattr_flags(args[4] as u32 as u64) {
+        Ok(mode) => mode,
+        Err(err) => return err,
+    };
     let name = match read_xattr_name(memory, args[1]) {
         Ok(name) => name,
         Err(err) => return err,
@@ -3075,10 +3128,6 @@ pub(super) async fn setxattr_path<R: Resources, M: UserMemory, F: Filesystem<R>>
     if size > permissions::XATTR_SIZE_MAX as u64 {
         return errno(E2BIG);
     }
-    let mode = match parse_xattr_flags(args[4] as u32 as u64) {
-        Ok(mode) => mode,
-        Err(err) => return err,
-    };
     let mut value = alloc::vec![0u8; size as usize];
     if !value.is_empty() && memory.read(args[2], &mut value).is_err() {
         return errno(EFAULT);
@@ -3101,6 +3150,11 @@ pub(super) async fn fsetxattr<R: Resources, M: UserMemory, F: Filesystem<R>>(
     fs: &mut F,
 ) -> u64 {
     let fd = args[0] as u32 as i32;
+    // `fs/xattr.c` `setxattr_copy`: validate `flags` before copying `name`.
+    let mode = match parse_xattr_flags(args[4] as u32 as u64) {
+        Ok(mode) => mode,
+        Err(err) => return err,
+    };
     let name = match read_xattr_name(memory, args[1]) {
         Ok(name) => name,
         Err(err) => return err,
@@ -3109,10 +3163,6 @@ pub(super) async fn fsetxattr<R: Resources, M: UserMemory, F: Filesystem<R>>(
     if size > permissions::XATTR_SIZE_MAX as u64 {
         return errno(E2BIG);
     }
-    let mode = match parse_xattr_flags(args[4] as u32 as u64) {
-        Ok(mode) => mode,
-        Err(err) => return err,
-    };
     let mut value = alloc::vec![0u8; size as usize];
     if !value.is_empty() && memory.read(args[2], &mut value).is_err() {
         return errno(EFAULT);

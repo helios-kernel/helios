@@ -846,7 +846,9 @@ pub(super) fn p1_add_wait_target<CpuImpl, Net, StorageImpl>(
     store
         .descriptors
         .with(|descriptors| match descriptors.get(fd) {
-            Some(Preview1Descriptor::PipeRead { reader }) if event_type == P1_EVENTTYPE_FD_READ => {
+            Some(Preview1Descriptor::PipeRead { reader, .. })
+                if event_type == P1_EVENTTYPE_FD_READ =>
+            {
                 wait.notified.push(EpollWaitTarget::ByteReader {
                     reader: reader.clone(),
                     wait: reader.wait_state(),
@@ -872,7 +874,7 @@ pub(super) fn p1_add_wait_target<CpuImpl, Net, StorageImpl>(
                     wait.repoll = true;
                 }
             }
-            Some(Preview1Descriptor::PipeWrite { writer })
+            Some(Preview1Descriptor::PipeWrite { writer, .. })
                 if event_type == P1_EVENTTYPE_FD_WRITE && !writer.is_writable() =>
             {
                 wait.notified.push(EpollWaitTarget::ByteWriter {
@@ -1683,7 +1685,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
             Some(Preview1Descriptor::Stdin { carry }) if carry.is_empty() => {
                 Ok(inherited.stdin_route())
             }
-            Some(Preview1Descriptor::PipeRead { reader }) => {
+            Some(Preview1Descriptor::PipeRead { reader, .. }) => {
                 Ok(crate::ComponentInputRoute::Child(reader.clone()))
             }
             Some(descriptor) => Err(ComponentStdioRefusal {
@@ -1706,7 +1708,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
             Some(Preview1Descriptor::Stderr) => {
                 Ok(inherited.route(crate::ComponentOutputStreamKind::Stderr))
             }
-            Some(Preview1Descriptor::PipeWrite { writer }) => {
+            Some(Preview1Descriptor::PipeWrite { writer, .. }) => {
                 Ok(OutputRoute::Child(writer.clone()))
             }
             Some(Preview1Descriptor::NullDevice) => Ok(OutputRoute::Discard),
@@ -1993,7 +1995,7 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
                 })
             }
         }
-        (Some(Preview1Descriptor::PipeRead { reader }), P1_EVENTTYPE_FD_READ) => {
+        (Some(Preview1Descriptor::PipeRead { reader, .. }), P1_EVENTTYPE_FD_READ) => {
             local(if reader.is_readable() {
                 P1Readiness::Ready { bytes: 1 }
             } else {
@@ -2043,7 +2045,7 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
         // guest that polls for `POLLOUT` sleeps instead of spinning on a
         // full pipe. `is_writable` also covers a vanished peer, where the
         // write itself reports the error.
-        (Some(Preview1Descriptor::PipeWrite { writer }), P1_EVENTTYPE_FD_WRITE) => {
+        (Some(Preview1Descriptor::PipeWrite { writer, .. }), P1_EVENTTYPE_FD_WRITE) => {
             if writer.is_writable() {
                 local(P1Readiness::Ready {
                     bytes: usize::MAX as u64,

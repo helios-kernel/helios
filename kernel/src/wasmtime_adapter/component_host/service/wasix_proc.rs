@@ -1176,18 +1176,21 @@ where
         return p1::errno::FAULT;
     };
     let (writer, reader) = crate::byte_channel();
+    let inode = helios_unix::PipeInode::default();
     let read_fd = match caller
         .data_mut()
         .descriptors
-        .insert(Preview1Descriptor::PipeRead { reader })
-    {
+        .insert(Preview1Descriptor::PipeRead {
+            reader,
+            inode: inode.clone(),
+        }) {
         Ok(fd) => fd,
         Err(errno) => return errno,
     };
     let write_fd = match caller
         .data_mut()
         .descriptors
-        .insert(Preview1Descriptor::PipeWrite { writer })
+        .insert(Preview1Descriptor::PipeWrite { writer, inode })
     {
         Ok(fd) => fd,
         Err(errno) => {
@@ -3660,7 +3663,10 @@ where
     caller
         .data_mut()
         .descriptors
-        .insert(Preview1Descriptor::PipeWrite { writer })
+        .insert(Preview1Descriptor::PipeWrite {
+            writer,
+            inode: helios_unix::PipeInode::default(),
+        })
         .map(Some)
 }
 
@@ -3684,7 +3690,10 @@ where
     caller
         .data_mut()
         .descriptors
-        .insert(Preview1Descriptor::PipeRead { reader })
+        .insert(Preview1Descriptor::PipeRead {
+            reader,
+            inode: helios_unix::PipeInode::default(),
+        })
         .map(Some)
 }
 
@@ -4584,6 +4593,7 @@ mod spawn_descriptor_tests {
             .descriptors
             .insert(Preview1Descriptor::PipeRead {
                 reader: pipe_reader,
+                inode: helios_unix::PipeInode::default(),
             })
             .expect("pipe fd inserts") as i32;
         let cloexec_fd = parent
@@ -4621,7 +4631,7 @@ mod spawn_descriptor_tests {
                     _ => panic!("child must inherit parent's open file at fd {shared_file_fd}"),
                 }
                 match child.descriptors.get_cloned(pipe_fd) {
-                    Some(Preview1Descriptor::PipeRead { reader }) => {
+                    Some(Preview1Descriptor::PipeRead { reader, .. }) => {
                         pipe_writer
                             .write(Bytes::from_static(b"spawn2-pipe"))
                             .await
@@ -4656,7 +4666,10 @@ mod spawn_descriptor_tests {
         let (_writer, reader) = crate::byte_channel();
         let pipe_fd = parent
             .descriptors
-            .insert(Preview1Descriptor::PipeRead { reader })
+            .insert(Preview1Descriptor::PipeRead {
+                reader,
+                inode: helios_unix::PipeInode::default(),
+            })
             .expect("pipe fd inserts") as i32;
         let cloexec_fd = parent
             .descriptors
@@ -4732,6 +4745,7 @@ mod spawn_descriptor_tests {
             .insert_with_close_on_exec(
                 Preview1Descriptor::PipeWrite {
                     writer: pipe_writer,
+                    inode: helios_unix::PipeInode::default(),
                 },
                 true,
             )
@@ -4791,7 +4805,7 @@ mod spawn_descriptor_tests {
                 );
                 assert_eq!(child.descriptors.close_on_exec(1), Ok(false));
                 match child.descriptors.get_cloned(1) {
-                    Some(Preview1Descriptor::PipeWrite { writer }) => {
+                    Some(Preview1Descriptor::PipeWrite { writer, .. }) => {
                         writer
                             .write(Bytes::from_static(b"cloexec-dup2"))
                             .await
@@ -4821,7 +4835,10 @@ mod spawn_descriptor_tests {
         let (_writer, reader) = crate::byte_channel();
         let pipe_fd = parent
             .descriptors
-            .insert(Preview1Descriptor::PipeRead { reader })
+            .insert(Preview1Descriptor::PipeRead {
+                reader,
+                inode: helios_unix::PipeInode::default(),
+            })
             .expect("pipe fd inserts") as i32;
         assert!(parent.descriptors.get_cloned(file_fd).is_some());
         assert!(parent.descriptors.get_cloned(pipe_fd).is_some());

@@ -38,10 +38,10 @@ impl Wait {
     pub(super) fn arm<R: Resources>(entry: &Entry<R>, events: u32) -> Option<Self> {
         match &entry.descriptor {
             FileDescriptor::Event(event) => Some(Self::Event(event.clone(), event.wait_state())),
-            FileDescriptor::PipeRead { reader } if events & (POLLIN | POLLRDNORM) != 0 => {
+            FileDescriptor::PipeRead { reader, .. } if events & (POLLIN | POLLRDNORM) != 0 => {
                 Some(Self::Read(reader.clone(), reader.wait_state()))
             }
-            FileDescriptor::PipeWrite { writer } if events & (POLLOUT | POLLWRNORM) != 0 => {
+            FileDescriptor::PipeWrite { writer, .. } if events & (POLLOUT | POLLWRNORM) != 0 => {
                 Some(Self::Write(writer.clone(), writer.wait_state()))
             }
             _ => None,
@@ -76,7 +76,7 @@ pub(super) fn ready_mask<R: Resources, O: Stdio>(
                 0
             })
         }
-        FileDescriptor::PipeRead { reader } => {
+        FileDescriptor::PipeRead { reader, .. } => {
             (if reader.has_buffered_data() {
                 POLLIN | POLLRDNORM
             } else {
@@ -87,7 +87,7 @@ pub(super) fn ready_mask<R: Resources, O: Stdio>(
                 0
             })
         }
-        FileDescriptor::PipeWrite { writer } => {
+        FileDescriptor::PipeWrite { writer, .. } => {
             if writer.is_reader_closed() {
                 POLLERR
             } else if writer.is_writable() {

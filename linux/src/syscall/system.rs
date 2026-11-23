@@ -361,12 +361,17 @@ impl LinuxCapabilities {
     /// `security/commoncap.c` `cap_emulate_setxuid`: drops capabilities when
     /// transitioning from UID 0 to all non-zero UIDs, and adjusts the
     /// effective set on `euid` transitions between 0 and non-zero.
-    fn emulate_setxuid(&mut self, old: Ids, new: Ids) {
+    fn emulate_setxuid(&mut self, old: Ids, new: Ids, keep_caps: bool) {
         let had_root = old.real == 0 || old.effective == 0 || old.saved == 0;
         let all_nonzero = new.real != 0 && new.effective != 0 && new.saved != 0;
         if had_root && all_nonzero {
-            self.permitted = 0;
-            self.effective = 0;
+            if !keep_caps {
+                self.permitted = 0;
+                self.effective = 0;
+            }
+            // `security/commoncap.c` `cap_emulate_setxuid`: ambient capabilities
+            // are always cleared on a root -> non-root transition, even when
+            // `PR_SET_KEEPCAPS` is active.
             self.ambient = 0;
         }
         if old.effective == 0 && new.effective != 0 {
@@ -396,6 +401,10 @@ pub struct Credentials {
     /// `PF_NO_NEW_PRIVS`): once set, inherited across `fork`/`clone`/`execve`
     /// and suppresses set-id and file-capability elevation on `execve`.
     pub no_new_privs: bool,
+    /// `PR_SET_KEEPCAPS` (`include/uapi/linux/securebits.h` `SECURE_KEEP_CAPS`):
+    /// retains permitted capabilities when transitioning all UIDs away from 0,
+    /// and is always cleared across `execve` (`security/commoncap.c`).
+    pub keep_caps: bool,
 }
 
 impl Default for Credentials {
@@ -466,6 +475,7 @@ impl Credentials {
             supplementary_groups,
             capabilities: LinuxCapabilities::for_uid(uid),
             no_new_privs: false,
+            keep_caps: false,
         })
     }
 
@@ -1022,7 +1032,7 @@ impl Credentials {
         }
         new.effective = uid;
         self.user = new;
-        self.capabilities.emulate_setxuid(old, new);
+        self.capabilities.emulate_setxuid(old, new, self.keep_caps);
         0
     }
 
@@ -1068,7 +1078,7 @@ impl Credentials {
             new.saved = new.effective;
         }
         self.user = new;
-        self.capabilities.emulate_setxuid(old, new);
+        self.capabilities.emulate_setxuid(old, new, self.keep_caps);
         0
     }
 
@@ -1121,7 +1131,7 @@ impl Credentials {
             saved: if suid == u32::MAX { old.saved } else { suid },
         };
         self.user = new;
-        self.capabilities.emulate_setxuid(old, new);
+        self.capabilities.emulate_setxuid(old, new, self.keep_caps);
         0
     }
 
@@ -1234,7 +1244,7 @@ impl<R: Resources> Process<R> {
         if !self.names_self(pid) {
             return errno(ESRCH);
         }
-        let caps = self.shared.credentials.lock().capabilities;
+        let caps = self.credentials.lock().capabilities;
         let words = [
             [
                 caps.effective as u32,
@@ -1285,7 +1295,7 @@ impl<R: Resources> Process<R> {
             permitted |= u64::from(read_u32(16)) << 32;
             inheritable |= u64::from(read_u32(20)) << 32;
         }
-        let mut creds = self.shared.credentials.lock();
+        let mut creds = self.credentials.lock();
         let old = creds.capabilities;
         // `security/commoncap.c` `cap_capset`:
         // 1. Inheritable cannot grow beyond old.inheritable | old.permitted
@@ -1382,7 +1392,7 @@ impl<R: Resources> Process<R> {
         match which {
             0 => self.names_self(who),
             1 => who == 0,
-            _ => who == 0 || who as u32 == self.shared.credentials.lock().user.real,
+            _ => who == 0 || who as u32 == self.credentials.lock().user.real,
         }
     }
 
@@ -1426,21 +1436,31 @@ impl<R: Resources> Process<R> {
     /// `PR_GET_NO_NEW_PRIVS` (39); other options return `EINVAL`.
     pub(super) fn prctl(&mut self, args: [u64; 6]) -> u64 {
         // `include/uapi/linux/prctl.h`, Linux v6.12.
+        const PR_GET_KEEPCAPS: i32 = 7;
+        const PR_SET_KEEPCAPS: i32 = 8;
         const PR_SET_NO_NEW_PRIVS: i32 = 38;
         const PR_GET_NO_NEW_PRIVS: i32 = 39;
         match args[0] as u32 as i32 {
+            PR_GET_KEEPCAPS => u64::from(self.credentials.lock().keep_caps),
+            PR_SET_KEEPCAPS => {
+                if args[1] != 0 && args[1] != 1 {
+                    return errno(EINVAL);
+                }
+                self.credentials.lock().keep_caps = args[1] == 1;
+                0
+            }
             PR_SET_NO_NEW_PRIVS => {
                 if args[1] != 1 || args[2] != 0 || args[3] != 0 || args[4] != 0 {
                     return errno(EINVAL);
                 }
-                self.shared.credentials.lock().no_new_privs = true;
+                self.credentials.lock().no_new_privs = true;
                 0
             }
             PR_GET_NO_NEW_PRIVS => {
                 if args[1] != 0 || args[2] != 0 || args[3] != 0 || args[4] != 0 {
                     return errno(EINVAL);
                 }
-                u64::from(self.shared.credentials.lock().no_new_privs)
+                u64::from(self.credentials.lock().no_new_privs)
             }
             _ => errno(EINVAL),
         }

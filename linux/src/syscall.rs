@@ -461,7 +461,6 @@ struct ProcessShared<R: Resources> {
     shared_mappings: Arc<spin::Mutex<Vec<memory::SharedFileMapping<R::File>>>>,
     stdin_lock: RawMutex,
     stdin_carry: spin::Mutex<Bytes>,
-    credentials: Arc<spin::Mutex<Credentials>>,
     attributes: spin::Mutex<system::Attributes>,
     program_break: Arc<spin::Mutex<memory::ProgramBreak>>,
     signals: Arc<ProcessSignals>,
@@ -477,20 +476,22 @@ impl core::ops::Deref for GroupLifecycle {
 }
 
 /// One thread's handle to a Linux process (`CLONE_THREAD` shares the
-/// underlying descriptor table, futex queues, program break and attributes).
+/// underlying descriptor table, futex queues, program break and attributes,
+/// while each thread holds its own credentials per Linux `kernel/cred.c`).
 ///
 /// # Concurrency
 ///
 /// Each thread task exclusively owns its `Process<R>` handle while
 /// dispatching a syscall. Shared process structures synchronize internally
 /// with bounded non-awaiting critical sections (`descriptors`, `cwd`,
-/// `shared_mappings`, `attributes`, `credentials`, `program_break`, `signals`,
+/// `shared_mappings`, `attributes`, `program_break`, `signals`,
 /// `threads`, `futex`) or an async mutex (`stdin_carry`); no spin lock is ever
 /// held across an `.await`.
 pub struct Process<R: Resources> {
     shared: Arc<ProcessShared<R>>,
     tid: NonZeroU32,
     signals: Arc<ThreadSignalSlot>,
+    credentials: Arc<spin::Mutex<Credentials>>,
     clear_child_tid: u64,
     robust_list: Arc<AtomicU64>,
     exited: bool,
@@ -565,7 +566,6 @@ impl<R: Resources> Process<R> {
                 shared_mappings: Arc::new(spin::Mutex::new(Vec::new())),
                 stdin_lock: RawMutex::new(),
                 stdin_carry: spin::Mutex::new(initial_stdin_carry),
-                credentials,
                 attributes: spin::Mutex::new(system::Attributes::new(start, open_files)),
                 program_break: Arc::new(spin::Mutex::new(memory::ProgramBreak::new(program_break))),
                 signals: process_signals,
@@ -574,6 +574,7 @@ impl<R: Resources> Process<R> {
             }),
             tid: id,
             signals: thread_signals,
+            credentials,
             clear_child_tid: 0,
             robust_list,
             exited: false,
@@ -761,11 +762,11 @@ impl<R: Resources> Process<R> {
         self.shared.cwd.clone()
     }
 
-    /// Shared handle to this process's credentials (for host `execve`/`execveat`
+    /// Shared handle to this thread's credentials (for host `execve`/`execveat`
     /// permission checks and set-id / file-capability transitions without
     /// holding a borrow on `Process`).
     pub fn credentials_handle(&self) -> Arc<spin::Mutex<system::Credentials>> {
-        self.shared.credentials.clone()
+        self.credentials.clone()
     }
 
     /// If a non-leader thread called `execve`, transitions its thread ID to
@@ -778,11 +779,12 @@ impl<R: Resources> Process<R> {
             self.shared.pids.release_tid(self.tid);
             self.tid = pid;
             self.signals = self.shared.signals.register_thread(pid, old_mask);
-            self.shared.pids.register_thread(
-                pid,
-                self.signals.clone(),
-                self.shared.credentials.clone(),
-            );
+            self.shared
+                .pids
+                .register_thread(pid, self.signals.clone(), self.credentials.clone());
+            self.shared
+                .pids
+                .update_process_credentials(pid, self.credentials.clone());
         }
     }
 
@@ -802,7 +804,7 @@ impl<R: Resources> Process<R> {
         new_credentials: system::Credentials,
     ) {
         let pid = self.pid();
-        *self.shared.credentials.lock() = new_credentials;
+        *self.credentials.lock() = new_credentials;
         let mut surviving = self.shared.descriptors.lock().clone();
         let len = surviving.entries.len();
         for index in 0..len {
@@ -852,7 +854,6 @@ impl<R: Resources> Process<R> {
             shared_mappings: Arc::new(spin::Mutex::new(Vec::new())),
             stdin_lock: RawMutex::new(),
             stdin_carry: spin::Mutex::new(self.shared.stdin_carry.lock().clone()),
-            credentials: self.shared.credentials.clone(),
             attributes: spin::Mutex::new(self.shared.attributes.lock().clone()),
             program_break: Arc::new(spin::Mutex::new(memory::ProgramBreak::new(
                 new_program_break,
@@ -1007,7 +1008,7 @@ pub async fn dispatch<
             memory,
         )),
         Operation::Kill => {
-            let creds = process.shared.credentials.lock().clone();
+            let creds = process.credentials.lock().clone();
             SyscallOutcome::Return(signal::kill(
                 &process.shared.pids,
                 process.pid(),
@@ -1017,7 +1018,7 @@ pub async fn dispatch<
             ))
         }
         Operation::Tkill => {
-            let creds = process.shared.credentials.lock().clone();
+            let creds = process.credentials.lock().clone();
             SyscallOutcome::Return(signal::tkill(
                 &process.shared.pids,
                 process.pid(),
@@ -1026,7 +1027,7 @@ pub async fn dispatch<
             ))
         }
         Operation::Tgkill => {
-            let creds = process.shared.credentials.lock().clone();
+            let creds = process.credentials.lock().clone();
             SyscallOutcome::Return(signal::tgkill(
                 &process.shared.pids,
                 process.pid(),
@@ -1289,11 +1290,17 @@ pub async fn dispatch<
             fs::fsync::<R, _, _>(process, arguments, true, memory, output).await,
         ),
         operation @ (Operation::Pipe | Operation::Pipe2) => {
+            let (uid, gid) = {
+                let creds = process.credentials.lock();
+                (creds.user.effective, creds.group.effective)
+            };
             SyscallOutcome::Return(io::pipe::<R, _>(
                 &mut process.shared.descriptors.lock(),
                 arguments,
                 memory,
                 operation == Operation::Pipe2,
+                uid,
+                gid,
             ))
         }
         operation @ (Operation::Dup | Operation::Dup2 | Operation::Dup3 | Operation::Fcntl) => {
@@ -1443,7 +1450,6 @@ pub async fn dispatch<
         Operation::ClockGetres => SyscallOutcome::Return(system::clock_getres(arguments, memory)),
         Operation::ClockSettime => {
             let has_cap = process
-                .shared
                 .credentials
                 .lock()
                 .capabilities
@@ -1460,7 +1466,6 @@ pub async fn dispatch<
         Operation::Uname => SyscallOutcome::Return(system::uname(abi, arguments, memory, output)),
         operation @ (Operation::Sethostname | Operation::Setdomainname) => {
             let has_cap = process
-                .shared
                 .credentials
                 .lock()
                 .capabilities
@@ -1473,49 +1478,35 @@ pub async fn dispatch<
         operation @ (Operation::Getuid
         | Operation::Geteuid
         | Operation::Getgid
-        | Operation::Getegid) => {
-            SyscallOutcome::Return(process.shared.credentials.lock().id(operation))
+        | Operation::Getegid) => SyscallOutcome::Return(process.credentials.lock().id(operation)),
+        Operation::Getgroups => {
+            SyscallOutcome::Return(process.credentials.lock().getgroups(arguments, memory))
         }
-        Operation::Getgroups => SyscallOutcome::Return(
-            process
-                .shared
-                .credentials
-                .lock()
-                .getgroups(arguments, memory),
-        ),
         Operation::Getresuid | Operation::Getresgid => {
-            let credentials = process.shared.credentials.lock().clone();
+            let credentials = process.credentials.lock().clone();
             SyscallOutcome::Return(credentials.resolve(
                 abi.operation(call.number),
                 arguments,
                 memory,
             ))
         }
-        Operation::Setuid => {
-            SyscallOutcome::Return(process.shared.credentials.lock().setuid(arguments))
-        }
-        Operation::Setgid => {
-            SyscallOutcome::Return(process.shared.credentials.lock().setgid(arguments))
-        }
+        Operation::Setuid => SyscallOutcome::Return(process.credentials.lock().setuid(arguments)),
+        Operation::Setgid => SyscallOutcome::Return(process.credentials.lock().setgid(arguments)),
         Operation::Setreuid => {
-            SyscallOutcome::Return(process.shared.credentials.lock().setreuid(arguments))
+            SyscallOutcome::Return(process.credentials.lock().setreuid(arguments))
         }
         Operation::Setregid => {
-            SyscallOutcome::Return(process.shared.credentials.lock().setregid(arguments))
+            SyscallOutcome::Return(process.credentials.lock().setregid(arguments))
         }
         Operation::Setresuid => {
-            SyscallOutcome::Return(process.shared.credentials.lock().setresuid(arguments))
+            SyscallOutcome::Return(process.credentials.lock().setresuid(arguments))
         }
         Operation::Setresgid => {
-            SyscallOutcome::Return(process.shared.credentials.lock().setresgid(arguments))
+            SyscallOutcome::Return(process.credentials.lock().setresgid(arguments))
         }
-        Operation::Setgroups => SyscallOutcome::Return(
-            process
-                .shared
-                .credentials
-                .lock()
-                .setgroups(arguments, memory),
-        ),
+        Operation::Setgroups => {
+            SyscallOutcome::Return(process.credentials.lock().setgroups(arguments, memory))
+        }
         Operation::Capget => SyscallOutcome::Return(process.capget(arguments, memory)),
         Operation::Capset => SyscallOutcome::Return(process.capset(arguments, memory)),
         operation @ (Operation::Prlimit64 | Operation::Getrlimit | Operation::Setrlimit) => {
@@ -1728,7 +1719,7 @@ async fn read<R: Resources, M: UserMemory, O: Stdio + Filesystem<R> + Network<R:
 }
 
 fn socket_context<R: Resources>(process: &Process<R>) -> socket::SocketContext {
-    let creds = process.shared.credentials.lock();
+    let creds = process.credentials.lock();
     socket::SocketContext {
         pid: process.shared.identity.id().get() as u32,
         cap_net_admin: creds.capabilities.has_effective(CAP_NET_ADMIN),

@@ -25,6 +25,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use clap::Args as ClapArgs;
+use helios_inspector_protocol::RpcError;
+use helios_inspector_protocol::debugger::filesystem::{self as debugger_fs, MountBtrfsRequest};
+use helios_inspector_protocol::debugger::programs::{ContainerMountBind, ExecInContainerRequest};
 use helios_inspector_protocol::system::programs::{ExecErrorKind, ExecResult};
 use serde::Serialize;
 
@@ -67,6 +70,13 @@ pub(crate) struct LinuxSuiteCommand {
     /// flushed before the next case starts.
     #[arg(long, value_name = "PATH")]
     results: PathBuf,
+
+    /// Optional virtio-blk serial of a writable btrfs disk to mount as a
+    /// private container mount at `/tmp` (with `/dev/shm` bound to `/tmp/shm`)
+    /// so every case runs inside a Linux container with `TEST_TMPDIR` on that
+    /// private btrfs mount.
+    #[arg(long, value_name = "SERIAL")]
+    private_btrfs: Option<String>,
 }
 
 /// Why the suite run stopped before its last case.
@@ -97,6 +107,12 @@ pub(crate) enum LinuxSuiteError {
         path: String,
         #[source]
         source: io::Error,
+    },
+    #[error("failed to mount private btrfs disk {serial:?} at /tmp: {source}")]
+    MountPrivateBtrfs {
+        serial: String,
+        #[source]
+        source: RpcError,
     },
     #[error("the guest stopped answering while it ran {binary} {case}: {source}")]
     GuestLost {
@@ -177,12 +193,28 @@ pub(crate) async fn run(
         })?;
     let mut results = BufWriter::new(file);
     let guest_dir = command.guest_dir.trim_end_matches('/');
-    for case in &cases {
+    if let Some(serial) = command.private_btrfs.as_deref() {
+        debugger_fs::mount_btrfs(
+            client,
+            &MountBtrfsRequest {
+                serial: serial.to_owned(),
+                path: "/tmp".to_owned(),
+                read_only: false,
+                private: true,
+            },
+        )
+        .await
+        .map_err(|source| LinuxSuiteError::MountPrivateBtrfs {
+            serial: serial.to_owned(),
+            source,
+        })?;
+    }
+    for (index, case) in cases.iter().enumerate() {
         // Printed before the launch, so a caller whose guest died can tell
         // a case that took the guest down from a session that never
         // reached its first case.
         eprintln!("linux-suite: running {} {}", case.binary, case.case);
-        let record = run_case(client, command, guest_dir, case, vcpus).await?;
+        let record = run_case(client, command, guest_dir, index, case, vcpus).await?;
         write_record(&mut results, &command.results, case, &record)?;
         eprintln!(
             "linux-suite: {} {} {}",
@@ -198,13 +230,44 @@ async fn run_case(
     client: &RpcClient,
     command: &LinuxSuiteCommand,
     guest_dir: &str,
+    index: usize,
     case: &Case,
     vcpus: &VcpuStateCapture,
 ) -> Result<Finished, LinuxSuiteError> {
     let path = format!("{guest_dir}/{}", case.binary);
-    let args = [format!("--gtest_filter={}", case.case)];
+    let args = vec![format!("--gtest_filter={}", case.case)];
     let started = Instant::now();
-    let mut exec = core::pin::pin!(crate::programs::exec(client, &path, &args));
+    let mut exec = core::pin::pin!(async {
+        if command.private_btrfs.is_some() {
+            let scratch_dir = format!("/tmp/gvisor-case-{index}");
+            crate::programs::exec_in_container(
+                client,
+                ExecInContainerRequest {
+                    path: path.clone(),
+                    args: args.clone(),
+                    env: vec![("TEST_TMPDIR".to_owned(), scratch_dir.clone())],
+                    mounts: vec![
+                        ContainerMountBind {
+                            source_path: "/tmp".to_owned(),
+                            target_path: "/tmp".to_owned(),
+                            writable: true,
+                            private: true,
+                        },
+                        ContainerMountBind {
+                            source_path: guest_dir.to_owned(),
+                            target_path: guest_dir.to_owned(),
+                            writable: false,
+                            private: false,
+                        },
+                    ],
+                    scratch_dir: Some(scratch_dir),
+                },
+            )
+            .await
+        } else {
+            crate::programs::exec(client, &path, &args).await
+        }
+    });
     let bound = Duration::from_secs(command.case_timeout_seconds);
     if let Some(outcome) = crate::runtime::timeout(bound, exec.as_mut()).await {
         return finish(case, outcome, false, started);
