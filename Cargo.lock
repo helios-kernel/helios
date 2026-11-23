@@ -3450,7 +3450,10 @@ dependencies = [
 name = "helios-inspector-protocol"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
+ "async-lock",
  "bytes",
+ "event-listener",
  "futures-core",
  "futures-io",
  "futures-lite",
@@ -3688,6 +3691,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-sysctl"
+version = "0.1.0"
+dependencies = [
+ "helios-api",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "helios-tpm"
 version = "0.1.0"
 dependencies = [
@@ -3811,6 +3822,35 @@ version = "0.1.0"
 dependencies = [
  "helios-api",
  "helios-webgpu",
+]
+
+[[package]]
+name = "helios-wit-rpc"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "async-lock",
+ "event-listener",
+ "futures-core",
+ "futures-io",
+ "futures-lite",
+ "futures-util",
+ "helios-inspector-protocol",
+ "helios-wit-rpc-macro",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "helios-wit-rpc-macro"
+version = "0.1.0"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+ "thiserror 2.0.21",
+ "wit-parser",
 ]
 
 [[package]]

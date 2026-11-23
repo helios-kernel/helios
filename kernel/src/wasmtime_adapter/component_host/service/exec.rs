@@ -65,7 +65,7 @@ where
     pub(super) executable: ProgramExecutable<CpuImpl, Net, StorageImpl>,
     pub(super) authority: ProcessAuthority,
     pub(super) filesystem: Option<Namespace<StorageImpl>>,
-    pub(super) descriptors: Option<Preview1DescriptorTable<Net>>,
+    pub(super) descriptors: DescriptorOrigin<Net>,
     pub(super) signal_state: WasixSignalState,
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
     /// The replacement launch's phase timeline — the calling task runs
@@ -244,8 +244,9 @@ pub(super) async fn run_program_executable<CpuImpl, Net, StorageImpl>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
+    ipc_grants: crate::IpcEndpointGrants,
     filesystem: Option<Namespace<StorageImpl>>,
-    descriptors: Option<Preview1DescriptorTable<Net>>,
+    descriptors: DescriptorOrigin<Net>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
     #[cfg(feature = "linux")] container: Option<LinuxContainerLaunch<StorageImpl>>,
@@ -276,8 +277,10 @@ where
         // so that no pipe end it held outlives the launch.
         ProgramExecutable::Component(compiled) => {
             let stdio = match descriptors {
-                Some(table) => table.component_output_mode(&output_mode),
-                None => Ok(output_mode),
+                DescriptorOrigin::Fresh => Ok(output_mode),
+                DescriptorOrigin::NewProcess(table) | DescriptorOrigin::SameProcess(table) => {
+                    table.component_output_mode(&output_mode)
+                }
             };
             match stdio {
                 Ok(output_mode) => {
@@ -286,6 +289,7 @@ where
                         argv,
                         env,
                         authority,
+                        ipc_grants,
                         filesystem,
                         signal_state,
                         spawner,
@@ -400,7 +404,7 @@ pub(super) async fn run_program_core_module<CpuImpl, Net, StorageImpl>(
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<Namespace<StorageImpl>>,
-    descriptors: Option<Preview1DescriptorTable<Net>>,
+    descriptors: DescriptorOrigin<Net>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
     spawner: crate::InstanceSpawner<CpuImpl>,
@@ -749,7 +753,9 @@ where
                 write_serial,
                 Some(restore.memory.clone()),
                 filesystem,
-                Some(restore.descriptors),
+                // The fork child is a new process: it takes the machine's
+                // current limit, not its parent's.
+                DescriptorOrigin::NewProcess(restore.descriptors),
                 signal_state,
                 threads.main_mailbox(),
                 restore.signal_dispositions,
@@ -1141,12 +1147,17 @@ where
                             .runtime_state
                             .root_namespace()
                     });
+                    let ephemeral = Arc::new(crate::LinuxContainer::ephemeral(
+                        id,
+                        replacement.authority.clone(),
+                        namespace,
+                    ));
+                    replacement_state
+                        .exec_context
+                        .runtime_state
+                        .register_container(&ephemeral);
                     Some(LinuxContainerLaunch {
-                        container: Arc::new(crate::LinuxContainer::ephemeral(
-                            id,
-                            replacement.authority.clone(),
-                            namespace,
-                        )),
+                        container: ephemeral,
                         credentials: None,
                     })
                 } else {
@@ -1157,6 +1168,7 @@ where
                 replacement.argv,
                 replacement.env,
                 replacement.authority,
+                crate::IpcEndpointGrants::new(),
                 replacement.filesystem,
                 replacement.descriptors,
                 replacement.signal_state,
@@ -1188,6 +1200,7 @@ pub(super) async fn run_program_component<CpuImpl, Net, StorageImpl>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
+    ipc_grants: crate::IpcEndpointGrants,
     filesystem: Option<Namespace<StorageImpl>>,
     signal_state: WasixSignalState,
     spawner: crate::InstanceSpawner<CpuImpl>,
@@ -1240,7 +1253,6 @@ where
             exec_context.runtime_state.clone(),
             exec_context.instance_registry,
             launched_instance,
-            None,
             filesystem,
             argv,
             env,
@@ -1248,7 +1260,8 @@ where
             output_mode,
             exec_context.read_serial,
             exec_context.write_serial,
-        ),
+        )
+        .with_ipc_grants(ipc_grants),
         Some(signal_state.clone()),
     );
     if let Some(store_prepare_started) = store_prepare_started {

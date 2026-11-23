@@ -1035,7 +1035,6 @@ pub(crate) mod test_store {
             runtime_state.clone(),
             registry,
             instance,
-            None,
             runtime_state.root_namespace().descend(),
             Vec::new(),
             Vec::new(),

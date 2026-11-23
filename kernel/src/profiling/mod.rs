@@ -129,7 +129,7 @@ pub trait LlvmProfile {
 pub use instructions::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
     SAMPLE_DRAIN_INTERVAL_MILLIS, SAMPLE_RING_CAPACITY, SampleCapture, SampledCode,
-    WasmFunctionSample,
+    SamplingSession, WasmFunctionSample,
 };
 
 #[cfg(helios_profile_generate)]

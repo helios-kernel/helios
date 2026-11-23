@@ -42,7 +42,10 @@ type WasixHostArgs14 = (
 pub(super) struct WasixChildInheritance<Net: ComponentHostNetwork> {
     pub(super) environment: Option<Vec<(String, String)>>,
     pub(super) authority: Option<ProcessAuthority>,
-    pub(super) descriptors: Option<Preview1DescriptorTable<Net>>,
+    /// A spawn child is a new process: [`DescriptorOrigin::Fresh`], or
+    /// [`DescriptorOrigin::NewProcess`] with the table its descriptor
+    /// actions produced.
+    pub(super) descriptors: DescriptorOrigin<Net>,
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
 }
 
@@ -2007,7 +2010,8 @@ where
             executable,
             authority,
             filesystem,
-            descriptors: Some(descriptors),
+            // Exec keeps the process, so it keeps the process's limit.
+            descriptors: DescriptorOrigin::SameProcess(descriptors),
             signal_state,
             signal_dispositions,
             timeline: trace.timeline().for_task(),
@@ -2258,7 +2262,7 @@ pub(super) fn wasix_proc_spawn_inheritance<Net: ComponentHostNetwork>(
     WasixChildInheritance {
         environment: None,
         authority: Some(authority),
-        descriptors: None,
+        descriptors: DescriptorOrigin::Fresh,
         signal_dispositions: Vec::new(),
     }
 }
@@ -2276,7 +2280,7 @@ pub(super) fn wasix_proc_spawn2_inheritance<Net: ComponentHostNetwork>(
     WasixChildInheritance {
         environment,
         authority: Some(snapshot.authority),
-        descriptors: Some(snapshot.descriptors),
+        descriptors: DescriptorOrigin::NewProcess(snapshot.descriptors),
         signal_dispositions,
     }
 }
@@ -2365,11 +2369,40 @@ pub(super) fn wasix_proc_spawn_inherited_non_directory_authority(
     // device does not: it belongs to the driver instance it was granted
     // to, not to that instance's children.
     authority.grant_device_classes(parent.device_class_rights());
-    // The observation right follows the shell the same way: the programs
-    // a launcher runs through `dash` observe the machine as it does.
+    // Subtree and machine observation/control scopes follow the shell so
+    // diagnostic and instance-control utilities run from it act within the
+    // launcher's scope; `Own` stays with the parent instance itself.
+    if let Some(scope) = parent
+        .inspect_read_scope()
+        .filter(|&scope| scope != crate::AuthorityScope::Own)
+    {
+        authority.grant_inspect_read(scope);
+    }
+    if let Some(scope) = parent
+        .trace_read_scope()
+        .filter(|&scope| scope != crate::AuthorityScope::Own)
+    {
+        authority.grant_trace_read(scope);
+    }
+    if let Some(scope) = parent
+        .profile_read_scope()
+        .filter(|&scope| scope != crate::AuthorityScope::Own)
+    {
+        authority.grant_profile_read(scope);
+    }
     authority.grant_diagnostic_rights(parent.diagnostic_rights());
-    // So does the right to control processors: `cpu` run from the
-    // launcher's shell acts with the launcher's authority.
+    if let Some(scope) = parent
+        .instance_control_scope()
+        .filter(|&scope| scope != crate::AuthorityScope::Own)
+    {
+        authority.grant_instance_control(scope);
+    }
+    // The settings-write right follows the shell the same way: the
+    // programs a launcher runs through `dash` configure the machine as
+    // it does.
+    authority.grant_settings_rights(parent.settings_rights());
+    // Machine control and identity rights follow the shell when the
+    // launcher explicitly handed them down.
     authority.grant_machine_rights(parent.machine_rights());
     authority
 }
@@ -3042,7 +3075,19 @@ where
     if fd_ops == 0 && fd_ops_len != 0 {
         return Err(P1Stop::Errno(p1::errno::FAULT));
     }
-    let parent_descriptors = caller.data().descriptors.snapshot();
+    // The actions are the child's first steps, so they run under the
+    // limit the child takes, a new process's, not under the parent's:
+    // a target between the two would otherwise be judged by the wrong one.
+    let child_limit = caller
+        .data()
+        .runtime_state
+        .settings()
+        .get::<DescriptorLimitSetting>();
+    let parent_descriptors = caller
+        .data()
+        .descriptors
+        .snapshot()
+        .for_new_process(child_limit);
     let parent_authority = caller.data().effective_authority();
     let parent_cwd = caller.data().cwd.get();
     let mut snapshot =
@@ -3603,6 +3648,8 @@ where
                 argv,
                 env: LaunchEnvironment::from_guest(environment),
                 authority,
+                ipc_grants: crate::IpcEndpointGrants::new(),
+                launched_instance: None,
                 filesystem,
                 descriptors,
                 signal_dispositions,
@@ -4436,7 +4483,7 @@ mod spawn_descriptor_tests {
             &self,
             name: &str,
             authority: ProcessAuthority,
-            descriptors: Option<Preview1DescriptorTable<TestNetworkService>>,
+            descriptors: DescriptorOrigin<TestNetworkService>,
         ) -> Preview1ProgramStore<TestCpu, TestNetworkService, UnsupportedStorage> {
             let instance = self.registry.register(name, 0);
             let threads = WasixProcessThreads::new();
@@ -4582,7 +4629,8 @@ mod spawn_descriptor_tests {
     #[test]
     fn proc_spawn2_no_actions_inherits_open_file_and_pipe_without_cloexec() {
         let fixture = std::sync::Arc::new(SpawnFixture::new());
-        let parent = fixture.make_store("parent", fixture.authority.clone(), None);
+        let parent =
+            fixture.make_store("parent", fixture.authority.clone(), DescriptorOrigin::Fresh);
 
         let shared_file_fd = parent
             .descriptors
@@ -4657,7 +4705,8 @@ mod spawn_descriptor_tests {
     #[test]
     fn proc_spawn2_no_actions_equals_empty_action_list_and_action_base() {
         let fixture = std::sync::Arc::new(SpawnFixture::new());
-        let parent = fixture.make_store("parent", fixture.authority.clone(), None);
+        let parent =
+            fixture.make_store("parent", fixture.authority.clone(), DescriptorOrigin::Fresh);
 
         let file_fd = parent
             .descriptors
@@ -4738,7 +4787,8 @@ mod spawn_descriptor_tests {
     #[test]
     fn proc_spawn2_dup2_redirects_cloexec_pipe_and_closes_source_fd() {
         let fixture = std::sync::Arc::new(SpawnFixture::new());
-        let parent = fixture.make_store("parent", fixture.authority.clone(), None);
+        let parent =
+            fixture.make_store("parent", fixture.authority.clone(), DescriptorOrigin::Fresh);
         let (pipe_writer, pipe_reader) = crate::byte_channel();
         let cloexec_pipe_fd = parent
             .descriptors
@@ -4827,7 +4877,8 @@ mod spawn_descriptor_tests {
     #[test]
     fn proc_spawn_uses_fresh_table_from_scoped_authority_unlike_proc_spawn2() {
         let fixture = SpawnFixture::new();
-        let parent = fixture.make_store("parent", fixture.authority.clone(), None);
+        let parent =
+            fixture.make_store("parent", fixture.authority.clone(), DescriptorOrigin::Fresh);
         let file_fd = parent
             .descriptors
             .insert(open_file_descriptor("/mnt/workspace/parent-only.txt"))
@@ -4846,7 +4897,7 @@ mod spawn_descriptor_tests {
         let inheritance =
             wasix_proc_spawn_inheritance::<TestNetworkService>(fixture.authority.clone());
         assert!(
-            inheritance.descriptors.is_none(),
+            matches!(inheritance.descriptors, DescriptorOrigin::Fresh),
             "proc_spawn leaves child descriptor creation to Preview1DescriptorTable::from_authority"
         );
         let child = fixture.make_store(

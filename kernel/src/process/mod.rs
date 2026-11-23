@@ -4,18 +4,20 @@ mod program_service;
 #[cfg(test)]
 pub(crate) use authority::test_caps;
 pub use authority::{
-    AudioClaimCap, BtrfsDedupeCap, BtrfsDeviceAdminCap, BtrfsMountAdminCap, BtrfsReceiveCap,
-    BtrfsReflinkCap, BtrfsSendCap, BtrfsSnapshotCap, BtrfsSubvolCreateCap, BtrfsSubvolDeleteCap,
-    BtrfsSubvolReadCap, BtrfsSubvolReadOnlyCap, ClockAuthorityRights, CompileAuthority,
-    ControlProcessorsCap, DeviceClassRights, DeviceGrantClaimCap, DiagnosticAuthorityRights,
-    DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
-    ExecAuthority, ForkAuthority, GpuOpenCap, InputClaimCap, JoinAuthority, LinkAuthorityRights,
-    LinkSourceCap, LinkTargetDirectoryCap, MachineAuthorityRights, MountAuthorityRights, MountCap,
-    MulticastCap, NetworkAdminCap, NetworkAuthorityRights, NetworkCap, ObserveMachineCap,
-    PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
-    SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap,
-    TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, TtyControlCap, UdpCap,
-    UnmountCap,
+    AudioClaimCap, AuthorityScope, BtrfsDedupeCap, BtrfsDeviceAdminCap, BtrfsMountAdminCap,
+    BtrfsReceiveCap, BtrfsReflinkCap, BtrfsSendCap, BtrfsSnapshotCap, BtrfsSubvolCreateCap,
+    BtrfsSubvolDeleteCap, BtrfsSubvolReadCap, BtrfsSubvolReadOnlyCap, ClockAuthorityRights,
+    CompileAuthority, DeviceClassRights, DeviceGrantClaimCap, DiagnosticAuthorityRights,
+    DiagnosticsControlCap, DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen,
+    DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority, GpuOpenCap, InputClaimCap,
+    InspectReadCap, InstanceControlCap, JoinAuthority, LinkAuthorityRights, LinkSourceCap,
+    LinkTargetDirectoryCap, MachineAuthorityRights, MachineControlCap, MachineIdentityCap,
+    MountAuthorityRights, MountCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights,
+    NetworkCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
+    ProfileReadCap, RequestedAuthorityScope, SetWallClockCap, SettingsAuthorityRights,
+    SignalAuthority, SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap,
+    TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, TraceReadCap, TtyControlCap,
+    UdpCap, UnmountCap, WriteSettingsCap,
 };
 pub use program_service::{
     ComponentStdioRefusal, LinuxImageRefusal, ProgramExecError, ProgramExecErrorDetail,

@@ -119,37 +119,44 @@ interface profiling {
     dropped: u64,
   }
 
-  /// Why the kernel could not produce an instruction profile.
+  /// Why the kernel could not start or read an instruction profile.
   enum instruction-profile-error {
     /// The running backend does not sample instruction addresses.
     not-captured,
-    /// The caller does not hold the right to observe the machine, which
-    /// sampling instruction addresses requires: a sample cannot be
-    /// attributed to one instance.
+    /// The caller does not hold the required right (`diagnostics.control` to
+    /// start sampling, `diagnostics.profile-read` at machine scope to read
+    /// samples).
     denied,
+    /// Another `sampling-session` is already active.
+    busy,
   }
 
-  /// Turns machine-wide profiling on or off. It needs the right to
-  /// observe the machine.
+  /// Active periodic timer instruction-sampling lease.
+  ///
+  /// Dropping this resource stops periodic instruction sampling and restores
+  /// normal processor timer behavior while keeping collected samples readable
+  /// through `instruction-samples`.
+  resource sampling-session;
+
+  /// Turns machine-wide profiling on or off. Requires `diagnostics.control`.
   set-enabled: func(enabled: bool) -> result<_, control-error>;
 
-  /// Wipes the machine-wide profile. It needs the right to observe the
-  /// machine.
+  /// Wipes the machine-wide profile. Requires `diagnostics.control`.
   clear: func() -> result<_, control-error>;
 
-  /// The folded stacks of the profile. A caller that holds the right to
-  /// observe the machine sees every instance's and the kernel's; any other
-  /// caller sees only the samples its own instance recorded.
+  /// The folded stacks of the profile visible to the caller's `profile-read`
+  /// scope.
   folded: func(filter: filter, limit: u32) -> result<list<folded-sample>, filter-error>;
 
   /// The perf metrics of the profile, visible by the rule of `folded`.
   metrics: func(filter: metric-filter, limit: u32) -> result<list<metric-sample>, filter-error>;
 
-  /// Starts or stops instruction-address sampling, independently of
-  /// `set-enabled`. Sampling shortens every processor's timer period, so
-  /// it perturbs timings and runs only when a reader asked for it.
-  /// Starting discards the samples of any earlier run.
-  set-instruction-sampling: func(enabled: bool) -> result<_, instruction-profile-error>;
+  /// Starts instruction-address sampling, independently of `set-enabled`, and
+  /// returns a `sampling-session` resource whose drop stops sampling.
+  /// Sampling shortens every processor's timer period, so it perturbs timings
+  /// and runs only while a session resource is held. Starting discards the
+  /// samples of any earlier run.
+  start-instruction-sampling: func() -> result<sampling-session, instruction-profile-error>;
 
   /// The instruction addresses the processors' periodic timer sampled
   /// since sampling last started, attributed to the code they executed.

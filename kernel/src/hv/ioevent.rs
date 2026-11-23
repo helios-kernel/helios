@@ -3,6 +3,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use helios_hal::hv::{GuestAddress, HvError, IoWidth};
 use triomphe::Arc;
 
+use super::VmTelemetry;
 use crate::exec::Notify;
 use crate::memory::IrqSafeMutex;
 
@@ -10,6 +11,7 @@ use crate::memory::IrqSafeMutex;
 /// lock. Waiters hold no lock. Each event has a lock-free completion count.
 pub(super) struct IoEvents {
     entries: IrqSafeMutex<Vec<Registration>>,
+    telemetry: Arc<VmTelemetry>,
 }
 
 struct Registration {
@@ -56,9 +58,10 @@ impl EventSignal {
 }
 
 impl IoEvents {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(telemetry: Arc<VmTelemetry>) -> Self {
         Self {
             entries: IrqSafeMutex::new(Vec::new()),
+            telemetry,
         }
     }
 
@@ -93,6 +96,7 @@ impl IoEvents {
             });
             Ok(())
         })?;
+        registry.telemetry.inc_ioevents();
         Ok(IoEvent {
             registry: registry.clone(),
             signal,
@@ -145,17 +149,26 @@ impl Drop for IoEvent {
         self.registry.entries.with(|entries| {
             entries.retain(|entry| !Arc::ptr_eq(&entry.signal, &self.signal));
         });
+        self.registry.telemetry.dec_ioevents();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hv::GuestMemoryAccount;
     use futures_lite::future::{block_on, poll_once};
+
+    fn test_events() -> Arc<IoEvents> {
+        let account = Arc::new(GuestMemoryAccount::new(0));
+        Arc::new(IoEvents::new(Arc::new(VmTelemetry::new(
+            0, None, None, account,
+        ))))
+    }
 
     #[test]
     fn matching_respects_width_and_value_and_drop_unregisters() {
-        let registry = Arc::new(IoEvents::new());
+        let registry = test_events();
         let address = GuestAddress(0x1000);
         let event = IoEvents::register(&registry, address, IoWidth::Dword, Some(4)).unwrap();
         assert!(registry.matching(address, IoWidth::Word, 4).is_none());
@@ -175,7 +188,7 @@ mod tests {
 
     #[test]
     fn cancellation_preserves_completions_and_vm_stop_wakes_waiters() {
-        let registry = Arc::new(IoEvents::new());
+        let registry = test_events();
         let event = IoEvents::register(&registry, GuestAddress(0), IoWidth::Dword, None).unwrap();
         {
             let mut wait = core::pin::pin!(event.wait());

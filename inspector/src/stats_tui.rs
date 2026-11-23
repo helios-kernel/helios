@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 use futures_lite::future;
+use helios_inspector_protocol::system::inspect::{self, MemoryPressure};
 use helios_inspector_protocol::system::instances;
-use helios_inspector_protocol::system::stats::{self, MemoryPressure};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -72,7 +72,7 @@ pub async fn run(client: &mut RpcClient) -> Result<(), TerminalError> {
 
 struct App {
     period_ms: u64,
-    sample: Option<stats::Sample>,
+    sample: Option<inspect::KernelSnapshot>,
     instances: Vec<instances::Instance>,
     last_updated: Option<Instant>,
     status: String,
@@ -114,7 +114,7 @@ impl App {
 
     async fn refresh(&mut self, client: &mut RpcClient) {
         match (
-            system::fetch_stats(client).await,
+            system::fetch_kernel_snapshot(client).await,
             system::fetch_instances(client).await,
         ) {
             (Ok(sample), Ok(instances)) => {
@@ -151,7 +151,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     draw_status(frame, layout[2], app);
 }
 
-fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &inspect::KernelSnapshot) {
     let cards = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -203,7 +203,7 @@ fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Samp
 fn draw_main_panels(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
-    sample: &stats::Sample,
+    sample: &inspect::KernelSnapshot,
     instances: &[instances::Instance],
 ) {
     let sections = Layout::default()
@@ -257,7 +257,7 @@ fn draw_main_panels(
 }
 
 /// The input devices the kernel drains, and who is reading them.
-fn draw_input_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+fn draw_input_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &inspect::KernelSnapshot) {
     if sample.inputs.is_empty() {
         let empty = Paragraph::new(Text::from(vec![Line::from(Span::styled(
             "no input devices on this machine",
@@ -314,7 +314,7 @@ fn draw_input_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::
 }
 
 /// The playback streams the kernel pumps, and who is playing them.
-fn draw_audio_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+fn draw_audio_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &inspect::KernelSnapshot) {
     if sample.audio.is_empty() {
         let empty = Paragraph::new(Text::from(vec![Line::from(Span::styled(
             "no playback streams on this machine",
@@ -377,7 +377,11 @@ fn draw_audio_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::
 }
 
 /// The hardware the kernel does not drive itself, and who holds it.
-fn draw_devices_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+fn draw_devices_panel(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    sample: &inspect::KernelSnapshot,
+) {
     let rows = sample.devices.iter().map(|device| {
         let owner = if device.claimed { "held" } else { "free" };
         let style = if device.claimed {
@@ -501,7 +505,7 @@ fn draw_instances_panel(
     frame.render_widget(table, area);
 }
 
-fn draw_cpu_chart(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+fn draw_cpu_chart(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &inspect::KernelSnapshot) {
     let bars: Vec<Bar<'_>> = sample
         .processors
         .utilization
@@ -533,7 +537,7 @@ fn draw_cpu_chart(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sa
     frame.render_widget(chart, area);
 }
 
-fn draw_memory_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+fn draw_memory_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &inspect::KernelSnapshot) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -597,7 +601,7 @@ fn draw_memory_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats:
 /// above it, so nothing is drawn for it. The off-node count is the number
 /// worth seeing: a node whose processors keep being served from another
 /// node has run its own memory out.
-fn node_lines(sample: &stats::Sample) -> Vec<Line<'static>> {
+fn node_lines(sample: &inspect::KernelSnapshot) -> Vec<Line<'static>> {
     if sample.memory.nodes.len() < 2 {
         return Vec::new();
     }
@@ -629,7 +633,7 @@ fn node_lines(sample: &stats::Sample) -> Vec<Line<'static>> {
 /// balloon that stopped short of what the host asked for is the case
 /// worth seeing, so the target is shown alongside whenever the two
 /// differ.
-fn balloon_lines(sample: &stats::Sample) -> Vec<Line<'static>> {
+fn balloon_lines(sample: &inspect::KernelSnapshot) -> Vec<Line<'static>> {
     let Some(balloon) = &sample.balloon else {
         return Vec::new();
     };
@@ -656,7 +660,7 @@ fn balloon_lines(sample: &stats::Sample) -> Vec<Line<'static>> {
 /// The number that matters when a guest feels slow is the mean fault
 /// latency, so it is shown next to how much is out rather than in a
 /// panel of its own.
-fn swap_lines(sample: &stats::Sample) -> Vec<Line<'static>> {
+fn swap_lines(sample: &inspect::KernelSnapshot) -> Vec<Line<'static>> {
     let Some(swap) = &sample.swap else {
         return Vec::new();
     };
@@ -682,7 +686,7 @@ fn swap_lines(sample: &stats::Sample) -> Vec<Line<'static>> {
 
 /// The block device the kernel identified at boot, or the fact that it
 /// has none.
-fn draw_block_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+fn draw_block_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &inspect::KernelSnapshot) {
     let lines = match &sample.block {
         Some(block) => {
             let mut features = Vec::new();
@@ -740,7 +744,11 @@ fn draw_block_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::
 
 /// How well the in-kernel 9p client's caches are keeping the guest from
 /// re-walking the host share, or the fact that there is no share.
-fn draw_host_share_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+fn draw_host_share_panel(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    sample: &inspect::KernelSnapshot,
+) {
     let lines = match &sample.host_share {
         Some(cache) => {
             let hits =
@@ -799,7 +807,7 @@ fn draw_host_share_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &st
 
 /// What the platform's translation unit confines, or the fact that the
 /// machine has none and its devices reach all of memory.
-fn draw_iommu_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+fn draw_iommu_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &inspect::KernelSnapshot) {
     let lines = match &sample.iommu {
         Some(iommu) => {
             let mut lines = vec![
@@ -847,7 +855,11 @@ fn draw_iommu_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::
 /// drains it, so the frame and interrupt counts spread down the column;
 /// a device that cannot steer leaves everything on shard 0, which is
 /// what the summary line names.
-fn draw_network_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+fn draw_network_panel(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    sample: &inspect::KernelSnapshot,
+) {
     let lines = match &sample.network {
         Some(network) if !network.queues.is_empty() => {
             let rx: u64 = network.queues.iter().map(|queue| queue.rx_frames).sum();
@@ -987,7 +999,7 @@ struct MemoryView {
 }
 
 impl MemoryView {
-    fn new(sample: &stats::Sample) -> Self {
+    fn new(sample: &inspect::KernelSnapshot) -> Self {
         let total_bytes = (sample.memory.total_bytes != 0).then_some(sample.memory.total_bytes);
         let available_bytes = total_bytes
             .map(|total| sample.memory.available_bytes.min(total))
@@ -1125,7 +1137,7 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn peak_cpu_busy(sample: &stats::Sample) -> u16 {
+fn peak_cpu_busy(sample: &inspect::KernelSnapshot) -> u16 {
     sample
         .processors
         .utilization
@@ -1135,11 +1147,11 @@ fn peak_cpu_busy(sample: &stats::Sample) -> u16 {
         .unwrap_or(0)
 }
 
-fn peak_cpu_percent(sample: &stats::Sample) -> String {
+fn peak_cpu_percent(sample: &inspect::KernelSnapshot) -> String {
     format!("{:.1}%", f64::from(peak_cpu_busy(sample)) / 10.0)
 }
 
-fn busiest_core_text(sample: &stats::Sample) -> String {
+fn busiest_core_text(sample: &inspect::KernelSnapshot) -> String {
     sample
         .processors
         .utilization
@@ -1180,19 +1192,19 @@ fn memory_pressure_label(pressure: MemoryPressure) -> &'static str {
 mod tests {
     use super::*;
 
-    fn sample(nodes: Vec<stats::MemoryNode>) -> stats::Sample {
-        stats::Sample {
+    fn sample(nodes: Vec<inspect::MemoryNode>) -> inspect::KernelSnapshot {
+        inspect::KernelSnapshot {
             timestamp: 0,
             uptime: 0,
             wall_clock: 0,
-            processors: stats::Processors {
+            processors: inspect::Processors {
                 configured: 0,
                 online: 0,
                 utilization: Vec::new(),
                 guest_isa_level: String::new(),
                 guest_isa_extras: Vec::new(),
             },
-            memory: stats::Memory {
+            memory: inspect::Memory {
                 total_bytes: 0,
                 available_bytes: 0,
                 pressure: MemoryPressure::Nominal,
@@ -1207,11 +1219,13 @@ mod tests {
             devices: Vec::new(),
             inputs: Vec::new(),
             audio: Vec::new(),
+            containers: Vec::new(),
+            hv_vms: Vec::new(),
         }
     }
 
-    fn node(id: u32, total_bytes: u64, available_bytes: u64, off: u64) -> stats::MemoryNode {
-        stats::MemoryNode {
+    fn node(id: u32, total_bytes: u64, available_bytes: u64, off: u64) -> inspect::MemoryNode {
+        inspect::MemoryNode {
             id,
             total_bytes,
             available_bytes,

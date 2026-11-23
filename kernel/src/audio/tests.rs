@@ -1431,20 +1431,26 @@ mod component_host {
         );
     }
 
-    /// The inventory a program reads agrees with what its claims answer:
-    /// a stream it cannot claim is not listed.
+    /// Kernel audio telemetry under `/kernel/audio/*` requires machine-scoped
+    /// inspect authority and is hidden from callers without it.
     #[test]
-    fn program_stats_hide_streams_the_caller_cannot_claim() {
+    fn kernel_audio_inspect_requires_machine_scope() {
+        use crate::wasmtime_adapter::component_host::inspect::snapshot_for_store;
+        use crate::{AuthorityScope, PrefixSet};
+
         let (service, _inboxes) = service_of(&[playback_stream(0)]);
-        let listed = |authority: ProcessAuthority| {
+        let prefix = PrefixSet::from_prefixes(["/kernel/audio"]).unwrap();
+        let entry_count = |authority: ProcessAuthority| {
             let data = store_under(authority, &service);
-            let mut sample = data.runtime_state.snapshot(0);
-            sample.restrict_to(data.process_authority());
-            sample.audio.len()
+            snapshot_for_store(&data, &prefix, 0).entries.len()
         };
 
-        assert_eq!(listed(ProcessAuthority::empty()), 0);
-        assert_eq!(listed(authority_with(DeviceClassRights::AUDIO)), 1);
+        assert_eq!(entry_count(ProcessAuthority::empty()), 0);
+        assert_eq!(entry_count(authority_with(DeviceClassRights::AUDIO)), 0);
+
+        let mut inspector = ProcessAuthority::empty();
+        inspector.grant_inspect_read(AuthorityScope::Machine);
+        assert!(entry_count(inspector) > 0);
     }
 
     /// A program that holds the audio class lists the streams and claims

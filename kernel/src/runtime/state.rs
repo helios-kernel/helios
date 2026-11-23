@@ -5,16 +5,19 @@ use core::panic::Location;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use triomphe::Arc;
 
+use crate::hv::HvTelemetryRegistry;
+use crate::inspect::{InspectRegistry, KernelTelemetrySnapshot};
 use crate::{
     BOOT_DEVICE, BootFs, BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
-    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedComponent, FoldedProfileSample, HEAP_SIZE_CLASS_COUNT,
-    HOST_SHARE_GUEST_MOUNT_PATH, HeapStats, HostShare, InstanceId, InstanceRegistry,
-    InstructionSampler, MountTable, MountedFs, Namespace, Notify, PerfMetricFilter,
-    PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink,
-    StatsSample, TraceEvent, TraceFilter, TraceLog,
+    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedComponent, EmbeddedInit, FoldedProfileSample,
+    HEAP_SIZE_CLASS_COUNT, HOST_SHARE_GUEST_MOUNT_PATH, HeapStats, HostShare, InstanceId,
+    InstanceRegistry, InstructionSampler, MountTable, MountedFs, Namespace, Notify,
+    PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileScope,
+    ProfileSink, Settings, TraceEvent, TraceFilter, TraceLog,
 };
 use crate::{MachineGeneration, MachineGenerationHandle, RootEntropy, RootEntropyHandle};
 use crate::{MountGrant, MountSharing};
+use crossbeam_utils::CachePadded;
 use helios_hal::cpu::{HardwarePerfCounterDelta, Timebase};
 use helios_hal::fs::FileSystemRights;
 use helios_hal::rtc::{RealTimeClock, UnixSeconds};
@@ -52,6 +55,15 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// the root DRBG rekeys against and the reactions to a restore wait
     /// on. Installed before the root entropy.
     machine_generation: Once<MachineGenerationHandle>,
+    /// This boot's Ed25519 machine identity key, settled alongside the
+    /// compiler-signing key from the measured-boot or ephemeral seed.
+    machine_identity: Once<crate::MachineIdentityKey>,
+    /// Nonzero token of the active `snapshot-hold` keeping the 9p share quiet
+    /// for a VM snapshot, or `0` when no hold is in force.
+    snapshot_hold_token: AtomicU64,
+    /// Monotonic token generator for `snapshot_hold_token` (starts at `1`;
+    /// skips `0` on wrap).
+    next_snapshot_hold_token: AtomicU64,
     /// Nanoseconds between the monotonic clock and wall time, as the
     /// platform's real-time clock last set them: at bring-up, and again
     /// after each machine restore. Unseeded on a machine that carries no
@@ -128,6 +140,9 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// `argv0`, and the boot filesystem it carries — parsed from the
     /// boot module at bring-up.
     payload: BootPayload,
+    boot_init_launched: AtomicBool,
+    boot_init_completed: AtomicBool,
+    boot_init_ready: Notify,
     /// The root namespace: the kernel's own process tree, which every
     /// program's tree descends from. Its root is the payload's boot
     /// filesystem; the host share joins its table once a backend installs
@@ -142,7 +157,19 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// backend whose timer captures them installs its capture here during
     /// bring-up.
     instructions: InstructionSampler,
+    /// Component-published lock-free inspect spans (`/instances/<id>/<name>/*`).
+    inspect: InspectRegistry,
+    /// Live virtual-machine telemetry exposed under `/kernel/hv/*`.
+    hv_telemetry: HvTelemetryRegistry,
+    /// Weak handles to live Linux containers exposed under `/kernel/containers/*`.
+    #[cfg(feature = "linux")]
+    containers: Mutex<alloc::vec::Vec<alloc::sync::Weak<crate::LinuxContainer<StorageImpl>>>>,
     heap_perf_snapshot: HeapPerfSnapshot,
+    /// The operator's machine-wide settings. Padded to its own cache
+    /// line: every process creation reads them and the profile counters
+    /// above are written constantly. Its words are written by whichever
+    /// processor serves a write (see [`crate::Settings`]).
+    settings: CachePadded<Settings>,
 }
 
 struct HeapPerfSnapshot {
@@ -353,6 +380,9 @@ where
                 network_service_ready: Notify::new(),
                 root_entropy: Once::new(),
                 machine_generation: Once::new(),
+                machine_identity: Once::new(),
+                snapshot_hold_token: AtomicU64::new(0),
+                next_snapshot_hold_token: AtomicU64::new(1),
                 wall_clock: crate::exec::WallClock::new(),
                 http_client: PerProcessorProvider::new(),
                 host_fs_service: Mutex::new(None),
@@ -373,6 +403,9 @@ where
                 audio_service: Once::new(),
                 vsock_service: Once::new(),
                 payload,
+                boot_init_launched: AtomicBool::new(false),
+                boot_init_completed: AtomicBool::new(false),
+                boot_init_ready: Notify::new(),
                 namespace: Namespace::new(MountTable::new(
                     BootFs::new(payload.bootfs(), BOOT_DEVICE),
                     processor_count,
@@ -383,7 +416,12 @@ where
                     DEFAULT_PERF_METRIC_CAPACITY,
                 ),
                 instructions: InstructionSampler::new(processor_count),
+                inspect: InspectRegistry::new(),
+                hv_telemetry: HvTelemetryRegistry::new(),
+                #[cfg(feature = "linux")]
+                containers: Mutex::new(alloc::vec::Vec::new()),
                 heap_perf_snapshot: HeapPerfSnapshot::new(),
+                settings: CachePadded::new(Settings::default()),
             }),
         }
     }
@@ -425,6 +463,12 @@ where
             self.inner.heap_perf_snapshot.reset(crate::heap_stats());
         }
         self.inner.profiles.set_enabled(enabled);
+    }
+
+    /// The machine-wide settings. Every consumer reaches them through the
+    /// state it already holds.
+    pub fn settings(&self) -> &Settings {
+        &self.inner.settings
     }
 
     /// The instruction-address sampler. It has its own start and stop
@@ -1005,6 +1049,61 @@ where
         })
     }
 
+    /// Publishes this boot's Ed25519 machine identity key once bring-up
+    /// settles the signing seed.
+    pub fn install_machine_identity_key(&self, key: crate::MachineIdentityKey) {
+        let mut installed = false;
+        self.inner.machine_identity.call_once(|| {
+            installed = true;
+            key
+        });
+        assert!(
+            installed,
+            "the machine identity key was installed more than once"
+        );
+    }
+
+    /// This boot's Ed25519 machine identity key, once installed.
+    pub fn machine_identity_key(&self) -> Option<&crate::MachineIdentityKey> {
+        self.inner.machine_identity.get()
+    }
+
+    /// Acquires the exclusive snapshot hold and quiets the 9p host share
+    /// (when attached). Dropping the returned [`SnapshotHold`] reopens
+    /// the share and clears the hold, including if this future is
+    /// cancelled mid-drain.
+    pub async fn prepare_snapshot_hold(
+        &self,
+    ) -> Result<SnapshotHold<ProgramService, NetworkService, StorageImpl>, SnapshotHoldBusy> {
+        let mut token = self
+            .inner
+            .next_snapshot_hold_token
+            .fetch_add(1, Ordering::Relaxed);
+        if token == 0 {
+            token = self
+                .inner
+                .next_snapshot_hold_token
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if self
+            .inner
+            .snapshot_hold_token
+            .compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(SnapshotHoldBusy);
+        }
+        let hold = SnapshotHold {
+            state: self.clone(),
+            token,
+            active: true,
+        };
+        if let Some(host_fs) = self.host_fs_service() {
+            host_fs.prepare_snapshot().await;
+        }
+        Ok(hold)
+    }
+
     /// Publishes the root DRBG the backend seeded at boot.
     pub fn install_root_entropy(&self, root: RootEntropyHandle) {
         let mut installed = false;
@@ -1199,6 +1298,50 @@ where
         self.inner.vsock_service.get().cloned()
     }
 
+    /// The boot-time init component and `argv0` this payload carries.
+    pub fn embedded_init(&self) -> EmbeddedInit {
+        self.inner.payload.embedded_init()
+    }
+
+    /// Marks that the bootstrap processor has scheduled the payload's
+    /// boot `init` component to run.
+    pub(crate) fn mark_boot_init_launched(&self) {
+        assert!(
+            !self.inner.boot_init_launched.swap(true, Ordering::AcqRel),
+            "boot init was launched more than once"
+        );
+    }
+
+    /// Marks that the payload's boot `init` component has finished its
+    /// bring-up run and wakes any system component waiting for it.
+    pub(crate) fn mark_boot_init_completed(&self) {
+        self.inner
+            .boot_init_completed
+            .store(true, Ordering::Release);
+        self.inner.boot_init_ready.notify_all();
+    }
+
+    /// Whether the payload's boot `init` component has finished running.
+    pub fn boot_init_completed(&self) -> bool {
+        self.inner.boot_init_completed.load(Ordering::Acquire)
+    }
+
+    /// Waits until the payload's boot `init` component has finished.
+    ///
+    /// Waits unconditionally rather than checking `boot_init_launched`: on
+    /// SMP boots a secondary processor can reach the system component entry
+    /// before the bootstrap processor schedules `init`, so checking
+    /// `boot_init_launched` here would let it bypass the barrier.
+    pub async fn wait_for_boot_init(&self) {
+        loop {
+            let ready = self.inner.boot_init_ready.notified();
+            if self.inner.boot_init_completed.load(Ordering::Acquire) {
+                return;
+            }
+            ready.await;
+        }
+    }
+
     /// The system component this payload carries, when this build would
     /// autostart one.
     pub fn system_component(&self) -> Option<EmbeddedComponent> {
@@ -1230,10 +1373,46 @@ where
     NetworkService: crate::NetworkAdminBackend,
     StorageImpl: Storage,
 {
-    pub fn snapshot(&self, current_ticks: u64) -> StatsSample {
+    pub fn inspect_registry(&self) -> &InspectRegistry {
+        &self.inner.inspect
+    }
+
+    pub fn hv_telemetry(&self) -> &HvTelemetryRegistry {
+        &self.inner.hv_telemetry
+    }
+
+    #[cfg(feature = "linux")]
+    pub fn register_container(
+        &self,
+        container: &alloc::sync::Arc<crate::LinuxContainer<StorageImpl>>,
+    ) {
+        let mut list = self.inner.containers.lock();
+        list.retain(|weak| weak.strong_count() > 0);
+        list.push(alloc::sync::Arc::downgrade(container));
+    }
+
+    #[cfg(feature = "linux")]
+    pub fn container_snapshots(&self) -> alloc::vec::Vec<crate::LinuxContainerSnapshot> {
+        let live: alloc::vec::Vec<alloc::sync::Arc<crate::LinuxContainer<StorageImpl>>> = {
+            let mut list = self.inner.containers.lock();
+            list.retain(|weak| weak.strong_count() > 0);
+            list.iter().filter_map(alloc::sync::Weak::upgrade).collect()
+        };
+        let mut snapshots: alloc::vec::Vec<_> =
+            live.iter().map(|container| container.telemetry()).collect();
+        snapshots.sort_unstable_by_key(|snapshot| snapshot.id);
+        snapshots
+    }
+
+    pub fn kernel_telemetry_snapshot(&self, current_ticks: u64) -> KernelTelemetrySnapshot {
         let uptime = self.ticks_to_nanos(current_ticks.saturating_sub(self.inner.boot_ticks));
         let guest_isa = self.inner.guest_isa;
-        StatsSample {
+        let machine = crate::machine_memory();
+        let memory_total_bytes =
+            u64::try_from(machine.usable_bytes).expect("machine memory does not fit into u64");
+        let memory_available_bytes =
+            u64::try_from(machine.free_bytes).expect("free machine memory does not fit into u64");
+        KernelTelemetrySnapshot {
             timestamp: uptime,
             uptime,
             wall_clock: self.wall_clock_nanos(current_ticks),
@@ -1242,6 +1421,9 @@ where
                 .unwrap_or_else(|_| panic!("the online processor count does not fit a u32")),
             guest_isa_level: guest_isa.processor().base_name(),
             guest_isa_extras: guest_isa.processor().extras().collect(),
+            memory_total_bytes,
+            memory_available_bytes,
+            memory_nodes: crate::memory::try_user_node_stats(),
             block: self.inner.block_service.get().map(BlockService::stats),
             iommu: self
                 .inner
@@ -1269,6 +1451,9 @@ where
                 .get()
                 .map(crate::audio::AudioService::snapshot)
                 .unwrap_or_default(),
+            #[cfg(feature = "linux")]
+            containers: self.container_snapshots(),
+            hv_vms: self.inner.hv_telemetry.snapshot(),
         }
     }
 }
@@ -1288,6 +1473,10 @@ where
             "a socket resource retired a network handle on a machine with no network service",
         );
         crate::retire_queued_handles(retired, &service);
+    }
+
+    fn release_snapshot_hold(&self, token: u64) {
+        self.finish_snapshot_hold(token);
     }
 
     fn uptime_nanos(&self, current_ticks: u64) -> u64 {
@@ -1359,6 +1548,92 @@ where
         sample: PerfSample,
     ) {
         RuntimeState::record_perf_metric_parts(self, scope, prefix, suffix, sample);
+    }
+}
+
+impl<ProgramService, NetworkService, StorageImpl: Storage>
+    RuntimeState<ProgramService, NetworkService, StorageImpl>
+{
+    /// Releases the snapshot hold identified by `token` and reopens the 9p
+    /// host share. Stale tokens (such as a pre-restore hold dropped after a
+    /// VM restore cleared the gate) are ignored so they can never cancel a
+    /// newer hold.
+    pub fn finish_snapshot_hold(&self, token: u64) {
+        if token == 0 {
+            return;
+        }
+        if self
+            .inner
+            .snapshot_hold_token
+            .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let host_fs = self.inner.host_fs_service.lock().clone();
+            if let Some(host_fs) = host_fs {
+                host_fs.snapshot_finished();
+            }
+        }
+    }
+
+    /// Clears any pre-snapshot hold token after a VM restore advances the
+    /// machine generation (`reset_host_share` has already re-attached the
+    /// host share). Any surviving pre-restore hold carries an older token
+    /// and becomes a no-op on drop.
+    pub fn clear_snapshot_hold_on_restore(&self) {
+        self.inner.snapshot_hold_token.store(0, Ordering::Release);
+    }
+
+    pub fn snapshot_hold_active(&self) -> bool {
+        self.inner.snapshot_hold_token.load(Ordering::Acquire) != 0
+    }
+}
+
+/// Another caller already holds an active [`SnapshotHold`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("a machine snapshot hold is already active")]
+pub struct SnapshotHoldBusy;
+
+/// Exclusive RAII hold over the machine's 9p snapshot gate.
+#[must_use = "dropping a SnapshotHold reopens the host-share gate"]
+pub struct SnapshotHold<ProgramService, NetworkService, StorageImpl: Storage> {
+    state: RuntimeState<ProgramService, NetworkService, StorageImpl>,
+    token: u64,
+    active: bool,
+}
+
+impl<ProgramService, NetworkService, StorageImpl>
+    SnapshotHold<ProgramService, NetworkService, StorageImpl>
+where
+    ProgramService: Clone,
+    NetworkService: Clone,
+    StorageImpl: Storage,
+{
+    /// Monotonic hold token identifying this specific lease.
+    pub const fn token(&self) -> u64 {
+        self.token
+    }
+
+    /// Whether this boot exposes a VM generation ID window so a snapshot
+    /// restore can tell itself apart from the continuing machine.
+    pub fn has_generation_id(&self) -> bool {
+        self.state.machine_generation().has_window()
+    }
+
+    /// Transfers cleanup responsibility to an external retirement channel
+    /// (such as a component store's resource retirement queue) without
+    /// releasing the hold now.
+    pub(crate) fn disarm(mut self) {
+        self.active = false;
+    }
+}
+
+impl<ProgramService, NetworkService, StorageImpl: Storage> Drop
+    for SnapshotHold<ProgramService, NetworkService, StorageImpl>
+{
+    fn drop(&mut self) {
+        if self.active {
+            self.state.finish_snapshot_hold(self.token);
+        }
     }
 }
 

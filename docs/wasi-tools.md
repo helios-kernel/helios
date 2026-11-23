@@ -250,8 +250,8 @@ unix_seconds=1788381063
 The kernel logs `wall clock seeded source=<device> unix_seconds=<n>` as
 it reads the device; that line reaches the serial on backends that
 mirror kernel logs there (AArch64) and stays in the trace history on the
-others. `helios:system/stats` carries the same wall clock in every
-snapshot.
+others. `helios:system/inspect` carries the same wall clock under
+`/kernel/clock/wall-clock-nanos`.
 
 The staged coreutils module provides ordinary shell helpers used by the
 WASIX shell smoke tests:

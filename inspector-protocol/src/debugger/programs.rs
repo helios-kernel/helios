@@ -164,8 +164,15 @@ mod guest {
                         host_programs::root_process_grant(),
                         host_programs::root_mount_grant(),
                         host_programs::all_device_classes_grant(),
-                        host_programs::observe_machine_grant(),
-                        host_programs::control_processors_grant(),
+                        host_programs::inspect_read_grant(host_programs::AuthorityScope::Machine),
+                        host_programs::trace_read_grant(host_programs::AuthorityScope::Machine),
+                        host_programs::profile_read_grant(host_programs::AuthorityScope::Machine),
+                        host_programs::diagnostics_control_grant(),
+                        host_programs::instance_control_grant(
+                            host_programs::AuthorityScope::Machine,
+                        ),
+                        host_programs::write_settings_grant(),
+                        host_programs::machine_control_grant(),
                     ],
                 })
                 .await
@@ -282,8 +289,12 @@ mod guest {
                 host_programs::root_process_grant(),
                 host_programs::root_mount_grant(),
                 host_programs::all_device_classes_grant(),
-                host_programs::observe_machine_grant(),
-                host_programs::control_processors_grant(),
+                host_programs::inspect_read_grant(host_programs::AuthorityScope::Machine),
+                host_programs::trace_read_grant(host_programs::AuthorityScope::Machine),
+                host_programs::profile_read_grant(host_programs::AuthorityScope::Machine),
+                host_programs::diagnostics_control_grant(),
+                host_programs::instance_control_grant(host_programs::AuthorityScope::Machine),
+                host_programs::machine_control_grant(),
             ],
         };
         let container = match host_programs::create_container(config).await {

@@ -246,7 +246,13 @@ impl<C: Cpu + Clone, N: ComponentHostNetwork, S: Storage> wire::HostVm for Store
         if self.cpu.hv().is_none() {
             return Ok(Err(wire::HvError::Unavailable));
         }
-        let vm = match crate::hv::create_vm(&self.cpu, crate::memory::user_memory_pool(), limit) {
+        let vm = match crate::hv::create_vm_observed(
+            &self.cpu,
+            crate::memory::user_memory_pool(),
+            limit,
+            self.runtime_state.hv_telemetry(),
+            Some(self.instance().id()),
+        ) {
             Ok(vm) => vm,
             Err(error) => return Ok(Err(error.into())),
         };

@@ -16,7 +16,7 @@ use helios_hal::cpu::HardwarePerfCounterDelta;
 use spin::Mutex;
 use triomphe::Arc;
 
-use crate::{InstanceId, ObserveMachineCap};
+use crate::{InstanceId, InstanceRegistry};
 
 pub const DEFAULT_TRACE_HISTORY_CAPACITY: usize = 512;
 pub const DEFAULT_PROFILE_STACK_CAPACITY: usize = 1024;
@@ -109,6 +109,11 @@ impl PrefixSet {
         self.0.len()
     }
 
+    /// Iterates over the configured prefixes.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(|prefix| prefix.as_str())
+    }
+
     /// Whether `name` starts with one of the prefixes, or the set is
     /// empty and so restricts nothing.
     pub fn admits(&self, name: &str) -> bool {
@@ -117,6 +122,18 @@ impl PrefixSet {
                 .0
                 .iter()
                 .any(|prefix| name.starts_with(prefix.as_str()))
+    }
+
+    /// Whether any path starting with `subtree` could match this prefix set.
+    ///
+    /// Used to prune whole kernel subtrees and component publications before
+    /// copying data out of subsystems that no prefix in the query can select.
+    pub fn may_match_subtree(&self, subtree: &str) -> bool {
+        self.0.is_empty()
+            || self.0.iter().any(|prefix| {
+                let p = prefix.as_str();
+                p.starts_with(subtree) || subtree.starts_with(p)
+            })
     }
 }
 
@@ -160,69 +177,6 @@ pub enum TraceLevel {
     Info,
     Debug,
     Trace,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StatsSample {
-    pub timestamp: u64,
-    pub uptime: u64,
-    /// Wall time in nanoseconds since the Unix epoch, as the real-time
-    /// clock the kernel read at boot places it. Zero on a machine that
-    /// carried no such clock, where wall time is uptime.
-    pub wall_clock: u64,
-    pub configured_processors: u32,
-    pub online_processors: u32,
-    /// The ISA level guest code is compiled for, without the extras its
-    /// name appends (`x86-64-v4` for `x86-64-v4+vbmi+bitalg`).
-    pub guest_isa_level: &'static str,
-    /// The features guest code uses beyond `guest_isa_level`.
-    pub guest_isa_extras: Vec<&'static str>,
-    /// The block device the kernel owns, absent on a machine that gave
-    /// it none.
-    pub block: Option<crate::BlockStats>,
-    /// The platform's I/O translation unit, absent on a machine whose
-    /// devices are not confined by one.
-    pub iommu: Option<crate::IommuStats>,
-    /// The memory balloon the host resizes this guest through, absent on
-    /// a machine that gave the kernel none.
-    pub balloon: Option<crate::memory::BalloonStats>,
-    /// What the kernel has swapped out and what bringing it back costs,
-    /// absent on a machine that runs without swap.
-    pub swap: Option<crate::memory::SwapStats>,
-    /// How the host share's 9p caches have served the kernel, absent on
-    /// a machine with no host share behind a 9p session.
-    pub host_share: Option<crate::HostFsCacheStats>,
-    /// How the interface's work is spread across processors, absent on a
-    /// machine that gave the kernel no network device.
-    pub network: Option<crate::NetworkStats>,
-    /// The hardware the kernel does not drive itself and has offered to
-    /// user-mode drivers. Empty on a machine that described none.
-    pub devices: Vec<crate::GrantedDeviceSnapshot>,
-    /// The input devices the kernel owns and drains. Empty on a machine
-    /// that gave it none.
-    pub inputs: Vec<crate::InputDeviceSnapshot>,
-    /// The playback streams the kernel owns and pumps. Empty on a
-    /// machine that gave it no sound device.
-    pub audio: Vec<crate::AudioStreamSnapshot>,
-}
-
-impl StatsSample {
-    /// Drop the device, input and audio entries `authority` could not
-    /// claim.
-    ///
-    /// A claim an instance may not make is answered as if the hardware
-    /// were absent, so the inventory it can read has to agree: a listed
-    /// device would answer the existence question the claim hides.
-    pub(crate) fn restrict_to(&mut self, authority: &crate::ProcessAuthority) {
-        let granted = authority.granted_devices();
-        self.devices.retain(|device| granted.contains(&device.name));
-        if authority.derive_input_claim_cap().is_err() {
-            self.inputs.clear();
-        }
-        if authority.derive_audio_claim_cap().is_err() {
-            self.audio.clear();
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -323,16 +277,65 @@ pub trait ObservationScope {
     fn admits(&self, origin: Option<InstanceId>) -> bool;
 }
 
-/// Holding the right to observe the machine admits every record, the
-/// kernel's own included.
-impl ObservationScope for ObserveMachineCap {
+/// Admits no record at all, for a caller that holds no read capability
+/// over the requested history.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NoObservation;
+
+impl ObservationScope for NoObservation {
+    fn admits(&self, _origin: Option<InstanceId>) -> bool {
+        false
+    }
+}
+
+/// Admits every record on the machine, kernel-origin records included.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MachineObservation;
+
+impl ObservationScope for MachineObservation {
     fn admits(&self, _origin: Option<InstanceId>) -> bool {
         true
     }
 }
 
-/// What a reader without the machine-wide right sees: the records its own
-/// instance wrote, and never the kernel's or another instance's.
+/// Admits records attributed to `root` or any descendant in `root`'s
+/// subtree (resolved through [`InstanceRegistry`]'s live and retired
+/// immutable ancestor chains), excluding kernel-origin (`None`) records.
+#[derive(Clone)]
+pub struct SubtreeObservation {
+    root: InstanceId,
+    registry: InstanceRegistry,
+}
+
+impl core::fmt::Debug for SubtreeObservation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SubtreeObservation")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SubtreeObservation {
+    pub const fn new(root: InstanceId, registry: InstanceRegistry) -> Self {
+        Self { root, registry }
+    }
+
+    pub const fn root(&self) -> InstanceId {
+        self.root
+    }
+}
+
+impl ObservationScope for SubtreeObservation {
+    fn admits(&self, origin: Option<InstanceId>) -> bool {
+        let Some(origin) = origin else {
+            return false;
+        };
+        origin == self.root || self.registry.is_in_subtree(self.root, origin)
+    }
+}
+
+/// What a reader with `Own` scope sees: the records its own instance
+/// wrote, and never the kernel's or another instance's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnInstance(InstanceId);
 

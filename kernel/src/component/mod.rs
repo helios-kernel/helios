@@ -37,12 +37,13 @@ pub use provider::{
 };
 pub use resources::{
     ComponentRawMutex, ComponentRawMutexGuard, ComponentRawRwLock, ComponentRawRwLockReadGuard,
-    ComponentRawRwLockWriteGuard, ComponentSerialPort, ComponentTcpBackend, ComponentTcpStream,
-    ComponentUdpBackend, ComponentUdpSocket,
+    ComponentRawRwLockWriteGuard, ComponentSamplingSession, ComponentSerialPort,
+    ComponentSnapshotHold, ComponentTcpBackend, ComponentTcpStream, ComponentUdpBackend,
+    ComponentUdpSocket,
 };
 pub use retire::{
-    RetiredNetworkHandle, SocketRetirementQueue, SocketRetirementSender, StoreSocketRetirement,
-    retire_queued_handles,
+    RetiredNetworkHandle, SnapshotRetirementSender, SocketRetirementQueue, SocketRetirementSender,
+    StoreSocketRetirement, retire_queued_handles,
 };
 pub use runtime::{
     COMPONENT_ASYNC_STACK_SIZE, ComponentInputRoute, ComponentOutputMode, ComponentOutputRoute,
