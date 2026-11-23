@@ -646,18 +646,6 @@ impl<CpuImpl: Cpu> Trace<CpuImpl> {
         replied_ns - clock.arrival_ns
     }
 
-    /// Re-arms the emit-on-drop guard around a `Timeline` another
-    /// scope began — a guest launch syscall hands the timeline down
-    /// call by call, and each callee's failure exits are its own to
-    /// report.
-    pub(crate) fn adopt(cpu: CpuImpl, timeline: Timeline) -> Self {
-        Self {
-            cpu,
-            timeline,
-            emit_on_drop: true,
-        }
-    }
-
     /// The shared handle — handed to the loader, the spawn, and the
     /// run task.
     pub(crate) fn timeline(&self) -> &Timeline {

@@ -185,6 +185,44 @@ pub(crate) fn xsave_sizes() -> (u32, u32) {
     (leaf.ebx, leaf.ecx)
 }
 
+/// Active `XCR0` user-state mask programmed on every processor (`XGETBV(0)`).
+#[cfg(feature = "native-users")]
+pub(crate) fn current_xcr0() -> u64 {
+    // SAFETY: `OSXSAVE` is enabled before any native context is created.
+    unsafe {
+        let eax: u32;
+        let edx: u32;
+        core::arch::asm!(
+            "xgetbv",
+            in("ecx") 0_u32,
+            lateout("eax") eax,
+            lateout("edx") edx,
+            options(nomem, nostack, preserves_flags),
+        );
+        u64::from(eax) | (u64::from(edx) << 32)
+    }
+}
+
+/// Hardware-supported `MXCSR` feature mask (Intel SDM vol. 1, §11.6.6).
+/// Bits outside this mask raise `#GP` when loaded by `XRSTOR`/`LDMXCSR`.
+#[cfg(feature = "native-users")]
+pub(crate) fn mxcsr_mask() -> u32 {
+    #[repr(C, align(16))]
+    struct FxSave([u8; 512]);
+    let mut area = FxSave([0; 512]);
+    // SAFETY: `area` is 16-byte aligned and 512 bytes long, matching `FXSAVE64`.
+    unsafe {
+        core::arch::asm!(
+            "fxsave64 [{}]",
+            in(reg) area.0.as_mut_ptr(),
+            options(nostack, preserves_flags),
+        );
+    }
+    let mask = u32::from_le_bytes(area.0[28..32].try_into().unwrap());
+    // Intel SDM vol. 1, §11.6.6: 0 means the default mask 0x0000_ffbf.
+    if mask == 0 { 0x0000_ffbf } else { mask }
+}
+
 /// What CPUID.(EAX=0DH,ECX=1) reports about supervisor state. Helios
 /// enables no supervisor state, so its IA32_XSS stays 0. Under KVM, a
 /// guest whose CPUID reports XSAVES makes the host write IA32_XSS on every

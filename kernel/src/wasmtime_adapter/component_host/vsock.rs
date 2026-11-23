@@ -21,8 +21,9 @@ use alloc::vec::Vec;
 
 use helios_hal::cpu::Cpu;
 use helios_hal::vsock::{VsockAddress, VsockShutdown};
-use wasmtime::StoreContextMut;
-use wasmtime::component::{Accessor, ComponentType, Lift, Linker, Lower, Resource, ResourceType};
+use wasmtime::component::{
+    Access, Accessor, ComponentType, Lift, Linker, Lower, Resource, ResourceType,
+};
 
 use crate::wasmtime_adapter::bindings::debugger::bindings as debugger_bindings;
 use crate::wasmtime_adapter::bindings::program::bindings as program_bindings;
@@ -247,7 +248,7 @@ where
     )?;
     instance.func_wrap_concurrent_immediate(
         "guest-cid",
-        |caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>, (): ()| {
+        |caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>, (): ()| {
             let store = caller.data();
             let cid = store
                 .debug_port()
@@ -258,7 +259,7 @@ where
     )?;
     instance.func_wrap_concurrent_immediate(
         "listen",
-        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+        |mut caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (port, backlog): (u32, u32)| {
             let service = match authorise::<Bindings, _, _, _>(caller.data()) {
                 Ok(service) => service,
@@ -306,7 +307,7 @@ where
     )?;
     instance.func_wrap_concurrent_immediate(
         "[method]vsock-listener.port",
-        |caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+        |caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockListener>,)| {
             let listener = caller.data().table.get(&resource)?;
             Ok((listener
@@ -345,7 +346,7 @@ where
     )?;
     instance.func_wrap_concurrent_immediate(
         "[method]vsock-listener.close",
-        |caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+        |caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockListener>,)| {
             let listener = caller.data().table.get(&resource)?;
             Ok((listener
@@ -356,7 +357,7 @@ where
     )?;
     instance.func_wrap_concurrent_immediate(
         "[method]vsock-stream.peer",
-        |caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+        |caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockStream>,)| {
             let stream = caller.data().table.get(&resource)?;
             Ok((stream

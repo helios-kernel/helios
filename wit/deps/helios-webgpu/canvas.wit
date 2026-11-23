@@ -1,0 +1,47 @@
+package helios:webgpu@0.1.0;
+
+/// The platform half of WebGPU's canvas: where `wasi:webgpu`'s
+/// `gpu-canvas-context` draws and how a frame reaches the compositor.
+///
+/// A browser owns an HTML canvas and presents it when the page yields. A
+/// Helios program owns a `canvas` instead, and `present` is the explicit end
+/// of the frame: the drawing buffer is copied on the GPU into an image the
+/// compositor scans out, so no pixel crosses the CPU.
+interface canvas {
+  use wasi:webgpu/webgpu@0.3.0-rc.2.{gpu-canvas-context};
+  use helios:system/surface@0.1.0.{error as surface-error, size};
+  use helios:system/input@0.1.0.{input-event};
+
+  /// Why a canvas request failed.
+  variant error {
+    /// The compositor refused the surface or the frame.
+    surface(surface-error),
+    /// The context holds no configuration, so there is no drawing buffer.
+    unconfigured,
+    /// The GPU could not allocate, copy or complete the frame.
+    presentation(string),
+  }
+
+  /// One window's worth of WebGPU drawing buffer.
+  resource canvas {
+    /// Ask the compositor for a surface of `width` by `height` pixels.
+    create: static async func(width: u32, height: u32) -> result<canvas, error>;
+
+    /// The size the canvas was created at.
+    %size: func() -> size;
+
+    /// The WebGPU context drawing into this canvas. Every call returns a
+    /// handle to the same context.
+    context: func() -> gpu-canvas-context;
+
+    /// End the frame: hand the drawing buffer to the compositor and expire
+    /// the current texture, as a browser does when the page yields.
+    ///
+    /// Resolves when the compositor has taken the frame. The next
+    /// `get-current-texture` starts a cleared drawing buffer.
+    present: async func() -> result<_, error>;
+
+    /// Every input event the compositor routed to this canvas.
+    events: func() -> stream<input-event>;
+  }
+}

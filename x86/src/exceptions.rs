@@ -337,6 +337,13 @@ impl ProcessorIdt {
             install_interrupt(table, SCI_INTERRUPT_VECTOR, helios_x86_interrupt_sci);
             #[cfg(feature = "native-users")]
             {
+                // Ring-3 `int3` (`0xCC`) checks `CPL <= IDT[3].DPL` before
+                // delivering `#BP`, matching Linux `arch/x86/kernel/idt.c`
+                // (`SYSG(X86_TRAP_BP, ...)`).
+                table
+                    .breakpoint
+                    .set_handler_addr(handler_address(helios_x86_exception_breakpoint))
+                    .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
                 table
                     .debug
                     .set_handler_addr(handler_address(helios_x86_exception_debug));
@@ -679,6 +686,21 @@ extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) {
     if frame.vector == PAGE_FAULT_VECTOR {
         assert_frame_on_exception_stack(frame);
         let faulting_address = Cr2::read_raw() as usize;
+        // The isolation check reaches each user page through a `call`, so
+        // the refused access resumes its caller as a return would.
+        #[cfg(feature = "native-users")]
+        if frame.cs & 3 == 0
+            && smp::current_runtime()
+                .isolation_probe
+                .claim(faulting_address, frame.error_code)
+        {
+            // SAFETY: the faulting code is the check's own, running on a
+            // kernel stack whose top word is the return address its `call`
+            // pushed.
+            frame.rip = unsafe { (frame.rsp as *const u64).read() };
+            frame.rsp += 8;
+            return;
+        }
         if resolve_probe_fault(faulting_address) {
             return;
         }

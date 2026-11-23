@@ -31,6 +31,14 @@ pub(crate) struct PathPairRequest {
     destination: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountBtrfsRequest {
+    pub serial: String,
+    pub path: String,
+    pub read_only: bool,
+    pub private: bool,
+}
+
 #[cfg(feature = "host")]
 mod host {
     use super::*;
@@ -154,6 +162,19 @@ mod host {
         decode_response::<()>("move", &response)
     }
 
+    pub async fn mount_btrfs<R, W>(
+        client: &Client<R, W>,
+        request: &MountBtrfsRequest,
+    ) -> Result<(), RpcError>
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        let func = crate::debugger::methods::MOUNT_BTRFS;
+        let response = invoke(client, func, request).await?;
+        decode_response::<()>(func, &response)
+    }
+
     async fn invoke<R, W, Req>(
         client: &Client<R, W>,
         func: &'static str,
@@ -197,7 +218,7 @@ pub use host::*;
 #[cfg(feature = "guest")]
 mod guest {
     use super::*;
-    use crate::debugger::methods::FILESYSTEM_INSTANCE;
+    use crate::debugger::methods::{FILESYSTEM_INSTANCE, MOUNT_BTRFS};
     use crate::error::DispatchError;
     use futures_lite::future::zip;
     use helios_api::bindings::wasi::filesystem::preopens;
@@ -205,6 +226,7 @@ mod guest {
         Descriptor, DescriptorFlags, DescriptorType, DirectoryEntry as WasiDirectoryEntry,
         ErrorCode, OpenFlags, PathFlags,
     };
+    use helios_api::mounts::{self as host_mounts, MountRequest, MountSharing, MountSource};
     use std::path::Path;
 
     impl PathRequest {
@@ -224,6 +246,7 @@ mod guest {
                 | (FILESYSTEM_INSTANCE, "write")
                 | (FILESYSTEM_INSTANCE, "copy")
                 | (FILESYSTEM_INSTANCE, "move")
+                | (FILESYSTEM_INSTANCE, MOUNT_BTRFS)
         )
     }
 
@@ -271,6 +294,17 @@ mod guest {
                 let request = decode_path_pair_request(payload, "filesystem.move")?;
                 move_guest_path(&request.source, &request.destination).await?;
                 encode_response("filesystem.move", &())
+            }
+            MOUNT_BTRFS => {
+                let request =
+                    postcard::from_bytes::<MountBtrfsRequest>(payload).map_err(|source| {
+                        DispatchError::Decode {
+                            operation: "filesystem.mount-btrfs",
+                            source,
+                        }
+                    })?;
+                mount_btrfs_volume(&request).await?;
+                encode_response("filesystem.mount-btrfs", &())
             }
             _ => {
                 unreachable!("filesystem::supports must filter unsupported debugger methods")
@@ -400,6 +434,148 @@ mod guest {
             .await
             .map_err(|code| filesystem_error(path, "create directory", code))?;
         Ok(())
+    }
+
+    pub(crate) async fn ensure_directory_path(path: &str) -> Result<(), DispatchError> {
+        let components = normalized_components(path)?;
+        let mut descriptor = root_descriptor()?;
+        for component in components {
+            match descriptor.create_directory_at(component.clone()).await {
+                Ok(()) | Err(ErrorCode::Exist) => {}
+                Err(code) => return Err(filesystem_error(path, "create directory", code)),
+            }
+            descriptor = descriptor
+                .open_at(
+                    PathFlags::empty(),
+                    component,
+                    OpenFlags::DIRECTORY,
+                    DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY,
+                )
+                .await
+                .map_err(|code| filesystem_error(path, "open directory", code))?;
+        }
+        Ok(())
+    }
+
+    async fn mount_btrfs_volume(request: &MountBtrfsRequest) -> Result<(), DispatchError> {
+        ensure_directory_path(&request.path).await?;
+        let sharing = if request.private {
+            MountSharing::Private
+        } else {
+            MountSharing::Shared
+        };
+        host_mounts::mount(MountRequest {
+            source: MountSource::Btrfs(request.serial.clone()),
+            path: request.path.clone(),
+            read_only: request.read_only,
+            sharing,
+            compress: None,
+            commit: None,
+            max_inline: None,
+        })
+        .await
+        .map_err(|error| {
+            DispatchError::Filesystem(format!(
+                "failed to mount btrfs:{} at {}: {:?}: {}",
+                request.serial, request.path, error.kind, error.detail
+            ))
+        })
+    }
+
+    /// Removes every child under `descriptor` without descending through symlinks.
+    async fn clear_descriptor_children(root: Descriptor) {
+        struct PendingEntry {
+            name: String,
+            descend: bool,
+        }
+        struct WalkFrame {
+            dir: Descriptor,
+            pending: Vec<PendingEntry>,
+            listed: bool,
+        }
+
+        let mut stack = vec![WalkFrame {
+            dir: root,
+            pending: Vec::new(),
+            listed: false,
+        }];
+        while let Some(mut frame) = stack.pop() {
+            if !frame.listed {
+                let (stream, result) = frame.dir.read_directory();
+                let entries = stream.collect().await;
+                if result.await.is_err() {
+                    continue;
+                }
+                for entry in entries {
+                    if entry.name == "." || entry.name == ".." {
+                        continue;
+                    }
+                    if matches!(entry.type_, DescriptorType::Directory) {
+                        frame.pending.push(PendingEntry {
+                            name: entry.name,
+                            descend: true,
+                        });
+                    } else {
+                        let _ = frame.dir.unlink_file_at(entry.name).await;
+                    }
+                }
+                frame.listed = true;
+            }
+            if let Some(entry) = frame.pending.pop() {
+                if entry.descend {
+                    match frame
+                        .dir
+                        .open_at(
+                            PathFlags::empty(),
+                            entry.name.clone(),
+                            OpenFlags::DIRECTORY,
+                            DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY,
+                        )
+                        .await
+                    {
+                        Ok(child) => {
+                            // Revisit `name` to rmdir it once `child` has been cleared.
+                            frame.pending.push(PendingEntry {
+                                name: entry.name,
+                                descend: false,
+                            });
+                            stack.push(frame);
+                            stack.push(WalkFrame {
+                                dir: child,
+                                pending: Vec::new(),
+                                listed: false,
+                            });
+                            continue;
+                        }
+                        Err(_) => {
+                            let _ = frame.dir.remove_directory_at(entry.name).await;
+                        }
+                    }
+                } else {
+                    let _ = frame.dir.remove_directory_at(entry.name).await;
+                }
+                stack.push(frame);
+            }
+        }
+    }
+
+    async fn clear_directory_best_effort(path: &str) {
+        if let Ok(dir) = open_path(
+            path,
+            DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY,
+            OpenFlags::DIRECTORY,
+        )
+        .await
+        {
+            clear_descriptor_children(dir).await;
+        }
+    }
+
+    pub(crate) async fn remove_tree_best_effort(path: &str) {
+        clear_directory_best_effort(path).await;
+        if let Ok((parent, name)) = open_parent_directory(path).await {
+            let _ = parent.remove_directory_at(name).await;
+        }
     }
 
     async fn touch_path(path: &str) -> Result<(), DispatchError> {
@@ -653,4 +829,4 @@ mod guest {
 }
 
 #[cfg(feature = "guest")]
-pub(crate) use guest::{dispatch, supports};
+pub(crate) use guest::{dispatch, ensure_directory_path, remove_tree_best_effort, supports};

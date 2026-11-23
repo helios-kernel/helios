@@ -89,10 +89,7 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (snapshot, ret_value): (i32, i32)| {
                 Box::new(async move {
-                    p1_reply(
-                        wasix_stack_checkpoint(&mut caller, snapshot as u32, ret_value as u32)
-                            .await,
-                    )
+                    wasix_stack_checkpoint(&mut caller, snapshot as u32, ret_value as u32).await
                 })
             },
         )
@@ -128,9 +125,7 @@ where
             "proc_fork",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (_copy_memory, ret_pid): (i32, i32)| {
-                Box::new(
-                    async move { p1_reply(wasix_proc_fork(&mut caller, ret_pid as u32).await) },
-                )
+                Box::new(async move { wasix_proc_fork(&mut caller, ret_pid as u32).await })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -305,10 +300,10 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (pid, flags, ret_status): (i32, i32, i32)| {
                 Box::new(async move {
-                    p1_reply(
+                    let answer =
                         wasix_proc_join(&mut caller, pid as u32, flags as u32, ret_status as u32)
-                            .await,
-                    )
+                            .await;
+                    p1_finish_async_call(&mut caller, answer).await
                 })
             },
         )
@@ -318,7 +313,7 @@ where
             WASIX_MODULE,
             "proc_snapshot",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>, (): ()| {
-                Box::new(async move { p1_reply(wasix_proc_snapshot(&mut caller).await) })
+                Box::new(async move { wasix_proc_snapshot(&mut caller).await })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -517,14 +512,12 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "proc_signal",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-             pid: i32,
-             signal: i32|
-             -> wasmtime::Result<i32> {
-                wasix_proc_signal(&mut caller, pid as u32, signal)
+             (pid, signal): (i32, i32)| {
+                Box::new(async move { wasix_proc_signal(&mut caller, pid as u32, signal).await })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -592,7 +585,10 @@ where
             "thread_sleep",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (duration,): (i64,)| {
-                Box::new(async move { wasix_thread_sleep(&mut caller, duration).await })
+                Box::new(async move {
+                    let errno = wasix_thread_sleep(&mut caller, duration).await;
+                    p1_finish_errno_call(&mut caller, errno).await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -611,7 +607,10 @@ where
             "thread_join",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (tid,): (i32,)| {
-                Box::new(async move { wasix_thread_join(&mut caller, tid as u32).await })
+                Box::new(async move {
+                    let errno = wasix_thread_join(&mut caller, tid as u32).await;
+                    p1_finish_errno_call(&mut caller, errno).await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -625,13 +624,13 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "thread_signal",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-             tid: i32,
-             signal: i32|
-             -> wasmtime::Result<i32> { wasix_thread_signal(&mut caller, tid, signal) },
+             (tid, signal): (i32, i32)| {
+                Box::new(async move { wasix_thread_signal(&mut caller, tid, signal).await })
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -650,16 +649,15 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (futex, expected, timeout, ret_woken): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_reply(
-                        wasix_futex_wait(
-                            &mut caller,
-                            futex as u32,
-                            expected as u32,
-                            timeout as u32,
-                            ret_woken as u32,
-                        )
-                        .await,
+                    let answer = wasix_futex_wait(
+                        &mut caller,
+                        futex as u32,
+                        expected as u32,
+                        timeout as u32,
+                        ret_woken as u32,
                     )
+                    .await;
+                    p1_finish_async_call(&mut caller, answer).await
                 })
             },
         )
@@ -823,10 +821,10 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, iovs, iovs_len, nread): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_reply(
+                    let answer =
                         p1_fd_read(&mut caller, fd, iovs as u32, iovs_len as u32, nread as u32)
-                            .await,
-                    )
+                            .await;
+                    p1_finish_async_call(&mut caller, answer).await
                 })
             },
         )
@@ -884,16 +882,15 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, iovs, iovs_len, nwritten): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_reply(
-                        p1_fd_write(
-                            &mut caller,
-                            fd,
-                            iovs as u32,
-                            iovs_len as u32,
-                            nwritten as u32,
-                        )
-                        .await,
+                    let answer = p1_fd_write(
+                        &mut caller,
+                        fd,
+                        iovs as u32,
+                        iovs_len as u32,
+                        nwritten as u32,
                     )
+                    .await;
+                    p1_finish_async_call(&mut caller, answer).await
                 })
             },
         )
@@ -959,10 +956,10 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "sched_yield",
-            |_caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>, ()| {
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>, ()| {
                 Box::new(async move {
                     crate::yield_now().await;
-                    p1::errno::SUCCESS
+                    p1_finish_errno_call(&mut caller, p1::errno::SUCCESS).await
                 })
             },
         )
@@ -1026,7 +1023,7 @@ where
     }
     let mut descriptor_flags = p1_descriptor_flags(rights, fdflags);
     if open_flags.intersects(fs_types::OpenFlags::CREATE | fs_types::OpenFlags::TRUNCATE) {
-        descriptor_flags |= fs_types::DescriptorFlags::WRITE;
+        descriptor_flags |= FsDescriptorFlags::WRITE;
     }
     p1_path_open_resolved(
         caller,
@@ -1179,12 +1176,13 @@ where
         return p1::errno::FAULT;
     };
     let (writer, reader) = crate::byte_channel();
+    let inode = helios_unix::PipeInode::default();
     let read_fd = match caller
         .data_mut()
         .descriptors
         .insert(Preview1Descriptor::PipeRead {
             reader,
-            carry: Bytes::new(),
+            inode: inode.clone(),
         }) {
         Ok(fd) => fd,
         Err(errno) => return errno,
@@ -1192,7 +1190,7 @@ where
     let write_fd = match caller
         .data_mut()
         .descriptors
-        .insert(Preview1Descriptor::PipeWrite { writer })
+        .insert(Preview1Descriptor::PipeWrite { writer, inode })
     {
         Ok(fd) => fd,
         Err(errno) => {
@@ -1394,7 +1392,7 @@ where
         Ok(cwd) => cwd,
         Err(errno) => return errno,
     };
-    let needed = match wasix_getcwd_required_len(cwd) {
+    let needed = match wasix_getcwd_required_len(&cwd) {
         Ok(needed) => needed,
         Err(errno) => return errno,
     };
@@ -1454,7 +1452,15 @@ where
     };
     let callback = p1_read_path(caller, memory, GuestAddress::wasm32(callback), callback_len)
         .map_err(wasmtime::Error::new)?;
-    caller.data_mut().signal_callback = Some(callback);
+    let is_valid_handler = !callback.is_empty()
+        && p1_caller_export(caller, &callback)
+            .and_then(wasmtime::Extern::into_func)
+            .and_then(|func| func.typed::<i32, ()>(&mut *caller).ok())
+            .is_some();
+    caller
+        .data()
+        .process_signals
+        .set_callback(is_valid_handler.then(|| Arc::from(callback.as_str())));
     Ok(())
 }
 
@@ -1470,7 +1476,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let pid = match u32::try_from(caller.data().instance().id().raw()) {
+    let pid = match u32::try_from(caller.data().identity.id().get()) {
         Ok(pid) => pid,
         Err(_) => return p1::errno::OVERFLOW,
     };
@@ -1490,7 +1496,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let current = match u32::try_from(caller.data().instance().id().raw()) {
+    let current = match u32::try_from(caller.data().identity.id().get()) {
         Ok(pid) => pid,
         Err(_) => return p1::errno::OVERFLOW,
     };
@@ -1507,7 +1513,7 @@ where
     p1_write_u32(caller, memory, GuestAddress::wasm32(ret_pid), parent)
 }
 
-pub(super) fn wasix_proc_signal<CpuImpl, Net, StorageImpl>(
+pub(super) async fn wasix_proc_signal<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     pid: u32,
     signal: i32,
@@ -1521,27 +1527,27 @@ where
     if status != p1::errno::SUCCESS {
         return Ok(status);
     }
-    let current = match u32::try_from(caller.data().instance().id().raw()) {
+    let current = match u32::try_from(caller.data().identity.id().get()) {
         Ok(pid) => pid,
         Err(_) => return Ok(p1::errno::OVERFLOW),
     };
     if !(0..=31).contains(&signal) {
         return Ok(p1::errno::INVAL);
-    };
-    let signal = signal as u32;
+    }
     if pid == current {
-        caller
-            .data_mut()
-            .request_exit(128u32.saturating_add(signal));
-        return Err(wasmtime::Error::new(Preview1Exit));
+        if let Some(signal) = helios_unix::Signal::from_standard(signal as u8) {
+            caller.data().signal_state.raise(signal);
+        }
+        wasix_deliver_pending_signals(caller).await?;
+        return Ok(p1::errno::SUCCESS);
     }
-    let Some(index) = caller.data().find_child_index(Some(pid)) else {
+    let Some(target) = caller.data_mut().live_child_signal_target(pid) else {
         return Ok(p1::errno::SRCH);
     };
-    if caller.data().children[index].completed.is_some() {
-        return Ok(p1::errno::SRCH);
+    if let Some(signal) = helios_unix::Signal::from_standard(signal as u8) {
+        target.raise(signal);
     }
-    caller.data().children[index].signal_state.raise(signal);
+    wasix_deliver_pending_signals(caller).await?;
     Ok(p1::errno::SUCCESS)
 }
 
@@ -1623,17 +1629,16 @@ where
     if interval < 0 || !matches!(repeat, 0 | 1) {
         return p1::errno::INVAL;
     }
-    let signal = match u32::try_from(signal) {
-        Ok(signal) => signal,
-        Err(_) => return p1::errno::INVAL,
-    };
-    if interval == 0 {
+    if interval == 0 || signal == 0 {
         caller.data().signal_state.cancel_interval();
         // Dropping the handle cancels the timer task, so the instance
         // share gets its block back now rather than one interval later.
         caller.data_mut().signal_interval = None;
         return p1::errno::SUCCESS;
     }
+    let Some(signal) = helios_unix::Signal::from_standard(signal as u8) else {
+        return p1::errno::INVAL;
+    };
     let interval = match u64::try_from(interval) {
         Ok(interval) => interval,
         Err(_) => return p1::errno::INVAL,
@@ -1678,70 +1683,91 @@ where
 pub(super) async fn wasix_proc_fork<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     ret_pid: u32,
-) -> Result<i32, P1Stop>
+) -> wasmtime::Result<i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    if let Some(value) = caller.data_mut().asyncify.rewind_value.take() {
-        if wasix_call_asyncify_stop_rewind(caller).await != p1::errno::SUCCESS {
-            return Ok(p1::errno::NOTSUP);
+    if let Some(value) = caller.data().asyncify.rewind_value {
+        let stop = wasix_call_asyncify_stop_rewind(caller).await;
+        caller.data_mut().asyncify.rewind_value = None;
+        if stop? != p1::errno::SUCCESS {
+            return p1_finish_errno_call(caller, p1::errno::NOTSUP).await;
         }
         let Some(memory) = p1_async_memory(caller) else {
-            return Ok(p1::errno::FAULT);
+            return p1_finish_errno_call(caller, p1::errno::FAULT).await;
         };
         let Ok(pid) = u32::try_from(value) else {
-            return Ok(p1::errno::OVERFLOW);
+            return p1_finish_errno_call(caller, p1::errno::OVERFLOW).await;
         };
-        memory.write_u32(GuestAddress::wasm32(ret_pid), pid).await?;
-        return Ok(p1::errno::SUCCESS);
+        let write = memory
+            .write_u32(GuestAddress::wasm32(ret_pid), pid)
+            .await
+            .map(|()| p1::errno::SUCCESS)
+            .map_err(P1Stop::from);
+        return p1_finish_async_call(caller, write).await;
     }
     let status = caller.data().require_fork_authority();
     if status != p1::errno::SUCCESS {
-        return Ok(status);
+        return p1_finish_errno_call(caller, status).await;
     }
     let Some(memory) = p1_async_memory(caller) else {
-        return Ok(p1::errno::FAULT);
+        return p1_finish_errno_call(caller, p1::errno::FAULT).await;
     };
     if caller.data().current_core_module.is_none() {
-        return Ok(p1::errno::NOTSUP);
+        return p1_finish_errno_call(caller, p1::errno::NOTSUP).await;
     }
     let Ok((stack_lower, stack_upper, stack_pointer)) = wasix_stack_bounds_from_caller(caller)
     else {
-        return Ok(p1::errno::NOTSUP);
+        return p1_finish_errno_call(caller, p1::errno::NOTSUP).await;
     };
     if stack_lower >= stack_pointer || stack_pointer > stack_upper {
-        return Ok(p1::errno::INVAL);
+        return p1_finish_errno_call(caller, p1::errno::INVAL).await;
     }
     let memory_stack_len = match usize::try_from(stack_upper - stack_pointer) {
         Ok(len) => len,
-        Err(_) => return Ok(p1::errno::OVERFLOW),
+        Err(_) => return p1_finish_errno_call(caller, p1::errno::OVERFLOW).await,
     };
-    let memory_stack = memory
+    let memory_stack = match memory
         .read_bytes(GuestAddress::wasm32(stack_pointer), memory_stack_len)
-        .await?;
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(error) => return p1_finish_async_call(caller, Err(error.into())).await,
+    };
     let unwind_stack_begin = match stack_lower.checked_add(WASIX_ASYNCIFY_DATA_SIZE) {
         Some(begin) if begin <= stack_pointer => begin,
-        _ => return Ok(p1::errno::OVERFLOW),
+        _ => return p1_finish_errno_call(caller, p1::errno::OVERFLOW).await,
     };
-    memory.write_u32(GuestAddress::wasm32(ret_pid), 0).await?;
     let stack_lower_address = GuestAddress::wasm32(stack_lower);
-    memory
-        .write_u32(stack_lower_address, unwind_stack_begin)
-        .await?;
-    memory
-        .write_u32(stack_lower_address.offset(4), stack_pointer)
-        .await?;
-    caller.data_mut().asyncify.phase = WasixAsyncifyPhase::Forking {
-        ret_pid,
-        stack_lower,
-        stack_upper,
-        unwind_stack_begin,
-        memory_stack,
-        stack_pointer,
-    };
-    Ok(wasix_call_asyncify_start_unwind(caller, stack_lower).await)
+    let setup = async {
+        memory.write_u32(GuestAddress::wasm32(ret_pid), 0).await?;
+        memory
+            .write_u32(stack_lower_address, unwind_stack_begin)
+            .await?;
+        memory
+            .write_u32(stack_lower_address.offset(4), stack_pointer)
+            .await
+    }
+    .await;
+    if let Err(error) = setup {
+        return p1_finish_async_call(caller, Err(error.into())).await;
+    }
+    let status = wasix_call_asyncify_start_unwind(caller, stack_lower).await?;
+    if status == p1::errno::SUCCESS {
+        caller.data_mut().asyncify.phase = WasixAsyncifyPhase::Forking {
+            ret_pid,
+            stack_lower,
+            stack_upper,
+            unwind_stack_begin,
+            memory_stack,
+            stack_pointer,
+        };
+        Ok(p1::errno::SUCCESS)
+    } else {
+        p1_finish_errno_call(caller, status).await
+    }
 }
 
 /// The program name a launch's timeline carries, decoded only while the
@@ -1826,6 +1852,41 @@ fn launch_exit_error_stop<CpuImpl: Cpu>(
     }
 }
 
+async fn wasix_read_exec_arguments(
+    memory: &Preview1AsyncMemory,
+    args: u32,
+    args_len: u32,
+    env: Option<(u32, u32)>,
+) -> Result<(Vec<String>, Option<Vec<(String, String)>>), ExecReadError> {
+    let argv = wasix_split_lines(&wasix_read_exec_string(memory, args, args_len).await?);
+    let environment = match env {
+        Some((ptr, len)) => Some(wasix_split_environment(
+            &wasix_read_exec_string(memory, ptr, len).await?,
+        )),
+        None => None,
+    };
+    Ok((argv, environment))
+}
+
+/// Translates an error on `proc_exec3`'s errno-returning path: a
+/// [`ProgramExecError`] records its kind and errno on `trace` and
+/// returns `Ok(errno)` so the caller keeps running, while a replacement
+/// unwind (`Preview1Exit`), lost swap page (`SwapFaultError`), signal or
+/// kill unwinds the store.
+fn wasix_exec3_error<CpuImpl: Cpu>(
+    trace: &phases::Trace<CpuImpl>,
+    error: wasmtime::Error,
+) -> wasmtime::Result<i32> {
+    if let Some(exec_error) = error.downcast_ref::<ProgramExecError>() {
+        let errno = p1_errno_from_program_exec_error(exec_error);
+        return Ok(trace.exit_error_errno(exec_error, errno));
+    }
+    if error.is::<crate::memory::SwapFaultError>() {
+        trace.failed(ProgramExecErrorKind::Internal);
+    }
+    Err(error)
+}
+
 pub(super) async fn wasix_proc_exec<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     name: u32,
@@ -1863,6 +1924,10 @@ where
         }
     };
     let compile_authority = CompileAuthority::from(&exec_authority);
+    let (argv, environment) = wasix_read_exec_arguments(&memory, args, args_len, env)
+        .await
+        .map_err(ExecReadError::into_error)
+        .inspect_err(|error| launch_exit_error(&trace, error))?;
     let prepared = match wasix_prepare_program(caller, &memory, name, name_len).await {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -1872,59 +1937,32 @@ where
     };
     trace.record(LaunchPhase::SourceRead);
     trace.record_source_bytes(prepared.source.payload_len());
-    // Emission hands to the exec path's own guard.
-    trace.disarm();
     wasix_exec_prepared_program(
         caller,
         &compile_authority,
-        &memory,
         prepared,
-        args,
-        args_len,
-        env,
-        trace.timeline().clone(),
+        argv,
+        environment,
+        &mut trace,
     )
     .await
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the compile authority is the one argument that must be spelled out so no exec reaches the compiler without a process right"
-)]
 pub(super) async fn wasix_exec_prepared_program<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     compile: &CompileAuthority,
-    memory: &Preview1AsyncMemory,
     prepared: WasixPreparedProgram,
-    args: u32,
-    args_len: u32,
-    env: Option<(u32, u32)>,
-    timeline: phases::Timeline,
+    argv: Vec<String>,
+    environment: Option<Vec<(String, String)>>,
+    trace: &mut phases::Trace<CpuImpl>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let mut trace = phases::Trace::adopt(caller.data().cpu.clone(), timeline);
-    let argv = wasix_read_exec_string(memory, args, args_len)
-        .await
-        .map(|value| wasix_split_lines(&value))
-        .map_err(ExecReadError::into_error)
-        .inspect_err(|error| launch_exit_error(&trace, error))?;
     let argv = ProgramArgv::from_caller(&prepared.guest_name, argv);
-    let environment = match env {
-        Some((ptr, len)) => match wasix_read_exec_string(memory, ptr, len).await {
-            Ok(value) => wasix_split_environment(&value),
-            Err(ExecReadError::Program(_)) => Vec::new(),
-            Err(error @ ExecReadError::Swap(_)) => {
-                let error = error.into_error();
-                launch_exit_error(&trace, &error);
-                return Err(error);
-            }
-        },
-        None => caller.data().environment.clone(),
-    };
+    let environment = environment.unwrap_or_else(|| caller.data().environment.clone());
     // The replacement keeps this instance, so it keeps this instance's id.
     let environment =
         LaunchEnvironment::from_guest(environment).into_process_env(caller.data().instance().id());
@@ -1939,7 +1977,7 @@ where
         .inspect_err(|error| trace.exit_error(error))
         .map_err(wasmtime::Error::new)?;
     let exec_context = caller.data().exec_context();
-    let authority = caller.data().authority.clone();
+    let authority = caller.data().effective_authority();
     let descriptors = caller.data().descriptors.clone_for_exec();
     let filesystem = Some(caller.data().filesystem.clone());
     let signal_state = caller.data().signal_state.clone();
@@ -1955,7 +1993,7 @@ where
         )
         .await
         .map_err(wasmtime::Error::new)
-        .inspect_err(|error| launch_exit_error(&trace, error))?;
+        .inspect_err(|error| launch_exit_error(trace, error))?;
     // The reply of an exec is the replacement itself: the call returns
     // by unwinding the calling instance into the new program, which
     // then owns the timeline's emit at its completion.
@@ -1999,43 +2037,8 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    wasix_proc_exec_with_search(
-        caller,
-        name,
-        name_len,
-        args,
-        args_len,
-        Some((env, env_len)),
-        search_path,
-        path,
-        path_len,
-    )
-    .await
-    .map(|()| p1::errno::SUCCESS)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn wasix_proc_exec_with_search<CpuImpl, Net, StorageImpl>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    name: u32,
-    name_len: u32,
-    args: u32,
-    args_len: u32,
-    env: Option<(u32, u32)>,
-    search_path: i32,
-    path: u32,
-    path_len: u32,
-) -> wasmtime::Result<()>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
     let Some(memory) = p1_async_memory(caller) else {
-        return Err(wasmtime::Error::new(ProgramExecError {
-            kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-        }));
+        return Ok(p1::errno::FAULT);
     };
     let program = wasix_launch_program_label(&memory, name, name_len)
         .await
@@ -2043,15 +2046,21 @@ where
     let mut trace = phases::Trace::begin(caller.data().cpu.clone(), "exec", &program);
     let exec_authority = match caller.data().require_exec_authority() {
         Ok(authority) => authority,
-        Err(_) => {
-            trace.refused(ProgramExecErrorKind::PermissionDenied);
-            return Err(wasmtime::Error::new(ProgramExecError {
-                kind: ProgramExecErrorKind::PermissionDenied,
-                detail: ProgramExecErrorDetail::ProcessAuthorityDenied,
-            }));
-        }
+        Err(_) => return Ok(launch_exit_errno(&trace, p1::errno::NOTCAPABLE)),
     };
     let compile_authority = CompileAuthority::from(&exec_authority);
+    let (argv, environment) =
+        match wasix_read_exec_arguments(&memory, args, args_len, Some((env, env_len))).await {
+            Ok(decoded) => decoded,
+            Err(ExecReadError::Program(error)) => {
+                let errno = p1_errno_from_program_exec_error(&error);
+                return Ok(trace.exit_error_errno(&error, errno));
+            }
+            Err(ExecReadError::Swap(error)) => {
+                trace.failed(ProgramExecErrorKind::Internal);
+                return Err(wasmtime::Error::new(error));
+            }
+        };
     let prepared = match wasix_prepare_program_with_search(
         caller,
         &memory,
@@ -2064,25 +2073,23 @@ where
     .await
     {
         Ok(prepared) => prepared,
-        Err(error) => {
-            launch_exit_error(&trace, &error);
-            return Err(error);
-        }
+        Err(error) => return wasix_exec3_error(&trace, error),
     };
     trace.record(LaunchPhase::SourceRead);
     trace.record_source_bytes(prepared.source.payload_len());
-    trace.disarm();
-    wasix_exec_prepared_program(
+    match wasix_exec_prepared_program(
         caller,
         &compile_authority,
-        &memory,
         prepared,
-        args,
-        args_len,
-        env,
-        trace.timeline().clone(),
+        argv,
+        environment,
+        &mut trace,
     )
     .await
+    {
+        Ok(()) => Ok(p1::errno::SUCCESS),
+        Err(error) => wasix_exec3_error(&trace, error),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2174,7 +2181,7 @@ where
         if chroot {
             return Ok(launch_exit_errno(&trace, p1::errno::INVAL));
         }
-        caller.data().authority.clone()
+        caller.data().effective_authority()
     } else {
         let preopen = match wasix_read_exec_string(&memory, preopen, preopen_len).await {
             Ok(preopen) => preopen,
@@ -2224,12 +2231,7 @@ where
         argv,
         &mut trace,
         WasixSpawnIo::from_modes(stdin, stdout, stderr),
-        WasixChildInheritance {
-            environment: None,
-            authority: Some(authority),
-            descriptors: None,
-            signal_dispositions: Vec::new(),
-        },
+        wasix_proc_spawn_inheritance(authority),
     )
     .await
     {
@@ -2239,6 +2241,44 @@ where
     };
     wasix_write_process_handles(&memory, GuestAddress::wasm32(ret_handles), result).await?;
     Ok(p1::errno::SUCCESS)
+}
+
+/// Descriptor, authority and signal inheritance for legacy `proc_spawn`.
+///
+/// Unlike `proc_spawn2`, which starts from the parent's inheritable
+/// descriptor table (`clone_for_exec`) and applies `fd_ops`, `proc_spawn`
+/// takes explicit stdio modes (`stdin`/`stdout`/`stderr`), `chroot`, and a
+/// `preopen` list. Its child therefore starts with a fresh descriptor table
+/// built from the scoped `authority` (standard streams plus the granted
+/// preopens) rather than inheriting arbitrary open files, pipes or sockets
+/// from the parent.
+pub(super) fn wasix_proc_spawn_inheritance<Net: ComponentHostNetwork>(
+    authority: ProcessAuthority,
+) -> WasixChildInheritance<Net> {
+    WasixChildInheritance {
+        environment: None,
+        authority: Some(authority),
+        descriptors: None,
+        signal_dispositions: Vec::new(),
+    }
+}
+
+/// Descriptor, authority and signal inheritance for `proc_spawn2`.
+///
+/// Always starts the child over the snapshot built by
+/// [`wasix_spawn_descriptor_snapshot`] (the parent's descriptor table with
+/// `close_on_exec` entries removed, plus any `fd_ops`).
+pub(super) fn wasix_proc_spawn2_inheritance<Net: ComponentHostNetwork>(
+    environment: Option<Vec<(String, String)>>,
+    snapshot: WasixSpawnFdSnapshot<Net>,
+    signal_dispositions: Vec<WasixSignalDisposition>,
+) -> WasixChildInheritance<Net> {
+    WasixChildInheritance {
+        environment,
+        authority: Some(snapshot.authority),
+        descriptors: Some(snapshot.descriptors),
+        signal_dispositions,
+    }
 }
 
 /// Refuses a path that does not name a directory.
@@ -2274,7 +2314,8 @@ where
     let mut chroot_entry = None;
     for entry in wasix_split_lines(preopen) {
         let store = caller.data();
-        let guest_name = wasix_proc_spawn_preopen_guest_name(store.cwd.as_ref(), &entry)?;
+        let cwd = store.cwd.get();
+        let guest_name = wasix_proc_spawn_preopen_guest_name(cwd.as_ref(), &entry)?;
         let (source_path, flags) = store.resolve_absolute_guest_path(&guest_name)?;
         wasix_require_directory(&namespace, &source_path).await?;
         let store = caller.data();
@@ -2366,7 +2407,7 @@ pub(super) fn wasix_proc_spawn_resolve_child_cwd(
             .map_err(p1_errno_from_component_path)?;
         (guest_name, source_path, cwd.descriptor.flags)
     };
-    if !flags.contains(fs_types::DescriptorFlags::READ) {
+    if !flags.contains(FsDescriptorFlags::READ) {
         return Err(p1::errno::NOTCAPABLE);
     }
     Ok(Preview1Cwd {
@@ -2377,6 +2418,7 @@ pub(super) fn wasix_proc_spawn_resolve_child_cwd(
             flags,
             identity: None,
             mount: None,
+            open: None,
         },
     })
 }
@@ -2384,7 +2426,7 @@ pub(super) fn wasix_proc_spawn_resolve_child_cwd(
 pub(super) fn wasix_authority_resolve_absolute_guest_path(
     authority: &ProcessAuthority,
     guest_name: &str,
-) -> Result<(String, fs_types::DescriptorFlags), i32> {
+) -> Result<(String, FsDescriptorFlags), i32> {
     let mut best: Option<(&str, &str, DirectoryAuthorityRights)> = None;
     for preopen in authority.directory_preopens() {
         let preopen_guest = preopen.guest_name();
@@ -2517,17 +2559,10 @@ where
     };
     trace.record(LaunchPhase::SourceRead);
     trace.record_source_bytes(prepared.source.payload_len());
-    let snapshot = if fd_ops == 0 && fd_ops_len == 0 {
-        None
-    } else {
-        match wasix_spawn_descriptor_snapshot(caller, &memory, fd_ops, fd_ops_len).await {
-            Ok(snapshot) => Some(snapshot),
-            Err(stop) => return Err(launch_exit_stop(&trace, stop)),
-        }
-    };
-    let (authority, descriptors) = match snapshot {
-        Some(snapshot) => (Some(snapshot.authority), Some(snapshot.descriptors)),
-        None => (None, None),
+    let snapshot = match wasix_spawn_descriptor_snapshot(caller, &memory, fd_ops, fd_ops_len).await
+    {
+        Ok(snapshot) => snapshot,
+        Err(stop) => return Err(launch_exit_stop(&trace, stop)),
     };
     let signal_dispositions =
         match wasix_read_signal_dispositions(&memory, GuestAddress::wasm32(signals), signals_len)
@@ -2543,12 +2578,7 @@ where
         argv,
         &mut trace,
         WasixSpawnIo::inherit(),
-        WasixChildInheritance {
-            environment,
-            authority,
-            descriptors,
-            signal_dispositions,
-        },
+        wasix_proc_spawn2_inheritance(environment, snapshot, signal_dispositions),
     )
     .await
     {
@@ -2602,115 +2632,129 @@ where
     }
     let (pid, ret_status) = (GuestAddress::wasm32(pid), GuestAddress::wasm32(ret_status));
     let requested_pid = wasix_read_option_pid(&memory, pid).await?;
-    let Some(index) = caller.data().find_child_index(requested_pid) else {
-        wasix_write_join_nothing(&memory, ret_status).await?;
-        return Ok(p1::errno::SUCCESS);
-    };
-    if flags & WASIX_JOIN_FLAG_NON_BLOCKING != 0 {
-        match caller.data_mut().poll_child_exit(index) {
-            Ok(Some(code)) => {
-                let child = caller.data_mut().children.swap_remove(index);
-                wasix_write_join_exit(&memory, pid, ret_status, child.pid, code).await?;
-            }
-            Ok(None) => {
+    let joined = if flags & WASIX_JOIN_FLAG_NON_BLOCKING != 0 {
+        match caller.data_mut().try_child_join(requested_pid) {
+            Poll::Ready(joined) => joined,
+            Poll::Pending => {
                 crate::yield_now().await;
-                wasix_write_join_nothing(&memory, ret_status).await?;
+                None
             }
-            Err(errno) => return Ok(errno),
         }
     } else {
-        let child_pid = caller.data().children[index].pid;
-        match caller.data_mut().poll_child_exit(index) {
-            Ok(Some(code)) => {
-                let child = caller.data_mut().children.swap_remove(index);
-                wasix_write_join_exit(&memory, pid, ret_status, child.pid, code).await?;
-                return Ok(p1::errno::SUCCESS);
+        let (mut children_wait, _join_guard) = caller.data().children.begin_blocking_join();
+        let signals = caller.data().signals();
+        let active_handlers = caller.data().active_signal_handlers;
+        let mut catch_wait = core::pin::pin!(signals.wait_for_catch_signal(active_handlers));
+        let outcome = core::future::poll_fn(|cx| {
+            // Check already-completed children first so a completed child is
+            // never left unjoined when a caught signal is also pending.
+            if let Poll::Ready(joined) =
+                caller
+                    .data_mut()
+                    .poll_child_join(requested_pid, cx, &mut children_wait)
+            {
+                return Poll::Ready(Ok(joined));
             }
-            Ok(None) => {}
+            if catch_wait.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Err(p1::errno::INTR));
+            }
+            Poll::Pending
+        })
+        .await;
+        match outcome {
+            Ok(joined) => joined,
             Err(errno) => return Ok(errno),
         }
-        let Some(exit) = caller.data_mut().children[index].exit.take() else {
-            wasix_write_join_nothing(&memory, ret_status).await?;
-            return Ok(p1::errno::SUCCESS);
-        };
-        let (code, filesystem) = wasix_child_exit_result(exit.await);
-        if let Some(filesystem) = filesystem {
-            caller.data_mut().filesystem.adopt_root_layer(filesystem);
+    };
+    match joined {
+        Some(WasixJoinedChild {
+            pid: child_pid,
+            outcome: Ok(termination),
+        }) => {
+            wasix_write_join_exit(&memory, pid, ret_status, child_pid, termination).await?;
         }
-        let Some(index) = caller.data().find_child_index(Some(child_pid)) else {
-            wasix_write_join_nothing(&memory, ret_status).await?;
-            return Ok(p1::errno::SUCCESS);
-        };
-        let child = caller.data_mut().children.swap_remove(index);
-        wasix_write_join_exit(&memory, pid, ret_status, child.pid, code).await?;
+        Some(WasixJoinedChild {
+            outcome: Err(errno),
+            ..
+        }) => return Ok(errno),
+        None => wasix_write_join_nothing(&memory, ret_status).await?,
     }
     Ok(p1::errno::SUCCESS)
 }
 
-pub(super) fn wasix_child_exit_result(
-    result: Result<Result<ChildExit, ProgramExecError>, futures::channel::oneshot::Canceled>,
-) -> (u32, Option<MemoryFs>) {
-    match result {
-        Ok(Ok(exit)) => (exit.exit_code, exit.filesystem),
-        Ok(Err(_)) | Err(_) => (u32::from(p1::errno::IO as u16), None),
-    }
-}
-
 pub(super) async fn wasix_proc_snapshot<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-) -> Result<i32, P1Stop>
+) -> wasmtime::Result<i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    if caller.data_mut().asyncify.process_snapshot_rewinding {
+    if caller.data().asyncify.process_snapshot_rewinding {
+        let stop = wasix_call_asyncify_stop_rewind(caller).await;
         caller.data_mut().asyncify.process_snapshot_rewinding = false;
-        if wasix_call_asyncify_stop_rewind(caller).await != p1::errno::SUCCESS {
-            return Ok(p1::errno::NOTSUP);
-        }
-        return Ok(p1::errno::SUCCESS);
+        let status = if stop? == p1::errno::SUCCESS {
+            p1::errno::SUCCESS
+        } else {
+            p1::errno::NOTSUP
+        };
+        return p1_finish_errno_call(caller, status).await;
     }
 
     let Some(memory) = p1_async_memory(caller) else {
-        return Ok(p1::errno::FAULT);
+        return p1_finish_errno_call(caller, p1::errno::FAULT).await;
     };
     if caller.data().current_core_module.is_none() {
-        return Ok(p1::errno::NOTSUP);
+        return p1_finish_errno_call(caller, p1::errno::NOTSUP).await;
     }
     let Ok((stack_lower, stack_upper, stack_pointer)) = wasix_stack_bounds_from_caller(caller)
     else {
-        return Ok(p1::errno::NOTSUP);
+        return p1_finish_errno_call(caller, p1::errno::NOTSUP).await;
     };
     if stack_lower >= stack_pointer || stack_pointer > stack_upper {
-        return Ok(p1::errno::INVAL);
+        return p1_finish_errno_call(caller, p1::errno::INVAL).await;
     }
     let memory_stack_len = match usize::try_from(stack_upper - stack_pointer) {
         Ok(len) => len,
-        Err(_) => return Ok(p1::errno::OVERFLOW),
+        Err(_) => return p1_finish_errno_call(caller, p1::errno::OVERFLOW).await,
     };
-    let memory_stack = memory
+    let memory_stack = match memory
         .read_bytes(GuestAddress::wasm32(stack_pointer), memory_stack_len)
-        .await?;
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(error) => return p1_finish_async_call(caller, Err(error.into())).await,
+    };
     let unwind_stack_begin = match stack_lower.checked_add(WASIX_ASYNCIFY_DATA_SIZE) {
         Some(begin) if begin <= stack_pointer => begin,
-        _ => return Ok(p1::errno::OVERFLOW),
+        _ => return p1_finish_errno_call(caller, p1::errno::OVERFLOW).await,
     };
     let stack_lower_address = GuestAddress::wasm32(stack_lower);
-    memory
-        .write_u32(stack_lower_address, unwind_stack_begin)
-        .await?;
-    memory
-        .write_u32(stack_lower_address.offset(4), stack_pointer)
-        .await?;
-    caller.data_mut().asyncify.phase = WasixAsyncifyPhase::ProcessSnapshot {
-        stack_lower,
-        stack_upper,
-        unwind_stack_begin,
-        memory_stack,
-        stack_pointer,
-    };
-    Ok(wasix_call_asyncify_start_unwind(caller, stack_lower).await)
+    let setup = async {
+        memory
+            .write_u32(stack_lower_address, unwind_stack_begin)
+            .await?;
+        memory
+            .write_u32(stack_lower_address.offset(4), stack_pointer)
+            .await
+    }
+    .await;
+    if let Err(error) = setup {
+        return p1_finish_async_call(caller, Err(error.into())).await;
+    }
+    let status = wasix_call_asyncify_start_unwind(caller, stack_lower).await?;
+    if status == p1::errno::SUCCESS {
+        caller.data_mut().asyncify.phase = WasixAsyncifyPhase::ProcessSnapshot {
+            stack_lower,
+            stack_upper,
+            unwind_stack_begin,
+            memory_stack,
+            stack_pointer,
+        };
+        Ok(p1::errno::SUCCESS)
+    } else {
+        p1_finish_errno_call(caller, status).await
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2779,10 +2823,13 @@ where
         return Err(p1::errno::INVAL);
     }
 
-    let (stdin_writer, stdin_reader) = crate::byte_channel();
-    let stdin_writer = match io.stdin {
-        WasixStdioMode::Piped => Some(stdin_writer),
-        WasixStdioMode::Inherit | WasixStdioMode::Null | WasixStdioMode::Log => None,
+    let (stdin, stdin_writer) = match io.stdin {
+        WasixStdioMode::Piped => {
+            let (writer, reader) = crate::byte_channel();
+            (crate::ComponentInputRoute::Child(reader), Some(writer))
+        }
+        WasixStdioMode::Inherit => (store.stdin_route(), None),
+        WasixStdioMode::Null | WasixStdioMode::Log => (crate::ComponentInputRoute::Closed, None),
         WasixStdioMode::Invalid => unreachable!("invalid stdio mode already rejected"),
     };
     let (stdout, stdout_reader) = wasix_prepare_child_output_route(
@@ -2797,7 +2844,7 @@ where
     )?;
     Ok(WasixSpawnPreparedIo {
         output_mode: OutputMode::RoutedChild {
-            stdin_rx: stdin_reader,
+            stdin,
             stdout,
             stderr,
         },
@@ -2950,15 +2997,35 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let cwd = caller
-        .data()
-        .cwd
-        .as_ref()
-        .map(|cwd| cwd.guest_name.as_str());
-    let candidate = wasix_search_path_candidate(cwd, directory, name)?;
+    let cwd = caller.data().cwd.get();
+    let candidate = wasix_search_path_candidate(
+        cwd.as_ref().map(|cwd| cwd.guest_name.as_str()),
+        directory,
+        name,
+    )?;
     wasix_prepare_program_from_guest_name(caller, candidate)
         .await
         .ok()
+}
+
+/// Initial descriptor, authority and working-directory snapshot for
+/// `proc_spawn2`.
+///
+/// Starts from a full clone of the parent's table so `fd_ops` (`dup2`,
+/// `fchdir`, `close`) can act on parent `close_on_exec` descriptors (such as
+/// `O_CLOEXEC` pipes redirected onto stdio); [`wasix_spawn_descriptor_snapshot`]
+/// strips any descriptors that still have `close_on_exec` set once `fd_ops`
+/// finish.
+pub(super) fn wasix_spawn_initial_snapshot<Net: ComponentHostNetwork>(
+    descriptors: &Preview1DescriptorTable<Net>,
+    authority: &ProcessAuthority,
+    cwd: Option<&Preview1Cwd>,
+) -> WasixSpawnFdSnapshot<Net> {
+    WasixSpawnFdSnapshot {
+        descriptors: descriptors.clone(),
+        authority: authority.clone(),
+        cwd: cwd.cloned(),
+    }
 }
 
 pub(super) async fn wasix_spawn_descriptor_snapshot<CpuImpl, Net, StorageImpl>(
@@ -2972,19 +3039,20 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    if fd_ops == 0 {
+    if fd_ops == 0 && fd_ops_len != 0 {
         return Err(P1Stop::Errno(p1::errno::FAULT));
     }
-    let mut snapshot = WasixSpawnFdSnapshot {
-        descriptors: caller.data().descriptors.clone(),
-        authority: caller.data().authority.clone(),
-        cwd: caller.data().cwd.clone(),
-    };
+    let parent_descriptors = caller.data().descriptors.snapshot();
+    let parent_authority = caller.data().effective_authority();
+    let parent_cwd = caller.data().cwd.get();
+    let mut snapshot =
+        wasix_spawn_initial_snapshot(&parent_descriptors, &parent_authority, parent_cwd.as_ref());
     let fd_ops = GuestAddress::wasm32(fd_ops);
     for index in 0..fd_ops_len {
         let op = fd_ops.offset(u64::from(index) * u64::from(WASIX_PROC_SPAWN_FD_OP_SIZE));
         wasix_apply_spawn_fd_op(caller, memory, &mut snapshot, op).await?;
     }
+    snapshot.descriptors = snapshot.descriptors.clone_for_exec();
     Ok(snapshot)
 }
 
@@ -3125,18 +3193,12 @@ where
         p1_descriptor_flags(rights, fdflags),
     )
     .await?;
-    snapshot
-        .descriptors
-        .insert_at(
-            fd,
-            Preview1Descriptor::File {
-                descriptor,
-                offset: 0,
-                fdflags,
-            },
-            close_on_exec,
-        )
-        .map(drop)
+    let entry = Preview1DescriptorEntry::new(
+        Preview1Descriptor::File(OpenFile::new(descriptor)),
+        close_on_exec,
+    );
+    entry.set_fdflags(fdflags);
+    snapshot.descriptors.insert_entry_at(fd, entry).map(drop)
 }
 
 pub(super) fn wasix_spawn_resolve_open_base<Net: ComponentHostNetwork>(
@@ -3153,14 +3215,10 @@ pub(super) fn wasix_spawn_resolve_open_base<Net: ComponentHostNetwork>(
         return Ok((cwd.descriptor.clone(), path.to_owned()));
     }
     let base = match snapshot.descriptors.get(source_fd) {
-        Some(Preview1Descriptor::Preopen { descriptor, .. })
-        | Some(Preview1Descriptor::File { descriptor, .. })
-            if descriptor.kind == FsNodeKind::Directory =>
-        {
-            descriptor.clone()
-        }
-        Some(_) => return Err(p1::errno::NOTDIR),
         None => return Err(p1::errno::BADF),
+        descriptor => p1_directory_descriptor(descriptor)
+            .ok_or(p1::errno::NOTDIR)?
+            .clone(),
     };
     Ok((base, path.to_owned()))
 }
@@ -3202,13 +3260,11 @@ pub(super) fn wasix_apply_spawn_fchdir<Net: ComponentHostNetwork>(
             guest_name: guest_name.clone(),
             descriptor: descriptor.clone(),
         },
-        Some(Preview1Descriptor::File { descriptor, .. })
-            if descriptor.kind == FsNodeKind::Directory =>
-        {
-            let guest_name = wasix_spawn_guest_name_for_source(snapshot, &descriptor.path)?;
+        Some(Preview1Descriptor::File(file)) if file.node().kind == FsNodeKind::Directory => {
+            let guest_name = wasix_spawn_guest_name_for_source(snapshot, &file.node().path)?;
             Preview1Cwd {
                 guest_name,
-                descriptor: descriptor.clone(),
+                descriptor: file.node().clone(),
             }
         }
         Some(_) => return Err(p1::errno::NOTDIR),
@@ -3247,14 +3303,10 @@ pub(super) fn wasix_spawn_resolve_cwd_target<Net: ComponentHostNetwork>(
         (guest_name, source_path, descriptor.flags)
     } else {
         let base = match snapshot.descriptors.get(fd) {
-            Some(Preview1Descriptor::Preopen { descriptor, .. })
-            | Some(Preview1Descriptor::File { descriptor, .. })
-                if descriptor.kind == FsNodeKind::Directory =>
-            {
-                descriptor.clone()
-            }
-            Some(_) => return Err(p1::errno::NOTDIR),
             None => return Err(p1::errno::BADF),
+            descriptor => p1_directory_descriptor(descriptor)
+                .ok_or(p1::errno::NOTDIR)?
+                .clone(),
         };
         let base_guest = wasix_spawn_guest_name_for_source(snapshot, &base.path)?;
         let guest_name =
@@ -3264,7 +3316,7 @@ pub(super) fn wasix_spawn_resolve_cwd_target<Net: ComponentHostNetwork>(
         (guest_name, source_path, base.flags)
     };
 
-    if !flags.contains(fs_types::DescriptorFlags::READ) {
+    if !flags.contains(FsDescriptorFlags::READ) {
         return Err(p1::errno::NOTCAPABLE);
     }
     Ok(Preview1Cwd {
@@ -3275,6 +3327,7 @@ pub(super) fn wasix_spawn_resolve_cwd_target<Net: ComponentHostNetwork>(
             flags,
             identity: None,
             mount: None,
+            open: None,
         },
     })
 }
@@ -3452,7 +3505,7 @@ where
         });
     }
 
-    let Some(cwd) = store.cwd.as_ref() else {
+    let Some(cwd) = store.cwd.get() else {
         return Err(wasmtime::Error::new(ProgramExecError {
             kind: ProgramExecErrorKind::PermissionDenied,
             detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
@@ -3538,7 +3591,7 @@ where
     let runtime_state = caller.data().runtime_state.clone();
     let service = runtime_state.wait_for_program_service().await;
     let exec_context = caller.data().exec_context();
-    let authority = authority.unwrap_or_else(|| caller.data().authority.clone());
+    let authority = authority.unwrap_or_else(|| caller.data().effective_authority());
     let filesystem = Some(caller.data().filesystem.clone());
     let launch_started = p1_kernel_profile_start(caller.data());
     let mut child = service
@@ -3553,6 +3606,8 @@ where
                 filesystem,
                 descriptors,
                 signal_dispositions,
+                #[cfg(feature = "linux")]
+                container: None,
                 timeline: trace.timeline().for_task(),
             },
             prepared_io.output_mode,
@@ -3608,7 +3663,10 @@ where
     caller
         .data_mut()
         .descriptors
-        .insert(Preview1Descriptor::PipeWrite { writer })
+        .insert(Preview1Descriptor::PipeWrite {
+            writer,
+            inode: helios_unix::PipeInode::default(),
+        })
         .map(Some)
 }
 
@@ -3634,7 +3692,7 @@ where
         .descriptors
         .insert(Preview1Descriptor::PipeRead {
             reader,
-            carry: Bytes::new(),
+            inode: helios_unix::PipeInode::default(),
         })
         .map(Some)
 }
@@ -3708,9 +3766,8 @@ pub(super) async fn wasix_write_join_exit(
     pid_ptr: GuestAddress,
     ret_status: GuestAddress,
     pid: u32,
-    code: u32,
+    termination: helios_unix::ChildTermination,
 ) -> Result<(), GuestAccessError> {
-    let errno = u16::try_from(code).unwrap_or(u16::MAX);
     memory.write_u8(pid_ptr, WASIX_OPTION_SOME).await?;
     memory
         .write_u32(
@@ -3718,13 +3775,53 @@ pub(super) async fn wasix_write_join_exit(
             pid,
         )
         .await?;
+    match termination {
+        helios_unix::ChildTermination::Exited(code) => {
+            let errno = u16::try_from(code).unwrap_or(u16::MAX);
+            memory
+                .write_u8(ret_status, WASIX_JOIN_STATUS_EXIT_NORMAL)
+                .await?;
+            memory
+                .write_u16(
+                    ret_status.offset(u64::from(WASIX_JOIN_STATUS_UNION_OFFSET)),
+                    errno,
+                )
+                .await
+        }
+        helios_unix::ChildTermination::Signaled(helios_unix::SignalTermination {
+            signal,
+            core_dumped,
+        }) => {
+            let encoded = (signal & 0x7f) | (u8::from(core_dumped) << 7);
+            wasix_write_join_signal(memory, ret_status, encoded).await
+        }
+        helios_unix::ChildTermination::Trapped => {
+            wasix_write_join_signal(memory, ret_status, WASIX_SIGABRT).await
+        }
+        helios_unix::ChildTermination::Killed => {
+            wasix_write_join_signal(memory, ret_status, WASIX_SIGKILL).await
+        }
+    }
+}
+
+async fn wasix_write_join_signal(
+    memory: &Preview1AsyncMemory,
+    ret_status: GuestAddress,
+    signal: u8,
+) -> Result<(), GuestAccessError> {
     memory
-        .write_u8(ret_status, WASIX_JOIN_STATUS_EXIT_NORMAL)
+        .write_u8(ret_status, WASIX_JOIN_STATUS_EXIT_SIGNAL)
         .await?;
     memory
         .write_u16(
             ret_status.offset(u64::from(WASIX_JOIN_STATUS_UNION_OFFSET)),
-            errno,
+            0,
+        )
+        .await?;
+    memory
+        .write_u8(
+            ret_status.offset(u64::from(WASIX_ERRNO_SIGNAL_SIGNAL_OFFSET)),
+            signal,
         )
         .await
 }
@@ -4044,21 +4141,60 @@ mod tests {
         );
     }
 
-    /// A join that reaped a child reports it as the guest's record has
-    /// it, and one that found nothing reports so.
+    /// A join that reaped a child encodes each termination kind into the
+    /// guest's `__wasi_join_status_t`, and one that found nothing reports so.
     #[test]
     fn a_join_reports_an_exit_and_the_absence_of_one() {
-        let mut guest = vec![0xee_u8; 64];
+        let mut guest = vec![0xee_u8; 128];
         let memory = memory_over(&mut guest);
         run(wasix_write_join_exit(
             &memory,
             GuestAddress::wasm32(0),
             GuestAddress::wasm32(16),
             9,
-            3,
+            helios_unix::ChildTermination::Exited(3),
         ))
         .expect("the records fit");
         run(wasix_write_join_nothing(&memory, GuestAddress::wasm32(32))).expect("fits");
+        run(wasix_write_join_exit(
+            &memory,
+            GuestAddress::wasm32(40),
+            GuestAddress::wasm32(48),
+            10,
+            helios_unix::ChildTermination::Signaled(helios_unix::SignalTermination {
+                signal: 15,
+                core_dumped: false,
+            }),
+        ))
+        .expect("fits");
+        run(wasix_write_join_exit(
+            &memory,
+            GuestAddress::wasm32(56),
+            GuestAddress::wasm32(64),
+            11,
+            helios_unix::ChildTermination::Signaled(helios_unix::SignalTermination {
+                signal: 11,
+                core_dumped: true,
+            }),
+        ))
+        .expect("fits");
+        run(wasix_write_join_exit(
+            &memory,
+            GuestAddress::wasm32(72),
+            GuestAddress::wasm32(80),
+            12,
+            helios_unix::ChildTermination::Trapped,
+        ))
+        .expect("fits");
+        run(wasix_write_join_exit(
+            &memory,
+            GuestAddress::wasm32(88),
+            GuestAddress::wasm32(96),
+            13,
+            helios_unix::ChildTermination::Killed,
+        ))
+        .expect("fits");
+
         assert_eq!(guest[0], WASIX_OPTION_SOME);
         assert_eq!(guest[4..8], 9_u32.to_le_bytes());
         assert_eq!(guest[16], WASIX_JOIN_STATUS_EXIT_NORMAL);
@@ -4071,6 +4207,23 @@ mod tests {
             guest[32 + WASIX_JOIN_STATUS_UNION_OFFSET as usize..][..2],
             0_u16.to_le_bytes()
         );
+
+        let check_signal = |at: usize, expected_signal: u8| {
+            assert_eq!(guest[at], WASIX_JOIN_STATUS_EXIT_SIGNAL);
+            assert_eq!(
+                guest[at + WASIX_JOIN_STATUS_UNION_OFFSET as usize..][..2],
+                0_u16.to_le_bytes(),
+                "exit_signal.exit_code must stay zero so musl WIFSIGNALED holds"
+            );
+            assert_eq!(
+                guest[at + WASIX_ERRNO_SIGNAL_SIGNAL_OFFSET as usize],
+                expected_signal
+            );
+        };
+        check_signal(48, 15);
+        check_signal(64, 11 | 0x80);
+        check_signal(80, WASIX_SIGABRT);
+        check_signal(96, WASIX_SIGKILL);
     }
 
     /// Signal dispositions are decoded one record at a time; an unknown
@@ -4191,6 +4344,539 @@ mod tests {
         assert_eq!(
             read_error_stop(error),
             P1Stop::Trap(crate::memory::SwapFaultError::Backend)
+        );
+    }
+}
+
+#[cfg(test)]
+mod spawn_descriptor_tests {
+    use super::*;
+    use crate::TaskFunding;
+    use crate::isa::GuestIsa;
+    use crate::test_support::{TestCpu, TestNetworkService, UnsupportedStorage};
+    use crate::wasmtime_adapter::component_host::service::test_store::DiscardPort;
+    use crate::wasmtime_adapter::engine::build_component_engine_for_platform;
+    use crate::wasmtime_adapter::preemption::GuestInterrupts;
+    use futures_lite::future::block_on;
+    use helios_hal::cpu::{Cpu, ProcessorId};
+    use helios_hal::watchdog::ProgressCounter;
+    use triomphe::Arc as SharedArc;
+
+    fn read_nothing(_: &mut Vec<u8>, _: u32) {}
+
+    struct SpawnFixture {
+        engine: wasmtime::Engine,
+        cpu: TestCpu,
+        timer: crate::Timer<TestCpu>,
+        spawner: crate::InstanceSpawner<TestCpu>,
+        runtime_state: HostRuntimeState<TestCpu, TestNetworkService, UnsupportedStorage>,
+        interrupts: Arc<GuestInterrupts>,
+        registry: crate::InstanceRegistry,
+        authority: ProcessAuthority,
+    }
+
+    impl SpawnFixture {
+        fn new() -> Self {
+            let cpu = TestCpu::with_entropy(0x42);
+            let engine = build_component_engine_for_platform(&cpu)
+                .expect("component engine builds on test platform");
+            let interrupts = Arc::new(GuestInterrupts::new(1, cpu.timebase()));
+            let runtime_state: HostRuntimeState<TestCpu, TestNetworkService, UnsupportedStorage> =
+                crate::RuntimeState::new(
+                    cpu.timebase(),
+                    1,
+                    0,
+                    crate::BootPayload::for_tests(),
+                    GuestIsa::for_build_target(cpu.native_feature_probe()),
+                );
+            runtime_state.install_root_entropy(SharedArc::new(
+                crate::RootEntropy::from_platform(
+                    &cpu,
+                    None,
+                    None,
+                    crate::MachineGeneration::new(None),
+                )
+                .expect("fixture CPU has entropy"),
+            ));
+            let executor = crate::Executor::new(
+                ProgressCounter::new(),
+                crate::test_support::single_node_pool(1),
+                ProcessorId::new(0),
+            );
+            let registry = crate::InstanceRegistry::new();
+            let parent_instance = registry.register("spawn-fixture", 0);
+            let spawner = executor
+                .spawner(cpu)
+                .instance_spawner(TaskFunding::Instance, &parent_instance);
+            let timer = executor.timer(cpu);
+
+            let mut authority = ProcessAuthority::empty();
+            authority.insert_directory_preopen(
+                crate::DirectoryPreopen::new(
+                    "/mnt/workspace",
+                    "/workspace",
+                    crate::DirectoryAuthorityRights::READ | crate::DirectoryAuthorityRights::WRITE,
+                )
+                .expect("preopen is valid"),
+            );
+
+            Self {
+                engine,
+                cpu,
+                timer,
+                spawner,
+                runtime_state,
+                interrupts,
+                registry,
+                authority,
+            }
+        }
+
+        fn make_store(
+            &self,
+            name: &str,
+            authority: ProcessAuthority,
+            descriptors: Option<Preview1DescriptorTable<TestNetworkService>>,
+        ) -> Preview1ProgramStore<TestCpu, TestNetworkService, UnsupportedStorage> {
+            let instance = self.registry.register(name, 0);
+            let threads = WasixProcessThreads::new();
+            let signal_state = WasixSignalState::new();
+            Preview1ProgramStore::new(
+                self.cpu,
+                self.timer.clone(),
+                self.spawner.clone(),
+                self.runtime_state.clone(),
+                self.interrupts.clone(),
+                instance,
+                None,
+                alloc::vec![name.to_owned()],
+                Vec::new(),
+                authority,
+                OutputMode::Serial,
+                read_nothing,
+                crate::DebugSerialWriter::of::<DiscardPort>(),
+                None,
+                None,
+                descriptors,
+                signal_state,
+                threads.main_mailbox(),
+                Vec::new(),
+                None,
+                true,
+                threads,
+            )
+        }
+
+        fn run_with_caller(
+            &self,
+            store_data: Preview1ProgramStore<TestCpu, TestNetworkService, UnsupportedStorage>,
+            probe: impl FnOnce(
+                wasmtime::Caller<
+                    '_,
+                    Preview1ProgramStore<TestCpu, TestNetworkService, UnsupportedStorage>,
+                >,
+            )
+                -> core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send + '_>>
+            + Send
+            + Sync
+            + 'static,
+        ) {
+            let mut store = wasmtime::Store::new(&self.engine, store_data);
+            let probe = std::sync::Mutex::new(Some(probe));
+            let func = wasmtime::Func::wrap_async(&mut store, move |caller, (): ()| {
+                let probe = probe
+                    .lock()
+                    .expect("probe mutex")
+                    .take()
+                    .expect("probe called once");
+                Box::new(async move {
+                    probe(caller).await;
+                    Ok(())
+                })
+            });
+            block_on(async {
+                let typed = func
+                    .typed::<(), ()>(&store)
+                    .expect("probe function has unit signature");
+                typed
+                    .call_async(&mut store, ())
+                    .await
+                    .expect("probe succeeds");
+            });
+        }
+    }
+
+    fn open_file_descriptor(path: &str) -> Preview1Descriptor<TestNetworkService> {
+        Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: path.into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
+            identity: None,
+            mount: None,
+            open: None,
+        }))
+    }
+
+    fn assert_tables_equal(
+        left: &Preview1DescriptorTable<TestNetworkService>,
+        right: &Preview1DescriptorTable<TestNetworkService>,
+    ) {
+        assert_eq!(left.limit, right.limit);
+        assert_eq!(left.entries.len(), right.entries.len());
+        for fd in 0..left.entries.len() as i32 {
+            assert_eq!(left.fdflags(fd), right.fdflags(fd), "fd {fd} fdflags");
+            assert_eq!(
+                left.close_on_exec(fd),
+                right.close_on_exec(fd),
+                "fd {fd} close_on_exec"
+            );
+            match (left.get(fd), right.get(fd)) {
+                (None, None) => {}
+                (
+                    Some(Preview1Descriptor::Stdin { .. }),
+                    Some(Preview1Descriptor::Stdin { .. }),
+                )
+                | (Some(Preview1Descriptor::Stdout), Some(Preview1Descriptor::Stdout))
+                | (Some(Preview1Descriptor::Stderr), Some(Preview1Descriptor::Stderr))
+                | (Some(Preview1Descriptor::NullDevice), Some(Preview1Descriptor::NullDevice)) => {}
+                (
+                    Some(Preview1Descriptor::Preopen {
+                        guest_name: left_name,
+                        descriptor: left_desc,
+                    }),
+                    Some(Preview1Descriptor::Preopen {
+                        guest_name: right_name,
+                        descriptor: right_desc,
+                    }),
+                ) => {
+                    assert_eq!(left_name, right_name);
+                    assert_eq!(left_desc.path, right_desc.path);
+                    assert_eq!(left_desc.flags, right_desc.flags);
+                }
+                (
+                    Some(Preview1Descriptor::File(left_file)),
+                    Some(Preview1Descriptor::File(right_file)),
+                ) => {
+                    assert!(
+                        left_file.same_description(right_file),
+                        "fd {fd} must share the same OpenFile description"
+                    );
+                }
+                (
+                    Some(Preview1Descriptor::PipeRead { .. }),
+                    Some(Preview1Descriptor::PipeRead { .. }),
+                )
+                | (
+                    Some(Preview1Descriptor::PipeWrite { .. }),
+                    Some(Preview1Descriptor::PipeWrite { .. }),
+                ) => {}
+                _ => panic!("fd {fd} descriptor mismatch between spawn tables"),
+            }
+        }
+    }
+
+    /// `proc_spawn2` with no descriptor actions (`fd_ops == 0 && fd_ops_len == 0`)
+    /// starts the child over the parent's table with `close_on_exec` entries
+    /// removed: an inheritable file and pipe opened in the parent are both
+    /// open in the child, while a `close_on_exec` descriptor is dropped.
+    #[test]
+    fn proc_spawn2_no_actions_inherits_open_file_and_pipe_without_cloexec() {
+        let fixture = std::sync::Arc::new(SpawnFixture::new());
+        let parent = fixture.make_store("parent", fixture.authority.clone(), None);
+
+        let shared_file_fd = parent
+            .descriptors
+            .insert(open_file_descriptor("/mnt/workspace/shared.txt"))
+            .expect("file fd inserts") as i32;
+        let (pipe_writer, pipe_reader) = crate::byte_channel();
+        let pipe_fd = parent
+            .descriptors
+            .insert(Preview1Descriptor::PipeRead {
+                reader: pipe_reader,
+                inode: helios_unix::PipeInode::default(),
+            })
+            .expect("pipe fd inserts") as i32;
+        let cloexec_fd = parent
+            .descriptors
+            .insert_with_close_on_exec(open_file_descriptor("/mnt/workspace/secret.txt"), true)
+            .expect("cloexec fd inserts") as i32;
+
+        let parent_file = match parent.descriptors.get_cloned(shared_file_fd) {
+            Some(Preview1Descriptor::File(file)) => file,
+            _ => panic!("parent must hold open file"),
+        };
+
+        let fixture_clone = fixture.clone();
+        fixture.run_with_caller(parent, move |mut caller| {
+            Box::pin(async move {
+                let mut guest = [0_u8; 256];
+                let memory = Preview1AsyncMemory::new(Preview1Memory {
+                    base: guest.as_mut_ptr() as usize,
+                    len: guest.len(),
+                });
+                let snapshot = wasix_spawn_descriptor_snapshot(&mut caller, &memory, 0, 0)
+                    .await
+                    .expect("no-action snapshot succeeds");
+                let inheritance = wasix_proc_spawn2_inheritance(None, snapshot, Vec::new());
+                let child = fixture_clone.make_store(
+                    "child",
+                    inheritance.authority.expect("child authority"),
+                    inheritance.descriptors,
+                );
+
+                match child.descriptors.get_cloned(shared_file_fd) {
+                    Some(Preview1Descriptor::File(child_file)) => {
+                        assert!(child_file.same_description(&parent_file));
+                    }
+                    _ => panic!("child must inherit parent's open file at fd {shared_file_fd}"),
+                }
+                match child.descriptors.get_cloned(pipe_fd) {
+                    Some(Preview1Descriptor::PipeRead { reader, .. }) => {
+                        pipe_writer
+                            .write(Bytes::from_static(b"spawn2-pipe"))
+                            .await
+                            .expect("parent writes pipe");
+                        assert_eq!(
+                            reader.read_limit(32).await.as_deref(),
+                            Some(&b"spawn2-pipe"[..])
+                        );
+                    }
+                    _ => panic!("child must inherit parent's pipe at fd {pipe_fd}"),
+                }
+                assert!(
+                    child.descriptors.get_cloned(cloexec_fd).is_none(),
+                    "close-on-exec descriptor must be removed in child"
+                );
+            })
+        });
+    }
+
+    /// A `proc_spawn2` call with no actions (`0, 0`) produces the exact same
+    /// child table as one with a non-null empty action list (`ptr, 0`), and
+    /// both start from the same `clone_for_exec` base as action-carrying calls.
+    #[test]
+    fn proc_spawn2_no_actions_equals_empty_action_list_and_action_base() {
+        let fixture = std::sync::Arc::new(SpawnFixture::new());
+        let parent = fixture.make_store("parent", fixture.authority.clone(), None);
+
+        let file_fd = parent
+            .descriptors
+            .insert(open_file_descriptor("/mnt/workspace/data.bin"))
+            .expect("file fd inserts") as i32;
+        let (_writer, reader) = crate::byte_channel();
+        let pipe_fd = parent
+            .descriptors
+            .insert(Preview1Descriptor::PipeRead {
+                reader,
+                inode: helios_unix::PipeInode::default(),
+            })
+            .expect("pipe fd inserts") as i32;
+        let cloexec_fd = parent
+            .descriptors
+            .insert_with_close_on_exec(open_file_descriptor("/mnt/workspace/cloexec.bin"), true)
+            .expect("cloexec fd inserts") as i32;
+
+        fixture.run_with_caller(parent, move |mut caller| {
+            Box::pin(async move {
+                let mut guest = [0_u8; 256];
+                let memory = Preview1AsyncMemory::new(Preview1Memory {
+                    base: guest.as_mut_ptr() as usize,
+                    len: guest.len(),
+                });
+                let no_actions = wasix_spawn_descriptor_snapshot(&mut caller, &memory, 0, 0)
+                    .await
+                    .expect("no-action snapshot succeeds");
+                let empty_actions = wasix_spawn_descriptor_snapshot(&mut caller, &memory, 64, 0)
+                    .await
+                    .expect("empty-action snapshot succeeds");
+
+                assert_tables_equal(&no_actions.descriptors, &empty_actions.descriptors);
+                assert_eq!(
+                    no_actions.authority.directory_preopens().len(),
+                    empty_actions.authority.directory_preopens().len()
+                );
+
+                // Null pointer with nonzero action count still faults.
+                assert_eq!(
+                    wasix_spawn_descriptor_snapshot(&mut caller, &memory, 0, 1)
+                        .await
+                        .err(),
+                    Some(P1Stop::Errno(p1::errno::FAULT))
+                );
+
+                // An action list starts from the exact same `clone_for_exec` base:
+                // encode `WASIX_PROC_SPAWN_FD_OP_CLOSE` for `pipe_fd` at offset 64.
+                let op_base = GuestAddress::wasm32(64);
+                memory
+                    .write_bytes(
+                        op_base.offset(u64::from(WASIX_PROC_SPAWN_FD_OP_CMD_OFFSET)),
+                        &[WASIX_PROC_SPAWN_FD_OP_CLOSE],
+                    )
+                    .await
+                    .expect("writes cmd");
+                memory
+                    .write_bytes(
+                        op_base.offset(u64::from(WASIX_PROC_SPAWN_FD_OP_FD_OFFSET)),
+                        &(pipe_fd as u32).to_le_bytes(),
+                    )
+                    .await
+                    .expect("writes fd");
+                let with_close = wasix_spawn_descriptor_snapshot(&mut caller, &memory, 64, 1)
+                    .await
+                    .expect("close-action snapshot succeeds");
+                assert!(with_close.descriptors.get(file_fd).is_some());
+                assert!(with_close.descriptors.get(pipe_fd).is_none());
+                assert!(with_close.descriptors.get(cloexec_fd).is_none());
+            })
+        });
+    }
+
+    /// A `proc_spawn2` `DUP2` action runs before `close_on_exec` filtering, so
+    /// a parent holding an `O_CLOEXEC` pipe can redirect it onto stdout (`fd 1`)
+    /// with `close_on_exec == false` while the original `cloexec_pipe_fd` is
+    /// stripped from the child's table.
+    #[test]
+    fn proc_spawn2_dup2_redirects_cloexec_pipe_and_closes_source_fd() {
+        let fixture = std::sync::Arc::new(SpawnFixture::new());
+        let parent = fixture.make_store("parent", fixture.authority.clone(), None);
+        let (pipe_writer, pipe_reader) = crate::byte_channel();
+        let cloexec_pipe_fd = parent
+            .descriptors
+            .insert_with_close_on_exec(
+                Preview1Descriptor::PipeWrite {
+                    writer: pipe_writer,
+                    inode: helios_unix::PipeInode::default(),
+                },
+                true,
+            )
+            .expect("cloexec pipe inserts") as i32;
+
+        let fixture_clone = fixture.clone();
+        fixture.run_with_caller(parent, move |mut caller| {
+            Box::pin(async move {
+                let mut guest = [0_u8; 256];
+                let memory = Preview1AsyncMemory::new(Preview1Memory {
+                    base: guest.as_mut_ptr() as usize,
+                    len: guest.len(),
+                });
+                let op_base = GuestAddress::wasm32(64);
+                memory
+                    .write_bytes(
+                        op_base.offset(u64::from(WASIX_PROC_SPAWN_FD_OP_CMD_OFFSET)),
+                        &[WASIX_PROC_SPAWN_FD_OP_DUP2],
+                    )
+                    .await
+                    .expect("writes cmd");
+                memory
+                    .write_bytes(
+                        op_base.offset(u64::from(WASIX_PROC_SPAWN_FD_OP_FD_OFFSET)),
+                        &1_u32.to_le_bytes(),
+                    )
+                    .await
+                    .expect("writes target fd");
+                memory
+                    .write_bytes(
+                        op_base.offset(u64::from(WASIX_PROC_SPAWN_FD_OP_SRC_FD_OFFSET)),
+                        &(cloexec_pipe_fd as u32).to_le_bytes(),
+                    )
+                    .await
+                    .expect("writes source fd");
+                memory
+                    .write_bytes(
+                        op_base.offset(u64::from(WASIX_PROC_SPAWN_FD_OP_FDFLAGSEXT_OFFSET)),
+                        &0_u16.to_le_bytes(),
+                    )
+                    .await
+                    .expect("writes fdflagsext");
+
+                let snapshot = wasix_spawn_descriptor_snapshot(&mut caller, &memory, 64, 1)
+                    .await
+                    .expect("dup2 over cloexec pipe succeeds");
+                let inheritance = wasix_proc_spawn2_inheritance(None, snapshot, Vec::new());
+                let child = fixture_clone.make_store(
+                    "child",
+                    inheritance.authority.expect("child authority"),
+                    inheritance.descriptors,
+                );
+
+                assert!(
+                    child.descriptors.get_cloned(cloexec_pipe_fd).is_none(),
+                    "original close_on_exec pipe fd must be closed in child"
+                );
+                assert_eq!(child.descriptors.close_on_exec(1), Ok(false));
+                match child.descriptors.get_cloned(1) {
+                    Some(Preview1Descriptor::PipeWrite { writer, .. }) => {
+                        writer
+                            .write(Bytes::from_static(b"cloexec-dup2"))
+                            .await
+                            .expect("child writes redirected stdout pipe");
+                        assert_eq!(
+                            pipe_reader.read_limit(32).await.as_deref(),
+                            Some(&b"cloexec-dup2"[..])
+                        );
+                    }
+                    _ => panic!("child fd 1 must receive the redirected pipe"),
+                }
+            })
+        });
+    }
+
+    /// `proc_spawn` builds a fresh descriptor table from its scoped child
+    /// `authority` (stdio + granted preopens) rather than inheriting arbitrary
+    /// files or pipes from the parent's descriptor table.
+    #[test]
+    fn proc_spawn_uses_fresh_table_from_scoped_authority_unlike_proc_spawn2() {
+        let fixture = SpawnFixture::new();
+        let parent = fixture.make_store("parent", fixture.authority.clone(), None);
+        let file_fd = parent
+            .descriptors
+            .insert(open_file_descriptor("/mnt/workspace/parent-only.txt"))
+            .expect("file fd inserts") as i32;
+        let (_writer, reader) = crate::byte_channel();
+        let pipe_fd = parent
+            .descriptors
+            .insert(Preview1Descriptor::PipeRead {
+                reader,
+                inode: helios_unix::PipeInode::default(),
+            })
+            .expect("pipe fd inserts") as i32;
+        assert!(parent.descriptors.get_cloned(file_fd).is_some());
+        assert!(parent.descriptors.get_cloned(pipe_fd).is_some());
+
+        let inheritance =
+            wasix_proc_spawn_inheritance::<TestNetworkService>(fixture.authority.clone());
+        assert!(
+            inheritance.descriptors.is_none(),
+            "proc_spawn leaves child descriptor creation to Preview1DescriptorTable::from_authority"
+        );
+        let child = fixture.make_store(
+            "proc-spawn-child",
+            inheritance.authority.expect("child authority"),
+            inheritance.descriptors,
+        );
+        assert!(matches!(
+            child.descriptors.get_cloned(0),
+            Some(Preview1Descriptor::Stdin { .. })
+        ));
+        assert!(matches!(
+            child.descriptors.get_cloned(1),
+            Some(Preview1Descriptor::Stdout)
+        ));
+        assert!(matches!(
+            child.descriptors.get_cloned(2),
+            Some(Preview1Descriptor::Stderr)
+        ));
+        assert!(matches!(
+            child.descriptors.get_cloned(3),
+            Some(Preview1Descriptor::Preopen { guest_name, .. }) if guest_name == "/workspace"
+        ));
+        assert!(
+            child.descriptors.get_cloned(file_fd).is_none(),
+            "proc_spawn must not inherit parent's open file"
+        );
+        assert!(
+            child.descriptors.get_cloned(pipe_fd).is_none(),
+            "proc_spawn must not inherit parent's pipe"
         );
     }
 }

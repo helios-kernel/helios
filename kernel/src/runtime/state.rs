@@ -7,13 +7,14 @@ use triomphe::Arc;
 
 use crate::{
     BOOT_DEVICE, BootFs, BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
-    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedComponent, FoldedProfileSample, FutexKey, FutexTable,
-    FutexWaitRegistration, HEAP_SIZE_CLASS_COUNT, HOST_SHARE_GUEST_MOUNT_PATH, HeapStats,
-    HostShare, InstanceId, InstanceRegistry, InstructionSampler, MountTable, MountedFs, Namespace,
-    Notify, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter,
-    ProfileScope, ProfileSink, StatsSample, TraceEvent, TraceFilter, TraceLog,
+    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedComponent, FoldedProfileSample, HEAP_SIZE_CLASS_COUNT,
+    HOST_SHARE_GUEST_MOUNT_PATH, HeapStats, HostShare, InstanceId, InstanceRegistry,
+    InstructionSampler, MountTable, MountedFs, Namespace, Notify, PerfMetricFilter,
+    PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink,
+    StatsSample, TraceEvent, TraceFilter, TraceLog,
 };
 use crate::{MachineGeneration, MachineGenerationHandle, RootEntropy, RootEntropyHandle};
+use crate::{MountGrant, MountSharing};
 use helios_hal::cpu::{HardwarePerfCounterDelta, Timebase};
 use helios_hal::fs::FileSystemRights;
 use helios_hal::rtc::{RealTimeClock, UnixSeconds};
@@ -22,7 +23,7 @@ use spin::{Mutex, Once};
 use crate::memory::BalloonHandle;
 
 use crate::ComponentHostVsockService;
-use crate::component::{ComponentRuntimeState, ProviderSlot};
+use crate::component::{ComponentRuntimeState, PerProcessorProvider, ProviderSlot};
 use crate::device::DeviceGrantRegistry;
 use crate::network::HttpExchange;
 use crate::{AttachedStorage, BlockCache, BlockService, HostFileSystem, Storage};
@@ -56,15 +57,21 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// after each machine restore. Unseeded on a machine that carries no
     /// such clock, where wall time is uptime.
     wall_clock: crate::exec::WallClock,
-    /// Queue into the `http-client` kernel plugin. Empty on a kernel image
-    /// that does not provision the plugin, in which case the runtime adapter
-    /// answers a configuration error rather than trapping.
-    http_client: ProviderSlot<HttpExchange>,
+    /// Per-processor sharded queues into the `http-client` kernel plugin.
+    /// Empty on a kernel image that does not provision the plugin, in which
+    /// case the runtime adapter answers a configuration error rather than
+    /// trapping.
+    http_client: PerProcessorProvider<HttpExchange>,
     host_fs_service: Mutex<Option<StorageImpl::HostShare>>,
     /// The block cache over the machine's mount-source disks, once the
     /// kernel identified them. Empty on a machine with none, where a
     /// disk mount is refused as unavailable.
     mount_sources: Once<BlockCache<StorageImpl::Disk>>,
+    /// True while the asynchronous block-discovery task is identifying disks
+    /// and opening mount sources; cleared once `install_mount_sources` has
+    /// published them so early mount requests wait instead of racing boot.
+    block_discovery_pending: AtomicBool,
+    block_discovery_ready: Notify,
     /// What the kernel publishes about its disks once it identified them
     /// and proved the scratch disk: the scratch disk's counters and the
     /// compressed pool's settings. Empty on a machine with no block
@@ -117,7 +124,6 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// device up. Empty on a machine with no vsock device, where the
     /// runtime adapter answers `unavailable` rather than trapping.
     vsock_service: Once<ComponentHostVsockService>,
-    futex_table: FutexTable,
     /// The user payload the backend handed the kernel — init component,
     /// `argv0`, and the boot filesystem it carries — parsed from the
     /// boot module at bring-up.
@@ -348,9 +354,11 @@ where
                 root_entropy: Once::new(),
                 machine_generation: Once::new(),
                 wall_clock: crate::exec::WallClock::new(),
-                http_client: ProviderSlot::new(),
+                http_client: PerProcessorProvider::new(),
                 host_fs_service: Mutex::new(None),
                 mount_sources: Once::new(),
+                block_discovery_pending: AtomicBool::new(false),
+                block_discovery_ready: Notify::new(),
                 block_service: Once::new(),
                 device_grants: DeviceGrantRegistry::new(),
                 iommu_report: Once::new(),
@@ -364,7 +372,6 @@ where
                 compositor: ProviderSlot::new(),
                 audio_service: Once::new(),
                 vsock_service: Once::new(),
-                futex_table: FutexTable::new(),
                 payload,
                 namespace: Namespace::new(MountTable::new(
                     BootFs::new(payload.bootfs(), BOOT_DEVICE),
@@ -850,13 +857,14 @@ where
         }
     }
 
-    /// The hand-off slot for the `http-client` kernel plugin.
+    /// The per-processor sharded hand-off slot for the `http-client` kernel
+    /// plugin.
     ///
-    /// The plugin supervisor installs the queue during startup; the runtime
-    /// adapter's HTTP client binding sends every exchange through it. The slot
-    /// stays empty when the plugin is not provisioned, which that binding
-    /// reports to the guest as a configuration error.
-    pub fn http_client(&self) -> &ProviderSlot<HttpExchange> {
+    /// Each online processor sends into its own cache-padded NUMA-local shard;
+    /// processor hot-unplug atomically redirects queued and future work to its
+    /// successor. The slot stays empty when the plugin is not provisioned,
+    /// which the adapter reports to the guest as a configuration error.
+    pub fn http_client(&self) -> &PerProcessorProvider<HttpExchange> {
         &self.inner.http_client
     }
 
@@ -1036,7 +1044,11 @@ where
             .mount(
                 HOST_SHARE_GUEST_MOUNT_PATH,
                 MountedFs::Host(HostShare::new(service)),
-                FileSystemRights::READ | FileSystemRights::WRITE,
+                // The host's files, seen by every program the kernel runs.
+                MountGrant {
+                    rights: FileSystemRights::READ | FileSystemRights::WRITE,
+                    sharing: MountSharing::Shared,
+                },
             )
             .unwrap_or_else(|error| panic!("host share mount failed at bring-up: {error}"));
     }
@@ -1068,6 +1080,35 @@ where
     /// machine with none.
     pub fn mount_sources(&self) -> Option<BlockCache<StorageImpl::Disk>> {
         self.inner.mount_sources.get().cloned()
+    }
+
+    /// Marks asynchronous block-device discovery as in flight so disk mounts
+    /// wait until [`Self::finish_block_discovery`] publishes any mount sources.
+    pub fn begin_block_discovery(&self) {
+        self.inner
+            .block_discovery_pending
+            .store(true, Ordering::Release);
+    }
+
+    /// Marks asynchronous block-device discovery complete and wakes any
+    /// mount request waiting for mount-source disks.
+    pub fn finish_block_discovery(&self) {
+        self.inner
+            .block_discovery_pending
+            .store(false, Ordering::Release);
+        self.inner.block_discovery_ready.notify_all();
+    }
+
+    /// Waits until in-flight block-device discovery completes. Returns
+    /// immediately on machines with no pending block discovery.
+    pub async fn wait_for_block_discovery(&self) {
+        while self.inner.block_discovery_pending.load(Ordering::Acquire) {
+            let ready = self.inner.block_discovery_ready.notified();
+            if !self.inner.block_discovery_pending.load(Ordering::Acquire) {
+                return;
+            }
+            ready.await;
+        }
     }
 
     /// The storage a mount request builds its source from.
@@ -1156,18 +1197,6 @@ where
 
     pub fn vsock_service(&self) -> Option<ComponentHostVsockService> {
         self.inner.vsock_service.get().cloned()
-    }
-
-    pub fn prepare_futex_wait(&self, key: FutexKey) -> FutexWaitRegistration {
-        self.inner.futex_table.prepare_wait(key)
-    }
-
-    pub fn wake_futex(&self, key: FutexKey, count: usize) -> usize {
-        self.inner.futex_table.wake(key, count)
-    }
-
-    pub fn wake_all_futex(&self, key: FutexKey) -> usize {
-        self.inner.futex_table.wake_all(key)
     }
 
     /// The system component this payload carries, when this build would
@@ -1351,7 +1380,7 @@ mod tests {
 
     #[test]
     fn a_reseed_moves_the_wall_clock_to_the_new_reading() {
-        let state = RuntimeState::<(), (), crate::UnsupportedStorage>::new(
+        let state = RuntimeState::<(), (), crate::test_support::UnsupportedStorage>::new(
             Timebase::new(1_000_000_000),
             1,
             0,
@@ -1365,7 +1394,7 @@ mod tests {
 
         // The machine was stopped and the calendar moved a day.
         rtc.0.set(1_000 + 86_400);
-        let wall = RuntimeState::<(), (), crate::UnsupportedStorage>::read_rtc(&rtc);
+        let wall = RuntimeState::<(), (), crate::test_support::UnsupportedStorage>::read_rtc(&rtc);
         state.reseed_wall_clock(6_000_000_000, wall);
         assert_eq!(state.wall_clock_nanos(6_000_000_000), 87_400_000_000_000);
     }
@@ -1373,7 +1402,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "seeded more than once")]
     fn seeding_the_wall_clock_twice_is_a_bring_up_fault() {
-        let state = RuntimeState::<(), (), crate::UnsupportedStorage>::new(
+        let state = RuntimeState::<(), (), crate::test_support::UnsupportedStorage>::new(
             Timebase::new(1_000_000_000),
             1,
             0,
@@ -1387,7 +1416,7 @@ mod tests {
 
     #[test]
     fn runtime_state_records_kernel_heap_delta_metrics() {
-        let state = RuntimeState::<(), (), crate::UnsupportedStorage>::new(
+        let state = RuntimeState::<(), (), crate::test_support::UnsupportedStorage>::new(
             Timebase::new(1_000_000_000),
             1,
             0,

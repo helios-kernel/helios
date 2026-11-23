@@ -656,6 +656,153 @@ mod tests {
         }
     }
 
+    fn push_leb_u32(out: &mut Vec<u8>, mut value: u32) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn push_section(module: &mut Vec<u8>, id: u8, payload: &[u8]) {
+        module.push(id);
+        push_leb_u32(
+            module,
+            u32::try_from(payload.len()).expect("section fits u32"),
+        );
+        module.extend_from_slice(payload);
+    }
+
+    fn br_table_module(tables: &[(u32, u8)]) -> Vec<u8> {
+        let mut module = Vec::new();
+        module.extend_from_slice(b"\0asm\x01\0\0\0");
+        // Type 0: (param i32) -> (result i32)
+        push_section(&mut module, 0x01, &[0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]);
+        // Function 0 uses type 0
+        push_section(&mut module, 0x03, &[0x01, 0x00]);
+        // Export "f" -> func 0
+        push_section(&mut module, 0x07, &[0x01, 0x01, b'f', 0x00, 0x00]);
+
+        let mut body = Vec::new();
+        body.push(0x00); // 0 locals
+        // Outer `$default` block: every table's default branch jumps past all
+        // remaining inline jump tables to return 0 at the end of the function.
+        body.extend_from_slice(&[0x02, 0x40]); // block $default
+        for &(targets, hit_val) in tables {
+            body.extend_from_slice(&[
+                0x02, 0x40, // block $hit
+                0x20, 0x00, // local.get 0
+                0x0e, // br_table
+            ]);
+            push_leb_u32(&mut body, targets);
+            body.resize(body.len() + usize::try_from(targets).unwrap(), 0x00); // all hit $hit (0)
+            body.push(0x01); // default jumps to outer $default (depth 1)
+            body.extend_from_slice(&[
+                0x0b, // end $hit
+                0x41, hit_val, // i32.const hit_val
+                0x0f,    // return
+            ]);
+        }
+        body.extend_from_slice(&[
+            0x0b, // end $default
+            0x41, 0x00, // i32.const 0
+            0x0b, // end function
+        ]);
+
+        let mut code_section = Vec::with_capacity(body.len() + 8);
+        code_section.push(0x01); // 1 function body
+        push_leb_u32(
+            &mut code_section,
+            u32::try_from(body.len()).expect("body fits u32"),
+        );
+        code_section.extend_from_slice(&body);
+        push_section(&mut module, 0x0a, &code_section);
+        module
+    }
+
+    /// Regression test for #503 (GHSA-mghf-wjfp-p5xm / Wasmtime #14826):
+    /// 1. `br_table` up to `MAX_BR_TABLE_TARGETS` (65_520) compiles on aarch64,
+    ///    and 5 chained 60_000-entry tables (300_000 > 2^18 entries = 1.2 MiB of
+    ///    inline jump tables) branch cleanly to a default target > 1 MiB away.
+    /// 2. Single `br_table`s above 65_520 (including > 2^18 targets) are
+    ///    refused cleanly during translation.
+    #[test]
+    fn aarch64_large_br_table_past_adr_range_compiles() {
+        let floor = cwasm_target_isa_levels("aarch64-unknown-none")
+            .floor()
+            .name();
+        let target = CwasmTarget::new("aarch64-unknown-none", floor).expect("a defined level");
+
+        let max_single = br_table_module(&[(65_520, 5)]);
+        precompile_artifact(&max_single, &target, AotCompileHint::Performance)
+            .expect("aarch64 65_520-target br_table precompiles");
+
+        let over_one_mib_default = br_table_module(&[
+            (60_000, 5),
+            (60_000, 6),
+            (60_000, 7),
+            (60_000, 8),
+            (60_000, 9),
+        ]);
+        precompile_artifact(&over_one_mib_default, &target, AotCompileHint::Performance)
+            .expect("aarch64 br_tables pushing default branch past 1 MiB precompile");
+
+        for oversized in [65_521_u32, (1 << 18) + 64] {
+            let module = br_table_module(&[(oversized, 5)]);
+            let error = precompile_artifact(&module, &target, AotCompileHint::Performance)
+                .err()
+                .unwrap_or_else(|| panic!("br_table with {oversized} targets must be rejected"));
+            let rendered = format!("{error:?}");
+            assert!(
+                rendered.contains("exceeds the implementation limit of 65520"),
+                "unexpected error for {oversized} targets: {rendered}"
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")))]
+        {
+            #[cfg(target_os = "linux")]
+            const HOST_AARCH64_TARGET: &str = "aarch64-unknown-linux-gnu";
+            #[cfg(target_os = "macos")]
+            const HOST_AARCH64_TARGET: &str = "aarch64-apple-darwin";
+            let host_floor = cwasm_target_isa_levels(HOST_AARCH64_TARGET).floor().name();
+            let host_target =
+                CwasmTarget::new(HOST_AARCH64_TARGET, host_floor).expect("a defined level");
+            let config = build_engine_config(&host_target, AotCompileHint::Performance, 1)
+                .expect("host config builds");
+            let engine = wasmtime::Engine::new(&config).expect("host engine builds");
+            for (module_bytes, n) in [(&max_single, 65_520_u32), (&over_one_mib_default, 60_000)] {
+                let artifact =
+                    precompile_artifact(module_bytes, &host_target, AotCompileHint::Performance)
+                        .expect("host artifact precompiles");
+                let module = unsafe { wasmtime::Module::deserialize(&engine, &artifact.bytes) }
+                    .expect("host artifact deserializes");
+                let mut store = wasmtime::Store::new(&engine, ());
+                let instance =
+                    wasmtime::Instance::new(&mut store, &module, &[]).expect("instantiates");
+                let f = instance
+                    .get_typed_func::<u32, u32>(&mut store, "f")
+                    .expect("exported f");
+                for (idx, expected) in [
+                    (0, 5),
+                    (5, 5),
+                    (n - 1, 5),
+                    (n, 0),
+                    (n + 37_600, 0),
+                    (u32::MAX, 0),
+                ] {
+                    assert_eq!(f.call(&mut store, idx).expect("call succeeds"), expected);
+                }
+            }
+        }
+    }
+
     /// Deserialization needs a target that is the host itself, so it runs only
     /// where the host is a platform Helios develops on; the other
     /// architectures' levels are covered by compilation alone.

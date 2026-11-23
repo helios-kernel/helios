@@ -74,7 +74,6 @@ helios_aarch64_enter_guest:
     msr hcr_el2, x10
     isb
     mov x30, x0
-    ldp x0, x1, [x30, #0]
     ldp x2, x3, [x30, #16]
     ldp x4, x5, [x30, #32]
     ldp x6, x7, [x30, #48]
@@ -89,6 +88,23 @@ helios_aarch64_enter_guest:
     ldp x24, x25, [x30, #192]
     ldp x26, x27, [x30, #208]
     ldp x28, x29, [x30, #224]
+
+    // Start the execution slice only after the expensive state switch.
+    // X0/X1 remain scratch until the final two loads; X30 owns the context.
+    mrs x0, cntpct_el0
+    ldr x1, [x30, #{slice_ticks}]
+    adds x0, x0, x1
+    csinv x0, x0, xzr, cc // Saturate now + ticks on unsigned overflow.
+    ldr x1, [x30, #{timer_deadline}]
+    cbz x1, .Lguest_timer_selected
+    cmp x0, x1
+    csel x0, x0, x1, ls
+.Lguest_timer_selected:
+    msr cnthp_cval_el2, x0
+    mov x0, #1
+    msr cnthp_ctl_el2, x0
+    isb
+    ldp x0, x1, [x30, #0]
     ldr x30, [x30, #240]
     eret
 .size helios_aarch64_enter_guest, . - helios_aarch64_enter_guest

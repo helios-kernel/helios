@@ -220,3 +220,11 @@ source_url = "tools/wasi-apps/wasix-tests"
 targets = ["aarch64-unknown-none", "x86_64-unknown-none"]
 bootfs_path = "bin/simd-lanes"
 source = "artifacts/wasix/simd-lanes/simd-lanes.wasm"
+
+[[artifact]]
+command = "wasix-port-list"
+package = "helios-wasix-conformance"
+version = "0.1.0"
+source_url = "tools/wasi-apps/wasix-tests"
+bootfs_path = "bin/wasix-port-list"
+source = "artifacts/wasix/port-list/port-list.wasm"

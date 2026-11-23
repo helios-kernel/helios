@@ -1,4 +1,5 @@
 mod frame_reader;
+mod linux_suite;
 mod programs;
 mod ready;
 mod remote;

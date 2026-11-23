@@ -16,7 +16,7 @@
 //!
 //! Store state is owned by the one task running the instance, so
 //! nothing here is shared and nothing here locks. The session record
-//! and the request queues behind [`Gpu3dSession`] are the shared part
+//! and the request queues behind [`GpuSession`] are the shared part
 //! and carry their own synchronisation.
 //!
 //! # What an end has to do, and what it must not
@@ -33,18 +33,16 @@
 //! and drops its references to their buffers.
 
 use crate::buffer::{ViewError, ViewGroup, ViewTable};
-
 use crate::process::GpuOpenCap;
 
+use super::service::{Gpu3dService, GpuClient, GpuSession, SessionId};
 use super::{Gpu3dServiceError, MAX_GPU_VIEWS};
-
-use super::service::{Gpu3dService, Gpu3dSession, SessionId};
 
 /// One instance's side of the 3D path.
 #[derive(Default)]
 pub struct Gpu3dOwnership {
     /// The session, once this instance opened one.
-    session: Option<Gpu3dSession>,
+    session: Option<GpuSession>,
     /// The set of views that ends when the session does. Present
     /// exactly when `session` is.
     views: Option<ViewGroup>,
@@ -86,16 +84,21 @@ impl Gpu3dOwnership {
     }
 
     /// The session, or the reason there is none.
-    pub fn session_ref(&self) -> Result<&Gpu3dSession, Gpu3dServiceError> {
+    pub fn session_ref(&self) -> Result<&GpuSession, Gpu3dServiceError> {
         self.session.as_ref().ok_or(Gpu3dServiceError::SessionEnded)
     }
 
     /// The session, if it is the one `id` names.
-    pub fn session_of(&self, id: SessionId) -> Result<&Gpu3dSession, Gpu3dServiceError> {
+    pub fn session_of(&self, id: SessionId) -> Result<&GpuSession, Gpu3dServiceError> {
         match &self.session {
             Some(session) if session.id() == id => Ok(session),
             _ => Err(Gpu3dServiceError::SessionEnded),
         }
+    }
+
+    /// A cloneable client for session `id`, if it is the one open now.
+    pub fn client_of(&self, id: SessionId) -> Result<GpuClient, Gpu3dServiceError> {
+        Ok(self.session_of(id)?.client())
     }
 
     /// Whether `id` names the session that is open now.

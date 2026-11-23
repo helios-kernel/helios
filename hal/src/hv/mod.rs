@@ -184,8 +184,14 @@ pub trait VcpuKick: Send + Sync + 'static {
     fn kick(&self);
 }
 
-/// Architectural names used by VMM boot loaders and exit emulation. The
-/// backend's snapshot keeps its native layout; names never encode pointers.
+/// Architectural register names, shared by every contract that exposes a
+/// detached register snapshot: VMM boot loaders and exit emulation here, and
+/// native user contexts ([`crate::native::UserContext`]). The backend's
+/// snapshot keeps its native layout; names never encode pointers.
+///
+/// `X86Gpr(n)` numbers the sixteen 64-bit general registers by their
+/// instruction encoding (Intel SDM vol. 2, table 2-2 with REX.B): RAX 0,
+/// RCX 1, RDX 2, RBX 3, RSP 4, RBP 5, RSI 6, RDI 7, R8 to R15 8 to 15.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegisterId {
     Aarch64X(u8),
@@ -244,6 +250,10 @@ pub unsafe trait GuestVcpu: Send + 'static {
     /// `false` leaves ownership with the caller: retry at an IRQ-window exit.
     fn inject_irq(&mut self, irq: VirtualIrq) -> Result<bool, HvError>;
     fn set_irq_window(&mut self, enabled: bool);
+    /// Reset detached architectural state, including translation registers,
+    /// timers and virtual interrupt interfaces. Preserve the kick handle and
+    /// Stage-2 ownership. The caller excludes concurrent entry and completion.
+    fn reset(&mut self) -> Result<(), HvError>;
     fn get_regs(&mut self) -> Result<Self::Registers, HvError>;
     fn set_regs(&mut self, registers: &Self::Registers) -> Result<(), HvError>;
     /// Supply read data (or acknowledge a write) for the pending emulated exit.

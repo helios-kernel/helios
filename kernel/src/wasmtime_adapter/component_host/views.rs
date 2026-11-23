@@ -14,17 +14,32 @@
 
 use helios_hal::vmm::VirtAddr;
 use wasmtime::AsContext;
+use wasmtime::component::{Access, HasData};
 
 use crate::buffer::{GuestMemory, ViewError};
 use crate::{ProgramOutOfMemory, user_heap_stats};
 
-/// The calling instance's linear memory, read from the runtime now.
+/// The linear memory of the guest call `access` serves, read from the
+/// runtime now.
 ///
-/// `memory` is the handle the store recorded when the instance was
-/// built, absent when its component lowers through a shared memory or
-/// through more than one: the runtime does not hand a shared memory back
-/// as an unshared one, and nothing is shown in a memory another
-/// processor may be running code against.
+/// A span a guest passes names "this instance's linear memory", and for
+/// a component composed of several subcomponents that is the calling
+/// subcomponent's own: the memory its `canon lower` options name, which
+/// the runtime answers per call. A call lowered through no memory, or a
+/// shared one, has none, and every span it names is refused.
+pub(crate) fn caller_memory<T, D>(access: &Access<'_, T, D>) -> Result<GuestMemory, ViewError>
+where
+    D: HasData + ?Sized,
+{
+    guest_memory(access.caller_memory(), access)
+}
+
+/// `memory`'s extent, read from the runtime now.
+///
+/// `memory` is absent when there is no unshared memory to read: the
+/// runtime does not hand a shared memory back as an unshared one, and
+/// nothing is shown in a memory another processor may be running code
+/// against.
 pub(crate) fn guest_memory(
     memory: Option<wasmtime::Memory>,
     store: impl AsContext,

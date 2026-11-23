@@ -82,6 +82,7 @@ impl TestCpu {
 
 impl Cpu for TestCpu {
     type Hypervisor = core::convert::Infallible;
+    type Native = core::convert::Infallible;
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
     fn has_lazy_commit_virtual_memory(&self) -> bool {
@@ -377,6 +378,7 @@ impl ManualClockCpu {
 
 impl Cpu for ManualClockCpu {
     type Hypervisor = core::convert::Infallible;
+    type Native = core::convert::Infallible;
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
     fn processor_count(&self) -> usize {
@@ -492,6 +494,7 @@ impl RecordingSmpCpu {
 
 impl Cpu for RecordingSmpCpu {
     type Hypervisor = core::convert::Infallible;
+    type Native = core::convert::Infallible;
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
     fn processor_count(&self) -> usize {
@@ -1170,7 +1173,7 @@ mod network {
 
     use bytes::Bytes;
 
-    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use triomphe::Arc;
 
@@ -1207,48 +1210,11 @@ mod network {
         closed: Arc<TestClosedStreams>,
         closed_udp: Arc<TestClosedStreams>,
         closed_listeners: Arc<TestClosedStreams>,
-        /// The failure switch a stream test arms: once set, the calls a
-        /// device poll sits behind — `tcp_read`, `tcp_write_all_bytes`,
-        /// `tcp_write_ready` — fail the way a device fault fails them,
-        /// while the synchronous probes keep answering: `tcp_try_read`
-        /// still drains and the send side reports a full queue, since a
-        /// device that cannot be polled also cannot drain one.
-        drive_failure: Arc<AtomicBool>,
-        /// Bytes `tcp_write_all` accepted — the evidence a parked batch
-        /// was retried rather than dropped.
-        bytes_written: Arc<AtomicU64>,
     }
 
     impl TestNetworkService {
         pub(crate) fn new() -> Self {
             Self::default()
-        }
-
-        /// Arm the driving calls to fail — see `drive_failure`.
-        pub(crate) fn fail_drives(&self) {
-            self.drive_failure.store(true, Ordering::Release);
-        }
-
-        /// Disarm the switch, so a retried write can show what a parked
-        /// batch kept.
-        pub(crate) fn heal_drives(&self) {
-            self.drive_failure.store(false, Ordering::Release);
-        }
-
-        /// Total bytes `tcp_write_all` has accepted.
-        pub(crate) fn bytes_written(&self) -> u64 {
-            self.bytes_written.load(Ordering::Acquire)
-        }
-
-        /// The error a real device fault surfaces as from a driving
-        /// call, when the switch is armed.
-        fn drive_error(&self) -> Option<crate::TcpError> {
-            self.drive_failure
-                .load(Ordering::Acquire)
-                .then_some(crate::TcpError {
-                    kind: crate::TcpErrorKind::Internal,
-                    detail: crate::NetworkErrorDetail::VirtioAdvanceFailed,
-                })
         }
 
         /// The TCP retirement log this service writes to, which is
@@ -1314,6 +1280,10 @@ mod network {
             [2, 0, 0, 0, 0, 1]
         }
 
+        fn owns_ip_address(&self, address: crate::NetworkIpAddress) -> bool {
+            address == crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1]))
+        }
+
         fn revalidate_lease(&self) -> impl Future<Output = ()> + Send + '_ {
             core::future::ready(())
         }
@@ -1353,6 +1323,24 @@ mod network {
             )]))
         }
 
+        fn dns_resolve_https(
+            &self,
+            _: &str,
+            _: u16,
+            _: u64,
+        ) -> impl core::future::Future<
+            Output = Result<Option<crate::HttpsRecord>, crate::DnsError>,
+        > + Send
+        + '_ {
+            core::future::ready(Ok(None))
+        }
+
+        fn dns_servers(&self) -> Vec<crate::NetworkIpAddress> {
+            vec![crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
+                10, 0, 2, 3,
+            ]))]
+        }
+
         fn tcp_connect(
             &self,
             _: &str,
@@ -1389,6 +1377,42 @@ mod network {
             } else {
                 u64::from(local_port)
             }))
+        }
+
+        fn tcp_connect_start(
+            &self,
+            _: crate::NetworkIpAddress,
+            _: u16,
+            local_port: u16,
+            _: u8,
+        ) -> impl core::future::Future<
+            Output = Result<(Self::TcpStream, crate::TcpConnectPoll), crate::TcpError>,
+        > + Send
+        + '_ {
+            let id = if local_port == 0 {
+                7
+            } else {
+                u64::from(local_port)
+            };
+            core::future::ready(Ok((id, crate::TcpConnectPoll::Connected)))
+        }
+
+        fn tcp_connect_poll(
+            &self,
+            _: Self::TcpStream,
+        ) -> impl core::future::Future<Output = Result<crate::TcpConnectPoll, crate::TcpError>> + Send + '_
+        {
+            core::future::ready(Ok(crate::TcpConnectPoll::Connected))
+        }
+
+        fn tcp_local_endpoint(
+            &self,
+            _: Self::TcpStream,
+        ) -> Result<Option<(crate::NetworkIpAddress, u16)>, crate::TcpError> {
+            Ok(Some((
+                crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
+                40000,
+            )))
         }
 
         fn tcp_listen(
@@ -1437,18 +1461,10 @@ mod network {
         fn tcp_write_all(
             &self,
             _: Self::TcpStream,
-            bytes: &[u8],
+            _: &[u8],
             _: u64,
         ) -> impl core::future::Future<Output = Result<(), crate::TcpError>> + Send + '_ {
-            let written = bytes.len() as u64;
-            let failure = self.drive_error();
-            core::future::ready(match failure {
-                Some(error) => Err(error),
-                None => {
-                    self.bytes_written.fetch_add(written, Ordering::AcqRel);
-                    Ok(())
-                }
-            })
+            core::future::ready(Ok(()))
         }
 
         fn tcp_read(
@@ -1458,19 +1474,7 @@ mod network {
             _: u64,
         ) -> impl core::future::Future<Output = Result<Option<Bytes>, crate::TcpError>> + Send + '_
         {
-            let failure = self.drive_error();
-            core::future::ready(match failure {
-                Some(error) => Err(error),
-                None => Ok(Some(Bytes::from_static(&[4, 2]))),
-            })
-        }
-
-        fn tcp_try_read(
-            &self,
-            _: Self::TcpStream,
-            _: usize,
-        ) -> Result<crate::TcpReadProgress, crate::TcpError> {
-            Ok(crate::TcpReadProgress::Data(Bytes::from_static(&[4, 2])))
+            core::future::ready(Ok(Some(Bytes::from_static(&[4, 2]))))
         }
 
         /// The same reply as [`Self::tcp_read`], as much of it as the
@@ -1482,49 +1486,19 @@ mod network {
             _: u64,
         ) -> impl core::future::Future<Output = Result<crate::TcpReadInto, crate::TcpError>> + Send + 'a
         {
-            let failure = self.drive_error();
-            core::future::ready(match failure {
-                Some(error) => Err(error),
-                None => Ok(crate::TcpReadInto::Data(
-                    helios_netstack::TcpReceiveBuffer::write_from(buffer, &[4, 2]),
-                )),
-            })
+            core::future::ready(Ok(crate::TcpReadInto::Data(
+                helios_netstack::TcpReceiveBuffer::write_from(buffer, &[4, 2]),
+            )))
         }
 
-        fn tcp_send_room(
-            &self,
-            _: Self::TcpStream,
-        ) -> Result<crate::TcpWriteProgress, crate::TcpError> {
-            Ok(match self.drive_failure.load(Ordering::Acquire) {
-                // A device whose polls fail drains nothing: the send
-                // queue reads as full.
-                true => crate::TcpWriteProgress::Pending,
-                false => crate::TcpWriteProgress::Room(usize::MAX),
-            })
-        }
-
-        fn tcp_try_write(
-            &self,
-            _: Self::TcpStream,
-            bytes: &mut Bytes,
-        ) -> Result<crate::TcpWriteProgress, crate::TcpError> {
-            if self.drive_failure.load(Ordering::Acquire) {
-                return Ok(crate::TcpWriteProgress::Pending);
-            }
-            let written = bytes.len();
-            bytes.clear();
-            Ok(crate::TcpWriteProgress::Room(written))
-        }
-
-        fn tcp_write_ready(
-            &self,
-            _: Self::TcpStream,
-        ) -> impl core::future::Future<Output = Result<(), crate::TcpError>> + Send + '_ {
-            let failure = self.drive_error();
-            core::future::ready(match failure {
-                Some(error) => Err(error),
-                None => Ok(()),
-            })
+        fn tcp_peek_into<'a>(
+            &'a self,
+            stream: Self::TcpStream,
+            buffer: &'a mut crate::RegisteredTcpReadBuffer<'_>,
+            timeout_nanos: u64,
+        ) -> impl core::future::Future<Output = Result<crate::TcpReadInto, crate::TcpError>> + Send + 'a
+        {
+            self.tcp_read_into(stream, buffer, timeout_nanos)
         }
 
         fn tcp_shutdown_send(
@@ -1544,6 +1518,7 @@ mod network {
 
         fn udp_bind(
             &self,
+            _: crate::NetworkIpAddress,
             local_port: u16,
         ) -> impl core::future::Future<
             Output = Result<crate::UdpBinding<Self::UdpSocket>, crate::UdpError>,
@@ -1605,6 +1580,18 @@ mod network {
         > + Send
         + '_ {
             core::future::ready(Ok(None))
+        }
+
+        fn udp_peek(
+            &self,
+            socket: Self::UdpSocket,
+            max_bytes: u32,
+            timeout_nanos: u64,
+        ) -> impl core::future::Future<
+            Output = Result<Option<crate::UdpDatagram>, crate::UdpError>,
+        > + Send
+        + '_ {
+            self.udp_receive(socket, max_bytes, timeout_nanos)
         }
 
         fn udp_join_multicast_v4(
@@ -1848,6 +1835,168 @@ pub(crate) fn recording_udp_network_service()
     let service = TestNetworkService::new();
     let closed = service.closed_udp_sockets();
     (service, closed)
+}
+
+/// A [`crate::HostFileSystem`] for a test that needs a host share type
+/// but never reaches one: every operation answers
+/// [`helios_hal::io::IoError::Unsupported`].
+#[derive(Clone)]
+pub(crate) struct UnsupportedHostFileSystem;
+
+fn unsupported_host_fs<T>() -> core::future::Ready<Result<T, crate::HostFsError>> {
+    core::future::ready(Err(crate::HostFsError::Transport(
+        helios_hal::io::IoError::Unsupported,
+    )))
+}
+
+impl crate::HostFileSystem for UnsupportedHostFileSystem {
+    type Write = core::convert::Infallible;
+
+    /// There is no share here, so there is nothing to have cached.
+    fn cache_stats(&self) -> Option<crate::HostFsCacheStats> {
+        None
+    }
+
+    /// No session and no cache, so a restore leaves nothing to drop.
+    fn after_machine_restore(
+        &self,
+        _restore: crate::HostShareRestore,
+    ) -> impl core::future::Future<Output = ()> + Send + '_ {
+        core::future::ready(())
+    }
+
+    /// No session, so nothing to release for a snapshot.
+    fn prepare_snapshot(&self) -> impl core::future::Future<Output = ()> + Send + '_ {
+        core::future::ready(())
+    }
+
+    fn snapshot_finished(&self) {}
+
+    fn stat_path(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<crate::HostMetadata, crate::HostFsError>> + Send + '_
+    {
+        unsupported_host_fs()
+    }
+    fn read_dir(
+        &self,
+        _path: &str,
+        _limit: crate::HostDirLimit,
+    ) -> impl core::future::Future<Output = Result<Vec<crate::HostDirEntry>, crate::HostFsError>>
+    + Send
+    + '_ {
+        unsupported_host_fs()
+    }
+    fn read_file(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<Vec<u8>, crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn read_file_range(
+        &self,
+        _path: &str,
+        _offset: u64,
+        _max_bytes: u32,
+    ) -> impl core::future::Future<Output = Result<Vec<u8>, crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn prepare_write(
+        &self,
+        _path: &str,
+        _position: helios_hal::fs::WritePosition,
+        _len: usize,
+    ) -> impl core::future::Future<Output = Result<Self::Write, crate::HostFsError>> + Send + '_
+    {
+        unsupported_host_fs()
+    }
+    fn sync_file(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn truncate_file(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn set_file_size(
+        &self,
+        _path: &str,
+        _size: u64,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn set_times(
+        &self,
+        _path: &str,
+        _access_nanos: Option<u64>,
+        _modified_nanos: Option<u64>,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn create_file(
+        &self,
+        _path: &str,
+        _creation: crate::HostCreation,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn create_directory(
+        &self,
+        _path: &str,
+        _creation: crate::HostCreation,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn remove(
+        &self,
+        _path: &str,
+        _directory: bool,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn rename(
+        &self,
+        _source: &str,
+        _destination: &str,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn hard_link(
+        &self,
+        _source: &str,
+        _destination: &str,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn symlink(
+        &self,
+        _target: &str,
+        _link_path: &str,
+        _gid: u32,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn read_link(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<alloc::string::String, crate::HostFsError>> + Send + '_
+    {
+        unsupported_host_fs()
+    }
+}
+
+/// The storage of a test machine with neither a host share nor a disk.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UnsupportedStorage;
+
+impl crate::Storage for UnsupportedStorage {
+    type HostShare = UnsupportedHostFileSystem;
+    type Disk = crate::NoDisks;
 }
 
 #[test]

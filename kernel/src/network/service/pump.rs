@@ -566,11 +566,29 @@ where
                 let immediate_started = self.profile_start();
                 let mut immediate_device_started = None;
                 let mut immediate_device_finished = None;
+                let mut loopback_frames: Vec<RxFrame> = Vec::new();
+                let mut offered_to_device = 0usize;
                 let immediate = {
                     let mut state = self.inner.state.shard_at(shard_idx).lock();
                     state.stack.try_submit_outbound_slices(
                         remaining_budget.min(NETWORK_TX_BATCH_FRAMES),
                         |frames| {
+                            let loopback_prefix = frames
+                                .iter()
+                                .take_while(|frame| is_loopback_tx_frame(frame))
+                                .count();
+                            if loopback_prefix != 0 {
+                                loopback_frames.reserve(loopback_prefix);
+                                for frame in &frames[..loopback_prefix] {
+                                    loopback_frames.push(tx_frame_to_loopback_rx(frame));
+                                }
+                                return Ok(Some(loopback_prefix));
+                            }
+                            let device_prefix = frames
+                                .iter()
+                                .take_while(|frame| !is_loopback_tx_frame(frame))
+                                .count();
+                            offered_to_device = device_prefix;
                             immediate_device_started = self.profile_start();
                             // Zero-copy: only the header prefix is
                             // copied into the device's slot, and the
@@ -580,22 +598,30 @@ where
                             // A shard submits on the live pair it
                             // folds onto, which is also how the scope's
                             // `serves_shard_on` picked this shard.
-                            let result = self
-                                .inner
-                                .device
-                                .try_transmit_scatter_immediate_on(shard_pair, frames);
+                            let result = self.inner.device.try_transmit_scatter_immediate_on(
+                                shard_pair,
+                                &frames[..device_prefix],
+                            );
                             immediate_device_finished = self.profile_start();
                             result
                         },
                     )
                 }?;
+                if !loopback_frames.is_empty() {
+                    let now = StackInstant::from_nanos(self.now_nanos());
+                    let mut batch = RxBatchDelivery::new();
+                    for frame in &loopback_frames {
+                        self.deliver_rx_frame(frame, now, &mut batch);
+                    }
+                    self.inner.state.notify_arrivals(&batch.arrivals);
+                }
                 match immediate {
                     // `Deferred`: another processor holds this queue
                     // pair's ring and is already draining the same
                     // frames. Nothing to do but come back.
                     OutboundBatchStatus::Empty | OutboundBatchStatus::Deferred => {}
                     OutboundBatchStatus::Submitted {
-                        offered,
+                        offered: _,
                         accepted,
                         accepted_bytes,
                     } => {
@@ -616,7 +642,7 @@ where
                         self.inner.state.record_transmitted(shard_idx, accepted);
                         transmitted += accepted;
                         transmitted_bytes = transmitted_bytes.saturating_add(accepted_bytes);
-                        if accepted < offered {
+                        if offered_to_device != 0 && accepted < offered_to_device {
                             transmit_stop = NetworkTransmitStop::RingFull;
                             break;
                         }
@@ -932,4 +958,49 @@ pub(super) const fn tcp_read_profile_phase(
         (Prefix::IntoPolling, Outcome::Ready) => "tcp-read-into-polling-ready",
         (Prefix::IntoPolling, Outcome::Eof) => "tcp-read-into-polling-eof",
     }
+}
+
+/// Returns `true` when `frame` is an Ethernet IPv4 or IPv6 frame whose
+/// destination address is a host loopback address (`127.0.0.0/8` or `::1`).
+fn is_loopback_tx_frame(frame: &helios_netstack::TxFrameRef<'_>) -> bool {
+    const ETH_HEADER_LEN: usize = 14;
+    const ETHERTYPE_IPV4: [u8; 2] = [0x08, 0x00];
+    const ETHERTYPE_IPV6: [u8; 2] = [0x86, 0xdd];
+    let bytes = frame.bytes;
+    if bytes.len() < ETH_HEADER_LEN {
+        return false;
+    }
+    match [bytes[12], bytes[13]] {
+        ETHERTYPE_IPV4 => {
+            bytes.len() >= ETH_HEADER_LEN + 20
+                && Ipv4Address::new([bytes[30], bytes[31], bytes[32], bytes[33]]).is_loopback()
+        }
+        ETHERTYPE_IPV6 => {
+            if bytes.len() < ETH_HEADER_LEN + 40 {
+                return false;
+            }
+            let mut dst = [0u8; 16];
+            dst.copy_from_slice(&bytes[38..54]);
+            Ipv6Address::new(dst).is_loopback()
+        }
+        _ => false,
+    }
+}
+
+/// Materializes an outbound loopback frame into an owned `RxFrame` for
+/// in-kernel receive delivery, carrying validated checksum and any
+/// segmentation metadata.
+fn tx_frame_to_loopback_rx(frame: &helios_netstack::TxFrameRef<'_>) -> RxFrame {
+    let payload_len = frame.payload.map_or(0, bytes::Bytes::len);
+    let mut raw = Vec::with_capacity(frame.bytes.len() + payload_len);
+    raw.extend_from_slice(frame.bytes);
+    if let Some(payload) = frame.payload {
+        raw.extend_from_slice(payload.as_ref());
+    }
+    let offload = helios_netstack::RxFrameOffload {
+        checksum: helios_netstack::RxChecksumReport::Validated,
+        large_receive_segment_bytes: frame.segmentation.map(|seg| seg.segment_bytes),
+        flow_hash: None,
+    };
+    RxFrame::with_offload(bytes::Bytes::from(raw), offload)
 }

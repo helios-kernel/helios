@@ -258,6 +258,41 @@ pub fn aggregate_items(an: &Analysis, set: &TypeSet) -> Result<TokenStream> {
     Ok(out)
 }
 
+/// `struct_layout`: the Rust layout of every encoded structure that carries
+/// an sType, by that sType. A driver that rewrites one member of a caller's
+/// `pNext` chain copies the members before it through this table; a member
+/// the table does not name is one no encoder sends.
+pub fn struct_layout_items(an: &Analysis) -> Result<TokenStream> {
+    let mut seen = BTreeSet::new();
+    let mut arms = TokenStream::new();
+    for &id in &an.generated_structs {
+        let ty = &an.reg.types[id];
+        if ty.category() != Category::Struct
+            || matches!(ty.name.as_str(), "VkBaseInStructure" | "VkBaseOutStructure")
+        {
+            continue;
+        }
+        let Some(s_type) = &ty.s_type else { continue };
+        if !seen.insert(s_type.clone()) {
+            return Err(RegistryError::inconsistent(format!(
+                "{s_type} names more than one encoded structure"
+            )));
+        }
+        let (s_type, name) = (ident(s_type), ident(&ty.name));
+        arms.extend(quote!(#s_type => Some(::core::alloc::Layout::new::<#name>()),));
+    }
+    Ok(quote! {
+        /// The layout of the encoded structure an sType names, or `None` when
+        /// no encoder sends a structure of that type.
+        pub fn struct_layout(s_type: VkStructureType) -> Option<::core::alloc::Layout> {
+            match s_type {
+                #arms
+                _ => None,
+            }
+        }
+    })
+}
+
 /// `size_of`, `align_of` and `offset_of` assertions for both pointer widths.
 pub fn layout_assertions(an: &Analysis, set: &TypeSet) -> Result<TokenStream> {
     let mut out = TokenStream::new();
