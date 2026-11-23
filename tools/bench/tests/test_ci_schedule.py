@@ -138,6 +138,9 @@ def test_every_selected_review_job_has_a_fifteen_minute_limit(ci_jobs, tmp_path)
     jobs.update(f"wasm-{profile}" for profile in json.loads(selected["wasm_profiles"]))
     mode = selected["linux_suite_mode"]
     assert mode == "listed"
+    listed_shards = json.loads(selected["linux_suite_shards"])
+    assert sum(1 for entry in listed_shards if entry["arch"] == "x86_64") == 8
+    assert sum(1 for entry in listed_shards if entry["arch"] == "aarch64") == 16
     jobs.update({"linux-syscalls-build", "linux-syscalls", "linux-syscalls-report"})
     # The suite's jobs take their limit from the mode: a full run's shards
     # are heavy and run on dispatch and nightly only.
