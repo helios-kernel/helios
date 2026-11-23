@@ -39,13 +39,13 @@ use helios_netstack::{
     DnsResponse, DnsWireName, EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey,
     IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol,
     Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr, Ipv6Packet,
-    IsnSecret, MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry,
-    NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable, RxChecksumOffload,
-    RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent,
-    StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
-    TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, TcpReceiveDiagnostics,
-    TcpSendState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload,
-    UdpSocketBinding, UdpSocketError, flow_hash, next_transaction_id,
+    MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry, NetworkInterface as NetworkDevice,
+    OutboundBatchStatus, Route, RouteTable, RxChecksumOffload, RxDrain, RxFrame,
+    SegmentationOffload, Stack, StackConfig, StackError, StackEvent, StackInstant, StackSecret,
+    TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint, TcpListenBacklog,
+    TcpPacket, TcpReadIntoState, TcpReadState, TcpReceiveDiagnostics, TcpSendState,
+    TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding,
+    UdpSocketError, flow_hash, next_transaction_id,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -751,17 +751,19 @@ where
         } else {
             SegmentationOffload::none()
         };
-        // The key of the initial sequence number function (RFC 6528) is
+        // The secret of the stack's keyed functions (the initial sequence
+        // number function of RFC 6528 and the socket indexes' hash) is
         // drawn once, here, and shared by every shard's stack, so a
         // flow's number does not depend on which shard opens it.
-        let mut isn_key = [0_u8; IsnSecret::BYTES];
-        root_entropy.fill(&mut isn_key);
-        let stack_config = StackConfig::new(mac, max_frame_len, IsnSecret::from_bytes(isn_key))
-            .with_rx_budget(rx_poll_budget)
-            .with_rx_checksum_offload(rx_checksum_offload)
-            .with_tx_checksum_offload(tx_checksum_offload)
-            .with_direct_tx_dma(capabilities.direct_tx_dma)
-            .with_segmentation_offload(segmentation);
+        let mut stack_secret = [0_u8; StackSecret::BYTES];
+        root_entropy.fill(&mut stack_secret);
+        let stack_config =
+            StackConfig::new(mac, max_frame_len, StackSecret::from_bytes(stack_secret))
+                .with_rx_budget(rx_poll_budget)
+                .with_rx_checksum_offload(rx_checksum_offload)
+                .with_tx_checksum_offload(tx_checksum_offload)
+                .with_direct_tx_dma(capabilities.direct_tx_dma)
+                .with_segmentation_offload(segmentation);
         let stack_rx_budget = Stack::new(stack_config).config().rx_budget;
         let state = NetworkShardSet::new(pool, |index| {
             let staggered_xid = transaction_id.wrapping_add(index as u32);
@@ -1984,8 +1986,8 @@ mod tests {
     use helios_netstack::{
         ArpOperation, ArpPacket, ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol,
         IcmpEchoKey, Icmpv4Packet, Icmpv6Packet, IpAddress, IpProtocol, Ipv4Address, Ipv4Cidr,
-        Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, IsnSecret, MAX_OUTBOUND_FRAMES,
-        NeighborEntry, NeighborState, StackConfig, StackInstant, TCP_RECEIVE_WINDOW_BYTES,
+        Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry,
+        NeighborState, StackConfig, StackInstant, StackSecret, TCP_RECEIVE_WINDOW_BYTES,
         TCP_TRANSMIT_BUFFER_BYTES, TcpEndpoint, TcpFlags, TcpHeader, TcpListenBacklog, TcpPacket,
         TransportChecksum, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, internet_checksum,
     };
@@ -2227,7 +2229,7 @@ mod tests {
         StackConfig::new(
             [0x02, 0, 0, 0, 0, 1],
             ETHERNET_FRAME_BYTES,
-            IsnSecret::from_bytes([0x5a; IsnSecret::BYTES]),
+            StackSecret::from_bytes([0x5a; StackSecret::BYTES]),
         )
         .with_rx_budget(8)
     }
@@ -6034,6 +6036,154 @@ mod tests {
                 "draw {draw} did not take the one free own port"
             );
         }
+    }
+
+    /// The owners of the local ports of a flow to the resolver
+    /// [`connect_remote`] on the DNS port, as `open_resolver_socket`
+    /// builds them.
+    fn resolver_owners(shard_count: usize) -> super::PortOwners {
+        super::PortOwners::new(
+            IpAddress::Ipv6(connect_local()),
+            IpAddress::Ipv6(connect_remote()),
+            super::DNS_PORT,
+            shard_count,
+        )
+    }
+
+    /// Binds `port` on `shard` the way a datagram socket holds it.
+    fn hold_udp_port(shard: &mut NetworkShard, port: u16) {
+        shard
+            .stack
+            .open_udp(UdpSocketBinding::wildcard(port))
+            .expect("a free datagram port binds");
+    }
+
+    /// Issue #831: every draw the resolver's port allocation can make,
+    /// on every shard of a set, through the allocation function with
+    /// every port free. Each own port is returned `floor(W / n)` or
+    /// `ceil(W / n)` times of the `W` draws and no foreign port is,
+    /// however the shard's own ports are spaced in its window.
+    #[test]
+    fn a_resolver_port_is_drawn_equally_often_from_each_own_port() {
+        for shard_count in [3usize, 4, 7] {
+            let state = connect_shard_set(shard_count);
+            let owners = resolver_owners(shard_count);
+            for accepting in 0..shard_count {
+                let shard = state.shard_at(accepting).lock();
+                let (first, last) = shard.ephemeral_window();
+                let window = u32::from(last - first) + 1;
+                let is_own: Vec<bool> = (first..=last)
+                    .map(|port| owners.owner_of(port) == accepting)
+                    .collect();
+                let own_count = is_own.iter().filter(|own| **own).count() as u32;
+                assert!(own_count != 0, "the fixture needs an own port");
+                let mut taken = alloc::collections::BTreeMap::<u16, u32>::new();
+                for draw in 0..window {
+                    let candidates = super::EphemeralCandidates::classify(
+                        super::ConnectStart::new(
+                            first,
+                            last,
+                            draw,
+                            super::ConnectCounters::default(),
+                        ),
+                        |port| is_own[usize::from(port - first)],
+                    );
+                    let port = shard
+                        .allocate_udp_local_port_for(&candidates)
+                        .expect("every port is free");
+                    *taken.entry(port).or_default() += 1;
+                }
+                assert_eq!(
+                    taken.len() as u32,
+                    own_count,
+                    "every own port is returned for some draw \
+                     (shards {shard_count}, accepting {accepting})"
+                );
+                for (port, times) in &taken {
+                    assert!(
+                        is_own[usize::from(port - first)],
+                        "a foreign port {port} was returned"
+                    );
+                    assert!(
+                        *times == window / own_count || *times == window.div_ceil(own_count),
+                        "port {port} was returned {times} times of {window} draws over \
+                         {own_count} own ports (shards {shard_count}, accepting {accepting})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The allocation takes an own port whenever one is free: with
+    /// every own port but one bound, every draw returns that one.
+    #[test]
+    fn a_resolver_port_is_the_one_free_own_port() {
+        const SHARDS: usize = 64;
+        let state = connect_shard_set(SHARDS);
+        let owners = resolver_owners(SHARDS);
+        let mut shard = state.shard_at(0).lock();
+        let (first, last) = shard.ephemeral_window();
+        let window = u32::from(last - first) + 1;
+        let own: Vec<u16> = (first..=last)
+            .filter(|port| owners.owner_of(*port) == 0)
+            .collect();
+        assert!(own.len() > 2, "the fixture needs several own ports");
+        let free = own[own.len() / 2];
+        for port in own.iter().filter(|port| **port != free) {
+            hold_udp_port(&mut shard, *port);
+        }
+        for draw in 0..window {
+            let candidates = super::EphemeralCandidates::classify(
+                super::ConnectStart::new(first, last, draw, super::ConnectCounters::default()),
+                |port| owners.owner_of(port) == 0,
+            );
+            assert_eq!(
+                shard.allocate_udp_local_port_for(&candidates).ok(),
+                Some(free),
+                "draw {draw} did not take the one free own port"
+            );
+        }
+    }
+
+    /// With no own port free a free foreign port is returned, and with
+    /// the whole window bound the allocation fails.
+    #[test]
+    fn a_resolver_port_falls_back_to_a_foreign_port_then_fails() {
+        // A window small enough to bind whole: the stack holds
+        // `MAX_UDP_SOCKETS` datagram sockets, and the window is 128.
+        const SHARDS: usize = 128;
+        let state = connect_shard_set(SHARDS);
+        let owners = resolver_owners(SHARDS);
+        // Classifies under the shard's own lock, so it comes first.
+        // The first shard whose window holds an own port.
+        let (accepting, candidates) = (0..SHARDS)
+            .map(|accepting| {
+                (
+                    accepting,
+                    state.classify_ephemeral_window(accepting, &owners),
+                )
+            })
+            .find(|(_, candidates)| candidates.own_ports().next().is_some())
+            .expect("the fixture needs a shard with an own port");
+        let mut shard = state.shard_at(accepting).lock();
+        let (first, last) = shard.ephemeral_window();
+        for candidate in candidates.own_ports() {
+            hold_udp_port(&mut shard, candidate.port);
+        }
+
+        let port = shard
+            .allocate_udp_local_port_for(&candidates)
+            .expect("a foreign port is free");
+        assert!((first..=last).contains(&port));
+        assert_ne!(owners.owner_of(port), accepting, "an own port was returned");
+
+        for foreign in (first..=last).filter(|port| owners.owner_of(*port) != accepting) {
+            hold_udp_port(&mut shard, foreign);
+        }
+        let error = shard
+            .allocate_udp_local_port_for(&candidates)
+            .expect_err("the whole window is bound");
+        assert_eq!(error.detail, crate::NetworkErrorDetail::UdpNoEphemeralPorts);
     }
 
     /// Issue #788: a walk that starts on ports whose four-tuple to this
