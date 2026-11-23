@@ -21,10 +21,12 @@ mkfs.btrfs -q -f --rootdir "$runtime/tree" "$runtime/image.btrfs"
   --disk "$runtime/image.erofs,serial=erofs-smoke,readonly" \
   --disk "$runtime/image.btrfs,serial=btrfs-smoke" \
   --boot-program dash --boot-program debugger \
-  --boot-program ls --boot-program cat --boot-program init --boot-program python3 \
+  --boot-program ls --boot-program cat --boot-program python3 \
   --no-compiler-plugin \
-  shell -c init 2>&1 > "$runtime/guest.out" | tee "$runtime/inspector.log"
+  shell -c true 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+sed '/^\[KDBG run:begin\]$/q' "$runtime/debug-serial.log" | tr -d '\r' > "$runtime/guest.out"
 cat "$runtime/guest.out"
+grep -Fqx 'helios init: online root=/' "$runtime/guest.out"
 grep -Fqx 'helios init: mounted disk:erofs-smoke at /image' "$runtime/guest.out"
 grep -Fqx 'helios init: mounted btrfs:btrfs-smoke at /btrfs' "$runtime/guest.out"
 grep -Fqx 'helios init: listing /image' "$runtime/guest.out"

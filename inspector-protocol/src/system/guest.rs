@@ -502,6 +502,15 @@ fn map_capability_grants_to_host(
                         .collect(),
                 })
             }
+            programs::CapabilityGrant::Settings(grant) => {
+                host_programs::CapabilityGrant::Settings(host_programs::SettingsGrant {
+                    rights: grant
+                        .rights
+                        .into_iter()
+                        .map(map_settings_right_to_host)
+                        .collect(),
+                })
+            }
             programs::CapabilityGrant::Machine(grant) => {
                 host_programs::CapabilityGrant::Machine(host_programs::MachineGrant {
                     rights: grant
@@ -601,6 +610,12 @@ fn map_diagnostics_right_to_host(
         programs::DiagnosticsRight::ObserveMachine => {
             host_programs::DiagnosticsRight::ObserveMachine
         }
+    }
+}
+
+fn map_settings_right_to_host(right: programs::SettingsRight) -> host_programs::SettingsRight {
+    match right {
+        programs::SettingsRight::Write => host_programs::SettingsRight::Write,
     }
 }
 
