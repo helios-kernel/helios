@@ -75,9 +75,13 @@ jobs:
       - name: Checkout main
         uses: actions/checkout@v4
         with:
+          path: helios
           ref: ${{ needs.classify.outputs.head_sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Attach local main branch to green CI commit
+        run: git -C helios checkout -B main
+      - uses: ./helios/.github/actions/checkout-wasmtime
       - uses: dtolnay/rust-toolchain@stable
       # Mint a short-lived crates.io token from the GitHub OIDC identity
       # instead of a stored CARGO_REGISTRY_TOKEN. Trusted publishing is
@@ -91,6 +95,7 @@ jobs:
         uses: release-plz/action@v0.5
         with:
           command: release
+          manifest_path: helios/Cargo.toml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
@@ -111,14 +116,19 @@ jobs:
       - name: Checkout main
         uses: actions/checkout@v4
         with:
+          path: helios
           ref: ${{ needs.classify.outputs.head_sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Attach local main branch to green CI commit
+        run: git -C helios checkout -B main
+      - uses: ./helios/.github/actions/checkout-wasmtime
       - uses: dtolnay/rust-toolchain@stable
       - id: release-plz
         uses: release-plz/action@v0.5
         with:
           command: release-pr
+          manifest_path: helios/Cargo.toml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Approve the release PR's CI

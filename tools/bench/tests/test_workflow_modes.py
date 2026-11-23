@@ -858,8 +858,12 @@ def test_release_classify_distinguishes_regular_merges_from_release_prs(
     assert jobs["release"]["if"] == "needs.classify.outputs.is_release_pr == 'true'"
     assert jobs["release-pr"]["if"] == "needs.classify.outputs.is_release_pr == 'false'"
     assert jobs["kernel-release-tag"]["needs"] == "release"
-    assert jobs["release"]["steps"][-1]["with"]["command"] == "release"
-    assert jobs["release-pr"]["steps"][2]["with"]["command"] == "release-pr"
+    for job_name, command in (("release", "release"), ("release-pr", "release-pr")):
+        steps = jobs[job_name]["steps"]
+        assert any(step.get("uses") == "./helios/.github/actions/checkout-wasmtime" for step in steps)
+        plz = next(step for step in steps if step.get("uses") == "release-plz/action@v0.5")
+        assert plz["with"]["command"] == command
+        assert plz["with"]["manifest_path"] == "helios/Cargo.toml"
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
