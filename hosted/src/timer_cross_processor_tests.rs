@@ -121,11 +121,10 @@ fn owner_thread(
                             .expect("processor 1 takes every sleep it asked for");
                     }
                 }
-                let fired_now = timer.fire_expired();
+                let stats = executor.run_until_stalled_with_stats(&timer);
+                let fired_now = stats.timer_fired_count();
                 fired += fired_now;
-                let ran = executor
-                    .run_until_stalled_with_stats(&timer)
-                    .runnable_count();
+                let ran = stats.runnable_count();
                 if fired_now == 0 && ran == 0 {
                     executor.park_until_work(&timer, || !requests.is_empty());
                     // The hosted timer thread only unparks the processor;
