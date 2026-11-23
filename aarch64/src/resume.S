@@ -64,7 +64,7 @@ __helios_aarch64_cpu_resume:
     msr apiakeylo_el1, x1
     ldr x1, [x0, #328]
     msr apiakeyhi_el1, x1
-    // Restore MTE tag-generation registers before enabling SCTLR.{TCF,ATA}.
+    // Restore MTE tag-generation registers before enabling SCTLR.TCF and SCTLR.ATA.
     ldr x1, [x0, #336]
     cbz x1, 4f
     ldr x1, [x0, #344]
