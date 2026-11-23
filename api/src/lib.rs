@@ -2,7 +2,7 @@
 //!
 //! Each capability area lives behind a Cargo feature so programs only
 //! link the WIT interfaces they use: `btrfs`, `fs`, `http`, `http-handler`, `http-kit-io`,
-//! `inspect`, `io`, `ipc`, `machine-identity`, `mounts`, `net`, `programs`, `serial`, `snapshot`,
+//! `inspect`, `inspect-publish`, `io`, `ipc`, `machine-identity`, `mounts`, `net`, `programs`, `serial`, `snapshot`,
 //! `sync`, `task`, `tracing`, `profiling`, `instances`, `display`, `gpu`, `input`, `surface`,
 //! `compositor`, `audio`, `vsock`, and `channel`. `bindings` exposes the raw generated WIT
 //! bindings for anything the typed helpers do not cover, and
@@ -49,7 +49,7 @@ pub mod machine_identity;
 #[cfg(any(
     feature = "display",
     feature = "gpu",
-    feature = "inspect",
+    feature = "inspect-publish",
     feature = "surface"
 ))]
 pub mod memory;

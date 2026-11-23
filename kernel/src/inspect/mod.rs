@@ -108,8 +108,6 @@ pub enum InspectPublishError {
 
 #[derive(Clone, Copy)]
 struct MappedSpan {
-    /// Span relative to the owner's linear memory, used for overlap detection.
-    span: Span,
     /// Host virtual address of byte 0 of the span.
     base: usize,
     /// Byte length of the span (`<= MAX_INSPECT_SPAN_BYTES`).
@@ -183,7 +181,12 @@ impl InspectRegistry {
                 return Err(InspectPublishError::DuplicateName);
             }
             if let Some(existing_map) = existing.mapping.try_read().and_then(|g| *g)
-                && spans_overlap(existing_map.span, span)
+                && virt_ranges_overlap(
+                    existing_map.base,
+                    existing_map.length,
+                    mapped.base,
+                    mapped.length,
+                )
             {
                 return Err(InspectPublishError::BadSpan);
             }
@@ -414,8 +417,8 @@ impl Drop for InspectPublication {
     }
 }
 
-fn spans_overlap(a: Span, b: Span) -> bool {
-    a.offset < b.offset.saturating_add(b.length) && b.offset < a.offset.saturating_add(a.length)
+const fn virt_ranges_overlap(a_base: usize, a_len: usize, b_base: usize, b_len: usize) -> bool {
+    a_base < b_base.saturating_add(b_len) && b_base < a_base.saturating_add(a_len)
 }
 
 fn validate_span(memory: GuestMemory, span: Span) -> Result<MappedSpan, InspectPublishError> {
@@ -441,8 +444,8 @@ fn validate_span(memory: GuestMemory, span: Span) -> Result<MappedSpan, InspectP
     let Ok(length) = usize::try_from(span.length) else {
         return Err(InspectPublishError::BadSpan);
     };
-    if !base.is_multiple_of(8) {
+    if base.checked_add(length).is_none() || !base.is_multiple_of(8) {
         return Err(InspectPublishError::BadSpan);
     }
-    Ok(MappedSpan { span, base, length })
+    Ok(MappedSpan { base, length })
 }

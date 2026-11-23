@@ -22,7 +22,7 @@ use wasmtime::component::{
 };
 use wasmtime::{AsContext, StoreContextMut};
 
-use crate::buffer::Span;
+use crate::buffer::{PinnedRangeId, Span};
 use crate::wasmtime_adapter::bindings::inspect::bindings::helios::system::filters as inspect_filters_wit;
 use crate::wasmtime_adapter::bindings::inspect::bindings::helios::system::inspect as inspect_wit;
 use crate::{
@@ -34,6 +34,16 @@ use crate::{
 use super::{StoreData, caller_memory};
 
 const INSPECT_INSTANCE: &str = "helios:system/inspect@0.1.0";
+
+/// Host resource backing `helios:system/inspect.publication`.
+///
+/// Pairs the kernel [`InspectPublication`] with its [`PinnedRangeId`] in the
+/// store's [`crate::buffer::ViewTable`] so no kernel view (`show_buffer` /
+/// `show_device`) can substitute backing pages underneath a live inspect span.
+pub struct InspectPublicationHandle {
+    publication: InspectPublication,
+    pin: PinnedRangeId,
+}
 
 /// Bound-checked view of `helios:system/inspect.query` whose prefix list is
 /// inspected in guest memory before copying into a fixed-size [`PrefixSet`].
@@ -234,22 +244,16 @@ where
         mut access: Access<'_, U, Self>,
         name: String,
         region: inspect_wit::Span,
-    ) -> wasmtime::Result<Result<Resource<InspectPublication>, inspect_wit::PublishError>> {
+    ) -> wasmtime::Result<Result<Resource<InspectPublicationHandle>, inspect_wit::PublishError>>
+    {
         let Ok(memory) = caller_memory(&access) else {
             return Ok(Err(inspect_wit::PublishError::BadSpan));
         };
         let span = Span::new(region.offset, region.length);
-        if span
-            .offset
-            .checked_add(span.length)
-            .is_none_or(|end| end > memory.bytes())
-        {
-            return Ok(Err(inspect_wit::PublishError::BadSpan));
-        }
         let data = access.get();
-        if data.views.overlaps(span) {
+        let Ok(pin) = data.views.pin_range(memory, span) else {
             return Ok(Err(inspect_wit::PublishError::BadSpan));
-        }
+        };
         let instance_id = data.instance().id();
         let instance_name = String::from(data.instance().name());
         let publication = match data.runtime_state.inspect_registry().publish(
@@ -260,10 +264,21 @@ where
             span,
         ) {
             Ok(publication) => publication,
-            Err(error) => return Ok(Err(convert_publish_error(error))),
+            Err(error) => {
+                data.views.unpin_range(pin);
+                return Ok(Err(convert_publish_error(error)));
+            }
         };
-        let handle = data.table.push(publication)?;
-        Ok(Ok(handle))
+        match data
+            .table
+            .push(InspectPublicationHandle { publication, pin })
+        {
+            Ok(handle) => Ok(Ok(handle)),
+            Err(error) => {
+                data.views.unpin_range(pin);
+                Err(error.into())
+            }
+        }
     }
 }
 
@@ -274,8 +289,13 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    fn drop(&mut self, publication: Resource<InspectPublication>) -> wasmtime::Result<()> {
-        let _ = self.table.delete(publication)?;
+    fn drop(&mut self, publication: Resource<InspectPublicationHandle>) -> wasmtime::Result<()> {
+        let InspectPublicationHandle { publication, pin } = self.table.delete(publication)?;
+        // Revoke the inspect mapping synchronously before releasing the
+        // `ViewTable` pin so no view can substitute pages underneath an
+        // in-flight reader copy.
+        drop(publication);
+        self.views.unpin_range(pin);
         Ok(())
     }
 }
@@ -383,33 +403,57 @@ mod tests {
         let gm = GuestMemory::new(VirtAddr::new(backing.as_ptr() as usize), WASM_PAGE_BYTES);
         let inst_id = store.data().instance().id();
 
+        let span = Span::new(0, WASM_PAGE_BYTES);
+        let pin1 = store.data_mut().views.pin_range(gm, span).unwrap();
         let pub1 = registry
-            .publish(
-                inst_id,
-                "test",
-                "metrics",
-                gm,
-                Span::new(0, WASM_PAGE_BYTES),
-            )
+            .publish(inst_id, "test", "metrics", gm, span)
             .unwrap();
-        let handle1 = store.data_mut().table.push(pub1).unwrap();
+        let handle1 = store
+            .data_mut()
+            .table
+            .push(super::InspectPublicationHandle {
+                publication: pub1,
+                pin: pin1,
+            })
+            .unwrap();
         assert_eq!(registry.publication_count(), 1);
 
-        // Explicit drop removes publication immediately.
+        // Symmetric exclusion: while the inspect span is published, `ViewTable`
+        // refuses any overlapping buffer/device view on the same span.
+        assert_eq!(
+            store.data().views.validate(gm, span, WASM_PAGE_BYTES),
+            Err(crate::buffer::ViewError::Overlap)
+        );
+        // And pinning an overlapping second inspect span is also refused.
+        assert_eq!(
+            store.data_mut().views.pin_range(gm, span),
+            Err(crate::buffer::ViewError::Overlap)
+        );
+
+        // Explicit drop removes publication and releases the `ViewTable` pin.
         store.data_mut().drop(handle1).unwrap();
         assert_eq!(registry.publication_count(), 0);
+        assert!(
+            store
+                .data()
+                .views
+                .validate(gm, span, WASM_PAGE_BYTES)
+                .is_ok()
+        );
 
         // Re-publish and drop entire `Store` without explicit resource drop.
+        let pin2 = store.data_mut().views.pin_range(gm, span).unwrap();
         let pub2 = registry
-            .publish(
-                inst_id,
-                "test",
-                "metrics",
-                gm,
-                Span::new(0, WASM_PAGE_BYTES),
-            )
+            .publish(inst_id, "test", "metrics", gm, span)
             .unwrap();
-        let _leaked = store.data_mut().table.push(pub2).unwrap();
+        let _leaked = store
+            .data_mut()
+            .table
+            .push(super::InspectPublicationHandle {
+                publication: pub2,
+                pin: pin2,
+            })
+            .unwrap();
         assert_eq!(registry.publication_count(), 1);
         drop(store);
         assert_eq!(

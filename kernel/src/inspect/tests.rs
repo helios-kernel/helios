@@ -197,6 +197,24 @@ fn publish_validates_span_duplicates_overlap_and_capacity() {
     assert_eq!(registry.publication_count(), MAX_PUBLICATIONS_PER_INSTANCE);
     drop(held);
     assert_eq!(registry.publication_count(), 0);
+
+    // Distinct linear memories publishing at the same guest offset (0) have
+    // disjoint host virtual addresses and must not collide.
+    let second_backing = MockGuestMemory::pages(1);
+    let gm_second = second_backing.guest_memory();
+    let _m0 = registry
+        .publish(inst.id(), "vmm", "mem0", gm, Span::new(0, WASM_PAGE_BYTES))
+        .expect("offset 0 in first memory succeeds");
+    let _m1 = registry
+        .publish(
+            inst.id(),
+            "vmm",
+            "mem1",
+            gm_second,
+            Span::new(0, WASM_PAGE_BYTES),
+        )
+        .expect("offset 0 in distinct second memory must not collide");
+    assert_eq!(registry.publication_count(), 2);
 }
 
 #[test]

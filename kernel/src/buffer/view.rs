@@ -43,13 +43,6 @@ impl Span {
     pub const fn new(offset: u64, length: u64) -> Self {
         Self { offset, length }
     }
-
-    /// Whether this span and `other` share a byte.
-    const fn overlaps(self, other: Self) -> bool {
-        // Both ends are already known not to overflow: a span is only
-        // recorded once its end has been computed against the memory.
-        self.offset < other.offset + other.length && other.offset < self.offset + self.length
-    }
 }
 
 /// The calling instance's linear memory as it stands at the call.
@@ -150,12 +143,22 @@ pub struct ViewId(u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ViewGroup(u64);
 
+/// The identity of one pinned non-view span (such as a lock-free inspect
+/// publication) that views may not substitute backing pages underneath.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PinnedRangeId(u64);
+
+struct PinnedRange {
+    id: PinnedRangeId,
+    range: VirtRange,
+}
+
 /// One live view.
 struct Shown {
     id: ViewId,
     group: Option<ViewGroup>,
-    /// The span the guest named.
-    span: Span,
+    /// The full guest span in the host virtual address space.
+    range: VirtRange,
     /// The part of it whose backing was substituted, which is what
     /// is shown rounded up to the address space's granule.
     substituted: VirtRange,
@@ -171,6 +174,7 @@ struct Shown {
 /// resets the memory slot only after it.
 pub struct ViewTable {
     views: Vec<Shown>,
+    pinned: Vec<PinnedRange>,
     next: u64,
 }
 
@@ -184,6 +188,7 @@ impl ViewTable {
     pub const fn new() -> Self {
         Self {
             views: Vec::new(),
+            pinned: Vec::new(),
             next: 0,
         }
     }
@@ -202,11 +207,41 @@ impl ViewTable {
         self.views.iter().any(|view| view.id == id)
     }
 
-    /// Whether `span` overlaps any live view in this table.
+    /// Pins `span` of `memory` so no view (`show_buffer` / `show_device`) can
+    /// substitute backing pages underneath it while the pin is held.
     ///
-    /// Expects `span.offset.checked_add(span.length)` not to overflow.
-    pub fn overlaps(&self, span: Span) -> bool {
-        self.views.iter().any(|view| view.span.overlaps(span))
+    /// Refuses with [`ViewError::Overlap`] if the span's host virtual range
+    /// overlaps any live view or any existing pinned range.
+    pub fn pin_range(
+        &mut self,
+        memory: GuestMemory,
+        span: Span,
+    ) -> Result<PinnedRangeId, ViewError> {
+        let range = span_virt_range(memory, span)?;
+        if self.range_overlaps(range) {
+            return Err(ViewError::Overlap);
+        }
+        self.next += 1;
+        let id = PinnedRangeId(self.next);
+        self.pinned.push(PinnedRange { id, range });
+        Ok(id)
+    }
+
+    /// Releases a range previously pinned with [`Self::pin_range`].
+    pub fn unpin_range(&mut self, id: PinnedRangeId) {
+        if let Some(index) = self.pinned.iter().position(|pin| pin.id == id) {
+            self.pinned.swap_remove(index);
+        }
+    }
+
+    fn range_overlaps(&self, candidate: VirtRange) -> bool {
+        self.views
+            .iter()
+            .any(|view| virt_ranges_overlap(view.range, candidate))
+            || self
+                .pinned
+                .iter()
+                .any(|pin| virt_ranges_overlap(pin.range, candidate))
     }
 
     /// How many live views are in `group`.
@@ -237,19 +272,7 @@ impl ViewTable {
         span: Span,
         object_bytes: u64,
     ) -> Result<VirtAddr, ViewError> {
-        if span.length == 0
-            || !span.offset.is_multiple_of(WASM_PAGE_BYTES)
-            || !span.length.is_multiple_of(WASM_PAGE_BYTES)
-        {
-            return Err(ViewError::Misaligned);
-        }
-        let end = span
-            .offset
-            .checked_add(span.length)
-            .filter(|end| *end <= memory.bytes)
-            .ok_or(ViewError::OutOfBounds {
-                memory_bytes: memory.bytes,
-            })?;
+        let range = span_virt_range(memory, span)?;
         let expected = object_bytes
             .checked_next_multiple_of(WASM_PAGE_BYTES)
             .filter(|expected| *expected != 0)
@@ -263,20 +286,13 @@ impl ViewTable {
                 given: span.length,
             });
         }
-        if self.views.iter().any(|view| view.span.overlaps(span)) {
+        if self.range_overlaps(range) {
             return Err(ViewError::Overlap);
         }
         if self.views.len() >= MAX_VIEWS {
             return Err(ViewError::TooManyViews);
         }
-        let start = (memory.base.raw() as u64)
-            .checked_add(span.offset)
-            .and_then(|start| usize::try_from(start).ok())
-            .ok_or(ViewError::OutOfBounds {
-                memory_bytes: memory.bytes,
-            })?;
-        debug_assert!(end <= memory.bytes);
-        Ok(VirtAddr::new(start))
+        Ok(range.start)
     }
 
     /// Show `buffer` at `span` of `memory`, in place of what the guest
@@ -294,6 +310,7 @@ impl ViewTable {
         group: Option<ViewGroup>,
     ) -> Result<ViewId, ViewError> {
         let start = self.validate(memory, span, buffer.bytes())?;
+        let full_range = VirtRange::new(start, to_usize(span.length));
         let substituted = VirtRange::new(start, to_usize(buffer.bytes()));
         (device_vm_hooks().substitute_memory)(
             substituted,
@@ -301,7 +318,7 @@ impl ViewTable {
             PageFlags::READ | PageFlags::WRITE,
         )
         .map_err(ViewError::AddressSpace)?;
-        Ok(self.record(group, span, substituted, Some(buffer.clone())))
+        Ok(self.record(group, full_range, substituted, Some(buffer.clone())))
     }
 
     /// Show `region` — a device's own bytes — at `span` of `memory`, in
@@ -318,10 +335,11 @@ impl ViewTable {
             return Err(ViewError::UnalignedRegion);
         }
         let start = self.validate(memory, span, region.physical.bytes)?;
+        let full_range = VirtRange::new(start, to_usize(span.length));
         let substituted = VirtRange::new(start, to_usize(region.physical.bytes));
         (device_vm_hooks().substitute_device)(substituted, region)
             .map_err(ViewError::AddressSpace)?;
-        Ok(self.record(group, span, substituted, None))
+        Ok(self.record(group, full_range, substituted, None))
     }
 
     /// End the view `id`: the span becomes ordinary zeroed memory again,
@@ -360,7 +378,7 @@ impl ViewTable {
     fn record(
         &mut self,
         group: Option<ViewGroup>,
-        span: Span,
+        range: VirtRange,
         substituted: VirtRange,
         buffer: Option<Buffer>,
     ) -> ViewId {
@@ -369,12 +387,49 @@ impl ViewTable {
         self.views.push(Shown {
             id,
             group,
-            span,
+            range,
             substituted,
             _buffer: buffer,
         });
         id
     }
+}
+
+fn span_virt_range(memory: GuestMemory, span: Span) -> Result<VirtRange, ViewError> {
+    if span.length == 0
+        || !span.offset.is_multiple_of(WASM_PAGE_BYTES)
+        || !span.length.is_multiple_of(WASM_PAGE_BYTES)
+    {
+        return Err(ViewError::Misaligned);
+    }
+    let end = span
+        .offset
+        .checked_add(span.length)
+        .filter(|end| *end <= memory.bytes)
+        .ok_or(ViewError::OutOfBounds {
+            memory_bytes: memory.bytes,
+        })?;
+    let start = (memory.base.raw() as u64)
+        .checked_add(span.offset)
+        .and_then(|start| usize::try_from(start).ok())
+        .ok_or(ViewError::OutOfBounds {
+            memory_bytes: memory.bytes,
+        })?;
+    let length = usize::try_from(span.length).map_err(|_| ViewError::OutOfBounds {
+        memory_bytes: memory.bytes,
+    })?;
+    if start.checked_add(length).is_none() {
+        return Err(ViewError::OutOfBounds {
+            memory_bytes: memory.bytes,
+        });
+    }
+    debug_assert!(end <= memory.bytes);
+    Ok(VirtRange::new(VirtAddr::new(start), length))
+}
+
+const fn virt_ranges_overlap(a: VirtRange, b: VirtRange) -> bool {
+    a.start.raw() < b.start.raw().saturating_add(b.byte_len)
+        && b.start.raw() < a.start.raw().saturating_add(a.byte_len)
 }
 
 impl Drop for ViewTable {

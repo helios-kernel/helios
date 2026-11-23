@@ -82,6 +82,7 @@ fn lower_bytes_to_vec(bytes: Bytes) -> Vec<u8> {
 mod device;
 mod filters;
 pub(crate) mod inspect;
+pub use inspect::InspectPublicationHandle;
 mod instances_snapshot;
 mod ipc;
 mod machine_identity;
