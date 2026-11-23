@@ -303,14 +303,29 @@ where
         // on whichever shard the flow actually hashes to — so the
         // lookup's answers are demultiplexed straight into the queue
         // this call is about to poll.
+        fn start_failed<E>(_: E) -> DnsError {
+            DnsError {
+                kind: DnsErrorKind::Unavailable,
+                detail: NetworkErrorDetail::DnsQueryStartFailed,
+            }
+        }
+        let source = self
+            .inner
+            .state
+            .shard_at(shard_idx)
+            .lock()
+            .udp_local_endpoint(0, resolver)
+            .map_err(start_failed)?
+            .address;
+        let candidates = self.inner.state.classify_ephemeral_window(
+            shard_idx,
+            &PortOwners::new(source, resolver, DNS_PORT, shard_count),
+        );
         let (local, local_port) = {
-            let mut shard = self.inner.state.shard_at(shard_idx).lock();
+            let shard = self.inner.state.shard_at(shard_idx).lock();
             let local_port = shard
-                .allocate_udp_local_port_for(resolver, DNS_PORT, shard_count)
-                .map_err(|_| DnsError {
-                    kind: DnsErrorKind::Unavailable,
-                    detail: NetworkErrorDetail::DnsQueryStartFailed,
-                })?;
+                .allocate_udp_local_port_for(&candidates)
+                .map_err(start_failed)?;
             let local = shard
                 .udp_local_endpoint(local_port, resolver)
                 .map_err(|_| DnsError {
@@ -335,10 +350,7 @@ where
             .lock()
             .stack
             .open_udp(binding)
-            .map_err(|_| DnsError {
-                kind: DnsErrorKind::Unavailable,
-                detail: NetworkErrorDetail::DnsQueryStartFailed,
-            })?;
+            .map_err(start_failed)?;
         Ok(ResolverSocket {
             shard_idx,
             stack_socket,
