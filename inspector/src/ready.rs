@@ -7,7 +7,7 @@ use std::time::Duration;
 use futures_io::AsyncRead;
 use futures_lite::io::{AsyncReadExt, Cursor};
 use helios_inspector_protocol::RpcError;
-use helios_inspector_protocol::system::stats;
+use helios_inspector_protocol::system::inspect;
 
 use crate::runtime;
 use crate::serial::{RpcClient, RpcReader, SerialIo};
@@ -45,10 +45,10 @@ pub(crate) enum BootError {
     MarkerSharesLine { line: String },
     #[error("multiple debugger stage markers appeared on one serial line: {line:?}")]
     MultipleMarkersOnLine { line: String },
-    #[error("timed out waiting for remote stats readiness probe")]
+    #[error("timed out waiting for remote inspect readiness probe")]
     ReadinessProbeTimedOut,
     #[error(
-        "failed to fetch initial remote stats snapshot while waiting for debugger readiness: \
+        "failed to fetch initial remote inspect snapshot while waiting for debugger readiness: \
          {source}"
     )]
     ReadinessProbeFailed {
@@ -157,10 +157,13 @@ pub(crate) fn echo_serial_console(read: RpcReader) {
 }
 
 pub(crate) async fn wait_until_ready(client: &mut RpcClient) -> Result<(), BootError> {
-    runtime::timeout(READY_PROBE_TIMEOUT, stats::snapshot(client))
-        .await
-        .ok_or(BootError::ReadinessProbeTimedOut)?
-        .map_err(|source| BootError::ReadinessProbeFailed { source })?;
+    let _ = runtime::timeout(
+        READY_PROBE_TIMEOUT,
+        inspect::snapshot_prefixes(client, &["/kernel/clock"], 16),
+    )
+    .await
+    .ok_or(BootError::ReadinessProbeTimedOut)?
+    .map_err(|source| BootError::ReadinessProbeFailed { source })?;
     Ok(())
 }
 

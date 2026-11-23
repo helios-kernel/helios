@@ -202,6 +202,13 @@ impl ViewTable {
         self.views.iter().any(|view| view.id == id)
     }
 
+    /// Whether `span` overlaps any live view in this table.
+    ///
+    /// Expects `span.offset.checked_add(span.length)` not to overflow.
+    pub fn overlaps(&self, span: Span) -> bool {
+        self.views.iter().any(|view| view.span.overlaps(span))
+    }
+
     /// How many live views are in `group`.
     pub fn group_len(&self, group: ViewGroup) -> usize {
         self.views

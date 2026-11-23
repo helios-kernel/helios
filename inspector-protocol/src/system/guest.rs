@@ -1,21 +1,24 @@
 use futures_io::{AsyncRead, AsyncWrite};
 use helios_api::{
-    instances as host_instances, processors as host_processors, profiling as host_profiling,
-    programs as host_programs, stats as host_stats, tracing as host_tracing,
+    inspect as host_inspect, instances as host_instances, processors as host_processors,
+    profiling as host_profiling, programs as host_programs, tracing as host_tracing,
 };
 
 use crate::error::DispatchError;
 use crate::system::accept;
 use crate::system::server::{self, Dispatcher, Invocations};
 
-use super::bindings::helios::system::{filters, instances, processors, profiling, stats, tracing};
+use super::bindings::helios::system::{
+    filters, inspect, instances, processors, profiling, tracing,
+};
+use super::inspect::SnapshotRequest;
 use super::methods::{
-    INSTANCES_INSTANCE, INSTANCES_KILL, INSTANCES_SNAPSHOT, PROCESSORS_INSTANCE,
-    PROCESSORS_OFFLINE, PROCESSORS_ONLINE, PROCESSORS_SETS, PROFILING_CLEAR, PROFILING_FOLDED,
-    PROFILING_INSTANCE, PROFILING_INSTRUCTION_SAMPLES, PROFILING_METRICS,
+    INSPECT_INSTANCE, INSPECT_SNAPSHOT, INSTANCES_INSTANCE, INSTANCES_KILL, INSTANCES_SNAPSHOT,
+    PROCESSORS_INSTANCE, PROCESSORS_OFFLINE, PROCESSORS_ONLINE, PROCESSORS_SETS, PROFILING_CLEAR,
+    PROFILING_FOLDED, PROFILING_INSTANCE, PROFILING_INSTRUCTION_SAMPLES, PROFILING_METRICS,
     PROFILING_RAW_PROFILE_READ, PROFILING_RAW_PROFILE_SIZE, PROFILING_SET_ENABLED,
     PROFILING_SET_INSTRUCTION_SAMPLING, PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE,
-    STATS_INSTANCE, STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT, TRACING_SET_TARGET_ENABLED,
+    TRACING_INSTANCE, TRACING_RECENT, TRACING_SET_TARGET_ENABLED,
 };
 use super::programs;
 use crate::debugger::{filesystem, programs as debugger_programs, snapshot as debugger_snapshot};
@@ -69,7 +72,7 @@ fn supports_request(instance: &str, func: &str) -> bool {
         (instance, func),
         (PROGRAMS_INSTANCE, PROGRAMS_EXEC)
             | (PROGRAMS_INSTANCE, PROGRAMS_AOT)
-            | (STATS_INSTANCE, STATS_SNAPSHOT)
+            | (INSPECT_INSTANCE, INSPECT_SNAPSHOT)
             | (INSTANCES_INSTANCE, INSTANCES_SNAPSHOT)
             | (INSTANCES_INSTANCE, INSTANCES_KILL)
             | (PROCESSORS_INSTANCE, PROCESSORS_SETS)
@@ -163,15 +166,21 @@ async fn dispatch(
                 source,
             })
         }
-        (STATS_INSTANCE, STATS_SNAPSHOT) => {
-            if !payload.is_empty() {
-                return Err(DispatchError::UnexpectedPayload {
-                    operation: "stats.snapshot",
-                });
-            }
-            let snapshot = convert_sample(host_stats::snapshot());
-            postcard::to_allocvec(&snapshot).map_err(|source| DispatchError::Encode {
-                operation: "stats.snapshot",
+        (INSPECT_INSTANCE, INSPECT_SNAPSHOT) => {
+            let request = postcard::from_bytes::<SnapshotRequest>(payload).map_err(|source| {
+                DispatchError::Decode {
+                    operation: "inspect.snapshot",
+                    source,
+                }
+            })?;
+            let host_query = host_inspect::Query {
+                prefixes: request.query.prefixes,
+            };
+            let response = host_inspect::snapshot(&host_query, request.limit)
+                .map(convert_inspect_snapshot)
+                .map_err(convert_filter_error);
+            postcard::to_allocvec(&response).map_err(|source| DispatchError::Encode {
+                operation: "inspect.snapshot",
                 source,
             })
         }
@@ -645,209 +654,43 @@ fn convert_launch_error_kind(kind: host_programs::ExecErrorKind) -> programs::Ex
     }
 }
 
-fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
-    stats::Sample {
-        timestamp: sample.timestamp,
-        uptime: sample.uptime,
-        wall_clock: sample.wall_clock,
-        processors: stats::Processors {
-            configured: sample.processors.configured,
-            online: sample.processors.online,
-            utilization: sample
-                .processors
-                .utilization
-                .into_iter()
-                .map(convert_processor)
-                .collect(),
-            guest_isa_level: sample.processors.guest_isa_level,
-            guest_isa_extras: sample.processors.guest_isa_extras,
-        },
-        memory: stats::Memory {
-            total_bytes: sample.memory.total_bytes,
-            available_bytes: sample.memory.available_bytes,
-            pressure: convert_memory_pressure(sample.memory.pressure),
-            nodes: sample
-                .memory
-                .nodes
-                .into_iter()
-                .map(convert_memory_node)
-                .collect(),
-        },
-        block: sample.block.map(convert_block_device),
-        iommu: sample.iommu.map(convert_iommu),
-        balloon: sample.balloon.map(convert_memory_balloon),
-        swap: sample.swap.map(convert_swap),
-        host_share: sample.host_share.map(convert_host_share_cache),
-        network: sample.network.map(convert_network),
-        devices: sample.devices.into_iter().map(convert_device).collect(),
-        inputs: sample.inputs.into_iter().map(convert_input).collect(),
-        audio: sample.audio.into_iter().map(convert_audio_stream).collect(),
-    }
-}
-
-fn convert_memory_node(node: host_stats::MemoryNode) -> stats::MemoryNode {
-    stats::MemoryNode {
-        id: node.id,
-        total_bytes: node.total_bytes,
-        available_bytes: node.available_bytes,
-        off_node_allocations: node.off_node_allocations,
-    }
-}
-
-fn convert_input(device: host_stats::InputDevice) -> stats::InputDevice {
-    stats::InputDevice {
-        name: device.name,
-        claimed: device.claimed,
-        events_delivered: device.events_delivered,
-        lost_reports: device.lost_reports,
-    }
-}
-
-fn convert_audio_stream(stream: host_stats::AudioStream) -> stats::AudioStream {
-    stats::AudioStream {
-        id: stream.id,
-        claimed: stream.claimed,
-        played_bytes: stream.played_bytes,
-        xruns: stream.xruns,
-        lost_feedback: stream.lost_feedback,
-    }
-}
-
-fn convert_device(device: host_stats::GrantedDevice) -> stats::GrantedDevice {
-    stats::GrantedDevice {
-        name: device.name,
-        region_bytes: device.region_bytes,
-        regions: device.regions,
-        interrupts: device.interrupts,
-        dma_budget_bytes: device.dma_budget_bytes,
-        confined: device.confined,
-        claimed: device.claimed,
-        interrupts_forwarded: device.interrupts_forwarded,
-        interrupts_coalesced: device.interrupts_coalesced,
-        masked_sources: device.masked_sources,
-    }
-}
-
-fn convert_swap(swap: host_stats::Swap) -> stats::Swap {
-    stats::Swap {
-        backend: swap.backend,
-        capacity_bytes: swap.capacity_bytes,
-        used_bytes: swap.used_bytes,
-        pages_out: swap.pages_out,
-        pages_in: swap.pages_in,
-        faults_served: swap.faults_served,
-        mean_fault_latency: swap.mean_fault_latency,
-    }
-}
-
-fn convert_network(network: host_stats::Network) -> stats::Network {
-    stats::Network {
-        queues: network
-            .queues
+fn convert_inspect_snapshot(snapshot: host_inspect::SnapshotResult) -> inspect::SnapshotResult {
+    inspect::SnapshotResult {
+        timestamp: snapshot.timestamp,
+        entries: snapshot
+            .entries
             .into_iter()
-            .map(|queue| stats::NetworkQueue {
-                id: queue.id,
-                rx_frames: queue.rx_frames,
-                tx_frames: queue.tx_frames,
-                interrupts: queue.interrupts,
-                rx_refused_frames: queue.rx_refused_frames,
-                rx_device_refusals: queue.rx_device_refusals,
-                tcp_acks_sent: queue.tcp_acks_sent,
-                tcp_window_updates_sent: queue.tcp_window_updates_sent,
-                tcp_retransmits_sent: queue.tcp_retransmits_sent,
-                tcp_sockets: queue.tcp_sockets,
-                tcp_orphan_sockets: queue.tcp_orphan_sockets,
-                tcp_orphan_send_queued_bytes: queue.tcp_orphan_send_queued_bytes,
-                tcp_orphan_fin_wait_1: queue.tcp_orphan_fin_wait_1,
-                tcp_orphan_fin_wait_2: queue.tcp_orphan_fin_wait_2,
-                tcp_orphan_closing: queue.tcp_orphan_closing,
-                tcp_orphan_last_ack: queue.tcp_orphan_last_ack,
-                tcp_orphan_time_wait: queue.tcp_orphan_time_wait,
-                tcp_orphan_other_state: queue.tcp_orphan_other_state,
-                tcp_orphan_retransmit_armed: queue.tcp_orphan_retransmit_armed,
-                tcp_receive_backpressured_sockets: queue.tcp_receive_backpressured_sockets,
-                tcp_receive_window_bytes: queue.tcp_receive_window_bytes,
-                receive_queued_bytes: queue.receive_queued_bytes,
-                out_of_order_queued_bytes: queue.out_of_order_queued_bytes,
-                peer_retransmits_received: queue.peer_retransmits_received,
-                duplicate_acks_requested: queue.duplicate_acks_requested,
-                rx_pool_stalls: queue.rx_pool_stalls,
-                rx_pool_free: queue.rx_pool_free,
+            .map(|entry| inspect::Entry {
+                path: entry.path,
+                value: match entry.value {
+                    host_inspect::Value::Boolean(v) => inspect::Value::Boolean(v),
+                    host_inspect::Value::Signed64(v) => inspect::Value::Signed64(v),
+                    host_inspect::Value::Unsigned64(v) => inspect::Value::Unsigned64(v),
+                    host_inspect::Value::Float64(v) => inspect::Value::Float64(v),
+                    host_inspect::Value::Text(v) => inspect::Value::Text(v),
+                    host_inspect::Value::Blob(v) => inspect::Value::Blob(v),
+                },
             })
             .collect(),
-    }
-}
-
-fn convert_memory_balloon(balloon: host_stats::MemoryBalloon) -> stats::MemoryBalloon {
-    stats::MemoryBalloon {
-        target_bytes: balloon.target_bytes,
-        actual_bytes: balloon.actual_bytes,
-        reported_bytes: balloon.reported_bytes,
-    }
-}
-
-fn convert_host_share_cache(cache: host_stats::HostShareCache) -> stats::HostShareCache {
-    stats::HostShareCache {
-        attribute_hits: cache.attribute_hits,
-        attribute_misses: cache.attribute_misses,
-        negative_hits: cache.negative_hits,
-        directory_hits: cache.directory_hits,
-        directory_misses: cache.directory_misses,
-        fid_hits: cache.fid_hits,
-        fid_misses: cache.fid_misses,
-        evictions: cache.evictions,
-        invalidations: cache.invalidations,
-    }
-}
-
-fn convert_iommu(iommu: host_stats::Iommu) -> stats::Iommu {
-    stats::Iommu {
-        granule_bytes: iommu.granule_bytes,
-        global_bypass: iommu.global_bypass,
-        faults: iommu.faults,
-        endpoints: iommu
-            .endpoints
+        truncated: snapshot.truncated,
+        publications: snapshot
+            .publications
             .into_iter()
-            .map(|endpoint| stats::IommuEndpoint {
-                endpoint: endpoint.endpoint,
-                domain: endpoint.domain,
-                mapped_bytes: endpoint.mapped_bytes,
+            .map(|pub_info| inspect::ComponentPublication {
+                instance_id: pub_info.instance_id,
+                instance_name: pub_info.instance_name,
+                name: pub_info.name,
+                generation: pub_info.generation,
+                status: match pub_info.status {
+                    host_inspect::PublicationStatus::Ok => inspect::PublicationStatus::Ok,
+                    host_inspect::PublicationStatus::Busy => inspect::PublicationStatus::Busy,
+                    host_inspect::PublicationStatus::Corrupt => inspect::PublicationStatus::Corrupt,
+                    host_inspect::PublicationStatus::SwappedOut => {
+                        inspect::PublicationStatus::SwappedOut
+                    }
+                },
             })
             .collect(),
-    }
-}
-
-fn convert_block_device(block: host_stats::BlockDevice) -> stats::BlockDevice {
-    stats::BlockDevice {
-        capacity_bytes: block.capacity_bytes,
-        block_bytes: block.block_bytes,
-        physical_block_bytes: block.physical_block_bytes,
-        flush: block.flush,
-        discard: block.discard,
-        write_zeroes: block.write_zeroes,
-        queues: block.queues,
-        queue_depth: block.queue_depth,
-        reads: block.reads,
-        writes: block.writes,
-        flushes: block.flushes,
-        discards: block.discards,
-        write_zeroes_requests: block.write_zeroes_requests,
-    }
-}
-
-fn convert_processor(processor: host_stats::Processor) -> stats::Processor {
-    stats::Processor {
-        id: processor.id,
-        busy: processor.busy,
-    }
-}
-
-fn convert_memory_pressure(pressure: host_stats::MemoryPressure) -> stats::MemoryPressure {
-    match pressure {
-        host_stats::MemoryPressure::Nominal => stats::MemoryPressure::Nominal,
-        host_stats::MemoryPressure::Elevated => stats::MemoryPressure::Elevated,
-        host_stats::MemoryPressure::High => stats::MemoryPressure::High,
-        host_stats::MemoryPressure::Critical => stats::MemoryPressure::Critical,
     }
 }
 

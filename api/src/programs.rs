@@ -157,7 +157,7 @@ pub fn diagnostics_grant(grant: DiagnosticsGrant) -> CapabilityGrant {
     CapabilityGrant::Diagnostics(grant)
 }
 
-/// Grant `helios:system/instances.snapshot` and `helios:system/stats` read
+/// Grant `helios:system/instances.snapshot` and `helios:system/inspect` read
 /// visibility within `scope`.
 pub fn inspect_read_grant(scope: AuthorityScope) -> CapabilityGrant {
     CapabilityGrant::Diagnostics(DiagnosticsGrant::InspectRead(scope))

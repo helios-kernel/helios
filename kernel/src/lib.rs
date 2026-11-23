@@ -22,6 +22,7 @@ mod gpu;
 mod host_fs;
 pub mod hv;
 mod input;
+pub mod inspect;
 mod instance;
 mod io;
 mod ipc;
@@ -126,12 +127,12 @@ pub use exec::{
     ProcessorLifecycle, ProfileFilter, ProfileHistory, ProfileScope, ProfileSink, ProgressChanged,
     ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease,
     RawRwLockWriteLease, ReadyLink, RwLock, RwLockReadGuard, RwLockWriteGuard, SequenceSignal,
-    SharedTimeline, SignalTimeline, Sleep, Spawner, StatsSample, SubtreeObservation,
-    TaskCapacityError, TaskFunding, Timeline, TimelineError, TimelinePoint, TimelineSource, Timer,
-    TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceLog, TraceValue,
-    UptimeClock, YieldNow, elapsed_millis, matches_perf_metric_filter, matches_profile_filter,
-    matches_trace_filter, monotonic_nanos, online_processor_count, parse_console_text,
-    wait_timelines, wall_clock_offset_nanos, yield_now,
+    SharedTimeline, SignalTimeline, Sleep, Spawner, SubtreeObservation, TaskCapacityError,
+    TaskFunding, Timeline, TimelineError, TimelinePoint, TimelineSource, Timer, TraceEvent,
+    TraceField, TraceFilter, TraceHistory, TraceLevel, TraceLog, TraceValue, UptimeClock, YieldNow,
+    elapsed_millis, matches_perf_metric_filter, matches_profile_filter, matches_trace_filter,
+    monotonic_nanos, online_processor_count, parse_console_text, wait_timelines,
+    wall_clock_offset_nanos, yield_now,
 };
 pub use gpu::{
     BlobCreate, BlobHold, BlobMapping, CompletionSignal, Gpu3dOwnership, Gpu3dService,
@@ -155,11 +156,21 @@ pub use input::{
     InputLedSender, InputOwnership, InputService, InputServiceError, MAX_CLAIMED_DEVICES,
     MAX_REPORT_EVENTS, install_input_devices,
 };
+pub use inspect::{
+    ComponentPublication, DEFAULT_INSPECT_LIMIT, INSPECT_FORMAT_VERSION, INSPECT_HEADER_BYTES,
+    INSPECT_HEADER_MAGIC, InspectEntry, InspectPublication, InspectPublishError, InspectRegistry,
+    InspectSnapshot, InspectValue, KernelTelemetrySnapshot, MAX_BLOB_VALUE_BYTES,
+    MAX_COMPONENT_ENTRIES, MAX_INSPECT_LIMIT, MAX_INSPECT_SPAN_BYTES, MAX_PUBLICATION_NAME_BYTES,
+    MAX_PUBLICATIONS_PER_INSTANCE, MAX_RELATIVE_PATH_BYTES, MAX_SEQLOCK_RETRIES,
+    MAX_TEXT_VALUE_BYTES, PublicationStatus, emit_kernel_entries, is_valid_publication_name,
+    is_valid_relative_path,
+};
 pub use instance::{
-    CondemnedMemory, InstanceActivity, InstanceId, InstanceProfileTotal, InstanceRegistry,
-    InstanceSnapshot, KernelHeapCharge, KillOutcome, KillReason, MemoryPool, OOM_RECLAIM_GRACE,
-    OffProcessor, OffProcessorRefused, OomKillDecision, OomKillOutcome, OomPolicy, OomVictim,
-    ProcessorTurn, RegisteredInstance, StoreTurns, allow_instance_resource_growth,
+    CondemnedMemory, InspectReadPin, InstanceActivity, InstanceId, InstanceProfileTotal,
+    InstanceRegistry, InstanceSnapshot, KernelHeapCharge, KillOutcome, KillReason, MemoryPool,
+    OOM_RECLAIM_GRACE, OffProcessor, OffProcessorRefused, OomKillDecision, OomKillOutcome,
+    OomPolicy, OomVictim, ProcessorTurn, RegisteredInstance, StoreTurns,
+    allow_instance_resource_growth,
 };
 pub use io::{
     BlockCache, BlockCacheError, BlockCacheLimits, BlockInstallError, BlockMut, BlockPages,
@@ -186,8 +197,8 @@ pub use limine_tpm_event_log::LimineTpmEventLogRequest;
 #[cfg(feature = "linux")]
 pub use linux_container::{
     ContainerConfig, ContainerError, ContainerFilesystem, ContainerId, ContainerMount,
-    ContainerMountSpec, ContainerNodeInfo, ContainerProcessGuard, ContainerResolved,
-    LinuxContainer,
+    ContainerMountSnapshot, ContainerMountSpec, ContainerNodeInfo, ContainerProcessGuard,
+    ContainerResolved, LinuxContainer, LinuxContainerSnapshot,
 };
 pub use machine::{
     AdvanceCause, DeviceResets, GENERATION_PROBE_INTERVAL, Generation, MachineGeneration,

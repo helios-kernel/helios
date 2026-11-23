@@ -259,7 +259,7 @@ impl DeviceGrantClaimCap {
     }
 }
 
-/// Proof that the instance may read `helios:system/stats` and scoped
+/// Proof that the instance may read scoped `helios:system/inspect` and
 /// `helios:system/instances` snapshots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InspectReadCap(AuthorityScope);

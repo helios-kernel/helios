@@ -91,6 +91,7 @@ use crate::wasmtime_adapter::{
 };
 use crate::{
     BootfsBytes, ComponentStdioRefusal, ProgramExecErrorDetail, RuntimeMessage, UnbindableStdio,
+    machine_memory,
 };
 use crate::{FileContents, FsDescriptorFlags, MemoryFs, Namespace};
 use alloc::borrow::ToOwned;
@@ -1779,7 +1780,8 @@ where
         )
         .await
         .map_err(map_container_error)?;
-        self.inner.containers.lock().insert(id, Arc::new(container));
+        let container = Arc::new(container);
+        self.inner.containers.lock().insert(id, container);
         Ok(ContainerHandle::new(
             id,
             self.inner.retired_containers.clone(),
@@ -1990,6 +1992,7 @@ where
                     authority.clone(),
                     namespace,
                 ));
+                exec_context.runtime_state.register_container(&ephemeral);
                 Some(LinuxContainerLaunch {
                     container: ephemeral,
                     credentials: None,

@@ -5,13 +5,15 @@ use core::panic::Location;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use triomphe::Arc;
 
+use crate::hv::HvTelemetryRegistry;
+use crate::inspect::{InspectRegistry, KernelTelemetrySnapshot};
 use crate::{
     BOOT_DEVICE, BootFs, BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
     DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedComponent, EmbeddedInit, FoldedProfileSample,
     HEAP_SIZE_CLASS_COUNT, HOST_SHARE_GUEST_MOUNT_PATH, HeapStats, HostShare, InstanceId,
     InstanceRegistry, InstructionSampler, MountTable, MountedFs, Namespace, Notify,
     PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileScope,
-    ProfileSink, StatsSample, TraceEvent, TraceFilter, TraceLog,
+    ProfileSink, TraceEvent, TraceFilter, TraceLog,
 };
 use crate::{MachineGeneration, MachineGenerationHandle, RootEntropy, RootEntropyHandle};
 use crate::{MountGrant, MountSharing};
@@ -154,6 +156,13 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// backend whose timer captures them installs its capture here during
     /// bring-up.
     instructions: InstructionSampler,
+    /// Component-published lock-free inspect spans (`/instances/<id>/<name>/*`).
+    inspect: InspectRegistry,
+    /// Live virtual-machine telemetry exposed under `/kernel/hv/*`.
+    hv_telemetry: HvTelemetryRegistry,
+    /// Weak handles to live Linux containers exposed under `/kernel/containers/*`.
+    #[cfg(feature = "linux")]
+    containers: Mutex<alloc::vec::Vec<alloc::sync::Weak<crate::LinuxContainer<StorageImpl>>>>,
     heap_perf_snapshot: HeapPerfSnapshot,
 }
 
@@ -401,6 +410,10 @@ where
                     DEFAULT_PERF_METRIC_CAPACITY,
                 ),
                 instructions: InstructionSampler::new(processor_count),
+                inspect: InspectRegistry::new(),
+                hv_telemetry: HvTelemetryRegistry::new(),
+                #[cfg(feature = "linux")]
+                containers: Mutex::new(alloc::vec::Vec::new()),
                 heap_perf_snapshot: HeapPerfSnapshot::new(),
             }),
         }
@@ -1347,10 +1360,46 @@ where
     NetworkService: crate::NetworkAdminBackend,
     StorageImpl: Storage,
 {
-    pub fn snapshot(&self, current_ticks: u64) -> StatsSample {
+    pub fn inspect_registry(&self) -> &InspectRegistry {
+        &self.inner.inspect
+    }
+
+    pub fn hv_telemetry(&self) -> &HvTelemetryRegistry {
+        &self.inner.hv_telemetry
+    }
+
+    #[cfg(feature = "linux")]
+    pub fn register_container(
+        &self,
+        container: &alloc::sync::Arc<crate::LinuxContainer<StorageImpl>>,
+    ) {
+        let mut list = self.inner.containers.lock();
+        list.retain(|weak| weak.strong_count() > 0);
+        list.push(alloc::sync::Arc::downgrade(container));
+    }
+
+    #[cfg(feature = "linux")]
+    pub fn container_snapshots(&self) -> alloc::vec::Vec<crate::LinuxContainerSnapshot> {
+        let live: alloc::vec::Vec<alloc::sync::Arc<crate::LinuxContainer<StorageImpl>>> = {
+            let mut list = self.inner.containers.lock();
+            list.retain(|weak| weak.strong_count() > 0);
+            list.iter().filter_map(alloc::sync::Weak::upgrade).collect()
+        };
+        let mut snapshots: alloc::vec::Vec<_> =
+            live.iter().map(|container| container.telemetry()).collect();
+        snapshots.sort_unstable_by_key(|snapshot| snapshot.id);
+        snapshots
+    }
+
+    pub fn kernel_telemetry_snapshot(&self, current_ticks: u64) -> KernelTelemetrySnapshot {
         let uptime = self.ticks_to_nanos(current_ticks.saturating_sub(self.inner.boot_ticks));
         let guest_isa = self.inner.guest_isa;
-        StatsSample {
+        let machine = crate::machine_memory();
+        let memory_total_bytes =
+            u64::try_from(machine.usable_bytes).expect("machine memory does not fit into u64");
+        let memory_available_bytes =
+            u64::try_from(machine.free_bytes).expect("free machine memory does not fit into u64");
+        KernelTelemetrySnapshot {
             timestamp: uptime,
             uptime,
             wall_clock: self.wall_clock_nanos(current_ticks),
@@ -1359,6 +1408,9 @@ where
                 .unwrap_or_else(|_| panic!("the online processor count does not fit a u32")),
             guest_isa_level: guest_isa.processor().base_name(),
             guest_isa_extras: guest_isa.processor().extras().collect(),
+            memory_total_bytes,
+            memory_available_bytes,
+            memory_nodes: crate::memory::try_user_node_stats(),
             block: self.inner.block_service.get().map(BlockService::stats),
             iommu: self
                 .inner
@@ -1386,6 +1438,9 @@ where
                 .get()
                 .map(crate::audio::AudioService::snapshot)
                 .unwrap_or_default(),
+            #[cfg(feature = "linux")]
+            containers: self.container_snapshots(),
+            hv_vms: self.inner.hv_telemetry.snapshot(),
         }
     }
 }

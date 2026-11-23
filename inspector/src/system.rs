@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::time::Duration;
 
-use helios_inspector_protocol::system::{instances, stats, tracing};
+use helios_inspector_protocol::system::{inspect, instances, tracing};
 use nu_ansi_term::{Color, Style as AnsiStyle};
 
 use crate::TracingCommand;
@@ -102,13 +102,39 @@ impl TracingConfig {
     }
 }
 
-pub async fn fetch_stats(client: &RpcClient) -> Result<stats::Sample, SystemError> {
-    remote::call(stats::snapshot(client), "remote stats snapshot")
-        .await
-        .map_err(|source| SystemError::Fetch {
-            what: "remote stats snapshot",
-            source,
-        })
+pub async fn fetch_inspect(
+    client: &RpcClient,
+    prefixes: &[&str],
+    limit: u32,
+) -> Result<inspect::SnapshotResult, SystemError> {
+    remote::call(
+        inspect::snapshot_prefixes(client, prefixes, limit),
+        "remote inspect snapshot",
+    )
+    .await
+    .map_err(|source| SystemError::Fetch {
+        what: "remote inspect snapshot",
+        source,
+    })?
+    .map_err(|source| SystemError::FilterRefused {
+        what: "remote inspect snapshot",
+        source,
+    })
+}
+
+pub async fn fetch_kernel_snapshot(
+    client: &RpcClient,
+) -> Result<inspect::KernelSnapshot, SystemError> {
+    fetch_kernel_snapshot_prefixes(client, &["/kernel/"], 0).await
+}
+
+pub async fn fetch_kernel_snapshot_prefixes(
+    client: &RpcClient,
+    prefixes: &[&str],
+    limit: u32,
+) -> Result<inspect::KernelSnapshot, SystemError> {
+    let raw = fetch_inspect(client, prefixes, limit).await?;
+    Ok(inspect::KernelSnapshot::from_snapshot(&raw))
 }
 
 pub async fn fetch_instances(client: &RpcClient) -> Result<Vec<instances::Instance>, SystemError> {

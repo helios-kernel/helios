@@ -156,8 +156,8 @@ interface programs {
 
   /// Orthogonal observation and diagnostic-control grants.
   variant diagnostics-grant {
-    /// Read component and machine state (`helios:system/instances.snapshot`,
-    /// `helios:system/stats`, and `helios:system/inspect`) within the scope.
+    /// Read component and machine state (`helios:system/instances.snapshot`
+    /// and `helios:system/inspect`) within the scope.
     inspect-read(authority-scope),
     /// Read tracing events (`helios:system/tracing.recent` and `subscribe`)
     /// within the scope.

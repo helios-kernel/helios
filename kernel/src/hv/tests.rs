@@ -53,7 +53,7 @@ pub(crate) struct TestSpace {
     architectural_waiters: AtomicUsize,
 }
 impl TestSpace {
-    fn new(exits: impl IntoIterator<Item = VmExit>) -> Self {
+    pub(crate) fn new(exits: impl IntoIterator<Item = VmExit>) -> Self {
         Self {
             exits: IrqSafeMutex::new(exits.into_iter().collect()),
             entries: IrqSafeMutex::new(Vec::new()),
@@ -87,6 +87,9 @@ unsafe impl Stage2Space for TestSpace {
             guest_address_bits: NonZeroU8::new(48).unwrap(),
             max_vcpus: NonZeroUsize::new(2).unwrap(),
         }
+    }
+    fn vmid(&self) -> Option<u32> {
+        Some(42)
     }
     fn create_vcpu(space: &Arc<Self>, _: u32) -> Result<TestVcpu, HvError> {
         Ok(TestVcpu {

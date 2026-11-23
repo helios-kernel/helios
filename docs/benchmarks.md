@@ -56,7 +56,7 @@ reason under the table the cell is missing from.
 
 | Class | Workload | Helios | Linux + Wasmtime | Native Linux |
 | --- | --- | --- | --- | --- |
-| startup | `instance-startup-{1,100,500}` | `procbench startup N hello hold` through `helios:system/programs`; time to first stdout byte per instance, memory per instance as the drop in `helios:system/stats` available memory while all are alive | `procbench` spawning `wasmtime run --allow-precompiled hello.cwasm hold` | `procbench` spawning the C `hello`; RSS from `/proc` |
+| startup | `instance-startup-{1,100,500}` | `procbench startup N hello hold` through `helios:system/programs`; time to first stdout byte per instance, memory per instance as the drop in `helios:system/inspect` (`/kernel/memory/available-bytes`) while all are alive | `procbench` spawning `wasmtime run --allow-precompiled hello.cwasm hold` | `procbench` spawning the C `hello`; RSS from `/proc` |
 | startup | `spawn-wait` | 200 sequential spawn+wait | same, Wasmtime child | same, native child |
 | startup | `process-startup` | 20 × `dash -c true` | 20 × `wasmtime run hello.cwasm` | same |
 | hostcall | `hostcall-loop` | 2 000 000 × `wasi:clocks/monotonic-clock.now` | same wasm | 2 000 000 × `clock_gettime(CLOCK_MONOTONIC)` |

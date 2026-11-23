@@ -146,7 +146,7 @@ enum FrameAction {
 /// Serves inspector RPC over `read`/`write` until the transport closes.
 ///
 /// Invocations run concurrently, so a long call such as `programs.exec`
-/// does not stop the connection from answering `stats.snapshot` or
+/// does not stop the connection from answering `inspect.snapshot` or
 /// `tracing.recent` while it runs. Frames are written one at a time by
 /// this single loop, so a response never interleaves with another.
 pub async fn serve<R, W, D>(read: R, mut write: W, dispatcher: D) -> Result<(), DispatchError>

@@ -1,9 +1,9 @@
 //! Async-first userland SDK for Helios wasm programs.
 //!
 //! Each capability area lives behind a Cargo feature so programs only
-//! link the WIT interfaces they use: `btrfs`, `fs`, `http`, `http-handler`, `http-kit-io`, `io`,
-//! `ipc`, `machine-identity`, `mounts`, `net`, `programs`, `serial`, `snapshot`, `stats`, `sync`,
-//! `task`, `tracing`, `profiling`, `instances`, `display`, `gpu`, `input`, `surface`,
+//! link the WIT interfaces they use: `btrfs`, `fs`, `http`, `http-handler`, `http-kit-io`,
+//! `inspect`, `io`, `ipc`, `machine-identity`, `mounts`, `net`, `programs`, `serial`, `snapshot`,
+//! `sync`, `task`, `tracing`, `profiling`, `instances`, `display`, `gpu`, `input`, `surface`,
 //! `compositor`, `audio`, `vsock`, and `channel`. `bindings` exposes the raw generated WIT
 //! bindings for anything the typed helpers do not cover, and
 //! [`main`](macro@main) wraps a program's async entry point.
@@ -36,6 +36,8 @@ pub mod http;
 pub mod http_kit;
 #[cfg(feature = "input")]
 pub mod input;
+#[cfg(feature = "inspect")]
+pub mod inspect;
 #[cfg(feature = "instances")]
 pub mod instances;
 #[cfg(feature = "io")]
@@ -44,7 +46,12 @@ pub mod io;
 pub mod ipc;
 #[cfg(feature = "machine-identity")]
 pub mod machine_identity;
-#[cfg(any(feature = "display", feature = "gpu", feature = "surface"))]
+#[cfg(any(
+    feature = "display",
+    feature = "gpu",
+    feature = "inspect",
+    feature = "surface"
+))]
 pub mod memory;
 #[cfg(feature = "mounts")]
 pub mod mounts;
@@ -61,8 +68,6 @@ pub mod programs;
 pub mod serial;
 #[cfg(feature = "snapshot")]
 pub mod snapshot;
-#[cfg(feature = "stats")]
-pub mod stats;
 #[cfg(feature = "surface")]
 pub mod surface;
 #[cfg(feature = "sync")]

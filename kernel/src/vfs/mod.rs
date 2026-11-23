@@ -596,6 +596,28 @@ mount_kinds! {
 }
 
 impl<S: Storage> MountedFs<S> {
+    /// Short name identifying the backing filesystem kind for inspection.
+    pub const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Root(_) => "root",
+            Self::Boot(_) => "boot",
+            Self::Memory(_) => "memory",
+            Self::Host(_) => "host",
+            Self::Erofs(_) => "erofs",
+            Self::Btrfs(_) => "btrfs",
+        }
+    }
+
+    /// Number of 4 KiB pages currently occupied in an in-memory overlay upper
+    /// layer or memory filesystem; zero for read-only or disk/host mounts.
+    pub fn overlay_pages(&self) -> u64 {
+        match self {
+            Self::Root(fs) => fs.upper().telemetry().overlay_pages,
+            Self::Memory(fs) => fs.telemetry().overlay_pages,
+            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) | Self::Btrfs(_) => 0,
+        }
+    }
+
     pub async fn unix_metadata(&self, path: FsPath<'_>) -> Result<UnixNodeMetadata, UnixFsError> {
         match self {
             Self::Btrfs(fs) => fs.unix_metadata(path).await,

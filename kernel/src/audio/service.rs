@@ -35,7 +35,7 @@
 //! producer ever waits: a drain that waits is a virtio ring that stops,
 //! and a playback task that waits is a period the device does not get.
 //! What a reader that has fallen behind loses is the oldest feedback,
-//! counted and reported on `helios:system/stats`.
+//! counted and reported under `/kernel/audio` via `helios:system/inspect`.
 //!
 //! A claim's release is not a message. The store that holds a claim is
 //! dropped by whatever kills its instance, and a drop cannot await a
