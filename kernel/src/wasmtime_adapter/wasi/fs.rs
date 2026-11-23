@@ -223,6 +223,7 @@ pub(crate) fn child_path(base: &FsDescriptor, path: &str) -> FsOpResult<String> 
 /// `write` as well. Both rights are demanded whether or not the file
 /// exists, and before the path is resolved: a refused open reaches no
 /// filesystem and leaves it as it was.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn open_at<StorageImpl>(
     namespace: &Namespace<StorageImpl>,
     base: Granted<'_, Directory, Read>,

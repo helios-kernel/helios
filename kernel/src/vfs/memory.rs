@@ -142,11 +142,10 @@ fn test_memory_storage_pool() -> &'static UserMemoryPool {
         let backing: &'static mut [u8] = alloc::vec![0u8; POOL_BYTES + PhysFrame::SIZE].leak();
         let raw = backing.as_mut_ptr() as usize;
         let aligned = (raw + PhysFrame::SIZE - 1) & !(PhysFrame::SIZE - 1);
-        let pool = alloc::boxed::Box::leak(alloc::boxed::Box::new(UserMemoryPool::single_node(
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(UserMemoryPool::single_node(
             1,
             &[(aligned, aligned + POOL_BYTES)],
-        )));
-        pool
+        ))) as &'static UserMemoryPool
     })
 }
 
