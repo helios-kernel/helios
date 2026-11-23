@@ -72,9 +72,9 @@ pub(crate) struct LinuxSuiteCommand {
     results: PathBuf,
 
     /// Optional virtio-blk serial of a writable btrfs disk to mount as a
-    /// private container mount at `/tmp` (with `/dev/shm` bound to `/tmp/shm`)
-    /// so every case runs inside a Linux container with `TEST_TMPDIR` on that
-    /// private btrfs mount.
+    /// private container mount at `/tmp` so every case runs inside a Linux
+    /// container with `/tmp` (private, writable), `guest_dir` (shared,
+    /// read-only executable), and `TEST_TMPDIR` on that private btrfs mount.
     #[arg(long, value_name = "SERIAL")]
     private_btrfs: Option<String>,
 }

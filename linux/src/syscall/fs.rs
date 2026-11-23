@@ -2945,6 +2945,11 @@ pub(super) async fn fchownat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         let Some(entry) = process.shared.descriptors.lock().get_entry(dirfd).cloned() else {
             return errno(EBADF);
         };
+        if let FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } =
+            &entry.descriptor
+        {
+            return chown_pipe(inode, &creds, uid, gid);
+        }
         let Some(open) = entry_file::<R>(&entry) else {
             return errno(EINVAL);
         };
@@ -2964,6 +2969,39 @@ pub(super) async fn fchownat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         .await
     {
         Ok(()) => 0,
+        Err(error) => fs_errno(error),
+    }
+}
+
+fn chown_pipe(
+    inode: &helios_unix::PipeInode,
+    creds: &Credentials,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> u64 {
+    let attrs = inode.attrs();
+    let meta = permissions::InodeMeta {
+        kind: NodeKind::Fifo,
+        uid: attrs.uid,
+        gid: attrs.gid,
+        mode: attrs.mode,
+    };
+    match permissions::check_chown(creds, meta, uid, gid) {
+        Ok(result) => {
+            let mut new_mode = attrs.mode;
+            if result.kill_privs {
+                new_mode &= !permissions::S_ISUID;
+                if new_mode & permissions::S_IXGRP != 0 {
+                    new_mode &= !permissions::S_ISGID;
+                }
+            }
+            inode.set_owner_and_mode(
+                result.uid.unwrap_or(attrs.uid),
+                result.gid.unwrap_or(attrs.gid),
+                new_mode,
+            );
+            0
+        }
         Err(error) => fs_errno(error),
     }
 }
@@ -3005,31 +3043,7 @@ pub(super) async fn fchown<R: Resources, F: Filesystem<R>>(
     if let FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } =
         &entry.descriptor
     {
-        let attrs = inode.attrs();
-        let meta = permissions::InodeMeta {
-            kind: NodeKind::Fifo,
-            uid: attrs.uid,
-            gid: attrs.gid,
-            mode: attrs.mode,
-        };
-        return match permissions::check_chown(&creds, meta, uid, gid) {
-            Ok(result) => {
-                let mut new_mode = attrs.mode;
-                if result.kill_privs {
-                    new_mode &= !permissions::S_ISUID;
-                    if new_mode & permissions::S_IXGRP != 0 {
-                        new_mode &= !permissions::S_ISGID;
-                    }
-                }
-                inode.set_owner_and_mode(
-                    result.uid.unwrap_or(attrs.uid),
-                    result.gid.unwrap_or(attrs.gid),
-                    new_mode,
-                );
-                0
-            }
-            Err(error) => fs_errno(error),
-        };
+        return chown_pipe(inode, &creds, uid, gid);
     }
     let Some(open) = entry_file::<R>(&entry) else {
         return errno(EINVAL);

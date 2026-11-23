@@ -9,10 +9,10 @@ use helios_hal::fs::NodeKind;
 use helios_hal::vmm::PageFlags;
 use helios_linux::abi::{Abi, Operation};
 use helios_linux::syscall::{
-    CAP_DAC_OVERRIDE, CAP_MKNOD, CAP_SETFCAP, CAP_SYS_ADMIN, Call, Clock, Credentials, Denied,
-    FileAccess, Filesystem, FsOpError, MapError, MemoryFault, MemoryTotals, Process, Region,
-    Resources, SpawnError, SpawnedThread, Stdio, Stream, SyscallOutcome, System, Thread, Tty,
-    UserMemory, VirtualMemory, WriteError, XattrSetMode, dispatch,
+    AT_EMPTY_PATH, CAP_DAC_OVERRIDE, CAP_MKNOD, CAP_SETFCAP, CAP_SYS_ADMIN, Call, Clock,
+    Credentials, Denied, FileAccess, Filesystem, FsOpError, MapError, MemoryFault, MemoryTotals,
+    Process, Region, Resources, SpawnError, SpawnedThread, Stdio, Stream, SyscallOutcome, System,
+    Thread, Tty, UserMemory, VirtualMemory, WriteError, XattrSetMode, dispatch,
 };
 use helios_unix::NoNetwork;
 use std::collections::BTreeMap;
@@ -828,7 +828,8 @@ fn prctl_keepcaps_retains_permitted_and_pipe_fchown_enforces_ownership() {
             assert_eq!(guard.capabilities.ambient, 0);
         }
 
-        // Unprivileged owner (uid 1000) can fchown pipe to own uid/gid, not to uid 0.
+        // Unprivileged owner (uid 1000) can fchown/fchownat(AT_EMPTY_PATH) pipe
+        // to own uid/gid, not to uid 0.
         assert_eq!(
             run_call(
                 &mut proc,
@@ -846,6 +847,37 @@ fn prctl_keepcaps_retains_permitted_and_pipe_fchown_enforces_ownership() {
                 abi,
                 Operation::Fchown,
                 [write_fd, 0, 0, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            err(EPERM)
+        );
+        let empty_addr = 0x4080;
+        mem.write_cstr(empty_addr, "");
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Fchownat,
+                [
+                    read_fd,
+                    empty_addr,
+                    1000,
+                    u32::MAX as u64,
+                    u64::from(AT_EMPTY_PATH),
+                    0,
+                ],
+                &mut mem,
+                &mut host
+            ),
+            0
+        );
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Fchownat,
+                [write_fd, empty_addr, 0, 0, u64::from(AT_EMPTY_PATH), 0],
                 &mut mem,
                 &mut host
             ),
