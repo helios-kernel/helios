@@ -1,0 +1,22 @@
+[package]
+name = "helios-wit-rpc"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+async-lock = "3.4.2"
+event-listener = "5.4.2"
+futures-core = "0.3.31"
+futures-io = "0.3.34"
+futures-lite = "2.6.1"
+helios-inspector-protocol = { workspace = true, default-features = false }
+helios-wit-rpc-macro = { workspace = true }
+thiserror = "2.0.20"
+tracing = { workspace = true }
+
+[dev-dependencies]
+async-channel = "2.5.0"
+futures-util = { version = "0.3.31", default-features = false, features = ["std", "async-await", "io"] }
+
+[lints]
+workspace = true

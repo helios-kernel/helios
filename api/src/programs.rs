@@ -17,8 +17,9 @@ pub use crate::bindings::helios::system::programs::{
     ContainerMountSharing, ContainerSpawnRequest, DeviceClass, DeviceGrant, DiagnosticsGrant,
     DiagnosticsRight, DirectoryGrant, ExecError, ExecErrorKind, ExecOutput, ExecRequest,
     ExecResult, ExitStatus, FilesystemRight, LinkGrant, LinkRight, MachineGrant, MachineRight,
-    MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight,
-    SignalTermination, SpawnError, SpawnErrorKind, SpawnRequest, TerminalGrant, TerminalRight,
+    MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight, SettingsGrant,
+    SettingsRight, SignalTermination, SpawnError, SpawnErrorKind, SpawnRequest, TerminalGrant,
+    TerminalRight,
 };
 
 impl PartialEq for ChildTermination {
@@ -163,6 +164,18 @@ pub fn diagnostics_grant(rights: Vec<DiagnosticsRight>) -> CapabilityGrant {
 /// machine owner's behalf.
 pub fn observe_machine_grant() -> CapabilityGrant {
     diagnostics_grant(vec![DiagnosticsRight::ObserveMachine])
+}
+
+/// Build a settings grant. A program holds a right only when its parent
+/// granted it, so the rights must be a subset of the caller's.
+pub fn settings_grant(rights: Vec<SettingsRight>) -> CapabilityGrant {
+    CapabilityGrant::Settings(SettingsGrant { rights })
+}
+
+/// Change the machine-wide settings, for a trusted launcher that runs
+/// programs on the machine owner's behalf.
+pub fn write_settings_grant() -> CapabilityGrant {
+    settings_grant(vec![SettingsRight::Write])
 }
 
 /// Build a machine grant. A program holds a right only when its parent

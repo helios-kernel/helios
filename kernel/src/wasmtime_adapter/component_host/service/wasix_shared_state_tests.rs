@@ -136,7 +136,7 @@ impl SharedStateFixture {
         &self,
         name: &str,
         authority: ProcessAuthority,
-        descriptors: Option<Preview1DescriptorTable<TestNetworkService>>,
+        descriptors: DescriptorOrigin<TestNetworkService>,
         filesystem: Option<Namespace<UnsupportedStorage>>,
     ) -> (TestStore, SharedMemory) {
         let instance = self.registry.register(name, 0);
@@ -326,8 +326,12 @@ fn seed_workspace_dirs(ns: &Namespace<UnsupportedStorage>) {
 #[test]
 fn duplicated_fd1_and_dup_share_open_file_description_and_write_in_order() {
     let fixture = SharedStateFixture::new();
-    let (mut store, memory) =
-        fixture.make_process_store("dup-fd1", fixture.authority.clone(), None, None);
+    let (mut store, memory) = fixture.make_process_store(
+        "dup-fd1",
+        fixture.authority.clone(),
+        DescriptorOrigin::Fresh,
+        None,
+    );
     seed_workspace_dirs(&store.data().filesystem);
 
     let mem = memory.clone();
@@ -511,8 +515,12 @@ fn duplicated_fd1_and_dup_share_open_file_description_and_write_in_order() {
 #[test]
 fn descriptors_and_cwd_are_shared_across_threads_and_inherited_on_exec() {
     let fixture = SharedStateFixture::new();
-    let (mut main_store, memory) =
-        fixture.make_process_store("shared-proc", fixture.authority.clone(), None, None);
+    let (mut main_store, memory) = fixture.make_process_store(
+        "shared-proc",
+        fixture.authority.clone(),
+        DescriptorOrigin::Fresh,
+        None,
+    );
     seed_workspace_dirs(&main_store.data().filesystem);
 
     // Spawn worker BEFORE main opens a file or chdirs, so any visibility proves
@@ -680,8 +688,12 @@ fn descriptors_and_cwd_are_shared_across_threads_and_inherited_on_exec() {
 #[test]
 fn child_table_is_shared_and_nonblocking_probes_preserve_blocking_join_waker() {
     let fixture = SharedStateFixture::new();
-    let (mut main_store, _memory) =
-        fixture.make_process_store("shared-children", fixture.authority.clone(), None, None);
+    let (mut main_store, _memory) = fixture.make_process_store(
+        "shared-children",
+        fixture.authority.clone(),
+        DescriptorOrigin::Fresh,
+        None,
+    );
     let (_tid, _exit, mut worker_store) = fixture.make_sibling_store(main_store.data());
 
     let (tx, rx) = futures::channel::oneshot::channel();
@@ -798,8 +810,12 @@ fn child_table_is_shared_and_nonblocking_probes_preserve_blocking_join_waker() {
 #[test]
 fn thread_join_succeeds_for_already_ended_thread_and_table_stays_bounded() {
     let fixture = SharedStateFixture::new();
-    let (mut store, _memory) =
-        fixture.make_process_store("thread-table", fixture.authority.clone(), None, None);
+    let (mut store, _memory) = fixture.make_process_store(
+        "thread-table",
+        fixture.authority.clone(),
+        DescriptorOrigin::Fresh,
+        None,
+    );
 
     let mut finished_tids = Vec::new();
     for _ in 0..32 {
@@ -871,8 +887,12 @@ fn thread_join_succeeds_for_already_ended_thread_and_table_stays_bounded() {
 #[test]
 fn thread_spawn_requires_process_instance_pre_and_shares_process_state() {
     let fixture = SharedStateFixture::new();
-    let (mut main_store, memory) =
-        fixture.make_process_store("instance-pre", fixture.authority.clone(), None, None);
+    let (mut main_store, memory) = fixture.make_process_store(
+        "instance-pre",
+        fixture.authority.clone(),
+        DescriptorOrigin::Fresh,
+        None,
+    );
 
     // Without a per-process `InstancePre`, `thread_spawn_v2` returns `NOTSUP`
     // rather than constructing a fresh per-thread linker.

@@ -21,6 +21,8 @@ mod swap;
 #[cfg(test)]
 mod swap_tests;
 mod test_pool;
+#[cfg(test)]
+mod timer_cross_processor_tests;
 mod timer_tests;
 mod vmm;
 

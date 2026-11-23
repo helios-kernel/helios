@@ -19,7 +19,8 @@ use bytes::Bytes;
 use crate::{
     ClockAuthorityRights, CompileAuthority, DeviceClassRights, DiagnosticAuthorityRights,
     DirectoryAuthorityRights, ExecAuthority, LinkAuthorityRights, NetworkAuthorityRights,
-    ProcessAuthority, ProcessAuthorityError, SpawnAuthority, TerminalAuthorityRights,
+    ProcessAuthority, ProcessAuthorityError, SettingsAuthorityRights, SpawnAuthority,
+    TerminalAuthorityRights,
 };
 use crate::{
     ComponentCache, ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
@@ -61,6 +62,7 @@ const STATS_INSTANCE: &str = "helios:system/stats@0.1.0";
 const NET_INSTANCE: &str = "helios:system/net@0.1.0";
 const TRACING_INSTANCE: &str = "helios:system/tracing@0.1.0";
 const PROFILING_INSTANCE: &str = "helios:system/profiling@0.1.0";
+const SETTINGS_INSTANCE: &str = "helios:system/settings@0.1.0";
 const INSTANCES_INSTANCE: &str = "helios:system/instances@0.1.0";
 const SNAPSHOT_INSTANCE: &str = "helios:system/snapshot@0.1.0";
 /// The share of the machine's free memory the compiled-component cache
@@ -88,6 +90,7 @@ mod observation;
 mod pending;
 pub(crate) use pending::PendingReply;
 pub mod service;
+mod settings;
 mod timeline;
 mod topology;
 mod views;
@@ -99,7 +102,7 @@ pub use service::{
     BlobHandle, ChildExit, ChildHandle, ClientImageSurfaceHandle, ClientSurfaceHandle,
     CommandBufferHandle, ContainerHandle, ContextHandle, DisplayHandle, GpuHandle,
     InputDeviceHandle, PlaybackHandle, SurfaceHandle, UserProgramService,
-    install_component_host_program_service, install_program_service,
+    install_component_host_program_service, install_program_service, launch_boot_init,
     run_component_host_processor_forever, run_embedded_component_forever,
     run_program_workers_forever,
 };
@@ -1341,6 +1344,20 @@ macro_rules! impl_authority_conversion {
                             .map_err(map_process_authority_error)?;
                         authority.grant_diagnostic_rights(rights);
                     }
+                    $bindings::helios::system::programs::CapabilityGrant::Settings(settings) => {
+                        let mut rights = SettingsAuthorityRights::empty();
+                        for right in settings.rights {
+                            rights |= match right {
+                                $bindings::helios::system::programs::SettingsRight::Write => {
+                                    SettingsAuthorityRights::WRITE
+                                }
+                            };
+                        }
+                        let rights = caller_authority
+                            .derive_settings_rights(rights)
+                            .map_err(map_process_authority_error)?;
+                        authority.grant_settings_rights(rights);
+                    }
                     $bindings::helios::system::programs::CapabilityGrant::Machine(machine) => {
                         let mut rights = crate::MachineAuthorityRights::empty();
                         for right in machine.rights {
@@ -1630,13 +1647,14 @@ mod authority_tests {
     use crate::{
         ClockAuthorityRights, DeviceClassRights, DiagnosticAuthorityRights,
         DirectoryAuthorityRights, DirectoryPreopen, LinkAuthorityRights, NetworkAuthorityRights,
-        ProcessAuthority, ProcessAuthorityRights, TerminalAuthorityRights,
+        ProcessAuthority, ProcessAuthorityRights, SettingsAuthorityRights, TerminalAuthorityRights,
     };
 
     use program_wit::programs::{
         CapabilityGrant, ClockGrant, ClockRight, DeviceClass, DeviceGrant, DiagnosticsGrant,
         DiagnosticsRight, DirectoryGrant, FilesystemRight, LinkGrant, LinkRight, NetworkGrant,
-        NetworkRight, ProcessGrant, ProcessRight, TerminalGrant, TerminalRight,
+        NetworkRight, ProcessGrant, ProcessRight, SettingsGrant, SettingsRight, TerminalGrant,
+        TerminalRight,
     };
 
     fn directory_grant(
@@ -1679,6 +1697,10 @@ mod authority_tests {
         CapabilityGrant::Diagnostics(DiagnosticsGrant { rights })
     }
 
+    fn settings_grant(rights: Vec<SettingsRight>) -> CapabilityGrant {
+        CapabilityGrant::Settings(SettingsGrant { rights })
+    }
+
     #[test]
     fn empty_grants_create_zero_child_authority() {
         let child = build_program_child_authority(&ProcessAuthority::root(), Vec::new())
@@ -1693,6 +1715,7 @@ mod authority_tests {
         assert!(child.device_class_rights().is_empty());
         assert!(child.granted_devices().is_empty());
         assert!(child.diagnostic_rights().is_empty());
+        assert!(child.settings_rights().is_empty());
         assert!(child.cwd().is_none());
     }
 
@@ -1746,6 +1769,62 @@ mod authority_tests {
             child.diagnostic_rights(),
             DiagnosticAuthorityRights::OBSERVE_MACHINE
         );
+    }
+
+    #[test]
+    fn settings_grant_derives_from_caller_authority() {
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_settings_rights(SettingsAuthorityRights::WRITE);
+
+        let child = build_program_child_authority(
+            &caller,
+            vec![settings_grant(vec![SettingsRight::Write])],
+        )
+        .expect("a caller holding the right may hand it on");
+
+        assert_eq!(child.settings_rights(), SettingsAuthorityRights::WRITE);
+    }
+
+    #[test]
+    fn settings_grant_exceeding_caller_is_refused() {
+        let error = build_program_child_authority(
+            &ProcessAuthority::root(),
+            vec![settings_grant(vec![SettingsRight::Write])],
+        )
+        .expect_err("root authority holds no settings right to hand on");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+
+        let mut observer = ProcessAuthority::empty();
+        observer.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        let error = build_program_child_authority(
+            &observer,
+            vec![settings_grant(vec![SettingsRight::Write])],
+        )
+        .expect_err("the observe right is no settings right");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+
+        let error = build_program_child_authority(
+            &ProcessAuthority::root(),
+            vec![settings_grant(Vec::new())],
+        )
+        .expect_err("an empty settings grant is a mistake");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+    }
+
+    /// The inspector session's shell configures the machine through
+    /// programs the debugger launches, so the debugger holds the right it
+    /// hands on.
+    #[test]
+    fn debugger_authority_hands_the_settings_right_to_what_it_launches() {
+        let debugger = super::debugger_authority();
+
+        let child = build_program_child_authority(
+            &debugger,
+            vec![settings_grant(vec![SettingsRight::Write])],
+        )
+        .expect("the debugger holds the settings right");
+
+        assert_eq!(child.settings_rights(), SettingsAuthorityRights::WRITE);
     }
 
     #[test]
@@ -2245,6 +2324,8 @@ fn map_process_authority_error(error: ProcessAuthorityError) -> crate::ProgramEx
         | ProcessAuthorityError::TooManyDeviceGrants
         | ProcessAuthorityError::EmptyDiagnosticRights
         | ProcessAuthorityError::DiagnosticGrantExceedsAuthority(_)
+        | ProcessAuthorityError::EmptySettingsRights
+        | ProcessAuthorityError::SettingsGrantExceedsAuthority(_)
         | ProcessAuthorityError::EmptyMachineRights
         | ProcessAuthorityError::MachineGrantExceedsAuthority(_) => {
             crate::ProgramExecErrorKind::PermissionDenied
@@ -2291,18 +2372,22 @@ where
 }
 
 /// The authority the embedded debugger runs with: everything `root`
-/// grants, plus every device class and the machine-observation right.
+/// grants, plus every device class, the machine-observation right, the
+/// settings-write right and the control-processors right.
 /// The debugger claims no device itself; it holds the classes because a
 /// program can be handed only what its launcher holds, and the inspector
 /// session runs desktop, input and audio programs through it. It holds
 /// the observation right for the same reason: the inspector session
-/// runs `perf` through it. It holds the control-processors right both
-/// for its own `helios:system/processors` RPC and because the session
-/// runs `cpu` through it.
+/// runs `perf` through it. The settings-write right is held for the
+/// shell it launches, whose programs configure the machine. It holds
+/// the control-processors right both for its own
+/// `helios:system/processors` RPC and because the session runs `cpu`
+/// through it.
 fn debugger_authority() -> ProcessAuthority {
     let mut authority = ProcessAuthority::root();
     authority.grant_device_classes(DeviceClassRights::all());
     authority.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+    authority.grant_settings_rights(SettingsAuthorityRights::WRITE);
     authority.grant_machine_rights(crate::MachineAuthorityRights::CONTROL_PROCESSORS);
     authority
 }
@@ -2332,6 +2417,10 @@ where
     } = host;
 
     let component_name = component.name();
+    // Wait for the payload's boot `init` to finish its mounts, console
+    // banner, and `/etc/rc` before emitting debugger stage markers or
+    // claiming the serial line for RPC framing.
+    debug_state.wait_for_boot_init().await;
     let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu.clone());
 
     write_serial.emit_stage_marker("engine:new");
@@ -2647,6 +2736,7 @@ where
     add_snapshot_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
     debugger_profiling::add_to_linker(linker)?;
+    add_settings_to_linker(linker)?;
     Ok(())
 }
 
@@ -2852,6 +2942,7 @@ where
     service::add_hv_to_linker(linker)?;
     add_tracing_to_program_linker(linker)?;
     program_profiling::add_to_linker(linker)?;
+    add_settings_to_linker(linker)?;
     Ok(())
 }
 
@@ -3813,6 +3904,49 @@ where
             }
         };
         Ok((Ok(reader),))
+    })?;
+    Ok(())
+}
+
+/// Registers `helios:system/settings` for both worlds.
+///
+/// Unlike the interfaces above, nothing here is written against a world's
+/// generated types: the listing, a row and the value cross as the views in
+/// `settings`, which name the interface's records by their component model
+/// shape. One registration therefore serves the debugger and program
+/// worlds, and the whole interface is registered, so neither can
+/// instantiate against a missing function.
+fn add_settings_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
+) -> wasmtime::Result<()>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    use settings::{SettingView, ValueView, WriteErrorView};
+    use wasmtime::AsContext;
+    use wasmtime::component::WasmStr;
+
+    let mut instance = linker.instance(SETTINGS_INSTANCE)?;
+    // Reads need no right; a write needs the right to write settings and is
+    // refused before the name is looked up. See `settings`.
+    instance.func_wrap("list", |caller, (): ()| {
+        Ok((settings::listing(caller.data()),))
+    })?;
+    // A name is compared where it sits in the caller's memory, so a
+    // guest-chosen string is not copied onto the kernel heap for UTF-8.
+    instance.func_wrap("read", |caller, (name,): (WasmStr,)| {
+        let name = name.to_str(caller.as_context())?;
+        let setting = settings::read(caller.data(), &name).map(SettingView::from);
+        Ok((setting,))
+    })?;
+    instance.func_wrap("write", |caller, (name, value): (WasmStr, ValueView)| {
+        let name = name.to_str(caller.as_context())?;
+        let replaced = settings::write(caller.data(), &name, value.into())
+            .map(ValueView::from)
+            .map_err(WriteErrorView::from);
+        Ok((replaced,))
     })?;
     Ok(())
 }
@@ -5836,23 +5970,17 @@ mod tests {
             self.executor.run_until_stalled_with_stats(&self.timer);
         }
 
-        /// Moves the timer's inbox into its wheel, which is where a
-        /// sleep that was dropped before it fired is discarded. The
-        /// kernel event loop does this every tick; a test that runs
-        /// more phases than the timer inbox holds has to do it too.
-        fn settle_timer(&self) {
-            self.timer.fire_expired();
-        }
-
         /// One phase, started and ended, with its heartbeat parked on
         /// its sleep in between — the shape every instance's run phase
-        /// has.
+        /// has. The cancelled heartbeat's sleep leaves its timer's
+        /// wheel as it is dropped, so nothing is left for a fire to
+        /// clear.
         fn run_phase(&self) -> Result<(), TaskCapacityError> {
             let heartbeat = self.start_phase()?;
             self.drain();
             drop(heartbeat);
             self.drain();
-            self.settle_timer();
+            assert_eq!(self.timer.registered_sleeps(), 0);
             Ok(())
         }
     }
@@ -5898,7 +6026,7 @@ mod tests {
                 "phase {phase} did not reach its error exit",
             );
             fixture.drain();
-            fixture.settle_timer();
+            assert_eq!(fixture.timer.registered_sleeps(), 0);
         }
     }
 }
