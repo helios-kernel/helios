@@ -10,7 +10,7 @@ use rpds::RedBlackTreeMapSync;
 use zerocopy::IntoBytes;
 
 use crate::items::RootRecord;
-use crate::ondisk::{RawRootItem, RawRootTail, item_type, objectid, view};
+use crate::ondisk::{RawRootItem, RawRootTail, RawTimespec, item_type, objectid, view};
 use crate::source::BlockSource;
 use crate::space::Space;
 use crate::tree::write::{Trees, WriteError};
@@ -18,6 +18,23 @@ use crate::tree::{Cursor, TreeRoot};
 use crate::uuid_tree::{self, UuidTree};
 use crate::volume::Volume;
 use crate::{Error, Key};
+
+/// Decoded metadata fields of one subvolume's `ROOT_ITEM`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SubvolumeMeta {
+    pub(crate) id: u64,
+    pub(crate) root: TreeRoot,
+    pub(crate) root_dirid: u64,
+    pub(crate) bytes_used: u64,
+    pub(crate) uuid: [u8; 16],
+    pub(crate) parent_uuid: Option<[u8; 16]>,
+    pub(crate) received_uuid: Option<[u8; 16]>,
+    pub(crate) ctransid: u64,
+    pub(crate) otransid: u64,
+    pub(crate) stransid: u64,
+    pub(crate) rtransid: u64,
+    pub(crate) read_only: bool,
+}
 
 #[derive(Clone)]
 struct RootItem {
@@ -128,6 +145,251 @@ impl Roots {
             entries,
             uuid_tree,
         })
+    }
+
+    pub(crate) fn uuid_root(&self) -> Option<TreeRoot> {
+        self.uuid_tree.as_ref().map(|u| u.root)
+    }
+
+    pub(crate) fn set_uuid_root(&mut self, root: TreeRoot) {
+        if let Some(index) = &mut self.uuid_tree {
+            Arc::make_mut(index).root = root;
+        }
+        if let Some(entry) = self.entries.get_mut(&objectid::UUID_TREE) {
+            entry.root = root;
+        }
+    }
+
+    /// Every live subvolume (`FS_TREE` or `FIRST_FREE..=LAST_FREE` with
+    /// `refs > 0`), in ascending tree-id order.
+    pub(crate) fn live_subvolume_roots(&self) -> Vec<(u64, TreeRoot)> {
+        self.entries
+            .iter()
+            .filter(|&(&tree, entry)| {
+                crate::fs::is_subvolume(tree)
+                    && view::<RawRootItem>(&entry.bytes)
+                        .expect("validated root item")
+                        .refs
+                        .get()
+                        != 0
+            })
+            .map(|(&tree, entry)| (tree, entry.root))
+            .collect()
+    }
+
+    /// Next unused subvolume tree id (`>= FIRST_FREE`).
+    pub(crate) fn next_subvolume_id(&self) -> Result<u64, WriteError> {
+        let highest = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|&tree| (objectid::FIRST_FREE..=objectid::LAST_FREE).contains(&tree))
+            .max()
+            .unwrap_or(objectid::FIRST_FREE - 1);
+        let next = highest
+            .checked_add(1)
+            .filter(|&id| id <= objectid::LAST_FREE)
+            .ok_or(WriteError::IdentifierExhausted {
+                tree: objectid::ROOT_TREE,
+            })?;
+        Ok(next)
+    }
+
+    /// Inserts a newly created internal tree (such as `QUOTA_TREE`) into the
+    /// root catalogue so `sync` writes its `ROOT_ITEM` into `ROOT_TREE`.
+    pub(crate) fn insert_internal(&mut self, root: TreeRoot) {
+        let mut item = RootItem::internal(root);
+        item.dirty = true;
+        self.entries.insert_mut(root.tree, item);
+    }
+
+    /// Inserts a newly created subvolume or snapshot root item into the
+    /// catalogue.
+    pub(crate) fn insert_subvolume(
+        &mut self,
+        key: Key,
+        root: TreeRoot,
+        initial_used: u64,
+        bytes: Vec<u8>,
+    ) {
+        self.entries.insert_mut(
+            root.tree,
+            RootItem {
+                key,
+                root,
+                initial_used,
+                dirty: true,
+                bytes,
+            },
+        );
+    }
+
+    /// Removes `tree`'s `ROOT_ITEM` from both `ROOT_TREE` and this catalogue.
+    pub(crate) async fn remove_tree<S: BlockSource>(
+        &mut self,
+        volume: &Volume<S>,
+        trees: &mut Trees,
+        space: &mut Space,
+        tree: u64,
+    ) -> Result<(), WriteError> {
+        let Some(entry) = self.entries.get(&tree).cloned() else {
+            return Err(Error::MissingRoot { tree }.into());
+        };
+        self.root = trees
+            .apply(volume, self.root, entry.key, None, space)
+            .await?;
+        self.entries.remove_mut(&tree);
+        Ok(())
+    }
+
+    /// Sets or clears `BTRFS_ROOT_SUBVOL_RDONLY` on `tree`.
+    pub(crate) fn set_read_only(&mut self, tree: u64, read_only: bool) -> Result<(), WriteError> {
+        let entry = self
+            .entries
+            .get_mut(&tree)
+            .ok_or(Error::MissingRoot { tree })?;
+        let mut head = *view::<RawRootItem>(&entry.bytes).expect("validated root item");
+        let flags = if read_only {
+            head.flags.get() | 1
+        } else {
+            head.flags.get() & !1
+        };
+        head.flags.set(flags);
+        entry.bytes[..size_of::<RawRootItem>()].copy_from_slice(head.as_bytes());
+        entry.dirty = true;
+        Ok(())
+    }
+
+    /// Updates `last_snapshot` on a source subvolume after snapshotting it.
+    pub(crate) fn set_last_snapshot(
+        &mut self,
+        tree: u64,
+        generation: u64,
+    ) -> Result<(), WriteError> {
+        let entry = self
+            .entries
+            .get_mut(&tree)
+            .ok_or(Error::MissingRoot { tree })?;
+        let mut head = *view::<RawRootItem>(&entry.bytes).expect("validated root item");
+        head.last_snapshot.set(generation);
+        entry.bytes[..size_of::<RawRootItem>()].copy_from_slice(head.as_bytes());
+        entry.dirty = true;
+        Ok(())
+    }
+
+    /// Records receive-stream provenance (`received_uuid`, `stransid`,
+    /// `rtransid`, `rtime`) and marks the subvolume read-only if requested.
+    pub(crate) fn set_received_info(
+        &mut self,
+        tree: u64,
+        received_uuid: [u8; 16],
+        stransid: u64,
+        rtransid: u64,
+        rtime: RawTimespec,
+        read_only: bool,
+    ) -> Result<(), WriteError> {
+        let entry = self
+            .entries
+            .get_mut(&tree)
+            .ok_or(Error::MissingRoot { tree })?;
+        let head_size = size_of::<RawRootItem>();
+        let full_size = head_size + size_of::<RawRootTail>();
+        if entry.bytes.len() < full_size {
+            entry.bytes.resize(full_size, 0);
+        }
+        let mut head = *view::<RawRootItem>(&entry.bytes).expect("validated root item");
+        if read_only {
+            head.flags.set(head.flags.get() | 1);
+        }
+        entry.bytes[..head_size].copy_from_slice(head.as_bytes());
+        let mut tail = *view::<RawRootTail>(&entry.bytes[head_size..]).expect("full root item");
+        tail.received_uuid = received_uuid;
+        tail.stransid.set(stransid);
+        tail.rtransid.set(rtransid);
+        tail.rtime = rtime;
+        tail.generation_v2.set(head.generation.get());
+        entry.bytes[head_size..full_size].copy_from_slice(tail.as_bytes());
+        entry.dirty = true;
+        Ok(())
+    }
+
+    /// Finds a live subvolume whose `received_uuid` (when `check_received` is
+    /// true) or `uuid` matches `uuid` (and optionally matches `ctransid` or
+    /// `stransid`).
+    pub(crate) fn find_subvolume_by_uuid(
+        &self,
+        uuid: [u8; 16],
+        ctransid: Option<u64>,
+    ) -> Option<u64> {
+        if uuid == [0; 16] {
+            return None;
+        }
+        // Prefer matching `received_uuid` + `stransid` (standard Linux receive
+        // lookup for chained send/receive), then fall back to matching `uuid` +
+        // `ctransid` (when receiving into the same filesystem that produced the
+        // send stream).
+        let mut fallback = None;
+        for (&tree, _) in &self.entries {
+            if !crate::fs::is_subvolume(tree) || !self.is_live(tree) {
+                continue;
+            }
+            let Ok(meta) = self.subvolume_meta(tree) else {
+                continue;
+            };
+            if meta.received_uuid == Some(uuid) {
+                if ctransid.is_none_or(|c| meta.stransid == c || meta.ctransid == c) {
+                    return Some(tree);
+                }
+                fallback.get_or_insert(tree);
+            }
+            if meta.uuid == uuid {
+                if ctransid.is_none_or(|c| meta.ctransid == c || meta.otransid == c) {
+                    return Some(tree);
+                }
+                fallback.get_or_insert(tree);
+            }
+        }
+        fallback
+    }
+
+    /// Decoded metadata for subvolume `tree`.
+    pub(crate) fn subvolume_meta(&self, tree: u64) -> Result<SubvolumeMeta, WriteError> {
+        let entry = self.entries.get(&tree).ok_or(Error::MissingRoot { tree })?;
+        let head = view::<RawRootItem>(&entry.bytes).expect("validated root item");
+        let head_size = size_of::<RawRootItem>();
+        let tail = view::<RawRootTail>(&entry.bytes[head_size..])
+            .filter(|t| t.generation_v2.get() == head.generation.get());
+        let nonzero = |u: [u8; 16]| (u != [0; 16]).then_some(u);
+        Ok(SubvolumeMeta {
+            id: tree,
+            root: entry.root,
+            root_dirid: head.root_dirid.get(),
+            bytes_used: head.bytes_used.get(),
+            uuid: tail.map_or([0; 16], |t| t.uuid),
+            parent_uuid: tail.and_then(|t| nonzero(t.parent_uuid)),
+            received_uuid: tail.and_then(|t| nonzero(t.received_uuid)),
+            ctransid: tail.map_or(head.generation.get(), |t| t.ctransid.get()),
+            otransid: tail.map_or(head.generation.get(), |t| t.otransid.get()),
+            stransid: tail.map_or(0, |t| t.stransid.get()),
+            rtransid: tail.map_or(0, |t| t.rtransid.get()),
+            read_only: head.flags.get() & 1 != 0,
+        })
+    }
+
+    /// Rewrites `ctransid` and `ctime` when a subvolume has been modified in
+    /// the current transaction, and updates `bytes_used` and `UUID_TREE`.
+    pub(crate) fn update_ctransid(&mut self, tree: u64, generation: u64, ctime: RawTimespec) {
+        if let Some(entry) = self.entries.get_mut(&tree) {
+            let head_size = size_of::<RawRootItem>();
+            if let Some(tail_ref) = view::<RawRootTail>(&entry.bytes[head_size..]) {
+                let mut tail = *tail_ref;
+                tail.ctransid.set(generation);
+                tail.ctime = ctime;
+                let full_size = head_size + size_of::<RawRootTail>();
+                entry.bytes[head_size..full_size].copy_from_slice(tail.as_bytes());
+                entry.dirty = true;
+            }
+        }
     }
 
     pub(crate) fn get(&self, tree: u64) -> Result<TreeRoot, WriteError> {

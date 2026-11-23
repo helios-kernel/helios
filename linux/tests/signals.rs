@@ -21,9 +21,9 @@ use helios_linux::signal_frame::{
     SS_AUTODISARM, SS_DISABLE, SS_ONSTACK,
 };
 use helios_linux::syscall::{
-    Call, Clock, Credentials, Denied, MapError, MemoryFault, MemoryTotals, NoBacking, PidNamespace,
-    Process, Region, SignalDelivery, SpawnError, SpawnedThread, Start, Stdio, Stream,
-    SyscallOutcome, SyscallRestart, System, Thread, UserMemory, VirtualMemory, WriteError,
+    Call, Clock, Credentials, Denied, Filesystem, MapError, MemoryFault, MemoryTotals, NoBacking,
+    PidNamespace, Process, Region, SignalDelivery, SpawnError, SpawnedThread, Start, Stdio, Stream,
+    SyscallOutcome, SyscallRestart, System, Thread, Tty, UserMemory, VirtualMemory, WriteError,
     dispatch, standard_streams,
 };
 use helios_unix::{Signal, SignalSet};
@@ -179,12 +179,24 @@ impl Stdio for TestPlatform {
     }
 }
 
+impl Filesystem<NoBacking> for TestPlatform {}
+impl Tty for TestPlatform {}
+
 impl Clock for TestPlatform {
     fn now_nanos(&self) -> u64 {
         self.now_ns.load(Ordering::Relaxed)
     }
     async fn sleep_until(&self, _: u64) {
         core::future::pending().await
+    }
+}
+
+impl helios_linux::syscall::Network<helios_unix::NoNetwork> for TestPlatform {
+    fn to_ip(&self, address: core::convert::Infallible) -> helios_linux::syscall::IpAddr {
+        match address {}
+    }
+    fn encode_ip(&self, _: helios_linux::syscall::IpAddr) -> core::convert::Infallible {
+        unreachable!()
     }
 }
 

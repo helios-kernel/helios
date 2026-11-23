@@ -17,12 +17,21 @@ use std::sync::{Arc, Mutex};
 use helios_hal::vmm::PageFlags;
 use helios_linux::abi::{Abi, Operation};
 use helios_linux::syscall::{
-    Call, Clock, Denied, Exit, MapError, MemoryFault, MemoryTotals, NoBacking, Process, Region,
-    SpawnError, SpawnedThread, Start, Stdio, Stream, SyscallOutcome, System, Thread, UserMemory,
-    VirtualMemory, WriteError, dispatch as raw_dispatch,
+    Call, Clock, Denied, Exit, Filesystem, MapError, MemoryFault, MemoryTotals, NoBacking, Process,
+    Region, SpawnError, SpawnedThread, Start, Stdio, Stream, SyscallOutcome, System, Thread, Tty,
+    UserMemory, VirtualMemory, WriteError, dispatch as raw_dispatch,
 };
 
-async fn dispatch<M: VirtualMemory, T: Thread<NoBacking>, O: Stdio + Clock + System>(
+async fn dispatch<
+    M: VirtualMemory,
+    T: Thread<NoBacking>,
+    O: Stdio
+        + Clock
+        + System
+        + Filesystem<NoBacking>
+        + Tty
+        + helios_linux::syscall::Network<helios_unix::NoNetwork>,
+>(
     process: &mut Process<NoBacking>,
     call: Call,
     memory: &mut M,
@@ -264,6 +273,15 @@ impl Clock for Platform {
     }
 }
 
+impl helios_linux::syscall::Network<helios_unix::NoNetwork> for Platform {
+    fn to_ip(&self, address: core::convert::Infallible) -> helios_linux::syscall::IpAddr {
+        match address {}
+    }
+    fn encode_ip(&self, _: helios_linux::syscall::IpAddr) -> core::convert::Infallible {
+        unreachable!()
+    }
+}
+
 impl System for Platform {
     fn realtime_nanos(&self) -> u64 {
         self.realtime
@@ -297,6 +315,8 @@ impl System for Platform {
         "#1 Helios test"
     }
 }
+impl helios_linux::syscall::Filesystem<NoBacking> for Platform {}
+impl helios_linux::syscall::Tty for Platform {}
 
 fn drive<T>(future: impl Future<Output = T>) -> T {
     let mut future = std::pin::pin!(future);

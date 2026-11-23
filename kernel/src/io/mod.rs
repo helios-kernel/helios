@@ -9,7 +9,7 @@ use helios_sync as child;
 
 /// The block layer's test disk, for the filesystems mounted over it.
 #[cfg(test)]
-pub(crate) use block::tests::{MemoryDisk, cache_over};
+pub(crate) use block::tests::{MemoryDisk, cache_over, cache_over_many};
 mod console;
 mod debug_serial;
 mod interrupts;

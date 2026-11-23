@@ -335,8 +335,20 @@ where
         #[cfg(feature = "linux")]
         ProgramExecutable::Linux(executable) => {
             let launch = container.expect("every Linux launch carries a container");
+            let exec_runtime = LinuxExecRuntime {
+                exec_context: exec_context.clone(),
+                wasm: Some(LinuxWasmRuntime {
+                    filesystem,
+                    progress,
+                    engine: engine.clone(),
+                    runtime: runtime.clone(),
+                    preview1_core_linker,
+                    shared_memory_pool,
+                    core_module_instance_pre_cache,
+                }),
+            };
             run_linux_process(
-                exec_context,
+                exec_runtime,
                 argv,
                 env,
                 launch.container,

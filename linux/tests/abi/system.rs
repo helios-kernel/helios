@@ -143,7 +143,8 @@ fn system_information_calls_have_each_abis_own_numbers() {
         assert_eq!(Abi::X86_64.operation(x86_64), operation);
         match aarch64 {
             Some(aarch64) => assert_eq!(Abi::Aarch64.operation(aarch64), operation),
-            None => assert_eq!(Abi::Aarch64.operation(201), Operation::Unknown),
+            // On aarch64's asm-generic table, 201 is `listen`, never `time`.
+            None => assert_ne!(Abi::Aarch64.operation(x86_64), operation),
         }
     }
 }
@@ -322,15 +323,8 @@ fn gettimeofday_and_time_report_the_wall_clock() {
         1_700_000_000
     );
     assert_eq!(world.call(Operation::Time, [FAULT, 0, 0, 0, 0, 0]), EFAULT);
-    // aarch64's asm-generic table has no `time`.
-    let mut world = World::new(Abi::Aarch64);
-    let result = drive(process_dispatch(
-        &mut world.process,
-        call(201, [64, 0, 0, 0, 0, 0]),
-        &mut world.memory,
-        &mut world.sink,
-    ));
-    assert_eq!(result, ControlFlow::Continue(38_u64.wrapping_neg()));
+    // aarch64's asm-generic table has no `time`: number 201 is `listen`.
+    assert_eq!(Abi::Aarch64.operation(201), Operation::Listen);
 }
 
 #[test]
@@ -476,6 +470,7 @@ fn credentials() -> Credentials {
         },
         supplementary_groups: vec![10, 20, 30],
         capabilities: helios_linux::syscall::LinuxCapabilities::for_uid(1001),
+        no_new_privs: false,
     }
 }
 

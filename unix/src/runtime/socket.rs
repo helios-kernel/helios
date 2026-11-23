@@ -23,9 +23,11 @@
 //! each ABI maps its own onto the typed [`SocketFlag`], [`SocketSize`],
 //! [`SocketTime`] and [`SocketOptionError`] here.
 
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use bytes::Bytes;
 use core::convert::Infallible;
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use helios_sync::{ByteReader, ByteWriter, RawMutex, TryRead, byte_channel};
 use spin::Mutex;
 use thiserror::Error;
@@ -47,6 +49,7 @@ pub trait SocketNetwork: Clone + Send + Sync + 'static {
     type TcpStream: Copy + Send + Sync + 'static;
     type TcpListener: Copy + Send + Sync + 'static;
     type UdpSocket: Copy + Send + Sync + 'static;
+    type PacketSocket: Copy + Send + Sync + 'static;
 
     /// What the stack reserves and stamps per socket.
     const LIMITS: SocketLimits;
@@ -59,6 +62,9 @@ pub trait SocketNetwork: Clone + Send + Sync + 'static {
 
     /// Retires a datagram socket.
     fn udp_close(&self, socket: Self::UdpSocket);
+
+    /// Retires a link-layer packet tap socket.
+    fn packet_close(&self, socket: Self::PacketSocket);
 }
 
 /// The per-socket facts of a network stack that options report.
@@ -85,6 +91,7 @@ impl SocketNetwork for NoNetwork {
     type TcpStream = Infallible;
     type TcpListener = Infallible;
     type UdpSocket = Infallible;
+    type PacketSocket = Infallible;
 
     /// No stack reserves anything, so nothing clamps a requested buffer;
     /// 64 is the default TTL Linux's `ip_default_ttl` and RFC 1700 give.
@@ -105,6 +112,10 @@ impl SocketNetwork for NoNetwork {
     fn udp_close(&self, socket: Infallible) {
         match socket {}
     }
+
+    fn packet_close(&self, socket: Infallible) {
+        match socket {}
+    }
 }
 
 /// The address family a socket was opened with.
@@ -119,11 +130,12 @@ pub enum SocketFamily {
     Ipv6,
 }
 
-/// Whether a socket carries a byte stream or datagrams.
+/// Whether a socket carries a byte stream, datagrams, or raw link frames.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SocketKind {
     Stream,
     Datagram,
+    Raw,
 }
 
 /// The transport protocol an IP socket speaks.
@@ -214,6 +226,49 @@ impl<Net: SocketNetwork> Drop for OwnedUdpSocket<Net> {
     }
 }
 
+/// A link-layer packet socket tap retired when its last owner drops.
+pub struct OwnedPacketSocket<Net: SocketNetwork> {
+    network: Net,
+    socket: Net::PacketSocket,
+}
+
+impl<Net: SocketNetwork> OwnedPacketSocket<Net> {
+    pub fn new(network: Net, socket: Net::PacketSocket) -> Arc<Self> {
+        Arc::new(Self { network, socket })
+    }
+
+    pub fn id(&self) -> Net::PacketSocket {
+        self.socket
+    }
+}
+
+impl<Net: SocketNetwork> Drop for OwnedPacketSocket<Net> {
+    fn drop(&mut self) {
+        self.network.packet_close(self.socket);
+    }
+}
+
+/// Shared state of a netlink socket (`AF_NETLINK`).
+#[derive(Clone, Debug)]
+pub struct NetlinkSocket {
+    pub protocol: u32,
+    pub port_id: u32,
+    pub groups: u32,
+    pub rx_queue: VecDeque<Bytes>,
+    pub options: SocketOptions,
+}
+
+/// Shared state of a link-layer packet socket (`AF_PACKET`).
+#[derive(Clone)]
+pub struct PacketSocket<Net: SocketNetwork> {
+    pub handle: Arc<OwnedPacketSocket<Net>>,
+    /// EtherType filter in host byte order (`0x0003` = `ETH_P_ALL`, `0x0800` = `ETH_P_IP`).
+    pub protocol: u16,
+    /// Bound interface index (`0` = any, `1` = `lo`, `2` = `eth0`).
+    pub ifindex: u32,
+    pub options: SocketOptions,
+}
+
 #[derive(Clone)]
 pub enum TcpSocket<Net: SocketNetwork> {
     Unconnected {
@@ -231,6 +286,13 @@ pub enum TcpSocket<Net: SocketNetwork> {
         listener: Arc<OwnedTcpListener<Net>>,
         local_address: Net::Address,
         local_port: u16,
+        options: SocketOptions,
+    },
+    Connecting {
+        family: SocketFamily,
+        stream: Arc<OwnedTcpStream<Net>>,
+        peer_address: Net::Address,
+        peer_port: u16,
         options: SocketOptions,
     },
     Connected {
@@ -253,6 +315,7 @@ pub enum UdpSocket<Net: SocketNetwork> {
         socket: Arc<OwnedUdpSocket<Net>>,
         local_address: Net::Address,
         local_port: u16,
+        peer: Option<(Net::Address, u16)>,
         options: SocketOptions,
     },
 }
@@ -276,11 +339,17 @@ enum SocketBody<Net: SocketNetwork> {
         recv_lock: RawMutex,
         options: Mutex<SocketOptions>,
     },
+    Netlink(Mutex<NetlinkSocket>),
+    Packet(Mutex<PacketSocket<Net>>),
 }
 
 struct SharedSocket<Net: SocketNetwork> {
     kind: SocketKind,
     protocol: Option<TransportProtocol>,
+    nonblocking: AtomicBool,
+    pending_error: AtomicI32,
+    shutdown_read: AtomicBool,
+    shutdown_write: AtomicBool,
     body: SocketBody<Net>,
 }
 
@@ -291,13 +360,16 @@ struct SharedSocket<Net: SocketNetwork> {
 /// Clones share one [`SharedSocket`] via `Arc`. No operation fans out to other
 /// processors, and no interrupt handler touches a `Socket` lock.
 ///
-/// - **Lock-free**: immutable metadata and channel-end clones
-///   (`same_description`, `kind`, `protocol`, `is_tcp`, `is_udp`, `is_pair`,
-///   `pair_ends`, `pair_writer`).
+/// - **Lock-free**: immutable metadata, channel-end clones, and atomic status
+///   words (`same_description`, `kind`, `protocol`, `is_tcp`, `is_udp`,
+///   `is_pair`, `pair_ends`, `pair_writer`, `is_nonblocking`,
+///   `set_nonblocking`, `take_pending_error`, `set_pending_error`,
+///   `is_shutdown_read`, `mark_shutdown_read`, `is_shutdown_write`,
+///   `mark_shutdown_write`).
 /// - **Synchronous `spin::Mutex`** (short critical section, never held across
 ///   `.await`): state and option reads/transitions (`tcp_state`, `udp_state`,
 ///   `with_tcp_mut`, `with_udp_mut`, `options`, `set_flag`, `set_size`,
-///   `set_time`, `handle`, `pair_read_probe`, and `carry` updates).
+///   `set_time`, `handle`, `family`, `pair_read_probe`, and `carry` updates).
 /// - **Async [`helios_sync::RawMutex`]**: `recv_pair` serializes concurrent
 ///   socket-pair readers across duplicates (`try_lock` when non-blocking,
 ///   `lock().await` when blocking) and acquires the `carry` spin lock only
@@ -318,6 +390,7 @@ pub enum SocketHandle<Net: SocketNetwork> {
     TcpStream(Net::TcpStream),
     TcpListener(Net::TcpListener),
     UdpSocket(Net::UdpSocket),
+    PacketSocket(Net::PacketSocket),
 }
 
 impl<Net: SocketNetwork> Clone for SocketHandle<Net> {
@@ -333,12 +406,14 @@ where
     Net::TcpStream: PartialEq,
     Net::TcpListener: PartialEq,
     Net::UdpSocket: PartialEq,
+    Net::PacketSocket: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::TcpStream(a), Self::TcpStream(b)) => a == b,
             (Self::TcpListener(a), Self::TcpListener(b)) => a == b,
             (Self::UdpSocket(a), Self::UdpSocket(b)) => a == b,
+            (Self::PacketSocket(a), Self::PacketSocket(b)) => a == b,
             _ => false,
         }
     }
@@ -349,6 +424,7 @@ where
     Net::TcpStream: Eq,
     Net::TcpListener: Eq,
     Net::UdpSocket: Eq,
+    Net::PacketSocket: Eq,
 {
 }
 
@@ -357,6 +433,7 @@ where
     Net::TcpStream: core::fmt::Debug,
     Net::TcpListener: core::fmt::Debug,
     Net::UdpSocket: core::fmt::Debug,
+    Net::PacketSocket: core::fmt::Debug,
 {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -366,6 +443,9 @@ where
                 .field(listener)
                 .finish(),
             Self::UdpSocket(socket) => formatter.debug_tuple("UdpSocket").field(socket).finish(),
+            Self::PacketSocket(socket) => {
+                formatter.debug_tuple("PacketSocket").field(socket).finish()
+            }
         }
     }
 }
@@ -402,6 +482,10 @@ impl<Net: SocketNetwork> Socket<Net> {
         Self(Arc::new(SharedSocket {
             kind: SocketKind::Stream,
             protocol: Some(TransportProtocol::Tcp),
+            nonblocking: AtomicBool::new(false),
+            pending_error: AtomicI32::new(0),
+            shutdown_read: AtomicBool::new(false),
+            shutdown_write: AtomicBool::new(false),
             body: SocketBody::Tcp(Mutex::new(tcp)),
         }))
     }
@@ -411,6 +495,10 @@ impl<Net: SocketNetwork> Socket<Net> {
         Self(Arc::new(SharedSocket {
             kind: SocketKind::Datagram,
             protocol: Some(TransportProtocol::Udp),
+            nonblocking: AtomicBool::new(false),
+            pending_error: AtomicI32::new(0),
+            shutdown_read: AtomicBool::new(false),
+            shutdown_write: AtomicBool::new(false),
             body: SocketBody::Udp(Mutex::new(udp)),
         }))
     }
@@ -423,6 +511,10 @@ impl<Net: SocketNetwork> Socket<Net> {
             Self(Arc::new(SharedSocket {
                 kind,
                 protocol: None,
+                nonblocking: AtomicBool::new(false),
+                pending_error: AtomicI32::new(0),
+                shutdown_read: AtomicBool::new(false),
+                shutdown_write: AtomicBool::new(false),
                 body: SocketBody::Pair {
                     reader,
                     writer,
@@ -436,6 +528,134 @@ impl<Net: SocketNetwork> Socket<Net> {
             end(left_reader, left_writer),
             end(right_reader, right_writer),
         )
+    }
+
+    /// A netlink socket (`AF_NETLINK`) speaking `protocol` (e.g. `NETLINK_ROUTE`).
+    pub fn netlink(kind: SocketKind, protocol: u32) -> Self {
+        Self(Arc::new(SharedSocket {
+            kind,
+            protocol: None,
+            nonblocking: AtomicBool::new(false),
+            pending_error: AtomicI32::new(0),
+            shutdown_read: AtomicBool::new(false),
+            shutdown_write: AtomicBool::new(false),
+            body: SocketBody::Netlink(Mutex::new(NetlinkSocket {
+                protocol,
+                port_id: 0,
+                groups: 0,
+                rx_queue: VecDeque::new(),
+                options: SocketOptions::for_network::<Net>(),
+            })),
+        }))
+    }
+
+    /// A link-layer packet socket (`AF_PACKET`) backed by a host tap handle.
+    pub fn packet(kind: SocketKind, handle: Arc<OwnedPacketSocket<Net>>, protocol: u16) -> Self {
+        Self(Arc::new(SharedSocket {
+            kind,
+            protocol: None,
+            nonblocking: AtomicBool::new(false),
+            pending_error: AtomicI32::new(0),
+            shutdown_read: AtomicBool::new(false),
+            shutdown_write: AtomicBool::new(false),
+            body: SocketBody::Packet(Mutex::new(PacketSocket {
+                handle,
+                protocol,
+                ifindex: 0,
+                options: SocketOptions::for_network::<Net>(),
+            })),
+        }))
+    }
+
+    /// Whether this socket is a netlink socket.
+    pub fn is_netlink(&self) -> bool {
+        matches!(self.0.body, SocketBody::Netlink(_))
+    }
+
+    /// Whether this socket is a link-layer packet socket.
+    pub fn is_packet(&self) -> bool {
+        matches!(self.0.body, SocketBody::Packet(_))
+    }
+
+    /// Snapshot of the netlink socket state, or `None` if not netlink.
+    pub fn netlink_state(&self) -> Option<NetlinkSocket> {
+        match &self.0.body {
+            SocketBody::Netlink(nl) => Some(nl.lock().clone()),
+            _ => None,
+        }
+    }
+
+    /// Runs `f` with mutable access to the netlink socket state.
+    pub fn with_netlink_mut<R>(&self, f: impl FnOnce(&mut NetlinkSocket) -> R) -> Option<R> {
+        match &self.0.body {
+            SocketBody::Netlink(nl) => Some(f(&mut nl.lock())),
+            _ => None,
+        }
+    }
+
+    /// Snapshot of the packet socket state, or `None` if not a packet socket.
+    pub fn packet_state(&self) -> Option<PacketSocket<Net>> {
+        match &self.0.body {
+            SocketBody::Packet(pkt) => Some(pkt.lock().clone()),
+            _ => None,
+        }
+    }
+
+    /// Runs `f` with mutable access to the packet socket state.
+    pub fn with_packet_mut<R>(&self, f: impl FnOnce(&mut PacketSocket<Net>) -> R) -> Option<R> {
+        match &self.0.body {
+            SocketBody::Packet(pkt) => Some(f(&mut pkt.lock())),
+            _ => None,
+        }
+    }
+
+    /// Whether `O_NONBLOCK` / `SOCK_NONBLOCK` is set on this open description.
+    pub fn is_nonblocking(&self) -> bool {
+        self.0.nonblocking.load(Ordering::Acquire)
+    }
+
+    /// Sets or clears `O_NONBLOCK` on this open description.
+    pub fn set_nonblocking(&self, nonblocking: bool) {
+        self.0.nonblocking.store(nonblocking, Ordering::Release);
+    }
+
+    /// Reads and clears the latched asynchronous socket error (`SO_ERROR`).
+    pub fn take_pending_error(&self) -> i32 {
+        self.0.pending_error.swap(0, Ordering::AcqRel)
+    }
+
+    /// Latches an asynchronous socket error (`SO_ERROR`) for a later read.
+    pub fn set_pending_error(&self, errno: i32) {
+        self.0.pending_error.store(errno, Ordering::Release);
+    }
+
+    /// Whether the receive half has been shut down locally (`SHUT_RD`).
+    pub fn is_shutdown_read(&self) -> bool {
+        self.0.shutdown_read.load(Ordering::Acquire)
+    }
+
+    /// Marks the receive half as locally shut down (`SHUT_RD`).
+    pub fn mark_shutdown_read(&self) {
+        self.0.shutdown_read.store(true, Ordering::Release);
+    }
+
+    /// Whether the send half has been shut down locally (`SHUT_WR`).
+    pub fn is_shutdown_write(&self) -> bool {
+        self.0.shutdown_write.load(Ordering::Acquire)
+    }
+
+    /// Marks the send half as locally shut down (`SHUT_WR`).
+    pub fn mark_shutdown_write(&self) {
+        self.0.shutdown_write.store(true, Ordering::Release);
+    }
+
+    /// The IP address family of this socket, or `None` for non-IP sockets.
+    pub fn family(&self) -> Option<SocketFamily> {
+        match &self.0.body {
+            SocketBody::Tcp(tcp) => Some(tcp.lock().family()),
+            SocketBody::Udp(udp) => Some(udp.lock().family()),
+            SocketBody::Pair { .. } | SocketBody::Netlink(_) | SocketBody::Packet(_) => None,
+        }
     }
 
     /// Whether `self` and `other` refer to the same open socket description.
@@ -577,6 +797,8 @@ impl<Net: SocketNetwork> Socket<Net> {
             SocketBody::Tcp(tcp) => *tcp.lock().options(),
             SocketBody::Udp(udp) => *udp.lock().options(),
             SocketBody::Pair { options, .. } => *options.lock(),
+            SocketBody::Netlink(nl) => nl.lock().options,
+            SocketBody::Packet(pkt) => pkt.lock().options,
         }
     }
 
@@ -585,6 +807,8 @@ impl<Net: SocketNetwork> Socket<Net> {
             SocketBody::Tcp(tcp) => f(tcp.lock().options_mut()),
             SocketBody::Udp(udp) => f(udp.lock().options_mut()),
             SocketBody::Pair { options, .. } => f(&mut options.lock()),
+            SocketBody::Netlink(nl) => f(&mut nl.lock().options),
+            SocketBody::Packet(pkt) => f(&mut pkt.lock().options),
         }
     }
 
@@ -602,7 +826,9 @@ impl<Net: SocketNetwork> Socket<Net> {
     pub fn handle(&self) -> Option<SocketHandle<Net>> {
         match &self.0.body {
             SocketBody::Tcp(tcp) => match &*tcp.lock() {
-                TcpSocket::Connected { stream, .. } => Some(SocketHandle::TcpStream(stream.id())),
+                TcpSocket::Connected { stream, .. } | TcpSocket::Connecting { stream, .. } => {
+                    Some(SocketHandle::TcpStream(stream.id()))
+                }
                 TcpSocket::Listening { listener, .. } => {
                     Some(SocketHandle::TcpListener(listener.id()))
                 }
@@ -612,7 +838,8 @@ impl<Net: SocketNetwork> Socket<Net> {
                 UdpSocket::Bound { socket, .. } => Some(SocketHandle::UdpSocket(socket.id())),
                 UdpSocket::Unbound { .. } => None,
             },
-            SocketBody::Pair { .. } => None,
+            SocketBody::Pair { .. } | SocketBody::Netlink(_) => None,
+            SocketBody::Packet(pkt) => Some(SocketHandle::PacketSocket(pkt.lock().handle.id())),
         }
     }
 
@@ -681,6 +908,7 @@ impl<Net: SocketNetwork> TcpSocket<Net> {
             Self::Unconnected { options, .. }
             | Self::Bound { options, .. }
             | Self::Listening { options, .. }
+            | Self::Connecting { options, .. }
             | Self::Connected { options, .. } => options,
         }
     }
@@ -690,6 +918,7 @@ impl<Net: SocketNetwork> TcpSocket<Net> {
             Self::Unconnected { options, .. }
             | Self::Bound { options, .. }
             | Self::Listening { options, .. }
+            | Self::Connecting { options, .. }
             | Self::Connected { options, .. } => options,
         }
     }
@@ -699,6 +928,7 @@ impl<Net: SocketNetwork> TcpSocket<Net> {
             Self::Unconnected { family, .. }
             | Self::Bound { family, .. }
             | Self::Listening { family, .. }
+            | Self::Connecting { family, .. }
             | Self::Connected { family, .. } => *family,
         }
     }
@@ -877,6 +1107,7 @@ mod tests {
         type TcpStream = u64;
         type TcpListener = u64;
         type UdpSocket = u64;
+        type PacketSocket = u64;
 
         const LIMITS: SocketLimits = SocketLimits {
             receive_buffer_bytes: 4096,
@@ -891,6 +1122,9 @@ mod tests {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
         fn udp_close(&self, _: u64) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn packet_close(&self, _: u64) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
     }

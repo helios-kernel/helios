@@ -247,34 +247,53 @@ mod tests {
     }
 
     #[test]
-    fn hyphenated_cargo_flags_parse_as_field_values() {
-        let parsed = KernelImageRestore::try_parse_from([
+    fn kernel_image_fields_accept_cargo_flags_with_leading_hyphens() {
+        let restore = KernelImageRestore::try_parse_from([
             "kernel-image-restore",
             "--public-key",
-            "helios-root-public.key",
+            "root.pub",
             "--image",
             "helios",
             "--field",
             "cargo",
             "--field",
-            "build",
+            "--profile",
             "--field",
-            "--target",
-            "--field",
-            "x86_64-unknown-none",
+            "release",
             "--field",
             "-Zbuild-std=core,alloc",
+            "--field",
+            "--no-default-features",
         ])
-        .expect("cargo flags starting with hyphens are field values");
+        .expect("restore parses hyphenated --field arguments");
         assert_eq!(
-            parsed.key.fields,
+            restore.key.fields,
             [
                 "cargo",
-                "build",
-                "--target",
-                "x86_64-unknown-none",
-                "-Zbuild-std=core,alloc"
+                "--profile",
+                "release",
+                "-Zbuild-std=core,alloc",
+                "--no-default-features",
             ]
         );
+
+        let store = KernelImageStore::try_parse_from([
+            "kernel-image-store",
+            "--field",
+            "--profile",
+            "--field",
+            "release",
+            "--public-key",
+            "root.pub",
+            "--image",
+            "helios",
+            "--target",
+            "x86_64-unknown-none",
+            "--target-dir",
+            "target",
+        ])
+        .expect("store parses hyphenated --field arguments");
+        assert_eq!(store.key.fields, ["--profile", "release"]);
+        assert_eq!(store.target, "x86_64-unknown-none");
     }
 }

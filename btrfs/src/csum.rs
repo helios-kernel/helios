@@ -111,6 +111,15 @@ pub(crate) fn inode_ref_hash(parent: u64, name: &[u8]) -> u64 {
     u64::from(!digest.finalize())
 }
 
+/// Linux btrfs send stream command CRC32C (`btrfs_crc32c(0, buf, len)`):
+/// raw CRC32C register seeded with 0 and returned without final inversion.
+#[cfg(feature = "write")]
+pub(crate) fn send_stream_crc(data: &[u8]) -> u32 {
+    let mut digest = CASTAGNOLI.digest_with_initial(0);
+    digest.update(data);
+    !digest.finalize()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

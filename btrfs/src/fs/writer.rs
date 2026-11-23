@@ -37,11 +37,14 @@ use alloc::vec::Vec;
 use core::num::NonZeroUsize;
 use core::ops::{Deref, DerefMut};
 use helios_hal::fs::RenameMode;
+use helios_hal::fs_management::{
+    BalanceFilter, BalanceReport, DedupeOutcome, QgroupId, QgroupInfo, QgroupLimit, QuotaStatus,
+    ResizeTarget, ScrubReport, SubvolumeInfo, VolumeDeviceInfo,
+};
 
-use super::{Filesystem, Snapshot, find_root};
+use super::{Filesystem, Snapshot};
 use crate::accounting::Allocation;
 use crate::compress::policy::Compressor;
-use crate::ondisk::objectid;
 use crate::retirement::Retirements;
 use crate::roots::Roots;
 use crate::source::BlockSink;
@@ -271,25 +274,34 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
         now: Timestamp,
     ) -> Result<Self, WriteError> {
         let current = Filesystem::mount_committed(Arc::new(source)).await?;
+        Self::finish_mount(current, uuids, concurrency, compressor, now).await
+    }
+
+    /// Mounts a multi-device btrfs volume for writing.
+    pub async fn mount_devices(
+        sources: Vec<S>,
+        uuids: U,
+        concurrency: NonZeroUsize,
+        compressor: Compressor,
+        now: Timestamp,
+    ) -> Result<Self, WriteError> {
+        let wrapped: Vec<Arc<S>> = sources.into_iter().map(Arc::new).collect();
+        let current = Filesystem::mount_committed_devices(wrapped).await?;
+        Self::finish_mount(current, uuids, concurrency, compressor, now).await
+    }
+
+    async fn finish_mount(
+        current: Filesystem<Arc<S>>,
+        uuids: U,
+        concurrency: NonZeroUsize,
+        compressor: Compressor,
+        now: Timestamp,
+    ) -> Result<Self, WriteError> {
         current.superblock().check_writable()?;
         let log = current
             .superblock()
             .log_tree()
             .map(|(bytenr, level)| PendingLog { bytenr, level });
-        // Linux enables quotas by creating the quota tree. Its qgroup counts
-        // go stale under any write this writer makes, so refuse until the
-        // writer maintains them (lexoliu/helios#1043).
-        match find_root(
-            &current.volume,
-            current.snapshot.root_tree,
-            objectid::QUOTA_TREE,
-        )
-        .await
-        {
-            Ok(_) => return Err(WriteError::QuotaTreePresent),
-            Err(Error::MissingRoot { .. }) => {}
-            Err(error) => return Err(error.into()),
-        }
         let allocation = Allocation::load(&current.volume, current.snapshot.root_tree).await?;
         let mut writer = Self {
             committed: Some(current),
@@ -555,7 +567,9 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
             return Err(WriteError::WriterPoisoned);
         }
         if self.running.as_ref().is_none_or(|running| {
-            running.inner.dirty_metadata_bytes() == 0 && running.inner.dirty_data_bytes() == 0
+            !running.inner.force_commit
+                && running.inner.dirty_metadata_bytes() == 0
+                && running.inner.dirty_data_bytes() == 0
         }) {
             // A clean transaction holds nothing the last commit did not,
             // except any in-memory open-handle accounting updates.
@@ -565,6 +579,778 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
             return Ok(());
         }
         self.commit_running().await
+    }
+
+    /// Resolves a normalized relative path inside the running transaction
+    /// starting at the default subvolume root.
+    async fn resolve_tx_path(&self, path: &str) -> Result<FileId, WriteError> {
+        let running = self
+            .running
+            .as_ref()
+            .expect("a transaction runs once started");
+        let default = running.inner.base().default_subvolume;
+        let mut current = FileId {
+            tree: default.root.tree,
+            inode: default.root_dirid,
+        };
+        if !path.is_empty() {
+            for seg in path.split('/') {
+                current = running
+                    .inner
+                    .lookup_file(RawName {
+                        tree: current.tree,
+                        parent: current.inode,
+                        bytes: seg.as_bytes(),
+                    })
+                    .await?
+                    .ok_or(WriteError::NoEntry {
+                        tree: current.tree,
+                        parent: current.inode,
+                    })?;
+            }
+        }
+        Ok(current)
+    }
+
+    /// Creates a new empty subvolume at `parent_path`/`name` and commits it.
+    pub async fn create_subvolume(
+        &mut self,
+        parent_path: &str,
+        name: &[u8],
+        attributes: Attributes,
+        when: Timestamp,
+    ) -> Result<SubvolumeInfo, WriteError> {
+        self.start().await?;
+        let parent = self.resolve_tx_path(parent_path).await?;
+        let raw_attrs = attributes.raw(0o040_000)?;
+        let uuid = self.uuids.next_uuid();
+        let tree_id = {
+            let mut tx = self.join().await?;
+            let mut op = Mutation::new(&mut tx, Units::CREATE).await?;
+            let id = op
+                .inner_mut()
+                .create_subvolume(
+                    RawName {
+                        tree: parent.tree,
+                        parent: parent.inode,
+                        bytes: name,
+                    },
+                    raw_attrs,
+                    when,
+                    uuid,
+                )
+                .await?;
+            op.accept()?;
+            id
+        };
+        self.commit().await?;
+        self.subvolume_info(tree_id).await
+    }
+
+    /// Creates a snapshot of subvolume `source_tree` at `dest_parent_path`/`name`,
+    /// flushing any pending changes and delalloc first, then commits it.
+    pub async fn snapshot_subvolume(
+        &mut self,
+        source_tree: u64,
+        dest_parent_path: &str,
+        name: &[u8],
+        read_only: bool,
+        when: Timestamp,
+    ) -> Result<SubvolumeInfo, WriteError> {
+        // Flush delalloc and commit pending edits so the source root block and
+        // its direct children are accounted in `EXTENT_TREE`.
+        self.commit().await?;
+        self.start().await?;
+        let parent = self.resolve_tx_path(dest_parent_path).await?;
+        let uuid = self.uuids.next_uuid();
+        let snap_tree = {
+            let mut tx = self.join().await?;
+            let mut op = Mutation::new(&mut tx, Units::CREATE).await?;
+            let id = op
+                .inner_mut()
+                .snapshot_subvolume(
+                    source_tree,
+                    RawName {
+                        tree: parent.tree,
+                        parent: parent.inode,
+                        bytes: name,
+                    },
+                    read_only,
+                    when,
+                    uuid,
+                )
+                .await?;
+            op.accept()?;
+            id
+        };
+        self.commit().await?;
+        self.subvolume_info(snap_tree).await
+    }
+
+    /// Deletes the subvolume linked at `parent_path`/`name` and commits.
+    pub async fn delete_subvolume(
+        &mut self,
+        parent_path: &str,
+        name: &[u8],
+        when: Timestamp,
+    ) -> Result<(), WriteError> {
+        self.commit().await?;
+        self.start().await?;
+        let parent = self.resolve_tx_path(parent_path).await?;
+        {
+            let mut tx = self.join().await?;
+            let mut op = Mutation::new(&mut tx, Units::UNLINK).await?;
+            op.inner_mut()
+                .delete_subvolume(
+                    RawName {
+                        tree: parent.tree,
+                        parent: parent.inode,
+                        bytes: name,
+                    },
+                    when,
+                )
+                .await?;
+            op.accept()?;
+        }
+        self.commit().await
+    }
+
+    /// Toggles `BTRFS_ROOT_SUBVOL_RDONLY` on subvolume `tree` and commits.
+    pub async fn set_subvolume_read_only(
+        &mut self,
+        tree: u64,
+        read_only: bool,
+    ) -> Result<(), WriteError> {
+        self.commit().await?;
+        self.start().await?;
+        {
+            let mut tx = self.join().await?;
+            let mut op = Mutation::new(&mut tx, Units::INODE_UPDATE).await?;
+            op.inner_mut().roots.set_read_only(tree, read_only)?;
+            op.inner_mut().force_commit = true;
+            op.accept()?;
+        }
+        self.commit().await
+    }
+
+    /// Returns metadata and canonical path for subvolume `tree`.
+    pub async fn subvolume_info(&mut self, tree: u64) -> Result<SubvolumeInfo, WriteError> {
+        self.start().await?;
+        self.running
+            .as_ref()
+            .expect("transaction started")
+            .inner
+            .subvolume_info(tree)
+            .await
+    }
+
+    /// Lists every live subvolume in the filesystem.
+    pub async fn list_subvolumes(&mut self) -> Result<Vec<SubvolumeInfo>, WriteError> {
+        self.start().await?;
+        let inner = &self.running.as_ref().expect("transaction started").inner;
+        let trees: Vec<u64> = inner
+            .roots
+            .live_subvolume_roots()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let mut out = Vec::with_capacity(trees.len());
+        for tree in trees {
+            out.push(inner.subvolume_info(tree).await?);
+        }
+        Ok(out)
+    }
+
+    /// Produces a Linux-compatible btrfs send stream (v1) for read-only
+    /// subvolume `tree` (full or incremental against `parent_tree`, with
+    /// optional `clone_trees`).
+    pub async fn send_subvolume(
+        &mut self,
+        tree: u64,
+        parent_tree: Option<u64>,
+        clone_trees: &[u64],
+    ) -> Result<Vec<u8>, WriteError> {
+        self.commit().await?;
+        self.start().await?;
+        let view = self.snapshot()?;
+        let inner = &self.running.as_ref().expect("transaction started").inner;
+        let (_, rel_path) = inner.subvolume_path(tree).await?;
+        let basename = rel_path.rsplit('/').next().unwrap_or("subvol");
+        crate::send::send_subvolume(
+            &view,
+            &inner.roots,
+            basename.as_bytes(),
+            tree,
+            parent_tree,
+            clone_trees,
+        )
+        .await
+    }
+
+    /// Consumes a Linux-compatible btrfs send stream (v1), creating a new
+    /// subvolume (or snapshot for an incremental stream) inside `dest_dir_path`
+    /// and committing the result.
+    ///
+    /// `authorize_source` is called with the canonical mount-relative path of
+    /// any existing subvolume referenced by `SNAPSHOT` or `CLONE` before any
+    /// data is copied or snapshotted from it.
+    pub async fn receive_subvolume<F>(
+        &mut self,
+        dest_dir_path: &str,
+        stream: &[u8],
+        when: Timestamp,
+        mut authorize_source: F,
+    ) -> Result<SubvolumeInfo, WriteError>
+    where
+        F: FnMut(&str) -> Result<(), WriteError>,
+    {
+        let commands = crate::receive::parse_stream(stream)?;
+        let init = crate::receive::decode_receive_init(&commands)?;
+        let referenced_sources = crate::receive::referenced_sources_in_commands(&commands)?;
+        let (target_name, stream_uuid) = match &init {
+            crate::receive::ReceiveInit::Subvol { name, uuid, .. }
+            | crate::receive::ReceiveInit::Snapshot { name, uuid, .. } => (name.to_vec(), *uuid),
+        };
+
+        // Commit any prior pending work so parent and clone source lookups see committed roots.
+        self.commit().await?;
+        self.start().await?;
+
+        // Pre-authorize every external source subvolume referenced by `SNAPSHOT`
+        // or `CLONE` commands before creating any target subvolume on disk.
+        {
+            let inner = &self.running.as_ref().expect("transaction started").inner;
+            for &(clone_uuid, clone_ctransid) in &referenced_sources {
+                if clone_uuid == stream_uuid {
+                    continue;
+                }
+                let found = inner
+                    .roots
+                    .find_subvolume_by_uuid(clone_uuid, Some(clone_ctransid))
+                    .ok_or_else(|| {
+                        WriteError::InvalidStream(alloc::string::String::from(
+                            "stream references unknown source subvolume UUID",
+                        ))
+                    })?;
+                let (_, source_root_path) = inner.subvolume_path(found).await?;
+                authorize_source(&source_root_path)?;
+            }
+        }
+
+        let dest_parent = self.resolve_tx_path(dest_dir_path).await?;
+        let new_uuid = self.uuids.next_uuid();
+
+        let (target_tree, received_uuid, stransid) = match init {
+            crate::receive::ReceiveInit::Subvol {
+                name,
+                uuid,
+                ctransid,
+            } => {
+                let attrs = Attributes {
+                    permissions: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    umask: 0,
+                }
+                .raw(0o040_000)?;
+                let mut tx = self.join().await?;
+                let mut op = Mutation::new(&mut tx, Units::CREATE).await?;
+                let id = op
+                    .inner_mut()
+                    .create_subvolume(
+                        RawName {
+                            tree: dest_parent.tree,
+                            parent: dest_parent.inode,
+                            bytes: name,
+                        },
+                        attrs,
+                        when,
+                        new_uuid,
+                    )
+                    .await?;
+                op.accept()?;
+                (id, uuid, ctransid)
+            }
+            crate::receive::ReceiveInit::Snapshot {
+                name,
+                uuid,
+                ctransid,
+                clone_uuid,
+                clone_ctransid,
+            } => {
+                let parent_tree = {
+                    let inner = &self.running.as_ref().expect("transaction started").inner;
+                    inner
+                        .roots
+                        .find_subvolume_by_uuid(clone_uuid, Some(clone_ctransid))
+                        .ok_or_else(|| {
+                            WriteError::InvalidStream(alloc::string::String::from(
+                                "SNAPSHOT references unknown parent subvolume UUID",
+                            ))
+                        })?
+                };
+                let mut tx = self.join().await?;
+                let mut op = Mutation::new(&mut tx, Units::CREATE).await?;
+                let id = op
+                    .inner_mut()
+                    .snapshot_subvolume(
+                        parent_tree,
+                        RawName {
+                            tree: dest_parent.tree,
+                            parent: dest_parent.inode,
+                            bytes: name,
+                        },
+                        false, // writable while applying stream commands; set RO at END
+                        when,
+                        new_uuid,
+                    )
+                    .await?;
+                op.accept()?;
+                (id, uuid, ctransid)
+            }
+        };
+
+        // Commit the created subvolume/snapshot first so any in-stream CLONE
+        // or rollback operates cleanly, then apply all stream commands in a
+        // transaction and commit. If applying the stream fails, remove the
+        // half-received writable subvolume so nothing stray remains on disk.
+        self.commit().await?;
+        let apply_result: Result<(), WriteError> = async {
+            self.start().await?;
+            {
+                let mut tx = self.join().await?;
+                let mut op = Mutation::checkpointed(&mut tx, Units::default());
+                let (inner, compressor, concurrency, max_inline) = op.split();
+                crate::receive::apply_receive_commands(
+                    inner,
+                    crate::receive::ReceiveApplyContext {
+                        target_tree,
+                        received_uuid,
+                        stransid,
+                        when,
+                        compressor,
+                        concurrency,
+                        max_inline,
+                    },
+                    &commands,
+                    authorize_source,
+                )
+                .await?;
+                op.publish()?;
+            }
+            self.commit().await
+        }
+        .await;
+        if let Err(err) = apply_result {
+            if self.committed.is_some() {
+                let _ = self
+                    .delete_subvolume(dest_dir_path, &target_name, when)
+                    .await;
+            }
+            return Err(err);
+        }
+        self.subvolume_info(target_tree).await
+    }
+
+    /// Lists every backing device currently in the volume.
+    pub async fn list_devices(&mut self) -> Result<Vec<VolumeDeviceInfo>, WriteError> {
+        self.start().await?;
+        self.running
+            .as_ref()
+            .expect("transaction started")
+            .inner
+            .list_devices()
+            .await
+    }
+
+    /// Adds a new backing device `device` to the volume and commits.
+    pub async fn add_device(&mut self, device: S) -> Result<VolumeDeviceInfo, WriteError> {
+        self.commit().await?;
+        self.start().await?;
+        let uuid = self.uuids.next_uuid();
+        let info = {
+            let mut tx = self.join().await?;
+            let mut op = Mutation::new(&mut tx, Units::CREATE).await?;
+            let info = op
+                .inner_mut()
+                .add_device(Arc::new(Arc::new(device)), uuid)
+                .await?;
+            op.publish()?;
+            info
+        };
+        self.commit().await?;
+        Ok(info)
+    }
+
+    /// Relocates all chunks off `devid`, removes `devid` from the volume,
+    /// commits the updated remaining devices, and wipes `devid`'s superblocks.
+    pub async fn remove_device(&mut self, devid: u64) -> Result<(), WriteError> {
+        self.commit().await?;
+        self.start().await?;
+        let (to_relocate, dev_count) = {
+            let inner = &self.running.as_ref().expect("transaction started").inner;
+            let devs = inner.all_dev_items().await?;
+            if !devs.iter().any(|(id, _)| *id == devid) {
+                return Err(WriteError::DeviceNotFound { devid });
+            }
+            let chunks: Vec<(u64, u64, u64)> = inner
+                .volume
+                .chunks()
+                .chunks()
+                .iter()
+                .filter(|c| c.copies().iter().any(|s| s.devid == devid))
+                .map(|c| (c.logical(), c.length(), c.flags()))
+                .collect();
+            (chunks, devs.len())
+        };
+        if dev_count <= 1 {
+            return Err(WriteError::LastDevice);
+        }
+        for (logical, length, flags) in to_relocate {
+            self.relocate_one_chunk(logical, length, flags, Some(devid), None)
+                .await?;
+        }
+        self.commit().await?;
+        self.start().await?;
+        let detached = {
+            let mut tx = self.join().await?;
+            let mut op = Mutation::checkpointed(&mut tx, Units::default());
+            let dev = op.inner_mut().finish_remove_device(devid).await?;
+            op.publish()?;
+            dev
+        };
+        self.commit().await?;
+        Transaction::<Arc<S>>::wipe_detached(&detached).await?;
+        Ok(())
+    }
+
+    /// Replaces `source_devid` in place with `target`, commits, and wipes the
+    /// old source device's superblocks.
+    pub async fn replace_device(
+        &mut self,
+        source_devid: u64,
+        target: S,
+    ) -> Result<VolumeDeviceInfo, WriteError> {
+        self.commit().await?;
+        self.start().await?;
+        let uuid = self.uuids.next_uuid();
+        let (info, detached) = {
+            let mut tx = self.join().await?;
+            let mut op = Mutation::checkpointed(&mut tx, Units::default());
+            let res = op
+                .inner_mut()
+                .replace_device(source_devid, Arc::new(Arc::new(target)), uuid)
+                .await?;
+            op.publish()?;
+            res
+        };
+        self.commit().await?;
+        Transaction::<Arc<S>>::wipe_detached(&detached).await?;
+        Ok(info)
+    }
+
+    /// Resizes `devid` (or the primary device when `None`) to `target`,
+    /// relocating any chunks past the new boundary when shrinking.
+    pub async fn resize_device(
+        &mut self,
+        devid: Option<u64>,
+        target: ResizeTarget,
+    ) -> Result<VolumeDeviceInfo, WriteError> {
+        self.commit().await?;
+        self.start().await?;
+        let (devid, old_size, new_size) = self
+            .running
+            .as_ref()
+            .expect("transaction started")
+            .inner
+            .resolve_resize_target(devid, target)
+            .await?;
+
+        if new_size < old_size {
+            let to_relocate: Vec<(u64, u64, u64)> = self
+                .running
+                .as_ref()
+                .expect("transaction started")
+                .inner
+                .volume
+                .chunks()
+                .chunks()
+                .iter()
+                .filter(|c| {
+                    c.copies()
+                        .iter()
+                        .any(|s| s.devid == devid && s.offset + c.length() > new_size)
+                })
+                .map(|c| (c.logical(), c.length(), c.flags()))
+                .collect();
+            for (logical, length, flags) in to_relocate {
+                self.relocate_one_chunk(logical, length, flags, None, Some((devid, new_size)))
+                    .await?;
+            }
+        }
+
+        self.commit().await?;
+        self.start().await?;
+        let info = {
+            let mut tx = self.join().await?;
+            let mut op = Mutation::checkpointed(&mut tx, Units::default());
+            let info = op.inner_mut().finish_resize_device(devid, new_size).await?;
+            op.publish()?;
+            info
+        };
+        self.commit().await?;
+        Ok(info)
+    }
+
+    /// Relocates block groups matching `filter`.
+    pub async fn balance(&mut self, filter: BalanceFilter) -> Result<BalanceReport, WriteError> {
+        use crate::space::{DATA, METADATA, SYSTEM};
+        self.commit().await?;
+        self.start().await?;
+        let summaries = self
+            .running
+            .as_ref()
+            .expect("transaction started")
+            .inner
+            .space
+            .group_summaries();
+        let mut report = BalanceReport::default();
+        let mut candidates = Vec::new();
+        for (logical, length, flags, used) in summaries {
+            let kind_match = (filter.data && flags & DATA != 0)
+                || (filter.metadata && flags & METADATA != 0)
+                || (filter.system && flags & SYSTEM != 0);
+            if !kind_match {
+                continue;
+            }
+            report.considered += 1;
+            if let Some(max_pct) = filter.usage_max_percent {
+                let pct = if length == 0 {
+                    100
+                } else {
+                    (u128::from(used) * 100 / u128::from(length)) as u64
+                };
+                if pct > u64::from(max_pct) {
+                    continue;
+                }
+            }
+            if let Some(limit) = filter.limit
+                && candidates.len() as u64 >= limit
+            {
+                break;
+            }
+            candidates.push((logical, length, flags));
+        }
+
+        for (logical, length, flags) in candidates {
+            self.relocate_one_chunk(logical, length, flags, None, None)
+                .await?;
+            report.relocated += 1;
+        }
+        Ok(report)
+    }
+
+    /// Relocates a single block group in one commit and deletes the emptied
+    /// chunk in the follow-up cleanup commit.
+    async fn relocate_one_chunk(
+        &mut self,
+        logical: u64,
+        length: u64,
+        flags: u64,
+        excluded_device: Option<u64>,
+        device_size_limit: Option<(u64, u64)>,
+    ) -> Result<(), WriteError> {
+        self.commit().await?;
+        self.start().await?;
+        let concurrency = self.concurrency;
+        {
+            let mut tx = self.join().await?;
+            let mut op = Mutation::checkpointed(&mut tx, Units::default());
+            op.inner_mut().excluded_device = excluded_device;
+            op.inner_mut().device_size_limit = device_size_limit;
+            op.inner_mut()
+                .relocate_chunk(logical, length, flags, concurrency)
+                .await?;
+            op.publish()?;
+        }
+        self.commit().await?;
+        // Second commit allows `remove_unused_groups` to drop the now-empty
+        // chunk once no live reader pins the previous generation.
+        self.start().await?;
+        if let Some(running) = &mut self.running {
+            running.inner.excluded_device = excluded_device;
+            running.inner.device_size_limit = device_size_limit;
+            if !running
+                .inner
+                .space
+                .unused_groups(running.inner.volume.chunks())
+                .is_empty()
+            {
+                running.inner.force_commit = true;
+            }
+        }
+        self.commit().await?;
+        Ok(())
+    }
+
+    /// Verifies checksums across all allocated metadata blocks, data extents,
+    /// and superblocks (optionally restricted to `devid`), repairing corrupt
+    /// mirror copies when `!read_only`. Forces a commit whenever repairs were
+    /// staged so they become durable on write-caching `BlockSink`s.
+    pub async fn scrub(
+        &mut self,
+        devid: Option<u64>,
+        read_only: bool,
+    ) -> Result<ScrubReport, WriteError> {
+        self.commit().await?;
+        let report = {
+            let committed = self.committed.as_ref().ok_or(WriteError::WriterPoisoned)?;
+            crate::scrub::scrub_volume(
+                &committed.volume,
+                committed.snapshot.root_tree,
+                devid,
+                read_only,
+            )
+            .await?
+        };
+        if !read_only && report.corrected_errors > 0 {
+            self.start().await?;
+            if let Some(running) = &mut self.running {
+                running.inner.force_commit = true;
+            }
+            self.commit().await?;
+        }
+        Ok(report)
+    }
+
+    /// Enables quota groups and scans existing extents into `QUOTA_TREE`.
+    pub async fn quota_enable(&mut self) -> Result<(), WriteError> {
+        self.commit().await?;
+        self.start().await?;
+        {
+            let mut tx = self.join().await?;
+            let mut op = Mutation::new(&mut tx, Units::CREATE).await?;
+            op.inner_mut().quota_enable().await?;
+            op.publish()?;
+        }
+        self.commit().await
+    }
+
+    /// Disables quota groups and removes `QUOTA_TREE`.
+    pub async fn quota_disable(&mut self) -> Result<(), WriteError> {
+        self.commit().await?;
+        self.start().await?;
+        {
+            let mut tx = self.join().await?;
+            let mut op = Mutation::checkpointed(&mut tx, Units::default());
+            op.inner_mut().quota_disable().await?;
+            op.publish()?;
+        }
+        self.commit().await
+    }
+
+    /// Recomputes all quota group counters and commits them.
+    pub async fn quota_rescan(&mut self) -> Result<(), WriteError> {
+        self.commit().await?;
+        self.start().await?;
+        {
+            let mut tx = self.join().await?;
+            let mut op = Mutation::checkpointed(&mut tx, Units::default());
+            op.inner_mut().quota_rescan().await?;
+            op.publish()?;
+        }
+        self.commit().await
+    }
+
+    pub async fn qgroup_create(&mut self, id: QgroupId) -> Result<(), WriteError> {
+        self.start().await?;
+        {
+            let mut tx = self.join().await?;
+            let mut op = Mutation::new(&mut tx, Units::INODE_UPDATE).await?;
+            op.inner_mut().qgroup_create(id)?;
+            op.publish()?;
+        }
+        self.commit().await
+    }
+
+    pub async fn qgroup_destroy(&mut self, id: QgroupId) -> Result<(), WriteError> {
+        self.start().await?;
+        {
+            let mut tx = self.join().await?;
+            let mut op = Mutation::new(&mut tx, Units::INODE_UPDATE).await?;
+            op.inner_mut().qgroup_destroy(id)?;
+            op.publish()?;
+        }
+        self.commit().await
+    }
+
+    pub async fn qgroup_assign(
+        &mut self,
+        member: QgroupId,
+        parent: QgroupId,
+    ) -> Result<(), WriteError> {
+        self.start().await?;
+        {
+            let mut tx = self.join().await?;
+            let mut op = Mutation::new(&mut tx, Units::INODE_UPDATE).await?;
+            op.inner_mut().qgroup_assign(member, parent)?;
+            op.publish()?;
+        }
+        self.commit().await
+    }
+
+    pub async fn qgroup_remove(
+        &mut self,
+        member: QgroupId,
+        parent: QgroupId,
+    ) -> Result<(), WriteError> {
+        self.start().await?;
+        {
+            let mut tx = self.join().await?;
+            let mut op = Mutation::new(&mut tx, Units::INODE_UPDATE).await?;
+            op.inner_mut().qgroup_remove(member, parent)?;
+            op.publish()?;
+        }
+        self.commit().await
+    }
+
+    pub async fn qgroup_limit(
+        &mut self,
+        id: QgroupId,
+        limit: QgroupLimit,
+    ) -> Result<(), WriteError> {
+        self.start().await?;
+        {
+            let mut tx = self.join().await?;
+            let mut op = Mutation::new(&mut tx, Units::INODE_UPDATE).await?;
+            op.inner_mut().qgroup_limit(id, limit)?;
+            op.publish()?;
+        }
+        self.commit().await
+    }
+
+    pub async fn quota_status(&mut self) -> Result<QuotaStatus, WriteError> {
+        self.start().await?;
+        Ok(self
+            .running
+            .as_ref()
+            .expect("transaction started")
+            .inner
+            .quota
+            .as_ref()
+            .map_or_else(QuotaStatus::default, crate::qgroup::QuotaTree::status))
+    }
+
+    pub async fn list_qgroups(&mut self) -> Result<Vec<QgroupInfo>, WriteError> {
+        self.start().await?;
+        Ok(self
+            .running
+            .as_ref()
+            .expect("transaction started")
+            .inner
+            .quota
+            .as_ref()
+            .map_or_else(Vec::new, crate::qgroup::QuotaTree::list))
     }
 
     /// Commits the running transaction, whatever it holds.
@@ -815,6 +1601,13 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         self.checked(file).await?;
         let id = file.id;
         self.inner().roots.check_writable(id.tree)?;
+        let sector = u64::from(self.inner().volume.superblock().sectorsize());
+        let quota_delta = if data.is_empty() {
+            0
+        } else {
+            (data.len() as u64).next_multiple_of(sector)
+        };
+        self.inner().check_quota_limit(id.tree, quota_delta)?;
         let max_inline = self.writer.max_inline;
         let units = self
             .reserve_with_data(DataReservation::Write {
@@ -899,6 +1692,45 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
             .clone_range(range, when, compressor, concurrency, max_inline)
             .await?;
         operation.accept()
+    }
+
+    /// Deduplicates `range` from source into destination if and only if both
+    /// ranges are byte-for-byte identical, as Linux's `FIDEDUPERANGE`.
+    pub async fn dedupe_range(
+        &mut self,
+        range: CloneRange<'_>,
+        when: Timestamp,
+    ) -> Result<DedupeOutcome, WriteError> {
+        self.checked(range.source).await?;
+        self.checked(range.destination).await?;
+        let units = self
+            .reserve_with_data(DataReservation::Clone {
+                source: range.source.id,
+                destination: range.destination.id,
+                offset: range.destination_offset,
+                length: range.length,
+            })
+            .await?;
+        let mut operation = Mutation::new(self, units).await?;
+        operation.checked(range.source).await?;
+        operation.checked(range.destination).await?;
+        let range = RawCloneRange {
+            source: range.source.id,
+            destination: range.destination.id,
+            source_offset: range.source_offset,
+            destination_offset: range.destination_offset,
+            length: range.length,
+        };
+        operation
+            .inner_mut()
+            .roots
+            .check_writable(range.destination.tree)?;
+        let (inner, compressor, concurrency, max_inline) = operation.split();
+        let outcome = inner
+            .dedupe_range(range, when, compressor, concurrency, max_inline)
+            .await?;
+        operation.accept()?;
+        Ok(outcome)
     }
 
     /// Preallocates space, punches holes or zeroes a byte range of `file`, as

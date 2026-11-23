@@ -220,6 +220,18 @@ unsafe impl UserTranslation for X86Tables {
     fn physical(&self, frame: NonNull<u8>) -> u64 {
         (frame.as_ptr() as usize - self.tables.offset) as u64
     }
+
+    fn new_empty(&self) -> Result<Self, NativeError> {
+        let mut tables = X86Tables {
+            root: Box::new(PageTable::new()),
+            tables: Tables {
+                frames: Vec::new(),
+                offset: self.tables.offset,
+            },
+        };
+        tables.sync_kernel_half();
+        Ok(tables)
+    }
 }
 
 impl X86Tables {
@@ -380,7 +392,24 @@ impl X86Context {
         let user = AlignedBytes::new(size, 64)?;
         let kernel = AlignedBytes::new(size, 64)?;
         let entry_stack = AlignedBytes::new(exceptions::EXCEPTION_STACK_BYTES, 16)?;
-        // The all-zero XSAVE header restores architectural initial state.
+        // Intel SDM vol. 1 §11.6.4 and vol. 2C `XRSTOR`: even when `XSTATE_BV`
+        // is zero (initialising x87/SSE/AVX registers), `XRSTOR` still loads
+        // `MXCSR` from bytes 24..28 whenever `RFBM[1]` (SSE) or `RFBM[2]`
+        // (AVX) is set; leaving the buffer zeroed unmasks every SIMD FP
+        // exception (`#XM`). Seed the architectural defaults matching Linux
+        // `arch/x86/kernel/fpu/core.c` (`FCW = 0x037F`, `MXCSR = 0x1F80`).
+        const FCW_OFFSET: usize = 0;
+        const MXCSR_OFFSET: usize = 24;
+        const MXCSR_MASK_OFFSET: usize = 28;
+        const DEFAULT_FCW: u16 = 0x037f;
+        const DEFAULT_MXCSR: u32 = 0x1f80;
+        // SAFETY: `user` is uniquely owned and at least 512 bytes (the FXSAVE
+        // legacy region).
+        let xstate = unsafe { core::slice::from_raw_parts_mut(user.pointer.as_ptr(), size) };
+        xstate[FCW_OFFSET..FCW_OFFSET + 2].copy_from_slice(&DEFAULT_FCW.to_le_bytes());
+        xstate[MXCSR_OFFSET..MXCSR_OFFSET + 4].copy_from_slice(&DEFAULT_MXCSR.to_le_bytes());
+        xstate[MXCSR_MASK_OFFSET..MXCSR_MASK_OFFSET + 4]
+            .copy_from_slice(&extended_state::mxcsr_mask().to_le_bytes());
         Ok(Self {
             switch: Switch {
                 registers: Registers {

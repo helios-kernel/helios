@@ -959,6 +959,10 @@ where
             .udp_readiness(socket)
             .await
             .map_err(p1_errno_from_udp_error)?,
+        UnixSocketHandle::<Net>::PacketSocket(socket) => service
+            .packet_readiness(socket)
+            .await
+            .map_err(p1_errno_from_udp_error)?,
     };
     Ok(p1_readiness_from_socket(readiness, event_type))
 }
@@ -1550,6 +1554,15 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     #[cfg(feature = "linux")]
     pub(super) fn into_slots(self) -> helios_unix::DescriptorSlots<Preview1DescriptorEntry<Net>> {
         self.slots
+    }
+
+    /// Reconstructs a preview1 descriptor table from shared `helios-unix`
+    /// slots when a Linux process executes a Wasm/WASIX image (`execve`).
+    #[cfg(feature = "linux")]
+    pub(super) fn from_slots(
+        slots: helios_unix::DescriptorSlots<Preview1DescriptorEntry<Net>>,
+    ) -> Self {
+        Self { slots }
     }
 
     pub(super) fn clone_for_exec(&self) -> Self {

@@ -28,10 +28,16 @@
 //!   and stops running slices at the next timer preemption.
 
 use super::*;
-use crate::{SetWallClockCap, TerminalInputCap, TerminalOutputCap};
+use crate::{
+    ComponentFsNodeKind, Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route, LinkSourceCap,
+    MulticastCap, NetworkAdminCap, NetworkControlError, NetworkPortId, PrivilegedBindCap,
+    SetWallClockCap, SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights,
+    TerminalInputCap, TerminalOutputCap, TtyControlCap, UdpCap,
+};
 use core::num::NonZeroU32;
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use helios_hal::fs::{FileSystem, FsError, Landed, NodeKind, RenameMode, WritePosition};
 use helios_hal::native::{
     FaultKind, NativeError, NativeExecution, NativeUnavailable, Stop, UserContext, UserFault,
     UserSpace,
@@ -41,11 +47,15 @@ use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
 use helios_linux::abi::{self, Abi};
 use helios_linux::elf::{self, Image};
 use helios_linux::syscall::{
-    self, Call, Denied, EpollData, Exit, MapError, MemoryFault, MemoryTotals, Process,
-    ProcessSignals, Region, Resource, Resources, SignalDelivery, SpawnError, SpawnedThread, Start,
-    Stdio, Stream, SyscallOutcome, SyscallRestart, System, Thread, UserMemory, VirtualMemory,
-    WriteError,
+    self, AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, AccessCheck, Call, Denied, Descriptors, DirListEntry,
+    EpollData, ExecError, ExecSpec, Exit, FileAccess, FileStat, Filesystem, LinkOptions, MapError,
+    MemoryFault, MemoryTotals, OpenRequest, Process, ProcessSignals, READY_ERR, READY_HUP,
+    READY_IN, READY_OUT, Region, Resource, Resources, SignalDelivery, SpawnError, SpawnedProcess,
+    SpawnedThread, Start, StdinTryRead, Stdio, Stream, SyscallOutcome, SyscallRestart, System,
+    Termios, TermiosAction, Thread, TimeUpdate, Tty, TtyError, TtyStream, UserMemory,
+    VirtualMemory, Winsize, WriteError,
 };
+use helios_sync::{TryRead, TryWrite};
 
 /// The ELF identification bytes every ELF file starts with (System V gABI,
 /// `e_ident[EI_MAG0..EI_MAG3]`).
@@ -101,8 +111,17 @@ fn user_end<Native: NativeExecution>(native: &Native) -> u64 {
 struct LinuxGrants {
     terminal_input: Option<TerminalInputCap>,
     terminal_output: Option<TerminalOutputCap>,
+    tty_control: Option<TtyControlCap>,
     /// What WASIX's `clock_time_set` derives, for `clock_settime`.
     set_wall_clock: Option<SetWallClockCap>,
+    link_source: Option<LinkSourceCap>,
+    symlink_create: Option<SymlinkCreateCap>,
+    symlink_read: Option<SymlinkReadCap>,
+    tcp: Option<TcpCap>,
+    udp: Option<UdpCap>,
+    privileged_bind: Option<PrivilegedBindCap>,
+    multicast: Option<MulticastCap>,
+    network_admin: Option<NetworkAdminCap>,
 }
 
 impl LinuxGrants {
@@ -110,7 +129,65 @@ impl LinuxGrants {
         Self {
             terminal_input: authority.derive_terminal_input_cap().ok(),
             terminal_output: authority.derive_terminal_output_cap().ok(),
+            tty_control: authority.derive_tty_control_cap().ok(),
             set_wall_clock: authority.derive_set_wall_clock_cap().ok(),
+            link_source: authority.derive_link_source_cap().ok(),
+            symlink_create: authority.derive_symlink_create_cap().ok(),
+            symlink_read: authority.derive_symlink_read_cap().ok(),
+            tcp: authority.derive_tcp_cap().ok(),
+            udp: authority.derive_udp_cap().ok(),
+            privileged_bind: authority.derive_privileged_bind_cap().ok(),
+            multicast: authority.derive_multicast_cap().ok(),
+            network_admin: authority.derive_network_admin_cap().ok(),
+        }
+    }
+}
+
+/// Process-wide terminal state aligned with [`WasixTtyState`]: whether each
+/// standard stream is attached to a terminal, plus the active `termios` and
+/// window size.
+#[derive(Clone)]
+struct LinuxTtyState {
+    stdin_tty: bool,
+    stdout_tty: bool,
+    stderr_tty: bool,
+    termios: Termios,
+    winsize: Winsize,
+}
+
+impl LinuxTtyState {
+    fn new(
+        authority: &ProcessAuthority,
+        output_mode: &OutputMode,
+        instance_id: crate::InstanceId,
+    ) -> Self {
+        let rights = authority.terminal_rights();
+        let stdin_tty = matches!(
+            output_mode.stdin_route(),
+            crate::ComponentInputRoute::Serial
+        ) && rights.contains(TerminalAuthorityRights::INPUT);
+        let stdout_tty = matches!(
+            output_mode.sink(crate::ComponentOutputStreamKind::Stdout, instance_id),
+            crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial)
+        ) && rights.contains(TerminalAuthorityRights::OUTPUT);
+        let stderr_tty = matches!(
+            output_mode.sink(crate::ComponentOutputStreamKind::Stderr, instance_id),
+            crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial)
+        ) && rights.contains(TerminalAuthorityRights::OUTPUT);
+        Self {
+            stdin_tty,
+            stdout_tty,
+            stderr_tty,
+            termios: Termios::from_flags(stdin_tty, stdin_tty, true),
+            winsize: Winsize::DEFAULT,
+        }
+    }
+
+    fn is_tty(&self, stream: TtyStream) -> bool {
+        match stream {
+            TtyStream::Stdin => self.stdin_tty,
+            TtyStream::Stdout => self.stdout_tty,
+            TtyStream::Stderr => self.stderr_tty,
         }
     }
 }
@@ -269,6 +346,10 @@ impl<Space: UserSpace> UserMemory for LinuxMemory<'_, Space> {
             .atomic_compare_exchange_u32(VirtAddr::new(address as usize), expected, desired)
             .map_err(|_| MemoryFault)
     }
+
+    fn is_page_shared(&self, address: u64) -> bool {
+        self.space.is_page_shared(VirtAddr::new(address as usize))
+    }
 }
 
 fn page_range(address: u64, length: u64) -> VirtRange {
@@ -351,6 +432,99 @@ impl<Space: UserSpace> VirtualMemory for LinuxMemory<'_, Space> {
     }
 }
 
+/// Wasm/WASIX execution handles forwarded from the program service so a Linux
+/// process can `execve`/`execveat` into a Wasm module or component.
+pub(super) struct LinuxWasmRuntime<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    pub(super) filesystem: Option<Namespace<StorageImpl>>,
+    pub(super) progress: helios_hal::watchdog::ProgressCounter,
+    pub(super) engine: crate::wasmtime_adapter::WasmtimeEngine,
+    pub(super) runtime: crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
+    pub(super) preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    pub(super) shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
+    pub(super) core_module_instance_pre_cache:
+        CoreModuleInstancePreCache<CpuImpl, Net, StorageImpl>,
+}
+
+impl<CpuImpl, Net, StorageImpl> Clone for LinuxWasmRuntime<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn clone(&self) -> Self {
+        Self {
+            filesystem: self.filesystem.clone(),
+            progress: self.progress.clone(),
+            engine: self.engine.clone(),
+            runtime: self.runtime.clone(),
+            preview1_core_linker: self.preview1_core_linker.clone(),
+            shared_memory_pool: self.shared_memory_pool.clone(),
+            core_module_instance_pre_cache: self.core_module_instance_pre_cache.clone(),
+        }
+    }
+}
+
+/// Runtime handles forwarded from the program service into a Linux process so
+/// `fork` can register child instances and `execve`/`execveat` can replace the
+/// image with either a Linux ELF or a Wasm/WASIX program.
+pub(super) struct LinuxExecRuntime<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    pub(super) exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
+    pub(super) wasm: Option<LinuxWasmRuntime<CpuImpl, Net, StorageImpl>>,
+}
+
+impl<CpuImpl, Net, StorageImpl> Clone for LinuxExecRuntime<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn clone(&self) -> Self {
+        Self {
+            exec_context: self.exec_context.clone(),
+            wasm: self.wasm.clone(),
+        }
+    }
+}
+
+/// Validated replacement image prepared by `ContextThread::prepare_exec`
+/// before committing the point-of-no-return `execve`/`execveat` transition.
+enum PreparedExec<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    Linux {
+        executable: LinuxExecutable,
+        argv: Vec<String>,
+        env: Vec<String>,
+        credentials: syscall::Credentials,
+        secure: bool,
+    },
+    Wasm {
+        executable: ProgramExecutable<CpuImpl, Net, StorageImpl>,
+        argv: ProgramArgv,
+        env: Vec<(String, String)>,
+    },
+}
+
+/// A prepared `execve`/`execveat` payload handed from the calling thread to
+/// the process lifecycle driver.
+type ExecHandoff<CpuImpl, Net, StorageImpl> = (
+    Box<PreparedExec<CpuImpl, Net, StorageImpl>>,
+    Process<LinuxResources<Net>>,
+);
+
 /// Process-wide host state shared across every thread task of one Linux
 /// process.
 struct LinuxShared<CpuImpl, Net, StorageImpl, Space>
@@ -363,16 +537,21 @@ where
     timer: crate::Timer<CpuImpl>,
     spawner: crate::InstanceSpawner<CpuImpl>,
     runtime_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
+    exec_runtime: LinuxExecRuntime<CpuImpl, Net, StorageImpl>,
     read_serial: crate::SerialReader,
     write_serial: crate::DebugSerialWriter,
     output_mode: OutputMode,
     launched_instance: crate::RegisteredInstance,
     signal_state: WasixSignalState,
     container: Arc<crate::LinuxContainer<StorageImpl>>,
-    /// Keeps this process's container-local PID reserved until every thread
-    /// task has exited and dropped `LinuxShared`.
-    _process_guard: crate::ContainerProcessGuard,
     grants: LinuxGrants,
+    /// Process-wide terminal state (`termios`, window size, stream TTY flags).
+    /// Never held across `.await`.
+    tty: spin::Mutex<LinuxTtyState>,
+    /// Bytes drained from the debug serial ring during non-blocking reads or
+    /// readiness checks so `poll`/`epoll`/`read(O_NONBLOCK)` never drop input.
+    /// Never held across `.await`.
+    serial_peek: spin::Mutex<Vec<u8>>,
     /// The process's view of wall time, which `clock_settime` moves as
     /// WASIX's `clock_time_set` moves a program's. Never held across `.await`.
     clock: spin::Mutex<crate::KernelClock<CpuImpl, HostRuntimeState<CpuImpl, Net, StorageImpl>>>,
@@ -392,6 +571,10 @@ where
     /// First host-level failure (user memory exhaustion or instance kill)
     /// observed on any thread of the process.
     fatal_error: spin::Mutex<Option<ProgramExecError>>,
+    /// Prepared `execve`/`execveat` handoff submitted by any thread of the
+    /// process; first caller wins, condemns sibling threads, and the process
+    /// driver commits the replacement once every thread task has drained.
+    exec_handoff: spin::Mutex<Option<ExecHandoff<CpuImpl, Net, StorageImpl>>>,
     /// Detached thread tasks still executing or dropping their process/space
     /// handles.
     running_tasks: AtomicUsize,
@@ -424,6 +607,39 @@ where
 
     fn take_fatal(&self) -> Option<ProgramExecError> {
         self.fatal_error.lock().take()
+    }
+
+    fn pull_serial_into_peek(&self, max_bytes: usize) -> bool {
+        let mut peek = self.serial_peek.lock();
+        if !peek.is_empty() {
+            return true;
+        }
+        let mut scratch = Vec::new();
+        (self.read_serial)(
+            &mut scratch,
+            u32::try_from(max_bytes.max(1)).unwrap_or(u32::MAX),
+        );
+        if scratch.is_empty() {
+            return false;
+        }
+        peek.extend_from_slice(&scratch);
+        true
+    }
+
+    fn take_serial_peek(&self, limit: usize) -> Option<Bytes> {
+        let mut peek = self.serial_peek.lock();
+        if peek.is_empty() {
+            let mut scratch = Vec::new();
+            (self.read_serial)(&mut scratch, u32::try_from(limit).unwrap_or(u32::MAX));
+            if scratch.is_empty() {
+                return None;
+            }
+            peek.extend_from_slice(&scratch);
+        }
+        let take = peek.len().min(limit);
+        let bytes = Bytes::copy_from_slice(&peek[..take]);
+        peek.drain(..take);
+        Some(bytes)
     }
 
     async fn wait_tasks_drained(&self) {
@@ -461,8 +677,8 @@ where
     }
 }
 
-/// Per-thread host state: thread-local serial buffer, per-thread DRBG stream,
-/// and per-thread slice tick counter (`CLOCK_THREAD_CPUTIME_ID`).
+/// Per-thread host state: per-thread DRBG stream and per-thread slice tick
+/// counter (`CLOCK_THREAD_CPUTIME_ID`).
 struct LinuxThreadPlatform<CpuImpl, Net, StorageImpl, Space>
 where
     CpuImpl: Cpu + Clone,
@@ -470,7 +686,6 @@ where
     StorageImpl: crate::Storage,
 {
     shared: Arc<LinuxShared<CpuImpl, Net, StorageImpl, Space>>,
-    serial_input: Vec<u8>,
     entropy: crate::EntropyPool,
     thread_cpu_ticks: u64,
 }
@@ -487,7 +702,6 @@ where
             crate::EntropyPool::derive(shared.runtime_state.root_entropy(), personalization);
         Self {
             shared,
-            serial_input: Vec::new(),
             entropy,
             thread_cpu_ticks: 0,
         }
@@ -541,6 +755,44 @@ where
         }
     }
 
+    fn try_write(&mut self, stream: Stream, bytes: &[u8]) -> Result<usize, WriteError> {
+        let kind = match stream {
+            Stream::Stdout => crate::ComponentOutputStreamKind::Stdout,
+            Stream::Stderr => crate::ComponentOutputStreamKind::Stderr,
+        };
+        match self
+            .shared
+            .output_mode
+            .sink(kind, self.shared.launched_instance.id())
+        {
+            crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial)
+                if self.shared.grants.terminal_output.is_none() =>
+            {
+                Err(WriteError::Denied)
+            }
+            crate::ComponentOutputSink::Local(local) => {
+                let taken = local.write(
+                    &self.shared.cpu,
+                    &self.shared.runtime_state,
+                    self.shared.write_serial,
+                    bytes,
+                );
+                if taken == 0 && !bytes.is_empty() {
+                    Err(WriteError::WouldBlock)
+                } else {
+                    Ok(taken)
+                }
+            }
+            crate::ComponentOutputSink::Child(writer) => {
+                match writer.try_write(Bytes::copy_from_slice(bytes)) {
+                    TryWrite::Written => Ok(bytes.len()),
+                    TryWrite::Closed => Err(WriteError::Io),
+                    TryWrite::Full(_) => Err(WriteError::WouldBlock),
+                }
+            }
+        }
+    }
+
     async fn read_input(&mut self, limit: usize) -> Result<Bytes, Denied> {
         Ok(match self.shared.output_mode.stdin_route() {
             crate::ComponentInputRoute::Serial if self.shared.grants.terminal_input.is_none() => {
@@ -548,12 +800,8 @@ where
             }
             crate::ComponentInputRoute::Serial => loop {
                 let wait = self.shared.write_serial.wait_for_debug_serial_input();
-                (self.shared.read_serial)(
-                    &mut self.serial_input,
-                    u32::try_from(limit).unwrap_or(u32::MAX),
-                );
-                if !self.serial_input.is_empty() {
-                    break Bytes::copy_from_slice(&self.serial_input);
+                if let Some(bytes) = self.shared.take_serial_peek(limit) {
+                    break bytes;
                 }
                 wait.await;
             },
@@ -562,6 +810,989 @@ where
                 stdin_rx.read_limit(limit).await.unwrap_or_default()
             }
         })
+    }
+
+    fn try_read_input(&mut self, limit: usize) -> StdinTryRead {
+        match self.shared.output_mode.stdin_route() {
+            crate::ComponentInputRoute::Serial if self.shared.grants.terminal_input.is_none() => {
+                StdinTryRead::Denied
+            }
+            crate::ComponentInputRoute::Serial => match self.shared.take_serial_peek(limit) {
+                Some(bytes) => StdinTryRead::Ready(bytes),
+                None => StdinTryRead::WouldBlock,
+            },
+            crate::ComponentInputRoute::Closed => StdinTryRead::Eof,
+            crate::ComponentInputRoute::Child(stdin_rx) => match stdin_rx.try_read_limit(limit) {
+                TryRead::Ready(bytes) => StdinTryRead::Ready(bytes),
+                TryRead::Eof => StdinTryRead::Eof,
+                TryRead::Pending => StdinTryRead::WouldBlock,
+            },
+        }
+    }
+
+    fn stdin_ready_mask(&self) -> u32 {
+        match self.shared.output_mode.stdin_route() {
+            crate::ComponentInputRoute::Serial if self.shared.grants.terminal_input.is_none() => {
+                READY_ERR
+            }
+            crate::ComponentInputRoute::Serial => {
+                if self.shared.pull_serial_into_peek(4096) {
+                    READY_IN
+                } else {
+                    0
+                }
+            }
+            crate::ComponentInputRoute::Closed => READY_IN | READY_HUP,
+            crate::ComponentInputRoute::Child(stdin_rx) => {
+                (if stdin_rx.has_buffered_data() {
+                    READY_IN
+                } else {
+                    0
+                }) | (if stdin_rx.is_writer_closed() {
+                    READY_HUP
+                } else {
+                    0
+                })
+            }
+        }
+    }
+
+    async fn wait_stdin_ready(&self) {
+        match self.shared.output_mode.stdin_route() {
+            crate::ComponentInputRoute::Serial if self.shared.grants.terminal_input.is_none() => {}
+            crate::ComponentInputRoute::Serial => loop {
+                let wait = self.shared.write_serial.wait_for_debug_serial_input();
+                if self.shared.pull_serial_into_peek(4096) {
+                    return;
+                }
+                wait.await;
+            },
+            crate::ComponentInputRoute::Closed => {}
+            crate::ComponentInputRoute::Child(stdin_rx) => {
+                let mut wait = stdin_rx.wait_state();
+                core::future::poll_fn(|cx| stdin_rx.poll_readable(cx, &mut wait)).await;
+            }
+        }
+    }
+
+    fn stdout_ready_mask(&self, stream: Stream) -> u32 {
+        let kind = match stream {
+            Stream::Stdout => crate::ComponentOutputStreamKind::Stdout,
+            Stream::Stderr => crate::ComponentOutputStreamKind::Stderr,
+        };
+        match self
+            .shared
+            .output_mode
+            .sink(kind, self.shared.launched_instance.id())
+        {
+            crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial)
+                if self.shared.grants.terminal_output.is_none() =>
+            {
+                READY_ERR
+            }
+            crate::ComponentOutputSink::Local(_) => READY_OUT,
+            crate::ComponentOutputSink::Child(writer) => {
+                if writer.is_reader_closed() {
+                    READY_ERR
+                } else if writer.is_writable() {
+                    READY_OUT
+                } else {
+                    0
+                }
+            }
+        }
+    }
+}
+
+fn node_kind_to_component(kind: NodeKind) -> ComponentFsNodeKind {
+    match kind {
+        NodeKind::Directory => ComponentFsNodeKind::Directory,
+        NodeKind::File => ComponentFsNodeKind::File,
+        NodeKind::Symlink => ComponentFsNodeKind::Symlink,
+        NodeKind::CharacterDevice => ComponentFsNodeKind::CharacterDevice,
+        NodeKind::BlockDevice => ComponentFsNodeKind::BlockDevice,
+        NodeKind::Fifo => ComponentFsNodeKind::Fifo,
+        NodeKind::Socket => ComponentFsNodeKind::Socket,
+    }
+}
+
+fn join_synthetic_etc_path(base_dir: &str, path: &str) -> Option<(String, bool)> {
+    // Reject `..` components so `/nonexistent/../etc/hosts` cannot lexically
+    // collapse onto a synthetic `/etc` entry.
+    if path.split('/').any(|seg| seg == "..") {
+        return None;
+    }
+    let trailing_slash = path.ends_with('/');
+    let combined = if path.starts_with('/') {
+        String::from(path)
+    } else if base_dir.ends_with('/') {
+        alloc::format!("{base_dir}{path}")
+    } else {
+        alloc::format!("{base_dir}/{path}")
+    };
+    Some((combined, trailing_slash))
+}
+
+fn synthetic_etc_open<StorageImpl: crate::Storage>(
+    container: &crate::LinuxContainer<StorageImpl>,
+    base_dir: &str,
+    path: &str,
+    servers: &[crate::NetworkIpAddress],
+    request: OpenRequest,
+) -> Result<FsDescriptor, FsError> {
+    let Some((combined, trailing_slash)) = join_synthetic_etc_path(base_dir, path) else {
+        return Err(FsError::NoEntry);
+    };
+    if container.synthetic_etc_file(&combined, servers).is_none() {
+        return Err(FsError::NoEntry);
+    }
+    if trailing_slash || request.directory {
+        return Err(FsError::NotDirectory);
+    }
+    if request.create && request.exclusive {
+        return Err(FsError::Exists);
+    }
+    if request.write || request.truncate {
+        return Err(FsError::ReadOnly);
+    }
+    let mut flags = FsDescriptorFlags::empty();
+    if request.read {
+        flags |= FsDescriptorFlags::READ;
+    }
+    Ok(FsDescriptor {
+        path: combined,
+        kind: ComponentFsNodeKind::File,
+        flags,
+        identity: None,
+        mount: None,
+        open: None,
+    })
+}
+
+fn synthetic_etc_stat_lookup<StorageImpl: crate::Storage>(
+    container: &crate::LinuxContainer<StorageImpl>,
+    base_dir: &str,
+    path: &str,
+    servers: &[crate::NetworkIpAddress],
+) -> Result<(FileStat, String), FsError> {
+    let Some((combined, trailing_slash)) = join_synthetic_etc_path(base_dir, path) else {
+        return Err(FsError::NoEntry);
+    };
+    let Some(bytes) = container.synthetic_etc_file(&combined, servers) else {
+        return Err(FsError::NoEntry);
+    };
+    if trailing_slash {
+        return Err(FsError::NotDirectory);
+    }
+    Ok((synthetic_etc_stat(&combined, bytes.len() as u64), combined))
+}
+
+fn synthetic_etc_access_lookup<StorageImpl: crate::Storage>(
+    container: &crate::LinuxContainer<StorageImpl>,
+    base_dir: &str,
+    path: &str,
+    servers: &[crate::NetworkIpAddress],
+    check: AccessCheck,
+) -> Result<(), FsError> {
+    let Some((combined, trailing_slash)) = join_synthetic_etc_path(base_dir, path) else {
+        return Err(FsError::NoEntry);
+    };
+    if container.synthetic_etc_file(&combined, servers).is_none() {
+        return Err(FsError::NoEntry);
+    }
+    if trailing_slash {
+        return Err(FsError::NotDirectory);
+    }
+    if check.write {
+        return Err(FsError::ReadOnly);
+    }
+    if check.exec {
+        return Err(FsError::NotPermitted);
+    }
+    Ok(())
+}
+
+fn synthetic_etc_stat(path: &str, size: u64) -> FileStat {
+    let ino = if path.ends_with("/resolv.conf") { 1 } else { 2 };
+    FileStat {
+        dev: u64::MAX,
+        ino,
+        kind: NodeKind::File,
+        permissions: 0o444,
+        nlink: 1,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        size,
+        access_nanos: 0,
+        modified_nanos: 0,
+        status_nanos: 0,
+    }
+}
+
+fn container_info_to_stat(info: &crate::ContainerNodeInfo) -> FileStat {
+    FileStat {
+        dev: info.metadata.id.device.raw(),
+        ino: info.metadata.id.inode,
+        kind: info.metadata.kind,
+        permissions: info.unix.permissions,
+        nlink: info.metadata.link_count,
+        uid: info.unix.uid,
+        gid: info.unix.gid,
+        rdev: info.rdev,
+        size: info.metadata.size,
+        access_nanos: info.metadata.access_nanos,
+        modified_nanos: info.metadata.modified_nanos,
+        status_nanos: info.metadata.status_nanos,
+    }
+}
+
+impl<CpuImpl, Net, StorageImpl, Space: UserSpace> Tty
+    for LinuxThreadPlatform<CpuImpl, Net, StorageImpl, Space>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn is_tty(&self, stream: TtyStream) -> bool {
+        self.shared.tty.lock().is_tty(stream)
+    }
+
+    fn get_termios(&self, stream: TtyStream) -> Result<Termios, TtyError> {
+        let state = self.shared.tty.lock();
+        if !state.is_tty(stream) {
+            return Err(TtyError::NotTty);
+        }
+        Ok(state.termios)
+    }
+
+    fn set_termios(
+        &mut self,
+        stream: TtyStream,
+        termios: Termios,
+        action: TermiosAction,
+    ) -> Result<(), TtyError> {
+        let mut state = self.shared.tty.lock();
+        if !state.is_tty(stream) {
+            return Err(TtyError::NotTty);
+        }
+        if self.shared.grants.tty_control.is_none() {
+            return Err(TtyError::Denied);
+        }
+        state.termios = termios;
+        drop(state);
+        if action == TermiosAction::Flush {
+            self.shared.serial_peek.lock().clear();
+        }
+        Ok(())
+    }
+
+    fn get_winsize(&self, stream: TtyStream) -> Result<Winsize, TtyError> {
+        let state = self.shared.tty.lock();
+        if !state.is_tty(stream) {
+            return Err(TtyError::NotTty);
+        }
+        Ok(state.winsize)
+    }
+
+    fn set_winsize(&mut self, stream: TtyStream, winsize: Winsize) -> Result<(), TtyError> {
+        let mut state = self.shared.tty.lock();
+        if !state.is_tty(stream) {
+            return Err(TtyError::NotTty);
+        }
+        if self.shared.grants.tty_control.is_none() {
+            return Err(TtyError::Denied);
+        }
+        state.winsize = winsize;
+        Ok(())
+    }
+}
+
+impl<CpuImpl, Net, StorageImpl, Space: UserSpace> Filesystem<LinuxResources<Net>>
+    for LinuxThreadPlatform<CpuImpl, Net, StorageImpl, Space>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn file_access(&self, file: &FsDescriptor) -> FileAccess {
+        let read = file.flags.contains(FsDescriptorFlags::READ);
+        let write = file.flags.contains(FsDescriptorFlags::WRITE);
+        match (read, write) {
+            (true, true) => FileAccess::ReadWrite,
+            (true, false) => FileAccess::ReadOnly,
+            (false, true) => FileAccess::WriteOnly,
+            (false, false) => FileAccess::PathOnly,
+        }
+    }
+
+    fn file_is_directory(&self, file: &FsDescriptor) -> bool {
+        file.kind == ComponentFsNodeKind::Directory
+    }
+
+    fn file_path<'a>(&self, file: &'a FsDescriptor) -> Option<&'a str> {
+        Some(&file.path)
+    }
+
+    fn can_exec_file(&self, file: &FsDescriptor) -> bool {
+        self.shared.container.filesystem().can_exec(&file.path)
+    }
+
+    fn same_file(&self, a: &FsDescriptor, b: &FsDescriptor) -> bool {
+        match (a.identity, b.identity) {
+            (Some(ia), Some(ib)) => ia == ib,
+            _ => a.path == b.path,
+        }
+    }
+
+    async fn open(
+        &mut self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        request: OpenRequest,
+        creds: &syscall::Credentials,
+    ) -> Result<FsDescriptor, syscall::FsOpError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        let opened = self
+            .shared
+            .container
+            .filesystem()
+            .open_at(base_dir, path, request, creds, now)
+            .await;
+        let (info, container_path, mount_hold) = match opened {
+            Ok(ok) => ok,
+            Err(syscall::FsOpError::Fs(FsError::NoEntry)) => {
+                let servers = self
+                    .shared
+                    .runtime_state
+                    .network_service()
+                    .map(|service| service.dns_servers())
+                    .unwrap_or_default();
+                return synthetic_etc_open(
+                    &self.shared.container,
+                    base_dir,
+                    path,
+                    &servers,
+                    request,
+                )
+                .map_err(Into::into);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut flags = FsDescriptorFlags::empty();
+        if request.read {
+            flags |= FsDescriptorFlags::READ;
+        }
+        if request.write {
+            flags |= FsDescriptorFlags::WRITE;
+        }
+        if request.sync {
+            flags |= FsDescriptorFlags::FILE_INTEGRITY_SYNC;
+        }
+        if request.dsync {
+            flags |= FsDescriptorFlags::DATA_INTEGRITY_SYNC;
+        }
+        if info.metadata.kind == NodeKind::Directory {
+            flags |= FsDescriptorFlags::MUTATE_DIRECTORY;
+        }
+        Ok(FsDescriptor {
+            path: container_path,
+            kind: node_kind_to_component(info.metadata.kind),
+            flags,
+            identity: Some(crate::vfs::object_identity(&info.metadata)),
+            mount: mount_hold,
+            open: None,
+        })
+    }
+
+    async fn stat_path(
+        &self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        follow: bool,
+        creds: &syscall::Credentials,
+    ) -> Result<(FileStat, String), syscall::FsOpError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        match self
+            .shared
+            .container
+            .filesystem()
+            .stat_at(base_dir, path, follow, creds)
+            .await
+        {
+            Ok((info, resolved_path)) => Ok((container_info_to_stat(&info), resolved_path)),
+            Err(syscall::FsOpError::Fs(FsError::NoEntry)) => {
+                let servers = self
+                    .shared
+                    .runtime_state
+                    .network_service()
+                    .map(|service| service.dns_servers())
+                    .unwrap_or_default();
+                synthetic_etc_stat_lookup(&self.shared.container, base_dir, path, &servers)
+                    .map_err(Into::into)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn stat_file(&self, file: &FsDescriptor) -> Result<FileStat, syscall::FsOpError> {
+        match self
+            .shared
+            .container
+            .filesystem()
+            .stat_resolved(&file.path)
+            .await
+        {
+            Ok(info) => Ok(container_info_to_stat(&info)),
+            Err(syscall::FsOpError::Fs(FsError::NoEntry)) => {
+                let servers = self
+                    .shared
+                    .runtime_state
+                    .network_service()
+                    .map(|service| service.dns_servers())
+                    .unwrap_or_default();
+                if let Some(bytes) = self
+                    .shared
+                    .container
+                    .synthetic_etc_file(&file.path, &servers)
+                {
+                    return Ok(synthetic_etc_stat(&file.path, bytes.len() as u64));
+                }
+                Err(FsError::NoEntry.into())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn access_path(
+        &self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        check: AccessCheck,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        match self
+            .shared
+            .container
+            .filesystem()
+            .access_at(base_dir, path, check, creds)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(syscall::FsOpError::Fs(FsError::NoEntry)) => {
+                let servers = self
+                    .shared
+                    .runtime_state
+                    .network_service()
+                    .map(|service| service.dns_servers())
+                    .unwrap_or_default();
+                synthetic_etc_access_lookup(&self.shared.container, base_dir, path, &servers, check)
+                    .map_err(Into::into)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn can_chdir_file(
+        &self,
+        file: &FsDescriptor,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        self.shared
+            .container
+            .filesystem()
+            .can_chdir(&file.path, creds)
+            .await
+    }
+
+    async fn read_at(
+        &self,
+        file: &FsDescriptor,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<Bytes, syscall::FsOpError> {
+        match self
+            .shared
+            .container
+            .filesystem()
+            .read_at(&file.path, offset, max_bytes)
+            .await
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(syscall::FsOpError::Fs(FsError::NoEntry)) => {
+                let servers = self
+                    .shared
+                    .runtime_state
+                    .network_service()
+                    .map(|service| service.dns_servers())
+                    .unwrap_or_default();
+                if let Some(bytes) = self
+                    .shared
+                    .container
+                    .synthetic_etc_file(&file.path, &servers)
+                {
+                    let start = usize::try_from(offset)
+                        .unwrap_or(bytes.len())
+                        .min(bytes.len());
+                    let end = start.saturating_add(max_bytes).min(bytes.len());
+                    return Ok(Bytes::copy_from_slice(&bytes[start..end]));
+                }
+                Err(FsError::NoEntry.into())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn write_at(
+        &mut self,
+        file: &FsDescriptor,
+        position: WritePosition,
+        bytes: &[u8],
+        creds: &syscall::Credentials,
+    ) -> Result<Landed, syscall::FsOpError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .write_at(&file.path, position, bytes, creds, now)
+            .await
+    }
+
+    async fn list_dir(
+        &self,
+        file: &FsDescriptor,
+    ) -> Result<(u64, u64, Vec<DirListEntry>), syscall::FsOpError> {
+        let (self_ino, parent_ino, entries) = self
+            .shared
+            .container
+            .filesystem()
+            .list_with_inodes(&file.path)
+            .await?;
+        let out = entries
+            .into_iter()
+            .map(|entry| DirListEntry {
+                name: entry.name,
+                kind: entry.kind,
+                inode: entry.inode,
+            })
+            .collect();
+        Ok((self_ino, parent_ino, out))
+    }
+
+    async fn set_size_file(
+        &mut self,
+        file: &FsDescriptor,
+        size: u64,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .set_size(&file.path, size, creds, now)
+            .await
+    }
+
+    async fn set_size_path(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        size: u64,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .set_size_at(cwd, path, size, creds, now)
+            .await
+    }
+
+    async fn sync(&self, file: &FsDescriptor, data_only: bool) -> Result<(), syscall::FsOpError> {
+        self.shared
+            .container
+            .filesystem()
+            .sync(&file.path, data_only)
+            .await
+    }
+
+    async fn read_link(
+        &self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        creds: &syscall::Credentials,
+    ) -> Result<String, syscall::FsOpError> {
+        if self.shared.grants.symlink_read.is_none() {
+            return Err(FsError::NotPermitted.into());
+        }
+        if path.is_empty() {
+            let Some(file) = base else {
+                return Err(FsError::NoEntry.into());
+            };
+            return self
+                .shared
+                .container
+                .filesystem()
+                .read_link_resolved(&file.path)
+                .await;
+        }
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        self.shared
+            .container
+            .filesystem()
+            .read_link_at(base_dir, path, creds)
+            .await
+    }
+
+    async fn mkdir(
+        &mut self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        mode: u32,
+        umask: u32,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .mkdir_at(base_dir, path, mode, umask, creds, now)
+            .await
+    }
+
+    async fn mknod(
+        &mut self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        kind: NodeKind,
+        mode: u32,
+        umask: u32,
+        rdev: u64,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .mknod_at(base_dir, path, kind, mode, umask, rdev, creds, now)
+            .await
+    }
+
+    async fn unlink(
+        &mut self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        remove_dir: bool,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .unlink_at(base_dir, path, remove_dir, creds, now)
+            .await
+    }
+
+    async fn rename(
+        &mut self,
+        old_base: Option<&FsDescriptor>,
+        old_path: &str,
+        new_base: Option<&FsDescriptor>,
+        new_path: &str,
+        cwd: &str,
+        mode: RenameMode,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let old_dir = old_base.map_or(cwd, |f| f.path.as_str());
+        let new_dir = new_base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .rename_at(old_dir, old_path, new_dir, new_path, mode, creds, now)
+            .await
+    }
+
+    async fn link(
+        &mut self,
+        old_base: Option<&FsDescriptor>,
+        old_path: &str,
+        new_base: Option<&FsDescriptor>,
+        new_path: &str,
+        cwd: &str,
+        options: LinkOptions,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        if self.shared.grants.link_source.is_none() {
+            return Err(FsError::NotPermitted.into());
+        }
+        let old_dir = old_base.map_or(cwd, |f| f.path.as_str());
+        let new_dir = new_base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .link_at(
+                old_dir,
+                old_path,
+                new_dir,
+                new_path,
+                options.follow,
+                options.empty_path,
+                creds,
+                now,
+            )
+            .await
+    }
+
+    async fn symlink(
+        &mut self,
+        target: &str,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        link_path: &str,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        if self.shared.grants.symlink_create.is_none() {
+            return Err(FsError::NotPermitted.into());
+        }
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .symlink_at(target, base_dir, link_path, creds, now)
+            .await
+    }
+
+    async fn set_times_path(
+        &mut self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        follow: bool,
+        access: TimeUpdate,
+        modified: TimeUpdate,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .set_times_at(base_dir, path, follow, access, modified, creds, now)
+            .await
+    }
+
+    async fn set_times_file(
+        &mut self,
+        file: &FsDescriptor,
+        access: TimeUpdate,
+        modified: TimeUpdate,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .set_times_resolved(&file.path, access, modified, creds, now)
+            .await
+    }
+
+    async fn chmod_path(
+        &mut self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        follow: bool,
+        mode: u32,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .chmod_at(base_dir, path, follow, mode, creds, now)
+            .await
+    }
+
+    async fn chmod_file(
+        &mut self,
+        file: &FsDescriptor,
+        mode: u32,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .chmod_resolved(&file.path, mode, creds, now)
+            .await
+    }
+
+    async fn chown_path(
+        &mut self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        follow: bool,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .chown_at(base_dir, path, follow, uid, gid, creds, now)
+            .await
+    }
+
+    async fn chown_file(
+        &mut self,
+        file: &FsDescriptor,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .chown_resolved(&file.path, uid, gid, creds, now)
+            .await
+    }
+
+    async fn get_xattr_path(
+        &self,
+        cwd: &str,
+        path: &str,
+        follow: bool,
+        name: &str,
+        creds: &syscall::Credentials,
+    ) -> Result<Vec<u8>, syscall::FsOpError> {
+        self.shared
+            .container
+            .filesystem()
+            .get_xattr_at(cwd, path, follow, name, creds)
+            .await
+    }
+
+    async fn get_xattr_file(
+        &self,
+        file: &FsDescriptor,
+        name: &str,
+        creds: &syscall::Credentials,
+    ) -> Result<Vec<u8>, syscall::FsOpError> {
+        self.shared
+            .container
+            .filesystem()
+            .get_xattr_resolved(&file.path, name, creds)
+            .await
+    }
+
+    async fn set_xattr_path(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        follow: bool,
+        name: &str,
+        value: &[u8],
+        mode: syscall::XattrSetMode,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .set_xattr_at(cwd, path, follow, name, value, mode, creds, now)
+            .await
+    }
+
+    async fn set_xattr_file(
+        &mut self,
+        file: &FsDescriptor,
+        name: &str,
+        value: &[u8],
+        mode: syscall::XattrSetMode,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .set_xattr_resolved(&file.path, name, value, mode, creds, now)
+            .await
+    }
+
+    async fn list_xattrs_path(
+        &self,
+        cwd: &str,
+        path: &str,
+        follow: bool,
+        creds: &syscall::Credentials,
+    ) -> Result<Vec<String>, syscall::FsOpError> {
+        self.shared
+            .container
+            .filesystem()
+            .list_xattrs_at(cwd, path, follow, creds)
+            .await
+    }
+
+    async fn list_xattrs_file(
+        &self,
+        file: &FsDescriptor,
+        creds: &syscall::Credentials,
+    ) -> Result<Vec<String>, syscall::FsOpError> {
+        self.shared
+            .container
+            .filesystem()
+            .list_xattrs_resolved(&file.path, creds)
+            .await
+    }
+
+    async fn remove_xattr_path(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        follow: bool,
+        name: &str,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .remove_xattr_at(cwd, path, follow, name, creds, now)
+            .await
+    }
+
+    async fn remove_xattr_file(
+        &mut self,
+        file: &FsDescriptor,
+        name: &str,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .remove_xattr_resolved(&file.path, name, creds, now)
+            .await
     }
 }
 
@@ -664,7 +1895,1108 @@ where
     }
 }
 
-/// Calling thread's context view for `arch_prctl` and `clone` / `clone3`.
+fn linux_to_network_ip(ip: syscall::IpAddr) -> crate::NetworkIpAddress {
+    match ip {
+        syscall::IpAddr::V4(octets) => {
+            crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new(octets))
+        }
+        syscall::IpAddr::V6(octets) => {
+            crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::new(octets))
+        }
+    }
+}
+
+fn network_to_linux_ip(address: crate::NetworkIpAddress) -> syscall::IpAddr {
+    match address {
+        crate::NetworkIpAddress::Ipv4(addr) => syscall::IpAddr::V4(addr.octets()),
+        crate::NetworkIpAddress::Ipv6(addr) => syscall::IpAddr::V6(addr.octets()),
+    }
+}
+
+fn linux_errno_from_tcp_error(error: crate::TcpError) -> u64 {
+    const EACCES: u64 = 13;
+    const EIO: u64 = 5;
+    match error.detail {
+        crate::NetworkErrorDetail::AddressNotAvailable => return syscall::EADDRNOTAVAIL,
+        crate::NetworkErrorDetail::TcpRemotePortUnreachable => return syscall::ECONNREFUSED,
+        crate::NetworkErrorDetail::TcpRemoteNetworkUnreachable => return syscall::ENETUNREACH,
+        crate::NetworkErrorDetail::TcpRemoteHostUnreachable => return syscall::EHOSTUNREACH,
+        crate::NetworkErrorDetail::TcpRemoteCommunicationProhibited => return EACCES,
+        crate::NetworkErrorDetail::TcpClosedDuringConnect => return syscall::ECONNREFUSED,
+        crate::NetworkErrorDetail::TcpListenStartFailed => return syscall::EADDRINUSE,
+        crate::NetworkErrorDetail::TcpNoLongerWritable => return syscall::EPIPE,
+        _ => {}
+    }
+    match error.kind {
+        crate::TcpErrorKind::UnresolvedHost => syscall::EHOSTUNREACH,
+        crate::TcpErrorKind::Timeout => syscall::ETIMEDOUT,
+        crate::TcpErrorKind::ConnectionReset => syscall::ECONNRESET,
+        crate::TcpErrorKind::ConnectionAborted => syscall::ECONNABORTED,
+        crate::TcpErrorKind::PermissionDenied => EACCES,
+        crate::TcpErrorKind::Unavailable => syscall::ENETDOWN,
+        crate::TcpErrorKind::Internal => EIO,
+    }
+}
+
+fn linux_errno_from_udp_error(error: crate::UdpError) -> u64 {
+    const EACCES: u64 = 13;
+    const EIO: u64 = 5;
+    const EINVAL: u64 = 22;
+    const EOPNOTSUPP: u64 = 95;
+    match error.detail {
+        crate::NetworkErrorDetail::AddressNotAvailable
+        | crate::NetworkErrorDetail::UdpMulticastInterfaceUnavailable => {
+            return syscall::EADDRNOTAVAIL;
+        }
+        crate::NetworkErrorDetail::UdpPortInUse => return syscall::EADDRINUSE,
+        crate::NetworkErrorDetail::UdpDatagramTooLarge => return syscall::EMSGSIZE,
+        crate::NetworkErrorDetail::UdpRemotePortUnreachable => return syscall::ECONNREFUSED,
+        crate::NetworkErrorDetail::UdpRemoteNetworkUnreachable => return syscall::ENETUNREACH,
+        crate::NetworkErrorDetail::UdpRemoteHostUnreachable => return syscall::EHOSTUNREACH,
+        crate::NetworkErrorDetail::UdpRemoteCommunicationProhibited => return EACCES,
+        crate::NetworkErrorDetail::UnsupportedAddressFamily => return syscall::EAFNOSUPPORT,
+        crate::NetworkErrorDetail::UdpMulticastJoinFailed
+        | crate::NetworkErrorDetail::UdpMulticastLeaveFailed => return EINVAL,
+        _ => {}
+    }
+    match error.kind {
+        crate::UdpErrorKind::UnresolvedHost => syscall::EHOSTUNREACH,
+        crate::UdpErrorKind::Unsupported => EOPNOTSUPP,
+        crate::UdpErrorKind::Timeout => syscall::ETIMEDOUT,
+        crate::UdpErrorKind::PermissionDenied => EACCES,
+        crate::UdpErrorKind::Unavailable => syscall::ENETDOWN,
+        crate::UdpErrorKind::Internal => EIO,
+    }
+}
+
+impl<CpuImpl, Net, StorageImpl, Space: UserSpace> syscall::Network<crate::UnixNetwork<Net>>
+    for LinuxThreadPlatform<CpuImpl, Net, StorageImpl, Space>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn to_ip(&self, address: crate::NetworkIpAddress) -> syscall::IpAddr {
+        network_to_linux_ip(address)
+    }
+
+    fn encode_ip(&self, ip: syscall::IpAddr) -> crate::NetworkIpAddress {
+        linux_to_network_ip(ip)
+    }
+
+    fn check_tcp_open(&self) -> Result<(), u64> {
+        const EACCES: u64 = 13;
+        if self.shared.grants.tcp.is_none() {
+            return Err(EACCES);
+        }
+        if self.shared.runtime_state.network_service().is_none() {
+            return Err(syscall::ENETDOWN);
+        }
+        Ok(())
+    }
+
+    fn check_udp_open(&self) -> Result<(), u64> {
+        const EACCES: u64 = 13;
+        if self.shared.grants.udp.is_none() {
+            return Err(EACCES);
+        }
+        if self.shared.runtime_state.network_service().is_none() {
+            return Err(syscall::ENETDOWN);
+        }
+        Ok(())
+    }
+
+    fn check_tcp_bind(&self, local_port: u16) -> Result<(), u64> {
+        const EACCES: u64 = 13;
+        self.check_tcp_open()?;
+        if local_port != 0 && local_port < 1024 && self.shared.grants.privileged_bind.is_none() {
+            return Err(EACCES);
+        }
+        Ok(())
+    }
+
+    fn check_udp_bind(&self, local_port: u16) -> Result<(), u64> {
+        const EACCES: u64 = 13;
+        self.check_udp_open()?;
+        if local_port != 0 && local_port < 1024 && self.shared.grants.privileged_bind.is_none() {
+            return Err(EACCES);
+        }
+        Ok(())
+    }
+
+    async fn tcp_listen(
+        &self,
+        local: syscall::SocketAddr,
+        backlog: u16,
+        hop_limit: u8,
+    ) -> Result<(Arc<OwnedTcpListener<crate::UnixNetwork<Net>>>, u16), u64> {
+        self.check_tcp_bind(local.port)?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let bound = service
+            .tcp_listen(
+                linux_to_network_ip(local.ip),
+                local.port,
+                backlog,
+                hop_limit,
+            )
+            .await
+            .map_err(linux_errno_from_tcp_error)?;
+        let owned = OwnedTcpListener::new(crate::UnixNetwork::new(service), bound.listener);
+        Ok((owned, bound.local_port))
+    }
+
+    async fn tcp_accept(
+        &self,
+        listener: Net::TcpListener,
+        timeout_nanos: u64,
+    ) -> Result<
+        (
+            Arc<OwnedTcpStream<crate::UnixNetwork<Net>>>,
+            syscall::SocketAddr,
+        ),
+        u64,
+    > {
+        self.check_tcp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let accepted = service
+            .tcp_accept(listener, timeout_nanos)
+            .await
+            .map_err(linux_errno_from_tcp_error)?;
+        let owned = OwnedTcpStream::new(crate::UnixNetwork::new(service), accepted.stream);
+        Ok((
+            owned,
+            syscall::SocketAddr {
+                ip: network_to_linux_ip(accepted.address),
+                port: accepted.port,
+            },
+        ))
+    }
+
+    async fn tcp_connect(
+        &self,
+        remote: syscall::SocketAddr,
+        local_port: u16,
+        hop_limit: u8,
+        timeout_nanos: u64,
+    ) -> Result<Arc<OwnedTcpStream<crate::UnixNetwork<Net>>>, u64> {
+        self.check_tcp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let stream = service
+            .tcp_connect_address(
+                linux_to_network_ip(remote.ip),
+                remote.port,
+                local_port,
+                hop_limit,
+                timeout_nanos,
+            )
+            .await
+            .map_err(linux_errno_from_tcp_error)?;
+        Ok(OwnedTcpStream::new(
+            crate::UnixNetwork::new(service),
+            stream,
+        ))
+    }
+
+    async fn tcp_connect_start(
+        &self,
+        remote: syscall::SocketAddr,
+        local_port: u16,
+        hop_limit: u8,
+    ) -> Result<
+        (
+            Arc<OwnedTcpStream<crate::UnixNetwork<Net>>>,
+            syscall::ConnectProgress,
+        ),
+        u64,
+    > {
+        self.check_tcp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let (stream, progress) = service
+            .tcp_connect_start(
+                linux_to_network_ip(remote.ip),
+                remote.port,
+                local_port,
+                hop_limit,
+            )
+            .await
+            .map_err(linux_errno_from_tcp_error)?;
+        let owned = OwnedTcpStream::new(crate::UnixNetwork::new(service), stream);
+        let progress = match progress {
+            crate::TcpConnectPoll::Pending => syscall::ConnectProgress::Pending,
+            crate::TcpConnectPoll::Connected => syscall::ConnectProgress::Connected,
+        };
+        Ok((owned, progress))
+    }
+
+    async fn tcp_connect_poll(
+        &self,
+        stream: Net::TcpStream,
+    ) -> Result<syscall::ConnectProgress, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        match service
+            .tcp_connect_poll(stream)
+            .await
+            .map_err(linux_errno_from_tcp_error)?
+        {
+            crate::TcpConnectPoll::Pending => Ok(syscall::ConnectProgress::Pending),
+            crate::TcpConnectPoll::Connected => Ok(syscall::ConnectProgress::Connected),
+        }
+    }
+
+    fn tcp_local_endpoint(
+        &self,
+        stream: Net::TcpStream,
+    ) -> Result<Option<syscall::SocketAddr>, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        Ok(service
+            .tcp_local_endpoint(stream)
+            .map_err(linux_errno_from_tcp_error)?
+            .map(|(ip, port)| syscall::SocketAddr {
+                ip: network_to_linux_ip(ip),
+                port,
+            }))
+    }
+
+    fn tcp_set_hop_limit(&self, stream: Net::TcpStream, hop_limit: u8) -> Result<(), u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .tcp_set_hop_limit(stream, hop_limit)
+            .map_err(linux_errno_from_tcp_error)
+    }
+
+    fn tcp_listener_set_hop_limit(
+        &self,
+        listener: Net::TcpListener,
+        hop_limit: u8,
+    ) -> Result<(), u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .tcp_listener_set_hop_limit(listener, hop_limit)
+            .map_err(linux_errno_from_tcp_error)
+    }
+
+    async fn tcp_read(
+        &self,
+        stream: Net::TcpStream,
+        max_bytes: u32,
+        timeout_nanos: u64,
+        peek: bool,
+    ) -> Result<Option<Bytes>, u64> {
+        self.check_tcp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        if !peek {
+            return service
+                .tcp_read(stream, max_bytes, timeout_nanos)
+                .await
+                .map_err(linux_errno_from_tcp_error);
+        }
+        let cap = (max_bytes as usize).min(65_536);
+        let mut storage = alloc::vec![0u8; cap];
+        let ranges = [(0usize, storage.len())];
+        // SAFETY: `storage` is a live, exclusively owned heap buffer that stays
+        // in place for the duration of `tcp_peek_into`, and no page of it can
+        // be swapped out (`residency = None`).
+        let mut buffer = unsafe {
+            crate::RegisteredTcpReadBuffer::new(storage.as_mut_ptr() as usize, &ranges, None)
+        };
+        match service
+            .tcp_peek_into(stream, &mut buffer, timeout_nanos)
+            .await
+            .map_err(linux_errno_from_tcp_error)?
+        {
+            crate::TcpReadInto::Data(n) => {
+                storage.truncate(n);
+                Ok(Some(Bytes::from(storage)))
+            }
+            crate::TcpReadInto::Eof => Ok(None),
+            crate::TcpReadInto::PageLost(_) => Err(5),
+        }
+    }
+
+    async fn tcp_write(
+        &self,
+        stream: Net::TcpStream,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> Result<usize, u64> {
+        self.check_tcp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .tcp_write_some_bytes(stream, bytes, timeout_nanos)
+            .await
+            .map_err(linux_errno_from_tcp_error)
+    }
+
+    async fn tcp_shutdown_send(&self, stream: Net::TcpStream) -> Result<(), u64> {
+        self.check_tcp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .tcp_shutdown_send(stream)
+            .await
+            .map_err(linux_errno_from_tcp_error)
+    }
+
+    async fn tcp_readiness(&self, stream: Net::TcpStream) -> Result<syscall::SocketReady, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let r = service
+            .tcp_readiness(stream)
+            .await
+            .map_err(linux_errno_from_tcp_error)?;
+        Ok(syscall::SocketReady {
+            readable: r.readable,
+            writable: r.writable,
+            hangup: r.hangup,
+        })
+    }
+
+    async fn tcp_listener_readiness(
+        &self,
+        listener: Net::TcpListener,
+    ) -> Result<syscall::SocketReady, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let r = service
+            .tcp_listener_readiness(listener)
+            .await
+            .map_err(linux_errno_from_tcp_error)?;
+        Ok(syscall::SocketReady {
+            readable: r.readable,
+            writable: r.writable,
+            hangup: r.hangup,
+        })
+    }
+
+    async fn udp_bind(
+        &self,
+        local: syscall::SocketAddr,
+        hop_limit: u8,
+    ) -> Result<(Arc<OwnedUdpSocket<crate::UnixNetwork<Net>>>, u16), u64> {
+        self.check_udp_bind(local.port)?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let bound = service
+            .udp_bind(linux_to_network_ip(local.ip), local.port)
+            .await
+            .map_err(linux_errno_from_udp_error)?;
+        let owned = OwnedUdpSocket::new(crate::UnixNetwork::new(service.clone()), bound.socket);
+        service
+            .udp_set_hop_limit(bound.socket, hop_limit)
+            .map_err(linux_errno_from_udp_error)?;
+        Ok((owned, bound.local_port))
+    }
+
+    fn udp_connect(&self, socket: Net::UdpSocket, remote: syscall::SocketAddr) -> Result<(), u64> {
+        self.check_udp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .udp_connect(socket, linux_to_network_ip(remote.ip), remote.port)
+            .map_err(linux_errno_from_udp_error)
+    }
+
+    fn udp_disconnect(&self, socket: Net::UdpSocket) -> Result<(), u64> {
+        self.check_udp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .udp_disconnect(socket)
+            .map_err(linux_errno_from_udp_error)
+    }
+
+    fn udp_set_hop_limit(&self, socket: Net::UdpSocket, hop_limit: u8) -> Result<(), u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .udp_set_hop_limit(socket, hop_limit)
+            .map_err(linux_errno_from_udp_error)
+    }
+
+    async fn udp_send<'a>(
+        &'a self,
+        socket: Net::UdpSocket,
+        remote: syscall::SocketAddr,
+        bytes: &'a [u8],
+        timeout_nanos: u64,
+    ) -> Result<usize, u64> {
+        self.check_udp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let sent = service
+            .udp_send_address(
+                socket,
+                linux_to_network_ip(remote.ip),
+                remote.port,
+                bytes,
+                timeout_nanos,
+            )
+            .await
+            .map_err(linux_errno_from_udp_error)?;
+        Ok(sent as usize)
+    }
+
+    async fn udp_receive(
+        &self,
+        socket: Net::UdpSocket,
+        max_bytes: u32,
+        timeout_nanos: u64,
+        peek: bool,
+    ) -> Result<Option<(Bytes, syscall::SocketAddr, usize)>, u64> {
+        self.check_udp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let datagram = if peek {
+            service
+                .udp_peek(socket, max_bytes, timeout_nanos)
+                .await
+                .map_err(linux_errno_from_udp_error)?
+        } else {
+            service
+                .udp_receive(socket, max_bytes, timeout_nanos)
+                .await
+                .map_err(linux_errno_from_udp_error)?
+        };
+        Ok(datagram.map(|d| {
+            (
+                d.bytes,
+                syscall::SocketAddr {
+                    ip: network_to_linux_ip(d.address),
+                    port: d.port,
+                },
+                d.original_len,
+            )
+        }))
+    }
+
+    async fn udp_readiness(&self, socket: Net::UdpSocket) -> Result<syscall::SocketReady, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let r = service
+            .udp_readiness(socket)
+            .await
+            .map_err(linux_errno_from_udp_error)?;
+        Ok(syscall::SocketReady {
+            readable: r.readable,
+            writable: r.writable,
+            hangup: r.hangup,
+        })
+    }
+
+    async fn udp_join_multicast_v4(&self, group: [u8; 4], interface: [u8; 4]) -> Result<(), u64> {
+        const EACCES: u64 = 13;
+        if self.shared.grants.multicast.is_none() {
+            return Err(EACCES);
+        }
+        self.check_udp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .udp_join_multicast_v4(
+                crate::Ipv4Address::new(group),
+                crate::Ipv4Address::new(interface),
+            )
+            .await
+            .map_err(linux_errno_from_udp_error)
+    }
+
+    async fn udp_leave_multicast_v4(&self, group: [u8; 4], interface: [u8; 4]) -> Result<(), u64> {
+        const EACCES: u64 = 13;
+        if self.shared.grants.multicast.is_none() {
+            return Err(EACCES);
+        }
+        self.check_udp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .udp_leave_multicast_v4(
+                crate::Ipv4Address::new(group),
+                crate::Ipv4Address::new(interface),
+            )
+            .await
+            .map_err(linux_errno_from_udp_error)
+    }
+
+    fn check_multicast_v6(&self) -> Result<(), u64> {
+        const EACCES: u64 = 13;
+        if self.shared.grants.multicast.is_none() {
+            return Err(EACCES);
+        }
+        self.check_udp_open()
+    }
+
+    async fn interface_mac(&self) -> Result<[u8; 6], u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .mac_address(NetworkPortId::new(0))
+            .await
+            .map(crate::MacAddress::octets)
+            .map_err(linux_errno_from_control_error)
+    }
+
+    async fn list_ipv4_addresses(&self) -> Result<Vec<syscall::Ipv4InterfaceAddress>, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let addrs = service
+            .list_addresses(NetworkPortId::new(0))
+            .await
+            .map_err(linux_errno_from_control_error)?;
+        Ok(addrs
+            .into_iter()
+            .map(|cidr| syscall::Ipv4InterfaceAddress {
+                address: cidr.address().octets(),
+                prefix: cidr.prefix_len(),
+            })
+            .collect())
+    }
+
+    async fn add_ipv4_address(&self, address: syscall::Ipv4InterfaceAddress) -> Result<(), u64> {
+        self.check_net_admin()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let cidr = KernelIpv4Cidr::new(crate::Ipv4Address::new(address.address), address.prefix);
+        service
+            .add_address(NetworkPortId::new(0), cidr)
+            .await
+            .map_err(linux_errno_from_control_error)
+    }
+
+    async fn remove_ipv4_address(&self, address: syscall::Ipv4InterfaceAddress) -> Result<(), u64> {
+        self.check_net_admin()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let cidr = KernelIpv4Cidr::new(crate::Ipv4Address::new(address.address), address.prefix);
+        service
+            .remove_address(NetworkPortId::new(0), cidr)
+            .await
+            .map_err(linux_errno_from_control_error)
+    }
+
+    async fn list_ipv4_routes(&self) -> Result<Vec<syscall::Ipv4RouteEntry>, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let routes = service
+            .list_routes(NetworkPortId::new(0))
+            .await
+            .map_err(linux_errno_from_control_error)?;
+        Ok(routes
+            .into_iter()
+            .map(|route| {
+                let gw = route.gateway().octets();
+                syscall::Ipv4RouteEntry {
+                    destination: route.destination().address().octets(),
+                    prefix: route.destination().prefix_len(),
+                    gateway: if gw == [0, 0, 0, 0] { None } else { Some(gw) },
+                }
+            })
+            .collect())
+    }
+
+    async fn add_ipv4_route(&self, route: syscall::Ipv4RouteEntry) -> Result<(), u64> {
+        self.check_net_admin()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let cidr = KernelIpv4Cidr::new(crate::Ipv4Address::new(route.destination), route.prefix);
+        let gw = crate::Ipv4Address::new(route.gateway.unwrap_or([0, 0, 0, 0]));
+        service
+            .add_route(NetworkPortId::new(0), KernelIpv4Route::new(cidr, gw))
+            .await
+            .map_err(linux_errno_from_control_error)
+    }
+
+    async fn remove_ipv4_route(&self, route: syscall::Ipv4RouteEntry) -> Result<(), u64> {
+        self.check_net_admin()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let cidr = KernelIpv4Cidr::new(crate::Ipv4Address::new(route.destination), route.prefix);
+        let gw = crate::Ipv4Address::new(route.gateway.unwrap_or([0, 0, 0, 0]));
+        service
+            .remove_route(NetworkPortId::new(0), KernelIpv4Route::new(cidr, gw))
+            .await
+            .map_err(linux_errno_from_control_error)
+    }
+
+    fn check_net_admin(&self) -> Result<(), u64> {
+        const EPERM: u64 = 1;
+        if self.shared.grants.network_admin.is_none() {
+            return Err(EPERM);
+        }
+        Ok(())
+    }
+
+    fn packet_open(
+        &self,
+        protocol: u16,
+    ) -> Result<Arc<helios_unix::OwnedPacketSocket<crate::UnixNetwork<Net>>>, u64> {
+        self.check_net_admin()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let id = service
+            .packet_open(protocol)
+            .map_err(linux_errno_from_udp_error)?;
+        Ok(helios_unix::OwnedPacketSocket::new(
+            crate::UnixNetwork::new(service),
+            id,
+        ))
+    }
+
+    fn packet_bind(&self, socket: u64, protocol: u16, ifindex: u32) -> Result<(), u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .packet_bind(socket, protocol, ifindex)
+            .map_err(linux_errno_from_udp_error)
+    }
+
+    async fn packet_send<'a>(
+        &'a self,
+        socket: u64,
+        ifindex: u32,
+        frame: &'a [u8],
+    ) -> Result<usize, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .packet_send(socket, ifindex, frame)
+            .await
+            .map_err(linux_errno_from_udp_error)
+    }
+
+    async fn packet_receive(
+        &self,
+        socket: u64,
+        max_bytes: u32,
+        timeout_nanos: u64,
+        peek: bool,
+    ) -> Result<Option<syscall::PacketFrameData>, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let frame = service
+            .packet_receive(socket, max_bytes, timeout_nanos, peek)
+            .await
+            .map_err(linux_errno_from_udp_error)?;
+        Ok(frame.map(|f| syscall::PacketFrameData {
+            ifindex: f.ifindex,
+            protocol: f.protocol,
+            bytes: f.bytes,
+            original_len: f.original_len,
+        }))
+    }
+
+    async fn packet_readiness(&self, socket: u64) -> Result<syscall::SocketReady, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let ready = service
+            .packet_readiness(socket)
+            .await
+            .map_err(linux_errno_from_udp_error)?;
+        Ok(syscall::SocketReady {
+            readable: ready.readable,
+            writable: ready.writable,
+            hangup: ready.hangup,
+        })
+    }
+}
+
+fn linux_errno_from_control_error(error: NetworkControlError) -> u64 {
+    const EINVAL: u64 = 22;
+    const EIO: u64 = 5;
+    const EOPNOTSUPP: u64 = 95;
+    match error {
+        NetworkControlError::PortUnavailable => syscall::ENODEV,
+        NetworkControlError::BridgeUnavailable => EOPNOTSUPP,
+        NetworkControlError::InvalidBridgeRequest
+        | NetworkControlError::InvalidAddress
+        | NetworkControlError::InvalidRoute
+        | NetworkControlError::RouteTimestampOutOfRange => EINVAL,
+        NetworkControlError::BackendFault => EIO,
+    }
+}
+
+/// Parses a `#!` script header (`fs/binfmt_script.c`): returns
+/// `(interpreter, optional_argument)` from the first line (up to 256 bytes).
+fn parse_shebang(bytes: &[u8]) -> Option<(String, Option<String>)> {
+    if !bytes.starts_with(b"#!") {
+        return None;
+    }
+    let line = bytes[2..].split(|&b| b == b'\n').next().unwrap_or(&[]);
+    let line = &line[..line.len().min(256)];
+    let trimmed = core::str::from_utf8(line)
+        .ok()?
+        .trim_matches([' ', '\t', '\r']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut split = trimmed.splitn(2, [' ', '\t']);
+    let interp = split.next()?.to_owned();
+    let arg = split
+        .next()
+        .map(|s| s.trim_matches([' ', '\t']))
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    Some((interp, arg))
+}
+
+fn map_fs_error_to_exec(error: helios_hal::fs::FsError) -> ExecError {
+    use helios_hal::fs::FsError;
+    match error {
+        FsError::NoEntry => ExecError::NoEntry,
+        FsError::NotPermitted => ExecError::Access,
+        FsError::NotDirectory => ExecError::NotDir,
+        FsError::IsDirectory => ExecError::IsDir,
+        FsError::Loop => ExecError::Loop,
+        FsError::NameTooLong => ExecError::NameTooLong,
+        FsError::NoSpace => ExecError::OutOfMemory,
+        _ => ExecError::Io,
+    }
+}
+
+fn map_program_error_to_exec(error: &ProgramExecError) -> ExecError {
+    match error.kind {
+        ProgramExecErrorKind::NotFound => ExecError::NoEntry,
+        ProgramExecErrorKind::PermissionDenied => ExecError::Access,
+        ProgramExecErrorKind::InvalidPath => ExecError::NoEntry,
+        ProgramExecErrorKind::InvalidBinary | ProgramExecErrorKind::InvalidHint => {
+            ExecError::InvalidFormat
+        }
+        ProgramExecErrorKind::OutOfMemory => ExecError::OutOfMemory,
+        _ => ExecError::Io,
+    }
+}
+
+enum ExecTarget {
+    Path { base_dir: String, raw_path: String },
+    Resolved(String),
+}
+
+fn map_fs_op_error_to_exec(error: syscall::FsOpError) -> ExecError {
+    match error {
+        syscall::FsOpError::Fs(error) => map_fs_error_to_exec(error),
+        syscall::FsOpError::PermissionDenied | syscall::FsOpError::NoDevice => ExecError::Access,
+        syscall::FsOpError::NoData | syscall::FsOpError::Range | syscall::FsOpError::ArgTooBig => {
+            ExecError::Io
+        }
+    }
+}
+
+fn resolve_exec_spec_base<Net: ComponentHostNetwork>(
+    spec: &ExecSpec,
+    cwd: &Arc<spin::Mutex<String>>,
+    descriptors: &Arc<spin::Mutex<Descriptors<LinuxResources<Net>>>>,
+) -> Result<ExecTarget, ExecError> {
+    const AT_FDCWD: i32 = -100;
+    if spec.path.starts_with('/') {
+        return Ok(ExecTarget::Path {
+            base_dir: String::from("/"),
+            raw_path: spec.path.clone(),
+        });
+    }
+    if spec.dirfd == AT_FDCWD {
+        if spec.path.is_empty() {
+            return Err(ExecError::NoEntry);
+        }
+        return Ok(ExecTarget::Path {
+            base_dir: cwd.lock().clone(),
+            raw_path: spec.path.clone(),
+        });
+    }
+    let entry = descriptors
+        .lock()
+        .get_entry(spec.dirfd)
+        .cloned()
+        .ok_or(ExecError::BadFd)?;
+    let desc = match &entry.descriptor {
+        helios_unix::FileDescriptor::File(open) => open.node(),
+        helios_unix::FileDescriptor::Preopen { descriptor, .. } => descriptor,
+        _ => {
+            return Err(if spec.path.is_empty() && spec.flags & AT_EMPTY_PATH != 0 {
+                ExecError::Access
+            } else {
+                ExecError::NotDir
+            });
+        }
+    };
+    if spec.path.is_empty() {
+        if spec.flags & AT_EMPTY_PATH == 0 {
+            return Err(ExecError::NoEntry);
+        }
+        if desc.kind == crate::ComponentFsNodeKind::Directory {
+            return Err(ExecError::Access);
+        }
+        return Ok(ExecTarget::Resolved(desc.path.clone()));
+    }
+    if desc.kind != crate::ComponentFsNodeKind::Directory {
+        return Err(ExecError::NotDir);
+    }
+    Ok(ExecTarget::Path {
+        base_dir: desc.path.clone(),
+        raw_path: spec.path.clone(),
+    })
+}
+
+async fn prepare_exec_in_container<CpuImpl, Net, StorageImpl>(
+    shared: &LinuxShared<CpuImpl, Net, StorageImpl, <CpuImpl::Native as NativeExecution>::Space>,
+    cwd: &Arc<spin::Mutex<String>>,
+    descriptors: &Arc<spin::Mutex<Descriptors<LinuxResources<Net>>>>,
+    credentials: &Arc<spin::Mutex<syscall::Credentials>>,
+    spec: ExecSpec,
+) -> Result<PreparedExec<CpuImpl, Net, StorageImpl>, ExecError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    const MAX_SHEBANG_DEPTH: usize = 4;
+    let current_creds = credentials.lock().clone();
+    let mut target = resolve_exec_spec_base(&spec, cwd, descriptors)?;
+    let mut argv = spec.argv;
+    let envp = spec.envp;
+    let mut nofollow = spec.flags & AT_SYMLINK_NOFOLLOW != 0;
+
+    for depth in 0..=MAX_SHEBANG_DEPTH {
+        let fs = shared.container.filesystem();
+        let (resolved, trailing_slash) = match &target {
+            ExecTarget::Resolved(path) => (fs.resolve(path).map_err(map_fs_error_to_exec)?, false),
+            ExecTarget::Path { base_dir, raw_path } => fs
+                .walk_path_for(base_dir, raw_path, !nofollow, &current_creds)
+                .await
+                .map_err(map_fs_op_error_to_exec)?,
+        };
+        let meta = resolved
+            .fs()
+            .stat(resolved.fs_path())
+            .await
+            .map_err(map_fs_error_to_exec)?;
+        if meta.kind == NodeKind::Symlink {
+            return Err(ExecError::Loop);
+        }
+        nofollow = false;
+        if meta.kind == NodeKind::Directory {
+            return Err(ExecError::Access);
+        }
+        if trailing_slash {
+            return Err(ExecError::NotDir);
+        }
+        if meta.kind != NodeKind::File {
+            return Err(ExecError::Access);
+        }
+        let current_path = resolved.container_path().to_owned();
+
+        let contents = resolved
+            .check_exec_and_read(&current_creds)
+            .await
+            .map_err(map_fs_op_error_to_exec)?;
+
+        let raw_slice = match &contents {
+            FileContents::Boot(boot) => boot.as_slice(),
+            FileContents::Written(written) => written.as_ref(),
+        };
+        if let Some((interp, opt_arg)) = parse_shebang(raw_slice) {
+            if depth == MAX_SHEBANG_DEPTH {
+                return Err(ExecError::Loop);
+            }
+            let mut next_argv = Vec::with_capacity(argv.len() + 2);
+            next_argv.push(interp.clone());
+            if let Some(arg) = opt_arg {
+                next_argv.push(arg);
+            }
+            next_argv.push(current_path);
+            if argv.len() > 1 {
+                next_argv.extend(argv.into_iter().skip(1));
+            }
+            argv = next_argv;
+            target = ExecTarget::Path {
+                base_dir: String::from("/"),
+                raw_path: interp,
+            };
+            continue;
+        }
+
+        let source = ProgramSource::from_file(contents);
+        match source {
+            ProgramSource::LinuxElf(bytes) => {
+                let executable = LinuxExecutable::load(&shared.cpu, bytes)
+                    .map_err(|error| map_program_error_to_exec(&error))?;
+                // Compute post-execve credentials strictly for the final binary
+                // (never an intermediate `#!` script, `fs/binfmt_script.c`),
+                // respecting `NO_SUID`, `PR_SET_NO_NEW_PRIVS`, and the
+                // container's `ProcessAuthority` capability ceiling.
+                let next_creds = resolved
+                    .exec_credentials(&current_creds, shared.container.authority_cap_ceiling())
+                    .await
+                    .map_err(map_fs_op_error_to_exec)?;
+                let secure = syscall::permissions::exec_is_secure(&current_creds, &next_creds);
+                if argv.is_empty() {
+                    argv.push(current_path);
+                }
+                return Ok(PreparedExec::Linux {
+                    executable,
+                    argv,
+                    env: envp,
+                    credentials: next_creds,
+                    secure,
+                });
+            }
+            other => {
+                if shared.exec_runtime.wasm.is_none() {
+                    return Err(ExecError::InvalidFormat);
+                }
+                let Some(program_service) = shared.runtime_state.program_service() else {
+                    return Err(ExecError::InvalidFormat);
+                };
+                let exec_auth = shared
+                    .container
+                    .authority()
+                    .derive_exec_authority()
+                    .map_err(|_| ExecError::Access)?;
+                let compile = CompileAuthority::from(&exec_auth);
+                let program_argv = ProgramArgv::from_caller(&current_path, argv);
+                let timeline = phases::Timeline::disabled();
+                let executable = program_service
+                    .load_executable(
+                        &compile,
+                        &shared.exec_runtime.exec_context,
+                        program_argv.program_name(),
+                        &other,
+                        None,
+                        &timeline,
+                    )
+                    .await
+                    .map_err(|error| map_program_error_to_exec(&error))?;
+                let parsed_env: Vec<(String, String)> = envp
+                    .into_iter()
+                    .filter_map(|entry| {
+                        entry
+                            .split_once('=')
+                            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                    })
+                    .collect();
+                return Ok(PreparedExec::Wasm {
+                    executable,
+                    argv: program_argv,
+                    env: parsed_env,
+                });
+            }
+        }
+    }
+    Err(ExecError::Loop)
+}
+
+/// Calling thread's context view for `arch_prctl`, `clone` / `clone3`, `fork`,
+/// `vfork`, `execve`, and `execveat`.
 struct ContextThread<'a, CpuImpl, Net, StorageImpl, Context: UserContext>
 where
     CpuImpl: Cpu + Clone,
@@ -673,10 +3005,14 @@ where
 {
     context: &'a mut Context,
     shared: &'a Arc<LinuxShared<CpuImpl, Net, StorageImpl, Context::Space>>,
+    cwd: Arc<spin::Mutex<String>>,
+    descriptors: Arc<spin::Mutex<Descriptors<LinuxResources<Net>>>>,
+    credentials: Arc<spin::Mutex<syscall::Credentials>>,
+    prepared_exec: &'a mut Option<Box<PreparedExec<CpuImpl, Net, StorageImpl>>>,
 }
 
-impl<CpuImpl, Net, StorageImpl, Context: UserContext> Thread<LinuxResources<Net>>
-    for ContextThread<'_, CpuImpl, Net, StorageImpl, Context>
+impl<CpuImpl, Net, StorageImpl> Thread<LinuxResources<Net>>
+    for ContextThread<'_, CpuImpl, Net, StorageImpl, <CpuImpl::Native as NativeExecution>::Context>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -721,12 +3057,23 @@ where
             .set_register(self.shared.registers.result, 0)
             .expect("the ABI names registers of this instruction set");
         let child_platform = LinuxThreadPlatform::new(self.shared.clone(), child.tid());
-        self.shared.running_tasks.fetch_add(1, Ordering::SeqCst);
-        let guard = TaskDrainGuard(self.shared.clone());
-        self.shared
-            .spawner
+        let shared = self.shared.clone();
+        let spawner = shared.spawner.clone();
+        shared.running_tasks.fetch_add(1, Ordering::SeqCst);
+        let guard = TaskDrainGuard(shared.clone());
+        spawner
             .try_spawn_detached(async move {
-                drive_linux_thread(child_context, child, child_platform).await;
+                if let ThreadRunEnd::Exec(prepared, exec_proc) =
+                    drive_linux_thread(child_context, child, child_platform).await
+                {
+                    let observer = exec_proc.observer();
+                    let mut slot = shared.exec_handoff.lock();
+                    if slot.is_none() {
+                        *slot = Some((prepared, exec_proc));
+                        drop(slot);
+                        observer.terminate_group(helios_unix::ChildTermination::Exited(0));
+                    }
+                }
                 drop(guard);
             })
             .map_err(|error| {
@@ -739,6 +3086,175 @@ where
                 SpawnError::Busy
             })
     }
+
+    fn spawn_process(
+        &mut self,
+        spawned: SpawnedProcess<LinuxResources<Net>>,
+    ) -> Result<(), SpawnError> {
+        let mut child_context = self
+            .context
+            .try_clone()
+            .map_err(|_| SpawnError::OutOfMemory)?;
+        if let Some(tls) = spawned.tls {
+            child_context
+                .set_thread_pointer(VirtAddr::new(tls as usize))
+                .map_err(|_| SpawnError::InvalidTls)?;
+        }
+        if let Some(stack) = spawned.stack {
+            child_context
+                .set_register(self.shared.abi.stack_pointer_register(), stack)
+                .expect("the ABI names registers of this instruction set");
+        }
+        child_context
+            .set_register(self.shared.registers.result, 0)
+            .expect("the ABI names registers of this instruction set");
+
+        let child_space = if spawned.share_vm {
+            self.shared.space.clone()
+        } else {
+            Arc::new(
+                self.shared
+                    .space
+                    .clone_cow()
+                    .map_err(|_| SpawnError::OutOfMemory)?,
+            )
+        };
+        if let Some(addr) = spawned.child_tid_addr {
+            let pid_val = spawned.child.pid().get();
+            if addr & 3 == 0 {
+                let _ = child_space.atomic_store_u32(VirtAddr::new(addr as usize), pid_val);
+            } else {
+                let _ = child_space.write(VirtAddr::new(addr as usize), &pid_val.to_le_bytes());
+            }
+        }
+
+        let exec_context = &self.shared.exec_runtime.exec_context;
+        let started_at = exec_context
+            .runtime_state
+            .uptime_nanos(exec_context.cpu.now().ticks());
+        let child_name = alloc::format!("linux-pid-{}", spawned.child.pid().get());
+        let child_instance = exec_context
+            .instance_registry
+            .register(child_name, started_at);
+        let child_spawner = exec_context
+            .spawner
+            .instance_spawner(crate::TaskFunding::Instance, &child_instance);
+        let child_signal_state = WasixSignalState::new();
+        let child_shared = Arc::new(LinuxShared {
+            cpu: self.shared.cpu.clone(),
+            timer: self.shared.timer.clone(),
+            spawner: child_spawner.clone(),
+            runtime_state: self.shared.runtime_state.clone(),
+            exec_runtime: self.shared.exec_runtime.clone(),
+            read_serial: self.shared.read_serial,
+            write_serial: self.shared.write_serial,
+            output_mode: self.shared.output_mode.clone(),
+            launched_instance: child_instance,
+            signal_state: child_signal_state,
+            container: self.shared.container.clone(),
+            grants: LinuxGrants::derive(self.shared.container.authority()),
+            tty: spin::Mutex::new(self.shared.tty.lock().clone()),
+            serial_peek: spin::Mutex::new(Vec::new()),
+            clock: spin::Mutex::new(crate::KernelClock::new(
+                self.shared.cpu.clone(),
+                self.shared.runtime_state.clone(),
+            )),
+            abi: self.shared.abi,
+            registers: self.shared.registers,
+            user: self.shared.user,
+            stack_top: self.shared.stack_top,
+            stack_base: self.shared.stack_base,
+            image_end: self.shared.image_end,
+            sigreturn_trampoline: self.shared.sigreturn_trampoline,
+            space: child_space,
+            process_cpu_ticks: AtomicU64::new(0),
+            fatal_error: spin::Mutex::new(None),
+            exec_handoff: spin::Mutex::new(None),
+            running_tasks: AtomicUsize::new(0),
+            tasks_drained: helios_sync::Notify::new(),
+        });
+
+        let child_proc = spawned.child;
+        let child_pid = child_proc.pid();
+        let container = self.shared.container.clone();
+        child_spawner
+            .try_spawn_detached(async move {
+                let mut guard = ChildExitSafetyGuard {
+                    pids: container.pid_namespace().clone(),
+                    pid: child_pid,
+                    completed: false,
+                };
+                let outcome = Box::pin(drive_linux_process_lifecycle(
+                    child_context,
+                    child_proc,
+                    child_shared,
+                    None,
+                    phases::Timeline::disabled(),
+                ))
+                .await;
+                let termination = match outcome {
+                    Ok(exit) => exit.termination,
+                    Err(_) => helios_unix::ChildTermination::Killed,
+                };
+                guard.completed = true;
+                container
+                    .pid_namespace()
+                    .mark_exited(child_pid, termination);
+            })
+            .map_err(|error| {
+                tracing::warn!(
+                    target: "helios_kernel::linux",
+                    instance = ?self.shared.launched_instance.id(),
+                    %error,
+                    "refused a forked Linux child: the executor's instance share is full"
+                );
+                SpawnError::Busy
+            })
+    }
+
+    async fn prepare_exec(&mut self, spec: ExecSpec) -> Result<(), ExecError> {
+        let prepared = Box::pin(prepare_exec_in_container(
+            self.shared,
+            &self.cwd,
+            &self.descriptors,
+            &self.credentials,
+            spec,
+        ))
+        .await?;
+        *self.prepared_exec = Some(Box::new(prepared));
+        Ok(())
+    }
+}
+
+/// Safety net ensuring a forked child process transitions to exited state even
+/// if its executor task is cancelled before normal completion.
+struct ChildExitSafetyGuard {
+    pids: syscall::PidNamespace,
+    pid: NonZeroU32,
+    completed: bool,
+}
+
+impl Drop for ChildExitSafetyGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.pids
+                .mark_exited(self.pid, helios_unix::ChildTermination::Killed);
+        }
+    }
+}
+
+/// What ended a thread's execution loop.
+enum ThreadRunEnd<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    Exited,
+    Exec(
+        Box<PreparedExec<CpuImpl, Net, StorageImpl>>,
+        Process<LinuxResources<Net>>,
+    ),
 }
 
 /// What ended a system call a thread was suspended in.
@@ -863,7 +3379,11 @@ where
         restart,
         shared.sigreturn_trampoline,
     ) {
-        SignalDelivery::None | SignalDelivery::Delivered | SignalDelivery::Stopped => false,
+        SignalDelivery::None | SignalDelivery::Delivered => false,
+        SignalDelivery::Stopped(signal) => {
+            process.mark_stopped(signal);
+            false
+        }
         SignalDelivery::Terminated { signal, .. } => {
             // No core dump file is produced (`RLIMIT_CORE` default is 0), so
             // `WCOREDUMP` stays false as on Linux.
@@ -934,22 +3454,28 @@ where
             ));
             true
         }
-        SignalDelivery::None | SignalDelivery::Stopped => false,
+        SignalDelivery::None | SignalDelivery::Stopped(_) => false,
     }
 }
 
 /// Drives one Linux thread (`main` or a `clone`-spawned worker) until that
 /// thread exits (`exit`), condemns the group (`exit_group`, unhandled fault,
-/// OOM), or observes condemnation from a sibling, signal or kill.
-async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
-    mut context: Context,
+/// OOM), commits an `execve`/`execveat` replacement, or observes condemnation
+/// from a sibling, signal or kill.
+async fn drive_linux_thread<CpuImpl, Net, StorageImpl>(
+    mut context: <CpuImpl::Native as NativeExecution>::Context,
     mut process: Process<LinuxResources<Net>>,
-    mut platform: LinuxThreadPlatform<CpuImpl, Net, StorageImpl, Context::Space>,
-) where
+    mut platform: LinuxThreadPlatform<
+        CpuImpl,
+        Net,
+        StorageImpl,
+        <CpuImpl::Native as NativeExecution>::Space,
+    >,
+) -> ThreadRunEnd<CpuImpl, Net, StorageImpl>
+where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
-    Context: UserContext,
 {
     let shared = platform.shared.clone();
     let observer = process.observer();
@@ -1004,6 +3530,7 @@ async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
                     break;
                 }
                 let syscall_began = shared.cpu.now().ticks();
+                let mut prepared_exec = None;
                 let ended = {
                     let mut memory = LinuxMemory {
                         space: &*shared.space,
@@ -1015,6 +3542,10 @@ async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
                     let mut thread = ContextThread {
                         context: &mut context,
                         shared: &shared,
+                        cwd: process.cwd_handle(),
+                        descriptors: process.descriptors_handle(),
+                        credentials: process.credentials_handle(),
+                        prepared_exec: &mut prepared_exec,
                     };
                     let mut call = core::pin::pin!(syscall::dispatch(
                         &mut process,
@@ -1096,6 +3627,17 @@ async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
                             ));
                             break;
                         }
+                    }
+                    CallEnd::Done(ControlFlow::Continue(SyscallOutcome::Exec)) => {
+                        let memory = LinuxMemory {
+                            space: &*shared.space,
+                            user: shared.user,
+                            stack_growth: None,
+                        };
+                        process.flush_shared_mappings(&memory, &mut platform).await;
+                        let prepared = prepared_exec
+                            .expect("SyscallOutcome::Exec follows Thread::prepare_exec");
+                        return ThreadRunEnd::Exec(prepared, process);
                     }
                     CallEnd::Done(ControlFlow::Break(_)) => break,
                     CallEnd::Stopped => {}
@@ -1200,6 +3742,13 @@ async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
             },
         }
     }
+    let memory = LinuxMemory {
+        space: &*shared.space,
+        user: shared.user,
+        stack_growth: None,
+    };
+    process.flush_shared_mappings(&memory, &mut platform).await;
+    ThreadRunEnd::Exited
 }
 
 /// Drives a process's `ITIMER_REAL` (`alarm` / `setitimer`) asynchronously
@@ -1264,36 +3813,50 @@ async fn drive_real_timer<CpuImpl, Net, StorageImpl>(
     }
 }
 
-/// Runs a Linux process inside `container` to its end: maps `executable`,
-/// builds its initial stack from `argv` and `env`, allocates its container-local
-/// PID (starting at 1), drives `main` and every thread spawned via
-/// `clone` / `clone3`, and returns once every thread task has exited and
-/// released the process's resources.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_linux_process<CpuImpl, Net, StorageImpl>(
-    exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
-    argv: ProgramArgv,
-    env: Vec<(String, String)>,
-    container: Arc<crate::LinuxContainer<StorageImpl>>,
-    credentials: Option<syscall::Credentials>,
-    descriptors: Option<Preview1DescriptorTable<Net>>,
-    signal_state: WasixSignalState,
-    spawner: crate::InstanceSpawner<CpuImpl>,
-    launched_instance: crate::RegisteredInstance,
-    output_mode: OutputMode,
-    executable: LinuxExecutable,
-    timeline: &phases::Timeline,
-) -> Result<ChildExit, ProgramExecError>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let instance_id = launched_instance.id();
-    timeline.set_instance(instance_id);
-    timeline.record(&exec_context.cpu, LaunchPhase::TaskBegin);
-    let cpu = exec_context.cpu.clone();
-    let native = cpu.native().map_err(native_unavailable)?;
+/// Computes the initial stack top and, when `abi` supplies a sigreturn
+/// trampoline (AArch64), maps it at the top of `user` above an unmapped guard
+/// page so it never collides with `brk` growth at `image_end`.
+fn map_sigreturn_trampoline<Space: UserSpace>(
+    space: &Space,
+    user: VirtRange,
+    abi: Abi,
+) -> Result<(u64, u64), NativeError> {
+    if let Some(code) = abi.sigreturn_trampoline_code() {
+        let trampoline = VirtAddr::new(user.end().raw() - PhysFrame::SIZE);
+        space.map(
+            VirtRange::new(trampoline, PhysFrame::SIZE),
+            code,
+            PageFlags::READ | PageFlags::EXECUTE,
+        )?;
+        Ok((
+            (user.end().raw() - 2 * PhysFrame::SIZE) as u64,
+            trampoline.raw() as u64,
+        ))
+    } else {
+        Ok(((user.end().raw() - PhysFrame::SIZE) as u64, 0))
+    }
+}
+
+struct MappedLinuxImage<Native: NativeExecution> {
+    space: Arc<Native::Space>,
+    context: Native::Context,
+    user: VirtRange,
+    stack_top: u64,
+    stack_base: usize,
+    image_end: usize,
+    sigreturn_trampoline: u64,
+    program_break: u64,
+}
+
+fn map_linux_image<Native: NativeExecution>(
+    native: &Native,
+    entropy: &crate::RootEntropy,
+    executable: &LinuxExecutable,
+    argv: &[String],
+    environment: &[String],
+    credentials: &syscall::Credentials,
+    secure: bool,
+) -> Result<MappedLinuxImage<Native>, ProgramExecError> {
     let image =
         Image::parse(&executable.image, executable.abi, user_end(native)).map_err(image_error)?;
     let space = Arc::new(native.create_space().map_err(native_error)?);
@@ -1315,24 +3878,14 @@ where
             .map_err(native_error)?;
     }
 
-    let argv = argv.into_vec();
-    let environment: Vec<String> = env
-        .into_iter()
-        .map(|(name, value)| {
-            let mut variable = String::with_capacity(name.len() + 1 + value.len());
-            variable.push_str(&name);
-            variable.push('=');
-            variable.push_str(&value);
-            variable
-        })
-        .collect();
     let arguments: Vec<&[u8]> = argv.iter().map(String::as_bytes).collect();
     let variables: Vec<&[u8]> = environment.iter().map(String::as_bytes).collect();
     let mut random = [0; 16];
-    exec_context.runtime_state.root_entropy().fill(&mut random);
+    entropy.fill(&mut random);
     let user = native.user_range();
-    // One unmapped guard page above the stack.
-    let top = (user.end().raw() - PhysFrame::SIZE) as u64;
+    let (top, sigreturn_trampoline) =
+        map_sigreturn_trampoline(&*space, user, executable.abi).map_err(native_error)?;
+    let executable_name = arguments.first().copied().unwrap_or(b"");
     let stack = helios_linux::stack::build(
         &helios_linux::stack::Startup {
             entry: image.entry(),
@@ -1341,9 +3894,12 @@ where
             random,
             arguments: &arguments,
             environment: &variables,
-            // The name the program was invoked under; the resolved path
-            // does not travel with a launch.
-            executable: arguments[0],
+            executable: executable_name,
+            uid: credentials.user.real,
+            euid: credentials.user.effective,
+            gid: credentials.group.real,
+            egid: credentials.group.effective,
+            secure,
         },
         top,
     )
@@ -1358,30 +3914,359 @@ where
             PageFlags::READ | PageFlags::WRITE,
         )
         .map_err(native_error)?;
-    let sigreturn_trampoline = if let Some(code) = executable.abi.sigreturn_trampoline_code() {
-        let addr = space
-            .free_range(
-                VirtAddr::new(image_end.max(PhysFrame::SIZE)),
-                PhysFrame::SIZE,
-            )
-            .ok_or_else(|| native_error(NativeError::OutOfMemory))?;
-        space
-            .map(
-                VirtRange::new(addr, PhysFrame::SIZE),
-                code,
-                PageFlags::READ | PageFlags::EXECUTE,
-            )
-            .map_err(native_error)?;
-        addr.raw() as u64
-    } else {
-        0
-    };
     let context = native
         .create_context(
             VirtAddr::new(image.entry() as usize),
             VirtAddr::new(stack.pointer as usize),
         )
         .map_err(native_error)?;
+    Ok(MappedLinuxImage {
+        space,
+        context,
+        user,
+        stack_top: top,
+        stack_base: stack.base as usize,
+        image_end,
+        sigreturn_trampoline,
+        program_break: image.program_break(PhysFrame::SIZE as u64),
+    })
+}
+
+/// Drives a Linux process (either a root launch or a forked child) across its
+/// initial image and any subsequent `execve`/`execveat` replacements — whether
+/// Linux ELF or Wasm/WASIX — until the process terminates.
+async fn drive_linux_process_lifecycle<CpuImpl, Net, StorageImpl>(
+    mut context: <CpuImpl::Native as NativeExecution>::Context,
+    mut process: Process<LinuxResources<Net>>,
+    mut shared: Arc<
+        LinuxShared<CpuImpl, Net, StorageImpl, <CpuImpl::Native as NativeExecution>::Space>,
+    >,
+    root_guard: Option<crate::ContainerProcessGuard>,
+    timeline: phases::Timeline,
+) -> Result<ChildExit, ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let _root_guard = root_guard;
+    loop {
+        let cpu = shared.cpu.clone();
+        let pid = process.pid();
+        let observer = process.observer();
+        let proc_signals = process.process_signals();
+        let main_platform = LinuxThreadPlatform::new(shared.clone(), pid);
+        let real_timer_driver = drive_real_timer(
+            cpu.clone(),
+            shared.timer.clone(),
+            shared.runtime_state.clone(),
+            proc_signals.clone(),
+            observer.clone(),
+        );
+        let mut main_exec: Option<ExecHandoff<CpuImpl, Net, StorageImpl>> = None;
+        let main_and_siblings = async {
+            match drive_linux_thread(context, process, main_platform).await {
+                ThreadRunEnd::Exec(prepared, exec_proc) => {
+                    // Condemn any sibling threads so they drain before the
+                    // address space is replaced.
+                    observer.terminate_group(helios_unix::ChildTermination::Exited(0));
+                    main_exec = Some((prepared, exec_proc));
+                    return;
+                }
+                ThreadRunEnd::Exited => {}
+            }
+
+            // Wait for every live sibling thread to exit, still honouring
+            // external signals and instance kills while `main` is already gone.
+            loop {
+                let mut group_wait = observer.waiter();
+                let mut signal_wait = shared.signal_state.wait_state();
+                let mut kill_wait = shared.launched_instance.arm_kill_wait();
+                if let Some(reason) = shared.launched_instance.pending_kill() {
+                    match reason {
+                        crate::KillReason::Operator | crate::KillReason::RequesterGone => {
+                            observer.terminate_group(helios_unix::ChildTermination::Killed);
+                        }
+                        crate::KillReason::OutOfMemory
+                        | crate::KillReason::SupervisorRestart
+                        | crate::KillReason::StoreFailed => {
+                            shared.record_fatal(map_program_runtime_error(wasmtime::Error::from(
+                                crate::InstanceKilled { reason },
+                            )));
+                            observer.terminate_group(helios_unix::ChildTermination::Killed);
+                        }
+                    }
+                } else if !observer.group_ended() {
+                    forward_external_signals(&proc_signals, &shared.signal_state);
+                }
+                if observer.all_threads_exited() {
+                    break;
+                }
+                core::future::poll_fn(|cx| {
+                    let group_changed = observer.poll_changed(cx, &mut group_wait).is_ready();
+                    let signalled = shared
+                        .signal_state
+                        .poll_changed(cx, &mut signal_wait)
+                        .is_ready();
+                    let killed = shared
+                        .launched_instance
+                        .poll_kill_wait(cx, &mut kill_wait)
+                        .is_ready();
+                    if group_changed || signalled || killed {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
+        };
+        futures::future::join(main_and_siblings, real_timer_driver).await;
+
+        // Wait for every detached thread task to drop its `Process` and
+        // `Arc<Space>` before committing exec or reporting `ChildExit`.
+        shared.wait_tasks_drained().await;
+
+        let exec_request = main_exec.or_else(|| shared.exec_handoff.lock().take());
+        if let Some((prepared, mut exec_proc)) = exec_request {
+            match *prepared {
+                PreparedExec::Linux {
+                    executable,
+                    argv,
+                    env,
+                    credentials,
+                    secure,
+                } => {
+                    let native = cpu.native().map_err(native_unavailable)?;
+                    let mapped = map_linux_image(
+                        native,
+                        shared.runtime_state.root_entropy(),
+                        &executable,
+                        &argv,
+                        &env,
+                        &credentials,
+                        secure,
+                    )?;
+                    exec_proc.commit_linux_exec(mapped.program_break, credentials);
+                    let next_shared = Arc::new(LinuxShared {
+                        cpu: shared.cpu.clone(),
+                        timer: shared.timer.clone(),
+                        spawner: shared.spawner.clone(),
+                        runtime_state: shared.runtime_state.clone(),
+                        exec_runtime: shared.exec_runtime.clone(),
+                        read_serial: shared.read_serial,
+                        write_serial: shared.write_serial,
+                        output_mode: shared.output_mode.clone(),
+                        launched_instance: shared.launched_instance.clone(),
+                        signal_state: shared.signal_state.clone(),
+                        container: shared.container.clone(),
+                        grants: LinuxGrants::derive(shared.container.authority()),
+                        tty: spin::Mutex::new(shared.tty.lock().clone()),
+                        serial_peek: spin::Mutex::new(core::mem::take(
+                            &mut *shared.serial_peek.lock(),
+                        )),
+                        clock: spin::Mutex::new(crate::KernelClock::new(
+                            shared.cpu.clone(),
+                            shared.runtime_state.clone(),
+                        )),
+                        abi: executable.abi,
+                        registers: executable.abi.system_call_registers(),
+                        user: mapped.user,
+                        stack_top: mapped.stack_top,
+                        stack_base: mapped.stack_base,
+                        image_end: mapped.image_end,
+                        sigreturn_trampoline: mapped.sigreturn_trampoline,
+                        space: mapped.space,
+                        process_cpu_ticks: AtomicU64::new(
+                            shared.process_cpu_ticks.load(Ordering::Relaxed),
+                        ),
+                        fatal_error: spin::Mutex::new(None),
+                        exec_handoff: spin::Mutex::new(None),
+                        running_tasks: AtomicUsize::new(0),
+                        tasks_drained: helios_sync::Notify::new(),
+                    });
+                    // Drop the old `LinuxShared` and old address space before
+                    // starting the replacement image.
+                    drop(observer);
+                    drop(proc_signals);
+                    shared = next_shared;
+                    context = mapped.context;
+                    process = exec_proc;
+                    continue;
+                }
+                PreparedExec::Wasm {
+                    executable,
+                    argv,
+                    env,
+                } => {
+                    let (surviving_slots, ignored) = exec_proc.commit_wasm_exec();
+                    let thread_signals = exec_proc.thread_signals().clone();
+                    let descriptors = Preview1DescriptorTable::from_slots(surviving_slots);
+                    let signal_dispositions: Vec<WasixSignalDisposition> = ignored
+                        .into_iter()
+                        .map(|sig| WasixSignalDisposition {
+                            signal: sig.raw(),
+                            action: WasixSignalDispositionAction::Ignore,
+                        })
+                        .collect();
+                    let exec_runtime = shared.exec_runtime.clone();
+                    let spawner = shared.spawner.clone();
+                    let launched_instance = shared.launched_instance.clone();
+                    let output_mode = shared.output_mode.clone();
+                    let external_signal_state = shared.signal_state.clone();
+                    let authority = shared.container.authority().clone();
+                    // Reclaim the entire old Linux address space before
+                    // instantiating the replacement Wasm image.
+                    drop(observer);
+                    drop(proc_signals);
+                    drop(exec_proc);
+                    drop(shared);
+
+                    let wasm_runtime = exec_runtime
+                        .wasm
+                        .expect("PreparedExec::Wasm requires a Wasm runtime");
+                    let wasm_signal_state = WasixSignalState::new();
+                    let wasm_run = Box::pin(run_program_executable(
+                        exec_runtime.exec_context,
+                        argv,
+                        env,
+                        authority,
+                        wasm_runtime.filesystem,
+                        Some(descriptors),
+                        wasm_signal_state.clone(),
+                        signal_dispositions,
+                        None,
+                        spawner,
+                        wasm_runtime.progress,
+                        executable,
+                        &wasm_runtime.engine,
+                        &wasm_runtime.runtime,
+                        wasm_runtime.preview1_core_linker,
+                        wasm_runtime.shared_memory_pool,
+                        wasm_runtime.core_module_instance_pre_cache,
+                        launched_instance,
+                        output_mode,
+                        timeline,
+                    ));
+                    // Bridge container Linux signals (`kill(pid, sig)` /
+                    // `kill(-pgid, sig)`) and parent external signals into the
+                    // replacement Wasm/WASIX process while it runs.
+                    let mut wasm_run = wasm_run;
+                    let mut linux_sig_wait = thread_signals.signal_waiter();
+                    let mut ext_sig_wait = external_signal_state.wait_state();
+                    let outcome = core::future::poll_fn(|cx| {
+                        while let Some(sig) = thread_signals.take_pending_signal() {
+                            wasm_signal_state.raise(sig);
+                        }
+                        while let Some(sig) = external_signal_state.take_pending() {
+                            wasm_signal_state.raise(sig);
+                        }
+                        if let Poll::Ready(result) = wasm_run.as_mut().poll(cx) {
+                            return Poll::Ready(result);
+                        }
+                        if thread_signals
+                            .poll_signal_waiter(cx, &mut linux_sig_wait)
+                            .is_ready()
+                        {
+                            while let Some(sig) = thread_signals.take_pending_signal() {
+                                wasm_signal_state.raise(sig);
+                            }
+                            linux_sig_wait = thread_signals.signal_waiter();
+                            let _ = thread_signals.poll_signal_waiter(cx, &mut linux_sig_wait);
+                        }
+                        if external_signal_state
+                            .poll_changed(cx, &mut ext_sig_wait)
+                            .is_ready()
+                        {
+                            while let Some(sig) = external_signal_state.take_pending() {
+                                wasm_signal_state.raise(sig);
+                            }
+                            ext_sig_wait = external_signal_state.wait_state();
+                            let _ = external_signal_state.poll_changed(cx, &mut ext_sig_wait);
+                        }
+                        Poll::Pending
+                    })
+                    .await;
+                    return outcome;
+                }
+            }
+        }
+
+        timeline.record(&cpu, LaunchPhase::GuestEnd);
+        let instance_id = shared.launched_instance.id();
+        let fatal = shared.take_fatal();
+        let termination = observer.termination();
+        drop(observer);
+        drop(proc_signals);
+        drop(shared);
+
+        return match fatal {
+            Some(error) => Err(error),
+            None => Ok(ChildExit {
+                instance_id,
+                termination,
+                filesystem: None,
+            }),
+        };
+    }
+}
+
+/// Runs a Linux process inside `container` to its end: maps `executable`,
+/// builds its initial stack from `argv` and `env`, allocates its container-local
+/// PID (starting at 1), drives `main`, every thread spawned via `clone`/`clone3`,
+/// forked children, and `execve`/`execveat` replacements (Linux ELF or Wasm),
+/// and returns once the process has exited and released its resources.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_linux_process<CpuImpl, Net, StorageImpl>(
+    exec_runtime: LinuxExecRuntime<CpuImpl, Net, StorageImpl>,
+    argv: ProgramArgv,
+    env: Vec<(String, String)>,
+    container: Arc<crate::LinuxContainer<StorageImpl>>,
+    credentials: Option<syscall::Credentials>,
+    descriptors: Option<Preview1DescriptorTable<Net>>,
+    signal_state: WasixSignalState,
+    spawner: crate::InstanceSpawner<CpuImpl>,
+    launched_instance: crate::RegisteredInstance,
+    output_mode: OutputMode,
+    executable: LinuxExecutable,
+    timeline: &phases::Timeline,
+) -> Result<ChildExit, ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let exec_context = exec_runtime.exec_context.clone();
+    let instance_id = launched_instance.id();
+    timeline.set_instance(instance_id);
+    timeline.record(&exec_context.cpu, LaunchPhase::TaskBegin);
+    let cpu = exec_context.cpu.clone();
+    let native = cpu.native().map_err(native_unavailable)?;
+
+    let argv = argv.into_vec();
+    let environment: Vec<String> = env
+        .into_iter()
+        .map(|(name, value)| {
+            let mut variable = String::with_capacity(name.len() + 1 + value.len());
+            variable.push_str(&name);
+            variable.push('=');
+            variable.push_str(&value);
+            variable
+        })
+        .collect();
+    let mut credentials = credentials.unwrap_or_else(|| container.default_credentials().clone());
+    container.clamp_credentials(&mut credentials);
+    let initial_secure = credentials.user.effective != credentials.user.real
+        || credentials.group.effective != credentials.group.real;
+    let mapped = map_linux_image(
+        native,
+        exec_context.runtime_state.root_entropy(),
+        &executable,
+        &argv,
+        &environment,
+        &credentials,
+        initial_secure,
+    )?;
 
     let process_guard = container.allocate_process().map_err(|_| ProgramExecError {
         kind: ProgramExecErrorKind::OutOfMemory,
@@ -1394,11 +4279,14 @@ where
         Some(table) => table.into_slots(),
         None => syscall::standard_streams::<LinuxResources<Net>>(),
     };
-    let credentials = credentials.unwrap_or_else(|| container.default_credentials().clone());
+    let initial_cwd = container
+        .authority()
+        .cwd()
+        .map(|preopen| String::from(preopen.guest_name()));
     let process = Process::<LinuxResources<Net>>::with_descriptors(
         executable.abi,
         pid,
-        image.program_break(PhysFrame::SIZE as u64),
+        mapped.program_break,
         table,
         Start {
             credentials,
@@ -1406,12 +4294,12 @@ where
             futex: container.futex_table().clone(),
             pids: Some(container.pid_namespace().clone()),
             memory_id: Some(instance_id.raw()),
+            cwd: initial_cwd,
             ..Start::default()
         },
     );
-    let observer = process.observer();
-    let proc_signals = process.process_signals();
     let grants = LinuxGrants::derive(container.authority());
+    let tty = LinuxTtyState::new(container.authority(), &output_mode, instance_id);
     let shared = Arc::new(LinuxShared {
         cpu: cpu.clone(),
         timer: exec_context.timer.clone(),
@@ -1419,111 +4307,42 @@ where
         runtime_state: exec_context.runtime_state.clone(),
         read_serial: exec_context.read_serial,
         write_serial: exec_context.write_serial,
+        exec_runtime,
         output_mode,
         launched_instance,
         signal_state,
         container,
-        _process_guard: process_guard,
         grants,
+        tty: spin::Mutex::new(tty),
+        serial_peek: spin::Mutex::new(Vec::new()),
         clock: spin::Mutex::new(crate::KernelClock::new(
             cpu.clone(),
             exec_context.runtime_state.clone(),
         )),
         abi: executable.abi,
         registers: executable.abi.system_call_registers(),
-        user,
-        stack_top: top,
-        stack_base: stack.base as usize,
-        image_end,
-        sigreturn_trampoline,
-        space,
+        user: mapped.user,
+        stack_top: mapped.stack_top,
+        stack_base: mapped.stack_base,
+        image_end: mapped.image_end,
+        sigreturn_trampoline: mapped.sigreturn_trampoline,
+        space: mapped.space,
         process_cpu_ticks: AtomicU64::new(0),
         fatal_error: spin::Mutex::new(None),
+        exec_handoff: spin::Mutex::new(None),
         running_tasks: AtomicUsize::new(0),
         tasks_drained: helios_sync::Notify::new(),
     });
-    let main_platform = LinuxThreadPlatform::new(shared.clone(), pid);
 
     timeline.record(&cpu, LaunchPhase::GuestBegin);
-    let real_timer_driver = drive_real_timer(
-        cpu.clone(),
-        shared.timer.clone(),
-        shared.runtime_state.clone(),
-        proc_signals.clone(),
-        observer.clone(),
-    );
-    let main_and_siblings = async {
-        // `drive_linux_thread` consumes `main`'s `Process` and `Context`, so if
-        // `main` calls `SYS_exit` (`pthread_exit`) while worker threads
-        // continue, `main`'s thread handle withdraws immediately without
-        // holding the group open.
-        drive_linux_thread(context, process, main_platform).await;
-
-        // Wait for every live sibling thread to exit, still honouring external
-        // signals and instance kills while `main` is already gone.
-        loop {
-            let mut group_wait = observer.waiter();
-            let mut signal_wait = shared.signal_state.wait_state();
-            let mut kill_wait = shared.launched_instance.arm_kill_wait();
-            if let Some(reason) = shared.launched_instance.pending_kill() {
-                match reason {
-                    crate::KillReason::Operator | crate::KillReason::RequesterGone => {
-                        observer.terminate_group(helios_unix::ChildTermination::Killed);
-                    }
-                    crate::KillReason::OutOfMemory
-                    | crate::KillReason::SupervisorRestart
-                    | crate::KillReason::StoreFailed => {
-                        shared.record_fatal(map_program_runtime_error(wasmtime::Error::from(
-                            crate::InstanceKilled { reason },
-                        )));
-                        observer.terminate_group(helios_unix::ChildTermination::Killed);
-                    }
-                }
-            } else if !observer.group_ended() {
-                forward_external_signals(&proc_signals, &shared.signal_state);
-            }
-            if observer.all_threads_exited() {
-                break;
-            }
-            core::future::poll_fn(|cx| {
-                let group_changed = observer.poll_changed(cx, &mut group_wait).is_ready();
-                let signalled = shared
-                    .signal_state
-                    .poll_changed(cx, &mut signal_wait)
-                    .is_ready();
-                let killed = shared
-                    .launched_instance
-                    .poll_kill_wait(cx, &mut kill_wait)
-                    .is_ready();
-                if group_changed || signalled || killed {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            })
-            .await;
-        }
-    };
-    futures::future::join(main_and_siblings, real_timer_driver).await;
-
-    // Wait for every detached thread task to drop its `Process` (descriptor
-    // table) and `Arc<Space>` before reporting `ChildExit` to the parent.
-    shared.wait_tasks_drained().await;
-    timeline.record(&cpu, LaunchPhase::GuestEnd);
-
-    let fatal = shared.take_fatal();
-    let termination = observer.termination();
-    drop(observer);
-    drop(shared);
-
-    match fatal {
-        Some(error) => Err(error),
-        None => Ok(ChildExit {
-            instance_id,
-            termination,
-            filesystem: None,
-        }),
-    }
+    drive_linux_process_lifecycle(
+        mapped.context,
+        process,
+        shared,
+        Some(process_guard),
+        timeline.clone(),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1561,6 +4380,9 @@ mod tests {
         fn invalidate(&self, _: u64, _: u64) {}
         fn physical(&self, frame: NonNull<u8>) -> u64 {
             frame.as_ptr() as u64
+        }
+        fn new_empty(&self) -> Result<Self, NativeError> {
+            Ok(DummyTables)
         }
     }
 
@@ -1618,68 +4440,84 @@ mod tests {
         );
     }
 
+    struct DummyThread;
+
+    impl Thread for DummyThread {
+        fn thread_pointer(&self) -> u64 {
+            0
+        }
+        fn set_thread_pointer(&mut self, _: u64) -> Result<(), Denied> {
+            Err(Denied)
+        }
+        fn spawn_thread(
+            &mut self,
+            _: Process<helios_linux::syscall::NoBacking>,
+            _: SpawnedThread,
+        ) -> Result<(), SpawnError> {
+            unreachable!("no thread spawned")
+        }
+    }
+
+    struct DummyOutput;
+
+    impl syscall::Network<helios_unix::NoNetwork> for DummyOutput {
+        fn to_ip(&self, address: core::convert::Infallible) -> syscall::IpAddr {
+            match address {}
+        }
+        fn encode_ip(&self, _: syscall::IpAddr) -> core::convert::Infallible {
+            unreachable!()
+        }
+    }
+
+    impl Stdio for DummyOutput {
+        async fn write(&mut self, _: Stream, _: &[u8]) -> Result<usize, WriteError> {
+            Err(WriteError::Io)
+        }
+        async fn read_input(&mut self, _: usize) -> Result<Bytes, Denied> {
+            Err(Denied)
+        }
+    }
+
+    impl syscall::Clock for DummyOutput {
+        fn now_nanos(&self) -> u64 {
+            0
+        }
+        async fn sleep_until(&self, _: u64) {}
+    }
+
+    impl System for DummyOutput {
+        fn realtime_nanos(&self) -> u64 {
+            0
+        }
+        fn set_realtime_nanos(&mut self, _: u64) -> Result<(), Denied> {
+            Err(Denied)
+        }
+        fn cpu_nanos(&self) -> u64 {
+            0
+        }
+        fn fill_random(&mut self, _: &mut [u8]) {}
+        fn memory(&self) -> MemoryTotals {
+            MemoryTotals {
+                total_bytes: 0,
+                free_bytes: 0,
+            }
+        }
+        fn process_count(&self) -> u32 {
+            1
+        }
+        fn kernel_version(&self) -> &str {
+            "test"
+        }
+    }
+
+    impl Filesystem<syscall::NoBacking> for DummyOutput {}
+    impl Tty for DummyOutput {}
+
     #[test]
     fn linux_mmap_brk_and_mremap_commit_only_touched_pages() {
         use core::future::Future;
         use core::task::{Context, Poll, Waker};
-        use helios_linux::syscall::{Clock, NoBacking, dispatch};
-
-        struct DummyThread;
-        impl Thread for DummyThread {
-            fn thread_pointer(&self) -> u64 {
-                0
-            }
-            fn set_thread_pointer(&mut self, _: u64) -> Result<(), Denied> {
-                Err(Denied)
-            }
-            fn spawn_thread(
-                &mut self,
-                _: Process<NoBacking>,
-                _: SpawnedThread,
-            ) -> Result<(), SpawnError> {
-                unreachable!("no thread spawned")
-            }
-        }
-
-        struct DummyOutput;
-        impl Stdio for DummyOutput {
-            async fn write(&mut self, _: Stream, _: &[u8]) -> Result<usize, WriteError> {
-                Err(WriteError::Io)
-            }
-            async fn read_input(&mut self, _: usize) -> Result<Bytes, Denied> {
-                Err(Denied)
-            }
-        }
-        impl Clock for DummyOutput {
-            fn now_nanos(&self) -> u64 {
-                0
-            }
-            async fn sleep_until(&self, _: u64) {}
-        }
-        impl System for DummyOutput {
-            fn realtime_nanos(&self) -> u64 {
-                0
-            }
-            fn set_realtime_nanos(&mut self, _: u64) -> Result<(), Denied> {
-                Err(Denied)
-            }
-            fn cpu_nanos(&self) -> u64 {
-                0
-            }
-            fn fill_random(&mut self, _: &mut [u8]) {}
-            fn memory(&self) -> MemoryTotals {
-                MemoryTotals {
-                    total_bytes: 0,
-                    free_bytes: 0,
-                }
-            }
-            fn process_count(&self) -> u32 {
-                1
-            }
-            fn kernel_version(&self) -> &str {
-                "test"
-            }
-        }
+        use helios_linux::syscall::dispatch;
 
         const MMAP: u64 = 9;
         const MUNMAP: u64 = 11;
@@ -1805,5 +4643,247 @@ mod tests {
         assert_eq!(call(MUNMAP, [moved, grown_len, 0, 0, 0, 0]), 0);
         assert_eq!(call(BRK, [brk_start, 0, 0, 0, 0, 0]), brk_start);
         assert_eq!(crate::memory::user_heap_stats().allocated_bytes, baseline);
+    }
+
+    #[test]
+    fn aarch64_sigreturn_trampoline_sits_above_stack_guard_and_leaves_brk_free() {
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
+        use helios_linux::syscall::dispatch;
+
+        ensure_pool();
+        let page = PhysFrame::SIZE;
+        let start = page;
+        let end = 1usize << 32;
+        let user = VirtRange::new(VirtAddr::new(start), end - start);
+
+        // x86-64 needs no kernel trampoline and keeps one guard page above the stack.
+        let x86_space = NativeSpace::new(DummyTables, start as u64, end as u64);
+        let (x86_top, x86_tramp) = map_sigreturn_trampoline(&x86_space, user, Abi::X86_64).unwrap();
+        assert_eq!(x86_tramp, 0);
+        assert_eq!(x86_top, (end - page) as u64);
+        assert_eq!(
+            x86_space.mapping(VirtRange::new(VirtAddr::new(end - page), page)),
+            None
+        );
+
+        // AArch64 maps the RX trampoline at the very top page, keeps an unmapped
+        // guard page between the stack and the trampoline, and leaves `brk`
+        // growth right at `image_end` unblocked.
+        let arm_space = NativeSpace::new(DummyTables, start as u64, end as u64);
+        let image_end = 0x41_0000usize;
+        arm_space
+            .map(
+                VirtRange::new(VirtAddr::new(0x40_0000), image_end - 0x40_0000),
+                &[],
+                PageFlags::READ | PageFlags::EXECUTE,
+            )
+            .unwrap();
+        let (arm_top, arm_tramp) =
+            map_sigreturn_trampoline(&arm_space, user, Abi::Aarch64).unwrap();
+        assert_eq!(arm_tramp, (end - page) as u64);
+        assert_eq!(arm_top, (end - 2 * page) as u64);
+        assert_eq!(
+            arm_space
+                .mapping(VirtRange::new(VirtAddr::new(end - page), page))
+                .map(|m| m.flags),
+            Some(PageFlags::READ | PageFlags::EXECUTE)
+        );
+        assert_eq!(
+            arm_space.mapping(VirtRange::new(VirtAddr::new(end - 2 * page), page)),
+            None
+        );
+
+        let expected_code = Abi::Aarch64.sigreturn_trampoline_code().unwrap();
+        let mut actual_code = vec![0u8; expected_code.len()];
+        arm_space
+            .read(VirtAddr::new(arm_tramp as usize), &mut actual_code)
+            .unwrap();
+        assert_eq!(actual_code.as_slice(), expected_code);
+
+        // Growing `brk` directly above `image_end` must succeed without colliding.
+        const AARCH64_BRK: u64 = 214;
+        let mut memory = LinuxMemory {
+            space: &arm_space,
+            user,
+            stack_growth: None,
+        };
+        let mut process = Process::new(Abi::Aarch64, NonZeroU32::new(1).unwrap(), image_end as u64);
+        let (mut thread, mut output) = (DummyThread, DummyOutput);
+        let grown = image_end as u64 + 4 * page as u64;
+        let mut fut = core::pin::pin!(dispatch(
+            &mut process,
+            Call {
+                number: AARCH64_BRK,
+                arguments: [grown, 0, 0, 0, 0, 0],
+            },
+            &mut memory,
+            &mut thread,
+            &mut output,
+        ));
+        match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(ControlFlow::Continue(SyscallOutcome::Return(result))) => {
+                assert_eq!(result, grown);
+            }
+            other => panic!("unexpected aarch64 brk outcome: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn synthetic_etc_lookup_enforces_trailing_slash_and_open_flags() {
+        use crate::test_support::UnsupportedStorage;
+        use crate::vfs::BOOT_DEVICE;
+        use crate::{
+            BootFs, ContainerConfig, ContainerId, ContainerMountSpec, DirectoryAuthorityRights,
+            EmbeddedBootDirectory, EmbeddedBootFs, LinuxContainer, MountSharing, ProcessAuthority,
+            SharedOwner,
+        };
+        use core::task::{Context, Poll, Waker};
+        use helios_linux::syscall::{Credentials, UtsField};
+
+        const BOOT_IMAGE: EmbeddedBootFs =
+            EmbeddedBootFs::new(&[EmbeddedBootDirectory::new("root", 0)], &[]);
+        let host_ns = crate::Namespace::<UnsupportedStorage>::new(crate::MountTable::new(
+            BootFs::new(BOOT_IMAGE, BOOT_DEVICE),
+            4,
+        ));
+        let root_auth = ProcessAuthority::root();
+        let container = {
+            let mut fut = core::pin::pin!(LinuxContainer::create(
+                ContainerId::new(core::num::NonZeroU64::new(1).unwrap()),
+                &root_auth,
+                &host_ns,
+                ProcessAuthority::root(),
+                ContainerConfig {
+                    root: ContainerMountSpec {
+                        source_path: String::from("/root"),
+                        target_path: String::from("/"),
+                        rights: DirectoryAuthorityRights::READ | DirectoryAuthorityRights::EXECUTE,
+                        sharing: MountSharing::Shared,
+                    },
+                    mounts: Vec::new(),
+                    shared_owner: SharedOwner { uid: 0, gid: 0 },
+                    credentials: Credentials::root(),
+                    hostname: UtsField::from_bytes(b"helios-test").unwrap(),
+                    domainname: UtsField::from_bytes(b"").unwrap(),
+                },
+            ));
+            match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(Ok(container)) => container,
+                Poll::Ready(Err(err)) => panic!("container create failed: {err:?}"),
+                Poll::Pending => panic!("container create unexpectedly pending"),
+            }
+        };
+
+        let servers = [crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
+            10, 0, 2, 3,
+        ]))];
+        let base_req = OpenRequest {
+            read: true,
+            write: false,
+            create: false,
+            exclusive: false,
+            truncate: false,
+            directory: false,
+            nofollow: false,
+            path_only: false,
+            append: false,
+            sync: false,
+            dsync: false,
+            mode: 0o644,
+            umask: 0,
+        };
+
+        // Trailing slash on a synthetic regular file must fail with NotDirectory.
+        assert_eq!(
+            synthetic_etc_open(&container, "/", "/etc/hosts/", &servers, base_req).err(),
+            Some(FsError::NotDirectory)
+        );
+        assert_eq!(
+            synthetic_etc_stat_lookup(&container, "/", "/etc/hosts/", &servers).err(),
+            Some(FsError::NotDirectory)
+        );
+        assert_eq!(
+            synthetic_etc_stat_lookup(&container, "/", "/etc/resolv.conf/", &servers).err(),
+            Some(FsError::NotDirectory)
+        );
+        assert_eq!(
+            synthetic_etc_access_lookup(
+                &container,
+                "/",
+                "/etc/hosts/",
+                &servers,
+                AccessCheck {
+                    read: false,
+                    write: false,
+                    exec: false,
+                    follow: true,
+                    use_effective: false,
+                },
+            )
+            .err(),
+            Some(FsError::NotDirectory)
+        );
+
+        // O_CREAT | O_EXCL on an existing synthetic file must return Exists (EEXIST).
+        assert_eq!(
+            synthetic_etc_open(
+                &container,
+                "/",
+                "/etc/hosts",
+                &servers,
+                OpenRequest {
+                    create: true,
+                    exclusive: true,
+                    ..base_req
+                },
+            )
+            .err(),
+            Some(FsError::Exists)
+        );
+
+        // O_CREAT | O_RDONLY (without exclusive/write/truncate) opens the existing file read-only.
+        let desc = synthetic_etc_open(
+            &container,
+            "/",
+            "/etc/hosts",
+            &servers,
+            OpenRequest {
+                create: true,
+                ..base_req
+            },
+        )
+        .expect("O_CREAT | O_RDONLY on existing synthetic /etc/hosts must succeed");
+        assert_eq!(desc.path, "/etc/hosts");
+        assert!(desc.flags.contains(FsDescriptorFlags::READ));
+
+        // O_WRONLY / O_TRUNC still return ReadOnly (EROFS).
+        assert_eq!(
+            synthetic_etc_open(
+                &container,
+                "/",
+                "/etc/hosts",
+                &servers,
+                OpenRequest {
+                    write: true,
+                    ..base_req
+                },
+            )
+            .err(),
+            Some(FsError::ReadOnly)
+        );
+
+        // `..` path traversal must not resolve to synthetic /etc files.
+        assert_eq!(
+            synthetic_etc_open(
+                &container,
+                "/",
+                "/nonexistent/../etc/hosts",
+                &servers,
+                base_req,
+            )
+            .err(),
+            Some(FsError::NoEntry)
+        );
     }
 }

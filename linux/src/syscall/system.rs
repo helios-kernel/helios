@@ -296,6 +296,7 @@ pub const CAP_FSETID: u32 = 4;
 pub const CAP_KILL: u32 = 5;
 pub const CAP_SETGID: u32 = 6;
 pub const CAP_SETUID: u32 = 7;
+pub const CAP_SETPCAP: u32 = 8;
 pub const CAP_NET_BIND_SERVICE: u32 = 10;
 pub const CAP_NET_BROADCAST: u32 = 11;
 pub const CAP_NET_ADMIN: u32 = 12;
@@ -305,8 +306,10 @@ pub const CAP_SYS_ADMIN: u32 = 21;
 pub const CAP_SYS_NICE: u32 = 23;
 pub const CAP_SYS_RESOURCE: u32 = 24;
 pub const CAP_SYS_TIME: u32 = 25;
-const CAP_LAST_CAP: u32 = 40;
-const CAP_FULL_SET: u64 = (1u64 << (CAP_LAST_CAP + 1)) - 1;
+pub const CAP_MKNOD: u32 = 27;
+pub const CAP_SETFCAP: u32 = 31;
+pub const CAP_LAST_CAP: u32 = 40;
+pub const CAP_FULL_SET: u64 = (1u64 << (CAP_LAST_CAP + 1)) - 1;
 
 /// Process Linux capability sets (`include/linux/cred.h`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -345,6 +348,16 @@ impl LinuxCapabilities {
         cap <= CAP_LAST_CAP && (self.effective & (1u64 << cap)) != 0
     }
 
+    /// Clamps every capability set to `ceiling` (bounded by [`CAP_FULL_SET`]).
+    pub const fn clamp(&mut self, ceiling: u64) {
+        let mask = ceiling & CAP_FULL_SET;
+        self.effective &= mask;
+        self.permitted &= mask;
+        self.inheritable &= mask;
+        self.bounding &= mask;
+        self.ambient &= mask;
+    }
+
     /// `security/commoncap.c` `cap_emulate_setxuid`: drops capabilities when
     /// transitioning from UID 0 to all non-zero UIDs, and adjusts the
     /// effective set on `euid` transitions between 0 and non-zero.
@@ -379,6 +392,10 @@ pub struct Credentials {
     pub group: Ids,
     pub supplementary_groups: Vec<u32>,
     pub capabilities: LinuxCapabilities,
+    /// `PR_SET_NO_NEW_PRIVS` one-way latch (`include/linux/sched.h`
+    /// `PF_NO_NEW_PRIVS`): once set, inherited across `fork`/`clone`/`execve`
+    /// and suppresses set-id and file-capability elevation on `execve`.
+    pub no_new_privs: bool,
 }
 
 impl Default for Credentials {
@@ -448,6 +465,7 @@ impl Credentials {
             },
             supplementary_groups,
             capabilities: LinuxCapabilities::for_uid(uid),
+            no_new_privs: false,
         })
     }
 
@@ -459,6 +477,28 @@ impl Credentials {
     pub fn for_ids(uid: u32, gid: u32, supplementary_groups: Vec<u32>) -> Self {
         Self::try_for_ids(uid, gid, supplementary_groups)
             .expect("trusted credentials satisfy Linux ID invariants")
+    }
+
+    /// Whether `gid` matches the effective GID or any supplementary group
+    /// (`kernel/groups.c` `in_group_p`).
+    pub fn in_group(&self, gid: u32) -> bool {
+        self.group.effective == gid || self.supplementary_groups.contains(&gid)
+    }
+
+    /// Temporary credential override used by `access(2)` / `faccessat(2)`
+    /// without `AT_EACCESS` (`fs/open.c` `do_faccessat`, Linux v6.12): uses
+    /// real UID/GID and resets effective capabilities to permitted when real
+    /// UID is 0 or empty otherwise.
+    pub fn for_real_access(&self) -> Self {
+        let mut out = self.clone();
+        out.user.effective = self.user.real;
+        out.group.effective = self.group.real;
+        out.capabilities.effective = if self.user.real == 0 {
+            self.capabilities.permitted
+        } else {
+            0
+        };
+        out
     }
 }
 
@@ -480,6 +520,8 @@ pub struct Start {
     /// Distinct process-memory identity for futex scoping; when `None`,
     /// derived from the process ID.
     pub memory_id: Option<u64>,
+    /// Initial current working directory inside the container root. Defaults to `"/"`.
+    pub cwd: Option<alloc::string::String>,
 }
 
 impl Default for Start {
@@ -491,6 +533,7 @@ impl Default for Start {
             futex: helios_unix::FutexTable::new(),
             pids: None,
             memory_id: None,
+            cwd: None,
         }
     }
 }
@@ -501,7 +544,7 @@ impl Default for Start {
 pub(super) struct Attributes {
     values: [Rlimit; 16],
     open_files_ceiling: u64,
-    umask: u32,
+    pub(super) umask: u32,
     nice: i32,
 }
 
@@ -1138,6 +1181,143 @@ impl Credentials {
     }
 }
 
+// `include/uapi/linux/capability.h` (Linux v6.12).
+const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
+const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+fn cap_validate_magic<M: UserMemory>(hdr_addr: u64, memory: &mut M) -> Result<(usize, i32), u64> {
+    let mut raw = [0u8; 8];
+    if memory.read(hdr_addr, &mut raw).is_err() {
+        return Err(errno(EFAULT));
+    }
+    let version = u32::from_le_bytes(raw[0..4].try_into().unwrap());
+    let pid = i32::from_le_bytes(raw[4..8].try_into().unwrap());
+    let tocopy = match version {
+        LINUX_CAPABILITY_VERSION_1 => 1,
+        LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => 2,
+        _ => {
+            if memory
+                .write(hdr_addr, &LINUX_CAPABILITY_VERSION_3.to_le_bytes())
+                .is_err()
+            {
+                return Err(errno(EFAULT));
+            }
+            return Err(errno(EINVAL));
+        }
+    };
+    Ok((tocopy, pid))
+}
+
+impl<R: Resources> Process<R> {
+    /// `kernel/capability.c` `sys_capget` (Linux v6.12).
+    pub(super) fn capget<M: UserMemory>(&self, args: [u64; 6], memory: &mut M) -> u64 {
+        let hdr_addr = args[0];
+        let data_addr = args[1];
+        let (tocopy, pid) = match cap_validate_magic(hdr_addr, memory) {
+            Ok(pair) => pair,
+            Err(err) => {
+                // `sys_capget`: probing version with `dataptr == NULL` succeeds
+                // after writing `_LINUX_CAPABILITY_VERSION_3`.
+                if data_addr == 0 && err == errno(EINVAL) {
+                    return 0;
+                }
+                return err;
+            }
+        };
+        if data_addr == 0 {
+            return 0;
+        }
+        if pid < 0 {
+            return errno(EINVAL);
+        }
+        if !self.names_self(pid) {
+            return errno(ESRCH);
+        }
+        let caps = self.shared.credentials.lock().capabilities;
+        let words = [
+            [
+                caps.effective as u32,
+                caps.permitted as u32,
+                caps.inheritable as u32,
+            ],
+            [
+                (caps.effective >> 32) as u32,
+                (caps.permitted >> 32) as u32,
+                (caps.inheritable >> 32) as u32,
+            ],
+        ];
+        let mut buf = [0u8; 24];
+        for (slot, triple) in words.iter().take(tocopy).enumerate() {
+            let base = slot * 12;
+            buf[base..base + 4].copy_from_slice(&triple[0].to_le_bytes());
+            buf[base + 4..base + 8].copy_from_slice(&triple[1].to_le_bytes());
+            buf[base + 8..base + 12].copy_from_slice(&triple[2].to_le_bytes());
+        }
+        write_result(memory, data_addr, &buf[..tocopy * 12])
+    }
+
+    /// `kernel/capability.c` `sys_capset` + `security/commoncap.c` `cap_capset`
+    /// (Linux v6.12).
+    pub(super) fn capset<M: UserMemory>(&mut self, args: [u64; 6], memory: &mut M) -> u64 {
+        let hdr_addr = args[0];
+        let data_addr = args[1];
+        let (tocopy, pid) = match cap_validate_magic(hdr_addr, memory) {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+        if pid != 0 && pid as u32 != self.tid.get() {
+            return errno(EPERM);
+        }
+        if data_addr == 0 {
+            return errno(EFAULT);
+        }
+        let mut buf = [0u8; 24];
+        if memory.read(data_addr, &mut buf[..tocopy * 12]).is_err() {
+            return errno(EFAULT);
+        }
+        let read_u32 = |off: usize| u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        let mut effective = u64::from(read_u32(0));
+        let mut permitted = u64::from(read_u32(4));
+        let mut inheritable = u64::from(read_u32(8));
+        if tocopy == 2 {
+            effective |= u64::from(read_u32(12)) << 32;
+            permitted |= u64::from(read_u32(16)) << 32;
+            inheritable |= u64::from(read_u32(20)) << 32;
+        }
+        let mut creds = self.shared.credentials.lock();
+        let old = creds.capabilities;
+        // `security/commoncap.c` `cap_capset`:
+        // 1. Inheritable cannot grow beyond old.inheritable | old.permitted
+        //    without CAP_SETPCAP, nor beyond old.inheritable | old.bounding.
+        let allowed_inheritable = if old.has_effective(CAP_SETPCAP) {
+            old.inheritable | old.permitted | old.bounding
+        } else {
+            old.inheritable | old.permitted
+        };
+        if (inheritable & !allowed_inheritable) != 0 {
+            return errno(EPERM);
+        }
+        if (inheritable & !(old.inheritable | old.bounding)) != 0 {
+            return errno(EPERM);
+        }
+        // 2. Permitted cannot grow beyond old.permitted.
+        if (permitted & !old.permitted) != 0 {
+            return errno(EPERM);
+        }
+        // 3. Effective must be a subset of the new permitted set.
+        if (effective & !permitted) != 0 {
+            return errno(EPERM);
+        }
+        creds.capabilities.effective = effective & CAP_FULL_SET;
+        creds.capabilities.permitted = permitted & CAP_FULL_SET;
+        creds.capabilities.inheritable = inheritable & CAP_FULL_SET;
+        // `cap_capset` clears ambient bits not in both new permitted & inheritable.
+        creds.capabilities.ambient &= creds.capabilities.permitted & creds.capabilities.inheritable;
+        0
+    }
+}
+
 impl<R: Resources> Process<R> {
     /// kernel/sys.c `prlimit64`, `getrlimit` and `setrlimit`.
     pub(super) fn rlimit<M: UserMemory>(
@@ -1239,5 +1419,30 @@ impl<R: Resources> Process<R> {
         }
         attributes.nice = nice;
         0
+    }
+
+    /// `prctl(option, arg2, arg3, arg4, arg5)` (`kernel/sys.c` `sys_prctl`,
+    /// Linux v6.12). Supports `PR_SET_NO_NEW_PRIVS` (38) and
+    /// `PR_GET_NO_NEW_PRIVS` (39); other options return `EINVAL`.
+    pub(super) fn prctl(&mut self, args: [u64; 6]) -> u64 {
+        // `include/uapi/linux/prctl.h`, Linux v6.12.
+        const PR_SET_NO_NEW_PRIVS: i32 = 38;
+        const PR_GET_NO_NEW_PRIVS: i32 = 39;
+        match args[0] as u32 as i32 {
+            PR_SET_NO_NEW_PRIVS => {
+                if args[1] != 1 || args[2] != 0 || args[3] != 0 || args[4] != 0 {
+                    return errno(EINVAL);
+                }
+                self.shared.credentials.lock().no_new_privs = true;
+                0
+            }
+            PR_GET_NO_NEW_PRIVS => {
+                if args[1] != 0 || args[2] != 0 || args[3] != 0 || args[4] != 0 {
+                    return errno(EINVAL);
+                }
+                u64::from(self.shared.credentials.lock().no_new_privs)
+            }
+            _ => errno(EINVAL),
+        }
     }
 }

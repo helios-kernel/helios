@@ -45,23 +45,23 @@ impl Iterator for ReceivePairOrder {
 ///
 /// Owned by the polling task alone: the sink runs synchronously on the
 /// processor that called the drain, so nothing here is shared.
-struct RxBatchDelivery {
+pub(super) struct RxBatchDelivery {
     /// Shards that took a frame, signalled once the batch is done.
-    arrivals: ShardArrivals,
+    pub(super) arrivals: ShardArrivals,
     /// Frames a shard consumed — delivered or unparseable — which is
     /// what the poll's receive budget counts.
-    delivered: usize,
-    delivered_bytes: usize,
+    pub(super) delivered: usize,
+    pub(super) delivered_bytes: usize,
     /// Bytes of every frame the device lent, refused ones included:
     /// the ring phase's byte count.
-    lent_bytes: usize,
+    pub(super) lent_bytes: usize,
     /// Time spent demuxing inside the device's hold, summed over the
     /// batch's frames, which the ring phase is reported without.
-    dispatch: NetworkPerfSpan,
+    pub(super) dispatch: NetworkPerfSpan,
 }
 
 impl RxBatchDelivery {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             arrivals: ShardArrivals::new(),
             delivered: 0,
@@ -169,6 +169,94 @@ where
         .await
     }
 
+    /// Starts a non-blocking TCP connection attempt and drives the stack once.
+    pub async fn tcp_connect_start(
+        &self,
+        remote_address: NetworkIpAddress,
+        port: u16,
+        local_port: u16,
+        hop_limit: u8,
+    ) -> Result<(TcpStreamId, TcpConnectPoll), TcpError> {
+        let destination = map_network_ip_address(remote_address);
+        let local = self.local_address_for(destination).ok_or(TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::NetworkServiceUnavailable,
+        })?;
+        let shard_count = self.inner.state.shard_count();
+        let opened_at = StackInstant::from_nanos(self.now_nanos());
+        let stream = if local_port == 0 {
+            self.inner.state.open_ephemeral_tcp_connect(
+                self.accepting_shard_idx(),
+                TcpConnectRequest {
+                    local,
+                    destination,
+                    port,
+                    hop_limit,
+                    opened_at,
+                },
+            )?
+        } else {
+            let owner = shard_idx_for_flow(local, local_port, destination, port, shard_count);
+            self.inner
+                .state
+                .shard_at(owner)
+                .lock()
+                .start_tcp_connect(local, destination, port, local_port, hop_limit, opened_at)
+                .map_err(TcpConnectStartError::into_tcp_error)?
+        };
+        if let Err(error) = self.drive_tcp().await {
+            self.tcp_close(stream);
+            return Err(error);
+        }
+        let now = StackInstant::from_nanos(self.now_nanos());
+        match self
+            .inner
+            .state
+            .with_handle(stream, |state| match state.poll_tcp_connect(stream) {
+                Ok(TcpConnectProgress::Connected) => Ok(TcpConnectPoll::Connected),
+                Ok(TcpConnectProgress::Pending) => Ok(TcpConnectPoll::Pending),
+                Err(error) => {
+                    state.remove_tcp_stream(stream, now);
+                    Err(error)
+                }
+            }) {
+            Ok(progress) => Ok((stream, progress)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Drives the stack and polls an in-flight non-blocking TCP connection.
+    pub async fn tcp_connect_poll(&self, stream: TcpStreamId) -> Result<TcpConnectPoll, TcpError> {
+        self.drive_tcp().await?;
+        self.inner
+            .state
+            .with_handle(stream, |state| match state.poll_tcp_connect(stream) {
+                Ok(TcpConnectProgress::Connected) => Ok(TcpConnectPoll::Connected),
+                Ok(TcpConnectProgress::Pending) => Ok(TcpConnectPoll::Pending),
+                Err(error) => Err(error),
+            })
+    }
+
+    /// Returns the local IP address and port bound to `stream`, if any.
+    pub fn tcp_local_endpoint(
+        &self,
+        stream: TcpStreamId,
+    ) -> Result<Option<(NetworkIpAddress, u16)>, TcpError> {
+        self.inner.state.with_handle(stream, |state| {
+            let socket = state.tcp_socket(stream)?;
+            state
+                .stack
+                .tcp_local_endpoint(socket)
+                .map(|endpoint| {
+                    endpoint.map(|endpoint| (map_ip_address(endpoint.address), endpoint.port))
+                })
+                .map_err(|_| TcpError {
+                    kind: TcpErrorKind::Unavailable,
+                    detail: NetworkErrorDetail::UnknownTcpStream,
+                })
+        })
+    }
+
     pub async fn tcp_listen(
         &self,
         local_address: NetworkIpAddress,
@@ -228,6 +316,16 @@ where
         timeout_nanos: u64,
     ) -> Result<(), TcpError> {
         self.execute_tcp_write_all_bytes(stream, bytes, timeout_nanos)
+            .await
+    }
+
+    pub async fn tcp_write_some_bytes(
+        &self,
+        stream: TcpStreamId,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> Result<usize, TcpError> {
+        self.execute_tcp_write_some_bytes(stream, bytes, timeout_nanos)
             .await
     }
 
@@ -473,7 +571,7 @@ where
         hop_limit: u8,
         deadline_nanos: u64,
     ) -> Result<TcpStreamId, TcpError> {
-        if matches!(destination, IpAddress::Ipv4(_)) {
+        if matches!(destination, IpAddress::Ipv4(ip) if !ip.is_loopback()) {
             self.wait_for_ipv4_tcp(deadline_nanos).await?;
         }
         // The source address is the same on every shard — the control
@@ -698,6 +796,51 @@ where
             self.wait_for_tcp_progress(wait, deadline_nanos).await;
         }
         Ok(())
+    }
+
+    pub(super) async fn execute_tcp_write_some_bytes(
+        &self,
+        stream: TcpStreamId,
+        mut bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> Result<usize, TcpError> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        let mut written = 0usize;
+        while !bytes.is_empty() {
+            let wait = self.shard_wait_for_handle(stream);
+            let progress = self.inner.state.with_handle(stream, |state| {
+                state.try_write_tcp_bytes(stream, &mut bytes)
+            })?;
+            self.drive_tcp().await?;
+            match progress {
+                TcpWriteProgress::Room(queued) => {
+                    written += queued;
+                    if bytes.is_empty() || timeout_nanos == 0 {
+                        return Ok(written);
+                    }
+                    continue;
+                }
+                TcpWriteProgress::Pending => {
+                    if written > 0 {
+                        return Ok(written);
+                    }
+                }
+                TcpWriteProgress::Closed(error) => {
+                    return if written > 0 { Ok(written) } else { Err(error) };
+                }
+            }
+            if self.now_nanos() >= deadline_nanos {
+                return Err(TcpError {
+                    kind: TcpErrorKind::Timeout,
+                    detail: NetworkErrorDetail::TcpWriteTimeout,
+                });
+            }
+            self.wait_for_tcp_progress(wait, deadline_nanos).await;
+        }
+        Ok(written)
     }
 
     pub(super) async fn execute_tcp_read(
@@ -1223,7 +1366,7 @@ where
     /// for different flows are processed in parallel by other
     /// processors and each shard's stack only sees the connections it
     /// owns.
-    fn deliver_rx_frame(
+    pub(super) fn deliver_rx_frame(
         &self,
         frame: &RxFrame,
         received_at: StackInstant,
@@ -1232,6 +1375,13 @@ where
         let dispatch_started = self.profile_start();
         let frame_len = frame.len();
         batch.lent_bytes = batch.lent_bytes.saturating_add(frame_len);
+        if self
+            .inner
+            .packet_taps
+            .tap_rx_frame(IFINDEX_ETH0, frame.bytes.as_ref())
+        {
+            self.inner.state.any_arrival.signal();
+        }
         match self
             .inner
             .state

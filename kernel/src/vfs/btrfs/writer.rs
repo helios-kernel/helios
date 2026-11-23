@@ -27,6 +27,7 @@
 //!   the mount stops taking writes it cannot make durable.
 
 use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::Arc as SharedArc;
 use alloc::vec::Vec;
@@ -38,20 +39,26 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use futures::channel::oneshot;
 use futures::future::{Either, select};
 use helios_btrfs::write::{
-    Attributes, ChunkError, InodeHandle, Name, RootUuids, SpaceError, WriteError, WriteTransaction,
-    Writer,
+    Attributes, ChunkError, CloneRange, InodeHandle, Name, RootUuids, SpaceError, Special,
+    WriteError, WriteTransaction, Writer, XattrMode,
 };
 use helios_btrfs::{BlockSink, Error, FileKind, Timestamp};
 use helios_hal::cpu::{Cpu, Instant};
 use helios_hal::fs::{
-    BlockDevice, FsError, FsResult, Landed, NodeKind, OpenFlags, RenameMode, WritePosition,
+    BlockDevice, BlockSerial, DeviceId, FsError, FsResult, Landed, NodeKind, OpenFlags, RenameMode,
+    WritePosition,
+};
+use helios_hal::fs_management::{
+    BalanceFilter, BalanceReport, DedupeOutcome, QgroupId, QgroupInfo, QgroupLimit, QuotaStatus,
+    ResizeTarget, ScrubReport, SubvolumeInfo, VolumeDeviceInfo, VolumeManagementError,
+    VolumeManagementResult,
 };
 use triomphe::Arc;
 
-use super::super::UnixAttributes;
-use super::{Image, LivePolicy, Snapshot};
+use super::super::{DeviceIdAllocator, UnixAttributes, UnixFsError};
+use super::{Image, LivePolicy, MountLease, Snapshot};
 use crate::component::{ProviderReceiver, ProviderSender, provider_channel};
-use crate::{BlockPages, ProgressMark, ProgressSignal, RootEntropyHandle, Timer};
+use crate::{BlockPages, CachedDisk, ProgressMark, ProgressSignal, RootEntropyHandle, Timer};
 
 /// Pending inode releases enqueued by dropped [`BtrfsOpenHandle`]s.
 ///
@@ -179,11 +186,18 @@ pub(super) enum Operation {
     },
     Open {
         flags: OpenFlags,
+        attributes: Option<Attributes>,
     },
     CreateTmpfile {
         exclusive: bool,
     },
-    CreateDirectory,
+    CreateDirectory {
+        attributes: Option<Attributes>,
+    },
+    CreateSpecial {
+        special: Special,
+        attributes: Attributes,
+    },
     Remove {
         directory: bool,
     },
@@ -194,6 +208,21 @@ pub(super) enum Operation {
         access: Option<u64>,
         modified: Option<u64>,
     },
+    SetPermissions {
+        permissions: u32,
+    },
+    SetOwner {
+        uid: Option<u32>,
+        gid: Option<u32>,
+    },
+    SetXattr {
+        name: String,
+        value: bytes::Bytes,
+        mode: XattrMode,
+    },
+    RemoveXattr {
+        name: String,
+    },
     Rename {
         destination: String,
         mode: RenameMode,
@@ -203,6 +232,7 @@ pub(super) enum Operation {
     },
     Symlink {
         target: String,
+        attributes: Option<Attributes>,
     },
     Sync,
 }
@@ -211,7 +241,163 @@ pub(super) struct Request {
     target: Target,
     when: u64,
     operation: Operation,
-    reply: oneshot::Sender<FsResult<Response>>,
+    reply: oneshot::Sender<Result<Response, UnixFsError>>,
+}
+
+pub(super) enum ManageResponse {
+    Done,
+    Subvolume(SubvolumeInfo),
+    Subvolumes(Vec<SubvolumeInfo>),
+    Stream(Vec<u8>),
+    Dedupe(DedupeOutcome),
+    Device(VolumeDeviceInfo),
+    Devices(Vec<VolumeDeviceInfo>),
+    Balance(BalanceReport),
+    Scrub(ScrubReport),
+    QuotaStatus(QuotaStatus),
+    Qgroups(Vec<QgroupInfo>),
+}
+
+pub(super) enum ManageOperation<Device: BlockDevice<Buffer = BlockPages>> {
+    CreateSubvolume {
+        path: String,
+        now: u64,
+    },
+    DeleteSubvolume {
+        path: String,
+        now: u64,
+    },
+    SnapshotSubvolume {
+        source: String,
+        destination: String,
+        read_only: bool,
+        now: u64,
+    },
+    SetSubvolumeReadOnly {
+        path: String,
+        read_only: bool,
+    },
+    SubvolumeInfo {
+        path: String,
+    },
+    ListSubvolumes,
+    SendSubvolume {
+        subvolume: String,
+        parent: Option<String>,
+        clone_sources: Vec<String>,
+    },
+    ReceiveSubvolume {
+        destination: String,
+        stream: Vec<u8>,
+        now: u64,
+        authorized_sources: BTreeSet<String>,
+    },
+    Reflink {
+        source: String,
+        source_offset: u64,
+        destination: String,
+        destination_offset: u64,
+        length: u64,
+        now: u64,
+    },
+    Dedupe {
+        source: String,
+        source_offset: u64,
+        destination: String,
+        destination_offset: u64,
+        length: u64,
+        now: u64,
+    },
+    ListDevices,
+    AddDevice {
+        disk: CachedDisk<Device>,
+    },
+    RemoveDevice {
+        devid: u64,
+    },
+    ReplaceDevice {
+        source_devid: u64,
+        target: CachedDisk<Device>,
+    },
+    ResizeDevice {
+        devid: Option<u64>,
+        target: ResizeTarget,
+    },
+    Balance {
+        filter: BalanceFilter,
+    },
+    Scrub {
+        devid: Option<u64>,
+        read_only: bool,
+    },
+    QuotaEnable,
+    QuotaDisable,
+    QuotaRescan,
+    QuotaStatus,
+    ListQgroups,
+    QgroupCreate {
+        id: QgroupId,
+    },
+    QgroupDestroy {
+        id: QgroupId,
+    },
+    QgroupAssign {
+        member: QgroupId,
+        parent: QgroupId,
+    },
+    QgroupRemove {
+        member: QgroupId,
+        parent: QgroupId,
+    },
+    QgroupLimit {
+        id: QgroupId,
+        limit: QgroupLimit,
+    },
+}
+
+pub(super) struct ManageRequest<Device: BlockDevice<Buffer = BlockPages>> {
+    operation: ManageOperation<Device>,
+    reply: oneshot::Sender<VolumeManagementResult<ManageResponse>>,
+}
+
+pub(super) struct ManageClient<Device: BlockDevice<Buffer = BlockPages>> {
+    sender: ProviderSender<ManageRequest<Device>>,
+}
+
+impl<Device: BlockDevice<Buffer = BlockPages>> Drop for ManageClient<Device> {
+    fn drop(&mut self) {
+        self.sender.close();
+    }
+}
+
+impl<Device: BlockDevice<Buffer = BlockPages>> ManageClient<Device> {
+    pub(super) fn close(&self) {
+        self.sender.close();
+    }
+
+    pub(super) async fn execute(
+        &self,
+        operation: ManageOperation<Device>,
+    ) -> VolumeManagementResult<ManageResponse> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .send(ManageRequest { operation, reply })
+            .await
+            .map_err(|_| VolumeManagementError::Fs(FsError::Io))?;
+        result
+            .await
+            .map_err(|_| VolumeManagementError::Fs(FsError::Io))?
+    }
+}
+
+pub(super) fn manage_channel<Device: BlockDevice<Buffer = BlockPages>>(
+    capacity: NonZeroUsize,
+) -> (
+    ManageClient<Device>,
+    ProviderReceiver<ManageRequest<Device>>,
+) {
+    let (sender, receiver) = provider_channel(capacity.get());
+    (ManageClient { sender }, receiver)
 }
 
 pub(super) struct Client {
@@ -302,6 +488,7 @@ impl Client {
     ) -> FsResult<Response> {
         self.execute_target(Target::Path(String::from(path)), when, operation)
             .await
+            .map_err(UnixFsError::into_fs_error)
     }
 
     pub(super) async fn execute_inode(
@@ -312,6 +499,27 @@ impl Client {
     ) -> FsResult<Response> {
         self.execute_target(Target::Inode(inode), when, operation)
             .await
+            .map_err(UnixFsError::into_fs_error)
+    }
+
+    pub(super) async fn execute_unix(
+        &self,
+        path: &str,
+        when: u64,
+        operation: Operation,
+    ) -> Result<Response, UnixFsError> {
+        self.execute_target(Target::Path(String::from(path)), when, operation)
+            .await
+    }
+
+    pub(super) async fn execute_inode_unix(
+        &self,
+        inode: InodeHandle,
+        when: u64,
+        operation: Operation,
+    ) -> Result<Response, UnixFsError> {
+        self.execute_target(Target::Inode(inode), when, operation)
+            .await
     }
 
     async fn execute_target(
@@ -319,7 +527,7 @@ impl Client {
         target: Target,
         when: u64,
         operation: Operation,
-    ) -> FsResult<Response> {
+    ) -> Result<Response, UnixFsError> {
         let (reply, result) = oneshot::channel();
         self.sender
             .send(Request {
@@ -329,8 +537,8 @@ impl Client {
                 reply,
             })
             .await
-            .map_err(|_| FsError::Io)?;
-        result.await.map_err(|_| FsError::Io)?
+            .map_err(|_| UnixFsError::Fs(FsError::Io))?;
+        result.await.map_err(|_| UnixFsError::Fs(FsError::Io))?
     }
 }
 
@@ -353,7 +561,11 @@ pub(super) fn channel(capacity: NonZeroUsize) -> (Client, ProviderReceiver<Reque
 pub struct BtrfsService<Device: BlockDevice<Buffer = BlockPages>> {
     pub(super) writer: Writer<Image<Device>, EntropyUuids>,
     pub(super) receiver: ProviderReceiver<Request>,
+    pub(super) manage_receiver: ProviderReceiver<ManageRequest<Device>>,
     pub(super) published: Arc<spin::Mutex<Snapshot<Device>>>,
+    pub(super) devices: Arc<spin::Mutex<BTreeMap<u64, (DeviceId, u64)>>>,
+    pub(super) block_serials: Arc<spin::Mutex<BTreeMap<u64, BlockSerial>>>,
+    pub(super) device_ids: DeviceIdAllocator,
     pub(super) releases: SharedArc<PendingReleases>,
     pub(super) concurrency: NonZeroUsize,
     pub(super) policy: Arc<LivePolicy>,
@@ -362,11 +574,12 @@ pub struct BtrfsService<Device: BlockDevice<Buffer = BlockPages>> {
 }
 
 /// A sync request's reply, held until a commit covers it.
-type SyncWaiter = oneshot::Sender<FsResult<Response>>;
+type SyncWaiter = oneshot::Sender<Result<Response, UnixFsError>>;
 
 /// What woke the service.
-enum Wake {
+enum Wake<Device: BlockDevice<Buffer = BlockPages>> {
     Request(Option<Request>),
+    Manage(Option<ManageRequest<Device>>),
     /// The commit deadline passed, the operator changed the policy, or an open
     /// handle was dropped.
     Wakeup,
@@ -379,6 +592,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
         // When the running transaction first changed: the commit interval
         // runs from here, as Linux's from the transaction's `start_time`.
         let mut dirty_since: Option<Instant> = None;
+        let mut manage_open = true;
         loop {
             let release_mark = self.releases.mark();
             if self.releases.has_pending() {
@@ -418,6 +632,13 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
             }
             let wake = {
                 let request = pin!(self.receiver.recv());
+                let manage = pin!(async {
+                    if manage_open {
+                        self.manage_receiver.recv().await
+                    } else {
+                        pending().await
+                    }
+                });
                 let due = pin!(async {
                     match deadline {
                         Some(deadline) => timer.sleep_until(deadline).await,
@@ -426,13 +647,43 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
                 });
                 let changed = pin!(self.policy.changed.changed(mark));
                 let released = pin!(self.releases.changed(release_mark));
-                match select(request, select(released, select(due, changed))).await {
-                    Either::Left((request, _)) => Wake::Request(request),
+                match select(
+                    select(request, manage),
+                    select(released, select(due, changed)),
+                )
+                .await
+                {
+                    Either::Left((Either::Left((request, _)), _)) => Wake::Request(request),
+                    Either::Left((Either::Right((manage, _)), _)) => Wake::Manage(manage),
                     Either::Right(_) => Wake::Wakeup,
                 }
             };
             match wake {
                 Wake::Wakeup => {}
+                Wake::Manage(None) => {
+                    manage_open = false;
+                }
+                Wake::Manage(Some(req)) => {
+                    if !Box::pin(self.drain_releases()).await {
+                        return;
+                    }
+                    if !req.reply.is_canceled() {
+                        // Box management futures so infrequent volume-admin
+                        // state machines do not inflate `BtrfsService::run`'s
+                        // stack frame on bare-metal kernel tasks.
+                        let res = Box::pin(self.apply_manage(req.operation)).await;
+                        if let Ok(snap) = self.writer.snapshot() {
+                            Box::pin(self.refresh_subvolume_devices(&snap)).await;
+                            *self.published.lock() = snap;
+                        }
+                        if self.writer.dirty().is_clean() {
+                            dirty_since = None;
+                        } else if dirty_since.is_none() {
+                            dirty_since = Some(timer.now());
+                        }
+                        let _ = req.reply.send(res);
+                    }
+                }
                 Wake::Request(None) => {
                     // Unmounted: release any dropped handles, then make what
                     // the running transaction holds durable before releasing
@@ -468,9 +719,576 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
         }
     }
 
+    async fn refresh_subvolume_devices(&self, snap: &Snapshot<Device>) {
+        let mut live = BTreeMap::new();
+        if snap
+            .subvolumes(|tree, root_inode| {
+                live.insert(tree, root_inode);
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let mut devices = self.devices.lock();
+        devices.retain(|tree, _| live.contains_key(tree));
+        for (tree, root_inode) in live {
+            devices
+                .entry(tree)
+                .or_insert_with(|| (self.device_ids.allocate(), root_inode));
+        }
+    }
+
+    #[inline(never)]
+    async fn resolve_subvolume_tree(&mut self, path: &str) -> VolumeManagementResult<u64> {
+        let handle = {
+            let tx = self.writer.join().await.map_err(volume_error)?;
+            inode(&tx, path).await.map_err(VolumeManagementError::Fs)?
+        };
+        let info = self
+            .writer
+            .subvolume_info(handle.tree())
+            .await
+            .map_err(volume_error)?;
+        if info.path != path {
+            return Err(VolumeManagementError::NotSubvolume);
+        }
+        Ok(handle.tree())
+    }
+
+    #[inline(never)]
+    async fn manage_create_subvolume(
+        &mut self,
+        path: String,
+        now: u64,
+    ) -> VolumeManagementResult<ManageResponse> {
+        if path.is_empty() {
+            return Err(VolumeManagementError::Fs(FsError::Exists));
+        }
+        let (parent_path, name) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
+        let attrs = {
+            let tx = self.writer.join().await.map_err(volume_error)?;
+            let parent_handle = inode(&tx, parent_path)
+                .await
+                .map_err(VolumeManagementError::Fs)?;
+            inherited(&tx, &parent_handle, NodeKind::Directory)
+                .await
+                .map_err(VolumeManagementError::Fs)?
+        };
+        let info = Box::pin(self.writer.create_subvolume(
+            parent_path,
+            name.as_bytes(),
+            attrs,
+            timestamp(now),
+        ))
+        .await
+        .map_err(volume_error)?;
+        Ok(ManageResponse::Subvolume(info))
+    }
+
+    #[inline(never)]
+    async fn manage_delete_subvolume(
+        &mut self,
+        path: String,
+        now: u64,
+    ) -> VolumeManagementResult<ManageResponse> {
+        if path.is_empty() {
+            return Err(VolumeManagementError::DefaultSubvolume);
+        }
+        let _tree = self.resolve_subvolume_tree(&path).await?;
+        let (parent_path, name) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
+        Box::pin(
+            self.writer
+                .delete_subvolume(parent_path, name.as_bytes(), timestamp(now)),
+        )
+        .await
+        .map_err(volume_error)?;
+        Ok(ManageResponse::Done)
+    }
+
+    #[inline(never)]
+    async fn manage_snapshot_subvolume(
+        &mut self,
+        source: String,
+        destination: String,
+        read_only: bool,
+        now: u64,
+    ) -> VolumeManagementResult<ManageResponse> {
+        if destination.is_empty() {
+            return Err(VolumeManagementError::Fs(FsError::Exists));
+        }
+        let source_tree = self.resolve_subvolume_tree(&source).await?;
+        let (parent_path, name) = destination
+            .rsplit_once('/')
+            .unwrap_or(("", destination.as_str()));
+        let info = Box::pin(self.writer.snapshot_subvolume(
+            source_tree,
+            parent_path,
+            name.as_bytes(),
+            read_only,
+            timestamp(now),
+        ))
+        .await
+        .map_err(volume_error)?;
+        Ok(ManageResponse::Subvolume(info))
+    }
+
+    #[inline(never)]
+    async fn manage_set_subvolume_read_only(
+        &mut self,
+        path: String,
+        read_only: bool,
+    ) -> VolumeManagementResult<ManageResponse> {
+        let tree = self.resolve_subvolume_tree(&path).await?;
+        Box::pin(self.writer.set_subvolume_read_only(tree, read_only))
+            .await
+            .map_err(volume_error)?;
+        Ok(ManageResponse::Done)
+    }
+
+    #[inline(never)]
+    async fn manage_subvolume_info(
+        &mut self,
+        path: String,
+    ) -> VolumeManagementResult<ManageResponse> {
+        let tree = self.resolve_subvolume_tree(&path).await?;
+        let info = Box::pin(self.writer.subvolume_info(tree))
+            .await
+            .map_err(volume_error)?;
+        Ok(ManageResponse::Subvolume(info))
+    }
+
+    #[inline(never)]
+    async fn manage_list_subvolumes(&mut self) -> VolumeManagementResult<ManageResponse> {
+        let list = Box::pin(self.writer.list_subvolumes())
+            .await
+            .map_err(volume_error)?;
+        Ok(ManageResponse::Subvolumes(list))
+    }
+
+    #[inline(never)]
+    async fn manage_send_subvolume(
+        &mut self,
+        subvolume: String,
+        parent: Option<String>,
+        clone_sources: Vec<String>,
+    ) -> VolumeManagementResult<ManageResponse> {
+        let tree = self.resolve_subvolume_tree(&subvolume).await?;
+        let parent_tree = match parent {
+            Some(ref p) => Some(self.resolve_subvolume_tree(p).await?),
+            None => None,
+        };
+        let mut clone_trees = Vec::with_capacity(clone_sources.len());
+        for src in &clone_sources {
+            clone_trees.push(self.resolve_subvolume_tree(src).await?);
+        }
+        let bytes = Box::pin(self.writer.send_subvolume(tree, parent_tree, &clone_trees))
+            .await
+            .map_err(volume_error)?;
+        Ok(ManageResponse::Stream(bytes))
+    }
+
+    #[inline(never)]
+    async fn manage_receive_subvolume(
+        &mut self,
+        destination: String,
+        stream: Vec<u8>,
+        now: u64,
+        authorized_sources: BTreeSet<String>,
+    ) -> VolumeManagementResult<ManageResponse> {
+        let info = Box::pin(self.writer.receive_subvolume(
+            &destination,
+            &stream,
+            timestamp(now),
+            |source_path| {
+                if authorized_sources.contains(source_path) {
+                    Ok(())
+                } else {
+                    Err(WriteError::PermissionDenied)
+                }
+            },
+        ))
+        .await
+        .map_err(volume_error)?;
+        Ok(ManageResponse::Subvolume(info))
+    }
+
+    #[inline(never)]
+    async fn manage_reflink(
+        &mut self,
+        source: String,
+        source_offset: u64,
+        destination: String,
+        destination_offset: u64,
+        length: u64,
+        now: u64,
+    ) -> VolumeManagementResult<ManageResponse> {
+        let mut tx = self.writer.join().await.map_err(volume_error)?;
+        let src = inode(&tx, &source)
+            .await
+            .map_err(VolumeManagementError::Fs)?;
+        let dst = inode(&tx, &destination)
+            .await
+            .map_err(VolumeManagementError::Fs)?;
+        Box::pin(tx.clone_range(
+            CloneRange {
+                source: &src,
+                destination: &dst,
+                source_offset,
+                destination_offset,
+                length,
+            },
+            timestamp(now),
+        ))
+        .await
+        .map_err(volume_error)?;
+        Ok(ManageResponse::Done)
+    }
+
+    #[inline(never)]
+    async fn manage_dedupe(
+        &mut self,
+        source: String,
+        source_offset: u64,
+        destination: String,
+        destination_offset: u64,
+        length: u64,
+        now: u64,
+    ) -> VolumeManagementResult<ManageResponse> {
+        let mut tx = self.writer.join().await.map_err(volume_error)?;
+        let src = inode(&tx, &source)
+            .await
+            .map_err(VolumeManagementError::Fs)?;
+        let dst = inode(&tx, &destination)
+            .await
+            .map_err(VolumeManagementError::Fs)?;
+        let outcome = Box::pin(tx.dedupe_range(
+            CloneRange {
+                source: &src,
+                destination: &dst,
+                source_offset,
+                destination_offset,
+                length,
+            },
+            timestamp(now),
+        ))
+        .await
+        .map_err(volume_error)?;
+        Ok(ManageResponse::Dedupe(outcome))
+    }
+
+    #[inline(never)]
+    async fn manage_list_devices(&mut self) -> VolumeManagementResult<ManageResponse> {
+        let mut list = Box::pin(self.writer.list_devices())
+            .await
+            .map_err(volume_error)?;
+        let serials = self.block_serials.lock();
+        for dev in &mut list {
+            dev.serial = serials.get(&dev.devid).copied();
+        }
+        Ok(ManageResponse::Devices(list))
+    }
+
+    #[inline(never)]
+    async fn manage_add_device(
+        &mut self,
+        disk: CachedDisk<Device>,
+    ) -> VolumeManagementResult<ManageResponse> {
+        let serial = disk.serial();
+        let lease = disk
+            .write_mount()
+            .ok_or(VolumeManagementError::Fs(FsError::Busy))?;
+        let image = Image {
+            disk,
+            _lease: MountLease::Write { _lease: lease },
+        };
+        let mut info = Box::pin(self.writer.add_device(image))
+            .await
+            .map_err(volume_error)?;
+        self.block_serials.lock().insert(info.devid, serial);
+        info.serial = Some(serial);
+        Ok(ManageResponse::Device(info))
+    }
+
+    #[inline(never)]
+    async fn manage_remove_device(&mut self, devid: u64) -> VolumeManagementResult<ManageResponse> {
+        Box::pin(self.writer.remove_device(devid))
+            .await
+            .map_err(volume_error)?;
+        self.block_serials.lock().remove(&devid);
+        Ok(ManageResponse::Done)
+    }
+
+    #[inline(never)]
+    async fn manage_replace_device(
+        &mut self,
+        source_devid: u64,
+        target: CachedDisk<Device>,
+    ) -> VolumeManagementResult<ManageResponse> {
+        let serial = target.serial();
+        let lease = target
+            .write_mount()
+            .ok_or(VolumeManagementError::Fs(FsError::Busy))?;
+        let image = Image {
+            disk: target,
+            _lease: MountLease::Write { _lease: lease },
+        };
+        let mut info = Box::pin(self.writer.replace_device(source_devid, image))
+            .await
+            .map_err(volume_error)?;
+        self.block_serials.lock().insert(info.devid, serial);
+        info.serial = Some(serial);
+        Ok(ManageResponse::Device(info))
+    }
+
+    #[inline(never)]
+    async fn manage_resize_device(
+        &mut self,
+        devid: Option<u64>,
+        target: ResizeTarget,
+    ) -> VolumeManagementResult<ManageResponse> {
+        let mut info = Box::pin(self.writer.resize_device(devid, target))
+            .await
+            .map_err(volume_error)?;
+        info.serial = self.block_serials.lock().get(&info.devid).copied();
+        Ok(ManageResponse::Device(info))
+    }
+
+    #[inline(never)]
+    async fn manage_balance(
+        &mut self,
+        filter: BalanceFilter,
+    ) -> VolumeManagementResult<ManageResponse> {
+        let report = Box::pin(self.writer.balance(filter))
+            .await
+            .map_err(volume_error)?;
+        Ok(ManageResponse::Balance(report))
+    }
+
+    #[inline(never)]
+    async fn manage_scrub(
+        &mut self,
+        devid: Option<u64>,
+        read_only: bool,
+    ) -> VolumeManagementResult<ManageResponse> {
+        let report = Box::pin(self.writer.scrub(devid, read_only))
+            .await
+            .map_err(volume_error)?;
+        Ok(ManageResponse::Scrub(report))
+    }
+
+    #[inline(never)]
+    async fn manage_quota_enable(&mut self) -> VolumeManagementResult<ManageResponse> {
+        Box::pin(self.writer.quota_enable())
+            .await
+            .map_err(volume_error)?;
+        Ok(ManageResponse::Done)
+    }
+
+    #[inline(never)]
+    async fn manage_quota_disable(&mut self) -> VolumeManagementResult<ManageResponse> {
+        Box::pin(self.writer.quota_disable())
+            .await
+            .map_err(volume_error)?;
+        Ok(ManageResponse::Done)
+    }
+
+    #[inline(never)]
+    async fn manage_quota_rescan(&mut self) -> VolumeManagementResult<ManageResponse> {
+        Box::pin(self.writer.quota_rescan())
+            .await
+            .map_err(volume_error)?;
+        Ok(ManageResponse::Done)
+    }
+
+    #[inline(never)]
+    async fn manage_quota_status(&mut self) -> VolumeManagementResult<ManageResponse> {
+        let status = Box::pin(self.writer.quota_status())
+            .await
+            .map_err(volume_error)?;
+        Ok(ManageResponse::QuotaStatus(status))
+    }
+
+    #[inline(never)]
+    async fn manage_list_qgroups(&mut self) -> VolumeManagementResult<ManageResponse> {
+        let list = Box::pin(self.writer.list_qgroups())
+            .await
+            .map_err(volume_error)?;
+        Ok(ManageResponse::Qgroups(list))
+    }
+
+    #[inline(never)]
+    async fn manage_qgroup_create(
+        &mut self,
+        id: QgroupId,
+    ) -> VolumeManagementResult<ManageResponse> {
+        Box::pin(self.writer.qgroup_create(id))
+            .await
+            .map_err(volume_error)?;
+        Ok(ManageResponse::Done)
+    }
+
+    #[inline(never)]
+    async fn manage_qgroup_destroy(
+        &mut self,
+        id: QgroupId,
+    ) -> VolumeManagementResult<ManageResponse> {
+        Box::pin(self.writer.qgroup_destroy(id))
+            .await
+            .map_err(volume_error)?;
+        Ok(ManageResponse::Done)
+    }
+
+    #[inline(never)]
+    async fn manage_qgroup_assign(
+        &mut self,
+        member: QgroupId,
+        parent: QgroupId,
+    ) -> VolumeManagementResult<ManageResponse> {
+        Box::pin(self.writer.qgroup_assign(member, parent))
+            .await
+            .map_err(volume_error)?;
+        Ok(ManageResponse::Done)
+    }
+
+    #[inline(never)]
+    async fn manage_qgroup_remove(
+        &mut self,
+        member: QgroupId,
+        parent: QgroupId,
+    ) -> VolumeManagementResult<ManageResponse> {
+        Box::pin(self.writer.qgroup_remove(member, parent))
+            .await
+            .map_err(volume_error)?;
+        Ok(ManageResponse::Done)
+    }
+
+    #[inline(never)]
+    async fn manage_qgroup_limit(
+        &mut self,
+        id: QgroupId,
+        limit: QgroupLimit,
+    ) -> VolumeManagementResult<ManageResponse> {
+        Box::pin(self.writer.qgroup_limit(id, limit))
+            .await
+            .map_err(volume_error)?;
+        Ok(ManageResponse::Done)
+    }
+
+    #[inline(never)]
+    async fn apply_manage(
+        &mut self,
+        operation: ManageOperation<Device>,
+    ) -> VolumeManagementResult<ManageResponse> {
+        match operation {
+            ManageOperation::CreateSubvolume { path, now } => {
+                self.manage_create_subvolume(path, now).await
+            }
+            ManageOperation::DeleteSubvolume { path, now } => {
+                self.manage_delete_subvolume(path, now).await
+            }
+            ManageOperation::SnapshotSubvolume {
+                source,
+                destination,
+                read_only,
+                now,
+            } => {
+                self.manage_snapshot_subvolume(source, destination, read_only, now)
+                    .await
+            }
+            ManageOperation::SetSubvolumeReadOnly { path, read_only } => {
+                self.manage_set_subvolume_read_only(path, read_only).await
+            }
+            ManageOperation::SubvolumeInfo { path } => self.manage_subvolume_info(path).await,
+            ManageOperation::ListSubvolumes => self.manage_list_subvolumes().await,
+            ManageOperation::SendSubvolume {
+                subvolume,
+                parent,
+                clone_sources,
+            } => {
+                self.manage_send_subvolume(subvolume, parent, clone_sources)
+                    .await
+            }
+            ManageOperation::ReceiveSubvolume {
+                destination,
+                stream,
+                now,
+                authorized_sources,
+            } => {
+                self.manage_receive_subvolume(destination, stream, now, authorized_sources)
+                    .await
+            }
+            ManageOperation::Reflink {
+                source,
+                source_offset,
+                destination,
+                destination_offset,
+                length,
+                now,
+            } => {
+                self.manage_reflink(
+                    source,
+                    source_offset,
+                    destination,
+                    destination_offset,
+                    length,
+                    now,
+                )
+                .await
+            }
+            ManageOperation::Dedupe {
+                source,
+                source_offset,
+                destination,
+                destination_offset,
+                length,
+                now,
+            } => {
+                self.manage_dedupe(
+                    source,
+                    source_offset,
+                    destination,
+                    destination_offset,
+                    length,
+                    now,
+                )
+                .await
+            }
+            ManageOperation::ListDevices => self.manage_list_devices().await,
+            ManageOperation::AddDevice { disk } => self.manage_add_device(disk).await,
+            ManageOperation::RemoveDevice { devid } => self.manage_remove_device(devid).await,
+            ManageOperation::ReplaceDevice {
+                source_devid,
+                target,
+            } => self.manage_replace_device(source_devid, target).await,
+            ManageOperation::ResizeDevice { devid, target } => {
+                self.manage_resize_device(devid, target).await
+            }
+            ManageOperation::Balance { filter } => self.manage_balance(filter).await,
+            ManageOperation::Scrub { devid, read_only } => {
+                self.manage_scrub(devid, read_only).await
+            }
+            ManageOperation::QuotaEnable => self.manage_quota_enable().await,
+            ManageOperation::QuotaDisable => self.manage_quota_disable().await,
+            ManageOperation::QuotaRescan => self.manage_quota_rescan().await,
+            ManageOperation::QuotaStatus => self.manage_quota_status().await,
+            ManageOperation::ListQgroups => self.manage_list_qgroups().await,
+            ManageOperation::QgroupCreate { id } => self.manage_qgroup_create(id).await,
+            ManageOperation::QgroupDestroy { id } => self.manage_qgroup_destroy(id).await,
+            ManageOperation::QgroupAssign { member, parent } => {
+                self.manage_qgroup_assign(member, parent).await
+            }
+            ManageOperation::QgroupRemove { member, parent } => {
+                self.manage_qgroup_remove(member, parent).await
+            }
+            ManageOperation::QgroupLimit { id, limit } => self.manage_qgroup_limit(id, limit).await,
+        }
+    }
+
     /// Processes all dropped [`BtrfsOpenHandle`]s queued in [`Self::releases`],
     /// publishing a fresh snapshot if any orphan inode was deleted. Returns
     /// `false` once the writer is poisoned.
+    #[inline(never)]
     async fn drain_releases(&mut self) -> bool {
         let pending = self.releases.drain();
         if pending.is_empty() {
@@ -504,6 +1322,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
     /// Applies `first` and what else is queued, up to `concurrency`
     /// requests, publishes the result and replies. Returns the syncs left
     /// waiting for a commit, or `None` once the writer is poisoned.
+    #[inline(never)]
     async fn apply_batch(&mut self, first: Request) -> Option<Vec<SyncWaiter>> {
         let concurrency = self.concurrency;
         let mut requests = Vec::with_capacity(concurrency.get());
@@ -518,7 +1337,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
         let mut transaction = match self.writer.join().await {
             Ok(transaction) => transaction,
             Err(error) => {
-                let error = fs_error(error);
+                let error = unix_error(error);
                 for request in requests {
                     let _ = request.reply.send(Err(error));
                 }
@@ -534,13 +1353,13 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
                 continue;
             }
             let sync = matches!(request.operation, Operation::Sync);
-            let result = apply(
+            let result = Box::pin(apply(
                 &mut transaction,
                 &self.releases,
                 request.target,
                 request.when,
                 request.operation,
-            )
+            ))
             .await;
             match result {
                 Ok(_) if sync => syncs.push(request.reply),
@@ -560,8 +1379,9 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
     /// Writes the dirty data back into extents and publishes the result,
     /// which releases the pages the previous view held. Returns false once
     /// the writeback failed, which ends the service.
+    #[inline(never)]
     async fn writeback(&mut self) -> bool {
-        match self.writer.writeback().await {
+        match Box::pin(self.writer.writeback()).await {
             Ok(()) => {
                 *self.published.lock() = self
                     .writer
@@ -579,8 +1399,9 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
     /// Commits the running transaction and answers `syncs`. Returns false
     /// once the commit failed, which poisons the writer and ends the
     /// service.
+    #[inline(never)]
     async fn commit(&mut self, syncs: Vec<SyncWaiter>, dirty_since: &mut Option<Instant>) -> bool {
-        let committed = self.writer.commit().await;
+        let committed = Box::pin(self.writer.commit()).await;
         let outcome = match committed {
             Ok(()) => {
                 *dirty_since = None;
@@ -592,7 +1413,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
             }
             Err(error) => {
                 tracing::error!(%error, "btrfs commit failed; the mount takes no more writes");
-                Err(fs_error(error))
+                Err(unix_error(error))
             }
         };
         for sync in syncs {
@@ -677,129 +1498,263 @@ fn require_path(target: &Target) -> &str {
     }
 }
 
-async fn apply<S: BlockSink, U: RootUuids>(
+/// Constructs a future inside an out-of-line frame and pins it on the heap so
+/// a dispatching coroutine's state machine and stack frame hold only the
+/// closure arguments and a `Pin<Box<_>>` pointer, never every arm's unboxed
+/// sub-future at once.
+#[inline(never)]
+async fn boxed<F: core::future::Future>(make: impl FnOnce() -> F) -> F::Output {
+    Box::pin(make()).await
+}
+
+#[inline(never)]
+async fn apply_write<S: BlockSink, U: RootUuids>(
+    transaction: &mut WriteTransaction<'_, S, U>,
+    target: &Target,
+    position: WritePosition,
+    bytes: bytes::Bytes,
+    when: Timestamp,
+) -> Result<Response, UnixFsError> {
+    let inode = resolve_target(transaction, target).await?;
+    let metadata = transaction.metadata(&inode).await.map_err(unix_error)?;
+    let offset = match position {
+        WritePosition::At(offset) => offset,
+        WritePosition::End => metadata.size,
+    };
+    offset
+        .checked_add(bytes.len() as u64)
+        .ok_or(FsError::Overflow)?;
+    let written = transaction
+        .write_file(&inode, offset, &bytes, when)
+        .await
+        .map_err(unix_error)?;
+    // A device with no more free sectors stores a prefix, which the
+    // transaction keeps and the caller learns the length of.
+    if written != bytes.len() {
+        tracing::warn!(
+            written,
+            requested = bytes.len(),
+            "btrfs write ran out of space"
+        );
+    }
+    Ok(Response::Written(Landed {
+        offset,
+        len: written,
+    }))
+}
+
+#[inline(never)]
+async fn apply_open<S: BlockSink, U: RootUuids>(
     transaction: &mut WriteTransaction<'_, S, U>,
     releases: &SharedArc<PendingReleases>,
-    target: Target,
-    now: u64,
+    target: &Target,
+    flags: OpenFlags,
+    attributes: Option<Attributes>,
+    when: Timestamp,
+) -> Result<Response, UnixFsError> {
+    let path = require_path(target);
+    let file = match inode(transaction, path).await {
+        Ok(file) => {
+            if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
+                return Err(FsError::Exists.into());
+            }
+            file
+        }
+        Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
+            if flags.contains(OpenFlags::DIRECTORY) {
+                return Err(FsError::NotDirectory.into());
+            }
+            let (parent, bytes) = parent(transaction, path).await?;
+            let attributes = match attributes {
+                Some(attributes) => attributes,
+                None => inherited(transaction, &parent, NodeKind::File).await?,
+            };
+            transaction
+                .create_file(
+                    Name {
+                        parent: &parent,
+                        bytes,
+                    },
+                    attributes,
+                    when,
+                )
+                .await
+                .map_err(unix_error)?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = transaction.metadata(&file).await.map_err(unix_error)?;
+    if let Some(refusal) = super::node_kind(metadata.kind)?.open_refusal() {
+        return Err(refusal.into());
+    }
+    if flags.contains(OpenFlags::DIRECTORY) && metadata.kind != FileKind::Directory {
+        return Err(FsError::NotDirectory.into());
+    }
+    if flags.contains(OpenFlags::TRUNCATE) {
+        transaction
+            .truncate_file(&file, 0, when)
+            .await
+            .map_err(unix_error)?;
+    }
+    let metadata = transaction.metadata(&file).await.map_err(unix_error)?;
+    transaction.open_inode(&file).await.map_err(unix_error)?;
+    Ok(Response::Opened {
+        handle: BtrfsOpenHandle::writable(file, releases.clone()),
+        metadata,
+    })
+}
+
+enum UnixMetadataOp {
+    CreateSpecial {
+        special: Special,
+        attributes: Attributes,
+    },
+    SetPermissions {
+        permissions: u32,
+    },
+    SetOwner {
+        uid: Option<u32>,
+        gid: Option<u32>,
+    },
+    SetXattr {
+        name: String,
+        value: bytes::Bytes,
+        mode: XattrMode,
+    },
+    RemoveXattr {
+        name: String,
+    },
+}
+
+/// Applies Unix special-node, ownership/mode, and extended-attribute mutations.
+/// Boxed from [`apply`] so infrequent metadata state machines do not inflate
+/// `apply_batch`'s stack frame on bare-metal tasks or debug test threads.
+#[inline(never)]
+async fn apply_unix_metadata<S: BlockSink, U: RootUuids>(
+    transaction: &mut WriteTransaction<'_, S, U>,
+    target: &Target,
+    when: Timestamp,
+    op: UnixMetadataOp,
+) -> Result<Response, UnixFsError> {
+    match op {
+        UnixMetadataOp::CreateSpecial {
+            special,
+            attributes,
+        } => {
+            let path = require_path(target);
+            let (parent, bytes) = parent(transaction, path).await?;
+            transaction
+                .create_special(
+                    Name {
+                        parent: &parent,
+                        bytes,
+                    },
+                    special,
+                    attributes,
+                    when,
+                )
+                .await
+                .map_err(unix_error)?;
+        }
+        UnixMetadataOp::SetPermissions { permissions } => {
+            let file = resolve_target(transaction, target).await?;
+            transaction
+                .set_permissions(&file, permissions, when)
+                .await
+                .map_err(unix_error)?;
+        }
+        UnixMetadataOp::SetOwner { uid, gid } => {
+            let file = resolve_target(transaction, target).await?;
+            transaction
+                .set_owner(&file, uid, gid, when)
+                .await
+                .map_err(unix_error)?;
+        }
+        UnixMetadataOp::SetXattr { name, value, mode } => {
+            let file = resolve_target(transaction, target).await?;
+            transaction
+                .set_xattr(&file, name.as_bytes(), &value, mode, when)
+                .await
+                .map_err(unix_error)?;
+        }
+        UnixMetadataOp::RemoveXattr { name } => {
+            let file = resolve_target(transaction, target).await?;
+            transaction
+                .remove_xattr(&file, name.as_bytes(), when)
+                .await
+                .map_err(unix_error)?;
+        }
+    }
+    Ok(Response::Done)
+}
+
+#[inline(never)]
+async fn apply_create_tmpfile<S: BlockSink, U: RootUuids>(
+    transaction: &mut WriteTransaction<'_, S, U>,
+    releases: &SharedArc<PendingReleases>,
+    target: &Target,
+    exclusive: bool,
+    when: Timestamp,
+) -> Result<Response, UnixFsError> {
+    let path = require_path(target);
+    let directory = inode(transaction, path).await?;
+    let attributes = inherited(transaction, &directory, NodeKind::File).await?;
+    let file = transaction
+        .create_tmpfile(&directory, attributes, !exclusive, when)
+        .await
+        .map_err(unix_error)?;
+    let metadata = transaction.metadata(&file).await.map_err(unix_error)?;
+    Ok(Response::Opened {
+        handle: BtrfsOpenHandle::writable(file, releases.clone()),
+        metadata,
+    })
+}
+
+#[inline(never)]
+async fn apply_tree_op<S: BlockSink, U: RootUuids>(
+    transaction: &mut WriteTransaction<'_, S, U>,
+    target: &Target,
+    when: Timestamp,
     operation: Operation,
-) -> FsResult<Response> {
-    let when = timestamp(now);
+) -> Result<Response, UnixFsError> {
     match operation {
-        Operation::Write { position, bytes } => {
-            let inode = resolve_target(transaction, &target).await?;
-            let metadata = transaction.metadata(&inode).await.map_err(fs_error)?;
-            let offset = match position {
-                WritePosition::At(offset) => offset,
-                WritePosition::End => metadata.size,
-            };
-            offset
-                .checked_add(bytes.len() as u64)
-                .ok_or(FsError::Overflow)?;
-            let written = transaction
-                .write_file(&inode, offset, &bytes, when)
-                .await
-                .map_err(fs_error)?;
-            // A device with no more free sectors stores a prefix, which the
-            // transaction keeps and the caller learns the length of.
-            if written != bytes.len() {
-                tracing::warn!(
-                    written,
-                    requested = bytes.len(),
-                    "btrfs write ran out of space"
-                );
-            }
-            return Ok(Response::Written(Landed {
-                offset,
-                len: written,
-            }));
-        }
-        Operation::Open { flags } => {
-            let path = require_path(&target);
-            let file = match inode(transaction, path).await {
-                Ok(file) => {
-                    if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
-                        return Err(FsError::Exists);
-                    }
-                    file
-                }
-                Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
-                    if flags.contains(OpenFlags::DIRECTORY) {
-                        return Err(FsError::NotDirectory);
-                    }
-                    let (parent, bytes) = parent(transaction, path).await?;
-                    let attributes = inherited(transaction, &parent, NodeKind::File).await?;
-                    transaction
-                        .create_file(
-                            Name {
-                                parent: &parent,
-                                bytes,
-                            },
-                            attributes,
-                            when,
-                        )
-                        .await
-                        .map_err(fs_error)?
-                }
-                Err(error) => return Err(error),
-            };
-            let metadata = transaction.metadata(&file).await.map_err(fs_error)?;
-            if let Some(refusal) = super::node_kind(metadata.kind)?.open_refusal() {
-                return Err(refusal);
-            }
-            if flags.contains(OpenFlags::DIRECTORY) && metadata.kind != FileKind::Directory {
-                return Err(FsError::NotDirectory);
-            }
-            if flags.contains(OpenFlags::TRUNCATE) {
-                transaction
-                    .truncate_file(&file, 0, when)
-                    .await
-                    .map_err(fs_error)?;
-            }
-            let metadata = transaction.metadata(&file).await.map_err(fs_error)?;
-            transaction.open_inode(&file).await.map_err(fs_error)?;
-            return Ok(Response::Opened {
-                handle: BtrfsOpenHandle::writable(file, releases.clone()),
-                metadata,
-            });
-        }
-        Operation::CreateTmpfile { exclusive } => {
-            let path = require_path(&target);
-            let directory = inode(transaction, path).await?;
-            let attributes = inherited(transaction, &directory, NodeKind::File).await?;
-            let file = transaction
-                .create_tmpfile(&directory, attributes, !exclusive, when)
-                .await
-                .map_err(fs_error)?;
-            let metadata = transaction.metadata(&file).await.map_err(fs_error)?;
-            return Ok(Response::Opened {
-                handle: BtrfsOpenHandle::writable(file, releases.clone()),
-                metadata,
-            });
-        }
-        Operation::CreateDirectory | Operation::Symlink { .. } => {
-            let path = require_path(&target);
+        Operation::CreateDirectory { attributes } => {
+            let path = require_path(target);
             let (parent, bytes) = parent(transaction, path).await?;
             let name = Name {
                 parent: &parent,
                 bytes,
             };
-            match operation {
-                Operation::Symlink { target } => {
-                    let attributes = inherited(transaction, &parent, NodeKind::Symlink).await?;
-                    transaction
-                        .symlink(name, target.as_bytes(), attributes, when)
-                        .await
-                }
-                _ => {
-                    let attributes = inherited(transaction, &parent, NodeKind::Directory).await?;
-                    transaction.create_directory(name, attributes, when).await
-                }
-            }
-            .map_err(fs_error)?;
+            let attributes = match attributes {
+                Some(attributes) => attributes,
+                None => inherited(transaction, &parent, NodeKind::Directory).await?,
+            };
+            transaction
+                .create_directory(name, attributes, when)
+                .await
+                .map_err(unix_error)?;
+        }
+        Operation::Symlink {
+            target: link_target,
+            attributes,
+        } => {
+            let path = require_path(target);
+            let (parent, bytes) = parent(transaction, path).await?;
+            let name = Name {
+                parent: &parent,
+                bytes,
+            };
+            let attributes = match attributes {
+                Some(attributes) => attributes,
+                None => inherited(transaction, &parent, NodeKind::Symlink).await?,
+            };
+            transaction
+                .symlink(name, link_target.as_bytes(), attributes, when)
+                .await
+                .map_err(unix_error)?;
         }
         Operation::Rename { destination, mode } => {
-            let path = require_path(&target);
+            let path = require_path(target);
             let (source, source_name) = parent(transaction, path).await?;
             let (destination, destination_name) = parent(transaction, &destination).await?;
             transaction
@@ -816,10 +1771,10 @@ async fn apply<S: BlockSink, U: RootUuids>(
                     when,
                 )
                 .await
-                .map_err(fs_error)?;
+                .map_err(unix_error)?;
         }
         Operation::Link { destination } => {
-            let file = resolve_target(transaction, &target).await?;
+            let file = resolve_target(transaction, target).await?;
             let (parent, bytes) = parent(transaction, &destination).await?;
             transaction
                 .hard_link(
@@ -831,17 +1786,17 @@ async fn apply<S: BlockSink, U: RootUuids>(
                     when,
                 )
                 .await
-                .map_err(fs_error)?;
+                .map_err(unix_error)?;
         }
         Operation::Remove { directory } => {
-            let path = require_path(&target);
+            let path = require_path(target);
             let file = inode(transaction, path).await?;
-            let kind = transaction.metadata(&file).await.map_err(fs_error)?.kind;
+            let kind = transaction.metadata(&file).await.map_err(unix_error)?.kind;
             if directory && kind != FileKind::Directory {
-                return Err(FsError::NotDirectory);
+                return Err(FsError::NotDirectory.into());
             }
             if !directory && kind == FileKind::Directory {
-                return Err(FsError::IsDirectory);
+                return Err(FsError::IsDirectory.into());
             }
             let (parent, bytes) = parent(transaction, path).await?;
             transaction
@@ -853,28 +1808,164 @@ async fn apply<S: BlockSink, U: RootUuids>(
                     when,
                 )
                 .await
-                .map_err(fs_error)?;
+                .map_err(unix_error)?;
         }
         Operation::Truncate { size } => {
-            let file = resolve_target(transaction, &target).await?;
+            let file = resolve_target(transaction, target).await?;
             transaction
                 .truncate_file(&file, size, when)
                 .await
-                .map_err(fs_error)?;
+                .map_err(unix_error)?;
         }
         Operation::Times { access, modified } => {
-            let file = resolve_target(transaction, &target).await?;
+            let file = resolve_target(transaction, target).await?;
             transaction
                 .set_times(&file, access.map(timestamp), modified.map(timestamp), when)
                 .await
-                .map_err(fs_error)?;
+                .map_err(unix_error)?;
         }
         Operation::Sync => {
-            let file = resolve_target(transaction, &target).await?;
-            transaction.metadata(&file).await.map_err(fs_error)?;
+            let file = resolve_target(transaction, target).await?;
+            transaction.metadata(&file).await.map_err(unix_error)?;
         }
+        _ => unreachable!("handled by apply"),
     }
     Ok(Response::Done)
+}
+
+#[inline(never)]
+async fn apply<S: BlockSink, U: RootUuids>(
+    transaction: &mut WriteTransaction<'_, S, U>,
+    releases: &SharedArc<PendingReleases>,
+    target: Target,
+    now: u64,
+    operation: Operation,
+) -> Result<Response, UnixFsError> {
+    let when = timestamp(now);
+    match operation {
+        Operation::Write { position, bytes } => {
+            boxed(|| apply_write(transaction, &target, position, bytes, when)).await
+        }
+        Operation::Open { flags, attributes } => {
+            boxed(|| apply_open(transaction, releases, &target, flags, attributes, when)).await
+        }
+        Operation::CreateTmpfile { exclusive } => {
+            boxed(|| apply_create_tmpfile(transaction, releases, &target, exclusive, when)).await
+        }
+        Operation::CreateSpecial {
+            special,
+            attributes,
+        } => {
+            boxed(|| {
+                apply_unix_metadata(
+                    transaction,
+                    &target,
+                    when,
+                    UnixMetadataOp::CreateSpecial {
+                        special,
+                        attributes,
+                    },
+                )
+            })
+            .await
+        }
+        Operation::SetPermissions { permissions } => {
+            boxed(|| {
+                apply_unix_metadata(
+                    transaction,
+                    &target,
+                    when,
+                    UnixMetadataOp::SetPermissions { permissions },
+                )
+            })
+            .await
+        }
+        Operation::SetOwner { uid, gid } => {
+            boxed(|| {
+                apply_unix_metadata(
+                    transaction,
+                    &target,
+                    when,
+                    UnixMetadataOp::SetOwner { uid, gid },
+                )
+            })
+            .await
+        }
+        Operation::SetXattr { name, value, mode } => {
+            boxed(|| {
+                apply_unix_metadata(
+                    transaction,
+                    &target,
+                    when,
+                    UnixMetadataOp::SetXattr { name, value, mode },
+                )
+            })
+            .await
+        }
+        Operation::RemoveXattr { name } => {
+            boxed(|| {
+                apply_unix_metadata(
+                    transaction,
+                    &target,
+                    when,
+                    UnixMetadataOp::RemoveXattr { name },
+                )
+            })
+            .await
+        }
+        other => boxed(|| apply_tree_op(transaction, &target, when, other)).await,
+    }
+}
+
+pub(super) fn volume_error(error: WriteError) -> VolumeManagementError {
+    match error {
+        WriteError::NotSubvolume { .. } => VolumeManagementError::NotSubvolume,
+        WriteError::ReadOnlySubvolume { .. } => VolumeManagementError::ReadOnlySubvolume,
+        WriteError::SubvolumeNotReadOnly { .. } => VolumeManagementError::SubvolumeNotReadOnly,
+        WriteError::SubvolumeNotEmpty { .. } => VolumeManagementError::SubvolumeNotEmpty,
+        WriteError::DefaultSubvolume { .. } => VolumeManagementError::DefaultSubvolume,
+        WriteError::QuotaNotEnabled => VolumeManagementError::QuotaNotEnabled,
+        WriteError::QuotaAlreadyEnabled => VolumeManagementError::QuotaAlreadyEnabled,
+        WriteError::QuotaExceeded => VolumeManagementError::QuotaExceeded,
+        WriteError::QgroupNotFound { id } => VolumeManagementError::QgroupNotFound(id),
+        WriteError::QgroupExists { id } => VolumeManagementError::QgroupExists(id),
+        WriteError::QgroupInvalidRelation => VolumeManagementError::QgroupInvalidRelation,
+        WriteError::DeviceNotFound { devid } => VolumeManagementError::DeviceNotFound(devid),
+        WriteError::LastDevice => VolumeManagementError::LastDevice,
+        WriteError::DeviceTooSmall { .. } => VolumeManagementError::DeviceTooSmall,
+        WriteError::InvalidStream(detail) => VolumeManagementError::InvalidStream(detail),
+        WriteError::CloneAlignment => VolumeManagementError::Alignment,
+        WriteError::CloneOverlap => VolumeManagementError::Overlap,
+        WriteError::CloneChecksumPolicy => VolumeManagementError::ChecksumPolicyMismatch,
+        WriteError::CloneSourceRange => VolumeManagementError::CloneSourceOutOfRange,
+        WriteError::PermissionDenied => VolumeManagementError::PermissionDenied,
+        other => VolumeManagementError::Fs(fs_error(other)),
+    }
+}
+
+pub(super) fn unix_error(error: WriteError) -> UnixFsError {
+    match error {
+        WriteError::XattrMissing { .. } => UnixFsError::NoData,
+        WriteError::XattrNameLength { .. } | WriteError::XattrBuffer { .. } => UnixFsError::Range,
+        WriteError::XattrValueTooBig { .. } => UnixFsError::ArgTooBig,
+        WriteError::XattrNotPermitted { .. }
+        | WriteError::PermissionDenied
+        | WriteError::InodeFlags { .. }
+        | WriteError::DirectoryLink => UnixFsError::PermissionDenied,
+        WriteError::XattrExists { .. } | WriteError::Exists { .. } => {
+            UnixFsError::Fs(FsError::Exists)
+        }
+        WriteError::XattrNoSpace { .. } => UnixFsError::Fs(FsError::NoSpace),
+        WriteError::XattrNamespace | WriteError::AclNotSupported { .. } => {
+            UnixFsError::Fs(FsError::Unsupported)
+        }
+        WriteError::AclDefaultNotDirectory { .. } => UnixFsError::Fs(FsError::NotPermitted),
+        WriteError::InvalidPermissions { .. }
+        | WriteError::XattrName
+        | WriteError::AclInvalid
+        | WriteError::AclVersion { .. } => UnixFsError::Fs(FsError::Invalid),
+        other => UnixFsError::Fs(fs_error(other)),
+    }
 }
 
 pub(super) fn fs_error(error: WriteError) -> FsError {

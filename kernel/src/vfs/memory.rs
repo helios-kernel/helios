@@ -30,16 +30,16 @@ use core::ops::Bound;
 use bytes::{Bytes, BytesMut};
 use hashbrown::{HashMap, HashSet};
 use helios_btrfs::DeviceNumber;
-use helios_btrfs::write::Special;
+use helios_btrfs::write::{Attributes, Special};
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, DirStream, FileSystem, FsError, FsPath, FsResult, Landed,
-    Metadata, NodeId, NodeKind, OpenFlags, OwnedFsPath, PreparedWrite, RenameMode, WritePosition,
-    WriteProgress,
+    Metadata, NodeId, NodeKind, OpenFlags, Opened, OwnedFsPath, PreparedWrite, RenameMode,
+    WritePosition, WriteProgress,
 };
 use spin::Mutex;
 use triomphe::Arc;
 
-use super::{UnixAttributes, cmp_to_children};
+use super::{UnixAttributes, UnixFsError, UnixNodeMetadata, cmp_to_children};
 
 const ROOT_INODE: u64 = 1;
 const ROOT_UNIX: UnixAttributes = UnixAttributes {
@@ -435,6 +435,212 @@ impl MemoryFs {
         Ok(removed)
     }
 
+    fn resolve_create_unix(
+        state: &MemoryState,
+        path: FsPath<'_>,
+        kind: NodeKind,
+        attributes: Attributes,
+    ) -> FsResult<UnixAttributes> {
+        let (parent, _) = path.split_last().ok_or(FsError::Exists)?;
+        let (_, parent_inode) = state.inode(parent)?;
+        if parent_inode.kind != NodeKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        let parent_sgid = (parent_inode.unix.permissions & S_ISGID) != 0;
+        let gid = if parent_sgid {
+            parent_inode.unix.gid
+        } else {
+            attributes.gid
+        };
+        let permissions = match kind {
+            NodeKind::Symlink => 0o777,
+            NodeKind::Directory => {
+                ((attributes.permissions & 0o1777) & !(attributes.umask & 0o777))
+                    | if parent_sgid { S_ISGID } else { 0 }
+            }
+            _ => (attributes.permissions & S_IALLUGO) & !(attributes.umask & 0o777),
+        };
+        Ok(UnixAttributes {
+            permissions,
+            uid: attributes.uid,
+            gid,
+        })
+    }
+
+    pub fn open_unix(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<Opened<OwnedFsPath>, UnixFsError> {
+        let mut state = self.state.lock();
+        let metadata = match state.metadata(self.device, path) {
+            Ok(metadata) => {
+                if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
+                    return Err(FsError::Exists.into());
+                }
+                metadata
+            }
+            Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
+                if flags.contains(OpenFlags::DIRECTORY) {
+                    return Err(FsError::NotDirectory.into());
+                }
+                let unix = Self::resolve_create_unix(&state, path, NodeKind::File, attributes)?;
+                state.require_new_name(path)?;
+                state.insert(
+                    path,
+                    NodeKind::File,
+                    unix,
+                    DeviceNumber::default(),
+                    Bytes::new(),
+                    now,
+                );
+                state.metadata(self.device, path)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(refusal) = metadata.kind.open_refusal() {
+            return Err(refusal.into());
+        }
+        if flags.contains(OpenFlags::DIRECTORY) && metadata.kind != NodeKind::Directory {
+            return Err(FsError::NotDirectory.into());
+        }
+        if flags.contains(OpenFlags::TRUNCATE) {
+            let inode = state.inode_mut(path)?;
+            if inode.kind == NodeKind::Directory {
+                return Err(FsError::IsDirectory.into());
+            }
+            inode.contents.clear();
+            inode.modified_nanos = now;
+            inode.status_nanos = now;
+        }
+        let metadata = state.metadata(self.device, path)?;
+        Ok(Opened {
+            metadata,
+            handle: path.into(),
+        })
+    }
+
+    pub fn create_directory_unix(
+        &self,
+        path: FsPath<'_>,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        let mut state = self.state.lock();
+        let unix = Self::resolve_create_unix(&state, path, NodeKind::Directory, attributes)?;
+        state.require_new_name(path)?;
+        state.insert(
+            path,
+            NodeKind::Directory,
+            unix,
+            DeviceNumber::default(),
+            Bytes::new(),
+            now,
+        );
+        Ok(())
+    }
+
+    pub fn symlink_unix(
+        &self,
+        target: &str,
+        link: FsPath<'_>,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        let mut state = self.state.lock();
+        let unix = Self::resolve_create_unix(&state, link, NodeKind::Symlink, attributes)?;
+        state.require_new_name(link)?;
+        state.insert(
+            link,
+            NodeKind::Symlink,
+            unix,
+            DeviceNumber::default(),
+            Bytes::copy_from_slice(target.as_bytes()),
+            now,
+        );
+        Ok(())
+    }
+
+    pub fn create_special_unix(
+        &self,
+        path: FsPath<'_>,
+        special: Special,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        let (kind, rdev) = match special {
+            Special::CharDevice(device) => (NodeKind::CharacterDevice, device),
+            Special::BlockDevice(device) => (NodeKind::BlockDevice, device),
+            Special::Fifo => (NodeKind::Fifo, DeviceNumber::default()),
+            Special::Socket => (NodeKind::Socket, DeviceNumber::default()),
+        };
+        let mut state = self.state.lock();
+        let unix = Self::resolve_create_unix(&state, path, kind, attributes)?;
+        state.require_new_name(path)?;
+        state.insert(path, kind, unix, rdev, Bytes::new(), now);
+        Ok(())
+    }
+
+    pub fn unix_node_metadata(&self, path: FsPath<'_>) -> Result<UnixNodeMetadata, UnixFsError> {
+        let md = self.unix_metadata(path)?;
+        Ok(UnixNodeMetadata {
+            kind: md.kind,
+            attributes: md.attributes,
+            rdev: md.rdev.encode(),
+        })
+    }
+
+    pub fn set_xattr_unix(
+        &self,
+        path: FsPath<'_>,
+        name: &str,
+        value: Bytes,
+        mode: XattrSetMode,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        if value.len() > XATTR_SIZE_MAX {
+            return Err(UnixFsError::ArgTooBig);
+        }
+        let mut state = self.state.lock();
+        let inode = state.inode_mut(path)?;
+        validate_xattr_name(inode.kind, name, XattrOp::Set).map_err(|e| match e {
+            FsError::NameTooLong => UnixFsError::Range,
+            FsError::NotPermitted => UnixFsError::PermissionDenied,
+            other => UnixFsError::Fs(other),
+        })?;
+        let exists = inode.xattrs.contains_key(name);
+        match (mode, exists) {
+            (XattrSetMode::Create, true) => return Err(FsError::Exists.into()),
+            (XattrSetMode::Replace, false) => return Err(UnixFsError::NoData),
+            _ => {}
+        }
+        inode.xattrs.insert(String::from(name), value);
+        inode.status_nanos = now;
+        Ok(())
+    }
+
+    pub fn remove_xattr_unix(
+        &self,
+        path: FsPath<'_>,
+        name: &str,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        let mut state = self.state.lock();
+        let inode = state.inode_mut(path)?;
+        validate_xattr_name(inode.kind, name, XattrOp::Remove).map_err(|e| match e {
+            FsError::NameTooLong => UnixFsError::Range,
+            FsError::NotPermitted => UnixFsError::PermissionDenied,
+            other => UnixFsError::Fs(other),
+        })?;
+        if inode.xattrs.remove(name).is_none() {
+            return Err(UnixFsError::NoData);
+        }
+        inode.status_nanos = now;
+        Ok(())
+    }
+
     /// Removes the object at `path` (a directory when `directory`, which
     /// must hold no names) and, when `whiteout`, records a whiteout there
     /// so the layer below stays hidden. With `whiteout`, a path the tree
@@ -508,7 +714,10 @@ impl MemoryFs {
             return Err(FsError::NotPermitted);
         }
         let mut state = self.state.lock();
-        let (_, inode) = state.inode(source)?;
+        let (source_inode, source_kind) = {
+            let (number, inode) = state.inode(source)?;
+            (number, inode.kind)
+        };
         if mode == RenameMode::Exchange {
             debug_assert!(!whiteout, "an exchange hides nothing");
             return state.exchange(source, destination, now);
@@ -519,11 +728,41 @@ impl MemoryFs {
                 RenameMode::Replace | RenameMode::Exchange => Ok(()),
             };
         }
-        if inode.kind == NodeKind::Directory && destination.starts_with(source) {
+        if source_kind == NodeKind::Directory && destination.starts_with(source) {
             return Err(FsError::NotPermitted);
         }
-        state.require_new_name(destination)?;
-        let source_inode = state.inode_of(source)?;
+        let Some((dest_parent, _)) = destination.split_last() else {
+            return Err(FsError::NotPermitted);
+        };
+        if state.inode(dest_parent)?.1.kind != NodeKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        if let Ok((dest_inode, dest)) = state.inode(destination) {
+            if mode == RenameMode::NoReplace {
+                return Err(FsError::Exists);
+            }
+            if dest_inode == source_inode {
+                return Ok(());
+            }
+            let dest_is_dir = dest.kind == NodeKind::Directory;
+            match (source_kind == NodeKind::Directory, dest_is_dir) {
+                (true, false) => return Err(FsError::NotDirectory),
+                (false, true) => return Err(FsError::IsDirectory),
+                (true, true) if state.children(destination).next().is_some() => {
+                    return Err(FsError::NotEmpty);
+                }
+                _ => {}
+            }
+            state
+                .inodes
+                .get_mut(&dest_inode)
+                .expect("replaced inode exists")
+                .status_nanos = now;
+            state.remove_name(destination);
+            if dest_is_dir {
+                state.drop_whiteouts_below(destination);
+            }
+        }
         let moved: Vec<(String, u64)> =
             core::iter::once((source.as_str().to_string(), source_inode))
                 .chain(
@@ -1537,6 +1776,49 @@ mod tests {
         block_on(fs.rename(path("b"), path("b"), RenameMode::Exchange, 4)).expect("a no-op");
         assert_eq!(names(&fs, "b"), ["inner"]);
         assert_eq!(names(&fs, ""), ["a", "b", "file"]);
+    }
+
+    #[test]
+    fn rename_replace_overwrites_existing_file_and_empty_directory() {
+        let fs = tree();
+        block_on(fs.open(path("a"), OpenFlags::CREATE, 0)).expect("creates a");
+        block_on(write_bytes(&fs, path("a"), WritePosition::At(0), b"new", 1)).expect("writes a");
+        block_on(fs.open(path("b"), OpenFlags::CREATE, 0)).expect("creates b");
+        block_on(write_bytes(&fs, path("b"), WritePosition::At(0), b"old", 1)).expect("writes b");
+        block_on(fs.create_directory(path("d1"), 0)).expect("creates d1");
+        block_on(fs.create_directory(path("d2"), 0)).expect("creates d2");
+        block_on(fs.open(path("d2/child"), OpenFlags::CREATE, 0)).expect("creates d2/child");
+        block_on(fs.create_directory(path("empty"), 0)).expect("creates empty");
+
+        // File over dir -> IsDirectory; dir over file -> NotDirectory; dir over non-empty -> NotEmpty.
+        assert_eq!(
+            block_on(fs.rename(path("a"), path("d1"), RenameMode::Replace, 2)),
+            Err(FsError::IsDirectory)
+        );
+        assert_eq!(
+            block_on(fs.rename(path("d1"), path("a"), RenameMode::Replace, 2)),
+            Err(FsError::NotDirectory)
+        );
+        assert_eq!(
+            block_on(fs.rename(path("d1"), path("d2"), RenameMode::Replace, 2)),
+            Err(FsError::NotEmpty)
+        );
+
+        // File replaces existing file atomically.
+        block_on(fs.rename(path("a"), path("b"), RenameMode::Replace, 3)).expect("replaces file");
+        assert_eq!(block_on(fs.stat(path("a"))), Err(FsError::NoEntry));
+        assert_eq!(
+            block_on(fs.read_at(path("b"), 0, 16))
+                .expect("reads replaced b")
+                .as_ref(),
+            b"new"
+        );
+
+        // Directory replaces existing empty directory.
+        block_on(fs.rename(path("d2"), path("empty"), RenameMode::Replace, 4))
+            .expect("replaces empty dir");
+        assert_eq!(block_on(fs.stat(path("d2"))), Err(FsError::NoEntry));
+        assert_eq!(names(&fs, "empty"), ["child"]);
     }
 
     #[test]

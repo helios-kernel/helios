@@ -14,6 +14,10 @@ use helios_linux::syscall::{
 };
 
 // The crate root is not `mod.rs`, so the submodule names its directory.
+#[path = "abi/files_poll_tty.rs"]
+mod files_poll_tty;
+#[path = "abi/permissions.rs"]
+mod permissions;
 #[path = "abi/system.rs"]
 mod system;
 
@@ -177,6 +181,15 @@ struct Sink {
     hostname: helios_linux::syscall::UtsField,
     domainname: helios_linux::syscall::UtsField,
 }
+impl helios_linux::syscall::Network<helios_unix::NoNetwork> for Sink {
+    fn to_ip(&self, address: core::convert::Infallible) -> helios_linux::syscall::IpAddr {
+        match address {}
+    }
+    fn encode_ip(&self, _: helios_linux::syscall::IpAddr) -> core::convert::Infallible {
+        unreachable!()
+    }
+}
+
 impl System for Sink {
     fn realtime_nanos(&self) -> u64 {
         self.wall_nanos
@@ -225,6 +238,8 @@ impl System for Sink {
         Ok(())
     }
 }
+impl helios_linux::syscall::Filesystem<NoBacking> for Sink {}
+impl helios_linux::syscall::Tty for Sink {}
 impl Stdio for Sink {
     async fn write(&mut self, _: Stream, bytes: &[u8]) -> Result<usize, WriteError> {
         if let Some(error) = self.error {
@@ -437,6 +452,11 @@ fn initial_stack_is_aligned_and_contains_linux_arguments() {
         arguments: &arguments,
         environment: &environment,
         executable: b"/bin/args",
+        uid: 1000,
+        euid: 0,
+        gid: 100,
+        egid: 200,
+        secure: true,
     };
     let top = 0x7fff_0000_0000;
     let stack = helios_linux::stack::build(&startup, top).unwrap();
@@ -448,7 +468,7 @@ fn initial_stack_is_aligned_and_contains_linux_arguments() {
         .as_chunks::<8>()
         .0
         .iter()
-        .take(24)
+        .take(34)
         .map(|word| u64::from_le_bytes(*word))
         .collect();
     let string = |address: u64| {
@@ -464,14 +484,17 @@ fn initial_stack_is_aligned_and_contains_linux_arguments() {
     assert_eq!(string(words[6]), environment[0]);
     assert_eq!(words[7], 0);
     assert_eq!(
-        &words[8..18],
-        &[3, 0x400040, 4, 56, 5, 3, 6, 4096, 9, 0x401000]
+        &words[8..28],
+        &[
+            3, 0x400040, 4, 56, 5, 3, 6, 4096, 9, 0x401000, 11, 1000, 12, 0, 13, 100, 14, 200, 23,
+            1
+        ]
     );
-    assert_eq!(words[18], 25);
-    assert_eq!(&stack.bytes[at(words[19])..at(words[19]) + 16], &[7; 16]);
-    assert_eq!(words[20], 31);
-    assert_eq!(string(words[21]), b"/bin/args");
-    assert_eq!(&words[22..24], &[0, 0]);
+    assert_eq!(words[28], 25);
+    assert_eq!(&stack.bytes[at(words[29])..at(words[29]) + 16], &[7; 16]);
+    assert_eq!(words[30], 31);
+    assert_eq!(string(words[31]), b"/bin/args");
+    assert_eq!(&words[32..34], &[0, 0]);
     let bad: [&[u8]; 1] = [b"bad\0arg"];
     let refused = helios_linux::stack::Startup {
         arguments: &bad,
@@ -506,9 +529,9 @@ fn aarch64_numbers_reach_the_same_operations_and_legacy_numbers_do_not() {
         unix_call(&mut process, 172, [0; 6], &mut memory, &mut sink),
         5
     );
-    // x86-64's write (1), dup2 (33) and epoll_create (213) are no aarch64
-    // calls this decoder serves (213 is readahead there).
-    for number in [1, 33, 213] {
+    // x86-64's write (1), epoll_create (213) and eventfd (284) are no aarch64
+    // calls this decoder serves (1 is io_destroy, 213 readahead, 284 seccomp).
+    for number in [1, 213, 284] {
         assert_eq!(
             unix_call(&mut process, number, [0; 6], &mut memory, &mut sink),
             38u64.wrapping_neg()

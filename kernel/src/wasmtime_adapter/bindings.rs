@@ -345,6 +345,23 @@ pub mod processors {
     }
 }
 
+/// Bindings for the btrfs volume management interface served to both program
+/// worlds (`init` and `debugger`).
+pub mod btrfs {
+    pub mod bindings {
+        use wasmtime;
+
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "btrfs-host",
+            imports: {
+                default: trappable,
+            },
+            require_store_data_send: true,
+        });
+    }
+}
+
 /// Bindings for the export the compositor plugin answers on.
 ///
 /// Generated from the `compositor-host` world rather than from

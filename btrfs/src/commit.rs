@@ -43,6 +43,24 @@ impl CommitImage {
             .copy_from_slice(raw.as_bytes());
     }
 
+    /// Replaces the superblock's embedded `dev_item` for a specific device
+    /// before publishing that device's superblock mirrors.
+    pub(crate) fn set_dev_item(&mut self, dev_item: crate::ondisk::RawDevItem) {
+        let mut raw = *view::<RawSuperblock>(&self.bytes[..]).expect("validated superblock image");
+        raw.dev_item = dev_item;
+        Arc::make_mut(&mut self.bytes)[..size_of::<RawSuperblock>()]
+            .copy_from_slice(raw.as_bytes());
+    }
+
+    /// Updates `num_devices` and `total_bytes` in the superblock.
+    pub(crate) fn set_device_totals(&mut self, num_devices: u64, total_bytes: u64) {
+        let mut raw = *view::<RawSuperblock>(&self.bytes[..]).expect("validated superblock image");
+        raw.num_devices.set(num_devices);
+        raw.total_bytes.set(total_bytes);
+        Arc::make_mut(&mut self.bytes)[..size_of::<RawSuperblock>()]
+            .copy_from_slice(raw.as_bytes());
+    }
+
     /// Records `bytes` more allocated on the device in the superblock's
     /// embedded device item, which the chunk tree's device item mirrors.
     pub(crate) fn add_device_used(&mut self, bytes: u64) {

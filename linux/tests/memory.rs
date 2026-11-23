@@ -242,6 +242,15 @@ impl Clock for NoOutput {
 }
 /// The memory calls read nothing of the machine; a test that reaches here
 /// made a call it does not mean to.
+impl helios_linux::syscall::Network<helios_unix::NoNetwork> for NoOutput {
+    fn to_ip(&self, address: core::convert::Infallible) -> helios_linux::syscall::IpAddr {
+        match address {}
+    }
+    fn encode_ip(&self, _: helios_linux::syscall::IpAddr) -> core::convert::Infallible {
+        unreachable!()
+    }
+}
+
 impl System for NoOutput {
     fn realtime_nanos(&self) -> u64 {
         unreachable!("the memory tests read no clock")
@@ -265,6 +274,8 @@ impl System for NoOutput {
         unreachable!("the memory tests read no kernel version")
     }
 }
+impl helios_linux::syscall::Filesystem<NoBacking> for NoOutput {}
+impl helios_linux::syscall::Tty for NoOutput {}
 
 struct Linux {
     process: Process<NoBacking>,

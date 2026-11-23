@@ -31,6 +31,8 @@ mod hv;
 pub(super) use hv::add_hv_to_linker;
 mod processors;
 pub(super) use processors::add_processors_to_linker;
+mod btrfs;
+pub(super) use btrfs::add_btrfs_to_linker;
 mod shared_memory_plugin;
 use shared_memory_plugin::*;
 mod compiler;
@@ -3004,6 +3006,7 @@ const WASIX_SIGABRT: u8 = 6;
 const WASIX_SIGKILL: u8 = 9;
 const WASIX_SOCK_TYPE_STREAM: i32 = 1;
 const WASIX_SOCK_TYPE_DGRAM: i32 = 2;
+const WASIX_SOCK_TYPE_RAW: i32 = 3;
 const WASIX_SOCK_STATUS_OPENED: u8 = 1;
 const WASIX_SOCK_OPTION_REUSE_PORT: i32 = 1;
 const WASIX_SOCK_OPTION_REUSE_ADDR: i32 = 2;
@@ -4187,6 +4190,7 @@ mod tests {
             ),
             local_address: crate::unix::unspecified_address(SocketFamily::Ipv4),
             local_port: 5353,
+            peer: None,
             options: unix_socket_options::<TestNet>(),
         }));
         let udp_unbound: TestDescriptor =

@@ -59,7 +59,7 @@ pub(crate) struct Snapshot {
     pub(crate) mapping: Arc<Mapping>,
     pub(crate) root_tree: TreeRoot,
     csum_tree: TreeRoot,
-    default_subvolume: RootRecord,
+    pub(crate) default_subvolume: RootRecord,
     /// The running transaction's state this view reads through; `None` for
     /// a committed generation.
     #[cfg(feature = "write")]
@@ -175,6 +175,8 @@ impl Snapshot {
             volume: volume.view(&self.mapping),
             #[cfg(feature = "write")]
             overlay: self.running.as_ref().map(|running| &running.trees),
+            #[cfg(not(feature = "write"))]
+            _lifetime: core::marker::PhantomData,
         }
     }
 
@@ -194,10 +196,12 @@ impl Snapshot {
 
 /// Where a view's tree blocks come from: the running transaction's private
 /// blocks first when the view has them, then the device.
-struct Nodes<'a, S> {
-    volume: Volume<&'a S>,
+pub(crate) struct Nodes<'a, S> {
+    volume: Volume<S>,
     #[cfg(feature = "write")]
     overlay: Option<&'a crate::tree::write::Trees>,
+    #[cfg(not(feature = "write"))]
+    _lifetime: core::marker::PhantomData<&'a ()>,
 }
 
 impl<S: BlockSource> crate::tree::NodeSource for Nodes<'_, S> {
@@ -346,7 +350,57 @@ impl<S: BlockSource> Filesystem<S> {
     pub async fn mount(source: S) -> Result<Self, Error> {
         let selected = superblock::select(&source).await?;
         selected.superblock.check_supported()?;
-        Self::open(source, selected).await
+        let devid = selected.superblock.devid();
+        let dev_bytes = selected.superblock.device_bytes();
+        Self::open_multi(
+            vec![(devid, Arc::new(source))],
+            selected,
+            &[(devid, dev_bytes)],
+        )
+        .await
+    }
+
+    /// Mounts a multi-device filesystem spanning `sources`. Every source must
+    /// belong to the same filesystem (`fsid`) and together cover all
+    /// `num_devices` recorded in the superblock.
+    pub async fn mount_devices(sources: Vec<S>) -> Result<Self, Error> {
+        if sources.is_empty() {
+            return Err(Error::MultiDevice { devices: 0 });
+        }
+        let mut parsed = Vec::with_capacity(sources.len());
+        for source in sources {
+            let selected = superblock::select(&source).await?;
+            parsed.push((selected, Arc::new(source)));
+        }
+        let best_idx = parsed
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (sel, _))| sel.superblock.generation())
+            .map(|(i, _)| i)
+            .expect("sources is nonempty");
+        let fsid = parsed[best_idx].0.superblock.fsid();
+        let mut devices = Vec::with_capacity(parsed.len());
+        let mut device_sizes = Vec::with_capacity(parsed.len());
+        let mut chosen = None;
+        for (idx, (selected, source)) in parsed.into_iter().enumerate() {
+            if selected.superblock.fsid() != fsid {
+                return Err(Error::NoValidSuperblock {
+                    primary: crate::SuperblockDefect::DeviceFsid,
+                    backups_checked: 0,
+                });
+            }
+            let devid = selected.superblock.devid();
+            let dev_bytes = selected.superblock.device_bytes();
+            devices.push((devid, source));
+            device_sizes.push((devid, dev_bytes));
+            if idx == best_idx {
+                chosen = Some(selected);
+            }
+        }
+        let selected = chosen.expect("best_idx was in bounds");
+        selected.superblock.check_supported_for(devices.len())?;
+        devices.sort_unstable_by_key(|(id, _)| *id);
+        Self::open_multi(devices, selected, &device_sizes).await
     }
 
     /// Mounts the last committed generation of `source`, whether or not a log
@@ -355,12 +409,65 @@ impl<S: BlockSource> Filesystem<S> {
     pub(crate) async fn mount_committed(source: S) -> Result<Self, Error> {
         let selected = superblock::select(&source).await?;
         selected.superblock.check_features()?;
-        Self::open(source, selected).await
+        let devid = selected.superblock.devid();
+        let dev_bytes = selected.superblock.device_bytes();
+        Self::open_multi(
+            vec![(devid, Arc::new(source))],
+            selected,
+            &[(devid, dev_bytes)],
+        )
+        .await
     }
 
-    async fn open(source: S, selected: superblock::SelectedSuperblock) -> Result<Self, Error> {
+    /// Multi-device counterpart of [`Self::mount_committed`].
+    #[cfg(feature = "write")]
+    pub(crate) async fn mount_committed_devices(sources: Vec<S>) -> Result<Self, Error> {
+        if sources.is_empty() {
+            return Err(Error::MultiDevice { devices: 0 });
+        }
+        let mut parsed = Vec::with_capacity(sources.len());
+        for source in sources {
+            let selected = superblock::select(&source).await?;
+            parsed.push((selected, Arc::new(source)));
+        }
+        let best_idx = parsed
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (sel, _))| sel.superblock.generation())
+            .map(|(i, _)| i)
+            .expect("sources is nonempty");
+        let fsid = parsed[best_idx].0.superblock.fsid();
+        let mut devices = Vec::with_capacity(parsed.len());
+        let mut device_sizes = Vec::with_capacity(parsed.len());
+        let mut chosen = None;
+        for (idx, (selected, source)) in parsed.into_iter().enumerate() {
+            if selected.superblock.fsid() != fsid {
+                return Err(Error::NoValidSuperblock {
+                    primary: crate::SuperblockDefect::DeviceFsid,
+                    backups_checked: 0,
+                });
+            }
+            let devid = selected.superblock.devid();
+            let dev_bytes = selected.superblock.device_bytes();
+            devices.push((devid, source));
+            device_sizes.push((devid, dev_bytes));
+            if idx == best_idx {
+                chosen = Some(selected);
+            }
+        }
+        let selected = chosen.expect("best_idx was in bounds");
+        selected.superblock.check_features_for(devices.len())?;
+        devices.sort_unstable_by_key(|(id, _)| *id);
+        Self::open_multi(devices, selected, &device_sizes).await
+    }
+
+    async fn open_multi(
+        devices: Vec<(u64, Arc<S>)>,
+        selected: superblock::SelectedSuperblock,
+        device_sizes: &[(u64, u64)],
+    ) -> Result<Self, Error> {
         let superblock = selected.superblock;
-        let bootstrap = ChunkMap::from_sys_chunk_array(&superblock, &selected.bytes)?;
+        let bootstrap = ChunkMap::from_sys_chunk_array(&superblock, &selected.bytes, device_sizes)?;
         let chunk_root = superblock.chunk_tree();
         let root_tree = TreeRoot {
             tree: objectid::ROOT_TREE,
@@ -368,7 +475,7 @@ impl<S: BlockSource> Filesystem<S> {
             level: superblock.root_tree().level,
             generation: superblock.generation(),
         };
-        let mut volume = Volume::new(source, superblock, bootstrap);
+        let mut volume = Volume::new_multi(devices, superblock, bootstrap);
 
         let chunks = read_chunk_tree(
             &volume,
@@ -378,6 +485,7 @@ impl<S: BlockSource> Filesystem<S> {
                 level: chunk_root.level,
                 generation: chunk_root.generation,
             },
+            device_sizes,
         )
         .await?;
         let bootstrap = volume.replace_chunks(chunks);
@@ -402,8 +510,9 @@ impl<S: BlockSource> Filesystem<S> {
     }
 
     #[cfg(feature = "write")]
-    pub(crate) fn publish(&mut self, committed: crate::transaction::Committed) {
+    pub(crate) fn publish(&mut self, committed: crate::transaction::Committed<S>) {
         self.volume.install(committed.snapshot.mapping.clone());
+        self.volume.install_devices(committed.devices);
         self.snapshot = committed.snapshot;
     }
 
@@ -448,6 +557,68 @@ impl<S: BlockSource> Filesystem<S> {
             visit(tree, root_inode);
         }
         Ok(())
+    }
+
+    /// Returns a node reader and tree root for subvolume `tree`, used by
+    /// `send` to inspect extent layouts cleanly on an immutable view.
+    #[cfg(feature = "write")]
+    pub(crate) async fn subvolume_tree_reader(
+        &self,
+        tree: u64,
+    ) -> Result<(&Volume<S>, Nodes<'_, S>, TreeRoot), Error> {
+        let nodes = self.snapshot.nodes(&self.volume);
+        let record = self.snapshot.find_root(&nodes, tree).await?;
+        Ok((&self.volume, nodes, record.root))
+    }
+
+    /// Reads the quota status and qgroup list from this immutable view.
+    #[cfg(feature = "write")]
+    pub async fn quota_info(
+        &self,
+    ) -> Result<
+        (
+            helios_hal::fs_management::QuotaStatus,
+            Vec<helios_hal::fs_management::QgroupInfo>,
+        ),
+        Error,
+    > {
+        crate::qgroup::QuotaTree::inspect(&self.volume, self.snapshot.root_tree).await
+    }
+
+    /// Reads `DEV_ITEM` records from this view's chunk tree.
+    #[cfg(feature = "write")]
+    pub async fn devices(&self) -> Result<Vec<helios_hal::fs_management::VolumeDeviceInfo>, Error> {
+        let chunk = self.volume.superblock().chunk_tree();
+        let root = TreeRoot {
+            tree: objectid::CHUNK_TREE,
+            bytenr: chunk.bytenr,
+            level: chunk.level,
+            generation: chunk.generation,
+        };
+        let nodes = self.snapshot.nodes(&self.volume);
+        let mut cursor = Cursor::ceiling(
+            &nodes,
+            root,
+            Key::new(objectid::DEV_ITEMS, item_type::DEV_ITEM, 0),
+        )
+        .await?;
+        let mut out = Vec::new();
+        while let (Some(key), Some(bytes)) = (cursor.key(), cursor.item()) {
+            if !key.is(objectid::DEV_ITEMS, item_type::DEV_ITEM) {
+                break;
+            }
+            if let Some(raw) = crate::ondisk::view::<crate::ondisk::RawDevItem>(bytes) {
+                out.push(helios_hal::fs_management::VolumeDeviceInfo {
+                    devid: key.offset,
+                    uuid: raw.uuid,
+                    total_bytes: raw.total_bytes.get(),
+                    bytes_used: raw.bytes_used.get(),
+                    serial: None,
+                });
+            }
+            cursor.advance(&nodes).await?;
+        }
+        Ok(out)
     }
 
     /// The root directory of the default subvolume.
@@ -917,6 +1088,7 @@ fn find_record<'a>(
 async fn read_chunk_tree<S: BlockSource>(
     volume: &Volume<S>,
     root: TreeRoot,
+    device_sizes: &[(u64, u64)],
 ) -> Result<ChunkMap, Error> {
     let mut chunks = ChunkMap::default();
     let start = Key::new(objectid::FIRST_CHUNK_TREE, item_type::CHUNK_ITEM, 0);
@@ -925,7 +1097,7 @@ async fn read_chunk_tree<S: BlockSource>(
         if !key.is(objectid::FIRST_CHUNK_TREE, item_type::CHUNK_ITEM) {
             break;
         }
-        chunks.insert_item(key, item, volume.superblock())?;
+        chunks.insert_item(key, item, volume.superblock(), device_sizes)?;
         cursor.advance(volume).await?;
     }
     Ok(chunks)
