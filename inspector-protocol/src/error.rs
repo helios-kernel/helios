@@ -9,13 +9,12 @@
 //! typed API a production caller uses, so there is no second error contract
 //! reachable from this crate.
 
-#[cfg(feature = "host")]
 use std::io;
 
 use thiserror::Error;
 
-/// Lower-level transport faults raised by the wRPC framing client/server.
-#[cfg(feature = "host")]
+/// Lower-level transport faults raised by the framing client, server, and
+/// peer-to-peer multiplexer.
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error("transport closed unexpectedly")]
@@ -37,6 +36,11 @@ pub enum TransportError {
         source: io::Error,
     },
 
+    /// Remote peer reported a structured wire-protocol violation on an
+    /// invocation or connection handle.
+    #[error("wire protocol violation: {0}")]
+    Wire(#[from] WireError),
+
     /// The guest's kernel printed a panic report on the console the
     /// frame scanner reads.
     ///
@@ -48,10 +52,26 @@ pub enum TransportError {
     GuestPanicked { report: String },
 }
 
-#[cfg(feature = "host")]
 impl TransportError {
-    pub(crate) fn io(operation: &'static str, source: io::Error) -> Self {
+    pub fn io(operation: &'static str, source: io::Error) -> Self {
+        if let Some(wire) = WireError::from_io(&source) {
+            return Self::Wire(wire.clone());
+        }
         Self::Io { operation, source }
+    }
+
+    /// Extracts a [`WireError`] when this transport fault originated from a
+    /// wire-level limit or handle check.
+    pub fn wire_error(&self) -> Option<&WireError> {
+        match self {
+            Self::Wire(error) => Some(error),
+            Self::Io { source, .. } => WireError::from_io(source),
+            Self::Closed
+            | Self::Rejected(_)
+            | Self::UnexpectedReply
+            | Self::HandoffClosed { .. }
+            | Self::GuestPanicked { .. } => None,
+        }
     }
 
     /// The guest's panic report when this fault is a dead guest rather
@@ -71,12 +91,12 @@ impl TransportError {
             Self::Closed
             | Self::Rejected(_)
             | Self::UnexpectedReply
-            | Self::HandoffClosed { .. } => None,
+            | Self::HandoffClosed { .. }
+            | Self::Wire(_) => None,
         }
     }
 }
 
-#[cfg(feature = "host")]
 impl From<TransportError> for io::Error {
     fn from(error: TransportError) -> Self {
         io::Error::other(error)
@@ -89,6 +109,7 @@ impl From<TransportError> for io::Error {
 /// `programs::ExecError`) are returned as nested `Result` values from the
 /// caller-facing function rather than collapsed into this enum so each call
 /// site keeps its typed service contract.
+#[cfg(feature = "system")]
 #[derive(Debug, Error)]
 pub enum RpcError {
     #[error("failed to encode {instance}.{func} request: {source}")]
@@ -117,6 +138,7 @@ pub enum RpcError {
     },
 }
 
+#[cfg(feature = "system")]
 impl RpcError {
     /// The guest's panic report when this call failed because the guest
     /// kernel died rather than because the call itself was refused.
@@ -136,6 +158,7 @@ impl RpcError {
 ///
 /// Not gated on the `guest` feature: the RPC server loop that raises it
 /// is generic over its dispatcher, and the host build tests that loop.
+#[cfg(feature = "system")]
 #[derive(Debug, Error)]
 pub enum DispatchError {
     #[error("failed to encode {operation} response: {source}")]
@@ -169,6 +192,7 @@ pub enum DispatchError {
     },
 }
 
+#[cfg(feature = "system")]
 impl DispatchError {
     pub fn protocol(message: impl Into<String>) -> Self {
         Self::Protocol {
@@ -177,14 +201,14 @@ impl DispatchError {
     }
 }
 
-/// A frame or console line the guest sent that the wire format's
-/// stated limits refuse.
+/// A frame, console line, stream credit update, or resource handle that
+/// violates the wire protocol's limits or ownership rules.
 ///
-/// The guest is the untrusted side of the link, so every size it
-/// announces or implies is judged against the limits in [`crate::wire`]
-/// before the host allocates for it. The wire layer reports through
-/// `io::Error` to match the stream it reads, carrying this enum as the
-/// payload; use [`WireError::from_io`] to recover it.
+/// Both peers treat incoming wire data as untrusted: every length, path
+/// count, stream credit, and resource handle is validated before allocating
+/// or dereferencing state. The low-level wire reader surfaces these through
+/// `io::Error` (recoverable via [`WireError::from_io`]), while higher-level
+/// RPC layers carry [`WireError`] directly.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum WireError {
     /// A frame header announced a payload above the frame maximum.
@@ -221,19 +245,63 @@ pub enum WireError {
     /// transport holds state for. Only that invocation fails.
     #[error("invocation {invocation} addressed more than the {max} inbound path(s) it may hold")]
     TooManyInboundPaths { invocation: u32, max: usize },
+
+    /// A peer sent data on a sub-path stream or future without available
+    /// credit.
+    #[error("invocation {invocation} path {path:?} sent data without stream credit")]
+    StreamCreditExceeded { invocation: u32, path: Vec<u32> },
+
+    /// A peer sent zero credits or overflowed the 32-bit credit window on a
+    /// sub-path.
+    #[error("invocation {invocation} path {path:?} invalid credit grant of {credits}")]
+    CreditOverflow {
+        invocation: u32,
+        path: Vec<u32>,
+        credits: u32,
+    },
+
+    /// A peer referenced or dropped a connection-local resource handle that
+    /// is unallocated, forged, or already dropped.
+    #[error("invalid or forged connection resource handle {handle}")]
+    InvalidResourceHandle { handle: u32 },
+
+    /// A peer supplied a live resource handle whose runtime resource type
+    /// does not match the parameter's WIT resource type.
+    #[error("resource handle {handle} has type {actual}, expected {expected}")]
+    ResourceTypeMismatch {
+        handle: u32,
+        expected: String,
+        actual: String,
+    },
+
+    /// A peer attempted to drop or move (`own<R>`) a resource handle while an
+    /// active `borrow<R>` is still in flight.
+    #[error("resource handle {handle} cannot be moved or dropped while borrowed")]
+    ResourceBorrowed { handle: u32 },
+
+    /// A structured WIT-RPC payload failed validation or decoding.
+    #[error("malformed WIT-RPC payload in {context}: {detail}")]
+    MalformedPayload { context: String, detail: String },
 }
 
 impl WireError {
     /// The wire fault carried by `error`, if that is what it is.
-    pub fn from_io(error: &std::io::Error) -> Option<&Self> {
-        error
+    pub fn from_io(error: &io::Error) -> Option<&Self> {
+        if let Some(direct) = error
             .get_ref()
             .and_then(|inner| inner.downcast_ref::<Self>())
+        {
+            return Some(direct);
+        }
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<TransportError>())
+            .and_then(TransportError::wire_error)
     }
 }
 
-impl From<WireError> for std::io::Error {
+impl From<WireError> for io::Error {
     fn from(error: WireError) -> Self {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+        io::Error::new(io::ErrorKind::InvalidData, error)
     }
 }

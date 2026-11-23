@@ -9,7 +9,7 @@ use helios_hal::cpu::{Cpu, ProcessorId};
 use helios_hal::serial::ByteSerial;
 use helios_hal::watchdog::ProgressCounter;
 
-use super::descriptor::{P1Readiness, Preview1DescriptorTable};
+use super::descriptor::{DescriptorOrigin, P1Readiness};
 use super::preview1::Preview1ProgramStore;
 use super::wasix_proc::{WasixSpawnIo, WasixStdioMode, wasix_prepare_child_io};
 use super::{
@@ -91,7 +91,7 @@ macro_rules! define_test_serial {
 
 fn new_program_store<Access: DebugSerialAccess>(
     output_mode: OutputMode,
-    descriptors: Option<Preview1DescriptorTable<TestNetworkService>>,
+    descriptors: DescriptorOrigin<TestNetworkService>,
 ) -> TestProgramStore {
     let cpu = TestCpu::with_entropy(0x5a);
     let runtime_state: HostRuntimeState<TestCpu, TestNetworkService, UnsupportedStorage> =
@@ -159,11 +159,11 @@ fn forked_child_shares_parent_channel_stdin_stream() {
             stdout_tx,
             stderr_tx,
         },
-        None,
+        DescriptorOrigin::Fresh,
     );
     let mut child = new_program_store::<ChannelForkAccess>(
         parent.fork_output_mode(),
-        Some(parent.descriptors.snapshot()),
+        DescriptorOrigin::NewProcess(parent.descriptors.snapshot()),
     );
 
     assert!(matches!(
@@ -185,10 +185,10 @@ fn forked_child_shares_parent_channel_stdin_stream() {
 fn forked_child_inherits_serial_stdin_stream() {
     define_test_serial!(SerialForkAccess, SERIAL_FORK_PORT, SERIAL_FORK_CONSOLE);
 
-    let parent = new_program_store::<SerialForkAccess>(OutputMode::Serial, None);
+    let parent = new_program_store::<SerialForkAccess>(OutputMode::Serial, DescriptorOrigin::Fresh);
     let mut child = new_program_store::<SerialForkAccess>(
         parent.fork_output_mode(),
-        Some(parent.descriptors.snapshot()),
+        DescriptorOrigin::NewProcess(parent.descriptors.snapshot()),
     );
     assert!(matches!(child.stdin_route(), ComponentInputRoute::Serial));
 
@@ -214,12 +214,13 @@ fn spawned_inherit_child_shares_parent_channel_and_serial_stdin() {
             stdout_tx,
             stderr_tx,
         },
-        None,
+        DescriptorOrigin::Fresh,
     );
     let channel_io = wasix_prepare_child_io(&channel_parent, WasixSpawnIo::inherit())
         .expect("inherit spawn io succeeds");
     assert!(channel_io.stdin_writer.is_none());
-    let mut channel_child = new_program_store::<SpawnInheritAccess>(channel_io.output_mode, None);
+    let mut channel_child =
+        new_program_store::<SpawnInheritAccess>(channel_io.output_mode, DescriptorOrigin::Fresh);
 
     assert!(matches!(
         stdin_tx.try_write(Bytes::from_static(b"123456")),
@@ -231,11 +232,13 @@ fn spawned_inherit_child_shares_parent_channel_and_serial_stdin() {
     assert_eq!(read_stdin(&mut channel_parent, 3).as_ref(), b"456");
     assert_eq!(read_stdin(&mut channel_child, 3).as_ref(), b"");
 
-    let serial_parent = new_program_store::<SpawnInheritAccess>(OutputMode::Serial, None);
+    let serial_parent =
+        new_program_store::<SpawnInheritAccess>(OutputMode::Serial, DescriptorOrigin::Fresh);
     let serial_io = wasix_prepare_child_io(&serial_parent, WasixSpawnIo::inherit())
         .expect("inherit spawn io succeeds on serial");
     assert!(serial_io.stdin_writer.is_none());
-    let mut serial_child = new_program_store::<SpawnInheritAccess>(serial_io.output_mode, None);
+    let mut serial_child =
+        new_program_store::<SpawnInheritAccess>(serial_io.output_mode, DescriptorOrigin::Fresh);
     assert!(matches!(
         serial_child.stdin_route(),
         ComponentInputRoute::Serial
@@ -258,12 +261,14 @@ fn exec_from_forked_child_preserves_inherited_stdin_stream() {
             stdout_tx,
             stderr_tx,
         },
-        None,
+        DescriptorOrigin::Fresh,
     );
     let forked_mode = parent.fork_output_mode();
     let exec_descriptors = parent.descriptors.clone_for_exec();
-    let mut exec_child =
-        new_program_store::<ExecForkAccess>(forked_mode.clone(), Some(exec_descriptors.clone()));
+    let mut exec_child = new_program_store::<ExecForkAccess>(
+        forked_mode.clone(),
+        DescriptorOrigin::SameProcess(exec_descriptors.clone()),
+    );
 
     assert!(matches!(
         stdin_tx.try_write(Bytes::from_static(b"exec-ok")),
@@ -281,11 +286,12 @@ fn exec_from_forked_child_preserves_inherited_stdin_stream() {
         ComponentInputRoute::Child(_)
     ));
 
-    let serial_parent = new_program_store::<ExecForkAccess>(OutputMode::Serial, None);
+    let serial_parent =
+        new_program_store::<ExecForkAccess>(OutputMode::Serial, DescriptorOrigin::Fresh);
     let serial_fork_mode = serial_parent.fork_output_mode();
     let mut serial_exec_child = new_program_store::<ExecForkAccess>(
         serial_fork_mode,
-        Some(serial_parent.descriptors.clone_for_exec()),
+        DescriptorOrigin::SameProcess(serial_parent.descriptors.clone_for_exec()),
     );
     EXEC_FORK_PORT.push_bytes(&EXEC_FORK_CONSOLE, b"serial-exec");
     assert_eq!(
@@ -307,7 +313,7 @@ fn spawn_null_and_log_stdin_modes_end_at_eof() {
             stdout_tx,
             stderr_tx,
         },
-        None,
+        DescriptorOrigin::Fresh,
     );
     assert!(matches!(
         stdin_tx.try_write(Bytes::from_static(b"unseen")),
@@ -323,20 +329,23 @@ fn spawn_null_and_log_stdin_modes_end_at_eof() {
         let prepared = wasix_prepare_child_io(&parent, WasixSpawnIo::from_modes(raw_mode, 1, 1))
             .expect("null and log spawn io succeed");
         assert!(prepared.stdin_writer.is_none());
-        let mut child = new_program_store::<ClosedSpawnAccess>(prepared.output_mode, None);
+        let mut child =
+            new_program_store::<ClosedSpawnAccess>(prepared.output_mode, DescriptorOrigin::Fresh);
         assert!(matches!(child.stdin_route(), ComponentInputRoute::Closed));
         assert_eq!(child.probe_stdin(0), P1Readiness::Hangup);
         assert_eq!(read_stdin(&mut child, 16).as_ref(), b"");
     }
 
     // Also verify Null and Log end the stream when parent is Serial.
-    let serial_parent = new_program_store::<ClosedSpawnAccess>(OutputMode::Serial, None);
+    let serial_parent =
+        new_program_store::<ClosedSpawnAccess>(OutputMode::Serial, DescriptorOrigin::Fresh);
     CLOSED_SPAWN_PORT.push_bytes(&CLOSED_SPAWN_CONSOLE, b"console-bytes");
     for raw_mode in [2, 3] {
         let prepared =
             wasix_prepare_child_io(&serial_parent, WasixSpawnIo::from_modes(raw_mode, 1, 1))
                 .expect("null and log spawn io succeed on serial");
-        let mut child = new_program_store::<ClosedSpawnAccess>(prepared.output_mode, None);
+        let mut child =
+            new_program_store::<ClosedSpawnAccess>(prepared.output_mode, DescriptorOrigin::Fresh);
         assert!(matches!(child.stdin_route(), ComponentInputRoute::Closed));
         assert!(matches!(
             child.output_mode,
