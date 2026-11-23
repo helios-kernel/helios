@@ -70,9 +70,13 @@ mod stdin_inheritance_tests;
 #[cfg(feature = "linux")]
 use linux::*;
 #[cfg(test)]
+mod boot_init_tests;
+#[cfg(test)]
 mod child_exit_tests;
 
 use super::*;
+use crate::DescriptorLimitSetting;
+use crate::Settings;
 use crate::isa::GuestIsa;
 use crate::wasmtime_adapter::artifact_profile::{self, ArtifactProfileError};
 use crate::wasmtime_adapter::code_map::{CodeMap, CodeRegistration};
@@ -183,7 +187,6 @@ struct CompilerPhaseTimestamps {
     response_done_ns: u64,
     tasks_joined_ns: u64,
     signed_ns: u64,
-    verified_ns: u64,
     plugin_cached: bool,
 }
 
@@ -255,9 +258,9 @@ pub(super) struct ProgramLaunch<Net: ComponentHostNetwork, StorageImpl: crate::S
     /// program the kernel launches, which runs in a tree descending from
     /// the root namespace.
     filesystem: Option<Namespace<StorageImpl>>,
-    /// Inherited preview1 descriptors. Only core modules have a
-    /// descriptor table; a component ignores one.
-    descriptors: Option<Preview1DescriptorTable<Net>>,
+    /// Where the process's preview1 descriptors come from. Only core
+    /// modules have a descriptor table; a component ignores one.
+    descriptors: DescriptorOrigin<Net>,
     signal_dispositions: Vec<WasixSignalDisposition>,
     /// Explicit Linux container for launches started through a container
     /// handle. Direct Linux ELF launches wrap themselves in an ephemeral
@@ -286,7 +289,7 @@ impl<Net: ComponentHostNetwork, StorageImpl: crate::Storage> ProgramLaunch<Net, 
             env: LaunchEnvironment::from_guest(env),
             authority,
             filesystem,
-            descriptors: None,
+            descriptors: DescriptorOrigin::Fresh,
             signal_dispositions: Vec::new(),
             #[cfg(feature = "linux")]
             container: None,
@@ -307,7 +310,7 @@ impl<Net: ComponentHostNetwork, StorageImpl: crate::Storage> ProgramLaunch<Net, 
             env: LaunchEnvironment::from_guest(env),
             authority,
             filesystem: None,
-            descriptors: None,
+            descriptors: DescriptorOrigin::Fresh,
             signal_dispositions: Vec::new(),
             container: Some(LinuxContainerLaunch {
                 container,
@@ -440,7 +443,7 @@ struct ProgramSpawnRequest<Net: ComponentHostNetwork, StorageImpl: crate::Storag
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<Namespace<StorageImpl>>,
-    descriptors: Option<Preview1DescriptorTable<Net>>,
+    descriptors: DescriptorOrigin<Net>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
     #[cfg(feature = "linux")]
@@ -858,6 +861,190 @@ fn spawn_instruction_sample_drain<CpuImpl, Net, StorageImpl, WatchdogImpl, Measu
     });
 }
 
+struct BootInitCompletionGuard<CpuImpl, Net, StorageImpl>(
+    HostRuntimeState<CpuImpl, Net, StorageImpl>,
+)
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage;
+
+impl<CpuImpl, Net, StorageImpl> Drop for BootInitCompletionGuard<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn drop(&mut self) {
+        self.0.mark_boot_init_completed();
+    }
+}
+
+/// Selects stdio routing for the payload's boot `init` component.
+///
+/// When a system component (`bin/debugger`) is provisioned, `init`'s
+/// standard output and error still write to the debug UART as line-framed
+/// console segments before the debugger enters `wasi:cli/run`, while
+/// standard input stays closed so `init` never consumes incoming bytes
+/// meant for the debugger's serial RPC transport. Without a system
+/// component, `init` owns the full serial console when the platform
+/// exposes a debug UART, and falls back to observer trace output on
+/// platforms with no UART.
+pub(crate) fn boot_init_output_mode(
+    has_debug_serial: bool,
+    has_system_component: bool,
+) -> OutputMode {
+    if !has_debug_serial {
+        OutputMode::Trace
+    } else if has_system_component {
+        OutputMode::RoutedChild {
+            stdin: crate::ComponentInputRoute::Closed,
+            stdout: crate::ComponentOutputRoute::Serial,
+            stderr: crate::ComponentOutputRoute::Serial,
+        }
+    } else {
+        OutputMode::Serial
+    }
+}
+
+/// Schedules the payload's `EmbeddedInit::component()` to run on the
+/// calling bootstrap processor.
+///
+/// Shared across every backend (`aarch64`, `riscv`, `x86`, `hosted`) so
+/// bare-metal and hosted boots run the same bring-up orchestration, with
+/// or without `embedded-debugger`.
+pub fn launch_boot_init<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
+    cpu: &CpuImpl,
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    debug_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
+    read_serial: crate::SerialReader,
+    write_serial: crate::DebugSerialWriter,
+    has_system_component: bool,
+) where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+    WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
+{
+    let service = debug_state
+        .program_service()
+        .expect("program service must be installed before launching boot init");
+    debug_state.mark_boot_init_launched();
+    let completion = BootInitCompletionGuard(debug_state.clone());
+    let output_mode =
+        boot_init_output_mode(kernel.devices().has_debug_serial, has_system_component);
+    let exec_context = ProgramExecContext {
+        cpu: cpu.clone(),
+        timer: kernel.timer(),
+        spawner: kernel.spawner(),
+        runtime_state: debug_state.clone(),
+        instance_registry: debug_state.instance_registry(),
+        parent_instance_id: None,
+        read_serial,
+        write_serial,
+    };
+    let debug_state = debug_state.clone();
+    kernel.spawn_local_detached(async move {
+        let _completion = completion;
+        run_boot_init(service, exec_context, debug_state, output_mode).await;
+    });
+}
+
+async fn run_boot_init<CpuImpl, Net, StorageImpl>(
+    service: UserProgramService<CpuImpl, Net, StorageImpl>,
+    exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
+    debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
+    output_mode: OutputMode,
+) where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let init = debug_state.embedded_init();
+    let component = init.component();
+    let component_name = component.name();
+    let argv0 = init.argv0();
+    tracing::info!(
+        component = component_name,
+        argv0,
+        "launching boot init component"
+    );
+    let authority = ProcessAuthority::root();
+    let spawn_authority = authority
+        .derive_spawn_authority()
+        .expect("root process authority grants spawn");
+    let compile_authority = CompileAuthority::from(&spawn_authority);
+    let source = ProgramSource::from_file(FileContents::Boot(component.bootfs_bytes()));
+    let launch = ProgramLaunch::new(
+        ProgramArgv::launched(argv0, Vec::new()),
+        Vec::new(),
+        authority,
+        None,
+    );
+    let child = match service
+        .spawn_with_output_mode(
+            &compile_authority,
+            exec_context,
+            source,
+            launch,
+            output_mode,
+            ChildStdio {
+                stdin: None,
+                stdout: None,
+                stderr: None,
+            },
+        )
+        .await
+    {
+        Ok(child) => child,
+        Err(error) => {
+            tracing::error!(
+                component = component_name,
+                argv0,
+                ?error,
+                "failed to launch boot init component"
+            );
+            return;
+        }
+    };
+
+    match child.wait().await {
+        Ok(exit) => match exit.termination {
+            helios_unix::ChildTermination::Exited(0) => {
+                tracing::info!(
+                    component = component_name,
+                    argv0,
+                    instance = exit.instance_id.raw(),
+                    "boot init component exited cleanly"
+                );
+            }
+            termination => {
+                tracing::error!(
+                    component = component_name,
+                    argv0,
+                    instance = exit.instance_id.raw(),
+                    ?termination,
+                    "boot init component exited unsuccessfully"
+                );
+            }
+        },
+        Err(error) => {
+            tracing::error!(
+                component = component_name,
+                argv0,
+                ?error,
+                "boot init component wait failed"
+            );
+        }
+    }
+
+    // Settle any writable mounts `init` created before its namespace
+    // dropped, so on-disk mutations from `/etc/rc` are durable before
+    // the system component opens inspector sessions.
+    debug_state.root_namespace().sync_writable_mounts().await;
+}
+
 pub fn run_embedded_component_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
     component: EmbeddedComponent,
     world: ComponentBindingSet,
@@ -875,6 +1062,14 @@ where
     MeasuredBootImpl: MeasuredBoot,
 {
     let component_name = component.name();
+    // Wait for the payload's boot `init` to complete before emitting any
+    // debugger stage markers or tracing records onto the shared serial
+    // console, so SMP boots never interleave debugger bring-up lines with
+    // `init` or `/etc/rc` output.
+    let wait_state = debug_state.clone();
+    kernel.run_local_future(async move {
+        wait_state.wait_for_boot_init().await;
+    });
     write_serial.emit_stage_marker("boot");
     write_serial.emit_stage_marker("component-host:trace-begin");
     tracing::info!(
@@ -1035,6 +1230,14 @@ where
     if helios_hal::cpu::current_processor() == topology.bootstrap_processor {
         crate::control_flow::ReturnAddressCoverage::of(&cpu, env!("HELIOS_BUILD_TARGET"))
             .log(topology.configured_processors);
+        launch_boot_init(
+            &cpu,
+            &kernel,
+            &debug_state,
+            read_serial,
+            write_serial,
+            debug_state.has_system_component(),
+        );
     }
     match component_host_processor_role(
         helios_hal::cpu::current_processor(),
@@ -1106,6 +1309,9 @@ fn report_fiber_stack_demand_commits<CpuImpl: Cpu>(cpu: &CpuImpl) {
         released_committed_bytes = stats.released_committed_bytes,
         released_eager_bytes = stats.released_eager_bytes,
         reserve_bytes = crate::page_fault_frame_reserve_bytes(),
+        demand_committed_pages = stats.demand_committed_pages,
+        reserve_commits = stats.reserve_commits,
+        reserve_committed_pages = stats.reserve_committed_pages,
         "fiber stack arena totals for this boot"
     );
 }
@@ -1683,7 +1889,7 @@ where
             )
             .await?;
         if matches!(executable, ProgramExecutable::Component(_)) {
-            launch.descriptors = None;
+            launch.descriptors = DescriptorOrigin::Fresh;
         }
         self.spawn_loaded_with_output_mode(exec_context, executable, launch, output_mode, stdio)
     }
@@ -2024,17 +2230,8 @@ where
                 let _profile = artifact_profile::classify_raw_wasm(wasm)
                     .map_err(map_artifact_profile_error)?;
                 let hint = hint.unwrap_or(AotCompileHint::Performance);
-                let compiled = self
-                    .compile_raw_component_to_signed_artifact(
-                        compile,
-                        exec_context,
-                        wasm,
-                        hint,
-                        false,
-                    )
-                    .await?;
-                let signed = Bytes::from(compiled.signed);
-                trusted_signed_payload(&signed, &self.inner.cwasm_signing_key)?
+                self.compile_raw_component_payload(compile, exec_context, wasm, hint)
+                    .await?
             }
         };
         timeline.record(&self.inner.clock_cpu, LaunchPhase::ArtifactTrust);
@@ -2248,12 +2445,62 @@ where
 
     async fn compile_raw_component_to_signed_artifact(
         &self,
-        _: &CompileAuthority,
+        compile: &CompileAuthority,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
     ) -> Result<AotArtifact, ProgramExecError> {
+        self.compile_raw_component(
+            compile,
+            exec_context,
+            wasm,
+            hint,
+            profile,
+            move |service, exec_context, end| service.sign_compiled(exec_context, profile, end),
+        )
+        .await
+    }
+
+    /// Compiles raw wasm directly to the bare Wasmtime payload for immediate
+    /// execution in this kernel, without signing and then verifying its own
+    /// output in one call.
+    async fn compile_raw_component_payload(
+        &self,
+        compile: &CompileAuthority,
+        exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        wasm: &Bytes,
+        hint: AotCompileHint,
+    ) -> Result<Bytes, ProgramExecError> {
+        self.compile_raw_component(
+            compile,
+            exec_context,
+            wasm,
+            hint,
+            false,
+            |_service, _exec_context, end| {
+                let (payload, _thread_reports) = end.result?;
+                Ok(Bytes::from(payload))
+            },
+        )
+        .await
+    }
+
+    async fn compile_raw_component<T: Send + 'static>(
+        &self,
+        _: &CompileAuthority,
+        exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        wasm: &Bytes,
+        hint: AotCompileHint,
+        profile: bool,
+        finish: impl FnOnce(
+            &Self,
+            &ProgramExecContext<CpuImpl, Net, StorageImpl>,
+            CompileEnd,
+        ) -> Result<T, ProgramExecError>
+        + Send
+        + 'static,
+    ) -> Result<T, ProgramExecError> {
         let phases = CompilerPhaseTimestamps {
             processor: if profile {
                 helios_hal::cpu::current_processor().id()
@@ -2284,7 +2531,7 @@ where
             let exec_context = exec_context.clone();
             async move {
                 service
-                    .compile_session(&exec_context, job, phases, reply)
+                    .compile_session(&exec_context, job, phases, reply, finish)
                     .await;
             }
         });
@@ -2299,15 +2546,19 @@ where
 
     /// The compile session task: waits for the session slot, runs the compile
     /// with core affinity until every worker is joined, condemns the compile
-    /// if its requester leaves, and replies with the signed artifact.
-    async fn compile_session(
+    /// if its requester leaves, and replies with `finish`'s output.
+    async fn compile_session<T>(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         job: CompileJob,
         phases: CompilerPhaseTimestamps,
-        reply: futures::channel::oneshot::Sender<Result<AotArtifact, ProgramExecError>>,
+        reply: futures::channel::oneshot::Sender<Result<T, ProgramExecError>>,
+        finish: impl FnOnce(
+            &Self,
+            &ProgramExecContext<CpuImpl, Net, StorageImpl>,
+            CompileEnd,
+        ) -> Result<T, ProgramExecError>,
     ) {
-        let profile = job.profile;
         run_shared_memory_session(
             &self.inner.compile_slot,
             reply,
@@ -2341,13 +2592,14 @@ where
                     self.run_compile(exec_context, job, instance, phases),
                 )
             },
-            |end| self.sign_compiled(exec_context, profile, end),
+            |end| finish(self, exec_context, end),
         )
         .await;
     }
 
     /// Signs what a finished compile produced with this boot's key and
-    /// reports its phases.
+    /// reports its phases. The kernel produced both the payload and its
+    /// signature here, so it does not verify its own output.
     fn sign_compiled(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
@@ -2363,13 +2615,6 @@ where
         let signed = cwasm::sign_artifact_payload(&payload, &self.inner.cwasm_signing_key)
             .map_err(map_artifact_trust_error)?;
         phases.signed_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
-        } else {
-            0
-        };
-        cwasm::verify_signed_artifact(UntrustedCwasm::new(&signed), &self.inner.cwasm_signing_key)
-            .map_err(map_artifact_trust_error)?;
-        phases.verified_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
         } else {
             0
@@ -2882,7 +3127,7 @@ fn emit_compiler_phase_report(
     output_bytes: usize,
 ) {
     write_serial.emit_fmt(format_args!(
-        "aot-phases processor={} plugin_cached={} slot_us={} plugin_us={} instantiate_us={} input_us={} compile_us={} diagnostic_us={} output_copy_us={} join_us={} sign_us={} verify_us={} output_bytes={}\n",
+        "aot-phases processor={} plugin_cached={} slot_us={} plugin_us={} instantiate_us={} input_us={} compile_us={} diagnostic_us={} output_copy_us={} join_us={} sign_us={} output_bytes={}\n",
         phases.processor,
         phases.plugin_cached,
         phase_us(phases.entered_ns, phases.slot_acquired_ns),
@@ -2894,7 +3139,6 @@ fn emit_compiler_phase_report(
         phase_us(phases.diagnostic_done_ns, phases.response_done_ns),
         phase_us(phases.response_done_ns, phases.tasks_joined_ns),
         phase_us(phases.tasks_joined_ns, phases.signed_ns),
-        phase_us(phases.signed_ns, phases.verified_ns),
         output_bytes,
     ));
     for report in thread_reports {
@@ -3213,6 +3457,53 @@ mod tests {
             validate_preview1_program_import("wasi_unstable", import)
                 .expect("wasi_unstable imports should validate as preview1");
         }
+    }
+
+    /// A stack-reserve commit the user pool refuses ends the guest's call
+    /// with the pool's refusal, and the program service classifies that as
+    /// running out of memory, whatever context the runtime wraps it in. The
+    /// adapter asks the OOM killer to cover the bytes the pool could not
+    /// give.
+    #[test]
+    fn a_refused_stack_reserve_ends_the_call_as_out_of_memory() {
+        use crate::wasmtime_adapter::store::answer_stack_reserve;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        let engine = crate::wasmtime_adapter::engine::build_component_engine_for_platform(
+            &crate::test_support::TestCpu::without_entropy(),
+        )
+        .expect("the component engine builds on the test platform");
+        let mut store = wasmtime::Store::new(&engine, ());
+        let condemned_for = Arc::new(AtomicUsize::new(0));
+        let seen = condemned_for.clone();
+        store.stack_reserve_callback(move |_context, _sp| {
+            let shortfall = crate::ProgramOutOfMemory {
+                requested_bytes: 4096,
+                available_bytes: 0,
+                pool_bytes: 1 << 20,
+                reserved_bytes: 0,
+            };
+            answer_stack_reserve(
+                Err(crate::StackReserveError::OutOfMemory(shortfall)),
+                |requested_bytes| seen.store(requested_bytes, Ordering::Relaxed),
+            )
+        });
+        let host = wasmtime::Func::wrap(&mut store, || {});
+
+        let error = futures_lite::future::block_on(host.call_async(&mut store, &[], &mut []))
+            .expect_err("the entry into wasm asks for the reserve, and the pool refuses it");
+
+        assert_eq!(
+            condemned_for.load(Ordering::Relaxed),
+            4096,
+            "the OOM killer was asked to cover the refused bytes"
+        );
+        let error = map_program_runtime_error(error);
+        assert_eq!(
+            error.kind,
+            ProgramExecErrorKind::OutOfMemory,
+            "a refused reserve is the same out-of-memory a refused grow is: {error:?}"
+        );
     }
 
     #[test]
@@ -3631,6 +3922,89 @@ mod tests {
         assert_eq!(table.dup(0), Ok(1));
     }
 
+    /// A process created after the operator changes the descriptor-limit
+    /// setting takes the new value; a running process keeps the limit it
+    /// was created with, and so does a process that only changes its image.
+    #[test]
+    fn a_process_created_after_a_change_takes_the_new_limit_and_a_running_one_keeps_its_own() {
+        let machine = test_store::store_data_authorized(ProcessAuthority::empty(), |_| {});
+        let settings = machine.runtime_state.settings();
+        let mut operator = ProcessAuthority::empty();
+        operator.grant_settings_rights(crate::SettingsAuthorityRights::WRITE);
+        let proof = operator
+            .derive_write_settings_cap()
+            .expect("an authority granted the right derives its proof");
+        let authority = ProcessAuthority::empty();
+
+        // 1. A process created before the change has the default.
+        let mut running: TestDescriptorTable =
+            process_descriptors(DescriptorOrigin::Fresh, &authority, settings);
+        assert_eq!(running.limit, DescriptorLimit::DEFAULT);
+
+        // 2. The operator lowers the setting and is told what it was.
+        assert_eq!(
+            settings.set::<DescriptorLimitSetting>(&proof, DescriptorLimit::new(64)),
+            DescriptorLimit::DEFAULT
+        );
+
+        // 3. A process created after it takes the new value.
+        let mut created: TestDescriptorTable =
+            process_descriptors(DescriptorOrigin::Fresh, &authority, settings);
+        assert_eq!(created.limit, DescriptorLimit::new(64));
+
+        // 4. The running process still hands out numbers up to its own.
+        assert_eq!(
+            running.insert_entry_at(
+                100,
+                Preview1DescriptorEntry::new(Preview1Descriptor::NullDevice, false),
+            ),
+            Ok(100)
+        );
+
+        // 5. The new process refuses a number at its limit.
+        assert_eq!(
+            created.insert_entry_at(
+                64,
+                Preview1DescriptorEntry::new(Preview1Descriptor::NullDevice, false),
+            ),
+            Err(p1::errno::BADF)
+        );
+
+        // 6. Its lowest-free allocation runs out at the limit.
+        for expected in 3..64 {
+            assert_eq!(created.insert(Preview1Descriptor::NullDevice), Ok(expected));
+        }
+        assert_eq!(
+            created.insert(Preview1Descriptor::NullDevice),
+            Err(p1::errno::MFILE)
+        );
+
+        // 7. An exec is the same process: it keeps the limit it has.
+        let exec = process_descriptors(
+            DescriptorOrigin::SameProcess(running.clone_for_exec()),
+            &authority,
+            settings,
+        );
+        assert_eq!(exec.limit, DescriptorLimit::DEFAULT);
+
+        // 8. A fork or spawn child is a new process: it takes the setting,
+        // and the descriptors it inherits at or past the limit stay open.
+        let mut child = process_descriptors(
+            DescriptorOrigin::NewProcess(running.clone()),
+            &authority,
+            settings,
+        );
+        assert_eq!(child.limit, DescriptorLimit::new(64));
+        assert!(child.get(100).is_some());
+        assert_eq!(
+            child.insert_entry_at(
+                65,
+                Preview1DescriptorEntry::new(Preview1Descriptor::NullDevice, false),
+            ),
+            Err(p1::errno::BADF)
+        );
+    }
+
     #[test]
     fn fd_close_can_close_stdio_slots() {
         let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
@@ -3862,6 +4236,7 @@ mod tests {
             crate::DeviceClassRights::DISPLAY | crate::DeviceClassRights::AUDIO,
         );
         parent.grant_diagnostic_rights(crate::DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        parent.grant_settings_rights(crate::SettingsAuthorityRights::WRITE);
         parent.grant_machine_rights(crate::MachineAuthorityRights::CONTROL_PROCESSORS);
 
         let child = wasix_proc_spawn_inherited_non_directory_authority(&parent);
@@ -3888,6 +4263,10 @@ mod tests {
         assert_eq!(
             child.diagnostic_rights(),
             crate::DiagnosticAuthorityRights::OBSERVE_MACHINE
+        );
+        assert_eq!(
+            child.settings_rights(),
+            crate::SettingsAuthorityRights::WRITE
         );
         assert_eq!(
             child.machine_rights(),
