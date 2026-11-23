@@ -2337,7 +2337,7 @@ where
     let capacity = layout.byte_len;
     let bytes = match caller.data().descriptors.get_cloned(fd) {
         Some(Preview1Descriptor::Stdin { .. }) => caller.data_mut().read_stdin(fd, capacity).await,
-        Some(Preview1Descriptor::PipeRead { reader }) => reader
+        Some(Preview1Descriptor::PipeRead { reader, .. }) => reader
             .read_limit(capacity as usize)
             .await
             .unwrap_or_default(),
@@ -5138,7 +5138,7 @@ where
             )
             .await
         }
-        Some(Preview1Descriptor::PipeWrite { writer }) => {
+        Some(Preview1Descriptor::PipeWrite { writer, .. }) => {
             if nonblocking {
                 match writer.try_write(Bytes::copy_from_slice(bytes)) {
                     crate::TryWrite::Written => {}
@@ -5190,7 +5190,7 @@ where
         Some(Preview1Descriptor::Stdin { .. }) => {
             Ok(caller.data_mut().read_stdin(fd, capacity).await)
         }
-        Some(Preview1Descriptor::PipeRead { reader }) => Ok(reader
+        Some(Preview1Descriptor::PipeRead { reader, .. }) => Ok(reader
             .read_limit(capacity as usize)
             .await
             .unwrap_or_default()),

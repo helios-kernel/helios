@@ -9,10 +9,10 @@ use helios_hal::fs::NodeKind;
 use helios_hal::vmm::PageFlags;
 use helios_linux::abi::{Abi, Operation};
 use helios_linux::syscall::{
-    CAP_DAC_OVERRIDE, CAP_MKNOD, CAP_SETFCAP, CAP_SYS_ADMIN, Call, Clock, Credentials, Denied,
-    FileAccess, Filesystem, FsOpError, MapError, MemoryFault, MemoryTotals, Process, Region,
-    Resources, SpawnError, SpawnedThread, Stdio, Stream, SyscallOutcome, System, Thread, Tty,
-    UserMemory, VirtualMemory, WriteError, XattrSetMode, dispatch,
+    AT_EMPTY_PATH, CAP_DAC_OVERRIDE, CAP_MKNOD, CAP_SETFCAP, CAP_SYS_ADMIN, Call, Clock,
+    Credentials, Denied, FileAccess, Filesystem, FsOpError, MapError, MemoryFault, MemoryTotals,
+    Process, Region, Resources, SpawnError, SpawnedThread, Stdio, Stream, SyscallOutcome, System,
+    Thread, Tty, UserMemory, VirtualMemory, WriteError, XattrSetMode, dispatch,
 };
 use helios_unix::NoNetwork;
 use std::collections::BTreeMap;
@@ -720,5 +720,195 @@ fn prctl_no_new_privs_works_across_both_abis() {
             1
         );
         assert!(proc.credentials_handle().lock().no_new_privs);
+    }
+}
+
+#[test]
+fn prctl_keepcaps_retains_permitted_and_pipe_fchown_enforces_ownership() {
+    const PR_GET_KEEPCAPS: u64 = 7;
+    const PR_SET_KEEPCAPS: u64 = 8;
+
+    for abi in [Abi::X86_64, Abi::Aarch64] {
+        let mut proc = Process::<DummyRes>::new(abi, NonZeroU32::new(1).unwrap(), 0x40_0000);
+        let mut mem = FlatMem::default();
+        let mut host = RecordingHost::default();
+
+        // Default keep_caps is 0; bad values fail with EINVAL.
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Prctl,
+                [PR_GET_KEEPCAPS, 0, 0, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            0
+        );
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Prctl,
+                [PR_SET_KEEPCAPS, 2, 0, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            err(EINVAL)
+        );
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Prctl,
+                [PR_SET_KEEPCAPS, 1, 0, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            0
+        );
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Prctl,
+                [PR_GET_KEEPCAPS, 0, 0, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            1
+        );
+
+        // Create a pipe as root (owned by 0:0), then drop uid to 1000 with KEEPCAPS:
+        // permitted is kept while effective is cleared.
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Pipe2,
+                [0x4000, 0, 0, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            0
+        );
+        let read_fd = u32::from_le_bytes(mem.read_bytes(0x4000, 4).try_into().unwrap()) as u64;
+        let write_fd = u32::from_le_bytes(mem.read_bytes(0x4004, 4).try_into().unwrap()) as u64;
+
+        // Root can fchown the pipe to 1000:1000.
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Fchown,
+                [write_fd, 1000, 1000, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            0
+        );
+
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Setuid,
+                [1000, 0, 0, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            0
+        );
+        {
+            let creds = proc.credentials_handle();
+            let guard = creds.lock();
+            assert_eq!(guard.user.effective, 1000);
+            assert_ne!(guard.capabilities.permitted, 0);
+            assert_eq!(guard.capabilities.effective, 0);
+            assert_eq!(guard.capabilities.ambient, 0);
+        }
+
+        // Unprivileged owner (uid 1000) can fchown/fchownat(AT_EMPTY_PATH) pipe
+        // to own uid/gid, not to uid 0.
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Fchown,
+                [read_fd, 1000, u32::MAX as u64, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            0
+        );
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Fchown,
+                [write_fd, 0, 0, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            err(EPERM)
+        );
+        let empty_addr = 0x4080;
+        mem.write_cstr(empty_addr, "");
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Fchownat,
+                [
+                    read_fd,
+                    empty_addr,
+                    1000,
+                    u32::MAX as u64,
+                    u64::from(AT_EMPTY_PATH),
+                    0,
+                ],
+                &mut mem,
+                &mut host
+            ),
+            0
+        );
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Fchownat,
+                [write_fd, empty_addr, 0, 0, u64::from(AT_EMPTY_PATH), 0],
+                &mut mem,
+                &mut host
+            ),
+            err(EPERM)
+        );
+
+        // `setxattr`/`fsetxattr` reject invalid flags (`EINVAL`) before
+        // reading a null `name` pointer (`EFAULT`).
+        let path_addr = 0x4100;
+        mem.write_cstr(path_addr, "/file");
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Setxattr,
+                [path_addr, 0, 0, 0, 0x4, 0],
+                &mut mem,
+                &mut host
+            ),
+            err(EINVAL)
+        );
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Fsetxattr,
+                [read_fd, 0, 0, 0, 0x4, 0],
+                &mut mem,
+                &mut host
+            ),
+            err(EINVAL)
+        );
     }
 }

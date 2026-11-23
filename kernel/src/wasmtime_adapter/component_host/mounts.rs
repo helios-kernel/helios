@@ -161,32 +161,40 @@ macro_rules! impl_mount_bindings {
                             return Ok(Err(mount_error(&error)));
                         }
                     };
-                    let (authority, namespace, attached, write, spawner, timer) = accessor.with(|mut access| {
-                        let store = access.get();
-                        (
-                            store.process_authority().clone(),
-                            store.filesystem().clone(),
-                            store.runtime_state.attached_storage(),
-                            crate::vfs::BtrfsWriteOptions {
-                                entropy: store.runtime_state.root_entropy_handle().clone(),
-                                concurrency: core::num::NonZeroUsize::new(store.cpu.processor_count())
+                    let (authority, namespace, runtime_state, write, spawner, timer) =
+                        accessor.with(|mut access| {
+                            let store = access.get();
+                            (
+                                store.process_authority().clone(),
+                                store.filesystem().clone(),
+                                store.runtime_state.clone(),
+                                crate::vfs::BtrfsWriteOptions {
+                                    entropy: store.runtime_state.root_entropy_handle().clone(),
+                                    concurrency: core::num::NonZeroUsize::new(
+                                        store.cpu.processor_count(),
+                                    )
                                     .expect("a machine has at least one processor"),
-                                compress,
-                                commit: request
-                                    .commit
-                                    .map(|seconds| {
+                                    compress,
+                                    commit: request.commit.map(|seconds| {
                                         crate::vfs::CommitPolicy::machine_default()
                                             .with_commit_option(seconds)
                                     }),
-                                max_inline: request.max_inline,
-                                now: store.now_nanos(),
-                            },
-                            store.spawner().launch_spawner().clone(),
-                            store.timer(),
-                        )
-                    });
+                                    max_inline: request.max_inline,
+                                    now: store.now_nanos(),
+                                },
+                                store.spawner().launch_spawner().clone(),
+                                store.timer(),
+                            )
+                        });
                     let outcome = match mount_source(request.source) {
                         Ok(source) => {
+                            if matches!(
+                                source,
+                                MountSource::Disk { .. } | MountSource::Btrfs { .. }
+                            ) {
+                                runtime_state.wait_for_block_discovery().await;
+                            }
+                            let attached = runtime_state.attached_storage();
                             crate::request_mount(
                                 &authority,
                                 &namespace,

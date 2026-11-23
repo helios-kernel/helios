@@ -432,7 +432,17 @@ pub fn check_xattr_permission(
     name: &str,
     write: bool,
 ) -> Result<XattrNamespace, FsOpError> {
-    let ns = classify_xattr_name(name)?;
+    let ns = match classify_xattr_name(name) {
+        Ok(ns) => ns,
+        // `fs/xattr.c` `xattr_permission`: unknown prefixes still pass through
+        // `inode_permission` before the filesystem rejects them with `EOPNOTSUPP`.
+        Err(FsOpError::Fs(FsError::Unsupported)) => {
+            let mask = if write { MAY_WRITE } else { MAY_READ };
+            generic_permission(creds, inode, access_acl, mask)?;
+            return Err(FsOpError::Fs(FsError::Unsupported));
+        }
+        Err(err) => return Err(err),
+    };
     match ns {
         XattrNamespace::Trusted => {
             if !creds.capabilities.has_effective(CAP_SYS_ADMIN) {
@@ -621,6 +631,9 @@ pub fn apply_exec_credentials(
         effective &= permitted;
     }
 
+    // `security/commoncap.c` `cap_bprm_creds_from_file`: `SECURE_KEEP_CAPS` is
+    // unconditionally cleared on `execve`.
+    new.keep_caps = false;
     new.capabilities.bounding &= ceiling;
     new.capabilities.permitted = permitted & ceiling;
     new.capabilities.effective = effective & ceiling;
@@ -911,6 +924,35 @@ mod tests {
         assert_eq!(nnp_creds.capabilities.effective, 0);
         assert!(nnp_creds.no_new_privs);
         assert!(!exec_is_secure(&nnp_user, &nnp_creds));
+
+        // `PR_SET_KEEPCAPS` is unconditionally cleared across `execve`.
+        let mut kc_user = user.clone();
+        kc_user.keep_caps = true;
+        let kc_creds = apply_exec_credentials(&kc_user, exec_file, None, false, CAP_FULL_SET);
+        assert!(!kc_creds.keep_caps);
+
+        // Unknown xattr prefix checks `generic_permission` (`EACCES`) before
+        // returning `EOPNOTSUPP` (`fs/xattr.c` `xattr_permission`).
+        let no_read = InodeMeta {
+            kind: NodeKind::File,
+            uid: 0,
+            gid: 0,
+            mode: 0o000,
+        };
+        assert_eq!(
+            check_xattr_permission(&user, no_read, None, "ceph.file.layout", false),
+            Err(FsOpError::Fs(FsError::NotPermitted))
+        );
+        let readable = InodeMeta {
+            kind: NodeKind::File,
+            uid: 0,
+            gid: 0,
+            mode: 0o444,
+        };
+        assert_eq!(
+            check_xattr_permission(&user, readable, None, "ceph.file.layout", false),
+            Err(FsOpError::Fs(FsError::Unsupported))
+        );
     }
 
     use super::super::system::CAP_NET_BIND_SERVICE;

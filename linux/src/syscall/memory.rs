@@ -241,7 +241,7 @@ async fn flush_shared_range<R: Resources, M: UserMemory, F: fs::Filesystem<R>>(
     fs: &mut F,
 ) {
     let segments = snapshot_overlapping(process, start, end, true);
-    let creds = process.shared.credentials.lock().clone();
+    let creds = process.credentials.lock().clone();
     for (seg_start, seg_len, file, file_off) in segments {
         flush_one_range(seg_start, seg_len, &file, file_off, &creds, memory, fs).await;
     }
@@ -266,7 +266,7 @@ pub(super) async fn flush_file_shared_mappings<
             .map(|m| (m.start, m.len, m.file.clone(), m.file_offset))
             .collect()
     };
-    let creds = process.shared.credentials.lock().clone();
+    let creds = process.credentials.lock().clone();
     for (seg_start, seg_len, f, file_off) in segments {
         flush_one_range(seg_start, seg_len, &f, file_off, &creds, memory, fs).await;
     }
@@ -286,7 +286,7 @@ pub(super) async fn flush_all_shared_mappings<R: Resources, M: UserMemory, F: fs
             .map(|m| (m.start, m.len, m.file.clone(), m.file_offset))
             .collect()
     };
-    let creds = process.shared.credentials.lock().clone();
+    let creds = process.credentials.lock().clone();
     for (seg_start, seg_len, f, file_off) in segments {
         flush_one_range(seg_start, seg_len, &f, file_off, &creds, memory, fs).await;
     }
@@ -501,7 +501,12 @@ pub(super) async fn mmap<R: Resources, M: VirtualMemory, F: fs::Filesystem<R>>(
     let mapped_addr = {
         let _mm = process.shared.program_break.lock();
         if !is_fixed {
-            match memory.map_anywhere(hint & !(PAGE - 1), length, initial_access) {
+            // `CONFIG_DEFAULT_MMAP_MIN_ADDR` (64 KiB, `security/min_addr.c`):
+            // keep unfixed mappings above the low null-pointer guard range so
+            // small invalid user pointers never alias a live mapping.
+            const MMAP_MIN_ADDR: u64 = 65_536;
+            let unfixed_hint = (hint & !(PAGE - 1)).max(MMAP_MIN_ADDR);
+            match memory.map_anywhere(unfixed_hint, length, initial_access) {
                 Ok(addr) => addr,
                 Err(error) => return map_errno(error),
             }
@@ -628,7 +633,7 @@ pub(super) async fn msync<R: Resources, M: VirtualMemory, F: fs::Filesystem<R>>(
     }
 
     let segments = snapshot_overlapping(process, start, clamped_end, true);
-    let creds = process.shared.credentials.lock().clone();
+    let creds = process.credentials.lock().clone();
     for (seg_start, seg_len, file, file_off) in segments {
         flush_one_range(seg_start, seg_len, &file, file_off, &creds, memory, fs).await;
         if flags & MS_SYNC != 0

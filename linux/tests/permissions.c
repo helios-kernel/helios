@@ -70,6 +70,8 @@ int main(void) {
     int has_cap_mknod = (data[0].effective & (1U << 27)) != 0;
 
     /* 2. Scratch directory for file/mode/owner/mknod/xattr checks. */
+    long mk = SYS(SYS_mkdirat, AT_FDCWD, "/tmp", 0755);
+    CHECK(mk == 0 || mk == -EEXIST);
     char dir[128];
     snprintf(dir, sizeof(dir), "/tmp/helios-perm-%d", (int)getpid());
     (void)rmdir(dir);

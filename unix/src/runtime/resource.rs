@@ -37,6 +37,49 @@ pub struct FileDescriptorEntry<File: Clone, Net: SocketNetwork, Data: Clone> {
     fdflags: Arc<AtomicU16>,
 }
 
+/// Ownership and mode of an anonymous `pipefs` inode shared by both ends of a pipe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PipeAttrs {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+}
+
+/// Shared handle to an anonymous pipe's inode metadata (`fs/pipe.c`).
+#[derive(Clone, Debug)]
+pub struct PipeInode(Arc<spin::Mutex<PipeAttrs>>);
+
+impl PipeInode {
+    pub fn new(uid: u32, gid: u32) -> Self {
+        Self(Arc::new(spin::Mutex::new(PipeAttrs {
+            uid,
+            gid,
+            mode: 0o600,
+        })))
+    }
+
+    pub fn attrs(&self) -> PipeAttrs {
+        *self.0.lock()
+    }
+
+    pub fn set_owner_and_mode(&self, uid: u32, gid: u32, mode: u32) {
+        let mut attrs = self.0.lock();
+        attrs.uid = uid;
+        attrs.gid = gid;
+        attrs.mode = mode & 0o7777;
+    }
+
+    pub fn set_mode(&self, mode: u32) {
+        self.0.lock().mode = mode & 0o7777;
+    }
+}
+
+impl Default for PipeInode {
+    fn default() -> Self {
+        Self::new(0, 0)
+    }
+}
+
 #[derive(Clone)]
 pub enum FileDescriptor<File: Clone, Net: SocketNetwork, Data: Clone> {
     Stdin {
@@ -46,9 +89,11 @@ pub enum FileDescriptor<File: Clone, Net: SocketNetwork, Data: Clone> {
     Stderr,
     PipeRead {
         reader: ByteReader,
+        inode: PipeInode,
     },
     PipeWrite {
         writer: ByteWriter,
+        inode: PipeInode,
     },
     Event(EventFd),
     Preopen {

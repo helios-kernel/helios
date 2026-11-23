@@ -67,7 +67,7 @@ where
     MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let discovered = discover_block_devices(cpu, platform, physical_memory_offset, handoff);
-    let devices = discovered
+    let devices: Vec<_> = discovered
         .iter()
         .map(|interrupt| interrupt.device.inner.clone())
         .collect();
@@ -75,6 +75,9 @@ where
     let spawner = kernel.spawner();
     let timer = kernel.timer();
     let swap_cpu = *cpu;
+    if !devices.is_empty() {
+        debug_state.begin_block_discovery();
+    }
     helios_kernel::install_block_devices(
         kernel,
         root,
@@ -84,6 +87,7 @@ where
             if let Some(cache) = mount_sources {
                 state.install_mount_sources(cache);
             }
+            state.finish_block_discovery();
             if let Some(swap) = helios_kernel::install_scratch_swap(
                 state.instance_registry(),
                 scratch,

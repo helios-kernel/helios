@@ -552,7 +552,7 @@ pub(super) async fn clone_process<
         )
     };
 
-    let child_creds = Arc::new(spin::Mutex::new(process.shared.credentials.lock().clone()));
+    let child_creds = Arc::new(spin::Mutex::new(process.credentials.lock().clone()));
     let child_attrs = process.shared.attributes.lock().clone();
     let child_stdin_carry = process.shared.stdin_carry.lock().clone();
     let share_sighand = parsed.flags & CLONE_SIGHAND != 0;
@@ -617,7 +617,6 @@ pub(super) async fn clone_process<
             shared_mappings: child_shared_mappings,
             stdin_lock: helios_sync::RawMutex::new(),
             stdin_carry: spin::Mutex::new(child_stdin_carry),
-            credentials: child_creds,
             attributes: spin::Mutex::new(child_attrs),
             program_break: child_program_break,
             signals: child_signals,
@@ -626,6 +625,7 @@ pub(super) async fn clone_process<
         }),
         tid: child_pid,
         signals: child_thread_signals,
+        credentials: child_creds,
         clear_child_tid: if parsed.flags & CLONE_CHILD_CLEARTID != 0 {
             parsed.child_tid
         } else {

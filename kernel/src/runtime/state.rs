@@ -67,6 +67,11 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// kernel identified them. Empty on a machine with none, where a
     /// disk mount is refused as unavailable.
     mount_sources: Once<BlockCache<StorageImpl::Disk>>,
+    /// True while the asynchronous block-discovery task is identifying disks
+    /// and opening mount sources; cleared once `install_mount_sources` has
+    /// published them so early mount requests wait instead of racing boot.
+    block_discovery_pending: AtomicBool,
+    block_discovery_ready: Notify,
     /// What the kernel publishes about its disks once it identified them
     /// and proved the scratch disk: the scratch disk's counters and the
     /// compressed pool's settings. Empty on a machine with no block
@@ -352,6 +357,8 @@ where
                 http_client: PerProcessorProvider::new(),
                 host_fs_service: Mutex::new(None),
                 mount_sources: Once::new(),
+                block_discovery_pending: AtomicBool::new(false),
+                block_discovery_ready: Notify::new(),
                 block_service: Once::new(),
                 device_grants: DeviceGrantRegistry::new(),
                 iommu_report: Once::new(),
@@ -1073,6 +1080,35 @@ where
     /// machine with none.
     pub fn mount_sources(&self) -> Option<BlockCache<StorageImpl::Disk>> {
         self.inner.mount_sources.get().cloned()
+    }
+
+    /// Marks asynchronous block-device discovery as in flight so disk mounts
+    /// wait until [`Self::finish_block_discovery`] publishes any mount sources.
+    pub fn begin_block_discovery(&self) {
+        self.inner
+            .block_discovery_pending
+            .store(true, Ordering::Release);
+    }
+
+    /// Marks asynchronous block-device discovery complete and wakes any
+    /// mount request waiting for mount-source disks.
+    pub fn finish_block_discovery(&self) {
+        self.inner
+            .block_discovery_pending
+            .store(false, Ordering::Release);
+        self.inner.block_discovery_ready.notify_all();
+    }
+
+    /// Waits until in-flight block-device discovery completes. Returns
+    /// immediately on machines with no pending block discovery.
+    pub async fn wait_for_block_discovery(&self) {
+        while self.inner.block_discovery_pending.load(Ordering::Acquire) {
+            let ready = self.inner.block_discovery_ready.notified();
+            if !self.inner.block_discovery_pending.load(Ordering::Acquire) {
+                return;
+            }
+            ready.await;
+        }
     }
 
     /// The storage a mount request builds its source from.

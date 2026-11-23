@@ -817,8 +817,10 @@ fn anonymous_mmap_allocates_zeroed_memory_and_rejects_invalid_requests() {
         &mut memory,
         &mut sink,
     ));
-    assert_eq!(result, ControlFlow::Continue(4096));
-    assert_eq!(&memory.0[4096..], &[0; 4096]);
+    // Unfixed `mmap(0, ...)` starts at `CONFIG_DEFAULT_MMAP_MIN_ADDR` (64 KiB)
+    // so low invalid user pointers never alias live mappings.
+    assert_eq!(result, ControlFlow::Continue(65_536));
+    assert_eq!(&memory.0[65_536..], &[0; 4096]);
     for (arguments, error) in [
         ([0, 0, 3, 0x22, u64::MAX, 0], 22u64),
         // MAP_FIXED below the lowest mappable address.

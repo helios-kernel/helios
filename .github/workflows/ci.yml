@@ -1336,7 +1336,7 @@ jobs:
             --bootfs-root "$runtime/bootfs" \
             --boot-program dash --boot-program debugger --boot-program cat --boot-program wasix-port-list \
             --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1; /linux/sockets; /linux/netconfig; /bin/dash /linux/check-busybox-netconfig.sh /linux/busybox /linux/udhcpc-script.sh /bin/wasix-port-list; /linux/files; printf "from-wasix: 中文 日本語 한국어\n" > /tmp/cross.txt && /linux/files cross /tmp/cross.txt && cat /tmp/cross.txt /tmp/cross.txt.mmap; /linux/readiness hold-open | /linux/readiness stdin-quiet; /linux/readiness stdin-epoll >/dev/null && echo "stdin-epoll: ok"; /linux/tty; /linux/process; /linux/process mixed /bin/cat; /bin/dash /linux/check-dash.sh /linux/dash /linux/hello /linux/args /bin/cat; echo "dash:$?"; /linux/curl -fsS --max-time 30 http://10.0.2.2:'"$curl_port"'/hello' \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1; /linux/sockets; /linux/netconfig; /bin/dash /linux/check-busybox-netconfig.sh /linux/busybox /linux/udhcpc-script.sh /bin/wasix-port-list; /linux/files; printf "from-wasix: 中文 日本語 한국어\n" > /tmp/cross.txt && /linux/files cross /tmp/cross.txt && cat /tmp/cross.txt /tmp/cross.txt.mmap; /linux/readiness hold-open | /linux/readiness stdin-quiet; /linux/readiness stdin-epoll >/dev/null && echo "stdin-epoll: ok"; /linux/tty; /linux/permissions; /linux/process; /linux/process mixed /bin/cat; /bin/dash /linux/check-dash.sh /linux/dash /linux/hello /linux/args /bin/cat; echo "dash:$?"; /linux/curl -fsS --max-time 30 http://10.0.2.2:'"$curl_port"'/hello' \
             2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
           cat linux-smoke.out
           grep -Fqx 'arg1=3' linux-smoke.out
@@ -1359,7 +1359,7 @@ jobs:
           # The system-information suite (#1035), sockets (#1030), netconfig
           # (#1031), file/readiness/tty suites (#1028), and process/dash suites
           # (#1034) run in the same modes build-fixtures.sh asserts on Linux.
-          for suite in clock random identity limits machine priority container sockets netconfig busybox-netconfig files files-cross readiness stdin-epoll tty process curl-smoke; do
+          for suite in clock random identity limits machine priority container sockets netconfig busybox-netconfig files files-cross readiness stdin-epoll tty permissions process curl-smoke; do
             grep -Fqx "$suite: ok" linux-smoke.out
           done
           grep -Fqx 'from-wasix: 中文 日本語 한국어' linux-smoke.out
@@ -2053,7 +2053,7 @@ jobs:
             --bootfs-root "$runtime/bootfs" \
             --boot-program dash --boot-program debugger --boot-program cat --boot-program wasix-port-list \
             --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1; /linux/sockets; /linux/netconfig; /bin/dash /linux/check-busybox-netconfig.sh /linux/busybox /linux/udhcpc-script.sh /bin/wasix-port-list; /linux/files; printf "from-wasix: 中文 日本語 한국어\n" > /tmp/cross.txt && /linux/files cross /tmp/cross.txt && cat /tmp/cross.txt /tmp/cross.txt.mmap; /linux/readiness hold-open | /linux/readiness stdin-quiet; /linux/readiness stdin-epoll >/dev/null && echo "stdin-epoll: ok"; /linux/tty; /linux/process; /linux/process mixed /bin/cat; /bin/dash /linux/check-dash.sh /linux/dash /linux/hello /linux/args /bin/cat; echo "dash:$?"; /linux/curl -fsS --max-time 30 http://10.0.2.2:'"$curl_port"'/hello' \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1; /linux/sockets; /linux/netconfig; /bin/dash /linux/check-busybox-netconfig.sh /linux/busybox /linux/udhcpc-script.sh /bin/wasix-port-list; /linux/files; printf "from-wasix: 中文 日本語 한국어\n" > /tmp/cross.txt && /linux/files cross /tmp/cross.txt && cat /tmp/cross.txt /tmp/cross.txt.mmap; /linux/readiness hold-open | /linux/readiness stdin-quiet; /linux/readiness stdin-epoll >/dev/null && echo "stdin-epoll: ok"; /linux/tty; /linux/permissions; /linux/process; /linux/process mixed /bin/cat; /bin/dash /linux/check-dash.sh /linux/dash /linux/hello /linux/args /bin/cat; echo "dash:$?"; /linux/curl -fsS --max-time 30 http://10.0.2.2:'"$curl_port"'/hello' \
             2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
           cat linux-smoke.out
           grep -Fqx 'arg1=3' linux-smoke.out
@@ -2076,7 +2076,7 @@ jobs:
           # The system-information suite (#1035), sockets (#1030), netconfig
           # (#1031), file/readiness/tty suites (#1028), and process/dash suites
           # (#1034) run in the same modes build-fixtures.sh asserts on Linux.
-          for suite in clock random identity limits machine priority container sockets netconfig busybox-netconfig files files-cross readiness stdin-epoll tty process curl-smoke; do
+          for suite in clock random identity limits machine priority container sockets netconfig busybox-netconfig files files-cross readiness stdin-epoll tty permissions process curl-smoke; do
             grep -Fqx "$suite: ok" linux-smoke.out
           done
           grep -Fqx 'from-wasix: 中文 日本語 한국어' linux-smoke.out
@@ -3759,7 +3759,13 @@ jobs:
         run: |
           set -euo pipefail
           runtime="$RESULTS/runtime-${{ matrix.arch }}-${{ matrix.shard }}"
-          mkdir -p "$runtime"
+          mkdir -p "$runtime/tmp-root"
+          chmod 1777 "$runtime/tmp-root"
+          # Format a writable 128 MiB btrfs image mounted as a private container
+          # mount at `/tmp` so every case gets a fresh `TEST_TMPDIR` with full
+          # Unix permissions, ownership, set-id, ACL and xattr enforcement (#1084).
+          truncate -s 128M "$runtime/scratch.btrfs"
+          mkfs.btrfs -q -f --rootdir "$runtime/tmp-root" "$runtime/scratch.btrfs"
           uv run --project tools/gvisor-syscalls --quiet gvisor-syscalls helios \
             --cases "$SUITE/cases.txt" \
             --native "$RESULTS/native-${{ matrix.arch }}-${{ matrix.shard }}.jsonl" \
@@ -3769,9 +3775,11 @@ jobs:
             -- ./target/release/helios-inspector vm --arch "$VM_ARCH" --release --memory 2G \
               --accel "$ACCEL" --kernel-feature linux \
               --runtime-dir "$runtime" --keep-runtime-dir \
+              --disk "$runtime/scratch.btrfs,serial=linux-suite-tmp" \
               --shared-dir "$SUITE/bin" \
               --boot-program debugger --no-compiler-plugin \
-              linux-suite --guest-dir /host --case-timeout-seconds "$CASE_TIMEOUT"
+              linux-suite --guest-dir /host --private-btrfs linux-suite-tmp \
+              --case-timeout-seconds "$CASE_TIMEOUT"
       # Nothing to boot for: the report still reads one file per shard.
       - name: Record an empty Helios run
         if: steps.cases.outputs.count == '0'

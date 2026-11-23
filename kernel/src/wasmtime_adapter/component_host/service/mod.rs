@@ -3445,7 +3445,10 @@ mod tests {
         let (pipe_tx, pipe_rx) = crate::byte_channel();
         let mut table = stdio_table();
         let pipe = table
-            .insert(Preview1Descriptor::PipeWrite { writer: pipe_tx })
+            .insert(Preview1Descriptor::PipeWrite {
+                writer: pipe_tx,
+                inode: helios_unix::PipeInode::default(),
+            })
             .expect("a free slot");
         let pipe = i32::try_from(pipe).expect("small fd");
         assert_eq!(table.dup2(pipe, 1), p1::errno::SUCCESS);
@@ -4545,6 +4548,7 @@ mod tests {
         let (pipe_writer, pipe_reader) = crate::byte_channel();
         let pipe = Preview1Descriptor::PipeRead {
             reader: pipe_reader,
+            inode: helios_unix::PipeInode::default(),
         };
         assert_eq!(local_epoll_mask(Some(&pipe), WASIX_EPOLL_TYPE_EPOLLIN), 0);
         assert_eq!(
@@ -4836,8 +4840,14 @@ mod tests {
             },
             Preview1Descriptor::Stdout,
             Preview1Descriptor::Stderr,
-            Preview1Descriptor::PipeRead { reader },
-            Preview1Descriptor::PipeWrite { writer },
+            Preview1Descriptor::PipeRead {
+                reader,
+                inode: helios_unix::PipeInode::default(),
+            },
+            Preview1Descriptor::PipeWrite {
+                writer,
+                inode: helios_unix::PipeInode::default(),
+            },
         ];
         for descriptor in &descriptors {
             let (identity, stat) =
