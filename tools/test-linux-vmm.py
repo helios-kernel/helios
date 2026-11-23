@@ -1,5 +1,6 @@
 """Boot real Linux in the Wasm VMM and check SMP, console and virtio block."""
 import argparse
+import json
 import logging
 import os
 from pathlib import Path
@@ -35,7 +36,7 @@ def main():
                "--qemu-arg=virtualization=on", "--shared-dir", str(args.assets.resolve()),
                "--shared-dir-writable", "--runtime-dir", str(args.runtime_dir),
                "--keep-runtime-dir", "--no-compiler-plugin"]
-    for program in ("init", "debugger", "dash", "vmm"):
+    for program in ("init", "debugger", "nu", "vmm"):
         command.extend(["--boot-program", program])
     if args.no_build:
         command.append("--no-build")
@@ -46,8 +47,12 @@ def main():
     # Input is queued until Linux opens the virtio console; no sleep or
     # serial side channel is needed to guess when its shell becomes ready.
     script = Path(__file__).with_name("linux-vmm-commands").read_text()
-    shell = "printf '%s' '" + script.replace("'", "'\\''") + "' | /bin/vmm --kernel /host/Image --initramfs /host/initramfs.gz --disk /host/disk.raw --cpus " + str(args.cpus)
-    command.extend(["shell", "-c", shell])
+    shell = (
+        f'with-grants "virtualize" {{ {json.dumps(script)} '
+        f"| ^/bin/vmm --kernel /host/Image --initramfs /host/initramfs.gz "
+        f"--disk /host/disk.raw --cpus {args.cpus} }}"
+    )
+    command.extend(["shell", "--shell", "/bin/nu", "-c", shell])
     deadline = time.monotonic() + args.deadline_seconds
     output = bytearray()
     with (args.runtime_dir / "linux.log").open("wb") as log:

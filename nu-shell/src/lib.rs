@@ -139,6 +139,17 @@ impl<E: HeliosEnv> ShellSession<E> {
         source: &str,
         input: AsyncPipelineData,
     ) -> Result<AsyncPipelineData, NuError> {
+        self.eval_pipeline_with_file(source, None, input).await
+    }
+
+    /// Evaluate Nushell source text with an optional file name for diagnostics
+    /// and return the raw [`AsyncPipelineData`].
+    pub async fn eval_pipeline_with_file(
+        &mut self,
+        source: &str,
+        file_name: Option<&str>,
+        input: AsyncPipelineData,
+    ) -> Result<AsyncPipelineData, NuError> {
         let mut rt = EvalRuntime {
             env: &self.env,
             registry: &self.registry,
@@ -149,7 +160,7 @@ impl<E: HeliosEnv> ShellSession<E> {
             &mut self.stack,
             &mut rt,
             source,
-            None,
+            file_name,
             input,
         )
         .await
@@ -157,7 +168,22 @@ impl<E: HeliosEnv> ShellSession<E> {
 
     /// Evaluate Nushell source text and collect its output into a [`Value`].
     pub async fn eval(&mut self, source: &str) -> Result<Value, NuError> {
-        let out = self.eval_pipeline(source, AsyncPipelineData::Empty).await?;
+        let mut child_scope = self.runtime_scope.clone();
+        child_scope.capture_inherited_stdout = true;
+        let mut rt = EvalRuntime {
+            env: &self.env,
+            registry: &self.registry,
+            runtime_scope: &mut child_scope,
+        };
+        let out = eval_source_async(
+            &mut self.engine_state,
+            &mut self.stack,
+            &mut rt,
+            source,
+            None,
+            AsyncPipelineData::Empty,
+        )
+        .await?;
         Ok(out.into_value_async(nu_protocol::Span::unknown()).await?)
     }
 

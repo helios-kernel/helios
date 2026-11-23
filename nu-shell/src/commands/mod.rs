@@ -72,9 +72,11 @@ pub enum AsyncBuiltin {
     // Async-capable combinators so closures can call async commands without block_on
     Do,
     Each,
+    ParEach,
     Where,
     WithEnv,
     Complete,
+    Print,
 }
 
 impl AsyncBuiltin {
@@ -126,9 +128,11 @@ impl AsyncBuiltin {
         Self::RandomUuid,
         Self::Do,
         Self::Each,
+        Self::ParEach,
         Self::Where,
         Self::WithEnv,
         Self::Complete,
+        Self::Print,
     ];
 
     /// Command name as registered in Nushell.
@@ -181,9 +185,11 @@ impl AsyncBuiltin {
             Self::RandomUuid => "random uuid",
             Self::Do => "do",
             Self::Each => "each",
+            Self::ParEach => "par-each",
             Self::Where => "where",
             Self::WithEnv => "with-env",
             Self::Complete => "complete",
+            Self::Print => "print",
         }
     }
 
@@ -270,9 +276,11 @@ impl AsyncBuiltin {
             }
             Self::Do => <AsyncDo as AsyncCommand<E>>::signature(&AsyncDo),
             Self::Each => <AsyncEach as AsyncCommand<E>>::signature(&AsyncEach),
+            Self::ParEach => <AsyncParEach as AsyncCommand<E>>::signature(&AsyncParEach),
             Self::Where => <AsyncWhere as AsyncCommand<E>>::signature(&AsyncWhere),
             Self::WithEnv => <AsyncWithEnv as AsyncCommand<E>>::signature(&AsyncWithEnv),
             Self::Complete => <AsyncComplete as AsyncCommand<E>>::signature(&AsyncComplete),
+            Self::Print => <AsyncPrint as AsyncCommand<E>>::signature(&AsyncPrint),
         }
     }
 
@@ -359,9 +367,11 @@ impl AsyncBuiltin {
             }
             Self::Do => <AsyncDo as AsyncCommand<E>>::description(&AsyncDo),
             Self::Each => <AsyncEach as AsyncCommand<E>>::description(&AsyncEach),
+            Self::ParEach => <AsyncParEach as AsyncCommand<E>>::description(&AsyncParEach),
             Self::Where => <AsyncWhere as AsyncCommand<E>>::description(&AsyncWhere),
             Self::WithEnv => <AsyncWithEnv as AsyncCommand<E>>::description(&AsyncWithEnv),
             Self::Complete => <AsyncComplete as AsyncCommand<E>>::description(&AsyncComplete),
+            Self::Print => <AsyncPrint as AsyncCommand<E>>::description(&AsyncPrint),
         }
     }
 
@@ -442,9 +452,11 @@ impl AsyncBuiltin {
             Self::RandomUuid => random::RandomUuid.run_async(ctx, input).await,
             Self::Do => AsyncDo.run_async(ctx, input).await,
             Self::Each => AsyncEach.run_async(ctx, input).await,
+            Self::ParEach => AsyncParEach.run_async(ctx, input).await,
             Self::Where => AsyncWhere.run_async(ctx, input).await,
             Self::WithEnv => AsyncWithEnv.run_async(ctx, input).await,
             Self::Complete => AsyncComplete.run_async(ctx, input).await,
+            Self::Print => AsyncPrint.run_async(ctx, input).await,
         }
     }
 }
@@ -628,6 +640,162 @@ impl<E: HeliosEnv> AsyncCommand<E> for AsyncEach {
 
         Ok(AsyncPipelineData::value(
             Value::list(results, span),
+            metadata,
+        ))
+    }
+}
+
+/// Async-native `par-each` command executing closures concurrently on the
+/// active async executor without spawning OS threads (works on single-threaded
+/// `wasm32-wasip3` as well as host targets).
+#[derive(Debug, Clone, Copy)]
+pub struct AsyncParEach;
+
+impl<E: HeliosEnv> AsyncCommand<E> for AsyncParEach {
+    fn name(&self) -> &str {
+        "par-each"
+    }
+
+    fn description(&self) -> &str {
+        "Run a closure on each row of the input list concurrently via async tasks."
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build("par-each")
+            .input_output_types(vec![
+                (Type::list(Type::Any), Type::list(Type::Any)),
+                (Type::table(), Type::list(Type::Any)),
+                (Type::Any, Type::Any),
+            ])
+            .switch(
+                "keep-order",
+                "Keep sequence of output same as the order of input.",
+                Some('k'),
+            )
+            .named(
+                "threads",
+                SyntaxShape::Int,
+                "Maximum number of concurrent tasks (advisory).",
+                Some('t'),
+            )
+            .required(
+                "closure",
+                SyntaxShape::Closure(Some(vec![SyntaxShape::Any])),
+                "The closure to run on each element.",
+            )
+            .category(Category::Filters)
+    }
+
+    async fn run_async<'a>(
+        &'a self,
+        ctx: &'a mut AsyncCommandContext<'_, E>,
+        input: AsyncPipelineData,
+    ) -> Result<AsyncPipelineData, ShellError> {
+        use core::future::Future;
+        use core::pin::Pin;
+        use core::task::Poll;
+
+        let head = ctx.call.head;
+        let _keep_order = ctx
+            .call
+            .has_flag(ctx.engine_state, ctx.stack, "keep-order")?;
+        let max_concurrency: Option<i64> =
+            ctx.call.get_flag(ctx.engine_state, ctx.stack, "threads")?;
+        let closure: Closure = ctx.call.req(ctx.engine_state, ctx.stack, 0)?;
+
+        let (rx, span, metadata) = input.into_list_stream_receiver(head).await?;
+        let mut items = Vec::new();
+        while let Ok(item) = rx.recv().await {
+            if let Value::Error { error, .. } = item {
+                return Err(*error);
+            }
+            items.push(item);
+        }
+
+        if items.is_empty() {
+            return Ok(AsyncPipelineData::value(
+                Value::list(Vec::new(), span),
+                metadata,
+            ));
+        }
+
+        let engine_state = ctx.engine_state;
+        let env = ctx.env;
+        let registry = ctx.registry;
+        let base_stack = ctx.stack.clone();
+        let base_scope = ctx.runtime_scope.clone();
+        let limit = max_concurrency
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(items.len());
+
+        let total = items.len();
+        let mut pending_items = items.into_iter().enumerate();
+        let mut results: Vec<Option<Value>> = vec![None; total];
+        type TaskFuture<'b> = Pin<Box<dyn Future<Output = Result<Value, ShellError>> + Send + 'b>>;
+        let mut active: Vec<(usize, TaskFuture<'_>)> = Vec::with_capacity(limit.min(total));
+
+        let spawn_next = |idx: usize, item: Value| -> (usize, TaskFuture<'_>) {
+            let mut task_stack = base_stack.clone();
+            let mut task_scope = base_scope.clone();
+            let closure = closure.clone();
+            let fut: TaskFuture<'_> = Box::pin(async move {
+                let mut rt = crate::command::EvalRuntime {
+                    env,
+                    registry,
+                    runtime_scope: &mut task_scope,
+                };
+                let out = eval_closure_async(
+                    engine_state,
+                    &mut task_stack,
+                    &closure,
+                    vec![item.clone()],
+                    AsyncPipelineData::value(item, None),
+                    &mut rt,
+                    head,
+                )
+                .await?;
+                out.into_value_async(head).await
+            });
+            (idx, fut)
+        };
+
+        for _ in 0..limit {
+            if let Some((idx, item)) = pending_items.next() {
+                active.push(spawn_next(idx, item));
+            }
+        }
+
+        futures_lite::future::poll_fn(|cx| {
+            let mut i = 0;
+            while i < active.len() {
+                match active[i].1.as_mut().poll(cx) {
+                    Poll::Ready(Ok(val)) => {
+                        let (idx, _) = active.swap_remove(i);
+                        results[idx] = Some(val);
+                        if let Some((next_idx, next_item)) = pending_items.next() {
+                            active.push(spawn_next(next_idx, next_item));
+                        }
+                    }
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Pending => i += 1,
+                }
+            }
+            if active.is_empty() {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await?;
+
+        let collected: Vec<Value> = results
+            .into_iter()
+            .flatten()
+            .filter(|val| !val.is_nothing())
+            .collect();
+        Ok(AsyncPipelineData::value(
+            Value::list(collected, span),
             metadata,
         ))
     }
@@ -844,6 +1012,93 @@ impl<E: HeliosEnv> AsyncCommand<E> for AsyncComplete {
         rec.push("stderr", Value::string(stderr, head));
         rec.push("exit_code", Value::int(i64::from(exit_code), head));
         Ok(AsyncPipelineData::value(Value::record(rec, head), None))
+    }
+}
+
+/// Async-native `print` command writing formatted values to stdout or stderr
+/// through [`HeliosEnv::write_stdout`] / [`HeliosEnv::write_stderr`].
+#[derive(Debug, Clone, Copy)]
+pub struct AsyncPrint;
+
+impl<E: HeliosEnv> AsyncCommand<E> for AsyncPrint {
+    fn name(&self) -> &str {
+        "print"
+    }
+
+    fn description(&self) -> &str {
+        "Print the given values to stdout (or stderr with -e)."
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build("print")
+            .input_output_types(vec![(Type::Any, Type::Nothing)])
+            .switch("no-newline", "Print without a trailing newline.", Some('n'))
+            .switch("stderr", "Print to stderr instead of stdout.", Some('e'))
+            .switch(
+                "raw",
+                "Print raw string/binary bytes without formatting.",
+                Some('r'),
+            )
+            .rest("rest", SyntaxShape::Any, "The values to print.")
+            .category(Category::Strings)
+    }
+
+    async fn run_async<'a>(
+        &'a self,
+        ctx: &'a mut AsyncCommandContext<'_, E>,
+        input: AsyncPipelineData,
+    ) -> Result<AsyncPipelineData, ShellError> {
+        let head = ctx.call.head;
+        let no_newline = ctx
+            .call
+            .has_flag(ctx.engine_state, ctx.stack, "no-newline")?;
+        let to_stderr = ctx.call.has_flag(ctx.engine_state, ctx.stack, "stderr")?;
+        let _raw = ctx.call.has_flag(ctx.engine_state, ctx.stack, "raw")?;
+        let args: Vec<Value> = ctx.call.rest(ctx.engine_state, ctx.stack, 0)?;
+
+        let config = ctx.stack.get_config(ctx.engine_state);
+        let mut payload = Vec::new();
+        if args.is_empty() {
+            if !input.is_empty_or_nothing() {
+                let val = input.into_value_async(head).await?;
+                append_printable(&mut payload, &val, &config);
+                if !no_newline {
+                    payload.push(b'\n');
+                }
+            } else if !no_newline {
+                payload.push(b'\n');
+            }
+        } else {
+            for (idx, val) in args.iter().enumerate() {
+                if idx > 0 {
+                    payload.push(b'\n');
+                }
+                append_printable(&mut payload, val, &config);
+            }
+            if !no_newline {
+                payload.push(b'\n');
+            }
+        }
+
+        if !payload.is_empty() {
+            let res = if to_stderr {
+                ctx.env.write_stderr(&payload).await
+            } else {
+                ctx.env.write_stdout(&payload).await
+            };
+            res.map_err(|err| err.into_shell_error("print failed", head))?;
+        }
+
+        Ok(AsyncPipelineData::Empty)
+    }
+}
+
+fn append_printable(out: &mut Vec<u8>, value: &Value, config: &nu_protocol::Config) {
+    match value {
+        Value::Nothing { .. } => {}
+        Value::String { val, .. } => out.extend_from_slice(val.as_bytes()),
+        Value::Binary { val, .. } => out.extend_from_slice(val),
+        other => out.extend_from_slice(other.to_expanded_string("\n", config).as_bytes()),
     }
 }
 

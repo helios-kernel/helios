@@ -239,6 +239,7 @@ fn sys_inspect_ps_kill_whoami_sleep_clear_and_scoping() {
             .unwrap();
         assert_eq!(snap_id.as_str().unwrap(), "snap-1");
         assert_eq!(env.recorded_snapshots().len(), 1);
+        assert_eq!(env.released_snapshots(), vec!["snap-1"]);
 
         // `with-instruction-profile`
         let prof = session
@@ -751,5 +752,72 @@ fn save_unknown_extension_stderr_redirection_do_env_tilde_and_cancellation() {
             session.runtime_scope().current_scope().is_none(),
             "cancelled with-scope must not leak scope onto session"
         );
+
+        // 6. Stderr file redirection drains stdout and stderr concurrently even when
+        //    stdout exceeds `STREAM_CHANNEL_CAPACITY` chunks before stderr closes.
+        let out_len = session
+            .eval(r#"run-external "big-out-then-err" e> /tmp/big-err.txt | str length"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            out_len.as_int().unwrap(),
+            i64::try_from(helios_nu::STREAM_CHANNEL_CAPACITY * 4 * 4).unwrap()
+        );
+        assert_eq!(
+            env.read_vfs_bytes("/tmp/big-err.txt").as_deref(),
+            Some(b"late-stderr".as_slice())
+        );
+
+        // 7. Async `par-each` runs closures concurrently without OS threads
+        let par = session
+            .eval("[1 2 3 4] | par-each { |x| sleep 1ms; $x * 3 } | math sum")
+            .await
+            .unwrap();
+        assert_eq!(par.as_int().unwrap(), 30);
+
+        // 8. Non-zero external exit in a drained statement raises an error catchable by `try`
+        let failed = session
+            .eval(r#"run-external "fail-ext"; "unreachable""#)
+            .await;
+        assert!(failed.is_err());
+        let recovered = session
+            .eval(r#"try { run-external "fail-ext"; "no" } catch { "caught" }"#)
+            .await
+            .unwrap();
+        assert_eq!(recovered.as_str().unwrap(), "caught");
+
+        // 9. Async `print` routes through `HeliosEnv::{write_stdout, write_stderr}`
+        let _ = session
+            .eval(r#"print "hello"; print -n "world"; print -e "errline""#)
+            .await
+            .unwrap();
+        assert_eq!(env.recorded_stdout(), "hello\nworld");
+        assert_eq!(env.recorded_stderr(), "errline\n");
+
+        // 10. Every committed guest `.nu` script parses and compiles cleanly
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        for rel in [
+            "tools/fs-smoke/bootfs/etc/rc.nu",
+            "tools/fs-smoke/crash/bootfs/etc/rc.nu",
+            "tools/cpu-lifecycle/guest.nu",
+        ] {
+            let source = std::fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|e| panic!("failed to read {rel}: {e}"));
+            let (engine_state, _) = helios_nu::create_helios_context();
+            let mut working_set = nu_protocol::engine::StateWorkingSet::new(&engine_state);
+            let _ = nu_parser::parse(&mut working_set, Some(rel), source.as_bytes(), false);
+            assert!(
+                working_set.parse_errors.is_empty(),
+                "{rel} parse errors: {:?}",
+                working_set.parse_errors
+            );
+            assert!(
+                working_set.compile_errors.is_empty(),
+                "{rel} compile errors: {:?}",
+                working_set.compile_errors
+            );
+        }
     });
 }

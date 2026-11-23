@@ -692,6 +692,14 @@ async fn eval_instruction_async<E: HeliosEnv>(
             match data.body.drain_async().await {
                 Ok(Some(code)) => {
                     ctx.stack.set_last_exit_code(code, span_val);
+                    if let Some(non_zero) = core::num::NonZeroI32::new(code) {
+                        let err = ShellError::NonZeroExitCode {
+                            exit_code: non_zero,
+                            span: span_val,
+                        };
+                        ctx.stack.set_last_error(&err);
+                        return Err(err);
+                    }
                     Ok(Continue)
                 }
                 Ok(None) => Ok(Continue),
@@ -1630,8 +1638,30 @@ async fn eval_call_async<E: HeliosEnv>(
                 }
 
                 if let Some(err_rx) = stderr {
-                    let err_bytes = collect_byte_receiver(err_rx).await?;
+                    // Drain stdout and stderr concurrently so a child writing more than
+                    // `STREAM_CHANNEL_CAPACITY` stdout chunks before closing stderr cannot
+                    // backpressure-deadlock.
+                    let (out_res, err_res) = futures_lite::future::zip(
+                        collect_byte_receiver(stream),
+                        collect_byte_receiver(err_rx),
+                    )
+                    .await;
+                    let out_bytes = out_res?;
+                    let err_bytes = err_res?;
                     write_redirect_slot(ctx, err_num, &err_bytes, head).await?;
+                    let (out_tx, out_rx) = async_channel::bounded(1);
+                    if !out_bytes.is_empty() {
+                        let _ = out_tx.send(Ok(out_bytes)).await;
+                    }
+                    drop(out_tx);
+                    return Ok(AsyncPipelineData::ByteStream {
+                        stream: out_rx,
+                        stderr: None,
+                        exit_code,
+                        span,
+                        stream_type,
+                        metadata,
+                    });
                 }
                 return Ok(AsyncPipelineData::ByteStream {
                     stream,

@@ -3583,6 +3583,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-nu-shell"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "chrono",
+ "futures-lite",
+ "helios-api",
+ "helios-nu",
+ "nu-protocol",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "helios-oob-load"
 version = "0.1.0"
 dependencies = [

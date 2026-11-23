@@ -332,6 +332,8 @@ enum BootProgramError {
     },
     #[error("{path} is missing package.name or lib.name")]
     ManifestHasNoName { path: String },
+    #[error("{path} specifies invalid package.metadata.helios.command `{command}`")]
+    InvalidCommandName { path: String, command: String },
 }
 
 /// Why the external boot-artifacts manifest does not describe artifacts
@@ -1091,6 +1093,10 @@ struct ProgramRole {
     /// this program's imports.
     #[serde(default)]
     plugs: Vec<String>,
+    /// Override the installed `bin/<command>` name (defaults to the directory
+    /// name under `programs/`).
+    #[serde(default)]
+    command: Option<String>,
 }
 
 /// Every command's failure is a typed error whose message names what was
@@ -1860,18 +1866,19 @@ fn build_boot_program_assets(
     let mut libraries = BTreeMap::new();
     let mut external_artifacts = read_external_boot_artifacts(boot_artifacts_manifest)?;
 
-    for (command, path) in program_dirs(&programs_root)? {
+    for (dir_name, path) in program_dirs(&programs_root)? {
         // Init is built once, as the payload's init component; the
         // prebuild publishes that same artifact at `bin/init`.
-        if command == INIT_COMMAND {
-            available_programs.insert(command);
+        if dir_name == INIT_COMMAND {
+            available_programs.insert(dir_name);
             continue;
         }
-        let manifest = read_program_manifest(&command, &path.join("Cargo.toml"))?;
+        let manifest = read_program_manifest(&dir_name, &path.join("Cargo.toml"))?;
         if manifest.role.library {
-            libraries.insert(command, manifest);
+            libraries.insert(dir_name, manifest);
             continue;
         }
+        let command = manifest.command.clone();
         available_programs.insert(command.clone());
         if selected_programs
             .as_ref()
@@ -2469,8 +2476,21 @@ fn read_program_manifest(
             plugs: role.plugs.join(", "),
         });
     }
+    let installed_command = match &role.command {
+        Some(explicit) => {
+            if explicit.is_empty() || explicit.contains('/') || explicit == "." || explicit == ".."
+            {
+                return Err(BootProgramError::InvalidCommandName {
+                    path: manifest_path.display().to_string(),
+                    command: explicit.clone(),
+                });
+            }
+            explicit.clone()
+        }
+        None => command.to_owned(),
+    };
     Ok(ProgramManifest {
-        command: command.to_owned(),
+        command: installed_command,
         manifest_path: manifest_path.to_path_buf(),
         artifact_name: format!("{artifact_stem}.wasm"),
         role,

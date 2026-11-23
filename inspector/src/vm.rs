@@ -2058,7 +2058,7 @@ enum VmSessionCommand {
     Stats,
     /// List the live program instances, and optionally stop one.
     Instances(crate::InstancesCommand),
-    Repl,
+    Repl(crate::ReplCommand),
     AotBench(AotBenchCommand),
     WorkloadBench(WorkloadBenchCommand),
     /// Move the guest's memory balloon and watch the guest follow.
@@ -6832,7 +6832,7 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Instances(command) => {
                 Self::Session(SessionCommand::Instances(command))
             }
-            VmSessionCommand::Repl => Self::Session(SessionCommand::Repl),
+            VmSessionCommand::Repl(command) => Self::Session(SessionCommand::Repl(command)),
             VmSessionCommand::AotBench(command) => Self::AotBench(command),
             VmSessionCommand::WorkloadBench(command) => Self::WorkloadBench(command),
             VmSessionCommand::Balloon(command) => Self::Balloon(command),

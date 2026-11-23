@@ -25,6 +25,10 @@ pub struct RuntimeScope {
     pub grant_frames: Vec<Vec<GrantSpec>>,
     /// Stack of active subtree scopes pushed by `with-scope`.
     pub scope_frames: Vec<String>,
+    /// When `true`, external commands capture stdout even when `stack.stdout()`
+    /// is `OutDest::Inherit`/`OutDest::Print` (used by `ShellSession::eval` so
+    /// the caller receives the final expression as a [`nu_protocol::Value`]).
+    pub capture_inherited_stdout: bool,
 }
 
 impl RuntimeScope {

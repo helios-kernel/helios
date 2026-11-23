@@ -482,14 +482,25 @@ impl AsyncPipelineData {
                 span,
                 ..
             } => {
-                while let Ok(chunk) = stream.recv().await {
-                    let _ = chunk?;
-                }
-                if let Some(stderr_rx) = stderr {
-                    while let Ok(chunk) = stderr_rx.recv().await {
-                        let _ = chunk?;
-                    }
-                }
+                let (out_res, err_res) = futures_lite::future::zip(
+                    async move {
+                        while let Ok(chunk) = stream.recv().await {
+                            let _ = chunk?;
+                        }
+                        Ok::<(), ShellError>(())
+                    },
+                    async move {
+                        if let Some(stderr_rx) = stderr {
+                            while let Ok(chunk) = stderr_rx.recv().await {
+                                let _ = chunk?;
+                            }
+                        }
+                        Ok::<(), ShellError>(())
+                    },
+                )
+                .await;
+                out_res?;
+                err_res?;
                 if let Some(exit_rx) = exit_code
                     && let Ok(code) = exit_rx.recv().await
                 {
