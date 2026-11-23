@@ -98,6 +98,7 @@ def write_retake(out_dir: Path, side: Side, name: str, values, out_name: str = R
                 {
                     "type": "iteration",
                     "workload": name,
+                    "runner": "program",
                     "iteration": iteration.index,
                     "elapsed_ms": iteration.elapsed_ms,
                     "metrics": {},
@@ -140,6 +141,7 @@ def test_only_a_dispersed_headline_cell_is_retaken(options, monkeypatch) -> None
 
     args = gap_bench().build_parser().parse_args(executed[0].argv[2:])
     assert args.workloads == ["hostcall-loop"]
+    assert args.helios_skip_build
     assert not args.control, "the control pass belongs to the suite, not the retake"
     assert Path(args.out_dir) == options.out_dir / RETAKE_OUT / "helios"
     assert args.helios_baseline_out_dir == options.out_dir / RETAKE_OUT / "helios-baseline"
@@ -183,6 +185,7 @@ def test_an_unpaired_run_retakes_its_one_image(tmp_path, monkeypatch) -> None:
     plan = retake_plan(options, 11, ["hostcall-loop"], RETAKE_OUT, "dispersed", {})
     args = gap_bench().build_parser().parse_args(plan.argv[2:])
     assert args.helios_baseline_out_dir is None
+    assert args.helios_skip_build
 
 
 def test_the_gate_names_the_retaken_workloads(paired_flat_report: Report) -> None:
@@ -249,6 +252,7 @@ def test_a_first_pass_regression_is_measured_again_and_a_drift_clears(
     assert len(executed) == 1
     args = gap_bench().build_parser().parse_args(executed[0].argv[2:])
     assert args.workloads == ["hostcall-loop"] and not args.control
+    assert args.helios_skip_build
     assert Path(args.out_dir) == options.out_dir / RECONFIRM_OUT / "helios"
     # The first pass booted `hostcall-loop` candidate first; the replicate
     # boots it the other way round, so it cannot share that slot's bias.

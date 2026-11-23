@@ -7,13 +7,12 @@
 //!
 //! Concurrency contract: the devices are discovered and programmed on
 //! the bootstrap hart before external interrupts are unmasked, and their
-//! completions arrive on the PLIC sources the device tree names, so
+//! completions arrive on the PLIC lines the device tree names, so
 //! every reader parks on a notification rather than polling a used ring.
 
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::num::NonZeroU32;
 
 use fdt::Fdt;
 use helios_hal::fs::BlockDeviceRights;
@@ -21,9 +20,9 @@ use helios_kernel::ExternalInterruptHandler;
 
 use crate::RiscvCpu;
 use crate::debug_state::RuntimeState;
-use crate::net::InterruptSourceId;
+use crate::net::PlicInterrupt;
 
-type RiscvVirtioBlockDevice =
+pub(crate) type RiscvVirtioBlockDevice =
     helios_virtio::VirtioMmioBlockDevice<RiscvCpu, helios_kernel::BlockPages>;
 
 #[derive(Clone)]
@@ -32,9 +31,9 @@ pub(crate) struct VirtioBlockDevice {
 }
 
 /// One block device the bootstrap hart brought up, together with the
-/// PLIC source the device tree routes it to.
+/// PLIC line the device tree routes it to.
 pub(crate) struct BlockInterrupt {
-    pub(crate) source: InterruptSourceId,
+    pub(crate) line: PlicInterrupt,
     pub(crate) device: VirtioBlockDevice,
 }
 
@@ -61,25 +60,30 @@ where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
 {
     let discovered = discover_block_devices(cpu, fdt);
-    let devices = discovered
+    let devices: Vec<_> = discovered
         .iter()
         .map(|interrupt| interrupt.device.inner.clone())
         .collect();
     let state = debug_state.clone();
     // Swap is not wired on this backend, so the scratch disk is proved
-    // and counted but nothing writes to it yet. Nothing mounts a disk
-    // yet either, so the mount sources' cache is held by its reclaim
-    // task alone.
+    // and counted but nothing writes to it yet.
+    if !devices.is_empty() {
+        debug_state.begin_block_discovery();
+    }
     helios_kernel::install_block_devices(
         kernel,
         root,
         devices,
-        move |service, _scratch, _mount_sources| {
+        move |service, _scratch, mount_sources| {
             state.install_block_service(service);
+            if let Some(cache) = mount_sources {
+                state.install_mount_sources(cache);
+            }
+            state.finish_block_discovery();
         },
     );
     for interrupt in &discovered {
-        tracing::info!(irq = interrupt.source.0.get(), "virtio block online");
+        tracing::info!(irq = interrupt.line.number(), "virtio block online");
     }
     discovered
 }
@@ -96,10 +100,9 @@ fn discover_block_devices(cpu: &RiscvCpu, fdt: &Fdt<'_>) -> Vec<BlockInterrupt> 
             let base = candidate.base;
             let header = core::ptr::NonNull::new(base as *mut u8)
                 .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
-            let source = candidate
+            let line = candidate
                 .interrupt
-                .and_then(|interrupt| NonZeroU32::new(interrupt.number))
-                .map(InterruptSourceId)
+                .and_then(PlicInterrupt::from_specifier)
                 .unwrap_or_else(|| {
                     panic!("virtio-blk node at {base:#x} has no valid interrupt source")
                 });
@@ -115,7 +118,7 @@ fn discover_block_devices(cpu: &RiscvCpu, fdt: &Fdt<'_>) -> Vec<BlockInterrupt> 
                 panic!("failed to initialize virtio-blk device at {base:#x}: {error}")
             });
             BlockInterrupt {
-                source,
+                line,
                 device: VirtioBlockDevice { inner: device },
             }
         })

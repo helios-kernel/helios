@@ -3,6 +3,12 @@ pub enum ComponentFsNodeKind {
     Directory,
     File,
     Symlink,
+    /// The four kinds below are report-only, as for `helios_hal::fs::NodeKind`:
+    /// a listing or `stat` names them and no descriptor is ever opened on one.
+    CharacterDevice,
+    BlockDevice,
+    Fifo,
+    Socket,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

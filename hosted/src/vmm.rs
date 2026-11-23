@@ -637,6 +637,24 @@ impl AddressSpace for HostedAddressSpace {
         committed + pinned
     }
 
+    /// The same two parts [`Self::owned_resident_bytes`] adds, for every
+    /// owner: committed pages, then the runs charged to each owner.
+    fn visit_owned_resident_bytes<Visit>(&self, mut visit: Visit)
+    where
+        Visit: FnMut(u64, u64),
+    {
+        self.reservations
+            .lock()
+            .unwrap()
+            .visit_owned_resident_bytes(|owner, bytes| visit(owner.raw(), bytes));
+        self.runs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|run| !run.owner.is_none())
+            .for_each(|run| visit(run.owner.raw(), run.bytes as u64));
+    }
+
     fn drain_orphaned_swap_tokens<Visit>(&self, visit: Visit) -> usize
     where
         Visit: FnMut(SwapToken),
@@ -1422,7 +1440,7 @@ mod tests {
     #[test]
     fn a_run_is_not_resident_memory_of_the_slot_it_is_shown_in() {
         use helios_kernel::{configure_user_memory_owner_processors, enter_user_memory_owner};
-        configure_user_memory_owner_processors(1);
+        configure_user_memory_owner_processors(crate::test_pool::single_node_pool(1));
         let address_space = HostedAddressSpace::new();
         let owner = MemoryOwner::new(9);
         let _scope = enter_user_memory_owner(address_space.processor, owner);

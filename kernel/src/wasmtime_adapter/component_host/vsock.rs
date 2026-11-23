@@ -21,7 +21,9 @@ use alloc::vec::Vec;
 
 use helios_hal::cpu::Cpu;
 use helios_hal::vsock::{VsockAddress, VsockShutdown};
-use wasmtime::component::{Accessor, ComponentType, Lift, Linker, Lower, Resource, ResourceType};
+use wasmtime::component::{
+    Access, Accessor, ComponentType, Lift, Linker, Lower, Resource, ResourceType,
+};
 
 use crate::wasmtime_adapter::bindings::debugger::bindings as debugger_bindings;
 use crate::wasmtime_adapter::bindings::program::bindings as program_bindings;
@@ -185,14 +187,14 @@ impl VsockBindings for ProgramVsock {
 /// machine's device have both been checked.
 type Authorised<Bindings> = Result<ComponentHostVsockService, <Bindings as VsockBindings>::Error>;
 
-fn authorise<Bindings, CpuImpl, Net, HostFs>(
-    store: &StoreData<CpuImpl, Net, HostFs>,
+fn authorise<Bindings, CpuImpl, Net, StorageImpl>(
+    store: &StoreData<CpuImpl, Net, StorageImpl>,
 ) -> Authorised<Bindings>
 where
     Bindings: VsockBindings,
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if store.debug_port().is_none() {
         return Err(denied::<Bindings>());
@@ -203,14 +205,14 @@ where
         .ok_or_else(unavailable::<Bindings>)
 }
 
-pub(super) fn add_vsock_to_linker<Bindings, CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+pub(super) fn add_vsock_to_linker<Bindings, CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     Bindings: VsockBindings,
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(VSOCK_INSTANCE)?;
     instance.resource_concurrent(
@@ -232,66 +234,51 @@ where
             })
         },
     )?;
-    instance.resource_concurrent(
+    instance.resource(
         "vsock-listener",
         ResourceType::host::<ComponentVsockListener>(),
-        |accessor, rep| {
-            Box::pin(async move {
-                let listener = accessor.with(|mut access| {
-                    let resource = Resource::<ComponentVsockListener>::new_own(rep);
-                    access.get().table.delete(resource)
-                })?;
-                if let Err(error) = listener.service.close_listener(listener.listener) {
-                    tracing::debug!(%error, "dropped vsock listener was already gone");
-                }
-                Ok::<_, wasmtime::Error>(())
-            })
+        |mut caller, rep| {
+            let resource = Resource::<ComponentVsockListener>::new_own(rep);
+            let listener = caller.data_mut().table.delete(resource)?;
+            if let Err(error) = listener.service.close_listener(listener.listener) {
+                tracing::debug!(%error, "dropped vsock listener was already gone");
+            }
+            Ok(())
         },
     )?;
-    instance.func_wrap_concurrent(
+    instance.func_wrap_concurrent_immediate(
         "guest-cid",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>, (): ()| {
-            Box::pin(async move {
-                let cid = accessor.with(|mut access| {
-                    let store = access.get();
-                    Ok::<_, wasmtime::Error>(
-                        (store.debug_port().is_some())
-                            .then(|| store.runtime_state.vsock_service())
-                            .flatten()
-                            .map(|service| service.guest_cid()),
-                    )
-                })?;
-                Ok::<_, wasmtime::Error>((cid,))
-            })
+        |caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>, (): ()| {
+            let store = caller.data();
+            let cid = store
+                .debug_port()
+                .and_then(|()| store.runtime_state.vsock_service())
+                .map(|service| service.guest_cid());
+            Ok((cid,))
         },
     )?;
-    instance.func_wrap_concurrent(
+    instance.func_wrap_concurrent_immediate(
         "listen",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>, (port, backlog): (u32, u32)| {
-            Box::pin(async move {
-                let response = accessor.with(|mut access| {
-                    let service = match authorise::<Bindings, _, _, _>(access.get()) {
-                        Ok(service) => service,
-                        Err(error) => return Ok::<_, wasmtime::Error>(Err(error)),
-                    };
-                    let listener = match service.listen(port, backlog as usize) {
-                        Ok(listener) => listener,
-                        Err(error) => {
-                            return Ok::<_, wasmtime::Error>(Err(convert_error::<Bindings>(error)));
-                        }
-                    };
-                    Ok(Ok(access
-                        .get()
-                        .table
-                        .push(ComponentVsockListener { service, listener })?))
-                })?;
-                Ok::<_, wasmtime::Error>((response,))
-            })
+        |mut caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+         (port, backlog): (u32, u32)| {
+            let service = match authorise::<Bindings, _, _, _>(caller.data()) {
+                Ok(service) => service,
+                Err(error) => return Ok((Err(error),)),
+            };
+            let listener = match service.listen(port, backlog as usize) {
+                Ok(listener) => listener,
+                Err(error) => return Ok((Err(convert_error::<Bindings>(error)),)),
+            };
+            let resource = caller
+                .data_mut()
+                .table
+                .push(ComponentVsockListener { service, listener })?;
+            Ok((Ok(resource),))
         },
     )?;
     instance.func_wrap_concurrent(
         "connect",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (address, timeout): (Bindings::Address, u64)| {
             Box::pin(async move {
                 let peer = Bindings::to_address(&address);
@@ -318,27 +305,20 @@ where
             })
         },
     )?;
-    instance.func_wrap_concurrent(
+    instance.func_wrap_concurrent_immediate(
         "[method]vsock-listener.port",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockListener>,)| {
-            Box::pin(async move {
-                let response = accessor.with(|mut access| {
-                    let listener = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>(
-                        listener
-                            .service
-                            .listener_port(listener.listener)
-                            .map_err(convert_error::<Bindings>),
-                    )
-                })?;
-                Ok::<_, wasmtime::Error>((response,))
-            })
+            let listener = caller.data().table.get(&resource)?;
+            Ok((listener
+                .service
+                .listener_port(listener.listener)
+                .map_err(convert_error::<Bindings>),))
         },
     )?;
     instance.func_wrap_concurrent(
         "[method]vsock-listener.accept",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource, timeout): (Resource<ComponentVsockListener>, u64)| {
             Box::pin(async move {
                 let listener = accessor.with(|mut access| {
@@ -364,46 +344,32 @@ where
             })
         },
     )?;
-    instance.func_wrap_concurrent(
+    instance.func_wrap_concurrent_immediate(
         "[method]vsock-listener.close",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockListener>,)| {
-            Box::pin(async move {
-                let response = accessor.with(|mut access| {
-                    let listener = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>(
-                        listener
-                            .service
-                            .close_listener(listener.listener)
-                            .map_err(convert_error::<Bindings>),
-                    )
-                })?;
-                Ok::<_, wasmtime::Error>((response,))
-            })
+            let listener = caller.data().table.get(&resource)?;
+            Ok((listener
+                .service
+                .close_listener(listener.listener)
+                .map_err(convert_error::<Bindings>),))
         },
     )?;
-    instance.func_wrap_concurrent(
+    instance.func_wrap_concurrent_immediate(
         "[method]vsock-stream.peer",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockStream>,)| {
-            Box::pin(async move {
-                let response = accessor.with(|mut access| {
-                    let stream = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>(
-                        stream
-                            .service
-                            .peer(stream.stream)
-                            .map(Bindings::address)
-                            .map_err(convert_error::<Bindings>),
-                    )
-                })?;
-                Ok::<_, wasmtime::Error>((response,))
-            })
+            let stream = caller.data().table.get(&resource)?;
+            Ok((stream
+                .service
+                .peer(stream.stream)
+                .map(Bindings::address)
+                .map_err(convert_error::<Bindings>),))
         },
     )?;
     instance.func_wrap_concurrent(
         "[method]vsock-stream.read",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource, max_bytes, timeout): (Resource<ComponentVsockStream>, u32, u64)| {
             Box::pin(async move {
                 let stream = accessor.with(|mut access| {
@@ -429,7 +395,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]vsock-stream.write",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource, bytes, timeout): (Resource<ComponentVsockStream>, Vec<u8>, u64)| {
             Box::pin(async move {
                 let stream = accessor.with(|mut access| {
@@ -453,7 +419,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]vsock-stream.shutdown-send",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockStream>,)| {
             Box::pin(async move {
                 let stream = accessor.with(|mut access| {
@@ -477,7 +443,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]vsock-stream.close",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockStream>,)| {
             Box::pin(async move {
                 let stream = accessor.with(|mut access| {

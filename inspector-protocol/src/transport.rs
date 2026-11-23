@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::future::{Future, poll_fn};
+use std::future::Future;
 use std::io;
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -10,8 +10,7 @@ use bytes::Bytes;
 use futures_core::Stream;
 use futures_io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
-use tokio::sync::futures::Notified;
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
 use crate::error::{TransportError, WireError};
 use crate::wire::{Frame, read_frame, write_frame};
@@ -131,26 +130,51 @@ struct Invocation<R, W> {
     progress: Notify,
 }
 
-#[derive(Clone)]
 pub struct Client<R, W> {
     inner: Arc<ClientInner<R, W>>,
+    lifetime: mpsc::Sender<()>,
 }
 
-/// The client half of a connection: one reader, many waiters.
-///
-/// Whichever caller holds `read` is the reader, and it routes the frame
-/// it read into the invocation that frame names before it releases the
-/// lock. Every other caller parks on its own invocation's signal and
-/// races that signal against the same lock, so the reader role passes
-/// to a waiter as soon as the current reader steps away, and a waiter
-/// whose answer has already been filed leaves through its signal rather
-/// than taking the transport.
+/// Another handle on the same connection. Written out because the
+/// derive would ask the transport halves themselves to be `Clone`, and
+/// the handle only shares them.
+impl<R, W> Clone for Client<R, W> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            lifetime: self.lifetime.clone(),
+        }
+    }
+}
+
+/// A connection has one driver; invocation futures only enqueue frames and
+/// await their own signals. Cancelling an invocation never cancels transport I/O.
 struct ClientInner<R, W> {
-    read: Arc<Mutex<R>>,
-    write: Arc<Mutex<W>>,
+    transport: StdMutex<Option<ClientTransport<R, W>>>,
+    outgoing: mpsc::Sender<PendingFrame>,
     closed: StdMutex<bool>,
     next_invocation: AtomicU32,
     active: StdMutex<HashMap<u32, Weak<Invocation<R, W>>>>,
+}
+
+struct ClientTransport<R, W> {
+    read: R,
+    write: W,
+    outgoing: mpsc::Receiver<PendingFrame>,
+    lifetime: mpsc::Receiver<()>,
+}
+
+struct PendingFrame {
+    frame: Frame,
+    completion: oneshot::Sender<io::Result<()>>,
+}
+
+struct ClientDriverGuard<R, W>(Arc<ClientInner<R, W>>);
+
+impl<R, W> Drop for ClientDriverGuard<R, W> {
+    fn drop(&mut self) {
+        close_client(&self.0, "client connection driver stopped");
+    }
 }
 
 #[derive(Clone)]
@@ -215,54 +239,91 @@ where
     W: FuturesAsyncWrite + Send + Unpin + 'static,
 {
     pub fn new(read: R, write: W) -> Self {
+        // One queued frame lets the producer prepare its next chunk while the
+        // driver writes the current one, with backpressure before another.
+        let (outgoing, incoming) = mpsc::channel(1);
+        let (lifetime, ended) = mpsc::channel(1);
         Self {
             inner: Arc::new(ClientInner {
-                read: Arc::new(Mutex::new(read)),
-                write: Arc::new(Mutex::new(write)),
+                transport: StdMutex::new(Some(ClientTransport {
+                    read,
+                    write,
+                    outgoing: incoming,
+                    lifetime: ended,
+                })),
+                outgoing,
                 closed: StdMutex::new(false),
                 next_invocation: AtomicU32::new(1),
                 active: StdMutex::new(HashMap::new()),
             }),
+            lifetime,
         }
     }
 
-    /// Routes frames until the transport closes.
-    ///
-    /// A connection is read by whoever is waiting on it, so a session
-    /// with no call in flight reads nothing — and a guest that keeps
-    /// talking while the host asks it for nothing fills the transport
-    /// and blocks on it. A session that drives the machine without
-    /// asking it anything (taking a capture, driving its input) holds
-    /// this instead, and the guest keeps running.
-    ///
-    /// The reader role still passes: the read lock is released between
-    /// frames, and while this is parked inside a read it routes whatever
-    /// arrives into whichever invocation named it, which is exactly what
-    /// a waiter would have done for itself.
-    pub async fn route_frames(&self) -> Result<()> {
-        loop {
-            if is_closed(&self.inner.closed) {
-                return Ok(());
+    /// Drives both halves until the transport closes. Must run once for the
+    /// connection's lifetime, independently of individual invocation futures.
+    /// Dropping this future closes the connection and wakes all callers.
+    pub async fn route_frames(self) -> Result<()> {
+        let Self { inner, lifetime } = self;
+        drop(lifetime);
+        let transport = inner
+            .transport
+            .lock()
+            .expect("client transport mutex poisoned")
+            .take()
+            .ok_or_else(|| {
+                TransportError::io(
+                    "start connection driver",
+                    io::Error::other("client connection driver already started"),
+                )
+            })?;
+        let _guard = ClientDriverGuard(inner.clone());
+        let ClientTransport {
+            mut read,
+            mut write,
+            mut outgoing,
+            mut lifetime,
+        } = transport;
+        let receive = async {
+            loop {
+                let Some(frame) = read_frame(&mut read)
+                    .await
+                    .map_err(|source| TransportError::io("read client frame", source))?
+                else {
+                    return Ok(());
+                };
+                route_client_frame(&inner, frame)
+                    .map_err(|source| TransportError::io("route client frame", source))?;
             }
-            let frame = {
-                let mut io = self.inner.read.lock().await;
-                match read_frame(&mut *io).await {
-                    Ok(Some(frame)) => frame,
-                    Ok(None) => {
-                        close_client(&self.inner, "client transport closed while routing frames");
-                        return Ok(());
+        };
+        let transmit = async {
+            while let Some(pending) = outgoing.recv().await {
+                match write_frame(&mut write, &pending.frame).await {
+                    Ok(()) => {
+                        let _ = pending.completion.send(Ok(()));
                     }
                     Err(source) => {
-                        close_client(&self.inner, &source.to_string());
-                        return Err(TransportError::io("route client frames", source));
+                        let message = source.to_string();
+                        let _ = pending.completion.send(Err(source));
+                        return Err(TransportError::io(
+                            "write client frame",
+                            io::Error::other(message),
+                        ));
                     }
                 }
-            };
-            route_client_frame(&self.inner, frame).map_err(|source| {
-                close_client(&self.inner, &source.to_string());
-                TransportError::io("route client frame", source)
-            })?;
+            }
+            Ok(())
+        };
+        let stopped = async {
+            let _ = lifetime.recv().await;
+            Ok(())
+        };
+        let result =
+            futures_lite::future::or(stopped, futures_lite::future::or(receive, transmit)).await;
+        if let Err(error) = &result {
+            close_client(&inner, &error.to_string());
         }
+        result
     }
 
     pub async fn invoke_raw(
@@ -322,19 +383,16 @@ where
     ) -> Result<(Outgoing<R, W>, Incoming<R, W>)> {
         let id = self.inner.next_invocation.fetch_add(1, Ordering::Relaxed);
         let invocation = Invocation::new_client(id, &self.inner);
-        {
-            let mut io = self.inner.write.lock().await;
-            write_frame(
-                &mut *io,
-                &Frame::Open {
-                    invocation: id,
-                    instance: instance.to_owned(),
-                    func: func.to_owned(),
-                },
-            )
-            .await
-            .map_err(|source| TransportError::io("open remote invocation", source))?;
-        }
+        enqueue_client_frame(
+            &self.inner,
+            Frame::Open {
+                invocation: id,
+                instance: instance.to_owned(),
+                func: func.to_owned(),
+            },
+        )
+        .await
+        .map_err(|source| TransportError::io("open remote invocation", source))?;
 
         loop {
             // Armed before the reply is tested for, so a reply filed
@@ -348,12 +406,13 @@ where
                     Reply::Reject(message) => return Err(TransportError::Rejected(message)),
                 }
             }
+            if let Some(source) = invocation.failure() {
+                return Err(TransportError::io("read remote invocation reply", source));
+            }
             if is_closed(&self.inner.closed) {
                 return Err(TransportError::Closed);
             }
-            drive_client(&self.inner, signal)
-                .await
-                .map_err(|source| TransportError::io("read remote invocation reply", source))?;
+            signal.await;
         }
 
         if !params.is_empty() {
@@ -636,7 +695,13 @@ where
                     let inner = inner.upgrade().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::BrokenPipe, "client transport disappeared")
                     })?;
-                    drive_client(&inner, signal).await?;
+                    if is_closed(&inner.closed) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "client transport closed",
+                        ));
+                    }
+                    signal.await;
                 }
                 InvocationOwner::Server(inner) => {
                     if let Some(state) = self.ready_state(&path) {
@@ -659,7 +724,10 @@ where
         };
         match &self.owner {
             InvocationOwner::Client(inner) => {
-                write_owned_frame(&inner.upgrade(), &frame, "client transport disappeared").await
+                let inner = inner.upgrade().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "client transport disappeared")
+                })?;
+                enqueue_client_frame(&inner, frame).await
             }
             InvocationOwner::Server(inner) => {
                 write_owned_frame(&inner.upgrade(), &frame, "server transport disappeared").await
@@ -674,7 +742,10 @@ where
         };
         match &self.owner {
             InvocationOwner::Client(inner) => {
-                write_owned_frame(&inner.upgrade(), &frame, "client transport disappeared").await
+                let inner = inner.upgrade().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "client transport disappeared")
+                })?;
+                enqueue_client_frame(&inner, frame).await
             }
             InvocationOwner::Server(inner) => {
                 write_owned_frame(&inner.upgrade(), &frame, "server transport disappeared").await
@@ -994,55 +1065,22 @@ fn mark_closed(closed: &StdMutex<bool>) {
     *closed = true;
 }
 
-/// Waits for `signal`, or takes the reader role and routes one frame.
-///
-/// The two are raced with the signal polled first, and the reader
-/// routes its frame before it releases the read lock. A caller whose
-/// answer has already been filed therefore always finds the signal
-/// ready on the poll that would otherwise hand it the transport, so it
-/// cannot end up inside `read_frame` waiting for a frame the remote has
-/// already sent.
-async fn drive_client<R, W>(
-    client: &Arc<ClientInner<R, W>>,
-    mut signal: Pin<&mut Notified<'_>>,
-) -> io::Result<()>
-where
-    R: FuturesAsyncRead + Send + Unpin + 'static,
-    W: FuturesAsyncWrite + Send + Unpin + 'static,
-{
+async fn enqueue_client_frame<R, W>(client: &ClientInner<R, W>, frame: Frame) -> io::Result<()> {
     if is_closed(&client.closed) {
         return Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
-            "client transport is closed",
+            "client transport closed",
         ));
     }
-
-    let mut acquire = pin!(client.read.lock());
-    let reader = poll_fn(|cx| {
-        if signal.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(None);
-        }
-        acquire.as_mut().poll(cx).map(Some)
-    })
-    .await;
-    let Some(mut io) = reader else {
-        return Ok(());
-    };
-
-    let frame = match read_frame(&mut *io).await {
-        Ok(Some(frame)) => frame,
-        Ok(None) => {
-            close_client(client, "client transport closed mid-invocation");
-            return Ok(());
-        }
-        Err(error) => {
-            close_client(client, &error.to_string());
-            return Err(error);
-        }
-    };
-    route_client_frame(client, frame).inspect_err(|error| {
-        close_client(client, &error.to_string());
-    })
+    let (completion, finished) = oneshot::channel();
+    client
+        .outgoing
+        .send(PendingFrame { frame, completion })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "client writer stopped"))?;
+    finished
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "client writer stopped"))?
 }
 
 /// Files one frame into the invocation it names.
@@ -1097,10 +1135,7 @@ fn route_client_frame<R, W>(client: &Arc<ClientInner<R, W>>, frame: Frame) -> io
 
 /// Ends every call on a connection the reader can no longer read.
 ///
-/// With several invocations in flight the failure belongs to all of
-/// them, not only to whichever one happened to hold the reader role:
-/// failing each one both reports the fault and wakes the waiter parked
-/// on its signal.
+/// Every invocation receives the failure and wakes from its own signal.
 fn close_client<R, W>(client: &Arc<ClientInner<R, W>>, reason: &str) {
     mark_closed(&client.closed);
     let waiting: Vec<Arc<Invocation<R, W>>> = client
@@ -1269,12 +1304,6 @@ trait FrameWriter<W> {
     fn write(&self) -> &Arc<Mutex<W>>;
 }
 
-impl<R, W> FrameWriter<W> for ClientInner<R, W> {
-    fn write(&self) -> &Arc<Mutex<W>> {
-        &self.write
-    }
-}
-
 impl<R, W> FrameWriter<W> for ServerInner<R, W> {
     fn write(&self) -> &Arc<Mutex<W>> {
         &self.write
@@ -1330,6 +1359,8 @@ mod tests {
                 let server = Server::new(host_read.compat(), host_write.compat_write());
                 let (peer_read, peer_write) = tokio::io::split(peer);
                 let client = Client::new(peer_read.compat(), peer_write.compat_write());
+                let driver = client.clone();
+                tokio::spawn(async move { driver.route_frames().await });
 
                 let mut invocations = server
                     .serve("transport:test", "ping")
@@ -1399,6 +1430,8 @@ mod tests {
                 let server = Server::new(host_read.compat(), host_write.compat_write());
                 let (peer_read, peer_write) = tokio::io::split(peer);
                 let client = Client::new(peer_read.compat(), peer_write.compat_write());
+                let driver = client.clone();
+                tokio::spawn(async move { driver.route_frames().await });
                 let released = std::sync::Arc::new(Notify::new());
 
                 let mut stream_calls = server
@@ -1508,6 +1541,8 @@ mod tests {
                 let server = Server::new(host_read.compat(), host_write.compat_write());
                 let (peer_read, peer_write) = tokio::io::split(peer);
                 let client = Client::new(peer_read.compat(), peer_write.compat_write());
+                let driver = client.clone();
+                tokio::spawn(async move { driver.route_frames().await });
 
                 let mut calls = server
                     .serve("transport:test", "fail")
@@ -1574,6 +1609,8 @@ mod tests {
                 let server = Server::new(host_read.compat(), host_write.compat_write());
                 let (peer_read, peer_write) = tokio::io::split(peer);
                 let client = Client::new(peer_read.compat(), peer_write.compat_write());
+                let driver = client.clone();
+                tokio::spawn(async move { driver.route_frames().await });
 
                 let mut invocations =
                     server
@@ -1679,6 +1716,8 @@ mod tests {
                 let server = Server::new(host_read.compat(), host_write.compat_write());
                 let (peer_read, peer_write) = tokio::io::split(peer);
                 let client = Client::new(peer_read.compat(), peer_write.compat_write());
+                let driver = client.clone();
+                tokio::spawn(async move { driver.route_frames().await });
 
                 let expected = vec![0x5a; RAW_UPLOAD_CHUNK_BYTES * 3 + 17];
                 let mut calls = server
@@ -1898,6 +1937,8 @@ mod tests {
                 let server = Server::new(host_read.compat(), host_write.compat_write());
                 let (peer_read, peer_write) = tokio::io::split(peer);
                 let client = Client::new(peer_read.compat(), peer_write.compat_write());
+                let driver = client.clone();
+                tokio::spawn(async move { driver.route_frames().await });
                 let release = std::sync::Arc::new(Notify::new());
 
                 let mut slow_calls = server
@@ -2021,15 +2062,21 @@ mod tests {
                 let mut guest_write = guest_write.compat_write();
                 let (peer_read, peer_write) = tokio::io::split(peer);
                 let client = Client::new(peer_read.compat(), peer_write.compat_write());
+                let driver = client.clone();
+                tokio::spawn(async move { driver.route_frames().await });
 
-                // The first caller takes the reader role and parks in
-                // the transport; the second is left a pure waiter.
+                // Both callers remain parked while the driver files the
+                // second response before the first one is accepted.
                 let mut reader =
                     Box::pin(client.open_invocation("transport:test", "reader", Bytes::new()));
                 assert!(
                     poll_once(&mut reader).await.is_none(),
                     "the first caller must park until the guest answers it"
                 );
+                assert!(matches!(
+                    super::read_frame(&mut guest_read).await.unwrap(),
+                    Some(super::Frame::Open { invocation: 1, .. })
+                ));
                 let mut waiter =
                     Box::pin(client.open_invocation("transport:test", "waiter", Bytes::new()));
                 assert!(
@@ -2037,7 +2084,7 @@ mod tests {
                     "the second caller must park until the guest answers it"
                 );
 
-                for expected in ["reader", "waiter"] {
+                for expected in ["waiter"] {
                     match super::read_frame(&mut guest_read)
                         .await
                         .unwrap_or_else(|error| {
@@ -2104,8 +2151,11 @@ mod tests {
             let (guest, host) = tokio::io::duplex(4096);
             let (guest_read, guest_write) = tokio::io::split(guest);
             let (host_read, host_write) = tokio::io::split(host);
+            let client = Client::new(host_read.compat(), host_write.compat_write());
+            let driver = client.clone();
+            tokio::spawn(async move { driver.route_frames().await });
             Self {
-                client: Client::new(host_read.compat(), host_write.compat_write()),
+                client,
                 read: guest_read.compat(),
                 write: guest_write.compat_write(),
             }
@@ -2148,6 +2198,155 @@ mod tests {
             .build()
             .unwrap_or_else(|error| panic!("failed to build test runtime: {error}"))
             .block_on(future)
+    }
+
+    #[test]
+    fn cancelling_a_partial_response_preserves_the_next_frame() {
+        block_on_test(async {
+            let mut peer = RawPeer::new();
+            let (outgoing, mut incoming) = peer.open("cancelled", 1).await;
+            let mut encoded = futures_lite::io::Cursor::new(Vec::new());
+            super::write_frame(
+                &mut encoded,
+                &super::Frame::Data {
+                    invocation: 1,
+                    path: Vec::new(),
+                    payload: "中文日本語한국어".as_bytes().to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+            let encoded = encoded.into_inner();
+            // Split within the length header, before the driver can route it.
+            let split = crate::wire::FRAME_MAGIC.len() + 2;
+            futures_lite::io::AsyncWriteExt::write_all(&mut peer.write, &encoded[..split])
+                .await
+                .unwrap();
+            let mut buffer = [0; 8];
+            let mut read = Box::pin(incoming.read(&mut buffer));
+            assert!(poll_once(&mut read).await.is_none());
+            tokio::task::yield_now().await;
+            drop(read);
+            drop(incoming);
+            drop(outgoing);
+            futures_lite::io::AsyncWriteExt::write_all(&mut peer.write, &encoded[split..])
+                .await
+                .unwrap();
+            let (_outgoing, mut incoming) = timeout(CONCURRENT_DEADLINE, peer.open("next", 2))
+                .await
+                .unwrap();
+            super::write_frame(
+                &mut peer.write,
+                &super::Frame::Data {
+                    invocation: 2,
+                    path: Vec::new(),
+                    payload: b"alive".to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+            super::write_frame(
+                &mut peer.write,
+                &super::Frame::Close {
+                    invocation: 2,
+                    path: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+            let mut response = Vec::new();
+            timeout(CONCURRENT_DEADLINE, incoming.read_to_end(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response, b"alive");
+        });
+    }
+
+    #[test]
+    fn cancelling_a_partial_write_finishes_the_started_frame() {
+        block_on_test(async {
+            let mut peer = RawPeer::new();
+            let (mut outgoing, incoming) = peer.open("cancelled", 1).await;
+            // The 64 KiB request exceeds RawPeer's 4 KiB transport capacity.
+            let payload = vec![0x5a; RAW_UPLOAD_CHUNK_BYTES];
+            let mut write = Box::pin(outgoing.write_all(&payload));
+            assert!(poll_once(&mut write).await.is_none());
+            tokio::task::yield_now().await;
+            assert!(poll_once(&mut write).await.is_none());
+            drop(write);
+            drop(outgoing);
+            drop(incoming);
+            match timeout(CONCURRENT_DEADLINE, super::read_frame(&mut peer.read))
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                Some(super::Frame::Data {
+                    invocation: 1,
+                    payload: actual,
+                    ..
+                }) => assert_eq!(actual, payload),
+                other => panic!("cancelled write left an incomplete frame: {other:?}"),
+            }
+            timeout(CONCURRENT_DEADLINE, peer.open("next", 2))
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn a_driver_failure_preserves_the_guest_panic_report() {
+        block_on_test(async {
+            let mut peer = RawPeer::new();
+            let client = peer.client.clone();
+            let call = client.open_invocation("transport:test", "panic", Bytes::new());
+            let guest = async {
+                assert!(matches!(
+                    super::read_frame(&mut peer.read).await.unwrap(),
+                    Some(super::Frame::Open { .. })
+                ));
+                futures_lite::io::AsyncWriteExt::write_all(
+                    &mut peer.write,
+                    b"Kernel panic: cancellation test fault\n",
+                )
+                .await
+                .unwrap();
+            };
+            let (result, ()) = timeout(CONCURRENT_DEADLINE, join(call, guest))
+                .await
+                .unwrap();
+            let error = match result {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("a guest panic accepted the invocation"),
+            };
+            assert!(error.contains("cancellation test fault"), "{error}");
+        });
+    }
+
+    #[test]
+    fn stopping_the_driver_wakes_a_pending_invocation() {
+        block_on_test(async {
+            let (host, guest) = tokio::io::duplex(64);
+            let (read, write) = tokio::io::split(host);
+            let client = Client::new(read.compat(), write.compat_write());
+            let driver = client.clone();
+            let task = tokio::spawn(async move { driver.route_frames().await });
+            let mut call =
+                Box::pin(client.open_invocation("transport:test", "pending", Bytes::new()));
+            assert!(poll_once(&mut call).await.is_none());
+            tokio::task::yield_now().await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert!(timeout(CONCURRENT_DEADLINE, call).await.unwrap().is_err());
+            assert!(
+                client
+                    .open_invocation("transport:test", "closed", Bytes::new())
+                    .await
+                    .is_err()
+            );
+            drop(guest);
+        });
     }
 
     /// Opens invocations 1 and 2, has the peer send `frames` on the first

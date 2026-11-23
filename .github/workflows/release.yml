@@ -1,7 +1,9 @@
 name: Release
 
 on:
-  push:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
     branches: [main]
   workflow_dispatch:
     inputs:
@@ -19,17 +21,48 @@ permissions:
   contents: read
 
 jobs:
-  release-plz:
-    name: Release
-    # A dispatch names a tag that already exists; it attaches assets to
-    # that release and never cuts one.
-    if: github.event_name == 'push'
+  classify:
+    name: Classify main push
+    if: >-
+      github.event_name == 'workflow_run'
+      && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      head_sha: ${{ steps.inspect.outputs.head_sha }}
+      is_release_pr: ${{ steps.inspect.outputs.is_release_pr }}
+    steps:
+      - id: inspect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          pulls="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/pulls")"
+          is_release_pr="$(printf '%s' "${pulls}" | jq -r 'any(.[]; .merged_at != null and (.head.ref | startswith("release-plz-")))')"
+          {
+            echo "head_sha=${HEAD_SHA}"
+            echo "is_release_pr=${is_release_pr}"
+          } >> "${GITHUB_OUTPUT}"
+
+  release:
+    name: Publish prepared release
+    needs: classify
+    if: needs.classify.outputs.is_release_pr == 'true'
     runs-on: ubuntu-latest
-    # Tags and releases, the release pull request, and the OIDC identity
-    # crates.io trades for a publishing token.
+    concurrency:
+      group: release-plz-release
+      cancel-in-progress: false
+    # Tags and releases, and the OIDC identity crates.io trades for a
+    # publishing token.
     permissions:
       contents: write
-      pull-requests: write
+      pull-requests: read
       id-token: write
     outputs:
       # What release-plz released, as it reports it: a JSON array of
@@ -39,9 +72,16 @@ jobs:
       releases: ${{ steps.release-plz.outputs.releases }}
       releases-created: ${{ steps.release-plz.outputs.releases_created }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout main
+        uses: actions/checkout@v4
         with:
+          path: helios
+          ref: ${{ needs.classify.outputs.head_sha }}
           fetch-depth: 0
+          persist-credentials: false
+      - name: Attach local main branch to green CI commit
+        run: git -C helios checkout -B main
+      - uses: ./helios/.github/actions/checkout-wasmtime
       - uses: dtolnay/rust-toolchain@stable
       # Mint a short-lived crates.io token from the GitHub OIDC identity
       # instead of a stored CARGO_REGISTRY_TOKEN. Trusted publishing is
@@ -52,10 +92,67 @@ jobs:
         id: crates-io-auth
         continue-on-error: true
       - id: release-plz
-        uses: MarcoIeni/release-plz-action@v0.5
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+          manifest_path: helios/Cargo.toml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+
+  release-pr:
+    name: Prepare release pull request
+    needs: classify
+    if: needs.classify.outputs.is_release_pr == 'false'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-plz-pr
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          path: helios
+          ref: ${{ needs.classify.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Attach local main branch to green CI commit
+        run: git -C helios checkout -B main
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - uses: dtolnay/rust-toolchain@stable
+      - id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+          manifest_path: helios/Cargo.toml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Approve the release PR's CI
+        if: steps.release-plz.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.release-plz.outputs.pr }}
+        run: |
+          set -euo pipefail
+          pr="$(jq -er .number <<<"${PR}")"
+          sha="$(gh pr view "${pr}" -R "${GITHUB_REPOSITORY}" --json headRefOid -q .headRefOid)"
+          deadline=$(( $(date +%s) + 60 ))
+          while [ "$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${sha}&event=pull_request" -q '.total_count')" -eq 0 ]; do
+            if [ "$(date +%s)" -ge "${deadline}" ]; then
+              echo "no pull_request run appeared on #${pr} (${sha})"
+              exit 0
+            fi
+            sleep 5
+          done
+          for run in $(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${sha}&event=pull_request" \
+            -q '.workflow_runs[] | select(.conclusion == "action_required") | .id'); do
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${run}/approve" > /dev/null
+            echo "approved run ${run} on #${pr}"
+          done
 
   # Which release the kernel profile belongs to, decided before hours of
   # collection are spent on it. release-plz bumps the packages that
@@ -64,11 +161,12 @@ jobs:
   # then names no tag and the one below does not run.
   kernel-release-tag:
     name: kernel-release-tag
-    needs: release-plz
+    needs: release
     if: >-
       always()
       && (github.event_name == 'workflow_dispatch'
-          || needs.release-plz.outputs.releases-created == 'true')
+          || (needs.release.result == 'success'
+              && needs.release.outputs.releases-created == 'true'))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -77,7 +175,7 @@ jobs:
       - id: tag
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASES: ${{ needs.release-plz.outputs.releases }}
+          RELEASES: ${{ needs.release.outputs.releases }}
           DISPATCH_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
@@ -144,10 +242,41 @@ jobs:
         with:
           limine-dir: ${{ github.workspace }}/limine
           output: ${{ github.workspace }}/profiles/helios-kernel.profdata
+      # The key the released kernel trusts and its boot payload is signed
+      # with (docs/boot.md). It lives in the runner's temporary directory,
+      # outside the checkout and every build directory, so no artifact or
+      # cache can pick it up, and the last step removes it. The profile
+      # collection above keeps the keys its own builds generated.
+      - name: Install the release signing key
+        env:
+          HELIOS_BOOTFS_ROOT_KEY: ${{ secrets.HELIOS_BOOTFS_ROOT_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HELIOS_BOOTFS_ROOT_KEY}" ]; then
+            echo "::error::the repository secret HELIOS_BOOTFS_ROOT_KEY is empty or not set; a release cannot sign its boot payload without it"
+            exit 1
+          fi
+          key="${RUNNER_TEMP}/helios-bootfs-root.key"
+          # Created owner-only before a byte is written, so the key is
+          # never on disk under the runner's umask.
+          install -m 600 /dev/null "${key}"
+          if ! printf '%s' "${HELIOS_BOOTFS_ROOT_KEY}" | base64 -d > "${key}" 2>/dev/null; then
+            rm -f "${key}"
+            echo "::error::the repository secret HELIOS_BOOTFS_ROOT_KEY is not valid base64; it holds the base64 of the 32 raw key bytes"
+            exit 1
+          fi
+          if [ "$(wc -c < "${key}")" -ne 32 ]; then
+            rm -f "${key}"
+            echo "::error::the repository secret HELIOS_BOOTFS_ROOT_KEY does not decode to 32 bytes; it holds the base64 of the 32 raw key bytes"
+            exit 1
+          fi
+          echo "HELIOS_ROOT_KEY_FILE=${key}" >> "${GITHUB_ENV}"
       - name: Build the released kernel against the profile
         working-directory: helios
-        run: just kernel-pgo-use x86-64 "$GITHUB_WORKSPACE/profiles/helios-kernel.profdata"
-      - name: Attach the profile and the profile-guided kernel to the release
+        run: |
+          just kernel-pgo-use x86-64 "$GITHUB_WORKSPACE/profiles/helios-kernel.profdata" \
+            --root-secret-key "${HELIOS_ROOT_KEY_FILE}"
+      - name: Attach the profile, the profile-guided kernel and its boot payload to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -165,8 +294,17 @@ jobs:
             vm --arch x86-64 --profile-use "$GITHUB_WORKSPACE/profiles/helios-kernel.profdata" \
             kernel-path)"
           cp "$kernel" assets/helios-kernel-x86-64
+          # The payload the build above signed with the release key: the
+          # kernel trusts that key's public half and nothing else.
+          bootfs="$(cd helios && cargo run -p helios-inspector --quiet -- \
+            vm --arch x86-64 --profile-use "$GITHUB_WORKSPACE/profiles/helios-kernel.profdata" \
+            bootfs-path)"
+          cp "$bootfs" assets/helios-bootfs-x86-64
           gh release upload "${RELEASE_TAG}" \
             assets/helios-kernel.profdata \
             assets/helios-kernel-x86-64 \
+            assets/helios-bootfs-x86-64 \
             --clobber --repo "${GITHUB_REPOSITORY}"
-
+      - name: Remove the release signing key
+        if: always()
+        run: rm -f "${HELIOS_ROOT_KEY_FILE:-${RUNNER_TEMP}/helios-bootfs-root.key}"

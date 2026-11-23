@@ -4,10 +4,9 @@
 //! responses, and request options are plain kernel values
 //! ([`crate::HttpFields`] and friends) wrapped in resource handles. It owns
 //! none of the *protocol* half. `client.send` is a forwarder: it turns the
-//! caller's request into a transport-neutral [`HttpExchange`], pushes it
-//! through the `http_client` provider slot on
-//! [`RuntimeState`](crate::RuntimeState), and awaits the response the
-//! `http-client` kernel plugin sends back.
+//! caller's request into a transport-neutral [`HttpExchange`], pushes it onto
+//! the executing processor's shard in `RuntimeState::http_client()`, and
+//! awaits the response the `http-client` kernel plugin sends back.
 //!
 //! Exactly one implementation serves both stores. The program's store sees
 //! the *import* side (it constructs a request and calls `client.send`); the
@@ -26,6 +25,8 @@
 //! trailers into a oneshot, and the result channel travels along inside
 //! [`HttpBody`] so that whoever consumes the body on the far side reports the
 //! verdict straight back to the producing guest.
+
+use alloc::borrow::Cow;
 
 use super::*;
 use crate::ComponentHostNetwork;
@@ -283,24 +284,24 @@ fn kernel_scheme(scheme: http_types::Scheme) -> core::result::Result<HttpScheme,
 /// The guest resolves its trailers future with an owned `trailers` resource;
 /// this deletes that resource from the store table and hands the fields to
 /// whoever is reading the body on the far side.
-pub(crate) struct TrailersConsumer<T, CpuImpl, Net, HostFs>
+pub(crate) struct TrailersConsumer<T, CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
+    getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, StorageImpl>,
     sender: Option<oneshot::Sender<core::result::Result<Option<HttpFields>, HttpErrorCode>>>,
 }
 
-impl<T, CpuImpl, Net, HostFs> TrailersConsumer<T, CpuImpl, Net, HostFs>
+impl<T, CpuImpl, Net, StorageImpl> TrailersConsumer<T, CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn new(
-        getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
+        getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, StorageImpl>,
         sender: oneshot::Sender<core::result::Result<Option<HttpFields>, HttpErrorCode>>,
     ) -> Self {
         Self {
@@ -310,12 +311,12 @@ where
     }
 }
 
-impl<T: 'static, CpuImpl, Net, HostFs> FutureConsumer<T>
-    for TrailersConsumer<T, CpuImpl, Net, HostFs>
+impl<T: 'static, CpuImpl, Net, StorageImpl> FutureConsumer<T>
+    for TrailersConsumer<T, CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     type Item = core::result::Result<Option<Resource<HttpFields>>, http_types::ErrorCode>;
 
@@ -387,36 +388,36 @@ impl<T: 'static> FutureConsumer<T> for BodyResultConsumer {
 ///
 /// Pushing the fields into the store table needs store access, which is why
 /// this is a [`FutureProducer`] rather than a plain async block.
-pub(crate) struct TrailersProducer<T, CpuImpl, Net, HostFs>
+pub(crate) struct TrailersProducer<T, CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
+    getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, StorageImpl>,
     receiver: oneshot::Receiver<core::result::Result<Option<HttpFields>, HttpErrorCode>>,
 }
 
-impl<T, CpuImpl, Net, HostFs> TrailersProducer<T, CpuImpl, Net, HostFs>
+impl<T, CpuImpl, Net, StorageImpl> TrailersProducer<T, CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn new(
-        getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
+        getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, StorageImpl>,
         receiver: oneshot::Receiver<core::result::Result<Option<HttpFields>, HttpErrorCode>>,
     ) -> Self {
         Self { getter, receiver }
     }
 }
 
-impl<T: 'static, CpuImpl, Net, HostFs> FutureProducer<T>
-    for TrailersProducer<T, CpuImpl, Net, HostFs>
+impl<T: 'static, CpuImpl, Net, StorageImpl> FutureProducer<T>
+    for TrailersProducer<T, CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     type Item = core::result::Result<Option<Resource<HttpFields>>, http_types::ErrorCode>;
 
@@ -464,8 +465,8 @@ pub(crate) enum WasiBody {
 impl WasiBody {
     /// Wrap the stream and trailers future a guest passed to `request.new` or
     /// `response.new`, returning the future that reports transmission back.
-    fn new_guest<T, CpuImpl, Net, HostFs>(
-        access: &mut Access<'_, T, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+    fn new_guest<T, CpuImpl, Net, StorageImpl>(
+        access: &mut Access<'_, T, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
         contents: Option<StreamReader<u8>>,
         trailers: GuestTrailers,
     ) -> Result<(Self, GuestBodyResult)>
@@ -473,7 +474,7 @@ impl WasiBody {
         T: 'static,
         CpuImpl: Cpu + Clone,
         Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
+        StorageImpl: crate::Storage,
     {
         let (result, result_rx) = oneshot::channel();
         let body = Self::Guest {
@@ -494,15 +495,15 @@ impl WasiBody {
     ///
     /// A guest body is piped into a fresh byte channel and a trailers oneshot;
     /// a host body is already in that form and passes straight through.
-    fn into_host<T, CpuImpl, Net, HostFs>(
+    fn into_host<T, CpuImpl, Net, StorageImpl>(
         self,
-        access: &mut Access<'_, T, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+        access: &mut Access<'_, T, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     ) -> Result<HttpBody>
     where
         T: 'static,
         CpuImpl: Cpu + Clone,
         Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
+        StorageImpl: crate::Storage,
     {
         match self {
             Self::Host { body } => Ok(body),
@@ -536,16 +537,16 @@ impl WasiBody {
     ///
     /// `fut` is how the caller will report back how the body was handled; it
     /// is wired to whichever result channel this body carries.
-    fn consume<T, CpuImpl, Net, HostFs>(
+    fn consume<T, CpuImpl, Net, StorageImpl>(
         self,
-        access: &mut Access<'_, T, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+        access: &mut Access<'_, T, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
         fut: GuestBodyResult,
     ) -> Result<(StreamReader<u8>, GuestTrailers)>
     where
         T: 'static,
         CpuImpl: Cpu + Clone,
         Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
+        StorageImpl: crate::Storage,
     {
         match self {
             Self::Guest {
@@ -577,15 +578,15 @@ impl WasiBody {
     }
 
     /// Release everything this body still owns in the store.
-    fn close<T, CpuImpl, Net, HostFs>(
+    fn close<T, CpuImpl, Net, StorageImpl>(
         self,
-        access: &mut Access<'_, T, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+        access: &mut Access<'_, T, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     ) -> Result<()>
     where
         T: 'static,
         CpuImpl: Cpu + Clone,
         Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
+        StorageImpl: crate::Storage,
     {
         if let Self::Guest {
             contents,
@@ -635,15 +636,15 @@ impl WasiResponse {
 
     /// Move a response the plugin just produced out of the plugin's store and
     /// onto kernel channels, ready to travel back to the calling program.
-    pub(crate) fn into_host_response<T, CpuImpl, Net, HostFs>(
+    pub(crate) fn into_host_response<T, CpuImpl, Net, StorageImpl>(
         self,
-        access: &mut Access<'_, T, HasSelf<StoreData<CpuImpl, Net, HostFs>>>,
+        access: &mut Access<'_, T, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     ) -> Result<HttpResponse>
     where
         T: 'static,
         CpuImpl: Cpu + Clone,
         Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
+        StorageImpl: crate::Storage,
     {
         let Self { head, body } = self;
         Ok(HttpResponse {
@@ -671,11 +672,11 @@ fn plugin_unavailable() -> HttpError {
     http_types::ErrorCode::InternalError(Some(String::from("http plugin restarted"))).into()
 }
 
-impl<CpuImpl, Net, HostFs> http_types::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> http_types::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn convert_error_code(&mut self, error: HttpError) -> Result<http_types::ErrorCode> {
         error.downcast()
@@ -696,11 +697,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> http_types::HostFields for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> http_types::HostFields for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn new(&mut self) -> Result<Resource<HttpFields>> {
         Ok(self.table.push(HttpFields::new_mutable())?)
@@ -708,65 +709,64 @@ where
 
     fn from_list(
         &mut self,
-        entries: Vec<(String, Vec<u8>)>,
+        entries: Vec<(Cow<'_, str>, &[u8])>,
     ) -> core::result::Result<Resource<HttpFields>, HttpHeaderTrapError> {
         let entries = entries
             .into_iter()
-            .map(|(name, value)| (name, Bytes::from(value)))
-            .collect();
+            .map(|(name, value)| (name, Bytes::copy_from_slice(value)));
         let fields = HttpFields::from_list(entries).map_err(header_error)?;
         self.table.push(fields).map_err(header_trap)
     }
 
-    fn get(&mut self, fields: Resource<HttpFields>, name: String) -> Result<Vec<Vec<u8>>> {
+    fn get(&mut self, fields: Resource<HttpFields>, name: &str) -> Result<Vec<Vec<u8>>> {
         let fields = self.table.get(&fields)?;
         Ok(fields
-            .get(&name)
+            .get(name)
             .into_iter()
             .map(|value| value.to_vec())
             .collect())
     }
 
-    fn has(&mut self, fields: Resource<HttpFields>, name: String) -> Result<bool> {
-        Ok(self.table.get(&fields)?.has(&name))
+    fn has(&mut self, fields: Resource<HttpFields>, name: &str) -> Result<bool> {
+        Ok(self.table.get(&fields)?.has(name))
     }
 
     fn set(
         &mut self,
         fields: Resource<HttpFields>,
-        name: String,
-        values: Vec<Vec<u8>>,
+        name: &str,
+        values: Vec<&[u8]>,
     ) -> core::result::Result<(), HttpHeaderTrapError> {
-        let values = values.into_iter().map(Bytes::from).collect();
+        let values = values.into_iter().map(Bytes::copy_from_slice).collect();
         self.table
             .get_mut(&fields)
             .map_err(header_trap)?
-            .set(&name, values)
+            .set(name, values)
             .map_err(header_error)
     }
 
     fn delete(
         &mut self,
         fields: Resource<HttpFields>,
-        name: String,
+        name: &str,
     ) -> core::result::Result<(), HttpHeaderTrapError> {
         self.table
             .get_mut(&fields)
             .map_err(header_trap)?
-            .delete(&name)
+            .delete(name)
             .map_err(header_error)
     }
 
     fn get_and_delete(
         &mut self,
         fields: Resource<HttpFields>,
-        name: String,
+        name: &str,
     ) -> core::result::Result<Vec<Vec<u8>>, HttpHeaderTrapError> {
         let removed = self
             .table
             .get_mut(&fields)
             .map_err(header_trap)?
-            .get_and_delete(&name)
+            .get_and_delete(name)
             .map_err(header_error)?;
         Ok(removed.into_iter().map(|value| value.to_vec()).collect())
     }
@@ -774,13 +774,13 @@ where
     fn append(
         &mut self,
         fields: Resource<HttpFields>,
-        name: String,
-        value: Vec<u8>,
+        name: &str,
+        value: &[u8],
     ) -> core::result::Result<(), HttpHeaderTrapError> {
         self.table
             .get_mut(&fields)
             .map_err(header_trap)?
-            .append(&name, Bytes::from(value))
+            .append(name, Bytes::copy_from_slice(value))
             .map_err(header_error)
     }
 
@@ -805,11 +805,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> http_types::HostRequestOptions for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> http_types::HostRequestOptions
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn new(&mut self) -> Result<Resource<HttpRequestOptions>> {
         Ok(self.table.push(HttpRequestOptions::new_mutable())?)
@@ -886,11 +887,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> http_types::HostRequest for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> http_types::HostRequest for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn get_method(&mut self, request: Resource<WasiRequest>) -> Result<http_types::Method> {
         Ok(wit_method(&self.table.get(&request)?.head.method))
@@ -984,11 +985,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> http_types::HostResponse for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> http_types::HostResponse for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn get_status_code(&mut self, response: Resource<WasiResponse>) -> Result<u16> {
         Ok(self.table.get(&response)?.head.status)
@@ -1012,12 +1013,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> http_types::HostRequestWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> http_types::HostRequestWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn new(
         mut access: Access<'_, U, Self>,
@@ -1057,12 +1058,12 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> http_types::HostResponseWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> http_types::HostResponseWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn new(
         mut access: Access<'_, U, Self>,
@@ -1099,20 +1100,20 @@ where
 // `wasi:http/client`
 // ---------------------------------------------------------------------------
 
-impl<CpuImpl, Net, HostFs> http_client::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> http_client::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
 
-impl<CpuImpl, Net, HostFs, U> http_client::HostWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> http_client::HostWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     /// Forward the request to the `http-client` kernel plugin and wait.
     ///
@@ -1172,39 +1173,73 @@ where
     }
 }
 
-/// Link `wasi:http` into a store, for the interfaces the component imports.
-///
-/// `types` is linked whenever either interface is present: `client` is defined
-/// in terms of the `types` resources, so linking it alone would leave those
-/// resource types undefined.
-pub(crate) fn add_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut wasmtime::component::Linker<StoreData<CpuImpl, Net, HostFs>>,
-    imports: &WasiImportSet,
-) -> Result<()>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
-    let wants_types = imports.has("wasi:http/types", "0.3");
-    let wants_client = imports.has("wasi:http/client", "0.3");
-    if wants_types || wants_client {
-        http_types::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+// Link `wasi:http` into a store, for the interfaces the component imports.
+//
+// `wasi:http/handler` is not among them: the kernel calls it as an export on
+// the plugin's store rather than serving it as an import.
+//
+// `wasi:http/client` imports `types` (error-code, fields, request, response,
+// trailers) by reference, so linking `client` alone would leave those
+// resource types undefined; `wasi:http/types` is linked whenever either
+// interface is imported.
+linked_interfaces! {
+    linker, imports;
+    "wasi:http/types"
+        when imports.has("wasi:http/types", "0.3") || imports.has("wasi:http/client", "0.3") =>
+        http_types::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
-        )?;
-    }
-    if wants_client {
-        http_client::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(
+        );
+    "wasi:http/client" when imports.has("wasi:http/client", "0.3") =>
+        http_client::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
-        )?;
-    }
-    Ok(())
+        );
 }
 
-/// Interfaces [`add_to_linker`] serves. `wasi:http/handler` is not among them:
-/// the kernel calls it as an export on the plugin's store rather than serving
-/// it as an import.
 #[cfg(test)]
-pub(crate) const LINKED_INTERFACES: &[&str] = &["wasi:http/types", "wasi:http/client"];
+mod borrowed_fields_tests {
+    use super::*;
+    use crate::wasmtime_adapter::component_host::service::test_store;
+    use alloc::vec;
+    use http_types::HostFields;
+
+    #[test]
+    fn borrowed_fields_keep_final_values_after_input_release() {
+        let mut store = test_store::store_data_with(|_| {});
+        let name = String::from("X-Input");
+        let bytes = "中文、日本語、한국어".as_bytes().to_vec();
+        let fields =
+            HostFields::from_list(&mut store, vec![(Cow::Borrowed(&name), &bytes)]).unwrap();
+        let rep = fields.rep();
+        drop(name);
+        drop(bytes);
+        assert_eq!(
+            HostFields::get(&mut store, Resource::new_borrow(rep), "x-input").unwrap(),
+            vec!["中文、日本語、한국어".as_bytes().to_vec()]
+        );
+        HostFields::append(&mut store, Resource::new_borrow(rep), "X-Input", b"second").unwrap();
+        HostFields::set(
+            &mut store,
+            Resource::new_borrow(rep),
+            "x-input",
+            vec![b"replacement"],
+        )
+        .unwrap();
+        assert_eq!(
+            HostFields::get_and_delete(&mut store, Resource::new_borrow(rep), "X-INPUT").unwrap(),
+            vec![b"replacement".to_vec()]
+        );
+        assert!(!HostFields::has(&mut store, Resource::new_borrow(rep), "x-input").unwrap());
+        assert!(
+            HostFields::append(&mut store, Resource::new_borrow(rep), "host", b"invalid").is_err()
+        );
+        let immutable = store.table.delete(fields).unwrap().into_immutable();
+        let immutable = store.table.push(immutable).unwrap();
+        let error = HostFields::delete(&mut store, immutable, "x-input").unwrap_err();
+        assert!(matches!(
+            error.downcast().unwrap(),
+            http_types::HeaderError::Immutable
+        ));
+    }
+}

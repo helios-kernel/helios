@@ -4,10 +4,26 @@ version = "0.1.0"
 edition.workspace = true
 autobins = false
 
+[package.metadata.helios]
+boringssl = true
+
 [dependencies]
-helios-api = { path = "../../api", default-features = false, features = ["http-handler", "net", "task"] }
-http = "1.4.0"
-httparse = { version = "1.10.1", default-features = false }
+futures-channel = { version = "0.3.34", default-features = false, features = ["alloc"] }
+futures-lite = { version = "2.6.1", default-features = false }
+helios-api = { path = "../../api", default-features = false, features = ["fs", "http-handler", "http-kit-io", "net", "task"] }
+http = { version = "1.5.0", default-features = false, features = ["std"] }
+http-kit-h2 = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false }
+http-kit-h3 = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false, features = ["quiche"] }
+http-kit-io = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false }
+rustls = { version = "0.23.46", default-features = false, features = ["std"] }
+rustls-pure = { version = "0.15.4", default-features = false }
+thiserror = { version = "2.0.21", default-features = false }
+zenwave = { git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["native-backend", "native-http2", "native-http3"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+executor-core = { git = "https://github.com/lexoliu/executor-core", branch = "main", default-features = false }
+http-kit-tls = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false }
+tempfile.workspace = true
 
 [lib]
 name = "helios_http_client"

@@ -7,19 +7,59 @@ use core::future::Future;
 use core::ptr;
 
 use crate::InstanceId;
+use crate::memory::{GuestResidency, SwapFaultError};
 use bytes::Bytes;
+use helios_hal::fs::{FsError, NodeKind, WritePosition, WriteProgress};
 use helios_hal::io::IoError;
+use helios_hal::pmm::PhysFrame;
+use helios_hal::vmm::{VirtAddr, VirtRange};
 use thiserror::Error;
 
+/// A guest's scattered read buffer, registered with the TCP stack so the
+/// bytes a stream received are copied out of its receive queue straight
+/// into guest memory, once.
+///
+/// # Concurrency
+///
+/// One task drives the buffer: the host call that registered it, whose
+/// every poll is a turn of the instance that owns the memory. Each copy
+/// into it runs synchronously inside such a poll, under the lock of the
+/// shard that holds the stream, and lands only on a page that the same
+/// synchronous step has just seen present. A page is detached only from
+/// an instance that is off every processor (see [`GuestResidency`]), so a
+/// page seen present stays present until the copy is done; the check and
+/// the copy never straddle an await.
+///
+/// A page that is out stops the copy in front of it. Whatever the stack
+/// could not hand over stays in the stream's receive queue,
+/// [`Self::awaits_page`] answers `true`, and [`Self::bring_in_next_page`]
+/// faults the page in. That await ends the turn, and the read that is
+/// retried afterwards checks every page again.
 pub struct RegisteredTcpReadBuffer<'a> {
     memory_base: usize,
+    /// `(offset, len)` spans of linear memory, in the order they fill.
     ranges: &'a [(usize, usize)],
     capacity: usize,
     written: usize,
+    /// `None` on a machine that cannot swap, where every page is present.
+    residency: Option<GuestResidency>,
 }
 
 impl<'a> RegisteredTcpReadBuffer<'a> {
-    pub fn new(memory_base: usize, ranges: &'a [(usize, usize)]) -> Self {
+    /// A buffer over the `ranges` of the linear memory at `memory_base`.
+    ///
+    /// # Safety
+    ///
+    /// Every range lies inside that linear memory, which stays mapped and
+    /// in place for as long as the buffer lives, and nothing else touches
+    /// those bytes meanwhile: the guest that owns them is suspended in the
+    /// host call that holds the buffer. `residency` is the machine's swap,
+    /// or `None` only where no guest page is ever absent.
+    pub(crate) unsafe fn new(
+        memory_base: usize,
+        ranges: &'a [(usize, usize)],
+        residency: Option<GuestResidency>,
+    ) -> Self {
         let capacity = ranges.iter().fold(0usize, |total, (_, len)| {
             total
                 .checked_add(*len)
@@ -30,6 +70,7 @@ impl<'a> RegisteredTcpReadBuffer<'a> {
             ranges,
             capacity,
             written: 0,
+            residency,
         }
     }
 
@@ -40,45 +81,115 @@ impl<'a> RegisteredTcpReadBuffer<'a> {
     pub const fn written(&self) -> usize {
         self.written
     }
+
+    /// Whether the page the next byte lands on is swapped out, so the
+    /// buffer takes nothing until [`Self::bring_in_next_page`] has run.
+    pub fn awaits_page(&self) -> bool {
+        self.next_page().is_some_and(|(residency, next)| {
+            residency.first_swapped(VirtRange::new(next, 1)).is_some()
+        })
+    }
+
+    /// Faults in the page the next byte lands on, if it is out. Present
+    /// once this resolves, and only then: the caller retries its read,
+    /// which checks again in the poll that copies.
+    pub async fn bring_in_next_page(&self) -> Result<(), SwapFaultError> {
+        let Some((residency, next)) = self.next_page() else {
+            return Ok(());
+        };
+        match residency.fault_in_first_swapped(VirtRange::new(next, 1)) {
+            Some(fault) => fault.await,
+            None => Ok(()),
+        }
+    }
+
+    /// The machine's swap and the host address of the next byte, while
+    /// the buffer has room on a machine that swaps.
+    fn next_page(&self) -> Option<(&GuestResidency, VirtAddr)> {
+        let residency = self.residency.as_ref()?;
+        let mut skip = self.written;
+        for &(start, len) in self.ranges {
+            if skip < len {
+                return Some((residency, VirtAddr::new(self.memory_base + start + skip)));
+            }
+            skip -= len;
+        }
+        None
+    }
+
+    /// Whether every page of the `len` bytes at host address `at` is
+    /// present.
+    fn present(&self, at: usize, len: usize) -> bool {
+        self.residency.as_ref().is_none_or(|residency| {
+            residency
+                .first_swapped(VirtRange::new(VirtAddr::new(at), len))
+                .is_none()
+        })
+    }
 }
 
 impl helios_netstack::TcpReceiveBuffer for RegisteredTcpReadBuffer<'_> {
+    /// No room while the next page is out, which is what makes the stack
+    /// leave its bytes queued.
     fn remaining_capacity(&self) -> usize {
+        if self.awaits_page() {
+            return 0;
+        }
         self.capacity - self.written
     }
 
+    /// Copies as much of `bytes` as fits, a page at a time, each page
+    /// checked present just before it is written, and stops in front of
+    /// the first page that is out.
     fn write_from(&mut self, bytes: &[u8]) -> usize {
-        let write_len = bytes.len().min(self.remaining_capacity());
-        let mut source_offset = 0usize;
-        let mut global_offset = self.written;
-        for (range_start, range_len) in self.ranges {
-            if source_offset == write_len {
+        let mut taken = 0usize;
+        let mut skip = self.written;
+        'ranges: for &(start, len) in self.ranges {
+            if taken == bytes.len() {
                 break;
             }
-            if global_offset >= *range_len {
-                global_offset -= *range_len;
+            if skip >= len {
+                skip -= len;
                 continue;
             }
-            let range_offset = global_offset;
-            let range_remaining = *range_len - range_offset;
-            let chunk_len = (write_len - source_offset).min(range_remaining);
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    bytes.as_ptr().add(source_offset),
-                    (self.memory_base as *mut u8).add(*range_start + range_offset),
-                    chunk_len,
-                );
+            let mut offset = skip;
+            skip = 0;
+            while offset < len && taken < bytes.len() {
+                let at = self.memory_base + start + offset;
+                let page_end = (at / PhysFrame::SIZE + 1) * PhysFrame::SIZE;
+                let span = (page_end - at).min(len - offset).min(bytes.len() - taken);
+                if !self.present(at, span) {
+                    break 'ranges;
+                }
+                // SAFETY: the span lies inside the linear memory the
+                // constructor's contract names, on a page this step has
+                // just seen present, and it is copied before anything can
+                // await (see the type's concurrency notes).
+                unsafe {
+                    ptr::copy_nonoverlapping(bytes.as_ptr().add(taken), at as *mut u8, span);
+                }
+                offset += span;
+                taken += span;
             }
-            source_offset += chunk_len;
-            global_offset = 0;
         }
-        assert_eq!(
-            source_offset, write_len,
-            "registered TCP receive buffer ranges did not cover their capacity"
-        );
-        self.written += write_len;
-        write_len
+        self.written += taken;
+        taken
     }
+}
+
+/// What a read into a [`RegisteredTcpReadBuffer`] came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpReadInto {
+    /// This many bytes landed in the buffer: fewer than it holds only
+    /// when the stream had fewer queued, and none only for a buffer with
+    /// no room.
+    Data(usize),
+    /// The peer's send side is done.
+    Eof,
+    /// Bytes were waiting, but the page they would land on could not be
+    /// brought back from swap: the guest's memory is gone. The bytes are
+    /// still queued on the stream.
+    PageLost(SwapFaultError),
 }
 
 #[derive(Clone, Debug)]
@@ -242,6 +353,17 @@ impl DnsError {
     }
 }
 
+/// Usable RFC 9460 Type 65 (`HTTPS`) service parameters resolved for an origin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpsRecord {
+    /// ALPN protocol identifiers from `SvcParamKey` 1, in wire order.
+    pub alpn: Vec<String>,
+    /// Alternative port from `SvcParamKey` 3, when overridden.
+    pub port: Option<u16>,
+    /// Minimum TTL across the answer chain, in nanoseconds.
+    pub ttl_nanos: u64,
+}
+
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum TcpErrorKind {
     #[error("host could not be resolved")]
@@ -355,6 +477,8 @@ pub enum NetworkErrorDetail {
     NetworkAuthorityMissing,
     #[error("privileged bind authority is required for this port")]
     PrivilegedBindDenied,
+    #[error("requested local address is not available")]
+    AddressNotAvailable,
     #[error("virtio network device advance failed")]
     VirtioAdvanceFailed,
     #[error("DNS servers are not configured")]
@@ -470,6 +594,7 @@ impl NetworkErrorDetail {
             Self::NetworkServiceUnavailable => "network service is unavailable",
             Self::NetworkAuthorityMissing => "network authority is missing required rights",
             Self::PrivilegedBindDenied => "privileged bind authority is required for this port",
+            Self::AddressNotAvailable => "requested local address is not available",
             Self::VirtioAdvanceFailed => "virtio network device advance failed",
             Self::DnsServersUnavailable => "DNS servers are not configured",
             Self::DnsQueryStartFailed => "DNS query could not be started",
@@ -532,6 +657,21 @@ pub struct UdpDatagram {
     pub address: NetworkIpAddress,
     pub port: u16,
     pub bytes: Bytes,
+    /// Full payload length of the datagram before truncation to the caller's buffer.
+    pub original_len: usize,
+}
+
+/// One raw link-layer Ethernet frame delivered to an `AF_PACKET` socket.
+#[derive(Clone, Debug)]
+pub struct PacketFrame {
+    /// Linux interface index (`1` = `lo`, `2` = `eth0`).
+    pub ifindex: u32,
+    /// Ethernet protocol (EtherType) in host byte order (for example `0x0800`).
+    pub protocol: u16,
+    /// Frame bytes, truncated to the caller's requested maximum length.
+    pub bytes: Bytes,
+    /// Full original frame length before truncation.
+    pub original_len: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -550,6 +690,17 @@ pub struct TcpListener<Listener> {
 pub enum NetworkIpAddress {
     Ipv4(Ipv4Address),
     Ipv6(helios_netstack::Ipv6Address),
+}
+
+impl NetworkIpAddress {
+    /// Whether this address is the wildcard (`0.0.0.0` or `::`).
+    #[must_use]
+    pub const fn is_unspecified(self) -> bool {
+        match self {
+            Self::Ipv4(address) => u32::from_be_bytes(address.octets()) == 0,
+            Self::Ipv6(address) => address.is_unspecified(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -574,6 +725,15 @@ pub struct SocketReadiness {
     pub writable: bool,
     /// The peer closed its send side, so receives report end-of-stream.
     pub hangup: bool,
+}
+
+/// Current handshake progress of a non-blocking TCP connection attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpConnectPoll {
+    /// The three-way handshake is still in flight.
+    Pending,
+    /// The stream is established and ready for I/O.
+    Connected,
 }
 
 /// What a non-parking poll of a TCP stream's receive queue found.
@@ -626,24 +786,45 @@ impl<Service> ComponentHostNetwork for Service where
 {
 }
 
-/// The queue-pair packet pump a network service runs per processor.
+/// The queue-pair packet pump a network service runs per processor, and
+/// the hand-off of a processor's pair when it goes offline or online.
 ///
 /// A queue pair's interrupt is routed to one processor, so the pump
-/// that drains the pair is pinned to it: every processor calls this
-/// once from its own run loop through `spawn_local_detached`, and the
-/// service either runs the pump for the pair the processor owns or
-/// returns at once. Which pair a processor owns is decided from the
-/// topology inside the service, never by which task got there first —
-/// with more processors than pairs, only the lowest processor mapped
-/// to each pair runs a pump.
+/// that drains the pair is pinned to it: every online processor runs
+/// one as a local task, which its network lifecycle step spawns on the
+/// way up and cancels on the way down. Which pair a processor owns is
+/// the service's routing table's answer, never which task got there
+/// first, and it changes only through the two hand-off calls below.
+///
+/// # Concurrency contract
+///
+/// `hand_off_queue_pair` and `take_up_queue_pair` run on the processor
+/// they name, from its lifecycle step, while the initiator of the
+/// transition holds the lifecycle's transition lock: at most one runs
+/// at a time, and never during a machine freeze. They are synchronous
+/// and take no lock a pump or a socket operation holds; the device
+/// command they issue is polled for its acknowledgement.
 pub trait NetworkPacketPump {
-    /// Runs the packet pump for the queue pair `processor` owns, for as
-    /// long as the interface lives — or completes immediately when the
-    /// processor owns no pair.
+    /// Runs the packet pump of `processor` for as long as the task is
+    /// not cancelled: it drains whichever pair the processor owns and
+    /// parks while it owns none.
     fn run_packet_pump(
         &self,
         processor: helios_hal::cpu::ProcessorId,
     ) -> impl Future<Output = ()> + Send + '_;
+
+    /// Hands the pair `departing` owns to an online processor, steering
+    /// its interrupt and the device's live pair count, before
+    /// `departing` leaves `online`.
+    fn hand_off_queue_pair(
+        &self,
+        departing: helios_hal::cpu::ProcessorId,
+        online: &crate::exec::OnlineSet,
+    );
+
+    /// Gives `arriving` a pair when the device has one that is not
+    /// live, after `arriving` restarted or refused to go offline.
+    fn take_up_queue_pair(&self, arriving: helios_hal::cpu::ProcessorId);
 }
 
 /// A network handle's stable numeric name.
@@ -702,6 +883,9 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
 
     fn hardware_address(&self) -> [u8; 6];
 
+    /// Whether the stack currently owns `address` as a configured local address.
+    fn owns_ip_address(&self, address: NetworkIpAddress) -> bool;
+
     /// Asks the DHCP server whether the lease the interface holds is
     /// still good, after a machine restore may have moved the machine to
     /// another network. An interface that is not DHCP-configured does
@@ -724,6 +908,18 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         host: &'a str,
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Vec<NetworkIpAddress>, DnsError>> + Send + 'a;
+
+    fn dns_resolve_https<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<Option<HttpsRecord>, DnsError>> + Send + 'a;
+
+    /// Returns the DNS resolver addresses currently configured on this link,
+    /// in the same preference order `dns_resolve` uses (DHCP IPv4 first, else
+    /// IPv6 RDNSS).
+    fn dns_servers(&self) -> Vec<NetworkIpAddress>;
 
     fn tcp_connect<'a>(
         &'a self,
@@ -754,6 +950,30 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         hop_limit: u8,
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_;
+
+    /// Begins a TCP connection attempt without waiting for the three-way
+    /// handshake to complete. Drives the stack once so the initial SYN is
+    /// queued immediately and returns whether the connection is already
+    /// established or still pending.
+    fn tcp_connect_start(
+        &self,
+        remote_address: NetworkIpAddress,
+        port: u16,
+        local_port: u16,
+        hop_limit: u8,
+    ) -> impl Future<Output = Result<(Self::TcpStream, TcpConnectPoll), TcpError>> + Send + '_;
+
+    /// Drives the stack and inspects a pending TCP connection attempt.
+    fn tcp_connect_poll(
+        &self,
+        stream: Self::TcpStream,
+    ) -> impl Future<Output = Result<TcpConnectPoll, TcpError>> + Send + '_;
+
+    /// Returns the local IP address and port bound to `stream`, if any.
+    fn tcp_local_endpoint(
+        &self,
+        stream: Self::TcpStream,
+    ) -> Result<Option<(NetworkIpAddress, u16)>, TcpError>;
 
     /// Listens with an explicit hop limit, inherited by accepted connections
     /// so their SYN-ACK carries it too.
@@ -797,6 +1017,24 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         async move { self.tcp_write_all(stream, &bytes, timeout_nanos).await }
     }
 
+    /// Writes up to `bytes.len()` bytes to `stream`, returning a partial count
+    /// if some bytes were queued before the send window filled or `timeout_nanos`
+    /// expired. Fails with `TcpErrorKind::Timeout` only when zero bytes could be
+    /// queued before the deadline.
+    fn tcp_write_some_bytes<'a>(
+        &'a self,
+        stream: Self::TcpStream,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<usize, TcpError>> + Send + 'a {
+        async move {
+            let len = bytes.len();
+            self.tcp_write_all_bytes(stream, bytes, timeout_nanos)
+                .await?;
+            Ok(len)
+        }
+    }
+
     fn tcp_read<'a>(
         &'a self,
         stream: Self::TcpStream,
@@ -804,90 +1042,30 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Option<Bytes>, TcpError>> + Send + 'a;
 
-    /// Drains up to `max_bytes` of what `stream`'s receive queue already
-    /// holds, without parking and without driving the device.
+    /// Waits up to `timeout_nanos` for `stream` to have received bytes
+    /// and copies them out of its receive queue straight into `buffer`.
     ///
-    /// This is the non-blocking `read` of a socket-backed byte stream: it
-    /// runs on the guest task's own poll, so the only bytes it may report
-    /// are the ones already delivered to the shard — anything still in
-    /// the device's rings belongs to the readiness wait that follows a
-    /// `Pending` answer. A drain that relieves receive backpressure
-    /// raises the shard's arrival signal itself.
-    fn tcp_try_read(
-        &self,
-        stream: Self::TcpStream,
-        max_bytes: usize,
-    ) -> Result<TcpReadProgress, TcpError>;
-
-    /// What `stream`'s send side does with a write right now — the
-    /// permit a stream reports.
-    ///
-    /// `Room` is the byte count a `write` may queue without parking,
-    /// `Pending` is a full send queue on a live connection, and `Closed`
-    /// is a connection that cannot send again — so a caller parking on
-    /// the answer does not sleep through a shutdown.
-    fn tcp_send_room(&self, stream: Self::TcpStream) -> Result<TcpWriteProgress, TcpError>;
-
-    /// Queues up to `bytes.len()` on `stream`'s send path and publishes
-    /// it synchronously: the stack's segment production, the egress drain
-    /// onto the rings and the doorbell all run on the caller's own poll.
-    /// `Room` is the count `bytes` gave up; whatever did not fit stays
-    /// in `bytes` for the caller to park or complete later. `Pending`
-    /// and `Closed` are a queue that took nothing, classified under the
-    /// same lock that ran the write: a full send queue on a live
-    /// connection, or a send side that cannot send again — so the one
-    /// call answers what a separate probe would take a second lock to
-    /// say.
-    ///
-    /// Synchronous because a guest stream's `write` may not block:
-    /// everything it touches — the shard lock, the ring's `try_lock`
-    /// submit — is held for the call and released before it returns.
-    fn tcp_try_write(
-        &self,
-        stream: Self::TcpStream,
-        bytes: &mut Bytes,
-    ) -> Result<TcpWriteProgress, TcpError>;
-
-    /// Resolves when `stream`'s send queue has room, when the send side
-    /// can no longer send, or when the stream is gone — a socket-backed
-    /// output stream's readiness wait.
-    ///
-    /// A dead send side resolves the wait rather than failing it: the
-    /// pollable contract is that a closed stream is ready, and the
-    /// accessor that follows reports the state. The implementation
-    /// samples the owning shard's arrival mark and the queue pair's
-    /// event mark before it probes the send queue, so an ACK — or a
-    /// reset — another processor drains between the probe and the park
-    /// resolves the wait rather than being slept through.
-    fn tcp_write_ready(
-        &self,
-        stream: Self::TcpStream,
-    ) -> impl Future<Output = Result<(), TcpError>> + Send + '_;
-
+    /// The copy runs on the caller's own poll, a page of the buffer at a
+    /// time, each page checked present just before it is written (see
+    /// [`RegisteredTcpReadBuffer`]). A page that is out is faulted in and
+    /// the copy carried on within the same deadline; bytes that could not
+    /// be handed over stay queued.
     fn tcp_read_into<'a>(
         &'a self,
         stream: Self::TcpStream,
-        buffer: RegisteredTcpReadBuffer<'a>,
+        buffer: &'a mut RegisteredTcpReadBuffer<'_>,
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<Option<usize>, TcpError>> + Send + 'a {
-        async move {
-            let capacity = u32::try_from(buffer.capacity()).unwrap_or(u32::MAX);
-            match self.tcp_read(stream, capacity, timeout_nanos).await? {
-                Some(bytes) => {
-                    let mut buffer = buffer;
-                    let written =
-                        helios_netstack::TcpReceiveBuffer::write_from(&mut buffer, bytes.as_ref());
-                    assert_eq!(
-                        written,
-                        bytes.len(),
-                        "registered TCP receive buffer truncated a read"
-                    );
-                    Ok(Some(written))
-                }
-                None => Ok(None),
-            }
-        }
-    }
+    ) -> impl Future<Output = Result<TcpReadInto, TcpError>> + Send + 'a;
+
+    /// Waits up to `timeout_nanos` for `stream` to have received bytes
+    /// and copies them into `buffer` without consuming them from the
+    /// stream's receive queue.
+    fn tcp_peek_into<'a>(
+        &'a self,
+        stream: Self::TcpStream,
+        buffer: &'a mut RegisteredTcpReadBuffer<'_>,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<TcpReadInto, TcpError>> + Send + 'a;
 
     fn tcp_shutdown_send(
         &self,
@@ -914,6 +1092,7 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
 
     fn udp_bind(
         &self,
+        local_address: NetworkIpAddress,
         local_port: u16,
     ) -> impl Future<Output = Result<UdpBinding<Self::UdpSocket>, UdpError>> + Send + '_;
 
@@ -954,6 +1133,15 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Option<UdpDatagram>, UdpError>> + Send + 'a;
 
+    /// Waits up to `timeout_nanos` for a datagram on `socket` and returns a
+    /// copy without removing it from the receive queue.
+    fn udp_peek<'a>(
+        &'a self,
+        socket: Self::UdpSocket,
+        max_bytes: u32,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<Option<UdpDatagram>, UdpError>> + Send + 'a;
+
     fn udp_join_multicast_v4(
         &self,
         group: Ipv4Address,
@@ -972,6 +1160,74 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
     /// A datagram socket owes its peers no shutdown sequence, so unlike
     /// the TCP closes this queues nothing and publishes nothing.
     fn udp_close(&self, socket: Self::UdpSocket);
+
+    /// Opens an `AF_PACKET` tap receiving frames matching `protocol` (host byte
+    /// order; `0x0003` / `ETH_P_ALL` matches every EtherType).
+    fn packet_open(&self, protocol: u16) -> Result<u64, UdpError> {
+        let _ = protocol;
+        Err(UdpError {
+            kind: UdpErrorKind::Unsupported,
+            detail: NetworkErrorDetail::UnsupportedAddressFamily,
+        })
+    }
+
+    /// Rebinds an open `AF_PACKET` tap to `protocol` (host byte order) and
+    /// `ifindex` (`0` = any interface, `1` = `lo`, `2` = `eth0`).
+    fn packet_bind(&self, socket: u64, protocol: u16, ifindex: u32) -> Result<(), UdpError> {
+        let _ = (socket, protocol, ifindex);
+        Err(UdpError {
+            kind: UdpErrorKind::Unsupported,
+            detail: NetworkErrorDetail::UnsupportedAddressFamily,
+        })
+    }
+
+    /// Transmits a raw Ethernet frame on `ifindex` (`0` or `2` = `eth0`, `1` = `lo`).
+    fn packet_send<'a>(
+        &'a self,
+        socket: u64,
+        ifindex: u32,
+        frame: &'a [u8],
+    ) -> impl Future<Output = Result<usize, UdpError>> + Send + 'a {
+        let _ = (socket, ifindex, frame);
+        async {
+            Err(UdpError {
+                kind: UdpErrorKind::Unsupported,
+                detail: NetworkErrorDetail::UnsupportedAddressFamily,
+            })
+        }
+    }
+
+    /// Waits up to `timeout_nanos` for one raw Ethernet frame on `socket`.
+    fn packet_receive<'a>(
+        &'a self,
+        socket: u64,
+        max_bytes: u32,
+        timeout_nanos: u64,
+        peek: bool,
+    ) -> impl Future<Output = Result<Option<PacketFrame>, UdpError>> + Send + 'a {
+        let _ = (socket, max_bytes, timeout_nanos, peek);
+        async {
+            Err(UdpError {
+                kind: UdpErrorKind::Unsupported,
+                detail: NetworkErrorDetail::UnsupportedAddressFamily,
+            })
+        }
+    }
+
+    /// Non-destructive readiness of an `AF_PACKET` tap, driving the device RX
+    /// ring before probing so `epoll_wait`/`poll` observe freshly arrived frames.
+    fn packet_readiness(
+        &self,
+        socket: u64,
+    ) -> impl Future<Output = Result<SocketReadiness, UdpError>> + Send + '_ {
+        let _ = socket;
+        async { Ok(SocketReadiness::default()) }
+    }
+
+    /// Retires an `AF_PACKET` tap. Synchronous because `Drop` calls it.
+    fn packet_close(&self, socket: u64) {
+        let _ = socket;
+    }
 }
 
 pub trait ComponentNetworkState<Service>: Clone + Send + 'static
@@ -984,7 +1240,10 @@ where
 #[derive(Clone, Debug)]
 pub struct HostDirEntry {
     pub name: String,
-    pub is_directory: bool,
+    /// What the host's listing says the entry is, or `None` when it does
+    /// not say (`DT_UNKNOWN` with a qid type that decides nothing): the
+    /// caller then asks for the entry's attributes.
+    pub kind: Option<NodeKind>,
 }
 
 /// How much of one directory the caller of [`HostFileSystem::read_dir`] is
@@ -1072,6 +1331,12 @@ pub struct HostMetadata {
     pub qid_path: u64,
     pub qid_type: u8,
     pub mode: u32,
+    /// The owner and group the host reports (`Rgetattr.uid`, `.gid`).
+    pub uid: u32,
+    pub gid: u32,
+    /// The device number a character or block device node names
+    /// (`Rgetattr.rdev`); zero for every other kind.
+    pub rdev: u64,
     pub size: u64,
     /// Hard-link count reported by the host (`Rgetattr.nlink`).
     pub link_count: u64,
@@ -1081,6 +1346,58 @@ pub struct HostMetadata {
     pub modified_nanos: u64,
     /// Last status change time in nanoseconds since the Unix epoch.
     pub status_nanos: u64,
+}
+
+/// What a node created on the host share is made with: its permission bits
+/// and its group, the two a 9P2000.L creation carries (`Tlcreate` and
+/// `Tmkdir` take a mode and a gid, `Tsymlink` a gid). The owner is the
+/// server's to assign from the identity the session attached as, as it is
+/// for Linux's own 9p client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostCreation {
+    /// The permission, set-id and sticky bits (`07777`).
+    pub permissions: u32,
+    pub gid: u32,
+}
+
+impl HostMetadata {
+    /// The object's kind, from the file type bits of `mode` (`S_IFMT`).
+    /// The qid type cannot say: it names no device, FIFO or socket.
+    pub fn kind(&self) -> Result<NodeKind, HostFsError> {
+        node_kind_from_mode(self.mode)
+    }
+
+    /// Refuses, before anything is opened, the objects the host's open
+    /// must not reach: the kinds [`NodeKind::open_refusal`] names, and a
+    /// symbolic link, which the kernel resolves by `read_link` and a host
+    /// that followed it on open could point at any of them.
+    pub fn require_openable(&self) -> Result<(), HostFsError> {
+        let kind = self.kind()?;
+        let refusal = match kind {
+            NodeKind::Symlink => Some(FsError::Loop),
+            kind => kind.open_refusal(),
+        };
+        match refusal {
+            None => Ok(()),
+            Some(refusal) => Err(HostFsError::Refused { kind, refusal }),
+        }
+    }
+}
+
+/// The kind a POSIX `st_mode` names. A value whose file type bits are none
+/// of the seven is a host that broke the protocol.
+fn node_kind_from_mode(mode: u32) -> Result<NodeKind, HostFsError> {
+    // `S_IFMT` and its values, from `<sys/stat.h>` and the Linux `stat(7)`.
+    match mode & 0o170_000 {
+        0o140_000 => Ok(NodeKind::Socket),
+        0o120_000 => Ok(NodeKind::Symlink),
+        0o100_000 => Ok(NodeKind::File),
+        0o060_000 => Ok(NodeKind::BlockDevice),
+        0o040_000 => Ok(NodeKind::Directory),
+        0o020_000 => Ok(NodeKind::CharacterDevice),
+        0o010_000 => Ok(NodeKind::Fifo),
+        _ => Err(HostFsError::Protocol("getattr mode has no file type")),
+    }
 }
 
 #[derive(Clone, Debug, Error)]
@@ -1106,6 +1423,10 @@ pub enum HostFsError {
         max_entries: usize,
         max_name_bytes: usize,
     },
+    /// The object is a kind the kernel never opens, so nothing was
+    /// sent to the host to open it.
+    #[error("host share object is a {kind:?}, which the kernel never opens")]
+    Refused { kind: NodeKind, refusal: FsError },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1118,7 +1439,10 @@ pub enum HostFsErrorKind {
     ReadOnly,
     Unsupported,
     NameTooLong,
+    NoSpace,
     Io,
+    /// A kind the kernel never opens, with the error that refuses it.
+    Refused(FsError),
 }
 
 impl HostFsError {
@@ -1133,6 +1457,7 @@ impl HostFsError {
             | HostFsError::Transport(IoError::ReadOnly) => HostFsErrorKind::ReadOnly,
             HostFsError::Transport(IoError::Unsupported) => HostFsErrorKind::Unsupported,
             HostFsError::NameTooLong { .. } => HostFsErrorKind::NameTooLong,
+            HostFsError::Refused { refusal, .. } => HostFsErrorKind::Refused(*refusal),
             HostFsError::Transport(IoError::InvalidBufferLength { .. })
             | HostFsError::Transport(IoError::InvalidDeviceConfig(_))
             | HostFsError::Transport(IoError::OutOfBounds)
@@ -1146,14 +1471,16 @@ impl HostFsError {
                 20 => HostFsErrorKind::NotDirectory,
                 21 => HostFsErrorKind::IsDirectory,
                 39 => HostFsErrorKind::NotEmpty,
+                // `ENOSPC`; a 9p2000.L `Rlerror` carries the host's Linux errno.
+                28 => HostFsErrorKind::NoSpace,
                 _ => HostFsErrorKind::Io,
             },
         }
     }
 }
 
-/// What a machine restore did to the host share, as far as the kernel
-/// can tell from the restore's cause.
+/// What a machine restore or a device reset did to the host share, as far
+/// as the kernel can tell from its cause.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostShareRestore {
     /// The host's 9p server is the one the session was attached to and
@@ -1163,17 +1490,92 @@ pub enum HostShareRestore {
     ServerKept,
     /// The server no longer knows the session or any fid in it, because
     /// the kernel came back from an image taken before the server saw
-    /// them. The session is dropped without a `Tclunk`, and the next
-    /// operation attaches again.
+    /// them, or because the virtio 9p device itself was reset
+    /// ([`crate::ResetDevice::HostShare`]). The session is dropped
+    /// without a `Tclunk`, and the next operation attaches again.
     SessionLost,
 }
 
+/// A host-share write [`HostFileSystem::prepare_write`] staged.
+///
+/// A write lands in rounds: each round's destinations are staged before
+/// its bytes, filled synchronously, and then sent. An implementation
+/// bounds a round by the destinations it can hold at once (the 9p
+/// client's request pool), never by the write's length; the rounds'
+/// lengths sum to the prepared length and land in order at consecutive
+/// offsets.
+///
+/// Dropping a staged or filled write before its submit returns what it
+/// holds (its destinations, its open file) and leaves the file as it
+/// was: the rounds already submitted have landed, this one has not.
+/// Dropping a submit's future part way may leave part of its round
+/// written.
+///
+/// Concurrency: a staged write is owned by the task that prepared it and
+/// moved, never shared; for its whole life it counts as an operation in
+/// flight on the share, so a snapshot hold waits for it.
+pub trait HostWrite: Send + Sized {
+    /// The round once its bytes are in.
+    type Filled: HostFilledWrite<Next = Self>;
+
+    /// The bytes this round stages.
+    fn staged_len(&self) -> usize;
+
+    /// Writes this round's bytes into its destinations. `fill` is called
+    /// once per destination region, in write order, with the region's
+    /// offset from the start of the whole write; the regions cover
+    /// [`Self::staged_len`] bytes exactly.
+    fn fill<F>(self, fill: F) -> Self::Filled
+    where
+        F: FnMut(usize, &mut [u8]);
+}
+
+/// A round of a [`HostWrite`] whose bytes are in, ready to send.
+pub trait HostFilledWrite: Send + Sized {
+    /// The staged write the next round continues as.
+    type Next;
+
+    /// Sends the round in order, checking that the host took every byte
+    /// of it, and resolves with the next round staged or, after the last,
+    /// the offset the whole write began at.
+    fn submit(self) -> impl Future<Output = Result<WriteProgress<Self::Next>, HostFsError>> + Send;
+}
+
+/// The write of a host filesystem that refuses every write before it is
+/// staged.
+impl HostWrite for core::convert::Infallible {
+    type Filled = Self;
+
+    fn staged_len(&self) -> usize {
+        match *self {}
+    }
+
+    fn fill<F>(self, _: F) -> Self
+    where
+        F: FnMut(usize, &mut [u8]),
+    {
+        match self {}
+    }
+}
+
+impl HostFilledWrite for core::convert::Infallible {
+    type Next = Self;
+
+    async fn submit(self) -> Result<WriteProgress<Self>, HostFsError> {
+        match self {}
+    }
+}
+
 pub trait HostFileSystem: Clone + Send + Sync + 'static {
+    /// The write [`Self::prepare_write`] stages.
+    type Write: HostWrite + 'static;
+
     /// How this filesystem's caches have been serving the kernel, or
     /// `None` from an implementation that caches nothing.
     fn cache_stats(&self) -> Option<crate::HostFsCacheStats>;
 
-    /// Brings the filesystem's own state in line with a machine restore:
+    /// Brings the filesystem's own state in line with a machine restore
+    /// or a reset of its device:
     /// an implementation with a session and caches drops what `restore`
     /// says is stale, and one with neither does nothing. Called by the
     /// machine-generation reactions task, never concurrently with
@@ -1222,20 +1624,17 @@ pub trait HostFileSystem: Clone + Send + Sync + 'static {
         offset: u64,
         max_bytes: u32,
     ) -> impl Future<Output = Result<Vec<u8>, HostFsError>> + Send + 'a;
-    fn write_file<'a>(
+    /// Stages a write of `len` bytes to `path` at `position`: opens the
+    /// file, resolves where the bytes land (an append reads the host's
+    /// current end of file, so concurrent growth is not overwritten) and
+    /// readies the destinations the first round of bytes goes into.
+    /// Nothing reaches the file until [`HostFilledWrite::submit`].
+    fn prepare_write<'a>(
         &'a self,
         path: &'a str,
-        offset: u64,
-        bytes: &'a [u8],
-    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
-    /// Appends to the end of `path`, resolving the current end of file on the
-    /// host so concurrent growth is not overwritten. Resolves with the offset
-    /// the bytes were written at.
-    fn append_file<'a>(
-        &'a self,
-        path: &'a str,
-        bytes: &'a [u8],
-    ) -> impl Future<Output = Result<u64, HostFsError>> + Send + 'a;
+        position: WritePosition,
+        len: usize,
+    ) -> impl Future<Output = Result<Self::Write, HostFsError>> + Send + 'a;
     /// Flushes host-side buffers for `path` (9p `Tfsync`).
     fn sync_file<'a>(
         &'a self,
@@ -1256,13 +1655,17 @@ pub trait HostFileSystem: Clone + Send + Sync + 'static {
         access_nanos: Option<u64>,
         modified_nanos: Option<u64>,
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
+    /// Creates the regular file `path`, made as `creation` says.
     fn create_file<'a>(
         &'a self,
         path: &'a str,
+        creation: HostCreation,
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
+    /// Creates the directory `path`, made as `creation` says.
     fn create_directory<'a>(
         &'a self,
         path: &'a str,
+        creation: HostCreation,
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
     fn remove<'a>(
         &'a self,
@@ -1279,10 +1682,13 @@ pub trait HostFileSystem: Clone + Send + Sync + 'static {
         source: &'a str,
         destination: &'a str,
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
+    /// Creates the symbolic link `link_path` to `target`, in group `gid`;
+    /// a link's mode is always `0777`.
     fn symlink<'a>(
         &'a self,
         target: &'a str,
         link_path: &'a str,
+        gid: u32,
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
     fn read_link<'a>(
         &'a self,

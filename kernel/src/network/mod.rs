@@ -3,14 +3,12 @@
 //! `service` hosts the `NetworkService` that wraps `helios-netstack`
 //! for component-host TCP/UDP/DNS access. `control` exposes the
 //! capability-checked admin API used by privileged components.
-//! `socket_stack` provides per-task socket lifecycle bookkeeping.
 //! `http` holds the transport-neutral HTTP value types that cross the
 //! boundary between a program and the `http-client` kernel plugin.
 
 mod control;
 mod http;
 mod service;
-mod socket_stack;
 
 pub use control::{
     Ipv4Cidr, Ipv4Route, MacAddress, NetworkAdminBackend, NetworkBridgeRequest,
@@ -27,7 +25,6 @@ pub use http::{
 pub use service::{
     NetworkQueueStats, NetworkService, NetworkStats, TcpListenerId, TcpStreamId, UdpSocketId,
 };
-pub use socket_stack::SocketStack;
 
 /// The established-connection fixture the retirement tests in
 /// `wasmtime_adapter` need. Its wiring is private to `network::service`
@@ -49,10 +46,11 @@ pub(crate) use service::fixture::EstablishedTcpFixture;
 /// loop, which awaits the install this publishes
 /// ([`crate::RuntimeState::wait_for_network_service`]).
 #[cfg(feature = "wasmtime-runtime")]
-impl<CpuImpl, WatchdogImpl> crate::Kernel<CpuImpl, WatchdogImpl>
+impl<CpuImpl, WatchdogImpl, MeasuredBootImpl> crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     /// Installs the network service over `device`.
     ///
@@ -69,21 +67,22 @@ where
     /// Publishing the service is what releases them: each pump is
     /// pinned to the processor that owns its pair and was already
     /// parked on this install completing.
-    pub fn install_network_interface<ProgramService, HostFsService, DeviceImpl>(
+    pub fn install_network_interface<ProgramService, StorageImpl, DeviceImpl>(
         &self,
         runtime_state: &crate::RuntimeState<
             ProgramService,
             NetworkService<CpuImpl, DeviceImpl>,
-            HostFsService,
+            StorageImpl,
         >,
         device: DeviceImpl,
     ) where
         ProgramService: Clone + Send + Sync + 'static,
-        HostFsService: Clone + Send + Sync + 'static,
+        StorageImpl: crate::Storage,
         DeviceImpl: crate::NetworkDevice,
     {
         let service = NetworkService::new(
             self.cpu.clone(),
+            crate::memory::user_memory_pool(),
             runtime_state.profiles(),
             runtime_state.uptime_clock(),
             self.timer(),

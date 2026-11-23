@@ -1,63 +1,6 @@
+use alloc::string::String;
+
 use super::*;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum DhcpClientState {
-    Init {
-        transaction_id: u32,
-    },
-    Selecting {
-        transaction_id: u32,
-        last_sent: StackInstant,
-    },
-    Requesting {
-        transaction_id: u32,
-        requested_ip: Ipv4Address,
-        server_identifier: Ipv4Address,
-        last_sent: StackInstant,
-    },
-    /// INIT-REBOOT (RFC 2131 section 3.2): the interface holds an
-    /// address from before a machine restore and has asked any server
-    /// on the link to confirm it.
-    Rebooting {
-        transaction_id: u32,
-        requested_ip: Ipv4Address,
-        /// REQUESTs sent so far, the first included.
-        attempts: u32,
-        last_sent: StackInstant,
-    },
-    Bound,
-}
-
-impl DhcpClientState {
-    /// Whether `message` is a reply to the request this client has
-    /// outstanding.
-    ///
-    /// RFC 2131 §4.3.2 and §4.4.1 (table 4) make DHCPACK and DHCPNAK
-    /// meaningful only in REQUESTING, RENEWING, REBINDING and REBOOTING,
-    /// and require a client to discard a message whose `xid` is not its
-    /// own; §3.1 has the selected server alone answer the REQUEST, and a
-    /// server's NAK carries its server identifier (§4.3.2, table 3).
-    /// This client has no RENEWING or REBINDING state (a lease is never
-    /// renewed). `Requesting` accepts a reply from the server it
-    /// selected. `Rebooting` selected none: its INIT-REBOOT REQUEST
-    /// carries no server identifier and any server on the link may
-    /// confirm or refuse the address (§3.2, §4.3.2), so the `xid` alone
-    /// decides. `Bound` never accepts one.
-    pub(super) fn accepts_reply(&self, message: &DhcpServerMessage) -> bool {
-        match *self {
-            Self::Requesting {
-                transaction_id,
-                server_identifier,
-                ..
-            } => {
-                message.transaction_id == transaction_id
-                    && message.server_identifier == Some(server_identifier)
-            }
-            Self::Rebooting { transaction_id, .. } => message.transaction_id == transaction_id,
-            Self::Init { .. } | Self::Selecting { .. } | Self::Bound => false,
-        }
-    }
-}
 
 impl<CpuImpl, DeviceImpl> NetworkService<CpuImpl, DeviceImpl>
 where
@@ -70,6 +13,149 @@ where
         timeout_nanos: u64,
     ) -> Result<Vec<NetworkIpAddress>, DnsError> {
         self.execute_dns_resolve(host, timeout_nanos).await
+    }
+
+    pub async fn dns_resolve_https(
+        &self,
+        host: &str,
+        port: u16,
+        timeout_nanos: u64,
+    ) -> Result<Option<HttpsRecord>, DnsError> {
+        self.execute_dns_resolve_https(host, port, timeout_nanos)
+            .await
+    }
+
+    /// Queries RFC 9460 Type 65 (`HTTPS`) records for `host:port`.
+    ///
+    /// IP literals have no `HTTPS` record (`Ok(None)`), and `NODATA`,
+    /// `NXDOMAIN`, and `AliasMode` `.` also answer `Ok(None)`. An `AliasMode`
+    /// target whose own `HTTPS` RRSet was not included in the packet is
+    /// re-queried on the same connected resolver socket within the remaining
+    /// [`DNS_MAX_CNAME_CHAIN`] hop budget.
+    pub(super) async fn execute_dns_resolve_https(
+        &self,
+        host: &str,
+        port: u16,
+        timeout_nanos: u64,
+    ) -> Result<Option<HttpsRecord>, DnsError> {
+        if is_ip_literal(host) {
+            return Ok(None);
+        }
+        let qname = DnsWireName::https_qname(host, port).ok_or(DnsError {
+            kind: DnsErrorKind::UnresolvedHost,
+            detail: NetworkErrorDetail::DnsQueryStartFailed,
+        })?;
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        self.wait_for_dns_transport(deadline_nanos).await?;
+        let resolver = self.resolver_endpoint()?;
+        let socket = self.open_resolver_socket(resolver)?;
+        let result = self
+            .resolve_https_through(&socket, qname, deadline_nanos)
+            .await;
+        self.close_resolver_socket(&socket);
+        result
+    }
+
+    async fn resolve_https_through(
+        &self,
+        socket: &ResolverSocket,
+        mut qname: DnsWireName,
+        deadline_nanos: u64,
+    ) -> Result<Option<HttpsRecord>, DnsError> {
+        let mut hops_remaining = DNS_MAX_CNAME_CHAIN;
+        let mut min_ttl_seconds: Option<u32> = None;
+        let mut visited: Vec<DnsWireName> = vec![qname];
+        let mut next_alias = qname;
+
+        loop {
+            let query_id = self
+                .inner
+                .state
+                .shard_at(socket.shard_idx)
+                .lock()
+                .draw_dns_query_id();
+            let mut query_sent = false;
+            let step = loop {
+                let wait = self.shard_wait(socket.shard_idx);
+                self.drive_dns().await?;
+                let now = StackInstant::from_nanos(self.now_nanos());
+                let polled = {
+                    let mut shard = self.inner.state.shard_at(socket.shard_idx).lock();
+                    let ready = if query_sent {
+                        shard.poll_dns_https_response(
+                            socket,
+                            query_id,
+                            &qname,
+                            hops_remaining,
+                            &mut next_alias,
+                        )?
+                    } else {
+                        None
+                    };
+                    if ready.is_some() {
+                        ready
+                    } else {
+                        query_sent = true;
+                        shard.send_dns_wire_query(
+                            socket,
+                            query_id,
+                            &qname,
+                            DnsRecordType::Https,
+                            now,
+                        )?;
+                        shard.poll_dns_https_response(
+                            socket,
+                            query_id,
+                            &qname,
+                            hops_remaining,
+                            &mut next_alias,
+                        )?
+                    }
+                };
+                if let Some(polled) = polled {
+                    break polled;
+                }
+                if self.now_nanos() >= deadline_nanos {
+                    return Err(DnsError {
+                        kind: DnsErrorKind::Timeout,
+                        detail: NetworkErrorDetail::DnsLookupTimeout,
+                    });
+                }
+                self.drive_dns().await?;
+                self.wait_for_shard_progress(
+                    wait,
+                    self.retransmit_wait(deadline_nanos, NETWORK_RETRANSMIT_WAIT),
+                )
+                .await;
+            };
+
+            match step {
+                PolledHttpsResponse::Service(mut record) => {
+                    if let Some(chain_ttl) = min_ttl_seconds {
+                        record.ttl_nanos =
+                            record.ttl_nanos.min(u64::from(chain_ttl) * 1_000_000_000);
+                    }
+                    return Ok(Some(record));
+                }
+                PolledHttpsResponse::NoRecord => return Ok(None),
+                PolledHttpsResponse::ServerFailure => {
+                    return Err(DnsError {
+                        kind: DnsErrorKind::Unavailable,
+                        detail: NetworkErrorDetail::DnsLookupFailed,
+                    });
+                }
+                PolledHttpsResponse::Alias { ttl_seconds, hops } => {
+                    if hops > hops_remaining || visited.contains(&next_alias) {
+                        return Ok(None);
+                    }
+                    hops_remaining -= hops;
+                    min_ttl_seconds =
+                        Some(min_ttl_seconds.map_or(ttl_seconds, |min| min.min(ttl_seconds)));
+                    visited.push(next_alias);
+                    qname = next_alias;
+                }
+            }
+        }
     }
 
     /// Resolves `host` to every address the resolver knows, in both
@@ -160,6 +246,28 @@ where
             )
             .await;
         }
+    }
+
+    /// Returns the DNS resolver addresses currently known on this link in the
+    /// same order [`resolver_endpoint`](Self::resolver_endpoint) selects them:
+    /// DHCP IPv4 resolvers when present, otherwise IPv6 RDNSS resolvers.
+    pub fn dns_servers(&self) -> Vec<NetworkIpAddress> {
+        self.inner.state.with(|state| {
+            if !state.dns_servers.is_empty() {
+                state
+                    .dns_servers
+                    .iter()
+                    .copied()
+                    .map(|addr| NetworkIpAddress::Ipv4(map_ipv4_address(addr)))
+                    .collect()
+            } else {
+                state
+                    .stack
+                    .ipv6_dns_servers()
+                    .map(NetworkIpAddress::Ipv6)
+                    .collect()
+            }
+        })
     }
 
     /// The resolver this link can actually reach.
@@ -318,25 +426,22 @@ where
     /// message. Live TCP is left alone: a connection keeps working if
     /// the lease is confirmed. Resolves once the REQUEST has
     /// been handed to the device; the packet pumps carry the exchange
-    /// on from there.
+    /// on from there, retransmitting it on the client's own deadline.
     pub(super) async fn revalidate_lease(&self) {
         let now_nanos = self.now_nanos();
         let transaction_id = next_transaction_id(now_nanos as u32);
-        let sent = self
-            .inner
-            .state
-            .shard_for_default()
-            .lock()
-            .begin_lease_revalidation(transaction_id, StackInstant::from_nanos(now_nanos));
-        match sent {
-            Ok(true) => {
-                tracing::info!("machine restored: re-validating the DHCP lease");
-                if let Err(error) = self.drive_network(NetworkPollSource::Configuration).await {
-                    tracing::warn!(?error, "the lease re-validation could not be sent");
-                }
-            }
-            Ok(false) => {}
-            Err(error) => tracing::warn!(?error, "the lease re-validation could not be built"),
+        let begun = self.inner.state.with_mut(|state| {
+            state.begin_lease_revalidation(transaction_id, StackInstant::from_nanos(now_nanos))
+        });
+        if !begun {
+            return;
+        }
+        tracing::info!("machine restored: re-validating the DHCP lease");
+        // The configuration duty runs the client, which queues the
+        // REQUEST that is due, and submitting it puts it on the device.
+        self.drive_interface_configuration();
+        if let Err(error) = self.drive_network(NetworkPollSource::Configuration).await {
+            tracing::warn!(?error, "the lease re-validation could not be sent");
         }
     }
 
@@ -355,29 +460,29 @@ where
                 .await
                 .map_err(|_| NetworkControlError::BackendFault)?;
             let now = StackInstant::from_nanos(self.now_nanos());
-            let next = self.inner.state.with_mut(|state| {
-                state.drive_dhcp(now)?;
-                if state.is_configured() {
+            let (next, drive) = self.inner.state.with_mut(|state| {
+                let drive = state.drive_dhcp(now);
+                if drive.lease_changed || state.is_configured() {
                     self.inner.control.publish_from_shard(state);
                 }
-                Ok(state.stack.primary_ipv4_address().map(map_ipv4_cidr))
-            })?;
-            if let Some(cidr) = next {
+                (state.stack.primary_ipv4_address().map(map_ipv4_cidr), drive)
+            });
+            if drive.lease_changed || next.is_some() {
                 self.synchronize_control_plane();
+            }
+            drive.result?;
+            if let Some(cidr) = next {
                 return Ok(cidr);
             }
             self.drive_network(NetworkPollSource::Configuration)
                 .await
                 .map_err(|_| NetworkControlError::BackendFault)?;
             // This walk has no caller deadline of its own; a dropped
-            // DISCOVER is retried at the client's retransmission
-            // interval, and an offer that lands sooner wakes it through
+            // DISCOVER is retried when the client's next deadline
+            // passes, and an offer that lands sooner wakes it through
             // the shard.
-            self.wait_for_shard_progress(
-                wait,
-                self.progress_wait(Duration::from_nanos(DHCP_RETRANSMIT_NANOS)),
-            )
-            .await;
+            self.wait_for_shard_progress(wait, self.progress_wait(self.configuration_wait()))
+                .await;
         }
     }
 }
@@ -393,6 +498,10 @@ where
 
     fn hardware_address(&self) -> [u8; 6] {
         NetworkService::hardware_address(self)
+    }
+
+    fn owns_ip_address(&self, address: NetworkIpAddress) -> bool {
+        NetworkService::owns_ip_address(self, address)
     }
 
     async fn revalidate_lease(&self) {
@@ -413,6 +522,19 @@ where
         timeout_nanos: u64,
     ) -> Result<Vec<NetworkIpAddress>, DnsError> {
         NetworkService::dns_resolve(self, host, timeout_nanos).await
+    }
+
+    async fn dns_resolve_https<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+        timeout_nanos: u64,
+    ) -> Result<Option<HttpsRecord>, DnsError> {
+        NetworkService::dns_resolve_https(self, host, port, timeout_nanos).await
+    }
+
+    fn dns_servers(&self) -> Vec<NetworkIpAddress> {
+        NetworkService::dns_servers(self)
     }
 
     async fn tcp_connect<'a>(
@@ -453,6 +575,27 @@ where
             timeout_nanos,
         )
         .await
+    }
+
+    async fn tcp_connect_start(
+        &self,
+        remote_address: NetworkIpAddress,
+        port: u16,
+        local_port: u16,
+        hop_limit: u8,
+    ) -> Result<(Self::TcpStream, TcpConnectPoll), TcpError> {
+        NetworkService::tcp_connect_start(self, remote_address, port, local_port, hop_limit).await
+    }
+
+    async fn tcp_connect_poll(&self, stream: Self::TcpStream) -> Result<TcpConnectPoll, TcpError> {
+        NetworkService::tcp_connect_poll(self, stream).await
+    }
+
+    fn tcp_local_endpoint(
+        &self,
+        stream: Self::TcpStream,
+    ) -> Result<Option<(NetworkIpAddress, u16)>, TcpError> {
+        NetworkService::tcp_local_endpoint(self, stream)
     }
 
     async fn tcp_listen(
@@ -518,6 +661,15 @@ where
         NetworkService::tcp_write_all_bytes(self, stream, bytes, timeout_nanos).await
     }
 
+    async fn tcp_write_some_bytes(
+        &self,
+        stream: Self::TcpStream,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> Result<usize, TcpError> {
+        NetworkService::tcp_write_some_bytes(self, stream, bytes, timeout_nanos).await
+    }
+
     async fn tcp_read(
         &self,
         stream: Self::TcpStream,
@@ -527,37 +679,22 @@ where
         NetworkService::tcp_read(self, stream, max_bytes, timeout_nanos).await
     }
 
-    fn tcp_try_read(
-        &self,
-        stream: Self::TcpStream,
-        max_bytes: usize,
-    ) -> Result<crate::TcpReadProgress, TcpError> {
-        NetworkService::tcp_try_read(self, stream, max_bytes)
-    }
-
-    fn tcp_send_room(&self, stream: Self::TcpStream) -> Result<crate::TcpWriteProgress, TcpError> {
-        NetworkService::tcp_send_room(self, stream)
-    }
-
-    fn tcp_try_write(
-        &self,
-        stream: Self::TcpStream,
-        bytes: &mut Bytes,
-    ) -> Result<crate::TcpWriteProgress, TcpError> {
-        NetworkService::tcp_try_write(self, stream, bytes)
-    }
-
-    async fn tcp_write_ready(&self, stream: Self::TcpStream) -> Result<(), TcpError> {
-        NetworkService::tcp_write_ready(self, stream).await
-    }
-
     async fn tcp_read_into<'a>(
         &'a self,
         stream: Self::TcpStream,
-        buffer: RegisteredTcpReadBuffer<'a>,
+        buffer: &'a mut RegisteredTcpReadBuffer<'_>,
         timeout_nanos: u64,
-    ) -> Result<Option<usize>, TcpError> {
+    ) -> Result<crate::TcpReadInto, TcpError> {
         NetworkService::tcp_read_into(self, stream, buffer, timeout_nanos).await
+    }
+
+    async fn tcp_peek_into<'a>(
+        &'a self,
+        stream: Self::TcpStream,
+        buffer: &'a mut RegisteredTcpReadBuffer<'_>,
+        timeout_nanos: u64,
+    ) -> Result<crate::TcpReadInto, TcpError> {
+        NetworkService::tcp_peek_into(self, stream, buffer, timeout_nanos).await
     }
 
     async fn tcp_shutdown_send(&self, stream: Self::TcpStream) -> Result<(), TcpError> {
@@ -572,8 +709,12 @@ where
         NetworkService::tcp_listener_close(self, listener);
     }
 
-    async fn udp_bind(&self, local_port: u16) -> Result<UdpBinding<Self::UdpSocket>, UdpError> {
-        NetworkService::udp_bind(self, local_port).await
+    async fn udp_bind(
+        &self,
+        local_address: NetworkIpAddress,
+        local_port: u16,
+    ) -> Result<UdpBinding<Self::UdpSocket>, UdpError> {
+        NetworkService::udp_bind(self, local_address, local_port).await
     }
 
     fn udp_connect(
@@ -625,6 +766,15 @@ where
         NetworkService::udp_receive(self, socket, max_bytes, timeout_nanos).await
     }
 
+    async fn udp_peek(
+        &self,
+        socket: Self::UdpSocket,
+        max_bytes: u32,
+        timeout_nanos: u64,
+    ) -> Result<Option<UdpDatagram>, UdpError> {
+        NetworkService::udp_peek(self, socket, max_bytes, timeout_nanos).await
+    }
+
     async fn udp_join_multicast_v4(
         &self,
         group: KernelIpv4Address,
@@ -643,6 +793,41 @@ where
 
     fn udp_close(&self, socket: Self::UdpSocket) {
         NetworkService::udp_close(self, socket);
+    }
+
+    fn packet_open(&self, protocol: u16) -> Result<u64, UdpError> {
+        NetworkService::packet_open(self, protocol)
+    }
+
+    fn packet_bind(&self, socket: u64, protocol: u16, ifindex: u32) -> Result<(), UdpError> {
+        NetworkService::packet_bind(self, socket, protocol, ifindex)
+    }
+
+    async fn packet_send<'a>(
+        &'a self,
+        socket: u64,
+        ifindex: u32,
+        frame: &'a [u8],
+    ) -> Result<usize, UdpError> {
+        NetworkService::packet_send(self, socket, ifindex, frame).await
+    }
+
+    async fn packet_receive(
+        &self,
+        socket: u64,
+        max_bytes: u32,
+        timeout_nanos: u64,
+        peek: bool,
+    ) -> Result<Option<PacketFrame>, UdpError> {
+        NetworkService::packet_receive(self, socket, max_bytes, timeout_nanos, peek).await
+    }
+
+    async fn packet_readiness(&self, socket: u64) -> Result<SocketReadiness, UdpError> {
+        NetworkService::packet_readiness(self, socket).await
+    }
+
+    fn packet_close(&self, socket: u64) {
+        NetworkService::packet_close(self, socket);
     }
 }
 
@@ -863,8 +1048,38 @@ where
     }
 }
 
+/// What one [`NetworkShard::drive_dhcp`] did.
+#[must_use]
+pub(super) struct DhcpDrive {
+    /// Whether the drive installed or removed a lease on the shard,
+    /// which is when the control plane has to be told: an address
+    /// installed has to reach it, and an address removed has to leave
+    /// it, or the next `synchronize_shard` puts the old one back. It is
+    /// reported even when a later step failed, because the shard has
+    /// already changed.
+    pub(super) lease_changed: bool,
+    /// The first step that failed. The drive stops there, and the next
+    /// one takes up the messages and deadlines it left.
+    pub(super) result: Result<(), NetworkControlError>,
+}
+
 impl NetworkShard {
-    pub(super) fn drive_dhcp(&mut self, now: StackInstant) -> Result<(), NetworkControlError> {
+    /// Hands the DHCP client every server message that has arrived and
+    /// whatever is due at `now`, and applies what it asks for.
+    pub(super) fn drive_dhcp(&mut self, now: StackInstant) -> DhcpDrive {
+        let mut lease_changed = false;
+        let result = self.run_dhcp(now, &mut lease_changed);
+        DhcpDrive {
+            lease_changed,
+            result,
+        }
+    }
+
+    fn run_dhcp(
+        &mut self,
+        now: StackInstant,
+        lease_changed: &mut bool,
+    ) -> Result<(), NetworkControlError> {
         let socket = self.internal_udp_socket(INTERNAL_DHCP_SOCKET_INDEX, DHCP_CLIENT_PORT);
         while let Some(datagram) = self
             .stack
@@ -876,186 +1091,139 @@ impl NetworkShard {
             else {
                 continue;
             };
-            match (self.dhcp, message.message_type) {
-                (DhcpClientState::Selecting { transaction_id, .. }, DhcpMessageType::Offer)
-                    if message.transaction_id == transaction_id =>
-                {
-                    let server_identifier = message
-                        .server_identifier
-                        .ok_or(NetworkControlError::BackendFault)?;
-                    self.send_dhcp_request(
-                        transaction_id,
-                        message.your_ip,
-                        server_identifier,
-                        now,
-                    )?;
-                    self.dhcp = DhcpClientState::Requesting {
-                        transaction_id,
-                        requested_ip: message.your_ip,
-                        server_identifier,
-                        last_sent: now,
-                    };
+            let action = self.dhcp.on_message(now, &message);
+            self.apply_dhcp_action(action, now, lease_changed)?;
+        }
+        // A step that moves the client on can owe a message at once: the
+        // DISCOVER after a lease was removed, say. It is asked until it
+        // has nothing due.
+        loop {
+            let action = self.dhcp.poll(now);
+            if action == DhcpAction::None {
+                return Ok(());
+            }
+            self.apply_dhcp_action(action, now, lease_changed)?;
+        }
+    }
+
+    /// Does what the DHCP client asked for, and records in
+    /// `lease_changed` when that touched the lease this shard holds.
+    fn apply_dhcp_action(
+        &mut self,
+        action: DhcpAction,
+        now: StackInstant,
+        lease_changed: &mut bool,
+    ) -> Result<(), NetworkControlError> {
+        match action {
+            DhcpAction::None => Ok(()),
+            DhcpAction::Send(transmit) => self.send_dhcp_transmit(transmit, now),
+            DhcpAction::Install { lease, replaces } => {
+                *lease_changed = true;
+                if let Some(replaced) = replaces {
+                    self.remove_dhcp_lease(&replaced);
                 }
-                (DhcpClientState::Requesting { .. }, DhcpMessageType::Ack)
-                    if self.dhcp.accepts_reply(&message) =>
-                {
-                    self.bind_lease(message)?;
+                if let Err(error) = self.install_dhcp_lease(&lease) {
+                    // Whatever part of the lease went in comes back out,
+                    // and the client, which believes itself bound, is
+                    // told it holds nothing and starts over.
+                    self.remove_dhcp_lease(&lease);
+                    self.dhcp.lease_not_installed(now);
+                    return Err(error);
                 }
-                (DhcpClientState::Rebooting { requested_ip, .. }, DhcpMessageType::Ack)
-                    if self.dhcp.accepts_reply(&message) =>
-                {
-                    if message.your_ip != requested_ip {
-                        // The server granted another address: the one
-                        // held from before the restore is not ours.
-                        self.stack.clear_ipv4_addresses();
-                    }
-                    self.bind_lease(message)?;
-                }
-                // A refused INIT-REBOOT means the address held from
-                // before the restore is not ours (RFC 2131 §3.2, step 3).
-                (
-                    DhcpClientState::Requesting { .. } | DhcpClientState::Rebooting { .. },
-                    DhcpMessageType::Nak,
-                ) if self.dhcp.accepts_reply(&message) => {
-                    self.stack.clear_ipv4_addresses();
-                    self.dhcp = DhcpClientState::Init {
-                        transaction_id: next_transaction_id(message.transaction_id),
-                    };
-                }
-                (state, message_type) => {
-                    tracing::debug!(
-                        ?state,
-                        ?message_type,
-                        transaction_id = message.transaction_id,
-                        "dropped DHCP message that is not a reply to the outstanding exchange"
-                    );
-                }
+                Ok(())
+            }
+            DhcpAction::Remove(lease) => {
+                *lease_changed = true;
+                self.remove_dhcp_lease(&lease);
+                Ok(())
             }
         }
+    }
 
-        if let DhcpClientState::Init { transaction_id } = self.dhcp {
-            self.send_dhcp_discover(transaction_id, now)?;
-            self.dhcp = DhcpClientState::Selecting {
-                transaction_id,
-                last_sent: now,
-            };
-        } else {
-            self.retransmit_dhcp(now)?;
+    /// Configures what a lease names: its address with the connected
+    /// route that comes with it, its default route and its resolvers.
+    fn install_dhcp_lease(&mut self, lease: &DhcpLease) -> Result<(), NetworkControlError> {
+        self.stack
+            .add_ipv4_address(lease.address)
+            .map_err(|_| NetworkControlError::InvalidAddress)?;
+        if let Some(router) = lease.router {
+            self.set_default_ipv4_gateway(map_ipv4_address(router))?;
         }
+        self.dns_servers = lease.dns_servers.clone();
         Ok(())
     }
 
-    /// Applies an ACK: the address, gateway and resolvers it carries
-    /// become the interface's configuration, and the client is bound.
-    fn bind_lease(&mut self, message: DhcpServerMessage) -> Result<(), NetworkControlError> {
-        let prefix_len = message
-            .subnet_mask
-            .map(ipv4_mask_prefix_len)
-            .transpose()?
-            .ok_or(NetworkControlError::InvalidAddress)?;
-        self.stack
-            .add_ipv4_address(Ipv4Cidr::new(message.your_ip, prefix_len))
-            .map_err(|_| NetworkControlError::InvalidAddress)?;
-        if let Some(router) = message.router {
-            self.set_default_ipv4_gateway(map_ipv4_address(router))?;
+    /// Takes back what a lease configured: its address with the
+    /// connected route that came with it, its default route and its
+    /// resolvers. Addresses and routes somebody else configured stay.
+    fn remove_dhcp_lease(&mut self, lease: &DhcpLease) {
+        self.stack.remove_ipv4_address(lease.address);
+        if let Some(router) = lease.router {
+            self.stack.routes_mut().remove(Route {
+                destination: IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0)),
+                gateway: Some(IpAddress::Ipv4(router)),
+                expires_at: None,
+            });
         }
         self.dns_servers.clear();
-        self.dns_servers.extend(message.dns_servers);
-        self.dhcp = DhcpClientState::Bound;
-        Ok(())
     }
 
     /// Starts INIT-REBOOT for the lease the interface holds, after a
     /// machine restore that may have moved it to another network.
     ///
-    /// Returns whether a question was sent: only a client that is bound
-    /// holds a lease to ask about, and one that is not has an exchange
+    /// Returns whether a question was begun: only a client that holds a
+    /// lease has one to ask about, and one that does not has an exchange
     /// of its own under way, which already asks the link for an address.
-    /// The address stays in use until the server answers or the retries
-    /// run out ([`DHCP_REBOOT_ATTEMPTS`]).
+    /// The REQUEST itself leaves with the next DHCP drive, which also
+    /// retransmits it and, when nobody answers, ends the lease; the
+    /// address stays in use until then.
     pub(super) fn begin_lease_revalidation(
         &mut self,
         transaction_id: u32,
         now: StackInstant,
-    ) -> Result<bool, NetworkControlError> {
-        if self.dhcp != DhcpClientState::Bound {
-            return Ok(false);
-        }
-        let Some(lease) = self.stack.primary_ipv4_address() else {
-            return Ok(false);
-        };
-        let requested_ip = lease.address();
-        self.send_dhcp_init_reboot(transaction_id, requested_ip, now)?;
-        self.dhcp = DhcpClientState::Rebooting {
-            transaction_id,
-            requested_ip,
-            attempts: 1,
-            last_sent: now,
-        };
-        Ok(true)
+    ) -> bool {
+        self.dhcp.revalidate(now, transaction_id)
     }
 
-    pub(super) fn send_dhcp_init_reboot(
+    /// Queues one client message, and tells the client when a unicast
+    /// one could not leave yet because the server's hardware address is
+    /// still being resolved: the ARP request went out in its place.
+    fn send_dhcp_transmit(
         &mut self,
-        transaction_id: u32,
-        requested_ip: Ipv4Address,
+        transmit: DhcpTransmit,
         now: StackInstant,
     ) -> Result<(), NetworkControlError> {
-        let message =
-            DhcpClientMessage::init_reboot(transaction_id, self.stack.config().mac, requested_ip);
-        self.send_dhcp_message(message, transaction_id as u16, now)
-    }
-
-    pub(super) fn send_dhcp_discover(
-        &mut self,
-        transaction_id: u32,
-        now: StackInstant,
-    ) -> Result<(), NetworkControlError> {
-        let message = DhcpClientMessage::discover(transaction_id, self.stack.config().mac);
-        self.send_dhcp_message(message, transaction_id as u16, now)
-    }
-
-    pub(super) fn send_dhcp_request(
-        &mut self,
-        transaction_id: u32,
-        requested_ip: Ipv4Address,
-        server_identifier: Ipv4Address,
-        now: StackInstant,
-    ) -> Result<(), NetworkControlError> {
-        let message = DhcpClientMessage::request(
-            transaction_id,
-            self.stack.config().mac,
-            requested_ip,
-            server_identifier,
-        );
-        self.send_dhcp_message(message, transaction_id as u16, now)
-    }
-
-    pub(super) fn send_dhcp_message(
-        &mut self,
-        message: DhcpClientMessage,
-        identification: u16,
-        now: StackInstant,
-    ) -> Result<(), NetworkControlError> {
+        let DhcpTransmit {
+            message,
+            destination,
+        } = transmit;
         let mut payload = [0u8; 548];
         let len = message
             .encode(&mut payload)
             .ok_or(NetworkControlError::BackendFault)?;
-        self.stack
+        let destination_address = match destination {
+            DhcpDestination::Broadcast => Ipv4Address::BROADCAST,
+            DhcpDestination::Server(server) => server,
+        };
+        let queued = self
+            .stack
             .send_udp_ipv4_from(
-                Ipv4Address::UNSPECIFIED,
-                Ipv4Address::BROADCAST,
+                message.client_ip,
+                destination_address,
                 UdpEgress {
                     source_port: DHCP_CLIENT_PORT,
                     destination_port: DHCP_SERVER_PORT,
                     payload: &payload[..len],
                     hop_limit: DEFAULT_HOP_LIMIT,
                 },
-                identification,
+                message.transaction_id as u16,
                 now,
             )
-            .map(|_| ())
-            .map_err(|_| NetworkControlError::BackendFault)
+            .map_err(|_| NetworkControlError::BackendFault)?;
+        if queued == 0 {
+            self.dhcp.retry_unresolved(now);
+        }
+        Ok(())
     }
 
     /// Identifier for the next echo exchange this shard starts, drawn
@@ -1107,6 +1275,11 @@ impl NetworkShard {
         )
     }
 
+    /// One nonzero question id for a single-record lookup (`HTTPS`).
+    pub(super) fn draw_dns_query_id(&mut self) -> u16 {
+        self.entropy.nonzero_u16()
+    }
+
     /// Sends whichever of the pair's questions is still outstanding.
     ///
     /// Called on every poll iteration, so an unanswered question is
@@ -1126,6 +1299,37 @@ impl NetworkShard {
             self.send_dns_query(socket, queries.aaaa, host, DnsRecordType::Aaaa, now)?;
         }
         Ok(())
+    }
+
+    pub(super) fn send_dns_wire_query(
+        &mut self,
+        socket: &ResolverSocket,
+        query_id: u16,
+        qname: &DnsWireName,
+        record: DnsRecordType,
+        now: StackInstant,
+    ) -> Result<(), DnsError> {
+        let mut payload = [0u8; 512];
+        let len = DnsQuestionWriter::new(&mut payload)
+            .write_wire_query(query_id, qname, record)
+            .ok_or(DnsError {
+                kind: DnsErrorKind::UnresolvedHost,
+                detail: NetworkErrorDetail::DnsQueryStartFailed,
+            })?;
+        self.stack
+            .send_udp(
+                socket.stack_socket,
+                socket.resolver,
+                DNS_PORT,
+                &payload[..len],
+                query_id,
+                now,
+            )
+            .map(|_| ())
+            .map_err(|_| DnsError {
+                kind: DnsErrorKind::Unavailable,
+                detail: NetworkErrorDetail::DnsQueryStartFailed,
+            })
     }
 
     fn send_dns_query(
@@ -1194,10 +1398,62 @@ impl NetworkShard {
             match record {
                 DnsRecordType::A => answers.a_answered = true,
                 DnsRecordType::Aaaa => answers.aaaa_answered = true,
+                DnsRecordType::Https => unreachable!("HTTPS uses poll_dns_https_response"),
             }
             answers.extend(message.addresses.iter().copied());
         }
         Ok(())
+    }
+
+    pub(super) fn poll_dns_https_response(
+        &mut self,
+        socket: &ResolverSocket,
+        query_id: u16,
+        qname: &DnsWireName,
+        max_hops: usize,
+        alias_out: &mut DnsWireName,
+    ) -> Result<Option<PolledHttpsResponse>, DnsError> {
+        let socket = socket.stack_socket;
+        let mut resolved = None;
+        while let Some(datagram) = self.stack.take_udp(socket).map_err(|_| DnsError {
+            kind: DnsErrorKind::Unavailable,
+            detail: NetworkErrorDetail::DnsQueryStartFailed,
+        })? {
+            if resolved.is_some() {
+                continue;
+            }
+            let Some(response) = DnsResponse::parse(&datagram.bytes) else {
+                continue;
+            };
+            if response.id() != query_id {
+                continue;
+            }
+            let Some(outcome) = response.https_outcome(qname, max_hops) else {
+                continue;
+            };
+            resolved = Some(match outcome {
+                DnsHttpsOutcome::Service(record) => PolledHttpsResponse::Service(HttpsRecord {
+                    alpn: record
+                        .alpn
+                        .iter()
+                        .map(|&protocol| String::from(protocol))
+                        .collect(),
+                    port: record.port,
+                    ttl_nanos: u64::from(record.ttl_seconds) * 1_000_000_000,
+                }),
+                DnsHttpsOutcome::Alias {
+                    target,
+                    ttl_seconds,
+                    hops,
+                } => {
+                    *alias_out = target;
+                    PolledHttpsResponse::Alias { ttl_seconds, hops }
+                }
+                DnsHttpsOutcome::NoRecord => PolledHttpsResponse::NoRecord,
+                DnsHttpsOutcome::ServerFailure(_) => PolledHttpsResponse::ServerFailure,
+            });
+        }
+        Ok(resolved)
     }
 
     /// Drives IPv6 stateless address autoconfiguration one step:
@@ -1304,4 +1560,21 @@ impl DnsAnswers {
         }
         Ok(self.addresses)
     }
+}
+
+pub(super) enum PolledHttpsResponse {
+    Service(HttpsRecord),
+    Alias { ttl_seconds: u32, hops: usize },
+    NoRecord,
+    ServerFailure,
+}
+
+fn is_ip_literal(host: &str) -> bool {
+    parse_ipv4(host).is_some()
+        || parse_ipv6(host).is_some()
+        || host
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .and_then(parse_ipv6)
+            .is_some()
 }

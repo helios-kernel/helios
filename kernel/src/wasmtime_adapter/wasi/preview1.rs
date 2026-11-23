@@ -75,6 +75,8 @@ pub(crate) const PREVIEW1_FUNCTIONS: &[&str] = &[
 pub(crate) mod errno {
     pub(crate) const SUCCESS: i32 = 0;
     pub(crate) const ACCES: i32 = 2;
+    /// `__WASI_ERRNO_ADDRNOTAVAIL`: address not available
+    pub(crate) const ADDRNOTAVAIL: i32 = 4;
     /// `__WASI_ERRNO_AFNOSUPPORT`: the address family is not supported
     /// by this socket, which is what an `AF_INET` socket must report for
     /// an `AF_INET6` peer address and vice versa.
@@ -87,6 +89,8 @@ pub(crate) mod errno {
     pub(crate) const CONNRESET: i32 = 15;
     pub(crate) const EXIST: i32 = 20;
     pub(crate) const FAULT: i32 = 21;
+    /// `__WASI_ERRNO_INTR`: interrupted function.
+    pub(crate) const INTR: i32 = 27;
     pub(crate) const INVAL: i32 = 28;
     pub(crate) const IO: i32 = 29;
     pub(crate) const ISDIR: i32 = 31;
@@ -94,12 +98,15 @@ pub(crate) mod errno {
     /// `__WASI_ERRNO_MFILE`: the process has no free descriptor number
     /// below its descriptor limit.
     pub(crate) const MFILE: i32 = 33;
+    /// `__WASI_ERRNO_MSGSIZE`: a datagram larger than the protocol can carry.
+    pub(crate) const MSGSIZE: i32 = 35;
     /// `__WASI_ERRNO_NAMETOOLONG`: filename too long.
     pub(crate) const NAMETOOLONG: i32 = 37;
     pub(crate) const NETDOWN: i32 = 38;
     pub(crate) const HOSTUNREACH: i32 = 23;
     pub(crate) const NOMEM: i32 = 48;
     pub(crate) const NOENT: i32 = 44;
+    pub(crate) const NOSPC: i32 = 51;
     pub(crate) const NOTDIR: i32 = 54;
     pub(crate) const NOTEMPTY: i32 = 55;
     pub(crate) const NOTSOCK: i32 = 57;

@@ -29,7 +29,7 @@ use std::num::ParseIntError;
 use std::time::Instant;
 
 use helios_api::channel;
-use helios_api::programs::{self, Child, ExecRequest, SpawnRequest};
+use helios_api::programs::{self, Child, ChildTermination, ExecRequest, SpawnRequest};
 use helios_api::wit_bindgen::{FutureReader, StreamReader};
 use helios_api::{stats, task};
 use helios_bench_metrics::{LatencySamples, mib_per_second, report_metric};
@@ -66,10 +66,10 @@ enum ProcbenchError {
         kind: programs::ExecErrorKind,
         detail: String,
     },
-    #[error("child {path} exited with code {code}; its stderr said: {stderr}")]
+    #[error("child {path} {termination}; its stderr said: {stderr}")]
     ChildFailed {
         path: String,
-        code: u32,
+        termination: ChildTermination,
         stderr: String,
     },
     #[error("child {path} closed its stdout before producing output")]
@@ -337,7 +337,7 @@ async fn wait_child(child: Child, path: &str) -> Result<(), ProcbenchError> {
         kind: error.kind,
         detail: error.detail,
     })?;
-    if status.code != 0 {
+    if status.termination != ChildTermination::Exited(0) {
         let mut captured = Vec::new();
         loop {
             let (result, chunk) = stderr.read(Vec::with_capacity(READ_CHUNK_BYTES)).await;
@@ -348,7 +348,7 @@ async fn wait_child(child: Child, path: &str) -> Result<(), ProcbenchError> {
         }
         return Err(ProcbenchError::ChildFailed {
             path: path.to_owned(),
-            code: status.code,
+            termination: status.termination,
             stderr: String::from_utf8_lossy(&captured).trim().to_owned(),
         });
     }
@@ -379,7 +379,7 @@ async fn spawn_wait(count: u64, child: ChildSpec) -> Result<(), ProcbenchError> 
         if result.exit_code != 0 {
             return Err(ProcbenchError::ChildFailed {
                 path: child.path.clone(),
-                code: result.exit_code,
+                termination: ChildTermination::Exited(result.exit_code),
                 stderr: String::from_utf8_lossy(&result.output.stderr)
                     .trim()
                     .to_owned(),

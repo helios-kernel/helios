@@ -18,13 +18,14 @@ never depends on anything above it.
 | Layer | Crates | Contents |
 | --- | --- | --- |
 | Hardware contracts | `hal/` | Traits, capability types and value types only. `#![no_std]`. |
-| Device and protocol libraries | `netstack/`, `virtio/`, `i6300esb/` | `#![no_std]` protocol engines and drivers. `virtio/` builds on `netstack/`; all three depend on `hal/` and none on the kernel. |
+| Device and protocol libraries | `netstack/`, `virtio/`, `i6300esb/`, `tpm/`, `firmware/`, `btrfs/`, `sync/` | `#![no_std]` protocol engines and drivers. `virtio/` builds on `netstack/`; `tpm/` drives a TPM 2.0 over the FIFO and CRB interfaces for measured boot and sealing only; `firmware/` turns the platform description a backend hands it (the device tree's NUMA properties, the ACPI SRAT and SLIT) into `hal/` values; `sync/` holds the async primitives the kernel and the compatibility layers share and depends on none of the others; the other six depend on `hal/`, and none depends on the kernel. |
+| Compatibility layers | `unix/`, `linux/` | `#![no_std]` services the non-Preview-3 ABIs share (`unix/`) and the Linux ABI (`linux/`), each behind a kernel feature that is off by default. Both build on `hal/` and `sync/`; neither depends on the kernel. |
 | Shared ABIs | `compiler-abi/`, `artifact/` | `#![no_std]` wire formats shared by the kernel and host tools: the compiler plugin's request and response headers, `cwasm` target flags, the signature trailer, and the `helios-bootfs` payload image the kernel reads at bring-up. |
-| Kernel | `kernel/` | Every piece of hardware-independent runtime logic: executor, timer, memory and OOM, instance registry, component host, Wasmtime adapter, network service, host-fs client, every WIT service. `#![no_std]`, generic over `Cpu`. The user payload is not linked into the kernel: it arrives as a boot module (`docs/boot.md`). |
-| Backends | `aarch64/`, `riscv/`, `x86/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport and SMP wiring, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. |
+| Kernel | `kernel/` | Every piece of hardware-independent runtime logic: executor, timer, memory and OOM, instance registry, component host, Wasmtime adapter, network service, host-fs client, every WIT service, and, behind the `linux` feature, the native Linux process host. `#![no_std]`, generic over `Cpu`. The user payload is not linked into the kernel: it arrives as a boot module (`docs/boot.md`). |
+| Backends | `aarch64/`, `riscv/`, `x86/`, `x86-vmm/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport, SMP wiring and native user execution, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. `x86-vmm/` is the x86 user address space over a `Machine` the backend supplies, so the host builds and tests the code the kernel runs. |
 | Kernel image | the root crate `helios` (`src/`) | The binary that links whichever backend the target selects, and runs `hosted` on the host. |
 | User space | `api/`, `api-macro/`, `programs/*`, `venus/` | The userland SDK and the wasm programs, kernel plugins included: `init`, `debugger`, `http-client`, `date`, `ping`, `perf`, `oob-load`. `compiler-plugin/` is the in-kernel compiler, a kernel plugin built by the host tools. `venus/` is the Venus wire protocol a program's GPU driver links: the hand-written sinks and the encoders generated at build time. |
-| Host tools | `inspector/`, `inspector-protocol/`, `cli/`, `compiler-support/`, `compiler-host/`, `profdata/`, `venus-gen/`, `workspace-root/` | `std` crates that boot, build and observe a guest. `inspector-protocol/` is the WIT RPC contract between the inspector and the guest debugger. `profdata/` is the kernel profile's header check and fetched-profile store, shared by `cli/` and `inspector/`. `venus-gen/` generates `venus/`'s encoders from the pinned venus-protocol registry. `compiler-host/` runs the compiler plugin under Wasmtime on Linux, the bench's Linux + Wasmtime column of `aot-curl`. |
+| Host tools | `inspector/`, `inspector-protocol/`, `cli/`, `compiler-support/`, `compiler-host/`, `profdata/`, `venus-gen/`, `workspace-root/` | `std` crates that boot, build and observe a guest. `inspector-protocol/` is the WIT RPC contract between the inspector and the guest debugger. `profdata/` is the kernel profile's header check and fetched-profile store, shared by `cli/` and `inspector/`. `workspace-root/` finds the workspace and holds the root key file format those two share. `venus-gen/` generates `venus/`'s encoders from the pinned venus-protocol registry. `compiler-host/` runs the compiler plugin under Wasmtime on Linux, the bench's Linux + Wasmtime column of `aot-curl`. |
 
 The rules that follow from the table:
 
@@ -76,6 +77,15 @@ maintainer's decision and the fork's revision moves once, per §1.
   through `Kernel<CpuImpl>`, `RuntimeState<…>` and similar structures.
 - A system capability is a Rust trait first and a WASI/WIT interface second.
   Define the trait, then expose it.
+- An optional subsystem is a cargo feature that is off by default, and a
+  build without it compiles none of its code. The Linux subsystem is the
+  `linux` feature.
+- The kernel exposes one async-first API, its resources, services and
+  capability checks, and every guest ABI is an adapter over it: WASI
+  Preview 3, WASIX and the Linux subsystem. An adapter translates arguments,
+  layouts and errors; it never re-implements a resource, a wait mechanism or
+  a policy the kernel owns. What WASIX and Linux need beyond Preview 3 lives
+  once, in `unix/`.
 
 ## 3. Code quality
 
@@ -101,8 +111,9 @@ maintainer's decision and the fork's revision moves once, per §1.
 - Kernel memory and user memory are separate ownership domains. The kernel is
   as close to zero-allocation as practical and, when it must allocate, uses
   kernel-owned pools; kernel OOM is fatal and panics. User-mode wasm
-  instances, kernel plugins included, use user-memory allocation and
-  accounting; user OOM kills the instance and reclaims its pool, and never
+  instances, kernel plugins included, and native Linux processes use
+  user-memory allocation and accounting; user OOM kills the instance or
+  process and reclaims its pool, and never
   grows a kernel budget or adds per-plugin policy.
 - A buffer the device handed up belongs to the driver and is on loan for one
   receive pass. Nothing the stack queues (an out-of-order TCP segment, an
@@ -121,8 +132,17 @@ maintainer's decision and the fork's revision moves once, per §1.
   transport. Replacing any of them with IDE, an emulated legacy device, an
   ad-hoc host file, or other fallback I/O is an architectural change that
   needs explicit approval in the task that proposes it.
+- A TPM 2.0 (`tpm/`) is the one device outside virtio. It carries measured
+  boot and sealing, and never data I/O.
 - A well-maintained, `no_std`-friendly third-party crate beats a hand-rolled
   implementation.
+- Kernel-mode code is safe Rust above two kinds of boundary: `hal/` and the
+  backends, where `unsafe` touches hardware, and a safe, ergonomic Rust API
+  whose implementation confines the `unsafe` it needs and states each
+  precondition. A component whose work needs `unsafe` throughout (a driver
+  speaking a C ABI, a parser of untrusted formats, a protocol engine over raw
+  memory) runs in user mode, inside the wasm sandbox, as a program or kernel
+  plugin, so that its defects end an instance rather than corrupt the kernel.
 
 ### 3.2 Rust style
 
@@ -170,9 +190,12 @@ maintainer's decision and the fork's revision moves once, per §1.
   startup, trusted for signed `cwasm` output.
 - The HTTP client is a kernel plugin (`programs/http-client`): the kernel
   implements `wasi:http/types` only and forwards `wasi:http/client.send`
-  through a typed provider slot to the plugin's `wasi:http/handler`; HTTP/1.1
-  framing, DNS and, later, TLS run in user memory. The provider slot is the
-  route for any future interface a plugin serves.
+  through a cache-padded, NUMA-local `PerProcessorProvider` shard to that
+  core's lazy plugin `wasi:http/handler`; HTTP/1.1, HTTP/2, HTTP/3 (QUIC), DNS
+  and TLS run in user memory, synchronized with `ProcessorStep` CPU hotplug so
+  departing cores drain/redirect work to their successor. `ProviderSlot` remains
+  the route for singleton plugins with exclusive hardware ownership (such as
+  `compositor`).
 - Plugins share the user-memory and allocation contract of every program.
   There is no plugin-private allocator policy, memory floor, or oversized
   linker memory. A plugin may fail with a typed OOM result and be discarded
@@ -197,9 +220,12 @@ maintainer's decision and the fork's revision moves once, per §1.
   bounds checks, with `memory_init_cow(true)` and `memory_may_move(false)`.
   Disabling any of them needs a same-PR justification of the alternative
   semantic path.
-- Full x86 AVX, FMA and AVX-512 enablement waits on the x86 kernel providing
-  OSXSAVE, XCR0 configuration and XSAVE/XRSTOR state preservation, and is
-  tracked as such.
+- x86 guest code is compiled for the highest ISA level the processor
+  satisfies. The kernel saves no extended vector state: its image carries no
+  VEX or EVEX instruction, and it switches away from guest code only at
+  call boundaries, where the vector registers and k-masks are caller-saved.
+  A change that breaks either property brings XSAVE/XRSTOR preservation
+  with it.
 - Performance decisions rest on bare-metal targets and explicit capabilities,
   never on `hosted/`.
 - A performance test, benchmark, or acceptance measurement runs `--release`
@@ -330,6 +356,70 @@ and never comes from CI.
   happen it is for alignment, never for permission to land a degraded
   variant.
 
+### 3.8 Linux subsystem
+
+- The Linux subsystem runs unmodified Linux programs natively on x86-64 and
+  aarch64, an important optional feature of Helios. Its goal is the Linux
+  UAPI in full, and its support is measured by the conformance suite (§7),
+  never by counting syscalls.
+- Native execution is a `hal/` contract each backend implements. Linux ABI
+  decoding lives in `linux/`, never in a backend or the kernel core. Each
+  implemented behaviour cites the Linux source or manual it follows, and a
+  divergence from Linux is a defect.
+- Every Linux process lives in a container, and its children stay in it. A
+  container is the Linux system its processes see: its root and mounts, its
+  process IDs, its users and groups, its hostname, all constructed by the
+  kernel. It holds the `ProcessAuthority` it was created with, which is the
+  ceiling of everything its processes can reach. Processes in different
+  containers see nothing of each other.
+- Inside a container, Linux's own permission model (users and groups, file
+  modes, capabilities, setuid) applies as Linux defines it and only narrows
+  the container's authority, never widens it: a process running as uid 0
+  holds no more than its container was granted. Every syscall that reaches
+  a resource derives the capability the matching WASI or WASIX operation
+  derives, and a missing right fails with Linux's errno.
+- A filesystem reaches a program only through an explicit mount, and the
+  rights the mount grants are all a WASI or WASIX program holds on it:
+  neither sees ownership, modes or ACLs. A container's mounts are the same
+  explicit mounts, and their rights bound everything the container's
+  processes can do on them. A mount is granted as private or as shared,
+  and that never changes while it exists. A private mount belongs to one
+  container, and within its bound the kernel enforces the ownership,
+  modes, ACLs, setuid bits and file capabilities a Unix filesystem stores,
+  as Linux does. A shared mount may be granted to several containers and
+  to WASI programs at once, and in each container it behaves as it does
+  for WASI: every node appears owned by the identity the container's
+  configuration names, its modes follow the mount's rights, and it is
+  nosuid and nodev with file capabilities ignored. A node a non-Linux
+  program creates, or any program creates on a shared mount, takes its
+  owner and group from its parent directory, and its mode from the
+  parent's, with the execute bits cleared for a regular file; no mount or
+  WASI interface carries a user or group.
+- Native execution runs only with the hardware protections its contract
+  states (kernel-mode execute and access protection of user pages, a
+  processor unaffected by rogue data cache load) and refuses to start where
+  one is missing, naming it. It keeps every mitigation Linux applies to user
+  processes on the same hardware.
+
+### 3.9 Target environment
+
+Helios runs in production as a guest under hardware-accelerated
+virtualization on a cloud provider's x86-64 Linux KVM host, and a macOS
+development host under HVF is the same class of machine. Design and policy
+decisions assume that machine.
+
+- Guest processor time is cheap and every device access crosses the
+  virtualization boundary, so a mechanism that spends processor work to
+  save device round-trips is usually the right one.
+- The facilities a host offers its guest are part of the machine model,
+  not an edge case.
+- The host's device models are a trust boundary: device input is
+  untrusted, and limiting what a device may access or claim is a
+  legitimate design input.
+- TCG checks correctness on architectures CI cannot virtualize. It is
+  never a design target, and an optimization that wins only under
+  emulation is not an optimization.
+
 ## 4. Async-first execution
 
 The kernel runs a cooperative async executor. Anything that pins it blocks
@@ -361,7 +451,7 @@ does.
   bootstrap paths only.
 - No `Arc<Mutex<T>>` behind an async API. Channels, the kernel `Notify`, and
   single-owner `RefCell` within a task come first; when a lock is unavoidable
-  it is the kernel's async `Mutex` or `RwLock` from `kernel/src/exec/sync.rs`,
+  it is the async `Mutex` or `RwLock` from `sync/`,
   and the guard is released before an `.await`.
 - A loop that polls for progress yields on the non-ready path so the executor
   can drive the task that produces the progress.
@@ -404,11 +494,18 @@ does.
   re-established from the run's artifacts (the console log, the counter
   lines, the QEMU and gdbstub state) before any code changes, and a PR that
   fixes a different mechanism than the issue named says so.
+- `vm --kernel-feature linux --bootfs-root <dir>` boots a kernel with the
+  Linux subsystem and a boot root holding Linux programs;
+  `linux/tests/build-fixtures.sh` builds that root.
 - Inspector and guest communicate through the WIT RPC defined in
   `helios-inspector-protocol`, never through a side channel.
 
 ## 6. WASI tooling
 
+- WASI 0.3 is the kernel's first-class ABI. Programs, tools and host
+  interfaces use 0.3 wherever it covers the need. Preview 1 and WASIX
+  are supported for programs built against them; Preview 2 is not a
+  supported ABI.
 - `tools/wasi-apps/build.sh` is the single entry point that stages the WASI
   shared-fs tooling: it downloads the official CPython WASI build into
   `artifacts/python3-root/` (`python3.wasm` plus the standard library) and
@@ -417,14 +514,21 @@ does.
   stub does not return.
 - `docs/wasi-tools.md` describes the reproducible workflow; a change to
   runtime behaviour updates the docs and the paths in the same change.
+- `linux/tests/build-fixtures.sh` builds the static musl Linux fixtures for
+  x86-64 or aarch64 and, on a Linux host of that architecture, runs them
+  there first. A fixture records the Linux behaviour it expects and where
+  that comes from.
 
 ## 7. Checks and CI
 
 Before a change is complete, run the recipes for every surface it can
-affect. `just check-target` and `just test-units` run `helios-cli
-kernel-prebuild` themselves and export the two trusted-root key files it
-writes as `HELIOS_KERNEL_ROOT_PUBLIC_KEY` and `HELIOS_KERNEL_ROOT_SECRET_KEY`,
-the only prebuild outputs the kernel build tracks; the `helios-bootfs`
+affect. Compile and lint recipes run `helios-cli kernel-keys`; tests that
+read a boot payload run `helios-cli kernel-prebuild`. They export the
+trusted-root public key file as `HELIOS_KERNEL_ROOT_PUBLIC_KEY`, the only prebuild output the
+kernel build tracks; a recipe that compiles the kernel's tests also exports
+`HELIOS_KERNEL_ROOT_SECRET_KEY`, which only a test build reads and no
+kernel image is given (the inspector's image build searches every image
+it links for that key and fails on a match); the `helios-bootfs`
 payload it also writes is loaded at boot, never compiled in, so changing
 the boot programs never relinks the kernel. The `check-target` set is the
 backends the diff can reach: a change in `hal/`, a library crate, a shared
@@ -445,8 +549,8 @@ just test-units
 `just lint` is `tools/fmt.sh --check`, `cargo deny --workspace check bans`
 against `deny.toml`, and `cargo clippy … -D warnings` over the host crates, each
 guest program, and the three bare-metal targets.
-`just test-units` runs the `hal`, `virtio`, `netstack`, `kernel`,
-`inspector-protocol` and `workspace-root` unit tests, every `hosted` test,
+`just test-units` runs the `hal`, `virtio`, `netstack`, `tpm`, `firmware`, `sync`, `unix`, `linux`, `kernel`, `x86-vmm`,
+`inspector-protocol` and `workspace-root` unit tests, every `btrfs` and `hosted` test,
 and the `hal_layering` test (`kernel/tests/`) that enforces §1. The recipe names each integration
 test with `--test <name>`, so a new enforcement test is added to the recipe
 in the same change or it never runs.
@@ -459,19 +563,32 @@ red lane names the surface that broke:
 
 | Lane | Runner | What it proves |
 | --- | --- | --- |
-| `check-host`, `check-aarch64`, `check-riscv`, `check-x86` | `ubuntu-24.04` | Every surface compiles. |
-| `lint-fmt`, `lint-host`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting, the `deny.toml` bans, and clippy at `-D warnings`. |
-| `test-units`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests and the embedded debugger. |
-| `smoke-x86-64` | `ubuntu-24.04`, `--accel kvm` | Boot, shell, CPython, the in-kernel compiler, a trapped OOB load, curl over virtio-net, the raw serial captures. |
-| `smoke-riscv64` | `ubuntu-24.04`, `--accel tcg` | Boot, shell, CPython, a trapped OOB load, the inspector RPC over vsock, curl over virtio-net. |
-| `smoke-aarch64` | `ubuntu-24.04-arm`, `--accel tcg` | Boot from the device tree and from ACPI, against a pinned upstream QEMU the lane builds and caches, because Ubuntu 24.04's QEMU asserts in its emulated GICv3 under multi-threaded TCG. |
+| `check-host` | `ubuntu-24.04` | The host surfaces compile. |
+| `lint-fmt`, `lint-host`, `lint-programs`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting, the `deny.toml` bans, and clippy at `-D warnings`; a bare-metal lint lane is also that target's compile check, since clippy builds the packages `check-target` checks. |
+| `test-kernel`, `test-libraries`, `test-host-tools`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests, the btrfs reader against `mkfs.btrfs` images, and the embedded debugger. |
+| `smoke-x86-64` | `ubuntu-24.04`, `--accel kvm` | Boot on one node and on two NUMA nodes, shell, CPython, the in-kernel compiler, a trapped OOB load, curl over virtio-net, the raw serial captures; under `swtpm`, the kernel's signing key kept across two boots, resealed after a changed payload, and a tampered payload refused; static Linux programs through dash, checked against the same programs run natively on the runner. |
+| `smoke-x86-64-venus` | `ubuntu-24.04`, `--accel kvm` | `gpu-test` on a Venus `virtio-gpu-gl` device rendered through lavapipe: a virgl context's fence, host and guest blobs, two instances at once. It runs only on changes to the 3D path, against a pinned QEMU and virglrenderer it builds and caches. |
+| `smoke-riscv64` | `ubuntu-24.04`, `--accel tcg` | Boot, a two-node NUMA boot, shell, CPython, a trapped OOB load, the inspector RPC over vsock, curl over virtio-net. |
+| `smoke-aarch64` | `ubuntu-24.04-arm`, `--accel tcg` | Boot from the device tree and from ACPI, each on one node and on two NUMA nodes; under `swtpm`, the kernel's signing key kept across two ACPI boots, resealed after a changed payload, changed state detected across device-tree boots, and a tampered payload refused; static Linux programs through dash, checked against the same programs run natively on the runner. Runs against a pinned upstream QEMU the lane builds and caches, because Ubuntu 24.04's QEMU asserts in its emulated GICv3 under multi-threaded TCG. |
 | `bench-x86-64-linux` | `ubuntu-24.04`, `--accel kvm`, multi-queue tap | The workload benchmarks of §3.6, with the negotiated virtio-net features reported. |
 
-The bench lane is the exception: it lives in `bench-lane.yml` and runs
-nightly against `dev` and on `workflow_dispatch` for any ref, never on a
-pull request, because one unpaired run is no performance evidence (§3.6)
-and the lane is the heaviest job there is. A failed nightly run files a
-`bench`/`bug` issue, or comments on the one already open.
+All smoke suites, the benchmark lanes and kernel-profile collection run
+nightly and on demand. They retain their full coverage outside the review
+loop. A nightly failure opens or reopens its suite's issue and records the
+failed run. Release-triggered benchmarks also remain enabled.
+
+A pull request runs only non-heavy lanes whose surfaces its change touches
+(`.github/ci-lanes.json`), and a draft runs `lint-fmt` alone until it is
+marked ready for review. Compile, lint and test lanes keep a Rust cache,
+written only by a `main` push. Other shared caches are written only from
+the default branch. Guest wasm is built once per profile and reused by
+every test and smoke lane that runs a kernel prebuild. A consumer compiles
+its tests while the wasm builds and runs them once its profile is ready.
+The CI result job requires every selected lane to succeed. Every job run by
+a pull request or `main` push has a 15-minute timeout. A pull request's run
+finishes within 15 minutes. Linux compatibility is measured by gVisor's
+syscall suite, in a lane that runs only when a change touches the Linux
+subsystem.
 
 Every lane runs on a Linux runner. macOS runners are not used: their queue
 dominates the run and nothing Helios ships targets macOS. Every boot in CI
@@ -484,27 +601,28 @@ reason that says why the lint is wrong there. `clippy::manual_async_fn` is
 the gate for §3.2's `async fn` rule.
 
 `dep-check.yml` runs on a schedule and on demand. `kernel-profile.yml`
-collects the x86-64 kernel profile every release build spends, on every
-push to `dev` that touches the kernel image's inputs, on demand and
-monthly (`docs/pgo.md`); `bench-suite.yml`'s `profile-generate` job
-calls it. `release.yml` runs `release-plz` on every push to `main`: it
-owns version numbers, the changelog and tags, so commits follow the
-conventional format (`feat:`, `fix:`, `feat!:`, `BREAKING CHANGE:`) and
+collects the x86-64 kernel profile every release build spends, nightly and
+on demand (`docs/pgo.md`); `bench-suite.yml`'s `profile-generate` job
+calls it. `release.yml` runs `release-plz` after `CI` succeeds on `main`:
+regular merges open or update the release pull request, and merging a
+release pull request cuts tags, changelogs and releases, so commits follow
+the conventional format (`feat:`, `fix:`, `feat!:`, `BREAKING CHANGE:`) and
 nobody edits a version or a changelog by hand.
 
 ## 8. Branches, pull requests, evidence
 
-- Nobody pushes to `dev` or `main`. Work lives on a topic branch and lands
-  through a pull request against `dev`. `main` is the release trigger, and
-  merging into it is a maintainer decision.
+- `main` is the only long-lived branch. Nobody pushes to `main`. Work lives
+  on a topic branch and lands through a pull request against `main`;
+  merging a `release-plz` pull request cuts the release and is a maintainer
+  decision.
 - A problem becomes an issue before it becomes a branch; one issue, one
   branch, one PR, with `Fixes #N` on its own line in the body. A PR that
   advances an issue without closing it says `Part of #N`.
-- Commits on `dev` are signed; the branch ruleset rejects unsigned ones.
+- Commits on `main` are signed; the branch ruleset rejects unsigned ones.
   Commit messages and PR bodies carry no attribution trailers, generated-by
   footers, or session identifiers.
 - A PR merges when every check it can affect is green. A red lane that is
-  already red on `dev` and untouched by the PR is named in the PR body with
+  already red on `main` and untouched by the PR is named in the PR body with
   the issue that tracks it (filed by the PR if none exists yet) and does not
   block. Evidence in the PR body is concrete:
   the run id, the lane, the median, the negotiated feature line, the log
@@ -518,7 +636,7 @@ Several agents and developers work on this tree at once. The rules that keep
 them from colliding:
 
 - One checkout per task. A delegated agent works in its own git worktree
-  branched from `origin/dev`, with a cloned `target/` for a warm cache, and
+  branched from `origin/main`, with a cloned `target/` for a warm cache, and
   never edits, cleans, or builds inside another worktree or another project.
   Nothing outside the worktree is modified for any reason: not another
   project's `target/`, not a tool's cache under the home directory, not a

@@ -29,16 +29,57 @@ use core::ops::Bound;
 
 use bytes::{Bytes, BytesMut};
 use hashbrown::{HashMap, HashSet};
+use helios_btrfs::DeviceNumber;
+use helios_btrfs::write::{Attributes, Special};
 use helios_hal::fs::{
-    DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeId,
-    NodeKind, OpenFlags, WritePosition,
+    DeviceId, DirCookie, DirEntry, DirStream, FileSystem, FsError, FsPath, FsResult, Landed,
+    Metadata, NodeId, NodeKind, OpenFlags, Opened, OwnedFsPath, PreparedWrite, RenameMode,
+    WritePosition, WriteProgress,
 };
 use spin::Mutex;
 use triomphe::Arc;
 
-use super::cmp_to_children;
+use super::{UnixAttributes, UnixFsError, UnixNodeMetadata, cmp_to_children};
 
 const ROOT_INODE: u64 = 1;
+const ROOT_UNIX: UnixAttributes = UnixAttributes {
+    permissions: 0o755,
+    uid: 0,
+    gid: 0,
+};
+/// Every bit `chmod` sets (`S_IALLUGO` in `include/linux/stat.h`).
+const S_IALLUGO: u32 = 0o7777;
+const S_ISUID: u32 = 0o4000;
+const S_ISGID: u32 = 0o2000;
+/// `XATTR_NAME_MAX` and `XATTR_SIZE_MAX` in `include/uapi/linux/limits.h`.
+const XATTR_NAME_MAX: usize = 255;
+const XATTR_SIZE_MAX: usize = 65_536;
+
+/// The Unix metadata an inode of a [`MemoryFs`] stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryUnixMetadata {
+    pub kind: NodeKind,
+    pub attributes: UnixAttributes,
+    /// The device number a character or block device names; zero for
+    /// every other kind.
+    pub rdev: DeviceNumber,
+}
+
+/// How [`MemoryFs::set_xattr`] treats an attribute that already exists,
+/// matching `XATTR_CREATE` and `XATTR_REPLACE` in
+/// `include/uapi/linux/xattr.h`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum XattrSetMode {
+    /// Create or replace (`flags == 0`).
+    #[default]
+    Any,
+    /// Fail with [`FsError::Exists`] when the attribute exists
+    /// (`XATTR_CREATE`).
+    Create,
+    /// Fail with [`FsError::NoEntry`] when the attribute is absent
+    /// (`XATTR_REPLACE`).
+    Replace,
+}
 
 /// A tree in kernel memory. Clones share the tree.
 #[derive(Clone)]
@@ -58,8 +99,11 @@ impl core::fmt::Debug for MemoryFs {
 
 struct Inode {
     kind: NodeKind,
+    unix: UnixAttributes,
+    rdev: DeviceNumber,
     /// A file's bytes or a symbolic link's target text.
     contents: Bytes,
+    xattrs: BTreeMap<String, Bytes>,
     link_count: u64,
     access_nanos: u64,
     modified_nanos: u64,
@@ -92,14 +136,18 @@ pub(super) struct UpperView {
 }
 
 impl MemoryFs {
-    /// An empty tree with only its root directory.
+    /// An empty tree with only its root directory (`0755`, owned by
+    /// `0:0`, as `RAMFS_DEFAULT_MODE` in `fs/ramfs/inode.c`).
     pub fn new(device: DeviceId) -> Self {
         let mut inodes = HashMap::new();
         inodes.insert(
             ROOT_INODE,
             Inode {
                 kind: NodeKind::Directory,
+                unix: ROOT_UNIX,
+                rdev: DeviceNumber::default(),
                 contents: Bytes::new(),
+                xattrs: BTreeMap::new(),
                 link_count: 1,
                 access_nanos: 0,
                 modified_nanos: 0,
@@ -147,15 +195,16 @@ impl MemoryFs {
     }
 
     /// Copies an object of the layer below up to `path`, keeping its
-    /// times: `contents` is a file's bytes or a link's target, and empty
-    /// for a directory, which stays merging. When the tree has an object
-    /// there already, another copy-up won and this one does nothing; when
-    /// the layer below no longer shows there, the object was removed
-    /// meanwhile: [`FsError::NoEntry`].
+    /// times and Unix attributes: `contents` is a file's bytes or a link's
+    /// target, and empty for a directory, which stays merging. When the
+    /// tree has an object there already, another copy-up won and this one
+    /// does nothing; when the layer below no longer shows there, the
+    /// object was removed meanwhile: [`FsError::NoEntry`].
     pub(super) fn copy_up(
         &self,
         path: FsPath<'_>,
         kind: NodeKind,
+        unix: UnixAttributes,
         contents: Bytes,
         original: &Metadata,
     ) -> FsResult<()> {
@@ -167,7 +216,14 @@ impl MemoryFs {
             return Err(FsError::NoEntry);
         }
         state.require_new_name(path)?;
-        let number = state.insert(path, kind, contents, original.modified_nanos);
+        let number = state.insert(
+            path,
+            kind,
+            unix,
+            DeviceNumber::default(),
+            contents,
+            original.modified_nanos,
+        );
         let inode = state
             .inodes
             .get_mut(&number)
@@ -177,12 +233,426 @@ impl MemoryFs {
         Ok(())
     }
 
+    /// The Unix attributes and device number stored on the inode at
+    /// `path`.
+    pub fn unix_metadata(&self, path: FsPath<'_>) -> FsResult<MemoryUnixMetadata> {
+        let state = self.state.lock();
+        let (_, inode) = state.inode(path)?;
+        Ok(MemoryUnixMetadata {
+            kind: inode.kind,
+            attributes: inode.unix,
+            rdev: inode.rdev,
+        })
+    }
+
+    /// Creates a regular file at `path` with explicit Unix attributes,
+    /// keeping every bit of `07777` (the set-id and sticky bits included).
+    pub fn create_file_with(
+        &self,
+        path: FsPath<'_>,
+        unix: UnixAttributes,
+        now: u64,
+    ) -> FsResult<Metadata> {
+        validate_permissions(unix.permissions)?;
+        let mut state = self.state.lock();
+        state.require_new_name(path)?;
+        state.insert(
+            path,
+            NodeKind::File,
+            unix,
+            DeviceNumber::default(),
+            Bytes::new(),
+            now,
+        );
+        state.metadata(self.device, path)
+    }
+
+    /// Creates a directory at `path` with explicit Unix attributes,
+    /// keeping every bit of `07777` (the set-id and sticky bits included).
+    pub fn create_directory_with(
+        &self,
+        path: FsPath<'_>,
+        unix: UnixAttributes,
+        now: u64,
+    ) -> FsResult<()> {
+        validate_permissions(unix.permissions)?;
+        let mut state = self.state.lock();
+        state.require_new_name(path)?;
+        state.insert(
+            path,
+            NodeKind::Directory,
+            unix,
+            DeviceNumber::default(),
+            Bytes::new(),
+            now,
+        );
+        Ok(())
+    }
+
+    /// Creates a symbolic link at `link` to `target` with explicit Unix
+    /// attributes.
+    pub fn symlink_with(
+        &self,
+        target: &str,
+        link: FsPath<'_>,
+        unix: UnixAttributes,
+        now: u64,
+    ) -> FsResult<()> {
+        validate_permissions(unix.permissions)?;
+        let mut state = self.state.lock();
+        state.require_new_name(link)?;
+        state.insert(
+            link,
+            NodeKind::Symlink,
+            unix,
+            DeviceNumber::default(),
+            Bytes::copy_from_slice(target.as_bytes()),
+            now,
+        );
+        Ok(())
+    }
+
+    /// Creates a device node, a FIFO or a socket at `path`, as
+    /// `shmem_mknod` in `mm/shmem.c`.
+    pub fn create_special(
+        &self,
+        path: FsPath<'_>,
+        special: Special,
+        unix: UnixAttributes,
+        now: u64,
+    ) -> FsResult<()> {
+        validate_permissions(unix.permissions)?;
+        let (kind, rdev) = match special {
+            Special::CharDevice(device) => (NodeKind::CharacterDevice, device),
+            Special::BlockDevice(device) => (NodeKind::BlockDevice, device),
+            Special::Fifo => (NodeKind::Fifo, DeviceNumber::default()),
+            Special::Socket => (NodeKind::Socket, DeviceNumber::default()),
+        };
+        let mut state = self.state.lock();
+        state.require_new_name(path)?;
+        state.insert(path, kind, unix, rdev, Bytes::new(), now);
+        Ok(())
+    }
+
+    /// Replaces the permission, set-id and sticky bits (`07777`) of the
+    /// inode at `path`, keeping them on every kind of inode as Linux's
+    /// storage does (`chmod_common` in `fs/open.c`).
+    pub fn set_permissions(&self, path: FsPath<'_>, permissions: u32, now: u64) -> FsResult<()> {
+        validate_permissions(permissions)?;
+        let mut state = self.state.lock();
+        let inode = state.inode_mut(path)?;
+        inode.unix.permissions = permissions;
+        inode.status_nanos = now;
+        Ok(())
+    }
+
+    /// Sets the owner and/or the group of the inode at `path`, leaving
+    /// either alone when `None`. On a non-directory, the set-id bits and
+    /// `security.capability` are dropped (`chown_common` in `fs/open.c`
+    /// with `ATTR_KILL_SUID | ATTR_KILL_SGID | ATTR_KILL_PRIV`).
+    pub fn set_owner(
+        &self,
+        path: FsPath<'_>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        now: u64,
+    ) -> FsResult<()> {
+        let mut state = self.state.lock();
+        let inode = state.inode_mut(path)?;
+        if let Some(uid) = uid {
+            inode.unix.uid = uid;
+        }
+        if let Some(gid) = gid {
+            inode.unix.gid = gid;
+        }
+        if inode.kind != NodeKind::Directory {
+            inode.unix.permissions &= !(S_ISUID | S_ISGID);
+            inode.xattrs.remove("security.capability");
+        }
+        inode.status_nanos = now;
+        Ok(())
+    }
+
+    /// Reads the extended attribute `name` on the inode at `path`, or
+    /// `Ok(None)` when that attribute is not set.
+    pub fn xattr(&self, path: FsPath<'_>, name: &str) -> FsResult<Option<Bytes>> {
+        let state = self.state.lock();
+        let (_, inode) = state.inode(path)?;
+        match validate_xattr_name(inode.kind, name, XattrOp::Read) {
+            Ok(()) => Ok(inode.xattrs.get(name).cloned()),
+            Err(FsError::NoEntry) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Lists every extended attribute name stored on the inode at `path`,
+    /// in lexicographic order.
+    pub fn list_xattrs(&self, path: FsPath<'_>) -> FsResult<Vec<String>> {
+        let state = self.state.lock();
+        let (_, inode) = state.inode(path)?;
+        Ok(inode.xattrs.keys().cloned().collect())
+    }
+
+    /// Sets the extended attribute `name` on the inode at `path`, in the
+    /// `user.*`, `security.*`, `trusted.*` and `system.posix_acl_*`
+    /// namespaces of `shmem_xattr_handlers` in `mm/shmem.c`, with no
+    /// policy refusal of what an attribute would mean.
+    pub fn set_xattr(
+        &self,
+        path: FsPath<'_>,
+        name: &str,
+        value: Bytes,
+        mode: XattrSetMode,
+        now: u64,
+    ) -> FsResult<()> {
+        if value.len() > XATTR_SIZE_MAX {
+            return Err(FsError::Overflow);
+        }
+        let mut state = self.state.lock();
+        let inode = state.inode_mut(path)?;
+        validate_xattr_name(inode.kind, name, XattrOp::Set)?;
+        let exists = inode.xattrs.contains_key(name);
+        match (mode, exists) {
+            (XattrSetMode::Create, true) => return Err(FsError::Exists),
+            (XattrSetMode::Replace, false) => return Err(FsError::NoEntry),
+            _ => {}
+        }
+        inode.xattrs.insert(String::from(name), value);
+        inode.status_nanos = now;
+        Ok(())
+    }
+
+    /// Removes the extended attribute `name` from the inode at `path`,
+    /// returning whether it was present.
+    pub fn remove_xattr(&self, path: FsPath<'_>, name: &str, now: u64) -> FsResult<bool> {
+        let mut state = self.state.lock();
+        let inode = state.inode_mut(path)?;
+        validate_xattr_name(inode.kind, name, XattrOp::Remove)?;
+        let removed = inode.xattrs.remove(name).is_some();
+        if removed {
+            inode.status_nanos = now;
+        }
+        Ok(removed)
+    }
+
+    fn resolve_create_unix(
+        state: &MemoryState,
+        path: FsPath<'_>,
+        kind: NodeKind,
+        attributes: Attributes,
+    ) -> FsResult<UnixAttributes> {
+        let (parent, _) = path.split_last().ok_or(FsError::Exists)?;
+        let (_, parent_inode) = state.inode(parent)?;
+        if parent_inode.kind != NodeKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        let parent_sgid = (parent_inode.unix.permissions & S_ISGID) != 0;
+        let gid = if parent_sgid {
+            parent_inode.unix.gid
+        } else {
+            attributes.gid
+        };
+        let permissions = match kind {
+            NodeKind::Symlink => 0o777,
+            NodeKind::Directory => {
+                ((attributes.permissions & 0o1777) & !(attributes.umask & 0o777))
+                    | if parent_sgid { S_ISGID } else { 0 }
+            }
+            _ => (attributes.permissions & S_IALLUGO) & !(attributes.umask & 0o777),
+        };
+        Ok(UnixAttributes {
+            permissions,
+            uid: attributes.uid,
+            gid,
+        })
+    }
+
+    pub fn open_unix(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<Opened<OwnedFsPath>, UnixFsError> {
+        let mut state = self.state.lock();
+        let metadata = match state.metadata(self.device, path) {
+            Ok(metadata) => {
+                if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
+                    return Err(FsError::Exists.into());
+                }
+                metadata
+            }
+            Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
+                if flags.contains(OpenFlags::DIRECTORY) {
+                    return Err(FsError::NotDirectory.into());
+                }
+                let unix = Self::resolve_create_unix(&state, path, NodeKind::File, attributes)?;
+                state.require_new_name(path)?;
+                state.insert(
+                    path,
+                    NodeKind::File,
+                    unix,
+                    DeviceNumber::default(),
+                    Bytes::new(),
+                    now,
+                );
+                state.metadata(self.device, path)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(refusal) = metadata.kind.open_refusal() {
+            return Err(refusal.into());
+        }
+        if flags.contains(OpenFlags::DIRECTORY) && metadata.kind != NodeKind::Directory {
+            return Err(FsError::NotDirectory.into());
+        }
+        if flags.contains(OpenFlags::TRUNCATE) {
+            let inode = state.inode_mut(path)?;
+            if inode.kind == NodeKind::Directory {
+                return Err(FsError::IsDirectory.into());
+            }
+            inode.contents.clear();
+            inode.modified_nanos = now;
+            inode.status_nanos = now;
+        }
+        let metadata = state.metadata(self.device, path)?;
+        Ok(Opened {
+            metadata,
+            handle: path.into(),
+        })
+    }
+
+    pub fn create_directory_unix(
+        &self,
+        path: FsPath<'_>,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        let mut state = self.state.lock();
+        let unix = Self::resolve_create_unix(&state, path, NodeKind::Directory, attributes)?;
+        state.require_new_name(path)?;
+        state.insert(
+            path,
+            NodeKind::Directory,
+            unix,
+            DeviceNumber::default(),
+            Bytes::new(),
+            now,
+        );
+        Ok(())
+    }
+
+    pub fn symlink_unix(
+        &self,
+        target: &str,
+        link: FsPath<'_>,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        let mut state = self.state.lock();
+        let unix = Self::resolve_create_unix(&state, link, NodeKind::Symlink, attributes)?;
+        state.require_new_name(link)?;
+        state.insert(
+            link,
+            NodeKind::Symlink,
+            unix,
+            DeviceNumber::default(),
+            Bytes::copy_from_slice(target.as_bytes()),
+            now,
+        );
+        Ok(())
+    }
+
+    pub fn create_special_unix(
+        &self,
+        path: FsPath<'_>,
+        special: Special,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        let (kind, rdev) = match special {
+            Special::CharDevice(device) => (NodeKind::CharacterDevice, device),
+            Special::BlockDevice(device) => (NodeKind::BlockDevice, device),
+            Special::Fifo => (NodeKind::Fifo, DeviceNumber::default()),
+            Special::Socket => (NodeKind::Socket, DeviceNumber::default()),
+        };
+        let mut state = self.state.lock();
+        let unix = Self::resolve_create_unix(&state, path, kind, attributes)?;
+        state.require_new_name(path)?;
+        state.insert(path, kind, unix, rdev, Bytes::new(), now);
+        Ok(())
+    }
+
+    pub fn unix_node_metadata(&self, path: FsPath<'_>) -> Result<UnixNodeMetadata, UnixFsError> {
+        let md = self.unix_metadata(path)?;
+        Ok(UnixNodeMetadata {
+            kind: md.kind,
+            attributes: md.attributes,
+            rdev: md.rdev.encode(),
+        })
+    }
+
+    pub fn set_xattr_unix(
+        &self,
+        path: FsPath<'_>,
+        name: &str,
+        value: Bytes,
+        mode: XattrSetMode,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        if value.len() > XATTR_SIZE_MAX {
+            return Err(UnixFsError::ArgTooBig);
+        }
+        let mut state = self.state.lock();
+        let inode = state.inode_mut(path)?;
+        validate_xattr_name(inode.kind, name, XattrOp::Set).map_err(|e| match e {
+            FsError::NameTooLong => UnixFsError::Range,
+            FsError::NotPermitted => UnixFsError::PermissionDenied,
+            other => UnixFsError::Fs(other),
+        })?;
+        let exists = inode.xattrs.contains_key(name);
+        match (mode, exists) {
+            (XattrSetMode::Create, true) => return Err(FsError::Exists.into()),
+            (XattrSetMode::Replace, false) => return Err(UnixFsError::NoData),
+            _ => {}
+        }
+        inode.xattrs.insert(String::from(name), value);
+        inode.status_nanos = now;
+        Ok(())
+    }
+
+    pub fn remove_xattr_unix(
+        &self,
+        path: FsPath<'_>,
+        name: &str,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        let mut state = self.state.lock();
+        let inode = state.inode_mut(path)?;
+        validate_xattr_name(inode.kind, name, XattrOp::Remove).map_err(|e| match e {
+            FsError::NameTooLong => UnixFsError::Range,
+            FsError::NotPermitted => UnixFsError::PermissionDenied,
+            other => UnixFsError::Fs(other),
+        })?;
+        if inode.xattrs.remove(name).is_none() {
+            return Err(UnixFsError::NoData);
+        }
+        inode.status_nanos = now;
+        Ok(())
+    }
+
     /// Removes the object at `path` (a directory when `directory`, which
     /// must hold no names) and, when `whiteout`, records a whiteout there
     /// so the layer below stays hidden. With `whiteout`, a path the tree
     /// has no object at is the layer below's alone, and only the whiteout
     /// is recorded.
-    pub(super) fn remove(&self, path: FsPath<'_>, directory: bool, whiteout: bool) -> FsResult<()> {
+    pub(super) fn remove(
+        &self,
+        path: FsPath<'_>,
+        directory: bool,
+        whiteout: bool,
+        now: u64,
+    ) -> FsResult<()> {
         if path.is_root() {
             return Err(if directory {
                 FsError::NotPermitted
@@ -201,6 +671,17 @@ impl MemoryFs {
                     }
                     _ => {}
                 }
+                let number = state.inode_of(path).expect("removed name exists");
+                let (parent, _) = path.split_last().expect("root removal was rejected");
+                let parent = state.inode_of(parent).expect("removed name has a parent");
+                state
+                    .inodes
+                    .get_mut(&number)
+                    .expect("removed inode exists")
+                    .status_nanos = now;
+                let parent = state.inodes.get_mut(&parent).expect("parent inode exists");
+                parent.modified_nanos = now;
+                parent.status_nanos = now;
                 state.remove_name(path);
             }
             Err(FsError::NoEntry) if whiteout && state.beneath(path) => {}
@@ -217,10 +698,15 @@ impl MemoryFs {
 
     /// Renames as [`FileSystem::rename`] does, then records a whiteout at
     /// `source` when `whiteout`, so the layer below stays hidden there.
+    /// An exchange leaves both names in place and so records no whiteout.
+    ///
+    /// The whole change happens under the tree's lock, so it is atomic to
+    /// every reader.
     pub(super) fn rename_over(
         &self,
         source: FsPath<'_>,
         destination: FsPath<'_>,
+        mode: RenameMode,
         now: u64,
         whiteout: bool,
     ) -> FsResult<()> {
@@ -228,15 +714,55 @@ impl MemoryFs {
             return Err(FsError::NotPermitted);
         }
         let mut state = self.state.lock();
-        let (_, inode) = state.inode(source)?;
-        if source == destination {
-            return Ok(());
+        let (source_inode, source_kind) = {
+            let (number, inode) = state.inode(source)?;
+            (number, inode.kind)
+        };
+        if mode == RenameMode::Exchange {
+            debug_assert!(!whiteout, "an exchange hides nothing");
+            return state.exchange(source, destination, now);
         }
-        if inode.kind == NodeKind::Directory && destination.starts_with(source) {
+        if source == destination {
+            return match mode {
+                RenameMode::NoReplace => Err(FsError::Exists),
+                RenameMode::Replace | RenameMode::Exchange => Ok(()),
+            };
+        }
+        if source_kind == NodeKind::Directory && destination.starts_with(source) {
             return Err(FsError::NotPermitted);
         }
-        state.require_new_name(destination)?;
-        let source_inode = state.inode_of(source)?;
+        let Some((dest_parent, _)) = destination.split_last() else {
+            return Err(FsError::NotPermitted);
+        };
+        if state.inode(dest_parent)?.1.kind != NodeKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        if let Ok((dest_inode, dest)) = state.inode(destination) {
+            if mode == RenameMode::NoReplace {
+                return Err(FsError::Exists);
+            }
+            if dest_inode == source_inode {
+                return Ok(());
+            }
+            let dest_is_dir = dest.kind == NodeKind::Directory;
+            match (source_kind == NodeKind::Directory, dest_is_dir) {
+                (true, false) => return Err(FsError::NotDirectory),
+                (false, true) => return Err(FsError::IsDirectory),
+                (true, true) if state.children(destination).next().is_some() => {
+                    return Err(FsError::NotEmpty);
+                }
+                _ => {}
+            }
+            state
+                .inodes
+                .get_mut(&dest_inode)
+                .expect("replaced inode exists")
+                .status_nanos = now;
+            state.remove_name(destination);
+            if dest_is_dir {
+                state.drop_whiteouts_below(destination);
+            }
+        }
         let moved: Vec<(String, u64)> =
             core::iter::once((source.as_str().to_string(), source_inode))
                 .chain(
@@ -245,14 +771,7 @@ impl MemoryFs {
                         .map(|(name, number)| (name.clone(), *number)),
                 )
                 .collect();
-        let renamed = |name: &str| {
-            let mut renamed = String::with_capacity(
-                destination.as_str().len() + name.len() - source.as_str().len(),
-            );
-            renamed.push_str(destination.as_str());
-            renamed.push_str(&name[source.as_str().len()..]);
-            renamed
-        };
+        let renamed = |name: &str| rebase(name, source, destination);
         for (name, number) in moved {
             state.names.remove(&name);
             state.names.insert(renamed(&name), number);
@@ -274,7 +793,150 @@ impl MemoryFs {
     }
 }
 
+/// Validates `permissions` against `07777` (`S_IALLUGO`).
+fn validate_permissions(permissions: u32) -> FsResult<()> {
+    if permissions & !S_IALLUGO != 0 {
+        return Err(FsError::Invalid);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum XattrOp {
+    Read,
+    Set,
+    Remove,
+}
+
+/// Validates an extended attribute name against Linux's tmpfs handlers
+/// (`shmem_xattr_handlers` in `mm/shmem.c`, `xattr_permission` and
+/// `xattr_resolve_name` in `fs/xattr.c`, and `posix_acl_xattr_set` in
+/// `fs/posix_acl.c`). No attribute is refused for what its value means.
+fn validate_xattr_name(kind: NodeKind, name: &str, op: XattrOp) -> FsResult<()> {
+    if name.len() > XATTR_NAME_MAX {
+        return Err(FsError::NameTooLong);
+    }
+    if let Some(suffix) = name.strip_prefix("user.") {
+        // `xattr_permission` in `fs/xattr.c` runs before `xattr_resolve_name`:
+        // `user.*` applies to regular files, directories and sockets, and any
+        // other kind answers `EPERM` for `MAY_WRITE` and `ENODATA` for `MAY_READ`.
+        if !matches!(
+            kind,
+            NodeKind::File | NodeKind::Directory | NodeKind::Socket
+        ) {
+            return Err(match op {
+                XattrOp::Read => FsError::NoEntry,
+                XattrOp::Set | XattrOp::Remove => FsError::NotPermitted,
+            });
+        }
+        if suffix.is_empty() {
+            return Err(FsError::Invalid);
+        }
+        return Ok(());
+    }
+    if let Some(suffix) = name
+        .strip_prefix("security.")
+        .or_else(|| name.strip_prefix("trusted."))
+    {
+        if suffix.is_empty() {
+            return Err(FsError::Invalid);
+        }
+        return Ok(());
+    }
+    if name == "system.posix_acl_access" {
+        if kind == NodeKind::Symlink {
+            return Err(FsError::Unsupported);
+        }
+        return Ok(());
+    }
+    if name == "system.posix_acl_default" {
+        if kind == NodeKind::Symlink {
+            return Err(FsError::Unsupported);
+        }
+        if op == XattrOp::Set && kind != NodeKind::Directory {
+            return Err(FsError::NotPermitted);
+        }
+        return Ok(());
+    }
+    Err(FsError::Unsupported)
+}
+
+/// `name`, which is `from` or lies below it, moved to the same place
+/// below `to`.
+fn rebase(name: &str, from: FsPath<'_>, to: FsPath<'_>) -> String {
+    let mut rebased = String::with_capacity(to.as_str().len() + name.len() - from.as_str().len());
+    rebased.push_str(to.as_str());
+    rebased.push_str(&name[from.as_str().len()..]);
+    rebased
+}
+
 impl MemoryState {
+    /// Swaps the objects at `first` and `second`, each with whatever lies
+    /// below it. Two names of one object stay as they are, and a directory
+    /// with the other name below it is [`FsError::Invalid`].
+    fn exchange(&mut self, first: FsPath<'_>, second: FsPath<'_>, now: u64) -> FsResult<()> {
+        let (first_number, first_kind) = {
+            let (number, inode) = self.inode(first)?;
+            (number, inode.kind)
+        };
+        let (second_number, second_kind) = {
+            let (number, inode) = self.inode(second)?;
+            (number, inode.kind)
+        };
+        if first_number == second_number {
+            return Ok(());
+        }
+        if (first_kind == NodeKind::Directory && second.starts_with(first))
+            || (second_kind == NodeKind::Directory && first.starts_with(second))
+        {
+            return Err(FsError::Invalid);
+        }
+        let subtree = |state: &Self, path: FsPath<'_>, number: u64| -> Vec<(String, u64)> {
+            core::iter::once((path.as_str().to_string(), number))
+                .chain(
+                    state
+                        .descendants(path)
+                        .map(|(name, number)| (name.clone(), *number)),
+                )
+                .collect()
+        };
+        let first_names = subtree(self, first, first_number);
+        let second_names = subtree(self, second, second_number);
+        let first_whiteouts = self.whiteouts_below(first);
+        let second_whiteouts = self.whiteouts_below(second);
+        for (name, _) in first_names.iter().chain(&second_names) {
+            self.names.remove(name);
+        }
+        for name in first_whiteouts.iter().chain(&second_whiteouts) {
+            self.whiteouts.remove(name);
+        }
+        for (name, number) in first_names {
+            self.names.insert(rebase(&name, first, second), number);
+        }
+        for (name, number) in second_names {
+            self.names.insert(rebase(&name, second, first), number);
+        }
+        for name in first_whiteouts {
+            self.whiteouts.insert(rebase(&name, first, second));
+        }
+        for name in second_whiteouts {
+            self.whiteouts.insert(rebase(&name, second, first));
+        }
+        for number in [first_number, second_number] {
+            self.inodes
+                .get_mut(&number)
+                .expect("every name refers to a live inode")
+                .status_nanos = now;
+        }
+        for path in [first, second] {
+            let (parent, _) = path.split_last().expect("the root was rejected");
+            let parent = self.inode_mut(parent)?;
+            parent.modified_nanos = now;
+            parent.status_nanos = now;
+        }
+        Ok(())
+    }
+
     fn inode_of(&self, path: FsPath<'_>) -> FsResult<u64> {
         if path.is_root() {
             return Ok(ROOT_INODE);
@@ -305,8 +967,14 @@ impl MemoryState {
             kind: inode.kind,
             link_count: inode.link_count,
             size: match inode.kind {
-                NodeKind::Directory => 0,
                 NodeKind::File | NodeKind::Symlink => inode.contents.len() as u64,
+                // The tree creates only files, directories and symlinks;
+                // a report-only node has no contents here.
+                NodeKind::Directory
+                | NodeKind::CharacterDevice
+                | NodeKind::BlockDevice
+                | NodeKind::Fifo
+                | NodeKind::Socket => 0,
             },
             access_nanos: inode.access_nanos,
             modified_nanos: inode.modified_nanos,
@@ -324,18 +992,41 @@ impl MemoryState {
         }
         match self.inode(parent)?.1.kind {
             NodeKind::Directory => Ok(()),
-            NodeKind::File | NodeKind::Symlink => Err(FsError::NotDirectory),
+            NodeKind::File
+            | NodeKind::Symlink
+            | NodeKind::CharacterDevice
+            | NodeKind::BlockDevice
+            | NodeKind::Fifo
+            | NodeKind::Socket => Err(FsError::NotDirectory),
         }
     }
 
-    fn insert(&mut self, path: FsPath<'_>, kind: NodeKind, contents: Bytes, now: u64) -> u64 {
+    /// The Unix attributes a node of `kind` at `path` inherits from its
+    /// parent directory when created without a caller identity.
+    fn inherited_unix(&self, path: FsPath<'_>, kind: NodeKind) -> FsResult<UnixAttributes> {
+        let (parent, _) = path.split_last().ok_or(FsError::Exists)?;
+        Ok(self.inode(parent)?.1.unix.inherited(kind))
+    }
+
+    fn insert(
+        &mut self,
+        path: FsPath<'_>,
+        kind: NodeKind,
+        unix: UnixAttributes,
+        rdev: DeviceNumber,
+        contents: Bytes,
+        now: u64,
+    ) -> u64 {
         let number = self.next_inode;
         self.next_inode += 1;
         self.inodes.insert(
             number,
             Inode {
                 kind,
+                unix,
+                rdev,
                 contents,
+                xattrs: BTreeMap::new(),
                 link_count: 1,
                 access_nanos: now,
                 modified_nanos: now,
@@ -448,11 +1139,7 @@ impl MemoryState {
         edit: impl FnOnce(&mut BytesMut) -> FsResult<()>,
     ) -> FsResult<()> {
         let inode = self.inode_mut(path)?;
-        match inode.kind {
-            NodeKind::File => {}
-            NodeKind::Directory => return Err(FsError::IsDirectory),
-            NodeKind::Symlink => return Err(FsError::Invalid),
-        }
+        inode.kind.require_regular()?;
         let contents = core::mem::take(&mut inode.contents);
         let mut contents = contents
             .try_into_mut()
@@ -466,8 +1153,69 @@ impl MemoryState {
     }
 }
 
+/// A write to a [`MemoryFs`], staged at once: its one round is the whole
+/// write, and filling writes straight into the file's
+/// own storage under the tree's lock.
+pub struct MemoryWrite {
+    fs: MemoryFs,
+    path: OwnedFsPath,
+    position: WritePosition,
+    len: usize,
+    now: u64,
+}
+
+impl MemoryWrite {
+    /// Stages a write of `len` bytes to the regular file at `path`,
+    /// refusing it at once when `path` names none.
+    pub(super) fn prepare(
+        fs: &MemoryFs,
+        path: FsPath<'_>,
+        position: WritePosition,
+        len: usize,
+        now: u64,
+    ) -> FsResult<Self> {
+        fs.state.lock().inode(path)?.1.kind.require_regular()?;
+        Ok(Self {
+            fs: fs.clone(),
+            path: path.into(),
+            position,
+            len,
+            now,
+        })
+    }
+
+    /// Lands the write and resolves with the offset it began at. The
+    /// checks of [`Self::prepare`] are made again under the lock, since
+    /// the file may have changed in between.
+    pub(super) fn land(self, mut fill: impl FnMut(usize, &mut [u8])) -> FsResult<Landed> {
+        self.fs.write_now(
+            self.path.as_path(),
+            self.position,
+            self.len,
+            self.now,
+            |destination| fill(0, destination),
+        )
+    }
+}
+
+impl PreparedWrite for MemoryWrite {
+    type Filled = FsResult<WriteProgress<Self>>;
+
+    fn staged_len(&self) -> usize {
+        self.len
+    }
+
+    fn fill<F>(self, fill: F) -> Self::Filled
+    where
+        F: FnMut(usize, &mut [u8]),
+    {
+        // The result retains neither the filler nor the tree lock.
+        self.land(fill).map(WriteProgress::Done)
+    }
+}
+
 impl MemoryFs {
-    /// [`FileSystem::write_with`], done at once: `fill` writes straight
+    /// Writes `len` bytes at `position` at once: `fill` writes straight
     /// into the file's storage.
     pub(super) fn write_now(
         &self,
@@ -476,7 +1224,7 @@ impl MemoryFs {
         len: usize,
         now: u64,
         fill: impl FnOnce(&mut [u8]),
-    ) -> FsResult<u64> {
+    ) -> FsResult<Landed> {
         let mut landed = 0;
         self.state.lock().edit_contents(path, now, |contents| {
             let at = match position {
@@ -493,21 +1241,80 @@ impl MemoryFs {
             landed = at as u64;
             Ok(())
         })?;
-        Ok(landed)
+        Ok(Landed {
+            offset: landed,
+            len,
+        })
+    }
+}
+
+/// An open directory stream over a [`MemoryFs`].
+pub struct MemoryDir {
+    fs: MemoryFs,
+    path: OwnedFsPath,
+}
+
+impl DirStream for MemoryDir {
+    async fn read(&self, cookie: DirCookie, max_entries: usize) -> FsResult<Vec<DirEntry>> {
+        self.fs
+            .read_dir_at(self.path.as_path(), cookie, max_entries)
+    }
+
+    async fn rewind(&mut self) -> FsResult<()> {
+        Ok(())
+    }
+}
+
+impl MemoryFs {
+    pub(super) fn read_dir_at(
+        &self,
+        path: FsPath<'_>,
+        cookie: DirCookie,
+        max_entries: usize,
+    ) -> FsResult<Vec<DirEntry>> {
+        let state = self.state.lock();
+        if state.inode(path)?.1.kind != NodeKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        let skip = usize::try_from(cookie.raw()).map_err(|_| FsError::Invalid)?;
+        Ok(state
+            .children(path)
+            .enumerate()
+            .skip(skip)
+            .take(max_entries)
+            .map(|(position, (name, number))| DirEntry {
+                name: String::from(name),
+                kind: state.inodes[&number].kind,
+                inode: number,
+                next: DirCookie::new(position as u64 + 1),
+            })
+            .collect())
     }
 }
 
 impl FileSystem for MemoryFs {
+    super::delegate_path_handles!();
+    type Write = MemoryWrite;
+    type Dir = MemoryDir;
+
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.state.lock().metadata(self.device, path)
     }
 
-    async fn open(&self, path: FsPath<'_>, flags: OpenFlags, now: u64) -> FsResult<Metadata> {
+    async fn open(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        now: u64,
+    ) -> FsResult<helios_hal::fs::Opened<OwnedFsPath>> {
         let mut state = self.state.lock();
         match state.inode(path) {
             Ok((_, inode)) => {
                 if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
                     return Err(FsError::Exists);
+                }
+                if let Some(refusal) = inode.kind.open_refusal() {
+                    return Err(refusal);
                 }
                 if flags.contains(OpenFlags::DIRECTORY) && inode.kind != NodeKind::Directory {
                     return Err(FsError::NotDirectory);
@@ -524,21 +1331,29 @@ impl FileSystem for MemoryFs {
                     return Err(FsError::Invalid);
                 }
                 state.require_new_name(path)?;
-                state.insert(path, NodeKind::File, Bytes::new(), now);
+                let unix = state.inherited_unix(path, NodeKind::File)?;
+                state.insert(
+                    path,
+                    NodeKind::File,
+                    unix,
+                    DeviceNumber::default(),
+                    Bytes::new(),
+                    now,
+                );
             }
             Err(error) => return Err(error),
         }
-        state.metadata(self.device, path)
+        let metadata = state.metadata(self.device, path)?;
+        Ok(helios_hal::fs::Opened {
+            metadata,
+            handle: OwnedFsPath::from(path),
+        })
     }
 
     async fn read_at(&self, path: FsPath<'_>, offset: u64, max_bytes: usize) -> FsResult<Bytes> {
         let state = self.state.lock();
         let (_, inode) = state.inode(path)?;
-        match inode.kind {
-            NodeKind::File => {}
-            NodeKind::Directory => return Err(FsError::IsDirectory),
-            NodeKind::Symlink => return Err(FsError::Invalid),
-        }
+        inode.kind.require_regular()?;
         let offset = usize::try_from(offset).map_err(|_| FsError::Overflow)?;
         if offset >= inode.contents.len() {
             return Ok(Bytes::new());
@@ -547,20 +1362,14 @@ impl FileSystem for MemoryFs {
         Ok(inode.contents.slice(offset..end))
     }
 
-    fn write_with<'a, F>(
+    fn prepare_write<'a>(
         &'a self,
         path: FsPath<'a>,
         position: WritePosition,
         len: usize,
         now: u64,
-        fill: F,
-    ) -> impl Future<Output = FsResult<u64>> + Send + 'a
-    where
-        F: FnOnce(&mut [u8]),
-    {
-        // The write is done here, under the lock; the future only reports
-        // it, so it holds nothing of `fill`.
-        core::future::ready(self.write_now(path, position, len, now, fill))
+    ) -> impl Future<Output = FsResult<MemoryWrite>> + Send + 'a {
+        core::future::ready(MemoryWrite::prepare(self, path, position, len, now))
     }
 
     async fn set_size(&self, path: FsPath<'_>, size: u64, now: u64) -> FsResult<()> {
@@ -592,48 +1401,48 @@ impl FileSystem for MemoryFs {
         Ok(())
     }
 
-    async fn read_dir(
-        &self,
-        path: FsPath<'_>,
-        cookie: DirCookie,
-        max_entries: usize,
-    ) -> FsResult<Vec<DirEntry>> {
+    async fn open_dir(&self, path: FsPath<'_>) -> FsResult<MemoryDir> {
         let state = self.state.lock();
         if state.inode(path)?.1.kind != NodeKind::Directory {
             return Err(FsError::NotDirectory);
         }
-        let skip = usize::try_from(cookie.raw()).map_err(|_| FsError::Invalid)?;
-        Ok(state
-            .children(path)
-            .enumerate()
-            .skip(skip)
-            .take(max_entries)
-            .map(|(position, (name, number))| DirEntry {
-                name: String::from(name),
-                kind: state.inodes[&number].kind,
-                inode: number,
-                next: DirCookie::new(position as u64 + 1),
-            })
-            .collect())
+        Ok(MemoryDir {
+            fs: self.clone(),
+            path: OwnedFsPath::from(path),
+        })
     }
 
     async fn create_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
         let mut state = self.state.lock();
         state.require_new_name(path)?;
-        state.insert(path, NodeKind::Directory, Bytes::new(), now);
+        let unix = state.inherited_unix(path, NodeKind::Directory)?;
+        state.insert(
+            path,
+            NodeKind::Directory,
+            unix,
+            DeviceNumber::default(),
+            Bytes::new(),
+            now,
+        );
         Ok(())
     }
 
-    async fn remove_directory(&self, path: FsPath<'_>) -> FsResult<()> {
-        self.remove(path, true, false)
+    async fn remove_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+        self.remove(path, true, false, now)
     }
 
-    async fn unlink(&self, path: FsPath<'_>) -> FsResult<()> {
-        self.remove(path, false, false)
+    async fn unlink(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+        self.remove(path, false, false, now)
     }
 
-    async fn rename(&self, source: FsPath<'_>, destination: FsPath<'_>, now: u64) -> FsResult<()> {
-        self.rename_over(source, destination, now, false)
+    async fn rename(
+        &self,
+        source: FsPath<'_>,
+        destination: FsPath<'_>,
+        mode: RenameMode,
+        now: u64,
+    ) -> FsResult<()> {
+        self.rename_over(source, destination, mode, now, false)
     }
 
     async fn link(&self, existing: FsPath<'_>, link: FsPath<'_>, now: u64) -> FsResult<()> {
@@ -657,9 +1466,12 @@ impl FileSystem for MemoryFs {
     async fn symlink(&self, target: &str, link: FsPath<'_>, now: u64) -> FsResult<()> {
         let mut state = self.state.lock();
         state.require_new_name(link)?;
+        let unix = state.inherited_unix(link, NodeKind::Symlink)?;
         state.insert(
             link,
             NodeKind::Symlink,
+            unix,
+            DeviceNumber::default(),
             Bytes::copy_from_slice(target.as_bytes()),
             now,
         );
@@ -695,7 +1507,8 @@ mod tests {
 
     use futures_lite::future::block_on;
     use helios_hal::fs::{
-        DeviceId, DirCookie, FileSystem, FsError, FsPath, NodeKind, OpenFlags, WritePosition,
+        DeviceId, DirCookie, DirStream, FileSystem, FilledWrite, FsError, FsPath, Landed, NodeKind,
+        OpenFlags, PreparedWrite, RenameMode, WritePosition, WriteProgress,
     };
 
     use super::MemoryFs;
@@ -710,11 +1523,104 @@ mod tests {
     }
 
     fn names(fs: &MemoryFs, directory: &str) -> Vec<String> {
-        block_on(fs.read_dir(path(directory), DirCookie::START, usize::MAX))
+        let dir = block_on(fs.open_dir(path(directory))).expect("opens directory");
+        block_on(dir.read(DirCookie::START, usize::MAX))
             .expect("directory lists")
             .into_iter()
             .map(|entry| entry.name)
             .collect()
+    }
+
+    /// Creates of one path that race on several processors: one wins,
+    /// every other is told the name exists, and none panics. Each round
+    /// races the four ways a name comes into being.
+    #[test]
+    fn racing_creates_of_one_path_leave_one_winner() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        const RACERS: usize = 8;
+        const ROUNDS: usize = 200;
+
+        let fs = tree();
+        block_on(fs.open(path("existing"), OpenFlags::CREATE, 0)).expect("creates");
+        for round in 0..ROUNDS {
+            let name = alloc::format!("raced-{round}");
+            let barrier = Barrier::new(RACERS);
+            let outcomes: Vec<Result<(), FsError>> = thread::scope(|scope| {
+                let racers: Vec<_> = (0..RACERS)
+                    .map(|racer| {
+                        let (fs, name, barrier) = (&fs, &name, &barrier);
+                        scope.spawn(move || {
+                            let new = path(name);
+                            barrier.wait();
+                            block_on(async {
+                                match racer % 4 {
+                                    0 => fs
+                                        .open(new, OpenFlags::CREATE | OpenFlags::EXCLUSIVE, 1)
+                                        .await
+                                        .map(drop),
+                                    1 => fs.create_directory(new, 1).await,
+                                    2 => fs.symlink("existing", new, 1).await,
+                                    _ => fs.link(path("existing"), new, 1).await,
+                                }
+                            })
+                        })
+                    })
+                    .collect();
+                racers
+                    .into_iter()
+                    .map(|racer| racer.join().expect("no create panics"))
+                    .collect()
+            });
+            let winners = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+            assert_eq!(winners, 1, "round {round}: {outcomes:?}");
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|outcome| matches!(outcome, Ok(()) | Err(FsError::Exists))),
+                "round {round}: {outcomes:?}"
+            );
+            block_on(fs.stat(path(&name))).expect("the winner's node is there");
+        }
+    }
+
+    #[test]
+    fn a_write_is_refused_while_staging_and_a_dropped_one_changes_nothing() {
+        let fs = tree();
+        block_on(fs.create_directory(path("d"), 1)).expect("creates the directory");
+        block_on(fs.open(path("f"), OpenFlags::CREATE, 1)).expect("creates the file");
+        block_on(write_bytes(
+            &fs,
+            path("f"),
+            WritePosition::At(0),
+            b"kept",
+            2,
+        ))
+        .expect("writes");
+
+        assert!(matches!(
+            block_on(fs.prepare_write(path("d"), WritePosition::At(0), 1, 3)),
+            Err(FsError::IsDirectory)
+        ));
+        assert!(matches!(
+            block_on(fs.prepare_write(path("missing"), WritePosition::End, 1, 3)),
+            Err(FsError::NoEntry)
+        ));
+        // Staged, then dropped at the end of the statement.
+        assert_eq!(
+            block_on(fs.prepare_write(path("f"), WritePosition::At(0), 4, 3))
+                .expect("stages")
+                .staged_len(),
+            4
+        );
+
+        let read = block_on(fs.read_at(path("f"), 0, 64)).expect("reads");
+        assert_eq!(read.as_ref(), b"kept");
+        assert_eq!(
+            block_on(fs.stat(path("f"))).expect("stats").modified_nanos,
+            2
+        );
     }
 
     #[test]
@@ -726,22 +1632,57 @@ mod tests {
             Ok(2),
             "writes past the end"
         );
-        // The filesystem hands its own storage to the filler.
-        assert_eq!(
+        // The filesystem stages the whole write in one round and hands its
+        // own storage to the filler.
+        let staged =
+            block_on(fs.prepare_write(path("f"), WritePosition::End, 2, 7)).expect("stages");
+        assert_eq!(staged.staged_len(), 2);
+        assert!(matches!(
             block_on(
-                fs.write_with(path("f"), WritePosition::End, 2, 7, |destination| {
-                    assert_eq!(destination, [0, 0]);
-                    destination.copy_from_slice(b"ef");
-                })
+                staged
+                    .fill(|at, destination| {
+                        assert_eq!((at, &*destination), (0, &[0, 0][..]));
+                        destination.copy_from_slice(b"ef");
+                    })
+                    .submit()
             ),
-            Ok(4)
-        );
+            Ok(WriteProgress::Done(Landed { offset: 4, len: 2 }))
+        ));
         let read = block_on(fs.read_at(path("f"), 0, 64)).expect("reads");
         assert_eq!(read.as_ref(), b"\0\0cdef");
         let stat = block_on(fs.stat(path("f"))).expect("stats");
         assert_eq!((stat.size, stat.modified_nanos), (6, 7));
         block_on(fs.open(path("f"), OpenFlags::TRUNCATE, 8)).expect("truncates");
         assert_eq!(block_on(fs.stat(path("f"))).expect("stats").size, 0);
+    }
+
+    #[test]
+    fn a_filled_write_outlives_its_source() {
+        let fs = tree();
+        block_on(fs.open(path("f"), OpenFlags::CREATE, 0)).expect("creates");
+        let source = "文件・ファイル・파일".as_bytes().to_vec();
+        let staged = {
+            let preparing_fs = fs.clone();
+            let preparing_path = String::from("f");
+            block_on(preparing_fs.prepare_write(
+                path(&preparing_path),
+                WritePosition::At(0),
+                source.len(),
+                1,
+            ))
+            .expect("stages")
+        };
+        let filled = staged.fill(|at, destination| {
+            destination.copy_from_slice(&source[at..at + destination.len()]);
+        });
+        let len = source.len();
+        drop(source);
+        assert!(matches!(
+            block_on(filled.submit()),
+            Ok(WriteProgress::Done(Landed { offset: 0, len: landed })) if landed == len
+        ));
+        let bytes = block_on(fs.read_at(path("f"), 0, 128)).expect("reads");
+        assert_eq!(bytes.as_ref(), "文件・ファイル・파일".as_bytes());
     }
 
     #[test]
@@ -768,8 +1709,116 @@ mod tests {
             (a.link_count, a.id),
             (2, block_on(fs.stat(path("b"))).expect("stats").id)
         );
-        block_on(fs.unlink(path("a"))).expect("unlinks");
+        block_on(fs.unlink(path("a"), 7_000_000_000)).expect("unlinks");
         assert_eq!(block_on(fs.stat(path("b"))).expect("stats").link_count, 1);
+    }
+
+    #[test]
+    fn rename_noreplace_refuses_any_destination_and_exchange_needs_both() {
+        let fs = tree();
+        block_on(fs.create_directory(path("d"), 0)).expect("creates");
+        block_on(fs.open(path("f"), OpenFlags::CREATE, 0)).expect("creates");
+        for (source, destination) in [("d", "f"), ("f", "d"), ("f", "f")] {
+            assert_eq!(
+                block_on(fs.rename(path(source), path(destination), RenameMode::NoReplace, 1)),
+                Err(FsError::Exists),
+                "{source} over {destination}"
+            );
+        }
+        assert_eq!(
+            block_on(fs.rename(path("none"), path("f"), RenameMode::NoReplace, 1)),
+            Err(FsError::NoEntry)
+        );
+        block_on(fs.rename(path("f"), path("g"), RenameMode::NoReplace, 1)).expect("renames");
+        assert_eq!(names(&fs, ""), ["d", "g"]);
+        for (source, destination) in [("g", "none"), ("none", "g"), ("none", "never")] {
+            assert_eq!(
+                block_on(fs.rename(path(source), path(destination), RenameMode::Exchange, 1)),
+                Err(FsError::NoEntry),
+                "{source} with {destination}"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_exchange_swaps_subtrees_and_refuses_an_ancestor() {
+        let fs = tree();
+        block_on(fs.create_directory(path("a"), 0)).expect("creates");
+        block_on(fs.open(path("a/inner"), OpenFlags::CREATE, 0)).expect("creates");
+        block_on(fs.create_directory(path("b"), 0)).expect("creates");
+        block_on(fs.create_directory(path("b/deeper"), 0)).expect("creates");
+        block_on(fs.open(path("b/deeper/leaf"), OpenFlags::CREATE, 0)).expect("creates");
+        block_on(fs.open(path("file"), OpenFlags::CREATE, 0)).expect("creates");
+        let identity = |name: &str| block_on(fs.stat(path(name))).expect("stats").id;
+        let (a, b, file) = (identity("a"), identity("b"), identity("file"));
+        assert_eq!(
+            block_on(fs.rename(path("a"), path("a/inner"), RenameMode::Exchange, 1)),
+            Err(FsError::Invalid)
+        );
+        assert_eq!(
+            block_on(fs.rename(path("b/deeper"), path("b"), RenameMode::Exchange, 1)),
+            Err(FsError::Invalid)
+        );
+        block_on(fs.rename(path("a"), path("b"), RenameMode::Exchange, 2)).expect("exchanges");
+        assert_eq!((identity("a"), identity("b")), (b, a));
+        assert_eq!(names(&fs, "a"), ["deeper"]);
+        assert_eq!(names(&fs, "a/deeper"), ["leaf"]);
+        assert_eq!(names(&fs, "b"), ["inner"]);
+        // A file against a directory, and an object against itself.
+        block_on(fs.rename(path("file"), path("a/deeper"), RenameMode::Exchange, 3))
+            .expect("exchanges");
+        assert_eq!(names(&fs, "file"), ["leaf"]);
+        assert_eq!(
+            block_on(fs.stat(path("a/deeper"))).expect("stats").kind,
+            NodeKind::File
+        );
+        assert_eq!(identity("a/deeper"), file);
+        block_on(fs.rename(path("b"), path("b"), RenameMode::Exchange, 4)).expect("a no-op");
+        assert_eq!(names(&fs, "b"), ["inner"]);
+        assert_eq!(names(&fs, ""), ["a", "b", "file"]);
+    }
+
+    #[test]
+    fn rename_replace_overwrites_existing_file_and_empty_directory() {
+        let fs = tree();
+        block_on(fs.open(path("a"), OpenFlags::CREATE, 0)).expect("creates a");
+        block_on(write_bytes(&fs, path("a"), WritePosition::At(0), b"new", 1)).expect("writes a");
+        block_on(fs.open(path("b"), OpenFlags::CREATE, 0)).expect("creates b");
+        block_on(write_bytes(&fs, path("b"), WritePosition::At(0), b"old", 1)).expect("writes b");
+        block_on(fs.create_directory(path("d1"), 0)).expect("creates d1");
+        block_on(fs.create_directory(path("d2"), 0)).expect("creates d2");
+        block_on(fs.open(path("d2/child"), OpenFlags::CREATE, 0)).expect("creates d2/child");
+        block_on(fs.create_directory(path("empty"), 0)).expect("creates empty");
+
+        // File over dir -> IsDirectory; dir over file -> NotDirectory; dir over non-empty -> NotEmpty.
+        assert_eq!(
+            block_on(fs.rename(path("a"), path("d1"), RenameMode::Replace, 2)),
+            Err(FsError::IsDirectory)
+        );
+        assert_eq!(
+            block_on(fs.rename(path("d1"), path("a"), RenameMode::Replace, 2)),
+            Err(FsError::NotDirectory)
+        );
+        assert_eq!(
+            block_on(fs.rename(path("d1"), path("d2"), RenameMode::Replace, 2)),
+            Err(FsError::NotEmpty)
+        );
+
+        // File replaces existing file atomically.
+        block_on(fs.rename(path("a"), path("b"), RenameMode::Replace, 3)).expect("replaces file");
+        assert_eq!(block_on(fs.stat(path("a"))), Err(FsError::NoEntry));
+        assert_eq!(
+            block_on(fs.read_at(path("b"), 0, 16))
+                .expect("reads replaced b")
+                .as_ref(),
+            b"new"
+        );
+
+        // Directory replaces existing empty directory.
+        block_on(fs.rename(path("d2"), path("empty"), RenameMode::Replace, 4))
+            .expect("replaces empty dir");
+        assert_eq!(block_on(fs.stat(path("d2"))), Err(FsError::NoEntry));
+        assert_eq!(names(&fs, "empty"), ["child"]);
     }
 
     #[test]
@@ -781,14 +1830,14 @@ mod tests {
         // Sorts between `d` and `d/f`.
         block_on(fs.open(path("d.x"), OpenFlags::CREATE, 0)).expect("creates");
         assert_eq!(
-            block_on(fs.rename(path("d"), path("d/inner"), 1)),
+            block_on(fs.rename(path("d"), path("d/inner"), RenameMode::Replace, 1)),
             Err(FsError::NotPermitted)
         );
-        block_on(fs.rename(path("d"), path("e"), 1)).expect("renames");
+        block_on(fs.rename(path("d"), path("e"), RenameMode::Replace, 1)).expect("renames");
         assert_eq!(names(&fs, ""), ["d.x", "dx", "e"]);
         assert_eq!(names(&fs, "e"), ["f"]);
         assert_eq!(
-            block_on(fs.remove_directory(path("e"))),
+            block_on(fs.remove_directory(path("e"), 7_000_000_000)),
             Err(FsError::NotEmpty)
         );
     }
@@ -801,10 +1850,349 @@ mod tests {
         }
         block_on(fs.symlink("a", path("l"), 0)).expect("links");
         assert_eq!(names(&fs, ""), ["a", "c", "l"]);
-        let first = block_on(fs.read_dir(FsPath::ROOT, DirCookie::START, 1)).expect("lists");
-        let rest = block_on(fs.read_dir(FsPath::ROOT, first[0].next, 8)).expect("lists");
+        let dir = block_on(fs.open_dir(FsPath::ROOT)).expect("opens");
+        let first = block_on(dir.read(DirCookie::START, 1)).expect("lists");
+        let rest = block_on(dir.read(first[0].next, 8)).expect("lists");
         assert_eq!(rest.len(), 2);
         assert_eq!(rest[1].kind, NodeKind::Symlink);
         assert_eq!(block_on(fs.read_link(path("l"))).as_deref(), Ok("a"));
+    }
+
+    #[test]
+    fn a_node_created_without_an_identity_inherits_from_its_parent() {
+        use crate::UnixAttributes;
+
+        let fs = tree();
+        let directories = [
+            ("中文目录", 0o2775, 1000, 100),
+            ("日本語のディレクトリ", 0o1777, 0, 0),
+            ("한국어디렉터리", 0o4750, 7, 8),
+        ];
+        for (name, permissions, uid, gid) in directories {
+            fs.create_directory_with(
+                path(name),
+                UnixAttributes {
+                    permissions,
+                    uid,
+                    gid,
+                },
+                10,
+            )
+            .expect("creates directory");
+            let file = alloc::format!("{name}/ファイル");
+            block_on(fs.open(path(&file), OpenFlags::CREATE, 20)).expect("creates file");
+            let child = alloc::format!("{name}/하위");
+            block_on(fs.create_directory(path(&child), 20)).expect("creates subdirectory");
+            let link = alloc::format!("{name}/链接");
+            block_on(fs.symlink("ファイル", path(&link), 20)).expect("creates symlink");
+
+            assert_eq!(
+                fs.unix_metadata(path(&file)).expect("file").attributes,
+                UnixAttributes {
+                    permissions: permissions & 0o666,
+                    uid,
+                    gid,
+                },
+                "{name}"
+            );
+            assert_eq!(
+                fs.unix_metadata(path(&child)).expect("child").attributes,
+                UnixAttributes {
+                    permissions: permissions & 0o2777,
+                    uid,
+                    gid,
+                },
+                "{name}"
+            );
+            assert_eq!(
+                fs.unix_metadata(path(&link)).expect("link").attributes,
+                UnixAttributes {
+                    permissions: 0o777,
+                    uid,
+                    gid,
+                },
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn stores_unix_authority_device_nodes_and_xattrs_as_linux_does() {
+        use bytes::Bytes;
+        use helios_btrfs::DeviceNumber;
+        use helios_btrfs::write::Special;
+
+        use super::XattrSetMode;
+        use crate::UnixAttributes;
+
+        let fs = tree();
+        let owner = |permissions| UnixAttributes {
+            permissions,
+            uid: 1000,
+            gid: 100,
+        };
+        assert_eq!(
+            fs.create_file_with(path("bad"), owner(0o100_644), 1)
+                .map(drop),
+            Err(FsError::Invalid)
+        );
+        fs.create_file_with(path("suid"), owner(0o4755), 1)
+            .expect("creates setuid file");
+        fs.create_directory_with(path("sgid"), owner(0o3775), 1)
+            .expect("creates setgid sticky directory");
+        fs.symlink_with("suid", path("link"), owner(0o777), 1)
+            .expect("creates symlink");
+
+        let null = DeviceNumber::new(1, 3).unwrap();
+        let wide = DeviceNumber::new(259, 0x1_2345).unwrap();
+        for (name, special, kind, expected_rdev, open_err) in [
+            (
+                "chr",
+                Special::CharDevice(null),
+                NodeKind::CharacterDevice,
+                null,
+                FsError::NotPermitted,
+            ),
+            (
+                "blk",
+                Special::BlockDevice(wide),
+                NodeKind::BlockDevice,
+                wide,
+                FsError::NotPermitted,
+            ),
+            (
+                "fifo",
+                Special::Fifo,
+                NodeKind::Fifo,
+                DeviceNumber::default(),
+                FsError::Unsupported,
+            ),
+            (
+                "sock",
+                Special::Socket,
+                NodeKind::Socket,
+                DeviceNumber::default(),
+                FsError::Unsupported,
+            ),
+        ] {
+            fs.create_special(path(name), special, owner(0o6640), 2)
+                .expect("creates special");
+            let meta = fs.unix_metadata(path(name)).expect("special metadata");
+            assert_eq!(meta.kind, kind, "{name}");
+            assert_eq!(meta.rdev, expected_rdev, "{name}");
+            assert_eq!(meta.attributes, owner(0o6640), "{name}");
+            assert_eq!(
+                block_on(fs.open(path(name), OpenFlags::empty(), 3)).map(drop),
+                Err(open_err),
+                "{name}"
+            );
+        }
+
+        // Extended attributes across every handler Linux's tmpfs keeps, with
+        // no policy refusal of `security.*`, `trusted.*` or POSIX ACLs.
+        for (attr, value) in [
+            ("user.comment", &b"hello"[..]),
+            ("security.capability", &[1, 0, 0, 2][..]),
+            ("trusted.overlay.opaque", b"y"),
+            ("system.posix_acl_access", &[2, 0, 0, 0][..]),
+        ] {
+            fs.set_xattr(
+                path("suid"),
+                attr,
+                Bytes::copy_from_slice(value),
+                XattrSetMode::Create,
+                4,
+            )
+            .expect(attr);
+            assert_eq!(
+                fs.set_xattr(
+                    path("suid"),
+                    attr,
+                    Bytes::from_static(b"dup"),
+                    XattrSetMode::Create,
+                    5,
+                ),
+                Err(FsError::Exists)
+            );
+        }
+        fs.set_xattr(
+            path("sgid"),
+            "system.posix_acl_default",
+            Bytes::from_static(&[2, 0, 0, 0]),
+            XattrSetMode::Any,
+            4,
+        )
+        .expect("default ACL on directory");
+        assert_eq!(
+            fs.set_xattr(
+                path("suid"),
+                "system.posix_acl_default",
+                Bytes::from_static(&[2, 0, 0, 0]),
+                XattrSetMode::Any,
+                4,
+            ),
+            Err(FsError::NotPermitted)
+        );
+        // `user.*` applies to regular files, directories and sockets
+        // (`xattr_permission` in `fs/xattr.c`), and is refused with `EPERM`
+        // for `MAY_WRITE` and `ENODATA` for `MAY_READ` on other kinds;
+        // `security.*` and `trusted.*` are kept on every kind.
+        fs.set_xattr(
+            path("sock"),
+            "user.varlink",
+            Bytes::from_static(b"1"),
+            XattrSetMode::Create,
+            4,
+        )
+        .expect("user xattr on socket");
+        assert_eq!(
+            fs.xattr(path("sock"), "user.varlink").unwrap().as_deref(),
+            Some(&b"1"[..])
+        );
+        assert_eq!(
+            fs.set_xattr(
+                path("chr"),
+                "user.label",
+                Bytes::from_static(b"no"),
+                XattrSetMode::Any,
+                4,
+            ),
+            Err(FsError::NotPermitted)
+        );
+        assert_eq!(fs.xattr(path("chr"), "user.label").unwrap(), None);
+        assert_eq!(fs.xattr(path("chr"), "user.").unwrap(), None);
+        assert_eq!(
+            fs.remove_xattr(path("chr"), "user.label", 4),
+            Err(FsError::NotPermitted)
+        );
+        for bare in ["user.", "security.", "trusted."] {
+            assert_eq!(
+                fs.xattr(path("suid"), bare),
+                Err(FsError::Invalid),
+                "{bare}"
+            );
+        }
+        fs.set_xattr(
+            path("chr"),
+            "security.selinux",
+            Bytes::from_static(b"system_u:object_r:null_device_t:s0"),
+            XattrSetMode::Any,
+            4,
+        )
+        .expect("security xattr on device node");
+        fs.set_xattr(
+            path("link"),
+            "trusted.tag",
+            Bytes::from_static(b"kept"),
+            XattrSetMode::Any,
+            4,
+        )
+        .expect("trusted xattr on symlink");
+        assert_eq!(
+            fs.set_xattr(
+                path("suid"),
+                "",
+                Bytes::from_static(b"no"),
+                XattrSetMode::Any,
+                4,
+            ),
+            Err(FsError::Unsupported)
+        );
+        let overlong = alloc::format!("user.{}", "x".repeat(256));
+        assert_eq!(
+            fs.set_xattr(
+                path("suid"),
+                &overlong,
+                Bytes::from_static(b"no"),
+                XattrSetMode::Any,
+                4,
+            ),
+            Err(FsError::NameTooLong)
+        );
+        assert_eq!(
+            fs.set_xattr(
+                path("suid"),
+                "other.ns",
+                Bytes::from_static(b"no"),
+                XattrSetMode::Any,
+                4,
+            ),
+            Err(FsError::Unsupported)
+        );
+        assert_eq!(
+            fs.set_xattr(
+                path("suid"),
+                "user.missing",
+                Bytes::from_static(b"no"),
+                XattrSetMode::Replace,
+                4,
+            ),
+            Err(FsError::NoEntry)
+        );
+        assert_eq!(
+            fs.list_xattrs(path("suid")).unwrap(),
+            [
+                "security.capability",
+                "system.posix_acl_access",
+                "trusted.overlay.opaque",
+                "user.comment",
+            ]
+        );
+
+        // Unrelated writes, hard links and renames preserve stored metadata.
+        block_on(write_bytes(
+            &fs,
+            path("suid"),
+            WritePosition::At(0),
+            b"#!/bin/sh\n",
+            6,
+        ))
+        .expect("writes");
+        block_on(fs.link(path("suid"), path("suid-hard"), 7)).expect("links");
+        block_on(fs.rename(path("chr"), path("chr-moved"), RenameMode::Replace, 8))
+            .expect("renames device node");
+        assert_eq!(
+            fs.unix_metadata(path("suid-hard")).unwrap().attributes,
+            owner(0o4755)
+        );
+        assert_eq!(fs.unix_metadata(path("chr-moved")).unwrap().rdev, null);
+        assert_eq!(
+            fs.xattr(path("suid-hard"), "trusted.overlay.opaque")
+                .unwrap()
+                .as_deref(),
+            Some(&b"y"[..])
+        );
+
+        // chmod stores every bit of 07777; chown on a non-directory drops
+        // set-id bits and `security.capability`, while a directory keeps them.
+        fs.set_permissions(path("suid"), 0o6755, 9).expect("chmod");
+        assert_eq!(
+            fs.unix_metadata(path("suid")).unwrap().attributes,
+            owner(0o6755)
+        );
+        fs.set_owner(path("suid"), Some(0), Some(0), 10)
+            .expect("chown file");
+        assert_eq!(
+            fs.unix_metadata(path("suid")).unwrap().attributes,
+            UnixAttributes {
+                permissions: 0o755,
+                uid: 0,
+                gid: 0,
+            }
+        );
+        assert_eq!(fs.xattr(path("suid"), "security.capability").unwrap(), None);
+        assert!(fs.remove_xattr(path("suid"), "user.comment", 11).unwrap());
+        assert!(!fs.remove_xattr(path("suid"), "user.comment", 12).unwrap());
+
+        fs.set_owner(path("sgid"), Some(0), Some(200), 13)
+            .expect("chown directory");
+        assert_eq!(
+            fs.unix_metadata(path("sgid")).unwrap().attributes,
+            UnixAttributes {
+                permissions: 0o3775,
+                uid: 0,
+                gid: 200,
+            }
+        );
     }
 }

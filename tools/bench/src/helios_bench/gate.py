@@ -6,7 +6,7 @@ Two comparisons, and the difference between them is the whole point:
   report — two images timed on one host, in one job, minutes apart. There
   is no change of machine between the columns, so the comparison is
   enforced whether or not the report is publishable.
-- **Cross-run.** The candidate against the newest `dev` report of the
+- **Cross-run.** The candidate against the newest `main` report of the
   same lane, taken in another job on another runner. A shared runner does
   not pin the CPU model, so this one is only as good as the machines
   happened to be alike: it enforces when both reports are publishable
@@ -260,7 +260,7 @@ def cross_run_sampling_mismatch(baseline: Report, candidate: Report) -> Sampling
 
 GATE_TITLES = {
     GateKind.PAIRED: "Paired, one host, one job",
-    GateKind.CROSS_RUN: "Cross-run, against the latest `dev` report",
+    GateKind.CROSS_RUN: "Cross-run, against the latest `main` report",
 }
 
 
@@ -516,7 +516,7 @@ class GateReport:
 
     paired: GateResult | None
     cross_run: GateResult | None
-    #: Set, with `cross_run` None, when the latest `dev` report and the
+    #: Set, with `cross_run` None, when the latest `main` report and the
     #: candidate were sampled differently: the cross-run comparison is
     #: refused and neither blocks nor passes, while the paired one stands.
     cross_run_refused: SamplingMismatch | None = None
@@ -676,6 +676,16 @@ class ComparedCells:
     candidate: Cell
     rebuild: Cell | None = None
     first_pass: dict[Column, Cell] = field(default_factory=dict)
+    baseline_workload: WorkloadResult | None = None
+
+    @property
+    def matched_metrics(self) -> frozenset[str]:
+        """Metrics either run's record holds matched: a baseline built before a
+        metric existed has no record of it, and the candidate's does."""
+        names = set(self.workload.matched_metrics)
+        if self.baseline_workload is not None:
+            names.update(self.baseline_workload.matched_metrics)
+        return frozenset(names)
 
 
 def series(cell: Cell, measurement: str) -> SeriesStats | None:
@@ -760,6 +770,9 @@ def gate_rows(
         for metric in sorted(set(base_cell.metrics) | set(cand_cell.metrics)):
             if metric.endswith(SAMPLE_COUNT_SUFFIX):
                 # Context for the percentiles beside it, not a row.
+                continue
+            if metric in compared.matched_metrics:
+                # A condition the comparison is held at, not a measurement.
                 continue
             before = base_cell.metrics.get(metric)
             after = cand_cell.metrics.get(metric)
@@ -887,7 +900,14 @@ def evaluate(baseline: Report, candidate: Report) -> GateResult:
             continue
         # Two jobs: neither run's rebuild column or reconfirm boots
         # measured anything about the other run's machine.
-        pairs.append(ComparedCells(workload=workload, baseline=base_cell, candidate=cand_cell))
+        pairs.append(
+            ComparedCells(
+                workload=workload,
+                baseline=base_cell,
+                candidate=cand_cell,
+                baseline_workload=before,
+            )
+        )
     bound = candidate.thresholds.cv_bound
     rows, unpaired = gate_rows(pairs, floor, bound)
     # Two runs of one lane are two machines as often as they are one
@@ -1140,8 +1160,8 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
 def gate_report(candidate: Report, baseline: Report | None) -> GateReport:
     """Both comparisons the candidate can take part in.
 
-    A `dev` report sampled differently from the candidate — the candidate
-    asked for an instruction profile and `dev`'s run did not, or the other
+    A `main` report sampled differently from the candidate — the candidate
+    asked for an instruction profile and `main`'s run did not, or the other
     way round — refuses the cross-run comparison and leaves the paired
     one, whose columns the driver sampled alike, standing.
     """

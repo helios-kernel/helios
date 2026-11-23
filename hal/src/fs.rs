@@ -138,18 +138,87 @@ pub enum FsError {
     NameTooLong,
     #[error("operation not supported by this filesystem")]
     Unsupported,
+    /// The filesystem has no free space for what the operation needs.
+    #[error("no space left on device")]
+    NoSpace,
     #[error("input/output error")]
     Io,
 }
 
 pub type FsResult<T> = Result<T, FsError>;
 
+/// How a rename treats a name that already exists at its destination.
+///
+/// The three modes are the combinations Linux's `renameat2` accepts:
+/// `RENAME_NOREPLACE` and `RENAME_EXCHANGE` together are `EINVAL` there, and
+/// here they cannot be written down. `RENAME_WHITEOUT` needs a device node
+/// the contract has no way to create, so a caller refuses it before any
+/// filesystem is asked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RenameMode {
+    /// A name at the destination is replaced by the source: `rename(2)`.
+    #[default]
+    Replace,
+    /// A name at the destination fails the rename with
+    /// [`FsError::Exists`]: `RENAME_NOREPLACE`.
+    NoReplace,
+    /// Source and destination swap places and both must exist, otherwise
+    /// [`FsError::NoEntry`]. Either may be a directory, and a directory
+    /// that is an ancestor of the other name is [`FsError::Invalid`]:
+    /// `RENAME_EXCHANGE`.
+    Exchange,
+}
+
 /// What kind of object a path names.
+///
+/// [`CharacterDevice`](Self::CharacterDevice),
+/// [`BlockDevice`](Self::BlockDevice), [`Fifo`](Self::Fifo) and
+/// [`Socket`](Self::Socket) are report-only: a filesystem names them in
+/// `stat` and directory listings so that a tree holding one stays
+/// readable, and the kernel never opens, creates or reads through them.
+/// Opening a device is refused with [`FsError::NotPermitted`], because
+/// hardware is reached only through device grants; opening a FIFO or a
+/// socket is refused with [`FsError::Unsupported`]. Operations that touch
+/// only the directory entry (unlink, rename, stat) work on them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NodeKind {
     Directory,
     File,
     Symlink,
+    CharacterDevice,
+    BlockDevice,
+    Fifo,
+    Socket,
+}
+
+impl NodeKind {
+    /// Succeeds for a regular file and otherwise says why its bytes cannot
+    /// be read or written: a directory is `IsDirectory`, a symbolic link
+    /// `Invalid`, and the report-only kinds fail as
+    /// [`open_refusal`](Self::open_refusal) says.
+    pub const fn require_regular(self) -> FsResult<()> {
+        match self {
+            NodeKind::File => Ok(()),
+            NodeKind::Directory => Err(FsError::IsDirectory),
+            NodeKind::Symlink => Err(FsError::Invalid),
+            NodeKind::CharacterDevice | NodeKind::BlockDevice => Err(FsError::NotPermitted),
+            NodeKind::Fifo | NodeKind::Socket => Err(FsError::Unsupported),
+        }
+    }
+
+    /// Why the kernel never opens an object of this kind, or `None` for
+    /// the kinds a filesystem's `open` answers (files, directories and
+    /// symbolic links, which resolution follows before a filesystem
+    /// opens anything).
+    ///
+    /// Devices are `NotPermitted` and FIFOs and sockets `Unsupported`.
+    pub const fn open_refusal(self) -> Option<FsError> {
+        match self {
+            NodeKind::File | NodeKind::Directory | NodeKind::Symlink => None,
+            NodeKind::CharacterDevice | NodeKind::BlockDevice => Some(FsError::NotPermitted),
+            NodeKind::Fifo | NodeKind::Socket => Some(FsError::Unsupported),
+        }
+    }
 }
 
 /// Names one filesystem instance: what `st_dev` reports.
@@ -216,7 +285,7 @@ bitflags! {
     }
 }
 
-/// Where [`FileSystem::write_with`] puts its bytes.
+/// Where [`FileSystem::prepare_write`] puts its bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WritePosition {
     /// At this offset, zero-filling any gap past the end of the file.
@@ -224,6 +293,195 @@ pub enum WritePosition {
     /// At the end of the file as the filesystem sees it when the write
     /// arrives.
     End,
+}
+
+/// What a [`FilledWrite::submit`] leaves of its write.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WriteProgress<W> {
+    /// The round landed and bytes remain: the next round, staged and
+    /// waiting for its own submit.
+    More(W),
+    /// The write is over: [`Landed`] says where it began and how much of
+    /// it is stored.
+    Done(Landed),
+}
+
+/// Where a finished write began and how many of its bytes landed.
+///
+/// `len` is the prepared length, except when the filesystem ran out of
+/// space after storing a prefix: then `len` is that prefix, nonzero and
+/// shorter than the prepared length, as a POSIX short write. A write that
+/// stores no byte at all fails with [`FsError::NoSpace`] instead, so a
+/// `Landed` with `len == 0` exists only for a prepared length of zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Landed {
+    /// The offset the write began at.
+    pub offset: u64,
+    /// The bytes stored, from `offset` on.
+    pub len: usize,
+}
+
+impl Landed {
+    /// The offset just past the stored bytes: where a sequential writer
+    /// continues. `None` when it does not fit a `u64`.
+    pub fn end(self) -> Option<u64> {
+        self.offset.checked_add(self.len as u64)
+    }
+}
+
+/// A write [`FileSystem::prepare_write`] staged.
+///
+/// A write lands in rounds. Each round stages [`Self::staged_len`] bytes
+/// of the write in the filesystem's own destination. Filling copies those
+/// bytes synchronously; submission sends the filled destinations. A filesystem that keeps its bytes in
+/// memory stages the whole write in one round; one that sends them
+/// elsewhere bounds a round by the destinations it can hold at once,
+/// never by the write's length, so a write larger than that lands in
+/// several rounds over one prepare. The rounds' lengths sum to the
+/// prepared length, and the rounds land in order at consecutive offsets.
+///
+/// A write that runs out of space ends early: when a round stores only a
+/// prefix of what it staged, the submit resolves with
+/// [`WriteProgress::Done`] carrying the bytes stored so far, and no later
+/// round runs. Only running out of space after at least one byte ends a
+/// write short; when no byte is stored the submit fails with
+/// [`FsError::NoSpace`], and any other failure is its own error.
+///
+/// Dropping a prepared write before filling releases what it staged
+/// and leaves the file as it was: the bytes of earlier rounds have
+/// landed, this round's have not. Dropping a submit's future part way
+/// may leave part of its round written.
+///
+/// Concurrency: a prepared write is owned by the task that prepared it
+/// and is moved, never shared; it may be submitted on another
+/// processor. Two writes to one file staged at once land in whatever
+/// order their fills or submits do.
+pub trait PreparedWrite: Send + Sized {
+    /// The filled round, independent of the source borrowed by `fill`.
+    type Filled: FilledWrite<Next = Self>;
+
+    /// The bytes the next submit takes: all of the write's remaining
+    /// bytes, or the most this filesystem stages in one round.
+    fn staged_len(&self) -> usize;
+
+    /// Fills this round synchronously.
+    ///
+    /// `fill` runs before this returns, so it
+    /// may read memory that is valid only until the next await (a
+    /// guest's) and need not be `Send`. It is called once for each of the
+    /// round's destination regions, in write order, with the region's
+    /// offset from the start of the whole write; the regions cover the
+    /// round's [`Self::staged_len`] bytes exactly. A round refused before
+    /// its bytes are needed does not run it.
+    fn fill<F>(self, fill: F) -> Self::Filled
+    where
+        F: FnMut(usize, &mut [u8]);
+}
+
+/// A filled round owns its destinations and retains no borrow of its source.
+/// Submission may suspend; dropping it may leave part of the round written.
+pub trait FilledWrite: Send + Sized {
+    /// The next round, if the prepared write has bytes remaining.
+    type Next: PreparedWrite;
+
+    fn submit(self) -> impl Future<Output = FsResult<WriteProgress<Self::Next>>> + Send;
+}
+
+/// Memory-backed writes finish while filling their destination. Submission
+/// reports that result without holding the source or the filesystem lock.
+impl<W: PreparedWrite> FilledWrite for FsResult<WriteProgress<W>> {
+    type Next = W;
+
+    fn submit(self) -> impl Future<Output = Self> + Send {
+        core::future::ready(self)
+    }
+}
+
+/// The write of a filesystem that refuses every write before staging.
+impl PreparedWrite for core::convert::Infallible {
+    type Filled = Self;
+
+    fn staged_len(&self) -> usize {
+        match *self {}
+    }
+
+    fn fill<F>(self, _: F) -> Self
+    where
+        F: FnMut(usize, &mut [u8]),
+    {
+        match self {}
+    }
+}
+
+impl FilledWrite for core::convert::Infallible {
+    type Next = Self;
+
+    async fn submit(self) -> FsResult<WriteProgress<Self>> {
+        match self {}
+    }
+}
+
+/// Writes `len` bytes at `position` and resolves with where they landed
+/// and how many did (fewer than `len` only after running out of space,
+/// see [`Landed`]), staging them through [`FileSystem::prepare_write`]
+/// and landing every round.
+///
+/// `source` copies the bytes of the write that start at its first
+/// argument into its second, straight into the filesystem's destination,
+/// so a write copies its bytes once. It runs between awaits, never
+/// across one, and once per destination region; the memory it reads must
+/// stay valid for the whole call.
+pub async fn write_with<F, S>(
+    fs: &F,
+    path: FsPath<'_>,
+    position: WritePosition,
+    len: usize,
+    now: u64,
+    mut source: S,
+) -> FsResult<Landed>
+where
+    F: FileSystem,
+    S: FnMut(usize, &mut [u8]),
+{
+    let mut write = fs.prepare_write(path, position, len, now).await?;
+    loop {
+        match write.fill(&mut source).submit().await? {
+            WriteProgress::More(next) => write = next,
+            WriteProgress::Done(landed) => return Ok(landed),
+        }
+    }
+}
+
+/// Writes `len` bytes at `position` through an open handle and resolves with
+/// where they landed and how many did, staging them through
+/// [`FileSystem::prepare_write_handle`].
+pub async fn write_handle_with<F, S>(
+    fs: &F,
+    handle: &F::OpenHandle,
+    position: WritePosition,
+    len: usize,
+    now: u64,
+    mut source: S,
+) -> FsResult<Landed>
+where
+    F: FileSystem,
+    S: FnMut(usize, &mut [u8]),
+{
+    let mut write = fs.prepare_write_handle(handle, position, len, now).await?;
+    loop {
+        match write.fill(&mut source).submit().await? {
+            WriteProgress::More(next) => write = next,
+            WriteProgress::Done(landed) => return Ok(landed),
+        }
+    }
+}
+
+/// The result of opening a path or creating an unnamed temporary file:
+/// its current metadata and a handle retaining the open object until dropped.
+#[derive(Clone, Debug)]
+pub struct Opened<H> {
+    pub metadata: Metadata,
+    pub handle: H,
 }
 
 /// Where a directory listing resumes.
@@ -256,6 +514,30 @@ pub struct DirEntry {
     pub inode: u64,
     /// The cookie that resumes the listing after this entry.
     pub next: DirCookie,
+}
+
+/// An open directory listing stream.
+///
+/// Opened by [`FileSystem::open_dir`], which records any open-time state
+/// the filesystem needs so concurrent insertions or renames do not repeat
+/// entries indefinitely across batches.
+///
+/// Concurrency: owned by the task that opened it, never shared; it may move
+/// across processors between calls.
+pub trait DirStream: Send + Sized {
+    /// Lists at most `max_entries` entries resuming at `cookie`. Fewer than
+    /// `max_entries` means the listing is complete. `.` and `..` are not
+    /// listed.
+    fn read(
+        &self,
+        cookie: DirCookie,
+        max_entries: usize,
+    ) -> impl Future<Output = FsResult<Vec<DirEntry>>> + Send + '_;
+
+    /// Refreshes any open-time bound to the directory's current state, as
+    /// POSIX `rewinddir(3)` does so entries added since open become visible
+    /// on the next read from [`DirCookie::START`].
+    fn rewind(&mut self) -> impl Future<Output = FsResult<()>> + Send + '_;
 }
 
 /// A path relative to the root of one filesystem.
@@ -311,6 +593,22 @@ impl<'a> FsPath<'a> {
     }
 }
 
+/// An owned, normalized path for a transfer that outlives its prepare call.
+#[derive(Clone, Debug)]
+pub struct OwnedFsPath(String);
+
+impl From<FsPath<'_>> for OwnedFsPath {
+    fn from(path: FsPath<'_>) -> Self {
+        Self(String::from(path.as_str()))
+    }
+}
+
+impl OwnedFsPath {
+    pub fn as_path(&self) -> FsPath<'_> {
+        FsPath(&self.0)
+    }
+}
+
 /// One filesystem: the operations every mount kind implements.
 ///
 /// Mutating operations take `now`, the caller's wall-clock time in
@@ -319,19 +617,42 @@ impl<'a> FsPath<'a> {
 /// share) ignores it. Symbolic links are never followed here: `stat`
 /// describes the link itself, and resolving a link is the caller's job.
 pub trait FileSystem: Clone + Send + Sync + 'static {
+    /// An open reference to a filesystem object, keeping unlinked or unnamed
+    /// files alive until the final clone is dropped.
+    type OpenHandle: Clone + Send + Sync + 'static;
+
     /// Describes the object at `path` without following a final symbolic
     /// link.
     fn stat<'a>(&'a self, path: FsPath<'a>)
     -> impl Future<Output = FsResult<Metadata>> + Send + 'a;
 
+    /// Describes the open object referenced by `handle`.
+    fn stat_handle<'a>(
+        &'a self,
+        handle: &'a Self::OpenHandle,
+    ) -> impl Future<Output = FsResult<Metadata>> + Send + 'a;
+
     /// Opens the object at `path` as `flags` asks, creating or truncating
-    /// a regular file, and describes what was opened.
+    /// a regular file, and returns its metadata together with an open handle.
     fn open<'a>(
         &'a self,
         path: FsPath<'a>,
         flags: OpenFlags,
         now: u64,
-    ) -> impl Future<Output = FsResult<Metadata>> + Send + 'a;
+    ) -> impl Future<Output = FsResult<Opened<Self::OpenHandle>>> + Send + 'a;
+
+    /// Creates and opens an unnamed temporary regular file within the
+    /// filesystem subtree containing `directory` (`nlink == 0`). When
+    /// `exclusive` is false, [`Self::link_handle`] may later give the file a
+    /// directory entry; when true, linking it fails with [`FsError::NoEntry`].
+    fn open_tmpfile<'a>(
+        &'a self,
+        _directory: FsPath<'a>,
+        _exclusive: bool,
+        _now: u64,
+    ) -> impl Future<Output = FsResult<Opened<Self::OpenHandle>>> + Send + 'a {
+        core::future::ready(Err(FsError::Unsupported))
+    }
 
     /// Reads at most `max_bytes` from `offset`. An empty result is end of
     /// file.
@@ -342,32 +663,54 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         max_bytes: usize,
     ) -> impl Future<Output = FsResult<Bytes>> + Send + 'a;
 
-    /// Writes `len` bytes at `position` and resolves with the offset they
-    /// landed at.
+    /// Reads at most `max_bytes` from `offset` of the open object `handle`.
+    fn read_handle_at<'a>(
+        &'a self,
+        handle: &'a Self::OpenHandle,
+        offset: u64,
+        max_bytes: usize,
+    ) -> impl Future<Output = FsResult<Bytes>> + Send + 'a;
+
+    /// The write [`Self::prepare_write`] stages.
+    type Write: PreparedWrite + 'static;
+
+    /// Stages a write of `len` bytes at `position`: everything the write
+    /// needs before its bytes (resolving the file, an append's offset,
+    /// the destination the bytes go into) is done here, and the bytes
+    /// themselves go in through [`PreparedWrite::fill`].
     ///
-    /// The filesystem supplies the destination and `fill` writes the bytes
-    /// into it, so a write copies its bytes once: a filesystem that keeps
-    /// them in memory hands `fill` the file's own storage, and one that
-    /// sends them elsewhere hands it the buffer it sends. `fill` runs at
-    /// most once and before this returns, never from the future, so it may
-    /// read memory that is valid only for this call (a guest's) and need
-    /// not be `Send`. A write refused before its bytes are needed does not
-    /// run it.
-    fn write_with<'a, F>(
+    /// A filesystem that keeps its bytes in memory resolves at once; one
+    /// that sends them elsewhere awaits whatever its destination needs
+    /// first. A write refused here has run no filler.
+    fn prepare_write<'a>(
         &'a self,
         path: FsPath<'a>,
         position: WritePosition,
         len: usize,
         now: u64,
-        fill: F,
-    ) -> impl Future<Output = FsResult<u64>> + Send + 'a
-    where
-        F: FnOnce(&mut [u8]);
+    ) -> impl Future<Output = FsResult<Self::Write>> + Send + 'a;
+
+    /// Stages a write of `len` bytes at `position` on the open object `handle`.
+    fn prepare_write_handle<'a>(
+        &'a self,
+        handle: &'a Self::OpenHandle,
+        position: WritePosition,
+        len: usize,
+        now: u64,
+    ) -> impl Future<Output = FsResult<Self::Write>> + Send + 'a;
 
     /// Truncates or zero-extends a regular file to `size` bytes.
     fn set_size<'a>(
         &'a self,
         path: FsPath<'a>,
+        size: u64,
+        now: u64,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
+
+    /// Truncates or zero-extends the open regular file `handle` to `size` bytes.
+    fn set_size_handle<'a>(
+        &'a self,
+        handle: &'a Self::OpenHandle,
         size: u64,
         now: u64,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
@@ -381,15 +724,32 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         now: u64,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
-    /// Lists at most `max_entries` entries of the directory at `path`,
-    /// resuming at `cookie`. Fewer than `max_entries` means the listing is
-    /// complete. `.` and `..` are not listed.
-    fn read_dir<'a>(
+    /// Sets the access and modification times of the open object `handle`.
+    fn set_times_handle<'a>(
+        &'a self,
+        handle: &'a Self::OpenHandle,
+        access_nanos: Option<u64>,
+        modified_nanos: Option<u64>,
+        now: u64,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
+
+    /// The directory stream [`Self::open_dir`] opens.
+    type Dir: DirStream + 'static;
+
+    /// Opens a directory listing stream for the directory at `path`,
+    /// recording any open-time bound the filesystem needs so concurrent
+    /// insertions or renames cannot repeat entries indefinitely across
+    /// batches.
+    fn open_dir<'a>(
         &'a self,
         path: FsPath<'a>,
-        cookie: DirCookie,
-        max_entries: usize,
-    ) -> impl Future<Output = FsResult<Vec<DirEntry>>> + Send + 'a;
+    ) -> impl Future<Output = FsResult<Self::Dir>> + Send + 'a;
+
+    /// Opens a directory listing stream for the open directory `handle`.
+    fn open_dir_handle<'a>(
+        &'a self,
+        handle: &'a Self::OpenHandle,
+    ) -> impl Future<Output = FsResult<Self::Dir>> + Send + 'a;
 
     fn create_directory<'a>(
         &'a self,
@@ -401,16 +761,29 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
     fn remove_directory<'a>(
         &'a self,
         path: FsPath<'a>,
+        now: u64,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Removes a non-directory name.
-    fn unlink<'a>(&'a self, path: FsPath<'a>) -> impl Future<Output = FsResult<()>> + Send + 'a;
+    fn unlink<'a>(
+        &'a self,
+        path: FsPath<'a>,
+        now: u64,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
-    /// Moves `source` to `destination` within this filesystem.
+    /// Moves `source` to `destination` within this filesystem, treating a
+    /// name already at `destination` as `mode` says. The whole change is
+    /// atomic: no reader sees `source` gone and `destination` not yet
+    /// there, or one name of an exchange moved and not the other.
+    ///
+    /// A filesystem that cannot honour a `mode` other than
+    /// [`RenameMode::Replace`] answers [`FsError::Unsupported`] without
+    /// changing anything.
     fn rename<'a>(
         &'a self,
         source: FsPath<'a>,
         destination: FsPath<'a>,
+        mode: RenameMode,
         now: u64,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
@@ -418,6 +791,15 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
     fn link<'a>(
         &'a self,
         existing: FsPath<'a>,
+        link: FsPath<'a>,
+        now: u64,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
+
+    /// Gives the open non-directory `handle` the name `link` (including
+    /// materializing a non-exclusive unnamed temporary file).
+    fn link_handle<'a>(
+        &'a self,
+        handle: &'a Self::OpenHandle,
         link: FsPath<'a>,
         now: u64,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
@@ -439,9 +821,21 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
     /// Makes the file's data and metadata durable.
     fn sync<'a>(&'a self, path: FsPath<'a>) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
+    /// Makes the open object `handle`'s data and metadata durable.
+    fn sync_handle<'a>(
+        &'a self,
+        handle: &'a Self::OpenHandle,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
+
     /// Makes the file's data durable, and the metadata needed to read it
     /// back.
     fn sync_data<'a>(&'a self, path: FsPath<'a>) -> impl Future<Output = FsResult<()>> + Send + 'a;
+
+    /// Makes the open object `handle`'s data and essential metadata durable.
+    fn sync_data_handle<'a>(
+        &'a self,
+        handle: &'a Self::OpenHandle,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 }
 
 bitflags! {

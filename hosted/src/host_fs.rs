@@ -1,15 +1,19 @@
 use std::ffi::CString;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{self as unix_fs, MetadataExt};
+use std::os::unix::fs::{self as unix_fs, FileExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
+use helios_hal::fs::{Landed, NodeKind, WritePosition, WriteProgress};
 use helios_hal::io::IoError;
 use helios_kernel::{
-    AuthorityDomain, HostDirEntry, HostDirLimit, HostFileSystem, HostFsError, HostMetadata,
-    ObjectIdentity,
+    AuthorityDomain, HostCreation, HostDirEntry, HostDirLimit, HostFileSystem, HostFilledWrite,
+    HostFsError, HostMetadata, HostWrite, ObjectIdentity,
 };
+
+/// Linux `ENOSPC`, the code a host-share server answers a full device with.
+const ENOSPC: u32 = 28;
 
 /// Host-OS backed filesystem for the hosted backend.
 ///
@@ -42,6 +46,10 @@ impl HostedFileSystem {
 }
 
 fn map_io_error(error: io::Error) -> HostFsError {
+    if error.kind() == io::ErrorKind::StorageFull {
+        // The host-share error a 9p server's `ENOSPC` reply becomes.
+        return HostFsError::Server(ENOSPC);
+    }
     let io_error = match error.kind() {
         io::ErrorKind::NotFound => IoError::NotFound,
         io::ErrorKind::AlreadyExists => IoError::AlreadyExists,
@@ -77,6 +85,8 @@ where
 }
 
 impl HostFileSystem for HostedFileSystem {
+    type Write = HostedWrite;
+
     /// The hosted backend calls the host OS directly, which does its own
     /// caching; there is no 9p session in front of it to cache for.
     fn cache_stats(&self) -> Option<helios_kernel::HostFsCacheStats> {
@@ -121,6 +131,7 @@ impl HostFileSystem for HostedFileSystem {
         path: &str,
     ) -> impl core::future::Future<Output = Result<Vec<u8>, HostFsError>> + Send + '_ {
         blocking_path(self.resolve(path), |path| {
+            require_openable(&path)?;
             fs::read(path).map_err(map_io_error)
         })
     }
@@ -136,26 +147,14 @@ impl HostFileSystem for HostedFileSystem {
         })
     }
 
-    fn write_file(
+    fn prepare_write(
         &self,
         path: &str,
-        offset: u64,
-        bytes: &[u8],
-    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
-        let bytes = bytes.to_vec();
+        position: WritePosition,
+        len: usize,
+    ) -> impl core::future::Future<Output = Result<HostedWrite, HostFsError>> + Send + '_ {
         blocking_path(self.resolve(path), move |path| {
-            write_file_impl(&path, offset, &bytes)
-        })
-    }
-
-    fn append_file(
-        &self,
-        path: &str,
-        bytes: &[u8],
-    ) -> impl core::future::Future<Output = Result<u64, HostFsError>> + Send + '_ {
-        let bytes = bytes.to_vec();
-        blocking_path(self.resolve(path), move |path| {
-            append_file_impl(&path, &bytes)
+            open_for_write(&path, position, len)
         })
     }
 
@@ -197,18 +196,41 @@ impl HostFileSystem for HostedFileSystem {
     fn create_file(
         &self,
         path: &str,
+        creation: HostCreation,
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
-        blocking_path(self.resolve(path), |path| {
-            fs::File::create_new(path).map(|_| ()).map_err(map_io_error)
+        blocking_path(self.resolve(path), move |path| {
+            let file = fs::File::create_new(&path).map_err(map_io_error)?;
+            let configured = (|| {
+                if file.metadata().map_err(map_io_error)?.gid() != creation.gid {
+                    unix_fs::fchown(&file, None, Some(creation.gid)).map_err(map_io_error)?;
+                }
+                file.set_permissions(fs::Permissions::from_mode(creation.permissions))
+                    .map_err(map_io_error)
+            })();
+            if configured.is_err() {
+                drop(file);
+                let _ = fs::remove_file(&path);
+            }
+            configured
         })
     }
 
     fn create_directory(
         &self,
         path: &str,
+        creation: HostCreation,
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
-        blocking_path(self.resolve(path), |path| {
-            fs::create_dir(path).map_err(map_io_error)
+        blocking_path(self.resolve(path), move |path| {
+            fs::create_dir(&path).map_err(map_io_error)?;
+            let configured = (|| {
+                in_group(&path, creation.gid)?;
+                fs::set_permissions(&path, fs::Permissions::from_mode(creation.permissions))
+                    .map_err(map_io_error)
+            })();
+            if configured.is_err() {
+                let _ = fs::remove_dir(&path);
+            }
+            configured
         })
     }
 
@@ -254,10 +276,16 @@ impl HostFileSystem for HostedFileSystem {
         &self,
         target: &str,
         link_path: &str,
+        gid: u32,
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         let target = PathBuf::from(target);
         blocking_path(self.resolve(link_path), move |link_path| {
-            unix_fs::symlink(target, link_path).map_err(map_io_error)
+            unix_fs::symlink(target, &link_path).map_err(map_io_error)?;
+            let configured = in_group(&link_path, gid);
+            if configured.is_err() {
+                let _ = fs::remove_file(&link_path);
+            }
+            configured
         })
     }
 
@@ -269,16 +297,41 @@ impl HostFileSystem for HostedFileSystem {
     }
 }
 
+/// Puts the node at `path` in group `gid`, changing nothing when the host
+/// already did (a BSD host gives a new node its directory's group). Run
+/// before setting permission bits so `chown` never strips a set-id bit.
+fn in_group(path: &Path, gid: u32) -> Result<(), HostFsError> {
+    let current = fs::symlink_metadata(path).map_err(map_io_error)?.gid();
+    if current != gid {
+        unix_fs::lchown(path, None, Some(gid)).map_err(map_io_error)?;
+    }
+    Ok(())
+}
+
+/// The attributes of the object `path` names, itself and not what a
+/// symbolic link there points at: the kernel resolves links through
+/// `read_link`, as the 9p share's `Tgetattr` does.
 fn stat_impl(path: &Path) -> Result<HostMetadata, HostFsError> {
-    let meta = fs::metadata(path).map_err(map_io_error)?;
-    let qid_type = if meta.is_dir() { 0x80 } else { 0x00 };
-    let mode = if meta.is_dir() { 0o040755 } else { 0o100644 };
+    let meta = fs::symlink_metadata(path).map_err(map_io_error)?;
+    let mode = meta.mode();
+    // 9p `QTDIR` and `QTSYMLINK`.
+    let file_type = meta.file_type();
+    let qid_type = if file_type.is_dir() {
+        0x80
+    } else if file_type.is_symlink() {
+        0x02
+    } else {
+        0x00
+    };
     let inode = meta.ino();
     Ok(HostMetadata {
         identity: ObjectIdentity::new(AuthorityDomain::host_device(meta.dev()), inode),
         qid_path: inode,
         qid_type,
         mode,
+        uid: meta.uid(),
+        gid: meta.gid(),
+        rdev: meta.rdev(),
         size: meta.len(),
         link_count: meta.nlink(),
         access_nanos: unix_timestamp_nanos(meta.atime(), meta.atime_nsec()),
@@ -307,16 +360,33 @@ fn read_dir_impl(path: &Path, limit: HostDirLimit) -> Result<Vec<HostDirEntry>, 
             .file_name()
             .into_string()
             .unwrap_or_else(|os| os.to_string_lossy().into_owned());
-        let is_directory = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let kind = entry.file_type().ok().map(|file_type| {
+            if file_type.is_dir() {
+                NodeKind::Directory
+            } else if file_type.is_symlink() {
+                NodeKind::Symlink
+            } else if file_type.is_file() {
+                NodeKind::File
+            } else if file_type.is_char_device() {
+                NodeKind::CharacterDevice
+            } else if file_type.is_block_device() {
+                NodeKind::BlockDevice
+            } else if file_type.is_fifo() {
+                NodeKind::Fifo
+            } else {
+                NodeKind::Socket
+            }
+        });
         name_bytes = name_bytes.saturating_add(name.len());
         limit.check(result.len() + 1, name_bytes)?;
-        result.push(HostDirEntry { name, is_directory });
+        result.push(HostDirEntry { name, kind });
     }
     Ok(result)
 }
 
 fn read_file_range_impl(path: &Path, offset: u64, max_bytes: u32) -> Result<Vec<u8>, HostFsError> {
     use std::io::{Read, Seek, SeekFrom};
+    require_openable(path)?;
     let mut file = fs::File::open(path).map_err(map_io_error)?;
     file.seek(SeekFrom::Start(offset)).map_err(map_io_error)?;
     let mut buf = vec![0u8; max_bytes as usize];
@@ -325,31 +395,102 @@ fn read_file_range_impl(path: &Path, offset: u64, max_bytes: u32) -> Result<Vec<
     Ok(buf)
 }
 
-fn write_file_impl(path: &Path, offset: u64, bytes: &[u8]) -> Result<(), HostFsError> {
-    use std::io::{Seek, SeekFrom, Write};
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(map_io_error)?;
-    file.seek(SeekFrom::Start(offset)).map_err(map_io_error)?;
-    file.write_all(bytes).map_err(map_io_error)?;
-    Ok(())
+/// A write to a host file, staged by opening it: an append opens it with
+/// `O_APPEND`, so the host OS positions the bytes at its end of file when
+/// they arrive.
+///
+/// The destination is the buffer handed to the host OS's write, and the
+/// write lands in one round of its whole length: the hosted backend runs
+/// the kernel for development on the host itself, with no request pool to
+/// bound a round by.
+pub struct HostedWrite {
+    file: fs::File,
+    position: WritePosition,
+    bytes: Vec<u8>,
 }
 
-fn append_file_impl(path: &Path, bytes: &[u8]) -> Result<u64, HostFsError> {
-    use std::io::Write;
-    let mut file = fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(map_io_error)?;
-    // `O_APPEND` positions the write at the end of file itself; the length
-    // read here is only reported back so callers can track the stream offset.
-    let offset = file.metadata().map_err(map_io_error)?.len();
-    file.write_all(bytes).map_err(map_io_error)?;
-    Ok(offset)
+/// A [`HostedWrite`] whose bytes are in.
+pub struct FilledHostedWrite {
+    write: HostedWrite,
+}
+
+fn open_for_write(
+    path: &Path,
+    position: WritePosition,
+    len: usize,
+) -> Result<HostedWrite, HostFsError> {
+    require_openable(path)?;
+    let mut options = fs::OpenOptions::new();
+    match position {
+        WritePosition::At(_) => options.write(true),
+        WritePosition::End => options.append(true),
+    };
+    let file = options.open(path).map_err(map_io_error)?;
+    Ok(HostedWrite {
+        file,
+        position,
+        bytes: vec![0; len],
+    })
+}
+
+impl HostWrite for HostedWrite {
+    type Filled = FilledHostedWrite;
+
+    fn staged_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn fill<F>(mut self, mut fill: F) -> FilledHostedWrite
+    where
+        F: FnMut(usize, &mut [u8]),
+    {
+        fill(0, &mut self.bytes);
+        FilledHostedWrite { write: self }
+    }
+}
+
+impl HostFilledWrite for FilledHostedWrite {
+    type Next = HostedWrite;
+
+    async fn submit(self) -> Result<WriteProgress<HostedWrite>, HostFsError> {
+        let HostedWrite {
+            mut file,
+            position,
+            bytes,
+        } = self.write;
+        let len = bytes.len();
+        blocking::unblock(move || {
+            let landed = match position {
+                WritePosition::At(offset) => {
+                    file.write_all_at(&bytes, offset).map_err(map_io_error)?;
+                    offset
+                }
+                WritePosition::End => {
+                    // `O_APPEND` positions the write at the end of file
+                    // itself; the length read here is only reported back
+                    // so callers can track the stream offset.
+                    let offset = file.metadata().map_err(map_io_error)?.len();
+                    file.write_all(&bytes).map_err(map_io_error)?;
+                    offset
+                }
+            };
+            Ok(WriteProgress::Done(Landed {
+                offset: landed,
+                len,
+            }))
+        })
+        .await
+    }
+}
+
+/// Refuses, before opening it, a device, FIFO, socket or symbolic link:
+/// the host would open it with this process's privileges.
+fn require_openable(path: &Path) -> Result<(), HostFsError> {
+    stat_impl(path)?.require_openable()
 }
 
 fn sync_file_impl(path: &Path) -> Result<(), HostFsError> {
+    require_openable(path)?;
     fs::File::open(path)
         .map_err(map_io_error)?
         .sync_all()
@@ -357,6 +498,7 @@ fn sync_file_impl(path: &Path) -> Result<(), HostFsError> {
 }
 
 fn set_file_size_impl(path: &Path, size: u64) -> Result<(), HostFsError> {
+    require_openable(path)?;
     let file = fs::OpenOptions::new()
         .write(true)
         .open(path)
@@ -375,7 +517,14 @@ fn set_times_impl(
         timespec_from_optional_nanos(access_nanos)?,
         timespec_from_optional_nanos(modified_nanos)?,
     ];
-    let result = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) };
+    let result = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
     if result == 0 {
         Ok(())
     } else {
@@ -414,7 +563,8 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use helios_kernel::HostFileSystem;
+    use helios_hal::fs::{Landed, WritePosition, WriteProgress};
+    use helios_kernel::{HostDirLimit, HostFileSystem, HostFilledWrite, HostFsError, HostWrite};
 
     use super::HostedFileSystem;
 
@@ -436,6 +586,71 @@ mod tests {
             .block_on(test);
     }
 
+    /// The group the test root has, which every node made in it can take.
+    fn current_gid(root: &TempDir) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(root.path())
+            .expect("the test root has metadata")
+            .gid()
+    }
+
+    /// A node the share creates takes its group and mode from the
+    /// directory it is made in, with the execute bits cleared for a
+    /// regular file, whatever the process's umask. Its owner is the host's
+    /// to give, here the user that owns the directory too.
+    #[test]
+    fn a_node_created_on_the_share_inherits_from_its_parent() {
+        run_hosted_fs_test(async {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            use helios_hal::fs::{FileSystem, FsPath, OpenFlags};
+            use helios_kernel::HostShare;
+
+            let root = test_root();
+            let gid = current_gid(&root);
+            let share = HostShare::new(filesystem(&root));
+            for (directory, mode, file_mode, child_mode) in [
+                ("中文目录", 0o2750, 0o640, 0o2750),
+                ("日本語のディレクトリ", 0o777, 0o666, 0o777),
+                ("한국어디렉터리", 0o1755, 0o644, 0o755),
+            ] {
+                let path = root.path().join(directory);
+                std::fs::create_dir(&path).expect("directory must be created");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                    .expect("directory mode must be set");
+                let at = |name: &str| format!("{directory}/{name}");
+                let file = at("ファイル");
+                share
+                    .open(
+                        FsPath::new(&file).unwrap(),
+                        OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                        0,
+                    )
+                    .await
+                    .expect("file must be created");
+                let child = at("하위");
+                share
+                    .create_directory(FsPath::new(&child).unwrap(), 0)
+                    .await
+                    .expect("directory must be created");
+                let link = at("链接");
+                share
+                    .symlink("ファイル", FsPath::new(&link).unwrap(), 0)
+                    .await
+                    .expect("link must be created");
+                let parent = std::fs::metadata(&path).expect("parent metadata");
+                for (name, expected) in [(&file, file_mode), (&child, child_mode)] {
+                    let made = std::fs::symlink_metadata(root.path().join(name))
+                        .expect("created node metadata");
+                    assert_eq!(made.mode() & 0o7777, expected, "{name}");
+                    assert_eq!((made.uid(), made.gid()), (parent.uid(), gid), "{name}");
+                }
+                let made = std::fs::symlink_metadata(root.path().join(&link)).unwrap();
+                assert_eq!((made.uid(), made.gid()), (parent.uid(), gid), "{link}");
+            }
+        });
+    }
+
     #[test]
     fn hosted_filesystem_supports_links() {
         run_hosted_fs_test(async {
@@ -449,7 +664,7 @@ mod tests {
                 .await
                 .expect("hard link must be created");
             filesystem
-                .symlink("source", "sym")
+                .symlink("source", "sym", current_gid(&root))
                 .await
                 .expect("symlink must be created");
 
@@ -491,6 +706,41 @@ mod tests {
         });
     }
 
+    #[test]
+    fn hosted_filesystem_set_times_acts_on_symlink_itself() {
+        run_hosted_fs_test(async {
+            use std::os::unix::fs::MetadataExt;
+
+            let root = test_root();
+            std::fs::write(root.path().join("target"), b"payload").expect("target must be written");
+            std::os::unix::fs::symlink("target", root.path().join("sym"))
+                .expect("symlink must be created");
+            let filesystem = filesystem(&root);
+
+            filesystem
+                .set_times("target", Some(10_000_000_001), Some(20_000_000_002))
+                .await
+                .expect("target times must be set");
+            filesystem
+                .set_times("sym", Some(30_000_000_003), Some(40_000_000_004))
+                .await
+                .expect("symlink times must be set");
+
+            let target =
+                std::fs::symlink_metadata(root.path().join("target")).expect("target stat");
+            assert_eq!(target.atime(), 10);
+            assert_eq!(target.atime_nsec(), 1);
+            assert_eq!(target.mtime(), 20);
+            assert_eq!(target.mtime_nsec(), 2);
+
+            let link = std::fs::symlink_metadata(root.path().join("sym")).expect("symlink stat");
+            assert_eq!(link.atime(), 30);
+            assert_eq!(link.atime_nsec(), 3);
+            assert_eq!(link.mtime(), 40);
+            assert_eq!(link.mtime_nsec(), 4);
+        });
+    }
+
     /// Appending must land at the host's current end of file even when the
     /// caller never tracked an offset, and must report where it wrote so a
     /// stream can keep its own position.
@@ -501,20 +751,185 @@ mod tests {
             std::fs::write(root.path().join("log"), b"first").expect("seed file must be written");
             let filesystem = filesystem(&root);
 
-            let offset = filesystem
-                .append_file("log", b"-second")
+            let offset = append(&filesystem, "log", b"-second")
                 .await
                 .expect("append must succeed");
             assert_eq!(offset, b"first".len() as u64);
 
-            filesystem
-                .append_file("log", b"-third")
+            append(&filesystem, "log", b"-third")
                 .await
                 .expect("second append must succeed");
 
             let contents = std::fs::read(root.path().join("log")).expect("file must be readable");
             assert_eq!(contents, b"first-second-third");
         });
+    }
+
+    /// A positional write lands at its offset, and one prepared but
+    /// dropped before its submit leaves the file as it was.
+    #[test]
+    fn hosted_filesystem_writes_at_an_offset_and_a_dropped_write_changes_nothing() {
+        run_hosted_fs_test(async {
+            let root = test_root();
+            std::fs::write(root.path().join("data"), b"0123456789")
+                .expect("seed file must be written");
+            let filesystem = filesystem(&root);
+
+            let staged = filesystem
+                .prepare_write("data", WritePosition::At(3), 4)
+                .await
+                .expect("write must be staged");
+            drop(staged);
+            assert_eq!(
+                std::fs::read(root.path().join("data")).expect("file must be readable"),
+                b"0123456789"
+            );
+
+            let staged = filesystem
+                .prepare_write("data", WritePosition::At(3), 4)
+                .await
+                .expect("write must be staged");
+            assert_eq!(staged.staged_len(), 4);
+            let landed = staged
+                .fill(|at, destination| {
+                    destination.copy_from_slice(&b"abcd"[at..at + destination.len()]);
+                })
+                .submit()
+                .await
+                .expect("write must land");
+            assert!(matches!(
+                landed,
+                WriteProgress::Done(Landed { offset: 3, len: 4 })
+            ));
+            assert_eq!(
+                std::fs::read(root.path().join("data")).expect("file must be readable"),
+                b"012abcd789"
+            );
+        });
+    }
+
+    /// A write to a path the host does not have fails while it is being
+    /// staged, before any bytes are asked for.
+    #[test]
+    fn hosted_filesystem_refuses_a_write_to_a_missing_file_when_staging_it() {
+        run_hosted_fs_test(async {
+            let root = test_root();
+            let filesystem = filesystem(&root);
+
+            let error = filesystem
+                .prepare_write("missing", WritePosition::At(0), 4)
+                .await
+                .map(drop)
+                .expect_err("a missing file cannot be written");
+            assert_eq!(error.kind(), helios_kernel::HostFsErrorKind::NoEntry);
+        });
+    }
+
+    /// A FIFO in the share is listed and statted as one, and opening it
+    /// for any data path is refused without opening it (opening a FIFO
+    /// with no peer would block the host thread).
+    #[test]
+    fn hosted_filesystem_reports_a_fifo_and_refuses_to_open_it() {
+        run_hosted_fs_test(async {
+            let root = test_root();
+            std::fs::write(root.path().join("plain"), b"data").expect("file must be written");
+            let fifo = std::ffi::CString::new(
+                root.path()
+                    .join("pipe")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            )
+            .expect("path has no NUL");
+            // SAFETY: `fifo` is a NUL-terminated path that outlives the call.
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+            std::os::unix::fs::symlink("plain", root.path().join("link"))
+                .expect("symlink must be created");
+            let filesystem = filesystem(&root);
+
+            let metadata = filesystem.stat_path("pipe").await.expect("stat the FIFO");
+            assert_eq!(
+                metadata.kind().expect("a kind"),
+                helios_hal::fs::NodeKind::Fifo
+            );
+            let link = filesystem.stat_path("link").await.expect("stat the link");
+            assert_eq!(
+                link.kind().expect("a kind"),
+                helios_hal::fs::NodeKind::Symlink
+            );
+
+            let mut listed: Vec<_> = filesystem
+                .read_dir(
+                    "/",
+                    HostDirLimit {
+                        max_entries: 64,
+                        max_name_bytes: 4096,
+                    },
+                )
+                .await
+                .expect("the directory lists")
+                .into_iter()
+                .map(|entry| (entry.name, entry.kind))
+                .collect();
+            listed.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                listed,
+                [
+                    ("link".to_owned(), Some(helios_hal::fs::NodeKind::Symlink)),
+                    ("pipe".to_owned(), Some(helios_hal::fs::NodeKind::Fifo)),
+                    ("plain".to_owned(), Some(helios_hal::fs::NodeKind::File)),
+                ]
+            );
+
+            let refusal =
+                helios_kernel::HostFsErrorKind::Refused(helios_hal::fs::FsError::Unsupported);
+            let error = filesystem.read_file("pipe").await.expect_err("refused");
+            assert_eq!(error.kind(), refusal);
+            let error = filesystem
+                .read_file_range("pipe", 0, 4)
+                .await
+                .expect_err("refused");
+            assert_eq!(error.kind(), refusal);
+            let error = filesystem
+                .prepare_write("pipe", WritePosition::At(0), 4)
+                .await
+                .map(drop)
+                .expect_err("refused");
+            assert_eq!(error.kind(), refusal);
+            let error = filesystem.sync_file("pipe").await.expect_err("refused");
+            assert_eq!(error.kind(), refusal);
+            // The entry itself is still removable.
+            filesystem.remove("pipe", false).await.expect("unlink");
+
+            // A link is refused for data too: the kernel follows it itself.
+            let error = filesystem.read_file("link").await.expect_err("refused");
+            assert_eq!(
+                error.kind(),
+                helios_kernel::HostFsErrorKind::Refused(helios_hal::fs::FsError::Loop)
+            );
+        });
+    }
+
+    /// Appends `bytes` to `path` through the staged write, resolving with
+    /// the offset they landed at.
+    async fn append(
+        filesystem: &HostedFileSystem,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<u64, HostFsError> {
+        let staged = filesystem
+            .prepare_write(path, WritePosition::End, bytes.len())
+            .await?;
+        match staged
+            .fill(|at, destination| {
+                destination.copy_from_slice(&bytes[at..at + destination.len()]);
+            })
+            .submit()
+            .await?
+        {
+            WriteProgress::Done(landed) => Ok(landed.offset),
+            WriteProgress::More(_) => panic!("a hosted write lands in one round"),
+        }
     }
 
     /// `fd_sync` must reach the host rather than report success without
@@ -576,6 +991,73 @@ mod tests {
                 .await
                 .expect("alias stat must succeed");
             assert_eq!(alias.identity, metadata.identity);
+        });
+    }
+
+    #[test]
+    fn hosted_filesystem_preserves_set_id_sticky_bits_and_special_nodes() {
+        run_hosted_fs_test(async {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            use std::os::unix::net::UnixListener;
+
+            let root = test_root();
+            let host_meta = std::fs::metadata(root.path()).expect("root metadata");
+            for (name, bits) in [
+                ("suid", 0o4755),
+                ("sgid", 0o2755),
+                ("both", 0o6711),
+                ("sticky", 0o1755),
+            ] {
+                let path = root.path().join(name);
+                std::fs::write(&path, b"#!/bin/sh\n").expect("file must be written");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(bits))
+                    .expect("set-id and sticky bits must be set");
+            }
+            let dir = root.path().join("sgid-dir");
+            std::fs::create_dir(&dir).expect("dir must be created");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o3775))
+                .expect("dir setgid and sticky bits must be set");
+            let sock_path = root.path().join("sock");
+            let _listener = UnixListener::bind(&sock_path).expect("unix socket must bind");
+
+            let filesystem = filesystem(&root);
+            filesystem
+                .create_file(
+                    "sibling",
+                    helios_kernel::HostCreation {
+                        permissions: 0o640,
+                        gid: host_meta.gid(),
+                    },
+                )
+                .await
+                .expect("sibling created");
+            append(&filesystem, "sibling", b"unrelated write")
+                .await
+                .expect("sibling write");
+
+            for (name, bits) in [
+                ("suid", 0o104_755),
+                ("sgid", 0o102_755),
+                ("both", 0o106_711),
+                ("sticky", 0o101_755),
+                ("sgid-dir", 0o043_775),
+            ] {
+                let meta = filesystem.stat_path(name).await.expect("stat must succeed");
+                assert_eq!(meta.mode, bits, "{name}: {:#o}", meta.mode);
+                assert_eq!(
+                    (meta.uid, meta.gid),
+                    (host_meta.uid(), host_meta.gid()),
+                    "{name}"
+                );
+            }
+            let sock = filesystem.stat_path("sock").await.expect("stat socket");
+            assert_eq!(sock.kind().unwrap(), helios_hal::fs::NodeKind::Socket);
+            let refusal =
+                helios_kernel::HostFsErrorKind::Refused(helios_hal::fs::FsError::Unsupported);
+            assert_eq!(
+                filesystem.read_file("sock").await.unwrap_err().kind(),
+                refusal
+            );
         });
     }
 
