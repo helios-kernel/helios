@@ -181,7 +181,7 @@ test-libraries:
     # and is tested here rather than only inside a boot, alongside the
     # capture check that links it.
     cargo nextest run -p helios-compositor-render -p helios-desktop-text-check
-    cargo nextest run -p helios-inspector-protocol --lib
+    cargo nextest run -p helios-inspector-protocol -p helios-wit-rpc
     # Btrfs reader and transaction tests use images two pure-Rust writers build.
     # Images from `mkfs.btrfs` need btrfs-progs and run in
     # `test-btrfs-mkfs`.
@@ -346,6 +346,7 @@ check-host:
     cargo check -p helios-kernel
     cargo check -p helios-hosted
     cargo check -p helios-inspector
+    cargo check -p helios-wit-rpc
     cargo check -p helios-compositor-render -p helios-desktop-text-check
 
 # Run hosted embedded-debugger smoke test.

@@ -8,15 +8,15 @@ use crate::error::WireError;
 #[cfg(feature = "host")]
 use std::io::Write as _;
 
-pub(crate) const FRAME_MAGIC: [u8; 8] = [0xff, 0x00, b'H', b'R', b'P', b'C', 0xaa, 0x55];
+pub const FRAME_MAGIC: [u8; 8] = [0xff, 0x00, b'H', b'R', b'P', b'C', 0xaa, 0x55];
 
 /// Largest frame payload the reader accepts, in bytes.
 ///
 /// The largest legitimate payload is one raw-transfer chunk plus its
 /// fixed fields, well under this; the bound exists so the length in a
-/// frame header, which the guest controls, never sizes an allocation
+/// frame header, which the peer controls, never sizes an allocation
 /// beyond it.
-pub(crate) const MAX_FRAME_SIZE: usize = 1 << 20;
+pub const MAX_FRAME_SIZE: usize = 1 << 20;
 
 /// Longest run of guest console bytes the frame scanner holds while it
 /// waits for a newline or a frame header, in bytes.
@@ -45,8 +45,8 @@ const GUEST_PANIC_MARKER: &str = "Kernel panic:";
 #[cfg(feature = "host")]
 const GUEST_CONSOLE_LOOKBACK: usize = 3;
 
-#[derive(Debug)]
-pub(crate) enum Frame {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Frame {
     Open {
         invocation: u32,
         instance: String,
@@ -68,9 +68,21 @@ pub(crate) enum Frame {
         invocation: u32,
         path: Vec<u32>,
     },
+    Credit {
+        invocation: u32,
+        path: Vec<u32>,
+        credits: u32,
+    },
+    ResourceDrop {
+        handle: u32,
+    },
+    Fault {
+        invocation: u32,
+        error: WireError,
+    },
 }
 
-pub(crate) async fn write_frame<T>(io: &mut T, frame: &Frame) -> io::Result<()>
+pub async fn write_frame<T>(io: &mut T, frame: &Frame) -> io::Result<()>
 where
     T: AsyncWrite + Unpin,
 {
@@ -86,7 +98,7 @@ where
     flush(io).await
 }
 
-pub(crate) async fn read_frame<T>(io: &mut T) -> io::Result<Option<Frame>>
+pub async fn read_frame<T>(io: &mut T) -> io::Result<Option<Frame>>
 where
     T: AsyncRead + Unpin,
 {
@@ -313,7 +325,7 @@ where
     Ok(())
 }
 
-fn encode_frame(frame: &Frame) -> io::Result<Vec<u8>> {
+pub fn encode_frame(frame: &Frame) -> io::Result<Vec<u8>> {
     let mut payload = Vec::new();
     match frame {
         Frame::Open {
@@ -353,11 +365,30 @@ fn encode_frame(frame: &Frame) -> io::Result<Vec<u8>> {
             encode_u32(&mut payload, *invocation);
             encode_u32_vec(&mut payload, path)?;
         }
+        Frame::Credit {
+            invocation,
+            path,
+            credits,
+        } => {
+            payload.push(5);
+            encode_u32(&mut payload, *invocation);
+            encode_u32_vec(&mut payload, path)?;
+            encode_u32(&mut payload, *credits);
+        }
+        Frame::ResourceDrop { handle } => {
+            payload.push(6);
+            encode_u32(&mut payload, *handle);
+        }
+        Frame::Fault { invocation, error } => {
+            payload.push(7);
+            encode_u32(&mut payload, *invocation);
+            encode_wire_error(&mut payload, error)?;
+        }
     }
     Ok(payload)
 }
 
-fn decode_frame(mut payload: &[u8]) -> io::Result<Frame> {
+pub fn decode_frame(mut payload: &[u8]) -> io::Result<Frame> {
     let Some(tag) = payload.first().copied() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -387,6 +418,18 @@ fn decode_frame(mut payload: &[u8]) -> io::Result<Frame> {
             invocation: decode_u32(&mut payload)?,
             path: decode_u32_vec(&mut payload)?,
         }),
+        5 => Ok(Frame::Credit {
+            invocation: decode_u32(&mut payload)?,
+            path: decode_u32_vec(&mut payload)?,
+            credits: decode_u32(&mut payload)?,
+        }),
+        6 => Ok(Frame::ResourceDrop {
+            handle: decode_u32(&mut payload)?,
+        }),
+        7 => Ok(Frame::Fault {
+            invocation: decode_u32(&mut payload)?,
+            error: decode_wire_error(&mut payload)?,
+        }),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown frame tag {other}"),
@@ -394,7 +437,184 @@ fn decode_frame(mut payload: &[u8]) -> io::Result<Frame> {
     }
 }
 
+fn encode_wire_error(buffer: &mut Vec<u8>, error: &WireError) -> io::Result<()> {
+    match error {
+        WireError::FrameTooLarge { len, max } => {
+            buffer.push(0);
+            encode_u64(buffer, *len as u64);
+            encode_u64(buffer, *max as u64);
+        }
+        WireError::LengthExceedsInput {
+            field,
+            len,
+            needed,
+            remaining,
+        } => {
+            buffer.push(1);
+            buffer.push(encode_field_kind(field));
+            encode_u32(buffer, *len);
+            encode_u64(buffer, *needed as u64);
+            encode_u64(buffer, *remaining as u64);
+        }
+        WireError::ConsoleLineTooLong { max } => {
+            buffer.push(2);
+            encode_u64(buffer, *max as u64);
+        }
+        WireError::InboundBacklogExceeded {
+            invocation,
+            held,
+            max,
+        } => {
+            buffer.push(3);
+            encode_u32(buffer, *invocation);
+            encode_u64(buffer, *held as u64);
+            encode_u64(buffer, *max as u64);
+        }
+        WireError::TooManyInboundPaths { invocation, max } => {
+            buffer.push(4);
+            encode_u32(buffer, *invocation);
+            encode_u64(buffer, *max as u64);
+        }
+        WireError::StreamCreditExceeded { invocation, path } => {
+            buffer.push(5);
+            encode_u32(buffer, *invocation);
+            encode_u32_vec(buffer, path)?;
+        }
+        WireError::CreditOverflow {
+            invocation,
+            path,
+            credits,
+        } => {
+            buffer.push(6);
+            encode_u32(buffer, *invocation);
+            encode_u32_vec(buffer, path)?;
+            encode_u32(buffer, *credits);
+        }
+        WireError::InvalidResourceHandle { handle } => {
+            buffer.push(7);
+            encode_u32(buffer, *handle);
+        }
+        WireError::ResourceTypeMismatch {
+            handle,
+            expected,
+            actual,
+        } => {
+            buffer.push(8);
+            encode_u32(buffer, *handle);
+            encode_string(buffer, expected)?;
+            encode_string(buffer, actual)?;
+        }
+        WireError::ResourceBorrowed { handle } => {
+            buffer.push(9);
+            encode_u32(buffer, *handle);
+        }
+        WireError::MalformedPayload { context, detail } => {
+            buffer.push(10);
+            encode_string(buffer, context)?;
+            encode_string(buffer, detail)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_wire_error(payload: &mut &[u8]) -> io::Result<WireError> {
+    let Some(tag) = payload.first().copied() else {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated wire error tag",
+        ));
+    };
+    *payload = &payload[1..];
+    match tag {
+        0 => Ok(WireError::FrameTooLarge {
+            len: decode_usize(payload)?,
+            max: decode_usize(payload)?,
+        }),
+        1 => {
+            let Some(kind) = payload.first().copied() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated field kind",
+                ));
+            };
+            *payload = &payload[1..];
+            Ok(WireError::LengthExceedsInput {
+                field: decode_field_kind(kind),
+                len: decode_u32(payload)?,
+                needed: decode_usize(payload)?,
+                remaining: decode_usize(payload)?,
+            })
+        }
+        2 => Ok(WireError::ConsoleLineTooLong {
+            max: decode_usize(payload)?,
+        }),
+        3 => Ok(WireError::InboundBacklogExceeded {
+            invocation: decode_u32(payload)?,
+            held: decode_usize(payload)?,
+            max: decode_usize(payload)?,
+        }),
+        4 => Ok(WireError::TooManyInboundPaths {
+            invocation: decode_u32(payload)?,
+            max: decode_usize(payload)?,
+        }),
+        5 => Ok(WireError::StreamCreditExceeded {
+            invocation: decode_u32(payload)?,
+            path: decode_u32_vec(payload)?,
+        }),
+        6 => Ok(WireError::CreditOverflow {
+            invocation: decode_u32(payload)?,
+            path: decode_u32_vec(payload)?,
+            credits: decode_u32(payload)?,
+        }),
+        7 => Ok(WireError::InvalidResourceHandle {
+            handle: decode_u32(payload)?,
+        }),
+        8 => Ok(WireError::ResourceTypeMismatch {
+            handle: decode_u32(payload)?,
+            expected: decode_string(payload)?,
+            actual: decode_string(payload)?,
+        }),
+        9 => Ok(WireError::ResourceBorrowed {
+            handle: decode_u32(payload)?,
+        }),
+        10 => Ok(WireError::MalformedPayload {
+            context: decode_string(payload)?,
+            detail: decode_string(payload)?,
+        }),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown wire error tag {other}"),
+        )),
+    }
+}
+
+fn encode_field_kind(field: &'static str) -> u8 {
+    match field {
+        "byte slice" => 0,
+        "u32 vector" => 1,
+        "list" => 2,
+        "string" => 3,
+        "stream batch" => 4,
+        _ => 255,
+    }
+}
+
+fn decode_field_kind(tag: u8) -> &'static str {
+    match tag {
+        0 => "byte slice",
+        1 => "u32 vector",
+        2 => "list",
+        3 => "string",
+        4 => "stream batch",
+        _ => "payload field",
+    }
+}
+
 fn encode_u32(buffer: &mut Vec<u8>, value: u32) {
+    buffer.extend_from_slice(&value.to_le_bytes());
+}
+
+fn encode_u64(buffer: &mut Vec<u8>, value: u64) {
     buffer.extend_from_slice(&value.to_le_bytes());
 }
 
@@ -410,6 +630,25 @@ fn decode_u32(payload: &mut &[u8]) -> io::Result<u32> {
     let mut bytes = [0_u8; 4];
     bytes.copy_from_slice(raw);
     Ok(u32::from_le_bytes(bytes))
+}
+
+fn decode_u64(payload: &mut &[u8]) -> io::Result<u64> {
+    if payload.len() < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated u64 field",
+        ));
+    }
+    let (raw, rest) = payload.split_at(8);
+    *payload = rest;
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(raw);
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn decode_usize(payload: &mut &[u8]) -> io::Result<usize> {
+    let raw = decode_u64(payload)?;
+    usize::try_from(raw).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "usize overflow"))
 }
 
 fn encode_string(buffer: &mut Vec<u8>, value: &str) -> io::Result<()> {
@@ -661,5 +900,54 @@ unhandled x86 kernel exception after Wasmtime dispatch: fault details / Kernel p
         let mut stray = b"INFO [helios_kernel] Kernel is ready\n".to_vec();
         flush_stray_bytes(&mut stray, &mut console).expect("an ordinary line is not a fault");
         assert!(stray.is_empty());
+    }
+
+    #[test]
+    fn credit_resource_drop_and_fault_frames_round_trip() {
+        let frames = [
+            Frame::Credit {
+                invocation: 9,
+                path: vec![1, 3],
+                credits: 16,
+            },
+            Frame::ResourceDrop { handle: 42 },
+            Frame::Fault {
+                invocation: 9,
+                error: WireError::InvalidResourceHandle { handle: 42 },
+            },
+            Frame::Fault {
+                invocation: 11,
+                error: WireError::ResourceTypeMismatch {
+                    handle: 7,
+                    expected: "counter".to_owned(),
+                    actual: "session".to_owned(),
+                },
+            },
+            Frame::Fault {
+                invocation: 12,
+                error: WireError::StreamCreditExceeded {
+                    invocation: 12,
+                    path: vec![0, 2],
+                },
+            },
+        ];
+        futures_lite::future::block_on(async {
+            let mut buffer = futures_lite::io::Cursor::new(Vec::new());
+            for frame in &frames {
+                write_frame(&mut buffer, frame)
+                    .await
+                    .expect("encode wire frame");
+            }
+            let raw = buffer.into_inner();
+            let mut slice = raw.as_slice();
+            for expected in &frames {
+                let decoded = read_frame(&mut slice)
+                    .await
+                    .expect("decode wire frame")
+                    .expect("frame present");
+                assert_eq!(&decoded, expected);
+            }
+            assert_eq!(read_frame(&mut slice).await.expect("eof"), None);
+        });
     }
 }

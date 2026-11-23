@@ -11,6 +11,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use artifact_cache::{
     ArtifactCache, CacheError, EntryKind, FeatureSet, KeyBuilder, PrecompileCache, PrecompileError,
     lock_closure_digest, package_directories, package_name, precompile, prune, workspace_inputs,
+    workspace_manifest_digest,
 };
 use askama::Template;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -2699,10 +2700,22 @@ impl WasmBuilder<'_> {
             .join(artifact_name);
         let environment = build_environment(self.profile, target_triple, requirements);
         let cache = match self.cache {
-            Some(cache) => Some((
-                cache,
-                self.cache_key(manifest_path, target_triple, &environment, requirements)?,
-            )),
+            Some(cache) => {
+                let package_dirs = package_directories(
+                    self.cargo,
+                    manifest_path,
+                    target_triple,
+                    FeatureSet::Default,
+                )?;
+                let key = self.cache_key(
+                    manifest_path,
+                    target_triple,
+                    &environment,
+                    requirements,
+                    &package_dirs,
+                )?;
+                Some((cache, key, package_dirs))
+            }
             None => None,
         };
         let resolve = || {
@@ -2711,7 +2724,7 @@ impl WasmBuilder<'_> {
                 source,
             })
         };
-        if let Some((cache, key)) = &cache
+        if let Some((cache, key, _)) = &cache
             && let Some(wasm) = cache.lookup_inputs(key, self.workspace_root.path())?
         {
             let write_cached = |source| WasmBuildError::WriteCached {
@@ -2780,7 +2793,7 @@ impl WasmBuilder<'_> {
         }
         let resolved = resolve()?;
 
-        if let Some((cache, key)) = &cache {
+        if let Some((cache, key, package_dirs)) = &cache {
             let wasm = fs::read(&resolved).map_err(|source| WasmBuildError::Read {
                 path: resolved.display().to_string(),
                 source,
@@ -2796,12 +2809,7 @@ impl WasmBuilder<'_> {
                 &[artifact.with_extension("d")],
                 self.workspace_root.path(),
                 &excluded,
-                &package_directories(
-                    self.cargo,
-                    manifest_path,
-                    target_triple,
-                    FeatureSet::Default,
-                )?,
+                package_dirs,
             )?;
             cache.store_inputs(key, self.workspace_root.path(), &inputs, &wasm)?;
         }
@@ -2817,6 +2825,7 @@ impl WasmBuilder<'_> {
         target_triple: &str,
         environment: &[(&'static str, String)],
         requirements: &WasmRequirements,
+        package_dirs: &[PathBuf],
     ) -> Result<artifact_cache::Key, WasmBuildError> {
         let root = self.workspace_root.path();
         let relative = manifest_path.strip_prefix(root).map_err(|_| {
@@ -2860,10 +2869,12 @@ impl WasmBuilder<'_> {
             }
         })?;
         let lock_closure = lock_closure_digest(&lock, &package_name(manifest_path)?)?;
+        let manifest_digest = workspace_manifest_digest(root, package_dirs)?;
         Ok(key
             .field(rustc_print("-vV")?)
             .field(config)
             .field(lock_closure)
+            .field(manifest_digest)
             .finish())
     }
 }
@@ -3544,14 +3555,39 @@ mod tests {
             cache: None,
         };
 
+        let cargo = std::env::var_os("CARGO")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("cargo"));
+        let package_dirs =
+            package_directories(&cargo, &manifest, COMPONENT_TRIPLE, FeatureSet::Default)
+                .expect("package directories resolve");
+
         let key_plain = builder_a
-            .cache_key(&manifest, COMPONENT_TRIPLE, &env_plain, &plain)
+            .cache_key(
+                &manifest,
+                COMPONENT_TRIPLE,
+                &env_plain,
+                &plain,
+                &package_dirs,
+            )
             .expect("plain key");
         let key_boring_a = builder_a
-            .cache_key(&manifest, COMPONENT_TRIPLE, &env_boring, &boring)
+            .cache_key(
+                &manifest,
+                COMPONENT_TRIPLE,
+                &env_boring,
+                &boring,
+                &package_dirs,
+            )
             .expect("boring key a");
         let key_boring_b = builder_b
-            .cache_key(&manifest, COMPONENT_TRIPLE, &env_boring, &boring)
+            .cache_key(
+                &manifest,
+                COMPONENT_TRIPLE,
+                &env_boring,
+                &boring,
+                &package_dirs,
+            )
             .expect("boring key b");
         assert_ne!(
             key_plain, key_boring_a,
