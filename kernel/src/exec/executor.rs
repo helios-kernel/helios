@@ -2,7 +2,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use core::alloc::Layout;
-use core::cell::UnsafeCell;
+use core::cell::{Cell, UnsafeCell};
 use core::future::Future;
 use core::marker::PhantomData;
 use core::mem::{align_of, size_of};
@@ -28,7 +28,7 @@ use crate::exec::ready::{
     GlobalPop, GlobalReadyQueue, ReadyLink, ReadyRunnable, ReadyShared, RunList,
 };
 use crate::exec::sync::Notify;
-use crate::exec::timer::{Timer, TimerBases};
+use crate::exec::timer::{GUEST_TIME_SLICE, Timer, TimerBases};
 use crate::instance::{InstanceHome, RegisteredInstance};
 use crate::memory::{
     LocalMemory, Locality, NodeMemory, PerProcessor, UserMemoryPool, task_arena_bytes_for,
@@ -36,6 +36,29 @@ use crate::memory::{
 
 pub type JoinHandle<T> = Task<T, ReadyLink>;
 pub const READY_BATCH_TASKS: usize = 1024;
+/// How many runs the loop may make between two service points: Go's
+/// `schedtick%61` global-queue check (`runtime/proc.go`, `findRunnable`),
+/// the seed of Tokio's tuned global queue interval and its fixed
+/// `event_interval` (tokio `runtime/builder.rs`, `new_multi_thread`).
+/// The other bound is time: a service point is also due once one
+/// [`GUEST_TIME_SLICE`] has passed since the last, because one run here
+/// can be a whole guest slice, and Tokio's own interval is a time budget
+/// (`TARGET_GLOBAL_QUEUE_INTERVAL`, tokio `runtime/scheduler/multi_thread/stats.rs`).
+///
+/// At a service point the loop fires the timer's expired sleeps and pops
+/// its node's queue ahead of local work. A local task requeues itself
+/// locally and cannot move to a node queue, so without a service
+/// point a guest that yields every time slice would hold off both for
+/// as long as it lives. A node-queue task queued while the local queue never
+/// empties runs at the first service point after its push: within this
+/// many runs, and no later than the first run boundary after one
+/// [`GUEST_TIME_SLICE`] of clock time, plus one run per global pop that
+/// met another processor's consumer lock. An expired sleep is fired at
+/// the first service point at or after the moment the wheel counts it
+/// due, under the same bound. The bound is measured in runs: the run in
+/// progress is not preempted, so a kernel task that never yields is
+/// outside this policy, and a guest is preempted by its slice.
+const SERVICE_INTERVAL_RUNS: u32 = 61;
 const TASK_ARENA_ALIGN: usize = 64;
 /// Power-of-two block classes from the alignment granule (64 B) up to
 /// the largest future the arena places (256 KiB).
@@ -840,6 +863,32 @@ pub struct Executor {
     progress: ProgressCounter,
     progress_notify: NoWeakArc<Notify>,
     local_run: RunList,
+    service: ServiceClock,
+}
+
+/// When this processor next serves its timer and its node's queue ahead
+/// of local work ([`SERVICE_INTERVAL_RUNS`]). Owner only: `Executor` is
+/// already `!Sync` (`local_run`). It persists across passes, so the bound
+/// does not reset when a pass returns early.
+struct ServiceClock {
+    /// Runs since the last service point.
+    runs: Cell<u32>,
+    /// Timer ticks at the last service point.
+    served_at: Cell<u64>,
+    /// That service point's global pop met [`GlobalPop::Contended`], so
+    /// each following run tries global first again until it gets an
+    /// answer.
+    global_owed: Cell<bool>,
+}
+
+impl ServiceClock {
+    const fn new() -> Self {
+        Self {
+            runs: Cell::new(0),
+            served_at: Cell::new(0),
+            global_owed: Cell::new(false),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -848,6 +897,7 @@ pub struct ExecutorRunStats {
     global_runnable_count: usize,
     local_empty_pop_count: usize,
     global_empty_pop_count: usize,
+    timer_fired_count: usize,
 }
 
 struct ProgressSignal {
@@ -901,6 +951,12 @@ impl ExecutorRunStats {
     /// empty, or another processor held its consumer lock.
     pub const fn global_empty_pop_count(self) -> usize {
         self.global_empty_pop_count
+    }
+
+    /// Sleeps the pass's timer fired: at its start and at each service
+    /// point.
+    pub const fn timer_fired_count(self) -> usize {
+        self.timer_fired_count
     }
 }
 
@@ -959,6 +1015,7 @@ impl Executor {
             progress,
             progress_notify: NoWeakArc::new(Notify::new()),
             local_run: RunList::new(),
+            service: ServiceClock::new(),
         }
     }
 
@@ -1015,11 +1072,18 @@ impl Executor {
     /// empty, one task at a time, so the next task is looked for close
     /// to home again. The node queues count as global in the stats.
     ///
-    /// `timer` is this processor's. Before the first task of a pass runs,
-    /// its deadline is pulled to within one scheduler tick
-    /// ([`Timer::arm_scheduler_tick`]): the task may be a guest, which is
-    /// preempted only from a timer interrupt, and a processor that has
-    /// just left a park may have its deadline an idle interval out.
+    /// That order holds between service points
+    /// ([`SERVICE_INTERVAL_RUNS`]). At a service point the timer fires
+    /// again and the owner's node queue is popped ahead of local work,
+    /// so a processor that always has local work still serves both.
+    ///
+    /// `timer` is this processor's. The pass begins by firing its expired
+    /// sleeps, so the tasks they wake are eligible at once. Before the
+    /// first task of a pass runs, its deadline is pulled to within one
+    /// scheduler tick ([`Timer::arm_scheduler_tick`]): the task may be a
+    /// guest, which is preempted only from a timer interrupt, and a
+    /// processor that has just left a park may have its deadline an idle
+    /// interval out.
     pub fn run_until_stalled_with_stats<CpuImpl: Cpu + Clone>(
         &self,
         timer: &Timer<CpuImpl>,
@@ -1029,25 +1093,41 @@ impl Executor {
         let own_node = ReadySource::Node(self.node);
         // The order starts with the owner's node itself.
         let remote_nodes = &self.group.locality.scheduling_order(self.node)[1..];
+        let service = &self.service;
+        stats.timer_fired_count += timer.fire_expired();
+        let slice_ticks = timer.cpu().timebase().duration_to_ticks(GUEST_TIME_SLICE);
 
         while stats.runnable_count() < READY_BATCH_TASKS {
             // A scheduler boundary: between tasks, with nothing polled.
             // One `Relaxed` load unless a freeze holds the machine.
             self.group.freeze.checkpoint(timer.cpu());
-            let (first, second) = if local_ready.load(Ordering::Relaxed) != 0 {
-                (ReadySource::Local, own_node)
+            let now = timer.now().ticks();
+            if service.runs.get() >= SERVICE_INTERVAL_RUNS
+                || now.saturating_sub(service.served_at.get()) >= slice_ticks
+            {
+                stats.timer_fired_count += timer.fire_expired();
+                service.runs.set(0);
+                service.served_at.set(now);
+                service.global_owed.set(true);
+            }
+
+            let near = if service.global_owed.get() {
+                self.pop_owed_node(&mut stats)
+                    .or_else(|| self.pop_ready_source(ReadySource::Local, &mut stats))
             } else {
-                (own_node, ReadySource::Local)
+                let (first, second) = if local_ready.load(Ordering::Relaxed) != 0 {
+                    (ReadySource::Local, own_node)
+                } else {
+                    (own_node, ReadySource::Local)
+                };
+                self.pop_ready_source(first, &mut stats)
+                    .or_else(|| self.pop_ready_source(second, &mut stats))
             };
-            let Some((runnable, source)) = self
-                .pop_ready_source(first, &mut stats)
-                .or_else(|| self.pop_ready_source(second, &mut stats))
-                .or_else(|| {
-                    remote_nodes.iter().find_map(|&node| {
-                        self.pop_ready_source(ReadySource::Node(node), &mut stats)
-                    })
-                })
-            else {
+            let Some((runnable, source)) = near.or_else(|| {
+                remote_nodes
+                    .iter()
+                    .find_map(|&node| self.pop_ready_source(ReadySource::Node(node), &mut stats))
+            }) else {
                 return stats;
             };
 
@@ -1055,6 +1135,7 @@ impl Executor {
                 timer.arm_scheduler_tick();
             }
             runnable.run();
+            service.runs.set(service.runs.get() + 1);
             match source {
                 ReadySource::Local => stats.local_runnable_count += 1,
                 ReadySource::Node(_) => stats.global_runnable_count += 1,
@@ -1062,6 +1143,28 @@ impl Executor {
         }
 
         stats
+    }
+
+    /// The pop of the owner's node queue a service point owes: one try
+    /// ahead of local work. `Ready` and `Empty` settle it; `Contended`
+    /// (another processor holds the consumer lock) leaves it owed, so the
+    /// next run tries again.
+    fn pop_owed_node(&self, stats: &mut ExecutorRunStats) -> Option<(ReadyRunnable, ReadySource)> {
+        match self.group.nodes[self.node.index()].queue.pop() {
+            GlobalPop::Ready(runnable) => {
+                self.service.global_owed.set(false);
+                Some((runnable, ReadySource::Node(self.node)))
+            }
+            GlobalPop::Empty => {
+                self.service.global_owed.set(false);
+                stats.global_empty_pop_count += 1;
+                None
+            }
+            GlobalPop::Contended => {
+                stats.global_empty_pop_count += 1;
+                None
+            }
+        }
     }
 
     /// Parks this processor until work arrives, polling its ready
@@ -1965,7 +2068,7 @@ impl<T> Future for LocalJoinHandle<T> {
 mod tests {
     use core::future::Future as _;
     use core::mem::size_of;
-    use core::pin::Pin;
+    use core::pin::{Pin, pin};
     use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use core::task::{Context, Waker};
 
@@ -1978,6 +2081,7 @@ mod tests {
         TASK_ARENA_CLASS_COUNT, TASK_ARENA_KERNEL_RESERVE_BYTES, TASK_ARENA_TOP_BYTES, TaskArena,
         should_wake_global_processor, should_wake_owner_processor, task_arena_bytes,
     };
+    use crate::exec::timer::TIMER_WHEEL_QUANTUM;
     use crate::instance::{InstanceActivity, InstanceHome, InstanceRegistry};
     use crate::memory::{PerProcessor, UserMemoryPool};
     use crate::test_support::{
@@ -2555,12 +2659,21 @@ mod tests {
         assert_eq!(cpu.woken(), [ProcessorId::new(1)]);
     }
 
+    /// The instant a timer publishes and arms for a sleep due at
+    /// `deadline`: the wheel quantum boundary at or after it, which is
+    /// when the wheel counts the sleep due.
+    fn wheel_due(cpu: &impl Cpu, deadline: u64) -> u64 {
+        let quantum = cpu.timebase().duration_to_ticks(TIMER_WHEEL_QUANTUM);
+        deadline.div_ceil(quantum) * quantum
+    }
+
     /// Sleeps a departing processor hands to another processor's timer
     /// base program no comparator on the departing processor —
     /// `set_deadline` reaches the executing processor, not the base's
     /// owner — and reach the owner through the idle handshake: a wake
     /// when it is parked, and its own arm before it parks when it was
-    /// running.
+    /// running. Every deadline is published and armed at the wheel
+    /// quantum boundary that makes its sleep due.
     #[test]
     fn a_foreign_sleep_wakes_the_parked_owner_and_programs_no_other_comparator() {
         let _serialized = super::executor_test_guard();
@@ -2580,12 +2693,12 @@ mod tests {
         crate::test_processor_identity::set(ProcessorId::new(1));
         let executor1 = executor0.sibling(ProgressCounter::new(), ProcessorId::new(1));
         let timer1 = executor1.timer(cpu.clone());
-        let mut while_parked = timer1.sleep_until(Instant::new(now + 500));
-        assert!(Pin::new(&mut while_parked).poll(&mut context).is_pending());
+        let mut while_parked = pin!(timer1.sleep_until(Instant::new(now + 500)));
+        assert!(while_parked.as_mut().poll(&mut context).is_pending());
         let registered = cpu.deadlines();
         assert_eq!(
             registered.last(),
-            Some(&(ProcessorId::new(1), now + 500)),
+            Some(&(ProcessorId::new(1), wheel_due(&cpu, now + 500))),
             "a sleep programs the comparator of the processor that registers it"
         );
 
@@ -2606,8 +2719,8 @@ mod tests {
         );
 
         idle.store(IdleState::Running);
-        let mut while_running = timer1.sleep_until(Instant::new(now + 400));
-        assert!(Pin::new(&mut while_running).poll(&mut context).is_pending());
+        let mut while_running = pin!(timer1.sleep_until(Instant::new(now + 400)));
+        assert!(while_running.as_mut().poll(&mut context).is_pending());
         let registered = cpu.deadlines();
         timer1.migrate_base(ProcessorId::new(0));
         assert_eq!(
@@ -2625,7 +2738,7 @@ mod tests {
         timer0.arm_published_deadline();
         assert_eq!(
             cpu.deadlines().last(),
-            Some(&(ProcessorId::new(0), now + 400)),
+            Some(&(ProcessorId::new(0), wheel_due(&cpu, now + 400))),
             "the owner arms the earliest published deadline before it parks"
         );
     }
@@ -2635,7 +2748,8 @@ mod tests {
     /// interrupt re-arms a tick on unless it is parked, when it stretches
     /// to the idle interval (100 ms), and the first executor pass that
     /// runs work after a park pulls it back within a tick, once, not on
-    /// every pass.
+    /// every pass. A sleep's deadline is armed at the wheel quantum
+    /// boundary that makes it due.
     #[test]
     fn a_running_processor_is_interrupted_every_tick_and_a_parked_one_keeps_its_long_deadline() {
         let _serialized = super::executor_test_guard();
@@ -2712,27 +2826,34 @@ mod tests {
             "a running processor's interrupt re-arms a tick on"
         );
 
+        // The later sleep first: a cancelled sleep leaves its published
+        // deadline in place until a fire after it passes, and this clock
+        // never moves.
         let mut context = Context::from_waker(Waker::noop());
-        let mut soon = timer.sleep_until(Instant::new(now + tick / 2));
-        assert!(Pin::new(&mut soon).poll(&mut context).is_pending());
-        assert_eq!(
-            armed(),
-            now + tick / 2,
-            "a sleep sooner than the tick is armed"
-        );
-        drop(soon);
-        timer.fire_expired();
-
-        let mut late = timer.sleep_until(Instant::new(now + long / 2));
-        assert!(Pin::new(&mut late).poll(&mut context).is_pending());
+        let mut late = pin!(timer.sleep_until(Instant::new(now + long / 2)));
+        assert!(late.as_mut().poll(&mut context).is_pending());
         idle.store(IdleState::Parked);
         timer.handle_interrupt();
         assert_eq!(
             armed(),
-            now + long / 2,
+            wheel_due(&cpu, now + long / 2),
             "a parked processor wakes for its next sleep inside the idle interval"
         );
+
         idle.store(IdleState::Running);
+        timer.handle_interrupt();
+        assert_eq!(
+            armed(),
+            now + tick,
+            "a running processor's interrupt re-arms a tick on, ahead of a later sleep"
+        );
+        let mut soon = pin!(timer.sleep_until(Instant::new(now + tick / 2)));
+        assert!(soon.as_mut().poll(&mut context).is_pending());
+        assert_eq!(
+            armed(),
+            wheel_due(&cpu, now + tick / 2),
+            "a sleep sooner than the tick is armed"
+        );
     }
 
     #[test]
@@ -3297,6 +3418,215 @@ mod tests {
         assert_eq!(local_ready(&executor, 0), LEFT_OVER);
         assert_eq!(run_to_stall(&executor, &timer), (LEFT_OVER, 0));
         assert_eq!(ran.load(Ordering::Relaxed), READY_BATCH_TASKS + LEFT_OVER);
+    }
+
+    use super::{GUEST_TIME_SLICE, SERVICE_INTERVAL_RUNS};
+    use crate::exec::yield_now;
+    use crate::test_support::ManualClockCpu;
+
+    /// A local task that requeues itself every run and counts them, until
+    /// `stop` is set. `each_run` runs once per run, after the count.
+    async fn self_rewaking_task(
+        spins: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        each_run: impl Fn(usize) + 'static,
+    ) {
+        loop {
+            let run = spins.fetch_add(1, Ordering::Relaxed) + 1;
+            each_run(run);
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            yield_now().await;
+        }
+    }
+
+    /// #704, count bound: a local task that requeues itself locally on
+    /// every run keeps the local queue non-empty for good, and the global
+    /// task queued behind it still runs within one service interval.
+    /// `TestCpu`'s clock never moves, so only the count rule can fire.
+    #[test]
+    fn a_global_task_runs_within_the_service_interval_behind_a_self_rewaking_local_task() {
+        let _serialized = super::executor_test_guard();
+        crate::test_processor_identity::set(ProcessorId::new(0));
+        let executor = Executor::new(
+            ProgressCounter::new(),
+            crate::test_support::single_node_pool(1),
+            ProcessorId::new(0),
+        );
+        let timer = executor.timer(TestCpu::new());
+        let spawner = executor.spawner(TestCpu::new());
+        let spins = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        spawner.spawn_local_detached(self_rewaking_task(spins.clone(), stop.clone(), |_| {}));
+
+        // One full pass of spinner runs leaves the interval mid-count.
+        let first = executor.run_until_stalled_with_stats(&timer);
+        assert_eq!(first.local_runnable_count(), READY_BATCH_TASKS);
+        let spins_at_push = spins.load(Ordering::Relaxed);
+
+        let seen_at = Arc::new(AtomicUsize::new(usize::MAX));
+        spawner.spawn_detached({
+            let spins = spins.clone();
+            let stop = stop.clone();
+            let seen_at = seen_at.clone();
+            async move {
+                seen_at.store(spins.load(Ordering::Relaxed), Ordering::Relaxed);
+                stop.store(true, Ordering::Relaxed);
+            }
+        });
+        let second = executor.run_until_stalled_with_stats(&timer);
+
+        assert_eq!(second.global_runnable_count(), 1);
+        let seen_at = seen_at.load(Ordering::Relaxed);
+        assert_ne!(seen_at, usize::MAX, "the global task never ran");
+        assert!(
+            seen_at - spins_at_push <= SERVICE_INTERVAL_RUNS as usize,
+            "the global task waited {} spinner runs",
+            seen_at - spins_at_push
+        );
+    }
+
+    /// #704, time bound: when each run takes a whole guest slice, every
+    /// run boundary is a service point, so the global task runs at the
+    /// first one rather than up to a count interval later.
+    #[test]
+    fn a_global_task_runs_within_one_guest_slice_of_runs_that_each_take_a_slice() {
+        let _serialized = super::executor_test_guard();
+        crate::test_processor_identity::set(ProcessorId::new(0));
+        let cpu = ManualClockCpu::new();
+        let executor = Executor::new(
+            ProgressCounter::new(),
+            crate::test_support::single_node_pool(1),
+            ProcessorId::new(0),
+        );
+        let timer = executor.timer(cpu.clone());
+        let spawner = executor.spawner(cpu.clone());
+        let slice_nanos = u64::try_from(GUEST_TIME_SLICE.as_nanos())
+            .expect("a guest time slice fits in nanoseconds");
+        let spins = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        spawner.spawn_local_detached(self_rewaking_task(spins.clone(), stop.clone(), {
+            let cpu = cpu.clone();
+            move |_| cpu.advance(slice_nanos)
+        }));
+
+        let first = executor.run_until_stalled_with_stats(&timer);
+        assert_eq!(first.local_runnable_count(), READY_BATCH_TASKS);
+        let spins_at_push = spins.load(Ordering::Relaxed);
+
+        let seen_at = Arc::new(AtomicUsize::new(usize::MAX));
+        spawner.spawn_detached({
+            let spins = spins.clone();
+            let stop = stop.clone();
+            let seen_at = seen_at.clone();
+            async move {
+                seen_at.store(spins.load(Ordering::Relaxed), Ordering::Relaxed);
+                stop.store(true, Ordering::Relaxed);
+            }
+        });
+        let second = executor.run_until_stalled_with_stats(&timer);
+
+        assert_eq!(second.global_runnable_count(), 1);
+        let seen_at = seen_at.load(Ordering::Relaxed);
+        assert_ne!(seen_at, usize::MAX, "the global task never ran");
+        assert!(
+            seen_at - spins_at_push <= 2,
+            "the global task waited {} spinner runs",
+            seen_at - spins_at_push
+        );
+    }
+
+    /// Runs a self-rewaking spinner that moves the clock `step_nanos` per
+    /// run beside a task sleeping 100 us, and returns how many spinner
+    /// runs passed between the first run that took the clock to the
+    /// moment the wheel counts the sleep due and the run before the
+    /// sleeper woke.
+    fn expired_sleep_wake_distance(step_nanos: u64) -> usize {
+        /// The timer wheel's quantum (`TIMER_WHEEL_QUANTUM`, 50 us): a
+        /// sleep is due at its deadline rounded up to it.
+        const WHEEL_QUANTUM_NANOS: u64 = 50_000;
+        const SLEEP_NANOS: u64 = 100_000;
+
+        crate::test_processor_identity::set(ProcessorId::new(0));
+        let cpu = ManualClockCpu::new();
+        let executor = Executor::new(
+            ProgressCounter::new(),
+            crate::test_support::single_node_pool(1),
+            ProcessorId::new(0),
+        );
+        let timer = executor.timer(cpu.clone());
+        let spawner = executor.spawner(cpu.clone());
+        let spins = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let due_nanos = Arc::new(AtomicU64::new(u64::MAX));
+        let due_at = Arc::new(AtomicUsize::new(usize::MAX));
+        let woke_at = Arc::new(AtomicUsize::new(usize::MAX));
+
+        spawner.spawn_local_detached({
+            let cpu = cpu.clone();
+            let timer = timer.clone();
+            let spins = spins.clone();
+            let stop = stop.clone();
+            let due_nanos = due_nanos.clone();
+            let woke_at = woke_at.clone();
+            async move {
+                let deadline = cpu.now().ticks() + SLEEP_NANOS;
+                due_nanos.store(
+                    deadline.div_ceil(WHEEL_QUANTUM_NANOS) * WHEEL_QUANTUM_NANOS,
+                    Ordering::Relaxed,
+                );
+                timer.sleep_until(Instant::new(deadline)).await;
+                woke_at.store(spins.load(Ordering::Relaxed), Ordering::Relaxed);
+                stop.store(true, Ordering::Relaxed);
+            }
+        });
+        spawner.spawn_local_detached(self_rewaking_task(spins.clone(), stop.clone(), {
+            let cpu = cpu.clone();
+            let due_nanos = due_nanos.clone();
+            let due_at = due_at.clone();
+            move |run| {
+                cpu.advance(step_nanos);
+                if cpu.now().ticks() >= due_nanos.load(Ordering::Relaxed)
+                    && due_at.load(Ordering::Relaxed) == usize::MAX
+                {
+                    due_at.store(run, Ordering::Relaxed);
+                }
+            }
+        }));
+
+        while executor
+            .run_until_stalled_with_stats(&timer)
+            .runnable_count()
+            != 0
+        {}
+
+        let woke_at = woke_at.load(Ordering::Relaxed);
+        let due_at = due_at.load(Ordering::Relaxed);
+        assert_ne!(woke_at, usize::MAX, "the sleeper never woke");
+        assert_ne!(due_at, usize::MAX, "the clock never passed the deadline");
+        woke_at.saturating_sub(due_at)
+    }
+
+    /// #704, timer bound: an expired sleep behind a self-rewaking local
+    /// task is fired at the first service point, whether that comes from
+    /// the run count (1 us per run, so 61 runs stay inside one slice) or
+    /// from the slice (1 ms per run).
+    #[test]
+    fn an_expired_sleep_fires_within_the_service_interval_behind_a_self_rewaking_local_task() {
+        let _serialized = super::executor_test_guard();
+
+        let by_count = expired_sleep_wake_distance(1_000);
+        assert!(
+            by_count <= SERVICE_INTERVAL_RUNS as usize + 1,
+            "the sleep fired {by_count} spinner runs after it was due"
+        );
+
+        let by_slice = expired_sleep_wake_distance(1_000_000);
+        assert!(
+            by_slice <= 3,
+            "the sleep fired {by_slice} spinner runs after it was due"
+        );
     }
 
     /// `try_spawn_on` refuses an offline or out-of-range processor without
