@@ -1111,7 +1111,7 @@ where
     // As Linux syncs and unmounts before it powers off: what the writable
     // mounts hold reaches their devices before the machine goes down.
     kernel.run_local_future(async move { namespace.sync_writable_mounts().await });
-    report_fiber_stack_demand_commits(&cpu);
+    report_fiber_stack_commits(&cpu);
     cpu.shutdown()
 }
 
@@ -1277,11 +1277,11 @@ where
 /// Prints what the fiber-stack arena did over this boot, per processor.
 ///
 /// The arena's whole claim is that a live instance costs the stack it
-/// touched rather than the stack it might, and a demand commit is the
+/// touched rather than the stack it might, and a reserve commit is the
 /// event that makes that true. Counting them per processor is also what
-/// shows the fault path running on every processor rather than only on
+/// shows the reserve path running on every processor rather than only on
 /// the one that created the stack.
-fn report_fiber_stack_demand_commits<CpuImpl: Cpu>(cpu: &CpuImpl) {
+fn report_fiber_stack_commits<CpuImpl: Cpu>(cpu: &CpuImpl) {
     let Some(stats) = crate::fiber_stack_arena_stats() else {
         return;
     };
@@ -1293,8 +1293,8 @@ fn report_fiber_stack_demand_commits<CpuImpl: Cpu>(cpu: &CpuImpl) {
         tracing::info!(
             target: "helios_kernel::fiber_stack",
             processor = processor.id(),
-            demand_commits = crate::fiber_stack_demand_commits_on(processor),
-            "fiber stack demand commits resolved on this processor"
+            reserve_commits = crate::fiber_stack_reserve_commits_on(processor),
+            "fiber stack reserve commits resolved on this processor"
         );
     }
     tracing::info!(
@@ -1303,14 +1303,11 @@ fn report_fiber_stack_demand_commits<CpuImpl: Cpu>(cpu: &CpuImpl) {
         live_slots = stats.live_slots,
         warm_slots = stats.warm_slots,
         retained_bytes = stats.retained_bytes,
-        demand_commits = stats.demand_commits,
         committed_bytes = stats.committed_bytes,
         eager_bytes = stats.eager_bytes,
         released_stacks = stats.released_stacks,
         released_committed_bytes = stats.released_committed_bytes,
         released_eager_bytes = stats.released_eager_bytes,
-        reserve_bytes = crate::page_fault_frame_reserve_bytes(),
-        demand_committed_pages = stats.demand_committed_pages,
         reserve_commits = stats.reserve_commits,
         reserve_committed_pages = stats.reserve_committed_pages,
         "fiber stack arena totals for this boot"

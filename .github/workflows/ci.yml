@@ -931,6 +931,31 @@ jobs:
           grep -Fqx oob-load:before-fault oob-load-smoke.out
           grep -Fqx guest-alive oob-load-smoke.out
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
+      - name: Exercise guest fiber-stack growth and overflow
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/stack-test"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program stack-test \
+            --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/stack-test host-call && /bin/stack-test large-frame && (/bin/stack-test recurse; echo after-recurse) && (/bin/stack-test large-frame-overflow; echo after-large-frame-overflow)' \
+            2>&1 > stack-test-smoke.out | tee "$runtime/inspector.log"
+          cat stack-test-smoke.out
+          cat "$runtime/guest-tracing.log"
+          grep -Fqx stack-test:host-call:ok stack-test-smoke.out
+          grep -Fqx stack-test:large-frame:ok stack-test-smoke.out
+          grep -Fqx stack-test:recurse:before stack-test-smoke.out
+          grep -Fqx after-recurse stack-test-smoke.out
+          grep -Fqx stack-test:large-frame-overflow:before stack-test-smoke.out
+          grep -Fqx after-large-frame-overflow stack-test-smoke.out
+          ! grep -Fq 'Kernel panic' stack-test-smoke.out "$runtime/inspector.log"
       - uses: ./helios/.github/actions/vhost-vsock
       - name: Boot riscv64 guest with the inspector RPC on vsock
         timeout-minutes: 5
@@ -1412,6 +1437,31 @@ jobs:
           grep -Fqx oob-load:before-fault oob-load-smoke.out
           grep -Fqx guest-alive oob-load-smoke.out
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
+      - name: Exercise guest fiber-stack growth and overflow
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/stack-test"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            --accel tcg \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program stack-test \
+            --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/stack-test host-call && /bin/stack-test large-frame && (/bin/stack-test recurse; echo after-recurse) && (/bin/stack-test large-frame-overflow; echo after-large-frame-overflow)' \
+            2>&1 > stack-test-smoke.out | tee "$runtime/inspector.log"
+          cat stack-test-smoke.out
+          cat "$runtime/guest-tracing.log"
+          grep -Fqx stack-test:host-call:ok stack-test-smoke.out
+          grep -Fqx stack-test:large-frame:ok stack-test-smoke.out
+          grep -Fqx stack-test:recurse:before stack-test-smoke.out
+          grep -Fqx after-recurse stack-test-smoke.out
+          grep -Fqx stack-test:large-frame-overflow:before stack-test-smoke.out
+          grep -Fqx after-large-frame-overflow stack-test-smoke.out
+          ! grep -Fq 'Kernel panic' stack-test-smoke.out "$runtime/inspector.log"
       - uses: ./helios/.github/actions/swtpm
       # Measured boot (#602): the kernel's signing seed is sealed in the
       # TPM to the boot chain. The ACPI description is the boot whose
@@ -2194,6 +2244,31 @@ jobs:
           grep -Fqx oob-load:before-fault oob-load-smoke.out
           grep -Fqx guest-alive oob-load-smoke.out
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
+      - name: Exercise guest fiber-stack growth and overflow
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/stack-test"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program stack-test \
+            --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/stack-test host-call && /bin/stack-test large-frame && (/bin/stack-test recurse; echo after-recurse) && (/bin/stack-test large-frame-overflow; echo after-large-frame-overflow)' \
+            2>&1 > stack-test-smoke.out | tee "$runtime/inspector.log"
+          cat stack-test-smoke.out
+          cat "$runtime/guest-tracing.log"
+          grep -Fqx stack-test:host-call:ok stack-test-smoke.out
+          grep -Fqx stack-test:large-frame:ok stack-test-smoke.out
+          grep -Fqx stack-test:recurse:before stack-test-smoke.out
+          grep -Fqx after-recurse stack-test-smoke.out
+          grep -Fqx stack-test:large-frame-overflow:before stack-test-smoke.out
+          grep -Fqx after-large-frame-overflow stack-test-smoke.out
+          ! grep -Fq 'Kernel panic' stack-test-smoke.out "$runtime/inspector.log"
       - name: Boot with online-capable processors that are not present
         timeout-minutes: 5
         shell: bash
