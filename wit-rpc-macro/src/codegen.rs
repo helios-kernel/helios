@@ -1779,9 +1779,14 @@ fn generate_server_resource_enum(ctx: &IfaceContext<'_>) -> TokenStream {
                     __dec: &mut #rt::__private::Decoder<'_, RpcServerResource<__H>>,
                 ) -> ::core::result::Result<Self, #rt::__private::WireError> {
                     let __handle = __dec.read_u32()?;
-                    let __owned = __dec.resources_mut()?.take(__handle, #wit_name, |__entry| match __entry {
-                        #extract_arm
-                    })?;
+                    let __owned = __dec.resources_mut()?.take(
+                        __handle,
+                        #wit_name,
+                        |__entry| match __entry {
+                            #extract_arm
+                        },
+                        RpcServerResource::#var,
+                    )?;
                     ::core::result::Result::Ok(Self(__owned))
                 }
             }

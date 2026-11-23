@@ -332,6 +332,10 @@ impl CallCore {
                 inbound.chunks.entry(path).or_default().push_back(payload);
             }
         }
+        if wire_fault.is_some() {
+            self.clear_prebuffered().await;
+            self.wake_writers(false).await;
+        }
         self.progress.signal();
         match wire_fault {
             Some(err) => Err(err),
@@ -356,6 +360,10 @@ impl CallCore {
                 inbound.fail_wire(err.clone());
                 wire_fault = Some(err);
             }
+        }
+        if wire_fault.is_some() {
+            self.clear_prebuffered().await;
+            self.wake_writers(false).await;
         }
         self.progress.signal();
         match wire_fault {
@@ -471,6 +479,29 @@ impl CallCore {
         Ok(())
     }
 
+    async fn clear_prebuffered(&self) {
+        let keys: Vec<u32> = {
+            let mut prebuffered = self.prebuffered_streams.lock().await;
+            std::mem::take(&mut *prebuffered).into_keys().collect()
+        };
+        if !keys.is_empty() {
+            let mut keepalive = self.shared.buffered_keepalive.lock().await;
+            for sub_id in keys {
+                keepalive.remove(&(self.side, self.invocation, sub_id));
+            }
+        }
+    }
+
+    async fn wake_writers(&self, mark_stopped: bool) {
+        let slots: Vec<Arc<WriterSlot>> = self.writers.lock().await.values().cloned().collect();
+        for slot in slots {
+            if mark_stopped {
+                slot.peer_stopped.store(true, Ordering::Release);
+            }
+            slot.progress.signal();
+        }
+    }
+
     async fn cancel_from_peer(&self) {
         self.cancelled.store(true, Ordering::Release);
         {
@@ -479,11 +510,8 @@ impl CallCore {
                 inbound.error = Some(Fault::Remote("invocation cancelled by caller".to_owned()));
             }
         }
-        let slots: Vec<Arc<WriterSlot>> = self.writers.lock().await.values().cloned().collect();
-        for slot in slots {
-            slot.peer_stopped.store(true, Ordering::Release);
-            slot.progress.signal();
-        }
+        self.clear_prebuffered().await;
+        self.wake_writers(true).await;
         self.progress.signal();
     }
 
@@ -494,10 +522,8 @@ impl CallCore {
                 inbound.error = Some(Fault::Remote(message));
             }
         }
-        let slots: Vec<Arc<WriterSlot>> = self.writers.lock().await.values().cloned().collect();
-        for slot in slots {
-            slot.progress.signal();
-        }
+        self.clear_prebuffered().await;
+        self.wake_writers(false).await;
         self.progress.signal();
     }
 
@@ -506,10 +532,8 @@ impl CallCore {
             let mut inbound = self.inbound.lock().await;
             inbound.fail_wire(error);
         }
-        let slots: Vec<Arc<WriterSlot>> = self.writers.lock().await.values().cloned().collect();
-        for slot in slots {
-            slot.progress.signal();
-        }
+        self.clear_prebuffered().await;
+        self.wake_writers(false).await;
         self.progress.signal();
     }
 }
@@ -542,6 +566,41 @@ pub struct InboundCall {
     peer: PeerHandle,
 }
 
+/// Lock-free watcher for whether a [`SubpathWriter`]'s remote consumer has
+/// stopped reading, cancelled the invocation, or disconnected.
+#[derive(Clone)]
+pub struct SubpathStopWatch {
+    core: Arc<CallCore>,
+    slot: Arc<WriterSlot>,
+}
+
+impl SubpathStopWatch {
+    pub fn is_peer_stopped(&self) -> bool {
+        self.slot.peer_stopped.load(Ordering::Acquire)
+            || self.core.cancelled.load(Ordering::Acquire)
+            || self.core.shared.closed.load(Ordering::Acquire)
+    }
+
+    pub async fn wait_peer_stopped(&self) {
+        loop {
+            let slot_mark = self.slot.progress.mark();
+            let call_mark = self.core.progress.mark();
+            let conn_mark = self.core.shared.progress.mark();
+            if self.is_peer_stopped() || self.core.failure_error().await.is_some() {
+                return;
+            }
+            futures_lite::future::or(
+                self.slot.progress.changed(slot_mark),
+                futures_lite::future::or(
+                    self.core.progress.changed(call_mark),
+                    self.core.shared.progress.changed(conn_mark),
+                ),
+            )
+            .await;
+        }
+    }
+}
+
 /// Credit-controlled sub-path writer backing `stream<T>` and `future<T>`.
 pub struct SubpathWriter {
     core: Arc<CallCore>,
@@ -566,6 +625,7 @@ pub struct SubpathReader {
     core: Arc<CallCore>,
     sub_id: u32,
     path: Vec<u32>,
+    replenish_credits: bool,
     reached_eof: bool,
 }
 
@@ -643,7 +703,11 @@ impl CallHandle {
         sub_id: u32,
         credit_window: u32,
     ) -> Result<SubpathReader, TransportError> {
-        open_reader(&self.core, sub_id, credit_window).await
+        open_reader(&self.core, sub_id, credit_window, true).await
+    }
+
+    pub async fn open_oneshot_reader(&self, sub_id: u32) -> Result<SubpathReader, TransportError> {
+        open_reader(&self.core, sub_id, 1, false).await
     }
 }
 
@@ -664,39 +728,6 @@ impl OutboundCall {
             outgoing_tx: self.core.outgoing_tx.clone(),
             control_tx: self.core.control_tx.clone(),
         }
-    }
-
-    pub async fn create_subpath_writer(&self) -> (u32, SubpathWriter) {
-        create_writer(&self.core).await
-    }
-
-    pub fn create_empty_subpath(&self) -> u32 {
-        let sub_id = self.core.next_subpath.fetch_add(1, Ordering::Relaxed);
-        self.core.send_control(Frame::Close {
-            invocation: self.core.invocation,
-            path: vec![self.core.side.out_data_dir(), sub_id],
-        });
-        sub_id
-    }
-
-    pub async fn create_ready_future_subpath(&self, payload: Vec<u8>) -> u32 {
-        let sub_id = self.core.next_subpath.fetch_add(1, Ordering::Relaxed);
-        let mut queue = VecDeque::with_capacity(1);
-        queue.push_back(payload);
-        self.core
-            .prebuffered_streams
-            .lock()
-            .await
-            .insert(sub_id, queue);
-        sub_id
-    }
-
-    pub async fn open_subpath_reader(
-        &self,
-        sub_id: u32,
-        credit_window: u32,
-    ) -> Result<SubpathReader, TransportError> {
-        open_reader(&self.core, sub_id, credit_window).await
     }
 
     pub async fn send_root_request(&self, payload: &[u8]) -> Result<(), TransportError> {
@@ -729,39 +760,6 @@ impl InboundCall {
         self.core.cancelled.load(Ordering::Acquire)
     }
 
-    pub async fn create_subpath_writer(&self) -> (u32, SubpathWriter) {
-        create_writer(&self.core).await
-    }
-
-    pub fn create_empty_subpath(&self) -> u32 {
-        let sub_id = self.core.next_subpath.fetch_add(1, Ordering::Relaxed);
-        self.core.send_control(Frame::Close {
-            invocation: self.core.invocation,
-            path: vec![self.core.side.out_data_dir(), sub_id],
-        });
-        sub_id
-    }
-
-    pub async fn create_ready_future_subpath(&self, payload: Vec<u8>) -> u32 {
-        let sub_id = self.core.next_subpath.fetch_add(1, Ordering::Relaxed);
-        let mut queue = VecDeque::with_capacity(1);
-        queue.push_back(payload);
-        self.core
-            .prebuffered_streams
-            .lock()
-            .await
-            .insert(sub_id, queue);
-        sub_id
-    }
-
-    pub async fn open_subpath_reader(
-        &self,
-        sub_id: u32,
-        credit_window: u32,
-    ) -> Result<SubpathReader, TransportError> {
-        open_reader(&self.core, sub_id, credit_window).await
-    }
-
     pub async fn recv_root_request(&self) -> Result<Vec<u8>, TransportError> {
         recv_root_all(&self.core).await
     }
@@ -786,29 +784,19 @@ impl SubpathWriter {
         }
     }
 
+    pub fn stop_watch(&self) -> SubpathStopWatch {
+        SubpathStopWatch {
+            core: Arc::clone(&self.core),
+            slot: Arc::clone(&self.slot),
+        }
+    }
+
     pub fn is_peer_stopped(&self) -> bool {
-        self.slot.peer_stopped.load(Ordering::Acquire)
-            || self.core.cancelled.load(Ordering::Acquire)
-            || self.core.shared.closed.load(Ordering::Acquire)
+        self.stop_watch().is_peer_stopped()
     }
 
     pub async fn wait_peer_stopped(&self) {
-        loop {
-            let slot_mark = self.slot.progress.mark();
-            let call_mark = self.core.progress.mark();
-            let conn_mark = self.core.shared.progress.mark();
-            if self.is_peer_stopped() || self.core.failure_error().await.is_some() {
-                return;
-            }
-            futures_lite::future::or(
-                self.slot.progress.changed(slot_mark),
-                futures_lite::future::or(
-                    self.core.progress.changed(call_mark),
-                    self.core.shared.progress.changed(conn_mark),
-                ),
-            )
-            .await;
-        }
+        self.stop_watch().wait_peer_stopped().await;
     }
 
     pub async fn send(&mut self, payload: Vec<u8>) -> Result<(), TransportError> {
@@ -912,13 +900,15 @@ impl SubpathReader {
                     }
                     inbound.undelivered_bytes -= chunk.len();
                     let is_closed = inbound.closed.contains(&self.path);
-                    let replenish =
-                        if !is_closed && let Some(credits) = inbound.credits.get_mut(&self.path) {
-                            *credits = credits.saturating_add(1);
-                            true
-                        } else {
-                            false
-                        };
+                    let replenish = if self.replenish_credits
+                        && !is_closed
+                        && let Some(credits) = inbound.credits.get_mut(&self.path)
+                    {
+                        *credits = credits.saturating_add(1);
+                        true
+                    } else {
+                        false
+                    };
                     Some(Ok(Some((chunk, replenish))))
                 } else if inbound.closed.contains(&self.path) {
                     Some(Ok(None))
@@ -938,6 +928,12 @@ impl SubpathReader {
                             path: self.path.clone(),
                             credits: 1,
                         });
+                    } else if !self.replenish_credits {
+                        // Single-shot future sub-paths never replenish credit
+                        // and are complete after the single value frame; mark
+                        // EOF so dropping the reader emits no spurious stop
+                        // notification while leaving inbound credit at 0.
+                        self.reached_eof = true;
                     }
                     return Ok(Some(chunk));
                 }
@@ -962,25 +958,11 @@ impl SubpathReader {
     }
 }
 
-async fn create_writer(core: &Arc<CallCore>) -> (u32, SubpathWriter) {
-    let sub_id = core.next_subpath.fetch_add(1, Ordering::Relaxed);
-    let slot = Arc::new(WriterSlot::new());
-    core.writers.lock().await.insert(sub_id, Arc::clone(&slot));
-    (
-        sub_id,
-        SubpathWriter {
-            core: Arc::clone(core),
-            sub_id,
-            slot,
-            closed: false,
-        },
-    )
-}
-
 async fn open_reader(
     core: &Arc<CallCore>,
     sub_id: u32,
     credit_window: u32,
+    replenish_credits: bool,
 ) -> Result<SubpathReader, TransportError> {
     let window = credit_window.max(1);
     let path = vec![core.side.in_data_dir(), sub_id];
@@ -1005,6 +987,7 @@ async fn open_reader(
         core: Arc::clone(core),
         sub_id,
         path,
+        replenish_credits,
         reached_eof: false,
     })
 }

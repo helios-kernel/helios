@@ -2463,7 +2463,6 @@ dependencies = [
  "helios-inspector-protocol",
  "helios-kernel",
  "helios-riscv",
- "helios-wit-rpc",
  "helios-x86",
  "wasmtime",
 ]
@@ -3244,7 +3243,6 @@ version = "0.1.0"
 dependencies = [
  "async-channel",
  "async-lock",
- "bytes",
  "event-listener",
  "futures-core",
  "futures-io",

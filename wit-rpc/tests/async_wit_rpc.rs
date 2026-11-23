@@ -1463,3 +1463,316 @@ fn composed_multi_interface_dispatchers_share_connection_handle_namespace() {
         .await;
     });
 }
+
+#[test]
+fn oneshot_future_omits_credit_replenishment_returns_without_eof_and_rejects_second_data() {
+    block_on(async {
+        let ((client_read, client_write), (mut raw_read, mut raw_write)) = duplex_pipe(32);
+        let config = EndpointConfig {
+            stream_credit_window: 2,
+        };
+        let endpoint = Endpoint::with_config(client_read, client_write, (), config);
+        let handle = endpoint.handle();
+        let client = lab::Client::new(handle.clone());
+
+        let (resolved_tx, resolved_rx) = async_channel::bounded::<()>(1);
+        let (second_sent_tx, second_sent_rx) = async_channel::bounded::<()>(1);
+
+        let caller = async {
+            let (mut out_stream, done_fut) = client
+                .transform(StreamReader::empty(), "oneshot".to_owned())
+                .await
+                .expect("open transform");
+
+            // Raw peer omits trailing `Frame::Close` on `[1, 2]`; single-shot
+            // `FutureReader` must still resolve immediately with `Ok(77)`.
+            let total = done_fut
+                .await
+                .expect("oneshot future must resolve without trailing Close")
+                .expect("result ok");
+            assert_eq!(total, 77);
+            resolved_tx.send(()).await.unwrap();
+
+            // Open a second call as an in-order wire barrier so `raw_peer` can
+            // prove no spurious `Credit(1)` or stop-reading `Close` was emitted
+            // for `[1, 2]` before `Open(2)`.
+            let sentinel = client.await_ticket(true).await.expect("sentinel open");
+            drop(sentinel);
+
+            // Wait until the raw peer transmits a delayed second `Frame::Data`
+            // on the exhausted single-shot future path `[1, 2]`.
+            second_sent_rx.recv().await.unwrap();
+            let err = out_stream.next().await.expect_err(
+                "delayed second Data on oneshot future must fail with StreamCreditExceeded",
+            );
+            assert_eq!(
+                err.wire_error(),
+                Some(&WireError::StreamCreditExceeded {
+                    invocation: 1,
+                    path: vec![1, 2],
+                })
+            );
+
+            handle.close();
+        };
+
+        let raw_peer = async {
+            assert!(matches!(
+                read_frame(&mut raw_read).await.unwrap(),
+                Some(Frame::Open { invocation: 1, .. })
+            ));
+            write_frame(&mut raw_write, &Frame::Accept { invocation: 1 })
+                .await
+                .unwrap();
+
+            // Drain request frames (`Data([0])`, `Close([0])`, empty input stream `Close([0, 1])`)
+            // and initial credits (`Credit([1, 1], 2)` and `Credit([1, 2], 1)`).
+            let mut saw_root_close = false;
+            while !saw_root_close {
+                match read_frame(&mut raw_read).await.unwrap() {
+                    Some(Frame::Close {
+                        invocation: 1,
+                        path,
+                    }) if path == vec![0] => saw_root_close = true,
+                    Some(_) => {}
+                    None => panic!("unexpected EOF reading request"),
+                }
+            }
+
+            // Return `(out_stream: sub_id = 1, done_fut: sub_id = 2)`.
+            let mut root_resp = Vec::with_capacity(8);
+            root_resp.extend_from_slice(&1_u32.to_le_bytes());
+            root_resp.extend_from_slice(&2_u32.to_le_bytes());
+            write_frame(
+                &mut raw_write,
+                &Frame::Data {
+                    invocation: 1,
+                    path: vec![1],
+                    payload: root_resp,
+                },
+            )
+            .await
+            .unwrap();
+            write_frame(
+                &mut raw_write,
+                &Frame::Close {
+                    invocation: 1,
+                    path: vec![1],
+                },
+            )
+            .await
+            .unwrap();
+
+            let mut saw_stream_credit = false;
+            let mut saw_future_credit = false;
+            while !(saw_stream_credit && saw_future_credit) {
+                match read_frame(&mut raw_read).await.unwrap() {
+                    Some(Frame::Credit {
+                        invocation: 1,
+                        path,
+                        credits: 2,
+                    }) if path == vec![1, 1] => saw_stream_credit = true,
+                    Some(Frame::Credit {
+                        invocation: 1,
+                        path,
+                        credits: 1,
+                    }) if path == vec![1, 2] => saw_future_credit = true,
+                    Some(Frame::Close {
+                        invocation: 1,
+                        path,
+                    }) if path == vec![0, 1] => {}
+                    other => panic!("unexpected frame waiting for initial credits: {other:?}"),
+                }
+            }
+
+            // Send single `Result::Ok(77_u64)` payload on future sub-path `[1, 2]`
+            // WITHOUT any `Frame::Close`.
+            let mut fut_payload = Vec::with_capacity(9);
+            fut_payload.push(0); // Result::Ok
+            fut_payload.extend_from_slice(&77_u64.to_le_bytes());
+            write_frame(
+                &mut raw_write,
+                &Frame::Data {
+                    invocation: 1,
+                    path: vec![1, 2],
+                    payload: fut_payload.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+            // Wait until the client has already consumed the oneshot future and
+            // opened invocation 2, verifying ZERO spurious `Credit` or stop-reading
+            // `Close` frames were emitted for `[1, 2]`.
+            resolved_rx.recv().await.unwrap();
+            loop {
+                match read_frame(&mut raw_read).await.unwrap() {
+                    Some(Frame::Open { invocation: 2, .. }) => {
+                        write_frame(&mut raw_write, &Frame::Accept { invocation: 2 })
+                            .await
+                            .unwrap();
+                        write_frame(
+                            &mut raw_write,
+                            &Frame::Data {
+                                invocation: 2,
+                                path: vec![1],
+                                payload: 1_u32.to_le_bytes().to_vec(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        write_frame(
+                            &mut raw_write,
+                            &Frame::Close {
+                                invocation: 2,
+                                path: vec![1],
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        break;
+                    }
+                    Some(Frame::Credit {
+                        invocation: 1,
+                        path,
+                        credits,
+                    }) if path == vec![1, 2] => {
+                        panic!(
+                            "oneshot future must never replenish credit (got Credit({credits}))"
+                        );
+                    }
+                    Some(Frame::Close {
+                        invocation: 1,
+                        path,
+                    }) if path == vec![2, 2] => {
+                        panic!("resolved oneshot future must not emit stop-reading Close");
+                    }
+                    Some(_) => {}
+                    None => panic!("unexpected EOF before sentinel Open(2)"),
+                }
+            }
+
+            // Now send a delayed second `Frame::Data` on `[1, 2]` (credit is 0!).
+            write_frame(
+                &mut raw_write,
+                &Frame::Data {
+                    invocation: 1,
+                    path: vec![1, 2],
+                    payload: fut_payload,
+                },
+            )
+            .await
+            .unwrap();
+            second_sent_tx.send(()).await.unwrap();
+        };
+
+        or(zip(caller, raw_peer), async {
+            let _ = endpoint.drive().await;
+            ((), ())
+        })
+        .await;
+    });
+}
+
+#[test]
+fn resource_take_restores_slot_on_extra_arc_and_writer_closed_does_not_block_is_closed() {
+    use helios_wit_rpc::{ResourceEntry, ResourceTableInner};
+
+    struct TestEntry(Arc<AtomicUsize>);
+    impl ResourceEntry for TestEntry {
+        fn kind_name(&self) -> &'static str {
+            "test-entry"
+        }
+    }
+
+    let mut table = ResourceTableInner::new();
+    let shared = Arc::new(AtomicUsize::new(42));
+    let extra_ref = Arc::clone(&shared);
+    let handle = table.insert(TestEntry(shared)).expect("insert");
+
+    // Simulate an extra `Arc` reference surviving when `borrows == 0`: `take`
+    // must fail with `ResourceBorrowed` AND restore the slot without dropping
+    // the live resource.
+    let err = table
+        .take(handle, "test-entry", |TestEntry(arc)| Ok(arc), TestEntry)
+        .expect_err("extra Arc ref must fail take with ResourceBorrowed");
+    assert_eq!(err, WireError::ResourceBorrowed { handle });
+    assert!(
+        table.contains(handle),
+        "failed take must restore slot instead of destroying live resource"
+    );
+
+    // Borrowing and dropping releases the borrow's Arc before decrementing
+    // `borrows`, so an immediate `take` after dropping `extra_ref` and `borrow`
+    // succeeds cleanly.
+    let borrow = table
+        .borrow(handle, "test-entry", |TestEntry(arc)| Some(arc))
+        .expect("borrow restored slot");
+    assert_eq!(borrow.load(Ordering::Acquire), 42);
+    drop(extra_ref);
+    drop(borrow);
+
+    let owned = table
+        .take(handle, "test-entry", |TestEntry(arc)| Ok(arc), TestEntry)
+        .expect("take after borrow drop");
+    assert_eq!(owned.load(Ordering::Acquire), 42);
+    assert!(!table.contains(handle));
+
+    // Also verify `StreamWriter::closed()` parked on `.await` does not block
+    // concurrent `StreamWriter::is_closed()` both before and after binding
+    // (no MutexGuard held across `.await`).
+    block_on(async {
+        let (writer, reader) = stream::<u32>();
+        let mut closed_fut = Box::pin(writer.closed());
+        assert!(poll_once(&mut closed_fut).await.is_none());
+        assert!(!writer.is_closed().await);
+        drop(reader);
+        assert!(writer.is_closed().await);
+        closed_fut.await;
+    });
+
+    block_on(async {
+        let ((a_read, a_write), (b_read, b_write)) = duplex_pipe(16);
+        let endpoint_a = Endpoint::new(a_read, a_write, ());
+        let handle_a = endpoint_a.handle();
+        let client = lab::Client::new(handle_a.clone());
+
+        let telemetry = Arc::new(LabTelemetry::default());
+        let (service, bg_rx) = LabService::new("bound-closed", telemetry);
+        let endpoint_b = Endpoint::new(b_read, b_write, lab::Server::new(service));
+        let handle_b = endpoint_b.handle();
+
+        let check = async {
+            let (mut writer, reader) = stream::<Packet>();
+            let (_out, _done) = client
+                .transform(reader, "bound".to_owned())
+                .await
+                .expect("open transform");
+            writer
+                .send(Packet {
+                    seq: 1,
+                    label: "ok".to_owned(),
+                    perms: Permissions::READ,
+                    mode: Mode::Fast,
+                })
+                .await
+                .expect("send first item");
+            let mut closed_fut = Box::pin(writer.closed());
+            assert!(poll_once(&mut closed_fut).await.is_none());
+            assert!(!writer.is_closed().await);
+            drop(closed_fut);
+            writer.close().await.expect("close writer");
+            handle_a.close();
+            handle_b.close();
+        };
+
+        or(check, async {
+            let _ = zip(
+                zip(endpoint_a.drive(), endpoint_b.drive()),
+                pump_bg_tasks(bg_rx),
+            )
+            .await;
+        })
+        .await;
+    });
+}

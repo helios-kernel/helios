@@ -56,7 +56,6 @@ helios-netstack = { path = "netstack" }
 helios-profdata = { path = "profdata" }
 helios-venus-gen = { path = "venus-gen", default-features = false }
 helios-virtio = { path = "virtio" }
-helios-wit-rpc = { path = "wit-rpc" }
 helios-wit-rpc-macro = { path = "wit-rpc-macro" }
 helios-tpm = { path = "tpm" }
 helios-workspace-root = { path = "workspace-root" }
@@ -84,7 +83,6 @@ helios-x86.workspace = true
 
 [dev-dependencies]
 helios-inspector-protocol.workspace = true
-helios-wit-rpc.workspace = true
 wasmtime = { path = "../wasmtime/crates/wasmtime", default-features = false, features = ["component-model", "cranelift", "gc-null", "runtime", "std"] }
 
 [profile.dev]

@@ -6,7 +6,8 @@ use async_lock::Mutex;
 use event_listener::{Event, EventListener};
 use helios_inspector_protocol::WireError;
 use helios_inspector_protocol::mux::{
-    CallHandle, InboundCall, OutboundCall, PeerHandle, SubpathReader, SubpathWriter,
+    CallHandle, InboundCall, OutboundCall, PeerHandle, SubpathReader, SubpathStopWatch,
+    SubpathWriter,
 };
 
 use crate::error::RpcError;
@@ -19,11 +20,19 @@ pub struct ErrorContext {
     pub debug_message: String,
 }
 
+struct OutboundPipeState {
+    writer: Option<SubpathWriter>,
+    stop_watch: Option<SubpathStopWatch>,
+}
+
 /// Shared non-generic pipe connecting a [`crate::StreamWriter`] or
 /// [`crate::FutureWriter`] to the wire sub-path allocated when its reader half
 /// is encoded onto an invocation.
+///
+/// The internal lock is only ever held for non-yielding handoff mutations and
+/// never across an `.await` point.
 pub struct OutboundPipe {
-    writer: Mutex<Option<SubpathWriter>>,
+    state: Mutex<OutboundPipeState>,
     bound: AtomicBool,
     writer_dropped: AtomicBool,
     reader_dropped: AtomicBool,
@@ -39,7 +48,10 @@ impl Default for OutboundPipe {
 impl OutboundPipe {
     pub fn new() -> Self {
         Self {
-            writer: Mutex::new(None),
+            state: Mutex::new(OutboundPipeState {
+                writer: None,
+                stop_watch: None,
+            }),
             bound: AtomicBool::new(false),
             writer_dropped: AtomicBool::new(false),
             reader_dropped: AtomicBool::new(false),
@@ -48,20 +60,39 @@ impl OutboundPipe {
     }
 
     pub(crate) async fn bind(&self, writer: SubpathWriter) {
-        if self.writer_dropped.load(Ordering::Acquire) {
+        let mut close_now = None;
+        {
+            let mut state = self.state.lock().await;
+            if self.writer_dropped.load(Ordering::SeqCst) {
+                close_now = Some(writer);
+            } else {
+                state.stop_watch = Some(writer.stop_watch());
+                state.writer = Some(writer);
+            }
+        }
+        if let Some(writer) = close_now {
             let _ = writer.close().await;
             return;
         }
-        *self.writer.lock().await = Some(writer);
-        self.bound.store(true, Ordering::Release);
+        self.bound.store(true, Ordering::SeqCst);
         self.event.notify(usize::MAX);
+
+        // Re-check `writer_dropped` with `SeqCst` after unlocking so a
+        // concurrent synchronous `Drop` (`mark_writer_dropped`) whose
+        // `try_lock()` lost the race cannot leave an orphaned `SubpathWriter`.
+        if self.writer_dropped.load(Ordering::SeqCst) {
+            let orphaned = self.state.lock().await.writer.take();
+            if let Some(writer) = orphaned {
+                let _ = writer.close().await;
+            }
+        }
     }
 
     pub(crate) fn mark_writer_dropped(&self) {
-        self.writer_dropped.store(true, Ordering::Release);
-        if let Some(mut guard) = self.writer.try_lock() {
+        self.writer_dropped.store(true, Ordering::SeqCst);
+        if let Some(mut state) = self.state.try_lock() {
             // Dropping `SubpathWriter` enqueues `Frame::Close` on the wire.
-            let _ = guard.take();
+            let _ = state.writer.take();
         }
         self.event.notify(usize::MAX);
     }
@@ -103,8 +134,21 @@ impl OutboundPipe {
         .await
     }
 
-    pub(crate) async fn lock_writer(&self) -> async_lock::MutexGuard<'_, Option<SubpathWriter>> {
-        self.writer.lock().await
+    pub(crate) async fn take_writer(&self) -> Option<SubpathWriter> {
+        self.state.lock().await.writer.take()
+    }
+
+    pub(crate) async fn stop_watch(&self) -> Option<SubpathStopWatch> {
+        self.state.lock().await.stop_watch.clone()
+    }
+
+    pub(crate) async fn is_peer_stopped(&self) -> bool {
+        self.state
+            .lock()
+            .await
+            .stop_watch
+            .as_ref()
+            .is_some_and(SubpathStopWatch::is_peer_stopped)
     }
 }
 
@@ -131,9 +175,18 @@ impl InboundPipe {
         *self.reader.lock().await = Some(reader);
     }
 
-    pub(crate) async fn lock_reader(&self) -> async_lock::MutexGuard<'_, Option<SubpathReader>> {
-        self.reader.lock().await
+    pub(crate) async fn take_reader(&self) -> Option<SubpathReader> {
+        self.reader.lock().await.take()
     }
+}
+
+/// Credit policy for an inbound sub-path opened during decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubpathCreditMode {
+    /// Multi-item `stream<T>` with initial window and per-chunk replenishment.
+    Streaming { window: u32 },
+    /// Single-shot `future<T>` granting 1 credit with no replenishment.
+    Oneshot,
 }
 
 /// Deferred outbound sub-path registration collected during synchronous
@@ -156,7 +209,7 @@ pub enum PendingOutboundSubpath {
 /// decoding and activated before returning decoded values to caller/handler.
 pub struct PendingInboundSubpath {
     pub sub_id: u32,
-    pub credit_window: u32,
+    pub credit_mode: SubpathCreditMode,
     pub pipe: Arc<InboundPipe>,
 }
 
@@ -407,9 +460,12 @@ pub async fn activate_inbound_subpaths(
     subpaths: Vec<PendingInboundSubpath>,
 ) -> Result<(), RpcError> {
     for pending in subpaths {
-        let reader = call
-            .open_reader(pending.sub_id, pending.credit_window)
-            .await?;
+        let reader = match pending.credit_mode {
+            SubpathCreditMode::Streaming { window } => {
+                call.open_reader(pending.sub_id, window).await?
+            }
+            SubpathCreditMode::Oneshot => call.open_oneshot_reader(pending.sub_id).await?,
+        };
         pending.pipe.install(reader).await;
     }
     Ok(())
@@ -463,16 +519,19 @@ where
         (value, subpaths)
     };
     for pending in subpaths {
-        let reader = handle
-            .open_reader(pending.sub_id, pending.credit_window)
-            .await
-            .map_err(|err| match err.wire_error() {
-                Some(wire) => wire.clone(),
-                None => WireError::MalformedPayload {
-                    context: "open_reader".to_owned(),
-                    detail: err.to_string(),
-                },
-            })?;
+        let open_res = match pending.credit_mode {
+            SubpathCreditMode::Streaming { window } => {
+                handle.open_reader(pending.sub_id, window).await
+            }
+            SubpathCreditMode::Oneshot => handle.open_oneshot_reader(pending.sub_id).await,
+        };
+        let reader = open_res.map_err(|err| match err.wire_error() {
+            Some(wire) => wire.clone(),
+            None => WireError::MalformedPayload {
+                context: "open_reader".to_owned(),
+                detail: err.to_string(),
+            },
+        })?;
         pending.pipe.install(reader).await;
     }
     Ok(value)

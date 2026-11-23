@@ -7,15 +7,23 @@ use std::task::{Context, Poll};
 
 use futures_core::Stream;
 use helios_inspector_protocol::WireError;
+use helios_inspector_protocol::mux::{SubpathReader, SubpathWriter};
 
 use crate::codec::{
     Decoder, Encoder, InboundPipe, OutboundPipe, PendingInboundSubpath, PendingOutboundSubpath,
-    RpcDecode, RpcEncode, activate_inbound_subpaths, activate_outbound_subpaths,
+    RpcDecode, RpcEncode, SubpathCreditMode, activate_inbound_subpaths, activate_outbound_subpaths,
 };
 use crate::error::RpcError;
 use crate::resource::ResourceEntry;
 
-type PollFuture<T> = Pin<Box<dyn Future<Output = Result<T, RpcError>> + Send + 'static>>;
+type FuturePollFuture<T> = Pin<Box<dyn Future<Output = Result<T, RpcError>> + Send + 'static>>;
+type StreamPollFuture<T> = Pin<
+    Box<
+        dyn Future<Output = (Option<SubpathReader>, Result<Option<Vec<T>>, RpcError>)>
+            + Send
+            + 'static,
+    >,
+>;
 
 /// Creates a credit-flow-controlled WIT `stream<T>` pair `(StreamWriter<T>, StreamReader<T>)`.
 ///
@@ -27,6 +35,7 @@ pub fn stream<T>() -> (StreamWriter<T>, StreamReader<T>) {
     (
         StreamWriter {
             pipe: Arc::clone(&pipe),
+            writer: None,
             closed: false,
             _marker: PhantomData,
         },
@@ -44,6 +53,7 @@ pub fn future<T>() -> (FutureWriter<T>, FutureReader<T>) {
     (
         FutureWriter {
             pipe: Arc::clone(&pipe),
+            writer: None,
             resolved: false,
             _marker: PhantomData,
         },
@@ -57,6 +67,7 @@ pub fn future<T>() -> (FutureWriter<T>, FutureReader<T>) {
 /// Producer half of a WIT `stream<T>`.
 pub struct StreamWriter<T> {
     pipe: Arc<OutboundPipe>,
+    writer: Option<SubpathWriter>,
     closed: bool,
     _marker: PhantomData<fn(T)>,
 }
@@ -72,12 +83,24 @@ impl<T> std::fmt::Debug for StreamWriter<T> {
 impl<T> Drop for StreamWriter<T> {
     fn drop(&mut self) {
         if !self.closed {
+            let _ = self.writer.take();
             self.pipe.mark_writer_dropped();
         }
     }
 }
 
 impl<T: RpcEncode<core::convert::Infallible>> StreamWriter<T> {
+    async fn ensure_writer(&mut self) -> Result<&mut SubpathWriter, RpcError> {
+        if self.writer.is_none() {
+            if self.closed || self.pipe.is_closed_for_writer() {
+                return Err(RpcError::StreamClosed);
+            }
+            self.pipe.wait_until_bound().await?;
+            self.writer = self.pipe.take_writer().await;
+        }
+        self.writer.as_mut().ok_or(RpcError::StreamClosed)
+    }
+
     /// Sends a single item on the stream, waiting for per-stream credit from
     /// the remote consumer when the window is full.
     pub async fn send(&mut self, item: T) -> Result<(), RpcError> {
@@ -93,11 +116,7 @@ impl<T: RpcEncode<core::convert::Infallible>> StreamWriter<T> {
         if self.closed || self.pipe.is_closed_for_writer() {
             return Err(RpcError::StreamClosed);
         }
-        self.pipe.wait_until_bound().await?;
-        let mut guard = self.pipe.lock_writer().await;
-        let Some(writer) = guard.as_mut() else {
-            return Err(RpcError::StreamClosed);
-        };
+        let writer = self.ensure_writer().await?;
         if writer.is_peer_stopped() {
             return Err(RpcError::StreamClosed);
         }
@@ -124,10 +143,14 @@ impl<T: RpcEncode<core::convert::Infallible>> StreamWriter<T> {
             return Ok(());
         }
         self.closed = true;
-        if self.pipe.wait_until_bound().await.is_err() {
-            return Ok(());
-        }
-        let writer = self.pipe.lock_writer().await.take();
+        let writer = if let Some(writer) = self.writer.take() {
+            Some(writer)
+        } else {
+            if self.pipe.wait_until_bound().await.is_err() {
+                return Ok(());
+            }
+            self.pipe.take_writer().await
+        };
         if let Some(writer) = writer {
             writer.close().await?;
         }
@@ -140,18 +163,23 @@ impl<T: RpcEncode<core::convert::Infallible>> StreamWriter<T> {
         if self.closed || self.pipe.is_closed_for_writer() {
             return true;
         }
-        let guard = self.pipe.lock_writer().await;
-        guard.as_ref().is_some_and(|w| w.is_peer_stopped())
+        if let Some(writer) = self.writer.as_ref() {
+            return writer.is_peer_stopped();
+        }
+        self.pipe.is_peer_stopped().await
     }
 
     /// Waits until the remote consumer stops reading or disconnects.
     pub async fn closed(&self) {
+        if let Some(writer) = self.writer.as_ref() {
+            writer.wait_peer_stopped().await;
+            return;
+        }
         if self.pipe.wait_until_bound().await.is_err() {
             return;
         }
-        let guard = self.pipe.lock_writer().await;
-        if let Some(writer) = guard.as_ref() {
-            writer.wait_peer_stopped().await;
+        if let Some(stop_watch) = self.pipe.stop_watch().await {
+            stop_watch.wait_peer_stopped().await;
         }
     }
 }
@@ -161,13 +189,15 @@ enum StreamReaderState<T> {
     Buffered(Vec<T>),
     Empty,
     Inbound(Arc<InboundPipe>),
+    InboundActive(SubpathReader),
+    InboundPolling,
 }
 
 /// Consumer half of a WIT `stream<T>`.
 pub struct StreamReader<T> {
     state: StreamReaderState<T>,
     buffered: VecDeque<T>,
-    poll_fut: Option<PollFuture<Option<Vec<T>>>>,
+    poll_fut: Option<StreamPollFuture<T>>,
 }
 
 impl<T> std::fmt::Debug for StreamReader<T> {
@@ -241,7 +271,9 @@ impl<T: RpcEncode<core::convert::Infallible>> StreamReader<T> {
             StreamReaderState::Empty => {
                 enc.push_outbound_subpath(PendingOutboundSubpath::Empty { sub_id });
             }
-            StreamReaderState::Inbound(_) => {
+            StreamReaderState::Inbound(_)
+            | StreamReaderState::InboundActive(_)
+            | StreamReaderState::InboundPolling => {
                 return Err(WireError::MalformedPayload {
                     context: "StreamReader::encode".to_owned(),
                     detail: "inbound stream reader must be forwarded explicitly".to_owned(),
@@ -266,7 +298,9 @@ impl<T: RpcDecode<core::convert::Infallible>> StreamReader<T> {
         let pipe = Arc::new(InboundPipe::new());
         dec.push_inbound_subpath(PendingInboundSubpath {
             sub_id,
-            credit_window: dec.default_stream_window(),
+            credit_mode: SubpathCreditMode::Streaming {
+                window: dec.default_stream_window(),
+            },
             pipe: Arc::clone(&pipe),
         });
         Ok(Self {
@@ -310,8 +344,21 @@ impl<T: RpcDecode<core::convert::Infallible>> StreamReader<T> {
     }
 
     async fn next_frame_batch(&mut self) -> Result<Option<Vec<T>>, RpcError> {
+        if let StreamReaderState::Inbound(pipe) = &self.state {
+            let pipe = Arc::clone(pipe);
+            match pipe.take_reader().await {
+                Some(reader) => {
+                    self.state = StreamReaderState::InboundActive(reader);
+                }
+                None => {
+                    self.state = StreamReaderState::Empty;
+                    return Ok(None);
+                }
+            }
+        }
+
         match &mut self.state {
-            StreamReaderState::Empty => Ok(None),
+            StreamReaderState::Empty | StreamReaderState::InboundPolling => Ok(None),
             StreamReaderState::Buffered(items) => {
                 if items.is_empty() {
                     Ok(None)
@@ -320,25 +367,23 @@ impl<T: RpcDecode<core::convert::Infallible>> StreamReader<T> {
                 }
             }
             StreamReaderState::Outbound(_) => Err(RpcError::StreamClosed),
-            StreamReaderState::Inbound(pipe) => recv_stream_batch::<T>(Arc::clone(pipe)).await,
+            StreamReaderState::InboundActive(reader) => {
+                recv_stream_batch_from_reader::<T>(reader).await
+            }
+            StreamReaderState::Inbound(_) => unreachable!("inbound pipe transitioned above"),
         }
     }
 }
 
-async fn recv_stream_batch<T: RpcDecode<core::convert::Infallible>>(
-    pipe: Arc<InboundPipe>,
+async fn recv_stream_batch_from_reader<T: RpcDecode<core::convert::Infallible>>(
+    reader: &mut SubpathReader,
 ) -> Result<Option<Vec<T>>, RpcError> {
     loop {
-        let mut guard = pipe.lock_reader().await;
-        let Some(reader) = guard.as_mut() else {
-            return Ok(None);
-        };
         let Some(chunk) = reader.recv().await? else {
             return Ok(None);
         };
         let peer = reader.peer();
         let call = reader.call_handle();
-        drop(guard);
 
         let mut dec = Decoder::<core::convert::Infallible>::new(&chunk, peer, None);
         let batch = T::rpc_decode_vec(&mut dec)?;
@@ -361,21 +406,42 @@ impl<T: RpcDecode<core::convert::Infallible> + Unpin + Send + 'static> Stream fo
             }
 
             if this.poll_fut.is_none() {
-                match &mut this.state {
-                    StreamReaderState::Empty => return Poll::Ready(None),
+                match std::mem::replace(&mut this.state, StreamReaderState::InboundPolling) {
+                    StreamReaderState::Empty => {
+                        this.state = StreamReaderState::Empty;
+                        return Poll::Ready(None);
+                    }
                     StreamReaderState::Buffered(items) => {
                         if items.is_empty() {
+                            this.state = StreamReaderState::Empty;
                             return Poll::Ready(None);
                         }
-                        this.buffered.extend(std::mem::take(items));
+                        this.state = StreamReaderState::Empty;
+                        this.buffered.extend(items);
                         continue;
                     }
-                    StreamReaderState::Outbound(_) => {
+                    StreamReaderState::Outbound(pipe) => {
+                        this.state = StreamReaderState::Outbound(pipe);
                         return Poll::Ready(Some(Err(RpcError::StreamClosed)));
                     }
                     StreamReaderState::Inbound(pipe) => {
-                        let pipe = Arc::clone(pipe);
-                        this.poll_fut = Some(Box::pin(recv_stream_batch::<T>(pipe)));
+                        this.poll_fut = Some(Box::pin(async move {
+                            let Some(mut reader) = pipe.take_reader().await else {
+                                return (None, Ok(None));
+                            };
+                            let res = recv_stream_batch_from_reader::<T>(&mut reader).await;
+                            (Some(reader), res)
+                        }));
+                    }
+                    StreamReaderState::InboundActive(mut reader) => {
+                        this.poll_fut = Some(Box::pin(async move {
+                            let res = recv_stream_batch_from_reader::<T>(&mut reader).await;
+                            (Some(reader), res)
+                        }));
+                    }
+                    StreamReaderState::InboundPolling => {
+                        this.state = StreamReaderState::Empty;
+                        return Poll::Ready(None);
                     }
                 }
             }
@@ -385,17 +451,19 @@ impl<T: RpcDecode<core::convert::Infallible> + Unpin + Send + 'static> Stream fo
                 .as_mut()
                 .expect("stream poll future must exist");
             match fut.as_mut().poll(cx) {
-                Poll::Ready(Ok(Some(batch))) => {
+                Poll::Ready((reader_back, res)) => {
                     this.poll_fut = None;
-                    this.buffered.extend(batch);
-                }
-                Poll::Ready(Ok(None)) => {
-                    this.poll_fut = None;
-                    return Poll::Ready(None);
-                }
-                Poll::Ready(Err(err)) => {
-                    this.poll_fut = None;
-                    return Poll::Ready(Some(Err(err)));
+                    this.state = match reader_back {
+                        Some(reader) => StreamReaderState::InboundActive(reader),
+                        None => StreamReaderState::Empty,
+                    };
+                    match res {
+                        Ok(Some(batch)) => {
+                            this.buffered.extend(batch);
+                        }
+                        Ok(None) => return Poll::Ready(None),
+                        Err(err) => return Poll::Ready(Some(Err(err))),
+                    }
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -406,6 +474,7 @@ impl<T: RpcDecode<core::convert::Infallible> + Unpin + Send + 'static> Stream fo
 /// Completer half of a single-shot WIT `future<T>`.
 pub struct FutureWriter<T> {
     pipe: Arc<OutboundPipe>,
+    writer: Option<SubpathWriter>,
     resolved: bool,
     _marker: PhantomData<fn(T)>,
 }
@@ -421,6 +490,7 @@ impl<T> std::fmt::Debug for FutureWriter<T> {
 impl<T> Drop for FutureWriter<T> {
     fn drop(&mut self) {
         if !self.resolved {
+            let _ = self.writer.take();
             self.pipe.mark_writer_dropped();
         }
     }
@@ -434,13 +504,14 @@ impl<T: RpcEncode<core::convert::Infallible>> FutureWriter<T> {
         if self.pipe.is_closed_for_writer() {
             return Err(RpcError::Cancelled);
         }
-        self.pipe
-            .wait_until_bound()
-            .await
-            .map_err(|_| RpcError::Cancelled)?;
-        let writer = self.pipe.lock_writer().await.take();
-        let Some(mut writer) = writer else {
-            return Err(RpcError::Cancelled);
+        let mut writer = if let Some(writer) = self.writer.take() {
+            writer
+        } else {
+            self.pipe
+                .wait_until_bound()
+                .await
+                .map_err(|_| RpcError::Cancelled)?;
+            self.pipe.take_writer().await.ok_or(RpcError::Cancelled)?
         };
         if writer.is_peer_stopped() {
             return Err(RpcError::Cancelled);
@@ -470,18 +541,23 @@ impl<T: RpcEncode<core::convert::Infallible>> FutureWriter<T> {
         if self.pipe.is_closed_for_writer() {
             return true;
         }
-        let guard = self.pipe.lock_writer().await;
-        guard.as_ref().is_some_and(|w| w.is_peer_stopped())
+        if let Some(writer) = self.writer.as_ref() {
+            return writer.is_peer_stopped();
+        }
+        self.pipe.is_peer_stopped().await
     }
 
     /// Waits until the remote consumer cancels or drops its [`FutureReader`].
     pub async fn cancelled(&self) {
+        if let Some(writer) = self.writer.as_ref() {
+            writer.wait_peer_stopped().await;
+            return;
+        }
         if self.pipe.wait_until_bound().await.is_err() {
             return;
         }
-        let guard = self.pipe.lock_writer().await;
-        if let Some(writer) = guard.as_ref() {
-            writer.wait_peer_stopped().await;
+        if let Some(stop_watch) = self.pipe.stop_watch().await {
+            stop_watch.wait_peer_stopped().await;
         }
     }
 }
@@ -498,7 +574,7 @@ enum FutureReaderState<T> {
 /// propagates cancellation on the sub-path to the remote [`FutureWriter`].
 pub struct FutureReader<T> {
     state: FutureReaderState<T>,
-    poll_fut: Option<PollFuture<T>>,
+    poll_fut: Option<FuturePollFuture<T>>,
 }
 
 impl<T> std::fmt::Debug for FutureReader<T> {
@@ -583,7 +659,7 @@ impl<T: RpcDecode<core::convert::Infallible>> FutureReader<T> {
         let pipe = Arc::new(InboundPipe::new());
         dec.push_inbound_subpath(PendingInboundSubpath {
             sub_id,
-            credit_window: 1,
+            credit_mode: SubpathCreditMode::Oneshot,
             pipe: Arc::clone(&pipe),
         });
         Ok(Self {
@@ -596,19 +672,15 @@ impl<T: RpcDecode<core::convert::Infallible>> FutureReader<T> {
 async fn recv_future_value<T: RpcDecode<core::convert::Infallible>>(
     pipe: Arc<InboundPipe>,
 ) -> Result<T, RpcError> {
-    let mut guard = pipe.lock_reader().await;
-    let Some(reader) = guard.as_mut() else {
+    let Some(mut reader) = pipe.take_reader().await else {
         return Err(RpcError::FutureDropped);
     };
     let Some(bytes) = reader.recv().await? else {
         return Err(RpcError::FutureDropped);
     };
-    // Drain the trailing EOF frame if already queued so `Drop` does not emit an
-    // unnecessary stop-reading notification.
-    let _ = reader.recv().await;
     let peer = reader.peer();
     let call = reader.call_handle();
-    drop(guard);
+    drop(reader);
 
     let mut dec = Decoder::<core::convert::Infallible>::new(&bytes, peer, None);
     let value = T::rpc_decode(&mut dec)?;

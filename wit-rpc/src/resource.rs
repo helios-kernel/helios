@@ -71,9 +71,10 @@ impl<L: ResourceEntry, R: ResourceEntry> ResourceEntry for EitherResource<L, R> 
 /// Active server-side `borrow<R>` guard held for the duration of an
 /// invocation.
 ///
-/// Releases its borrow count atomically on drop without acquiring any lock.
+/// Releases its `Arc<T>` reference before decrementing the borrow count
+/// atomically on drop without acquiring any lock.
 pub struct ResourceBorrow<T> {
-    value: Arc<T>,
+    value: Option<Arc<T>>,
     borrows: Arc<AtomicUsize>,
 }
 
@@ -81,12 +82,18 @@ impl<T> Deref for ResourceBorrow<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        &self.value
+        self.value
+            .as_ref()
+            .expect("resource borrow value is present until drop")
     }
 }
 
 impl<T> Drop for ResourceBorrow<T> {
     fn drop(&mut self) {
+        // Release the `Arc<T>` before dropping the borrow count to 0 so a
+        // concurrent `ResourceTableInner::take` observing `borrows == 0`
+        // cannot race with `Arc::try_unwrap`.
+        drop(self.value.take());
         self.borrows.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -173,7 +180,7 @@ impl<R: ResourceEntry> ResourceTableInner<R> {
         };
         slot.borrows.fetch_add(1, Ordering::AcqRel);
         Ok(ResourceBorrow {
-            value: Arc::clone(arc),
+            value: Some(Arc::clone(arc)),
             borrows: Arc::clone(&slot.borrows),
         })
     }
@@ -184,6 +191,7 @@ impl<R: ResourceEntry> ResourceTableInner<R> {
         handle: u32,
         expected: &'static str,
         extract: impl FnOnce(R) -> Result<Arc<T>, R>,
+        restore: impl FnOnce(Arc<T>) -> R,
     ) -> Result<T, WireError> {
         let Some(slot) = self.slots.get(&handle) else {
             return Err(WireError::InvalidResourceHandle { handle });
@@ -196,7 +204,19 @@ impl<R: ResourceEntry> ResourceTableInner<R> {
             .remove(&handle)
             .expect("verified resource slot must exist");
         match extract(removed.value) {
-            Ok(arc) => Arc::try_unwrap(arc).map_err(|_| WireError::ResourceBorrowed { handle }),
+            Ok(arc) => match Arc::try_unwrap(arc) {
+                Ok(value) => Ok(value),
+                Err(arc) => {
+                    self.slots.insert(
+                        handle,
+                        ResourceSlot {
+                            value: restore(arc),
+                            borrows: removed.borrows,
+                        },
+                    );
+                    Err(WireError::ResourceBorrowed { handle })
+                }
+            },
             Err(restored) => {
                 let actual = restored.kind_name().to_owned();
                 self.slots.insert(
