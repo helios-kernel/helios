@@ -1061,6 +1061,14 @@ where
     MeasuredBootImpl: MeasuredBoot,
 {
     let component_name = component.name();
+    // Wait for the payload's boot `init` to complete before emitting any
+    // debugger stage markers or tracing records onto the shared serial
+    // console, so SMP boots never interleave debugger bring-up lines with
+    // `init` or `/etc/rc` output.
+    let wait_state = debug_state.clone();
+    kernel.run_local_future(async move {
+        wait_state.wait_for_boot_init().await;
+    });
     write_serial.emit_stage_marker("boot");
     write_serial.emit_stage_marker("component-host:trace-begin");
     tracing::info!(

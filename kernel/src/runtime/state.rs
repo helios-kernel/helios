@@ -1233,12 +1233,13 @@ where
         self.inner.boot_init_completed.load(Ordering::Acquire)
     }
 
-    /// Waits until the payload's boot `init` component has finished, if
-    /// this boot scheduled one.
+    /// Waits until the payload's boot `init` component has finished.
+    ///
+    /// Waits unconditionally rather than checking `boot_init_launched`: on
+    /// SMP boots a secondary processor can reach the system component entry
+    /// before the bootstrap processor schedules `init`, so checking
+    /// `boot_init_launched` here would let it bypass the barrier.
     pub async fn wait_for_boot_init(&self) {
-        if !self.inner.boot_init_launched.load(Ordering::Acquire) {
-            return;
-        }
         loop {
             let ready = self.inner.boot_init_ready.notified();
             if self.inner.boot_init_completed.load(Ordering::Acquire) {

@@ -2332,6 +2332,10 @@ where
     } = host;
 
     let component_name = component.name();
+    // Wait for the payload's boot `init` to finish its mounts, console
+    // banner, and `/etc/rc` before emitting debugger stage markers or
+    // claiming the serial line for RPC framing.
+    debug_state.wait_for_boot_init().await;
     let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu.clone());
 
     write_serial.emit_stage_marker("engine:new");
@@ -2417,11 +2421,6 @@ where
     drop(instantiate_heartbeat);
     let executor = executor.map_err(DebuggerError::InstantiateComponent)?;
     write_serial.emit_stage_marker("instantiate:ok");
-
-    // Let the payload's boot `init` finish its mounts, console banner,
-    // and `/etc/rc` before the system component claims the serial line
-    // for RPC framing or opens inspector sessions.
-    debug_state.wait_for_boot_init().await;
 
     tracing::info!(component = component_name, "entering wasi:cli/run");
     write_serial.emit_stage_marker("run:begin");

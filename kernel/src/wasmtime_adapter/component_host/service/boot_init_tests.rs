@@ -128,7 +128,45 @@ fn boot_payload_exposes_init_component_and_argv0_on_runtime_state() {
     );
     assert_eq!(state.embedded_init().argv0(), "/sbin/init");
     assert!(!state.boot_init_completed());
-    futures_lite::future::block_on(state.wait_for_boot_init());
+}
+
+#[test]
+fn wait_for_boot_init_stays_pending_before_launch_and_wakes_on_completion() {
+    use core::future::Future;
+    use core::pin::pin;
+    use core::task::{Context, Poll, Waker};
+
+    let cpu = TestCpu::with_entropy(0x73);
+    let payload = signed_test_payload("init_component.cwasm", b"synthetic-bytes", "/init.wasm");
+    let state: crate::HostRuntimeState<TestCpu, TestNetworkService, UnsupportedStorage> =
+        crate::RuntimeState::new(
+            cpu.timebase(),
+            2,
+            0,
+            payload,
+            crate::GuestIsa::for_build_target(cpu.native_feature_probe()),
+        );
+
+    // Simulate a secondary processor reaching `wait_for_boot_init()`
+    // before the bootstrap processor has even called `launch_boot_init()`.
+    let mut waiter = pin!(state.wait_for_boot_init());
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        matches!(waiter.as_mut().poll(&mut cx), Poll::Pending),
+        "wait_for_boot_init must stay Pending before boot init is launched"
+    );
+
+    state.mark_boot_init_launched();
+    assert!(
+        matches!(waiter.as_mut().poll(&mut cx), Poll::Pending),
+        "wait_for_boot_init must stay Pending while boot init is still running"
+    );
+
+    state.mark_boot_init_completed();
+    assert!(
+        matches!(waiter.as_mut().poll(&mut cx), Poll::Ready(())),
+        "wait_for_boot_init must resolve once boot init completes"
+    );
 }
 
 #[test]
