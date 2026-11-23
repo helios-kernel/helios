@@ -287,12 +287,17 @@ pub struct ControlFlowIntegrity {
     /// own return addresses; a return address saved without signing (an
     /// exception frame, assembly) is not covered.
     pub return_addresses: Option<ReturnAddressSigning>,
+    /// Every executable kernel and runtime code page is guarded so indirect
+    /// branches must land on a valid landing pad (Arm FEAT_BTI, PTE `GP`
+    /// and `SCTLR_EL1.BT1`).
+    pub branch_targets_identified: bool,
 }
 
 impl ControlFlowIntegrity {
     /// A backend that enabled no control-flow integrity mechanism.
     pub const NONE: Self = Self {
         return_addresses: None,
+        branch_targets_identified: false,
     };
 }
 
@@ -613,12 +618,14 @@ mod tests {
     #[test]
     fn no_control_flow_integrity_names_no_mechanism() {
         assert_eq!(ControlFlowIntegrity::NONE.return_addresses, None);
+        const { assert!(!ControlFlowIntegrity::NONE.branch_targets_identified) };
         assert_ne!(
             ControlFlowIntegrity::NONE,
             ControlFlowIntegrity {
                 return_addresses: Some(ReturnAddressSigning {
                     faults_at_authentication: false,
                 }),
+                branch_targets_identified: false,
             }
         );
     }

@@ -101,12 +101,16 @@ pub struct CwasmCodeProtection {
     /// Every function that sets up a frame signs its return address and
     /// authenticates it before returning.
     pub return_addresses_signed: bool,
+    /// Every indirect-branch target begins with a BTI landing pad and
+    /// indirect tail calls route through `x16`.
+    pub branch_targets_identified: bool,
 }
 
 impl CwasmCodeProtection {
     /// Code that carries no protection.
     pub const NONE: Self = Self {
         return_addresses_signed: false,
+        branch_targets_identified: false,
     };
 
     /// The version string a Wasmtime engine records in, and requires of, an
@@ -118,8 +122,12 @@ impl CwasmCodeProtection {
     /// The string is a compatibility key compared for byte equality, not a
     /// document.
     pub fn module_version(self, wasmtime: &str) -> Option<String> {
-        self.return_addresses_signed
-            .then(|| format!("{wasmtime}+return-address-signing"))
+        match (self.return_addresses_signed, self.branch_targets_identified) {
+            (false, false) => None,
+            (true, false) => Some(format!("{wasmtime}+return-address-signing")),
+            (false, true) => Some(format!("{wasmtime}+bti")),
+            (true, true) => Some(format!("{wasmtime}+return-address-signing+bti")),
+        }
     }
 }
 
@@ -128,10 +136,10 @@ impl CwasmCodeProtection {
 /// level's Cranelift flags include
 /// ([`CwasmIsaLevels::cranelift_settings`]), so the two cannot drift apart.
 pub fn cwasm_target_code_protection(target: &str) -> CwasmCodeProtection {
+    let settings = cwasm_target_isa_levels(target).cranelift_settings();
     CwasmCodeProtection {
-        return_addresses_signed: cwasm_target_isa_levels(target)
-            .cranelift_settings()
-            .contains(&isa::SIGN_RETURN_ADDRESS),
+        return_addresses_signed: settings.contains(&isa::SIGN_RETURN_ADDRESS),
+        branch_targets_identified: settings.contains(&isa::USE_BTI),
     }
 }
 
@@ -356,7 +364,8 @@ mod tests {
             assert_eq!(
                 cwasm_target_code_protection(target),
                 CwasmCodeProtection {
-                    return_addresses_signed: true
+                    return_addresses_signed: true,
+                    branch_targets_identified: true,
                 },
                 "{target}"
             );
@@ -387,6 +396,7 @@ mod tests {
                 .cranelift_flags()
                 .collect();
             assert!(flags.contains(&"sign_return_address"), "{flags:?}");
+            assert!(flags.contains(&"use_bti"), "{flags:?}");
             assert!(!flags.contains(&"has_pauth"), "{flags:?}");
             assert!(
                 !flags.contains(&"sign_return_address_with_bkey"),
@@ -401,11 +411,21 @@ mod tests {
         assert_eq!(CwasmCodeProtection::NONE.module_version("48"), None);
         assert_eq!(
             CwasmCodeProtection {
-                return_addresses_signed: true
+                return_addresses_signed: true,
+                branch_targets_identified: false,
             }
             .module_version("48")
             .as_deref(),
             Some("48+return-address-signing")
+        );
+        assert_eq!(
+            CwasmCodeProtection {
+                return_addresses_signed: true,
+                branch_targets_identified: true,
+            }
+            .module_version("48")
+            .as_deref(),
+            Some("48+return-address-signing+bti")
         );
     }
 

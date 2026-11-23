@@ -44,6 +44,7 @@ __helios_aarch64_guest_vectors:
 .global helios_aarch64_enter_guest
 .type helios_aarch64_enter_guest, %function
 helios_aarch64_enter_guest:
+    hint #34
     sub sp, sp, #{frame_bytes}
     str x0, [sp, #{context_bytes}]
     stp x19, x20, [sp, #152]

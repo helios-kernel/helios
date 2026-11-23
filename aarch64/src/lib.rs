@@ -20,7 +20,7 @@ use helios_hal::boot::{
 };
 use helios_hal::cpu::{
     ControlFlowIntegrity, Cpu, GUEST_STACK_LIMIT_OFFSET, HardwarePerfCounters, Instant,
-    ProcessorId, ReturnAddressSigning, Timebase, TimerInterrupt,
+    ProcessorId, Timebase, TimerInterrupt,
 };
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
@@ -413,10 +413,9 @@ struct Aarch64PlatformState {
     /// platform describes one.
     psci: Option<lifecycle::Psci>,
     timebase: Timebase,
-    /// How a failed return-address authentication shows on every
-    /// processor, probed on the bootstrap processor before any other starts
-    /// and never written again (`cfi`).
-    return_address_signing: ReturnAddressSigning,
+    /// Control-flow integrity capabilities probed on the bootstrap processor
+    /// before any other starts and never written again (`cfi`).
+    control_flow_integrity: ControlFlowIntegrity,
     /// The key every processor installs, held only while the secondaries
     /// start (`cfi`).
     instruction_key: cfi::SharedInstructionKey,
@@ -472,7 +471,7 @@ impl Aarch64PlatformState {
             processors,
             psci: psci.map(lifecycle::Psci::new),
             timebase,
-            return_address_signing: cfi::bootstrap_capability(),
+            control_flow_integrity: cfi::bootstrap_capability(),
             instruction_key: cfi::SharedInstructionKey::new(),
             debug_state: Once::new(),
             gic: Once::new(),
@@ -876,7 +875,17 @@ extern "C" fn aarch64_kernel_main() -> ! {
     // `aarch64_kernel_main` is `-> !`.
     unsafe {
         cfi::install_bootstrap_key(&platform_state.instruction_key, &root_entropy);
-        cfi::enable_instruction_key_a();
+        cfi::enable_instruction_key_a(
+            platform_state
+                .control_flow_integrity
+                .branch_targets_identified,
+        );
+    }
+    if platform_state
+        .control_flow_integrity
+        .branch_targets_identified
+    {
+        vmm::guard_kernel_text(physical_memory_offset);
     }
     platform_state.user_isolation.enable_on_current_processor();
     #[cfg(feature = "native-users")]
@@ -1101,6 +1110,11 @@ extern "C" fn aarch64_kernel_main() -> ! {
     unsafe {
         cfi::self_test()
     };
+    #[cfg(helios_bti_self_test)]
+    // SAFETY: kernel text has `GP` set and `BT1` is enabled when `FEAT_BTI` is present.
+    unsafe {
+        cfi::bti_self_test()
+    };
 
     #[cfg(helios_hv_self_test)]
     kernel.spawn_local_detached(hv::self_test::run(cpu, kernel.processor_control()));
@@ -1310,12 +1324,11 @@ impl Cpu for Aarch64Cpu {
         true
     }
 
-    /// Every processor signs and authenticates its return addresses: a
-    /// processor without FEAT_PAuth does not boot (`cfi`).
+    /// Every processor signs and authenticates its return addresses (a
+    /// processor without FEAT_PAuth does not boot) and guards executable
+    /// pages with BTI wherever the hardware implements FEAT_BTI (`cfi`).
     fn control_flow_integrity(&self) -> ControlFlowIntegrity {
-        ControlFlowIntegrity {
-            return_addresses: Some(self.state.return_address_signing),
-        }
+        self.state.control_flow_integrity
     }
 
     unsafe fn zero_memory(&self, ptr: NonNull<u8>, size: usize) {
@@ -1487,6 +1500,9 @@ pub(crate) unsafe fn aarch64_zero_memory(ptr: *mut u8, size: usize) {
 #[unsafe(naked)]
 unsafe extern "C" fn aarch64_secondary_entry(mp_info: &MpInfo) -> ! {
     core::arch::naked_asm!(
+        // Limine enters secondaries through an indirect branch after the
+        // bootstrap processor has marked kernel text guarded (`GP=1`).
+        "hint #38",
         "mov x9, sp",
         "msr spsel, #1",
         "mov sp, x9",
@@ -1524,11 +1540,11 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     // `aarch64_secondary_main` is `-> !`.
     unsafe {
         cfi::install_secondary_key(
-            state.return_address_signing,
+            state.control_flow_integrity,
             &state.instruction_key,
             mp_info.mpidr,
         );
-        cfi::enable_instruction_key_a();
+        cfi::enable_instruction_key_a(state.control_flow_integrity.branch_targets_identified);
     }
     state.user_isolation.enable_on_current_processor();
     #[cfg(feature = "native-users")]

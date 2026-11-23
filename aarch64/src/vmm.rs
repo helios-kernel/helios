@@ -81,6 +81,7 @@ const SH_INNER: u64 = 0b11 << 8;
 const ATTR_NORMAL: u64 = 0; // MAIR index 0: outer/inner write-back cacheable.
 /// The MAIR attribute index field of a leaf descriptor, AttrIndx[2:0].
 const ATTR_INDEX_MASK: u64 = 0b111 << crate::PAGE_ATTR_INDEX_SHIFT;
+const GP: u64 = 1 << 50;
 const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
 const PT_ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
@@ -1471,8 +1472,107 @@ fn page_flags_to_pte(flags: PageFlags) -> Result<u64, AddressSpaceError> {
     }
     if flags.contains(PageFlags::EXECUTE) {
         pte &= !PXN;
+        if crate::cfi::branch_target_identification_enabled() {
+            pte |= GP;
+        }
     }
     Ok(pte)
+}
+
+unsafe extern "C" {
+    static __helios_text_start: u8;
+    static __helios_text_end: u8;
+}
+
+/// Marks every executable page of the kernel's `.text` segment with the
+/// Stage-1 Guarded Page (`GP`, bit 50) attribute in `TTBR1_EL1` and
+/// invalidates the inner-shareable TLB.
+///
+/// Called once on the bootstrap processor when `FEAT_BTI` is present, before
+/// any secondary processor starts. Panics if the kernel text mapping is
+/// missing or straddles an unexpected block descriptor.
+pub(crate) fn guard_kernel_text(physical_memory_offset: usize) {
+    let start = core::ptr::addr_of!(__helios_text_start) as usize;
+    let end = core::ptr::addr_of!(__helios_text_end) as usize;
+    assert!(
+        start < end && start.is_multiple_of(PAGE) && end.is_multiple_of(PAGE),
+        "AArch64 kernel text range [{start:#x}, {end:#x}) is not page-aligned"
+    );
+    let root = (read_ttbr1_el1() + physical_memory_offset) as *mut u64;
+    let mut va = start;
+    let mut guarded_entries = 0usize;
+    while va < end {
+        let l0_idx = (va >> 39) & 0x1ff;
+        let l1_idx = (va >> 30) & 0x1ff;
+        let l2_idx = (va >> 21) & 0x1ff;
+        let l3_idx = (va >> 12) & 0x1ff;
+        // SAFETY: `TTBR1_EL1` holds the live 4-level kernel page table
+        // reachable through the HHDM, and no other processor is mutating
+        // kernel text mappings during bootstrap bring-up.
+        unsafe {
+            let l0_entry = root.add(l0_idx).read_volatile();
+            assert!(
+                l0_entry & TABLE_DESCRIPTOR == TABLE_DESCRIPTOR,
+                "AArch64 kernel text {va:#x} has no L0 table descriptor"
+            );
+            let l1 = ((l0_entry & PT_ADDR_MASK) as usize + physical_memory_offset) as *mut u64;
+            let l1_entry = l1.add(l1_idx).read_volatile();
+            assert!(
+                l1_entry & TABLE_DESCRIPTOR == TABLE_DESCRIPTOR,
+                "AArch64 kernel text {va:#x} is not mapped via an L1 table descriptor"
+            );
+            let l2 = ((l1_entry & PT_ADDR_MASK) as usize + physical_memory_offset) as *mut u64;
+            let l2_entry = l2.add(l2_idx).read_volatile();
+            assert!(
+                l2_entry & VALID != 0,
+                "AArch64 kernel text {va:#x} has no valid L2 descriptor"
+            );
+            if l2_entry & TABLE_DESCRIPTOR != TABLE_DESCRIPTOR {
+                // 2 MiB block descriptor covering kernel text.
+                let block_span = 2 * 1024 * 1024;
+                let block_start = va & !(block_span - 1);
+                let block_end = block_start + block_span;
+                assert!(
+                    block_start >= start && block_end <= end,
+                    "AArch64 kernel text {va:#x} shares a 2 MiB block [{block_start:#x}, \
+                     {block_end:#x}) with non-text sections"
+                );
+                if l2_entry & PXN == 0 {
+                    l2.add(l2_idx).write_volatile(l2_entry | GP);
+                    guarded_entries += 1;
+                }
+                va = block_end;
+                continue;
+            }
+            let l3 = ((l2_entry & PT_ADDR_MASK) as usize + physical_memory_offset) as *mut u64;
+            let l3_entry = l3.add(l3_idx).read_volatile();
+            assert!(
+                l3_entry & VALID != 0,
+                "AArch64 kernel text {va:#x} has no valid L3 descriptor"
+            );
+            if l3_entry & PXN == 0 {
+                l3.add(l3_idx).write_volatile(l3_entry | GP);
+                guarded_entries += 1;
+            }
+        }
+        va += PAGE;
+    }
+    assert!(
+        guarded_entries > 0,
+        "AArch64 kernel text [{start:#x}, {end:#x}) had no executable pages to guard"
+    );
+    // SAFETY: broadcasts TLB invalidation for all EL1 translations so every
+    // processor observes `GP=1` on kernel text before executing indirect
+    // branches.
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags),
+        );
+    }
 }
 
 fn read_ttbr1_el1() -> usize {

@@ -531,6 +531,7 @@ unsafe extern "C" fn save_and_power_off(
     power_off: unsafe extern "C" fn(*const ResumeContext) -> u64,
 ) -> u64 {
     naked_asm!(
+        "hint #34",
         "stp x19, x20, [x0, #0]",
         "stp x21, x22, [x0, #16]",
         "stp x23, x24, [x0, #32]",
