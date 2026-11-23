@@ -27,10 +27,14 @@ for program in hello-libc args memory clock random identity limits machine prior
         -Ilinux/tests "linux/tests/$program.c" -o "$out/linux/$program"
 done
 bash linux/tests/build-dash.sh "$out/linux/dash" "$arch"
+bash linux/tests/build-busybox.sh "$out/linux/busybox" "$arch"
 cp linux/tests/check-memory.sh "$out/linux/check-memory.sh"
 cp linux/tests/check-pthreads.sh "$out/linux/check-pthreads.sh"
 cp linux/tests/check-signals.sh "$out/linux/check-signals.sh"
 cp linux/tests/check-dash.sh "$out/linux/check-dash.sh"
+cp linux/tests/check-busybox-netconfig.sh "$out/linux/check-busybox-netconfig.sh"
+cp linux/tests/udhcpc-script.sh "$out/linux/udhcpc-script.sh"
+chmod +x "$out/linux/udhcpc-script.sh"
 cat > "$out/linux/shebang-hello.sh" <<'EOF'
 #!/linux/dash
 exec /linux/hello

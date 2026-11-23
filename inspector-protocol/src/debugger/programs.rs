@@ -107,6 +107,7 @@ mod guest {
                             host_programs::NetworkRight::Dns,
                             host_programs::NetworkRight::PrivilegedBind,
                             host_programs::NetworkRight::Multicast,
+                            host_programs::NetworkRight::Admin,
                         ]),
                         host_programs::root_terminal_grant(),
                         host_programs::root_process_grant(),
