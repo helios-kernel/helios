@@ -18,6 +18,7 @@ pub(super) const POLLHUP: u32 = 0x0010;
 pub(super) const POLLNVAL: u32 = 0x0020;
 pub(super) const POLLRDNORM: u32 = 0x0040;
 pub(super) const POLLWRNORM: u32 = 0x0100;
+pub(super) const POLLRDHUP: u32 = 0x2000;
 
 // Linux `fs/select.c` readiness masks for `select`/`pselect6`.
 const SELECT_IN_SET: u32 = POLLIN | POLLRDNORM | POLLHUP | POLLERR;
@@ -171,7 +172,7 @@ pub(super) fn arm_entry_wait<R: Resources, O: Stdio>(
         }
         FileDescriptor::Socket(sock) => {
             if let Some((reader, carry_len)) = sock.pair_read_probe() {
-                if events & (POLLIN | POLLRDNORM) != 0 && carry_len == 0 {
+                if events & (POLLIN | POLLRDNORM | POLLRDHUP) != 0 && carry_len == 0 {
                     waits.push(Wait::Read(reader.clone(), reader.wait_state()));
                 }
                 if events & (POLLOUT | POLLWRNORM) != 0
@@ -398,8 +399,8 @@ async fn poll_common<
                     ready_count += 1;
                     continue;
                 };
-                let wanted =
-                    u32::from(events) & (POLLIN | POLLPRI | POLLOUT | POLLRDNORM | POLLWRNORM);
+                let wanted = u32::from(events)
+                    & (POLLIN | POLLPRI | POLLOUT | POLLRDNORM | POLLWRNORM | POLLRDHUP);
                 if matches!(entry.descriptor, FileDescriptor::Socket(_)) {
                     revents[idx] = 0;
                     arm_entry_wait::<R, O>(

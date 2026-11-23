@@ -290,21 +290,21 @@ jobs:
             [$lanes[] as $name | .[$name]["guest-wasm"] // empty] | unique' .github/ci-lanes.json)"
           # gVisor's syscall suite: a full run takes every case, sharded
           # so each shard fits a job; a listed run takes the committed
-          # passing lists' cases, one shard per architecture. aarch64
-          # runs under TCG (the Arm runners publish no KVM) and gets
-          # twice the shards.
+          # passing lists' cases, sharded to fit the 15-minute review
+          # job limit. aarch64 runs under TCG (the Arm runners publish
+          # no KVM) and gets twice the shards.
           linux_suite="$(jq -cn --argjson lanes "${lanes}" '
             (if ($lanes | index("linux-syscalls-full")) then "full"
              elif ($lanes | index("linux-syscalls")) then "listed"
              else "none" end) as $mode
-            | [{arch: "x86_64", runner: "ubuntu-24.04", vm_arch: "x86-64", accel: "kvm", shards: 16},
-               {arch: "aarch64", runner: "ubuntu-24.04-arm", vm_arch: "aarch64", accel: "tcg", shards: 32}] as $arches
+            | [{arch: "x86_64", runner: "ubuntu-24.04", vm_arch: "x86-64", accel: "kvm", full_shards: 16, listed_shards: 8},
+               {arch: "aarch64", runner: "ubuntu-24.04-arm", vm_arch: "aarch64", accel: "tcg", full_shards: 32, listed_shards: 16}] as $arches
             | {mode: $mode,
-               build: (if $mode == "none" then [] else $arches | map(del(.shards)) end),
+               build: (if $mode == "none" then [] else $arches | map(del(.full_shards, .listed_shards)) end),
                shards: (if $mode == "none" then []
-                        else [$arches[] | . as $a | range(0; if $mode == "full" then $a.shards else 1 end)
+                        else [$arches[] | . as $a | (if $mode == "full" then $a.full_shards else $a.listed_shards end) as $n | range(0; $n)
                               | {arch: $a.arch, runner: $a.runner, vm_arch: $a.vm_arch, accel: $a.accel,
-                                 shard: ., shards: (if $mode == "full" then $a.shards else 1 end)}] end)}')"
+                                 shard: ., shards: $n}] end)}')"
           linux_suite_mode="$(jq -r .mode <<< "$linux_suite")"
           cli_builds="$(jq -cn \
             --argjson checks "${checks}" \

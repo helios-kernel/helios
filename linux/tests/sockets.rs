@@ -147,6 +147,7 @@ struct MockNet {
     allow_udp: bool,
     allow_priv_bind: bool,
     allow_multicast: bool,
+    tcp_hangup: bool,
     connect_state: Arc<Mutex<ConnectProgress>>,
     multicast_joins: Arc<Mutex<Vec<MulticastJoin>>>,
     udp_queue: Arc<Mutex<Vec<(Bytes, SocketAddr, usize)>>>,
@@ -160,6 +161,7 @@ impl Default for MockNet {
             allow_udp: false,
             allow_priv_bind: false,
             allow_multicast: false,
+            tcp_hangup: false,
             connect_state: Arc::new(Mutex::new(ConnectProgress::Pending)),
             multicast_joins: Arc::new(Mutex::new(Vec::new())),
             udp_queue: Arc::new(Mutex::new(Vec::new())),
@@ -321,7 +323,7 @@ impl Network<MockNet> for Platform {
         Ok(SocketReady {
             readable: true,
             writable: true,
-            hangup: false,
+            hangup: self.net.tcp_hangup,
         })
     }
     async fn udp_bind(
@@ -1078,4 +1080,143 @@ fn writev_socket_large_unmapped_iovec_returns_efault_without_allocating() {
         ),
         14u64.wrapping_neg()
     );
+}
+
+fn poll_socket_events(
+    proc: &mut Process<MockResources>,
+    abi: Abi,
+    use_poll: bool,
+    fd: i32,
+    events: u16,
+    mem: &mut Memory,
+    plat: &mut Platform,
+) -> (u64, u16) {
+    let mut pollfd = [0u8; 8];
+    pollfd[0..4].copy_from_slice(&fd.to_le_bytes());
+    pollfd[4..6].copy_from_slice(&events.to_le_bytes());
+    mem.write(256, &pollfd).unwrap();
+    // Zero timespec for non-blocking ppoll; timeout_ms=0 for poll.
+    mem.write(288, &[0u8; 16]).unwrap();
+    let ready = if use_poll {
+        call_op(proc, abi, Operation::Poll, [256, 1, 0, 0, 0, 0], mem, plat)
+    } else {
+        call_op(
+            proc,
+            abi,
+            Operation::Ppoll,
+            [256, 1, 288, 0, 8, 0],
+            mem,
+            plat,
+        )
+    };
+    mem.read(256, &mut pollfd).unwrap();
+    (ready, u16::from_le_bytes(pollfd[6..8].try_into().unwrap()))
+}
+
+#[test]
+fn poll_reports_pollrdhup_on_peer_close() {
+    const POLLIN: u16 = 0x0001;
+    const POLLHUP: u16 = 0x0010;
+    const POLLRDHUP: u16 = 0x2000;
+
+    for abi in [Abi::X86_64, Abi::Aarch64] {
+        let mut proc = new_process(abi);
+        let mut mem = Memory::new(4096);
+        let mut plat = Platform {
+            net: MockNet {
+                allow_tcp: true,
+                tcp_hangup: true,
+                connect_state: Arc::new(Mutex::new(ConnectProgress::Connected)),
+                ..Default::default()
+            },
+            now: 0,
+        };
+
+        // 1. Socketpair peer close exposes POLLRDHUP when requested via ppoll/poll.
+        assert_eq!(
+            call_op(
+                &mut proc,
+                abi,
+                Operation::Socketpair,
+                [1, 1, 0, 64, 0, 0],
+                &mut mem,
+                &mut plat,
+            ),
+            0
+        );
+        let mut sv = [0u8; 8];
+        mem.read(64, &mut sv).unwrap();
+        let fd0 = i32::from_le_bytes(sv[0..4].try_into().unwrap());
+        let fd1 = i32::from_le_bytes(sv[4..8].try_into().unwrap());
+        assert_eq!(
+            call_op(
+                &mut proc,
+                abi,
+                Operation::Close,
+                [fd1 as u64, 0, 0, 0, 0, 0],
+                &mut mem,
+                &mut plat,
+            ),
+            0
+        );
+        assert_eq!(
+            poll_socket_events(
+                &mut proc,
+                abi,
+                false,
+                fd0,
+                POLLIN | POLLRDHUP,
+                &mut mem,
+                &mut plat
+            ),
+            (1, POLLIN | POLLHUP | POLLRDHUP)
+        );
+        assert_eq!(
+            poll_socket_events(&mut proc, abi, false, fd0, POLLRDHUP, &mut mem, &mut plat),
+            (1, POLLHUP | POLLRDHUP)
+        );
+        // POLLRDHUP must not leak when the caller only asked for POLLIN.
+        assert_eq!(
+            poll_socket_events(&mut proc, abi, false, fd0, POLLIN, &mut mem, &mut plat),
+            (1, POLLIN | POLLHUP)
+        );
+
+        // 2. Connected TCP socket with peer hangup exposes POLLIN | POLLRDHUP.
+        let tcp_fd = call_op(
+            &mut proc,
+            abi,
+            Operation::Socket,
+            [2, 1 | 0x0800, 0, 0, 0, 0],
+            &mut mem,
+            &mut plat,
+        ) as i32;
+        let mut sa = [0u8; 16];
+        sa[0..2].copy_from_slice(&2u16.to_le_bytes());
+        sa[2..4].copy_from_slice(&8080u16.to_be_bytes());
+        sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        mem.write(64, &sa).unwrap();
+        assert_eq!(
+            call_op(
+                &mut proc,
+                abi,
+                Operation::Connect,
+                [tcp_fd as u64, 64, 16, 0, 0, 0],
+                &mut mem,
+                &mut plat,
+            ),
+            0
+        );
+        assert_eq!(
+            poll_socket_events(
+                &mut proc,
+                abi,
+                abi == Abi::X86_64,
+                tcp_fd,
+                POLLIN | POLLRDHUP,
+                &mut mem,
+                &mut plat,
+            ),
+            (1, POLLIN | POLLRDHUP)
+        );
+    }
 }
