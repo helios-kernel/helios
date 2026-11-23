@@ -280,12 +280,12 @@ pub use vfs::{
     AttachedStorage, BOOT_DEVICE, BtrfsManagementError, BtrfsOpenHandle, BtrfsVolumeRequest,
     DeviceIdAllocator, DiskImage, ErofsError, ErofsFs, FileContents, Follow, FsDescriptor,
     FsDescriptorFlags, HeldPath, HostShare, HostShareWrite, MAX_MOUNTS, MAX_SYMLINK_DEPTH,
-    MemoryFs, MemoryUnixMetadata, MemoryWrite, MountError, MountFlags, MountGrant, MountHold,
-    MountRequest, MountRequestError, MountSharing, MountSource, MountTable, MountedFs,
-    MountedOpenHandle, MountedWrite, Namespace, NoDisks, PrivateMountClaim, PrivateMountClaimError,
-    ROOT_GRANT, ROOT_LAYER_DEVICE, ReaderError, Resolved, RootFs, RootWrite, SharedOwner, Storage,
-    UnixAttributes, XattrSetMode, object_identity, request_mount, request_unmount, symlink_target,
-    within_directory,
+    MemoryFs, MemoryStorageBudget, MemoryStorageSetting, MemoryUnixMetadata, MemoryWrite,
+    MountError, MountFlags, MountGrant, MountHold, MountRequest, MountRequestError, MountSharing,
+    MountSource, MountTable, MountedFs, MountedOpenHandle, MountedWrite, Namespace, NoDisks,
+    PrivateMountClaim, PrivateMountClaimError, ROOT_GRANT, ROOT_LAYER_DEVICE, ReaderError,
+    Resolved, RootFs, RootWrite, SharedOwner, Storage, UnixAttributes, XattrSetMode,
+    object_identity, request_mount, request_unmount, symlink_target, within_directory,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,

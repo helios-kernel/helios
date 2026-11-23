@@ -313,22 +313,36 @@ mod tests {
     }
 
     #[test]
-    fn list_shows_the_descriptor_limit_with_its_unit_and_value() {
+    fn list_shows_the_machine_settings_with_their_units_and_values() {
         let program = ordinary();
+        let expected_storage = crate::MemoryStorageSetting::initial();
 
         assert_eq!(
             list(&program),
-            [SettingEntry {
-                name: "process.descriptor-limit",
-                description: DescriptorLimitSetting::DESCRIPTION,
-                value: SettingValue::Count(1024),
-            }]
+            [
+                SettingEntry {
+                    name: "process.descriptor-limit",
+                    description: DescriptorLimitSetting::DESCRIPTION,
+                    value: SettingValue::Count(1024),
+                },
+                SettingEntry {
+                    name: "fs.memory-storage",
+                    description: crate::MemoryStorageSetting::DESCRIPTION,
+                    value: SettingValue::Bytes(expected_storage),
+                },
+            ]
         );
         let views = listing(&program);
-        assert_eq!(views.len(), 1);
+        assert_eq!(views.len(), 2);
         assert_eq!(views[0].name, "process.descriptor-limit");
         assert_eq!(views[0].description, DescriptorLimitSetting::DESCRIPTION);
         assert!(matches!(views[0].value, ValueView::Count(1024)));
+        assert_eq!(views[1].name, "fs.memory-storage");
+        assert_eq!(
+            views[1].description,
+            crate::MemoryStorageSetting::DESCRIPTION
+        );
+        assert!(matches!(views[1].value, ValueView::Bytes(v) if v == expected_storage));
     }
 
     #[test]

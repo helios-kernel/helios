@@ -54,7 +54,10 @@ pub use btrfs::{
 pub use btrfs_management::{BtrfsManagementError, BtrfsVolumeRequest};
 pub use erofs::{DiskImage, ErofsError, ErofsFs, ReaderError};
 pub use host::{HostShare, HostShareWrite};
-pub use memory::{MemoryFs, MemoryUnixMetadata, MemoryWrite, XattrSetMode};
+pub use memory::{
+    MemoryFs, MemoryStorageBudget, MemoryStorageSetting, MemoryUnixMetadata, MemoryWrite,
+    XattrSetMode,
+};
 pub use node::{FsDescriptor, FsDescriptorFlags};
 pub use request::{
     AttachedStorage, MountRequest, MountRequestError, MountSource, request_mount, request_unmount,
@@ -1337,6 +1340,9 @@ struct Machine {
     /// Processors that may resolve a path: one pin block each, in every
     /// table.
     processors: usize,
+    /// Machine-wide user-pool byte budget shared by every [`MemoryFs`] on
+    /// this machine (including every namespace's root overlay layer).
+    memory_storage: MemoryStorageBudget,
     /// Every writable btrfs mount whose service has not ended, in whichever
     /// tree it was made: what the machine commits before it powers off.
     /// Held only to add, prune and copy the list, never across an await.
@@ -1466,14 +1472,27 @@ fn valid_point(point: &str) -> bool {
 
 impl<S: Storage> MountTable<S> {
     /// A kernel's first table: `boot` under each namespace's own layer,
-    /// with nothing mounted, for a machine of `processors` processors.
-    pub fn new(boot: BootFs, processors: usize) -> Self {
+    /// with nothing mounted, for a machine of `processors` processors and
+    /// in-memory filesystem budget `memory_storage`.
+    pub fn with_storage(
+        boot: BootFs,
+        processors: usize,
+        memory_storage: MemoryStorageBudget,
+    ) -> Self {
         Self::on(Arc::new(Machine {
             boot,
             next_device: DeviceIdAllocator::starting_at(AuthorityDomain::FIRST_MOUNTED.raw()),
             processors,
+            memory_storage,
             writable: spin::Mutex::new(Vec::new()),
         }))
+    }
+
+    /// A kernel's first table for unit tests that do not construct a full
+    /// runtime state, backed by the test memory-storage budget.
+    #[cfg(test)]
+    pub fn new(boot: BootFs, processors: usize) -> Self {
+        Self::with_storage(boot, processors, MemoryStorageBudget::for_test())
     }
 
     fn on(machine: Arc<Machine>) -> Self {
@@ -1497,6 +1516,11 @@ impl<S: Storage> MountTable<S> {
     /// The boot image under every namespace's root.
     pub fn boot(&self) -> &BootFs {
         &self.inner.machine.boot
+    }
+
+    /// The machine-wide budget shared by every [`MemoryFs`] on this kernel.
+    pub fn memory_storage(&self) -> MemoryStorageBudget {
+        self.inner.machine.memory_storage.clone()
     }
 
     /// A device id no other filesystem on this kernel has, for a tree the
@@ -2016,10 +2040,11 @@ impl<S: Storage> Namespace<S> {
     /// The root namespace, over `table`: the kernel's own tree, with a
     /// fresh root layer and no ancestors.
     pub fn new(table: MountTable<S>) -> Self {
+        let storage = table.memory_storage();
         Self::over(
             table,
             Arc::new(Vec::new()),
-            MemoryFs::new(ROOT_LAYER_DEVICE),
+            MemoryFs::with_budget(ROOT_LAYER_DEVICE, storage),
         )
     }
 
@@ -2039,10 +2064,11 @@ impl<S: Storage> Namespace<S> {
         let inherited = core::iter::once(self.own.clone())
             .chain(self.inherited.iter().cloned())
             .collect();
+        let storage = self.own.memory_storage();
         Self::over(
             self.own.descendant(),
             Arc::new(inherited),
-            MemoryFs::new(ROOT_LAYER_DEVICE),
+            MemoryFs::with_budget(ROOT_LAYER_DEVICE, storage),
         )
     }
 

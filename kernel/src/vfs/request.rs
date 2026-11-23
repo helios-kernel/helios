@@ -120,9 +120,10 @@ pub async fn request_mount<S: Storage>(
     }
     let mut service = None;
     let fs = match source {
-        MountSource::Memory => {
-            MountedFs::Memory(MemoryFs::new(namespace.table().allocate_device()))
-        }
+        MountSource::Memory => MountedFs::Memory(MemoryFs::with_budget(
+            namespace.table().allocate_device(),
+            namespace.table().memory_storage(),
+        )),
         MountSource::BootImage => MountedFs::Boot(namespace.table().boot().clone()),
         MountSource::HostShare => MountedFs::Host(HostShare::new(
             attached

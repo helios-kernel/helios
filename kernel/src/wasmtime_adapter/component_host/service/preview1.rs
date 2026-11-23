@@ -2989,10 +2989,16 @@ where
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
     let payer = caller.data().instance().storage_payer();
-    p1_write_open_file(
+    let result = p1_write_open_file(
         &namespace, &open, append, memory, layout, at, now_nanos, &payer,
     )
-    .await
+    .await;
+    if matches!(result, Err(P1Stop::Errno(p1::errno::NOMEM))) {
+        caller.data().request_user_memory_oom_kill(
+            u64::from(layout.byte_len).max(helios_hal::pmm::PhysFrame::SIZE as u64),
+        );
+    }
+    result
 }
 
 /// Writes the bytes `layout` names through the open file description

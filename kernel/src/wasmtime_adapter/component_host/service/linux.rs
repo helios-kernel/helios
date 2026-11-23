@@ -1358,11 +1358,23 @@ where
     ) -> Result<Landed, syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
         let payer = self.shared.launched_instance.storage_payer();
-        self.shared
+        let result = self
+            .shared
             .container
             .filesystem()
             .write_at(&file.path, position, bytes, creds, now, &payer)
-            .await
+            .await;
+        if matches!(result, Err(syscall::FsOpError::Fs(FsError::OutOfMemory))) {
+            crate::wasmtime_adapter::store::request_oom_kill(
+                &self.shared.runtime_state,
+                &self.shared.runtime_state.instance_registry(),
+                &self.shared.cpu,
+                self.shared.launched_instance.id(),
+                crate::MemoryPool::User,
+                bytes.len().max(helios_hal::pmm::PhysFrame::SIZE),
+            );
+        }
+        result
     }
 
     async fn list_dir(

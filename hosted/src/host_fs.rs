@@ -609,6 +609,7 @@ mod tests {
             let root = test_root();
             let gid = current_gid(&root);
             let share = HostShare::new(filesystem(&root));
+            crate::cpu::set_current_processor(helios_hal::cpu::ProcessorId::new(0));
             let registry = helios_kernel::InstanceRegistry::new();
             let instance = registry.register("host-fs-test", 0);
             let payer = instance.storage_payer();

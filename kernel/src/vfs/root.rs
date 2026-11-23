@@ -436,7 +436,7 @@ impl RootWrite {
         })
     }
 
-    fn land(self, mut fill: impl FnMut(usize, &mut [u8])) -> FsResult<Landed> {
+    fn land(self, fill: impl FnMut(usize, &mut [u8])) -> FsResult<Landed> {
         self.root.copy_up(self.path.as_path(), &self.payer)?;
         self.root.upper.write_now(
             self.path.as_path(),
@@ -444,7 +444,7 @@ impl RootWrite {
             self.len,
             self.now,
             &self.payer,
-            |destination| fill(0, destination),
+            fill,
         )
     }
 }

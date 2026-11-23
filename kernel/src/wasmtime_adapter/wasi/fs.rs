@@ -2521,6 +2521,9 @@ where
     StorageImpl: crate::Storage,
 {
     let payer = accessor.get().instance().storage_payer();
+    let runtime_state = accessor.get().runtime_state.clone();
+    let cpu = accessor.get().cpu.clone();
+    let requester = accessor.get().instance().id();
     let resolved = descriptor_in(accessor.get(), &descriptor)
         .and_then(|(descriptor, namespace)| write_stream_target(&namespace, descriptor.grant()?));
     let getter = accessor.getter();
@@ -2531,7 +2534,20 @@ where
                 &mut accessor,
                 file_write_consumer(getter, resolved, mode, payer, tx),
             )?;
-            transfer_outcome(&mut accessor, rx)
+            FutureReader::new(&mut accessor, async move {
+                let outcome = rx.await.unwrap_or(Ok(()));
+                if matches!(outcome, Err(fs_types::ErrorCode::InsufficientMemory)) {
+                    crate::wasmtime_adapter::store::request_oom_kill(
+                        &runtime_state,
+                        &runtime_state.instance_registry(),
+                        &cpu,
+                        requester,
+                        crate::MemoryPool::User,
+                        helios_hal::pmm::PhysFrame::SIZE,
+                    );
+                }
+                Ok::<_, wasmtime::Error>(outcome)
+            })
         }
         Err(error) => {
             data.close(&mut accessor)?;

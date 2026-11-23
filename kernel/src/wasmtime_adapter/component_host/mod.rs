@@ -2255,19 +2255,33 @@ where
             detail: ProgramExecErrorDetail::ProgramArtifactDestinationNotGranted,
         }));
     }
-    let (namespace, now_nanos, payer) = accessor.with(|mut access| {
+    let (namespace, now_nanos, payer, runtime_state, requester) = accessor.with(|mut access| {
         let store_data = access.get();
         (
             store_data.filesystem().clone(),
             store_data.now_nanos(),
             store_data.instance().storage_payer(),
+            store_data.runtime_state.clone(),
+            store_data.instance().id(),
         )
     });
-    crate::wasmtime_adapter::wasi::write_program_file(
+    if let Err(error) = crate::wasmtime_adapter::wasi::write_program_file(
         &namespace, &absolute, bytes, now_nanos, &payer,
     )
     .await
-    .map_err(map_fs_error_to_program_exec)?;
+    {
+        if matches!(error, FsErrorCode::InsufficientMemory) {
+            crate::wasmtime_adapter::store::request_oom_kill(
+                &runtime_state,
+                &runtime_state.instance_registry(),
+                cpu,
+                requester,
+                crate::MemoryPool::User,
+                bytes.len().max(helios_hal::pmm::PhysFrame::SIZE),
+            );
+        }
+        return Err(map_fs_error_to_program_exec(error).into());
+    }
     if profile {
         write_serial.emit_fmt(format_args!(
             "aot-write us={} bytes={}\n",

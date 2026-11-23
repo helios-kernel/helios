@@ -116,6 +116,13 @@ pub trait Setting: 'static {
     type Value: Copy;
     /// What it holds until an operator sets it.
     const DEFAULT: Self::Value;
+    /// What it holds when a machine's [`Settings`] is first created.
+    ///
+    /// Defaults to [`Self::DEFAULT`]; a setting whose initial value depends on
+    /// the machine's memory capacity overrides this.
+    fn initial() -> Self::Value {
+        Self::DEFAULT
+    }
     /// The amount, in [`Self::UNIT`], that stands for `value`.
     fn to_raw(value: Self::Value) -> u64;
     /// The value an amount in [`Self::UNIT`] stands for. Operators are
@@ -132,7 +139,7 @@ pub struct SettingCell<S: Setting> {
 impl<S: Setting> Default for SettingCell<S> {
     fn default() -> Self {
         Self {
-            raw: AtomicU64::new(S::to_raw(S::DEFAULT)),
+            raw: AtomicU64::new(S::to_raw(S::initial())),
             _setting: PhantomData,
         }
     }
@@ -328,10 +335,13 @@ macro_rules! settings {
 #[cfg(feature = "unix")]
 settings! {
     descriptor_limit: crate::DescriptorLimitSetting,
+    fs_memory_storage: crate::vfs::MemoryStorageSetting,
 }
 
 #[cfg(not(feature = "unix"))]
-settings! {}
+settings! {
+    fs_memory_storage: crate::vfs::MemoryStorageSetting,
+}
 
 #[cfg(test)]
 mod tests {
@@ -412,17 +422,24 @@ mod tests {
 
     #[cfg(feature = "unix")]
     #[test]
-    fn the_machine_lists_the_descriptor_limit_and_nothing_else() {
+    fn the_machine_lists_its_settings() {
         let settings = Settings::default();
 
-        assert_eq!(SETTING_COUNT, 1);
+        assert_eq!(SETTING_COUNT, 2);
         assert_eq!(
             settings.entries(),
-            [SettingEntry {
-                name: "process.descriptor-limit",
-                description: DescriptorLimitSetting::DESCRIPTION,
-                value: SettingValue::Count(1024),
-            }]
+            [
+                SettingEntry {
+                    name: "process.descriptor-limit",
+                    description: DescriptorLimitSetting::DESCRIPTION,
+                    value: SettingValue::Count(1024),
+                },
+                SettingEntry {
+                    name: "fs.memory-storage",
+                    description: crate::vfs::MemoryStorageSetting::DESCRIPTION,
+                    value: SettingValue::Bytes(crate::vfs::MemoryStorageSetting::initial()),
+                },
+            ]
         );
     }
 
