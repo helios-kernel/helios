@@ -12,6 +12,17 @@ use helios_bench_metrics::report_metric;
 use thiserror::Error;
 use wasi::clocks::monotonic_clock;
 
+wit_bindgen::generate!({
+    path: "../../../wit/deps/clocks.wit",
+    inline: "
+        package helios:hostcall-loop;
+        world hostcall-loop {
+            import wasi:clocks/monotonic-clock@0.3.0;
+        }
+    ",
+    generate_all,
+});
+
 #[derive(Debug, Error)]
 enum HostcallLoopError {
     #[error("usage: hostcall-loop <calls>")]

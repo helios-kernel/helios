@@ -10,6 +10,7 @@
 !/artifacts/wasix/coreutils/*
 /tools/wasi-apps/*/target
 /tools/bench/.venv
+/tools/gvisor-syscalls/.venv
 /.notes-*.md
 __pycache__/
 *.wasm

@@ -12,7 +12,8 @@ use helios_hal::fs::{BlockSerial, FileSystemRights};
 use thiserror::Error;
 
 use super::{
-    BtrfsFs, ErofsError, ErofsFs, HostShare, MemoryFs, MountError, MountedFs, Namespace, Storage,
+    BtrfsFs, BtrfsService, BtrfsWriteOptions, ErofsError, ErofsFs, HostShare, MemoryFs, MountError,
+    MountGrant, MountSharing, MountedFs, Namespace, Storage,
 };
 use crate::{BlockCache, ProcessAuthority, ProcessAuthorityError};
 
@@ -28,7 +29,7 @@ pub enum MountSource {
     /// The EROFS image on the mount-source disk that reported `serial`,
     /// read-only whatever the request says.
     Disk { serial: BlockSerial },
-    /// A read-only btrfs image on the disk with this serial.
+    /// A btrfs image on the disk with this serial.
     Btrfs { serial: BlockSerial },
 }
 
@@ -52,31 +53,72 @@ pub enum MountRequestError {
     InvalidSerial(String),
     #[error("no mount-source disk reported the serial {serial:?}")]
     DiskUnavailable { serial: BlockSerial },
+    #[error("disk {serial:?} is read-only but a writable mount was requested")]
+    ReadOnlyDisk { serial: BlockSerial },
     #[error("the image on disk {serial:?} cannot be mounted: {error}")]
     Erofs {
         serial: BlockSerial,
         error: ErofsError,
     },
+    #[error("invalid compression option: {0}")]
+    CompressionOption(#[from] helios_btrfs::write::CompressionOptionError),
+    #[error("a compression policy applies only to a btrfs mount")]
+    CompressionUnsupported,
+    #[error("a commit interval applies only to a btrfs mount")]
+    CommitUnsupported,
+    #[error("an inline data limit applies only to a btrfs mount")]
+    MaxInlineUnsupported,
     #[error("the btrfs image on disk {serial:?} cannot be mounted: {error}")]
     Btrfs {
         serial: BlockSerial,
-        error: helios_btrfs::Error,
+        error: super::BtrfsMountError,
     },
     #[error(transparent)]
     Mount(#[from] MountError),
 }
 
-/// Attaches the filesystem `source` names at `point`, under `authority`,
-/// from the storage the machine `attached`.
+/// One mount user space asks for.
+pub struct MountRequest<'a> {
+    pub source: MountSource,
+    /// The guest path to attach the filesystem at.
+    pub point: &'a str,
+    /// Attach for reading only. The boot image and an EROFS disk are
+    /// read-only whatever this says.
+    pub read_only: bool,
+    /// Whether the mount is private or shared, for as long as it exists.
+    pub sharing: MountSharing,
+    /// How a writable btrfs mount writes; only btrfs takes a compression
+    /// policy or a commit interval.
+    pub write: BtrfsWriteOptions,
+}
+
+/// Attaches the filesystem `request` names, under `authority`, from the
+/// storage the machine `attached`. The caller must spawn any returned
+/// service on the kernel executor before serving filesystem requests.
 pub async fn request_mount<S: Storage>(
     authority: &ProcessAuthority,
     namespace: &Namespace<S>,
     attached: AttachedStorage<S>,
-    source: MountSource,
-    point: &str,
-    read_only: bool,
-) -> Result<(), MountRequestError> {
+    request: MountRequest<'_>,
+) -> Result<Option<BtrfsService<S::Disk>>, MountRequestError> {
+    let MountRequest {
+        source,
+        point,
+        read_only,
+        sharing,
+        write,
+    } = request;
     let cap = authority.derive_mount_cap(point)?;
+    if write.compress.is_some() && !matches!(source, MountSource::Btrfs { .. }) {
+        return Err(MountRequestError::CompressionUnsupported);
+    }
+    if write.commit.is_some() && !matches!(source, MountSource::Btrfs { .. }) {
+        return Err(MountRequestError::CommitUnsupported);
+    }
+    if write.max_inline.is_some() && !matches!(source, MountSource::Btrfs { .. }) {
+        return Err(MountRequestError::MaxInlineUnsupported);
+    }
+    let mut service = None;
     let fs = match source {
         MountSource::Memory => {
             MountedFs::Memory(MemoryFs::new(namespace.table().allocate_device()))
@@ -102,23 +144,40 @@ pub async fn request_mount<S: Storage>(
                 .disks
                 .and_then(|disks| disks.disk_by_serial(serial.as_bytes()))
                 .ok_or(MountRequestError::DiskUnavailable { serial })?;
-            let fs = BtrfsFs::mount(disk, || namespace.table().allocate_device())
+            if !read_only && disk.is_read_only() {
+                return Err(MountRequestError::ReadOnlyDisk { serial });
+            }
+            let fs = if read_only {
+                BtrfsFs::mount(disk, || namespace.table().allocate_device())
+                    .await
+                    .map_err(|error| MountRequestError::Btrfs { serial, error })?
+            } else {
+                let (fs, task) = BtrfsFs::mount_writable_with_allocator(
+                    disk,
+                    namespace.table().device_allocator(),
+                    write,
+                )
                 .await
                 .map_err(|error| MountRequestError::Btrfs { serial, error })?;
+                service = Some(task);
+                fs
+            };
             MountedFs::Btrfs(fs)
         }
     };
     let rights = match source {
-        MountSource::BootImage | MountSource::Disk { .. } | MountSource::Btrfs { .. } => {
+        MountSource::BootImage | MountSource::Disk { .. } => FileSystemRights::READ,
+        MountSource::Memory | MountSource::HostShare | MountSource::Btrfs { .. } if read_only => {
             FileSystemRights::READ
         }
-        MountSource::Memory | MountSource::HostShare if read_only => FileSystemRights::READ,
-        MountSource::Memory | MountSource::HostShare => {
+        MountSource::Memory | MountSource::HostShare | MountSource::Btrfs { .. } => {
             FileSystemRights::READ | FileSystemRights::WRITE
         }
     };
-    namespace.mount(&cap, fs, rights).await?;
-    Ok(())
+    namespace
+        .mount(&cap, fs, MountGrant { rights, sharing })
+        .await?;
+    Ok(service)
 }
 
 /// Detaches the filesystem at `point`, under `authority`.

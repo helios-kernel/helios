@@ -143,6 +143,42 @@ fn u64_literal(value: u64) -> TokenStream {
 }
 
 impl<'a> Wire<'a> {
+    pub(super) fn entry_output_handles(&self, id: TypeId, assign: bool) -> Result<TokenStream> {
+        let frame = Frame {
+            container: id,
+            access: Access::Param,
+        };
+        let mut output = TokenStream::new();
+        for var in &self.an.reg.types[id].variables {
+            if !var.attrs.var_out || self.category(var.ty.base) != Category::Handle {
+                continue;
+            }
+            let name = ident(&var.name);
+            let handle = ident(&self.an.reg.types[var.ty.base].name);
+            let value = if assign {
+                quote!(venus_state.connection.object_id()?)
+            } else {
+                quote!(0)
+            };
+            let write = if let Some(len) = var.attrs.lens.first() {
+                let expression = expr::parse(&len.expr, &len.name)?;
+                let count = self.expr_tokens(frame, &expression, len, &var.name, false)?;
+                quote! {
+                    for venus_index in 0..(#count as usize) {
+                        #name.add(venus_index).write(#handle(#value));
+                    }
+                }
+            } else {
+                quote!(#name.write(#handle(#value));)
+            };
+            output.extend(quote! {
+                if !#name.is_null() {
+                    #write
+                }
+            });
+        }
+        Ok(output)
+    }
     pub fn new(an: &'a Analysis) -> Self {
         Self { an }
     }
@@ -633,6 +669,34 @@ impl<'a> Wire<'a> {
         } else {
             quote!({ #body })
         })
+    }
+
+    /// Save a command output array's capacity before reply count parameters
+    /// overwrite the caller's input counts. A null array has no storage,
+    /// even when its count pointer is used to query the required length.
+    pub fn reply_array_capacity(
+        &self,
+        frame: Frame,
+        var: &Variable,
+    ) -> Result<Option<(Ident, TokenStream)>> {
+        if !var.is_dynamic_array() || !self.an.is_serializable(var) {
+            return Ok(None);
+        }
+        let plan = self.plan(frame, var)?;
+        let Some(count) = plan
+            .loops
+            .first()
+            .map(|item| &item.count)
+            .or(plan.array_size.as_ref())
+        else {
+            return Ok(None);
+        };
+        let name = format_ident!("venus_capacity_{}", var.name);
+        let pointer = &plan.place.expr;
+        Ok(Some((
+            name,
+            quote!(if #pointer.is_null() { 0 } else { #count }),
+        )))
     }
 
     // -- unions ---------------------------------------------------------------

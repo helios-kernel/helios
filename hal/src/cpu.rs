@@ -314,6 +314,16 @@ pub trait Cpu: Send + Sync + 'static {
         None
     }
 
+    type Native: crate::native::NativeExecution;
+
+    /// Native user execution is absent unless the backend exposes a
+    /// capability meeting every property of [`crate::native`]'s contract,
+    /// its isolation contract included; the refusal says which part is
+    /// missing.
+    fn native(&self) -> Result<&Self::Native, crate::native::NativeUnavailable> {
+        Err(crate::native::NativeUnavailable::Unsupported)
+    }
+
     /// How this platform's timer interrupt is scheduled.
     ///
     /// A deadline published for another processor has to reach that

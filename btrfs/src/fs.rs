@@ -1,30 +1,32 @@
 //! The mounted filesystem: inodes, directories, file data, symlinks and
 //! extended attributes.
 
+#[cfg(feature = "write")]
+pub(crate) mod writer;
+
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
 
 use crate::chunk::ChunkMap;
-use crate::compress::decompress;
 use crate::csum::name_hash;
+#[cfg(feature = "write")]
+use crate::delalloc::Delalloc;
 use crate::error::{Error, FileKind, ItemDefect};
 use crate::items::{
-    DirRecord, EntryTarget, ExtentData, FileExtent, INODE_NODATASUM, Metadata, RecordKind,
-    RootRecord, dir_index_record, dir_records,
+    DirRecord, EntryTarget, Metadata, RecordKind, RootRecord, dir_index_record, dir_records,
+    root_backref_dirid,
 };
 use crate::key::Key;
-use crate::ondisk::{MAX_COMPRESSED_EXTENT, NAME_MAX, SYMLINK_MAX, item_type, objectid};
+use crate::ondisk::{NAME_MAX, SYMLINK_MAX, item_type, objectid};
 use crate::source::BlockSource;
 use crate::superblock::{self, Superblock};
-use crate::tree::{Cursor, TreeRoot};
-use crate::volume::Volume;
+use crate::tree::{Cursor, Node, TreeRoot};
+use crate::volume::{Mapping, Volume};
 
 /// Most symlinks one path resolution follows, as Linux's `MAXSYMLINKS`.
 pub const MAX_SYMLINK_FOLLOWS: usize = 40;
-
-/// Largest window of file data read and checksummed in one request.
-const DATA_WINDOW: u64 = MAX_COMPRESSED_EXTENT;
 
 /// A btrfs filesystem mounted read-only from one device.
 ///
@@ -40,18 +42,215 @@ const DATA_WINDOW: u64 = MAX_COMPRESSED_EXTENT;
 /// eight, each one node size) and a bounded data window, and frees them
 /// when it finishes.
 ///
-/// An [`Inode`] records the tree root of the commit it was read from, so
-/// operations on it see that commit's state whatever happens afterwards.
+/// An [`Inode`] records the view it was read from — a commit, or with the
+/// `write` feature the running transaction as of an accepted mutation — so
+/// operations on it see that view's state whatever happens afterwards.
+#[derive(Clone)]
 pub struct Filesystem<S> {
+    snapshot: Arc<Snapshot>,
     volume: Volume<S>,
-    root_tree: TreeRoot,
+}
+
+/// Every tree and address translation needed to read one view: a committed
+/// generation, or the running transaction as of an accepted mutation.
+/// Inodes retain this whole view, including its retirement pin.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Snapshot {
+    pub(crate) mapping: Arc<Mapping>,
+    pub(crate) root_tree: TreeRoot,
     csum_tree: TreeRoot,
-    default_subvolume: RootRecord,
+    pub(crate) default_subvolume: RootRecord,
+    /// The running transaction's state this view reads through; `None` for
+    /// a committed generation.
+    #[cfg(feature = "write")]
+    pub(crate) running: Option<Running>,
+}
+
+/// What a view of the running transaction holds beyond a committed
+/// generation's roots. Every collection is persistent, so taking a view is a
+/// handful of reference-count increments, and the writer's later edits copy
+/// only the paths they change.
+#[cfg(feature = "write")]
+pub(crate) struct Running {
+    /// The transaction's private tree blocks, read before the device.
+    trees: crate::tree::write::Trees,
+    /// The subvolume roots as the transaction has moved them. The root tree
+    /// records them only at commit, so a view looks them up here.
+    roots: crate::roots::Roots,
+    /// The private data extents this view reaches. The writer keeps them
+    /// from reuse while the view lives.
+    data: rpds::RedBlackTreeMapSync<u64, u64>,
+    /// The dirty file data not yet written back, which reads see first.
+    dirty: Delalloc,
+    /// The generation the transaction started from: blocks it retired stay
+    /// pinned while this view can still read them.
+    base: Arc<Snapshot>,
+}
+
+#[cfg(feature = "write")]
+impl core::fmt::Debug for Running {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("Running")
+            .field("base", &self.base.mapping.superblock.generation())
+            .field("private_data_extents", &self.data.size())
+            .field("dirty_bytes", &self.dirty.bytes())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Two views of a running transaction are the same view only when they are
+/// one value: an overlay has no cheaper identity.
+#[cfg(feature = "write")]
+impl PartialEq for Running {
+    fn eq(&self, other: &Self) -> bool {
+        core::ptr::eq(self, other)
+    }
+}
+
+#[cfg(feature = "write")]
+impl Eq for Running {}
+
+#[cfg(feature = "write")]
+impl Snapshot {
+    pub(crate) fn advance(
+        &self,
+        superblock: Superblock,
+        chunks: Arc<ChunkMap>,
+        roots: &crate::roots::Roots,
+    ) -> Result<Arc<Self>, crate::tree::write::WriteError> {
+        Ok(Arc::new(Self {
+            mapping: Mapping::advance(superblock, chunks),
+            root_tree: roots.root,
+            csum_tree: roots.get(objectid::CSUM_TREE)?,
+            default_subvolume: RootRecord {
+                root: roots.get(self.default_subvolume.root.tree)?,
+                root_dirid: self.default_subvolume.root_dirid,
+            },
+            running: None,
+        }))
+    }
+
+    /// A view of the running transaction started from `base`, as its state
+    /// stands now.
+    pub(crate) fn running(
+        base: &Arc<Self>,
+        mapping: Arc<Mapping>,
+        roots: &crate::roots::Roots,
+        checksums: TreeRoot,
+        trees: &crate::tree::write::Trees,
+        data: rpds::RedBlackTreeMapSync<u64, u64>,
+        dirty: &Delalloc,
+    ) -> Result<Arc<Self>, crate::tree::write::WriteError> {
+        Ok(Arc::new(Self {
+            mapping,
+            root_tree: roots.root,
+            csum_tree: checksums,
+            default_subvolume: RootRecord {
+                root: roots.get(base.default_subvolume.root.tree)?,
+                root_dirid: base.default_subvolume.root_dirid,
+            },
+            running: Some(Running {
+                trees: trees.clone(),
+                roots: roots.clone(),
+                data,
+                dirty: dirty.clone(),
+                base: base.clone(),
+            }),
+        }))
+    }
+
+    /// Whether this view reaches the private data extent at `address`.
+    pub(crate) fn reaches_private_data(&self, address: u64) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|running| running.data.contains_key(&address))
+    }
+}
+
+impl Snapshot {
+    /// The tree blocks this view reads, through its own mapping.
+    fn nodes<'a, S: BlockSource>(&'a self, volume: &'a Volume<S>) -> Nodes<'a, S> {
+        Nodes {
+            volume: volume.view(&self.mapping),
+            #[cfg(feature = "write")]
+            overlay: self.running.as_ref().map(|running| &running.trees),
+            #[cfg(not(feature = "write"))]
+            _lifetime: core::marker::PhantomData,
+        }
+    }
+
+    /// The newest root record of `tree` as this view sees it.
+    async fn find_root<S: BlockSource>(
+        &self,
+        nodes: &Nodes<'_, S>,
+        tree: u64,
+    ) -> Result<RootRecord, Error> {
+        #[cfg(feature = "write")]
+        if let Some(running) = &self.running {
+            return running.roots.record(tree);
+        }
+        find_root(&nodes.volume, self.root_tree, tree).await
+    }
+}
+
+/// Where a view's tree blocks come from: the running transaction's private
+/// blocks first when the view has them, then the device.
+pub(crate) struct Nodes<'a, S> {
+    volume: Volume<S>,
+    #[cfg(feature = "write")]
+    overlay: Option<&'a crate::tree::write::Trees>,
+    #[cfg(not(feature = "write"))]
+    _lifetime: core::marker::PhantomData<&'a ()>,
+}
+
+impl<S: BlockSource> crate::tree::NodeSource for Nodes<'_, S> {
+    async fn read_node(
+        &self,
+        logical: u64,
+        expected: crate::tree::Expected,
+    ) -> Result<Node, Error> {
+        #[cfg(feature = "write")]
+        if let Some(trees) = self.overlay {
+            return trees.read(&self.volume, logical, expected).await;
+        }
+        Node::read(&self.volume, logical, expected).await
+    }
+}
+
+/// How a file extent item stores its range.
+#[cfg(any(all(test, feature = "write"), feature = "test-support"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtentKind {
+    /// The bytes are in the item itself.
+    Inline,
+    /// The bytes are in a data extent (a `disk_bytenr` of zero is a hole).
+    Regular,
+    /// Preallocated, never written.
+    Prealloc,
+}
+
+/// One file extent item, as returned by [`Filesystem::file_extents`]: a test
+/// inspection API.
+#[cfg(any(all(test, feature = "write"), feature = "test-support"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExtentInfo {
+    /// File offset of the range the item covers.
+    pub offset: u64,
+    /// Length of that range in bytes.
+    pub len: u64,
+    pub kind: ExtentKind,
+    /// The item's compression type; `None` for stored plain.
+    pub compression: Option<crate::Compression>,
+    /// The bytes the range occupies as stored: an inline item's data, or a
+    /// regular or preallocated extent's `disk_num_bytes` (zero for a hole).
+    pub stored: u64,
 }
 
 /// An inode, as of the commit it was read from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inode {
+    snapshot: Arc<Snapshot>,
     root: TreeRoot,
     number: u64,
     metadata: Metadata,
@@ -87,10 +286,6 @@ impl Inode {
         }
         Ok(())
     }
-
-    fn is_checksummed(&self) -> bool {
-        self.metadata.flags & INODE_NODATASUM == 0
-    }
 }
 
 /// A place in a directory listing to resume from.
@@ -100,6 +295,34 @@ pub struct DirPosition(pub u64);
 impl DirPosition {
     /// The start of a listing.
     pub const START: Self = Self(0);
+}
+
+/// An upper `DIR_INDEX` bound for a directory listing.
+///
+/// Capturing the directory's highest `DIR_INDEX` when opening a stream via
+/// [`Filesystem::dir_bound`] follows Linux's `btrfs_opendir` and
+/// `btrfs_real_readdir` (`fs/btrfs/inode.c`, commit `9b378f6ad48c`): entries
+/// inserted or renamed to higher indices while the stream is open are skipped
+/// so iteration always terminates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirBound(Option<DirPosition>);
+
+impl DirBound {
+    /// No entries existed when the stream opened; listings yield nothing.
+    pub const EMPTY: Self = Self(None);
+
+    /// Lists every entry present in the view, without an upper bound.
+    pub const UNBOUNDED: Self = Self(Some(DirPosition(u64::MAX)));
+
+    /// Bounds a listing at `position`, inclusive.
+    pub const fn at(position: DirPosition) -> Self {
+        Self(Some(position))
+    }
+
+    /// The inclusive upper position, or `None` for [`DirBound::EMPTY`].
+    pub const fn position(self) -> Option<DirPosition> {
+        self.0
+    }
 }
 
 /// One entry of a directory listing. `.` and `..` are not stored by the
@@ -120,11 +343,131 @@ impl<S: BlockSource> Filesystem<S> {
     /// does not implement, reads the chunk tree through the bootstrap
     /// chunks the superblock carries and checks the two agree, and finds
     /// the checksum tree and the default subvolume.
+    ///
+    /// A filesystem whose fsynced state is still in a log tree is refused
+    /// with [`Error::LogReplayRequired`]: its committed trees do not hold
+    /// that state, and only a writable mount replays the log.
     pub async fn mount(source: S) -> Result<Self, Error> {
         let selected = superblock::select(&source).await?;
+        selected.superblock.check_supported()?;
+        let devid = selected.superblock.devid();
+        let dev_bytes = selected.superblock.device_bytes();
+        Self::open_multi(
+            vec![(devid, Arc::new(source))],
+            selected,
+            &[(devid, dev_bytes)],
+        )
+        .await
+    }
+
+    /// Mounts a multi-device filesystem spanning `sources`. Every source must
+    /// belong to the same filesystem (`fsid`) and together cover all
+    /// `num_devices` recorded in the superblock.
+    pub async fn mount_devices(sources: Vec<S>) -> Result<Self, Error> {
+        if sources.is_empty() {
+            return Err(Error::MultiDevice { devices: 0 });
+        }
+        let mut parsed = Vec::with_capacity(sources.len());
+        for source in sources {
+            let selected = superblock::select(&source).await?;
+            parsed.push((selected, Arc::new(source)));
+        }
+        let best_idx = parsed
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (sel, _))| sel.superblock.generation())
+            .map(|(i, _)| i)
+            .expect("sources is nonempty");
+        let fsid = parsed[best_idx].0.superblock.fsid();
+        let mut devices = Vec::with_capacity(parsed.len());
+        let mut device_sizes = Vec::with_capacity(parsed.len());
+        let mut chosen = None;
+        for (idx, (selected, source)) in parsed.into_iter().enumerate() {
+            if selected.superblock.fsid() != fsid {
+                return Err(Error::NoValidSuperblock {
+                    primary: crate::SuperblockDefect::DeviceFsid,
+                    backups_checked: 0,
+                });
+            }
+            let devid = selected.superblock.devid();
+            let dev_bytes = selected.superblock.device_bytes();
+            devices.push((devid, source));
+            device_sizes.push((devid, dev_bytes));
+            if idx == best_idx {
+                chosen = Some(selected);
+            }
+        }
+        let selected = chosen.expect("best_idx was in bounds");
+        selected.superblock.check_supported_for(devices.len())?;
+        devices.sort_unstable_by_key(|(id, _)| *id);
+        Self::open_multi(devices, selected, &device_sizes).await
+    }
+
+    /// Mounts the last committed generation of `source`, whether or not a log
+    /// tree is pending behind it: what a writable mount replays the log into.
+    #[cfg(feature = "write")]
+    pub(crate) async fn mount_committed(source: S) -> Result<Self, Error> {
+        let selected = superblock::select(&source).await?;
+        selected.superblock.check_features()?;
+        let devid = selected.superblock.devid();
+        let dev_bytes = selected.superblock.device_bytes();
+        Self::open_multi(
+            vec![(devid, Arc::new(source))],
+            selected,
+            &[(devid, dev_bytes)],
+        )
+        .await
+    }
+
+    /// Multi-device counterpart of [`Self::mount_committed`].
+    #[cfg(feature = "write")]
+    pub(crate) async fn mount_committed_devices(sources: Vec<S>) -> Result<Self, Error> {
+        if sources.is_empty() {
+            return Err(Error::MultiDevice { devices: 0 });
+        }
+        let mut parsed = Vec::with_capacity(sources.len());
+        for source in sources {
+            let selected = superblock::select(&source).await?;
+            parsed.push((selected, Arc::new(source)));
+        }
+        let best_idx = parsed
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (sel, _))| sel.superblock.generation())
+            .map(|(i, _)| i)
+            .expect("sources is nonempty");
+        let fsid = parsed[best_idx].0.superblock.fsid();
+        let mut devices = Vec::with_capacity(parsed.len());
+        let mut device_sizes = Vec::with_capacity(parsed.len());
+        let mut chosen = None;
+        for (idx, (selected, source)) in parsed.into_iter().enumerate() {
+            if selected.superblock.fsid() != fsid {
+                return Err(Error::NoValidSuperblock {
+                    primary: crate::SuperblockDefect::DeviceFsid,
+                    backups_checked: 0,
+                });
+            }
+            let devid = selected.superblock.devid();
+            let dev_bytes = selected.superblock.device_bytes();
+            devices.push((devid, source));
+            device_sizes.push((devid, dev_bytes));
+            if idx == best_idx {
+                chosen = Some(selected);
+            }
+        }
+        let selected = chosen.expect("best_idx was in bounds");
+        selected.superblock.check_features_for(devices.len())?;
+        devices.sort_unstable_by_key(|(id, _)| *id);
+        Self::open_multi(devices, selected, &device_sizes).await
+    }
+
+    async fn open_multi(
+        devices: Vec<(u64, Arc<S>)>,
+        selected: superblock::SelectedSuperblock,
+        device_sizes: &[(u64, u64)],
+    ) -> Result<Self, Error> {
         let superblock = selected.superblock;
-        superblock.check_supported()?;
-        let bootstrap = ChunkMap::from_sys_chunk_array(&superblock, &selected.bytes)?;
+        let bootstrap = ChunkMap::from_sys_chunk_array(&superblock, &selected.bytes, device_sizes)?;
         let chunk_root = superblock.chunk_tree();
         let root_tree = TreeRoot {
             tree: objectid::ROOT_TREE,
@@ -132,7 +475,7 @@ impl<S: BlockSource> Filesystem<S> {
             level: superblock.root_tree().level,
             generation: superblock.generation(),
         };
-        let mut volume = Volume::new(source, superblock, bootstrap);
+        let mut volume = Volume::new_multi(devices, superblock, bootstrap);
 
         let chunks = read_chunk_tree(
             &volume,
@@ -142,6 +485,7 @@ impl<S: BlockSource> Filesystem<S> {
                 level: chunk_root.level,
                 generation: chunk_root.generation,
             },
+            device_sizes,
         )
         .await?;
         let bootstrap = volume.replace_chunks(chunks);
@@ -153,11 +497,23 @@ impl<S: BlockSource> Filesystem<S> {
         let default_tree = default_subvolume(&volume, root_tree).await?;
         let default_subvolume = find_root(&volume, root_tree, default_tree).await?;
         Ok(Self {
+            snapshot: Arc::new(Snapshot {
+                mapping: volume.mapping(),
+                root_tree,
+                csum_tree,
+                default_subvolume,
+                #[cfg(feature = "write")]
+                running: None,
+            }),
             volume,
-            root_tree,
-            csum_tree,
-            default_subvolume,
         })
+    }
+
+    #[cfg(feature = "write")]
+    pub(crate) fn publish(&mut self, committed: crate::transaction::Committed<S>) {
+        self.volume.install(committed.snapshot.mapping.clone());
+        self.volume.install_devices(committed.devices);
+        self.snapshot = committed.snapshot;
     }
 
     pub fn superblock(&self) -> &Superblock {
@@ -166,7 +522,7 @@ impl<S: BlockSource> Filesystem<S> {
 
     /// The id of the subvolume a mount lands in.
     pub fn default_subvolume(&self) -> u64 {
-        self.default_subvolume.root.tree
+        self.snapshot.default_subvolume.root.tree
     }
 
     /// Visits each subvolume once, in tree-id order. A mount uses this
@@ -176,16 +532,15 @@ impl<S: BlockSource> Filesystem<S> {
     where
         F: FnMut(u64, u64),
     {
-        let mut cursor = Cursor::ceiling(&self.volume, self.root_tree, Key::new(0, 0, 0)).await?;
+        let nodes = self.snapshot.nodes(&self.volume);
+        let mut cursor =
+            Cursor::ceiling(&nodes, self.snapshot.root_tree, Key::new(0, 0, 0)).await?;
         let mut previous: Option<(u64, u64)> = None;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
-            if key.item_type == item_type::ROOT_ITEM
-                && (key.objectid == objectid::FS_TREE
-                    || (objectid::FIRST_FREE..=objectid::LAST_FREE).contains(&key.objectid))
-            {
+            if key.item_type == item_type::ROOT_ITEM && is_subvolume(key.objectid) {
                 let record = RootRecord::parse(key, item, self.volume.superblock().sectorsize())
                     .map_err(|defect| Error::Item {
-                        tree: self.root_tree.tree,
+                        tree: self.snapshot.root_tree.tree,
                         key,
                         defect,
                     })?;
@@ -196,7 +551,7 @@ impl<S: BlockSource> Filesystem<S> {
                 }
                 previous = Some((key.objectid, record.root_dirid));
             }
-            cursor.advance(&self.volume).await?;
+            cursor.advance(&nodes).await?;
         }
         if let Some((tree, root_inode)) = previous {
             visit(tree, root_inode);
@@ -204,24 +559,151 @@ impl<S: BlockSource> Filesystem<S> {
         Ok(())
     }
 
+    /// Returns a node reader and tree root for subvolume `tree`, used by
+    /// `send` to inspect extent layouts cleanly on an immutable view.
+    #[cfg(feature = "write")]
+    pub(crate) async fn subvolume_tree_reader(
+        &self,
+        tree: u64,
+    ) -> Result<(&Volume<S>, Nodes<'_, S>, TreeRoot), Error> {
+        let nodes = self.snapshot.nodes(&self.volume);
+        let record = self.snapshot.find_root(&nodes, tree).await?;
+        Ok((&self.volume, nodes, record.root))
+    }
+
+    /// Reads the quota status and qgroup list from this immutable view.
+    #[cfg(feature = "write")]
+    pub async fn quota_info(
+        &self,
+    ) -> Result<
+        (
+            helios_hal::fs_management::QuotaStatus,
+            Vec<helios_hal::fs_management::QgroupInfo>,
+        ),
+        Error,
+    > {
+        crate::qgroup::QuotaTree::inspect(&self.volume, self.snapshot.root_tree).await
+    }
+
+    /// Reads `DEV_ITEM` records from this view's chunk tree.
+    #[cfg(feature = "write")]
+    pub async fn devices(&self) -> Result<Vec<helios_hal::fs_management::VolumeDeviceInfo>, Error> {
+        let chunk = self.volume.superblock().chunk_tree();
+        let root = TreeRoot {
+            tree: objectid::CHUNK_TREE,
+            bytenr: chunk.bytenr,
+            level: chunk.level,
+            generation: chunk.generation,
+        };
+        let nodes = self.snapshot.nodes(&self.volume);
+        let mut cursor = Cursor::ceiling(
+            &nodes,
+            root,
+            Key::new(objectid::DEV_ITEMS, item_type::DEV_ITEM, 0),
+        )
+        .await?;
+        let mut out = Vec::new();
+        while let (Some(key), Some(bytes)) = (cursor.key(), cursor.item()) {
+            if !key.is(objectid::DEV_ITEMS, item_type::DEV_ITEM) {
+                break;
+            }
+            if let Some(raw) = crate::ondisk::view::<crate::ondisk::RawDevItem>(bytes) {
+                out.push(helios_hal::fs_management::VolumeDeviceInfo {
+                    devid: key.offset,
+                    uuid: raw.uuid,
+                    total_bytes: raw.total_bytes.get(),
+                    bytes_used: raw.bytes_used.get(),
+                    serial: None,
+                });
+            }
+            cursor.advance(&nodes).await?;
+        }
+        Ok(out)
+    }
+
     /// The root directory of the default subvolume.
     pub async fn root(&self) -> Result<Inode, Error> {
         self.load_inode(
-            self.default_subvolume.root,
-            self.default_subvolume.root_dirid,
+            self.snapshot.default_subvolume.root,
+            self.snapshot.default_subvolume.root_dirid,
+            &self.snapshot,
         )
         .await
     }
 
     /// The root directory of subvolume `tree`.
     pub async fn subvolume_root(&self, tree: u64) -> Result<Inode, Error> {
-        let record = find_root(&self.volume, self.root_tree, tree).await?;
-        self.load_inode(record.root, record.root_dirid).await
+        let nodes = self.snapshot.nodes(&self.volume);
+        let record = self.snapshot.find_root(&nodes, tree).await?;
+        self.load_inode(record.root, record.root_dirid, &self.snapshot)
+            .await
     }
 
-    async fn load_inode(&self, root: TreeRoot, number: u64) -> Result<Inode, Error> {
+    /// Inode `number` of subvolume `tree`, as of this view. For a caller
+    /// that holds an inode's identity across views and needs its current
+    /// state, such as a network or FUSE server.
+    pub async fn inode(&self, tree: u64, number: u64) -> Result<Inode, Error> {
+        if !is_subvolume(tree) {
+            return Err(Error::MissingRoot { tree });
+        }
+        let nodes = self.snapshot.nodes(&self.volume);
+        let record = self.snapshot.find_root(&nodes, tree).await?;
+        self.load_inode(record.root, number, &self.snapshot).await
+    }
+
+    /// The parent directory of `dir`, or `None` when `dir` is the mount's root
+    /// directory or has no parent reference.
+    pub async fn parent(&self, dir: &Inode) -> Result<Option<Inode>, Error> {
+        dir.expect_kind(FileKind::Directory)?;
+        let default_root = dir.snapshot.default_subvolume;
+        if dir.root.tree == default_root.root.tree && dir.number == default_root.root_dirid {
+            return Ok(None);
+        }
+        let nodes = dir.snapshot.nodes(&self.volume);
+        let key = Key::new(dir.number, item_type::INODE_REF, 0);
+        let cursor = Cursor::ceiling(&nodes, dir.root, key).await?;
+        let Some(found) = cursor
+            .key()
+            .filter(|k| k.is(dir.number, item_type::INODE_REF))
+        else {
+            return Ok(None);
+        };
+        if found.offset != dir.number {
+            return self
+                .load_inode(dir.root, found.offset, &dir.snapshot)
+                .await
+                .map(Some);
+        }
+        // A subvolume root's `INODE_REF` points to itself; its parent lives in
+        // the root tree's `ROOT_BACKREF` item.
+        let backref_key = Key::new(dir.root.tree, item_type::ROOT_BACKREF, 0);
+        let cursor = Cursor::ceiling(&nodes, dir.snapshot.root_tree, backref_key).await?;
+        let (Some(found), Some(item)) = (cursor.key(), cursor.item()) else {
+            return Ok(None);
+        };
+        if !found.is(dir.root.tree, item_type::ROOT_BACKREF) {
+            return Ok(None);
+        }
+        let parent_inode = root_backref_dirid(item).map_err(|defect| Error::Item {
+            tree: dir.snapshot.root_tree.tree,
+            key: found,
+            defect,
+        })?;
+        let record = dir.snapshot.find_root(&nodes, found.offset).await?;
+        self.load_inode(record.root, parent_inode, &dir.snapshot)
+            .await
+            .map(Some)
+    }
+
+    async fn load_inode(
+        &self,
+        root: TreeRoot,
+        number: u64,
+        snapshot: &Arc<Snapshot>,
+    ) -> Result<Inode, Error> {
+        let nodes = snapshot.nodes(&self.volume);
         let key = Key::new(number, item_type::INODE_ITEM, 0);
-        let cursor = Cursor::ceiling(&self.volume, root, key).await?;
+        let cursor = Cursor::ceiling(&nodes, root, key).await?;
         let (Some(found), Some(item)) = (cursor.key(), cursor.item()) else {
             return Err(Error::MissingInode {
                 tree: root.tree,
@@ -234,12 +716,23 @@ impl<S: BlockSource> Filesystem<S> {
                 inode: number,
             });
         }
-        let metadata = Metadata::parse(item).map_err(|defect| Error::Item {
+        #[cfg_attr(
+            not(feature = "write"),
+            expect(unused_mut, reason = "only writable views hold delalloc bytes")
+        )]
+        let mut metadata = Metadata::parse(item).map_err(|defect| Error::Item {
             tree: root.tree,
             key,
             defect,
         })?;
+        #[cfg(feature = "write")]
+        if let Some(running) = &snapshot.running {
+            metadata.nbytes = metadata
+                .nbytes
+                .saturating_add(running.dirty.unbacked_file_bytes(root.tree, number));
+        }
         Ok(Inode {
+            snapshot: snapshot.clone(),
             root,
             number,
             metadata,
@@ -248,8 +741,13 @@ impl<S: BlockSource> Filesystem<S> {
 
     async fn open_target(&self, dir: &Inode, target: EntryTarget) -> Result<Inode, Error> {
         match target {
-            EntryTarget::Inode(number) => self.load_inode(dir.root, number).await,
-            EntryTarget::Subvolume(tree) => self.subvolume_root(tree).await,
+            EntryTarget::Inode(number) => self.load_inode(dir.root, number, &dir.snapshot).await,
+            EntryTarget::Subvolume(tree) => {
+                let nodes = dir.snapshot.nodes(&self.volume);
+                let record = dir.snapshot.find_root(&nodes, tree).await?;
+                self.load_inode(record.root, record.root_dirid, &dir.snapshot)
+                    .await
+            }
         }
     }
 
@@ -261,13 +759,14 @@ impl<S: BlockSource> Filesystem<S> {
     /// Looks `name` up in directory `dir`. `None` when no entry has that
     /// name; `.` and `..` are not stored and are never found.
     pub async fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Option<Inode>, Error> {
+        let nodes = dir.snapshot.nodes(&self.volume);
         dir.expect_kind(FileKind::Directory)?;
         if name.is_empty() || name.len() > NAME_MAX {
             return Ok(None);
         }
         let key = Key::new(dir.number, item_type::DIR_ITEM, name_hash(name));
         let target = {
-            let cursor = Cursor::ceiling(&self.volume, dir.root, key).await?;
+            let cursor = Cursor::ceiling(&nodes, dir.root, key).await?;
             find_record(&cursor, key, name, RecordKind::Entry)?.map(|record| record.target())
         };
         match target {
@@ -276,26 +775,67 @@ impl<S: BlockSource> Filesystem<S> {
         }
     }
 
-    /// Lists directory `dir` from `from`, handing each entry to `visit`.
+    /// The highest `DIR_INDEX` currently in directory `dir`, or
+    /// [`DirBound::EMPTY`] when `dir` holds no entries.
+    ///
+    /// Follows Linux's `btrfs_opendir` / `btrfs_get_dir_last_index`
+    /// (`fs/btrfs/inode.c`, commit `9b378f6ad48c`): callers opening a
+    /// directory stream capture this bound and pass it to
+    /// [`Filesystem::read_dir`] so entries inserted or renamed to higher
+    /// indices during iteration do not repeat indefinitely.
+    pub async fn dir_bound(&self, dir: &Inode) -> Result<DirBound, Error> {
+        let nodes = dir.snapshot.nodes(&self.volume);
+        dir.expect_kind(FileKind::Directory)?;
+        let cursor = Cursor::floor(
+            &nodes,
+            dir.root,
+            Key::new(dir.number, item_type::DIR_INDEX, u64::MAX),
+        )
+        .await?;
+        match cursor.key() {
+            Some(key) if key.is(dir.number, item_type::DIR_INDEX) => {
+                Ok(DirBound::at(DirPosition(key.offset)))
+            }
+            _ => Ok(DirBound::EMPTY),
+        }
+    }
+
+    /// Lists directory `dir` from `from` up to `bound` (inclusive), handing
+    /// each entry to `visit`.
+    ///
+    /// Pass the [`DirBound`] captured by [`Filesystem::dir_bound`] when the
+    /// directory stream opened so entries inserted or renamed to higher
+    /// `DIR_INDEX` offsets during iteration are not visited (`btrfs_opendir`
+    /// and `btrfs_real_readdir` in Linux `fs/btrfs/inode.c`, commit
+    /// `9b378f6ad48c`), or [`DirBound::UNBOUNDED`] for a one-shot listing of
+    /// an immutable view.
     ///
     /// `visit` returns [`ControlFlow::Continue`] to take the entry and go
     /// on, or [`ControlFlow::Break`] to stop without taking it. Returns the
     /// position to resume from when `visit` stopped the listing, `None`
-    /// once every entry has been visited.
+    /// once every entry up to `bound` has been visited.
     pub async fn read_dir<F>(
         &self,
         dir: &Inode,
         from: DirPosition,
+        bound: DirBound,
         mut visit: F,
     ) -> Result<Option<DirPosition>, Error>
     where
         F: FnMut(DirEntry<'_>) -> ControlFlow<()>,
     {
         dir.expect_kind(FileKind::Directory)?;
+        let Some(last) = bound.0 else {
+            return Ok(None);
+        };
+        if from > last {
+            return Ok(None);
+        }
+        let nodes = dir.snapshot.nodes(&self.volume);
         let start = Key::new(dir.number, item_type::DIR_INDEX, from.0);
-        let mut cursor = Cursor::ceiling(&self.volume, dir.root, start).await?;
+        let mut cursor = Cursor::ceiling(&nodes, dir.root, start).await?;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
-            if !key.is(dir.number, item_type::DIR_INDEX) {
+            if !key.is(dir.number, item_type::DIR_INDEX) || key.offset > last.0 {
                 break;
             }
             let record = dir_index_record(item).map_err(|defect| Error::Item {
@@ -312,7 +852,7 @@ impl<S: BlockSource> Filesystem<S> {
             if visit(entry).is_break() {
                 return Ok(Some(DirPosition(key.offset)));
             }
-            cursor.advance(&self.volume).await?;
+            cursor.advance(&nodes).await?;
         }
         Ok(None)
     }
@@ -322,6 +862,25 @@ impl<S: BlockSource> Filesystem<S> {
     pub async fn read(&self, file: &Inode, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
         file.expect_kind(FileKind::Regular)?;
         self.read_range(file, offset, buf).await
+    }
+
+    /// The file extents of `file`, in file-offset order, as stored.
+    ///
+    /// A test inspection API: it exposes the on-disk layout (extent kind and
+    /// compression) that reads deliberately hide.
+    #[cfg(any(all(test, feature = "write"), feature = "test-support"))]
+    pub async fn file_extents(&self, file: &Inode) -> Result<Vec<ExtentInfo>, Error> {
+        file.expect_kind(FileKind::Regular)?;
+        let nodes = file.snapshot.nodes(&self.volume);
+        crate::data::Reader::new(&nodes.volume, &nodes, file.snapshot.csum_tree)
+            .extents(crate::data::File {
+                root: file.root,
+                number: file.number,
+                metadata: &file.metadata,
+                #[cfg(feature = "write")]
+                dirty: None,
+            })
+            .await
     }
 
     /// Reads the target of symlink `link` into `buf`. Returns the target's
@@ -351,11 +910,12 @@ impl<S: BlockSource> Filesystem<S> {
         name: &[u8],
         buf: &mut [u8],
     ) -> Result<Option<usize>, Error> {
+        let nodes = inode.snapshot.nodes(&self.volume);
         if name.is_empty() || name.len() > NAME_MAX {
             return Ok(None);
         }
         let key = Key::new(inode.number, item_type::XATTR_ITEM, name_hash(name));
-        let cursor = Cursor::ceiling(&self.volume, inode.root, key).await?;
+        let cursor = Cursor::ceiling(&nodes, inode.root, key).await?;
         let Some(record) = find_record(&cursor, key, name, RecordKind::Xattr)? else {
             return Ok(None);
         };
@@ -370,8 +930,9 @@ impl<S: BlockSource> Filesystem<S> {
     where
         F: FnMut(&[u8]) -> ControlFlow<()>,
     {
+        let nodes = inode.snapshot.nodes(&self.volume);
         let start = Key::new(inode.number, item_type::XATTR_ITEM, 0);
-        let mut cursor = Cursor::ceiling(&self.volume, inode.root, start).await?;
+        let mut cursor = Cursor::ceiling(&nodes, inode.root, start).await?;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
             if !key.is(inode.number, item_type::XATTR_ITEM) {
                 break;
@@ -386,7 +947,7 @@ impl<S: BlockSource> Filesystem<S> {
                     return Ok(());
                 }
             }
-            cursor.advance(&self.volume).await?;
+            cursor.advance(&nodes).await?;
         }
         Ok(())
     }
@@ -461,268 +1022,38 @@ impl<S: BlockSource> Filesystem<S> {
         Ok(current)
     }
 
-    /// The file bytes at `offset`, through the inode's extents.
     async fn read_range(&self, inode: &Inode, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
-        let size = inode.metadata.size;
-        if offset >= size || buf.is_empty() {
-            return Ok(0);
-        }
-        let len = (size - offset).min(buf.len() as u64) as usize;
-        let buf = &mut buf[..len];
-        let end = offset + len as u64;
-        let first_extent = Key::new(inode.number, item_type::EXTENT_DATA, 0);
-        let mut cursor = Cursor::floor(
-            &self.volume,
-            inode.root,
-            Key::new(inode.number, item_type::EXTENT_DATA, offset),
-        )
-        .await?;
-        let mut position = offset;
-        let mut previous_end = 0;
-        while position < end {
-            let (Some(key), Some(item)) = (cursor.key(), cursor.item()) else {
-                break;
-            };
-            if key < first_extent {
-                cursor.advance(&self.volume).await?;
-                continue;
-            }
-            if !key.is(inode.number, item_type::EXTENT_DATA) {
-                break;
-            }
-            let item_error = |defect| Error::Item {
-                tree: inode.root.tree,
-                key,
-                defect,
-            };
-            let extent =
-                FileExtent::parse(key, item, self.superblock().sectorsize()).map_err(item_error)?;
-            if extent.start < previous_end {
-                return Err(item_error(ItemDefect::ExtentOverlap(previous_end)));
-            }
-            previous_end = extent.end;
-            if extent.end > position {
-                if extent.start > position {
-                    // A hole the format leaves implicit.
-                    let gap_end = extent.start.min(end);
-                    buf[(position - offset) as usize..(gap_end - offset) as usize].fill(0);
-                    position = gap_end;
-                }
-                if position < end {
-                    let copy_end = extent.end.min(end);
-                    let out = &mut buf[(position - offset) as usize..(copy_end - offset) as usize];
-                    self.copy_extent(inode, &extent, position - extent.start, out)
-                        .await?;
-                    position = copy_end;
-                }
-            }
-            cursor.advance(&self.volume).await?;
-        }
-        // Past the last extent the file reads as zeroes up to its size.
-        buf[(position - offset) as usize..].fill(0);
-        Ok(len)
-    }
-
-    /// Copies the bytes of `extent` from `from`, relative to its start,
-    /// into `out`.
-    async fn copy_extent(
-        &self,
-        inode: &Inode,
-        extent: &FileExtent<'_>,
-        from: u64,
-        out: &mut [u8],
-    ) -> Result<(), Error> {
-        let sectorsize = self.superblock().sectorsize() as usize;
-        let decompress_error = |algorithm, defect| Error::Decompress {
-            algorithm,
-            tree: inode.root.tree,
-            inode: inode.number,
-            file_offset: extent.start,
-            defect,
-        };
-        match extent.data {
-            ExtentData::Zero => out.fill(0),
-            ExtentData::Inline {
-                data,
-                compression: None,
-            } => {
-                let from = from as usize;
-                out.copy_from_slice(&data[from..from + out.len()]);
-            }
-            ExtentData::Inline {
-                data,
-                compression: Some(algorithm),
-            } => {
-                // `FileExtent::parse` bounded this by the sector size.
-                let mut plain = vec![0_u8; extent.end as usize];
-                decompress(algorithm, data, &mut plain, sectorsize)
-                    .map_err(|defect| decompress_error(algorithm, defect))?;
-                let from = from as usize;
-                out.copy_from_slice(&plain[from..from + out.len()]);
-            }
-            ExtentData::Regular {
-                disk_bytenr,
+        let nodes = inode.snapshot.nodes(&self.volume);
+        crate::data::Reader::new(&nodes.volume, &nodes, inode.snapshot.csum_tree)
+            .read(
+                crate::data::File {
+                    root: inode.root,
+                    number: inode.number,
+                    metadata: &inode.metadata,
+                    #[cfg(feature = "write")]
+                    dirty: inode
+                        .snapshot
+                        .running
+                        .as_ref()
+                        .and_then(|running| running.dirty.file(inode.root.tree, inode.number)),
+                },
                 offset,
-                compression: None,
-                ..
-            } => {
-                self.read_data(disk_bytenr + offset + from, out, inode.is_checksummed())
-                    .await?;
-            }
-            ExtentData::Regular {
-                disk_bytenr,
-                disk_num_bytes,
-                offset,
-                ram_bytes,
-                compression: Some(algorithm),
-            } => {
-                // Both sizes were bounded by 128 KiB in `FileExtent::parse`.
-                let mut stored = vec![0_u8; disk_num_bytes as usize];
-                self.read_sectors(disk_bytenr, &mut stored, inode.is_checksummed())
-                    .await?;
-                let mut plain = vec![0_u8; ram_bytes as usize];
-                decompress(algorithm, &stored, &mut plain, sectorsize)
-                    .map_err(|defect| decompress_error(algorithm, defect))?;
-                let from = (offset + from) as usize;
-                out.copy_from_slice(&plain[from..from + out.len()]);
-            }
-        }
-        Ok(())
-    }
-
-    /// Reads data bytes at `logical`, which need not be sector aligned, in
-    /// windows of at most [`DATA_WINDOW`] bytes.
-    async fn read_data(
-        &self,
-        logical: u64,
-        out: &mut [u8],
-        checksummed: bool,
-    ) -> Result<(), Error> {
-        let sector = u64::from(self.superblock().sectorsize());
-        let mut window = Vec::new();
-        let mut done = 0;
-        while done < out.len() {
-            let at = logical + done as u64;
-            let window_start = at - at % sector;
-            let wanted_end = at + (out.len() - done) as u64;
-            let window_end = wanted_end
-                .next_multiple_of(sector)
-                .min(window_start + DATA_WINDOW);
-            window.resize((window_end - window_start) as usize, 0);
-            self.read_sectors(window_start, &mut window, checksummed)
-                .await?;
-            let skip = (at - window_start) as usize;
-            let count = (window.len() - skip).min(out.len() - done);
-            out[done..done + count].copy_from_slice(&window[skip..skip + count]);
-            done += count;
-        }
-        Ok(())
-    }
-
-    /// Reads whole sectors at `logical` and, for checksummed data, verifies
-    /// each against the checksum tree, falling back to the other copy of a
-    /// `dup` chunk when one fails.
-    async fn read_sectors(
-        &self,
-        logical: u64,
-        buf: &mut [u8],
-        checksummed: bool,
-    ) -> Result<(), Error> {
-        let sector = self.superblock().sectorsize() as usize;
-        let csum_type = self.superblock().csum_type();
-        let expected = if checksummed {
-            Some(self.lookup_checksums(logical, buf.len()).await?)
-        } else {
-            None
-        };
-        self.volume
-            .read_verified(logical, buf, |data| {
-                let Some(expected) = &expected else {
-                    return Ok(());
-                };
-                let size = csum_type.size();
-                for (index, (sector_data, stored)) in data
-                    .chunks_exact(sector)
-                    .zip(expected.chunks_exact(size))
-                    .enumerate()
-                {
-                    if !csum_type.verifies(sector_data, stored) {
-                        return Err(Error::DataChecksum {
-                            logical: logical + (index * sector) as u64,
-                        });
-                    }
-                }
-                Ok(())
-            })
+                buf,
+            )
             .await
     }
 
-    /// The stored checksum of every sector of `[logical, logical + len)`,
-    /// concatenated.
-    async fn lookup_checksums(&self, logical: u64, len: usize) -> Result<Vec<u8>, Error> {
-        let sector = u64::from(self.superblock().sectorsize());
-        let size = self.superblock().csum_type().size();
-        let sectors = len / sector as usize;
-        let mut sums = vec![0_u8; sectors * size];
-        let mut filled = 0;
-        let first = Key::new(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM, 0);
-        let mut cursor = Cursor::floor(
-            &self.volume,
-            self.csum_tree,
-            Key::new(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM, logical),
-        )
-        .await?;
-        while filled < sectors {
-            let (Some(key), Some(item)) = (cursor.key(), cursor.item()) else {
-                break;
-            };
-            if key < first {
-                cursor.advance(&self.volume).await?;
-                continue;
-            }
-            if !key.is(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM) {
-                break;
-            }
-            let item_error = |defect| Error::Item {
-                tree: cursor.tree(),
-                key,
-                defect,
-            };
-            if item.len() % size != 0 {
-                return Err(item_error(ItemDefect::ChecksumItem(item.len())));
-            }
-            if !key.offset.is_multiple_of(sector) {
-                return Err(item_error(ItemDefect::Unaligned {
-                    field: "checksum start",
-                    value: key.offset,
-                }));
-            }
-            let item_sectors = (item.len() / size) as u64;
-            let item_end = key
-                .offset
-                .checked_add(item_sectors * sector)
-                .ok_or(item_error(ItemDefect::ExtentOverflow))?;
-            let wanted = logical + filled as u64 * sector;
-            if item_end <= wanted {
-                cursor.advance(&self.volume).await?;
-                continue;
-            }
-            if key.offset > wanted {
-                break;
-            }
-            let skip = ((wanted - key.offset) / sector) as usize;
-            let count = (item_sectors as usize - skip).min(sectors - filled);
-            sums[filled * size..(filled + count) * size]
-                .copy_from_slice(&item[skip * size..(skip + count) * size]);
-            filled += count;
-            cursor.advance(&self.volume).await?;
-        }
-        if filled < sectors {
-            return Err(Error::MissingDataChecksum {
-                logical: logical + filled as u64 * sector,
-            });
-        }
-        Ok(sums)
+    #[cfg(all(test, feature = "write"))]
+    async fn lookup_checksums(
+        &self,
+        snapshot: &Arc<Snapshot>,
+        logical: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let nodes = snapshot.nodes(&self.volume);
+        crate::data::Reader::new(&nodes.volume, &nodes, snapshot.csum_tree)
+            .lookup_checksums(logical, len)
+            .await
     }
 }
 
@@ -757,6 +1088,7 @@ fn find_record<'a>(
 async fn read_chunk_tree<S: BlockSource>(
     volume: &Volume<S>,
     root: TreeRoot,
+    device_sizes: &[(u64, u64)],
 ) -> Result<ChunkMap, Error> {
     let mut chunks = ChunkMap::default();
     let start = Key::new(objectid::FIRST_CHUNK_TREE, item_type::CHUNK_ITEM, 0);
@@ -765,14 +1097,14 @@ async fn read_chunk_tree<S: BlockSource>(
         if !key.is(objectid::FIRST_CHUNK_TREE, item_type::CHUNK_ITEM) {
             break;
         }
-        chunks.insert_item(key, item, volume.superblock())?;
+        chunks.insert_item(key, item, volume.superblock(), device_sizes)?;
         cursor.advance(volume).await?;
     }
     Ok(chunks)
 }
 
 /// The newest root item of tree `tree`.
-async fn find_root<S: BlockSource>(
+pub(crate) async fn find_root<S: BlockSource>(
     volume: &Volume<S>,
     root_tree: TreeRoot,
     tree: u64,
@@ -813,9 +1145,7 @@ async fn default_subvolume<S: BlockSource>(
         Some(record) => record.location.objectid,
         None => objectid::FS_TREE,
     };
-    let is_subvolume =
-        tree == objectid::FS_TREE || (objectid::FIRST_FREE..=objectid::LAST_FREE).contains(&tree);
-    if !is_subvolume {
+    if !is_subvolume(tree) {
         return Err(Error::Item {
             tree: objectid::ROOT_TREE,
             key,
@@ -824,3 +1154,17 @@ async fn default_subvolume<S: BlockSource>(
     }
     Ok(tree)
 }
+
+/// Whether `tree` is a subvolume tree id (`FS_TREE` or a free objectid).
+pub(crate) fn is_subvolume(tree: u64) -> bool {
+    tree == objectid::FS_TREE || (objectid::FIRST_FREE..=objectid::LAST_FREE).contains(&tree)
+}
+
+#[cfg(all(test, feature = "write"))]
+mod inline_tests;
+#[cfg(all(test, feature = "write"))]
+mod rename_tests;
+#[cfg(all(test, feature = "write"))]
+mod replay_tests;
+#[cfg(all(test, feature = "write"))]
+mod write_tests;

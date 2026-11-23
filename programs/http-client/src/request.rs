@@ -45,6 +45,16 @@ impl BodyOutcome {
     pub fn failure(&self) -> Option<ErrorCode> {
         self.failure.get().cloned()
     }
+
+    #[cfg(test)]
+    pub fn record_sent(&self, bytes: u64) {
+        self.sent.store(bytes, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn record_failure(&self, code: ErrorCode) {
+        let _ = self.failure.set(code);
+    }
 }
 
 /// The caller's body stream reported a failure instead of its trailers.

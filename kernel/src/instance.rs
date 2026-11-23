@@ -768,6 +768,13 @@ impl InstanceRegistry {
         })
     }
 
+    /// How many instances are registered. Unlike [`Self::snapshot`] it
+    /// leaves the sampling window of the processor-time statistics alone,
+    /// so any caller may ask.
+    pub fn count(&self) -> usize {
+        self.inner.entries.lock().len()
+    }
+
     pub fn snapshot(&self, now_nanos: u64) -> Vec<InstanceSnapshot> {
         let entries = self.inner.entries.lock();
         let mut sampling = self.inner.sampling.lock();
@@ -1044,6 +1051,22 @@ impl RegisteredInstance {
     /// the guest's next interrupt check.
     pub fn pending_kill(&self) -> Option<KillReason> {
         decode_kill_flag(self.entry().kill_flag.load(Ordering::Acquire))
+    }
+
+    /// Arm a wait for this instance's condemnation.
+    ///
+    /// The wait completes on a condemnation raised from this point on,
+    /// so a caller arms it before it reads [`Self::pending_kill`] and
+    /// cannot lose a kill that lands between the read and the park.
+    pub fn arm_kill_wait(&self) -> NotifyWaiter {
+        self.entry().condemned.waiter()
+    }
+
+    /// Poll a wait armed by [`Self::arm_kill_wait`]. `Ready` means the
+    /// instance may have been condemned since the wait was armed, and
+    /// re-arms the wait; the caller reads [`Self::pending_kill`] again.
+    pub fn poll_kill_wait(&self, cx: &mut Context<'_>, wait: &mut NotifyWaiter) -> Poll<()> {
+        self.entry().condemned.poll_notified(cx, wait)
     }
 }
 
@@ -1413,20 +1436,14 @@ impl StoreTurns {
         self.instance.pending_kill()
     }
 
-    /// Arm a wait for this instance's condemnation.
-    ///
-    /// The wait completes on a condemnation raised from this point on,
-    /// so a caller arms it before it reads [`Self::pending_kill`] and
-    /// cannot lose a kill that lands between the read and the park.
+    /// See [`RegisteredInstance::arm_kill_wait`].
     pub fn arm_kill_wait(&self) -> NotifyWaiter {
-        self.instance.entry().condemned.waiter()
+        self.instance.arm_kill_wait()
     }
 
-    /// Poll a wait armed by [`Self::arm_kill_wait`]. `Ready` means the
-    /// instance may have been condemned since the wait was armed, and
-    /// re-arms the wait; the caller reads [`Self::pending_kill`] again.
+    /// See [`RegisteredInstance::poll_kill_wait`].
     pub fn poll_kill_wait(&self, cx: &mut Context<'_>, wait: &mut NotifyWaiter) -> Poll<()> {
-        self.instance.entry().condemned.poll_notified(cx, wait)
+        self.instance.poll_kill_wait(cx, wait)
     }
 
     /// Put the store on the executing processor as of `now_nanos`.

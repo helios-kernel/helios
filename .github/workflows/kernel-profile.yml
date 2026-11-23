@@ -72,6 +72,12 @@ jobs:
           checkout-path: ${{ env.CHECKOUT_PATH }}
           network-tools: "true"
           bench-tooling: "true"
+      # Read from the shared tools, since the profiled checkout may predate
+      # the action; the binary is that checkout's own commit.
+      - uses: ./profile-tooling/.github/actions/helios-cli
+        with:
+          profile: release
+          root: ${{ env.CHECKOUT_PATH }}
       - uses: ./profile-tooling/.github/actions/collect-kernel-profile
         with:
           checkout-path: ${{ env.CHECKOUT_PATH }}

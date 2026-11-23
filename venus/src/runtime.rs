@@ -36,6 +36,8 @@ pub enum DecodeError {
     Truncated { needed: usize, available: usize },
     #[error("the reply has an array of {found} elements where {expected} are expected")]
     ArraySize { expected: u64, found: u64 },
+    #[error("the reply has {found} array elements but the caller provided capacity {capacity}")]
+    ArrayCapacity { capacity: u64, found: u64 },
     #[error("member {member} is not serializable but the reply carries it")]
     NotSerializable { member: &'static str },
     #[error("the reply has a struct with sType {found}, expected {expected}")]

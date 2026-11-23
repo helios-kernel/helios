@@ -340,13 +340,13 @@ impl Drop for ReturnedSurface {
 }
 
 /// One `create` the kernel forwards to the compositor.
-pub struct SurfaceCreate {
+pub struct SurfaceCreate<Backing = Buffer> {
     pub id: SurfaceId,
     pub geometry: SurfaceGeometry,
     /// The client's frame buffer, which the supervisor shows a second
     /// time at the span of the compositor's own memory the compositor
     /// answers with.
-    pub buffer: Buffer,
+    pub buffer: Backing,
     pub reply: oneshot::Sender<Result<(), SurfaceServiceError>>,
 }
 
@@ -354,6 +354,13 @@ pub struct SurfaceCreate {
 pub enum SurfaceRequest {
     /// A client asked for a window.
     Create(SurfaceCreate),
+    CreateImage(SurfaceCreate<()>),
+    PresentImage {
+        id: SurfaceId,
+        image: crate::gpu::GpuImage,
+        retired: crate::TimelineSource,
+        reply: oneshot::Sender<Result<(), SurfaceServiceError>>,
+    },
     /// A client published the pixels in a region of one.
     Commit {
         id: SurfaceId,

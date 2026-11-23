@@ -6,7 +6,7 @@ Two comparisons, and the difference between them is the whole point:
   report — two images timed on one host, in one job, minutes apart. There
   is no change of machine between the columns, so the comparison is
   enforced whether or not the report is publishable.
-- **Cross-run.** The candidate against the newest `dev` report of the
+- **Cross-run.** The candidate against the newest `main` report of the
   same lane, taken in another job on another runner. A shared runner does
   not pin the CPU model, so this one is only as good as the machines
   happened to be alike: it enforces when both reports are publishable
@@ -260,7 +260,7 @@ def cross_run_sampling_mismatch(baseline: Report, candidate: Report) -> Sampling
 
 GATE_TITLES = {
     GateKind.PAIRED: "Paired, one host, one job",
-    GateKind.CROSS_RUN: "Cross-run, against the latest `dev` report",
+    GateKind.CROSS_RUN: "Cross-run, against the latest `main` report",
 }
 
 
@@ -516,7 +516,7 @@ class GateReport:
 
     paired: GateResult | None
     cross_run: GateResult | None
-    #: Set, with `cross_run` None, when the latest `dev` report and the
+    #: Set, with `cross_run` None, when the latest `main` report and the
     #: candidate were sampled differently: the cross-run comparison is
     #: refused and neither blocks nor passes, while the paired one stands.
     cross_run_refused: SamplingMismatch | None = None
@@ -1160,8 +1160,8 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
 def gate_report(candidate: Report, baseline: Report | None) -> GateReport:
     """Both comparisons the candidate can take part in.
 
-    A `dev` report sampled differently from the candidate — the candidate
-    asked for an instruction profile and `dev`'s run did not, or the other
+    A `main` report sampled differently from the candidate — the candidate
+    asked for an instruction profile and `main`'s run did not, or the other
     way round — refuses the cross-run comparison and leaves the paired
     one, whose columns the driver sampled alike, standing.
     """

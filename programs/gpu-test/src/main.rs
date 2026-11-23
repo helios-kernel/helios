@@ -27,9 +27,15 @@
 //! blob create naming the same id.
 
 use std::env;
+mod timeline;
+mod venus;
 
-use helios_api::gpu::{BlobMemory, BlobUsage, CapsetInfo, Context, Gpu, GpuError};
-use helios_api::programs::{Child, DeviceClass, SpawnError, SpawnRequest, device_grant};
+use helios_api::bindings::wasi::clocks::monotonic_clock;
+use helios_api::gpu::{BlobMemory, BlobUsage, CapsetInfo, Completion, Context, Gpu, GpuError};
+use helios_api::programs::{
+    Child, ChildTermination, DeviceClass, SpawnError, SpawnRequest, device_grant,
+};
+use helios_api::sync::{SignalSource, wait_all};
 use helios_api::wit_bindgen::StreamReader;
 use thiserror::Error;
 
@@ -67,6 +73,10 @@ const CHILD_DONE: &str = "gpu-test:child fence=1";
 
 #[derive(Debug, Error)]
 enum GpuTestError {
+    #[error(transparent)]
+    Venus(#[from] venus::Error),
+    #[error(transparent)]
+    Timeline(#[from] timeline::Error),
     #[error("the 3D engine refused: {0}")]
     Gpu(#[from] GpuError),
     #[error("usage: gpu-test [--expect-renderer] [--child]; `{0}` is not an option")]
@@ -88,8 +98,8 @@ enum GpuTestError {
     NoGuestPages,
     #[error("the second instance could not be started: {0:?}")]
     Spawn(SpawnError),
-    #[error("the second instance exited {code} without retiring its fence")]
-    Child { code: u32 },
+    #[error("the second instance {termination} without retiring its fence")]
+    Child { termination: ChildTermination },
 }
 
 /// What this run was asked to do.
@@ -120,6 +130,7 @@ impl Options {
 #[helios_api::main]
 async fn main() -> Result<(), GpuTestError> {
     let options = Options::parse()?;
+    timeline::run().await?;
     let gpu = match Gpu::open() {
         Ok(gpu) => gpu,
         Err(error @ (GpuError::NoRenderer | GpuError::Unavailable)) => {
@@ -154,6 +165,12 @@ async fn main() -> Result<(), GpuTestError> {
     host_blob(&gpu, &context).await?;
     guest_blob(&gpu, &context).await?;
     second_instance().await?;
+    if capsets
+        .iter()
+        .any(|info| info.id == helios_venus::capset::ID)
+    {
+        venus::run().await?;
+    }
     Ok(())
 }
 
@@ -187,10 +204,32 @@ async fn fences_on_every_ring(context: &Context) -> Result<(), GpuTestError> {
         streams.push(context.fences(ring)?);
     }
     for ring in 0..RINGS {
+        let source = SignalSource::new(0);
+        let reader = source.reader();
+        let signals = [source.point(FENCE)];
         context
-            .submit(&buffer, 0, span.length, ring, Some(FENCE))
+            .submit(
+                &buffer,
+                0,
+                span.length,
+                ring,
+                Some(Completion {
+                    fence: FENCE,
+                    signals: &signals,
+                }),
+            )
             .await?;
+        drop(source);
+        // Bound completion waiting by the smoke operation's five-second budget.
+        let deadline = monotonic_clock::now() + 5_000_000_000;
+        if !wait_all(&[reader.point(FENCE)], Some(deadline))
+            .await
+            .map_err(timeline::Error::from)?
+        {
+            return Err(timeline::Error::Contract("GPU completion before its deadline").into());
+        }
         println!("gpu-test:submit ring={ring} fence={FENCE}");
+        println!("gpu-test:shared-gpu-timeline ring={ring} value={FENCE}");
     }
     for (ring, stream) in (0..RINGS).zip(&mut streams) {
         let fence = retired(stream, ring, FENCE).await?;
@@ -352,8 +391,12 @@ async fn second_instance() -> Result<(), GpuTestError> {
     let status = child.wait().await.map_err(GpuTestError::Spawn)?;
     let output = String::from_utf8_lossy(&output);
     print!("{output}");
-    if status.code != 0 || !output.lines().any(|line| line == CHILD_DONE) {
-        return Err(GpuTestError::Child { code: status.code });
+    if status.termination != ChildTermination::Exited(0)
+        || !output.lines().any(|line| line == CHILD_DONE)
+    {
+        return Err(GpuTestError::Child {
+            termination: status.termination,
+        });
     }
     println!("gpu-test:instances=2");
     Ok(())
@@ -368,7 +411,18 @@ async fn child(gpu: &Gpu) -> Result<(), GpuTestError> {
     let length = buffer.span().length;
     buffer.bytes().fill(0);
     let mut fences = context.fences(0)?;
-    context.submit(&buffer, 0, length, 0, Some(FENCE)).await?;
+    context
+        .submit(
+            &buffer,
+            0,
+            length,
+            0,
+            Some(Completion {
+                fence: FENCE,
+                signals: &[],
+            }),
+        )
+        .await?;
     retired(&mut fences, 0, FENCE).await?;
     println!("{CHILD_DONE}");
     Ok(())

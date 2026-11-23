@@ -249,9 +249,21 @@ interface programs {
     launch-nanos: u64,
   }
 
+  record signal-termination {
+    signal: u8,
+    core-dumped: bool,
+  }
+
+  variant child-termination {
+    exited(u32),
+    signaled(signal-termination),
+    trapped,
+    killed,
+  }
+
   record exit-status {
     instance-id: instance-id,
-    code: u32,
+    termination: child-termination,
   }
 
   enum spawn-error-kind {
@@ -280,6 +292,96 @@ interface programs {
   type exec-error-kind = spawn-error-kind;
   type exec-error = spawn-error;
 
+  /// Whether a container mount belongs exclusively to one container or may be
+  /// shared with other containers and WASI programs. Must match the backing
+  /// mount's sharing kind (`helios:system/mounts.mount-sharing`), which never
+  /// changes while the mount exists.
+  enum container-mount-sharing {
+    /// Belongs exclusively to this container, which sees stored Unix ownership,
+    /// modes, set-id bits and file capabilities within the mount's rights.
+    private,
+    /// Shared across containers and WASI programs; every node appears owned by
+    /// the container's shared-mount identity, modes follow the mount's rights,
+    /// and the mount is nosuid and nodev with file capabilities ignored.
+    shared,
+  }
+
+  /// One filesystem mount inside a Linux container.
+  record container-mount {
+    /// Directory path in the caller's namespace and authority to mount.
+    source-path: string,
+    /// Normalized absolute mount point inside the container (`"/"` for the
+    /// container's root, or a normalized path below `"/"`).
+    target-path: string,
+    /// Rights granted to the container on this mount. Must be a subset of the
+    /// caller's rights for `source-path` and bounded by the backing mount.
+    rights: list<filesystem-right>,
+    /// Whether this mount is private to the container or shared.
+    sharing: container-mount-sharing,
+  }
+
+  /// Owner and group IDs presented for every node on a shared mount inside
+  /// a container.
+  record container-identity {
+    uid: u32,
+    gid: u32,
+  }
+
+  /// Linux credentials a process starts with inside a container.
+  record container-credentials {
+    uid: u32,
+    gid: u32,
+    supplementary-groups: list<u32>,
+  }
+
+  /// Configuration of a new Linux container, bounded by the authority its
+  /// `capability-grants` derive from the caller.
+  record container-config {
+    /// Container root mount (`target-path` must be `"/"`).
+    root: container-mount,
+    /// Additional mounts inside the container (`target-path` below `"/"`).
+    mounts: list<container-mount>,
+    /// Owner and group presented on every shared mount in this container.
+    shared-owner: container-identity,
+    /// Default credentials for processes started in this container.
+    credentials: container-credentials,
+    /// Initial UTS hostname (`uname().nodename`). Empty uses Linux's `"(none)"`.
+    hostname: string,
+    /// Initial UTS domain name (`uname().domainname`). Empty uses Linux's `"(none)"`.
+    domainname: string,
+    /// Non-filesystem capabilities granted to the container, derived as a
+    /// subset of the caller's authority. Directory grants are refused here;
+    /// filesystem authority comes solely from `root` and `mounts`.
+    capability-grants: list<capability-grant>,
+  }
+
+  record container-spawn-request {
+    /// Name the process is launched under (`argv[0]`).
+    name: string,
+    /// Argument vector (`argv[1..]`).
+    args: list<string>,
+    /// Environment variables.
+    env: list<tuple<string, string>>,
+    /// Path to a Linux executable inside the container's filesystem.
+    path: string,
+    /// Optional credentials override for this process; defaults to the
+    /// container's configured credentials.
+    credentials: option<container-credentials>,
+  }
+
+  record container-exec-request {
+    /// Name the process is launched under (`argv[0]`).
+    name: string,
+    args: list<string>,
+    env: list<tuple<string, string>>,
+    /// Path to a Linux executable inside the container's filesystem.
+    path: string,
+    stdin: list<u8>,
+    /// Optional credentials override for this process; defaults to the
+    /// container's configured credentials.
+    credentials: option<container-credentials>,
+  }
+
   /// Handle to a running child program. Each stream accessor may be
   /// called at most once; subsequent calls return empty streams.
   /// Dropping the handle before `wait` completes terminates the child.
@@ -297,6 +399,21 @@ interface programs {
     /// Await child completion and return its exit status.
     wait: async func() -> result<exit-status, spawn-error>;
   }
+
+  /// Handle to a kernel Linux container. Processes started in this container
+  /// share its root, mounts, PID namespace (starting at 1), hostname and
+  /// domain name, and are bounded by the container's `ProcessAuthority`.
+  resource container {
+    /// Spawn a Linux program inside this container and return its child handle.
+    spawn: async func(request: container-spawn-request) -> result<child, spawn-error>;
+
+    /// Run a Linux program to completion inside this container, collecting its
+    /// buffered stdout and stderr.
+    exec: async func(request: container-exec-request) -> result<exec-result, exec-error>;
+  }
+
+  /// Create a new Linux container bounded by the caller's authority.
+  create-container: async func(config: container-config) -> result<container, spawn-error>;
 
   /// Spawn a new program and return a handle for streaming its IO.
   spawn: async func(request: spawn-request) -> result<child, spawn-error>;

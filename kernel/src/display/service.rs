@@ -32,7 +32,6 @@
 //! display engine has actually given the resources back.
 
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
-use core::task::{Context, Poll};
 
 use futures::channel::oneshot;
 use helios_hal::display::{
@@ -43,8 +42,8 @@ use triomphe::Arc;
 
 use crate::buffer::Buffer;
 use crate::component::{ProviderError, ProviderSender};
-use crate::exec::{Notify, NotifyWaiter};
-use crate::gpu::ScanoutHold;
+use crate::exec::{Notify, SequenceSignal};
+use crate::gpu::BlobHold;
 use crate::process::DisplayClaimCap;
 
 use super::DisplayServiceError;
@@ -86,80 +85,9 @@ impl ClaimState {
     pub(super) const RELEASING: u8 = 2;
 }
 
-/// A counted event a stream in some instance's store is driven by.
-///
-/// Two of them exist: one per surface, bumped every time the display
-/// engine finishes a flush, and one per device, bumped every time the
-/// set of outputs changes. Both are read the same way — "has the count
-/// moved since I last looked, and if not, wake me when it does" — so
-/// they are one type rather than two that differ in their field names.
-///
-/// # Concurrency contract
-///
-/// Written by the owner tasks and read from whichever processor runs the
-/// reading store. A reader arms the notification inside
-/// [`Self::poll_next`] before it re-reads the count, so an event
-/// published between the read and the park wakes it; the notification is
-/// a broadcast, because every reader of one signal is owed the same
-/// event.
-#[derive(Default)]
-pub struct SequenceSignal {
-    sequence: AtomicU64,
-    nanos: AtomicU64,
-    published: Notify,
-}
-
-impl SequenceSignal {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Record event number `sequence`, taken at `nanos` on the kernel's
-    /// monotonic clock, and wake every reader waiting for one.
-    pub fn publish(&self, sequence: u64, nanos: u64) {
-        self.nanos.store(nanos, Ordering::Release);
-        self.sequence.store(sequence, Ordering::Release);
-        self.published.notify_all();
-    }
-
-    /// Bump the count by one, taking the time from `nanos`.
-    pub fn bump(&self, nanos: u64) -> u64 {
-        let next = self.sequence.load(Ordering::Acquire) + 1;
-        self.publish(next, nanos);
-        next
-    }
-
-    /// How many events this signal has published.
-    pub fn sequence(&self) -> u64 {
-        self.sequence.load(Ordering::Acquire)
-    }
-
-    /// A fresh wait on this signal.
-    pub fn waiter(&self) -> NotifyWaiter {
-        self.published.waiter()
-    }
-
-    /// The next event published after `last_seen`, as its count and the
-    /// clock reading it was taken at.
-    pub fn poll_next(
-        &self,
-        cx: &mut Context<'_>,
-        waiter: &mut NotifyWaiter,
-        last_seen: &mut u64,
-    ) -> Poll<(u64, u64)> {
-        loop {
-            let sequence = self.sequence.load(Ordering::Acquire);
-            if sequence != *last_seen {
-                *last_seen = sequence;
-                return Poll::Ready((sequence, self.nanos.load(Ordering::Acquire)));
-            }
-            match self.published.poll_notified(cx, waiter) {
-                Poll::Ready(()) => continue,
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-}
+/// Identity of one blob surface within a display claim, independent of storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlobSurfaceId(pub(super) u64);
 
 /// What a surface's pixels are read out of.
 ///
@@ -170,11 +98,10 @@ impl SequenceSignal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceSource {
     Framebuffer(FramebufferId),
-    /// A blob on one scanout: one blob may be shown on several, one
-    /// surface each.
+    /// Distinct surfaces may retain the same blob on the same output.
     Blob {
         blob: BlobId,
-        scanout: ScanoutId,
+        surface: BlobSurfaceId,
     },
 }
 
@@ -215,7 +142,14 @@ pub(crate) enum ControlRequest {
         generation: u64,
         scanout: ScanoutId,
         layout: BlobScanout,
-        hold: ScanoutHold,
+        hold: BlobHold,
+        reply: oneshot::Sender<Result<SurfaceSource, DisplayServiceError>>,
+    },
+    ActivateSurface {
+        generation: u64,
+        surface: SurfaceSource,
+        scanout: ScanoutId,
+        mode: DisplayMode,
         reply: oneshot::Sender<Result<(), DisplayServiceError>>,
     },
     DestroySurface {
@@ -251,6 +185,7 @@ impl ControlRequest {
             | Self::Modes { generation, .. }
             | Self::CreateSurface { generation, .. }
             | Self::CreateBlobSurface { generation, .. }
+            | Self::ActivateSurface { generation, .. }
             | Self::DestroySurface { generation, .. }
             | Self::Present { generation, .. }
             | Self::CreateCursor { generation, .. }

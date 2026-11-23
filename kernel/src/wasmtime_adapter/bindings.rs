@@ -17,9 +17,12 @@ pub mod debugger {
             exports: { default: async },
             with: {
                 "helios:system/programs.child": crate::ChildHandle,
+                "helios:system/programs.container": crate::ContainerHandle,
                 "helios:system/serial.serial-port": crate::ComponentSerialPort,
                 "helios:system/vsock.vsock-stream": crate::wasmtime_adapter::component_host::ComponentVsockStream,
                 "helios:system/vsock.vsock-listener": crate::wasmtime_adapter::component_host::ComponentVsockListener,
+                "helios:system/sync.timeline": crate::SharedTimeline,
+                "helios:system/sync.signal-source": crate::TimelineSource,
                 "helios:system/sync.raw-mutex": crate::ComponentRawMutex,
                 "helios:system/sync.raw-mutex-guard": crate::ComponentRawMutexGuard,
                 "helios:system/sync.raw-rw-lock": crate::ComponentRawRwLock,
@@ -50,9 +53,12 @@ pub mod program {
             exports: { default: async },
             with: {
                 "helios:system/programs.child": crate::ChildHandle,
+                "helios:system/programs.container": crate::ContainerHandle,
                 "helios:system/serial.serial-port": crate::ComponentSerialPort,
                 "helios:system/vsock.vsock-stream": crate::wasmtime_adapter::component_host::ComponentVsockStream,
                 "helios:system/vsock.vsock-listener": crate::wasmtime_adapter::component_host::ComponentVsockListener,
+                "helios:system/sync.timeline": crate::SharedTimeline,
+                "helios:system/sync.signal-source": crate::TimelineSource,
                 "helios:system/sync.raw-mutex": crate::ComponentRawMutex,
                 "helios:system/sync.raw-mutex-guard": crate::ComponentRawMutexGuard,
                 "helios:system/sync.raw-rw-lock": crate::ComponentRawRwLock,
@@ -195,6 +201,7 @@ pub mod surface {
                 // so it can build one against it; it returns the reader
                 // immediately rather than awaiting.
                 "helios:system/surface.[method]surface.events": store | trappable,
+                "helios:system/surface.[method]image-surface.events": store | trappable,
                 // `create`, `commit` and `deliver` all reach the
                 // compositor and are `async func` in the WIT, generated
                 // against the store on their own account. What is left —
@@ -204,6 +211,9 @@ pub mod surface {
                 default: trappable,
             },
             with: {
+                "helios:system/surface.image-surface": crate::wasmtime_adapter::component_host::ClientImageSurfaceHandle,
+                "helios:system/gpu": crate::wasmtime_adapter::bindings::gpu::bindings::helios::system::gpu,
+                "helios:system/sync": crate::wasmtime_adapter::bindings::debugger::bindings::helios::system::sync,
                 "helios:system/surface.surface":
                     crate::wasmtime_adapter::component_host::ClientSurfaceHandle,
             },
@@ -239,12 +249,14 @@ pub mod gpu {
                 default: trappable,
             },
             with: {
+                "helios:system/sync": crate::wasmtime_adapter::bindings::debugger::bindings::helios::system::sync,
                 "helios:system/gpu.gpu":
                     crate::wasmtime_adapter::component_host::GpuHandle,
                 "helios:system/gpu.context":
                     crate::wasmtime_adapter::component_host::ContextHandle,
                 "helios:system/gpu.command-buffer":
                     crate::wasmtime_adapter::component_host::CommandBufferHandle,
+                "helios:system/gpu.image": crate::gpu::GpuImage,
                 "helios:system/gpu.blob":
                     crate::wasmtime_adapter::component_host::BlobHandle,
             },
@@ -333,6 +345,23 @@ pub mod processors {
     }
 }
 
+/// Bindings for the btrfs volume management interface served to both program
+/// worlds (`init` and `debugger`).
+pub mod btrfs {
+    pub mod bindings {
+        use wasmtime;
+
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "btrfs-host",
+            imports: {
+                default: trappable,
+            },
+            require_store_data_send: true,
+        });
+    }
+}
+
 /// Bindings for the export the compositor plugin answers on.
 ///
 /// Generated from the `compositor-host` world rather than from
@@ -346,6 +375,10 @@ pub mod compositor {
         wasmtime::component::bindgen!({
             path: "../wit",
             world: "compositor-host",
+            with: {
+                "helios:system/gpu": crate::wasmtime_adapter::bindings::gpu::bindings::helios::system::gpu,
+                "helios:system/sync": crate::wasmtime_adapter::bindings::debugger::bindings::helios::system::sync,
+            },
             exports: { default: async | store },
             require_store_data_send: true,
         });
