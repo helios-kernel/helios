@@ -1,15 +1,48 @@
 use super::*;
 use crate::ComponentHostNetwork;
+use crate::settings::{Setting, SettingUnit};
+
+/// Default byte ceiling on a single `wasi:random` byte-list call: 64 MiB,
+/// matching Wasmtime's `WasiCtxBuilder::max_random_size` default.
+const DEFAULT_MAX_RANDOM_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Machine-wide limit on the byte list returned by
+/// `wasi:random/random.get-random-bytes` and
+/// `wasi:random/insecure.get-insecure-random-bytes`.
+pub(crate) struct RandomBytesLimitSetting;
+
+impl Setting for RandomBytesLimitSetting {
+    const NAME: &'static str = "wasi.max-random-bytes";
+    const DESCRIPTION: &'static str = "Largest byte list a wasi:random byte-list call may return.";
+    const UNIT: SettingUnit = SettingUnit::Bytes;
+    type Value = u64;
+    const DEFAULT: u64 = DEFAULT_MAX_RANDOM_BYTES;
+
+    fn to_raw(value: u64) -> u64 {
+        value
+    }
+
+    fn from_raw(raw: u64) -> u64 {
+        raw
+    }
+}
 
 /// Builds the list a `wasi:random` call returns, `len` bytes long, and is the
 /// only place a guest-chosen random length becomes an allocation.
 ///
-/// The buffer is reserved fallibly: a length the kernel heap cannot serve
-/// traps the calling instance with [`WasiAdapterTrap::RandomBytesUnavailable`]
-/// instead of reaching the infallible allocator, whose failure is a kernel
-/// panic. `fill` runs once, on the whole buffer, only after the reservation
-/// succeeded.
-pub(crate) fn random_bytes(len: u64, fill: impl FnOnce(&mut [u8])) -> Result<Vec<u8>> {
+/// Requests above `limit` (read from [`RandomBytesLimitSetting`]) trap the
+/// calling instance with [`WasiAdapterTrap::RandomBytesLimitExceeded`] before
+/// any allocation or fill runs. Within the limit, the buffer is reserved
+/// fallibly: a length the kernel heap cannot serve traps with
+/// [`WasiAdapterTrap::RandomBytesUnavailable`] instead of reaching the
+/// infallible allocator, whose failure is a kernel panic. `fill` runs once, on
+/// the whole buffer, only after the reservation succeeded.
+pub(crate) fn random_bytes(len: u64, limit: u64, fill: impl FnOnce(&mut [u8])) -> Result<Vec<u8>> {
+    if len > limit {
+        return Err(wasmtime::Error::new(
+            WasiAdapterTrap::RandomBytesLimitExceeded { len, limit },
+        ));
+    }
     let size = usize::try_from(len)
         .map_err(|_| wasmtime::Error::new(WasiAdapterTrap::RandomLengthOverflow))?;
     let mut bytes = Vec::new();
@@ -385,7 +418,11 @@ where
     StorageImpl: crate::Storage,
 {
     fn get_random_bytes(&mut self, len: u64) -> Result<Vec<u8>> {
-        random_bytes(len, |bytes| self.fill_secure_random(bytes))
+        let limit = self
+            .runtime_state
+            .settings()
+            .get::<RandomBytesLimitSetting>();
+        random_bytes(len, limit, |bytes| self.fill_secure_random(bytes))
     }
 
     fn get_random_u64(&mut self) -> Result<u64> {
@@ -401,7 +438,11 @@ where
     StorageImpl: crate::Storage,
 {
     fn get_insecure_random_bytes(&mut self, len: u64) -> Result<Vec<u8>> {
-        random_bytes(len, |bytes| self.fill_insecure_random(bytes))
+        let limit = self
+            .runtime_state
+            .settings()
+            .get::<RandomBytesLimitSetting>();
+        random_bytes(len, limit, |bytes| self.fill_insecure_random(bytes))
     }
 
     fn get_insecure_random_u64(&mut self) -> Result<u64> {

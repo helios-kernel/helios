@@ -133,6 +133,8 @@ impl Preview3GuestExit {
 pub(crate) enum WasiAdapterTrap {
     #[error("random byte length exceeds usize")]
     RandomLengthOverflow,
+    #[error("random byte list of {len} bytes exceeds the {limit}-byte limit")]
+    RandomBytesLimitExceeded { len: u64, limit: u64 },
     #[error("the kernel heap cannot serve a random byte list of {len} bytes")]
     RandomBytesUnavailable { len: u64 },
     #[error("file read offset overflowed u64")]
@@ -326,10 +328,11 @@ mod tests {
     #[test]
     fn a_random_length_the_address_space_cannot_hold_traps_without_filling() {
         // Both exceed `isize::MAX`, the most a single allocation can span, so
-        // the reservation refuses them on every host without allocating.
+        // even when an operator lifts the limit to `u64::MAX`, the reservation
+        // refuses them on every host without allocating.
         for len in [u64::MAX, isize::MAX as u64 + 1] {
             let mut filled = false;
-            let error = super::random_bytes(len, |_| filled = true)
+            let error = super::random_bytes(len, u64::MAX, |_| filled = true)
                 .expect_err("a list larger than the address space cannot be built");
             assert_eq!(
                 error.downcast_ref::<super::WasiAdapterTrap>(),
@@ -340,13 +343,29 @@ mod tests {
     }
 
     #[test]
+    fn a_random_length_above_the_setting_traps_without_filling() {
+        use crate::settings::Setting;
+
+        let limit = super::RandomBytesLimitSetting::DEFAULT;
+        let len = limit + 1;
+        let mut filled = false;
+        let error = super::random_bytes(len, limit, |_| filled = true)
+            .expect_err("a list one byte above the limit must trap");
+        assert_eq!(
+            error.downcast_ref::<super::WasiAdapterTrap>(),
+            Some(&super::WasiAdapterTrap::RandomBytesLimitExceeded { len, limit })
+        );
+        assert!(!filled, "fill ran for a length above the limit");
+    }
+
+    #[test]
     fn a_small_random_length_is_filled_once_to_exactly_that_length() {
         let mut calls = 0_u32;
-        let bytes = super::random_bytes(37, |buffer| {
+        let bytes = super::random_bytes(37, 37, |buffer| {
             calls += 1;
             buffer.fill(0xa5);
         })
-        .expect("a small list is served");
+        .expect("a list at the limit is served");
         assert_eq!(bytes, vec![0xa5_u8; 37]);
         assert_eq!(calls, 1);
     }
