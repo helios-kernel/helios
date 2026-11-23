@@ -2,7 +2,7 @@
 
 use core::ops::ControlFlow;
 
-use helios_btrfs::{ChecksumType, DirPosition, EntryTarget, Error, FileKind};
+use helios_btrfs::{ChecksumType, DirBound, DirPosition, EntryTarget, Error, FileKind};
 
 use crate::fixture::{
     BIG_LEN, CJK_FILES, HELLO, HOSTNAME, MANY_FILES, base_image, block_on, default_subvolume_image,
@@ -71,14 +71,16 @@ fn lists_the_root_directory() {
     let fs = mount(base_image()).expect("mounts");
     let root = block_on(fs.root()).expect("root");
     let mut entries = Vec::new();
-    let end = block_on(fs.read_dir(&root, DirPosition::START, |entry| {
-        entries.push((
-            String::from_utf8(entry.name.to_vec()).unwrap(),
-            entry.kind,
-            entry.target,
-        ));
-        ControlFlow::Continue(())
-    }))
+    let end = block_on(
+        fs.read_dir(&root, DirPosition::START, DirBound::UNBOUNDED, |entry| {
+            entries.push((
+                String::from_utf8(entry.name.to_vec()).unwrap(),
+                entry.kind,
+                entry.target,
+            ));
+            ControlFlow::Continue(())
+        }),
+    )
     .expect("lists");
     assert_eq!(end, None);
     let mut names: Vec<_> = entries.iter().map(|(name, ..)| name.as_str()).collect();
@@ -109,7 +111,7 @@ fn lists_a_large_directory_in_pages() {
     let mut pages = 0;
     while let Some(from) = position {
         let mut taken = 0;
-        position = block_on(fs.read_dir(&many, from, |entry| {
+        position = block_on(fs.read_dir(&many, from, DirBound::UNBOUNDED, |entry| {
             if taken == 97 {
                 return ControlFlow::Break(());
             }

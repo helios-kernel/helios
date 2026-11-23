@@ -13,6 +13,7 @@ pub mod device;
 pub mod display;
 pub mod entropy;
 pub mod fs;
+pub mod fs_management;
 pub mod generation;
 pub mod hv;
 pub mod input;
@@ -23,6 +24,7 @@ pub mod measured_boot;
 pub mod measured_boot_model;
 pub mod memory;
 pub mod mmio;
+pub mod native;
 pub mod numa;
 pub mod pmm;
 pub mod processor_hotplug;
@@ -347,6 +349,7 @@ mod tests {
 
     impl cpu::Cpu for TestCpu {
         type Hypervisor = core::convert::Infallible;
+        type Native = core::convert::Infallible;
         const TIMER_INTERRUPT: cpu::TimerInterrupt = cpu::TimerInterrupt::Deadline;
 
         fn processor_count(&self) -> usize {

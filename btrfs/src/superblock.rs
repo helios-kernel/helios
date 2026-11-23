@@ -11,6 +11,8 @@ use crate::ondisk::{
     SYS_CHUNK_ARRAY_BYTES, view,
 };
 use crate::source::BlockSource;
+#[cfg(feature = "write")]
+use crate::tree::write::WriteError;
 
 /// Device offsets of the superblock copies: the primary, then the backups
 /// at 64 MiB and 256 GiB where the device is long enough to hold them.
@@ -66,7 +68,9 @@ pub struct Superblock {
     root: RootPointer,
     chunk_root: RootPointer,
     log_root: u64,
+    log_root_level: u8,
     total_bytes: u64,
+    bytes_used: u64,
     num_devices: u64,
     sectorsize: u32,
     nodesize: u32,
@@ -120,9 +124,12 @@ impl Superblock {
                 return Err(SuperblockDefect::Unaligned { field, value });
             }
         }
+        // `btrfs_validate_super` checks the log root's level as it checks
+        // the other roots', whether or not a log is pending.
         for (field, level) in [
             ("root_level", raw.root_level),
             ("chunk_root_level", raw.chunk_root_level),
+            ("log_root_level", raw.log_root_level),
         ] {
             if level >= MAX_LEVEL {
                 return Err(SuperblockDefect::Level { field, level });
@@ -167,7 +174,9 @@ impl Superblock {
                 generation: raw.chunk_root_generation.get(),
             },
             log_root: raw.log_root.get(),
+            log_root_level: raw.log_root_level,
             total_bytes: raw.total_bytes.get(),
+            bytes_used: raw.bytes_used.get(),
             num_devices: raw.num_devices.get(),
             sectorsize,
             nodesize,
@@ -183,8 +192,34 @@ impl Superblock {
     }
 
     /// Refuses a valid superblock describing a filesystem this crate does
-    /// not read.
+    /// not read as it stands: one with a feature it does not implement, or
+    /// one whose fsynced state is still in a log tree. Only a writable mount
+    /// replays the log.
     pub(crate) fn check_supported(&self) -> Result<(), Error> {
+        self.check_supported_for(1)
+    }
+
+    /// [`Self::check_supported`] for a mount given `device_count` backing devices.
+    pub(crate) fn check_supported_for(&self, device_count: usize) -> Result<(), Error> {
+        self.check_features_for(device_count)?;
+        if self.log_root != 0 {
+            return Err(Error::LogReplayRequired {
+                log_root: self.log_root,
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuses a filesystem with a feature this crate does not implement,
+    /// requiring a single device.
+    #[cfg(feature = "write")]
+    pub(crate) fn check_features(&self) -> Result<(), Error> {
+        self.check_features_for(1)
+    }
+
+    /// Refuses a filesystem with a feature this crate does not implement,
+    /// checking that its device count matches `device_count`.
+    pub(crate) fn check_features_for(&self, device_count: usize) -> Result<(), Error> {
         let mut unknown = self.incompat_flags;
         for (bit, name, supported) in INCOMPAT_FEATURES {
             if self.incompat_flags & bit != 0 && !supported {
@@ -199,15 +234,32 @@ impl Superblock {
                 bit,
             });
         }
-        if self.num_devices != 1 {
+        if self.num_devices != device_count as u64 {
             return Err(Error::MultiDevice {
                 devices: self.num_devices,
             });
         }
-        if self.log_root != 0 {
-            return Err(Error::LogReplayRequired {
-                log_root: self.log_root,
-            });
+        Ok(())
+    }
+
+    /// The log root tree a crash left behind an fsync, as its logical
+    /// address and level: `None` when no log is pending.
+    #[cfg(feature = "write")]
+    pub(crate) fn log_tree(&self) -> Option<(u64, u8)> {
+        (self.log_root != 0).then_some((self.log_root, self.log_root_level))
+    }
+
+    /// COMPAT_RO explicitly permits readers that do not implement a feature,
+    /// but a writer must understand every set bit before changing the image.
+    #[cfg(feature = "write")]
+    pub(crate) fn check_writable(&self) -> Result<(), WriteError> {
+        // FREE_SPACE_TREE, FREE_SPACE_TREE_VALID and BLOCK_GROUP_TREE are
+        // maintained by the transaction's accounting and root catalogue.
+        let unsupported = self.compat_ro_flags & !((1 << 0) | (1 << 1) | (1 << 3));
+        if unsupported != 0 {
+            let bit = 1_u64 << unsupported.trailing_zeros();
+            let name = if bit == 1 << 2 { "verity" } else { "undefined" };
+            return Err(WriteError::UnsupportedCompatRo { name, bit });
         }
         Ok(())
     }
@@ -238,6 +290,12 @@ impl Superblock {
 
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
+    }
+
+    /// Bytes of the device's block groups in use, as the superblock records
+    /// them at its commit.
+    pub fn bytes_used(&self) -> u64 {
+        self.bytes_used
     }
 
     pub fn sectorsize(&self) -> u32 {

@@ -37,6 +37,18 @@ __helios_aarch64_exception_vectors:
     .balign 128
     b __helios_aarch64_sync_exception
     .balign 128
+    // Lower EL, AArch64: a native user slice (`native.S`), whose SP_EL1
+    // is the slice's register record, so every one of the four ends it.
+.if {native_users}
+    b helios_aarch64_native_lower_sync
+    .balign 128
+    b helios_aarch64_native_lower_irq
+    .balign 128
+    b helios_aarch64_native_lower_fiq
+    .balign 128
+    b helios_aarch64_native_lower_serror
+    .balign 128
+.else
     b __helios_aarch64_sync_exception
     .balign 128
     b __helios_aarch64_irq
@@ -45,6 +57,11 @@ __helios_aarch64_exception_vectors:
     .balign 128
     b __helios_aarch64_sync_exception
     .balign 128
+.endif
+    // Lower EL, AArch32: unreachable. A native slice enters EL0 through
+    // an SPSR rebuilt with M[4] = 0 (`native.rs`), and a hypervisor guest
+    // runs under its own vector table (`hv/enter.S`), so no AArch32 state
+    // ever takes an exception into this table.
     b __helios_aarch64_sync_exception
     .balign 128
     b __helios_aarch64_irq

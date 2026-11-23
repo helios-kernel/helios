@@ -9,6 +9,16 @@ use std::ops::Range;
 
 use wasm_encoder::Encode;
 
+/// Converts a `wasmparser` byte offset from an in-memory slice into `usize`.
+pub fn as_usize(offset: u64) -> usize {
+    usize::try_from(offset).expect("an in-memory wasm offset fits in usize")
+}
+
+/// Converts a `wasmparser` byte range from an in-memory slice into `Range<usize>`.
+pub fn usize_range(range: Range<u64>) -> Range<usize> {
+    as_usize(range.start)..as_usize(range.end)
+}
+
 /// Encodes `value` as an unsigned LEB128 integer.
 pub fn leb_u32(value: u32) -> Vec<u8> {
     let mut bytes = Vec::new();

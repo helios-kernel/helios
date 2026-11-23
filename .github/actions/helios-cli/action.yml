@@ -1,0 +1,134 @@
+name: helios-cli for this run
+description: >-
+  Yields the `helios-cli` binary of the checked-out commit in one cargo
+  profile and exports its path as `HELIOS_CLI_BIN`. When `download-only` is
+  `true` (used by `ci.yml` consumers after the `build-helios-cli` producer
+  job), it downloads the prebuilt run artifact directly and fails fast if
+  missing. Otherwise (standalone callers such as `kernel-profile.yml`) it
+  restores a cross-run cache keyed by `helios-cli`'s inputs, falls back to an
+  in-run artifact, and builds and uploads it when missed.
+inputs:
+  profile:
+    description: The cargo profile, `release` or `debug`.
+    required: true
+  root:
+    description: The Helios checkout, relative to the workspace.
+    required: false
+    default: helios
+  download-only:
+    description: >-
+      Download the prebuilt run artifact from `build-helios-cli` directly and
+      fail if absent, without falling back to caching or building.
+    required: false
+    default: "false"
+outputs:
+  path:
+    description: The binary's absolute path.
+    value: ${{ steps.name.outputs.dir }}/helios-cli
+runs:
+  using: composite
+  steps:
+    - id: name
+      shell: bash
+      env:
+        ROOT: ${{ inputs.root }}
+        PROFILE: ${{ inputs.profile }}
+        DOWNLOAD_ONLY: ${{ inputs.download-only }}
+      run: |
+        set -euo pipefail
+        case "${PROFILE}" in
+          release | debug) ;;
+          *) echo "::error::profile must be release or debug, not '${PROFILE}'"; exit 1 ;;
+        esac
+        echo "dir=${RUNNER_TEMP}/helios-cli-${PROFILE}" >> "$GITHUB_OUTPUT"
+        echo "run_artifact=helios-cli-${PROFILE}-${RUNNER_OS}-${RUNNER_ARCH}" >> "$GITHUB_OUTPUT"
+        if [[ "${DOWNLOAD_ONLY}" == "true" ]]; then
+          exit 0
+        fi
+        if command -v sha256sum >/dev/null 2>&1; then
+          hash_cmd=(sha256sum)
+        else
+          hash_cmd=(shasum -a 256)
+        fi
+        input_hash="$(
+          {
+            (
+              cd "${ROOT}"
+              git ls-files --cached --others --exclude-standard -z -- \
+                cli \
+                artifact \
+                compiler-support \
+                hal \
+                profdata \
+                venus-gen \
+                workspace-root \
+                Cargo.toml \
+                Cargo.lock \
+                rust-toolchain.toml \
+                .cargo/config.toml \
+                docs/wasmtime.md \
+                | LC_ALL=C sort -z \
+                | xargs -0 "${hash_cmd[@]}"
+            )
+            printf "%s  action.yml\n" "$("${hash_cmd[@]}" "${GITHUB_ACTION_PATH}/action.yml" | awk '{print $1}')"
+          } | "${hash_cmd[@]}" | awk '{print $1}'
+        )"
+        commit="$(git -C "${ROOT}" rev-parse HEAD)"
+        echo "input_hash=${input_hash}" >> "$GITHUB_OUTPUT"
+        echo "artifact=helios-cli-${commit}-${PROFILE}-${RUNNER_OS}-${RUNNER_ARCH}" >> "$GITHUB_OUTPUT"
+    - id: run-download
+      if: inputs.download-only == 'true'
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ steps.name.outputs.run_artifact }}
+        path: ${{ steps.name.outputs.dir }}
+    - id: cache
+      if: inputs.download-only != 'true'
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.name.outputs.dir }}
+        key: helios-cli-${{ inputs.profile }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.name.outputs.input_hash }}
+    # Absent until some job of this run has built it; that is the case the
+    # build below covers, so a failed download is not a failure.
+    - id: download
+      if: inputs.download-only != 'true' && steps.cache.outputs.cache-hit != 'true'
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ steps.name.outputs.artifact }}
+        path: ${{ steps.name.outputs.dir }}
+    - if: inputs.download-only != 'true' && steps.cache.outputs.cache-hit != 'true' && steps.download.outcome != 'success'
+      shell: bash
+      working-directory: ${{ inputs.root }}
+      env:
+        PROFILE: ${{ inputs.profile }}
+        DIR: ${{ steps.name.outputs.dir }}
+      run: |
+        set -euo pipefail
+        if [[ "${PROFILE}" == release ]]; then
+          cargo build --release -p helios-cli
+        else
+          cargo build -p helios-cli
+        fi
+        mkdir -p "${DIR}"
+        cp "target/${PROFILE}/helios-cli" "${DIR}/helios-cli"
+    # Jobs that started before the first upload built their own identical
+    # commit binary; keep the first upload live instead of deleting and
+    # re-uploading it (`overwrite: true` deletes before uploading and races
+    # concurrent readers).
+    - if: inputs.download-only != 'true' && steps.cache.outputs.cache-hit != 'true' && steps.download.outcome != 'success'
+      continue-on-error: true
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ steps.name.outputs.artifact }}
+        path: ${{ steps.name.outputs.dir }}/helios-cli
+        if-no-files-found: error
+        retention-days: 1
+    - shell: bash
+      env:
+        DIR: ${{ steps.name.outputs.dir }}
+      run: |
+        set -euo pipefail
+        # An artifact keeps no file mode.
+        chmod +x "${DIR}/helios-cli"
+        echo "HELIOS_CLI_BIN=${DIR}/helios-cli" >> "$GITHUB_ENV"

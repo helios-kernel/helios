@@ -84,9 +84,13 @@ value is a backend of this host's own — `coreaudio`, `pa`, `alsa`,
 ## Capturing a scanout
 
 `screendump` writes the machine's current scanout as a PNG. It speaks to
-QEMU, not to the guest, so it needs a monitor socket; the action asks for
-one on its own, and `--keep-runtime-dir` or an explicit
-`--qmp unix:<path>,server=on,wait=off` also provides it.
+QEMU, not to the guest: the action starts QEMU with a VNC server on a
+socket in the runtime directory and reads one full frame from it per
+capture. QMP's own `screendump` refuses a console whose scanout is a GL
+or dma-buf buffer, while QEMU feeds its VNC server from the console's 2D
+surface under every display backend, `egl-headless` copying each GL
+frame into it. The action also takes a QMP socket on its own, for
+`--input` and `--kill-instance`.
 
 ```bash
 ./target/release/helios-inspector vm --arch x86-64 --release --accel kvm \

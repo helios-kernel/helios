@@ -46,18 +46,15 @@ runs:
   using: composite
   steps:
     - name: Install host dependencies
-      shell: bash
-      run: |
-        packages=(
+      uses: ./helios/.github/actions/install-apt-packages
+      with:
+        packages: >-
           libudev-dev just cmake ninja-build
           qemu-system-x86 ovmf qemu-utils genisoimage
-        )
-        if [ "${{ inputs.network-tools }}" = true ]; then
-          packages+=(iproute2 nftables dnsmasq-base)
-        fi
-        sudo rm -f /etc/apt/sources.list.d/google-chrome*
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends "${packages[@]}"
+          ${{ inputs.network-tools == 'true' && 'iproute2 nftables dnsmasq-base' || '' }}
+    - name: Grant KVM access
+      shell: bash
+      run: |
         # Every boot in this workflow names `--accel kvm`, and the
         # inspector refuses rather than falling back to the emulator, so
         # the device has to be usable by the runner's own user.

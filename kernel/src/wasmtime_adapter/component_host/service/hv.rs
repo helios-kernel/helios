@@ -33,6 +33,7 @@ impl From<GuestMemoryError> for wire::HvError {
         match error {
             GuestMemoryError::Budget { .. } => Self::MemoryBudget,
             GuestMemoryError::Frames(_) => Self::OutOfMemory,
+            GuestMemoryError::Contended => Self::Busy,
             GuestMemoryError::Bounds | GuestMemoryError::Length => Self::Bounds,
         }
     }
@@ -463,6 +464,17 @@ impl<C: Cpu + Clone, N: ComponentHostNetwork, S: Storage> wire::HostMemoryRegion
 }
 
 impl<C: Cpu + Clone, N: ComponentHostNetwork, S: Storage> wire::HostVcpu for StoreData<C, N, S> {
+    fn reset(
+        &mut self,
+        handle: Resource<wire::Vcpu>,
+    ) -> wasmtime::Result<Result<(), wire::HvError>> {
+        let handle = self.table.get(&typed::<_, VcpuHandle<Space<C>>>(handle))?;
+        let mut cpu = match handle.slot.take() {
+            Ok(cpu) => cpu,
+            Err(error) => return Ok(Err(error.into())),
+        };
+        Ok(cpu.reset().map_err(Into::into))
+    }
     fn get_regs(
         &mut self,
         handle: Resource<wire::Vcpu>,

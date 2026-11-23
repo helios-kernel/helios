@@ -2,11 +2,19 @@
 
 //! Linux ABI policy for native execution. The platform owns execution and
 //! memory; this crate never dereferences a guest address or selects a backend.
-//! A caller exclusively owns a process while dispatching a syscall. No global
-//! state or locks are required, and separate processes may run concurrently.
+//! Each thread owns its [`syscall::Process`] handle while dispatching a
+//! syscall, and threads of one process share their descriptor table, futex
+//! queues, program break and process attributes without global state.
 
 #[cfg(feature = "runtime")]
+extern crate alloc;
+
+#[cfg(feature = "runtime")]
+pub mod abi;
+#[cfg(feature = "runtime")]
 pub mod elf;
+#[cfg(feature = "runtime")]
+pub mod signal_frame;
 #[cfg(feature = "runtime")]
 pub mod syscall;
 

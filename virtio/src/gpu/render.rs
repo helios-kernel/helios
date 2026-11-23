@@ -71,8 +71,9 @@ use helios_hal::device::{DeviceRegion, DeviceRegionAttributes};
 use helios_hal::display::{
     BlobCaching, BlobId, BlobMemory, BlobRequest, BlobScanout, BlobUsage, CapsetId, CapsetInfo,
     CapsetList, CommandStream, ContextId, ContextName, DisplayError, DisplayResult, FenceId,
-    FramebufferId, Gpu3d, Gpu3dError, Gpu3dResult, Gpu3dTable, MAX_BACKING_RANGES,
-    MAX_CONTEXT_NAME, MAX_RINGS, Rect, RingCount, RingIndex, ScanoutId, Submission,
+    FramebufferId, Gpu3d, Gpu3dCapabilities, Gpu3dError, Gpu3dResult, Gpu3dTable,
+    MAX_BACKING_RANGES, MAX_CONTEXT_NAME, MAX_RINGS, Rect, RingCount, RingIndex, ScanoutId,
+    Submission,
 };
 use helios_hal::io::IoError;
 use helios_hal::iommu::PhysicalRange;
@@ -418,6 +419,23 @@ impl RenderSubject {
 }
 
 impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
+    fn capabilities(&self) -> Gpu3dCapabilities {
+        let renders = self.features.device(GPU_FEATURE_VIRGL);
+        let blob_alignment = self
+            .features
+            .device(GPU_FEATURE_BLOB_ALIGNMENT)
+            .then(|| core::num::NonZeroU32::new(self.blob_alignment as u32))
+            .flatten();
+        Gpu3dCapabilities {
+            renders,
+            blobs: renders && self.features.device(GPU_FEATURE_RESOURCE_BLOB),
+            host_visible: renders && self.host_visible.is_some(),
+            context_init: renders && self.features.device(GPU_FEATURE_CONTEXT_INIT),
+            cross_device: renders && self.features.device(GPU_FEATURE_RESOURCE_UUID),
+            blob_alignment: if renders { blob_alignment } else { None },
+        }
+    }
+
     fn renders(&self) -> bool {
         self.features.device(GPU_FEATURE_VIRGL)
     }

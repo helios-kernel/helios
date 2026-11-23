@@ -1,0 +1,677 @@
+//! The kernel-facing half: FUSE requests onto [`State`].
+//!
+//! fuser hands requests to a `Sync` filesystem by shared reference, so the
+//! state sits behind a mutex shared with the control socket thread. The FUSE
+//! session runs one event-loop thread, so the lock is only briefly contended
+//! during an explicit `remount` request.
+//!
+//! Operations the writer has no API for answer the errno of a filesystem that
+//! lacks the feature, and nothing else:
+//!
+//! - `setattr` changing the file flags: `EOPNOTSUPP`
+//! - `fallocate` with modes Linux's btrfs refuses (`COLLAPSE_RANGE`,
+//!   `INSERT_RANGE`, `UNSHARE_RANGE`, `NO_HIDE_STALE`, unknown bits):
+//!   `EOPNOTSUPP`; invalid combinations (`PUNCH_HOLE` without `KEEP_SIZE`,
+//!   `PUNCH_HOLE | ZERO_RANGE`): `EINVAL`
+//! - `rename` with `RENAME_WHITEOUT`, or with both `RENAME_NOREPLACE` and
+//!   `RENAME_EXCHANGE`: `EINVAL`
+//!
+//! Left to fuser's default of `ENOSYS`: `access`, `bmap`, `ioctl`, `poll`,
+//! `getlk`, `setlk`, `lseek` and `copy_file_range`.
+
+use std::ffi::OsStr;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use fuser::{
+    BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, INodeNo, InitFlags, KernelConfig,
+    LockOwner, OpenFlags, Owner as FuseOwner, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
+    Request, TimeOrNow, WriteFlags,
+};
+use futures_lite::future::block_on;
+use helios_btrfs::write::{AllocateMode, Special};
+use helios_btrfs::{DeviceNumber, Timestamp};
+use helios_hal::fs::RenameMode;
+
+use super::state::{Node, Owner, Setattr, SharedState, State, target_bytes, timestamp};
+
+/// Attributes and entries are never cached: every change is made through this
+/// daemon, and the kernel revalidating on each use keeps a reply the same as
+/// what the next request sees.
+const TTL: Duration = Duration::ZERO;
+
+/// The longest name `statfs` reports, `BTRFS_NAME_LEN`.
+const NAME_MAX: u32 = 255;
+
+pub struct Daemon {
+    shared: Arc<SharedState>,
+}
+
+impl Daemon {
+    pub fn new(shared: Arc<SharedState>) -> Self {
+        Self { shared }
+    }
+
+    fn run<R>(&self, request: impl FnOnce(&mut State) -> R) -> R {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("an earlier request panicked while holding the filesystem");
+        request(&mut state)
+    }
+}
+
+fn now() -> Timestamp {
+    timestamp(SystemTime::now())
+}
+
+/// A new node's permission bits as the caller asked for them. The kernel
+/// leaves the umask to the filesystem (`FUSE_DONT_MASK`), which applies it
+/// as Linux's `posix_acl_create` does: only when the parent has no default
+/// ACL.
+fn permissions(mode: u32) -> u32 {
+    mode & 0o7777
+}
+
+impl Filesystem for Daemon {
+    /// Asks for `FUSE_POSIX_ACL`, under which the kernel enforces POSIX ACLs
+    /// with `default_permissions` as it does for a local filesystem
+    /// (`process_init_reply` in `fs/fuse/inode.c` sets both), `FUSE_DONT_MASK`,
+    /// so a creation arrives with its umask unapplied for the writer's
+    /// `posix_acl_create`, and `FUSE_EXPORT_SUPPORT`, so `open_by_handle_at`
+    /// resolves evicted inodes and parents through `lookup` of `.` and `..`.
+    /// A kernel without any of them fails the mount rather than serve a
+    /// degraded contract.
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        config
+            .add_capabilities(
+                InitFlags::FUSE_POSIX_ACL
+                    | InitFlags::FUSE_DONT_MASK
+                    | InitFlags::FUSE_EXPORT_SUPPORT,
+            )
+            .map_err(|missing| {
+                std::io::Error::other(format!("the kernel's FUSE lacks {missing:?}"))
+            })
+    }
+
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        match self.run(|state| block_on(state.lookup(parent, name))) {
+            Ok((attr, generation)) => reply.entry(&TTL, &attr, generation),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        if self.run(|state| block_on(state.forget(ino, nlookup))) {
+            self.shared.writable_released.notify_all();
+        }
+    }
+
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        match self.run(|state| block_on(state.getattr(ino))) {
+            Ok(attr) => reply.attr(&TTL, &attr),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        flags: Option<BsdFileFlags>,
+        _kill_suid_gid: bool,
+        reply: ReplyAttr,
+    ) {
+        if flags.is_some() {
+            return reply.error(Errno::EOPNOTSUPP);
+        }
+        let change = Setattr {
+            mode,
+            uid,
+            gid,
+            size,
+            access: atime,
+            modified: mtime,
+        };
+        match self.run(|state| block_on(state.setattr(ino, change, now()))) {
+            Ok(attr) => reply.attr(&TTL, &attr),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        match self.run(|state| block_on(state.readlink(ino))) {
+            Ok(target) => reply.data(&target),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn mknod(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        rdev: u32,
+        owner: FuseOwner,
+        reply: ReplyEntry,
+    ) {
+        // The kernel sends `mknod`'s own encoding of the number
+        // (`fuse_mknod` in `fs/fuse/dir.c` applies `new_encode_dev`).
+        let device = DeviceNumber::decode(rdev);
+        let node = match mode & libc::S_IFMT {
+            libc::S_IFREG => Node::File,
+            libc::S_IFCHR => Node::Special(Special::CharDevice(device)),
+            libc::S_IFBLK => Node::Special(Special::BlockDevice(device)),
+            libc::S_IFIFO => Node::Special(Special::Fifo),
+            libc::S_IFSOCK => Node::Special(Special::Socket),
+            // `vfs_mknod` refuses every other type before it reaches a
+            // filesystem.
+            _ => return reply.error(Errno::EINVAL),
+        };
+        self.create_entry(
+            parent,
+            name,
+            node,
+            permissions(mode),
+            owner_with_umask(owner, umask),
+            reply,
+        );
+    }
+
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        owner: FuseOwner,
+        reply: ReplyEntry,
+    ) {
+        self.create_entry(
+            parent,
+            name,
+            Node::Directory,
+            permissions(mode),
+            owner_with_umask(owner, umask),
+            reply,
+        );
+    }
+
+    fn symlink(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &std::path::Path,
+        owner: FuseOwner,
+        reply: ReplyEntry,
+    ) {
+        self.create_entry(
+            parent,
+            link_name,
+            Node::Symlink(target_bytes(target)),
+            0o777,
+            // `posix_acl_create` leaves a symlink's mode alone.
+            owner_with_umask(owner, 0),
+            reply,
+        );
+    }
+
+    fn open(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        flags: OpenFlags,
+        _kill_suid_gid: bool,
+        reply: ReplyOpen,
+    ) {
+        match self.run(|state| block_on(state.open_file(ino, flags))) {
+            Ok(fh) => reply.opened(fh, FopenFlags::empty()),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        _kill_suid_gid: bool,
+        owner: FuseOwner,
+        reply: ReplyCreate,
+    ) {
+        let owner = owner_with_umask(owner, umask);
+        let permissions = permissions(mode);
+        match self.run(|state| {
+            let (attr, generation) =
+                block_on(state.create(parent, name, Node::File, permissions, owner, now()))?;
+            let fh = block_on(state.open_file(attr.ino, OpenFlags(flags)))?;
+            Ok((attr, generation, fh))
+        }) {
+            Ok((attr, generation, fh)) => {
+                reply.created(&TTL, &attr, generation, fh, FopenFlags::empty())
+            }
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn tmpfile(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        _kill_suid_gid: bool,
+        owner: FuseOwner,
+        reply: ReplyCreate,
+    ) {
+        let owner = owner_with_umask(owner, umask);
+        let permissions = permissions(mode);
+        match self.run(|state| {
+            block_on(state.tmpfile(parent, permissions, owner, OpenFlags(flags), now()))
+        }) {
+            Ok((attr, generation, fh)) => {
+                reply.created(&TTL, &attr, generation, fh, FopenFlags::empty())
+            }
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        if self.run(|state| block_on(state.release_file(fh))) {
+            self.shared.writable_released.notify_all();
+        }
+        reply.ok();
+    }
+
+    fn link(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        match self.run(|state| block_on(state.link(ino, newparent, newname, now()))) {
+            Ok((attr, generation)) => reply.entry(&TTL, &attr, generation),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        finish(
+            self.run(|state| block_on(state.remove(parent, name, false, now()))),
+            reply,
+        );
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        finish(
+            self.run(|state| block_on(state.remove(parent, name, true, now()))),
+            reply,
+        );
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: RenameFlags,
+        _owner: Option<FuseOwner>,
+        reply: ReplyEmpty,
+    ) {
+        // Both flags together, `RENAME_WHITEOUT` (which `rename` does not
+        // implement) and unknown bits are `EINVAL` as on Linux.
+        let mode = if flags.is_empty() {
+            RenameMode::Replace
+        } else if flags == RenameFlags::RENAME_NOREPLACE {
+            RenameMode::NoReplace
+        } else if flags == RenameFlags::RENAME_EXCHANGE {
+            RenameMode::Exchange
+        } else {
+            return reply.error(Errno::EINVAL);
+        };
+        finish(
+            self.run(|state| block_on(state.rename(parent, name, newparent, newname, mode, now()))),
+            reply,
+        );
+    }
+
+    fn read(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        size: u32,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyData,
+    ) {
+        match self.run(|state| block_on(state.read(ino, offset, size))) {
+            Ok(data) => reply.data(&data),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn write(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        match self.run(|state| block_on(state.write(ino, offset, data, now()))) {
+            Ok(written) => reply.written(written),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    // Closing a file makes nothing durable on Linux's btrfs either: every
+    // reply's change is already visible, and `fsync` is what commits it.
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    // The writer's commit is the whole filesystem's, so `fdatasync` commits
+    // what `fsync` does.
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        finish(self.run(|state| block_on(state.sync())), reply);
+    }
+
+    fn fsyncdir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        finish(self.run(|state| block_on(state.sync())), reply);
+    }
+
+    /// The unmount: what the running transaction holds becomes durable
+    /// before the daemon lets the device go.
+    fn destroy(&mut self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("an earlier request panicked while holding the filesystem");
+        if let Err(errno) = block_on(state.destroy()) {
+            tracing::error!(
+                ?errno,
+                "the unmount commit failed; the device keeps the last one"
+            );
+        }
+        self.shared.writable_released.notify_all();
+    }
+
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
+        match self.run(|state| block_on(state.opendir(ino))) {
+            Ok(fh) => reply.opened(fh, FopenFlags::empty()),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn readdir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
+    ) {
+        let listed = self.run(|state| {
+            block_on(state.readdir(ino, fh, offset, |entry, cookie, kind, name| {
+                reply.add(entry, cookie, kind, name)
+            }))
+        });
+        match listed {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn releasedir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: fuser::OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        if self.run(|state| block_on(state.releasedir(fh))) {
+            self.shared.writable_released.notify_all();
+        }
+        reply.ok();
+    }
+
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        match self.run(|state| state.statfs()) {
+            Ok(statfs) => reply.statfs(
+                statfs.blocks,
+                statfs.free,
+                statfs.available,
+                // The format keeps no inode count, as Linux's btrfs reports.
+                0,
+                0,
+                statfs.block_size,
+                NAME_MAX,
+                statfs.block_size,
+            ),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        match self.run(|state| block_on(state.getxattr(ino, name, size))) {
+            Ok((length, _)) if size == 0 => reply.size(length as u32),
+            Ok((_, value)) => reply.data(&value),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        match self.run(|state| block_on(state.listxattr(ino))) {
+            Ok(names) if size == 0 => reply.size(names.len() as u32),
+            Ok(names) if names.len() > size as usize => reply.error(Errno::ERANGE),
+            Ok(names) => reply.data(&names),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        // Only macOS sets a position, in resource forks.
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        match self.run(|state| block_on(state.setxattr(ino, name, value, flags, now()))) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        match self.run(|state| block_on(state.removexattr(ino, name, now()))) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn fallocate(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        let mode = match decode_fallocate_mode(mode) {
+            Ok(mode) => mode,
+            Err(errno) => return reply.error(errno),
+        };
+        finish(
+            self.run(|state| block_on(state.fallocate(ino, offset, length, mode, now()))),
+            reply,
+        );
+    }
+}
+
+impl Daemon {
+    fn create_entry(
+        &self,
+        parent: INodeNo,
+        name: &OsStr,
+        node: Node<'_>,
+        permissions: u32,
+        owner: Owner,
+        reply: ReplyEntry,
+    ) {
+        match self
+            .run(|state| block_on(state.create(parent, name, node, permissions, owner, now())))
+        {
+            Ok((attr, generation)) => reply.entry(&TTL, &attr, generation),
+            Err(errno) => reply.error(errno),
+        }
+    }
+}
+
+fn owner_with_umask(owner: FuseOwner, umask: u32) -> Owner {
+    Owner {
+        uid: owner.uid,
+        gid: owner.gid,
+        umask,
+    }
+}
+
+fn decode_fallocate_mode(mode: i32) -> Result<AllocateMode, Errno> {
+    const KEEP_SIZE: i32 = libc::FALLOC_FL_KEEP_SIZE;
+    const PUNCH_HOLE: i32 = libc::FALLOC_FL_PUNCH_HOLE;
+    const ZERO_RANGE: i32 = libc::FALLOC_FL_ZERO_RANGE;
+    const SUPPORTED: i32 = KEEP_SIZE | PUNCH_HOLE | ZERO_RANGE;
+
+    if mode & !SUPPORTED != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    match mode {
+        0 => Ok(AllocateMode::Allocate),
+        KEEP_SIZE => Ok(AllocateMode::KeepSize),
+        m if m == PUNCH_HOLE | KEEP_SIZE => Ok(AllocateMode::PunchHole),
+        ZERO_RANGE => Ok(AllocateMode::ZeroRange),
+        m if m == ZERO_RANGE | KEEP_SIZE => Ok(AllocateMode::ZeroRangeKeepSize),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn finish(result: Result<(), Errno>, reply: ReplyEmpty) {
+    match result {
+        Ok(()) => reply.ok(),
+        Err(errno) => reply.error(errno),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_fallocate_modes() {
+        assert_eq!(decode_fallocate_mode(0), Ok(AllocateMode::Allocate));
+        assert_eq!(
+            decode_fallocate_mode(libc::FALLOC_FL_KEEP_SIZE),
+            Ok(AllocateMode::KeepSize)
+        );
+        assert_eq!(
+            decode_fallocate_mode(libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE),
+            Ok(AllocateMode::PunchHole)
+        );
+        assert_eq!(
+            decode_fallocate_mode(libc::FALLOC_FL_ZERO_RANGE),
+            Ok(AllocateMode::ZeroRange)
+        );
+        assert_eq!(
+            decode_fallocate_mode(libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE),
+            Ok(AllocateMode::ZeroRangeKeepSize)
+        );
+        assert_eq!(
+            decode_fallocate_mode(libc::FALLOC_FL_PUNCH_HOLE),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            decode_fallocate_mode(
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE
+            ),
+            Err(Errno::EINVAL)
+        );
+        for unsupported in [
+            libc::FALLOC_FL_COLLAPSE_RANGE,
+            libc::FALLOC_FL_INSERT_RANGE,
+            libc::FALLOC_FL_UNSHARE_RANGE,
+            // `FALLOC_FL_NO_HIDE_STALE` in `include/uapi/linux/falloc.h`.
+            0x04,
+            1 << 20,
+        ] {
+            assert_eq!(decode_fallocate_mode(unsupported), Err(Errno::EOPNOTSUPP));
+        }
+    }
+}

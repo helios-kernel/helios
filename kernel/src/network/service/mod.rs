@@ -2,6 +2,8 @@ mod address;
 use address::*;
 mod error;
 use error::*;
+mod packet;
+use packet::*;
 mod pump;
 use pump::*;
 mod routes;
@@ -31,12 +33,13 @@ use bytes::Bytes;
 use helios_hal::cpu::{Cpu, HardwarePerfCounterDelta, HardwarePerfCounters, current_processor};
 use helios_hal::io::IoError;
 use helios_netstack::{
-    DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpAction, DhcpClient,
-    DhcpDestination, DhcpDnsServers, DhcpLease, DhcpPacket, DhcpTransmit, DnsQuery,
-    DnsQuestionWriter, DnsRecordType, DnsResponse, EthernetFrame, EthernetProtocol, FlowTuple,
-    IcmpEchoKey, IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr,
-    IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr,
-    Ipv6Packet, IsnSecret, MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry,
+    DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_MAX_CNAME_CHAIN, DNS_PORT,
+    DestinationPortHashes, DhcpAction, DhcpClient, DhcpDestination, DhcpDnsServers, DhcpLease,
+    DhcpPacket, DhcpTransmit, DnsHttpsOutcome, DnsQuery, DnsQuestionWriter, DnsRecordType,
+    DnsResponse, DnsWireName, EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey,
+    IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol,
+    Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr, Ipv6Packet,
+    IsnSecret, MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry,
     NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable, RxChecksumOffload,
     RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent,
     StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
@@ -46,16 +49,16 @@ use helios_netstack::{
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
-use crate::SocketReadiness;
 use crate::{
-    ComponentNetworkService, DnsError, DnsErrorKind, Ipv4Address as KernelIpv4Address,
+    ComponentNetworkService, DnsError, DnsErrorKind, HttpsRecord, Ipv4Address as KernelIpv4Address,
     Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route, MacAddress, NetworkAdminBackend,
     NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail, NetworkIpAddress, NetworkPortId,
-    PingError, PingErrorKind, PingReply, ProfileSink, ProgressMark, ProgressSignal,
+    PacketFrame, PingError, PingErrorKind, PingReply, ProfileSink, ProgressMark, ProgressSignal,
     RegisteredTcpReadBuffer, RootEntropyHandle, TcpAccepted, TcpError, TcpErrorKind, TcpListener,
     TcpReadInto, TcpReadProgress, TcpWriteProgress, Timer, UdpBinding, UdpDatagram, UdpError,
     UdpErrorKind, UptimeClock,
 };
+use crate::{SocketReadiness, TcpConnectPoll};
 use triomphe::Arc;
 
 const EPHEMERAL_PORT_START: u16 = 49_152;
@@ -178,6 +181,7 @@ where
     /// the interface exactly once without a task or a device poll of
     /// its own.
     link_up: AtomicBool,
+    packet_taps: PacketTapRegistry,
 }
 
 struct NetworkControlPlane {
@@ -535,6 +539,30 @@ impl NetworkControlPlane {
             .map(map_ipv4_cidr)
             .collect()
     }
+
+    fn owns_ip_address(&self, address: NetworkIpAddress) -> bool {
+        match address {
+            NetworkIpAddress::Ipv4(address) => {
+                let target = map_kernel_ipv4_address(address);
+                target.is_loopback()
+                    || self
+                        .ipv4_addresses
+                        .load_full()
+                        .entries
+                        .iter()
+                        .any(|cidr| cidr.address() == target)
+            }
+            NetworkIpAddress::Ipv6(address) => {
+                address.is_loopback()
+                    || self
+                        .ipv6_addresses
+                        .load_full()
+                        .entries
+                        .iter()
+                        .any(|entry| entry.cidr().address() == address)
+            }
+        }
+    }
 }
 
 impl<T> SnapshotCell<T> {
@@ -761,6 +789,7 @@ where
                 poll: NetworkPollState::new(rx_poll_budget, tx_completion_budget, rx_poll_budget),
                 stack_rx_budget,
                 link_up: AtomicBool::new(device.link_state().is_up()),
+                packet_taps: PacketTapRegistry::new(),
                 device,
             }),
         }
@@ -944,6 +973,13 @@ where
     /// answers the same — and it has to be answerable before a shard is
     /// chosen, since the answer is half of the flow the choice hashes.
     fn local_address_for(&self, destination: IpAddress) -> Option<IpAddress> {
+        match destination {
+            IpAddress::Ipv4(ipv4) if ipv4.is_loopback() => return Some(IpAddress::Ipv4(ipv4)),
+            IpAddress::Ipv6(ipv6) if ipv6.is_loopback() => {
+                return Some(IpAddress::Ipv6(Ipv6Address::LOOPBACK));
+            }
+            _ => {}
+        }
         self.inner.state.with(|state| match destination {
             IpAddress::Ipv4(_) => state
                 .stack
@@ -1552,6 +1588,11 @@ where
         self.inner.device.mac_address()
     }
 
+    /// Whether the stack currently owns `address` as a configured local address.
+    pub fn owns_ip_address(&self, address: NetworkIpAddress) -> bool {
+        self.inner.control.owns_ip_address(address)
+    }
+
     pub async fn ipv4_cidr(&self) -> Option<crate::Ipv4Cidr> {
         self.inner.control.list_ipv4_addresses().into_iter().next()
     }
@@ -1892,6 +1933,47 @@ pub(crate) mod fixture {
             segments
         }
     }
+
+    impl<C, I> NetworkService<C, I>
+    where
+        C: Cpu + Clone,
+        I: helios_netstack::NetworkInterface,
+    {
+        /// Installs static test IPv4/IPv6 interface addresses and an optional
+        /// reachable neighbor entry, then publishes and syncs them across shards.
+        pub(crate) fn configure_test_addresses(
+            &self,
+            ipv4: &[helios_netstack::Ipv4Cidr],
+            ipv6: &[helios_netstack::Ipv6Cidr],
+            neighbor: Option<(helios_netstack::IpAddress, [u8; 6])>,
+        ) {
+            {
+                let mut shard = self.inner.state.shard_at(DEFAULT_SHARD_IDX).lock();
+                for &cidr in ipv4 {
+                    shard
+                        .stack
+                        .add_ipv4_address(cidr)
+                        .expect("test IPv4 address should be accepted");
+                }
+                for &cidr in ipv6 {
+                    shard
+                        .stack
+                        .add_ipv6_address(cidr)
+                        .expect("test IPv6 address should be accepted");
+                }
+                if let Some((ip, mac)) = neighbor {
+                    shard.stack.learn_neighbor(helios_netstack::NeighborEntry {
+                        ip,
+                        mac,
+                        state: helios_netstack::NeighborState::Reachable,
+                        updated_at: StackInstant::from_nanos(0),
+                    });
+                }
+                self.inner.control.publish_from_shard(&shard);
+            }
+            self.synchronize_control_plane();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2182,7 +2264,11 @@ mod tests {
     /// for the whole set.
     fn bind_udp(shard: &mut NetworkShard, slot: usize, local_port: u16) -> UdpSocketId {
         shard
-            .install_udp_bind(slot, local_port)
+            .install_udp_bind(
+                slot,
+                NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+                local_port,
+            )
             .expect("test UDP socket should bind");
         UdpSocketId(ReplicaHandle::new(slot).get())
     }
@@ -3513,7 +3599,11 @@ mod tests {
                         .stack
                         .add_ipv4_address(Ipv4Cidr::new(local, 24))
                         .expect("test address should be accepted");
-                    shard.install_udp_bind(slot, 49_153)
+                    shard.install_udp_bind(
+                        slot,
+                        NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+                        49_153,
+                    )
                 },
                 NetworkShard::remove_udp_replica,
             )
@@ -5617,6 +5707,207 @@ mod tests {
         ports
     }
 
+    /// The start of the window `first..=last` at the keyed position
+    /// `keyed`, for a destination no connect has advanced yet.
+    fn fresh_start(first: u16, last: u16, keyed: u32) -> super::ConnectStart {
+        super::ConnectStart::new(first, last, keyed, super::ConnectCounters::default())
+    }
+
+    /// The candidates of the window `first..=last` for the connect of
+    /// `connect_request` from shard `accepting` of `shard_count`, from
+    /// the keyed start `keyed` with the destination's counters at zero.
+    fn classified_candidates(
+        first: u16,
+        last: u16,
+        keyed: u32,
+        accepting: usize,
+        shard_count: usize,
+    ) -> super::EphemeralCandidates {
+        let owners = connect_request().port_owners(shard_count);
+        super::EphemeralCandidates::classify(fresh_start(first, last, keyed), |port| {
+            owners.owner_of(port) == accepting
+        })
+    }
+
+    /// The first port a connect from `shard` to `request`'s destination
+    /// tries: the own port its start names.
+    fn first_connect_port(shard: &NetworkShard, request: &super::TcpConnectRequest) -> u16 {
+        let owners = request.port_owners(shard.shard_count);
+        let (start, _) = shard.connect_start(request);
+        super::EphemeralCandidates::classify(start, |port| owners.owner_of(port) == shard.shard_idx)
+            .own_ports()
+            .next()
+            .expect("the shard owns a port of its window")
+            .port
+    }
+
+    /// The owner of a port through [`super::PortOwners`] is what
+    /// `shard_idx_for_flow` answers for every port of the ephemeral
+    /// range, on several shard counts, in both families, and the
+    /// default shard answers when the families form no tuple.
+    #[test]
+    fn port_owners_equal_the_flow_owner_for_every_ephemeral_port() {
+        let v4_local = IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 7]));
+        let v4_remote = IpAddress::Ipv4(Ipv4Address::new([198, 51, 100, 9]));
+        let v6 = connect_request();
+        for (local, remote, remote_port) in [
+            (v4_local, v4_remote, 443),
+            (v6.local, v6.destination, v6.port),
+        ] {
+            for shard_count in [1usize, 3, 4, 7] {
+                let owners = super::PortOwners::new(local, remote, remote_port, shard_count);
+                for port in super::EPHEMERAL_PORT_START..=super::EPHEMERAL_PORT_END {
+                    assert_eq!(
+                        owners.owner_of(port),
+                        super::shard_idx_for_flow(local, port, remote, remote_port, shard_count),
+                        "port {port} on {shard_count} shards to {remote:?}"
+                    );
+                }
+            }
+        }
+        let mixed = super::PortOwners::new(v4_local, v6.destination, 443, 4);
+        assert_eq!(mixed.owner_of(49_200), super::DEFAULT_SHARD_IDX);
+    }
+
+    /// Issue #790: every keyed start a destination can have, on every
+    /// shard of a set, counted by the port its first connect takes with
+    /// every port free. Each own port is taken `floor(W / n)` or
+    /// `ceil(W / n)` times of the `W` starts and no foreign port is
+    /// taken, however the shard's own ports are spaced in its window.
+    /// Shard counts that do not divide the range leave the last window
+    /// longer than the others.
+    #[test]
+    fn an_ephemeral_connect_takes_each_own_port_equally_often() {
+        for shard_count in [3usize, 4, 7] {
+            for accepting in 0..shard_count {
+                let shard = NetworkShard::new(
+                    test_stack_config(),
+                    1,
+                    accepting,
+                    shard_count,
+                    test_root_entropy(),
+                );
+                let (first, last) = shard.ephemeral_window();
+                let window = u32::from(last - first) + 1;
+                let mut taken = alloc::collections::BTreeMap::<u16, u32>::new();
+                // The classification does not depend on the start.
+                let owners = connect_request().port_owners(shard_count);
+                let is_own: Vec<bool> = (first..=last)
+                    .map(|port| owners.owner_of(port) == accepting)
+                    .collect();
+                let own_count = is_own.iter().filter(|own| **own).count() as u32;
+                assert!(own_count != 0, "the fixture needs an own port");
+                for keyed in 0..window {
+                    let candidates = super::EphemeralCandidates::classify(
+                        fresh_start(first, last, keyed),
+                        |port| is_own[usize::from(port - first)],
+                    );
+                    let port = candidates
+                        .own_ports()
+                        .next()
+                        .expect("an own port exists")
+                        .port;
+                    *taken.entry(port).or_default() += 1;
+                }
+                assert_eq!(
+                    taken.len() as u32,
+                    own_count,
+                    "every own port is the first candidate of some start \
+                     (shards {shard_count}, accepting {accepting})"
+                );
+                for (port, times) in &taken {
+                    assert_eq!(
+                        owners.owner_of(*port),
+                        accepting,
+                        "a foreign port {port} was taken first"
+                    );
+                    assert!(
+                        *times == window / own_count || *times == window.div_ceil(own_count),
+                        "port {port} was taken {times} times of {window} starts over \
+                         {own_count} own ports (shards {shard_count}, accepting {accepting})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The own ports are tried in rank order from the start rank, each
+    /// once, and the foreign ports each once from the keyed place, so
+    /// together they are the window exactly once.
+    #[test]
+    fn the_candidates_cover_the_window_once() {
+        let first = super::EPHEMERAL_PORT_START;
+        let last = first + 1023;
+        for draw in [0, 1, 511, 1022, 1023] {
+            let candidates = classified_candidates(first, last, draw, 1, 4);
+            let own: Vec<u16> = candidates
+                .own_ports()
+                .map(|candidate| candidate.port)
+                .collect();
+            let foreign: Vec<u16> = candidates
+                .foreign_ports()
+                .map(|candidate| candidate.port)
+                .collect();
+            let mut all = [own.clone(), foreign.clone()].concat();
+            all.sort_unstable();
+            assert_eq!(all, (first..=last).collect::<Vec<u16>>());
+            let lowest = own
+                .iter()
+                .position(|port| Some(port) == own.iter().min())
+                .expect("an own port exists");
+            let mut ascending = own;
+            ascending.rotate_left(lowest);
+            assert!(ascending.windows(2).all(|pair| pair[0] < pair[1]));
+            assert_eq!(
+                foreign.first().copied(),
+                (first + draw as u16..=last)
+                    .chain(first..first + draw as u16)
+                    .find(|port| !ascending.contains(port)),
+                "the foreign ports start at the keyed place"
+            );
+        }
+    }
+
+    /// A connect opens on an own port whenever one is free: with every
+    /// own port but one held, every draw takes that one.
+    #[test]
+    fn an_ephemeral_connect_takes_the_one_free_own_port() {
+        const SHARDS: usize = 64;
+        let (first, last) = {
+            let shard = NetworkShard::new(test_stack_config(), 1, 0, SHARDS, test_root_entropy());
+            shard.ephemeral_window()
+        };
+        let window = u32::from(last - first) + 1;
+        let own: Vec<u16> = classified_candidates(first, last, 0, 0, SHARDS)
+            .own_ports()
+            .map(|candidate| candidate.port)
+            .collect();
+        assert!(own.len() > 2, "the fixture needs several own ports");
+        for draw in (0..window).step_by(7).chain([window - 1]) {
+            let state = connect_shard_set(SHARDS);
+            let free = own[draw as usize % own.len()];
+            let mut shard = state.shard_at(0).lock();
+            for port in own.iter().filter(|port| **port != free) {
+                hold_four_tuple(&mut shard, *port);
+            }
+            let candidates = classified_candidates(first, last, draw, 0, SHARDS);
+
+            shard
+                .open_tcp_connect_along_own_flows(&candidates, connect_request())
+                .expect("an in-use candidate is not a failure")
+                .expect("the one free own port opens");
+
+            assert_eq!(
+                queued_syn_source_ports(&mut shard)
+                    .into_iter()
+                    .filter(|port| *port == free)
+                    .count(),
+                1,
+                "draw {draw} did not take the one free own port"
+            );
+        }
+    }
+
     /// Issue #788: a walk that starts on ports whose four-tuple to this
     /// remote a lingering connection still holds takes the next
     /// candidate instead of failing the connect.
@@ -5629,10 +5920,10 @@ mod tests {
         for offset in 0..HELD {
             hold_four_tuple(&mut shard, first + offset);
         }
-        let walk = super::EphemeralWalk::starting_at(first, last, 0);
+        let candidates = classified_candidates(first, last, 0, 0, 1);
 
         shard
-            .open_tcp_connect_along_own_flows(walk, connect_request(), 1)
+            .open_tcp_connect_along_own_flows(&candidates, connect_request())
             .expect("an in-use candidate is not a failure")
             .expect("the candidate after the held ones opens");
 
@@ -5674,19 +5965,20 @@ mod tests {
     /// four-tuple is free again, as it is for a guest that closed second
     /// or whose peer holds no state), never take a local port twice
     /// while the accepting shard's own-flow candidates of the window are
-    /// not exhausted. The design's bound: a connect takes the first
-    /// own-flow candidate at or after its start and the next start is the
-    /// port after it, so the taken ports ascend through the window's own
-    /// flow candidates and the first repeat is the connect after the last
-    /// of them. This is the issue #881 reuse, which the previous uniformly
-    /// random start made likely within a few connects.
+    /// not exhausted. The design's bound: a connect takes the first free
+    /// own port at or after its start rank and the next start is the rank
+    /// after it, so the taken ports ascend through the window's own ports
+    /// and the first repeat is the connect after the last of them. This
+    /// is the issue #881 reuse, which the previous uniformly random start
+    /// made likely within a few connects.
     #[test]
     fn closed_connects_to_one_remote_walk_the_window_before_reusing_a_port() {
         const CONNECTS: usize = 600;
         let state = connect_shard_set(2);
         let (first, last) = state.shard_at(0).lock().ephemeral_window();
+        let owners = connect_request().port_owners(2);
         let own_candidates = (first..=last)
-            .filter(|port| connect_request().owner_of(*port, 2) == 0)
+            .filter(|port| owners.owner_of(*port) == 0)
             .count();
         assert!(
             own_candidates > CONNECTS,
@@ -5722,13 +6014,7 @@ mod tests {
     fn different_remotes_start_at_unrelated_offsets() {
         let state = connect_shard_set(1);
         let shard = state.shard_at(0).lock();
-        let start = |request: &super::TcpConnectRequest| {
-            shard
-                .connect_walk(request)
-                .0
-                .next()
-                .expect("a walk has a first candidate")
-        };
+        let start = |request: &super::TcpConnectRequest| first_connect_port(&shard, request);
         let base = connect_request();
         let mut starts = Vec::new();
         for step in 0..8_u8 {
@@ -5784,7 +6070,7 @@ mod tests {
                         port: CONNECT_REMOTE_PORT + port,
                         ..connect_request()
                     };
-                    shard.connect_walk(&request).0.next().expect("a first port") - first
+                    first_connect_port(&shard, &request) - first
                 })
                 .collect()
         };
@@ -5827,16 +6113,20 @@ mod tests {
             hold_four_tuple(&mut state.shard_at(0).lock(), *port);
         }
         hold_four_tuple(&mut state.shard_at(1).lock(), foreign[0]);
-        let walk = super::EphemeralWalk::starting_at(first, first + 63, 0);
+        let candidates = classified_candidates(first, first + 63, 0, 0, 2);
 
         let own_flow = state
             .shard_at(0)
             .lock()
-            .open_tcp_connect_along_own_flows(walk, connect_request(), 2)
+            .open_tcp_connect_along_own_flows(&candidates, connect_request())
             .expect("an in-use candidate is not a failure");
         assert!(own_flow.is_none(), "every own-shard candidate is held");
         let stream = state
-            .open_tcp_connect_along_foreign_flows(walk, 0, connect_request())
+            .open_tcp_connect_along_foreign_flows(
+                &candidates,
+                &connect_request().port_owners(2),
+                connect_request(),
+            )
             .expect("the second foreign candidate opens")
             .stream;
 
@@ -5860,16 +6150,20 @@ mod tests {
         for port in &foreign {
             hold_four_tuple(&mut state.shard_at(1).lock(), *port);
         }
-        let walk = super::EphemeralWalk::starting_at(first, first + 63, 0);
+        let candidates = classified_candidates(first, first + 63, 0, 0, 2);
 
         let own_flow = state
             .shard_at(0)
             .lock()
-            .open_tcp_connect_along_own_flows(walk, connect_request(), 2)
+            .open_tcp_connect_along_own_flows(&candidates, connect_request())
             .expect("an in-use candidate is not a failure");
         assert!(own_flow.is_none());
         let error = state
-            .open_tcp_connect_along_foreign_flows(walk, 0, connect_request())
+            .open_tcp_connect_along_foreign_flows(
+                &candidates,
+                &connect_request().port_owners(2),
+                connect_request(),
+            )
             .err()
             .expect("no candidate is free");
         assert_eq!(error.detail, crate::NetworkErrorDetail::TcpNoEphemeralPorts);
@@ -6275,7 +6569,11 @@ mod tests {
                         state: NeighborState::Reachable,
                         updated_at: StackInstant::from_nanos(0),
                     });
-                    shard.install_udp_bind(slot, 49_153)
+                    shard.install_udp_bind(
+                        slot,
+                        NetworkIpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
+                        49_153,
+                    )
                 },
                 NetworkShard::remove_udp_replica,
             )
@@ -6881,5 +7179,416 @@ mod tests {
                 assert_eq!(sorted, (0..pair_count).collect::<Vec<_>>());
             }
         }
+    }
+
+    fn configure_ipv4_dns_service() -> (
+        super::NetworkService<TestCpu, RecordingNetworkInterface>,
+        RecordingNetworkInterface,
+        Ipv4Address,
+        Ipv4Address,
+    ) {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let resolver = Ipv4Address::new([192, 0, 2, 53]);
+        let device = RecordingNetworkInterface::accepting_transmissions(1);
+        let service = test_network_service_on(device.clone());
+        service.inner.state.with_mut(|shard| {
+            shard
+                .stack
+                .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                .expect("test IPv4 configuration should succeed");
+            let _ = shard.dns_servers.try_push(resolver);
+            shard.stack.learn_neighbor(NeighborEntry {
+                ip: IpAddress::Ipv4(resolver),
+                mac: [0x02, 0, 0, 0, 0, 53],
+                state: NeighborState::Reachable,
+                updated_at: StackInstant::from_nanos(0),
+            });
+            service.inner.control.publish_from_shard(shard);
+        });
+        service.synchronize_control_plane();
+        (service, device, local, resolver)
+    }
+
+    fn decode_transmitted_udp_dns(frame: &[u8]) -> Option<(u16, u16, &[u8])> {
+        let ethernet = EthernetFrame::parse(frame)?;
+        if ethernet.protocol != EthernetProtocol::Ipv4 {
+            return None;
+        }
+        let ipv4 = Ipv4Packet::parse(ethernet.payload)?;
+        if ipv4.protocol != IpProtocol::Udp {
+            return None;
+        }
+        let udp = UdpPacket::parse(ipv4.payload)?;
+        if udp.destination_port != super::DNS_PORT || udp.payload.len() < 12 {
+            return None;
+        }
+        let id = u16::from_be_bytes([udp.payload[0], udp.payload[1]]);
+        Some((udp.source_port, id, udp.payload))
+    }
+
+    fn encode_https_reply_payload(
+        query_id: u16,
+        qname: &str,
+        flags: u16,
+        records: &[(&str, u16, u32, Vec<u8>)],
+    ) -> Vec<u8> {
+        let push_labels = |out: &mut Vec<u8>, domain: &str| {
+            if domain == "." {
+                out.push(0);
+                return;
+            }
+            for label in domain.split('.') {
+                out.push(label.len() as u8);
+                out.extend_from_slice(label.as_bytes());
+            }
+            out.push(0);
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(&query_id.to_be_bytes());
+        out.extend_from_slice(&flags.to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(&(records.len() as u16).to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        push_labels(&mut out, qname);
+        out.extend_from_slice(&65u16.to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes());
+        for (owner, rtype, ttl, rdata) in records {
+            push_labels(&mut out, owner);
+            out.extend_from_slice(&rtype.to_be_bytes());
+            out.extend_from_slice(&1u16.to_be_bytes());
+            out.extend_from_slice(&ttl.to_be_bytes());
+            out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            out.extend_from_slice(rdata);
+        }
+        out
+    }
+
+    #[test]
+    fn dns_resolve_https_short_circuits_ip_literals_and_rejects_malformed_names() {
+        let service = test_network_service();
+        assert_eq!(
+            block_on(service.dns_resolve_https("192.0.2.1", 443, SECOND)).expect("IPv4 literal"),
+            None
+        );
+        assert_eq!(
+            block_on(service.dns_resolve_https("2001:db8::1", 443, SECOND)).expect("IPv6 literal"),
+            None
+        );
+        assert_eq!(
+            block_on(service.dns_resolve_https("[2001:db8::1]", 8443, SECOND))
+                .expect("bracketed IPv6 literal"),
+            None
+        );
+        let err = block_on(service.dns_resolve_https("", 443, SECOND))
+            .expect_err("empty hostname must fail query construction");
+        assert_eq!(err.kind, crate::DnsErrorKind::UnresolvedHost);
+    }
+
+    #[test]
+    fn dns_resolve_https_queries_prefixed_qname_chases_alias_and_handles_rcodes() {
+        let (service, device, local, resolver) = configure_ipv4_dns_service();
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+
+        // 1. Non-443 port sends `_8443._https.example.com` Type 65 and decodes ServiceMode.
+        {
+            let mut fut = core::pin::pin!(service.dns_resolve_https("example.com", 8443, SECOND));
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            let tx = device.transmitted_frames();
+            let (client_port, query_id, dns_wire) = tx
+                .iter()
+                .rev()
+                .find_map(|frame| decode_transmitted_udp_dns(frame))
+                .expect("expected outbound UDP DNS query");
+            let expected_qname =
+                super::DnsWireName::https_qname("example.com", 8443).expect("valid qname");
+            assert_eq!(
+                &dns_wire[12..12 + expected_qname.as_wire().len()],
+                expected_qname.as_wire()
+            );
+
+            // ServiceMode: priority 1, target `.`, alpn=["h3"], port=8443, TTL 120s.
+            let rdata = alloc::vec![
+                0, 1, 0, // priority=1, target="."
+                0, 1, 0, 3, 2, b'h', b'3', // alpn=["h3"]
+                0, 3, 0, 2, 0x20, 0xfb, // port=8443
+            ];
+            let reply = encode_https_reply_payload(
+                query_id,
+                "_8443._https.example.com",
+                0x8180,
+                &[("_8443._https.example.com", 65, 120, rdata)],
+            );
+            let (frame, len) =
+                ipv4_udp_frame(resolver, super::DNS_PORT, local, client_port, &reply);
+            device.deliver_on(0, &frame[..len]);
+
+            let core::task::Poll::Ready(Ok(Some(record))) = fut.as_mut().poll(&mut cx) else {
+                panic!("expected Ready(Ok(Some(HttpsRecord)))");
+            };
+            assert_eq!(record.alpn, alloc::vec![alloc::string::String::from("h3")]);
+            assert_eq!(record.port, Some(8443));
+            assert_eq!(record.ttl_nanos, 120 * SECOND);
+        }
+
+        // 2. External AliasMode hop re-queries target and clamps TTL to minimum across hops.
+        {
+            let before = device.transmitted_frames().len();
+            let mut fut = core::pin::pin!(service.dns_resolve_https("alias.test", 443, SECOND));
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            let tx = device.transmitted_frames();
+            let (client_port, first_id, _) = decode_transmitted_udp_dns(&tx[before])
+                .expect("expected first AliasMode hop query");
+
+            let mut alias_rdata = alloc::vec![0, 0];
+            alias_rdata.extend_from_slice(
+                super::DnsWireName::from_host("real.test")
+                    .expect("valid host")
+                    .as_wire(),
+            );
+            let first_reply = encode_https_reply_payload(
+                first_id,
+                "alias.test",
+                0x8180,
+                &[("alias.test", 65, 45, alias_rdata)],
+            );
+            let (frame, len) =
+                ipv4_udp_frame(resolver, super::DNS_PORT, local, client_port, &first_reply);
+            device.deliver_on(0, &frame[..len]);
+
+            let before_second = device.transmitted_frames().len();
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            let tx = device.transmitted_frames();
+            let (_, second_id, second_wire) = decode_transmitted_udp_dns(&tx[before_second])
+                .expect("expected follow-up query for real.test");
+            let real_wire = super::DnsWireName::from_host("real.test").unwrap();
+            assert_eq!(
+                &second_wire[12..12 + real_wire.as_wire().len()],
+                real_wire.as_wire()
+            );
+
+            let service_rdata = alloc::vec![0, 1, 0, 0, 1, 0, 3, 2, b'h', b'3'];
+            let second_reply = encode_https_reply_payload(
+                second_id,
+                "real.test",
+                0x8180,
+                &[("real.test", 65, 300, service_rdata)],
+            );
+            let (frame, len) =
+                ipv4_udp_frame(resolver, super::DNS_PORT, local, client_port, &second_reply);
+            device.deliver_on(0, &frame[..len]);
+
+            let core::task::Poll::Ready(Ok(Some(record))) = fut.as_mut().poll(&mut cx) else {
+                panic!("expected Ready(Ok(Some(HttpsRecord))) after AliasMode hop");
+            };
+            assert_eq!(record.alpn, alloc::vec![alloc::string::String::from("h3")]);
+            assert_eq!(record.ttl_nanos, 45 * SECOND);
+        }
+
+        // 3. NXDOMAIN -> Ok(None), SERVFAIL -> Err(DnsError).
+        for (rcode_flags, expect_none) in [(0x8183u16, true), (0x8182u16, false)] {
+            let before = device.transmitted_frames().len();
+            let mut fut = core::pin::pin!(service.dns_resolve_https("missing.test", 443, SECOND));
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            let tx = device.transmitted_frames();
+            let (client_port, query_id, _) =
+                decode_transmitted_udp_dns(&tx[before]).expect("expected query");
+            let reply = encode_https_reply_payload(query_id, "missing.test", rcode_flags, &[]);
+            let (frame, len) =
+                ipv4_udp_frame(resolver, super::DNS_PORT, local, client_port, &reply);
+            device.deliver_on(0, &frame[..len]);
+
+            let core::task::Poll::Ready(outcome) = fut.as_mut().poll(&mut cx) else {
+                panic!("expected Ready after DNS response");
+            };
+            if expect_none {
+                assert_eq!(outcome.expect("NXDOMAIN must return Ok(None)"), None);
+            } else {
+                let err = outcome.expect_err("SERVFAIL must surface a DnsError");
+                assert_eq!(err.detail, crate::NetworkErrorDetail::DnsLookupFailed);
+            }
+        }
+    }
+
+    #[test]
+    fn dns_resolve_https_enforces_combined_cross_packet_and_in_packet_hop_budget() {
+        let (service, device, local, resolver) = configure_ipv4_dns_service();
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+
+        // 1 external AliasMode hop + `DNS_MAX_CNAME_CHAIN` in-packet CNAME hops
+        // totals `DNS_MAX_CNAME_CHAIN + 1` hops and must resolve to `Ok(None)`.
+        for (in_packet_cnames, expect_some) in [
+            (super::DNS_MAX_CNAME_CHAIN, false),
+            (super::DNS_MAX_CNAME_CHAIN - 1, true),
+        ] {
+            let before = device.transmitted_frames().len();
+            let mut fut = core::pin::pin!(service.dns_resolve_https("start.test", 443, SECOND));
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            let tx = device.transmitted_frames();
+            let (client_port, first_id, _) = tx[before..]
+                .iter()
+                .rev()
+                .find_map(|frame| decode_transmitted_udp_dns(frame))
+                .expect("expected initial query");
+
+            let mut alias_rdata = alloc::vec![0, 0];
+            alias_rdata.extend_from_slice(
+                super::DnsWireName::from_host("hop1.test")
+                    .expect("valid host")
+                    .as_wire(),
+            );
+            let first_reply = encode_https_reply_payload(
+                first_id,
+                "start.test",
+                0x8180,
+                &[("start.test", 65, 120, alias_rdata)],
+            );
+            let (frame, len) =
+                ipv4_udp_frame(resolver, super::DNS_PORT, local, client_port, &first_reply);
+            device.deliver_on(0, &frame[..len]);
+
+            let before_second = device.transmitted_frames().len();
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            let tx = device.transmitted_frames();
+            let (_, second_id, _) = tx[before_second..]
+                .iter()
+                .rev()
+                .find_map(|frame| decode_transmitted_udp_dns(frame))
+                .expect("expected follow-up query");
+
+            let names: alloc::vec::Vec<alloc::string::String> = (1..=in_packet_cnames + 1)
+                .map(|idx| alloc::format!("hop{idx}.test"))
+                .collect();
+            let mut records = alloc::vec::Vec::new();
+            for pair in names.windows(2) {
+                records.push((
+                    pair[0].as_str(),
+                    5u16,
+                    120u32,
+                    super::DnsWireName::from_host(&pair[1])
+                        .expect("valid host")
+                        .as_wire()
+                        .to_vec(),
+                ));
+            }
+            records.push((
+                names[in_packet_cnames].as_str(),
+                65u16,
+                120u32,
+                alloc::vec![0, 1, 0, 0, 1, 0, 3, 2, b'h', b'3'],
+            ));
+            let second_reply = encode_https_reply_payload(second_id, "hop1.test", 0x8180, &records);
+            let (frame, len) =
+                ipv4_udp_frame(resolver, super::DNS_PORT, local, client_port, &second_reply);
+            device.deliver_on(0, &frame[..len]);
+
+            let core::task::Poll::Ready(outcome) = fut.as_mut().poll(&mut cx) else {
+                panic!("expected Ready after second DNS response");
+            };
+            let record = outcome.expect("chain budget check must not fail with DnsError");
+            assert_eq!(record.is_some(), expect_some);
+        }
+    }
+
+    #[test]
+    fn loopback_ipv4_and_ipv6_tcp_and_udp_work_without_dhcp_or_nic_tx() {
+        fn poll_ready<F: core::future::Future>(
+            mut fut: core::pin::Pin<&mut F>,
+            cx: &mut core::task::Context<'_>,
+        ) -> F::Output {
+            for _ in 0..16 {
+                if let core::task::Poll::Ready(out) = fut.as_mut().poll(cx) {
+                    return out;
+                }
+            }
+            panic!("loopback future did not complete within 16 polls");
+        }
+
+        let device = RecordingNetworkInterface::accepting_transmissions(1);
+        let service = test_network_service_on(device.clone());
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+
+        for loopback in [
+            NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
+            NetworkIpAddress::Ipv6(Ipv6Address::LOOPBACK),
+        ] {
+            let listener = {
+                let fut = core::pin::pin!(service.tcp_listen(loopback, 0, 4, 64));
+                poll_ready(fut, &mut cx).expect("loopback tcp listen must succeed without DHCP")
+            };
+            assert_ne!(listener.local_port, 0);
+
+            let client = {
+                let fut = core::pin::pin!(service.tcp_connect_address(
+                    loopback,
+                    listener.local_port,
+                    0,
+                    64,
+                    SECOND,
+                ));
+                poll_ready(fut, &mut cx).expect("loopback tcp connect must succeed without DHCP")
+            };
+            let accepted = {
+                let fut = core::pin::pin!(service.tcp_accept(listener.listener, SECOND));
+                poll_ready(fut, &mut cx).expect("loopback tcp accept must succeed")
+            };
+
+            {
+                let fut = core::pin::pin!(service.tcp_write_all(client, b"hello", SECOND));
+                poll_ready(fut, &mut cx).expect("loopback tcp write");
+            }
+            let received = {
+                let fut = core::pin::pin!(service.tcp_read(accepted.stream, 32, SECOND));
+                poll_ready(fut, &mut cx).expect("loopback tcp read")
+            };
+            let received: alloc::vec::Vec<u8> = received
+                .into_iter()
+                .flat_map(|chunk| chunk.to_vec())
+                .collect();
+            assert_eq!(received.as_slice(), b"hello");
+
+            service.tcp_close(client);
+            service.tcp_close(accepted.stream);
+            service.tcp_listener_close(listener.listener);
+
+            let udp_server = {
+                let fut = core::pin::pin!(service.udp_bind(loopback, 0));
+                poll_ready(fut, &mut cx).expect("loopback udp bind must succeed")
+            };
+            let udp_client = {
+                let fut = core::pin::pin!(service.udp_bind(loopback, 0));
+                poll_ready(fut, &mut cx).expect("loopback udp client bind must succeed")
+            };
+            let sent = {
+                let fut = core::pin::pin!(service.udp_send_address(
+                    udp_client.socket,
+                    loopback,
+                    udp_server.local_port,
+                    b"dgram",
+                    SECOND,
+                ));
+                poll_ready(fut, &mut cx).expect("loopback udp send_address")
+            };
+            assert_eq!(sent, 5);
+            let dgram = {
+                let fut = core::pin::pin!(service.udp_receive(udp_server.socket, 64, SECOND));
+                poll_ready(fut, &mut cx)
+                    .expect("loopback udp receive")
+                    .expect("loopback udp datagram must arrive")
+            };
+            assert_eq!(dgram.bytes.as_ref(), b"dgram");
+            assert_eq!(dgram.address, loopback);
+
+            service.udp_close(udp_client.socket);
+            service.udp_close(udp_server.socket);
+        }
+
+        assert!(
+            device.transmitted_frames().is_empty(),
+            "loopback traffic must never be transmitted onto the NIC"
+        );
     }
 }

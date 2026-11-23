@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 use core::alloc::Layout;
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crossbeam_utils::CachePadded;
 use helios_hal::hv::{GuestRange, Hypervisor};
 use helios_hal::pmm::{PhysFrame, PhysFrameAllocator, PhysFrameRange};
@@ -20,6 +20,8 @@ pub enum GuestMemoryError {
     Bounds,
     #[error("scatter/gather byte count does not match the buffer")]
     Length,
+    #[error("guest memory partial-word write raced with another writer")]
+    Contended,
 }
 
 /// Per-VM accounting, independent of Wasm linear memory and pooling slots.
@@ -108,13 +110,13 @@ impl GuestPages {
     pub(super) fn frames(&self) -> &[PhysFrame] {
         &self.frames
     }
-    fn byte(&self, offset: usize) -> &AtomicU8 {
+    fn word(&self, offset: usize) -> &AtomicU64 {
         let frame = self.frames[offset / PhysFrame::SIZE];
-        let address = frame.phys_addr() + offset % PhysFrame::SIZE;
-        // SAFETY: these initialized frames remain owned by self. Atomic byte
-        // accesses permit concurrent host access without manufacturing slices
-        // or exclusive references over RAM a guest can modify concurrently.
-        unsafe { AtomicU8::from_ptr(core::ptr::with_exposed_provenance_mut(address)) }
+        let address = frame.phys_addr() + ((offset % PhysFrame::SIZE) & !7);
+        // SAFETY: frames are initialized, page-aligned and retained by self.
+        // Every host access uses this same atomic width. No Rust slice or
+        // exclusive reference is manufactured over concurrently running RAM.
+        unsafe { AtomicU64::from_ptr(core::ptr::with_exposed_provenance_mut(address)) }
     }
 }
 
@@ -128,8 +130,11 @@ impl Drop for GuestPages {
 
 /// Explicit byte-copy view of kernel-managed guest RAM. Cloning retains the
 /// allocation, not a host pointer or Wasm linear-memory mapping. Reads/writes
-/// are byte-atomic, not a coherent snapshot against running guest processors;
-/// device protocols must provide their own publication/synchronization rules.
+/// use aligned 64-bit atomic cells with acquire/release publication. Naturally
+/// aligned 1/2/4/8-byte accesses are atomic; larger or unaligned transfers are
+/// not snapshots. Device protocols still own synchronization with guest CPUs.
+/// Partial-cell writes attempt one compare-exchange and return `Contended`
+/// on interference; a prefix of the transfer may already have been written.
 #[derive(Clone)]
 pub struct GuestMemoryRegion {
     pub(super) range: GuestRange,
@@ -177,17 +182,47 @@ impl GuestMemoryRegion {
     }
     pub fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), GuestMemoryError> {
         self.validate(offset, destination.len())?;
-        for (index, byte) in destination.iter_mut().enumerate() {
-            *byte = self.pages.byte(offset + index).load(Ordering::Relaxed);
+        let mut copied = 0;
+        while copied < destination.len() {
+            let position = offset + copied;
+            let lane = position % 8;
+            let count = (8 - lane).min(destination.len() - copied);
+            let bytes = self
+                .pages
+                .word(position)
+                .load(Ordering::Acquire)
+                .to_ne_bytes();
+            destination[copied..copied + count].copy_from_slice(&bytes[lane..lane + count]);
+            copied += count;
         }
         Ok(())
     }
     pub fn write(&self, offset: usize, source: &[u8]) -> Result<(), GuestMemoryError> {
         self.validate(offset, source.len())?;
-        for (index, byte) in source.iter().enumerate() {
-            self.pages
-                .byte(offset + index)
-                .store(*byte, Ordering::Relaxed);
+        let mut copied = 0;
+        while copied < source.len() {
+            let position = offset + copied;
+            let lane = position % 8;
+            let count = (8 - lane).min(source.len() - copied);
+            let word = self.pages.word(position);
+            if count == 8 {
+                word.store(
+                    u64::from_ne_bytes(source[copied..copied + 8].try_into().unwrap()),
+                    Ordering::Release,
+                );
+            } else {
+                let previous = word.load(Ordering::Acquire);
+                let mut bytes = previous.to_ne_bytes();
+                bytes[lane..lane + count].copy_from_slice(&source[copied..copied + count]);
+                word.compare_exchange(
+                    previous,
+                    u64::from_ne_bytes(bytes),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| GuestMemoryError::Contended)?;
+            }
+            copied += count;
         }
         Ok(())
     }

@@ -15,8 +15,13 @@
 //! range its parent gives it, breaks that order and ends the walk with
 //! [`Error::TreeOrder`] instead of revisiting blocks.
 
-use alloc::boxed::Box;
-use alloc::vec;
+#[cfg(feature = "write")]
+pub(crate) mod edit;
+#[cfg(feature = "write")]
+pub(crate) mod write;
+
+use alloc::sync::Arc;
+use core::iter::repeat_n;
 
 use arrayvec::ArrayVec;
 
@@ -53,8 +58,9 @@ pub(crate) struct Expected {
 }
 
 /// A validated tree block.
+#[derive(Clone)]
 pub(crate) struct Node {
-    bytes: Box<[u8]>,
+    bytes: Arc<[u8]>,
     level: u8,
     nritems: usize,
 }
@@ -67,20 +73,51 @@ impl Node {
         logical: u64,
         expected: Expected,
     ) -> Result<Self, Error> {
+        Self::read_until(volume, logical, expected, volume.superblock().generation()).await
+    }
+
+    /// [`Self::read`] of a block that may be newer than the superblock, up to
+    /// generation `newest`: a log tree's blocks belong to the transaction
+    /// after the last commit, as `btrfs_replay_log` reads them.
+    pub(crate) async fn read_until<S: BlockSource>(
+        volume: &Volume<S>,
+        logical: u64,
+        expected: Expected,
+        newest: u64,
+    ) -> Result<Self, Error> {
         let superblock = volume.superblock();
         let nodesize = superblock.nodesize() as usize;
-        let mut bytes = vec![0_u8; nodesize].into_boxed_slice();
+        let mut bytes = Arc::<[u8]>::from_iter(repeat_n(0, nodesize));
         let nritems = volume
-            .read_verified(logical, &mut bytes, |block| {
-                validate(block, logical, expected, superblock)
-                    .map_err(|defect| Error::TreeBlock { logical, defect })
-            })
+            .read_verified(
+                logical,
+                Arc::get_mut(&mut bytes).expect("unpublished node"),
+                |block| {
+                    validate(block, logical, expected, superblock, newest)
+                        .map_err(|defect| Error::TreeBlock { logical, defect })
+                },
+            )
             .await?;
         Ok(Self {
             bytes,
             level: expected.level,
             nritems,
         })
+    }
+
+    #[cfg(feature = "write")]
+    pub(crate) fn owner(&self) -> u64 {
+        view::<RawHeader>(&self.bytes)
+            .expect("validated node")
+            .owner
+            .get()
+    }
+
+    #[cfg(feature = "write")]
+    pub(crate) fn chunk_tree_uuid(&self) -> [u8; 16] {
+        view::<RawHeader>(&self.bytes)
+            .expect("validated node")
+            .chunk_tree_uuid
     }
 
     pub(crate) fn level(&self) -> u8 {
@@ -114,7 +151,7 @@ impl Node {
     }
 
     /// The block and generation internal slot `slot` points at.
-    fn child(&self, slot: usize) -> (u64, u64) {
+    pub(crate) fn child(&self, slot: usize) -> (u64, u64) {
         let ptr: &RawKeyPtr = view(&self.bytes[HEADER_BYTES + slot * KEY_PTR_BYTES..])
             .expect("validated key pointer array");
         (ptr.blockptr.get(), ptr.generation.get())
@@ -136,12 +173,14 @@ impl Node {
     }
 }
 
-/// Every check a tree block must pass. Returns the item count.
+/// Every check a tree block must pass, none of its generation above
+/// `newest`. Returns the item count.
 fn validate(
     bytes: &[u8],
     logical: u64,
     expected: Expected,
     superblock: &Superblock,
+    newest: u64,
 ) -> Result<usize, NodeDefect> {
     let header: &RawHeader = view(bytes).ok_or(NodeDefect::ItemCount { nritems: 0 })?;
     if !superblock
@@ -165,10 +204,10 @@ fn validate(
         });
     }
     let generation = header.generation.get();
-    if generation > superblock.generation() {
+    if generation > newest {
         return Err(NodeDefect::FutureGeneration {
             found: generation,
-            superblock: superblock.generation(),
+            superblock: newest,
         });
     }
     if generation != expected.generation {
@@ -235,6 +274,22 @@ fn validate(
     Ok(nritems)
 }
 
+/// Immutable node access for a committed tree or a transaction's CoW view.
+/// Reads are independent and may be polled concurrently on any processor.
+pub(crate) trait NodeSource: Sync {
+    fn read_node(
+        &self,
+        logical: u64,
+        expected: Expected,
+    ) -> impl core::future::Future<Output = Result<Node, Error>> + Send;
+}
+
+impl<S: BlockSource> NodeSource for Volume<S> {
+    async fn read_node(&self, logical: u64, expected: Expected) -> Result<Node, Error> {
+        Node::read(self, logical, expected).await
+    }
+}
+
 struct Level {
     node: Node,
     slot: usize,
@@ -252,22 +307,22 @@ pub(crate) struct Cursor {
 impl Cursor {
     /// A cursor on the last item whose key is at most `target`, or on the
     /// tree's first item when every key is above `target`.
-    pub(crate) async fn floor<S: BlockSource>(
-        volume: &Volume<S>,
+    pub(crate) async fn floor<R: NodeSource>(
+        source: &R,
         root: TreeRoot,
         target: Key,
     ) -> Result<Self, Error> {
         let mut path = ArrayVec::new();
-        let mut node = Node::read(
-            volume,
-            root.bytenr,
-            Expected {
-                level: root.level,
-                generation: root.generation,
-                first_key: None,
-            },
-        )
-        .await?;
+        let mut node = source
+            .read_node(
+                root.bytenr,
+                Expected {
+                    level: root.level,
+                    generation: root.generation,
+                    first_key: None,
+                },
+            )
+            .await?;
         loop {
             let slot = node.floor_slot(target);
             if node.level() == 0 {
@@ -279,21 +334,21 @@ impl Cursor {
                     exhausted,
                 });
             }
-            let child = read_child(volume, &node, slot).await?;
+            let child = read_child(source, &node, slot).await?;
             path.push(Level { node, slot });
             node = child;
         }
     }
 
     /// A cursor on the first item whose key is at least `target`.
-    pub(crate) async fn ceiling<S: BlockSource>(
-        volume: &Volume<S>,
+    pub(crate) async fn ceiling<R: NodeSource>(
+        source: &R,
         root: TreeRoot,
         target: Key,
     ) -> Result<Self, Error> {
-        let mut cursor = Self::floor(volume, root, target).await?;
+        let mut cursor = Self::floor(source, root, target).await?;
         if cursor.key().is_some_and(|key| key < target) {
-            cursor.advance(volume).await?;
+            cursor.advance(source).await?;
         }
         Ok(cursor)
     }
@@ -322,10 +377,7 @@ impl Cursor {
     }
 
     /// Moves to the next item in key order.
-    pub(crate) async fn advance<S: BlockSource>(
-        &mut self,
-        volume: &Volume<S>,
-    ) -> Result<(), Error> {
+    pub(crate) async fn advance<R: NodeSource>(&mut self, source: &R) -> Result<(), Error> {
         let Some(previous) = self.key() else {
             return Ok(());
         };
@@ -352,7 +404,7 @@ impl Cursor {
         while let Some(parent) = self.path.last()
             && parent.node.level() > 0
         {
-            let child = read_child(volume, &parent.node, parent.slot).await?;
+            let child = read_child(source, &parent.node, parent.slot).await?;
             self.path.push(Level {
                 node: child,
                 slot: 0,
@@ -370,20 +422,16 @@ impl Cursor {
     }
 }
 
-async fn read_child<S: BlockSource>(
-    volume: &Volume<S>,
-    parent: &Node,
-    slot: usize,
-) -> Result<Node, Error> {
+async fn read_child<R: NodeSource>(source: &R, parent: &Node, slot: usize) -> Result<Node, Error> {
     let (bytenr, generation) = parent.child(slot);
-    Node::read(
-        volume,
-        bytenr,
-        Expected {
-            level: parent.level() - 1,
-            generation,
-            first_key: Some(parent.key(slot)),
-        },
-    )
-    .await
+    source
+        .read_node(
+            bytenr,
+            Expected {
+                level: parent.level() - 1,
+                generation,
+                first_key: Some(parent.key(slot)),
+            },
+        )
+        .await
 }

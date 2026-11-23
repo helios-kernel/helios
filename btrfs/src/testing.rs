@@ -12,7 +12,7 @@ use core::task::{Context, Poll, Waker};
 use helios_hal::io::{IoError, IoResult};
 
 use crate::items::{FileExtent, Metadata, RecordKind, RootRecord, dir_index_record, dir_records};
-use crate::{BlockSource, Compression, DirPosition, Error, FileKind, Filesystem, Key};
+use crate::{BlockSource, Compression, DirBound, DirPosition, Error, FileKind, Filesystem, Key};
 
 const SECTOR: usize = 4096;
 
@@ -87,7 +87,7 @@ pub async fn walk<S: BlockSource>(source: S) -> Result<(), Error> {
         match inode.kind() {
             FileKind::Directory => {
                 let mut entries = vec![];
-                fs.read_dir(&inode, DirPosition::START, |entry| {
+                fs.read_dir(&inode, DirPosition::START, DirBound::UNBOUNDED, |entry| {
                     entries.push((entry.name.to_vec(), entry.target, entry.kind));
                     ControlFlow::Continue(())
                 })

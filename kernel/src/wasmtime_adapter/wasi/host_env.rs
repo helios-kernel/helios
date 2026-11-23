@@ -202,18 +202,16 @@ where
         StreamReader<u8>,
         FutureReader<core::result::Result<(), cli_types::ErrorCode>>,
     )> {
-        use crate::ComponentOutputMode;
+        use crate::ComponentInputRoute;
         // For spawn-mode programs, drain the parent-provided stdin reader
-        // one chunk at a time. For Serial/Trace programs, hand back an
+        // one chunk at a time. For Serial/Closed routes, hand back an
         // immediately empty stream (serial stdin is polled through the
         // dedicated `helios:system/serial` interface instead).
-        let stream = match access.get().output_mode() {
-            ComponentOutputMode::Child { stdin_rx, .. }
-            | ComponentOutputMode::RoutedChild { stdin_rx, .. } => {
-                let reader = stdin_rx.clone();
+        let stream = match access.get().output_mode().stdin_route() {
+            ComponentInputRoute::Child(reader) => {
                 StreamReader::new(&mut access, ChannelStreamProducer::new(reader))?
             }
-            ComponentOutputMode::Serial | ComponentOutputMode::Trace => {
+            ComponentInputRoute::Serial | ComponentInputRoute::Closed => {
                 StreamReader::new(&mut access, Vec::<u8>::new())?
             }
         };

@@ -111,6 +111,23 @@ impl<S: Stage2Space> Vcpu<S> {
     pub fn previous_processor(&self) -> Option<ProcessorId> {
         self.previous
     }
+    /// Requires exclusive ownership, so entry/completion cannot race reset.
+    /// Discard queued IRQs; an injection concurrent with this operation may
+    /// be discarded or become pending after reset. A stopped VM stays stopped.
+    pub fn reset(&mut self) -> Result<(), HvError> {
+        if self.signals.stopped.load(Ordering::Acquire) {
+            return Err(HvError::Stopped);
+        }
+        self.backend.reset()?;
+        self.pending = None;
+        for _ in 0..self.signals.capacity {
+            if self.signals.irqs.pop().is_err() {
+                break;
+            }
+        }
+        self.signals.requested.store(false, Ordering::Release);
+        Ok(())
+    }
     pub fn get_regs(&mut self) -> Result<<S::Vcpu as GuestVcpu>::Registers, HvError> {
         self.backend.get_regs()
     }

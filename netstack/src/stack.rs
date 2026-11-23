@@ -4260,6 +4260,20 @@ where
         panic!("UDP receive socket count had no matching queued datagram");
     }
 
+    /// Returns a reference to the next queued datagram for `socket` without
+    /// removing it from the receive queue.
+    pub fn peek_udp(&self, socket: UdpSocketId) -> Result<Option<&UdpReceive>, StackError> {
+        self.udp_socket(socket)?;
+        if self.udp_rx_counts[udp_socket_index(socket)] == 0 {
+            return Ok(None);
+        }
+        Ok(self
+            .udp_rx
+            .iter()
+            .find(|queued| queued.socket == socket)
+            .map(|queued| &queued.datagram))
+    }
+
     pub fn take_udp_error(
         &mut self,
         socket: UdpSocketId,
@@ -4321,6 +4335,11 @@ where
             ),
             _ => TcpConnectState::Pending,
         })
+    }
+
+    /// Returns the local endpoint bound to `socket`, if any.
+    pub fn tcp_local_endpoint(&self, socket: SocketId) -> Result<Option<TcpEndpoint>, StackError> {
+        Ok(self.tcp_socket(socket)?.local_endpoint())
     }
 
     /// The receive state of one socket, for a caller that has to report
@@ -4968,6 +4987,32 @@ where
         self.schedule_tcp_timer(index);
         self.update_tcp_receive_backpressure(index);
         Ok(state)
+    }
+
+    /// Copies queued receive bytes for `socket` into `sink` without consuming
+    /// them or advancing the receive window.
+    pub fn tcp_peek_into<S>(
+        &self,
+        socket: SocketId,
+        skip_bytes: usize,
+        sink: &mut S,
+    ) -> Result<TcpReadIntoState, StackError>
+    where
+        S: TcpReceiveBuffer,
+    {
+        let socket = self.tcp_socket(socket)?;
+        Ok(match socket.peek_into(skip_bytes, sink) {
+            Some(bytes) => TcpReadIntoState::Data(bytes),
+            None => match tcp_read_termination(socket) {
+                Some(kind) => TcpReadIntoState::Closed(kind),
+                None => TcpReadIntoState::Pending,
+            },
+        })
+    }
+
+    /// Returns the number of contiguous in-order bytes currently queued for `socket`.
+    pub fn tcp_receive_queued_bytes(&self, socket: SocketId) -> Result<usize, StackError> {
+        Ok(self.tcp_socket(socket)?.receive_queued_bytes())
     }
 
     pub fn send_udp(
@@ -5939,6 +5984,9 @@ where
     }
 
     fn source_ipv4_for(&self, destination: Ipv4Address) -> Option<Ipv4Address> {
+        if destination.is_loopback() {
+            return Some(destination);
+        }
         self.ipv4_addresses
             .iter()
             .copied()
@@ -5963,6 +6011,9 @@ where
     /// qualifies (RFC 6724 §5 rule 3, RFC 4862 §5.5.4), so it still
     /// serves a destination nothing else can reach.
     fn source_ipv6_for(&self, destination: Ipv6Address) -> Option<Ipv6Address> {
+        if destination.is_loopback() {
+            return Some(Ipv6Address::LOOPBACK);
+        }
         self.source_ipv6_among(destination, |entry| !entry.is_deprecated())
             .or_else(|| self.source_ipv6_among(destination, |_| true))
             .or_else(|| {
@@ -6104,6 +6155,9 @@ where
     }
 
     fn next_hop(&self, destination: IpAddress) -> Option<IpAddress> {
+        if is_loopback_ip(destination) {
+            return None;
+        }
         self.routes
             .resolve(destination)
             .and_then(|route| route.gateway)
@@ -6111,17 +6165,24 @@ where
 
     /// Whether `address` shares the link with this stack, which is the
     /// only kind of address ARP and Neighbor Discovery may cache. IPv6
-    /// link-local addresses are on-link by construction.
+    /// link-local addresses and loopback addresses are on-link by
+    /// construction.
     fn is_on_link(&self, address: IpAddress) -> bool {
         match address {
-            IpAddress::Ipv6(ipv6) if ipv6.is_link_local() => true,
+            IpAddress::Ipv4(ipv4) if ipv4.is_loopback() => true,
+            IpAddress::Ipv6(ipv6) if ipv6.is_loopback() || ipv6.is_link_local() => true,
             _ => self.routes.is_on_link(address),
         }
     }
 
     /// The link-layer address frames for `ip` may be sent to: a stale or
     /// delayed entry still is one (RFC 4861 §7.3.3), a probed one is not.
+    /// Loopback frames stay inside the host and carry the local MAC
+    /// without ARP or Neighbor Discovery.
     fn neighbor_mac(&self, ip: IpAddress) -> Option<EthernetAddress> {
+        if is_loopback_ip(ip) {
+            return Some(self.config.mac);
+        }
         self.neighbors
             .get(ip)
             .filter(|entry| {
@@ -7809,16 +7870,22 @@ where
         self.owns_ip_address(IpAddress::Ipv6(destination)) || destination.is_multicast()
     }
 
-    fn owns_ip_address(&self, address: IpAddress) -> bool {
+    pub fn owns_ip_address(&self, address: IpAddress) -> bool {
         match address {
-            IpAddress::Ipv4(address) => self
-                .ipv4_addresses
-                .iter()
-                .any(|local| local.address() == address),
-            IpAddress::Ipv6(address) => self
-                .ipv6_addresses
-                .iter()
-                .any(|local| local.cidr().address() == address),
+            IpAddress::Ipv4(address) => {
+                address.is_loopback()
+                    || self
+                        .ipv4_addresses
+                        .iter()
+                        .any(|local| local.address() == address)
+            }
+            IpAddress::Ipv6(address) => {
+                address.is_loopback()
+                    || self
+                        .ipv6_addresses
+                        .iter()
+                        .any(|local| local.cidr().address() == address)
+            }
         }
     }
 
@@ -8700,6 +8767,13 @@ fn ipv4_directed_broadcast(cidr: Ipv4Cidr) -> Option<Ipv4Address> {
     };
     let network = u32::from_be_bytes(cidr.address().octets()) & mask;
     Some(Ipv4Address::new((network | !mask).to_be_bytes()))
+}
+
+const fn is_loopback_ip(address: IpAddress) -> bool {
+    match address {
+        IpAddress::Ipv4(ipv4) => ipv4.is_loopback(),
+        IpAddress::Ipv6(ipv6) => ipv6.is_loopback(),
+    }
 }
 
 fn ipv4_addresses_own(addresses: &[Ipv4Cidr], address: Ipv4Address) -> bool {

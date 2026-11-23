@@ -80,6 +80,17 @@ impl Digest {
     }
 }
 
+/// Ordering hash for an extent's ordinary data references.
+#[cfg(feature = "write")]
+pub(crate) fn data_ref_hash(root: u64, inode: u64, offset: u64) -> u64 {
+    // btrfs hash_extent_data_ref uses raw CRC32C registers seeded with ~0.
+    let high = !CASTAGNOLI.checksum(&root.to_le_bytes());
+    let mut low = CASTAGNOLI.digest();
+    low.update(&inode.to_le_bytes());
+    low.update(&offset.to_le_bytes());
+    (u64::from(high) << 31) ^ u64::from(!low.finalize())
+}
+
 /// The hash directory items and xattr items are keyed by: the kernel's
 /// `crc32c(~1, name)`, a CRC32C register seeded with `0xfffffffe` and
 /// returned without the final inversion.
@@ -90,6 +101,23 @@ pub(crate) fn name_hash(name: &[u8]) -> u64 {
     let mut digest = register;
     digest.update(name);
     u64::from(!digest.finalize())
+}
+
+/// Linux btrfs_extref_hash seeds the raw register with the parent inode.
+#[cfg(feature = "write")]
+pub(crate) fn inode_ref_hash(parent: u64, name: &[u8]) -> u64 {
+    let mut digest = CASTAGNOLI.digest_with_initial((parent as u32).reverse_bits());
+    digest.update(name);
+    u64::from(!digest.finalize())
+}
+
+/// Linux btrfs send stream command CRC32C (`btrfs_crc32c(0, buf, len)`):
+/// raw CRC32C register seeded with 0 and returned without final inversion.
+#[cfg(feature = "write")]
+pub(crate) fn send_stream_crc(data: &[u8]) -> u32 {
+    let mut digest = CASTAGNOLI.digest_with_initial(0);
+    digest.update(data);
+    !digest.finalize()
 }
 
 #[cfg(test)]

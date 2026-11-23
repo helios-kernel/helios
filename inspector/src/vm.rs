@@ -43,6 +43,8 @@ mod disk;
 mod input;
 mod instruction_profile;
 mod kernel_image;
+mod kernel_image_cache;
+mod kill;
 mod network;
 mod numa;
 mod qemu;
@@ -51,10 +53,13 @@ mod raw_profile;
 mod root_secret_scan;
 mod tpm;
 mod vcpu_state;
+mod vnc;
 mod x86_image_audit;
 
 use disk::{DiskSpecError, VmDiskSpec, validate_disks};
 use input::{InputScript, InputScriptError, InputStatement};
+use kernel_image_cache::{KernelImageBuild, KernelImageCache};
+use kill::KillAfterLines;
 use network::{
     HostPlatform, NetSetupCommand, NetTeardownCommand, QemuNetArgs, VmNetwork, VmNetworkArgs,
     VmNetworkError, VmNetworkFile, VmNetworkProfile, VmNetworkSetupError,
@@ -66,6 +71,7 @@ use raw_profile::{ProfileCommand, RawProfileCollectError};
 use tpm::{Swtpm, SwtpmError, VmTpm, VmTpmBackend, VmTpmError, VmTpmProfile};
 pub(crate) use vcpu_state::VcpuStateCapture;
 use vcpu_state::VcpuStateError;
+use vnc::VncError;
 
 /// Why a `vm` session did not run.
 ///
@@ -254,6 +260,8 @@ pub(crate) enum VmBuildError {
     Tool(#[from] ToolDiscoveryError),
     #[error("{0}")]
     WorkspaceRoot(#[from] WorkspaceRootError),
+    #[error("{0}")]
+    KernelImageCache(#[from] kernel_image_cache::KernelImageCacheError),
     #[error("{0}")]
     RootSecretScan(#[from] root_secret_scan::RootSecretScanError),
     #[error("{0}")]
@@ -528,7 +536,7 @@ pub(crate) enum VmSessionError {
     Screendump {
         path: String,
         #[source]
-        source: QmpError,
+        source: VncError,
     },
     #[error("failed to send statement {statement} of the input script {path}: {source}")]
     SendInput {
@@ -563,6 +571,8 @@ pub(crate) enum VmSessionError {
     WorkloadBench(#[from] WorkloadBenchError),
     #[error("{0}")]
     AotBench(#[from] AotBenchError),
+    #[error("{0}")]
+    LinuxSuite(#[from] crate::linux_suite::LinuxSuiteError),
     #[error("{0}")]
     RawProfile(#[from] RawProfileCollectError),
     #[error("{0}")]
@@ -708,6 +718,7 @@ const SOCKET_DIR_LINK_NAME: &str = "sockets";
 const DEBUG_SOCKET_NAME: &str = "debug.sock";
 const MONITOR_SOCKET_NAME: &str = "monitor.sock";
 const QMP_SOCKET_NAME: &str = "qmp.sock";
+const VNC_SOCKET_NAME: &str = "vnc.sock";
 /// The QEMU IOThread the memory balloon's free-page hint queue runs on.
 const BALLOON_IOTHREAD_ID: &str = "balloon-io";
 /// How long the guest's reported balloon size has to hold still before a
@@ -1779,9 +1790,10 @@ pub(crate) struct VmCommand {
     /// Sign the boot payload with the Ed25519 secret in this file, and
     /// embed its public half in the kernel, instead of the key a
     /// development build generates in its own build directory. A
-    /// release names the key its workflow installed; the file is read
-    /// in place and never copied into the build directory.
-    #[arg(long, value_name = "PATH")]
+    /// release names the key its workflow installed, and CI's boots name
+    /// its signing key through the environment; the file is read in
+    /// place and never copied into the build directory.
+    #[arg(long, value_name = "PATH", env = "HELIOS_ROOT_SECRET_KEY")]
     root_secret_key: Option<PathBuf>,
 
     #[arg(long)]
@@ -1909,6 +1921,16 @@ pub(crate) struct VmCommand {
     #[arg(long = "enable-target", value_name = "TARGET")]
     enable_targets: Vec<String>,
 
+    /// SIGKILL QEMU once `FILE` holds `COUNT` complete lines.
+    ///
+    /// `FILE` is a file the guest appends a line to after each unit of
+    /// work it finished, normally on a writable `--shared-dir`. The guest
+    /// is ended with no shutdown, so what its disks hold is what a crash
+    /// at that point leaves; the session then fails with the lost
+    /// connection.
+    #[arg(long, value_name = "FILE:COUNT")]
+    kill_after_lines: Option<KillAfterLines>,
+
     /// Extra Cargo feature for the kernel image. Repeat to select several.
     #[arg(long = "kernel-feature")]
     kernel_features: Vec<String>,
@@ -1968,7 +1990,7 @@ pub(crate) struct VmCommand {
     /// Attach the desktop devices: a virtio-GPU and the keyboard,
     /// tablet and mouse an input script drives.
     ///
-    /// The scanout is read through QMP by the `screendump` action, so
+    /// The scanout is read over VNC by the `screendump` action, so
     /// this is worth asking for with `--display none` as well as with a
     /// host window.
     #[arg(long, default_value_t = false)]
@@ -2058,6 +2080,12 @@ enum VmSessionCommand {
     /// Only an instrumented kernel (`--profile-generate`) carries one; any
     /// other says so rather than handing back an empty profile.
     Profile(ProfileCommand),
+    /// Run Linux conformance-suite cases, each in its own guest process
+    /// under a bound, and record how each ended.
+    ///
+    /// Boot it with `--kernel-feature linux` and the binaries exported
+    /// through `--shared-dir`; `tools/gvisor-syscalls` drives it in CI.
+    LinuxSuite(crate::linux_suite::LinuxSuiteCommand),
     /// Print the guest kernel artifact this checkout would boot, and
     /// stop there.
     ///
@@ -2376,6 +2404,7 @@ struct ResolvedVmCommand {
     qemu_trace_log: Option<PathBuf>,
     qemu_arg: Vec<String>,
     enable_targets: Vec<String>,
+    kill_after_lines: Option<KillAfterLines>,
     runtime_dir: Option<PathBuf>,
     keep_runtime_dir: bool,
     acpi: bool,
@@ -2406,6 +2435,7 @@ enum ResolvedVmSessionCommand {
     Screendump(ScreendumpCommand),
     Input(InputCommand),
     Profile(ProfileCommand),
+    LinuxSuite(crate::linux_suite::LinuxSuiteCommand),
 }
 
 impl ResolvedVmSessionCommand {
@@ -2420,9 +2450,11 @@ impl ResolvedVmSessionCommand {
             Self::Balloon(_) => Some("balloon"),
             Self::Screendump(_) => Some("screendump"),
             Self::Input(_) => Some("input"),
-            Self::Session(_) | Self::AotBench(_) | Self::WorkloadBench(_) | Self::Profile(_) => {
-                None
-            }
+            Self::Session(_)
+            | Self::AotBench(_)
+            | Self::WorkloadBench(_)
+            | Self::Profile(_)
+            | Self::LinuxSuite(_) => None,
         }
     }
 
@@ -2433,7 +2465,11 @@ impl ResolvedVmSessionCommand {
     /// it before QEMU is torn down (`vcpu_state`), and every lane has to
     /// be able to leave that capture behind.
     fn needs_qmp(&self) -> bool {
-        self.qmp_action().is_some() || matches!(self, Self::AotBench(_) | Self::WorkloadBench(_))
+        self.qmp_action().is_some()
+            || matches!(
+                self,
+                Self::AotBench(_) | Self::WorkloadBench(_) | Self::LinuxSuite(_)
+            )
     }
 }
 
@@ -2523,7 +2559,12 @@ pub(crate) fn run(mut command: VmCommand) -> Result<(), VmError> {
         build_vm(&command.build)?;
     }
     let mut runtime = VmRuntime::spawn(&command)?;
+    let kill_watch = command
+        .kill_after_lines
+        .as_ref()
+        .map(|kill| kill.watch(runtime.child.id()));
     let result = connect_and_run(&command, &mut runtime);
+    drop(kill_watch);
     let runtime_dir = runtime.runtime_dir_path().display().to_string();
     // QEMU's own log is the only account of a machine it refused to
     // build or a device backend that never started, and the runtime
@@ -3074,6 +3115,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         qemu_trace_log,
         qemu_arg,
         enable_targets,
+        kill_after_lines: command.kill_after_lines,
         runtime_dir,
         keep_runtime_dir,
         acpi,
@@ -3278,15 +3320,19 @@ fn ensure_qemu_command(command: &ResolvedVmCommand) -> Result<(), VmConfigError>
 
 fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
     let repo_root = repo_root()?;
-    run_step(
-        "building helios-cli",
-        command
-            .kind
-            .host()
-            .cargo_build_command(&repo_root)
-            .arg("-p")
-            .arg("helios-cli"),
-    )?;
+    // A `helios-cli` named by `HELIOS_CLI_BIN` is the one the prebuild
+    // runs (`discover_helios_cli`), so building the workspace's is waste.
+    if std::env::var_os("HELIOS_CLI_BIN").is_none() {
+        run_step(
+            "building helios-cli",
+            command
+                .kind
+                .host()
+                .cargo_build_command(&repo_root)
+                .arg("-p")
+                .arg("helios-cli"),
+        )?;
+    }
     run_kernel_prebuild(command)?;
     let kernel_label = match &command.profile_use {
         // Which profile a PGO kernel was built from is part of what it
@@ -3305,20 +3351,43 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
         .arg(command.profile.cargo_target)
         .arg("--bin")
         .arg(command.profile.kernel_artifact_name);
-    if command.profile_use.is_some() {
+    let kernel = command.kernel_path()?;
+    // An image an earlier run linked from the same inputs is taken from
+    // the artifact cache instead of linked again (#1023).
+    let cache = KernelImageCache::open(KernelImageBuild {
+        cli: discover_helios_cli(command.kind)?,
+        repo_root: &repo_root,
+        cargo: &kernel_build,
+        profile: command.profile_use.as_ref().map(KernelProfileUse::path),
+        public_key: kernel_prebuild_dir(command)?.join(ROOT_PUBLIC_FILE),
+        image: kernel.clone(),
+        target: command.profile.cargo_target,
+        target_dir: command.target_dir(&repo_root).path().to_path_buf(),
+    })?;
+    let restored = match &cache {
+        Some(cache) => cache.restore()?,
+        None => false,
+    };
+    if restored {
+        eprintln!("{kernel_label}: restored from the artifact cache");
+    } else if command.profile_use.is_some() {
         // A profile-use build emits one warning per function the profile
         // covers nothing about, thousands of them; they are captured to a
         // list beside the kernel and the step log gets the count (#329).
-        let kernel = command.kernel_path()?;
         run_pgo_kernel_step(&kernel_label, &mut kernel_build, command, &kernel)?;
     } else {
         run_step(&kernel_label, &mut kernel_build)?;
     }
     // The image carries the public key alone; the secret this build's
     // prebuild signed with must not be anywhere in it.
-    root_secret_scan::scan_image(&command.kernel_path()?, &command.root_secret_key_path()?)?;
+    root_secret_scan::scan_image(&kernel, &command.root_secret_key_path()?)?;
     if command.profile.arch == VmArch::X86_64 && command.kind.audited_for_legacy_encoding() {
-        x86_image_audit::audit(&command.kernel_path()?)?;
+        x86_image_audit::audit(&kernel)?;
+    }
+    // Stored after the scan and the audit, so the cache holds no image
+    // either refused.
+    if !restored && let Some(cache) = &cache {
+        cache.store()?;
     }
     run_step(
         "building inspector",
@@ -3564,6 +3633,7 @@ fn connect_and_run(
     runtime: &mut VmRuntime,
 ) -> Result<(), VmSessionError> {
     let qmp_socket = runtime.qmp_socket.clone();
+    let vnc_socket = runtime.vnc_socket.clone();
     let vcpus = VcpuStateCapture::new(
         command.profile.arch,
         qmp_socket.clone(),
@@ -3672,12 +3742,17 @@ fn connect_and_run(
             let socket = qmp_socket.ok_or(VmSessionError::NeedsQmp {
                 action: "screendump",
             })?;
-            run_screendump(client, screendump, &socket)
+            let vnc_socket = vnc_socket
+                .expect("a screendump session starts QEMU with a VNC socket (vnc_socket_path)");
+            run_screendump(client, screendump, &socket, &vnc_socket)
         }
         Some(ResolvedVmSessionCommand::Input(input)) => {
             let socket = qmp_socket.ok_or(VmSessionError::NeedsQmp { action: "input" })?;
             run_input(client, input, &socket)
         }
+        Some(ResolvedVmSessionCommand::LinuxSuite(suite)) => crate::run_interruptible(async move {
+            Ok::<_, VmSessionError>(crate::linux_suite::run(&client, &suite, &vcpus).await?)
+        }),
         Some(ResolvedVmSessionCommand::Profile(profile)) => {
             crate::run_interruptible(async move { Ok(raw_profile::run(&client, &profile).await?) })
         }
@@ -3741,22 +3816,24 @@ fn run_balloon(
 
 /// Captures the guest's scanout into each file the caller named.
 ///
-/// The guest is not asked anything: the capture is of the display
-/// device's surface as QEMU holds it, which is the whole point of taking
-/// it from the host. A session whose guest never drove the device still
-/// produces an image — QEMU's blank scanout — and that is the evidence
-/// that the machine had a display at all.
+/// The guest is not asked anything: the capture is of the console's
+/// surface as QEMU's VNC server holds it, which is the whole point of
+/// taking it from the host. A session whose guest never drove the device
+/// still produces an image — QEMU's blank scanout — and that is the
+/// evidence that the machine had a display at all.
 fn run_screendump(
     client: RpcClient,
     command: ScreendumpCommand,
     qmp_socket: &Path,
+    vnc_socket: &Path,
 ) -> Result<(), VmSessionError> {
     let socket = qmp_socket.to_path_buf();
+    let vnc_socket = vnc_socket.to_path_buf();
     let capture_command = command.clone();
     // One slot: a request is answered before the next is made, because
     // the thread that makes them is waiting for the answer.
     let (requests, incoming) = async_channel::bounded(1);
-    let host_side = move || capture_scanout(&capture_command, &socket, &requests);
+    let host_side = move || capture_scanout(&capture_command, &socket, &vnc_socket, &requests);
     match command.run.clone() {
         Some(program) => alongside_guest_program(
             client,
@@ -3987,9 +4064,14 @@ fn report_guest_run(program: &str, outcome: GuestRunOutcome) {
 }
 
 /// Drive the desktop, if asked, and write each capture.
+///
+/// The desktop is driven and the instance killed over QMP; the frames
+/// are read over VNC, one connection and one full-screen request per
+/// capture so that each file shows the screen as it is then.
 fn capture_scanout(
     command: &ScreendumpCommand,
     qmp_socket: &Path,
+    vnc_socket: &Path,
     requests: &async_channel::Sender<GuestRequest>,
 ) -> Result<(), VmSessionError> {
     let mut qmp = QmpClient::connect(qmp_socket)?;
@@ -4010,9 +4092,9 @@ fn capture_scanout(
         } else if command.settle_seconds != 0 {
             std::thread::sleep(Duration::from_secs(command.settle_seconds));
         }
-        // QEMU resolves a relative filename against its own working
-        // directory, which is the inspector's only by accident of how it
-        // was spawned; an absolute path names the same file either way.
+        // The path is reported as written, so it is made absolute: a
+        // relative one names a different file to a reader whose working
+        // directory is not the inspector's.
         let path = std::path::absolute(path).map_err(|source| VmSessionError::ScreendumpPath {
             path: path.display().to_string(),
             source,
@@ -4023,11 +4105,10 @@ fn capture_scanout(
                 source,
             })?;
         }
-        qmp.screendump(&path)
-            .map_err(|source| VmSessionError::Screendump {
-                path: path.display().to_string(),
-                source,
-            })?;
+        vnc::capture(vnc_socket, &path).map_err(|source| VmSessionError::Screendump {
+            path: path.display().to_string(),
+            source,
+        })?;
         println!("{} {}", style("captured").green(), path.display());
         if index == 0
             && let Some(name) = &command.kill_instance
@@ -5398,6 +5479,8 @@ struct VmRuntime {
     _serial_pty_slave: Option<fs::File>,
     /// The QMP socket the inspector created, when it owns one.
     qmp_socket: Option<PathBuf>,
+    /// The VNC socket the inspector created for a `screendump` session.
+    vnc_socket: Option<PathBuf>,
     /// The raw copy of the guest's debug serial line, when the console
     /// is a socket the chardev can log.
     debug_serial_log: Option<PathBuf>,
@@ -5632,6 +5715,9 @@ impl VmRuntime {
         if let Some(qmp) = qmp_endpoint(command, socket_dir.path())? {
             qemu.arg("-qmp").arg(qmp);
         }
+        if let Some(vnc) = vnc_socket_path(command, socket_dir.path())? {
+            qemu.arg("-vnc").arg(vnc_endpoint(&vnc));
+        }
         qemu.arg("-machine")
             .arg(machine_options(command).to_string());
         for accel in &command.accel {
@@ -5834,6 +5920,7 @@ impl VmRuntime {
             transport: Some(transport),
             _serial_pty_slave: serial_pty_slave,
             qmp_socket: qmp_socket_path(command, socket_dir.path())?,
+            vnc_socket: vnc_socket_path(command, socket_dir.path())?,
             debug_serial_log,
             qemu_log,
             runtime_dir,
@@ -5894,13 +5981,29 @@ impl VmRuntime {
 
     fn shutdown(&mut self) {
         if let Ok(None) = self.child.try_wait() {
-            let _ = self.child.kill();
+            // A QEMU that crashed is still running while the kernel
+            // writes its core, and a kill then cuts the dump short; the
+            // core is the only account of where it crashed.
+            if !qemu_is_dumping_core(self.child.id()) {
+                let _ = self.child.kill();
+            }
             let _ = self.child.wait();
         }
         if let Some(swtpm) = &mut self.swtpm {
             swtpm.shutdown();
         }
     }
+}
+
+/// Whether Linux is writing a core for `pid`, from the `CoreDumping` field
+/// of `/proc/<pid>/status` (proc(5)). A host without that file has no
+/// dump in progress to protect.
+fn qemu_is_dumping_core(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|status| {
+        status
+            .lines()
+            .any(|line| line.strip_prefix("CoreDumping:").map(str::trim) == Some("1"))
+    })
 }
 
 fn default_persistent_runtime_dir() -> Result<PathBuf, VmRuntimeError> {
@@ -5952,6 +6055,30 @@ fn qmp_socket_path(
     socket_dir: &Path,
 ) -> Result<Option<PathBuf>, SocketPathTooLong> {
     Ok(qmp_endpoint(command, socket_dir)?.and_then(|endpoint| unix_socket_of(&endpoint)))
+}
+
+/// The VNC socket a `screendump` session reads its frames from.
+///
+/// It is the inspector's own: no flag names it, because the capture is
+/// the only thing that connects to it.
+fn vnc_socket_path(
+    command: &ResolvedVmCommand,
+    socket_dir: &Path,
+) -> Result<Option<PathBuf>, SocketPathTooLong> {
+    if !matches!(
+        command.command,
+        Some(ResolvedVmSessionCommand::Screendump(_))
+    ) {
+        return Ok(None);
+    }
+    let path = socket_dir.join(VNC_SOCKET_NAME);
+    check_socket_path(&path)?;
+    Ok(Some(path))
+}
+
+/// QEMU's `-vnc` display specification for a unix socket.
+fn vnc_endpoint(socket: &Path) -> String {
+    format!("unix:{}", socket.display())
 }
 
 /// The socket path of a QEMU `unix:<path>[,option…]` endpoint, or `None`
@@ -6581,8 +6708,9 @@ fn configure_vsock_device(
 /// the machine has.
 ///
 /// The PCI machine creates a VGA adapter of its own unless it is told
-/// not to, and QEMU's console 0 — the one `screendump` captures — would
-/// then be that adapter's rather than the guest's. A capture of a
+/// not to, and QEMU's console 0 — the one the `screendump` VNC server
+/// shows by default — would then be that adapter's rather than the
+/// guest's. A capture of a
 /// display device the guest never drove is worse than no capture: it
 /// looks exactly like one the guest failed to draw into.
 fn configure_display(
@@ -6705,6 +6833,7 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Screendump(command) => Self::Screendump(command),
             VmSessionCommand::Input(command) => Self::Input(command),
             VmSessionCommand::Profile(command) => Self::Profile(command),
+            VmSessionCommand::LinuxSuite(command) => Self::LinuxSuite(command),
             VmSessionCommand::Build
             | VmSessionCommand::KernelPath
             | VmSessionCommand::BootfsPath
@@ -8511,6 +8640,7 @@ mod tests {
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
             enable_targets: Vec::new(),
+            kill_after_lines: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
@@ -8583,6 +8713,7 @@ mod tests {
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
             enable_targets: Vec::new(),
+            kill_after_lines: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
@@ -9264,6 +9395,7 @@ mod tests {
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
             enable_targets: Vec::new(),
+            kill_after_lines: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
@@ -9311,39 +9443,6 @@ mod tests {
             })?;
         }
         Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires QEMU and a cross-compiled native-users kernel"]
-    fn native_linux_syscalls_x86() -> Result<(), GuestTestFailure> {
-        let root = repo_root()?;
-        let bootfs = root.join("target/native-linux-bootfs");
-        run_step(
-            "building Linux ABI fixtures",
-            Command::new("bash")
-                .current_dir(&root)
-                .arg("linux/tests/build-fixtures.sh")
-                .arg(&bootfs),
-        )?;
-        let mut command = guest_test_command(&X86_64_VM_PROFILE);
-        command.accel =
-            vec![std::env::var("HELIOS_NATIVE_TEST_ACCEL").unwrap_or_else(|_| "kvm".to_owned())];
-        command.cpu = default_cpu(command.profile, &command.accel).map(str::to_owned);
-        command.build.kernel_features = vec!["linux-prototype".to_owned()];
-        command.build.bootfs_root = Some(bootfs);
-        command.runtime_dir = Some(root.join("target/native-linux-runtime"));
-        command.keep_runtime_dir = true;
-        command.debug_serial_log = Some(root.join("target/native-linux-serial.log"));
-        build_self_test_kernel(&command, &[])?;
-        let mut runtime = VmRuntime::spawn(&command)?;
-        let marker = b"native Linux prototype passed:";
-        let result = wait_for_console_matches(
-            runtime.socket_path(),
-            |line| line.windows(marker.len()).any(|window| window == marker),
-            1,
-        );
-        runtime.shutdown();
-        result
     }
 
     /// The aarch64 kernel built with `HELIOS_CFI_SELF_TEST` corrupts a signed
@@ -9496,6 +9595,7 @@ mod tests {
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
             enable_targets: Vec::new(),
+            kill_after_lines: None,
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,
@@ -9716,6 +9816,7 @@ mod tests {
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
             enable_targets: Vec::new(),
+            kill_after_lines: None,
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,

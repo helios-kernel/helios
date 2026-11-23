@@ -42,7 +42,7 @@ use crate::buffer::{Span, ViewError};
 use crate::wasmtime_adapter::bindings::device::bindings::helios::system::device as device_wit;
 use crate::{DeviceName, DmaBufferHandle, GrantError, GrantHandle, InterruptRelay, NotifyWaiter};
 
-use super::{StoreData, guest_memory, view_trap};
+use super::{StoreData, caller_memory, view_trap};
 
 /// Register `helios:system/device` in a linker.
 ///
@@ -63,30 +63,6 @@ where
     device_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(linker, |state| {
         state
     })
-}
-
-/// Record the runtime's handle on an instance's linear memory.
-///
-/// Called once, right after the instance is built, on every component
-/// the kernel runs. Every call that later takes a span reads the
-/// memory's base and current size through this handle at the moment of
-/// the call.
-///
-/// A component that lowers through a shared memory, or through more
-/// than one, records nothing: the runtime does not hand a shared memory
-/// back as an unshared one, and every span such an instance names is
-/// refused, because nothing may be shown in memory another processor
-/// is running code against.
-pub(crate) fn record_linear_memory<CpuImpl, Net, StorageImpl>(
-    mut store: impl wasmtime::AsContextMut<Data = StoreData<CpuImpl, Net, StorageImpl>>,
-    instance: &wasmtime::component::Instance,
-) where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let memory = instance.get_default_memory(store.as_context_mut());
-    store.as_context_mut().data_mut().linear_memory = memory;
 }
 
 const fn span(at: device_wit::Span) -> Span {
@@ -450,12 +426,11 @@ where
         index: u32,
         at: device_wit::Span,
     ) -> wasmtime::Result<Result<(), device_wit::Error>> {
-        let data = accessor.get();
-        let device = *data.table.get(&handle)?.device();
-        let linear_memory = data.linear_memory;
+        let device = *accessor.get().table.get(&handle)?.device();
         // Read now, at the call: the span is checked against the size
-        // the memory has at this moment, not when it was built.
-        let memory = guest_memory(linear_memory, &accessor);
+        // the calling subcomponent's memory has at this moment, not when
+        // it was built.
+        let memory = caller_memory(&accessor);
         let data = accessor.get();
         let lease = match data.device.lease_for_mut(&device) {
             Ok(lease) => lease,
@@ -476,10 +451,8 @@ where
         align: u64,
         at: device_wit::Span,
     ) -> wasmtime::Result<Result<Resource<DmaBufferHandle>, device_wit::Error>> {
-        let data = accessor.get();
-        let device = *data.table.get(&handle)?.device();
-        let linear_memory = data.linear_memory;
-        let memory = guest_memory(linear_memory, &accessor);
+        let device = *accessor.get().table.get(&handle)?.device();
+        let memory = caller_memory(&accessor);
         let data = accessor.get();
         let lease = match data.device.lease_for_mut(&device) {
             Ok(lease) => lease,

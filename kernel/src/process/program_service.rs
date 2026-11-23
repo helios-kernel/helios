@@ -2,6 +2,7 @@ use core::fmt::{self, Write};
 
 use arrayvec::ArrayString;
 use helios_hal::fs::FsError;
+use helios_hal::native::NativeUnavailable;
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -170,6 +171,10 @@ pub enum ProgramExecErrorDetail {
     ChildExitChannelDropped,
     #[error("child exit result was already consumed")]
     ChildExitAlreadyConsumed,
+    #[error("the child program trapped")]
+    ChildTrapped,
+    #[error("the child program was killed")]
+    ChildKilled,
     #[error("compile hint is not allowed for precompiled artifacts")]
     HintNotAllowedForPrecompiledArtifact,
     #[error("the fast AOT hint is not supported")]
@@ -252,6 +257,33 @@ pub enum ProgramExecErrorDetail {
     InternalInvariant,
     #[error("{0}")]
     ComponentStdioUnbindable(ComponentStdioRefusal),
+    #[error("{0}")]
+    NativeExecutionUnavailable(NativeUnavailable),
+    #[error("no Linux ABI is decoded for this platform's instruction set")]
+    LinuxAbiUnsupported,
+    #[error("the Linux executable is not a static image this kernel loads: {0}")]
+    LinuxImageInvalid(LinuxImageRefusal),
+    #[error("user memory for a native process is exhausted")]
+    NativeMemoryExhausted,
+    #[error("the Linux subsystem is not enabled in this kernel")]
+    LinuxSubsystemUnavailable,
+    #[error("{0}")]
+    ContainerRefused(RuntimeMessage),
+}
+
+/// Why a Linux executable was refused before any of it was mapped.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum LinuxImageRefusal {
+    #[error("it is not a well-formed ELF file")]
+    Malformed,
+    #[error("it is not a little-endian static x86-64 ET_EXEC image")]
+    Unsupported,
+    #[error("it needs an interpreter or dynamic relocation")]
+    Dynamic,
+    #[error("a load segment's range, alignment or permissions are invalid")]
+    Segment,
+    #[error("its entry point is not in executable file-backed bytes")]
+    Entry,
 }
 
 /// A standard descriptor a launching process hands to a component
@@ -287,6 +319,8 @@ impl ProgramExecErrorDetail {
         match self {
             Self::ChildExitChannelDropped => "child exit channel closed before completion",
             Self::ChildExitAlreadyConsumed => "child exit result was already consumed",
+            Self::ChildTrapped => "the child program trapped",
+            Self::ChildKilled => "the child program was killed",
             Self::HintNotAllowedForPrecompiledArtifact => {
                 "compile hint is not allowed for precompiled artifacts"
             }
@@ -354,6 +388,20 @@ impl ProgramExecErrorDetail {
             Self::ComponentStdioUnbindable(_) => {
                 "a standard descriptor cannot be a component's standard stream"
             }
+            // What is missing is in the error's `Display`; `as_str` has no
+            // storage to format it into.
+            Self::NativeExecutionUnavailable(_) => "native user execution is unavailable",
+            Self::LinuxAbiUnsupported => {
+                "no Linux ABI is decoded for this platform's instruction set"
+            }
+            // The refusal is in the error's `Display`; `as_str` has no
+            // storage to format it into.
+            Self::LinuxImageInvalid(_) => {
+                "the Linux executable is not a static image this kernel loads"
+            }
+            Self::NativeMemoryExhausted => "user memory for a native process is exhausted",
+            Self::LinuxSubsystemUnavailable => "the Linux subsystem is not enabled in this kernel",
+            Self::ContainerRefused(message) => message.as_str(),
         }
     }
 }
@@ -388,7 +436,7 @@ impl ProgramExecError {
                 };
             }
             FsError::NoEntry => ProgramExecErrorKind::NotFound,
-            FsError::Io => ProgramExecErrorKind::Io,
+            FsError::Io | FsError::NoSpace => ProgramExecErrorKind::Io,
             FsError::NotDirectory
             | FsError::IsDirectory
             | FsError::ReadOnly
