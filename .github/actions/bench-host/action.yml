@@ -46,18 +46,15 @@ runs:
   using: composite
   steps:
     - name: Install host dependencies
-      shell: bash
-      run: |
-        packages=(
+      uses: ./helios/.github/actions/install-apt-packages
+      with:
+        packages: >-
           libudev-dev just cmake ninja-build
           qemu-system-x86 ovmf qemu-utils genisoimage
-        )
-        if [ "${{ inputs.network-tools }}" = true ]; then
-          packages+=(iproute2 nftables dnsmasq-base)
-        fi
-        sudo rm -f /etc/apt/sources.list.d/google-chrome*
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends "${packages[@]}"
+          ${{ inputs.network-tools == 'true' && 'iproute2 nftables dnsmasq-base' || '' }}
+    - name: Grant KVM access
+      shell: bash
+      run: |
         # Every boot in this workflow names `--accel kvm`, and the
         # inspector refuses rather than falling back to the emulator, so
         # the device has to be usable by the runner's own user.
@@ -77,7 +74,7 @@ runs:
     - uses: taiki-e/install-action@v2
       with:
         tool: wasm-tools,cargo-zigbuild
-    - uses: mlugg/setup-zig@v2
+    - uses: ./helios/.github/actions/setup-zig
       with:
         version: 0.13.0
     - name: Stage Limine bootloader share
@@ -96,13 +93,13 @@ runs:
         make -C "$GITHUB_WORKSPACE/limine"
     - name: Restore WASI tooling artifacts
       id: artifact-cache
-      uses: actions/cache@v4
+      uses: ./helios/.github/actions/shared-cache
       with:
         path: |
           ${{ inputs.checkout-path }}/artifacts/wasi-tools
           ${{ inputs.checkout-path }}/artifacts/python3-root
           ${{ inputs.checkout-path }}/artifacts/wasix
-        key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/tools/wasi-apps/**', inputs.checkout-path), format('{0}/Cargo.lock', inputs.checkout-path)) }}
+        key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/tools/wasi-apps/**', inputs.checkout-path), format('{0}/tools/branch-hints/**', inputs.checkout-path), format('{0}/docs/wasmtime.md', inputs.checkout-path), format('{0}/api/**', inputs.checkout-path), format('{0}/api-macro/**', inputs.checkout-path), format('{0}/wit/**', inputs.checkout-path), format('{0}/Cargo.toml', inputs.checkout-path), format('{0}/Cargo.lock', inputs.checkout-path), format('{0}/rust-toolchain.toml', inputs.checkout-path), format('{0}/.cargo/config.toml', inputs.checkout-path)) }}
     - name: Stage WASI tooling artifacts
       if: steps.artifact-cache.outputs.cache-hit != 'true'
       shell: bash
@@ -110,7 +107,7 @@ runs:
       run: tools/wasi-apps/build.sh
     - name: Restore pinned Fedora VM assets
       if: inputs.guest-arch != ''
-      uses: actions/cache@v4
+      uses: ./helios/.github/actions/shared-cache
       with:
         path: |
           ${{ inputs.checkout-path }}/target/perf-baselines/linux-vm/fedora-${{ inputs.guest-arch }}/*.qcow2

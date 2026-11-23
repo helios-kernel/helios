@@ -33,12 +33,16 @@ package helios:system@0.1.0;
 /// it is handed while it has focus.
 interface surface {
   use input.{input-event};
+  use gpu.{image};
+  use sync.{timeline, timeline-point};
   use memory.{span};
 
   /// Why a surface request was refused.
   enum error {
     /// This kernel image ships no compositor plugin.
     unavailable,
+    /// Rendering failed or its producer closed before completing the image.
+    render-failed,
     /// The compositor died and has not come back yet. The surfaces it
     /// was composing died with it; a client makes a new one.
     no-compositor,
@@ -117,6 +121,18 @@ interface surface {
     events: func() -> stream<input-event>;
   }
 
+  /// A GPU-backed presentation surface managed by the compositor.
+  resource image-surface {
+    %size: func() -> size;
+    /// The image must match this surface's dimensions. Rendering is awaited
+    /// before presentation. Value 1 on the returned timeline means the image
+    /// has been replaced or detached and its storage may be reused.
+    present: async func(image: borrow<image>, ready: timeline-point) -> result<timeline, error>;
+    events: func() -> stream<input-event>;
+  }
+
+  create-image: async func(width: u32, height: u32) -> result<image-surface, error>;
+
   /// Ask the compositor for a window of `width` by `height` pixels,
   /// with its pixels shown at `buffer`.
   ///
@@ -158,44 +174,57 @@ interface surface {
 /// the client's pixels are to appear.
 interface compositor {
   use surface.{error, rect};
+  use gpu.{image};
+  use sync.{signal-source};
   use memory.{span};
 
   /// Stable identifier of one client surface, minted by the kernel.
   type surface-id = u64;
 
-  /// Own the desktop until the machine goes down.
-  ///
-  /// Called once per instance, by the supervisor, as a task of its own:
-  /// it claims the display and the input devices, draws, and returns
-  /// only when it can no longer do so. Returning is a death like any
-  /// other and the supervisor rebuilds the instance.
-  ///
-  /// The calls below run concurrently with it, in the same store.
-  run: async func() -> result<_, error>;
+  /// One compositor instance's request routing and desktop lifecycle.
+  /// The supervisor constructs it before dispatching concurrent calls.
+  resource desktop {
+    constructor();
 
-  /// Take a new client surface onto the desktop.
-  ///
-  /// The answer is a span of *this* component's linear memory,
-  /// `dimensions.width * dimensions.height * 4` bytes rounded up to
-  /// whole wasm pages, that the compositor allocated for the surface.
-  /// When the call returns the kernel shows the client's pinned run
-  /// there, so those bytes and the client's are the same bytes; no
-  /// `commit` for `id` arrives before that has happened.
-  create: async func(id: surface-id, dimensions: rect) -> result<span, error>;
+    create-image: async func(id: surface-id, dimensions: rect) -> result<_, error>;
+    /// The kernel has already awaited rendering. Signal value 1 only after
+    /// replacement or detachment; dropping the producer reports closure.
+    present-image: async func(id: surface-id, image: image, retired: signal-source) -> result<_, error>;
 
-  /// The client published the pixels in `region`.
-  commit: async func(id: surface-id, region: rect) -> result<_, error>;
+    /// Own the desktop until the machine goes down.
+    ///
+    /// Called once per instance, by the supervisor, as a task of its own:
+    /// it claims the display and the input devices, draws, and returns
+    /// only when it can no longer do so. Returning is a death like any
+    /// other and the supervisor rebuilds the instance.
+    ///
+    /// The calls below run concurrently with it, in the same store.
+    run: async func() -> result<_, error>;
 
-  /// The surface is gone: the client dropped it, died, or stopped
-  /// waiting for its `create`. The span `create` answered with is
-  /// ordinary zeroed memory again before this is called, so the
-  /// compositor frees it here and reads nothing from it.
-  ///
-  /// `id` may name a surface this component does not hold — one whose
-  /// `create` it refused, or one it was already told is gone — and the
-  /// call then does nothing. A client that gives up while `create` is
-  /// still running can be told before `create` returns; the kernel
-  /// calls `destroy` again once it has, so the surface never outlives
-  /// both calls.
-  destroy: async func(id: surface-id);
+    /// Take a new client surface onto the desktop.
+    ///
+    /// The answer is a span of *this* component's linear memory,
+    /// `dimensions.width * dimensions.height * 4` bytes rounded up to
+    /// whole wasm pages, that the compositor allocated for the surface.
+    /// When the call returns the kernel shows the client's pinned run
+    /// there, so those bytes and the client's are the same bytes; no
+    /// `commit` for `id` arrives before that has happened.
+    create: async func(id: surface-id, dimensions: rect) -> result<span, error>;
+
+    /// The client published the pixels in `region`.
+    commit: async func(id: surface-id, region: rect) -> result<_, error>;
+
+    /// The surface is gone: the client dropped it, died, or stopped
+    /// waiting for its `create`. The span `create` answered with is
+    /// ordinary zeroed memory again before this is called, so the
+    /// compositor frees it here and reads nothing from it.
+    ///
+    /// `id` may name a surface this component does not hold — one whose
+    /// `create` it refused, or one it was already told is gone — and the
+    /// call then does nothing. A client that gives up while `create` is
+    /// still running can be told before `create` returns; the kernel
+    /// calls `destroy` again once it has, so the surface never outlives
+    /// both calls.
+    destroy: async func(id: surface-id);
+  }
 }

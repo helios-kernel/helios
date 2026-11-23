@@ -44,11 +44,6 @@ use crate::{
 
 /// `SPSR_EL1.M[3:0]`, the mode the exception was taken from.
 const SPSR_MODE_MASK: u64 = 0xf;
-/// EL1 on `SP_EL1`: kernel code on its own stack, the only mode a trap
-/// the runtime can claim is taken from.
-const SPSR_MODE_EL1H: u64 = 0b0101;
-/// EL1 on `SP_EL0`: an exception or IRQ handler on the exception stack.
-const SPSR_MODE_EL1T: u64 = 0b0100;
 /// Bytes of one A64 instruction, which is what a resolved `brk` steps
 /// past.
 const A64_INSTRUCTION_BYTES: u64 = 4;
@@ -166,7 +161,10 @@ impl fmt::Display for HandOverRefusal {
             }
             Self::InsideHandOver => f.write_str("it interrupted a trap hand-over in progress"),
             Self::UnexpectedMode(mode) => {
-                write!(f, "it was taken from SPSR_EL1.M {mode:#06b}, not EL1h")
+                write!(
+                    f,
+                    "it was taken from SPSR.M {mode:#06b}, not the host exception level"
+                )
             }
         }
     }
@@ -180,9 +178,10 @@ pub(crate) fn hand_over_trap(record: TrapHandOver, spsr: u64) -> HandOverRefusal
     let Some(runtime) = installed_processor_runtime() else {
         return HandOverRefusal::NoProcessorRuntime;
     };
+    let host_level = crate::current_exception_level();
     match spsr & SPSR_MODE_MASK {
-        SPSR_MODE_EL1H => {}
-        SPSR_MODE_EL1T => return HandOverRefusal::InsideExceptionHandler,
+        mode if mode == host_level | 1 => {}
+        mode if mode == host_level => return HandOverRefusal::InsideExceptionHandler,
         mode => return HandOverRefusal::UnexpectedMode(mode),
     }
     let hand_over_stack = runtime.hand_over_stack.range();

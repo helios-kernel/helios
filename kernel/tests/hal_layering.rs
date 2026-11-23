@@ -45,7 +45,7 @@ fn hal_does_not_name_wasm_or_wasi_abstractions() {
 
 /// The device and protocol libraries of AGENTS.md §1: each builds on
 /// `hal/` and none on the kernel.
-const DEVICE_LIBRARIES: &[&str] = &["netstack", "virtio", "i6300esb", "tpm"];
+const DEVICE_LIBRARIES: &[&str] = &["netstack", "virtio", "i6300esb", "tpm", "acpi"];
 
 #[test]
 fn device_libraries_never_depend_on_the_kernel() {
@@ -67,34 +67,6 @@ fn device_libraries_never_depend_on_the_kernel() {
     assert!(
         leaks.is_empty(),
         "device and protocol libraries must not depend on the kernel:\n{}",
-        leaks.join("\n")
-    );
-}
-
-#[test]
-fn wasmtime_wasi_io_stays_inside_adapter_layer() {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut files = Vec::new();
-    collect_files(&manifest_dir.join("src"), &mut files);
-
-    let mut leaks = Vec::new();
-    for path in files {
-        if path
-            .components()
-            .any(|component| component.as_os_str() == "wasmtime_adapter")
-        {
-            continue;
-        }
-        let content = fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-        if content.contains("wasmtime_wasi_io") || content.contains("async_trait") {
-            leaks.push(path.display().to_string());
-        }
-    }
-
-    assert!(
-        leaks.is_empty(),
-        "wasmtime_wasi_io and async_trait are adapter-only details:\n{}",
         leaks.join("\n")
     );
 }

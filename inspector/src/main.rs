@@ -1,3 +1,5 @@
+mod frame_reader;
+mod linux_suite;
 mod programs;
 mod ready;
 mod remote;
@@ -45,6 +47,11 @@ enum InspectorError {
 /// second is the guest's own boot.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ConnectError {
+    #[error("failed to start the RPC connection driver: {source}")]
+    Driver {
+        #[from]
+        source: std::io::Error,
+    },
     #[error("{0}")]
     Transport(#[from] SerialError),
     #[error("{0}")]
@@ -273,7 +280,7 @@ pub(crate) fn connect_client(
         if boot_sync {
             Ok(ready::connect_after_boot(io).await?)
         } else {
-            let mut client = io.into_client();
+            let mut client = io.into_client()?;
             ready::wait_until_ready(&mut client).await?;
             Ok(client)
         }

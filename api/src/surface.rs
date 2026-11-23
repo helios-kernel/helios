@@ -25,6 +25,8 @@ pub use crate::memory::Span;
 /// Why a surface request was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum SurfaceError {
+    #[error("rendering failed before the image was ready")]
+    RenderFailed,
     #[error("this machine ships no compositor")]
     Unavailable,
     #[error("the compositor is not running")]
@@ -50,6 +52,7 @@ pub enum SurfaceError {
 impl From<raw::Error> for SurfaceError {
     fn from(error: raw::Error) -> Self {
         match error {
+            raw::Error::RenderFailed => Self::RenderFailed,
             raw::Error::Unavailable => Self::Unavailable,
             raw::Error::NoCompositor => Self::NoCompositor,
             raw::Error::UnsupportedSize => Self::UnsupportedSize,
@@ -160,4 +163,59 @@ impl Surface {
 /// is refused with [`SurfaceError::NotTheCompositor`].
 pub async fn deliver(id: u64, events: Vec<InputEvent>) -> Result<(), SurfaceError> {
     raw::deliver(id, events).await.map_err(SurfaceError::from)
+}
+
+/// A GPU-backed surface whose images are presented by the compositor.
+pub struct ImageSurface {
+    raw: raw::ImageSurface,
+    size: Size,
+}
+
+/// Completion of a presentation's device reads, separate from rendering.
+pub struct PresentedFrame {
+    retired: crate::sync::Timeline,
+}
+
+impl PresentedFrame {
+    /// Wait until the image is replaced or detached. A compositor failure
+    /// returns a timeline error; a deadline returns false without retiring it.
+    pub async fn retired(
+        &self,
+        deadline: Option<crate::sync::Deadline>,
+    ) -> Result<bool, crate::sync::TimelineError> {
+        crate::sync::wait_all(&[self.retired.point(1)], deadline).await
+    }
+}
+
+impl ImageSurface {
+    pub async fn create(width: u32, height: u32) -> Result<Self, SurfaceError> {
+        let raw = raw::create_image(width, height)
+            .await
+            .map_err(SurfaceError::from)?;
+        let size = raw.size();
+        Ok(Self { raw, size })
+    }
+
+    pub const fn size(&self) -> Size {
+        self.size
+    }
+
+    pub async fn present(
+        &self,
+        image: &crate::image::Image,
+        ready: crate::sync::TimelinePoint<'_>,
+    ) -> Result<PresentedFrame, SurfaceError> {
+        let retired = self
+            .raw
+            .present(image.handle(), ready.raw())
+            .await
+            .map_err(SurfaceError::from)?;
+        Ok(PresentedFrame {
+            retired: retired.into(),
+        })
+    }
+
+    pub fn events(&self) -> StreamReader<InputEvent> {
+        self.raw.events()
+    }
 }

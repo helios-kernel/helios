@@ -49,8 +49,9 @@ mod gpu3d;
 
 pub use gpu3d::{
     BlobCaching, BlobId, BlobMemory, BlobRequest, BlobScanout, BlobUsage, CapsetId, CapsetInfo,
-    CapsetList, CommandStream, ContextId, ContextName, FenceId, Gpu3d, Gpu3dError, Gpu3dResult,
-    Gpu3dTable, MAX_CAPSETS, MAX_CONTEXT_NAME, MAX_RINGS, RingCount, RingIndex, Submission,
+    CapsetList, CommandStream, ContextId, ContextName, FenceId, Gpu3d, Gpu3dCapabilities,
+    Gpu3dError, Gpu3dResult, Gpu3dTable, MAX_CAPSETS, MAX_CONTEXT_NAME, MAX_RINGS, RingCount,
+    RingIndex, Submission,
 };
 
 /// Largest number of scanouts a display device may present.

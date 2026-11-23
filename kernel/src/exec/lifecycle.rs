@@ -21,6 +21,17 @@
 //! step before its second on the way up and after it on the way down,
 //! so the reverse order is not something a caller can get wrong.
 //!
+//! A layer above the kernel that owns per-processor state the kernel
+//! cannot name — the component host's network step, which owns the
+//! processor's packet pump and its queue pair — lends its step to the
+//! run loop it drives (`Kernel::run_until_stalled_with_steps`). It is
+//! composed after [`STEPS`], so it comes up last and goes down first,
+//! while every kernel owner is still up. A run loop that lends none
+//! still services the lifecycle with [`STEPS`] alone, and any local task
+//! that layer left on the processor is then pinned work the executor
+//! step refuses on, so a forgotten step costs an offline, never a
+//! stranded owner.
+//!
 //! A teardown step may refuse, and refuses before it changes anything.
 //! The steps already torn down are then brought back up in order, and
 //! the processor stays online: an offline either completes or leaves the
@@ -32,7 +43,10 @@
 //!   `ProcessorLifecycles::transition`, the kernel's async mutex, for
 //!   the whole of one offline or online; at most one processor is ever
 //!   between states, so the processor a departing one hands its timers
-//!   to cannot itself be departing. Nothing on a hot path takes it.
+//!   to cannot itself be departing. Nothing on a hot path takes it. A
+//!   removal (`ProcessorControl::remove`, firmware ejecting a processor)
+//!   keeps it through the platform's release too, so no online restarts
+//!   a processor firmware is destroying.
 //! - The initiator is a task on any online processor other than the
 //!   target ([`ProcessorControl`]). It publishes the request in the
 //!   target's lifecycle cell, wakes the target if it has parked, and
@@ -67,9 +81,9 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use core::future::Future;
 use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
-use crossbeam_utils::CachePadded;
 use helios_hal::cpu::{Cpu, ProcessorId, current_processor};
 use helios_hal::measured_boot::MeasuredBoot;
 use helios_hal::watchdog::Watchdog;
@@ -77,6 +91,7 @@ use helios_hal::watchdog::Watchdog;
 use super::executor::{ExecutorGroup, PinnedTasks, machine_executor_group};
 use super::sync::{Notify, RawMutex, RawMutexLease};
 use crate::Kernel;
+use crate::memory::{PerProcessor, UserMemoryPool};
 
 /// The kernel's online set: one bit per possible processor.
 ///
@@ -145,50 +160,6 @@ impl OnlineSet {
     pub fn count(&self) -> usize {
         self.count.load(Ordering::SeqCst)
     }
-
-    /// The online processor `start` places among the online processors
-    /// other than `exclude`, or `None` when there is none.
-    ///
-    /// The words are read twice — once to count, once to select — so a
-    /// transition between the reads can make the selection come up
-    /// empty. That is a transition's own window, and the departing
-    /// processor's handoff wake covers the work a lost pick was for.
-    pub(crate) fn nth_after(&self, start: usize, exclude: ProcessorId) -> Option<ProcessorId> {
-        let (exclude_word, exclude_bit) = self.word_and_bit(exclude);
-        let candidates = |word: &AtomicU64| {
-            let bits = word.load(Ordering::SeqCst);
-            if core::ptr::eq(word, exclude_word) {
-                bits & !exclude_bit
-            } else {
-                bits
-            }
-        };
-        let total: usize = self
-            .words
-            .iter()
-            .map(|word| candidates(word).count_ones() as usize)
-            .sum();
-        if total == 0 {
-            return None;
-        }
-        let mut target = start % total;
-        for (index, word) in self.words.iter().enumerate() {
-            let mut bits = candidates(word);
-            let ones = bits.count_ones() as usize;
-            if target >= ones {
-                target -= ones;
-                continue;
-            }
-            for _ in 0..target {
-                bits &= bits - 1;
-            }
-            let processor = index * 64 + bits.trailing_zeros() as usize;
-            return Some(ProcessorId::new(u16::try_from(processor).unwrap_or_else(
-                |_| panic!("online processor {processor} does not fit a processor identifier"),
-            )));
-        }
-        None
-    }
 }
 
 /// Where one processor stands in the lifecycle.
@@ -220,15 +191,21 @@ impl LifecycleState {
     }
 }
 
+/// Which [`OfflineRefusal`] a lifecycle cell records.
+const REFUSED_PINNED_TASKS: u8 = 0;
+const REFUSED_NETWORK_STARTING: u8 = 1;
+
 /// One processor's lifecycle cell.
 ///
 /// `state` is written by the initiator (a request) and by the processor
 /// itself (a completion), and `changed` is raised on every completion.
-/// `successor` and `refused_live` are written before the `state` store
-/// that publishes them and read after the load that observes it.
+/// `successor`, `refused_kind` and `refused_live` are written before the
+/// `state` store that publishes them and read after the load that
+/// observes it.
 struct LifecycleCell {
     state: AtomicU8,
     successor: AtomicU16,
+    refused_kind: AtomicU8,
     refused_live: AtomicUsize,
     changed: Notify,
 }
@@ -238,8 +215,31 @@ impl LifecycleCell {
         Self {
             state: AtomicU8::new(LifecycleState::Absent as u8),
             successor: AtomicU16::new(0),
+            refused_kind: AtomicU8::new(REFUSED_PINNED_TASKS),
             refused_live: AtomicUsize::new(0),
             changed: Notify::new(),
+        }
+    }
+
+    /// Records why the processor refused, before the `Online` publish.
+    fn record_refusal(&self, refusal: OfflineRefusal) {
+        let (kind, live) = match refusal {
+            OfflineRefusal::PinnedTasks(pinned) => (REFUSED_PINNED_TASKS, pinned.live),
+            OfflineRefusal::NetworkStarting { .. } => (REFUSED_NETWORK_STARTING, 0),
+        };
+        self.refused_kind.store(kind, Ordering::Relaxed);
+        self.refused_live.store(live, Ordering::Relaxed);
+    }
+
+    /// The refusal [`Self::record_refusal`] recorded for `processor`.
+    fn refusal(&self, processor: ProcessorId) -> OfflineRefusal {
+        match self.refused_kind.load(Ordering::Relaxed) {
+            REFUSED_PINNED_TASKS => OfflineRefusal::PinnedTasks(PinnedTasks {
+                processor,
+                live: self.refused_live.load(Ordering::Relaxed),
+            }),
+            REFUSED_NETWORK_STARTING => OfflineRefusal::NetworkStarting { processor },
+            kind => panic!("offline refusal {kind} was never recorded"),
         }
     }
 
@@ -270,31 +270,33 @@ impl LifecycleCell {
 
 /// Every processor's lifecycle cell, and the lock that serialises
 /// transitions.
+///
+/// Each cell is a [`PerProcessor`] block, on a cache line of its own and
+/// in memory of its processor's node: the processor reads its own cell
+/// on every run-loop pass, and an initiator writes it once per
+/// transition.
 pub(crate) struct ProcessorLifecycles {
-    cells: Box<[CachePadded<LifecycleCell>]>,
+    cells: PerProcessor<LifecycleCell>,
     transition: RawMutex,
 }
 
 impl ProcessorLifecycles {
-    pub(crate) fn new(possible_processors: usize) -> Self {
+    /// One cell per possible processor of the machine `pool` describes.
+    pub(crate) fn new(pool: &UserMemoryPool) -> Self {
         Self {
-            cells: (0..possible_processors)
-                .map(|_| CachePadded::new(LifecycleCell::new()))
-                .collect(),
+            cells: PerProcessor::new(pool, |_, _| LifecycleCell::new()),
             transition: RawMutex::new(),
         }
     }
 
     fn cell(&self, processor: ProcessorId) -> &LifecycleCell {
-        self.cells
-            .get(usize::from(processor.id()))
-            .unwrap_or_else(|| {
-                panic!(
-                    "processor {} is outside the {} possible processors' lifecycle cells",
-                    processor.id(),
-                    self.cells.len()
-                )
-            })
+        self.cells.try_get(processor).unwrap_or_else(|| {
+            panic!(
+                "processor {} is outside the {} possible processors' lifecycle cells",
+                processor.id(),
+                self.cells.len()
+            )
+        })
     }
 
     /// Takes the lock that serialises transitions. An offline or online
@@ -320,6 +322,16 @@ pub enum OfflineRefusal {
     /// they cannot move to another processor.
     #[error(transparent)]
     PinnedTasks(#[from] PinnedTasks),
+    /// The machine has a network interface whose service is not
+    /// installed yet, so the queue pair the processor drains has no
+    /// routing table to be handed off through. Asked again once the
+    /// interface is up, the offline proceeds.
+    #[error(
+        "processor {} cannot go offline before the network interface is up: its queue pair \
+         has nowhere to be handed off yet",
+        processor.id()
+    )]
+    NetworkStarting { processor: ProcessorId },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -359,6 +371,49 @@ pub enum OnlineError {
     NotOffline { processor: ProcessorId },
 }
 
+/// The processor lifecycle as a system capability: the possible and
+/// online sets, and the two transitions between them.
+///
+/// The kernel's services reach the lifecycle through this trait, and
+/// `helios:system/processors` is its WIT face.
+///
+/// # Concurrency contract
+///
+/// The set reads are lock-free atomic loads, callable from any
+/// processor; a read concurrent with a transition sees the set before
+/// or after it. `offline` and `online` take the kernel's async
+/// transition mutex for the whole transition and fan out to exactly the
+/// target processor (and, for an offline, the successor the call runs
+/// on), so concurrent requests from any number of processors are
+/// serialised and each one's result describes its own transition.
+pub trait ProcessorLifecycle {
+    /// How many processors the machine can ever run: the possible set
+    /// is `0..possible_processors()`.
+    fn possible_processors(&self) -> usize;
+
+    /// The processor that booted the machine, which stays online.
+    fn bootstrap_processor(&self) -> ProcessorId;
+
+    /// Whether `processor`, one of the possible processors, is online.
+    fn is_online(&self, processor: ProcessorId) -> bool;
+
+    /// Takes `processor` offline: it runs its teardown steps, hands its
+    /// pending timers and queued global work to the processor the call
+    /// runs on, and stops. Resolves once it has stopped, or with why it
+    /// did not; a refusal leaves it online and unchanged.
+    fn offline(
+        &self,
+        processor: ProcessorId,
+    ) -> impl Future<Output = Result<(), OfflineError>> + Send + '_;
+
+    /// Brings `processor` online, starting it when it has never run.
+    /// Resolves once it has run its bring-up and joined the online set.
+    fn online(
+        &self,
+        processor: ProcessorId,
+    ) -> impl Future<Output = Result<(), OnlineError>> + Send + '_;
+}
+
 /// The initiator's side of the lifecycle: takes processors offline and
 /// brings them online from a task on any online processor.
 #[derive(Clone)]
@@ -381,13 +436,43 @@ impl<CpuImpl: Cpu + Clone> ProcessorControl<CpuImpl> {
         usize::from(processor.id()) < self.group.possible_processors()
     }
 
-    /// Takes `processor` offline: it runs its teardown steps, hands its
-    /// pending timers and queued global work to the processor this
-    /// call runs on, and stops through [`Cpu::stop_current`].
+    /// Takes `processor` out of the machine: offline when it is online,
+    /// then `release` hands it back to the platform while the transition
+    /// lock is still held, so no online can restart it until `release`
+    /// has returned. A processor already offline, or one that never ran,
+    /// goes straight to `release`.
     ///
-    /// Refused with [`OfflineError::Refused`] when the processor still
-    /// runs work pinned to it, which leaves it online and unchanged.
-    pub async fn offline(&self, processor: ProcessorId) -> Result<(), OfflineError> {
+    /// Refused as [`ProcessorLifecycle::offline`] refuses, and with
+    /// [`OfflineError::NotOnline`] when the processor is still in its
+    /// first bring-up; `release` runs only when the processor is
+    /// offline or never started.
+    pub async fn remove<Release, Released>(
+        &self,
+        processor: ProcessorId,
+        release: Release,
+    ) -> Result<(), OfflineError>
+    where
+        Release: FnOnce(ProcessorId) -> Released,
+        Released: Future<Output = ()>,
+    {
+        self.check_offline_target(processor)?;
+        let _transition = self.group.lifecycle().lock_transitions().await;
+        let cell = self.group.lifecycle().cell(processor);
+        match cell.state() {
+            LifecycleState::Online => self.depart(processor, cell).await?,
+            LifecycleState::Offline | LifecycleState::Absent => {}
+            // Under the lock only a first bring-up at boot is between
+            // states; it has not finished arriving.
+            LifecycleState::Arriving | LifecycleState::Departing => {
+                return Err(OfflineError::NotOnline { processor });
+            }
+        }
+        release(processor).await;
+        Ok(())
+    }
+
+    /// The checks an offline makes before it takes the transition lock.
+    fn check_offline_target(&self, processor: ProcessorId) -> Result<(), OfflineError> {
         if !self.possible(processor) {
             return Err(OfflineError::NotPossible {
                 processor,
@@ -397,42 +482,69 @@ impl<CpuImpl: Cpu + Clone> ProcessorControl<CpuImpl> {
         if processor == self.cpu.bootstrap_processor() {
             return Err(OfflineError::Bootstrap { processor });
         }
-        let _transition = self.group.lifecycle().lock_transitions().await;
+        Ok(())
+    }
+
+    /// Asks an online `processor` to go offline and waits for its answer.
+    /// The caller holds the transition lock.
+    async fn depart(
+        &self,
+        processor: ProcessorId,
+        cell: &LifecycleCell,
+    ) -> Result<(), OfflineError> {
         // Read after the lock: the task may have resumed elsewhere.
         let successor = current_processor();
         if successor == processor {
             return Err(OfflineError::CurrentProcessor { processor });
         }
-        let cell = self.group.lifecycle().cell(processor);
-        if cell.state() != LifecycleState::Online {
-            return Err(OfflineError::NotOnline { processor });
-        }
         cell.successor.store(successor.id(), Ordering::Relaxed);
         // `SeqCst` store, then the target's idle state: the requester
         // half of the handshake `departure_requested` describes.
         cell.publish(LifecycleState::Departing);
-        if self.group.needs_wake(usize::from(processor.id())) {
+        if self.group.needs_wake(processor) {
             self.cpu.wake_processor(processor);
         }
         match cell.settled(LifecycleState::Departing).await {
             LifecycleState::Offline => Ok(()),
-            LifecycleState::Online => Err(OfflineError::Refused(OfflineRefusal::PinnedTasks(
-                PinnedTasks {
-                    processor,
-                    live: cell.refused_live.load(Ordering::Relaxed),
-                },
-            ))),
+            LifecycleState::Online => Err(OfflineError::Refused(cell.refusal(processor))),
             state => panic!(
                 "processor {} left Departing for {state:?}, which no teardown publishes",
                 processor.id()
             ),
         }
     }
+}
 
-    /// Brings `processor` online: restarts it when it was taken offline,
-    /// starts it when it has never run, and returns once it has run its
-    /// bring-up steps and joined the online set.
-    pub async fn online(&self, processor: ProcessorId) -> Result<(), OnlineError> {
+impl<CpuImpl: Cpu + Clone> ProcessorLifecycle for ProcessorControl<CpuImpl> {
+    fn possible_processors(&self) -> usize {
+        self.group.possible_processors()
+    }
+
+    fn bootstrap_processor(&self) -> ProcessorId {
+        self.cpu.bootstrap_processor()
+    }
+
+    fn is_online(&self, processor: ProcessorId) -> bool {
+        self.online_set().contains(processor)
+    }
+
+    /// Takes `processor` offline through [`Cpu::stop_current`].
+    ///
+    /// Refused with [`OfflineError::Refused`] when the processor still
+    /// runs work pinned to it, which leaves it online and unchanged.
+    async fn offline(&self, processor: ProcessorId) -> Result<(), OfflineError> {
+        self.check_offline_target(processor)?;
+        let _transition = self.group.lifecycle().lock_transitions().await;
+        let cell = self.group.lifecycle().cell(processor);
+        if cell.state() != LifecycleState::Online {
+            return Err(OfflineError::NotOnline { processor });
+        }
+        self.depart(processor, cell).await
+    }
+
+    /// Restarts `processor` when it was taken offline and starts it
+    /// when it has never run.
+    async fn online(&self, processor: ProcessorId) -> Result<(), OnlineError> {
         if !self.possible(processor) {
             return Err(OnlineError::NotPossible {
                 processor,
@@ -492,6 +604,59 @@ pub(crate) trait ProcessorStep {
         CpuImpl: Cpu + Clone,
         WatchdogImpl: Watchdog + Clone,
         MeasuredBootImpl: MeasuredBoot;
+}
+
+/// The step a run loop adds when its layer owns nothing per processor.
+impl ProcessorStep for () {
+    fn online<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
+        &self,
+        _kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    ) where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot,
+    {
+    }
+
+    fn offline<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
+        &self,
+        _kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+        _successor: ProcessorId,
+    ) -> Result<(), OfflineRefusal>
+    where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot,
+    {
+        Ok(())
+    }
+}
+
+/// A step its run loop lends the lifecycle.
+impl<Step: ProcessorStep> ProcessorStep for &Step {
+    fn online<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
+        &self,
+        kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    ) where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot,
+    {
+        (**self).online(kernel);
+    }
+
+    fn offline<CpuImpl, WatchdogImpl, MeasuredBootImpl>(
+        &self,
+        kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+        successor: ProcessorId,
+    ) -> Result<(), OfflineRefusal>
+    where
+        CpuImpl: Cpu + Clone,
+        WatchdogImpl: Watchdog + Clone,
+        MeasuredBootImpl: MeasuredBoot,
+    {
+        (**self).offline(kernel, successor)
+    }
 }
 
 /// `First` comes up before `Then` and goes down after it; a refusal by
@@ -676,6 +841,12 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
         ProcessorControl::new(self.cpu.clone(), self.executor.group())
     }
 
+    /// The online set, live: what a lifecycle step reads to find the
+    /// processors that stay.
+    pub(crate) fn online_set(&self) -> &'static OnlineSet {
+        self.executor.group().online()
+    }
+
     /// This processor's first bring-up, from `init`: every step, in
     /// order, then the processor is online.
     pub(crate) fn bring_up(&self) {
@@ -702,17 +873,23 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
     /// the stop, and — once another processor restarts it — the
     /// bring-up. Called at the top of every run-loop pass, where the
     /// processor holds nothing.
-    pub(crate) fn service_lifecycle(&self) {
+    ///
+    /// `extra` is the step of the layer whose run loop this is — the
+    /// component host's network step — composed after [`STEPS`]: it
+    /// comes up last and goes down first, while every kernel owner is
+    /// still up. A run loop whose layer owns nothing per processor
+    /// passes `&()`.
+    pub(crate) fn service_lifecycle<Extra: ProcessorStep>(&self, extra: &Extra) {
         let processor = self.executor.owner_processor();
         let lifecycles = self.executor.group().lifecycle();
         if !lifecycles.departure_requested(processor) {
             return;
         }
+        let steps = (STEPS, extra);
         let cell = lifecycles.cell(processor);
         let successor = ProcessorId::new(cell.successor.load(Ordering::Relaxed));
-        if let Err(refusal) = STEPS.offline(self, successor) {
-            let OfflineRefusal::PinnedTasks(pinned) = refusal;
-            cell.refused_live.store(pinned.live, Ordering::Relaxed);
+        if let Err(refusal) = steps.offline(self, successor) {
+            cell.record_refusal(refusal);
             tracing::info!(
                 processor = processor.id(),
                 %refusal,
@@ -735,7 +912,7 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
             "processor {} returned from stop_current without a restart",
             processor.id()
         );
-        STEPS.online(self);
+        steps.online(self);
         // No join checkpoint: the initiator holds the transition lock
         // until this publish, so no freeze has set `hold`, and one that
         // starts after it counts this processor, already online.
@@ -758,35 +935,30 @@ mod tests {
     use crate::exec::Executor;
     use crate::exec::executor::PinnedTasks;
     use crate::test_processor_identity;
-    use crate::test_support::{ManualClockCpu, RecordingSmpCpu};
+    use crate::test_support::{ManualClockCpu, RecordingSmpCpu, single_node_pool};
 
     const P0: ProcessorId = ProcessorId::new(0);
     const P1: ProcessorId = ProcessorId::new(1);
     const P2: ProcessorId = ProcessorId::new(2);
 
+    /// The set answers membership and its count across its words: a
+    /// processor past the first 64 lives in the second word.
     #[test]
-    fn a_global_wake_picks_only_online_processors_other_than_the_waker() {
+    fn the_online_set_tracks_joins_and_departures_across_its_words() {
+        let p65 = ProcessorId::new(65);
         let online = OnlineSet::new(70);
-        for processor in [P0, P2, ProcessorId::new(65)] {
+        for processor in [P0, P2, p65] {
             online.insert(processor);
         }
         assert_eq!(online.count(), 3);
-
-        let picks: alloc::vec::Vec<_> = (0..4).map(|start| online.nth_after(start, P0)).collect();
-        assert_eq!(
-            picks,
-            [
-                Some(P2),
-                Some(ProcessorId::new(65)),
-                Some(P2),
-                Some(ProcessorId::new(65))
-            ]
-        );
+        assert!(online.contains(P0) && online.contains(P2) && online.contains(p65));
+        assert!(!online.contains(P1));
 
         online.remove(P2);
-        online.remove(ProcessorId::new(65));
-        assert_eq!(online.nth_after(0, P0), None);
+        online.remove(p65);
         assert!(!online.contains(P2));
+        assert!(!online.contains(p65));
+        assert!(online.contains(P0));
         assert_eq!(online.count(), 1);
     }
 
@@ -805,7 +977,7 @@ mod tests {
     #[test]
     fn a_pinned_local_task_refuses_the_departure_until_it_is_gone() {
         let cpu = RecordingSmpCpu::new(0, 2);
-        let executor0 = Executor::isolated(ProgressCounter::new(), 2, P0);
+        let executor0 = Executor::isolated(ProgressCounter::new(), single_node_pool(2), P0);
         let group = executor0.group();
         group.bring_processor_online(P0);
 
@@ -846,7 +1018,7 @@ mod tests {
     fn a_departing_processors_pending_sleep_fires_on_its_successor() {
         let cpu = ManualClockCpu::new();
         test_processor_identity::set(P0);
-        let executor0 = Executor::isolated(ProgressCounter::new(), 2, P0);
+        let executor0 = Executor::isolated(ProgressCounter::new(), single_node_pool(2), P0);
         let timer0 = executor0.timer(cpu.clone());
 
         test_processor_identity::set(P1);

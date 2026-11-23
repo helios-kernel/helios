@@ -1,11 +1,330 @@
 use super::*;
+#[derive(Clone)]
+pub(crate) struct SignalTarget {
+    pub(crate) interrupts: Arc<GuestInterrupts>,
+    pub(crate) instance: crate::InstanceId,
+}
+impl helios_unix::InterruptTarget for SignalTarget {
+    fn interrupt(&self) {
+        self.interrupts.interrupt_instance(self.instance);
+    }
+}
+pub(crate) type WasixSignalState = helios_unix::SignalState<SignalTarget>;
+pub(super) type WasixProcessThreads<Image> =
+    helios_unix::ProcessThreads<SignalTarget, Image, ProgramExecError>;
+pub(super) type WasixProcessEnd<Image> = helios_unix::ProcessEnd<Image, ProgramExecError>;
+pub(super) type WasixThreadExit = helios_unix::ThreadExit;
+pub(super) type EventFd = helios_unix::EventFd;
 
-pub(super) struct WasixChildProcess {
+/// The exit report a child's launch task sends its parent.
+pub(super) type WasixChildExit =
+    futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>;
+
+/// A process's children, in spawn order, until each one is joined.
+///
+/// Owned by the process and shared by every store of the process (`Arc::clone`),
+/// so a child spawned on any thread can be joined or signaled by any other
+/// thread of the process.
+///
+/// # Concurrency contract
+///
+/// Every caller runs in task context (never an interrupt handler). The
+/// `spin::Mutex` guards only in-memory table reads, inserts, `try_recv`
+/// probes, and synchronous `oneshot` polls, and is always dropped before any
+/// `.await`, filesystem layer adoption, or waiter wakeup.
+///
+/// Non-blocking probes ([`Self::poll_signal_target`] and [`Self::try_join`])
+/// inspect `oneshot::Receiver::try_recv` rather than polling with a no-op
+/// waker, so they never overwrite a waker registered by another thread
+/// blocked in `proc_join`. Whenever a child is inserted, transitions to
+/// `Completed`, is reaped, or a blocking joiner returns or drops (through
+/// [`WasixChildrenJoinGuard`]), `changed.notify_all()` wakes any remaining
+/// blocking joiners so they re-register their wakers on the remaining running
+/// children without lost wakeups.
+#[derive(Clone)]
+pub(super) struct WasixChildren {
+    inner: Arc<WasixChildrenInner>,
+}
+
+struct WasixChildrenInner {
+    table: Mutex<Vec<WasixChildProcess>>,
+    changed: crate::Notify,
+}
+
+/// RAII guard held by a blocking `proc_join` future. Dropping it wakes any
+/// sibling thread also blocked in `proc_join` so it re-registers its waker
+/// on the remaining children's `oneshot` receivers if this joiner overwrote
+/// them before returning, returning `EINTR`, or being cancelled.
+pub(super) struct WasixChildrenJoinGuard {
+    children: WasixChildren,
+}
+
+impl Drop for WasixChildrenJoinGuard {
+    fn drop(&mut self) {
+        self.children.inner.changed.notify_all();
+    }
+}
+
+struct WasixChildProcess {
+    pid: u32,
+    signal_state: WasixSignalState,
+    state: WasixChildState,
+}
+
+enum WasixChildState {
+    Running(WasixChildExit),
+    /// Completed and not joined yet: either how the child ended or the
+    /// errno its failed launch or lost report gives the joiner.
+    Completed(Result<helios_unix::ChildTermination, i32>),
+}
+
+/// The child a join took off the table, and what came of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct WasixJoinedChild {
     pub(super) pid: u32,
-    pub(super) signal_state: WasixSignalState,
-    pub(super) exit:
-        Option<futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>>,
-    pub(super) completed: Option<u32>,
+    pub(super) outcome: Result<helios_unix::ChildTermination, i32>,
+}
+
+impl WasixChildren {
+    pub(super) fn new() -> Self {
+        Self {
+            inner: Arc::new(WasixChildrenInner {
+                table: Mutex::new(Vec::new()),
+                changed: crate::Notify::new(),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.inner.table.lock().is_empty()
+    }
+
+    pub(super) fn insert(&self, pid: u32, signal_state: WasixSignalState, exit: WasixChildExit) {
+        self.inner.table.lock().push(WasixChildProcess {
+            pid,
+            signal_state,
+            state: WasixChildState::Running(exit),
+        });
+        self.inner.changed.notify_all();
+    }
+
+    /// Arms a change waiter and a drop guard for a blocking `proc_join`.
+    pub(super) fn begin_blocking_join(&self) -> (crate::NotifyWaiter, WasixChildrenJoinGuard) {
+        (
+            self.inner.changed.waiter(),
+            WasixChildrenJoinGuard {
+                children: self.clone(),
+            },
+        )
+    }
+
+    /// The signal mailbox of child `pid` while it is still running: `None`
+    /// for a pid that names no child and for a child whose completion has
+    /// already arrived on its exit channel. Any completion observed here is
+    /// recorded in place without reaping the child, so a subsequent
+    /// [`Self::poll_join`] still reports its termination or launch error.
+    pub(super) fn poll_signal_target(
+        &self,
+        pid: u32,
+        mut adopt: impl FnMut(MemoryFs),
+    ) -> Option<WasixSignalState> {
+        let mut adopted = None;
+        let mut completed_now = false;
+        let mailbox = {
+            let mut table = self.inner.table.lock();
+            let child = table.iter_mut().find(|child| child.pid == pid)?;
+            if let WasixChildState::Running(exit) = &mut child.state {
+                match exit.try_recv() {
+                    Ok(Some(result)) => {
+                        child.state = WasixChildState::Completed(child_exit_outcome(
+                            Ok(result),
+                            &mut |layer| adopted = Some(layer),
+                        ));
+                        completed_now = true;
+                    }
+                    Err(canceled) => {
+                        child.state = WasixChildState::Completed(child_exit_outcome(
+                            Err(canceled),
+                            &mut |layer| adopted = Some(layer),
+                        ));
+                        completed_now = true;
+                    }
+                    Ok(None) => {}
+                }
+            }
+            matches!(child.state, WasixChildState::Running(_)).then(|| child.signal_state.clone())
+        };
+        if let Some(layer) = adopted {
+            adopt(layer);
+        }
+        if completed_now {
+            self.inner.changed.notify_all();
+        }
+        mailbox
+    }
+
+    /// Non-blocking join (`WNOHANG`) of `pid`, or any child for `None`.
+    /// Uses `try_recv` so it never clobbers a blocking joiner's waker.
+    pub(super) fn try_join(
+        &self,
+        pid: Option<u32>,
+        mut adopt: impl FnMut(MemoryFs),
+    ) -> Poll<Option<WasixJoinedChild>> {
+        let mut adopted: SmallVec<[MemoryFs; 1]> = SmallVec::new();
+        let mut changed = false;
+        let outcome = {
+            let mut table = self.inner.table.lock();
+            let mut named = false;
+            let mut completed = None;
+            for (index, child) in table.iter_mut().enumerate() {
+                if pid.is_some_and(|pid| child.pid != pid) {
+                    continue;
+                }
+                named = true;
+                if let WasixChildState::Running(exit) = &mut child.state {
+                    match exit.try_recv() {
+                        Ok(Some(result)) => {
+                            child.state = WasixChildState::Completed(child_exit_outcome(
+                                Ok(result),
+                                &mut |layer| adopted.push(layer),
+                            ));
+                            changed = true;
+                        }
+                        Err(canceled) => {
+                            child.state = WasixChildState::Completed(child_exit_outcome(
+                                Err(canceled),
+                                &mut |layer| adopted.push(layer),
+                            ));
+                            changed = true;
+                        }
+                        Ok(None) => {}
+                    }
+                }
+                if completed.is_none() && matches!(child.state, WasixChildState::Completed(_)) {
+                    completed = Some(index);
+                }
+            }
+            match completed {
+                Some(index) => {
+                    let child = table.remove(index);
+                    let WasixChildState::Completed(outcome) = child.state else {
+                        unreachable!("a joined child was just seen to have completed");
+                    };
+                    changed = true;
+                    Poll::Ready(Some(WasixJoinedChild {
+                        pid: child.pid,
+                        outcome,
+                    }))
+                }
+                None if named => Poll::Pending,
+                None => Poll::Ready(None),
+            }
+        };
+        for layer in adopted {
+            adopt(layer);
+        }
+        if changed {
+            self.inner.changed.notify_all();
+        }
+        outcome
+    }
+
+    /// Joins the child `pid` names, or any child for `None`.
+    ///
+    /// Every running child the join names is polled, so each completion
+    /// that has arrived is recorded and `cx` is registered with every
+    /// child still running: an any-child join takes the oldest child
+    /// that has completed, never waits on one child while another has
+    /// already completed, and is woken by whichever completes first. A
+    /// shell reaps each foreground command this way while its background
+    /// jobs, older children, keep running.
+    ///
+    /// `Ready(None)` when `pid` names no child, `Ready(Some)` with the
+    /// child taken off the table once one it names has completed, and
+    /// `Pending` while every child it names is still running. `adopt`
+    /// receives the filesystem layer each exit observed here hands back
+    /// to the parent.
+    pub(super) fn poll_join(
+        &self,
+        pid: Option<u32>,
+        cx: &mut Context<'_>,
+        wait: &mut crate::NotifyWaiter,
+        mut adopt: impl FnMut(MemoryFs),
+    ) -> Poll<Option<WasixJoinedChild>> {
+        loop {
+            let mut adopted: SmallVec<[MemoryFs; 1]> = SmallVec::new();
+            let mut changed = false;
+            let outcome = {
+                let mut table = self.inner.table.lock();
+                let mut named = false;
+                let mut completed = None;
+                for (index, child) in table.iter_mut().enumerate() {
+                    if pid.is_some_and(|pid| child.pid != pid) {
+                        continue;
+                    }
+                    named = true;
+                    if let WasixChildState::Running(exit) = &mut child.state
+                        && let Poll::Ready(result) = Pin::new(exit).poll(cx)
+                    {
+                        child.state =
+                            WasixChildState::Completed(child_exit_outcome(result, &mut |layer| {
+                                adopted.push(layer)
+                            }));
+                        changed = true;
+                    }
+                    if completed.is_none() && matches!(child.state, WasixChildState::Completed(_)) {
+                        completed = Some(index);
+                    }
+                }
+                match completed {
+                    Some(index) => {
+                        let child = table.remove(index);
+                        let WasixChildState::Completed(outcome) = child.state else {
+                            unreachable!("a joined child was just seen to have completed");
+                        };
+                        changed = true;
+                        Poll::Ready(Some(WasixJoinedChild {
+                            pid: child.pid,
+                            outcome,
+                        }))
+                    }
+                    None if named => Poll::Pending,
+                    None => Poll::Ready(None),
+                }
+            };
+            for layer in adopted {
+                adopt(layer);
+            }
+            if changed {
+                self.inner.changed.notify_all();
+            }
+            if outcome.is_ready() {
+                return outcome;
+            }
+            if self.inner.changed.poll_notified(cx, wait).is_pending() {
+                return Poll::Pending;
+            }
+        }
+    }
+}
+
+/// What a child's exit report gives its parent: the child's termination,
+/// or the errno for a launch failure or dropped exit channel.
+fn child_exit_outcome(
+    result: Result<Result<ChildExit, ProgramExecError>, futures::channel::oneshot::Canceled>,
+    adopt: &mut impl FnMut(MemoryFs),
+) -> Result<helios_unix::ChildTermination, i32> {
+    match result {
+        Ok(Ok(exit)) => {
+            if let Some(filesystem) = exit.filesystem {
+                adopt(filesystem);
+            }
+            Ok(exit.termination)
+        }
+        Ok(Err(error)) => Err(p1_errno_from_program_exec_error(&error)),
+        Err(_) => Err(p1::errno::IO),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,150 +339,103 @@ pub(super) enum WasixSignalDispositionAction {
     Ignore,
 }
 
-/// One signal mailbox: a process's, shared by every store of the
-/// process (its threads' included), or one thread's, read only by that
-/// thread's store. It holds the one pending delivery, the interval
-/// timer's generation, the broadcast a raise sends to the turns driving
-/// the stores that read it, and the instance a raise interrupts. A
-/// thread's mailbox also carries the end of its process
-/// ([`Self::end_thread`]), which reaches the thread the way a signal
-/// does and is never taken.
+/// Process-wide WASIX signal state shared by every thread of one process
+/// image: the initial `Ignore` set inherited from spawn or exec plus the guest
+/// handler export registered through `callback_signal`, if any.
 ///
 /// # Concurrency
 ///
-/// Any processor may raise (a parent's `proc_raise`, a sibling's
-/// `thread_signal`, the interval timer task) or end the thread (the
-/// process's last turn); one turn at a time takes. The pending signal,
-/// the end and the generation are single atomics and the broadcast is
-/// lock-free; only naming and reaching the interrupt target takes a
-/// spin lock, see [`WasixSignals::target`].
-#[derive(Clone)]
-pub(super) struct WasixSignalState {
-    shared: Arc<WasixSignals>,
+/// Any thread of the process may register or clear `callback_signal`, and any
+/// thread's store may sample the state at an interrupt check, turn epilogue,
+/// or safe point. Every caller runs in task context (never an interrupt
+/// handler), copies an 8-byte [`helios_unix::SignalSet`] and optional
+/// [`Arc<str>`] under the spin lock, and drops the guard before any `.await`
+/// or guest call.
+#[derive(Clone, Default)]
+pub(super) struct WasixProcessSignals {
+    inner: Arc<Mutex<WasixProcessSignalsState>>,
 }
 
-struct WasixSignals {
-    pending: AtomicU32,
-    /// Set once, when the process this thread belongs to has ended. It
-    /// is a stop the thread's store owes its guest at every turn from
-    /// then on, so it is read and never taken.
-    thread_ended: AtomicBool,
-    interval_generation: AtomicU64,
-    /// Broadcast by every raise and by the thread's end, after either is
-    /// stored, so a turn whose guest is suspended in a host call ends the
-    /// call instead of waiting for the host call to resolve.
-    raised: crate::Notify,
-    /// The process a raise interrupts, once a store of it exists.
-    ///
-    /// Raises come from host calls and timer tasks, never from an
-    /// interrupt handler, so a spin lock is enough; it is also what orders
-    /// a raise against [`WasixSignalState::attach`], which see the comment
-    /// there.
-    target: Mutex<Option<SignalTarget>>,
+#[derive(Default)]
+struct WasixProcessSignalsState {
+    ignored: helios_unix::SignalSet,
+    callback: Option<Arc<str>>,
 }
 
-struct SignalTarget {
-    interrupts: Arc<GuestInterrupts>,
-    instance: crate::InstanceId,
-}
-
-impl WasixSignalState {
-    pub(super) fn new() -> Self {
+impl WasixProcessSignals {
+    pub(super) fn from_dispositions(dispositions: &[WasixSignalDisposition]) -> Self {
+        let mut ignored = helios_unix::SignalSet::EMPTY;
+        for disposition in dispositions {
+            let Some(signal) = helios_unix::Signal::from_standard(disposition.signal) else {
+                continue;
+            };
+            if signal.is_uncatchable() {
+                continue;
+            }
+            match disposition.action {
+                WasixSignalDispositionAction::Ignore => ignored.insert(signal),
+                WasixSignalDispositionAction::Default => {
+                    ignored.remove(signal);
+                }
+            }
+        }
         Self {
-            shared: Arc::new(WasixSignals {
-                pending: AtomicU32::new(WASIX_NO_PENDING_SIGNAL),
-                thread_ended: AtomicBool::new(false),
-                interval_generation: AtomicU64::new(0),
-                raised: crate::Notify::new(),
-                target: Mutex::new(None),
-            }),
+            inner: Arc::new(Mutex::new(WasixProcessSignalsState {
+                ignored,
+                callback: None,
+            })),
         }
     }
 
-    /// Marks `signal` pending and brings it to the guest: a running
-    /// guest takes it at its next interrupt check, which interrupting
-    /// every store of the process makes immediate, and a suspended one
-    /// through the turn that waits on `raised`.
-    pub(super) fn raise(&self, signal: u32) {
-        self.shared.pending.store(signal, AtomicOrdering::Release);
-        self.deliver();
+    pub(super) fn set_callback(&self, callback: Option<Arc<str>>) {
+        self.inner.lock().callback = callback;
     }
 
-    /// Ends the thread whose mailbox this is, because its process ended:
-    /// a running thread meets the end at its next interrupt check, which
-    /// interrupting the process's stores makes immediate, and a suspended
-    /// one through the turn that waits on `raised`, which drops the call
-    /// it is suspended in (a parked `memory.atomic.wait` included).
-    pub(super) fn end_thread(&self) {
-        self.shared
-            .thread_ended
-            .store(true, AtomicOrdering::Release);
-        self.deliver();
+    pub(super) fn callback(&self) -> Option<Arc<str>> {
+        self.inner.lock().callback.clone()
     }
 
-    /// Whether [`Self::end_thread`] has ended the thread.
-    pub(super) fn thread_ended(&self) -> bool {
-        self.shared.thread_ended.load(AtomicOrdering::Acquire)
+    fn summary(&self) -> (helios_unix::SignalSet, bool) {
+        let state = self.inner.lock();
+        (state.ignored, state.callback.is_some())
     }
 
-    /// Brings what was just stored to the stores that read this mailbox:
-    /// wakes the turns whose guests are suspended and interrupts the
-    /// running ones.
-    fn deliver(&self) {
-        self.shared.raised.notify_all();
-        if let Some(target) = &*self.shared.target.lock() {
-            target.interrupts.interrupt_instance(target.instance);
-        }
+    fn snapshot(&self) -> (helios_unix::SignalSet, Option<Arc<str>>) {
+        let state = self.inner.lock();
+        (state.ignored, state.callback.clone())
     }
+}
 
-    /// Names `instance`, whose stores `interrupts` reaches, as the process
-    /// a raise interrupts. Every store of the process attaches when it is
-    /// created; a replacement image attaches its own instance.
-    ///
-    /// A raise or an end that came before the target was named left its
-    /// mark and interrupted nothing, so this interrupts on its behalf.
-    /// The lock orders the two: one that takes it after this released it
-    /// finds the target, and one that took it before had already stored
-    /// its mark, which the loads below then see.
-    pub(super) fn attach(&self, interrupts: Arc<GuestInterrupts>, instance: crate::InstanceId) {
-        *self.shared.target.lock() = Some(SignalTarget {
-            interrupts: interrupts.clone(),
-            instance,
-        });
-        if self.shared.pending.load(AtomicOrdering::Acquire) != WASIX_NO_PENDING_SIGNAL
-            || self.thread_ended()
-        {
-            interrupts.interrupt_instance(instance);
-        }
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WasixResolvedAction<H> {
+    Ignore,
+    Catch(H),
+    Terminate,
+}
 
-    pub(super) fn take_pending(&self) -> Option<u32> {
-        match self
-            .shared
-            .pending
-            .swap(WASIX_NO_PENDING_SIGNAL, AtomicOrdering::AcqRel)
-        {
-            WASIX_NO_PENDING_SIGNAL => None,
-            signal => Some(signal),
-        }
-    }
-
-    pub(super) fn next_interval_generation(&self) -> u64 {
-        self.shared
-            .interval_generation
-            .fetch_add(1, AtomicOrdering::AcqRel)
-            .saturating_add(1)
-    }
-
-    pub(super) fn cancel_interval(&self) {
-        let _ = self.next_interval_generation();
-    }
-
-    pub(super) fn interval_generation_is_current(&self, generation: u64) -> bool {
-        self.shared
-            .interval_generation
-            .load(AtomicOrdering::Acquire)
-            == generation
+fn resolve_wasix_signal<H: Copy>(
+    signal: helios_unix::Signal,
+    ignored: helios_unix::SignalSet,
+    callback: Option<H>,
+) -> WasixResolvedAction<H> {
+    let disposition = if ignored.contains(signal) {
+        helios_unix::SignalDisposition::Ignore
+    } else if let Some(handler) = callback {
+        helios_unix::SignalDisposition::Catch(handler)
+    } else {
+        helios_unix::SignalDisposition::Default
+    };
+    match signal.resolve(disposition) {
+        helios_unix::ResolvedSignal::Ignore
+        | helios_unix::ResolvedSignal::Default(
+            helios_unix::DefaultSignalAction::Ignore | helios_unix::DefaultSignalAction::Continue,
+        ) => WasixResolvedAction::Ignore,
+        helios_unix::ResolvedSignal::Catch(handler) => WasixResolvedAction::Catch(handler),
+        helios_unix::ResolvedSignal::Default(
+            helios_unix::DefaultSignalAction::Terminate
+            | helios_unix::DefaultSignalAction::CoreDump
+            | helios_unix::DefaultSignalAction::Stop,
+        ) => WasixResolvedAction::Terminate,
     }
 }
 
@@ -187,15 +459,181 @@ pub(super) struct Preview1Cwd {
     pub(super) descriptor: FsDescriptor,
 }
 
+/// Process-wide working directory shared by every store of one WASIX process.
+///
+/// # Concurrency contract
+///
+/// Every caller runs in task context (never an interrupt handler). The
+/// `spin::Mutex` is held only to clone or replace `Option<Preview1Cwd>` and
+/// is always dropped before any `.await` (path resolution and `stat_path`
+/// run outside the lock).
+#[derive(Clone)]
+pub(super) struct SharedCwd {
+    inner: Arc<Mutex<Option<Preview1Cwd>>>,
+}
+
+impl SharedCwd {
+    pub(super) fn new(cwd: Option<Preview1Cwd>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(cwd)),
+        }
+    }
+
+    pub(super) fn get(&self) -> Option<Preview1Cwd> {
+        self.inner.lock().clone()
+    }
+
+    pub(super) fn set(&self, cwd: Option<Preview1Cwd>) {
+        *self.inner.lock() = cwd;
+    }
+
+    pub(super) fn with<R>(&self, f: impl FnOnce(Option<&Preview1Cwd>) -> R) -> R {
+        f(self.inner.lock().as_ref())
+    }
+}
+
+/// Process-wide descriptor table shared by every store of one WASIX process.
+///
+/// # Concurrency contract
+///
+/// Every caller runs in task context (never an interrupt handler). The
+/// `spin::Mutex` guards only in-memory slot lookups, insertions,
+/// duplications, flag reads/writes, closes, and table snapshots, and is
+/// always dropped before any `.await` or guest call. Open file descriptions
+/// (`OpenFile` with its async `RawMutex` position lock, `FileDescriptorEntry`'s
+/// atomic `fdflags`, and shared `Socket` handles) are cloned out under the
+/// lock so concurrent I/O across threads shares offsets, status flags, and
+/// socket state without holding the table spin lock across `.await`.
+pub(super) struct SharedDescriptorTable<Net: ComponentHostNetwork> {
+    inner: Arc<Mutex<Preview1DescriptorTable<Net>>>,
+}
+
+impl<Net: ComponentHostNetwork> Clone for SharedDescriptorTable<Net> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<Net: ComponentHostNetwork> SharedDescriptorTable<Net> {
+    pub(super) fn new(table: Preview1DescriptorTable<Net>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(table)),
+        }
+    }
+
+    pub(super) fn with<R>(&self, f: impl FnOnce(&Preview1DescriptorTable<Net>) -> R) -> R {
+        f(&self.inner.lock())
+    }
+
+    pub(super) fn with_mut<R>(&self, f: impl FnOnce(&mut Preview1DescriptorTable<Net>) -> R) -> R {
+        f(&mut self.inner.lock())
+    }
+
+    /// Clones a descriptor handle out of slot `fd` and drops the table lock
+    /// immediately so callers can await I/O on the handle without holding the
+    /// spin lock.
+    pub(super) fn get_cloned(&self, fd: i32) -> Option<Preview1Descriptor<Net>> {
+        self.inner.lock().get(fd).cloned()
+    }
+
+    /// Point-in-time snapshot of the process's descriptor table (preserving
+    /// open-file-description sharing on every slot) for `fork`, `proc_snapshot`,
+    /// or `proc_spawn2` fd-op evaluation.
+    pub(super) fn snapshot(&self) -> Preview1DescriptorTable<Net> {
+        self.inner.lock().clone()
+    }
+
+    /// Snapshot with `close_on_exec` slots cleared for `proc_exec*` from any
+    /// thread of the process.
+    pub(super) fn clone_for_exec(&self) -> Preview1DescriptorTable<Net> {
+        self.inner.lock().clone_for_exec()
+    }
+
+    pub(super) fn insert(&self, descriptor: Preview1Descriptor<Net>) -> Result<u32, i32> {
+        self.inner.lock().insert(descriptor)
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert_with_close_on_exec(
+        &self,
+        descriptor: Preview1Descriptor<Net>,
+        close_on_exec: bool,
+    ) -> Result<u32, i32> {
+        self.inner
+            .lock()
+            .insert_with_close_on_exec(descriptor, close_on_exec)
+    }
+
+    pub(super) fn insert_with_fdflags(
+        &self,
+        descriptor: Preview1Descriptor<Net>,
+        close_on_exec: bool,
+        fdflags: u16,
+    ) -> Result<u32, i32> {
+        self.inner
+            .lock()
+            .insert_with_fdflags(descriptor, close_on_exec, fdflags)
+    }
+
+    pub(super) fn dup(&self, fd: i32) -> Result<u32, i32> {
+        self.inner.lock().dup(fd)
+    }
+
+    pub(super) fn dup2(&self, from: i32, to: i32) -> i32 {
+        self.inner.lock().dup2(from, to)
+    }
+
+    pub(super) fn dup_to(&self, fd: i32, to_fd: i32, close_on_exec: bool) -> Result<u32, i32> {
+        self.inner.lock().dup_to(fd, to_fd, close_on_exec)
+    }
+
+    pub(super) fn renumber(&self, from: i32, to: i32) -> i32 {
+        self.inner.lock().renumber(from, to)
+    }
+
+    pub(super) fn close(&self, fd: i32) -> i32 {
+        self.inner.lock().close(fd)
+    }
+
+    pub(super) fn fdflags(&self, fd: i32) -> Result<u16, i32> {
+        self.inner.lock().fdflags(fd)
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_fdflags(&self, fd: i32, fdflags: u16) -> i32 {
+        self.inner.lock().set_fdflags(fd, fdflags)
+    }
+
+    pub(super) fn close_on_exec(&self, fd: i32) -> Result<bool, i32> {
+        self.inner.lock().close_on_exec(fd)
+    }
+
+    pub(super) fn set_close_on_exec(&self, fd: i32, close_on_exec: bool) -> i32 {
+        self.inner.lock().set_close_on_exec(fd, close_on_exec)
+    }
+
+    pub(super) fn limit(&self) -> helios_unix::DescriptorLimit {
+        self.inner.lock().limit
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct Preview1DescriptorTable<Net: ComponentHostNetwork> {
-    pub(super) entries: Vec<Option<Preview1DescriptorEntry<Net>>>,
-    pub(super) free: FreeDescriptorSlots,
-    /// Descriptor numbers at or past this are never handed out or accepted.
-    /// A process takes it from the machine's descriptor-limit setting when
-    /// it is created ([`process_descriptors`]) and keeps it for as long as
-    /// it runs: `clone_for_exec` and `Clone` carry it to the same process.
-    pub(super) limit: DescriptorLimit,
+    slots: helios_unix::DescriptorSlots<Preview1DescriptorEntry<Net>>,
+}
+
+impl<Net: ComponentHostNetwork> core::ops::Deref for Preview1DescriptorTable<Net> {
+    type Target = helios_unix::DescriptorSlots<Preview1DescriptorEntry<Net>>;
+    fn deref(&self) -> &Self::Target {
+        &self.slots
+    }
+}
+impl<Net: ComponentHostNetwork> core::ops::DerefMut for Preview1DescriptorTable<Net> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.slots
+    }
 }
 
 /// Where a process's descriptor table comes from. Every place that builds
@@ -235,54 +673,36 @@ pub(super) fn process_descriptors<Net: ComponentHostNetwork>(
         DescriptorOrigin::SameProcess(table) => table,
     }
 }
-
-#[derive(Clone)]
-pub(super) struct Preview1DescriptorEntry<Net: ComponentHostNetwork> {
-    pub(super) descriptor: Preview1Descriptor<Net>,
-    pub(super) close_on_exec: bool,
-    pub(super) fdflags: u16,
+fn descriptor_errno(error: helios_unix::DescriptorTableError) -> i32 {
+    match error {
+        helios_unix::DescriptorTableError::BadDescriptor(_) => p1::errno::BADF,
+        helios_unix::DescriptorTableError::TooManyDescriptors { .. } => p1::errno::MFILE,
+        helios_unix::DescriptorTableError::IndexOverflow => p1::errno::OVERFLOW,
+        helios_unix::DescriptorTableError::RightsWidening => p1::errno::NOTCAPABLE,
+    }
 }
+pub(super) type Preview1DescriptorEntry<Net> =
+    helios_unix::FileDescriptorEntry<FsDescriptor, crate::UnixNetwork<Net>, EpollUserData>;
+pub(super) type Preview1Descriptor<Net> =
+    helios_unix::FileDescriptor<FsDescriptor, crate::UnixNetwork<Net>, EpollUserData>;
 
-#[derive(Clone)]
-pub(super) enum Preview1Descriptor<Net: ComponentHostNetwork> {
-    Stdin {
-        carry: Bytes,
-    },
-    Stdout,
-    Stderr,
-    PipeRead {
-        reader: crate::ByteReader,
-        carry: Bytes,
-    },
-    PipeWrite {
-        writer: crate::ByteWriter,
-    },
-    Event(EventFd),
-    Preopen {
-        guest_name: String,
-        descriptor: FsDescriptor,
-    },
-    File {
-        descriptor: FsDescriptor,
-        offset: u64,
-        fdflags: u16,
-    },
-    NullDevice,
-    Socket(WasixSocketDescriptor<Net>),
-    Epoll(EpollDescriptor),
+/// The shared UNIX socket objects on the machine's network, as every
+/// descriptor table in this host (WASIX's and the Linux host's) holds them.
+pub(super) type UnixSocket<Net> = helios_unix::Socket<crate::UnixNetwork<Net>>;
+pub(super) type UnixTcpSocket<Net> = helios_unix::TcpSocket<crate::UnixNetwork<Net>>;
+pub(super) type UnixUdpSocket<Net> = helios_unix::UdpSocket<crate::UnixNetwork<Net>>;
+pub(super) type UnixSocketHandle<Net> = helios_unix::SocketHandle<crate::UnixNetwork<Net>>;
+/// The options a new socket on the machine's network starts with.
+pub(super) const fn unix_socket_options<Net: ComponentHostNetwork>() -> SocketOptions {
+    SocketOptions::for_network::<crate::UnixNetwork<Net>>()
 }
+pub(super) use helios_unix::{
+    OwnedTcpListener, OwnedTcpStream, OwnedUdpSocket, SocketFamily, SocketFlag, SocketKind,
+    SocketOptionError, SocketOptions, SocketSize, SocketTime,
+};
 
-#[derive(Clone)]
-pub(super) struct EpollDescriptor {
-    pub(super) interests: Vec<EpollInterest>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct EpollInterest {
-    pub(super) fd: i32,
-    pub(super) events: u32,
-    pub(super) data: EpollUserData,
-}
+pub(super) type EpollDescriptor = helios_unix::Epoll<EpollUserData>;
+pub(super) type EpollInterest = helios_unix::Interest<EpollUserData>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct EpollUserData {
@@ -361,26 +781,30 @@ impl P1WaitSet {
     }
 }
 
-/// Sleep until a watched descriptor wakes us, the re-probe cadence elapses,
-/// or `remaining` runs out.
+/// Sleep until a watched descriptor wakes us, a catchable handled signal
+/// arrives, the re-probe cadence elapses, or `remaining` runs out.
 ///
 /// The caller re-probes after every step, so this only has to guarantee that
 /// it yields control and comes back when something might have changed.
 /// `remaining` of `None` means "no deadline": block until a descriptor makes
-/// progress.
+/// progress or a handled signal interrupts the wait.
 pub(super) async fn p1_wait_step<CpuImpl>(
     timer: &crate::Timer<CpuImpl>,
     wait: &mut P1WaitSet,
     remaining: Option<Duration>,
-) where
+    signals: &WasixStoreSignals,
+    active_handlers: helios_unix::SignalSet,
+) -> bool
+where
     CpuImpl: Cpu + Clone,
 {
+    let mut catch_signal = core::pin::pin!(signals.wait_for_catch_signal(active_handlers));
     if wait.is_empty() && remaining.is_none() {
         // Nothing subscribed can ever become ready and no deadline will end
-        // the call. Park rather than spin; the task is dropped with the
-        // instance.
-        core::future::pending::<()>().await;
-        return;
+        // the call; only a caught signal (or a fatal stop on the outer turn)
+        // can wake it.
+        catch_signal.await;
+        return true;
     }
 
     // A descriptor without a wakeup source needs us back on a fixed cadence;
@@ -390,36 +814,56 @@ pub(super) async fn p1_wait_step<CpuImpl>(
         (true, None) => P1_READINESS_REPOLL_INTERVAL,
         (false, Some(remaining)) => remaining,
         (false, None) => {
-            // Every subscribed descriptor can wake us, so wait on them alone.
+            // Every subscribed descriptor can wake us, so wait on them and
+            // any caught signal.
             let targets = &mut wait.notified;
-            core::future::poll_fn(|cx| poll_epoll_wait_targets(targets, cx)).await;
-            return;
+            return core::future::poll_fn(|cx| {
+                if catch_signal.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(true);
+                }
+                if poll_epoll_wait_targets(targets, cx).is_ready() {
+                    return Poll::Ready(false);
+                }
+                Poll::Pending
+            })
+            .await;
         }
     };
 
     if sleep.is_zero() {
-        return;
+        return signals.has_deliverable_catch(active_handlers);
     }
 
     let mut timer = core::pin::pin!(timer.sleep_for(sleep));
     if wait.notified.is_empty() {
-        timer.await;
-        return;
+        return core::future::poll_fn(|cx| {
+            if catch_signal.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(true);
+            }
+            if timer.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(false);
+            }
+            Poll::Pending
+        })
+        .await;
     }
 
-    // Race the wakeup sources against the sleep: whichever comes first ends
-    // this step and sends the caller back to re-probe.
+    // Race the wakeup sources against the sleep and caught signals: whichever
+    // comes first ends this step and sends the caller back to re-probe.
     let targets = &mut wait.notified;
     core::future::poll_fn(|cx| {
+        if catch_signal.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(true);
+        }
         if poll_epoll_wait_targets(targets, cx).is_ready() {
-            return Poll::Ready(());
+            return Poll::Ready(false);
         }
         if timer.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(());
+            return Poll::Ready(false);
         }
         Poll::Pending
     })
-    .await;
+    .await
 }
 
 /// Register whatever wakes `fd` into `wait`.
@@ -437,63 +881,79 @@ pub(super) fn p1_add_wait_target<CpuImpl, Net, StorageImpl>(
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    match store.descriptors.get(fd) {
-        Some(Preview1Descriptor::PipeRead { reader, carry })
-        | Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { reader, carry, .. }))
-            if carry.is_empty() && event_type == P1_EVENTTYPE_FD_READ =>
-        {
-            wait.notified.push(EpollWaitTarget::ByteReader {
-                reader: reader.clone(),
-                wait: reader.wait_state(),
-            });
-        }
-        Some(Preview1Descriptor::PipeWrite { writer })
-        | Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. }))
-            if event_type == P1_EVENTTYPE_FD_WRITE && !writer.is_writable() =>
-        {
-            wait.notified.push(EpollWaitTarget::ByteWriter {
-                writer: writer.clone(),
-                wait: writer.wait_state(),
-            });
-        }
-        Some(Preview1Descriptor::Event(event))
-            if event_type == P1_EVENTTYPE_FD_READ && !event.is_readable() =>
-        {
-            wait.notified.push(EpollWaitTarget::Event {
-                event: event.clone(),
-                wait: event.wait_state(),
-            });
-        }
-        Some(Preview1Descriptor::Stdin { carry })
-            if carry.is_empty() && event_type == P1_EVENTTYPE_FD_READ =>
-        {
-            match &store.output_mode {
-                // A child's stdin is a byte channel, so it can wake us.
-                OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
-                    wait.notified.push(EpollWaitTarget::ByteReader {
-                        reader: stdin_rx.clone(),
-                        wait: stdin_rx.wait_state(),
-                    });
-                }
-                // The serial console's receive signal is the wakeup
-                // source, parked on the same way a channel's is.
-                OutputMode::Serial => wait.notified.push(EpollWaitTarget::SerialInput {
-                    serial: store.write_serial,
-                    wait: store.write_serial.debug_serial_input_waiter(),
-                }),
-                // Trace output never delivers input; the probe reports it as
-                // an immediate hangup, so there is nothing to wait for.
-                OutputMode::Trace => {}
+    store
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::PipeRead { reader, .. })
+                if event_type == P1_EVENTTYPE_FD_READ =>
+            {
+                wait.notified.push(EpollWaitTarget::ByteReader {
+                    reader: reader.clone(),
+                    wait: reader.wait_state(),
+                });
             }
-        }
-        Some(Preview1Descriptor::Socket(
-            WasixSocketDescriptor::Tcp(
-                WasixTcpSocket::Connected { .. } | WasixTcpSocket::Listening { .. },
-            )
-            | WasixSocketDescriptor::Udp(WasixUdpSocket::Bound { .. }),
-        )) => wait.repoll = true,
-        _ => {}
-    }
+            Some(Preview1Descriptor::Socket(socket)) => {
+                if let Some((reader, carry_len)) = socket.pair_read_probe() {
+                    if event_type == P1_EVENTTYPE_FD_READ && carry_len == 0 {
+                        wait.notified.push(EpollWaitTarget::ByteReader {
+                            reader: reader.clone(),
+                            wait: reader.wait_state(),
+                        });
+                    } else if event_type == P1_EVENTTYPE_FD_WRITE
+                        && let Some(writer) = socket.pair_writer()
+                        && !writer.is_writable()
+                    {
+                        wait.notified.push(EpollWaitTarget::ByteWriter {
+                            writer: writer.clone(),
+                            wait: writer.wait_state(),
+                        });
+                    }
+                } else if socket.handle().is_some() {
+                    wait.repoll = true;
+                }
+            }
+            Some(Preview1Descriptor::PipeWrite { writer, .. })
+                if event_type == P1_EVENTTYPE_FD_WRITE && !writer.is_writable() =>
+            {
+                wait.notified.push(EpollWaitTarget::ByteWriter {
+                    writer: writer.clone(),
+                    wait: writer.wait_state(),
+                });
+            }
+            Some(Preview1Descriptor::Event(event))
+                if event_type == P1_EVENTTYPE_FD_READ && !event.is_readable() =>
+            {
+                wait.notified.push(EpollWaitTarget::Event {
+                    event: event.clone(),
+                    wait: event.wait_state(),
+                });
+            }
+            Some(Preview1Descriptor::Stdin { carry })
+                if carry.is_empty() && event_type == P1_EVENTTYPE_FD_READ =>
+            {
+                match store.output_mode.stdin_route() {
+                    // A child's stdin is a byte channel, so it can wake us.
+                    crate::ComponentInputRoute::Child(stdin_rx) => {
+                        wait.notified.push(EpollWaitTarget::ByteReader {
+                            wait: stdin_rx.wait_state(),
+                            reader: stdin_rx,
+                        });
+                    }
+                    // The serial console's receive signal is the wakeup
+                    // source, parked on the same way a channel's is.
+                    crate::ComponentInputRoute::Serial => {
+                        wait.notified.push(EpollWaitTarget::SerialInput {
+                            serial: store.write_serial,
+                            wait: store.write_serial.debug_serial_input_waiter(),
+                        })
+                    }
+                    // Trace or closed input never delivers input; the probe reports
+                    // it as an immediate hangup, so there is nothing to wait for.
+                    crate::ComponentInputRoute::Closed => {}
+                }
+            }
+            _ => {}
+        });
 }
 
 /// Resolve a descriptor's readiness, consulting the network service when the
@@ -509,14 +969,17 @@ where
     StorageImpl: crate::Storage,
 {
     if event_type == P1_EVENTTYPE_FD_READ
-        && matches!(
-            caller.data().descriptors.get(fd),
-            Some(Preview1Descriptor::Stdin { .. })
-        )
+        && caller.data().descriptors.with(|descriptors| {
+            matches!(descriptors.get(fd), Some(Preview1Descriptor::Stdin { .. }))
+        })
     {
         return Ok(caller.data_mut().probe_stdin(fd));
     }
-    let probe = match p1_probe_descriptor(caller.data().descriptors.get(fd), event_type)? {
+    let probe = match caller
+        .data()
+        .descriptors
+        .with(|descriptors| p1_probe_descriptor(descriptors.get(fd), event_type))?
+    {
         P1Probe::Local(readiness) => return Ok(readiness),
         P1Probe::Network(probe) => probe,
     };
@@ -524,16 +987,20 @@ where
         return Err(p1::errno::NETDOWN);
     };
     let readiness = match probe {
-        P1NetworkProbe::TcpStream(stream) => service
+        UnixSocketHandle::<Net>::TcpStream(stream) => service
             .tcp_readiness(stream)
             .await
             .map_err(p1_errno_from_tcp_error)?,
-        P1NetworkProbe::TcpListener(listener) => service
+        UnixSocketHandle::<Net>::TcpListener(listener) => service
             .tcp_listener_readiness(listener)
             .await
             .map_err(p1_errno_from_tcp_error)?,
-        P1NetworkProbe::UdpSocket(socket) => service
+        UnixSocketHandle::<Net>::UdpSocket(socket) => service
             .udp_readiness(socket)
+            .await
+            .map_err(p1_errno_from_udp_error)?,
+        UnixSocketHandle::<Net>::PacketSocket(socket) => service
+            .packet_readiness(socket)
             .await
             .map_err(p1_errno_from_udp_error)?,
     };
@@ -561,430 +1028,11 @@ pub(super) fn p1_readiness_from_socket(
     P1Readiness::Ready { bytes: 1 }
 }
 
-#[derive(Clone)]
-pub(super) enum WasixSocketDescriptor<Net: ComponentHostNetwork> {
-    Tcp(WasixTcpSocket<Net>),
-    Udp(WasixUdpSocket<Net>),
-    Pair {
-        reader: crate::ByteReader,
-        writer: crate::ByteWriter,
-        carry: Bytes,
-        options: WasixSocketOptions,
-        socket_type: i32,
-    },
-}
-
-/// Address family a WASIX socket was opened with.
-///
-/// `socket(AF_INET6, ...)` and `socket(AF_INET, ...)` produce sockets
-/// that differ in what a wildcard bind means and in which peer
-/// addresses they accept, so the family is descriptor identity and
-/// travels with the socket through every state transition.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum WasixSocketFamily {
-    Ipv4,
-    Ipv6,
-}
-
-impl WasixSocketFamily {
-    /// The wildcard local address for this family: `0.0.0.0` or `::`.
-    pub(super) const fn unspecified_address(self) -> crate::NetworkIpAddress {
-        match self {
-            Self::Ipv4 => crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
-            Self::Ipv6 => crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::UNSPECIFIED),
-        }
-    }
-
-    /// Whether an address supplied by the guest may be used on a socket
-    /// of this family. There is no v4-mapped-v6 path here: the netstack
-    /// keeps the two families in separate socket address spaces, so
-    /// accepting a v4 address on an v6 socket would silently produce a
-    /// socket that cannot be described back to the guest.
-    pub(super) const fn accepts(self, address: crate::NetworkIpAddress) -> bool {
-        matches!(
-            (self, address),
-            (Self::Ipv4, crate::NetworkIpAddress::Ipv4(_))
-                | (Self::Ipv6, crate::NetworkIpAddress::Ipv6(_))
-        )
-    }
-}
-
-/// A netstack TCP stream a preview1 descriptor owns.
-///
-/// The stream is retired when the last descriptor holding it goes away.
-/// That is the whole lifetime rule, and it covers every way a preview1
-/// socket can end: `fd_close` drops the table entry, `sock_shutdown`
-/// replaces it, an `exec` inherits a duplicate of it, and a program
-/// that simply exits takes its descriptor table with it. Retiring the
-/// stream from `fd_close` alone left the stream behind in that last
-/// case, which is how eleven connections outlived the programs that
-/// opened them in #184.
-pub(super) struct WasixOwnedTcpStream<Net: ComponentHostNetwork> {
-    service: Net,
-    stream: Net::TcpStream,
-}
-
-impl<Net: ComponentHostNetwork> WasixOwnedTcpStream<Net> {
-    pub(super) fn new(service: Net, stream: Net::TcpStream) -> Arc<Self> {
-        Arc::new(Self { service, stream })
-    }
-
-    pub(super) fn id(&self) -> Net::TcpStream {
-        self.stream
-    }
-}
-
-impl<Net: ComponentHostNetwork> Drop for WasixOwnedTcpStream<Net> {
-    fn drop(&mut self) {
-        self.service.tcp_close(self.stream);
-    }
-}
-
-/// A netstack TCP listener a preview1 descriptor owns.
-///
-/// The same rule as [`WasixOwnedTcpStream`], for the same reason: the
-/// listener is retired when the last descriptor holding it goes away,
-/// which covers `fd_close`, the duplicate an `exec` inherits, and the
-/// table a program takes with it when it exits. Nothing on any of those
-/// paths touched the listener before — the network service had no
-/// `tcp_listener_close` at all — so every listener a program opened
-/// stayed in its shard for the rest of the boot, holding the local port
-/// that `is_tcp_local_port_free` consults (#191).
-pub(super) struct WasixOwnedTcpListener<Net: ComponentHostNetwork> {
-    service: Net,
-    listener: Net::TcpListener,
-}
-
-impl<Net: ComponentHostNetwork> WasixOwnedTcpListener<Net> {
-    pub(super) fn new(service: Net, listener: Net::TcpListener) -> Arc<Self> {
-        Arc::new(Self { service, listener })
-    }
-
-    pub(super) fn id(&self) -> Net::TcpListener {
-        self.listener
-    }
-}
-
-impl<Net: ComponentHostNetwork> Drop for WasixOwnedTcpListener<Net> {
-    fn drop(&mut self) {
-        self.service.tcp_listener_close(self.listener);
-    }
-}
-
-#[derive(Clone)]
-pub(super) enum WasixTcpSocket<Net: ComponentHostNetwork> {
-    Unconnected {
-        family: WasixSocketFamily,
-        options: WasixSocketOptions,
-    },
-    Bound {
-        family: WasixSocketFamily,
-        local_port: u16,
-        options: WasixSocketOptions,
-    },
-    Listening {
-        family: WasixSocketFamily,
-        listener: Arc<WasixOwnedTcpListener<Net>>,
-        local_port: u16,
-        options: WasixSocketOptions,
-    },
-    Connected {
-        family: WasixSocketFamily,
-        stream: Arc<WasixOwnedTcpStream<Net>>,
-        peer_address: crate::NetworkIpAddress,
-        peer_port: u16,
-        options: WasixSocketOptions,
-    },
-}
-
-/// A netstack datagram socket a preview1 descriptor owns.
-///
-/// The same rule as [`WasixOwnedTcpStream`], for the same reason: the
-/// socket is retired when the last descriptor holding it goes away,
-/// which covers `fd_close`, the `sock_shutdown` that unbinds it, the
-/// duplicate an `exec` inherits, and the table a program takes with it
-/// when it exits. Nothing on any of those paths touched the netstack
-/// socket before, so a datagram socket stayed installed on every shard
-/// with its slot in `udp_slots` held (#190).
-pub(super) struct WasixOwnedUdpSocket<Net: ComponentHostNetwork> {
-    service: Net,
-    socket: Net::UdpSocket,
-}
-
-impl<Net: ComponentHostNetwork> WasixOwnedUdpSocket<Net> {
-    pub(super) fn new(service: Net, socket: Net::UdpSocket) -> Arc<Self> {
-        Arc::new(Self { service, socket })
-    }
-
-    pub(super) fn id(&self) -> Net::UdpSocket {
-        self.socket
-    }
-}
-
-impl<Net: ComponentHostNetwork> Drop for WasixOwnedUdpSocket<Net> {
-    fn drop(&mut self) {
-        self.service.udp_close(self.socket);
-    }
-}
-
-#[derive(Clone)]
-pub(super) enum WasixUdpSocket<Net: ComponentHostNetwork> {
-    Unbound {
-        family: WasixSocketFamily,
-        options: WasixSocketOptions,
-    },
-    Bound {
-        family: WasixSocketFamily,
-        socket: Arc<WasixOwnedUdpSocket<Net>>,
-        local_port: u16,
-        options: WasixSocketOptions,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct WasixSocketOptions {
-    pub(super) flag_bits: u32,
-    pub(super) receive_buffer_size: u64,
-    pub(super) send_buffer_size: u64,
-    pub(super) receive_low_water: u64,
-    pub(super) send_low_water: u64,
-    pub(super) ttl: u64,
-    pub(super) multicast_ttl_v4: u64,
-    pub(super) receive_timeout: Option<u64>,
-    pub(super) send_timeout: Option<u64>,
-    pub(super) connect_timeout: Option<u64>,
-    pub(super) accept_timeout: Option<u64>,
-    pub(super) linger: Option<u64>,
-}
-
-impl Default for WasixSocketOptions {
-    fn default() -> Self {
-        Self {
-            flag_bits: 0,
-            receive_buffer_size: DEFAULT_WASIX_SOCKET_BUFFER_BYTES,
-            send_buffer_size: DEFAULT_WASIX_SOCKET_BUFFER_BYTES,
-            receive_low_water: DEFAULT_WASIX_SOCKET_LOW_WATER_BYTES,
-            send_low_water: DEFAULT_WASIX_SOCKET_LOW_WATER_BYTES,
-            ttl: DEFAULT_WASIX_SOCKET_TTL,
-            multicast_ttl_v4: DEFAULT_WASIX_SOCKET_MULTICAST_TTL,
-            receive_timeout: None,
-            send_timeout: None,
-            connect_timeout: None,
-            accept_timeout: None,
-            linger: None,
-        }
-    }
-}
-
-impl WasixSocketOptions {
-    /// Records a boolean socket option, refusing the ones the netstack has no
-    /// mechanism for.
-    ///
-    /// `SO_KEEPALIVE` has no keepalive timer behind it, and `TCP_NODELAY`
-    /// cleared is a request for Nagle's algorithm, which the stack does not
-    /// implement — it transmits as soon as the window allows. Accepting either
-    /// would report a behaviour change that never happens, so both are
-    /// answered with `ENOTSUP`; clearing keepalive and setting nodelay
-    /// describe what the stack already does and succeed.
-    pub(super) fn set_flag(&mut self, option: i32, flag: bool) -> i32 {
-        let bit = match wasix_socket_flag_bit(option) {
-            Ok(bit) => bit,
-            Err(errno) => return errno,
-        };
-        match (option, flag) {
-            (WASIX_SOCK_OPTION_KEEP_ALIVE, true) | (WASIX_SOCK_OPTION_NO_DELAY, false) => {
-                return p1::errno::NOTSUP;
-            }
-            _ => {}
-        }
-        if flag {
-            self.flag_bits |= bit;
-        } else {
-            self.flag_bits &= !bit;
-        }
-        p1::errno::SUCCESS
-    }
-
-    /// Records a sized socket option.
-    ///
-    /// Buffer sizes clamp to what the netstack actually reserves per socket so
-    /// a read-back reports the effective value; `IP_TTL` is range-checked here
-    /// and pushed to the live socket by the syscall wrapper.
-    pub(super) fn set_size(&mut self, option: i32, size: u64) -> i32 {
-        match option {
-            WASIX_SOCK_OPTION_RECV_BUF_SIZE => {
-                self.receive_buffer_size = size.min(WASIX_SOCKET_RECEIVE_BUFFER_CEILING);
-            }
-            WASIX_SOCK_OPTION_SEND_BUF_SIZE => {
-                self.send_buffer_size = size.min(WASIX_SOCKET_SEND_BUFFER_CEILING);
-            }
-            WASIX_SOCK_OPTION_RECV_LOWAT => self.receive_low_water = size,
-            WASIX_SOCK_OPTION_SEND_LOWAT => self.send_low_water = size,
-            WASIX_SOCK_OPTION_TTL => {
-                if size == 0 || size > u64::from(u8::MAX) {
-                    return p1::errno::INVAL;
-                }
-                self.ttl = size;
-            }
-            WASIX_SOCK_OPTION_MULTICAST_TTL_V4 => self.multicast_ttl_v4 = size,
-            WASIX_SOCK_OPTION_TYPE | WASIX_SOCK_OPTION_PROTO => return p1::errno::INVAL,
-            _ => return p1::errno::INVAL,
-        }
-        p1::errno::SUCCESS
-    }
-
-    /// TTL to stamp on this socket's packets, as a netstack hop limit.
-    pub(super) fn hop_limit(self) -> u8 {
-        u8::try_from(self.ttl).unwrap_or(helios_netstack::DEFAULT_HOP_LIMIT)
-    }
-
-    pub(super) fn size(self, option: i32) -> Result<u64, i32> {
-        match option {
-            WASIX_SOCK_OPTION_RECV_BUF_SIZE => Ok(self.receive_buffer_size),
-            WASIX_SOCK_OPTION_SEND_BUF_SIZE => Ok(self.send_buffer_size),
-            WASIX_SOCK_OPTION_RECV_LOWAT => Ok(self.receive_low_water),
-            WASIX_SOCK_OPTION_SEND_LOWAT => Ok(self.send_low_water),
-            WASIX_SOCK_OPTION_TTL => Ok(self.ttl),
-            WASIX_SOCK_OPTION_MULTICAST_TTL_V4 => Ok(self.multicast_ttl_v4),
-            WASIX_SOCK_OPTION_TYPE | WASIX_SOCK_OPTION_PROTO => Err(p1::errno::INVAL),
-            _ => Err(p1::errno::INVAL),
-        }
-    }
-
-    pub(super) fn flag(self, option: i32) -> Result<bool, i32> {
-        let bit = wasix_socket_flag_bit(option)?;
-        Ok(self.flag_bits & bit != 0)
-    }
-
-    pub(super) fn set_time(&mut self, option: i32, time: Option<u64>) -> i32 {
-        match option {
-            WASIX_SOCK_OPTION_RECV_TIMEOUT => self.receive_timeout = time,
-            WASIX_SOCK_OPTION_SEND_TIMEOUT => self.send_timeout = time,
-            WASIX_SOCK_OPTION_CONNECT_TIMEOUT => self.connect_timeout = time,
-            WASIX_SOCK_OPTION_ACCEPT_TIMEOUT => self.accept_timeout = time,
-            WASIX_SOCK_OPTION_LINGER => self.linger = time,
-            _ => return p1::errno::INVAL,
-        }
-        p1::errno::SUCCESS
-    }
-
-    pub(super) fn time(self, option: i32) -> Result<Option<u64>, i32> {
-        match option {
-            WASIX_SOCK_OPTION_RECV_TIMEOUT => Ok(self.receive_timeout),
-            WASIX_SOCK_OPTION_SEND_TIMEOUT => Ok(self.send_timeout),
-            WASIX_SOCK_OPTION_CONNECT_TIMEOUT => Ok(self.connect_timeout),
-            WASIX_SOCK_OPTION_ACCEPT_TIMEOUT => Ok(self.accept_timeout),
-            WASIX_SOCK_OPTION_LINGER => Ok(self.linger),
-            _ => Err(p1::errno::INVAL),
-        }
-    }
-}
-
-impl<Net: ComponentHostNetwork> WasixSocketDescriptor<Net> {
-    pub(super) fn options(&self) -> &WasixSocketOptions {
-        match self {
-            WasixSocketDescriptor::Tcp(socket) => socket.options(),
-            WasixSocketDescriptor::Udp(socket) => socket.options(),
-            WasixSocketDescriptor::Pair { options, .. } => options,
-        }
-    }
-
-    pub(super) fn options_mut(&mut self) -> &mut WasixSocketOptions {
-        match self {
-            WasixSocketDescriptor::Tcp(socket) => socket.options_mut(),
-            WasixSocketDescriptor::Udp(socket) => socket.options_mut(),
-            WasixSocketDescriptor::Pair { options, .. } => options,
-        }
-    }
-
-    pub(super) fn socket_type(&self) -> i32 {
-        match self {
-            WasixSocketDescriptor::Tcp(_) => WASIX_SOCK_TYPE_STREAM,
-            WasixSocketDescriptor::Udp(_) => WASIX_SOCK_TYPE_DGRAM,
-            WasixSocketDescriptor::Pair { socket_type, .. } => *socket_type,
-        }
-    }
-
-    pub(super) fn protocol(&self) -> u64 {
-        match self {
-            WasixSocketDescriptor::Tcp(_) => WASIX_IPPROTO_TCP,
-            WasixSocketDescriptor::Udp(_) => WASIX_IPPROTO_UDP,
-            WasixSocketDescriptor::Pair { .. } => 0,
-        }
-    }
-}
-
-impl<Net: ComponentHostNetwork> WasixTcpSocket<Net> {
-    pub(super) fn options(&self) -> &WasixSocketOptions {
-        match self {
-            WasixTcpSocket::Unconnected { options, .. }
-            | WasixTcpSocket::Bound { options, .. }
-            | WasixTcpSocket::Listening { options, .. }
-            | WasixTcpSocket::Connected { options, .. } => options,
-        }
-    }
-
-    pub(super) fn options_mut(&mut self) -> &mut WasixSocketOptions {
-        match self {
-            WasixTcpSocket::Unconnected { options, .. }
-            | WasixTcpSocket::Bound { options, .. }
-            | WasixTcpSocket::Listening { options, .. }
-            | WasixTcpSocket::Connected { options, .. } => options,
-        }
-    }
-
-    pub(super) fn family(&self) -> WasixSocketFamily {
-        match self {
-            WasixTcpSocket::Unconnected { family, .. }
-            | WasixTcpSocket::Bound { family, .. }
-            | WasixTcpSocket::Listening { family, .. }
-            | WasixTcpSocket::Connected { family, .. } => *family,
-        }
-    }
-}
-
-impl<Net: ComponentHostNetwork> WasixUdpSocket<Net> {
-    pub(super) fn options(&self) -> &WasixSocketOptions {
-        match self {
-            WasixUdpSocket::Unbound { options, .. } | WasixUdpSocket::Bound { options, .. } => {
-                options
-            }
-        }
-    }
-
-    pub(super) fn options_mut(&mut self) -> &mut WasixSocketOptions {
-        match self {
-            WasixUdpSocket::Unbound { options, .. } | WasixUdpSocket::Bound { options, .. } => {
-                options
-            }
-        }
-    }
-
-    pub(super) fn family(&self) -> WasixSocketFamily {
-        match self {
-            WasixUdpSocket::Unbound { family, .. } | WasixUdpSocket::Bound { family, .. } => {
-                *family
-            }
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WasixSocketAuthority {
     LocalOnly,
     Tcp,
     Udp,
-}
-
-#[derive(Clone)]
-pub(super) struct EventFd {
-    pub(super) state: Arc<Mutex<EventFdState>>,
-    pub(super) notify: Arc<crate::Notify>,
-    pub(super) semaphore: bool,
-}
-
-pub(super) struct EventFdState {
-    pub(super) value: u64,
 }
 
 #[derive(Debug, Error)]
@@ -1008,33 +1056,26 @@ impl WasixThreadExitRequested {
 }
 
 /// A pending WASIX signal raised on the process ended the guest. The
-/// program exits with `128 + signal`, whatever the guest asked for
-/// before it, and on any thread the whole process does.
+/// program ends with that signal, whatever the guest asked for before it,
+/// and on any thread the whole process does.
 #[derive(Debug, Error)]
 #[error("guest ended by wasix signal {signal}")]
-pub(super) struct Preview1SignalExit {
-    pub(super) signal: u32,
-}
-
-impl Preview1SignalExit {
-    pub(super) fn exit_code(&self) -> u32 {
-        128u32.saturating_add(self.signal)
-    }
+pub(crate) struct Preview1SignalExit {
+    pub(crate) signal: u8,
 }
 
 /// A WASIX signal raised on one thread alone (`thread_signal`) ended
-/// that thread's call. The thread exits with `128 + signal`, whatever it
-/// asked for before; a spawned thread ends alone, so a joiner sees the
-/// status, and main ends the image with it.
+/// that thread's call. A spawned thread ends alone with `128 + signal`,
+/// so a joiner sees the status, and main ends the image with the signal.
 #[derive(Debug, Error)]
 #[error("wasix thread ended by thread-directed signal {signal}")]
 pub(super) struct WasixThreadSignalExit {
-    pub(super) signal: u32,
+    pub(super) signal: u8,
 }
 
 impl WasixThreadSignalExit {
     pub(super) fn exit_code(&self) -> u32 {
-        128u32.saturating_add(self.signal)
+        128u32.saturating_add(u32::from(self.signal))
     }
 }
 
@@ -1058,70 +1099,254 @@ impl WasixThreadEnded {
     }
 }
 
-/// The exit status of a program whose call ended in `error`, given the
+/// The termination of a program whose call ended in `error`, given the
 /// status the guest `requested` before: the signal that ended it, raised
-/// on its process or its thread, otherwise the requested status,
-/// otherwise none, and the error is a failure.
-pub(super) fn preview1_exit_status(error: &wasmtime::Error, requested: Option<u32>) -> Option<u32> {
+/// on its process or its thread, otherwise an owner kill, otherwise the
+/// requested exit status, otherwise none.
+pub(super) fn preview1_exit_status(
+    error: &wasmtime::Error,
+    requested: Option<u32>,
+) -> Option<helios_unix::ChildTermination> {
     if let Some(exit) = error.downcast_ref::<Preview1SignalExit>() {
-        return Some(exit.exit_code());
+        return Some(helios_unix::ChildTermination::Signaled(
+            helios_unix::SignalTermination {
+                signal: exit.signal,
+                core_dumped: false,
+            },
+        ));
     }
     if let Some(exit) = error.downcast_ref::<WasixThreadSignalExit>() {
-        return Some(exit.exit_code());
+        return Some(helios_unix::ChildTermination::Signaled(
+            helios_unix::SignalTermination {
+                signal: exit.signal,
+                core_dumped: false,
+            },
+        ));
     }
-    requested
+    if let Some(killed) = error.downcast_ref::<crate::InstanceKilled>() {
+        return match killed.reason {
+            crate::KillReason::Operator | crate::KillReason::RequesterGone => {
+                Some(helios_unix::ChildTermination::Killed)
+            }
+            crate::KillReason::OutOfMemory
+            | crate::KillReason::SupervisorRestart
+            | crate::KillReason::StoreFailed => None,
+        };
+    }
+    if caused_by_out_of_memory(error) {
+        return None;
+    }
+    requested.map(helios_unix::ChildTermination::Exited)
 }
 
-/// How a process ends when one of its calls ended in `error`, given the
-/// status the guest `requested` before: the exit status
-/// [`preview1_exit_status`] finds, otherwise the failure the error is
-/// (a trap, an out-of-memory kill, any other runtime error). Main's own
-/// end and a spawned thread's end of its process both report through
-/// this, so a trap ends the process the same way on any thread.
+/// How a running process ends when one of its guest calls ended in `error`,
+/// given the status the guest `requested` before: the signal, owner kill or
+/// requested exit [`preview1_exit_status`] finds, otherwise an out-of-memory
+/// or supervisor failure when condemned for one, otherwise a guest trap.
+/// Main's own end, a spawned thread's end of its process, and a component's
+/// `run` all report through this, so every guest kind classifies endings
+/// identically.
 pub(super) fn preview1_process_end(
     error: wasmtime::Error,
     requested: Option<u32>,
-) -> Result<u32, ProgramExecError> {
-    match preview1_exit_status(&error, requested) {
-        Some(code) => Ok(code),
-        None => Err(map_program_runtime_error(error)),
+) -> Result<helios_unix::ChildTermination, ProgramExecError> {
+    if let Some(termination) = preview1_exit_status(&error, requested) {
+        return Ok(termination);
     }
+    if caused_by_out_of_memory(&error) || error.downcast_ref::<crate::InstanceKilled>().is_some() {
+        return Err(map_program_runtime_error(error));
+    }
+    tracing::debug!(?error, "guest program trapped");
+    Ok(helios_unix::ChildTermination::Trapped)
+}
+
+/// Next safe-point signal action claimed from a store's mailboxes.
+pub(super) enum WasixPendingDelivery {
+    ThreadEnded,
+    TerminateThread(u8),
+    TerminateProcess(u8),
+    Catch {
+        signal: helios_unix::Signal,
+        callback: Arc<str>,
+        thread_directed: bool,
+    },
 }
 
 /// The signals one store answers to: those raised on its own thread and
-/// those raised on its process. A thread-directed raise reaches only this
+/// those raised on its process, resolved through the process's shared
+/// [`WasixProcessSignals`]. A thread-directed raise reaches only this
 /// store's turn; a process-directed one goes to whichever store of the
 /// process takes it first.
 ///
 /// # Concurrency
 ///
-/// As [`WasixSignalState`]: either mailbox is raised from any processor,
-/// and one turn of this store at a time takes.
+/// As [`WasixSignalState`] and [`WasixProcessSignals`]: either mailbox is
+/// raised from any processor, dispositions are sampled under a short
+/// task-context spin lock never held across `.await`, and atomic bitmask
+/// compare-exchange ensures each signal is claimed once.
 #[derive(Clone)]
 pub(super) struct WasixStoreSignals {
     thread: WasixSignalState,
     process: WasixSignalState,
+    dispositions: WasixProcessSignals,
 }
 
 impl WasixStoreSignals {
+    #[cfg(test)]
     pub(super) fn new(thread: WasixSignalState, process: WasixSignalState) -> Self {
-        Self { thread, process }
+        Self::with_dispositions(thread, process, WasixProcessSignals::default())
     }
 
-    /// The stop this store owes its guest, if any: the end of its
-    /// thread's process, which stays owed, then a pending signal, which
-    /// is delivered once. The interrupt callback and the turn both read
-    /// it, so a running guest and a suspended one meet the same stop.
+    pub(super) fn with_dispositions(
+        thread: WasixSignalState,
+        process: WasixSignalState,
+        dispositions: WasixProcessSignals,
+    ) -> Self {
+        Self {
+            thread,
+            process,
+            dispositions,
+        }
+    }
+
+    /// The fatal stop this store owes its guest now, if any: the end of its
+    /// thread's process, which stays owed, then a pending signal whose
+    /// disposition is to terminate. Ignored signals are dropped in place and
+    /// caught signals stay pending in the bitmask until the next safe point.
     pub(super) fn owed_stop(&self) -> Option<wasmtime::Error> {
         if self.thread.thread_ended() {
             return Some(wasmtime::Error::new(WasixThreadEnded));
         }
-        if let Some(signal) = self.thread.take_pending() {
-            return Some(wasmtime::Error::new(WasixThreadSignalExit { signal }));
+        let (ignored, has_callback) = self.dispositions.summary();
+        let classify = |signal: helios_unix::Signal| match resolve_wasix_signal(
+            signal,
+            ignored,
+            has_callback.then_some(()),
+        ) {
+            WasixResolvedAction::Ignore => helios_unix::SignalSweep::Drop,
+            WasixResolvedAction::Catch(()) => helios_unix::SignalSweep::Retain,
+            WasixResolvedAction::Terminate => helios_unix::SignalSweep::Take,
+        };
+        if let Some(signal) = self.thread.sweep_pending(classify) {
+            return Some(wasmtime::Error::new(WasixThreadSignalExit {
+                signal: signal.raw(),
+            }));
+        }
+        self.process.sweep_pending(classify).map(|signal| {
+            wasmtime::Error::new(Preview1SignalExit {
+                signal: signal.raw(),
+            })
+        })
+    }
+
+    /// Claims the next deliverable action at a safe point, prioritizing fatal
+    /// signals ahead of caught handlers and skipping caught signals already
+    /// masked in `active_handlers` while their own callback runs.
+    pub(super) fn take_next_delivery(
+        &self,
+        active_handlers: helios_unix::SignalSet,
+    ) -> Option<WasixPendingDelivery> {
+        if self.thread.thread_ended() {
+            return Some(WasixPendingDelivery::ThreadEnded);
+        }
+        let (ignored, callback) = self.dispositions.snapshot();
+        let has_callback = callback.is_some();
+        let classify_fatal = |signal: helios_unix::Signal| match resolve_wasix_signal(
+            signal,
+            ignored,
+            has_callback.then_some(()),
+        ) {
+            WasixResolvedAction::Ignore => helios_unix::SignalSweep::Drop,
+            WasixResolvedAction::Catch(()) => helios_unix::SignalSweep::Retain,
+            WasixResolvedAction::Terminate => helios_unix::SignalSweep::Take,
+        };
+        if let Some(signal) = self.thread.sweep_pending(classify_fatal) {
+            return Some(WasixPendingDelivery::TerminateThread(signal.raw()));
+        }
+        if let Some(signal) = self.process.sweep_pending(classify_fatal) {
+            return Some(WasixPendingDelivery::TerminateProcess(signal.raw()));
+        }
+        let callback = callback?;
+        let classify_catch =
+            |signal: helios_unix::Signal| match resolve_wasix_signal(signal, ignored, Some(())) {
+                WasixResolvedAction::Ignore => helios_unix::SignalSweep::Drop,
+                WasixResolvedAction::Terminate => helios_unix::SignalSweep::Retain,
+                WasixResolvedAction::Catch(()) if active_handlers.contains(signal) => {
+                    helios_unix::SignalSweep::Retain
+                }
+                WasixResolvedAction::Catch(()) => helios_unix::SignalSweep::Take,
+            };
+        if let Some(signal) = self.thread.sweep_pending(classify_catch) {
+            return Some(WasixPendingDelivery::Catch {
+                signal,
+                callback,
+                thread_directed: true,
+            });
         }
         self.process
-            .take_pending()
-            .map(|signal| wasmtime::Error::new(Preview1SignalExit { signal }))
+            .sweep_pending(classify_catch)
+            .map(|signal| WasixPendingDelivery::Catch {
+                signal,
+                callback,
+                thread_directed: false,
+            })
+    }
+
+    /// Sweeps any ignored signals and reports whether an unmasked caught
+    /// signal is waiting for safe-point delivery.
+    pub(super) fn has_deliverable_catch(&self, active_handlers: helios_unix::SignalSet) -> bool {
+        if self.thread.thread_ended() {
+            return false;
+        }
+        let (ignored, has_callback) = self.dispositions.summary();
+        let drop_ignored = |signal: helios_unix::Signal| match resolve_wasix_signal(
+            signal,
+            ignored,
+            has_callback.then_some(()),
+        ) {
+            WasixResolvedAction::Ignore => helios_unix::SignalSweep::Drop,
+            WasixResolvedAction::Catch(()) | WasixResolvedAction::Terminate => {
+                helios_unix::SignalSweep::Retain
+            }
+        };
+        let _ = self.thread.sweep_pending(drop_ignored);
+        let _ = self.process.sweep_pending(drop_ignored);
+        if !has_callback {
+            return false;
+        }
+        let mut candidates = self
+            .thread
+            .pending_set()
+            .union(self.process.pending_set())
+            .difference(active_handlers);
+        while let Some(signal) = candidates.take_first() {
+            if matches!(
+                resolve_wasix_signal(signal, ignored, Some(())),
+                WasixResolvedAction::Catch(())
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Waits until an unmasked caught signal is ready for safe-point delivery,
+    /// arming its broadcast waiter before inspecting the mailboxes.
+    pub(super) async fn wait_for_catch_signal(&self, active_handlers: helios_unix::SignalSet) {
+        use crate::component::StopWake as _;
+
+        let mut wait = self.arm_stop_wait();
+        core::future::poll_fn(|cx| {
+            loop {
+                if self.has_deliverable_catch(active_handlers) {
+                    return Poll::Ready(());
+                }
+                if self.poll_stop_wait(cx, &mut wait).is_pending() {
+                    return Poll::Pending;
+                }
+            }
+        })
+        .await;
     }
 }
 
@@ -1132,10 +1357,7 @@ impl crate::component::StopWake for WasixStoreSignals {
     type Wait = (crate::NotifyWaiter, crate::NotifyWaiter);
 
     fn arm_stop_wait(&self) -> Self::Wait {
-        (
-            self.thread.shared.raised.waiter(),
-            self.process.shared.raised.waiter(),
-        )
+        (self.thread.wait_state(), self.process.wait_state())
     }
 
     fn poll_stop_wait(
@@ -1145,8 +1367,8 @@ impl crate::component::StopWake for WasixStoreSignals {
     ) -> core::task::Poll<()> {
         // Both are polled, so each re-arms on `Ready` as the trait asks
         // and each registers its listener on `Pending`.
-        let thread = self.thread.shared.raised.poll_notified(cx, thread);
-        let process = self.process.shared.raised.poll_notified(cx, process);
+        let thread = self.thread.poll_changed(cx, thread);
+        let process = self.process.poll_changed(cx, process);
         if thread.is_ready() || process.is_ready() {
             core::task::Poll::Ready(())
         } else {
@@ -1180,6 +1402,7 @@ pub(super) fn preview1_cwd_from_authority(authority: &ProcessAuthority) -> Optio
             flags: directory_authority_to_descriptor_flags(preopen.rights()),
             identity: None,
             mount: None,
+            open: None,
         },
     })
 }
@@ -1228,6 +1451,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
                 flags: directory_authority_to_descriptor_flags(preopen.rights()),
                 identity: None,
                 mount: None,
+                open: None,
             };
             table.entries.push(Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Preopen {
@@ -1245,17 +1469,9 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         entries: Vec<Option<Preview1DescriptorEntry<Net>>>,
         limit: DescriptorLimit,
     ) -> Self {
-        let mut free = FreeDescriptorSlots::with_capacity(entries.len());
-        for (index, entry) in entries.iter().enumerate() {
-            if entry.is_none() {
-                free.release(index);
-            }
-        }
-        Self {
-            entries,
-            free,
-            limit,
-        }
+        let mut slots = helios_unix::DescriptorSlots::from_entries(entries);
+        slots.limit = limit;
+        Self { slots }
     }
 
     /// A fixture table of `entries` under the default limit. Production
@@ -1276,7 +1492,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     pub(super) fn get(&self, fd: i32) -> Option<&Preview1Descriptor<Net>> {
         usize::try_from(fd)
             .ok()
-            .and_then(|index| self.entries.get(index))
+            .and_then(|index| self.slots.entries.get(index))
             .and_then(Option::as_ref)
             .map(|entry| &entry.descriptor)
     }
@@ -1284,7 +1500,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     pub(super) fn get_mut(&mut self, fd: i32) -> Option<&mut Preview1Descriptor<Net>> {
         usize::try_from(fd)
             .ok()
-            .and_then(|index| self.entries.get_mut(index))
+            .and_then(|index| self.slots.entries.get_mut(index))
             .and_then(Option::as_mut)
             .map(|entry| &mut entry.descriptor)
     }
@@ -1307,17 +1523,13 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         close_on_exec: bool,
         fdflags: u16,
     ) -> Result<u32, i32> {
-        self.insert_entry(Preview1DescriptorEntry {
-            descriptor,
-            close_on_exec,
-            fdflags,
-        })
+        let entry = Preview1DescriptorEntry::new(descriptor, close_on_exec);
+        entry.set_fdflags(fdflags);
+        self.insert_entry(entry)
     }
 
     pub(super) fn insert_entry(&mut self, entry: Preview1DescriptorEntry<Net>) -> Result<u32, i32> {
-        let index = self.allocate_slot_index()?;
-        self.entries[index] = Some(entry);
-        u32::try_from(index).map_err(|_| p1::errno::OVERFLOW)
+        self.slots.insert_entry(entry).map_err(descriptor_errno)
     }
 
     /// The slot a guest-named descriptor number `fd` denotes as the target
@@ -1325,10 +1537,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     /// at or past the limit. Every caller that accepts a number checks it
     /// here before touching the table.
     pub(super) fn target_index(&self, fd: i32) -> Result<usize, i32> {
-        usize::try_from(fd)
-            .ok()
-            .filter(|index| self.limit.admits(*index))
-            .ok_or(p1::errno::BADF)
+        self.slots.target_index(fd).map_err(descriptor_errno)
     }
 
     pub(super) fn dup(&mut self, fd: i32) -> Result<u32, i32> {
@@ -1344,47 +1553,27 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         self.insert_entry_at(to_fd, entry)
     }
 
-    pub(super) fn insert_at(
-        &mut self,
-        fd: i32,
-        descriptor: Preview1Descriptor<Net>,
-        close_on_exec: bool,
-    ) -> Result<u32, i32> {
-        self.insert_entry_at(fd, Preview1DescriptorEntry::new(descriptor, close_on_exec))
-    }
-
     pub(super) fn insert_entry_at(
         &mut self,
         fd: i32,
         entry: Preview1DescriptorEntry<Net>,
     ) -> Result<u32, i32> {
-        let to = self.target_index(fd)?;
-        if self.entries.len() <= to {
-            let previous_len = self.entries.len();
-            self.entries.resize_with(to + 1, || None);
-            self.free.release_range(previous_len..to);
-        }
-        self.entries[to] = Some(entry);
-        u32::try_from(to).map_err(|_| p1::errno::OVERFLOW)
+        self.slots
+            .insert_entry_at(fd, entry)
+            .map_err(descriptor_errno)
     }
 
     pub(super) fn get_entry(&self, fd: i32) -> Option<&Preview1DescriptorEntry<Net>> {
-        usize::try_from(fd)
-            .ok()
-            .and_then(|index| self.entries.get(index))
-            .and_then(Option::as_ref)
+        self.slots.get_entry(fd)
     }
 
     pub(super) fn get_entry_mut(&mut self, fd: i32) -> Option<&mut Preview1DescriptorEntry<Net>> {
-        usize::try_from(fd)
-            .ok()
-            .and_then(|index| self.entries.get_mut(index))
-            .and_then(Option::as_mut)
+        self.slots.get_entry_mut(fd)
     }
 
     pub(super) fn fdflags(&self, fd: i32) -> Result<u16, i32> {
         self.get_entry(fd)
-            .map(|entry| entry.fdflags)
+            .map(|entry| entry.fdflags())
             .ok_or(p1::errno::BADF)
     }
 
@@ -1392,21 +1581,14 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         let Some(entry) = self.get_entry_mut(fd) else {
             return p1::errno::BADF;
         };
-        entry.fdflags = fdflags;
-        if let Preview1Descriptor::File {
-            fdflags: file_flags,
-            ..
-        } = &mut entry.descriptor
-        {
-            *file_flags = fdflags;
-        }
+        entry.set_fdflags(fdflags);
         p1::errno::SUCCESS
     }
 
     pub(super) fn close_on_exec(&self, fd: i32) -> Result<bool, i32> {
         usize::try_from(fd)
             .ok()
-            .and_then(|index| self.entries.get(index))
+            .and_then(|index| self.slots.entries.get(index))
             .and_then(Option::as_ref)
             .map(|entry| entry.close_on_exec)
             .ok_or(p1::errno::BADF)
@@ -1415,7 +1597,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     pub(super) fn set_close_on_exec(&mut self, fd: i32, close_on_exec: bool) -> i32 {
         match usize::try_from(fd)
             .ok()
-            .and_then(|index| self.entries.get_mut(index))
+            .and_then(|index| self.slots.entries.get_mut(index))
             .and_then(Option::as_mut)
         {
             Some(entry) => {
@@ -1426,51 +1608,40 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         }
     }
 
+    /// The descriptor slots themselves, for a process of another ABI that
+    /// takes this table over whole.
+    #[cfg(feature = "linux")]
+    pub(super) fn into_slots(self) -> helios_unix::DescriptorSlots<Preview1DescriptorEntry<Net>> {
+        self.slots
+    }
+
+    /// Reconstructs a preview1 descriptor table from shared `helios-unix`
+    /// slots when a Linux process executes a Wasm/WASIX image (`execve`).
+    #[cfg(feature = "linux")]
+    pub(super) fn from_slots(
+        slots: helios_unix::DescriptorSlots<Preview1DescriptorEntry<Net>>,
+    ) -> Self {
+        Self { slots }
+    }
+
     pub(super) fn clone_for_exec(&self) -> Self {
         Self::from_entries_with_limit(
-            self.entries
+            self.slots
+                .entries
                 .iter()
                 .map(|entry| match entry {
                     Some(entry) if entry.close_on_exec => None,
                     _ => entry.clone(),
                 })
                 .collect(),
-            self.limit,
+            self.slots.limit,
         )
     }
 
     pub(super) fn close(&mut self, fd: i32) -> i32 {
-        let Some(index) = usize::try_from(fd).ok() else {
-            return p1::errno::BADF;
-        };
-        self.entries
-            .get_mut(index)
-            .and_then(Option::take)
-            .map(|_| self.free.release(index))
-            .map_or(p1::errno::BADF, |_| p1::errno::SUCCESS)
-    }
-
-    /// The lowest free descriptor number below the limit, or `MFILE`;
-    /// nothing is allocated on failure.
-    pub(super) fn allocate_slot_index(&mut self) -> Result<usize, i32> {
-        while let Some(index) = self.free.allocate() {
-            if !self.limit.admits(index) {
-                // The heap pops the lowest number, so every other free
-                // number is at or past the limit too. Keep this one free
-                // for when the limit is raised.
-                self.free.release(index);
-                break;
-            }
-            if self.entries.get(index).is_some_and(Option::is_none) {
-                return Ok(index);
-            }
-        }
-        let index = self.entries.len();
-        if !self.limit.admits(index) {
-            return Err(p1::errno::MFILE);
-        }
-        self.entries.push(None);
-        Ok(index)
+        self.slots
+            .close(fd)
+            .map_or_else(descriptor_errno, |_| p1::errno::SUCCESS)
     }
 
     pub(super) fn get_owned_entry(
@@ -1479,6 +1650,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     ) -> Result<(usize, Preview1DescriptorEntry<Net>), i32> {
         let index = usize::try_from(fd).map_err(|_| p1::errno::BADF)?;
         let entry = self
+            .slots
             .entries
             .get_mut(index)
             .and_then(Option::take)
@@ -1487,8 +1659,8 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     }
 
     pub(super) fn close_slot(&mut self, index: usize) {
-        self.entries[index] = None;
-        self.free.release(index);
+        self.slots.entries[index] = None;
+        self.slots.free.release(index);
     }
 
     pub(super) fn renumber(&mut self, from: i32, to: i32) -> i32 {
@@ -1500,108 +1672,127 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         };
         entry.close_on_exec = false;
         if from == to {
-            self.entries[from] = Some(entry);
+            self.slots.entries[from] = Some(entry);
             return p1::errno::SUCCESS;
         }
-        if self.entries.len() <= to {
-            let previous_len = self.entries.len();
-            self.entries.resize_with(to + 1, || None);
-            self.free.release_range(previous_len..to);
+        if self.slots.entries.len() <= to {
+            let previous_len = self.slots.entries.len();
+            self.slots.entries.resize_with(to + 1, || None);
+            self.slots.free.release_range(previous_len..to);
         }
         self.close_slot(from);
-        self.entries[to] = Some(entry);
+        self.slots.entries[to] = Some(entry);
         p1::errno::SUCCESS
     }
-}
 
-impl<Net: ComponentHostNetwork> Preview1DescriptorEntry<Net> {
-    pub(super) fn new(descriptor: Preview1Descriptor<Net>, close_on_exec: bool) -> Self {
-        let fdflags = preview1_descriptor_initial_fdflags(&descriptor);
-        Self {
-            descriptor,
-            close_on_exec,
-            fdflags,
+    /// POSIX `dup2`: `to` becomes a copy of `from`, which stays open, and
+    /// whatever `to` held is closed. Naming the same descriptor twice
+    /// leaves it as it is.
+    pub(super) fn dup2(&mut self, from: i32, to: i32) -> i32 {
+        if from == to {
+            return match self.get_entry(from) {
+                Some(_) => p1::errno::SUCCESS,
+                None => p1::errno::BADF,
+            };
         }
-    }
-}
-
-pub(super) fn preview1_descriptor_initial_fdflags<Net: ComponentHostNetwork>(
-    descriptor: &Preview1Descriptor<Net>,
-) -> u16 {
-    match descriptor {
-        Preview1Descriptor::File { fdflags, .. } => *fdflags,
-        _ => 0,
-    }
-}
-
-impl EventFd {
-    pub(super) fn new(value: u64, semaphore: bool) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(EventFdState { value })),
-            notify: Arc::new(crate::Notify::new()),
-            semaphore,
+        match self.dup_to(from, to, false) {
+            Ok(_) => p1::errno::SUCCESS,
+            Err(errno) => errno,
         }
     }
 
-    pub(super) fn write(&self, increment: u64) -> Result<(), i32> {
-        if increment == u64::MAX {
-            return Err(p1::errno::INVAL);
-        }
-        let mut state = self.state.lock();
-        let next = state
-            .value
-            .checked_add(increment)
-            .filter(|value| *value != u64::MAX)
-            .ok_or(p1::errno::AGAIN)?;
-        state.value = next;
-        drop(state);
-        self.notify.notify_all();
-        Ok(())
-    }
-
-    pub(super) fn is_readable(&self) -> bool {
-        self.state.lock().value != 0
-    }
-
-    pub(super) fn wait_state(&self) -> crate::NotifyWaiter {
-        self.notify.waiter()
-    }
-
-    pub(super) fn poll_readable(
+    /// The stdio a component program launched over this table gets:
+    /// `wasi:cli` stdin, stdout and stderr are descriptors 0, 1 and 2,
+    /// whatever the launching process left in them. `inherited` is the
+    /// launching process's own stdio, which the `Stdin`, `Stdout` and
+    /// `Stderr` descriptors name; a table whose three slots are exactly
+    /// those hands the component `inherited` itself.
+    ///
+    /// A closed slot is a closed stream: stdin reads end of file and a
+    /// write to stdout or stderr fails, as a write to a closed descriptor
+    /// does.
+    pub(super) fn component_output_mode(
         &self,
-        cx: &mut Context<'_>,
-        wait: &mut crate::NotifyWaiter,
-    ) -> Poll<()> {
-        loop {
-            if self.is_readable() {
-                return Poll::Ready(());
+        inherited: &OutputMode,
+    ) -> Result<OutputMode, ComponentStdioRefusal> {
+        let inherits_stdin = matches!(
+            self.get(0),
+            Some(Preview1Descriptor::Stdin { carry }) if carry.is_empty()
+        );
+        if inherits_stdin
+            && matches!(self.get(1), Some(Preview1Descriptor::Stdout))
+            && matches!(self.get(2), Some(Preview1Descriptor::Stderr))
+        {
+            return Ok(inherited.clone());
+        }
+        Ok(OutputMode::RoutedChild {
+            stdin: self.component_stdin(inherited)?,
+            stdout: self.component_output(1, inherited)?,
+            stderr: self.component_output(2, inherited)?,
+        })
+    }
+
+    fn component_stdin(
+        &self,
+        inherited: &OutputMode,
+    ) -> Result<crate::ComponentInputRoute, ComponentStdioRefusal> {
+        match self.get(0) {
+            None | Some(Preview1Descriptor::NullDevice) => Ok(crate::ComponentInputRoute::Closed),
+            Some(Preview1Descriptor::Stdin { carry }) if carry.is_empty() => {
+                Ok(inherited.stdin_route())
             }
-            match self.notify.poll_notified(cx, wait) {
-                Poll::Ready(()) => continue,
-                Poll::Pending => return Poll::Pending,
+            Some(Preview1Descriptor::PipeRead { reader, .. }) => {
+                Ok(crate::ComponentInputRoute::Child(reader.clone()))
             }
+            Some(descriptor) => Err(ComponentStdioRefusal {
+                fd: 0,
+                held: unbindable_stdio(descriptor),
+            }),
         }
     }
 
-    pub(super) async fn read(&self) -> u64 {
-        loop {
-            // Armed before the counter is read: a write broadcasts to
-            // every reader and every `poll_readable` waiter at once and
-            // banks nothing, so a wait created after the write would
-            // park until the next one.
-            let written = self.notify.notified();
-            {
-                let mut state = self.state.lock();
-                if state.value != 0 {
-                    if self.semaphore {
-                        state.value -= 1;
-                        return 1;
-                    }
-                    return core::mem::take(&mut state.value);
-                }
+    fn component_output(
+        &self,
+        fd: u8,
+        inherited: &OutputMode,
+    ) -> Result<OutputRoute, ComponentStdioRefusal> {
+        match self.get(i32::from(fd)) {
+            None => Ok(OutputRoute::Child(crate::byte_channel().0)),
+            Some(Preview1Descriptor::Stdout) => {
+                Ok(inherited.route(crate::ComponentOutputStreamKind::Stdout))
             }
-            written.await;
+            Some(Preview1Descriptor::Stderr) => {
+                Ok(inherited.route(crate::ComponentOutputStreamKind::Stderr))
+            }
+            Some(Preview1Descriptor::PipeWrite { writer, .. }) => {
+                Ok(OutputRoute::Child(writer.clone()))
+            }
+            Some(Preview1Descriptor::NullDevice) => Ok(OutputRoute::Discard),
+            Some(descriptor) => Err(ComponentStdioRefusal {
+                fd,
+                held: unbindable_stdio(descriptor),
+            }),
         }
+    }
+}
+
+/// What a descriptor that cannot be a component's standard stream holds.
+fn unbindable_stdio<Net: ComponentHostNetwork>(
+    descriptor: &Preview1Descriptor<Net>,
+) -> UnbindableStdio {
+    match descriptor {
+        Preview1Descriptor::Stdin { carry } if !carry.is_empty() => UnbindableStdio::ReadAhead,
+        Preview1Descriptor::Stdin { .. }
+        | Preview1Descriptor::PipeRead { .. }
+        | Preview1Descriptor::Stdout
+        | Preview1Descriptor::Stderr
+        | Preview1Descriptor::PipeWrite { .. }
+        | Preview1Descriptor::NullDevice => UnbindableStdio::WrongDirection,
+        Preview1Descriptor::File(_) => UnbindableStdio::File,
+        Preview1Descriptor::Preopen { .. } => UnbindableStdio::Directory,
+        Preview1Descriptor::Socket(_) => UnbindableStdio::Socket,
+        Preview1Descriptor::Event(_) => UnbindableStdio::Event,
+        Preview1Descriptor::Epoll(_) => UnbindableStdio::Epoll,
     }
 }
 
@@ -1627,31 +1818,31 @@ impl WasixTtyState {
 
 pub(super) fn directory_authority_to_descriptor_flags(
     rights: DirectoryAuthorityRights,
-) -> fs_types::DescriptorFlags {
-    let mut flags = fs_types::DescriptorFlags::empty();
+) -> FsDescriptorFlags {
+    let mut flags = FsDescriptorFlags::empty();
     if rights.contains(DirectoryAuthorityRights::READ) {
-        flags |= fs_types::DescriptorFlags::READ;
+        flags |= FsDescriptorFlags::READ;
     }
     if rights.contains(DirectoryAuthorityRights::WRITE) {
-        flags |= fs_types::DescriptorFlags::WRITE;
+        flags |= FsDescriptorFlags::WRITE;
     }
     if rights.contains(DirectoryAuthorityRights::MUTATE_DIRECTORY) {
-        flags |= fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+        flags |= FsDescriptorFlags::MUTATE_DIRECTORY;
     }
     flags
 }
 
 pub(super) fn descriptor_flags_to_directory_authority(
-    flags: fs_types::DescriptorFlags,
+    flags: FsDescriptorFlags,
 ) -> DirectoryAuthorityRights {
     let mut rights = DirectoryAuthorityRights::empty();
-    if flags.contains(fs_types::DescriptorFlags::READ) {
+    if flags.contains(FsDescriptorFlags::READ) {
         rights |= DirectoryAuthorityRights::READ;
     }
-    if flags.contains(fs_types::DescriptorFlags::WRITE) {
+    if flags.contains(FsDescriptorFlags::WRITE) {
         rights |= DirectoryAuthorityRights::WRITE;
     }
-    if flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY) {
+    if flags.contains(FsDescriptorFlags::MUTATE_DIRECTORY) {
         rights |= DirectoryAuthorityRights::MUTATE_DIRECTORY;
     }
     rights
@@ -1681,36 +1872,39 @@ pub(super) fn p1_descriptor_rights<Net: ComponentHostNetwork>(
         Preview1Descriptor::Socket(_) => {
             P1_RIGHT_FD_READ | P1_RIGHT_FD_WRITE | P1_RIGHT_POLL_FD_READWRITE
         }
-        Preview1Descriptor::Preopen { descriptor, .. }
-        | Preview1Descriptor::File { descriptor, .. } => {
-            let mut rights = P1_RIGHT_FD_ADVISE | P1_RIGHT_FD_FILESTAT_GET;
-            if descriptor.flags.contains(fs_types::DescriptorFlags::READ) {
-                rights |= P1_RIGHT_FD_READ
-                    | P1_RIGHT_FD_SEEK
-                    | P1_RIGHT_FD_TELL
-                    | P1_RIGHT_FD_READDIR
-                    | P1_RIGHT_POLL_FD_READWRITE
-                    | P1_RIGHT_PATH_READ_MASK;
-            }
-            if descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
-                rights |= P1_RIGHT_FD_DATASYNC
-                    | P1_RIGHT_FD_SYNC
-                    | P1_RIGHT_FD_WRITE
-                    | P1_RIGHT_FD_ALLOCATE
-                    | P1_RIGHT_FD_FDSTAT_SET_FLAGS
-                    | P1_RIGHT_FD_FILESTAT_SET_SIZE
-                    | P1_RIGHT_FD_FILESTAT_SET_TIMES
-                    | P1_RIGHT_PATH_FILE_WRITE_MASK;
-            }
-            if descriptor
-                .flags
-                .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-            {
-                rights |= P1_RIGHT_PATH_MUTATE_MASK;
-            }
-            rights
-        }
+        Preview1Descriptor::Preopen { descriptor, .. } => p1_node_rights(descriptor),
+        Preview1Descriptor::File(file) => p1_node_rights(file.node()),
     }
+}
+
+/// The preview1 rights a filesystem node handle's flags grant.
+fn p1_node_rights(descriptor: &FsDescriptor) -> u64 {
+    let mut rights = P1_RIGHT_FD_ADVISE | P1_RIGHT_FD_FILESTAT_GET;
+    if descriptor.flags.contains(FsDescriptorFlags::READ) {
+        rights |= P1_RIGHT_FD_READ
+            | P1_RIGHT_FD_SEEK
+            | P1_RIGHT_FD_TELL
+            | P1_RIGHT_FD_READDIR
+            | P1_RIGHT_POLL_FD_READWRITE
+            | P1_RIGHT_PATH_READ_MASK;
+    }
+    if descriptor.flags.contains(FsDescriptorFlags::WRITE) {
+        rights |= P1_RIGHT_FD_DATASYNC
+            | P1_RIGHT_FD_SYNC
+            | P1_RIGHT_FD_WRITE
+            | P1_RIGHT_FD_ALLOCATE
+            | P1_RIGHT_FD_FDSTAT_SET_FLAGS
+            | P1_RIGHT_FD_FILESTAT_SET_SIZE
+            | P1_RIGHT_FD_FILESTAT_SET_TIMES
+            | P1_RIGHT_PATH_FILE_WRITE_MASK;
+    }
+    if descriptor
+        .flags
+        .contains(FsDescriptorFlags::MUTATE_DIRECTORY)
+    {
+        rights |= P1_RIGHT_PATH_MUTATE_MASK;
+    }
+    rights
 }
 
 pub(super) fn p1_filetype(kind: FsNodeKind) -> u8 {
@@ -1718,6 +1912,11 @@ pub(super) fn p1_filetype(kind: FsNodeKind) -> u8 {
         FsNodeKind::Directory => 3,
         FsNodeKind::File => 4,
         FsNodeKind::Symlink => 7,
+        FsNodeKind::CharacterDevice => 2,
+        FsNodeKind::BlockDevice => 1,
+        // `filetype` has no FIFO, and a socket there is a datagram or a
+        // stream one, which a filesystem node does not say: `unknown`.
+        FsNodeKind::Fifo | FsNodeKind::Socket => 0,
     }
 }
 
@@ -1729,16 +1928,6 @@ pub(super) fn p1_filetype_from_descriptor_type(type_: fs_types::DescriptorType) 
         fs_types::DescriptorType::CharacterDevice => 2,
         fs_types::DescriptorType::BlockDevice => 1,
         _ => 0,
-    }
-}
-
-pub(super) fn p1_descriptor_path<Net: ComponentHostNetwork>(
-    descriptor: Option<&Preview1Descriptor<Net>>,
-) -> Option<&str> {
-    match descriptor {
-        Some(Preview1Descriptor::Preopen { descriptor, .. })
-        | Some(Preview1Descriptor::File { descriptor, .. }) => Some(&descriptor.path),
-        _ => None,
     }
 }
 
@@ -1762,18 +1951,36 @@ pub(super) fn p1_null_device_identity() -> crate::ObjectIdentity {
     crate::ObjectIdentity::new(crate::AuthorityDomain::GUEST_DEVICES, 1)
 }
 
+/// Synthetic `filestat` for open descriptors with no backing filesystem path
+/// (`/dev/null`, standard streams, and pipes), so `fstat(0..=2)` in Preview 1
+/// runtimes (`wasi-libc` / CPython `init_sys_streams`) sees valid character
+/// descriptors rather than `EBADF`.
+pub(super) fn p1_synthetic_descriptor_stat<Net: ComponentHostNetwork>(
+    descriptor: &Preview1Descriptor<Net>,
+) -> Option<(crate::ObjectIdentity, fs_types::DescriptorStat)> {
+    let identity = match descriptor {
+        Preview1Descriptor::NullDevice => p1_null_device_identity(),
+        Preview1Descriptor::Stdin { .. } => {
+            crate::ObjectIdentity::new(crate::AuthorityDomain::GUEST_DEVICES, 2)
+        }
+        Preview1Descriptor::Stdout => {
+            crate::ObjectIdentity::new(crate::AuthorityDomain::GUEST_DEVICES, 3)
+        }
+        Preview1Descriptor::Stderr => {
+            crate::ObjectIdentity::new(crate::AuthorityDomain::GUEST_DEVICES, 4)
+        }
+        Preview1Descriptor::PipeRead { .. } | Preview1Descriptor::PipeWrite { .. } => {
+            crate::ObjectIdentity::new(crate::AuthorityDomain::GUEST_DEVICES, 5)
+        }
+        _ => return None,
+    };
+    Some((identity, p1_null_device_stat()))
+}
+
 pub(super) fn p1_directory_descriptor<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> Option<&FsDescriptor> {
-    match descriptor {
-        Some(Preview1Descriptor::Preopen { descriptor, .. })
-        | Some(Preview1Descriptor::File { descriptor, .. })
-            if descriptor.kind == FsNodeKind::Directory =>
-        {
-            Some(descriptor)
-        }
-        _ => None,
-    }
+    p1_fs_descriptor(descriptor).filter(|descriptor| descriptor.kind == FsNodeKind::Directory)
 }
 
 /// Readiness of one descriptor for a single `poll_oneoff`/`epoll` interest.
@@ -1821,14 +2028,7 @@ impl P1Readiness {
 /// socket as "not ready" when it simply never asked the network.
 pub(super) enum P1Probe<Net: ComponentHostNetwork> {
     Local(P1Readiness),
-    Network(P1NetworkProbe<Net>),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum P1NetworkProbe<Net: ComponentHostNetwork> {
-    TcpStream(Net::TcpStream),
-    TcpListener(Net::TcpListener),
-    UdpSocket(Net::UdpSocket),
+    Network(UnixSocketHandle<Net>),
 }
 
 /// Probe every descriptor whose readiness is answerable from local state.
@@ -1851,14 +2051,20 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
                 })
             }
         }
-        (Some(Preview1Descriptor::PipeRead { reader, carry }), P1_EVENTTYPE_FD_READ)
-        | (
-            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { reader, carry, .. })),
-            P1_EVENTTYPE_FD_READ,
-        ) => {
-            if !carry.is_empty() {
+        (Some(Preview1Descriptor::PipeRead { reader, .. }), P1_EVENTTYPE_FD_READ) => {
+            local(if reader.is_readable() {
+                P1Readiness::Ready { bytes: 1 }
+            } else {
+                P1Readiness::Pending
+            })
+        }
+        (Some(Preview1Descriptor::Socket(socket)), P1_EVENTTYPE_FD_READ) if socket.is_pair() => {
+            let Some((reader, carry_len)) = socket.pair_read_probe() else {
+                return Err(p1::errno::INVAL);
+            };
+            if carry_len != 0 {
                 return local(P1Readiness::Ready {
-                    bytes: carry.len() as u64,
+                    bytes: carry_len as u64,
                 });
             }
             // `is_readable` covers queued bytes and a closed writer alike;
@@ -1887,7 +2093,7 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
         // carry a cached size, so report readiness without one rather than
         // paying a filesystem round-trip per poll.
         (
-            Some(Preview1Descriptor::File { .. }) | Some(Preview1Descriptor::Preopen { .. }),
+            Some(Preview1Descriptor::File(_)) | Some(Preview1Descriptor::Preopen { .. }),
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
         ) => local(P1Readiness::Ready { bytes: 0 }),
         // A guest-owned pipe or socketpair write end is a bounded channel:
@@ -1895,11 +2101,19 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
         // guest that polls for `POLLOUT` sleeps instead of spinning on a
         // full pipe. `is_writable` also covers a vanished peer, where the
         // write itself reports the error.
-        (Some(Preview1Descriptor::PipeWrite { writer }), P1_EVENTTYPE_FD_WRITE)
-        | (
-            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. })),
-            P1_EVENTTYPE_FD_WRITE,
-        ) => {
+        (Some(Preview1Descriptor::PipeWrite { writer, .. }), P1_EVENTTYPE_FD_WRITE) => {
+            if writer.is_writable() {
+                local(P1Readiness::Ready {
+                    bytes: usize::MAX as u64,
+                })
+            } else {
+                local(P1Readiness::Pending)
+            }
+        }
+        (Some(Preview1Descriptor::Socket(socket)), P1_EVENTTYPE_FD_WRITE) if socket.is_pair() => {
+            let Some(writer) = socket.pair_writer() else {
+                return Err(p1::errno::INVAL);
+            };
             if writer.is_writable() {
                 local(P1Readiness::Ready {
                     bytes: usize::MAX as u64,
@@ -1920,39 +2134,17 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
                 bytes: usize::MAX as u64,
             })
         }
+        // A network socket's readiness is the network's answer for the
+        // endpoint it owns. One with no endpoint yet can never make
+        // progress; it is not an error to poll it, it simply never becomes
+        // ready.
         (
-            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-                WasixTcpSocket::Connected { stream, .. },
-            ))),
+            Some(Preview1Descriptor::Socket(socket)),
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        ) => Ok(P1Probe::Network(P1NetworkProbe::TcpStream(stream.id()))),
-        (
-            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-                WasixTcpSocket::Listening { listener, .. },
-            ))),
-            P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        ) => Ok(P1Probe::Network(P1NetworkProbe::TcpListener(listener.id()))),
-        (
-            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
-                socket,
-                ..
-            }))),
-            P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        ) => Ok(P1Probe::Network(P1NetworkProbe::UdpSocket(socket.id()))),
-        // A socket with no endpoint yet can never make progress; it is not
-        // an error to poll it, it simply never becomes ready.
-        (
-            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-                WasixTcpSocket::Unconnected { .. } | WasixTcpSocket::Bound { .. },
-            ))),
-            P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        )
-        | (
-            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
-                ..
-            }))),
-            P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        ) => local(P1Readiness::Pending),
+        ) if !socket.is_pair() => match socket.handle() {
+            Some(handle) => Ok(P1Probe::Network(handle)),
+            None => local(P1Readiness::Pending),
+        },
         (Some(_), _) => Err(p1::errno::INVAL),
         (None, _) => Err(p1::errno::BADF),
     }

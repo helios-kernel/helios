@@ -17,10 +17,9 @@ tools/wasi-apps/build.sh
 This script:
 
 1. Downloads the official CPython 3.14.4 WASI build
-   (`brettcannon/cpython-wasi-build`) and the wasmtime
-   `wasi_snapshot_preview1.command.wasm` adapter.
-2. Wraps the preview1 core module into a WASI P2 component via
-   `wasm-tools component new --adapt …`.
+   (`brettcannon/cpython-wasi-build`).
+2. Stages its `python.wasm`, a WASI Preview 1 core module the kernel runs
+   as it is, with `wasm-tools strip`.
 3. Compiles the stdlib to bytecode with the interpreter it just staged
    (`python.wasm -m compileall --invalidation-mode unchecked-hash`,
    run under the wasmtime CLI of the same pinned release), so every
@@ -52,7 +51,7 @@ This script:
 
 Artifacts produced:
 
-- `artifacts/python3-root/python3.wasm` — real CPython 3.14 component.
+- `artifacts/python3-root/python3.wasm` — real CPython 3.14 Preview 1 core module.
 - `artifacts/python3-root/lib/python3.14/` — CPython standard library,
   with unchecked-hash bytecode under every `__pycache__/`.
 - `artifacts/wasix/dash/dash.wasm` — standard WASIX dash raw module.
@@ -419,7 +418,7 @@ Expected output contains:
 ## Implementation Notes
 
 - `artifacts/python3-root/python3.wasm` is the real CPython interpreter
-  converted from WASI preview1 to the preview2 component we run. In bootfs
+  as a WASI preview1 core module. In bootfs
   the stdlib is mounted under `usr/local/lib/python3.14/`, matching the
   upstream CPython build prefix. The tree is read-only in the guest, so
   the bytecode `build.sh` compiles is the only bytecode CPython will
@@ -432,9 +431,12 @@ Expected output contains:
   `helios_api::http_kit` (`wasi:sockets` and the monotonic clock); the
   plugin must be provisioned (`--boot-program http-client`) or
   `wasi:http/client` reports `configuration-error`. `https://` runs rustls
-  against the Mozilla roots compiled in (`webpki-roots`), checking validity
+  against the Mozilla roots compiled in (`webpki-roots`) plus the optional
+  PEM bundle at `/etc/ssl/certs/ca-certificates.crt`, checking validity
   against `wasi:clocks/wall-clock`; an untrusted, expired or mismatched
-  certificate is the typed `TLS-certificate-error`.
+  certificate is the typed `TLS-certificate-error`. CI supplies its own CA
+  through bootfs and serves valid, expired, wrong-host and self-signed
+  certificates on the runner with `tools/wasi-apps/tls-smoke.py`.
 - `tools/wasi-apps/extract-webc-wasm.pl` extracts the single raw wasm atom
   from the pinned Wasmer WEBc images. The build script validates both WEBc
   and raw wasm SHA-256 digests before staging.

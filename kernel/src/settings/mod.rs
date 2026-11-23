@@ -325,16 +325,20 @@ macro_rules! settings {
 
 // The machine's settings. A setting is listed here together with the change
 // that makes a consumer enforce it, so that none is declared and then ignored.
+#[cfg(feature = "unix")]
 settings! {
-    descriptor_limit: crate::process::DescriptorLimitSetting,
+    descriptor_limit: crate::DescriptorLimitSetting,
 }
+
+#[cfg(not(feature = "unix"))]
+settings! {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        DescriptorLimit, DescriptorLimitSetting, ProcessAuthority, SettingsAuthorityRights,
-    };
+    #[cfg(feature = "unix")]
+    use crate::{DescriptorLimit, DescriptorLimitSetting};
+    use crate::{ProcessAuthority, SettingsAuthorityRights};
 
     /// The proof a holder of the right derives from its authority.
     fn proof() -> WriteSettingsCap {
@@ -406,6 +410,7 @@ mod tests {
         assert_eq!(settings.entries(), before);
     }
 
+    #[cfg(feature = "unix")]
     #[test]
     fn the_machine_lists_the_descriptor_limit_and_nothing_else() {
         let settings = Settings::default();
@@ -421,6 +426,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "unix")]
     #[test]
     fn a_write_by_name_reaches_the_limit_the_consumers_read() {
         let settings = Settings::default();

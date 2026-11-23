@@ -306,6 +306,24 @@ pub struct ReturnAddressSigning {
 }
 
 pub trait Cpu: Send + Sync + 'static {
+    type Hypervisor: crate::hv::Hypervisor;
+
+    /// Hardware virtualization is absent unless the backend exposes a usable
+    /// factory, including Stage-2 translation and hardware-bounded entry.
+    fn hv(&self) -> Option<&Self::Hypervisor> {
+        None
+    }
+
+    type Native: crate::native::NativeExecution;
+
+    /// Native user execution is absent unless the backend exposes a
+    /// capability meeting every property of [`crate::native`]'s contract,
+    /// its isolation contract included; the refusal says which part is
+    /// missing.
+    fn native(&self) -> Result<&Self::Native, crate::native::NativeUnavailable> {
+        Err(crate::native::NativeUnavailable::Unsupported)
+    }
+
     /// How this platform's timer interrupt is scheduled.
     ///
     /// A deadline published for another processor has to reach that
