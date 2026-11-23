@@ -4,24 +4,32 @@ version = "0.1.0"
 edition.workspace = true
 
 [features]
+# Native user execution (`helios_hal::native`): ring-three address spaces
+# and contexts, and the exception stubs that route user traps to them.
+native-users = []
 default = ["embedded-debugger"]
 embedded-debugger = ["helios-kernel/embedded-debugger"]
 
 [dependencies]
-acpi = "6.1.1"
+acpi = { workspace = true, features = ["aml"] }
+helios-acpi.workspace = true
+helios-artifact.workspace = true
 bitflags = "2.11.0"
 critical-section = { version = "1.2.0", features = ["restore-state-usize"] }
+helios-firmware = { workspace = true, features = ["acpi"] }
 helios-hal.workspace = true
 i6300esb.workspace = true
 helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-bare-metal"] }
 helios-virtio.workspace = true
+helios-tpm.workspace = true
+helios-x86-vmm.workspace = true
 # The kernel saves only the legacy FXSAVE x87/SSE state on interrupt entry,
 # so it must not contain libm's CPUID-dispatched FMA/FMA4 paths.
 libm = { version = "0.2.16", default-features = false, features = ["force-soft-floats"] }
 tracing.workspace = true
 limine = "0.5.0"
 pci_types = "0.10.1"
-spin = { version = "0.9.8", default-features = false, features = ["once"] }
+spin = { version = "0.9.8", default-features = false, features = ["once", "mutex", "spin_mutex"] }
 x86 = "0.52.0"
 x86_64 = { version = "0.15.3", default-features = false, features = ["instructions"] }
 

@@ -93,6 +93,15 @@ pub struct Desktop {
 }
 
 impl Desktop {
+    /// Restore the desktop after another compositor-owned surface was shown.
+    pub async fn activate(&self) -> Result<(), DisplayError> {
+        self.surface.activate().await
+    }
+
+    pub const fn mode(&self) -> Mode {
+        self.mode
+    }
+
     /// Build the desktop on `surface`, sized to `mode`.
     pub fn new(surface: Surface, mode: Mode) -> Self {
         let bounds = Region::new(0, 0, mode.width, mode.height);

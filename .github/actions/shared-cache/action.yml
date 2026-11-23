@@ -1,0 +1,34 @@
+name: Restore a shared cache
+description: Restore on every branch; only the default branch saves at job completion.
+inputs:
+  path:
+    description: Files or directories to cache.
+    required: true
+  key:
+    description: Key identifying the cached inputs.
+    required: true
+  restore-keys:
+    description: Key prefixes, one per line, restored in order when no cache has the exact key.
+    required: false
+    default: ""
+outputs:
+  cache-hit:
+    description: Whether the exact key was restored.
+    value: ${{ steps.writer.outputs.cache-hit || steps.reader.outputs.cache-hit }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache@v4
+      id: writer
+      if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      with:
+        path: ${{ inputs.path }}
+        key: ${{ inputs.key }}
+        restore-keys: ${{ inputs.restore-keys }}
+    - uses: actions/cache/restore@v4
+      id: reader
+      if: github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
+      with:
+        path: ${{ inputs.path }}
+        key: ${{ inputs.key }}
+        restore-keys: ${{ inputs.restore-keys }}

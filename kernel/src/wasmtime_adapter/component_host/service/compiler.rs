@@ -1,21 +1,17 @@
 use super::*;
 use crate::wasmtime_adapter::preemption::kill_or_yield;
-use crate::{RawMutex, RawMutexLease};
 use helios_compiler_abi::{CompilerStatus, OutputKind, UnknownDiscriminant};
 
-/// Cached state of the compiler kernel plugin. Building it costs one
-/// `Module::deserialize` + one `SharedMemory::new(8192 pages)` + one
-/// `Linker::instantiate_pre`; the result is reused across compile
-/// calls. Per-call work is reduced to a fresh `wasmtime::Store`,
-/// `instance_pre.instantiate`, then `initialize` / `alloc` / `compile`.
-pub(super) struct CompilerPluginRuntime<CpuImpl, Net, HostFs>
+/// Cached runtime of the compiler kernel plugin (`SharedMemory` + `InstancePre`
+/// + main-thread TLS block).
+pub(super) struct CompilerPluginRuntime<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    pub(super) instance_pre: Arc<InstancePre<CompilerCoreStore<CpuImpl, Net, HostFs>>>,
-    pub(super) shared: Arc<CompilerCoreShared<CompilerCoreStore<CpuImpl, Net, HostFs>>>,
+    pub(super) instance_pre: Arc<InstancePre<CompilerCoreStore<CpuImpl, Net, StorageImpl>>>,
+    pub(super) shared: Arc<SharedMemoryCoreShared<CompilerCoreStore<CpuImpl, Net, StorageImpl>>>,
     /// The linker-reserved main-thread TLS block, initialised once by the
     /// instance that wins the memory-init flag; every per-compile instance
     /// adopts it because later instances skip that init and see `__tls_base == 0`.
@@ -23,47 +19,6 @@ where
     /// Names the plugin's code to the instruction sampler while the
     /// plugin is resident.
     pub(super) _code: crate::wasmtime_adapter::code_map::CodeRegistration,
-}
-
-/// The one compile the plugin runs at a time.
-///
-/// The cached `SharedMemory` is the plugin's only scratch surface, so a
-/// second compile racing the first would corrupt its request and response
-/// buffers. The slot is an async mutex rather than a hand-built `Notify`
-/// permit queue: `RawMutex` parks a waiter, arms its wait before it tests
-/// the lock, wakes exactly one waiter when a lease drops, and is FIFO, which
-/// is the whole of what a slot needs. A waiter costs nothing while parked.
-///
-/// The lease is held across every await of the compile on purpose. It is the
-/// slot itself, the permission to use the plugin's memory, and guards no
-/// data, so §4's "release the guard before an `.await`" (which keeps a data
-/// lock from pinning other tasks across a suspension) does not describe it.
-///
-/// Concurrency contract: any processor may wait for the slot and any
-/// processor may drop the lease (the lease is `Send`); both are lock-free
-/// apart from the mutex's own state. Interrupt handlers never touch it.
-pub(super) struct CompilerCompileSlot {
-    lock: RawMutex,
-}
-
-/// Ownership of the compile slot; releasing it wakes one waiting compile.
-pub(super) struct CompilerCompileLease<'a> {
-    _lease: RawMutexLease<'a>,
-}
-
-impl CompilerCompileSlot {
-    pub(super) fn new() -> Self {
-        Self {
-            lock: RawMutex::new(),
-        }
-    }
-
-    /// Parks until the slot is free, then takes it.
-    pub(super) async fn acquire(&self) -> CompilerCompileLease<'_> {
-        CompilerCompileLease {
-            _lease: self.lock.lock().await,
-        }
-    }
 }
 
 /// The compiler plugin's exports one call uses.
@@ -75,15 +30,15 @@ pub(super) struct CompilerExports {
 }
 
 /// The bytes the plugin counts as owned across the interface right now.
-pub(super) async fn compiler_outstanding_bytes<CpuImpl, Net, HostFs>(
+pub(super) async fn compiler_outstanding_bytes<CpuImpl, Net, StorageImpl>(
     drive: &CompilerStoreDrive<CpuImpl>,
-    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     outstanding: &wasmtime::TypedFunc<(), i32>,
 ) -> Result<u32, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     drive
         .call(store, outstanding, ())
@@ -129,6 +84,17 @@ pub(super) fn ensure_compiler_buffers_returned(
 /// program `Err`.
 pub(super) type CompilerCallOutcome = Result<Result<Vec<u8>, ProgramExecError>, ProgramExecError>;
 
+/// What one compile asks of the plugin: the module, the ISA the artifact
+/// is for, and how hard to optimise it.
+#[derive(Clone)]
+pub(super) struct CompileRequest {
+    pub(super) wasm: Bytes,
+    pub(super) guest_isa: GuestIsa,
+    pub(super) hint: AotCompileHint,
+    /// Whether the plugin reports its pass timings.
+    pub(super) profile: bool,
+}
+
 /// A buffer in the plugin's memory, with the layout it was allocated with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PluginBuffer {
@@ -137,7 +103,7 @@ struct PluginBuffer {
     align: usize,
 }
 
-/// The plugin allocations of one compile call: the three request buffers the
+/// The plugin allocations of one compile call: the four request buffers the
 /// kernel allocates and the three response buffers the plugin hands over (the
 /// ownership table is in `helios_compiler_abi`).
 ///
@@ -147,8 +113,8 @@ struct PluginBuffer {
 /// reaches `release`, and its allocations die with the runtime.
 #[must_use = "the plugin's allocations leak unless released"]
 pub(super) struct CompilerAllocations {
-    /// Three request buffers and three response buffers.
-    buffers: SmallVec<[PluginBuffer; 6]>,
+    /// Four request buffers and three response buffers.
+    buffers: SmallVec<[PluginBuffer; 7]>,
 }
 
 impl CompilerAllocations {
@@ -160,10 +126,10 @@ impl CompilerAllocations {
 
     /// Allocates a request buffer through the plugin and records it. A
     /// zero-length buffer is pointer 0 and is not allocated.
-    pub(super) async fn alloc<CpuImpl, Net, HostFs>(
+    pub(super) async fn alloc<CpuImpl, Net, StorageImpl>(
         &mut self,
         drive: &CompilerStoreDrive<CpuImpl>,
-        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
         alloc: &wasmtime::TypedFunc<(i32, i32), i32>,
         len: usize,
         align: usize,
@@ -171,7 +137,7 @@ impl CompilerAllocations {
     where
         CpuImpl: Cpu + Clone,
         Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
+        StorageImpl: crate::Storage,
     {
         if len == 0 {
             return Ok(0);
@@ -191,16 +157,16 @@ impl CompilerAllocations {
     }
 
     /// Returns every recorded buffer to the plugin.
-    pub(super) async fn release<CpuImpl, Net, HostFs>(
+    pub(super) async fn release<CpuImpl, Net, StorageImpl>(
         self,
         drive: &CompilerStoreDrive<CpuImpl>,
-        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
         free: &wasmtime::TypedFunc<(i32, i32, i32), ()>,
     ) -> Result<(), ProgramExecError>
     where
         CpuImpl: Cpu + Clone,
         Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
+        StorageImpl: crate::Storage,
     {
         for buffer in self.buffers {
             drive
@@ -220,33 +186,35 @@ impl CompilerAllocations {
 /// compile's instance and the plugin runtime's shared state. A worker store
 /// is built from a clone of its parent's context.
 #[derive(Clone)]
-pub(super) struct CompilerCompileContext<CpuImpl, Net, HostFs>
+pub(super) struct CompilerCompileContext<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     pub(super) cpu: CpuImpl,
     pub(super) spawner: crate::Spawner<CpuImpl>,
-    pub(super) runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+    pub(super) runtime_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     pub(super) instance: crate::RegisteredInstance,
     /// The registry `instance` lives in, which a condemnation goes through.
     pub(super) registry: crate::InstanceRegistry,
-    pub(super) shared: Arc<CompilerCoreShared<CompilerCoreStore<CpuImpl, Net, HostFs>>>,
+    pub(super) shared: Arc<SharedMemoryCoreShared<CompilerCoreStore<CpuImpl, Net, StorageImpl>>>,
+    /// Core-affinity plan for every thread of this compile session.
+    pub(super) affinity_plan: CoreAffinityPlan,
     pub(super) write_serial: crate::DebugSerialWriter,
-    pub(super) _marker: core::marker::PhantomData<fn() -> HostFs>,
+    pub(super) _marker: core::marker::PhantomData<fn() -> StorageImpl>,
 }
 
-impl<CpuImpl, Net, HostFs> CompilerCompileContext<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> CompilerCompileContext<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     /// Condemns the compile's instance for `reason` and interrupts every
     /// store of it.
     fn condemn(&self, reason: crate::KillReason) -> crate::KillOutcome {
-        condemn_compile(
+        condemn_session(
             &self.registry,
             &self.shared.interrupts,
             self.instance.id(),
@@ -303,7 +271,7 @@ where
 /// returned a response, because the plugin's memory is in an unknown state.
 pub(super) fn first_trap_wins<T>(
     result: Result<T, ProgramExecError>,
-    reports: &mut [CompilerThreadReport],
+    reports: &mut [SharedMemoryThreadReport],
 ) -> Result<T, ProgramExecError> {
     match reports.iter_mut().find_map(|report| report.trap.take()) {
         Some(trap) => Err(trap),
@@ -319,13 +287,13 @@ pub(super) fn first_trap_wins<T>(
 /// plugin's memory belongs to the cached runtime, not to the compile's
 /// instance or to the requester, and the kernel reads it without a
 /// pre-fault, so it is never the swap policy's to evict.
-pub(super) struct CompilerCoreStore<CpuImpl, Net, HostFs>
+pub(super) struct CompilerCoreStore<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    pub(super) context: CompilerCompileContext<CpuImpl, Net, HostFs>,
+    pub(super) context: CompilerCompileContext<CpuImpl, Net, StorageImpl>,
     pub(super) preview1_descriptors: CompilerPreview1Descriptors,
     activity: crate::InstanceActivity,
 }
@@ -366,39 +334,15 @@ impl CompilerPreview1Descriptors {
     }
 }
 
-pub(super) struct CompilerCoreShared<T> {
-    pub(super) memory: SharedMemory,
-    pub(super) entropy: Mutex<crate::EntropyPool>,
-    pub(super) instance_pre: spin::Once<Arc<InstancePre<T>>>,
-    pub(super) next_thread_id: AtomicI32,
-    pub(super) thread_tasks: Mutex<Vec<crate::JoinHandle<CompilerThreadReport>>>,
-    /// The interrupt routes of the engine every compiler store runs on,
-    /// so a kill reaches each of them, the threads' included.
-    pub(super) interrupts: Arc<crate::wasmtime_adapter::preemption::GuestInterrupts>,
-}
-
-pub(super) struct CompilerThreadReport {
-    /// The error this worker's store trapped with, when that trap is the one
-    /// that condemned the compile. See
-    /// [`CompilerCompileContext::condemn_for_store_end`].
-    pub(super) trap: Option<ProgramExecError>,
-    pub(super) thread_id: i32,
-    pub(super) processor: u16,
-    pub(super) spawned_ns: u64,
-    pub(super) started_ns: u64,
-    pub(super) instantiated_ns: u64,
-    pub(super) finished_ns: u64,
-}
-
-impl<CpuImpl, Net, HostFs> CompilerCoreStore<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> CompilerCoreStore<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     /// A store of `context`'s compile, with its own accounting over the
     /// compile's instance.
-    pub(super) fn new(context: CompilerCompileContext<CpuImpl, Net, HostFs>) -> Self {
+    pub(super) fn new(context: CompilerCompileContext<CpuImpl, Net, StorageImpl>) -> Self {
         let activity = crate::InstanceActivity::without_memory_owner(
             context.instance.clone(),
             crate::store_kernel_heap_bytes(size_of::<Self>()),
@@ -417,9 +361,10 @@ where
     /// The handle the code driving this store accounts its processor
     /// turns through. Taken before the store is borrowed for the call;
     /// see [`crate::component::GuestTurns::drive`].
-    fn guest_turns(
+    pub(super) fn guest_turns(
         &self,
-    ) -> crate::component::GuestTurns<CpuImpl, HostRuntimeState<CpuImpl, Net, HostFs>, ()> {
+    ) -> crate::component::GuestTurns<CpuImpl, HostRuntimeState<CpuImpl, Net, StorageImpl>, ()>
+    {
         crate::component::GuestTurns::new(
             self.activity.turns(),
             self.context.cpu.clone(),
@@ -456,14 +401,14 @@ pub(super) fn define_compiler_shared_memory<T>(
     define_imported_shared_memory(linker, store, module, memory)
 }
 
-pub(super) fn add_compiler_core_imports<CpuImpl, Net, HostFs>(
-    linker: &mut CoreLinker<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+pub(super) fn add_compiler_core_imports<CpuImpl, Net, StorageImpl>(
+    linker: &mut CoreLinker<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     memory: SharedMemory,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     add_wasi_p1_imports(linker)?;
     add_wasi_thread_spawn(linker)?;
@@ -471,31 +416,21 @@ where
     Ok(())
 }
 
-pub(super) fn compiler_plugin_worker_threads<CpuImpl: Cpu>(cpu: &CpuImpl) -> u32 {
-    let kernel_processors = super::component_host_kernel_processor_count(
-        cpu.processor_count(),
-        cpu.bootstrap_processor(),
-    );
-    let worker_count = kernel_processors.max(1);
-    u32::try_from(worker_count)
-        .unwrap_or_else(|_| panic!("compiler plugin processor count exceeds u32"))
-}
-
 pub(super) fn compiler_rayon_env_len(thread_count: u32) -> u32 {
     RAYON_NUM_THREADS_ENV.len() as u32 + decimal_len(thread_count) + 1
 }
 
-pub(super) fn compiler_environ_get<CpuImpl, Net, HostFs>(
-    caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>,
+pub(super) fn compiler_environ_get<CpuImpl, Net, StorageImpl>(
+    caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     environ: u32,
     buf: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let thread_count = compiler_plugin_worker_threads(&caller.data().context.cpu);
+    let thread_count = caller.data().context.shared.worker_threads();
     let memory = caller.data().memory();
     let environ = GuestAddress::wasm32(environ);
     let pointer_status = write_u32(memory, environ, buf);
@@ -564,15 +499,15 @@ pub(super) struct CompilerStoreDrive<CpuImpl: Cpu> {
 
 impl<CpuImpl: Cpu + Clone> CompilerStoreDrive<CpuImpl> {
     /// Calls `func` on `store` under the drive.
-    pub(super) async fn call<Net, HostFs, Params, Results>(
+    pub(super) async fn call<Net, StorageImpl, Params, Results>(
         &self,
-        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
         func: &wasmtime::TypedFunc<Params, Results>,
         params: Params,
     ) -> wasmtime::Result<Results>
     where
         Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
+        StorageImpl: crate::Storage,
         Params: wasmtime::WasmParams + Sync,
         Results: wasmtime::WasmResults + Sync,
     {
@@ -583,14 +518,14 @@ impl<CpuImpl: Cpu + Clone> CompilerStoreDrive<CpuImpl> {
     }
 
     /// Instantiates `instance_pre` on `store` under the drive.
-    pub(super) async fn instantiate<Net, HostFs>(
+    pub(super) async fn instantiate<Net, StorageImpl>(
         &self,
-        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
-        instance_pre: &InstancePre<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+        store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
+        instance_pre: &InstancePre<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     ) -> wasmtime::Result<wasmtime::Instance>
     where
         Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
+        StorageImpl: crate::Storage,
     {
         let turns = store.data().guest_turns();
         self.interrupts
@@ -601,13 +536,13 @@ impl<CpuImpl: Cpu + Clone> CompilerStoreDrive<CpuImpl> {
 
 /// Installs the compiler store's interrupt callback and registers the
 /// store for kills, for as long as the returned drive lives.
-pub(super) fn configure_compiler_core_store<CpuImpl, Net, HostFs>(
-    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+pub(super) fn configure_compiler_core_store<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
 ) -> CompilerStoreDrive<CpuImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     store.interrupt_callback(|caller| caller.data().on_interrupt());
     let interrupts = store.data().context.shared.interrupts.clone();
@@ -617,14 +552,14 @@ where
     }
 }
 
-pub(super) fn compiler_tls_base<CpuImpl, Net, HostFs>(
-    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+pub(super) fn compiler_tls_base<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     instance: &wasmtime::Instance,
 ) -> Result<u32, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let global = instance
         .get_global(&mut *store, "__tls_base")
@@ -644,15 +579,15 @@ where
     }
 }
 
-pub(super) fn set_compiler_tls_base<CpuImpl, Net, HostFs>(
-    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+pub(super) fn set_compiler_tls_base<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     instance: &wasmtime::Instance,
     tls_base: u32,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let global = instance
         .get_global(&mut *store, "__tls_base")
@@ -665,9 +600,9 @@ where
         .map_err(map_program_runtime_error)
 }
 
-pub(super) async fn compiler_alloc<CpuImpl, Net, HostFs>(
+pub(super) async fn compiler_alloc<CpuImpl, Net, StorageImpl>(
     drive: &CompilerStoreDrive<CpuImpl>,
-    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+    store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     alloc: &wasmtime::TypedFunc<(i32, i32), i32>,
     len: usize,
     align: usize,
@@ -675,7 +610,7 @@ pub(super) async fn compiler_alloc<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let ptr = drive
         .call(store, alloc, (len as i32, align as i32))
@@ -695,22 +630,6 @@ where
         });
     }
     Ok(ptr as u32)
-}
-
-/// Reads the response header the plugin returned. The header is all `u32`
-/// fields, so every byte pattern in plugin memory decodes to a header; what
-/// its enumerated fields mean is checked by [`decode_compiler_response`].
-pub(super) fn read_compiler_response(
-    memory: &SharedMemory,
-    ptr: GuestAddress,
-) -> Result<CompilerResponseHeader, ProgramExecError> {
-    let bytes = read_shared_memory(memory, ptr, CompilerResponseHeader::SIZE as u32)?;
-    let bytes: &[u8; CompilerResponseHeader::SIZE] =
-        bytes.as_slice().try_into().map_err(|_| ProgramExecError {
-            kind: ProgramExecErrorKind::Internal,
-            detail: ProgramExecErrorDetail::InternalInvariant,
-        })?;
-    Ok(CompilerResponseHeader::from_bytes(bytes))
 }
 
 /// The typed error for a wire value the plugin sent that names no variant.
@@ -742,8 +661,14 @@ pub(super) fn decode_compiler_response(
 /// the caller. The response buffers are adopted into `allocations` as soon as
 /// the header's layout is known to be this ABI's, before anything else can
 /// fail, so a rejected or malformed response is freed too.
-pub(super) fn accept_compiler_response<CpuImpl, Net, HostFs>(
-    store: &CompilerCoreStore<CpuImpl, Net, HostFs>,
+///
+/// The plugin's memory is read during the store's turns
+/// ([`in_guest_turn`]): `compile` has returned, so the instance is off every
+/// processor between them. The header is all `u32` fields, so every byte
+/// pattern in plugin memory decodes to a header; what its enumerated fields
+/// mean is checked by [`decode_compiler_response`].
+pub(super) async fn accept_compiler_response<CpuImpl, Net, StorageImpl>(
+    store: &CompilerCoreStore<CpuImpl, Net, StorageImpl>,
     allocations: &mut CompilerAllocations,
     response_ptr: u32,
     profile: bool,
@@ -752,10 +677,15 @@ pub(super) fn accept_compiler_response<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let memory = store.memory();
-    let header = read_compiler_response(memory, GuestAddress::wasm32(response_ptr))?;
+    let memory = Preview1AsyncMemory::of_shared(store.memory());
+    let header = in_guest_turn(
+        store.guest_turns(),
+        memory.read_array::<{ CompilerResponseHeader::SIZE }>(GuestAddress::wasm32(response_ptr)),
+    )
+    .await?;
+    let header = CompilerResponseHeader::from_bytes(&header);
     if header.abi_version != HELIOS_COMPILER_ABI_VERSION {
         return Err(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
@@ -770,11 +700,14 @@ where
     allocations.adopt(header.diagnostic_ptr, header.diagnostic_len as usize, 1);
     allocations.adopt(header.precompiled_ptr, header.precompiled_len as usize, 1);
     let (status, _output_kind) = decode_compiler_response(&header)?;
-    let diagnostic = read_shared_memory(
-        memory,
-        GuestAddress::wasm32(header.diagnostic_ptr),
-        header.diagnostic_len,
-    )?;
+    let diagnostic = in_guest_turn(
+        store.guest_turns(),
+        memory.read_bytes(
+            GuestAddress::wasm32(header.diagnostic_ptr),
+            header.diagnostic_len as usize,
+        ),
+    )
+    .await?;
     if status != CompilerStatus::Ok {
         if !diagnostic.is_empty() {
             tracing::error!(
@@ -795,11 +728,14 @@ where
     } else {
         0
     };
-    let output = read_shared_memory(
-        memory,
-        GuestAddress::wasm32(header.precompiled_ptr),
-        header.precompiled_len,
-    )?;
+    let output = in_guest_turn(
+        store.guest_turns(),
+        memory.read_bytes(
+            GuestAddress::wasm32(header.precompiled_ptr),
+            header.precompiled_len as usize,
+        ),
+    )
+    .await?;
     phases.response_done_ns = if profile {
         monotonic_nanos(&store.context.cpu)
     } else {
@@ -808,15 +744,15 @@ where
     Ok(output)
 }
 
-pub(super) fn compiler_fd_fdstat_get<CpuImpl, Net, HostFs>(
-    caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>,
+pub(super) fn compiler_fd_fdstat_get<CpuImpl, Net, StorageImpl>(
+    caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     stat: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let descriptor = match fd {
         1 if caller.data().preview1_descriptors.stdout_open => Preview1Descriptor::<Net>::Stdout,
@@ -828,8 +764,8 @@ where
         .map_or(p1::errno::FAULT, |_| p1::errno::SUCCESS)
 }
 
-pub(super) fn fd_write<CpuImpl, Net, HostFs>(
-    caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>,
+pub(super) fn fd_write<CpuImpl, Net, StorageImpl>(
+    caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     iovs: u32,
     iovs_len: u32,
@@ -838,7 +774,7 @@ pub(super) fn fd_write<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if !caller.data().preview1_descriptors.can_write(fd) {
         return p1::errno::BADF;
@@ -980,7 +916,7 @@ mod tests {
     /// polled in between.
     #[test]
     fn a_waiting_compile_is_woken_by_the_release() {
-        let slot = CompilerCompileSlot::new();
+        let slot = SharedMemorySessionSlot::new();
         let first = block_on(slot.acquire());
 
         let second_wakes = SharedArc::new(WakeCount::default());
@@ -1006,7 +942,7 @@ mod tests {
     type FixtureStore = CompilerCoreStore<
         crate::test_support::TestCpu,
         crate::test_support::TestNetworkService,
-        crate::UnsupportedHostFileSystem,
+        crate::test_support::UnsupportedStorage,
     >;
 
     /// A compile's context on the fixtures a kernel unit test carries, the
@@ -1019,7 +955,7 @@ mod tests {
         context: CompilerCompileContext<
             crate::test_support::TestCpu,
             crate::test_support::TestNetworkService,
-            crate::UnsupportedHostFileSystem,
+            crate::test_support::UnsupportedStorage,
         >,
     }
 
@@ -1037,8 +973,14 @@ mod tests {
             let runtime_state: HostRuntimeState<
                 TestCpu,
                 crate::test_support::TestNetworkService,
-                crate::UnsupportedHostFileSystem,
-            > = crate::RuntimeState::new(cpu.timebase(), 1, 0, crate::BootPayload::for_tests());
+                crate::test_support::UnsupportedStorage,
+            > = crate::RuntimeState::new(
+                cpu.timebase(),
+                1,
+                0,
+                crate::BootPayload::for_tests(),
+                GuestIsa::for_build_target(cpu.native_feature_probe()),
+            );
             runtime_state.install_root_entropy(triomphe::Arc::new(
                 crate::RootEntropy::from_platform(
                     &cpu,
@@ -1050,21 +992,22 @@ mod tests {
             ));
             let executor = crate::Executor::new(
                 helios_hal::watchdog::ProgressCounter::new(),
-                1,
+                crate::test_support::single_node_pool(1),
                 helios_hal::cpu::ProcessorId::new(0),
             );
             let registry = crate::InstanceRegistry::new();
             let instance = registry.register("compiler-plugin", 0);
-            let memory = SharedMemory::new(&engine, wasmtime::MemoryType::shared(1, 1))
-                .expect("the engine enables shared memories");
-            let shared = Arc::new(CompilerCoreShared {
+            let memory = SharedMemory::new(
+                &engine,
+                wasmtime::MemoryType::shared(1, 1).expect("1..=1 is a valid shared memory type"),
+            )
+            .expect("the engine enables shared memories");
+            let shared = Arc::new(SharedMemoryCoreShared::new(
                 memory,
-                entropy: Mutex::new(crate::EntropyPool::derive(runtime_state.root_entropy(), 0)),
-                instance_pre: spin::Once::new(),
-                next_thread_id: AtomicI32::new(0),
-                thread_tasks: Mutex::new(Vec::new()),
-                interrupts: interrupts.clone(),
-            });
+                crate::EntropyPool::derive(runtime_state.root_entropy(), 0),
+                interrupts.clone(),
+                1,
+            ));
             let context = CompilerCompileContext {
                 cpu,
                 spawner: executor.spawner(cpu),
@@ -1072,6 +1015,7 @@ mod tests {
                 instance: instance.clone(),
                 registry: registry.clone(),
                 shared,
+                affinity_plan: CoreAffinityPlan::single(helios_hal::cpu::ProcessorId::new(0)),
                 write_serial: crate::DebugSerialWriter::of::<DiscardPort>(),
                 _marker: core::marker::PhantomData,
             };
@@ -1151,9 +1095,12 @@ mod tests {
         ] {
             let fixture = CompileFixture::new();
             let (store, _drive) = fixture.open_store();
-            fixture
-                .registry
-                .request_kill(fixture.instance.id(), reason, 0);
+            fixture.registry.request_kill(
+                fixture.instance.id(),
+                reason,
+                0,
+                &crate::UserResidency::default(),
+            );
             let Err(error) = store.data().on_interrupt() else {
                 panic!("a condemned instance's guest traps at its next check");
             };
@@ -1205,9 +1152,12 @@ mod tests {
         assert!(!dropped.load(Ordering::SeqCst));
 
         assert_eq!(
-            fixture
-                .registry
-                .request_kill(fixture.instance.id(), crate::KillReason::Operator, 0),
+            fixture.registry.request_kill(
+                fixture.instance.id(),
+                crate::KillReason::Operator,
+                0,
+                &crate::UserResidency::default()
+            ),
             crate::KillOutcome::Requested
         );
         assert_eq!(wakes.count(), 1, "the condemnation wakes the parked turn");
@@ -1252,8 +1202,8 @@ mod tests {
         .expect("the parked wait is a () -> () function")
     }
 
-    fn report(trap: Option<ProgramExecError>) -> CompilerThreadReport {
-        CompilerThreadReport {
+    fn report(trap: Option<ProgramExecError>) -> SharedMemoryThreadReport {
+        SharedMemoryThreadReport {
             trap,
             thread_id: 1,
             processor: 0,
@@ -1398,9 +1348,12 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
         let mut call = pin!(drive.call(&mut worker, &wait, ()));
         assert!(call.as_mut().poll(&mut cx).is_pending());
-        fixture
-            .registry
-            .request_kill(fixture.instance.id(), crate::KillReason::Operator, 0);
+        fixture.registry.request_kill(
+            fixture.instance.id(),
+            crate::KillReason::Operator,
+            0,
+            &crate::UserResidency::default(),
+        );
         let Poll::Ready(Err(error)) = call.as_mut().poll(&mut cx) else {
             panic!("the kill ends the parked worker");
         };

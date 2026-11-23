@@ -48,6 +48,8 @@ pub enum DisplayError {
     BadSpan,
     #[error("no contiguous run of memory left for a frame buffer")]
     OutOfMemory,
+    #[error("the display engine cannot scan out a blob")]
+    NoBlobScanout,
     #[error("the display engine faulted")]
     DeviceFault,
     #[error("this program's heap cannot supply the frame buffer: {0}")]
@@ -66,6 +68,7 @@ impl From<raw::Error> for DisplayError {
             raw::Error::TooManySurfaces => Self::TooManySurfaces,
             raw::Error::BadSpan => Self::BadSpan,
             raw::Error::OutOfMemory => Self::OutOfMemory,
+            raw::Error::NoBlobScanout => Self::NoBlobScanout,
             raw::Error::DeviceFault => Self::DeviceFault,
         }
     }
@@ -138,9 +141,60 @@ impl Display {
         })
     }
 
+    /// Scan out an image, retaining its storage until this surface is dropped.
+    pub async fn create_from_image(
+        &self,
+        scanout: u32,
+        image: &crate::image::Image,
+    ) -> Result<ImageSurface, DisplayError> {
+        let layout = image.layout();
+        let raw = self
+            .raw
+            .create_from_image(scanout, image.handle())
+            .await
+            .map_err(DisplayError::from)?;
+        Ok(ImageSurface {
+            raw,
+            mode: Mode {
+                width: layout.width,
+                height: layout.height,
+            },
+        })
+    }
+
     /// Every change to the device's set of outputs, from now on.
     pub fn changed(&self) -> StreamReader<DisplayChange> {
         self.raw.changed()
+    }
+}
+
+/// One output scanning an image whose storage is retained until it is blanked.
+pub struct ImageSurface {
+    raw: raw::Surface,
+    mode: Mode,
+}
+
+impl ImageSurface {
+    /// Display this image again, retiring the output's previous surface.
+    pub async fn activate(&self) -> Result<(), DisplayError> {
+        self.raw.activate().await.map_err(DisplayError::from)
+    }
+
+    /// The mode this surface was created at.
+    pub const fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// Tell the output to re-read `region` of the blob.
+    ///
+    /// Resolves when the display engine has flushed it.
+    pub async fn present(&self, region: Rect) -> Result<FrameToken, DisplayError> {
+        self.raw.present(region).await.map_err(DisplayError::from)
+    }
+
+    /// Every frame this surface publishes.
+    pub fn vsync(&self) -> StreamReader<FrameToken> {
+        self.raw.vsync()
     }
 }
 
@@ -155,6 +209,15 @@ pub struct Surface {
 }
 
 impl Surface {
+    /// Display this framebuffer again, retiring the output's previous surface.
+    pub async fn activate(&self) -> Result<(), DisplayError> {
+        self.frame
+            .resource()
+            .activate()
+            .await
+            .map_err(DisplayError::from)
+    }
+
     /// The mode this surface was created at.
     pub const fn mode(&self) -> Mode {
         self.mode

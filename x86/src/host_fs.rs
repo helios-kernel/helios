@@ -7,33 +7,22 @@
 //! arrive on the device's MSI-X vector, so callers await a notification
 //! instead of polling the used ring.
 
-extern crate alloc;
-
-use alloc::sync::Arc;
-
-use helios_hal::dma::BufResult;
-use helios_hal::io::IoError;
-use helios_kernel::{ExternalInterruptHandler, HostFsTransport};
-use helios_virtio::{DeviceType, TransportBuffer, Virtio9pDevice, VirtioPciTransport};
+use helios_kernel::{HostFsTransport, Virtio9pTransport};
+use helios_virtio::{DeviceType, VirtioPciTransport};
 use pci_types::PciAddress;
 
 use crate::debug_state::RuntimeState;
 use crate::iommu::X86DmaPool;
-use crate::pci::PciRoot;
+use crate::pci::{PciRoot, VirtioFunctions};
 
-type X86Virtio9pDevice = Virtio9pDevice<VirtioPciTransport<X86DmaPool>>;
+pub(crate) type HostFsTransportService = Virtio9pTransport<VirtioPciTransport<X86DmaPool>>;
 
 pub(crate) type HostFileSystemService =
     helios_kernel::HostFsClient<HostFsTransportService, crate::X86Cpu>;
 
-#[derive(Clone)]
-pub(crate) struct HostFsTransportService {
-    device: Arc<X86Virtio9pDevice>,
-}
-
 /// The PCI function that carries the platform's virtio-9p host share.
-pub(crate) fn discover(pci: &PciRoot) -> Option<PciAddress> {
-    pci.find_virtio_function(DeviceType::_9P)
+pub(crate) fn discover(virtio: &VirtioFunctions) -> Option<PciAddress> {
+    virtio.find_virtio_function(DeviceType::_9P)
 }
 
 /// Brings up the virtio-9p function at `address` and installs the host
@@ -52,9 +41,7 @@ pub(crate) fn install(
         .unwrap_or_else(|error| {
             panic!("failed to initialize the virtio-9p function at {address}: {error}")
         });
-    let transport = HostFsTransportService {
-        device: Arc::new(device),
-    };
+    let transport = Virtio9pTransport::new(device);
     debug_state.install_host_fs_service(HostFileSystemService::new(
         transport.clone(),
         cpu.clone(),
@@ -62,41 +49,8 @@ pub(crate) fn install(
     ));
     tracing::info!(
         "virtio 9p online transport=pci function={address} msix_vector={vector:#x} mount_tag={}",
-        transport.device.mount_tag()
+        transport.mount_tag()
     );
     transport
 }
 
-impl ExternalInterruptHandler for HostFsTransportService {
-    fn handle_interrupt(&self) {
-        self.device.handle_interrupt();
-    }
-}
-
-impl HostFsTransport for HostFsTransportService {
-    fn mount_tag(&self) -> &str {
-        self.device.mount_tag()
-    }
-
-    fn pipeline_depth(&self) -> usize {
-        self.device.pipeline_depth()
-    }
-
-    type Buffer = TransportBuffer<VirtioPciTransport<X86DmaPool>>;
-
-    fn buffer(&self, capacity: usize) -> Result<Self::Buffer, IoError> {
-        self.device.buffer(capacity)
-    }
-
-    async fn request(
-        &self,
-        request: Self::Buffer,
-        request_len: usize,
-        response: Self::Buffer,
-        response_len: usize,
-    ) -> BufResult<usize, (Self::Buffer, Self::Buffer)> {
-        self.device
-            .request(request, request_len, response, response_len)
-            .await
-    }
-}

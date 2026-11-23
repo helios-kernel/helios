@@ -175,7 +175,7 @@ the instrumented x86-64 kernel, runs the compiler workload and the
 suite's non-network classes on it under KVM and merges every `.profraw`
 into one `helios-kernel.profdata`; the job uploads that as the
 `helios-kernel-profdata` artifact, which is the profile every x86-64
-release build spends (#226). It runs on every push to `dev` that touches
+release build spends (#226). It runs on every push to `main` that touches
 what the image is built from — the kernel crates and the layers below
 them, the backend, the root crate, the guest programs, the workload
 manifest and the WASI apps, the collection sequence, the Wasmtime pin
@@ -507,7 +507,7 @@ a release ships would not be the kernel `suite-pgo` measured.
 
 The refresh cadence is the push collection above, not the release: a
 profile goes stale in its counts long before it goes stale in its
-hashes, and silently, so `kernel-profile.yml` collects on every `dev`
+hashes, and silently, so `kernel-profile.yml` collects on every `main`
 merge that moves the kernel and runs monthly regardless. A release
 attaches the profile its own kernel was built with so that the released
 image can be reproduced, and a release build between releases reads the

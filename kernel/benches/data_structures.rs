@@ -1,3 +1,5 @@
+use helios_unix::FutexTable;
+use helios_unix::{DescriptorId, DescriptorTable, FutexKey, GuestAddress, ProcessMemoryIdentity};
 extern crate alloc;
 
 use alloc::string::{String, ToString};
@@ -7,17 +9,17 @@ use divan::counter::ItemsCount;
 use divan::{AllocProfiler, Bencher, black_box};
 use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase, TimerInterrupt};
 use helios_hal::fs::FileRights;
+use helios_hal::numa::{NodeId, SingleNode};
 use helios_hal::resource::KernelResource;
 use helios_hal::watchdog::ProgressCounter;
 use helios_kernel::SocketReadiness;
 use helios_kernel::{
-    ComponentNetworkService, DescriptorId, DescriptorTable, DnsError, DnsErrorKind, Executor,
-    FutexKey, FutexTable, GuestAddress, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
-    NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
-    NetworkIpAddress, NetworkPortId, Notify, PingError, PingErrorKind, PingReply,
-    ProcessMemoryIdentity, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
-    TcpWriteProgress, TryRead, TryWrite, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
-    byte_channel,
+    ComponentNetworkService, DnsError, DnsErrorKind, Executor, HttpsRecord, Ipv4Address, Ipv4Cidr,
+    Ipv4Route, MacAddress, NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError,
+    NetworkErrorDetail, NetworkIpAddress, NetworkPortId, NodeRun, Notify, PingError, PingErrorKind,
+    PingReply, RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind, TcpListener,
+    TcpReadInto, TryRead, TryWrite, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    UserMemoryPool, byte_channel,
 };
 use spin::{Mutex, Once};
 
@@ -80,6 +82,30 @@ impl helios_hal::critical_section::LocalInterruptMask for BenchInterruptMask {
 }
 
 helios_hal::critical_section::set_local_interrupt_mask_impl!(BenchInterruptMask);
+
+/// Processor 0's executor on the one-processor machine this bench
+/// models, which has no NUMA description. The pool is leaked over one
+/// naturally aligned host block: the kernel holds it for the machine's
+/// life, and the bench process is that.
+fn bench_executor() -> Executor {
+    const BLOCK_BYTES: usize = 64 << 20;
+    let layout =
+        core::alloc::Layout::from_size_align(BLOCK_BYTES, BLOCK_BYTES).expect("bench pool layout");
+    // SAFETY: a non-zero layout, leaked for the process's life.
+    let start = unsafe { alloc::alloc::alloc(layout) } as usize;
+    assert!(start != 0, "host allocation for the bench pool failed");
+    let runs = [NodeRun {
+        start,
+        end: start + BLOCK_BYTES,
+        node: NodeId::new(0),
+    }];
+    let pool = Box::leak(Box::new(UserMemoryPool::new(
+        &SingleNode::new(1),
+        ProcessorId::new(0),
+        &runs,
+    )));
+    Executor::new(ProgressCounter::new(), pool, ProcessorId::new(0))
+}
 
 #[divan::bench(args = [16usize, 64, 256])]
 fn descriptor_insert_close_reuse(bencher: Bencher, count: usize) {
@@ -341,7 +367,7 @@ fn drain_byte_channel(reader: helios_kernel::ByteReader, count: usize) {
 fn futex_prepare_complete_distinct_keys(bencher: Bencher, count: usize) {
     let memory = ProcessMemoryIdentity::new(1);
     bencher.counter(ItemsCount::new(count)).bench_local(|| {
-        let mut table = FutexTable::new();
+        let table = FutexTable::new();
         let mut registrations = [const { None }; 64];
         for (index, registration) in registrations.iter_mut().take(count).enumerate() {
             *registration = Some(table.prepare_wait(FutexKey::new(
@@ -352,23 +378,20 @@ fn futex_prepare_complete_distinct_keys(bencher: Bencher, count: usize) {
                 registration
                     .as_ref()
                     .expect("futex bench registration should be present")
-                    .notify(),
+                    .is_released(),
             );
         }
-        for registration in registrations.into_iter().take(count).flatten() {
-            table.complete_wait(registration);
-        }
+        // Dropping a registration completes it.
+        drop(registrations);
     });
 }
 
 #[divan::bench(args = [1usize, 64, 1024])]
 fn timer_sleep_future_create_drop(bencher: Bencher, count: usize) {
-    let timer =
-        Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0)).timer(BenchCpu::new());
+    let timer = bench_executor().timer(BenchCpu::new());
     // Created-but-never-polled sleeps model timeout candidates that lose a
-    // select/race before the executor parks the task. They must not allocate;
-    // pending sleeps still allocate one timer state until the sleep-state pool
-    // is designed around the timer wheel ownership boundary.
+    // select/race before the executor parks the task. They must not allocate,
+    // and neither does a pending sleep: it links the wheel node it carries.
     bencher.counter(ItemsCount::new(count)).bench_local(|| {
         for _ in 0..count {
             black_box(timer.sleep_for(core::time::Duration::from_micros(500)));
@@ -407,7 +430,7 @@ fn notify_coalesced_presignaled_future_wait(bencher: Bencher, count: usize) {
 
 #[divan::bench(args = [1usize, 64, 1024])]
 fn executor_spawn_detached_run_global(bencher: Bencher, count: usize) {
-    let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+    let executor = bench_executor();
     let spawner = executor.spawner(BenchCpu::new());
     let timer = executor.timer(BenchCpu::new());
     // Task allocation includes the scheduler capture stored by async-task. This
@@ -426,7 +449,7 @@ fn executor_spawn_detached_run_global(bencher: Bencher, count: usize) {
 
 #[divan::bench(args = [1usize, 64, 1024])]
 fn executor_spawn_detached_run_local(bencher: Bencher, count: usize) {
-    let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+    let executor = bench_executor();
     let spawner = executor.spawner(BenchCpu::new());
     let timer = executor.timer(BenchCpu::new());
     // Local tasks still carry owner-processor routing state, so the scheduler
@@ -584,6 +607,10 @@ impl ComponentNetworkService for BenchNetworkService {
         [2, 0, 0, 0, 0, 1]
     }
 
+    fn owns_ip_address(&self, _address: NetworkIpAddress) -> bool {
+        false
+    }
+
     fn revalidate_lease(&self) -> impl Future<Output = ()> + Send + '_ {
         core::future::ready(())
     }
@@ -602,6 +629,43 @@ impl ComponentNetworkService for BenchNetworkService {
         _timeout_nanos: u64,
     ) -> Result<alloc::vec::Vec<NetworkIpAddress>, DnsError> {
         Err(bench_dns_error())
+    }
+
+    async fn dns_resolve_https(
+        &self,
+        _host: &str,
+        _port: u16,
+        _timeout_nanos: u64,
+    ) -> Result<Option<HttpsRecord>, DnsError> {
+        Err(bench_dns_error())
+    }
+
+    fn dns_servers(&self) -> alloc::vec::Vec<NetworkIpAddress> {
+        alloc::vec::Vec::new()
+    }
+
+    async fn tcp_connect_start(
+        &self,
+        _remote_address: NetworkIpAddress,
+        _port: u16,
+        _local_port: u16,
+        _hop_limit: u8,
+    ) -> Result<(Self::TcpStream, helios_kernel::TcpConnectPoll), TcpError> {
+        Err(bench_tcp_error())
+    }
+
+    async fn tcp_connect_poll(
+        &self,
+        _stream: Self::TcpStream,
+    ) -> Result<helios_kernel::TcpConnectPoll, TcpError> {
+        Err(bench_tcp_error())
+    }
+
+    fn tcp_local_endpoint(
+        &self,
+        _stream: Self::TcpStream,
+    ) -> Result<Option<(NetworkIpAddress, u16)>, TcpError> {
+        Err(bench_tcp_error())
     }
 
     async fn tcp_connect(
@@ -719,30 +783,24 @@ impl ComponentNetworkService for BenchNetworkService {
         Ok(Some(self.payload.clone()))
     }
 
-    fn tcp_try_read(
-        &self,
+    async fn tcp_read_into<'a>(
+        &'a self,
         _stream: Self::TcpStream,
-        _max_bytes: usize,
-    ) -> Result<TcpReadProgress, TcpError> {
-        Ok(TcpReadProgress::Data(self.payload.clone()))
+        buffer: &'a mut RegisteredTcpReadBuffer<'_>,
+        _timeout_nanos: u64,
+    ) -> Result<TcpReadInto, TcpError> {
+        Ok(TcpReadInto::Data(
+            helios_netstack::TcpReceiveBuffer::write_from(buffer, &self.payload),
+        ))
     }
 
-    fn tcp_send_room(&self, _stream: Self::TcpStream) -> Result<TcpWriteProgress, TcpError> {
-        Ok(TcpWriteProgress::Room(usize::MAX))
-    }
-
-    fn tcp_try_write(
-        &self,
-        _stream: Self::TcpStream,
-        bytes: &mut Bytes,
-    ) -> Result<TcpWriteProgress, TcpError> {
-        let written = bytes.len();
-        bytes.clear();
-        Ok(TcpWriteProgress::Room(written))
-    }
-
-    async fn tcp_write_ready(&self, _stream: Self::TcpStream) -> Result<(), TcpError> {
-        Ok(())
+    async fn tcp_peek_into<'a>(
+        &'a self,
+        stream: Self::TcpStream,
+        buffer: &'a mut RegisteredTcpReadBuffer<'_>,
+        timeout_nanos: u64,
+    ) -> Result<TcpReadInto, TcpError> {
+        self.tcp_read_into(stream, buffer, timeout_nanos).await
     }
 
     async fn tcp_shutdown_send(&self, _stream: Self::TcpStream) -> Result<(), TcpError> {
@@ -753,7 +811,11 @@ impl ComponentNetworkService for BenchNetworkService {
 
     fn tcp_listener_close(&self, _listener: Self::TcpListener) {}
 
-    async fn udp_bind(&self, local_port: u16) -> Result<UdpBinding<Self::UdpSocket>, UdpError> {
+    async fn udp_bind(
+        &self,
+        _local_address: NetworkIpAddress,
+        local_port: u16,
+    ) -> Result<UdpBinding<Self::UdpSocket>, UdpError> {
         Ok(UdpBinding {
             socket: 1,
             local_port,
@@ -791,6 +853,15 @@ impl ComponentNetworkService for BenchNetworkService {
         Err(bench_udp_error())
     }
 
+    async fn udp_peek(
+        &self,
+        socket: Self::UdpSocket,
+        max_bytes: u32,
+        timeout_nanos: u64,
+    ) -> Result<Option<UdpDatagram>, UdpError> {
+        self.udp_receive(socket, max_bytes, timeout_nanos).await
+    }
+
     async fn udp_join_multicast_v4(
         &self,
         _group: Ipv4Address,
@@ -811,6 +882,8 @@ impl ComponentNetworkService for BenchNetworkService {
 }
 
 impl Cpu for BenchCpu {
+    type Hypervisor = core::convert::Infallible;
+    type Native = core::convert::Infallible;
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
     fn processor_count(&self) -> usize {
@@ -836,6 +909,14 @@ impl Cpu for BenchCpu {
     fn start_processor(&self, _processor: ProcessorId) {}
 
     fn wake_processor(&self, _processor: ProcessorId) {}
+
+    fn stop_current(&self) {
+        panic!("bench CPU never stops a processor")
+    }
+
+    fn restart_processor(&self, _processor: ProcessorId) {
+        panic!("bench CPU never restarts a processor")
+    }
 
     fn now(&self) -> Instant {
         Instant::new(0)

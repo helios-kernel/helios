@@ -42,7 +42,7 @@ use crate::buffer::{Span, ViewError};
 use crate::wasmtime_adapter::bindings::device::bindings::helios::system::device as device_wit;
 use crate::{DeviceName, DmaBufferHandle, GrantError, GrantHandle, InterruptRelay, NotifyWaiter};
 
-use super::{StoreData, guest_memory, view_trap};
+use super::{StoreData, caller_memory, view_trap};
 
 /// Register `helios:system/device` in a linker.
 ///
@@ -52,39 +52,17 @@ use super::{StoreData, guest_memory, view_trap};
 /// `available` lists only the devices it names. An ordinary program
 /// importing it therefore sees the machine as one with no granted
 /// devices, whether or not the machine has any.
-pub(super) fn add_device_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+pub(super) fn add_device_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    device_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(linker, |state| state)
-}
-
-/// Record the runtime's handle on an instance's linear memory.
-///
-/// Called once, right after the instance is built, on every component
-/// the kernel runs. Every call that later takes a span reads the
-/// memory's base and current size through this handle at the moment of
-/// the call.
-///
-/// A component that lowers through a shared memory, or through more
-/// than one, records nothing: the runtime does not hand a shared memory
-/// back as an unshared one, and every span such an instance names is
-/// refused, because nothing may be shown in memory another processor
-/// is running code against.
-pub(crate) fn record_linear_memory<CpuImpl, Net, HostFs>(
-    mut store: impl wasmtime::AsContextMut<Data = StoreData<CpuImpl, Net, HostFs>>,
-    instance: &wasmtime::component::Instance,
-) where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
-    let memory = instance.get_default_memory(store.as_context_mut());
-    store.as_context_mut().data_mut().linear_memory = memory;
+    device_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(linker, |state| {
+        state
+    })
 }
 
 const fn span(at: device_wit::Span) -> Span {
@@ -149,17 +127,18 @@ fn to_wit_region(region: &DeviceRegion) -> device_wit::Region {
         kind: match region.attributes.kind {
             MemoryKind::Device => device_wit::MemoryKind::Device,
             MemoryKind::Normal => device_wit::MemoryKind::Normal,
+            MemoryKind::WriteCombining => device_wit::MemoryKind::WriteCombining,
         },
         writable: region.attributes.writable,
         prefetchable: region.attributes.prefetchable,
     }
 }
 
-impl<CpuImpl, Net, HostFs> device_wit::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> device_wit::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn claim(
         &mut self,
@@ -214,11 +193,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> device_wit::HostGrant for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> device_wit::HostGrant for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn name(&mut self, handle: Resource<GrantHandle>) -> wasmtime::Result<String> {
         Ok(self.table.get(&handle)?.device().as_str().to_string())
@@ -286,11 +265,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> device_wit::HostDmaBuffer for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> device_wit::HostDmaBuffer for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn physical_address(&mut self, handle: Resource<DmaBufferHandle>) -> wasmtime::Result<u64> {
         Ok(self.table.get(&handle)?.buffer().device_address)
@@ -306,11 +285,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     /// Run `act` against the relay of the device `handle` names.
     fn with_relay<Act>(
@@ -337,33 +316,33 @@ where
 /// relay through it. That is what keeps the lease single-owned and lets
 /// a reclaim end the stream rather than race it — once the lease is
 /// gone the stream reports the device is gone too.
-struct InterruptStreamProducer<T, CpuImpl, Net, HostFs>
+struct InterruptStreamProducer<T, CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
+    getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, StorageImpl>,
     device: DeviceName,
     waiter: Option<NotifyWaiter>,
 }
 
-impl<T, CpuImpl, Net, HostFs> Unpin for InterruptStreamProducer<T, CpuImpl, Net, HostFs>
+impl<T, CpuImpl, Net, StorageImpl> Unpin for InterruptStreamProducer<T, CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
 }
 
-impl<T, CpuImpl, Net, HostFs> InterruptStreamProducer<T, CpuImpl, Net, HostFs>
+impl<T, CpuImpl, Net, StorageImpl> InterruptStreamProducer<T, CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     const fn new(
-        getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, HostFs>,
+        getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, StorageImpl>,
         device: DeviceName,
     ) -> Self {
         Self {
@@ -374,12 +353,13 @@ where
     }
 }
 
-impl<T, CpuImpl, Net, HostFs> StreamProducer<T> for InterruptStreamProducer<T, CpuImpl, Net, HostFs>
+impl<T, CpuImpl, Net, StorageImpl> StreamProducer<T>
+    for InterruptStreamProducer<T, CpuImpl, Net, StorageImpl>
 where
     T: 'static,
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     type Item = device_wit::InterruptEvent;
     type Buffer = Option<Self::Item>;
@@ -423,13 +403,13 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> device_wit::HostGrantWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> device_wit::HostGrantWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     U: 'static,
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn interrupts(
         mut accessor: Access<'_, U, Self>,
@@ -446,12 +426,11 @@ where
         index: u32,
         at: device_wit::Span,
     ) -> wasmtime::Result<Result<(), device_wit::Error>> {
-        let data = accessor.get();
-        let device = *data.table.get(&handle)?.device();
-        let linear_memory = data.linear_memory;
+        let device = *accessor.get().table.get(&handle)?.device();
         // Read now, at the call: the span is checked against the size
-        // the memory has at this moment, not when it was built.
-        let memory = guest_memory(linear_memory, &accessor);
+        // the calling subcomponent's memory has at this moment, not when
+        // it was built.
+        let memory = caller_memory(&accessor);
         let data = accessor.get();
         let lease = match data.device.lease_for_mut(&device) {
             Ok(lease) => lease,
@@ -472,10 +451,8 @@ where
         align: u64,
         at: device_wit::Span,
     ) -> wasmtime::Result<Result<Resource<DmaBufferHandle>, device_wit::Error>> {
-        let data = accessor.get();
-        let device = *data.table.get(&handle)?.device();
-        let linear_memory = data.linear_memory;
-        let memory = guest_memory(linear_memory, &accessor);
+        let device = *accessor.get().table.get(&handle)?.device();
+        let memory = caller_memory(&accessor);
         let data = accessor.get();
         let lease = match data.device.lease_for_mut(&device) {
             Ok(lease) => lease,

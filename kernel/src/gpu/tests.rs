@@ -1,4 +1,4 @@
-//! The 3D path's own tests.
+//! The 3D subsystem's own tests.
 //!
 //! The device side is a recording fake: every call the owner tasks make
 //! is appended to a log, so a test asserts on the exact sequence the
@@ -7,37 +7,47 @@
 //! `device::platform`'s test hooks install, so a test can also see when
 //! a buffer's run was taken, shown and given back.
 
+use crate::{SignalTimeline, Timeline, TimelineError, TimelineSource};
 use alloc::vec::Vec;
 use core::future::Future;
+use core::num::NonZeroU32;
 use core::pin::pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::task::{Context as TaskContext, Poll, Waker};
+use std::task::Wake;
 
 use futures::channel::oneshot;
 use futures_lite::future::{block_on, poll_once};
 use helios_hal::device::{DeviceRegion, DeviceRegionAttributes};
 use helios_hal::display::{
-    BlobId, BlobMemory, BlobRequest, BlobUsage, CapsetId, CapsetInfo, CapsetList, ContextId,
-    ContextName, FenceId, Gpu3d, Gpu3dError, Gpu3dResult,
+    BlobId, BlobMemory, BlobRequest, BlobUsage, CapsetId, CapsetInfo, CapsetList, CommandStream,
+    ContextId, ContextName, DisplayMode, FenceId, Gpu3d, Gpu3dCapabilities, Gpu3dError,
+    Gpu3dResult, PixelFormat, RingCount, RingIndex, Submission,
 };
 use helios_hal::io::IoError;
 use helios_hal::iommu::PhysicalRange;
 use helios_hal::vmm::VirtAddr;
-use std::sync::Mutex;
+use std::sync::{Arc as WakeArc, Mutex};
 use triomphe::Arc;
 
 use crate::buffer::{Buffer, GuestMemory, Span, ViewTable, WASM_PAGE_BYTES};
 use crate::component::ProviderReceiver;
 use crate::device::test_hooks;
-use crate::display::SequenceSignal;
 use crate::process::test_caps;
 use crate::test_support::TestCpu;
 
 use super::owner::{gpu3d_channels, serve_control, serve_submit};
-use super::service::{Gpu3dRequest, Gpu3dService, Gpu3dShared, SubmitRequest};
-use super::{Gpu3dOwnership, Gpu3dServiceError, MAX_GPU_VIEWS};
+use super::service::{
+    BlobCreate, BlobMapping, CompletionSignal, ControlMessage, Gpu3dService, Gpu3dShared, GpuBlob,
+    GpuContext, InlineCommands, SubmitCommands, SubmitCompletion, SubmitMessage,
+};
+#[cfg(feature = "wasmtime-runtime")]
+use super::service::{BlobShared, ContextShared};
+use super::{
+    Gpu3dOwnership, Gpu3dServiceError, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_VIEWS,
+    MAX_MACHINE_GPU_BLOBS, MAX_MACHINE_GPU_CONTEXTS,
+};
 
-/// Where the tests pretend the claiming instance's memory sits, and how
-/// far it has grown.
 const MEMORY_BASE: usize = 0x1_0000_0000;
 const MEMORY_BYTES: u64 = 64 * WASM_PAGE_BYTES;
 
@@ -45,62 +55,57 @@ fn memory() -> GuestMemory {
     GuestMemory::new(VirtAddr::new(MEMORY_BASE), MEMORY_BYTES)
 }
 
-/// `pages` wasm pages of the instance's memory starting at page `first`.
 const fn pages(first: u64, pages: u64) -> Span {
     Span::new(first * WASM_PAGE_BYTES, pages * WASM_PAGE_BYTES)
 }
 
-/// A command buffer or a guest blob's storage, as the host functions pin
-/// one.
 fn pinned(bytes: u64) -> Buffer {
     Buffer::pinned(bytes).expect("the test pool has room")
 }
 
-/// The capset the fake renderer speaks.
 const CAPSET: CapsetId = CapsetId::VENUS;
+const CAPSET_MAX_VERSION: u32 = 1;
+const APERTURE: u64 = 0x8_0000_0000;
 
-/// One thing the display engine's rendering half was asked to do.
+const fn test_capabilities(renders: bool) -> Gpu3dCapabilities {
+    Gpu3dCapabilities {
+        renders,
+        blobs: renders,
+        host_visible: renders,
+        context_init: renders,
+        cross_device: false,
+        blob_alignment: None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Call {
     Capsets,
     Capset(CapsetId, u32),
-    CreateContext(CapsetId),
+    CreateContext(CapsetId, u8),
     DestroyContext(ContextId),
-    CreateBlob(ContextId, BlobMemory, u64),
+    CreateBlob(ContextId, BlobMemory, u64, u64),
     DestroyBlob(BlobId),
     MapBlob(BlobId),
     UnmapBlob(BlobId),
     Attach(ContextId, BlobId),
     Detach(ContextId, BlobId),
-    Submit(ContextId, FenceId),
+    Submit(ContextId, u8, Option<FenceId>),
 }
 
-/// A display engine that records what its rendering half was asked and
-/// always agrees.
 struct FakeGpu3d {
     calls: Mutex<Vec<Call>>,
-    /// The capability-set payload [`Gpu3d::capset`] writes back.
     capset_bytes: Vec<u8>,
-    /// Set to make every submission fail, as a device refusing a
-    /// command stream does.
-    refuse_submits: AtomicBool,
-    /// When `Some`, `submit` records the call and then parks on the
-    /// receiver until the test lets it answer — a device still working
-    /// on a chain it was given.
+    refuse_context: Mutex<Option<ContextId>>,
+    refuse_before_post: AtomicBool,
     submit_hold: Mutex<Option<oneshot::Receiver<()>>>,
-    /// Set to make every submission end in a transport error, as a
-    /// faulted queue does: the chain is left published and nothing
-    /// answers it.
     transport_fault_submits: AtomicBool,
-    /// Like `submit_hold`, for `destroy_blob`.
     destroy_hold: Mutex<Option<oneshot::Receiver<()>>>,
-    /// Set to make every blob destroy fail.
     refuse_destroy: AtomicBool,
-    /// Set to make every blob unmap fail.
     refuse_unmap: AtomicBool,
-    /// Set to make every blob create fail: an answered refusal when
-    /// false is stored with it, a transport error when true.
     fail_creates: Mutex<Option<bool>>,
+    map_attributes: DeviceRegionAttributes,
+    capabilities: Gpu3dCapabilities,
     next_context: Mutex<u32>,
     next_blob: Mutex<u32>,
 }
@@ -110,13 +115,16 @@ impl FakeGpu3d {
         Self {
             calls: Mutex::new(Vec::new()),
             capset_bytes: alloc::vec![0xde, 0xad, 0xbe, 0xef],
-            refuse_submits: AtomicBool::new(false),
+            refuse_context: Mutex::new(None),
+            refuse_before_post: AtomicBool::new(false),
             submit_hold: Mutex::new(None),
             transport_fault_submits: AtomicBool::new(false),
             destroy_hold: Mutex::new(None),
             refuse_destroy: AtomicBool::new(false),
             refuse_unmap: AtomicBool::new(false),
             fail_creates: Mutex::new(None),
+            map_attributes: DeviceRegionAttributes::PREFETCHABLE_MEMORY,
+            capabilities: test_capabilities(true),
             next_context: Mutex::new(1),
             next_blob: Mutex::new(1),
         }
@@ -129,11 +137,15 @@ impl FakeGpu3d {
     fn calls(&self) -> Vec<Call> {
         self.calls.lock().expect("no test panics here").clone()
     }
+
+    fn saw(&self, call: &Call) -> bool {
+        self.calls().contains(call)
+    }
 }
 
 impl Gpu3d for FakeGpu3d {
-    fn renders(&self) -> bool {
-        true
+    fn capabilities(&self) -> Gpu3dCapabilities {
+        self.capabilities
     }
 
     async fn capsets(&self) -> Gpu3dResult<CapsetList> {
@@ -141,7 +153,7 @@ impl Gpu3d for FakeGpu3d {
         let mut list = CapsetList::new();
         list.push(CapsetInfo {
             id: CAPSET,
-            max_version: 1,
+            max_version: CAPSET_MAX_VERSION,
             max_size: 4,
         });
         Ok(list)
@@ -154,14 +166,19 @@ impl Gpu3d for FakeGpu3d {
         Ok(written)
     }
 
-    async fn create_context(&self, capset: CapsetId, _name: ContextName) -> Gpu3dResult<ContextId> {
+    async fn create_context(
+        &self,
+        capset: CapsetId,
+        rings: RingCount,
+        _name: ContextName,
+    ) -> Gpu3dResult<ContextId> {
         let id = {
             let mut next = self.next_context.lock().expect("no test panics here");
             let id = ContextId::new(*next);
             *next += 1;
             id
         };
-        self.record(Call::CreateContext(capset));
+        self.record(Call::CreateContext(capset, rings.get()));
         Ok(id)
     }
 
@@ -181,6 +198,7 @@ impl Gpu3d for FakeGpu3d {
             request.context,
             request.memory,
             request.size,
+            request.blob_id,
         ));
         match *self.fail_creates.lock().expect("no test panics here") {
             Some(true) => Err(Gpu3dError::Transport(IoError::DeviceFault)),
@@ -208,8 +226,8 @@ impl Gpu3d for FakeGpu3d {
     async fn map_blob(&self, blob: BlobId) -> Gpu3dResult<DeviceRegion> {
         self.record(Call::MapBlob(blob));
         Ok(DeviceRegion::new(
-            PhysicalRange::new(0x8_0000_0000, 0x1000),
-            DeviceRegionAttributes::PREFETCHABLE_MEMORY,
+            PhysicalRange::new(APERTURE, 0x1000),
+            self.map_attributes,
         ))
     }
 
@@ -231,13 +249,27 @@ impl Gpu3d for FakeGpu3d {
         Ok(())
     }
 
-    async fn submit(
-        &self,
-        context: ContextId,
-        commands: PhysicalRange,
-        fence: FenceId,
-    ) -> Gpu3dResult<()> {
-        self.record(Call::Submit(context, fence));
+    async fn submit<'a, Posted>(
+        &'a self,
+        submission: Submission<'a>,
+        posted: &'a mut Posted,
+    ) -> Gpu3dResult<()>
+    where
+        Posted: FnMut() + Send,
+    {
+        self.record(Call::Submit(
+            submission.context,
+            submission.ring.raw(),
+            submission.fence,
+        ));
+        match submission.commands {
+            CommandStream::Pages(range) => assert!(range.bytes > 0, "a command run covers bytes"),
+            CommandStream::Inline(bytes) => assert!(!bytes.is_empty(), "a stream has bytes"),
+        }
+        if self.refuse_before_post.load(Ordering::Relaxed) {
+            return Err(Gpu3dError::Unspecified);
+        }
+        posted();
         let hold = self.submit_hold.lock().expect("no test panics here").take();
         if let Some(hold) = hold {
             let _ = hold.await;
@@ -245,30 +277,37 @@ impl Gpu3d for FakeGpu3d {
         if self.transport_fault_submits.load(Ordering::Relaxed) {
             return Err(Gpu3dError::Transport(IoError::DeviceFault));
         }
-        if self.refuse_submits.load(Ordering::Relaxed) {
+        if *self.refuse_context.lock().expect("no test panics here") == Some(submission.context) {
             return Err(Gpu3dError::Unspecified);
         }
-        assert!(commands.bytes > 0, "a command buffer covers bytes");
         Ok(())
     }
 
-    async fn fences(&self, _context: ContextId, after: FenceId) -> Gpu3dResult<FenceId> {
-        // The kernel never asks the device for a fence: the submit
-        // server's completion is the signal. Resolving with the point
-        // asked after keeps a stray caller honest without parking it.
+    async fn fences(
+        &self,
+        _context: ContextId,
+        _ring: RingIndex,
+        after: FenceId,
+    ) -> Gpu3dResult<FenceId> {
         Ok(after)
     }
 }
 
-/// Run `work` with both servers running beside it.
-///
-/// The servers never return, so the result is the work's; what they are
-/// there for is to answer the requests the work makes.
+fn channels(
+    renders: bool,
+) -> (
+    Arc<Gpu3dShared>,
+    ProviderReceiver<ControlMessage>,
+    ProviderReceiver<SubmitMessage>,
+) {
+    gpu3d_channels(test_capabilities(renders))
+}
+
 fn with_servers<T>(
     device: &FakeGpu3d,
-    shared: &Gpu3dShared,
-    control: &ProviderReceiver<Gpu3dRequest>,
-    submit: &ProviderReceiver<SubmitRequest>,
+    shared: &Arc<Gpu3dShared>,
+    control: &ProviderReceiver<ControlMessage>,
+    submit: &ProviderReceiver<SubmitMessage>,
     work: impl Future<Output = T>,
 ) -> T {
     let cpu = TestCpu::without_entropy();
@@ -277,7 +316,7 @@ fn with_servers<T>(
         let servers = pin!(async {
             futures::future::join(
                 serve_control(device, shared, control),
-                serve_submit(device, shared, submit, &cpu),
+                serve_submit(device, submit, &cpu),
             )
             .await;
         });
@@ -290,107 +329,730 @@ fn with_servers<T>(
     })
 }
 
-/// A claim whose views go in a set of `views`.
-fn claimed_in(shared: &Arc<Gpu3dShared>, views: &mut ViewTable) -> Gpu3dOwnership {
+fn opened_in(shared: &Arc<Gpu3dShared>, views: &mut ViewTable) -> Gpu3dOwnership {
     let service = Gpu3dService::from_shared(shared.clone());
     let mut ownership = Gpu3dOwnership::new();
     ownership
-        .claim(&service, views.group(), test_caps::gpu())
-        .expect("the engine is free");
+        .open(&service, || views.group(), test_caps::gpu())
+        .expect("the engine renders");
     ownership
 }
 
-/// A claim for a test that shows nothing.
-fn claimed(shared: &Arc<Gpu3dShared>) -> Gpu3dOwnership {
-    claimed_in(shared, &mut ViewTable::new())
+fn opened(shared: &Arc<Gpu3dShared>) -> Gpu3dOwnership {
+    opened_in(shared, &mut ViewTable::new())
 }
 
-/// Ask the control server to open one context for `ownership`.
-async fn create_context(ownership: &Gpu3dOwnership) -> super::ContextRecord {
-    let claim = ownership.claim_ref().expect("the claim is held");
-    let (reply, answer) = oneshot::channel();
-    claim
-        .sender()
-        .control(
-            Gpu3dRequest::CreateContext {
-                generation: claim.generation(),
-                capset: CAPSET,
-                name: ContextName::new(),
-                reply,
-            },
-            answer,
+fn close(ownership: &mut Gpu3dOwnership, views: &mut ViewTable) {
+    let id = ownership.session_ref().expect("the session is open").id();
+    ownership
+        .close(id, views)
+        .expect("the test pool refills anything");
+}
+
+async fn request_context(
+    ownership: &Gpu3dOwnership,
+    capset: CapsetId,
+    rings: u8,
+) -> Result<GpuContext, Gpu3dServiceError> {
+    ownership
+        .session_ref()?
+        .create_context(
+            capset,
+            RingCount::new(rings).expect("the test names a ring count in range"),
+            ContextName::new(),
         )
+        .await
+}
+
+async fn create_context(ownership: &Gpu3dOwnership) -> GpuContext {
+    request_context(ownership, CAPSET, 1)
         .await
         .expect("the fake engine agrees")
 }
 
-/// An instance is refused the engine another instance holds, and is
-/// still refused while the first owner's resources are being handed
-/// back: the engine is not free until the display engine says it is.
-#[test]
-fn a_second_instance_is_refused_the_engine_the_first_holds() {
-    test_hooks::install();
-    let (shared, _control, _submit) = gpu3d_channels(true);
-    let service = Gpu3dService::from_shared(shared.clone());
-
-    let first = service.claim(test_caps::gpu()).expect("the engine is free");
-    assert_eq!(
-        service.claim(test_caps::gpu()).err(),
-        Some(Gpu3dServiceError::AlreadyClaimed)
-    );
-
-    drop(first);
-    assert_eq!(
-        service.claim(test_caps::gpu()).err(),
-        Some(Gpu3dServiceError::AlreadyClaimed)
-    );
+async fn request_blob(
+    ownership: &Gpu3dOwnership,
+    context: &GpuContext,
+    memory: BlobMemory,
+    usage: BlobUsage,
+    blob_id: u64,
+) -> Result<GpuBlob, Gpu3dServiceError> {
+    let backing = match memory {
+        BlobMemory::Host3d => None,
+        BlobMemory::Guest | BlobMemory::Host3dGuest => Some(pinned(4096)),
+    };
+    ownership
+        .session_ref()?
+        .create_blob(
+            context,
+            BlobCreate {
+                memory,
+                usage,
+                size: 4096,
+                blob_id,
+                backing,
+            },
+        )
+        .await
 }
 
-/// A device that renders nothing still answers the claim — with
-/// `no-renderer` rather than `unavailable`, because the machine has a
-/// display engine; it simply has no renderer on it.
+async fn new_blob(
+    ownership: &Gpu3dOwnership,
+    context: &GpuContext,
+    memory: BlobMemory,
+    usage: BlobUsage,
+) -> GpuBlob {
+    request_blob(ownership, context, memory, usage, 0)
+        .await
+        .expect("the fake engine agrees")
+}
+
+async fn place(blob: &GpuBlob) -> BlobMapping {
+    blob.map().await.expect("the fake engine agrees")
+}
+
+fn page_commands() -> SubmitCommands {
+    let buffer = pinned(4096);
+    let range = buffer.physical();
+    SubmitCommands::Pages { buffer, range }
+}
+
+async fn submit_on(
+    context: &GpuContext,
+    ring: u8,
+    fence: Option<u64>,
+) -> Result<(), Gpu3dServiceError> {
+    context
+        .submit(
+            ring,
+            page_commands(),
+            fence.map(|fence| SubmitCompletion {
+                fence: FenceId::new(fence),
+                signals: Vec::new(),
+            }),
+        )
+        .await
+}
+
+fn retired(context: &GpuContext, ring: u8) -> u64 {
+    context
+        .shared()
+        .timeline(RingIndex::new(ring).expect("the test names a ring in range"))
+        .expect("the context has the ring")
+        .signal()
+        .sequence()
+}
+
+async fn settle() {
+    for _ in 0..16 {
+        crate::yield_now().await;
+    }
+}
+
 #[test]
-fn an_engine_that_renders_nothing_cannot_be_claimed() {
+fn an_engine_that_renders_nothing_cannot_be_opened() {
     test_hooks::install();
-    let (shared, _control, _submit) = gpu3d_channels(false);
+    let (shared, _control, _submit) = channels(false);
     let service = Gpu3dService::from_shared(shared);
 
+    assert!(!service.renders());
     assert_eq!(
-        service.claim(test_caps::gpu()).err(),
+        service.open(test_caps::gpu()).err(),
         Some(Gpu3dServiceError::NoRenderer)
     );
-    assert!(!service.is_claimed());
 }
 
-/// One instance holds one engine: a second claim from the same store
-/// would make the release ambiguous.
 #[test]
-fn one_instance_holds_the_engine_once() {
+fn capabilities_and_blob_alignment_are_enforced_by_the_subsystem() {
     test_hooks::install();
-    let (shared, _control, _submit) = gpu3d_channels(true);
+    let mut caps = test_capabilities(true);
+    caps.cross_device = true;
+    caps.blob_alignment = NonZeroU32::new(4096);
+    let (shared, control, submit) = gpu3d_channels(caps);
+    let mut device = FakeGpu3d::new();
+    device.capabilities = caps;
     let service = Gpu3dService::from_shared(shared.clone());
+    assert_eq!(service.capabilities(), caps);
+
+    let session = service.open(test_caps::gpu()).expect("renders");
+    assert_eq!(session.capabilities(), caps);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = session
+            .create_context(CAPSET, RingCount::ONE, ContextName::new())
+            .await
+            .expect("context created");
+        let unaligned = session
+            .create_blob(
+                &context,
+                BlobCreate {
+                    memory: BlobMemory::Host3d,
+                    usage: BlobUsage::MAPPABLE,
+                    size: 4097,
+                    blob_id: 1,
+                    backing: None,
+                },
+            )
+            .await;
+        assert!(matches!(unaligned, Err(Gpu3dServiceError::InvalidBlob)));
+        assert!(
+            !device
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::CreateBlob(..)))
+        );
+
+        let aligned = session
+            .create_blob(
+                &context,
+                BlobCreate {
+                    memory: BlobMemory::Host3d,
+                    usage: BlobUsage::MAPPABLE | BlobUsage::SHAREABLE,
+                    size: 8192,
+                    blob_id: 2,
+                    backing: None,
+                },
+            )
+            .await
+            .expect("aligned blob succeeds");
+        assert_eq!(aligned.size(), 8192);
+        assert_eq!(aligned.memory(), BlobMemory::Host3d);
+        assert_eq!(aligned.usage(), BlobUsage::MAPPABLE | BlobUsage::SHAREABLE);
+    });
+}
+
+#[test]
+fn two_instances_hold_contexts_at_once() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let first = opened(&shared);
+    let second = opened(&shared);
+    assert_ne!(
+        first.session_ref().unwrap().id(),
+        second.session_ref().unwrap().id(),
+        "each instance has a session of its own"
+    );
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let (a, b) = futures::future::join(create_context(&first), create_context(&second)).await;
+        assert_ne!(a.id(), b.id());
+
+        assert_eq!(submit_on(&a, 0, Some(1)).await, Ok(()));
+        assert_eq!(submit_on(&b, 0, Some(1)).await, Ok(()));
+        settle().await;
+        assert_eq!(retired(&a, 0), 1);
+        assert_eq!(retired(&b, 0), 1);
+    });
+}
+
+#[test]
+fn a_second_open_in_one_instance_shares_its_session() {
+    test_hooks::install();
+    let (shared, _control, _submit) = channels(true);
+    let service = Gpu3dService::from_shared(shared);
+    let mut views = ViewTable::new();
     let mut ownership = Gpu3dOwnership::new();
 
-    let group = ViewTable::new().group();
+    let first = ownership
+        .open(&service, || views.group(), test_caps::gpu())
+        .expect("the engine renders");
+    let second = ownership
+        .open(&service, || views.group(), test_caps::gpu())
+        .expect("the engine renders");
+    assert_eq!(first, second, "both handles name one session");
+
     ownership
-        .claim(&service, group, test_caps::gpu())
-        .expect("the engine is free");
+        .close(first, &mut views)
+        .expect("the session showed nothing");
+    assert!(ownership.is_open(), "one handle still holds the session");
+    ownership
+        .close(second, &mut views)
+        .expect("the session showed nothing");
+    assert!(!ownership.is_open(), "the last handle ends it");
+}
+
+#[test]
+fn one_instance_s_end_releases_only_its_own_resources() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let mut views = ViewTable::new();
+    let mut dying = opened_in(&shared, &mut views);
+    let living = opened(&shared);
+    let runs = test_hooks::live_runs();
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let dead = create_context(&dying).await;
+        let kept = create_context(&living).await;
+        let dead_blob = new_blob(&dying, &dead, BlobMemory::Guest, BlobUsage::empty()).await;
+        let dead_blob_id = dead_blob.id();
+        let kept_blob = new_blob(&living, &kept, BlobMemory::Guest, BlobUsage::empty()).await;
+        assert_eq!(test_hooks::live_runs() - runs, 2);
+
+        close(&mut dying, &mut views);
+        settle().await;
+
+        assert!(device.saw(&Call::DestroyBlob(dead_blob_id)));
+        assert!(device.saw(&Call::DestroyContext(dead.id())));
+        assert!(!device.saw(&Call::DestroyBlob(kept_blob.id())));
+        assert!(!device.saw(&Call::DestroyContext(kept.id())));
+        assert_eq!(
+            test_hooks::live_runs() - runs,
+            1,
+            "only the ended session's backing went back to the pool"
+        );
+
+        assert_eq!(submit_on(&kept, 0, Some(1)).await, Ok(()));
+        let _extra = new_blob(&living, &kept, BlobMemory::Host3d, BlobUsage::MAPPABLE).await;
+    });
+}
+
+#[test]
+fn an_instance_holds_at_most_its_share_of_contexts_and_blobs() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = opened(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let mut contexts = Vec::new();
+        for _ in 0..MAX_GPU_CONTEXTS {
+            contexts.push(create_context(&ownership).await);
+        }
+        assert_eq!(
+            request_context(&ownership, CAPSET, 1).await.err(),
+            Some(Gpu3dServiceError::TooManyContexts)
+        );
+
+        let mut blobs = Vec::new();
+        for _ in 0..MAX_GPU_BLOBS {
+            blobs.push(
+                new_blob(
+                    &ownership,
+                    &contexts[0],
+                    BlobMemory::Host3d,
+                    BlobUsage::MAPPABLE,
+                )
+                .await,
+            );
+        }
+        assert_eq!(
+            request_blob(
+                &ownership,
+                &contexts[0],
+                BlobMemory::Host3d,
+                BlobUsage::MAPPABLE,
+                0
+            )
+            .await
+            .err(),
+            Some(Gpu3dServiceError::TooManyBlobs)
+        );
+    });
+}
+
+#[test]
+fn the_machine_holds_at_most_its_tables_of_contexts_and_blobs() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let full_sessions = MAX_MACHINE_GPU_CONTEXTS / MAX_GPU_CONTEXTS;
+    let sessions: Vec<_> = (0..full_sessions).map(|_| opened(&shared)).collect();
+    let late = opened(&shared);
     assert_eq!(
-        ownership.claim(&service, group, test_caps::gpu()).err(),
-        Some(Gpu3dServiceError::AlreadyClaimed)
+        MAX_MACHINE_GPU_BLOBS / MAX_GPU_BLOBS,
+        full_sessions,
+        "the blob table fills at the same session count the context table does"
+    );
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let mut contexts = Vec::new();
+        for session in &sessions {
+            let mut own = Vec::new();
+            for _ in 0..MAX_GPU_CONTEXTS {
+                own.push(create_context(session).await);
+            }
+            contexts.push(own);
+        }
+        assert_eq!(
+            request_context(&late, CAPSET, 1).await.err(),
+            Some(Gpu3dServiceError::ContextsExhausted),
+            "a session holding nothing is refused once the machine's table is full"
+        );
+
+        let given_back = contexts[0].pop().expect("the session holds contexts");
+        drop(given_back);
+        let late_context = create_context(&late).await;
+
+        let mut blobs = Vec::new();
+        for (session, own) in sessions.iter().zip(&contexts) {
+            let context = own.first().expect("the session holds contexts");
+            for _ in 0..MAX_GPU_BLOBS {
+                blobs.push(
+                    new_blob(session, context, BlobMemory::Host3d, BlobUsage::MAPPABLE).await,
+                );
+            }
+        }
+        assert_eq!(
+            request_blob(
+                &late,
+                &late_context,
+                BlobMemory::Host3d,
+                BlobUsage::MAPPABLE,
+                0,
+            )
+            .await
+            .err(),
+            Some(Gpu3dServiceError::BlobsExhausted),
+            "a session holding no blob is refused once the machine's table is full"
+        );
+    });
+}
+
+#[test]
+fn a_stale_fence_is_checked_per_ring() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = opened(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = request_context(&ownership, CAPSET, 2)
+            .await
+            .expect("the fake engine agrees");
+        assert_eq!(submit_on(&context, 0, Some(5)).await, Ok(()));
+        assert_eq!(
+            submit_on(&context, 0, Some(5)).await,
+            Err(Gpu3dServiceError::StaleFence)
+        );
+        assert_eq!(
+            submit_on(&context, 0, Some(4)).await,
+            Err(Gpu3dServiceError::StaleFence)
+        );
+        assert_eq!(
+            submit_on(&context, 1, Some(1)).await,
+            Ok(()),
+            "ring 1 has admitted nothing yet"
+        );
+        assert_eq!(
+            submit_on(&context, 0, None).await,
+            Ok(()),
+            "no fence, nothing to be stale"
+        );
+        assert_eq!(submit_on(&context, 0, Some(6)).await, Ok(()));
+    });
+}
+
+#[test]
+fn a_ring_the_context_was_not_created_with_is_a_bad_ring() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = opened(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = request_context(&ownership, CAPSET, 2)
+            .await
+            .expect("two rings are in range");
+        for ring in [2, 63, 64, u8::MAX] {
+            assert_eq!(
+                submit_on(&context, ring, None).await,
+                Err(Gpu3dServiceError::BadRing),
+                "ring {ring}"
+            );
+        }
+    });
+    assert!(RingCount::new(0).is_none());
+    assert!(RingCount::new(65).is_none());
+}
+
+#[test]
+fn fences_retire_on_the_ring_they_were_submitted_on() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = opened(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = request_context(&ownership, CAPSET, 2)
+            .await
+            .expect("the fake engine agrees");
+        assert!(device.saw(&Call::CreateContext(CAPSET, 2)));
+
+        assert_eq!(submit_on(&context, 0, Some(3)).await, Ok(()));
+        assert_eq!(submit_on(&context, 1, Some(1)).await, Ok(()));
+        assert_eq!(submit_on(&context, 1, None).await, Ok(()));
+        settle().await;
+
+        assert_eq!(retired(&context, 0), 3);
+        assert_eq!(retired(&context, 1), 1);
+        let id = context.id();
+        assert!(device.saw(&Call::Submit(id, 0, Some(FenceId::new(3)))));
+        assert!(device.saw(&Call::Submit(id, 1, Some(FenceId::new(1)))));
+        assert!(device.saw(&Call::Submit(id, 1, None)));
+    });
+}
+
+#[test]
+fn an_inline_stream_reaches_the_device() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = opened(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let inline = InlineCommands::try_from([1_u8, 2, 3, 4].as_slice()).expect("four bytes fit");
+        assert_eq!(
+            context
+                .submit(
+                    0,
+                    SubmitCommands::Inline(inline),
+                    Some(SubmitCompletion {
+                        fence: FenceId::new(2),
+                        signals: Vec::new(),
+                    }),
+                )
+                .await,
+            Ok(())
+        );
+        settle().await;
+        assert_eq!(retired(&context, 0), 2);
+    });
+}
+
+#[test]
+fn a_refusal_faults_only_its_context_and_retires_every_ring() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = opened(&shared);
+    let other = opened(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let faulted = request_context(&ownership, CAPSET, 2)
+            .await
+            .expect("the fake engine agrees");
+        let healthy = create_context(&other).await;
+
+        let (gate, hold) = oneshot::channel();
+        *device.submit_hold.lock().expect("no test panics here") = Some(hold);
+        assert_eq!(
+            submit_on(&faulted, 1, Some(9)).await,
+            Ok(()),
+            "resolved once it is on the ring"
+        );
+        *device.refuse_context.lock().expect("no test panics here") = Some(faulted.id());
+        assert_eq!(
+            submit_on(&faulted, 0, Some(2)).await,
+            Ok(()),
+            "the refusal comes after the submission resolved"
+        );
+        settle().await;
+
+        assert!(faulted.is_faulted());
+        assert_eq!(retired(&faulted, 0), 2);
+        assert_eq!(
+            retired(&faulted, 1),
+            9,
+            "a ring whose chain the device still holds retires too"
+        );
+        assert_eq!(
+            submit_on(&faulted, 0, Some(3)).await,
+            Err(Gpu3dServiceError::DeviceFault)
+        );
+
+        assert!(!healthy.is_faulted());
+        assert_eq!(submit_on(&healthy, 0, Some(1)).await, Ok(()));
+        settle().await;
+        assert_eq!(retired(&healthy, 0), 1);
+
+        gate.send(()).expect("the device is parked on it");
+        settle().await;
+    });
+}
+
+#[test]
+fn a_submission_the_driver_could_not_post_is_answered_with_its_refusal() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    device.refuse_before_post.store(true, Ordering::Relaxed);
+    let ownership = opened(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        assert_eq!(
+            submit_on(&context, 0, Some(4)).await,
+            Err(Gpu3dServiceError::DeviceFault)
+        );
+        assert_eq!(retired(&context, 0), 4, "its fence retired anyway");
+        assert!(context.is_faulted());
+    });
+}
+
+#[test]
+fn a_guest_blob_naming_a_blob_id_is_refused() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = opened(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        assert_eq!(
+            request_blob(
+                &ownership,
+                &context,
+                BlobMemory::Guest,
+                BlobUsage::empty(),
+                5
+            )
+            .await
+            .err(),
+            Some(Gpu3dServiceError::InvalidBlob)
+        );
+        let _blob = request_blob(
+            &ownership,
+            &context,
+            BlobMemory::Host3d,
+            BlobUsage::MAPPABLE,
+            5,
+        )
+        .await
+        .expect("a host blob names its allocation");
+    });
+
+    let created: Vec<_> = device
+        .calls()
+        .into_iter()
+        .filter(|call| matches!(call, Call::CreateBlob(..)))
+        .collect();
+    assert_eq!(
+        created,
+        alloc::vec![Call::CreateBlob(
+            ContextId::new(1),
+            BlobMemory::Host3d,
+            4096,
+            5
+        )],
+        "only the host blob reached the device"
     );
 }
 
-/// Giving the engine back ends every view the claim showed — command
-/// buffers, guest blobs and aperture placements alike — and a run shown
-/// nowhere and held by nothing else goes back to the pool with it.
 #[test]
-fn releasing_the_claim_ends_every_view_in_its_set() {
+fn a_write_combining_blob_is_shown_write_combined() {
     test_hooks::install();
-    let (shared, _control, _submit) = gpu3d_channels(true);
+    let (shared, control, submit) = channels(true);
+    let mut device = FakeGpu3d::new();
+    device.map_attributes = DeviceRegionAttributes::WRITE_COMBINING_MEMORY;
     let mut views = ViewTable::new();
-    let mut ownership = claimed_in(&shared, &mut views);
-    let group = ownership.views().expect("a claim has a set");
+    let ownership = opened_in(&shared, &mut views);
+
+    let region = with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let blob = new_blob(
+            &ownership,
+            &context,
+            BlobMemory::Host3d,
+            BlobUsage::MAPPABLE,
+        )
+        .await;
+        place(&blob).await.region()
+    });
+    assert_eq!(
+        region.attributes,
+        DeviceRegionAttributes::WRITE_COMBINING_MEMORY
+    );
+
+    let before = test_hooks::changes().len();
+    views
+        .show_device(
+            memory(),
+            pages(2, 1),
+            region,
+            Some(ownership.views().expect("an open session has a set")),
+        )
+        .expect("the span is free");
+    assert_eq!(
+        &test_hooks::changes()[before..],
+        &[test_hooks::MappingChange::SubstituteDevice(
+            helios_hal::vmm::VirtRange::new(
+                VirtAddr::new(MEMORY_BASE + 2 * WASM_PAGE_BYTES as usize),
+                0x1000
+            ),
+            DeviceRegionAttributes::WRITE_COMBINING_MEMORY,
+        )],
+        "the aperture is shown under the memory type the device reported"
+    );
+}
+
+#[test]
+fn dropping_a_mapping_without_explicit_unmap_releases_the_aperture_slot() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = opened(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let blob = new_blob(
+            &ownership,
+            &context,
+            BlobMemory::Host3d,
+            BlobUsage::MAPPABLE,
+        )
+        .await;
+        let mapping = place(&blob).await;
+        drop(mapping);
+        let remapped = place(&blob).await;
+        remapped.unmap().await.expect("explicit unmap succeeds");
+        assert_eq!(
+            device
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, Call::UnmapBlob(id) if *id == blob.id()))
+                .count(),
+            2
+        );
+    });
+}
+
+#[test]
+fn cloned_blob_handles_share_lifetime_until_last_clone_drops() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = opened(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let blob = new_blob(
+            &ownership,
+            &context,
+            BlobMemory::Host3d,
+            BlobUsage::SHAREABLE,
+        )
+        .await;
+        let id = blob.id();
+        let exported = blob.clone();
+        drop(blob);
+        settle().await;
+        assert!(!device.saw(&Call::DestroyBlob(id)));
+        drop(exported);
+        settle().await;
+        assert!(device.saw(&Call::DestroyBlob(id)));
+    });
+}
+
+#[test]
+fn ending_the_session_ends_every_view_in_its_set() {
+    test_hooks::install();
+    let (shared, _control, _submit) = channels(true);
+    let mut views = ViewTable::new();
+    let mut ownership = opened_in(&shared, &mut views);
+    let group = ownership.views().expect("an open session has a set");
     let runs = test_hooks::live_runs();
 
     let commands = pinned(4096);
@@ -404,7 +1066,7 @@ fn releasing_the_claim_ends_every_view_in_its_set() {
             memory(),
             pages(1, 1),
             DeviceRegion::new(
-                PhysicalRange::new(0x8_0000_0000, 0x1000),
+                PhysicalRange::new(APERTURE, 0x1000),
                 DeviceRegionAttributes::PREFETCHABLE_MEMORY,
             ),
             Some(group),
@@ -412,12 +1074,10 @@ fn releasing_the_claim_ends_every_view_in_its_set() {
         .expect("the span is free");
     let before = test_hooks::changes().len();
 
-    ownership
-        .release(&mut views)
-        .expect("the test pool refills anything");
+    close(&mut ownership, &mut views);
 
-    assert!(views.is_empty(), "nothing of the claim is shown");
-    assert!(!ownership.holds_gpu());
+    assert!(views.is_empty(), "nothing of the session is shown");
+    assert!(!ownership.is_open());
     let changes = &test_hooks::changes()[before..];
     assert_eq!(
         changes
@@ -431,58 +1091,21 @@ fn releasing_the_claim_ends_every_view_in_its_set() {
     assert_eq!(test_hooks::live_runs(), runs);
 }
 
-/// An aperture placement is shown as the device's own bytes: nothing is
-/// taken from the pool for it, because the memory behind it is the
-/// renderer's.
 #[test]
-fn a_mapped_blob_is_a_device_region_not_a_run() {
+fn a_session_shows_at_most_its_share_of_views() {
     test_hooks::install();
-    let (shared, _control, _submit) = gpu3d_channels(true);
+    let (shared, _control, _submit) = channels(true);
     let mut views = ViewTable::new();
-    let ownership = claimed_in(&shared, &mut views);
-    let before = test_hooks::changes().len();
-
-    views
-        .show_device(
-            memory(),
-            pages(2, 1),
-            DeviceRegion::new(
-                PhysicalRange::new(0x8_0000_0000, 0x1000),
-                DeviceRegionAttributes::PREFETCHABLE_MEMORY,
-            ),
-            Some(ownership.views().expect("a claim has a set")),
-        )
-        .expect("the span is free");
-
-    assert_eq!(
-        &test_hooks::changes()[before..],
-        &[test_hooks::MappingChange::SubstituteDevice(
-            helios_hal::vmm::VirtRange::new(
-                VirtAddr::new(MEMORY_BASE + 2 * WASM_PAGE_BYTES as usize),
-                0x1000
-            )
-        )],
-        "the aperture is shown like a device's own frames"
-    );
-}
-
-/// A claim shows at most its share of the store's views: the next one is
-/// refused before anything is substituted, and ending one makes room.
-#[test]
-fn a_claim_shows_at_most_its_share_of_views() {
-    test_hooks::install();
-    let (shared, _control, _submit) = gpu3d_channels(true);
-    let mut views = ViewTable::new();
-    let ownership = claimed_in(&shared, &mut views);
+    let ownership = opened_in(&shared, &mut views);
     let region = DeviceRegion::new(
-        PhysicalRange::new(0x8_0000_0000, 0x1000),
+        PhysicalRange::new(APERTURE, 0x1000),
         DeviceRegionAttributes::PREFETCHABLE_MEMORY,
     );
     let mut shown = Vec::new();
     for page in 0..MAX_GPU_VIEWS as u64 {
         let group = ownership
             .room_for_view(&views)
-            .expect("the claim is under its share");
+            .expect("the session is under its share");
         shown.push(
             views
                 .show_device(memory(), pages(page, 1), region, Some(group))
@@ -495,37 +1118,25 @@ fn a_claim_shows_at_most_its_share_of_views() {
         Some(Gpu3dServiceError::TooManyViews)
     );
     views
-        .end(shown.pop().expect("the claim shows something"))
+        .end(shown.pop().expect("the session shows something"))
         .expect("the test pool refills anything");
     assert!(ownership.room_for_view(&views).is_ok());
 }
 
-/// The context type is checked against the device's own capability
-/// sets: an engine that negotiated no context-init would silently hand
-/// a venus asker a virgl context, and the guest could not tell.
 #[test]
 fn a_context_is_refused_for_a_renderer_the_host_does_not_speak() {
     test_hooks::install();
-    let (shared, control, submit) = gpu3d_channels(true);
+    let (shared, control, submit) = channels(true);
     let device = FakeGpu3d::new();
-    let ownership = claimed(&shared);
+    let ownership = opened(&shared);
 
     with_servers(&device, &shared, &control, &submit, async {
-        let claim = ownership.claim_ref().expect("the claim is held");
-        let (reply, answer) = oneshot::channel();
-        let refused = claim
-            .sender()
-            .control(
-                Gpu3dRequest::CreateContext {
-                    generation: claim.generation(),
-                    capset: CapsetId::GFXSTREAM_VULKAN,
-                    name: ContextName::new(),
-                    reply,
-                },
-                answer,
-            )
-            .await;
-        assert_eq!(refused.err(), Some(Gpu3dServiceError::UnsupportedContext));
+        assert_eq!(
+            request_context(&ownership, CapsetId::GFXSTREAM_VULKAN, 1)
+                .await
+                .err(),
+            Some(Gpu3dServiceError::UnsupportedContext)
+        );
     });
 
     assert_eq!(
@@ -535,79 +1146,62 @@ fn a_context_is_refused_for_a_renderer_the_host_does_not_speak() {
     );
 }
 
-/// A capability set is the renderer's bytes: read once for the list,
-/// then fetched whole for the guest that asked, and never interpreted.
 #[test]
 fn a_capset_s_bytes_reach_their_reader_undecoded() {
     test_hooks::install();
-    let (shared, control, submit) = gpu3d_channels(true);
+    let (shared, control, submit) = channels(true);
     let device = FakeGpu3d::new();
-    let ownership = claimed(&shared);
+    let ownership = opened(&shared);
 
     with_servers(&device, &shared, &control, &submit, async {
-        let claim = ownership.claim_ref().expect("the claim is held");
-        let (reply, answer) = oneshot::channel();
-        let bytes = claim
-            .sender()
-            .control(
-                Gpu3dRequest::Capset {
-                    generation: claim.generation(),
-                    id: CAPSET,
-                    reply,
-                },
-                answer,
-            )
-            .await
-            .expect("the fake engine agrees");
-        assert_eq!(bytes, alloc::vec![0xde, 0xad, 0xbe, 0xef]);
-
-        let (reply, answer) = oneshot::channel();
-        let refused = claim
-            .sender()
-            .control(
-                Gpu3dRequest::Capset {
-                    generation: claim.generation(),
-                    id: CapsetId::VIRGL,
-                    reply,
-                },
-                answer,
-            )
-            .await;
-        assert_eq!(refused.err(), Some(Gpu3dServiceError::NoSuchCapset));
+        let session = ownership.session_ref().unwrap();
+        assert_eq!(
+            session.capset(CAPSET, CAPSET_MAX_VERSION).await,
+            Ok(alloc::vec![0xde, 0xad, 0xbe, 0xef])
+        );
+        assert_eq!(
+            session.capset(CAPSET, CAPSET_MAX_VERSION + 1).await.err(),
+            Some(Gpu3dServiceError::NoSuchCapset)
+        );
+        assert_eq!(
+            session.capset(CapsetId::VIRGL, 0).await.err(),
+            Some(Gpu3dServiceError::NoSuchCapset)
+        );
     });
+
+    assert_eq!(
+        device
+            .calls()
+            .into_iter()
+            .filter(|call| matches!(call, Call::Capset(..)))
+            .collect::<Vec<_>>(),
+        alloc::vec![Call::Capset(CAPSET, CAPSET_MAX_VERSION)],
+        "only the set the device carries, at a version it publishes, was read"
+    );
 }
 
-/// A blob names the context whose renderer owns it; a context the claim
-/// never opened is not a place a resource can live.
 #[test]
-fn a_blob_for_a_context_the_claim_never_opened_is_refused() {
+fn a_blob_for_a_context_the_session_never_opened_is_refused() {
     test_hooks::install();
-    let (shared, control, submit) = gpu3d_channels(true);
+    let (shared, control, submit) = channels(true);
     let device = FakeGpu3d::new();
-    let ownership = claimed(&shared);
+    let ownership = opened(&shared);
+    let other = opened(&shared);
 
     with_servers(&device, &shared, &control, &submit, async {
-        let claim = ownership.claim_ref().expect("the claim is held");
-        let (reply, answer) = oneshot::channel();
-        let refused = claim
-            .sender()
-            .control(
-                Gpu3dRequest::CreateBlob {
-                    generation: claim.generation(),
-                    spec: crate::gpu::BlobSpec {
-                        context: ContextId::new(77),
-                        memory: BlobMemory::Guest,
-                        usage: BlobUsage::empty(),
-                        size: 4096,
-                        host_id: 0,
-                        backing: Some(pinned(4096)),
-                    },
-                    reply,
-                },
-                answer,
+        let foreign = create_context(&other).await;
+        assert_eq!(
+            request_blob(
+                &ownership,
+                &foreign,
+                BlobMemory::Guest,
+                BlobUsage::empty(),
+                0
             )
-            .await;
-        assert_eq!(refused.err(), Some(Gpu3dServiceError::InvalidBlob));
+            .await
+            .err(),
+            Some(Gpu3dServiceError::InvalidBlob)
+        );
     });
 
     assert!(
@@ -619,172 +1213,46 @@ fn a_blob_for_a_context_the_claim_never_opened_is_refused() {
     );
 }
 
-/// A submission's completion is its fence: the context's signal carries
-/// it whether the device agreed with the command stream or not.
 #[test]
-fn a_submission_publishes_its_fence() {
+fn an_ended_session_unmaps_then_destroys_then_frees() {
     test_hooks::install();
-    let (shared, control, submit) = gpu3d_channels(true);
-    let device = FakeGpu3d::new();
-    let ownership = claimed(&shared);
-
-    with_servers(&device, &shared, &control, &submit, async {
-        let context = create_context(&ownership).await;
-        let commands = pinned(4096);
-        let claim = ownership.claim_ref().expect("the claim is held");
-
-        let (reply, answer) = oneshot::channel();
-        claim
-            .sender()
-            .submit(
-                SubmitRequest::Submit {
-                    generation: claim.generation(),
-                    context: context.id,
-                    commands: commands.physical(),
-                    buffer: commands,
-                    fence: FenceId::new(7),
-                    fences: context.fences.clone(),
-                    reply,
-                },
-                answer,
-            )
-            .await
-            .expect("the fake engine agrees");
-        assert_eq!(
-            context.fences.sequence(),
-            7,
-            "the fence stream sees the fence the submission carried"
-        );
-    });
-
-    assert!(
-        device
-            .calls()
-            .contains(&Call::Submit(ContextId::new(1), FenceId::new(7))),
-        "the device saw the submission"
-    );
-}
-
-/// A command the device refuses still retires its fence: a reader of
-/// the context's stream must not wait for a point the device decided
-/// would not come.
-#[test]
-fn a_rejected_submission_still_retires_its_fence() {
-    test_hooks::install();
-    let (shared, control, submit) = gpu3d_channels(true);
-    let device = FakeGpu3d::new();
-    device.refuse_submits.store(true, Ordering::Relaxed);
-    let ownership = claimed(&shared);
-
-    with_servers(&device, &shared, &control, &submit, async {
-        let context = create_context(&ownership).await;
-        let commands = pinned(4096);
-        let claim = ownership.claim_ref().expect("the claim is held");
-
-        let (reply, answer) = oneshot::channel();
-        let refused = claim
-            .sender()
-            .submit(
-                SubmitRequest::Submit {
-                    generation: claim.generation(),
-                    context: context.id,
-                    commands: commands.physical(),
-                    buffer: commands,
-                    fence: FenceId::new(3),
-                    fences: context.fences.clone(),
-                    reply,
-                },
-                answer,
-            )
-            .await;
-        assert!(refused.is_err(), "the device refused the command");
-        assert_eq!(context.fences.sequence(), 3, "its fence retired anyway");
-    });
-}
-
-/// Letting go gives the aperture placements back before the blobs, and
-/// the blobs before the contexts: a renderer still holding a context
-/// that names dead resources would be reading guest pages on their way
-/// back to a pool. The blob's buffer goes back only after the device
-/// has destroyed the blob, because the owner task's record holds it.
-#[test]
-fn a_released_claim_unmaps_then_destroys_then_frees() {
-    test_hooks::install();
-    let (shared, control, submit) = gpu3d_channels(true);
+    let (shared, control, submit) = channels(true);
     let device = FakeGpu3d::new();
     let mut views = ViewTable::new();
-    let mut ownership = claimed_in(&shared, &mut views);
+    let mut ownership = opened_in(&shared, &mut views);
     let runs = test_hooks::live_runs();
 
     with_servers(&device, &shared, &control, &submit, async {
         let context = create_context(&ownership).await;
-        let claim = ownership.claim_ref().expect("the claim is held");
-        let generation = claim.generation();
-        let sender = claim.sender();
-
-        let (reply, answer) = oneshot::channel();
-        let blob = sender
-            .control(
-                Gpu3dRequest::CreateBlob {
-                    generation,
-                    spec: crate::gpu::BlobSpec {
-                        context: context.id,
-                        memory: BlobMemory::Host3dGuest,
-                        usage: BlobUsage::MAPPABLE,
-                        size: 4096,
-                        host_id: 0,
-                        backing: Some(pinned(4096)),
-                    },
-                    reply,
-                },
-                answer,
-            )
-            .await
-            .expect("the fake engine agrees");
-
-        let (reply, answer) = oneshot::channel();
-        sender
-            .control(
-                Gpu3dRequest::MapBlob {
-                    generation,
-                    blob,
-                    reply,
-                },
-                answer,
-            )
-            .await
-            .expect("the fake engine agrees");
-
+        let blob = new_blob(
+            &ownership,
+            &context,
+            BlobMemory::Host3dGuest,
+            BlobUsage::MAPPABLE,
+        )
+        .await;
+        let _mapping = place(&blob).await;
         assert_eq!(test_hooks::live_runs() - runs, 1);
 
-        // Giving the engine back while alive is this; dying is the same
-        // with the views withdrawn by the store's table first.
-        ownership
-            .release(&mut views)
-            .expect("the test pool refills anything");
+        close(&mut ownership, &mut views);
         assert_eq!(
             test_hooks::live_runs() - runs,
             1,
-            "the blob's buffer is not freed by the release itself"
+            "the blob's buffer is not freed by the end itself"
         );
-
-        crate::yield_now().await;
-        crate::yield_now().await;
+        settle().await;
     });
 
     let calls = device.calls();
-    let unmap = calls
-        .iter()
-        .position(|call| matches!(call, Call::UnmapBlob(_)))
-        .expect("the blob leaves the aperture");
-    let destroy_blob = calls
-        .iter()
-        .position(|call| matches!(call, Call::DestroyBlob(_)))
-        .expect("the blob is destroyed");
-    let destroy_context = calls
-        .iter()
-        .position(|call| matches!(call, Call::DestroyContext(_)))
-        .expect("the context is destroyed");
+    let position = |wanted: fn(&Call) -> bool| {
+        calls
+            .iter()
+            .position(wanted)
+            .expect("the release made the call")
+    };
+    let unmap = position(|call| matches!(call, Call::UnmapBlob(_)));
+    let destroy_blob = position(|call| matches!(call, Call::DestroyBlob(_)));
+    let destroy_context = position(|call| matches!(call, Call::DestroyContext(_)));
     assert!(
         unmap < destroy_blob && destroy_blob < destroy_context,
         "the renderer stops placing the storage before it forgets the resource"
@@ -797,202 +1265,116 @@ fn a_released_claim_unmaps_then_destroys_then_frees() {
         "the blob's buffer goes back once the renderer has let go"
     );
     assert_eq!(test_hooks::live_runs(), runs);
-
-    let service = Gpu3dService::from_shared(shared.clone());
-    assert!(
-        service.claim(test_caps::gpu()).is_ok(),
-        "the engine is free once its resources are back"
-    );
 }
 
-/// A request made under a claim that has ended is dropped rather than
-/// served: a dead plugin must not drive a live one's renderer.
 #[test]
-fn a_request_that_outlived_its_claim_is_not_served() {
+fn a_request_that_outlived_its_session_is_not_served() {
     test_hooks::install();
-    let (shared, control, submit) = gpu3d_channels(true);
+    let (shared, control, submit) = channels(true);
     let device = FakeGpu3d::new();
-    let mut ownership = claimed(&shared);
-    let stale = ownership.claim_ref().expect("the claim is held").sender();
-    let stale_generation = stale.generation();
+    let mut ownership = opened(&shared);
+    let stale = ownership.session_ref().unwrap().client();
 
     with_servers(&device, &shared, &control, &submit, async {
-        // The first claim ends and a second one takes the engine.
-        ownership
-            .release(&mut ViewTable::new())
-            .expect("the claim showed nothing");
-        crate::yield_now().await;
-        crate::yield_now().await;
-        let _second = claimed(&shared);
+        let context = create_context(&ownership).await;
+        device.calls.lock().unwrap().clear();
 
-        let (reply, answer) = oneshot::channel();
-        let refused = stale
-            .control(
-                Gpu3dRequest::Capsets {
-                    generation: stale_generation,
-                    reply,
-                },
-                answer,
-            )
-            .await;
-        assert_eq!(refused.err(), Some(Gpu3dServiceError::Closed));
+        close(&mut ownership, &mut ViewTable::new());
+        settle().await;
+        device.calls.lock().unwrap().clear();
 
-        let (reply, answer) = oneshot::channel();
-        let refused = stale
-            .submit(
-                SubmitRequest::Submit {
-                    generation: stale_generation,
-                    context: ContextId::new(1),
-                    buffer: pinned(4096),
-                    commands: PhysicalRange::new(0x4000_0000, 4096),
-                    fence: FenceId::new(1),
-                    fences: Arc::new(SequenceSignal::new()),
-                    reply,
-                },
-                answer,
-            )
-            .await;
-        assert_eq!(refused.err(), Some(Gpu3dServiceError::Closed));
+        let _next = opened(&shared);
+
+        assert_eq!(
+            stale.capsets().await.err(),
+            Some(Gpu3dServiceError::SessionEnded)
+        );
+        assert_eq!(
+            submit_on(&context, 0, Some(1)).await,
+            Err(Gpu3dServiceError::SessionEnded)
+        );
     });
 
     assert!(
         device.calls().is_empty(),
-        "nothing reached the device under a claim that had ended"
+        "nothing reached the device under a session that had ended"
     );
 }
 
-/// A request sitting in the inbox when its claim is let go is dropped
-/// rather than served, however long the engine then sits unclaimed:
-/// the generation that delimits a claim's window advances on release,
-/// not only on the next claim.
 #[test]
-fn a_request_queued_before_release_is_dropped() {
+fn a_request_queued_before_the_end_is_dropped() {
     test_hooks::install();
-    let (shared, control, submit) = gpu3d_channels(true);
+    let (shared, control, submit) = channels(true);
     let device = FakeGpu3d::new();
-    let mut ownership = claimed(&shared);
-    let claim = ownership.claim_ref().expect("the claim is held");
-    let generation = claim.generation();
-    let sender = claim.sender();
+    let mut ownership = opened(&shared);
+    let client = ownership.session_ref().unwrap().client();
 
-    // The request lands in the inbox before the servers run and before
-    // the claim is let go: it is the one thing the owner task finds
-    // waiting when it wakes for the release.
-    let (reply, answer) = oneshot::channel();
-    let mut pending = pin!(sender.control(
-        Gpu3dRequest::CreateContext {
-            generation,
-            capset: CAPSET,
-            name: ContextName::new(),
-            reply,
-        },
-        answer,
-    ));
+    let mut pending = pin!(client.create_context(CAPSET, RingCount::ONE, ContextName::new()));
     assert!(
         block_on(poll_once(pending.as_mut())).is_none(),
         "the request is queued and unanswered"
     );
-    ownership
-        .release(&mut ViewTable::new())
-        .expect("the claim showed nothing");
+    close(&mut ownership, &mut ViewTable::new());
 
     with_servers(&device, &shared, &control, &submit, async {
         assert_eq!(
             pending.await.err(),
-            Some(Gpu3dServiceError::Closed),
-            "the dead claim's request is dropped, not served"
+            Some(Gpu3dServiceError::SessionEnded),
+            "the ended session's request is dropped, not served"
         );
-        crate::yield_now().await;
-        crate::yield_now().await;
+        settle().await;
     });
 
     assert!(
         device.calls().is_empty(),
-        "no device-side context was created for a claim that had ended"
-    );
-    let service = Gpu3dService::from_shared(shared);
-    assert!(
-        service.claim(test_caps::gpu()).is_ok(),
-        "the engine is free once its resources are back"
+        "no device-side context was created for a session that had ended"
     );
 }
 
-/// A submission the device is still working on is not torn down under
-/// it: the release waits the in-flight tally out, so the destroy lands
-/// on the control ring only after the device has finished the chain,
-/// and the command buffer is not freed while the engine may still be
-/// reading it — even once the instance's own view of it has ended.
 #[test]
-fn a_submission_in_flight_is_finished_before_the_claim_is_released() {
+fn a_submission_in_flight_is_finished_before_the_session_is_released() {
     test_hooks::install();
-    let (shared, control, submit) = gpu3d_channels(true);
+    let (shared, control, submit) = channels(true);
     let device = FakeGpu3d::new();
     let (gate, hold) = oneshot::channel();
     *device.submit_hold.lock().expect("no test panics here") = Some(hold);
-    let service = Gpu3dService::from_shared(shared.clone());
     let mut views = ViewTable::new();
-    let mut ownership = claimed_in(&shared, &mut views);
+    let mut ownership = opened_in(&shared, &mut views);
     let runs = test_hooks::live_runs();
 
     with_servers(&device, &shared, &control, &submit, async {
         let context = create_context(&ownership).await;
-        let commands = pinned(4096);
+        let buffer = pinned(4096);
+        let range = buffer.physical();
         views
             .show_buffer(
                 memory(),
                 pages(0, 1),
-                &commands,
-                Some(ownership.views().expect("a claim has a set")),
+                &buffer,
+                Some(ownership.views().expect("an open session has a set")),
             )
             .expect("the span is free");
-        let generation = ownership
-            .claim_ref()
-            .expect("the claim is held")
-            .generation();
 
-        // The device takes the submission and keeps working on it, as
-        // a chain parked for ring room is. The request's reference is
-        // the only one left once the view ends.
-        let (reply, answer) = oneshot::channel();
-        shared
-            .submit
-            .send(SubmitRequest::Submit {
-                generation,
-                context: context.id,
-                commands: commands.physical(),
-                buffer: commands,
-                fence: FenceId::new(1),
-                fences: context.fences.clone(),
-                reply,
-            })
-            .await
-            .expect("the queue has room");
-        for _ in 0..64 {
-            if device
-                .calls()
-                .contains(&Call::Submit(context.id, FenceId::new(1)))
-            {
-                break;
-            }
-            crate::yield_now().await;
-        }
-        assert!(
-            device
-                .calls()
-                .contains(&Call::Submit(context.id, FenceId::new(1))),
-            "the device is holding the chain"
+        assert_eq!(
+            context
+                .submit(
+                    0,
+                    SubmitCommands::Pages { buffer, range },
+                    Some(SubmitCompletion {
+                        fence: FenceId::new(1),
+                        signals: Vec::new(),
+                    }),
+                )
+                .await,
+            Ok(()),
+            "resolved once it is on the ring"
         );
+        let submitted = Call::Submit(context.id(), 0, Some(FenceId::new(1)));
+        assert!(device.saw(&submitted), "the device is holding the chain");
 
-        // The claim ends while the device holds it, and with it the
-        // instance's view of the command buffer. The teardown is given
-        // every chance to run ahead of the device.
-        ownership
-            .release(&mut views)
-            .expect("the test pool refills anything");
-        assert!(views.is_empty(), "the claim's views end with it");
-        for _ in 0..8 {
-            crate::yield_now().await;
-        }
+        close(&mut ownership, &mut views);
+        assert!(views.is_empty(), "the session's views end with it");
+        settle().await;
         assert!(
             !device
                 .calls()
@@ -1006,15 +1388,9 @@ fn a_submission_in_flight_is_finished_before_the_claim_is_released() {
             "the command buffer is not freed while the device holds the chain"
         );
 
-        // The device finishes; only then may the claim's teardown run.
         gate.send(()).expect("the device is parked on it");
-        answer
-            .await
-            .expect("the submission is answered")
-            .expect("the fake engine agrees");
-        while service.is_claimed() {
-            crate::yield_now().await;
-        }
+        settle().await;
+        assert!(device.saw(&Call::DestroyContext(context.id())));
     });
 
     let calls = device.calls();
@@ -1026,21 +1402,144 @@ fn a_submission_in_flight_is_finished_before_the_claim_is_released() {
         .iter()
         .position(|call| matches!(call, Call::DestroyContext(_)))
         .expect("the context is destroyed once the device is done");
-    assert!(
-        submitted < destroyed,
-        "the chain is taken before its context goes"
-    );
-    assert_eq!(
-        test_hooks::live_runs(),
-        runs,
-        "the command buffer goes back once the device has answered"
-    );
+    assert!(submitted < destroyed);
+    assert_eq!(test_hooks::live_runs(), runs);
 }
 
-/// A submission too long for the wire's command-buffer field is a
-/// bounds refusal, which is what the WIT's `out-of-bounds` is written
-/// for — not `invalid-blob`, which is a blob's own parameters being
-/// wrong.
+#[test]
+fn dropping_a_context_waits_for_its_in_flight_submissions() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let (gate, hold) = oneshot::channel();
+    *device.submit_hold.lock().expect("no test panics here") = Some(hold);
+    let ownership = opened(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let id = context.id();
+        assert_eq!(submit_on(&context, 0, Some(1)).await, Ok(()));
+        drop(context);
+        settle().await;
+        assert!(
+            !device.saw(&Call::DestroyContext(id)),
+            "context destroy waits while the submission is still with the device"
+        );
+
+        gate.send(()).expect("the device is parked on it");
+        settle().await;
+        assert!(device.saw(&Call::DestroyContext(id)));
+    });
+}
+
+#[test]
+fn an_ended_session_s_drain_does_not_stall_other_sessions() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let (gate, hold) = oneshot::channel();
+    *device.submit_hold.lock().expect("no test panics here") = Some(hold);
+    let mut views = ViewTable::new();
+    let mut ending = opened_in(&shared, &mut views);
+    let other = opened(&shared);
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let held_back = create_context(&ending).await;
+        assert_eq!(submit_on(&held_back, 0, Some(1)).await, Ok(()));
+        close(&mut ending, &mut views);
+        settle().await;
+
+        let context = create_context(&other).await;
+        let _blob = new_blob(&other, &context, BlobMemory::Host3d, BlobUsage::MAPPABLE).await;
+        assert!(!device.saw(&Call::DestroyContext(held_back.id())));
+
+        gate.send(()).expect("the device is parked on it");
+        settle().await;
+        assert!(device.saw(&Call::DestroyContext(held_back.id())));
+        assert!(!device.saw(&Call::DestroyContext(context.id())));
+    });
+}
+
+#[test]
+fn an_exported_image_retains_storage_until_its_last_scanout_retires() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let mut views = ViewTable::new();
+    let mut ownership = opened_in(&shared, &mut views);
+    let runs = test_hooks::live_runs();
+
+    let blob_id = with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let blob = new_blob(&ownership, &context, BlobMemory::Guest, BlobUsage::empty()).await;
+        let first_id = blob.id();
+        let image = blob
+            .image(
+                DisplayMode {
+                    width: 4,
+                    height: 4,
+                },
+                PixelFormat::Rgba8888,
+                0,
+                16,
+            )
+            .unwrap();
+        let (_, scanout) = image.clone().into_scanout();
+        drop(image);
+
+        drop(blob);
+        settle().await;
+        assert!(
+            !device.saw(&Call::DestroyBlob(first_id)),
+            "no destroy reaches the device while the scanout shows the blob"
+        );
+        assert_eq!(test_hooks::live_runs() - runs, 1);
+
+        drop(scanout);
+        settle().await;
+        assert!(device.saw(&Call::DestroyBlob(first_id)));
+        assert_eq!(test_hooks::live_runs(), runs);
+
+        let second = new_blob(&ownership, &context, BlobMemory::Guest, BlobUsage::empty()).await;
+        let second_id = second.id();
+        let image = second
+            .image(
+                DisplayMode {
+                    width: 4,
+                    height: 4,
+                },
+                PixelFormat::Rgba8888,
+                0,
+                16,
+            )
+            .unwrap();
+        close(&mut ownership, &mut views);
+        settle().await;
+        assert!(!device.saw(&Call::DestroyBlob(second_id)));
+        assert!(!device.saw(&Call::DestroyContext(context.id())));
+
+        let (layout, scanout) = image.into_scanout();
+        assert_eq!(layout.blob, second_id);
+        settle().await;
+        assert!(!device.saw(&Call::DestroyBlob(second_id)));
+        drop(scanout);
+        settle().await;
+        second_id
+    });
+
+    let calls = device.calls();
+    let destroyed = calls
+        .iter()
+        .position(|call| *call == Call::DestroyBlob(blob_id))
+        .expect("the blob is destroyed once the scanout let go");
+    let context_gone = calls
+        .iter()
+        .position(|call| matches!(call, Call::DestroyContext(_)))
+        .expect("and then its context");
+    assert!(destroyed < context_gone);
+    assert_eq!(test_hooks::live_runs(), runs);
+}
+
 #[test]
 fn a_command_buffer_too_long_for_the_wire_is_out_of_bounds() {
     assert_eq!(
@@ -1049,12 +1548,183 @@ fn a_command_buffer_too_long_for_the_wire_is_out_of_bounds() {
     );
 }
 
-/// The guest-facing handles a component holds are the store's resource
-/// table entries, so the stale-handle test builds a store for real: a
-/// `command-buffer` or `blob` handle minted under one claim names that
-/// claim's resources, and answered under the next it would be a run
-/// somebody else owns. The fixture itself lives with the adapter,
-/// because the store type names pieces that are adapter-only.
+#[test]
+fn a_blob_is_freed_only_once_the_device_has_destroyed_it() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let (gate, hold) = oneshot::channel();
+    *device.destroy_hold.lock().expect("no test panics here") = Some(hold);
+    let ownership = opened(&shared);
+    let runs = test_hooks::live_runs();
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let blob = new_blob(&ownership, &context, BlobMemory::Guest, BlobUsage::empty()).await;
+        let id = blob.id();
+        assert_eq!(test_hooks::live_runs() - runs, 1);
+
+        drop(blob);
+        settle().await;
+        assert!(device.saw(&Call::DestroyBlob(id)));
+        assert_eq!(test_hooks::live_runs() - runs, 1);
+
+        gate.send(()).expect("the device is parked on it");
+        settle().await;
+        assert_eq!(test_hooks::live_runs(), runs);
+    });
+}
+
+#[test]
+fn a_blob_the_device_would_not_destroy_stays_pinned() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    device.refuse_destroy.store(true, Ordering::Relaxed);
+    let mut views = ViewTable::new();
+    let mut ownership = opened_in(&shared, &mut views);
+    let runs = test_hooks::live_runs();
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let first = new_blob(&ownership, &context, BlobMemory::Guest, BlobUsage::empty()).await;
+        let first_id = first.id();
+        let _second = new_blob(&ownership, &context, BlobMemory::Guest, BlobUsage::empty()).await;
+        assert_eq!(test_hooks::live_runs() - runs, 2);
+
+        drop(first);
+        settle().await;
+        assert!(device.saw(&Call::DestroyBlob(first_id)));
+        assert_eq!(test_hooks::live_runs() - runs, 2);
+
+        close(&mut ownership, &mut views);
+        settle().await;
+    });
+
+    let destroyed = device
+        .calls()
+        .iter()
+        .filter(|call| matches!(call, Call::DestroyBlob(_)))
+        .count();
+    assert_eq!(destroyed, 2);
+    assert_eq!(test_hooks::live_runs() - runs, 2);
+}
+
+#[test]
+fn a_blob_the_device_would_not_unmap_stays_pinned() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    device.refuse_unmap.store(true, Ordering::Relaxed);
+    let mut views = ViewTable::new();
+    let mut ownership = opened_in(&shared, &mut views);
+    let runs = test_hooks::live_runs();
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let first = new_blob(
+            &ownership,
+            &context,
+            BlobMemory::Host3dGuest,
+            BlobUsage::MAPPABLE,
+        )
+        .await;
+        let first_id = first.id();
+        let second = new_blob(
+            &ownership,
+            &context,
+            BlobMemory::Host3dGuest,
+            BlobUsage::MAPPABLE,
+        )
+        .await;
+        let _m1 = place(&first).await;
+        let _m2 = place(&second).await;
+        assert_eq!(test_hooks::live_runs() - runs, 2);
+
+        drop(first);
+        settle().await;
+        assert!(device.saw(&Call::UnmapBlob(first_id)));
+        assert_eq!(test_hooks::live_runs() - runs, 2);
+
+        close(&mut ownership, &mut views);
+        settle().await;
+    });
+
+    assert!(
+        !device
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::DestroyBlob(_)))
+    );
+    assert_eq!(test_hooks::live_runs() - runs, 2);
+}
+
+#[test]
+fn a_command_buffer_is_kept_only_when_the_device_never_answered() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = opened(&shared);
+    let runs = test_hooks::live_runs();
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let refused = create_context(&ownership).await;
+        let unanswered = create_context(&ownership).await;
+
+        *device.refuse_context.lock().expect("no test panics here") = Some(refused.id());
+        assert_eq!(submit_on(&refused, 0, Some(1)).await, Ok(()));
+        settle().await;
+        assert_eq!(test_hooks::live_runs(), runs);
+
+        device
+            .transport_fault_submits
+            .store(true, Ordering::Relaxed);
+        assert_eq!(submit_on(&unanswered, 0, Some(2)).await, Ok(()));
+        settle().await;
+        assert_eq!(test_hooks::live_runs() - runs, 1);
+        assert_eq!(retired(&unanswered, 0), 2);
+    });
+}
+
+#[test]
+fn a_blobs_backing_is_kept_only_when_the_create_was_never_answered() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = opened(&shared);
+    let runs = test_hooks::live_runs();
+
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+
+        *device.fail_creates.lock().expect("no test panics here") = Some(false);
+        let refused = request_blob(
+            &ownership,
+            &context,
+            BlobMemory::Guest,
+            BlobUsage::empty(),
+            0,
+        )
+        .await;
+        assert!(refused.is_err());
+        settle().await;
+        assert_eq!(test_hooks::live_runs(), runs);
+
+        *device.fail_creates.lock().expect("no test panics here") = Some(true);
+        let unanswered = request_blob(
+            &ownership,
+            &context,
+            BlobMemory::Guest,
+            BlobUsage::empty(),
+            0,
+        )
+        .await;
+        assert!(unanswered.is_err());
+        settle().await;
+        assert_eq!(test_hooks::live_runs() - runs, 1);
+    });
+}
+
 #[cfg(feature = "wasmtime-runtime")]
 mod component_host {
     use wasmtime::component::Resource;
@@ -1064,10 +1734,89 @@ mod component_host {
     use crate::wasmtime_adapter::component_host::service::test_store;
     use crate::wasmtime_adapter::component_host::service::{BlobHandle, CommandBufferHandle};
 
-    /// Show a fresh 4 KiB buffer at wasm page `page` of the store's
-    /// memory, in the live claim's set.
+    fn synthetic_blob(
+        shared_service: &Arc<Gpu3dShared>,
+        data: &test_store::TestStoreData,
+        id: u32,
+        size: u64,
+    ) -> GpuBlob {
+        let session_state = data.device.gpu().session_ref().unwrap().state().clone();
+        let shared = Arc::new(BlobShared::new(
+            BlobId::new(id),
+            size,
+            BlobMemory::Host3d,
+            BlobUsage::SHAREABLE,
+            shared_service.release.clone(),
+        ));
+        GpuBlob::new(shared_service.clone(), session_state, shared)
+    }
+
+    fn synthetic_context(
+        shared_service: &Arc<Gpu3dShared>,
+        data: &test_store::TestStoreData,
+        id: u32,
+        rings: RingCount,
+    ) -> GpuContext {
+        let session_state = data.device.gpu().session_ref().unwrap().state().clone();
+        let shared = Arc::new(ContextShared::new(
+            ContextId::new(id),
+            CAPSET,
+            rings,
+            shared_service.release.clone(),
+        ));
+        GpuContext::new(shared_service.clone(), session_state, shared)
+    }
+
+    #[test]
+    fn exported_images_survive_their_source_session_but_stale_blobs_cannot_export() {
+        test_hooks::install();
+        let (shared, _control, _submit) = channels(true);
+        let service = Gpu3dService::from_shared(shared.clone());
+        let mut data = test_store::store_data(&service);
+        let session = data
+            .device
+            .open_gpu(&service, &mut data.views, test_caps::gpu())
+            .expect("the engine renders");
+        let gpu_blob = synthetic_blob(&shared, &data, 9, 4096);
+        let probe = gpu_blob.clone();
+        let blob = data
+            .table
+            .push(BlobHandle {
+                blob: gpu_blob,
+                backing: None,
+                mapped: None,
+            })
+            .unwrap();
+        let layout = contract::ImageLayout {
+            width: 8,
+            height: 8,
+            format: contract::PixelFormat::Rgba8888,
+            offset: 32,
+            stride: 64,
+        };
+        let image = contract::HostBlob::image(&mut data, Resource::new_borrow(blob.rep()), layout)
+            .unwrap()
+            .unwrap();
+        assert!(probe.is_retained());
+        reopen(&mut data, &service, session);
+        let actual =
+            contract::Host::describe_image(&mut data, Resource::new_borrow(image.rep())).unwrap();
+        assert_eq!(
+            (actual.width, actual.height, actual.offset, actual.stride),
+            (8, 8, 32, 64)
+        );
+        assert!(matches!(
+            contract::HostBlob::image(&mut data, Resource::new_borrow(blob.rep()), layout).unwrap(),
+            Err(contract::Error::SessionEnded)
+        ));
+        contract::HostBlob::drop(&mut data, blob).unwrap();
+        assert!(probe.is_retained());
+        contract::HostImage::drop(&mut data, image).unwrap();
+        assert!(!probe.is_retained());
+    }
+
     fn shown(data: &mut test_store::TestStoreData, page: u64) -> (Buffer, crate::ViewId) {
-        let group = data.device.gpu().views().expect("the claim is held");
+        let group = data.device.gpu().views().expect("the session is open");
         let buffer = pinned(4096);
         let view = data
             .views
@@ -1076,138 +1825,99 @@ mod component_host {
         (buffer, view)
     }
 
-    /// A buffer a component kept across its claim's release was shown in
-    /// a set the release already ended, so `submit` refuses it with the
-    /// contract's word for a dead claim, and dropping it — or a blob of
-    /// the same claim — ends nothing twice. A live claim's handle ends
-    /// its own view when it is dropped.
+    fn reopen(
+        data: &mut test_store::TestStoreData,
+        service: &Gpu3dService,
+        first: super::super::SessionId,
+    ) -> super::super::SessionId {
+        data.device
+            .gpu_mut()
+            .close(first, &mut data.views)
+            .expect("the test pool refills anything");
+        data.device
+            .open_gpu(service, &mut data.views, test_caps::gpu())
+            .expect("the engine renders")
+    }
+
     #[test]
-    fn a_command_buffer_that_outlived_its_claim_is_refused() {
+    fn a_command_buffer_that_outlived_its_session_is_refused() {
         test_hooks::install();
-        let (shared, control, submit) = gpu3d_channels(true);
-        let device = FakeGpu3d::new();
+        let (shared, _control, _submit) = channels(true);
         let service = Gpu3dService::from_shared(shared.clone());
         let mut data = test_store::store_data(&service);
-        data.device
-            .claim_gpu(&service, &mut data.views, test_caps::gpu())
-            .expect("the engine is free");
-        let first = data.device.gpu().claim_ref().expect("held").generation();
+        let first = data
+            .device
+            .open_gpu(&service, &mut data.views, test_caps::gpu())
+            .expect("the engine renders");
         let (buffer, view) = shown(&mut data, 0);
         let commands = data
             .table
             .push(CommandBufferHandle {
-                generation: first,
+                session: first,
                 buffer,
                 view,
             })
             .expect("the table has room");
-        let (_, backing) = shown(&mut data, 1);
+        let (_storage, backing) = shown(&mut data, 1);
+        let gpu_blob = synthetic_blob(&shared, &data, 9, 4096);
         let blob = data
             .table
             .push(BlobHandle {
-                generation: first,
-                id: BlobId::new(9),
+                blob: gpu_blob,
                 backing: Some(backing),
                 mapped: None,
             })
             .expect("the table has room");
 
-        // The claim ends, and with it every view it showed; the handles
-        // live on, as they do in a store nobody told. Whoever claims the
-        // engine next holds it under a generation that is not theirs.
-        with_servers(&device, &shared, &control, &submit, async {
-            data.device
-                .gpu_mut()
-                .release(&mut data.views)
-                .expect("the test pool refills anything");
-            while service.is_claimed() {
-                crate::yield_now().await;
-            }
-            data.device
-                .claim_gpu(&service, &mut data.views, test_caps::gpu())
-                .expect("the engine is free once its resources are back");
-        });
-        assert!(data.views.is_empty(), "the release ended the claim's views");
-        let live = data.device.gpu().claim_ref().expect("held").generation();
-        assert_ne!(live, first, "a release and a claim both move it");
+        let live = reopen(&mut data, &service, first);
+        assert!(data.views.is_empty(), "the end ended the session's views");
+        assert_ne!(live, first, "a new session is a new identity");
 
         let refused = data
             .command_range(&commands, 0, 16, live)
             .expect("the handle is still in the table");
-        assert_eq!(
-            refused.err(),
-            Some(contract::Error::NotClaimed),
-            "submit's run check answers not-claimed for a dead claim's buffer"
-        );
-        assert!(
-            contract::HostCommandBuffer::drop(&mut data, commands).is_ok(),
-            "a dead claim's buffer ends no view a second time"
-        );
-        assert!(
-            contract::HostBlob::drop(&mut data, blob).is_ok(),
-            "a dead claim's blob ends no view a second time"
-        );
+        assert!(matches!(refused, Err(contract::Error::SessionEnded)));
+        assert!(contract::HostCommandBuffer::drop(&mut data, commands).is_ok());
+        assert!(contract::HostBlob::drop(&mut data, blob).is_ok());
 
         let (buffer, view) = shown(&mut data, 2);
         let commands = data
             .table
             .push(CommandBufferHandle {
-                generation: live,
+                session: live,
                 buffer,
                 view,
             })
             .expect("the table has room");
         contract::HostCommandBuffer::drop(&mut data, commands)
-            .expect("a live claim's buffer ends its view");
-        assert!(
-            !data.views.is_shown(view),
-            "the span is ordinary memory again"
-        );
+            .expect("a live session's buffer ends its view");
+        assert!(!data.views.is_shown(view));
     }
 
-    /// A context that outlived its claim must not hand out the dead
-    /// claim's fence signal — nothing publishes to it again, so the
-    /// guest's stream read would hang — so `fences` traps: its signature
-    /// cannot carry `not-claimed`.
     #[test]
-    fn a_context_that_outlived_its_claim_opens_no_fence_stream() {
+    fn a_context_opens_fence_streams_only_for_a_live_session_and_its_own_rings() {
         test_hooks::install();
-        let (shared, control, submit) = gpu3d_channels(true);
-        let device = FakeGpu3d::new();
+        let (shared, _control, _submit) = channels(true);
         let service = Gpu3dService::from_shared(shared.clone());
         let mut data = test_store::store_data(&service);
-        data.device
-            .claim_gpu(&service, &mut data.views, test_caps::gpu())
-            .expect("the engine is free");
-        let first = data.device.gpu().claim_ref().expect("held").generation();
-        let context = data
+        let first = data
+            .device
+            .open_gpu(&service, &mut data.views, test_caps::gpu())
+            .expect("the engine renders");
+        let rings = RingCount::new(2).expect("two rings are in range");
+        let stale_ctx = synthetic_context(&shared, &data, 4, rings);
+        let stale = data
             .table
-            .push(test_store::context_handle(first, ContextId::new(4)))
+            .push(test_store::context_handle(stale_ctx))
             .expect("the table has room");
 
-        // The claim ends and another takes the engine; the handle lives
-        // on, as it does in a store nobody told.
-        with_servers(&device, &shared, &control, &submit, async {
-            data.device
-                .gpu_mut()
-                .release(&mut data.views)
-                .expect("the claim showed nothing");
-            while service.is_claimed() {
-                crate::yield_now().await;
-            }
-            data.device
-                .claim_gpu(&service, &mut data.views, test_caps::gpu())
-                .expect("the engine is free once its resources are back");
-        });
-        let live = data.device.gpu().claim_ref().expect("held").generation();
-        assert_ne!(live, first, "a release and a claim both move it");
+        let _live = reopen(&mut data, &service, first);
+        let live_ctx = synthetic_context(&shared, &data, 5, rings);
         let live_context = data
             .table
-            .push(test_store::context_handle(live, ContextId::new(5)))
+            .push(test_store::context_handle(live_ctx))
             .expect("the table has room");
 
-        // `fences` is a with-store host call, so it wants a real store
-        // to take its `Access` from.
         let engine =
             wasmtime::Engine::new(&wasmtime::Config::new()).expect("the host engine builds");
         let mut store = wasmtime::Store::new(&engine, data);
@@ -1217,24 +1927,19 @@ mod component_host {
             wasmtime::component::HasSelf<test_store::TestStoreData>,
         >;
         use wasmtime::AsContextMut;
-        let refused = contract::HostContextWithStore::fences(
-            GpuAccess::new(store.as_context_mut(), |data| data),
-            Resource::new_borrow(context.rep()),
-        );
-        assert!(
-            refused.is_err_and(
-                |error| alloc::format!("{error}").contains("does not hold the 3D engine")
-            ),
-            "the dead claim's context is a trap, not a stream nobody feeds"
-        );
-        let served = contract::HostContextWithStore::fences(
-            GpuAccess::new(store.as_context_mut(), |data| data),
-            Resource::new_borrow(live_context.rep()),
-        );
-        assert!(
-            served.is_ok(),
-            "the live claim's context still opens its stream"
-        );
+        let mut fences = |context: &Resource<_>, ring: u8| {
+            contract::HostContextWithStore::fences(
+                GpuAccess::new(store.as_context_mut(), |data| data),
+                Resource::new_borrow(context.rep()),
+                ring,
+            )
+            .expect("an answer, not a trap")
+            .map(|_| ())
+        };
+        assert_eq!(fences(&stale, 0), Err(contract::Error::SessionEnded));
+        assert_eq!(fences(&live_context, 2), Err(contract::Error::BadRing));
+        assert_eq!(fences(&live_context, 1), Ok(()));
+        assert_eq!(fences(&live_context, 0), Ok(()));
     }
 
     fn authority_with(classes: crate::DeviceClassRights) -> crate::ProcessAuthority {
@@ -1243,14 +1948,11 @@ mod component_host {
         authority
     }
 
-    /// An ordinary program is told what a machine with no 3D service
-    /// tells everyone, not `no-renderer`, and the engine stays free for
-    /// its owner.
     #[test]
     fn ordinary_program_is_refused_the_gpu_as_if_there_were_none() {
         test_hooks::install();
-        let (shared, _control, _submit) = gpu3d_channels(true);
-        let service = Gpu3dService::from_shared(shared.clone());
+        let (shared, _control, _submit) = channels(true);
+        let service = Gpu3dService::from_shared(shared);
 
         for authority in [
             crate::ProcessAuthority::empty(),
@@ -1260,30 +1962,24 @@ mod component_host {
             let mut data = test_store::store_data_authorized(authority, |runtime_state| {
                 runtime_state.install_gpu3d_service(service.clone());
             });
-            let answer = <test_store::TestStoreData as contract::Host>::claim(&mut data)
+            let answer = <test_store::TestStoreData as contract::Host>::open(&mut data)
                 .expect("a refusal is an answer, not a trap");
-            assert_eq!(answer.err(), Some(contract::Error::Unavailable));
-            assert!(!data.device.gpu().holds_gpu());
+            assert!(matches!(answer, Err(contract::Error::Unavailable)));
+            assert!(!data.device.gpu().is_open());
         }
-        assert!(!service.is_claimed(), "nobody took the engine");
 
         let mut absent =
             test_store::store_data_authorized(crate::ProcessAuthority::empty(), |_| {});
-        let none = <test_store::TestStoreData as contract::Host>::claim(&mut absent)
+        let none = <test_store::TestStoreData as contract::Host>::open(&mut absent)
             .expect("a machine with no 3D service answers");
-        assert_eq!(
-            none.err(),
-            Some(contract::Error::Unavailable),
-            "the answer is the one a machine with no 3D service gives"
-        );
+        assert!(matches!(none, Err(contract::Error::Unavailable)));
     }
 
-    /// A program that holds the GPU class claims the engine.
     #[test]
-    fn debugger_granted_child_claims_the_gpu() {
+    fn a_program_holding_the_gpu_class_opens_the_engine() {
         test_hooks::install();
-        let (shared, _control, _submit) = gpu3d_channels(true);
-        let service = Gpu3dService::from_shared(shared.clone());
+        let (shared, _control, _submit) = channels(true);
+        let service = Gpu3dService::from_shared(shared);
         let mut data = test_store::store_data_authorized(
             authority_with(crate::DeviceClassRights::GPU),
             |runtime_state| {
@@ -1291,366 +1987,210 @@ mod component_host {
             },
         );
 
-        let answer = <test_store::TestStoreData as contract::Host>::claim(&mut data)
-            .expect("the claim is answered");
+        let first = <test_store::TestStoreData as contract::Host>::open(&mut data)
+            .expect("the open is answered")
+            .expect("the GPU class opens the engine");
+        let second = <test_store::TestStoreData as contract::Host>::open(&mut data)
+            .expect("the open is answered")
+            .expect("a second handle is another hold on the session");
+        assert!(data.device.gpu().is_open());
 
-        assert!(answer.is_ok(), "the GPU class opens the engine");
-        assert!(service.is_claimed());
+        contract::HostGpu::drop(&mut data, first).expect("the drop is answered");
+        assert!(data.device.gpu().is_open());
+        contract::HostGpu::drop(&mut data, second).expect("the drop is answered");
+        assert!(!data.device.gpu().is_open());
     }
 }
 
-/// Ask the control server for one blob of `memory` in `context`, with a
-/// run of its own behind it when it is guest-backed.
-async fn new_blob(
-    ownership: &Gpu3dOwnership,
-    context: ContextId,
-    memory: BlobMemory,
-    usage: BlobUsage,
-) -> BlobId {
-    request_blob(ownership, context, memory, usage)
-        .await
-        .expect("the fake engine agrees")
+#[test]
+fn waiting_for_a_retired_fence_does_not_need_a_new_event() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = opened(&shared);
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = request_context(&ownership, CAPSET, 2).await.unwrap();
+        context
+            .shared()
+            .timeline(RingIndex::new(0).unwrap())
+            .unwrap()
+            .record_submitted(FenceId::new(5));
+        context
+            .shared()
+            .timeline(RingIndex::new(0).unwrap())
+            .unwrap()
+            .retire(5, 0);
+        assert_eq!(context.wait(0, 3).await, Ok(()));
+        assert_eq!(context.wait(0, 0).await, Ok(()));
+        assert_eq!(
+            context.wait(0, 6).await,
+            Err(Gpu3dServiceError::UnsubmittedFence)
+        );
+        assert_eq!(
+            context.wait(1, 5).await,
+            Err(Gpu3dServiceError::UnsubmittedFence)
+        );
+        assert_eq!(context.wait(2, 0).await, Err(Gpu3dServiceError::BadRing));
+    });
 }
 
-/// [`new_blob`], with the engine's answer left to the caller.
-async fn request_blob(
-    ownership: &Gpu3dOwnership,
-    context: ContextId,
-    memory: BlobMemory,
-    usage: BlobUsage,
-) -> Result<BlobId, Gpu3dServiceError> {
-    let claim = ownership.claim_ref().expect("the claim is held");
-    let (reply, answer) = oneshot::channel();
-    claim
-        .sender()
-        .control(
-            Gpu3dRequest::CreateBlob {
-                generation: claim.generation(),
-                spec: crate::gpu::BlobSpec {
-                    context,
-                    memory,
-                    usage,
-                    size: 4096,
-                    host_id: 0,
-                    backing: Some(pinned(4096)),
-                },
-                reply,
-            },
-            answer,
-        )
-        .await
-}
+struct FenceWake(AtomicUsize);
 
-/// Place `blob` in the aperture.
-async fn place(ownership: &Gpu3dOwnership, blob: BlobId) {
-    let claim = ownership.claim_ref().expect("the claim is held");
-    let (reply, answer) = oneshot::channel();
-    claim
-        .sender()
-        .control(
-            Gpu3dRequest::MapBlob {
-                generation: claim.generation(),
-                blob,
-                reply,
-            },
-            answer,
-        )
-        .await
-        .expect("the fake engine agrees");
-}
-
-/// Queue the destroy of `blob` without waiting for it to be served.
-async fn queue_destroy(ownership: &Gpu3dOwnership, blob: BlobId) {
-    let claim = ownership.claim_ref().expect("the claim is held");
-    claim
-        .sender()
-        .control_oneway(Gpu3dRequest::DestroyBlob {
-            generation: claim.generation(),
-            blob,
-        })
-        .await
-        .expect("the owner task is serving");
-}
-
-/// Let the owner tasks run until they have nothing left to do.
-async fn settle() {
-    for _ in 0..8 {
-        crate::yield_now().await;
+impl Wake for FenceWake {
+    fn wake(self: WakeArc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-/// A blob's run stays live for as long as the device has not answered
-/// the destroy, and goes back once it has.
 #[test]
-fn a_blob_is_freed_only_once_the_device_has_destroyed_it() {
+fn a_fence_wait_is_woken_by_retirement_and_not_completed_by_an_earlier_point() {
     test_hooks::install();
-    let (shared, control, submit) = gpu3d_channels(true);
+    let (shared, control, submit) = channels(true);
     let device = FakeGpu3d::new();
-    let (gate, hold) = oneshot::channel();
-    *device.destroy_hold.lock().expect("no test panics here") = Some(hold);
-    let ownership = claimed(&shared);
-    let runs = test_hooks::live_runs();
-
-    with_servers(&device, &shared, &control, &submit, async {
-        let context = create_context(&ownership).await;
-        let blob = new_blob(
-            &ownership,
-            context.id,
-            BlobMemory::Guest,
-            BlobUsage::empty(),
-        )
-        .await;
-        assert_eq!(test_hooks::live_runs() - runs, 1);
-
-        queue_destroy(&ownership, blob).await;
-        settle().await;
-        assert!(
-            device.calls().contains(&Call::DestroyBlob(blob)),
-            "the device is holding the destroy"
-        );
-        assert_eq!(
-            test_hooks::live_runs() - runs,
-            1,
-            "the run stays live while the device has not answered"
-        );
-
-        gate.send(()).expect("the device is parked on it");
-        settle().await;
-        assert_eq!(
-            test_hooks::live_runs(),
-            runs,
-            "the run goes back once the device has destroyed the blob"
-        );
+    let ownership = opened(&shared);
+    let context = with_servers(&device, &shared, &control, &submit, async {
+        create_context(&ownership).await
     });
+    let timeline = context
+        .shared()
+        .timeline(RingIndex::new(0).unwrap())
+        .unwrap();
+    timeline.record_submitted(FenceId::new(5));
+    let wakes = WakeArc::new(FenceWake(AtomicUsize::new(0)));
+    let waker = Waker::from(wakes.clone());
+    let mut cx = TaskContext::from_waker(&waker);
+    let mut wait = pin!(context.wait(0, 5));
+    assert!(wait.as_mut().poll(&mut cx).is_pending());
+    timeline.retire(3, 0);
+    assert!(wakes.0.load(Ordering::Relaxed) > 0);
+    assert!(wait.as_mut().poll(&mut cx).is_pending());
+    wakes.0.store(0, Ordering::Relaxed);
+    timeline.retire(5, 0);
+    assert!(wakes.0.load(Ordering::Relaxed) > 0);
+    assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
 }
 
-/// A blob the device would not destroy may still be read and written by
-/// the renderer, so its run never goes back to the pool, whether the
-/// destroy was asked for on its own or came with the claim.
 #[test]
-fn a_blob_the_device_would_not_destroy_stays_pinned() {
+fn ending_a_session_wakes_a_fence_wait_whose_submission_never_retired() {
     test_hooks::install();
-    let (shared, control, submit) = gpu3d_channels(true);
+    let (shared, control, submit) = channels(true);
     let device = FakeGpu3d::new();
-    device.refuse_destroy.store(true, Ordering::Relaxed);
-    let mut views = ViewTable::new();
-    let mut ownership = claimed_in(&shared, &mut views);
-    let runs = test_hooks::live_runs();
-
-    with_servers(&device, &shared, &control, &submit, async {
-        let context = create_context(&ownership).await;
-        let first = new_blob(
-            &ownership,
-            context.id,
-            BlobMemory::Guest,
-            BlobUsage::empty(),
-        )
-        .await;
-        new_blob(
-            &ownership,
-            context.id,
-            BlobMemory::Guest,
-            BlobUsage::empty(),
-        )
-        .await;
-        assert_eq!(test_hooks::live_runs() - runs, 2);
-
-        queue_destroy(&ownership, first).await;
-        settle().await;
-        assert!(device.calls().contains(&Call::DestroyBlob(first)));
-        assert_eq!(
-            test_hooks::live_runs() - runs,
-            2,
-            "a refused destroy keeps the run"
-        );
-
-        ownership
-            .release(&mut views)
-            .expect("the claim showed nothing");
-        settle().await;
+    let ownership = opened(&shared);
+    let context = with_servers(&device, &shared, &control, &submit, async {
+        create_context(&ownership).await
     });
-
-    let destroyed = device
-        .calls()
-        .iter()
-        .filter(|call| matches!(call, Call::DestroyBlob(_)))
-        .count();
-    assert_eq!(destroyed, 2, "both blobs were asked to go");
+    context
+        .shared()
+        .timeline(RingIndex::new(0).unwrap())
+        .unwrap()
+        .record_submitted(FenceId::new(1));
+    let wakes = WakeArc::new(FenceWake(AtomicUsize::new(0)));
+    let waker = Waker::from(wakes.clone());
+    let mut cx = TaskContext::from_waker(&waker);
+    let mut wait = pin!(context.wait(0, 1));
+    assert!(wait.as_mut().poll(&mut cx).is_pending());
+    drop(ownership);
+    assert!(wakes.0.load(Ordering::Relaxed) > 0);
     assert_eq!(
-        test_hooks::live_runs() - runs,
-        2,
-        "neither run goes back to a pool the renderer may still write"
+        wait.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Gpu3dServiceError::SessionEnded))
     );
 }
 
-/// A blob the device would not take out of the aperture is not destroyed
-/// at all, and its run never goes back to the pool.
 #[test]
-fn a_blob_the_device_would_not_unmap_stays_pinned() {
+fn faulting_a_context_does_not_report_its_retired_fences_as_successful() {
     test_hooks::install();
-    let (shared, control, submit) = gpu3d_channels(true);
+    let (shared, control, submit) = channels(true);
     let device = FakeGpu3d::new();
-    device.refuse_unmap.store(true, Ordering::Relaxed);
-    let mut views = ViewTable::new();
-    let mut ownership = claimed_in(&shared, &mut views);
-    let runs = test_hooks::live_runs();
-
-    with_servers(&device, &shared, &control, &submit, async {
-        let context = create_context(&ownership).await;
-        let first = new_blob(
-            &ownership,
-            context.id,
-            BlobMemory::Host3dGuest,
-            BlobUsage::MAPPABLE,
-        )
-        .await;
-        let second = new_blob(
-            &ownership,
-            context.id,
-            BlobMemory::Host3dGuest,
-            BlobUsage::MAPPABLE,
-        )
-        .await;
-        place(&ownership, first).await;
-        place(&ownership, second).await;
-        assert_eq!(test_hooks::live_runs() - runs, 2);
-
-        queue_destroy(&ownership, first).await;
-        settle().await;
-        assert!(device.calls().contains(&Call::UnmapBlob(first)));
-        assert_eq!(
-            test_hooks::live_runs() - runs,
-            2,
-            "a refused unmap keeps the run"
-        );
-
-        ownership
-            .release(&mut views)
-            .expect("the claim showed nothing");
-        settle().await;
+    let ownership = opened(&shared);
+    let context = with_servers(&device, &shared, &control, &submit, async {
+        create_context(&ownership).await
     });
-
-    assert!(
-        !device
-            .calls()
-            .iter()
-            .any(|call| matches!(call, Call::DestroyBlob(_))),
-        "a placed blob is never offered to the device's destroy"
-    );
-    assert_eq!(
-        test_hooks::live_runs() - runs,
-        2,
-        "neither run goes back to a pool the renderer may still write"
-    );
-}
-
-/// Submit one command buffer on `context` and report the answer.
-async fn submit_commands(
-    ownership: &Gpu3dOwnership,
-    context: &super::ContextRecord,
-    fence: u64,
-) -> Result<(), Gpu3dServiceError> {
-    let commands = pinned(4096);
-    let claim = ownership.claim_ref().expect("the claim is held");
-    let (reply, answer) = oneshot::channel();
-    claim
-        .sender()
-        .submit(
-            SubmitRequest::Submit {
-                generation: claim.generation(),
-                context: context.id,
-                commands: commands.physical(),
-                buffer: commands,
-                fence: FenceId::new(fence),
-                fences: context.fences.clone(),
-                reply,
-            },
-            answer,
-        )
-        .await
-}
-
-/// A submission the device never answered may still be read by it, so
-/// its command buffer stays out of the pool; one the device answered
-/// with a refusal is finished with, and the buffer goes back.
-#[test]
-fn a_command_buffer_is_kept_only_when_the_device_never_answered() {
-    test_hooks::install();
-    let (shared, control, submit) = gpu3d_channels(true);
-    let device = FakeGpu3d::new();
-    let ownership = claimed(&shared);
-    let runs = test_hooks::live_runs();
-
-    with_servers(&device, &shared, &control, &submit, async {
-        let context = create_context(&ownership).await;
-
-        device.refuse_submits.store(true, Ordering::Relaxed);
-        assert!(submit_commands(&ownership, &context, 1).await.is_err());
-        settle().await;
+    context
+        .shared()
+        .timeline(RingIndex::new(0).unwrap())
+        .unwrap()
+        .record_submitted(FenceId::new(1));
+    block_on(async {
+        let mut wait = pin!(context.wait(0, 1));
+        assert!(poll_once(wait.as_mut()).await.is_none());
+        context.shared().fault(0);
+        assert_eq!(wait.await, Err(Gpu3dServiceError::DeviceFault));
         assert_eq!(
-            test_hooks::live_runs(),
-            runs,
-            "an answered refusal frees the command buffer"
+            context.wait(0, 1).await,
+            Err(Gpu3dServiceError::DeviceFault)
         );
-
-        device
-            .transport_fault_submits
-            .store(true, Ordering::Relaxed);
-        assert!(submit_commands(&ownership, &context, 2).await.is_err());
-        settle().await;
-        assert_eq!(
-            test_hooks::live_runs() - runs,
-            1,
-            "a submission the device never answered keeps its command buffer"
-        );
-        assert_eq!(context.fences.sequence(), 2, "its fence retired anyway");
     });
 }
 
-/// A blob create the device never answered may have attached the pages
-/// to a blob nobody has a name for, so the run stays out of the pool;
-/// one the device refused attached nothing, and the run goes back.
 #[test]
-fn a_blobs_backing_is_kept_only_when_the_create_was_never_answered() {
+fn a_submission_keeps_its_signal_source_alive_until_retirement() {
     test_hooks::install();
-    let (shared, control, submit) = gpu3d_channels(true);
+    let (shared, control, submit) = channels(true);
     let device = FakeGpu3d::new();
-    let ownership = claimed(&shared);
-    let runs = test_hooks::live_runs();
-
+    let ownership = opened(&shared);
     with_servers(&device, &shared, &control, &submit, async {
         let context = create_context(&ownership).await;
-
-        *device.fail_creates.lock().expect("no test panics here") = Some(false);
-        let refused = request_blob(
-            &ownership,
-            context.id,
-            BlobMemory::Guest,
-            BlobUsage::empty(),
-        )
-        .await;
-        assert!(refused.is_err());
-        settle().await;
+        let source = TimelineSource::new(0);
+        let reader = source.reader();
+        let (release, hold) = oneshot::channel();
+        *device.submit_hold.lock().unwrap() = Some(hold);
         assert_eq!(
-            test_hooks::live_runs(),
-            runs,
-            "an answered refusal frees the backing"
+            context
+                .submit(
+                    0,
+                    page_commands(),
+                    Some(SubmitCompletion {
+                        fence: FenceId::new(1),
+                        signals: alloc::vec![CompletionSignal {
+                            source: source.clone(),
+                            value: 7,
+                        }],
+                    }),
+                )
+                .await,
+            Ok(())
         );
+        drop(source);
+        let mut wait = pin!(reader.wait(7));
+        assert!(poll_once(wait.as_mut()).await.is_none());
+        assert_eq!(reader.value(), Ok(0));
+        release.send(()).unwrap();
+        assert_eq!(wait.await, Ok(()));
+        assert_eq!(reader.wait(8).await, Err(TimelineError::Closed));
+    });
+}
 
-        *device.fail_creates.lock().expect("no test panics here") = Some(true);
-        let unanswered = request_blob(
-            &ownership,
-            context.id,
-            BlobMemory::Guest,
-            BlobUsage::empty(),
-        )
-        .await;
-        assert!(unanswered.is_err());
-        settle().await;
+#[test]
+fn a_context_fault_fails_signals_while_an_earlier_submission_is_still_pending() {
+    test_hooks::install();
+    let (shared, control, submit) = channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = opened(&shared);
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let source = TimelineSource::new(0);
+        let reader = source.reader();
+        let (release, hold) = oneshot::channel();
+        *device.submit_hold.lock().unwrap() = Some(hold);
         assert_eq!(
-            test_hooks::live_runs() - runs,
-            1,
-            "a create the device never answered keeps its backing"
+            context
+                .submit(
+                    0,
+                    page_commands(),
+                    Some(SubmitCompletion {
+                        fence: FenceId::new(1),
+                        signals: alloc::vec![CompletionSignal { source, value: 1 }],
+                    }),
+                )
+                .await,
+            Ok(())
         );
+        *device.refuse_context.lock().unwrap() = Some(context.id());
+        assert_eq!(submit_on(&context, 0, Some(2)).await, Ok(()));
+        assert_eq!(reader.wait(1).await, Err(TimelineError::Failed));
+        release.send(()).unwrap();
+        settle().await;
+        assert_eq!(reader.value(), Err(TimelineError::Failed));
     });
 }

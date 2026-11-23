@@ -28,6 +28,10 @@ inputs:
     description: Directory the Helios checkout is in, relative to the workspace.
     required: false
     default: helios
+  tooling-path:
+    description: Checkout providing the collection tools; defaults to checkout-path.
+    required: false
+    default: ''
   lane:
     description: >-
       Benchmark lane whose machine and workloads the profile describes,
@@ -54,13 +58,21 @@ inputs:
     description: The bridge the tap interface is attached to.
     required: false
     default: helios-br0
+  workload-timeout-seconds:
+    description: Deadline for each profile collection and raw profile export.
+    required: false
+    default: '600'
+  diagnostics-name:
+    description: Artifact name for failed collection logs.
+    required: false
+    default: kernel-profile-diagnostics
 runs:
   using: composite
   steps:
     - name: Read the lane
       id: lane
       shell: bash
-      working-directory: ${{ inputs.checkout-path }}/tools/bench
+      working-directory: ${{ inputs.tooling-path || inputs.checkout-path }}/tools/bench
       run: |
         # The collection boots the lane's own workloads, so it boots the
         # lane's machine: a guest smaller than the one the suite times
@@ -68,7 +80,8 @@ runs:
         # definition of the one in tools/bench/manifest.toml.
         entry="$(uv run helios-bench lanes --select "${{ inputs.lane }}" --format github-matrix | jq -c '.[0]')"
         printf 'memory=%s\n' "$(printf '%s' "$entry" | jq -r '.memory')" >> "$GITHUB_OUTPUT"
-        printf 'rpc-transport=%s\n' "$(printf '%s' "$entry" | jq -r '."rpc-transport"')" >> "$GITHUB_OUTPUT"
+        printf 'vcpus=%s\n' "$(printf '%s' "$entry" | jq -r '.vcpus')" >> "$GITHUB_OUTPUT"
+        printf 'rpc-transport=%s\n' "$(printf '%s' "$entry" | jq -r '.["rpc-transport"]')" >> "$GITHUB_OUTPUT"
     - name: Put llvm-profdata on PATH
       # The inspector merges the raw profile before it writes anything and
       # names this tool if it cannot find it; the toolchain's own copy is
@@ -92,7 +105,11 @@ runs:
         mkdir -p "${RUNNER_TEMP}/kernel-profile-raw"
         ./target/release/helios-inspector vm --arch x86-64 --profile-generate \
           --accel kvm --memory "${{ steps.lane.outputs.memory }}" \
+          --smp "${{ steps.lane.outputs.vcpus }}" \
+          --rpc-transport "${{ steps.lane.outputs.rpc-transport }}" \
+          --runtime-dir "${RUNNER_TEMP}/kernel-profile-raw/aot-runtime" \
           aot-bench artifacts/wasi-tools/curl.wasm --iterations 2 \
+          --timeout-seconds "${{ inputs.workload-timeout-seconds }}" \
           --llvm-raw-profile-output "${RUNNER_TEMP}/kernel-profile-raw/aot-bench.profraw"
     - name: Provision the tap network backend
       shell: bash
@@ -112,24 +129,26 @@ runs:
         HELIOS_LIMINE_SHARE: ${{ inputs.limine-dir }}
         HELIOS_LIMINE_BIN: ${{ inputs.limine-dir }}/limine
       run: |
-        # Every class the suite runs, the network class on the tap
-        # backend the suite times it on, so the profile covers every
-        # workload the kernel is measured on (#315).
-        # --keep-going for the same reason the suite passes it: a
-        # workload this machine cannot run is a recorded failure and not
-        # the end of the pass. instance-startup-500 wants more guest than
-        # the lane has and exhausts the pooling allocator's core-instance
-        # limit (run 34012834611, job 101431842184); the profile is the
-        # counts of everything that did run, and losing the classes after
-        # it would collect nothing for them.
-        ./target/release/helios-inspector vm --arch x86-64 --profile-generate \
-          --accel kvm --memory "${{ steps.lane.outputs.memory }}" \
-          --rpc-transport "${{ steps.lane.outputs.rpc-transport }}" \
-          --net-backend tap --net-queues "$(nproc)" \
+        uv run --project "${{ github.workspace }}/${{ inputs.tooling-path || inputs.checkout-path }}/tools/bench" \
+          helios-bench collect-profile \
+          --lane "${{ inputs.lane }}" \
+          --checkout-path "${{ github.workspace }}/${{ inputs.checkout-path }}" \
+          --output "${RUNNER_TEMP}/kernel-profile-raw/workloads.profraw" \
+          --net-queues "$(nproc)" \
           --net-ifname "${{ inputs.net-ifname }}" \
           --net-bridge "${{ inputs.net-bridge }}" \
-          workload-bench --iterations 1 --keep-going \
-          --llvm-raw-profile-output "${RUNNER_TEMP}/kernel-profile-raw/workloads.profraw"
+          --timeout-seconds "${{ inputs.workload-timeout-seconds }}"
+    - name: Upload failed profile diagnostics
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.diagnostics-name }}
+        path: |
+          ${{ runner.temp }}/kernel-profile-raw/aot-runtime
+          ${{ runner.temp }}/kernel-profile-raw/aot-bench.profraw
+          ${{ runner.temp }}/kernel-profile-raw/workloads.jsonl
+          ${{ runner.temp }}/kernel-profile-raw/workload-runtime
+        if-no-files-found: ignore
     - name: Remove the tap network backend
       if: always()
       shell: bash

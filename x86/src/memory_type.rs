@@ -1,71 +1,40 @@
-//! The memory types a user mapping of a device region takes.
+//! Bring-up of the `IA32_PAT` table the user mappings' memory types
+//! select from.
 //!
-//! A 4 KiB leaf entry selects one of eight `IA32_PAT` entries with
-//! `index = PAT << 2 | PCD << 1 | PWT` (Intel SDM Vol. 3A, Table 13-11
-//! "Selection of PAT Entries with PAT, PCD, and PWT Flags"). This backend
-//! never writes `IA32_PAT`, so the table is the power-up value of SDM
-//! Vol. 3A Table 13-12 "Memory Type Setting of PAT Entries Following a
-//! Power-up or Reset": entry 0 is write-back and entry 3 (`PWT | PCD`) is
-//! uncacheable, the encoding the kernel's own register-file mappings in
-//! `smp.rs` already use. The two kinds of [`MemoryKind`] need exactly those
-//! two entries, and the `PAT` bit is never set.
+//! The leaf encoding of each memory type is
+//! [`helios_x86_vmm::memory_type`]'s; this module programs the one
+//! entry that encoding needs changed from its power-up value (SDM Vol.
+//! 3A Table 13-12 "Memory Type Setting of PAT Entries Following a
+//! Power-up or Reset"), which a leaf selects with `PAT` alone.
 
-use helios_hal::device::{DeviceRegionAttributes, MemoryKind};
-use x86_64::structures::paging::PageTableFlags;
+use helios_x86_vmm::memory_type::WRITE_COMBINING_ENTRY;
+use x86::msr::{IA32_PAT, rdmsr, wrmsr};
 
-/// The bits of a leaf entry that select the memory type: `PWT` and `PCD`.
-pub(crate) const MEMORY_TYPE_BITS: PageTableFlags =
-    PageTableFlags::WRITE_THROUGH.union(PageTableFlags::NO_CACHE);
+/// The memory-type encoding of write-combining in an `IA32_PAT` entry
+/// (SDM Vol. 3A, Table 13-10 "Memory Types That Can Be Encoded With
+/// PAT").
+const PAT_TYPE_WRITE_COMBINING: u64 = 0x01;
 
-/// The `PWT`/`PCD` bits a region's kind calls for: none (write-back) for
-/// memory the processor may treat as RAM, both (uncacheable) for a
-/// register file.
-const fn memory_type_flags(kind: MemoryKind) -> PageTableFlags {
-    match kind {
-        MemoryKind::Normal => PageTableFlags::empty(),
-        MemoryKind::Device => MEMORY_TYPE_BITS,
-    }
-}
-
-/// The leaf flags that show a device region: present, never executable,
-/// writable only when the region is, and the region's memory type.
-pub(crate) fn device_leaf_flags(attributes: DeviceRegionAttributes) -> PageTableFlags {
-    let mut flags =
-        PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE | memory_type_flags(attributes.kind);
-    if attributes.writable {
-        flags |= PageTableFlags::WRITABLE;
-    }
-    flags
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn read_only_register_file_is_uncacheable_and_not_writable() {
-        assert_eq!(
-            device_leaf_flags(DeviceRegionAttributes::READ_ONLY_REGISTERS),
-            PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE | MEMORY_TYPE_BITS
-        );
-    }
-
-    #[test]
-    fn writable_register_file_is_uncacheable_and_writable() {
-        assert_eq!(
-            device_leaf_flags(DeviceRegionAttributes::REGISTERS),
-            PageTableFlags::PRESENT
-                | PageTableFlags::NO_EXECUTE
-                | PageTableFlags::WRITABLE
-                | MEMORY_TYPE_BITS
-        );
-    }
-
-    #[test]
-    fn prefetchable_memory_is_write_back() {
-        assert_eq!(
-            device_leaf_flags(DeviceRegionAttributes::PREFETCHABLE_MEMORY),
-            PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE | PageTableFlags::WRITABLE
-        );
+/// Programs `IA32_PAT` entry [`WRITE_COMBINING_ENTRY`] to
+/// write-combining on the calling processor, keeping every other entry
+/// as it is.
+///
+/// Called once on every processor during its bring-up, before it can
+/// run anything that maps device memory: the SDM requires every
+/// processor to hold the same table (Vol. 3A §13.12.4 "Programming the
+/// PAT"). No mapping selects entry 4 before this runs — nothing in this
+/// backend sets the `PAT` bit before it — so no translation the
+/// processor already caches changes memory type, which is what lets the
+/// write skip the cache-disable procedure §13.11.8 prescribes for
+/// changing a type that is in use.
+pub(crate) fn program_page_attribute_table() {
+    let shift = WRITE_COMBINING_ENTRY * 8;
+    // SAFETY: `IA32_PAT` exists on every processor this backend boots
+    // (PAT support is architectural on x86-64), and the only entry the
+    // write changes is one no mapping selects yet.
+    unsafe {
+        let table = rdmsr(IA32_PAT);
+        let table = (table & !(0xff << shift)) | (PAT_TYPE_WRITE_COMBINING << shift);
+        wrmsr(IA32_PAT, table);
     }
 }

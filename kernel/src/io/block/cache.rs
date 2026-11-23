@@ -924,6 +924,7 @@ pub(super) struct CacheDisk<Device> {
 /// The cache's state for one disk; the device itself is the cache's
 /// handle on it, in [`CacheShared`].
 struct DiskState {
+    mount: Arc<crate::RawRwLock>,
     serial: BlockSerial,
     layout: DiskLayout,
     read_only: bool,
@@ -939,6 +940,7 @@ struct DiskState {
 impl DiskState {
     fn new<Device>(disk: &CacheDisk<Device>, processors: usize, entries: usize) -> Self {
         Self {
+            mount: Arc::new(crate::RawRwLock::new()),
             serial: disk.serial,
             layout: disk.layout,
             read_only: disk.read_only,
@@ -2389,6 +2391,16 @@ where
 
     fn state(&self) -> &DiskState {
         &self.shared().disks[self.disk]
+    }
+
+    /// Claim a shared read-only mount. Existing writable mounts exclude it.
+    pub(crate) fn read_mount(&self) -> Option<crate::OwnedRawRwLockReadLease> {
+        self.state().mount.try_read_owned()
+    }
+
+    /// Claim the sole writable mount, excluding independent reader snapshots.
+    pub(crate) fn write_mount(&self) -> Option<crate::OwnedRawRwLockWriteLease> {
+        self.state().mount.try_write_owned()
     }
 
     /// The serial the disk reported.

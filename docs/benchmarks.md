@@ -70,7 +70,7 @@ reason under the table the cell is missing from.
 | fs | `fs-smallfiles`, `fs-readstream` | coreutils on the embedded filesystem root | `coreutils-wasi.wasm` under `wasmtime run --dir` | ext4 in the guest |
 | compute | `quickjs-loop`, `cpython-json`, `cpython-regex`, `wasm-simd-lanes` | interpreter or SIMD loops | same wasm | native QuickJS/CPython/NEON-or-SSE probe |
 | compute | `cpython-startup`, `cpython-import-json` | the CPython row decomposed — interpreter start-up alone, then start-up plus `import json` over the host share | same wasm | native CPython |
-| compute | `aot-curl` | compiler plugin AOT of `curl.wasm` for the kernel target, performance hint, the kernel's worker count | the same compiler plugin under Wasmtime on Linux (`helios-compiler-host`), the same input, target, hint and worker count | `wasmtime compile` of the same input (a reference, uncompared) |
+| compute | `aot-curl` | compiler plugin AOT of `curl.wasm` for the kernel target, performance hint, the kernel's worker count | the same compiler plugin under Wasmtime on Linux (`helios-compiler-host`), the same input, target, ISA level (the one the Helios guest reports), hint and worker count | `wasmtime compile` of the same input (a reference, uncompared) |
 
 `headline: true` marks the rows the README table and the regression gate
 carry. Every compared row is a parity check, not a claim: Helios running
@@ -258,7 +258,7 @@ Per cell (workload × side), `iterations` executions (11 by default):
     from both images: a missing, failed or variance-rejected cell blocks
     as incomplete paired evidence, rather than disappearing from the
     acceptance decision. Comparable rows remain in the report.
-  - **Cross-run**, against the newest `dev` report of the same lane:
+  - **Cross-run**, against the newest `main` report of the same lane:
     another job, another runner. This half blocks only when both reports
     are publishable *and* their run records name the same host CPU;
     otherwise it comments the table and enforces nothing.
@@ -280,7 +280,7 @@ nanoseconds from `rpc-arrival`:
 | --- | --- |
 | `rpc_arrival_ns` | the launch call entered the kernel; always `0`, the epoch |
 | `source_read_ns` | the program's bytes are read out of their source (`source_bytes` carries the size) |
-| `trust_ns` | artifact trust established — the bootfs trailer parse, the signature check for a signed artifact, or — on a raw-wasm source — the whole in-kernel compile+sign between `load_begin` and here |
+| `trust_ns` | artifact trust established — the bootfs artifact hand-off, the signature check for a signed artifact, or — on a raw-wasm source — the whole in-kernel compile+sign between `load_begin` and here |
 | `cache_lookup_ns` | the deserialize cache answered (`cache_hit` carries its answer) |
 | `deserialize_ns` | the `cwasm` payload deserialized; present only on a cache miss |
 | `instantiate_pre_ns` | the `InstancePre` cache answered or `instantiate_pre` built (`instantiate_pre_hit`) |
@@ -443,9 +443,9 @@ that a ratio against the unsampled Linux columns is not evidence. The
 gate keeps its verdicts only between columns sampled alike. The paired
 table says both columns carried the sampler and at what period, and
 keeps its verdicts; a report whose two columns disagree is refused. The
-cross-run table compares against a `dev` report that was not sampled, so
+cross-run table compares against a `main` report that was not sampled, so
 a sampled candidate's cross-run comparison is refused, and so is an
-unsampled candidate's against a sampled `dev` report: the refusal names
+unsampled candidate's against a sampled `main` report: the refusal names
 both sides' sampling and neither blocks nor passes, while the paired
 table stands. A sampled run with no paired table has nothing the gate
 can compare and fails naming why.
@@ -667,6 +667,36 @@ elapsed before the lane moved (#413: `instance-startup-1` measured
 provenance and the report's pins name the transport, and a lane on a
 host with no vhost-vsock (macOS) says `serial` and is read as such.
 
+On a `serial` lane that reading would put the serial line inside every
+Helios launch and nothing like it inside the Linux column, which is
+timed in its guest around the process. So there a launch is compared on
+the kernel's own clock: the `exec` reply carries `launch-nanos`, from
+the launch call's arrival in the kernel to its result being in hand, the
+inspector records it as `launch_elapsed_ms`, and the report compares
+that. `helios_bench.sources.compared_clock` is the one place a row's
+clock is chosen: a Linux row is `guest-process`, a Helios launch is
+`kernel-launch` on a `serial` lane and `host-round-trip` on a `vsock`
+one, and a Helios workload that launches no program (`aot-curl`) keeps
+the host clock on either. Every iteration in `report.json` names its
+`clock` and keeps `host_elapsed_ms` beside the compared value, and the
+tables say under each class which clock its rows were read from.
+
+### Both guests' RAM is backed the same way
+
+The Fedora guest's RAM is a preallocated `memory-backend-ram`
+(`guest_ram_backend` in `fedora_qemu_baseline.py`). A guest whose RAM
+QEMU maps lazily pays a host page fault on the first touch of every
+page, so a comparison boots Helios with `--guest-ram prealloc` as well
+(`HELIOS_WORKLOAD_BENCH_GUEST_RAM`, set by the runner). The inspector's
+run record states the backing it booted with, the pins print both
+guests', and a report from an inspector that predates the option is
+refused instead of read as if the backings matched.
+
+A lane gives its two guests one memory size. `manifest.toml` refuses a
+lane whose `memory` and `linux_vm_memory` differ unless it states
+`memory_differs_because`, and refuses the reason on a lane whose sizes
+agree, so the reason lives beside the two fields it explains.
+
 ## Dedicated runners
 
 Publishable numbers come from a self-hosted machine registered with this
@@ -689,7 +719,7 @@ Until that machine exists, the lane runs on its hosted stand-in in
 says so, and nothing blocks. The stand-in has the lane's accelerator and
 its network backend; what it cannot promise is an idle machine or a fixed
 governor. The repository variable `HELIOS_BENCH_DEDICATED=true` turns on
-the dedicated-runner runs for pushes to `dev`; tags always use the
+the dedicated-runner runs for pushes to `main`; tags always use the
 dedicated label.
 
 Every difference between the host a run is taken on and the lane it
@@ -715,7 +745,7 @@ uv run helios-bench run --lane x86-64-kvm --out-dir … --baseline-ref
 ```
 
 Given a ref, `--baseline-ref` resolves it; given none, it means the merge
-base with `dev`, the commit the branch is a change to. The suite checks
+base with `main`, the commit the branch is a change to. The suite checks
 that commit out as a git worktree, `<candidate dir>-baseline-<sha12>`,
 and times its guest against the candidate's.
 
@@ -843,9 +873,9 @@ monitor socket with both guest images already built. The inspector puts
 own under `$XDG_RUNTIME_DIR` and links it as `<runtime>/sockets`; see
 `docs/debug-serial.md`.
 
-`bench-suite.yml` runs a pull request in paired mode against the `dev`
+`bench-suite.yml` runs a pull request in paired mode against the `main`
 commit it is merged against (the first parent of the merge commit the
-run checks out, not the event's `base.sha`, which is the tip `dev` had
+run checks out, not the event's `base.sha`, which is the tip `main` had
 when the pull request was opened), and `workflow_dispatch` takes a
 `baseline_ref` input. An advisory dispatch with an explicit baseline is
 revision acceptance: it runs only `helios` and `helios_baseline`, with

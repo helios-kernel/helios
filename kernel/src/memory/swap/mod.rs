@@ -26,11 +26,18 @@
 //! instruction is retried; the runtime above never learns a fault
 //! happened.
 //!
-//! Kernel code is not on a fiber and has no trampoline. **Any kernel
-//! path that reads or writes user memory directly must call
-//! [`SwapHandle::ensure_present`] on the range first.** A fault taken
-//! outside a fiber is fatal, and it is fatal on purpose: silently
-//! resolving it would need a nested executor.
+//! Kernel code is not on a fiber and has no trampoline, and neither is a
+//! host call that already holds its fiber's blocking context (an async
+//! host function, polled inside the fiber's `block_on`). A fault taken
+//! there is fatal, and it is fatal on purpose: silently resolving it
+//! would need a nested executor. **A kernel or runtime path may touch a
+//! guest page only during a turn of the page's own instance, after
+//! seeing the page present in that same poll, with no await between the
+//! check and the copy. When a page is absent the path awaits its
+//! fault-in, which ends the turn, and checks again in its next poll.**
+//! [`GuestResidency::with_present`] is that contract as an accessor, and
+//! the Wasmtime adapter's residency hook is the same check for the
+//! copies the runtime makes for streams and futures.
 //!
 //! The matching half of that contract is enforced here rather than at
 //! every host call: **a page is only ever detached from an instance
@@ -39,6 +46,18 @@
 //! context, so the trampoline could not block again to fault a page
 //! back in. Both eviction phases below take that bar; the difference
 //! between them is how long the instance has to have been off.
+//!
+//! The bar holds at the moment of each detach, not at the moment a
+//! victim was picked. A pass picks its victims once and then awaits the
+//! device for every page, and any victim may begin a turn during one of
+//! those awaits. So the only way to a detach is
+//! [`SwapVmHooks::detach_page`], which takes the
+//! [`OffProcessor`] proof that
+//! [`InstanceRegistry::while_off_processor`] lends: the page's instance
+//! had no store on a processor when the hold was granted, and none can
+//! begin a turn until the detach — leaf, shootdown and copy — is done.
+//! A victim that is running when its next page comes up refuses the
+//! hold, and the pass leaves it.
 //!
 //! "On a processor" is a store's processor turn (`crate::StoreTurns`):
 //! the poll of the future that drives its guest, synchronous host calls
@@ -56,10 +75,11 @@
 //! `Red` phase — which takes only cold pages — passes over it; and an
 //! instance that has just taken a fault or made a host call is by
 //! definition not ten seconds idle, so the `Yellow` phase, which
-//! ignores age, has no claim on it either. That is what makes
-//! [`SwapHandle::ensure_present`] a sound contract for kernel paths:
-//! the pages it faults in stay in until the host call that asked for
-//! them has finished with them.
+//! ignores age, has no claim on it either. Neither property keeps a page
+//! in across an await, though: an await ends the instance's turn, and
+//! from then on the page may leave again. A page faulted in ahead of a
+//! copy that comes after an await is no guarantee at all, which is why
+//! the check and the copy share a poll.
 //!
 //! # Order against the balloon
 //!
@@ -77,7 +97,10 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::task::{Context, Poll, ready};
 use core::time::Duration;
 
 use concurrent_queue::ConcurrentQueue;
@@ -90,8 +113,8 @@ use spin::Once;
 use thiserror::Error;
 
 use crate::exec::Spawner;
-use crate::exec::{PressureLevel, monotonic_nanos};
-use crate::instance::InstanceRegistry;
+use crate::exec::{NotifyWaiter, PressureLevel, monotonic_nanos};
+use crate::instance::{InstanceId, InstanceRegistry, OffProcessor};
 use crate::{Notify, Timer};
 
 use super::owner::MemoryOwner;
@@ -203,7 +226,10 @@ pub struct SwapStats {
 /// it.
 pub struct SwapVmHooks {
     /// Detach one committed page, copying it into the caller's buffer.
-    pub swap_out_page: fn(VirtAddr, SwapToken, &mut [u8]) -> Result<PageFlags, AddressSpaceError>,
+    /// Reached only through [`Self::detach_page`], which asks for the
+    /// proof that the page's instance is off every processor.
+    pub(crate) swap_out_page:
+        fn(VirtAddr, SwapToken, &mut [u8]) -> Result<PageFlags, AddressSpaceError>,
     /// Reinstate one page from the caller's buffer.
     pub swap_in_page: fn(VirtAddr, &[u8]) -> Result<SwapToken, AddressSpaceError>,
     /// The token the entry at this address carries. Lock-free; the
@@ -222,6 +248,26 @@ pub struct SwapVmHooks {
     /// fault entry and the pre-fault accessor: neither holds a `Cpu`, and
     /// the handle they reach swap through cannot be generic over one.
     pub now_ticks: fn() -> u64,
+}
+
+impl SwapVmHooks {
+    /// Detach the committed page at `addr`, which belongs to the instance
+    /// `off` holds off every processor, leaving `token` in its entry and
+    /// its bytes in `out`.
+    ///
+    /// The proof is what keeps a page from leaving an instance that may
+    /// be inside a host call (see the module docs); every path that takes
+    /// a page out of memory, whatever it does with the bytes afterwards,
+    /// comes through here.
+    pub fn detach_page(
+        &self,
+        _off: &OffProcessor<'_>,
+        addr: VirtAddr,
+        token: SwapToken,
+        out: &mut [u8],
+    ) -> Result<PageFlags, AddressSpaceError> {
+        (self.swap_out_page)(addr, token, out)
+    }
 }
 
 /// What [`SwapVmHooks::scan_committed_pages`] calls for each page it
@@ -378,67 +424,171 @@ impl SwapHandle {
     /// device.
     ///
     /// This is what the page-fault trampoline blocks the faulting fiber
-    /// on, and what [`Self::ensure_present`] calls per page.
+    /// on, and what [`GuestResidency`] awaits for a page a kernel or
+    /// runtime copy found absent. The request is queued when the future
+    /// is first polled.
     ///
     /// Callers ask about an address whose entry carried a swap token when
     /// they looked. Succeeding means the page is present now: it was read
     /// back for this request, or another request got there first. The
     /// instruction is retried either way, and if the entry has since been
     /// released or decommitted the retry takes a fresh fault that the
-    /// fault entry classifies again.
-    pub async fn fault_in(&self, addr: VirtAddr) -> Result<(), SwapFaultError> {
-        // A fault reports the address the instruction touched, not the
-        // page it lives in; everything below this point works in pages.
-        let addr = addr.page_floor();
-        let reply = Arc::new(SwapFaultReply::new());
-        let request = SwapFaultRequest {
-            addr,
-            reply: reply.clone(),
-            issued_nanos: self.shared.clock.now_nanos(),
-        };
-        if self.shared.faults.push(request).is_err() {
-            // The queue is full or closed. Either way nothing will ever
-            // read this page back, and a caller that returns to the
-            // faulting instruction would fault forever.
-            return Err(SwapFaultError::Backend);
+    /// fault entry classifies again. Present *now* is all it means: by the
+    /// time the waiter is next polled its instance may have been off a
+    /// processor long enough for the page to leave again, so a copy
+    /// checks for itself in the poll that makes it.
+    pub fn fault_in(&self, addr: VirtAddr) -> SwapFaultIn {
+        SwapFaultIn {
+            shared: self.shared.clone(),
+            // A fault reports the address the instruction touched, not
+            // the page it lives in; everything below this point works in
+            // pages.
+            addr: addr.page_floor(),
+            issued: None,
         }
-        self.shared.work.notify_one_coalesced();
-        loop {
-            if let Some(outcome) = reply.read() {
-                return outcome;
-            }
-            reply.ready.notified().await;
-        }
-    }
-
-    /// Reads back every swapped-out page in `range`.
-    ///
-    /// Kernel code that touches user memory directly — a host call
-    /// copying a guest buffer, a byte channel taking bytes out of guest
-    /// memory, a DMA source built over a guest slice — calls this before
-    /// the copy. Kernel stacks have no fault trampoline, so a fault
-    /// there is fatal by design; pre-faulting is how those paths stay
-    /// correct.
-    pub async fn ensure_present(&self, range: VirtRange) -> Result<(), SwapFaultError> {
-        let Some(hooks) = installed_swap_hooks() else {
-            return Ok(());
-        };
-        let mut addr = range.start.page_floor().raw();
-        let end = range.end().raw();
-        while addr < end {
-            let page = VirtAddr::new(addr);
-            if (hooks.swapped_token)(page).is_some() {
-                self.fault_in(page).await?;
-            }
-            addr += PhysFrame::SIZE;
-        }
-        Ok(())
     }
 
     /// Wakes the policy, for callers that have just changed how much
     /// memory is free.
     pub fn poke(&self) {
         self.shared.work.notify_one_coalesced();
+    }
+}
+
+/// A page being read back in for [`SwapHandle::fault_in`].
+///
+/// One waiter: whoever polls it. The swap service settles the reply from
+/// whatever processor it runs on, and the settle stores a permit, so the
+/// outcome is never missed whichever of the two gets there first.
+#[must_use = "a fault-in is queued when it is first polled"]
+pub struct SwapFaultIn {
+    shared: Arc<SwapShared>,
+    addr: VirtAddr,
+    /// The request once it is queued, and the wait on its reply.
+    issued: Option<IssuedFault>,
+}
+
+struct IssuedFault {
+    reply: Arc<SwapFaultReply>,
+    waiter: NotifyWaiter,
+}
+
+impl Future for SwapFaultIn {
+    type Output = Result<(), SwapFaultError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let issued = match &mut this.issued {
+            Some(issued) => issued,
+            None => {
+                let reply = Arc::new(SwapFaultReply::new());
+                let request = SwapFaultRequest {
+                    addr: this.addr,
+                    reply: reply.clone(),
+                    issued_nanos: this.shared.clock.now_nanos(),
+                };
+                if this.shared.faults.push(request).is_err() {
+                    // The queue is full or closed. Either way nothing will
+                    // ever read this page back, and a caller that returns to
+                    // the faulting instruction would fault forever.
+                    return Poll::Ready(Err(SwapFaultError::Backend));
+                }
+                this.shared.work.notify_one_coalesced();
+                let waiter = reply.ready.waiter();
+                this.issued.insert(IssuedFault { reply, waiter })
+            }
+        };
+        loop {
+            if let Some(outcome) = issued.reply.read() {
+                return Poll::Ready(outcome);
+            }
+            ready!(issued.reply.ready.poll_notified(cx, &mut issued.waiter));
+        }
+    }
+}
+
+/// What a kernel or runtime path checks before it copies to or from a
+/// guest page swap may have taken.
+///
+/// # Concurrency
+///
+/// Every check is lock-free: it reads the page-table entries of the
+/// range through [`SwapVmHooks::swapped_token`], which any processor may
+/// call at any time, and the swap handle's `Once`. A fault-in it hands
+/// out queues one request on the swap service and parks on that
+/// request's own reply. A check answers for the moment it runs; it
+/// stays true for the rest of the poll only because a page is detached
+/// solely from an instance that is off every processor, and the check
+/// runs inside a turn of the page's own instance (see the module docs).
+#[derive(Clone, Copy)]
+pub struct GuestResidency {
+    hooks: &'static SwapVmHooks,
+    /// Published once the swap device comes up, which may be after the
+    /// stores that consult this were built. Until then no page has been
+    /// taken, so no check needs to walk anything.
+    handle: &'static Once<SwapHandle>,
+}
+
+impl GuestResidency {
+    /// The machine's swap, or `None` when the platform cannot swap at all
+    /// (its address space installed no swap hooks), in which case no guest
+    /// page is ever absent and nothing needs checking.
+    pub fn installed() -> Option<Self> {
+        Some(Self {
+            hooks: installed_swap_hooks()?,
+            handle: &HANDLE,
+        })
+    }
+
+    /// The first page of `range` that is swapped out right now, or `None`
+    /// when every page of it is present.
+    ///
+    /// A copy that may stop part-way asks this of the span it is about to
+    /// touch and copies only what lies before the page it names.
+    pub fn first_swapped(&self, range: VirtRange) -> Option<VirtAddr> {
+        // Before the swap device comes up no page has been taken.
+        self.handle.get()?;
+        let end = range.end().raw();
+        let mut page = range.start.page_floor().raw();
+        while page < end {
+            let addr = VirtAddr::new(page);
+            if (self.hooks.swapped_token)(addr).is_some() {
+                return Some(addr);
+            }
+            page += PhysFrame::SIZE;
+        }
+        None
+    }
+
+    /// A fault-in of the first page of `range` that is swapped out right
+    /// now, or `None` when every page of it is present.
+    pub fn fault_in_first_swapped(&self, range: VirtRange) -> Option<SwapFaultIn> {
+        let page = self.first_swapped(range)?;
+        let handle = self
+            .handle
+            .get()
+            .expect("a page is swapped out only once the swap handle is published");
+        Some(handle.fault_in(page))
+    }
+
+    /// Runs `access` once every page of `range` is present, in the same
+    /// poll as the check that found them present.
+    ///
+    /// `access` is synchronous, so nothing can await between the check
+    /// and the bytes it touches. Each absent page is faulted in and the
+    /// whole range checked again afterwards, because a page brought back
+    /// for one round may be gone by the next.
+    pub async fn with_present<R>(
+        &self,
+        range: VirtRange,
+        access: impl FnOnce() -> R,
+    ) -> Result<R, SwapFaultError> {
+        loop {
+            match self.fault_in_first_swapped(range) {
+                None => return Ok(access()),
+                Some(fault) => fault.await?,
+            }
+        }
     }
 }
 
@@ -820,7 +970,7 @@ where
         // A request exists only for an address whose entry carried a token
         // when the fault was taken (the backend's fault entry checks
         // `swapped_token` before it enters the trampoline, and
-        // `ensure_present` before it asks). One that carries none now has
+        // `GuestResidency` before it asks). One that carries none now has
         // changed since: an earlier request reinstated the page, which is
         // the case of several guest threads or fibers faulting on one
         // page, or the address space dropped the entry. Either way the
@@ -968,27 +1118,21 @@ where
 
         let now = monotonic_nanos(&self.cpu);
         let idle_after = IDLE_SWAP_AFTER.as_nanos() as u64;
-        let mut candidates: Vec<MemoryOwner> = self
-            .registry
-            .idle_instances(now, idle_after)
-            .into_iter()
-            .map(|id| MemoryOwner::new(id.raw()))
-            .collect();
+        let mut candidates = self.registry.idle_instances(now, idle_after);
         // Largest resident first: one pass over the biggest idle
         // instance frees more than several passes over small ones, and
         // resident bytes come from the address space rather than from
         // what the instance thinks it grew to.
-        candidates.sort_by_key(|owner| {
-            core::cmp::Reverse((self.hooks.owned_resident_bytes)(owner.raw()))
-        });
+        candidates
+            .sort_by_key(|id| core::cmp::Reverse((self.hooks.owned_resident_bytes)(id.raw())));
 
         let mut moved = 0_usize;
-        for owner in &candidates {
+        for id in &candidates {
             if moved >= SWAP_BATCH_BYTES {
                 break;
             }
             moved += self
-                .evict_owner(*owner, SWAP_BATCH_BYTES - moved, EvictionAge::Any)
+                .evict_owner(*id, SWAP_BATCH_BYTES - moved, EvictionAge::Any)
                 .await;
         }
 
@@ -1016,16 +1160,14 @@ where
         // what keeps the kernel out of that corner, and it is why the
         // pre-fault accessor is a contract for kernel paths that hold
         // guest pointers rather than a thing every host call must do.
+        // The list below only nominates; each detach re-establishes the
+        // bar for itself (`evict_owner`).
         for id in self.registry.idle_instances(now, 0) {
             if moved >= SWAP_BATCH_BYTES {
                 break;
             }
             moved += self
-                .evict_owner(
-                    MemoryOwner::new(id.raw()),
-                    SWAP_BATCH_BYTES - moved,
-                    EvictionAge::ColdOnly,
-                )
+                .evict_owner(id, SWAP_BATCH_BYTES - moved, EvictionAge::ColdOnly)
                 .await;
         }
         tracing::debug!(
@@ -1035,9 +1177,26 @@ where
         );
     }
 
-    /// Swaps up to `budget` bytes of `owner`'s pages out, and reports
+    /// Swaps up to `budget` bytes of `instance`'s pages out, and reports
     /// how many bytes actually left memory.
-    async fn evict_owner(&mut self, owner: MemoryOwner, budget: usize, age: EvictionAge) -> usize {
+    ///
+    /// The plan is a scan taken once, and the instance was off every
+    /// processor when it was nominated; neither is true for long. Each
+    /// page is detached under a hold of its own
+    /// ([`InstanceRegistry::while_off_processor`]), taken after the
+    /// previous page's device write has landed, and the first refusal —
+    /// the instance began a turn, or is gone — ends the instance's part
+    /// of the pass. The hold covers the detach and nothing after it: the
+    /// device write runs with the page already out, and a turn that
+    /// begins then meets a swapped page the way it would after any
+    /// earlier pass.
+    async fn evict_owner(
+        &mut self,
+        instance: InstanceId,
+        budget: usize,
+        age: EvictionAge,
+    ) -> usize {
+        let owner = MemoryOwner::new(instance.raw());
         let mut plan = EvictionPlan {
             pages: Vec::new(),
             remaining: budget,
@@ -1064,7 +1223,7 @@ where
             if !self.handle.shared.faults.is_empty() {
                 break;
             }
-            match self.swap_out(addr).await {
+            match self.swap_out(instance, addr).await {
                 Ok(()) => moved += PhysFrame::SIZE,
                 Err(()) => break,
             }
@@ -1080,7 +1239,8 @@ where
         moved
     }
 
-    async fn swap_out(&mut self, addr: VirtAddr) -> Result<(), ()> {
+    /// Swaps out the page at `addr`, which belongs to `instance`.
+    async fn swap_out(&mut self, instance: InstanceId, addr: VirtAddr) -> Result<(), ()> {
         // The index has to exist before the page can be detached: the
         // page-table entry carries it, and the entry has to be in place
         // before the frame goes back to the pool.
@@ -1111,18 +1271,37 @@ where
         // buffer and hands the frame back, all under the address space's
         // own lock: a store from a processor that was still running the
         // instance has landed in the frame before the copy, or faulted.
-        if let Err(error) =
-            (self.hooks.swap_out_page)(addr, handle, &mut page.as_mut()[..PhysFrame::SIZE])
-        {
-            tracing::debug!(
-                target: "helios_kernel::swap",
-                addr = addr.raw(),
-                ?error,
-                "page could not be detached for swap-out"
-            );
-            self.page = Some(page);
-            self.map.free(handle);
-            return Err(());
+        // The hold around it keeps every store of the instance off every
+        // processor until it is done.
+        let hooks = self.hooks;
+        let detached = self.registry.while_off_processor(instance, |off| {
+            hooks.detach_page(off, addr, handle, &mut page.as_mut()[..PhysFrame::SIZE])
+        });
+        match detached {
+            Ok(Ok(_flags)) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    target: "helios_kernel::swap",
+                    addr = addr.raw(),
+                    ?error,
+                    "page could not be detached for swap-out"
+                );
+                self.page = Some(page);
+                self.map.free(handle);
+                return Err(());
+            }
+            Err(refused) => {
+                tracing::debug!(
+                    target: "helios_kernel::swap",
+                    instance = instance.raw(),
+                    addr = addr.raw(),
+                    %refused,
+                    "instance cannot be held off the processors; leaving its pages"
+                );
+                self.page = Some(page);
+                self.map.free(handle);
+                return Err(());
+            }
         }
         // From here the page is not present and its entry points at an
         // empty slot. A guest faulting on it in this window queues a
@@ -1241,6 +1420,8 @@ fn current_pressure() -> PressureLevel {
 
 #[cfg(test)]
 mod service_tests;
+#[cfg(test)]
+pub(crate) use service_tests::{GUEST_SWAP_PAGE, GuestSwap};
 #[cfg(test)]
 mod space_tests;
 

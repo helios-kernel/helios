@@ -1,0 +1,462 @@
+[
+  {
+    "path": "grub-fs-tester.in",
+    "url": "https://raw.githubusercontent.com/rhboot/grub2/b07cc37ca64fe99260884e7325abc333374e098b/tests/util/grub-fs-tester.in",
+    "sha256": "e7648f164c4a16bb0ceada6a68daaf9ced5924a91f2f859933dc6aca92a9800c"
+  },
+  {
+    "path": "garbage-gen.c",
+    "url": "https://raw.githubusercontent.com/rhboot/grub2/b07cc37ca64fe99260884e7325abc333374e098b/util/garbage-gen.c",
+    "sha256": "421e5e652c79529d2789526630a649c76a575d1c8b58d013dda4e6bcb1f2a5cb"
+  },
+  {
+    "path": "corpus/bad-superblock-1.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bad-superblock-1.raw.xz",
+    "sha256": "faf1419f1763925473e763ab1f51c17df273c60afaa5da8c3a38644f5db826ac"
+  },
+  {
+    "path": "corpus/bad-superblock-2.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bad-superblock-2.raw.xz",
+    "sha256": "8902748fd3e0df9aac00d41cee0028bfb22781aaf88ae8bdd1e522a95c91d70c"
+  },
+  {
+    "path": "corpus/bad-superblock-3.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bad-superblock-3.raw.xz",
+    "sha256": "68d7ca3f2154204b0382c9588699ab05968e6065b6e572cd96b32d7d06b1d907"
+  },
+  {
+    "path": "corpus/bad-superblock.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bad-superblock.txt",
+    "sha256": "41faa4d9e75893c329a5591fb25f519de89cf23380cb5d40118e82e41359f7a3"
+  },
+  {
+    "path": "corpus/bko-104131-fsck-oob-read.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-104131-fsck-oob-read.raw.xz",
+    "sha256": "aea378b7f28d1c24e30ac111c238482ad21d335fd745106497fbee66d46b86a6"
+  },
+  {
+    "path": "corpus/bko-104131-fsck-oob-read.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-104131-fsck-oob-read.txt",
+    "sha256": "47475693cd761d39fe1a78e2cdd79e638a85fa0b88144d3b5014fd9fac347054"
+  },
+  {
+    "path": "corpus/bko-104141-fsck-exception.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-104141-fsck-exception.raw.xz",
+    "sha256": "2f5c10ad2213e600c2a4eebf143584d004eefd314d177e80c1dc750c9ad854d2"
+  },
+  {
+    "path": "corpus/bko-104141-fsck-exception.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-104141-fsck-exception.txt",
+    "sha256": "c45c72c5d64ea65b5eddaeed76d1c77526f2c1fb7832bbb3d894082b62a3a2a5"
+  },
+  {
+    "path": "corpus/bko-153641-unaligned-tree-block-bytenr.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-153641-unaligned-tree-block-bytenr.raw.txt",
+    "sha256": "0ea313456fa04d796aa8fbf697f17df74ee75d77559999640cb1180fbca2a045"
+  },
+  {
+    "path": "corpus/bko-153641-unaligned-tree-block-bytenr.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-153641-unaligned-tree-block-bytenr.raw.xz",
+    "sha256": "5efb7770cefcb1bd6c93fc6abdd6e43065e61e06dcfa00ad5b34ba7738b195a6"
+  },
+  {
+    "path": "corpus/bko-154021-invalid-drop-level.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-154021-invalid-drop-level.raw.txt",
+    "sha256": "21cf816d46ff9dff7e8fe7aaa0db09b4cb64ba330b511aacf10719d18252267a"
+  },
+  {
+    "path": "corpus/bko-154021-invalid-drop-level.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-154021-invalid-drop-level.raw.xz",
+    "sha256": "c8bbb9603dbfe2daef5c8077eef3b1cad2dc06f0655f7aaf3186c25a8c60367a"
+  },
+  {
+    "path": "corpus/bko-154961-heap-overflow-chunk-items.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-154961-heap-overflow-chunk-items.raw.txt",
+    "sha256": "cbeb132dbd45b77e89232e04eb495d262909dc453d914db620907034410f7205"
+  },
+  {
+    "path": "corpus/bko-154961-heap-overflow-chunk-items.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-154961-heap-overflow-chunk-items.raw.xz",
+    "sha256": "4f1788f03257eab40beea63a273c061437bb3e28f061ff4d609136ff9a60789a"
+  },
+  {
+    "path": "corpus/bko-155151-bad-block-group-offset.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-155151-bad-block-group-offset.raw.txt",
+    "sha256": "07e88099c68ac317c9d845c44d4e8d087ba07073b308dbcce44a85681994fc54"
+  },
+  {
+    "path": "corpus/bko-155151-bad-block-group-offset.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-155151-bad-block-group-offset.raw.xz",
+    "sha256": "0c677abdc2e70fb1084753d279d33caba36712f828fe340ee4f3534b3c5a4452"
+  },
+  {
+    "path": "corpus/bko-155181-bad-backref.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-155181-bad-backref.raw.txt",
+    "sha256": "5bc86576a4c507a59ed3cc21392dcb798b77809bc4533bd21ab0268f4ac846ba"
+  },
+  {
+    "path": "corpus/bko-155181-bad-backref.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-155181-bad-backref.raw.xz",
+    "sha256": "b2ecc4427cee62463bc1d1fc916d580b06b26ae3d9094b5a10ae6f35a64b486f"
+  },
+  {
+    "path": "corpus/bko-155181-unaligned-extent-item.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-155181-unaligned-extent-item.raw.txt",
+    "sha256": "02f714a6faad41901f7c08dbaca3fcda78fd4ba3385e6c304f4e1389008d7afa"
+  },
+  {
+    "path": "corpus/bko-155181-unaligned-extent-item.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-155181-unaligned-extent-item.raw.xz",
+    "sha256": "aea77674ac9d752693d669d0a62dcc16891faeba99defdcd82f828e7f052e976"
+  },
+  {
+    "path": "corpus/bko-155201-wrong-chunk-item-in-root-tree.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-155201-wrong-chunk-item-in-root-tree.raw.txt",
+    "sha256": "303a1ae49020217711ebb06d2c81391ec43bb829212d76b5c08e32fcb099bb11"
+  },
+  {
+    "path": "corpus/bko-155201-wrong-chunk-item-in-root-tree.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-155201-wrong-chunk-item-in-root-tree.raw.xz",
+    "sha256": "4c451eaab8dee1bef4729254ac7fc427df167b2d9b47f18a7d8c9a426622e617"
+  },
+  {
+    "path": "corpus/bko-155551-unaligned-tree-block.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-155551-unaligned-tree-block.raw.txt",
+    "sha256": "cc53ef37aaf02e94c9df8309e48c2551b521a4b6a14320e3f56f9bab49529fe8"
+  },
+  {
+    "path": "corpus/bko-155551-unaligned-tree-block.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-155551-unaligned-tree-block.raw.xz",
+    "sha256": "20ab45841af75ccd964c0f0dbb06d6af03072a3bcc9cadf508ce9e1f5372dc80"
+  },
+  {
+    "path": "corpus/bko-155621-bad-block-group-offset.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-155621-bad-block-group-offset.raw.txt",
+    "sha256": "b4345eebcca5c88fa9c1bc6cd7e42b5710cfbdb42f86a80b737d6a75557266c8"
+  },
+  {
+    "path": "corpus/bko-155621-bad-block-group-offset.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-155621-bad-block-group-offset.raw.xz",
+    "sha256": "d6963cc25aae62d3dabd9516e50ef9e3fa16efd9315078257353058bb916c8f8"
+  },
+  {
+    "path": "corpus/bko-156471-ubsan-trigger-crc32c-unaligned.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-156471-ubsan-trigger-crc32c-unaligned.raw.txt",
+    "sha256": "bd2109268ace93cbe5150a00334350fed53e9491fac0ac68629a7e6365e8585c"
+  },
+  {
+    "path": "corpus/bko-156471-ubsan-trigger-crc32c-unaligned.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-156471-ubsan-trigger-crc32c-unaligned.raw.xz",
+    "sha256": "5099a9fe7019b80ed4fe447699c1473176fbb98e9e8a95a222de7be120f91dfc"
+  },
+  {
+    "path": "corpus/bko-156731.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-156731.raw.txt",
+    "sha256": "bae5ea6c26a39dd332360e24bf74f89211f57b8fa3394e4f87775a93205a9eba"
+  },
+  {
+    "path": "corpus/bko-156731.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-156731.raw.xz",
+    "sha256": "b60c371979b0a5dd5dc09e5c7ee99162c5d53261ec44a640dee98ce576a3c7df"
+  },
+  {
+    "path": "corpus/bko-156741.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-156741.raw.txt",
+    "sha256": "7275e70433646476f3781f577d35de6c95f93647f98d120afc2c0c65cb260302"
+  },
+  {
+    "path": "corpus/bko-156741.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-156741.raw.xz",
+    "sha256": "7db151dda22fa7a8bcac2146bddb1984231dc9dea79e9cd2531cb073a0cea711"
+  },
+  {
+    "path": "corpus/bko-156811-bad-parent-ref-qgroup-verify.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-156811-bad-parent-ref-qgroup-verify.raw.txt",
+    "sha256": "3c547d64ce7b0e789810441a785c09abb287bb8178062b29ab7e8cfec931b3a0"
+  },
+  {
+    "path": "corpus/bko-156811-bad-parent-ref-qgroup-verify.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-156811-bad-parent-ref-qgroup-verify.raw.xz",
+    "sha256": "ab17c9dc2026888fe5bb1673a0b7cb5d87c5783e6b01e8e208f26cdc48e15f39"
+  },
+  {
+    "path": "corpus/bko-161811.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-161811.raw.txt",
+    "sha256": "d2f0537bcd0fe58ad75bc680a6eb44baacc8d834e7ce5a64fdd8209df989eb05"
+  },
+  {
+    "path": "corpus/bko-161811.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-161811.raw.xz",
+    "sha256": "ef3af86bf65a47dce19246d0cc28e4e4e038236618da7a2f398e891fa6cd80df"
+  },
+  {
+    "path": "corpus/bko-161821.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-161821.raw.txt",
+    "sha256": "e001e56e1b2d9dfae2864b42ae4a6ad643363c28c5f767d21a8beaee60b529d1"
+  },
+  {
+    "path": "corpus/bko-161821.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-161821.raw.xz",
+    "sha256": "d8748747bd7e58bce19d874416cfff786facb5d5c4743d9b0aa9774536fb6317"
+  },
+  {
+    "path": "corpus/bko-166361-blocksize-zero.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-166361-blocksize-zero.raw.txt",
+    "sha256": "ceb64048de6dfe0e528e2fcc186e2068bae363621df7a10306bcfd5666966240"
+  },
+  {
+    "path": "corpus/bko-166361-blocksize-zero.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-166361-blocksize-zero.raw.xz",
+    "sha256": "94dcb6e5457e17971ce95bc9f54334ba81e04ae3aca99e27fda9ba7c937c8eca"
+  },
+  {
+    "path": "corpus/bko-167551.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-167551.raw.txt",
+    "sha256": "f47b338950f8f556c1be118a24d6b27cff582a1ecaa538565c4611a3df095d63"
+  },
+  {
+    "path": "corpus/bko-167551.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-167551.raw.xz",
+    "sha256": "c67319a4495dbb65d120443dd291f1339ecf12370613047bc1b1c260d0fb82b9"
+  },
+  {
+    "path": "corpus/bko-167781.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-167781.raw.txt",
+    "sha256": "7178f42618f64d18867e60f331866e7ccf201e6f66ec52f5235c170fed88c924"
+  },
+  {
+    "path": "corpus/bko-167781.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-167781.raw.xz",
+    "sha256": "e0046773a10905ba0168066081caf6fc6e72c08a896b09bd9ecb3211d33f54c3"
+  },
+  {
+    "path": "corpus/bko-167921.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-167921.raw.txt",
+    "sha256": "951e777dc6f921e6ee1ecfe9c2c518f69651732f0cc063762fb463271ea69ae8"
+  },
+  {
+    "path": "corpus/bko-167921.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-167921.raw.xz",
+    "sha256": "546bca4c8083761e83b93a34df085a8466da8de68d132ac38bc46f1a1a0a8a18"
+  },
+  {
+    "path": "corpus/bko-168301.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-168301.raw.txt",
+    "sha256": "b76663c70ef530b5f85c12fe072d383789b477e0bc4c4475b572cbe69f121695"
+  },
+  {
+    "path": "corpus/bko-168301.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-168301.raw.xz",
+    "sha256": "5d702ac1ff4d915982c32cd0d3344b22119834fe6e4f475f0f066ca4844008db"
+  },
+  {
+    "path": "corpus/bko-169301-1-blocksize-zero.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-169301-1-blocksize-zero.raw.txt",
+    "sha256": "380661a650befe6c1471142aa94f86b1f99513c1268e4695b602fd8743334b64"
+  },
+  {
+    "path": "corpus/bko-169301-1-blocksize-zero.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-169301-1-blocksize-zero.raw.xz",
+    "sha256": "ea113d866ce66ebddc9b5340df1a094f876cfb233977710eee8a194e9395b228"
+  },
+  {
+    "path": "corpus/bko-169301-2-blocksize-zero.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-169301-2-blocksize-zero.raw.txt",
+    "sha256": "bbb66a5b9c778e203ac77fd6781aa509ffc15b2d7eb7ba53dc52edbad4397620"
+  },
+  {
+    "path": "corpus/bko-169301-2-blocksize-zero.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-169301-2-blocksize-zero.raw.xz",
+    "sha256": "18923c26ac7113de40bbd3b7610b4a1e40eae0c43626cb806d771f51037aef74"
+  },
+  {
+    "path": "corpus/bko-169311-blocksize-zero-qgroup-verify.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-169311-blocksize-zero-qgroup-verify.raw.txt",
+    "sha256": "8a786d98c08e57c527bcf8a58e36b48e96fdc6ba363ef3efc4be05bd2f40de77"
+  },
+  {
+    "path": "corpus/bko-169311-blocksize-zero-qgroup-verify.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-169311-blocksize-zero-qgroup-verify.raw.xz",
+    "sha256": "5a3d075263e0029f8e04b9e5797e8e1a347c4a1b22ab9ad58e70f4fef23fb92c"
+  },
+  {
+    "path": "corpus/bko-172811.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-172811.raw.txt",
+    "sha256": "5037de406f375034e8f5e4b230e19f818ba344e8823a9ba52ee2686c9bc5498e"
+  },
+  {
+    "path": "corpus/bko-172811.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-172811.raw.xz",
+    "sha256": "e04b82a48eab45e2e2a17aa56bacf9cf1d9728848e61f9f51cfb1331d09f4c87"
+  },
+  {
+    "path": "corpus/bko-172861.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-172861.raw.txt",
+    "sha256": "3715708ff30cd80a64a81239176d8a0bba673d7587f3559faabfe444e7778261"
+  },
+  {
+    "path": "corpus/bko-172861.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-172861.raw.xz",
+    "sha256": "c02180dbe8155c55da4f90ab928c855cfaaeda925bcc32a4f10eaa49837cb321"
+  },
+  {
+    "path": "corpus/bko-199833-reloc-recovery-crash.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-199833-reloc-recovery-crash.raw.xz",
+    "sha256": "e2e9f9a7b8d4c0228cd58647a7bba8ba4dfa30389db209d85b97675122f75d5d"
+  },
+  {
+    "path": "corpus/bko-199833-reloc-recovery-crash.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-199833-reloc-recovery-crash.txt",
+    "sha256": "7cd966ffeea949e5aaf8cebbf04fa864a6b380d4449316e25ffb7dfd205ca150"
+  },
+  {
+    "path": "corpus/bko-199839.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-199839.raw.txt",
+    "sha256": "f674aa1bef0863a9fa3e0e583fda17dd1aaebad13c49ffc952040c0acc28b3b0"
+  },
+  {
+    "path": "corpus/bko-199839.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-199839.raw.xz",
+    "sha256": "7b246a3da90d1cc0f80c9945071c4106b7ca57302dc323f33c5a0071c2d35a08"
+  },
+  {
+    "path": "corpus/bko-200403.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-200403.raw.txt",
+    "sha256": "b1b26ab6a1383b3c301c532dd198c8e78c771865d05f42936115ab23ae82ebf7"
+  },
+  {
+    "path": "corpus/bko-200403.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-200403.raw.xz",
+    "sha256": "66baa8f3bd79fa4991657ca8c9209ae7242a2e7b364ad6b2aa50666c018ad004"
+  },
+  {
+    "path": "corpus/bko-200409.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-200409.raw.txt",
+    "sha256": "36d16de02c35c8e13306caf1ac456445a87566dcf38ec887c3c8288a77e2a888"
+  },
+  {
+    "path": "corpus/bko-200409.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-200409.raw.xz",
+    "sha256": "d55994788db652e26825258db022aa0b1b59e35db0ff15e90c8d4624a22c4d92"
+  },
+  {
+    "path": "corpus/bko-96971-btrfs-image.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-96971-btrfs-image.raw.xz",
+    "sha256": "078cb91604f6445f3670ae5655aec07a1ea6f997b86372f8b0353f58c3da2b74"
+  },
+  {
+    "path": "corpus/bko-96971-btrfs-image.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-96971-btrfs-image.txt",
+    "sha256": "bf88a154f036f52043c2efbc990140805153baa3a5b29d083bf4858bb0717c17"
+  },
+  {
+    "path": "corpus/bko-97021-invalid-chunk-sectorsize.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-97021-invalid-chunk-sectorsize.raw.txt",
+    "sha256": "bc1ea7b1757c75b0140128032d940af8ffa234e47d1aadefe47e57d21e778ecd"
+  },
+  {
+    "path": "corpus/bko-97021-invalid-chunk-sectorsize.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-97021-invalid-chunk-sectorsize.raw.xz",
+    "sha256": "23fdc4d0ea80d8f3ac35e7e047fb7faa44af3a1d9da1bb0b28323ce6bae4a920"
+  },
+  {
+    "path": "corpus/bko-97031-invalid-stripe-len-sys-array.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-97031-invalid-stripe-len-sys-array.raw.txt",
+    "sha256": "5b1038c2c13d88474f9f705a7183c55e504ffea9e3c6b8d82d7165f1b4a955cd"
+  },
+  {
+    "path": "corpus/bko-97031-invalid-stripe-len-sys-array.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-97031-invalid-stripe-len-sys-array.raw.xz",
+    "sha256": "77f5bfbe7de4de860c99dd8c3c1fdb19ad8c83192aa26f11a4d5d775759b2f5e"
+  },
+  {
+    "path": "corpus/bko-97041-invalid-sub-stripes-zero-FPE.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-97041-invalid-sub-stripes-zero-FPE.raw.txt",
+    "sha256": "c85cbb4e059ccdfe0e9b978bbb60a99fc0a616a5c29ad661e15a642bae61fd7b"
+  },
+  {
+    "path": "corpus/bko-97041-invalid-sub-stripes-zero-FPE.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-97041-invalid-sub-stripes-zero-FPE.raw.xz",
+    "sha256": "28eeb71ecfcc0e8024351f326c6a83a4173a6ae8b48a993927f8ad7f61b1fb1e"
+  },
+  {
+    "path": "corpus/bko-97171-btrfs-image.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-97171-btrfs-image.raw.txt",
+    "sha256": "1345f59e6d9450583597b94d1e7362548567a9356337c83ca3841e6a6c2ffe16"
+  },
+  {
+    "path": "corpus/bko-97171-btrfs-image.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-97171-btrfs-image.raw.xz",
+    "sha256": "44edf8c38bafaf6fcbfc2143130caa1b9730f58853a26822f8daca593b5f9af8"
+  },
+  {
+    "path": "corpus/bko-97191-btrfs-image.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-97191-btrfs-image.raw.txt",
+    "sha256": "5dc868d8334e7646498d0372c3c3571bdb15783fc7d9aeecbbebd0534719a3b5"
+  },
+  {
+    "path": "corpus/bko-97191-btrfs-image.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-97191-btrfs-image.raw.xz",
+    "sha256": "b7d90c7588dfa2bcef7d63e6a2b9e93f655a278475fc50d553f6a6e605d5dd7b"
+  },
+  {
+    "path": "corpus/bko-97271-btrfs-image.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-97271-btrfs-image.raw.txt",
+    "sha256": "0d6edbd4a396f3660ebac634aa66e4db005dd445b45782293d9acc36ea8c0c34"
+  },
+  {
+    "path": "corpus/bko-97271-btrfs-image.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/bko-97271-btrfs-image.raw.xz",
+    "sha256": "702fe0d599ddf2f829b22c73ecb2263b2dff6d8530a709cb79a9b8b0cfe6c810"
+  },
+  {
+    "path": "corpus/superblock-stripsize-bogus.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/superblock-stripsize-bogus.raw.txt",
+    "sha256": "fb36db2a758b71669a8254a809f68e32c26e12fdb801a6f1b73050ef9f9f3c03"
+  },
+  {
+    "path": "corpus/superblock-stripsize-bogus.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/superblock-stripsize-bogus.raw.xz",
+    "sha256": "77be231025bac8575208885ade2cc6d3a83bd8c58c2b06e536e6ea3116b02ad9"
+  },
+  {
+    "path": "corpus/superblock-total-bytes-0.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/superblock-total-bytes-0.raw.txt",
+    "sha256": "1e501cf73f8618d1b2fb461780f996d12c6218102bd4cc8e1e11d4df4934632d"
+  },
+  {
+    "path": "corpus/superblock-total-bytes-0.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/superblock-total-bytes-0.raw.xz",
+    "sha256": "976a407e897a47a8c875c46a363e81c0a0aaae834267063f4c97ddc1b96aa615"
+  },
+  {
+    "path": "corpus/sys-array-num-stripes-0.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/sys-array-num-stripes-0.raw.txt",
+    "sha256": "97d1097831366d40f77b62428e8540dff228a45a2b22aaaaf2136133a22174dd"
+  },
+  {
+    "path": "corpus/sys-array-num-stripes-0.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/sys-array-num-stripes-0.raw.xz",
+    "sha256": "322ee57d77e6ab200771666dd867e9e08083dffd2217edafb673b840f274400c"
+  },
+  {
+    "path": "corpus/sys-chunk-stripe-len-bogus.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/sys-chunk-stripe-len-bogus.raw.txt",
+    "sha256": "654413efa5085ec0138db1ff768dd3ffb02aa0537f30541f3de4b11645625b5a"
+  },
+  {
+    "path": "corpus/sys-chunk-stripe-len-bogus.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/sys-chunk-stripe-len-bogus.raw.xz",
+    "sha256": "8deb3622e60ecf972eb71ee2960a7ec70e01afcb3258a67c70aefddde4b5a9dc"
+  },
+  {
+    "path": "corpus/sys-chunk-type-bogus.raw.txt",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/sys-chunk-type-bogus.raw.txt",
+    "sha256": "e599e37a5074899633baedd3cf64657c3af5388ec22e27334e9d196e4fc057a9"
+  },
+  {
+    "path": "corpus/sys-chunk-type-bogus.raw.xz",
+    "url": "https://raw.githubusercontent.com/kdave/btrfs-progs/afdc3a65e33f4d42f768ad50dca20c32e5ee1496/tests/fuzz-tests/images/sys-chunk-type-bogus.raw.xz",
+    "sha256": "d6997d636a266ddbceb06fecd8cfd11597e11861bb93ce73e032d4c096283da0"
+  }
+]

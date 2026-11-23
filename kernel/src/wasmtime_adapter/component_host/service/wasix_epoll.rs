@@ -1,18 +1,19 @@
 use super::*;
+use crate::memory::SwapFaultError;
 
-pub(super) fn add_wasix_epoll_imports<CpuImpl, Net, HostFs>(
-    linker: &mut CoreLinker<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn add_wasix_epoll_imports<CpuImpl, Net, StorageImpl>(
+    linker: &mut CoreLinker<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     linker
         .func_wrap(
             WASIX_MODULE,
             "epoll_create",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              ret_fd: i32|
              -> i32 { wasix_epoll_create(&mut caller, ret_fd as u32) },
         )
@@ -21,7 +22,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "epoll_ctl",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              epfd: i32,
              op: i32,
              fd: i32,
@@ -33,10 +34,13 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "epoll_wait",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (epfd, events, maxevents, timeout, ret_nevents): (i32, i32, i32, i64, i32)| {
                 Box::new(async move {
-                    wasix_epoll_wait(
+                    // A page of the guest's that could not be read back is
+                    // memory it has lost: it traps rather than reading an
+                    // errno out of memory that is not there.
+                    let errno = wasix_epoll_wait(
                         &mut caller,
                         epfd,
                         events as u32,
@@ -45,6 +49,8 @@ where
                         ret_nevents as u32,
                     )
                     .await
+                    .map_err(wasmtime::Error::new)?;
+                    p1_finish_errno_call(&mut caller, errno).await
                 })
             },
         )
@@ -52,14 +58,14 @@ where
     Ok(())
 }
 
-pub(super) fn wasix_epoll_create<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_epoll_create<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     ret_fd: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -67,17 +73,16 @@ where
     let fd = match caller
         .data_mut()
         .descriptors
-        .insert(Preview1Descriptor::Epoll(EpollDescriptor {
-            interests: Vec::new(),
-        })) {
+        .insert(Preview1Descriptor::Epoll(EpollDescriptor::new()))
+    {
         Ok(fd) => fd,
         Err(errno) => return errno,
     };
     p1_write_u32(caller, memory, GuestAddress::wasm32(ret_fd), fd)
 }
 
-pub(super) fn wasix_epoll_ctl<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_epoll_ctl<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     epfd: i32,
     op: i32,
     fd: i32,
@@ -86,15 +91,21 @@ pub(super) fn wasix_epoll_ctl<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    match caller.data().descriptors.get(epfd) {
-        Some(Preview1Descriptor::Epoll(_)) => {}
-        Some(_) => return p1::errno::INVAL,
-        None => return p1::errno::BADF,
-    }
-    if caller.data().descriptors.get(fd).is_none() {
-        return p1::errno::BADF;
+    let precheck = caller.data().descriptors.with(|descriptors| {
+        match descriptors.get(epfd) {
+            Some(Preview1Descriptor::Epoll(_)) => {}
+            Some(_) => return p1::errno::INVAL,
+            None => return p1::errno::BADF,
+        }
+        if descriptors.get(fd).is_none() {
+            return p1::errno::BADF;
+        }
+        p1::errno::SUCCESS
+    });
+    if precheck != p1::errno::SUCCESS {
+        return precheck;
     }
     let interest = if op == WASIX_EPOLL_CTL_DEL {
         None
@@ -107,59 +118,57 @@ where
             Err(errno) => return errno,
         }
     };
-    let Some(Preview1Descriptor::Epoll(epoll)) = caller.data_mut().descriptors.get_mut(epfd) else {
-        return p1::errno::BADF;
-    };
-    let existing = epoll
-        .interests
-        .iter()
-        .position(|registered| registered.fd == fd);
-    match (op, existing, interest) {
-        (WASIX_EPOLL_CTL_ADD, Some(_), _) => p1::errno::EXIST,
-        (WASIX_EPOLL_CTL_ADD, None, Some(interest)) => {
-            epoll.interests.push(interest);
-            p1::errno::SUCCESS
+    caller.data().descriptors.with_mut(|descriptors| {
+        let Some(Preview1Descriptor::Epoll(epoll)) = descriptors.get_mut(epfd) else {
+            return p1::errno::BADF;
+        };
+        let result = match (op, interest) {
+            (WASIX_EPOLL_CTL_ADD, Some(interest)) => epoll.add(interest),
+            (WASIX_EPOLL_CTL_MOD, Some(interest)) => epoll.modify(interest),
+            (WASIX_EPOLL_CTL_DEL, None) => epoll.remove(fd),
+            _ => return p1::errno::INVAL,
+        };
+        match result {
+            Ok(()) => p1::errno::SUCCESS,
+            Err(helios_unix::InterestError::Exists) => p1::errno::EXIST,
+            Err(helios_unix::InterestError::NotFound) => p1::errno::NOENT,
         }
-        (WASIX_EPOLL_CTL_MOD, Some(index), Some(interest)) => {
-            epoll.interests[index] = interest;
-            p1::errno::SUCCESS
-        }
-        (WASIX_EPOLL_CTL_MOD, None, _) | (WASIX_EPOLL_CTL_DEL, None, _) => p1::errno::NOENT,
-        (WASIX_EPOLL_CTL_DEL, Some(index), None) => {
-            epoll.interests.remove(index);
-            p1::errno::SUCCESS
-        }
-        _ => p1::errno::INVAL,
-    }
+    })
 }
 
-pub(super) async fn wasix_epoll_wait<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_epoll_wait<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     epfd: i32,
     events: u32,
     maxevents: i32,
     timeout: i64,
     ret_nevents: u32,
-) -> i32
+) -> Result<i32, SwapFaultError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if maxevents <= 0 {
-        return p1::errno::INVAL;
+        return Ok(p1::errno::INVAL);
     }
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
     let maxevents = match u32::try_from(maxevents) {
         Ok(maxevents) => maxevents,
-        Err(_) => return p1::errno::INVAL,
+        Err(_) => return Ok(p1::errno::INVAL),
     };
-    match caller.data().descriptors.get(epfd) {
-        Some(Preview1Descriptor::Epoll(_)) => {}
-        Some(_) => return p1::errno::INVAL,
-        None => return p1::errno::BADF,
+    let epfd_check = caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(epfd) {
+            Some(Preview1Descriptor::Epoll(_)) => p1::errno::SUCCESS,
+            Some(_) => p1::errno::INVAL,
+            None => p1::errno::BADF,
+        });
+    if epfd_check != p1::errno::SUCCESS {
+        return Ok(epfd_check);
     }
     // A negative timeout blocks indefinitely; otherwise anchor the deadline
     // once so the wait loop cannot restart its countdown on every re-probe.
@@ -176,7 +185,7 @@ where
         // invisible to the parked wait.
         let mut wait = match wasix_epoll_wait_set(caller, epfd) {
             Ok(wait) => wait,
-            Err(errno) => return errno,
+            Err(errno) => return Ok(errno),
         };
         let ready = wasix_collect_epoll_events(caller, epfd, maxevents).await;
         if !ready.is_empty() {
@@ -194,23 +203,61 @@ where
                 Some(Duration::from_nanos(deadline - now))
             }
         };
+        if caller.data().has_deliverable_catch() {
+            return Ok(p1::errno::INTR);
+        }
         let timer = caller.data().timer();
-        p1_wait_step(&timer, &mut wait, remaining).await;
+        let signals = caller.data().signals();
+        let active_handlers = caller.data().active_signal_handlers;
+        if p1_wait_step(&timer, &mut wait, remaining, &signals, active_handlers).await {
+            return Ok(p1::errno::INTR);
+        }
     };
 
-    let events = GuestAddress::wasm32(events);
-    for (index, event) in ready.iter().enumerate() {
-        let event_ptr = events.offset(index as u64 * u64::from(WASIX_EPOLL_EVENT_SIZE));
-        let status = wasix_write_epoll_event(caller, memory, event_ptr, event);
-        if status != p1::errno::SUCCESS {
-            return status;
-        }
-    }
     let returned = match u32::try_from(ready.len()) {
         Ok(returned) => returned,
-        Err(_) => return p1::errno::OVERFLOW,
+        Err(_) => return Ok(p1::errno::OVERFLOW),
     };
-    p1_write_u32(caller, memory, GuestAddress::wasm32(ret_nevents), returned)
+    // The wait above awaited, so the guest's pages are checked again here,
+    // in the poll that writes them.
+    let written = wasix_write_epoll_events(
+        &memory,
+        GuestAddress::wasm32(events),
+        &ready,
+        GuestAddress::wasm32(ret_nevents),
+        returned,
+    )
+    .await;
+    match written {
+        Ok(()) => Ok(p1::errno::SUCCESS),
+        Err(GuestAccessError::OutOfBounds) => Ok(p1::errno::FAULT),
+        Err(GuestAccessError::Swap(error)) => Err(error),
+    }
+}
+
+/// Lays `ready` out as the guest's `epoll_event` records at `events` and
+/// stores their count, `returned`, at `ret_nevents`, each write in the
+/// poll that found its pages present.
+pub(super) async fn wasix_write_epoll_events(
+    memory: &Preview1AsyncMemory,
+    events: GuestAddress,
+    ready: &[EpollInterest],
+    ret_nevents: GuestAddress,
+    returned: u32,
+) -> Result<(), GuestAccessError> {
+    let event_size = WASIX_EPOLL_EVENT_SIZE as usize;
+    memory
+        .write(events, ready.len() * event_size, |records| {
+            for (event, record) in ready.iter().zip(records.chunks_exact_mut(event_size)) {
+                wasix_encode_epoll_event(event, record);
+            }
+        })
+        .await?;
+    memory
+        .write(ret_nevents, 4, |count| {
+            count.copy_from_slice(&returned.to_le_bytes());
+        })
+        .await
 }
 
 pub(super) fn poll_epoll_wait_targets(
@@ -232,20 +279,23 @@ pub(super) fn poll_epoll_wait_targets(
 /// with an infinite timeout it parked forever, and with a timeout it always
 /// timed out. `p1_add_wait_target` covers every descriptor kind, flagging the
 /// poll-driven ones for re-probing.
-pub(super) fn wasix_epoll_wait_set<CpuImpl, Net, HostFs>(
-    caller: &Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_epoll_wait_set<CpuImpl, Net, StorageImpl>(
+    caller: &Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     epfd: i32,
 ) -> Result<P1WaitSet, i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let interests = match caller.data().descriptors.get(epfd) {
-        Some(Preview1Descriptor::Epoll(epoll)) => epoll.interests.clone(),
-        Some(_) => return Err(p1::errno::INVAL),
-        None => return Err(p1::errno::BADF),
-    };
+    let interests = caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(epfd) {
+            Some(Preview1Descriptor::Epoll(epoll)) => Ok(epoll.interests()),
+            Some(_) => Err(p1::errno::INVAL),
+            None => Err(p1::errno::BADF),
+        })?;
     let mut wait = P1WaitSet::new();
     for interest in interests {
         if interest.events & WASIX_EPOLL_TYPE_EPOLLIN != 0 {
@@ -294,68 +344,55 @@ pub(super) fn wasix_read_epoll_event<T>(
     Ok(EpollInterest {
         fd,
         events,
+        one_shot: events & WASIX_EPOLL_TYPE_EPOLLONESHOT != 0,
         data: user_data,
     })
 }
 
-pub(super) fn wasix_write_epoll_event<T>(
-    caller: &mut Caller<'_, T>,
-    memory: Preview1Memory,
-    ptr: GuestAddress,
-    event: &EpollInterest,
-) -> i32 {
-    p1_write_u32(caller, memory, ptr, event.events)
-        .max(p1_write_u32(
-            caller,
-            memory,
-            ptr.offset(u64::from(WASIX_EPOLL_EVENT_PADDING_OFFSET)),
-            0,
-        ))
-        .max(p1_write_u32(
-            caller,
-            memory,
-            ptr.offset(u64::from(WASIX_EPOLL_EVENT_DATA_OFFSET)),
-            event.data.ptr,
-        ))
-        .max(p1_write_u32(
-            caller,
-            memory,
-            ptr.offset(u64::from(WASIX_EPOLL_EVENT_DATA_FD_OFFSET)),
-            event.data.fd,
-        ))
-        .max(p1_write_u32(
-            caller,
-            memory,
-            ptr.offset(u64::from(WASIX_EPOLL_EVENT_DATA1_OFFSET)),
-            event.data.data1,
-        ))
-        .max(p1_write_u32(
-            caller,
-            memory,
-            ptr.offset(u64::from(WASIX_EPOLL_EVENT_DATA_PADDING_OFFSET)),
-            0,
-        ))
-        .max(p1_write_u64(
-            caller,
-            memory,
-            ptr.offset(u64::from(WASIX_EPOLL_EVENT_DATA2_OFFSET)),
-            event.data.data2,
-        ))
+/// Lays `event` out as one WASIX `epoll_event` record, padding zeroed.
+/// `record` is exactly [`WASIX_EPOLL_EVENT_SIZE`] bytes.
+pub(super) fn wasix_encode_epoll_event(event: &EpollInterest, record: &mut [u8]) {
+    let mut field = |offset: u32, bytes: &[u8]| {
+        let offset = offset as usize;
+        record[offset..offset + bytes.len()].copy_from_slice(bytes);
+    };
+    field(0, &event.events.to_le_bytes());
+    field(WASIX_EPOLL_EVENT_PADDING_OFFSET, &0_u32.to_le_bytes());
+    field(WASIX_EPOLL_EVENT_DATA_OFFSET, &event.data.ptr.to_le_bytes());
+    field(
+        WASIX_EPOLL_EVENT_DATA_FD_OFFSET,
+        &event.data.fd.to_le_bytes(),
+    );
+    field(
+        WASIX_EPOLL_EVENT_DATA1_OFFSET,
+        &event.data.data1.to_le_bytes(),
+    );
+    field(WASIX_EPOLL_EVENT_DATA_PADDING_OFFSET, &0_u32.to_le_bytes());
+    field(
+        WASIX_EPOLL_EVENT_DATA2_OFFSET,
+        &event.data.data2.to_le_bytes(),
+    );
 }
 
-pub(super) async fn wasix_collect_epoll_events<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_collect_epoll_events<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     epfd: i32,
     maxevents: u32,
 ) -> Vec<EpollInterest>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let interests = match caller.data().descriptors.get(epfd) {
-        Some(Preview1Descriptor::Epoll(epoll)) => epoll.interests.clone(),
-        _ => return Vec::new(),
+    let interests = caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(epfd) {
+            Some(Preview1Descriptor::Epoll(epoll)) => Some(epoll.interests()),
+            _ => None,
+        });
+    let Some(interests) = interests else {
+        return Vec::new();
     };
     let mut ready = Vec::new();
     let mut oneshot_fds = Vec::new();
@@ -367,19 +404,21 @@ where
         if events == 0 {
             continue;
         }
-        let oneshot = interest.events & WASIX_EPOLL_TYPE_EPOLLONESHOT != 0;
+        let oneshot = interest.one_shot;
         interest.events = events;
         if oneshot {
             oneshot_fds.push(interest.fd);
         }
         ready.push(interest);
     }
-    if !oneshot_fds.is_empty()
-        && let Some(Preview1Descriptor::Epoll(epoll)) = caller.data_mut().descriptors.get_mut(epfd)
-    {
-        epoll
-            .interests
-            .retain(|interest| !oneshot_fds.contains(&interest.fd));
+    if !oneshot_fds.is_empty() {
+        caller.data().descriptors.with_mut(|descriptors| {
+            if let Some(Preview1Descriptor::Epoll(epoll)) = descriptors.get_mut(epfd) {
+                for fd in oneshot_fds {
+                    epoll.delivered(fd);
+                }
+            }
+        });
     }
     ready
 }
@@ -391,17 +430,21 @@ where
 /// readable, so they never raised `EPOLLIN`. The tri-state readiness makes
 /// "ready with nothing buffered" (end-of-stream, a drained regular file)
 /// distinguishable from "would block".
-pub(super) async fn wasix_epoll_ready_mask<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_epoll_ready_mask<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     interest: u32,
 ) -> u32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    if caller.data().descriptors.get(fd).is_none() {
+    if caller
+        .data()
+        .descriptors
+        .with(|descriptors| descriptors.get(fd).is_none())
+    {
         return WASIX_EPOLL_TYPE_EPOLLERR | WASIX_EPOLL_TYPE_EPOLLHUP;
     }
     let mut ready = 0;
@@ -442,6 +485,32 @@ pub(super) fn wasix_epoll_mask_bit(readiness: Result<P1Readiness, i32>, event_ty
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The record `epoll_wait` hands back is WASIX's `epoll_event`: the
+    /// event mask, then the user data at its fixed offsets, padding zeroed.
+    #[test]
+    fn an_epoll_event_is_laid_out_as_wasix_defines_it() {
+        let event = EpollInterest {
+            fd: 3,
+            events: WASIX_EPOLL_TYPE_EPOLLIN,
+            one_shot: false,
+            data: EpollUserData {
+                ptr: 0x1122_3344,
+                fd: 7,
+                data1: 0x5566_7788,
+                data2: 0x99aa_bbcc_ddee_ff00,
+            },
+        };
+        let mut record = [0xa5_u8; WASIX_EPOLL_EVENT_SIZE as usize];
+        wasix_encode_epoll_event(&event, &mut record);
+        let mut expected = [0_u8; WASIX_EPOLL_EVENT_SIZE as usize];
+        expected[0..4].copy_from_slice(&WASIX_EPOLL_TYPE_EPOLLIN.to_le_bytes());
+        expected[8..12].copy_from_slice(&0x1122_3344_u32.to_le_bytes());
+        expected[12..16].copy_from_slice(&7_u32.to_le_bytes());
+        expected[16..20].copy_from_slice(&0x5566_7788_u32.to_le_bytes());
+        expected[24..32].copy_from_slice(&0x99aa_bbcc_ddee_ff00_u64.to_le_bytes());
+        assert_eq!(record, expected);
+    }
 
     fn socket_mask(readiness: crate::SocketReadiness, event_type: u8) -> u32 {
         wasix_epoll_mask_bit(
@@ -537,5 +606,78 @@ mod tests {
             wasix_epoll_mask_bit(Err(p1::errno::BADF), P1_EVENTTYPE_FD_READ),
             WASIX_EPOLL_TYPE_EPOLLERR
         );
+    }
+
+    /// Two ready interests whose records run from a present page onto
+    /// one swap has taken, with the count slot on page zero.
+    fn events_over_an_evicted_page() -> (crate::memory::GuestSwap, GuestAddress, [EpollInterest; 2])
+    {
+        let mut swap = crate::memory::GuestSwap::new(2);
+        swap.evict(1);
+        let events = GuestAddress::wasm32((TEST_PAGE - WASIX_EPOLL_EVENT_SIZE as usize) as u32);
+        let ready = [3, 4].map(|fd| EpollInterest {
+            fd,
+            events: WASIX_EPOLL_TYPE_EPOLLIN,
+            one_shot: false,
+            data: EpollUserData {
+                ptr: 0x1000 + fd as u32,
+                fd: fd as u32,
+                data1: 7,
+                data2: 0x0102_0304_0506_0708,
+            },
+        });
+        (swap, events, ready)
+    }
+
+    /// `epoll_wait`'s records wait for a page that is out, then land as a
+    /// present page would have them, the count after them.
+    #[test]
+    fn epoll_events_land_on_an_evicted_page_once_it_is_back() {
+        let (mut swap, events, ready) = events_over_an_evicted_page();
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let mut write = core::pin::pin!(wasix_write_epoll_events(
+            &memory,
+            events,
+            &ready,
+            GuestAddress::wasm32(0),
+            2,
+        ));
+        assert!(poll_once(write.as_mut()).is_none(), "the records wait");
+        assert_eq!(swap.queued_faults(), 1, "the page was asked for");
+
+        swap.serve();
+        assert_eq!(poll_once(write.as_mut()), Some(Ok(())));
+        let size = WASIX_EPOLL_EVENT_SIZE as usize;
+        let mut expected = vec![0_u8; 2 * size];
+        for (event, record) in ready.iter().zip(expected.chunks_exact_mut(size)) {
+            wasix_encode_epoll_event(event, record);
+        }
+        let start = events.raw() as usize;
+        assert!(swap.bytes()[start..start + 2 * size] == expected[..]);
+        assert_eq!(swap.bytes()[0..4], 2_u32.to_le_bytes());
+    }
+
+    /// The records' page cannot come back, so `epoll_wait` traps.
+    #[test]
+    fn epoll_events_for_a_lost_page_trap() {
+        let (mut swap, events, ready) = events_over_an_evicted_page();
+        swap.fail_reads(1);
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let mut write = core::pin::pin!(wasix_write_epoll_events(
+            &memory,
+            events,
+            &ready,
+            GuestAddress::wasm32(0),
+            2,
+        ));
+        assert!(poll_once(write.as_mut()).is_none());
+        swap.serve();
+        assert_eq!(
+            poll_once(write.as_mut()),
+            Some(Err(GuestAccessError::Swap(
+                crate::memory::SwapFaultError::Backend
+            )))
+        );
+        assert_eq!(swap.bytes()[0..4], [0; 4], "no count was reported");
     }
 }

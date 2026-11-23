@@ -54,6 +54,49 @@ fn key(code: u16, value: i32) -> InputEvent {
 }
 
 #[test]
+fn a_gpu_surface_uses_no_cpu_pages_and_cancellation_returns_its_slot() {
+    test_hooks::install();
+    let service = SurfaceService::new();
+    let mut client = SurfaceOwnership::new();
+    let runs = test_hooks::live_runs();
+    let pending = client.prepare_image(&service, geometry(640, 480)).unwrap();
+    let id = pending.id();
+    assert_eq!(test_hooks::live_runs(), runs);
+    assert_eq!(client.held(), 1);
+    drop(pending);
+    assert!(service.lookup(id).is_none());
+    assert_eq!(client.held(), 1);
+    let returned = service.take_returned();
+    assert_eq!(returned.len(), 1);
+    assert_eq!(returned[0].id(), id);
+    for surface in returned {
+        surface.drained();
+    }
+    assert_eq!(client.held(), 0);
+    assert_eq!(test_hooks::live_runs(), runs);
+}
+
+#[test]
+fn an_accepted_gpu_surface_is_returned_when_its_client_dies() {
+    let service = SurfaceService::new();
+    let mut client = SurfaceOwnership::new();
+    let shared = client
+        .prepare_image(&service, geometry(640, 480))
+        .unwrap()
+        .settle();
+    let mut events = SurfaceShared::events(&shared);
+    drop(client);
+    assert!(!shared.is_alive());
+    assert!(matches!(
+        events.poll_burst(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(None)
+    ));
+    let returned = service.take_returned();
+    assert_eq!(returned.len(), 1);
+    assert_eq!(returned[0].id(), shared.id());
+}
+
+#[test]
 fn a_frame_is_four_bytes_a_pixel_and_a_degenerate_one_has_no_size() {
     assert_eq!(geometry(4, 3).frame_bytes(), Some(48));
     assert_eq!(geometry(0, 3).frame_bytes(), None);

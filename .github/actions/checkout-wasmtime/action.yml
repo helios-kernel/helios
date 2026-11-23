@@ -15,5 +15,6 @@ runs:
     - uses: actions/checkout@v4
       with:
         repository: lexoliu/wasmtime
-        ref: 18b428e6becfb6138b877a3fe70afb08bf5724ba
+        # Branch `helios/sync-main-52`.
+        ref: 56131f786d90a136fec6e80e143de18e5b38e8de
         path: ${{ inputs.path }}

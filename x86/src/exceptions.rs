@@ -5,7 +5,9 @@ use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 
 use helios_hal::vmm::VirtAddr as UserVirtAddr;
-use helios_kernel::{KernelException, KernelExceptionCause, KernelExceptionDispatch, StackFault};
+use helios_kernel::{
+    InterruptedContext, KernelException, KernelExceptionCause, KernelExceptionDispatch, StackFault,
+};
 use x86_64::VirtAddr;
 use x86_64::instructions::segmentation::{CS, DS, ES, SS, Segment};
 use x86_64::instructions::tables::load_tss;
@@ -83,6 +85,7 @@ const _: () = {
         DISPLAY_INTERRUPT_VECTOR,
         SOUND_INTERRUPT_VECTOR,
         DEBUG_SERIAL_INTERRUPT_VECTOR,
+        SCI_INTERRUPT_VECTOR,
     ]));
     assert!(held_by_wake_only_mask(&NETWORK_QUEUE_INTERRUPT_VECTORS));
     assert!(held_by_wake_only_mask(&INPUT_INTERRUPT_VECTORS));
@@ -120,6 +123,12 @@ pub(crate) const SOUND_INTERRUPT_VECTOR: u8 = 0x3d;
 /// message: the UART raises ISA IRQ 4 and an I/O APIC redirection entry
 /// translates that line into this local-APIC vector.
 pub(crate) const DEBUG_SERIAL_INTERRUPT_VECTOR: u8 = 0x3e;
+/// The ACPI SCI, the other line an I/O APIC entry translates: firmware
+/// raises it for a general-purpose event, which is how a hypervisor
+/// announces a hot-added or hot-removed vCPU. It is routed to the
+/// bootstrap processor and dispatched beside, not through, the device
+/// routes (`smp::handle_sci_interrupt`).
+pub(crate) const SCI_INTERRUPT_VECTOR: u8 = 0x3f;
 /// One vector per block device the routing table can hold: the platform
 /// exposes the boot image and the kernel's own disk as separate
 /// functions, and each of them delivers its completions on its own
@@ -150,7 +159,21 @@ global_asm!(
     include_str!("exceptions.S"),
     wake_vector = const WAKE_INTERRUPT_VECTOR,
     tlb_shootdown_vector = const TLB_SHOOTDOWN_INTERRUPT_VECTOR,
+    native_users = const cfg!(feature = "native-users") as u8,
 );
+
+#[cfg(feature = "native-users")]
+unsafe extern "C" {
+    fn helios_x86_exception_debug();
+    fn helios_x86_exception_overflow();
+    fn helios_x86_exception_bound();
+    fn helios_x86_exception_device_unavailable();
+    fn helios_x86_exception_invalid_tss();
+    fn helios_x86_exception_segment_missing();
+    fn helios_x86_exception_stack_segment();
+    fn helios_x86_exception_alignment();
+    fn helios_x86_exception_control_protection();
+}
 
 unsafe extern "C" {
     fn helios_x86_exception_divide_error();
@@ -188,6 +211,7 @@ unsafe extern "C" {
     fn helios_x86_interrupt_block_2();
     fn helios_x86_interrupt_block_3();
     fn helios_x86_interrupt_debug_serial();
+    fn helios_x86_interrupt_sci();
 }
 
 pub(crate) struct ProcessorIdt {
@@ -312,6 +336,44 @@ impl ProcessorIdt {
                 DEBUG_SERIAL_INTERRUPT_VECTOR,
                 helios_x86_interrupt_debug_serial,
             );
+            install_interrupt(table, SCI_INTERRUPT_VECTOR, helios_x86_interrupt_sci);
+            #[cfg(feature = "native-users")]
+            {
+                // Ring-3 `int3` (`0xCC`) checks `CPL <= IDT[3].DPL` before
+                // delivering `#BP`, matching Linux `arch/x86/kernel/idt.c`
+                // (`SYSG(X86_TRAP_BP, ...)`).
+                table
+                    .breakpoint
+                    .set_handler_addr(handler_address(helios_x86_exception_breakpoint))
+                    .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+                table
+                    .debug
+                    .set_handler_addr(handler_address(helios_x86_exception_debug));
+                table
+                    .overflow
+                    .set_handler_addr(handler_address(helios_x86_exception_overflow));
+                table
+                    .bound_range_exceeded
+                    .set_handler_addr(handler_address(helios_x86_exception_bound));
+                table
+                    .device_not_available
+                    .set_handler_addr(handler_address(helios_x86_exception_device_unavailable));
+                table
+                    .invalid_tss
+                    .set_handler_addr(handler_address(helios_x86_exception_invalid_tss));
+                table
+                    .segment_not_present
+                    .set_handler_addr(handler_address(helios_x86_exception_segment_missing));
+                table
+                    .stack_segment_fault
+                    .set_handler_addr(handler_address(helios_x86_exception_stack_segment));
+                table
+                    .alignment_check
+                    .set_handler_addr(handler_address(helios_x86_exception_alignment));
+                table
+                    .cp_protection_exception
+                    .set_handler_addr(handler_address(helios_x86_exception_control_protection));
+            }
             table.load_unsafe();
         }
     }
@@ -395,6 +457,14 @@ impl ProcessorSegments {
         // `publish_anchor_identities` pinned at its final address before
         // any processor was activated, so the descriptor's base stays
         // valid for as long as the processor runs.
+        #[cfg(feature = "native-users")]
+        {
+            let user_data = gdt.append(Descriptor::user_data_segment());
+            let user_code = gdt.append(Descriptor::user_code_segment());
+            assert_eq!(user_data.0, crate::native::USER_DATA);
+            assert_eq!(user_code.0, crate::native::USER_CODE);
+            tss.privilege_stack_table[0] = VirtAddr::new(self.interrupt_stack.end as u64);
+        }
         let tss_selector = gdt.append(unsafe { Descriptor::tss_segment_unchecked(tss) });
         // SAFETY: the table outlives the processor for the reason above;
         // the selectors loaded are the ones this table just produced.
@@ -581,6 +651,8 @@ pub(crate) struct ExceptionFrame {
     rip: u64,
     cs: u64,
     rflags: u64,
+    rsp: u64,
+    ss: u64,
 }
 
 const RFLAGS_INTERRUPT_FLAG: u64 = 1 << 9;
@@ -616,13 +688,36 @@ extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) {
     if frame.vector == PAGE_FAULT_VECTOR {
         assert_frame_on_exception_stack(frame);
         let faulting_address = Cr2::read_raw() as usize;
+        // The isolation check reaches each user page through a `call`, so
+        // the refused access resumes its caller as a return would.
+        #[cfg(feature = "native-users")]
+        if frame.cs & 3 == 0
+            && smp::current_runtime()
+                .isolation_probe
+                .claim(faulting_address, frame.error_code)
+        {
+            // SAFETY: the faulting code is the check's own, running on a
+            // kernel stack whose top word is the return address its `call`
+            // pushed.
+            frame.rip = unsafe { (frame.rsp as *const u64).read() };
+            frame.rsp += 8;
+            return;
+        }
         if resolve_probe_fault(faulting_address) {
             return;
         }
         // A reserved page inside a live fiber stack is a demand commit
-        // the kernel resolves here, with no lock and no allocation; the
-        // guard page below one is a stack overflow and stays a fault.
-        stack_fault = helios_kernel::resolve_stack_fault(UserVirtAddr::new(faulting_address));
+        // the kernel resolves here: from the user pool's ordinary path
+        // when the interrupted context had interrupts enabled (the gate
+        // cleared IF, so the saved RFLAGS is the answer), from the
+        // per-processor reserve when it had them masked; the guard page
+        // below one is a stack overflow and stays a fault.
+        stack_fault = helios_kernel::resolve_stack_fault(
+            UserVirtAddr::new(faulting_address),
+            InterruptedContext {
+                interrupts_enabled: frame.rflags & RFLAGS_INTERRUPT_FLAG != 0,
+            },
+        );
         if stack_fault == StackFault::Committed {
             return;
         }
@@ -654,7 +749,7 @@ extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
+pub(crate) extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
     let runtime = smp::current_runtime();
     assert_frame_on_interrupt_stack(frame);
     runtime.begin_interrupt_dispatch(frame.vector);
@@ -674,6 +769,9 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
         Ok(TLB_SHOOTDOWN_INTERRUPT_VECTOR) => {
             smp::handle_tlb_shootdown_interrupt();
         }
+        Ok(SCI_INTERRUPT_VECTOR) => {
+            smp::handle_sci_interrupt();
+        }
         Ok(vector) if is_device_interrupt(vector) => {
             smp::handle_device_interrupt(vector);
         }
@@ -683,7 +781,7 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
              entropy={ENTROPY_INTERRUPT_VECTOR:#x} vsock={VSOCK_INTERRUPT_VECTOR:#x} \
              display={DISPLAY_INTERRUPT_VECTOR:#x} input={INPUT_INTERRUPT_VECTORS:#x?} \
              sound={SOUND_INTERRUPT_VECTOR:#x} block={BLOCK_INTERRUPT_VECTORS:#x?} \
-             debug-serial={DEBUG_SERIAL_INTERRUPT_VECTOR:#x}",
+             debug-serial={DEBUG_SERIAL_INTERRUPT_VECTOR:#x} sci={SCI_INTERRUPT_VECTOR:#x}",
             frame.vector, frame.rip
         ),
     }

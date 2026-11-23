@@ -5,14 +5,19 @@ edition.workspace = true
 build = "build.rs"
 
 [features]
+unix = ["dep:helios-unix", "helios-unix/runtime"]
+# The Linux process host: a program service launch of a static Linux ELF
+# runs it natively through `Cpu::native`. Off by default; a build without it
+# compiles none of `helios-linux`.
+linux = ["wasmtime-runtime", "dep:helios-linux", "helios-linux/runtime"]
 default = ["wasmtime-host", "embedded-debugger"]
 # Autostart of the embedded debugger system component. Production kernels
 # can drop it; the prebuild bootfs contents are controlled separately by
 # the kernel-prebuild manifest.
 embedded-debugger = []
-# Adapter-only runtime support. `wasmtime-wasi-io` must stay behind this
-# feature; the core kernel and HAL no-default path must not depend on it.
-wasmtime-runtime = ["dep:wasmtime", "dep:wasmtime-wasi-io"]
+# Adapter-only runtime support; the core kernel and HAL no-default path must
+# not depend on it.
+wasmtime-runtime = ["unix", "dep:wasmtime"]
 wasmtime-host = ["wasmtime-runtime"]
 # Every bare-metal backend runs the same runtime profile: its
 # `hal::vmm::AddressSpace` answers wasmtime's custom-virtual-memory ABI, and
@@ -33,16 +38,22 @@ wasmtime-bare-metal = [
 ]
 
 [dependencies]
-async-lock = { version = "3.4.2", default-features = false }
+helios-sync = { workspace = true, features = ["runtime"] }
+helios-unix = { workspace = true, optional = true }
+helios-linux = { path = "../linux", default-features = false, optional = true }
+helios-btrfs = { path = "../btrfs", default-features = false, features = ["write"] }
 async-task = { version = "4.7.1", default-features = false }
 atomic-waker = "1.1.2"
 arrayvec = { version = "0.7.6", default-features = false }
-buddy_system_allocator = "0.12.0"
 bytes = { version = "1.12.1", default-features = false }
 concurrent-queue = { version = "2.5.0", default-features = false }
 crossbeam-utils.workspace = true
 critical-section = "1.2.0"
-event-listener = { version = "5.4.1", default-features = false, features = ["critical-section"] }
+crc = { version = "3.4.0", default-features = false }
+# The reader of upstream `erofs-rs` imports `rustix`, which does not build
+# for `target_os = "none"`; the fork's reader does not, and it publishes
+# the path lookup and resumable listings the mount kind is built on.
+erofs-rs = { git = "https://github.com/lexoliu/erofs-rs", branch = "no-std-bare-metal", default-features = false, features = ["deflate", "lz4"] }
 futures = { version = "0.3.31", default-features = false, features = ["alloc"] }
 hashbrown = { version = "0.16.1", default-features = false, features = ["allocator-api2", "default-hasher", "equivalent", "inline-more"] }
 heapless = { version = "0.7.17", default-features = false }
@@ -53,6 +64,7 @@ helios-artifact.workspace = true
 helios-compiler-abi.workspace = true
 helios-hal.workspace = true
 helios-netstack.workspace = true
+helios-virtio.workspace = true
 thiserror = { version = "2.0.17", default-features = false }
 triomphe = { version = "0.1.15", default-features = false, features = ["unsize"] }
 unsize = { version = "1.1.0", default-features = false }
@@ -60,30 +72,45 @@ tracing.workspace = true
 bitflags = "2.11.0"
 lru = { version = "0.16.3", default-features = false, features = ["hashbrown"] }
 rand_chacha = { version = "0.3.1", default-features = false }
+siphasher = { version = "1.0.4", default-features = false }
 rand_core = { version = "0.6.4", default-features = false }
-sha2 = { version = "0.10.9", default-features = false }
+sha2 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
+# The compiler-signing key: an Ed25519 key HKDF-SHA256 derives from the
+# boot's seed. `zeroize` makes the signing key, the HMAC state and the
+# SHA-256 state wipe themselves when dropped.
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize"] }
+hkdf = { version = "0.13.0", default-features = false }
+hmac = { version = "0.13.0", default-features = false, features = ["zeroize"] }
+zeroize = { version = "1.9.1", default-features = false }
 smallvec = { version = "1.15.1", default-features = false }
 slab = { version = "0.4.12", default-features = false }
 spin = { version = "0.9.8", default-features = false, features = ["mutex", "once", "rwlock", "spin_mutex"] }
-wasmparser = { version = "0.245.0", default-features = false, features = ["component-model"] }
+wasmparser = { version = "0.263.0", default-features = false, features = ["component-model"] }
 talc = { version = "=5.1.0", default-features = false, features = ["counters"] }
 frame-alloc = { version = "=0.1.0", default-features = false, features = ["stats"] }
-# The fork makes `CompressContext` available without `std` (paddor/zrip#106).
-zrip = { git = "https://github.com/lexoliu/zrip", branch = "compress-context-alloc", default-features = false, features = ["alloc"] }
+zrip = { version = "0.8.17", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
+# The compression test reads each extent's stored kind and algorithm.
+helios-btrfs = { path = "../btrfs", default-features = false, features = ["write", "test-support"] }
+ferrosys = { version = "0.8.0", default-features = false, features = ["btrfs"] }
 critical-section = { version = "1.2.0", features = ["std"] }
+# The image builder writes the EROFS fixtures that run on every host;
+# `mkfs.erofs` writes the ones CI runs (see `vfs/erofs/tests.rs`).
+erofs-rs = { git = "https://github.com/lexoliu/erofs-rs", branch = "no-std-bare-metal", default-features = false, features = ["deflate", "lz4", "std"] }
+tempfile.workspace = true
 # The console-gate tests drive the real `KernelConsoleSubscriber` through
 # `tracing::subscriber::with_default`, which is a std-only dispatcher.
 tracing = { workspace = true, features = ["std"] }
 divan = { version = "0.1.21", default-features = false }
 futures-lite = "2.6.1"
 arc-swap = "1.7.1"
-wasm-encoder = "0.245.0"
+wasm-encoder = { version = "0.263.0", default-features = false, features = ["component-model"] }
 
 [[bench]]
 name = "data_structures"
 harness = false
+required-features = ["unix"]
 
 [[bench]]
 name = "network_smp"
@@ -98,11 +125,9 @@ askama = "0.15.6"
 
 [target.'cfg(target_os = "none")'.dependencies]
 wasmtime = { path = "../../wasmtime/crates/wasmtime", optional = true, default-features = false, features = ["component-model", "component-model-async", "custom-native-signals", "custom-sync-primitives", "gc-null", "runtime", "threads"] }
-wasmtime-wasi-io = { path = "../../wasmtime/crates/wasi-io", optional = true, default-features = false }
 
 [target.'cfg(not(target_os = "none"))'.dependencies]
 wasmtime = { path = "../../wasmtime/crates/wasmtime", optional = true, default-features = false, features = ["component-model", "component-model-async", "gc-null", "pooling-allocator", "runtime", "std", "threads"] }
-wasmtime-wasi-io = { path = "../../wasmtime/crates/wasi-io", optional = true }
 
 [lints]
 workspace = true

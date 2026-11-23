@@ -51,6 +51,12 @@ use super::service::{
     SurfaceService, SurfaceShared,
 };
 
+/// CPU-backed storage prepared for mapping into a client.
+pub struct MappedSurface {
+    buffer: Buffer,
+    span: Span,
+}
+
 /// A window registered and on its way to the compositor, whose client
 /// has not finished creating it.
 ///
@@ -60,37 +66,34 @@ use super::service::{
 /// which ends the compositor's view of it, if it took one, and tells the
 /// compositor it is gone. That path needs no store, so it is the one a
 /// future dropped by its guest can take.
-pub struct PendingSurface {
+pub struct PendingSurface<Backing = MappedSurface> {
     shared: Arc<SurfaceShared>,
-    /// The frame buffer, which the compositor is handed a reference to.
-    buffer: Buffer,
-    /// The client's span, checked when the window was registered and
-    /// checked again when the buffer is shown there.
-    span: Span,
+    backing: Backing,
     /// The registry the window goes back through. Taken when the create
     /// finishes, either way, so a finished one is not handed back.
     registry: Option<SurfaceService>,
 }
 
-impl PendingSurface {
+impl<Backing> PendingSurface<Backing> {
     pub fn id(&self) -> SurfaceId {
         self.shared.id()
     }
 
-    /// The frame buffer, for the compositor's own view of it.
-    pub const fn buffer(&self) -> &Buffer {
-        &self.buffer
-    }
-
     /// Finish the create: the window is no longer the pending one's to
     /// hand back.
-    fn settle(mut self) -> Arc<SurfaceShared> {
+    pub(crate) fn settle(mut self) -> Arc<SurfaceShared> {
         self.registry = None;
         self.shared.clone()
     }
 }
 
-impl Drop for PendingSurface {
+impl PendingSurface {
+    pub const fn buffer(&self) -> &Buffer {
+        &self.backing.buffer
+    }
+}
+
+impl<Backing> Drop for PendingSurface<Backing> {
     fn drop(&mut self) {
         if let Some(registry) = self.registry.take() {
             registry.return_surfaces(ReturnedSurfaces::one(self.shared.id()));
@@ -157,22 +160,41 @@ impl SurfaceOwnership {
         span: Span,
         geometry: SurfaceGeometry,
     ) -> Result<PendingSurface, SurfaceServiceError> {
-        self.prune();
-        if self.held.is_full() {
-            return Err(SurfaceServiceError::TooManySurfaces);
-        }
         let bytes = geometry
             .frame_bytes()
             .ok_or(SurfaceServiceError::UnsupportedSize)?;
         views.validate(memory, span, bytes)?;
         let buffer = Buffer::pinned(bytes)?;
+        self.register(registry, geometry, MappedSurface { buffer, span })
+    }
+
+    pub fn prepare_image(
+        &mut self,
+        registry: &SurfaceService,
+        geometry: SurfaceGeometry,
+    ) -> Result<PendingSurface<()>, SurfaceServiceError> {
+        geometry
+            .frame_bytes()
+            .ok_or(SurfaceServiceError::UnsupportedSize)?;
+        self.register(registry, geometry, ())
+    }
+
+    fn register<Backing>(
+        &mut self,
+        registry: &SurfaceService,
+        geometry: SurfaceGeometry,
+        backing: Backing,
+    ) -> Result<PendingSurface<Backing>, SurfaceServiceError> {
+        self.prune();
+        if self.held.is_full() {
+            return Err(SurfaceServiceError::TooManySurfaces);
+        }
         let shared = registry.register(geometry)?;
         self.service.get_or_insert_with(|| registry.clone());
         self.held.push(shared.clone());
         Ok(PendingSurface {
             shared,
-            buffer,
-            span,
+            backing,
             registry: Some(registry.clone()),
         })
     }
@@ -192,7 +214,7 @@ impl SurfaceOwnership {
         memory: GuestMemory,
         pending: PendingSurface,
     ) -> Result<(Arc<SurfaceShared>, ViewId), SurfaceServiceError> {
-        match views.show_buffer(memory, pending.span, &pending.buffer, None) {
+        match views.show_buffer(memory, pending.backing.span, &pending.backing.buffer, None) {
             Ok(view) => Ok((pending.settle(), view)),
             Err(error) => {
                 drop(pending);
@@ -207,7 +229,11 @@ impl SurfaceOwnership {
     /// The compositor holds nothing of the window, so it is not told:
     /// the window comes off the desktop, and the frame buffer goes back
     /// to the pool with the pending window's reference.
-    pub fn refused(&mut self, registry: &SurfaceService, pending: PendingSurface) {
+    pub fn refused<Backing>(
+        &mut self,
+        registry: &SurfaceService,
+        pending: PendingSurface<Backing>,
+    ) {
         let id = pending.settle().id();
         self.abandon(registry, id);
     }

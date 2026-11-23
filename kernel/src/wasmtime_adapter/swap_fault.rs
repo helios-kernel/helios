@@ -7,11 +7,15 @@
 //! swap task performs the read on whatever processor it lives on, and
 //! the fiber is resumed in place.
 //!
-//! The invariant this rests on: **only guest code may fault on user
-//! memory.** Kernel code has no fiber to suspend, so every kernel path
-//! that touches guest memory directly pre-faults its range with
-//! [`SwapHandle::ensure_present`](crate::SwapHandle::ensure_present)
-//! first. A fault that arrives with no fiber under it is that invariant
+//! The invariant this rests on: **only code on a fiber whose blocking
+//! context is free may fault on user memory** — guest code, a synchronous
+//! host call, a runtime worker fiber. The store's event loop has no fiber
+//! to suspend, and an async host function already holds its fiber's, so
+//! every path of that kind checks its pages in the poll that touches
+//! them: the runtime's copies through the residency hook
+//! (`super::residency`), async host functions through
+//! [`GuestResidency::with_present`](crate::memory::GuestResidency::with_present).
+//! A fault that arrives with no fiber able to take it is that invariant
 //! being broken, and it is reported rather than papered over.
 
 use core::convert::Infallible;
@@ -21,7 +25,8 @@ use wasmtime::BlockOnCurrentFiberError;
 
 use crate::kernel_exception::{KernelException, dispatch_native_trap};
 use crate::memory::{
-    StackFault, SwapFaultError, installed_swap_handle, resolve_stack_fault, swapped_token,
+    InterruptedContext, StackFault, SwapFaultError, installed_swap_handle, resolve_stack_fault,
+    swapped_token,
 };
 
 /// Reads the page at `addr` back in, blocking the fiber this is called
@@ -48,8 +53,8 @@ pub fn resolve_swap_fault_blocking(addr: VirtAddr) -> Result<(), SwapFaultError>
             tracing::error!(
                 target: "helios_kernel::swap",
                 addr = addr.raw(),
-                "user memory faulted outside a fiber: a kernel path touched guest memory \
-                 without calling ensure_present() on it first"
+                "user memory faulted outside a fiber: a kernel or runtime path touched guest \
+                 memory without checking in the same poll that the page was present"
             );
             Err(SwapFaultError::NotConfigured)
         }
@@ -58,7 +63,7 @@ pub fn resolve_swap_fault_blocking(addr: VirtAddr) -> Result<(), SwapFaultError>
                 target: "helios_kernel::swap",
                 addr = addr.raw(),
                 "user memory faulted inside a host call that already holds the fiber: \
-                 that path must call ensure_present() before touching guest memory"
+                 that path must reach guest memory through GuestResidency::with_present"
             );
             Err(SwapFaultError::NotConfigured)
         }
@@ -91,12 +96,14 @@ pub enum UserPageFault {
 }
 
 /// Classifies a fault at `addr` in the order every backend uses: the fiber
-/// stack arena first, because it resolves with no lock and no allocation,
-/// then the swap entry.
+/// stack arena first, because it resolves from the user pool without
+/// touching the swap tables, then the swap entry.
 ///
-/// Lock-free and safe to call from trap context.
-pub fn classify_user_page_fault(addr: VirtAddr) -> UserPageFault {
-    let stack_fault = resolve_stack_fault(addr);
+/// `interrupted` is what the backend's entry saved of the context the
+/// fault interrupted; see [`InterruptedContext`]. Safe to call from trap
+/// context: it waits only as [`resolve_stack_fault`] does.
+pub fn classify_user_page_fault(addr: VirtAddr, interrupted: InterruptedContext) -> UserPageFault {
+    let stack_fault = resolve_stack_fault(addr, interrupted);
     if stack_fault == StackFault::Committed {
         return UserPageFault::Resolved;
     }

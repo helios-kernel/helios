@@ -1,37 +1,40 @@
 //! Timer allocation baseline.
 //!
-//! `Sleep::poll` now acquires a refcounted slab slot inside
-//! `TimerShared` on the first pending poll. The bench captures the
-//! allocation profile of the pool-backed path so the old
-//! per-`Sleep` heap allocation does not return.
+//! A pending `Sleep` carries its own wheel node, so its first pending
+//! poll links memory the sleep already is into its timer's wheel. The
+//! bench captures the allocation profile of that path so a per-`Sleep`
+//! heap allocation does not return.
 //!
 //! Workload shape:
 //!
 //!   * `sleep_create_only` — construct a Sleep but never poll. Models
 //!     timeout candidates that lose a select/race before reaching a
-//!     pending state. These already do not allocate today.
+//!     pending state.
 //!   * `sleep_first_poll_pending` — poll once with a non-zero
-//!     deadline and a noop waker so the future returns Pending. This
-//!     exercises pool acquisition. The divan allocator profile shows
+//!     deadline and a noop waker so the future returns Pending, which
+//!     registers it, then drop it. The divan allocator profile shows
 //!     per-iteration bytes / count.
 //!   * `sleep_register_then_drop` — first-pending poll, then drop the
 //!     future without firing. Mirrors a TCP retransmit timer that is
-//!     cancelled when an ACK arrives in time. This path must stay
-//!     zero-allocation after warm pool setup.
+//!     cancelled when an ACK arrives in time: the drop unlinks the node
+//!     at once and leaves nothing for a later fire.
+//!
+//! Every path here must stay zero-allocation.
 
 extern crate alloc;
 
 use alloc::string::String;
 use core::future::Future;
-use core::pin::Pin;
+use core::pin::pin;
 use core::task::Context;
 
 use divan::counter::ItemsCount;
 use divan::{AllocProfiler, Bencher, black_box};
 use futures::task::noop_waker_ref;
 use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId, Timebase, TimerInterrupt};
+use helios_hal::numa::{NodeId, SingleNode};
 use helios_hal::watchdog::ProgressCounter;
-use helios_kernel::{Executor, Timer};
+use helios_kernel::{Executor, NodeRun, Timer, UserMemoryPool};
 
 #[global_allocator]
 static ALLOC: AllocProfiler = AllocProfiler::system();
@@ -60,9 +63,28 @@ impl helios_hal::critical_section::LocalInterruptMask for BenchInterruptMask {
 
 helios_hal::critical_section::set_local_interrupt_mask_impl!(BenchInterruptMask);
 
-/// Processor 0's timer, as its executor builds it.
+/// Processor 0's timer, as its executor builds it on a one-processor
+/// machine with no NUMA description. The pool is leaked over one
+/// naturally aligned host block: the kernel holds it for the machine's
+/// life, and the benchmark process is that.
 fn bench_timer() -> Timer<BenchCpu> {
-    Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0)).timer(BenchCpu::new())
+    const BLOCK_BYTES: usize = 64 << 20;
+    let layout =
+        core::alloc::Layout::from_size_align(BLOCK_BYTES, BLOCK_BYTES).expect("bench pool layout");
+    // SAFETY: a non-zero layout, leaked for the process's life.
+    let start = unsafe { alloc::alloc::alloc(layout) } as usize;
+    assert!(start != 0, "host allocation for the bench pool failed");
+    let runs = [NodeRun {
+        start,
+        end: start + BLOCK_BYTES,
+        node: NodeId::new(0),
+    }];
+    let pool = Box::leak(Box::new(UserMemoryPool::new(
+        &SingleNode::new(1),
+        ProcessorId::new(0),
+        &runs,
+    )));
+    Executor::new(ProgressCounter::new(), pool, ProcessorId::new(0)).timer(BenchCpu::new())
 }
 
 #[derive(Clone)]
@@ -79,6 +101,8 @@ impl BenchCpu {
 }
 
 impl Cpu for BenchCpu {
+    type Hypervisor = core::convert::Infallible;
+    type Native = core::convert::Infallible;
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
     fn processor_count(&self) -> usize {
@@ -104,6 +128,14 @@ impl Cpu for BenchCpu {
     fn start_processor(&self, _processor: ProcessorId) {}
 
     fn wake_processor(&self, _processor: ProcessorId) {}
+
+    fn stop_current(&self) {
+        panic!("bench CPU never stops a processor")
+    }
+
+    fn restart_processor(&self, _processor: ProcessorId) {
+        panic!("bench CPU never restarts a processor")
+    }
 
     fn now(&self) -> Instant {
         Instant::new(0)
@@ -152,18 +184,10 @@ fn sleep_first_poll_pending(bencher: Bencher, count: usize) {
     bencher.counter(ItemsCount::new(count)).bench_local(|| {
         let mut waker = Context::from_waker(noop_waker_ref());
         for _ in 0..count {
-            let mut sleep = timer.sleep_for(core::time::Duration::from_secs(1));
-            // SAFETY: the Sleep is owned by this stack frame for the
-            // duration of the poll call.
-            let pinned = unsafe { Pin::new_unchecked(&mut sleep) };
-            let _ = pinned.poll(&mut waker);
+            let mut sleep = pin!(timer.sleep_for(core::time::Duration::from_secs(1)));
+            let _ = sleep.as_mut().poll(&mut waker);
             black_box(sleep);
         }
-        // Drain the timer inbox into the wheel so the bounded
-        // inbox never fills across iterations. With `now()` pinned
-        // at 0 no entry actually fires; this just resolves the
-        // pending submissions.
-        timer.fire_expired();
     });
 }
 
@@ -173,14 +197,11 @@ fn sleep_register_then_drop(bencher: Bencher, count: usize) {
     bencher.counter(ItemsCount::new(count)).bench_local(|| {
         let mut waker = Context::from_waker(noop_waker_ref());
         for _ in 0..count {
-            let mut sleep = timer.sleep_for(core::time::Duration::from_secs(1));
-            let pinned = unsafe { Pin::new_unchecked(&mut sleep) };
-            let _ = pinned.poll(&mut waker);
-            // Drop the sleep before its deadline. Phase 3.1 must
-            // return its slot to the pool here without leaking.
-            drop(sleep);
+            // Dropped at the end of the iteration, before its deadline:
+            // the drop unlinks it from the wheel.
+            let sleep = pin!(timer.sleep_for(core::time::Duration::from_secs(1)));
+            let _ = sleep.poll(&mut waker);
         }
-        timer.fire_expired();
     });
 }
 

@@ -1,0 +1,61 @@
+name: Install host apt packages
+description: >-
+  Installs required Ubuntu packages without upgrading preinstalled ones,
+  routing x86_64 EC2/Azure regional mirrors to archive.ubuntu.com and
+  enforcing bounded HTTP/HTTPS acquire timeouts so a throttled mirror
+  cannot stall a 15-minute CI job.
+inputs:
+  packages:
+    description: Space-separated list of apt package names to install.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install host packages
+      shell: bash
+      env:
+        APT_PACKAGES: ${{ inputs.packages }}
+      run: |
+        set -euo pipefail
+        read -r -a packages <<< "$APT_PACKAGES"
+        if [ "${#packages[@]}" -eq 0 ]; then
+          exit 0
+        fi
+
+        missing=()
+        for pkg in "${packages[@]}"; do
+          if ! dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -qx 'install ok installed'; then
+            missing+=("$pkg")
+          fi
+        done
+        if [ "${#missing[@]}" -eq 0 ]; then
+          echo "All requested apt packages are already installed: ${packages[*]}"
+          exit 0
+        fi
+
+        sudo rm -f /etc/apt/sources.list.d/google-chrome*
+
+        # On x86_64 GitHub-hosted runners, *.ec2.archive.ubuntu.com and
+        # *.azure.archive.ubuntu.com frequently throttle to ~66 kB/s and stall
+        # multi-megabyte .deb fetches for >10 minutes. Keep ports.ubuntu.com on
+        # arm64 untouched.
+        if [ "$(dpkg --print-architecture)" = amd64 ]; then
+          for file in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            [ -f "$file" ] || continue
+            if sudo grep -qE '(ec2|azure)\.archive\.ubuntu\.com' "$file"; then
+              sudo sed -i -E \
+                -e 's#https?://[^[:space:]]*\.ec2\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' \
+                -e 's#https?://([^[:space:]]*\.)?azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' \
+                "$file"
+            fi
+          done
+        fi
+
+        apt_opts=(
+          -o Acquire::http::Timeout=15
+          -o Acquire::https::Timeout=15
+          -o Acquire::Retries=3
+          -o Acquire::ForceIPv4=true
+        )
+        sudo apt-get "${apt_opts[@]}" update
+        sudo apt-get "${apt_opts[@]}" install -y --no-install-recommends --no-upgrade "${packages[@]}"

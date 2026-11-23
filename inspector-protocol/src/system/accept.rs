@@ -228,6 +228,8 @@ mod tests {
                     connections.send(guest).expect("the listener is alive");
                     let (read, write) = tokio::io::split(host);
                     let client = Client::new(read.compat(), write.compat_write());
+                    let driver = client.clone();
+                    tokio::spawn(async move { driver.route_frames().await });
                     let answer = tokio::time::timeout(
                         DEADLINE,
                         client.invoke_raw(INSTANCE, FUNC, Vec::new()),

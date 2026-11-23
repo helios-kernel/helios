@@ -76,14 +76,9 @@ impl ReportedFrames {
         });
     }
 
-    /// Clears `range` and reports whether any of it had been shown to a
-    /// consumer, and therefore has to be zeroed before it is used again.
-    #[must_use]
-    pub(crate) fn take(&self, range: PhysFrameRange) -> bool {
-        self.take_bytes(range.start.phys_addr(), range.byte_size())
-    }
-
-    /// The byte-granular form of [`ReportedFrames::take`].
+    /// Clears the bytes `[start, start + len)` and reports whether any
+    /// of them had been shown to a consumer, and therefore have to be
+    /// zeroed before they are used again.
     ///
     /// A pool that serves sub-frame allocations can hand out part of a
     /// frame that was reported. Only the frames the allocation covers
@@ -109,28 +104,6 @@ impl ReportedFrames {
             }
             found
         })
-    }
-
-    /// Clears the marks over `[start, start + len)` when the bitmap can
-    /// be taken without waiting, and reports whether it was.
-    ///
-    /// This is the page-fault path's form. That path zeroes the frame
-    /// unconditionally, so a mark it fails to clear costs one redundant
-    /// zeroing the next time the frame is handed out and nothing else —
-    /// whereas waiting for the lock would be waiting on whatever the
-    /// fault interrupted, which may be the context holding it.
-    pub(crate) fn try_clear_bytes(&self, start: usize, len: usize) -> bool {
-        if len == 0 {
-            return false;
-        }
-        let covered = start.div_ceil(PhysFrame::SIZE)..(start + len) / PhysFrame::SIZE;
-        self.bits
-            .try_with(|bits| {
-                for frame in covered {
-                    bits.clear(frame);
-                }
-            })
-            .is_some()
     }
 
     /// How many frames are currently marked.
@@ -274,19 +247,23 @@ mod tests {
         }
     }
 
+    fn take(reported: &ReportedFrames, range: PhysFrameRange) -> bool {
+        reported.take_bytes(range.start.phys_addr(), range.byte_size())
+    }
+
     #[test]
     fn taking_a_marked_range_reports_it_and_clears_it() {
         let reported = ReportedFrames::new();
         reported.cover(0, 64 * PhysFrame::SIZE);
 
-        assert!(!reported.take(range(0, 4)), "nothing has been reported");
+        assert!(!take(&reported, range(0, 4)), "nothing has been reported");
         reported.mark(range(8, 4));
         assert_eq!(reported.count(), 4);
 
-        assert!(reported.take(range(8, 4)));
+        assert!(take(&reported, range(8, 4)));
         assert_eq!(reported.count(), 0);
         assert!(
-            !reported.take(range(8, 4)),
+            !take(&reported, range(8, 4)),
             "a range is only clobbered once per report"
         );
     }
@@ -299,12 +276,12 @@ mod tests {
         reported.cover(0, 64 * PhysFrame::SIZE);
         reported.mark(range(16, 8));
 
-        assert!(reported.take(range(16, 2)));
+        assert!(take(&reported, range(16, 2)));
         assert_eq!(reported.count(), 6);
-        assert!(reported.take(range(20, 4)));
+        assert!(take(&reported, range(20, 4)));
         assert_eq!(reported.count(), 2);
         assert!(
-            !reported.take(range(0, 16)),
+            !take(&reported, range(0, 16)),
             "frames outside the reported run were never shown to anyone"
         );
     }
@@ -319,7 +296,7 @@ mod tests {
 
         reported.cover(0, 64 * PhysFrame::SIZE);
         assert_eq!(reported.count(), 2);
-        assert!(reported.take(range(70, 2)));
+        assert!(take(&reported, range(70, 2)));
         assert_eq!(reported.count(), 0);
     }
 
@@ -331,7 +308,7 @@ mod tests {
         reported.cover(0, 8 * PhysFrame::SIZE);
         reported.mark(range(100, 4));
         assert_eq!(reported.count(), 0);
-        assert!(!reported.take(range(100, 4)));
+        assert!(!take(&reported, range(100, 4)));
     }
 
     #[test]

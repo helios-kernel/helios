@@ -32,6 +32,24 @@ bitflags! {
     }
 }
 
+/// First unprivileged port (IANA well-known ports occupy `1..1024`; port `0`
+/// requests an ephemeral port from the stack).
+const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
+
+impl NetworkAuthorityRights {
+    /// Returns the rights required to bind `local_port` on top of `self`.
+    ///
+    /// Ports `1..1024` require [`Self::PRIVILEGED_BIND`]; port `0` asks the
+    /// stack for an ephemeral port and is exempt.
+    pub const fn bind_rights(self, local_port: u16) -> Self {
+        if local_port != 0 && local_port < FIRST_UNPRIVILEGED_PORT {
+            self.union(Self::PRIVILEGED_BIND)
+        } else {
+            self
+        }
+    }
+}
+
 bitflags! {
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct ClockAuthorityRights: u8 {
@@ -92,6 +110,42 @@ bitflags! {
         const INPUT = 1 << 1;
         const GPU = 1 << 2;
         const AUDIO = 1 << 3;
+    }
+}
+
+bitflags! {
+    /// What an instance may do to the machine's diagnostics, beyond
+    /// reading its own.
+    ///
+    /// `OBSERVE_MACHINE` covers the tracing and profiling controls and
+    /// reading any instance's records. Every observer in the tree uses
+    /// both, so one right covers them.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct DiagnosticAuthorityRights: u8 {
+        const OBSERVE_MACHINE = 1 << 0;
+    }
+}
+
+bitflags! {
+    /// What an instance may do to the machine-wide settings. Reading a
+    /// setting needs no right.
+    ///
+    /// A class of its own beside the diagnostics rights: observing the
+    /// machine and configuring it are separate powers, and an observer
+    /// has no reason to hold the second.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct SettingsAuthorityRights: u8 {
+        const WRITE = 1 << 0;
+    }
+}
+
+bitflags! {
+    /// What an instance may do to the machine itself rather than to
+    /// what runs on it.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct MachineAuthorityRights: u8 {
+        /// Take processors offline and bring them online.
+        const CONTROL_PROCESSORS = 1 << 0;
     }
 }
 
@@ -160,7 +214,7 @@ macro_rules! typed_device_class_cap {
 
 typed_device_class_cap!(DisplayClaimCap, DeviceClassRights::DISPLAY);
 typed_device_class_cap!(InputClaimCap, DeviceClassRights::INPUT);
-typed_device_class_cap!(GpuClaimCap, DeviceClassRights::GPU);
+typed_device_class_cap!(GpuOpenCap, DeviceClassRights::GPU);
 typed_device_class_cap!(AudioClaimCap, DeviceClassRights::AUDIO);
 
 /// Proof that the instance was granted one named device. The name is
@@ -171,6 +225,51 @@ pub struct DeviceGrantClaimCap(DeviceName);
 impl DeviceGrantClaimCap {
     pub const fn name(&self) -> &DeviceName {
         &self.0
+    }
+}
+
+/// Proof, checked on the owning task, that the instance may control the
+/// machine's tracing and profiling and read every instance's records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObserveMachineCap(DiagnosticAuthorityRights);
+
+impl ObserveMachineCap {
+    pub const fn required_rights() -> DiagnosticAuthorityRights {
+        DiagnosticAuthorityRights::OBSERVE_MACHINE
+    }
+
+    pub const fn rights(self) -> DiagnosticAuthorityRights {
+        self.0
+    }
+}
+
+/// Proof, checked on the owning task, that the instance may change the
+/// machine-wide settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteSettingsCap(SettingsAuthorityRights);
+
+impl WriteSettingsCap {
+    pub const fn required_rights() -> SettingsAuthorityRights {
+        SettingsAuthorityRights::WRITE
+    }
+
+    pub const fn rights(self) -> SettingsAuthorityRights {
+        self.0
+    }
+}
+
+/// Proof, checked on the owning task, that the instance may take
+/// processors offline and bring them online.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlProcessorsCap(MachineAuthorityRights);
+
+impl ControlProcessorsCap {
+    pub const fn required_rights() -> MachineAuthorityRights {
+        MachineAuthorityRights::CONTROL_PROCESSORS
+    }
+
+    pub const fn rights(self) -> MachineAuthorityRights {
+        self.0
     }
 }
 
@@ -242,6 +341,188 @@ pub struct UnmountCap {
     point: String,
 }
 
+/// Authority to create a btrfs subvolume inside `parent`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BtrfsSubvolCreateCap {
+    parent: String,
+}
+
+impl BtrfsSubvolCreateCap {
+    pub fn parent(&self) -> &str {
+        &self.parent
+    }
+}
+
+/// Authority to delete a btrfs subvolume: `MUTATE_DIRECTORY` at `parent` and
+/// over the whole `subvolume` root being removed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BtrfsSubvolDeleteCap {
+    parent: String,
+    subvolume: String,
+}
+
+impl BtrfsSubvolDeleteCap {
+    pub fn parent(&self) -> &str {
+        &self.parent
+    }
+
+    pub fn subvolume(&self) -> &str {
+        &self.subvolume
+    }
+}
+
+/// Authority to snapshot a btrfs subvolume: `READ` over the whole
+/// `source_subvolume` root and `MUTATE_DIRECTORY` at `destination_parent`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BtrfsSnapshotCap {
+    source_subvolume: String,
+    destination_parent: String,
+}
+
+impl BtrfsSnapshotCap {
+    pub fn source_subvolume(&self) -> &str {
+        &self.source_subvolume
+    }
+
+    pub fn destination_parent(&self) -> &str {
+        &self.destination_parent
+    }
+}
+
+/// Authority to change the read-only flag on `subvolume`: `MUTATE_DIRECTORY`
+/// over the whole subvolume root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BtrfsSubvolReadOnlyCap {
+    subvolume: String,
+}
+
+impl BtrfsSubvolReadOnlyCap {
+    pub fn subvolume(&self) -> &str {
+        &self.subvolume
+    }
+}
+
+/// Authority to inspect or read a whole subvolume (used for `subvolume_info`,
+/// `list_subvolumes`, and source subvolumes referenced by `receive`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BtrfsSubvolReadCap {
+    subvolume: String,
+}
+
+impl BtrfsSubvolReadCap {
+    pub fn subvolume(&self) -> &str {
+        &self.subvolume
+    }
+}
+
+/// Authority to send a btrfs subvolume: `READ` over the whole `subvolume`,
+/// plus `READ` over `parent` (for incremental send) and every clone source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BtrfsSendCap {
+    subvolume: String,
+    parent: Option<String>,
+    clone_sources: Vec<String>,
+}
+
+impl BtrfsSendCap {
+    pub fn subvolume(&self) -> &str {
+        &self.subvolume
+    }
+
+    pub fn parent(&self) -> Option<&str> {
+        self.parent.as_deref()
+    }
+
+    pub fn clone_sources(&self) -> &[String] {
+        &self.clone_sources
+    }
+}
+
+/// Authority to receive a btrfs stream into `destination` (`MUTATE_DIRECTORY`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BtrfsReceiveCap {
+    destination: String,
+}
+
+impl BtrfsReceiveCap {
+    pub fn destination(&self) -> &str {
+        &self.destination
+    }
+}
+
+/// Authority to reflink (clone extents) from `source` (`READ`) to `destination`
+/// (`WRITE`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BtrfsReflinkCap {
+    source: String,
+    destination: String,
+}
+
+impl BtrfsReflinkCap {
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn destination(&self) -> &str {
+        &self.destination
+    }
+}
+
+/// Authority to deduplicate extents from `source` (`READ`) into `destination`
+/// (`WRITE`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BtrfsDedupeCap {
+    source: String,
+    destination: String,
+}
+
+impl BtrfsDedupeCap {
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn destination(&self) -> &str {
+        &self.destination
+    }
+}
+
+/// Authority to perform volume-wide administration on a mounted btrfs
+/// filesystem (resize, balance, scrub, quota groups, device listing): holds
+/// the mount's authority over `mount_point`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BtrfsMountAdminCap {
+    mount: MountCap,
+}
+
+impl BtrfsMountAdminCap {
+    pub fn point(&self) -> &str {
+        self.mount.point()
+    }
+
+    pub fn mount_cap(&self) -> &MountCap {
+        &self.mount
+    }
+}
+
+/// Authority to perform a device-naming volume operation (device add, remove,
+/// replace, or targeting a specific device): holds the mount's authority plus
+/// an explicit device grant for the named device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BtrfsDeviceAdminCap {
+    mount: MountCap,
+    device: DeviceGrantClaimCap,
+}
+
+impl BtrfsDeviceAdminCap {
+    pub fn point(&self) -> &str {
+        self.mount.point()
+    }
+
+    pub fn device(&self) -> &DeviceName {
+        self.device.name()
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProcessAuthority {
     directory_preopens: Vec<DirectoryPreopen>,
@@ -256,6 +537,9 @@ pub struct ProcessAuthority {
     /// Raw devices this instance may claim by name. Bounded by the
     /// registry's own capacity, because the registry cannot publish more.
     devices: ArrayVec<DeviceName, MAX_GRANTS>,
+    diagnostics: DiagnosticAuthorityRights,
+    settings: SettingsAuthorityRights,
+    machine: MachineAuthorityRights,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -302,6 +586,18 @@ pub enum ProcessAuthorityError {
     DeviceNameTooLong,
     #[error("an instance holds at most {} named devices", MAX_GRANTS)]
     TooManyDeviceGrants,
+    #[error("diagnostic grant rights must not be empty")]
+    EmptyDiagnosticRights,
+    #[error("diagnostic grant exceeds caller authority: {0:?}")]
+    DiagnosticGrantExceedsAuthority(DiagnosticAuthorityRights),
+    #[error("settings grant rights must not be empty")]
+    EmptySettingsRights,
+    #[error("settings grant exceeds caller authority: {0:?}")]
+    SettingsGrantExceedsAuthority(SettingsAuthorityRights),
+    #[error("machine grant rights must not be empty")]
+    EmptyMachineRights,
+    #[error("machine grant exceeds caller authority: {0:?}")]
+    MachineGrantExceedsAuthority(MachineAuthorityRights),
 }
 
 impl DirectoryPreopen {
@@ -444,12 +740,17 @@ impl ProcessAuthority {
             mount: MountAuthorityRights::empty(),
             device_classes: DeviceClassRights::empty(),
             devices: ArrayVec::new_const(),
+            diagnostics: DiagnosticAuthorityRights::empty(),
+            settings: SettingsAuthorityRights::empty(),
+            machine: MachineAuthorityRights::empty(),
         }
     }
 
-    /// Every right except the device ones. The kernel adds the device
-    /// classes and named devices a component needs where it starts that
-    /// component, so no program inherits a claim through this value.
+    /// Every right except the device, diagnostic, settings and machine ones.
+    /// The kernel adds the device classes, named devices, diagnostic, settings
+    /// and machine rights a component needs where it starts that component, so
+    /// no program inherits a claim, the machine's diagnostics, its settings or
+    /// control of its processors through this value.
     pub fn root() -> Self {
         let mut authority = Self::empty();
         authority.insert_directory_preopen(
@@ -553,6 +854,30 @@ impl ProcessAuthority {
 
     pub fn granted_devices(&self) -> &[DeviceName] {
         &self.devices
+    }
+
+    pub fn diagnostic_rights(&self) -> DiagnosticAuthorityRights {
+        self.diagnostics
+    }
+
+    pub fn grant_diagnostic_rights(&mut self, rights: DiagnosticAuthorityRights) {
+        self.diagnostics |= rights;
+    }
+
+    pub fn settings_rights(&self) -> SettingsAuthorityRights {
+        self.settings
+    }
+
+    pub fn grant_settings_rights(&mut self, rights: SettingsAuthorityRights) {
+        self.settings |= rights;
+    }
+
+    pub fn machine_rights(&self) -> MachineAuthorityRights {
+        self.machine
+    }
+
+    pub fn grant_machine_rights(&mut self, rights: MachineAuthorityRights) {
+        self.machine |= rights;
     }
 
     pub fn grant_device_classes(&mut self, rights: DeviceClassRights) {
@@ -805,6 +1130,64 @@ impl ProcessAuthority {
         Ok(rights)
     }
 
+    pub fn derive_diagnostic_rights(
+        &self,
+        rights: DiagnosticAuthorityRights,
+    ) -> Result<DiagnosticAuthorityRights, ProcessAuthorityError> {
+        if rights.is_empty() {
+            return Err(ProcessAuthorityError::EmptyDiagnosticRights);
+        }
+        if !self.diagnostics.contains(rights) {
+            return Err(ProcessAuthorityError::DiagnosticGrantExceedsAuthority(
+                rights,
+            ));
+        }
+        Ok(rights)
+    }
+
+    pub fn derive_observe_machine_cap(&self) -> Result<ObserveMachineCap, ProcessAuthorityError> {
+        self.derive_diagnostic_rights(ObserveMachineCap::required_rights())
+            .map(ObserveMachineCap)
+    }
+
+    pub fn derive_settings_rights(
+        &self,
+        rights: SettingsAuthorityRights,
+    ) -> Result<SettingsAuthorityRights, ProcessAuthorityError> {
+        if rights.is_empty() {
+            return Err(ProcessAuthorityError::EmptySettingsRights);
+        }
+        if !self.settings.contains(rights) {
+            return Err(ProcessAuthorityError::SettingsGrantExceedsAuthority(rights));
+        }
+        Ok(rights)
+    }
+
+    pub fn derive_write_settings_cap(&self) -> Result<WriteSettingsCap, ProcessAuthorityError> {
+        self.derive_settings_rights(WriteSettingsCap::required_rights())
+            .map(WriteSettingsCap)
+    }
+
+    pub fn derive_machine_rights(
+        &self,
+        rights: MachineAuthorityRights,
+    ) -> Result<MachineAuthorityRights, ProcessAuthorityError> {
+        if rights.is_empty() {
+            return Err(ProcessAuthorityError::EmptyMachineRights);
+        }
+        if !self.machine.contains(rights) {
+            return Err(ProcessAuthorityError::MachineGrantExceedsAuthority(rights));
+        }
+        Ok(rights)
+    }
+
+    pub fn derive_control_processors_cap(
+        &self,
+    ) -> Result<ControlProcessorsCap, ProcessAuthorityError> {
+        self.derive_machine_rights(ControlProcessorsCap::required_rights())
+            .map(ControlProcessorsCap)
+    }
+
     pub fn derive_device_class_rights(
         &self,
         rights: DeviceClassRights,
@@ -857,9 +1240,9 @@ impl ProcessAuthority {
             .map(InputClaimCap)
     }
 
-    pub fn derive_gpu_claim_cap(&self) -> Result<GpuClaimCap, ProcessAuthorityError> {
-        self.derive_device_class_rights(GpuClaimCap::required_rights())
-            .map(GpuClaimCap)
+    pub fn derive_gpu_open_cap(&self) -> Result<GpuOpenCap, ProcessAuthorityError> {
+        self.derive_device_class_rights(GpuOpenCap::required_rights())
+            .map(GpuOpenCap)
     }
 
     pub fn derive_audio_claim_cap(&self) -> Result<AudioClaimCap, ProcessAuthorityError> {
@@ -878,6 +1261,185 @@ impl ProcessAuthority {
             return Err(ProcessAuthorityError::DeviceGrantExceedsAuthority(name));
         }
         Ok(DeviceGrantClaimCap(name))
+    }
+
+    /// The widest directory grant that covers `path` with all of `rights`,
+    /// which is the floor a symbolic link followed from `path` may not leave.
+    pub fn directory_floor(&self, path: &str, rights: DirectoryAuthorityRights) -> Option<&str> {
+        self.directory_preopens
+            .iter()
+            .map(|preopen| (preopen.source_path(), preopen.rights()))
+            .chain(self.cwd.iter().map(|cwd| (cwd.source_path(), cwd.rights())))
+            .filter(|(directory, held)| {
+                directory_contains(directory, path) && held.contains(rights)
+            })
+            .map(|(directory, _)| directory)
+            .min_by_key(|directory| directory.len())
+    }
+
+    fn require_directory(
+        &self,
+        path: &str,
+        rights: DirectoryAuthorityRights,
+    ) -> Result<String, ProcessAuthorityError> {
+        let normalized = normalize_authority_path(path)?;
+        if !self.has_directory_authority(&normalized, rights) {
+            return Err(ProcessAuthorityError::DirectoryGrantExceedsAuthority(
+                rights,
+            ));
+        }
+        Ok(normalized)
+    }
+
+    /// Derives authority to create a subvolume inside `parent` (`MUTATE_DIRECTORY`).
+    pub fn derive_btrfs_subvol_create_cap(
+        &self,
+        parent: &str,
+    ) -> Result<BtrfsSubvolCreateCap, ProcessAuthorityError> {
+        let parent = self.require_directory(parent, DirectoryAuthorityRights::MUTATE_DIRECTORY)?;
+        Ok(BtrfsSubvolCreateCap { parent })
+    }
+
+    /// Derives authority to delete `subvolume` from `parent`: requires
+    /// `MUTATE_DIRECTORY` at `parent` AND over the whole `subvolume` root.
+    pub fn derive_btrfs_subvol_delete_cap(
+        &self,
+        parent: &str,
+        subvolume: &str,
+    ) -> Result<BtrfsSubvolDeleteCap, ProcessAuthorityError> {
+        let parent = self.require_directory(parent, DirectoryAuthorityRights::MUTATE_DIRECTORY)?;
+        let subvolume =
+            self.require_directory(subvolume, DirectoryAuthorityRights::MUTATE_DIRECTORY)?;
+        Ok(BtrfsSubvolDeleteCap { parent, subvolume })
+    }
+
+    /// Derives authority to snapshot `source_subvolume` into
+    /// `destination_parent`: requires `READ` over the whole `source_subvolume`
+    /// root and `MUTATE_DIRECTORY` at `destination_parent`.
+    pub fn derive_btrfs_snapshot_cap(
+        &self,
+        source_subvolume: &str,
+        destination_parent: &str,
+    ) -> Result<BtrfsSnapshotCap, ProcessAuthorityError> {
+        let source_subvolume =
+            self.require_directory(source_subvolume, DirectoryAuthorityRights::READ)?;
+        let destination_parent = self.require_directory(
+            destination_parent,
+            DirectoryAuthorityRights::MUTATE_DIRECTORY,
+        )?;
+        Ok(BtrfsSnapshotCap {
+            source_subvolume,
+            destination_parent,
+        })
+    }
+
+    /// Derives authority to toggle the read-only flag on `subvolume`
+    /// (`MUTATE_DIRECTORY` over the whole subvolume root).
+    pub fn derive_btrfs_subvol_read_only_cap(
+        &self,
+        subvolume: &str,
+    ) -> Result<BtrfsSubvolReadOnlyCap, ProcessAuthorityError> {
+        let subvolume =
+            self.require_directory(subvolume, DirectoryAuthorityRights::MUTATE_DIRECTORY)?;
+        Ok(BtrfsSubvolReadOnlyCap { subvolume })
+    }
+
+    /// Derives authority to read a whole subvolume root (`READ`).
+    pub fn derive_btrfs_subvol_read_cap(
+        &self,
+        subvolume: &str,
+    ) -> Result<BtrfsSubvolReadCap, ProcessAuthorityError> {
+        let subvolume = self.require_directory(subvolume, DirectoryAuthorityRights::READ)?;
+        Ok(BtrfsSubvolReadCap { subvolume })
+    }
+
+    /// Derives authority to send `subvolume`, optionally incremental against
+    /// `parent` and cloning from `clone_sources`: requires `READ` over each
+    /// subvolume root.
+    pub fn derive_btrfs_send_cap(
+        &self,
+        subvolume: &str,
+        parent: Option<&str>,
+        clone_sources: &[&str],
+    ) -> Result<BtrfsSendCap, ProcessAuthorityError> {
+        let subvolume = self.require_directory(subvolume, DirectoryAuthorityRights::READ)?;
+        let parent = match parent {
+            Some(p) => Some(self.require_directory(p, DirectoryAuthorityRights::READ)?),
+            None => None,
+        };
+        let mut sources = Vec::with_capacity(clone_sources.len());
+        for &src in clone_sources {
+            sources.push(self.require_directory(src, DirectoryAuthorityRights::READ)?);
+        }
+        Ok(BtrfsSendCap {
+            subvolume,
+            parent,
+            clone_sources: sources,
+        })
+    }
+
+    /// Derives authority to receive a stream into `destination`
+    /// (`MUTATE_DIRECTORY`).
+    pub fn derive_btrfs_receive_cap(
+        &self,
+        destination: &str,
+    ) -> Result<BtrfsReceiveCap, ProcessAuthorityError> {
+        let destination =
+            self.require_directory(destination, DirectoryAuthorityRights::MUTATE_DIRECTORY)?;
+        Ok(BtrfsReceiveCap { destination })
+    }
+
+    /// Derives authority to reflink from `source` (`READ`) to `destination`
+    /// (`WRITE`).
+    pub fn derive_btrfs_reflink_cap(
+        &self,
+        source: &str,
+        destination: &str,
+    ) -> Result<BtrfsReflinkCap, ProcessAuthorityError> {
+        let source = self.require_directory(source, DirectoryAuthorityRights::READ)?;
+        let destination = self.require_directory(destination, DirectoryAuthorityRights::WRITE)?;
+        Ok(BtrfsReflinkCap {
+            source,
+            destination,
+        })
+    }
+
+    /// Derives authority to deduplicate from `source` (`READ`) into
+    /// `destination` (`WRITE`).
+    pub fn derive_btrfs_dedupe_cap(
+        &self,
+        source: &str,
+        destination: &str,
+    ) -> Result<BtrfsDedupeCap, ProcessAuthorityError> {
+        let source = self.require_directory(source, DirectoryAuthorityRights::READ)?;
+        let destination = self.require_directory(destination, DirectoryAuthorityRights::WRITE)?;
+        Ok(BtrfsDedupeCap {
+            source,
+            destination,
+        })
+    }
+
+    /// Derives volume-wide administration authority on `mount_point` (requires
+    /// the mount's authority: `MOUNT` right + `MUTATE_DIRECTORY` at `mount_point`).
+    pub fn derive_btrfs_mount_admin_cap(
+        &self,
+        mount_point: &str,
+    ) -> Result<BtrfsMountAdminCap, ProcessAuthorityError> {
+        let mount = self.derive_mount_cap(mount_point)?;
+        Ok(BtrfsMountAdminCap { mount })
+    }
+
+    /// Derives device-naming volume administration authority on `mount_point`
+    /// for `device_name`: requires the mount's authority plus an explicit
+    /// device grant for `device_name`.
+    pub fn derive_btrfs_device_admin_cap(
+        &self,
+        mount_point: &str,
+        device_name: &str,
+    ) -> Result<BtrfsDeviceAdminCap, ProcessAuthorityError> {
+        let mount = self.derive_mount_cap(mount_point)?;
+        let device = self.derive_device_grant_cap(device_name)?;
+        Ok(BtrfsDeviceAdminCap { mount, device })
     }
 
     pub fn can_load_program(&self, path: &str) -> bool {
@@ -927,6 +1489,9 @@ impl ProcessAuthority {
             && self.link.contains(child.link)
             && self.mount.contains(child.mount)
             && self.device_classes.contains(child.device_classes)
+            && self.diagnostics.contains(child.diagnostics)
+            && self.settings.contains(child.settings)
+            && self.machine.contains(child.machine)
             && child
                 .devices
                 .iter()
@@ -947,7 +1512,7 @@ impl ProcessAuthority {
 #[cfg(test)]
 pub(crate) mod test_caps {
     use super::{
-        AudioClaimCap, DeviceClassRights, DeviceGrantClaimCap, DisplayClaimCap, GpuClaimCap,
+        AudioClaimCap, DeviceClassRights, DeviceGrantClaimCap, DisplayClaimCap, GpuOpenCap,
         InputClaimCap, ProcessAuthority,
     };
     use crate::device::DeviceName;
@@ -970,9 +1535,9 @@ pub(crate) mod test_caps {
             .expect("the authority holds the input class")
     }
 
-    pub(crate) fn gpu() -> GpuClaimCap {
+    pub(crate) fn gpu() -> GpuOpenCap {
         holding(DeviceClassRights::GPU)
-            .derive_gpu_claim_cap()
+            .derive_gpu_open_cap()
             .expect("the authority holds the GPU class")
     }
 
@@ -1009,9 +1574,10 @@ fn directory_contains(directory: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClockAuthorityRights, DeviceClassRights, DirectoryAuthorityRights, LinkAuthorityRights,
+        ClockAuthorityRights, DeviceClassRights, DiagnosticAuthorityRights,
+        DirectoryAuthorityRights, LinkAuthorityRights, MachineAuthorityRights,
         MountAuthorityRights, NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityError,
-        ProcessAuthorityRights, TerminalAuthorityRights,
+        ProcessAuthorityRights, SettingsAuthorityRights, TerminalAuthorityRights,
     };
     use crate::device::{DeviceName, MAX_GRANTS};
 
@@ -1404,12 +1970,16 @@ mod tests {
         child.grant_process_rights(ProcessAuthorityRights::SPAWN);
         child.grant_link_rights(LinkAuthorityRights::SOURCE);
         child.grant_device_classes(DeviceClassRights::DISPLAY);
+        child.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        child.grant_settings_rights(SettingsAuthorityRights::WRITE);
         child
             .grant_device(device_name("pci:0000:00:04.0"))
             .expect("one named device fits");
 
         let mut parent = parent;
         parent.grant_device_classes(DeviceClassRights::all());
+        parent.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        parent.grant_settings_rights(SettingsAuthorityRights::WRITE);
         parent
             .grant_device(device_name("pci:0000:00:04.0"))
             .expect("one named device fits");
@@ -1432,6 +2002,136 @@ mod tests {
             .grant_device(device_name("pci:0000:00:04.0"))
             .expect("one named device fits");
         assert!(!device_only_parent.contains_authority(&child));
+
+        let mut diagnostics_less_parent = ProcessAuthority::root();
+        diagnostics_less_parent.grant_device_classes(DeviceClassRights::all());
+        diagnostics_less_parent
+            .grant_device(device_name("pci:0000:00:04.0"))
+            .expect("one named device fits");
+        diagnostics_less_parent.grant_settings_rights(SettingsAuthorityRights::WRITE);
+        assert!(!diagnostics_less_parent.contains_authority(&child));
+
+        let mut settings_less_parent = ProcessAuthority::root();
+        settings_less_parent.grant_device_classes(DeviceClassRights::all());
+        settings_less_parent.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        settings_less_parent
+            .grant_device(device_name("pci:0000:00:04.0"))
+            .expect("one named device fits");
+        assert!(!settings_less_parent.contains_authority(&child));
+    }
+
+    #[test]
+    fn settings_grant_must_be_subset_of_caller_authority() {
+        let mut parent = ProcessAuthority::empty();
+        parent.grant_settings_rights(SettingsAuthorityRights::WRITE);
+
+        assert_eq!(
+            parent
+                .derive_settings_rights(SettingsAuthorityRights::WRITE)
+                .expect("caller may derive a right it holds"),
+            SettingsAuthorityRights::WRITE
+        );
+        assert_eq!(
+            parent
+                .derive_settings_rights(SettingsAuthorityRights::empty())
+                .expect_err("an empty settings grant is a mistake"),
+            ProcessAuthorityError::EmptySettingsRights
+        );
+        assert!(parent.derive_write_settings_cap().is_ok());
+
+        let holder_less = ProcessAuthority::empty();
+        assert_eq!(
+            holder_less
+                .derive_settings_rights(SettingsAuthorityRights::WRITE)
+                .expect_err("a caller without the right must not hand it on"),
+            ProcessAuthorityError::SettingsGrantExceedsAuthority(SettingsAuthorityRights::WRITE)
+        );
+        assert!(matches!(
+            holder_less.derive_write_settings_cap(),
+            Err(ProcessAuthorityError::SettingsGrantExceedsAuthority(_))
+        ));
+
+        // The observe right is a separate power: holding it grants no
+        // write.
+        let mut observer = ProcessAuthority::empty();
+        observer.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        assert!(observer.derive_write_settings_cap().is_err());
+    }
+
+    #[test]
+    fn root_authority_holds_no_settings_rights() {
+        let root = ProcessAuthority::root();
+        assert_eq!(root.settings_rights(), SettingsAuthorityRights::empty());
+        assert!(root.derive_write_settings_cap().is_err());
+    }
+
+    #[test]
+    fn diagnostic_grant_must_be_subset_of_caller_authority() {
+        let mut parent = ProcessAuthority::empty();
+        parent.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+
+        assert_eq!(
+            parent
+                .derive_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE)
+                .expect("caller may derive a right it holds"),
+            DiagnosticAuthorityRights::OBSERVE_MACHINE
+        );
+        assert_eq!(
+            parent
+                .derive_diagnostic_rights(DiagnosticAuthorityRights::empty())
+                .expect_err("an empty diagnostic grant is a mistake"),
+            ProcessAuthorityError::EmptyDiagnosticRights
+        );
+        assert!(parent.derive_observe_machine_cap().is_ok());
+
+        let holder_less = ProcessAuthority::empty();
+        assert_eq!(
+            holder_less
+                .derive_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE)
+                .expect_err("a caller without the right must not hand it on"),
+            ProcessAuthorityError::DiagnosticGrantExceedsAuthority(
+                DiagnosticAuthorityRights::OBSERVE_MACHINE
+            )
+        );
+        assert!(matches!(
+            holder_less.derive_observe_machine_cap(),
+            Err(ProcessAuthorityError::DiagnosticGrantExceedsAuthority(_))
+        ));
+    }
+
+    #[test]
+    fn root_authority_holds_no_diagnostic_rights() {
+        let root = ProcessAuthority::root();
+        assert_eq!(root.diagnostic_rights(), DiagnosticAuthorityRights::empty());
+        assert!(root.derive_observe_machine_cap().is_err());
+    }
+
+    #[test]
+    fn machine_grant_must_be_subset_of_caller_authority() {
+        let mut parent = ProcessAuthority::root();
+        parent.grant_machine_rights(MachineAuthorityRights::CONTROL_PROCESSORS);
+        assert!(parent.derive_control_processors_cap().is_ok());
+        assert_eq!(
+            parent
+                .derive_machine_rights(MachineAuthorityRights::empty())
+                .expect_err("an empty machine grant is a mistake"),
+            ProcessAuthorityError::EmptyMachineRights
+        );
+
+        let root = ProcessAuthority::root();
+        assert_eq!(root.machine_rights(), MachineAuthorityRights::empty());
+        assert_eq!(
+            root.derive_control_processors_cap()
+                .expect_err("root authority does not control processors"),
+            ProcessAuthorityError::MachineGrantExceedsAuthority(
+                MachineAuthorityRights::CONTROL_PROCESSORS
+            )
+        );
+
+        let mut child = ProcessAuthority::root();
+        child.grant_machine_rights(MachineAuthorityRights::CONTROL_PROCESSORS);
+        assert!(parent.contains_authority(&child));
+        assert!(!root.contains_authority(&child));
     }
 
     #[test]
@@ -1463,7 +2163,7 @@ mod tests {
         assert!(parent.derive_display_claim_cap().is_ok());
         assert!(parent.derive_input_claim_cap().is_ok());
         assert!(matches!(
-            parent.derive_gpu_claim_cap(),
+            parent.derive_gpu_open_cap(),
             Err(ProcessAuthorityError::DeviceClassGrantExceedsAuthority(_))
         ));
         assert!(matches!(
@@ -1527,7 +2227,211 @@ mod tests {
         assert!(root.granted_devices().is_empty());
         assert!(root.derive_display_claim_cap().is_err());
         assert!(root.derive_input_claim_cap().is_err());
-        assert!(root.derive_gpu_claim_cap().is_err());
+        assert!(root.derive_gpu_open_cap().is_err());
         assert!(root.derive_audio_claim_cap().is_err());
+    }
+
+    #[test]
+    fn bind_rights_exempts_ephemeral_port_zero_and_requires_privilege_below_1024() {
+        assert_eq!(
+            NetworkAuthorityRights::UDP.bind_rights(0),
+            NetworkAuthorityRights::UDP
+        );
+        assert_eq!(
+            NetworkAuthorityRights::TCP.bind_rights(0),
+            NetworkAuthorityRights::TCP
+        );
+        assert_eq!(
+            NetworkAuthorityRights::UDP.bind_rights(1),
+            NetworkAuthorityRights::UDP | NetworkAuthorityRights::PRIVILEGED_BIND
+        );
+        assert_eq!(
+            NetworkAuthorityRights::TCP.bind_rights(1023),
+            NetworkAuthorityRights::TCP | NetworkAuthorityRights::PRIVILEGED_BIND
+        );
+        assert_eq!(
+            NetworkAuthorityRights::UDP.bind_rights(1024),
+            NetworkAuthorityRights::UDP
+        );
+    }
+
+    #[test]
+    fn btrfs_management_caps_refuse_narrower_grants() {
+        use super::DirectoryPreopen;
+
+        // Snapshot: READ on a child directory inside the subvolume is NOT
+        // enough for the whole subvolume root.
+        let mut narrow_snap = ProcessAuthority::empty();
+        narrow_snap.insert_directory_preopen(
+            DirectoryPreopen::new(
+                "/mnt/sub/inner",
+                "/mnt/sub/inner",
+                DirectoryAuthorityRights::READ,
+            )
+            .unwrap(),
+        );
+        narrow_snap.insert_directory_preopen(
+            DirectoryPreopen::new(
+                "/mnt/snaps",
+                "/mnt/snaps",
+                DirectoryAuthorityRights::MUTATE_DIRECTORY,
+            )
+            .unwrap(),
+        );
+        assert!(
+            narrow_snap
+                .derive_btrfs_snapshot_cap("/mnt/sub", "/mnt/snaps")
+                .is_err()
+        );
+
+        // Snapshot succeeds only with READ on whole source subvolume root AND
+        // MUTATE_DIRECTORY on destination parent.
+        let mut full_snap = narrow_snap.clone();
+        full_snap.insert_directory_preopen(
+            DirectoryPreopen::new("/mnt/sub", "/mnt/sub", DirectoryAuthorityRights::READ).unwrap(),
+        );
+        assert!(
+            full_snap
+                .derive_btrfs_snapshot_cap("/mnt/sub", "/mnt/snaps")
+                .is_ok()
+        );
+        // Missing destination MUTATE_DIRECTORY is still refused.
+        let mut read_only_dest = ProcessAuthority::empty();
+        read_only_dest.insert_directory_preopen(
+            DirectoryPreopen::new("/mnt/sub", "/mnt/sub", DirectoryAuthorityRights::READ).unwrap(),
+        );
+        read_only_dest.insert_directory_preopen(
+            DirectoryPreopen::new("/mnt/snaps", "/mnt/snaps", DirectoryAuthorityRights::READ)
+                .unwrap(),
+        );
+        assert!(
+            read_only_dest
+                .derive_btrfs_snapshot_cap("/mnt/sub", "/mnt/snaps")
+                .is_err()
+        );
+
+        // Subvolume create: READ/WRITE alone without MUTATE_DIRECTORY refused.
+        let mut no_mutate = ProcessAuthority::empty();
+        no_mutate.insert_directory_preopen(
+            DirectoryPreopen::new(
+                "/mnt",
+                "/mnt",
+                DirectoryAuthorityRights::READ | DirectoryAuthorityRights::WRITE,
+            )
+            .unwrap(),
+        );
+        assert!(no_mutate.derive_btrfs_subvol_create_cap("/mnt").is_err());
+
+        // Subvolume delete: MUTATE_DIRECTORY on subvolume alone (missing parent)
+        // is refused; MUTATE_DIRECTORY on child inside subvolume is refused.
+        let mut sub_only = ProcessAuthority::empty();
+        sub_only.insert_directory_preopen(
+            DirectoryPreopen::new(
+                "/mnt/sub",
+                "/mnt/sub",
+                DirectoryAuthorityRights::MUTATE_DIRECTORY,
+            )
+            .unwrap(),
+        );
+        assert!(
+            sub_only
+                .derive_btrfs_subvol_delete_cap("/mnt", "/mnt/sub")
+                .is_err()
+        );
+
+        // Send: READ on subvolume without READ on parent (or clone source) is refused.
+        let mut send_no_parent = ProcessAuthority::empty();
+        send_no_parent.insert_directory_preopen(
+            DirectoryPreopen::new("/mnt/child", "/mnt/child", DirectoryAuthorityRights::READ)
+                .unwrap(),
+        );
+        assert!(
+            send_no_parent
+                .derive_btrfs_send_cap("/mnt/child", None, &[])
+                .is_ok()
+        );
+        assert!(
+            send_no_parent
+                .derive_btrfs_send_cap("/mnt/child", Some("/mnt/parent"), &[])
+                .is_err()
+        );
+        assert!(
+            send_no_parent
+                .derive_btrfs_send_cap("/mnt/child", None, &["/mnt/clone"])
+                .is_err()
+        );
+
+        // Receive: WRITE alone without MUTATE_DIRECTORY is refused.
+        assert!(no_mutate.derive_btrfs_receive_cap("/mnt").is_err());
+
+        // Reflink & dedupe: READ on source + WRITE on destination required.
+        let mut read_only = ProcessAuthority::empty();
+        read_only.insert_directory_preopen(
+            DirectoryPreopen::new("/mnt", "/mnt", DirectoryAuthorityRights::READ).unwrap(),
+        );
+        assert!(
+            read_only
+                .derive_btrfs_reflink_cap("/mnt/a", "/mnt/b")
+                .is_err()
+        );
+        assert!(
+            read_only
+                .derive_btrfs_dedupe_cap("/mnt/a", "/mnt/b")
+                .is_err()
+        );
+
+        let mut write_only = ProcessAuthority::empty();
+        write_only.insert_directory_preopen(
+            DirectoryPreopen::new("/mnt", "/mnt", DirectoryAuthorityRights::WRITE).unwrap(),
+        );
+        assert!(
+            write_only
+                .derive_btrfs_reflink_cap("/mnt/a", "/mnt/b")
+                .is_err()
+        );
+        assert!(
+            write_only
+                .derive_btrfs_dedupe_cap("/mnt/a", "/mnt/b")
+                .is_err()
+        );
+
+        assert!(
+            no_mutate
+                .derive_btrfs_reflink_cap("/mnt/a", "/mnt/b")
+                .is_ok()
+        );
+        assert!(
+            no_mutate
+                .derive_btrfs_dedupe_cap("/mnt/a", "/mnt/b")
+                .is_ok()
+        );
+
+        // Mount admin & device admin: requires MOUNT right + MUTATE_DIRECTORY on
+        // mount point, plus explicit device grant where a device is named.
+        let mut mount_only = ProcessAuthority::empty();
+        mount_only.grant_mount_rights(MountAuthorityRights::MOUNT);
+        assert!(mount_only.derive_btrfs_mount_admin_cap("/mnt").is_err());
+
+        mount_only.insert_directory_preopen(
+            DirectoryPreopen::new("/mnt", "/mnt", DirectoryAuthorityRights::MUTATE_DIRECTORY)
+                .unwrap(),
+        );
+        assert!(mount_only.derive_btrfs_mount_admin_cap("/mnt").is_ok());
+        assert!(
+            mount_only
+                .derive_btrfs_device_admin_cap("/mnt", "disk-2")
+                .is_err()
+        );
+        mount_only.grant_device(device_name("disk-2")).unwrap();
+        assert!(
+            mount_only
+                .derive_btrfs_device_admin_cap("/mnt", "disk-2")
+                .is_ok()
+        );
+        assert!(
+            mount_only
+                .derive_btrfs_device_admin_cap("/mnt", "disk-3")
+                .is_err()
+        );
     }
 }

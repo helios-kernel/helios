@@ -1,0 +1,24 @@
+### gVisor syscall suite on Helios, {{ report.arch }} ({{ report.mode.value }} run)
+
+gVisor `{{ report.revision }}`. Excluded cases fail natively on the runner and are not run on Helios; the report artifact records why each was excluded and why each failure failed.
+
+| | {% for column in columns %}{{ column }} | {% endfor %}
+| --- | {% for column in columns %}---: | {% endfor %}
+| **total** | {% for column in columns %}**{{ report.totals[column] }}** | {% endfor %}
+{% for binary, counts in report.binaries | dictsort -%}
+| `{{ binary }}` | {% for column in columns %}{{ counts[column] }} | {% endfor %}
+{% endfor %}
+{% if report.regressions %}
+**{{ report.regressions | length }} listed case(s) no longer pass:**
+
+{% for entry in report.regressions -%}
+- `{{ entry.case }}`: {{ entry.reason }}
+{% endfor %}
+{% endif %}
+{% if report.unlisted %}
+**{{ report.unlisted | length }} case(s) pass and are not in `tools/gvisor-syscalls/passing/{{ report.arch }}.txt`; extend the list with them (the artifact's `passing-{{ report.arch }}.txt`):**
+
+{% for case in report.unlisted -%}
+- `{{ case.line() }}`
+{% endfor %}
+{% endif %}

@@ -311,7 +311,11 @@ where
             })?;
             Ok(FrameAction::Dispatch(invocation, request))
         }
-        Frame::Accept { .. } | Frame::Reject { .. } => Err(DispatchError::protocol(
+        Frame::Accept { .. }
+        | Frame::Reject { .. }
+        | Frame::Credit { .. }
+        | Frame::ResourceDrop { .. }
+        | Frame::Fault { .. } => Err(DispatchError::protocol(
             "unexpected control frame on the debugger request stream",
         )),
     }
@@ -462,6 +466,8 @@ mod tests {
                 let (guest_read, guest_write) = tokio::io::split(guest);
                 let (host_read, host_write) = tokio::io::split(host);
                 let client = Client::new(host_read.compat(), host_write.compat_write());
+                let driver = client.clone();
+                tokio::spawn(async move { driver.route_frames().await });
 
                 let started = Arc::new(Notify::new());
                 let release = Arc::new(Notify::new());
