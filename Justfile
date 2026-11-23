@@ -95,7 +95,7 @@ clippy-host:
         --exclude helios-oob-load --exclude helios-perf \
         --exclude helios-ping --exclude helios-pride-flag --exclude helios-procbench \
         --exclude helios-sched-tasks --exclude helios-surface-test \
-        --exclude helios-webgpu-provider \
+        --exclude helios-sysctl --exclude helios-webgpu-provider \
         -- -D warnings
 
 # Clippy each guest program on its own, denying warnings.
@@ -112,7 +112,7 @@ clippy-programs:
     for package in helios-audio-test helios-compositor helios-cpu helios-date helios-debugger helios-display-test helios-gpu-test \
         helios-http-client \
         helios-init helios-input-test helios-oob-load helios-perf helios-ping helios-pride-flag \
-        helios-procbench helios-sched-tasks helios-surface-test helios-webgpu-provider; do
+        helios-procbench helios-sched-tasks helios-surface-test helios-sysctl helios-webgpu-provider; do
         cargo clippy -p "${package}" --all-targets -- -D warnings
     done
 
@@ -181,7 +181,10 @@ test-libraries:
     # and is tested here rather than only inside a boot, alongside the
     # capture check that links it.
     cargo nextest run -p helios-compositor-render -p helios-desktop-text-check
-    cargo nextest run -p helios-inspector-protocol --lib
+    cargo nextest run -p helios-inspector-protocol -p helios-wit-rpc
+    # A guest program's pure parts (argument and value parsing, output
+    # lines) run on the host.
+    cargo nextest run -p helios-sysctl
     # Btrfs reader and transaction tests use images two pure-Rust writers build.
     # Images from `mkfs.btrfs` need btrfs-progs and run in
     # `test-btrfs-mkfs`.
@@ -346,6 +349,7 @@ check-host:
     cargo check -p helios-kernel
     cargo check -p helios-hosted
     cargo check -p helios-inspector
+    cargo check -p helios-wit-rpc
     cargo check -p helios-compositor-render -p helios-desktop-text-check
 
 # Run hosted embedded-debugger smoke test.

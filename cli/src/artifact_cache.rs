@@ -27,7 +27,7 @@
 //! and does not grow with every revision. The modification time is the
 //! only record of use, so it works across the processes of one job.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
@@ -98,6 +98,12 @@ pub enum CacheError {
     },
     #[error("failed to encode the manifest of the cache entry {path}: {source}")]
     EncodeManifest {
+        path: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to encode the workspace manifest digest for {path}: {source}")]
+    EncodeWorkspaceDigest {
         path: String,
         #[source]
         source: serde_json::Error,
@@ -492,14 +498,17 @@ pub fn prune(dir: &Path, older_than: SystemTime) -> Result<usize, CacheError> {
 
 /// The files an entry built by cargo depends on, relative to
 /// `workspace_root` and sorted: the source files cargo's dep-info files
-/// `dep_infos` name, every file of every package in `package_dirs`, and the
-/// root manifest.
+/// `dep_infos` name and every file of every package in `package_dirs`.
 ///
 /// The package that is the workspace root itself holds the whole
-/// repository in its directory, so it contributes what a cargo package
-/// there is made of: its manifest, `src/` and the plain files beside the
-/// manifest (linker scripts), and not the documentation, workflows and
-/// tools beside them.
+/// repository in its directory, so when `workspace_root` is in
+/// `package_dirs` it contributes what a cargo package there is made of: its
+/// manifest, `src/` and the plain files beside the manifest (linker
+/// scripts), and not the documentation, workflows and tools beside them.
+/// Non-root workspace packages do not include the raw root `Cargo.toml`
+/// here because unrelated edits to `[workspace].members` or unreferenced
+/// `[workspace.dependencies]` must not invalidate them; instead their
+/// cache keys include [`workspace_manifest_digest`].
 ///
 /// Files outside the workspace that a registry or git checkout or the
 /// sysroot holds are left out because the lockfile and the toolchain are
@@ -518,7 +527,7 @@ pub fn workspace_inputs(
     excluded: &Path,
     package_dirs: &[PathBuf],
 ) -> Result<Vec<PathBuf>, CacheError> {
-    let mut inputs = BTreeSet::from([PathBuf::from(MANIFEST)]);
+    let mut inputs = BTreeSet::new();
     for dep_info in dep_infos {
         let text = fs::read_to_string(dep_info).map_err(|source| CacheError::Read {
             path: dep_info.display().to_string(),
@@ -607,17 +616,136 @@ fn package_files(
     Ok(paths)
 }
 
-/// Whether the cargo manifest at `path` has a `[workspace]` table.
-fn declares_workspace(path: &Path) -> Result<bool, CacheError> {
+/// Reads and parses a TOML manifest into a table.
+fn read_toml_table(path: &Path) -> Result<toml::Table, CacheError> {
     let text = fs::read_to_string(path).map_err(|source| CacheError::Read {
         path: path.display().to_string(),
         source,
     })?;
-    let manifest: toml::Table = toml::from_str(&text).map_err(|source| CacheError::DecodeToml {
+    toml::from_str(&text).map_err(|source| CacheError::DecodeToml {
         path: path.display().to_string(),
         source,
-    })?;
-    Ok(manifest.contains_key("workspace"))
+    })
+}
+
+/// Whether the cargo manifest at `path` has a `[workspace]` table.
+fn declares_workspace(path: &Path) -> Result<bool, CacheError> {
+    Ok(read_toml_table(path)?.contains_key("workspace"))
+}
+
+/// Canonical subset of the root `Cargo.toml` that can affect a build of the
+/// workspace packages in `package_dirs`.
+#[derive(Serialize)]
+struct WorkspaceManifestInputs<'a> {
+    profile: Option<&'a toml::Value>,
+    workspace_package: Option<&'a toml::Value>,
+    workspace_lints: Option<&'a toml::Value>,
+    workspace_resolver: Option<&'a toml::Value>,
+    patch: Option<&'a toml::Value>,
+    workspace_dependencies: BTreeMap<&'a str, &'a toml::Value>,
+}
+
+/// A digest of the sections of the root `Cargo.toml` that can affect a
+/// build of the workspace packages in `package_dirs`: `[profile]`,
+/// `[workspace.package]`, `[workspace.lints]`, `[workspace.resolver]`,
+/// `[patch]`, and only the `[workspace.dependencies]` entries inherited via
+/// `workspace = true` by any manifest inside `package_dirs`.
+///
+/// Edits to `[workspace].members`, `[workspace].exclude`, the root crate's
+/// own `[package]`/`[dependencies]`, or unreferenced entries of
+/// `[workspace.dependencies]` leave this digest unchanged, so adding a crate
+/// to the workspace does not invalidate cached guest wasm artifacts.
+pub fn workspace_manifest_digest(
+    workspace_root: &Path,
+    package_dirs: &[PathBuf],
+) -> Result<String, CacheError> {
+    let canonical_root =
+        fs::canonicalize(workspace_root).map_err(|source| CacheError::Resolve {
+            path: workspace_root.display().to_string(),
+            source,
+        })?;
+    let root_manifest_path = canonical_root.join(MANIFEST);
+    let root_manifest = read_toml_table(&root_manifest_path)?;
+
+    let mut referenced_deps = BTreeSet::new();
+    for package_dir in package_dirs {
+        let resolved = fs::canonicalize(package_dir).map_err(|source| CacheError::Resolve {
+            path: package_dir.display().to_string(),
+            source,
+        })?;
+        // External path packages (such as the sibling Wasmtime checkout)
+        // belong to their own workspace and never inherit from this root.
+        if !resolved.starts_with(&canonical_root) {
+            continue;
+        }
+        let manifest = read_toml_table(&resolved.join(MANIFEST))?;
+        collect_workspace_dependencies(&manifest, &mut referenced_deps);
+    }
+
+    let workspace = root_manifest
+        .get("workspace")
+        .and_then(toml::Value::as_table);
+    let all_workspace_deps = workspace
+        .and_then(|ws| ws.get("dependencies"))
+        .and_then(toml::Value::as_table);
+    let mut workspace_dependencies = BTreeMap::new();
+    if let Some(all_deps) = all_workspace_deps {
+        for name in &referenced_deps {
+            if let Some(value) = all_deps.get(name) {
+                workspace_dependencies.insert(name.as_str(), value);
+            }
+        }
+    }
+
+    let inputs = WorkspaceManifestInputs {
+        profile: root_manifest.get("profile"),
+        workspace_package: workspace.and_then(|ws| ws.get("package")),
+        workspace_lints: workspace.and_then(|ws| ws.get("lints")),
+        workspace_resolver: workspace.and_then(|ws| ws.get("resolver")),
+        patch: root_manifest.get("patch"),
+        workspace_dependencies,
+    };
+    let encoded =
+        serde_json::to_vec(&inputs).map_err(|source| CacheError::EncodeWorkspaceDigest {
+            path: root_manifest_path.display().to_string(),
+            source,
+        })?;
+    Ok(sha256_hex(&encoded))
+}
+
+/// Inserts every dependency key in `manifest` that declares `workspace = true`
+/// across `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, and
+/// `[target.<cfg>.*-dependencies]`.
+fn collect_workspace_dependencies(manifest: &toml::Table, referenced: &mut BTreeSet<String>) {
+    const SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+    for section in SECTIONS {
+        collect_dependency_table(manifest.get(section), referenced);
+    }
+    if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values() {
+            if let Some(target_table) = target.as_table() {
+                for section in SECTIONS {
+                    collect_dependency_table(target_table.get(section), referenced);
+                }
+            }
+        }
+    }
+}
+
+fn collect_dependency_table(table: Option<&toml::Value>, referenced: &mut BTreeSet<String>) {
+    let Some(deps) = table.and_then(toml::Value::as_table) else {
+        return;
+    };
+    for (name, spec) in deps {
+        if spec
+            .as_table()
+            .and_then(|table| table.get("workspace"))
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+        {
+            referenced.insert(name.clone());
+        }
+    }
 }
 
 /// `path` relative to the directory `base`; both are canonical, so the
@@ -736,14 +864,7 @@ fn resolve_lock_dependency(
 
 /// The name of the package a cargo manifest's `[package]` table declares.
 pub fn package_name(manifest_path: &Path) -> Result<String, CacheError> {
-    let text = fs::read_to_string(manifest_path).map_err(|source| CacheError::Read {
-        path: manifest_path.display().to_string(),
-        source,
-    })?;
-    let manifest: toml::Table = toml::from_str(&text).map_err(|source| CacheError::DecodeToml {
-        path: manifest_path.display().to_string(),
-        source,
-    })?;
+    let manifest = read_toml_table(manifest_path)?;
     manifest
         .get("package")
         .and_then(|package| package.get("name"))
@@ -1087,7 +1208,6 @@ mod tests {
     fn the_inputs_are_the_listed_sources_and_every_file_of_the_packages() {
         let fixture = Fixture::new();
         let expected = [
-            "Cargo.toml",
             "api/Cargo.toml",
             "api/protocol.txt",
             "api/src/lib.rs",
@@ -1820,5 +1940,286 @@ source = "git+https://example.org/acpi?branch=helios#0123abcd"
                 "{manifest} enables helios-hal and must include hal/"
             );
         }
+    }
+
+    const WORKSPACE_ROOT_TOML: &str = r#"[workspace]
+members = ["programs/date", "api"]
+exclude = ["scratch"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[package]
+name = "helios"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+kernel-only = "0.1.0"
+
+[workspace.dependencies]
+dep-normal = "1.0.0"
+dep-dev = "1.0.0"
+dep-build = "1.0.0"
+dep-target = "1.0.0"
+dep-target-dev = "1.0.0"
+dep-target-build = "1.0.0"
+unrelated-dep = "0.1.0"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[patch.crates-io]
+patched-crate = { git = "https://example.org/patched", branch = "main" }
+"#;
+
+    fn workspace_manifest_fixture() -> (Fixture, Vec<PathBuf>) {
+        let fixture = Fixture::new();
+        let root = fixture.workspace();
+        fs::write(root.join("Cargo.toml"), WORKSPACE_ROOT_TOML).expect("write root Cargo.toml");
+        fs::write(
+            root.join("programs/date/Cargo.toml"),
+            r#"[package]
+name = "date"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+dep-normal.workspace = true
+
+[dev-dependencies]
+dep-dev = { workspace = true }
+
+[build-dependencies]
+dep-build = { workspace = true, features = ["gen"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+dep-target.workspace = true
+"#,
+        )
+        .expect("write programs/date/Cargo.toml");
+        fs::write(
+            root.join("api/Cargo.toml"),
+            r#"[package]
+name = "api"
+version = "0.1.0"
+edition.workspace = true
+
+[target.'cfg(target_os = "wasi")'.dev-dependencies]
+dep-target-dev.workspace = true
+
+[target.'cfg(target_os = "wasi")'.build-dependencies]
+dep-target-build.workspace = true
+
+[lints]
+workspace = true
+"#,
+        )
+        .expect("write api/Cargo.toml");
+        let package_dirs = vec![root.join("programs/date"), root.join("api")];
+        (fixture, package_dirs)
+    }
+
+    #[test]
+    fn workspace_manifest_digest_preserves_cache_hits_on_unrelated_root_edits() {
+        let (fixture, mut package_dirs) = workspace_manifest_fixture();
+        let root = fixture.workspace();
+
+        // Also include an external sibling package that references `unrelated-dep`
+        // from its own workspace; that must not couple Helios's `unrelated-dep`.
+        let sibling_pkg = fixture.outside.path().join("crates/engine");
+        fs::create_dir_all(&sibling_pkg).expect("create sibling dir");
+        fs::write(
+            fixture.outside.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/engine\"]\n[workspace.dependencies]\nunrelated-dep = \"9.9.9\"\n",
+        )
+        .expect("write sibling root Cargo.toml");
+        fs::write(
+            sibling_pkg.join("Cargo.toml"),
+            "[package]\nname = \"engine\"\nversion = \"0.1.0\"\n[dependencies]\nunrelated-dep.workspace = true\n",
+        )
+        .expect("write sibling pkg Cargo.toml");
+        package_dirs.push(sibling_pkg);
+
+        let initial_digest =
+            workspace_manifest_digest(&root, &package_dirs).expect("initial digest");
+        let key = KeyBuilder::new(EntryKind::Wasm)
+            .field("programs/date/Cargo.toml")
+            .field(&initial_digest)
+            .finish();
+        let inputs = workspace_inputs(
+            &[fixture.dep_info()],
+            &root,
+            &root.join("target"),
+            &package_dirs,
+        )
+        .expect("inputs");
+        let cache = fixture.cache();
+        cache
+            .store_inputs(&key, &root, &inputs, b"\0asm")
+            .expect("store");
+
+        let unrelated_edits = [
+            // Adding a new member crate to [workspace].members.
+            WORKSPACE_ROOT_TOML.replace(
+                "members = [\"programs/date\", \"api\"]",
+                "members = [\"programs/date\", \"api\", \"programs/new-crate\"]",
+            ),
+            // Editing [workspace].exclude.
+            WORKSPACE_ROOT_TOML.replace(
+                "exclude = [\"scratch\"]",
+                "exclude = [\"scratch\", \"tmp\"]",
+            ),
+            // Editing root [package] and root [dependencies].
+            WORKSPACE_ROOT_TOML
+                .replace("version = \"0.1.0\"", "version = \"0.9.0\"")
+                .replace("kernel-only = \"0.1.0\"", "kernel-only = \"0.2.0\""),
+            // Adding and editing an unreferenced [workspace.dependencies] entry.
+            WORKSPACE_ROOT_TOML.replace(
+                "unrelated-dep = \"0.1.0\"",
+                "unrelated-dep = \"0.2.0\"\nnew-unrelated = \"1.0.0\"",
+            ),
+        ];
+
+        for edited in unrelated_edits {
+            fs::write(root.join("Cargo.toml"), edited).expect("write edited Cargo.toml");
+            let updated_digest =
+                workspace_manifest_digest(&root, &package_dirs).expect("updated digest");
+            assert_eq!(
+                updated_digest, initial_digest,
+                "unrelated root Cargo.toml edit must preserve workspace_manifest_digest"
+            );
+            let updated_key = KeyBuilder::new(EntryKind::Wasm)
+                .field("programs/date/Cargo.toml")
+                .field(&updated_digest)
+                .finish();
+            assert_eq!(updated_key, key);
+            assert_eq!(
+                cache.lookup_inputs(&updated_key, &root).expect("lookup"),
+                Some(b"\0asm".to_vec()),
+                "cache hit must be preserved for guest wasm packages"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_manifest_digest_invalidates_on_relevant_root_edits() {
+        let (fixture, package_dirs) = workspace_manifest_fixture();
+        let root = fixture.workspace();
+        let initial_digest =
+            workspace_manifest_digest(&root, &package_dirs).expect("initial digest");
+
+        let relevant_edits = [
+            (
+                "profile.dev",
+                WORKSPACE_ROOT_TOML.replace("opt-level = 1", "opt-level = 2"),
+            ),
+            (
+                "profile.dev.package",
+                WORKSPACE_ROOT_TOML.replace("opt-level = 2", "opt-level = 3"),
+            ),
+            (
+                "patch",
+                WORKSPACE_ROOT_TOML.replace("branch = \"main\"", "branch = \"next\""),
+            ),
+            (
+                "workspace.package",
+                WORKSPACE_ROOT_TOML.replace("edition = \"2024\"", "edition = \"2021\""),
+            ),
+            (
+                "workspace.lints",
+                WORKSPACE_ROOT_TOML.replace("all = \"warn\"", "all = \"deny\""),
+            ),
+            (
+                "workspace.resolver",
+                WORKSPACE_ROOT_TOML.replace("resolver = \"2\"", "resolver = \"3\""),
+            ),
+            (
+                "inherited [dependencies]",
+                WORKSPACE_ROOT_TOML.replace("dep-normal = \"1.0.0\"", "dep-normal = \"1.1.0\""),
+            ),
+            (
+                "inherited [dev-dependencies]",
+                WORKSPACE_ROOT_TOML.replace("dep-dev = \"1.0.0\"", "dep-dev = \"1.1.0\""),
+            ),
+            (
+                "inherited [build-dependencies]",
+                WORKSPACE_ROOT_TOML.replace("dep-build = \"1.0.0\"", "dep-build = \"1.1.0\""),
+            ),
+            (
+                "inherited [target.<cfg>.dependencies]",
+                WORKSPACE_ROOT_TOML.replace("dep-target = \"1.0.0\"", "dep-target = \"1.1.0\""),
+            ),
+            (
+                "inherited [target.<cfg>.dev-dependencies]",
+                WORKSPACE_ROOT_TOML
+                    .replace("dep-target-dev = \"1.0.0\"", "dep-target-dev = \"1.1.0\""),
+            ),
+            (
+                "inherited [target.<cfg>.build-dependencies]",
+                WORKSPACE_ROOT_TOML.replace(
+                    "dep-target-build = \"1.0.0\"",
+                    "dep-target-build = \"1.1.0\"",
+                ),
+            ),
+        ];
+
+        for (label, edited) in relevant_edits {
+            fs::write(root.join("Cargo.toml"), edited).expect("write edited Cargo.toml");
+            let updated_digest =
+                workspace_manifest_digest(&root, &package_dirs).expect("updated digest");
+            assert_ne!(
+                updated_digest, initial_digest,
+                "edit to {label} must invalidate workspace_manifest_digest"
+            );
+        }
+    }
+
+    #[test]
+    fn root_package_inputs_still_invalidate_on_root_package_edit() {
+        let (fixture, _) = workspace_manifest_fixture();
+        let root = fixture.workspace();
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("write src/main.rs");
+
+        let inputs = workspace_inputs(
+            &[fixture.dep_info()],
+            &root,
+            &root.join("target"),
+            std::slice::from_ref(&root),
+        )
+        .expect("root package inputs");
+        assert!(
+            inputs.contains(&PathBuf::from("Cargo.toml")),
+            "root package must retain raw root Cargo.toml in inputs: {inputs:?}"
+        );
+
+        let cache = fixture.cache();
+        let key = key("rustc 1");
+        cache
+            .store_inputs(&key, &root, &inputs, b"kernel")
+            .expect("store kernel");
+        assert_eq!(
+            cache.lookup_inputs(&key, &root).expect("lookup"),
+            Some(b"kernel".to_vec())
+        );
+
+        fs::write(
+            root.join("Cargo.toml"),
+            WORKSPACE_ROOT_TOML.replace("kernel-only = \"0.1.0\"", "kernel-only = \"0.2.0\""),
+        )
+        .expect("edit root dependencies");
+        assert_eq!(
+            cache.lookup_inputs(&key, &root).expect("lookup after edit"),
+            None,
+            "root package must miss when root Cargo.toml changes"
+        );
     }
 }
