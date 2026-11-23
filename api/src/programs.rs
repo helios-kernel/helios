@@ -18,7 +18,8 @@ pub use crate::bindings::helios::system::programs::{
     DiagnosticsGrant, DirectoryGrant, ExecError, ExecErrorKind, ExecOutput, ExecRequest,
     ExecResult, ExitStatus, FilesystemRight, IpcGrant, LinkGrant, LinkRight, MachineGrant,
     MachineRight, MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight,
-    SignalTermination, SpawnError, SpawnErrorKind, SpawnRequest, TerminalGrant, TerminalRight,
+    SettingsGrant, SettingsRight, SignalTermination, SpawnError, SpawnErrorKind, SpawnRequest,
+    TerminalGrant, TerminalRight,
 };
 
 impl PartialEq for ChildTermination {
@@ -181,6 +182,18 @@ pub fn diagnostics_control_grant() -> CapabilityGrant {
 /// Grant `helios:system/instances.kill` within `scope`.
 pub fn instance_control_grant(scope: AuthorityScope) -> CapabilityGrant {
     CapabilityGrant::InstanceControl(scope)
+}
+
+/// Build a settings grant. A program holds a right only when its parent
+/// granted it, so the rights must be a subset of the caller's.
+pub fn settings_grant(rights: Vec<SettingsRight>) -> CapabilityGrant {
+    CapabilityGrant::Settings(SettingsGrant { rights })
+}
+
+/// Change the machine-wide settings, for a trusted launcher that runs
+/// programs on the machine owner's behalf.
+pub fn write_settings_grant() -> CapabilityGrant {
+    settings_grant(vec![SettingsRight::Write])
 }
 
 /// Build a machine grant. A program holds a right only when its parent

@@ -3346,7 +3346,7 @@ mod tests {
             write_serial,
             Some(memory),
             None,
-            None,
+            DescriptorOrigin::Fresh,
             WasixSignalState::new(),
             WasixSignalState::new(),
             Vec::new(),

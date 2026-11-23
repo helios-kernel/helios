@@ -4135,7 +4135,8 @@ where
                         authority,
                         crate::IpcEndpointGrants::new(),
                         wasm_runtime.filesystem,
-                        Some(descriptors),
+                        // Exec keeps the process, so it keeps the process's limit.
+                        DescriptorOrigin::SameProcess(descriptors),
                         wasm_signal_state.clone(),
                         signal_dispositions,
                         None,
@@ -4226,7 +4227,7 @@ pub(super) async fn run_linux_process<CpuImpl, Net, StorageImpl>(
     env: Vec<(String, String)>,
     container: Arc<crate::LinuxContainer<StorageImpl>>,
     credentials: Option<syscall::Credentials>,
-    descriptors: Option<Preview1DescriptorTable<Net>>,
+    descriptors: DescriptorOrigin<Net>,
     signal_state: WasixSignalState,
     spawner: crate::InstanceSpawner<CpuImpl>,
     launched_instance: crate::RegisteredInstance,
@@ -4279,8 +4280,23 @@ where
     })?;
     let pid = process_guard.pid();
     let table = match descriptors {
-        Some(table) => table.into_slots(),
-        None => syscall::standard_streams::<LinuxResources<Net>>(),
+        DescriptorOrigin::Fresh => {
+            let mut table = syscall::standard_streams::<LinuxResources<Net>>();
+            table.limit = exec_context
+                .runtime_state
+                .settings()
+                .get::<DescriptorLimitSetting>();
+            table
+        }
+        DescriptorOrigin::NewProcess(table) => table
+            .for_new_process(
+                exec_context
+                    .runtime_state
+                    .settings()
+                    .get::<DescriptorLimitSetting>(),
+            )
+            .into_slots(),
+        DescriptorOrigin::SameProcess(table) => table.into_slots(),
     };
     let initial_cwd = container
         .authority()

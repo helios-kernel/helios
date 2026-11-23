@@ -40,6 +40,7 @@ mod network;
 mod process;
 mod profiling;
 mod runtime;
+mod settings;
 mod signing_key;
 mod surface;
 #[cfg(test)]
@@ -248,9 +249,10 @@ pub use process::{
     NetworkAdminCap, NetworkAuthorityRights, NetworkCap, PrivilegedBindCap, ProcessAuthority,
     ProcessAuthorityError, ProcessAuthorityRights, ProfileReadCap, ProgramExecError,
     ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory, RequestedAuthorityScope,
-    RuntimeMessage, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
-    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap,
-    TraceReadCap, TtyControlCap, UdpCap, UnbindableStdio, UnmountCap,
+    RuntimeMessage, SetWallClockCap, SettingsAuthorityRights, SignalAuthority, SpawnAuthority,
+    SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap,
+    TerminalOutputCap, TraceReadCap, TtyControlCap, UdpCap, UnbindableStdio, UnmountCap,
+    WriteSettingsCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
@@ -267,6 +269,10 @@ pub use runtime::{
     RegisteredTcpReadBuffer, RuntimeState, SnapshotHold, SnapshotHoldBusy, SocketReadiness,
     TcpAccepted, TcpConnectPoll, TcpError, TcpErrorKind, TcpListener, TcpReadInto, TcpReadProgress,
     TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+};
+pub use settings::{
+    Holds, SETTING_COUNT, Setting, SettingCell, SettingEntry, SettingUnit, SettingValue,
+    SettingWriteError, Settings,
 };
 pub use signing_key::{
     CwasmSigningKey, MACHINE_IDENTITY_INFO, MACHINE_IDENTITY_SIGNATURE_PREFIX,
@@ -2068,5 +2074,9 @@ mod tests {
 
 #[cfg(feature = "unix")]
 mod unix;
+#[cfg(feature = "unix")]
+pub use helios_unix::DescriptorLimit;
+#[cfg(feature = "unix")]
+pub use unix::DescriptorLimitSetting;
 #[cfg(feature = "unix")]
 pub(crate) use unix::UnixNetwork;

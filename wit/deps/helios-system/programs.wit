@@ -171,6 +171,19 @@ interface programs {
     control,
   }
 
+  /// A right over the machine-wide settings. Reading a setting needs
+  /// none; a program that holds none cannot change one.
+  enum settings-right {
+    /// Change the machine-wide settings.
+    write,
+  }
+
+  record settings-grant {
+    /// Settings rights granted to the child. These must be a subset of
+    /// the caller's settings authority.
+    rights: list<settings-right>,
+  }
+
   /// A right over the machine itself rather than over individual instances.
   enum machine-right {
     /// Control machine-level execution and lifecycle (`helios:system/processors`
@@ -207,6 +220,7 @@ interface programs {
     diagnostics(diagnostics-grant),
     /// Stop live instances (`helios:system/instances.kill`) within the scope.
     instance-control(authority-scope),
+    settings(settings-grant),
     machine(machine-grant),
     ipc(ipc-grant),
   }

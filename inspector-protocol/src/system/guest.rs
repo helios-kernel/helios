@@ -508,6 +508,15 @@ fn map_capability_grants_to_host(
             programs::CapabilityGrant::InstanceControl(scope) => {
                 host_programs::CapabilityGrant::InstanceControl(map_authority_scope_to_host(scope))
             }
+            programs::CapabilityGrant::Settings(grant) => {
+                host_programs::CapabilityGrant::Settings(host_programs::SettingsGrant {
+                    rights: grant
+                        .rights
+                        .into_iter()
+                        .map(map_settings_right_to_host)
+                        .collect(),
+                })
+            }
             programs::CapabilityGrant::Machine(grant) => {
                 host_programs::CapabilityGrant::Machine(host_programs::MachineGrant {
                     rights: grant
@@ -623,6 +632,12 @@ fn map_diagnostics_grant_to_host(
             host_programs::DiagnosticsGrant::ProfileRead(map_authority_scope_to_host(scope))
         }
         programs::DiagnosticsGrant::Control => host_programs::DiagnosticsGrant::Control,
+    }
+}
+
+fn map_settings_right_to_host(right: programs::SettingsRight) -> host_programs::SettingsRight {
+    match right {
+        programs::SettingsRight::Write => host_programs::SettingsRight::Write,
     }
 }
 
