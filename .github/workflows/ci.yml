@@ -9,9 +9,8 @@ on:
   workflow_dispatch:
     inputs:
       check_lane:
-        description: "Optional lane from ci-lanes.json; empty runs the full suite"
-        required: false
-        default: ""
+        description: "Required lane from ci-lanes.json"
+        required: true
         type: string
   schedule:
     - cron: "37 3 * * *"
@@ -40,8 +39,9 @@ jobs:
   # by path. A lane also runs on `shared` and `pin` changes unless it is
   # `exclusive`, which reads only its own surfaces. A skipped lane
   # reports as skipped, which a required check counts as passing; no
-  # ruleset on `dev` requires a lane of this workflow. A dispatch and the
-  # nightly schedule run every lane unless a dispatch names a command lane;
+  # ruleset on `dev` requires a lane of this workflow. The nightly schedule
+  # runs every lane; a dispatch names a required `check_lane` from
+  # `.github/ci-lanes.json` and runs only that lane.
   # PR and dev pushes omit heavy suites,
   # and Btrfs lanes filter pushes by surface. A draft pull request is not a merge
   # candidate and runs `lint-fmt` alone; marking it ready for review runs
@@ -252,6 +252,10 @@ jobs:
         run: |
           set -euo pipefail
           CHECK_LANE="${CHECK_LANE:-}"
+          if [[ "${EVENT:-}" == "workflow_dispatch" && -z "$CHECK_LANE" ]]; then
+            echo "workflow_dispatch requires a non-empty check_lane" >&2
+            exit 1
+          fi
           if [[ -n "$CHECK_LANE" ]]; then
             jq -e --arg lane "$CHECK_LANE" 'has($lane)' .github/ci-lanes.json > /dev/null || {
               echo "Unknown lane: $CHECK_LANE" >&2
