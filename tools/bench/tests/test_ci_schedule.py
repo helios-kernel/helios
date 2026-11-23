@@ -89,10 +89,11 @@ def test_selected_checks_keep_their_commands_and_only_payload_tests_wait(
         assert lanes == []
     if changed == ["btrfs_src"] and not draft:
         assert "test-libraries" in lanes
-    assert ci_jobs["checks"]["needs"] == "changes"
-    # The payload tests start with `changes` and wait for the guest wasm in
-    # a step, after their tests have compiled and before their command runs.
-    assert ci_jobs["tests"]["needs"] == "changes"
+    assert ci_jobs["checks"]["needs"] == ["changes", "build-helios-cli"]
+    # The payload tests start beside `wasm-debug` after `build-helios-cli`
+    # and wait for the guest wasm in a step, after their tests have compiled
+    # and before their command runs.
+    assert ci_jobs["tests"]["needs"] == ["changes", "build-helios-cli"]
     steps = [step.get("uses", step.get("name", "")) for step in ci_jobs["tests"]["steps"]]
     wait = steps.index("./helios/.github/actions/prebuilt-wasm")
     assert steps.index("Compile the tests of ${{ matrix.name }}") < wait
@@ -170,7 +171,7 @@ def test_schedule_still_selects_full_suite(ci_jobs, tmp_path):
 
 def test_every_selected_review_job_has_a_fifteen_minute_limit(ci_jobs, tmp_path):
     selected = select_lanes(ci_jobs, tmp_path, changed=None, heavy=False)
-    jobs = {"changes", "checks", "tests", "gate"}
+    jobs = {"changes", "build-helios-cli", "checks", "tests", "gate"}
     jobs.update(name for name in json.loads(selected["lanes"]) if name in ci_jobs)
     jobs.update(f"wasm-{profile}" for profile in json.loads(selected["wasm_profiles"]))
     mode = selected["linux_suite_mode"]
@@ -291,3 +292,42 @@ def test_mixed_prose_and_code_keeps_code_selection(ci_jobs, tmp_path, path):
     assert code
     selected = select_lanes(ci_jobs, tmp_path, mixed)
     assert json.loads(selected["lanes"])
+
+
+def test_helios_cli_producer_covers_every_selected_consumer_and_consumers_only_download(ci_jobs, tmp_path):
+    for name, job in ci_jobs.items():
+        cli_steps = [
+            step for step in job.get("steps", []) if step.get("uses") == "./helios/.github/actions/helios-cli"
+        ]
+        if cli_steps:
+            assert "build-helios-cli" in job["needs"], name
+            for step in cli_steps:
+                assert step["with"].get("download-only") == "true", name
+
+    cases = [
+        (["docs"], True, False),
+        (["kernel"], False, False),
+        (["linux_abi"], False, False),
+        (None, False, True),
+    ]
+    for changed, draft, heavy in cases:
+        selected = select_lanes(ci_jobs, tmp_path, changed, draft=draft, heavy=heavy)
+        lanes = set(json.loads(selected["lanes"]))
+        checks = json.loads(selected["checks"]) + json.loads(selected["tests"])
+        wasm_profiles = json.loads(selected["wasm_profiles"])
+        cli_builds = {(entry["profile"], entry["arch"]) for entry in json.loads(selected["cli_builds"])}
+        expected = set()
+        for entry in checks:
+            if entry["helios-cli"]:
+                expected.add((entry["helios-cli"], "X64"))
+        if wasm_profiles:
+            expected.add(("debug", "X64"))
+        if "smoke-x86-64-venus" in lanes:
+            expected.add(("debug", "X64"))
+        if lanes & {"smoke-riscv64", "smoke-x86-64", "smoke-x86-64-cpu-lifecycle"}:
+            expected.add(("release", "X64"))
+        if "smoke-aarch64" in lanes:
+            expected.add(("release", "ARM64"))
+        if selected["linux_suite_mode"] != "none":
+            expected.update({("release", "X64"), ("release", "ARM64")})
+        assert cli_builds == expected, (changed, draft, heavy)

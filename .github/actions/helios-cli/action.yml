@@ -1,13 +1,12 @@
 name: helios-cli for this run
 description: >-
   Yields the `helios-cli` binary of the checked-out commit in one cargo
-  profile and exports its path as `HELIOS_CLI_BIN`. It restores a cross-run
-  cache keyed by `helios-cli`'s inputs, falls back to the binary another job
-  of this run already uploaded for the same commit, profile and runner, and
-  otherwise builds it and uploads it for the jobs after it. `helios-cli`
-  links Wasmtime and Cranelift for every architecture, so each job that builds
-  its own pays that compile again. Call it after the Wasmtime checkout, since
-  a build needs it.
+  profile and exports its path as `HELIOS_CLI_BIN`. When `download-only` is
+  `true` (used by `ci.yml` consumers after the `build-helios-cli` producer
+  job), it downloads the prebuilt run artifact directly and fails fast if
+  missing. Otherwise (standalone callers such as `kernel-profile.yml`) it
+  restores a cross-run cache keyed by `helios-cli`'s inputs, falls back to an
+  in-run artifact, and builds and uploads it when missed.
 inputs:
   profile:
     description: The cargo profile, `release` or `debug`.
@@ -16,6 +15,12 @@ inputs:
     description: The Helios checkout, relative to the workspace.
     required: false
     default: helios
+  download-only:
+    description: >-
+      Download the prebuilt run artifact from `build-helios-cli` directly and
+      fail if absent, without falling back to caching or building.
+    required: false
+    default: "false"
 outputs:
   path:
     description: The binary's absolute path.
@@ -28,12 +33,18 @@ runs:
       env:
         ROOT: ${{ inputs.root }}
         PROFILE: ${{ inputs.profile }}
+        DOWNLOAD_ONLY: ${{ inputs.download-only }}
       run: |
         set -euo pipefail
         case "${PROFILE}" in
           release | debug) ;;
           *) echo "::error::profile must be release or debug, not '${PROFILE}'"; exit 1 ;;
         esac
+        echo "dir=${RUNNER_TEMP}/helios-cli-${PROFILE}" >> "$GITHUB_OUTPUT"
+        echo "run_artifact=helios-cli-${PROFILE}-${RUNNER_OS}-${RUNNER_ARCH}" >> "$GITHUB_OUTPUT"
+        if [[ "${DOWNLOAD_ONLY}" == "true" ]]; then
+          exit 0
+        fi
         if command -v sha256sum >/dev/null 2>&1; then
           hash_cmd=(sha256sum)
         else
@@ -65,8 +76,14 @@ runs:
         commit="$(git -C "${ROOT}" rev-parse HEAD)"
         echo "input_hash=${input_hash}" >> "$GITHUB_OUTPUT"
         echo "artifact=helios-cli-${commit}-${PROFILE}-${RUNNER_OS}-${RUNNER_ARCH}" >> "$GITHUB_OUTPUT"
-        echo "dir=${RUNNER_TEMP}/helios-cli-${PROFILE}" >> "$GITHUB_OUTPUT"
+    - id: run-download
+      if: inputs.download-only == 'true'
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ steps.name.outputs.run_artifact }}
+        path: ${{ steps.name.outputs.dir }}
     - id: cache
+      if: inputs.download-only != 'true'
       uses: actions/cache@v4
       with:
         path: ${{ steps.name.outputs.dir }}
@@ -74,13 +91,13 @@ runs:
     # Absent until some job of this run has built it; that is the case the
     # build below covers, so a failed download is not a failure.
     - id: download
-      if: steps.cache.outputs.cache-hit != 'true'
+      if: inputs.download-only != 'true' && steps.cache.outputs.cache-hit != 'true'
       continue-on-error: true
       uses: actions/download-artifact@v4
       with:
         name: ${{ steps.name.outputs.artifact }}
         path: ${{ steps.name.outputs.dir }}
-    - if: steps.cache.outputs.cache-hit != 'true' && steps.download.outcome != 'success'
+    - if: inputs.download-only != 'true' && steps.cache.outputs.cache-hit != 'true' && steps.download.outcome != 'success'
       shell: bash
       working-directory: ${{ inputs.root }}
       env:
@@ -99,7 +116,7 @@ runs:
     # commit binary; keep the first upload live instead of deleting and
     # re-uploading it (`overwrite: true` deletes before uploading and races
     # concurrent readers).
-    - if: steps.cache.outputs.cache-hit != 'true' && steps.download.outcome != 'success'
+    - if: inputs.download-only != 'true' && steps.cache.outputs.cache-hit != 'true' && steps.download.outcome != 'success'
       continue-on-error: true
       uses: actions/upload-artifact@v4
       with:
