@@ -749,6 +749,24 @@ impl NetworkShardSet {
         self.shards.len()
     }
 
+    /// Classifies shard `accepting`'s ephemeral window by `owners`
+    /// ([`EphemeralCandidates`]): the shard's own ports are those whose
+    /// flow hashes back to it. Shared by every ephemeral-port
+    /// allocation, TCP connects and datagram sockets alike.
+    ///
+    /// The shard's lock is taken only to read its window and draw from
+    /// its entropy, and released before the classification, which runs
+    /// over the whole window and touches no shard.
+    pub(super) fn classify_ephemeral_window(
+        &self,
+        accepting: usize,
+        owners: &PortOwners,
+    ) -> EphemeralCandidates {
+        let (first, last, draw) = self.shard_at(accepting).lock().ephemeral_draw();
+        let start = ConnectStart::new(first, last, draw, ConnectCounters::default());
+        EphemeralCandidates::classify(start, |port| owners.owner_of(port) == accepting)
+    }
+
     /// Picks the shard responsible for an unqualified operation
     /// (control-plane queries, admin commands that target every
     /// shard, etc.).
@@ -1325,6 +1343,16 @@ impl NetworkShard {
         let (first, last) = self.ephemeral_window();
         let offset = self.entropy.below(EphemeralWalk::window_len(first, last));
         EphemeralWalk::starting_at(first, last, offset)
+    }
+
+    /// This shard's window `(first, last)` and the draw, below the
+    /// window's length, that [`EphemeralCandidates::classify`] selects
+    /// its starting points from. The entropy stream is touched only
+    /// here, under this shard's lock, which the caller holds.
+    pub(super) fn ephemeral_draw(&mut self) -> (u16, u16, u32) {
+        let (first, last) = self.ephemeral_window();
+        let draw = self.entropy.below(EphemeralWalk::window_len(first, last));
+        (first, last, draw)
     }
 
     /// Where an outbound TCP connect to `request`'s destination starts
