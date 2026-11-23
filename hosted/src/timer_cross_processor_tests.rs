@@ -95,6 +95,7 @@ async fn race_sleep(mut sleep: HandedSleep, cancel: bool, outcome: Arc<Outcome>)
 /// many are still registered on its base.
 fn owner_thread(
     machine: Arc<HostedMachine>,
+    pool: &'static helios_kernel::UserMemoryPool,
     both_up: Arc<Barrier>,
     requests: Receiver<usize>,
     hand: Sender<HandedSleep>,
@@ -105,7 +106,7 @@ fn owner_thread(
         .spawn(move || {
             machine.register_thread(OWNER, thread::current());
             let cpu = HostedCpu::new(OWNER, machine.clone());
-            let executor = Executor::new(ProgressCounter::new(), machine.processor_count(), OWNER);
+            let executor = Executor::new(ProgressCounter::new(), pool, OWNER);
             let timer = executor.timer(cpu.clone());
             both_up.wait();
 
@@ -146,6 +147,7 @@ fn owner_thread(
 /// and registers nothing on its own base.
 fn spawner_thread(
     machine: Arc<HostedMachine>,
+    pool: &'static helios_kernel::UserMemoryPool,
     both_up: Arc<Barrier>,
     request: Sender<usize>,
     handed: Receiver<HandedSleep>,
@@ -156,8 +158,7 @@ fn spawner_thread(
         .spawn(move || {
             machine.register_thread(SPAWNER, thread::current());
             let cpu = HostedCpu::new(SPAWNER, machine.clone());
-            let executor =
-                Executor::new(ProgressCounter::new(), machine.processor_count(), SPAWNER);
+            let executor = Executor::new(ProgressCounter::new(), pool, SPAWNER);
             let timer = executor.timer(cpu.clone());
             both_up.wait();
             let spawner = executor.spawner(cpu.clone());
@@ -195,6 +196,7 @@ fn spawner_thread(
 #[test]
 fn sleeps_dropped_on_one_processor_leave_nothing_on_another_processors_timer() {
     let machine = HostedMachine::new(2, OWNER, DEFAULT_HEAP_BYTES);
+    let pool = crate::test_pool::single_node_pool(machine.processor_count());
     let both_up = Arc::new(Barrier::new(2));
     let outcome = Arc::new(Outcome::default());
     let (request, requests) = unbounded();
@@ -202,12 +204,20 @@ fn sleeps_dropped_on_one_processor_leave_nothing_on_another_processors_timer() {
 
     let owner = owner_thread(
         machine.clone(),
+        pool,
         both_up.clone(),
         requests,
         hand,
         outcome.clone(),
     );
-    let spawner = spawner_thread(machine.clone(), both_up, request, handed, outcome.clone());
+    let spawner = spawner_thread(
+        machine.clone(),
+        pool,
+        both_up,
+        request,
+        handed,
+        outcome.clone(),
+    );
     let spawner_registered = spawner.join().expect("the spawning processor panicked");
     let (fired, owner_registered) = owner.join().expect("the timer owner panicked");
 
