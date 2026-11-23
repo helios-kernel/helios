@@ -1,4 +1,4 @@
-<p align="center"><img src="logo.svg" alt="Helios" width="160"></p>
+<p align="center"><img src="docs/logo.svg" alt="Helios" width="160"></p>
 
 # Helios
 
