@@ -92,12 +92,24 @@ pub fn verify_signed_artifact<'a>(
     })
 }
 
-/// Signs the compiler plugin's output with this boot's key.
+/// Signs `payload` with `signer`, returning `[payload || trailer]` for tests.
+#[cfg(test)]
 pub fn sign_artifact_payload(
     payload: &[u8],
     signer: &CwasmSigningKey,
 ) -> Result<Vec<u8>, ArtifactTrustError> {
     signer.sign(payload).map_err(ArtifactTrustError::Trailer)
+}
+
+/// Signs `payload` with this boot's key and returns only the encoded trailer
+/// and footer bytes.
+pub fn sign_artifact_trailer(
+    payload: &[u8],
+    signer: &CwasmSigningKey,
+) -> Result<Vec<u8>, ArtifactTrustError> {
+    signer
+        .sign_trailer(payload)
+        .map_err(ArtifactTrustError::Trailer)
 }
 
 /// The public keys a boot payload's signature footer must name.

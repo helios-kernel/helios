@@ -1,6 +1,58 @@
 use super::*;
 use crate::wasmtime_adapter::preemption::kill_or_yield;
 use helios_compiler_abi::{CompilerStatus, OutputKind, UnknownDiscriminant};
+use helios_hal::fs::{FilledWrite, PreparedWrite, WritePosition, WriteProgress};
+
+/// Rejects raw wasm input larger than `limit` (`compiler.max-input-bytes`).
+pub(super) fn check_compiler_input_limit(bytes: u64, limit: u64) -> Result<(), ProgramExecError> {
+    if bytes > limit {
+        return Err(ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidBinary,
+            detail: ProgramExecErrorDetail::CompilerInputTooLarge { bytes, limit },
+        });
+    }
+    Ok(())
+}
+
+/// Converts a host length to the signed 32-bit size the compiler plugin's
+/// `alloc`/`free` exports take, failing fast instead of truncating.
+pub(super) fn compiler_abi_i32(len: usize) -> Result<i32, ProgramExecError> {
+    i32::try_from(len).map_err(|_| ProgramExecError {
+        kind: ProgramExecErrorKind::InvalidBinary,
+        detail: ProgramExecErrorDetail::CompilerAbiLengthOverflow,
+    })
+}
+
+/// Converts a host length to the unsigned 32-bit field in
+/// [`CompilerRequestHeader`], failing fast instead of truncating.
+pub(super) fn compiler_abi_u32(len: usize) -> Result<u32, ProgramExecError> {
+    u32::try_from(len).map_err(|_| ProgramExecError {
+        kind: ProgramExecErrorKind::InvalidBinary,
+        detail: ProgramExecErrorDetail::CompilerAbiLengthOverflow,
+    })
+}
+
+/// Destination for a signed AOT artifact streamed directly from plugin memory.
+pub(crate) struct AotDestination<StorageImpl: crate::Storage> {
+    pub(crate) namespace: crate::Namespace<StorageImpl>,
+    pub(crate) absolute: String,
+    pub(crate) now: u64,
+}
+
+/// Where the compiled output of one compile session lands.
+pub(super) enum CompileOutputSink<StorageImpl: crate::Storage> {
+    /// Return the raw Wasmtime payload to the caller (`exec`/`spawn` of raw wasm).
+    ReturnPayload,
+    /// Sign the payload directly in plugin memory and stream `[payload || trailer]`
+    /// straight to `destination` without a whole-artifact kernel-heap copy.
+    WriteSignedFile(AotDestination<StorageImpl>),
+}
+
+/// What one compile call produced according to its [`CompileOutputSink`].
+pub(super) enum CompileOutput {
+    Payload(Vec<u8>),
+    WrittenBytes(usize),
+}
 
 /// Cached runtime of the compiler kernel plugin (`SharedMemory` + `InstancePre`
 /// + main-thread TLS block).
@@ -82,25 +134,26 @@ pub(super) fn ensure_compiler_buffers_returned(
 /// of the interface produced the error, never by a flag, and the nesting
 /// (rather than a wrapper enum) keeps the error within the size budget of a
 /// program `Err`.
-pub(super) type CompilerCallOutcome = Result<Result<Vec<u8>, ProgramExecError>, ProgramExecError>;
+pub(super) type CompilerCallOutcome =
+    Result<Result<CompileOutput, ProgramExecError>, ProgramExecError>;
 
 /// What one compile asks of the plugin: the module, the ISA the artifact
-/// is for, and how hard to optimise it.
-#[derive(Clone)]
-pub(super) struct CompileRequest {
+/// is for, how hard to optimise it, and where its output lands.
+pub(super) struct CompileRequest<StorageImpl: crate::Storage> {
     pub(super) wasm: Bytes,
     pub(super) guest_isa: GuestIsa,
     pub(super) hint: AotCompileHint,
     /// Whether the plugin reports its pass timings.
     pub(super) profile: bool,
+    pub(super) sink: CompileOutputSink<StorageImpl>,
 }
 
 /// A buffer in the plugin's memory, with the layout it was allocated with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PluginBuffer {
     ptr: u32,
-    len: usize,
-    align: usize,
+    len: i32,
+    align: i32,
 }
 
 /// The plugin allocations of one compile call: the four request buffers the
@@ -142,18 +195,34 @@ impl CompilerAllocations {
         if len == 0 {
             return Ok(0);
         }
-        let ptr = compiler_alloc(drive, store, alloc, len, align).await?;
-        self.buffers.push(PluginBuffer { ptr, len, align });
+        let abi_len = compiler_abi_i32(len)?;
+        let abi_align = compiler_abi_i32(align)?;
+        let ptr = compiler_alloc(drive, store, alloc, abi_len, abi_align).await?;
+        self.buffers.push(PluginBuffer {
+            ptr,
+            len: abi_len,
+            align: abi_align,
+        });
         Ok(ptr)
     }
 
     /// Takes ownership of a buffer the plugin handed over in its response. A
     /// zero-length buffer is pointer 0 and was never allocated.
-    pub(super) fn adopt(&mut self, ptr: u32, len: usize, align: usize) {
+    pub(super) fn adopt(
+        &mut self,
+        ptr: u32,
+        len: usize,
+        align: usize,
+    ) -> Result<(), ProgramExecError> {
         if len == 0 {
-            return;
+            return Ok(());
         }
-        self.buffers.push(PluginBuffer { ptr, len, align });
+        self.buffers.push(PluginBuffer {
+            ptr,
+            len: compiler_abi_i32(len)?,
+            align: compiler_abi_i32(align)?,
+        });
+        Ok(())
     }
 
     /// Returns every recorded buffer to the plugin.
@@ -170,11 +239,7 @@ impl CompilerAllocations {
     {
         for buffer in self.buffers {
             drive
-                .call(
-                    store,
-                    free,
-                    (buffer.ptr as i32, buffer.len as i32, buffer.align as i32),
-                )
+                .call(store, free, (buffer.ptr as i32, buffer.len, buffer.align))
                 .await
                 .map_err(map_program_runtime_error)?;
         }
@@ -604,8 +669,8 @@ pub(super) async fn compiler_alloc<CpuImpl, Net, StorageImpl>(
     drive: &CompilerStoreDrive<CpuImpl>,
     store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
     alloc: &wasmtime::TypedFunc<(i32, i32), i32>,
-    len: usize,
-    align: usize,
+    len: i32,
+    align: i32,
 ) -> Result<u32, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
@@ -613,7 +678,7 @@ where
     StorageImpl: crate::Storage,
 {
     let ptr = drive
-        .call(store, alloc, (len as i32, align as i32))
+        .call(store, alloc, (len, align))
         .await
         .map_err(map_program_runtime_error)?;
     if ptr == 0 {
@@ -667,13 +732,193 @@ pub(super) fn decode_compiler_response(
 /// processor between them. The header is all `u32` fields, so every byte
 /// pattern in plugin memory decodes to a header; what its enumerated fields
 /// mean is checked by [`decode_compiler_response`].
+/// Copies the region `[offset .. offset + dst.len()]` of the logical
+/// `[payload || trailer]` stream into `dst`, where `payload_chunk` covers
+/// `[payload_start .. payload_start + payload_chunk.len()]` of `payload`.
+pub(super) fn copy_payload_and_trailer(
+    offset: usize,
+    dst: &mut [u8],
+    payload_start: usize,
+    payload_chunk: &[u8],
+    payload_len: usize,
+    trailer: &[u8],
+) {
+    let payload_part = payload_len.saturating_sub(offset).min(dst.len());
+    if payload_part > 0 {
+        let rel = offset - payload_start;
+        dst[..payload_part].copy_from_slice(&payload_chunk[rel..rel + payload_part]);
+    }
+    if payload_part < dst.len() {
+        let trailer_start = (offset + payload_part) - payload_len;
+        let trailer_len = dst.len() - payload_part;
+        dst[payload_part..].copy_from_slice(&trailer[trailer_start..trailer_start + trailer_len]);
+    }
+}
+
+/// Maps a WASI filesystem error while streaming an AOT artifact to a
+/// [`ProgramExecError`].
+fn map_aot_fs_error(error: fs_types::ErrorCode) -> ProgramExecError {
+    tracing::error!(
+        ?error,
+        "filesystem operation failed during AOT output write"
+    );
+    let kind = match error {
+        fs_types::ErrorCode::NoEntry
+        | fs_types::ErrorCode::NotDirectory
+        | fs_types::ErrorCode::BadDescriptor
+        | fs_types::ErrorCode::ReadOnly
+        | fs_types::ErrorCode::NotPermitted
+        | fs_types::ErrorCode::Exist
+        | fs_types::ErrorCode::IsDirectory
+        | fs_types::ErrorCode::IllegalByteSequence
+        | fs_types::ErrorCode::Invalid
+        | fs_types::ErrorCode::Overflow => ProgramExecErrorKind::InvalidPath,
+        _ => ProgramExecErrorKind::Internal,
+    };
+    ProgramExecError {
+        kind,
+        detail: ProgramExecErrorDetail::FilesystemOperationFailed,
+    }
+}
+
+/// A byte range inside the compiler plugin's linear memory.
+#[derive(Clone, Copy)]
+struct PluginSlice {
+    ptr: u32,
+    len: usize,
+}
+
+/// Signs the compiled artifact directly inside plugin linear memory and
+/// streams `[payload || trailer]` straight into `destination` via
+/// [`PreparedWrite`], avoiding any whole-artifact copy on the kernel heap.
+async fn write_signed_artifact_from_plugin_memory<CpuImpl, Net, StorageImpl>(
+    store: &CompilerCoreStore<CpuImpl, Net, StorageImpl>,
+    memory: &Preview1AsyncMemory,
+    precompiled: PluginSlice,
+    destination: AotDestination<StorageImpl>,
+    signing_key: &crate::CwasmSigningKey,
+    profile: bool,
+    phases: &mut CompilerPhaseTimestamps,
+) -> Result<usize, ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let precompiled_ptr = precompiled.ptr;
+    let precompiled_len = precompiled.len;
+    let trailer = in_guest_turn(
+        store.guest_turns(),
+        memory.read(
+            GuestAddress::wasm32(precompiled_ptr),
+            precompiled_len,
+            |payload| cwasm::sign_artifact_trailer(payload, signing_key),
+        ),
+    )
+    .await?
+    .map_err(map_artifact_trust_error)?;
+    phases.signed_ns = if profile {
+        monotonic_nanos(&store.context.cpu)
+    } else {
+        0
+    };
+    let total_len = precompiled_len
+        .checked_add(trailer.len())
+        .ok_or(ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidBinary,
+            detail: ProgramExecErrorDetail::CompilerAbiLengthOverflow,
+        })?;
+    let write_started_ns = if profile {
+        monotonic_nanos(&store.context.cpu)
+    } else {
+        0
+    };
+    let resolved = crate::wasmtime_adapter::wasi::open_program_file_for_write(
+        &destination.namespace,
+        &destination.absolute,
+        destination.now,
+    )
+    .await
+    .map_err(map_aot_fs_error)?;
+    let mut next = crate::wasmtime_adapter::wasi::prepare_resolved_write(
+        &resolved,
+        WritePosition::At(0),
+        total_len,
+        destination.now,
+    )
+    .await
+    .map_err(map_aot_fs_error)?;
+    let mut written = 0usize;
+    loop {
+        let round_len = next.staged_len();
+        let payload_start = written.min(precompiled_len);
+        let payload_end = (written + round_len).min(precompiled_len);
+        let payload_len = payload_end - payload_start;
+        let filled = if payload_len > 0 {
+            let mut next_slot = Some(next);
+            in_guest_turn(
+                store.guest_turns(),
+                memory.read(
+                    GuestAddress::wasm32(precompiled_ptr).offset(payload_start as u64),
+                    payload_len,
+                    |payload_chunk| {
+                        next_slot
+                            .take()
+                            .expect("prepared write round filled once")
+                            .fill(|offset, dst| {
+                                copy_payload_and_trailer(
+                                    offset,
+                                    dst,
+                                    payload_start,
+                                    payload_chunk,
+                                    precompiled_len,
+                                    &trailer,
+                                );
+                            })
+                    },
+                ),
+            )
+            .await?
+        } else {
+            next.fill(|offset, dst| {
+                let start = offset - precompiled_len;
+                dst.copy_from_slice(&trailer[start..start + dst.len()]);
+            })
+        };
+        match filled.submit().await.map_err(|error| {
+            map_aot_fs_error(crate::wasmtime_adapter::wasi::fs_error_code(error))
+        })? {
+            WriteProgress::Done(landed) => {
+                if landed.len != total_len {
+                    return Err(map_aot_fs_error(fs_types::ErrorCode::InsufficientSpace));
+                }
+                break;
+            }
+            WriteProgress::More(more) => {
+                written += round_len;
+                next = more;
+            }
+        }
+    }
+    if profile {
+        store.context.write_serial.emit_fmt(format_args!(
+            "aot-write us={} bytes={}\n",
+            monotonic_nanos(&store.context.cpu).saturating_sub(write_started_ns) / 1_000,
+            total_len,
+        ));
+    }
+    Ok(total_len)
+}
+
 pub(super) async fn accept_compiler_response<CpuImpl, Net, StorageImpl>(
     store: &CompilerCoreStore<CpuImpl, Net, StorageImpl>,
     allocations: &mut CompilerAllocations,
     response_ptr: u32,
     profile: bool,
+    sink: CompileOutputSink<StorageImpl>,
+    signing_key: &crate::CwasmSigningKey,
     phases: &mut CompilerPhaseTimestamps,
-) -> Result<Vec<u8>, ProgramExecError>
+) -> Result<CompileOutput, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -696,9 +941,9 @@ where
         response_ptr,
         CompilerResponseHeader::SIZE,
         CompilerResponseHeader::ALIGN,
-    );
-    allocations.adopt(header.diagnostic_ptr, header.diagnostic_len as usize, 1);
-    allocations.adopt(header.precompiled_ptr, header.precompiled_len as usize, 1);
+    )?;
+    allocations.adopt(header.diagnostic_ptr, header.diagnostic_len as usize, 1)?;
+    allocations.adopt(header.precompiled_ptr, header.precompiled_len as usize, 1)?;
     let (status, _output_kind) = decode_compiler_response(&header)?;
     let diagnostic = in_guest_turn(
         store.guest_turns(),
@@ -728,14 +973,35 @@ where
     } else {
         0
     };
-    let output = in_guest_turn(
-        store.guest_turns(),
-        memory.read_bytes(
-            GuestAddress::wasm32(header.precompiled_ptr),
-            header.precompiled_len as usize,
-        ),
-    )
-    .await?;
+    let output = match sink {
+        CompileOutputSink::ReturnPayload => {
+            let payload = in_guest_turn(
+                store.guest_turns(),
+                memory.read_bytes(
+                    GuestAddress::wasm32(header.precompiled_ptr),
+                    header.precompiled_len as usize,
+                ),
+            )
+            .await?;
+            CompileOutput::Payload(payload)
+        }
+        CompileOutputSink::WriteSignedFile(destination) => {
+            let bytes = write_signed_artifact_from_plugin_memory(
+                store,
+                &memory,
+                PluginSlice {
+                    ptr: header.precompiled_ptr,
+                    len: header.precompiled_len as usize,
+                },
+                destination,
+                signing_key,
+                profile,
+                phases,
+            )
+            .await?;
+            CompileOutput::WrittenBytes(bytes)
+        }
+    };
     phases.response_done_ns = if profile {
         monotonic_nanos(&store.context.cpu)
     } else {
@@ -899,8 +1165,8 @@ mod tests {
     #[test]
     fn a_zero_length_response_buffer_is_not_adopted() {
         let mut allocations = CompilerAllocations::new();
-        allocations.adopt(0, 0, 1);
-        allocations.adopt(64, 10, 1);
+        allocations.adopt(0, 0, 1).unwrap();
+        allocations.adopt(64, 10, 1).unwrap();
         assert_eq!(
             allocations.buffers.as_slice(),
             &[PluginBuffer {
@@ -909,6 +1175,67 @@ mod tests {
                 align: 1
             }]
         );
+    }
+
+    #[test]
+    fn compiler_abi_lengths_reject_overflow_without_truncating() {
+        assert_eq!(compiler_abi_i32(i32::MAX as usize), Ok(i32::MAX));
+        assert_eq!(
+            compiler_abi_i32(i32::MAX as usize + 1),
+            Err(ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidBinary,
+                detail: ProgramExecErrorDetail::CompilerAbiLengthOverflow,
+            })
+        );
+        assert_eq!(
+            compiler_abi_u32(u32::MAX as usize + 1),
+            Err(ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidBinary,
+                detail: ProgramExecErrorDetail::CompilerAbiLengthOverflow,
+            })
+        );
+        assert_eq!(
+            check_compiler_input_limit(1025, 1024),
+            Err(ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidBinary,
+                detail: ProgramExecErrorDetail::CompilerInputTooLarge {
+                    bytes: 1025,
+                    limit: 1024,
+                },
+            })
+        );
+        assert_eq!(check_compiler_input_limit(1024, 1024), Ok(()));
+    }
+
+    #[test]
+    fn copy_payload_and_trailer_streams_across_arbitrary_round_boundaries() {
+        let payload: Vec<u8> = (0..137u8).collect();
+        let trailer: Vec<u8> = (200..243u8).collect();
+        let total = payload.len() + trailer.len();
+        let mut expected = payload.clone();
+        expected.extend_from_slice(&trailer);
+
+        // Test multiple chunk sizes including ones that straddle the payload/trailer seam.
+        for chunk_size in [1usize, 7, 16, 64, 137, 200] {
+            let mut out = vec![0u8; total];
+            let mut written = 0;
+            while written < total {
+                let round_len = chunk_size.min(total - written);
+                let payload_start = written.min(payload.len());
+                let payload_end = (written + round_len).min(payload.len());
+                let payload_chunk = &payload[payload_start..payload_end];
+                copy_payload_and_trailer(
+                    written,
+                    &mut out[written..written + round_len],
+                    payload_start,
+                    payload_chunk,
+                    payload.len(),
+                    &trailer,
+                );
+                written += round_len;
+            }
+            assert_eq!(out, expected, "chunk_size={chunk_size}");
+        }
     }
 
     /// A compile that arrives while another holds the slot parks, and the

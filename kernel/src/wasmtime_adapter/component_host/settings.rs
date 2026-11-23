@@ -318,17 +318,33 @@ mod tests {
 
         assert_eq!(
             list(&program),
-            [SettingEntry {
-                name: "process.descriptor-limit",
-                description: DescriptorLimitSetting::DESCRIPTION,
-                value: SettingValue::Count(1024),
-            }]
+            [
+                SettingEntry {
+                    name: "process.descriptor-limit",
+                    description: DescriptorLimitSetting::DESCRIPTION,
+                    value: SettingValue::Count(1024),
+                },
+                SettingEntry {
+                    name: "compiler.max-input-bytes",
+                    description: crate::CompilerMaxInputBytesSetting::DESCRIPTION,
+                    value: SettingValue::Bytes(crate::DEFAULT_COMPILER_MAX_INPUT_BYTES),
+                },
+            ]
         );
         let views = listing(&program);
-        assert_eq!(views.len(), 1);
+        assert_eq!(views.len(), 2);
         assert_eq!(views[0].name, "process.descriptor-limit");
         assert_eq!(views[0].description, DescriptorLimitSetting::DESCRIPTION);
         assert!(matches!(views[0].value, ValueView::Count(1024)));
+        assert_eq!(views[1].name, "compiler.max-input-bytes");
+        assert_eq!(
+            views[1].description,
+            crate::CompilerMaxInputBytesSetting::DESCRIPTION
+        );
+        assert!(matches!(
+            views[1].value,
+            ValueView::Bytes(crate::DEFAULT_COMPILER_MAX_INPUT_BYTES)
+        ));
     }
 
     #[test]
