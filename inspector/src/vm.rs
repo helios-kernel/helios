@@ -7007,6 +7007,8 @@ mod tests {
         },
         #[error("expected a {CFI_VIOLATION_MESSAGE:?} panic from the guest, got: {outcome}")]
         NotAControlFlowViolation { outcome: String },
+        #[error("expected a {MTE_FAULT_MESSAGE:?} panic from the guest, got: {outcome}")]
+        NotATagCheckFault { outcome: String },
         #[error("socket path must be valid UTF-8")]
         SocketPathNotUtf8,
         #[error("failed to connect {purpose} RPC client: {source}")]
@@ -7077,6 +7079,8 @@ mod tests {
     /// What the aarch64 kernel's panic carries when a return address fails
     /// authentication (`aarch64/src/cfi.rs`).
     const CFI_VIOLATION_MESSAGE: &str = "control-flow violation:";
+    const MTE_FAULT_MESSAGE: &str = "AArch64 synchronous tag check fault:";
+    const MTE_FREE_TAG_MESSAGE: &str = "holds tag 0x0";
     const WATCHDOG_TIMEOUT_SECS: &str = "10";
     const WATCHDOG_STAGE_TIMEOUT: Duration = Duration::from_secs(120);
     const DIRECT_EXEC_TIMEOUT: Duration = Duration::from_secs(900);
@@ -9688,6 +9692,48 @@ mod tests {
                 outcome: other.to_string(),
             }),
             Ok(()) => Err(GuestTestFailure::NotAControlFlowViolation {
+                outcome: "the guest booted to the debugger".to_owned(),
+            }),
+        }
+    }
+
+    /// The aarch64 kernel built with `HELIOS_MTE_SELF_TEST` reads into a
+    /// `Tag::FREE` redzone through a live-tagged pointer once every processor
+    /// has started, so a machine with FEAT_MTE2 enabled panics with a
+    /// synchronous tag check fault naming the faulting granule and `0x0` tag.
+    #[test]
+    #[ignore = "requires qemu and a cross-compiled aarch64 kernel"]
+    fn mte_self_test_panics_aarch64() -> Result<(), GuestTestFailure> {
+        let mut command = guest_test_command(&AARCH64_VIRT_TCG_PROFILE);
+        command.mte = true;
+        build_self_test_kernel(&command, &[("HELIOS_MTE_SELF_TEST", "1")])?;
+        let mut runtime = VmRuntime::spawn(&command)?;
+        let socket = runtime
+            .socket_path()
+            .to_str()
+            .ok_or(GuestTestFailure::SocketPathNotUtf8)?
+            .to_owned();
+        let baud = command.baud;
+        let outcome = crate::runtime::block_on(async move {
+            let io = crate::serial::open(&socket, baud)
+                .await
+                .map_err(|source| GuestTestFailure::OpenSerial { source })?;
+            let (read, _write) = io.into_split();
+            Ok::<_, GuestTestFailure>(crate::ready::wait_for_boot(read).await.map(drop))
+        })?;
+        runtime.shutdown();
+        match outcome {
+            Err(crate::ready::BootError::GuestPanicked { report, trailer })
+                if (report.contains(MTE_FAULT_MESSAGE) || trailer.contains(MTE_FAULT_MESSAGE))
+                    && (report.contains(MTE_FREE_TAG_MESSAGE)
+                        || trailer.contains(MTE_FREE_TAG_MESSAGE)) =>
+            {
+                Ok(())
+            }
+            Err(other) => Err(GuestTestFailure::NotATagCheckFault {
+                outcome: other.to_string(),
+            }),
+            Ok(()) => Err(GuestTestFailure::NotATagCheckFault {
                 outcome: "the guest booted to the debugger".to_owned(),
             }),
         }
