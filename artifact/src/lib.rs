@@ -68,6 +68,28 @@ pub fn cwasm_target_guest_stack_limit_offset(target: &str) -> Option<i32> {
     (os == Some("none")).then_some(GUEST_STACK_LIMIT_OFFSET)
 }
 
+/// The frame size above which compiled code checks the stack in the
+/// function's prologue, before the frame is allocated.
+///
+/// The stack-limit checks the kernel's guests make otherwise run after the
+/// prologue has allocated and probed the frame, so a frame much larger than
+/// what the kernel has committed past the limit touches memory it has not
+/// committed. A function whose frame (fixed frame, clobber saves, outgoing
+/// arguments and frame setup area) exceeds this threshold compares the
+/// lowest address of its frame with the limit first, and the kernel commits
+/// the stack below it before any byte of the frame is written. A smaller
+/// frame is covered by the host reserve the kernel keeps committed under
+/// every checked stack pointer (`FIBER_STACK_HOST_RESERVE`), which is
+/// sized with this number in it: the reserve less this threshold is what
+/// host code called from a guest function may use.
+///
+/// 16 KiB is the size chosen in helios#535: a smaller one puts the prologue
+/// check on more functions, a larger one needs a larger reserve. The
+/// compiler and the kernel engine both set it, and Wasmtime refuses a
+/// `cwasm` compiled with another threshold, or with none, when it is
+/// loaded. A Winch compile cannot carry it, so the kernel engine refuses
+/// its output.
+pub const CWASM_STACK_LIMIT_LARGE_FRAME: u32 = 16 * 1024;
 /// The code protection the machine code of a cwasm artifact carries.
 ///
 /// It is part of an artifact's compatibility: the compiler records it in the
@@ -194,17 +216,28 @@ impl<'a> ParsedArtifact<'a> {
     }
 }
 
+/// Encodes `trailer` followed by its 4-byte little-endian length and
+/// [`TRAILER_MAGIC`]. Appending these bytes to the payload yields the same
+/// signed artifact [`append_signature_trailer`] produces, without copying the
+/// payload on the caller's heap.
+pub fn encode_signature_trailer(trailer: &SignatureTrailer) -> Result<Vec<u8>, TrailerError> {
+    let encoded = postcard::to_allocvec(trailer).map_err(TrailerError::Encode)?;
+    let encoded_len = u32::try_from(encoded.len()).map_err(|_| TrailerError::LengthOverflow)?;
+    let mut bytes = Vec::with_capacity(encoded.len() + 12);
+    bytes.extend_from_slice(&encoded);
+    bytes.extend_from_slice(&encoded_len.to_le_bytes());
+    bytes.extend_from_slice(TRAILER_MAGIC);
+    Ok(bytes)
+}
+
 pub fn append_signature_trailer(
     payload: &[u8],
     trailer: &SignatureTrailer,
 ) -> Result<Vec<u8>, TrailerError> {
-    let encoded = postcard::to_allocvec(trailer).map_err(TrailerError::Encode)?;
-    let encoded_len = u32::try_from(encoded.len()).map_err(|_| TrailerError::LengthOverflow)?;
-    let mut bytes = Vec::with_capacity(payload.len() + encoded.len() + 12);
+    let trailer_bytes = encode_signature_trailer(trailer)?;
+    let mut bytes = Vec::with_capacity(payload.len() + trailer_bytes.len());
     bytes.extend_from_slice(payload);
-    bytes.extend_from_slice(&encoded);
-    bytes.extend_from_slice(&encoded_len.to_le_bytes());
-    bytes.extend_from_slice(TRAILER_MAGIC);
+    bytes.extend_from_slice(&trailer_bytes);
     Ok(bytes)
 }
 
@@ -245,25 +278,36 @@ pub fn strip_signature_trailer(bytes: &[u8]) -> Result<&[u8], TrailerError> {
     parse_signed_artifact(bytes).map(|artifact| artifact.payload())
 }
 
+fn build_signature_trailer(payload: &[u8], signing_key: &SigningKey) -> SignatureTrailer {
+    let public_key = VerifyingKey::from(signing_key).to_bytes();
+    SignatureTrailer::new(
+        SignatureAlgorithm::Ed25519,
+        SignerCertificate {
+            public_key,
+            issuer_public_key: public_key,
+            issuer_signature: signing_key
+                .sign(&certificate_message(&public_key))
+                .to_bytes(),
+        },
+        signing_key.sign(payload).to_bytes(),
+    )
+}
+
+/// Signs `payload` and returns only the encoded signature trailer and footer
+/// bytes, allowing callers to stream `payload` directly followed by the
+/// returned trailer without copying `payload`.
+pub fn sign_payload_trailer_with_key(
+    payload: &[u8],
+    signing_key: &SigningKey,
+) -> Result<Vec<u8>, TrailerError> {
+    encode_signature_trailer(&build_signature_trailer(payload, signing_key))
+}
+
 pub fn sign_payload_with_key(
     payload: &[u8],
     signing_key: &SigningKey,
 ) -> Result<Vec<u8>, TrailerError> {
-    let public_key = VerifyingKey::from(signing_key).to_bytes();
-    append_signature_trailer(
-        payload,
-        &SignatureTrailer::new(
-            SignatureAlgorithm::Ed25519,
-            SignerCertificate {
-                public_key,
-                issuer_public_key: public_key,
-                issuer_signature: signing_key
-                    .sign(&certificate_message(&public_key))
-                    .to_bytes(),
-            },
-            signing_key.sign(payload).to_bytes(),
-        ),
-    )
+    append_signature_trailer(payload, &build_signature_trailer(payload, signing_key))
 }
 
 pub fn sign_payload_with_secret_key_bytes(
@@ -413,5 +457,24 @@ mod tests {
                 "{target}"
             );
         }
+    }
+
+    #[test]
+    fn trailer_only_signing_matches_full_signed_artifact() {
+        use super::{
+            SigningKey, VerifyingKey, sign_payload_trailer_with_key, sign_payload_with_key,
+            verify_signed_payload,
+        };
+        let key = SigningKey::from_bytes(&[0x3c; 32]);
+        let payload = b"compiled-wasm-artifact-payload";
+        let full = sign_payload_with_key(payload, &key).expect("full sign");
+        let trailer = sign_payload_trailer_with_key(payload, &key).expect("trailer sign");
+        let mut streamed = Vec::with_capacity(payload.len() + trailer.len());
+        streamed.extend_from_slice(payload);
+        streamed.extend_from_slice(&trailer);
+        assert_eq!(streamed, full);
+        let parsed = verify_signed_payload(&streamed, &[VerifyingKey::from(&key).to_bytes()])
+            .expect("verify");
+        assert_eq!(parsed.payload(), payload);
     }
 }

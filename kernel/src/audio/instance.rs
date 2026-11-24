@@ -144,9 +144,11 @@ impl AudioOwnership {
     ///
     /// Called when the playback task refuses the parameters, which is
     /// the one point at which nothing has been handed to the device yet:
-    /// the period buffers go back with the last reference to the ring.
+    /// the ring closes so any writer opened during the in-flight
+    /// negotiation ends without touching a period, and the period
+    /// buffers go back with the last reference to the ring.
     pub fn discard_negotiation(&mut self) {
-        self.ring = None;
+        self.close_ring();
         self.format = None;
     }
 

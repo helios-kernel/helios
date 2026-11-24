@@ -22,7 +22,7 @@ use crate::Aarch64Cpu;
 use crate::debug_state::RuntimeState;
 
 pub(crate) type Aarch64VirtioBlockDevice = helios_virtio::VirtioBlockResource<
-    helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>,
+    helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<crate::Aarch64DmaPool>>,
     Aarch64Cpu,
     helios_kernel::BlockPages,
 >;
@@ -134,7 +134,7 @@ fn discover_block_devices(
             let header = core::ptr::NonNull::new(virtual_base as *mut u8).unwrap_or_else(|| {
                 panic!("virtio MMIO base {virtual_base:#x} was unexpectedly null")
             });
-            let dma = helios_virtio::OffsetDmaPool::new(physical_memory_offset);
+            let dma = crate::dma_pool();
             let device = unsafe {
                 helios_virtio::block_from_mmio_with_dma(
                     header,

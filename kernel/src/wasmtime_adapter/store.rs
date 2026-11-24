@@ -7,16 +7,71 @@
 extern crate alloc;
 
 use helios_hal::cpu::Cpu;
-use wasmtime::ResourceLimiter;
 use wasmtime::component::ResourceTableLimiter;
+use wasmtime::{ResourceLimiter, Trap};
 
 use crate::process::ComponentHandleLimitSetting;
 use crate::wasmtime_adapter::component_host::{HostRuntimeState, StoreData, deliver_kill};
 use crate::{
     ComponentHostNetwork, InstanceRegistry, KernelHeapHeadroom, MemoryPool, OomKillOutcome,
-    ProgramOutOfMemory, RegisteredInstance, Storage, UserResidency, allow_instance_resource_growth,
-    heap_stats, monotonic_nanos, user_heap_stats,
+    ProgramOutOfMemory, RegisteredInstance, StackReserveError, Storage, UserResidency,
+    allow_instance_resource_growth, heap_stats, monotonic_nanos, user_heap_stats,
 };
+
+/// What the runtime's stack-reserve callback answers for the kernel's
+/// commit of the stack below a guest stack pointer.
+///
+/// A commit is the runtime asking for memory, so a refusal takes the
+/// path a refused grow takes. A pool that cannot back the reserve asks the
+/// OOM killer to cover the bytes it could not give (`condemn`, called with
+/// that shortfall) and ends the guest's call with the typed
+/// [`ProgramOutOfMemory`], which the program service classifies as running
+/// out of memory. The guest unwinds from the libcall that asked, in
+/// ordinary context, never from a fault. A stack with no room left for the
+/// reserve is a stack overflow, the trap a guest that recurses past its
+/// stack takes.
+pub(crate) fn answer_stack_reserve(
+    committed: Result<usize, StackReserveError>,
+    condemn: impl FnOnce(usize),
+) -> wasmtime::Result<usize> {
+    match committed {
+        Ok(limit) => Ok(limit),
+        Err(StackReserveError::Overflow { .. }) => Err(Trap::StackOverflow.into()),
+        Err(StackReserveError::OutOfMemory(shortfall)) => {
+            condemn(shortfall.requested_bytes);
+            Err(shortfall.into())
+        }
+    }
+}
+
+/// Installs the stack-reserve callback on a store whose guest runs on a
+/// fiber stack of the arena.
+///
+/// A machine with a fiber-stack arena commits each fiber's stack ahead of
+/// the guest: the runtime calls back from a guest stack-limit check that
+/// falls below the stack's reserve limit and at a guest entry, so host
+/// code never meets an uncommitted stack page. Only a backend with the
+/// arena has one (the hosted build runs guests on ordinary thread
+/// stacks), and a store there gets no callback.
+///
+/// `condemn` is given the store's data and the bytes the user pool could
+/// not back. A store with an OOM-kill route asks the killer to cover
+/// them; one without leaves the guest's own typed failure, which ends it
+/// and returns its memory to the pool, as the whole answer.
+pub(crate) fn install_stack_reserve<T: 'static>(
+    store: &mut wasmtime::Store<T>,
+    condemn: impl Fn(&T, usize) + Send + Sync + 'static,
+) {
+    if !crate::memory::fiber_stack_arena_installed() {
+        return;
+    }
+    store.stack_reserve_callback(move |caller, sp| {
+        answer_stack_reserve(
+            crate::memory::commit_fiber_stack_reserve(sp),
+            |requested_bytes| condemn(caller.data(), requested_bytes),
+        )
+    });
+}
 
 impl<CpuImpl, Net, StorageImpl> ResourceLimiter for StoreData<CpuImpl, Net, StorageImpl>
 where
@@ -97,7 +152,14 @@ where
         let user_heap = user_heap_stats();
         let user_available = user_heap.available_bytes();
         if user_available < growth {
-            self.request_oom_kill_for_growth(MemoryPool::User, growth);
+            request_oom_kill(
+                &self.runtime_state,
+                &self.instance_registry,
+                &self.cpu,
+                self.instance().id(),
+                MemoryPool::User,
+                growth,
+            );
             return Some(
                 ProgramOutOfMemory {
                     requested_bytes: desired,
@@ -112,7 +174,14 @@ where
         let heap = heap_stats();
         let headroom = KernelHeapHeadroom::of(heap, user_available);
         if let Some(shortfall) = headroom.growth_shortfall_bytes(growth) {
-            self.request_oom_kill_for_growth(MemoryPool::Kernel, shortfall);
+            request_oom_kill(
+                &self.runtime_state,
+                &self.instance_registry,
+                &self.cpu,
+                self.instance().id(),
+                MemoryPool::Kernel,
+                shortfall,
+            );
             // Every number in this refusal describes the kernel side
             // of the grow, including the request: reporting the guest's
             // `desired` here alongside kernel-heap availability is what
@@ -154,23 +223,13 @@ where
         self.table.set_limiter(limiter);
     }
 
-    /// Ask the OOM killer to cover `requested_bytes` of `pool`.
-    ///
-    /// The killer answers against its condemned-memory ledger, so a
-    /// shortfall that an in-flight kill already covers condemns nothing
-    /// further: `memory_growing` is a synchronous Wasmtime callback and
-    /// cannot wait for the reclaim, so the requester takes its typed
-    /// `ProgramOutOfMemory` failure either way and retries when the
-    /// guest next asks for the memory. Logged at warn level so
-    /// post-mortem analysis can trace which instance was sacrificed for
-    /// which grow request, and which requests were absorbed by a kill
-    /// that had already happened.
-    fn request_oom_kill_for_growth(&self, pool: MemoryPool, requested_bytes: usize) {
-        request_oom_kill_for_pool(
+    /// Ask the OOM killer to cover `requested_bytes` of `pool` for this store.
+    pub(crate) fn request_oom_kill_for_growth(&self, pool: MemoryPool, requested_bytes: usize) {
+        request_oom_kill(
             &self.runtime_state,
             &self.instance_registry,
-            self.instance(),
             &self.cpu,
+            self.instance().id(),
             pool,
             requested_bytes,
         );
@@ -200,11 +259,11 @@ where
 {
     fn try_charge_with_headroom(&mut self, bytes: usize, headroom: KernelHeapHeadroom) -> bool {
         if let Some(shortfall) = headroom.allocation_shortfall_bytes(bytes) {
-            request_oom_kill_for_pool(
+            request_oom_kill(
                 &self.runtime_state,
                 &self.instance_registry,
-                &self.instance,
                 &self.cpu,
+                self.instance.id(),
                 MemoryPool::Kernel,
                 shortfall,
             );
@@ -238,11 +297,28 @@ where
     }
 }
 
-fn request_oom_kill_for_pool<CpuImpl, Net, StorageImpl>(
+/// Ask the OOM killer to cover `requested_bytes` of `pool` for
+/// `requester`.
+///
+/// The one OOM request: a refused linear-memory grow, a refused kernel
+/// heap grow and any later refusal of user-pool frames (a store-held
+/// buffer, a file page) all come through here, so the balloon, the
+/// condemned-memory ledger and the log line behave the same for every
+/// one. It takes the pieces of a store rather than the store, because a
+/// stream that outlives the call that made it holds exactly these.
+///
+/// The killer answers against its condemned-memory ledger, so a
+/// shortfall that an in-flight kill already covers condemns nothing
+/// further: the requester cannot wait for the reclaim, so it takes its
+/// typed failure either way and retries when it next asks for the
+/// memory. Logged at warn level so post-mortem analysis can trace which
+/// instance was sacrificed for which request, and which requests were
+/// absorbed by a kill that had already happened.
+pub(crate) fn request_oom_kill<CpuImpl, Net, StorageImpl>(
     runtime_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
     instance_registry: &InstanceRegistry,
-    requester_instance: &RegisteredInstance,
     cpu: &CpuImpl,
+    requester: crate::InstanceId,
     pool: MemoryPool,
     requested_bytes: usize,
 ) where
@@ -253,11 +329,10 @@ fn request_oom_kill_for_pool<CpuImpl, Net, StorageImpl>(
     // VIRTIO_BALLOON_F_DEFLATE_ON_OOM: memory the host is holding is
     // reclaimed before memory a program is using. The balloon task
     // does the deflating, so this only asks; the requester still
-    // takes this refusal and retries.
+    // takes its failure and retries.
     if let Some(balloon) = runtime_state.memory_balloon() {
         balloon.request_deflate();
     }
-    let requester = requester_instance.id();
     // Before the registry's lock, never under it: see `UserResidency`.
     let residency = user_residency();
     let decision = instance_registry.condemn_for_oom(
@@ -295,7 +370,7 @@ fn request_oom_kill_for_pool<CpuImpl, Net, StorageImpl>(
             requested_bytes,
             condemned_pending_bytes = condemned.pending_bytes,
             condemned_stale_bytes = condemned.stale_bytes,
-            "memory already condemned covers this allocation — requester retries instead of \
+            "memory already condemned covers this request — requester retries instead of \
              condemning another instance"
         ),
         OomKillOutcome::NoVictim => tracing::warn!(
@@ -305,7 +380,7 @@ fn request_oom_kill_for_pool<CpuImpl, Net, StorageImpl>(
             requested_bytes,
             condemned_pending_bytes = condemned.pending_bytes,
             condemned_stale_bytes = condemned.stale_bytes,
-            "OOM killer found no eligible victim — requester takes the allocation failure"
+            "OOM killer found no eligible victim — requester takes its failure"
         ),
     }
 }

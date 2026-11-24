@@ -704,13 +704,10 @@ extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) {
         if resolve_probe_fault(faulting_address) {
             return;
         }
-        // A reserved page inside a live fiber stack is a demand commit
-        // the kernel resolves here, with no lock and no allocation; the
-        // guard page below one is a stack overflow and stays a fault.
-        stack_fault = helios_kernel::resolve_stack_fault(UserVirtAddr::new(faulting_address));
-        if stack_fault == StackFault::Committed {
-            return;
-        }
+        // Fiber stacks commit ahead of the guest through the stack-reserve
+        // callback; a fault on an uncommitted page inside one fails fast
+        // here, and the guard page below one stays a stack-overflow fault.
+        stack_fault = helios_kernel::classify_stack_fault(UserVirtAddr::new(faulting_address));
     }
     if frame.vector == DOUBLE_FAULT_VECTOR {
         panic!(

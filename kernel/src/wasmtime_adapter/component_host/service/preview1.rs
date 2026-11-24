@@ -449,6 +449,25 @@ where
         self.activity.instance()
     }
 
+    /// The user pool, installed during boot before any program runs (or the
+    /// shared test pool in unit tests that do not boot a machine).
+    pub(super) fn user_pool() -> &'static crate::UserMemoryPool {
+        crate::vfs::default_memory_storage_pool()
+    }
+
+    /// Asks the shared OOM path to cover `requested_bytes` of user memory
+    /// for this instance, which is never its own victim.
+    pub(super) fn request_user_memory_oom_kill(&self, requested_bytes: u64) {
+        crate::wasmtime_adapter::store::request_oom_kill(
+            &self.runtime_state,
+            &self.runtime_state.instance_registry(),
+            &self.cpu,
+            self.instance().id(),
+            crate::MemoryPool::User,
+            usize::try_from(requested_bytes).unwrap_or(usize::MAX),
+        );
+    }
+
     /// The handle the code driving this store accounts its processor
     /// turns through. Taken before the store is borrowed for the call;
     /// see [`crate::component::GuestTurns::drive`].
@@ -965,6 +984,7 @@ where
             mtim,
             now_nanos,
         );
+        let payer = self.instance().storage_payer();
         wasi_fs::set_times_at(
             &self.filesystem,
             granted,
@@ -973,6 +993,7 @@ where
             access,
             modified,
             now_nanos,
+            &payer,
         )
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
@@ -1236,6 +1257,9 @@ where
     // the call that drives this store is polled, and signals and kills
     // reach the guest at its interrupt checks.
     store.interrupt_callback(|mut caller| caller.data_mut().on_interrupt());
+    // A program store has no OOM-kill route: a stack reserve the pool
+    // cannot back ends the program with its typed out-of-memory failure.
+    crate::wasmtime_adapter::store::install_stack_reserve(store, |_, _| {});
     let interrupts = store.data().interrupts.clone();
     let instance = store.data().instance().id();
     let registration = interrupts.register(instance, store, store.data().cpu.clone());
@@ -2664,11 +2688,12 @@ where
     };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    let payer = caller.data().instance().storage_payer();
     let file = match p1_grant(&descriptor) {
         Ok(file) => file,
         Err(errno) => return errno,
     };
-    wasi_fs::set_size(&namespace, file, size, now_nanos)
+    wasi_fs::set_size(&namespace, file, size, now_nanos, &payer)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -2698,7 +2723,8 @@ where
     };
     let (access, modified, now_nanos) = p1_set_times_arguments(caller, atim, mtim, fstflags);
     let namespace = p1_namespace(caller);
-    wasi_fs::set_times(&namespace, target, access, modified, now_nanos)
+    let payer = caller.data().instance().storage_payer();
+    wasi_fs::set_times(&namespace, target, access, modified, now_nanos, &payer)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -2783,11 +2809,12 @@ where
         return p1::errno::SUCCESS;
     }
     let now_nanos = caller.data().now_nanos();
+    let payer = caller.data().instance().storage_payer();
     let file = match p1_grant(&descriptor) {
         Ok(file) => file,
         Err(errno) => return errno,
     };
-    wasi_fs::set_size(&namespace, file, end, now_nanos)
+    wasi_fs::set_size(&namespace, file, end, now_nanos, &payer)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -2964,12 +2991,23 @@ where
     })?;
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    p1_write_open_file(&namespace, &open, append, memory, layout, at, now_nanos).await
+    let payer = caller.data().instance().storage_payer();
+    let result = p1_write_open_file(
+        &namespace, &open, append, memory, layout, at, now_nanos, &payer,
+    )
+    .await;
+    if matches!(result, Err(P1Stop::Errno(p1::errno::NOMEM))) {
+        caller.data().request_user_memory_oom_kill(
+            u64::from(layout.byte_len).max(helios_hal::pmm::PhysFrame::SIZE as u64),
+        );
+    }
+    result
 }
 
 /// Writes the bytes `layout` names through the open file description
 /// `open`, as [`p1_write_file`] describes; `append` is the description's
 /// `APPEND` status flag.
+#[allow(clippy::too_many_arguments)]
 async fn p1_write_open_file<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     open: &OpenFile<FsDescriptor>,
@@ -2978,6 +3016,7 @@ async fn p1_write_open_file<StorageImpl: crate::Storage>(
     layout: &Preview1IovLayout,
     at: Option<u64>,
     now_nanos: u64,
+    payer: &crate::StoragePayer,
 ) -> Result<u32, P1Stop> {
     let mut gather = Preview1Gather::new(memory, layout)?;
     let file =
@@ -2985,6 +3024,7 @@ async fn p1_write_open_file<StorageImpl: crate::Storage>(
     let mut resolved = ResolvedFileChunks {
         file: &file,
         now_nanos,
+        payer,
     };
     match at {
         Some(at) => {
@@ -3019,6 +3059,7 @@ async fn p1_write_open_file<StorageImpl: crate::Storage>(
 struct ResolvedFileChunks<'file, 'namespace, StorageImpl: crate::Storage> {
     file: &'file crate::vfs::Resolved<'namespace, StorageImpl>,
     now_nanos: u64,
+    payer: &'file crate::StoragePayer,
 }
 
 impl<StorageImpl: crate::Storage> Preview1ChunkedFile for ResolvedFileChunks<'_, '_, StorageImpl> {
@@ -3035,11 +3076,18 @@ impl<StorageImpl: crate::Storage> Preview1ChunkedFile for ResolvedFileChunks<'_,
         // waiting on swap holds up this write and never the file; each
         // round checks them again in the poll that fills it.
         gather.bring_in(memory, len).await?;
-        let write =
-            match wasi_fs::prepare_resolved_write(self.file, position, len, self.now_nanos).await {
-                Ok(write) => write,
-                Err(refusal) => return Ok(Err(refusal)),
-            };
+        let write = match wasi_fs::prepare_resolved_write(
+            self.file,
+            position,
+            len,
+            self.now_nanos,
+            self.payer,
+        )
+        .await
+        {
+            Ok(write) => write,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
         let landed = gather.submit_staged(memory, write).await?;
         Ok(landed.map_err(wasi_fs::fs_error_code).and_then(|landed| {
             Ok(ChunkLanded {
@@ -3400,6 +3448,7 @@ where
     let base = p1_grant(base)?;
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    let payer = caller.data().instance().storage_payer();
     wasi_fs::open_at(
         &namespace,
         base,
@@ -3408,6 +3457,7 @@ where
         open_flags,
         descriptor_flags,
         now_nanos,
+        &payer,
     )
     .await
     .map_err(p1_errno_from_fs)
@@ -3449,11 +3499,12 @@ where
     };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    let payer = caller.data().instance().storage_payer();
     let granted = match p1_grant(&base) {
         Ok(granted) => granted,
         Err(errno) => return errno,
     };
-    wasi_fs::create_directory_at(&namespace, granted, &path, now_nanos)
+    wasi_fs::create_directory_at(&namespace, granted, &path, now_nanos, &payer)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3597,6 +3648,7 @@ where
         };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    let payer = caller.data().instance().storage_payer();
     let link = match p1_grant(&source_base).and_then(|source| {
         source
             .alias_into(p1_grant(&destination_base)?)
@@ -3605,7 +3657,7 @@ where
         Ok(link) => link,
         Err(errno) => return errno,
     };
-    wasi_fs::link_at(&namespace, link, &old_path, &new_path, now_nanos)
+    wasi_fs::link_at(&namespace, link, &old_path, &new_path, now_nanos, &payer)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3694,13 +3746,20 @@ where
         Err(errno) => return errno,
     };
     let namespace = p1_namespace(caller);
+    let payer = caller.data().instance().storage_payer();
     let granted = match p1_grant(&base) {
         Ok(granted) => granted,
         Err(errno) => return errno,
     };
-    wasi_fs::remove_directory_at(&namespace, granted, &path, caller.data().now_nanos())
-        .await
-        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
+    wasi_fs::remove_directory_at(
+        &namespace,
+        granted,
+        &path,
+        caller.data().now_nanos(),
+        &payer,
+    )
+    .await
+    .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_path_rename<CpuImpl, Net, StorageImpl>(
@@ -3752,6 +3811,7 @@ where
         };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    let payer = caller.data().instance().storage_payer();
     let rename = match p1_grant(&source_base).and_then(|source| {
         source
             .alias_into(p1_grant(&destination_base)?)
@@ -3761,7 +3821,7 @@ where
         Ok(rename) => rename,
         Err(errno) => return errno,
     };
-    wasi_fs::rename_at(&namespace, rename, &old_path, &new_path, now_nanos)
+    wasi_fs::rename_at(&namespace, rename, &old_path, &new_path, now_nanos, &payer)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3812,11 +3872,12 @@ where
     };
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    let payer = caller.data().instance().storage_payer();
     let granted = match p1_grant(&base) {
         Ok(granted) => granted,
         Err(errno) => return errno,
     };
-    wasi_fs::symlink_at(&namespace, granted, target, &new_path, now_nanos)
+    wasi_fs::symlink_at(&namespace, granted, target, &new_path, now_nanos, &payer)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3856,13 +3917,20 @@ where
         Err(errno) => return errno,
     };
     let namespace = p1_namespace(caller);
+    let payer = caller.data().instance().storage_payer();
     let granted = match p1_grant(&base) {
         Ok(granted) => granted,
         Err(errno) => return errno,
     };
-    wasi_fs::unlink_file_at(&namespace, granted, &path, caller.data().now_nanos())
-        .await
-        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
+    wasi_fs::unlink_file_at(
+        &namespace,
+        granted,
+        &path,
+        caller.data().now_nanos(),
+        &payer,
+    )
+    .await
+    .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 /// How much console input one stdin readiness probe pulls into the carry.
@@ -5383,9 +5451,10 @@ pub(super) fn p1_errno_from_fs(error: fs_types::ErrorCode) -> i32 {
         fs_types::ErrorCode::Unsupported => p1::errno::NOTSUP,
         fs_types::ErrorCode::Overflow => p1::errno::OVERFLOW,
         fs_types::ErrorCode::NotPermitted => p1::errno::PERM,
-        fs_types::ErrorCode::InsufficientSpace => p1::errno::NOSPC,
         fs_types::ErrorCode::ReadOnly => p1::errno::ROFS,
         fs_types::ErrorCode::CrossDevice => p1::errno::XDEV,
+        fs_types::ErrorCode::InsufficientSpace => p1::errno::NOSPC,
+        fs_types::ErrorCode::InsufficientMemory => p1::errno::NOMEM,
         _ => p1::errno::IO,
     }
 }
@@ -5479,6 +5548,7 @@ mod tests {
             mount: None,
             open: None,
         };
+        let payer = crate::StoragePayer::for_test();
         let file = block_on(wasi_fs::open_at(
             &namespace,
             owner.grant().expect("the owner may read the directory"),
@@ -5487,6 +5557,7 @@ mod tests {
             fs_types::OpenFlags::CREATE,
             FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
             1,
+            &payer,
         ))
         .expect("the owner creates the file");
         block_on(wasi_fs::write(
@@ -5495,6 +5566,7 @@ mod tests {
             helios_hal::fs::WritePosition::At(0),
             "日本語 한국어".as_bytes(),
             2,
+            &payer,
         ))
         .expect("the owner writes the file");
 
@@ -5511,6 +5583,7 @@ mod tests {
                 p1_open_flags(8),
                 p1_descriptor_flags(rights, 0),
                 3,
+                &payer,
             ));
             assert!(matches!(opened, Err(fs_types::ErrorCode::ReadOnly)));
             let contents = block_on(wasi_fs::read(
@@ -5543,6 +5616,7 @@ mod tests {
             mount: None,
             open: None,
         };
+        let payer = crate::StoragePayer::for_test();
         block_on(wasi_fs::open_at(
             &namespace,
             owner.grant().expect("the owner may read the directory"),
@@ -5551,6 +5625,7 @@ mod tests {
             fs_types::OpenFlags::CREATE,
             FsDescriptorFlags::READ,
             1,
+            &payer,
         ))
         .expect("the owner creates the file");
         namespace
@@ -5618,6 +5693,7 @@ mod tests {
             let Some(Preview1Descriptor::File(file)) = table.get(fd) else {
                 panic!("descriptor {fd} must name the file");
             };
+            let payer = crate::StoragePayer::for_test();
             let written = block_on(p1_write_open_file(
                 &namespace,
                 file,
@@ -5626,6 +5702,7 @@ mod tests {
                 &layout,
                 None,
                 2,
+                &payer,
             ))
             .expect("the write lands");
             assert_eq!(written, len);
@@ -5682,6 +5759,7 @@ mod tests {
         assert_eq!(modified_nanos(&namespace), before);
 
         let retimer = file(P1_RIGHT_FD_FILESTAT_SET_TIMES);
+        let payer = crate::StoragePayer::for_test();
         block_on(wasi_fs::set_times(
             &namespace,
             retimer
@@ -5690,6 +5768,7 @@ mod tests {
             None,
             Some(77),
             78,
+            &payer,
         ))
         .expect("the descriptor with the right sets the times");
         assert_eq!(modified_nanos(&namespace), 77);
@@ -5721,6 +5800,7 @@ mod tests {
         assert_eq!(modified_nanos(&namespace), before);
 
         let creator = base(P1_RIGHT_PATH_CREATE_FILE);
+        let payer = crate::StoragePayer::for_test();
         block_on(wasi_fs::set_times_at(
             &namespace,
             p1_grant(&creator).expect("PATH_CREATE_FILE gives mutate-directory"),
@@ -5729,6 +5809,7 @@ mod tests {
             None,
             Some(88),
             89,
+            &payer,
         ))
         .expect("the base with the right sets the times");
         assert_eq!(modified_nanos(&namespace), 88);
@@ -7175,6 +7256,7 @@ mod open_file_offset_tests {
             mount: None,
             open: None,
         };
+        let payer = crate::StoragePayer::for_test();
         let opened = block_on(wasi_fs::open_at(
             &namespace,
             root.grant().expect("root directory grant"),
@@ -7183,6 +7265,7 @@ mod open_file_offset_tests {
             fs_types::OpenFlags::CREATE,
             FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
             1,
+            &payer,
         ))
         .expect("creates shared.txt");
         let table =
@@ -7249,6 +7332,7 @@ mod open_file_offset_tests {
         let fd1 = open_file_at(&table, 1).clone();
         let fd2 = open_file_at(&table, 2).clone();
 
+        let payer = crate::StoragePayer::for_test();
         let mut first_write = core::pin::pin!(p1_write_open_file(
             &namespace,
             &fd1,
@@ -7257,6 +7341,7 @@ mod open_file_offset_tests {
             &first_layout,
             None,
             10,
+            &payer,
         ));
         let mut second_write = core::pin::pin!(p1_write_open_file(
             &namespace,
@@ -7266,6 +7351,7 @@ mod open_file_offset_tests {
             &second_layout,
             None,
             11,
+            &payer,
         ));
 
         // First write acquires the position lock and suspends bringing in its guest page.
@@ -7337,6 +7423,7 @@ mod open_file_offset_tests {
         let fd1 = open_file_at(&table, 1).clone();
         let fd2 = open_file_at(&table, 2).clone();
 
+        let payer = crate::StoragePayer::for_test();
         let mut seq_write = core::pin::pin!(p1_write_open_file(
             &namespace,
             &fd1,
@@ -7345,6 +7432,7 @@ mod open_file_offset_tests {
             &seq_layout,
             None,
             10,
+            &payer,
         ));
         assert!(poll(seq_write.as_mut()).is_none());
 
@@ -7358,6 +7446,7 @@ mod open_file_offset_tests {
             &pwrite_layout,
             Some(pwrite_at),
             11,
+            &payer,
         )))
         .expect("pwrite must not block on the offset lock")
         .expect("pwrite succeeds");
@@ -7408,8 +7497,9 @@ mod open_file_offset_tests {
         let fd1 = open_file_at(&table, 1).clone();
         let fd2 = open_file_at(&table, 2).clone();
 
+        let payer = crate::StoragePayer::for_test();
         let mut in_flight_write = core::pin::pin!(p1_write_open_file(
-            &namespace, &fd1, false, &memory, &layout, None, 10,
+            &namespace, &fd1, false, &memory, &layout, None, 10, &payer,
         ));
         assert!(poll(in_flight_write.as_mut()).is_none());
 
@@ -7433,5 +7523,19 @@ mod open_file_offset_tests {
             Some(Ok(payload.to_vec()))
         );
         assert_eq!(block_on(p1_tell_open_file(&fd1)), payload.len() as u64);
+    }
+
+    /// A full storage budget is `NOSPC` and a refused frame is `NOMEM`;
+    /// neither falls through to the catch-all `IO`.
+    #[test]
+    fn storage_exhaustion_has_its_own_errnos() {
+        assert_eq!(
+            p1_errno_from_fs(fs_types::ErrorCode::InsufficientSpace),
+            p1::errno::NOSPC
+        );
+        assert_eq!(
+            p1_errno_from_fs(fs_types::ErrorCode::InsufficientMemory),
+            p1::errno::NOMEM
+        );
     }
 }

@@ -313,23 +313,147 @@ mod tests {
     }
 
     #[test]
-    fn list_shows_the_descriptor_limit_with_its_unit_and_value() {
-        let program = ordinary();
+    fn list_shows_the_machine_settings_with_their_units_and_values() {
+        use crate::{CompilerMaxInputBytesSetting, RandomBytesLimitSetting};
 
-        let expected = SettingEntry {
-            name: "process.descriptor-limit",
-            description: DescriptorLimitSetting::DESCRIPTION,
-            value: SettingValue::Count(1024),
-        };
-        assert!(list(&program).contains(&expected));
+        let program = ordinary();
+        let expected_storage = crate::MemoryStorageSetting::initial();
+
+        use crate::process::{BufferedExecOutputLimitSetting, ComponentHandleLimitSetting};
+
+        assert_eq!(
+            list(&program),
+            [
+                SettingEntry {
+                    name: "process.descriptor-limit",
+                    description: DescriptorLimitSetting::DESCRIPTION,
+                    value: SettingValue::Count(1024),
+                },
+                SettingEntry {
+                    name: "fs.memory-storage",
+                    description: crate::MemoryStorageSetting::DESCRIPTION,
+                    value: SettingValue::Bytes(expected_storage),
+                },
+                SettingEntry {
+                    name: "compiler.max-input-bytes",
+                    description: CompilerMaxInputBytesSetting::DESCRIPTION,
+                    value: SettingValue::Bytes(crate::DEFAULT_COMPILER_MAX_INPUT_BYTES),
+                },
+                SettingEntry {
+                    name: "random.max-bytes",
+                    description: RandomBytesLimitSetting::DESCRIPTION,
+                    value: SettingValue::Bytes(RandomBytesLimitSetting::DEFAULT),
+                },
+                SettingEntry {
+                    name: "process.max-component-handles",
+                    description: ComponentHandleLimitSetting::DESCRIPTION,
+                    value: SettingValue::Count(ComponentHandleLimitSetting::DEFAULT_LIMIT as u64),
+                },
+                SettingEntry {
+                    name: "programs.max-buffered-exec-bytes",
+                    description: BufferedExecOutputLimitSetting::DESCRIPTION,
+                    value: SettingValue::Bytes(
+                        BufferedExecOutputLimitSetting::DEFAULT_LIMIT as u64,
+                    ),
+                },
+            ]
+        );
         let views = listing(&program);
         assert_eq!(views.len(), SETTING_COUNT);
-        let view = views
-            .iter()
-            .find(|view| view.name == "process.descriptor-limit")
-            .expect("descriptor limit appears in listing");
-        assert_eq!(view.description, DescriptorLimitSetting::DESCRIPTION);
-        assert!(matches!(view.value, ValueView::Count(1024)));
+        assert_eq!(views[0].name, "process.descriptor-limit");
+        assert_eq!(views[0].description, DescriptorLimitSetting::DESCRIPTION);
+        assert!(matches!(views[0].value, ValueView::Count(1024)));
+        assert_eq!(views[1].name, "fs.memory-storage");
+        assert_eq!(
+            views[1].description,
+            crate::MemoryStorageSetting::DESCRIPTION
+        );
+        assert!(matches!(views[1].value, ValueView::Bytes(v) if v == expected_storage));
+        assert_eq!(views[2].name, "compiler.max-input-bytes");
+        assert_eq!(
+            views[2].description,
+            CompilerMaxInputBytesSetting::DESCRIPTION
+        );
+        assert!(matches!(
+            views[2].value,
+            ValueView::Bytes(crate::DEFAULT_COMPILER_MAX_INPUT_BYTES)
+        ));
+        assert_eq!(views[3].name, "random.max-bytes");
+        assert_eq!(views[3].description, RandomBytesLimitSetting::DESCRIPTION);
+        assert!(matches!(
+            views[3].value,
+            ValueView::Bytes(bytes) if bytes == RandomBytesLimitSetting::DEFAULT
+        ));
+        assert_eq!(views[4].name, "process.max-component-handles");
+        assert_eq!(
+            views[4].description,
+            ComponentHandleLimitSetting::DESCRIPTION
+        );
+        assert!(matches!(
+            views[4].value,
+            ValueView::Count(n) if n == ComponentHandleLimitSetting::DEFAULT_LIMIT as u64
+        ));
+        assert_eq!(views[5].name, "programs.max-buffered-exec-bytes");
+        assert_eq!(
+            views[5].description,
+            BufferedExecOutputLimitSetting::DESCRIPTION
+        );
+        assert!(matches!(
+            views[5].value,
+            ValueView::Bytes(n) if n == BufferedExecOutputLimitSetting::DEFAULT_LIMIT as u64
+        ));
+    }
+
+    #[test]
+    fn lowering_the_random_bytes_limit_setting_refuses_larger_random_calls() {
+        use crate::RandomBytesLimitSetting;
+        use crate::wasmtime_adapter::wasi::WasiAdapterTrap;
+        use crate::wasmtime_adapter::wasi::bindings::random::{insecure, random};
+
+        let mut program = holder();
+        assert_eq!(
+            random::Host::get_random_bytes(&mut program, 24)
+                .expect("under default limit")
+                .len(),
+            24
+        );
+        assert_eq!(
+            insecure::Host::get_insecure_random_bytes(&mut program, 24)
+                .expect("under default limit")
+                .len(),
+            24
+        );
+
+        assert_eq!(
+            write(&program, "random.max-bytes", SettingValue::Bytes(16)),
+            Ok(SettingValue::Bytes(RandomBytesLimitSetting::DEFAULT))
+        );
+
+        assert_eq!(
+            random::Host::get_random_bytes(&mut program, 16)
+                .expect("at new limit")
+                .len(),
+            16
+        );
+        let secure_err = random::Host::get_random_bytes(&mut program, 17)
+            .expect_err("one byte above lowered limit must trap");
+        assert_eq!(
+            secure_err.downcast_ref::<WasiAdapterTrap>(),
+            Some(&WasiAdapterTrap::RandomBytesLimitExceeded { len: 17, limit: 16 })
+        );
+
+        assert_eq!(
+            insecure::Host::get_insecure_random_bytes(&mut program, 16)
+                .expect("at new limit")
+                .len(),
+            16
+        );
+        let insecure_err = insecure::Host::get_insecure_random_bytes(&mut program, 17)
+            .expect_err("one byte above lowered limit must trap");
+        assert_eq!(
+            insecure_err.downcast_ref::<WasiAdapterTrap>(),
+            Some(&WasiAdapterTrap::RandomBytesLimitExceeded { len: 17, limit: 16 })
+        );
     }
 
     #[test]
