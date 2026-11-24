@@ -47,10 +47,34 @@ use thiserror::Error;
 use triomphe::Arc;
 
 use crate::machine::{Generation, MachineGeneration, MachineGenerationHandle};
+use crate::settings::{Setting, SettingUnit};
 use crate::{Kernel, Timer};
 
 /// Bytes the root DRBG draws from a hardware source per seed or reseed.
 pub const ROOT_ENTROPY_MATERIAL_BYTES: usize = 64;
+
+/// Default byte ceiling on a single guest random-bytes request: 64 MiB.
+const DEFAULT_MAX_RANDOM_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Machine-wide limit on the byte list returned by a single random-bytes
+/// request.
+pub struct RandomBytesLimitSetting;
+
+impl Setting for RandomBytesLimitSetting {
+    const NAME: &'static str = "random.max-bytes";
+    const DESCRIPTION: &'static str = "Largest byte list a single random-bytes request may return.";
+    const UNIT: SettingUnit = SettingUnit::Bytes;
+    type Value = u64;
+    const DEFAULT: u64 = DEFAULT_MAX_RANDOM_BYTES;
+
+    fn to_raw(value: u64) -> u64 {
+        value
+    }
+
+    fn from_raw(raw: u64) -> u64 {
+        raw
+    }
+}
 
 /// Domain separators, so material that reaches the hash through two
 /// different paths cannot collide into the same key.
