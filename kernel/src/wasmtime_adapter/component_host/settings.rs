@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn list_shows_the_machine_settings_with_their_units_and_values() {
-        use crate::wasmtime_adapter::wasi::RandomBytesLimitSetting;
+        use crate::RandomBytesLimitSetting;
 
         let program = ordinary();
 
@@ -327,7 +327,7 @@ mod tests {
                     value: SettingValue::Count(1024),
                 },
                 SettingEntry {
-                    name: "wasi.max-random-bytes",
+                    name: "random.max-bytes",
                     description: RandomBytesLimitSetting::DESCRIPTION,
                     value: SettingValue::Bytes(RandomBytesLimitSetting::DEFAULT),
                 },
@@ -338,7 +338,7 @@ mod tests {
         assert_eq!(views[0].name, "process.descriptor-limit");
         assert_eq!(views[0].description, DescriptorLimitSetting::DESCRIPTION);
         assert!(matches!(views[0].value, ValueView::Count(1024)));
-        assert_eq!(views[1].name, "wasi.max-random-bytes");
+        assert_eq!(views[1].name, "random.max-bytes");
         assert_eq!(views[1].description, RandomBytesLimitSetting::DESCRIPTION);
         assert!(matches!(
             views[1].value,
@@ -348,6 +348,7 @@ mod tests {
 
     #[test]
     fn lowering_the_random_bytes_limit_setting_refuses_larger_random_calls() {
+        use crate::RandomBytesLimitSetting;
         use crate::wasmtime_adapter::wasi::WasiAdapterTrap;
         use crate::wasmtime_adapter::wasi::bindings::random::{insecure, random};
 
@@ -366,10 +367,8 @@ mod tests {
         );
 
         assert_eq!(
-            write(&program, "wasi.max-random-bytes", SettingValue::Bytes(16)),
-            Ok(SettingValue::Bytes(
-                crate::wasmtime_adapter::wasi::RandomBytesLimitSetting::DEFAULT
-            ))
+            write(&program, "random.max-bytes", SettingValue::Bytes(16)),
+            Ok(SettingValue::Bytes(RandomBytesLimitSetting::DEFAULT))
         );
 
         assert_eq!(

@@ -328,12 +328,12 @@ macro_rules! settings {
 #[cfg(feature = "unix")]
 settings! {
     descriptor_limit: crate::DescriptorLimitSetting,
-    random_bytes_limit: crate::wasmtime_adapter::wasi::RandomBytesLimitSetting,
+    random_bytes_limit: crate::RandomBytesLimitSetting,
 }
 
 #[cfg(not(feature = "unix"))]
 settings! {
-    random_bytes_limit: crate::wasmtime_adapter::wasi::RandomBytesLimitSetting,
+    random_bytes_limit: crate::RandomBytesLimitSetting,
 }
 
 #[cfg(test)]
@@ -416,7 +416,7 @@ mod tests {
     #[cfg(feature = "unix")]
     #[test]
     fn the_machine_lists_its_declared_settings() {
-        use crate::wasmtime_adapter::wasi::RandomBytesLimitSetting;
+        use crate::RandomBytesLimitSetting;
 
         let settings = Settings::default();
 
@@ -430,7 +430,7 @@ mod tests {
                     value: SettingValue::Count(1024),
                 },
                 SettingEntry {
-                    name: "wasi.max-random-bytes",
+                    name: "random.max-bytes",
                     description: RandomBytesLimitSetting::DESCRIPTION,
                     value: SettingValue::Bytes(RandomBytesLimitSetting::DEFAULT),
                 },

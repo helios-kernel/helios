@@ -1,31 +1,5 @@
 use super::*;
-use crate::ComponentHostNetwork;
-use crate::settings::{Setting, SettingUnit};
-
-/// Default byte ceiling on a single `wasi:random` byte-list call: 64 MiB,
-/// matching Wasmtime's `WasiCtxBuilder::max_random_size` default.
-const DEFAULT_MAX_RANDOM_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Machine-wide limit on the byte list returned by
-/// `wasi:random/random.get-random-bytes` and
-/// `wasi:random/insecure.get-insecure-random-bytes`.
-pub(crate) struct RandomBytesLimitSetting;
-
-impl Setting for RandomBytesLimitSetting {
-    const NAME: &'static str = "wasi.max-random-bytes";
-    const DESCRIPTION: &'static str = "Largest byte list a wasi:random byte-list call may return.";
-    const UNIT: SettingUnit = SettingUnit::Bytes;
-    type Value = u64;
-    const DEFAULT: u64 = DEFAULT_MAX_RANDOM_BYTES;
-
-    fn to_raw(value: u64) -> u64 {
-        value
-    }
-
-    fn from_raw(raw: u64) -> u64 {
-        raw
-    }
-}
+use crate::{ComponentHostNetwork, RandomBytesLimitSetting};
 
 /// Builds the list a `wasi:random` call returns, `len` bytes long, and is the
 /// only place a guest-chosen random length becomes an allocation.
