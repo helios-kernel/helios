@@ -862,7 +862,7 @@ where
         &destination.payer,
     )
     .await
-    .map_err(&map_write_error)?;
+    .map_err(map_write_error)?;
     let mut next = crate::wasmtime_adapter::wasi::prepare_resolved_write(
         &resolved,
         WritePosition::At(0),
@@ -871,7 +871,7 @@ where
         &destination.payer,
     )
     .await
-    .map_err(&map_write_error)?;
+    .map_err(map_write_error)?;
     let mut written = 0usize;
     loop {
         let round_len = next.staged_len();
