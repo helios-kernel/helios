@@ -113,7 +113,7 @@ use helios_compiler_abi::{
     HELIOS_COMPILER_PTHREAD_SELF_OFFSET,
 };
 use helios_hal::fs::WritePosition;
-use helios_hal::measured_boot::{MeasuredBoot, Sha256Digest};
+use helios_hal::measured_boot::MeasuredBoot;
 use helios_hal::watchdog::Watchdog;
 use helios_unix::OpenFile;
 use helios_unix::{DescriptorLimit, GuestAddress};
@@ -187,7 +187,6 @@ struct CompilerPhaseTimestamps {
     response_done_ns: u64,
     tasks_joined_ns: u64,
     signed_ns: u64,
-    verified_ns: u64,
     plugin_cached: bool,
 }
 
@@ -799,7 +798,7 @@ where
     let (cwasm_signing_key, machine_identity_key) =
         crate::signing_key::settle_signing_key_at_bring_up(
             measured_boot.as_mut(),
-            &Sha256Digest(debug_state.payload_digest()),
+            debug_state.payload_body(),
             debug_state.root_entropy(),
         );
     debug_state.install_machine_identity_key(machine_identity_key);
@@ -2285,17 +2284,8 @@ where
                 let _profile = artifact_profile::classify_raw_wasm(wasm)
                     .map_err(map_artifact_profile_error)?;
                 let hint = hint.unwrap_or(AotCompileHint::Performance);
-                let compiled = self
-                    .compile_raw_component_to_signed_artifact(
-                        compile,
-                        exec_context,
-                        wasm,
-                        hint,
-                        false,
-                    )
-                    .await?;
-                let signed = Bytes::from(compiled.signed);
-                trusted_signed_payload(&signed, &self.inner.cwasm_signing_key)?
+                self.compile_raw_component_payload(compile, exec_context, wasm, hint)
+                    .await?
             }
         };
         timeline.record(&self.inner.clock_cpu, LaunchPhase::ArtifactTrust);
@@ -2509,12 +2499,62 @@ where
 
     async fn compile_raw_component_to_signed_artifact(
         &self,
-        _: &CompileAuthority,
+        compile: &CompileAuthority,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
     ) -> Result<AotArtifact, ProgramExecError> {
+        self.compile_raw_component(
+            compile,
+            exec_context,
+            wasm,
+            hint,
+            profile,
+            move |service, exec_context, end| service.sign_compiled(exec_context, profile, end),
+        )
+        .await
+    }
+
+    /// Compiles raw wasm directly to the bare Wasmtime payload for immediate
+    /// execution in this kernel, without signing and then verifying its own
+    /// output in one call.
+    async fn compile_raw_component_payload(
+        &self,
+        compile: &CompileAuthority,
+        exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        wasm: &Bytes,
+        hint: AotCompileHint,
+    ) -> Result<Bytes, ProgramExecError> {
+        self.compile_raw_component(
+            compile,
+            exec_context,
+            wasm,
+            hint,
+            false,
+            |_service, _exec_context, end| {
+                let (payload, _thread_reports) = end.result?;
+                Ok(Bytes::from(payload))
+            },
+        )
+        .await
+    }
+
+    async fn compile_raw_component<T: Send + 'static>(
+        &self,
+        _: &CompileAuthority,
+        exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        wasm: &Bytes,
+        hint: AotCompileHint,
+        profile: bool,
+        finish: impl FnOnce(
+            &Self,
+            &ProgramExecContext<CpuImpl, Net, StorageImpl>,
+            CompileEnd,
+        ) -> Result<T, ProgramExecError>
+        + Send
+        + 'static,
+    ) -> Result<T, ProgramExecError> {
         let phases = CompilerPhaseTimestamps {
             processor: if profile {
                 helios_hal::cpu::current_processor().id()
@@ -2545,7 +2585,7 @@ where
             let exec_context = exec_context.clone();
             async move {
                 service
-                    .compile_session(&exec_context, job, phases, reply)
+                    .compile_session(&exec_context, job, phases, reply, finish)
                     .await;
             }
         });
@@ -2560,15 +2600,19 @@ where
 
     /// The compile session task: waits for the session slot, runs the compile
     /// with core affinity until every worker is joined, condemns the compile
-    /// if its requester leaves, and replies with the signed artifact.
-    async fn compile_session(
+    /// if its requester leaves, and replies with `finish`'s output.
+    async fn compile_session<T>(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         job: CompileJob,
         phases: CompilerPhaseTimestamps,
-        reply: futures::channel::oneshot::Sender<Result<AotArtifact, ProgramExecError>>,
+        reply: futures::channel::oneshot::Sender<Result<T, ProgramExecError>>,
+        finish: impl FnOnce(
+            &Self,
+            &ProgramExecContext<CpuImpl, Net, StorageImpl>,
+            CompileEnd,
+        ) -> Result<T, ProgramExecError>,
     ) {
-        let profile = job.profile;
         run_shared_memory_session(
             &self.inner.compile_slot,
             reply,
@@ -2602,13 +2646,14 @@ where
                     self.run_compile(exec_context, job, instance, phases),
                 )
             },
-            |end| self.sign_compiled(exec_context, profile, end),
+            |end| finish(self, exec_context, end),
         )
         .await;
     }
 
     /// Signs what a finished compile produced with this boot's key and
-    /// reports its phases.
+    /// reports its phases. The kernel produced both the payload and its
+    /// signature here, so it does not verify its own output.
     fn sign_compiled(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
@@ -2624,13 +2669,6 @@ where
         let signed = cwasm::sign_artifact_payload(&payload, &self.inner.cwasm_signing_key)
             .map_err(map_artifact_trust_error)?;
         phases.signed_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
-        } else {
-            0
-        };
-        cwasm::verify_signed_artifact(UntrustedCwasm::new(&signed), &self.inner.cwasm_signing_key)
-            .map_err(map_artifact_trust_error)?;
-        phases.verified_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
         } else {
             0
@@ -3143,7 +3181,7 @@ fn emit_compiler_phase_report(
     output_bytes: usize,
 ) {
     write_serial.emit_fmt(format_args!(
-        "aot-phases processor={} plugin_cached={} slot_us={} plugin_us={} instantiate_us={} input_us={} compile_us={} diagnostic_us={} output_copy_us={} join_us={} sign_us={} verify_us={} output_bytes={}\n",
+        "aot-phases processor={} plugin_cached={} slot_us={} plugin_us={} instantiate_us={} input_us={} compile_us={} diagnostic_us={} output_copy_us={} join_us={} sign_us={} output_bytes={}\n",
         phases.processor,
         phases.plugin_cached,
         phase_us(phases.entered_ns, phases.slot_acquired_ns),
@@ -3155,7 +3193,6 @@ fn emit_compiler_phase_report(
         phase_us(phases.diagnostic_done_ns, phases.response_done_ns),
         phase_us(phases.response_done_ns, phases.tasks_joined_ns),
         phase_us(phases.tasks_joined_ns, phases.signed_ns),
-        phase_us(phases.signed_ns, phases.verified_ns),
         output_bytes,
     ));
     for report in thread_reports {

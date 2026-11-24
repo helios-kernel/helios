@@ -32,15 +32,18 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::fmt;
 
+use arrayvec::ArrayVec;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use helios_artifact::bootfs::Fingerprint;
 use helios_artifact::{ParsedArtifact, TrailerError, sign_payload_with_key, verify_signed_payload};
 use helios_hal::measured_boot::{
-    MeasuredBoot, MeasuredBootError, MeasurementRegister, MeasurementSet, SealedSecret,
-    Sha256Digest, UnsealRefused,
+    MAX_MEASUREMENT_BANKS, MeasuredBoot, MeasuredBootError, MeasurementAlgorithm,
+    MeasurementDigest, MeasurementRegister, MeasurementSet, SealedSecret, UnsealRefused,
 };
 use hkdf::Hkdf;
-use sha2::Sha256;
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha384, Sha512};
+use sha3::{Sha3_256, Sha3_384, Sha3_512};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -317,16 +320,36 @@ pub struct SettledSigningKey {
     pub bound_to: MeasurementSet,
 }
 
+/// Hashes `payload` with `algorithm` for a PCR bank extend.
+fn digest_for_bank(algorithm: MeasurementAlgorithm, payload: &[u8]) -> MeasurementDigest {
+    match algorithm {
+        MeasurementAlgorithm::Sha1 => MeasurementDigest::Sha1(Sha1::digest(payload).into()),
+        MeasurementAlgorithm::Sha256 => MeasurementDigest::Sha256(Sha256::digest(payload).into()),
+        MeasurementAlgorithm::Sha384 => MeasurementDigest::Sha384(Sha384::digest(payload).into()),
+        MeasurementAlgorithm::Sha512 => MeasurementDigest::Sha512(Sha512::digest(payload).into()),
+        MeasurementAlgorithm::Sha3_256 => {
+            MeasurementDigest::Sha3_256(Sha3_256::digest(payload).into())
+        }
+        MeasurementAlgorithm::Sha3_384 => {
+            MeasurementDigest::Sha3_384(Sha3_384::digest(payload).into())
+        }
+        MeasurementAlgorithm::Sha3_512 => {
+            MeasurementDigest::Sha3_512(Sha3_512::digest(payload).into())
+        }
+    }
+}
+
 /// Settles this boot's compiler-signing and machine-identity keys.
 ///
-/// With a device, `payload_digest` is extended into [`PAYLOAD_REGISTER`]
-/// first, and only then is the slot bound to the kernel image registers
-/// and that register read; a seed it does not release is replaced by a
-/// fresh one from `entropy`, sealed to the same registers. Without one,
-/// the seed is drawn from `entropy` for this boot alone.
+/// With a device, `payload` is hashed for every active bank that keeps
+/// [`PAYLOAD_REGISTER`] and extended into it in one operation; only then is
+/// the slot bound to the kernel image registers and that register read. A seed
+/// it does not release is replaced by a fresh one from `entropy`, sealed to
+/// the same registers. Without one, the seed is drawn from `entropy` for this
+/// boot alone.
 pub async fn settle_signing_key<Device: MeasuredBoot>(
     measured_boot: Option<&mut Device>,
-    payload_digest: &Sha256Digest,
+    payload: &[u8],
     entropy: &RootEntropy,
 ) -> Result<SettledSigningKey, SigningKeyError> {
     let Some(device) = measured_boot else {
@@ -339,8 +362,15 @@ pub async fn settle_signing_key<Device: MeasuredBoot>(
         });
     };
 
+    let mut digests = ArrayVec::<MeasurementDigest, MAX_MEASUREMENT_BANKS>::new();
+    for bank in device.banks() {
+        if bank.registers.contains(PAYLOAD_REGISTER) {
+            digests.push(digest_for_bank(bank.algorithm, payload));
+        }
+    }
+
     device
-        .extend(PAYLOAD_REGISTER, payload_digest)
+        .extend(PAYLOAD_REGISTER, &digests)
         .await
         .map_err(|source| SigningKeyError::Measure {
             register: PAYLOAD_REGISTER,
@@ -390,15 +420,14 @@ pub async fn settle_signing_key<Device: MeasuredBoot>(
 /// contract makes every operation wait on nothing but the device.
 pub(crate) fn settle_signing_key_at_bring_up<Device: MeasuredBoot>(
     measured_boot: Option<&mut Device>,
-    payload_digest: &Sha256Digest,
+    payload: &[u8],
     entropy: &RootEntropy,
 ) -> (CwasmSigningKey, MachineIdentityKey) {
-    let settled = complete_device_future_at_bring_up(settle_signing_key(
-        measured_boot,
-        payload_digest,
-        entropy,
-    ))
-    .unwrap_or_else(|error| panic!("the compiler-signing key could not be settled: {error}"));
+    let settled =
+        complete_device_future_at_bring_up(settle_signing_key(measured_boot, payload, entropy))
+            .unwrap_or_else(|error| {
+                panic!("the compiler-signing key could not be settled: {error}")
+            });
     if settled.source == SeedSource::Provisioned(ProvisionCause::ForeignSlot) {
         tracing::warn!(
             "the sealed slot was not defined by this kernel; someone with the device's owner \
@@ -431,7 +460,7 @@ mod tests {
     use core::pin::pin;
     use core::task::{Context, Poll, Waker};
 
-    use helios_hal::measured_boot::NoMeasuredBoot;
+    use helios_hal::measured_boot::{MeasurementBank, NoMeasuredBoot};
     use helios_hal::measured_boot_model::{MeasuredBootModel, Operation, OperationKind};
 
     use super::*;
@@ -466,23 +495,33 @@ mod tests {
         .expect("a processor source seeds the root")
     }
 
-    fn payload(byte: u8) -> Sha256Digest {
-        Sha256Digest([byte; 32])
+    fn payload(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    fn extend_all(device: &mut MeasuredBootModel, register: MeasurementRegister, bytes: &[u8]) {
+        let mut digests = ArrayVec::<MeasurementDigest, MAX_MEASUREMENT_BANKS>::new();
+        for bank in device.banks() {
+            if bank.registers.contains(register) {
+                digests.push(digest_for_bank(bank.algorithm, bytes));
+            }
+        }
+        complete(device.extend(register, &digests)).unwrap();
     }
 
     /// One boot: the pre-kernel chain measures the loader and the
-    /// kernel, then the kernel settles its key for `payload_digest`.
+    /// kernel, then the kernel settles its key for `payload`.
     fn boot(
         device: &mut MeasuredBootModel,
         boot_number: u8,
-        payload_digest: &Sha256Digest,
+        payload: &[u8],
     ) -> Result<SettledSigningKey, SigningKeyError> {
         device.power_cycle();
-        complete(device.extend(PCR4, &Sha256Digest([0x04; 32]))).unwrap();
-        complete(device.extend(PAYLOAD_REGISTER, &Sha256Digest([0x4b; 32]))).unwrap();
+        extend_all(device, PCR4, b"loader");
+        extend_all(device, PAYLOAD_REGISTER, b"kernel");
         complete(settle_signing_key(
             Some(device),
-            payload_digest,
+            payload,
             &entropy(boot_number),
         ))
     }
@@ -560,31 +599,73 @@ mod tests {
     #[test]
     fn the_payload_is_measured_before_the_slot_is_read() {
         let mut device = MeasuredBootModel::new(KERNEL_IMAGE);
-        boot(&mut device, 1, &payload(0x01)).unwrap();
+        let body = payload(0x01);
+        let expected = alloc::vec![digest_for_bank(MeasurementAlgorithm::Sha256, &body)];
+        boot(&mut device, 1, &body).unwrap();
         let kernel_ops = &device.journal()[2..];
         assert_eq!(
             kernel_ops,
             [
                 Operation::Extend {
                     register: PAYLOAD_REGISTER,
-                    digest: payload(0x01),
+                    digests: expected.clone(),
                 },
                 Operation::LoadSealed { bound_to: BOUND },
                 Operation::StoreSealed { bound_to: BOUND },
             ]
         );
 
-        boot(&mut device, 2, &payload(0x01)).unwrap();
+        boot(&mut device, 2, &body).unwrap();
         assert_eq!(
             &device.journal()[2..],
             [
                 Operation::Extend {
                     register: PAYLOAD_REGISTER,
-                    digest: payload(0x01),
+                    digests: expected,
                 },
                 Operation::LoadSealed { bound_to: BOUND },
             ]
         );
+    }
+
+    #[test]
+    fn settling_extends_every_active_bank_with_its_own_payload_digest() {
+        let all = MeasurementSet::from_bits(u32::MAX);
+        let banks = [
+            MeasurementBank {
+                algorithm: MeasurementAlgorithm::Sha1,
+                registers: all,
+            },
+            MeasurementBank {
+                algorithm: MeasurementAlgorithm::Sha256,
+                registers: all,
+            },
+            MeasurementBank {
+                algorithm: MeasurementAlgorithm::Sha384,
+                registers: all,
+            },
+            MeasurementBank {
+                algorithm: MeasurementAlgorithm::Sha512,
+                registers: all,
+            },
+        ];
+        let mut device = MeasuredBootModel::with_banks(KERNEL_IMAGE, &banks);
+        let body = b"helios-bootfs-body";
+        boot(&mut device, 1, body).unwrap();
+        for bank in banks {
+            let history = device
+                .register_history(bank.algorithm, PAYLOAD_REGISTER)
+                .expect("every active bank keeps PCR 9");
+            assert_eq!(
+                history,
+                &[
+                    digest_for_bank(bank.algorithm, b"kernel"),
+                    digest_for_bank(bank.algorithm, body),
+                ],
+                "bank {} must receive the kernel and payload digests in order",
+                bank.algorithm
+            );
+        }
     }
 
     #[test]

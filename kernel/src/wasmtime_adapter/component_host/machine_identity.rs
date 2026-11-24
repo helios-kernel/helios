@@ -85,18 +85,13 @@ mod tests {
         MAX_MACHINE_IDENTITY_CHALLENGE_BYTES, MachineAuthorityRights, MachineIdentityKey,
         NoMeasuredBoot, ProcessAuthority, settle_signing_key,
     };
-    use helios_hal::measured_boot::Sha256Digest;
 
     fn settled_identity_key() -> MachineIdentityKey {
         let entropy = test_root_entropy();
         let mut tpm: Option<NoMeasuredBoot> = None;
-        block_on(settle_signing_key(
-            tpm.as_mut(),
-            &Sha256Digest([0x42; 32]),
-            &entropy,
-        ))
-        .expect("ephemeral bring-up key settlement succeeds")
-        .machine_identity
+        block_on(settle_signing_key(tpm.as_mut(), &[0x42; 32], &entropy))
+            .expect("ephemeral bring-up key settlement succeeds")
+            .machine_identity
     }
 
     #[test]
