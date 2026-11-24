@@ -2181,7 +2181,7 @@ enum VmSessionCommand {
     Stats,
     /// List the live program instances, and optionally stop one.
     Instances(crate::InstancesCommand),
-    Repl,
+    Repl(crate::ReplCommand),
     AotBench(AotBenchCommand),
     WorkloadBench(WorkloadBenchCommand),
     /// Move the guest's memory balloon and watch the guest follow.
@@ -7374,7 +7374,7 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Instances(command) => {
                 Self::Session(SessionCommand::Instances(command))
             }
-            VmSessionCommand::Repl => Self::Session(SessionCommand::Repl),
+            VmSessionCommand::Repl(command) => Self::Session(SessionCommand::Repl(command)),
             VmSessionCommand::AotBench(command) => Self::AotBench(command),
             VmSessionCommand::WorkloadBench(command) => Self::WorkloadBench(command),
             VmSessionCommand::Balloon(command) => Self::Balloon(command),
@@ -10125,8 +10125,23 @@ mod tests {
     #[test]
     #[ignore = "requires qemu and a cross-compiled aarch64 kernel"]
     fn cfi_self_test_panics_aarch64() -> Result<(), GuestTestFailure> {
+        assert_cfi_self_test_panics(&[("HELIOS_CFI_SELF_TEST", "1")])
+    }
+
+    /// The aarch64 kernel built with `HELIOS_BTI_SELF_TEST` performs an
+    /// indirect call to a non-landing-pad instruction on a guarded kernel text
+    /// page once every processor has started, so a machine enforcing BTI
+    /// panics with a control-flow violation before the debugger reports that
+    /// it runs.
+    #[test]
+    #[ignore = "requires qemu and a cross-compiled aarch64 kernel"]
+    fn bti_self_test_panics_aarch64() -> Result<(), GuestTestFailure> {
+        assert_cfi_self_test_panics(&[("HELIOS_BTI_SELF_TEST", "1")])
+    }
+
+    fn assert_cfi_self_test_panics(envs: &[(&str, &str)]) -> Result<(), GuestTestFailure> {
         let command = guest_test_command(&AARCH64_VIRT_TCG_PROFILE);
-        build_self_test_kernel(&command, &[("HELIOS_CFI_SELF_TEST", "1")])?;
+        build_self_test_kernel(&command, envs)?;
         let mut runtime = VmRuntime::spawn(&command)?;
         let socket = runtime
             .socket_path()

@@ -417,6 +417,7 @@ def test_wasm_jobs_drop_host_rust_cache_and_subset_programs_safely(ci_jobs, tmp_
         "debugger",
         "gpu-test",
         "init",
+        "nu",
         "pride-flag",
     ]
     assert venus_sel["wasi_artifacts"] == "true"
@@ -630,3 +631,22 @@ def test_prebuilt_wasm_action_downloads_via_rest_and_retries_transient_lag(tmp_p
     assert res_fail.returncode != 0
     assert "::error::" in res_fail.stdout
     assert "concluded 'failure'" in res_fail.stdout
+
+
+def test_btrfs_fuzz_installs_toolchain_before_running_fuzz():
+    workflow = yaml.load(
+        (REPO_ROOT / ".github/workflows/ci.yml").read_text(),
+        Loader=yaml.BaseLoader,
+    )
+    steps = workflow["jobs"]["test-btrfs-fuzz"]["steps"]
+    install_idx = next(
+        (i for i, step in enumerate(steps) if "rustup toolchain install" in step.get("run", "")),
+        None,
+    )
+    fuzz_idx = next(
+        (i for i, step in enumerate(steps) if "tools/btrfs/run.py fuzz" in step.get("run", "")),
+        None,
+    )
+    assert install_idx is not None, "test-btrfs-fuzz must install the pinned Rust toolchain"
+    assert fuzz_idx is not None
+    assert install_idx < fuzz_idx

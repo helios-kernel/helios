@@ -30,7 +30,9 @@ enum Report {
     /// The backend enabled signing on every processor.
     Enabled {
         signing: ReturnAddressSigning,
+        branch_targets_identified: bool,
         runtime_code_signed: bool,
+        runtime_code_bti: bool,
     },
     /// The backend enabled nothing, and the runtime code carries signing
     /// instructions that therefore do nothing.
@@ -62,7 +64,9 @@ impl ReturnAddressCoverage {
         match self.backend.return_addresses {
             Some(signing) => Report::Enabled {
                 signing,
+                branch_targets_identified: self.backend.branch_targets_identified,
                 runtime_code_signed: self.runtime_code.return_addresses_signed,
+                runtime_code_bti: self.runtime_code.branch_targets_identified,
             },
             None if self.runtime_code.return_addresses_signed => {
                 Report::NotEnabledRuntimeCodeSigned
@@ -76,19 +80,35 @@ impl ReturnAddressCoverage {
         match self.report() {
             Report::Enabled {
                 signing,
+                branch_targets_identified,
                 runtime_code_signed,
+                runtime_code_bti,
             } => tracing::info!(
                 processors,
                 key = "IA, one per boot",
                 fpac = signing.faults_at_authentication,
-                kernel_text = "non-leaf functions sign their return addresses",
-                runtime_code = if runtime_code_signed {
-                    "every loaded artifact signs its return addresses (zero modifier)"
+                bti = branch_targets_identified,
+                kernel_text = if branch_targets_identified {
+                    "non-leaf functions sign their return addresses; executable pages guarded (GP, BT1)"
                 } else {
-                    "not signed"
+                    "non-leaf functions sign their return addresses"
                 },
-                not_covered = "exception frames, swap-fault resume frames, suspended fiber switch frames, hand-written assembly, bring-up before the enable, forward edges",
-                "return-address signing enabled on every processor"
+                runtime_code = match (runtime_code_signed, runtime_code_bti) {
+                    (true, true) => {
+                        "every loaded artifact signs its return addresses (zero modifier) and carries BTI landing pads"
+                    }
+                    (true, false) => {
+                        "every loaded artifact signs its return addresses (zero modifier)"
+                    }
+                    (false, true) => "carries BTI landing pads; return addresses not signed",
+                    (false, false) => "not signed",
+                },
+                not_covered = if branch_targets_identified {
+                    "exception frames, swap-fault resume frames, hand-written assembly, bring-up before the enable"
+                } else {
+                    "exception frames, swap-fault resume frames, hand-written assembly, bring-up before the enable, forward edges"
+                },
+                "control-flow integrity enabled on every processor"
             ),
             Report::NotEnabledRuntimeCodeSigned => tracing::info!(
                 runtime_code =
@@ -108,12 +128,14 @@ mod tests {
 
     const SIGNED: CwasmCodeProtection = CwasmCodeProtection {
         return_addresses_signed: true,
+        branch_targets_identified: true,
     };
     const SIGNING: ReturnAddressSigning = ReturnAddressSigning {
         faults_at_authentication: true,
     };
     const ENABLED: ControlFlowIntegrity = ControlFlowIntegrity {
         return_addresses: Some(SIGNING),
+        branch_targets_identified: true,
     };
 
     #[test]
@@ -122,7 +144,9 @@ mod tests {
             ReturnAddressCoverage::new(ENABLED, SIGNED).report(),
             Report::Enabled {
                 signing: SIGNING,
+                branch_targets_identified: true,
                 runtime_code_signed: true,
+                runtime_code_bti: true,
             }
         );
     }
@@ -133,7 +157,9 @@ mod tests {
             ReturnAddressCoverage::new(ENABLED, CwasmCodeProtection::NONE).report(),
             Report::Enabled {
                 signing: SIGNING,
+                branch_targets_identified: true,
                 runtime_code_signed: false,
+                runtime_code_bti: false,
             }
         );
     }

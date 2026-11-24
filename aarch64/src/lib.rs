@@ -20,7 +20,7 @@ use helios_hal::boot::{
 };
 use helios_hal::cpu::{
     ControlFlowIntegrity, Cpu, GUEST_STACK_LIMIT_OFFSET, HardwarePerfCounters, Instant,
-    ProcessorId, ReturnAddressSigning, Timebase, TimerInterrupt,
+    ProcessorId, Timebase, TimerInterrupt,
 };
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
@@ -60,6 +60,12 @@ const IRQ_FRAME_BYTES: usize = 0x320;
 /// FP/SIMD file is saved because a fault can be redirected into kernel
 /// code that clobbers it, and the guest it interrupted must not notice.
 const SYNC_FRAME_BYTES: usize = 0x320;
+/// `SPSR_EL1.BTYPE` (bits `[11:10]`, Arm ARM C5.2.19): the branch-type state
+/// recorded when an exception is taken before the target instruction executes.
+/// Clearing it on an `elr` redirect simulates a `ret` so the landing
+/// instruction is not required to be a BTI landing pad.
+const SPSR_BTYPE_MASK: u64 = 0b11 << 10;
+
 const PAGE_BYTES: usize = 4096;
 const MMIO_BLOCK_BYTES: usize = 2 * 1024 * 1024;
 const PAGE_TABLE_ENTRIES: usize = 512;
@@ -427,10 +433,9 @@ struct Aarch64PlatformState {
     /// platform describes one.
     psci: Option<lifecycle::Psci>,
     timebase: Timebase,
-    /// How a failed return-address authentication shows on every
-    /// processor, probed on the bootstrap processor before any other starts
-    /// and never written again (`cfi`).
-    return_address_signing: ReturnAddressSigning,
+    /// Control-flow integrity capabilities probed on the bootstrap processor
+    /// before any other starts and never written again (`cfi`).
+    control_flow_integrity: ControlFlowIntegrity,
     /// The key every processor installs, held only while the secondaries
     /// start (`cfi`).
     instruction_key: cfi::SharedInstructionKey,
@@ -491,7 +496,7 @@ impl Aarch64PlatformState {
             processors,
             psci: psci.map(lifecycle::Psci::new),
             timebase,
-            return_address_signing: cfi::bootstrap_capability(),
+            control_flow_integrity: cfi::bootstrap_capability(),
             instruction_key: cfi::SharedInstructionKey::new(),
             memory_tagging,
             debug_state: Once::new(),
@@ -920,7 +925,17 @@ extern "C" fn aarch64_kernel_main() -> ! {
     // `aarch64_kernel_main` is `-> !`.
     unsafe {
         cfi::install_bootstrap_key(&platform_state.instruction_key, &root_entropy);
-        cfi::enable_instruction_key_a();
+        cfi::enable_instruction_key_a(
+            platform_state
+                .control_flow_integrity
+                .branch_targets_identified,
+        );
+    }
+    if platform_state
+        .control_flow_integrity
+        .branch_targets_identified
+    {
+        vmm::guard_kernel_text(physical_memory_offset);
     }
     platform_state.user_isolation.enable_on_current_processor();
     #[cfg(feature = "native-users")]
@@ -1146,6 +1161,11 @@ extern "C" fn aarch64_kernel_main() -> ! {
     unsafe {
         cfi::self_test()
     };
+    #[cfg(helios_bti_self_test)]
+    // SAFETY: kernel text has `GP` set and `BT1` is enabled when `FEAT_BTI` is present.
+    unsafe {
+        cfi::bti_self_test()
+    };
     #[cfg(helios_mte_self_test)]
     tagging::self_test();
 
@@ -1357,12 +1377,11 @@ impl Cpu for Aarch64Cpu {
         true
     }
 
-    /// Every processor signs and authenticates its return addresses: a
-    /// processor without FEAT_PAuth does not boot (`cfi`).
+    /// Every processor signs and authenticates its return addresses (a
+    /// processor without FEAT_PAuth does not boot) and guards executable
+    /// pages with BTI wherever the hardware implements FEAT_BTI (`cfi`).
     fn control_flow_integrity(&self) -> ControlFlowIntegrity {
-        ControlFlowIntegrity {
-            return_addresses: Some(self.state.return_address_signing),
-        }
+        self.state.control_flow_integrity
     }
 
     fn memory_tagging(&self) -> MemoryTagging {
@@ -1538,6 +1557,9 @@ pub(crate) unsafe fn aarch64_zero_memory(ptr: *mut u8, size: usize) {
 #[unsafe(naked)]
 unsafe extern "C" fn aarch64_secondary_entry(mp_info: &MpInfo) -> ! {
     core::arch::naked_asm!(
+        // Limine enters secondaries through an indirect branch after the
+        // bootstrap processor has marked kernel text guarded (`GP=1`).
+        "hint #38",
         "mov x9, sp",
         "msr spsel, #1",
         "mov sp, x9",
@@ -1586,11 +1608,11 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     // `aarch64_secondary_main` is `-> !`.
     unsafe {
         cfi::install_secondary_key(
-            state.return_address_signing,
+            state.control_flow_integrity,
             &state.instruction_key,
             mp_info.mpidr,
         );
-        cfi::enable_instruction_key_a();
+        cfi::enable_instruction_key_a(state.control_flow_integrity.branch_targets_identified);
     }
     state.user_isolation.enable_on_current_processor();
     #[cfg(feature = "native-users")]
@@ -1728,6 +1750,11 @@ extern "C" fn aarch64_handle_sync_exception(
         // address of the check's branch.
         let frame = unsafe { &mut *frame };
         frame.elr = frame.x[30];
+        // The PXN check faulted on the target of `blr x0` before any
+        // instruction ran there, capturing BTYPE = 0b10 in SPSR_EL1.
+        // Returning to `x30` simulates a `ret`, which clears BTYPE so the
+        // instruction after `blr` need not be a BTI landing pad.
+        frame.spsr &= !SPSR_BTYPE_MASK;
         return;
     }
     let (cause, faulting_address) = match exception_class {
@@ -1844,6 +1871,10 @@ unsafe fn enter_swap_fault_trampoline(frame: *mut SyncTrapFrame, faulting_addres
         (*frame).x[0] = landing as u64;
         (*frame).x[1] = faulting_address as u64;
         (*frame).elr = swap_fault_trampoline as *const () as usize as u64;
+        // The interrupted frame copied to `landing` preserves the original
+        // BTYPE for `__helios_aarch64_swap_fault_resume`; clear it for the
+        // `eret` into the trampoline itself.
+        (*frame).spsr &= !SPSR_BTYPE_MASK;
         (*frame).sp = landing as u64;
     }
 }

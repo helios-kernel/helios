@@ -208,18 +208,11 @@ where
             self.tcp_close(stream);
             return Err(error);
         }
-        let progress =
-            self.inner
-                .state
-                .with_handle(stream, |state| match state.poll_tcp_connect(stream) {
-                    Ok(TcpConnectProgress::Connected) => TcpConnectPoll::Connected,
-                    // Keep a peer-side terminal failure (such as a fast RST
-                    // arriving during the initial drive) attached to the in-flight
-                    // stream so non-blocking `connect(2)` returns `EINPROGRESS` and
-                    // delivers the error on the subsequent poll / `SO_ERROR` check.
-                    Ok(TcpConnectProgress::Pending) | Err(_) => TcpConnectPoll::Pending,
-                });
-        Ok((stream, progress))
+        // Linux non-blocking TCP `connect(2)` always returns `EINPROGRESS`
+        // once the handshake has been initiated, deferring both loopback
+        // completion and peer-side refusals to the subsequent `poll` /
+        // `SO_ERROR` check (`tcp_connect_poll`).
+        Ok((stream, TcpConnectPoll::Pending))
     }
 
     /// Drives the stack and polls an in-flight non-blocking TCP connection.

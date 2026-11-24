@@ -170,10 +170,10 @@ exec 3<>"$fifo"
 "$inspector" vm --arch x86-64 "${profile[@]}" --memory 2G --accel "$accel" \
     --smp 2 --max-processors 4 \
     --runtime-dir "$runtime" --keep-runtime-dir \
-    --boot-program dash --boot-program debugger --boot-program cpu \
+    --boot-program nu --boot-program debugger --boot-program cpu \
     --no-compiler-plugin \
     "${vm_options[@]}" \
-    repl <&3 2>"$runtime/inspector.log" >"$out" &
+    repl --shell /bin/nu <&3 2>"$runtime/inspector.log" >"$out" &
 inspector_pid=$!
 
 wait_for "$boot_seconds" "the QMP socket" qmp_ready
