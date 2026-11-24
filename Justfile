@@ -13,7 +13,7 @@ default_profile := "debug"
 # tools `test-host-tools` tests besides the compiler host; each recipe and its
 # `warm-` twin read the one list.
 kernel_unit_packages := "-p helios-hal -p helios-virtio -p helios-netstack -p helios-artifact -p helios-kernel"
-host_tool_packages := "-p helios-inspector -p helios-artifact -p helios-profdata -p helios-cli -p helios-compiler-support"
+host_tool_packages := "-p helios-ops -p helios-inspector-shell -p helios-inspector -p helios-nu -p helios-artifact -p helios-profdata -p helios-cli -p helios-compiler-support"
 
 # The one bare-metal target whose rustflags carry `-Zbranch-protection`, which
 # rustc refuses to mix with a precompiled `core`, `alloc` or
@@ -348,7 +348,10 @@ check-host:
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     cargo check -p helios-kernel
     cargo check -p helios-hosted
+    cargo check -p helios-ops
+    cargo check -p helios-inspector-shell
     cargo check -p helios-inspector
+    cargo check -p helios-nu
     cargo check -p helios-wit-rpc
     cargo check -p helios-compositor-render -p helios-desktop-text-check
 

@@ -99,10 +99,21 @@ pub trait AsyncCommand<E: HeliosEnv>: Send + Sync {
     ) -> impl Future<Output = Result<AsyncPipelineData, ShellError>> + Send + 'a;
 }
 
-/// Registry mapping Nushell [`DeclId`]s to Helios [`AsyncBuiltin`] commands.
+/// Registration metadata for an environment-provided custom async command.
+#[derive(Debug, Clone)]
+pub struct CustomCommandSpec {
+    pub name: String,
+    pub signature: Signature,
+    pub description: String,
+    pub extra_description: String,
+    pub search_terms: Vec<String>,
+}
+
+/// Registry mapping Nushell [`DeclId`]s to Helios [`AsyncBuiltin`] or custom commands.
 #[derive(Debug, Default, Clone)]
 pub struct AsyncCommandRegistry {
     by_decl: HashMap<DeclId, AsyncBuiltin>,
+    custom_by_decl: HashMap<DeclId, String>,
 }
 
 impl AsyncCommandRegistry {
@@ -110,6 +121,7 @@ impl AsyncCommandRegistry {
     pub fn new() -> Self {
         Self {
             by_decl: HashMap::new(),
+            custom_by_decl: HashMap::new(),
         }
     }
 
@@ -136,10 +148,37 @@ impl AsyncCommandRegistry {
         decl_id
     }
 
+    /// Register an environment-provided custom command (e.g. host-only `fleet`
+    /// or `bundle`, or `--local` VFS overrides) in `working_set`.
+    pub fn register_custom(
+        &mut self,
+        working_set: &mut StateWorkingSet<'_>,
+        spec: CustomCommandSpec,
+    ) -> DeclId {
+        let name = spec.name.clone();
+        let descriptor = AsyncCommandDescriptor {
+            name: spec.name,
+            signature: spec.signature,
+            description: spec.description,
+            extra_description: spec.extra_description,
+            search_terms: spec.search_terms,
+        };
+        let decl_id = working_set.add_decl(Box::new(descriptor));
+        self.by_decl.remove(&decl_id);
+        self.custom_by_decl.insert(decl_id, name);
+        decl_id
+    }
+
     /// Look up the async implementation for `decl_id`, if registered.
     #[must_use]
     pub fn get(&self, decl_id: DeclId) -> Option<AsyncBuiltin> {
         self.by_decl.get(&decl_id).copied()
+    }
+
+    /// Look up a custom environment-provided command name for `decl_id`.
+    #[must_use]
+    pub fn get_custom(&self, decl_id: DeclId) -> Option<&str> {
+        self.custom_by_decl.get(&decl_id).map(String::as_str)
     }
 }
 

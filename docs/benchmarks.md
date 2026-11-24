@@ -643,9 +643,9 @@ that kind of measurement.
 A host that must not compile anything runs `helios-bench run --lane
 aarch64-hvf --prebuilt`. The kernel image and `helios-bootfs` come from CI's
 `helios-guest-aarch64` artifact, unpacked so they land at
-`target/aarch64-unknown-none/kernel-release/helios` and
+`target/aarch64-unknown-none/kernel-release/helios-kernel` and
 `target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs`;
-`target/release/helios-inspector`, `target/release/helios-cli` and
+`target/release/helios`, `target/release/helios-cli` and
 `artifacts/bench-native/aarch64/` are copied from the machine that built
 them. The run then builds nothing, and lists every file it reads that is
 missing before it boots a guest. It cannot be paired with a baseline, whose

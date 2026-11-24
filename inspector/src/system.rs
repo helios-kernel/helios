@@ -262,19 +262,6 @@ pub async fn run_tracing(
     stream_tracing(&mut client, &config).await
 }
 
-pub async fn stream_tracing_command(
-    client: &mut RpcClient,
-    command: &TracingCommand,
-) -> Result<(), SystemError> {
-    enable_tracing_targets(client, &command.enable_target).await?;
-    let config = tracing_config(
-        command.limit,
-        command.min_level.as_deref(),
-        command.target_prefix.clone(),
-    )?;
-    stream_tracing(client, &config).await
-}
-
 /// Turns each kernel diagnostic target in `targets` on for the rest of
 /// the boot. The guest refuses a name no kernel module registered, and
 /// that refusal is the error — a session that asked for a target it

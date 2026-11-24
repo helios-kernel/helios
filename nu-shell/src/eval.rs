@@ -262,6 +262,24 @@ pub fn eval_call_by_name_async<'a, E: HeliosEnv>(
             return Ok(Some(output));
         }
 
+        if let Some(custom_name) = rt.registry.get_custom(decl_id) {
+            let call = Call::build(decl_id, head).finish();
+            let engine_call = (&call).into();
+            let mut cmd_ctx = AsyncCommandContext {
+                engine_state,
+                stack,
+                call: &engine_call,
+                env: rt.env,
+                registry: rt.registry,
+                runtime_scope: rt.runtime_scope,
+            };
+            let output = rt
+                .env
+                .run_custom_command(custom_name, &mut cmd_ctx, input)
+                .await?;
+            return Ok(Some(output));
+        }
+
         let decl = engine_state.get_decl(decl_id);
         if let Some(block_id) = decl.block_id() {
             let block = engine_state.get_block(block_id);
@@ -1769,6 +1787,22 @@ async fn eval_call_frame_async<E: HeliosEnv>(
             runtime_scope: rt.runtime_scope,
         };
         return async_cmd.run_async(&mut cmd_ctx, input).await;
+    }
+
+    if let Some(custom_name) = rt.registry.get_custom(decl_id) {
+        let engine_call = (&call).into();
+        let mut cmd_ctx = AsyncCommandContext {
+            engine_state,
+            stack: caller_stack,
+            call: &engine_call,
+            env: rt.env,
+            registry: rt.registry,
+            runtime_scope: rt.runtime_scope,
+        };
+        return rt
+            .env
+            .run_custom_command(custom_name, &mut cmd_ctx, input)
+            .await;
     }
 
     // Pure in-memory synchronous Nushell command (`nu-command` / `nu-cmd-lang`).

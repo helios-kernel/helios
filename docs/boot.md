@@ -92,11 +92,11 @@ the whole installation:
 
 ```bash
 gh run download <run> -n helios-guest-aarch64 -D target
-./target/release/helios-inspector vm --arch aarch64 --release --no-build shell -c 'echo ok'
+./target/release/helios vm --arch aarch64 --release --no-build shell -c 'echo ok'
 HELIOS_WORKLOAD_BENCH_NO_BUILD=1 tools/wasi-apps/workload-bench.sh
 ```
 
-The archive holds `<triple>/kernel-release/helios` and
+The archive holds `<triple>/kernel-release/helios-kernel` and
 `kernel-prebuild/<triple>/kernel-release/helios-bootfs`; the x86-64 one
 uses `profile-use` for the directory, because its release kernel is
 built against the fetched profile, so that host runs

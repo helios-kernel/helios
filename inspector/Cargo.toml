@@ -3,6 +3,10 @@ name = "helios-inspector"
 version = "0.1.0"
 edition.workspace = true
 
+[[bin]]
+name = "helios"
+path = "src/main.rs"
+
 [dependencies]
 # Expands a sampled kernel address into the chain of functions inlined at
 # it, from the DWARF the kernel image carries on the host (#451).
@@ -32,6 +36,9 @@ futures-lite = "2.6.1"
 futures-util = { version = "0.3.31", default-features = false, features = ["io"] }
 gimli = { version = "0.33.0", default-features = false, features = ["read", "endian-reader", "std"] }
 helios-inspector-protocol.workspace = true
+helios-inspector-shell.workspace = true
+helios-nu.workspace = true
+helios-ops.workspace = true
 helios-hal.workspace = true
 helios-profdata.workspace = true
 helios-workspace-root.workspace = true
@@ -48,11 +55,12 @@ ratatui = "0.30.0"
 png = { version = "0.18.1", default-features = false }
 # Names the function each vCPU of a wedged guest was executing.
 rustc-demangle = "0.1.28"
-rustyline = "14.0.0"
 serialport = "4.9.0"
 shell-words = "1.1.0"
 thiserror = "2.0.20"
+tokio = { version = "1.53.1", default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.8.23"
+tracing.workspace = true
 time = { version = "0.3.47", default-features = false, features = ["formatting", "std"] }
 
 [dev-dependencies]

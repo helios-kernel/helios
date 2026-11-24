@@ -734,7 +734,7 @@ def workload_bench_script() -> Path:
 def inspector_bin() -> Path:
     return Path(
         os.environ.get(
-            "HELIOS_INSPECTOR_BIN", str(repo_root() / "target" / "release" / "helios-inspector")
+            "HELIOS_INSPECTOR_BIN", str(repo_root() / "target" / "release" / "helios")
         )
     )
 

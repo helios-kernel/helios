@@ -18,12 +18,12 @@ from elftools.elf.elffile import ELFFile
 # too and would otherwise be the release kernel's own artifact (#327);
 # the inspector names that directory (`NAMED_PROFILE_KERNELS`).
 KERNEL_PATTERNS = (
-    "target/*-unknown-none*/kernel-release/helios",
-    "target/*-unknown-none*/profile-use/helios",
-    "target/pgo-kernels/*/*-unknown-none*/profile-use/helios",
-    "target/perf-baselines/worktrees/*/target/*-unknown-none*/kernel-release/helios",
-    "target/perf-baselines/worktrees/*/target/*-unknown-none*/profile-use/helios",
-    "target/perf-baselines/worktrees/*/target/pgo-kernels/*/*-unknown-none*/profile-use/helios",
+    "target/*-unknown-none*/kernel-release/helios-kernel",
+    "target/*-unknown-none*/profile-use/helios-kernel",
+    "target/pgo-kernels/*/*-unknown-none*/profile-use/helios-kernel",
+    "target/perf-baselines/worktrees/*/target/*-unknown-none*/kernel-release/helios-kernel",
+    "target/perf-baselines/worktrees/*/target/*-unknown-none*/profile-use/helios-kernel",
+    "target/perf-baselines/worktrees/*/target/pgo-kernels/*/*-unknown-none*/profile-use/helios-kernel",
 )
 
 

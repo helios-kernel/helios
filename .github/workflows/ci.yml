@@ -781,7 +781,7 @@ jobs:
           set -o pipefail
           runtime="$GITHUB_WORKSPACE/smoke-runtime/boot"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+          ./target/release/helios vm --arch riscv64 --release --memory 2G \
             --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
@@ -803,7 +803,7 @@ jobs:
           mkdir -p "$runtime"
           "$check" tamper target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-bootfs \
             "$runtime/helios-bootfs"
-          if ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+          if ./target/release/helios vm --arch riscv64 --release --memory 2G \
             --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --bootfs "$runtime/helios-bootfs" \
@@ -829,7 +829,7 @@ jobs:
           # which does not mirror kernel logs to the serial.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/wall-clock"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+          ./target/release/helios vm --arch riscv64 --release --memory 2G \
             --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --boot-program date \
@@ -856,7 +856,7 @@ jobs:
           # resolves it through PATH. Issue #39 died here on riscv64.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/coreutils"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+          ./target/release/helios vm --arch riscv64 --release --memory 2G \
             --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
@@ -889,7 +889,7 @@ jobs:
           # riscv64 lane covers the stdlib import path that issue #39 broke.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/cpython"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+          ./target/release/helios vm --arch riscv64 --release --memory 2G \
             --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --boot-program python3 \
@@ -918,7 +918,7 @@ jobs:
           # the fault did not take the machine with it (#59).
           runtime="$GITHUB_WORKSPACE/smoke-runtime/oob-load"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+          ./target/release/helios vm --arch riscv64 --release --memory 2G \
             --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --boot-program oob-load \
@@ -939,7 +939,7 @@ jobs:
         env:
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
         run: |
-          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+          ./target/release/helios vm --arch riscv64 --release --memory 2G \
             --accel tcg \
             --rpc-transport vsock \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
@@ -962,7 +962,7 @@ jobs:
           set -o pipefail
           runtime="$GITHUB_WORKSPACE/smoke-runtime/numa"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+          ./target/release/helios vm --arch riscv64 --release --memory 2G \
             --accel tcg --smp 4 --numa-nodes 2 --numa-distance 20 \
             --rpc-transport vsock \
             --runtime-dir "$runtime" --keep-runtime-dir \
@@ -1001,9 +1001,9 @@ jobs:
         id: guest-image
         # A lane that failed before it built the inspector has nothing
         # to build an image with.
-        if: ${{ !cancelled() && hashFiles('helios/target/release/helios-inspector') != '' }}
+        if: ${{ !cancelled() && hashFiles('helios/target/release/helios') != '' }}
         working-directory: helios
-        run: ./target/release/helios-inspector vm --arch riscv64 --release build
+        run: ./target/release/helios vm --arch riscv64 --release build
       # The image a `--no-build` boot needs on another host, laid out as
       # the paths under `target/` the inspector reads: unpacked into
       # `target/`, it is the whole installation (docs/boot.md). The
@@ -1018,7 +1018,7 @@ jobs:
         with:
           name: helios-guest-riscv64
           path: |
-            helios/target/riscv64gc-unknown-none-elf/kernel-release/helios
+            helios/target/riscv64gc-unknown-none-elf/kernel-release/helios-kernel
             helios/target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-bootfs
           if-no-files-found: error
           retention-days: 90
@@ -1192,7 +1192,7 @@ jobs:
           set -o pipefail
           runtime="$GITHUB_WORKSPACE/smoke-runtime/device-tree"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+          ./target/release/helios vm --arch aarch64 --release --memory 2G \
             --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
@@ -1225,7 +1225,7 @@ jobs:
           set -o pipefail
           runtime="$GITHUB_WORKSPACE/smoke-runtime/numa"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+          ./target/release/helios vm --arch aarch64 --release --memory 2G \
             --accel tcg --smp 4 --numa-nodes 2 --numa-distance 20 \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
@@ -1249,7 +1249,7 @@ jobs:
           set -o pipefail
           runtime="$GITHUB_WORKSPACE/smoke-runtime/acpi-numa"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+          ./target/release/helios vm --arch aarch64 --release --memory 2G --acpi \
             --accel tcg --smp 4 --numa-nodes 2 --numa-distance 20 \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
@@ -1279,7 +1279,7 @@ jobs:
           set -o pipefail
           runtime="$GITHUB_WORKSPACE/smoke-runtime/acpi"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+          ./target/release/helios vm --arch aarch64 --release --memory 2G --acpi \
             --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
@@ -1330,7 +1330,7 @@ jobs:
           curl_port="$(cat "$runtime/curl-port")"
           # The single-quoted -c argument is the guest dash's command line; `$?` must reach dash unexpanded.
           # shellcheck disable=SC2016
-          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+          ./target/release/helios vm --arch aarch64 --release --memory 2G \
             --accel tcg --smp 4 --kernel-feature linux \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --bootfs-root "$runtime/bootfs" \
@@ -1399,7 +1399,7 @@ jobs:
           # the fault did not take the machine with it (#59).
           runtime="$GITHUB_WORKSPACE/smoke-runtime/oob-load"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+          ./target/release/helios vm --arch aarch64 --release --memory 2G \
             --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --boot-program oob-load \
@@ -1440,7 +1440,7 @@ jobs:
             runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/$1"
             shift
             mkdir -p "$runtime"
-            ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+            ./target/release/helios vm --arch aarch64 --release --memory 2G --acpi \
               --accel tcg --tpm swtpm --tpm-state "$state" \
               --runtime-dir "$runtime" --keep-runtime-dir "$@" \
               shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
@@ -1474,7 +1474,7 @@ jobs:
           mkdir -p "$runtime"
           "$check" tamper "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained" \
             "$runtime/helios-bootfs"
-          if ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+          if ./target/release/helios vm --arch aarch64 --release --memory 2G --acpi \
             --accel tcg --tpm swtpm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --bootfs "$runtime/helios-bootfs" \
@@ -1503,7 +1503,7 @@ jobs:
           check=tools/measured-boot-check.sh
           runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/acpi-changed"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+          ./target/release/helios vm --arch aarch64 --release --memory 2G --acpi \
             --accel tcg --tpm swtpm --tpm-state "$RUNNER_TEMP/tpm-state-aarch64-acpi" \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --boot-program date \
@@ -1538,7 +1538,7 @@ jobs:
           boot() {
             runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/$1"
             mkdir -p "$runtime"
-            ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            ./target/release/helios vm --arch aarch64 --release --memory 2G \
               --accel tcg --tpm swtpm --tpm-state "$state" \
               --runtime-dir "$runtime" --keep-runtime-dir \
               --boot-program dash --boot-program debugger --no-compiler-plugin \
@@ -1570,9 +1570,9 @@ jobs:
         id: guest-image
         # A lane that failed before it built the inspector has nothing
         # to build an image with.
-        if: ${{ !cancelled() && hashFiles('helios/target/release/helios-inspector') != '' }}
+        if: ${{ !cancelled() && hashFiles('helios/target/release/helios') != '' }}
         working-directory: helios
-        run: ./target/release/helios-inspector vm --arch aarch64 --release build
+        run: ./target/release/helios vm --arch aarch64 --release build
       # The image a `--no-build` boot needs on another host, laid out as
       # the paths under `target/` the inspector reads: unpacked into
       # `target/`, it is the whole installation (docs/boot.md). The
@@ -1589,7 +1589,7 @@ jobs:
         with:
           name: helios-guest-aarch64
           path: |
-            helios/target/aarch64-unknown-none/kernel-release/helios
+            helios/target/aarch64-unknown-none/kernel-release/helios-kernel
             helios/target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs
             helios/target/kernel-prebuild/aarch64-unknown-none/kernel-release/compiler_plugin.wasm
           if-no-files-found: error
@@ -1842,7 +1842,7 @@ jobs:
           # other than the scratch disk's is a mount source, and
           # `helios-data` stays the scratch disk beside them (#510).
           truncate -s 64M "$runtime/src-a.img" "$runtime/src-b.img"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --qemu-arg -device --qemu-arg virtio-keyboard-pci \
@@ -1880,7 +1880,7 @@ jobs:
           set -o pipefail
           runtime="$GITHUB_WORKSPACE/smoke-runtime/numa"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm --smp 4 --numa-nodes 2 --numa-distance 20 \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
@@ -1912,7 +1912,7 @@ jobs:
             runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/$1"
             shift
             mkdir -p "$runtime"
-            ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            ./target/release/helios vm --arch x86-64 --release --memory 2G \
               --accel kvm --tpm swtpm --tpm-state "$state" \
               --runtime-dir "$runtime" --keep-runtime-dir "$@" \
               shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
@@ -1942,7 +1942,7 @@ jobs:
           mkdir -p "$runtime"
           "$check" tamper "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained" \
             "$runtime/helios-bootfs"
-          if ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          if ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm --tpm swtpm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --bootfs "$runtime/helios-bootfs" \
@@ -1967,7 +1967,7 @@ jobs:
           check=tools/measured-boot-check.sh
           runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/changed"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm --tpm swtpm --tpm-state "$RUNNER_TEMP/tpm-state-x86-64" \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --boot-program date \
@@ -1994,7 +1994,7 @@ jobs:
           mkdir -p "$runtime"
           # The single-quoted -c argument is the guest dash's command line; $(date) must reach dash unexpanded, so the host shell must not expand it.
           # shellcheck disable=SC2016
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
@@ -2047,7 +2047,7 @@ jobs:
           curl_port="$(cat "$runtime/curl-port")"
           # The single-quoted -c argument is the guest dash's command line; `$?` must reach dash unexpanded.
           # shellcheck disable=SC2016
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm --smp 4 --kernel-feature linux \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --bootfs-root "$runtime/bootfs" \
@@ -2119,7 +2119,7 @@ jobs:
           # split from. docs/benchmarks.md lists the fields.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/cpython-phases"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --boot-program python3 \
@@ -2156,7 +2156,7 @@ jobs:
           # pool answers a plugin-sized request.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/compiler"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             shell --trace-log "$runtime/guest-tracing.log" -c 'echo compiler:ok' \
@@ -2181,7 +2181,7 @@ jobs:
           # the fault did not take the machine with it (#59).
           runtime="$GITHUB_WORKSPACE/smoke-runtime/oob-load"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --boot-program oob-load \
@@ -2205,7 +2205,7 @@ jobs:
           # four and starts the two that are present (#493).
           runtime="$GITHUB_WORKSPACE/smoke-runtime/maxcpus"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm --smp 2 --max-processors 4 \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
@@ -2248,7 +2248,7 @@ jobs:
           # refused too, so the writes must report success.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/unsigned-cwasm"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --boot-program python3 \
@@ -2281,7 +2281,7 @@ jobs:
           # and the lane's timeout names it.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/atomic-wait-timeout"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
@@ -2307,7 +2307,7 @@ jobs:
           # returns, which needs the parked fiber to have unwound.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/atomic-wait-kill"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
@@ -2336,7 +2336,7 @@ jobs:
           # the shell's echo after it proves its output closed.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/orphan-threads"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
@@ -2364,7 +2364,7 @@ jobs:
           # the shell's echo after it proves its output closed.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/thread-proc-exit"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
@@ -2396,7 +2396,7 @@ jobs:
           # output closed.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/thread-exec"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
@@ -2429,7 +2429,7 @@ jobs:
           # after it proves its output closed.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/thread-trap"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
@@ -2481,7 +2481,7 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/desktop"
           captures="$GITHUB_WORKSPACE/desktop-scanout"
           mkdir -p "$runtime" "$captures"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --desktop --display none --audiodev "wav:$runtime/desktop.wav" \
@@ -2552,7 +2552,7 @@ jobs:
           # path: virtio ring, kernel drain, bounded queue, p3 stream.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/desktop-input"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --desktop --display none \
@@ -2608,7 +2608,7 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/desktop-compositor"
           captures="$GITHUB_WORKSPACE/desktop-scanout"
           mkdir -p "$runtime" "$captures"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --desktop --display none \
@@ -2683,7 +2683,7 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/desktop-restart"
           captures="$GITHUB_WORKSPACE/desktop-scanout"
           mkdir -p "$runtime" "$captures"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --desktop --display none \
@@ -2760,7 +2760,7 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/desktop-audio"
           evidence="$GITHUB_WORKSPACE/desktop-scanout"
           mkdir -p "$runtime" "$evidence"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --audiodev "wav:$evidence/tone.wav" \
@@ -2840,9 +2840,9 @@ jobs:
         id: guest-image
         # A lane that failed before it built the inspector has nothing
         # to build an image with.
-        if: ${{ !cancelled() && hashFiles('helios/target/release/helios-inspector') != '' }}
+        if: ${{ !cancelled() && hashFiles('helios/target/release/helios') != '' }}
         working-directory: helios
-        run: ./target/release/helios-inspector vm --arch x86-64 --release build
+        run: ./target/release/helios vm --arch x86-64 --release build
       # The image a `--no-build` boot needs on another host, laid out as
       # the paths under `target/` the inspector reads: unpacked into
       # `target/`, it is the whole installation (docs/boot.md). The
@@ -2859,7 +2859,7 @@ jobs:
         with:
           name: helios-guest-x86-64
           path: |
-            helios/target/x86_64-unknown-none/profile-use/helios
+            helios/target/x86_64-unknown-none/profile-use/helios-kernel
             helios/target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs
             helios/target/kernel-prebuild/x86_64-unknown-none/profile-use/compiler_plugin.wasm
           if-no-files-found: error
@@ -2989,7 +2989,7 @@ jobs:
         shell: bash
         working-directory: helios
         run: |
-          tools/cpu-lifecycle/check.sh ./target/release/helios-inspector \
+          tools/cpu-lifecycle/check.sh ./target/release/helios \
             "$GITHUB_WORKSPACE/smoke-runtime/cpu-lifecycle"
       - name: Upload the inspector runtime directory
         if: failure()
@@ -3007,7 +3007,7 @@ jobs:
         shell: bash
         working-directory: helios
         run: |
-          tools/cpu-lifecycle/hotplug.sh ./target/release/helios-inspector \
+          tools/cpu-lifecycle/hotplug.sh ./target/release/helios \
             "$GITHUB_WORKSPACE/smoke-runtime/cpu-hotplug"
       - name: Upload the hotplug runtime directory
         if: failure()
@@ -3229,7 +3229,7 @@ jobs:
           # `--renderer` makes the desktop's GPU `virtio-gpu-gl` with
           # Venus and blobs and backs the guest's RAM with a shared memfd;
           # `egl-headless` is the GL context it renders through.
-          ./target/debug/helios-inspector vm --arch x86-64 --memory 2G \
+          ./target/debug/helios vm --arch x86-64 --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --renderer virtio-gpu-gl --renderer-hostmem 256M \
@@ -3266,7 +3266,7 @@ jobs:
           # backtrace step below.
           sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/core.%e.%p"
           ulimit -c unlimited
-          ./target/debug/helios-inspector vm --arch x86-64 --memory 2G \
+          ./target/debug/helios vm --arch x86-64 --memory 2G \
             --accel kvm --runtime-dir "$runtime" --keep-runtime-dir \
             --renderer virtio-gpu-gl --renderer-hostmem 256M \
             --display egl-headless \
@@ -3772,7 +3772,7 @@ jobs:
             --shard "${{ matrix.shard }}/${{ matrix.shards }}" \
             --results "$RESULTS/helios-${{ matrix.arch }}-${{ matrix.shard }}.jsonl" \
             --log "$runtime/inspector.log" \
-            -- ./target/release/helios-inspector vm --arch "$VM_ARCH" --release --memory 2G \
+            -- ./target/release/helios vm --arch "$VM_ARCH" --release --memory 2G \
               --accel "$ACCEL" --kernel-feature linux \
               --runtime-dir "$runtime" --keep-runtime-dir \
               --disk "$runtime/scratch.btrfs,serial=linux-suite-tmp" \
