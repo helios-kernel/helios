@@ -1201,8 +1201,9 @@ jobs:
           grep -Fqx ok boot-dt.out
           grep -F 'platform described by device-tree' "$runtime/inspector.log"
           # Every processor installed the machine's key and enabled
-          # return-address signing before the kernel ran anything else.
-          grep -F 'return-address signing enabled on every processor' "$runtime/inspector.log"
+          # return-address signing and BTI before the kernel ran anything else.
+          grep -F 'control-flow integrity enabled on every processor' "$runtime/inspector.log"
+          grep -F 'bti=true' "$runtime/inspector.log"
           # The `virt` board's PL061 GPIO controller is hardware the
           # kernel has no driver for, so discovery offers it to a
           # user-mode one. This asserts the whole path from the device
@@ -1287,7 +1288,8 @@ jobs:
           cat boot-acpi.out
           grep -Fqx ok boot-acpi.out
           grep -F 'platform described by acpi' "$runtime/inspector.log"
-          grep -F 'return-address signing enabled on every processor' "$runtime/inspector.log"
+          grep -F 'control-flow integrity enabled on every processor' "$runtime/inspector.log"
+          grep -F 'bti=true' "$runtime/inspector.log"
           # The ACPI walk looks for virtio transports by hardware id and
           # names nothing else, so an ACPI-described machine publishes
           # no grants. Asserting the absence keeps that a stated fact
