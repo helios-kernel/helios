@@ -208,21 +208,18 @@ where
             self.tcp_close(stream);
             return Err(error);
         }
-        let now = StackInstant::from_nanos(self.now_nanos());
-        match self
-            .inner
-            .state
-            .with_handle(stream, |state| match state.poll_tcp_connect(stream) {
-                Ok(TcpConnectProgress::Connected) => Ok(TcpConnectPoll::Connected),
-                Ok(TcpConnectProgress::Pending) => Ok(TcpConnectPoll::Pending),
-                Err(error) => {
-                    state.remove_tcp_stream(stream, now);
-                    Err(error)
-                }
-            }) {
-            Ok(progress) => Ok((stream, progress)),
-            Err(error) => Err(error),
-        }
+        let progress =
+            self.inner
+                .state
+                .with_handle(stream, |state| match state.poll_tcp_connect(stream) {
+                    Ok(TcpConnectProgress::Connected) => TcpConnectPoll::Connected,
+                    // Keep a peer-side terminal failure (such as a fast RST
+                    // arriving during the initial drive) attached to the in-flight
+                    // stream so non-blocking `connect(2)` returns `EINPROGRESS` and
+                    // delivers the error on the subsequent poll / `SO_ERROR` check.
+                    Ok(TcpConnectProgress::Pending) | Err(_) => TcpConnectPoll::Pending,
+                });
+        Ok((stream, progress))
     }
 
     /// Drives the stack and polls an in-flight non-blocking TCP connection.
