@@ -7,7 +7,7 @@
 // touches only that context until the MMU is on. The offsets are pinned
 // by assertions in `lifecycle.rs`.
 .section .text.cpu_resume, "ax"
-.arch armv8.3-a
+.arch armv8.5-a+memtag
 .global __helios_aarch64_cpu_resume
 .type __helios_aarch64_cpu_resume, %function
 __helios_aarch64_cpu_resume:
@@ -28,8 +28,14 @@ __helios_aarch64_cpu_resume:
 1:
     // Entered at EL2: configure it to run EL1 as AArch64 with the
     // generic timer, FP/SIMD and the identification registers visible,
-    // then drop to EL1 at the next instruction.
+    // then drop to EL1 at the next instruction. When memory tagging is
+    // active, also set HCR_EL2.ATA (bit 56) so EL1 tag accesses do not
+    // trap to EL2.
     mov x1, #(1 << 31)
+    ldr x2, [x0, #336]
+    cbz x2, 3f
+    orr x1, x1, #(1 << 56)
+3:
     msr hcr_el2, x1
     mrs x1, cnthctl_el2
     orr x1, x1, #3
@@ -58,6 +64,15 @@ __helios_aarch64_cpu_resume:
     msr apiakeylo_el1, x1
     ldr x1, [x0, #328]
     msr apiakeyhi_el1, x1
+    // Restore MTE tag-generation registers before enabling SCTLR.TCF and SCTLR.ATA.
+    ldr x1, [x0, #336]
+    cbz x1, 4f
+    ldr x1, [x0, #344]
+    msr gcr_el1, x1
+    ldr x1, [x0, #352]
+    msr rgsr_el1, x1
+    msr tco, #0
+4:
     isb
     msr spsel, #1
     // Install the translation regime. TTBR0 is the context's identity

@@ -5,6 +5,33 @@ use helios_hal::fs::FsError;
 use helios_hal::native::NativeUnavailable;
 use thiserror::Error;
 
+use crate::{Setting, SettingUnit};
+
+/// Default upper bound on a raw WebAssembly input handed to the in-kernel
+/// compiler (64 MiB), adjustable at runtime through [`CompilerMaxInputBytesSetting`].
+pub const DEFAULT_COMPILER_MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Machine-wide limit on the raw WebAssembly input accepted by the in-kernel
+/// compiler (`programs.aot` and raw-wasm `exec`/`spawn`).
+pub struct CompilerMaxInputBytesSetting;
+
+impl Setting for CompilerMaxInputBytesSetting {
+    const NAME: &'static str = "compiler.max-input-bytes";
+    const DESCRIPTION: &'static str =
+        "Largest raw WebAssembly input accepted by the in-kernel compiler.";
+    const UNIT: SettingUnit = SettingUnit::Bytes;
+    type Value = u64;
+    const DEFAULT: u64 = DEFAULT_COMPILER_MAX_INPUT_BYTES;
+
+    fn to_raw(value: u64) -> u64 {
+        value
+    }
+
+    fn from_raw(raw: u64) -> u64 {
+        raw
+    }
+}
+
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum ProgramExecErrorKind {
     #[error("the program artifact is invalid")]
@@ -239,6 +266,10 @@ pub enum ProgramExecErrorDetail {
     CompilerBuffersOutstanding,
     #[error("compiler plugin rejected the input")]
     CompilerRejectedInput,
+    #[error("compiler input of {bytes} bytes exceeds compiler.max-input-bytes ({limit})")]
+    CompilerInputTooLarge { bytes: u64, limit: u64 },
+    #[error("compiler buffer length overflows the 32-bit plugin ABI")]
+    CompilerAbiLengthOverflow,
     #[error("compiler plugin allocation failed")]
     CompilerAllocationFailed,
     #[error("compiler plugin thread pointer overflowed")]
@@ -373,6 +404,12 @@ impl ProgramExecErrorDetail {
                 "compiler plugin buffers were not all returned after a compile"
             }
             Self::CompilerRejectedInput => "compiler plugin rejected the input",
+            // The lengths are in the error's `Display`; `as_str` has no
+            // storage to format them into.
+            Self::CompilerInputTooLarge { .. } => "compiler input exceeds compiler.max-input-bytes",
+            Self::CompilerAbiLengthOverflow => {
+                "compiler buffer length overflows the 32-bit plugin ABI"
+            }
             Self::CompilerAllocationFailed => "compiler plugin allocation failed",
             Self::CompilerThreadPointerOverflow => "compiler plugin thread pointer overflowed",
             Self::CompileSessionEnded => "the compile session ended without a result",
@@ -436,6 +473,7 @@ impl ProgramExecError {
                 };
             }
             FsError::NoEntry => ProgramExecErrorKind::NotFound,
+            FsError::OutOfMemory => ProgramExecErrorKind::OutOfMemory,
             FsError::Io | FsError::NoSpace => ProgramExecErrorKind::Io,
             FsError::NotDirectory
             | FsError::IsDirectory

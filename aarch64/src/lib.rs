@@ -7,7 +7,7 @@ use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 
 use alloc::boxed::Box;
 use arm_gic::IntId;
@@ -26,6 +26,7 @@ use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::numa::NumaTopology;
 use helios_hal::serial::ByteSerial;
+use helios_hal::tagging::MemoryTagging;
 use helios_hal::{
     DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology, align_up,
 };
@@ -204,8 +205,15 @@ mod net;
 mod platform;
 mod rtc;
 mod snd;
+mod tagging;
 mod tpm;
 mod vsock;
+
+pub(crate) type Aarch64DmaPool = helios_virtio::OffsetDmaPool<tagging::Aarch64AllocationTags>;
+
+pub(crate) fn dma_pool() -> Aarch64DmaPool {
+    tagging::dma_pool()
+}
 
 mod debug_state {
     /// The network service this machine's virtio-net device backs.
@@ -355,6 +363,8 @@ struct ProcessorRuntime {
     device_interrupts: Once<DeviceInterruptRoutes>,
     /// The record of this processor's trap hand-over self-check.
     hand_over_probe: hand_over::HandOverProbe,
+    /// The record of this processor's MTE synchronous tag-check self-check.
+    tag_check_probe: tagging::TagCheckProbe,
     /// Selected at bring-up, so IRQ dispatch does not probe the exception level.
     timer_interrupt: IntId,
     /// The record of this processor's check that EL1 can neither fetch
@@ -379,6 +389,7 @@ impl ProcessorRuntime {
             program_service: Once::new(),
             device_interrupts: Once::new(),
             hand_over_probe: hand_over::HandOverProbe::new(),
+            tag_check_probe: tagging::TagCheckProbe::new(),
             timer_interrupt: gic::host_timer_interrupt(),
             #[cfg(feature = "native-users")]
             isolation_probe: native::IsolationProbe::new(),
@@ -411,6 +422,9 @@ struct Aarch64ProcessorSlot {
     runtime: ProcessorRuntime,
     /// Whether the processor is in service, and what it resumes from.
     power: lifecycle::ProcessorPower,
+    /// Random tag generator seed (`RGSR_EL1.SEED`) drawn on the bootstrap
+    /// processor from `RootEntropy` before this processor starts.
+    mte_seed: AtomicU16,
 }
 
 struct Aarch64PlatformState {
@@ -425,6 +439,9 @@ struct Aarch64PlatformState {
     /// The key every processor installs, held only while the secondaries
     /// start (`cfi`).
     instruction_key: cfi::SharedInstructionKey,
+    /// What memory tagging every processor checks, fixed on the bootstrap
+    /// processor before the `Cpu` reaches the kernel (`tagging`).
+    memory_tagging: MemoryTagging,
     debug_state: Once<debug_state::RuntimeState>,
     gic: Once<gic::Gic>,
     #[cfg(feature = "hv")]
@@ -457,6 +474,7 @@ impl Aarch64PlatformState {
         timebase: Timebase,
         pool: &UserMemoryPool,
         psci: Option<platform::PsciConduit>,
+        memory_tagging: MemoryTagging,
     ) -> &'static Self {
         assert_eq!(
             pool.locality().processor_count(),
@@ -471,6 +489,7 @@ impl Aarch64PlatformState {
                     .unwrap_or_else(|| panic!("Limine's MP response has no processor {index}")),
                 runtime: ProcessorRuntime::new(processor.id()),
                 power: lifecycle::ProcessorPower::new(),
+                mte_seed: AtomicU16::new(1),
             }
         });
         Box::leak(Box::new(Self {
@@ -479,6 +498,7 @@ impl Aarch64PlatformState {
             timebase,
             control_flow_integrity: cfi::bootstrap_capability(),
             instruction_key: cfi::SharedInstructionKey::new(),
+            memory_tagging,
             debug_state: Once::new(),
             gic: Once::new(),
             #[cfg(feature = "hv")]
@@ -766,7 +786,16 @@ extern "C" fn aarch64_kernel_main() -> ! {
         .describe(console)
         .unwrap_or_else(|error| panic!("AArch64 platform description failed: {error}"));
     vmm::install_user_address_space(physical_memory_offset);
-    let platform_state = Aarch64PlatformState::from_limine_mp(timebase(), pool, platform.psci);
+    // Enable memory tagging before `Aarch64PlatformState` / `Cpu` reach the
+    // kernel, before any virtio device allocates rings, and before
+    // `cfi::enable_instruction_key_a` sets `EnIA` (because `TBI1` changes the
+    // PAC bit field).
+    // SAFETY: called once on the bootstrap processor after
+    // `install_memory_attributes` and `install_user_address_space`, with
+    // `EnIA` still clear and no secondary started.
+    let memory_tagging = unsafe { tagging::init_bootstrap(physical_memory_offset, &handoff) };
+    let platform_state =
+        Aarch64PlatformState::from_limine_mp(timebase(), pool, platform.psci, memory_tagging);
     activate_processor_runtime(platform_state.bootstrap_runtime());
 
     let cpu = Aarch64Cpu {
@@ -872,6 +901,21 @@ extern "C" fn aarch64_kernel_main() -> ! {
         machine_generation,
     );
     debug_state.install_root_entropy(root_entropy.clone());
+    // Replace the bootstrap processor's early MTE tag-generator seed with
+    // cryptographic output from the root DRBG, and draw an independent seed
+    // for every secondary processor before any secondary starts.
+    if memory_tagging.checking.is_some() {
+        let mut seed_bytes = [0u8; 2];
+        root_entropy.fill(&mut seed_bytes);
+        tagging::seed_random_tag_generator(u16::from_le_bytes(seed_bytes));
+        for (processor, slot) in platform_state.processors.iter() {
+            if processor.id() != 0 {
+                root_entropy.fill(&mut seed_bytes);
+                slot.mte_seed
+                    .store(u16::from_le_bytes(seed_bytes), Ordering::Release);
+            }
+        }
+    }
     // Every function this processor ran up to here has returned, and the
     // one still live, this one, never does, so none holds a return address
     // that the enable would make unauthenticatable. The key is drawn here
@@ -1099,6 +1143,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     // here, so an arriving interrupt now finds a handler.
     unsafe { unmask_irq() };
     hand_over::verify_trap_hand_over(platform_state.bootstrap_mpidr());
+    tagging::verify_on_current_processor(platform_state.bootstrap_mpidr());
     #[cfg(feature = "native-users")]
     native::verify_user_isolation(platform_state.user_isolation);
 
@@ -1121,6 +1166,8 @@ extern "C" fn aarch64_kernel_main() -> ! {
     unsafe {
         cfi::bti_self_test()
     };
+    #[cfg(helios_mte_self_test)]
+    tagging::self_test();
 
     #[cfg(helios_hv_self_test)]
     kernel.spawn_local_detached(hv::self_test::run(cpu, kernel.processor_control()));
@@ -1337,6 +1384,10 @@ impl Cpu for Aarch64Cpu {
         self.state.control_flow_integrity
     }
 
+    fn memory_tagging(&self) -> MemoryTagging {
+        self.state.memory_tagging
+    }
+
     unsafe fn zero_memory(&self, ptr: NonNull<u8>, size: usize) {
         // SAFETY: caller has guaranteed the buffer is writable; the
         // helper uses `dc zva` for cache-line aligned blocks and
@@ -1536,6 +1587,17 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
          bootstrap processor; Helios requires every processor to offer the same features",
         mp_info.mpidr
     );
+    // Enable memory tagging before `cfi::enable_instruction_key_a` so `TBI1`
+    // is already set before any return address on this processor is signed.
+    // SAFETY: `prepare_current_processor` ran `install_memory_attributes` and
+    // `SCTLR_EL1.EnIA` is still clear on this processor.
+    unsafe {
+        tagging::enable_on_secondary(
+            state.memory_tagging,
+            slot.mte_seed.load(Ordering::Acquire),
+            mp_info.mpidr,
+        );
+    }
     // Everything this processor ran up to here has returned, and the one
     // function still live, this one, never does. The key is installed
     // before `started` is set, so `start_processor` returns for this
@@ -1585,6 +1647,7 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     // bootstrap processor, so only private interrupts arrive here.
     unsafe { unmask_irq() };
     hand_over::verify_trap_hand_over(mp_info.mpidr);
+    tagging::verify_on_current_processor(mp_info.mpidr);
     #[cfg(feature = "native-users")]
     native::verify_user_isolation(state.user_isolation);
     #[cfg(helios_hv_self_test)]
@@ -1649,6 +1712,26 @@ extern "C" fn aarch64_handle_sync_exception(
     frame: *mut SyncTrapFrame,
 ) {
     let exception_class = (esr_el1 >> 26) & 0x3f;
+    // A tag check fault is decided before every other path: it is never
+    // offered to the access-flag, stack-commit, swap or runtime paths, so it
+    // cannot be taken for a guest trap or a swap-in. A guest reaches its
+    // memory through untagged pointers, so one is a kernel or runtime defect.
+    if tagging::is_tag_check_fault(esr_el1) {
+        // SAFETY: `is_tag_check_fault` holds, so FEAT_MTE2 is active and `far`
+        // names a tag-capable granule; `frame` was written by entry.S.
+        if let Some(runtime) = installed_processor_runtime()
+            && unsafe { runtime.tag_check_probe.claim(esr_el1, far_el1) }
+        {
+            let frame = unsafe { &mut *frame };
+            frame.elr = frame.x[30];
+            return;
+        }
+        // SAFETY: the entry wrote a complete frame at `frame`, and nothing
+        // else touches it while this handler runs. A processor that took a
+        // tag check fault implements FEAT_MTE2, and a tag mismatch is only
+        // raised on a tag-capable mapping.
+        unsafe { tagging::report_tag_check_fault(esr_el1, far_el1, (*frame).elr) }
+    }
     // A failed return-address authentication is never the runtime's: a
     // guest cannot form a native return address, so it is a corrupted host
     // stack or a compiler bug. It is refused before anything below can
@@ -1676,7 +1759,20 @@ extern "C" fn aarch64_handle_sync_exception(
     }
     let (cause, faulting_address) = match exception_class {
         0b100000 | 0b100001 => (KernelExceptionCause::InstructionFault, Some(far_el1)),
-        0b100100 | 0b100101 => (KernelExceptionCause::DataFault, Some(far_el1)),
+        // With top-byte-ignore a data abort's FAR carries the pointer's
+        // logical tag; every consumer below wants the address the
+        // processor translated. `far_el1` stays raw for the fatal report.
+        0b100100 | 0b100101 => {
+            let tcr_el1: u64;
+            // SAFETY: reading TCR_EL1 has no side effect at EL1.
+            unsafe {
+                asm!("mrs {tcr}, tcr_el1", tcr = out(reg) tcr_el1, options(nomem, nostack, preserves_flags));
+            }
+            (
+                KernelExceptionCause::DataFault,
+                Some(tagging::translated_address(far_el1, tcr_el1)),
+            )
+        }
         0b111100 => (KernelExceptionCause::Breakpoint, None),
         0b001110 => (KernelExceptionCause::IllegalInstruction, None),
         _ => (KernelExceptionCause::IllegalInstruction, None),
@@ -1694,32 +1790,19 @@ extern "C" fn aarch64_handle_sync_exception(
     }
 
     let mut stack_fault = helios_kernel::StackFault::Elsewhere;
-    if faulting_address.is_some() {
+    if let Some(faulting_address) = faulting_address {
         // The swap policy's aging pass clears access flags to measure
         // which pages are still being used. This machine may not set
         // them again in hardware, so the fault is how a page reports
         // that it was touched: set the bit and retry the instruction.
         if ACCESS_FLAG_FAULT_STATUS.contains(&(esr_el1 & 0x3f))
-            && vmm::resolve_access_flag_fault(far_el1)
+            && vmm::resolve_access_flag_fault(faulting_address)
         {
             return;
         }
-        // A fiber stack's page comes from the user pool's ordinary path
-        // when the interrupted context had IRQs unmasked (the pool's
-        // locks mask them while held, so it holds none), and from the
-        // per-processor reserve when it had them masked.
-        // SAFETY: the entry wrote a complete frame at `frame`.
-        let interrupted_spsr = unsafe { (*frame).spsr };
-        let interrupted = helios_kernel::InterruptedContext {
-            interrupts_enabled: interrupted_spsr & SPSR_IRQ_MASK == 0,
-        };
-        match helios_kernel::classify_user_page_fault(
-            helios_hal::vmm::VirtAddr::new(far_el1),
-            interrupted,
-        ) {
-            // A reserved page inside a live fiber stack was a demand
-            // commit the kernel resolved in place.
-            helios_kernel::UserPageFault::Resolved => return,
+        match helios_kernel::classify_user_page_fault(helios_hal::vmm::VirtAddr::new(
+            faulting_address,
+        )) {
             // A swapped-out page is ours to resolve, and resolving it
             // means waiting for the swap device. Redirect the faulting
             // context onto a kernel trampoline running on its own stack,
@@ -1728,7 +1811,7 @@ extern "C" fn aarch64_handle_sync_exception(
                 // SAFETY: `frame` is the frame the entry above wrote, and
                 // `enter_swap_fault_trampoline` only rewrites fields in it.
                 unsafe {
-                    enter_swap_fault_trampoline(frame, far_el1);
+                    enter_swap_fault_trampoline(frame, faulting_address);
                 }
                 return;
             }
@@ -2168,6 +2251,18 @@ fn cache_line_bytes() -> usize {
     4 << log2_words
 }
 
+/// Cache writeback granule from `CTR_EL0.CWG` (Arm ARM D19.2 `CTR_EL0`), or
+/// the architectural 2048-byte maximum when `CWG` reads zero.
+pub(crate) fn cache_writeback_granule_bytes() -> usize {
+    let ctr_el0: u64;
+    unsafe {
+        asm!("mrs {ctr_el0}, ctr_el0", ctr_el0 = out(reg) ctr_el0, options(nomem, nostack, preserves_flags));
+    }
+    let cwg = ((ctr_el0 >> 24) & 0xf) as usize;
+    let cwg_bytes = if cwg == 0 { 2048 } else { 4 << cwg };
+    cwg_bytes.max(cache_line_bytes())
+}
+
 fn kernel_virtual_to_physical(virtual_address: usize, handoff: &LimineBootHandoff) -> usize {
     let virtual_base = usize::try_from(handoff.kernel.virtual_base)
         .unwrap_or_else(|_| panic!("AArch64 kernel virtual base does not fit usize"));
@@ -2205,10 +2300,16 @@ fn install_memory_attributes() {
     unsafe {
         asm!("mrs {mair}, mair_el1", mair = out(reg) mair, options(nomem, nostack, preserves_flags));
     }
-    let mask = (0xff << MAIR_DEVICE_ATTR_INDEX_SHIFT) | (0xff << MAIR_NORMAL_NC_ATTR_INDEX_SHIFT);
-    let mair = (mair & !mask)
-        | (MAIR_DEVICE_NGNRNE << MAIR_DEVICE_ATTR_INDEX_SHIFT)
+    let mut mask =
+        (0xff << MAIR_DEVICE_ATTR_INDEX_SHIFT) | (0xff << MAIR_NORMAL_NC_ATTR_INDEX_SHIFT);
+    let mut attrs = (MAIR_DEVICE_NGNRNE << MAIR_DEVICE_ATTR_INDEX_SHIFT)
         | (MAIR_NORMAL_NON_CACHEABLE << MAIR_NORMAL_NC_ATTR_INDEX_SHIFT);
+    if tagging::supported_on_current_processor() {
+        let tagged_shift = tagging::PAGE_ATTR_NORMAL_TAGGED_INDEX * 8;
+        mask |= 0xff << tagged_shift;
+        attrs |= tagging::MAIR_NORMAL_TAGGED << tagged_shift;
+    }
+    let mair = (mair & !mask) | attrs;
     unsafe {
         asm!("msr mair_el1, {mair}", mair = in(reg) mair, options(nomem, nostack, preserves_flags));
         asm!("isb", options(nostack, preserves_flags));

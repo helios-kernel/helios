@@ -42,9 +42,11 @@ use core::ffi::c_int;
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use helios_hal::boot::{BootMemoryKind, BootMemoryMap};
 use helios_hal::device::{DeviceRegion, DeviceRegionAttributes, DmaPlacement, MemoryKind};
 use helios_hal::iommu::PhysicalRange;
 use helios_hal::pmm::PhysFrame;
+use helios_hal::tagging::{AllocationTags, TaggedView};
 use helios_hal::vmm::{
     AddressSpace, AddressSpaceError, PageAge, PageFlags, SwapToken, Translation, VirtAddr,
     VirtRange,
@@ -54,8 +56,8 @@ use helios_kernel::runtime_memory::{
     default_memory_image_map_at, default_memory_image_new, default_page_size,
 };
 use helios_kernel::{
-    FiberStackVmHooks, InstalledAddressSpace, MemoryOwner, ReservationLookup, ReservationTracker,
-    ResidencyVmHooks, SwapLeafFormat, SwapSpace, SwapVmHooks, VaCursor,
+    AllocationTagHooks, FiberStackVmHooks, InstalledAddressSpace, MemoryOwner, ReservationLookup,
+    ReservationTracker, ResidencyVmHooks, SwapLeafFormat, SwapSpace, SwapVmHooks, VaCursor,
     allocate_user_frame_uninit_on, allocate_user_frame_uninit_on_node, allocate_user_run_zeroed_on,
     current_user_memory_owner, deallocate_user_frame_on, deallocate_user_run_on,
     install_fiber_stack_hooks, install_residency_hooks, ranges_outside, residency_vm_hooks,
@@ -113,6 +115,13 @@ fn swap_descriptor_token(entry: u64) -> Option<SwapToken> {
 
 const USER_VA_BASE: usize = 0xFFFF_C000_0000_0000;
 const USER_VA_END: usize = 0xFFFF_E000_0000_0000;
+/// Second linear map of usable physical memory, carrying `MAIR_NORMAL_TAGGED`
+/// so tagged seams (`OffsetDmaPool`) reach the same physical bytes through a
+/// tag-capable mapping without changing HHDM attributes.
+const TAGGED_HHDM_BASE: usize = 0xFFFF_E000_0000_0000;
+const TAGGED_HHDM_SPAN_LIMIT: usize = 0x0000_1000_0000_0000;
+const BLOCK_2M: usize = 2 * 1024 * 1024;
+const BLOCK_DESCRIPTOR: u64 = 0b01;
 
 /// Per-platform aarch64 user address space.
 pub struct Aarch64UserAddressSpace {
@@ -327,6 +336,91 @@ impl Aarch64UserAddressSpace {
         if batch_count != 0 {
             self.flush_and_dealloc_entries(batch_start, &batch_entries[..batch_count]);
         }
+    }
+
+    /// Maps every usable physical memory region from `handoff` into
+    /// `[TAGGED_HHDM_BASE..)` with [`crate::tagging::PAGE_ATTR_NORMAL_TAGGED_INDEX`],
+    /// using 2 MiB blocks for aligned interior spans and 4 KiB pages for
+    /// unaligned edges.
+    fn build_tagged_view(&self, handoff: &crate::LimineBootHandoff) -> TaggedView {
+        let _guard = self.state.lock();
+        let attr = (crate::tagging::PAGE_ATTR_NORMAL_TAGGED_INDEX << crate::PAGE_ATTR_INDEX_SHIFT)
+            | AP_KERNEL_RW
+            | SH_INNER
+            | AF
+            | PXN
+            | UXN;
+        let l0 = self.root();
+        let mut max_end = 0usize;
+        for region in handoff.memory_map.regions() {
+            if region.kind != BootMemoryKind::Usable {
+                continue;
+            }
+            let start = usize::try_from(region.start)
+                .unwrap_or_else(|_| panic!("AArch64 usable RAM start does not fit usize"));
+            let end = usize::try_from(region.end)
+                .unwrap_or_else(|_| panic!("AArch64 usable RAM end does not fit usize"));
+            let start = (start + PAGE - 1) & !(PAGE - 1);
+            let end = end & !(PAGE - 1);
+            if start >= end {
+                continue;
+            }
+            assert!(
+                end <= TAGGED_HHDM_SPAN_LIMIT,
+                "AArch64 usable RAM end {end:#x} exceeds tagged direct-map window"
+            );
+            max_end = max_end.max(end);
+            let mut phys = start;
+            while phys < end {
+                let virt = TAGGED_HHDM_BASE + phys;
+                if phys.is_multiple_of(BLOCK_2M) && end - phys >= BLOCK_2M {
+                    let l1 = self.ensure_table(l0, (virt >> 39) & 0x1ff);
+                    let l2 = self.ensure_table(l1, (virt >> 30) & 0x1ff);
+                    let l2_index = (virt >> 21) & 0x1ff;
+                    // SAFETY: `l2` is a live kernel table frame and we hold `self.state`.
+                    let entry_ptr = unsafe { l2.add(l2_index) };
+                    let existing = unsafe { entry_ptr.read_volatile() };
+                    assert!(
+                        existing & VALID == 0,
+                        "AArch64 tagged view 2 MiB block at {virt:#x} collided with {existing:#x}"
+                    );
+                    // SAFETY: publishes a valid 2 MiB block descriptor before `dsb ishst; isb`.
+                    unsafe {
+                        entry_ptr.write_volatile((phys as u64) | attr | BLOCK_DESCRIPTOR);
+                    }
+                    phys += BLOCK_2M;
+                } else {
+                    let l1 = self.ensure_table(l0, (virt >> 39) & 0x1ff);
+                    let l2 = self.ensure_table(l1, (virt >> 30) & 0x1ff);
+                    let l3 = self.ensure_table(l2, (virt >> 21) & 0x1ff);
+                    let l3_index = (virt >> 12) & 0x1ff;
+                    // SAFETY: `l3` is a live kernel table frame and we hold `self.state`.
+                    let entry_ptr = unsafe { l3.add(l3_index) };
+                    let existing = unsafe { entry_ptr.read_volatile() };
+                    assert!(
+                        existing & VALID == 0,
+                        "AArch64 tagged view 4 KiB page at {virt:#x} collided with {existing:#x}"
+                    );
+                    // SAFETY: publishes a valid 4 KiB page descriptor before `dsb ishst; isb`.
+                    unsafe {
+                        entry_ptr.write_volatile((phys as u64) | attr | PAGE_DESCRIPTOR);
+                    }
+                    phys += PAGE;
+                }
+            }
+        }
+        // SAFETY: orders all new valid descriptors before any subsequent walk;
+        // every modified entry transitioned from invalid to valid, so no TLBI
+        // is required.
+        unsafe {
+            asm!("dsb ishst", "isb", options(nostack, preserves_flags));
+        }
+        TaggedView::new(
+            self.physical_memory_offset,
+            TAGGED_HHDM_BASE,
+            max_end,
+            crate::cache_writeback_granule_bytes(),
+        )
     }
 
     fn map_4k_no_flush(
@@ -1464,7 +1558,15 @@ fn page_flags_to_pte(flags: PageFlags) -> Result<u64, AddressSpaceError> {
     if flags.is_empty() {
         return Err(AddressSpaceError::InvalidFlags);
     }
-    let mut pte = (ATTR_NORMAL << 2) | PXN | UXN;
+    let attr_index = if flags.contains(PageFlags::TAGGED) {
+        if !crate::tagging::Aarch64AllocationTags::checking() {
+            return Err(AddressSpaceError::InvalidFlags);
+        }
+        crate::tagging::PAGE_ATTR_NORMAL_TAGGED_INDEX
+    } else {
+        ATTR_NORMAL
+    };
+    let mut pte = (attr_index << crate::PAGE_ATTR_INDEX_SHIFT) | PXN | UXN;
     if flags.contains(PageFlags::WRITE) {
         pte |= AP_KERNEL_RW;
     } else {
@@ -1829,6 +1931,16 @@ pub static AARCH64_SWAP_HOOKS: SwapVmHooks =
 pub static AARCH64_RESIDENCY_HOOKS: ResidencyVmHooks =
     residency_vm_hooks::<Aarch64UserAddressSpace>();
 
+/// Builds the tagged linear view of usable RAM in TTBR1.
+pub(crate) fn build_tagged_view(
+    physical_memory_offset: usize,
+    handoff: &crate::LimineBootHandoff,
+) -> TaggedView {
+    let address_space = user_as();
+    assert_eq!(address_space.physical_memory_offset, physical_memory_offset);
+    address_space.build_tagged_view(handoff)
+}
+
 /// The arena's address-space surface for this backend.
 ///
 /// Separate from [`AARCH64_VMM_HOOKS`] because it is a different
@@ -1841,6 +1953,7 @@ static AARCH64_FIBER_STACK_HOOKS: FiberStackVmHooks = FiberStackVmHooks {
     prepare_demand_commit: |virt, flags| user_as().prepare_demand_commit(virt, flags),
     commit_demand_page: |addr, frame, flags| user_as().commit_demand_page(addr, frame, flags),
     end_demand_commit: |virt, mapped| user_as().end_demand_commit(virt, mapped),
+    tags: AllocationTagHooks::of::<crate::tagging::Aarch64AllocationTags>(),
 };
 
 /// Resolves an access-flag fault raised by the swap policy's aging pass.

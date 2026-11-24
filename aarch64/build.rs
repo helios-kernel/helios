@@ -38,6 +38,14 @@ fn main() {
     if env::var_os("HELIOS_BTI_SELF_TEST").is_some() {
         println!("cargo:rustc-cfg=helios_bti_self_test");
     }
+    // The MTE self-test image reads into a Tag::FREE redzone through a
+    // live-tagged pointer and expects a synchronous tag check fault panic
+    // (`tagging::self_test`).
+    println!("cargo:rustc-check-cfg=cfg(helios_mte_self_test)");
+    println!("cargo:rerun-if-env-changed=HELIOS_MTE_SELF_TEST");
+    if env::var_os("HELIOS_MTE_SELF_TEST").is_some() {
+        println!("cargo:rustc-cfg=helios_mte_self_test");
+    }
     println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
     let flags = env::var("CARGO_ENCODED_RUSTFLAGS")
         .unwrap_or_else(|error| panic!("CARGO_ENCODED_RUSTFLAGS is unreadable: {error}"));

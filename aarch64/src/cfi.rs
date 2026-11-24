@@ -67,8 +67,8 @@ const ID_AA64PFR1_BT_MASK: u64 = 0xf;
 const SCTLR_EL1_BT1: u64 = 1 << 36;
 
 /// `ESR_ELx.EC` is bits `[31:26]`.
-const ESR_EC_SHIFT: usize = 26;
-const ESR_EC_MASK: usize = 0x3f;
+pub(crate) const ESR_EC_SHIFT: usize = 26;
+pub(crate) const ESR_EC_MASK: usize = 0x3f;
 /// `ESR_ELx.EC` of a Branch Target Exception (`ESR_ELx_EC_BTI` in Linux
 /// `arch/arm64/include/asm/esr.h`).
 const ESR_EC_BTI: usize = 0x0d;

@@ -15,9 +15,10 @@ pub use authority::{
     PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
     SetWallClockCap, SettingsAuthorityRights, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
     SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap,
-    TtyControlCap, UdpCap, UnmountCap, WriteSettingsCap,
+    TtyControlCap, UdpCap, UnmountCap, VirtualizeCap, WriteSettingsCap,
 };
 pub use program_service::{
-    ComponentStdioRefusal, LinuxImageRefusal, ProgramExecError, ProgramExecErrorDetail,
-    ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, UnbindableStdio,
+    CompilerMaxInputBytesSetting, ComponentStdioRefusal, DEFAULT_COMPILER_MAX_INPUT_BYTES,
+    LinuxImageRefusal, ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind,
+    ProgramOutOfMemory, RuntimeMessage, UnbindableStdio,
 };

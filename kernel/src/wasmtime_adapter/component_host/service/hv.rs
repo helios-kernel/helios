@@ -240,16 +240,20 @@ impl<C: Cpu + Clone, N: ComponentHostNetwork, S: Storage> wire::HostVm for Store
         &mut self,
         memory_limit: u64,
     ) -> wasmtime::Result<Result<Resource<wire::Vm>, wire::HvError>> {
+        let Ok(cap) = self.process_authority().derive_virtualize_cap() else {
+            return Ok(Err(wire::HvError::PermissionDenied));
+        };
         let Ok(limit) = usize::try_from(memory_limit) else {
             return Ok(Err(wire::HvError::MemoryBudget));
         };
         if self.cpu.hv().is_none() {
             return Ok(Err(wire::HvError::Unavailable));
         }
-        let vm = match crate::hv::create_vm(&self.cpu, crate::memory::user_memory_pool(), limit) {
-            Ok(vm) => vm,
-            Err(error) => return Ok(Err(error.into())),
-        };
+        let vm =
+            match crate::hv::create_vm(&self.cpu, crate::memory::user_memory_pool(), limit, cap) {
+                Ok(vm) => vm,
+                Err(error) => return Ok(Err(error.into())),
+            };
         Ok(Ok(typed(self.table.push(VmHandle {
             control: vm.control(),
             slot: ResourceSlot::new(vm),
@@ -589,10 +593,191 @@ impl<C: Cpu + Clone, N: ComponentHostNetwork, S: Storage, U: 'static> wire::Host
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_store::store_data_with;
+    use super::super::test_store::{DiscardPort, store_data_authorized, store_data_with};
     use super::*;
+    use crate::component::{ComponentOutputMode, ComponentStoreData};
+    use crate::hv::tests::TestHypervisor;
+    use crate::isa::GuestIsa;
+    use crate::memory::{UserMemoryPool, install_user_memory_pool, installed_user_memory_pool};
+    use crate::test_support::{TestCpu, TestNetworkService, UnsupportedStorage};
+    use crate::wasmtime_adapter::component_host::HostRuntimeState;
+    use crate::{
+        Executor, InstanceRegistry, MachineAuthorityRights, ProcessAuthority, TaskFunding,
+    };
+    use core::alloc::Layout;
+    use helios_hal::cpu::{Instant, ProcessorId, Timebase, TimerInterrupt};
+    use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
     use helios_hal::pmm::PhysFrame;
+    use helios_hal::watchdog::ProgressCounter;
+    use triomphe::Arc;
+    use wasmtime::component::ResourceTable;
     use wire::{HostMemoryRegion, HostVm};
+
+    #[derive(Clone)]
+    struct HvTestCpu {
+        inner: TestCpu,
+        hv: TestHypervisor,
+    }
+
+    impl HvTestCpu {
+        fn new() -> Self {
+            Self {
+                inner: TestCpu::with_entropy(0x5a),
+                hv: TestHypervisor::default(),
+            }
+        }
+    }
+
+    impl Cpu for HvTestCpu {
+        type Hypervisor = TestHypervisor;
+        type Native = core::convert::Infallible;
+        const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
+        fn has_lazy_commit_virtual_memory(&self) -> bool {
+            self.inner.has_lazy_commit_virtual_memory()
+        }
+
+        fn processor_count(&self) -> usize {
+            self.inner.processor_count()
+        }
+
+        fn bootstrap_processor(&self) -> ProcessorId {
+            self.inner.bootstrap_processor()
+        }
+
+        fn park_current(&self) {
+            self.inner.park_current();
+        }
+
+        type WakeOnlyMask = ();
+
+        fn mask_to_wake_only(&self) {
+            self.inner.mask_to_wake_only();
+        }
+
+        fn park_wake_only(&self, slot: &core::sync::atomic::AtomicU8, expected: u8) {
+            self.inner.park_wake_only(slot, expected);
+        }
+
+        fn start_processor(&self, id: ProcessorId) {
+            self.inner.start_processor(id);
+        }
+
+        fn wake_processor(&self, id: ProcessorId) {
+            self.inner.wake_processor(id);
+        }
+
+        fn stop_current(&self) {
+            self.inner.stop_current();
+        }
+
+        fn restart_processor(&self, id: ProcessorId) {
+            self.inner.restart_processor(id);
+        }
+
+        fn now(&self) -> Instant {
+            self.inner.now()
+        }
+
+        fn timebase(&self) -> Timebase {
+            self.inner.timebase()
+        }
+
+        fn set_deadline(&self, deadline: Instant) {
+            self.inner.set_deadline(deadline);
+        }
+
+        fn publish_executable(&self, ptr: *const u8, len: usize) {
+            self.inner.publish_executable(ptr, len);
+        }
+
+        fn unpublish_executable(&self, ptr: *const u8, len: usize) {
+            self.inner.unpublish_executable(ptr, len);
+        }
+
+        fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
+            self.inner.native_feature_probe()
+        }
+
+        fn fill_entropy(&self, buffer: &mut [u8]) -> Result<EntropyQuality, EntropyUnavailable> {
+            self.inner.fill_entropy(buffer)
+        }
+
+        fn hv(&self) -> Option<&Self::Hypervisor> {
+            Some(&self.hv)
+        }
+
+        fn shutdown(&self) -> ! {
+            self.inner.shutdown()
+        }
+
+        fn reboot(&self) -> ! {
+            self.inner.reboot()
+        }
+    }
+
+    fn read_nothing(_: &mut Vec<u8>, _: u32) {}
+
+    fn ensure_user_pool() {
+        const POOL_BYTES: usize = 4 * 1024 * 1024;
+        if installed_user_memory_pool().is_some() {
+            return;
+        }
+        let layout = Layout::from_size_align(POOL_BYTES, PhysFrame::SIZE).expect("pool layout");
+        // SAFETY: nonzero size, leaked for the lifetime of the test process.
+        let base = unsafe { alloc::alloc::alloc_zeroed(layout) } as usize;
+        assert!(base != 0, "pool backing");
+        install_user_memory_pool(UserMemoryPool::single_node(1, &[(base, base + POOL_BYTES)]));
+    }
+
+    fn hv_store_data(
+        authority: ProcessAuthority,
+    ) -> StoreData<HvTestCpu, TestNetworkService, UnsupportedStorage> {
+        let cpu = HvTestCpu::new();
+        let runtime_state: HostRuntimeState<HvTestCpu, TestNetworkService, UnsupportedStorage> =
+            crate::RuntimeState::new(
+                cpu.timebase(),
+                1,
+                0,
+                crate::BootPayload::for_tests(),
+                GuestIsa::for_build_target(cpu.native_feature_probe()),
+            );
+        runtime_state.install_root_entropy(Arc::new(
+            crate::RootEntropy::from_platform(
+                &cpu,
+                None,
+                None,
+                crate::MachineGeneration::new(None),
+            )
+            .expect("the fixture CPU has an entropy source"),
+        ));
+        let executor = Executor::new(
+            ProgressCounter::new(),
+            crate::test_support::single_node_pool(1),
+            ProcessorId::new(0),
+        );
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("hv-store", 0);
+        ComponentStoreData::new(
+            ResourceTable::new(),
+            cpu.clone(),
+            executor.timer(cpu.clone()),
+            executor
+                .spawner(cpu)
+                .instance_spawner(TaskFunding::Instance, &instance),
+            runtime_state.clone(),
+            registry,
+            instance,
+            None,
+            runtime_state.root_namespace().descend(),
+            Vec::new(),
+            Vec::new(),
+            authority,
+            ComponentOutputMode::Serial,
+            read_nothing,
+            crate::DebugSerialWriter::of::<DiscardPort>(),
+        )
+    }
 
     #[test]
     fn invalid_register_batch_preserves_the_original_snapshot() {
@@ -619,12 +804,49 @@ mod tests {
     }
 
     #[test]
+    fn create_refuses_callers_without_virtualize_authority() {
+        let mut empty_store = store_data_with(|_| {});
+        assert!(matches!(
+            HostVm::create(&mut empty_store, 128 << 20).unwrap(),
+            Err(wire::HvError::PermissionDenied)
+        ));
+
+        let mut root_store = hv_store_data(ProcessAuthority::root());
+        assert!(matches!(
+            HostVm::create(&mut root_store, 128 << 20).unwrap(),
+            Err(wire::HvError::PermissionDenied)
+        ));
+
+        let mut cpu_ctrl_only = ProcessAuthority::root();
+        cpu_ctrl_only.grant_machine_rights(MachineAuthorityRights::CONTROL_PROCESSORS);
+        let mut cpu_ctrl_store = hv_store_data(cpu_ctrl_only);
+        assert!(matches!(
+            HostVm::create(&mut cpu_ctrl_store, 128 << 20).unwrap(),
+            Err(wire::HvError::PermissionDenied)
+        ));
+    }
+
+    #[test]
     fn unavailable_platform_does_not_access_the_user_pool() {
-        let mut store = store_data_with(|_| {});
+        let mut authority = ProcessAuthority::empty();
+        authority.grant_machine_rights(MachineAuthorityRights::VIRTUALIZE);
+        let mut store = store_data_authorized(authority, |_| {});
         assert!(matches!(
             HostVm::create(&mut store, 128 << 20).unwrap(),
             Err(wire::HvError::Unavailable)
         ));
+    }
+
+    #[test]
+    fn create_succeeds_when_virtualize_authority_is_granted() {
+        ensure_user_pool();
+        let mut authority = ProcessAuthority::empty();
+        authority.grant_machine_rights(MachineAuthorityRights::VIRTUALIZE);
+        let mut store = hv_store_data(authority);
+        let handle = HostVm::create(&mut store, PhysFrame::SIZE as u64)
+            .unwrap()
+            .expect("authorized caller on HV-capable platform may create a VM");
+        HostVm::drop(&mut store, handle).unwrap();
     }
 
     #[test]

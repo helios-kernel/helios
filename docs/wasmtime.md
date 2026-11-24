@@ -508,17 +508,17 @@ the `StackCreator` installed by `kernel/src/wasmtime_adapter/fiber_stack.rs`.
 A stack is one slot of the arena in `kernel/src/memory/fiber_stack.rs`:
 `[guard][stack]` inside one reservation of
 `total_stacks × (64 KiB + COMPONENT_ASYNC_STACK_SIZE)` of user address space,
-with only the top page committed when the stack is created, through the user
-pool's fallible path (a typed out-of-memory when the pool is exhausted), and
-every page below it committed by the page-fault handler that touches it,
-together with any gap between it and the committed range. The handler takes
-its frames according to the context it interrupted: through the user pool's
-ordinary path when that context had interrupts enabled, because it then holds
-no pool lock and may wait for another processor's, and from the
-per-processor frame reserve when it had them masked, because it may hold a
-pool lock. The executor loop refills the reserve through the pool.
-`async_stack_keep_resident` is not set, because the generic pool retains no
-stack between instances and there is nothing to keep resident.
+with its top entry window (`FIBER_STACK_ENTRY_RESERVE`) committed when the
+stack is created, through the user pool's fallible path (a typed out-of-memory
+when the pool is exhausted). Every page below that window is committed ahead
+of the guest by the runtime's stack-reserve callback
+(`commit_fiber_stack_reserve`), which keeps `FIBER_STACK_HOST_RESERVE` bytes
+committed below every checked guest stack pointer (stepping by
+`FIBER_STACK_COMMIT_STEP` and returning a typed out-of-memory error after
+notifying the OOM killer when the pool is exhausted). A fault on an
+uncommitted fiber-stack page fails fast as a kernel defect; `async_stack_keep_resident`
+is not set, because the generic pool retains no stack between instances and
+there is nothing to keep resident.
 
 ## Runtime-performance context
 
