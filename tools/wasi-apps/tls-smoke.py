@@ -170,7 +170,7 @@ def main() -> int:
     parser.add_argument("--accel", required=True)
     parser.add_argument("--runtime-dir", type=Path, required=True)
     parser.add_argument(
-        "--inspector", type=Path, default=REPO_ROOT / "target/release/helios-inspector"
+        "--inspector", type=Path, default=REPO_ROOT / "target/release/helios"
     )
     parser.add_argument("--openssl", default="openssl")
     args = parser.parse_args()

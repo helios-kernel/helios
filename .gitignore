@@ -11,6 +11,10 @@
 /tools/wasi-apps/*/target
 /tools/bench/.venv
 /tools/gvisor-syscalls/.venv
+/ops-py/.venv
+/ops-py/target
+/ops-py/python/helios/*.so
+/ops-py/python/helios/*.pyd
 /.notes-*.md
 __pycache__/
 *.wasm

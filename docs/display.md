@@ -137,7 +137,7 @@ also produces a valid PNG, so "the file is a PNG" says nothing;
 the capture's own dimensions and checks it at the corners and the middle.
 
 ```bash
-./target/release/helios-inspector vm --arch x86-64 --release --accel kvm \
+./target/release/helios vm --arch x86-64 --release --accel kvm \
     --desktop --display none \
     --boot-program dash --boot-program debugger --boot-program display-test \
     screendump \

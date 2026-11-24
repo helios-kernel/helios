@@ -644,9 +644,9 @@ A host that must not compile anything runs `helios-bench run --lane
 aarch64-hvf --prebuilt`. The kernel image, `helios-bootfs` and
 `compiler_plugin.wasm` come from CI's `helios-image-aarch64-release` artifact
 (fetched with `helios-cli artifact-fetch --kind image --arch aarch64 --profile release`),
-placed at `target/aarch64-unknown-none/kernel-release/helios` and
+placed at `target/aarch64-unknown-none/kernel-release/helios-kernel` and
 `target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs`;
-`target/release/helios-inspector`, `target/release/helios-cli` and
+`target/release/helios`, `target/release/helios-cli` and
 `artifacts/bench-native/aarch64/` are copied from the machine that built
 them. The run then builds nothing, and lists every file it reads that is
 missing before it boots a guest. It cannot be paired with a baseline, whose

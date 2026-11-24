@@ -793,10 +793,8 @@ def inspector_for(workspace_root: Path) -> Path:
     inspector and no other — it is the pin a run sets for the candidate.
     """
     if workspace_root.resolve() == REPO_ROOT.resolve():
-        return Path(
-            os.environ.get("HELIOS_INSPECTOR_BIN", workspace_root / "target" / "release" / "helios-inspector")
-        )
-    return workspace_root / "target" / "release" / "helios-inspector"
+        return Path(os.environ.get("HELIOS_INSPECTOR_BIN", workspace_root / "target" / "release" / "helios"))
+    return workspace_root / "target" / "release" / "helios"
 
 
 def kernel_path(workspace_root: Path, lane: Lane, profile_use: Path | None) -> Path:

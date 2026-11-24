@@ -461,6 +461,30 @@ pub trait HeliosEnv: Send + Sync {
     fn complete_oci_refs(&self) -> impl Future<Output = Result<Vec<String>, EnvError>> + Send {
         async { Ok(Vec::new()) }
     }
+
+    /// Additional environment-specific commands registered alongside [`crate::AsyncBuiltin`].
+    fn custom_command_specs(&self) -> Vec<crate::command::CustomCommandSpec> {
+        Vec::new()
+    }
+
+    /// Dispatch an environment-specific custom command registered by [`Self::custom_command_specs`].
+    fn run_custom_command<'a>(
+        &'a self,
+        _name: &'a str,
+        _ctx: &'a mut crate::command::AsyncCommandContext<'_, Self>,
+        _input: crate::pipeline::AsyncPipelineData,
+    ) -> impl Future<Output = Result<crate::pipeline::AsyncPipelineData, ShellError>> + Send + 'a
+    where
+        Self: Sized,
+    {
+        async {
+            Err(crate::error::generic_error(
+                "unknown custom command",
+                "environment does not implement this custom command",
+                nu_protocol::Span::unknown(),
+            ))
+        }
+    }
 }
 
 /// Normalize a VFS path relative to `cwd`, resolving `.` and `..` without

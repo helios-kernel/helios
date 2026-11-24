@@ -1,0 +1,24 @@
+[workspace]
+
+[package]
+name = "helios-ops-py"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+async-channel = { version = "2.5.0", default-features = false }
+helios-inspector-protocol = { path = "../inspector-protocol" }
+helios-ops = { path = "../ops" }
+pyo3 = { version = "0.30.1", default-features = false, features = ["abi3-py311", "macros"] }
+pyo3-async-runtimes = { version = "0.30.0", default-features = false, features = ["tokio-runtime"] }
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tracing = { version = "0.1.44", default-features = false }

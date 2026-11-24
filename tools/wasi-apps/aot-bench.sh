@@ -9,7 +9,7 @@ input="${HELIOS_AOT_BENCH_INPUT:-artifacts/wasi-tools/curl.wasm}"
 iterations="${HELIOS_AOT_BENCH_ITERATIONS:-5}"
 arch="${HELIOS_AOT_BENCH_ARCH:-aarch64}"
 target_label="${HELIOS_AOT_BENCH_TARGET_LABEL:-${arch}-hvf}"
-inspector="${HELIOS_INSPECTOR_BIN:-target/release/helios-inspector}"
+inspector="${HELIOS_INSPECTOR_BIN:-target/release/helios}"
 
 if [[ ! "${iterations}" =~ ^[0-9]+$ ]] || (( iterations < 2 )); then
     printf 'HELIOS_AOT_BENCH_ITERATIONS must be an integer >= 2\n' >&2

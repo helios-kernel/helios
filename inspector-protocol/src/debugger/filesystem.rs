@@ -579,7 +579,7 @@ mod guest {
     }
 
     async fn touch_path(path: &str) -> Result<(), DispatchError> {
-        let (parent, name) = open_parent_directory(path).await?;
+        let (parent, name) = open_parent_directory_with_flags(path, DescriptorFlags::WRITE).await?;
         let _ = parent
             .open_at(
                 PathFlags::empty(),
@@ -741,7 +741,9 @@ mod guest {
             let next_flags = if is_last {
                 flags
             } else {
-                DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY
+                DescriptorFlags::READ
+                    | DescriptorFlags::MUTATE_DIRECTORY
+                    | (flags & DescriptorFlags::WRITE)
             };
             descriptor = descriptor
                 .open_at(
@@ -758,11 +760,19 @@ mod guest {
     }
 
     async fn open_parent_directory(path: &str) -> Result<(Descriptor, String), DispatchError> {
+        open_parent_directory_with_flags(path, DescriptorFlags::empty()).await
+    }
+
+    async fn open_parent_directory_with_flags(
+        path: &str,
+        extra_flags: DescriptorFlags,
+    ) -> Result<(Descriptor, String), DispatchError> {
         let mut components = normalized_components(path)?;
         let name = components.pop().ok_or_else(|| {
             DispatchError::protocol(format!("path {path:?} does not refer to a removable entry"))
         })?;
         let mut descriptor = root_descriptor()?;
+        let parent_flags = DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY | extra_flags;
 
         for component in components {
             descriptor = descriptor
@@ -770,7 +780,7 @@ mod guest {
                     PathFlags::empty(),
                     component.clone(),
                     OpenFlags::DIRECTORY,
-                    DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY,
+                    parent_flags,
                 )
                 .await
                 .map_err(|code| filesystem_error(path, "open parent directory for", code))?;
