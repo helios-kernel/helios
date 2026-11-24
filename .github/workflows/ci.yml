@@ -3735,6 +3735,9 @@ jobs:
           pattern: btrfs-upstream-*
           path: helios/target
           merge-multiple: true
+      - name: Install the pinned Rust toolchain
+        working-directory: helios
+        run: rustup toolchain install
       - name: Fuzz Helios with upstream seeds and AddressSanitizer
         working-directory: helios
         env:
