@@ -401,6 +401,13 @@ impl HeliosEnv for TestHeliosEnv {
                 let _ = err_tx.send(Ok(b"boom-stderr".to_vec())).await;
                 let _ = code_tx.send(Ok(7)).await;
             }
+            "async-missing" => {
+                let _ = code_tx
+                    .send(Err(EnvError::NotFound {
+                        path: "/bin/async-missing".to_owned(),
+                    }))
+                    .await;
+            }
             other => {
                 return Err(EnvError::NotFound {
                     path: other.to_owned(),

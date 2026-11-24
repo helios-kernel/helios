@@ -1608,8 +1608,12 @@ async fn eval_call_async<E: HeliosEnv>(
                     .await;
                 let mut combined = out_res?;
                 combined.extend_from_slice(&err_res?);
-                if let Some(exit_rx) = exit_code {
-                    let _ = exit_rx.recv().await;
+                if let Some(exit_rx) = exit_code
+                    && let Ok(status) = exit_rx.recv().await
+                {
+                    let code = status
+                        .map_err(|err| err.into_shell_error("external command failed", head))?;
+                    ctx.stack.set_last_exit_code(code, head);
                 }
                 write_redirect_slot(ctx, out_num, &combined, head).await?;
                 return Ok(AsyncPipelineData::Empty);
@@ -1639,8 +1643,12 @@ async fn eval_call_async<E: HeliosEnv>(
                         .await;
                     let out_bytes = out_res?;
                     let err_bytes = err_res?;
-                    if let Some(exit_rx) = exit_code {
-                        let _ = exit_rx.recv().await;
+                    if let Some(exit_rx) = exit_code
+                        && let Ok(status) = exit_rx.recv().await
+                    {
+                        let code = status
+                            .map_err(|err| err.into_shell_error("external command failed", head))?;
+                        ctx.stack.set_last_exit_code(code, head);
                     }
                     write_redirect_slot(ctx, out_num, &out_bytes, head).await?;
                     write_redirect_slot(ctx, err_num, &err_bytes, head).await?;

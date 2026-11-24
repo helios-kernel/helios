@@ -59,12 +59,24 @@ impl EnvError {
     /// Convert an environment error into a Nushell [`ShellError`] attributed to `span`.
     #[must_use]
     pub fn into_shell_error(self, title: &str, span: Span) -> ShellError {
-        ShellError::Generic(GenericError::new(title.to_owned(), self.to_string(), span))
+        let detail = self.to_string();
+        ShellError::Generic(GenericError::new(
+            format!("{title}: {detail}"),
+            detail,
+            span,
+        ))
     }
 }
 
 /// Build a concise [`ShellError::Generic`] attributed to `span`.
 #[must_use]
 pub fn generic_error(title: impl Into<String>, msg: impl Into<String>, span: Span) -> ShellError {
-    ShellError::Generic(GenericError::new(title.into(), msg.into(), span))
+    let title = title.into();
+    let msg = msg.into();
+    let headline = if msg.is_empty() || title == msg {
+        title
+    } else {
+        format!("{title}: {msg}")
+    };
+    ShellError::Generic(GenericError::new(headline, msg, span))
 }
