@@ -1,0 +1,40 @@
+[package]
+name = "helios-nu"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+default = []
+test-support = []
+
+[dependencies]
+async-channel = { version = "2.5.0", default-features = false }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+futures-lite = { version = "2.6.1", default-features = false, features = ["alloc"] }
+getrandom = { version = "0.4.2", default-features = false }
+nu-cmd-lang = { version = "=0.117.0", default-features = false }
+nu-command = { version = "=0.117.0", default-features = false }
+nu-engine = { version = "=0.117.0", default-features = false }
+nu-experimental = { version = "=0.117.0", default-features = false }
+nu-glob = { version = "=0.117.0", default-features = false }
+nu-parser = { version = "=0.117.0", default-features = false }
+nu-path = { version = "=0.117.0", default-features = false }
+nu-protocol = { version = "=0.117.0", default-features = false }
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
+thiserror = { version = "2.0.21", default-features = false }
+tracing = { workspace = true }
+uuid = { version = "1.26.0", default-features = false, features = ["v1", "v3", "v4", "v5", "v7"] }
+
+[target.'cfg(all(target_os = "wasi", not(target_env = "p1")))'.dependencies]
+zenwave = { workspace = true, features = ["wasi-backend"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zenwave = { workspace = true, features = ["hyper-rustls"] }
+
+[dev-dependencies]
+async-net = { version = "2.0.0", default-features = false }
+futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
+helios-nu = { path = ".", features = ["test-support"] }
+
+[lints]
+workspace = true

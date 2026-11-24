@@ -417,6 +417,7 @@ def test_wasm_jobs_drop_host_rust_cache_and_subset_programs_safely(ci_jobs, tmp_
         "debugger",
         "gpu-test",
         "init",
+        "nu",
         "pride-flag",
     ]
     assert venus_sel["wasi_artifacts"] == "true"

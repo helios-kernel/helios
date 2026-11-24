@@ -20,10 +20,10 @@ mkfs.btrfs -q -f --rootdir "$runtime/tree" "$runtime/image.btrfs"
   --bootfs-root "$runtime/bootfs" \
   --disk "$runtime/image.erofs,serial=erofs-smoke,readonly" \
   --disk "$runtime/image.btrfs,serial=btrfs-smoke" \
-  --boot-program dash --boot-program debugger \
+  --boot-program nu --boot-program debugger \
   --boot-program ls --boot-program cat --boot-program python3 \
   --no-compiler-plugin \
-  shell -c true 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+  shell --shell /bin/nu -c 'true' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
 sed '/^\[KDBG run:begin\]$/q' "$runtime/debug-serial.log" | tr -d '\r' > "$runtime/guest.out"
 cat "$runtime/guest.out"
 grep -Fqx 'helios init: online root=/' "$runtime/guest.out"
