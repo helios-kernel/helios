@@ -34,6 +34,8 @@ mod linux_container;
 mod log;
 mod machine;
 mod memory;
+#[cfg(feature = "wasmtime-runtime")]
+mod memory_tagging;
 mod network;
 mod process;
 mod profiling;
@@ -190,9 +192,9 @@ pub use machine::{
     spawn_generation_probe,
 };
 pub use memory::{
-    AGE_BATCH_PAGES, AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan,
-    BootRegionSplitter, COMPRESSED_PAGE_BYTES, CommittedRegion, CommittedRemoval, CompressRefusal,
-    CompressedPage, CompressedPool, CompressedPoolError, CompressedPoolStats,
+    AGE_BATCH_PAGES, AccessibilityPlan, AllocationTagHooks, BalloonHandle, BalloonStats,
+    BootMemoryPlan, BootRegionSplitter, COMPRESSED_PAGE_BYTES, CommittedRegion, CommittedRemoval,
+    CompressRefusal, CompressedPage, CompressedPool, CompressedPoolError, CompressedPoolStats,
     DEFAULT_COMPRESSION_LEVEL, DEFAULT_POOL_PERCENT, Decommitted, DetachedPages,
     ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, FIBER_STACK_GUARD_BYTES,
     FREE_PAGE_REPORT_INTERVAL, FiberStack, FiberStackArenaStats, FiberStackError,

@@ -1300,6 +1300,10 @@ jobs:
           # Every processor installed the machine's key and enabled
           # return-address signing before the kernel ran anything else.
           grep -F 'return-address signing enabled on every processor' "$runtime/inspector.log"
+          # Under TCG the inspector enables QEMU's allocation-tag storage by
+          # default, so every processor enables synchronous tag checking and
+          # passes its bring-up self-check.
+          grep -F 'memory tagging enabled on every processor' "$runtime/inspector.log"
           # The `virt` board's PL061 GPIO controller is hardware the
           # kernel has no driver for, so discovery offers it to a
           # user-mode one. This asserts the whole path from the device
@@ -1385,12 +1389,35 @@ jobs:
           grep -Fqx ok boot-acpi.out
           grep -F 'platform described by acpi' "$runtime/inspector.log"
           grep -F 'return-address signing enabled on every processor' "$runtime/inspector.log"
+          grep -F 'memory tagging enabled on every processor' "$runtime/inspector.log"
           # The ACPI walk looks for virtio transports by hardware id and
           # names nothing else, so an ACPI-described machine publishes
           # no grants. Asserting the absence keeps that a stated fact
           # rather than something that quietly starts or stops being
           # true.
           ! grep -qF 'device grant published' "$runtime/inspector.log"
+      # On a machine without FEAT_MTE2 (`--mte off`, matching HVF or pre-v8.5
+      # hardware), the backend leaves memory tagging disabled and reports it.
+      - name: Boot aarch64 guest without memory tagging
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/mte-off"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            --accel tcg --mte off \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-mte-off.out | tee "$runtime/inspector.log"
+          cat boot-mte-off.out
+          grep -Fqx ok boot-mte-off.out
+          grep -F 'memory tagging not enabled by this backend' "$runtime/inspector.log"
       - name: Run static Linux programs through dash
         timeout-minutes: 10
         shell: bash
@@ -1836,6 +1863,17 @@ jobs:
         run: |
           cargo test -p helios-inspector -- --ignored --nocapture --exact \
             vm::tests::cfi_self_test_panics_aarch64
+      - name: Refuse a tag mismatch
+        timeout-minutes: 60
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          cargo test -p helios-inspector -- --ignored --nocapture --exact \
+            vm::tests::mte_self_test_panics_aarch64
       - name: Stage prebuilt CFI kernel and image artifacts
         id: stage-prebuilt
         if: >-

@@ -21,11 +21,12 @@ use helios_hal::cpu::ProcessorId;
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{AddressSpaceError, VirtAddr, VirtRange};
 use helios_kernel::{
-    FIBER_STACK_COMMIT_STEP, FIBER_STACK_ENTRY_RESERVE, FIBER_STACK_HOST_RESERVE, FiberStack,
-    FiberStackError, FiberStackVmHooks, StackFault, StackReserveError, allocate_user_frame_zeroed,
-    allocate_user_run_zeroed_on, claim_fiber_stack, classify_stack_fault,
-    commit_fiber_stack_reserve, deallocate_user_frame, deallocate_user_run_on,
-    install_fiber_stack_arena, install_fiber_stack_hooks, install_user_memory_pool,
+    AllocationTagHooks, FIBER_STACK_COMMIT_STEP, FIBER_STACK_ENTRY_RESERVE,
+    FIBER_STACK_HOST_RESERVE, FiberStack, FiberStackError, FiberStackVmHooks, StackFault,
+    StackReserveError, allocate_user_frame_zeroed, allocate_user_run_zeroed_on, claim_fiber_stack,
+    classify_stack_fault, commit_fiber_stack_reserve, deallocate_user_frame,
+    deallocate_user_run_on, install_fiber_stack_arena, install_fiber_stack_hooks,
+    install_user_memory_pool,
 };
 
 use crate::cpu::set_current_processor;
@@ -72,6 +73,7 @@ static HOOKS: FiberStackVmHooks = FiberStackVmHooks {
         }
         Ok(())
     },
+    tags: AllocationTagHooks::NONE,
 };
 
 /// Builds the user pool and the arena on top of it, with the calling

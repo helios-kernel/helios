@@ -1226,6 +1226,7 @@ where
     if helios_hal::cpu::current_processor() == topology.bootstrap_processor {
         crate::control_flow::ReturnAddressCoverage::of(&cpu, env!("HELIOS_BUILD_TARGET"))
             .log(topology.configured_processors);
+        crate::memory_tagging::log(&cpu);
         launch_boot_init(
             &cpu,
             &kernel,

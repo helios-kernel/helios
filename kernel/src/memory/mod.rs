@@ -52,8 +52,8 @@ pub use entropy::{
 #[cfg(feature = "wasmtime-runtime")]
 pub(crate) use fiber_stack::fiber_stack_arena_installed;
 pub use fiber_stack::{
-    FIBER_STACK_GUARD_BYTES, FiberStack, FiberStackArenaStats, FiberStackError, FiberStackVmHooks,
-    StackFault, StackReserveError, claim_fiber_stack, classify_stack_fault,
+    AllocationTagHooks, FIBER_STACK_GUARD_BYTES, FiberStack, FiberStackArenaStats, FiberStackError,
+    FiberStackVmHooks, StackFault, StackReserveError, claim_fiber_stack, classify_stack_fault,
     commit_fiber_stack_reserve, fiber_stack_arena_stats, fiber_stack_reserve_commits_on,
     install_fiber_stack_arena, install_fiber_stack_hooks,
 };
