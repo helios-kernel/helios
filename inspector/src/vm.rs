@@ -47,6 +47,7 @@ mod kernel_image_cache;
 mod kill;
 mod network;
 mod numa;
+mod prebuilt;
 mod qemu;
 mod qmp;
 mod raw_profile;
@@ -65,6 +66,10 @@ use network::{
     VmNetworkError, VmNetworkFile, VmNetworkProfile, VmNetworkSetupError,
 };
 use numa::{NumaError, NumaMachine};
+use prebuilt::{
+    PrebuiltError, PrebuiltRequest, ResolvedPrebuilt, VmPrebuiltMode, resolve_prebuilt,
+    verify_kernel_root_key_compatibility,
+};
 use qemu::QemuOptions;
 use qmp::{QmpClient, QmpError, SizeError};
 use raw_profile::{ProfileCommand, RawProfileCollectError};
@@ -247,6 +252,8 @@ pub(crate) enum VmConfigError {
         source: io::Error,
     },
     #[error("{0}")]
+    Prebuilt(#[from] PrebuiltError),
+    #[error("{0}")]
     WorkspaceRoot(#[from] WorkspaceRootError),
 }
 
@@ -378,6 +385,13 @@ pub(crate) enum VmRuntimeError {
     #[error("failed to canonicalize kernel {path}: {source}")]
     CanonicalizeKernel {
         path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to copy prebuilt Limine UEFI image from {from} to {to}: {source}")]
+    CopyPrebuiltUefiImage {
+        from: String,
+        to: String,
         #[source]
         source: io::Error,
     },
@@ -1054,6 +1068,23 @@ impl KernelBuildProfile {
     }
 }
 
+/// Which Cargo profile guest wasm programs are built or consumed with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum GuestProgramsProfile {
+    Debug,
+    Release,
+}
+
+impl GuestProgramsProfile {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Release => "release",
+        }
+    }
+}
+
 /// Which build of the host tools (`helios-cli`, `helios-inspector`) a
 /// kernel build compiles beside the image.
 ///
@@ -1686,6 +1717,8 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) boot_programs: Vec<String>,
     #[serde(default)]
+    pub(crate) guest_programs_profile: Option<GuestProgramsProfile>,
+    #[serde(default)]
     pub(crate) no_compiler_plugin: Option<bool>,
     #[serde(default)]
     pub(crate) runtime_dir: Option<PathBuf>,
@@ -1809,6 +1842,52 @@ pub(crate) struct VmCommand {
 
     #[arg(long, default_value_t = false)]
     no_build: bool,
+
+    /// Reuse a prebuilt CI artifact instead of compiling locally (`image`,
+    /// `kernel`, or `userspace`). Defaults to `image` when given without a
+    /// tier name.
+    #[arg(
+        long,
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "image",
+        value_name = "TIER"
+    )]
+    prebuilt: Option<VmPrebuiltMode>,
+
+    /// Fetch the `--prebuilt` artifact from this specific GitHub Actions run ID.
+    #[arg(
+        long,
+        value_name = "RUN_ID",
+        requires = "prebuilt",
+        conflicts_with_all = ["prebuilt_ref", "prebuilt_dir"]
+    )]
+    prebuilt_run: Option<u64>,
+
+    /// Fetch the `--prebuilt` artifact from the latest green CI run matching
+    /// this commit SHA or branch name.
+    #[arg(
+        long,
+        value_name = "REF",
+        requires = "prebuilt",
+        conflicts_with_all = ["prebuilt_run", "prebuilt_dir"]
+    )]
+    prebuilt_ref: Option<String>,
+
+    /// Load the `--prebuilt` artifact from this local directory (no network
+    /// fetch). Must contain the artifact's `manifest.json`.
+    #[arg(
+        long,
+        value_name = "DIR",
+        requires = "prebuilt",
+        conflicts_with_all = ["prebuilt_run", "prebuilt_ref"]
+    )]
+    prebuilt_dir: Option<PathBuf>,
+
+    /// Override the Cargo profile (`debug` or `release`) used for guest wasm
+    /// programs in `kernel-prebuild`, independent of the kernel build profile.
+    #[arg(long, value_enum)]
+    guest_programs_profile: Option<GuestProgramsProfile>,
 
     #[arg(long)]
     smp: Option<u16>,
@@ -2375,6 +2454,9 @@ struct ResolvedVmCommand {
     qemu_bin: PathBuf,
     kernel: PathBuf,
     bootfs: PathBuf,
+    /// Prebuilt Limine UEFI disk image from `--prebuilt image`, reused directly
+    /// (copied into `runtime_dir`) so Limine does not need to be invoked.
+    uefi_image: Option<PathBuf>,
     socket: Option<PathBuf>,
     serial_stdio: bool,
     serial_pty: bool,
@@ -2590,6 +2672,15 @@ struct KernelBuildSpec {
     /// reads, and how it was asked for. `None` for every other kind.
     profile_use: Option<KernelProfileUse>,
     boot_programs: Vec<String>,
+    /// Explicit override for the guest wasm programs profile (`debug` or
+    /// `release`), decoupling guest userspace from the kernel build profile.
+    guest_programs_profile: Option<GuestProgramsProfile>,
+    /// Prebuilt userspace wasm directory passed to `kernel-prebuild
+    /// --prebuilt-wasm`, skipping `wasm-build`.
+    prebuilt_wasm: Option<PathBuf>,
+    /// When true (`--prebuilt kernel` with a matching root secret key), build
+    /// `helios-bootfs` only and skip compiling the kernel image.
+    skip_kernel_build: bool,
     no_compiler_plugin: bool,
     /// The release signing key a build was told to use, absolute. `None`
     /// is a development build, whose key `kernel-prebuild` generates in
@@ -2711,6 +2802,13 @@ impl KernelBuildSpec {
             None => Ok(kernel_prebuild_dir(self)?.join(ROOT_SECRET_FILE)),
         }
     }
+
+    /// The Cargo profile label (`debug` or `release`) passed to
+    /// `helios-cli kernel-prebuild --profile`.
+    fn guest_programs_profile(&self) -> &'static str {
+        self.guest_programs_profile
+            .map_or_else(|| self.kind.guest_programs(), GuestProgramsProfile::as_str)
+    }
 }
 
 fn debug_shortcut(command: &VmCommand, file: &VmConfigFile) -> bool {
@@ -2756,15 +2854,28 @@ fn resolve_build(
             })
         })
         .transpose()?;
+    let prebuilt_replaces_kernel = matches!(
+        command.prebuilt,
+        Some(VmPrebuiltMode::Image | VmPrebuiltMode::Kernel)
+    );
+    if prebuilt_replaces_kernel && (profile_generate || profile_use.is_some()) {
+        let mode = match command.prebuilt {
+            Some(VmPrebuiltMode::Image) => "image",
+            Some(VmPrebuiltMode::Kernel) => "kernel",
+            _ => unreachable!(),
+        };
+        return Err(PrebuiltError::ConflictsWithPgo { mode }.into());
+    }
     // A release build of the architecture performance is measured on
     // reads the fetched profile, so the kernel a developer boots, the
     // kernel the lanes measure and the kernel a release ships are the
     // same build (#226, #313). An explicit `--profile-use` is still the profile that
     // wins: it is how one profile is measured against another.
-    // A session that builds nothing and names the image it boots needs no
-    // profile: a profile describes a build, and there is none here.
-    let builds_its_own_kernel =
-        !(command.no_build && (command.kernel.is_some() || file.kernel.is_some()));
+    // A session that builds nothing and names the image it boots (or reuses a
+    // prebuilt kernel/image bundle) needs no profile: a profile describes a
+    // local kernel build, and there is none here.
+    let builds_its_own_kernel = !prebuilt_replaces_kernel
+        && !(command.no_build && (command.kernel.is_some() || file.kernel.is_some()));
     let profile_use = match profile_use {
         Some(explicit) => Some(explicit),
         None if release && builds_its_own_kernel => release_kernel_profile(
@@ -2814,6 +2925,11 @@ fn resolve_build(
         profile_use,
         kernel_features: command.kernel_features.clone(),
         boot_programs,
+        guest_programs_profile: command
+            .guest_programs_profile
+            .or(file.guest_programs_profile),
+        prebuilt_wasm: None,
+        skip_kernel_build: false,
         no_compiler_plugin,
         root_secret_key,
         bootfs_root: command.bootfs_root.clone(),
@@ -2912,7 +3028,7 @@ fn smp_argument(smp: u16, max_processors: Option<u16>) -> String {
 fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
     let file = load_config_file(command.config.as_deref())?;
     let session_command: Option<ResolvedVmSessionCommand> = command.command.take().map(Into::into);
-    let build = resolve_build(&command, &file, session_command.as_ref())?;
+    let mut build = resolve_build(&command, &file, session_command.as_ref())?;
     let profile = build.profile;
     let arch = profile.arch;
     let debug = debug_shortcut(&command, &file);
@@ -2920,8 +3036,116 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         .qemu_bin
         .or(file.qemu_bin)
         .unwrap_or_else(|| PathBuf::from(profile.qemu_bin));
-    let kernel = resolve_kernel_path(command.kernel, file.kernel, &build)?;
-    let bootfs = resolve_bootfs_path(command.bootfs, file.bootfs, &build)?;
+    let baud = if command.baud != DEFAULT_BAUD {
+        command.baud
+    } else {
+        file.baud.unwrap_or(DEFAULT_BAUD)
+    };
+    let mut no_build = command.no_build;
+    let mut uefi_image = None;
+    let explicit_kernel = command.kernel.or(file.kernel);
+    let explicit_bootfs = command.bootfs.or(file.bootfs);
+    let explicit_release = command.release || file.release.unwrap_or(false);
+    let explicit_debug = debug || command.kernel_debug || file.kernel_debug.unwrap_or(false);
+
+    let (kernel, bootfs) = if let Some(mode) = command.prebuilt {
+        let explicit_profile = match mode {
+            VmPrebuiltMode::Image | VmPrebuiltMode::Kernel => {
+                if explicit_release {
+                    Some("release")
+                } else if explicit_debug {
+                    Some("debug")
+                } else {
+                    None
+                }
+            }
+            VmPrebuiltMode::Userspace => {
+                if let Some(guest_profile) = build.guest_programs_profile {
+                    Some(guest_profile.as_str())
+                } else if explicit_release {
+                    Some("release")
+                } else if explicit_debug {
+                    Some("debug")
+                } else {
+                    None
+                }
+            }
+        };
+        let resolved = resolve_prebuilt(&PrebuiltRequest {
+            mode,
+            arch,
+            explicit_profile,
+            kernel_features: &build.kernel_features,
+            boot_programs: &build.boot_programs,
+            baud,
+            run_id: command.prebuilt_run,
+            git_ref: command.prebuilt_ref.as_deref(),
+            dir: command.prebuilt_dir.as_deref(),
+            host_build_kind: build.kind,
+        })?;
+        match resolved {
+            ResolvedPrebuilt::Image {
+                kernel,
+                bootfs,
+                uefi_image: prebuilt_uefi,
+            } => {
+                if explicit_kernel.is_some() {
+                    return Err(PrebuiltError::ConflictsWithExplicitPath {
+                        mode: "image",
+                        flag: "--kernel",
+                    }
+                    .into());
+                }
+                if explicit_bootfs.is_some() {
+                    return Err(PrebuiltError::ConflictsWithExplicitPath {
+                        mode: "image",
+                        flag: "--bootfs",
+                    }
+                    .into());
+                }
+                uefi_image = prebuilt_uefi;
+                no_build = true;
+                (kernel, bootfs)
+            }
+            ResolvedPrebuilt::Kernel {
+                kernel,
+                root_public_key,
+            } => {
+                if explicit_kernel.is_some() {
+                    return Err(PrebuiltError::ConflictsWithExplicitPath {
+                        mode: "kernel",
+                        flag: "--kernel",
+                    }
+                    .into());
+                }
+                let default_prebuild_dir = kernel_prebuild_dir(&build).ok();
+                let bootfs_matches = verify_kernel_root_key_compatibility(
+                    &root_public_key,
+                    explicit_bootfs.as_deref(),
+                    build.root_secret_key.as_deref(),
+                    default_prebuild_dir.as_deref(),
+                )?;
+                if bootfs_matches {
+                    no_build = true;
+                } else {
+                    build.skip_kernel_build = true;
+                }
+                let bootfs = resolve_bootfs_path(explicit_bootfs, None, &build)?;
+                (kernel, bootfs)
+            }
+            ResolvedPrebuilt::Userspace { dir, guest_profile } => {
+                build.prebuilt_wasm = Some(dir);
+                build.guest_programs_profile = Some(guest_profile);
+                let kernel = resolve_kernel_path(explicit_kernel, None, &build)?;
+                let bootfs = resolve_bootfs_path(explicit_bootfs, None, &build)?;
+                (kernel, bootfs)
+            }
+        }
+    } else {
+        let kernel = resolve_kernel_path(explicit_kernel, None, &build)?;
+        let bootfs = resolve_bootfs_path(explicit_bootfs, None, &build)?;
+        (kernel, bootfs)
+    };
     let smp = command.smp.or(file.smp).unwrap_or(profile.default_smp);
     let max_processors = command.max_processors.or(file.max_processors);
     if let Some(max_processors) = max_processors
@@ -2949,11 +3173,6 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         .bios
         .or(file.bios)
         .or_else(|| profile.default_bios.map(str::to_owned));
-    let baud = if command.baud != DEFAULT_BAUD {
-        command.baud
-    } else {
-        file.baud.unwrap_or(DEFAULT_BAUD)
-    };
     let mut accel = if file.accel.is_empty() && command.accel.is_empty() {
         default_accel(profile)?
     } else {
@@ -3088,10 +3307,11 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         qemu_bin,
         kernel,
         bootfs,
+        uefi_image,
         socket: command.socket,
         serial_stdio: command.serial_stdio,
         serial_pty: command.serial_pty,
-        no_build: command.no_build,
+        no_build,
         smp,
         max_processors,
         memory,
@@ -3334,6 +3554,9 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
         )?;
     }
     run_kernel_prebuild(command)?;
+    if command.skip_kernel_build {
+        return Ok(());
+    }
     let kernel_label = match &command.profile_use {
         // Which profile a PGO kernel was built from is part of what it
         // is, so the build says it rather than leaving a release build
@@ -3595,9 +3818,12 @@ fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
         .arg("--target")
         .arg(command.profile.cargo_target)
         .arg("--profile")
-        .arg(command.kind.guest_programs())
+        .arg(command.guest_programs_profile())
         .arg("--cargo")
         .arg("cargo");
+    if let Some(prebuilt_wasm) = &command.prebuilt_wasm {
+        prebuild.arg("--prebuilt-wasm").arg(prebuilt_wasm);
+    }
     for program in &command.boot_programs {
         prebuild.arg("--boot-program").arg(program);
     }
@@ -5007,6 +5233,18 @@ fn prepare_limine_uefi_image(
         Some(dir) => dir.join("kernel.uefi.img"),
         None => kernel.with_extension("uefi.img"),
     };
+    if let Some(prebuilt_uefi) = &command.uefi_image {
+        if prebuilt_uefi != &image {
+            fs::copy(prebuilt_uefi, &image).map_err(|source| {
+                VmRuntimeError::CopyPrebuiltUefiImage {
+                    from: prebuilt_uefi.display().to_string(),
+                    to: image.display().to_string(),
+                    source,
+                }
+            })?;
+        }
+        return Ok(image);
+    }
     let spinner = spinner(&format!(
         "building {} Limine UEFI disk image",
         arch_label(command.profile.arch)
@@ -7998,6 +8236,9 @@ mod tests {
             profile_use: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
+            guest_programs_profile: None,
+            prebuilt_wasm: None,
+            skip_kernel_build: false,
             no_compiler_plugin: true,
             root_secret_key: None,
             bootfs_root: None,
@@ -8047,6 +8288,9 @@ mod tests {
                     profile_use: None,
                     kernel_features: Vec::new(),
                     boot_programs: Vec::new(),
+                    guest_programs_profile: None,
+                    prebuilt_wasm: None,
+                    skip_kernel_build: false,
                     no_compiler_plugin: true,
                     root_secret_key: None,
                     bootfs_root: None,
@@ -8571,6 +8815,9 @@ mod tests {
             profile_use: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
+            guest_programs_profile: None,
+            prebuilt_wasm: None,
+            skip_kernel_build: false,
             no_compiler_plugin: false,
             root_secret_key: Some(PathBuf::from("/run/release/root.key")),
             bootfs_root: None,
@@ -8614,6 +8861,11 @@ mod tests {
             serial_stdio: false,
             serial_pty: false,
             no_build: true,
+            prebuilt: None,
+            prebuilt_run: None,
+            prebuilt_ref: None,
+            prebuilt_dir: None,
+            guest_programs_profile: None,
             smp: None,
             max_processors: None,
             memory: None,
@@ -8687,6 +8939,11 @@ mod tests {
             serial_stdio: false,
             serial_pty: false,
             no_build: true,
+            prebuilt: None,
+            prebuilt_run: None,
+            prebuilt_ref: None,
+            prebuilt_dir: None,
+            guest_programs_profile: None,
             smp: None,
             max_processors: None,
             memory: None,
@@ -9369,6 +9626,11 @@ mod tests {
             serial_stdio: false,
             serial_pty: false,
             no_build: true,
+            prebuilt: None,
+            prebuilt_run: None,
+            prebuilt_ref: None,
+            prebuilt_dir: None,
+            guest_programs_profile: None,
             smp: None,
             max_processors: None,
             memory: None,
@@ -9552,6 +9814,9 @@ mod tests {
             profile_use: None,
             kernel_features: Vec::new(),
             boot_programs: vec!["debugger".to_owned()],
+            guest_programs_profile: None,
+            prebuilt_wasm: None,
+            skip_kernel_build: false,
             no_compiler_plugin: true,
             root_secret_key: None,
             bootfs_root: None,
@@ -9564,6 +9829,7 @@ mod tests {
             bootfs: kernel_prebuild_dir(&build)
                 .expect("workspace root must resolve")
                 .join("helios-bootfs"),
+            uefi_image: None,
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -9773,6 +10039,9 @@ mod tests {
             profile_use: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
+            guest_programs_profile: None,
+            prebuilt_wasm: None,
+            skip_kernel_build: false,
             no_compiler_plugin: false,
             root_secret_key: None,
             bootfs_root: None,
@@ -9785,6 +10054,7 @@ mod tests {
             bootfs: kernel_prebuild_dir(&build)
                 .expect("workspace root must resolve")
                 .join("helios-bootfs"),
+            uefi_image: None,
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -9944,5 +10214,260 @@ mod tests {
             stages: observed_stages.join(" | "),
             lines: recent_lines.join(" | "),
         })
+    }
+
+    #[test]
+    fn resolve_prebuilt_image_skips_build_and_pgo_and_reuses_uefi_image() {
+        use ed25519_dalek::{SigningKey, VerifyingKey};
+        use helios_artifact::bootfs::{EntryKind, WriteEntry, sign_image, write_image};
+        use helios_workspace_root::prebuilt_manifest::{
+            BOOTFS_IMAGE_FILE, KERNEL_IMAGE_FILE, PREBUILT_SCHEMA_VERSION, PrebuiltArtifactKind,
+            PrebuiltManifest, PrebuiltPrograms, UEFI_DISK_IMAGE_FILE, sha256_hex, write_manifest,
+        };
+
+        let dir = TempDir::new().expect("temp dir");
+        let signing = SigningKey::from_bytes(&[3_u8; 32]);
+        let pubkey = VerifyingKey::from(&signing).to_bytes();
+        let body = write_image(&[
+            WriteEntry {
+                kind: EntryKind::InitComponent,
+                path: "bin/init",
+                data: b"init",
+                modified_nanos: 0,
+            },
+            WriteEntry {
+                kind: EntryKind::InitArgv0,
+                path: "/bin/init",
+                data: &[],
+                modified_nanos: 0,
+            },
+        ]);
+        fs::write(dir.path().join(KERNEL_IMAGE_FILE), b"elf").expect("write kernel");
+        fs::write(
+            dir.path().join(BOOTFS_IMAGE_FILE),
+            sign_image(body, &signing),
+        )
+        .expect("write bootfs");
+        fs::write(dir.path().join(ROOT_PUBLIC_FILE), pubkey).expect("write pubkey");
+        fs::write(dir.path().join(UEFI_DISK_IMAGE_FILE), b"uefi-disk").expect("write uefi");
+        write_manifest(
+            dir.path(),
+            &PrebuiltManifest {
+                schema_version: PREBUILT_SCHEMA_VERSION,
+                kind: PrebuiltArtifactKind::Image,
+                commit: Some("abcdef1234567890".to_owned()),
+                arch: Some("x86-64".to_owned()),
+                profile: "release-linux".to_owned(),
+                kernel_features: vec!["linux".to_owned()],
+                programs: Some(PrebuiltPrograms::Subset(vec![
+                    "debugger".to_owned(),
+                    "init".to_owned(),
+                ])),
+                files: vec![
+                    KERNEL_IMAGE_FILE.to_owned(),
+                    BOOTFS_IMAGE_FILE.to_owned(),
+                    ROOT_PUBLIC_FILE.to_owned(),
+                    UEFI_DISK_IMAGE_FILE.to_owned(),
+                ],
+                root_public_key_sha256: Some(sha256_hex(&pubkey)),
+                baud: Some(DEFAULT_BAUD),
+            },
+        )
+        .expect("write manifest");
+
+        let resolved = resolve(VmCommand {
+            arch: VmArch::X86_64,
+            release: true,
+            no_build: false,
+            kernel_features: vec!["linux".to_owned()],
+            boot_programs: vec!["debugger".to_owned()],
+            prebuilt: Some(VmPrebuiltMode::Image),
+            prebuilt_dir: Some(dir.path().to_path_buf()),
+            ..minimal_command()
+        })
+        .expect("prebuilt image resolves without needing PGO profile");
+
+        assert!(resolved.no_build);
+        assert_eq!(resolved.kernel, dir.path().join(KERNEL_IMAGE_FILE));
+        assert_eq!(resolved.bootfs, dir.path().join(BOOTFS_IMAGE_FILE));
+        assert_eq!(
+            resolved.uefi_image,
+            Some(dir.path().join(UEFI_DISK_IMAGE_FILE))
+        );
+
+        let runtime_dir = TempDir::new().expect("runtime dir");
+        let copied = prepare_limine_uefi_image(&resolved, Some(runtime_dir.path()))
+            .expect("prebuilt UEFI image copies directly without Limine");
+        assert_eq!(copied, runtime_dir.path().join(UEFI_DISK_IMAGE_FILE));
+        assert_eq!(fs::read(&copied).expect("read copied uefi"), b"uefi-disk");
+    }
+
+    #[test]
+    fn resolve_prebuilt_userspace_wires_prebuilt_wasm_and_profile() {
+        use helios_workspace_root::prebuilt_manifest::{
+            PREBUILT_SCHEMA_VERSION, PrebuiltArtifactKind, PrebuiltManifest, PrebuiltPrograms,
+            write_manifest,
+        };
+
+        let dir = TempDir::new().expect("temp dir");
+        fs::write(dir.path().join("helios_init.wasm"), b"wasm").expect("write wasm");
+        write_manifest(
+            dir.path(),
+            &PrebuiltManifest {
+                schema_version: PREBUILT_SCHEMA_VERSION,
+                kind: PrebuiltArtifactKind::Userspace,
+                commit: None,
+                arch: None,
+                profile: "release".to_owned(),
+                kernel_features: Vec::new(),
+                programs: Some(PrebuiltPrograms::All),
+                files: vec!["helios_init.wasm".to_owned()],
+                root_public_key_sha256: None,
+                baud: None,
+            },
+        )
+        .expect("write manifest");
+
+        let resolved = resolve(VmCommand {
+            arch: VmArch::Riscv64,
+            no_build: false,
+            prebuilt: Some(VmPrebuiltMode::Userspace),
+            prebuilt_dir: Some(dir.path().to_path_buf()),
+            ..minimal_command()
+        })
+        .expect("prebuilt userspace resolves cleanly");
+
+        assert!(!resolved.no_build);
+        assert_eq!(resolved.build.prebuilt_wasm.as_deref(), Some(dir.path()));
+        assert_eq!(resolved.build.guest_programs_profile(), "release");
+    }
+
+    #[test]
+    fn resolve_guest_programs_profile_decouples_userspace_from_release_kernel() {
+        let resolved = resolve(VmCommand {
+            arch: VmArch::Aarch64,
+            release: true,
+            guest_programs_profile: Some(GuestProgramsProfile::Debug),
+            ..minimal_command()
+        })
+        .expect("release kernel with debug guest programs resolves");
+
+        assert_eq!(resolved.build.kind, KernelBuildProfile::Release);
+        assert_eq!(resolved.build.guest_programs_profile(), "debug");
+    }
+
+    #[test]
+    fn resolve_prebuilt_kernel_checks_root_key_compatibility() {
+        use ed25519_dalek::{SigningKey, VerifyingKey};
+        use helios_workspace_root::prebuilt_manifest::{
+            KERNEL_IMAGE_FILE, PREBUILT_SCHEMA_VERSION, PrebuiltArtifactKind, PrebuiltManifest,
+            sha256_hex, write_manifest,
+        };
+        use helios_workspace_root::root_key::SECRET_KEY_MODE;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().expect("temp dir");
+        let seed = [42_u8; 32];
+        let signing = SigningKey::from_bytes(&seed);
+        let pubkey = VerifyingKey::from(&signing).to_bytes();
+        fs::write(dir.path().join(KERNEL_IMAGE_FILE), b"elf").expect("write kernel");
+        fs::write(dir.path().join(ROOT_PUBLIC_FILE), pubkey).expect("write pubkey");
+        write_manifest(
+            dir.path(),
+            &PrebuiltManifest {
+                schema_version: PREBUILT_SCHEMA_VERSION,
+                kind: PrebuiltArtifactKind::Kernel,
+                commit: None,
+                arch: Some("x86-64".to_owned()),
+                profile: "release".to_owned(),
+                kernel_features: Vec::new(),
+                programs: None,
+                files: vec![KERNEL_IMAGE_FILE.to_owned(), ROOT_PUBLIC_FILE.to_owned()],
+                root_public_key_sha256: Some(sha256_hex(&pubkey)),
+                baud: None,
+            },
+        )
+        .expect("write manifest");
+
+        // Without matching --bootfs or --root-secret-key, fails fast!
+        let missing = resolve(VmCommand {
+            arch: VmArch::X86_64,
+            release: true,
+            no_build: false,
+            prebuilt: Some(VmPrebuiltMode::Kernel),
+            prebuilt_dir: Some(dir.path().to_path_buf()),
+            ..minimal_command()
+        })
+        .expect_err("prebuilt kernel without matching key must fail fast");
+        assert!(matches!(
+            missing,
+            VmConfigError::Prebuilt(PrebuiltError::KernelRootKeyUnavailable { .. })
+        ));
+
+        // With matching --root-secret-key, resolves with skip_kernel_build = true!
+        let secret_dir = TempDir::new().expect("secret dir");
+        let secret_path = secret_dir.path().join("root.key");
+        fs::write(&secret_path, seed).expect("write secret");
+        fs::set_permissions(&secret_path, fs::Permissions::from_mode(SECRET_KEY_MODE))
+            .expect("chmod 600");
+
+        let resolved = resolve(VmCommand {
+            arch: VmArch::X86_64,
+            release: true,
+            no_build: false,
+            root_secret_key: Some(secret_path),
+            prebuilt: Some(VmPrebuiltMode::Kernel),
+            prebuilt_dir: Some(dir.path().to_path_buf()),
+            ..minimal_command()
+        })
+        .expect("matching root secret key allows local bootfs build");
+        assert!(!resolved.no_build);
+        assert!(resolved.build.skip_kernel_build);
+        assert_eq!(resolved.kernel, dir.path().join(KERNEL_IMAGE_FILE));
+    }
+
+    #[test]
+    fn cli_parses_prebuilt_and_guest_programs_profile_flags() {
+        use clap::Parser;
+
+        let parsed = crate::Args::try_parse_from([
+            "helios-inspector",
+            "vm",
+            "--arch",
+            "x86-64",
+            "--release",
+            "--guest-programs-profile",
+            "debug",
+            "--prebuilt",
+            "image",
+            "--prebuilt-dir",
+            "/tmp/prebuilt",
+            "shell",
+            "-c",
+            "echo ok",
+        ])
+        .expect("vm --prebuilt image parses");
+        let Some(crate::Command::Vm(vm)) = parsed.command else {
+            panic!("expected Vm command");
+        };
+        assert_eq!(vm.prebuilt, Some(VmPrebuiltMode::Image));
+        assert_eq!(vm.prebuilt_dir, Some(PathBuf::from("/tmp/prebuilt")));
+        assert_eq!(vm.guest_programs_profile, Some(GuestProgramsProfile::Debug));
+
+        let bare = crate::Args::try_parse_from([
+            "helios-inspector",
+            "vm",
+            "--prebuilt",
+            "--arch",
+            "x86-64",
+            "shell",
+            "-c",
+            "echo ok",
+        ])
+        .expect("bare --prebuilt defaults to image");
+        let Some(crate::Command::Vm(vm)) = bare.command else {
+            panic!("expected Vm command");
+        };
+        assert_eq!(vm.prebuilt, Some(VmPrebuiltMode::Image));
     }
 }

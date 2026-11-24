@@ -602,6 +602,22 @@ fn verify_signature(
     bytes: &'static [u8],
     trusted_public_keys: &[[u8; 32]],
 ) -> Result<(&'static [u8], [u8; 32], Digest256), BootfsError> {
+    verify_footer(bytes, Some(trusted_public_keys))
+}
+
+/// Validates the signature footer of `bytes` and verifies the Ed25519
+/// signature under its embedded signer public key, returning that 32-byte key.
+///
+/// Host tooling uses this to check whether a prebuilt `helios-bootfs` payload
+/// was signed by the root key a prebuilt kernel trusts before launching QEMU.
+pub fn verified_signer(bytes: &[u8]) -> Result<[u8; 32], BootfsError> {
+    verify_footer(bytes, None).map(|(_, signer, _)| signer)
+}
+
+fn verify_footer<'a>(
+    bytes: &'a [u8],
+    trusted_public_keys: Option<&[[u8; 32]]>,
+) -> Result<(&'a [u8], [u8; 32], Digest256), BootfsError> {
     let Some(body_len) = bytes.len().checked_sub(SIGNATURE_FOOTER_BYTES) else {
         return Err(BootfsError::MissingSignature);
     };
@@ -623,7 +639,9 @@ fn verify_signature(
     let signer: [u8; 32] = footer[FOOTER_SIGNER_OFFSET..FOOTER_SIGNATURE_OFFSET]
         .try_into()
         .expect("signer field is 32 bytes");
-    if !trusted_public_keys.contains(&signer) {
+    if let Some(trusted_public_keys) = trusted_public_keys
+        && !trusted_public_keys.contains(&signer)
+    {
         return Err(BootfsError::UntrustedSigner {
             signer: Fingerprint::of(&signer),
             trusted: FingerprintList(trusted_public_keys.iter().map(Fingerprint::of).collect()),
