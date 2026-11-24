@@ -35,7 +35,10 @@ use core::fmt;
 use arrayvec::ArrayVec;
 use ed25519_dalek::SigningKey;
 use helios_artifact::bootfs::Fingerprint;
-use helios_artifact::{ParsedArtifact, TrailerError, sign_payload_with_key, verify_signed_payload};
+use helios_artifact::{
+    ParsedArtifact, TrailerError, sign_payload_trailer_with_key, sign_payload_with_key,
+    verify_signed_payload,
+};
 use helios_hal::measured_boot::{
     MAX_MEASUREMENT_BANKS, MeasuredBoot, MeasuredBootError, MeasurementAlgorithm,
     MeasurementDigest, MeasurementRegister, MeasurementSet, SealedSecret, UnsealRefused,
@@ -97,6 +100,12 @@ impl CwasmSigningKey {
     /// signer and its issuer.
     pub fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, TrailerError> {
         sign_payload_with_key(payload, &self.key)
+    }
+
+    /// Only the encoded signature trailer and footer for `payload`, for
+    /// callers that stream `payload` straight to storage without copying it.
+    pub fn sign_trailer(&self, payload: &[u8]) -> Result<Vec<u8>, TrailerError> {
+        sign_payload_trailer_with_key(payload, &self.key)
     }
 
     /// The payload of `artifact`, when its trailer was issued by this key.
