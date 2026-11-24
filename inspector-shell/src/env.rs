@@ -2,6 +2,8 @@
 //! and [`helios_ops::http`] (`zenwave`), plus host-only `fleet`, `bundle`, `trace`, and
 //! `--local` file I/O commands.
 
+use core::future::Future;
+use core::pin::Pin;
 use core::time::Duration;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -727,21 +729,32 @@ impl HeliosEnv for HostEnv {
         ctx: &'a mut AsyncCommandContext<'_, Self>,
         input: AsyncPipelineData,
     ) -> Result<AsyncPipelineData, ShellError> {
-        match name {
-            "fleet" => run_fleet_overview(self, ctx).await,
-            "fleet inspect" => run_fleet_inspect(self, ctx).await,
-            "fleet ps" => run_fleet_ps(self, ctx).await,
-            "fleet exec" => run_fleet_exec(self, ctx).await,
-            "bundle" => run_bundle(self, ctx).await,
-            "trace" => run_trace(self, ctx).await,
-            "ls" => run_host_ls(ctx, input).await,
-            "open" => run_host_open(ctx, input).await,
-            "save" => run_host_save(ctx, input).await,
-            other => Err(shell_err(
-                "unknown host command",
-                format!("unhandled host command `{other}`"),
-                ctx.call.head,
-            )),
+        run_custom_command_boxed(self, name, ctx, input).await
+    }
+}
+
+/// Box each host-only custom command future independently so `HostEnv::run_custom_command`
+/// stays 16 bytes on the caller's stack rather than combining every host command future.
+fn run_custom_command_boxed<'a>(
+    env: &'a HostEnv,
+    name: &'a str,
+    ctx: &'a mut AsyncCommandContext<'_, HostEnv>,
+    input: AsyncPipelineData,
+) -> Pin<Box<dyn Future<Output = Result<AsyncPipelineData, ShellError>> + Send + 'a>> {
+    match name {
+        "fleet" => Box::pin(run_fleet_overview(env, ctx)),
+        "fleet inspect" => Box::pin(run_fleet_inspect(env, ctx)),
+        "fleet ps" => Box::pin(run_fleet_ps(env, ctx)),
+        "fleet exec" => Box::pin(run_fleet_exec(env, ctx)),
+        "bundle" => Box::pin(run_bundle(env, ctx)),
+        "trace" => Box::pin(run_trace(env, ctx)),
+        "ls" => Box::pin(run_host_ls(ctx, input)),
+        "open" => Box::pin(run_host_open(ctx, input)),
+        "save" => Box::pin(run_host_save(ctx, input)),
+        other => {
+            let head = ctx.call.head;
+            let msg = format!("unhandled host command `{other}`");
+            Box::pin(async move { Err(shell_err("unknown host command", msg, head)) })
         }
     }
 }

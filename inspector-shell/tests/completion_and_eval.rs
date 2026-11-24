@@ -498,6 +498,15 @@ async fn with_scope_enforces_monotonic_attenuation_and_blocks_escapes() {
     let (session, _counters, server_task) = spawn_mock_guest(Duration::ZERO);
     let env = HostEnv::new(session, None);
 
+    // Guard against async future state-machine bloat that would overflow 2 MiB debug stacks.
+    let probe_fut = eval_command(env.clone(), "inspect", OutputFormat::Json);
+    let eval_fut_bytes = std::mem::size_of_val(&probe_fut);
+    assert!(
+        eval_fut_bytes < 16 * 1024,
+        "eval_command future grew too large for debug thread stacks: {eval_fut_bytes} bytes"
+    );
+    drop(probe_fut);
+
     let scoped_ok = eval_command(
         env.clone(),
         "with-scope /core/http-client { inspect /core/http-client | length }",
