@@ -77,6 +77,8 @@ pub enum OpsError {
     NotFound { path: String },
     #[error("capability attenuation denied `{capability}` for scope `{scope}`")]
     AttenuationDenied { capability: String, scope: String },
+    #[error("invalid capability grant `{spec}`: {reason}")]
+    InvalidGrant { spec: String, reason: String },
 }
 
 impl OpsError {
@@ -197,6 +199,11 @@ pub enum TransportError {
         #[source]
         source: io::Error,
     },
+    #[error(
+        "TLS + Ed25519 CapabilityCert handshake for `helios://{host}:{port}` is not yet implemented \
+         (tracked by #1190); use explicit `tcp://{host}:{port}` for plaintext development links"
+    )]
+    TlsNotYetImplemented { host: String, port: u16 },
 }
 
 /// Errors loading or exchanging operator identities and capability certificates.

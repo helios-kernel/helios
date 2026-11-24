@@ -323,6 +323,8 @@ pub(crate) enum OpsCliError {
     Target(#[from] TargetError),
     #[error("{0}")]
     Repl(#[from] ReplError),
+    #[error("{0}")]
+    Terminal(#[from] crate::tui::TerminalError),
     #[error("unknown capability `{raw}` in `--only`")]
     UnknownCapability { raw: String },
     #[error("invalid environment variable `{raw}`; expected `KEY=VALUE`")]
@@ -1032,13 +1034,17 @@ pub(crate) async fn run_spawn(session: &Session, cmd: &SpawnCommand) -> Result<(
         };
         env.push((k.to_owned(), v.to_owned()));
     }
-    let _ = &cmd.grants;
+    let mut capability_grants = Vec::with_capacity(cmd.grants.len());
+    for spec in &cmd.grants {
+        capability_grants.push(helios_ops::session::parse_capability_grant(spec)?);
+    }
     let child = session
         .spawn(SpawnRequest {
             path: cmd.path.clone(),
             args: cmd.args.clone(),
             env,
             stdin: Vec::new(),
+            capability_grants,
         })
         .await?;
 

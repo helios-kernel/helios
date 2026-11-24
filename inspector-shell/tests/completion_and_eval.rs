@@ -490,3 +490,53 @@ async fn eval_command_supports_pipelines_local_io_bundle_and_fleet() {
 
     server_task.abort();
 }
+
+#[tokio::test]
+async fn with_scope_enforces_monotonic_attenuation_and_blocks_escapes() {
+    let (session, _counters, server_task) = spawn_mock_guest(Duration::ZERO);
+    let env = HostEnv::new(session, None);
+
+    let scoped_ok = eval_command(
+        env.clone(),
+        "with-scope /core/http-client { inspect /core/http-client | length }",
+        OutputFormat::Json,
+    )
+    .await
+    .expect("in-scope inspect succeeds");
+    assert_eq!(scoped_ok.trim(), "1");
+
+    let kernel_escape = eval_command(
+        env.clone(),
+        "with-scope /core/http-client { inspect /kernel/ }",
+        OutputFormat::Json,
+    )
+    .await;
+    assert!(
+        kernel_escape.is_err(),
+        "with-scope /core/http-client must deny `/kernel/` inspect, got {kernel_escape:?}"
+    );
+
+    let sibling_escape = eval_command(
+        env.clone(),
+        "with-scope /core/http-client { inspect /core/http-client-admin }",
+        OutputFormat::Json,
+    )
+    .await;
+    assert!(
+        sibling_escape.is_err(),
+        "with-scope must enforce path-segment boundaries, got {sibling_escape:?}"
+    );
+
+    let widen_escape = eval_command(
+        env,
+        "with-scope /core/http-client { with-scope / { inspect } }",
+        OutputFormat::Json,
+    )
+    .await;
+    assert!(
+        widen_escape.is_err(),
+        "nested with-scope must not widen back to `/`, got {widen_escape:?}"
+    );
+
+    server_task.abort();
+}

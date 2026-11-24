@@ -19,12 +19,19 @@ use helios_inspector_protocol::system::{
     profiling::{
         self, Filter as ProfileFilter, FoldedSample, InstructionProfile, MetricFilter, MetricSample,
     },
-    programs::{self, ExecRequest, ExecResult},
+    programs::{
+        self, AuthorityScope, CapabilityGrant, ClockGrant, ClockRight, DeviceClass, DeviceGrant,
+        DiagnosticsGrant, DirectoryGrant, ExecRequest, ExecResult, FilesystemRight, LinkGrant,
+        LinkRight, MachineGrant, MachineRight, MountGrant, MountRight, NetworkGrant, NetworkRight,
+        ProcessGrant, ProcessRight, SettingsGrant, SettingsRight, TerminalGrant, TerminalRight,
+    },
     tracing as sys_tracing,
 };
 
 use crate::error::OpsError;
-use crate::target::{Attenuation, GrantRight, IdentityProfile, Target};
+use crate::target::{
+    Attenuation, GrantRight, IdentityProfile, Target, normalize_scope, scope_contains,
+};
 use crate::transport::{ProtocolClient, RpcConnection, SecurityMode};
 
 /// Default per-RPC timeout when none is configured on [`SessionOptions`].
@@ -60,6 +67,7 @@ pub struct SpawnRequest {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub stdin: Vec<u8>,
+    pub capability_grants: Vec<CapabilityGrant>,
 }
 
 impl SpawnRequest {
@@ -70,6 +78,312 @@ impl SpawnRequest {
             args,
             env: Vec::new(),
             stdin: Vec::new(),
+            capability_grants: Vec::new(),
+        }
+    }
+}
+
+/// Parse a CLI `--grant` string (e.g. `dir:/tmp:rw`, `net:tcp,dns`, `inspect:own`,
+/// `diagnostics:control`, `terminal:all`, `process:spawn,exec`) into a typed [`CapabilityGrant`].
+pub fn parse_capability_grant(spec: &str) -> Result<CapabilityGrant, OpsError> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Err(OpsError::InvalidGrant {
+            spec: spec.to_owned(),
+            reason: "grant specification must not be empty".to_owned(),
+        });
+    }
+    let parts: Vec<&str> = trimmed.splitn(3, ':').collect();
+    match parts.as_slice() {
+        [kind] => parse_grant_spec(kind, "", None),
+        [kind, target] => parse_grant_spec(kind, target, None),
+        [kind, target, mode] => parse_grant_spec(kind, target, Some(mode)),
+        _ => unreachable!("splitn(3) produces 1..=3 parts"),
+    }
+}
+
+/// Translate structured `(kind, target, mode)` grant fields (used by both `--grant`
+/// and Nushell `with-grants`) into a wire [`CapabilityGrant`], failing fast on
+/// unknown kinds or modes.
+pub fn parse_grant_spec(
+    kind: &str,
+    target: &str,
+    mode: Option<&str>,
+) -> Result<CapabilityGrant, OpsError> {
+    let spec_display = match mode {
+        Some(m) if !m.is_empty() => format!("{kind}:{target}:{m}"),
+        _ if !target.is_empty() => format!("{kind}:{target}"),
+        _ => kind.to_owned(),
+    };
+    let invalid = |reason: &str| OpsError::InvalidGrant {
+        spec: spec_display.clone(),
+        reason: reason.to_owned(),
+    };
+
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "dir" | "fs" | "directory" => {
+            if target.is_empty() {
+                return Err(invalid("directory grant requires a path"));
+            }
+            let norm = normalize_absolute_path(target)?;
+            let rights = match mode.unwrap_or("ro").trim().to_ascii_lowercase().as_str() {
+                "ro" | "r" => vec![FilesystemRight::Read],
+                "rx" => vec![FilesystemRight::Read, FilesystemRight::Execute],
+                "rw" => vec![
+                    FilesystemRight::Read,
+                    FilesystemRight::Write,
+                    FilesystemRight::MutateDirectory,
+                ],
+                "rwx" => vec![
+                    FilesystemRight::Read,
+                    FilesystemRight::Write,
+                    FilesystemRight::MutateDirectory,
+                    FilesystemRight::Execute,
+                ],
+                other => {
+                    return Err(OpsError::InvalidGrant {
+                        spec: spec_display,
+                        reason: format!("unknown directory mode `{other}`; expected ro|rx|rw|rwx"),
+                    });
+                }
+            };
+            Ok(CapabilityGrant::Directory(DirectoryGrant {
+                source_path: norm.clone(),
+                guest_name: norm,
+                rights,
+            }))
+        }
+        "net" | "network" => {
+            let tokens = if target.is_empty() || target.eq_ignore_ascii_case("all") {
+                vec!["tcp", "udp", "dns", "privileged-bind", "multicast", "admin"]
+            } else {
+                target.split(',').collect()
+            };
+            let mut rights = Vec::with_capacity(tokens.len());
+            for tok in tokens {
+                let r = match tok.trim().to_ascii_lowercase().as_str() {
+                    "tcp" => NetworkRight::Tcp,
+                    "udp" => NetworkRight::Udp,
+                    "dns" => NetworkRight::Dns,
+                    "privileged-bind" => NetworkRight::PrivilegedBind,
+                    "multicast" => NetworkRight::Multicast,
+                    "admin" => NetworkRight::Admin,
+                    other => {
+                        return Err(OpsError::InvalidGrant {
+                            spec: spec_display,
+                            reason: format!("unknown network right `{other}`"),
+                        });
+                    }
+                };
+                rights.push(r);
+            }
+            Ok(CapabilityGrant::Network(NetworkGrant { rights }))
+        }
+        "clock" => {
+            if !target.is_empty()
+                && !target.eq_ignore_ascii_case("set-wall-clock")
+                && !target.eq_ignore_ascii_case("all")
+            {
+                return Err(invalid("expected `clock:set-wall-clock` or `clock:all`"));
+            }
+            Ok(CapabilityGrant::Clock(ClockGrant {
+                rights: vec![ClockRight::SetWallClock],
+            }))
+        }
+        "terminal" | "tty" => {
+            let tokens = if target.is_empty() || target.eq_ignore_ascii_case("all") {
+                vec!["input", "output", "control"]
+            } else {
+                target.split(',').collect()
+            };
+            let mut rights = Vec::with_capacity(tokens.len());
+            for tok in tokens {
+                let r = match tok.trim().to_ascii_lowercase().as_str() {
+                    "input" => TerminalRight::Input,
+                    "output" => TerminalRight::Output,
+                    "control" => TerminalRight::Control,
+                    other => {
+                        return Err(OpsError::InvalidGrant {
+                            spec: spec_display,
+                            reason: format!("unknown terminal right `{other}`"),
+                        });
+                    }
+                };
+                rights.push(r);
+            }
+            Ok(CapabilityGrant::Terminal(TerminalGrant { rights }))
+        }
+        "process" | "proc" => {
+            let tokens = if target.is_empty() || target.eq_ignore_ascii_case("all") {
+                vec!["spawn", "exec", "fork", "join", "signal"]
+            } else {
+                target.split(',').collect()
+            };
+            let mut rights = Vec::with_capacity(tokens.len());
+            for tok in tokens {
+                let r = match tok.trim().to_ascii_lowercase().as_str() {
+                    "spawn" => ProcessRight::Spawn,
+                    "exec" => ProcessRight::Exec,
+                    "fork" => ProcessRight::Fork,
+                    "join" => ProcessRight::Join,
+                    "signal" => ProcessRight::Signal,
+                    other => {
+                        return Err(OpsError::InvalidGrant {
+                            spec: spec_display,
+                            reason: format!("unknown process right `{other}`"),
+                        });
+                    }
+                };
+                rights.push(r);
+            }
+            Ok(CapabilityGrant::Process(ProcessGrant { rights }))
+        }
+        "link" => {
+            let tokens = if target.is_empty() || target.eq_ignore_ascii_case("all") {
+                vec![
+                    "source",
+                    "target-directory",
+                    "symlink-create",
+                    "symlink-read",
+                ]
+            } else {
+                target.split(',').collect()
+            };
+            let mut rights = Vec::with_capacity(tokens.len());
+            for tok in tokens {
+                let r = match tok.trim().to_ascii_lowercase().as_str() {
+                    "source" => LinkRight::Source,
+                    "target-directory" => LinkRight::TargetDirectory,
+                    "symlink-create" => LinkRight::SymlinkCreate,
+                    "symlink-read" => LinkRight::SymlinkRead,
+                    other => {
+                        return Err(OpsError::InvalidGrant {
+                            spec: spec_display,
+                            reason: format!("unknown link right `{other}`"),
+                        });
+                    }
+                };
+                rights.push(r);
+            }
+            Ok(CapabilityGrant::Link(LinkGrant { rights }))
+        }
+        "mount" => {
+            let tokens = if target.is_empty() || target.eq_ignore_ascii_case("all") {
+                vec!["mount", "unmount"]
+            } else {
+                target.split(',').collect()
+            };
+            let mut rights = Vec::with_capacity(tokens.len());
+            for tok in tokens {
+                let r = match tok.trim().to_ascii_lowercase().as_str() {
+                    "mount" => MountRight::Mount,
+                    "unmount" => MountRight::Unmount,
+                    other => {
+                        return Err(OpsError::InvalidGrant {
+                            spec: spec_display,
+                            reason: format!("unknown mount right `{other}`"),
+                        });
+                    }
+                };
+                rights.push(r);
+            }
+            Ok(CapabilityGrant::Mount(MountGrant { rights }))
+        }
+        "device" | "dev" => {
+            let tokens = if target.is_empty() || target.eq_ignore_ascii_case("all") {
+                vec!["display", "input", "gpu", "audio"]
+            } else {
+                target.split(',').collect()
+            };
+            let mut classes = Vec::with_capacity(tokens.len());
+            for tok in tokens {
+                let c = match tok.trim().to_ascii_lowercase().as_str() {
+                    "display" => DeviceClass::Display,
+                    "input" => DeviceClass::Input,
+                    "gpu" => DeviceClass::Gpu,
+                    "audio" => DeviceClass::Audio,
+                    other => {
+                        return Err(OpsError::InvalidGrant {
+                            spec: spec_display,
+                            reason: format!("unknown device class `{other}`"),
+                        });
+                    }
+                };
+                classes.push(c);
+            }
+            Ok(CapabilityGrant::Device(DeviceGrant { classes }))
+        }
+        "inspect" => Ok(CapabilityGrant::Diagnostics(DiagnosticsGrant::InspectRead(
+            parse_authority_scope(target, &spec_display)?,
+        ))),
+        "trace" | "tracing" => Ok(CapabilityGrant::Diagnostics(DiagnosticsGrant::TraceRead(
+            parse_authority_scope(target, &spec_display)?,
+        ))),
+        "profile" | "profiling" => Ok(CapabilityGrant::Diagnostics(DiagnosticsGrant::ProfileRead(
+            parse_authority_scope(target, &spec_display)?,
+        ))),
+        "diagnostics" => {
+            if !target.is_empty() && !target.eq_ignore_ascii_case("control") {
+                return Err(invalid("expected `diagnostics:control`"));
+            }
+            Ok(CapabilityGrant::Diagnostics(DiagnosticsGrant::Control))
+        }
+        "instance-control" | "instances" => Ok(CapabilityGrant::InstanceControl(
+            parse_authority_scope(target, &spec_display)?,
+        )),
+        "settings" => {
+            if !target.is_empty() && !target.eq_ignore_ascii_case("write") {
+                return Err(invalid("expected `settings:write`"));
+            }
+            Ok(CapabilityGrant::Settings(SettingsGrant {
+                rights: vec![SettingsRight::Write],
+            }))
+        }
+        "machine" => {
+            let tokens = if target.is_empty() || target.eq_ignore_ascii_case("all") {
+                vec!["control", "identity"]
+            } else {
+                target.split(',').collect()
+            };
+            let mut rights = Vec::with_capacity(tokens.len());
+            for tok in tokens {
+                let r = match tok.trim().to_ascii_lowercase().as_str() {
+                    "control" => MachineRight::Control,
+                    "identity" => MachineRight::Identity,
+                    other => {
+                        return Err(OpsError::InvalidGrant {
+                            spec: spec_display,
+                            reason: format!("unknown machine right `{other}`"),
+                        });
+                    }
+                };
+                rights.push(r);
+            }
+            Ok(CapabilityGrant::Machine(MachineGrant { rights }))
+        }
+        other => Err(OpsError::InvalidGrant {
+            spec: spec_display,
+            reason: format!("unknown capability grant kind `{other}`"),
+        }),
+    }
+}
+
+fn parse_authority_scope(raw: &str, spec: &str) -> Result<AuthorityScope, OpsError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "own" => Ok(AuthorityScope::Own),
+        "subtree" => Ok(AuthorityScope::Subtree(None)),
+        "machine" => Ok(AuthorityScope::Machine),
+        other => {
+            if let Ok(id) = other.parse::<u64>() {
+                Ok(AuthorityScope::Subtree(Some(id)))
+            } else {
+                Err(OpsError::InvalidGrant {
+                    spec: spec.to_owned(),
+                    reason: format!(
+                        "unknown authority scope `{other}`; expected own|subtree|machine|<instance-id>"
+                    ),
+                })
+            }
         }
     }
 }
@@ -223,12 +537,14 @@ impl Session {
         self.connection.client()
     }
 
-    /// Return a new [`Session`] handle sharing this connection with narrowed attenuation.
-    #[must_use]
-    pub fn attenuated(&self, attenuation: Attenuation) -> Self {
+    /// Return a new [`Session`] handle sharing this connection with monotonically
+    /// narrowed attenuation. Refuses any privilege or scope widening with
+    /// [`OpsError::AttenuationDenied`].
+    pub fn attenuated(&self, attenuation: Attenuation) -> Result<Self, OpsError> {
+        let narrowed = self.options.attenuation.attenuate(&attenuation)?;
         let mut next = self.clone();
-        next.options.attenuation = attenuation;
-        next
+        next.options.attenuation = narrowed;
+        Ok(next)
     }
 
     /// Active principal name for `whoami`.
@@ -265,35 +581,35 @@ impl Session {
     /// Query `helios:system/inspect` across `/kernel/*` and component inspect trees.
     pub async fn inspect(&self, prefixes: &[&str], limit: u32) -> Result<SnapshotResult, OpsError> {
         self.require_right(GrantRight::Inspect)?;
+        let active_scope = normalize_scope(self.options.attenuation.effective_scope());
         let scoped_owned: Vec<String>;
-        let effective_prefixes: Vec<&str> = if prefixes.is_empty() {
-            if let Some(scope) = self.options.attenuation.scope.as_deref()
-                && scope != "/"
-            {
-                vec![scope]
-            } else {
-                Vec::new()
-            }
-        } else if let Some(scope) = self.options.attenuation.scope.as_deref()
-            && scope != "/"
-        {
+        let effective_prefixes: Vec<&str> = if active_scope == "/" {
+            prefixes.to_vec()
+        } else if prefixes.is_empty() {
+            vec![active_scope.as_str()]
+        } else {
             scoped_owned = prefixes
                 .iter()
                 .map(|p| {
-                    if p.starts_with(scope) || p.starts_with("/kernel/") {
-                        (*p).to_owned()
+                    let candidate = if p.starts_with('/') {
+                        normalize_absolute_path(p)?
                     } else {
-                        format!(
-                            "{}/{}",
-                            scope.trim_end_matches('/'),
-                            p.trim_start_matches('/')
-                        )
+                        normalize_absolute_path(&format!("{active_scope}/{p}"))?
+                    };
+                    if !scope_contains(&active_scope, &candidate) {
+                        return Err(OpsError::AttenuationDenied {
+                            capability: GrantRight::Inspect.as_str().to_owned(),
+                            scope: active_scope.clone(),
+                        });
+                    }
+                    if p.ends_with('/') && candidate != "/" {
+                        Ok(format!("{candidate}/"))
+                    } else {
+                        Ok(candidate)
                     }
                 })
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
             scoped_owned.iter().map(String::as_str).collect()
-        } else {
-            prefixes.to_vec()
         };
 
         let answer = self
@@ -302,10 +618,16 @@ impl Session {
                 inspect::snapshot_prefixes(self.connection.client(), &effective_prefixes, limit),
             )
             .await?;
-        answer.map_err(|source| OpsError::FilterRefused {
+        let mut snapshot = answer.map_err(|source| OpsError::FilterRefused {
             operation: "system.inspect.snapshot",
             source,
-        })
+        })?;
+        if active_scope != "/" {
+            snapshot
+                .entries
+                .retain(|entry| scope_contains(&active_scope, &normalize_scope(&entry.path)));
+        }
+        Ok(snapshot)
     }
 
     /// Decode the `/kernel/*` inspect subtree into a typed [`KernelSnapshot`].
@@ -317,11 +639,17 @@ impl Session {
     /// List live instances (`ps`).
     pub async fn instances(&self) -> Result<Vec<Instance>, OpsError> {
         self.require_right(GrantRight::InstanceRead)?;
-        self.call(
-            "system.instances.snapshot",
-            instances::snapshot(self.connection.client()),
-        )
-        .await
+        let mut live = self
+            .call(
+                "system.instances.snapshot",
+                instances::snapshot(self.connection.client()),
+            )
+            .await?;
+        let active_scope = normalize_scope(self.options.attenuation.effective_scope());
+        if active_scope != "/" {
+            live.retain(|inst| scope_contains(&active_scope, &normalize_scope(&inst.name)));
+        }
+        Ok(live)
     }
 
     /// Alias for [`Self::instances`].
@@ -606,7 +934,10 @@ impl Session {
         let session = self.clone();
         let instance_slot = Arc::clone(&instance_id);
         tokio::spawn(async move {
-            let outcome = if request.env.is_empty() && request.stdin.is_empty() {
+            let outcome = if request.env.is_empty()
+                && request.stdin.is_empty()
+                && request.capability_grants.is_empty()
+            {
                 session.exec(&path, &request.args).await
             } else {
                 let req = ExecRequest {
@@ -616,13 +947,9 @@ impl Session {
                     path: path.clone(),
                     stdin: request.stdin,
                     hint: None,
-                    capability_grants: Vec::new(),
+                    capability_grants: request.capability_grants,
                 };
-                match session.exec_request(&req).await {
-                    Ok(res) => Ok(res),
-                    Err(OpsError::Rpc { .. }) => session.exec(&path, &req.args).await,
-                    Err(err) => Err(err),
-                }
+                session.exec_request(&req).await
             };
 
             match outcome {
@@ -852,5 +1179,139 @@ pub fn normalize_absolute_path(input: &str) -> Result<String, OpsError> {
         Ok("/".to_owned())
     } else {
         Ok(format!("/{}", segments.join("/")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::os::unix::net::UnixStream;
+
+    use async_io::Async;
+
+    use super::*;
+    use crate::target::TargetUri;
+    use crate::transport::{RpcConnection, SecurityMode};
+
+    fn dummy_session(attenuation: Attenuation) -> Session {
+        let (host, _guest) = UnixStream::pair().expect("socket pair");
+        host.set_nonblocking(true).expect("nonblocking");
+        let read = host.try_clone().expect("clone");
+        let conn = RpcConnection::from_split(
+            Box::new(Async::new(read).expect("async read")),
+            Box::new(Async::new(host).expect("async write")),
+        );
+        let target = Target::new("node", "tcp://127.0.0.1:9443").expect("target");
+        Session::from_connection(
+            target,
+            conn,
+            SessionOptions {
+                attenuation,
+                ..SessionOptions::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn session_attenuation_is_strictly_monotonic() {
+        let base = dummy_session(Attenuation {
+            scope: Some("/core/http".to_owned()),
+            only: BTreeSet::from([GrantRight::Inspect, GrantRight::InstanceRead]),
+        });
+
+        // Narrowing within scope + subset of rights succeeds.
+        let narrowed = base
+            .attenuated(Attenuation {
+                scope: Some("/core/http/v1".to_owned()),
+                only: BTreeSet::from([GrantRight::Inspect]),
+            })
+            .expect("monotonic narrowing must succeed");
+        assert_eq!(
+            narrowed.options().attenuation.effective_scope(),
+            "/core/http/v1"
+        );
+
+        // Widening scope to sibling prefix `/core/http-admin` must fail.
+        assert!(matches!(
+            base.attenuated(Attenuation {
+                scope: Some("/core/http-admin".to_owned()),
+                only: BTreeSet::from([GrantRight::Inspect]),
+            }),
+            Err(OpsError::AttenuationDenied { .. })
+        ));
+
+        // Widening scope back to `/` must fail.
+        assert!(matches!(
+            base.attenuated(Attenuation {
+                scope: Some("/".to_owned()),
+                only: BTreeSet::from([GrantRight::Inspect]),
+            }),
+            Err(OpsError::AttenuationDenied { .. })
+        ));
+
+        // Widening rights (empty `only` or extra right) must fail.
+        assert!(matches!(
+            base.attenuated(Attenuation {
+                scope: None,
+                only: BTreeSet::new(),
+            }),
+            Err(OpsError::AttenuationDenied { .. })
+        ));
+        assert!(matches!(
+            base.attenuated(Attenuation {
+                scope: None,
+                only: BTreeSet::from([GrantRight::Inspect, GrantRight::InstanceControl]),
+            }),
+            Err(OpsError::AttenuationDenied { .. })
+        ));
+
+        // Out-of-scope inspect prefixes (including `/kernel/*` and sibling `/core/http-admin`) must fail.
+        assert!(matches!(
+            base.inspect(&["/kernel/memory"], 0).await,
+            Err(OpsError::AttenuationDenied { .. })
+        ));
+        assert!(matches!(
+            base.inspect(&["/core/http-admin"], 0).await,
+            Err(OpsError::AttenuationDenied { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn helios_tls_uri_fails_fast_instead_of_downgrading_to_cleartext() {
+        let uri = TargetUri::parse("helios://127.0.0.1:9443").expect("parse helios uri");
+        let err = RpcConnection::connect(&uri, &SecurityMode::Plain)
+            .await
+            .err()
+            .expect("helios:// must fail fast until #1190 TLS lands");
+        assert!(matches!(
+            err,
+            crate::error::TransportError::TlsNotYetImplemented { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_capability_grant_translates_valid_and_rejects_invalid_specs() {
+        assert!(matches!(
+            parse_capability_grant("dir:/tmp:rw").expect("dir rw"),
+            CapabilityGrant::Directory(DirectoryGrant { ref source_path, ref rights, .. })
+                if source_path == "/tmp" && rights.contains(&FilesystemRight::Write)
+        ));
+        assert!(matches!(
+            parse_capability_grant("net:tcp,dns").expect("net tcp,dns"),
+            CapabilityGrant::Network(NetworkGrant { ref rights })
+                if rights.len() == 2
+        ));
+        assert!(matches!(
+            parse_capability_grant("inspect:own").expect("inspect own"),
+            CapabilityGrant::Diagnostics(DiagnosticsGrant::InspectRead(AuthorityScope::Own))
+        ));
+        assert!(matches!(
+            parse_capability_grant("unknown:foo"),
+            Err(OpsError::InvalidGrant { .. })
+        ));
+        assert!(matches!(
+            parse_capability_grant("dir:/tmp:badmode"),
+            Err(OpsError::InvalidGrant { .. })
+        ));
     }
 }

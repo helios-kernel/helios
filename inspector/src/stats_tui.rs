@@ -13,7 +13,8 @@ use ratatui::widgets::{
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::serial::RpcClient;
+use helios_ops::transport::ProtocolClient;
+
 use crate::system;
 use crate::tui::{self, TerminalError};
 
@@ -23,7 +24,7 @@ const LIVE_STATS_PERIOD_MS: u64 = 1_000;
 /// against.
 const STATS_VIEW: &str = "stats view";
 
-pub async fn run(client: &mut RpcClient) -> Result<(), TerminalError> {
+pub async fn run(client: &ProtocolClient) -> Result<(), TerminalError> {
     let mut session = tui::Session::open(false, STATS_VIEW)?;
     let events = tui::spawn_events();
     let mut app = App::new(LIVE_STATS_PERIOD_MS);
@@ -112,7 +113,7 @@ impl App {
         }
     }
 
-    async fn refresh(&mut self, client: &mut RpcClient) {
+    async fn refresh(&mut self, client: &ProtocolClient) {
         match (
             system::fetch_kernel_snapshot(client).await,
             system::fetch_instances(client).await,

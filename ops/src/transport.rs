@@ -106,12 +106,11 @@ impl RpcConnection {
             TargetUri::Serial { path, baud } => open_serial(path, *baud).await?,
             TargetUri::Vsock { cid, port } => open_vsock(*cid, *port).await?,
             TargetUri::Helios { host, port, tls } => {
-                if *tls && matches!(security, SecurityMode::CapabilityTls { cert: Some(_) }) {
-                    tracing::debug!(
-                        host,
-                        port,
-                        "opening helios:// TCP stream; TLS+CapabilityCert negotiation binds with #1190"
-                    );
+                if *tls || matches!(security, SecurityMode::CapabilityTls { .. }) {
+                    return Err(TransportError::TlsNotYetImplemented {
+                        host: host.clone(),
+                        port: *port,
+                    });
                 }
                 open_tcp(host, *port).await?
             }

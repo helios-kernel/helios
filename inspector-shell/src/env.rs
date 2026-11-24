@@ -34,6 +34,7 @@ pub struct HostEnv {
     session: Session,
     fleet: Option<Fleet>,
     cwd: Arc<RwLock<String>>,
+    scope_stack: Arc<RwLock<Vec<String>>>,
     completion_cache: RemoteCompletionCache,
     /// When `true`, `list_dir` and completion probes go through `completion_cache`
     /// with the 150ms latency ceiling.
@@ -48,6 +49,7 @@ impl HostEnv {
             session,
             fleet,
             cwd: Arc::new(RwLock::new(String::from("/"))),
+            scope_stack: Arc::new(RwLock::new(Vec::new())),
             completion_cache: RemoteCompletionCache::default(),
             completion_mode: false,
         }
@@ -64,9 +66,27 @@ impl HostEnv {
             session,
             fleet,
             cwd: Arc::new(RwLock::new(String::from("/"))),
+            scope_stack: Arc::new(RwLock::new(Vec::new())),
             completion_cache,
             completion_mode: false,
         }
+    }
+
+    async fn active_scope(&self) -> String {
+        if let Some(top) = self.scope_stack.read().await.last() {
+            return top.clone();
+        }
+        helios_ops::target::normalize_scope(self.session.options().attenuation.effective_scope())
+    }
+
+    async fn scoped_session(&self) -> Result<Session, EnvError> {
+        let top = self.scope_stack.read().await.last().cloned();
+        let Some(scope) = top else {
+            return Ok(self.session.clone());
+        };
+        let mut att = self.session.options().attenuation.clone();
+        att.scope = Some(scope);
+        self.session.attenuated(att).map_err(ops_to_env_err)
     }
 
     /// Return a lightweight clone configured for bounded-latency `<Tab>` completion.
@@ -143,11 +163,23 @@ impl HeliosEnv for HostEnv {
             }
         }
 
+        let mut capability_grants = Vec::with_capacity(request.grants.len());
+        for grant in &request.grants {
+            let translated = helios_ops::session::parse_grant_spec(
+                &grant.kind,
+                &grant.target,
+                grant.mode.as_deref(),
+            )
+            .map_err(ops_to_env_err)?;
+            capability_grants.push(translated);
+        }
+
         let spawn_req = SpawnRequest {
             path: program_path,
             args: request.args,
             env: request.env.into_iter().collect(),
             stdin: stdin_bytes,
+            capability_grants,
         };
         let child = self
             .session
@@ -376,9 +408,9 @@ impl HeliosEnv for HostEnv {
     }
 
     async fn inspect(&self, path: Option<&str>) -> Result<Vec<InspectEntry>, EnvError> {
+        let session = self.scoped_session().await?;
         let prefixes: Vec<&str> = path.into_iter().collect();
-        let snap = self
-            .session
+        let snap = session
             .inspect(&prefixes, 0)
             .await
             .map_err(ops_to_env_err)?;
@@ -401,7 +433,8 @@ impl HeliosEnv for HostEnv {
     }
 
     async fn list_processes(&self) -> Result<Vec<ProcessInfo>, EnvError> {
-        let instances = self.session.instances().await.map_err(ops_to_env_err)?;
+        let session = self.scoped_session().await?;
+        let instances = session.instances().await.map_err(ops_to_env_err)?;
         Ok(instances
             .into_iter()
             .map(|inst| {
@@ -454,10 +487,25 @@ impl HeliosEnv for HostEnv {
     }
 
     async fn enter_scope(&self, scope: &str) -> Result<String, EnvError> {
-        Ok(normalize_vfs_path("/", scope))
+        let current = self.active_scope().await;
+        let normalized = helios_ops::target::normalize_scope(scope);
+        if !helios_ops::target::scope_contains(&current, &normalized) {
+            return Err(EnvError::PermissionDenied {
+                detail: format!("cannot widen scope from `{current}` to `{normalized}`"),
+            });
+        }
+        self.scope_stack.write().await.push(normalized.clone());
+        Ok(normalized)
     }
 
-    async fn leave_scope(&self, _scope: &str) -> Result<(), EnvError> {
+    async fn leave_scope(&self, scope: &str) -> Result<(), EnvError> {
+        let normalized = helios_ops::target::normalize_scope(scope);
+        let mut stack = self.scope_stack.write().await;
+        if let Some(pos) = stack.iter().rposition(|s| s == &normalized) {
+            stack.remove(pos);
+        } else {
+            stack.pop();
+        }
         Ok(())
     }
 
@@ -632,14 +680,24 @@ impl HeliosEnv for HostEnv {
     }
 
     async fn complete_monikers(&self) -> Result<Vec<String>, EnvError> {
-        Ok(self.completion_cache.monikers(&self.session).await)
+        let active_scope = self.active_scope().await;
+        let all = self.completion_cache.monikers(&self.session).await;
+        Ok(all
+            .into_iter()
+            .filter(|m| helios_ops::target::scope_contains(&active_scope, m))
+            .collect())
     }
 
     async fn complete_inspect_keys(&self, prefix: &str) -> Result<Vec<String>, EnvError> {
-        Ok(self
+        let active_scope = self.active_scope().await;
+        let all = self
             .completion_cache
             .inspect_keys(&self.session, prefix)
-            .await)
+            .await;
+        Ok(all
+            .into_iter()
+            .filter(|k| helios_ops::target::scope_contains(&active_scope, k))
+            .collect())
     }
 
     async fn complete_diagnostic_targets(&self) -> Result<Vec<String>, EnvError> {
@@ -1456,6 +1514,9 @@ fn ops_to_env_err(err: OpsError) -> EnvError {
         },
         OpsError::InvalidPath { path, reason } => EnvError::InvalidArgument {
             detail: format!("invalid path `{path}`: {reason}"),
+        },
+        OpsError::InvalidGrant { spec, reason } => EnvError::InvalidArgument {
+            detail: format!("invalid capability grant `{spec}`: {reason}"),
         },
         OpsError::ExecRefused { kind, detail } => EnvError::Process {
             detail: format!("{kind:?}: {detail}"),

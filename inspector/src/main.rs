@@ -455,15 +455,30 @@ async fn run_ops_session_command(
             Ok(())
         }
         SessionCommand::Stats => {
-            // Live inspect watch fallback when connected over helios:// without raw serial RpcClient.
-            let watch = InspectCommand {
-                prefixes: vec!["/kernel/".to_owned()],
-                limit: 0,
-                watch: true,
-                diff: false,
-                interval_ms: 1000,
-            };
-            ops_cli::run_inspect(&session, &watch, ops.output).await
+            for right in [
+                helios_ops::GrantRight::Inspect,
+                helios_ops::GrantRight::InstanceRead,
+            ] {
+                if !session.options().attenuation.allows(right) {
+                    return Err(helios_ops::OpsError::AttenuationDenied {
+                        capability: right.as_str().to_owned(),
+                        scope: session.options().attenuation.effective_scope().to_owned(),
+                    }
+                    .into());
+                }
+            }
+            let active_scope = helios_ops::target::normalize_scope(
+                session.options().attenuation.effective_scope(),
+            );
+            if !helios_ops::target::scope_contains(&active_scope, "/kernel") {
+                return Err(helios_ops::OpsError::AttenuationDenied {
+                    capability: helios_ops::GrantRight::Inspect.as_str().to_owned(),
+                    scope: active_scope,
+                }
+                .into());
+            }
+            stats_tui::run(session.protocol_client()).await?;
+            Ok(())
         }
     }
 }
@@ -583,10 +598,9 @@ pub(crate) fn run_connected(
         SessionCommand::Tracing(command) => {
             Ok(runtime::block_on(system::run_tracing(client, &command))?)
         }
-        SessionCommand::Stats => run_interruptible(async move {
-            let mut client = client;
-            Ok(stats_tui::run(&mut client).await?)
-        }),
+        SessionCommand::Stats => {
+            run_interruptible(async move { Ok(stats_tui::run(&client).await?) })
+        }
         SessionCommand::Instances(command) => run_interruptible(async move {
             Ok(system::run_instances(&client, command.kill, command.kill_name.as_deref()).await?)
         }),

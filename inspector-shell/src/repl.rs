@@ -129,8 +129,8 @@ pub async fn eval_command(
     source: &str,
     format: OutputFormat,
 ) -> Result<String, ReplError> {
-    let mut session = ShellSession::new(env).await;
-    let value = session.eval(source).await?;
+    let mut session = Box::pin(ShellSession::new(env)).await;
+    let value = Box::pin(session.eval(source)).await?;
     format_value(session.engine_state(), session.stack(), &value, format).await
 }
 
@@ -147,7 +147,7 @@ pub async fn eval_script(
             path: script_path.to_path_buf(),
             source,
         })?;
-    let mut session = ShellSession::new(env).await;
+    let mut session = Box::pin(ShellSession::new(env)).await;
     let arg_values: Vec<Value> = args
         .iter()
         .map(|arg| Value::string(arg.clone(), Span::unknown()))
@@ -157,9 +157,8 @@ pub async fn eval_script(
         Value::list(arg_values, Span::unknown()),
     );
     let file_name = script_path.display().to_string();
-    let out = session
-        .eval_source(&source, Some(&file_name), AsyncPipelineData::Empty)
-        .await?;
+    let out =
+        Box::pin(session.eval_source(&source, Some(&file_name), AsyncPipelineData::Empty)).await?;
     let value = out
         .into_value_async(Span::unknown())
         .await
@@ -351,7 +350,7 @@ async fn eval_interruptible(
     };
 
     let outcome = tokio::select! {
-        res = session.eval(source) => EvalOutcome::Completed(res),
+        res = Box::pin(session.eval(source)) => EvalOutcome::Completed(res),
         _ = cancel_fut => {
             interrupt_flag.store(true, std::sync::atomic::Ordering::Release);
             EvalOutcome::Interrupted

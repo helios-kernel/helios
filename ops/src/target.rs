@@ -499,6 +499,45 @@ pub struct Attenuation {
     pub only: BTreeSet<GrantRight>,
 }
 
+/// Normalize a slash-delimited moniker or inspect scope path to canonical form
+/// (`"/"` or `"/a/b"`, no trailing slash, no empty/`.` segments, resolving `..`).
+#[must_use]
+pub fn normalize_scope(raw: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in raw.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        "/".to_owned()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
+}
+
+/// Returns `true` iff `child` lies within `parent` on a strict `/` path-segment boundary.
+///
+/// For example, `scope_contains("/core/http", "/core/http/v1")` is `true`, while
+/// `scope_contains("/core/http", "/core/http-admin")` and
+/// `scope_contains("/core/http", "/kernel/memory")` are `false`.
+#[must_use]
+pub fn scope_contains(parent: &str, child: &str) -> bool {
+    let parent = normalize_scope(parent);
+    let child = normalize_scope(child);
+    if parent == "/" {
+        return true;
+    }
+    child == parent
+        || child
+            .strip_prefix(&parent)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 impl Attenuation {
     /// Returns `true` if `right` is permitted under this attenuation.
     #[must_use]
@@ -510,6 +549,56 @@ impl Attenuation {
     #[must_use]
     pub fn effective_scope(&self) -> &str {
         self.scope.as_deref().unwrap_or("/")
+    }
+
+    /// Monotonically narrow `self` with `requested`.
+    ///
+    /// Refuses any widening of either capability rights (`only`) or component
+    /// subtree (`scope`) with [`crate::OpsError::AttenuationDenied`].
+    pub fn attenuate(&self, requested: &Self) -> Result<Self, crate::error::OpsError> {
+        let parent_scope = normalize_scope(self.effective_scope());
+        let next_scope = match requested.scope.as_deref() {
+            None => self.scope.clone(),
+            Some(req) => {
+                let norm_req = normalize_scope(req);
+                if !scope_contains(&parent_scope, &norm_req) {
+                    return Err(crate::error::OpsError::AttenuationDenied {
+                        capability: format!("scope:{norm_req}"),
+                        scope: parent_scope,
+                    });
+                }
+                if norm_req == "/" {
+                    None
+                } else {
+                    Some(norm_req)
+                }
+            }
+        };
+
+        let next_only = if self.only.is_empty() {
+            requested.only.clone()
+        } else if requested.only.is_empty() {
+            // An unrestricted request on an already-narrowed parent cannot widen back to all rights.
+            return Err(crate::error::OpsError::AttenuationDenied {
+                capability: "all".to_owned(),
+                scope: parent_scope,
+            });
+        } else {
+            for right in &requested.only {
+                if !self.only.contains(right) {
+                    return Err(crate::error::OpsError::AttenuationDenied {
+                        capability: right.as_str().to_owned(),
+                        scope: parent_scope,
+                    });
+                }
+            }
+            requested.only.clone()
+        };
+
+        Ok(Self {
+            scope: next_scope,
+            only: next_only,
+        })
     }
 }
 
