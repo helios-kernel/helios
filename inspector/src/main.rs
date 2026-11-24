@@ -157,7 +157,7 @@ enum Command {
     /// List the live program instances, and optionally stop one.
     Instances(InstancesCommand),
     /// Start an interactive shell that forwards most input to the remote shell.
-    Repl,
+    Repl(ReplCommand),
     /// Launch a local QEMU VM, wait for the debugger, and connect the inspector.
     ///
     /// Boxed: the VM options dwarf every other subcommand's, and the
@@ -176,7 +176,7 @@ pub(crate) enum SessionCommand {
     /// List the live program instances, and optionally stop one.
     Instances(InstancesCommand),
     /// Start an interactive shell that forwards most input to the remote shell.
-    Repl,
+    Repl(ReplCommand),
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -185,9 +185,13 @@ pub(crate) struct ShellCommand {
     #[arg(short = 'c', long = "command", conflicts_with = "script")]
     command: Option<String>,
 
-    /// Path to a local script file whose contents are executed remotely by `/bin/dash`.
+    /// Path to a local script file whose contents are executed remotely by the guest shell.
     #[arg(conflicts_with = "command")]
     script: Option<String>,
+
+    /// Guest shell binary to invoke (defaults to `/bin/dash`; pass `/bin/nu` for Nushell).
+    #[arg(long = "shell", value_name = "PATH")]
+    shell: Option<String>,
 
     /// Write the guest tracing events the script produced to this file.
     ///
@@ -208,6 +212,13 @@ pub(crate) struct ShellCommand {
     /// Number of recent guest events each `--trace-log` poll retrieves.
     #[arg(long = "trace-log-limit", value_name = "COUNT", default_value_t = 512)]
     trace_log_limit: u32,
+}
+
+#[derive(Debug, Clone, Default, ClapArgs)]
+pub(crate) struct ReplCommand {
+    /// Guest shell binary to invoke (defaults to `/bin/dash`; pass `/bin/nu` for Nushell).
+    #[arg(long = "shell", value_name = "PATH")]
+    shell: Option<String>,
 }
 
 /// Which live instances there are, and which of them to stop.
@@ -258,7 +269,7 @@ fn main() -> Result<(), InspectorError> {
         Some(Command::Tracing(command)) => Some(SessionCommand::Tracing(command)),
         Some(Command::Stats) => Some(SessionCommand::Stats),
         Some(Command::Instances(command)) => Some(SessionCommand::Instances(command)),
-        Some(Command::Repl) => Some(SessionCommand::Repl),
+        Some(Command::Repl(command)) => Some(SessionCommand::Repl(command)),
         None => None,
     };
     let device = args
@@ -291,7 +302,7 @@ pub(crate) fn run_connected(
     client: serial::RpcClient,
     command: Option<SessionCommand>,
 ) -> Result<(), SessionError> {
-    match command.unwrap_or(SessionCommand::Repl) {
+    match command.unwrap_or_else(|| SessionCommand::Repl(ReplCommand::default())) {
         SessionCommand::Shell(command) => run_interruptible(async move {
             let mut client = client;
             let mut capture = match command.trace_log.as_ref() {
@@ -335,7 +346,7 @@ pub(crate) fn run_connected(
         SessionCommand::Instances(command) => run_interruptible(async move {
             Ok(system::run_instances(&client, command.kill, command.kill_name.as_deref()).await?)
         }),
-        SessionCommand::Repl => Ok(repl::run(client)?),
+        SessionCommand::Repl(command) => Ok(repl::run(client, command.shell.as_deref())?),
     }
 }
 
@@ -388,8 +399,32 @@ mod tests {
         let args = Args::try_parse_from(["helios-inspector", "shell", "-c", "echo hi"])
             .expect("shell subcommand must parse");
         match args.command.expect("subcommand must be present") {
-            Command::Shell(_) => {}
+            Command::Shell(cmd) => assert_eq!(cmd.shell, None),
             _ => panic!("expected shell subcommand"),
+        }
+    }
+
+    #[test]
+    fn parses_shell_and_repl_explicit_shell_flag() {
+        let shell_args = Args::try_parse_from([
+            "helios-inspector",
+            "shell",
+            "--shell",
+            "/bin/nu",
+            "-c",
+            "true",
+        ])
+        .expect("shell --shell must parse");
+        match shell_args.command.expect("subcommand must be present") {
+            Command::Shell(cmd) => assert_eq!(cmd.shell.as_deref(), Some("/bin/nu")),
+            _ => panic!("expected shell subcommand"),
+        }
+
+        let repl_args = Args::try_parse_from(["helios-inspector", "repl", "--shell", "/bin/nu"])
+            .expect("repl --shell must parse");
+        match repl_args.command.expect("subcommand must be present") {
+            Command::Repl(cmd) => assert_eq!(cmd.shell.as_deref(), Some("/bin/nu")),
+            _ => panic!("expected repl subcommand"),
         }
     }
 
