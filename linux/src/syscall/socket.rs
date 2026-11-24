@@ -1122,6 +1122,37 @@ pub(crate) async fn accept<R: Resources, M: UserMemory, Net: Network<R::Network>
     }
 }
 
+fn install_udp_lazy_bind<N: SocketNetwork>(
+    sock: &Socket<N>,
+    owned: Arc<OwnedUdpSocket<N>>,
+    local_address: N::Address,
+    local_port: u16,
+) -> Arc<OwnedUdpSocket<N>> {
+    // Another thread may have bound the same socket while `udp_bind` was
+    // awaiting; keep the winning handle so the caller never operates on a
+    // losing socket that drops and closes as soon as the lock releases.
+    let mut pending = Some(owned);
+    sock.with_udp_mut(|slot| match slot {
+        UdpSocket::Unbound { family, options } => {
+            let family = *family;
+            let options = *options;
+            let socket = pending.take().expect("pending socket exists once");
+            let handle = Arc::clone(&socket);
+            *slot = UdpSocket::Bound {
+                family,
+                socket,
+                local_address,
+                local_port,
+                peer: None,
+                options,
+            };
+            handle
+        }
+        UdpSocket::Bound { socket, .. } => Arc::clone(socket),
+    })
+    .unwrap_or_else(|| pending.expect("socket was not moved when not UDP"))
+}
+
 pub(crate) async fn connect<R: Resources, M: UserMemory, Net: Network<R::Network>>(
     descriptors: &spin::Mutex<Descriptors<R>>,
     args: [u64; 6],
@@ -1158,8 +1189,8 @@ pub(crate) async fn connect<R: Resources, M: UserMemory, Net: Network<R::Network
             }
             return 0;
         };
-        let (udp_id, family) = match udp {
-            UdpSocket::Bound { socket, family, .. } => (socket.id(), family),
+        let (udp_socket, family) = match udp {
+            UdpSocket::Bound { socket, family, .. } => (socket, family),
             UdpSocket::Unbound { family, options } => {
                 if remote.ip.family() != family {
                     return errno(EAFNOSUPPORT);
@@ -1175,27 +1206,15 @@ pub(crate) async fn connect<R: Resources, M: UserMemory, Net: Network<R::Network
                     Ok(bound) => bound,
                     Err(err) => return errno(err),
                 };
-                let id = owned.id();
                 let local_address = net.encode_ip(local.ip);
-                sock.with_udp_mut(|slot| {
-                    if let UdpSocket::Unbound { family, options } = *slot {
-                        *slot = UdpSocket::Bound {
-                            family,
-                            socket: owned,
-                            local_address,
-                            local_port,
-                            peer: None,
-                            options,
-                        };
-                    }
-                });
-                (id, family)
+                let bound = install_udp_lazy_bind(&sock, owned, local_address, local_port);
+                (bound, family)
             }
         };
         if remote.ip.family() != family {
             return errno(EAFNOSUPPORT);
         }
-        if let Err(err) = net.udp_connect(udp_id, remote) {
+        if let Err(err) = net.udp_connect(udp_socket.id(), remote) {
             return errno(err);
         }
         let peer_addr = net.encode_ip(remote.ip);
@@ -1544,7 +1563,7 @@ pub(crate) async fn socket_send<N: SocketNetwork, Net: Network<N>>(
     }
 
     if let Some(udp) = sock.udp_state() {
-        let (udp_id, remote, send_timeout) = match udp {
+        let (udp_socket, remote, send_timeout) = match udp {
             UdpSocket::Bound {
                 family,
                 socket,
@@ -1567,7 +1586,7 @@ pub(crate) async fn socket_send<N: SocketNetwork, Net: Network<N>>(
                         None => return Err(EDESTADDRREQ),
                     },
                 };
-                (socket.id(), remote, options.time(SocketTime::SendTimeout))
+                (socket, remote, options.time(SocketTime::SendTimeout))
             }
             UdpSocket::Unbound { family, options } => {
                 let Some(remote) = dest else {
@@ -1582,25 +1601,13 @@ pub(crate) async fn socket_send<N: SocketNetwork, Net: Network<N>>(
                     port: 0,
                 };
                 let (owned, local_port) = net.udp_bind(local, options.hop_limit()).await?;
-                let id = owned.id();
                 let local_address = net.encode_ip(local.ip);
-                sock.with_udp_mut(|slot| {
-                    if let UdpSocket::Unbound { family, options } = *slot {
-                        *slot = UdpSocket::Bound {
-                            family,
-                            socket: owned,
-                            local_address,
-                            local_port,
-                            peer: None,
-                            options,
-                        };
-                    }
-                });
-                (id, remote, options.time(SocketTime::SendTimeout))
+                let bound = install_udp_lazy_bind(sock, owned, local_address, local_port);
+                (bound, remote, options.time(SocketTime::SendTimeout))
             }
         };
         let timeout = effective_timeout(send_timeout, nonblocking);
-        return match net.udp_send(udp_id, remote, &data, timeout).await {
+        return match net.udp_send(udp_socket.id(), remote, &data, timeout).await {
             Ok(sent) => Ok(sent),
             Err(ETIMEDOUT) => Err(EAGAIN),
             Err(err) => Err(err),
