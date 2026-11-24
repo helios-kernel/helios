@@ -641,7 +641,7 @@ mod tests {
 
     #[test]
     fn what_was_read_with_the_marker_is_handed_on_unread() {
-        let tail = b"compositor:device name=QEMU Virtio Tablet\ncompositor:shell path=/bin/dash\n";
+        let tail = b"compositor:device name=QEMU Virtio Tablet\ncompositor:shell path=/bin/nu\n";
         let mut stream = b"[KDBG run:begin]\n".to_vec();
         stream.extend_from_slice(tail);
         let transport = ChunkedTransport::new(&stream, &[stream.len()], 0);

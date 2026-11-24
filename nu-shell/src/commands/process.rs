@@ -458,6 +458,7 @@ impl<E: HeliosEnv> AsyncCommand<E> for WithSnapshot {
             .await
             .map_err(|e| e.into_shell_error("with-snapshot failed", head))?;
 
+        let snap_id = info.id.clone();
         let mut snap_rec = Record::new();
         snap_rec.push("id", Value::string(info.id, head));
         snap_rec.push("name", Value::string(info.name, head));
@@ -473,7 +474,7 @@ impl<E: HeliosEnv> AsyncCommand<E> for WithSnapshot {
             registry: ctx.registry,
             runtime_scope: ctx.runtime_scope,
         };
-        eval_closure_async(
+        let eval_result = eval_closure_async(
             ctx.engine_state,
             ctx.stack,
             &closure,
@@ -482,7 +483,15 @@ impl<E: HeliosEnv> AsyncCommand<E> for WithSnapshot {
             &mut rt,
             head,
         )
-        .await
+        .await;
+
+        let release_res = ctx.env.release_snapshot(&snap_id).await;
+        if let Err(err) = release_res
+            && eval_result.is_ok()
+        {
+            return Err(err.into_shell_error("with-snapshot release failed", head));
+        }
+        eval_result
     }
 }
 

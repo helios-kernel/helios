@@ -1,0 +1,37 @@
+[package]
+name = "helios-nu-shell"
+version = "0.1.0"
+edition.workspace = true
+autobins = false
+
+[package.metadata.helios]
+command = "nu"
+
+[dependencies]
+async-channel = { version = "2.5.0", default-features = false }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+futures-lite = { version = "2.6.1", default-features = false, features = ["alloc"] }
+helios-api = { path = "../../api", default-features = false, features = [
+    "fs",
+    "http",
+    "inspect",
+    "instances",
+    "io",
+    "processors",
+    "profiling",
+    "programs",
+    "snapshot",
+    "task",
+] }
+helios-nu = { workspace = true }
+nu-protocol = { version = "=0.117.0", default-features = false }
+thiserror = { version = "2.0.21", default-features = false }
+tracing = { workspace = true }
+
+[lib]
+name = "helios_nu_shell"
+path = "src/main.rs"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true

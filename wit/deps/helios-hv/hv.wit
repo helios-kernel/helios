@@ -5,6 +5,7 @@ package helios:hv@0.1.0;
 /// detaches and every retained memory-region handle is dropped.
 interface virtualization {
   variant hv-error {
+    permission-denied,
     unavailable,
     invalid-range,
     address-width,

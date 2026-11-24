@@ -168,11 +168,12 @@ pub async fn run_instances(
     for instance in &live {
         writeln!(
             out,
-            "{:>6}  {:<24} up {:>8} ms  {:>9} KiB  {:>4}‰ cpu",
+            "{:>6}  {:<24} up {:>8} ms  {:>9} KiB mem  {:>9} KiB storage  {:>4}‰ cpu",
             instance.id,
             instance.name,
             instance.uptime / 1_000_000,
             instance.memory_bytes / 1024,
+            instance.storage_bytes / 1024,
             instance.cpu_busy,
         )
         .map_err(|source| SystemError::Write { source })?;

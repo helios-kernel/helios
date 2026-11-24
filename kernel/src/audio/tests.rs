@@ -167,6 +167,13 @@ impl ScriptedDevice {
     fn played_bytes(&self) -> usize {
         self.played.lock().iter().map(Vec::len).sum()
     }
+
+    fn complete_held_writes(&self) {
+        self.released.store(true, Ordering::Release);
+        for waker in self.held_wakers.lock().drain(..) {
+            waker.wake();
+        }
+    }
 }
 
 impl PlaybackDevice for ScriptedDevice {
@@ -1154,29 +1161,36 @@ fn a_rejected_period_mid_stream_collects_the_rest_of_the_ring() {
     );
 }
 
-/// A device that refuses `release` does not wedge the stream.
-///
-/// The teardown's collection of outstanding chains rests on the release
-/// having completed them, so a release the device would not take is the
-/// one time the pump leaves without them: waiting could park for ever,
-/// which is the wedge this whole path exists to avoid. What it owes
-/// instead is the error line — stream, step, the device's refusal, and
-/// how many chains it left the device holding — and the claim's word,
-/// which frees even so.
+/// A device that refuses `release` while writes are still in flight
+/// never causes the pump to drop those writes or unpin their period
+/// pages: callers get a `DeviceFault` on `stop` and feedback closes,
+/// while the writes and pages stay alive until the device returns
+/// every outstanding chain.
 #[test]
-fn a_device_that_refuses_to_release_keeps_its_chains_but_frees_the_claim() {
+fn a_refused_release_keeps_outstanding_writes_and_pages_alive_until_returned() {
     test_hooks::install();
     let (service, inboxes) = service_of(&[playback_stream(0)]);
+    let runs_before = test_hooks::live_runs();
     let mut audio = AudioOwnership::new();
     audio
         .claim(&service, 0, test_caps::audio())
         .expect("the stream is free");
     let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
+    let sender = audio
+        .claim_ref()
+        .expect("the claim was just taken")
+        .sender();
+    let mut feedback = audio
+        .claim_ref()
+        .expect("the claim was just taken")
+        .feedback();
+    assert_eq!(test_hooks::live_runs() - runs_before, PERIODS_IN_FLIGHT);
 
     let mut device = ScriptedDevice::new(topology(&[playback_stream(0)]));
     // Two writes stay in the device's hands and the third is refused,
     // which is what ends the pump while the held two are outstanding —
-    // and the release refuses too, so their completions never come.
+    // and the release refuses too, so their completions do not arrive
+    // until the device later completes or resets them.
     device.holds_after = 0;
     device.writes_before_error = 2;
     device.write_error = Some(AudioError::DeviceIo);
@@ -1184,56 +1198,256 @@ fn a_device_that_refuses_to_release_keeps_its_chains_but_frees_the_claim() {
     let timer = crate::test_support::test_timer(TestCpu::without_entropy());
     let period = alloc::vec![0x22_u8; params.period_bytes as usize];
 
-    let periods_written = block_on(async {
-        let player = async {
-            let mut writer = PeriodWriter::new(ring.clone());
-            let mut written = 0_usize;
+    let inbox = &inboxes[0];
+    block_on(async {
+        let mut served = pin!(serve_playback(&device, stream_of(&service), inbox, &timer));
+        let mut writer = PeriodWriter::new(ring.clone());
+        let negotiate = sender.negotiate(params, ring.clone());
+        match select(pin!(negotiate), served.as_mut()).await {
+            Either::Left((outcome, _)) => outcome.expect("negotiation succeeds"),
+            Either::Right(((), _)) => panic!("serve_playback never exits"),
+        }
+
+        // Feed periods until the third write is refused and the pump closes the ring.
+        let mut written = 0_usize;
+        let feed = async {
             while let Written::Took(taken) = write_once(&mut writer, &period).await {
                 assert_eq!(taken, period.len());
                 written += 1;
             }
-            written
         };
-        let pump = pin!(play(&device, stream_of(&service), &ring, params, &timer));
-        join(pin!(player), pump).await.0
-    });
-    // The writer loop only leaves on `Ended`: the pump died with two
-    // chains in the device's hands and still ended its producer.
-    assert!(
-        periods_written >= 3,
-        "the producer committed past the two the device still holds"
-    );
-    assert_eq!(
-        device.in_flight.load(Ordering::Acquire),
-        2,
-        "the two chains the device never completed stayed with it — the count the teardown logged"
-    );
+        match select(pin!(feed), served.as_mut()).await {
+            Either::Left(((), _)) => {}
+            Either::Right(((), _)) => panic!("serve_playback never exits"),
+        }
+        assert!(written >= 3);
 
-    audio.release();
-    let inbox = &inboxes[0];
-    block_on(async {
-        let served = poll_once(pin!(serve_playback(
-            &device,
-            stream_of(&service),
-            inbox,
-            &timer
-        )))
-        .await;
+        // Drive the playback task through the refused `release`.
+        assert!(poll_once(served.as_mut()).await.is_none());
         assert_eq!(
-            served, None,
-            "the task keeps serving after a release the device refused"
+            device.in_flight.load(Ordering::Acquire),
+            2,
+            "the two outstanding writes remain alive rather than being dropped"
+        );
+
+        // `stop` reports `DeviceFault` and feedback closes so the player is not wedged.
+        let (stop_tx, stop_rx) = oneshot::channel();
+        ring.request_stop(stop_tx);
+        assert_eq!(stop_rx.await, Ok(Err(AudioServiceError::DeviceFault)));
+        assert_eq!(
+            poll_once(core::future::poll_fn(|cx| feedback.poll_burst(cx))).await,
+            Some(None),
+            "feedback closes even while the pump keeps outstanding writes alive"
+        );
+
+        // Dropping the player's writer, ring handle and claim must NOT unpin
+        // the period pages while the device still holds the two writes.
+        drop(writer);
+        drop(ring);
+        audio.release();
+        assert!(poll_once(served.as_mut()).await.is_none());
+        assert_eq!(
+            test_hooks::live_runs() - runs_before,
+            PERIODS_IN_FLIGHT,
+            "period pages stay pinned while the device still holds writes in flight"
+        );
+        assert_eq!(
+            device.in_flight.load(Ordering::Acquire),
+            2,
+            "writes in flight are never dropped while held by the device"
+        );
+
+        // Once the device finally returns the held chains (or is reset),
+        // the pump collects them, drops the ring, unpins the pages and frees the claim.
+        device.complete_held_writes();
+        assert!(poll_once(served.as_mut()).await.is_none());
+        assert_eq!(
+            device.in_flight.load(Ordering::Acquire),
+            0,
+            "every previously held write was collected"
+        );
+        assert_eq!(
+            test_hooks::live_runs(),
+            runs_before,
+            "period pages return to the pool once every write has returned"
         );
     });
 
     assert_eq!(
         stream_of(&service).claim.load(Ordering::Acquire),
         ClaimState::FREE,
-        "the claim word freed even though the device refused to release"
+        "the claim frees once the outstanding writes have been collected"
     );
     let mut second = AudioOwnership::new();
     second
         .claim(&service, 0, test_caps::audio())
-        .expect("a refused release did not wedge the stream");
+        .expect("the stream is claimable again after the device returns its chains");
+}
+
+/// A refused `release` with no writes in flight has nothing for the
+/// device to hold, so the claim frees straight away.
+#[test]
+fn a_refused_release_with_no_writes_in_flight_frees_the_claim() {
+    test_hooks::install();
+    let (service, inboxes) = service_of(&[playback_stream(0)]);
+    let mut audio = AudioOwnership::new();
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
+    let mut device = ScriptedDevice::new(topology(&[playback_stream(0)]));
+    device.release_error = Some(AudioError::DeviceIo);
+    let timer = crate::test_support::test_timer(TestCpu::without_entropy());
+
+    audio.release();
+    let inbox = &inboxes[0];
+    block_on(async {
+        assert!(
+            poll_once(pin!(serve_playback(
+                &device,
+                stream_of(&service),
+                inbox,
+                &timer
+            )))
+            .await
+            .is_none()
+        );
+    });
+
+    assert_eq!(
+        stream_of(&service).claim.load(Ordering::Acquire),
+        ClaimState::FREE,
+        "a refused release with no in-flight writes still frees the claim"
+    );
+}
+
+/// Dropping a sample writer after the claim has been released never
+/// writes into a closed ring's period and keeps the period pages pinned
+/// until that last writer is gone.
+#[test]
+fn dropping_a_sample_writer_after_release_touches_no_period_and_pins_until_gone() {
+    test_hooks::install();
+    let (service, inboxes) = service_of(&[playback_stream(0)]);
+    let runs_before = test_hooks::live_runs();
+    let mut audio = AudioOwnership::new();
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
+    let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
+    assert_eq!(test_hooks::live_runs() - runs_before, PERIODS_IN_FLIGHT);
+
+    // Pre-fill period 0 with a non-zero sentinel so any tail zero-fill
+    // during `finish` on a closed ring is immediately observable.
+    {
+        // SAFETY: period 0 is not yet handed to any device and no writer
+        // holds a cursor into it yet.
+        let slot = unsafe { ring.period_mut(0) };
+        slot.fill(0xee);
+    }
+
+    let mut writer = PeriodWriter::new(ring.clone());
+    let partial = alloc::vec![0x77_u8; 64];
+    block_on(async {
+        assert_eq!(write_some(&mut writer, &partial).await, partial.len());
+    });
+    assert_eq!(ring.committed_bytes(), 0);
+
+    // Release the claim and run the playback task's release path while
+    // the writer is still open with a part-filled period.
+    audio.release();
+    let device = ScriptedDevice::new(topology(&[playback_stream(0)]));
+    let timer = crate::test_support::test_timer(TestCpu::without_entropy());
+    let inbox = &inboxes[0];
+    block_on(async {
+        assert!(
+            poll_once(pin!(serve_playback(
+                &device,
+                stream_of(&service),
+                inbox,
+                &timer
+            )))
+            .await
+            .is_none()
+        );
+    });
+
+    assert!(ring.is_closed(), "release closed the ring");
+    assert_eq!(
+        test_hooks::live_runs() - runs_before,
+        PERIODS_IN_FLIGHT,
+        "period pages stay pinned while the late writer still holds the ring"
+    );
+
+    // Dropping the writer runs `finish()` on the closed ring: it must
+    // touch neither the period's tail nor the filled queue.
+    drop(writer);
+    assert_eq!(ring.committed_bytes(), 0);
+    assert_eq!(ring.take_filled(), None);
+    {
+        // SAFETY: no device or writer exists; inspecting the intact sentinel tail.
+        let slot = unsafe { ring.period(0) };
+        assert!(slot[..partial.len()].iter().all(|b| *b == 0x77));
+        assert!(
+            slot[partial.len()..params.period_bytes as usize]
+                .iter()
+                .all(|b| *b == 0xee),
+            "finish on a closed ring must not zero-fill the period tail"
+        );
+    }
+
+    // Dropping the final reference releases the pinned period pages.
+    drop(ring);
+    assert_eq!(test_hooks::live_runs(), runs_before);
+}
+
+/// A refused negotiation closes the ring so any writer opened while
+/// negotiation was in flight stops cleanly without touching a period,
+/// and the period pages remain pinned until that writer drops.
+#[test]
+fn a_refused_negotiation_closes_the_ring_and_pins_pages_until_writer_drops() {
+    test_hooks::install();
+    let (service, _inboxes) = service_of(&[playback_stream(0)]);
+    let runs_before = test_hooks::live_runs();
+    let mut audio = AudioOwnership::new();
+    audio
+        .claim(&service, 0, test_caps::audio())
+        .expect("the stream is free");
+    let (ring, params) = audio.negotiate(TONE).expect("the device takes this format");
+    assert_eq!(test_hooks::live_runs() - runs_before, PERIODS_IN_FLIGHT);
+
+    // A writer opened while `negotiate` is in flight writes part of a period.
+    let mut writer = PeriodWriter::new(ring.clone());
+    let partial = alloc::vec![0x55_u8; 32];
+    block_on(async {
+        assert_eq!(write_some(&mut writer, &partial).await, partial.len());
+    });
+
+    // The device refuses negotiation and the store discards it.
+    audio.discard_negotiation();
+    assert!(ring.is_closed(), "discard_negotiation closes the ring");
+    assert_eq!(
+        test_hooks::live_runs() - runs_before,
+        PERIODS_IN_FLIGHT,
+        "pages stay pinned while the writer still holds the ring"
+    );
+
+    // Further writes see `Ended` rather than filling freed memory or parking.
+    let more = alloc::vec![0x99_u8; params.period_bytes as usize];
+    block_on(async {
+        assert_eq!(write_once(&mut writer, &more).await, Written::Ended);
+    });
+
+    drop(writer);
+    assert_eq!(
+        ring.committed_bytes(),
+        0,
+        "dropping a writer on a discarded negotiation commits nothing"
+    );
+    drop(ring);
+    assert_eq!(
+        test_hooks::live_runs(),
+        runs_before,
+        "pages return to the pool once the last writer is gone"
+    );
 }
 
 /// A `write` that answers on its first poll — a device that completes

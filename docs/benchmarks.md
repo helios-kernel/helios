@@ -641,9 +641,10 @@ that machine), never from hosted CI. AGENTS.md §3.5's arm64 baseline is
 that kind of measurement.
 
 A host that must not compile anything runs `helios-bench run --lane
-aarch64-hvf --prebuilt`. The kernel image and `helios-bootfs` come from CI's
-`helios-guest-aarch64` artifact, unpacked so they land at
-`target/aarch64-unknown-none/kernel-release/helios-kernel` and
+aarch64-hvf --prebuilt`. The kernel image, `helios-bootfs` and
+`compiler_plugin.wasm` come from CI's `helios-image-aarch64-release` artifact
+(fetched with `helios-cli artifact-fetch --kind image --arch aarch64 --profile release`),
+placed at `target/aarch64-unknown-none/kernel-release/helios-kernel` and
 `target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs`;
 `target/release/helios`, `target/release/helios-cli` and
 `artifacts/bench-native/aarch64/` are copied from the machine that built

@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 use nu_engine::CallExt;
 use nu_protocol::engine::{Closure, EngineState, Stack};
 use nu_protocol::{
-    ByteStreamType, Category, Record, ShellError, Signature, Span, SyntaxShape, Type, Value,
+    ByteStreamType, Category, OutDest, Record, ShellError, Signature, Span, SyntaxShape, Type,
+    Value,
 };
 
 use crate::command::{AsyncCommand, AsyncCommandContext};
@@ -97,6 +98,10 @@ impl<E: HeliosEnv> AsyncCommand<E> for RunExternal {
         let scope = ctx.runtime_scope.current_scope().map(ToOwned::to_owned);
         let stdin = input.into_byte_receiver_async(head).await?;
 
+        let capture_stdout = ctx.runtime_scope.capture_inherited_stdout
+            || !matches!(ctx.stack.stdout(), OutDest::Inherit | OutDest::Print);
+        let capture_stderr = !matches!(ctx.stack.stderr(), OutDest::Inherit | OutDest::Print);
+
         let process = ctx
             .env
             .spawn_external(ExternalSpawnRequest {
@@ -107,8 +112,8 @@ impl<E: HeliosEnv> AsyncCommand<E> for RunExternal {
                 grants,
                 scope,
                 stdin,
-                capture_stdout: true,
-                capture_stderr: true,
+                capture_stdout,
+                capture_stderr,
             })
             .await
             .map_err(|err| err.into_shell_error(&format!("failed to spawn `{program}`"), head))?;

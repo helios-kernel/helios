@@ -92,9 +92,9 @@ clippy-host:
         --exclude helios-date --exclude helios-debugger --exclude helios-display-test \
         --exclude helios-gpu-test --exclude helios-http-client \
         --exclude helios-init --exclude helios-input-test \
-        --exclude helios-oob-load --exclude helios-perf \
+        --exclude helios-nu-shell --exclude helios-oob-load --exclude helios-perf \
         --exclude helios-ping --exclude helios-pride-flag --exclude helios-procbench \
-        --exclude helios-sched-tasks --exclude helios-surface-test \
+        --exclude helios-sched-tasks --exclude helios-stack-test --exclude helios-surface-test \
         --exclude helios-sysctl --exclude helios-webgpu-provider \
         -- -D warnings
 
@@ -111,8 +111,8 @@ clippy-programs:
     # them would unify those features and fail to build.
     for package in helios-audio-test helios-compositor helios-cpu helios-date helios-debugger helios-display-test helios-gpu-test \
         helios-http-client \
-        helios-init helios-input-test helios-oob-load helios-perf helios-ping helios-pride-flag \
-        helios-procbench helios-sched-tasks helios-surface-test helios-sysctl helios-webgpu-provider; do
+        helios-init helios-input-test helios-nu-shell helios-oob-load helios-perf helios-ping helios-pride-flag \
+        helios-procbench helios-sched-tasks helios-stack-test helios-surface-test helios-sysctl helios-webgpu-provider; do
         cargo clippy -p "${package}" --all-targets -- -D warnings
     done
 
@@ -129,7 +129,9 @@ test-kernel run_ignored="default":
         --out-dir "${out_dir}" \
         --target "${target}" \
         --profile "{{ default_profile }}" \
-        --cargo cargo
+        --cargo cargo \
+        --boot-program debugger \
+        --no-compiler-plugin
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     cargo nextest run {{ kernel_unit_packages }} --lib --run-ignored "{{ run_ignored }}"
@@ -198,6 +200,8 @@ test-libraries:
     cargo nextest run -p helios-venus -p helios-venus-gen --features helios-venus/driver
     # The HTTP client plugin's host unit, HTTP/2, and HTTP/3 tests.
     cargo nextest run -p helios-http-client
+    # The shared async Nushell evaluator, Helios commands, and completion core.
+    cargo nextest run -p helios-nu
     # The ACPI library runs QEMU's own CPU hotplug AML, from the pinned
     # tables the fetch below hash-verifies.
     just acpi-tables-fetch
@@ -216,7 +220,8 @@ test-host-tools:
             --out-dir "${out_dir}" \
             --target "${target}" \
             --profile "{{ default_profile }}" \
-            --cargo cargo
+            --cargo cargo \
+            --boot-program init
         plugin="${out_dir}/compiler_plugin.wasm"
     fi
     # These tools read no bootfs. The compiler-host test needs only the
@@ -369,7 +374,9 @@ test-embedded-debugger:
         --out-dir "${out_dir}" \
         --target "${target}" \
         --profile "{{ default_profile }}" \
-        --cargo cargo
+        --cargo cargo \
+        --boot-program debugger \
+        --no-compiler-plugin
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_BOOTFS="${out_dir}/helios-bootfs"
     cargo nextest run -p helios-hosted --no-capture init_program::tests::embedded_debugger_

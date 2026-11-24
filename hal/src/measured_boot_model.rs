@@ -24,14 +24,35 @@
 
 use alloc::vec::Vec;
 
+use arrayvec::ArrayVec;
+
 use crate::measured_boot::{
-    MeasuredBoot, MeasuredBootError, MeasurementRegister, MeasurementSet, SealedSecret,
-    Sha256Digest, UnsealRefused,
+    MAX_MEASUREMENT_BANKS, MeasuredBoot, MeasuredBootError, MeasurementAlgorithm, MeasurementBank,
+    MeasurementDigest, MeasurementRegister, MeasurementSet, SealedSecret, UnsealRefused,
+    validate_extend_digests,
 };
 
-/// What one register has had extended into it since the last power
+/// What one register in one bank has had extended into it since the last power
 /// cycle, oldest first.
-type RegisterHistory = Vec<Sha256Digest>;
+type RegisterHistory = Vec<MeasurementDigest>;
+
+struct BankState {
+    registers: [RegisterHistory; MeasurementSet::CAPACITY as usize],
+}
+
+impl BankState {
+    fn new() -> Self {
+        Self {
+            registers: core::array::from_fn(|_| Vec::new()),
+        }
+    }
+
+    fn clear(&mut self) {
+        for register in &mut self.registers {
+            register.clear();
+        }
+    }
+}
 
 enum Slot {
     Absent,
@@ -40,19 +61,19 @@ enum Slot {
     Foreign,
     Sealed {
         bound_to: MeasurementSet,
-        /// The histories of the registers in `bound_to` when the secret
-        /// was stored, lowest register first.
+        /// The SHA-256 histories of the registers in `bound_to` when the
+        /// secret was stored, lowest register first.
         state: Vec<RegisterHistory>,
         secret: SealedSecret,
     },
 }
 
 /// One operation a consumer asked the device for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Operation {
     Extend {
         register: MeasurementRegister,
-        digest: Sha256Digest,
+        digests: Vec<MeasurementDigest>,
     },
     LoadSealed {
         bound_to: MeasurementSet,
@@ -101,34 +122,102 @@ impl Faults {
 /// A measurement device whose registers and slot live in memory.
 pub struct MeasuredBootModel {
     kernel_image_registers: MeasurementSet,
-    registers: [RegisterHistory; MeasurementSet::CAPACITY as usize],
+    banks: ArrayVec<MeasurementBank, MAX_MEASUREMENT_BANKS>,
+    /// Index of the SHA-256 bank in `banks` and `bank_states`.
+    sha256_bank: usize,
+    bank_states: Vec<BankState>,
     slot: Slot,
     journal: Vec<Operation>,
     faults: Faults,
 }
 
 impl MeasuredBootModel {
-    /// A device fresh from the factory: every register at its reset
-    /// value and no slot defined. `kernel_image_registers` is what
+    /// A device fresh from the factory with a single SHA-256 bank keeping
+    /// all 32 registers, every register at its reset value and no slot
+    /// defined. `kernel_image_registers` is what
     /// [`MeasuredBoot::kernel_image_registers`] reports.
     pub fn new(kernel_image_registers: MeasurementSet) -> Self {
+        Self::with_banks(
+            kernel_image_registers,
+            &[MeasurementBank {
+                algorithm: MeasurementAlgorithm::Sha256,
+                registers: MeasurementSet::from_bits(u32::MAX),
+            }],
+        )
+    }
+
+    /// A device fresh from the factory carrying the active PCR banks in
+    /// `banks`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `banks` has more than [`MAX_MEASUREMENT_BANKS`] entries,
+    /// contains a bank with no registers, names an algorithm twice, or has
+    /// no SHA-256 bank covering `kernel_image_registers`.
+    pub fn with_banks(kernel_image_registers: MeasurementSet, banks: &[MeasurementBank]) -> Self {
+        assert!(
+            banks.len() <= MAX_MEASUREMENT_BANKS,
+            "at most {MAX_MEASUREMENT_BANKS} active PCR banks are supported"
+        );
+        let mut active = ArrayVec::new();
+        let mut sha256_bank = None;
+        for (index, bank) in banks.iter().copied().enumerate() {
+            assert!(
+                !bank.registers.is_empty(),
+                "an active PCR bank must keep at least one register"
+            );
+            assert!(
+                !active
+                    .iter()
+                    .any(|existing: &MeasurementBank| existing.algorithm == bank.algorithm),
+                "duplicate PCR bank algorithm {}",
+                bank.algorithm
+            );
+            if bank.algorithm == MeasurementAlgorithm::Sha256 {
+                assert!(
+                    bank.registers.contains_all(kernel_image_registers),
+                    "the SHA-256 bank must cover all kernel_image_registers"
+                );
+                sha256_bank = Some(index);
+            }
+            active.push(bank);
+        }
+        let sha256_bank = sha256_bank.expect("a measured-boot device must have a SHA-256 bank");
+        let bank_states = (0..active.len()).map(|_| BankState::new()).collect();
         Self {
             kernel_image_registers,
-            registers: core::array::from_fn(|_| Vec::new()),
+            banks: active,
+            sha256_bank,
+            bank_states,
             slot: Slot::Absent,
             journal: Vec::new(),
             faults: Faults::default(),
         }
     }
 
-    /// Returns every register to its reset value, as a power cycle does,
-    /// and starts a new journal. The slot is non-volatile and keeps what
-    /// it holds.
+    /// Returns every register in every bank to its reset value, as a power
+    /// cycle does, and starts a new journal. The slot is non-volatile and
+    /// keeps what it holds.
     pub fn power_cycle(&mut self) {
-        for register in &mut self.registers {
-            register.clear();
+        for bank in &mut self.bank_states {
+            bank.clear();
         }
         self.journal.clear();
+    }
+
+    /// The ordered digests extended into `register` in `algorithm`'s bank
+    /// since the last power cycle, or `None` when that bank does not keep
+    /// `register`.
+    pub fn register_history(
+        &self,
+        algorithm: MeasurementAlgorithm,
+        register: MeasurementRegister,
+    ) -> Option<&[MeasurementDigest]> {
+        let index = self
+            .banks
+            .iter()
+            .position(|bank| bank.algorithm == algorithm && bank.registers.contains(register))?;
+        Some(&self.bank_states[index].registers[usize::from(register.index())])
     }
 
     /// Every operation asked for since the last power cycle, oldest
@@ -145,8 +234,9 @@ impl MeasuredBootModel {
 
     /// Journals `operation` and answers the fault armed for its kind.
     fn begin(&mut self, operation: Operation) -> Result<(), MeasuredBootError> {
+        let kind = operation.kind();
         self.journal.push(operation);
-        match self.faults.slot(operation.kind()).take() {
+        match self.faults.slot(kind).take() {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -159,9 +249,10 @@ impl MeasuredBootModel {
     }
 
     fn snapshot(&self, bound_to: MeasurementSet) -> Vec<RegisterHistory> {
+        let sha256 = &self.bank_states[self.sha256_bank];
         bound_to
             .iter()
-            .map(|register| self.registers[usize::from(register.index())].clone())
+            .map(|register| sha256.registers[usize::from(register.index())].clone())
             .collect()
     }
 }
@@ -171,16 +262,29 @@ impl MeasuredBoot for MeasuredBootModel {
         self.kernel_image_registers
     }
 
+    fn banks(&self) -> &[MeasurementBank] {
+        &self.banks
+    }
+
     async fn extend(
         &mut self,
         register: MeasurementRegister,
-        digest: &Sha256Digest,
+        digests: &[MeasurementDigest],
     ) -> Result<(), MeasuredBootError> {
         self.begin(Operation::Extend {
             register,
-            digest: *digest,
+            digests: digests.to_vec(),
         })?;
-        self.registers[usize::from(register.index())].push(*digest);
+        validate_extend_digests(&self.banks, register, digests)?;
+        for (bank, state) in self.banks.iter().zip(self.bank_states.iter_mut()) {
+            if bank.registers.contains(register) {
+                let digest = digests
+                    .iter()
+                    .find(|digest| digest.algorithm() == bank.algorithm)
+                    .expect("validated above");
+                state.registers[usize::from(register.index())].push(*digest);
+            }
+        }
         Ok(())
     }
 
@@ -246,14 +350,22 @@ mod tests {
         }
     }
 
-    fn digest(byte: u8) -> Sha256Digest {
-        Sha256Digest([byte; 32])
+    fn digest(byte: u8) -> MeasurementDigest {
+        MeasurementDigest::Sha256([byte; 32])
+    }
+
+    fn sha384_digest(byte: u8) -> MeasurementDigest {
+        MeasurementDigest::Sha384([byte; 48])
+    }
+
+    fn one(digest: MeasurementDigest) -> Vec<MeasurementDigest> {
+        alloc::vec![digest]
     }
 
     /// Firmware measuring the loader and the loader measuring the kernel.
     fn boot(model: &mut MeasuredBootModel, kernel: u8) {
-        complete(model.extend(PCR4, &digest(0x04))).unwrap();
-        complete(model.extend(PCR9, &digest(kernel))).unwrap();
+        complete(model.extend(PCR4, &[digest(0x04)])).unwrap();
+        complete(model.extend(PCR9, &[digest(kernel)])).unwrap();
     }
 
     fn secret(byte: u8) -> SealedSecret {
@@ -301,7 +413,7 @@ mod tests {
         let mut model = MeasuredBootModel::new(BOUND);
         boot(&mut model, 0x09);
         complete(model.store_sealed(BOUND, &secret(0xa5))).unwrap();
-        complete(model.extend(PCR9, &digest(0x99))).unwrap();
+        complete(model.extend(PCR9, &[digest(0x99)])).unwrap();
         assert_eq!(
             complete(model.load_sealed(BOUND)).unwrap_err(),
             UnsealRefused::StateChanged
@@ -313,7 +425,7 @@ mod tests {
         let mut model = MeasuredBootModel::new(BOUND);
         boot(&mut model, 0x09);
         complete(model.store_sealed(BOUND, &secret(0xa5))).unwrap();
-        complete(model.extend(MeasurementRegister::new(16), &digest(0x16))).unwrap();
+        complete(model.extend(MeasurementRegister::new(16), &[digest(0x16)])).unwrap();
         assert!(complete(model.load_sealed(BOUND)).is_ok());
     }
 
@@ -376,11 +488,11 @@ mod tests {
             [
                 Operation::Extend {
                     register: PCR4,
-                    digest: digest(0x04),
+                    digests: one(digest(0x04)),
                 },
                 Operation::Extend {
                     register: PCR9,
-                    digest: digest(0x09),
+                    digests: one(digest(0x09)),
                 },
                 Operation::LoadSealed { bound_to: BOUND },
             ]
@@ -395,13 +507,13 @@ mod tests {
         let mut model = MeasuredBootModel::new(BOUND);
         model.fail_next(OperationKind::Extend, fault);
 
-        assert_eq!(complete(model.extend(PCR9, &digest(0x09))), Err(fault));
-        complete(model.extend(PCR9, &digest(0x09))).unwrap();
+        assert_eq!(complete(model.extend(PCR9, &[digest(0x09)])), Err(fault));
+        complete(model.extend(PCR9, &[digest(0x09)])).unwrap();
         complete(model.store_sealed(BOUND, &secret(0xa5))).unwrap();
 
         // The failed extend changed nothing: one extend is in the state.
         model.power_cycle();
-        complete(model.extend(PCR9, &digest(0x09))).unwrap();
+        complete(model.extend(PCR9, &[digest(0x09)])).unwrap();
         assert!(complete(model.load_sealed(BOUND)).is_ok());
         assert_eq!(model.journal().len(), 2);
     }
@@ -437,5 +549,94 @@ mod tests {
             MeasuredBootModel::new(BOUND).kernel_image_registers(),
             BOUND
         );
+    }
+
+    #[test]
+    fn a_two_bank_device_extends_both_banks_and_refuses_incomplete_digests() {
+        let all = MeasurementSet::from_bits(u32::MAX);
+        let banks = [
+            MeasurementBank {
+                algorithm: MeasurementAlgorithm::Sha256,
+                registers: all,
+            },
+            MeasurementBank {
+                algorithm: MeasurementAlgorithm::Sha384,
+                registers: all,
+            },
+        ];
+        let mut model = MeasuredBootModel::with_banks(BOUND, &banks);
+        assert_eq!(model.banks(), &banks);
+
+        // Omitting the SHA-384 bank is refused and mutates neither bank.
+        assert_eq!(
+            complete(model.extend(PCR9, &[digest(0x11)])),
+            Err(MeasuredBootError::MissingBankDigest {
+                register: PCR9,
+                algorithm: MeasurementAlgorithm::Sha384,
+            })
+        );
+        assert_eq!(
+            model.register_history(MeasurementAlgorithm::Sha256, PCR9),
+            Some(&[][..])
+        );
+        assert_eq!(
+            model.register_history(MeasurementAlgorithm::Sha384, PCR9),
+            Some(&[][..])
+        );
+
+        // Supplying an inactive bank (SHA-512) or duplicate is refused.
+        assert_eq!(
+            complete(model.extend(
+                PCR9,
+                &[
+                    digest(0x11),
+                    sha384_digest(0x22),
+                    MeasurementDigest::Sha512([0x33; 64]),
+                ]
+            )),
+            Err(MeasuredBootError::UnexpectedBankDigest {
+                register: PCR9,
+                algorithm: MeasurementAlgorithm::Sha512,
+            })
+        );
+        assert_eq!(
+            complete(model.extend(PCR9, &[digest(0x11), digest(0x12)])),
+            Err(MeasuredBootError::DuplicateBankDigest {
+                register: PCR9,
+                algorithm: MeasurementAlgorithm::Sha256,
+            })
+        );
+
+        // Extending with both digests updates both banks in order.
+        complete(model.extend(PCR4, &[digest(0x04), sha384_digest(0x40)])).unwrap();
+        complete(model.extend(PCR9, &[digest(0x09), sha384_digest(0x90)])).unwrap();
+        assert_eq!(
+            model.register_history(MeasurementAlgorithm::Sha256, PCR9),
+            Some(&[digest(0x09)][..])
+        );
+        assert_eq!(
+            model.register_history(MeasurementAlgorithm::Sha384, PCR9),
+            Some(&[sha384_digest(0x90)][..])
+        );
+        assert_eq!(
+            model.register_history(MeasurementAlgorithm::Sha512, PCR9),
+            None
+        );
+
+        // Sealing binds to the SHA-256 bank and survives power cycle when both banks replay.
+        complete(model.store_sealed(BOUND, &secret(0xa5))).unwrap();
+        model.power_cycle();
+        assert_eq!(
+            model.register_history(MeasurementAlgorithm::Sha256, PCR9),
+            Some(&[][..])
+        );
+        assert_eq!(
+            model.register_history(MeasurementAlgorithm::Sha384, PCR9),
+            Some(&[][..])
+        );
+        complete(model.extend(PCR4, &[digest(0x04), sha384_digest(0x40)])).unwrap();
+        complete(model.extend(PCR9, &[digest(0x09), sha384_digest(0x90)])).unwrap();
+        let loaded = complete(model.load_sealed(BOUND)).unwrap();
+        assert_eq!(loaded.expose(), secret(0xa5).expose());
     }
 }

@@ -81,28 +81,43 @@ The parsed result is a `BootPayload`, which the backend hands
 kernel's view types — they are views over the payload image now instead
 of generated statics.
 
-## Booting a CI-built image without a rebuild
+## Booting a CI-built artifact without a rebuild
 
-Each smoke lane uploads the release kernel and the full `helios-bootfs`
-it built as `helios-guest-<arch>` (`aarch64`, `riscv64`, `x86-64`), kept
-90 days. The archive mirrors the paths under `target/` that
-`vm --no-build` reads, so on a host with the same commit checked out and
-`helios-inspector` and `helios-cli` built, unpacking it into `target/` is
-the whole installation:
+CI uploads three tiers of prebuilt artifacts on demand — only for the lanes a
+run already builds — each carrying a typed `manifest.json` and never any root
+secret key:
+
+- **Userspace** (`helios-wasm-{profile}`): architecture-independent guest wasm
+  built by `wasm-debug` / `wasm-release`, kept 14 days.
+- **Kernel** (`helios-kernel-{arch}-{profile}`): built kernel ELF and its
+  embedded `helios-root-public.key`, kept 90 days on the release smoke lanes
+  and 14 days on other lanes (`release-linux`, `debug`, `debug-cfi`).
+- **Full bootable image** (`helios-image-{arch}-{profile}`): kernel ELF,
+  signed `helios-bootfs`, `helios-root-public.key`, prebuilt Limine UEFI disk
+  image `kernel.uefi.img` on `x86-64` and `aarch64`, and `compiler_plugin.wasm`
+  when built with the compiler plugin; kept 90 days on the release smoke lanes
+  and 14 days on other lanes.
+
+`helios-cli artifact-fetch` downloads any tier from the latest green CI run
+matching the current `HEAD` (falling back to the default branch, preferring
+`release` over `debug` unless `--profile` is specified) into the shared local
+cache, and `helios vm --prebuilt` wires it directly into a boot:
 
 ```bash
-gh run download <run> -n helios-guest-aarch64 -D target
-./target/release/helios vm --arch aarch64 --release --no-build shell -c 'echo ok'
-HELIOS_WORKLOAD_BENCH_NO_BUILD=1 tools/wasi-apps/workload-bench.sh
+# Boot the latest green full image directly (zero local compilation, no Limine needed)
+helios vm --arch x86-64 --prebuilt shell -c 'echo ok'
+
+# Reuse prebuilt guest wasm while building only the local kernel and bootfs
+helios vm --arch x86-64 --prebuilt userspace shell -c 'echo ok'
+
+# Fetch a specific tier explicitly (or inspect its cached path as JSON)
+helios-cli artifact-fetch --kind image --arch aarch64 --json
+
+# Boot an already-downloaded prebuilt image directory offline (zero network)
+helios vm --arch aarch64 --release --prebuilt image --prebuilt-dir /path/to/image shell -c 'echo ok'
 ```
 
-The archive holds `<triple>/kernel-release/helios-kernel` and
-`kernel-prebuild/<triple>/kernel-release/helios-bootfs`; the x86-64 one
-uses `profile-use` for the directory, because its release kernel is
-built against the fetched profile, so that host runs
-`helios-cli profile-fetch` first for the inspector to resolve the same
-directory. The disk image Limine boots (x86-64, aarch64) is written at
-boot from these two files, so the host needs `HELIOS_LIMINE_SHARE` and
-`HELIOS_LIMINE_BIN` as for any boot. The prebuild manifest and the root
-key files are not shipped: they are read by the build only, and the
-manifest records absolute paths of the machine that wrote it.
+`--prebuilt kernel` requires either a `--bootfs` signed by the prebuilt
+kernel's embedded `helios-root-public.key` or a matching `--root-secret-key`;
+the inspector checks key compatibility before launching QEMU and fails fast on
+a mismatch.

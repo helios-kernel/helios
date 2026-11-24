@@ -1,8 +1,8 @@
 //! Brings up a process tree from the boot image's configuration.
 //!
 //! Init mounts what the boot image's `/etc/fstab` names, lists the root
-//! and every mount it made, prints `/init.txt`, and runs `/etc/rc` with
-//! `/bin/dash` when the image carries one. Every program `/etc/rc` starts
+//! and every mount it made, prints `/init.txt`, and runs `/etc/rc.nu` with
+//! `/bin/nu` when the image carries one. Every program `/etc/rc.nu` starts
 //! descends from init, so it sees init's mounts.
 //!
 //! `/etc/fstab` holds one mount per line, `#` starting a comment:
@@ -31,8 +31,8 @@ use helios_api::mounts::{self, MountRequest, MountSharing, MountSource};
 use helios_api::programs::{self, ExecRequest};
 
 const FSTAB: &str = "/etc/fstab";
-const RC: &str = "/etc/rc";
-const SHELL: &str = "/bin/dash";
+const RC: &str = "/etc/rc.nu";
+const SHELL: &str = "/bin/nu";
 
 /// One line of `/etc/fstab`.
 struct Mount {
@@ -233,7 +233,7 @@ fn list(directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Runs `/etc/rc` under the shell, with init's authority over the tree.
+/// Runs `/etc/rc.nu` under `/bin/nu`, with init's authority over the tree.
 async fn run_rc() -> io::Result<()> {
     let result = programs::exec(ExecRequest {
         name: "rc".to_owned(),

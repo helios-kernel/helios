@@ -158,7 +158,7 @@ jobs:
             helios/artifacts/wasi-tools
             helios/artifacts/python3-root
             helios/artifacts/wasix
-          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/tools/branch-hints/**', 'helios/docs/wasmtime.md', 'helios/api/**', 'helios/api-macro/**', 'helios/wit/**', 'helios/Cargo.toml', 'helios/Cargo.lock', 'helios/rust-toolchain.toml', 'helios/.cargo/config.toml') }}
+          key: wasi-artifacts-v2-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/tools/branch-hints/**', 'helios/api/**', 'helios/api-macro/**', 'helios/wit/**', 'helios/rust-toolchain.toml') }}
       - name: Stage WASI tooling artifacts
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios

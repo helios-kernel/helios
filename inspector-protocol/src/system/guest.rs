@@ -551,6 +551,7 @@ fn map_machine_right_to_host(right: programs::MachineRight) -> host_programs::Ma
     match right {
         programs::MachineRight::Control => host_programs::MachineRight::Control,
         programs::MachineRight::Identity => host_programs::MachineRight::Identity,
+        programs::MachineRight::Virtualize => host_programs::MachineRight::Virtualize,
     }
 }
 
@@ -716,6 +717,7 @@ fn convert_instance(instance: host_instances::Instance) -> instances::Instance {
         started_at: instance.started_at,
         uptime: instance.uptime,
         memory_bytes: instance.memory_bytes,
+        storage_bytes: instance.storage_bytes,
         cpu_busy: instance.cpu_busy,
     }
 }

@@ -703,10 +703,14 @@ fn kernel_containers_telemetry_reports_mounts_pids_uts_and_overlay_pages() {
     let bootfs = BootFs::new(TEST_BOOT, BOOT_DEVICE);
     let table: MountTable<UnsupportedStorage> = MountTable::new(bootfs, 4);
     let mem_root = MemoryFs::new(table.allocate_device());
-    // Write 5000 bytes into a file so overlay_pages == 2 (ceil(5000 / 4096)).
+    // Write 5000 bytes into a file: `PagedBytes` stores 2 data frames plus 1 radix-tree
+    // node frame (height 1) = 3 resident user-pool frames.
     block_on(async {
         let path = FsPath::new("payload.bin").unwrap();
-        let _ = mem_root.open(path, OpenFlags::CREATE, 0).await.unwrap();
+        let _ = mem_root
+            .open(path, OpenFlags::CREATE, 0, &crate::StoragePayer::for_test())
+            .await
+            .unwrap();
         let payload = vec![0xabu8; 5000];
         write_bytes(&mem_root, path, WritePosition::At(0), &payload, 0)
             .await
@@ -785,7 +789,7 @@ fn kernel_containers_telemetry_reports_mounts_pids_uts_and_overlay_pages() {
     );
     assert_eq!(
         find("/kernel/containers/9/overlay-pages"),
-        Some(&InspectValue::Unsigned64(2))
+        Some(&InspectValue::Unsigned64(3))
     );
     assert_eq!(
         find("/kernel/containers/9/mounts/0/target"),
@@ -801,7 +805,7 @@ fn kernel_containers_telemetry_reports_mounts_pids_uts_and_overlay_pages() {
     );
     assert_eq!(
         find("/kernel/containers/9/mounts/0/overlay-pages"),
-        Some(&InspectValue::Unsigned64(2))
+        Some(&InspectValue::Unsigned64(3))
     );
 }
 

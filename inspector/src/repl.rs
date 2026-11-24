@@ -39,12 +39,14 @@ pub async fn run_shell_command(
         (None, None) => return Err(ShellScriptError::MissingScript),
         (Some(_), Some(_)) => unreachable!("clap must reject conflicting shell inputs"),
     };
-    Ok(run_shell_script(client, script).await?)
+    let shell_path = command.shell.as_deref().unwrap_or(REMOTE_SHELL_PATH);
+    Ok(run_shell_script(client, shell_path, script).await?)
 }
 
 async fn run_shell_script(
     client: &mut RpcClient,
+    shell_path: &str,
     script: String,
 ) -> Result<ExecResult, ProgramError> {
-    programs::exec(client, REMOTE_SHELL_PATH, &["-c".to_owned(), script]).await
+    programs::exec(client, shell_path, &["-c".to_owned(), script]).await
 }

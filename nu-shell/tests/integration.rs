@@ -239,6 +239,7 @@ fn sys_inspect_ps_kill_whoami_sleep_clear_and_scoping() {
             .unwrap();
         assert_eq!(snap_id.as_str().unwrap(), "snap-1");
         assert_eq!(env.recorded_snapshots().len(), 1);
+        assert_eq!(env.released_snapshots(), vec!["snap-1"]);
 
         // `with-instruction-profile`
         let prof = session
@@ -620,7 +621,8 @@ fn ast_completion_core_covers_all_surfaces() {
 #[test]
 fn parse_and_runtime_errors_surface_typed() {
     block_on(async {
-        let mut session = ShellSession::new(TestHeliosEnv::new()).await;
+        let env = TestHeliosEnv::new();
+        let mut session = ShellSession::new(env.clone()).await;
 
         let parse_err = session.eval("if true { (1 + ").await.unwrap_err();
         assert!(matches!(parse_err, NuError::Parse { .. }));
@@ -648,10 +650,49 @@ fn parse_and_runtime_errors_surface_typed() {
             .eval(r#"run-external "fail-ext""#)
             .await
             .unwrap_err();
-        let nonzero_msg = nonzero.to_string();
         assert!(
-            nonzero_msg.contains("7") && nonzero_msg.contains("boom-stderr"),
-            "expected non-zero exit status and stderr detail, got: {nonzero_msg}"
+            matches!(
+                nonzero,
+                NuError::Eval(ref err)
+                    if matches!(
+                        err.as_ref(),
+                        nu_protocol::ShellError::NonZeroExitCode { exit_code, .. }
+                            if exit_code.get() == 7
+                    )
+            ),
+            "expected NonZeroExitCode(7), got: {nonzero}"
+        );
+        assert!(
+            env.recorded_stderr().contains("boom-stderr"),
+            "expected uncaptured stderr to flow to inherited stderr"
+        );
+
+        // When stderr is captured on a failing external ByteStream (e.g. remote RPC spawn),
+        // `collect_byte_stream_checked` includes the trimmed stderr detail in the error message.
+        let (out_tx, out_rx) = async_channel::bounded(1);
+        let (err_tx, err_rx) = async_channel::bounded(1);
+        let (code_tx, code_rx) = async_channel::bounded(1);
+        out_tx.send(Ok(b"partial-out".to_vec())).await.unwrap();
+        err_tx.send(Ok(b"boom-stderr\n".to_vec())).await.unwrap();
+        code_tx.send(Ok(7)).await.unwrap();
+        drop(out_tx);
+        drop(err_tx);
+        drop(code_tx);
+        let captured_err = AsyncPipelineData::ByteStream {
+            stream: out_rx,
+            stderr: Some(err_rx),
+            exit_code: Some(code_rx),
+            span: nu_protocol::Span::test_data(),
+            stream_type: nu_protocol::ByteStreamType::Unknown,
+            metadata: None,
+        }
+        .into_value_async(nu_protocol::Span::test_data())
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            captured_err.contains('7') && captured_err.contains("boom-stderr"),
+            "expected non-zero exit status and captured stderr detail, got: {captured_err}"
         );
 
         // Direct AsyncPipelineData streaming input into `each`
@@ -783,5 +824,87 @@ fn save_unknown_extension_stderr_redirection_do_env_tilde_and_cancellation() {
             session.runtime_scope().current_scope().is_none(),
             "cancelled with-scope must not leak scope onto session"
         );
+
+        // 6. Stderr file redirection drains stdout and stderr concurrently even when
+        //    stdout exceeds `STREAM_CHANNEL_CAPACITY` chunks before stderr closes.
+        let out_len = session
+            .eval(r#"run-external "big-out-then-err" e> /tmp/big-err.txt | str length"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            out_len.as_int().unwrap(),
+            i64::try_from(helios_nu::STREAM_CHANNEL_CAPACITY * 4 * 4).unwrap()
+        );
+        assert_eq!(
+            env.read_vfs_bytes("/tmp/big-err.txt").as_deref(),
+            Some(b"late-stderr".as_slice())
+        );
+
+        // 7. Async `par-each` runs closures concurrently without OS threads
+        let par = session
+            .eval("[1 2 3 4] | par-each { |x| sleep 1ms; $x * 3 } | math sum")
+            .await
+            .unwrap();
+        assert_eq!(par.as_int().unwrap(), 30);
+
+        // 8. Non-zero external exit in a drained statement raises an error catchable by `try`,
+        //    and its uncaptured stderr flows directly to inherited stderr (`stderr_log`).
+        let failed = session
+            .eval(r#"run-external "fail-ext"; "unreachable""#)
+            .await;
+        assert!(failed.is_err());
+        let recovered = session
+            .eval(r#"try { run-external "fail-ext"; "no" } catch { "caught" }"#)
+            .await
+            .unwrap();
+        assert_eq!(recovered.as_str().unwrap(), "caught");
+        assert_eq!(env.recorded_stderr(), "boom-stderrboom-stderr");
+
+        // 9. Async `print` routes through `HeliosEnv::{write_stdout, write_stderr}`
+        let _ = session
+            .eval(r#"print "hello"; print -n "world"; print -e "errline""#)
+            .await
+            .unwrap();
+        assert_eq!(env.recorded_stdout(), "hello\nworld");
+        assert_eq!(env.recorded_stderr(), "boom-stderrboom-stderrerrline\n");
+
+        // 9b. Non-piped `eval_pipeline` leaves stdout inherited (`capture_stdout = false`)
+        //     and streams directly to `stdout_log` rather than buffering.
+        let inherited = session
+            .eval_pipeline(
+                r#"run-external "echo-ext" "direct-stream""#,
+                AsyncPipelineData::Empty,
+            )
+            .await
+            .unwrap();
+        let exit = inherited.drain_async().await.unwrap();
+        assert_eq!(exit, Some(0));
+        assert!(env.recorded_stdout().contains("direct-stream\n"));
+
+        // 10. Every committed guest `.nu` script parses and compiles cleanly
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        for rel in [
+            "tools/fs-smoke/bootfs/etc/rc.nu",
+            "tools/fs-smoke/crash/bootfs/etc/rc.nu",
+            "tools/cpu-lifecycle/guest.nu",
+        ] {
+            let source = std::fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|e| panic!("failed to read {rel}: {e}"));
+            let (engine_state, _) = helios_nu::create_helios_context();
+            let mut working_set = nu_protocol::engine::StateWorkingSet::new(&engine_state);
+            let _ = nu_parser::parse(&mut working_set, Some(rel), source.as_bytes(), false);
+            assert!(
+                working_set.parse_errors.is_empty(),
+                "{rel} parse errors: {:?}",
+                working_set.parse_errors
+            );
+            assert!(
+                working_set.compile_errors.is_empty(),
+                "{rel} compile errors: {:?}",
+                working_set.compile_errors
+            );
+        }
     });
 }

@@ -242,9 +242,13 @@ pub(crate) struct ShellCommand {
     #[arg(short = 'c', long = "command", conflicts_with = "script")]
     command: Option<String>,
 
-    /// Path to a local script file whose contents are executed remotely by `/bin/dash`.
+    /// Path to a local script file whose contents are executed remotely by the guest shell.
     #[arg(conflicts_with = "command")]
     script: Option<String>,
+
+    /// Guest shell binary to invoke (defaults to `/bin/dash`; pass `/bin/nu` for Nushell).
+    #[arg(long = "shell", value_name = "PATH")]
+    shell: Option<String>,
 
     /// Write the guest tracing events the script produced to this file.
     #[arg(long = "trace-log", value_name = "PATH")]
@@ -407,8 +411,9 @@ async fn run_ops_session_command(
                 (None, Some(path)) => std::fs::read_to_string(path)?,
                 _ => String::new(),
             };
+            let shell_path = cmd.shell.as_deref().unwrap_or(programs::REMOTE_SHELL_PATH);
             let res = session
-                .exec(programs::REMOTE_SHELL_PATH, &["-c".to_owned(), script])
+                .exec(shell_path, &["-c".to_owned(), script])
                 .await?;
             std::io::stdout().write_all(&res.output.stdout)?;
             std::io::stderr().write_all(&res.output.stderr)?;
@@ -741,8 +746,32 @@ mod tests {
         let args = Args::try_parse_from(["helios", "shell", "-c", "echo hi"])
             .expect("shell subcommand must parse");
         match args.command.expect("subcommand must be present") {
-            Command::Shell(_) => {}
+            Command::Shell(cmd) => assert_eq!(cmd.shell, None),
             _ => panic!("expected shell subcommand"),
+        }
+    }
+
+    #[test]
+    fn parses_shell_and_repl_explicit_shell_flag() {
+        let shell_args = Args::try_parse_from([
+            "helios-inspector",
+            "shell",
+            "--shell",
+            "/bin/nu",
+            "-c",
+            "true",
+        ])
+        .expect("shell --shell must parse");
+        match shell_args.command.expect("subcommand must be present") {
+            Command::Shell(cmd) => assert_eq!(cmd.shell.as_deref(), Some("/bin/nu")),
+            _ => panic!("expected shell subcommand"),
+        }
+
+        let repl_args = Args::try_parse_from(["helios-inspector", "repl", "--shell", "/bin/nu"])
+            .expect("repl --shell must parse");
+        match repl_args.command.expect("subcommand must be present") {
+            Command::Repl(cmd) => assert_eq!(cmd.shell.as_deref(), Some("/bin/nu")),
+            _ => panic!("expected repl subcommand"),
         }
     }
 

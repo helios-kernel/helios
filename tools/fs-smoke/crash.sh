@@ -45,11 +45,11 @@ boot() {
     --bootfs-root "$runtime/bootfs" \
     --disk "$runtime/image.btrfs,serial=btrfs-smoke" \
     --shared-dir "$runtime/share" --shared-dir-writable \
-    --boot-program dash --boot-program debugger \
+    --boot-program nu --boot-program debugger \
     --boot-program ls --boot-program cat --boot-program python3 \
     --no-compiler-plugin \
     "$@" \
-    shell -c true 2>&1 > "$runtime/$name.out" | tee "$runtime/$name.log"
+    shell --shell /bin/nu -c 'true' 2>&1 > "$runtime/$name.out" | tee "$runtime/$name.log"
   boot_status="${PIPESTATUS[0]}"
   sed '/^\[KDBG run:begin\]$/q' "$runtime/$name/debug-serial.log" | tr -d '\r' > "$runtime/$name-boot.out"
   set -e

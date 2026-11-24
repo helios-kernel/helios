@@ -314,6 +314,16 @@ pub trait HeliosEnv: Send + Sync {
     /// Clear the active terminal surface (`clear`).
     fn clear(&self) -> impl Future<Output = Result<(), EnvError>> + Send;
 
+    /// Write raw bytes to the shell's standard output stream (`print`).
+    fn write_stdout(&self, _bytes: &[u8]) -> impl Future<Output = Result<(), EnvError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Write raw bytes to the shell's standard error stream (`print -e`).
+    fn write_stderr(&self, _bytes: &[u8]) -> impl Future<Output = Result<(), EnvError>> + Send {
+        async { Ok(()) }
+    }
+
     /// Validate / enter a named capability subtree scope (`with-scope`).
     fn enter_scope(&self, scope: &str) -> impl Future<Output = Result<String, EnvError>> + Send;
 
@@ -326,6 +336,11 @@ pub trait HeliosEnv: Send + Sync {
         name: &str,
         moniker: Option<&str>,
     ) -> impl Future<Output = Result<SnapshotInfo, EnvError>> + Send;
+
+    /// Release a previously acquired snapshot hold when `with-snapshot` completes.
+    fn release_snapshot(&self, _id: &str) -> impl Future<Output = Result<(), EnvError>> + Send {
+        async { Ok(()) }
+    }
 
     /// Begin instruction profiling for `target` (`with-instruction-profile`).
     fn begin_instruction_profile(
