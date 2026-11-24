@@ -1,7 +1,7 @@
 use std::env;
 
 /// The rustflag `.cargo/config.toml` sets for this target, as one argument.
-const BRANCH_PROTECTION_FLAG: &str = "-Zbranch-protection=pac-ret";
+const BRANCH_PROTECTION_FLAG: &str = "-Zbranch-protection=bti,pac-ret";
 
 /// Cargo separates the arguments of `CARGO_ENCODED_RUSTFLAGS` with this byte
 /// (the Cargo book, "Environment variables Cargo sets for build scripts").
@@ -29,6 +29,14 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HELIOS_CFI_SELF_TEST");
     if env::var_os("HELIOS_CFI_SELF_TEST").is_some() {
         println!("cargo:rustc-cfg=helios_cfi_self_test");
+    }
+    // The BTI self-test image makes an indirect call to a non-landing-pad
+    // instruction on the bootstrap processor and expects a Branch Target
+    // Exception (`cfi::bti_self_test`).
+    println!("cargo:rustc-check-cfg=cfg(helios_bti_self_test)");
+    println!("cargo:rerun-if-env-changed=HELIOS_BTI_SELF_TEST");
+    if env::var_os("HELIOS_BTI_SELF_TEST").is_some() {
+        println!("cargo:rustc-cfg=helios_bti_self_test");
     }
     // The MTE self-test image reads into a Tag::FREE redzone through a
     // live-tagged pointer and expects a synchronous tag check fault panic
