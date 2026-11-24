@@ -553,3 +553,80 @@ def test_workflows_target_single_main_branch():
     assert "'dev'" not in (workflows_dir / "bench-lane.yml").read_text()
     assert "origin/dev" not in (workflows_dir / "bench-suite.yml").read_text()
     assert "--branch dev" not in (workflows_dir / "bench-suite.yml").read_text()
+
+
+def test_prebuilt_wasm_action_downloads_via_rest_and_retries_transient_lag(tmp_path):
+    action_path = REPO_ROOT / ".github/actions/prebuilt-wasm/action.yml"
+    action = yaml.load(action_path.read_text(), Loader=yaml.BaseLoader)
+    steps = action["runs"]["steps"]
+    assert all(step.get("uses") != "actions/download-artifact@v4" for step in steps)
+    script = steps[0]["run"]
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    sleep_shim = bin_dir / "sleep"
+    sleep_shim.write_text("#!/bin/sh\nexit 0\n")
+    sleep_shim.chmod(0o755)
+
+    # Case 1: REST listing reports the artifact while the first download fails
+    # transiently, then succeeds on retry.
+    state_file = tmp_path / "download_attempts"
+    gh_retry = bin_dir / "gh"
+    gh_retry.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, pathlib, sys\n"
+        "args = sys.argv[1:]\n"
+        "if args[:2] == ['api', '--paginate']:\n"
+        "    endpoint = args[2]\n"
+        "    if endpoint.endswith('/artifacts'):\n"
+        "        print('14894939174')\n"
+        "    elif endpoint.endswith('/jobs'):\n"
+        "        print('completed success')\n"
+        "    sys.exit(0)\n"
+        "if args[:2] == ['run', 'download']:\n"
+        "    counter = pathlib.Path(os.environ['STATE_FILE'])\n"
+        "    attempt = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+        "    counter.write_text(str(attempt))\n"
+        "    if attempt == 1:\n"
+        "        sys.stderr.write('artifact not ready yet\\n')\n"
+        "        sys.exit(1)\n"
+        "    dest = pathlib.Path(args[args.index('--dir') + 1])\n"
+        "    (dest / 'helios_debugger.wasm').write_bytes(b'wasm')\n"
+        "    sys.exit(0)\n"
+        "sys.exit(2)\n"
+    )
+    gh_retry.chmod(0o755)
+
+    dest = tmp_path / "out/wasm-programs/debug"
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "STATE_FILE": str(state_file),
+        "GITHUB_REPOSITORY": "lexoliu/helios",
+        "GITHUB_RUN_ID": "45338743742",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "PROFILE": "debug",
+        "DEST": str(dest),
+        "TIMEOUT_SECONDS": "60",
+    }
+    res = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+    assert (dest / "helios_debugger.wasm").read_bytes() == b"wasm"
+    assert int(state_file.read_text()) == 2
+
+    # Case 2: producer job fails without uploading -> fails fast.
+    gh_fail = bin_dir / "gh"
+    gh_fail.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        "if args[:2] == ['api', '--paginate'] and args[2].endswith('/jobs'):\n"
+        "    print('completed failure')\n"
+        "sys.exit(0)\n"
+    )
+    gh_fail.chmod(0o755)
+
+    res_fail = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+    assert res_fail.returncode != 0
+    assert "::error::" in res_fail.stdout
+    assert "concluded 'failure'" in res_fail.stdout

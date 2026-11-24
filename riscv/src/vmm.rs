@@ -80,11 +80,11 @@ use helios_kernel::runtime_memory::{
     default_memory_image_new, default_page_size,
 };
 use helios_kernel::{
-    FiberStackVmHooks, InstalledAddressSpace, MemoryOwner, ReservationLookup, ReservationTracker,
-    ResidencyVmHooks, VaCursor, allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed_on,
-    allocate_user_run_zeroed_on, current_user_memory_owner, deallocate_user_frame_on,
-    deallocate_user_run_on, install_fiber_stack_hooks, install_residency_hooks, ranges_outside,
-    residency_vm_hooks, user_frame_node, validate_range,
+    AllocationTagHooks, FiberStackVmHooks, InstalledAddressSpace, MemoryOwner, ReservationLookup,
+    ReservationTracker, ResidencyVmHooks, VaCursor, allocate_user_frame_uninit_on_node,
+    allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, current_user_memory_owner,
+    deallocate_user_frame_on, deallocate_user_run_on, install_fiber_stack_hooks,
+    install_residency_hooks, ranges_outside, residency_vm_hooks, user_frame_node, validate_range,
 };
 use spin::{Mutex, Once};
 
@@ -1233,7 +1233,8 @@ fn flush_tlb_pages(start: usize, pages: usize) {
 }
 
 fn page_flags_to_pte(flags: PageFlags) -> Result<u64, AddressSpaceError> {
-    if flags.is_empty() {
+    // RISC-V has no allocation-tag storage to map.
+    if flags.is_empty() || flags.contains(PageFlags::TAGGED) {
         return Err(AddressSpaceError::InvalidFlags);
     }
     let mut pte = 0u64;
@@ -1292,6 +1293,7 @@ static RISCV_FIBER_STACK_HOOKS: FiberStackVmHooks = FiberStackVmHooks {
     prepare_demand_commit: |virt, flags| user_as().prepare_demand_commit(virt, flags),
     commit_demand_page: |addr, frame, flags| user_as().commit_demand_page(addr, frame, flags),
     end_demand_commit: |virt, mapped| user_as().end_demand_commit(virt, mapped),
+    tags: AllocationTagHooks::NONE,
 };
 
 /// The machine's one user address space.

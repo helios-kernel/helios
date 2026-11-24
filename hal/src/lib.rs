@@ -31,6 +31,7 @@ pub mod processor_hotplug;
 pub mod resource;
 pub mod rtc;
 pub mod serial;
+pub mod tagging;
 pub mod vmm;
 pub mod vmm_test_harness;
 pub mod vsock;
