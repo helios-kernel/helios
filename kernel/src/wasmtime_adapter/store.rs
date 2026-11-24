@@ -135,7 +135,7 @@ where
     }
 
     /// Configures this store's component [`wasmtime::component::ResourceTable`]
-    /// with the operator handle limit (`wasi.max-component-handles`) and a
+    /// with the operator handle limit (`process.max-component-handles`) and a
     /// per-store [`ResourceTableLimiter`] that attributes table backing storage
     /// and boxed entries to this instance's kernel-heap footprint and refuses
     /// allocations that would breach [`KernelHeapHeadroom`].

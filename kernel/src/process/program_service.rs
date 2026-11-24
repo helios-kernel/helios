@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::settings::{Setting, SettingUnit};
 
 /// Operator setting for the maximum number of live component resource-table
-/// entries per store (`wasi.max-component-handles`).
+/// entries per store (`process.max-component-handles`).
 pub struct ComponentHandleLimitSetting;
 
 impl ComponentHandleLimitSetting {
@@ -17,7 +17,7 @@ impl ComponentHandleLimitSetting {
 }
 
 impl Setting for ComponentHandleLimitSetting {
-    const NAME: &'static str = "wasi.max-component-handles";
+    const NAME: &'static str = "process.max-component-handles";
     const DESCRIPTION: &'static str = "Maximum live component resource handles a store may hold.";
     const UNIT: SettingUnit = SettingUnit::Count;
     type Value = usize;

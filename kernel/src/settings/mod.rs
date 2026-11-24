@@ -432,7 +432,7 @@ mod tests {
                     value: SettingValue::Count(1024),
                 },
                 SettingEntry {
-                    name: "wasi.max-component-handles",
+                    name: "process.max-component-handles",
                     description: ComponentHandleLimitSetting::DESCRIPTION,
                     value: SettingValue::Count(ComponentHandleLimitSetting::DEFAULT_LIMIT as u64),
                 },
