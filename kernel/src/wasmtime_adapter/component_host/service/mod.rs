@@ -257,6 +257,11 @@ pub(super) struct ProgramLaunch<Net: ComponentHostNetwork, StorageImpl: crate::S
     argv: ProgramArgv,
     env: LaunchEnvironment,
     authority: ProcessAuthority,
+    /// Pre-registered child instance when the host launch path needed the
+    /// child's [`crate::InstanceId`] upfront to resolve `subtree(none)` grants.
+    launched_instance: Option<crate::RegisteredInstance>,
+    /// IPC capability endpoints moved into the child at launch.
+    ipc_grants: crate::IpcEndpointGrants,
     /// The namespace the program runs in: the launcher's own tree when it
     /// shares it, or a tree descending from the launcher's. `None` for a
     /// program the kernel launches, which runs in a tree descending from
@@ -292,6 +297,8 @@ impl<Net: ComponentHostNetwork, StorageImpl: crate::Storage> ProgramLaunch<Net, 
             argv,
             env: LaunchEnvironment::from_guest(env),
             authority,
+            launched_instance: None,
+            ipc_grants: crate::IpcEndpointGrants::new(),
             filesystem,
             descriptors: DescriptorOrigin::Fresh,
             signal_dispositions: Vec::new(),
@@ -313,6 +320,8 @@ impl<Net: ComponentHostNetwork, StorageImpl: crate::Storage> ProgramLaunch<Net, 
             argv,
             env: LaunchEnvironment::from_guest(env),
             authority,
+            launched_instance: None,
+            ipc_grants: crate::IpcEndpointGrants::new(),
             filesystem: None,
             descriptors: DescriptorOrigin::Fresh,
             signal_dispositions: Vec::new(),
@@ -322,6 +331,19 @@ impl<Net: ComponentHostNetwork, StorageImpl: crate::Storage> ProgramLaunch<Net, 
             }),
             timeline: phases::Timeline::disabled(),
         }
+    }
+
+    pub(super) fn with_launched_instance(
+        mut self,
+        launched_instance: crate::RegisteredInstance,
+    ) -> Self {
+        self.launched_instance = Some(launched_instance);
+        self
+    }
+
+    pub(super) fn with_ipc_grants(mut self, ipc_grants: crate::IpcEndpointGrants) -> Self {
+        self.ipc_grants = ipc_grants;
+        self
     }
 
     /// The timeline this launch's phases record into. The handle's
@@ -366,6 +388,18 @@ where
 {
     pub(crate) fn spawner(&self) -> crate::Spawner<CpuImpl> {
         self.spawner.clone()
+    }
+
+    pub(crate) fn parent_instance_id(&self) -> Option<crate::InstanceId> {
+        self.parent_instance_id
+    }
+
+    pub(crate) fn instance_registry(&self) -> &crate::InstanceRegistry {
+        &self.instance_registry
+    }
+
+    pub(crate) fn now_uptime_nanos(&self) -> u64 {
+        self.runtime_state.uptime_nanos(self.cpu.now().ticks())
     }
 }
 
@@ -438,6 +472,7 @@ struct ProgramSpawnRequest<Net: ComponentHostNetwork, StorageImpl: crate::Storag
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
+    ipc_grants: crate::IpcEndpointGrants,
     filesystem: Option<Namespace<StorageImpl>>,
     descriptors: DescriptorOrigin<Net>,
     signal_state: WasixSignalState,
@@ -756,11 +791,13 @@ where
     // The signing key is settled before any program can be admitted,
     // with the measured-boot device the platform handed the kernel.
     let mut measured_boot = kernel.take_measured_boot();
-    let cwasm_signing_key = crate::signing_key::settle_signing_key_at_bring_up(
-        measured_boot.as_mut(),
-        debug_state.payload_body(),
-        debug_state.root_entropy(),
-    );
+    let (cwasm_signing_key, machine_identity_key) =
+        crate::signing_key::settle_signing_key_at_bring_up(
+            measured_boot.as_mut(),
+            debug_state.payload_body(),
+            debug_state.root_entropy(),
+        );
+    debug_state.install_machine_identity_key(machine_identity_key);
     // Selected by the backend when it built the runtime state, before any
     // secondary processor ran guest code, and logged once here: this is the
     // single place every backend's program service passes through, after the
@@ -1926,6 +1963,8 @@ where
             argv,
             env,
             authority,
+            launched_instance,
+            ipc_grants,
             filesystem,
             descriptors,
             signal_dispositions,
@@ -1959,16 +1998,30 @@ where
         let started_at = exec_context
             .runtime_state
             .uptime_nanos(exec_context.cpu.now().ticks());
-        let launched_instance = exec_context
-            .instance_registry
-            .register(argv.program_name().to_owned(), started_at);
+        let launched_instance = launched_instance.unwrap_or_else(|| {
+            exec_context.instance_registry.register_child(
+                exec_context.parent_instance_id,
+                argv.program_name().to_owned(),
+                started_at,
+            )
+        });
         let instance_id = launched_instance.id();
+        let ipc_grant_count = ipc_grants.len();
+        if !authority.is_empty() || ipc_grant_count > 0 {
+            crate::audit::privileged_spawn(
+                exec_context.parent_instance_id,
+                instance_id,
+                argv.program_name(),
+                ipc_grant_count,
+            );
+        }
         let env = env.into_process_env(instance_id);
         let signal_state = WasixSignalState::new();
         let request = ProgramSpawnRequest {
             argv,
             env,
             authority,
+            ipc_grants,
             filesystem,
             descriptors,
             signal_state: signal_state.clone(),
@@ -2000,6 +2053,7 @@ where
                 request.argv,
                 request.env,
                 request.authority,
+                request.ipc_grants,
                 request.filesystem,
                 request.descriptors,
                 request.signal_state,
@@ -4228,10 +4282,19 @@ mod tests {
         parent.grant_device_classes(
             crate::DeviceClassRights::DISPLAY | crate::DeviceClassRights::AUDIO,
         );
-        parent.grant_diagnostic_rights(crate::DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        let registry = crate::InstanceRegistry::new();
+        let parent_inst = registry.register("parent", 0);
+        let child_inst = registry.register_child(Some(parent_inst.id()), "child", 1);
+        let root_id = parent_inst.id();
+        parent.grant_inspect_read(crate::AuthorityScope::Subtree(root_id));
+        parent.grant_trace_read(crate::AuthorityScope::Own);
+        parent.grant_profile_read(crate::AuthorityScope::Machine);
+        parent.grant_diagnostic_rights(crate::DiagnosticAuthorityRights::CONTROL);
+        parent.grant_instance_control(crate::AuthorityScope::Subtree(root_id));
         parent.grant_settings_rights(crate::SettingsAuthorityRights::WRITE);
         parent.grant_machine_rights(
-            crate::MachineAuthorityRights::CONTROL_PROCESSORS
+            crate::MachineAuthorityRights::CONTROL
+                | crate::MachineAuthorityRights::IDENTITY
                 | crate::MachineAuthorityRights::VIRTUALIZE,
         );
 
@@ -4257,8 +4320,21 @@ mod tests {
             crate::DeviceClassRights::DISPLAY | crate::DeviceClassRights::AUDIO
         );
         assert_eq!(
+            child.inspect_read_scope(),
+            Some(crate::AuthorityScope::Subtree(root_id))
+        );
+        assert_eq!(child.trace_read_scope(), None);
+        assert_eq!(
+            child.profile_read_scope(),
+            Some(crate::AuthorityScope::Machine)
+        );
+        assert_eq!(
             child.diagnostic_rights(),
-            crate::DiagnosticAuthorityRights::OBSERVE_MACHINE
+            crate::DiagnosticAuthorityRights::CONTROL
+        );
+        assert_eq!(
+            child.instance_control_scope(),
+            Some(crate::AuthorityScope::Subtree(root_id))
         );
         assert_eq!(
             child.settings_rights(),
@@ -4266,10 +4342,16 @@ mod tests {
         );
         assert_eq!(
             child.machine_rights(),
-            crate::MachineAuthorityRights::CONTROL_PROCESSORS
+            crate::MachineAuthorityRights::CONTROL
+                | crate::MachineAuthorityRights::IDENTITY
                 | crate::MachineAuthorityRights::VIRTUALIZE
         );
-        assert!(parent.contains_authority(&child));
+        assert!(parent.contains_child_authority(
+            parent_inst.id(),
+            child_inst.id(),
+            &child,
+            &registry,
+        ));
     }
 
     #[test]

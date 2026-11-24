@@ -53,6 +53,15 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// the root DRBG rekeys against and the reactions to a restore wait
     /// on. Installed before the root entropy.
     machine_generation: Once<MachineGenerationHandle>,
+    /// This boot's Ed25519 machine identity key, settled alongside the
+    /// compiler-signing key from the measured-boot or ephemeral seed.
+    machine_identity: Once<crate::MachineIdentityKey>,
+    /// Nonzero token of the active `snapshot-hold` keeping the 9p share quiet
+    /// for a VM snapshot, or `0` when no hold is in force.
+    snapshot_hold_token: AtomicU64,
+    /// Monotonic token generator for `snapshot_hold_token` (starts at `1`;
+    /// skips `0` on wrap).
+    next_snapshot_hold_token: AtomicU64,
     /// Nanoseconds between the monotonic clock and wall time, as the
     /// platform's real-time clock last set them: at bring-up, and again
     /// after each machine restore. Unseeded on a machine that carries no
@@ -364,6 +373,9 @@ where
                 network_service_ready: Notify::new(),
                 root_entropy: Once::new(),
                 machine_generation: Once::new(),
+                machine_identity: Once::new(),
+                snapshot_hold_token: AtomicU64::new(0),
+                next_snapshot_hold_token: AtomicU64::new(1),
                 wall_clock: crate::exec::WallClock::new(),
                 http_client: PerProcessorProvider::new(),
                 host_fs_service: Mutex::new(None),
@@ -1027,6 +1039,61 @@ where
         })
     }
 
+    /// Publishes this boot's Ed25519 machine identity key once bring-up
+    /// settles the signing seed.
+    pub fn install_machine_identity_key(&self, key: crate::MachineIdentityKey) {
+        let mut installed = false;
+        self.inner.machine_identity.call_once(|| {
+            installed = true;
+            key
+        });
+        assert!(
+            installed,
+            "the machine identity key was installed more than once"
+        );
+    }
+
+    /// This boot's Ed25519 machine identity key, once installed.
+    pub fn machine_identity_key(&self) -> Option<&crate::MachineIdentityKey> {
+        self.inner.machine_identity.get()
+    }
+
+    /// Acquires the exclusive snapshot hold and quiets the 9p host share
+    /// (when attached). Dropping the returned [`SnapshotHold`] reopens
+    /// the share and clears the hold, including if this future is
+    /// cancelled mid-drain.
+    pub async fn prepare_snapshot_hold(
+        &self,
+    ) -> Result<SnapshotHold<ProgramService, NetworkService, StorageImpl>, SnapshotHoldBusy> {
+        let mut token = self
+            .inner
+            .next_snapshot_hold_token
+            .fetch_add(1, Ordering::Relaxed);
+        if token == 0 {
+            token = self
+                .inner
+                .next_snapshot_hold_token
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if self
+            .inner
+            .snapshot_hold_token
+            .compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(SnapshotHoldBusy);
+        }
+        let hold = SnapshotHold {
+            state: self.clone(),
+            token,
+            active: true,
+        };
+        if let Some(host_fs) = self.host_fs_service() {
+            host_fs.prepare_snapshot().await;
+        }
+        Ok(hold)
+    }
+
     /// Publishes the root DRBG the backend seeded at boot.
     pub fn install_root_entropy(&self, root: RootEntropyHandle) {
         let mut installed = false;
@@ -1361,6 +1428,10 @@ where
         crate::retire_queued_handles(retired, &service);
     }
 
+    fn release_snapshot_hold(&self, token: u64) {
+        self.finish_snapshot_hold(token);
+    }
+
     fn uptime_nanos(&self, current_ticks: u64) -> u64 {
         RuntimeState::uptime_nanos(self, current_ticks)
     }
@@ -1430,6 +1501,92 @@ where
         sample: PerfSample,
     ) {
         RuntimeState::record_perf_metric_parts(self, scope, prefix, suffix, sample);
+    }
+}
+
+impl<ProgramService, NetworkService, StorageImpl: Storage>
+    RuntimeState<ProgramService, NetworkService, StorageImpl>
+{
+    /// Releases the snapshot hold identified by `token` and reopens the 9p
+    /// host share. Stale tokens (such as a pre-restore hold dropped after a
+    /// VM restore cleared the gate) are ignored so they can never cancel a
+    /// newer hold.
+    pub fn finish_snapshot_hold(&self, token: u64) {
+        if token == 0 {
+            return;
+        }
+        if self
+            .inner
+            .snapshot_hold_token
+            .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let host_fs = self.inner.host_fs_service.lock().clone();
+            if let Some(host_fs) = host_fs {
+                host_fs.snapshot_finished();
+            }
+        }
+    }
+
+    /// Clears any pre-snapshot hold token after a VM restore advances the
+    /// machine generation (`reset_host_share` has already re-attached the
+    /// host share). Any surviving pre-restore hold carries an older token
+    /// and becomes a no-op on drop.
+    pub fn clear_snapshot_hold_on_restore(&self) {
+        self.inner.snapshot_hold_token.store(0, Ordering::Release);
+    }
+
+    pub fn snapshot_hold_active(&self) -> bool {
+        self.inner.snapshot_hold_token.load(Ordering::Acquire) != 0
+    }
+}
+
+/// Another caller already holds an active [`SnapshotHold`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("a machine snapshot hold is already active")]
+pub struct SnapshotHoldBusy;
+
+/// Exclusive RAII hold over the machine's 9p snapshot gate.
+#[must_use = "dropping a SnapshotHold reopens the host-share gate"]
+pub struct SnapshotHold<ProgramService, NetworkService, StorageImpl: Storage> {
+    state: RuntimeState<ProgramService, NetworkService, StorageImpl>,
+    token: u64,
+    active: bool,
+}
+
+impl<ProgramService, NetworkService, StorageImpl>
+    SnapshotHold<ProgramService, NetworkService, StorageImpl>
+where
+    ProgramService: Clone,
+    NetworkService: Clone,
+    StorageImpl: Storage,
+{
+    /// Monotonic hold token identifying this specific lease.
+    pub const fn token(&self) -> u64 {
+        self.token
+    }
+
+    /// Whether this boot exposes a VM generation ID window so a snapshot
+    /// restore can tell itself apart from the continuing machine.
+    pub fn has_generation_id(&self) -> bool {
+        self.state.machine_generation().has_window()
+    }
+
+    /// Transfers cleanup responsibility to an external retirement channel
+    /// (such as a component store's resource retirement queue) without
+    /// releasing the hold now.
+    pub(crate) fn disarm(mut self) {
+        self.active = false;
+    }
+}
+
+impl<ProgramService, NetworkService, StorageImpl: Storage> Drop
+    for SnapshotHold<ProgramService, NetworkService, StorageImpl>
+{
+    fn drop(&mut self) {
+        if self.active {
+            self.state.finish_snapshot_hold(self.token);
+        }
     }
 }
 

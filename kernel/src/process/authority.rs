@@ -8,7 +8,7 @@ use bitflags::bitflags;
 use thiserror::Error;
 
 use crate::device::{DeviceName, MAX_GRANTS};
-use crate::{ComponentFsPathError, resolve_absolute_path};
+use crate::{ComponentFsPathError, InstanceId, InstanceRegistry, resolve_absolute_path};
 
 bitflags! {
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -114,15 +114,16 @@ bitflags! {
 }
 
 bitflags! {
-    /// What an instance may do to the machine's diagnostics, beyond
-    /// reading its own.
+    /// Mutation rights over the machine's diagnostic and profiling gates.
     ///
-    /// `OBSERVE_MACHINE` covers the tracing and profiling controls and
-    /// reading any instance's records. Every observer in the tree uses
-    /// both, so one right covers them.
+    /// Scoped read capabilities (`InspectReadCap`, `TraceReadCap`,
+    /// `ProfileReadCap`) carry an [`AuthorityScope`] on
+    /// [`ProcessAuthority`] rather than a machine-wide flag; `CONTROL`
+    /// covers mutating global diagnostic targets, profiler enable/clear,
+    /// and instruction-sampling sessions.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct DiagnosticAuthorityRights: u8 {
-        const OBSERVE_MACHINE = 1 << 0;
+        const CONTROL = 1 << 0;
     }
 }
 
@@ -144,11 +145,54 @@ bitflags! {
     /// what runs on it.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct MachineAuthorityRights: u8 {
-        /// Take processors offline and bring them online.
-        const CONTROL_PROCESSORS = 1 << 0;
+        /// Take processors offline/online and hold machine snapshot gates.
+        const CONTROL = 1 << 0;
+        /// Read the machine identity public key and sign domain-separated
+        /// challenges with the machine identity private key.
+        const IDENTITY = 1 << 1;
         /// Create hardware virtual machines.
-        const VIRTUALIZE = 1 << 1;
+        const VIRTUALIZE = 1 << 2;
     }
+}
+
+/// Scope of an observation or instance-control capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthorityScope {
+    /// Only the holding instance itself.
+    Own,
+    /// The subtree rooted at the named instance (`root` and every
+    /// descendant whose immutable ancestor chain contains `root`).
+    Subtree(InstanceId),
+    /// Every instance on the machine, plus kernel-origin records.
+    Machine,
+}
+
+impl AuthorityScope {
+    /// Whether `target` lies within this scope when held by `holder`.
+    pub fn admits_instance(
+        self,
+        holder: InstanceId,
+        target: InstanceId,
+        registry: &InstanceRegistry,
+    ) -> bool {
+        match self {
+            Self::Own => target == holder,
+            Self::Subtree(root) => registry.is_in_subtree(root, target),
+            Self::Machine => true,
+        }
+    }
+}
+
+/// Scope requested for a spawned child's capability grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestedAuthorityScope {
+    /// Only the child instance itself.
+    Own,
+    /// Subtree rooted at the named instance, or at the newly spawned
+    /// child itself when `None`.
+    Subtree(Option<InstanceId>),
+    /// Every instance on the machine, plus kernel-origin records.
+    Machine,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,14 +274,46 @@ impl DeviceGrantClaimCap {
     }
 }
 
-/// Proof, checked on the owning task, that the instance may control the
-/// machine's tracing and profiling and read every instance's records.
+/// Proof that the instance may read `helios:system/stats` and scoped
+/// `helios:system/instances` snapshots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ObserveMachineCap(DiagnosticAuthorityRights);
+pub struct InspectReadCap(AuthorityScope);
 
-impl ObserveMachineCap {
+impl InspectReadCap {
+    pub const fn scope(self) -> AuthorityScope {
+        self.0
+    }
+}
+
+/// Proof that the instance may read trace events within [`Self::scope`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TraceReadCap(AuthorityScope);
+
+impl TraceReadCap {
+    pub const fn scope(self) -> AuthorityScope {
+        self.0
+    }
+}
+
+/// Proof that the instance may read profile and perf samples within
+/// [`Self::scope`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProfileReadCap(AuthorityScope);
+
+impl ProfileReadCap {
+    pub const fn scope(self) -> AuthorityScope {
+        self.0
+    }
+}
+
+/// Proof that the instance may mutate global diagnostic targets, toggle or
+/// clear the profiler, and start instruction-sampling sessions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiagnosticsControlCap(DiagnosticAuthorityRights);
+
+impl DiagnosticsControlCap {
     pub const fn required_rights() -> DiagnosticAuthorityRights {
-        DiagnosticAuthorityRights::OBSERVE_MACHINE
+        DiagnosticAuthorityRights::CONTROL
     }
 
     pub const fn rights(self) -> DiagnosticAuthorityRights {
@@ -260,14 +336,39 @@ impl WriteSettingsCap {
     }
 }
 
-/// Proof, checked on the owning task, that the instance may take
-/// processors offline and bring them online.
+/// Proof that the instance may kill instances within [`Self::scope`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ControlProcessorsCap(MachineAuthorityRights);
+pub struct InstanceControlCap(AuthorityScope);
 
-impl ControlProcessorsCap {
+impl InstanceControlCap {
+    pub const fn scope(self) -> AuthorityScope {
+        self.0
+    }
+}
+
+/// Proof that the instance may control processors and hold machine
+/// snapshot gates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MachineControlCap(MachineAuthorityRights);
+
+impl MachineControlCap {
     pub const fn required_rights() -> MachineAuthorityRights {
-        MachineAuthorityRights::CONTROL_PROCESSORS
+        MachineAuthorityRights::CONTROL
+    }
+
+    pub const fn rights(self) -> MachineAuthorityRights {
+        self.0
+    }
+}
+
+/// Proof that the instance may read the machine identity public key and
+/// sign domain-separated challenges with the machine identity key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MachineIdentityCap(MachineAuthorityRights);
+
+impl MachineIdentityCap {
+    pub const fn required_rights() -> MachineAuthorityRights {
+        MachineAuthorityRights::IDENTITY
     }
 
     pub const fn rights(self) -> MachineAuthorityRights {
@@ -554,7 +655,11 @@ pub struct ProcessAuthority {
     /// Raw devices this instance may claim by name. Bounded by the
     /// registry's own capacity, because the registry cannot publish more.
     devices: ArrayVec<DeviceName, MAX_GRANTS>,
+    inspect_read: Option<AuthorityScope>,
+    trace_read: Option<AuthorityScope>,
+    profile_read: Option<AuthorityScope>,
     diagnostics: DiagnosticAuthorityRights,
+    instance_control: Option<AuthorityScope>,
     settings: SettingsAuthorityRights,
     machine: MachineAuthorityRights,
 }
@@ -607,6 +712,34 @@ pub enum ProcessAuthorityError {
     EmptyDiagnosticRights,
     #[error("diagnostic grant exceeds caller authority: {0:?}")]
     DiagnosticGrantExceedsAuthority(DiagnosticAuthorityRights),
+    #[error("inspect-read capability is not held")]
+    InspectReadMissing,
+    #[error("inspect-read grant {requested:?} exceeds caller scope {held:?}")]
+    InspectReadExceedsAuthority {
+        held: Option<AuthorityScope>,
+        requested: AuthorityScope,
+    },
+    #[error("trace-read capability is not held")]
+    TraceReadMissing,
+    #[error("trace-read grant {requested:?} exceeds caller scope {held:?}")]
+    TraceReadExceedsAuthority {
+        held: Option<AuthorityScope>,
+        requested: AuthorityScope,
+    },
+    #[error("profile-read capability is not held")]
+    ProfileReadMissing,
+    #[error("profile-read grant {requested:?} exceeds caller scope {held:?}")]
+    ProfileReadExceedsAuthority {
+        held: Option<AuthorityScope>,
+        requested: AuthorityScope,
+    },
+    #[error("instance-control capability is not held")]
+    InstanceControlMissing,
+    #[error("instance-control grant {requested:?} exceeds caller scope {held:?}")]
+    InstanceControlExceedsAuthority {
+        held: Option<AuthorityScope>,
+        requested: AuthorityScope,
+    },
     #[error("settings grant rights must not be empty")]
     EmptySettingsRights,
     #[error("settings grant exceeds caller authority: {0:?}")]
@@ -757,10 +890,34 @@ impl ProcessAuthority {
             mount: MountAuthorityRights::empty(),
             device_classes: DeviceClassRights::empty(),
             devices: ArrayVec::new_const(),
+            inspect_read: None,
+            trace_read: None,
+            profile_read: None,
             diagnostics: DiagnosticAuthorityRights::empty(),
+            instance_control: None,
             settings: SettingsAuthorityRights::empty(),
             machine: MachineAuthorityRights::empty(),
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.directory_preopens.is_empty()
+            && self.cwd.is_none()
+            && self.network.is_empty()
+            && self.clock.is_empty()
+            && self.terminal.is_empty()
+            && self.process.is_empty()
+            && self.link.is_empty()
+            && self.mount.is_empty()
+            && self.device_classes.is_empty()
+            && self.devices.is_empty()
+            && self.inspect_read.is_none()
+            && self.trace_read.is_none()
+            && self.profile_read.is_none()
+            && self.diagnostics.is_empty()
+            && self.instance_control.is_none()
+            && self.settings.is_empty()
+            && self.machine.is_empty()
     }
 
     /// Every right except the device, diagnostic, settings and machine ones.
@@ -818,7 +975,12 @@ impl ProcessAuthority {
     }
 
     pub fn fork_inherited(&self) -> Self {
-        self.clone()
+        let mut child = self.clone();
+        child.inspect_read = strip_own_scope(child.inspect_read);
+        child.trace_read = strip_own_scope(child.trace_read);
+        child.profile_read = strip_own_scope(child.profile_read);
+        child.instance_control = strip_own_scope(child.instance_control);
+        child
     }
 
     pub fn exec_preserved(&self) -> Self {
@@ -879,6 +1041,38 @@ impl ProcessAuthority {
 
     pub fn grant_diagnostic_rights(&mut self, rights: DiagnosticAuthorityRights) {
         self.diagnostics |= rights;
+    }
+
+    pub fn inspect_read_scope(&self) -> Option<AuthorityScope> {
+        self.inspect_read
+    }
+
+    pub fn grant_inspect_read(&mut self, scope: AuthorityScope) {
+        self.inspect_read = Some(scope);
+    }
+
+    pub fn trace_read_scope(&self) -> Option<AuthorityScope> {
+        self.trace_read
+    }
+
+    pub fn grant_trace_read(&mut self, scope: AuthorityScope) {
+        self.trace_read = Some(scope);
+    }
+
+    pub fn profile_read_scope(&self) -> Option<AuthorityScope> {
+        self.profile_read
+    }
+
+    pub fn grant_profile_read(&mut self, scope: AuthorityScope) {
+        self.profile_read = Some(scope);
+    }
+
+    pub fn instance_control_scope(&self) -> Option<AuthorityScope> {
+        self.instance_control
+    }
+
+    pub fn grant_instance_control(&mut self, scope: AuthorityScope) {
+        self.instance_control = Some(scope);
     }
 
     pub fn settings_rights(&self) -> SettingsAuthorityRights {
@@ -1162,9 +1356,119 @@ impl ProcessAuthority {
         Ok(rights)
     }
 
-    pub fn derive_observe_machine_cap(&self) -> Result<ObserveMachineCap, ProcessAuthorityError> {
-        self.derive_diagnostic_rights(ObserveMachineCap::required_rights())
-            .map(ObserveMachineCap)
+    pub fn derive_diagnostics_control_cap(
+        &self,
+    ) -> Result<DiagnosticsControlCap, ProcessAuthorityError> {
+        self.derive_diagnostic_rights(DiagnosticsControlCap::required_rights())
+            .map(DiagnosticsControlCap)
+    }
+
+    pub fn derive_inspect_read_cap(&self) -> Result<InspectReadCap, ProcessAuthorityError> {
+        self.inspect_read
+            .map(InspectReadCap)
+            .ok_or(ProcessAuthorityError::InspectReadMissing)
+    }
+
+    pub fn derive_trace_read_cap(&self) -> Result<TraceReadCap, ProcessAuthorityError> {
+        self.trace_read
+            .map(TraceReadCap)
+            .ok_or(ProcessAuthorityError::TraceReadMissing)
+    }
+
+    pub fn derive_profile_read_cap(&self) -> Result<ProfileReadCap, ProcessAuthorityError> {
+        self.profile_read
+            .map(ProfileReadCap)
+            .ok_or(ProcessAuthorityError::ProfileReadMissing)
+    }
+
+    pub fn derive_instance_control_cap(&self) -> Result<InstanceControlCap, ProcessAuthorityError> {
+        self.instance_control
+            .map(InstanceControlCap)
+            .ok_or(ProcessAuthorityError::InstanceControlMissing)
+    }
+
+    pub fn derive_inspect_read_for_child(
+        &self,
+        caller_id: InstanceId,
+        child_id: InstanceId,
+        requested: RequestedAuthorityScope,
+        registry: &InstanceRegistry,
+    ) -> Result<InspectReadCap, ProcessAuthorityError> {
+        attenuate_scope_for_child(
+            self.inspect_read,
+            caller_id,
+            child_id,
+            requested,
+            registry,
+            |held, resolved| ProcessAuthorityError::InspectReadExceedsAuthority {
+                held,
+                requested: resolved,
+            },
+        )
+        .map(InspectReadCap)
+    }
+
+    pub fn derive_trace_read_for_child(
+        &self,
+        caller_id: InstanceId,
+        child_id: InstanceId,
+        requested: RequestedAuthorityScope,
+        registry: &InstanceRegistry,
+    ) -> Result<TraceReadCap, ProcessAuthorityError> {
+        attenuate_scope_for_child(
+            self.trace_read,
+            caller_id,
+            child_id,
+            requested,
+            registry,
+            |held, resolved| ProcessAuthorityError::TraceReadExceedsAuthority {
+                held,
+                requested: resolved,
+            },
+        )
+        .map(TraceReadCap)
+    }
+
+    pub fn derive_profile_read_for_child(
+        &self,
+        caller_id: InstanceId,
+        child_id: InstanceId,
+        requested: RequestedAuthorityScope,
+        registry: &InstanceRegistry,
+    ) -> Result<ProfileReadCap, ProcessAuthorityError> {
+        attenuate_scope_for_child(
+            self.profile_read,
+            caller_id,
+            child_id,
+            requested,
+            registry,
+            |held, resolved| ProcessAuthorityError::ProfileReadExceedsAuthority {
+                held,
+                requested: resolved,
+            },
+        )
+        .map(ProfileReadCap)
+    }
+
+    pub fn derive_instance_control_for_child(
+        &self,
+        caller_id: InstanceId,
+        child_id: InstanceId,
+        requested: RequestedAuthorityScope,
+        registry: &InstanceRegistry,
+    ) -> Result<InstanceControlCap, ProcessAuthorityError> {
+        attenuate_scope_for_child(
+            self.instance_control,
+            caller_id,
+            child_id,
+            requested,
+            registry,
+            |held, resolved| ProcessAuthorityError::InstanceControlExceedsAuthority {
+                held,
+                requested: resolved,
+            },
+        )
+        .map(InstanceControlCap)
     }
 
     pub fn derive_settings_rights(
@@ -1198,11 +1502,14 @@ impl ProcessAuthority {
         Ok(rights)
     }
 
-    pub fn derive_control_processors_cap(
-        &self,
-    ) -> Result<ControlProcessorsCap, ProcessAuthorityError> {
-        self.derive_machine_rights(ControlProcessorsCap::required_rights())
-            .map(ControlProcessorsCap)
+    pub fn derive_machine_control_cap(&self) -> Result<MachineControlCap, ProcessAuthorityError> {
+        self.derive_machine_rights(MachineControlCap::required_rights())
+            .map(MachineControlCap)
+    }
+
+    pub fn derive_machine_identity_cap(&self) -> Result<MachineIdentityCap, ProcessAuthorityError> {
+        self.derive_machine_rights(MachineIdentityCap::required_rights())
+            .map(MachineIdentityCap)
     }
 
     pub fn derive_virtualize_cap(&self) -> Result<VirtualizeCap, ProcessAuthorityError> {
@@ -1511,7 +1818,72 @@ impl ProcessAuthority {
             && self.link.contains(child.link)
             && self.mount.contains(child.mount)
             && self.device_classes.contains(child.device_classes)
+            && scope_contains_without_registry(self.inspect_read, child.inspect_read)
+            && scope_contains_without_registry(self.trace_read, child.trace_read)
+            && scope_contains_without_registry(self.profile_read, child.profile_read)
             && self.diagnostics.contains(child.diagnostics)
+            && scope_contains_without_registry(self.instance_control, child.instance_control)
+            && self.settings.contains(child.settings)
+            && self.machine.contains(child.machine)
+            && child
+                .devices
+                .iter()
+                .all(|device| self.devices.contains(device))
+    }
+
+    /// Subset check across an explicit `(parent_id, child_id)` boundary
+    /// resolved against `registry`'s immutable ancestor chains.
+    pub fn contains_child_authority(
+        &self,
+        parent_id: InstanceId,
+        child_id: InstanceId,
+        child: &Self,
+        registry: &InstanceRegistry,
+    ) -> bool {
+        child
+            .directory_preopens
+            .iter()
+            .all(|preopen| self.has_directory_authority(preopen.source_path(), preopen.rights()))
+            && child
+                .cwd
+                .as_ref()
+                .is_none_or(|cwd| self.has_directory_authority(cwd.source_path(), cwd.rights()))
+            && self.network.contains(child.network)
+            && self.clock.contains(child.clock)
+            && self.terminal.contains(child.terminal)
+            && self.process.contains(child.process)
+            && self.link.contains(child.link)
+            && self.mount.contains(child.mount)
+            && self.device_classes.contains(child.device_classes)
+            && scope_contains_for_child(
+                self.inspect_read,
+                parent_id,
+                child_id,
+                child.inspect_read,
+                registry,
+            )
+            && scope_contains_for_child(
+                self.trace_read,
+                parent_id,
+                child_id,
+                child.trace_read,
+                registry,
+            )
+            && scope_contains_for_child(
+                self.profile_read,
+                parent_id,
+                child_id,
+                child.profile_read,
+                registry,
+            )
+            && self.diagnostics.contains(child.diagnostics)
+            && scope_contains_for_child(
+                self.instance_control,
+                parent_id,
+                child_id,
+                child.instance_control,
+                registry,
+            )
             && self.settings.contains(child.settings)
             && self.machine.contains(child.machine)
             && child
@@ -1577,6 +1949,84 @@ pub(crate) mod test_caps {
         authority
             .derive_device_grant_cap(name)
             .expect("the authority names the device")
+    }
+}
+
+const fn strip_own_scope(scope: Option<AuthorityScope>) -> Option<AuthorityScope> {
+    match scope {
+        Some(AuthorityScope::Own) | None => None,
+        Some(other) => Some(other),
+    }
+}
+
+fn scope_contains_without_registry(
+    parent: Option<AuthorityScope>,
+    child: Option<AuthorityScope>,
+) -> bool {
+    match (parent, child) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(AuthorityScope::Machine), Some(_)) => true,
+        (Some(AuthorityScope::Subtree(parent_root)), Some(AuthorityScope::Subtree(child_root))) => {
+            parent_root == child_root
+        }
+        (Some(AuthorityScope::Own), Some(AuthorityScope::Own)) => true,
+        _ => false,
+    }
+}
+
+fn scope_contains_for_child(
+    parent: Option<AuthorityScope>,
+    parent_id: InstanceId,
+    child_id: InstanceId,
+    child: Option<AuthorityScope>,
+    registry: &InstanceRegistry,
+) -> bool {
+    let Some(child_scope) = child else {
+        return true;
+    };
+    let requested = match child_scope {
+        AuthorityScope::Own => RequestedAuthorityScope::Own,
+        AuthorityScope::Subtree(root) => RequestedAuthorityScope::Subtree(Some(root)),
+        AuthorityScope::Machine => RequestedAuthorityScope::Machine,
+    };
+    attenuate_scope_for_child(parent, parent_id, child_id, requested, registry, |_, _| ()).is_ok()
+}
+
+fn attenuate_scope_for_child<Error>(
+    held: Option<AuthorityScope>,
+    caller_id: InstanceId,
+    child_id: InstanceId,
+    requested: RequestedAuthorityScope,
+    registry: &InstanceRegistry,
+    make_error: impl FnOnce(Option<AuthorityScope>, AuthorityScope) -> Error,
+) -> Result<AuthorityScope, Error> {
+    let resolved = match requested {
+        RequestedAuthorityScope::Own => AuthorityScope::Own,
+        RequestedAuthorityScope::Subtree(Some(root)) => AuthorityScope::Subtree(root),
+        RequestedAuthorityScope::Subtree(None) => AuthorityScope::Subtree(child_id),
+        RequestedAuthorityScope::Machine => AuthorityScope::Machine,
+    };
+    let Some(held_scope) = held else {
+        return Err(make_error(None, resolved));
+    };
+    let admitted = match (held_scope, resolved) {
+        (AuthorityScope::Machine, AuthorityScope::Machine | AuthorityScope::Own) => true,
+        (AuthorityScope::Machine, AuthorityScope::Subtree(root)) => registry.is_known(root),
+        (AuthorityScope::Subtree(_), AuthorityScope::Machine) => false,
+        (AuthorityScope::Subtree(parent_root), AuthorityScope::Subtree(child_root)) => {
+            registry.is_in_subtree(parent_root, child_root)
+        }
+        (AuthorityScope::Subtree(parent_root), AuthorityScope::Own) => {
+            registry.is_in_subtree(parent_root, child_id)
+        }
+        (AuthorityScope::Own, AuthorityScope::Own) => child_id == caller_id,
+        (AuthorityScope::Own, AuthorityScope::Subtree(_) | AuthorityScope::Machine) => false,
+    };
+    if admitted {
+        Ok(resolved)
+    } else {
+        Err(make_error(Some(held_scope), resolved))
     }
 }
 
@@ -1992,7 +2442,8 @@ mod tests {
         child.grant_process_rights(ProcessAuthorityRights::SPAWN);
         child.grant_link_rights(LinkAuthorityRights::SOURCE);
         child.grant_device_classes(DeviceClassRights::DISPLAY);
-        child.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        child.grant_inspect_read(super::AuthorityScope::Machine);
+        child.grant_diagnostic_rights(DiagnosticAuthorityRights::CONTROL);
         child.grant_settings_rights(SettingsAuthorityRights::WRITE);
         child
             .grant_device(device_name("pci:0000:00:04.0"))
@@ -2000,7 +2451,8 @@ mod tests {
 
         let mut parent = parent;
         parent.grant_device_classes(DeviceClassRights::all());
-        parent.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        parent.grant_inspect_read(super::AuthorityScope::Machine);
+        parent.grant_diagnostic_rights(DiagnosticAuthorityRights::CONTROL);
         parent.grant_settings_rights(SettingsAuthorityRights::WRITE);
         parent
             .grant_device(device_name("pci:0000:00:04.0"))
@@ -2035,7 +2487,8 @@ mod tests {
 
         let mut settings_less_parent = ProcessAuthority::root();
         settings_less_parent.grant_device_classes(DeviceClassRights::all());
-        settings_less_parent.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        settings_less_parent.grant_inspect_read(super::AuthorityScope::Machine);
+        settings_less_parent.grant_diagnostic_rights(DiagnosticAuthorityRights::CONTROL);
         settings_less_parent
             .grant_device(device_name("pci:0000:00:04.0"))
             .expect("one named device fits");
@@ -2073,10 +2526,11 @@ mod tests {
             Err(ProcessAuthorityError::SettingsGrantExceedsAuthority(_))
         ));
 
-        // The observe right is a separate power: holding it grants no
-        // write.
+        // Observation and diagnostic control are separate powers: holding them
+        // grants no settings write.
         let mut observer = ProcessAuthority::empty();
-        observer.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        observer.grant_inspect_read(super::AuthorityScope::Machine);
+        observer.grant_diagnostic_rights(DiagnosticAuthorityRights::CONTROL);
         assert!(observer.derive_write_settings_cap().is_err());
     }
 
@@ -2090,13 +2544,13 @@ mod tests {
     #[test]
     fn diagnostic_grant_must_be_subset_of_caller_authority() {
         let mut parent = ProcessAuthority::empty();
-        parent.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+        parent.grant_diagnostic_rights(DiagnosticAuthorityRights::CONTROL);
 
         assert_eq!(
             parent
-                .derive_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE)
+                .derive_diagnostic_rights(DiagnosticAuthorityRights::CONTROL)
                 .expect("caller may derive a right it holds"),
-            DiagnosticAuthorityRights::OBSERVE_MACHINE
+            DiagnosticAuthorityRights::CONTROL
         );
         assert_eq!(
             parent
@@ -2104,35 +2558,40 @@ mod tests {
                 .expect_err("an empty diagnostic grant is a mistake"),
             ProcessAuthorityError::EmptyDiagnosticRights
         );
-        assert!(parent.derive_observe_machine_cap().is_ok());
+        assert!(parent.derive_diagnostics_control_cap().is_ok());
 
         let holder_less = ProcessAuthority::empty();
         assert_eq!(
             holder_less
-                .derive_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE)
+                .derive_diagnostic_rights(DiagnosticAuthorityRights::CONTROL)
                 .expect_err("a caller without the right must not hand it on"),
             ProcessAuthorityError::DiagnosticGrantExceedsAuthority(
-                DiagnosticAuthorityRights::OBSERVE_MACHINE
+                DiagnosticAuthorityRights::CONTROL
             )
         );
         assert!(matches!(
-            holder_less.derive_observe_machine_cap(),
+            holder_less.derive_diagnostics_control_cap(),
             Err(ProcessAuthorityError::DiagnosticGrantExceedsAuthority(_))
         ));
     }
 
     #[test]
-    fn root_authority_holds_no_diagnostic_rights() {
+    fn root_authority_holds_no_diagnostic_or_instance_control_rights() {
         let root = ProcessAuthority::root();
         assert_eq!(root.diagnostic_rights(), DiagnosticAuthorityRights::empty());
-        assert!(root.derive_observe_machine_cap().is_err());
+        assert!(root.derive_diagnostics_control_cap().is_err());
+        assert!(root.derive_inspect_read_cap().is_err());
+        assert!(root.derive_trace_read_cap().is_err());
+        assert!(root.derive_profile_read_cap().is_err());
+        assert!(root.derive_instance_control_cap().is_err());
     }
 
     #[test]
     fn machine_grant_must_be_subset_of_caller_authority() {
         let mut parent = ProcessAuthority::root();
-        parent.grant_machine_rights(MachineAuthorityRights::CONTROL_PROCESSORS);
-        assert!(parent.derive_control_processors_cap().is_ok());
+        parent.grant_machine_rights(MachineAuthorityRights::CONTROL);
+        assert!(parent.derive_machine_control_cap().is_ok());
+        assert!(parent.derive_machine_identity_cap().is_err());
         assert_eq!(
             parent
                 .derive_virtualize_cap()
@@ -2146,14 +2605,22 @@ mod tests {
             ProcessAuthorityError::EmptyMachineRights
         );
 
+        let mut identity_only = ProcessAuthority::empty();
+        identity_only.grant_machine_rights(MachineAuthorityRights::IDENTITY);
+        assert!(identity_only.derive_machine_identity_cap().is_ok());
+        assert!(identity_only.derive_machine_control_cap().is_err());
+
         let root = ProcessAuthority::root();
         assert_eq!(root.machine_rights(), MachineAuthorityRights::empty());
         assert_eq!(
-            root.derive_control_processors_cap()
-                .expect_err("root authority does not control processors"),
-            ProcessAuthorityError::MachineGrantExceedsAuthority(
-                MachineAuthorityRights::CONTROL_PROCESSORS
-            )
+            root.derive_machine_control_cap()
+                .expect_err("root authority does not control machine"),
+            ProcessAuthorityError::MachineGrantExceedsAuthority(MachineAuthorityRights::CONTROL)
+        );
+        assert_eq!(
+            root.derive_machine_identity_cap()
+                .expect_err("root authority does not hold machine identity"),
+            ProcessAuthorityError::MachineGrantExceedsAuthority(MachineAuthorityRights::IDENTITY)
         );
         assert_eq!(
             root.derive_virtualize_cap()
@@ -2162,7 +2629,7 @@ mod tests {
         );
 
         let mut child = ProcessAuthority::root();
-        child.grant_machine_rights(MachineAuthorityRights::CONTROL_PROCESSORS);
+        child.grant_machine_rights(MachineAuthorityRights::CONTROL);
         assert!(parent.contains_authority(&child));
         assert!(!root.contains_authority(&child));
 
@@ -2171,11 +2638,9 @@ mod tests {
         assert!(hv_parent.derive_virtualize_cap().is_ok());
         assert_eq!(
             hv_parent
-                .derive_control_processors_cap()
-                .expect_err("virtualize right must not grant processor control"),
-            ProcessAuthorityError::MachineGrantExceedsAuthority(
-                MachineAuthorityRights::CONTROL_PROCESSORS
-            )
+                .derive_machine_control_cap()
+                .expect_err("virtualize right must not grant machine control"),
+            ProcessAuthorityError::MachineGrantExceedsAuthority(MachineAuthorityRights::CONTROL)
         );
 
         let mut hv_child = ProcessAuthority::root();
@@ -2183,6 +2648,207 @@ mod tests {
         assert!(hv_parent.contains_authority(&hv_child));
         assert!(!parent.contains_authority(&hv_child));
         assert!(!root.contains_authority(&hv_child));
+    }
+
+    #[test]
+    fn scoped_capabilities_are_orthogonal_and_attenuate_monotonically() {
+        use super::{AuthorityScope, RequestedAuthorityScope};
+        use crate::{InstanceId, InstanceRegistry};
+
+        let registry = InstanceRegistry::new();
+        let grand = registry.register("grand", 0);
+        let parent_inst = registry.register_child(Some(grand.id()), "parent", 1);
+        let child_inst = registry.register_child(Some(parent_inst.id()), "child", 2);
+        let sibling_inst = registry.register_child(Some(grand.id()), "sibling", 3);
+        let forged = InstanceId::from_raw(999_999);
+
+        // Orthogonality: granting one scoped right grants none of the others.
+        let mut inspect_only = ProcessAuthority::empty();
+        inspect_only.grant_inspect_read(AuthorityScope::Machine);
+        assert_eq!(
+            inspect_only.derive_inspect_read_cap().unwrap().scope(),
+            AuthorityScope::Machine
+        );
+        assert!(inspect_only.derive_trace_read_cap().is_err());
+        assert!(inspect_only.derive_profile_read_cap().is_err());
+        assert!(inspect_only.derive_instance_control_cap().is_err());
+        assert!(inspect_only.derive_diagnostics_control_cap().is_err());
+
+        // Machine -> Machine, Subtree(None => child), Subtree(Some(known)), Own.
+        assert_eq!(
+            inspect_only
+                .derive_inspect_read_for_child(
+                    grand.id(),
+                    parent_inst.id(),
+                    RequestedAuthorityScope::Machine,
+                    &registry,
+                )
+                .unwrap()
+                .scope(),
+            AuthorityScope::Machine
+        );
+        assert_eq!(
+            inspect_only
+                .derive_inspect_read_for_child(
+                    grand.id(),
+                    parent_inst.id(),
+                    RequestedAuthorityScope::Subtree(None),
+                    &registry,
+                )
+                .unwrap()
+                .scope(),
+            AuthorityScope::Subtree(parent_inst.id())
+        );
+        assert_eq!(
+            inspect_only
+                .derive_inspect_read_for_child(
+                    grand.id(),
+                    parent_inst.id(),
+                    RequestedAuthorityScope::Own,
+                    &registry,
+                )
+                .unwrap()
+                .scope(),
+            AuthorityScope::Own
+        );
+        // Machine still rejects a forged unallocated subtree root.
+        assert!(
+            inspect_only
+                .derive_inspect_read_for_child(
+                    grand.id(),
+                    parent_inst.id(),
+                    RequestedAuthorityScope::Subtree(Some(forged)),
+                    &registry,
+                )
+                .is_err()
+        );
+
+        // Subtree(parent_inst): admits Subtree(parent_inst), Subtree(None => child_inst),
+        // and Own on child_inst; refuses Machine, Subtree(grand), Subtree(sibling), and forged.
+        let mut subtree_holder = ProcessAuthority::empty();
+        subtree_holder.grant_trace_read(AuthorityScope::Subtree(parent_inst.id()));
+        subtree_holder.grant_profile_read(AuthorityScope::Subtree(parent_inst.id()));
+        subtree_holder.grant_instance_control(AuthorityScope::Subtree(parent_inst.id()));
+
+        assert_eq!(
+            subtree_holder
+                .derive_trace_read_for_child(
+                    parent_inst.id(),
+                    child_inst.id(),
+                    RequestedAuthorityScope::Subtree(None),
+                    &registry,
+                )
+                .unwrap()
+                .scope(),
+            AuthorityScope::Subtree(child_inst.id())
+        );
+        assert_eq!(
+            subtree_holder
+                .derive_profile_read_for_child(
+                    parent_inst.id(),
+                    child_inst.id(),
+                    RequestedAuthorityScope::Own,
+                    &registry,
+                )
+                .unwrap()
+                .scope(),
+            AuthorityScope::Own
+        );
+        assert!(
+            subtree_holder
+                .derive_instance_control_for_child(
+                    parent_inst.id(),
+                    child_inst.id(),
+                    RequestedAuthorityScope::Machine,
+                    &registry,
+                )
+                .is_err(),
+            "Subtree must never widen to Machine"
+        );
+        assert!(
+            subtree_holder
+                .derive_instance_control_for_child(
+                    parent_inst.id(),
+                    child_inst.id(),
+                    RequestedAuthorityScope::Subtree(Some(grand.id())),
+                    &registry,
+                )
+                .is_err(),
+            "Subtree must never climb to an ancestor root"
+        );
+        assert!(
+            subtree_holder
+                .derive_instance_control_for_child(
+                    parent_inst.id(),
+                    child_inst.id(),
+                    RequestedAuthorityScope::Subtree(Some(sibling_inst.id())),
+                    &registry,
+                )
+                .is_err(),
+            "Subtree must never cross into a sibling branch"
+        );
+
+        // Own on `parent_inst` covers `{parent_inst}` alone: a distinct child
+        // (`child_inst != parent_inst`) cannot be granted Own, Subtree, or Machine,
+        // while in-place exec (`child_id == caller_id`) preserves Own and still
+        // refuses Subtree(parent_inst).
+        let mut own_holder = ProcessAuthority::empty();
+        own_holder.grant_inspect_read(AuthorityScope::Own);
+        own_holder.grant_trace_read(AuthorityScope::Own);
+        assert!(
+            own_holder
+                .derive_inspect_read_for_child(
+                    parent_inst.id(),
+                    child_inst.id(),
+                    RequestedAuthorityScope::Own,
+                    &registry,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            own_holder
+                .derive_inspect_read_for_child(
+                    parent_inst.id(),
+                    parent_inst.id(),
+                    RequestedAuthorityScope::Own,
+                    &registry,
+                )
+                .unwrap()
+                .scope(),
+            AuthorityScope::Own
+        );
+        assert!(
+            own_holder
+                .derive_inspect_read_for_child(
+                    parent_inst.id(),
+                    parent_inst.id(),
+                    RequestedAuthorityScope::Subtree(Some(parent_inst.id())),
+                    &registry,
+                )
+                .is_err()
+        );
+
+        // `fork_inherited` strips `Own` while preserving `Subtree`; `exec_preserved`
+        // keeps `Own`.
+        let mut mixed = ProcessAuthority::empty();
+        mixed.grant_inspect_read(AuthorityScope::Own);
+        mixed.grant_trace_read(AuthorityScope::Subtree(parent_inst.id()));
+        let forked = mixed.fork_inherited();
+        assert_eq!(forked.inspect_read_scope(), None);
+        assert_eq!(
+            forked.trace_read_scope(),
+            Some(AuthorityScope::Subtree(parent_inst.id()))
+        );
+        assert!(mixed.contains_child_authority(
+            parent_inst.id(),
+            child_inst.id(),
+            &forked,
+            &registry
+        ));
+        assert_eq!(
+            mixed.exec_preserved().inspect_read_scope(),
+            Some(AuthorityScope::Own)
+        );
     }
 
     #[test]

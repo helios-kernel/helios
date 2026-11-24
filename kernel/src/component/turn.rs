@@ -116,6 +116,9 @@ where
         if !self.is_empty() {
             runtime_state.retire_network_handles(self);
         }
+        self.drain_snapshot_releases(|token| {
+            runtime_state.release_snapshot_hold(token);
+        });
     }
 
     fn take_stop(&self) -> Option<Error> {

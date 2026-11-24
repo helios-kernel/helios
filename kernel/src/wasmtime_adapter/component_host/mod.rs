@@ -17,18 +17,19 @@ use crate::wasmtime_adapter::wasi::net::ipv6_address_groups;
 use bytes::Bytes;
 
 use crate::{
-    ClockAuthorityRights, CompileAuthority, DeviceClassRights, DiagnosticAuthorityRights,
-    DirectoryAuthorityRights, ExecAuthority, LinkAuthorityRights, NetworkAuthorityRights,
-    ProcessAuthority, ProcessAuthorityError, SettingsAuthorityRights, SpawnAuthority,
+    AuthorityScope, ClockAuthorityRights, CompileAuthority, DeviceClassRights,
+    DiagnosticAuthorityRights, DirectoryAuthorityRights, ExecAuthority, IpcEndpointGrants,
+    IpcGrantError, LinkAuthorityRights, NetworkAuthorityRights, ProcessAuthority,
+    ProcessAuthorityError, RequestedAuthorityScope, SettingsAuthorityRights, SpawnAuthority,
     TerminalAuthorityRights,
 };
 use crate::{
     ComponentCache, ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
-    ComponentStoreData, EmbeddedComponent, ExecResult, HostFileSystem, InstanceId, KillOutcome,
-    KillReason, ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, RawMutex,
-    RawMutexGuardResource, RawMutexResource, RawRwLock, RawRwLockReadGuardResource,
-    RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis,
-    largest_servable_user_bytes, machine_memory, monotonic_nanos, user_heap_stats, user_node_stats,
+    ComponentStoreData, EmbeddedComponent, ExecResult, InstanceId, ProgramExecError,
+    ProgramExecErrorDetail, ProgramExecErrorKind, RawMutex, RawMutexGuardResource,
+    RawMutexResource, RawRwLock, RawRwLockReadGuardResource, RawRwLockResource,
+    RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis, largest_servable_user_bytes,
+    machine_memory, monotonic_nanos, user_heap_stats, user_node_stats,
 };
 use helios_hal::cpu::Cpu;
 use smallvec::SmallVec;
@@ -63,8 +64,6 @@ const NET_INSTANCE: &str = "helios:system/net@0.1.0";
 const TRACING_INSTANCE: &str = "helios:system/tracing@0.1.0";
 const PROFILING_INSTANCE: &str = "helios:system/profiling@0.1.0";
 const SETTINGS_INSTANCE: &str = "helios:system/settings@0.1.0";
-const INSTANCES_INSTANCE: &str = "helios:system/instances@0.1.0";
-const SNAPSHOT_INSTANCE: &str = "helios:system/snapshot@0.1.0";
 /// The share of the machine's free memory the compiled-component cache
 /// may hold.
 ///
@@ -85,6 +84,9 @@ fn lower_bytes_to_vec(bytes: Bytes) -> Vec<u8> {
 
 mod device;
 mod filters;
+mod instances_snapshot;
+mod ipc;
+mod machine_identity;
 mod mounts;
 mod observation;
 mod pending;
@@ -248,6 +250,7 @@ macro_rules! impl_program_bindings {
         $bindings:ident,
         $convert_result:ident,
         $convert_error:ident,
+        $extract_grants:ident,
         $build_authority:ident,
         $convert_container_config:ident,
         $convert_container_credentials:ident
@@ -755,15 +758,36 @@ macro_rules! impl_program_bindings {
                 }
                 #[cfg(feature = "linux")]
                 {
+                    let $bindings::helios::system::programs::ContainerConfig {
+                        root,
+                        mounts,
+                        shared_owner,
+                        credentials,
+                        hostname,
+                        domainname,
+                        capability_grants,
+                    } = config;
                     let snapshot = accessor.with(|mut access| {
+                        let extracted =
+                            $extract_grants(&mut access.get().table, capability_grants)?;
                         Ok::<_, wasmtime::Error>((
                             access.get().runtime_state.program_service(),
                             access.get().process_authority().clone(),
+                            access.get().instance().id(),
+                            access.get().instance_registry.clone(),
                             access.get().filesystem().clone(),
+                            extracted,
                         ))
                     });
                     async move {
-                        let (service, caller_authority, caller_namespace) = snapshot?;
+                        let (
+                            service,
+                            caller_authority,
+                            caller_id,
+                            registry,
+                            caller_namespace,
+                            (non_ipc_grants, ipc_result, had_ipc),
+                        ) = snapshot?;
                         let Some(service) = service else {
                             return Ok(Err($bindings::helios::system::programs::SpawnError {
                                 kind:
@@ -774,11 +798,37 @@ macro_rules! impl_program_bindings {
                         if let Err(error) = require_launch_authority(&caller_authority) {
                             return Ok(Err($convert_error(error)));
                         }
-                        let (non_fs_authority, container_config) =
-                            match $convert_container_config(&caller_authority, config) {
-                                Ok(pair) => pair,
-                                Err(error) => return Ok(Err($convert_error(error))),
-                            };
+                        if let Err(error) = ipc_result {
+                            return Ok(Err($convert_error(error)));
+                        }
+                        if had_ipc {
+                            return Ok(Err($convert_error(ProgramExecError {
+                                kind: ProgramExecErrorKind::PermissionDenied,
+                                detail: ProgramExecErrorDetail::ContainerRefused(
+                                    crate::RuntimeMessage::of(
+                                        "container capability grants cannot include IPC endpoint grants",
+                                    ),
+                                ),
+                            })));
+                        }
+                        let rebuilt_config = $bindings::helios::system::programs::ContainerConfig {
+                            root,
+                            mounts,
+                            shared_owner,
+                            credentials,
+                            hostname,
+                            domainname,
+                            capability_grants: non_ipc_grants,
+                        };
+                        let (non_fs_authority, container_config) = match $convert_container_config(
+                            &caller_authority,
+                            caller_id,
+                            &registry,
+                            rebuilt_config,
+                        ) {
+                            Ok(pair) => pair,
+                            Err(error) => return Ok(Err($convert_error(error))),
+                        };
                         let container = match service
                             .create_container(
                                 &caller_authority,
@@ -814,21 +864,39 @@ macro_rules! impl_program_bindings {
                     >,
                 >,
             > + Send {
+                let $bindings::helios::system::programs::SpawnRequest {
+                    name,
+                    args,
+                    env,
+                    path,
+                    capability_grants,
+                } = request;
                 let snapshot = accessor.with(|mut access| {
+                    let extracted = $extract_grants(&mut access.get().table, capability_grants)?;
                     Ok::<_, wasmtime::Error>((
                         access.get().runtime_state.program_service(),
                         ProgramExecContext::from_store(access.get()),
                         access.get().process_authority().clone(),
+                        access.get().instance().id(),
                         access.get().cpu.clone(),
                         // The child starts a tree of its own below the
                         // caller's: it sees the caller's mounts, and its
                         // own stay its own.
                         access.get().filesystem().descend(),
+                        extracted,
                     ))
                 });
                 async move {
-                    let (service, context, caller_authority, cpu, namespace) = snapshot?;
-                    let mut launch = phases::Trace::begin(cpu, "spawn", &request.path);
+                    let (
+                        service,
+                        context,
+                        caller_authority,
+                        caller_id,
+                        cpu,
+                        namespace,
+                        (non_ipc_grants, ipc_result, _),
+                    ) = snapshot?;
+                    let mut launch = phases::Trace::begin(cpu, "spawn", &path);
                     let Some(service) = service else {
                         launch.refused(ProgramExecErrorKind::Unavailable);
                         return Ok(Err($bindings::helios::system::programs::SpawnError {
@@ -843,18 +911,34 @@ macro_rules! impl_program_bindings {
                             return Ok(Err($convert_error(error)));
                         }
                     };
+                    let ipc_grants = match ipc_result {
+                        Ok(grants) => grants,
+                        Err(error) => {
+                            launch.refused(error.kind);
+                            return Ok(Err($convert_error(error)));
+                        }
+                    };
                     let compile_authority = CompileAuthority::from(&spawn_authority);
-                    let child_authority =
-                        match $build_authority(&caller_authority, request.capability_grants) {
-                            Ok(authority) => authority,
-                            Err(error) => {
-                                launch.refused(error.kind);
-                                return Ok(Err($convert_error(error)));
-                            }
-                        };
+                    let child_instance = context.instance_registry().register_child(
+                        context.parent_instance_id(),
+                        name.clone(),
+                        context.now_uptime_nanos(),
+                    );
+                    let child_authority = match $build_authority(
+                        &caller_authority,
+                        caller_id,
+                        Some(child_instance.id()),
+                        context.instance_registry(),
+                        non_ipc_grants,
+                    ) {
+                        Ok(authority) => authority,
+                        Err(error) => {
+                            launch.refused(error.kind);
+                            return Ok(Err($convert_error(error)));
+                        }
+                    };
                     let source =
-                        match read_program_source(accessor, &request.path, &caller_authority).await
-                        {
+                        match read_program_source(accessor, &path, &caller_authority).await {
                             Ok(Ok(source)) => source,
                             Ok(Err(error)) => {
                                 launch.exit_error(&error);
@@ -878,11 +962,13 @@ macro_rules! impl_program_bindings {
                             source,
                             None,
                             service::ProgramLaunch::new(
-                                ProgramArgv::launched(request.name, request.args),
-                                request.env,
+                                ProgramArgv::launched(name, args),
+                                env,
                                 child_authority,
                                 Some(namespace),
                             )
+                            .with_launched_instance(child_instance)
+                            .with_ipc_grants(ipc_grants)
                             .with_timeline(launch.timeline().for_task()),
                         )
                         .await
@@ -923,24 +1009,44 @@ macro_rules! impl_program_bindings {
                     >,
                 >,
             > + Send {
+                let $bindings::helios::system::programs::ExecRequest {
+                    name,
+                    args,
+                    env,
+                    path,
+                    stdin,
+                    hint,
+                    capability_grants,
+                } = request;
                 let snapshot = accessor.with(|mut access| {
+                    let extracted = $extract_grants(&mut access.get().table, capability_grants)?;
                     Ok::<_, wasmtime::Error>((
                         access.get().runtime_state.program_service(),
                         ProgramExecContext::from_store(access.get()),
                         access.get().process_authority().clone(),
+                        access.get().instance().id(),
                         access.get().cpu.clone(),
                         // The child starts a tree of its own below the
                         // caller's: it sees the caller's mounts, and its
                         // own stay its own.
                         access.get().filesystem().descend(),
+                        extracted,
                     ))
                 });
                 async move {
-                    let (service, context, caller_authority, cpu, namespace) = snapshot?;
+                    let (
+                        service,
+                        context,
+                        caller_authority,
+                        caller_id,
+                        cpu,
+                        namespace,
+                        (non_ipc_grants, ipc_result, _),
+                    ) = snapshot?;
                     // Read before anything else the call does, so the
                     // reported duration covers the whole launch.
                     let clock = phases::LaunchClock::arrive(&cpu);
-                    let launch = phases::Trace::begin_timed(cpu, "exec", &request.path, &clock);
+                    let launch = phases::Trace::begin_timed(cpu, "exec", &path, &clock);
                     let Some(service) = service else {
                         launch.refused(ProgramExecErrorKind::Unavailable);
                         return Ok(Err($bindings::helios::system::programs::ExecError {
@@ -955,18 +1061,35 @@ macro_rules! impl_program_bindings {
                             return Ok(Err($convert_error(error)));
                         }
                     };
+                    let ipc_grants = match ipc_result {
+                        Ok(grants) => grants,
+                        Err(error) => {
+                            launch.refused(error.kind);
+                            return Ok(Err($convert_error(error)));
+                        }
+                    };
                     let compile_authority = CompileAuthority::from(&exec_authority);
-                    let child_authority =
-                        match $build_authority(&caller_authority, request.capability_grants) {
-                            Ok(authority) => authority,
-                            Err(error) => {
-                                launch.refused(error.kind);
-                                return Ok(Err($convert_error(error)));
-                            }
-                        };
+                    let child_instance = context.instance_registry().register_child(
+                        context.parent_instance_id(),
+                        name.clone(),
+                        context.now_uptime_nanos(),
+                    );
+                    let child_authority = match $build_authority(
+                        &caller_authority,
+                        caller_id,
+                        Some(child_instance.id()),
+                        context.instance_registry(),
+                        non_ipc_grants,
+                    ) {
+                        Ok(authority) => authority,
+                        Err(error) => {
+                            launch.refused(error.kind);
+                            return Ok(Err($convert_error(error)));
+                        }
+                    };
                     // Refused before the source is read: the hint is a
                     // property of the request alone.
-                    let hint = match request.hint.map(RequestedAotHint::compile_hint).transpose() {
+                    let hint = match hint.map(RequestedAotHint::compile_hint).transpose() {
                         Ok(hint) => hint,
                         Err(error) => {
                             launch.refused(error.kind);
@@ -974,8 +1097,7 @@ macro_rules! impl_program_bindings {
                         }
                     };
                     let source =
-                        match read_program_source(accessor, &request.path, &caller_authority).await
-                        {
+                        match read_program_source(accessor, &path, &caller_authority).await {
                             Ok(Ok(source)) => source,
                             Ok(Err(error)) => {
                                 launch.exit_error(&error);
@@ -998,13 +1120,15 @@ macro_rules! impl_program_bindings {
                             context,
                             source,
                             hint,
-                            request.stdin,
+                            stdin,
                             service::ProgramLaunch::new(
-                                ProgramArgv::launched(request.name, request.args),
-                                request.env,
+                                ProgramArgv::launched(name, args),
+                                env,
                                 child_authority,
                                 Some(namespace),
                             )
+                            .with_launched_instance(child_instance)
+                            .with_ipc_grants(ipc_grants)
                             .with_timeline(launch.timeline().clone()),
                         )
                         .await;
@@ -1153,12 +1277,92 @@ macro_rules! impl_program_bindings {
     };
 }
 
+fn map_ipc_grant_error(error: IpcGrantError) -> ProgramExecError {
+    tracing::error!(?error, "IPC endpoint grant rejected during program launch");
+    let kind = match error {
+        IpcGrantError::EmptyName
+        | IpcGrantError::NameTooLong { .. }
+        | IpcGrantError::DuplicateName(_) => ProgramExecErrorKind::InvalidPath,
+        IpcGrantError::TooManyGrants { .. } => ProgramExecErrorKind::PermissionDenied,
+    };
+    ProgramExecError {
+        kind,
+        detail: ProgramExecErrorDetail::ProcessAuthorityDenied,
+    }
+}
+
 macro_rules! impl_authority_conversion {
-    ($name:ident, $bindings:ident) => {
+    ($extract_name:ident, $name:ident, $bindings:ident) => {
+        #[allow(clippy::type_complexity)]
+        fn $extract_name(
+            table: &mut ResourceTable,
+            grants: Vec<$bindings::helios::system::programs::CapabilityGrant>,
+        ) -> wasmtime::Result<(
+            Vec<$bindings::helios::system::programs::CapabilityGrant>,
+            Result<IpcEndpointGrants, ProgramExecError>,
+            bool,
+        )> {
+            let mut remaining = Vec::with_capacity(grants.len());
+            let mut ipc_grants = IpcEndpointGrants::new();
+            let mut first_error: Option<ProgramExecError> = None;
+            let mut had_ipc = false;
+            for grant in grants {
+                match grant {
+                    $bindings::helios::system::programs::CapabilityGrant::Ipc(ipc) => {
+                        had_ipc = true;
+                        let endpoint = table.delete(ipc.endpoint).map_err(wasmtime::Error::from)?;
+                        if first_error.is_none()
+                            && let Err(error) = ipc_grants.insert(&ipc.name, endpoint)
+                        {
+                            first_error = Some(map_ipc_grant_error(error));
+                        }
+                    }
+                    other => remaining.push(other),
+                }
+            }
+            let ipc_result = match first_error {
+                Some(error) => Err(error),
+                None => Ok(ipc_grants),
+            };
+            Ok((remaining, ipc_result, had_ipc))
+        }
+
         fn $name(
             caller_authority: &ProcessAuthority,
+            caller_id: InstanceId,
+            child_id: Option<InstanceId>,
+            registry: &crate::InstanceRegistry,
             grants: Vec<$bindings::helios::system::programs::CapabilityGrant>,
         ) -> Result<ProcessAuthority, ProgramExecError> {
+            fn convert_scope(
+                scope: $bindings::helios::system::programs::AuthorityScope,
+                child_id: Option<InstanceId>,
+            ) -> Result<(RequestedAuthorityScope, InstanceId), ProgramExecError> {
+                match scope {
+                    $bindings::helios::system::programs::AuthorityScope::Own => Ok((
+                        RequestedAuthorityScope::Own,
+                        child_id.unwrap_or_else(|| InstanceId::from_raw(0)),
+                    )),
+                    $bindings::helios::system::programs::AuthorityScope::Subtree(Some(id)) => Ok((
+                        RequestedAuthorityScope::Subtree(Some(InstanceId::from_raw(id))),
+                        child_id.unwrap_or_else(|| InstanceId::from_raw(id)),
+                    )),
+                    $bindings::helios::system::programs::AuthorityScope::Subtree(None) => {
+                        let Some(target_child) = child_id else {
+                            return Err(ProgramExecError {
+                                kind: ProgramExecErrorKind::PermissionDenied,
+                                detail: ProgramExecErrorDetail::ProcessAuthorityDenied,
+                            });
+                        };
+                        Ok((RequestedAuthorityScope::Subtree(None), target_child))
+                    }
+                    $bindings::helios::system::programs::AuthorityScope::Machine => Ok((
+                        RequestedAuthorityScope::Machine,
+                        child_id.unwrap_or_else(|| InstanceId::from_raw(0)),
+                    )),
+                }
+            }
+
             let mut authority = ProcessAuthority::empty();
             for grant in grants {
                 match grant {
@@ -1358,19 +1562,67 @@ macro_rules! impl_authority_conversion {
                     }
                     $bindings::helios::system::programs::CapabilityGrant::Diagnostics(
                         diagnostics,
-                    ) => {
-                        let mut rights = DiagnosticAuthorityRights::empty();
-                        for right in diagnostics.rights {
-                            rights |= match right {
-                                $bindings::helios::system::programs::DiagnosticsRight::ObserveMachine => {
-                                    DiagnosticAuthorityRights::OBSERVE_MACHINE
-                                }
-                            };
+                    ) => match diagnostics {
+                        $bindings::helios::system::programs::DiagnosticsGrant::InspectRead(
+                            scope,
+                        ) => {
+                            let (requested, target_child) = convert_scope(scope, child_id)?;
+                            let cap = caller_authority
+                                .derive_inspect_read_for_child(
+                                    caller_id,
+                                    target_child,
+                                    requested,
+                                    registry,
+                                )
+                                .map_err(map_process_authority_error)?;
+                            authority.grant_inspect_read(cap.scope());
                         }
-                        let rights = caller_authority
-                            .derive_diagnostic_rights(rights)
+                        $bindings::helios::system::programs::DiagnosticsGrant::TraceRead(scope) => {
+                            let (requested, target_child) = convert_scope(scope, child_id)?;
+                            let cap = caller_authority
+                                .derive_trace_read_for_child(
+                                    caller_id,
+                                    target_child,
+                                    requested,
+                                    registry,
+                                )
+                                .map_err(map_process_authority_error)?;
+                            authority.grant_trace_read(cap.scope());
+                        }
+                        $bindings::helios::system::programs::DiagnosticsGrant::ProfileRead(
+                            scope,
+                        ) => {
+                            let (requested, target_child) = convert_scope(scope, child_id)?;
+                            let cap = caller_authority
+                                .derive_profile_read_for_child(
+                                    caller_id,
+                                    target_child,
+                                    requested,
+                                    registry,
+                                )
+                                .map_err(map_process_authority_error)?;
+                            authority.grant_profile_read(cap.scope());
+                        }
+                        $bindings::helios::system::programs::DiagnosticsGrant::Control => {
+                            let rights = caller_authority
+                                .derive_diagnostic_rights(DiagnosticAuthorityRights::CONTROL)
+                                .map_err(map_process_authority_error)?;
+                            authority.grant_diagnostic_rights(rights);
+                        }
+                    },
+                    $bindings::helios::system::programs::CapabilityGrant::InstanceControl(
+                        scope,
+                    ) => {
+                        let (requested, target_child) = convert_scope(scope, child_id)?;
+                        let cap = caller_authority
+                            .derive_instance_control_for_child(
+                                caller_id,
+                                target_child,
+                                requested,
+                                registry,
+                            )
                             .map_err(map_process_authority_error)?;
-                        authority.grant_diagnostic_rights(rights);
+                        authority.grant_instance_control(cap.scope());
                     }
                     $bindings::helios::system::programs::CapabilityGrant::Settings(settings) => {
                         let mut rights = SettingsAuthorityRights::empty();
@@ -1390,8 +1642,11 @@ macro_rules! impl_authority_conversion {
                         let mut rights = crate::MachineAuthorityRights::empty();
                         for right in machine.rights {
                             rights |= match right {
-                                $bindings::helios::system::programs::MachineRight::ControlProcessors => {
-                                    crate::MachineAuthorityRights::CONTROL_PROCESSORS
+                                $bindings::helios::system::programs::MachineRight::Control => {
+                                    crate::MachineAuthorityRights::CONTROL
+                                }
+                                $bindings::helios::system::programs::MachineRight::Identity => {
+                                    crate::MachineAuthorityRights::IDENTITY
                                 }
                                 $bindings::helios::system::programs::MachineRight::Virtualize => {
                                     crate::MachineAuthorityRights::VIRTUALIZE
@@ -1403,6 +1658,11 @@ macro_rules! impl_authority_conversion {
                             .map_err(map_process_authority_error)?;
                         authority.grant_machine_rights(rights);
                     }
+                    $bindings::helios::system::programs::CapabilityGrant::Ipc(_) => {
+                        unreachable!(
+                            "IPC endpoint grants are extracted from the caller's resource table before authority derivation"
+                        )
+                    }
                 }
             }
             Ok(authority)
@@ -1410,8 +1670,16 @@ macro_rules! impl_authority_conversion {
     };
 }
 
-impl_authority_conversion!(build_debugger_child_authority, debugger_bindings);
-impl_authority_conversion!(build_program_child_authority, program_bindings);
+impl_authority_conversion!(
+    extract_debugger_ipc_grants,
+    build_debugger_child_authority,
+    debugger_bindings
+);
+impl_authority_conversion!(
+    extract_program_ipc_grants,
+    build_program_child_authority,
+    program_bindings
+);
 
 #[cfg(feature = "linux")]
 macro_rules! impl_container_config_conversion {
@@ -1432,6 +1700,8 @@ macro_rules! impl_container_config_conversion {
 
         fn $config_fn(
             caller_authority: &ProcessAuthority,
+            caller_id: InstanceId,
+            registry: &crate::InstanceRegistry,
             config: $bindings::helios::system::programs::ContainerConfig,
         ) -> Result<(ProcessAuthority, crate::ContainerConfig), ProgramExecError> {
             fn convert_mount(
@@ -1483,7 +1753,13 @@ macro_rules! impl_container_config_conversion {
                     )),
                 });
             }
-            let non_fs_authority = $build_authority(caller_authority, config.capability_grants)?;
+            let non_fs_authority = $build_authority(
+                caller_authority,
+                caller_id,
+                None,
+                registry,
+                config.capability_grants,
+            )?;
             let hostname = helios_linux::syscall::UtsField::from_configured(&config.hostname)
                 .map_err(|error| ProgramExecError {
                     kind: ProgramExecErrorKind::InvalidPath,
@@ -1575,6 +1851,7 @@ impl_program_bindings!(
     debugger_bindings,
     convert_launch_result,
     convert_launch_error,
+    extract_debugger_ipc_grants,
     build_debugger_child_authority,
     convert_debugger_container_config,
     convert_debugger_container_credentials
@@ -1583,6 +1860,7 @@ impl_program_bindings!(
     program_bindings,
     convert_program_launch_result,
     convert_program_launch_error,
+    extract_program_ipc_grants,
     build_program_child_authority,
     convert_program_container_config,
     convert_program_container_credentials
@@ -1671,23 +1949,38 @@ mod authority_tests {
     use alloc::vec::Vec;
 
     use super::{
-        build_program_child_authority, dns_network_rights, program_wit, require_compile_authority,
-        require_exec_authority, require_spawn_authority, tcp_connect_network_rights,
-        udp_bind_network_rights,
+        dns_network_rights, program_wit, require_compile_authority, require_exec_authority,
+        require_spawn_authority, tcp_connect_network_rights, udp_bind_network_rights,
     };
     use crate::{
-        ClockAuthorityRights, DeviceClassRights, DiagnosticAuthorityRights,
-        DirectoryAuthorityRights, DirectoryPreopen, LinkAuthorityRights, MachineAuthorityRights,
-        NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityRights, SettingsAuthorityRights,
-        TerminalAuthorityRights,
+        AuthorityScope, ClockAuthorityRights, DeviceClassRights, DiagnosticAuthorityRights,
+        DirectoryAuthorityRights, DirectoryPreopen, InstanceRegistry, LinkAuthorityRights,
+        MachineAuthorityRights, NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityRights,
+        SettingsAuthorityRights, TerminalAuthorityRights,
     };
 
     use program_wit::programs::{
-        CapabilityGrant, ClockGrant, ClockRight, DeviceClass, DeviceGrant, DiagnosticsGrant,
-        DiagnosticsRight, DirectoryGrant, FilesystemRight, LinkGrant, LinkRight, MachineGrant,
-        MachineRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight, SettingsGrant,
-        SettingsRight, TerminalGrant, TerminalRight,
+        AuthorityScope as WitScope, CapabilityGrant, ClockGrant, ClockRight, DeviceClass,
+        DeviceGrant, DiagnosticsGrant, DirectoryGrant, FilesystemRight, LinkGrant, LinkRight,
+        MachineGrant, MachineRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight,
+        SettingsGrant, SettingsRight, TerminalGrant, TerminalRight,
     };
+
+    fn build_child_authority(
+        caller: &ProcessAuthority,
+        grants: Vec<CapabilityGrant>,
+    ) -> Result<ProcessAuthority, crate::ProgramExecError> {
+        let registry = InstanceRegistry::new();
+        let parent_inst = registry.register("parent", 0);
+        let child_inst = registry.register_child(Some(parent_inst.id()), "child", 1);
+        super::build_program_child_authority(
+            caller,
+            parent_inst.id(),
+            Some(child_inst.id()),
+            &registry,
+            grants,
+        )
+    }
 
     fn directory_grant(
         source_path: &str,
@@ -1725,21 +2018,17 @@ mod authority_tests {
         CapabilityGrant::Device(DeviceGrant { classes })
     }
 
-    fn diagnostics_grant(rights: Vec<DiagnosticsRight>) -> CapabilityGrant {
-        CapabilityGrant::Diagnostics(DiagnosticsGrant { rights })
+    fn machine_grant(rights: Vec<MachineRight>) -> CapabilityGrant {
+        CapabilityGrant::Machine(MachineGrant { rights })
     }
 
     fn settings_grant(rights: Vec<SettingsRight>) -> CapabilityGrant {
         CapabilityGrant::Settings(SettingsGrant { rights })
     }
 
-    fn machine_grant(rights: Vec<MachineRight>) -> CapabilityGrant {
-        CapabilityGrant::Machine(MachineGrant { rights })
-    }
-
     #[test]
     fn empty_grants_create_zero_child_authority() {
-        let child = build_program_child_authority(&ProcessAuthority::root(), Vec::new())
+        let child = build_child_authority(&ProcessAuthority::root(), Vec::new())
             .expect("empty grants must be a valid zero-authority child");
 
         assert!(child.directory_preopens().is_empty());
@@ -1750,60 +2039,155 @@ mod authority_tests {
         assert!(child.link_rights().is_empty());
         assert!(child.device_class_rights().is_empty());
         assert!(child.granted_devices().is_empty());
+        assert!(child.inspect_read_scope().is_none());
+        assert!(child.trace_read_scope().is_none());
+        assert!(child.profile_read_scope().is_none());
         assert!(child.diagnostic_rights().is_empty());
+        assert!(child.instance_control_scope().is_none());
         assert!(child.settings_rights().is_empty());
+        assert!(child.machine_rights().is_empty());
         assert!(child.cwd().is_none());
     }
 
     #[test]
-    fn diagnostics_grant_derives_from_caller_authority() {
-        let mut caller = ProcessAuthority::empty();
-        caller.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+    fn orthogonal_diagnostics_instance_control_and_machine_grants_attenuate_monotonically() {
+        let registry = InstanceRegistry::new();
+        let parent_inst = registry.register("supervisor", 0);
+        let child_inst = registry.register_child(Some(parent_inst.id()), "worker", 1);
+        let sibling_inst = registry.register("sibling", 2);
 
-        let child = build_program_child_authority(
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_inspect_read(AuthorityScope::Machine);
+        caller.grant_trace_read(AuthorityScope::Subtree(parent_inst.id()));
+        caller.grant_profile_read(AuthorityScope::Own);
+        caller.grant_diagnostic_rights(DiagnosticAuthorityRights::CONTROL);
+        caller.grant_instance_control(AuthorityScope::Subtree(parent_inst.id()));
+        caller.grant_machine_rights(MachineAuthorityRights::CONTROL);
+
+        // `Subtree(None)` resolves to `Subtree(child_inst.id())`, strictly narrower
+        // than `Machine` and `Subtree(parent_inst.id())`.
+        let child = super::build_program_child_authority(
             &caller,
-            vec![diagnostics_grant(vec![DiagnosticsRight::ObserveMachine])],
+            parent_inst.id(),
+            Some(child_inst.id()),
+            &registry,
+            vec![
+                CapabilityGrant::Diagnostics(DiagnosticsGrant::InspectRead(WitScope::Subtree(
+                    None,
+                ))),
+                CapabilityGrant::Diagnostics(DiagnosticsGrant::TraceRead(WitScope::Subtree(None))),
+                CapabilityGrant::Diagnostics(DiagnosticsGrant::Control),
+                CapabilityGrant::InstanceControl(WitScope::Own),
+                machine_grant(vec![MachineRight::Control]),
+            ],
         )
-        .expect("a caller holding the right may hand it on");
+        .expect("narrowed orthogonal grants must succeed");
 
         assert_eq!(
-            child.diagnostic_rights(),
-            DiagnosticAuthorityRights::OBSERVE_MACHINE
+            child.inspect_read_scope(),
+            Some(AuthorityScope::Subtree(child_inst.id()))
         );
+        assert_eq!(
+            child.trace_read_scope(),
+            Some(AuthorityScope::Subtree(child_inst.id()))
+        );
+        assert_eq!(child.profile_read_scope(), None);
+        assert_eq!(
+            child.diagnostic_rights(),
+            DiagnosticAuthorityRights::CONTROL
+        );
+        assert_eq!(child.instance_control_scope(), Some(AuthorityScope::Own));
+        assert_eq!(child.machine_rights(), MachineAuthorityRights::CONTROL);
+
+        // Delegating `Own` profile-read to a child must fail (`Own` cannot transfer).
+        let own_err = super::build_program_child_authority(
+            &caller,
+            parent_inst.id(),
+            Some(child_inst.id()),
+            &registry,
+            vec![CapabilityGrant::Diagnostics(DiagnosticsGrant::ProfileRead(
+                WitScope::Own,
+            ))],
+        )
+        .expect_err("Own scope must never delegate to a child");
+        assert_eq!(own_err.kind, crate::ProgramExecErrorKind::PermissionDenied);
+
+        // Widening `Subtree(parent)` to `Machine` or `Subtree(sibling)` must fail.
+        for bad_scope in [
+            WitScope::Machine,
+            WitScope::Subtree(Some(sibling_inst.id().raw())),
+        ] {
+            let err = super::build_program_child_authority(
+                &caller,
+                parent_inst.id(),
+                Some(child_inst.id()),
+                &registry,
+                vec![CapabilityGrant::Diagnostics(DiagnosticsGrant::TraceRead(
+                    bad_scope,
+                ))],
+            )
+            .expect_err("scope widening must be refused");
+            assert_eq!(err.kind, crate::ProgramExecErrorKind::PermissionDenied);
+        }
+
+        // `MachineRight::Identity` cannot be derived from `MachineRight::Control`.
+        let id_err = super::build_program_child_authority(
+            &caller,
+            parent_inst.id(),
+            Some(child_inst.id()),
+            &registry,
+            vec![machine_grant(vec![MachineRight::Identity])],
+        )
+        .expect_err("identity right must not derive from control right");
+        assert_eq!(id_err.kind, crate::ProgramExecErrorKind::PermissionDenied);
     }
 
     #[test]
-    fn diagnostics_grant_exceeding_caller_is_refused() {
-        let error = build_program_child_authority(
+    fn diagnostics_and_machine_grants_exceeding_root_are_refused() {
+        let error = build_child_authority(
             &ProcessAuthority::root(),
-            vec![diagnostics_grant(vec![DiagnosticsRight::ObserveMachine])],
+            vec![CapabilityGrant::Diagnostics(DiagnosticsGrant::Control)],
         )
         .expect_err("root authority holds no diagnostic right to hand on");
         assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
 
-        let error = build_program_child_authority(
-            &ProcessAuthority::root(),
-            vec![diagnostics_grant(Vec::new())],
-        )
-        .expect_err("an empty diagnostics grant is a mistake");
+        let error =
+            build_child_authority(&ProcessAuthority::root(), vec![machine_grant(Vec::new())])
+                .expect_err("an empty machine grant is refused");
         assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
     }
 
-    /// The inspector session launches `perf` through the debugger, so the
-    /// debugger holds the right it hands on.
     #[test]
-    fn debugger_authority_hands_the_observe_right_to_what_it_launches() {
+    fn debugger_authority_hands_explicit_observation_and_machine_rights_to_what_it_launches() {
         let debugger = super::debugger_authority();
 
-        let child = build_program_child_authority(
+        let child = build_child_authority(
             &debugger,
-            vec![diagnostics_grant(vec![DiagnosticsRight::ObserveMachine])],
+            vec![
+                CapabilityGrant::Diagnostics(DiagnosticsGrant::InspectRead(WitScope::Machine)),
+                CapabilityGrant::Diagnostics(DiagnosticsGrant::TraceRead(WitScope::Machine)),
+                CapabilityGrant::Diagnostics(DiagnosticsGrant::ProfileRead(WitScope::Machine)),
+                CapabilityGrant::Diagnostics(DiagnosticsGrant::Control),
+                CapabilityGrant::InstanceControl(WitScope::Machine),
+                machine_grant(vec![MachineRight::Control, MachineRight::Identity]),
+            ],
         )
-        .expect("the debugger holds the observe right");
+        .expect("the debugger holds explicit machine observation, control, and identity rights");
 
+        assert_eq!(child.inspect_read_scope(), Some(AuthorityScope::Machine));
+        assert_eq!(child.trace_read_scope(), Some(AuthorityScope::Machine));
+        assert_eq!(child.profile_read_scope(), Some(AuthorityScope::Machine));
         assert_eq!(
             child.diagnostic_rights(),
-            DiagnosticAuthorityRights::OBSERVE_MACHINE
+            DiagnosticAuthorityRights::CONTROL
+        );
+        assert_eq!(
+            child.instance_control_scope(),
+            Some(AuthorityScope::Machine)
+        );
+        assert_eq!(
+            child.machine_rights(),
+            MachineAuthorityRights::CONTROL | MachineAuthorityRights::IDENTITY
         );
     }
 
@@ -1812,18 +2196,16 @@ mod authority_tests {
         let mut caller = ProcessAuthority::empty();
         caller.grant_settings_rights(SettingsAuthorityRights::WRITE);
 
-        let child = build_program_child_authority(
-            &caller,
-            vec![settings_grant(vec![SettingsRight::Write])],
-        )
-        .expect("a caller holding the right may hand it on");
+        let child =
+            build_child_authority(&caller, vec![settings_grant(vec![SettingsRight::Write])])
+                .expect("a caller holding the right may hand it on");
 
         assert_eq!(child.settings_rights(), SettingsAuthorityRights::WRITE);
     }
 
     #[test]
     fn settings_grant_exceeding_caller_is_refused() {
-        let error = build_program_child_authority(
+        let error = build_child_authority(
             &ProcessAuthority::root(),
             vec![settings_grant(vec![SettingsRight::Write])],
         )
@@ -1831,19 +2213,15 @@ mod authority_tests {
         assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
 
         let mut observer = ProcessAuthority::empty();
-        observer.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
-        let error = build_program_child_authority(
-            &observer,
-            vec![settings_grant(vec![SettingsRight::Write])],
-        )
-        .expect_err("the observe right is no settings right");
+        observer.grant_diagnostic_rights(DiagnosticAuthorityRights::CONTROL);
+        let error =
+            build_child_authority(&observer, vec![settings_grant(vec![SettingsRight::Write])])
+                .expect_err("the diagnostic control right is no settings right");
         assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
 
-        let error = build_program_child_authority(
-            &ProcessAuthority::root(),
-            vec![settings_grant(Vec::new())],
-        )
-        .expect_err("an empty settings grant is a mistake");
+        let error =
+            build_child_authority(&ProcessAuthority::root(), vec![settings_grant(Vec::new())])
+                .expect_err("an empty settings grant is a mistake");
         assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
     }
 
@@ -1854,11 +2232,9 @@ mod authority_tests {
     fn debugger_authority_hands_the_settings_right_to_what_it_launches() {
         let debugger = super::debugger_authority();
 
-        let child = build_program_child_authority(
-            &debugger,
-            vec![settings_grant(vec![SettingsRight::Write])],
-        )
-        .expect("the debugger holds the settings right");
+        let child =
+            build_child_authority(&debugger, vec![settings_grant(vec![SettingsRight::Write])])
+                .expect("the debugger holds the settings right");
 
         assert_eq!(child.settings_rights(), SettingsAuthorityRights::WRITE);
     }
@@ -1868,14 +2244,12 @@ mod authority_tests {
         let mut caller = ProcessAuthority::empty();
         caller.grant_machine_rights(MachineAuthorityRights::VIRTUALIZE);
 
-        let child = build_program_child_authority(
-            &caller,
-            vec![machine_grant(vec![MachineRight::Virtualize])],
-        )
-        .expect("a caller holding virtualize may hand it on");
+        let child =
+            build_child_authority(&caller, vec![machine_grant(vec![MachineRight::Virtualize])])
+                .expect("a caller holding virtualize may hand it on");
         assert_eq!(child.machine_rights(), MachineAuthorityRights::VIRTUALIZE);
 
-        let error = build_program_child_authority(
+        let error = build_child_authority(
             &ProcessAuthority::root(),
             vec![machine_grant(vec![MachineRight::Virtualize])],
         )
@@ -1883,15 +2257,15 @@ mod authority_tests {
         assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
 
         let mut cpu_ctrl_only = ProcessAuthority::empty();
-        cpu_ctrl_only.grant_machine_rights(MachineAuthorityRights::CONTROL_PROCESSORS);
-        let error = build_program_child_authority(
+        cpu_ctrl_only.grant_machine_rights(MachineAuthorityRights::CONTROL);
+        let error = build_child_authority(
             &cpu_ctrl_only,
             vec![machine_grant(vec![MachineRight::Virtualize])],
         )
-        .expect_err("control-processors right must not escalate to virtualize");
+        .expect_err("machine control right must not escalate to virtualize");
         assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
 
-        let error = build_program_child_authority(&caller, vec![machine_grant(Vec::new())])
+        let error = build_child_authority(&caller, vec![machine_grant(Vec::new())])
             .expect_err("an empty machine grant is a mistake");
         assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
     }
@@ -1900,7 +2274,7 @@ mod authority_tests {
     fn debugger_authority_hands_the_virtualize_right_to_what_it_launches() {
         let debugger = super::debugger_authority();
 
-        let child = build_program_child_authority(
+        let child = build_child_authority(
             &debugger,
             vec![machine_grant(vec![MachineRight::Virtualize])],
         )
@@ -1914,9 +2288,8 @@ mod authority_tests {
         let mut caller = ProcessAuthority::empty();
         caller.grant_device_classes(DeviceClassRights::DISPLAY | DeviceClassRights::INPUT);
 
-        let child =
-            build_program_child_authority(&caller, vec![device_grant(vec![DeviceClass::Input])])
-                .expect("device child grant may derive a subset");
+        let child = build_child_authority(&caller, vec![device_grant(vec![DeviceClass::Input])])
+            .expect("device child grant may derive a subset");
 
         assert_eq!(child.device_class_rights(), DeviceClassRights::INPUT);
         assert!(child.granted_devices().is_empty());
@@ -1929,7 +2302,7 @@ mod authority_tests {
     fn debugger_authority_hands_every_device_class_to_what_it_launches() {
         let debugger = super::debugger_authority();
 
-        let child = build_program_child_authority(
+        let child = build_child_authority(
             &debugger,
             vec![device_grant(vec![
                 DeviceClass::Display,
@@ -1950,14 +2323,14 @@ mod authority_tests {
         let mut caller = ProcessAuthority::empty();
         caller.grant_device_classes(DeviceClassRights::DISPLAY);
 
-        let error = build_program_child_authority(
+        let error = build_child_authority(
             &caller,
             vec![device_grant(vec![DeviceClass::Display, DeviceClass::Gpu])],
         )
         .expect_err("GPU must not be created from display-only authority");
         assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
 
-        let error = build_program_child_authority(
+        let error = build_child_authority(
             &ProcessAuthority::root(),
             vec![device_grant(vec![DeviceClass::Display])],
         )
@@ -1967,7 +2340,7 @@ mod authority_tests {
 
     #[test]
     fn explicit_grant_derives_subset_from_caller_authority() {
-        let child = build_program_child_authority(
+        let child = build_child_authority(
             &ProcessAuthority::root(),
             vec![directory_grant(
                 "/bin",
@@ -1991,7 +2364,7 @@ mod authority_tests {
 
     #[test]
     fn explicit_root_directory_grant_sets_child_cwd_from_capability() {
-        let child = build_program_child_authority(
+        let child = build_child_authority(
             &ProcessAuthority::root(),
             vec![directory_grant("/", "/", vec![FilesystemRight::Read])],
         )
@@ -2006,7 +2379,7 @@ mod authority_tests {
 
     #[test]
     fn non_read_root_directory_grant_does_not_create_cwd() {
-        let child = build_program_child_authority(
+        let child = build_child_authority(
             &ProcessAuthority::root(),
             vec![directory_grant("/", "/", vec![FilesystemRight::Execute])],
         )
@@ -2023,7 +2396,7 @@ mod authority_tests {
                 .expect("test authority must be valid"),
         );
 
-        let error = build_program_child_authority(
+        let error = build_child_authority(
             &caller,
             vec![directory_grant(
                 "/bin",
@@ -2038,7 +2411,7 @@ mod authority_tests {
 
     #[test]
     fn explicit_grant_rejects_path_escape() {
-        let error = build_program_child_authority(
+        let error = build_child_authority(
             &ProcessAuthority::root(),
             vec![directory_grant("../bin", "/", vec![FilesystemRight::Read])],
         )
@@ -2052,9 +2425,8 @@ mod authority_tests {
         let mut caller = ProcessAuthority::empty();
         caller.grant_network_rights(NetworkAuthorityRights::TCP | NetworkAuthorityRights::DNS);
 
-        let child =
-            build_program_child_authority(&caller, vec![network_grant(vec![NetworkRight::Tcp])])
-                .expect("network child grant may derive a subset");
+        let child = build_child_authority(&caller, vec![network_grant(vec![NetworkRight::Tcp])])
+            .expect("network child grant may derive a subset");
 
         assert_eq!(child.network_rights(), NetworkAuthorityRights::TCP);
     }
@@ -2064,9 +2436,8 @@ mod authority_tests {
         let mut caller = ProcessAuthority::empty();
         caller.grant_network_rights(NetworkAuthorityRights::DNS);
 
-        let error =
-            build_program_child_authority(&caller, vec![network_grant(vec![NetworkRight::Tcp])])
-                .expect_err("TCP must not be created from DNS-only authority");
+        let error = build_child_authority(&caller, vec![network_grant(vec![NetworkRight::Tcp])])
+            .expect_err("TCP must not be created from DNS-only authority");
 
         assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
     }
@@ -2076,11 +2447,9 @@ mod authority_tests {
         let mut caller = ProcessAuthority::empty();
         caller.grant_clock_rights(ClockAuthorityRights::SET_WALL_CLOCK);
 
-        let child = build_program_child_authority(
-            &caller,
-            vec![clock_grant(vec![ClockRight::SetWallClock])],
-        )
-        .expect("clock child grant may derive a subset");
+        let child =
+            build_child_authority(&caller, vec![clock_grant(vec![ClockRight::SetWallClock])])
+                .expect("clock child grant may derive a subset");
 
         assert_eq!(child.clock_rights(), ClockAuthorityRights::SET_WALL_CLOCK);
     }
@@ -2090,11 +2459,9 @@ mod authority_tests {
         let mut caller = ProcessAuthority::empty();
         caller.grant_terminal_rights(TerminalAuthorityRights::OUTPUT);
 
-        let child = build_program_child_authority(
-            &caller,
-            vec![terminal_grant(vec![TerminalRight::Output])],
-        )
-        .expect("terminal child grant may derive a subset");
+        let child =
+            build_child_authority(&caller, vec![terminal_grant(vec![TerminalRight::Output])])
+                .expect("terminal child grant may derive a subset");
 
         assert_eq!(child.terminal_rights(), TerminalAuthorityRights::OUTPUT);
     }
@@ -2104,9 +2471,8 @@ mod authority_tests {
         let mut caller = ProcessAuthority::empty();
         caller.grant_process_rights(ProcessAuthorityRights::SPAWN | ProcessAuthorityRights::JOIN);
 
-        let child =
-            build_program_child_authority(&caller, vec![process_grant(vec![ProcessRight::Spawn])])
-                .expect("process child grant may derive a subset");
+        let child = build_child_authority(&caller, vec![process_grant(vec![ProcessRight::Spawn])])
+            .expect("process child grant may derive a subset");
 
         assert_eq!(child.process_rights(), ProcessAuthorityRights::SPAWN);
     }
@@ -2116,9 +2482,8 @@ mod authority_tests {
         let mut caller = ProcessAuthority::empty();
         caller.grant_process_rights(ProcessAuthorityRights::JOIN);
 
-        let error =
-            build_program_child_authority(&caller, vec![process_grant(vec![ProcessRight::Spawn])])
-                .expect_err("spawn must not be created from join-only authority");
+        let error = build_child_authority(&caller, vec![process_grant(vec![ProcessRight::Spawn])])
+            .expect_err("spawn must not be created from join-only authority");
 
         assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
     }
@@ -2128,7 +2493,7 @@ mod authority_tests {
         let mut caller = ProcessAuthority::empty();
         caller.grant_link_rights(LinkAuthorityRights::SOURCE | LinkAuthorityRights::SYMLINK_READ);
 
-        let child = build_program_child_authority(
+        let child = build_child_authority(
             &caller,
             vec![link_grant(vec![LinkRight::Source, LinkRight::SymlinkRead])],
         )
@@ -2145,11 +2510,9 @@ mod authority_tests {
         let mut caller = ProcessAuthority::empty();
         caller.grant_link_rights(LinkAuthorityRights::SYMLINK_READ);
 
-        let error = build_program_child_authority(
-            &caller,
-            vec![link_grant(vec![LinkRight::SymlinkCreate])],
-        )
-        .expect_err("symlink-create must not be created from readlink-only authority");
+        let error =
+            build_child_authority(&caller, vec![link_grant(vec![LinkRight::SymlinkCreate])])
+                .expect_err("symlink-create must not be created from readlink-only authority");
 
         assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
     }
@@ -2382,6 +2745,14 @@ fn map_process_authority_error(error: ProcessAuthorityError) -> crate::ProgramEx
         | ProcessAuthorityError::TooManyDeviceGrants
         | ProcessAuthorityError::EmptyDiagnosticRights
         | ProcessAuthorityError::DiagnosticGrantExceedsAuthority(_)
+        | ProcessAuthorityError::InspectReadMissing
+        | ProcessAuthorityError::TraceReadMissing
+        | ProcessAuthorityError::ProfileReadMissing
+        | ProcessAuthorityError::InstanceControlMissing
+        | ProcessAuthorityError::InspectReadExceedsAuthority { .. }
+        | ProcessAuthorityError::TraceReadExceedsAuthority { .. }
+        | ProcessAuthorityError::ProfileReadExceedsAuthority { .. }
+        | ProcessAuthorityError::InstanceControlExceedsAuthority { .. }
         | ProcessAuthorityError::EmptySettingsRights
         | ProcessAuthorityError::SettingsGrantExceedsAuthority(_)
         | ProcessAuthorityError::EmptyMachineRights
@@ -2446,10 +2817,15 @@ where
 fn debugger_authority() -> ProcessAuthority {
     let mut authority = ProcessAuthority::root();
     authority.grant_device_classes(DeviceClassRights::all());
-    authority.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+    authority.grant_inspect_read(AuthorityScope::Machine);
+    authority.grant_trace_read(AuthorityScope::Machine);
+    authority.grant_profile_read(AuthorityScope::Machine);
+    authority.grant_diagnostic_rights(DiagnosticAuthorityRights::CONTROL);
+    authority.grant_instance_control(AuthorityScope::Machine);
     authority.grant_settings_rights(SettingsAuthorityRights::WRITE);
     authority.grant_machine_rights(
-        crate::MachineAuthorityRights::CONTROL_PROCESSORS
+        crate::MachineAuthorityRights::CONTROL
+            | crate::MachineAuthorityRights::IDENTITY
             | crate::MachineAuthorityRights::VIRTUALIZE,
     );
     authority
@@ -2541,7 +2917,6 @@ where
         debug_state.clone(),
         instance_registry,
         instance,
-        true,
         debug_state.clone(),
         Vec::new(),
         Vec::new(),
@@ -2602,6 +2977,10 @@ where
     crate::wasmtime_adapter::wasi::http::add_to_linker(&mut linker, &wasi_imports)?;
     add_serial_to_linker(&mut linker)?;
     add_sync_to_linker(&mut linker)?;
+    ipc::add_ipc_to_linker(&mut linker)?;
+    machine_identity::add_machine_identity_to_linker(&mut linker)?;
+    instances_snapshot::add_instances_to_linker(&mut linker)?;
+    instances_snapshot::add_snapshot_to_linker(&mut linker)?;
     match world {
         ComponentBindingSet::System => add_system_to_linker(&mut linker)?,
         ComponentBindingSet::Program => add_program_world_to_linker(&mut linker)?,
@@ -2696,6 +3075,9 @@ where
         if !self.retirement.is_empty() {
             runtime_state.retire_network_handles(&self.retirement);
         }
+        self.retirement.drain_snapshot_releases(|token| {
+            runtime_state.release_snapshot_hold(token);
+        });
     }
 
     fn take_stop(&self) -> Option<wasmtime::Error> {
@@ -2798,8 +3180,6 @@ where
     service::add_audio_to_linker(linker)?;
     service::add_processors_to_linker(linker)?;
     service::add_hv_to_linker(linker)?;
-    add_instances_to_linker(linker)?;
-    add_snapshot_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
     debugger_profiling::add_to_linker(linker)?;
     add_settings_to_linker(linker)?;
@@ -3962,12 +4342,18 @@ where
             }
         };
         // The stream fixes its scope here and keeps it for its life.
-        let visibility = Visibility::of(caller.data());
+        let visibility = Visibility::trace_of(caller.data());
         let reader = match visibility {
-            Visibility::Machine(scope) => {
+            Visibility::None(scope) => {
                 StreamReader::new(&mut caller, TracingStreamProducer::new(filter, scope))?
             }
             Visibility::Own(scope) => {
+                StreamReader::new(&mut caller, TracingStreamProducer::new(filter, scope))?
+            }
+            Visibility::Subtree(scope) => {
+                StreamReader::new(&mut caller, TracingStreamProducer::new(filter, scope))?
+            }
+            Visibility::Machine(scope) => {
                 StreamReader::new(&mut caller, TracingStreamProducer::new(filter, scope))?
             }
         };
@@ -4045,10 +4431,22 @@ macro_rules! impl_profiling_bindings {
                 StorageImpl: crate::Storage,
             {
                 let mut instance = linker.instance(PROFILING_INSTANCE)?;
-                // The controls and the instruction and raw profile reads
-                // need the right to observe the machine; the folded and
-                // metric reads are answered for every caller, within the
-                // scope its authority selects. See `observation`.
+                instance.resource(
+                    "sampling-session",
+                    ResourceType::host::<crate::ComponentSamplingSession>(),
+                    |mut caller, rep| {
+                        let caller_id = caller.data().instance().id();
+                        let resource = Resource::<crate::ComponentSamplingSession>::new_own(rep);
+                        let _ = caller.data_mut().table.delete(resource)?;
+                        crate::audit::diagnostic_gate_change(
+                            caller_id,
+                            "profiling.instruction-sampling",
+                            "stopped",
+                            true,
+                        );
+                        Ok(())
+                    },
+                )?;
                 instance.func_wrap_data("set-enabled", |data, (enabled,): (bool,)| {
                     let result = observation::set_profiling_enabled(data, enabled)
                         .map_err(|Denied| $wit::profiling::ControlError::Denied);
@@ -4089,14 +4487,16 @@ macro_rules! impl_profiling_bindings {
                         Ok((samples,))
                     },
                 )?;
-                instance.func_wrap_data(
-                    "set-instruction-sampling",
-                    |data, (enabled,): (bool,)| {
-                        let result = observation::set_instruction_sampling(data, enabled)
-                            .map_err(convert_instruction_profile_refusal);
-                        Ok((result,))
-                    },
-                )?;
+                instance.func_wrap("start-instruction-sampling", |mut caller, (): ()| {
+                    let result = match observation::start_instruction_sampling(caller.data()) {
+                        Ok(session) => {
+                            let handle = caller.data_mut().table.push(session)?;
+                            Ok(handle)
+                        }
+                        Err(refusal) => Err(convert_instruction_profile_refusal(refusal)),
+                    };
+                    Ok((result,))
+                })?;
                 instance.func_wrap_data("instruction-samples", |data, (): ()| {
                     let profile = observation::instruction_samples(data)?
                         .map(convert_instruction_profile)
@@ -4195,6 +4595,9 @@ macro_rules! impl_profiling_bindings {
                     Refused::Denied => $wit::profiling::InstructionProfileError::Denied,
                     Refused::Failed(crate::InstructionProfileError::NotCaptured) => {
                         $wit::profiling::InstructionProfileError::NotCaptured
+                    }
+                    Refused::Failed(crate::InstructionProfileError::Busy) => {
+                        $wit::profiling::InstructionProfileError::Busy
                     }
                 }
             }
@@ -4328,13 +4731,21 @@ where
             }
         };
         // The stream fixes its scope here and keeps it for its life.
-        let visibility = Visibility::of(caller.data());
+        let visibility = Visibility::trace_of(caller.data());
         let reader = match visibility {
-            Visibility::Machine(scope) => StreamReader::new(
+            Visibility::None(scope) => StreamReader::new(
                 &mut caller,
                 ProgramTracingStreamProducer::new(filter, scope),
             )?,
             Visibility::Own(scope) => StreamReader::new(
+                &mut caller,
+                ProgramTracingStreamProducer::new(filter, scope),
+            )?,
+            Visibility::Subtree(scope) => StreamReader::new(
+                &mut caller,
+                ProgramTracingStreamProducer::new(filter, scope),
+            )?,
+            Visibility::Machine(scope) => StreamReader::new(
                 &mut caller,
                 ProgramTracingStreamProducer::new(filter, scope),
             )?,
@@ -4758,86 +5169,10 @@ fn convert_program_udp_error(error: crate::UdpError) -> program_wit::net::UdpErr
     }
 }
 
-fn add_instances_to_linker<CpuImpl, Net, StorageImpl>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
-) -> wasmtime::Result<()>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let mut instance = linker.instance(INSTANCES_INSTANCE)?;
-    instance.func_wrap_data("snapshot", |data, (): ()| {
-        Ok((data
-            .instance_registry
-            .snapshot(data.now_nanos())
-            .into_iter()
-            .map(convert_instance)
-            .collect::<Vec<_>>(),))
-    })?;
-    instance.func_wrap_data("kill", |data, (id,): (u64,)| {
-        let now = data.now_nanos();
-        let victim = InstanceId::from_raw(id);
-        // The flag and the interruption are all this does: the victim
-        // unwinds at its next check, and whoever owns it — a plugin
-        // supervisor, or nobody — decides what happens after.
-        // Before the registry's lock, never under it: see `UserResidency`.
-        let residency = super::store::user_residency();
-        let outcome =
-            data.instance_registry
-                .request_kill(victim, KillReason::Operator, now, &residency);
-        Ok((match outcome {
-            KillOutcome::Requested => {
-                deliver_kill(&data.runtime_state, victim);
-                Ok(())
-            }
-            KillOutcome::AlreadyStopping => {
-                Err(debugger_wit::instances::KillError::AlreadyStopping)
-            }
-            KillOutcome::NoSuchInstance => Err(debugger_wit::instances::KillError::NoSuchInstance),
-        },))
-    })?;
-    Ok(())
-}
-
-fn add_snapshot_to_linker<CpuImpl, Net, StorageImpl>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
-) -> wasmtime::Result<()>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let mut instance = linker.instance(SNAPSHOT_INSTANCE)?;
-    instance.func_wrap_concurrent(
-        "prepare",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>, (): ()| {
-            Box::pin(async move {
-                let (host_fs, has_generation_id) = accessor.with(|mut access| {
-                    let state = &access.get().runtime_state;
-                    (
-                        state.host_fs_service(),
-                        state.machine_generation().has_window(),
-                    )
-                });
-                // A machine with no host share has nothing to release.
-                if let Some(host_fs) = host_fs {
-                    host_fs.prepare_snapshot().await;
-                }
-                Ok::<_, wasmtime::Error>((debugger_wit::snapshot::Prepared { has_generation_id },))
-            })
-        },
-    )?;
-    instance.func_wrap_data(
-        "finished",
-        |data: &mut StoreData<CpuImpl, Net, StorageImpl>, (): ()| {
-            if let Some(host_fs) = data.runtime_state.host_fs_service() {
-                host_fs.snapshot_finished();
-            }
-            Ok(())
-        },
-    )?;
-    Ok(())
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("serial port handle lacks {operation} authority")]
+struct SerialPermissionDenied {
+    operation: &'static str,
 }
 
 impl<CpuImpl, Net, StorageImpl> debugger_wit::serial::Host for StoreData<CpuImpl, Net, StorageImpl>
@@ -4858,12 +5193,17 @@ where
     fn debug_port(
         mut access: Access<'_, U, Self>,
     ) -> wasmtime::Result<Option<Resource<SbiSerialPort>>> {
-        match access.get().debug_port() {
-            Some(()) => Ok(Some(access.get().table.push(SbiSerialPort {
-                _resource: SerialPortResource,
-            })?)),
-            None => Ok(None),
+        let authority = access.get().process_authority();
+        let can_read = authority.derive_terminal_input_cap().is_ok();
+        let can_write = authority.derive_terminal_output_cap().is_ok();
+        if !can_read && !can_write {
+            return Ok(None);
         }
+        Ok(Some(access.get().table.push(SbiSerialPort {
+            can_read,
+            can_write,
+            _resource: SerialPortResource,
+        })?))
     }
 }
 
@@ -4887,10 +5227,16 @@ where
         mut access: Access<'_, U, Self>,
         resource: Resource<SbiSerialPort>,
     ) -> wasmtime::Result<debugger_wit::serial::SerialRights> {
-        let _ = access.get().table.get(&resource)?;
-        Ok(debugger_wit::serial::SerialRights::READ
-            | debugger_wit::serial::SerialRights::WRITE
-            | debugger_wit::serial::SerialRights::FLUSH)
+        let port = access.get().table.get(&resource)?;
+        let mut rights = debugger_wit::serial::SerialRights::empty();
+        if port.can_read {
+            rights |= debugger_wit::serial::SerialRights::READ;
+        }
+        if port.can_write {
+            rights |= debugger_wit::serial::SerialRights::WRITE
+                | debugger_wit::serial::SerialRights::FLUSH;
+        }
+        Ok(rights)
     }
 
     fn drop(
@@ -4907,7 +5253,12 @@ where
         max_bytes: u32,
     ) -> wasmtime::Result<Vec<u8>> {
         let writer = accessor.with(|mut access| {
-            let _ = access.get().table.get(&resource)?;
+            let port = access.get().table.get(&resource)?;
+            if !port.can_read {
+                return Err(wasmtime::Error::new(SerialPermissionDenied {
+                    operation: "read",
+                }));
+            }
             Ok::<_, wasmtime::Error>(access.get().serial_writer())
         })?;
         // Arm the console's receive wait before polling the
@@ -4929,7 +5280,12 @@ where
         bytes: Vec<u8>,
     ) -> wasmtime::Result<()> {
         let writer = accessor.with(|mut access| {
-            let _ = access.get().table.get(&resource)?;
+            let port = access.get().table.get(&resource)?;
+            if !port.can_write {
+                return Err(wasmtime::Error::new(SerialPermissionDenied {
+                    operation: "write",
+                }));
+            }
             Ok::<_, wasmtime::Error>(access.get().serial_writer())
         })?;
         // One call is one segment. The debugger's transport puts a
@@ -4951,7 +5307,12 @@ where
         mut access: Access<'_, U, Self>,
         resource: Resource<SbiSerialPort>,
     ) -> wasmtime::Result<()> {
-        let _ = access.get().table.get(&resource)?;
+        let port = access.get().table.get(&resource)?;
+        if !port.can_write {
+            return Err(wasmtime::Error::new(SerialPermissionDenied {
+                operation: "flush",
+            }));
+        }
         Ok(())
     }
 }
@@ -5388,7 +5749,9 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    convert_sample(store.runtime_state.snapshot(store.cpu.now().ticks()))
+    let mut sample = store.runtime_state.snapshot(store.cpu.now().ticks());
+    sample.restrict_to(store.process_authority());
+    convert_sample(sample)
 }
 
 fn snapshot_program_sample<CpuImpl, Net, StorageImpl>(
@@ -5740,18 +6103,6 @@ fn convert_program_sample(sample: StatsSample) -> program_wit::stats::Sample {
         devices: convert_device_stats!(program_wit::stats, sample.devices),
         inputs: convert_input_stats!(program_wit::stats, sample.inputs),
         audio: convert_audio_stats!(program_wit::stats, sample.audio),
-    }
-}
-
-fn convert_instance(instance: crate::InstanceSnapshot) -> debugger_wit::instances::Instance {
-    debugger_wit::instances::Instance {
-        id: instance.id.raw(),
-        name: instance.name,
-        started_at: instance.started_at,
-        uptime: instance.uptime,
-        memory_bytes: instance.memory_bytes,
-        storage_bytes: instance.storage_bytes,
-        cpu_busy: instance.cpu_busy,
     }
 }
 
@@ -6125,5 +6476,163 @@ mod tests {
             fixture.drain();
             assert_eq!(fixture.timer.registered_sleeps(), 0);
         }
+    }
+
+    #[test]
+    fn serial_debug_port_enforces_terminal_input_and_output_rights_independently() {
+        use super::debugger_wit::serial::{HostSerialPortWithStore, HostWithStore, SerialRights};
+        use crate::wasmtime_adapter::component_host::service::test_store::{
+            TestStoreData, store_data_authorized,
+        };
+        use crate::wasmtime_adapter::engine::build_component_engine_for_platform;
+        use crate::{ProcessAuthority, TerminalAuthorityRights};
+        use futures_lite::future::block_on;
+        use wasmtime::Store;
+        use wasmtime::component::{HasSelf, Resource};
+
+        let engine =
+            build_component_engine_for_platform(&crate::test_support::TestCpu::with_entropy(0x66))
+                .unwrap();
+
+        // 1. Empty authority gets no serial port.
+        let mut empty_store = Store::new(
+            &engine,
+            store_data_authorized(ProcessAuthority::empty(), |_| {}),
+        );
+        let none_port = block_on(empty_store.run_concurrent(async |accessor| {
+            accessor.with(<HasSelf<TestStoreData> as HostWithStore<_>>::debug_port)
+        }))
+        .unwrap()
+        .unwrap();
+        assert!(none_port.is_none());
+
+        // 2. `INPUT`-only authority gets READ right only; write and flush are refused.
+        let mut input_only = ProcessAuthority::empty();
+        input_only.grant_terminal_rights(TerminalAuthorityRights::INPUT);
+        let mut input_store = Store::new(&engine, store_data_authorized(input_only, |_| {}));
+        block_on(input_store.run_concurrent(async |accessor| {
+            let port = accessor
+                .with(<HasSelf<TestStoreData> as HostWithStore<_>>::debug_port)
+                .unwrap()
+                .expect("INPUT authority must obtain a read-only serial port");
+            let rights = accessor
+                .with(|access| {
+                    <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::rights(
+                        access,
+                        Resource::new_borrow(port.rep()),
+                    )
+                })
+                .unwrap();
+            assert_eq!(rights, SerialRights::READ);
+            assert!(
+                <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::write(
+                    accessor,
+                    Resource::new_borrow(port.rep()),
+                    b"blocked".to_vec(),
+                )
+                .await
+                .is_err(),
+                "INPUT-only serial port must refuse write"
+            );
+            assert!(
+                accessor
+                    .with(|access| {
+                        <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::flush(
+                            access,
+                            Resource::new_borrow(port.rep()),
+                        )
+                    })
+                    .is_err(),
+                "INPUT-only serial port must refuse flush"
+            );
+            accessor
+                .with(|access| {
+                    <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::drop(access, port)
+                })
+                .unwrap();
+        }))
+        .unwrap();
+
+        // 3. `OUTPUT`-only authority gets WRITE | FLUSH only; read is refused, write & flush succeed.
+        let mut output_only = ProcessAuthority::empty();
+        output_only.grant_terminal_rights(TerminalAuthorityRights::OUTPUT);
+        let mut output_store = Store::new(&engine, store_data_authorized(output_only, |_| {}));
+        block_on(output_store.run_concurrent(async |accessor| {
+            let port = accessor
+                .with(<HasSelf<TestStoreData> as HostWithStore<_>>::debug_port)
+                .unwrap()
+                .expect("OUTPUT authority must obtain a write-only serial port");
+            let rights = accessor
+                .with(|access| {
+                    <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::rights(
+                        access,
+                        Resource::new_borrow(port.rep()),
+                    )
+                })
+                .unwrap();
+            assert_eq!(rights, SerialRights::WRITE | SerialRights::FLUSH);
+            assert!(
+                <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::read(
+                    accessor,
+                    Resource::new_borrow(port.rep()),
+                    16,
+                )
+                .await
+                .is_err(),
+                "OUTPUT-only serial port must refuse read"
+            );
+            <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::write(
+                accessor,
+                Resource::new_borrow(port.rep()),
+                b"ok".to_vec(),
+            )
+            .await
+            .expect("OUTPUT-only serial port must allow write");
+            accessor
+                .with(|access| {
+                    <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::flush(
+                        access,
+                        Resource::new_borrow(port.rep()),
+                    )
+                })
+                .expect("OUTPUT-only serial port must allow flush");
+            accessor
+                .with(|access| {
+                    <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::drop(access, port)
+                })
+                .unwrap();
+        }))
+        .unwrap();
+
+        // 4. `INPUT | OUTPUT` gets READ | WRITE | FLUSH.
+        let mut both = ProcessAuthority::empty();
+        both.grant_terminal_rights(
+            TerminalAuthorityRights::INPUT | TerminalAuthorityRights::OUTPUT,
+        );
+        let mut both_store = Store::new(&engine, store_data_authorized(both, |_| {}));
+        block_on(both_store.run_concurrent(async |accessor| {
+            let port = accessor
+                .with(<HasSelf<TestStoreData> as HostWithStore<_>>::debug_port)
+                .unwrap()
+                .expect("INPUT | OUTPUT authority must obtain a full serial port");
+            let rights = accessor
+                .with(|access| {
+                    <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::rights(
+                        access,
+                        Resource::new_borrow(port.rep()),
+                    )
+                })
+                .unwrap();
+            assert_eq!(
+                rights,
+                SerialRights::READ | SerialRights::WRITE | SerialRights::FLUSH
+            );
+            accessor
+                .with(|access| {
+                    <HasSelf<TestStoreData> as HostSerialPortWithStore<_>>::drop(access, port)
+                })
+                .unwrap();
+        }))
+        .unwrap();
     }
 }

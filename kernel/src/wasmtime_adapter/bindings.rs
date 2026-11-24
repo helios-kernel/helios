@@ -18,6 +18,9 @@ pub mod debugger {
             with: {
                 "helios:system/programs.child": crate::ChildHandle,
                 "helios:system/programs.container": crate::ContainerHandle,
+                "helios:system/ipc.endpoint": crate::IpcEndpoint,
+                "helios:system/snapshot.snapshot-hold": crate::ComponentSnapshotHold,
+                "helios:system/profiling.sampling-session": crate::ComponentSamplingSession,
                 "helios:system/serial.serial-port": crate::ComponentSerialPort,
                 "helios:system/vsock.vsock-stream": crate::wasmtime_adapter::component_host::ComponentVsockStream,
                 "helios:system/vsock.vsock-listener": crate::wasmtime_adapter::component_host::ComponentVsockListener,
@@ -54,6 +57,9 @@ pub mod program {
             with: {
                 "helios:system/programs.child": crate::ChildHandle,
                 "helios:system/programs.container": crate::ContainerHandle,
+                "helios:system/ipc.endpoint": crate::IpcEndpoint,
+                "helios:system/snapshot.snapshot-hold": crate::ComponentSnapshotHold,
+                "helios:system/profiling.sampling-session": crate::ComponentSamplingSession,
                 "helios:system/serial.serial-port": crate::ComponentSerialPort,
                 "helios:system/vsock.vsock-stream": crate::wasmtime_adapter::component_host::ComponentVsockStream,
                 "helios:system/vsock.vsock-listener": crate::wasmtime_adapter::component_host::ComponentVsockListener,
@@ -356,6 +362,82 @@ pub mod btrfs {
             world: "btrfs-host",
             imports: {
                 default: trappable,
+            },
+            require_store_data_send: true,
+        });
+    }
+}
+
+/// Bindings for bounded duplex capability channels (`helios:system/ipc`)
+/// served identically across both program worlds.
+pub mod ipc {
+    pub mod bindings {
+        use wasmtime;
+
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "ipc-host",
+            imports: {
+                default: trappable,
+            },
+            with: {
+                "helios:system/ipc.endpoint": crate::IpcEndpoint,
+            },
+            require_store_data_send: true,
+        });
+    }
+}
+
+/// Bindings for Ed25519 machine-identity challenge signing
+/// (`helios:system/machine-identity`).
+pub mod machine_identity {
+    pub mod bindings {
+        use wasmtime;
+
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "machine-identity-host",
+            imports: {
+                default: trappable,
+            },
+            additional_derives: [PartialEq, Eq],
+            require_store_data_send: true,
+        });
+    }
+}
+
+/// Bindings for scoped live instance inspection and kill
+/// (`helios:system/instances`).
+pub mod instances {
+    pub mod bindings {
+        use wasmtime;
+
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "instances-host",
+            imports: {
+                default: trappable,
+            },
+            additional_derives: [PartialEq, Eq],
+            require_store_data_send: true,
+        });
+    }
+}
+
+/// Bindings for RAII host-share snapshot preparation
+/// (`helios:system/snapshot`).
+pub mod snapshot {
+    pub mod bindings {
+        use wasmtime;
+
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "snapshot-host",
+            imports: {
+                default: trappable,
+            },
+            with: {
+                "helios:system/snapshot.snapshot-hold": crate::ComponentSnapshotHold,
             },
             require_store_data_send: true,
         });

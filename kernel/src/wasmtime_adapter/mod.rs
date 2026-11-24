@@ -265,11 +265,6 @@ where
         // A system component is kernel-launched: its tree descends from
         // the root namespace and sees the kernel's mounts.
         let filesystem = context.host_filesystem_state.root_namespace().descend();
-        let debug_port = if context.has_debug_port {
-            Some(())
-        } else {
-            None
-        };
 
         let (mut store, interrupts) = store_with_state(
             engine,
@@ -281,7 +276,6 @@ where
                 context.runtime_state,
                 context.instance_registry,
                 context.instance,
-                debug_port,
                 filesystem,
                 context.arguments,
                 context.environment,
@@ -289,7 +283,8 @@ where
                 context.output_mode,
                 context.serial_reader,
                 context.serial_writer,
-            ),
+            )
+            .with_ipc_grants(context.ipc_grants),
         );
 
         let turns = store.data().guest_turns();
