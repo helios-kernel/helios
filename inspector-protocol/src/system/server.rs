@@ -19,6 +19,8 @@
 //! intra-future wakeup that the executor already handles.
 
 use std::cell::Cell;
+#[cfg(feature = "guest")]
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::future::Future;
@@ -66,6 +68,10 @@ pub trait Dispatcher {
 #[derive(Clone, Default)]
 pub struct Invocations {
     running: Rc<Cell<usize>>,
+    #[cfg(feature = "guest")]
+    snapshot_hold: Rc<RefCell<Option<helios_api::snapshot::SnapshotHold>>>,
+    #[cfg(feature = "guest")]
+    sampling_session: Rc<RefCell<Option<helios_api::profiling::SamplingSession>>>,
 }
 
 impl Invocations {
@@ -76,6 +82,19 @@ impl Invocations {
             .get()
             .checked_sub(1)
             .expect("an invocation asks about the others only while it is itself counted")
+    }
+
+    #[cfg(feature = "guest")]
+    pub(crate) fn set_snapshot_hold(&self, hold: Option<helios_api::snapshot::SnapshotHold>) {
+        *self.snapshot_hold.borrow_mut() = hold;
+    }
+
+    #[cfg(feature = "guest")]
+    pub(crate) fn set_sampling_session(
+        &self,
+        session: Option<helios_api::profiling::SamplingSession>,
+    ) {
+        *self.sampling_session.borrow_mut() = session;
     }
 
     fn start(&self) -> RunningInvocation {

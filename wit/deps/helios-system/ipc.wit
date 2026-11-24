@@ -1,0 +1,41 @@
+package helios:system@0.1.0;
+
+/// Bounded duplex byte channels whose endpoints travel as capabilities across
+/// `helios:system/programs.spawn`.
+interface ipc {
+  /// Why an IPC channel operation could not complete.
+  enum ipc-error {
+    /// This direction of the channel has been closed by either endpoint.
+    closed,
+  }
+
+  /// One end of a bounded duplex channel.
+  ///
+  /// Dropping an endpoint closes both its transmit and receive halves,
+  /// delivering end-of-file to a peer reading from it and `ipc-error.closed`
+  /// to a peer writing to it.
+  resource endpoint {
+    /// Reads up to `max-bytes` octets sent by the peer.
+    ///
+    /// Returns `ok(none)` once the peer has closed its transmit half (or
+    /// dropped its endpoint) and all buffered octets have been drained.
+    read: async func(max-bytes: u32) -> result<option<list<u8>>, ipc-error>;
+
+    /// Writes all of `bytes` to the peer, suspending while the bounded
+    /// channel is full.
+    write: async func(bytes: list<u8>) -> result<_, ipc-error>;
+
+    /// Closes the transmit half of this endpoint so the peer observes
+    /// orderly end-of-file while this endpoint can still read from the peer.
+    close-write: func();
+  }
+
+  /// Creates a connected pair of bounded duplex endpoints.
+  channel: func() -> tuple<endpoint, endpoint>;
+
+  /// Claims an endpoint granted to this instance at launch under `name`.
+  ///
+  /// Each granted name can be claimed at most once; subsequent calls for the
+  /// same name, or for a name that was not granted, return `none`.
+  take: func(name: string) -> option<endpoint>;
+}

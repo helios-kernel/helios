@@ -768,7 +768,6 @@ mod tests {
             runtime_state.clone(),
             registry,
             instance,
-            None,
             runtime_state.root_namespace().descend(),
             Vec::new(),
             Vec::new(),
@@ -818,7 +817,7 @@ mod tests {
         ));
 
         let mut cpu_ctrl_only = ProcessAuthority::root();
-        cpu_ctrl_only.grant_machine_rights(MachineAuthorityRights::CONTROL_PROCESSORS);
+        cpu_ctrl_only.grant_machine_rights(MachineAuthorityRights::CONTROL);
         let mut cpu_ctrl_store = hv_store_data(cpu_ctrl_only);
         assert!(matches!(
             HostVm::create(&mut cpu_ctrl_store, 128 << 20).unwrap(),

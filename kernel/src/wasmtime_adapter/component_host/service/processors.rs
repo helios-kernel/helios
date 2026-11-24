@@ -83,32 +83,44 @@ where
         accessor: &Accessor<U, Self>,
         processor: processors_wit::ProcessorId,
     ) -> wasmtime::Result<Result<(), processors_wit::OfflineError>> {
-        let control = accessor.with(|mut access| {
+        let (caller_id, control) = accessor.with(|mut access| {
             let data = access.get();
-            data.process_authority()
-                .derive_control_processors_cap()
-                .map(|_| data.spawner().processor_control())
+            (
+                data.instance().id(),
+                data.process_authority()
+                    .derive_machine_control_cap()
+                    .map(|_| data.spawner().processor_control()),
+            )
         });
         let Ok(control) = control else {
+            crate::audit::processor_transition(caller_id, processor, "offline", false);
             return Ok(Err(processors_wit::OfflineError::Denied));
         };
-        Ok(offline(&control, processor).await)
+        let result = offline(&control, processor).await;
+        crate::audit::processor_transition(caller_id, processor, "offline", result.is_ok());
+        Ok(result)
     }
 
     async fn online(
         accessor: &Accessor<U, Self>,
         processor: processors_wit::ProcessorId,
     ) -> wasmtime::Result<Result<(), processors_wit::OnlineError>> {
-        let control = accessor.with(|mut access| {
+        let (caller_id, control) = accessor.with(|mut access| {
             let data = access.get();
-            data.process_authority()
-                .derive_control_processors_cap()
-                .map(|_| data.spawner().processor_control())
+            (
+                data.instance().id(),
+                data.process_authority()
+                    .derive_machine_control_cap()
+                    .map(|_| data.spawner().processor_control()),
+            )
         });
         let Ok(control) = control else {
+            crate::audit::processor_transition(caller_id, processor, "online", false);
             return Ok(Err(processors_wit::OnlineError::Denied));
         };
-        Ok(online(&control, processor).await)
+        let result = online(&control, processor).await;
+        crate::audit::processor_transition(caller_id, processor, "online", result.is_ok());
+        Ok(result)
     }
 }
 
