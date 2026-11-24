@@ -639,19 +639,11 @@ def test_btrfs_fuzz_installs_toolchain_before_running_fuzz():
     )
     steps = workflow["jobs"]["test-btrfs-fuzz"]["steps"]
     install_idx = next(
-        (
-            i
-            for i, step in enumerate(steps)
-            if "rustup toolchain install" in step.get("run", "")
-        ),
+        (i for i, step in enumerate(steps) if "rustup toolchain install" in step.get("run", "")),
         None,
     )
     fuzz_idx = next(
-        (
-            i
-            for i, step in enumerate(steps)
-            if "tools/btrfs/run.py fuzz" in step.get("run", "")
-        ),
+        (i for i, step in enumerate(steps) if "tools/btrfs/run.py fuzz" in step.get("run", "")),
         None,
     )
     assert install_idx is not None, "test-btrfs-fuzz must install the pinned Rust toolchain"
