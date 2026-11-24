@@ -5051,7 +5051,8 @@ fn prepare_limine_uefi_image(
         arch_label(command.profile.arch)
     ));
     let cli = discover_helios_cli(command.build.kind)?;
-    let status = Command::new(&cli)
+    let mut limine_command = Command::new(&cli);
+    limine_command
         .arg("limine-uefi-image")
         .arg("--kernel")
         .arg(&kernel)
@@ -5062,12 +5063,9 @@ fn prepare_limine_uefi_image(
         .arg("--baud")
         .arg(command.baud.to_string())
         .arg("--efi-arch")
-        .arg(limine_efi_arch_argument(command.profile.arch))
-        .status()
-        .map_err(|source| BuildStepError::Spawn {
-            label: format!("{}", cli.display()),
-            source,
-        })?;
+        .arg(limine_efi_arch_argument(command.profile.arch));
+    let cli_label = format!("{}", cli.display());
+    let status = run_command_with_spinner(&cli_label, &mut limine_command, &spinner)?;
     if !status.success() {
         spinner.finish_and_clear();
         return Err(BuildStepError::Exited {
@@ -5156,10 +5154,13 @@ fn arch_label(arch: VmArch) -> &'static str {
 
 fn run_step(label: &str, command: &mut Command) -> Result<(), BuildStepError> {
     let spinner = spinner(label);
-    let status = command.status().map_err(|source| BuildStepError::Spawn {
-        label: label.to_owned(),
-        source,
-    })?;
+    let status = match run_command_with_spinner(label, command, &spinner) {
+        Ok(status) => status,
+        Err(error) => {
+            spinner.finish_and_clear();
+            return Err(error);
+        }
+    };
     if status.success() {
         spinner.finish_with_message(format!("{} {}", style("built").green(), label));
         return Ok(());
@@ -5169,6 +5170,162 @@ fn run_step(label: &str, command: &mut Command) -> Result<(), BuildStepError> {
         label: label.to_owned(),
         status,
     })
+}
+
+/// Runs `command` while `spinner` is active on stderr.
+///
+/// When `spinner` is drawing to an interactive terminal, inheriting stdio lets
+/// child tools (such as `cargo` under `helios-cli kernel-prebuild`) write
+/// directly to the same TTY while the 80 ms spinner ticker repaints, scrambling
+/// lines with padding spaces and duplicated spinner frames. Piping both streams
+/// and routing completed lines through [`ProgressBar::println`] lets
+/// `indicatif` clear the spinner line, print the child's line above it, and
+/// redraw the spinner cleanly.
+fn run_command_with_spinner(
+    label: &str,
+    command: &mut Command,
+    spinner: &ProgressBar,
+) -> Result<std::process::ExitStatus, BuildStepError> {
+    if spinner.is_hidden() {
+        return command.status().map_err(|source| BuildStepError::Spawn {
+            label: label.to_owned(),
+            source,
+        });
+    }
+    run_command_piped_to_spinner(label, command, spinner)
+}
+
+fn run_command_piped_to_spinner(
+    label: &str,
+    command: &mut Command,
+    spinner: &ProgressBar,
+) -> Result<std::process::ExitStatus, BuildStepError> {
+    configure_piped_cargo_env(command);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|source| BuildStepError::Spawn {
+        label: label.to_owned(),
+        source,
+    })?;
+    let stdout = child.stdout.take().expect("child stdout was piped");
+    let stderr = child.stderr.take().expect("child stderr was piped");
+
+    let (stdout_result, stderr_result) = std::thread::scope(|scope| {
+        let out_handle = scope.spawn(|| forward_stream_to_spinner(stdout, spinner));
+        let err_result = forward_stream_to_spinner(stderr, spinner);
+        let out_result = out_handle
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("stdout reader thread panicked")));
+        (out_result, err_result)
+    });
+
+    let status = child.wait().map_err(|source| BuildStepError::Spawn {
+        label: label.to_owned(),
+        source,
+    })?;
+    stdout_result.map_err(|source| BuildStepError::Captured {
+        label: label.to_owned(),
+        source,
+    })?;
+    stderr_result.map_err(|source| BuildStepError::Captured {
+        label: label.to_owned(),
+        source,
+    })?;
+    Ok(status)
+}
+
+/// Keeps Cargo's ANSI colors when piped to an interactive spinner while
+/// suppressing Cargo's own `\r` progress bar so it does not compete with ours.
+fn configure_piped_cargo_env(command: &mut Command) {
+    if std::env::var_os("CARGO_TERM_PROGRESS_WHEN").is_none() {
+        command.env("CARGO_TERM_PROGRESS_WHEN", "never");
+    }
+    if std::env::var_os("CARGO_TERM_COLOR").is_none() {
+        command.env("CARGO_TERM_COLOR", "always");
+    }
+}
+
+fn forward_stream_to_spinner(stream: impl io::Read, spinner: &ProgressBar) -> io::Result<()> {
+    forward_lines(io::BufReader::new(stream), |line| spinner.println(line))
+}
+
+fn forward_lines(mut reader: impl io::BufRead, mut emit: impl FnMut(&str)) -> io::Result<()> {
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        let raw = String::from_utf8_lossy(&buf);
+        if let Some(line) = normalize_spinner_line(&raw) {
+            emit(line);
+        }
+    }
+    Ok(())
+}
+
+/// Normalizes a raw line read from a child process before printing above a
+/// spinner.
+///
+/// Plain `\n` / `\r\n` blank lines are preserved (`Some("")`) so multi-line
+/// compiler diagnostics keep their spacing; lines containing carriage-return
+/// overwrites keep only the final non-empty segment so progress-bar clears do
+/// not emit empty lines.
+fn normalize_spinner_line(raw: &str) -> Option<&str> {
+    let trimmed = raw.strip_suffix('\n').unwrap_or(raw);
+    let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
+    if !trimmed.contains('\r') {
+        return Some(trimmed);
+    }
+    trimmed
+        .rsplit('\r')
+        .find(|segment| !segment.trim().is_empty())
+}
+
+/// `io::Write` adapter that forwards completed lines through an active
+/// `indicatif` spinner so `filter_pgo_stderr` never writes raw bytes over the
+/// spinner line on a TTY.
+struct SpinnerLineWriter<'a> {
+    spinner: &'a ProgressBar,
+    pending: Vec<u8>,
+}
+
+impl<'a> SpinnerLineWriter<'a> {
+    fn new(spinner: &'a ProgressBar) -> Self {
+        Self {
+            spinner,
+            pending: Vec::new(),
+        }
+    }
+
+    fn flush_complete_lines(&mut self) {
+        while let Some(newline) = self.pending.iter().position(|&byte| byte == b'\n') {
+            let chunk: Vec<u8> = self.pending.drain(..=newline).collect();
+            let raw = String::from_utf8_lossy(&chunk);
+            if let Some(line) = normalize_spinner_line(&raw) {
+                self.spinner.println(line);
+            }
+        }
+    }
+}
+
+impl io::Write for SpinnerLineWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.pending.extend_from_slice(buf);
+        self.flush_complete_lines();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_complete_lines();
+        if !self.pending.is_empty() {
+            let raw = String::from_utf8_lossy(&self.pending);
+            if let Some(line) = normalize_spinner_line(&raw) {
+                self.spinner.println(line);
+            }
+            self.pending.clear();
+        }
+        Ok(())
+    }
 }
 
 /// The missing-function warnings a profile-use kernel build emitted.
@@ -5230,20 +5387,46 @@ fn run_pgo_kernel_step(
     kernel: &Path,
 ) -> Result<(), BuildStepError> {
     let spinner = spinner(label);
+    let pipe_stdout = !spinner.is_hidden();
+    if pipe_stdout {
+        configure_piped_cargo_env(command);
+        command.stdout(Stdio::piped());
+    }
     command.stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|source| BuildStepError::Spawn {
         label: label.to_owned(),
         source,
     })?;
+    let stdout = pipe_stdout.then(|| {
+        child
+            .stdout
+            .take()
+            .expect("the kernel build's stdout was piped")
+    });
     let stderr = child
         .stderr
         .take()
         .expect("the kernel build's stderr was piped");
-    // Each forwarded line takes the stderr lock for that one write; a
-    // lock held for the whole build would freeze the spinner's ticker
-    // thread on the longest step of the job.
-    let mut forward = io::stderr();
-    let uncovered = match filter_pgo_stderr(label, &mut io::BufReader::new(stderr), &mut forward) {
+    let (stdout_result, uncovered_result) = std::thread::scope(|scope| {
+        let out_handle = stdout.map(|out| scope.spawn(|| forward_stream_to_spinner(out, &spinner)));
+        let uncovered_result = if spinner.is_hidden() {
+            let mut forward = io::stderr();
+            filter_pgo_stderr(label, &mut io::BufReader::new(stderr), &mut forward)
+        } else {
+            let mut forward = SpinnerLineWriter::new(&spinner);
+            let res = filter_pgo_stderr(label, &mut io::BufReader::new(stderr), &mut forward);
+            let _ = io::Write::flush(&mut forward);
+            res
+        };
+        let out_result = match out_handle {
+            Some(handle) => handle
+                .join()
+                .unwrap_or_else(|_| Err(io::Error::other("stdout reader thread panicked"))),
+            None => Ok(()),
+        };
+        (out_result, uncovered_result)
+    });
+    let uncovered = match uncovered_result {
         Ok(uncovered) => uncovered,
         Err(error) => {
             // Reap rather than orphan the build, and leave the spinner
@@ -5257,6 +5440,13 @@ fn run_pgo_kernel_step(
         label: label.to_owned(),
         source,
     })?;
+    if let Err(source) = stdout_result {
+        spinner.finish_and_clear();
+        return Err(BuildStepError::Captured {
+            label: label.to_owned(),
+            source,
+        });
+    }
     if !status.success() {
         spinner.finish_and_clear();
         return Err(BuildStepError::Exited {
@@ -10012,5 +10202,53 @@ mod tests {
         build.kind = KernelBuildProfile::Debug;
         build.guest_programs_profile = Some(GuestProgramsProfile::Release);
         assert_eq!(build.guest_programs_profile(), "release");
+    }
+
+    #[test]
+    fn normalize_spinner_line_preserves_blank_lines_and_collapses_carriage_returns() {
+        assert_eq!(
+            normalize_spinner_line("   Compiling syn v3.0.10\n"),
+            Some("   Compiling syn v3.0.10")
+        );
+        assert_eq!(normalize_spinner_line("line\r\n"), Some("line"));
+        assert_eq!(normalize_spinner_line("\n"), Some(""));
+        assert_eq!(normalize_spinner_line("\r\n"), Some(""));
+        assert_eq!(
+            normalize_spinner_line(
+                "  Building [=> ] 1/10\r  Building [==>] 2/10\r   Compiling foo\n"
+            ),
+            Some("   Compiling foo")
+        );
+        assert_eq!(normalize_spinner_line("   \r   \n"), None);
+    }
+
+    #[test]
+    fn forward_lines_handles_multiline_and_carriage_returns() {
+        let input = b"   Compiling a\n\nold\rnew\n   \r   \nlast without newline";
+        let mut emitted = Vec::new();
+        forward_lines(io::Cursor::new(&input[..]), |line| {
+            emitted.push(line.to_owned())
+        })
+        .expect("cursor read never fails");
+        assert_eq!(
+            emitted,
+            vec!["   Compiling a", "", "new", "last without newline"]
+        );
+    }
+
+    #[test]
+    fn piped_spinner_drains_large_stdout_and_stderr_concurrently_without_deadlock() {
+        let bar = ProgressBar::hidden();
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            "i=0; while [ $i -lt 2000 ]; do \
+               printf 'stdout-line-%04d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n' $i; \
+               printf 'stderr-line-%04d-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\\n' $i >&2; \
+               i=$((i + 1)); \
+             done; exit 7",
+        );
+        let status = run_command_piped_to_spinner("concurrent-streams", &mut command, &bar)
+            .expect("sh should spawn and drain cleanly");
+        assert_eq!(status.code(), Some(7));
     }
 }
