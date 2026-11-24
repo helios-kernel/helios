@@ -146,6 +146,8 @@ bitflags! {
     pub struct MachineAuthorityRights: u8 {
         /// Take processors offline and bring them online.
         const CONTROL_PROCESSORS = 1 << 0;
+        /// Create hardware virtual machines.
+        const VIRTUALIZE = 1 << 1;
     }
 }
 
@@ -266,6 +268,21 @@ pub struct ControlProcessorsCap(MachineAuthorityRights);
 impl ControlProcessorsCap {
     pub const fn required_rights() -> MachineAuthorityRights {
         MachineAuthorityRights::CONTROL_PROCESSORS
+    }
+
+    pub const fn rights(self) -> MachineAuthorityRights {
+        self.0
+    }
+}
+
+/// Proof, checked on the owning task, that the instance may create
+/// hardware virtual machines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VirtualizeCap(MachineAuthorityRights);
+
+impl VirtualizeCap {
+    pub const fn required_rights() -> MachineAuthorityRights {
+        MachineAuthorityRights::VIRTUALIZE
     }
 
     pub const fn rights(self) -> MachineAuthorityRights {
@@ -1186,6 +1203,11 @@ impl ProcessAuthority {
     ) -> Result<ControlProcessorsCap, ProcessAuthorityError> {
         self.derive_machine_rights(ControlProcessorsCap::required_rights())
             .map(ControlProcessorsCap)
+    }
+
+    pub fn derive_virtualize_cap(&self) -> Result<VirtualizeCap, ProcessAuthorityError> {
+        self.derive_machine_rights(VirtualizeCap::required_rights())
+            .map(VirtualizeCap)
     }
 
     pub fn derive_device_class_rights(
@@ -2113,6 +2135,12 @@ mod tests {
         assert!(parent.derive_control_processors_cap().is_ok());
         assert_eq!(
             parent
+                .derive_virtualize_cap()
+                .expect_err("processor-control right must not grant virtualization"),
+            ProcessAuthorityError::MachineGrantExceedsAuthority(MachineAuthorityRights::VIRTUALIZE)
+        );
+        assert_eq!(
+            parent
                 .derive_machine_rights(MachineAuthorityRights::empty())
                 .expect_err("an empty machine grant is a mistake"),
             ProcessAuthorityError::EmptyMachineRights
@@ -2127,11 +2155,34 @@ mod tests {
                 MachineAuthorityRights::CONTROL_PROCESSORS
             )
         );
+        assert_eq!(
+            root.derive_virtualize_cap()
+                .expect_err("root authority does not grant virtualization"),
+            ProcessAuthorityError::MachineGrantExceedsAuthority(MachineAuthorityRights::VIRTUALIZE)
+        );
 
         let mut child = ProcessAuthority::root();
         child.grant_machine_rights(MachineAuthorityRights::CONTROL_PROCESSORS);
         assert!(parent.contains_authority(&child));
         assert!(!root.contains_authority(&child));
+
+        let mut hv_parent = ProcessAuthority::root();
+        hv_parent.grant_machine_rights(MachineAuthorityRights::VIRTUALIZE);
+        assert!(hv_parent.derive_virtualize_cap().is_ok());
+        assert_eq!(
+            hv_parent
+                .derive_control_processors_cap()
+                .expect_err("virtualize right must not grant processor control"),
+            ProcessAuthorityError::MachineGrantExceedsAuthority(
+                MachineAuthorityRights::CONTROL_PROCESSORS
+            )
+        );
+
+        let mut hv_child = ProcessAuthority::root();
+        hv_child.grant_machine_rights(MachineAuthorityRights::VIRTUALIZE);
+        assert!(hv_parent.contains_authority(&hv_child));
+        assert!(!parent.contains_authority(&hv_child));
+        assert!(!root.contains_authority(&hv_child));
     }
 
     #[test]

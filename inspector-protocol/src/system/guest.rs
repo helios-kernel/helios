@@ -527,6 +527,7 @@ fn map_capability_grants_to_host(
 fn map_machine_right_to_host(right: programs::MachineRight) -> host_programs::MachineRight {
     match right {
         programs::MachineRight::ControlProcessors => host_programs::MachineRight::ControlProcessors,
+        programs::MachineRight::Virtualize => host_programs::MachineRight::Virtualize,
     }
 }
 
