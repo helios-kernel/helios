@@ -245,7 +245,7 @@ pub use process::{
     ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, SetWallClockCap,
     SettingsAuthorityRights, SignalAuthority, SpawnAuthority, SymlinkCreateCap, SymlinkReadCap,
     TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, TtyControlCap, UdpCap,
-    UnbindableStdio, UnmountCap, WriteSettingsCap,
+    UnbindableStdio, UnmountCap, VirtualizeCap, WriteSettingsCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,

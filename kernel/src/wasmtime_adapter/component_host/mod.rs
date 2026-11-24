@@ -1385,6 +1385,9 @@ macro_rules! impl_authority_conversion {
                                 $bindings::helios::system::programs::MachineRight::ControlProcessors => {
                                     crate::MachineAuthorityRights::CONTROL_PROCESSORS
                                 }
+                                $bindings::helios::system::programs::MachineRight::Virtualize => {
+                                    crate::MachineAuthorityRights::VIRTUALIZE
+                                }
                             };
                         }
                         let rights = caller_authority
@@ -1666,15 +1669,16 @@ mod authority_tests {
     };
     use crate::{
         ClockAuthorityRights, DeviceClassRights, DiagnosticAuthorityRights,
-        DirectoryAuthorityRights, DirectoryPreopen, LinkAuthorityRights, NetworkAuthorityRights,
-        ProcessAuthority, ProcessAuthorityRights, SettingsAuthorityRights, TerminalAuthorityRights,
+        DirectoryAuthorityRights, DirectoryPreopen, LinkAuthorityRights, MachineAuthorityRights,
+        NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityRights, SettingsAuthorityRights,
+        TerminalAuthorityRights,
     };
 
     use program_wit::programs::{
         CapabilityGrant, ClockGrant, ClockRight, DeviceClass, DeviceGrant, DiagnosticsGrant,
-        DiagnosticsRight, DirectoryGrant, FilesystemRight, LinkGrant, LinkRight, NetworkGrant,
-        NetworkRight, ProcessGrant, ProcessRight, SettingsGrant, SettingsRight, TerminalGrant,
-        TerminalRight,
+        DiagnosticsRight, DirectoryGrant, FilesystemRight, LinkGrant, LinkRight, MachineGrant,
+        MachineRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight, SettingsGrant,
+        SettingsRight, TerminalGrant, TerminalRight,
     };
 
     fn directory_grant(
@@ -1719,6 +1723,10 @@ mod authority_tests {
 
     fn settings_grant(rights: Vec<SettingsRight>) -> CapabilityGrant {
         CapabilityGrant::Settings(SettingsGrant { rights })
+    }
+
+    fn machine_grant(rights: Vec<MachineRight>) -> CapabilityGrant {
+        CapabilityGrant::Machine(MachineGrant { rights })
     }
 
     #[test]
@@ -1845,6 +1853,52 @@ mod authority_tests {
         .expect("the debugger holds the settings right");
 
         assert_eq!(child.settings_rights(), SettingsAuthorityRights::WRITE);
+    }
+
+    #[test]
+    fn virtualize_grant_derives_from_caller_authority_and_refuses_escalation() {
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_machine_rights(MachineAuthorityRights::VIRTUALIZE);
+
+        let child = build_program_child_authority(
+            &caller,
+            vec![machine_grant(vec![MachineRight::Virtualize])],
+        )
+        .expect("a caller holding virtualize may hand it on");
+        assert_eq!(child.machine_rights(), MachineAuthorityRights::VIRTUALIZE);
+
+        let error = build_program_child_authority(
+            &ProcessAuthority::root(),
+            vec![machine_grant(vec![MachineRight::Virtualize])],
+        )
+        .expect_err("root authority holds no virtualize right to hand on");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+
+        let mut cpu_ctrl_only = ProcessAuthority::empty();
+        cpu_ctrl_only.grant_machine_rights(MachineAuthorityRights::CONTROL_PROCESSORS);
+        let error = build_program_child_authority(
+            &cpu_ctrl_only,
+            vec![machine_grant(vec![MachineRight::Virtualize])],
+        )
+        .expect_err("control-processors right must not escalate to virtualize");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+
+        let error = build_program_child_authority(&caller, vec![machine_grant(Vec::new())])
+            .expect_err("an empty machine grant is a mistake");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn debugger_authority_hands_the_virtualize_right_to_what_it_launches() {
+        let debugger = super::debugger_authority();
+
+        let child = build_program_child_authority(
+            &debugger,
+            vec![machine_grant(vec![MachineRight::Virtualize])],
+        )
+        .expect("the debugger holds the virtualize right");
+
+        assert_eq!(child.machine_rights(), MachineAuthorityRights::VIRTUALIZE);
     }
 
     #[test]
@@ -2369,7 +2423,8 @@ where
 
 /// The authority the embedded debugger runs with: everything `root`
 /// grants, plus every device class, the machine-observation right, the
-/// settings-write right and the control-processors right.
+/// settings-write right, the control-processors right and the virtualize
+/// right.
 /// The debugger claims no device itself; it holds the classes because a
 /// program can be handed only what its launcher holds, and the inspector
 /// session runs desktop, input and audio programs through it. It holds
@@ -2378,13 +2433,17 @@ where
 /// shell it launches, whose programs configure the machine. It holds
 /// the control-processors right both for its own
 /// `helios:system/processors` RPC and because the session runs `cpu`
-/// through it.
+/// through it, and the virtualize right because the session runs `vmm`
+/// through its shell.
 fn debugger_authority() -> ProcessAuthority {
     let mut authority = ProcessAuthority::root();
     authority.grant_device_classes(DeviceClassRights::all());
     authority.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
     authority.grant_settings_rights(SettingsAuthorityRights::WRITE);
-    authority.grant_machine_rights(crate::MachineAuthorityRights::CONTROL_PROCESSORS);
+    authority.grant_machine_rights(
+        crate::MachineAuthorityRights::CONTROL_PROCESSORS
+            | crate::MachineAuthorityRights::VIRTUALIZE,
+    );
     authority
 }
 
