@@ -167,6 +167,7 @@ mod guest {
                         host_programs::observe_machine_grant(),
                         host_programs::write_settings_grant(),
                         host_programs::control_processors_grant(),
+                        host_programs::virtualize_grant(),
                     ],
                 })
                 .await

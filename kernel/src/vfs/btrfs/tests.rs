@@ -162,10 +162,12 @@ fn a_compressing_mount_writes_extents_the_reader_reads_back() {
             .expect("writable mount");
             let payload = &payload;
             let client = async move {
+                let payer = crate::StoragePayer::for_test();
                 fs.open(
                     path("text"),
                     OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
                     1_000_000_000,
+                    &payer,
                 )
                 .await
                 .expect("create");
@@ -175,6 +177,7 @@ fn a_compressing_mount_writes_extents_the_reader_reads_back() {
                     WritePosition::At(0),
                     payload.len(),
                     1_000_000_001,
+                    &payer,
                     |offset, bytes| bytes.copy_from_slice(&payload[offset..offset + bytes.len()]),
                 )
                 .await
@@ -275,10 +278,12 @@ fn chunked_stream_writes_coalesce_into_zstd_extents() {
         .expect("writable mount");
         let payload = &payload;
         let client = async move {
+            let payer = crate::StoragePayer::for_test();
             fs.open(
                 path("compressible"),
                 OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
                 1_000_000_000,
+                &payer,
             )
             .await
             .expect("create");
@@ -289,6 +294,7 @@ fn chunked_stream_writes_coalesce_into_zstd_extents() {
                     WritePosition::End,
                     chunk.len(),
                     1_000_000_001 + index as u64,
+                    &payer,
                     |_, bytes| bytes.copy_from_slice(chunk),
                 )
                 .await
@@ -374,16 +380,24 @@ fn prepared_writes_fill_rounds_synchronously_keep_start_offset_and_coalesce() {
         .expect("writable mount");
         let (first_bytes, second_bytes) = (&first_bytes, &second_bytes);
         let client = async move {
+            let payer = crate::StoragePayer::for_test();
             fs.open(
                 path("rounds"),
                 OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
                 1_000_000_000,
+                &payer,
             )
             .await
             .expect("create");
             let drive = async |fs: &BtrfsFs<MemoryDisk>, data: &[u8], stamp: u64| {
                 let mut current = fs
-                    .prepare_write(path("rounds"), WritePosition::End, data.len(), stamp)
+                    .prepare_write(
+                        path("rounds"),
+                        WritePosition::End,
+                        data.len(),
+                        stamp,
+                        &crate::StoragePayer::for_test(),
+                    )
                     .await
                     .expect("prepare");
                 let mut seen_offsets = Vec::new();
@@ -539,7 +553,13 @@ fn special_nodes_are_listed_and_statted_and_never_opened() {
             "{name}"
         );
         assert_eq!(
-            block_on(fs.open(path(name), OpenFlags::empty(), 0)).map(|_| ()),
+            block_on(fs.open(
+                path(name),
+                OpenFlags::empty(),
+                0,
+                &crate::StoragePayer::for_test(),
+            ))
+            .map(|_| ()),
             Err(refusal),
             "open {name}"
         );
@@ -606,12 +626,13 @@ fn mounted_image_preserves_subvolume_identity_links_and_directory_cookies() {
         block_on(fs.read_at(path("link"), 0, 1)),
         Err(FsError::Invalid)
     );
+    let payer = crate::StoragePayer::for_test();
     assert_eq!(
-        block_on(fs.open(path("hello"), OpenFlags::TRUNCATE, 0)).map(drop),
+        block_on(fs.open(path("hello"), OpenFlags::TRUNCATE, 0, &payer)).map(drop),
         Err(FsError::ReadOnly)
     );
     assert_eq!(
-        block_on(fs.open(path("absent"), OpenFlags::CREATE, 0)).map(drop),
+        block_on(fs.open(path("absent"), OpenFlags::CREATE, 0, &payer)).map(drop),
         Err(FsError::ReadOnly)
     );
 
@@ -682,11 +703,12 @@ fn a_writable_mount_links_a_file_created_through_the_namespace() {
     .expect("mount request")
     .expect("a writable btrfs mount returns its service");
     let client = async {
+        let payer = crate::StoragePayer::for_test();
         let resolved = namespace.resolve("/mnt/written").unwrap();
         resolved
             .writable()
             .unwrap()
-            .create_directory(resolved.path(), 1_000_000_000)
+            .create_directory(resolved.path(), 1_000_000_000, &payer)
             .await
             .expect("mkdir");
         let resolved = namespace.resolve("/mnt/written/original").unwrap();
@@ -695,6 +717,7 @@ fn a_writable_mount_links_a_file_created_through_the_namespace() {
             resolved.path(),
             OpenFlags::CREATE | OpenFlags::TRUNCATE,
             1_000_000_001,
+            &payer,
         )
         .await
         .expect("create");
@@ -704,13 +727,19 @@ fn a_writable_mount_links_a_file_created_through_the_namespace() {
             WritePosition::At(0),
             4096,
             1_000_000_002,
+            &payer,
             |_, bytes| bytes.fill(0x50),
         )
         .await
         .expect("write");
         fs.sync(resolved.path()).await.expect("fsync");
         namespace
-            .link("/mnt/written/original", "/mnt/written/hard", 1_000_000_003)
+            .link(
+                "/mnt/written/original",
+                "/mnt/written/hard",
+                1_000_000_003,
+                &payer,
+            )
             .await
             .expect("link through the namespace");
         assert_eq!(
@@ -757,10 +786,12 @@ fn writable_service_publishes_namespace_and_survives_remount() {
             Err(super::BtrfsMountError::Busy)
         ));
         let client = async move {
+            let payer = crate::StoragePayer::for_test();
             fs.open(
                 path("created"),
                 OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
                 1_000_000_000,
+                &payer,
             )
             .await
             .expect("create file");
@@ -768,7 +799,8 @@ fn writable_service_publishes_namespace_and_survives_remount() {
                 fs.open(
                     path("created"),
                     OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
-                    1_000_000_000
+                    1_000_000_000,
+                    &payer,
                 )
                 .await
                 .map(drop),
@@ -781,6 +813,7 @@ fn writable_service_publishes_namespace_and_survives_remount() {
                 WritePosition::At(0),
                 payload.len(),
                 1_000_000_001,
+                &payer,
                 |offset, bytes| bytes.copy_from_slice(&payload[offset..offset + bytes.len()]),
             )
             .await
@@ -797,7 +830,13 @@ fn writable_service_publishes_namespace_and_survives_remount() {
                 payload.as_slice()
             );
             let staged = fs
-                .prepare_write(path("created"), WritePosition::End, 5, 1_000_000_002)
+                .prepare_write(
+                    path("created"),
+                    WritePosition::End,
+                    5,
+                    1_000_000_002,
+                    &payer,
+                )
                 .await
                 .expect("stage without mutation");
             drop(staged);
@@ -806,11 +845,23 @@ fn writable_service_publishes_namespace_and_survives_remount() {
                 payload.len() as u64
             );
             let first = fs
-                .prepare_write(path("created"), WritePosition::End, 3, 1_000_000_003)
+                .prepare_write(
+                    path("created"),
+                    WritePosition::End,
+                    3,
+                    1_000_000_003,
+                    &payer,
+                )
                 .await
                 .unwrap();
             let second = fs
-                .prepare_write(path("created"), WritePosition::End, 2, 1_000_000_004)
+                .prepare_write(
+                    path("created"),
+                    WritePosition::End,
+                    2,
+                    1_000_000_004,
+                    &payer,
+                )
                 .await
                 .unwrap();
             fs.rename(
@@ -818,6 +869,7 @@ fn writable_service_publishes_namespace_and_survives_remount() {
                 path("renamed"),
                 RenameMode::Replace,
                 1_000_000_005,
+                &payer,
             )
             .await
             .expect("rename prepared inode");
@@ -844,10 +896,10 @@ fn writable_service_publishes_namespace_and_survives_remount() {
                 fs.read_at(path("renamed"), 19_000, 5).await.unwrap(),
                 &b"AAABB"[..]
             );
-            fs.create_directory(path("dir"), 2_000_000_000)
+            fs.create_directory(path("dir"), 2_000_000_000, &payer)
                 .await
                 .expect("mkdir");
-            fs.link(path("file"), path("dir/link"), 3_000_000_000)
+            fs.link(path("file"), path("dir/link"), 3_000_000_000, &payer)
                 .await
                 .expect("link");
             fs.rename(
@@ -855,27 +907,36 @@ fn writable_service_publishes_namespace_and_survives_remount() {
                 path("dir/moved"),
                 RenameMode::Replace,
                 4_000_000_000,
+                &payer,
             )
             .await
             .expect("rename");
-            fs.set_size(path("dir/moved"), 7, 5_000_000_000)
+            fs.set_size(path("dir/moved"), 7, 5_000_000_000, &payer)
                 .await
                 .expect("truncate");
-            fs.symlink("moved", path("dir/symlink"), 6_000_000_000)
+            fs.symlink("moved", path("dir/symlink"), 6_000_000_000, &payer)
                 .await
                 .expect("symlink");
             assert_eq!(
-                fs.remove_directory(path("dir"), 7_000_000_000).await,
+                fs.remove_directory(path("dir"), 7_000_000_000, &payer)
+                    .await,
                 Err(FsError::NotEmpty)
             );
             assert_eq!(
-                fs.unlink(path("dir"), 7_000_000_000).await,
+                fs.unlink(path("dir"), 7_000_000_000, &payer).await,
                 Err(FsError::IsDirectory)
             );
-            fs.open(path("dir/deleted"), OpenFlags::CREATE, 7_000_000_000)
+            fs.open(
+                path("dir/deleted"),
+                OpenFlags::CREATE,
+                7_000_000_000,
+                &payer,
+            )
+            .await
+            .unwrap();
+            fs.unlink(path("dir/deleted"), 8_000_000_000, &payer)
                 .await
                 .unwrap();
-            fs.unlink(path("dir/deleted"), 8_000_000_000).await.unwrap();
             let parent = fs.stat(path("dir")).await.unwrap();
             assert_eq!(parent.modified_nanos, 8_000_000_000);
             assert_eq!(parent.status_nanos, 8_000_000_000);
@@ -883,6 +944,7 @@ fn writable_service_publishes_namespace_and_survives_remount() {
                 path("dir/fresh"),
                 OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
                 9_000_000_000,
+                &payer,
             )
             .await
             .expect("create in a created directory");
@@ -892,14 +954,20 @@ fn writable_service_publishes_namespace_and_survives_remount() {
                 WritePosition::At(0),
                 4096,
                 9_000_000_001,
+                &payer,
                 |_, bytes| bytes.fill(0x46),
             )
             .await
             .expect("write the fresh file");
             fs.sync(path("dir/fresh")).await.expect("fsync");
-            fs.link(path("dir/fresh"), path("dir/fresh-link"), 9_000_000_002)
-                .await
-                .expect("link a file created and synced in this mount");
+            fs.link(
+                path("dir/fresh"),
+                path("dir/fresh-link"),
+                9_000_000_002,
+                &payer,
+            )
+            .await
+            .expect("link a file created and synced in this mount");
             fs.sync(path("file")).await.expect("sync commit");
             assert_eq!(
                 fs.read_at(path("file"), 0, 99).await.unwrap(),
@@ -973,17 +1041,18 @@ fn a_node_created_without_an_identity_inherits_from_its_parent() {
                 .await
                 .expect("writable mount");
         let client = async move {
+            let payer = crate::StoragePayer::for_test();
             for (name, ..) in directories {
                 let file = alloc::format!("{name}/ファイル");
-                fs.open(path(&file), OpenFlags::CREATE, 1_000_000_000)
+                fs.open(path(&file), OpenFlags::CREATE, 1_000_000_000, &payer)
                     .await
                     .expect("create");
                 let child = alloc::format!("{name}/하위");
-                fs.create_directory(path(&child), 1_000_000_000)
+                fs.create_directory(path(&child), 1_000_000_000, &payer)
                     .await
                     .expect("mkdir");
                 let link = alloc::format!("{name}/链接");
-                fs.symlink("ファイル", path(&link), 1_000_000_000)
+                fs.symlink("ファイル", path(&link), 1_000_000_000, &payer)
                     .await
                     .expect("symlink");
             }
@@ -1059,6 +1128,7 @@ fn writable_mount_refuses_to_open_special_nodes_and_keeps_them_across_writes() {
                 .await
                 .expect("writable mount");
         let client = async move {
+            let payer = crate::StoragePayer::for_test();
             for (name, expected_kind, expected_err) in [
                 (
                     "chr",
@@ -1083,14 +1153,14 @@ fn writable_mount_refuses_to_open_special_nodes_and_keeps_them_across_writes() {
             ] {
                 assert_eq!(fs.stat(path(name)).await.unwrap().kind, expected_kind);
                 assert_eq!(
-                    fs.open(path(name), OpenFlags::empty(), 1_000_000_000)
+                    fs.open(path(name), OpenFlags::empty(), 1_000_000_000, &payer)
                         .await
                         .map(drop),
                     Err(expected_err),
                     "{name}"
                 );
             }
-            fs.open(path("neighbor"), OpenFlags::CREATE, 1_000_000_000)
+            fs.open(path("neighbor"), OpenFlags::CREATE, 1_000_000_000, &payer)
                 .await
                 .expect("creates regular file beside special nodes");
             drop(fs);
@@ -1118,18 +1188,25 @@ fn writable_service_renames_with_noreplace_and_exchange_and_survives_remount() {
                 .await
                 .expect("writable mount");
         let client = async move {
-            fs.create_directory(path("日本語"), 1_000_000_000)
+            let payer = crate::StoragePayer::for_test();
+            fs.create_directory(path("日本語"), 1_000_000_000, &payer)
                 .await
                 .expect("mkdir");
-            fs.open(path("日本語/한국어"), OpenFlags::CREATE, 1_000_000_001)
-                .await
-                .expect("create");
+            fs.open(
+                path("日本語/한국어"),
+                OpenFlags::CREATE,
+                1_000_000_001,
+                &payer,
+            )
+            .await
+            .expect("create");
             assert_eq!(
                 fs.rename(
                     path("中文"),
                     path("日本語/한국어"),
                     RenameMode::NoReplace,
-                    2_000_000_000
+                    2_000_000_000,
+                    &payer,
                 )
                 .await,
                 Err(FsError::Exists)
@@ -1139,7 +1216,8 @@ fn writable_service_renames_with_noreplace_and_exchange_and_survives_remount() {
                     path("none"),
                     path("none2"),
                     RenameMode::Exchange,
-                    2_000_000_000
+                    2_000_000_000,
+                    &payer,
                 )
                 .await,
                 Err(FsError::NoEntry)
@@ -1149,7 +1227,8 @@ fn writable_service_renames_with_noreplace_and_exchange_and_survives_remount() {
                     path("中文"),
                     path("none2"),
                     RenameMode::Exchange,
-                    2_000_000_000
+                    2_000_000_000,
+                    &payer,
                 )
                 .await,
                 Err(FsError::NoEntry)
@@ -1159,7 +1238,8 @@ fn writable_service_renames_with_noreplace_and_exchange_and_survives_remount() {
                     path("日本語"),
                     path("日本語/한국어"),
                     RenameMode::Exchange,
-                    2_000_000_000
+                    2_000_000_000,
+                    &payer,
                 )
                 .await,
                 Err(FsError::Invalid)
@@ -1169,6 +1249,7 @@ fn writable_service_renames_with_noreplace_and_exchange_and_survives_remount() {
                 path("日本語/한국어"),
                 RenameMode::Exchange,
                 3_000_000_000,
+                &payer,
             )
             .await
             .expect("exchange a file with a file in another directory");
@@ -1177,6 +1258,7 @@ fn writable_service_renames_with_noreplace_and_exchange_and_survives_remount() {
                 path("中文"),
                 RenameMode::Exchange,
                 4_000_000_000,
+                &payer,
             )
             .await
             .expect("exchange a directory with a file");
@@ -1226,10 +1308,12 @@ fn a_full_device_stores_a_prefix_then_refuses_with_no_space() {
         .await
         .expect("writable mount");
         let client = async move {
+            let payer = crate::StoragePayer::for_test();
             fs.open(
                 path(NAME),
                 OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
                 1_000_000_000,
+                &payer,
             )
             .await
             .expect("create file");
@@ -1239,6 +1323,7 @@ fn a_full_device_stores_a_prefix_then_refuses_with_no_space() {
                 WritePosition::At(0),
                 REQUESTED,
                 1_000_000_001,
+                &payer,
                 |offset, bytes| {
                     // Rounds and sectors both start on sector boundaries.
                     for (index, sector) in bytes.chunks_mut(4096).enumerate() {
@@ -1263,6 +1348,7 @@ fn a_full_device_stores_a_prefix_then_refuses_with_no_space() {
                 WritePosition::End,
                 4096,
                 1_000_000_002,
+                &payer,
                 |_, bytes| bytes.fill(0x5a),
             )
             .await;
@@ -1364,11 +1450,13 @@ fn a_change_is_visible_at_once_and_durable_once_a_sync_covers_it() {
                 .expect("writable mount");
         let disk = &disk;
         let client = async move {
+            let payer = crate::StoragePayer::for_test();
             for (index, name) in names.iter().enumerate() {
                 fs.open(
                     path(name),
                     OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
                     1_000_000_000,
+                    &payer,
                 )
                 .await
                 .expect("create");
@@ -1378,6 +1466,7 @@ fn a_change_is_visible_at_once_and_durable_once_a_sync_covers_it() {
                     WritePosition::At(0),
                     4096,
                     1_000_000_001,
+                    &payer,
                     |_, bytes| bytes.fill(0x41 + index as u8),
                 )
                 .await
@@ -1441,7 +1530,8 @@ fn the_commit_interval_commits_a_waiting_change_and_follows_its_operator() {
         };
         let client = async {
             const NAME: &str = "间隔-間隔-간격";
-            fs.open(path(NAME), OpenFlags::CREATE, 1_000_000_000)
+            let payer = crate::StoragePayer::for_test();
+            fs.open(path(NAME), OpenFlags::CREATE, 1_000_000_000, &payer)
                 .await
                 .expect("create");
             advance(4);
@@ -1451,7 +1541,7 @@ fn the_commit_interval_commits_a_waiting_change_and_follows_its_operator() {
             settle(|| durable_generation(disk) == start + 1).await;
 
             fs.set_commit_policy(policy(60)).expect("writable mount");
-            fs.set_times(path(NAME), None, Some(2_000_000_000), 2_000_000_000)
+            fs.set_times(path(NAME), None, Some(2_000_000_000), 2_000_000_000, &payer)
                 .await
                 .expect("touch");
             advance(30);
@@ -1503,7 +1593,8 @@ fn the_dirty_data_bound_writes_back_without_a_commit() {
                 let inode = snapshot.resolve(NAME.as_bytes()).await.unwrap();
                 snapshot.file_extents(&inode).await.unwrap()
             };
-            fs.open(path(NAME), OpenFlags::CREATE, 1_000_000_000)
+            let payer = crate::StoragePayer::for_test();
+            fs.open(path(NAME), OpenFlags::CREATE, 1_000_000_000, &payer)
                 .await
                 .expect("create");
             write_with(
@@ -1512,6 +1603,7 @@ fn the_dirty_data_bound_writes_back_without_a_commit() {
                 WritePosition::At(0),
                 payload.len(),
                 1_000_000_001,
+                &payer,
                 |offset, bytes| bytes.copy_from_slice(&payload[offset..offset + bytes.len()]),
             )
             .await
@@ -1571,13 +1663,14 @@ fn the_dirty_bound_commits_without_a_sync() {
         .expect("writable mount");
         let disk = &disk;
         let client = async {
-            fs.create_directory(path("目录-ディレクトリ-디렉터리"), 1_000_000_000)
+            let payer = crate::StoragePayer::for_test();
+            fs.create_directory(path("目录-ディレクトリ-디렉터리"), 1_000_000_000, &payer)
                 .await
                 .expect("mkdir");
             settle(|| durable_generation(disk) == start + 1).await;
             fs.set_commit_policy(CommitPolicy::machine_default())
                 .expect("writable mount");
-            fs.create_directory(path("目录-ディレクトリ-디렉터리/内"), 2_000_000_000)
+            fs.create_directory(path("目录-ディレクトリ-디렉터리/内"), 2_000_000_000, &payer)
                 .await
                 .expect("mkdir");
             idle().await;
@@ -1609,7 +1702,8 @@ fn unmounting_commits_the_running_transaction() {
                 .expect("writable mount");
         let contents = contents.as_bytes();
         let client = async move {
-            fs.open(path(NAME), OpenFlags::CREATE, 1_000_000_000)
+            let payer = crate::StoragePayer::for_test();
+            fs.open(path(NAME), OpenFlags::CREATE, 1_000_000_000, &payer)
                 .await
                 .expect("create");
             write_with(
@@ -1618,6 +1712,7 @@ fn unmounting_commits_the_running_transaction() {
                 WritePosition::At(0),
                 contents.len(),
                 1_000_000_001,
+                &payer,
                 |offset, bytes| bytes.copy_from_slice(&contents[offset..offset + bytes.len()]),
             )
             .await
@@ -1656,7 +1751,8 @@ fn a_failed_commit_fails_its_sync_and_leaves_the_previous_tree() {
                 .await
                 .expect("writable mount");
         let client = async move {
-            fs.open(path(NAME), OpenFlags::CREATE, 1_000_000_000)
+            let payer = crate::StoragePayer::for_test();
+            fs.open(path(NAME), OpenFlags::CREATE, 1_000_000_000, &payer)
                 .await
                 .expect("create");
             assert!(
@@ -1665,7 +1761,7 @@ fn a_failed_commit_fails_its_sync_and_leaves_the_previous_tree() {
             );
             assert_eq!(fs.sync(path(NAME)).await, Err(FsError::Io));
             assert_eq!(
-                fs.create_directory(path("后来-後で-나중"), 2_000_000_000)
+                fs.create_directory(path("后来-後で-나중"), 2_000_000_000, &payer)
                     .await,
                 Err(FsError::Io)
             );
@@ -1723,7 +1819,8 @@ async fn create_in_namespace(namespace: &Namespace<MemoryStorage>, name: &str, c
     let point = alloc::format!("/mnt/{name}");
     let resolved = namespace.resolve(&point).unwrap();
     let fs = resolved.writable().unwrap();
-    fs.open(resolved.path(), OpenFlags::CREATE, 1_000_000_000)
+    let payer = crate::StoragePayer::for_test();
+    fs.open(resolved.path(), OpenFlags::CREATE, 1_000_000_000, &payer)
         .await
         .expect("create");
     write_with(
@@ -1732,6 +1829,7 @@ async fn create_in_namespace(namespace: &Namespace<MemoryStorage>, name: &str, c
         WritePosition::At(0),
         contents.len(),
         1_000_000_001,
+        &payer,
         |offset, bytes| bytes.copy_from_slice(&contents[offset..offset + bytes.len()]),
     )
     .await
@@ -1883,10 +1981,11 @@ fn the_max_inline_option_bounds_inline_files_and_follows_its_operator() {
         .expect("writable mount");
         let contents = contents.as_bytes();
         let client = async move {
+            let payer = crate::StoragePayer::for_test();
             assert_eq!(fs.max_inline(), Some(1024));
             for (name, max_inline) in [(BEFORE, 1024), (AFTER, 2048)] {
                 fs.set_max_inline(max_inline).expect("writable mount");
-                fs.open(path(name), OpenFlags::CREATE, 1_000_000_000)
+                fs.open(path(name), OpenFlags::CREATE, 1_000_000_000, &payer)
                     .await
                     .expect("create");
                 write_with(
@@ -1895,6 +1994,7 @@ fn the_max_inline_option_bounds_inline_files_and_follows_its_operator() {
                     WritePosition::At(0),
                     contents.len(),
                     1_000_000_001,
+                    &payer,
                     |offset, bytes| bytes.copy_from_slice(&contents[offset..offset + bytes.len()]),
                 )
                 .await
@@ -1962,16 +2062,17 @@ fn open_dir_bounds_iteration_during_renames_and_refreshes_on_rewind() {
         .await
         .expect("writable mount");
         let client = async move {
-            fs.create_directory(path("work"), 1_000_000_000)
+            let payer = crate::StoragePayer::for_test();
+            fs.create_directory(path("work"), 1_000_000_000, &payer)
                 .await
                 .expect("mkdir work");
-            fs.create_directory(path("empty"), 1_000_000_000)
+            fs.create_directory(path("empty"), 1_000_000_000, &payer)
                 .await
                 .expect("mkdir empty");
             let mut expected = Vec::new();
             for name in ["中文", "日本語", "한국어"] {
                 let full = alloc::format!("work/{name}");
-                fs.open(path(&full), OpenFlags::CREATE, 1_000_000_001)
+                fs.open(path(&full), OpenFlags::CREATE, 1_000_000_001, &payer)
                     .await
                     .expect("create cjk file");
                 expected.push(alloc::string::String::from(name));
@@ -1979,7 +2080,7 @@ fn open_dir_bounds_iteration_during_renames_and_refreshes_on_rewind() {
             for i in 0..32 {
                 let name = alloc::format!("entry-{i:02}");
                 let full = alloc::format!("work/{name}");
-                fs.open(path(&full), OpenFlags::CREATE, 1_000_000_001)
+                fs.open(path(&full), OpenFlags::CREATE, 1_000_000_001, &payer)
                     .await
                     .expect("create file");
                 expected.push(name);
@@ -1994,9 +2095,14 @@ fn open_dir_bounds_iteration_during_renames_and_refreshes_on_rewind() {
             // An open stream on an empty directory sees nothing added after
             // open until `rewind` refreshes its bound.
             let mut empty_stream = fs.open_dir(path("empty")).await.expect("open empty");
-            fs.open(path("empty/added"), OpenFlags::CREATE, 1_000_000_002)
-                .await
-                .expect("create after open");
+            fs.open(
+                path("empty/added"),
+                OpenFlags::CREATE,
+                1_000_000_002,
+                &payer,
+            )
+            .await
+            .expect("create after open");
             assert!(
                 empty_stream
                     .read(DirCookie::START, 8)
@@ -2031,6 +2137,7 @@ fn open_dir_bounds_iteration_during_renames_and_refreshes_on_rewind() {
                         path("work/TEMPFILE"),
                         RenameMode::Replace,
                         1_000_000_003,
+                        &payer,
                     )
                     .await
                     .expect("rename to TEMPFILE");
@@ -2039,6 +2146,7 @@ fn open_dir_bounds_iteration_during_renames_and_refreshes_on_rewind() {
                         path(&from),
                         RenameMode::Replace,
                         1_000_000_004,
+                        &payer,
                     )
                     .await
                     .expect("rename back");
@@ -2054,7 +2162,7 @@ fn open_dir_bounds_iteration_during_renames_and_refreshes_on_rewind() {
             assert_eq!(seen, expected);
 
             // After adding a new entry and calling `rewind`, the new entry appears.
-            fs.open(path("work/after"), OpenFlags::CREATE, 1_000_000_005)
+            fs.open(path("work/after"), OpenFlags::CREATE, 1_000_000_005, &payer)
                 .await
                 .expect("create after");
             stream.rewind().await.expect("rewind work");
@@ -2177,7 +2285,11 @@ fn btrfs_management_subvolume_and_snapshot_grants() {
             for dir in ["/mnt/sub/inner", "/mnt/snaps"] {
                 let res = namespace.resolve(dir).unwrap();
                 res.fs()
-                    .create_directory(res.path(), 1_750_000_001_000_000_000)
+                    .create_directory(
+                        res.path(),
+                        1_750_000_001_000_000_000,
+                        &crate::StoragePayer::for_test(),
+                    )
                     .await
                     .unwrap();
             }
@@ -2358,7 +2470,11 @@ fn btrfs_management_send_and_receive_grants() {
             for dir in ["/mnt/sub/inner", "/mnt/snaps", "/mnt/recv"] {
                 let res = namespace.resolve(dir).unwrap();
                 res.fs()
-                    .create_directory(res.path(), 1_750_000_001_000_000_000)
+                    .create_directory(
+                        res.path(),
+                        1_750_000_001_000_000_000,
+                        &crate::StoragePayer::for_test(),
+                    )
                     .await
                     .unwrap();
             }
@@ -2503,7 +2619,12 @@ fn btrfs_management_reflink_and_dedupe_grants() {
             for file in ["/mnt/a.bin", "/mnt/b.bin", "/mnt/c.bin"] {
                 let f = namespace.resolve(file).unwrap();
                 f.fs()
-                    .open(f.path(), OpenFlags::CREATE, 1_750_000_001_000_000_000)
+                    .open(
+                        f.path(),
+                        OpenFlags::CREATE,
+                        1_750_000_001_000_000_000,
+                        &crate::StoragePayer::for_test(),
+                    )
                     .await
                     .unwrap();
                 if file != "/mnt/c.bin" {
@@ -2910,8 +3031,9 @@ fn unlinked_open_handle_retains_inode_until_final_drop_and_isolates_recreated_pa
         .await
         .expect("writable mount");
         let client = async move {
+            let payer = crate::StoragePayer::for_test();
             let opened = fs
-                .open(path("target"), OpenFlags::CREATE, 1_000_000_000)
+                .open(path("target"), OpenFlags::CREATE, 1_000_000_000, &payer)
                 .await
                 .expect("create target");
             let dup = opened.handle.clone();
@@ -2921,13 +3043,14 @@ fn unlinked_open_handle_retains_inode_until_final_drop_and_isolates_recreated_pa
                 WritePosition::At(0),
                 b"original-data".len(),
                 1_000_000_001,
+                &payer,
                 |at, dst| dst.copy_from_slice(&b"original-data"[at..at + dst.len()]),
             )
             .await
             .expect("write original");
 
             // Unlink while two handle clones are live.
-            fs.unlink(path("target"), 1_000_000_002)
+            fs.unlink(path("target"), 1_000_000_002, &payer)
                 .await
                 .expect("unlink target");
             assert_eq!(fs.stat(path("target")).await, Err(FsError::NoEntry));
@@ -2947,7 +3070,7 @@ fn unlinked_open_handle_retains_inode_until_final_drop_and_isolates_recreated_pa
             // Recreate a new file at the same path; the open handle still refers
             // to the unlinked inode.
             let recreated = fs
-                .open(path("target"), OpenFlags::CREATE, 1_000_000_003)
+                .open(path("target"), OpenFlags::CREATE, 1_000_000_003, &payer)
                 .await
                 .expect("recreate target");
             assert_ne!(recreated.metadata.id, opened.metadata.id);
@@ -2957,6 +3080,7 @@ fn unlinked_open_handle_retains_inode_until_final_drop_and_isolates_recreated_pa
                 WritePosition::At(0),
                 b"replacement".len(),
                 1_000_000_003,
+                &payer,
                 |at, dst| dst.copy_from_slice(&b"replacement"[at..at + dst.len()]),
             )
             .await
@@ -2970,6 +3094,7 @@ fn unlinked_open_handle_retains_inode_until_final_drop_and_isolates_recreated_pa
                 WritePosition::End,
                 b"-more".len(),
                 1_000_000_004,
+                &payer,
                 |at, dst| dst.copy_from_slice(&b"-more"[at..at + dst.len()]),
             )
             .await
@@ -2988,7 +3113,7 @@ fn unlinked_open_handle_retains_inode_until_final_drop_and_isolates_recreated_pa
                     .as_ref(),
                 b"replacement"
             );
-            fs.set_size_handle(&opened.handle, 8, 1_000_000_005)
+            fs.set_size_handle(&opened.handle, 8, 1_000_000_005, &payer)
                 .await
                 .expect("truncate unlinked");
             fs.set_times_handle(
@@ -2996,6 +3121,7 @@ fn unlinked_open_handle_retains_inode_until_final_drop_and_isolates_recreated_pa
                 Some(2_000_000_000),
                 Some(3_000_000_000),
                 1_000_000_006,
+                &payer,
             )
             .await
             .expect("set_times unlinked");
@@ -3010,7 +3136,7 @@ fn unlinked_open_handle_retains_inode_until_final_drop_and_isolates_recreated_pa
 
             // Previously named unlinked files cannot be re-linked.
             assert_eq!(
-                fs.link_handle(&opened.handle, path("revived"), 1_000_000_007)
+                fs.link_handle(&opened.handle, path("revived"), 1_000_000_007, &payer)
                     .await,
                 Err(FsError::NoEntry)
             );
@@ -3048,9 +3174,10 @@ fn tmpfile_handle_supports_io_linking_exclusive_refusal_and_crash_cleanup() {
         .await
         .expect("writable mount");
         let client = async move {
+            let payer = crate::StoragePayer::for_test();
             // Linkable O_TMPFILE.
             let tmp = fs
-                .open_tmpfile(FsPath::ROOT, false, 1_000_000_000)
+                .open_tmpfile(FsPath::ROOT, false, 1_000_000_000, &payer)
                 .await
                 .expect("open_tmpfile");
             assert_eq!(tmp.metadata.link_count, 0);
@@ -3060,11 +3187,12 @@ fn tmpfile_handle_supports_io_linking_exclusive_refusal_and_crash_cleanup() {
                 WritePosition::At(0),
                 b"staged-via-tmpfile".len(),
                 1_000_000_001,
+                &payer,
                 |at, dst| dst.copy_from_slice(&b"staged-via-tmpfile"[at..at + dst.len()]),
             )
             .await
             .expect("write tmpfile");
-            fs.link_handle(&tmp.handle, path("linked"), 1_000_000_002)
+            fs.link_handle(&tmp.handle, path("linked"), 1_000_000_002, &payer)
                 .await
                 .expect("link tmpfile");
             assert_eq!(
@@ -3085,11 +3213,11 @@ fn tmpfile_handle_supports_io_linking_exclusive_refusal_and_crash_cleanup() {
 
             // Exclusive O_TMPFILE refuses link_handle and cleans up on drop.
             let excl = fs
-                .open_tmpfile(FsPath::ROOT, true, 1_000_000_003)
+                .open_tmpfile(FsPath::ROOT, true, 1_000_000_003, &payer)
                 .await
                 .expect("open exclusive tmpfile");
             assert_eq!(
-                fs.link_handle(&excl.handle, path("cannot-link"), 1_000_000_004)
+                fs.link_handle(&excl.handle, path("cannot-link"), 1_000_000_004, &payer)
                     .await,
                 Err(FsError::NoEntry)
             );
@@ -3098,7 +3226,7 @@ fn tmpfile_handle_supports_io_linking_exclusive_refusal_and_crash_cleanup() {
             // Keep one O_TMPFILE open across unmount to simulate a crash with
             // an active orphan item committed on disk.
             let crashed = fs
-                .open_tmpfile(FsPath::ROOT, false, 1_000_000_005)
+                .open_tmpfile(FsPath::ROOT, false, 1_000_000_005, &payer)
                 .await
                 .expect("open crash tmpfile");
             helios_hal::fs::write_handle_with(
@@ -3107,6 +3235,7 @@ fn tmpfile_handle_supports_io_linking_exclusive_refusal_and_crash_cleanup() {
                 WritePosition::At(0),
                 b"lost".len(),
                 1_000_000_006,
+                &payer,
                 |at, dst| dst.copy_from_slice(&b"lost"[at..at + dst.len()]),
             )
             .await

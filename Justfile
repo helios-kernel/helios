@@ -129,7 +129,9 @@ test-kernel run_ignored="default":
         --out-dir "${out_dir}" \
         --target "${target}" \
         --profile "{{ default_profile }}" \
-        --cargo cargo
+        --cargo cargo \
+        --boot-program debugger \
+        --no-compiler-plugin
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     cargo nextest run {{ kernel_unit_packages }} --lib --run-ignored "{{ run_ignored }}"
@@ -216,7 +218,8 @@ test-host-tools:
             --out-dir "${out_dir}" \
             --target "${target}" \
             --profile "{{ default_profile }}" \
-            --cargo cargo
+            --cargo cargo \
+            --boot-program init
         plugin="${out_dir}/compiler_plugin.wasm"
     fi
     # These tools read no bootfs. The compiler-host test needs only the
@@ -366,7 +369,9 @@ test-embedded-debugger:
         --out-dir "${out_dir}" \
         --target "${target}" \
         --profile "{{ default_profile }}" \
-        --cargo cargo
+        --cargo cargo \
+        --boot-program debugger \
+        --no-compiler-plugin
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_BOOTFS="${out_dir}/helios-bootfs"
     cargo nextest run -p helios-hosted --no-capture init_program::tests::embedded_debugger_

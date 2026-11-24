@@ -173,6 +173,8 @@ interface programs {
     /// Take processors offline and bring them online
     /// (`helios:system/processors`).
     control-processors,
+    /// Create hardware virtual machines (`helios:hv/virtualization`).
+    virtualize,
   }
 
   record machine-grant {

@@ -233,8 +233,17 @@ pub(crate) fn vm(
         pages * PhysFrame::SIZE,
     )
 }
-struct TestHypervisor {
-    published: IrqSafeMutex<Vec<PhysFrame>>,
+#[derive(Clone)]
+pub(crate) struct TestHypervisor {
+    published: Arc<IrqSafeMutex<Vec<PhysFrame>>>,
+}
+
+impl Default for TestHypervisor {
+    fn default() -> Self {
+        Self {
+            published: Arc::new(IrqSafeMutex::new(Vec::new())),
+        }
+    }
 }
 
 impl Hypervisor for TestHypervisor {
@@ -257,9 +266,7 @@ fn memory_publication_validates_bounds_before_synchronizing_covered_pages() {
     let region = vm
         .allocate_memory(range(2), PageFlags::READ | PageFlags::WRITE)
         .unwrap();
-    let hardware = TestHypervisor {
-        published: IrqSafeMutex::new(Vec::new()),
-    };
+    let hardware = TestHypervisor::default();
     region.publish(&hardware, PhysFrame::SIZE + 1, 1).unwrap();
     hardware
         .published
@@ -612,8 +619,13 @@ fn a_late_allocation_failure_releases_earlier_frames_and_the_entire_charge() {
 #[test]
 fn unsupported_cpu_refuses_vm_creation() {
     let cpu = crate::test_support::TestCpu::without_entropy();
+    let mut authority = crate::ProcessAuthority::empty();
+    authority.grant_machine_rights(crate::MachineAuthorityRights::VIRTUALIZE);
+    let cap = authority
+        .derive_virtualize_cap()
+        .expect("virtualize authority grants VirtualizeCap");
     assert!(matches!(
-        create_vm(&cpu, single_node_pool(1), PhysFrame::SIZE),
+        create_vm(&cpu, single_node_pool(1), PhysFrame::SIZE, cap),
         Err(VmError::Hardware(HvError::Unavailable))
     ));
 }

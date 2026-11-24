@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+arrayvec = { version = "0.7.6", default-features = false }
 helios-hal.workspace = true
 thiserror = { version = "2.0.20", default-features = false }
 tpm2-protocol = { version = "1.2.3", default-features = false }
@@ -13,6 +14,8 @@ zeroize = { version = "1.9.1", default-features = false }
 hex = { version = "0.4.3", default-features = false, features = ["serde", "std"] }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
+sha1 = { version = "0.11.0", default-features = false }
+sha2 = { version = "0.11.0", default-features = false }
 tempfile.workspace = true
 
 [lints]

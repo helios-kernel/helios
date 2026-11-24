@@ -30,6 +30,7 @@ mod locality;
 mod mapping_cost;
 mod native_pages;
 mod owner;
+mod paged;
 mod per_processor;
 mod policy;
 mod reported;
@@ -45,8 +46,8 @@ pub use compressed::{
 };
 pub use entropy::{
     ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, HardwareEntropySource,
-    NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RootEntropy,
-    RootEntropyHandle, install_entropy_device, seed_root_entropy,
+    NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RandomBytesLimitSetting,
+    RootEntropy, RootEntropyHandle, install_entropy_device, seed_root_entropy,
 };
 #[cfg(feature = "wasmtime-runtime")]
 pub(crate) use fiber_stack::fiber_stack_arena_installed;
@@ -66,6 +67,7 @@ pub use owner::{
     MemoryOwner, UserMemoryOwnerScope, UserMemoryOwners, configure_user_memory_owner_processors,
     current_user_memory_owner, enter_user_memory_owner,
 };
+pub use paged::{DetachedPages, FrameReservation, FrameShortage, PagedBytes};
 pub use per_processor::{LocalMemory, LocalSlice, NodeLocalArena, NodeMemory, PerProcessor};
 pub use policy::{
     BootMemoryPlan, BootRegionSplitter, KERNEL_HEAP_BOOTSTRAP_BYTES,
@@ -86,8 +88,6 @@ pub use swap::{
 };
 #[cfg(test)]
 pub(crate) use swap::{GUEST_SWAP_PAGE, GuestSwap};
-#[cfg(test)]
-pub(crate) use user::installed_user_memory_pool;
 pub use user::{
     MemoryNodeStats, UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on,
     allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
@@ -96,6 +96,6 @@ pub use user::{
     user_frame_node, user_heap_stats, user_node_stats,
 };
 pub(crate) use user::{
-    lend_user_memory_to_kernel_heap, release_processor_frames, user_memory_pool,
-    user_pool_available_bytes,
+    installed_user_memory_pool, lend_user_memory_to_kernel_heap, release_processor_frames,
+    user_memory_pool, user_pool_available_bytes,
 };
