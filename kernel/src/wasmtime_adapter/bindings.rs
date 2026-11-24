@@ -18,6 +18,7 @@ pub mod debugger {
             with: {
                 "helios:system/programs.child": crate::ChildHandle,
                 "helios:system/programs.container": crate::ContainerHandle,
+                "helios:system/inspect.publication": crate::wasmtime_adapter::component_host::InspectPublicationHandle,
                 "helios:system/ipc.endpoint": crate::IpcEndpoint,
                 "helios:system/snapshot.snapshot-hold": crate::ComponentSnapshotHold,
                 "helios:system/profiling.sampling-session": crate::ComponentSamplingSession,
@@ -57,6 +58,7 @@ pub mod program {
             with: {
                 "helios:system/programs.child": crate::ChildHandle,
                 "helios:system/programs.container": crate::ContainerHandle,
+                "helios:system/inspect.publication": crate::wasmtime_adapter::component_host::InspectPublicationHandle,
                 "helios:system/ipc.endpoint": crate::IpcEndpoint,
                 "helios:system/snapshot.snapshot-hold": crate::ComponentSnapshotHold,
                 "helios:system/profiling.sampling-session": crate::ComponentSamplingSession,
@@ -439,6 +441,33 @@ pub mod snapshot {
             with: {
                 "helios:system/snapshot.snapshot-hold": crate::ComponentSnapshotHold,
             },
+            require_store_data_send: true,
+        });
+    }
+}
+
+/// Bindings for lock-free component and kernel state inspection
+/// (`helios:system/inspect`), served identically across every component world.
+pub mod inspect {
+    pub mod bindings {
+        use wasmtime;
+
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "inspect-host",
+            imports: {
+                // `publish` needs `Access::caller_memory()` to validate the
+                // span against the calling subcomponent's unshared linear
+                // memory.
+                "helios:system/inspect.publish": store | trappable,
+                default: trappable,
+            },
+            with: {
+                "helios:system/inspect.publication": crate::wasmtime_adapter::component_host::InspectPublicationHandle,
+                "helios:system/memory":
+                    crate::wasmtime_adapter::bindings::gpu::bindings::helios::system::memory,
+            },
+            additional_derives: [PartialEq],
             require_store_data_send: true,
         });
     }

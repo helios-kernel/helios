@@ -2204,6 +2204,29 @@ impl Drop for ContainerProcessGuard {
     }
 }
 
+/// Point-in-time snapshot of one mount inside a [`LinuxContainer`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainerMountSnapshot {
+    pub target: String,
+    pub kind: &'static str,
+    pub sharing: &'static str,
+    pub read_only: bool,
+    pub overlay_pages: u64,
+}
+
+/// Point-in-time telemetry snapshot of a live [`LinuxContainer`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinuxContainerSnapshot {
+    pub id: u64,
+    pub hostname: String,
+    pub domainname: String,
+    pub live_processes: u32,
+    pub allocated_pids: u32,
+    pub live_threads: u32,
+    pub overlay_pages: u64,
+    pub mounts: Vec<ContainerMountSnapshot>,
+}
+
 /// A kernel Linux container: the bounded Linux system every native Linux
 /// process runs inside.
 pub struct LinuxContainer<S: Storage> {
@@ -2465,6 +2488,47 @@ impl<S: Storage> LinuxContainer<S> {
     /// Live process count inside this container (`sysinfo().procs`).
     pub fn process_count(&self) -> u32 {
         self.pids.process_count()
+    }
+
+    /// Returns a point-in-time telemetry snapshot of this container's mounts,
+    /// PID namespace counts, UTS names, and overlay page occupancy.
+    pub fn telemetry(&self) -> LinuxContainerSnapshot {
+        let uts = self.uts.lock();
+        let hostname = core::str::from_utf8(uts.hostname.as_bytes())
+            .unwrap_or("")
+            .to_owned();
+        let domainname = core::str::from_utf8(uts.domainname.as_bytes())
+            .unwrap_or("")
+            .to_owned();
+        drop(uts);
+        let pids = self.pids.telemetry();
+        let mut total_overlay_pages = 0u64;
+        let mut mounts = Vec::with_capacity(self.filesystem.mounts.len());
+        for mount in &self.filesystem.mounts {
+            let fs = mount.backing.resolved().fs();
+            let overlay_pages = fs.overlay_pages();
+            total_overlay_pages = total_overlay_pages.saturating_add(overlay_pages);
+            mounts.push(ContainerMountSnapshot {
+                target: mount.target.clone(),
+                kind: fs.kind_name(),
+                sharing: match mount.grant.sharing {
+                    MountSharing::Private => "private",
+                    MountSharing::Shared => "shared",
+                },
+                read_only: mount.grant.flags().contains(MountFlags::READ_ONLY),
+                overlay_pages,
+            });
+        }
+        LinuxContainerSnapshot {
+            id: self.id.raw(),
+            hostname,
+            domainname,
+            live_processes: pids.live_processes,
+            allocated_pids: pids.allocated_pids,
+            live_threads: pids.live_threads,
+            overlay_pages: total_overlay_pages,
+            mounts,
+        }
     }
 
     /// Container UTS hostname (`uname().nodename`).

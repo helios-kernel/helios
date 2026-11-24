@@ -31,7 +31,7 @@ use std::time::Instant;
 use helios_api::channel;
 use helios_api::programs::{self, Child, ChildTermination, ExecRequest, SpawnRequest};
 use helios_api::wit_bindgen::{FutureReader, StreamReader};
-use helios_api::{stats, task};
+use helios_api::{inspect, task};
 use helios_bench_metrics::{LatencySamples, mib_per_second, report_metric};
 use thiserror::Error;
 
@@ -234,8 +234,23 @@ struct HeldChild {
     _stdout_done: FutureReader<Result<(), ()>>,
 }
 
+fn available_memory_bytes() -> u64 {
+    inspect::snapshot_prefixes(&["/kernel/memory/available-bytes"], 4)
+        .ok()
+        .and_then(|snap| {
+            snap.entries.into_iter().find_map(|entry| {
+                (entry.path == "/kernel/memory/available-bytes").then_some(entry.value)
+            })
+        })
+        .and_then(|value| match value {
+            inspect::Value::Unsigned64(bytes) => Some(bytes),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
 async fn startup(count: u64, child: ChildSpec) -> Result<(), ProcbenchError> {
-    let memory_before = stats::snapshot().memory.available_bytes;
+    let memory_before = available_memory_bytes();
     let (tx, rx) = channel::bounded(usize::try_from(count).expect("count fits usize"));
     let batch_started = Instant::now();
     for _ in 0..count {
@@ -266,7 +281,7 @@ async fn startup(count: u64, child: ChildSpec) -> Result<(), ProcbenchError> {
     // the privileged debugger world, and the batch is proven alive by
     // construction, since every child has written its first line and none
     // has had its stdin closed yet.
-    let memory_after = stats::snapshot().memory.available_bytes;
+    let memory_after = available_memory_bytes();
 
     // The batch is dismantled from this one task, so the hundred instances
     // are destroyed one after another on whichever processor this task runs

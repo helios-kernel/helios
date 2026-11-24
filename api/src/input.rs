@@ -19,7 +19,7 @@
 //! machine's input. What it loses is a whole report at a time, never
 //! half of one: a pointer never keeps one axis of a move whose other
 //! half it dropped. Reports lost that way are counted on
-//! `helios:system/stats`.
+//! `helios:system/inspect` under `/kernel/input`.
 
 use std::string::String;
 use std::vec::Vec;

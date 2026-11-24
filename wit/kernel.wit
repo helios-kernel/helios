@@ -10,7 +10,7 @@ world init {
   import helios:system/btrfs@0.1.0;
   import helios:system/net@0.1.0;
   import helios:system/vsock@0.1.0;
-  import helios:system/stats@0.1.0;
+  import helios:system/inspect@0.1.0;
   import helios:system/tracing@0.1.0;
   import helios:system/profiling@0.1.0;
   import helios:system/settings@0.1.0;
@@ -38,7 +38,7 @@ world debugger{
   import helios:system/btrfs@0.1.0;
   import helios:system/net@0.1.0;
   import helios:system/vsock@0.1.0;
-  import helios:system/stats@0.1.0;
+  import helios:system/inspect@0.1.0;
   import helios:system/tracing@0.1.0;
   import helios:system/profiling@0.1.0;
   import helios:system/settings@0.1.0;
@@ -64,6 +64,7 @@ world debugger{
 /// The plugin must not import `wasi:http/client` — it *is* the client.
 world http-handler {
   include wasi:cli/imports@0.3.0;
+  import helios:system/inspect@0.1.0;
   import helios:system/net@0.1.0;
   import helios:system/sync@0.1.0;
   import wasi:sockets/types@0.3.0;
@@ -89,7 +90,7 @@ world http-host {
 world remote-system {
   export helios:system/programs@0.1.0;
   export helios:system/net@0.1.0;
-  export helios:system/stats@0.1.0;
+  export helios:system/inspect@0.1.0;
   export helios:system/tracing@0.1.0;
   export helios:system/profiling@0.1.0;
   export helios:system/sync@0.1.0;
@@ -107,6 +108,7 @@ world remote-system {
 world device-driver {
   include wasi:cli/imports@0.3.0;
   import helios:system/device@0.1.0;
+  import helios:system/inspect@0.1.0;
   import helios:system/sync@0.1.0;
   import helios:system/tracing@0.1.0;
 }
@@ -158,6 +160,7 @@ world compositor {
   import helios:system/programs@0.1.0;
   import helios:system/display@0.1.0;
   import helios:system/input@0.1.0;
+  import helios:system/inspect@0.1.0;
   import helios:system/surface@0.1.0;
   import helios:system/gpu@0.1.0;
   import helios:system/sync@0.1.0;
@@ -269,10 +272,14 @@ world snapshot-host {
   import helios:system/snapshot@0.1.0;
 }
 
+world inspect-host {
+  import helios:system/inspect@0.1.0;
+}
+
 /// Interfaces whose values cross the inspector's serialized RPC transport.
 world inspector-system {
   import helios:system/programs@0.1.0;
-  import helios:system/stats@0.1.0;
+  import helios:system/inspect@0.1.0;
   import helios:system/tracing@0.1.0;
   import helios:system/profiling@0.1.0;
   import helios:system/instances@0.1.0;

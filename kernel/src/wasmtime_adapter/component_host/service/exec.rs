@@ -1310,12 +1310,17 @@ where
                             .runtime_state
                             .root_namespace()
                     });
+                    let ephemeral = Arc::new(crate::LinuxContainer::ephemeral(
+                        id,
+                        replacement.authority.clone(),
+                        namespace,
+                    ));
+                    replacement_state
+                        .exec_context
+                        .runtime_state
+                        .register_container(&ephemeral);
                     Some(LinuxContainerLaunch {
-                        container: Arc::new(crate::LinuxContainer::ephemeral(
-                            id,
-                            replacement.authority.clone(),
-                            namespace,
-                        )),
+                        container: ephemeral,
                         credentials: None,
                     })
                 } else {

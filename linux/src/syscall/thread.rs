@@ -171,7 +171,26 @@ impl Default for PidNamespace {
     }
 }
 
+/// Point-in-time PID and thread counts for a container's [`PidNamespace`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PidNamespaceTelemetry {
+    pub live_processes: u32,
+    pub allocated_pids: u32,
+    pub live_threads: u32,
+}
+
 impl PidNamespace {
+    /// Returns a coherent point-in-time snapshot of process and thread counts
+    /// inside this PID namespace.
+    pub fn telemetry(&self) -> PidNamespaceTelemetry {
+        let state = self.inner.state.lock();
+        PidNamespaceTelemetry {
+            live_processes: state.live_processes,
+            allocated_pids: u32::try_from(state.allocated.len()).unwrap_or(u32::MAX),
+            live_threads: u32::try_from(state.threads.len()).unwrap_or(u32::MAX),
+        }
+    }
+
     /// A fresh PID namespace whose first process receives PID 1.
     pub fn new() -> Self {
         Self {

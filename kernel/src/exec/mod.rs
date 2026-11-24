@@ -54,8 +54,8 @@ pub use observer::{
     FoldedProfileSample, MAX_FILTER_PREFIX_BYTES, MAX_FILTER_PREFIXES, MachineObservation,
     NoObservation, ObservationScope, OwnInstance, PerfMetricFilter, PerfMetricHistory,
     PerfMetricSample, PerfSample, PrefixSet, PrefixSetError, ProfileFilter, ProfileHistory,
-    ProfileScope, ProfileSink, StatsSample, SubtreeObservation, TraceEvent, TraceField,
-    TraceFilter, TraceHistory, TraceLevel, TraceLog, TraceValue, matches_perf_metric_filter,
+    ProfileScope, ProfileSink, SubtreeObservation, TraceEvent, TraceField, TraceFilter,
+    TraceHistory, TraceLevel, TraceLog, TraceValue, matches_perf_metric_filter,
     matches_profile_filter, matches_trace_filter, parse_console_text,
 };
 pub use ready::ReadyLink;

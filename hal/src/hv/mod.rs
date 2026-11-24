@@ -279,6 +279,11 @@ pub unsafe trait Stage2Space: Send + Sync + 'static {
     type Vcpu: GuestVcpu;
 
     fn capabilities(&self) -> HvCapabilities;
+    /// Hardware virtual-machine identifier backing this Stage-2 space, when
+    /// the architecture assigns one (for example an AArch64 VMID).
+    fn vmid(&self) -> Option<u32> {
+        None
+    }
     fn create_vcpu(space: &Arc<Self>, id: u32) -> Result<Self::Vcpu, HvError>;
     /// # Safety
     /// Frames are initialized normal RAM, owned for the mapping's lifetime.

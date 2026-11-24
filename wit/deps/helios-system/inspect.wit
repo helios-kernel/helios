@@ -1,0 +1,128 @@
+package helios:system@0.1.0;
+
+/// Lock-free component and kernel state inspection.
+///
+/// Any instance may register a bounded span of its own unshared linear memory
+/// formatted with an even/odd 64-bit generation counter header so it can update
+/// structured telemetry in user memory with zero system calls. Readers query
+/// kernel telemetry (`/kernel/*`) and component trees
+/// (`/instances/<id>/<name>/*`) through one bounded prefix-filtered snapshot
+/// interface, gated by `InspectReadCap`.
+interface inspect {
+  use filters.{filter-error};
+  use memory.{span};
+
+  /// Monotonic nanoseconds since system boot.
+  type mono-nanos = u64;
+
+  /// Typed value of one inspect property.
+  variant value {
+    boolean(bool),
+    signed64(s64),
+    unsigned64(u64),
+    float64(f64),
+    text(string),
+    blob(list<u8>),
+  }
+
+  /// One property in a flattened inspect snapshot.
+  ///
+  /// `path` is a slash-delimited absolute path such as
+  /// `/kernel/memory/available-bytes` or `/instances/4/vmm/vcpu-exits`.
+  record entry {
+    path: string,
+    value: value,
+  }
+
+  /// Outcome of reading one published component inspect span during a snapshot.
+  enum publication-status {
+    /// Decoded cleanly from a consistent even generation.
+    ok,
+    /// Writer held an odd or changing generation across bounded retries.
+    busy,
+    /// Header or payload failed validation; the buffer was isolated and skipped.
+    corrupt,
+    /// One or more pages of the span were swapped out; skipped without stalling.
+    swapped-out,
+  }
+
+  /// Metadata and read health of one published component inspect span in scope.
+  record component-publication {
+    instance-id: u64,
+    instance-name: string,
+    name: string,
+    generation: u64,
+    status: publication-status,
+  }
+
+  /// One coherent inspect snapshot.
+  record snapshot-result {
+    /// Monotonic kernel timestamp taken at the start of the snapshot.
+    timestamp: mono-nanos,
+    /// Matching entries sorted lexicographically by `path`.
+    entries: list<entry>,
+    /// True when `entries` was capped by the requested `limit` or kernel ceiling.
+    truncated: bool,
+    /// Component publications admitted by the caller's scope and path filter.
+    publications: list<component-publication>,
+  }
+
+  /// Bounded path-prefix selector (`PrefixSet`).
+  record query {
+    /// Slash-prefixed path prefixes (for example `/kernel/memory`,
+    /// `/kernel/hv`, `/instances/`). Empty selects every path in scope.
+    /// At most 8 prefixes of at most 128 bytes each; exceeding either bound
+    /// is refused with `filter-error`.
+    prefixes: list<string>,
+  }
+
+  /// Why publishing a linear-memory inspect span was refused.
+  enum publish-error {
+    /// The span is empty, misaligned, out of bounds, exceeds the maximum
+    /// inspect span size (256 KiB), overlaps a kernel view or another
+    /// publication, or the call has no unshared linear memory.
+    bad-span,
+    /// The publication name is empty, longer than 64 bytes, or contains
+    /// characters outside ASCII `[A-Za-z0-9._-]`.
+    invalid-name,
+    /// This instance already holds a publication under the same name.
+    duplicate-name,
+    /// This instance already holds the maximum number of publications (4).
+    too-many-publications,
+  }
+
+  /// RAII handle keeping a published linear-memory inspect span visible.
+  ///
+  /// Dropping the handle revokes the publication and waits for any in-flight
+  /// kernel copy to finish before returning.
+  resource publication;
+
+  /// Registers `region` of the caller's unshared linear memory as a lock-free
+  /// inspect buffer published under `/instances/<self>/<name>`.
+  ///
+  /// Binary header layout (32 bytes, little-endian, at byte offset 0 of `region`):
+  /// - `0..4`:   magic `b"HINS"` (`0x534E4948`)
+  /// - `4..6`:   format version `1` (`u16`)
+  /// - `6..8`:   flags `0` (`u16`)
+  /// - `8..16`:  even/odd generation counter (`u64`); odd while mutating
+  /// - `16..20`: payload length in bytes (`u32`)
+  /// - `20..24`: entry count (`u32`, at most 1024)
+  /// - `24..32`: reserved `0` (`u64`)
+  ///
+  /// Each payload record immediately follows the header:
+  /// - `path-len: u16` (1..=256 UTF-8 bytes, relative slash-separated segments)
+  /// - `value-tag: u8` (`0`=bool, `1`=s64, `2`=u64, `3`=f64, `4`=text, `5`=blob)
+  /// - `reserved: u8` (`0`)
+  /// - `path-bytes: [u8; path-len]`
+  /// - value payload (`1` byte bool, `8` bytes LE scalar, or `u32` LE len + bytes)
+  publish: func(name: string, region: span) -> result<publication, publish-error>;
+
+  /// Reads up to `limit` matching inspect entries (`0` selects the kernel's
+  /// default ceiling) within the caller's `InspectReadCap` scope.
+  ///
+  /// - `Machine` scope observes `/kernel/*` and every instance's publications.
+  /// - `Subtree(root)` scope observes publications of `root` and its descendants.
+  /// - `Own` scope observes only the caller's own publications.
+  /// - Callers without `InspectReadCap` receive an empty snapshot.
+  snapshot: func(query: query, limit: u32) -> result<snapshot-result, filter-error>;
+}
