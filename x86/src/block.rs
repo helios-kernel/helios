@@ -76,7 +76,7 @@ where
                 &pci.access(),
                 *address,
                 pci,
-                *dma,
+                dma.clone(),
                 Some(msix_vector),
                 cpu.clone(),
                 BlockDeviceRights::READ | BlockDeviceRights::WRITE,
