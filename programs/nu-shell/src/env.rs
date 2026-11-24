@@ -49,143 +49,134 @@ struct ActiveProfile {
     _session: SamplingSession,
 }
 
-/// Bitmask of optional non-directory grants inherited by default child spawns.
+/// Fixed detail string returned by the kernel's `map_process_authority_error`
+/// (`ProgramExecErrorDetail::ProcessAuthorityDenied`) when any requested child
+/// grant exceeds the caller's held authority.
+const PROCESS_AUTHORITY_DENIED_DETAIL: &str = "process authority rejected the requested grant";
+
+/// Monotonic tier of default child grants inherited when a spawn does not
+/// specify explicit `with-grants`.
 ///
-/// Initialized from what the running shell can observe (machine inspect,
-/// terminal output) and narrowed lazily when the kernel rejects a specific
-/// capability the shell itself does not hold.
-#[derive(Clone, Copy)]
-struct DefaultGrantMask(u16);
+/// The kernel reports every rejected capability grant with the single fixed
+/// message [`PROCESS_AUTHORITY_DENIED_DETAIL`], so narrowing steps down a
+/// deterministic sequence of tiers until the child spawn succeeds or reaches
+/// directory-only grants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DefaultGrantTier {
+    /// Full launcher bundle (machine inspect/trace/profile/diagnostics,
+    /// instance/machine control, settings, devices, mount, network, terminal,
+    /// link, process, and preopen directories with `Execute`).
+    MachineFull,
+    /// Machine read-only inspect, optional terminal, link, process, and
+    /// preopen directories with `Execute`.
+    InspectTerminalExec,
+    /// Optional terminal, link, process, and preopen directories with `Execute`.
+    TerminalExec,
+    /// Link, process, and preopen directories with `Execute`.
+    ProcessExec,
+    /// Preopen directories with `Execute` only (no non-directory grants).
+    DirectoryExec,
+    /// Preopen directories with only the `Read`/`Write`/`MutateDirectory`
+    /// flags reported by `Descriptor::get_flags()` (no `Execute`, no
+    /// non-directory grants).
+    DirectoryOnly,
+}
 
-impl DefaultGrantMask {
-    const LINK: u16 = 1 << 0;
-    const PROCESS: u16 = 1 << 1;
-    const NETWORK: u16 = 1 << 2;
-    const TERMINAL: u16 = 1 << 3;
-    const MOUNT: u16 = 1 << 4;
-    const DEVICES: u16 = 1 << 5;
-    const INSPECT_READ: u16 = 1 << 6;
-    const TRACE_READ: u16 = 1 << 7;
-    const PROFILE_READ: u16 = 1 << 8;
-    const DIAGNOSTICS_CONTROL: u16 = 1 << 9;
-    const INSTANCE_CONTROL: u16 = 1 << 10;
-    const WRITE_SETTINGS: u16 = 1 << 11;
-    const MACHINE_CONTROL: u16 = 1 << 12;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DefaultGrantPolicy {
+    tier: DefaultGrantTier,
+    has_terminal: bool,
+}
 
-    const MACHINE_BUNDLE: u16 = Self::NETWORK
-        | Self::TERMINAL
-        | Self::MOUNT
-        | Self::DEVICES
-        | Self::INSPECT_READ
-        | Self::TRACE_READ
-        | Self::PROFILE_READ
-        | Self::DIAGNOSTICS_CONTROL
-        | Self::INSTANCE_CONTROL
-        | Self::WRITE_SETTINGS
-        | Self::MACHINE_CONTROL;
-
+impl DefaultGrantPolicy {
     fn initial(has_machine_inspect: bool, has_terminal: bool) -> Self {
-        let mut bits = Self::LINK | Self::PROCESS;
-        if has_machine_inspect {
-            bits |= Self::MACHINE_BUNDLE;
-        }
-        if has_terminal {
-            bits |= Self::TERMINAL;
-        }
-        Self(bits)
-    }
-
-    fn has(self, flag: u16) -> bool {
-        (self.0 & flag) != 0
-    }
-
-    fn clear(&mut self, flag: u16) -> bool {
-        if self.has(flag) {
-            self.0 &= !flag;
-            true
+        let tier = if has_machine_inspect {
+            DefaultGrantTier::MachineFull
+        } else if has_terminal {
+            DefaultGrantTier::TerminalExec
         } else {
-            false
-        }
+            DefaultGrantTier::ProcessExec
+        };
+        Self { tier, has_terminal }
     }
 
-    fn append_grants(self, grants: &mut Vec<CapabilityGrant>) {
-        if self.has(Self::LINK) {
-            grants.push(root_link_grant());
-        }
-        if self.has(Self::PROCESS) {
-            grants.push(root_process_grant());
-        }
-        if self.has(Self::NETWORK) {
-            grants.push(network_grant(vec![
-                NetworkRight::Tcp,
-                NetworkRight::Udp,
-                NetworkRight::Dns,
-                NetworkRight::PrivilegedBind,
-                NetworkRight::Multicast,
-                NetworkRight::Admin,
-            ]));
-        }
-        if self.has(Self::TERMINAL) {
-            grants.push(root_terminal_grant());
-        }
-        if self.has(Self::MOUNT) {
-            grants.push(root_mount_grant());
-        }
-        if self.has(Self::DEVICES) {
-            grants.push(all_device_classes_grant());
-        }
-        if self.has(Self::INSPECT_READ) {
-            grants.push(inspect_read_grant(AuthorityScope::Machine));
-        }
-        if self.has(Self::TRACE_READ) {
-            grants.push(trace_read_grant(AuthorityScope::Machine));
-        }
-        if self.has(Self::PROFILE_READ) {
-            grants.push(profile_read_grant(AuthorityScope::Machine));
-        }
-        if self.has(Self::DIAGNOSTICS_CONTROL) {
-            grants.push(diagnostics_control_grant());
-        }
-        if self.has(Self::INSTANCE_CONTROL) {
-            grants.push(instance_control_grant(AuthorityScope::Machine));
-        }
-        if self.has(Self::WRITE_SETTINGS) {
-            grants.push(write_settings_grant());
-        }
-        if self.has(Self::MACHINE_CONTROL) {
-            grants.push(machine_control_grant());
-        }
+    fn include_dir_execute(self) -> bool {
+        !matches!(self.tier, DefaultGrantTier::DirectoryOnly)
     }
 
-    const REFUSAL_TABLE: &[(&str, u16)] = &[
-        ("network grant", Self::NETWORK),
-        ("terminal grant", Self::TERMINAL),
-        ("mount grant", Self::MOUNT),
-        ("device class grant", Self::DEVICES),
-        ("inspect-read grant", Self::INSPECT_READ),
-        ("trace-read grant", Self::TRACE_READ),
-        ("profile-read grant", Self::PROFILE_READ),
-        ("diagnostic grant", Self::DIAGNOSTICS_CONTROL),
-        ("instance-control grant", Self::INSTANCE_CONTROL),
-        ("settings grant", Self::WRITE_SETTINGS),
-        ("machine grant", Self::MACHINE_CONTROL),
-        ("link grant", Self::LINK),
-        ("process grant", Self::PROCESS),
-    ];
-
-    /// Drop the specific grant the kernel reported as unheld by this shell.
-    ///
-    /// Matches the `ProcessAuthorityError` strings formatted by the kernel's
-    /// authority checker. Returns `true` if a flag was cleared so the caller
-    /// can retry the default spawn without that grant.
-    fn narrow_for_refusal(&mut self, detail: &str) -> bool {
-        let mut narrowed = false;
-        for &(needle, flag) in Self::REFUSAL_TABLE {
-            if detail.contains(needle) && self.clear(flag) {
-                narrowed = true;
+    fn append_non_directory_grants(self, grants: &mut Vec<CapabilityGrant>) {
+        match self.tier {
+            DefaultGrantTier::MachineFull => {
+                grants.push(root_link_grant());
+                grants.push(root_process_grant());
+                grants.push(network_grant(vec![
+                    NetworkRight::Tcp,
+                    NetworkRight::Udp,
+                    NetworkRight::Dns,
+                    NetworkRight::PrivilegedBind,
+                    NetworkRight::Multicast,
+                    NetworkRight::Admin,
+                ]));
+                grants.push(root_terminal_grant());
+                grants.push(root_mount_grant());
+                grants.push(all_device_classes_grant());
+                grants.push(inspect_read_grant(AuthorityScope::Machine));
+                grants.push(trace_read_grant(AuthorityScope::Machine));
+                grants.push(profile_read_grant(AuthorityScope::Machine));
+                grants.push(diagnostics_control_grant());
+                grants.push(instance_control_grant(AuthorityScope::Machine));
+                grants.push(write_settings_grant());
+                grants.push(machine_control_grant());
             }
+            DefaultGrantTier::InspectTerminalExec => {
+                grants.push(root_link_grant());
+                grants.push(root_process_grant());
+                grants.push(inspect_read_grant(AuthorityScope::Machine));
+                if self.has_terminal {
+                    grants.push(root_terminal_grant());
+                }
+            }
+            DefaultGrantTier::TerminalExec => {
+                grants.push(root_link_grant());
+                grants.push(root_process_grant());
+                if self.has_terminal {
+                    grants.push(root_terminal_grant());
+                }
+            }
+            DefaultGrantTier::ProcessExec => {
+                grants.push(root_link_grant());
+                grants.push(root_process_grant());
+            }
+            DefaultGrantTier::DirectoryExec | DefaultGrantTier::DirectoryOnly => {}
         }
-        narrowed
+    }
+
+    /// Step down one tier when the kernel reports
+    /// [`PROCESS_AUTHORITY_DENIED_DETAIL`].
+    ///
+    /// Returns `true` if the policy narrowed to a lower tier so the caller can
+    /// retry, or `false` if the refusal was unrelated (such as
+    /// `ProgramSourceNotGranted`) or the policy is already at its minimum tier.
+    fn narrow_for_refusal(&mut self, detail: &str) -> bool {
+        if detail != PROCESS_AUTHORITY_DENIED_DETAIL {
+            return false;
+        }
+        let next = match self.tier {
+            DefaultGrantTier::MachineFull => DefaultGrantTier::InspectTerminalExec,
+            DefaultGrantTier::InspectTerminalExec => {
+                if self.has_terminal {
+                    DefaultGrantTier::TerminalExec
+                } else {
+                    DefaultGrantTier::ProcessExec
+                }
+            }
+            DefaultGrantTier::TerminalExec => DefaultGrantTier::ProcessExec,
+            DefaultGrantTier::ProcessExec => DefaultGrantTier::DirectoryExec,
+            DefaultGrantTier::DirectoryExec => DefaultGrantTier::DirectoryOnly,
+            DefaultGrantTier::DirectoryOnly => return false,
+        };
+        self.tier = next;
+        true
     }
 }
 
@@ -195,7 +186,7 @@ pub struct GuestHeliosEnv {
     scopes: Mutex<Vec<String>>,
     snapshots: Mutex<BTreeMap<String, SnapshotHold>>,
     profiles: Mutex<BTreeMap<String, ActiveProfile>>,
-    default_grants: Mutex<DefaultGrantMask>,
+    default_grants: Mutex<DefaultGrantPolicy>,
     next_id: AtomicU64,
 }
 
@@ -204,8 +195,8 @@ impl GuestHeliosEnv {
     pub fn new(initial_cwd: String) -> Self {
         let initial_cwd = normalize_vfs_path("/", &initial_cwd);
         // Probe once via read-only `inspect.snapshot` whether this shell holds
-        // machine-level inspect authority; unheld grants in the default mask
-        // are narrowed individually on the first spawn refusal.
+        // machine-level inspect authority; unheld grants in the default tier
+        // step down deterministically on the first authority refusal.
         let has_machine_inspect = inspect::snapshot(
             &InspectQuery {
                 prefixes: vec![String::from("/kernel/")],
@@ -220,7 +211,7 @@ impl GuestHeliosEnv {
             scopes: Mutex::new(Vec::new()),
             snapshots: Mutex::new(BTreeMap::new()),
             profiles: Mutex::new(BTreeMap::new()),
-            default_grants: Mutex::new(DefaultGrantMask::initial(
+            default_grants: Mutex::new(DefaultGrantPolicy::initial(
                 has_machine_inspect,
                 has_terminal,
             )),
@@ -233,12 +224,12 @@ impl GuestHeliosEnv {
     }
 
     async fn default_child_grants(&self) -> Vec<CapabilityGrant> {
-        let mut grants = preopen_directory_grants().await;
-        let mask = *self
+        let policy = *self
             .default_grants
             .lock()
             .expect("guest default grants lock poisoned");
-        mask.append_grants(&mut grants);
+        let mut grants = preopen_directory_grants(policy.include_dir_execute()).await;
+        policy.append_non_directory_grants(&mut grants);
         grants
     }
 
@@ -1286,7 +1277,7 @@ impl HeliosEnv for GuestHeliosEnv {
     }
 }
 
-async fn preopen_directory_grants() -> Vec<CapabilityGrant> {
+async fn preopen_directory_grants(include_execute: bool) -> Vec<CapabilityGrant> {
     let mut grants = Vec::new();
     for (desc, path) in preopens::get_directories() {
         let normalized = normalize_vfs_path("/", &path);
@@ -1294,6 +1285,9 @@ async fn preopen_directory_grants() -> Vec<CapabilityGrant> {
         let mut rights = Vec::new();
         if (flags & DescriptorFlags::READ) != DescriptorFlags::empty() {
             rights.push(FilesystemRight::Read);
+            if include_execute {
+                rights.push(FilesystemRight::Execute);
+            }
         }
         if (flags & DescriptorFlags::WRITE) != DescriptorFlags::empty() {
             rights.push(FilesystemRight::Write);
@@ -1557,5 +1551,82 @@ fn map_profile_error(err: InstructionProfileError) -> EnvError {
         InstructionProfileError::NotCaptured => EnvError::Unsupported {
             detail: String::from("instruction sampling not captured on this target"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DefaultGrantPolicy, DefaultGrantTier, PROCESS_AUTHORITY_DENIED_DETAIL};
+
+    fn non_dir_count(policy: DefaultGrantPolicy) -> usize {
+        let mut grants = Vec::new();
+        policy.append_non_directory_grants(&mut grants);
+        grants.len()
+    }
+
+    #[test]
+    fn default_grant_policy_narrows_deterministically_on_kernel_authority_refusal() {
+        let mut policy = DefaultGrantPolicy::initial(true, true);
+        assert_eq!(policy.tier, DefaultGrantTier::MachineFull);
+        assert!(policy.include_dir_execute());
+        assert_eq!(non_dir_count(policy), 13);
+
+        // Unrelated PermissionDenied detail (e.g. ProgramSourceNotGranted) must not downgrade.
+        assert!(!policy.narrow_for_refusal("program source is not granted by process authority"));
+        assert_eq!(policy.tier, DefaultGrantTier::MachineFull);
+
+        // Fixed kernel ProcessAuthorityDenied string steps monotonically through every tier.
+        let expected = [
+            (DefaultGrantTier::InspectTerminalExec, true, 4),
+            (DefaultGrantTier::TerminalExec, true, 3),
+            (DefaultGrantTier::ProcessExec, true, 2),
+            (DefaultGrantTier::DirectoryExec, true, 0),
+            (DefaultGrantTier::DirectoryOnly, false, 0),
+        ];
+        for (tier, dir_exec, count) in expected {
+            assert!(policy.narrow_for_refusal(PROCESS_AUTHORITY_DENIED_DETAIL));
+            assert_eq!(policy.tier, tier);
+            assert_eq!(policy.include_dir_execute(), dir_exec);
+            assert_eq!(non_dir_count(policy), count);
+        }
+
+        // Minimum tier stops retrying so spawn surfaces PermissionDenied.
+        assert!(!policy.narrow_for_refusal(PROCESS_AUTHORITY_DENIED_DETAIL));
+        assert_eq!(policy.tier, DefaultGrantTier::DirectoryOnly);
+    }
+
+    #[test]
+    fn default_grant_policy_skips_terminal_tier_without_terminal() {
+        let mut policy = DefaultGrantPolicy::initial(true, false);
+        assert_eq!(policy.tier, DefaultGrantTier::MachineFull);
+
+        assert!(policy.narrow_for_refusal(PROCESS_AUTHORITY_DENIED_DETAIL));
+        assert_eq!(policy.tier, DefaultGrantTier::InspectTerminalExec);
+        assert_eq!(non_dir_count(policy), 3);
+
+        assert!(policy.narrow_for_refusal(PROCESS_AUTHORITY_DENIED_DETAIL));
+        assert_eq!(policy.tier, DefaultGrantTier::ProcessExec);
+        assert_eq!(non_dir_count(policy), 2);
+
+        assert!(policy.narrow_for_refusal(PROCESS_AUTHORITY_DENIED_DETAIL));
+        assert_eq!(policy.tier, DefaultGrantTier::DirectoryExec);
+        assert!(policy.include_dir_execute());
+
+        assert!(policy.narrow_for_refusal(PROCESS_AUTHORITY_DENIED_DETAIL));
+        assert_eq!(policy.tier, DefaultGrantTier::DirectoryOnly);
+        assert!(!policy.include_dir_execute());
+
+        assert!(!policy.narrow_for_refusal(PROCESS_AUTHORITY_DENIED_DETAIL));
+    }
+
+    #[test]
+    fn default_grant_policy_initial_tiers_without_machine_inspect() {
+        let with_tty = DefaultGrantPolicy::initial(false, true);
+        assert_eq!(with_tty.tier, DefaultGrantTier::TerminalExec);
+        assert_eq!(non_dir_count(with_tty), 3);
+
+        let headless = DefaultGrantPolicy::initial(false, false);
+        assert_eq!(headless.tier, DefaultGrantTier::ProcessExec);
+        assert_eq!(non_dir_count(headless), 2);
     }
 }
