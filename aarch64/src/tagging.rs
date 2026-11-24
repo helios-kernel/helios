@@ -169,6 +169,7 @@ unsafe fn enable_registers(seed: u16) {
             "isb",
             "tlbi vmalle1",
             "dsb nsh",
+            "msr tco, #0",
             "isb",
             gcr = in(reg) gcr,
             rgsr = in(reg) rgsr,
@@ -179,6 +180,29 @@ unsafe fn enable_registers(seed: u16) {
             sctlr_bits = in(reg) SCTLR_TCF_SYNC | SCTLR_ATA,
             options(nostack, preserves_flags),
         );
+    }
+}
+
+/// Clears `PSTATE.TCO` (Tag Check Override) after leaving an exception
+/// without executing `eret`.
+///
+/// On `FEAT_MTE2` processors, taking any exception to EL1 sets
+/// `PSTATE.TCO = 1` in hardware (Arm ARM D1.3.1). Normal returns restore
+/// `SPSR_EL1` via `eret`, whereas `__helios_aarch64_trap_hand_over` leaves
+/// the exception stack directly; clearing `TCO` here restores synchronous
+/// tag checking for the continuation and for all subsequent execution on
+/// this processor.
+pub(crate) fn clear_tag_check_override() {
+    if Aarch64AllocationTags::checking() {
+        // SAFETY: `checking()` is true only when `FEAT_MTE2` is implemented
+        // and enabled on this processor.
+        unsafe {
+            asm!(
+                ".arch_extension memtag",
+                "msr tco, #0",
+                options(nomem, nostack, preserves_flags),
+            );
+        }
     }
 }
 

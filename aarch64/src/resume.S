@@ -71,6 +71,7 @@ __helios_aarch64_cpu_resume:
     msr gcr_el1, x1
     ldr x1, [x0, #352]
     msr rgsr_el1, x1
+    msr tco, #0
 4:
     isb
     msr spsel, #1
