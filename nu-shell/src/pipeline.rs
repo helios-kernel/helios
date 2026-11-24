@@ -239,15 +239,13 @@ impl AsyncPipelineData {
             }
             Self::ByteStream {
                 stream,
+                stderr,
                 exit_code,
                 span,
                 stream_type,
                 ..
             } => {
-                let bytes = collect_byte_receiver(stream).await?;
-                if let Some(exit_rx) = exit_code {
-                    let _ = exit_rx.recv().await;
-                }
+                let bytes = collect_byte_stream_checked(stream, stderr, exit_code, span).await?;
                 Ok(bytes_to_value(bytes, stream_type, span))
             }
             Self::Sync(data) => data.into_value(fallback_span),
@@ -260,14 +258,12 @@ impl AsyncPipelineData {
             Self::Empty => Ok(Vec::new()),
             Self::Value(val, _) => value_to_bytes(&val, fallback_span),
             Self::ByteStream {
-                stream, exit_code, ..
-            } => {
-                let bytes = collect_byte_receiver(stream).await?;
-                if let Some(exit_rx) = exit_code {
-                    let _ = exit_rx.recv().await;
-                }
-                Ok(bytes)
-            }
+                stream,
+                stderr,
+                exit_code,
+                span,
+                ..
+            } => collect_byte_stream_checked(stream, stderr, exit_code, span).await,
             Self::ListStream { stream, .. } => {
                 let mut out = Vec::new();
                 while let Ok(item) = stream.recv().await {
@@ -357,16 +353,14 @@ impl AsyncPipelineData {
             }
             Self::ByteStream {
                 stream,
+                stderr,
                 exit_code,
                 span,
                 stream_type,
                 metadata,
                 ..
             } => {
-                let bytes = collect_byte_receiver(stream).await?;
-                if let Some(exit_rx) = exit_code {
-                    let _ = exit_rx.recv().await;
-                }
+                let bytes = collect_byte_stream_checked(stream, stderr, exit_code, span).await?;
                 let byte_stream = match stream_type {
                     ByteStreamType::Binary => ByteStream::read_binary(bytes, span, Signals::EMPTY),
                     ByteStreamType::String => match String::from_utf8(bytes) {
@@ -445,16 +439,14 @@ impl AsyncPipelineData {
             }
             Self::ByteStream {
                 stream,
+                stderr,
                 exit_code,
                 span,
                 stream_type,
                 metadata,
                 ..
             } => {
-                let bytes = collect_byte_receiver(stream).await?;
-                if let Some(exit_rx) = exit_code {
-                    let _ = exit_rx.recv().await;
-                }
+                let bytes = collect_byte_stream_checked(stream, stderr, exit_code, span).await?;
                 let val = bytes_to_value(bytes, stream_type, span);
                 let (tx, rx) = async_channel::bounded(1);
                 let _ = tx.try_send(val);
@@ -481,41 +473,95 @@ impl AsyncPipelineData {
                 exit_code,
                 span,
                 ..
-            } => {
-                let (out_res, err_res) = futures_lite::future::zip(
-                    async move {
-                        while let Ok(chunk) = stream.recv().await {
-                            let _ = chunk?;
-                        }
-                        Ok::<(), ShellError>(())
-                    },
-                    async move {
-                        if let Some(stderr_rx) = stderr {
-                            while let Ok(chunk) = stderr_rx.recv().await {
-                                let _ = chunk?;
-                            }
-                        }
-                        Ok::<(), ShellError>(())
-                    },
-                )
-                .await;
-                out_res?;
-                err_res?;
-                if let Some(exit_rx) = exit_code
-                    && let Ok(code) = exit_rx.recv().await
-                {
-                    let code =
-                        code.map_err(|err| err.into_shell_error("external command failed", span))?;
-                    return Ok(Some(code));
-                }
-                Ok(None)
-            }
+            } => drain_byte_stream(stream, stderr, exit_code, span).await,
             Self::Sync(data) => {
                 data.drain()?;
                 Ok(None)
             }
         }
     }
+}
+
+/// Drain stdout and stderr concurrently on a boxed future so recursive `eval_ir_async`
+/// frames do not grow with `zip` state in debug builds.
+fn drain_byte_stream(
+    stream: AsyncByteReceiver,
+    stderr: Option<AsyncByteReceiver>,
+    exit_code: Option<async_channel::Receiver<Result<i32, crate::error::EnvError>>>,
+    span: Span,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<i32>, ShellError>> + Send>> {
+    Box::pin(async move {
+        let drain_out = async {
+            while let Ok(chunk) = stream.recv().await {
+                let _ = chunk?;
+            }
+            Ok::<(), ShellError>(())
+        };
+        let drain_err = async {
+            if let Some(stderr_rx) = stderr {
+                while let Ok(chunk) = stderr_rx.recv().await {
+                    let _ = chunk?;
+                }
+            }
+            Ok::<(), ShellError>(())
+        };
+        let (out_res, err_res) = futures_lite::future::zip(drain_out, drain_err).await;
+        out_res?;
+        err_res?;
+        if let Some(exit_rx) = exit_code
+            && let Ok(code) = exit_rx.recv().await
+        {
+            let code = code.map_err(|err| err.into_shell_error("external command failed", span))?;
+            return Ok(Some(code));
+        }
+        Ok(None)
+    })
+}
+
+/// Collect stdout from an external `ByteStream` while draining stderr
+/// concurrently and propagating spawn/RPC failures and non-zero exit codes.
+///
+/// Boxed so `AsyncPipelineData` helpers do not bloat recursive `eval_ir_async`
+/// futures in debug builds.
+fn collect_byte_stream_checked(
+    stream: AsyncByteReceiver,
+    stderr: Option<AsyncByteReceiver>,
+    exit_code: Option<async_channel::Receiver<Result<i32, crate::error::EnvError>>>,
+    span: Span,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, ShellError>> + Send>> {
+    Box::pin(async move {
+        let read_out = collect_byte_receiver(stream);
+        let read_err = async {
+            match stderr {
+                Some(rx) => collect_byte_receiver(rx).await,
+                None => Ok(Vec::new()),
+            }
+        };
+        let (out_res, err_res) = futures_lite::future::zip(read_out, read_err).await;
+        let bytes = out_res?;
+        let stderr_bytes = err_res?;
+        if let Some(exit_rx) = exit_code
+            && let Ok(status) = exit_rx.recv().await
+        {
+            let code =
+                status.map_err(|err| err.into_shell_error("external command failed", span))?;
+            if let Some(non_zero) = core::num::NonZeroI32::new(code) {
+                let detail = String::from_utf8_lossy(&stderr_bytes).trim().to_owned();
+                if detail.is_empty() {
+                    return Err(ShellError::NonZeroExitCode {
+                        exit_code: non_zero,
+                        span,
+                    });
+                }
+                return Err(crate::error::generic_error(
+                    format!("external command exited with status {code}"),
+                    detail,
+                    span,
+                ));
+            }
+        }
+        Ok(bytes)
+    })
 }
 
 /// Collect all chunks from an [`AsyncByteReceiver`] into a single `Vec<u8>`.

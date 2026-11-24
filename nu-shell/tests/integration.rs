@@ -621,13 +621,79 @@ fn ast_completion_core_covers_all_surfaces() {
 #[test]
 fn parse_and_runtime_errors_surface_typed() {
     block_on(async {
-        let mut session = ShellSession::new(TestHeliosEnv::new()).await;
+        let env = TestHeliosEnv::new();
+        let mut session = ShellSession::new(env.clone()).await;
 
         let parse_err = session.eval("if true { (1 + ").await.unwrap_err();
         assert!(matches!(parse_err, NuError::Parse { .. }));
 
         let not_found = session.eval("open /does/not/exist.txt").await.unwrap_err();
         assert!(matches!(not_found, NuError::Eval(_)));
+        let not_found_msg = not_found.to_string();
+        assert!(
+            not_found_msg.contains("not found"),
+            "expected underlying cause in error display, got: {not_found_msg}"
+        );
+
+        let async_missing = session
+            .eval(r#"run-external "async-missing""#)
+            .await
+            .unwrap_err();
+        let async_missing_msg = async_missing.to_string();
+        assert!(
+            async_missing_msg.contains("not found")
+                && async_missing_msg.contains("/bin/async-missing"),
+            "expected async spawn failure to surface, got: {async_missing_msg}"
+        );
+
+        let nonzero = session
+            .eval(r#"run-external "fail-ext""#)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                nonzero,
+                NuError::Eval(ref err)
+                    if matches!(
+                        err.as_ref(),
+                        nu_protocol::ShellError::NonZeroExitCode { exit_code, .. }
+                            if exit_code.get() == 7
+                    )
+            ),
+            "expected NonZeroExitCode(7), got: {nonzero}"
+        );
+        assert!(
+            env.recorded_stderr().contains("boom-stderr"),
+            "expected uncaptured stderr to flow to inherited stderr"
+        );
+
+        // When stderr is captured on a failing external ByteStream (e.g. remote RPC spawn),
+        // `collect_byte_stream_checked` includes the trimmed stderr detail in the error message.
+        let (out_tx, out_rx) = async_channel::bounded(1);
+        let (err_tx, err_rx) = async_channel::bounded(1);
+        let (code_tx, code_rx) = async_channel::bounded(1);
+        out_tx.send(Ok(b"partial-out".to_vec())).await.unwrap();
+        err_tx.send(Ok(b"boom-stderr\n".to_vec())).await.unwrap();
+        code_tx.send(Ok(7)).await.unwrap();
+        drop(out_tx);
+        drop(err_tx);
+        drop(code_tx);
+        let captured_err = AsyncPipelineData::ByteStream {
+            stream: out_rx,
+            stderr: Some(err_rx),
+            exit_code: Some(code_rx),
+            span: nu_protocol::Span::test_data(),
+            stream_type: nu_protocol::ByteStreamType::Unknown,
+            metadata: None,
+        }
+        .into_value_async(nu_protocol::Span::test_data())
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            captured_err.contains('7') && captured_err.contains("boom-stderr"),
+            "expected non-zero exit status and captured stderr detail, got: {captured_err}"
+        );
 
         // Direct AsyncPipelineData streaming input into `each`
         let (tx, rx) = async_channel::bounded(4);
@@ -668,19 +734,25 @@ fn save_unknown_extension_stderr_redirection_do_env_tilde_and_cancellation() {
         );
 
         // 2. `e>`, `e>>`, `o+e>`, and `o> ... e> ...` stderr/stdout file redirections
-        let _ = session
-            .eval(r#"run-external "fail-ext" e> /tmp/err.txt | ignore"#)
-            .await
-            .unwrap();
+        assert!(
+            session
+                .eval(r#"run-external "fail-ext" e> /tmp/err.txt | ignore"#)
+                .await
+                .is_err(),
+            "non-zero external exit must still propagate after stderr redirection"
+        );
         assert_eq!(
             env.read_vfs_bytes("/tmp/err.txt").as_deref(),
             Some(b"boom-stderr".as_slice())
         );
 
-        let _ = session
-            .eval(r#"run-external "fail-ext" e>> /tmp/err.txt | ignore"#)
-            .await
-            .unwrap();
+        assert!(
+            session
+                .eval(r#"run-external "fail-ext" e>> /tmp/err.txt | ignore"#)
+                .await
+                .is_err(),
+            "non-zero external exit must still propagate after stderr append redirection"
+        );
         assert_eq!(
             env.read_vfs_bytes("/tmp/err.txt").as_deref(),
             Some(b"boom-stderrboom-stderr".as_slice())

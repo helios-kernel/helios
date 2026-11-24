@@ -468,6 +468,13 @@ impl HeliosEnv for TestHeliosEnv {
                 }
                 let _ = code_tx.send(Ok(7)).await;
             }
+            "async-missing" => {
+                let _ = code_tx
+                    .send(Err(EnvError::NotFound {
+                        path: "/bin/async-missing".to_owned(),
+                    }))
+                    .await;
+            }
             #[cfg(not(target_arch = "wasm32"))]
             "big-out-then-err" => {
                 // Simulate a real WASI child that emits more than
