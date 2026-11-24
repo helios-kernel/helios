@@ -20,7 +20,8 @@ pub use authority::{
     UdpCap, UnmountCap, VirtualizeCap, WriteSettingsCap,
 };
 pub use program_service::{
-    CompilerMaxInputBytesSetting, ComponentStdioRefusal, DEFAULT_COMPILER_MAX_INPUT_BYTES,
-    LinuxImageRefusal, ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind,
-    ProgramOutOfMemory, RuntimeMessage, UnbindableStdio,
+    BufferedExecOutputLimitSetting, CompilerMaxInputBytesSetting, ComponentHandleLimitSetting,
+    ComponentStdioRefusal, DEFAULT_COMPILER_MAX_INPUT_BYTES, LinuxImageRefusal, ProgramExecError,
+    ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage,
+    UnbindableStdio,
 };

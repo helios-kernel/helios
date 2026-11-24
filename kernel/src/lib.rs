@@ -1753,6 +1753,22 @@ impl KernelHeapHeadroom {
         }
     }
 
+    /// The kernel heap a direct kernel-heap allocation of `bytes` cannot
+    /// find above the reserve, or `None` when it fits.
+    pub const fn allocation_shortfall_bytes(self, bytes: usize) -> Option<usize> {
+        if bytes == 0 {
+            return None;
+        }
+        match self
+            .reserve_bytes
+            .saturating_add(bytes)
+            .checked_sub(self.available_bytes)
+        {
+            None | Some(0) => None,
+            Some(shortfall) => Some(shortfall),
+        }
+    }
+
     /// The kernel heap a user-memory grow of `growth_bytes` cannot find
     /// above the reserve, or `None` when its kernel-side cost fits.
     ///
@@ -1765,18 +1781,7 @@ impl KernelHeapHeadroom {
     /// A grow of nothing needs nothing, even from a heap under its
     /// reserve: this answers a grow request, not a health check.
     pub const fn growth_shortfall_bytes(self, growth_bytes: usize) -> Option<usize> {
-        let cost = user_mapping_kernel_heap_bytes(growth_bytes);
-        if cost == 0 {
-            return None;
-        }
-        match self
-            .reserve_bytes
-            .saturating_add(cost)
-            .checked_sub(self.available_bytes)
-        {
-            None | Some(0) => None,
-            Some(shortfall) => Some(shortfall),
-        }
+        self.allocation_shortfall_bytes(user_mapping_kernel_heap_bytes(growth_bytes))
     }
 }
 

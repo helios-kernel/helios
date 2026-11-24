@@ -3112,7 +3112,7 @@ where
 /// launched as a child program.
 pub(crate) fn store_with_signal_state<CpuImpl, Net, StorageImpl>(
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
-    state: StoreData<CpuImpl, Net, StorageImpl>,
+    mut state: StoreData<CpuImpl, Net, StorageImpl>,
     signal_state: Option<WasixSignalState>,
 ) -> (
     Store<StoreData<CpuImpl, Net, StorageImpl>>,
@@ -3123,6 +3123,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
+    state.configure_resource_table();
     let instance = state.instance().id();
     let mut store = Store::new(engine.raw(), state);
     store.limiter(|state| state);
