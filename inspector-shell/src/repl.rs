@@ -13,6 +13,7 @@ use crossterm::terminal;
 use futures_lite::StreamExt as _;
 use helios_nu::{AsyncPipelineData, HeliosEnv, ShellSession};
 use helios_ops::TargetStore;
+use helios_ops::transport::ProtocolClient;
 use nu_ansi_term::{Color, Style};
 use nu_protocol::engine::{EngineState, Stack};
 use nu_protocol::{Signals, Span, Value};
@@ -166,11 +167,32 @@ pub async fn eval_script(
     format_value(session.engine_state(), session.stack(), &value, format).await
 }
 
+/// RAII guard muting interleaved `helios-inspector: remote serial:` stderr
+/// echoes on the active RPC client while the interactive REPL owns the TTY.
+struct RemoteSerialEchoGuard {
+    client: ProtocolClient,
+    previous: bool,
+}
+
+impl RemoteSerialEchoGuard {
+    fn mute(client: ProtocolClient) -> Self {
+        let previous = client.set_remote_serial_echo(false);
+        Self { client, previous }
+    }
+}
+
+impl Drop for RemoteSerialEchoGuard {
+    fn drop(&mut self) {
+        self.client.set_remote_serial_echo(self.previous);
+    }
+}
+
 /// Run the interactive host Nushell REPL backed by `reedline 0.53.0` (with
 /// `bashisms`, `system_clipboard`, live `<Tab>` completion over
 /// [`helios_nu::complete_async`], raw-mode RAII teardown, and `Ctrl+C`
 /// per-invocation cancellation via [`crossterm::event::EventStream`] + `SIGINT`).
 pub async fn run_repl(env: HostEnv, format: OutputFormat) -> Result<(), ReplError> {
+    let _mute_remote_serial = RemoteSerialEchoGuard::mute(env.session().protocol_client().clone());
     let completion_env = env.for_completion();
     let target_name = env.session().target().name.clone();
     let scope = env.session().options().attenuation.scope.clone();

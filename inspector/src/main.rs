@@ -477,7 +477,11 @@ async fn run_ops_session_command(
                 }
                 .into());
             }
-            stats_tui::run(session.protocol_client()).await?;
+            let client = session.protocol_client();
+            let previous_echo = client.set_remote_serial_echo(false);
+            let run_result = stats_tui::run(client).await;
+            client.set_remote_serial_echo(previous_echo);
+            run_result?;
             Ok(())
         }
     }
