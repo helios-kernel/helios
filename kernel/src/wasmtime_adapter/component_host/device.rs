@@ -577,24 +577,41 @@ mod tests {
         );
     }
 
-    /// The inventory a program reads agrees with what its claims answer:
-    /// a device it cannot claim is not listed.
+    /// Kernel granted-device telemetry under `/kernel/devices/*` requires
+    /// machine-scoped inspect authority and is hidden from callers without it.
     #[test]
-    fn program_stats_hide_devices_the_caller_cannot_claim() {
+    fn kernel_device_inspect_requires_machine_scope() {
+        use crate::wasmtime_adapter::component_host::inspect::snapshot_for_store;
+        use crate::{AuthorityScope, InspectValue, PrefixSet};
+
+        let prefix = PrefixSet::from_prefixes(["/kernel/devices"]).unwrap();
         let names = |data: &test_store::TestStoreData| {
-            let mut sample = data.runtime_state.snapshot(0);
-            sample.restrict_to(data.process_authority());
-            sample
-                .devices
-                .iter()
-                .map(|device| alloc::string::String::from(device.name.as_str()))
+            snapshot_for_store(data, &prefix, 0)
+                .entries
+                .into_iter()
+                .filter_map(|entry| {
+                    if entry.path.ends_with("/name")
+                        && let InspectValue::Text(name) = entry.value
+                    {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                })
                 .collect::<alloc::vec::Vec<_>>()
         };
 
         assert!(names(&store_under(ProcessAuthority::empty())).is_empty());
+        assert!(names(&store_under(name_of(OTHER))).is_empty());
+
+        let mut inspector = ProcessAuthority::empty();
+        inspector.grant_inspect_read(AuthorityScope::Machine);
         assert_eq!(
-            names(&store_under(name_of(OTHER))),
-            vec![alloc::string::String::from(OTHER)]
+            names(&store_under(inspector)),
+            vec![
+                alloc::string::String::from(PUBLISHED),
+                alloc::string::String::from(OTHER),
+            ]
         );
     }
 

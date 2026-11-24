@@ -205,6 +205,9 @@ unsafe impl Stage2Space for Space {
     fn capabilities(&self) -> HvCapabilities {
         self.lease.hardware.capabilities
     }
+    fn vmid(&self) -> Option<u32> {
+        Some(u32::from(self.lease.id))
+    }
     fn create_vcpu(space: &Arc<Self>, id: u32) -> Result<Vcpu, HvError> {
         Ok(Vcpu {
             space: space.clone(),

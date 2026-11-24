@@ -163,7 +163,7 @@ device's events are relayed through a queue as deep as the driver's own
 ring, and what a slow reader loses is a whole report at a time, never
 half of one — a pointer never keeps one axis of a move whose other half
 it dropped. Reports lost that way are counted per device and published on
-`helios:system/stats`, where the stats view shows them beside the events
+`helios:system/inspect` under `/kernel/input/*`, where the stats view shows them beside the events
 each device delivered.
 
 `programs/input-test` is the guest side of that: it claims every device
@@ -321,7 +321,7 @@ takes the two things that would otherwise need a second boot:
 
 `--input` — here and on the `input` action — never sends on a delay.
 Before the first statement the inspector asks the guest, through
-`helios:system/stats`, whether every input device it reports is claimed,
+`helios:system/inspect` (`/kernel/input`), whether every input device it reports is claimed,
 and keeps asking until they are or `--input-wait-seconds` runs out. A
 report sent earlier would land in the kernel's unclaimed-device drain
 rather than on the queue of whoever takes the device next, so the gate

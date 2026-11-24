@@ -61,7 +61,9 @@ use triomphe::Arc;
 
 use crate::device::device_vm_hooks;
 
-pub use view::{GuestMemory, MAX_VIEWS, Span, ViewError, ViewGroup, ViewId, ViewTable};
+pub use view::{
+    GuestMemory, MAX_VIEWS, PinnedRangeId, Span, ViewError, ViewGroup, ViewId, ViewTable,
+};
 
 /// Every pixel format a Helios display engine latches is four bytes
 /// wide, so a frame's size is its area times this and its stride is its

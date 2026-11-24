@@ -176,6 +176,11 @@ impl<S: Stage2Space> Vcpu<S> {
                 .prepare_run(processor, self.previous, GUEST_TIME_SLICE)?;
             self.previous = Some(processor);
             let exit = self.backend.run()?;
+            self._registration
+                .shared
+                .telemetry
+                .telemetry()
+                .record_exit(exit);
             if let VmExit::Mmio {
                 address,
                 access: IoAccess::Write { width, value },
@@ -186,6 +191,11 @@ impl<S: Stage2Space> Vcpu<S> {
                     .ioevents
                     .matching(address, width, value)
             {
+                self._registration
+                    .shared
+                    .telemetry
+                    .telemetry()
+                    .record_ioevent_hit();
                 self.backend.complete_exit(0)?;
                 event.complete();
                 yield_now().await;
@@ -229,5 +239,6 @@ impl<S: Stage2Space> Drop for VcpuRegistration<S> {
         self.shared
             .vcpus
             .with(|vcpus| vcpus.retain(|(id, _)| *id != self.id));
+        self.shared.telemetry.telemetry().dec_vcpus();
     }
 }

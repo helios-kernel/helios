@@ -16,9 +16,9 @@ use console::{strip_ansi_codes, style};
 use directories::ProjectDirs;
 use helios_hal::fs::HOST_SHARE_MOUNT_TAG;
 use helios_inspector_protocol::debugger::filesystem as debugger_fs;
+use helios_inspector_protocol::system::inspect;
 use helios_inspector_protocol::system::profiling as system_profiling;
 use helios_inspector_protocol::system::programs as system_programs;
-use helios_inspector_protocol::system::stats;
 use helios_profdata::{
     KernelProfileStore, KernelProfileStoreError, ProfileDigest, ProfileUseError,
 };
@@ -4119,7 +4119,7 @@ enum VsockSessionError {
 ///
 /// Both sides are printed because they answer different questions: QEMU
 /// says how much guest memory it is still backing, the guest's own
-/// `helios:system/stats` says how much of its user memory the balloon is
+/// `helios:system/inspect` says how much of its user memory the balloon is
 /// holding and how much it has named as free.
 fn run_balloon(
     mut client: RpcClient,
@@ -4227,10 +4227,10 @@ enum GuestRequest {
     /// The input devices the guest reports right now and who holds each.
     ///
     /// The input gate asks once per poll; the answer is the guest's own
-    /// claim state through `helios:system/stats`, the only account that
+    /// claim state through `helios:system/inspect`, the only account that
     /// cannot be mistaken about whether a report would be read.
     InputDevices {
-        reply: async_channel::Sender<Result<Vec<stats::InputDevice>, SystemError>>,
+        reply: async_channel::Sender<Result<Vec<inspect::InputDevice>, SystemError>>,
     },
 }
 
@@ -4252,9 +4252,10 @@ async fn serve_guest_requests(
                     let _ = reply.send(outcome).await;
                 }
                 GuestRequest::InputDevices { reply } => {
-                    let outcome = system::fetch_stats(client)
-                        .await
-                        .map(|sample| sample.inputs);
+                    let outcome =
+                        system::fetch_kernel_snapshot_prefixes(client, &["/kernel/input"], 256)
+                            .await
+                            .map(|sample| sample.inputs);
                     let _ = reply.send(outcome).await;
                 }
             }
@@ -4496,7 +4497,7 @@ fn kill_instance(
 ///
 /// A statement sent before the claim lands in the kernel's
 /// unclaimed-device drain and never reaches the program that would have
-/// read it, so the gate asks the guest — `helios:system/stats` names
+/// read it, so the gate asks the guest — `helios:system/inspect` names
 /// each device and whether an instance holds it — rather than waiting
 /// out a delay that could only ever be unlucky again.
 fn await_input_claims(
@@ -4559,7 +4560,7 @@ fn wait_for_input_claims(
 /// request is sent before its answer is awaited, never the other way.
 fn input_devices(
     requests: &async_channel::Sender<GuestRequest>,
-) -> Result<Vec<stats::InputDevice>, VmSessionError> {
+) -> Result<Vec<inspect::InputDevice>, VmSessionError> {
     let (reply, answer) = async_channel::bounded(1);
     requests
         .send_blocking(GuestRequest::InputDevices { reply })
@@ -4651,7 +4652,7 @@ fn send_input_script(
 ///
 /// The guest is asked rather than QEMU: it is the side that decides how
 /// much it can spare, it publishes that decision through
-/// `helios:system/stats`, and its answer arrives over the debug serial
+/// `helios:system/inspect`, and its answer arrives over the debug serial
 /// rather than over the monitor — which the very memory work the guest
 /// is doing keeps busy.
 ///
@@ -4714,8 +4715,13 @@ fn settle_balloon(client: &mut RpcClient, target: u64, seconds: u64) {
 
 /// Reads the guest's own view of its memory, or nothing when the guest
 /// is too busy to answer right now.
-fn guest_stats(client: &mut RpcClient) -> Option<stats::Sample> {
-    crate::runtime::block_on(crate::system::fetch_stats(client)).ok()
+fn guest_stats(client: &mut RpcClient) -> Option<inspect::KernelSnapshot> {
+    crate::runtime::block_on(crate::system::fetch_kernel_snapshot_prefixes(
+        client,
+        &["/kernel/balloon", "/kernel/memory"],
+        256,
+    ))
+    .ok()
 }
 
 fn report_balloon(qmp: &mut QmpClient, client: &mut RpcClient, label: &str) {
@@ -8071,10 +8077,10 @@ mod tests {
         assert!(!ResolvedVmSessionCommand::Session(SessionCommand::Stats).needs_qmp());
     }
 
-    /// One input device the way `helios:system/stats` reports it, for
+    /// One input device the way `helios:system/inspect` reports it, for
     /// the gate's scripted answers.
-    fn input_device(name: &str, claimed: bool) -> stats::InputDevice {
-        stats::InputDevice {
+    fn input_device(name: &str, claimed: bool) -> inspect::InputDevice {
+        inspect::InputDevice {
             name: name.to_owned(),
             claimed,
             events_delivered: 0,
@@ -8091,7 +8097,7 @@ mod tests {
     /// meets a `remove` on an empty script, so either fails here.
     fn answer_input_devices(
         incoming: async_channel::Receiver<GuestRequest>,
-        mut snapshots: Vec<Vec<stats::InputDevice>>,
+        mut snapshots: Vec<Vec<inspect::InputDevice>>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             while let Ok(request) = incoming.recv_blocking() {

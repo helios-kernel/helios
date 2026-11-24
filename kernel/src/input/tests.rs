@@ -587,20 +587,30 @@ mod component_host {
         );
     }
 
-    /// The inventory a program reads agrees with what its claims answer:
-    /// an input device it cannot claim is not listed.
+    /// Kernel input telemetry under `/kernel/input/*` requires machine-scoped
+    /// inspect authority and is hidden from callers without it.
     #[test]
-    fn program_stats_hide_input_devices_the_caller_cannot_claim() {
+    fn kernel_input_inspect_requires_machine_scope() {
+        use crate::wasmtime_adapter::component_host::inspect::snapshot_for_store;
+        use crate::{AuthorityScope, PrefixSet};
+
         let service = service_of(&[KEYBOARD, TABLET]);
-        let listed = |authority: ProcessAuthority| {
+        let prefix = PrefixSet::from_prefixes(["/kernel/input"]).unwrap();
+        let names = |authority: ProcessAuthority| {
             let data = store_under(authority, &service);
-            let mut sample = data.runtime_state.snapshot(0);
-            sample.restrict_to(data.process_authority());
-            sample.inputs.len()
+            snapshot_for_store(&data, &prefix, 0)
+                .entries
+                .into_iter()
+                .filter(|entry| entry.path.ends_with("/name"))
+                .count()
         };
 
-        assert_eq!(listed(ProcessAuthority::empty()), 0);
-        assert_eq!(listed(authority_with(DeviceClassRights::INPUT)), 2);
+        assert_eq!(names(ProcessAuthority::empty()), 0);
+        assert_eq!(names(authority_with(DeviceClassRights::INPUT)), 0);
+
+        let mut inspector = ProcessAuthority::empty();
+        inspector.grant_inspect_read(AuthorityScope::Machine);
+        assert_eq!(names(inspector), 2);
     }
 
     /// The compositor's provisioning holds the input class: it lists the
