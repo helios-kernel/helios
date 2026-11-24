@@ -1,13 +1,13 @@
 name: Download the run's prebuilt guest wasm
 description: >-
   Waits for the `wasm-programs` job of this run to upload the guest wasm of
-  one profile, then downloads it. The lane that calls it runs in parallel
-  with that job, so this is the step placed right before the lane's first
-  kernel prebuild. It waits for as long as the job is queued or running,
-  whose own timeout bounds that, and fails at once when the job concluded
-  with anything but success, when it succeeded without the artifact, and
-  when the run has not listed the job within the bound. The calling job
-  needs `actions: read`.
+  one profile, then downloads it through the same REST API that reported it.
+  The lane that calls it runs in parallel with that job, so this is the step
+  placed right before the lane's first kernel prebuild. It waits for as long
+  as the job is queued or running, whose own timeout bounds that, and fails
+  at once when the job concluded with anything but success, when it succeeded
+  without a downloadable artifact, and when the run has not listed the job
+  within the bound. The calling job needs `actions: read`.
 inputs:
   profile:
     description: The guest programs' cargo profile, `release` or `debug`.
@@ -22,25 +22,47 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Wait for the wasm-programs job
+    - name: Wait for and download the wasm-programs artifact
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
         PROFILE: ${{ inputs.profile }}
+        DEST: ${{ inputs.path }}
         TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
       run: |
         set -euo pipefail
         artifact="helios-wasm-${PROFILE}"
         job="wasm-programs (${PROFILE})"
         run="repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-        uploaded() {
-          [[ -n "$(gh api --paginate "${run}/artifacts" \
-            --jq ".artifacts[] | select(.name == \"${artifact}\" and (.expired | not)) | .id")" ]]
+        # Download through the same GitHub REST API that listed the artifact
+        # instead of handing off to `actions/download-artifact@v4`: the runtime
+        # Twirp endpoint that action queries lags behind `FinalizeArtifact` and
+        # the REST listing, which caused `Artifact not found` immediately after
+        # the producer uploaded it.
+        try_download() {
+          local id
+          id="$(gh api --paginate "${run}/artifacts" \
+            --jq ".artifacts[] | select(.name == \"${artifact}\" and (.expired | not)) | .id" \
+            | head -n 1)"
+          [[ -n "${id}" ]] || return 1
+          mkdir -p "$(dirname "${DEST}")"
+          local tmp="${DEST}.download.$$"
+          rm -rf "${tmp}"
+          mkdir -p "${tmp}"
+          if gh run download "${GITHUB_RUN_ID}" --repo "${GITHUB_REPOSITORY}" \
+            --name "${artifact}" --dir "${tmp}"; then
+            rm -rf "${DEST}"
+            mv "${tmp}" "${DEST}"
+            echo "${artifact} downloaded (id=${id})"
+            return 0
+          fi
+          rm -rf "${tmp}"
+          return 1
         }
         deadline=$((SECONDS + TIMEOUT_SECONDS))
+        completed_since=""
         while true; do
-          if uploaded; then
-            echo "${artifact} is uploaded"
+          if try_download; then
             exit 0
           fi
           # "<status> <conclusion>", empty while the run does not list the job.
@@ -54,14 +76,17 @@ runs:
               fi
               ;;
             "completed success")
-              # The upload is the job's last step, so the artifact exists
-              # by now or never will.
-              if uploaded; then
-                echo "${artifact} is uploaded"
-                exit 0
+              # The upload step ran before job completion, so the artifact
+              # should be downloadable through the REST API; allow a short
+              # bounded window for artifact backend visibility, then fail fast.
+              if [[ -z "${completed_since}" ]]; then
+                completed_since="${SECONDS}"
+              elif ((SECONDS - completed_since >= 60)); then
+                echo "::error::the '${job}' job of this run succeeded, but ${artifact} was not downloadable within 60 s"
+                exit 1
               fi
-              echo "::error::the '${job}' job of this run succeeded without uploading ${artifact}"
-              exit 1
+              sleep 5
+              continue
               ;;
             completed\ *)
               echo "::error::the '${job}' job of this run concluded '${state#completed }', so ${artifact} will not appear"
@@ -72,7 +97,3 @@ runs:
           esac
           sleep 10
         done
-    - uses: actions/download-artifact@v4
-      with:
-        name: helios-wasm-${{ inputs.profile }}
-        path: ${{ inputs.path }}
