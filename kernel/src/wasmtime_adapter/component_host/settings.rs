@@ -319,6 +319,8 @@ mod tests {
         let program = ordinary();
         let expected_storage = crate::MemoryStorageSetting::initial();
 
+        use crate::process::{BufferedExecOutputLimitSetting, ComponentHandleLimitSetting};
+
         assert_eq!(
             list(&program),
             [
@@ -342,10 +344,22 @@ mod tests {
                     description: RandomBytesLimitSetting::DESCRIPTION,
                     value: SettingValue::Bytes(RandomBytesLimitSetting::DEFAULT),
                 },
+                SettingEntry {
+                    name: "process.max-component-handles",
+                    description: ComponentHandleLimitSetting::DESCRIPTION,
+                    value: SettingValue::Count(ComponentHandleLimitSetting::DEFAULT_LIMIT as u64),
+                },
+                SettingEntry {
+                    name: "programs.max-buffered-exec-bytes",
+                    description: BufferedExecOutputLimitSetting::DESCRIPTION,
+                    value: SettingValue::Bytes(
+                        BufferedExecOutputLimitSetting::DEFAULT_LIMIT as u64,
+                    ),
+                },
             ]
         );
         let views = listing(&program);
-        assert_eq!(views.len(), 4);
+        assert_eq!(views.len(), SETTING_COUNT);
         assert_eq!(views[0].name, "process.descriptor-limit");
         assert_eq!(views[0].description, DescriptorLimitSetting::DESCRIPTION);
         assert!(matches!(views[0].value, ValueView::Count(1024)));
@@ -369,6 +383,24 @@ mod tests {
         assert!(matches!(
             views[3].value,
             ValueView::Bytes(bytes) if bytes == RandomBytesLimitSetting::DEFAULT
+        ));
+        assert_eq!(views[4].name, "process.max-component-handles");
+        assert_eq!(
+            views[4].description,
+            ComponentHandleLimitSetting::DESCRIPTION
+        );
+        assert!(matches!(
+            views[4].value,
+            ValueView::Count(n) if n == ComponentHandleLimitSetting::DEFAULT_LIMIT as u64
+        ));
+        assert_eq!(views[5].name, "programs.max-buffered-exec-bytes");
+        assert_eq!(
+            views[5].description,
+            BufferedExecOutputLimitSetting::DESCRIPTION
+        );
+        assert!(matches!(
+            views[5].value,
+            ValueView::Bytes(n) if n == BufferedExecOutputLimitSetting::DEFAULT_LIMIT as u64
         ));
     }
 
