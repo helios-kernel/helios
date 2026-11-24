@@ -565,6 +565,7 @@ jobs:
       # Outside `helios/target`, so that no Rust cache saves or restores
       # the guest build directories or a stale copy of the result.
       - name: Build the guest wasm
+        shell: bash
         working-directory: helios
         env:
           WASM_PROGRAMS: ${{ matrix.programs }}

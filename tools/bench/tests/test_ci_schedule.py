@@ -437,6 +437,18 @@ def test_wasi_artifacts_produced_once_and_decoupled_from_root_cargo(ci_jobs):
             assert "tools/wasi-apps/build.sh" not in step.get("run", ""), name
 
 
+def test_container_job_bash_steps_declare_shell_bash(ci_jobs):
+    # GitHub Actions defaults to `sh` (`dash`) inside `container:` jobs.
+    bashisms = re.compile(r"pipefail|\[\[|<<<|<\(|\+=|\bmapfile\b|\bshopt\b|\$\{\w+\[")
+    for name, job in ci_jobs.items():
+        if "container" not in job:
+            continue
+        for step in job.get("steps", []):
+            run = step.get("run", "")
+            if bashisms.search(run):
+                assert step.get("shell") == "bash", (name, step.get("name"))
+
+
 def test_workflows_target_single_main_branch():
     workflows_dir = REPO_ROOT / ".github/workflows"
     assert not (workflows_dir / "pr-base-gate.yml").exists()
