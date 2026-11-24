@@ -1432,26 +1432,13 @@ unsafe fn configure_interrupts() {
 /// trap stack for good, or into a panic.
 fn handle_exception(exception: Exception, tf: &TrapFrame) {
     let stval = riscv::register::stval::read();
-    // A reserved page inside a live fiber stack is a demand commit the
-    // kernel resolves here: from the user pool's ordinary path when the
-    // interrupted context had interrupts enabled (the trap cleared SIE
-    // and saved it in SPIE), from the per-processor reserve when it had
-    // them masked; the guard page below one is a stack overflow and
-    // stays a fault. This is the first fault this backend can resolve
-    // without unwinding, which is why the function above it returns at
-    // all.
+    // Fiber stacks commit ahead of the guest through the stack-reserve
+    // callback; a fault on an uncommitted page inside one fails fast here,
+    // and the guard page below one stays a stack-overflow fault.
     let stack_fault = match kernel_exception_faulting_address(exception, stval) {
-        Some(addr) => helios_kernel::resolve_stack_fault(
-            helios_hal::vmm::VirtAddr::new(addr),
-            helios_kernel::InterruptedContext {
-                interrupts_enabled: tf.sstatus & SSTATUS_SPIE_BIT != 0,
-            },
-        ),
+        Some(addr) => helios_kernel::classify_stack_fault(helios_hal::vmm::VirtAddr::new(addr)),
         None => helios_kernel::StackFault::Elsewhere,
     };
-    if stack_fault == helios_kernel::StackFault::Committed {
-        return;
-    }
     match trap_origin(tf) {
         TrapOrigin::Kernel => {
             let Some(cause) = kernel_exception_cause(exception) else {
