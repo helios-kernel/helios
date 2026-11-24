@@ -108,6 +108,9 @@ global_asm!(
 pub(crate) struct TrapHandOver {
     exception: KernelException,
     esr: usize,
+    /// `FAR_EL1` as the processor wrote it, logical tag included. The
+    /// exception's `faulting_address` is its canonical form; this raw value
+    /// is what the fatal report prints.
     far: usize,
     stack_fault: StackFault,
     /// Where the entry built the frame, and the `SP_EL1` it recorded.
@@ -210,6 +213,10 @@ pub(crate) fn hand_over_trap(record: TrapHandOver, spsr: u64) -> HandOverRefusal
 /// synchronous epilogue would have restored.
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_trap_hand_over_main(record: usize) -> ! {
+    // Exception entry set `PSTATE.TCO = 1` on `FEAT_MTE2` cores, and this
+    // path leaves exception context without `eret`; restore tag checking
+    // before entering the continuation or the runtime trap handler.
+    crate::tagging::clear_tag_check_override();
     // SAFETY: `hand_over_trap` wrote a `TrapHandOver` at this address,
     // above this frame, and nothing else writes the hand-over stack.
     let record = unsafe { (record as *const TrapHandOver).read() };

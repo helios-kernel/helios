@@ -47,6 +47,7 @@ mod kernel_image_cache;
 mod kill;
 mod network;
 mod numa;
+mod prebuilt;
 mod qemu;
 mod qmp;
 mod raw_profile;
@@ -65,6 +66,10 @@ use network::{
     VmNetworkError, VmNetworkFile, VmNetworkProfile, VmNetworkSetupError,
 };
 use numa::{NumaError, NumaMachine};
+use prebuilt::{
+    PrebuiltError, PrebuiltRequest, ResolvedPrebuilt, VmPrebuiltMode, resolve_prebuilt,
+    verify_kernel_root_key_compatibility,
+};
 use qemu::QemuOptions;
 use qmp::{QmpClient, QmpError, SizeError};
 use raw_profile::{ProfileCommand, RawProfileCollectError};
@@ -224,6 +229,21 @@ pub(crate) enum VmConfigError {
          virtio-iommu can only confine PCI endpoints"
     )]
     IommuUnavailable { arch: &'static str },
+    #[error(
+        "--mte on is not available on {arch}: only the aarch64 `virt` machine has allocation-tag \
+         storage"
+    )]
+    MteUnavailable { arch: &'static str },
+    #[error(
+        "--mte on is not available under HVF: QEMU gives no allocation-tag storage to a guest \
+         the Hypervisor framework runs; use --accel tcg"
+    )]
+    MteUnderHvf,
+    #[error(
+        "--mte on cannot be combined with --memory {memory}: QEMU disables memory hotplug \
+         (`slots=`, `maxmem=`) on a machine with allocation-tag storage"
+    )]
+    MteWithMemoryHotplug { memory: String },
     #[error("{0}")]
     Numa(#[from] NumaError),
     #[error("{0}")]
@@ -246,6 +266,8 @@ pub(crate) enum VmConfigError {
         #[source]
         source: io::Error,
     },
+    #[error("{0}")]
+    Prebuilt(#[from] PrebuiltError),
     #[error("{0}")]
     WorkspaceRoot(#[from] WorkspaceRootError),
 }
@@ -378,6 +400,13 @@ pub(crate) enum VmRuntimeError {
     #[error("failed to canonicalize kernel {path}: {source}")]
     CanonicalizeKernel {
         path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to copy prebuilt Limine UEFI image from {from} to {to}: {source}")]
+    CopyPrebuiltUefiImage {
+        from: String,
+        to: String,
         #[source]
         source: io::Error,
     },
@@ -957,6 +986,24 @@ enum VmVsockProfile {
     VhostVsockPci,
 }
 
+/// Which cargo profile the guest wasm programs in bootfs are built or fetched
+/// from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum GuestProgramsProfile {
+    Debug,
+    Release,
+}
+
+impl GuestProgramsProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Release => "release",
+        }
+    }
+}
+
 /// Which transport carries the inspector RPC to the guest debugger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1413,6 +1460,19 @@ pub(crate) enum VmGuestRam {
     Prealloc,
 }
 
+/// Whether the aarch64 `virt` machine is given Arm allocation-tag
+/// storage (`-machine …,mte=on`).
+///
+/// QEMU provides tag storage under TCG, refuses it under HVF, and under
+/// KVM only on a host whose KVM supports it, so a session that does not
+/// say resolves to on for TCG and off for the native accelerators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum VmMte {
+    On,
+    Off,
+}
+
 /// The `-object` id of the guest RAM backend, which the machine
 /// names as its memory backend. It is the id the Fedora baseline gives
 /// its own (`GUEST_RAM_ID` in `tools/wasi-apps/fedora_qemu_baseline.py`),
@@ -1686,6 +1746,8 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) boot_programs: Vec<String>,
     #[serde(default)]
+    pub(crate) guest_programs_profile: Option<GuestProgramsProfile>,
+    #[serde(default)]
     pub(crate) no_compiler_plugin: Option<bool>,
     #[serde(default)]
     pub(crate) runtime_dir: Option<PathBuf>,
@@ -1701,6 +1763,8 @@ pub(crate) struct VmConfigFile {
     pub(crate) acpi: Option<bool>,
     #[serde(default)]
     pub(crate) iommu: Option<bool>,
+    #[serde(default)]
+    pub(crate) mte: Option<VmMte>,
     #[serde(default)]
     pub(crate) virtio_packed: Option<bool>,
     #[serde(default)]
@@ -1809,6 +1873,47 @@ pub(crate) struct VmCommand {
 
     #[arg(long, default_value_t = false)]
     no_build: bool,
+
+    /// Reuse a prebuilt CI artifact instead of compiling locally (`image`,
+    /// `kernel`, or `userspace`). Defaults to `image` when given without a
+    /// tier name.
+    #[arg(
+        long,
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "image",
+        value_name = "TIER"
+    )]
+    prebuilt: Option<VmPrebuiltMode>,
+
+    /// Fetch the `--prebuilt` artifact from this specific GitHub Actions run ID.
+    #[arg(
+        long,
+        value_name = "RUN_ID",
+        requires = "prebuilt",
+        conflicts_with_all = ["prebuilt_ref", "prebuilt_dir"]
+    )]
+    prebuilt_run: Option<u64>,
+
+    /// Fetch the `--prebuilt` artifact from the latest green CI run matching
+    /// this commit SHA or branch name.
+    #[arg(
+        long,
+        value_name = "REF",
+        requires = "prebuilt",
+        conflicts_with_all = ["prebuilt_run", "prebuilt_dir"]
+    )]
+    prebuilt_ref: Option<String>,
+
+    /// Load the `--prebuilt` artifact from this local directory (no network
+    /// fetch). Must contain the artifact's `manifest.json`.
+    #[arg(
+        long,
+        value_name = "DIR",
+        requires = "prebuilt",
+        conflicts_with_all = ["prebuilt_run", "prebuilt_ref"]
+    )]
+    prebuilt_dir: Option<PathBuf>,
 
     #[arg(long)]
     smp: Option<u16>,
@@ -1939,6 +2044,11 @@ pub(crate) struct VmCommand {
     #[arg(long = "boot-program")]
     boot_programs: Vec<String>,
 
+    /// Override the cargo profile (`debug` or `release`) used to build or load
+    /// guest wasm programs for bootfs, independent of the kernel profile.
+    #[arg(long, value_enum)]
+    guest_programs_profile: Option<GuestProgramsProfile>,
+
     /// Omit the compiler kernel plugin from bootfs.
     #[arg(long, default_value_t = false)]
     no_compiler_plugin: bool,
@@ -1968,6 +2078,19 @@ pub(crate) struct VmCommand {
     /// reaches the memory the kernel maps into its domain.
     #[arg(long, default_value_t = false)]
     iommu: bool,
+
+    /// Give the aarch64 `virt` machine allocation-tag storage
+    /// (`-machine …,mte=on`), which Arm memory tagging needs.
+    ///
+    /// Left unset, it is on for aarch64 under `--accel tcg` and off under
+    /// `hvf` and `kvm`. `on` is refused under `hvf`, which QEMU does not
+    /// give tag storage, for any other architecture, and with a
+    /// `--memory` that carries `slots=` or `maxmem=`, since QEMU
+    /// disables memory hotplug with tag storage. Under `kvm` QEMU itself
+    /// refuses a host without KVM MTE support.
+    #[arg(long, value_enum)]
+    mte: Option<VmMte>,
+
     /// Transport carrying the inspector RPC to the guest debugger.
     ///
     /// `vsock` needs a host that can provide a vsock device; the session
@@ -2375,6 +2498,9 @@ struct ResolvedVmCommand {
     qemu_bin: PathBuf,
     kernel: PathBuf,
     bootfs: PathBuf,
+    /// Prebuilt Limine UEFI disk image from `--prebuilt image`, reused directly
+    /// (copied into `runtime_dir`) so Limine does not need to be invoked.
+    uefi_image: Option<PathBuf>,
     socket: Option<PathBuf>,
     serial_stdio: bool,
     serial_pty: bool,
@@ -2409,6 +2535,9 @@ struct ResolvedVmCommand {
     keep_runtime_dir: bool,
     acpi: bool,
     iommu: bool,
+    /// Whether `-machine` carries `mte=on`, resolved from `--mte`, the
+    /// architecture and the accelerator.
+    mte: bool,
     desktop: bool,
     display: VmDisplayBackend,
     renderer: Option<VmRendererConfig>,
@@ -2590,6 +2719,16 @@ struct KernelBuildSpec {
     /// reads, and how it was asked for. `None` for every other kind.
     profile_use: Option<KernelProfileUse>,
     boot_programs: Vec<String>,
+    /// Explicit override for the guest wasm programs profile (`debug` or
+    /// `release`), decoupling guest userspace from the kernel build profile;
+    /// defaults to [`KernelBuildProfile::guest_programs`] when `None`.
+    guest_programs_profile: Option<GuestProgramsProfile>,
+    /// Prebuilt userspace wasm directory passed to `kernel-prebuild
+    /// --prebuilt-wasm`, skipping `wasm-build`.
+    prebuilt_wasm: Option<PathBuf>,
+    /// When true (`--prebuilt kernel` with a matching root secret key), build
+    /// `helios-bootfs` only and skip compiling the kernel image.
+    skip_kernel_build: bool,
     no_compiler_plugin: bool,
     /// The release signing key a build was told to use, absolute. `None`
     /// is a development build, whose key `kernel-prebuild` generates in
@@ -2711,6 +2850,13 @@ impl KernelBuildSpec {
             None => Ok(kernel_prebuild_dir(self)?.join(ROOT_SECRET_FILE)),
         }
     }
+
+    /// The Cargo profile label (`debug` or `release`) passed to
+    /// `helios-cli kernel-prebuild --profile`.
+    fn guest_programs_profile(&self) -> &'static str {
+        self.guest_programs_profile
+            .map_or_else(|| self.kind.guest_programs(), GuestProgramsProfile::as_str)
+    }
 }
 
 fn debug_shortcut(command: &VmCommand, file: &VmConfigFile) -> bool {
@@ -2756,15 +2902,28 @@ fn resolve_build(
             })
         })
         .transpose()?;
+    let prebuilt_replaces_kernel = matches!(
+        command.prebuilt,
+        Some(VmPrebuiltMode::Image | VmPrebuiltMode::Kernel)
+    );
+    if prebuilt_replaces_kernel && (profile_generate || profile_use.is_some()) {
+        let mode = match command.prebuilt {
+            Some(VmPrebuiltMode::Image) => "image",
+            Some(VmPrebuiltMode::Kernel) => "kernel",
+            _ => unreachable!(),
+        };
+        return Err(PrebuiltError::ConflictsWithPgo { mode }.into());
+    }
     // A release build of the architecture performance is measured on
     // reads the fetched profile, so the kernel a developer boots, the
     // kernel the lanes measure and the kernel a release ships are the
     // same build (#226, #313). An explicit `--profile-use` is still the profile that
     // wins: it is how one profile is measured against another.
-    // A session that builds nothing and names the image it boots needs no
-    // profile: a profile describes a build, and there is none here.
-    let builds_its_own_kernel =
-        !(command.no_build && (command.kernel.is_some() || file.kernel.is_some()));
+    // A session that builds nothing and names the image it boots (or reuses a
+    // prebuilt kernel/image bundle) needs no profile: a profile describes a
+    // local kernel build, and there is none here.
+    let builds_its_own_kernel = !prebuilt_replaces_kernel
+        && !(command.no_build && (command.kernel.is_some() || file.kernel.is_some()));
     let profile_use = match profile_use {
         Some(explicit) => Some(explicit),
         None if release && builds_its_own_kernel => release_kernel_profile(
@@ -2796,6 +2955,9 @@ fn resolve_build(
         }
     }
     let no_compiler_plugin = command.no_compiler_plugin || file.no_compiler_plugin.unwrap_or(false);
+    let guest_programs_profile = command
+        .guest_programs_profile
+        .or(file.guest_programs_profile);
     // Absolute, because the prebuild and the kernel build each run in the
     // workspace root rather than the directory the inspector was invoked in.
     let root_secret_key = command
@@ -2814,6 +2976,9 @@ fn resolve_build(
         profile_use,
         kernel_features: command.kernel_features.clone(),
         boot_programs,
+        guest_programs_profile,
+        prebuilt_wasm: None,
+        skip_kernel_build: false,
         no_compiler_plugin,
         root_secret_key,
         bootfs_root: command.bootfs_root.clone(),
@@ -2912,7 +3077,7 @@ fn smp_argument(smp: u16, max_processors: Option<u16>) -> String {
 fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
     let file = load_config_file(command.config.as_deref())?;
     let session_command: Option<ResolvedVmSessionCommand> = command.command.take().map(Into::into);
-    let build = resolve_build(&command, &file, session_command.as_ref())?;
+    let mut build = resolve_build(&command, &file, session_command.as_ref())?;
     let profile = build.profile;
     let arch = profile.arch;
     let debug = debug_shortcut(&command, &file);
@@ -2920,8 +3085,116 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         .qemu_bin
         .or(file.qemu_bin)
         .unwrap_or_else(|| PathBuf::from(profile.qemu_bin));
-    let kernel = resolve_kernel_path(command.kernel, file.kernel, &build)?;
-    let bootfs = resolve_bootfs_path(command.bootfs, file.bootfs, &build)?;
+    let baud = if command.baud != DEFAULT_BAUD {
+        command.baud
+    } else {
+        file.baud.unwrap_or(DEFAULT_BAUD)
+    };
+    let mut no_build = command.no_build;
+    let mut uefi_image = None;
+    let explicit_kernel = command.kernel.or(file.kernel);
+    let explicit_bootfs = command.bootfs.or(file.bootfs);
+    let explicit_release = command.release || file.release.unwrap_or(false);
+    let explicit_debug = debug || command.kernel_debug || file.kernel_debug.unwrap_or(false);
+
+    let (kernel, bootfs) = if let Some(mode) = command.prebuilt {
+        let explicit_profile = match mode {
+            VmPrebuiltMode::Image | VmPrebuiltMode::Kernel => {
+                if explicit_release {
+                    Some("release")
+                } else if explicit_debug {
+                    Some("debug")
+                } else {
+                    None
+                }
+            }
+            VmPrebuiltMode::Userspace => {
+                if let Some(guest_profile) = build.guest_programs_profile {
+                    Some(guest_profile.as_str())
+                } else if explicit_release {
+                    Some("release")
+                } else if explicit_debug {
+                    Some("debug")
+                } else {
+                    None
+                }
+            }
+        };
+        let resolved = resolve_prebuilt(&PrebuiltRequest {
+            mode,
+            arch,
+            explicit_profile,
+            kernel_features: &build.kernel_features,
+            boot_programs: &build.boot_programs,
+            baud,
+            run_id: command.prebuilt_run,
+            git_ref: command.prebuilt_ref.as_deref(),
+            dir: command.prebuilt_dir.as_deref(),
+            host_build_kind: build.kind,
+        })?;
+        match resolved {
+            ResolvedPrebuilt::Image {
+                kernel,
+                bootfs,
+                uefi_image: prebuilt_uefi,
+            } => {
+                if explicit_kernel.is_some() {
+                    return Err(PrebuiltError::ConflictsWithExplicitPath {
+                        mode: "image",
+                        flag: "--kernel",
+                    }
+                    .into());
+                }
+                if explicit_bootfs.is_some() {
+                    return Err(PrebuiltError::ConflictsWithExplicitPath {
+                        mode: "image",
+                        flag: "--bootfs",
+                    }
+                    .into());
+                }
+                uefi_image = prebuilt_uefi;
+                no_build = true;
+                (kernel, bootfs)
+            }
+            ResolvedPrebuilt::Kernel {
+                kernel,
+                root_public_key,
+            } => {
+                if explicit_kernel.is_some() {
+                    return Err(PrebuiltError::ConflictsWithExplicitPath {
+                        mode: "kernel",
+                        flag: "--kernel",
+                    }
+                    .into());
+                }
+                let default_prebuild_dir = kernel_prebuild_dir(&build).ok();
+                let bootfs_matches = verify_kernel_root_key_compatibility(
+                    &root_public_key,
+                    explicit_bootfs.as_deref(),
+                    build.root_secret_key.as_deref(),
+                    default_prebuild_dir.as_deref(),
+                )?;
+                if bootfs_matches {
+                    no_build = true;
+                } else {
+                    build.skip_kernel_build = true;
+                }
+                let bootfs = resolve_bootfs_path(explicit_bootfs, None, &build)?;
+                (kernel, bootfs)
+            }
+            ResolvedPrebuilt::Userspace { dir, guest_profile } => {
+                build.prebuilt_wasm = Some(dir);
+                build.guest_programs_profile = Some(guest_profile);
+                let kernel = resolve_kernel_path(explicit_kernel, None, &build)?;
+                let bootfs = resolve_bootfs_path(explicit_bootfs, None, &build)?;
+                (kernel, bootfs)
+            }
+        }
+    } else {
+        let kernel = resolve_kernel_path(explicit_kernel, None, &build)?;
+        let bootfs = resolve_bootfs_path(explicit_bootfs, None, &build)?;
+        (kernel, bootfs)
+    };
     let smp = command.smp.or(file.smp).unwrap_or(profile.default_smp);
     let max_processors = command.max_processors.or(file.max_processors);
     if let Some(max_processors) = max_processors
@@ -2949,11 +3222,6 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         .bios
         .or(file.bios)
         .or_else(|| profile.default_bios.map(str::to_owned));
-    let baud = if command.baud != DEFAULT_BAUD {
-        command.baud
-    } else {
-        file.baud.unwrap_or(DEFAULT_BAUD)
-    };
     let mut accel = if file.accel.is_empty() && command.accel.is_empty() {
         default_accel(profile)?
     } else {
@@ -3035,6 +3303,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
             arch: arch_label(arch),
         });
     }
+    let mte = resolve_mte(command.mte.or(file.mte), arch, &accel, &memory)?;
     let hostmem = command.renderer_hostmem.or(file.renderer_hostmem);
     let renderer = match (command.renderer.or(file.renderer), hostmem) {
         (Some(kind), hostmem) => Some(VmRendererConfig {
@@ -3088,10 +3357,11 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         qemu_bin,
         kernel,
         bootfs,
+        uefi_image,
         socket: command.socket,
         serial_stdio: command.serial_stdio,
         serial_pty: command.serial_pty,
-        no_build: command.no_build,
+        no_build,
         smp,
         max_processors,
         memory,
@@ -3120,6 +3390,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         keep_runtime_dir,
         acpi,
         iommu,
+        mte,
         desktop,
         display,
         renderer,
@@ -3135,6 +3406,62 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
             .is_some_and(ResolvedVmSessionCommand::needs_qmp),
         command: session_command,
     })
+}
+
+/// The accelerator name of one `-accel` value, which may carry options
+/// after a comma (`tcg,thread=multi`).
+fn accel_name(accel: &str) -> &str {
+    accel.split_once(',').map_or(accel, |(name, _)| name)
+}
+
+/// Whether a `-m` value carries the hotplug keys QEMU's `virt` machine
+/// cannot honour together with allocation-tag storage.
+fn memory_has_hotplug(memory: &str) -> bool {
+    memory.split(',').skip(1).any(|entry| {
+        matches!(
+            entry.split_once('=').map(|(key, _)| key),
+            Some("slots" | "maxmem")
+        )
+    })
+}
+
+/// Whether the machine gets allocation-tag storage.
+///
+/// Unset, it is on for aarch64 when every accelerator is TCG (the only
+/// one QEMU gives tag storage on the hosts this project uses, and not a
+/// session whose `--memory` asks for hotplug, which the storage rules
+/// out) and off otherwise. A stated `on` is refused where QEMU cannot
+/// honour it, before it starts.
+fn resolve_mte(
+    requested: Option<VmMte>,
+    arch: VmArch,
+    accel: &[String],
+    memory: &str,
+) -> Result<bool, VmConfigError> {
+    let aarch64 = arch == VmArch::Aarch64;
+    match requested {
+        Some(VmMte::Off) => Ok(false),
+        Some(VmMte::On) => {
+            if !aarch64 {
+                return Err(VmConfigError::MteUnavailable {
+                    arch: arch_label(arch),
+                });
+            }
+            if accel.iter().any(|value| accel_name(value) == "hvf") {
+                return Err(VmConfigError::MteUnderHvf);
+            }
+            if memory_has_hotplug(memory) {
+                return Err(VmConfigError::MteWithMemoryHotplug {
+                    memory: memory.to_owned(),
+                });
+            }
+            Ok(true)
+        }
+        None => Ok(aarch64
+            && !accel.is_empty()
+            && accel.iter().all(|value| accel_name(value) == "tcg")
+            && !memory_has_hotplug(memory)),
+    }
 }
 
 fn load_config_file(path: Option<&Path>) -> Result<VmConfigFile, VmConfigError> {
@@ -3334,6 +3661,9 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
         )?;
     }
     run_kernel_prebuild(command)?;
+    if command.skip_kernel_build {
+        return Ok(());
+    }
     let kernel_label = match &command.profile_use {
         // Which profile a PGO kernel was built from is part of what it
         // is, so the build says it rather than leaving a release build
@@ -3595,9 +3925,12 @@ fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
         .arg("--target")
         .arg(command.profile.cargo_target)
         .arg("--profile")
-        .arg(command.kind.guest_programs())
+        .arg(command.guest_programs_profile())
         .arg("--cargo")
         .arg("cargo");
+    if let Some(prebuilt_wasm) = &command.prebuilt_wasm {
+        prebuild.arg("--prebuilt-wasm").arg(prebuilt_wasm);
+    }
     for program in &command.boot_programs {
         prebuild.arg("--boot-program").arg(program);
     }
@@ -5013,12 +5346,25 @@ fn prepare_limine_uefi_image(
         Some(dir) => dir.join("kernel.uefi.img"),
         None => kernel.with_extension("uefi.img"),
     };
+    if let Some(prebuilt_uefi) = &command.uefi_image {
+        if prebuilt_uefi != &image {
+            fs::copy(prebuilt_uefi, &image).map_err(|source| {
+                VmRuntimeError::CopyPrebuiltUefiImage {
+                    from: prebuilt_uefi.display().to_string(),
+                    to: image.display().to_string(),
+                    source,
+                }
+            })?;
+        }
+        return Ok(image);
+    }
     let spinner = spinner(&format!(
         "building {} Limine UEFI disk image",
         arch_label(command.profile.arch)
     ));
     let cli = discover_helios_cli(command.build.kind)?;
-    let status = Command::new(&cli)
+    let mut limine_command = Command::new(&cli);
+    limine_command
         .arg("limine-uefi-image")
         .arg("--kernel")
         .arg(&kernel)
@@ -5029,12 +5375,9 @@ fn prepare_limine_uefi_image(
         .arg("--baud")
         .arg(command.baud.to_string())
         .arg("--efi-arch")
-        .arg(limine_efi_arch_argument(command.profile.arch))
-        .status()
-        .map_err(|source| BuildStepError::Spawn {
-            label: format!("{}", cli.display()),
-            source,
-        })?;
+        .arg(limine_efi_arch_argument(command.profile.arch));
+    let cli_label = format!("{}", cli.display());
+    let status = run_command_with_spinner(&cli_label, &mut limine_command, &spinner)?;
     if !status.success() {
         spinner.finish_and_clear();
         return Err(BuildStepError::Exited {
@@ -5123,10 +5466,13 @@ fn arch_label(arch: VmArch) -> &'static str {
 
 fn run_step(label: &str, command: &mut Command) -> Result<(), BuildStepError> {
     let spinner = spinner(label);
-    let status = command.status().map_err(|source| BuildStepError::Spawn {
-        label: label.to_owned(),
-        source,
-    })?;
+    let status = match run_command_with_spinner(label, command, &spinner) {
+        Ok(status) => status,
+        Err(error) => {
+            spinner.finish_and_clear();
+            return Err(error);
+        }
+    };
     if status.success() {
         spinner.finish_with_message(format!("{} {}", style("built").green(), label));
         return Ok(());
@@ -5136,6 +5482,162 @@ fn run_step(label: &str, command: &mut Command) -> Result<(), BuildStepError> {
         label: label.to_owned(),
         status,
     })
+}
+
+/// Runs `command` while `spinner` is active on stderr.
+///
+/// When `spinner` is drawing to an interactive terminal, inheriting stdio lets
+/// child tools (such as `cargo` under `helios-cli kernel-prebuild`) write
+/// directly to the same TTY while the 80 ms spinner ticker repaints, scrambling
+/// lines with padding spaces and duplicated spinner frames. Piping both streams
+/// and routing completed lines through [`ProgressBar::println`] lets
+/// `indicatif` clear the spinner line, print the child's line above it, and
+/// redraw the spinner cleanly.
+fn run_command_with_spinner(
+    label: &str,
+    command: &mut Command,
+    spinner: &ProgressBar,
+) -> Result<std::process::ExitStatus, BuildStepError> {
+    if spinner.is_hidden() {
+        return command.status().map_err(|source| BuildStepError::Spawn {
+            label: label.to_owned(),
+            source,
+        });
+    }
+    run_command_piped_to_spinner(label, command, spinner)
+}
+
+fn run_command_piped_to_spinner(
+    label: &str,
+    command: &mut Command,
+    spinner: &ProgressBar,
+) -> Result<std::process::ExitStatus, BuildStepError> {
+    configure_piped_cargo_env(command);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|source| BuildStepError::Spawn {
+        label: label.to_owned(),
+        source,
+    })?;
+    let stdout = child.stdout.take().expect("child stdout was piped");
+    let stderr = child.stderr.take().expect("child stderr was piped");
+
+    let (stdout_result, stderr_result) = std::thread::scope(|scope| {
+        let out_handle = scope.spawn(|| forward_stream_to_spinner(stdout, spinner));
+        let err_result = forward_stream_to_spinner(stderr, spinner);
+        let out_result = out_handle
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("stdout reader thread panicked")));
+        (out_result, err_result)
+    });
+
+    let status = child.wait().map_err(|source| BuildStepError::Spawn {
+        label: label.to_owned(),
+        source,
+    })?;
+    stdout_result.map_err(|source| BuildStepError::Captured {
+        label: label.to_owned(),
+        source,
+    })?;
+    stderr_result.map_err(|source| BuildStepError::Captured {
+        label: label.to_owned(),
+        source,
+    })?;
+    Ok(status)
+}
+
+/// Keeps Cargo's ANSI colors when piped to an interactive spinner while
+/// suppressing Cargo's own `\r` progress bar so it does not compete with ours.
+fn configure_piped_cargo_env(command: &mut Command) {
+    if std::env::var_os("CARGO_TERM_PROGRESS_WHEN").is_none() {
+        command.env("CARGO_TERM_PROGRESS_WHEN", "never");
+    }
+    if std::env::var_os("CARGO_TERM_COLOR").is_none() {
+        command.env("CARGO_TERM_COLOR", "always");
+    }
+}
+
+fn forward_stream_to_spinner(stream: impl io::Read, spinner: &ProgressBar) -> io::Result<()> {
+    forward_lines(io::BufReader::new(stream), |line| spinner.println(line))
+}
+
+fn forward_lines(mut reader: impl io::BufRead, mut emit: impl FnMut(&str)) -> io::Result<()> {
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        let raw = String::from_utf8_lossy(&buf);
+        if let Some(line) = normalize_spinner_line(&raw) {
+            emit(line);
+        }
+    }
+    Ok(())
+}
+
+/// Normalizes a raw line read from a child process before printing above a
+/// spinner.
+///
+/// Plain `\n` / `\r\n` blank lines are preserved (`Some("")`) so multi-line
+/// compiler diagnostics keep their spacing; lines containing carriage-return
+/// overwrites keep only the final non-empty segment so progress-bar clears do
+/// not emit empty lines.
+fn normalize_spinner_line(raw: &str) -> Option<&str> {
+    let trimmed = raw.strip_suffix('\n').unwrap_or(raw);
+    let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
+    if !trimmed.contains('\r') {
+        return Some(trimmed);
+    }
+    trimmed
+        .rsplit('\r')
+        .find(|segment| !segment.trim().is_empty())
+}
+
+/// `io::Write` adapter that forwards completed lines through an active
+/// `indicatif` spinner so `filter_pgo_stderr` never writes raw bytes over the
+/// spinner line on a TTY.
+struct SpinnerLineWriter<'a> {
+    spinner: &'a ProgressBar,
+    pending: Vec<u8>,
+}
+
+impl<'a> SpinnerLineWriter<'a> {
+    fn new(spinner: &'a ProgressBar) -> Self {
+        Self {
+            spinner,
+            pending: Vec::new(),
+        }
+    }
+
+    fn flush_complete_lines(&mut self) {
+        while let Some(newline) = self.pending.iter().position(|&byte| byte == b'\n') {
+            let chunk: Vec<u8> = self.pending.drain(..=newline).collect();
+            let raw = String::from_utf8_lossy(&chunk);
+            if let Some(line) = normalize_spinner_line(&raw) {
+                self.spinner.println(line);
+            }
+        }
+    }
+}
+
+impl io::Write for SpinnerLineWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.pending.extend_from_slice(buf);
+        self.flush_complete_lines();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_complete_lines();
+        if !self.pending.is_empty() {
+            let raw = String::from_utf8_lossy(&self.pending);
+            if let Some(line) = normalize_spinner_line(&raw) {
+                self.spinner.println(line);
+            }
+            self.pending.clear();
+        }
+        Ok(())
+    }
 }
 
 /// The missing-function warnings a profile-use kernel build emitted.
@@ -5197,20 +5699,46 @@ fn run_pgo_kernel_step(
     kernel: &Path,
 ) -> Result<(), BuildStepError> {
     let spinner = spinner(label);
+    let pipe_stdout = !spinner.is_hidden();
+    if pipe_stdout {
+        configure_piped_cargo_env(command);
+        command.stdout(Stdio::piped());
+    }
     command.stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|source| BuildStepError::Spawn {
         label: label.to_owned(),
         source,
     })?;
+    let stdout = pipe_stdout.then(|| {
+        child
+            .stdout
+            .take()
+            .expect("the kernel build's stdout was piped")
+    });
     let stderr = child
         .stderr
         .take()
         .expect("the kernel build's stderr was piped");
-    // Each forwarded line takes the stderr lock for that one write; a
-    // lock held for the whole build would freeze the spinner's ticker
-    // thread on the longest step of the job.
-    let mut forward = io::stderr();
-    let uncovered = match filter_pgo_stderr(label, &mut io::BufReader::new(stderr), &mut forward) {
+    let (stdout_result, uncovered_result) = std::thread::scope(|scope| {
+        let out_handle = stdout.map(|out| scope.spawn(|| forward_stream_to_spinner(out, &spinner)));
+        let uncovered_result = if spinner.is_hidden() {
+            let mut forward = io::stderr();
+            filter_pgo_stderr(label, &mut io::BufReader::new(stderr), &mut forward)
+        } else {
+            let mut forward = SpinnerLineWriter::new(&spinner);
+            let res = filter_pgo_stderr(label, &mut io::BufReader::new(stderr), &mut forward);
+            let _ = io::Write::flush(&mut forward);
+            res
+        };
+        let out_result = match out_handle {
+            Some(handle) => handle
+                .join()
+                .unwrap_or_else(|_| Err(io::Error::other("stdout reader thread panicked"))),
+            None => Ok(()),
+        };
+        (out_result, uncovered_result)
+    });
+    let uncovered = match uncovered_result {
         Ok(uncovered) => uncovered,
         Err(error) => {
             // Reap rather than orphan the build, and leave the spinner
@@ -5224,6 +5752,13 @@ fn run_pgo_kernel_step(
         label: label.to_owned(),
         source,
     })?;
+    if let Err(source) = stdout_result {
+        spinner.finish_and_clear();
+        return Err(BuildStepError::Captured {
+            label: label.to_owned(),
+            source,
+        });
+    }
     if !status.success() {
         spinner.finish_and_clear();
         return Err(BuildStepError::Exited {
@@ -6569,14 +7104,21 @@ fn configure_entropy_device(
 }
 
 /// The `-machine` option list this session boots, which is the ACPI
-/// variant only when `--acpi` asked for it and the profile has one.
-fn machine(command: &ResolvedVmCommand) -> &'static str {
-    if command.acpi {
-        return command.profile.acpi_machine.unwrap_or_else(|| {
+/// variant only when `--acpi` asked for it and the profile has one, with
+/// `mte=on` when the session resolved to allocation-tag storage.
+fn machine(command: &ResolvedVmCommand) -> String {
+    let base = if command.acpi {
+        command.profile.acpi_machine.unwrap_or_else(|| {
             unreachable!("--acpi is refused on a machine profile that publishes no ACPI tables")
-        });
+        })
+    } else {
+        command.profile.machine
+    };
+    let mut options = QemuOptions::new(base);
+    if command.mte {
+        options.set("mte", "on");
     }
-    command.profile.machine
+    options.to_string()
 }
 
 /// The processor count and the guest RAM backends.
@@ -6902,6 +7444,8 @@ mod tests {
         },
         #[error("expected a {CFI_VIOLATION_MESSAGE:?} panic from the guest, got: {outcome}")]
         NotAControlFlowViolation { outcome: String },
+        #[error("expected a {MTE_FAULT_MESSAGE:?} panic from the guest, got: {outcome}")]
+        NotATagCheckFault { outcome: String },
         #[error("socket path must be valid UTF-8")]
         SocketPathNotUtf8,
         #[error("failed to connect {purpose} RPC client: {source}")]
@@ -6972,6 +7516,8 @@ mod tests {
     /// What the aarch64 kernel's panic carries when a return address fails
     /// authentication (`aarch64/src/cfi.rs`).
     const CFI_VIOLATION_MESSAGE: &str = "control-flow violation:";
+    const MTE_FAULT_MESSAGE: &str = "AArch64 synchronous tag check fault:";
+    const MTE_FREE_TAG_MESSAGE: &str = "holds tag 0x0";
     const WATCHDOG_TIMEOUT_SECS: &str = "10";
     const WATCHDOG_STAGE_TIMEOUT: Duration = Duration::from_secs(120);
     const DIRECT_EXEC_TIMEOUT: Duration = Duration::from_secs(900);
@@ -7716,6 +8262,100 @@ mod tests {
         assert_eq!(machine(&command), "virt,gic-version=3,acpi=on");
     }
 
+    /// Resolves an aarch64 session on the given accelerator, with the
+    /// given `--mte` and `--memory`, against no config file.
+    fn resolve_mte_session(
+        arch: VmArch,
+        accel: &str,
+        mte: Option<VmMte>,
+        memory: Option<&str>,
+    ) -> Result<ResolvedVmCommand, VmConfigError> {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        resolve(VmCommand {
+            arch,
+            accel: vec![accel.to_owned()],
+            mte,
+            memory: memory.map(str::to_owned),
+            config: Some(tempdir.path().join("missing-vm.json")),
+            ..minimal_command()
+        })
+    }
+
+    #[test]
+    fn aarch64_tcg_boots_carry_mte_on() {
+        let mut resolved = resolve_mte_session(VmArch::Aarch64, "tcg", None, None)
+            .expect("a default aarch64 TCG session resolves");
+        assert!(resolved.mte);
+        assert_eq!(machine(&resolved), "virt,gic-version=3,acpi=off,mte=on");
+        assert_eq!(
+            machine_options(&resolved).to_string(),
+            "virt,gic-version=3,acpi=off,mte=on"
+        );
+        resolved.acpi = true;
+        assert_eq!(machine(&resolved), "virt,gic-version=3,acpi=on,mte=on");
+    }
+
+    #[test]
+    fn aarch64_hvf_default_has_no_mte() {
+        for accel in ["hvf", "kvm"] {
+            let resolved = resolve_mte_session(VmArch::Aarch64, accel, None, None)
+                .expect("a default native aarch64 session resolves");
+            assert!(!resolved.mte, "{accel}");
+            assert_eq!(machine(&resolved), "virt,gic-version=3,acpi=off", "{accel}");
+        }
+    }
+
+    #[test]
+    fn mte_on_under_hvf_is_refused() {
+        let error = resolve_mte_session(VmArch::Aarch64, "hvf", Some(VmMte::On), None)
+            .expect_err("QEMU gives HVF guests no allocation-tag storage");
+        assert!(matches!(error, VmConfigError::MteUnderHvf), "{error}");
+        assert!(error.to_string().contains("HVF"), "{error}");
+
+        let kvm = resolve_mte_session(VmArch::Aarch64, "kvm", Some(VmMte::On), None)
+            .expect("KVM passes the request through to QEMU");
+        assert_eq!(machine(&kvm), "virt,gic-version=3,acpi=off,mte=on");
+    }
+
+    #[test]
+    fn mte_off_under_tcg_drops_it() {
+        let resolved = resolve_mte_session(VmArch::Aarch64, "tcg", Some(VmMte::Off), None)
+            .expect("an aarch64 TCG session without tag storage resolves");
+        assert!(!resolved.mte);
+        assert_eq!(machine(&resolved), "virt,gic-version=3,acpi=off");
+    }
+
+    #[test]
+    fn mte_on_for_riscv_is_refused() {
+        for arch in [VmArch::Riscv64, VmArch::X86_64] {
+            let error = resolve_mte_session(arch, "tcg", Some(VmMte::On), None)
+                .expect_err("only the aarch64 machine has allocation-tag storage");
+            assert!(
+                matches!(error, VmConfigError::MteUnavailable { .. }),
+                "unexpected error for {arch:?}: {error}"
+            );
+            let default =
+                resolve_mte_session(arch, "tcg", None, None).expect("a default session resolves");
+            assert!(!default.mte, "{arch:?}");
+        }
+    }
+
+    #[test]
+    fn mte_on_with_memory_hotplug_is_refused() {
+        for memory in ["2G,slots=4,maxmem=8G", "2G,maxmem=8G"] {
+            let error = resolve_mte_session(VmArch::Aarch64, "tcg", Some(VmMte::On), Some(memory))
+                .expect_err("QEMU disables memory hotplug with tag storage");
+            assert!(
+                matches!(error, VmConfigError::MteWithMemoryHotplug { .. }),
+                "{memory}: {error}"
+            );
+            let default = resolve_mte_session(VmArch::Aarch64, "tcg", None, Some(memory))
+                .expect("an unstated --mte does not refuse");
+            assert!(!default.mte, "{memory}");
+        }
+    }
+
     #[test]
     fn only_the_aarch64_machines_can_publish_acpi_tables() {
         assert_eq!(
@@ -8004,6 +8644,9 @@ mod tests {
             profile_use: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
+            guest_programs_profile: None,
+            prebuilt_wasm: None,
+            skip_kernel_build: false,
             no_compiler_plugin: true,
             root_secret_key: None,
             bootfs_root: None,
@@ -8053,6 +8696,9 @@ mod tests {
                     profile_use: None,
                     kernel_features: Vec::new(),
                     boot_programs: Vec::new(),
+                    guest_programs_profile: None,
+                    prebuilt_wasm: None,
+                    skip_kernel_build: false,
                     no_compiler_plugin: true,
                     root_secret_key: None,
                     bootfs_root: None,
@@ -8577,6 +9223,9 @@ mod tests {
             profile_use: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
+            guest_programs_profile: None,
+            prebuilt_wasm: None,
+            skip_kernel_build: false,
             no_compiler_plugin: false,
             root_secret_key: Some(PathBuf::from("/run/release/root.key")),
             bootfs_root: None,
@@ -8620,6 +9269,10 @@ mod tests {
             serial_stdio: false,
             serial_pty: false,
             no_build: true,
+            prebuilt: None,
+            prebuilt_run: None,
+            prebuilt_ref: None,
+            prebuilt_dir: None,
             smp: None,
             max_processors: None,
             memory: None,
@@ -8649,12 +9302,14 @@ mod tests {
             kill_after_lines: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
+            guest_programs_profile: None,
             no_compiler_plugin: false,
             bootfs_root: None,
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,
             iommu: false,
+            mte: None,
             virtio_packed: false,
             virtio_in_order: false,
             desktop: false,
@@ -8693,6 +9348,10 @@ mod tests {
             serial_stdio: false,
             serial_pty: false,
             no_build: true,
+            prebuilt: None,
+            prebuilt_run: None,
+            prebuilt_ref: None,
+            prebuilt_dir: None,
             smp: None,
             max_processors: None,
             memory: None,
@@ -8722,12 +9381,14 @@ mod tests {
             kill_after_lines: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
+            guest_programs_profile: None,
             no_compiler_plugin: false,
             bootfs_root: None,
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,
             iommu: false,
+            mte: None,
             virtio_packed: false,
             virtio_in_order: false,
             desktop: false,
@@ -9375,6 +10036,10 @@ mod tests {
             serial_stdio: false,
             serial_pty: false,
             no_build: true,
+            prebuilt: None,
+            prebuilt_run: None,
+            prebuilt_ref: None,
+            prebuilt_dir: None,
             smp: None,
             max_processors: None,
             memory: None,
@@ -9404,12 +10069,14 @@ mod tests {
             kill_after_lines: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
+            guest_programs_profile: None,
             no_compiler_plugin: false,
             bootfs_root: None,
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,
             iommu: false,
+            mte: None,
             virtio_packed: false,
             virtio_in_order: false,
             desktop: false,
@@ -9491,6 +10158,48 @@ mod tests {
         }
     }
 
+    /// The aarch64 kernel built with `HELIOS_MTE_SELF_TEST` reads into a
+    /// `Tag::FREE` redzone through a live-tagged pointer once every processor
+    /// has started, so a machine with FEAT_MTE2 enabled panics with a
+    /// synchronous tag check fault naming the faulting granule and `0x0` tag.
+    #[test]
+    #[ignore = "requires qemu and a cross-compiled aarch64 kernel"]
+    fn mte_self_test_panics_aarch64() -> Result<(), GuestTestFailure> {
+        let mut command = guest_test_command(&AARCH64_VIRT_TCG_PROFILE);
+        command.mte = true;
+        build_self_test_kernel(&command, &[("HELIOS_MTE_SELF_TEST", "1")])?;
+        let mut runtime = VmRuntime::spawn(&command)?;
+        let socket = runtime
+            .socket_path()
+            .to_str()
+            .ok_or(GuestTestFailure::SocketPathNotUtf8)?
+            .to_owned();
+        let baud = command.baud;
+        let outcome = crate::runtime::block_on(async move {
+            let io = crate::serial::open(&socket, baud)
+                .await
+                .map_err(|source| GuestTestFailure::OpenSerial { source })?;
+            let (read, _write) = io.into_split();
+            Ok::<_, GuestTestFailure>(crate::ready::wait_for_boot(read).await.map(drop))
+        })?;
+        runtime.shutdown();
+        match outcome {
+            Err(crate::ready::BootError::GuestPanicked { report, trailer })
+                if (report.contains(MTE_FAULT_MESSAGE) || trailer.contains(MTE_FAULT_MESSAGE))
+                    && (report.contains(MTE_FREE_TAG_MESSAGE)
+                        || trailer.contains(MTE_FREE_TAG_MESSAGE)) =>
+            {
+                Ok(())
+            }
+            Err(other) => Err(GuestTestFailure::NotATagCheckFault {
+                outcome: other.to_string(),
+            }),
+            Ok(()) => Err(GuestTestFailure::NotATagCheckFault {
+                outcome: "the guest booted to the debugger".to_owned(),
+            }),
+        }
+    }
+
     fn assert_watchdog_reset(arch: VmArch) -> Result<(), GuestTestFailure> {
         let command = watchdog_test_command(arch);
         build_self_test_kernel(
@@ -9558,6 +10267,9 @@ mod tests {
             profile_use: None,
             kernel_features: Vec::new(),
             boot_programs: vec!["debugger".to_owned()],
+            guest_programs_profile: None,
+            prebuilt_wasm: None,
+            skip_kernel_build: false,
             no_compiler_plugin: true,
             root_secret_key: None,
             bootfs_root: None,
@@ -9570,6 +10282,7 @@ mod tests {
             bootfs: kernel_prebuild_dir(&build)
                 .expect("workspace root must resolve")
                 .join("helios-bootfs"),
+            uefi_image: None,
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -9606,6 +10319,7 @@ mod tests {
             keep_runtime_dir: false,
             acpi: false,
             iommu: false,
+            mte: false,
             desktop: false,
             display: VmDisplayBackend::None,
             renderer: None,
@@ -9779,6 +10493,9 @@ mod tests {
             profile_use: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
+            guest_programs_profile: None,
+            prebuilt_wasm: None,
+            skip_kernel_build: false,
             no_compiler_plugin: false,
             root_secret_key: None,
             bootfs_root: None,
@@ -9791,6 +10508,7 @@ mod tests {
             bootfs: kernel_prebuild_dir(&build)
                 .expect("workspace root must resolve")
                 .join("helios-bootfs"),
+            uefi_image: None,
             socket: None,
             serial_stdio: false,
             serial_pty: false,
@@ -9827,6 +10545,7 @@ mod tests {
             keep_runtime_dir: false,
             acpi: false,
             iommu: false,
+            mte: false,
             desktop: false,
             display: VmDisplayBackend::None,
             renderer: None,
@@ -9950,5 +10669,331 @@ mod tests {
             stages: observed_stages.join(" | "),
             lines: recent_lines.join(" | "),
         })
+    }
+
+    #[test]
+    fn resolve_prebuilt_image_skips_build_and_pgo_and_reuses_uefi_image() {
+        use ed25519_dalek::{SigningKey, VerifyingKey};
+        use helios_artifact::bootfs::{EntryKind, WriteEntry, sign_image, write_image};
+        use helios_workspace_root::prebuilt_manifest::{
+            BOOTFS_IMAGE_FILE, KERNEL_IMAGE_FILE, PREBUILT_SCHEMA_VERSION, PrebuiltArtifactKind,
+            PrebuiltManifest, PrebuiltPrograms, UEFI_DISK_IMAGE_FILE, sha256_hex, write_manifest,
+        };
+
+        let dir = TempDir::new().expect("temp dir");
+        let signing = SigningKey::from_bytes(&[3_u8; 32]);
+        let pubkey = VerifyingKey::from(&signing).to_bytes();
+        let body = write_image(&[
+            WriteEntry {
+                kind: EntryKind::InitComponent,
+                path: "bin/init",
+                data: b"init",
+                modified_nanos: 0,
+            },
+            WriteEntry {
+                kind: EntryKind::InitArgv0,
+                path: "/bin/init",
+                data: &[],
+                modified_nanos: 0,
+            },
+        ]);
+        fs::write(dir.path().join(KERNEL_IMAGE_FILE), b"elf").expect("write kernel");
+        fs::write(
+            dir.path().join(BOOTFS_IMAGE_FILE),
+            sign_image(body, &signing),
+        )
+        .expect("write bootfs");
+        fs::write(dir.path().join(ROOT_PUBLIC_FILE), pubkey).expect("write pubkey");
+        fs::write(dir.path().join(UEFI_DISK_IMAGE_FILE), b"uefi-disk").expect("write uefi");
+        write_manifest(
+            dir.path(),
+            &PrebuiltManifest {
+                schema_version: PREBUILT_SCHEMA_VERSION,
+                kind: PrebuiltArtifactKind::Image,
+                commit: Some("abcdef1234567890".to_owned()),
+                arch: Some("x86-64".to_owned()),
+                profile: "release-linux".to_owned(),
+                kernel_features: vec!["linux".to_owned()],
+                programs: Some(PrebuiltPrograms::Subset(vec![
+                    "debugger".to_owned(),
+                    "init".to_owned(),
+                ])),
+                files: vec![
+                    KERNEL_IMAGE_FILE.to_owned(),
+                    BOOTFS_IMAGE_FILE.to_owned(),
+                    ROOT_PUBLIC_FILE.to_owned(),
+                    UEFI_DISK_IMAGE_FILE.to_owned(),
+                ],
+                root_public_key_sha256: Some(sha256_hex(&pubkey)),
+                baud: Some(DEFAULT_BAUD),
+            },
+        )
+        .expect("write manifest");
+
+        let resolved = resolve(VmCommand {
+            arch: VmArch::X86_64,
+            release: true,
+            no_build: false,
+            kernel_features: vec!["linux".to_owned()],
+            boot_programs: vec!["debugger".to_owned()],
+            prebuilt: Some(VmPrebuiltMode::Image),
+            prebuilt_dir: Some(dir.path().to_path_buf()),
+            ..minimal_command()
+        })
+        .expect("prebuilt image resolves without needing PGO profile");
+
+        assert!(resolved.no_build);
+        assert_eq!(resolved.kernel, dir.path().join(KERNEL_IMAGE_FILE));
+        assert_eq!(resolved.bootfs, dir.path().join(BOOTFS_IMAGE_FILE));
+        assert_eq!(
+            resolved.uefi_image,
+            Some(dir.path().join(UEFI_DISK_IMAGE_FILE))
+        );
+
+        let runtime_dir = TempDir::new().expect("runtime dir");
+        let copied = prepare_limine_uefi_image(&resolved, Some(runtime_dir.path()))
+            .expect("prebuilt UEFI image copies directly without Limine");
+        assert_eq!(copied, runtime_dir.path().join(UEFI_DISK_IMAGE_FILE));
+        assert_eq!(fs::read(&copied).expect("read copied uefi"), b"uefi-disk");
+    }
+
+    #[test]
+    fn resolve_prebuilt_userspace_wires_prebuilt_wasm_and_profile() {
+        use helios_workspace_root::prebuilt_manifest::{
+            PREBUILT_SCHEMA_VERSION, PrebuiltArtifactKind, PrebuiltManifest, PrebuiltPrograms,
+            write_manifest,
+        };
+
+        let dir = TempDir::new().expect("temp dir");
+        fs::write(dir.path().join("helios_init.wasm"), b"wasm").expect("write wasm");
+        write_manifest(
+            dir.path(),
+            &PrebuiltManifest {
+                schema_version: PREBUILT_SCHEMA_VERSION,
+                kind: PrebuiltArtifactKind::Userspace,
+                commit: None,
+                arch: None,
+                profile: "release".to_owned(),
+                kernel_features: Vec::new(),
+                programs: Some(PrebuiltPrograms::All),
+                files: vec!["helios_init.wasm".to_owned()],
+                root_public_key_sha256: None,
+                baud: None,
+            },
+        )
+        .expect("write manifest");
+
+        let resolved = resolve(VmCommand {
+            arch: VmArch::Riscv64,
+            no_build: false,
+            prebuilt: Some(VmPrebuiltMode::Userspace),
+            prebuilt_dir: Some(dir.path().to_path_buf()),
+            ..minimal_command()
+        })
+        .expect("prebuilt userspace resolves cleanly");
+
+        assert!(!resolved.no_build);
+        assert_eq!(resolved.build.prebuilt_wasm.as_deref(), Some(dir.path()));
+        assert_eq!(resolved.build.guest_programs_profile(), "release");
+    }
+
+    #[test]
+    fn resolve_guest_programs_profile_decouples_userspace_from_release_kernel() {
+        let resolved = resolve(VmCommand {
+            arch: VmArch::Aarch64,
+            release: true,
+            guest_programs_profile: Some(GuestProgramsProfile::Debug),
+            ..minimal_command()
+        })
+        .expect("release kernel with debug guest programs resolves");
+
+        assert_eq!(resolved.build.kind, KernelBuildProfile::Release);
+        assert_eq!(resolved.build.guest_programs_profile(), "debug");
+    }
+
+    #[test]
+    fn resolve_prebuilt_kernel_checks_root_key_compatibility() {
+        use ed25519_dalek::{SigningKey, VerifyingKey};
+        use helios_workspace_root::prebuilt_manifest::{
+            KERNEL_IMAGE_FILE, PREBUILT_SCHEMA_VERSION, PrebuiltArtifactKind, PrebuiltManifest,
+            sha256_hex, write_manifest,
+        };
+        use helios_workspace_root::root_key::SECRET_KEY_MODE;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().expect("temp dir");
+        let seed = [42_u8; 32];
+        let signing = SigningKey::from_bytes(&seed);
+        let pubkey = VerifyingKey::from(&signing).to_bytes();
+        fs::write(dir.path().join(KERNEL_IMAGE_FILE), b"elf").expect("write kernel");
+        fs::write(dir.path().join(ROOT_PUBLIC_FILE), pubkey).expect("write pubkey");
+        write_manifest(
+            dir.path(),
+            &PrebuiltManifest {
+                schema_version: PREBUILT_SCHEMA_VERSION,
+                kind: PrebuiltArtifactKind::Kernel,
+                commit: None,
+                arch: Some("x86-64".to_owned()),
+                profile: "release".to_owned(),
+                kernel_features: Vec::new(),
+                programs: None,
+                files: vec![KERNEL_IMAGE_FILE.to_owned(), ROOT_PUBLIC_FILE.to_owned()],
+                root_public_key_sha256: Some(sha256_hex(&pubkey)),
+                baud: None,
+            },
+        )
+        .expect("write manifest");
+
+        // Without matching --bootfs or --root-secret-key, fails fast!
+        let missing = resolve(VmCommand {
+            arch: VmArch::X86_64,
+            release: true,
+            no_build: false,
+            prebuilt: Some(VmPrebuiltMode::Kernel),
+            prebuilt_dir: Some(dir.path().to_path_buf()),
+            ..minimal_command()
+        })
+        .expect_err("prebuilt kernel without matching key must fail fast");
+        assert!(matches!(
+            missing,
+            VmConfigError::Prebuilt(PrebuiltError::KernelRootKeyUnavailable { .. })
+        ));
+
+        // With matching --root-secret-key, resolves with skip_kernel_build = true!
+        let secret_dir = TempDir::new().expect("secret dir");
+        let secret_path = secret_dir.path().join("root.key");
+        fs::write(&secret_path, seed).expect("write secret");
+        fs::set_permissions(&secret_path, fs::Permissions::from_mode(SECRET_KEY_MODE))
+            .expect("chmod 600");
+
+        let resolved = resolve(VmCommand {
+            arch: VmArch::X86_64,
+            release: true,
+            no_build: false,
+            root_secret_key: Some(secret_path),
+            prebuilt: Some(VmPrebuiltMode::Kernel),
+            prebuilt_dir: Some(dir.path().to_path_buf()),
+            ..minimal_command()
+        })
+        .expect("matching root secret key allows local bootfs build");
+        assert!(!resolved.no_build);
+        assert!(resolved.build.skip_kernel_build);
+        assert_eq!(resolved.kernel, dir.path().join(KERNEL_IMAGE_FILE));
+    }
+
+    #[test]
+    fn cli_parses_prebuilt_and_guest_programs_profile_flags() {
+        use clap::Parser;
+
+        let parsed = crate::Args::try_parse_from([
+            "helios-inspector",
+            "vm",
+            "--arch",
+            "x86-64",
+            "--release",
+            "--guest-programs-profile",
+            "debug",
+            "--prebuilt",
+            "image",
+            "--prebuilt-dir",
+            "/tmp/prebuilt",
+            "shell",
+            "-c",
+            "echo ok",
+        ])
+        .expect("vm --prebuilt image parses");
+        let Some(crate::Command::Vm(vm)) = parsed.command else {
+            panic!("expected Vm command");
+        };
+        assert_eq!(vm.prebuilt, Some(VmPrebuiltMode::Image));
+        assert_eq!(vm.prebuilt_dir, Some(PathBuf::from("/tmp/prebuilt")));
+        assert_eq!(vm.guest_programs_profile, Some(GuestProgramsProfile::Debug));
+
+        let bare = crate::Args::try_parse_from([
+            "helios-inspector",
+            "vm",
+            "--prebuilt",
+            "--arch",
+            "x86-64",
+            "shell",
+            "-c",
+            "echo ok",
+        ])
+        .expect("bare --prebuilt defaults to image");
+        let Some(crate::Command::Vm(vm)) = bare.command else {
+            panic!("expected Vm command");
+        };
+        assert_eq!(vm.prebuilt, Some(VmPrebuiltMode::Image));
+    }
+
+    #[test]
+    fn guest_programs_profile_override_decouples_bootfs_from_release_kernel() {
+        let mut build = KernelBuildSpec {
+            profile: &X86_64_VM_PROFILE,
+            kind: KernelBuildProfile::Release,
+            profile_use: None,
+            kernel_features: Vec::new(),
+            boot_programs: vec!["debugger".to_owned()],
+            guest_programs_profile: None,
+            prebuilt_wasm: None,
+            skip_kernel_build: false,
+            no_compiler_plugin: true,
+            root_secret_key: None,
+            bootfs_root: None,
+        };
+        assert_eq!(build.guest_programs_profile(), "release");
+        build.guest_programs_profile = Some(GuestProgramsProfile::Debug);
+        assert_eq!(build.guest_programs_profile(), "debug");
+        build.kind = KernelBuildProfile::Debug;
+        build.guest_programs_profile = Some(GuestProgramsProfile::Release);
+        assert_eq!(build.guest_programs_profile(), "release");
+    }
+
+    #[test]
+    fn normalize_spinner_line_preserves_blank_lines_and_collapses_carriage_returns() {
+        assert_eq!(
+            normalize_spinner_line("   Compiling syn v3.0.10\n"),
+            Some("   Compiling syn v3.0.10")
+        );
+        assert_eq!(normalize_spinner_line("line\r\n"), Some("line"));
+        assert_eq!(normalize_spinner_line("\n"), Some(""));
+        assert_eq!(normalize_spinner_line("\r\n"), Some(""));
+        assert_eq!(
+            normalize_spinner_line(
+                "  Building [=> ] 1/10\r  Building [==>] 2/10\r   Compiling foo\n"
+            ),
+            Some("   Compiling foo")
+        );
+        assert_eq!(normalize_spinner_line("   \r   \n"), None);
+    }
+
+    #[test]
+    fn forward_lines_handles_multiline_and_carriage_returns() {
+        let input = b"   Compiling a\n\nold\rnew\n   \r   \nlast without newline";
+        let mut emitted = Vec::new();
+        forward_lines(io::Cursor::new(&input[..]), |line| {
+            emitted.push(line.to_owned())
+        })
+        .expect("cursor read never fails");
+        assert_eq!(
+            emitted,
+            vec!["   Compiling a", "", "new", "last without newline"]
+        );
+    }
+
+    #[test]
+    fn piped_spinner_drains_large_stdout_and_stderr_concurrently_without_deadlock() {
+        let bar = ProgressBar::hidden();
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            "i=0; while [ $i -lt 2000 ]; do \
+               printf 'stdout-line-%04d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n' $i; \
+               printf 'stderr-line-%04d-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\\n' $i >&2; \
+               i=$((i + 1)); \
+             done; exit 7",
+        );
+        let status = run_command_piped_to_spinner("concurrent-streams", &mut command, &bar)
+            .expect("sh should spawn and drain cleanly");
+        assert_eq!(status.code(), Some(7));
     }
 }

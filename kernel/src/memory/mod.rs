@@ -6,8 +6,7 @@
 //! `compressed` is the compressed page pool, the in-memory tier a page
 //! goes to before a disk.
 //! `fiber_stack` owns the arena the runtime's async stacks are committed
-//! out of one page-fault at a time, and `frame_reserve` holds the frames
-//! that fault path is allowed to allocate.
+//! out of ahead of the guest.
 //! `per_processor` carves one block per processor out of memory of the
 //! node the processor is on. `user` carries the per-program user-memory pool used by Wasmtime
 //! linear memories, one buddy pool per NUMA node. `frame_slab` is the
@@ -25,13 +24,13 @@ mod compressed;
 mod entropy;
 mod fiber_stack;
 mod frame_pool;
-mod frame_reserve;
 mod frame_slab;
 mod irq_safe;
 mod locality;
 mod mapping_cost;
 mod native_pages;
 mod owner;
+mod paged;
 mod per_processor;
 mod policy;
 mod reported;
@@ -47,20 +46,19 @@ pub use compressed::{
 };
 pub use entropy::{
     ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, HardwareEntropySource,
-    NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RootEntropy,
-    RootEntropyHandle, install_entropy_device, seed_root_entropy,
+    NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RandomBytesLimitSetting,
+    RootEntropy, RootEntropyHandle, install_entropy_device, seed_root_entropy,
 };
+#[cfg(feature = "wasmtime-runtime")]
+pub(crate) use fiber_stack::fiber_stack_arena_installed;
 pub use fiber_stack::{
-    FIBER_STACK_GUARD_BYTES, FiberStack, FiberStackArenaStats, FiberStackError, FiberStackVmHooks,
-    StackFault, claim_fiber_stack, fiber_stack_arena_stats, fiber_stack_demand_commits_on,
-    install_fiber_stack_arena, install_fiber_stack_hooks, resolve_stack_fault,
+    AllocationTagHooks, FIBER_STACK_GUARD_BYTES, FiberStack, FiberStackArenaStats, FiberStackError,
+    FiberStackVmHooks, StackFault, StackReserveError, claim_fiber_stack, classify_stack_fault,
+    commit_fiber_stack_reserve, fiber_stack_arena_stats, fiber_stack_reserve_commits_on,
+    install_fiber_stack_arena, install_fiber_stack_hooks,
 };
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
 pub(crate) use fiber_stack::{fiber_parking, parked_fibers};
-pub use frame_reserve::reserved_bytes as page_fault_frame_reserve_bytes;
-pub(crate) use frame_reserve::{
-    configure as configure_frame_reserve, top_up as top_up_frame_reserve,
-};
 pub(crate) use irq_safe::IrqSafeMutex;
 pub use locality::{Locality, NodeRun};
 pub use mapping_cost::user_mapping_kernel_heap_bytes;
@@ -69,6 +67,7 @@ pub use owner::{
     MemoryOwner, UserMemoryOwnerScope, UserMemoryOwners, configure_user_memory_owner_processors,
     current_user_memory_owner, enter_user_memory_owner,
 };
+pub use paged::{DetachedPages, FrameReservation, FrameShortage, PagedBytes};
 pub use per_processor::{LocalMemory, LocalSlice, NodeLocalArena, NodeMemory, PerProcessor};
 pub use policy::{
     BootMemoryPlan, BootRegionSplitter, KERNEL_HEAP_BOOTSTRAP_BYTES,
@@ -89,8 +88,6 @@ pub use swap::{
 };
 #[cfg(test)]
 pub(crate) use swap::{GUEST_SWAP_PAGE, GuestSwap};
-#[cfg(test)]
-pub(crate) use user::installed_user_memory_pool;
 pub use user::{
     MemoryNodeStats, UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on,
     allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
@@ -99,6 +96,6 @@ pub use user::{
     user_frame_node, user_heap_stats, user_node_stats,
 };
 pub(crate) use user::{
-    lend_user_memory_to_kernel_heap, release_processor_frames, try_user_node_stats,
-    user_memory_pool, user_pool_available_bytes,
+    installed_user_memory_pool, lend_user_memory_to_kernel_heap, release_processor_frames,
+    try_user_node_stats, user_memory_pool, user_pool_available_bytes,
 };

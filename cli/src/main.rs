@@ -26,6 +26,10 @@ use helios_profdata::{
     FetchedProfile, KERNEL_PROFILE_ARTIFACT, KERNEL_PROFILE_ASSET, KERNEL_PROFILE_WORKFLOW,
     KernelProfileStore, KernelProfileStoreError, ProfileUseError, RELEASE_REPOSITORY,
 };
+use helios_workspace_root::prebuilt_manifest::{
+    PREBUILT_MANIFEST_FILE, PREBUILT_SCHEMA_VERSION, PrebuiltArtifactKind, PrebuiltManifest,
+    PrebuiltManifestError, PrebuiltPrograms, read_manifest, write_manifest,
+};
 use helios_workspace_root::root_key::{
     ROOT_PUBLIC_FILE, ROOT_SECRET_FILE, RootSecretReadError, SECRET_KEY_MODE, read_root_secret_seed,
 };
@@ -41,6 +45,7 @@ use wit_component::ComponentEncoder;
 mod artifact_cache;
 mod boot_kernel;
 mod kernel_image;
+mod prebuilt_artifact;
 mod venus_fetch;
 mod wasi_sdk;
 
@@ -53,6 +58,10 @@ mod wasi_sdk;
 enum CliError {
     #[error("{0}")]
     ArtifactCachePrune(#[from] CacheError),
+    #[error("{0}")]
+    ArtifactFetch(#[from] prebuilt_artifact::ArtifactFetchError),
+    #[error("{0}")]
+    ArtifactStage(#[from] prebuilt_artifact::ArtifactStageError),
     #[error("{0}")]
     KernelImage(#[from] kernel_image::KernelImageError),
     #[error("{0}")]
@@ -106,6 +115,10 @@ enum WasmProgramsError {
         first: String,
         second: String,
     },
+    #[error("unknown guest program(s): {unknown}")]
+    UnknownPrograms { unknown: String },
+    #[error("{0}")]
+    Manifest(#[from] PrebuiltManifestError),
 }
 
 /// Why the root signing keypair could not be read or written.
@@ -269,6 +282,25 @@ enum WasmBuildError {
          writes the directory --prebuilt-wasm names"
     )]
     PrebuiltMissing { path: String, profile: String },
+    #[error("invalid prebuilt userspace manifest in {dir}: {source}")]
+    PrebuiltManifest {
+        dir: String,
+        #[source]
+        source: PrebuiltManifestError,
+    },
+    #[error("prebuilt userspace directory {dir} holds a {found} artifact, expected userspace")]
+    PrebuiltWrongKind {
+        dir: String,
+        found: PrebuiltArtifactKind,
+    },
+    #[error(
+        "prebuilt userspace directory {dir} was built for profile {found:?}, expected {expected:?}"
+    )]
+    PrebuiltProfileMismatch {
+        dir: String,
+        expected: String,
+        found: String,
+    },
     #[error("{0}")]
     Cache(#[from] CacheError),
     #[error("crate manifest {manifest} is outside the workspace {root}, so no cache key names it")]
@@ -448,7 +480,7 @@ enum BootfsError {
 
 /// Why the Limine UEFI disk image could not be built.
 #[derive(Debug, thiserror::Error)]
-enum LimineError {
+pub(crate) enum LimineError {
     #[error("failed to canonicalize kernel {path}: {source}")]
     CanonicalizeKernel {
         path: String,
@@ -580,7 +612,7 @@ const DEFAULT_BOOT_ARTIFACTS_MANIFEST: &str = "tools/wasi-apps/boot-artifacts.to
 /// reads the store and nothing downstream can tell an empty store from a
 /// half-written one.
 #[derive(Debug, thiserror::Error)]
-enum ProfileFetchError {
+pub(crate) enum ProfileFetchError {
     #[error("{0}")]
     WorkspaceRoot(#[from] WorkspaceRootError),
     #[error(
@@ -689,6 +721,8 @@ enum ProfileFetchError {
 }
 
 const COMPILER_PLUGIN_BOOTFS_PATH: &str = "bin/compiler.cwasm";
+/// The program name `wasm-build --program` uses for the in-kernel compiler plugin.
+const COMPILER_PLUGIN_NAME: &str = "compiler-plugin";
 const COMPILER_PLUGIN_MANIFEST: &str = "compiler-plugin/Cargo.toml";
 const COMPILER_PLUGIN_TARGET_DIR: &str = "compiler-plugin-target";
 const COMPILER_PLUGIN_TRIPLE: &str = "wasm32-wasip1-threads";
@@ -727,6 +761,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     ArtifactCachePrune(ArtifactCachePruneCommand),
+    /// Download a prebuilt CI artifact (`userspace`, `kernel`, or `image`)
+    /// into the local user cache or an explicit directory.
+    ArtifactFetch(prebuilt_artifact::ArtifactFetchCommand),
+    /// Stage a `kernel` or full bootable `image` artifact directory with its
+    /// typed `manifest.json`.
+    ArtifactStage(prebuilt_artifact::ArtifactStageCommand),
     /// Prepare the root keypair that compile and lint checks read,
     /// without building a boot payload.
     KernelKeys {
@@ -821,6 +861,13 @@ struct WasmBuildCommand {
     profile: String,
     #[arg(long)]
     cargo: PathBuf,
+    /// Restrict the build to the named guest programs (`compiler-plugin` or
+    /// directory names under `programs/`). Repeat for multiple programs. When
+    /// omitted, the compiler plugin and every program under `programs/` are
+    /// built. Library components plugged by a selected program are included
+    /// automatically.
+    #[arg(long = "program", value_name = "NAME")]
+    programs: Vec<String>,
     #[command(flatten)]
     cache: CacheArgs,
 }
@@ -913,7 +960,7 @@ struct ProfileFetchCommand {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum LimineEfiArch {
+pub(crate) enum LimineEfiArch {
     X86_64,
     Aarch64,
 }
@@ -1018,11 +1065,37 @@ struct WasmBuilder<'a> {
 }
 
 impl<'a> WasmSource<'a> {
-    fn prebuilt(root: PathBuf, profile: &'a str) -> Self {
-        Self::Prebuilt {
-            dir: root.join(profile_dir_name(profile)),
-            profile,
+    fn prebuilt(root: PathBuf, profile: &'a str) -> Result<Self, WasmBuildError> {
+        let profile_dir = profile_dir_name(profile);
+        let nested = root.join(profile_dir);
+        let dir = if nested.is_dir() {
+            nested
+        } else if root.join(PREBUILT_MANIFEST_FILE).is_file() {
+            root
+        } else {
+            nested
+        };
+        if dir.join(PREBUILT_MANIFEST_FILE).is_file() {
+            let manifest =
+                read_manifest(&dir).map_err(|source| WasmBuildError::PrebuiltManifest {
+                    dir: dir.display().to_string(),
+                    source,
+                })?;
+            if manifest.kind != PrebuiltArtifactKind::Userspace {
+                return Err(WasmBuildError::PrebuiltWrongKind {
+                    dir: dir.display().to_string(),
+                    found: manifest.kind,
+                });
+            }
+            if manifest.profile != profile_dir {
+                return Err(WasmBuildError::PrebuiltProfileMismatch {
+                    dir: dir.display().to_string(),
+                    expected: profile_dir.to_owned(),
+                    found: manifest.profile,
+                });
+            }
         }
+        Ok(Self::Prebuilt { dir, profile })
     }
 
     /// The `wasm32-wasip3` core module or component `manifest_path`
@@ -1125,6 +1198,20 @@ fn run(cli: Cli) -> Result<(), CliError> {
             );
             Ok(())
         }
+        Commands::ArtifactFetch(command) => {
+            let root = WorkspaceRoot::resolve(cli.workspace_root.as_deref()).ok();
+            Ok(prebuilt_artifact::run_fetch(
+                command,
+                root.as_ref().map(WorkspaceRoot::path),
+            )?)
+        }
+        Commands::ArtifactStage(command) => {
+            let root = WorkspaceRoot::resolve(cli.workspace_root.as_deref()).ok();
+            Ok(prebuilt_artifact::run_stage(
+                command,
+                root.as_ref().map(WorkspaceRoot::path),
+            )?)
+        }
         Commands::KernelKeys { out_dir } => {
             prepare_root_key(&out_dir, None)?;
             Ok(())
@@ -1180,7 +1267,7 @@ fn run_kernel_prebuild(
 
     let cache = command.cache.open()?;
     let wasm = match command.prebuilt_wasm.as_deref() {
-        Some(dir) => WasmSource::prebuilt(workspace_root.join(dir), &command.profile),
+        Some(dir) => WasmSource::prebuilt(workspace_root.join(dir), &command.profile)?,
         None => WasmSource::Build(WasmBuilder {
             cargo: &command.cargo,
             profile: &command.profile,
@@ -1435,13 +1522,13 @@ fn run_limine_uefi_image(command: LimineUefiImageCommand) -> Result<(), LimineEr
     build_limine_uefi_image(&limine, &kernel, &bootfs, &command.output, command.baud)
 }
 
-struct LimineToolchain {
+pub(crate) struct LimineToolchain {
     efi_bootloader: PathBuf,
     efi_bootloader_name: &'static str,
 }
 
 impl LimineToolchain {
-    fn discover(efi_arch: LimineEfiArch) -> Result<Self, LimineError> {
+    pub(crate) fn discover(efi_arch: LimineEfiArch) -> Result<Self, LimineError> {
         let executable = std::env::var_os("HELIOS_LIMINE_BIN")
             .map(PathBuf::from)
             .or_else(|| find_executable_in_path("limine"))
@@ -1482,7 +1569,7 @@ fn limine_datadir(executable: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(path.trim()))
 }
 
-fn build_limine_uefi_image(
+pub(crate) fn build_limine_uefi_image(
     limine: &LimineToolchain,
     kernel: &Path,
     bootfs: &Path,
@@ -1959,13 +2046,100 @@ fn program_dirs(programs_root: &Path) -> Result<Vec<(String, PathBuf)>, BootProg
     Ok(dirs)
 }
 
-/// Builds the compiler plugin and every program under `programs/` into
-/// `<out-dir>/<profile>/`, one file per artifact name: the wasm every
-/// target's boot payload is precompiled from.
+/// Guest wasm build targets chosen by `wasm-build`.
+struct SelectedWasmBuild {
+    compiler_plugin: bool,
+    programs: Vec<ProgramManifest>,
+}
+
+/// Resolves `--program` filters against `programs/` and `compiler-plugin`.
+///
+/// An empty request builds the compiler plugin and every program under
+/// `programs/`. A non-empty request rejects unknown names up front and
+/// automatically pulls in any library component a selected program plugs.
+fn select_wasm_programs(
+    requested: &[String],
+    available: Vec<ProgramManifest>,
+) -> Result<SelectedWasmBuild, WasmProgramsError> {
+    if requested.is_empty() {
+        return Ok(SelectedWasmBuild {
+            compiler_plugin: true,
+            programs: available,
+        });
+    }
+
+    let by_name: BTreeMap<String, ProgramManifest> = available
+        .into_iter()
+        .map(|manifest| (manifest.command.clone(), manifest))
+        .collect();
+    let requested_set: BTreeSet<&str> = requested.iter().map(String::as_str).collect();
+    let unknown: Vec<&str> = requested_set
+        .iter()
+        .copied()
+        .filter(|name| *name != COMPILER_PLUGIN_NAME && !by_name.contains_key(*name))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(WasmProgramsError::UnknownPrograms {
+            unknown: unknown.join(", "),
+        });
+    }
+
+    let compiler_plugin = requested_set.contains(COMPILER_PLUGIN_NAME);
+    let mut expanded: BTreeSet<String> = requested_set
+        .iter()
+        .filter(|name| **name != COMPILER_PLUGIN_NAME)
+        .map(|name| (*name).to_owned())
+        .collect();
+
+    let mut plugs_to_add = Vec::new();
+    for name in &expanded {
+        let manifest = &by_name[name];
+        for plug in &manifest.role.plugs {
+            let Some(library) = by_name.get(plug) else {
+                return Err(BootProgramError::UnknownPlug {
+                    command: manifest.command.clone(),
+                    plug: plug.clone(),
+                }
+                .into());
+            };
+            if !library.role.library {
+                return Err(BootProgramError::UnknownPlug {
+                    command: manifest.command.clone(),
+                    plug: plug.clone(),
+                }
+                .into());
+            }
+            plugs_to_add.push(plug.clone());
+        }
+    }
+    expanded.extend(plugs_to_add);
+
+    let programs = by_name
+        .into_iter()
+        .filter(|(name, _)| expanded.contains(name))
+        .map(|(_, manifest)| manifest)
+        .collect();
+    Ok(SelectedWasmBuild {
+        compiler_plugin,
+        programs,
+    })
+}
+
+/// Builds the compiler plugin and programs under `programs/` (or the subset
+/// named by `--program`) into `<out-dir>/<profile>/`, one file per artifact
+/// name: the wasm every target's boot payload is precompiled from.
 fn run_wasm_build(
     command: &WasmBuildCommand,
     workspace_root: &WorkspaceRoot,
 ) -> Result<(), WasmProgramsError> {
+    let mut program_entries = program_dirs(&workspace_root.join(Path::new("programs")))?;
+    program_entries.sort();
+    let available = program_entries
+        .into_iter()
+        .map(|(command_name, path)| read_program_manifest(&command_name, &path.join("Cargo.toml")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let selection = select_wasm_programs(&command.programs, available)?;
+
     let dest = command.out_dir.join(profile_dir_name(&command.profile));
     fs::create_dir_all(&dest).map_err(|source| WasmProgramsError::CreateDir {
         path: dest.display().to_string(),
@@ -1986,14 +2160,19 @@ fn run_wasm_build(
     };
 
     // The compiler plugin builds first and longest, so it takes the first
-    // worker; every target directory's programs follow.
-    let mut programs = program_dirs(&workspace_root.join(Path::new("programs")))?;
-    programs.sort();
+    // worker when selected; every target directory's programs follow.
+    let mut selected_program_names = BTreeSet::new();
+    if selection.compiler_plugin {
+        selected_program_names.insert(COMPILER_PLUGIN_NAME.to_owned());
+    }
+    for manifest in &selection.programs {
+        selected_program_names.insert(manifest.command.clone());
+    }
+
     let mut groups = BTreeMap::<String, Vec<(usize, ProgramManifest)>>::new();
     let mut venus_protocol = false;
     let mut boringssl = false;
-    for (index, (command_name, path)) in programs.into_iter().enumerate() {
-        let manifest = read_program_manifest(&command_name, &path.join("Cargo.toml"))?;
+    for (index, manifest) in selection.programs.into_iter().enumerate() {
         let requirements = read_wasm_requirements(&manifest.manifest_path)?;
         venus_protocol |= requirements.venus_protocol;
         boringssl |= requirements.boringssl;
@@ -2011,7 +2190,10 @@ fn run_wasm_build(
     if boringssl {
         wasi_sdk::ensure(workspace_root.path(), COMPONENT_TRIPLE).map_err(WasmBuildError::from)?;
     }
-    let jobs = std::iter::once(WasmJob::CompilerPlugin)
+    let jobs = selection
+        .compiler_plugin
+        .then_some(WasmJob::CompilerPlugin)
+        .into_iter()
         .chain(groups.into_values().map(WasmJob::Programs))
         .collect::<Vec<_>>();
     let mut built = run_wasm_jobs(&builder, &jobs)?;
@@ -2044,6 +2226,26 @@ fn run_wasm_build(
             source,
         })?;
     }
+    let manifest = PrebuiltManifest {
+        schema_version: PREBUILT_SCHEMA_VERSION,
+        kind: PrebuiltArtifactKind::Userspace,
+        commit: prebuilt_artifact::current_git_commit(Some(workspace_root.path())),
+        arch: None,
+        profile: profile_dir_name(&command.profile).to_owned(),
+        kernel_features: Vec::new(),
+        programs: Some(if command.programs.is_empty() {
+            PrebuiltPrograms::All
+        } else {
+            PrebuiltPrograms::Subset(selected_program_names.into_iter().collect())
+        }),
+        files: names
+            .into_iter()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect(),
+        root_public_key_sha256: None,
+        baud: None,
+    };
+    write_manifest(&dest, &manifest)?;
     CacheArgs::report(cache.as_ref());
     Ok(())
 }
@@ -3095,7 +3297,7 @@ fn read_signing_key(path: &Path) -> Result<SigningKey, KeyError> {
 }
 
 /// GitHub's REST API, where a release's tag and its assets are read from.
-const GITHUB_API: &str = "https://api.github.com";
+pub(crate) const GITHUB_API: &str = "https://api.github.com";
 
 /// Environment variables a GitHub token is read from, in order: the first
 /// is what a GitHub Actions runner sets, the second what `gh auth` sets.
@@ -3136,30 +3338,30 @@ struct GithubRepository {
 /// first, so the newest collection on a branch is within the first page
 /// unless that many newer runs on other branches uploaded one since; the
 /// refusal says so.
-const ARTIFACT_PAGE: usize = 100;
+pub(crate) const ARTIFACT_PAGE: usize = 100;
 
 /// One page of a repository's artifact listing.
 #[derive(Debug, Deserialize)]
-struct GithubArtifacts {
-    artifacts: Vec<GithubArtifact>,
+pub(crate) struct GithubArtifacts {
+    pub(crate) artifacts: Vec<GithubArtifact>,
 }
 
 /// The parts of a workflow artifact this fetch reads.
-#[derive(Debug, Deserialize)]
-struct GithubArtifact {
-    id: u64,
-    name: String,
-    expired: bool,
-    archive_download_url: String,
-    workflow_run: GithubWorkflowRun,
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct GithubArtifact {
+    pub(crate) id: u64,
+    pub(crate) name: String,
+    pub(crate) expired: bool,
+    pub(crate) archive_download_url: String,
+    pub(crate) workflow_run: GithubWorkflowRun,
 }
 
 /// The run that uploaded an artifact.
-#[derive(Debug, Deserialize)]
-struct GithubWorkflowRun {
-    id: u64,
-    head_branch: String,
-    head_sha: String,
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct GithubWorkflowRun {
+    pub(crate) id: u64,
+    pub(crate) head_branch: String,
+    pub(crate) head_sha: String,
 }
 
 /// What curl answered: the status, the redirect it did not follow, and
@@ -3305,7 +3507,7 @@ fn fetch_collection_artifact(
 
 /// The repository's default branch, which is where the collection runs
 /// every lane reads from.
-fn default_branch(repository: &str) -> Result<String, ProfileFetchError> {
+pub(crate) fn default_branch(repository: &str) -> Result<String, ProfileFetchError> {
     let url = format!("{GITHUB_API}/repos/{repository}");
     let document = github_get(&url, true)?;
     let repository: GithubRepository = decode(&url, "a GitHub repository", &document)?;
@@ -3334,7 +3536,7 @@ fn profile_in_archive(artifact: u64, archive: Vec<u8>) -> Result<Vec<u8>, Profil
 
 /// One JSON answer decoded, naming the endpoint and what it was expected
 /// to be when it is not.
-fn decode<T: serde::de::DeserializeOwned>(
+pub(crate) fn decode<T: serde::de::DeserializeOwned>(
     url: &str,
     what: &'static str,
     document: &[u8],
@@ -3348,7 +3550,7 @@ fn decode<T: serde::de::DeserializeOwned>(
 
 /// One HTTPS GET through curl, following redirects, returning the body
 /// of a 200.
-fn github_get(url: &str, authenticated: bool) -> Result<Vec<u8>, ProfileFetchError> {
+pub(crate) fn github_get(url: &str, authenticated: bool) -> Result<Vec<u8>, ProfileFetchError> {
     let answer = curl_get(url, authenticated, true)?;
     match answer.status.as_str() {
         "200" => Ok(answer.body),
@@ -3366,7 +3568,7 @@ fn github_get(url: &str, authenticated: bool) -> Result<Vec<u8>, ProfileFetchErr
 }
 
 /// Where an authenticated GET of `url` redirects to, without following it.
-fn github_redirect(url: &str) -> Result<String, ProfileFetchError> {
+pub(crate) fn github_redirect(url: &str) -> Result<String, ProfileFetchError> {
     let answer = curl_get(url, true, false)?;
     if answer.status == "404" {
         return Err(ProfileFetchError::NotFound {
@@ -3645,7 +3847,8 @@ mod tests {
         let release = root.path().join("release");
         fs::create_dir(&release).expect("a profile directory");
         fs::write(release.join(INIT_WASM), b"\0asm").expect("a wasm file");
-        let source = WasmSource::prebuilt(root.path().to_path_buf(), "release");
+        let source = WasmSource::prebuilt(root.path().to_path_buf(), "release")
+            .expect("prebuilt source resolves");
         let found = source
             .component(Path::new("unused/Cargo.toml"), INIT_WASM)
             .expect("the prebuilt file is found");
@@ -3653,11 +3856,50 @@ mod tests {
     }
 
     #[test]
+    fn a_flat_prebuilt_userspace_artifact_with_manifest_is_accepted_and_validated() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        fs::write(dir.path().join(INIT_WASM), b"\0asm").expect("a wasm file");
+        write_manifest(
+            dir.path(),
+            &PrebuiltManifest {
+                schema_version: PREBUILT_SCHEMA_VERSION,
+                kind: PrebuiltArtifactKind::Userspace,
+                commit: None,
+                arch: None,
+                profile: "release".to_owned(),
+                kernel_features: Vec::new(),
+                programs: Some(PrebuiltPrograms::All),
+                files: vec![INIT_WASM.to_owned()],
+                root_public_key_sha256: None,
+                baud: None,
+            },
+        )
+        .expect("manifest writes");
+
+        let source = WasmSource::prebuilt(dir.path().to_path_buf(), "release")
+            .expect("flat userspace dir resolves for matching profile");
+        let found = source
+            .component(Path::new("unused/Cargo.toml"), INIT_WASM)
+            .expect("init wasm found in flat dir");
+        assert_eq!(found, dir.path().join(INIT_WASM));
+
+        let err = match WasmSource::prebuilt(dir.path().to_path_buf(), "debug") {
+            Ok(_) => panic!("mismatched profile must fail fast"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            err,
+            WasmBuildError::PrebuiltProfileMismatch { .. }
+        ));
+    }
+
+    #[test]
     fn a_missing_prebuilt_file_is_refused_and_never_built() {
         let root = tempfile::tempdir().expect("a temporary directory");
         // Only the release tree exists, so a debug prebuild finds nothing.
         fs::create_dir(root.path().join("release")).expect("a profile directory");
-        let source = WasmSource::prebuilt(root.path().to_path_buf(), "debug");
+        let source = WasmSource::prebuilt(root.path().to_path_buf(), "debug")
+            .expect("prebuilt source resolves");
         let Err(error) = source.component(Path::new("unused/Cargo.toml"), INIT_WASM) else {
             panic!("a file that is not there is refused");
         };
@@ -3869,6 +4111,138 @@ mod tests {
             error.to_string().contains("quickjs requires wasm SIMD"),
             "unexpected error: {error}"
         );
+    }
+
+    fn test_program_manifest(command: &str, role: ProgramRole) -> ProgramManifest {
+        ProgramManifest {
+            command: command.to_owned(),
+            manifest_path: PathBuf::from(format!("programs/{command}/Cargo.toml")),
+            artifact_name: format!("helios_{}.wasm", command.replace('-', "_")),
+            role,
+        }
+    }
+
+    fn sample_program_manifests() -> Vec<ProgramManifest> {
+        vec![
+            test_program_manifest("compositor", ProgramRole::default()),
+            test_program_manifest("debugger", ProgramRole::default()),
+            test_program_manifest("init", ProgramRole::default()),
+            test_program_manifest(
+                "pride-flag",
+                ProgramRole {
+                    library: false,
+                    plugs: vec!["webgpu".to_owned()],
+                },
+            ),
+            test_program_manifest(
+                "webgpu",
+                ProgramRole {
+                    library: true,
+                    plugs: Vec::new(),
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn wasm_build_without_programs_selects_compiler_plugin_and_all_programs() {
+        let selected = select_wasm_programs(&[], sample_program_manifests())
+            .expect("empty selection selects all");
+        assert!(selected.compiler_plugin);
+        let names: Vec<_> = selected
+            .programs
+            .iter()
+            .map(|m| m.command.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["compositor", "debugger", "init", "pride-flag", "webgpu"]
+        );
+    }
+
+    #[test]
+    fn wasm_build_subset_selects_only_named_programs_and_deduplicates() {
+        let requested = vec![
+            "debugger".to_owned(),
+            "init".to_owned(),
+            "debugger".to_owned(),
+        ];
+        let selected = select_wasm_programs(&requested, sample_program_manifests())
+            .expect("valid subset resolves");
+        assert!(!selected.compiler_plugin);
+        let names: Vec<_> = selected
+            .programs
+            .iter()
+            .map(|m| m.command.as_str())
+            .collect();
+        assert_eq!(names, ["debugger", "init"]);
+    }
+
+    #[test]
+    fn wasm_build_subset_includes_plugged_library_components() {
+        let requested = vec!["pride-flag".to_owned()];
+        let selected = select_wasm_programs(&requested, sample_program_manifests())
+            .expect("plugged libraries are included automatically");
+        assert!(!selected.compiler_plugin);
+        let names: Vec<_> = selected
+            .programs
+            .iter()
+            .map(|m| m.command.as_str())
+            .collect();
+        assert_eq!(names, ["pride-flag", "webgpu"]);
+    }
+
+    #[test]
+    fn wasm_build_subset_can_select_compiler_plugin_alone() {
+        let requested = vec![COMPILER_PLUGIN_NAME.to_owned()];
+        let selected = select_wasm_programs(&requested, sample_program_manifests())
+            .expect("compiler-plugin alone is valid");
+        assert!(selected.compiler_plugin);
+        assert!(selected.programs.is_empty());
+    }
+
+    #[test]
+    fn wasm_build_rejects_unknown_program_names() {
+        let requested = vec![
+            "init".to_owned(),
+            "missing-b".to_owned(),
+            "missing-a".to_owned(),
+        ];
+        let error = select_wasm_programs(&requested, sample_program_manifests())
+            .err()
+            .expect("unknown program names must fail fast");
+        assert!(
+            matches!(
+                &error,
+                WasmProgramsError::UnknownPrograms { unknown } if unknown == "missing-a, missing-b"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn wasm_build_cli_parses_repeatable_program_flags() {
+        let parsed = Cli::try_parse_from([
+            "helios-cli",
+            "wasm-build",
+            "--out-dir",
+            "/tmp/out",
+            "--profile",
+            "debug",
+            "--cargo",
+            "cargo",
+            "--program",
+            "init",
+            "--program",
+            "debugger",
+            "--program",
+            "compiler-plugin",
+        ])
+        .expect("repeatable --program flags parse");
+        let Commands::WasmBuild(command) = parsed.command else {
+            panic!("expected WasmBuild command");
+        };
+        assert_eq!(command.programs, ["init", "debugger", "compiler-plugin"]);
     }
 
     fn test_artifact(

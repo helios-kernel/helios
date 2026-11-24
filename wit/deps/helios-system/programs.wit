@@ -192,6 +192,8 @@ interface programs {
     /// Sign domain-separated challenges with this boot's Ed25519 machine
     /// identity key (`helios:system/machine-identity`).
     identity,
+    /// Create hardware virtual machines (`helios:hv/virtualization`).
+    virtualize,
   }
 
   record machine-grant {

@@ -15,18 +15,21 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use helios_hal::measured_boot::{
-    MeasuredBoot, MeasurementRegister, MeasurementSet, SealedSecret, Sha256Digest, UnsealRefused,
+    MeasuredBoot, MeasurementAlgorithm, MeasurementDigest, MeasurementRegister, MeasurementSet,
+    SealedSecret, UnsealRefused,
 };
 use helios_tpm::{Crb, SLOT_INDEX, Tis, Tpm, Transport, TransportError};
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use tpm2_protocol::TpmWriter;
 use tpm2_protocol::basic::{TpmBuffer, TpmHandle, TpmUint16};
 use tpm2_protocol::data::{
-    Tpm2bNvPublic, TpmAlgId, TpmRc, TpmRcBase, TpmRh, TpmSt, TpmaNv, TpmaSession, TpmsAuthCommand,
-    TpmsNvPublic,
+    Tpm2bNvPublic, TpmAlgId, TpmRc, TpmRcBase, TpmRh, TpmSt, TpmaNv, TpmaSession, TpmlPcrSelection,
+    TpmsAuthCommand, TpmsNvPublic, TpmsPcrSelect, TpmsPcrSelection,
 };
 use tpm2_protocol::frame::{
-    TpmFrame, TpmNvDefineSpaceCommand, TpmNvUndefineSpaceCommand, TpmNvWriteCommand, TpmResponse,
-    tpm_marshal_command,
+    TpmFrame, TpmNvDefineSpaceCommand, TpmNvUndefineSpaceCommand, TpmNvWriteCommand,
+    TpmPcrReadCommand, TpmPcrReadResponse, TpmResponse, tpm_marshal_command,
 };
 
 use crate::support::crb::CrbModel;
@@ -42,11 +45,69 @@ const PCR9: MeasurementRegister = MeasurementRegister::new(9);
 const KERNEL_IMAGE: MeasurementSet = MeasurementSet::of(&[PCR4, PCR9]);
 
 const SEAL: &str = "seal";
+const VERIFY_PCR9_BANKS: &str = "verify-pcr9-banks";
 const PLANT_FOREIGN: &str = "plant-foreign";
 const REPLACE_FOREIGN: &str = "replace-foreign";
 
-/// Seals, reads back, changes a register, finds the secret refused,
-/// and seals again in the new state.
+/// Computes one digest for each active bank reported by `tpm`.
+fn digests_for_banks(
+    banks: &[helios_hal::measured_boot::MeasurementBank],
+    register: MeasurementRegister,
+    payload: &[u8],
+) -> Vec<MeasurementDigest> {
+    banks
+        .iter()
+        .filter(|bank| bank.registers.contains(register))
+        .map(|bank| match bank.algorithm {
+            MeasurementAlgorithm::Sha1 => MeasurementDigest::Sha1(Sha1::digest(payload).into()),
+            MeasurementAlgorithm::Sha256 => {
+                MeasurementDigest::Sha256(Sha256::digest(payload).into())
+            }
+            MeasurementAlgorithm::Sha384 => {
+                MeasurementDigest::Sha384(Sha384::digest(payload).into())
+            }
+            MeasurementAlgorithm::Sha512 => {
+                MeasurementDigest::Sha512(Sha512::digest(payload).into())
+            }
+            other => panic!("unexpected bank algorithm in swtpm fixture: {other}"),
+        })
+        .collect()
+}
+
+/// Expected PCR value after extending a zeroed register once with `digest`.
+fn expected_extended_pcr(digest: &MeasurementDigest) -> Vec<u8> {
+    let zeros = vec![0u8; digest.as_bytes().len()];
+    match digest {
+        MeasurementDigest::Sha1(bytes) => {
+            let mut hasher = Sha1::new();
+            hasher.update(&zeros);
+            hasher.update(bytes);
+            hasher.finalize().to_vec()
+        }
+        MeasurementDigest::Sha256(bytes) => {
+            let mut hasher = Sha256::new();
+            hasher.update(&zeros);
+            hasher.update(bytes);
+            hasher.finalize().to_vec()
+        }
+        MeasurementDigest::Sha384(bytes) => {
+            let mut hasher = Sha384::new();
+            hasher.update(&zeros);
+            hasher.update(bytes);
+            hasher.finalize().to_vec()
+        }
+        MeasurementDigest::Sha512(bytes) => {
+            let mut hasher = Sha512::new();
+            hasher.update(&zeros);
+            hasher.update(bytes);
+            hasher.finalize().to_vec()
+        }
+        other => panic!("unexpected bank algorithm in swtpm fixture: {other:?}"),
+    }
+}
+
+/// Seals, reads back, changes PCR 9 in every active bank, finds the secret
+/// refused, and seals again in the new state.
 async fn seal<T: Transport + 'static>(transport: T, inputs: &Inputs) {
     let mut tpm = Tpm::open(transport, KERNEL_IMAGE)
         .await
@@ -62,9 +123,13 @@ async fn seal<T: Transport + 'static>(transport: T, inputs: &Inputs) {
     let loaded = tpm.load_sealed(KERNEL_IMAGE).await.unwrap();
     assert_eq!(loaded.expose(), &inputs.first_secret);
 
-    tpm.extend(PCR9, &Sha256Digest(inputs.extend_digest))
-        .await
-        .unwrap();
+    let digests = digests_for_banks(tpm.banks(), PCR9, &inputs.extend_payload);
+    assert!(
+        digests.len() > 1,
+        "swtpm exposes multiple active PCR banks, got {}",
+        digests.len()
+    );
+    tpm.extend(PCR9, &digests).await.unwrap();
     assert_eq!(
         tpm.load_sealed(KERNEL_IMAGE).await.unwrap_err(),
         UnsealRefused::StateChanged
@@ -75,6 +140,63 @@ async fn seal<T: Transport + 'static>(transport: T, inputs: &Inputs) {
         .unwrap();
     let loaded = tpm.load_sealed(KERNEL_IMAGE).await.unwrap();
     assert_eq!(loaded.expose(), &inputs.second_secret);
+}
+
+/// Reads PCR 9 in all four swtpm active banks (SHA-1, SHA-256, SHA-384,
+/// SHA-512) and verifies every bank holds the exact fold of `extend_payload`.
+async fn verify_pcr9_banks<T: Transport>(mut transport: T, inputs: &Inputs) {
+    let expected = [
+        (
+            TpmAlgId::Sha1,
+            MeasurementDigest::Sha1(Sha1::digest(inputs.extend_payload).into()),
+        ),
+        (
+            TpmAlgId::Sha256,
+            MeasurementDigest::Sha256(Sha256::digest(inputs.extend_payload).into()),
+        ),
+        (
+            TpmAlgId::Sha384,
+            MeasurementDigest::Sha384(Sha384::digest(inputs.extend_payload).into()),
+        ),
+        (
+            TpmAlgId::Sha512,
+            MeasurementDigest::Sha512(Sha512::digest(inputs.extend_payload).into()),
+        ),
+    ];
+    let pcr9_bitmap = (1u32 << PCR9.index()).to_le_bytes();
+    let mut selection = TpmlPcrSelection::new();
+    for (hash, _) in &expected {
+        selection
+            .try_push(TpmsPcrSelection {
+                hash: *hash,
+                pcr_select: TpmsPcrSelect::try_from(&pcr9_bitmap[..3]).unwrap(),
+            })
+            .unwrap();
+    }
+    let command = TpmPcrReadCommand {
+        handles: [],
+        pcr_selection_in: selection,
+    };
+    let mut frame = [0u8; 512];
+    let mut writer = TpmWriter::new(&mut frame);
+    tpm_marshal_command(&command, TpmSt::NoSessions, &[], &mut writer).unwrap();
+    let len = writer.len();
+    let mut response = [0u8; 1024];
+    let received = transport
+        .transact(&frame[..len], &mut response)
+        .await
+        .unwrap();
+    let response = TpmResponse::cast(&response[..received]).unwrap();
+    assert_eq!(response.rc().unwrap(), TpmRc::Fmt0(TpmRcBase::Success));
+    let read: TpmPcrReadResponse = response.unmarshal().unwrap();
+    assert_eq!(read.pcr_values.len(), expected.len());
+    for ((hash, digest), actual) in expected.iter().zip(read.pcr_values.iter()) {
+        assert_eq!(
+            actual.as_ref(),
+            expected_extended_pcr(digest).as_slice(),
+            "PCR 9 in bank {hash:?} must reflect the extend"
+        );
+    }
 }
 
 /// Sends one command with the owner's empty password and requires
@@ -260,12 +382,17 @@ fn record_swtpm_fixtures() {
         second_secret: random_32(),
         forged_secret: random_32(),
         third_secret: random_32(),
-        extend_digest: random_32(),
+        extend_payload: random_32(),
     };
     let mut phases = Vec::new();
     complete(seal(recorder.clone(), &inputs));
     phases.push(Phase {
         name: SEAL.to_owned(),
+        exchanges: recorder.take(),
+    });
+    complete(verify_pcr9_banks(recorder.clone(), &inputs));
+    phases.push(Phase {
+        name: VERIFY_PCR9_BANKS.to_owned(),
         exchanges: recorder.take(),
     });
     complete(plant_foreign(recorder.clone(), &inputs));
@@ -296,6 +423,14 @@ fn sealing_replays_byte_for_byte() {
     let recording = load_recording();
     let replay = Replay::new(recording.phase(SEAL));
     complete(seal(replay.clone(), &recording.inputs));
+    replay.finish();
+}
+
+#[test]
+fn extend_changes_pcr9_in_every_active_bank() {
+    let recording = load_recording();
+    let replay = Replay::new(recording.phase(VERIFY_PCR9_BANKS));
+    complete(verify_pcr9_banks(replay.clone(), &recording.inputs));
     replay.finish();
 }
 

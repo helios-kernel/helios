@@ -325,6 +325,17 @@ impl UserMemoryPool {
         })
     }
 
+    /// Runs `act` with the home node's buddy heap lock held, as another
+    /// processor inside the pool's critical section would hold it.
+    #[cfg(test)]
+    pub(crate) fn hold_buddy_lock_while<R>(&self, act: impl FnOnce() -> R) -> R {
+        let home = self.locality.node_of(self.bootstrap);
+        self.node_pool(home)
+            .expect("the bootstrap node has a pool")
+            .heap
+            .with(|_| act())
+    }
+
     /// The whole machine's user memory: every node's added up.
     pub fn stats(&self) -> UserHeapStats {
         (0..self.locality.node_count())
@@ -583,55 +594,6 @@ impl UserMemoryPool {
         }
     }
 
-    /// One zeroed user frame, or `None` when taking it would have
-    /// meant waiting on a lock.
-    ///
-    /// This is the page-fault path's allocation. A fault arrives inside
-    /// whatever the interrupted code was doing, and that code may be
-    /// holding a node's lock on this processor — the kernel heap grows
-    /// out of this pool from inside the global allocator — so a blocking
-    /// acquire here would spin on a word only the interrupted context can
-    /// clear. The caller keeps a per-processor reserve for exactly the
-    /// times this answers `None`; see [`super::frame_reserve`].
-    ///
-    /// It walks the same memory order as every other allocation. For each
-    /// node the frame-slab list is tried first because it is the cheaper
-    /// lock and the one most likely to be free; the node's buddy is tried
-    /// only through [`IrqSafeMutex::try_with`], and no drain is attempted.
-    /// Zeroing happens outside every lock.
-    pub(crate) fn try_allocate_frame_on(&self, processor: ProcessorId) -> Option<NonNull<u8>> {
-        let home = self.locality.node_of(processor);
-        let (ptr, pool, node) = self.locality.memory_order(home).iter().find_map(|&node| {
-            let pool = self.node_pool(node)?;
-            self.frame_slab
-                .try_allocate_on(processor, node)
-                .or_else(|| {
-                    pool.heap
-                        .try_with(|heap| heap.allocate(PhysFrame::SIZE).ok())
-                        .flatten()
-                })
-                .map(|ptr| (ptr, pool, node))
-        })?;
-        if node != home {
-            self.count_off_node(processor);
-        }
-        // A frame the pool showed to a free-page consumer may have been
-        // discarded by it, so the zeroing below is not an optimisation
-        // that can be skipped for a frame the caller will overwrite: it
-        // is what makes the page readable at all. Because it happens
-        // either way, the mark is cleared only if the bitmap is free —
-        // the blocking form would be waiting on whatever this fault
-        // interrupted.
-        let _ = pool
-            .reported
-            .try_clear_bytes(ptr.as_ptr() as usize, PhysFrame::SIZE);
-        // SAFETY: `ptr` is one exclusively owned page from this pool.
-        unsafe {
-            core::ptr::write_bytes(ptr.as_ptr(), 0, PhysFrame::SIZE);
-        }
-        Some(ptr)
-    }
-
     /// Returns a byte allocation to the pool, in the executing
     /// processor's name.
     ///
@@ -888,15 +850,9 @@ pub(crate) fn installed_user_memory_pool() -> Option<&'static UserMemoryPool> {
 }
 
 /// The memory step of a processor going offline: every frame it holds
-/// for itself — its page-fault reserve and its frame-slab lists — goes
-/// back to the buddy of the node the frame lies on. Run on the departing
-/// processor.
-///
-/// The reserve is released first and in this processor's name, so its
-/// frames land on this processor's lists for their nodes, which the
-/// drain after it then empties.
+/// for itself in its frame-slab lists goes back to the buddy of the node
+/// the frame lies on. Run on the departing processor.
 pub(crate) fn release_processor_frames(processor: ProcessorId) {
-    super::frame_reserve::release(processor);
     if let Some(pool) = installed_user_memory_pool() {
         pool.release_processor_frames(processor);
     }
@@ -1010,11 +966,6 @@ pub fn allocate_user_run_zeroed_on(
 /// memory to the wrong free list.
 pub fn deallocate_user_run_on(processor: ProcessorId, ptr: NonNull<u8>, layout: Layout) {
     user_memory_pool().deallocate_bytes_on(processor, ptr, layout);
-}
-
-/// See [`UserMemoryPool::try_allocate_frame_on`].
-pub(crate) fn try_allocate_user_frame_zeroed_on(processor: ProcessorId) -> Option<NonNull<u8>> {
-    installed_user_memory_pool()?.try_allocate_frame_on(processor)
 }
 
 pub fn deallocate_user_frame(ptr: NonNull<u8>) {
@@ -1530,14 +1481,6 @@ mod tests {
         assert_eq!(node_of(&ranges, frame), 1, "node 0 has nothing left");
         assert_eq!(pool.off_node_allocations(NodeId::new(0)), 1);
         assert_eq!(pool.off_node_allocations(NodeId::new(1)), 0);
-
-        let faulted = pool.try_allocate_frame_on(P0).expect("fault frame");
-        assert_eq!(
-            node_of(&ranges, faulted),
-            1,
-            "the fault path walks the same order"
-        );
-        assert_eq!(pool.off_node_allocations(NodeId::new(0)), 2);
     }
 
     #[test]

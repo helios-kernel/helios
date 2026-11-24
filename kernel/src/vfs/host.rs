@@ -226,6 +226,7 @@ impl<H: HostFileSystem> DirStream for HostDir<H> {
 }
 
 impl<H: HostFileSystem> FileSystem for HostShare<H> {
+    type Payer = crate::StoragePayer;
     super::delegate_path_handles!();
     type Write = HostShareWrite<H::Write>;
     type Dir = HostDir<H>;
@@ -244,6 +245,7 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
         path: FsPath<'_>,
         flags: OpenFlags,
         _now: u64,
+        _payer: &crate::StoragePayer,
     ) -> FsResult<helios_hal::fs::Opened<OwnedFsPath>> {
         let host = host_path(path);
         let metadata = match self
@@ -311,6 +313,7 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
         position: WritePosition,
         len: usize,
         _now: u64,
+        _payer: &'a crate::StoragePayer,
     ) -> FsResult<HostShareWrite<H::Write>> {
         self.client
             .prepare_write(host_path(path), position, len)
@@ -319,7 +322,13 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
             .map_err(fs_error_from_host)
     }
 
-    async fn set_size(&self, path: FsPath<'_>, size: u64, _now: u64) -> FsResult<()> {
+    async fn set_size(
+        &self,
+        path: FsPath<'_>,
+        size: u64,
+        _now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         self.client
             .set_file_size(host_path(path), size)
             .await
@@ -332,6 +341,7 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
         access_nanos: Option<u64>,
         modified_nanos: Option<u64>,
         _now: u64,
+        _payer: &crate::StoragePayer,
     ) -> FsResult<()> {
         self.client
             .set_times(host_path(path), access_nanos, modified_nanos)
@@ -352,7 +362,12 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
         })
     }
 
-    async fn create_directory(&self, path: FsPath<'_>, _now: u64) -> FsResult<()> {
+    async fn create_directory(
+        &self,
+        path: FsPath<'_>,
+        _now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         let creation = self.creation(path, NodeKind::Directory).await?;
         self.client
             .create_directory(host_path(path), creation)
@@ -360,14 +375,24 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
             .map_err(fs_error_from_host)
     }
 
-    async fn remove_directory(&self, path: FsPath<'_>, _now: u64) -> FsResult<()> {
+    async fn remove_directory(
+        &self,
+        path: FsPath<'_>,
+        _now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         self.client
             .remove(host_path(path), true)
             .await
             .map_err(fs_error_from_host)
     }
 
-    async fn unlink(&self, path: FsPath<'_>, _now: u64) -> FsResult<()> {
+    async fn unlink(
+        &self,
+        path: FsPath<'_>,
+        _now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         self.client
             .remove(host_path(path), false)
             .await
@@ -385,6 +410,7 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
         destination: FsPath<'_>,
         mode: RenameMode,
         _now: u64,
+        _payer: &crate::StoragePayer,
     ) -> FsResult<()> {
         if mode != RenameMode::Replace {
             return Err(FsError::Unsupported);
@@ -395,14 +421,26 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
             .map_err(fs_error_from_host)
     }
 
-    async fn link(&self, existing: FsPath<'_>, link: FsPath<'_>, _now: u64) -> FsResult<()> {
+    async fn link(
+        &self,
+        existing: FsPath<'_>,
+        link: FsPath<'_>,
+        _now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         self.client
             .hard_link(host_path(existing), host_path(link))
             .await
             .map_err(fs_error_from_host)
     }
 
-    async fn symlink(&self, target: &str, link: FsPath<'_>, _now: u64) -> FsResult<()> {
+    async fn symlink(
+        &self,
+        target: &str,
+        link: FsPath<'_>,
+        _now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         let creation = self.creation(link, NodeKind::Symlink).await?;
         self.client
             .symlink(target, host_path(link), creation.gid)

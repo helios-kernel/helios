@@ -1,6 +1,7 @@
 use helios_artifact::{
-    CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, CwasmTarget, cwasm_target_code_protection,
-    cwasm_target_guest_stack_limit_offset, cwasm_target_supports_wasm_simd,
+    CWASM_MEMORY_GUARD_SIZE, CWASM_MEMORY_RESERVATION, CWASM_STACK_LIMIT_LARGE_FRAME, CwasmTarget,
+    cwasm_target_code_protection, cwasm_target_guest_stack_limit_offset,
+    cwasm_target_supports_wasm_simd,
 };
 use std::cell::{Cell, RefCell};
 use std::env;
@@ -528,6 +529,13 @@ fn build_engine_config(
     if let Some(offset) = cwasm_target_guest_stack_limit_offset(triple) {
         config.stack_limit_location(StackLimitLocation::PerProcessor { offset });
     }
+    // A function with a large frame checks the stack in its prologue, which
+    // the kernel engine requires of every artifact it loads (Wasmtime
+    // compares the threshold exactly). The threshold is only valid with the
+    // null collector, which is the one collector this build has (`gc-null` is
+    // the only collector feature in the workspace, so `Collector::Auto`
+    // resolves to it).
+    config.stack_limit_large_frame(Some(CWASM_STACK_LIMIT_LARGE_FRAME));
     // Wasmtime validates `max_wasm_stack <= async_stack_size`; keep the async
     // fiber stack comfortably above the wasm stack limit with host headroom.
     config.max_wasm_stack(MAX_WASM_STACK);

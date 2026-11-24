@@ -16,7 +16,7 @@ use crate::platform::PlatformDescription;
 use helios_kernel::ExternalInterruptHandler;
 
 type Aarch64VirtioSndDevice = helios_virtio::VirtioSndDevice<
-    helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>,
+    helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<crate::Aarch64DmaPool>>,
 >;
 
 /// The interrupt route's view of the machine's sound device.
@@ -86,7 +86,7 @@ fn discover_sound_device(
     let virtual_base = crate::mmio_virtual_base(candidate.region.base, physical_memory_offset);
     let header = core::ptr::NonNull::new(virtual_base as *mut u8)
         .unwrap_or_else(|| panic!("virtio MMIO base {virtual_base:#x} was unexpectedly null"));
-    let dma = helios_virtio::OffsetDmaPool::new(physical_memory_offset);
+    let dma = crate::dma_pool();
     let device =
         unsafe { helios_virtio::snd_from_mmio_with_dma(header, candidate.region.size, dma) }
             .unwrap_or_else(|error| {

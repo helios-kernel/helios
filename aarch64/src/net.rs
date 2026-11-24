@@ -10,7 +10,7 @@ use helios_kernel::{
 use triomphe::Arc;
 
 type Aarch64VirtioNetTransport =
-    helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>;
+    helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<crate::Aarch64DmaPool>>;
 type Aarch64VirtioNetDevice = helios_virtio::VirtioNetDevice<Aarch64VirtioNetTransport>;
 
 #[derive(Clone)]
@@ -216,7 +216,7 @@ fn init_network_device(
     let virtual_base = crate::mmio_virtual_base(physical_base, physical_memory_offset);
     let header = core::ptr::NonNull::new(virtual_base as *mut u8)
         .unwrap_or_else(|| panic!("virtio MMIO base {virtual_base:#x} was unexpectedly null"));
-    let dma = helios_virtio::OffsetDmaPool::new(physical_memory_offset);
+    let dma = crate::dma_pool();
     let device = unsafe { helios_virtio::net_from_mmio_with_dma(header, size, dma, pair_budget) }
         .unwrap_or_else(|error| {
             panic!("failed to initialize virtio-net device at {physical_base:#x}: {error}")
