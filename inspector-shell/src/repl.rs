@@ -2,15 +2,13 @@
 //! inline `-c` pipeline evaluation, script file execution, and structured output rendering.
 
 use std::borrow::Cow;
-use std::io::{IsTerminal as _, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
-use futures_lite::StreamExt as _;
 use helios_nu::{AsyncPipelineData, HeliosEnv, ShellSession};
 use helios_ops::TargetStore;
 use helios_ops::transport::ProtocolClient;
@@ -46,35 +44,6 @@ pub enum OutputFormat {
     Json,
     Jsonl,
     Nuon,
-}
-
-/// RAII guard ensuring raw terminal mode is always disabled on scope exit, error, or panic.
-struct RawModeGuard {
-    active: bool,
-}
-
-impl RawModeGuard {
-    fn enter() -> Result<Self, ReplError> {
-        if std::io::stdin().is_terminal() {
-            terminal::enable_raw_mode().map_err(|source| ReplError::Terminal { source })?;
-            Ok(Self { active: true })
-        } else {
-            Ok(Self { active: false })
-        }
-    }
-
-    fn ensure_disabled(&mut self) {
-        if self.active {
-            let _ = terminal::disable_raw_mode();
-            self.active = false;
-        }
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        self.ensure_disabled();
-    }
 }
 
 /// Styled prompt displaying the connected target name and current remote VFS working directory.
@@ -189,8 +158,8 @@ impl Drop for RemoteSerialEchoGuard {
 
 /// Run the interactive host Nushell REPL backed by `reedline 0.53.0` (with
 /// `bashisms`, `system_clipboard`, live `<Tab>` completion over
-/// [`helios_nu::complete_async`], raw-mode RAII teardown, and `Ctrl+C`
-/// per-invocation cancellation via [`crossterm::event::EventStream`] + `SIGINT`).
+/// [`helios_nu::complete_async`], raw-mode teardown, and `Ctrl+C`
+/// per-invocation cancellation via `SIGINT`).
 pub async fn run_repl(env: HostEnv, format: OutputFormat) -> Result<(), ReplError> {
     let _mute_remote_serial = RemoteSerialEchoGuard::mute(env.session().protocol_client().clone());
     let completion_env = env.for_completion();
@@ -351,58 +320,26 @@ enum EvalOutcome {
     Interrupted,
 }
 
-/// Evaluate one REPL command with `Ctrl+C` per-invocation cancellation driven by
-/// [`crossterm::event::EventStream`] (in raw mode when stdin is a TTY) and `SIGINT`.
+/// Evaluate one REPL command in cooked terminal mode with `Ctrl+C`
+/// per-invocation cancellation via `SIGINT`.
+///
+/// Leaving the terminal in cooked mode (never spawning a detached
+/// `crossterm::event::EventStream` stdin reader thread) lets the OS deliver
+/// `SIGINT` directly to `tokio::signal::ctrl_c()` and prevents a lingering
+/// background stdin reader from stealing `reedline`'s next `\x1b[6n` cursor
+/// position query on `read_line()`.
 async fn eval_interruptible(
     session: &mut ShellSession<HostEnv>,
     source: &str,
     interrupt_flag: &AtomicBool,
 ) -> EvalOutcome {
-    let mut raw_guard = RawModeGuard::enter().ok();
-    let mut event_stream = raw_guard
-        .as_ref()
-        .filter(|g| g.active)
-        .map(|_| EventStream::new());
-
-    let cancel_fut = async {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = wait_for_ctrl_c_key(&mut event_stream) => {}
-        }
-    };
-
-    let outcome = tokio::select! {
+    tokio::select! {
         res = Box::pin(session.eval(source)) => EvalOutcome::Completed(res),
-        _ = cancel_fut => {
+        _ = tokio::signal::ctrl_c() => {
             interrupt_flag.store(true, std::sync::atomic::Ordering::Release);
             EvalOutcome::Interrupted
         }
-    };
-
-    drop(event_stream);
-    if let Some(guard) = raw_guard.as_mut() {
-        guard.ensure_disabled();
     }
-    outcome
-}
-
-async fn wait_for_ctrl_c_key(stream: &mut Option<EventStream>) {
-    let Some(events) = stream.as_mut() else {
-        std::future::pending::<()>().await;
-        return;
-    };
-    while let Some(ev) = events.next().await {
-        if let Ok(Event::Key(KeyEvent {
-            code: KeyCode::Char('c'),
-            modifiers,
-            ..
-        })) = ev
-            && modifiers.contains(KeyModifiers::CONTROL)
-        {
-            return;
-        }
-    }
-    std::future::pending::<()>().await;
 }
 
 /// Render a Nushell [`Value`] in the requested [`OutputFormat`].
