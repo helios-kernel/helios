@@ -1,7 +1,7 @@
 {
   "check-host": {
     "command": "just check-host",
-    "helios-cli": "debug",
+    "helios-cli": ["x64"],
     "rust-cache": true,
     "surfaces": [
       "kernel",
@@ -14,9 +14,10 @@
   },
   "test-embedded-debugger": {
     "guest-wasm": "debug",
+    "guest-programs": ["init", "debugger"],
     "command": "just test-embedded-debugger",
     "warm": "just warm-test-embedded-debugger",
-    "helios-cli": "debug",
+    "helios-cli": ["x64"],
     "rust-cache": true,
     "surfaces": [
       "kernel",
@@ -44,7 +45,7 @@
   },
   "lint-host": {
     "command": "just clippy-host",
-    "helios-cli": "debug",
+    "helios-cli": ["x64"],
     "rust-cache": true,
     "surfaces": [
       "kernel",
@@ -58,7 +59,7 @@
   },
   "lint-programs": {
     "command": "just clippy-programs",
-    "helios-cli": "debug",
+    "helios-cli": ["x64"],
     "rust-cache": true,
     "surfaces": [
       "kernel",
@@ -73,7 +74,7 @@
   "lint-aarch64": {
     "rust-cache": true,
     "command": "just clippy-target aarch64-unknown-none helios-aarch64",
-    "helios-cli": "debug",
+    "helios-cli": ["x64"],
     "surfaces": [
       "aarch64",
       "kernel",
@@ -84,7 +85,7 @@
   "lint-riscv": {
     "rust-cache": true,
     "command": "just clippy-target riscv64gc-unknown-none-elf helios-riscv",
-    "helios-cli": "debug",
+    "helios-cli": ["x64"],
     "surfaces": [
       "riscv",
       "kernel",
@@ -95,7 +96,7 @@
   "lint-x86": {
     "rust-cache": true,
     "command": "just clippy-target x86_64-unknown-none helios-x86",
-    "helios-cli": "debug",
+    "helios-cli": ["x64"],
     "surfaces": [
       "x86",
       "kernel",
@@ -105,9 +106,10 @@
   },
   "test-kernel": {
     "guest-wasm": "debug",
+    "guest-programs": ["init", "debugger"],
     "command": "just test-kernel all",
     "warm": "just warm-test-kernel",
-    "helios-cli": "debug",
+    "helios-cli": ["x64"],
     "rust-cache": true,
     "surfaces": [
       "kernel",
@@ -120,48 +122,65 @@
   },
   "test-libraries": {
     "command": "just test-libraries && just test-btrfs-mkfs",
-    "helios-cli": "debug",
+    "helios-cli": ["x64"],
     "rust-cache": true,
     "surfaces": ["x86", "unix", "btrfs_src", "venus", "host_tools", "programs"]
   },
   "test-host-tools": {
     "guest-wasm": "debug",
+    "guest-programs": ["compiler-plugin"],
     "command": "just test-host-tools",
     "warm": "just warm-test-host-tools",
-    "helios-cli": "debug",
+    "helios-cli": ["x64"],
     "rust-cache": true,
     "surfaces": ["host_tools", "programs"]
   },
   "smoke-riscv64": {
     "heavy": true,
     "surfaces": ["riscv", "kernel", "unix", "btrfs_src", "host_tools", "programs"],
-    "guest-wasm": "release"
+    "helios-cli": ["x64"],
+    "guest-wasm": "release",
+    "guest-programs": "all",
+    "wasi-artifacts": true
   },
   "smoke-aarch64": {
     "heavy": true,
     "surfaces": ["aarch64", "kernel", "unix", "btrfs_src", "host_tools", "programs"],
-    "guest-wasm": "release"
+    "helios-cli": ["arm64"],
+    "guest-wasm": "release",
+    "guest-programs": "all",
+    "wasi-artifacts": true
   },
   "smoke-aarch64-cfi": {
     "heavy": true,
     "surfaces": ["aarch64", "kernel", "unix", "btrfs_src", "host_tools", "programs"],
-    "guest-wasm": "debug"
+    "guest-wasm": "debug",
+    "guest-programs": ["init", "debugger"]
   },
   "smoke-x86-64": {
     "heavy": true,
     "surfaces": ["x86", "kernel", "unix", "btrfs_src", "host_tools", "programs"],
-    "guest-wasm": "release"
+    "helios-cli": ["x64"],
+    "guest-wasm": "release",
+    "guest-programs": "all",
+    "wasi-artifacts": true
   },
   "smoke-x86-64-cpu-lifecycle": {
     "heavy": true,
     "surfaces": ["x86", "kernel", "unix", "btrfs_src", "host_tools", "programs"],
-    "guest-wasm": "release"
+    "helios-cli": ["x64"],
+    "guest-wasm": "release",
+    "guest-programs": ["init", "compiler-plugin", "debugger", "cpu", "http-client"],
+    "wasi-artifacts": true
   },
   "smoke-x86-64-venus": {
     "heavy": true,
     "surfaces": ["gpu"],
     "exclusive": true,
-    "guest-wasm": "debug"
+    "helios-cli": ["x64"],
+    "guest-wasm": "debug",
+    "guest-programs": ["init", "debugger", "gpu-test", "compositor", "pride-flag"],
+    "wasi-artifacts": true
   },
   "test-btrfs-upstream": {
     "surfaces": [
@@ -180,13 +199,17 @@
   "linux-syscalls": {
     "surfaces": ["linux_abi"],
     "exclusive": true,
-    "guest-wasm": "release"
+    "helios-cli": ["x64", "arm64"],
+    "guest-wasm": "release",
+    "guest-programs": ["init", "debugger"]
   },
   "linux-syscalls-full": {
     "heavy": true,
     "surfaces": ["linux_abi"],
     "exclusive": true,
-    "guest-wasm": "release"
+    "helios-cli": ["x64", "arm64"],
+    "guest-wasm": "release",
+    "guest-programs": ["init", "debugger"]
   },
   "test-btrfs-fuzz": {
     "surfaces": [

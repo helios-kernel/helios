@@ -2,8 +2,8 @@ name: helios-cli for this run
 description: >-
   Yields the `helios-cli` binary of the checked-out commit in one cargo
   profile and exports its path as `HELIOS_CLI_BIN`. When `download-only` is
-  `true` (used by `ci.yml` consumers after the `build-helios-cli` producer
-  job), it downloads the prebuilt run artifact directly and fails fast if
+  `true` (used by `ci.yml` consumers after the `build-helios-cli-*` producer
+  jobs), it downloads the prebuilt run artifact directly and fails fast if
   missing. Otherwise (standalone callers such as `kernel-profile.yml`) it
   restores a cross-run cache keyed by `helios-cli`'s inputs, falls back to an
   in-run artifact, and builds and uploads it when missed.
@@ -17,7 +17,7 @@ inputs:
     default: helios
   download-only:
     description: >-
-      Download the prebuilt run artifact from `build-helios-cli` directly and
+      Download the prebuilt run artifact from `build-helios-cli-*` directly and
       fail if absent, without falling back to caching or building.
     required: false
     default: "false"
