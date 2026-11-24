@@ -4230,7 +4230,10 @@ mod tests {
         );
         parent.grant_diagnostic_rights(crate::DiagnosticAuthorityRights::OBSERVE_MACHINE);
         parent.grant_settings_rights(crate::SettingsAuthorityRights::WRITE);
-        parent.grant_machine_rights(crate::MachineAuthorityRights::CONTROL_PROCESSORS);
+        parent.grant_machine_rights(
+            crate::MachineAuthorityRights::CONTROL_PROCESSORS
+                | crate::MachineAuthorityRights::VIRTUALIZE,
+        );
 
         let child = wasix_proc_spawn_inherited_non_directory_authority(&parent);
 
@@ -4264,6 +4267,7 @@ mod tests {
         assert_eq!(
             child.machine_rights(),
             crate::MachineAuthorityRights::CONTROL_PROCESSORS
+                | crate::MachineAuthorityRights::VIRTUALIZE
         );
         assert!(parent.contains_authority(&child));
     }
