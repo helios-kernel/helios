@@ -4031,11 +4031,6 @@ jobs:
             vm_arch: x86-64
             target: x86_64-unknown-none
             profile_dir: profile-use
-    env: &linux-syscalls-image-env
-      HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
-      HELIOS_ARTIFACT_CACHE: ${{ github.workspace }}/cwasm-cache
-      HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
-      HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
     steps: &linux-syscalls-image-steps
       - uses: actions/checkout@v4
         with:
@@ -4044,13 +4039,23 @@ jobs:
       - uses: ./helios/.github/actions/ci-root-key
         with:
           key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
-      - name: Record the job start
+      # Inside a container job, `$GITHUB_WORKSPACE` holds the container mount
+      # path (`/__w/...`) rather than the host runner path.
+      - name: Record the job start and container paths
         shell: bash
-        run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
+        run: |
+          set -euo pipefail
+          {
+            echo "HELIOS_CACHE_START=$(date +%s)"
+            echo "HELIOS_PREBUILT_WASM=${GITHUB_WORKSPACE}/helios/target/wasm-programs"
+            echo "HELIOS_ARTIFACT_CACHE=${GITHUB_WORKSPACE}/cwasm-cache"
+            echo "HELIOS_LIMINE_SHARE=${GITHUB_WORKSPACE}/limine"
+            echo "HELIOS_LIMINE_BIN=${GITHUB_WORKSPACE}/limine/limine"
+          } >> "$GITHUB_ENV"
       - name: Restore the precompiled cwasm cache
         uses: ./helios/.github/actions/shared-cache
         with:
-          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          path: cwasm-cache
           key: helios-cwasm-linux-syscalls-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
           restore-keys: helios-cwasm-linux-syscalls-${{ runner.os }}-${{ runner.arch }}-
       - name: Make the pinned toolchain the only one rust-cache sees
@@ -4060,7 +4065,7 @@ jobs:
           rustup toolchain install
           pinned="$(rustup show active-toolchain | cut -d' ' -f1)"
           rustup default "$pinned"
-          rustup toolchain list --quiet | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
+          (rustup toolchain list --quiet | grep -vxF "$pinned" || true) | xargs -r -n1 rustup toolchain uninstall
           rustup toolchain list
       - uses: Swatinem/rust-cache@v2
         with:
@@ -4096,12 +4101,11 @@ jobs:
             } | sha256sum | awk '{print $1}'
           )"
           echo "input_hash=${input_hash}" >> "$GITHUB_OUTPUT"
-          echo "dir=${RUNNER_TEMP}/helios-inspector-release" >> "$GITHUB_OUTPUT"
       - name: Restore cached release inspector
         id: inspector-cache
         uses: actions/cache@v4
         with:
-          path: ${{ steps.inspector-meta.outputs.dir }}
+          path: ${{ runner.temp }}/helios-inspector-release
           key: helios-inspector-v1-release-${{ runner.os }}-${{ runner.arch }}-${{ steps.inspector-meta.outputs.input_hash }}
       - name: Stage Limine bootloader share
         shell: bash
@@ -4126,7 +4130,7 @@ jobs:
         shell: bash
         working-directory: helios
         env:
-          DIR: ${{ steps.inspector-meta.outputs.dir }}
+          DIR: ${{ runner.temp }}/helios-inspector-release
         run: |
           set -euo pipefail
           cargo build --release -p helios-inspector
@@ -4137,7 +4141,7 @@ jobs:
         shell: bash
         working-directory: helios
         env:
-          DIR: ${{ steps.inspector-meta.outputs.dir }}
+          DIR: ${{ runner.temp }}/helios-inspector-release
         run: |
           set -euo pipefail
           mkdir -p target/release
@@ -4216,7 +4220,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
       - name: Prune the precompiled cwasm cache
-        if: always()
+        if: always() && env.HELIOS_CLI_BIN != ''
         uses: ./helios/.github/actions/prune-artifact-cache
         with:
           cache-dir: ${{ env.HELIOS_ARTIFACT_CACHE }}
@@ -4240,7 +4244,6 @@ jobs:
             vm_arch: aarch64
             target: aarch64-unknown-none
             profile_dir: kernel-release
-    env: *linux-syscalls-image-env
     steps: *linux-syscalls-image-steps
 
   linux-syscalls-x86-64:
