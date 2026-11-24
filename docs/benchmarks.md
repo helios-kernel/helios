@@ -413,7 +413,7 @@ interrupt only, so the guest's yield cadence matches an unprofiled run,
 but the extra interrupts (and, under KVM, the extra timer exits) on every
 processor cost time the medians would carry, as does the kernel task that
 drains the samples every 20 ms. Sampling therefore has its own control
-(`helios:system/profiling.set-instruction-sampling`), separate from the
+(`helios:system/profiling.start-instruction-sampling`), separate from the
 scoped profiler, which only the profile boot enables. The inspector starts it only when
 `--instruction-profile-output` is given, for the duration of the workload,
 and stops it before reading the samples. `linux-gap-bench.py` passes the

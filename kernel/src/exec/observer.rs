@@ -16,7 +16,7 @@ use helios_hal::cpu::HardwarePerfCounterDelta;
 use spin::Mutex;
 use triomphe::Arc;
 
-use crate::{InstanceId, ObserveMachineCap};
+use crate::{AuthorityScope, InstanceId, InstanceRegistry};
 
 pub const DEFAULT_TRACE_HISTORY_CAPACITY: usize = 512;
 pub const DEFAULT_PROFILE_STACK_CAPACITY: usize = 1024;
@@ -214,6 +214,12 @@ impl StatsSample {
     /// were absent, so the inventory it can read has to agree: a listed
     /// device would answer the existence question the claim hides.
     pub(crate) fn restrict_to(&mut self, authority: &crate::ProcessAuthority) {
+        if authority
+            .derive_inspect_read_cap()
+            .is_ok_and(|cap| cap.scope() == AuthorityScope::Machine)
+        {
+            return;
+        }
         let granted = authority.granted_devices();
         self.devices.retain(|device| granted.contains(&device.name));
         if authority.derive_input_claim_cap().is_err() {
@@ -323,16 +329,65 @@ pub trait ObservationScope {
     fn admits(&self, origin: Option<InstanceId>) -> bool;
 }
 
-/// Holding the right to observe the machine admits every record, the
-/// kernel's own included.
-impl ObservationScope for ObserveMachineCap {
+/// Admits no record at all, for a caller that holds no read capability
+/// over the requested history.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NoObservation;
+
+impl ObservationScope for NoObservation {
+    fn admits(&self, _origin: Option<InstanceId>) -> bool {
+        false
+    }
+}
+
+/// Admits every record on the machine, kernel-origin records included.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MachineObservation;
+
+impl ObservationScope for MachineObservation {
     fn admits(&self, _origin: Option<InstanceId>) -> bool {
         true
     }
 }
 
-/// What a reader without the machine-wide right sees: the records its own
-/// instance wrote, and never the kernel's or another instance's.
+/// Admits records attributed to `root` or any descendant in `root`'s
+/// subtree (resolved through [`InstanceRegistry`]'s live and retired
+/// immutable ancestor chains), excluding kernel-origin (`None`) records.
+#[derive(Clone)]
+pub struct SubtreeObservation {
+    root: InstanceId,
+    registry: InstanceRegistry,
+}
+
+impl core::fmt::Debug for SubtreeObservation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SubtreeObservation")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SubtreeObservation {
+    pub const fn new(root: InstanceId, registry: InstanceRegistry) -> Self {
+        Self { root, registry }
+    }
+
+    pub const fn root(&self) -> InstanceId {
+        self.root
+    }
+}
+
+impl ObservationScope for SubtreeObservation {
+    fn admits(&self, origin: Option<InstanceId>) -> bool {
+        let Some(origin) = origin else {
+            return false;
+        };
+        origin == self.root || self.registry.is_in_subtree(self.root, origin)
+    }
+}
+
+/// What a reader with `Own` scope sees: the records its own instance
+/// wrote, and never the kernel's or another instance's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnInstance(InstanceId);
 

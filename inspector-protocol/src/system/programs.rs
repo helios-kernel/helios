@@ -1,6 +1,42 @@
+use serde::{Deserialize, Serialize};
+
 pub use super::bindings::helios::system::programs::{
-    AotHint, AotRequest, AotResult, ExecError, ExecErrorKind, ExecOutput, ExecRequest, ExecResult,
+    AotHint, AotRequest, AotResult, AuthorityScope, ClockGrant, ClockRight, DeviceClass,
+    DeviceGrant, DiagnosticsGrant, DirectoryGrant, ExecError, ExecErrorKind, ExecOutput,
+    ExecResult, FilesystemRight, InstanceId, LinkGrant, LinkRight, MachineGrant, MachineRight,
+    MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight, SettingsGrant,
+    SettingsRight, TerminalGrant, TerminalRight,
 };
+
+/// Wire-serializable subset of `helios:system/programs.capability-grant` for
+/// remote `programs.exec` invocations (excludes in-guest `ipc-grant` handles).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum CapabilityGrant {
+    Directory(DirectoryGrant),
+    Network(NetworkGrant),
+    Clock(ClockGrant),
+    Terminal(TerminalGrant),
+    Process(ProcessGrant),
+    Link(LinkGrant),
+    Mount(MountGrant),
+    Device(DeviceGrant),
+    Diagnostics(DiagnosticsGrant),
+    InstanceControl(AuthorityScope),
+    Settings(SettingsGrant),
+    Machine(MachineGrant),
+}
+
+/// Wire-serializable `helios:system/programs.exec-request`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecRequest {
+    pub name: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub path: String,
+    pub stdin: Vec<u8>,
+    pub hint: Option<AotHint>,
+    pub capability_grants: Vec<CapabilityGrant>,
+}
 
 #[cfg(feature = "host")]
 mod host {
