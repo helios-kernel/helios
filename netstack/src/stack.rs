@@ -21066,9 +21066,9 @@ mod tests {
             let socket = establish_flows(&mut stack, 1, false)[0];
             let payload = vec![0x5a; 4 * MSS];
             assert_eq!(
-            stack.tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload)),
-            Ok(payload.len())
-        );
+                stack.tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload)),
+                Ok(payload.len())
+            );
             let original = settle(&mut stack, 2);
             assert_eq!(original.len(), 4);
 

@@ -4740,7 +4740,10 @@ mod tests {
             TCP_INITIAL_RTO_NANOS,
         );
         socket.mark_ack_queued();
-        assert_eq!(socket.queue_send_bytes(&mut Bytes::from_static(b"hello")), 5);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"hello")),
+            5
+        );
         let sent_at = 2 * TCP_INITIAL_RTO_NANOS;
         let first = socket
             .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
