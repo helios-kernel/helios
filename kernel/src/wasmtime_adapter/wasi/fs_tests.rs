@@ -82,6 +82,7 @@ fn create_file<S: crate::Storage>(
         WritePosition::At(0),
         bytes,
         1,
+        &crate::StoragePayer::for_test(),
     ))
     .expect("file write must succeed");
     descriptor
@@ -112,6 +113,7 @@ fn open<S: crate::Storage>(
             open_flags,
             flags,
             1,
+            &crate::StoragePayer::for_test(),
         )
         .await
     })
@@ -141,8 +143,14 @@ fn granted(rights: FileSystemRights) -> crate::MountGrant {
 #[test]
 fn create_directory_adds_node() {
     let namespace = namespace();
-    block_on(create_directory_at(&namespace, held(&root()), "tmp", 7))
-        .expect("directory creation must succeed");
+    block_on(create_directory_at(
+        &namespace,
+        held(&root()),
+        "tmp",
+        7,
+        &crate::StoragePayer::for_test(),
+    ))
+    .expect("directory creation must succeed");
 
     let metadata =
         block_on(stat_path(&namespace, "/tmp", Follow::No)).expect("directory must exist");
@@ -153,11 +161,24 @@ fn create_directory_adds_node() {
 #[test]
 fn create_directory_rejects_existing_path() {
     let namespace = namespace();
-    block_on(create_directory_at(&namespace, held(&root()), "tmp", 1))
-        .expect("initial directory creation must succeed");
+    let payer = crate::StoragePayer::for_test();
+    block_on(create_directory_at(
+        &namespace,
+        held(&root()),
+        "tmp",
+        1,
+        &payer,
+    ))
+    .expect("initial directory creation must succeed");
 
-    let error = block_on(create_directory_at(&namespace, held(&root()), "tmp", 2))
-        .expect_err("creating the same directory twice must fail");
+    let error = block_on(create_directory_at(
+        &namespace,
+        held(&root()),
+        "tmp",
+        2,
+        &payer,
+    ))
+    .expect_err("creating the same directory twice must fail");
     assert!(matches!(error, fs_types::ErrorCode::Exist));
 }
 
@@ -196,6 +217,7 @@ fn writing_a_boot_image_file_writes_the_trees_own_copy() {
         WritePosition::At(0),
         b"T",
         1,
+        &crate::StoragePayer::for_test(),
     ))
     .expect("the write lands in the tree's copy");
     assert_eq!(end.end(), Some(1));
@@ -221,8 +243,14 @@ fn open_at_rejects_descriptor_right_widening() {
 #[test]
 fn opening_existing_directory_without_directory_flag_fails() {
     let namespace = namespace();
-    block_on(create_directory_at(&namespace, held(&root()), "tmp", 1))
-        .expect("directory creation must succeed");
+    block_on(create_directory_at(
+        &namespace,
+        held(&root()),
+        "tmp",
+        1,
+        &crate::StoragePayer::for_test(),
+    ))
+    .expect("directory creation must succeed");
 
     let error = open(
         &namespace,
@@ -341,6 +369,7 @@ fn hardlink_preserves_identity_and_shared_contents() {
         WritePosition::At(0),
         b"bolt",
         3,
+        &crate::StoragePayer::for_test(),
     ))
     .expect("linked write must succeed");
     assert_eq!(read_all(&namespace, &alias), b"bolt");
@@ -351,7 +380,14 @@ fn set_size_resizes_all_links_without_widening_descriptor_rights() {
     let namespace = namespace();
     let original = create_file(&namespace, "tmp", b"data");
     link(&namespace, &root(), "tmp", &root(), "alias").expect("hardlink must succeed");
-    block_on(set_size(&namespace, held(&original), 6, 4)).expect("set-size must grow the file");
+    block_on(set_size(
+        &namespace,
+        held(&original),
+        6,
+        4,
+        &crate::StoragePayer::for_test(),
+    ))
+    .expect("set-size must grow the file");
 
     let alias = open(
         &namespace,
@@ -392,6 +428,7 @@ fn set_times_updates_stat_and_metadata_hash() {
         Some(11),
         Some(17),
         19,
+        &crate::StoragePayer::for_test(),
     ))
     .expect("set-times must succeed");
     let metadata = block_on(stat_path(&namespace, "/tmp", Follow::No)).expect("stat must succeed");
@@ -406,8 +443,14 @@ fn set_times_updates_stat_and_metadata_hash() {
 fn hardlink_rejects_directory_and_cross_mount() {
     let namespace = namespace();
     mount_memory(&namespace, "/mnt");
-    block_on(create_directory_at(&namespace, held(&root()), "dir", 1))
-        .expect("directory creation must succeed");
+    block_on(create_directory_at(
+        &namespace,
+        held(&root()),
+        "dir",
+        1,
+        &crate::StoragePayer::for_test(),
+    ))
+    .expect("directory creation must succeed");
     create_file(&namespace, "tmp", b"");
 
     let directory_error = link(&namespace, &root(), "dir", &root(), "dir-link")
@@ -428,6 +471,7 @@ fn symlink_target_is_read_without_normalization() {
         "bin/tool",
         "tool-link",
         1,
+        &crate::StoragePayer::for_test(),
     ))
     .expect("symlink creation must succeed");
 
@@ -464,6 +508,7 @@ fn symlink_targets_stay_inside_the_link_directory() {
 #[test]
 fn symlink_rejects_rooted_and_parent_escape_targets() {
     let namespace = namespace();
+    let payer = crate::StoragePayer::for_test();
 
     let absolute = block_on(symlink_at(
         &namespace,
@@ -471,6 +516,7 @@ fn symlink_rejects_rooted_and_parent_escape_targets() {
         "/bin/tool",
         "absolute",
         1,
+        &payer,
     ))
     .expect_err("an absolute symlink target must be rejected");
     assert!(matches!(absolute, fs_types::ErrorCode::NotPermitted));
@@ -481,6 +527,7 @@ fn symlink_rejects_rooted_and_parent_escape_targets() {
         "../bin/tool",
         "escape",
         1,
+        &payer,
     ))
     .expect_err("a parent-escaping symlink target must be rejected");
     assert!(matches!(parent, fs_types::ErrorCode::NotPermitted));
@@ -489,12 +536,14 @@ fn symlink_rejects_rooted_and_parent_escape_targets() {
 #[test]
 fn symlink_follow_is_confined_and_loop_limited() {
     let namespace = namespace();
+    let payer = crate::StoragePayer::for_test();
     block_on(symlink_at(
         &namespace,
         held(&root()),
         "bin/tool",
         "tool-link",
         1,
+        &payer,
     ))
     .expect("symlink creation must succeed");
     let opened = block_on(open_at(
@@ -505,14 +554,29 @@ fn symlink_follow_is_confined_and_loop_limited() {
         fs_types::OpenFlags::empty(),
         FsDescriptorFlags::READ,
         1,
+        &payer,
     ))
     .expect("symlink follow must open the target");
     assert_eq!(read_all(&namespace, &opened), b"tool");
 
-    block_on(symlink_at(&namespace, held(&root()), "loop-b", "loop-a", 1))
-        .expect("loop symlink a must be created");
-    block_on(symlink_at(&namespace, held(&root()), "loop-a", "loop-b", 1))
-        .expect("loop symlink b must be created");
+    block_on(symlink_at(
+        &namespace,
+        held(&root()),
+        "loop-b",
+        "loop-a",
+        1,
+        &payer,
+    ))
+    .expect("loop symlink a must be created");
+    block_on(symlink_at(
+        &namespace,
+        held(&root()),
+        "loop-a",
+        "loop-b",
+        1,
+        &payer,
+    ))
+    .expect("loop symlink b must be created");
     let error = block_on(open_at(
         &namespace,
         held(&root()),
@@ -521,6 +585,7 @@ fn symlink_follow_is_confined_and_loop_limited() {
         fs_types::OpenFlags::empty(),
         FsDescriptorFlags::READ,
         1,
+        &payer,
     ))
     .err()
     .expect("a symlink loop must be rejected");
@@ -608,8 +673,15 @@ fn bootfs_cwasm_loads_without_signature_verification() {
 fn guest_written_cwasm_must_verify() {
     let kernel_key = boot_key(1);
     let namespace = namespace_with_bootfs_cwasm();
-    block_on(create_directory_at(&namespace, held(&root()), "tmp", 1))
-        .expect("creating /tmp must succeed");
+    let payer = crate::StoragePayer::for_test();
+    block_on(create_directory_at(
+        &namespace,
+        held(&root()),
+        "tmp",
+        1,
+        &payer,
+    ))
+    .expect("creating /tmp must succeed");
     mount_memory(&namespace, "/mnt");
 
     // The bytes of a bootfs artifact, copied by a guest through an
@@ -639,6 +711,7 @@ fn guest_written_cwasm_must_verify() {
         "/tmp/foreign",
         foreign_signed_cwasm(),
         3,
+        &payer,
     ))
     .expect("writing a program file must succeed");
     let ProgramSource::SignedArtifact(bytes) = program_source(&namespace, "/tmp/foreign") else {
@@ -659,6 +732,7 @@ fn guest_written_cwasm_must_verify() {
         "/tmp/root-signed",
         &cwasm::sign_artifact_with_build_root_for_tests(b"payload"),
         3,
+        &payer,
     ))
     .expect("writing a program file must succeed");
     let ProgramSource::SignedArtifact(bytes) = program_source(&namespace, "/tmp/root-signed")
@@ -694,6 +768,7 @@ fn guest_written_cwasm_must_verify() {
         "/tmp/tampered",
         &tampered,
         4,
+        &payer,
     ))
     .expect("writing a program file must succeed");
     let ProgramSource::SignedArtifact(bytes) = program_source(&namespace, "/tmp/tampered") else {
@@ -710,8 +785,14 @@ fn guest_written_cwasm_must_verify() {
     // and that is what lets a guest exec it from anywhere.
     let signed = cwasm::sign_artifact_payload(b"payload", &kernel_key)
         .expect("signing with the kernel key must succeed");
-    block_on(write_program_file(&namespace, "/tmp/compiled", &signed, 5))
-        .expect("writing a program file must succeed");
+    block_on(write_program_file(
+        &namespace,
+        "/tmp/compiled",
+        &signed,
+        5,
+        &payer,
+    ))
+    .expect("writing a program file must succeed");
     let ProgramSource::SignedArtifact(bytes) = program_source(&namespace, "/tmp/compiled") else {
         panic!("a guest-written cwasm must classify as a signed artifact");
     };
@@ -732,16 +813,26 @@ fn writing_a_bootfs_node_drops_its_provenance() {
                 WritePosition::At(0),
                 b"p",
                 2,
+                &crate::StoragePayer::for_test(),
             ))
             .map(drop)
         },
-        |namespace, descriptor| block_on(set_size(namespace, held(descriptor), 1, 3)),
+        |namespace, descriptor| {
+            block_on(set_size(
+                namespace,
+                held(descriptor),
+                1,
+                3,
+                &crate::StoragePayer::for_test(),
+            ))
+        },
         |namespace, _| {
             block_on(write_program_file(
                 namespace,
                 "/bin/prog",
                 foreign_signed_cwasm(),
                 4,
+                &crate::StoragePayer::for_test(),
             ))
         },
     ];
@@ -774,8 +865,23 @@ fn work() -> FsDescriptor {
 #[test]
 fn the_base_itself_is_never_removed_renamed_or_replaced_through_it() {
     let namespace = namespace();
-    block_on(create_directory_at(&namespace, held(&root()), "work", 1)).expect("creates /work");
-    block_on(create_directory_at(&namespace, held(&root()), "bob", 1)).expect("creates /bob");
+    let payer = crate::StoragePayer::for_test();
+    block_on(create_directory_at(
+        &namespace,
+        held(&root()),
+        "work",
+        1,
+        &payer,
+    ))
+    .expect("creates /work");
+    block_on(create_directory_at(
+        &namespace,
+        held(&root()),
+        "bob",
+        1,
+        &payer,
+    ))
+    .expect("creates /bob");
 
     for path in ["", ".", "sub/.."] {
         assert!(matches!(
@@ -783,7 +889,8 @@ fn the_base_itself_is_never_removed_renamed_or_replaced_through_it() {
                 &namespace,
                 held(&work()),
                 path,
-                7_000_000_000
+                7_000_000_000,
+                &payer,
             )),
             Err(fs_types::ErrorCode::Invalid)
         ));
@@ -792,12 +899,20 @@ fn the_base_itself_is_never_removed_renamed_or_replaced_through_it() {
                 &namespace,
                 held(&work()),
                 path,
-                7_000_000_000
+                7_000_000_000,
+                &payer,
             )),
             Err(fs_types::ErrorCode::Invalid)
         ));
         assert!(matches!(
-            block_on(symlink_at(&namespace, held(&work()), "bob", path, 1)),
+            block_on(symlink_at(
+                &namespace,
+                held(&work()),
+                "bob",
+                path,
+                1,
+                &payer,
+            )),
             Err(fs_types::ErrorCode::Invalid)
         ));
         assert!(matches!(
@@ -816,11 +931,27 @@ fn the_base_itself_is_never_removed_renamed_or_replaced_through_it() {
 #[test]
 fn a_link_at_the_base_does_not_lead_out_of_it() {
     let namespace = namespace();
-    block_on(create_directory_at(&namespace, held(&root()), "bob", 1)).expect("creates /bob");
+    let payer = crate::StoragePayer::for_test();
+    block_on(create_directory_at(
+        &namespace,
+        held(&root()),
+        "bob",
+        1,
+        &payer,
+    ))
+    .expect("creates /bob");
     create_file(&namespace, "bob/secret", b"bob's");
     // Whoever holds the parent replaces the preopen's directory with a
     // link to its sibling: `work`'s holder still names `/work`.
-    block_on(symlink_at(&namespace, held(&root()), "bob", "work", 1)).expect("links /work");
+    block_on(symlink_at(
+        &namespace,
+        held(&root()),
+        "bob",
+        "work",
+        1,
+        &payer,
+    ))
+    .expect("links /work");
 
     for path in [".", ""] {
         let opened = block_on(open_at(
@@ -831,6 +962,7 @@ fn a_link_at_the_base_does_not_lead_out_of_it() {
             fs_types::OpenFlags::DIRECTORY,
             FsDescriptorFlags::READ,
             1,
+            &payer,
         ));
         assert!(matches!(opened, Err(fs_types::ErrorCode::NotPermitted)));
         assert!(matches!(
@@ -857,6 +989,7 @@ fn a_link_at_the_base_does_not_lead_out_of_it() {
         fs_types::OpenFlags::DIRECTORY,
         FsDescriptorFlags::READ,
         1,
+        &payer,
     ))
     .expect("the root's descriptor follows a link inside the root");
     assert_eq!(followed.path, "/bob");
@@ -930,6 +1063,7 @@ fn an_append_resolves_with_the_end_of_file_it_reached() {
         WritePosition::At(3),
         "日本語".as_bytes(),
         2,
+        &crate::StoragePayer::for_test(),
     ))
     .expect("the second writer extends the file");
     assert_eq!(end.end(), Some(3 + "日本語".len() as u64));
@@ -940,6 +1074,7 @@ fn an_append_resolves_with_the_end_of_file_it_reached() {
         WritePosition::End,
         "한국어".as_bytes(),
         3,
+        &crate::StoragePayer::for_test(),
     ))
     .expect("the append lands");
     let contents = read_all(&namespace, &appender);
@@ -950,8 +1085,16 @@ fn an_append_resolves_with_the_end_of_file_it_reached() {
 #[test]
 fn a_directory_holding_a_mount_point_is_busy() {
     let namespace = namespace();
+    let payer = crate::StoragePayer::for_test();
     for directory in ["a", "a/b"] {
-        block_on(create_directory_at(&namespace, held(&root()), directory, 1)).expect("creates");
+        block_on(create_directory_at(
+            &namespace,
+            held(&root()),
+            directory,
+            1,
+            &payer,
+        ))
+        .expect("creates");
     }
     mount_memory(&namespace, "/a/b");
 
@@ -962,7 +1105,8 @@ fn a_directory_holding_a_mount_point_is_busy() {
                     &namespace,
                     held(&root()),
                     path,
-                    7_000_000_000
+                    7_000_000_000,
+                    &payer,
                 )),
                 Err(fs_types::ErrorCode::Busy)
             ),
@@ -1042,12 +1186,15 @@ fn a_read_only_base_creates_no_directory_on_the_host_share() {
     let namespace = namespace();
     mount_unreachable_host(&namespace, "/mnt");
     let (rw, ro) = host_bases();
+    let payer = crate::StoragePayer::for_test();
 
     // The control: a request the base may make reaches the share.
-    let reached = block_on(async { create_directory_at(&namespace, rw.grant()?, "new", 1).await });
+    let reached =
+        block_on(async { create_directory_at(&namespace, rw.grant()?, "new", 1, &payer).await });
     assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
 
-    let refused = block_on(async { create_directory_at(&namespace, ro.grant()?, "new", 1).await });
+    let refused =
+        block_on(async { create_directory_at(&namespace, ro.grant()?, "new", 1, &payer).await });
     assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
 }
 
@@ -1056,14 +1203,15 @@ fn a_read_only_base_removes_no_directory_on_the_host_share() {
     let namespace = namespace();
     mount_unreachable_host(&namespace, "/mnt");
     let (rw, ro) = host_bases();
+    let payer = crate::StoragePayer::for_test();
 
     let reached = block_on(async {
-        remove_directory_at(&namespace, rw.grant()?, "old", 7_000_000_000).await
+        remove_directory_at(&namespace, rw.grant()?, "old", 7_000_000_000, &payer).await
     });
     assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
 
     let refused = block_on(async {
-        remove_directory_at(&namespace, ro.grant()?, "old", 7_000_000_000).await
+        remove_directory_at(&namespace, ro.grant()?, "old", 7_000_000_000, &payer).await
     });
     assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
 }
@@ -1093,13 +1241,16 @@ fn a_read_only_base_unlinks_nothing_on_the_host_share() {
     let namespace = namespace();
     mount_unreachable_host(&namespace, "/mnt");
     let (rw, ro) = host_bases();
+    let payer = crate::StoragePayer::for_test();
 
-    let reached =
-        block_on(async { unlink_file_at(&namespace, rw.grant()?, "old", 7_000_000_000).await });
+    let reached = block_on(async {
+        unlink_file_at(&namespace, rw.grant()?, "old", 7_000_000_000, &payer).await
+    });
     assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
 
-    let refused =
-        block_on(async { unlink_file_at(&namespace, ro.grant()?, "old", 7_000_000_000).await });
+    let refused = block_on(async {
+        unlink_file_at(&namespace, ro.grant()?, "old", 7_000_000_000, &payer).await
+    });
     assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
 }
 
@@ -1112,6 +1263,7 @@ fn times_of(namespace: &TestNamespace, path: &str) -> (u64, u64) {
 #[test]
 fn set_times_needs_write_on_the_descriptor() {
     let namespace = namespace();
+    let payer = crate::StoragePayer::for_test();
     let file = create_file(&namespace, "tmp", b"");
     let before = times_of(&namespace, "/tmp");
     let read_only = FsDescriptor {
@@ -1135,12 +1287,20 @@ fn set_times_needs_write_on_the_descriptor() {
         Some(11),
         Some(17),
         19,
+        &payer,
     ))
     .expect("a descriptor with write sets the times");
     assert_eq!(times_of(&namespace, "/tmp"), (11, 17));
 
     // A directory is retimed by the right to change it, not by `write`.
-    block_on(create_directory_at(&namespace, held(&root()), "dir", 1)).expect("creates /dir");
+    block_on(create_directory_at(
+        &namespace,
+        held(&root()),
+        "dir",
+        1,
+        &payer,
+    ))
+    .expect("creates /dir");
     let directory = |flags| directory_holding("/dir", flags);
     assert!(matches!(
         directory(FsDescriptorFlags::READ | FsDescriptorFlags::WRITE)
@@ -1155,6 +1315,7 @@ fn set_times_needs_write_on_the_descriptor() {
         Some(23),
         Some(29),
         31,
+        &payer,
     ))
     .expect("a directory descriptor with mutate-directory sets the times");
     assert_eq!(times_of(&namespace, "/dir"), (23, 29));
@@ -1164,6 +1325,7 @@ fn set_times_needs_write_on_the_descriptor() {
 fn set_times_asks_the_host_only_with_the_right() {
     let namespace = namespace();
     mount_unreachable_host(&namespace, "/mnt");
+    let payer = crate::StoragePayer::for_test();
     let file = |flags| FsDescriptor {
         path: String::from("/mnt/a/file"),
         kind: FsNodeKind::File,
@@ -1178,6 +1340,7 @@ fn set_times_asks_the_host_only_with_the_right() {
             Some(1),
             Some(2),
             3,
+            &payer,
         )
         .await
     });
@@ -1190,6 +1353,7 @@ fn set_times_asks_the_host_only_with_the_right() {
             Some(1),
             Some(2),
             3,
+            &payer,
         )
         .await
     });
@@ -1199,6 +1363,7 @@ fn set_times_asks_the_host_only_with_the_right() {
 #[test]
 fn set_times_at_needs_write_or_mutate_on_the_base() {
     let namespace = namespace();
+    let payer = crate::StoragePayer::for_test();
     create_file(&namespace, "tmp", b"");
     let before = times_of(&namespace, "/tmp");
     let base = |flags| directory_holding("/", flags);
@@ -1212,6 +1377,7 @@ fn set_times_at_needs_write_or_mutate_on_the_base() {
             Some(11),
             Some(17),
             19,
+            &payer,
         )
         .await
     });
@@ -1231,6 +1397,7 @@ fn set_times_at_needs_write_or_mutate_on_the_base() {
             Some(times.0),
             Some(times.1),
             31,
+            &payer,
         ))
         .expect("a base with write or mutate-directory sets the times");
         assert_eq!(times_of(&namespace, "/tmp"), times);
@@ -1248,6 +1415,7 @@ fn set_times_at_needs_write_or_mutate_on_the_base() {
             Some(1),
             Some(2),
             3,
+            &payer,
         )
         .await
     });
@@ -1261,6 +1429,7 @@ fn set_times_at_needs_write_or_mutate_on_the_base() {
             Some(1),
             Some(2),
             3,
+            &payer,
         )
         .await
     });
@@ -1337,7 +1506,15 @@ fn link(
 ) -> Result<(), fs_types::ErrorCode> {
     block_on(async {
         let proof = source.grant()?.alias_into(destination.grant()?)?;
-        link_at(namespace, proof, source_path, destination_path, 1).await
+        link_at(
+            namespace,
+            proof,
+            source_path,
+            destination_path,
+            1,
+            &crate::StoragePayer::for_test(),
+        )
+        .await
     })
 }
 
@@ -1355,7 +1532,15 @@ fn rename(
             .grant()?
             .alias_into(destination.grant()?)?
             .removing_source()?;
-        rename_at(namespace, proof, source_path, destination_path, 1).await
+        rename_at(
+            namespace,
+            proof,
+            source_path,
+            destination_path,
+            1,
+            &crate::StoragePayer::for_test(),
+        )
+        .await
     })
 }
 
@@ -1378,9 +1563,16 @@ const SECRET: &str = "秘密の文書 비밀 문서 机密文件";
 /// `/a/secret` holding [`SECRET`], and an empty `/b`, on the root layer.
 fn secret_in_a() -> TestNamespace {
     let namespace = namespace();
+    let payer = crate::StoragePayer::for_test();
     for name in ["a", "b"] {
-        block_on(create_directory_at(&namespace, held(&root()), name, 1))
-            .expect("directory creation must succeed");
+        block_on(create_directory_at(
+            &namespace,
+            held(&root()),
+            name,
+            1,
+            &payer,
+        ))
+        .expect("directory creation must succeed");
     }
     create_file(&namespace, "a/secret", SECRET.as_bytes());
     namespace
@@ -1467,10 +1659,17 @@ fn a_link_needs_mutate_on_its_destination() {
 /// `/mnt/a/pointer` to it and an empty `/mnt/b`.
 fn secret_on_a_memory_mount() -> TestNamespace {
     let namespace = namespace();
+    let payer = crate::StoragePayer::for_test();
     mount_memory(&namespace, "/mnt");
     for name in ["mnt/a", "mnt/b"] {
-        block_on(create_directory_at(&namespace, held(&root()), name, 1))
-            .expect("directory creation must succeed");
+        block_on(create_directory_at(
+            &namespace,
+            held(&root()),
+            name,
+            1,
+            &payer,
+        ))
+        .expect("directory creation must succeed");
     }
     create_file(&namespace, "mnt/a/secret", SECRET.as_bytes());
     block_on(symlink_at(
@@ -1479,6 +1678,7 @@ fn secret_on_a_memory_mount() -> TestNamespace {
         "secret",
         "pointer",
         1,
+        &payer,
     ))
     .expect("the link is created");
     namespace
@@ -1748,9 +1948,23 @@ fn a_create_lands_on_the_mount_that_owns_the_new_entry() {
         FsDescriptorFlags::READ,
     );
     assert!(matches!(created, Err(fs_types::ErrorCode::ReadOnly)));
-    let directory = block_on(create_directory_at(&namespace, held(&root()), "mnt/d", 1));
+    let payer = crate::StoragePayer::for_test();
+    let directory = block_on(create_directory_at(
+        &namespace,
+        held(&root()),
+        "mnt/d",
+        1,
+        &payer,
+    ));
     assert!(matches!(directory, Err(fs_types::ErrorCode::ReadOnly)));
-    let symlink = block_on(symlink_at(&namespace, held(&root()), "target", "mnt/l", 1));
+    let symlink = block_on(symlink_at(
+        &namespace,
+        held(&root()),
+        "target",
+        "mnt/l",
+        1,
+        &payer,
+    ));
     assert!(matches!(symlink, Err(fs_types::ErrorCode::ReadOnly)));
     for name in ["new", "d", "l"] {
         assert!(missing(&namespace, &alloc::format!("/mnt/{name}")));
@@ -1782,7 +1996,13 @@ fn file_stream_fills_destinations_without_moving_source_bytes() {
         let engine = wasmtime::Engine::new(&config).expect("stream engine");
         let mut store = wasmtime::Store::new(&engine, test_store::store_data_with(|_| {}));
         let (tx, rx) = futures::channel::oneshot::channel();
-        let consumer = file_write_consumer(|state| state, target, position, tx);
+        let consumer = file_write_consumer(
+            |state| state,
+            target,
+            position,
+            crate::StoragePayer::for_test(),
+            tx,
+        );
         let source = TrackedBuffer {
             bytes,
             reads: reads.clone(),
@@ -1829,6 +2049,7 @@ impl MemoryHostFileSystem {
                 IoError::Unsupported
             }
             FsError::NoSpace => return crate::HostFsError::Protocol("no space"),
+            FsError::OutOfMemory => return crate::HostFsError::Protocol("out of memory"),
             FsError::NameTooLong => {
                 return crate::HostFsError::NameTooLong {
                     len: 256,
@@ -1967,7 +2188,12 @@ impl crate::HostFileSystem for MemoryHostFileSystem {
         let path = Self::fs_path(path)?;
         use helios_hal::fs::FileSystem as _;
         self.inner
-            .open(path, helios_hal::fs::OpenFlags::TRUNCATE, 1)
+            .open(
+                path,
+                helios_hal::fs::OpenFlags::TRUNCATE,
+                1,
+                &crate::StoragePayer::for_test(),
+            )
             .await
             .map(|_| ())
             .map_err(Self::host_error)
@@ -1977,7 +2203,7 @@ impl crate::HostFileSystem for MemoryHostFileSystem {
         let path = Self::fs_path(path)?;
         use helios_hal::fs::FileSystem as _;
         self.inner
-            .set_size(path, size, 1)
+            .set_size(path, size, 1, &crate::StoragePayer::for_test())
             .await
             .map_err(Self::host_error)
     }
@@ -1991,7 +2217,13 @@ impl crate::HostFileSystem for MemoryHostFileSystem {
         let path = Self::fs_path(path)?;
         use helios_hal::fs::FileSystem as _;
         self.inner
-            .set_times(path, access_nanos, modified_nanos, 99)
+            .set_times(
+                path,
+                access_nanos,
+                modified_nanos,
+                99,
+                &crate::StoragePayer::for_test(),
+            )
             .await
             .map_err(Self::host_error)
     }
@@ -2046,13 +2278,17 @@ impl crate::HostFileSystem for MemoryHostFileSystem {
     async fn remove(&self, path: &str, directory: bool) -> Result<(), crate::HostFsError> {
         let path = Self::fs_path(path)?;
         use helios_hal::fs::FileSystem as _;
+        let payer = crate::StoragePayer::for_test();
         if directory {
             self.inner
-                .remove_directory(path, 1)
+                .remove_directory(path, 1, &payer)
                 .await
                 .map_err(Self::host_error)
         } else {
-            self.inner.unlink(path, 1).await.map_err(Self::host_error)
+            self.inner
+                .unlink(path, 1, &payer)
+                .await
+                .map_err(Self::host_error)
         }
     }
 
@@ -2061,7 +2297,13 @@ impl crate::HostFileSystem for MemoryHostFileSystem {
         let destination = Self::fs_path(destination)?;
         use helios_hal::fs::FileSystem as _;
         self.inner
-            .rename(source, destination, helios_hal::fs::RenameMode::Replace, 1)
+            .rename(
+                source,
+                destination,
+                helios_hal::fs::RenameMode::Replace,
+                1,
+                &crate::StoragePayer::for_test(),
+            )
             .await
             .map_err(Self::host_error)
     }
@@ -2071,7 +2313,7 @@ impl crate::HostFileSystem for MemoryHostFileSystem {
         let destination = Self::fs_path(destination)?;
         use helios_hal::fs::FileSystem as _;
         self.inner
-            .link(source, destination, 1)
+            .link(source, destination, 1, &crate::StoragePayer::for_test())
             .await
             .map_err(Self::host_error)
     }
@@ -2230,11 +2472,13 @@ fn p3_open_at_validates_all_open_flags_on_embedded_and_host_share() {
     use helios_hal::fs::FileSystem as _;
 
     let (mut store, host_fs) = memory_host_store_data();
+    let payer = crate::StoragePayer::for_test();
     // Seed an existing file and directory on both embedded root (`/`) and host share (`/host`).
     block_on(host_fs.inner.open(
         MemoryHostFileSystem::fs_path("existing.txt").unwrap(),
         helios_hal::fs::OpenFlags::CREATE,
         1,
+        &payer,
     ))
     .expect("host file created");
     block_on(async {
@@ -2245,6 +2489,7 @@ fn p3_open_at_validates_all_open_flags_on_embedded_and_host_share() {
                 WritePosition::At(0),
                 7,
                 2,
+                &payer,
             )
             .await
             .expect("prepare host write");
@@ -2253,18 +2498,26 @@ fn p3_open_at_validates_all_open_flags_on_embedded_and_host_share() {
         filled.submit().await.expect("submit host write");
         host_fs
             .inner
-            .create_directory(MemoryHostFileSystem::fs_path("subdir").unwrap(), 1)
+            .create_directory(MemoryHostFileSystem::fs_path("subdir").unwrap(), 1, &payer)
             .await
             .expect("host subdir");
     });
 
     let root_ns = store.filesystem().clone();
-    block_on(create_directory_at(&root_ns, held(&root()), "emb", 1)).expect("emb dir");
+    block_on(create_directory_at(
+        &root_ns,
+        held(&root()),
+        "emb",
+        1,
+        &payer,
+    ))
+    .expect("emb dir");
     block_on(create_directory_at(
         &root_ns,
         held(&root()),
         "emb/subdir",
         1,
+        &payer,
     ))
     .expect("emb subdir");
     let emb_file = create_file(&root_ns, "emb/existing.txt", b"payload");
@@ -2426,6 +2679,7 @@ fn host_share_and_embedded_symlinks_honor_symlink_follow_across_stat_open_and_se
     use helios_hal::fs::{FileSystem as _, FilledWrite as _, PreparedWrite as _};
 
     let (mut store, host_fs) = memory_host_store_data();
+    let payer = crate::StoragePayer::for_test();
     // Seed /host with target file, subdir, and symlinks to each.
     block_on(async {
         host_fs
@@ -2434,6 +2688,7 @@ fn host_share_and_embedded_symlinks_honor_symlink_follow_across_stat_open_and_se
                 MemoryHostFileSystem::fs_path("target").unwrap(),
                 helios_hal::fs::OpenFlags::CREATE,
                 10,
+                &payer,
             )
             .await
             .unwrap();
@@ -2444,6 +2699,7 @@ fn host_share_and_embedded_symlinks_honor_symlink_follow_across_stat_open_and_se
                 WritePosition::At(0),
                 4,
                 10,
+                &payer,
             )
             .await
             .unwrap();
@@ -2454,7 +2710,7 @@ fn host_share_and_embedded_symlinks_honor_symlink_follow_across_stat_open_and_se
             .unwrap();
         host_fs
             .inner
-            .create_directory(MemoryHostFileSystem::fs_path("dir").unwrap(), 10)
+            .create_directory(MemoryHostFileSystem::fs_path("dir").unwrap(), 10, &payer)
             .await
             .unwrap();
         host_fs
@@ -2463,6 +2719,7 @@ fn host_share_and_embedded_symlinks_honor_symlink_follow_across_stat_open_and_se
                 "target",
                 MemoryHostFileSystem::fs_path("file-link").unwrap(),
                 10,
+                &payer,
             )
             .await
             .unwrap();
@@ -2472,6 +2729,7 @@ fn host_share_and_embedded_symlinks_honor_symlink_follow_across_stat_open_and_se
                 "dir",
                 MemoryHostFileSystem::fs_path("dir-link").unwrap(),
                 10,
+                &payer,
             )
             .await
             .unwrap();
@@ -2479,8 +2737,15 @@ fn host_share_and_embedded_symlinks_honor_symlink_follow_across_stat_open_and_se
 
     // Seed /emb with target file, subdir, and symlinks to each.
     let ns = store.filesystem().clone();
-    block_on(create_directory_at(&ns, held(&root()), "emb", 10)).unwrap();
-    block_on(create_directory_at(&ns, held(&root()), "emb/dir", 10)).unwrap();
+    block_on(create_directory_at(&ns, held(&root()), "emb", 10, &payer)).unwrap();
+    block_on(create_directory_at(
+        &ns,
+        held(&root()),
+        "emb/dir",
+        10,
+        &payer,
+    ))
+    .unwrap();
     create_file(&ns, "emb/target", b"emb!");
     block_on(symlink_at(
         &ns,
@@ -2488,6 +2753,7 @@ fn host_share_and_embedded_symlinks_honor_symlink_follow_across_stat_open_and_se
         "target",
         "file-link",
         10,
+        &payer,
     ))
     .unwrap();
     block_on(symlink_at(
@@ -2496,6 +2762,7 @@ fn host_share_and_embedded_symlinks_honor_symlink_follow_across_stat_open_and_se
         "dir",
         "dir-link",
         10,
+        &payer,
     ))
     .unwrap();
 
@@ -2556,6 +2823,7 @@ fn host_share_and_embedded_symlinks_honor_symlink_follow_across_stat_open_and_se
             fs_types::OpenFlags::empty(),
             FsDescriptorFlags::READ,
             1,
+            &payer,
         ))
         .err()
         .expect("open-at without symlink-follow must refuse symlink");
@@ -2569,6 +2837,7 @@ fn host_share_and_embedded_symlinks_honor_symlink_follow_across_stat_open_and_se
             fs_types::OpenFlags::CREATE | fs_types::OpenFlags::EXCLUSIVE,
             FsDescriptorFlags::READ,
             1,
+            &payer,
         ))
         .err()
         .expect("create|exclusive on existing symlink must return Exist");
@@ -2583,6 +2852,7 @@ fn host_share_and_embedded_symlinks_honor_symlink_follow_across_stat_open_and_se
             fs_types::OpenFlags::empty(),
             FsDescriptorFlags::READ,
             1,
+            &payer,
         ))
         .expect("open-at with symlink-follow opens target file");
         assert_eq!(opened_file.kind, FsNodeKind::File);
@@ -2601,6 +2871,7 @@ fn host_share_and_embedded_symlinks_honor_symlink_follow_across_stat_open_and_se
             fs_types::OpenFlags::DIRECTORY,
             FsDescriptorFlags::READ,
             1,
+            &payer,
         ))
         .expect("open-at with symlink-follow opens target dir");
         assert_eq!(opened_dir.kind, FsNodeKind::Directory);
@@ -2837,6 +3108,7 @@ fn wasi_ignores_unix_metadata_and_inherits_from_parent_across_writable_mounts() 
             .unwrap();
 
         let client = async {
+            let payer = crate::StoragePayer::for_test();
             // Even with mode 0000, uid 999 and an ACL, WASI opens and writes
             // the file on a read-write mount.
             let secret = open_at(
@@ -2847,6 +3119,7 @@ fn wasi_ignores_unix_metadata_and_inherits_from_parent_across_writable_mounts() 
                 fs_types::OpenFlags::empty(),
                 FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
                 20,
+                &payer,
             )
             .await
             .expect("WASI ignores stored Unix mode and ACLs");
@@ -2856,6 +3129,7 @@ fn wasi_ignores_unix_metadata_and_inherits_from_parent_across_writable_mounts() 
                 WritePosition::At(0),
                 b"granted-by-mount",
                 21,
+                &payer,
             )
             .await
             .expect("WASI writes through mount rights");
@@ -2881,6 +3155,7 @@ fn wasi_ignores_unix_metadata_and_inherits_from_parent_across_writable_mounts() 
                         fs_types::OpenFlags::CREATE | fs_types::OpenFlags::EXCLUSIVE,
                         FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
                         30,
+                        &payer,
                     )
                     .await
                     .unwrap_or_else(|err| panic!("WASI create file in {base}: {err:?}"));
@@ -2889,6 +3164,7 @@ fn wasi_ignores_unix_metadata_and_inherits_from_parent_across_writable_mounts() 
                         held(&root()),
                         &alloc::format!("{base}/dir"),
                         30,
+                        &payer,
                     )
                     .await
                     .unwrap_or_else(|err| panic!("WASI create dir in {base}: {err:?}"));
@@ -2898,6 +3174,7 @@ fn wasi_ignores_unix_metadata_and_inherits_from_parent_across_writable_mounts() 
                         "file",
                         &alloc::format!("{base}/link"),
                         30,
+                        &payer,
                     )
                     .await
                     .unwrap_or_else(|err| panic!("WASI symlink in {base}: {err:?}"));
@@ -2964,4 +3241,20 @@ fn wasi_ignores_unix_metadata_and_inherits_from_parent_across_writable_mounts() 
             );
         }
     }
+}
+
+/// The two exhaustion errors of the filesystem contract reach the WASI
+/// error codes a guest tells apart: the storage budget and the pool.
+#[test]
+fn storage_exhaustion_maps_to_the_wasi_insufficient_codes() {
+    use helios_hal::fs::FsError;
+
+    assert!(matches!(
+        super::fs_error_code(FsError::NoSpace),
+        fs_types::ErrorCode::InsufficientSpace
+    ));
+    assert!(matches!(
+        super::fs_error_code(FsError::OutOfMemory),
+        fs_types::ErrorCode::InsufficientMemory
+    ));
 }

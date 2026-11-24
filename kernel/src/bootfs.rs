@@ -385,6 +385,7 @@ impl DirStream for BootDir {
 }
 
 impl FileSystem for BootFs {
+    type Payer = crate::StoragePayer;
     crate::vfs::delegate_path_handles!();
     type Write = Infallible;
     type Dir = BootDir;
@@ -398,6 +399,7 @@ impl FileSystem for BootFs {
         path: FsPath<'_>,
         flags: OpenFlags,
         _now: u64,
+        _payer: &crate::StoragePayer,
     ) -> FsResult<helios_hal::fs::Opened<OwnedFsPath>> {
         let metadata = match self.index.metadata(path) {
             Ok(metadata) => metadata,
@@ -437,11 +439,18 @@ impl FileSystem for BootFs {
         _: WritePosition,
         _: usize,
         _: u64,
+        _: &crate::StoragePayer,
     ) -> FsResult<Infallible> {
         Err(FsError::ReadOnly)
     }
 
-    async fn set_size(&self, _: FsPath<'_>, _: u64, _: u64) -> FsResult<()> {
+    async fn set_size(
+        &self,
+        _: FsPath<'_>,
+        _: u64,
+        _: u64,
+        _: &crate::StoragePayer,
+    ) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
@@ -451,6 +460,7 @@ impl FileSystem for BootFs {
         _: Option<u64>,
         _: Option<u64>,
         _: u64,
+        _: &crate::StoragePayer,
     ) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
@@ -467,27 +477,56 @@ impl FileSystem for BootFs {
         })
     }
 
-    async fn create_directory(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn create_directory(
+        &self,
+        _: FsPath<'_>,
+        _: u64,
+        _: &crate::StoragePayer,
+    ) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn remove_directory(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn remove_directory(
+        &self,
+        _: FsPath<'_>,
+        _: u64,
+        _: &crate::StoragePayer,
+    ) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn unlink(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn unlink(&self, _: FsPath<'_>, _: u64, _: &crate::StoragePayer) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn rename(&self, _: FsPath<'_>, _: FsPath<'_>, _: RenameMode, _: u64) -> FsResult<()> {
+    async fn rename(
+        &self,
+        _: FsPath<'_>,
+        _: FsPath<'_>,
+        _: RenameMode,
+        _: u64,
+        _: &crate::StoragePayer,
+    ) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn link(&self, _: FsPath<'_>, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn link(
+        &self,
+        _: FsPath<'_>,
+        _: FsPath<'_>,
+        _: u64,
+        _: &crate::StoragePayer,
+    ) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn symlink(&self, _: &str, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn symlink(
+        &self,
+        _: &str,
+        _: FsPath<'_>,
+        _: u64,
+        _: &crate::StoragePayer,
+    ) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
@@ -649,6 +688,7 @@ mod tests {
         assert_eq!(read.as_ref(), b"nti");
         let past_end = block_on(fs.read_at(path("lib/runtime.component"), 99, 3)).expect("reads");
         assert!(past_end.is_empty());
+        let payer = crate::StoragePayer::for_test();
         assert_eq!(
             block_on(helios_hal::fs::write_with(
                 &fs,
@@ -656,16 +696,17 @@ mod tests {
                 WritePosition::At(0),
                 1,
                 0,
+                &payer,
                 |_, _| panic!("a refused write needs no bytes"),
             )),
             Err(FsError::ReadOnly)
         );
         assert_eq!(
-            block_on(fs.open(path("etc/new"), OpenFlags::CREATE, 0)).map(drop),
+            block_on(fs.open(path("etc/new"), OpenFlags::CREATE, 0, &payer)).map(drop),
             Err(FsError::ReadOnly)
         );
         assert_eq!(
-            block_on(fs.unlink(path("etc/config.txt"), 7_000_000_000)),
+            block_on(fs.unlink(path("etc/config.txt"), 7_000_000_000, &payer)),
             Err(FsError::ReadOnly)
         );
     }

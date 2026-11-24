@@ -73,7 +73,7 @@ fn wit_error(error: &BtrfsManagementError) -> wit::BtrfsError {
                 | FsError::Overflow
                 | FsError::Loop
                 | FsError::Unsupported => Kind::InvalidArgument,
-                FsError::Io => Kind::Io,
+                FsError::Io | FsError::OutOfMemory => Kind::Io,
             },
             VolumeManagementError::NotSubvolume => Kind::NotSubvolume,
             VolumeManagementError::ReadOnlySubvolume => Kind::ReadOnlySubvolume,

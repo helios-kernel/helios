@@ -61,6 +61,7 @@ fn convert_instance(instance: InstanceSnapshot) -> instances_wit::Instance {
         started_at: instance.started_at,
         uptime: instance.uptime,
         memory_bytes: instance.memory_bytes,
+        storage_bytes: instance.storage_bytes,
         cpu_busy: instance.cpu_busy,
     }
 }

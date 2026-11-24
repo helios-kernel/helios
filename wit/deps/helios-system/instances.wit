@@ -16,6 +16,7 @@ interface instances {
     started-at: mono-nanos,
     uptime: mono-nanos,
     memory-bytes: u64,
+    storage-bytes: u64,
     cpu-busy: permille,
   }
 
