@@ -22,7 +22,7 @@ def test_profile_serves_network_endpoints_and_validates_all_workloads(tmp_path, 
             return command[command.index(name) + 1]
 
         assert cwd == REPO_ROOT
-        assert Path(command[0]) == REPO_ROOT / "target/release/helios-inspector"
+        assert Path(command[0]) == REPO_ROOT / "target/release/helios"
         assert option("--memory") == lane.memory
         assert int(option("--smp")) == lane.vcpus
         assert option("--rpc-transport") == lane.rpc_transport

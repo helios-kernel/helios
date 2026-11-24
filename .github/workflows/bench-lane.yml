@@ -211,7 +211,7 @@ jobs:
           sudo modprobe vhost_net
           sudo chmod 0666 /dev/vhost-net
           ls -l /dev/vhost-net
-          ./target/release/helios-inspector vm net-setup \
+          ./target/release/helios vm net-setup \
             --net-backend tap \
             --net-ifname "${HELIOS_NET_IFNAME}" \
             --net-bridge "${HELIOS_NET_BRIDGE}" \
@@ -310,7 +310,7 @@ jobs:
         if: always() && matrix.net-backend == 'tap'
         working-directory: helios
         run: |
-          ./target/release/helios-inspector vm net-teardown \
+          ./target/release/helios vm net-teardown \
             --net-backend tap \
             --net-ifname "${HELIOS_NET_IFNAME}" \
             --net-bridge "${HELIOS_NET_BRIDGE}"

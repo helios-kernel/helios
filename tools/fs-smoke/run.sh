@@ -14,7 +14,7 @@ mkfs.erofs -zlz4 "$runtime/image.erofs" "$runtime/tree"
 # mkfs.btrfs' default single-device geometry requires at least 114294784 bytes.
 truncate -s 128M "$runtime/image.btrfs"
 mkfs.btrfs -q -f --rootdir "$runtime/tree" "$runtime/image.btrfs"
-./target/release/helios-inspector vm --arch "$arch" --release --memory 2G \
+./target/release/helios vm --arch "$arch" --release --memory 2G \
   --accel "$accel" \
   --runtime-dir "$runtime" --keep-runtime-dir \
   --bootfs-root "$runtime/bootfs" \

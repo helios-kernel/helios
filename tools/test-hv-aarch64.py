@@ -15,7 +15,7 @@ from qemu_test import quit_vm
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--inspector", default="target/debug/helios-inspector")
+    parser.add_argument("--inspector", default="target/debug/helios")
     parser.add_argument("--runtime-dir", type=Path, default=Path("target/hv-aarch64-test"))
     parser.add_argument("--deadline-seconds", type=float, default=180)
     parser.add_argument("--no-build", action="store_true")

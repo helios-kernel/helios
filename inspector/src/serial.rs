@@ -1,5 +1,4 @@
 use async_io::Async;
-use futures_io::{AsyncRead, AsyncWrite};
 use std::ffi::CStr;
 use std::fs::File;
 use std::io;
@@ -128,22 +127,14 @@ pub(crate) enum SerialError {
 
 /// The read half of a transport the inspector RPC can run over.
 ///
-/// The transport is deliberately erased: the RPC framing is identical
-/// whether it runs over a serial line, a QEMU stdio pipe, or a vsock
-/// connection, so nothing above this alias is written twice per
-/// transport.
-pub(crate) trait RpcRead: AsyncRead + Unpin + Send {}
-pub(crate) trait RpcWrite: AsyncWrite + Unpin + Send {}
+/// Reuses `helios-ops`'s transport trait aliases so a booted VM's [`RpcClient`]
+/// hands directly into [`helios_ops::Session`] with zero adapter overhead.
+pub(crate) use helios_ops::transport::{RpcReader, RpcWriter};
 
-impl<T> RpcRead for T where T: AsyncRead + Unpin + Send {}
-impl<T> RpcWrite for T where T: AsyncWrite + Unpin + Send {}
-
-pub(crate) type RpcReader = Box<dyn RpcRead>;
-pub(crate) type RpcWriter = Box<dyn RpcWrite>;
 #[derive(Clone)]
 pub(crate) struct RpcClient {
     client: helios_inspector_protocol::transport::Client<RpcReader, RpcWriter>,
-    _driver: std::sync::Arc<crate::frame_reader::FrameReader>,
+    driver: std::sync::Arc<crate::frame_reader::FrameReader>,
 }
 
 impl RpcClient {
@@ -152,8 +143,17 @@ impl RpcClient {
         let driver = crate::frame_reader::FrameReader::start(&client)?;
         Ok(Self {
             client,
-            _driver: std::sync::Arc::new(driver),
+            driver: std::sync::Arc::new(driver),
         })
+    }
+
+    /// Wrap this already-connected client into a [`helios_ops::RpcConnection`]
+    /// sharing the same frame reader guard.
+    pub(crate) fn to_ops_connection(&self) -> helios_ops::RpcConnection {
+        helios_ops::RpcConnection::from_external(
+            self.client.clone(),
+            std::sync::Arc::clone(&self.driver) as std::sync::Arc<dyn Send + Sync>,
+        )
     }
 }
 

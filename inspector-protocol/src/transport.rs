@@ -16,6 +16,8 @@ use futures_io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite}
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::error::{TransportError, WireError};
+#[cfg(feature = "host")]
+use crate::wire::read_frame_with_echo;
 use crate::wire::{Frame, read_frame, write_frame};
 
 /// Transport-level result with structured error provenance.
@@ -194,6 +196,8 @@ struct ClientInner<R, W> {
     outgoing: Sender<PendingFrame>,
     control: Sender<Frame>,
     closed: AtomicBool,
+    #[cfg(feature = "host")]
+    echo_remote_serial: AtomicBool,
     driver_progress: Progress,
     next_invocation: AtomicU32,
     active: Mutex<HashMap<u32, Weak<Invocation<R, W>>>>,
@@ -333,12 +337,23 @@ where
                 outgoing,
                 control,
                 closed: AtomicBool::new(false),
+                #[cfg(feature = "host")]
+                echo_remote_serial: AtomicBool::new(true),
                 driver_progress: Progress::new(),
                 next_invocation: AtomicU32::new(1),
                 active: Mutex::new(HashMap::new()),
             }),
             lifetime,
         }
+    }
+
+    /// Controls whether interleaved non-RPC guest serial console lines are
+    /// echoed to host stderr, returning the previous setting.
+    #[cfg(feature = "host")]
+    pub fn set_remote_serial_echo(&self, enabled: bool) -> bool {
+        self.inner
+            .echo_remote_serial
+            .swap(enabled, Ordering::AcqRel)
     }
 
     pub async fn route_frames(self) -> Result<()> {
@@ -360,9 +375,12 @@ where
         } = transport;
         let receive = async {
             loop {
-                let Some(frame) = read_frame(&mut read)
-                    .await
-                    .map_err(|source| TransportError::io("read client frame", source))?
+                #[cfg(feature = "host")]
+                let next_frame = read_frame_with_echo(&mut read, &inner.echo_remote_serial).await;
+                #[cfg(not(feature = "host"))]
+                let next_frame = read_frame(&mut read).await;
+                let Some(frame) =
+                    next_frame.map_err(|source| TransportError::io("read client frame", source))?
                 else {
                     return Ok(());
                 };

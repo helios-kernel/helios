@@ -39,7 +39,7 @@ boot() {
   shift
   mkdir -p "$runtime/$name"
   set +e
-  ./target/release/helios-inspector vm --arch "$arch" --release --memory 2G \
+  ./target/release/helios vm --arch "$arch" --release --memory 2G \
     --accel "$accel" \
     --runtime-dir "$runtime/$name" --keep-runtime-dir \
     --bootfs-root "$runtime/bootfs" \

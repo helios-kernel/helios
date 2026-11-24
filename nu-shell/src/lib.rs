@@ -16,7 +16,8 @@ pub mod pipeline;
 pub mod test_env;
 
 pub use command::{
-    AsyncCommand, AsyncCommandContext, AsyncCommandRegistry, EvalRuntime, RuntimeScope,
+    AsyncCommand, AsyncCommandContext, AsyncCommandRegistry, CustomCommandSpec, EvalRuntime,
+    RuntimeScope,
 };
 pub use commands::AsyncBuiltin;
 pub use completion::{CompletionItem, CompletionKind, complete_async};
@@ -110,7 +111,20 @@ pub struct ShellSession<E: HeliosEnv> {
 impl<E: HeliosEnv> ShellSession<E> {
     /// Construct a new session backed by `env`, initializing `$env.PWD` from `env.cwd()`.
     pub async fn new(env: E) -> Self {
-        let (engine_state, registry) = create_helios_context();
+        let (mut engine_state, mut registry) = create_helios_context();
+        let custom_specs = env.custom_command_specs();
+        if !custom_specs.is_empty() {
+            let delta = {
+                let mut working_set = StateWorkingSet::new(&engine_state);
+                for spec in custom_specs {
+                    registry.register_custom(&mut working_set, spec);
+                }
+                working_set.render()
+            };
+            if let Err(err) = engine_state.merge_delta(delta) {
+                tracing::error!("failed to merge custom async command delta: {err}");
+            }
+        }
         let mut stack = Stack::new();
         let cwd = env.cwd().await.unwrap_or_else(|_| String::from("/"));
         stack.add_env_var(
@@ -133,13 +147,15 @@ impl<E: HeliosEnv> ShellSession<E> {
         }
     }
 
-    /// Evaluate Nushell source text and return the raw [`AsyncPipelineData`].
-    pub async fn eval_pipeline(
+    /// Evaluate Nushell source text with an optional script filename and return
+    /// the raw [`AsyncPipelineData`].
+    pub async fn eval_source(
         &mut self,
         source: &str,
+        file_name: Option<&str>,
         input: AsyncPipelineData,
     ) -> Result<AsyncPipelineData, NuError> {
-        self.eval_pipeline_with_file(source, None, input).await
+        self.eval_pipeline_with_file(source, file_name, input).await
     }
 
     /// Evaluate Nushell source text with an optional file name for diagnostics
@@ -164,6 +180,15 @@ impl<E: HeliosEnv> ShellSession<E> {
             input,
         )
         .await
+    }
+
+    /// Evaluate Nushell source text and return the raw [`AsyncPipelineData`].
+    pub async fn eval_pipeline(
+        &mut self,
+        source: &str,
+        input: AsyncPipelineData,
+    ) -> Result<AsyncPipelineData, NuError> {
+        self.eval_source(source, None, input).await
     }
 
     /// Evaluate Nushell source text and collect its output into a [`Value`].
@@ -197,9 +222,17 @@ impl<E: HeliosEnv> ShellSession<E> {
         &self.env
     }
 
+    pub fn env_mut(&mut self) -> &mut E {
+        &mut self.env
+    }
+
     #[must_use]
     pub const fn engine_state(&self) -> &EngineState {
         &self.engine_state
+    }
+
+    pub fn engine_state_mut(&mut self) -> &mut EngineState {
+        &mut self.engine_state
     }
 
     #[must_use]
@@ -209,6 +242,11 @@ impl<E: HeliosEnv> ShellSession<E> {
 
     pub fn stack_mut(&mut self) -> &mut Stack {
         &mut self.stack
+    }
+
+    #[must_use]
+    pub const fn registry(&self) -> &AsyncCommandRegistry {
+        &self.registry
     }
 
     #[must_use]

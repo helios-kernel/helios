@@ -423,7 +423,7 @@ jobs:
         run: |
           queues="$(nproc)"
           if [ "$TCP_PROBE" = true ]; then queues=1; fi
-          ./target/release/helios-inspector vm net-setup \
+          ./target/release/helios vm net-setup \
             --net-backend tap --net-queues "$queues" \
             --net-ifname "${HELIOS_NET_IFNAME}" \
             --net-bridge "${HELIOS_NET_BRIDGE}" \
@@ -526,13 +526,13 @@ jobs:
             bench-runtime/**/*.log
             bench-runtime/**/*.pcap
             kernel-symbols/**/*.symbols.json
-            helios/target/**/helios.pgo-uncovered.txt
+            helios/target/**/helios-kernel.pgo-uncovered.txt
           if-no-files-found: warn
       - name: Remove the tap network backend
         if: always() && matrix.net-backend == 'tap'
         working-directory: helios
         run: |
-          ./target/release/helios-inspector vm net-teardown \
+          ./target/release/helios vm net-teardown \
             --net-backend tap \
             --net-ifname "${HELIOS_NET_IFNAME}" \
             --net-bridge "${HELIOS_NET_BRIDGE}"
@@ -661,7 +661,7 @@ jobs:
         if: steps.lane.outputs.net-backend == 'tap'
         working-directory: helios
         run: |
-          ./target/release/helios-inspector vm net-setup \
+          ./target/release/helios vm net-setup \
             --net-backend tap \
             --net-ifname "${HELIOS_NET_IFNAME}" \
             --net-bridge "${HELIOS_NET_BRIDGE}" \
@@ -706,13 +706,13 @@ jobs:
           # beside their images under helios/target/ (#329); a green run's
           # step-log `full list:` path has to resolve too.
           name: bench-pgo-uncovered
-          path: helios/target/**/helios.pgo-uncovered.txt
+          path: helios/target/**/helios-kernel.pgo-uncovered.txt
           if-no-files-found: warn
       - name: Remove the tap network backend
         if: always() && steps.lane.outputs.net-backend == 'tap'
         working-directory: helios
         run: |
-          ./target/release/helios-inspector vm net-teardown \
+          ./target/release/helios vm net-teardown \
             --net-backend tap \
             --net-ifname "${HELIOS_NET_IFNAME}" \
             --net-bridge "${HELIOS_NET_BRIDGE}"

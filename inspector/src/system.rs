@@ -103,7 +103,7 @@ impl TracingConfig {
 }
 
 pub async fn fetch_inspect(
-    client: &RpcClient,
+    client: &helios_ops::transport::ProtocolClient,
     prefixes: &[&str],
     limit: u32,
 ) -> Result<inspect::SnapshotResult, SystemError> {
@@ -123,13 +123,13 @@ pub async fn fetch_inspect(
 }
 
 pub async fn fetch_kernel_snapshot(
-    client: &RpcClient,
+    client: &helios_ops::transport::ProtocolClient,
 ) -> Result<inspect::KernelSnapshot, SystemError> {
     fetch_kernel_snapshot_prefixes(client, &["/kernel/"], 0).await
 }
 
 pub async fn fetch_kernel_snapshot_prefixes(
-    client: &RpcClient,
+    client: &helios_ops::transport::ProtocolClient,
     prefixes: &[&str],
     limit: u32,
 ) -> Result<inspect::KernelSnapshot, SystemError> {
@@ -137,7 +137,9 @@ pub async fn fetch_kernel_snapshot_prefixes(
     Ok(inspect::KernelSnapshot::from_snapshot(&raw))
 }
 
-pub async fn fetch_instances(client: &RpcClient) -> Result<Vec<instances::Instance>, SystemError> {
+pub async fn fetch_instances(
+    client: &helios_ops::transport::ProtocolClient,
+) -> Result<Vec<instances::Instance>, SystemError> {
     remote::call(instances::snapshot(client), "remote instances snapshot")
         .await
         .map_err(|source| SystemError::Fetch {
@@ -261,19 +263,6 @@ pub async fn run_tracing(
         command.target_prefix.clone(),
     )?;
     stream_tracing(&mut client, &config).await
-}
-
-pub async fn stream_tracing_command(
-    client: &mut RpcClient,
-    command: &TracingCommand,
-) -> Result<(), SystemError> {
-    enable_tracing_targets(client, &command.enable_target).await?;
-    let config = tracing_config(
-        command.limit,
-        command.min_level.as_deref(),
-        command.target_prefix.clone(),
-    )?;
-    stream_tracing(client, &config).await
 }
 
 /// Turns each kernel diagnostic target in `targets` on for the rest of
