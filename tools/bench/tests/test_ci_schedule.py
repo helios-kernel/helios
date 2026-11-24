@@ -512,19 +512,34 @@ def test_prebuilt_ci_artifacts_and_linux_syscalls_deduplication(ci_jobs):
     assert cfi_uploads["helios-kernel-aarch64-debug-cfi"] == 14
     assert cfi_uploads["helios-image-aarch64-debug-cfi"] == 14
 
-    # `linux-syscalls-image-*` builds once per arch using `wasm-debug` (`--guest-programs-profile debug`)
-    # and shards boot the prebuilt image directly with zero local Rust/Limine compilation.
+    # `linux-syscalls-image-*` builds once per arch in the prebuilt `helios-ci`
+    # container with `rust-cache` and a cached release inspector, starting beside
+    # `wasm-debug` and waiting in `prebuilt-wasm` right before building the guest
+    # image (`--guest-programs-profile debug`). Shards boot the prebuilt image
+    # directly with zero local Rust/Limine compilation.
     for image_job_name, shard_job_name in (
         ("linux-syscalls-image-x86-64", "linux-syscalls-x86-64"),
         ("linux-syscalls-image-aarch64", "linux-syscalls-aarch64"),
     ):
         image_job = ci_jobs[image_job_name]
-        assert "wasm-debug" in image_job["needs"]
+        assert "container" in image_job
+        assert "wasm-debug" not in image_job["needs"]
         assert "wasm-release" not in image_job["needs"]
-        build_step = next(
-            step for step in image_job["steps"] if step.get("name") == "Build the Linux guest image"
+        image_steps = image_job["steps"]
+        assert any(step.get("uses", "").startswith("Swatinem/rust-cache") for step in image_steps)
+        assert not any(
+            step.get("uses") == "./helios/.github/actions/install-apt-packages" for step in image_steps
         )
-        assert "--guest-programs-profile debug" in build_step["run"]
+        wait_idx = next(
+            i
+            for i, step in enumerate(image_steps)
+            if step.get("uses") == "./helios/.github/actions/prebuilt-wasm"
+        )
+        build_idx = next(
+            i for i, step in enumerate(image_steps) if step.get("name") == "Build the Linux guest image"
+        )
+        assert wait_idx < build_idx
+        assert "--guest-programs-profile debug" in image_steps[build_idx]["run"]
 
         shard_job = ci_jobs[shard_job_name]
         assert image_job_name in shard_job["needs"]
@@ -537,6 +552,13 @@ def test_prebuilt_ci_artifacts_and_linux_syscalls_deduplication(ci_jobs):
             step for step in shard_job["steps"] if step.get("name") == "Run the shard on Helios"
         )
         assert "--prebuilt image --prebuilt-dir" in helios_step["run"]
+
+    report_downloads = [
+        step["with"].get("name")
+        for step in ci_jobs["linux-syscalls-report"]["steps"]
+        if step.get("uses") == "actions/download-artifact@v4" and "name" in step.get("with", {})
+    ]
+    assert report_downloads == ["gvisor-syscalls-cases-x86_64", "gvisor-syscalls-cases-aarch64"]
 
 
 def test_workflows_target_single_main_branch():
@@ -579,9 +601,9 @@ def test_prebuilt_wasm_action_downloads_via_rest_and_retries_transient_lag(tmp_p
         "args = sys.argv[1:]\n"
         "if args[:2] == ['api', '--paginate']:\n"
         "    endpoint = args[2]\n"
-        "    if endpoint.endswith('/artifacts'):\n"
+        "    if '/artifacts' in endpoint:\n"
         "        print('14894939174')\n"
-        "    elif endpoint.endswith('/jobs'):\n"
+        "    elif '/jobs' in endpoint:\n"
         "        print('completed success')\n"
         "    sys.exit(0)\n"
         "if args[:2] == ['run', 'download']:\n"
@@ -621,7 +643,7 @@ def test_prebuilt_wasm_action_downloads_via_rest_and_retries_transient_lag(tmp_p
         "#!/usr/bin/env python3\n"
         "import sys\n"
         "args = sys.argv[1:]\n"
-        "if args[:2] == ['api', '--paginate'] and args[2].endswith('/jobs'):\n"
+        "if args[:2] == ['api', '--paginate'] and '/jobs' in args[2]:\n"
         "    print('completed failure')\n"
         "sys.exit(0)\n"
     )
@@ -650,3 +672,40 @@ def test_btrfs_fuzz_installs_toolchain_before_running_fuzz():
     assert install_idx is not None, "test-btrfs-fuzz must install the pinned Rust toolchain"
     assert fuzz_idx is not None
     assert install_idx < fuzz_idx
+
+
+def test_ci_speedup_caches_cli_qemu_inspector_and_prunes_main_caches(ci_jobs):
+    for builder in ("build-helios-cli-x64", "build-helios-cli-arm64"):
+        steps = ci_jobs[builder]["steps"]
+        rust_cache = next(
+            (step for step in steps if step.get("uses", "").startswith("Swatinem/rust-cache")),
+            None,
+        )
+        assert rust_cache is not None, builder
+        assert "steps.cache.outputs.cache-hit != 'true'" in rust_cache["if"]
+
+    for image_job_name in ("linux-syscalls-image-x86-64", "linux-syscalls-image-aarch64"):
+        steps = ci_jobs[image_job_name]["steps"]
+        assert any(step.get("id") == "inspector-cache" for step in steps), image_job_name
+
+    build_arm_steps = ci_jobs["linux-syscalls-build-aarch64"]["steps"]
+    assert any(step.get("id") == "qemu-ghcr" for step in build_arm_steps)
+    assert any(
+        step.get("uses") == "actions/upload-artifact@v4"
+        and step["with"]["name"] == "gvisor-syscalls-cases-${{ matrix.arch }}"
+        for step in build_arm_steps
+    )
+
+    shard_arm_steps = ci_jobs["linux-syscalls-aarch64"]["steps"]
+    assert any(step.get("id") == "qemu-ghcr" for step in shard_arm_steps)
+    runtime_apt = next(
+        step for step in shard_arm_steps if step.get("name") == "Install host dependencies (aarch64)"
+    )
+    assert "ninja-build" not in runtime_apt["with"]["packages"]
+    assert "flex" not in runtime_apt["with"]["packages"]
+
+    gate_steps = ci_jobs["gate"]["steps"]
+    assert gate_steps[0]["name"] == "Require every selected lane to succeed"
+    assert gate_steps[1]["name"] == "Prune superseded main caches"
+    assert "refs/heads/main" in gate_steps[1]["if"]
+    assert ci_jobs["gate"]["permissions"]["actions"] == "write"

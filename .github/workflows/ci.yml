@@ -420,6 +420,14 @@ jobs:
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@stable
       - if: steps.cache.outputs.cache-hit != 'true'
+        uses: Swatinem/rust-cache@v2
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        with:
+          workspaces: helios
+          key: helios-cli-stable-${{ runner.arch }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - if: steps.cache.outputs.cache-hit != 'true'
         uses: water-rs/stow@main
       - if: steps.cache.outputs.cache-hit != 'true'
         name: Build helios-cli (debug)
@@ -1165,6 +1173,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      packages: read
     env:
       HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
       # The `cwasm` cache of `smoke-riscv64`, for this lane's prebuilds.
@@ -1191,21 +1200,33 @@ jobs:
           path: ${{ env.HELIOS_ARTIFACT_CACHE }}
           key: helios-cwasm-smoke-aarch64-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
           restore-keys: helios-cwasm-smoke-aarch64-${{ runner.os }}-${{ runner.arch }}-
-      - name: Install host dependencies
-        uses: ./helios/.github/actions/install-apt-packages
-        with:
-          packages: >-
-            libudev-dev just cmake ninja-build erofs-utils btrfs-progs
-            python3-venv pkg-config flex bison
-            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
-            swtpm
-      - name: Record swtpm and KVM availability
+      - name: Log in to the container registry
+        env:
+          TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+      - name: Take the pinned QEMU from GHCR
+        id: qemu-ghcr
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/helios-qemu:aarch64-${{ env.QEMU_VERSION }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
         run: |
-          swtpm --version
-          # Recorded rather than required: the accelerator is picked by
-          # capability and today's Arm runners publish no KVM node.
-          ls -la /dev/kvm || echo 'no /dev/kvm on this runner'
+          set -euo pipefail
+          if output="$(docker pull "$IMAGE" 2>&1)"; then
+            container="$(docker create "$IMAGE" none)"
+            mkdir -p "$QEMU_PREFIX"
+            docker cp "$container:/." "$QEMU_PREFIX"
+            docker rm "$container" > /dev/null
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          elif grep -qiE 'manifest unknown|not found|denied' <<< "$output"; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "no prebuilt QEMU at $IMAGE"
+          else
+            echo "$output" >&2
+            exit 1
+          fi
       - name: Restore the pinned QEMU install prefix
+        if: steps.qemu-ghcr.outputs.found != 'true'
         id: qemu-cache
         uses: ./helios/.github/actions/shared-cache
         with:
@@ -1213,8 +1234,27 @@ jobs:
           # The configure flags are part of the key: a build made with
           # other flags is a different install (#687).
           key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
+      - name: Install host dependencies
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs
+            libpixman-1-0 libslirp0 libfdt1 swtpm
+      - name: Install QEMU build dependencies
+        if: steps.qemu-ghcr.outputs.found != 'true' && steps.qemu-cache.outputs.cache-hit != 'true'
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            python3-venv pkg-config flex bison
+            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
+      - name: Record swtpm and KVM availability
+        run: |
+          swtpm --version
+          # Recorded rather than required: the accelerator is picked by
+          # capability and today's Arm runners publish no KVM node.
+          ls -la /dev/kvm || echo 'no /dev/kvm on this runner'
       - name: Build the pinned QEMU
-        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        if: steps.qemu-ghcr.outputs.found != 'true' && steps.qemu-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           tarball="qemu-${QEMU_VERSION}.tar.xz"
@@ -3778,8 +3818,11 @@ jobs:
     permissions:
       contents: read
       packages: write
-    env:
+    env: &linux-syscalls-build-env
       SUITE: ${{ github.workspace }}/gvisor-syscalls
+      QEMU_VERSION: "11.1.1"
+      QEMU_SHA256: 079ffbff8a7111bbc89022107cbabf3bbfd614d5fc9d7cc675991196aca12482
+      QEMU_PREFIX: ${{ github.workspace }}/qemu-install
     steps: &linux-syscalls-build-steps
       - uses: actions/checkout@v4
         with:
@@ -3868,6 +3911,69 @@ jobs:
           path: ${{ env.SUITE }}
           if-no-files-found: error
           retention-days: 14
+      # `linux-syscalls-report` reads only `cases.txt`; publishing it as its
+      # own tiny artifact saves downloading ~1 GiB of static test binaries.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gvisor-syscalls-cases-${{ matrix.arch }}
+          path: ${{ env.SUITE }}/cases.txt
+          if-no-files-found: error
+          retention-days: 14
+      # Ensure the pinned aarch64 QEMU is present in GHCR (immune to the
+      # 10 GiB Actions cache cap) or built once and cached before the
+      # aarch64 shards fan out, so shards never rebuild QEMU in parallel.
+      - name: Check prebuilt QEMU in GHCR
+        if: matrix.arch == 'aarch64'
+        id: qemu-ghcr
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/helios-qemu:aarch64-${{ env.QEMU_VERSION }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
+        run: |
+          set -euo pipefail
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "found prebuilt QEMU at $IMAGE"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "no prebuilt QEMU at $IMAGE"
+          fi
+      - name: Restore the pinned QEMU install prefix
+        if: matrix.arch == 'aarch64' && steps.qemu-ghcr.outputs.found == 'false'
+        id: qemu-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.QEMU_PREFIX }}
+          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
+      - name: Install QEMU build dependencies
+        if: matrix.arch == 'aarch64' && steps.qemu-ghcr.outputs.found == 'false' && steps.qemu-cache.outputs.cache-hit != 'true'
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            ninja-build python3-venv pkg-config flex bison
+            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
+      - name: Build the pinned QEMU
+        if: matrix.arch == 'aarch64' && steps.qemu-ghcr.outputs.found == 'false' && steps.qemu-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="qemu-${QEMU_VERSION}.tar.xz"
+          curl -fsSLO "https://download.qemu.org/${tarball}"
+          echo "${QEMU_SHA256}  ${tarball}" | sha256sum -c -
+          tar xf "${tarball}"
+          cd "qemu-${QEMU_VERSION}"
+          mapfile -t flags < "${GITHUB_WORKSPACE}/helios/.github/qemu/aarch64-configure.args"
+          ./configure --prefix="${QEMU_PREFIX}" "${flags[@]}"
+          ninja -C build install
+      - name: Publish the pinned QEMU to GHCR
+        if: matrix.arch == 'aarch64' && steps.qemu-ghcr.outputs.found == 'false' && github.event_name != 'pull_request'
+        shell: bash
+        env:
+          IMAGE: ${{ steps.qemu-ghcr.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker build --file helios/.github/qemu/Dockerfile --tag "$IMAGE" "$QEMU_PREFIX"
+          docker push "$IMAGE"
 
   linux-syscalls-build-aarch64:
     name: linux-syscalls-build (${{ matrix.arch }})
@@ -3881,19 +3987,23 @@ jobs:
     permissions:
       contents: read
       packages: write
-    env:
-      SUITE: ${{ github.workspace }}/gvisor-syscalls
+    env: *linux-syscalls-build-env
     steps: *linux-syscalls-build-steps
 
   # Build the `linux`-featured release kernel, signed `helios-bootfs` (reusing
   # `wasm-debug` guest userspace), Limine UEFI disk image and release
-  # `helios-inspector` ONCE per architecture (#1218). Every `linux-syscalls-*`
-  # shard downloads and boots this prebuilt image directly with zero compilation.
+  # `helios-inspector` ONCE per architecture (#1218). Starts beside `wasm-debug`
+  # in the prebuilt multi-arch `helios-ci` container with `rust-cache` and a
+  # content-addressed `helios-inspector` binary cache, waiting in `prebuilt-wasm`
+  # right before `Build the Linux guest image`. Every `linux-syscalls-*` shard
+  # downloads and boots this prebuilt image directly with zero compilation.
   linux-syscalls-image-x86-64:
     name: linux-syscalls-image (${{ matrix.vm_arch }})
-    needs: [changes, build-helios-cli-x64, kernel-profile, wasm-debug]
-    if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.build-helios-cli-x64.result == 'success' && needs.wasm-debug.result == 'success' && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
+    needs: [changes, build-helios-cli-x64, kernel-profile]
+    if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.build-helios-cli-x64.result == 'success' && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
     runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
     timeout-minutes: 15
     permissions:
       contents: read
@@ -3919,6 +4029,7 @@ jobs:
         with:
           key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
       - name: Record the job start
+        shell: bash
         run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
       - name: Restore the precompiled cwasm cache
         uses: ./helios/.github/actions/shared-cache
@@ -3926,12 +4037,60 @@ jobs:
           path: ${{ env.HELIOS_ARTIFACT_CACHE }}
           key: helios-cwasm-linux-syscalls-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
           restore-keys: helios-cwasm-linux-syscalls-${{ runner.os }}-${{ runner.arch }}-
-      - name: Install host dependencies
-        uses: ./helios/.github/actions/install-apt-packages
-        with:
-          packages: libudev-dev just cmake ninja-build erofs-utils
-      - name: Stage Limine bootloader share
+      - name: Make the pinned toolchain the only one rust-cache sees
+        shell: bash
+        working-directory: helios
         run: |
+          rustup toolchain install
+          pinned="$(rustup show active-toolchain | cut -d' ' -f1)"
+          rustup default "$pinned"
+          rustup toolchain list --quiet | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
+          rustup toolchain list
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: helios
+          key: linux-syscalls-image-${{ matrix.vm_arch }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Compute helios-inspector input hash
+        id: inspector-meta
+        shell: bash
+        env:
+          ROOT: helios
+        run: |
+          set -euo pipefail
+          input_hash="$(
+            {
+              cd "${ROOT}"
+              git ls-files --cached --others --exclude-standard -z -- \
+                api \
+                api-macro \
+                artifact \
+                hal \
+                inspector \
+                inspector-protocol \
+                profdata \
+                workspace-root \
+                wit \
+                Cargo.toml \
+                Cargo.lock \
+                rust-toolchain.toml \
+                .cargo/config.toml \
+                | LC_ALL=C sort -z \
+                | xargs -0 sha256sum
+            } | sha256sum | awk '{print $1}'
+          )"
+          echo "input_hash=${input_hash}" >> "$GITHUB_OUTPUT"
+          echo "dir=${RUNNER_TEMP}/helios-inspector-release" >> "$GITHUB_OUTPUT"
+      - name: Restore cached release inspector
+        id: inspector-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.inspector-meta.outputs.dir }}
+          key: helios-inspector-v1-release-${{ runner.os }}-${{ runner.arch }}-${{ steps.inspector-meta.outputs.input_hash }}
+      - name: Stage Limine bootloader share
+        shell: bash
+        run: |
+          set -euo pipefail
           # The digest is the one of v12.9.6's `limine-binary.tar.gz`.
           curl --fail --silent --show-error --location \
             --output "$RUNNER_TEMP/limine-binary.tar.gz" \
@@ -3947,13 +4106,33 @@ jobs:
           profile: debug
           download-only: "true"
       - name: Build inspector
+        if: steps.inspector-cache.outputs.cache-hit != 'true'
+        shell: bash
         working-directory: helios
-        run: cargo build --release -p helios-inspector
+        env:
+          DIR: ${{ steps.inspector-meta.outputs.dir }}
+        run: |
+          set -euo pipefail
+          cargo build --release -p helios-inspector
+          mkdir -p "${DIR}"
+          cp "target/release/helios-inspector" "${DIR}/helios-inspector"
+      - name: Stage cached release inspector
+        if: steps.inspector-cache.outputs.cache-hit == 'true'
+        shell: bash
+        working-directory: helios
+        env:
+          DIR: ${{ steps.inspector-meta.outputs.dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/release
+          cp "${DIR}/helios-inspector" target/release/helios-inspector
+          chmod +x target/release/helios-inspector
       # An x86-64 release kernel is built against the kernel profile, as
       # in smoke-x86-64: the default branch's, or this run's when the
       # change moves the profile's format.
       - name: Fetch the kernel profile
         if: matrix.arch == 'x86_64' && needs.changes.outputs.profile_format != 'true'
+        shell: bash
         working-directory: helios
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -3961,6 +4140,7 @@ jobs:
           "$HELIOS_CLI_BIN" profile-fetch
       - name: Fetch this run's kernel profile
         if: matrix.arch == 'x86_64' && needs.changes.outputs.profile_format == 'true'
+        shell: bash
         working-directory: helios
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -3971,12 +4151,15 @@ jobs:
           profile: debug
           path: helios/target/wasm-programs/debug
       - name: Build the Linux guest image
+        shell: bash
         working-directory: helios
         run: |
+          set -euo pipefail
           ./target/release/helios-inspector vm --arch "${{ matrix.vm_arch }}" --release \
             --guest-programs-profile debug \
             --kernel-feature linux --boot-program debugger --no-compiler-plugin build
       - name: Stage prebuilt kernel and image artifacts
+        shell: bash
         working-directory: helios
         run: |
           set -euo pipefail
@@ -4025,9 +4208,11 @@ jobs:
 
   linux-syscalls-image-aarch64:
     name: linux-syscalls-image (${{ matrix.vm_arch }})
-    needs: [changes, build-helios-cli-arm64, wasm-debug]
-    if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.build-helios-cli-arm64.result == 'success' && needs.wasm-debug.result == 'success' }}
+    needs: [changes, build-helios-cli-arm64]
+    if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.build-helios-cli-arm64.result == 'success' }}
     runs-on: ubuntu-24.04-arm
+    container:
+      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
     timeout-minutes: 15
     permissions:
       contents: read
@@ -4122,22 +4307,54 @@ jobs:
           qemu-system-x86_64 --version
           sudo chmod 666 /dev/kvm
           ls -la /dev/kvm
+      - name: Log in to the container registry (aarch64)
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64'
+        env:
+          TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+      - name: Take the pinned QEMU from GHCR
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64'
+        id: qemu-ghcr
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/helios-qemu:aarch64-${{ env.QEMU_VERSION }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
+        run: |
+          set -euo pipefail
+          if output="$(docker pull "$IMAGE" 2>&1)"; then
+            container="$(docker create "$IMAGE" none)"
+            mkdir -p "$QEMU_PREFIX"
+            docker cp "$container:/." "$QEMU_PREFIX"
+            docker rm "$container" > /dev/null
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          elif grep -qiE 'manifest unknown|not found|denied' <<< "$output"; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "no prebuilt QEMU at $IMAGE"
+          else
+            echo "$output" >&2
+            exit 1
+          fi
+      - name: Restore the pinned QEMU install prefix
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64' && steps.qemu-ghcr.outputs.found != 'true'
+        id: qemu-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.QEMU_PREFIX }}
+          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
       - name: Install host dependencies (aarch64)
         if: steps.cases.outputs.count != '0' && matrix.arch != 'x86_64'
         uses: ./helios/.github/actions/install-apt-packages
         with:
-          packages: >-
-            btrfs-progs ninja-build python3-venv pkg-config flex bison
-            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
-      - name: Restore the pinned QEMU install prefix
-        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64'
-        id: qemu-cache
-        uses: ./helios/.github/actions/shared-cache
+          packages: btrfs-progs libpixman-1-0 libslirp0 libfdt1
+      - name: Install QEMU build dependencies (aarch64)
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64' && steps.qemu-ghcr.outputs.found != 'true' && steps.qemu-cache.outputs.cache-hit != 'true'
+        uses: ./helios/.github/actions/install-apt-packages
         with:
-          path: ${{ env.QEMU_PREFIX }}
-          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
+          packages: >-
+            ninja-build python3-venv pkg-config flex bison
+            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
       - name: Build the pinned QEMU
-        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64' && steps.qemu-cache.outputs.cache-hit != 'true'
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64' && steps.qemu-ghcr.outputs.found != 'true' && steps.qemu-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           tarball="qemu-${QEMU_VERSION}.tar.xz"
@@ -4218,6 +4435,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      packages: read
     strategy:
       fail-fast: false
       matrix:
@@ -4246,11 +4464,11 @@ jobs:
           merge-multiple: true
       - uses: actions/download-artifact@v4
         with:
-          name: gvisor-syscalls-x86_64
+          name: gvisor-syscalls-cases-x86_64
           path: suite/x86_64
       - uses: actions/download-artifact@v4
         with:
-          name: gvisor-syscalls-aarch64
+          name: gvisor-syscalls-cases-aarch64
           path: suite/aarch64
       # Both architectures are counted and published before either gates,
       # so a regression on one still leaves the other's report.
@@ -4291,8 +4509,65 @@ jobs:
     needs: [changes, build-helios-cli-x64, build-helios-cli-arm64, kernel-profile, wasi-artifacts, wasm-debug, wasm-release, checks-no-cli, checks, tests, smoke-riscv64, smoke-aarch64, smoke-aarch64-cfi, smoke-x86-64, smoke-x86-64-cpu-lifecycle, smoke-x86-64-venus, test-btrfs-upstream, test-btrfs-fstests, test-btrfs-fuzz, linux-syscalls-build-x86-64, linux-syscalls-build-aarch64, linux-syscalls-image-x86-64, linux-syscalls-image-aarch64, linux-syscalls-x86-64, linux-syscalls-aarch64, linux-syscalls-report]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
     steps:
       - name: Require every selected lane to succeed
         env:
           RESULTS: ${{ toJSON(needs) }}
         run: jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<< "$RESULTS"
+      # Keep only the newest entry per logical `main` cache slot so two
+      # Cargo.lock generations never exceed GitHub's 10 GiB repository cache
+      # cap and evict active caches.
+      - name: Prune superseded main caches
+        if: success() && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import collections, json, os, re, subprocess
+
+          repo = os.environ["REPO"]
+          raw = subprocess.check_output(
+              ["gh", "api", "--paginate", f"repos/{repo}/actions/caches?ref=refs/heads/main&per_page=100"],
+              text=True,
+          )
+          caches = []
+          for line in raw.splitlines():
+              if line.strip():
+                  caches.extend(json.loads(line).get("actions_caches", []))
+
+          slot_patterns = [
+              re.compile(r"^(v0-rust-.+-Linux-(?:x64|arm64))-[0-9a-f]+-[0-9a-f]+$"),
+              re.compile(r"^(helios-wasm-[^-]+-[^-]+-[^-]+)-\d+$"),
+              re.compile(r"^(helios-cwasm-.+-[^-]+-[^-]+)-\d+$"),
+              re.compile(r"^(helios-cli-stable-v1-debug-[^-]+-[^-]+)-[0-9a-f]+$"),
+              re.compile(r"^(helios-inspector-v1-release-[^-]+-[^-]+)-[0-9a-f]+$"),
+          ]
+          groups = collections.defaultdict(list)
+          for entry in caches:
+              key = entry["key"]
+              for pat in slot_patterns:
+                  m = pat.match(key)
+                  if m:
+                      groups[m.group(1)].append(entry)
+                      break
+
+          deleted = 0
+          for slot, entries in sorted(groups.items()):
+              entries.sort(key=lambda e: e["created_at"], reverse=True)
+              for stale in entries[1:]:
+                  res = subprocess.run(
+                      ["gh", "api", "-X", "DELETE", f"repos/{repo}/actions/caches/{stale['id']}"],
+                      capture_output=True,
+                      text=True,
+                  )
+                  if res.returncode == 0:
+                      deleted += 1
+                      print(f"pruned {stale['key']} ({stale['size_in_bytes'] // 1048576} MiB)")
+          print(f"pruned {deleted} superseded main cache(s)")
+          PY
