@@ -60,7 +60,7 @@ pub use system::{
     LinuxCapabilities, MemoryTotals, NGROUPS_MAX, NR_OPEN_DEFAULT, RELEASE, RLIM_INFINITY,
     Resource, Rlimit, Start, System, UTS_FIELD_MAX, UtsField, UtsNameError,
 };
-pub use thread::PidNamespace;
+pub use thread::{PidNamespace, PidNamespaceTelemetry};
 pub use tty::{Termios, TermiosAction, Tty, TtyError, TtyStream, Winsize};
 
 /// The platform objects a process's descriptors can hold besides the UNIX

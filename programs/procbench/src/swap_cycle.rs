@@ -14,7 +14,7 @@ use std::io::{self, Read as _, Write as _};
 use std::time::{Duration, Instant};
 
 use helios_api::wit_bindgen::StreamReader;
-use helios_api::{stats, task};
+use helios_api::{inspect, task};
 use helios_bench_metrics::report_metric;
 
 use crate::{ChildSpec, ProcbenchError, READ_CHUNK_BYTES, wait_child};
@@ -128,13 +128,49 @@ struct Counters {
     pages_in: u64,
 }
 
+struct SwapMemorySample {
+    pages_out: u64,
+    pages_in: u64,
+    memory_total_bytes: u64,
+    memory_available_bytes: u64,
+}
+
+fn read_u64(entries: &[inspect::Entry], path: &str) -> Option<u64> {
+    entries.iter().find_map(|entry| {
+        if entry.path == path {
+            match entry.value {
+                inspect::Value::Unsigned64(v) => Some(v),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    })
+}
+
+fn swap_memory_sample() -> Result<SwapMemorySample, ProcbenchError> {
+    let snap = inspect::snapshot_prefixes(&["/kernel/swap", "/kernel/memory"], 64)
+        .map_err(|_| ProcbenchError::SwapUnavailable)?;
+    let pages_out =
+        read_u64(&snap.entries, "/kernel/swap/pages-out").ok_or(ProcbenchError::SwapUnavailable)?;
+    let pages_in =
+        read_u64(&snap.entries, "/kernel/swap/pages-in").ok_or(ProcbenchError::SwapUnavailable)?;
+    let memory_total_bytes = read_u64(&snap.entries, "/kernel/memory/total-bytes").unwrap_or(0);
+    let memory_available_bytes =
+        read_u64(&snap.entries, "/kernel/memory/available-bytes").unwrap_or(0);
+    Ok(SwapMemorySample {
+        pages_out,
+        pages_in,
+        memory_total_bytes,
+        memory_available_bytes,
+    })
+}
+
 fn swap_counters() -> Result<Counters, ProcbenchError> {
-    let swap = stats::snapshot()
-        .swap
-        .ok_or(ProcbenchError::SwapUnavailable)?;
+    let sample = swap_memory_sample()?;
     Ok(Counters {
-        pages_out: swap.pages_out,
-        pages_in: swap.pages_in,
+        pages_out: sample.pages_out,
+        pages_in: sample.pages_in,
     })
 }
 
@@ -242,21 +278,20 @@ pub(crate) async fn swap_cycle(options: Options, child: ChildSpec) -> Result<(),
     let mut previous = baseline.pages_out;
     loop {
         hog.touch().await;
-        let sample = stats::snapshot();
-        let swap = sample.swap.ok_or(ProcbenchError::SwapUnavailable)?;
-        let evicted = swap.pages_out.saturating_sub(baseline.pages_out);
+        let sample = swap_memory_sample()?;
+        let evicted = sample.pages_out.saturating_sub(baseline.pages_out);
         if evicted >= child_pages {
             break;
         }
         // A fail-fast guard against driving the machine into the OOM band
         // when swap never starts; it is not an estimate of pressure.
-        if swap.pages_out == baseline.pages_out
-            && sample.memory.available_bytes.saturating_mul(8) < sample.memory.total_bytes
+        if sample.pages_out == baseline.pages_out
+            && sample.memory_available_bytes.saturating_mul(8) < sample.memory_total_bytes
         {
             return Err(ProcbenchError::MemoryFloor {
-                available_bytes: sample.memory.available_bytes,
-                total_bytes: sample.memory.total_bytes,
-                pages_out: swap.pages_out,
+                available_bytes: sample.memory_available_bytes,
+                total_bytes: sample.memory_total_bytes,
+                pages_out: sample.pages_out,
                 baseline_pages_out: baseline.pages_out,
             });
         }
@@ -268,16 +303,16 @@ pub(crate) async fn swap_cycle(options: Options, child: ChildSpec) -> Result<(),
         {
             return Err(ProcbenchError::SwapOutDeadline {
                 waited: started.elapsed(),
-                pages_out: swap.pages_out,
+                pages_out: sample.pages_out,
                 baseline_pages_out: baseline.pages_out,
                 child_pages,
                 hog_bytes: hog.chunks.len() * HOG_STEP_BYTES,
             });
         }
-        if swap.pages_out == previous {
+        if sample.pages_out == previous {
             hog.grow()?;
         }
-        previous = swap.pages_out;
+        previous = sample.pages_out;
         task::sleep(SWAP_TICK).await;
     }
 

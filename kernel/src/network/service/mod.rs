@@ -8191,4 +8191,47 @@ mod tests {
             "loopback traffic must never be transmitted onto the NIC"
         );
     }
+
+    #[test]
+    fn nonblocking_tcp_connect_start_defers_immediate_reset_to_poll() {
+        fn poll_ready<F: core::future::Future>(
+            mut fut: core::pin::Pin<&mut F>,
+            cx: &mut core::task::Context<'_>,
+        ) -> F::Output {
+            for _ in 0..16 {
+                if let core::task::Poll::Ready(out) = fut.as_mut().poll(cx) {
+                    return out;
+                }
+            }
+            panic!("non-blocking connect future did not complete within 16 polls");
+        }
+
+        let device = RecordingNetworkInterface::accepting_transmissions(1);
+        let service = test_network_service_on(device);
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+
+        for loopback in [
+            NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
+            NetworkIpAddress::Ipv6(Ipv6Address::LOOPBACK),
+        ] {
+            let (stream, progress) = {
+                let fut = core::pin::pin!(service.tcp_connect_start(loopback, 65_432, 0, 64));
+                poll_ready(fut, &mut cx)
+                    .expect("non-blocking connect start must return Pending even on immediate RST")
+            };
+            assert_eq!(progress, crate::TcpConnectPoll::Pending);
+
+            let error = {
+                let fut = core::pin::pin!(service.tcp_connect_poll(stream));
+                poll_ready(fut, &mut cx).expect_err("subsequent poll must report the peer RST")
+            };
+            assert_eq!(
+                error.detail,
+                crate::NetworkErrorDetail::TcpClosedDuringConnect
+            );
+
+            service.tcp_close(stream);
+        }
+    }
 }

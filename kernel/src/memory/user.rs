@@ -1005,6 +1005,12 @@ pub fn user_node_stats() -> Vec<MemoryNodeStats> {
     user_memory_pool().node_stats()
 }
 
+/// Every node's share of the user pool, or an empty vector before the pool is
+/// installed at bootstrap.
+pub(crate) fn try_user_node_stats() -> Vec<MemoryNodeStats> {
+    installed_user_memory_pool().map_or_else(Vec::new, UserMemoryPool::node_stats)
+}
+
 /// User memory the pool can still hand out, or nothing at all before
 /// the pool exists.
 ///

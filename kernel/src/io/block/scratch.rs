@@ -93,7 +93,7 @@ pub struct ScratchDiskStats {
 }
 
 impl ScratchDiskStats {
-    /// A snapshot for `helios:system/stats`.
+    /// A snapshot for kernel telemetry inspection.
     pub fn snapshot(&self) -> BlockStats {
         BlockStats {
             capacity_bytes: self.geometry.capacity_bytes(),
