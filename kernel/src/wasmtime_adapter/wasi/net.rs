@@ -1273,11 +1273,7 @@ where
                     }
                 };
                 source.mark_read(len);
-                let write = (*this.start)(
-                    this.connection.clone(),
-                    this.service.clone(),
-                    piece,
-                );
+                let write = (*this.start)(this.connection.clone(), this.service.clone(), piece);
                 this.pending.set(Some(write));
             }
 

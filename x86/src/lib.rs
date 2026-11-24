@@ -252,16 +252,6 @@ fn x86_kernel_main() -> ! {
         ProcessorId::new(0),
     );
     let wakeup_page = (processor_count > 1).then_some(reserved_wakeup_page);
-    // The memory a confined device is allowed to reach is exactly what
-    // the allocator was primed with, captured here while the boot
-    // handoff is still in hand.
-    let dma_memory = dma_capable_ranges(
-        &handoff,
-        physical_memory_offset,
-        &reserved_ranges,
-        wakeup_page.clone(),
-        &numa,
-    );
     let timebase = Timebase::new(detect_tsc_frequency_hz());
     let tsc_base = read_tsc();
     let payload = helios_kernel::BootPayload::from_boot_modules(&handoff.modules);
@@ -473,9 +463,9 @@ fn x86_kernel_main() -> ! {
         &cpu,
         &kernel,
         &pci,
+        pool,
         physical_memory_offset,
         iommu_topology,
-        &dma_memory,
         network_function,
         host_share_function,
         entropy_function,
@@ -538,9 +528,9 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
     cpu: &X86Cpu,
     kernel: &helios_kernel::Kernel<X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     pci: &pci::PciRoot,
+    pool: &'static helios_kernel::UserMemoryPool,
     physical_memory_offset: usize,
     iommu_topology: Option<iommu::IommuTopology>,
-    dma_memory: &[helios_hal::iommu::PhysicalRange],
     network_function: Option<pci_types::PciAddress>,
     host_share_function: Option<pci_types::PciAddress>,
     entropy_function: Option<pci_types::PciAddress>,
@@ -557,6 +547,7 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
     MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let destination_apic_id = cpu.bootstrap_apic_id();
+    let processors = cpu.processor_count();
     let mut routes = exceptions::DeviceInterruptRoutes::new();
     // Every virtio function the kernel is about to drive has to be in a
     // domain before it is programmed, so the whole set is confined in
@@ -572,9 +563,8 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
         .chain(sound_function)
         .chain(block_functions.iter().copied())
         .collect();
-    let confinement = iommu_topology.map(|topology| {
-        iommu::confine_devices(pci, topology, physical_memory_offset, dma_memory, &confined)
-    });
+    let mut confinement = iommu_topology
+        .map(|topology| iommu::confine_devices(pci, topology, physical_memory_offset, &confined));
     if let Some(confinement) = &confinement {
         let report = confinement.report();
         debug_state.install_iommu_report(report.clone());
@@ -590,15 +580,21 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
             "no virtio-iommu in the ACPI topology; device DMA reaches all of physical memory"
         );
     }
-    let dma_pool = |address: pci_types::PciAddress| {
-        iommu::dma_pool(confinement.as_ref(), address, physical_memory_offset)
-    };
+    let mut dma_arenas = iommu::X86DmaArenas::new(helios_kernel::UserPoolChunks::new(pool));
     if let Some(address) = host_share_function {
+        let dma = iommu::dma_pool(
+            &mut dma_arenas,
+            confinement.as_mut(),
+            address,
+            physical_memory_offset,
+            iommu::LARGE_DMA_CHUNK_BYTES,
+            processors,
+        );
         let transport = host_fs::install(
             cpu,
             pci,
             address,
-            dma_pool(address),
+            dma,
             exceptions::HOST_FS_INTERRUPT_VECTOR,
             destination_apic_id,
             debug_state,
@@ -608,13 +604,21 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
         tracing::warn!("virtio 9p device was not discovered on the PCI bus");
     }
     if let Some(address) = network_function {
+        let dma = iommu::dma_pool(
+            &mut dma_arenas,
+            confinement.as_mut(),
+            address,
+            physical_memory_offset,
+            iommu::LARGE_DMA_CHUNK_BYTES,
+            processors,
+        );
         let interrupts = net::install(
             cpu,
             kernel,
             net::PciFunction {
                 root: pci,
                 address,
-                dma: dma_pool(address),
+                dma,
             },
             net::MsixDelivery {
                 vector: exceptions::NETWORK_INTERRUPT_VECTOR,
@@ -633,11 +637,19 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
         tracing::warn!("virtio network device was not discovered on the PCI bus");
     }
     if let Some(address) = entropy_function {
+        let dma = iommu::dma_pool(
+            &mut dma_arenas,
+            confinement.as_mut(),
+            address,
+            physical_memory_offset,
+            iommu::SMALL_DMA_CHUNK_BYTES,
+            processors,
+        );
         let device = entropy::install(
             kernel,
             pci,
             address,
-            dma_pool(address),
+            dma,
             exceptions::ENTROPY_INTERRUPT_VECTOR,
             destination_apic_id,
             root_entropy.clone(),
@@ -647,12 +659,20 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
         tracing::warn!("virtio entropy device was not discovered on the PCI bus");
     }
     if let Some(address) = vsock_function {
+        let dma = iommu::dma_pool(
+            &mut dma_arenas,
+            confinement.as_mut(),
+            address,
+            physical_memory_offset,
+            iommu::SMALL_DMA_CHUNK_BYTES,
+            processors,
+        );
         let device = vsock::install(
             cpu,
             kernel,
             pci,
             address,
-            dma_pool(address),
+            dma,
             exceptions::VSOCK_INTERRUPT_VECTOR,
             destination_apic_id,
             debug_state,
@@ -662,12 +682,20 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
         tracing::warn!("virtio vsock device was not discovered on the PCI bus");
     }
     if let Some(address) = display_function {
+        let dma = iommu::dma_pool(
+            &mut dma_arenas,
+            confinement.as_mut(),
+            address,
+            physical_memory_offset,
+            iommu::LARGE_DMA_CHUNK_BYTES,
+            processors,
+        );
         let device = gpu::install(
             cpu,
             kernel,
             pci,
             address,
-            dma_pool(address),
+            dma,
             exceptions::DISPLAY_INTERRUPT_VECTOR,
             destination_apic_id,
             debug_state,
@@ -677,11 +705,19 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
         tracing::info!("no virtio-gpu function on the PCI bus; this machine has no display");
     }
     if let Some(address) = balloon_function {
+        let dma = iommu::dma_pool(
+            &mut dma_arenas,
+            confinement.as_mut(),
+            address,
+            physical_memory_offset,
+            iommu::SMALL_DMA_CHUNK_BYTES,
+            processors,
+        );
         let handle = balloon::install(
             kernel,
             pci,
             address,
-            dma_pool(address),
+            dma,
             debug_state.machine_generation_handle(),
         );
         debug_state.install_memory_balloon(handle);
@@ -692,7 +728,17 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
     let input_devices: alloc::vec::Vec<(pci_types::PciAddress, iommu::X86DmaPool)> =
         input_functions
             .iter()
-            .map(|address| (*address, dma_pool(*address)))
+            .map(|address| {
+                let dma = iommu::dma_pool(
+                    &mut dma_arenas,
+                    confinement.as_mut(),
+                    *address,
+                    physical_memory_offset,
+                    iommu::SMALL_DMA_CHUNK_BYTES,
+                    processors,
+                );
+                (*address, dma)
+            })
             .collect();
     for device in input::install(
         kernel,
@@ -704,11 +750,19 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
         routes.add_input(device.vector, device.device);
     }
     if let Some(address) = sound_function {
+        let dma = iommu::dma_pool(
+            &mut dma_arenas,
+            confinement.as_mut(),
+            address,
+            physical_memory_offset,
+            iommu::SMALL_DMA_CHUNK_BYTES,
+            processors,
+        );
         let device = snd::install(
             kernel,
             pci,
             address,
-            dma_pool(address),
+            dma,
             exceptions::SOUND_INTERRUPT_VECTOR,
             destination_apic_id,
             debug_state,
@@ -729,7 +783,17 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
     let block_devices: alloc::vec::Vec<(pci_types::PciAddress, iommu::X86DmaPool)> =
         block_functions
             .iter()
-            .map(|address| (*address, dma_pool(*address)))
+            .map(|address| {
+                let dma = iommu::dma_pool(
+                    &mut dma_arenas,
+                    confinement.as_mut(),
+                    *address,
+                    physical_memory_offset,
+                    iommu::LARGE_DMA_CHUNK_BYTES,
+                    processors,
+                );
+                (*address, dma)
+            })
             .collect();
     for block in block::install(
         cpu,
@@ -742,6 +806,10 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
     ) {
         routes.add_block(block.vector, block.device);
     }
+    kernel.spawn_detached(helios_kernel::maintain_dma_arenas(
+        dma_arenas,
+        kernel.timer(),
+    ));
     // COM1 interrupts through the I/O APIC, not MSI-X, but its vector
     // registers beside the message-signalled routes. The redirection
     // entry is armed only once the table is installed, so no delivery
@@ -890,32 +958,6 @@ fn boot_memory_regions<'n, Numa: NumaTopology>(
         // the kernel image, modules and the wakeup page are reserved out.
         unsafe { usable_node_regions(region, &reserved_ranges, physical_memory_offset, numa) }
     })
-}
-
-/// The physical memory the kernel allocates its DMA buffers from.
-///
-/// It is exactly what the bootstrap allocator was primed with: every
-/// buffer a driver hands to a device is a kernel heap allocation, so a
-/// domain that maps these runs reaches every buffer and nothing else.
-fn dma_capable_ranges<Numa: NumaTopology>(
-    handoff: &boot::LimineBootHandoff,
-    physical_memory_offset: usize,
-    reserved_ranges: &BootReservedRanges,
-    excluded: Option<Range<usize>>,
-    numa: &Numa,
-) -> alloc::vec::Vec<helios_hal::iommu::PhysicalRange> {
-    boot_memory_regions(
-        handoff,
-        physical_memory_offset,
-        reserved_ranges,
-        excluded,
-        numa,
-    )
-    .map(|region| {
-        let start = region.start() - physical_memory_offset;
-        helios_hal::iommu::PhysicalRange::new(start as u64, region.len() as u64)
-    })
-    .collect()
 }
 
 /// The kernel console: every record is retained for the debugger and

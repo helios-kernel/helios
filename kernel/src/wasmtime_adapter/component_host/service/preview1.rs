@@ -6785,8 +6785,8 @@ mod tests {
             .collect();
         let mut gather = Preview1Gather::new(&memory, &layout).expect("buffers fit");
         let mut stream = RecordingStream::accepting(usize::MAX);
-        let sent = run(p1_send_gathered(&memory, &mut gather, &mut stream))
-            .expect("every chunk is taken");
+        let sent =
+            run(p1_send_gathered(&memory, &mut gather, &mut stream)).expect("every chunk is taken");
         let chunks = stream.chunks;
         assert_eq!(sent as usize, expected.len());
         assert!(chunks.len() > 1);

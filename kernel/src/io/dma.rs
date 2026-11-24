@@ -130,14 +130,17 @@ use core::ptr::{self, NonNull};
 use core::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
 };
+use core::time::Duration;
 
 use crossbeam_utils::CachePadded;
-use helios_hal::cpu::current_processor;
-use helios_hal::dma::{DeviceAddress, DmaBuffer, DmaError, DmaSpaceMark};
-use helios_hal::iommu::DmaAccess;
+use helios_hal::cpu::{Cpu, current_processor};
+use helios_hal::dma::{
+    DeviceAddress, DmaAddressing, DmaBuffer, DmaError, DmaForeignMapping, DmaMemory, DmaSpaceMark,
+};
+use helios_hal::iommu::{DmaAccess, PhysicalRange};
 use helios_hal::pmm::PhysFrame;
 
-use crate::exec::{Mutex, MutexGuard, ProgressMark, ProgressSignal};
+use crate::exec::{Mutex, MutexGuard, ProgressMark, ProgressSignal, Timer};
 
 /// Bytes in one page of an arena.
 const PAGE_BYTES: usize = PhysFrame::SIZE;
@@ -276,6 +279,10 @@ pub trait ChunkSource: Send + Sync + 'static {
 /// Called only by the holder of an arena's `grow` guard, so a domain's
 /// calls for one arena never overlap.
 pub trait ChunkDomain: Send + Sync + 'static {
+    /// A guard that keeps a caller-owned physical range mapped for this
+    /// device until dropped.
+    type ForeignMapping: DmaForeignMapping;
+
     /// The device address of `chunk`'s first byte, which is page aligned,
     /// reachable with `access` rights.
     ///
@@ -289,6 +296,22 @@ pub trait ChunkDomain: Send + Sync + 'static {
     /// the chunk goes back to the source. A refusal leaves the chunk with
     /// the arena for good, because the device may still reach it.
     fn unmap(&self, chunk: LentChunk, device: DeviceAddress) -> Result<(), DmaError>;
+
+    /// Maps `range` — physical memory this arena did not allocate — into the
+    /// device's address space with `access` rights, returning a guard that
+    /// keeps the mapping alive until dropped.
+    fn map_foreign(
+        &self,
+        range: PhysicalRange,
+        access: DmaAccess,
+    ) -> Result<Self::ForeignMapping, DmaError>;
+
+    /// The guest physical address of `bytes`, independent of any IOMMU
+    /// translation.
+    fn physical_address(&self, bytes: &[u8]) -> Result<u64, DmaError>;
+
+    /// What kind of address this domain hands out.
+    fn addressing(&self) -> DmaAddressing;
 }
 
 /// Which allocations an arena answers by lending a chunk.
@@ -421,6 +444,101 @@ impl ChunkClass {
             Self::Read => DmaAccess::READ,
             Self::Resident | Self::ReadWrite => DmaAccess::READ.union(DmaAccess::WRITE),
         }
+    }
+
+    /// Maps `access` for a request-scoped allocation to its chunk class.
+    const fn for_request(access: DmaAccess) -> Self {
+        if access.contains(DmaAccess::WRITE) {
+            Self::ReadWrite
+        } else {
+            Self::Read
+        }
+    }
+}
+
+/// A cheaply cloneable handle to a [`DmaArena`] implementing
+/// [`helios_hal::dma::DmaMemory`] for virtio and other DMA drivers.
+pub struct SharedDmaArena<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth>(Arc<DmaArena<S, D, G>>);
+
+impl<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth> Clone for SharedDmaArena<S, D, G> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth> SharedDmaArena<S, D, G> {
+    pub fn new(arena: Arc<DmaArena<S, D, G>>) -> Self {
+        Self(arena)
+    }
+
+    pub fn arena(&self) -> &DmaArena<S, D, G> {
+        &self.0
+    }
+}
+
+impl<S: ChunkSource, D: ChunkDomain, G: ChunkGrowth> DmaMemory for SharedDmaArena<S, D, G> {
+    type Buffer = ArenaBuffer;
+    type ForeignMapping = D::ForeignMapping;
+
+    fn allocate_resident(
+        &self,
+        layout: Layout,
+        _access: DmaAccess,
+    ) -> Result<Self::Buffer, DmaError> {
+        self.0.allocate(ChunkClass::Resident, layout)
+    }
+
+    fn allocate(&self, layout: Layout, access: DmaAccess) -> Result<Self::Buffer, DmaError> {
+        self.0.allocate(ChunkClass::for_request(access), layout)
+    }
+
+    fn allocate_overwritten(
+        &self,
+        layout: Layout,
+        access: DmaAccess,
+    ) -> Result<Self::Buffer, DmaError> {
+        self.0
+            .allocate_overwritten(ChunkClass::for_request(access), layout)
+    }
+
+    fn max_run_bytes(&self) -> usize {
+        self.0.max_run_bytes()
+    }
+
+    fn want_space(&self) -> DmaSpaceMark {
+        self.0.want_space()
+    }
+
+    fn space_changed(&self, mark: DmaSpaceMark) -> impl Future<Output = ()> + Send + '_ {
+        self.0.space_changed(mark)
+    }
+
+    fn short_of_space(&self) -> bool {
+        self.0.short_of_space()
+    }
+
+    fn space_mark(&self) -> DmaSpaceMark {
+        self.0.space_mark()
+    }
+
+    fn device_range(&self, bytes: &[u8]) -> Result<DeviceAddress, DmaError> {
+        self.0.device_range(bytes)
+    }
+
+    fn map_foreign(
+        &self,
+        range: PhysicalRange,
+        access: DmaAccess,
+    ) -> Result<Self::ForeignMapping, DmaError> {
+        self.0.domain.map_foreign(range, access)
+    }
+
+    fn physical_address(&self, bytes: &[u8]) -> Result<u64, DmaError> {
+        self.0.domain.physical_address(bytes)
+    }
+
+    fn addressing(&self) -> DmaAddressing {
+        self.0.domain.addressing()
     }
 }
 
@@ -1977,6 +2095,11 @@ impl<S: ChunkSource + Clone, D: ChunkDomain> DmaArenas<S, D> {
         }
     }
 
+    /// The chunk source these arenas draw from and return to.
+    pub fn source(&self) -> &S {
+        &self.source
+    }
+
     /// Builds and registers an elastic arena of `chunk_bytes` chunks for
     /// `processors` processors. Bring-up only.
     pub fn arena(
@@ -2039,6 +2162,48 @@ impl<S: ChunkSource + Clone, D: ChunkDomain> DmaArenas<S, D> {
             stayed |= arena.grow_refused().await;
         }
         stayed.then_some(mark)
+    }
+}
+
+/// How often idle elastic DMA arenas give excess empty chunks back to their
+/// source.
+pub const DMA_ARENA_RETIRE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Empty chunks retained per request class in each elastic DMA arena during
+/// periodic retirement so steady-state traffic avoids remapping on every burst.
+pub const DMA_ARENA_RETAINED_CHUNKS: usize = 1;
+
+/// Background maintenance task for a set of elastic DMA arenas.
+///
+/// Periodically retires excess empty chunks while retaining
+/// [`DMA_ARENA_RETAINED_CHUNKS`] per request class, and reacts immediately when
+/// any arena had a chunk lend refused by retiring empty chunks across all
+/// arenas and retrying growth once memory returns to the source.
+pub async fn maintain_dma_arenas<CpuImpl, S, D>(arenas: DmaArenas<S, D>, timer: Timer<CpuImpl>)
+where
+    CpuImpl: Cpu + Clone,
+    S: ChunkSource + Clone,
+    D: ChunkDomain,
+{
+    loop {
+        let demand = arenas.demand_mark();
+        if let Some(chunk_mark) = arenas.grow_refused().await {
+            if arenas.retire_empty(0).await > 0 {
+                continue;
+            }
+            let returned = core::pin::pin!(arenas.source().chunk_returned(chunk_mark));
+            let sleep = core::pin::pin!(timer.sleep_for(DMA_ARENA_RETIRE_INTERVAL));
+            let _ = futures::future::select(returned, sleep).await;
+            continue;
+        }
+        let kicked = core::pin::pin!(arenas.demand_changed(demand));
+        let sleep = core::pin::pin!(timer.sleep_for(DMA_ARENA_RETIRE_INTERVAL));
+        match futures::future::select(kicked, sleep).await {
+            futures::future::Either::Left(_) => {}
+            futures::future::Either::Right(_) => {
+                let _ = arenas.retire_empty(DMA_ARENA_RETAINED_CHUNKS).await;
+            }
+        }
     }
 }
 
@@ -2368,6 +2533,8 @@ mod tests {
     }
 
     impl<G: ChunkGrowth> ChunkDomain for TestDomain<G> {
+        type ForeignMapping = DeviceAddress;
+
         fn map(&self, chunk: LentChunk, access: DmaAccess) -> Result<DeviceAddress, DmaError> {
             if let Some(arena) = self.arena() {
                 assert_eq!(
@@ -2396,6 +2563,22 @@ mod tests {
             self.source.0.mapped[self.source.0.slot(chunk.start())].store(false, Ordering::SeqCst);
             self.source.record(Event::Unmap(chunk.start()));
             Ok(())
+        }
+
+        fn map_foreign(
+            &self,
+            range: PhysicalRange,
+            _access: DmaAccess,
+        ) -> Result<Self::ForeignMapping, DmaError> {
+            Ok(DeviceAddress::new(device_of(range.start as usize)))
+        }
+
+        fn physical_address(&self, bytes: &[u8]) -> Result<u64, DmaError> {
+            Ok(bytes.as_ptr() as usize as u64)
+        }
+
+        fn addressing(&self) -> DmaAddressing {
+            DmaAddressing::Platform
         }
     }
 

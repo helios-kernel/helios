@@ -19,24 +19,41 @@ use core::time::Duration;
 
 use acpi::sdt::SdtHeader;
 use helios_hal::cpu::{Cpu, Timebase};
-use helios_hal::iommu::{DmaTranslation, EndpointId, PhysicalRange};
-use helios_kernel::{IommuDomains, IommuReport, MAX_IOMMU_ENDPOINTS, Timer};
+use helios_hal::iommu::{EndpointId, PhysicalRange};
+use helios_kernel::{
+    DeviceChunkDomain, DirectChunkDomain, DmaArenas, Elastic, IommuChunkDomain, IommuDomains,
+    IommuReport, MAX_IOMMU_ENDPOINTS, SharedDmaArena, Timer, UserPoolChunks,
+};
 use helios_virtio::{
-    DeviceType, MAX_RESERVED_REGIONS, OffsetDmaPool, PlatformDmaPool, ReservedRegion,
-    VirtioIommuDevice, VirtioPciTransport,
+    DeviceType, MAX_RESERVED_REGIONS, OffsetDmaPool, ReservedRegion, VirtioIommuDevice,
+    VirtioPciTransport,
 };
 use pci_types::PciAddress;
 
 use crate::pci::PciRoot;
 
+/// Per-device chunk domain backing every virtio-PCI driver on x86.
+pub(crate) type X86DmaDomain = DeviceChunkDomain<Arc<X86VirtioIommuDevice>>;
+
 /// The DMA pool every virtio-PCI driver on this backend publishes
 /// addresses from.
 ///
-/// It is the same type whether or not the platform confines its devices:
-/// what changes is the translation inside it, which is the platform's
-/// own answer to "what address does a device have to issue for this
-/// page".
-pub(crate) type X86DmaPool = PlatformDmaPool<OffsetDmaPool>;
+/// Every device owns its own [`DmaArena`] whose chunks are lent from the
+/// user memory pool and dynamically mapped into that device's IOMMU
+/// domain (or translated directly when no translation unit is present).
+pub(crate) type X86DmaPool = SharedDmaArena<UserPoolChunks, X86DmaDomain, Elastic>;
+
+/// Registry of all x86 elastic DMA arenas driven by the background
+/// maintenance task.
+pub(crate) type X86DmaArenas = DmaArenas<UserPoolChunks, X86DmaDomain>;
+
+/// Chunk size (2 MiB) for high-throughput or large-slab devices (network,
+/// block, host-fs, GPU).
+pub(crate) const LARGE_DMA_CHUNK_BYTES: usize = 2 << 20;
+
+/// Chunk size (256 KiB = 64 pages, one bitmap word) for control and
+/// low-bandwidth devices (entropy, balloon, vsock, input, sound).
+pub(crate) const SMALL_DMA_CHUNK_BYTES: usize = 256 << 10;
 
 /// The `VIOT` signature, which the vendored `acpi` crate has no
 /// constant for and cannot be handed one: its `Signature` type has no
@@ -227,23 +244,33 @@ pub(crate) fn install(
     Arc::new(device)
 }
 
-/// The devices one translation unit confines, and what each of them
-/// reaches.
+/// The devices one translation unit confines, and each device's dynamic
+/// IOMMU chunk domain.
 pub(crate) struct Confinement {
     device: Arc<X86VirtioIommuDevice>,
     report: Arc<IommuReport>,
-    entries: [Option<(PciAddress, DmaTranslation)>; MAX_IOMMU_ENDPOINTS],
+    entries: [Option<(
+        PciAddress,
+        Option<IommuChunkDomain<Arc<X86VirtioIommuDevice>>>,
+    )>; MAX_IOMMU_ENDPOINTS],
 }
 
 impl Confinement {
-    /// The translation the driver of `address` publishes its addresses
-    /// through.
-    pub(crate) fn translation_of(&self, address: PciAddress) -> DmaTranslation {
+    /// Takes ownership of the dynamic IOMMU domain built for `address`.
+    pub(crate) fn take_domain(
+        &mut self,
+        address: PciAddress,
+    ) -> IommuChunkDomain<Arc<X86VirtioIommuDevice>> {
         self.entries
-            .iter()
+            .iter_mut()
             .flatten()
-            .find_map(|(confined, translation)| (*confined == address).then_some(*translation))
-            .unwrap_or_else(|| panic!("PCI function {address} was never given an IOMMU domain"))
+            .find_map(|(confined, domain)| (*confined == address).then(|| domain.take()))
+            .flatten()
+            .unwrap_or_else(|| {
+                panic!(
+                    "PCI function {address} was never given an IOMMU domain or was claimed twice"
+                )
+            })
     }
 
     /// The unit itself, for the task that collects its fault reports.
@@ -258,17 +285,15 @@ impl Confinement {
 }
 
 /// Brings the platform's translation unit up and gives every function in
-/// `functions` a domain of its own.
+/// `functions` a private domain of its own.
 ///
-/// `dma_memory` is the physical memory the kernel allocates its DMA
-/// buffers from; nothing outside it, and nothing outside the doorbells
-/// the unit and the platform name, is reachable by any confined device
-/// afterwards.
+/// Only the unit's and platform's interrupt doorbells are mapped here;
+/// each device's [`DmaArena`] maps its own chunks and foreign ranges on
+/// demand and unmaps them when retired or dropped.
 pub(crate) fn confine_devices(
     pci: &PciRoot,
     topology: IommuTopology,
     physical_memory_offset: usize,
-    dma_memory: &[PhysicalRange],
     functions: &[PciAddress],
 ) -> Confinement {
     let device = install(pci, topology.unit(), physical_memory_offset);
@@ -306,40 +331,49 @@ pub(crate) fn confine_devices(
         }
     }
 
-    let mut domains = IommuDomains::new(device.clone(), dma_memory, &doorbells[..doorbell_count])
-        .unwrap_or_else(|error| panic!("the IOMMU domain layout is not buildable: {error}"));
+    let mut domains = IommuDomains::new(
+        device.clone(),
+        &doorbells[..doorbell_count],
+        physical_memory_offset,
+        device.global_bypass(),
+    )
+    .unwrap_or_else(|error| panic!("the IOMMU domain layout is not buildable: {error}"));
     let mut entries = [const { None }; MAX_IOMMU_ENDPOINTS];
     for (slot, address) in functions.iter().enumerate() {
         let endpoint = topology
             .endpoint_of(*address)
             .unwrap_or_else(|| panic!("PCI function {address} left the VIOT topology"));
-        let translation = domains
+        let domain = domains
             .confine(endpoint)
             .unwrap_or_else(|error| panic!("failed to confine {address}: {error}"));
-        entries[slot] = Some((*address, translation));
+        entries[slot] = Some((*address, Some(domain)));
     }
 
     Confinement {
-        report: domains.report(device.global_bypass()),
+        report: domains.report(),
         device,
         entries,
     }
 }
 
-/// The pool a virtio-PCI driver publishes addresses from.
+/// Builds and registers a per-device DMA arena for `address`.
 ///
-/// With no translation unit the addresses are physical, which is what
-/// every machine without one requires.
+/// With a translation unit the arena maps only its own chunks and foreign
+/// ranges into that device's IOMMU domain; without one it translates
+/// direct-map addresses to physical addresses.
 pub(crate) fn dma_pool(
-    confinement: Option<&Confinement>,
+    arenas: &mut X86DmaArenas,
+    confinement: Option<&mut Confinement>,
     address: PciAddress,
     physical_memory_offset: usize,
+    chunk_bytes: usize,
+    processors: usize,
 ) -> X86DmaPool {
-    let translation = match confinement {
-        Some(confinement) => confinement.translation_of(address),
-        None => DmaTranslation::direct(),
+    let domain = match confinement {
+        Some(confinement) => DeviceChunkDomain::Confined(confinement.take_domain(address)),
+        None => DeviceChunkDomain::Direct(DirectChunkDomain::new(physical_memory_offset)),
     };
-    PlatformDmaPool::new(OffsetDmaPool::new(physical_memory_offset), translation)
+    SharedDmaArena::new(arenas.arena(domain, chunk_bytes, processors))
 }
 
 /// The local-APIC message window every MSI-X capable function writes to.

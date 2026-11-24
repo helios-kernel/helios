@@ -2475,7 +2475,6 @@ dependencies = [
  "acpi",
  "arm-gic",
  "arm-sysregs",
- "bytes",
  "critical-section",
  "crossbeam-utils",
  "fdt",
@@ -3060,7 +3059,6 @@ name = "helios-riscv"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
- "bytes",
  "critical-section",
  "fdt",
  "helios-firmware",
@@ -3289,7 +3287,6 @@ version = "0.1.0"
 dependencies = [
  "acpi",
  "bitflags 2.13.1",
- "bytes",
  "critical-section",
  "helios-acpi",
  "helios-artifact",

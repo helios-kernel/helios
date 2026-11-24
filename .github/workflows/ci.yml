@@ -1866,6 +1866,26 @@ jobs:
           # The inspector attaches `vmgenid` on the x86 profile, so the
           # guest has to have found its generation ID window (#572).
           grep -aF 'vmgenid online' "$runtime/debug-serial.log"
+      - name: Boot x86-64 guest behind virtio-iommu
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/iommu"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm --iommu --desktop --audiodev none \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-iommu.out | tee "$runtime/inspector.log"
+          cat boot-iommu.out
+          grep -Fqx ok boot-iommu.out
+          grep -aF 'virtio-iommu online' "$runtime/debug-serial.log"
+          grep -aF 'virtio device confined to its own IOMMU domain' "$runtime/debug-serial.log"
+          grep -aF 'virtio-input online' "$runtime/debug-serial.log"
+          test "$(grep -cF 'virtio-input online' "$runtime/debug-serial.log")" -eq 3
+          ! grep -aF 'virtio-iommu reported a translation fault' "$runtime/debug-serial.log"
       - name: Boot x86-64 guest on two NUMA nodes
         timeout-minutes: 5
         shell: bash
