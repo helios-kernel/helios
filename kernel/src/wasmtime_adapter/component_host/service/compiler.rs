@@ -763,7 +763,9 @@ pub(super) fn copy_payload_and_trailer(
 
 /// Maps a WASI filesystem error while streaming an AOT artifact to a
 /// [`ProgramExecError`].
-fn map_aot_fs_error(error: fs_types::ErrorCode) -> ProgramExecError {
+pub(in crate::wasmtime_adapter::component_host) fn map_aot_fs_error(
+    error: fs_types::ErrorCode,
+) -> ProgramExecError {
     tracing::error!(
         ?error,
         "filesystem operation failed during AOT output write"
@@ -844,7 +846,7 @@ where
         if matches!(error, fs_types::ErrorCode::InsufficientMemory) {
             crate::wasmtime_adapter::store::request_oom_kill(
                 &store.context.runtime_state,
-                &store.context.instance_registry,
+                &store.context.registry,
                 &store.context.cpu,
                 destination.requester,
                 crate::MemoryPool::User,

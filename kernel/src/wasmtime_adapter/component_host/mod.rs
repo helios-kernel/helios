@@ -5895,7 +5895,7 @@ mod tests {
     /// memory failure.
     #[test]
     fn exec_maps_a_refused_frame_to_out_of_memory() {
-        let memory = super::map_fs_error_to_program_exec(
+        let memory = super::service::map_aot_fs_error(
             crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode::InsufficientMemory,
         );
         assert_eq!(memory.kind, crate::ProgramExecErrorKind::OutOfMemory);
