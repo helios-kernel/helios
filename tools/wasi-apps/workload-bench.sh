@@ -8,7 +8,7 @@ cargo_bin="${CARGO:-cargo}"
 arch="${HELIOS_WORKLOAD_BENCH_ARCH:-aarch64}"
 target_label="${HELIOS_WORKLOAD_BENCH_TARGET_LABEL:-${arch}-hvf}"
 iterations="${HELIOS_WORKLOAD_BENCH_ITERATIONS:-5}"
-inspector="${HELIOS_INSPECTOR_BIN:-target/release/helios-inspector}"
+inspector="${HELIOS_INSPECTOR_BIN:-target/release/helios}"
 manifest="${HELIOS_WORKLOAD_BENCH_MANIFEST:-tools/wasi-apps/workloads.json}"
 
 if [[ ! "${iterations}" =~ ^[0-9]+$ ]] || (( iterations == 0 )); then

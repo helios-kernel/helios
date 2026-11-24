@@ -7,6 +7,9 @@ pub mod process;
 pub mod random;
 pub mod sys;
 
+use core::future::Future;
+use core::pin::Pin;
+
 use nu_engine::CallExt;
 use nu_protocol::engine::{Closure, StateWorkingSet};
 use nu_protocol::{Category, Record, ShellError, Signature, SyntaxShape, Type, Value};
@@ -411,65 +414,69 @@ impl AsyncBuiltin {
     }
 
     /// Execute this command asynchronously against `ctx`.
-    pub async fn run_async<E: HeliosEnv>(
+    ///
+    /// Each arm is boxed individually so the 53-command dispatch boundary stays
+    /// 16 bytes on the caller's stack rather than combining every command
+    /// future into a single state machine.
+    pub fn run_async<'a, E: HeliosEnv>(
         self,
-        ctx: &mut AsyncCommandContext<'_, E>,
+        ctx: &'a mut AsyncCommandContext<'_, E>,
         input: AsyncPipelineData,
-    ) -> Result<AsyncPipelineData, ShellError> {
+    ) -> Pin<Box<dyn Future<Output = Result<AsyncPipelineData, ShellError>> + Send + 'a>> {
         match self {
-            Self::RunExternal => external::RunExternal.run_async(ctx, input).await,
-            Self::WithGrants => external::WithGrants.run_async(ctx, input).await,
-            Self::Which => external::Which.run_async(ctx, input).await,
-            Self::Sys => sys::Sys.run_async(ctx, input).await,
-            Self::SysCpu => sys::SysCpu.run_async(ctx, input).await,
-            Self::SysMem => sys::SysMem.run_async(ctx, input).await,
-            Self::SysNet => sys::SysNet.run_async(ctx, input).await,
-            Self::SysDisks => sys::SysDisks.run_async(ctx, input).await,
-            Self::SysHost => sys::SysHost.run_async(ctx, input).await,
-            Self::Inspect => process::HeliosInspect.run_async(ctx, input).await,
-            Self::Ps => process::Ps.run_async(ctx, input).await,
-            Self::Kill => process::Kill.run_async(ctx, input).await,
-            Self::Whoami => process::Whoami.run_async(ctx, input).await,
-            Self::Sleep => process::Sleep.run_async(ctx, input).await,
-            Self::Clear => process::Clear.run_async(ctx, input).await,
-            Self::WithScope => process::WithScope.run_async(ctx, input).await,
-            Self::WithSnapshot => process::WithSnapshot.run_async(ctx, input).await,
+            Self::RunExternal => Box::pin(external::RunExternal.run_async(ctx, input)),
+            Self::WithGrants => Box::pin(external::WithGrants.run_async(ctx, input)),
+            Self::Which => Box::pin(external::Which.run_async(ctx, input)),
+            Self::Sys => Box::pin(sys::Sys.run_async(ctx, input)),
+            Self::SysCpu => Box::pin(sys::SysCpu.run_async(ctx, input)),
+            Self::SysMem => Box::pin(sys::SysMem.run_async(ctx, input)),
+            Self::SysNet => Box::pin(sys::SysNet.run_async(ctx, input)),
+            Self::SysDisks => Box::pin(sys::SysDisks.run_async(ctx, input)),
+            Self::SysHost => Box::pin(sys::SysHost.run_async(ctx, input)),
+            Self::Inspect => Box::pin(process::HeliosInspect.run_async(ctx, input)),
+            Self::Ps => Box::pin(process::Ps.run_async(ctx, input)),
+            Self::Kill => Box::pin(process::Kill.run_async(ctx, input)),
+            Self::Whoami => Box::pin(process::Whoami.run_async(ctx, input)),
+            Self::Sleep => Box::pin(process::Sleep.run_async(ctx, input)),
+            Self::Clear => Box::pin(process::Clear.run_async(ctx, input)),
+            Self::WithScope => Box::pin(process::WithScope.run_async(ctx, input)),
+            Self::WithSnapshot => Box::pin(process::WithSnapshot.run_async(ctx, input)),
             Self::WithInstructionProfile => {
-                process::WithInstructionProfile.run_async(ctx, input).await
+                Box::pin(process::WithInstructionProfile.run_async(ctx, input))
             }
-            Self::Cd => fs::Cd.run_async(ctx, input).await,
-            Self::Ls => fs::Ls.run_async(ctx, input).await,
-            Self::Open => fs::Open.run_async(ctx, input).await,
-            Self::Save => fs::Save.run_async(ctx, input).await,
-            Self::Mkdir => fs::Mkdir.run_async(ctx, input).await,
-            Self::Rm => fs::Rm.run_async(ctx, input).await,
-            Self::Cp => fs::Cp.run_async(ctx, input).await,
-            Self::Mv => fs::Mv.run_async(ctx, input).await,
-            Self::Touch => fs::Touch.run_async(ctx, input).await,
-            Self::Glob => fs::Glob.run_async(ctx, input).await,
-            Self::Watch => fs::Watch.run_async(ctx, input).await,
-            Self::Http => http::Http.run_async(ctx, input).await,
-            Self::HttpGet => http::HttpGet.run_async(ctx, input).await,
-            Self::HttpPost => http::HttpPost.run_async(ctx, input).await,
-            Self::HttpPut => http::HttpPut.run_async(ctx, input).await,
-            Self::HttpPatch => http::HttpPatch.run_async(ctx, input).await,
-            Self::HttpDelete => http::HttpDelete.run_async(ctx, input).await,
-            Self::HttpHead => http::HttpHead.run_async(ctx, input).await,
-            Self::HttpOptions => http::HttpOptions.run_async(ctx, input).await,
-            Self::Random => random::Random.run_async(ctx, input).await,
-            Self::RandomInt => random::RandomInt.run_async(ctx, input).await,
-            Self::RandomFloat => random::RandomFloat.run_async(ctx, input).await,
-            Self::RandomBool => random::RandomBool.run_async(ctx, input).await,
-            Self::RandomChars => random::RandomChars.run_async(ctx, input).await,
-            Self::RandomBinary => random::RandomBinary.run_async(ctx, input).await,
-            Self::RandomUuid => random::RandomUuid.run_async(ctx, input).await,
-            Self::Do => AsyncDo.run_async(ctx, input).await,
-            Self::Each => AsyncEach.run_async(ctx, input).await,
-            Self::ParEach => AsyncParEach.run_async(ctx, input).await,
-            Self::Where => AsyncWhere.run_async(ctx, input).await,
-            Self::WithEnv => AsyncWithEnv.run_async(ctx, input).await,
-            Self::Complete => AsyncComplete.run_async(ctx, input).await,
-            Self::Print => AsyncPrint.run_async(ctx, input).await,
+            Self::Cd => Box::pin(fs::Cd.run_async(ctx, input)),
+            Self::Ls => Box::pin(fs::Ls.run_async(ctx, input)),
+            Self::Open => Box::pin(fs::Open.run_async(ctx, input)),
+            Self::Save => Box::pin(fs::Save.run_async(ctx, input)),
+            Self::Mkdir => Box::pin(fs::Mkdir.run_async(ctx, input)),
+            Self::Rm => Box::pin(fs::Rm.run_async(ctx, input)),
+            Self::Cp => Box::pin(fs::Cp.run_async(ctx, input)),
+            Self::Mv => Box::pin(fs::Mv.run_async(ctx, input)),
+            Self::Touch => Box::pin(fs::Touch.run_async(ctx, input)),
+            Self::Glob => Box::pin(fs::Glob.run_async(ctx, input)),
+            Self::Watch => Box::pin(fs::Watch.run_async(ctx, input)),
+            Self::Http => Box::pin(http::Http.run_async(ctx, input)),
+            Self::HttpGet => Box::pin(http::HttpGet.run_async(ctx, input)),
+            Self::HttpPost => Box::pin(http::HttpPost.run_async(ctx, input)),
+            Self::HttpPut => Box::pin(http::HttpPut.run_async(ctx, input)),
+            Self::HttpPatch => Box::pin(http::HttpPatch.run_async(ctx, input)),
+            Self::HttpDelete => Box::pin(http::HttpDelete.run_async(ctx, input)),
+            Self::HttpHead => Box::pin(http::HttpHead.run_async(ctx, input)),
+            Self::HttpOptions => Box::pin(http::HttpOptions.run_async(ctx, input)),
+            Self::Random => Box::pin(random::Random.run_async(ctx, input)),
+            Self::RandomInt => Box::pin(random::RandomInt.run_async(ctx, input)),
+            Self::RandomFloat => Box::pin(random::RandomFloat.run_async(ctx, input)),
+            Self::RandomBool => Box::pin(random::RandomBool.run_async(ctx, input)),
+            Self::RandomChars => Box::pin(random::RandomChars.run_async(ctx, input)),
+            Self::RandomBinary => Box::pin(random::RandomBinary.run_async(ctx, input)),
+            Self::RandomUuid => Box::pin(random::RandomUuid.run_async(ctx, input)),
+            Self::Do => Box::pin(AsyncDo.run_async(ctx, input)),
+            Self::Each => Box::pin(AsyncEach.run_async(ctx, input)),
+            Self::ParEach => Box::pin(AsyncParEach.run_async(ctx, input)),
+            Self::Where => Box::pin(AsyncWhere.run_async(ctx, input)),
+            Self::WithEnv => Box::pin(AsyncWithEnv.run_async(ctx, input)),
+            Self::Complete => Box::pin(AsyncComplete.run_async(ctx, input)),
+            Self::Print => Box::pin(AsyncPrint.run_async(ctx, input)),
         }
     }
 }

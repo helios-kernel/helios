@@ -303,7 +303,7 @@ class RunInfo(BaseModel):
         default=None,
         description=(
             "functions the `helios` kernel's profile-use build listed as uncovered "
-            "(`helios.pgo-uncovered.txt` beside the kernel image, docs/pgo.md); "
+            "(`helios-kernel.pgo-uncovered.txt` beside the kernel image, docs/pgo.md); "
             "None when the build was not a profile-use one or recorded no list"
         ),
     )

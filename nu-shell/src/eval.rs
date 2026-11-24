@@ -86,55 +86,57 @@ pub fn eval_block_async<'a, E: HeliosEnv>(
 }
 
 /// Evaluate a Nushell [`IrBlock`] directly with async dual dispatch.
-pub async fn eval_ir_async<E: HeliosEnv>(
-    engine_state: &EngineState,
-    stack: &mut Stack,
-    ir_block: &IrBlock,
+pub fn eval_ir_async<'a, E: HeliosEnv>(
+    engine_state: &'a EngineState,
+    stack: &'a mut Stack,
+    ir_block: &'a IrBlock,
     block_span: Option<Span>,
     input: AsyncPipelineData,
-    rt: &mut EvalRuntime<'_, E>,
-) -> Result<AsyncExecutionData, ShellError> {
-    stack.ir_scope_regions = ir_block.scope_regions.clone();
-    stack.ir_instruction_index = None;
+    rt: &'a mut EvalRuntime<'_, E>,
+) -> Pin<Box<dyn Future<Output = Result<AsyncExecutionData, ShellError>> + Send + 'a>> {
+    Box::pin(async move {
+        stack.ir_scope_regions = ir_block.scope_regions.clone();
+        stack.ir_instruction_index = None;
 
-    let args_base = stack.arguments.get_base();
-    let error_handler_base = stack.error_handlers.get_base();
+        let args_base = stack.arguments.get_base();
+        let error_handler_base = stack.error_handlers.get_base();
 
-    let mut registers = Vec::with_capacity(ir_block.register_count as usize);
-    for _ in 0..ir_block.register_count {
-        registers.push(AsyncExecutionData::empty());
-    }
-    let mut files = vec![None; ir_block.file_count as usize];
-    let mut record_items = vec![Vec::new(); ir_block.register_count as usize];
+        let mut registers = Vec::with_capacity(ir_block.register_count as usize);
+        for _ in 0..ir_block.register_count {
+            registers.push(AsyncExecutionData::empty());
+        }
+        let mut files = vec![None; ir_block.file_count as usize];
+        let mut record_items = vec![Vec::new(); ir_block.register_count as usize];
 
-    let mut ctx = AsyncEvalContext {
-        engine_state,
-        stack,
-        env: rt.env,
-        registry: rt.registry,
-        runtime_scope: rt.runtime_scope,
-        data: &ir_block.data,
-        block_span: &block_span,
-        args_base,
-        error_handler_base,
-        finally_resumes: Vec::new(),
-        redirect_out: None,
-        redirect_err: None,
-        redirect_out_file: None,
-        redirect_err_file: None,
-        matches: Vec::new(),
-        registers: &mut registers[..],
-        files: &mut files[..],
-        record_items: &mut record_items[..],
-    };
+        let mut ctx = AsyncEvalContext {
+            engine_state,
+            stack,
+            env: rt.env,
+            registry: rt.registry,
+            runtime_scope: rt.runtime_scope,
+            data: &ir_block.data,
+            block_span: &block_span,
+            args_base,
+            error_handler_base,
+            finally_resumes: Vec::new(),
+            redirect_out: None,
+            redirect_err: None,
+            redirect_out_file: None,
+            redirect_err_file: None,
+            matches: Vec::new(),
+            registers: &mut registers[..],
+            files: &mut files[..],
+            record_items: &mut record_items[..],
+        };
 
-    let result = eval_ir_loop(&mut ctx, ir_block, input).await;
+        let result = eval_ir_loop(&mut ctx, ir_block, input).await;
 
-    ctx.stack.error_handlers.leave_frame(error_handler_base);
-    ctx.stack.arguments.leave_frame(args_base);
-    ctx.stack.ir_instruction_index = None;
+        ctx.stack.error_handlers.leave_frame(error_handler_base);
+        ctx.stack.arguments.leave_frame(args_base);
+        ctx.stack.ir_instruction_index = None;
 
-    result
+        result
+    })
 }
 
 /// Evaluate a Nushell [`Closure`] asynchronously with positional arguments and pipeline input.
@@ -259,6 +261,24 @@ pub fn eval_call_by_name_async<'a, E: HeliosEnv>(
                 runtime_scope: rt.runtime_scope,
             };
             let output = async_cmd.run_async(&mut cmd_ctx, input).await?;
+            return Ok(Some(output));
+        }
+
+        if let Some(custom_name) = rt.registry.get_custom(decl_id) {
+            let call = Call::build(decl_id, head).finish();
+            let engine_call = (&call).into();
+            let mut cmd_ctx = AsyncCommandContext {
+                engine_state,
+                stack,
+                call: &engine_call,
+                env: rt.env,
+                registry: rt.registry,
+                runtime_scope: rt.runtime_scope,
+            };
+            let output = rt
+                .env
+                .run_custom_command(custom_name, &mut cmd_ctx, input)
+                .await?;
             return Ok(Some(output));
         }
 
@@ -475,7 +495,37 @@ async fn eval_ir_loop<E: HeliosEnv>(
 
         ctx.stack.ir_instruction_index = Some(pc);
 
-        let result = eval_instruction_async(ctx, instruction, span, need_backtrace).await;
+        let result = match instruction {
+            Instruction::Call { decl_id, src_dst } => {
+                match instruction.check_interrupt(ctx.engine_state, span) {
+                    Ok(()) => {
+                        let input = ctx.take_reg(*src_dst);
+                        match eval_call_async(ctx, *decl_id, *span, input.body).await {
+                            Ok(mut call_result) => {
+                                if need_backtrace
+                                    && let AsyncPipelineData::Sync(sync_data) = &mut call_result
+                                {
+                                    match sync_data {
+                                        PipelineData::ByteStream(s, ..) => {
+                                            s.push_caller_span(*span)
+                                        }
+                                        PipelineData::ListStream(s, ..) => {
+                                            s.push_caller_span(*span)
+                                        }
+                                        _ => (),
+                                    }
+                                }
+                                ctx.put_reg(*src_dst, AsyncExecutionData::from_body(call_result));
+                                Ok(InstructionResult::Continue)
+                            }
+                            Err(err) => Err(err),
+                        }
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            _ => eval_instruction_async(ctx, instruction, span).await,
+        };
 
         let unwind = match result {
             Ok(InstructionResult::Continue) => {
@@ -526,7 +576,14 @@ async fn eval_ir_loop<E: HeliosEnv>(
             Err(err) => Unwind::Error(err.into_spanned(*span)),
         };
 
-        match unwind_through_handlers_async(ctx, unwind, *span, need_backtrace).await {
+        match Box::pin(unwind_through_handlers_async(
+            ctx,
+            unwind,
+            *span,
+            need_backtrace,
+        ))
+        .await
+        {
             Unwound::Branch(next_pc) => pc = next_pc,
             Unwound::Return(result) => return *result,
         }
@@ -637,11 +694,18 @@ fn prepare_error_handler<E: HeliosEnv>(
     }
 }
 
-async fn eval_instruction_async<E: HeliosEnv>(
+fn eval_instruction_async<'a, E: HeliosEnv>(
+    ctx: &'a mut AsyncEvalContext<'_, E>,
+    instruction: &'a Instruction,
+    span: &'a Span,
+) -> Pin<Box<dyn Future<Output = Result<InstructionResult, ShellError>> + Send + 'a>> {
+    Box::pin(eval_instruction_inner(ctx, instruction, span))
+}
+
+async fn eval_instruction_inner<E: HeliosEnv>(
     ctx: &mut AsyncEvalContext<'_, E>,
     instruction: &Instruction,
     span: &Span,
-    need_backtrace: bool,
 ) -> Result<InstructionResult, ShellError> {
     use InstructionResult::{Branch, Continue, EndFinally, Return, ReturnEarly, UnwindJump};
 
@@ -950,18 +1014,8 @@ async fn eval_instruction_async<E: HeliosEnv>(
                 })
             }
         }
-        Instruction::Call { decl_id, src_dst } => {
-            let input = ctx.take_reg(*src_dst);
-            let mut result = eval_call_async(ctx, *decl_id, *span, input.body).await?;
-            if need_backtrace && let AsyncPipelineData::Sync(sync_data) = &mut result {
-                match sync_data {
-                    PipelineData::ByteStream(s, ..) => s.push_caller_span(*span),
-                    PipelineData::ListStream(s, ..) => s.push_caller_span(*span),
-                    _ => (),
-                }
-            }
-            ctx.put_reg(*src_dst, AsyncExecutionData::from_body(result));
-            Ok(Continue)
+        Instruction::Call { .. } => {
+            unreachable!("Instruction::Call is dispatched directly by eval_ir_loop")
         }
         Instruction::StringAppend { src_dst, val } => {
             let string_value = ctx.collect_reg(*src_dst, *span).await?;
@@ -1531,7 +1585,16 @@ async fn binary_op_async<E: HeliosEnv>(
     Ok(InstructionResult::Continue)
 }
 
-async fn eval_call_async<E: HeliosEnv>(
+fn eval_call_async<'a, E: HeliosEnv>(
+    ctx: &'a mut AsyncEvalContext<'_, E>,
+    decl_id: DeclId,
+    head: Span,
+    input: AsyncPipelineData,
+) -> Pin<Box<dyn Future<Output = Result<AsyncPipelineData, ShellError>> + Send + 'a>> {
+    Box::pin(eval_call_inner(ctx, decl_id, head, input))
+}
+
+async fn eval_call_inner<E: HeliosEnv>(
     ctx: &mut AsyncEvalContext<'_, E>,
     decl_id: DeclId,
     head: Span,
@@ -1578,6 +1641,27 @@ async fn eval_call_async<E: HeliosEnv>(
         other => other,
     }?;
 
+    if out_file_num.is_none() && err_file_num.is_none() {
+        return Ok(result);
+    }
+
+    Box::pin(apply_file_redirections_async(
+        ctx,
+        result,
+        out_file_num,
+        err_file_num,
+        head,
+    ))
+    .await
+}
+
+async fn apply_file_redirections_async<E: HeliosEnv>(
+    ctx: &mut AsyncEvalContext<'_, E>,
+    result: AsyncPipelineData,
+    out_file_num: Option<u32>,
+    err_file_num: Option<u32>,
+    head: Span,
+) -> Result<AsyncPipelineData, ShellError> {
     // Handle file redirections (`o>`, `o>>`, `e>`, `e>>`, `o+e>`, `o+e>>`) through HeliosEnv.
     match (out_file_num, err_file_num) {
         (Some(out_num), Some(err_num)) if out_num == err_num => {
@@ -1728,94 +1812,113 @@ async fn write_redirect_slot<E: HeliosEnv>(
     Ok(())
 }
 
-async fn eval_call_frame_async<E: HeliosEnv>(
-    engine_state: &EngineState,
-    caller_stack: &mut Stack,
-    rt: &mut EvalRuntime<'_, E>,
+fn eval_call_frame_async<'a, E: HeliosEnv>(
+    engine_state: &'a EngineState,
+    caller_stack: &'a mut Stack,
+    rt: &'a mut EvalRuntime<'_, E>,
     decl_id: DeclId,
     head: Span,
     (args_base, args_len): (usize, usize),
     input: AsyncPipelineData,
-) -> Result<AsyncPipelineData, ShellError> {
-    let decl = engine_state.get_decl(decl_id);
-    if let Some(block_id) = decl.block_id() {
-        let block = engine_state.get_block(block_id);
-        check_async_input_types(&input, &block.signature, head)?;
-        let args_len =
-            normalize_call_arguments(&block.signature, caller_stack, args_base, args_len)?;
-        let mut callee_stack = caller_stack.gather_captures(engine_state, &block.captures);
-        gather_arguments(
-            engine_state,
-            block,
-            caller_stack,
-            &mut callee_stack,
+) -> Pin<Box<dyn Future<Output = Result<AsyncPipelineData, ShellError>> + Send + 'a>> {
+    Box::pin(async move {
+        let decl = engine_state.get_decl(decl_id);
+        if let Some(block_id) = decl.block_id() {
+            let block = engine_state.get_block(block_id);
+            check_async_input_types(&input, &block.signature, head)?;
+            let args_len =
+                normalize_call_arguments(&block.signature, caller_stack, args_base, args_len)?;
+            let mut callee_stack = caller_stack.gather_captures(engine_state, &block.captures);
+            gather_arguments(
+                engine_state,
+                block,
+                caller_stack,
+                &mut callee_stack,
+                args_base,
+                args_len,
+                head,
+            )?;
+            let mut callee_stack =
+                callee_stack.with_invocation_stdout(caller_stack.stdout().clone());
+            callee_stack.recursion_count += 1;
+
+            let result = eval_block_async(engine_state, &mut callee_stack, block, input, rt)
+                .await
+                .map(|exec| exec.body);
+
+            if block.redirect_env {
+                redirect_env(engine_state, caller_stack, &callee_stack);
+            }
+            return result;
+        }
+
+        let signature = engine_state.get_signature_cached(decl_id);
+        let allow_error_input = matches!(
+            input,
+            AsyncPipelineData::Value(Value::Error { .. }, ..)
+                | AsyncPipelineData::Sync(PipelineData::Value(Value::Error { .. }, ..))
+        ) && engine_state
+            .find_decl(b"ignore", &[])
+            .is_some_and(|ignore_decl_id| ignore_decl_id == decl_id);
+        if !allow_error_input {
+            check_async_input_types(&input, &signature, head)?;
+        }
+
+        let args_len = normalize_call_arguments(&signature, caller_stack, args_base, args_len)?;
+        let span = Span::merge_many(
+            std::iter::once(head).chain(
+                caller_stack
+                    .arguments
+                    .get_args(args_base, args_len)
+                    .iter()
+                    .flat_map(|arg| arg.span()),
+            ),
+        );
+        let call = Call {
+            decl_id,
+            head,
+            span,
             args_base,
             args_len,
-            head,
-        )?;
-        let mut callee_stack = callee_stack.with_invocation_stdout(caller_stack.stdout().clone());
-        callee_stack.recursion_count += 1;
-
-        let result = eval_block_async(engine_state, &mut callee_stack, block, input, rt)
-            .await
-            .map(|exec| exec.body);
-
-        if block.redirect_env {
-            redirect_env(engine_state, caller_stack, &callee_stack);
-        }
-        return result;
-    }
-
-    let signature = engine_state.get_signature_cached(decl_id);
-    let allow_error_input = matches!(
-        input,
-        AsyncPipelineData::Value(Value::Error { .. }, ..)
-            | AsyncPipelineData::Sync(PipelineData::Value(Value::Error { .. }, ..))
-    ) && engine_state
-        .find_decl(b"ignore", &[])
-        .is_some_and(|ignore_decl_id| ignore_decl_id == decl_id);
-    if !allow_error_input {
-        check_async_input_types(&input, &signature, head)?;
-    }
-
-    let args_len = normalize_call_arguments(&signature, caller_stack, args_base, args_len)?;
-    let span = Span::merge_many(
-        std::iter::once(head).chain(
-            caller_stack
-                .arguments
-                .get_args(args_base, args_len)
-                .iter()
-                .flat_map(|arg| arg.span()),
-        ),
-    );
-    let call = Call {
-        decl_id,
-        head,
-        span,
-        args_base,
-        args_len,
-    };
-
-    if let Some(async_cmd) = rt.registry.get(decl_id) {
-        let engine_call = (&call).into();
-        let mut cmd_ctx = AsyncCommandContext {
-            engine_state,
-            stack: caller_stack,
-            call: &engine_call,
-            env: rt.env,
-            registry: rt.registry,
-            runtime_scope: rt.runtime_scope,
         };
-        return async_cmd.run_async(&mut cmd_ctx, input).await;
-    }
 
-    // Pure in-memory synchronous Nushell command (`nu-command` / `nu-cmd-lang`).
-    let mut sync_input = input.into_sync_pipeline_data(head).await?;
-    if let PipelineData::Value(v, ..) = &mut sync_input {
-        v.inject_signals(engine_state);
-    }
-    let output = decl.run(engine_state, caller_stack, &(&call).into(), sync_input)?;
-    Ok(AsyncPipelineData::from(output))
+        if let Some(async_cmd) = rt.registry.get(decl_id) {
+            let engine_call = (&call).into();
+            let mut cmd_ctx = AsyncCommandContext {
+                engine_state,
+                stack: caller_stack,
+                call: &engine_call,
+                env: rt.env,
+                registry: rt.registry,
+                runtime_scope: rt.runtime_scope,
+            };
+            return async_cmd.run_async(&mut cmd_ctx, input).await;
+        }
+
+        if let Some(custom_name) = rt.registry.get_custom(decl_id) {
+            let engine_call = (&call).into();
+            let mut cmd_ctx = AsyncCommandContext {
+                engine_state,
+                stack: caller_stack,
+                call: &engine_call,
+                env: rt.env,
+                registry: rt.registry,
+                runtime_scope: rt.runtime_scope,
+            };
+            return rt
+                .env
+                .run_custom_command(custom_name, &mut cmd_ctx, input)
+                .await;
+        }
+
+        // Pure in-memory synchronous Nushell command (`nu-command` / `nu-cmd-lang`).
+        let mut sync_input = input.into_sync_pipeline_data(head).await?;
+        if let PipelineData::Value(v, ..) = &mut sync_input {
+            v.inject_signals(engine_state);
+        }
+        let output = decl.run(engine_state, caller_stack, &(&call).into(), sync_input)?;
+        Ok(AsyncPipelineData::from(output))
+    })
 }
 
 async fn eval_iterate_async<E: HeliosEnv>(

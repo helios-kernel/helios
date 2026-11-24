@@ -1219,7 +1219,7 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     qemu_bin: DEFAULT_AARCH64_QEMU_BIN,
     cargo_target: "aarch64-unknown-none",
     machine: AARCH64_VIRT_MACHINE,
-    kernel_artifact_name: "helios",
+    kernel_artifact_name: "helios-kernel",
     default_smp: DEFAULT_AARCH64_SMP,
     default_memory: DEFAULT_AARCH64_MEMORY,
     default_bios: None,
@@ -1255,7 +1255,7 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     qemu_bin: DEFAULT_AARCH64_QEMU_BIN,
     cargo_target: "aarch64-unknown-none",
     machine: AARCH64_VIRT_MACHINE,
-    kernel_artifact_name: "helios",
+    kernel_artifact_name: "helios-kernel",
     default_smp: DEFAULT_AARCH64_SMP,
     default_memory: DEFAULT_AARCH64_MEMORY,
     default_bios: None,
@@ -1290,7 +1290,7 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     qemu_bin: DEFAULT_RISCV_QEMU_BIN,
     cargo_target: "riscv64gc-unknown-none-elf",
     machine: "virt",
-    kernel_artifact_name: "helios",
+    kernel_artifact_name: "helios-kernel",
     default_smp: DEFAULT_RISCV_SMP,
     default_memory: DEFAULT_RISCV_MEMORY,
     default_bios: Some("default"),
@@ -1327,7 +1327,7 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     qemu_bin: DEFAULT_X86_QEMU_BIN,
     cargo_target: "x86_64-unknown-none",
     machine: "q35",
-    kernel_artifact_name: "helios",
+    kernel_artifact_name: "helios-kernel",
     default_smp: DEFAULT_X86_SMP,
     default_memory: DEFAULT_X86_MEMORY,
     default_bios: None,
@@ -2176,12 +2176,30 @@ pub(crate) struct VmCommand {
 
 #[derive(Debug, Subcommand)]
 enum VmSessionCommand {
+    /// Start the interactive host Nushell REPL (with live <Tab> completion), `-c`, or `<script.nu>`.
+    #[command(visible_alias = "repl")]
+    Nu(crate::ops_cli::NuCommand),
+    /// Run the symmetric Python entrypoint against this VM.
+    Python(crate::ops_cli::PythonCommand),
+    /// Query `/kernel/*` and component inspect state (`--watch`, `--diff`).
+    Inspect(crate::ops_cli::InspectCommand),
+    /// List running instances / components (`--tree`).
+    Ps(crate::ops_cli::PsCommand),
+    /// Stop a live instance by ID or name.
+    Kill(crate::ops_cli::KillCommand),
+    /// Fetch or stream (`--follow`) guest tracing events.
+    Trace(crate::ops_cli::TraceCommand),
+    /// Spawn or execute a remote program with streaming stdio.
+    Spawn(crate::ops_cli::SpawnCommand),
+    /// Collect a `.tar.zst` diagnostic bundle.
+    Bundle(crate::ops_cli::BundleCommand),
+    /// Export inspect metrics to Prometheus and/or OTLP/HTTP via `zenwave`.
+    Bridge(crate::ops_cli::BridgeCommand),
     Shell(crate::ShellCommand),
     Tracing(crate::TracingCommand),
     Stats,
     /// List the live program instances, and optionally stop one.
     Instances(crate::InstancesCommand),
-    Repl(crate::ReplCommand),
     AotBench(AotBenchCommand),
     WorkloadBench(WorkloadBenchCommand),
     /// Move the guest's memory balloon and watch the guest follow.
@@ -2602,7 +2620,10 @@ impl ResolvedVmSessionCommand {
     }
 }
 
-pub(crate) fn run(mut command: VmCommand) -> Result<(), VmError> {
+pub(crate) fn run(
+    mut command: VmCommand,
+    ops: crate::ops_cli::GlobalOpsFlags,
+) -> Result<(), VmError> {
     // The privileged network helpers provision the host, they do not boot
     // a guest, so they are dispatched before any build or QEMU work.
     match command.command.take() {
@@ -2692,7 +2713,7 @@ pub(crate) fn run(mut command: VmCommand) -> Result<(), VmError> {
         .kill_after_lines
         .as_ref()
         .map(|kill| kill.watch(runtime.child.id()));
-    let result = connect_and_run(&command, &mut runtime);
+    let result = connect_and_run(&command, &mut runtime, &ops);
     drop(kill_watch);
     let runtime_dir = runtime.runtime_dir_path().display().to_string();
     // QEMU's own log is the only account of a machine it refused to
@@ -3964,6 +3985,7 @@ fn export_trusted_root_public_key<'a>(
 fn connect_and_run(
     command: &ResolvedVmCommand,
     runtime: &mut VmRuntime,
+    ops: &crate::ops_cli::GlobalOpsFlags,
 ) -> Result<(), VmSessionError> {
     let qmp_socket = runtime.qmp_socket.clone();
     let vnc_socket = runtime.vnc_socket.clone();
@@ -3974,24 +3996,29 @@ fn connect_and_run(
         runtime.debug_serial_log.clone(),
         command.kernel.clone(),
     );
-    let client = match runtime.take_transport()? {
+    let (client, target_uri) = match runtime.take_transport()? {
         VmTransport::SerialSocket(socket_path) => {
             let socket = socket_path
                 .to_str()
                 .ok_or_else(|| VmSessionError::SocketPathNotUtf8 {
                     path: socket_path.display().to_string(),
                 })?;
-            connect_client(socket, command.baud, true)
-                .map_err(|source| VmSessionError::Connect { over: "", source })?
+            let uri = format!("serial://{socket}?baud={}", command.baud);
+            let client = connect_client(socket, command.baud, true)
+                .map_err(|source| VmSessionError::Connect { over: "", source })?;
+            (client, Some(uri))
         }
-        VmTransport::SerialIo(io) => crate::runtime::block_on(async move {
-            crate::ready::connect_after_boot(io)
-                .await
-                .map_err(|error| VmSessionError::Connect {
-                    over: " over QEMU stdio serial",
-                    source: ConnectError::from(error),
+        VmTransport::SerialIo(io) => {
+            let client = crate::runtime::block_on(async move {
+                crate::ready::connect_after_boot(io).await.map_err(|error| {
+                    VmSessionError::Connect {
+                        over: " over QEMU stdio serial",
+                        source: ConnectError::from(error),
+                    }
                 })
-        })?,
+            })?;
+            (client, None)
+        }
         VmTransport::VsockAfterSerial {
             serial_socket,
             guest_cid,
@@ -4003,7 +4030,11 @@ fn connect_and_run(
                         path: serial_socket.display().to_string(),
                     })?;
             let baud = command.baud;
-            crate::runtime::block_on(async move {
+            let uri = format!(
+                "vsock://{guest_cid}:{}",
+                helios_inspector_protocol::VSOCK_RPC_PORT
+            );
+            let client = crate::runtime::block_on(async move {
                 let io = crate::serial::open(socket, baud)
                     .await
                     .map_err(ConnectError::from)?;
@@ -4034,7 +4065,8 @@ fn connect_and_run(
                     over: " over vsock",
                     source,
                 },
-            })?
+            })?;
+            (client, Some(uri))
         }
     };
     // Diagnostic targets open before the session action so its launches
@@ -4089,10 +4121,13 @@ fn connect_and_run(
         Some(ResolvedVmSessionCommand::Profile(profile)) => {
             crate::run_interruptible(async move { Ok(raw_profile::run(&client, &profile).await?) })
         }
-        Some(ResolvedVmSessionCommand::Session(command)) => {
-            Ok(run_connected(client, Some(command))?)
-        }
-        None => Ok(run_connected(client, None)?),
+        Some(ResolvedVmSessionCommand::Session(command)) => Ok(run_connected(
+            client,
+            Some(command),
+            ops,
+            target_uri.as_deref(),
+        )?),
+        None => Ok(run_connected(client, None, ops, target_uri.as_deref())?),
     }
 }
 
@@ -7368,13 +7403,21 @@ fn configure_watchdog(qemu: &mut Command, watchdog: VmWatchdogProfile) {
 impl From<VmSessionCommand> for ResolvedVmSessionCommand {
     fn from(value: VmSessionCommand) -> Self {
         match value {
+            VmSessionCommand::Nu(command) => Self::Session(SessionCommand::Nu(command)),
+            VmSessionCommand::Python(command) => Self::Session(SessionCommand::Python(command)),
+            VmSessionCommand::Inspect(command) => Self::Session(SessionCommand::Inspect(command)),
+            VmSessionCommand::Ps(command) => Self::Session(SessionCommand::Ps(command)),
+            VmSessionCommand::Kill(command) => Self::Session(SessionCommand::Kill(command)),
+            VmSessionCommand::Trace(command) => Self::Session(SessionCommand::Trace(command)),
+            VmSessionCommand::Spawn(command) => Self::Session(SessionCommand::Spawn(command)),
+            VmSessionCommand::Bundle(command) => Self::Session(SessionCommand::Bundle(command)),
+            VmSessionCommand::Bridge(command) => Self::Session(SessionCommand::Bridge(command)),
             VmSessionCommand::Shell(command) => Self::Session(SessionCommand::Shell(command)),
             VmSessionCommand::Tracing(command) => Self::Session(SessionCommand::Tracing(command)),
             VmSessionCommand::Stats => Self::Session(SessionCommand::Stats),
             VmSessionCommand::Instances(command) => {
                 Self::Session(SessionCommand::Instances(command))
             }
-            VmSessionCommand::Repl(command) => Self::Session(SessionCommand::Repl(command)),
             VmSessionCommand::AotBench(command) => Self::AotBench(command),
             VmSessionCommand::WorkloadBench(command) => Self::WorkloadBench(command),
             VmSessionCommand::Balloon(command) => Self::Balloon(command),
@@ -9023,7 +9066,7 @@ mod tests {
     #[test]
     fn the_uncovered_list_lands_beside_the_kernel_and_carries_the_counts() {
         let directory = tempfile::tempdir().expect("a temporary target directory");
-        let kernel = directory.path().join("profile-use").join("helios");
+        let kernel = directory.path().join("profile-use").join("helios-kernel");
         fs::create_dir_all(kernel.parent().expect("the kernel's directory"))
             .expect("the build directory cargo made");
         let (uncovered, _functions, coverage) = coverage_fixture();
@@ -9034,7 +9077,7 @@ mod tests {
             list,
             directory
                 .path()
-                .join("profile-use/helios.pgo-uncovered.txt")
+                .join("profile-use/helios-kernel.pgo-uncovered.txt")
         );
         let document = fs::read_to_string(&list).expect("the list was written");
         assert!(

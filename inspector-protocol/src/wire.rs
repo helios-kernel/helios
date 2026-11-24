@@ -102,6 +102,52 @@ pub async fn read_frame<T>(io: &mut T) -> io::Result<Option<Frame>>
 where
     T: AsyncRead + Unpin,
 {
+    #[cfg(feature = "host")]
+    let echo = core::sync::atomic::AtomicBool::new(true);
+    #[cfg(feature = "host")]
+    return read_frame_with_echo(io, &echo).await;
+    #[cfg(not(feature = "host"))]
+    read_frame_inner(io).await
+}
+
+/// Reads the next framed RPC message while gating host-side stderr echoing of
+/// interleaved guest serial console lines on `echo_remote_serial`.
+///
+/// Guest panic detection (`GUEST_PANIC_MARKER`) always remains active even
+/// when echoing is muted for an interactive terminal session.
+#[cfg(feature = "host")]
+pub async fn read_frame_with_echo<T>(
+    io: &mut T,
+    echo_remote_serial: &core::sync::atomic::AtomicBool,
+) -> io::Result<Option<Frame>>
+where
+    T: AsyncRead + Unpin,
+{
+    if !sync_to_frame(io, echo_remote_serial).await? {
+        return Ok(None);
+    }
+
+    let mut len = [0_u8; 4];
+    read_exact(io, &mut len).await?;
+    let len = u32::from_le_bytes(len) as usize;
+    if len > MAX_FRAME_SIZE {
+        return Err(WireError::FrameTooLarge {
+            len,
+            max: MAX_FRAME_SIZE,
+        }
+        .into());
+    }
+
+    let mut payload = vec![0_u8; len];
+    read_exact(io, &mut payload).await?;
+    Ok(Some(decode_frame(&payload)?))
+}
+
+#[cfg(not(feature = "host"))]
+async fn read_frame_inner<T>(io: &mut T) -> io::Result<Option<Frame>>
+where
+    T: AsyncRead + Unpin,
+{
     if !sync_to_frame(io).await? {
         return Ok(None);
     }
@@ -122,7 +168,10 @@ where
     Ok(Some(decode_frame(&payload)?))
 }
 
-async fn sync_to_frame<T>(io: &mut T) -> io::Result<bool>
+async fn sync_to_frame<T>(
+    io: &mut T,
+    #[cfg(feature = "host")] echo_remote_serial: &core::sync::atomic::AtomicBool,
+) -> io::Result<bool>
 where
     T: AsyncRead + Unpin,
 {
@@ -136,12 +185,20 @@ where
         match std::future::poll_fn(|cx| Pin::new(&mut *io).poll_read(cx, &mut byte)).await {
             Ok(0) if matched == 0 => {
                 #[cfg(feature = "host")]
-                flush_stray_bytes(&mut stray, &mut console)?;
+                flush_stray_bytes(
+                    &mut stray,
+                    &mut console,
+                    echo_remote_serial.load(core::sync::atomic::Ordering::Acquire),
+                )?;
                 return Ok(false);
             }
             Ok(0) => {
                 #[cfg(feature = "host")]
-                flush_stray_bytes(&mut stray, &mut console)?;
+                flush_stray_bytes(
+                    &mut stray,
+                    &mut console,
+                    echo_remote_serial.load(core::sync::atomic::Ordering::Acquire),
+                )?;
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "truncated frame header",
@@ -155,7 +212,11 @@ where
             matched += 1;
             if matched == FRAME_MAGIC.len() {
                 #[cfg(feature = "host")]
-                flush_stray_bytes(&mut stray, &mut console)?;
+                flush_stray_bytes(
+                    &mut stray,
+                    &mut console,
+                    echo_remote_serial.load(core::sync::atomic::Ordering::Acquire),
+                )?;
                 return Ok(true);
             }
         } else {
@@ -165,7 +226,11 @@ where
                     stray.extend_from_slice(&FRAME_MAGIC[..matched]);
                 }
                 stray.push(byte[0]);
-                flush_stray_bytes_on_newline(&mut stray, &mut console)?;
+                flush_stray_bytes_on_newline(
+                    &mut stray,
+                    &mut console,
+                    echo_remote_serial.load(core::sync::atomic::Ordering::Acquire),
+                )?;
                 if stray.len() > MAX_CONSOLE_LINE_BYTES {
                     return Err(WireError::ConsoleLineTooLong {
                         max: MAX_CONSOLE_LINE_BYTES,
@@ -229,51 +294,59 @@ fn printable_console_line(line: &[u8]) -> String {
 }
 
 #[cfg(feature = "host")]
-fn flush_stray_bytes_on_newline(stray: &mut Vec<u8>, console: &mut GuestConsole) -> io::Result<()> {
+fn flush_stray_bytes_on_newline(
+    stray: &mut Vec<u8>,
+    console: &mut GuestConsole,
+    echo: bool,
+) -> io::Result<()> {
     if stray
         .last()
         .is_some_and(|byte| matches!(*byte, b'\n' | b'\r'))
     {
-        flush_stray_bytes(stray, console)?;
+        flush_stray_bytes(stray, console, echo)?;
     }
     Ok(())
 }
 
 #[cfg(feature = "host")]
-fn flush_stray_bytes(stray: &mut Vec<u8>, console: &mut GuestConsole) -> io::Result<()> {
+fn flush_stray_bytes(
+    stray: &mut Vec<u8>,
+    console: &mut GuestConsole,
+    echo: bool,
+) -> io::Result<()> {
     if stray.is_empty() {
         return Ok(());
     }
 
     let report = console.read(&printable_console_line(stray));
 
-    let mut stderr = std::io::stderr().lock();
-    stderr.write_all(b"helios-inspector: remote serial: ")?;
-    for &byte in stray.iter() {
-        match byte {
-            b'\n' => stderr.write_all(b"\\n")?,
-            b'\r' => stderr.write_all(b"\\r")?,
-            b'\t' => stderr.write_all(b"\\t")?,
-            0x20..=0x7e => stderr.write_all(&[byte])?,
-            other => {
-                let encoded = [
-                    b'\\',
-                    b'x',
-                    HEX[(other >> 4) as usize],
-                    HEX[(other & 0x0f) as usize],
-                ];
-                stderr.write_all(&encoded)?;
+    if echo {
+        let mut stderr = std::io::stderr().lock();
+        stderr.write_all(b"helios-inspector: remote serial: ")?;
+        for &byte in stray.iter() {
+            match byte {
+                b'\n' => stderr.write_all(b"\\n")?,
+                b'\r' => stderr.write_all(b"\\r")?,
+                b'\t' => stderr.write_all(b"\\t")?,
+                0x20..=0x7e => stderr.write_all(&[byte])?,
+                other => {
+                    let encoded = [
+                        b'\\',
+                        b'x',
+                        HEX[(other >> 4) as usize],
+                        HEX[(other & 0x0f) as usize],
+                    ];
+                    stderr.write_all(&encoded)?;
+                }
             }
         }
+        stderr.write_all(b"\n")?;
+        stderr.flush()?;
     }
-    stderr.write_all(b"\n")?;
-    stderr.flush()?;
     stray.clear();
-    drop(stderr);
 
-    // The line is echoed before it is judged: a panic report is the last
-    // thing the guest ever says, and it has to reach the log even though
-    // it also ends the session.
+    // The line is echoed (when enabled) before it is judged: a panic report
+    // is the last thing the guest ever says, and it ends the session either way.
     match report {
         Some(report) => Err(crate::error::TransportError::GuestPanicked { report }.into()),
         None => Ok(()),
@@ -794,7 +867,9 @@ unhandled x86 kernel exception after Wasmtime dispatch: fault details / Kernel p
         let mut error = None;
         for line in PANIC_LINES {
             let mut stray = line.to_vec();
-            error = flush_stray_bytes(&mut stray, &mut console).err().or(error);
+            error = flush_stray_bytes(&mut stray, &mut console, false)
+                .err()
+                .or(error);
         }
         let error = error.expect("a panic must end the read");
         let transport = error
@@ -875,7 +950,8 @@ unhandled x86 kernel exception after Wasmtime dispatch: fault details / Kernel p
     #[test]
     fn an_unterminated_console_line_is_refused() {
         let input = vec![b'x'; MAX_CONSOLE_LINE_BYTES + 1];
-        let error = futures_lite::future::block_on(sync_to_frame(&mut input.as_slice()))
+        let echo = core::sync::atomic::AtomicBool::new(false);
+        let error = futures_lite::future::block_on(sync_to_frame(&mut input.as_slice(), &echo))
             .expect_err("the line never ends");
         assert_eq!(
             wire_error(&error),
@@ -889,7 +965,8 @@ unhandled x86 kernel exception after Wasmtime dispatch: fault details / Kernel p
     fn a_console_line_at_the_maximum_is_accepted() {
         let mut input = vec![b'x'; MAX_CONSOLE_LINE_BYTES - 1];
         input.push(b'\n');
-        let found = futures_lite::future::block_on(sync_to_frame(&mut input.as_slice()))
+        let echo = core::sync::atomic::AtomicBool::new(false);
+        let found = futures_lite::future::block_on(sync_to_frame(&mut input.as_slice(), &echo))
             .expect("a line within the bound is console output");
         assert!(!found, "no frame header was present");
     }
@@ -898,7 +975,8 @@ unhandled x86 kernel exception after Wasmtime dispatch: fault details / Kernel p
     fn a_flushed_console_line_leaves_the_session_alone() {
         let mut console = GuestConsole::default();
         let mut stray = b"INFO [helios_kernel] Kernel is ready\n".to_vec();
-        flush_stray_bytes(&mut stray, &mut console).expect("an ordinary line is not a fault");
+        flush_stray_bytes(&mut stray, &mut console, false)
+            .expect("an ordinary line is not a fault");
         assert!(stray.is_empty());
     }
 

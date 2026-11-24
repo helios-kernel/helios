@@ -93,7 +93,7 @@ frame into it. The action also takes a QMP socket on its own, for
 `--input` and `--kill-instance`.
 
 ```bash
-./target/release/helios-inspector vm --arch x86-64 --release --accel kvm \
+./target/release/helios vm --arch x86-64 --release --accel kvm \
     --desktop --display none \
     screendump target/probe/desktop.png
 ```
@@ -131,7 +131,7 @@ in. `--interval-ms <n>` waits between statements when the guest redraws
 between them.
 
 ```bash
-./target/release/helios-inspector vm --arch x86-64 --release --accel kvm \
+./target/release/helios vm --arch x86-64 --release --accel kvm \
     --desktop input target/probe/desktop.input
 ```
 
@@ -186,7 +186,7 @@ same `--run` options `screendump` does, plus `--settle-seconds <n>` for
 the interval between starting the program and the first statement:
 
 ```bash
-./target/release/helios-inspector vm --arch x86-64 --release --accel kvm \
+./target/release/helios vm --arch x86-64 --release --accel kvm \
     --desktop --display none \
     --boot-program dash --boot-program debugger --boot-program input-test \
     input tools/desktop/input-probe.input \
@@ -259,7 +259,7 @@ audio-test:done latency-bytes=1920 xruns=0
 ```
 
 ```bash
-./target/release/helios-inspector vm --arch x86-64 --release --accel kvm \
+./target/release/helios vm --arch x86-64 --release --accel kvm \
     --audiodev "wav:$PWD/tone.wav" \
     --boot-program dash --boot-program debugger --boot-program audio-test \
     shell -c '/bin/audio-test --seconds 2'
@@ -335,7 +335,7 @@ and one taken after the drawing stopped is a capture of whatever was
 left.
 
 ```bash
-./target/release/helios-inspector vm --arch x86-64 --release --accel kvm \
+./target/release/helios vm --arch x86-64 --release --accel kvm \
     --desktop --display none \
     --boot-program dash --boot-program debugger --boot-program display-test \
     screendump \
@@ -529,7 +529,7 @@ image that ships no compositor. A bench-lane boot is such a machine.
 Killing it is how that is shown:
 
 ```bash
-./target/release/helios-inspector instances --kill-name compositor-plugin
+./target/release/helios instances --kill-name compositor-plugin
 ```
 
 and inside a capture sequence, which is where the evidence lives: a
@@ -537,7 +537,7 @@ restart is one machine before and after, not two machines, so
 `screendump` takes it in one boot.
 
 ```bash
-./target/release/helios-inspector vm --arch x86-64 --release --accel kvm \
+./target/release/helios vm --arch x86-64 --release --accel kvm \
     --desktop --display none \
     --boot-program dash --boot-program debugger --boot-program compositor \
     screendump --settle-seconds 20 \
