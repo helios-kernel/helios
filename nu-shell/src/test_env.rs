@@ -401,29 +401,71 @@ impl HeliosEnv for TestHeliosEnv {
             });
         }
 
-        let (out_tx, out_rx) = async_channel::bounded(STREAM_CHANNEL_CAPACITY);
-        let (err_tx, err_rx) = async_channel::bounded(STREAM_CHANNEL_CAPACITY);
+        let (out_tx, out_rx) = if request.capture_stdout {
+            let (tx, rx) = async_channel::bounded(STREAM_CHANNEL_CAPACITY);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let (err_tx, err_rx) = if request.capture_stderr {
+            let (tx, rx) = async_channel::bounded(STREAM_CHANNEL_CAPACITY);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let (code_tx, code_rx) = async_channel::bounded(1);
 
         match prog_name {
             "echo-ext" => {
                 let text = format!("{}\n", request.args.join(" "));
-                // Stream in multiple chunks to verify chunked async streaming.
-                for chunk in text.as_bytes().chunks(4) {
-                    let _ = out_tx.send(Ok(chunk.to_vec())).await;
+                if let Some(tx) = out_tx {
+                    // Stream in multiple chunks to verify chunked async streaming.
+                    for chunk in text.as_bytes().chunks(4) {
+                        let _ = tx.send(Ok(chunk.to_vec())).await;
+                    }
+                } else {
+                    self.state
+                        .lock()
+                        .expect("test env lock")
+                        .stdout_log
+                        .extend_from_slice(text.as_bytes());
                 }
                 let _ = code_tx.send(Ok(0)).await;
             }
             "upper-pipe" => {
                 let upper = String::from_utf8_lossy(&stdin_bytes).to_uppercase();
-                for chunk in upper.as_bytes().chunks(8) {
-                    let _ = out_tx.send(Ok(chunk.to_vec())).await;
+                if let Some(tx) = out_tx {
+                    for chunk in upper.as_bytes().chunks(8) {
+                        let _ = tx.send(Ok(chunk.to_vec())).await;
+                    }
+                } else {
+                    self.state
+                        .lock()
+                        .expect("test env lock")
+                        .stdout_log
+                        .extend_from_slice(upper.as_bytes());
                 }
                 let _ = code_tx.send(Ok(0)).await;
             }
             "fail-ext" => {
-                let _ = out_tx.send(Ok(b"partial-out".to_vec())).await;
-                let _ = err_tx.send(Ok(b"boom-stderr".to_vec())).await;
+                if let Some(tx) = out_tx {
+                    let _ = tx.send(Ok(b"partial-out".to_vec())).await;
+                } else {
+                    self.state
+                        .lock()
+                        .expect("test env lock")
+                        .stdout_log
+                        .extend_from_slice(b"partial-out");
+                }
+                if let Some(tx) = err_tx {
+                    let _ = tx.send(Ok(b"boom-stderr".to_vec())).await;
+                } else {
+                    self.state
+                        .lock()
+                        .expect("test env lock")
+                        .stderr_log
+                        .extend_from_slice(b"boom-stderr");
+                }
                 let _ = code_tx.send(Ok(7)).await;
             }
             #[cfg(not(target_arch = "wasm32"))]
@@ -432,16 +474,33 @@ impl HeliosEnv for TestHeliosEnv {
                 // `STREAM_CHANNEL_CAPACITY` stdout chunks before writing and
                 // closing stderr; sequential stderr-before-stdout draining
                 // would deadlock on channel backpressure.
+                let state_bg = Arc::clone(&self.state);
                 let out_tx_bg = out_tx;
                 let err_tx_bg = err_tx;
                 let code_tx_bg = code_tx;
                 std::thread::spawn(move || {
                     for _ in 0..(STREAM_CHANNEL_CAPACITY * 4) {
-                        if out_tx_bg.send_blocking(Ok(b"1234".to_vec())).is_err() {
-                            return;
+                        if let Some(tx) = &out_tx_bg {
+                            if tx.send_blocking(Ok(b"1234".to_vec())).is_err() {
+                                return;
+                            }
+                        } else {
+                            state_bg
+                                .lock()
+                                .expect("test env lock")
+                                .stdout_log
+                                .extend_from_slice(b"1234");
                         }
                     }
-                    let _ = err_tx_bg.send_blocking(Ok(b"late-stderr".to_vec()));
+                    if let Some(tx) = err_tx_bg {
+                        let _ = tx.send_blocking(Ok(b"late-stderr".to_vec()));
+                    } else {
+                        state_bg
+                            .lock()
+                            .expect("test env lock")
+                            .stderr_log
+                            .extend_from_slice(b"late-stderr");
+                    }
                     let _ = code_tx_bg.send_blocking(Ok(0));
                 });
             }
@@ -453,8 +512,8 @@ impl HeliosEnv for TestHeliosEnv {
         }
 
         Ok(ExternalProcess {
-            stdout: Some(out_rx),
-            stderr: Some(err_rx),
+            stdout: out_rx,
+            stderr: err_rx,
             exit_code: code_rx,
         })
     }

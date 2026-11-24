@@ -10,7 +10,7 @@ use core::future::Future;
 use std::collections::HashMap;
 
 use nu_protocol::engine::{Call, Command, CommandType, EngineState, Stack, StateWorkingSet};
-use nu_protocol::{DeclId, Example, PipelineData, ShellError, Signature};
+use nu_protocol::{DeclId, Example, OutDest, PipelineData, ShellError, Signature};
 
 use crate::commands::AsyncBuiltin;
 use crate::env::{GrantSpec, HeliosEnv};
@@ -134,6 +134,7 @@ impl AsyncCommandRegistry {
                 .into_iter()
                 .map(ToOwned::to_owned)
                 .collect(),
+            pipe_redirection: command.pipe_redirection(),
         };
         let decl_id = working_set.add_decl(Box::new(descriptor));
         self.by_decl.insert(decl_id, command);
@@ -159,6 +160,7 @@ struct AsyncCommandDescriptor {
     description: String,
     extra_description: String,
     search_terms: Vec<String>,
+    pipe_redirection: (Option<OutDest>, Option<OutDest>),
 }
 
 impl Command for AsyncCommandDescriptor {
@@ -188,6 +190,10 @@ impl Command for AsyncCommandDescriptor {
 
     fn command_type(&self) -> CommandType {
         CommandType::Builtin
+    }
+
+    fn pipe_redirection(&self) -> (Option<OutDest>, Option<OutDest>) {
+        self.pipe_redirection.clone()
     }
 
     fn run(

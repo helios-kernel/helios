@@ -775,7 +775,8 @@ fn save_unknown_extension_stderr_redirection_do_env_tilde_and_cancellation() {
             .unwrap();
         assert_eq!(par.as_int().unwrap(), 30);
 
-        // 8. Non-zero external exit in a drained statement raises an error catchable by `try`
+        // 8. Non-zero external exit in a drained statement raises an error catchable by `try`,
+        //    and its uncaptured stderr flows directly to inherited stderr (`stderr_log`).
         let failed = session
             .eval(r#"run-external "fail-ext"; "unreachable""#)
             .await;
@@ -785,6 +786,7 @@ fn save_unknown_extension_stderr_redirection_do_env_tilde_and_cancellation() {
             .await
             .unwrap();
         assert_eq!(recovered.as_str().unwrap(), "caught");
+        assert_eq!(env.recorded_stderr(), "boom-stderrboom-stderr");
 
         // 9. Async `print` routes through `HeliosEnv::{write_stdout, write_stderr}`
         let _ = session
@@ -792,7 +794,20 @@ fn save_unknown_extension_stderr_redirection_do_env_tilde_and_cancellation() {
             .await
             .unwrap();
         assert_eq!(env.recorded_stdout(), "hello\nworld");
-        assert_eq!(env.recorded_stderr(), "errline\n");
+        assert_eq!(env.recorded_stderr(), "boom-stderrboom-stderrerrline\n");
+
+        // 9b. Non-piped `eval_pipeline` leaves stdout inherited (`capture_stdout = false`)
+        //     and streams directly to `stdout_log` rather than buffering.
+        let inherited = session
+            .eval_pipeline(
+                r#"run-external "echo-ext" "direct-stream""#,
+                AsyncPipelineData::Empty,
+            )
+            .await
+            .unwrap();
+        let exit = inherited.drain_async().await.unwrap();
+        assert_eq!(exit, Some(0));
+        assert!(env.recorded_stdout().contains("direct-stream\n"));
 
         // 10. Every committed guest `.nu` script parses and compiles cleanly
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

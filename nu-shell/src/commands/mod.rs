@@ -381,6 +381,19 @@ impl AsyncBuiltin {
     }
 
     #[must_use]
+    pub const fn pipe_redirection(
+        self,
+    ) -> (Option<nu_protocol::OutDest>, Option<nu_protocol::OutDest>) {
+        match self {
+            Self::Complete => (
+                Some(nu_protocol::OutDest::PipeSeparate),
+                Some(nu_protocol::OutDest::PipeSeparate),
+            ),
+            _ => (None, None),
+        }
+    }
+
+    #[must_use]
     pub fn search_terms(self) -> Vec<&'static str> {
         match self {
             Self::RunExternal => vec!["exec", "spawn", "external", "process"],

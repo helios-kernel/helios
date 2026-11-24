@@ -9,6 +9,7 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, FixedOffset, TimeZone};
 use futures_lite::future::zip;
+use helios_api::bindings::wasi::cli::terminal_stdout;
 use helios_api::bindings::wasi::clocks::{monotonic_clock, system_clock};
 use helios_api::bindings::wasi::filesystem::preopens;
 use helios_api::bindings::wasi::filesystem::types::{
@@ -24,12 +25,12 @@ use helios_api::profiling::{self, InstructionProfileError, SamplingSession};
 use helios_api::programs::{
     AuthorityScope, CapabilityGrant, Child, ChildTermination, ClockRight, DeviceClass,
     DiagnosticsGrant, FilesystemRight, LinkRight, MachineRight, MountRight, NetworkRight,
-    ProcessRight, SettingsRight, SpawnError, SpawnRequest, TerminalRight, all_device_classes_grant,
-    clock_grant, device_grant, diagnostics_control_grant, diagnostics_grant, directory_grant,
-    inspect_read_grant, instance_control_grant, link_grant, machine_control_grant, machine_grant,
-    mount_grant, network_grant, process_grant, profile_read_grant, root_directory_grant,
-    root_link_grant, root_mount_grant, root_process_grant, root_terminal_grant, settings_grant,
-    terminal_grant, trace_read_grant, write_settings_grant,
+    ProcessRight, SettingsRight, SpawnError, SpawnErrorKind, SpawnRequest, TerminalRight,
+    all_device_classes_grant, clock_grant, device_grant, diagnostics_control_grant,
+    diagnostics_grant, directory_grant, inspect_read_grant, instance_control_grant, link_grant,
+    machine_control_grant, machine_grant, mount_grant, network_grant, process_grant,
+    profile_read_grant, root_link_grant, root_mount_grant, root_process_grant, root_terminal_grant,
+    settings_grant, terminal_grant, trace_read_grant, write_settings_grant,
 };
 use helios_api::snapshot::{self, SnapshotError, SnapshotHold};
 use helios_api::task;
@@ -48,55 +49,73 @@ struct ActiveProfile {
     _session: SamplingSession,
 }
 
-/// Guest implementation of [`HeliosEnv`] over `helios-api` and WASI Preview 3.
-pub struct GuestHeliosEnv {
-    cwd: Mutex<String>,
-    scopes: Mutex<Vec<String>>,
-    snapshots: Mutex<BTreeMap<String, SnapshotHold>>,
-    profiles: Mutex<BTreeMap<String, ActiveProfile>>,
-    next_id: AtomicU64,
-    has_machine_launcher_grants: bool,
-    has_terminal_grant: bool,
-}
+/// Bitmask of optional non-directory grants inherited by default child spawns.
+///
+/// Initialized from what the running shell can observe (machine inspect,
+/// terminal output) and narrowed lazily when the kernel rejects a specific
+/// capability the shell itself does not hold.
+#[derive(Clone, Copy)]
+struct DefaultGrantMask(u16);
 
-impl GuestHeliosEnv {
-    /// Construct a guest environment anchored at `initial_cwd`.
-    pub fn new(initial_cwd: String, has_terminal_hint: bool) -> Self {
-        let initial_cwd = normalize_vfs_path("/", &initial_cwd);
-        // Probe once via read-only `inspect.snapshot` whether this shell holds
-        // the debugger's machine-level launcher grant bundle (which includes
-        // `InspectRead(Machine)`, `network`, `machine-control`, etc.).
-        let has_machine_launcher_grants = inspect::snapshot(
-            &InspectQuery {
-                prefixes: vec![String::from("/kernel/")],
-            },
-            1,
-        )
-        .is_ok_and(|snap| !snap.entries.is_empty());
+impl DefaultGrantMask {
+    const LINK: u16 = 1 << 0;
+    const PROCESS: u16 = 1 << 1;
+    const NETWORK: u16 = 1 << 2;
+    const TERMINAL: u16 = 1 << 3;
+    const MOUNT: u16 = 1 << 4;
+    const DEVICES: u16 = 1 << 5;
+    const INSPECT_READ: u16 = 1 << 6;
+    const TRACE_READ: u16 = 1 << 7;
+    const PROFILE_READ: u16 = 1 << 8;
+    const DIAGNOSTICS_CONTROL: u16 = 1 << 9;
+    const INSTANCE_CONTROL: u16 = 1 << 10;
+    const WRITE_SETTINGS: u16 = 1 << 11;
+    const MACHINE_CONTROL: u16 = 1 << 12;
 
-        Self {
-            cwd: Mutex::new(initial_cwd),
-            scopes: Mutex::new(Vec::new()),
-            snapshots: Mutex::new(BTreeMap::new()),
-            profiles: Mutex::new(BTreeMap::new()),
-            next_id: AtomicU64::new(1),
-            has_machine_launcher_grants,
-            has_terminal_grant: has_terminal_hint,
+    const MACHINE_BUNDLE: u16 = Self::NETWORK
+        | Self::TERMINAL
+        | Self::MOUNT
+        | Self::DEVICES
+        | Self::INSPECT_READ
+        | Self::TRACE_READ
+        | Self::PROFILE_READ
+        | Self::DIAGNOSTICS_CONTROL
+        | Self::INSTANCE_CONTROL
+        | Self::WRITE_SETTINGS
+        | Self::MACHINE_CONTROL;
+
+    fn initial(has_machine_inspect: bool, has_terminal: bool) -> Self {
+        let mut bits = Self::LINK | Self::PROCESS;
+        if has_machine_inspect {
+            bits |= Self::MACHINE_BUNDLE;
+        }
+        if has_terminal {
+            bits |= Self::TERMINAL;
+        }
+        Self(bits)
+    }
+
+    fn has(self, flag: u16) -> bool {
+        (self.0 & flag) != 0
+    }
+
+    fn clear(&mut self, flag: u16) -> bool {
+        if self.has(flag) {
+            self.0 &= !flag;
+            true
+        } else {
+            false
         }
     }
 
-    fn current_cwd(&self) -> String {
-        self.cwd.lock().expect("guest cwd lock poisoned").clone()
-    }
-
-    fn default_child_grants(&self) -> Vec<CapabilityGrant> {
-        let mut grants = preopen_directory_grants();
-        if grants.is_empty() {
-            grants.push(root_directory_grant());
+    fn append_grants(self, grants: &mut Vec<CapabilityGrant>) {
+        if self.has(Self::LINK) {
+            grants.push(root_link_grant());
         }
-        grants.push(root_link_grant());
-        grants.push(root_process_grant());
-        if self.has_machine_launcher_grants {
+        if self.has(Self::PROCESS) {
+            grants.push(root_process_grant());
+        }
+        if self.has(Self::NETWORK) {
             grants.push(network_grant(vec![
                 NetworkRight::Tcp,
                 NetworkRight::Udp,
@@ -105,19 +124,121 @@ impl GuestHeliosEnv {
                 NetworkRight::Multicast,
                 NetworkRight::Admin,
             ]));
-            grants.push(root_terminal_grant());
-            grants.push(root_mount_grant());
-            grants.push(all_device_classes_grant());
-            grants.push(inspect_read_grant(AuthorityScope::Machine));
-            grants.push(trace_read_grant(AuthorityScope::Machine));
-            grants.push(profile_read_grant(AuthorityScope::Machine));
-            grants.push(diagnostics_control_grant());
-            grants.push(instance_control_grant(AuthorityScope::Machine));
-            grants.push(write_settings_grant());
-            grants.push(machine_control_grant());
-        } else if self.has_terminal_grant {
+        }
+        if self.has(Self::TERMINAL) {
             grants.push(root_terminal_grant());
         }
+        if self.has(Self::MOUNT) {
+            grants.push(root_mount_grant());
+        }
+        if self.has(Self::DEVICES) {
+            grants.push(all_device_classes_grant());
+        }
+        if self.has(Self::INSPECT_READ) {
+            grants.push(inspect_read_grant(AuthorityScope::Machine));
+        }
+        if self.has(Self::TRACE_READ) {
+            grants.push(trace_read_grant(AuthorityScope::Machine));
+        }
+        if self.has(Self::PROFILE_READ) {
+            grants.push(profile_read_grant(AuthorityScope::Machine));
+        }
+        if self.has(Self::DIAGNOSTICS_CONTROL) {
+            grants.push(diagnostics_control_grant());
+        }
+        if self.has(Self::INSTANCE_CONTROL) {
+            grants.push(instance_control_grant(AuthorityScope::Machine));
+        }
+        if self.has(Self::WRITE_SETTINGS) {
+            grants.push(write_settings_grant());
+        }
+        if self.has(Self::MACHINE_CONTROL) {
+            grants.push(machine_control_grant());
+        }
+    }
+
+    const REFUSAL_TABLE: &[(&str, u16)] = &[
+        ("network grant", Self::NETWORK),
+        ("terminal grant", Self::TERMINAL),
+        ("mount grant", Self::MOUNT),
+        ("device class grant", Self::DEVICES),
+        ("inspect-read grant", Self::INSPECT_READ),
+        ("trace-read grant", Self::TRACE_READ),
+        ("profile-read grant", Self::PROFILE_READ),
+        ("diagnostic grant", Self::DIAGNOSTICS_CONTROL),
+        ("instance-control grant", Self::INSTANCE_CONTROL),
+        ("settings grant", Self::WRITE_SETTINGS),
+        ("machine grant", Self::MACHINE_CONTROL),
+        ("link grant", Self::LINK),
+        ("process grant", Self::PROCESS),
+    ];
+
+    /// Drop the specific grant the kernel reported as unheld by this shell.
+    ///
+    /// Matches the `ProcessAuthorityError` strings formatted by the kernel's
+    /// authority checker. Returns `true` if a flag was cleared so the caller
+    /// can retry the default spawn without that grant.
+    fn narrow_for_refusal(&mut self, detail: &str) -> bool {
+        let mut narrowed = false;
+        for &(needle, flag) in Self::REFUSAL_TABLE {
+            if detail.contains(needle) && self.clear(flag) {
+                narrowed = true;
+            }
+        }
+        narrowed
+    }
+}
+
+/// Guest implementation of [`HeliosEnv`] over `helios-api` and WASI Preview 3.
+pub struct GuestHeliosEnv {
+    cwd: Mutex<String>,
+    scopes: Mutex<Vec<String>>,
+    snapshots: Mutex<BTreeMap<String, SnapshotHold>>,
+    profiles: Mutex<BTreeMap<String, ActiveProfile>>,
+    default_grants: Mutex<DefaultGrantMask>,
+    next_id: AtomicU64,
+}
+
+impl GuestHeliosEnv {
+    /// Construct a guest environment anchored at `initial_cwd`.
+    pub fn new(initial_cwd: String) -> Self {
+        let initial_cwd = normalize_vfs_path("/", &initial_cwd);
+        // Probe once via read-only `inspect.snapshot` whether this shell holds
+        // machine-level inspect authority; unheld grants in the default mask
+        // are narrowed individually on the first spawn refusal.
+        let has_machine_inspect = inspect::snapshot(
+            &InspectQuery {
+                prefixes: vec![String::from("/kernel/")],
+            },
+            1,
+        )
+        .is_ok_and(|snap| !snap.entries.is_empty());
+        let has_terminal = terminal_stdout::get_terminal_stdout().is_some();
+
+        Self {
+            cwd: Mutex::new(initial_cwd),
+            scopes: Mutex::new(Vec::new()),
+            snapshots: Mutex::new(BTreeMap::new()),
+            profiles: Mutex::new(BTreeMap::new()),
+            default_grants: Mutex::new(DefaultGrantMask::initial(
+                has_machine_inspect,
+                has_terminal,
+            )),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    fn current_cwd(&self) -> String {
+        self.cwd.lock().expect("guest cwd lock poisoned").clone()
+    }
+
+    async fn default_child_grants(&self) -> Vec<CapabilityGrant> {
+        let mut grants = preopen_directory_grants().await;
+        let mask = *self
+            .default_grants
+            .lock()
+            .expect("guest default grants lock poisoned");
+        mask.append_grants(&mut grants);
         grants
     }
 
@@ -126,23 +247,24 @@ impl GuestHeliosEnv {
         specs: &[GrantSpec],
     ) -> Result<Vec<CapabilityGrant>, EnvError> {
         let mut grants = Vec::new();
-        let mut saw_directory = false;
 
         for spec in specs {
             match spec.kind.as_str() {
                 "dir" | "fs" => {
-                    saw_directory = true;
                     let target = if spec.target.is_empty() {
                         String::from("/")
                     } else {
                         normalize_vfs_path(&self.current_cwd(), &spec.target)
                     };
                     let rights = match spec.mode.as_deref() {
-                        Some("ro" | "r") => {
-                            vec![FilesystemRight::Read, FilesystemRight::Execute]
-                        }
+                        Some("ro" | "r") => vec![FilesystemRight::Read],
                         Some("rx") => vec![FilesystemRight::Read, FilesystemRight::Execute],
-                        Some("rw" | "w") | None => vec![
+                        Some("rw" | "w") => vec![
+                            FilesystemRight::Read,
+                            FilesystemRight::Write,
+                            FilesystemRight::MutateDirectory,
+                        ],
+                        Some("rwx") | None => vec![
                             FilesystemRight::Read,
                             FilesystemRight::Write,
                             FilesystemRight::MutateDirectory,
@@ -249,27 +371,12 @@ impl GuestHeliosEnv {
                     };
                     grants.push(machine_grant(rights));
                 }
-                "virtualize" | "hv" => {
-                    // Hypervisor device access is authorized through the
-                    // `helios:hv/virtualization` interface; preserve standard
-                    // directory/process grants alongside it when requested.
-                }
                 other => {
                     return Err(EnvError::InvalidArgument {
                         detail: format!("unsupported grant kind `{other}`"),
                     });
                 }
             }
-        }
-
-        if !saw_directory {
-            let mut dir_grants = preopen_directory_grants();
-            if dir_grants.is_empty() {
-                dir_grants.push(root_directory_grant());
-            }
-            grants.extend(dir_grants);
-            grants.push(root_link_grant());
-            grants.push(root_process_grant());
         }
 
         Ok(grants)
@@ -316,26 +423,46 @@ impl HeliosEnv for GuestHeliosEnv {
             }
         };
 
-        let capability_grants = if request.grants.is_empty() {
-            self.default_child_grants()
-        } else {
-            self.translate_explicit_grants(&request.grants)?
-        };
-
         let mut env_pairs: Vec<(String, String)> = request.env.into_iter().collect();
         if !env_pairs.iter().any(|(k, _)| k == "PWD") {
             env_pairs.push((String::from("PWD"), request.cwd));
         }
 
-        let child = Child::spawn(SpawnRequest {
-            name: request.program,
-            args: request.args,
-            env: env_pairs,
-            path: resolved_path,
-            capability_grants,
-        })
-        .await
-        .map_err(map_spawn_error)?;
+        let child = if request.grants.is_empty() {
+            loop {
+                let capability_grants = self.default_child_grants().await;
+                match Child::spawn(SpawnRequest {
+                    name: request.program.clone(),
+                    args: request.args.clone(),
+                    env: env_pairs.clone(),
+                    path: resolved_path.clone(),
+                    capability_grants,
+                })
+                .await
+                {
+                    Ok(child) => break child,
+                    Err(err)
+                        if err.kind == SpawnErrorKind::PermissionDenied
+                            && self
+                                .default_grants
+                                .lock()
+                                .expect("guest default grants lock poisoned")
+                                .narrow_for_refusal(&err.detail) => {}
+                    Err(err) => return Err(map_spawn_error(err)),
+                }
+            }
+        } else {
+            let capability_grants = self.translate_explicit_grants(&request.grants)?;
+            Child::spawn(SpawnRequest {
+                name: request.program,
+                args: request.args,
+                env: env_pairs,
+                path: resolved_path,
+                capability_grants,
+            })
+            .await
+            .map_err(map_spawn_error)?
+        };
 
         if let Some(stdin_rx) = request.stdin {
             let (mut tx, rx) = wit_stream::new::<u8>();
@@ -569,11 +696,11 @@ impl HeliosEnv for GuestHeliosEnv {
             detail: format!("inspect memory failed: {err:?}"),
         })?;
 
-        let u64_metric = |suffix: &str| -> u64 {
+        let u64_metric = |exact_path: &str| -> u64 {
             snap.entries
                 .iter()
                 .find_map(|entry| {
-                    entry.path.ends_with(suffix).then_some(match entry.value {
+                    (entry.path == exact_path).then_some(match entry.value {
                         RawInspectValue::Unsigned64(v) => v,
                         RawInspectValue::Signed64(v) => u64::try_from(v).unwrap_or(0),
                         _ => 0,
@@ -582,12 +709,13 @@ impl HeliosEnv for GuestHeliosEnv {
                 .unwrap_or(0)
         };
 
-        let total = u64_metric("/memory/total-bytes");
-        let free = u64_metric("/memory/free-bytes");
-        let available = u64_metric("/memory/available-bytes").max(free);
-        let used = u64_metric("/memory/used-bytes").max(total.saturating_sub(available));
-        let swap_total = u64_metric("/swap/total-bytes");
-        let swap_used = u64_metric("/swap/used-bytes");
+        // Match the exact paths published by `kernel/src/inspect/kernel_tree.rs`.
+        let total = u64_metric("/kernel/memory/total-bytes");
+        let available = u64_metric("/kernel/memory/available-bytes");
+        let free = available;
+        let used = total.saturating_sub(available);
+        let swap_total = u64_metric("/kernel/swap/capacity-bytes");
+        let swap_used = u64_metric("/kernel/swap/used-bytes");
         let swap_free = swap_total.saturating_sub(swap_used);
 
         Ok(SysMemInfo {
@@ -616,38 +744,42 @@ impl HeliosEnv for GuestHeliosEnv {
             return Ok(Vec::new());
         }
 
-        let mut sent = 0_u64;
-        let mut recv = 0_u64;
-        let mut mac = String::new();
-        let mut ips = Vec::new();
+        // Aggregate per-queue counters published by `kernel/src/inspect/kernel_tree.rs`:
+        // `/kernel/network/queues/{id}/{tx-frames,rx-frames}`.
+        let mut queues: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
         for entry in snap.entries {
-            if entry.path.ends_with("tx-bytes") {
-                if let RawInspectValue::Unsigned64(v) = entry.value {
-                    sent = v;
-                }
-            } else if entry.path.ends_with("rx-bytes") {
-                if let RawInspectValue::Unsigned64(v) = entry.value {
-                    recv = v;
-                }
-            } else if entry.path.ends_with("mac") {
-                if let RawInspectValue::Text(v) = entry.value {
-                    mac = v;
-                }
-            } else if (entry.path.ends_with("ipv4") || entry.path.ends_with("ipv6"))
-                && let RawInspectValue::Text(v) = entry.value
-                && !v.is_empty()
-            {
-                ips.push(v);
+            let Some(rest) = entry.path.strip_prefix("/kernel/network/queues/") else {
+                continue;
+            };
+            let Some((id_str, field)) = rest.split_once('/') else {
+                continue;
+            };
+            let Ok(id) = id_str.parse::<u64>() else {
+                continue;
+            };
+            let value = match entry.value {
+                RawInspectValue::Unsigned64(v) => v,
+                RawInspectValue::Signed64(v) => u64::try_from(v).unwrap_or(0),
+                _ => continue,
+            };
+            let counters = queues.entry(id).or_insert((0, 0));
+            match field {
+                "tx-frames" => counters.0 = value,
+                "rx-frames" => counters.1 = value,
+                _ => {}
             }
         }
 
-        Ok(vec![SysNetInfo {
-            name: String::from("virtio-net0"),
-            mac,
-            ip: ips,
-            sent,
-            recv,
-        }])
+        Ok(queues
+            .into_iter()
+            .map(|(id, (sent, recv))| SysNetInfo {
+                name: format!("virtio-net0-q{id}"),
+                mac: String::new(),
+                ip: Vec::new(),
+                sent,
+                recv,
+            })
+            .collect())
     }
 
     async fn sys_disks(&self) -> Result<Vec<SysDiskInfo>, EnvError> {
@@ -1154,23 +1286,26 @@ impl HeliosEnv for GuestHeliosEnv {
     }
 }
 
-fn preopen_directory_grants() -> Vec<CapabilityGrant> {
-    preopens::get_directories()
-        .into_iter()
-        .map(|(_desc, path)| {
-            let normalized = normalize_vfs_path("/", &path);
-            directory_grant(
-                normalized.clone(),
-                normalized,
-                vec![
-                    FilesystemRight::Read,
-                    FilesystemRight::Write,
-                    FilesystemRight::MutateDirectory,
-                    FilesystemRight::Execute,
-                ],
-            )
-        })
-        .collect()
+async fn preopen_directory_grants() -> Vec<CapabilityGrant> {
+    let mut grants = Vec::new();
+    for (desc, path) in preopens::get_directories() {
+        let normalized = normalize_vfs_path("/", &path);
+        let flags = desc.get_flags().await.unwrap_or(DescriptorFlags::READ);
+        let mut rights = Vec::new();
+        if (flags & DescriptorFlags::READ) != DescriptorFlags::empty() {
+            rights.push(FilesystemRight::Read);
+        }
+        if (flags & DescriptorFlags::WRITE) != DescriptorFlags::empty() {
+            rights.push(FilesystemRight::Write);
+        }
+        if (flags & DescriptorFlags::MUTATE_DIRECTORY) != DescriptorFlags::empty() {
+            rights.push(FilesystemRight::MutateDirectory);
+        }
+        if !rights.is_empty() {
+            grants.push(directory_grant(normalized.clone(), normalized, rights));
+        }
+    }
+    grants
 }
 
 fn parse_scope(raw: &str) -> Result<AuthorityScope, EnvError> {

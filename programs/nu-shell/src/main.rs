@@ -78,10 +78,9 @@ async fn main() -> Result<(), NuShellError> {
     }
 
     let raw_env = environment::get_environment();
-    let has_terminal_hint = raw_env.iter().any(|(k, _)| k == "TERM");
     let initial_cwd = environment::get_initial_cwd().unwrap_or_else(|| String::from("/"));
 
-    let guest_env = GuestHeliosEnv::new(initial_cwd, has_terminal_hint);
+    let guest_env = GuestHeliosEnv::new(initial_cwd);
     let mut session = ShellSession::new(guest_env).await;
     seed_session_env(&mut session, &raw_env);
 
