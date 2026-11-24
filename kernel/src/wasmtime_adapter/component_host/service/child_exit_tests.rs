@@ -462,6 +462,8 @@ impl WasixJoinHarness {
 
     fn write_guest(&self, offset: usize, bytes: &[u8]) {
         for (i, &b) in bytes.iter().enumerate() {
+            // SAFETY: `self.memory.data()[offset + i]` is bounds-checked and owned exclusively by
+            // the test harness between calls with no concurrent guest access.
             unsafe {
                 self.memory.data()[offset + i].get().write(b);
             }
@@ -470,7 +472,11 @@ impl WasixJoinHarness {
 
     fn read_guest(&self, offset: usize, len: usize) -> Vec<u8> {
         (0..len)
-            .map(|i| unsafe { self.memory.data()[offset + i].get().read() })
+            .map(|i| {
+                // SAFETY: `self.memory.data()[offset + i]` is bounds-checked and owned exclusively
+                // by the test harness between calls with no concurrent guest access.
+                unsafe { self.memory.data()[offset + i].get().read() }
+            })
             .collect()
     }
 

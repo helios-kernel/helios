@@ -296,6 +296,8 @@ async fn open_vsock(_cid: u32, _port: u32) -> Result<(RpcReader, RpcWriter), Tra
 
 struct AsyncUnixSocket(UnixStream);
 
+// SAFETY: `AsyncUnixSocket` is a transparent wrapper around `std::os::unix::net::UnixStream`
+// (which is `IoSafe`); it never closes or replaces the inner descriptor while borrowed.
 unsafe impl async_io::IoSafe for AsyncUnixSocket {}
 
 impl AsFd for AsyncUnixSocket {
@@ -322,6 +324,8 @@ impl io::Write for AsyncUnixSocket {
 
 struct AsyncSerialPort(serialport::TTYPort);
 
+// SAFETY: `AsyncSerialPort` owns the `serialport::TTYPort` exclusively and keeps its raw
+// file descriptor open and unchanged for the wrapper's entire lifetime.
 unsafe impl async_io::IoSafe for AsyncSerialPort {}
 
 impl AsFd for AsyncSerialPort {
@@ -351,11 +355,14 @@ impl io::Write for AsyncSerialPort {
 struct AsyncVsockStream(vsock::VsockStream);
 
 #[cfg(target_os = "linux")]
+// SAFETY: `AsyncVsockStream` owns the `vsock::VsockStream` exclusively and keeps its raw
+// file descriptor open and unchanged for the wrapper's entire lifetime.
 unsafe impl async_io::IoSafe for AsyncVsockStream {}
 
 #[cfg(target_os = "linux")]
 impl AsFd for AsyncVsockStream {
     fn as_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: `self.0` stays alive for the borrow lifetime of `&self`.
         unsafe { BorrowedFd::borrow_raw(self.0.as_raw_fd()) }
     }
 }

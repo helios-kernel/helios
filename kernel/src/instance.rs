@@ -1485,7 +1485,11 @@ impl Clone for RegisteredInstance {
     }
 }
 
+// SAFETY: `entry` points to a `Box<InstanceEntry>` kept alive and immobile on the heap until
+// the last `RegisteredInstance` drops its `handle_count`, and `InstanceEntry` is `Sync`.
 unsafe impl Send for RegisteredInstance {}
+// SAFETY: `RegisteredInstance` only exposes shared `&InstanceEntry` access across handles,
+// and every field of `InstanceEntry` is safe to share across threads (`Sync`).
 unsafe impl Sync for RegisteredInstance {}
 
 impl Drop for RegisteredInstance {
