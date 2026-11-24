@@ -438,7 +438,41 @@ pub(super) struct UpperView {
     pub(super) beneath: bool,
 }
 
+/// Point-in-time telemetry for a [`MemoryFs`] tree or overlay upper layer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryFsTelemetry {
+    pub inodes: u64,
+    pub file_bytes: u64,
+    pub overlay_pages: u64,
+    pub whiteouts: u64,
+    pub opaque_dirs: u64,
+}
+
 impl MemoryFs {
+    /// Returns a point-in-time snapshot of the inodes, bytes, and overlay
+    /// page occupancy held by this memory filesystem.
+    pub fn telemetry(&self) -> MemoryFsTelemetry {
+        let state = self.state.lock();
+        let mut file_bytes = 0u64;
+        let mut overlay_pages = 0u64;
+        for inode in state.inodes.values() {
+            file_bytes = file_bytes.saturating_add(inode.contents.size());
+            let pages = match &inode.contents {
+                InodeContents::File(file) => file.pages.frames(),
+                InodeContents::Symlink(target) => target.len().div_ceil(PhysFrame::SIZE) as u64,
+                InodeContents::Empty => 0,
+            };
+            overlay_pages = overlay_pages.saturating_add(pages);
+        }
+        MemoryFsTelemetry {
+            inodes: state.inodes.len() as u64,
+            file_bytes,
+            overlay_pages,
+            whiteouts: state.whiteouts.len() as u64,
+            opaque_dirs: state.opaque.len() as u64,
+        }
+    }
+
     /// An empty tree with only its root directory (`0755`, owned by
     /// `0:0`, as `RAMFS_DEFAULT_MODE` in `fs/ramfs/inode.c`), drawing file
     /// frames through `budget`.

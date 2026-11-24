@@ -22,11 +22,14 @@ use crate::memory::{IrqSafeMutex, UserMemoryPool};
 mod ioevent;
 mod lease;
 mod memory;
+mod telemetry;
 pub use ioevent::IoEvent;
 use ioevent::IoEvents;
 pub use lease::{LeaseError, ResourceLease, ResourceSlot};
 mod shootdown;
 pub use shootdown::{Stage2Generation, Stage2Shootdown, Stage2Tracker};
+pub use telemetry::{HvTelemetryRegistry, HvVmSnapshot};
+use telemetry::{VmTelemetry, VmTelemetryGuard};
 #[cfg(test)]
 pub(crate) mod tests;
 mod vcpu;
@@ -54,6 +57,7 @@ struct VmShared<S: Stage2Space> {
     regions: IrqSafeMutex<Vec<GuestMemoryRegion>>,
     vcpus: IrqSafeMutex<LiveVcpus<S>>,
     ioevents: Arc<IoEvents>,
+    telemetry: VmTelemetryGuard,
 }
 
 /// Unique VM control owner. Dropping it requests termination of all its vCPUs;
@@ -101,15 +105,40 @@ impl<S: Stage2Space> VirtualMachine<S> {
         }
     }
     pub fn new(space: S, pool: &'static UserMemoryPool, memory_limit: usize) -> Self {
+        let account = Arc::new(GuestMemoryAccount::new(memory_limit));
+        let telemetry = VmTelemetryGuard::unregistered(space.vmid(), account.clone());
+        Self::with_telemetry(space, pool, account, telemetry)
+    }
+
+    pub fn new_observed(
+        space: S,
+        pool: &'static UserMemoryPool,
+        memory_limit: usize,
+        registry: &HvTelemetryRegistry,
+        owner_instance: Option<crate::InstanceId>,
+    ) -> Self {
+        let account = Arc::new(GuestMemoryAccount::new(memory_limit));
+        let telemetry = registry.register(owner_instance, space.vmid(), account.clone());
+        Self::with_telemetry(space, pool, account, telemetry)
+    }
+
+    fn with_telemetry(
+        space: S,
+        pool: &'static UserMemoryPool,
+        account: Arc<GuestMemoryAccount>,
+        telemetry: VmTelemetryGuard,
+    ) -> Self {
+        let ioevents = Arc::new(IoEvents::new(telemetry.telemetry().clone()));
         Self {
             shared: Arc::new(VmShared {
                 space: Arc::new(space),
                 regions: IrqSafeMutex::new(Vec::new()),
                 vcpus: IrqSafeMutex::new(Vec::new()),
-                ioevents: Arc::new(IoEvents::new()),
+                ioevents,
+                telemetry,
             }),
             pool,
-            account: Arc::new(GuestMemoryAccount::new(memory_limit)),
+            account,
         }
     }
     pub fn memory_account(&self) -> &Arc<GuestMemoryAccount> {
@@ -156,6 +185,10 @@ impl<S: Stage2Space> VirtualMachine<S> {
         self.shared
             .regions
             .with(|regions| regions.push(region.clone()));
+        self.shared
+            .telemetry
+            .telemetry()
+            .add_stage2_pages(range.page_count());
         Ok(region)
     }
 
@@ -171,6 +204,10 @@ impl<S: Stage2Space> VirtualMachine<S> {
                 .expect("exclusive VM owner lost a mapped region");
             regions.swap_remove(index)
         });
+        self.shared
+            .telemetry
+            .telemetry()
+            .sub_stage2_pages(range.page_count());
         drop(retired);
         Ok(())
     }
@@ -213,6 +250,7 @@ impl<S: Stage2Space> VirtualMachine<S> {
         self.shared
             .vcpus
             .with(|vcpus| vcpus.push((id, signals.clone())));
+        self.shared.telemetry.telemetry().inc_vcpus();
         Ok(Vcpu::new(id, backend, signals, self.shared.clone()))
     }
 }
@@ -232,4 +270,24 @@ pub fn create_vm<C: Cpu>(
 ) -> Result<VirtualMachine<<C::Hypervisor as Hypervisor>::Space>, VmError> {
     let hv = cpu.hv().ok_or(HvError::Unavailable)?;
     Ok(VirtualMachine::new(hv.create_space()?, pool, memory_limit))
+}
+
+/// Construct a VM registered with `registry` so `/kernel/hv/*` reflects its
+/// live Stage-2 pages, VMID, vCPU exits, and ioevent hits.
+pub fn create_vm_observed<C: Cpu>(
+    cpu: &C,
+    pool: &'static UserMemoryPool,
+    memory_limit: usize,
+    _cap: crate::VirtualizeCap,
+    registry: &HvTelemetryRegistry,
+    owner_instance: Option<crate::InstanceId>,
+) -> Result<VirtualMachine<<C::Hypervisor as Hypervisor>::Space>, VmError> {
+    let hv = cpu.hv().ok_or(HvError::Unavailable)?;
+    Ok(VirtualMachine::new_observed(
+        hv.create_space()?,
+        pool,
+        memory_limit,
+        registry,
+        owner_instance,
+    ))
 }

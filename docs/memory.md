@@ -57,8 +57,9 @@ kernel takes it, because a kernel OOM ends the guest and a user OOM ends
 one instance. Memory an instance frees goes back to the pool; memory the
 kernel heap has borrowed stays with the kernel heap.
 
-The guest sees one number for both domains. `helios:system/stats`
-reports the machine's usable bytes and the machine's free bytes — the
+The guest sees one number for both domains. `helios:system/inspect`
+reports the machine's usable bytes and the machine's free bytes under
+`/kernel/memory/*` — the
 kernel heap's free space plus the pool's — because with the kernel heap
 funding itself out of the pool, the kernel heap's own size is not a
 footprint anyone can reason about. `procbench`'s

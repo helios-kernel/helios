@@ -97,5 +97,5 @@ pub use user::{
 };
 pub(crate) use user::{
     installed_user_memory_pool, lend_user_memory_to_kernel_heap, release_processor_frames,
-    user_memory_pool, user_pool_available_bytes,
+    try_user_node_stats, user_memory_pool, user_pool_available_bytes,
 };

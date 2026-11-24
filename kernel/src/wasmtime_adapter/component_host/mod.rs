@@ -29,7 +29,7 @@ use crate::{
     ProgramExecErrorDetail, ProgramExecErrorKind, RawMutex, RawMutexGuardResource,
     RawMutexResource, RawRwLock, RawRwLockReadGuardResource, RawRwLockResource,
     RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis, largest_servable_user_bytes,
-    machine_memory, monotonic_nanos, user_heap_stats, user_node_stats,
+    monotonic_nanos, user_heap_stats,
 };
 use helios_hal::cpu::Cpu;
 use spin::Mutex;
@@ -47,8 +47,8 @@ use crate::wasmtime_adapter::config::AotCompileHint;
 use crate::wasmtime_adapter::cwasm;
 use crate::wasmtime_adapter::wasi::ChannelStreamProducer;
 use crate::{
-    HeapStats, LlvmProfile, PerfSample, ProfileScope, StatsSample, TraceEvent, TraceField,
-    TraceFilter, TraceLevel, TraceValue,
+    HeapStats, LlvmProfile, PerfSample, ProfileScope, TraceEvent, TraceField, TraceFilter,
+    TraceLevel, TraceValue,
 };
 use filters::{MetricFilterView, ProfileFilterView, TraceFilterView};
 use observation::{Denied, Refused, TargetRefusal, Visibility};
@@ -58,7 +58,6 @@ use debugger_bindings::helios::system as debugger_wit;
 use program_bindings::helios::system as program_wit;
 
 const SYNC_INSTANCE: &str = "helios:system/sync@0.1.0";
-const STATS_INSTANCE: &str = "helios:system/stats@0.1.0";
 const NET_INSTANCE: &str = "helios:system/net@0.1.0";
 const TRACING_INSTANCE: &str = "helios:system/tracing@0.1.0";
 const PROFILING_INSTANCE: &str = "helios:system/profiling@0.1.0";
@@ -83,6 +82,8 @@ fn lower_bytes_to_vec(bytes: Bytes) -> Vec<u8> {
 
 mod device;
 mod filters;
+pub(crate) mod inspect;
+pub use inspect::InspectPublicationHandle;
 mod instances_snapshot;
 mod ipc;
 mod machine_identity;
@@ -841,6 +842,9 @@ macro_rules! impl_program_bindings {
                             Err(error) => return Ok(Err($convert_error(error))),
                         };
                         let handle = accessor.with(|mut access| {
+                            if let Ok(live) = service.get_container(&container) {
+                                access.get().runtime_state.register_container(&live);
+                            }
                             access
                                 .get()
                                 .table
@@ -2978,6 +2982,7 @@ where
     add_sync_to_linker(&mut linker)?;
     ipc::add_ipc_to_linker(&mut linker)?;
     machine_identity::add_machine_identity_to_linker(&mut linker)?;
+    inspect::add_inspect_to_linker(&mut linker)?;
     instances_snapshot::add_instances_to_linker(&mut linker)?;
     instances_snapshot::add_snapshot_to_linker(&mut linker)?;
     match world {
@@ -3170,7 +3175,6 @@ where
     service::add_btrfs_to_linker(linker)?;
     add_net_to_linker(linker)?;
     vsock::add_vsock_to_linker::<vsock::DebuggerVsock, _, _, _>(linker)?;
-    add_stats_to_linker(linker)?;
     device::add_device_to_linker(linker)?;
     service::add_display_to_linker(linker)?;
     service::add_input_to_linker(linker)?;
@@ -3376,7 +3380,6 @@ where
     service::add_btrfs_to_linker(linker)?;
     add_net_to_program_linker(linker)?;
     vsock::add_vsock_to_linker::<vsock::ProgramVsock, _, _, _>(linker)?;
-    add_stats_to_program_linker(linker)?;
     device::add_device_to_linker(linker)?;
     service::add_display_to_linker(linker)?;
     service::add_input_to_linker(linker)?;
@@ -3543,24 +3546,6 @@ where
         },
     )?;
     timeline::add_to_linker(&mut instance)
-}
-
-fn add_stats_to_linker<CpuImpl, Net, StorageImpl>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
-) -> wasmtime::Result<()>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let mut instance = linker.instance(STATS_INSTANCE)?;
-    instance.func_wrap_data("snapshot", |data, (): ()| Ok((snapshot_sample(data),)))?;
-    instance.func_wrap("subscribe", |mut caller, (period,): (u64,)| {
-        let period = stats_period(period)?;
-        let reader = StreamReader::new(&mut caller, StatsStreamProducer::new(period))?;
-        Ok((reader,))
-    })?;
-    Ok(())
 }
 
 fn add_programs_to_linker<CpuImpl, Net, StorageImpl>(
@@ -4660,26 +4645,6 @@ fn read_raw_profile(offset: u64, length: u32) -> Result<Vec<u8>, crate::LlvmProf
     Ok(bytes)
 }
 
-fn add_stats_to_program_linker<CpuImpl, Net, StorageImpl>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
-) -> wasmtime::Result<()>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let mut instance = linker.instance(STATS_INSTANCE)?;
-    instance.func_wrap_data("snapshot", |data, (): ()| {
-        Ok((snapshot_program_sample(data),))
-    })?;
-    instance.func_wrap("subscribe", |mut caller, (period,): (u64,)| {
-        let period = stats_period(period)?;
-        let reader = StreamReader::new(&mut caller, ProgramStatsStreamProducer::new(period))?;
-        Ok((reader,))
-    })?;
-    Ok(())
-}
-
 fn add_tracing_to_program_linker<CpuImpl, Net, StorageImpl>(
     linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
@@ -5492,118 +5457,6 @@ where
     }
 }
 
-/// `stats.subscribe` was called with a period of zero.
-///
-/// The period comes from the guest and the interface has no error to
-/// answer with, so the call traps the instance that made it.
-#[derive(Debug, Error, PartialEq, Eq)]
-#[error("stats.subscribe needs a period above zero")]
-struct ZeroStatsPeriod;
-
-fn stats_period(nanos: u64) -> Result<NonZeroU64, ZeroStatsPeriod> {
-    NonZeroU64::new(nanos).ok_or(ZeroStatsPeriod)
-}
-
-struct StatsStreamProducer {
-    period_nanos: NonZeroU64,
-    next_due: Option<u64>,
-}
-
-impl StatsStreamProducer {
-    fn new(period_nanos: NonZeroU64) -> Self {
-        Self {
-            period_nanos,
-            next_due: None,
-        }
-    }
-}
-
-impl<CpuImpl, Net, StorageImpl> StreamProducer<StoreData<CpuImpl, Net, StorageImpl>>
-    for StatsStreamProducer
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    type Item = debugger_wit::stats::Sample;
-    type Buffer = Option<Self::Item>;
-
-    fn poll_produce<'a>(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        store: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
-        mut destination: Destination<'a, Self::Item, Self::Buffer>,
-        finish: bool,
-    ) -> Poll<wasmtime::Result<StreamResult>> {
-        if finish {
-            return Poll::Ready(Ok(StreamResult::Cancelled));
-        }
-
-        let now = store.data().now_nanos();
-        let period_nanos = self.period_nanos.get();
-        let due = self
-            .next_due
-            .get_or_insert_with(|| now.saturating_add(period_nanos));
-        if now < *due {
-            return Poll::Pending;
-        }
-
-        *due = now.saturating_add(period_nanos);
-        destination.set_buffer(Some(snapshot_sample(store.data())));
-        Poll::Ready(Ok(StreamResult::Completed))
-    }
-}
-
-struct ProgramStatsStreamProducer {
-    period_nanos: NonZeroU64,
-    next_due: Option<u64>,
-}
-
-impl ProgramStatsStreamProducer {
-    fn new(period_nanos: NonZeroU64) -> Self {
-        Self {
-            period_nanos,
-            next_due: None,
-        }
-    }
-}
-
-impl<CpuImpl, Net, StorageImpl> StreamProducer<StoreData<CpuImpl, Net, StorageImpl>>
-    for ProgramStatsStreamProducer
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    type Item = program_wit::stats::Sample;
-    type Buffer = Option<Self::Item>;
-
-    fn poll_produce<'a>(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        store: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
-        mut destination: Destination<'a, Self::Item, Self::Buffer>,
-        finish: bool,
-    ) -> Poll<wasmtime::Result<StreamResult>> {
-        if finish {
-            return Poll::Ready(Ok(StreamResult::Cancelled));
-        }
-
-        let now = store.data().now_nanos();
-        let period_nanos = self.period_nanos.get();
-        let due = self
-            .next_due
-            .get_or_insert_with(|| now.saturating_add(period_nanos));
-        if now < *due {
-            return Poll::Pending;
-        }
-
-        *due = now.saturating_add(period_nanos);
-        destination.set_buffer(Some(snapshot_program_sample(store.data())));
-        Poll::Ready(Ok(StreamResult::Completed))
-    }
-}
-
 /// The debugger world's trace stream. It owns a filter, the scope it was
 /// created with and a cursor, and no buffer: each poll runs on the store's
 /// task and asks the trace log for the next event the scope admits and the
@@ -5720,409 +5573,6 @@ where
     }
 }
 
-fn snapshot_sample<CpuImpl, Net, StorageImpl>(
-    store: &StoreData<CpuImpl, Net, StorageImpl>,
-) -> debugger_wit::stats::Sample
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let mut sample = store.runtime_state.snapshot(store.cpu.now().ticks());
-    sample.restrict_to(store.process_authority());
-    convert_sample(sample)
-}
-
-fn snapshot_program_sample<CpuImpl, Net, StorageImpl>(
-    store: &StoreData<CpuImpl, Net, StorageImpl>,
-) -> program_wit::stats::Sample
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    // A program sees only the hardware it could claim: `claim` answers
-    // as if the device were absent, and a listed device would say
-    // otherwise.
-    let mut sample = store.runtime_state.snapshot(store.cpu.now().ticks());
-    sample.restrict_to(store.process_authority());
-    convert_program_sample(sample)
-}
-
-/// Maps the kernel's block-device snapshot onto one binding set's
-/// `block-device` record.
-///
-/// The debugger world and the program world generate distinct Rust types
-/// for the same WIT record, so the field mapping is written once here and
-/// instantiated for each of them.
-/// Maps the kernel's IOMMU snapshot onto one binding set's `iommu`
-/// record.
-///
-/// The two generated worlds carry the same WIT record as distinct Rust
-/// types, so the mapping is written once and instantiated for each.
-macro_rules! convert_iommu_stats {
-    ($bindings:path, $iommu:expr) => {
-        $iommu.map(|iommu: crate::IommuStats| {
-            use $bindings as stats_bindings;
-            stats_bindings::Iommu {
-                granule_bytes: iommu.granule_bytes,
-                global_bypass: iommu.global_bypass,
-                faults: iommu.faults,
-                endpoints: iommu
-                    .endpoints()
-                    .iter()
-                    .map(|endpoint| stats_bindings::IommuEndpoint {
-                        endpoint: endpoint.endpoint,
-                        domain: endpoint.domain,
-                        mapped_bytes: endpoint.mapped_bytes,
-                    })
-                    .collect(),
-            }
-        })
-    };
-}
-
-/// Maps the host share's cache counters onto one binding set's
-/// `host-share-cache` record.
-macro_rules! convert_host_share_stats {
-    ($bindings:path, $host_share:expr) => {
-        $host_share.map(|cache: crate::HostFsCacheStats| {
-            use $bindings as stats_bindings;
-            stats_bindings::HostShareCache {
-                attribute_hits: cache.attribute_hits,
-                attribute_misses: cache.attribute_misses,
-                negative_hits: cache.negative_hits,
-                directory_hits: cache.directory_hits,
-                directory_misses: cache.directory_misses,
-                fid_hits: cache.fid_hits,
-                fid_misses: cache.fid_misses,
-                evictions: cache.evictions,
-                invalidations: cache.invalidations,
-            }
-        })
-    };
-}
-
-macro_rules! convert_network_stats {
-    ($bindings:path, $network:expr) => {
-        $network.map(|network: crate::NetworkStats| {
-            use $bindings as stats_bindings;
-            stats_bindings::Network {
-                queues: network
-                    .queues
-                    .into_iter()
-                    .map(|queue| stats_bindings::NetworkQueue {
-                        id: queue.id,
-                        rx_frames: queue.rx_frames,
-                        tx_frames: queue.tx_frames,
-                        interrupts: queue.interrupts,
-                        rx_refused_frames: queue.rx_refused_frames,
-                        rx_device_refusals: queue.rx_device_refusals,
-                        tcp_acks_sent: queue.tcp_acks_sent,
-                        tcp_window_updates_sent: queue.tcp_window_updates_sent,
-                        tcp_retransmits_sent: queue.tcp_retransmits_sent,
-                        tcp_sockets: queue.tcp_sockets,
-                        tcp_orphan_sockets: queue.tcp_orphan_sockets,
-                        tcp_orphan_send_queued_bytes: queue.tcp_orphan_send_queued_bytes,
-                        tcp_orphan_fin_wait_1: queue.tcp_orphan_fin_wait_1,
-                        tcp_orphan_fin_wait_2: queue.tcp_orphan_fin_wait_2,
-                        tcp_orphan_closing: queue.tcp_orphan_closing,
-                        tcp_orphan_last_ack: queue.tcp_orphan_last_ack,
-                        tcp_orphan_time_wait: queue.tcp_orphan_time_wait,
-                        tcp_orphan_other_state: queue.tcp_orphan_other_state,
-                        tcp_orphan_retransmit_armed: queue.tcp_orphan_retransmit_armed,
-                        tcp_receive_backpressured_sockets: queue.tcp_receive_backpressured_sockets,
-                        tcp_receive_window_bytes: queue.tcp_receive_window_bytes,
-                        receive_queued_bytes: queue.receive_queued_bytes,
-                        out_of_order_queued_bytes: queue.out_of_order_queued_bytes,
-                        peer_retransmits_received: queue.peer_retransmits_received,
-                        duplicate_acks_requested: queue.duplicate_acks_requested,
-                        rx_pool_stalls: queue.rx_pool_stalls,
-                        rx_pool_free: queue.rx_pool_free,
-                    })
-                    .collect(),
-            }
-        })
-    };
-}
-
-/// Maps the kernel's granted-device inventory onto one binding set's
-/// `granted-device` list, for the same reason [`convert_block_stats`]
-/// exists.
-macro_rules! convert_device_stats {
-    ($bindings:path, $devices:expr) => {
-        $devices
-            .into_iter()
-            .map(|device: crate::GrantedDeviceSnapshot| {
-                use $bindings as stats_bindings;
-                stats_bindings::GrantedDevice {
-                    name: alloc::string::String::from(device.name.as_str()),
-                    region_bytes: device.region_bytes,
-                    regions: device.regions,
-                    interrupts: device.interrupt_count,
-                    dma_budget_bytes: device.dma_budget_bytes,
-                    confined: device.confined,
-                    claimed: device.claimed,
-                    interrupts_forwarded: device.interrupts_forwarded,
-                    interrupts_coalesced: device.interrupts_coalesced,
-                    masked_sources: device.masked_sources,
-                }
-            })
-            .collect()
-    };
-}
-
-/// Maps the kernel's input-device inventory onto one binding set's
-/// `input-device` list, for the same reason [`convert_device_stats`]
-/// exists.
-macro_rules! convert_input_stats {
-    ($bindings:path, $inputs:expr) => {
-        $inputs
-            .into_iter()
-            .map(|device: crate::InputDeviceSnapshot| {
-                use $bindings as stats_bindings;
-                stats_bindings::InputDevice {
-                    name: device.name,
-                    claimed: device.claimed,
-                    events_delivered: device.events_delivered,
-                    lost_reports: device.lost_reports,
-                }
-            })
-            .collect()
-    };
-}
-
-/// Maps the kernel's playback-stream inventory onto one binding set's
-/// `audio-stream` list, for the same reason [`convert_input_stats`]
-/// exists.
-macro_rules! convert_audio_stats {
-    ($bindings:path, $audio:expr) => {
-        $audio
-            .into_iter()
-            .map(|stream: crate::AudioStreamSnapshot| {
-                use $bindings as stats_bindings;
-                stats_bindings::AudioStream {
-                    id: stream.id,
-                    claimed: stream.claimed,
-                    played_bytes: stream.played_bytes,
-                    xruns: stream.xruns,
-                    lost_feedback: stream.lost_feedback,
-                }
-            })
-            .collect()
-    };
-}
-
-macro_rules! convert_block_stats {
-    ($bindings:path, $block:expr) => {
-        $block.map(|block: crate::BlockStats| {
-            use $bindings as stats_bindings;
-            let capabilities =
-                helios_hal::fs::BlockDeviceCapabilities::from_bits_truncate(block.capabilities);
-            stats_bindings::BlockDevice {
-                capacity_bytes: block.capacity_bytes,
-                block_bytes: block.block_bytes,
-                physical_block_bytes: block.physical_block_bytes,
-                flush: capabilities.contains(helios_hal::fs::BlockDeviceCapabilities::FLUSH),
-                discard: capabilities.contains(helios_hal::fs::BlockDeviceCapabilities::DISCARD),
-                write_zeroes: capabilities
-                    .contains(helios_hal::fs::BlockDeviceCapabilities::WRITE_ZEROES),
-                queues: block.queues,
-                queue_depth: block.queue_depth,
-                reads: block.reads,
-                writes: block.writes,
-                flushes: block.flushes,
-                discards: block.discards,
-                write_zeroes_requests: block.write_zeroes,
-            }
-        })
-    };
-}
-
-/// Maps the kernel's balloon snapshot onto one binding set's
-/// `memory-balloon` record, for the same reason
-/// [`convert_block_stats`] exists.
-macro_rules! convert_balloon_stats {
-    ($bindings:path, $balloon:expr) => {
-        $balloon.map(|balloon: crate::BalloonStats| {
-            use $bindings as stats_bindings;
-            stats_bindings::MemoryBalloon {
-                target_bytes: balloon.target_bytes,
-                actual_bytes: balloon.actual_bytes,
-                reported_bytes: balloon.reported_bytes,
-            }
-        })
-    };
-}
-
-/// Maps the kernel's swap snapshot onto one binding set's `swap`
-/// record, for the same reason [`convert_block_stats`] exists.
-macro_rules! convert_swap_stats {
-    ($bindings:path, $swap:expr) => {
-        $swap.map(|swap: crate::SwapStats| {
-            use $bindings as stats_bindings;
-            stats_bindings::Swap {
-                backend: alloc::string::String::from(swap.backend),
-                capacity_bytes: swap.capacity_bytes,
-                used_bytes: swap.used_bytes,
-                pages_out: swap.pages_out,
-                pages_in: swap.pages_in,
-                faults_served: swap.faults_served,
-                mean_fault_latency: swap.mean_fault_latency_nanos,
-            }
-        })
-    };
-}
-
-/// Maps the user pool's per-node readings onto one binding set's
-/// `memory-node` records, for the same reason [`convert_block_stats`]
-/// exists.
-macro_rules! convert_memory_node_stats {
-    ($bindings:path, $nodes:expr) => {{
-        use $bindings as stats_bindings;
-        $nodes
-            .into_iter()
-            .map(|node: crate::MemoryNodeStats| stats_bindings::MemoryNode {
-                id: u32::try_from(node.node.index()).expect("node index does not fit into u32"),
-                total_bytes: u64::try_from(node.total_bytes)
-                    .expect("node memory does not fit into u64"),
-                available_bytes: u64::try_from(node.available_bytes)
-                    .expect("free node memory does not fit into u64"),
-                off_node_allocations: node.off_node_allocations,
-            })
-            .collect::<alloc::vec::Vec<_>>()
-    }};
-}
-
-/// The machine's memory, not the kernel heap's.
-///
-/// The two domains draw on the same physical memory — the kernel heap
-/// takes what it needs out of the user pool — so a consumer asking how
-/// much memory there is wants one number for both. Reporting the kernel
-/// heap alone made `procbench`'s `memory_per_instance_bytes` measure a
-/// share whose size is itself demand-driven, which is not a footprint.
-fn convert_sample(sample: StatsSample) -> debugger_wit::stats::Sample {
-    let machine = machine_memory();
-    let total_bytes =
-        u64::try_from(machine.usable_bytes).expect("machine memory does not fit into u64");
-    let available_bytes =
-        u64::try_from(machine.free_bytes).expect("free machine memory does not fit into u64");
-    debugger_wit::stats::Sample {
-        timestamp: sample.timestamp,
-        uptime: sample.uptime,
-        wall_clock: sample.wall_clock,
-        processors: debugger_wit::stats::Processors {
-            configured: sample.configured_processors,
-            online: sample.online_processors,
-            utilization: (0..sample.configured_processors)
-                .map(|id| debugger_wit::stats::Processor { id, busy: 0 })
-                .collect(),
-            guest_isa_level: sample.guest_isa_level.into(),
-            guest_isa_extras: sample
-                .guest_isa_extras
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-        },
-        memory: debugger_wit::stats::Memory {
-            total_bytes,
-            available_bytes,
-            pressure: convert_memory_pressure(total_bytes, available_bytes),
-            nodes: convert_memory_node_stats!(debugger_wit::stats, user_node_stats()),
-        },
-        block: convert_block_stats!(debugger_wit::stats, sample.block),
-        iommu: convert_iommu_stats!(debugger_wit::stats, sample.iommu),
-        balloon: convert_balloon_stats!(debugger_wit::stats, sample.balloon),
-        swap: convert_swap_stats!(debugger_wit::stats, sample.swap),
-        host_share: convert_host_share_stats!(debugger_wit::stats, sample.host_share),
-        network: convert_network_stats!(debugger_wit::stats, sample.network),
-        devices: convert_device_stats!(debugger_wit::stats, sample.devices),
-        inputs: convert_input_stats!(debugger_wit::stats, sample.inputs),
-        audio: convert_audio_stats!(debugger_wit::stats, sample.audio),
-    }
-}
-
-/// See [`convert_sample`]: the same machine-wide reading, for the
-/// unprivileged program world.
-fn convert_program_sample(sample: StatsSample) -> program_wit::stats::Sample {
-    let machine = machine_memory();
-    let total_bytes =
-        u64::try_from(machine.usable_bytes).expect("machine memory does not fit into u64");
-    let available_bytes =
-        u64::try_from(machine.free_bytes).expect("free machine memory does not fit into u64");
-    program_wit::stats::Sample {
-        timestamp: sample.timestamp,
-        uptime: sample.uptime,
-        wall_clock: sample.wall_clock,
-        processors: program_wit::stats::Processors {
-            configured: sample.configured_processors,
-            online: sample.online_processors,
-            utilization: (0..sample.configured_processors)
-                .map(|id| program_wit::stats::Processor { id, busy: 0 })
-                .collect(),
-            guest_isa_level: sample.guest_isa_level.into(),
-            guest_isa_extras: sample
-                .guest_isa_extras
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-        },
-        memory: program_wit::stats::Memory {
-            total_bytes,
-            available_bytes,
-            pressure: convert_program_memory_pressure(total_bytes, available_bytes),
-            nodes: convert_memory_node_stats!(program_wit::stats, user_node_stats()),
-        },
-        block: convert_block_stats!(program_wit::stats, sample.block),
-        iommu: convert_iommu_stats!(program_wit::stats, sample.iommu),
-        balloon: convert_balloon_stats!(program_wit::stats, sample.balloon),
-        swap: convert_swap_stats!(program_wit::stats, sample.swap),
-        host_share: convert_host_share_stats!(program_wit::stats, sample.host_share),
-        network: convert_network_stats!(program_wit::stats, sample.network),
-        devices: convert_device_stats!(program_wit::stats, sample.devices),
-        inputs: convert_input_stats!(program_wit::stats, sample.inputs),
-        audio: convert_audio_stats!(program_wit::stats, sample.audio),
-    }
-}
-
-fn convert_memory_pressure(
-    total_bytes: u64,
-    available_bytes: u64,
-) -> debugger_wit::stats::MemoryPressure {
-    if total_bytes == 0 {
-        return debugger_wit::stats::MemoryPressure::Nominal;
-    }
-
-    let used_permille =
-        ((total_bytes.saturating_sub(available_bytes.min(total_bytes))) * 1_000) / total_bytes;
-
-    match used_permille {
-        0..=699 => debugger_wit::stats::MemoryPressure::Nominal,
-        700..=849 => debugger_wit::stats::MemoryPressure::Elevated,
-        850..=949 => debugger_wit::stats::MemoryPressure::High,
-        _ => debugger_wit::stats::MemoryPressure::Critical,
-    }
-}
-
-fn convert_program_memory_pressure(
-    total_bytes: u64,
-    available_bytes: u64,
-) -> program_wit::stats::MemoryPressure {
-    if total_bytes == 0 {
-        return program_wit::stats::MemoryPressure::Nominal;
-    }
-
-    let used_permille =
-        ((total_bytes.saturating_sub(available_bytes.min(total_bytes))) * 1_000) / total_bytes;
-
-    match used_permille {
-        0..=699 => program_wit::stats::MemoryPressure::Nominal,
-        700..=849 => program_wit::stats::MemoryPressure::Elevated,
-        850..=949 => program_wit::stats::MemoryPressure::High,
-        _ => program_wit::stats::MemoryPressure::Critical,
-    }
-}
-
 /// Lowers a shared history event. The history keeps its copy for other
 /// readers, so the guest's copy of each string is made here, after the
 /// history's lock is released.
@@ -6232,64 +5682,9 @@ mod tests {
     use helios_hal::cpu::ProcessorId;
     use helios_hal::watchdog::ProgressCounter;
 
-    use super::{
-        ComponentPhase, ComponentPhaseHeartbeat, ZeroStatsPeriod, spawn_component_phase_heartbeat,
-        stats_period,
-    };
+    use super::{ComponentPhase, ComponentPhaseHeartbeat, spawn_component_phase_heartbeat};
     use crate::test_support::TestCpu;
     use crate::{Executor, InstanceSpawner, TaskCapacityError, TaskFunding, Timer};
-
-    /// Both binding sets get the same field mapping, node by node, in
-    /// node order.
-    #[test]
-    fn memory_nodes_convert_field_for_field_in_both_worlds() {
-        let readings = || {
-            alloc::vec![
-                crate::MemoryNodeStats {
-                    node: helios_hal::numa::NodeId::new(0),
-                    total_bytes: 4096,
-                    available_bytes: 1024,
-                    off_node_allocations: 7,
-                },
-                crate::MemoryNodeStats {
-                    node: helios_hal::numa::NodeId::new(1),
-                    total_bytes: 0,
-                    available_bytes: 0,
-                    off_node_allocations: 0,
-                },
-            ]
-        };
-        let debugger = convert_memory_node_stats!(super::debugger_wit::stats, readings());
-        let program = convert_memory_node_stats!(super::program_wit::stats, readings());
-        assert_eq!(debugger.len(), 2);
-        assert_eq!(program.len(), 2);
-        assert_eq!(
-            (
-                debugger[0].id,
-                debugger[0].total_bytes,
-                debugger[0].available_bytes,
-                debugger[0].off_node_allocations
-            ),
-            (0, 4096, 1024, 7)
-        );
-        assert_eq!(
-            (
-                program[0].id,
-                program[0].total_bytes,
-                program[0].available_bytes,
-                program[0].off_node_allocations
-            ),
-            (0, 4096, 1024, 7)
-        );
-        assert_eq!((debugger[1].id, program[1].id), (1, 1));
-        assert_eq!(debugger[1].total_bytes, 0);
-    }
-
-    #[test]
-    fn a_zero_stats_period_is_the_callers_error() {
-        assert_eq!(stats_period(0), Err(ZeroStatsPeriod));
-        assert_eq!(stats_period(1).map(|period| period.get()), Ok(1));
-    }
 
     /// One block per 64-byte granule is the most blocks an instance
     /// share can ever hold, so a run this long outlives the share

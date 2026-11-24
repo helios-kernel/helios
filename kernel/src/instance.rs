@@ -301,6 +301,22 @@ pub struct RegisteredInstance {
     entry: NonNull<InstanceEntry>,
 }
 
+/// Non-blocking guard pinning a live instance against concurrent
+/// [`InstanceRegistry::while_off_processor`] holds (swap eviction) during a
+/// bounded cross-instance inspect copy.
+pub struct InspectReadPin {
+    instance: RegisteredInstance,
+}
+
+impl Drop for InspectReadPin {
+    fn drop(&mut self) {
+        self.instance
+            .entry()
+            .inspect_readers
+            .fetch_sub(1, Ordering::Release);
+    }
+}
+
 /// Bounded history of retired instances' immutable ancestor chains so
 /// trace events and profile samples emitted by short-lived descendants
 /// remain attributable to an ancestor's subtree after those descendants
@@ -383,6 +399,9 @@ struct InstanceEntry {
     /// creation and the OOM killer, and none of that should cost a turn
     /// begin a miss.
     off_processor_holds: CachePadded<AtomicUsize>,
+    /// Active cross-instance inspect readers pinning this instance's resident
+    /// user pages against concurrent swap eviction (`while_off_processor`).
+    inspect_readers: CachePadded<AtomicUsize>,
     /// Where the instance's global tasks are queued. Shared with every
     /// [`crate::InstanceSpawner`] of the instance, whose tasks may
     /// outlive this entry.
@@ -567,6 +586,7 @@ impl InstanceRegistry {
             condemned_kernel_bytes: AtomicU64::new(0),
             handle_count: AtomicUsize::new(1),
             off_processor_holds: CachePadded::new(AtomicUsize::new(0)),
+            inspect_readers: CachePadded::new(AtomicUsize::new(0)),
             home,
         });
         let entry_ptr = NonNull::from(entry.as_ref());
@@ -864,7 +884,9 @@ impl InstanceRegistry {
         let instance = self.handle(id).ok_or(OffProcessorRefused::NoSuchInstance)?;
         let entry = instance.entry();
         let hold = OffProcessorHold::raise(entry);
-        if entry.stores.lock().any_on_processor() {
+        if entry.stores.lock().any_on_processor()
+            || entry.inspect_readers.load(Ordering::SeqCst) != 0
+        {
             return Err(OffProcessorRefused::OnProcessor);
         }
         let output = work(&OffProcessor {
@@ -873,6 +895,23 @@ impl InstanceRegistry {
         });
         drop(hold);
         Ok(output)
+    }
+
+    /// Non-blocking pin that prevents [`Self::while_off_processor`] (swap
+    /// eviction) from detaching pages of `id` while a cross-instance inspect
+    /// reader validates residency and copies out of `id`'s linear memory.
+    ///
+    /// Returns `None` immediately when `id` is gone or an off-processor hold
+    /// is already in flight.
+    pub fn try_pin_for_read(&self, id: InstanceId) -> Option<InspectReadPin> {
+        let instance = self.handle(id)?;
+        let entry = instance.entry();
+        entry.inspect_readers.fetch_add(1, Ordering::SeqCst);
+        if entry.off_processor_holds.load(Ordering::SeqCst) != 0 {
+            entry.inspect_readers.fetch_sub(1, Ordering::Release);
+            return None;
+        }
+        Some(InspectReadPin { instance })
     }
 
     /// A new handle on the live instance `id`.
