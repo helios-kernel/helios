@@ -338,6 +338,8 @@ settings! {
     fs_memory_storage: crate::vfs::MemoryStorageSetting,
     compiler_max_input_bytes: crate::CompilerMaxInputBytesSetting,
     random_bytes_limit: crate::RandomBytesLimitSetting,
+    component_handle_limit: crate::process::ComponentHandleLimitSetting,
+    buffered_exec_output_limit: crate::process::BufferedExecOutputLimitSetting,
 }
 
 #[cfg(not(feature = "unix"))]
@@ -345,6 +347,8 @@ settings! {
     fs_memory_storage: crate::vfs::MemoryStorageSetting,
     compiler_max_input_bytes: crate::CompilerMaxInputBytesSetting,
     random_bytes_limit: crate::RandomBytesLimitSetting,
+    component_handle_limit: crate::process::ComponentHandleLimitSetting,
+    buffered_exec_output_limit: crate::process::BufferedExecOutputLimitSetting,
 }
 
 #[cfg(test)]
@@ -427,11 +431,12 @@ mod tests {
     #[cfg(feature = "unix")]
     #[test]
     fn the_machine_lists_its_declared_settings() {
+        use crate::process::{BufferedExecOutputLimitSetting, ComponentHandleLimitSetting};
         use crate::{CompilerMaxInputBytesSetting, RandomBytesLimitSetting};
 
         let settings = Settings::default();
 
-        assert_eq!(SETTING_COUNT, 4);
+        assert_eq!(SETTING_COUNT, 6);
         assert_eq!(
             settings.entries(),
             [
@@ -454,6 +459,18 @@ mod tests {
                     name: "random.max-bytes",
                     description: RandomBytesLimitSetting::DESCRIPTION,
                     value: SettingValue::Bytes(RandomBytesLimitSetting::DEFAULT),
+                },
+                SettingEntry {
+                    name: "process.max-component-handles",
+                    description: ComponentHandleLimitSetting::DESCRIPTION,
+                    value: SettingValue::Count(ComponentHandleLimitSetting::DEFAULT_LIMIT as u64),
+                },
+                SettingEntry {
+                    name: "programs.max-buffered-exec-bytes",
+                    description: BufferedExecOutputLimitSetting::DESCRIPTION,
+                    value: SettingValue::Bytes(
+                        BufferedExecOutputLimitSetting::DEFAULT_LIMIT as u64
+                    ),
                 },
             ]
         );

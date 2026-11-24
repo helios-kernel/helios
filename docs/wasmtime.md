@@ -5,13 +5,25 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/bti-52`):
+The local checkout must be at (branch `helios/security-52`):
 
 ```text
-0980d541fce78a40acd2178602c9a8ca5b67620b
+b3d6003675b47b86a089dc7e741a3a25cd8e2061
 ```
 
-That revision is `helios/stack-reserve-52` at
+That revision is `helios/bti-52` at
+`0980d541fce78a40acd2178602c9a8ca5b67620b` plus two additive commits for guest
+preemption safety and component resource-table accounting (#720, #708):
+
+- Bulk-memory libcalls re-derive linear memory base pointers after resuming
+  from stack-limit interruption so a preempted copy/fill cannot write through
+  a stale base (#720).
+- `ResourceTableLimiter` exposes per-entry host memory accounting on component
+  resource tables so Helios can charge table entries against an instance's
+  user-memory budget (#708).
+
+`helios/bti-52` (`0980d541fce78a40acd2178602c9a8ca5b67620b`) is
+`helios/stack-reserve-52` at
 `e3e02d3d7aaaf3317d6211ae61a942983fea8aa2` plus three additive commits for
 AArch64 Branch Target Identification and suspended-fiber return-address
 signing (#370):
