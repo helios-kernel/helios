@@ -5,7 +5,62 @@ use crate::{
 };
 
 pub struct ComponentSerialPort {
+    pub can_read: bool,
+    pub can_write: bool,
     pub _resource: SerialPortResource,
+}
+
+/// Active instruction-sampling lease held in a component's resource table.
+/// Dropping the handle (by guest drop or store teardown) stops sampling.
+pub struct ComponentSamplingSession(pub crate::SamplingSession);
+
+/// Active snapshot-hold lease held in a component's resource table.
+///
+/// Explicit guest drop calls [`Self::release_now`] and releases the runtime
+/// state's hold immediately; an unclosed handle dropped during store teardown
+/// marks [`crate::SnapshotRetirementSender`], which [`crate::StoreSocketRetirement`]
+/// drains right after the resource table drops.
+pub struct ComponentSnapshotHold {
+    token: u64,
+    has_generation_id: bool,
+    retirement: crate::SnapshotRetirementSender,
+    released: bool,
+}
+
+impl ComponentSnapshotHold {
+    pub fn new(
+        token: u64,
+        has_generation_id: bool,
+        retirement: crate::SnapshotRetirementSender,
+    ) -> Self {
+        Self {
+            token,
+            has_generation_id,
+            retirement,
+            released: false,
+        }
+    }
+
+    pub const fn has_generation_id(&self) -> bool {
+        self.has_generation_id
+    }
+
+    pub fn release_now(&mut self) -> Option<u64> {
+        if self.released {
+            return None;
+        }
+        self.released = true;
+        Some(self.token)
+    }
+}
+
+impl Drop for ComponentSnapshotHold {
+    fn drop(&mut self) {
+        if !self.released {
+            self.released = true;
+            self.retirement.mark_released(self.token);
+        }
+    }
 }
 
 pub struct ComponentTcpStream<Backend> {

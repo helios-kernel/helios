@@ -105,7 +105,6 @@ where
             exec_context.runtime_state.clone(),
             registry,
             instance,
-            None,
             exec_context.runtime_state.root_namespace().descend(),
             alloc::vec![String::from(spec.bootfs_path)],
             Vec::new(),

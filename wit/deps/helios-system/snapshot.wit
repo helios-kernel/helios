@@ -3,23 +3,32 @@ package helios:system@0.1.0;
 /// Handing the machine's host share back to the VMM for a snapshot.
 ///
 /// A VMM refuses to snapshot a guest whose 9p host share is attached.
-/// `prepare` releases the share and holds it released, and the hold ends
-/// when the machine generation advances (the copy restored from the
-/// snapshot) or `finished` is called (the machine that keeps running).
+/// `prepare` releases the share and returns a `snapshot-hold` resource that
+/// keeps it released until the resource is dropped (the machine that keeps
+/// running) or the machine generation advances (the copy restored from the
+/// snapshot).
 interface snapshot {
-  /// What the kernel knows that the host needs before it takes the snapshot.
-  record prepared {
-    /// The machine has a VM generation ID, so a copy restored from the
+  /// Why `prepare` could not take a snapshot hold.
+  enum snapshot-error {
+    /// The caller does not hold `machine-right.control`.
+    denied,
+    /// Another `snapshot-hold` is already in force on this machine.
+    busy,
+  }
+
+  /// Active hold keeping the machine's host share released for a VMM snapshot.
+  ///
+  /// Dropping this resource ends the hold and lets parked host-share
+  /// operations re-attach and proceed.
+  resource snapshot-hold {
+    /// Whether the machine has a VM generation ID so a copy restored from the
     /// snapshot learns that it is a copy.
-    has-generation-id: bool,
+    has-generation-id: func() -> bool;
   }
 
   /// Waits for the host-share operations in flight to finish, returns the
-  /// share to the host and holds it there. Operations issued from the
-  /// moment this is called wait for the hold to end; none fails.
-  prepare: async func() -> prepared;
-
-  /// Ends the hold, for the machine that keeps running after the
-  /// snapshot. A no-op when no hold is in force.
-  finished: func();
+  /// share to the host, and holds it released until the returned
+  /// `snapshot-hold` drops. Operations issued while the hold is active wait
+  /// for it to end; none fails.
+  prepare: async func() -> result<snapshot-hold, snapshot-error>;
 }
