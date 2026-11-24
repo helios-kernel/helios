@@ -346,7 +346,7 @@ mod tests {
     fn a_random_length_above_the_setting_traps_without_filling() {
         use crate::settings::Setting;
 
-        let limit = super::RandomBytesLimitSetting::DEFAULT;
+        let limit = crate::RandomBytesLimitSetting::DEFAULT;
         let len = limit + 1;
         let mut filled = false;
         let error = super::random_bytes(len, limit, |_| filled = true)
