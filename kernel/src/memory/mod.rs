@@ -6,8 +6,7 @@
 //! `compressed` is the compressed page pool, the in-memory tier a page
 //! goes to before a disk.
 //! `fiber_stack` owns the arena the runtime's async stacks are committed
-//! out of one page-fault at a time, and `frame_reserve` holds the frames
-//! that fault path is allowed to allocate.
+//! out of ahead of the guest.
 //! `per_processor` carves one block per processor out of memory of the
 //! node the processor is on. `user` carries the per-program user-memory pool used by Wasmtime
 //! linear memories, one buddy pool per NUMA node. `frame_slab` is the
@@ -25,7 +24,6 @@ mod compressed;
 mod entropy;
 mod fiber_stack;
 mod frame_pool;
-mod frame_reserve;
 mod frame_slab;
 mod irq_safe;
 mod locality;
@@ -54,17 +52,13 @@ pub use entropy::{
 #[cfg(feature = "wasmtime-runtime")]
 pub(crate) use fiber_stack::fiber_stack_arena_installed;
 pub use fiber_stack::{
-    FIBER_STACK_GUARD_BYTES, FiberStack, FiberStackArenaStats, FiberStackError, FiberStackVmHooks,
-    InterruptedContext, StackFault, StackReserveError, claim_fiber_stack,
-    commit_fiber_stack_reserve, fiber_stack_arena_stats, fiber_stack_demand_commits_on,
-    install_fiber_stack_arena, install_fiber_stack_hooks, resolve_stack_fault,
+    AllocationTagHooks, FIBER_STACK_GUARD_BYTES, FiberStack, FiberStackArenaStats, FiberStackError,
+    FiberStackVmHooks, StackFault, StackReserveError, claim_fiber_stack, classify_stack_fault,
+    commit_fiber_stack_reserve, fiber_stack_arena_stats, fiber_stack_reserve_commits_on,
+    install_fiber_stack_arena, install_fiber_stack_hooks,
 };
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
 pub(crate) use fiber_stack::{fiber_parking, parked_fibers};
-pub use frame_reserve::reserved_bytes as page_fault_frame_reserve_bytes;
-pub(crate) use frame_reserve::{
-    configure as configure_frame_reserve, top_up as top_up_frame_reserve,
-};
 pub(crate) use irq_safe::IrqSafeMutex;
 pub use locality::{Locality, NodeRun};
 pub use mapping_cost::user_mapping_kernel_heap_bytes;

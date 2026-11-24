@@ -229,6 +229,21 @@ pub(crate) enum VmConfigError {
          virtio-iommu can only confine PCI endpoints"
     )]
     IommuUnavailable { arch: &'static str },
+    #[error(
+        "--mte on is not available on {arch}: only the aarch64 `virt` machine has allocation-tag \
+         storage"
+    )]
+    MteUnavailable { arch: &'static str },
+    #[error(
+        "--mte on is not available under HVF: QEMU gives no allocation-tag storage to a guest \
+         the Hypervisor framework runs; use --accel tcg"
+    )]
+    MteUnderHvf,
+    #[error(
+        "--mte on cannot be combined with --memory {memory}: QEMU disables memory hotplug \
+         (`slots=`, `maxmem=`) on a machine with allocation-tag storage"
+    )]
+    MteWithMemoryHotplug { memory: String },
     #[error("{0}")]
     Numa(#[from] NumaError),
     #[error("{0}")]
@@ -1445,6 +1460,19 @@ pub(crate) enum VmGuestRam {
     Prealloc,
 }
 
+/// Whether the aarch64 `virt` machine is given Arm allocation-tag
+/// storage (`-machine …,mte=on`).
+///
+/// QEMU provides tag storage under TCG, refuses it under HVF, and under
+/// KVM only on a host whose KVM supports it, so a session that does not
+/// say resolves to on for TCG and off for the native accelerators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum VmMte {
+    On,
+    Off,
+}
+
 /// The `-object` id of the guest RAM backend, which the machine
 /// names as its memory backend. It is the id the Fedora baseline gives
 /// its own (`GUEST_RAM_ID` in `tools/wasi-apps/fedora_qemu_baseline.py`),
@@ -1735,6 +1763,8 @@ pub(crate) struct VmConfigFile {
     pub(crate) acpi: Option<bool>,
     #[serde(default)]
     pub(crate) iommu: Option<bool>,
+    #[serde(default)]
+    pub(crate) mte: Option<VmMte>,
     #[serde(default)]
     pub(crate) virtio_packed: Option<bool>,
     #[serde(default)]
@@ -2048,6 +2078,19 @@ pub(crate) struct VmCommand {
     /// reaches the memory the kernel maps into its domain.
     #[arg(long, default_value_t = false)]
     iommu: bool,
+
+    /// Give the aarch64 `virt` machine allocation-tag storage
+    /// (`-machine …,mte=on`), which Arm memory tagging needs.
+    ///
+    /// Left unset, it is on for aarch64 under `--accel tcg` and off under
+    /// `hvf` and `kvm`. `on` is refused under `hvf`, which QEMU does not
+    /// give tag storage, for any other architecture, and with a
+    /// `--memory` that carries `slots=` or `maxmem=`, since QEMU
+    /// disables memory hotplug with tag storage. Under `kvm` QEMU itself
+    /// refuses a host without KVM MTE support.
+    #[arg(long, value_enum)]
+    mte: Option<VmMte>,
+
     /// Transport carrying the inspector RPC to the guest debugger.
     ///
     /// `vsock` needs a host that can provide a vsock device; the session
@@ -2492,6 +2535,9 @@ struct ResolvedVmCommand {
     keep_runtime_dir: bool,
     acpi: bool,
     iommu: bool,
+    /// Whether `-machine` carries `mte=on`, resolved from `--mte`, the
+    /// architecture and the accelerator.
+    mte: bool,
     desktop: bool,
     display: VmDisplayBackend,
     renderer: Option<VmRendererConfig>,
@@ -3257,6 +3303,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
             arch: arch_label(arch),
         });
     }
+    let mte = resolve_mte(command.mte.or(file.mte), arch, &accel, &memory)?;
     let hostmem = command.renderer_hostmem.or(file.renderer_hostmem);
     let renderer = match (command.renderer.or(file.renderer), hostmem) {
         (Some(kind), hostmem) => Some(VmRendererConfig {
@@ -3343,6 +3390,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         keep_runtime_dir,
         acpi,
         iommu,
+        mte,
         desktop,
         display,
         renderer,
@@ -3358,6 +3406,62 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
             .is_some_and(ResolvedVmSessionCommand::needs_qmp),
         command: session_command,
     })
+}
+
+/// The accelerator name of one `-accel` value, which may carry options
+/// after a comma (`tcg,thread=multi`).
+fn accel_name(accel: &str) -> &str {
+    accel.split_once(',').map_or(accel, |(name, _)| name)
+}
+
+/// Whether a `-m` value carries the hotplug keys QEMU's `virt` machine
+/// cannot honour together with allocation-tag storage.
+fn memory_has_hotplug(memory: &str) -> bool {
+    memory.split(',').skip(1).any(|entry| {
+        matches!(
+            entry.split_once('=').map(|(key, _)| key),
+            Some("slots" | "maxmem")
+        )
+    })
+}
+
+/// Whether the machine gets allocation-tag storage.
+///
+/// Unset, it is on for aarch64 when every accelerator is TCG (the only
+/// one QEMU gives tag storage on the hosts this project uses, and not a
+/// session whose `--memory` asks for hotplug, which the storage rules
+/// out) and off otherwise. A stated `on` is refused where QEMU cannot
+/// honour it, before it starts.
+fn resolve_mte(
+    requested: Option<VmMte>,
+    arch: VmArch,
+    accel: &[String],
+    memory: &str,
+) -> Result<bool, VmConfigError> {
+    let aarch64 = arch == VmArch::Aarch64;
+    match requested {
+        Some(VmMte::Off) => Ok(false),
+        Some(VmMte::On) => {
+            if !aarch64 {
+                return Err(VmConfigError::MteUnavailable {
+                    arch: arch_label(arch),
+                });
+            }
+            if accel.iter().any(|value| accel_name(value) == "hvf") {
+                return Err(VmConfigError::MteUnderHvf);
+            }
+            if memory_has_hotplug(memory) {
+                return Err(VmConfigError::MteWithMemoryHotplug {
+                    memory: memory.to_owned(),
+                });
+            }
+            Ok(true)
+        }
+        None => Ok(aarch64
+            && !accel.is_empty()
+            && accel.iter().all(|value| accel_name(value) == "tcg")
+            && !memory_has_hotplug(memory)),
+    }
 }
 
 fn load_config_file(path: Option<&Path>) -> Result<VmConfigFile, VmConfigError> {
@@ -7000,14 +7104,21 @@ fn configure_entropy_device(
 }
 
 /// The `-machine` option list this session boots, which is the ACPI
-/// variant only when `--acpi` asked for it and the profile has one.
-fn machine(command: &ResolvedVmCommand) -> &'static str {
-    if command.acpi {
-        return command.profile.acpi_machine.unwrap_or_else(|| {
+/// variant only when `--acpi` asked for it and the profile has one, with
+/// `mte=on` when the session resolved to allocation-tag storage.
+fn machine(command: &ResolvedVmCommand) -> String {
+    let base = if command.acpi {
+        command.profile.acpi_machine.unwrap_or_else(|| {
             unreachable!("--acpi is refused on a machine profile that publishes no ACPI tables")
-        });
+        })
+    } else {
+        command.profile.machine
+    };
+    let mut options = QemuOptions::new(base);
+    if command.mte {
+        options.set("mte", "on");
     }
-    command.profile.machine
+    options.to_string()
 }
 
 /// The processor count and the guest RAM backends.
@@ -7333,6 +7444,8 @@ mod tests {
         },
         #[error("expected a {CFI_VIOLATION_MESSAGE:?} panic from the guest, got: {outcome}")]
         NotAControlFlowViolation { outcome: String },
+        #[error("expected a {MTE_FAULT_MESSAGE:?} panic from the guest, got: {outcome}")]
+        NotATagCheckFault { outcome: String },
         #[error("socket path must be valid UTF-8")]
         SocketPathNotUtf8,
         #[error("failed to connect {purpose} RPC client: {source}")]
@@ -7403,6 +7516,8 @@ mod tests {
     /// What the aarch64 kernel's panic carries when a return address fails
     /// authentication (`aarch64/src/cfi.rs`).
     const CFI_VIOLATION_MESSAGE: &str = "control-flow violation:";
+    const MTE_FAULT_MESSAGE: &str = "AArch64 synchronous tag check fault:";
+    const MTE_FREE_TAG_MESSAGE: &str = "holds tag 0x0";
     const WATCHDOG_TIMEOUT_SECS: &str = "10";
     const WATCHDOG_STAGE_TIMEOUT: Duration = Duration::from_secs(120);
     const DIRECT_EXEC_TIMEOUT: Duration = Duration::from_secs(900);
@@ -8145,6 +8260,100 @@ mod tests {
         assert_eq!(machine(&command), "virt,gic-version=3,acpi=off");
         command.acpi = true;
         assert_eq!(machine(&command), "virt,gic-version=3,acpi=on");
+    }
+
+    /// Resolves an aarch64 session on the given accelerator, with the
+    /// given `--mte` and `--memory`, against no config file.
+    fn resolve_mte_session(
+        arch: VmArch,
+        accel: &str,
+        mte: Option<VmMte>,
+        memory: Option<&str>,
+    ) -> Result<ResolvedVmCommand, VmConfigError> {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        resolve(VmCommand {
+            arch,
+            accel: vec![accel.to_owned()],
+            mte,
+            memory: memory.map(str::to_owned),
+            config: Some(tempdir.path().join("missing-vm.json")),
+            ..minimal_command()
+        })
+    }
+
+    #[test]
+    fn aarch64_tcg_boots_carry_mte_on() {
+        let mut resolved = resolve_mte_session(VmArch::Aarch64, "tcg", None, None)
+            .expect("a default aarch64 TCG session resolves");
+        assert!(resolved.mte);
+        assert_eq!(machine(&resolved), "virt,gic-version=3,acpi=off,mte=on");
+        assert_eq!(
+            machine_options(&resolved).to_string(),
+            "virt,gic-version=3,acpi=off,mte=on"
+        );
+        resolved.acpi = true;
+        assert_eq!(machine(&resolved), "virt,gic-version=3,acpi=on,mte=on");
+    }
+
+    #[test]
+    fn aarch64_hvf_default_has_no_mte() {
+        for accel in ["hvf", "kvm"] {
+            let resolved = resolve_mte_session(VmArch::Aarch64, accel, None, None)
+                .expect("a default native aarch64 session resolves");
+            assert!(!resolved.mte, "{accel}");
+            assert_eq!(machine(&resolved), "virt,gic-version=3,acpi=off", "{accel}");
+        }
+    }
+
+    #[test]
+    fn mte_on_under_hvf_is_refused() {
+        let error = resolve_mte_session(VmArch::Aarch64, "hvf", Some(VmMte::On), None)
+            .expect_err("QEMU gives HVF guests no allocation-tag storage");
+        assert!(matches!(error, VmConfigError::MteUnderHvf), "{error}");
+        assert!(error.to_string().contains("HVF"), "{error}");
+
+        let kvm = resolve_mte_session(VmArch::Aarch64, "kvm", Some(VmMte::On), None)
+            .expect("KVM passes the request through to QEMU");
+        assert_eq!(machine(&kvm), "virt,gic-version=3,acpi=off,mte=on");
+    }
+
+    #[test]
+    fn mte_off_under_tcg_drops_it() {
+        let resolved = resolve_mte_session(VmArch::Aarch64, "tcg", Some(VmMte::Off), None)
+            .expect("an aarch64 TCG session without tag storage resolves");
+        assert!(!resolved.mte);
+        assert_eq!(machine(&resolved), "virt,gic-version=3,acpi=off");
+    }
+
+    #[test]
+    fn mte_on_for_riscv_is_refused() {
+        for arch in [VmArch::Riscv64, VmArch::X86_64] {
+            let error = resolve_mte_session(arch, "tcg", Some(VmMte::On), None)
+                .expect_err("only the aarch64 machine has allocation-tag storage");
+            assert!(
+                matches!(error, VmConfigError::MteUnavailable { .. }),
+                "unexpected error for {arch:?}: {error}"
+            );
+            let default =
+                resolve_mte_session(arch, "tcg", None, None).expect("a default session resolves");
+            assert!(!default.mte, "{arch:?}");
+        }
+    }
+
+    #[test]
+    fn mte_on_with_memory_hotplug_is_refused() {
+        for memory in ["2G,slots=4,maxmem=8G", "2G,maxmem=8G"] {
+            let error = resolve_mte_session(VmArch::Aarch64, "tcg", Some(VmMte::On), Some(memory))
+                .expect_err("QEMU disables memory hotplug with tag storage");
+            assert!(
+                matches!(error, VmConfigError::MteWithMemoryHotplug { .. }),
+                "{memory}: {error}"
+            );
+            let default = resolve_mte_session(VmArch::Aarch64, "tcg", None, Some(memory))
+                .expect("an unstated --mte does not refuse");
+            assert!(!default.mte, "{memory}");
+        }
     }
 
     #[test]
@@ -9100,6 +9309,7 @@ mod tests {
             keep_runtime_dir: false,
             acpi: false,
             iommu: false,
+            mte: None,
             virtio_packed: false,
             virtio_in_order: false,
             desktop: false,
@@ -9178,6 +9388,7 @@ mod tests {
             keep_runtime_dir: false,
             acpi: false,
             iommu: false,
+            mte: None,
             virtio_packed: false,
             virtio_in_order: false,
             desktop: false,
@@ -9865,6 +10076,7 @@ mod tests {
             keep_runtime_dir: false,
             acpi: false,
             iommu: false,
+            mte: None,
             virtio_packed: false,
             virtio_in_order: false,
             desktop: false,
@@ -9941,6 +10153,48 @@ mod tests {
                 outcome: other.to_string(),
             }),
             Ok(()) => Err(GuestTestFailure::NotAControlFlowViolation {
+                outcome: "the guest booted to the debugger".to_owned(),
+            }),
+        }
+    }
+
+    /// The aarch64 kernel built with `HELIOS_MTE_SELF_TEST` reads into a
+    /// `Tag::FREE` redzone through a live-tagged pointer once every processor
+    /// has started, so a machine with FEAT_MTE2 enabled panics with a
+    /// synchronous tag check fault naming the faulting granule and `0x0` tag.
+    #[test]
+    #[ignore = "requires qemu and a cross-compiled aarch64 kernel"]
+    fn mte_self_test_panics_aarch64() -> Result<(), GuestTestFailure> {
+        let mut command = guest_test_command(&AARCH64_VIRT_TCG_PROFILE);
+        command.mte = true;
+        build_self_test_kernel(&command, &[("HELIOS_MTE_SELF_TEST", "1")])?;
+        let mut runtime = VmRuntime::spawn(&command)?;
+        let socket = runtime
+            .socket_path()
+            .to_str()
+            .ok_or(GuestTestFailure::SocketPathNotUtf8)?
+            .to_owned();
+        let baud = command.baud;
+        let outcome = crate::runtime::block_on(async move {
+            let io = crate::serial::open(&socket, baud)
+                .await
+                .map_err(|source| GuestTestFailure::OpenSerial { source })?;
+            let (read, _write) = io.into_split();
+            Ok::<_, GuestTestFailure>(crate::ready::wait_for_boot(read).await.map(drop))
+        })?;
+        runtime.shutdown();
+        match outcome {
+            Err(crate::ready::BootError::GuestPanicked { report, trailer })
+                if (report.contains(MTE_FAULT_MESSAGE) || trailer.contains(MTE_FAULT_MESSAGE))
+                    && (report.contains(MTE_FREE_TAG_MESSAGE)
+                        || trailer.contains(MTE_FREE_TAG_MESSAGE)) =>
+            {
+                Ok(())
+            }
+            Err(other) => Err(GuestTestFailure::NotATagCheckFault {
+                outcome: other.to_string(),
+            }),
+            Ok(()) => Err(GuestTestFailure::NotATagCheckFault {
                 outcome: "the guest booted to the debugger".to_owned(),
             }),
         }
@@ -10065,6 +10319,7 @@ mod tests {
             keep_runtime_dir: false,
             acpi: false,
             iommu: false,
+            mte: false,
             desktop: false,
             display: VmDisplayBackend::None,
             renderer: None,
@@ -10290,6 +10545,7 @@ mod tests {
             keep_runtime_dir: false,
             acpi: false,
             iommu: false,
+            mte: false,
             desktop: false,
             display: VmDisplayBackend::None,
             renderer: None,

@@ -127,6 +127,9 @@ pub(crate) struct ResumeContext {
     hcr: u64,
     apia_lo: u64,
     apia_hi: u64,
+    mte_enabled: u64,
+    gcr: u64,
+    rgsr: u64,
     idmap: [Table; 3],
 }
 
@@ -152,6 +155,9 @@ const _: () = {
     assert!(offset_of!(ResumeContext, hcr) == 312);
     assert!(offset_of!(ResumeContext, apia_lo) == 320);
     assert!(offset_of!(ResumeContext, apia_hi) == 328);
+    assert!(offset_of!(ResumeContext, mte_enabled) == 336);
+    assert!(offset_of!(ResumeContext, gcr) == 344);
+    assert!(offset_of!(ResumeContext, rgsr) == 352);
 };
 
 impl ResumeContext {
@@ -441,6 +447,10 @@ unsafe fn prepare_context(context: *mut ResumeContext, psci: Psci) {
     context.conduit = psci.conduit as u64;
     context.apia_lo = read_apiakeylo_el1().bits();
     context.apia_hi = read_apiakeyhi_el1().bits();
+    let (mte_enabled, gcr, rgsr) = crate::tagging::save_registers();
+    context.mte_enabled = u64::from(mte_enabled);
+    context.gcr = gcr;
+    context.rgsr = rgsr;
     context.exception_level = crate::current_exception_level();
     context.hcr = if context.exception_level == 2 << 2 {
         read_system_register!("hcr_el2")

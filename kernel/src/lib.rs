@@ -37,6 +37,8 @@ mod linux_container;
 mod log;
 mod machine;
 mod memory;
+#[cfg(feature = "wasmtime-runtime")]
+mod memory_tagging;
 mod network;
 mod process;
 mod profiling;
@@ -208,14 +210,14 @@ pub use machine::{
     spawn_generation_probe,
 };
 pub use memory::{
-    AGE_BATCH_PAGES, AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan,
-    BootRegionSplitter, COMPRESSED_PAGE_BYTES, CommittedRegion, CommittedRemoval, CompressRefusal,
-    CompressedPage, CompressedPool, CompressedPoolError, CompressedPoolStats,
+    AGE_BATCH_PAGES, AccessibilityPlan, AllocationTagHooks, BalloonHandle, BalloonStats,
+    BootMemoryPlan, BootRegionSplitter, COMPRESSED_PAGE_BYTES, CommittedRegion, CommittedRemoval,
+    CompressRefusal, CompressedPage, CompressedPool, CompressedPoolError, CompressedPoolStats,
     DEFAULT_COMPRESSION_LEVEL, DEFAULT_POOL_PERCENT, Decommitted, DetachedPages,
     ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, FIBER_STACK_GUARD_BYTES,
     FREE_PAGE_REPORT_INTERVAL, FiberStack, FiberStackArenaStats, FiberStackError,
     FiberStackVmHooks, FrameReservation, FrameShortage, HardwareEntropySource, IDLE_SWAP_AFTER,
-    INCOMPRESSIBLE_BYTES, InstalledAddressSpace, InterruptedContext, KERNEL_HEAP_BOOTSTRAP_BYTES,
+    INCOMPRESSIBLE_BYTES, InstalledAddressSpace, KERNEL_HEAP_BOOTSTRAP_BYTES,
     KERNEL_HEAP_GROWTH_CHUNK_BYTES, KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES,
     KERNEL_HEAP_RESERVE_FRACTION, LocalMemory, LocalSlice, Locality, MemoryNodeStats, MemoryOwner,
     NativePage, NativePages, NativeSlice, NativeSpace, NoCryptographicEntropy, NoEntropyDevice,
@@ -228,16 +230,15 @@ pub use memory::{
     UserMemoryOwners, UserMemoryPool, UserResidency, UserTranslation, VaCursor,
     allocate_user_frame_uninit_on, allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed,
     allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, claim_fiber_stack,
-    commit_fiber_stack_reserve, configure_user_memory_owner_processors, current_user_memory_owner,
-    deallocate_user_frame, deallocate_user_frame_on, deallocate_user_run_on, disable_swap,
-    enter_user_memory_owner, fiber_stack_arena_stats, fiber_stack_demand_commits_on,
-    install_entropy_device, install_fiber_stack_arena, install_fiber_stack_hooks,
-    install_memory_balloon, install_residency_hooks, install_swap, install_swap_hooks,
-    install_user_memory_pool, installed_swap_handle, installed_swap_hooks, kernel_reserve_for,
-    largest_servable_user_bytes, page_fault_frame_reserve_bytes, ranges_outside,
-    residency_vm_hooks, resolve_stack_fault, seed_root_entropy, swap_vm_hooks, swapped_token,
-    task_arena_bytes_for, user_frame_node, user_heap_stats, user_mapping_kernel_heap_bytes,
-    user_node_stats, validate_range,
+    classify_stack_fault, commit_fiber_stack_reserve, configure_user_memory_owner_processors,
+    current_user_memory_owner, deallocate_user_frame, deallocate_user_frame_on,
+    deallocate_user_run_on, disable_swap, enter_user_memory_owner, fiber_stack_arena_stats,
+    fiber_stack_reserve_commits_on, install_entropy_device, install_fiber_stack_arena,
+    install_fiber_stack_hooks, install_memory_balloon, install_residency_hooks, install_swap,
+    install_swap_hooks, install_user_memory_pool, installed_swap_handle, installed_swap_hooks,
+    kernel_reserve_for, largest_servable_user_bytes, ranges_outside, residency_vm_hooks,
+    seed_root_entropy, swap_vm_hooks, swapped_token, task_arena_bytes_for, user_frame_node,
+    user_heap_stats, user_mapping_kernel_heap_bytes, user_node_stats, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -1057,15 +1058,6 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
         // nothing, which is where a processor asked to go offline tears
         // itself down and stops.
         self.service_lifecycle(steps);
-        // A fiber-stack fault whose interrupted context had interrupts
-        // masked takes its frames from this processor's reserve, because
-        // it may not wait on the pool's lock. The reserve is refilled
-        // here, through the pool's ordinary blocking path: every executor
-        // loop on every processor comes through this call, holding
-        // nothing, so waiting out another processor's critical section is
-        // safe. It is one atomic load when the reserve is full, which is
-        // nearly always.
-        memory::top_up_frame_reserve(current_processor());
         let mut progress = 0;
         let mut stats = KernelRunStats::default();
 
@@ -1521,10 +1513,6 @@ where
     // and the answer is per-processor; build that table out of the pool
     // it describes.
     memory::configure_user_memory_owner_processors(pool);
-    // And the frames the page-fault path is allowed to take, which come
-    // out of this same pool and are held per processor because a fault
-    // may not wait on its lock.
-    memory::configure_frame_reserve(pool);
     pool
 }
 
