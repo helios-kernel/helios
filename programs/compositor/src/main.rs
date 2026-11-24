@@ -66,7 +66,7 @@ mod bindings {
 }
 
 /// The shell the desktop boots into.
-const SHELL_PATH: &str = "/bin/dash";
+const SHELL_PATH: &str = "/bin/nu";
 
 /// Events waiting to be folded into the next frame.
 ///
@@ -404,7 +404,7 @@ async fn start_shell(
     events: &Sender<Event>,
 ) -> Result<(Child, helios_api::wit_bindgen::StreamWriter<u8>), DesktopError> {
     let child = Child::spawn(SpawnRequest {
-        name: String::from("dash"),
+        name: String::from("nu"),
         args: Vec::new(),
         env: vec![
             (String::from("TERM"), String::from("dumb")),

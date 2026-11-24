@@ -17,6 +17,7 @@
 .type __helios_aarch64_hand_over_probe_claimed, %function
 .balign 4
 __helios_aarch64_hand_over_probe_claimed:
+    hint #34
     sub sp, sp, #{save_bytes}
     stp x19, x20, [sp, #0x00]
     stp x21, x22, [sp, #0x10]
@@ -42,6 +43,9 @@ __helios_aarch64_hand_over_probe_claimed:
 1:
     brk #{claim_brk}
 2:
+    // Resumed by `br x4` from `hand_over.rs`, which requires a `bti j`/`jc`
+    // landing pad on guarded pages.
+    hint #38
     ldr x10, [sp, #0xa0]
     mrs x9, spsel
     str x9, [x10, #{resumed_spsel}]
@@ -76,6 +80,7 @@ __helios_aarch64_hand_over_probe_claimed:
 .type __helios_aarch64_hand_over_probe_returning, %function
 .balign 4
 __helios_aarch64_hand_over_probe_returning:
+    hint #34
     mov x10, sp
     str x10, [x0, #{return_sp}]
     adr x9, 1f

@@ -8232,6 +8232,32 @@ mod tests {
             );
 
             service.tcp_close(stream);
+
+            let listener = {
+                let fut = core::pin::pin!(service.tcp_listen(loopback, 0, 4, 64));
+                poll_ready(fut, &mut cx).expect("loopback tcp listen must succeed")
+            };
+            let (client, progress) = {
+                let fut = core::pin::pin!(service.tcp_connect_start(
+                    loopback,
+                    listener.local_port,
+                    0,
+                    64,
+                ));
+                poll_ready(fut, &mut cx).expect(
+                    "non-blocking connect start must return Pending even on immediate loopback handshake",
+                )
+            };
+            assert_eq!(progress, crate::TcpConnectPoll::Pending);
+
+            let polled = {
+                let fut = core::pin::pin!(service.tcp_connect_poll(client));
+                poll_ready(fut, &mut cx).expect("subsequent poll must report Connected")
+            };
+            assert_eq!(polled, crate::TcpConnectPoll::Connected);
+
+            service.tcp_close(client);
+            service.tcp_listener_close(listener.listener);
         }
     }
 }

@@ -37,5 +37,7 @@ deny = [
         # (`disas`), both used only by `compiler-support`'s lowering tests.
         "cranelift-reader",
         "cranelift-codegen",
+        # Nushell's glob crate uses anyhow internally for pattern errors.
+        "nu-glob",
     ] },
 ]

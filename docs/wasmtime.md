@@ -5,13 +5,30 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/stack-reserve-52`):
+The local checkout must be at (branch `helios/bti-52`):
 
 ```text
-e3e02d3d7aaaf3317d6211ae61a942983fea8aa2
+0980d541fce78a40acd2178602c9a8ca5b67620b
 ```
 
-That revision is `helios/sync-main-52` at
+That revision is `helios/stack-reserve-52` at
+`e3e02d3d7aaaf3317d6211ae61a942983fea8aa2` plus three additive commits for
+AArch64 Branch Target Identification and suspended-fiber return-address
+signing (#370):
+
+- `wasmtime_fiber_switch` on AArch64 begins with a `bti c` (`hint #34`)
+  landing pad so the final `blr x22` from a finished fiber lands legally on
+  guarded pages.
+- `wasmtime`'s `fiber-return-address-signing` feature
+  (`wasmtime-fiber/return-address-signing`) signs a suspended AArch64 fiber's
+  return address with key A and the stack pointer as modifier (`paciasp`/`autiasp`),
+  and signs the initial fiber frame's `lr` to match.
+- `tests/disas/aarch64-bti.wat` pins Cranelift's AArch64 BTI landing pads on
+  function entries, indirect tail calls through `x16`, `br_table` targets,
+  and exception handler blocks under `use_bti`.
+
+`helios/stack-reserve-52` (`e3e02d3d7aaaf3317d6211ae61a942983fea8aa2`) is
+`helios/sync-main-52` at
 `56131f786d90a136fec6e80e143de18e5b38e8de` plus six additive commits, which
 let an embedder that commits fiber stacks lazily commit the stack host code
 needs before anything touches it (#535):

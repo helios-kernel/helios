@@ -176,6 +176,7 @@ jobs:
             programs:
               - '!**/*.md'
               - 'programs/**'
+              - 'nu-shell/**'
               - 'api/**'
               - 'api-macro/**'
               - 'compiler-plugin/**'
@@ -1298,8 +1299,9 @@ jobs:
           grep -Fqx ok boot-dt.out
           grep -F 'platform described by device-tree' "$runtime/inspector.log"
           # Every processor installed the machine's key and enabled
-          # return-address signing before the kernel ran anything else.
-          grep -F 'return-address signing enabled on every processor' "$runtime/inspector.log"
+          # return-address signing and BTI before the kernel ran anything else.
+          grep -F 'control-flow integrity enabled on every processor' "$runtime/inspector.log"
+          grep -F 'bti=true' "$runtime/inspector.log"
           # Under TCG the inspector enables QEMU's allocation-tag storage by
           # default, so every processor enables synchronous tag checking and
           # passes its bring-up self-check.
@@ -1388,7 +1390,8 @@ jobs:
           cat boot-acpi.out
           grep -Fqx ok boot-acpi.out
           grep -F 'platform described by acpi' "$runtime/inspector.log"
-          grep -F 'return-address signing enabled on every processor' "$runtime/inspector.log"
+          grep -F 'control-flow integrity enabled on every processor' "$runtime/inspector.log"
+          grep -F 'bti=true' "$runtime/inspector.log"
           grep -F 'memory tagging enabled on every processor' "$runtime/inspector.log"
           # The ACPI walk looks for virtio transports by hardware id and
           # names nothing else, so an ACPI-described machine publishes
@@ -1863,6 +1866,17 @@ jobs:
         run: |
           cargo test -p helios-inspector -- --ignored --nocapture --exact \
             vm::tests::cfi_self_test_panics_aarch64
+      - name: Refuse an unguarded indirect call (BTI)
+        timeout-minutes: 60
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          cargo test -p helios-inspector -- --ignored --nocapture --exact \
+            vm::tests::bti_self_test_panics_aarch64
       - name: Refuse a tag mismatch
         timeout-minutes: 60
         shell: bash
@@ -2858,9 +2872,8 @@ jobs:
           # input device, draws a desktop, runs the shell in a terminal
           # on it, and puts what is typed at it on the screen.
           #
-          # No `--no-compiler-plugin` here, unlike the two boots above:
-          # the compositor spawns `/bin/dash`, which is a raw wasm the
-          # in-kernel compiler has to turn into an artifact first.
+          # The compositor spawns `/bin/nu` directly as a precompiled
+          # component from bootfs.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/desktop-compositor"
           captures="$GITHUB_WORKSPACE/desktop-scanout"
           mkdir -p "$runtime" "$captures"
@@ -2870,7 +2883,7 @@ jobs:
             --desktop --display none \
             --qemu-trace trace:virtio_gpu_update_cursor \
             --qemu-trace-log "$runtime/qemu-trace.log" \
-            --boot-program dash --boot-program debugger \
+            --boot-program nu --boot-program debugger \
             --boot-program compositor --boot-program surface-test \
             screendump \
               --run /bin/surface-test --run-wait-seconds 60 \
@@ -2943,7 +2956,7 @@ jobs:
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --desktop --display none \
-            --boot-program dash --boot-program debugger \
+            --boot-program nu --boot-program debugger \
             --boot-program compositor \
             screendump \
               --input tools/desktop/desktop-probe.input --input-interval-ms 150 \
@@ -3296,7 +3309,7 @@ jobs:
             --root-public-key target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-root-public.key
           "$HELIOS_CLI_BIN" artifact-stage \
             --kind image --arch x86-64 --profile release \
-            --program cpu --program dash --program debugger --program init \
+            --program cpu --program debugger --program init --program nu \
             --out-dir "$RUNNER_TEMP/stage-image-x86-64-cpu" \
             --kernel target/x86_64-unknown-none/profile-use/helios \
             --root-public-key target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-root-public.key \
@@ -3557,7 +3570,7 @@ jobs:
             --accel kvm --runtime-dir "$runtime" --keep-runtime-dir \
             --renderer virtio-gpu-gl --renderer-hostmem 256M \
             --display egl-headless \
-            --boot-program dash --boot-program debugger \
+            --boot-program nu --boot-program debugger \
             --boot-program compositor --boot-program pride-flag \
             --no-compiler-plugin \
             screendump --settle-seconds 20 --run /bin/pride-flag \
@@ -3622,7 +3635,7 @@ jobs:
             --root-public-key target/kernel-prebuild/x86_64-unknown-none/debug/helios-root-public.key
           "$HELIOS_CLI_BIN" artifact-stage \
             --kind image --arch x86-64 --profile debug \
-            --program compositor --program dash --program debugger --program init --program pride-flag \
+            --program compositor --program debugger --program init --program nu --program pride-flag \
             --out-dir "$RUNNER_TEMP/stage-image-x86-64-debug" \
             --kernel target/x86_64-unknown-none/debug/helios \
             --root-public-key target/kernel-prebuild/x86_64-unknown-none/debug/helios-root-public.key \
@@ -3755,6 +3768,9 @@ jobs:
           pattern: btrfs-upstream-*
           path: helios/target
           merge-multiple: true
+      - name: Install the pinned Rust toolchain
+        working-directory: helios
+        run: rustup toolchain install
       - name: Fuzz Helios with upstream seeds and AddressSanitizer
         working-directory: helios
         env:
