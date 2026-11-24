@@ -412,9 +412,7 @@ async fn run_ops_session_command(
                 _ => String::new(),
             };
             let shell_path = cmd.shell.as_deref().unwrap_or(programs::REMOTE_SHELL_PATH);
-            let res = session
-                .exec(shell_path, &["-c".to_owned(), script])
-                .await?;
+            let res = session.exec(shell_path, &["-c".to_owned(), script]).await?;
             std::io::stdout().write_all(&res.output.stdout)?;
             std::io::stderr().write_all(&res.output.stderr)?;
             if res.exit_code != 0 {
@@ -752,27 +750,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_shell_and_repl_explicit_shell_flag() {
-        let shell_args = Args::try_parse_from([
-            "helios-inspector",
-            "shell",
-            "--shell",
-            "/bin/nu",
-            "-c",
-            "true",
-        ])
-        .expect("shell --shell must parse");
+    fn parses_shell_explicit_shell_flag_and_repl_alias() {
+        let shell_args =
+            Args::try_parse_from(["helios", "shell", "--shell", "/bin/nu", "-c", "true"])
+                .expect("shell --shell must parse");
         match shell_args.command.expect("subcommand must be present") {
             Command::Shell(cmd) => assert_eq!(cmd.shell.as_deref(), Some("/bin/nu")),
             _ => panic!("expected shell subcommand"),
         }
 
-        let repl_args = Args::try_parse_from(["helios-inspector", "repl", "--shell", "/bin/nu"])
-            .expect("repl --shell must parse");
-        match repl_args.command.expect("subcommand must be present") {
-            Command::Repl(cmd) => assert_eq!(cmd.shell.as_deref(), Some("/bin/nu")),
-            _ => panic!("expected repl subcommand"),
-        }
+        let repl_args =
+            Args::try_parse_from(["helios", "repl"]).expect("repl alias for nu must parse");
+        assert!(matches!(repl_args.command, Some(Command::Nu(_))));
     }
 
     #[test]

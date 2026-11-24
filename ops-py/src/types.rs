@@ -524,6 +524,11 @@ impl PyInstance {
     }
 
     #[getter]
+    fn storage_bytes(&self) -> u64 {
+        self.inner.storage_bytes
+    }
+
+    #[getter]
     fn cpu_busy(&self) -> u16 {
         self.inner.cpu_busy
     }

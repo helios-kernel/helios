@@ -167,6 +167,7 @@ impl AsyncCommandRegistry {
             description: spec.description,
             extra_description: spec.extra_description,
             search_terms: spec.search_terms,
+            pipe_redirection: (None, None),
         };
         let decl_id = working_set.add_decl(Box::new(descriptor));
         self.by_decl.remove(&decl_id);

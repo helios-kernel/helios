@@ -155,7 +155,7 @@ impl<E: HeliosEnv> ShellSession<E> {
         file_name: Option<&str>,
         input: AsyncPipelineData,
     ) -> Result<AsyncPipelineData, NuError> {
-        self.eval_pipeline_with_file(source, None, input).await
+        self.eval_pipeline_with_file(source, file_name, input).await
     }
 
     /// Evaluate Nushell source text with an optional file name for diagnostics

@@ -259,16 +259,17 @@ class MockHeliosGuest:
 
     def _encode_instances(self) -> bytes:
         instances = [
-            (1, "init", 100, 5_000_000_000, 4 * 1024 * 1024, 12),
-            (7, "/core/http-client", 200, 3_000_000_000, 8 * 1024 * 1024, 45),
+            (1, "init", 100, 5_000_000_000, 4 * 1024 * 1024, 0, 12),
+            (7, "/core/http-client", 200, 3_000_000_000, 8 * 1024 * 1024, 65_536, 45),
         ]
         buf = bytearray(enc_varint(len(instances)))
-        for inst_id, name, started, uptime, mem, cpu in instances:
+        for inst_id, name, started, uptime, mem, storage, cpu in instances:
             buf += enc_varint(inst_id)
             buf += enc_str(name)
             buf += enc_varint(started)
             buf += enc_varint(uptime)
             buf += enc_varint(mem)
+            buf += enc_varint(storage)
             buf += enc_varint(cpu)
         return bytes(buf)
 

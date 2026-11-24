@@ -187,6 +187,7 @@ fn dispatch_mock(
                     started_at: 100,
                     uptime: 5_000_000_000,
                     memory_bytes: 4 * 1024 * 1024,
+                    storage_bytes: 0,
                     cpu_busy: 12,
                 },
                 Instance {
@@ -195,6 +196,7 @@ fn dispatch_mock(
                     started_at: 200,
                     uptime: 3_000_000_000,
                     memory_bytes: 8 * 1024 * 1024,
+                    storage_bytes: 0,
                     cpu_busy: 45,
                 },
             ];
