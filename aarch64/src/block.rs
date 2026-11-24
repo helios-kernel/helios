@@ -128,20 +128,35 @@ fn discover_block_devices(
                 candidate.region.size != 0,
                 "AArch64 virtio-blk node has zero MMIO size"
             );
-            crate::map_mmio_page(candidate.region.base, physical_memory_offset, handoff);
+            crate::map_mmio_range(
+                candidate.region.base,
+                candidate.region.size,
+                physical_memory_offset,
+                handoff,
+            );
             let virtual_base =
                 crate::mmio_virtual_base(candidate.region.base, physical_memory_offset);
+            assert!(
+                virtual_base.is_multiple_of(core::mem::align_of::<u32>()),
+                "virtio MMIO base {virtual_base:#x} is not 4-byte aligned"
+            );
             let header = core::ptr::NonNull::new(virtual_base as *mut u8).unwrap_or_else(|| {
                 panic!("virtio MMIO base {virtual_base:#x} was unexpectedly null")
             });
             let dma = crate::dma_pool();
+            let block_cpu = *cpu;
+            let rights = BlockDeviceRights::READ | BlockDeviceRights::WRITE;
+            // SAFETY: `map_mmio_range` mapped `header..header + candidate.region.size`
+            // as Device-nGnRnE, the device is brought up on the bootstrap processor
+            // before IRQs are unmasked with exclusive register access, and `dma`
+            // translates using the kernel's direct-map offset.
             let device = unsafe {
                 helios_virtio::block_from_mmio_with_dma(
                     header,
                     candidate.region.size,
                     dma,
-                    *cpu,
-                    BlockDeviceRights::READ | BlockDeviceRights::WRITE,
+                    block_cpu,
+                    rights,
                 )
             }
             .unwrap_or_else(|error| {

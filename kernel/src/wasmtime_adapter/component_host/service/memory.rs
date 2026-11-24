@@ -656,10 +656,13 @@ pub(super) fn preview1_read_memory(
     len: usize,
 ) -> Result<Vec<u8>, ProgramExecError> {
     let start = preview1_memory_start(memory, ptr, len)?;
+    // SAFETY: the bounds check above proves `start <= memory.len`, so
+    // `memory.base + start` stays within the guest linear memory allocation.
+    let start_ptr = unsafe { (memory.base as *const u8).add(start) };
     // SAFETY: the bounds check above proves `start..start + len` lies
     // inside the guest's linear memory, which stays mapped for as long
     // as the borrow of `memory` lasts.
-    let source = unsafe { core::slice::from_raw_parts((memory.base as *const u8).add(start), len) };
+    let source = unsafe { core::slice::from_raw_parts(start_ptr, len) };
     Ok(source.to_vec())
 }
 
@@ -816,10 +819,13 @@ pub(super) fn capture_window(
     len: usize,
 ) -> Result<ChargedPages, PageCaptureError> {
     let start = preview1_memory_start(memory, ptr, len).map_err(PageCaptureError::OutOfBounds)?;
+    // SAFETY: the bounds check above proves `start <= memory.len`, so
+    // `memory.base + start` stays within the guest linear memory allocation.
+    let start_ptr = unsafe { (memory.base as *const u8).add(start) };
     // SAFETY: the bounds check above proves `start..start + len` lies
     // inside the guest's linear memory, which stays mapped for the
     // duration of this call.
-    let source = unsafe { core::slice::from_raw_parts((memory.base as *const u8).add(start), len) };
+    let source = unsafe { core::slice::from_raw_parts(start_ptr, len) };
     capture_slice(pool, instance, source)
 }
 
@@ -855,11 +861,13 @@ pub(super) fn restore_pages(
         detail: ProgramExecErrorDetail::GuestMemoryAccessOverflow,
     })?;
     let start = preview1_memory_start(memory, ptr, len)?;
+    // SAFETY: the bounds check above proves `start <= memory.len`, so
+    // `memory.base + start` stays within the guest linear memory allocation.
+    let start_ptr = unsafe { (memory.base as *mut u8).add(start) };
     // SAFETY: the bounds check above proves `start..start + len` lies
     // inside the guest memory view captured for this call, and nothing else
     // reaches the destination while the rewind restores it.
-    let destination =
-        unsafe { core::slice::from_raw_parts_mut((memory.base as *mut u8).add(start), len) };
+    let destination = unsafe { core::slice::from_raw_parts_mut(start_ptr, len) };
     let copied = pages.read(0, destination);
     debug_assert_eq!(copied, len, "the pages hold exactly the captured length");
     Ok(())
@@ -871,15 +879,14 @@ pub(super) fn preview1_read_memory_into(
     bytes: &mut [u8],
 ) -> Result<(), ProgramExecError> {
     let start = preview1_memory_start(memory, ptr, bytes.len())?;
+    // SAFETY: the bounds check above proves `start <= memory.len`, so
+    // `memory.base + start` stays within the guest linear memory allocation.
+    let start_ptr = unsafe { (memory.base as *const u8).add(start) };
     // SAFETY: preview1/WASIX host calls run synchronously on the owning
     // store task. The bounds check above proves the source range lies inside
     // the guest memory view captured for this host call.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            (memory.base as *const u8).add(start),
-            bytes.as_mut_ptr(),
-            bytes.len(),
-        );
+        core::ptr::copy_nonoverlapping(start_ptr, bytes.as_mut_ptr(), bytes.len());
     }
     Ok(())
 }
@@ -918,14 +925,13 @@ pub(super) fn preview1_write_memory(
     if end > memory.len {
         return p1::errno::FAULT;
     }
+    // SAFETY: the bounds check above proves `start <= memory.len`, so
+    // `memory.base + start` stays within the guest linear memory allocation.
+    let start_ptr = unsafe { (memory.base as *mut u8).add(start) };
     // SAFETY: the bounds check above proves the destination range lies inside
     // the guest memory view captured for this host call.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            (memory.base as *mut u8).add(start),
-            bytes.len(),
-        );
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), start_ptr, bytes.len());
     }
     p1::errno::SUCCESS
 }

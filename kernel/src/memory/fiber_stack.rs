@@ -1192,13 +1192,13 @@ impl FrameChain {
     /// The most recently taken frame, zeroed again.
     fn pop(&mut self) -> Option<NonNull<u8>> {
         let frame = self.head?;
+        let link = frame.cast::<Option<NonNull<u8>>>();
         // SAFETY: `push` wrote the link of every frame on the chain, and
-        // this one is leaving it, so nothing reads the link again.
-        unsafe {
-            let link = frame.cast::<Option<NonNull<u8>>>();
-            self.head = link.read();
-            link.write(None);
-        }
+        // `&mut self` grants exclusive access to read this node's link.
+        self.head = unsafe { link.read() };
+        // SAFETY: this frame is leaving the chain, so nothing reads its link
+        // again, and `&mut self` grants exclusive access to zero it.
+        unsafe { link.write(None) };
         Some(frame)
     }
 

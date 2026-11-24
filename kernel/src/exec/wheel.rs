@@ -687,13 +687,10 @@ impl TimingWheel {
             &mut self.slots[expiration.level][expiration.slot],
             List::new(),
         );
-        loop {
-            // SAFETY: every node on `taken` was on a wheel list and is live
-            // (the lifetime invariant), and `&mut self` holds the lock
-            // throughout, so no dropper can reach a node while it is unlinked.
-            let Some(node) = (unsafe { taken.pop_back() }) else {
-                break;
-            };
+        // SAFETY: every node on `taken` was on a wheel list and is live
+        // (the lifetime invariant), and `&mut self` holds the lock
+        // throughout, so no dropper can reach a node while it is unlinked.
+        while let Some(node) = unsafe { taken.pop_back() } {
             // SAFETY: `node` is live and the lock is held.
             let when_ptr = unsafe { SleepNode::deadline_tick(node) };
             // SAFETY: `node` is live and the lock is held, so its deadline tick
