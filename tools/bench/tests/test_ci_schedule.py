@@ -678,12 +678,8 @@ def test_ci_speedup_caches_cli_qemu_inspector_and_prunes_main_caches(ci_jobs):
     for builder in ("build-helios-cli-x64", "build-helios-cli-arm64"):
         steps = ci_jobs[builder]["steps"]
         assert not any(step.get("uses", "").startswith("Swatinem/rust-cache") for step in steps), builder
-        stow_cache = next(
-            (step for step in steps if step.get("name") == "Restore stow local cache"),
-            None,
-        )
-        assert stow_cache is not None, builder
-        assert stow_cache["with"]["path"] == "~/.stow"
+        assert not any(step.get("with", {}).get("path") == "~/.stow" for step in steps), builder
+        assert any(step.get("uses") == "water-rs/stow@main" for step in steps), builder
         build_step = next(step for step in steps if "stow build" in step.get("run", ""))
         assert build_step["env"].get("CARGO_PROFILE_RELEASE_PANIC") == "unwind", builder
 

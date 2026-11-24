@@ -420,13 +420,6 @@ jobs:
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@stable
       - if: steps.cache.outputs.cache-hit != 'true'
-        name: Restore stow local cache
-        uses: ./helios/.github/actions/shared-cache
-        with:
-          path: ~/.stow
-          key: stow-helios-cli-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
-          restore-keys: stow-helios-cli-v1-${{ runner.os }}-${{ runner.arch }}-
-      - if: steps.cache.outputs.cache-hit != 'true'
         uses: water-rs/stow@main
       # Override workspace `[profile.release] panic = "abort"` back to `unwind`
       # so `helios-cli` compiles under `stow`'s named `release` profile and hits
@@ -4341,20 +4334,20 @@ jobs:
                   caches.extend(json.loads(line).get("actions_caches", []))
 
           slot_patterns = [
-              re.compile(r"^(v0-rust-.+-Linux-(?:x64|arm64))-[0-9a-f]+-[0-9a-f]+$"),
-              re.compile(r"^(helios-wasm-[^-]+-[^-]+-[^-]+)-\d+$"),
-              re.compile(r"^(helios-cwasm-.+-[^-]+-[^-]+)-\d+$"),
-              re.compile(r"^(stow-helios-cli-v1-[^-]+-[^-]+)-\d+$"),
-              re.compile(r"^(helios-cli-stable-v\d+-[^-]+-[^-]+-[^-]+)-[0-9a-f]+$"),
-              re.compile(r"^(helios-inspector-v\d+-release-[^-]+-[^-]+)-[0-9a-f]+$"),
+              (re.compile(r"^(v0-rust-.+-Linux-(?:x64|arm64))-[0-9a-f]+-[0-9a-f]+$"), (1,)),
+              (re.compile(r"^(helios-wasm-[^-]+-[^-]+-[^-]+)-\d+$"), (1,)),
+              (re.compile(r"^(helios-cwasm-.+-[^-]+-[^-]+)-\d+$"), (1,)),
+              (re.compile(r"^(stow-v1-(?:local|local-crates-io)-[^-]+-[^-]+)-[0-9a-f]+-(.+)-[0-9a-f]+$"), (1, 2)),
+              (re.compile(r"^(helios-cli-stable-v\d+-[^-]+-[^-]+-[^-]+)-[0-9a-f]+$"), (1,)),
+              (re.compile(r"^(helios-inspector-v\d+-release-[^-]+-[^-]+)-[0-9a-f]+$"), (1,)),
           ]
           groups = collections.defaultdict(list)
           for entry in caches:
               key = entry["key"]
-              for pat in slot_patterns:
+              for pat, grp_ids in slot_patterns:
                   m = pat.match(key)
                   if m:
-                      groups[m.group(1)].append(entry)
+                      groups["-".join(m.group(i) for i in grp_ids)].append(entry)
                       break
 
           deleted = 0
