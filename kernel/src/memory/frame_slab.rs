@@ -15,8 +15,7 @@
 //! # Concurrency contract
 //!
 //! - **On the owning processor:** pop and push ([`FrameSlabCache::allocate_on`],
-//!   [`FrameSlabCache::deallocate_on`]) and the page-fault path's try-pop
-//!   ([`FrameSlabCache::try_allocate_on`]). Callers name the executing
+//!   [`FrameSlabCache::deallocate_on`]). Callers name the executing
 //!   processor; every list operation takes the list's own lock, so naming
 //!   another processor is a placement mistake, never a race.
 //! - **From any processor:** [`FrameSlabCache::drain`] takes each
@@ -96,25 +95,6 @@ impl FrameList {
         })
     }
 
-    /// Pops a cached frame when the list's lock is free, and answers
-    /// `None` when it is not.
-    ///
-    /// A list's lock is taken by its own processor on the ordinary path
-    /// and by any processor during [`FrameSlabCache::drain`], so a
-    /// page-fault handler cannot afford to wait on it.
-    fn try_allocate(&self) -> Option<NonNull<u8>> {
-        self.head.try_with(|head| {
-            let frame = NonNull::new(*head)?;
-            // SAFETY: every frame on this list was pushed by
-            // `deallocate`, which wrote its link word.
-            let next = unsafe { frame.as_ref().next };
-            *head = next;
-            let cached = self.cached_frames.load(Ordering::Relaxed);
-            self.cached_frames.store(cached - 1, Ordering::Release);
-            Some(frame.cast())
-        })?
-    }
-
     fn deallocate(&self, frame: NonNull<u8>, capacity: usize) -> bool {
         self.head.with(|head| {
             let cached = self.cached_frames.load(Ordering::Relaxed);
@@ -165,15 +145,6 @@ impl FrameSlabCache {
     /// Pops `processor`'s cached frame of `node`.
     pub(crate) fn allocate_on(&self, processor: ProcessorId, node: NodeId) -> Option<NonNull<u8>> {
         self.list(processor, node).allocate()
-    }
-
-    /// See [`FrameList::try_allocate`].
-    pub(crate) fn try_allocate_on(
-        &self,
-        processor: ProcessorId,
-        node: NodeId,
-    ) -> Option<NonNull<u8>> {
-        self.list(processor, node).try_allocate()
     }
 
     /// Caches `frame`, which lies on `node`, on `processor`'s list for

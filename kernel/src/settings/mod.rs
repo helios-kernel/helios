@@ -329,11 +329,13 @@ macro_rules! settings {
 settings! {
     descriptor_limit: crate::DescriptorLimitSetting,
     compiler_max_input_bytes: crate::CompilerMaxInputBytesSetting,
+    random_bytes_limit: crate::RandomBytesLimitSetting,
 }
 
 #[cfg(not(feature = "unix"))]
 settings! {
     compiler_max_input_bytes: crate::CompilerMaxInputBytesSetting,
+    random_bytes_limit: crate::RandomBytesLimitSetting,
 }
 
 #[cfg(test)]
@@ -415,10 +417,12 @@ mod tests {
 
     #[cfg(feature = "unix")]
     #[test]
-    fn the_machine_lists_its_registered_settings() {
+    fn the_machine_lists_its_declared_settings() {
+        use crate::{CompilerMaxInputBytesSetting, RandomBytesLimitSetting};
+
         let settings = Settings::default();
 
-        assert_eq!(SETTING_COUNT, 2);
+        assert_eq!(SETTING_COUNT, 3);
         assert_eq!(
             settings.entries(),
             [
@@ -429,8 +433,13 @@ mod tests {
                 },
                 SettingEntry {
                     name: "compiler.max-input-bytes",
-                    description: crate::CompilerMaxInputBytesSetting::DESCRIPTION,
+                    description: CompilerMaxInputBytesSetting::DESCRIPTION,
                     value: SettingValue::Bytes(crate::DEFAULT_COMPILER_MAX_INPUT_BYTES),
+                },
+                SettingEntry {
+                    name: "random.max-bytes",
+                    description: RandomBytesLimitSetting::DESCRIPTION,
+                    value: SettingValue::Bytes(RandomBytesLimitSetting::DEFAULT),
                 },
             ]
         );

@@ -47,12 +47,15 @@ pub use compressed::{
 };
 pub use entropy::{
     ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, HardwareEntropySource,
-    NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RootEntropy,
-    RootEntropyHandle, install_entropy_device, seed_root_entropy,
+    NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RandomBytesLimitSetting,
+    RootEntropy, RootEntropyHandle, install_entropy_device, seed_root_entropy,
 };
+#[cfg(feature = "wasmtime-runtime")]
+pub(crate) use fiber_stack::fiber_stack_arena_installed;
 pub use fiber_stack::{
     FIBER_STACK_GUARD_BYTES, FiberStack, FiberStackArenaStats, FiberStackError, FiberStackVmHooks,
-    StackFault, claim_fiber_stack, fiber_stack_arena_stats, fiber_stack_demand_commits_on,
+    InterruptedContext, StackFault, StackReserveError, claim_fiber_stack,
+    commit_fiber_stack_reserve, fiber_stack_arena_stats, fiber_stack_demand_commits_on,
     install_fiber_stack_arena, install_fiber_stack_hooks, resolve_stack_fault,
 };
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
