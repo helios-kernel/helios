@@ -703,9 +703,10 @@ def test_ci_speedup_caches_cli_qemu_inspector_and_prunes_main_caches(ci_jobs):
             for step in job["steps"]
             if step.get("uses") == "./helios/.github/actions/install-apt-packages"
         ]
-        assert any("qemu-system-arm" in pkgs and "qemu-efi-aarch64" in pkgs for pkgs in apt_steps), (
-            aarch64_vm_job
-        )
+        assert any("qemu-system-arm" in pkgs for pkgs in apt_steps), aarch64_vm_job
+        assert any(
+            step.get("uses") == "./helios/.github/actions/qemu-edk2-aarch64" for step in job["steps"]
+        ), aarch64_vm_job
 
     gate_steps = ci_jobs["gate"]["steps"]
     assert gate_steps[0]["name"] == "Require every selected lane to succeed"

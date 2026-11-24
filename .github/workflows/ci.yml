@@ -1153,8 +1153,9 @@ jobs:
   #
   # Runs on `ubuntu-26.04-arm`, whose distro `qemu-system-arm` (QEMU 10.2)
   # avoids Ubuntu 24.04's QEMU 8.2 GICv3 multi-threaded TCG assertion (#85)
-  # without compiling QEMU from source, paired with `qemu-efi-aarch64`
-  # (AAVMF) for EDK2 firmware.
+  # without compiling QEMU from source, paired with QEMU's prebuilt
+  # `edk2-aarch64-code.fd` (Ubuntu 26.04's `qemu-efi-aarch64` 2025.11 faults
+  # in PrePi under `-cpu max`).
   smoke-aarch64:
     name: smoke-aarch64
     needs: [changes, build-helios-cli-arm64, wasm-release, wasi-artifacts]
@@ -1190,7 +1191,8 @@ jobs:
         with:
           packages: >-
             libudev-dev just cmake ninja-build erofs-utils btrfs-progs
-            qemu-system-arm qemu-efi-aarch64 swtpm
+            qemu-system-arm swtpm
+      - uses: ./helios/.github/actions/qemu-edk2-aarch64
       - name: Record swtpm and KVM availability
         run: |
           swtpm --version
@@ -1770,7 +1772,8 @@ jobs:
         with:
           packages: >-
             libudev-dev just cmake ninja-build erofs-utils
-            qemu-system-arm qemu-efi-aarch64 swtpm
+            qemu-system-arm swtpm
+      - uses: ./helios/.github/actions/qemu-edk2-aarch64
       - name: Record the QEMU in use
         run: |
           command -v qemu-system-aarch64
@@ -4164,7 +4167,10 @@ jobs:
         if: steps.cases.outputs.count != '0' && matrix.arch != 'x86_64'
         uses: ./helios/.github/actions/install-apt-packages
         with:
-          packages: btrfs-progs qemu-system-arm qemu-efi-aarch64
+          packages: btrfs-progs qemu-system-arm
+      - name: Stage prebuilt EDK2 firmware (aarch64)
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64'
+        uses: ./helios/.github/actions/qemu-edk2-aarch64
       - name: Record QEMU version (aarch64)
         if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64'
         run: qemu-system-aarch64 --version
