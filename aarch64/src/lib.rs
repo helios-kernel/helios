@@ -59,6 +59,12 @@ const IRQ_FRAME_BYTES: usize = 0x320;
 /// FP/SIMD file is saved because a fault can be redirected into kernel
 /// code that clobbers it, and the guest it interrupted must not notice.
 const SYNC_FRAME_BYTES: usize = 0x320;
+/// `SPSR_EL1.BTYPE` (bits `[11:10]`, Arm ARM C5.2.19): the branch-type state
+/// recorded when an exception is taken before the target instruction executes.
+/// Clearing it on an `elr` redirect simulates a `ret` so the landing
+/// instruction is not required to be a BTI landing pad.
+const SPSR_BTYPE_MASK: u64 = 0b11 << 10;
+
 const PAGE_BYTES: usize = 4096;
 const MMIO_BLOCK_BYTES: usize = 2 * 1024 * 1024;
 const PAGE_TABLE_ENTRIES: usize = 512;
@@ -1661,6 +1667,11 @@ extern "C" fn aarch64_handle_sync_exception(
         // address of the check's branch.
         let frame = unsafe { &mut *frame };
         frame.elr = frame.x[30];
+        // The PXN check faulted on the target of `blr x0` before any
+        // instruction ran there, capturing BTYPE = 0b10 in SPSR_EL1.
+        // Returning to `x30` simulates a `ret`, which clears BTYPE so the
+        // instruction after `blr` need not be a BTI landing pad.
+        frame.spsr &= !SPSR_BTYPE_MASK;
         return;
     }
     let (cause, faulting_address) = match exception_class {
@@ -1777,6 +1788,10 @@ unsafe fn enter_swap_fault_trampoline(frame: *mut SyncTrapFrame, faulting_addres
         (*frame).x[0] = landing as u64;
         (*frame).x[1] = faulting_address as u64;
         (*frame).elr = swap_fault_trampoline as *const () as usize as u64;
+        // The interrupted frame copied to `landing` preserves the original
+        // BTYPE for `__helios_aarch64_swap_fault_resume`; clear it for the
+        // `eret` into the trampoline itself.
+        (*frame).spsr &= !SPSR_BTYPE_MASK;
         (*frame).sp = landing as u64;
     }
 }
