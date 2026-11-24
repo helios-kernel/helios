@@ -692,20 +692,24 @@ def test_ci_speedup_caches_cli_qemu_inspector_and_prunes_main_caches(ci_jobs):
         assert any(step.get("id") == "inspector-cache" for step in steps), image_job_name
 
     build_arm_steps = ci_jobs["linux-syscalls-build-aarch64"]["steps"]
-    assert any(step.get("id") == "qemu-ghcr" for step in build_arm_steps)
     assert any(
         step.get("uses") == "actions/upload-artifact@v4"
         and step["with"]["name"] == "gvisor-syscalls-cases-${{ matrix.arch }}"
         for step in build_arm_steps
     )
 
-    shard_arm_steps = ci_jobs["linux-syscalls-aarch64"]["steps"]
-    assert any(step.get("id") == "qemu-ghcr" for step in shard_arm_steps)
-    runtime_apt = next(
-        step for step in shard_arm_steps if step.get("name") == "Install host dependencies (aarch64)"
-    )
-    assert "ninja-build" not in runtime_apt["with"]["packages"]
-    assert "flex" not in runtime_apt["with"]["packages"]
+    for aarch64_vm_job in ("smoke-aarch64", "smoke-aarch64-cfi", "linux-syscalls-aarch64"):
+        job = ci_jobs[aarch64_vm_job]
+        assert job["runs-on"] == "ubuntu-26.04-arm", aarch64_vm_job
+        assert not any("download.qemu.org" in step.get("run", "") for step in job["steps"]), aarch64_vm_job
+        apt_steps = [
+            step["with"]["packages"]
+            for step in job["steps"]
+            if step.get("uses") == "./helios/.github/actions/install-apt-packages"
+        ]
+        assert any("qemu-system-arm" in pkgs and "qemu-efi-aarch64" in pkgs for pkgs in apt_steps), (
+            aarch64_vm_job
+        )
 
     gate_steps = ci_jobs["gate"]["steps"]
     assert gate_steps[0]["name"] == "Require every selected lane to succeed"

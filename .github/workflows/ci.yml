@@ -319,7 +319,7 @@ jobs:
              elif ($lanes | index("linux-syscalls")) then "listed"
              else "none" end) as $mode
             | [{arch: "x86_64", runner: "ubuntu-24.04", vm_arch: "x86-64", accel: "kvm", full_shards: 16, listed_shards: 8},
-               {arch: "aarch64", runner: "ubuntu-24.04-arm", vm_arch: "aarch64", accel: "tcg", full_shards: 32, listed_shards: 16}] as $arches
+               {arch: "aarch64", runner: "ubuntu-26.04-arm", vm_arch: "aarch64", accel: "tcg", full_shards: 32, listed_shards: 16}] as $arches
             | def shards_for($a):
                 if $mode == "none" then []
                 else (if $mode == "full" then $a.full_shards else $a.listed_shards end) as $n
@@ -1150,42 +1150,28 @@ jobs:
           since: ${{ env.HELIOS_CACHE_START }}
 
   # A native Arm Linux runner under multi-threaded TCG. This lane is a
-  # functional check, not a performance surface: `ubuntu-24.04-arm`
-  # publishes no `/dev/kvm` at all — `-accel kvm` there fails with
-  # "Could not access KVM kernel module" (probe run 33944339758) — so
-  # both boots below ask for `--accel tcg` on purpose. The inspector
+  # functional check, not a performance surface: Arm runners publish no
+  # `/dev/kvm`, so boots ask for `--accel tcg` on purpose. The inspector
   # requires a profile's native accelerator when nobody names one, so a
   # lane that means to measure the emulator has to say so (#118).
   #
-  # The QEMU 8.2 that Ubuntu 24.04 ships asserts in its emulated GICv3
-  # CPU interface under multi-threaded TCG
-  # (`gicv3_cpuif_update: assertion failed: (qemu_mutex_iothread_locked())`,
-  # issue #85), and no archive that is safe to mix into noble carries a
-  # newer one: the cloud archive ships OpenStack only, noble-backports
-  # has no emulator at all, and a package from a later Ubuntu or from
-  # Debian trixie would pull its own glibc onto the runner. So the lane
-  # builds a pinned upstream release once and caches the install prefix
-  # by version. The tarball also installs the EDK2 blobs the aarch64
-  # boot needs, which the inspector finds through the prefix.
+  # Runs on `ubuntu-26.04-arm`, whose distro `qemu-system-arm` (QEMU 10.2)
+  # avoids Ubuntu 24.04's QEMU 8.2 GICv3 multi-threaded TCG assertion (#85)
+  # without compiling QEMU from source, paired with `qemu-efi-aarch64`
+  # (AAVMF) for EDK2 firmware.
   smoke-aarch64:
     name: smoke-aarch64
     needs: [changes, build-helios-cli-arm64, wasm-release, wasi-artifacts]
     if: ${{ !cancelled() && needs.changes.result == 'success' && needs.build-helios-cli-arm64.result == 'success' && needs.wasm-release.result == 'success' && needs.wasi-artifacts.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-aarch64') }}
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-26.04-arm
     timeout-minutes: 40
     permissions:
       contents: read
       actions: read
-      packages: read
     env:
       HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
       # The `cwasm` cache of `smoke-riscv64`, for this lane's prebuilds.
       HELIOS_ARTIFACT_CACHE: ${{ github.workspace }}/cwasm-cache
-      QEMU_VERSION: "11.1.1"
-      # download.qemu.org publishes a detached signature but no checksum
-      # file; this is the digest of the tarball that signature covers.
-      QEMU_SHA256: 079ffbff8a7111bbc89022107cbabf3bbfd614d5fc9d7cc675991196aca12482
-      QEMU_PREFIX: ${{ github.workspace }}/qemu-install
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1203,78 +1189,18 @@ jobs:
           path: ${{ env.HELIOS_ARTIFACT_CACHE }}
           key: helios-cwasm-smoke-aarch64-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
           restore-keys: helios-cwasm-smoke-aarch64-${{ runner.os }}-${{ runner.arch }}-
-      - name: Log in to the container registry
-        env:
-          TOKEN: ${{ github.token }}
-          ACTOR: ${{ github.actor }}
-        run: echo "$TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
-      - name: Take the pinned QEMU from GHCR
-        id: qemu-ghcr
-        shell: bash
-        env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/helios-qemu:aarch64-${{ env.QEMU_VERSION }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
-        run: |
-          set -euo pipefail
-          if output="$(docker pull "$IMAGE" 2>&1)"; then
-            container="$(docker create "$IMAGE" none)"
-            mkdir -p "$QEMU_PREFIX"
-            docker cp "$container:/." "$QEMU_PREFIX"
-            docker rm "$container" > /dev/null
-            echo "found=true" >> "$GITHUB_OUTPUT"
-          elif grep -qiE 'manifest unknown|not found|denied' <<< "$output"; then
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "no prebuilt QEMU at $IMAGE"
-          else
-            echo "$output" >&2
-            exit 1
-          fi
-      - name: Restore the pinned QEMU install prefix
-        if: steps.qemu-ghcr.outputs.found != 'true'
-        id: qemu-cache
-        uses: ./helios/.github/actions/shared-cache
-        with:
-          path: ${{ env.QEMU_PREFIX }}
-          # The configure flags are part of the key: a build made with
-          # other flags is a different install (#687).
-          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
       - name: Install host dependencies
         uses: ./helios/.github/actions/install-apt-packages
         with:
           packages: >-
             libudev-dev just cmake ninja-build erofs-utils btrfs-progs
-            libpixman-1-0 libslirp0 libfdt1 swtpm
-      - name: Install QEMU build dependencies
-        if: steps.qemu-ghcr.outputs.found != 'true' && steps.qemu-cache.outputs.cache-hit != 'true'
-        uses: ./helios/.github/actions/install-apt-packages
-        with:
-          packages: >-
-            python3-venv pkg-config flex bison
-            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
+            qemu-system-arm qemu-efi-aarch64 swtpm
       - name: Record swtpm and KVM availability
         run: |
           swtpm --version
           # Recorded rather than required: the accelerator is picked by
           # capability and today's Arm runners publish no KVM node.
           ls -la /dev/kvm || echo 'no /dev/kvm on this runner'
-      - name: Build the pinned QEMU
-        if: steps.qemu-ghcr.outputs.found != 'true' && steps.qemu-cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          tarball="qemu-${QEMU_VERSION}.tar.xz"
-          curl -fsSLO "https://download.qemu.org/${tarball}"
-          echo "${QEMU_SHA256}  ${tarball}" | sha256sum -c -
-          tar xf "${tarball}"
-          cd "qemu-${QEMU_VERSION}"
-          # aarch64-softmmu is the only target this lane boots, and the
-          # inspector's default network backend is `user`, which has been
-          # external libslirp since 8.0.
-          # The flags live in a file the cache key hashes.
-          mapfile -t flags < "${GITHUB_WORKSPACE}/helios/.github/qemu/aarch64-configure.args"
-          ./configure --prefix="${QEMU_PREFIX}" "${flags[@]}"
-          ninja -C build install
-      - name: Put the pinned QEMU on PATH
-        run: |
-          echo "${QEMU_PREFIX}/bin" >> "$GITHUB_PATH"
       - name: Record the QEMU in use
         run: |
           command -v qemu-system-aarch64
@@ -1830,7 +1756,7 @@ jobs:
     name: smoke-aarch64-cfi
     needs: [changes, wasm-debug]
     if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-aarch64-cfi')
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-26.04-arm
     timeout-minutes: 40
     permissions:
       contents: read
@@ -1838,10 +1764,6 @@ jobs:
     env:
       # The debug guest programs the test's kernel prebuild reads.
       HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
-      # The QEMU `smoke-aarch64` pins, restored from the same cache entry.
-      QEMU_VERSION: "11.1.1"
-      QEMU_SHA256: 079ffbff8a7111bbc89022107cbabf3bbfd614d5fc9d7cc675991196aca12482
-      QEMU_PREFIX: ${{ github.workspace }}/qemu-install
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1852,31 +1774,7 @@ jobs:
         with:
           packages: >-
             libudev-dev just cmake ninja-build erofs-utils
-            python3-venv pkg-config flex bison
-            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
-            swtpm
-      - name: Restore the pinned QEMU install prefix
-        id: qemu-cache
-        uses: ./helios/.github/actions/shared-cache
-        with:
-          path: ${{ env.QEMU_PREFIX }}
-          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
-      - name: Build the pinned QEMU
-        if: steps.qemu-cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          tarball="qemu-${QEMU_VERSION}.tar.xz"
-          curl -fsSLO "https://download.qemu.org/${tarball}"
-          echo "${QEMU_SHA256}  ${tarball}" | sha256sum -c -
-          tar xf "${tarball}"
-          cd "qemu-${QEMU_VERSION}"
-          mapfile -t flags < "${GITHUB_WORKSPACE}/helios/.github/qemu/aarch64-configure.args"
-          ./configure --prefix="${QEMU_PREFIX}" "${flags[@]}"
-          ninja -C build install
-      # The inspector looks for `qemu-system-aarch64` on PATH.
-      - name: Put the pinned QEMU on PATH
-        run: |
-          echo "${QEMU_PREFIX}/bin" >> "$GITHUB_PATH"
+            qemu-system-arm qemu-efi-aarch64 swtpm
       - name: Record the QEMU in use
         run: |
           command -v qemu-system-aarch64
@@ -3836,9 +3734,6 @@ jobs:
       packages: write
     env: &linux-syscalls-build-env
       SUITE: ${{ github.workspace }}/gvisor-syscalls
-      QEMU_VERSION: "11.1.1"
-      QEMU_SHA256: 079ffbff8a7111bbc89022107cbabf3bbfd614d5fc9d7cc675991196aca12482
-      QEMU_PREFIX: ${{ github.workspace }}/qemu-install
     steps: &linux-syscalls-build-steps
       - uses: actions/checkout@v4
         with:
@@ -3935,61 +3830,6 @@ jobs:
           path: ${{ env.SUITE }}/cases.txt
           if-no-files-found: error
           retention-days: 14
-      # Ensure the pinned aarch64 QEMU is present in GHCR (immune to the
-      # 10 GiB Actions cache cap) or built once and cached before the
-      # aarch64 shards fan out, so shards never rebuild QEMU in parallel.
-      - name: Check prebuilt QEMU in GHCR
-        if: matrix.arch == 'aarch64'
-        id: qemu-ghcr
-        shell: bash
-        env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/helios-qemu:aarch64-${{ env.QEMU_VERSION }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
-        run: |
-          set -euo pipefail
-          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-          if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "found prebuilt QEMU at $IMAGE"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "no prebuilt QEMU at $IMAGE"
-          fi
-      - name: Restore the pinned QEMU install prefix
-        if: matrix.arch == 'aarch64' && steps.qemu-ghcr.outputs.found == 'false'
-        id: qemu-cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.QEMU_PREFIX }}
-          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
-      - name: Install QEMU build dependencies
-        if: matrix.arch == 'aarch64' && steps.qemu-ghcr.outputs.found == 'false' && steps.qemu-cache.outputs.cache-hit != 'true'
-        uses: ./helios/.github/actions/install-apt-packages
-        with:
-          packages: >-
-            ninja-build python3-venv pkg-config flex bison
-            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
-      - name: Build the pinned QEMU
-        if: matrix.arch == 'aarch64' && steps.qemu-ghcr.outputs.found == 'false' && steps.qemu-cache.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          tarball="qemu-${QEMU_VERSION}.tar.xz"
-          curl -fsSLO "https://download.qemu.org/${tarball}"
-          echo "${QEMU_SHA256}  ${tarball}" | sha256sum -c -
-          tar xf "${tarball}"
-          cd "qemu-${QEMU_VERSION}"
-          mapfile -t flags < "${GITHUB_WORKSPACE}/helios/.github/qemu/aarch64-configure.args"
-          ./configure --prefix="${QEMU_PREFIX}" "${flags[@]}"
-          ninja -C build install
-      - name: Publish the pinned QEMU to GHCR
-        if: matrix.arch == 'aarch64' && steps.qemu-ghcr.outputs.found == 'false' && github.event_name != 'pull_request'
-        shell: bash
-        env:
-          IMAGE: ${{ steps.qemu-ghcr.outputs.image }}
-        run: |
-          set -euo pipefail
-          docker build --file helios/.github/qemu/Dockerfile --tag "$IMAGE" "$QEMU_PREFIX"
-          docker push "$IMAGE"
 
   linux-syscalls-build-aarch64:
     name: linux-syscalls-build (${{ matrix.arch }})
@@ -4261,11 +4101,6 @@ jobs:
         include: ${{ fromJSON(needs.changes.outputs.linux_suite_x86_64_shards) }}
     env: &linux-syscalls-env
       HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
-      # The QEMU smoke-aarch64 builds, for the same reason: Ubuntu 24.04's
-      # asserts in its emulated GICv3 under multi-threaded TCG.
-      QEMU_VERSION: "11.1.1"
-      QEMU_SHA256: 079ffbff8a7111bbc89022107cbabf3bbfd614d5fc9d7cc675991196aca12482
-      QEMU_PREFIX: ${{ github.workspace }}/qemu-install
       SUITE: ${{ github.workspace }}/gvisor-syscalls
       PREBUILT_IMAGE: ${{ github.workspace }}/prebuilt-image
       INSPECTOR_DIR: ${{ github.workspace }}/prebuilt-inspector
@@ -4326,68 +4161,14 @@ jobs:
           qemu-system-x86_64 --version
           sudo chmod 666 /dev/kvm
           ls -la /dev/kvm
-      - name: Log in to the container registry (aarch64)
-        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64'
-        env:
-          TOKEN: ${{ github.token }}
-          ACTOR: ${{ github.actor }}
-        run: echo "$TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
-      - name: Take the pinned QEMU from GHCR
-        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64'
-        id: qemu-ghcr
-        shell: bash
-        env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/helios-qemu:aarch64-${{ env.QEMU_VERSION }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
-        run: |
-          set -euo pipefail
-          if output="$(docker pull "$IMAGE" 2>&1)"; then
-            container="$(docker create "$IMAGE" none)"
-            mkdir -p "$QEMU_PREFIX"
-            docker cp "$container:/." "$QEMU_PREFIX"
-            docker rm "$container" > /dev/null
-            echo "found=true" >> "$GITHUB_OUTPUT"
-          elif grep -qiE 'manifest unknown|not found|denied' <<< "$output"; then
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "no prebuilt QEMU at $IMAGE"
-          else
-            echo "$output" >&2
-            exit 1
-          fi
-      - name: Restore the pinned QEMU install prefix
-        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64' && steps.qemu-ghcr.outputs.found != 'true'
-        id: qemu-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.QEMU_PREFIX }}
-          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
       - name: Install host dependencies (aarch64)
         if: steps.cases.outputs.count != '0' && matrix.arch != 'x86_64'
         uses: ./helios/.github/actions/install-apt-packages
         with:
-          packages: btrfs-progs libpixman-1-0 libslirp0 libfdt1
-      - name: Install QEMU build dependencies (aarch64)
-        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64' && steps.qemu-ghcr.outputs.found != 'true' && steps.qemu-cache.outputs.cache-hit != 'true'
-        uses: ./helios/.github/actions/install-apt-packages
-        with:
-          packages: >-
-            ninja-build python3-venv pkg-config flex bison
-            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
-      - name: Build the pinned QEMU
-        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64' && steps.qemu-ghcr.outputs.found != 'true' && steps.qemu-cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          tarball="qemu-${QEMU_VERSION}.tar.xz"
-          curl -fsSLO "https://download.qemu.org/${tarball}"
-          echo "${QEMU_SHA256}  ${tarball}" | sha256sum -c -
-          tar xf "${tarball}"
-          cd "qemu-${QEMU_VERSION}"
-          mapfile -t flags < "${GITHUB_WORKSPACE}/helios/.github/qemu/aarch64-configure.args"
-          ./configure --prefix="${QEMU_PREFIX}" "${flags[@]}"
-          ninja -C build install
-      - name: Put the pinned QEMU on PATH
+          packages: btrfs-progs qemu-system-arm qemu-efi-aarch64
+      - name: Record QEMU version (aarch64)
         if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64'
-        run: |
-          echo "${QEMU_PREFIX}/bin" >> "$GITHUB_PATH"
+        run: qemu-system-aarch64 --version
       # Each case runs as its own guest process under the bound below,
       # and a case that takes the guest down costs that case and a boot.
       # The binaries reach the guest through the read-only host share at
@@ -4449,12 +4230,11 @@ jobs:
     name: linux-syscalls (${{ matrix.arch }} ${{ matrix.shard }}/${{ matrix.shards }})
     needs: [changes, linux-syscalls-build-aarch64, linux-syscalls-image-aarch64]
     if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.linux-syscalls-build-aarch64.result == 'success' && needs.linux-syscalls-image-aarch64.result == 'success' }}
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-26.04-arm
     timeout-minutes: ${{ needs.changes.outputs.linux_suite_mode == 'full' && 60 || 15 }}
     permissions:
       contents: read
       actions: read
-      packages: read
     strategy:
       fail-fast: false
       matrix:

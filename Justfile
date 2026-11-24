@@ -173,22 +173,24 @@ test-libraries:
     cargo nextest run -p helios-sync -p helios-unix -p helios-linux \
         --features helios-sync/runtime,helios-unix/runtime,helios-linux/runtime
     cargo nextest run -p helios-workspace-root --lib
-    # Batch the remaining host library tests into one cargo invocation so
+    # Batch the non-guest-world host library crates into one cargo invocation so
     # compilation and linking run in parallel. Btrfs `mkfs.btrfs` tests need
     # btrfs-progs and run in `test-btrfs-mkfs`.
     cargo nextest run \
         -p helios-firmware \
-        -p helios-vmm \
         -p helios-tpm \
-        -p helios-compositor-render -p helios-desktop-text-check \
         -p helios-inspector-protocol -p helios-wit-rpc \
-        -p helios-sysctl \
         -p helios-btrfs \
         -p helios-venus -p helios-venus-gen \
-        -p helios-http-client \
         -p helios-nu \
         -p helios-acpi \
         --features helios-btrfs/write,helios-venus/driver
+    # Guest programs with host unit tests select mutually exclusive `helios-api`
+    # WIT worlds and cannot share one feature-unified cargo invocation.
+    cargo nextest run -p helios-vmm
+    cargo nextest run -p helios-compositor-render -p helios-desktop-text-check
+    cargo nextest run -p helios-sysctl
+    cargo nextest run -p helios-http-client
     python3 "{{ repo_root }}/x86/tests/interrupt_state.py"
 
 test-host-tools:
