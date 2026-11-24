@@ -664,7 +664,7 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
             confinement.as_mut(),
             address,
             physical_memory_offset,
-            iommu::SMALL_DMA_CHUNK_BYTES,
+            iommu::LARGE_DMA_CHUNK_BYTES,
             processors,
         );
         let device = vsock::install(
