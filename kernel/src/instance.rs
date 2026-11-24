@@ -255,9 +255,9 @@ pub struct OomVictim {
     pub name: String,
     /// The pool that ran out, and therefore the one `score` ranks.
     pub pool: MemoryPool,
-    /// The instance's wasm linear-memory size: what it grew to, not
-    /// what it holds. Reported beside `user_bytes` so a log line shows
-    /// how much of the memory was out of the pool.
+    /// The instance's wasm linear-memory size plus store-held user-pool
+    /// buffers ([`UserMemoryCharge`]). Reported beside `user_bytes` so a
+    /// log line shows how much of the memory was out of the pool.
     pub memory_bytes: u64,
     /// User-pool bytes the instance holds, and so what killing it gives
     /// back to the pool: see [`UserResidency`].
@@ -274,7 +274,13 @@ pub struct InstanceSnapshot {
     pub name: String,
     pub started_at: u64,
     pub uptime: u64,
+    /// User-pool bytes the instance holds: linear memory plus the
+    /// memory its stores hold through [`UserMemoryCharge`]s.
     pub memory_bytes: u64,
+    /// User-pool bytes held by in-memory filesystems for files this instance
+    /// created (reported separately from `memory_bytes` because killing an
+    /// instance does not unlink its files).
+    pub storage_bytes: u64,
     pub cpu_busy: u16,
 }
 
@@ -338,6 +344,21 @@ struct InstanceEntry {
     /// derived from `memory_bytes` instead of charged, so the two can
     /// never drift apart — see [`InstanceEntry::kernel_heap_bytes`].
     kernel_bytes: AtomicU64,
+    /// User-pool memory the instance's stores hold beyond its linear
+    /// memory: stack checkpoints, process snapshots and fork stacks.
+    /// One [`UserMemoryCharge`] per buffer, released when the buffer's
+    /// owning store drops, which is also when the frames go back, so
+    /// killing the instance returns exactly these bytes.
+    ///
+    /// `AcqRel` add and subtract from any processor; read under the
+    /// registry's `entries` lock by victim ranking and condemnation,
+    /// and by [`InstanceRegistry::snapshot`].
+    held_user_bytes: AtomicU64,
+    /// The in-memory file storage this instance created. Inodes it
+    /// creates hold clones; the entry holds one for the instance's life
+    /// and hands it out through [`RegisteredInstance::storage_payer`].
+    /// See [`StorageShare`] for who writes it.
+    storage: Arc<StorageShare>,
     /// The processor time of every store this instance holds. The swap
     /// policy reads it to decide whether an instance has been idle long
     /// enough to evict; stats and profiles read the total.
@@ -554,6 +575,8 @@ impl InstanceRegistry {
             started_at,
             memory_bytes: AtomicU64::new(0),
             kernel_bytes: AtomicU64::new(0),
+            held_user_bytes: AtomicU64::new(0),
+            storage: Arc::new(StorageShare::default()),
             stores: Mutex::new(StoreClocks::new(started_at)),
             policy,
             kill_flag: AtomicU8::new(KILL_FLAG_NONE),
@@ -983,7 +1006,8 @@ impl InstanceRegistry {
                 name: entry.name.clone(),
                 started_at: entry.started_at,
                 uptime: now_nanos.saturating_sub(entry.started_at),
-                memory_bytes: entry.memory_bytes.load(Ordering::Acquire),
+                memory_bytes: entry.user_pool_bytes(),
+                storage_bytes: entry.storage.bytes(),
                 cpu_busy,
             });
         }
@@ -1051,7 +1075,7 @@ fn best_victim(
                     id: entry.id,
                     name: entry.name.clone(),
                     pool,
-                    memory_bytes: entry.memory_bytes.load(Ordering::Acquire),
+                    memory_bytes: entry.user_pool_bytes(),
                     user_bytes,
                     kernel_bytes,
                     policy: entry.policy,
@@ -1233,6 +1257,41 @@ impl RegisteredInstance {
         }
     }
 
+    /// User-pool bytes a kill of this instance returns: its linear
+    /// memory plus every live [`UserMemoryCharge`] against it.
+    pub fn user_pool_bytes(&self) -> u64 {
+        self.entry().user_pool_bytes()
+    }
+
+    /// Charge `bytes` of user-pool memory to this instance for as long
+    /// as the returned charge is alive.
+    ///
+    /// Infallible: the frame allocation that precedes the charge is the
+    /// admission, so there is nothing for the charge to refuse.
+    pub fn charge_user_memory(&self, bytes: u64) -> UserMemoryCharge {
+        self.entry()
+            .held_user_bytes
+            .fetch_add(bytes, Ordering::AcqRel);
+        UserMemoryCharge {
+            instance: self.clone(),
+            bytes,
+        }
+    }
+
+    /// The payer a filesystem mutation this instance requests carries.
+    pub fn storage_payer(&self) -> StoragePayer {
+        let entry = self.entry();
+        StoragePayer {
+            share: entry.storage.clone(),
+            requester: entry.id,
+        }
+    }
+
+    /// Bytes of in-memory file storage attributed to this instance.
+    pub fn storage_bytes(&self) -> u64 {
+        self.entry().storage.bytes()
+    }
+
     /// Returns `Some(reason)` when the instance has been condemned by
     /// the OOM killer or a supervisor and the runtime should trap at
     /// the guest's next interrupt check.
@@ -1254,6 +1313,85 @@ impl RegisteredInstance {
     /// re-arms the wait; the caller reads [`Self::pending_kill`] again.
     pub fn poll_kill_wait(&self, cx: &mut Context<'_>, wait: &mut NotifyWaiter) -> Poll<()> {
         self.entry().condemned.poll_notified(cx, wait)
+    }
+}
+
+/// The in-memory file storage one instance created, as a byte count.
+///
+/// Concurrency contract: lock-free. The count has no single writer: every
+/// filesystem mutation that commits or frees frames for an inode this
+/// instance created adds or subtracts them, relaxed, from any processor
+/// that holds that inode's tree lock. Commits are per write call, not per
+/// page, so the word is not cache-padded. A reader (the instance's
+/// registry entry, for stats) loads it relaxed and may see a value that
+/// is mid-update; nothing orders it against another word.
+///
+/// Inodes hold clones of the share, so it outlives the registry entry: a
+/// file whose creator has exited keeps its share balanced and nobody
+/// reads it. The filesystem's own budget never depended on the share, so
+/// no exit hook is needed.
+#[derive(Debug, Default)]
+pub struct StorageShare {
+    bytes: AtomicU64,
+}
+
+impl StorageShare {
+    /// Bytes of file storage attributed to the instance this share
+    /// belongs to.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Attributes `bytes` more storage to the share's instance.
+    pub fn add(&self, bytes: u64) {
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Returns `bytes` of storage the share's instance no longer holds.
+    pub fn sub(&self, bytes: u64) {
+        self.bytes.fetch_sub(bytes, Ordering::Relaxed);
+    }
+}
+
+/// Who pays for the storage a filesystem mutation commits: the
+/// [`hal::fs::FileSystem::Payer`] of every kernel filesystem kind.
+///
+/// It names the requester and carries the share of the instance a new
+/// inode is attributed to, so a filesystem that creates an object on this
+/// request (a create, a copy-up) records who created it.
+///
+/// Concurrency contract: immutable once built, `Send + Sync`, and cheap to
+/// clone (one `Arc` count). It is built per call from the store's data, or
+/// captured by a stream at its creation; it takes no lock and writes
+/// nothing itself. The share it holds is written by whoever commits frames
+/// (see [`StorageShare`]).
+///
+/// [`hal::fs::FileSystem::Payer`]: helios_hal::fs::FileSystem::Payer
+#[derive(Clone, Debug)]
+pub struct StoragePayer {
+    share: Arc<StorageShare>,
+    requester: InstanceId,
+}
+
+impl StoragePayer {
+    /// The instance on whose behalf the mutation runs.
+    pub const fn requester(&self) -> InstanceId {
+        self.requester
+    }
+
+    /// The share an inode this request creates is attributed to.
+    pub fn share(&self) -> &Arc<StorageShare> {
+        &self.share
+    }
+
+    /// A payer that belongs to no registry entry, for tests of code that
+    /// takes one and does not read it.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            share: Arc::new(StorageShare::default()),
+            requester: InstanceId::from_raw(0),
+        }
     }
 }
 
@@ -1288,6 +1426,38 @@ impl Drop for KernelHeapCharge {
             .update(Ordering::AcqRel, Ordering::Acquire, |charged| {
                 charged.saturating_sub(bytes)
             });
+    }
+}
+
+/// User-pool memory held for an instance by a store-owned buffer, charged
+/// for as long as the buffer is alive.
+///
+/// Sibling of [`KernelHeapCharge`] for the other pool. What it counts is
+/// memory a kill gives back: the buffer dies with the store that owns it
+/// and the store with the instance, so the OOM killer ranks and
+/// condemns by it. Memory that outlives its writer (file pages) holds no
+/// charge. The charge holds a handle on the instance, so it never
+/// outlives the registry entry it counts against.
+pub struct UserMemoryCharge {
+    instance: RegisteredInstance,
+    bytes: u64,
+}
+
+impl UserMemoryCharge {
+    /// The bytes this charge holds against its instance.
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for UserMemoryCharge {
+    fn drop(&mut self) {
+        let bytes = self.bytes;
+        self.instance.entry().held_user_bytes.update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |charged| charged.saturating_sub(bytes),
+        );
     }
 }
 
@@ -1726,10 +1896,22 @@ impl ProcessorTurn<'_> {
 
 impl InstanceEntry {
     /// User-pool bytes this instance holds, as `residency` saw them: the
-    /// pages its owner scope committed that are still resident, which is
-    /// what tearing it down returns to the pool.
+    /// pages its owner scope committed that are still resident, plus the
+    /// resident user-pool frames its stores hold through
+    /// [`UserMemoryCharge`]s — which is what tearing it down returns to
+    /// the pool.
     fn user_bytes(&self, residency: &UserResidency) -> u64 {
-        residency.bytes_of(MemoryOwner::new(self.id.raw()))
+        residency
+            .bytes_of(MemoryOwner::new(self.id.raw()))
+            .saturating_add(self.held_user_bytes.load(Ordering::Acquire))
+    }
+
+    /// User-pool bytes attributed to this instance: its linear memory plus
+    /// what its stores hold through [`UserMemoryCharge`]s.
+    fn user_pool_bytes(&self) -> u64 {
+        self.memory_bytes
+            .load(Ordering::Acquire)
+            .saturating_add(self.held_user_bytes.load(Ordering::Acquire))
     }
 
     /// Kernel heap attributed to this instance.
@@ -1760,7 +1942,68 @@ mod tests {
     use core::time::Duration;
     use std::time::Instant as WallClock;
 
-    use super::{InstanceActivity, InstanceRegistry, OffProcessorRefused};
+    use super::{
+        InstanceActivity, InstanceRegistry, MemoryOwner, MemoryPool, OffProcessorRefused,
+        OomKillOutcome, UserResidency,
+    };
+
+    /// A user-memory charge is the instance's user-pool footprint beside
+    /// its linear memory: the score ranks by it, the stats report it, a
+    /// condemnation records it, and dropping the charge returns all
+    /// three.
+    #[test]
+    fn a_user_memory_charge_counts_until_it_drops() {
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("holder", 0);
+        instance.set_memory_bytes(4096);
+        let residency: UserResidency = [(MemoryOwner::new(instance.id().raw()), 4096)]
+            .into_iter()
+            .collect();
+
+        let charge = instance.charge_user_memory(1 << 20);
+        assert_eq!(charge.bytes(), 1 << 20);
+        assert_eq!(instance.user_pool_bytes(), 4096 + (1 << 20));
+        assert_eq!(registry.snapshot(1)[0].memory_bytes, 4096 + (1 << 20));
+        let victim = registry
+            .pick_oom_victim(MemoryPool::User, &residency)
+            .unwrap();
+        assert_eq!(victim.score, 4096 + (1 << 20));
+        assert_eq!(victim.memory_bytes, 4096 + (1 << 20));
+
+        let requester = registry.register("requester", 0);
+        let decision =
+            registry.condemn_for_oom(requester.id(), MemoryPool::User, 1, 10, &residency);
+        assert!(matches!(decision.outcome, OomKillOutcome::Condemned(_)));
+        assert_eq!(decision.condemned.pending_bytes, 4096 + (1 << 20));
+
+        drop(charge);
+        assert_eq!(instance.user_pool_bytes(), 4096);
+        assert_eq!(registry.snapshot(2)[0].memory_bytes, 4096);
+    }
+
+    /// Two charges on one instance add and release independently, and
+    /// the kernel heap is not what they count against.
+    #[test]
+    fn user_memory_charges_stack_and_leave_the_kernel_heap_alone() {
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("holder", 0);
+        let kernel_before = instance.kernel_heap_bytes();
+        let residency = UserResidency::default();
+
+        let first = instance.charge_user_memory(100);
+        let second = instance.charge_user_memory(30);
+        assert_eq!(instance.user_pool_bytes(), 130);
+        assert_eq!(instance.kernel_heap_bytes(), kernel_before);
+        drop(first);
+        assert_eq!(instance.user_pool_bytes(), 30);
+        drop(second);
+        assert_eq!(instance.user_pool_bytes(), 0);
+        assert!(
+            registry
+                .pick_oom_victim(MemoryPool::User, &residency)
+                .is_none()
+        );
+    }
 
     #[test]
     fn assigns_stable_ids() {
@@ -2053,5 +2296,21 @@ mod tests {
         // for observation attribution.
         drop(leaf);
         assert!(registry.is_in_subtree(root_id, leaf_id));
+    }
+
+    #[test]
+    fn snapshot_reports_storage_bytes_separately_from_memory_bytes() {
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("writer-中文-日本語-한국어", 0);
+        let payer = instance.storage_payer();
+        payer.share().add(16_384);
+
+        let snapshots = registry.snapshot(1);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].memory_bytes, 0);
+        assert_eq!(snapshots[0].storage_bytes, 16_384);
+
+        payer.share().sub(4_096);
+        assert_eq!(registry.snapshot(2)[0].storage_bytes, 12_288);
     }
 }

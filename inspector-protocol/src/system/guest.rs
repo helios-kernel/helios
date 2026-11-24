@@ -717,6 +717,7 @@ fn convert_instance(instance: host_instances::Instance) -> instances::Instance {
         started_at: instance.started_at,
         uptime: instance.uptime,
         memory_bytes: instance.memory_bytes,
+        storage_bytes: instance.storage_bytes,
         cpu_busy: instance.cpu_busy,
     }
 }

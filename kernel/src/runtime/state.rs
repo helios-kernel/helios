@@ -169,7 +169,7 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// line: every process creation reads them and the profile counters
     /// above are written constantly. Its words are written by whichever
     /// processor serves a write (see [`crate::Settings`]).
-    settings: CachePadded<Settings>,
+    settings: Arc<CachePadded<Settings>>,
 }
 
 struct HeapPerfSnapshot {
@@ -367,6 +367,8 @@ where
         payload: BootPayload,
         guest_isa: crate::isa::GuestIsa,
     ) -> Self {
+        let settings = Arc::new(CachePadded::new(Settings::default()));
+        let memory_storage = crate::vfs::MemoryStorageBudget::for_default_pool(settings.clone());
         Self {
             inner: Arc::new(RuntimeStateInner {
                 boot_ticks,
@@ -406,9 +408,10 @@ where
                 boot_init_launched: AtomicBool::new(false),
                 boot_init_completed: AtomicBool::new(false),
                 boot_init_ready: Notify::new(),
-                namespace: Namespace::new(MountTable::new(
+                namespace: Namespace::new(MountTable::with_storage(
                     BootFs::new(payload.bootfs(), BOOT_DEVICE),
                     processor_count,
+                    memory_storage,
                 )),
                 tracing: TraceLog::new(DEFAULT_TRACE_HISTORY_CAPACITY),
                 profiles: ProfileSink::new(
@@ -421,7 +424,7 @@ where
                 #[cfg(feature = "linux")]
                 containers: Mutex::new(alloc::vec::Vec::new()),
                 heap_perf_snapshot: HeapPerfSnapshot::new(),
-                settings: CachePadded::new(Settings::default()),
+                settings,
             }),
         }
     }

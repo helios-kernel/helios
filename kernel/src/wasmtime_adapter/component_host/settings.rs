@@ -317,6 +317,7 @@ mod tests {
         use crate::{CompilerMaxInputBytesSetting, RandomBytesLimitSetting};
 
         let program = ordinary();
+        let expected_storage = crate::MemoryStorageSetting::initial();
 
         assert_eq!(
             list(&program),
@@ -325,6 +326,11 @@ mod tests {
                     name: "process.descriptor-limit",
                     description: DescriptorLimitSetting::DESCRIPTION,
                     value: SettingValue::Count(1024),
+                },
+                SettingEntry {
+                    name: "fs.memory-storage",
+                    description: crate::MemoryStorageSetting::DESCRIPTION,
+                    value: SettingValue::Bytes(expected_storage),
                 },
                 SettingEntry {
                     name: "compiler.max-input-bytes",
@@ -339,23 +345,29 @@ mod tests {
             ]
         );
         let views = listing(&program);
-        assert_eq!(views.len(), 3);
+        assert_eq!(views.len(), 4);
         assert_eq!(views[0].name, "process.descriptor-limit");
         assert_eq!(views[0].description, DescriptorLimitSetting::DESCRIPTION);
         assert!(matches!(views[0].value, ValueView::Count(1024)));
-        assert_eq!(views[1].name, "compiler.max-input-bytes");
+        assert_eq!(views[1].name, "fs.memory-storage");
         assert_eq!(
             views[1].description,
+            crate::MemoryStorageSetting::DESCRIPTION
+        );
+        assert!(matches!(views[1].value, ValueView::Bytes(v) if v == expected_storage));
+        assert_eq!(views[2].name, "compiler.max-input-bytes");
+        assert_eq!(
+            views[2].description,
             CompilerMaxInputBytesSetting::DESCRIPTION
         );
         assert!(matches!(
-            views[1].value,
+            views[2].value,
             ValueView::Bytes(crate::DEFAULT_COMPILER_MAX_INPUT_BYTES)
         ));
-        assert_eq!(views[2].name, "random.max-bytes");
-        assert_eq!(views[2].description, RandomBytesLimitSetting::DESCRIPTION);
+        assert_eq!(views[3].name, "random.max-bytes");
+        assert_eq!(views[3].description, RandomBytesLimitSetting::DESCRIPTION);
         assert!(matches!(
-            views[2].value,
+            views[3].value,
             ValueView::Bytes(bytes) if bytes == RandomBytesLimitSetting::DEFAULT
         ));
     }

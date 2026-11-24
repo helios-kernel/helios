@@ -479,15 +479,18 @@ fn draw_instances_panel(
             Cell::from(format_duration(instance.uptime)),
             Cell::from(format!("{:>5.1}%", f64::from(instance.cpu_busy) / 10.0)),
             Cell::from(format_bytes(instance.memory_bytes)),
+            Cell::from(format_bytes(instance.storage_bytes)),
         ])
     });
-    let header = Row::new(["id", "name", "started", "uptime", "cpu", "memory"])
-        .style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .bottom_margin(1);
+    let header = Row::new([
+        "id", "name", "started", "uptime", "cpu", "memory", "storage",
+    ])
+    .style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )
+    .bottom_margin(1);
     let table = Table::new(
         rows,
         [
@@ -496,6 +499,7 @@ fn draw_instances_panel(
             Constraint::Length(8),
             Constraint::Length(8),
             Constraint::Length(7),
+            Constraint::Length(12),
             Constraint::Length(12),
         ],
     )

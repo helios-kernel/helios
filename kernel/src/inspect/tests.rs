@@ -706,7 +706,10 @@ fn kernel_containers_telemetry_reports_mounts_pids_uts_and_overlay_pages() {
     // Write 5000 bytes into a file so overlay_pages == 2 (ceil(5000 / 4096)).
     block_on(async {
         let path = FsPath::new("payload.bin").unwrap();
-        let _ = mem_root.open(path, OpenFlags::CREATE, 0).await.unwrap();
+        let _ = mem_root
+            .open(path, OpenFlags::CREATE, 0, &crate::StoragePayer::for_test())
+            .await
+            .unwrap();
         let payload = vec![0xabu8; 5000];
         write_bytes(&mem_root, path, WritePosition::At(0), &payload, 0)
             .await

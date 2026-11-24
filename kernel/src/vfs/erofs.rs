@@ -379,6 +379,7 @@ impl<Device> FileSystem for ErofsFs<Device>
 where
     Device: BlockDevice<Buffer = BlockPages> + 'static,
 {
+    type Payer = crate::StoragePayer;
     super::delegate_path_handles!();
     type Dir = ErofsDir<Device>;
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
@@ -391,6 +392,7 @@ where
         path: FsPath<'_>,
         flags: OpenFlags,
         _now: u64,
+        _payer: &crate::StoragePayer,
     ) -> FsResult<helios_hal::fs::Opened<helios_hal::fs::OwnedFsPath>> {
         let metadata = match self.stat(path).await {
             Ok(metadata) => metadata,
@@ -461,11 +463,18 @@ where
         _: WritePosition,
         _: usize,
         _: u64,
+        _: &crate::StoragePayer,
     ) -> FsResult<Infallible> {
         Err(FsError::ReadOnly)
     }
 
-    async fn set_size(&self, _: FsPath<'_>, _: u64, _: u64) -> FsResult<()> {
+    async fn set_size(
+        &self,
+        _: FsPath<'_>,
+        _: u64,
+        _: u64,
+        _: &crate::StoragePayer,
+    ) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
@@ -475,6 +484,7 @@ where
         _: Option<u64>,
         _: Option<u64>,
         _: u64,
+        _: &crate::StoragePayer,
     ) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
@@ -490,27 +500,56 @@ where
         })
     }
 
-    async fn create_directory(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn create_directory(
+        &self,
+        _: FsPath<'_>,
+        _: u64,
+        _: &crate::StoragePayer,
+    ) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn remove_directory(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn remove_directory(
+        &self,
+        _: FsPath<'_>,
+        _: u64,
+        _: &crate::StoragePayer,
+    ) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn unlink(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn unlink(&self, _: FsPath<'_>, _: u64, _: &crate::StoragePayer) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn rename(&self, _: FsPath<'_>, _: FsPath<'_>, _: RenameMode, _: u64) -> FsResult<()> {
+    async fn rename(
+        &self,
+        _: FsPath<'_>,
+        _: FsPath<'_>,
+        _: RenameMode,
+        _: u64,
+        _: &crate::StoragePayer,
+    ) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn link(&self, _: FsPath<'_>, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn link(
+        &self,
+        _: FsPath<'_>,
+        _: FsPath<'_>,
+        _: u64,
+        _: &crate::StoragePayer,
+    ) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn symlink(&self, _: &str, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn symlink(
+        &self,
+        _: &str,
+        _: FsPath<'_>,
+        _: u64,
+        _: &crate::StoragePayer,
+    ) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 

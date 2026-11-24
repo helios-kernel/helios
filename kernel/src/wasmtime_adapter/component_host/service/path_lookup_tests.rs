@@ -226,11 +226,12 @@ fn wasix_and_preview1_lookup_operations_honor_dirfd_and_symlink_follow() {
         )
         .await
         .expect("mount");
+        let payer = crate::StoragePayer::for_test();
         let root_dir = dir_descriptor("/workspace");
-        wasi_fs::create_directory_at(&ns, root_dir.grant().unwrap(), "sub", 1)
+        wasi_fs::create_directory_at(&ns, root_dir.grant().unwrap(), "sub", 1, &payer)
             .await
             .unwrap();
-        wasi_fs::create_directory_at(&ns, root_dir.grant().unwrap(), "other", 1)
+        wasi_fs::create_directory_at(&ns, root_dir.grant().unwrap(), "other", 1, &payer)
             .await
             .unwrap();
         let sub_file = wasi_fs::open_at(
@@ -241,6 +242,7 @@ fn wasix_and_preview1_lookup_operations_honor_dirfd_and_symlink_follow() {
             fs_types::OpenFlags::CREATE,
             FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
             1,
+            &payer,
         )
         .await
         .unwrap();
@@ -250,6 +252,7 @@ fn wasix_and_preview1_lookup_operations_honor_dirfd_and_symlink_follow() {
             WritePosition::At(0),
             b"sub",
             1,
+            &payer,
         )
         .await
         .unwrap();
@@ -261,6 +264,7 @@ fn wasix_and_preview1_lookup_operations_honor_dirfd_and_symlink_follow() {
             fs_types::OpenFlags::CREATE,
             FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
             1,
+            &payer,
         )
         .await
         .unwrap();
@@ -270,6 +274,7 @@ fn wasix_and_preview1_lookup_operations_honor_dirfd_and_symlink_follow() {
             WritePosition::At(0),
             b"payload",
             1,
+            &payer,
         )
         .await
         .unwrap();
@@ -279,11 +284,13 @@ fn wasix_and_preview1_lookup_operations_honor_dirfd_and_symlink_follow() {
             "in-other",
             "link",
             1,
+            &payer,
         )
         .await
         .unwrap();
     });
 
+    let payer = crate::StoragePayer::for_test();
     let at_fdcwd =
         Preview1ProgramStore::<TestCpu, TestNetworkService, UnsupportedStorage>::WASIX_AT_FDCWD;
 
@@ -300,6 +307,7 @@ fn wasix_and_preview1_lookup_operations_honor_dirfd_and_symlink_follow() {
             fs_types::OpenFlags::empty(),
             FsDescriptorFlags::READ,
             1,
+            &payer,
         )),
         Err(fs_types::ErrorCode::NoEntry)
     ));
@@ -315,6 +323,7 @@ fn wasix_and_preview1_lookup_operations_honor_dirfd_and_symlink_follow() {
         fs_types::OpenFlags::empty(),
         FsDescriptorFlags::READ,
         1,
+        &payer,
     ))
     .expect("in-other opens via dirfd 4");
     assert_eq!(opened.path, "/workspace/other/in-other");

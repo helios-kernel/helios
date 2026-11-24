@@ -37,6 +37,8 @@ mod shared_memory_plugin;
 use shared_memory_plugin::*;
 mod compiler;
 pub(crate) use compiler::AotDestination;
+#[cfg(test)]
+pub(super) use compiler::map_aot_fs_error;
 use compiler::*;
 mod exec;
 use exec::*;
