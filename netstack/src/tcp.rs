@@ -7108,7 +7108,10 @@ mod tests {
     #[test]
     fn closed_peer_window_reports_the_persist_deadline_not_a_past_pacing_time() {
         let mut socket = established_fixed_pacing_socket(PacingRate::from_bytes_per_second(1_000));
-        assert_eq!(socket.queue_send(b"abcdefgh"), 8);
+        assert_eq!(
+            socket.queue_send_bytes(&mut Bytes::from_static(b"abcdefgh")),
+            8
+        );
         let sent_at = TCP_INITIAL_RTO_NANOS + 1;
         socket
             .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
@@ -7130,7 +7133,7 @@ mod tests {
             },
             now,
         );
-        assert_eq!(socket.queue_send(b"ijkl"), 4);
+        assert_eq!(socket.queue_send_bytes(&mut Bytes::from_static(b"ijkl")), 4);
         assert_eq!(
             socket.take_transmit_segment(now, TcpSegmentBudget::wire_segments(usize::MAX)),
             None

@@ -244,15 +244,15 @@ pub(crate) fn install(
     Arc::new(device)
 }
 
+type X86IommuDomain = IommuChunkDomain<Arc<X86VirtioIommuDevice>>;
+type ConfinedEntry = (PciAddress, Option<X86IommuDomain>);
+
 /// The devices one translation unit confines, and each device's dynamic
 /// IOMMU chunk domain.
 pub(crate) struct Confinement {
     device: Arc<X86VirtioIommuDevice>,
     report: Arc<IommuReport>,
-    entries: [Option<(
-        PciAddress,
-        Option<IommuChunkDomain<Arc<X86VirtioIommuDevice>>>,
-    )>; MAX_IOMMU_ENDPOINTS],
+    entries: [Option<ConfinedEntry>; MAX_IOMMU_ENDPOINTS],
 }
 
 impl Confinement {
