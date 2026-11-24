@@ -41,8 +41,8 @@ use core::future::Future;
 
 use thiserror::Error;
 
-use crate::io::{IoError, IoResult};
-use crate::iommu::DmaAccess;
+use crate::io::IoError;
+use crate::iommu::{DmaAccess, PhysicalRange};
 
 /// An address one device issues.
 ///
@@ -230,6 +230,24 @@ pub trait DmaBuffer: Send + Sync + 'static {
     }
 }
 
+/// An active mapping of caller-owned physical memory into one device's
+/// address space.
+///
+/// Dropping the guard revokes the device's access to the range (unmapping
+/// it from the device's IOMMU domain when one sits in the path), so a
+/// driver keeps the guard alive for as long as the device may still
+/// address those frames.
+pub trait DmaForeignMapping: Send + Sync + 'static {
+    /// The address the device has to issue to reach the first byte.
+    fn device_address(&self) -> DeviceAddress;
+}
+
+impl DmaForeignMapping for DeviceAddress {
+    fn device_address(&self) -> DeviceAddress {
+        *self
+    }
+}
+
 /// Memory a device reaches with no mapping request on the data path.
 ///
 /// The memory of one device is not handed to another: a buffer is for the
@@ -243,6 +261,10 @@ pub trait DmaMemory: Send + Sync + 'static {
     /// touch the bytes of a buffer while a request that names it is in
     /// flight.
     type Buffer: DmaBuffer + AsRef<[u8]> + AsMut<[u8]>;
+
+    /// A guard that keeps a caller-owned physical range mapped for this
+    /// device until dropped.
+    type ForeignMapping: DmaForeignMapping;
 
     /// Zeroed memory for the life of the device: rings, control slots,
     /// receive and event buffers. It is never freed while the device
@@ -359,18 +381,23 @@ pub trait DmaMemory: Send + Sync + 'static {
     /// first byte.
     fn device_range(&self, bytes: &[u8]) -> Result<DeviceAddress, DmaError>;
 
-    /// The address a device has to issue to reach `bytes` of physical
-    /// memory at `physical`, which this memory did not allocate.
+    /// Maps `range` — physical memory this memory did not allocate, such as
+    /// a guest's pinned frame buffer or free pages reported to a balloon —
+    /// into the device's address space with `access` rights, returning a
+    /// guard that keeps the mapping alive until dropped.
+    fn map_foreign(
+        &self,
+        range: PhysicalRange,
+        access: DmaAccess,
+    ) -> Result<Self::ForeignMapping, DmaError>;
+
+    /// The guest physical address of `bytes`, independent of any IOMMU
+    /// translation.
     ///
-    /// [`DmaMemory::device_range`] answers for a buffer the driver holds a
-    /// slice of. This one answers for memory that is somebody else's and
-    /// is named by its physical address alone, a guest's own pinned pages
-    /// handed to the device by address instead of copied. A pool whose
-    /// device sees physical addresses answers with the address it was
-    /// given; one behind a translation answers with the address inside the
-    /// device's domain, and refuses a run the domain does not map
-    /// contiguously.
-    fn foreign_range(&self, physical: u64, bytes: u64) -> IoResult<u64>;
+    /// Used by drivers whose wire protocol names guest physical page frame
+    /// numbers directly (virtio-balloon inflate/deflate) or maps caller
+    /// slices as foreign physical ranges.
+    fn physical_address(&self, bytes: &[u8]) -> Result<u64, DmaError>;
 
     /// What kind of address this memory hands out.
     fn addressing(&self) -> DmaAddressing;

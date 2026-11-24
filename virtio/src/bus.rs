@@ -6,7 +6,7 @@ use core::ptr::NonNull;
 use futures_lite::future::yield_now;
 use helios_hal::dma::{DeviceAddress, DmaAddressing, DmaBuffer, DmaError, DmaMemory, DmaSpaceMark};
 use helios_hal::io::{IoError, IoResult};
-use helios_hal::iommu::{DmaAccess, DmaTranslation};
+use helios_hal::iommu::{DmaAccess, DmaTranslation, PhysicalRange};
 use helios_hal::mmio;
 use helios_hal::pmm::PhysFrame;
 
@@ -153,6 +153,7 @@ impl IdentityDmaPool {
 
 impl DmaMemory for IdentityDmaPool {
     type Buffer = IdentityDmaBuffer;
+    type ForeignMapping = DeviceAddress;
 
     fn allocate_resident(
         &self,
@@ -207,10 +208,16 @@ impl DmaMemory for IdentityDmaPool {
         Ok(DeviceAddress::new(bytes.as_ptr() as usize as u64))
     }
 
-    /// Physical addresses and host addresses are the same thing in this
-    /// pool, so a run of somebody else's memory is reached where it is.
-    fn foreign_range(&self, physical: u64, _bytes: u64) -> IoResult<u64> {
-        Ok(physical)
+    fn map_foreign(
+        &self,
+        range: PhysicalRange,
+        _access: DmaAccess,
+    ) -> Result<Self::ForeignMapping, DmaError> {
+        Ok(DeviceAddress::new(range.start))
+    }
+
+    fn physical_address(&self, bytes: &[u8]) -> Result<u64, DmaError> {
+        Ok(bytes.as_ptr() as usize as u64)
     }
 
     fn addressing(&self) -> DmaAddressing {
@@ -251,6 +258,7 @@ impl OffsetDmaPool {
 
 impl DmaMemory for OffsetDmaPool {
     type Buffer = OffsetDmaBuffer;
+    type ForeignMapping = DeviceAddress;
 
     fn allocate_resident(
         &self,
@@ -302,23 +310,26 @@ impl DmaMemory for OffsetDmaPool {
         DmaSpaceMark::new(0)
     }
 
-    /// The device sees physical addresses, so a run named by one is
-    /// already the address it has to issue. The offset this pool holds
-    /// turns a kernel pointer into a physical address and has nothing
-    /// to say about memory that arrived as one.
-    fn foreign_range(&self, physical: u64, _bytes: u64) -> IoResult<u64> {
-        Ok(physical)
+    fn map_foreign(
+        &self,
+        range: PhysicalRange,
+        _access: DmaAccess,
+    ) -> Result<Self::ForeignMapping, DmaError> {
+        Ok(DeviceAddress::new(range.start))
+    }
+
+    fn physical_address(&self, bytes: &[u8]) -> Result<u64, DmaError> {
+        self.translate(bytes.as_ptr())
+            .map_err(|_| DmaError::Unreachable {
+                address: bytes.as_ptr() as usize,
+                bytes: bytes.len(),
+            })
     }
 
     /// The offset is linear, so a buffer is contiguous in physical memory
     /// exactly when it is in the kernel's address space.
     fn device_range(&self, bytes: &[u8]) -> Result<DeviceAddress, DmaError> {
-        self.translate(bytes.as_ptr())
-            .map(DeviceAddress::new)
-            .map_err(|_| DmaError::Unreachable {
-                address: bytes.as_ptr() as usize,
-                bytes: bytes.len(),
-            })
+        self.physical_address(bytes).map(DeviceAddress::new)
     }
 
     fn addressing(&self) -> DmaAddressing {
@@ -394,6 +405,7 @@ impl<P: Copy> Copy for PlatformDmaPool<P> {}
 
 impl<P: DmaMemory> DmaMemory for PlatformDmaPool<P> {
     type Buffer = PlatformDmaBuffer<P::Buffer>;
+    type ForeignMapping = DeviceAddress;
 
     fn allocate_resident(
         &self,
@@ -452,8 +464,22 @@ impl<P: DmaMemory> DmaMemory for PlatformDmaPool<P> {
             .map_err(|_| unreachable)
     }
 
-    fn foreign_range(&self, physical: u64, bytes: u64) -> IoResult<u64> {
-        Ok(self.translation.device_range(physical, bytes)?)
+    fn map_foreign(
+        &self,
+        range: PhysicalRange,
+        _access: DmaAccess,
+    ) -> Result<Self::ForeignMapping, DmaError> {
+        self.translation
+            .device_range(range.start, range.bytes)
+            .map(DeviceAddress::new)
+            .map_err(|_| DmaError::Unreachable {
+                address: range.start as usize,
+                bytes: range.bytes as usize,
+            })
+    }
+
+    fn physical_address(&self, bytes: &[u8]) -> Result<u64, DmaError> {
+        self.inner.physical_address(bytes)
     }
 
     fn addressing(&self) -> DmaAddressing {

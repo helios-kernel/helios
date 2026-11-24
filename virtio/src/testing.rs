@@ -751,6 +751,7 @@ impl WindowDmaPool {
 
 impl DmaMemory for WindowDmaPool {
     type Buffer = WindowDmaBuffer;
+    type ForeignMapping = DeviceAddress;
 
     fn allocate_resident(
         &self,
@@ -812,10 +813,16 @@ impl DmaMemory for WindowDmaPool {
         }
     }
 
-    /// A run named by its address is already in the window, the way a
-    /// guest's own pinned pages reach a real device.
-    fn foreign_range(&self, physical: u64, _bytes: u64) -> IoResult<u64> {
-        Ok(physical)
+    fn map_foreign(
+        &self,
+        range: helios_hal::iommu::PhysicalRange,
+        _access: DmaAccess,
+    ) -> Result<Self::ForeignMapping, DmaError> {
+        Ok(DeviceAddress::new(range.start))
+    }
+
+    fn physical_address(&self, bytes: &[u8]) -> Result<u64, DmaError> {
+        self.device_range(bytes).map(DeviceAddress::get)
     }
 
     fn addressing(&self) -> DmaAddressing {
@@ -1098,6 +1105,7 @@ impl ConfinedDmaPool {
 
 impl DmaMemory for ConfinedDmaPool {
     type Buffer = ConfinedDmaBuffer;
+    type ForeignMapping = DeviceAddress;
 
     fn allocate_resident(
         &self,
@@ -1170,8 +1178,16 @@ impl DmaMemory for ConfinedDmaPool {
         }
     }
 
-    fn foreign_range(&self, physical: u64, _bytes: u64) -> IoResult<u64> {
-        Ok(physical)
+    fn map_foreign(
+        &self,
+        range: helios_hal::iommu::PhysicalRange,
+        _access: DmaAccess,
+    ) -> Result<Self::ForeignMapping, DmaError> {
+        Ok(DeviceAddress::new(range.start))
+    }
+
+    fn physical_address(&self, bytes: &[u8]) -> Result<u64, DmaError> {
+        Ok(bytes.as_ptr() as usize as u64)
     }
 
     fn addressing(&self) -> DmaAddressing {

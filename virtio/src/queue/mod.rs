@@ -31,9 +31,9 @@ use core::alloc::Layout;
 
 use alloc::boxed::Box;
 use helios_hal::io::{IoError, IoResult};
-use helios_hal::iommu::{DmaAccess, PhysicalRange};
+use helios_hal::iommu::DmaAccess;
 
-use helios_hal::dma::{DmaBuffer, DmaError, DmaMemory};
+use helios_hal::dma::{DeviceAddress, DmaBuffer, DmaError, DmaMemory};
 
 use crate::bus::DeviceBus;
 use crate::features::NegotiatedFeatures;
@@ -50,6 +50,10 @@ pub(crate) const READ_WRITE: DmaAccess = DmaAccess::READ.union(DmaAccess::WRITE)
 /// The DMA buffer type a transport's bus hands out.
 pub type TransportBuffer<T> =
     <<<T as VirtioTransport>::Bus as DeviceBus>::DmaPool as DmaMemory>::Buffer;
+
+/// The foreign-mapping guard type a transport's bus hands out.
+pub type TransportForeignMapping<T> =
+    <<<T as VirtioTransport>::Bus as DeviceBus>::DmaPool as DmaMemory>::ForeignMapping;
 
 /// Both ring layouts use 16-byte descriptors, so one indirect table
 /// stride covers both.
@@ -930,30 +934,12 @@ impl<T: VirtioTransport> VirtQueue<T> {
         inputs: &[&[u8]],
         outputs: &mut [&mut [u8]],
     ) -> IoResult<u16> {
-        self.submit_with_payload(transport, inputs, None, outputs)
-    }
-
-    /// Submits one chain that carries, between its read-only buffers
-    /// and its writable ones, a run of memory named by its physical
-    /// address rather than by a pointer.
-    ///
-    /// This is how a command whose body belongs to a guest reaches the
-    /// device: the pages are the guest's, pinned by whoever owns them,
-    /// and the device reads them where they are instead of being handed
-    /// a copy this driver would have to allocate.
-    pub fn submit_with_payload(
-        &mut self,
-        transport: &T,
-        inputs: &[&[u8]],
-        payload: Option<PhysicalRange>,
-        outputs: &mut [&mut [u8]],
-    ) -> IoResult<u16> {
         let mut chain = [ChainEntry {
             addr: 0,
             len: 0,
             writable: false,
         }; MAX_CHAIN_BUFFERS];
-        let used = build_chain(transport, inputs, payload, outputs, &mut chain)?;
+        let used = build_chain(transport, inputs, outputs, &mut chain)?;
         self.ensure_driven()?;
         Ok(self.ring.submit(&chain[..used], true)?)
     }
@@ -1019,7 +1005,7 @@ impl<T: VirtioTransport> VirtQueue<T> {
             len: 0,
             writable: false,
         }; MAX_CHAIN_BUFFERS];
-        let used = build_chain(transport, inputs, None, outputs, &mut chain)?;
+        let used = build_chain(transport, inputs, outputs, &mut chain)?;
         self.ensure_driven()?;
         Ok(self.ring.submit(&chain[..used], false)?)
     }
@@ -1254,19 +1240,13 @@ impl<T: VirtioTransport> VirtQueue<T> {
 }
 
 /// Translates a driver's buffers into device addresses.
-///
-/// `payload` is a run of memory the driver does not hold a pointer to —
-/// a guest's own pinned pages — and it goes on the wire between the
-/// read-only buffers and the writable ones, which is where a command
-/// whose body is the guest's carries it.
 fn build_chain<T: VirtioTransport>(
     transport: &T,
     inputs: &[&[u8]],
-    payload: Option<PhysicalRange>,
     outputs: &mut [&mut [u8]],
     chain: &mut [ChainEntry; MAX_CHAIN_BUFFERS],
 ) -> Result<usize, VirtqueueError> {
-    let buffers = inputs.len() + usize::from(payload.is_some()) + outputs.len();
+    let buffers = inputs.len() + outputs.len();
     if buffers == 0 {
         return Err(VirtqueueError::EmptyChain);
     }
@@ -1283,10 +1263,6 @@ fn build_chain<T: VirtioTransport>(
         chain[used] = entry(dma, input, false)?;
         used += 1;
     }
-    if let Some(payload) = payload {
-        chain[used] = foreign_entry(dma, payload)?;
-        used += 1;
-    }
     for output in outputs.iter() {
         chain[used] = entry(dma, output, true)?;
         used += 1;
@@ -1294,27 +1270,24 @@ fn build_chain<T: VirtioTransport>(
     Ok(used)
 }
 
-/// One read-only descriptor over memory the driver never mapped.
-fn foreign_entry<P: DmaMemory>(
-    dma: &P,
-    payload: PhysicalRange,
+/// One descriptor over a pre-translated device address whose backing is
+/// owned by the request or driver until the chain completes.
+fn device_entry(
+    address: DeviceAddress,
+    len: usize,
+    writable: bool,
 ) -> Result<ChainEntry, VirtqueueError> {
-    if payload.bytes == 0 {
+    if len == 0 {
         return Err(VirtqueueError::EmptyChain);
     }
-    let len = u32::try_from(payload.bytes).map_err(|_| VirtqueueError::ChainTooLong {
-        actual: payload.bytes as usize,
+    let len = u32::try_from(len).map_err(|_| VirtqueueError::ChainTooLong {
+        actual: len,
         limit: u32::MAX as usize,
     })?;
     Ok(ChainEntry {
-        addr: dma
-            .foreign_range(payload.start, payload.bytes)
-            .map_err(|_| VirtqueueError::Unreachable {
-                address: payload.start as usize,
-                bytes: len as usize,
-            })?,
+        addr: address.get(),
         len,
-        writable: false,
+        writable,
     })
 }
 

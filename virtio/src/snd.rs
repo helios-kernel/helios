@@ -75,15 +75,16 @@ use helios_hal::audio::{
     StreamDirection, StreamId, StreamInfo, StreamList, XferStatus,
 };
 use helios_hal::io::{IoError, IoResult};
+use helios_hal::iommu::DmaAccess;
 
 use spin::Mutex as SpinMutex;
 
 use crate::bus::DeviceBus;
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate, renegotiate};
 use crate::inflight::{
-    InFlight, await_completion, drain_to_idle, reinitialize_requests, submit_control,
+    InFlight, await_completion, drain_to_idle, reinitialize_requests, submit_control, submit_lent,
 };
-use crate::journal::Journal;
+use crate::journal::{Journal, allocate_dma_buffer};
 use crate::notify::Notify;
 use crate::queue::{
     ControlSlots, Part, SlotPool, TransportBuffer, VirtQueue, control_slots, exchange_blocking,
@@ -367,9 +368,10 @@ pub struct VirtioSndDevice<T: VirtioTransport> {
     /// Control requests and their replies, one slot per descriptor.
     control_slots: ControlSlots<TransportBuffer<T>>,
     tx: AsyncMutex<VirtQueue<T>>,
-    tx_inflight: InFlight<{ TX_QUEUE_SIZE as usize }>,
+    tx_inflight: InFlight<{ TX_QUEUE_SIZE as usize }, Option<TransportBuffer<T>>>,
     /// The transfer header and the status the device answers with, one
-    /// slot per descriptor. The period itself is the caller's memory.
+    /// slot per descriptor. The period is copied into a DMA buffer owned by
+    /// the in-flight entry until completion.
     tx_slots: ControlSlots<TransportBuffer<T>>,
     /// Programmed so the device sees four queues, and never posted: this
     /// driver plays and does not record.
@@ -1097,22 +1099,35 @@ impl<T: VirtioTransport> PlaybackDevice for VirtioSndDevice<T> {
 
         let header: [u8; XFER_HEADER_BYTES] = stream.index().to_le_bytes();
         let mut status = [0_u8; XFER_STATUS_BYTES];
+        let mut dma_period = allocate_dma_buffer(
+            self.transport.bus().dma(),
+            period.len(),
+            DmaAccess::READ,
+            false,
+        )
+        .await?;
+        dma_period.as_mut()[..period.len()].copy_from_slice(period);
         let written = {
-            // The header and the status are in the period's control slot.
-            // The period is the caller's own memory, pinned for the
-            // device by whoever owns it.
-            let ticket = submit_control(
+            // The header and the status live in the period's control slot;
+            // the period payload lives in `dma_period`, parked in
+            // `tx_inflight` until the device returns the chain.
+            let ticket = submit_lent(
                 &self.tx_inflight,
                 &self.tx,
                 &self.transport,
                 &self.tx_slots,
                 &[
                     Part::Request(&header),
-                    Part::Read(period),
+                    Part::LentRead {
+                        buffer: 0,
+                        range: 0..period.len(),
+                    },
                     Part::Response(XFER_STATUS_BYTES),
                 ],
+                Some(dma_period),
             )
-            .await?;
+            .await
+            .map_err(|error| error.into_error())?;
             let reply = await_completion(&self.tx, ticket, || self.completions.notified()).await?;
             status.copy_from_slice(reply.response());
             reply.written()

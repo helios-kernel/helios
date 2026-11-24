@@ -62,13 +62,13 @@ use core::mem::align_of;
 use core::ops::Range;
 
 use crossbeam_utils::CachePadded;
-use helios_hal::dma::{DmaBuffer, DmaMemory};
+use helios_hal::dma::{DeviceAddress, DmaBuffer, DmaMemory};
 use helios_hal::io::{IoError, IoResult};
-use helios_hal::iommu::{DmaAccess, PhysicalRange};
+use helios_hal::iommu::DmaAccess;
 
 use super::{
-    ChainEntry, MAX_CHAIN_BUFFERS, READ_WRITE, TransportBuffer, VirtQueue, VirtqueueError, entry,
-    foreign_entry,
+    ChainEntry, MAX_CHAIN_BUFFERS, READ_WRITE, TransportBuffer, VirtQueue, VirtqueueError,
+    device_entry, entry,
 };
 use crate::bus::DeviceBus;
 use crate::transport::VirtioTransport;
@@ -84,13 +84,12 @@ const SLOT_ALIGNMENT: usize = align_of::<CachePadded<u8>>();
 pub(crate) enum Part<'a> {
     /// Bytes copied into the slot's request area, which the device reads.
     Request(&'a [u8]),
-    /// Memory the caller owns and the device reads.
-    Read(&'a [u8]),
-    /// A run of somebody else's pages, named by physical address, that the
-    /// device reads.
-    Payload(PhysicalRange),
-    /// Memory the caller owns and the device writes.
-    Write(&'a mut [u8]),
+    /// A device-visible address whose backing is owned by the driver or
+    /// parked in [`Lend`] until the chain completes, which the device reads.
+    DeviceRead { address: DeviceAddress, len: usize },
+    /// A device-visible address whose backing is owned by the driver or
+    /// parked in [`Lend`] until the chain completes, which the device writes.
+    DeviceWrite { address: DeviceAddress, len: usize },
     /// Bytes `range` of buffer `buffer` of what the request lent the
     /// device ([`Lend`]), which the device reads.
     LentRead { buffer: usize, range: Range<usize> },
@@ -276,9 +275,8 @@ impl<B: DmaBuffer> ControlSlots<B> {
                     request_used = end;
                     (address, false)
                 }
-                Part::Read(bytes) => (entry(dma, bytes, false)?, false),
-                Part::Payload(run) => (foreign_entry(dma, *run)?, false),
-                Part::Write(bytes) => (entry(dma, bytes, true)?, true),
+                Part::DeviceRead { address, len } => (device_entry(*address, *len, false)?, false),
+                Part::DeviceWrite { address, len } => (device_entry(*address, *len, true)?, true),
                 Part::LentRead { buffer, range } => {
                     (entry(dma, lent_bytes(lent, *buffer, range)?, false)?, false)
                 }
@@ -524,8 +522,8 @@ impl<B: DmaBuffer> SlotPool<B> {
 /// For the one moment a driver may spin on a ring, before the executor
 /// exists: the caller holds the queue exclusively, so nothing else submits
 /// while the request runs.
-pub(crate) fn exchange_blocking<T: VirtioTransport, const N: usize>(
-    inflight: &crate::inflight::InFlight<N>,
+pub(crate) fn exchange_blocking<T: VirtioTransport, L: Lend, const N: usize>(
+    inflight: &crate::inflight::InFlight<N, L>,
     queue: &mut VirtQueue<T>,
     transport: &T,
     slots: &ControlSlots<TransportBuffer<T>>,

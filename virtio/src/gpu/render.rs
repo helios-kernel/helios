@@ -75,17 +75,20 @@ use helios_hal::display::{
     MAX_BACKING_RANGES, MAX_CONTEXT_NAME, MAX_RINGS, Rect, RingCount, RingIndex, ScanoutId,
     Submission,
 };
+use helios_hal::dma::{DmaForeignMapping, DmaMemory};
 use helios_hal::io::IoError;
-use helios_hal::iommu::PhysicalRange;
+use helios_hal::iommu::{DmaAccess, PhysicalRange};
 
-use crate::inflight::{await_completion, submit_control};
-use crate::queue::{MAX_CHAIN_BUFFERS, Part};
+use crate::bus::DeviceBus;
+use crate::inflight::{await_completion, submit_lent};
+use crate::journal::allocate_dma_buffer;
+use crate::queue::{MAX_CHAIN_BUFFERS, Part, TransportForeignMapping};
 use crate::transport::VirtioTransport;
 
 use super::{
-    CTRL_HEADER_BYTES, MemEntryError, RESP_ERR_OUT_OF_MEMORY, RESP_ERR_UNSPEC, RESP_OK_NODATA,
-    RequestSubject, VirtioGpuDevice, encode_mem_entries, encode_resource_flush, wire_format,
-    write_header, write_rect,
+    CTRL_HEADER_BYTES, GpuLent, MemEntryError, RESP_ERR_OUT_OF_MEMORY, RESP_ERR_UNSPEC,
+    RESP_OK_NODATA, RequestSubject, VirtioGpuDevice, encode_mem_entries, encode_resource_flush,
+    wire_format, write_header, write_rect,
 };
 
 /// `VIRTIO_GPU_F_VIRGL`: the device carries a host renderer, and every
@@ -264,6 +267,13 @@ pub(super) struct BlobRecord {
     pub(super) placed_at: Option<u64>,
 }
 
+/// One blob entry together with its active foreign DMA mappings kept alive
+/// until the device releases the blob.
+pub(super) struct BlobEntry<T: VirtioTransport> {
+    pub(super) record: BlobRecord,
+    pub(super) _backing: ArrayVec<TransportForeignMapping<T>, MAX_BACKING_RANGES>,
+}
+
 impl<T: VirtioTransport> VirtioGpuDevice<T> {
     /// Runs one 3D control command and checks its response header.
     async fn render_command(
@@ -273,9 +283,7 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
         expected: u32,
         subject: RenderSubject,
     ) -> Gpu3dResult<u32> {
-        let written = self
-            .control_exchange(inputs, None, response, &mut [])
-            .await?;
+        let written = self.control_exchange(inputs, response, &mut []).await?;
         if (written as usize) < CTRL_HEADER_BYTES {
             return Err(IoError::DeviceFault.into());
         }
@@ -305,8 +313,8 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
         self.blobs
             .lock()
             .iter()
-            .find(|record| record.id == blob)
-            .copied()
+            .find(|entry| entry.record.id == blob)
+            .map(|entry| entry.record)
             .ok_or(Gpu3dError::UnknownBlob(blob))
     }
 
@@ -347,10 +355,10 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
     fn reserve_aperture(&self, blob: BlobId, bytes: u64) -> Gpu3dResult<u64> {
         let aperture = self.host_visible.ok_or(Gpu3dError::ApertureExhausted)?;
         let mut blobs = self.blobs.lock();
-        let Some(index) = blobs.iter().position(|record| record.id == blob) else {
+        let Some(index) = blobs.iter().position(|entry| entry.record.id == blob) else {
             return Err(Gpu3dError::UnknownBlob(blob));
         };
-        if blobs[index].placed_at.is_some() {
+        if blobs[index].record.placed_at.is_some() {
             return Err(Gpu3dError::NotMappable(blob));
         }
         let mut candidate = 0_u64;
@@ -365,7 +373,7 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
             }
             let clash = blobs
                 .iter()
-                .filter_map(|record| record.placed_at.map(|at| (at, record.span)))
+                .filter_map(|entry| entry.record.placed_at.map(|at| (at, entry.record.span)))
                 .find(|(at, held)| candidate < at + held && *at < end);
             match clash {
                 Some((at, held)) => {
@@ -374,7 +382,7 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
                         .ok_or(Gpu3dError::ApertureExhausted)?;
                 }
                 None => {
-                    blobs[index].placed_at = Some(candidate);
+                    blobs[index].record.placed_at = Some(candidate);
                     return Ok(candidate);
                 }
             }
@@ -486,7 +494,7 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
         // would be the largest thing this driver did.
         let mut header = [0_u8; CTRL_HEADER_BYTES];
         let written = self
-            .control_exchange(&[&request], None, &mut header, &mut [out])
+            .control_exchange(&[&request], &mut header, &mut [out])
             .await?;
         if (written as usize) < CTRL_HEADER_BYTES {
             return Err(IoError::DeviceFault.into());
@@ -602,7 +610,12 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
         let span = size
             .checked_next_multiple_of(self.aperture_align)
             .ok_or(Gpu3dError::InvalidBlob)?;
-        let entries = encode_mem_entries(request.backing).map_err(|error| match error {
+        let (entries, backing_mappings) = encode_mem_entries(
+            self.transport.bus().dma(),
+            request.backing,
+            DmaAccess::READ | DmaAccess::WRITE,
+        )
+        .map_err(|error| match error {
             MemEntryError::Empty => Gpu3dError::InvalidBlob,
             MemEntryError::Unrepresentable => IoError::DeviceFault.into(),
         })?;
@@ -611,18 +624,23 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
         {
             let mut blobs = self.blobs.lock();
             if blobs.is_full() {
+                drop(blobs);
+                drop(backing_mappings);
                 return Err(Gpu3dError::TooMany {
                     table: Gpu3dTable::Blobs,
                     limit: MAX_BLOBS,
                 });
             }
-            blobs.push(BlobRecord {
-                id: blob,
-                context,
-                size,
-                span,
-                usage: request.usage,
-                placed_at: None,
+            blobs.push(BlobEntry {
+                record: BlobRecord {
+                    id: blob,
+                    context,
+                    size,
+                    span,
+                    usage: request.usage,
+                    placed_at: None,
+                },
+                _backing: backing_mappings,
             });
         }
         let create = encode_create_blob(blob, &request, size, request.backing.len());
@@ -644,7 +662,14 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
         {
             Ok(_) => Ok(blob),
             Err(error) => {
-                self.blobs.lock().retain(|record| record.id != blob);
+                let removed = {
+                    let mut blobs = self.blobs.lock();
+                    blobs
+                        .iter()
+                        .position(|entry| entry.record.id == blob)
+                        .map(|index| blobs.swap_remove(index))
+                };
+                drop(removed);
                 Err(error)
             }
         }
@@ -668,7 +693,14 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
             RenderSubject::blob(blob),
         )
         .await?;
-        self.blobs.lock().retain(|held| held.id != blob);
+        let removed = {
+            let mut blobs = self.blobs.lock();
+            blobs
+                .iter()
+                .position(|held| held.record.id == blob)
+                .map(|index| blobs.swap_remove(index))
+        };
+        drop(removed);
         Ok(())
     }
 
@@ -759,29 +791,58 @@ impl<T: VirtioTransport> Gpu3d for VirtioGpuDevice<T> {
         }
         let request = encode_submit_3d(record.id, bytes, submission.ring, submission.fence);
         let mut response = [0_u8; CTRL_HEADER_BYTES];
-        // The guest's pages go on the wire by address and a short stream
-        // from where the caller holds it: the device reads the bytes
-        // where they were written, and this driver never holds a copy of
-        // a command stream.
+        let (lent, stream_part) = match submission.commands {
+            CommandStream::Pages(range) => {
+                let mapping = self
+                    .transport
+                    .bus()
+                    .dma()
+                    .map_foreign(range, DmaAccess::READ)
+                    .map_err(IoError::from)?;
+                let address = mapping.device_address();
+                (
+                    GpuLent::Foreign(mapping),
+                    Some(Part::DeviceRead {
+                        address,
+                        len: range.bytes as usize,
+                    }),
+                )
+            }
+            CommandStream::Inline(bytes) if !bytes.is_empty() => {
+                let mut buffer = allocate_dma_buffer(
+                    self.transport.bus().dma(),
+                    bytes.len(),
+                    DmaAccess::READ,
+                    false,
+                )
+                .await?;
+                buffer.as_mut()[..bytes.len()].copy_from_slice(bytes);
+                (
+                    GpuLent::Buffer(buffer),
+                    Some(Part::LentRead {
+                        buffer: 0,
+                        range: 0..bytes.len(),
+                    }),
+                )
+            }
+            CommandStream::Inline(_) => (GpuLent::None, None),
+        };
         let mut parts: ArrayVec<Part<'_>, MAX_CHAIN_BUFFERS> = ArrayVec::new();
         parts.push(Part::Request(&request));
-        match submission.commands {
-            CommandStream::Pages(range) => parts.push(Part::Payload(range)),
-            CommandStream::Inline(bytes) => {
-                if !bytes.is_empty() {
-                    parts.push(Part::Read(bytes));
-                }
-            }
+        if let Some(part) = stream_part {
+            parts.push(part);
         }
         parts.push(Part::Response(response.len()));
-        let ticket = submit_control(
+        let ticket = submit_lent(
             &self.control_inflight,
             &self.control,
             &self.transport,
             &self.control_slots,
             &parts,
+            lent,
         )
-        .await?;
+        .await
+        .map_err(|error| error.into_error())?;
         // The chain is in the ring and the device notified: the caller
         // may let its next command follow this one.
         posted();
@@ -841,8 +902,13 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
     /// Records where a blob sits in the aperture, or that it sits
     /// nowhere.
     fn place_blob(&self, blob: BlobId, offset: Option<u64>) {
-        if let Some(record) = self.blobs.lock().iter_mut().find(|held| held.id == blob) {
-            record.placed_at = offset;
+        if let Some(entry) = self
+            .blobs
+            .lock()
+            .iter_mut()
+            .find(|held| held.record.id == blob)
+        {
+            entry.record.placed_at = offset;
         }
     }
 
@@ -920,8 +986,8 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
         self.blobs
             .lock()
             .iter()
-            .find(|record| record.id == blob)
-            .copied()
+            .find(|entry| entry.record.id == blob)
+            .map(|entry| entry.record)
             .ok_or(DisplayError::UnknownBlob(blob))
     }
 
@@ -929,7 +995,7 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
     async fn display_command(&self, request: &[u8], subject: RequestSubject) -> DisplayResult<()> {
         let mut response = [0_u8; CTRL_HEADER_BYTES];
         let written = self
-            .control_exchange(&[request], None, &mut response, &mut [])
+            .control_exchange(&[request], &mut response, &mut [])
             .await?;
         if (written as usize) < CTRL_HEADER_BYTES {
             return Err(IoError::DeviceFault.into());
@@ -1206,6 +1272,6 @@ fn check_render_response(
 }
 
 /// The blob table one device holds.
-pub(super) type BlobRecords = ArrayVec<BlobRecord, MAX_BLOBS>;
+pub(super) type BlobEntries<T> = ArrayVec<BlobEntry<T>, MAX_BLOBS>;
 /// The context table one device holds.
 pub(super) type ContextRecords = ArrayVec<ContextRecord, MAX_CONTEXTS>;

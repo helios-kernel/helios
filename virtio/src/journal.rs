@@ -64,14 +64,14 @@ use alloc::vec::Vec;
 
 use arrayvec::ArrayVec;
 use async_lock::Mutex as AsyncMutex;
-use helios_hal::dma::{DmaError, DmaMemory};
+use helios_hal::dma::{DmaBuffer, DmaError, DmaMemory};
 use helios_hal::io::{IoError, IoResult};
 use helios_hal::iommu::DmaAccess;
 use spin::Mutex;
 
 use crate::bus::DeviceBus;
-use crate::inflight::{InFlight, Ticket, submit_control};
-use crate::queue::{ControlSlots, MAX_CHAIN_BUFFERS, Part, TransportBuffer, VirtQueue};
+use crate::inflight::{InFlight, Ticket, submit_lent};
+use crate::queue::{ControlSlots, Lend, MAX_CHAIN_BUFFERS, Part, TransportBuffer, VirtQueue};
 use crate::transport::VirtioTransport;
 
 /// One submitted command and the change its acknowledgement applies.
@@ -167,20 +167,28 @@ impl<C, T: VirtioTransport, const N: usize> Journal<C, T, N> {
                   slots as `submit_control` does, and a journaled command adds its bytes, its \
                   answer length and its change; a struct would exist only to carry them here"
     )]
-    pub(crate) async fn send<'a>(
+    pub(crate) async fn send<'a, L: Lend + Default>(
         &self,
-        inflight: &'a InFlight<N>,
+        inflight: &'a InFlight<N, L>,
         queue: &AsyncMutex<VirtQueue<T>>,
         transport: &T,
         slots: &'a ControlSlots<TransportBuffer<T>>,
         inputs: &[&[u8]],
         response_bytes: usize,
         change: C,
-    ) -> IoResult<(Arc<Sent<C, T>>, Ticket<'a, N>, Displaced<C, T>)> {
-        let mut response = if response_bytes == 0 {
+    ) -> IoResult<(Arc<Sent<C, T>>, Ticket<'a, N, L>, Displaced<C, T>)> {
+        let response = if response_bytes == 0 {
             None
         } else {
-            Some(answer_buffer(transport.bus().dma(), response_bytes).await?)
+            Some(
+                allocate_dma_buffer(
+                    transport.bus().dma(),
+                    response_bytes,
+                    DmaAccess::WRITE,
+                    true,
+                )
+                .await?,
+            )
         };
         // The chain names the buffer's device address, which does not
         // move with the value when the record takes it below.
@@ -189,10 +197,15 @@ impl<C, T: VirtioTransport, const N: usize> Journal<C, T, N> {
             for bytes in inputs {
                 parts.push(Part::Request(bytes));
             }
-            if let Some(response) = response.as_mut() {
-                parts.push(Part::Write(&mut response.as_mut()[..response_bytes]));
+            if let Some(response) = response.as_ref() {
+                parts.push(Part::DeviceWrite {
+                    address: response.device_address(),
+                    len: response_bytes,
+                });
             }
-            submit_control(inflight, queue, transport, slots, &parts).await?
+            submit_lent(inflight, queue, transport, slots, &parts, L::default())
+                .await
+                .map_err(|error| error.into_error())?
         };
         let sent = Arc::new(Sent {
             token: ticket.token(),
@@ -227,13 +240,23 @@ impl<C, T: VirtioTransport, const N: usize> Journal<C, T, N> {
     }
 }
 
-/// Device memory for a command's answer of `bytes`, waited for while the
+/// Device memory of `bytes` with `access` rights, waited for while the
 /// device's memory is short, as [`DmaMemory::want_space`] says.
-async fn answer_buffer<P: DmaMemory>(dma: &P, bytes: usize) -> IoResult<P::Buffer> {
+pub(crate) async fn allocate_dma_buffer<P: DmaMemory>(
+    dma: &P,
+    bytes: usize,
+    access: DmaAccess,
+    zeroed: bool,
+) -> IoResult<P::Buffer> {
     let layout = Layout::array::<u8>(bytes).map_err(|_| IoError::OutOfBounds)?;
     let mut declared = None;
     loop {
-        match dma.allocate(layout, DmaAccess::WRITE) {
+        let result = if zeroed {
+            dma.allocate(layout, access)
+        } else {
+            dma.allocate_overwritten(layout, access)
+        };
+        match result {
             Ok(buffer) => return Ok(buffer),
             Err(DmaError::Replenishing { .. } | DmaError::Exhausted { .. }) => {}
             Err(error) => return Err(error.into()),

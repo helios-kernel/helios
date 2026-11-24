@@ -39,17 +39,19 @@ use async_lock::Mutex;
 use helios_hal::balloon::{MemoryBalloon, MemoryStat, MemoryStatTag};
 use helios_hal::io::{IoError, IoResult};
 
-use helios_hal::dma::DmaMemory;
+use helios_hal::dma::{DmaForeignMapping, DmaMemory};
+use helios_hal::iommu::{DmaAccess, PhysicalRange};
 
 use crate::bus::DeviceBus;
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate_with, renegotiate};
 use crate::inflight::{
     InFlight, await_completion, drain_to_idle, reinitialize_posted, reinitialize_requests,
-    submit_control,
+    submit_lent,
 };
 use crate::notify::Notify;
 use crate::queue::{
-    ControlSlots, MAX_CHAIN_BUFFERS, Part, TransportBuffer, VirtQueue, control_slots,
+    ControlSlots, Lend, MAX_CHAIN_BUFFERS, Part, TransportBuffer, TransportForeignMapping,
+    VirtQueue, control_slots,
 };
 use crate::resume::{DeviceReset, QuiesceError, ReinitError, conclude, driver_ok};
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
@@ -142,9 +144,25 @@ const fn stat_tag(tag: MemoryStatTag) -> u16 {
 /// waiting on. A device-wide notification would let the task parked on
 /// one queue consume the wake-up belonging to another, whose completion
 /// would then sit in the used ring with nobody left to reap it.
+/// Active foreign DMA mappings parked for a free-page report or hint
+/// batch until the device returns the chain.
+struct BalloonLent<T: VirtioTransport>(ArrayVec<TransportForeignMapping<T>, MAX_CHAIN_BUFFERS>);
+
+impl<T: VirtioTransport> Default for BalloonLent<T> {
+    fn default() -> Self {
+        Self(ArrayVec::new())
+    }
+}
+
+impl<T: VirtioTransport> Lend for BalloonLent<T> {
+    fn lent(&mut self, _index: usize) -> Option<&mut [u8]> {
+        None
+    }
+}
+
 struct BalloonQueue<T: VirtioTransport> {
     queue: Mutex<VirtQueue<T>>,
-    inflight: InFlight<{ QUEUE_SIZE as usize }>,
+    inflight: InFlight<{ QUEUE_SIZE as usize }, BalloonLent<T>>,
     /// The page-frame lists, command identifiers and statistics the
     /// device reads, one slot per descriptor.
     slots: ControlSlots<TransportBuffer<T>>,
@@ -186,15 +204,37 @@ impl<T: VirtioTransport> BalloonQueue<T> {
         inputs: &[&[u8]],
         outputs: &mut [&mut [u8]],
     ) -> IoResult<u32> {
+        let dma = transport.bus().dma();
         let mut parts: ArrayVec<Part<'_>, MAX_CHAIN_BUFFERS> = ArrayVec::new();
+        let mut mappings: ArrayVec<TransportForeignMapping<T>, MAX_CHAIN_BUFFERS> = ArrayVec::new();
         for bytes in inputs {
             parts.push(Part::Request(bytes));
         }
         for bytes in outputs.iter_mut() {
-            parts.push(Part::Write(bytes));
+            let physical = dma.physical_address(bytes)?;
+            let mapping = dma.map_foreign(
+                PhysicalRange::new(physical, bytes.len() as u64),
+                DmaAccess::READ | DmaAccess::WRITE,
+            )?;
+            let address = mapping.device_address();
+            mappings
+                .try_push(mapping)
+                .map_err(|_| IoError::OutOfBounds)?;
+            parts.push(Part::DeviceWrite {
+                address,
+                len: bytes.len(),
+            });
         }
-        let ticket =
-            submit_control(&self.inflight, &self.queue, transport, &self.slots, &parts).await?;
+        let ticket = submit_lent(
+            &self.inflight,
+            &self.queue,
+            transport,
+            &self.slots,
+            &parts,
+            BalloonLent(mappings),
+        )
+        .await
+        .map_err(|error| error.into_error())?;
         let reply = await_completion(&self.queue, ticket, || self.interrupts.notified()).await?;
         Ok(reply.written())
     }
@@ -621,7 +661,9 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
                 return Err(IoError::OutOfBounds);
             }
             for page in range.chunks(BALLOON_PAGE_SIZE) {
-                let address = dma.device_range(page)?.get();
+                // Balloon inflate/deflate payloads always carry guest physical
+                // page frame numbers, never IOMMU IOVAs (virtio 1.2 §5.5.6).
+                let address = dma.physical_address(page)?;
                 if !address.is_multiple_of(BALLOON_PAGE_SIZE as u64) {
                     return Err(IoError::OutOfBounds);
                 }

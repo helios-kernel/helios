@@ -934,7 +934,7 @@ fn a_buffer_running_past_the_window_is_refused_with_its_address() {
 
     let mut chain = empty_chain();
     assert_eq!(
-        build_chain(&transport, &[straddling], None, &mut [], &mut chain),
+        build_chain(&transport, &[straddling], &mut [], &mut chain),
         Err(refused)
     );
 
@@ -955,7 +955,7 @@ fn a_buffer_wholly_inside_the_window_translates_as_before() {
     let bytes = unsafe { core::slice::from_raw_parts(page.as_ptr(), 4096) };
 
     let mut chain = empty_chain();
-    let used = build_chain(&transport, &[bytes], None, &mut [], &mut chain)
+    let used = build_chain(&transport, &[bytes], &mut [], &mut chain)
         .expect("a page inside the window translates");
     assert_eq!(used, 1);
     assert_eq!(chain[0].addr, page.device_address().get());
