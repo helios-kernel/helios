@@ -5,9 +5,11 @@
 //! that has run `TPM2_PolicyPCR` over the registers it is bound to: the
 //! TPM itself refuses the read once any of them holds another value.
 
+use arrayvec::ArrayVec;
 use helios_hal::measured_boot::{
-    MeasuredBoot, MeasuredBootError, MeasurementRegister, MeasurementSet, SealedSecret,
-    Sha256Digest, UnsealRefused,
+    MAX_MEASUREMENT_BANKS, MeasuredBoot, MeasuredBootError, MeasurementAlgorithm, MeasurementBank,
+    MeasurementDigest, MeasurementRegister, MeasurementSet, SealedSecret, UnsealRefused,
+    validate_extend_digests,
 };
 use thiserror::Error;
 use tpm2_protocol::TpmWriter;
@@ -81,6 +83,8 @@ pub enum OpenError {
     NoSha256Bank,
     #[error("the TPM's SHA-256 bank does not keep the kernel image registers {missing:?}")]
     RegistersMissing { missing: MeasurementSet },
+    #[error("the TPM has an active PCR bank with unsupported algorithm {algorithm:#06x}")]
+    UnsupportedBank { algorithm: u16 },
 }
 
 /// What the TPM holds at [`SLOT_INDEX`].
@@ -93,12 +97,40 @@ enum Slot {
 pub struct Tpm<T> {
     transport: T,
     kernel_image_registers: MeasurementSet,
+    /// Active PCR banks reported by `TPM_CAP_PCRS`, in the order the TPM
+    /// reported them.
+    banks: ArrayVec<MeasurementBank, MAX_MEASUREMENT_BANKS>,
     /// The registers the SHA-256 bank keeps.
     registers: MeasurementSet,
-    /// How many bytes the bank's PCR bitmap has.
+    /// How many bytes the SHA-256 bank's PCR bitmap has.
     select_size: usize,
     command: [u8; TPM_MAX_COMMAND_SIZE],
     response: [u8; TPM_MAX_COMMAND_SIZE],
+}
+
+fn algorithm_from_tpm(alg: TpmAlgId) -> Option<MeasurementAlgorithm> {
+    match alg {
+        TpmAlgId::Sha1 => Some(MeasurementAlgorithm::Sha1),
+        TpmAlgId::Sha256 => Some(MeasurementAlgorithm::Sha256),
+        TpmAlgId::Sha384 => Some(MeasurementAlgorithm::Sha384),
+        TpmAlgId::Sha512 => Some(MeasurementAlgorithm::Sha512),
+        TpmAlgId::Sha3_256 => Some(MeasurementAlgorithm::Sha3_256),
+        TpmAlgId::Sha3_384 => Some(MeasurementAlgorithm::Sha3_384),
+        TpmAlgId::Sha3_512 => Some(MeasurementAlgorithm::Sha3_512),
+        _ => None,
+    }
+}
+
+fn algorithm_to_tpm(alg: MeasurementAlgorithm) -> TpmAlgId {
+    match alg {
+        MeasurementAlgorithm::Sha1 => TpmAlgId::Sha1,
+        MeasurementAlgorithm::Sha256 => TpmAlgId::Sha256,
+        MeasurementAlgorithm::Sha384 => TpmAlgId::Sha384,
+        MeasurementAlgorithm::Sha512 => TpmAlgId::Sha512,
+        MeasurementAlgorithm::Sha3_256 => TpmAlgId::Sha3_256,
+        MeasurementAlgorithm::Sha3_384 => TpmAlgId::Sha3_384,
+        MeasurementAlgorithm::Sha3_512 => TpmAlgId::Sha3_512,
+    }
 }
 
 fn handle(value: u32) -> TpmHandle {
@@ -194,6 +226,7 @@ impl<T: Transport> Tpm<T> {
         let mut tpm = Self {
             transport,
             kernel_image_registers,
+            banks: ArrayVec::new(),
             registers: MeasurementSet::empty(),
             select_size: 0,
             command: [0; TPM_MAX_COMMAND_SIZE],
@@ -211,19 +244,50 @@ impl<T: Transport> Tpm<T> {
         };
         let response: TpmGetCapabilityResponse =
             succeeded(OPERATION, tpm.execute(OPERATION, &command, &[]).await?)?;
+        if response.more_data.0 {
+            return Err(malformed(OPERATION).into());
+        }
         let TpmuCapabilities::Pcrs(banks) = response.capability_data.data else {
             return Err(malformed(OPERATION).into());
         };
-        let Some(bank) = banks.iter().find(|bank| bank.hash == TpmAlgId::Sha256) else {
-            if response.more_data.0 {
+        let mut found_sha256 = false;
+        for bank in banks.iter() {
+            let mut bitmap = [0u8; 4];
+            if bank.pcr_select.len() > bitmap.len() {
                 return Err(malformed(OPERATION).into());
             }
+            bitmap[..bank.pcr_select.len()].copy_from_slice(&bank.pcr_select);
+            let registers = MeasurementSet::from_bits(u32::from_le_bytes(bitmap));
+            if registers.is_empty() {
+                continue;
+            }
+            let Some(algorithm) = algorithm_from_tpm(bank.hash) else {
+                return Err(OpenError::UnsupportedBank {
+                    algorithm: bank.hash.value(),
+                });
+            };
+            if tpm
+                .banks
+                .iter()
+                .any(|existing| existing.algorithm == algorithm)
+            {
+                return Err(malformed(OPERATION).into());
+            }
+            if bank.hash == TpmAlgId::Sha256 {
+                tpm.select_size = bank.pcr_select.len();
+                tpm.registers = registers;
+                found_sha256 = true;
+            }
+            tpm.banks
+                .try_push(MeasurementBank {
+                    algorithm,
+                    registers,
+                })
+                .map_err(|_| malformed(OPERATION))?;
+        }
+        if !found_sha256 {
             return Err(OpenError::NoSha256Bank);
-        };
-        let mut bitmap = [0; 4];
-        bitmap[..bank.pcr_select.len()].copy_from_slice(&bank.pcr_select);
-        tpm.select_size = bank.pcr_select.len();
-        tpm.registers = MeasurementSet::from_bits(u32::from_le_bytes(bitmap));
+        }
 
         let missing =
             MeasurementSet::from_bits(kernel_image_registers.bits() & !tpm.registers.bits());
@@ -573,25 +637,39 @@ impl<T: Transport + 'static> MeasuredBoot for Tpm<T> {
         self.kernel_image_registers
     }
 
+    fn banks(&self) -> &[MeasurementBank] {
+        &self.banks
+    }
+
     async fn extend(
         &mut self,
         register: MeasurementRegister,
-        digest: &Sha256Digest,
+        digests: &[MeasurementDigest],
     ) -> Result<(), MeasuredBootError> {
         const OPERATION: &str = "TPM2_PCR_Extend";
-        self.check(MeasurementSet::empty().with(register))?;
-        let mut digests = TpmlDigestValues::new();
-        digests
-            .try_push(TpmtHa {
-                hash_alg: TpmAlgId::Sha256,
-                digest: TpmuHa::Digest(
-                    TpmBuffer::try_from(&digest.0[..]).expect("a SHA-256 digest fits TPMU_HA"),
-                ),
-            })
-            .expect("one digest fits a TPML_DIGEST_VALUES");
+        validate_extend_digests(&self.banks, register, digests)?;
+        let mut values = TpmlDigestValues::new();
+        for bank in &self.banks {
+            if !bank.registers.contains(register) {
+                continue;
+            }
+            let digest = digests
+                .iter()
+                .find(|digest| digest.algorithm() == bank.algorithm)
+                .expect("validated above");
+            values
+                .try_push(TpmtHa {
+                    hash_alg: algorithm_to_tpm(bank.algorithm),
+                    digest: TpmuHa::Digest(
+                        TpmBuffer::try_from(digest.as_bytes())
+                            .expect("every supported measurement digest fits TPMU_HA"),
+                    ),
+                })
+                .expect("active bank count is bounded by MAX_MEASUREMENT_BANKS");
+        }
         let command = TpmPcrExtendCommand {
             handles: [handle(u32::from(register.index()))],
-            digests,
+            digests: values,
         };
         let _: TpmPcrExtendResponse = succeeded(
             OPERATION,

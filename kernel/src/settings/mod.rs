@@ -336,11 +336,15 @@ macro_rules! settings {
 settings! {
     descriptor_limit: crate::DescriptorLimitSetting,
     fs_memory_storage: crate::vfs::MemoryStorageSetting,
+    compiler_max_input_bytes: crate::CompilerMaxInputBytesSetting,
+    random_bytes_limit: crate::RandomBytesLimitSetting,
 }
 
 #[cfg(not(feature = "unix"))]
 settings! {
     fs_memory_storage: crate::vfs::MemoryStorageSetting,
+    compiler_max_input_bytes: crate::CompilerMaxInputBytesSetting,
+    random_bytes_limit: crate::RandomBytesLimitSetting,
 }
 
 #[cfg(test)]
@@ -422,10 +426,12 @@ mod tests {
 
     #[cfg(feature = "unix")]
     #[test]
-    fn the_machine_lists_its_settings() {
+    fn the_machine_lists_its_declared_settings() {
+        use crate::{CompilerMaxInputBytesSetting, RandomBytesLimitSetting};
+
         let settings = Settings::default();
 
-        assert_eq!(SETTING_COUNT, 2);
+        assert_eq!(SETTING_COUNT, 4);
         assert_eq!(
             settings.entries(),
             [
@@ -438,6 +444,16 @@ mod tests {
                     name: "fs.memory-storage",
                     description: crate::vfs::MemoryStorageSetting::DESCRIPTION,
                     value: SettingValue::Bytes(crate::vfs::MemoryStorageSetting::initial()),
+                },
+                SettingEntry {
+                    name: "compiler.max-input-bytes",
+                    description: CompilerMaxInputBytesSetting::DESCRIPTION,
+                    value: SettingValue::Bytes(crate::DEFAULT_COMPILER_MAX_INPUT_BYTES),
+                },
+                SettingEntry {
+                    name: "random.max-bytes",
+                    description: RandomBytesLimitSetting::DESCRIPTION,
+                    value: SettingValue::Bytes(RandomBytesLimitSetting::DEFAULT),
                 },
             ]
         );

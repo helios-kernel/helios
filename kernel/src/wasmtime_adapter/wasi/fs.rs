@@ -8,9 +8,11 @@
 //! and preview1 (`component_host::service`) call them and only translate
 //! types.
 
+#[cfg(test)]
+use helios_hal::fs::Landed;
 use helios_hal::fs::{
-    FileSystem, FilledWrite, FsError as VfsError, FsResult, Landed, Metadata, NodeKind, OpenFlags,
-    Opened, PreparedWrite, RenameMode, WritePosition, WriteProgress,
+    FileSystem, FilledWrite, FsError as VfsError, FsResult, Metadata, NodeKind, OpenFlags, Opened,
+    PreparedWrite, RenameMode, WritePosition, WriteProgress,
 };
 use pin_project_lite::pin_project;
 
@@ -705,6 +707,7 @@ where
 
 /// Writes `bytes` through `resolved`, and resolves with where they landed
 /// and how many did ([`Landed`]).
+#[cfg(test)]
 pub(crate) async fn write_resolved<StorageImpl>(
     resolved: &Resolved<'_, StorageImpl>,
     position: WritePosition,
@@ -770,6 +773,7 @@ where
 /// from offset `at`. It runs between awaits, never across one, once per
 /// destination region; what it reads must stay valid for the whole call,
 /// which guest memory does for the host call that holds it.
+#[cfg(test)]
 pub(crate) async fn write_resolved_with<StorageImpl, S>(
     resolved: &Resolved<'_, StorageImpl>,
     position: WritePosition,
@@ -1384,14 +1388,50 @@ where
     resolved.read_whole().await
 }
 
-/// Creates or replaces the file `absolute` names with `bytes`.
-pub(crate) async fn write_program_file<StorageImpl>(
+/// Outcome of [`read_program_file_bounded`]: either the file contents or the
+/// byte length that exceeded the caller's upper bound.
+pub(crate) enum BoundedProgramFile {
+    Contents(FileContents),
+    TooLarge(u64),
+}
+
+/// Reads the program file `absolute` names only when its size does not exceed
+/// `max_bytes`, checking metadata before reading the whole file into memory.
+pub(crate) async fn read_program_file_bounded<StorageImpl>(
     namespace: &Namespace<StorageImpl>,
     absolute: &str,
-    bytes: &[u8],
+    floor: &str,
+    max_bytes: u64,
+) -> FsResult<BoundedProgramFile>
+where
+    StorageImpl: crate::Storage,
+{
+    let resolved = namespace
+        .resolve_following(absolute, Follow::Within(floor))
+        .await?;
+    let meta = resolved.fs().stat(resolved.path()).await?;
+    if meta.size > max_bytes {
+        return Ok(BoundedProgramFile::TooLarge(meta.size));
+    }
+    let contents = resolved.read_whole().await?;
+    let actual_len = match &contents {
+        FileContents::Boot(bytes) => bytes.as_slice().len(),
+        FileContents::Written(bytes) => bytes.len(),
+    } as u64;
+    if actual_len > max_bytes {
+        return Ok(BoundedProgramFile::TooLarge(actual_len));
+    }
+    Ok(BoundedProgramFile::Contents(contents))
+}
+
+/// Opens or truncates the writable file `absolute` names so the caller can
+/// stream bytes into it through [`prepare_resolved_write`].
+pub(crate) async fn open_program_file_for_write<'a, StorageImpl>(
+    namespace: &'a Namespace<StorageImpl>,
+    absolute: &'a str,
     now: u64,
     payer: &crate::StoragePayer,
-) -> FsOpResult<()>
+) -> FsOpResult<Resolved<'a, StorageImpl>>
 where
     StorageImpl: crate::Storage,
 {
@@ -1405,6 +1445,22 @@ where
     )
     .await
     .map_err(fs_error_code)?;
+    Ok(resolved)
+}
+
+/// Creates or replaces the file `absolute` names with `bytes`.
+#[cfg(test)]
+pub(crate) async fn write_program_file<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    absolute: &str,
+    bytes: &[u8],
+    now: u64,
+    payer: &crate::StoragePayer,
+) -> FsOpResult<()>
+where
+    StorageImpl: crate::Storage,
+{
+    let resolved = open_program_file_for_write(namespace, absolute, now, payer).await?;
     let landed = write_resolved(&resolved, WritePosition::At(0), bytes, now, payer).await?;
     // A file replaced in part is not the file the caller asked for.
     if landed.len != bytes.len() {

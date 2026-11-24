@@ -45,7 +45,6 @@ use crate::wasmtime_adapter::bindings::program::bindings as program_bindings;
 use crate::wasmtime_adapter::config::AotCompileHint;
 use crate::wasmtime_adapter::cwasm;
 use crate::wasmtime_adapter::wasi::ChannelStreamProducer;
-use crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode as FsErrorCode;
 use crate::{
     HeapStats, LlvmProfile, PerfSample, ProfileScope, StatsSample, TraceEvent, TraceField,
     TraceFilter, TraceLevel, TraceValue,
@@ -1042,10 +1041,15 @@ macro_rules! impl_program_bindings {
                         access.get().runtime_state.program_service(),
                         ProgramExecContext::from_store(access.get()),
                         access.get().process_authority().clone(),
+                        access
+                            .get()
+                            .runtime_state
+                            .settings()
+                            .get::<crate::CompilerMaxInputBytesSetting>(),
                     ))
                 });
                 async move {
-                    let (service, context, caller_authority) = snapshot?;
+                    let (service, context, caller_authority, max_input_bytes) = snapshot?;
                     let Some(service) = service else {
                         return Ok(Err($bindings::helios::system::programs::ExecError {
                             kind: $bindings::helios::system::programs::ExecErrorKind::Unavailable,
@@ -1062,10 +1066,31 @@ macro_rules! impl_program_bindings {
                         Ok(hint) => hint,
                         Err(error) => return Ok(Err($convert_error(error))),
                     };
-                    let source = match read_program_source(
+                    // Validate the destination path and authority before
+                    // reading the source or running the compiler.
+                    let dest_absolute = match crate::resolve_guest_path(
+                        "/",
+                        &request.destination_path,
+                    ) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            return Ok(Err($convert_error(map_program_host_error(
+                                ProgramHostOperation::WriteAotArtifact,
+                                map_component_fs_path_error_to_wasmtime(error),
+                            ))));
+                        }
+                    };
+                    if !caller_authority.can_create_or_replace_path(&dest_absolute) {
+                        return Ok(Err($convert_error(ProgramExecError {
+                            kind: ProgramExecErrorKind::PermissionDenied,
+                            detail: ProgramExecErrorDetail::ProgramArtifactDestinationNotGranted,
+                        })));
+                    }
+                    let source = match read_program_source_bounded(
                         accessor,
                         &request.source_path,
                         &caller_authority,
+                        max_input_bytes,
                     )
                     .await
                     {
@@ -1084,40 +1109,42 @@ macro_rules! impl_program_bindings {
                             detail: "aot only accepts raw wasm inputs".to_owned(),
                         }));
                     };
+                    let (namespace, now_nanos, payer, requester) = accessor.with(|mut access| {
+                        let store_data = access.get();
+                        (
+                            store_data.filesystem().clone(),
+                            store_data.now_nanos(),
+                            store_data.instance().storage_payer(),
+                            store_data.instance().id(),
+                        )
+                    });
                     // The compile runs in its own session task, which stops
-                    // the compile when this call is dropped.
-                    let artifact = match service
-                        .aot(&compile_authority, &context, &wasm, hint, request.profile)
+                    // the compile when this call is dropped, and streams the
+                    // signed artifact directly from plugin memory to disk.
+                    let written = match service
+                        .aot_to_file(
+                            &compile_authority,
+                            &context,
+                            &wasm,
+                            hint,
+                            request.profile,
+                            service::AotDestination {
+                                namespace,
+                                absolute: dest_absolute,
+                                now: now_nanos,
+                                payer,
+                                requester,
+                            },
+                        )
                         .await
                     {
-                        Ok(artifact) => artifact,
+                        Ok(written) => written,
                         Err(error) => return Ok(Err($convert_error(error))),
                     };
-                    let write_cpu = context.cpu();
-                    let write_serial = context.write_serial();
-                    match write_program_artifact(
-                        accessor,
-                        &request.destination_path,
-                        &artifact.signed,
-                        &caller_authority,
-                        &write_cpu,
-                        write_serial,
-                        request.profile,
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => return Ok(Err($convert_error(error))),
-                        Err(error) => {
-                            return Ok(Err($convert_error(map_program_host_error(
-                                ProgramHostOperation::WriteAotArtifact,
-                                error,
-                            ))));
-                        }
-                    }
+                    let _ = written.bytes;
                     Ok(Ok($bindings::helios::system::programs::AotResult {
                         destination_path: request.destination_path,
-                        worker_threads: artifact.worker_threads,
+                        worker_threads: written.worker_threads,
                     }))
                 }
             }
@@ -2228,89 +2255,44 @@ where
     Ok(Ok(ProgramSource::from_file(contents)))
 }
 
-async fn write_program_artifact<T, CpuImpl, Net, StorageImpl>(
+async fn read_program_source_bounded<T, CpuImpl, Net, StorageImpl>(
     accessor: &Accessor<T, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     path: &str,
-    bytes: &[u8],
     authority: &ProcessAuthority,
-    cpu: &CpuImpl,
-    write_serial: crate::DebugSerialWriter,
-    profile: bool,
-) -> wasmtime::Result<Result<(), crate::ProgramExecError>>
+    max_bytes: u64,
+) -> wasmtime::Result<Result<ProgramSource, crate::ProgramExecError>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let started_ns = if profile {
-        crate::monotonic_nanos(cpu)
-    } else {
-        0
-    };
     let absolute =
         crate::resolve_guest_path("/", path).map_err(map_component_fs_path_error_to_wasmtime)?;
-    if !authority.can_create_or_replace_path(&absolute) {
+    let Some(floor) = authority.program_load_floor(&absolute) else {
         return Ok(Err(ProgramExecError {
             kind: ProgramExecErrorKind::PermissionDenied,
-            detail: ProgramExecErrorDetail::ProgramArtifactDestinationNotGranted,
+            detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
         }));
-    }
-    let (namespace, now_nanos, payer, runtime_state, requester) = accessor.with(|mut access| {
-        let store_data = access.get();
-        (
-            store_data.filesystem().clone(),
-            store_data.now_nanos(),
-            store_data.instance().storage_payer(),
-            store_data.runtime_state.clone(),
-            store_data.instance().id(),
-        )
-    });
-    if let Err(error) = crate::wasmtime_adapter::wasi::write_program_file(
-        &namespace, &absolute, bytes, now_nanos, &payer,
+    };
+    let namespace = accessor.with(|mut access| access.get().filesystem().clone());
+    match crate::wasmtime_adapter::wasi::read_program_file_bounded(
+        &namespace, &absolute, floor, max_bytes,
     )
     .await
     {
-        if matches!(error, FsErrorCode::InsufficientMemory) {
-            crate::wasmtime_adapter::store::request_oom_kill(
-                &runtime_state,
-                &runtime_state.instance_registry(),
-                cpu,
-                requester,
-                crate::MemoryPool::User,
-                bytes.len().max(helios_hal::pmm::PhysFrame::SIZE),
-            );
+        Ok(crate::wasmtime_adapter::wasi::BoundedProgramFile::Contents(contents)) => {
+            Ok(Ok(ProgramSource::from_file(contents)))
         }
-        return Err(map_fs_error_to_program_exec(error).into());
-    }
-    if profile {
-        write_serial.emit_fmt(format_args!(
-            "aot-write us={} bytes={}\n",
-            crate::monotonic_nanos(cpu).saturating_sub(started_ns) / 1_000,
-            bytes.len(),
-        ));
-    }
-    Ok(Ok(()))
-}
-
-fn map_fs_error_to_program_exec(error: FsErrorCode) -> crate::ProgramExecError {
-    tracing::error!(?error, "filesystem operation failed during program exec");
-    let kind = match error {
-        FsErrorCode::NoEntry | FsErrorCode::NotDirectory | FsErrorCode::BadDescriptor => {
-            crate::ProgramExecErrorKind::InvalidPath
+        Ok(crate::wasmtime_adapter::wasi::BoundedProgramFile::TooLarge(bytes)) => {
+            Ok(Err(ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidBinary,
+                detail: ProgramExecErrorDetail::CompilerInputTooLarge {
+                    bytes,
+                    limit: max_bytes,
+                },
+            }))
         }
-        FsErrorCode::ReadOnly
-        | FsErrorCode::NotPermitted
-        | FsErrorCode::Exist
-        | FsErrorCode::IsDirectory
-        | FsErrorCode::IllegalByteSequence
-        | FsErrorCode::Invalid
-        | FsErrorCode::Overflow => crate::ProgramExecErrorKind::InvalidPath,
-        FsErrorCode::InsufficientMemory => crate::ProgramExecErrorKind::OutOfMemory,
-        _ => crate::ProgramExecErrorKind::Internal,
-    };
-    crate::ProgramExecError {
-        kind,
-        detail: ProgramExecErrorDetail::FilesystemOperationFailed,
+        Err(error) => Ok(Err(ProgramExecError::from_source_read_error(error))),
     }
 }
 
@@ -2724,6 +2706,9 @@ where
             return Err(stop);
         }
         crate::wasmtime_adapter::preemption::kill_or_yield(caller.data().pending_kill())
+    });
+    crate::wasmtime_adapter::store::install_stack_reserve(&mut store, |data, requested_bytes| {
+        data.request_oom_kill_for_growth(crate::MemoryPool::User, requested_bytes);
     });
     let interrupts = engine
         .interrupts()
