@@ -246,7 +246,9 @@ pub async fn qualify<T: Transport>(
             .await
             .map_err(|error| match error {
                 OpenError::Device(error) => QualifyError::Device(error),
-                OpenError::NoSha256Bank | OpenError::RegistersMissing { .. } => {
+                OpenError::NoSha256Bank
+                | OpenError::RegistersMissing { .. }
+                | OpenError::UnsupportedBank { .. } => {
                     QualifyError::Unqualified(Unqualified::Registers(error))
                 }
             })?;

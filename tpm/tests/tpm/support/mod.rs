@@ -102,7 +102,7 @@ pub struct Inputs {
     #[serde(with = "hex::serde")]
     pub third_secret: [u8; 32],
     #[serde(with = "hex::serde")]
-    pub extend_digest: [u8; 32],
+    pub extend_payload: [u8; 32],
 }
 
 /// The fixture `record_swtpm_fixtures` writes.

@@ -113,7 +113,7 @@ use helios_compiler_abi::{
     HELIOS_COMPILER_PTHREAD_SELF_OFFSET,
 };
 use helios_hal::fs::WritePosition;
-use helios_hal::measured_boot::{MeasuredBoot, Sha256Digest};
+use helios_hal::measured_boot::MeasuredBoot;
 use helios_hal::watchdog::Watchdog;
 use helios_unix::OpenFile;
 use helios_unix::{DescriptorLimit, GuestAddress};
@@ -762,7 +762,7 @@ where
     let mut measured_boot = kernel.take_measured_boot();
     let cwasm_signing_key = crate::signing_key::settle_signing_key_at_bring_up(
         measured_boot.as_mut(),
-        &Sha256Digest(debug_state.payload_digest()),
+        debug_state.payload_body(),
         debug_state.root_entropy(),
     );
     // Selected by the backend when it built the runtime state, before any

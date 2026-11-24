@@ -135,14 +135,98 @@ impl MeasurementSet {
     }
 }
 
-/// A SHA-256 digest: the value extended into a register.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Sha256Digest(pub [u8; 32]);
+/// Maximum number of active PCR banks a measurement device reports.
+///
+/// Matches TPM 2.0 `TPML_PCR_SELECTION` / `TPML_DIGEST_VALUES` capacity (8)
+/// and covers all seven algorithms [`MeasurementAlgorithm`] names.
+pub const MAX_MEASUREMENT_BANKS: usize = 8;
 
-impl fmt::Debug for Sha256Digest {
+/// Hash algorithm of one measurement register bank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MeasurementAlgorithm {
+    Sha1,
+    Sha256,
+    Sha384,
+    Sha512,
+    Sha3_256,
+    Sha3_384,
+    Sha3_512,
+}
+
+impl MeasurementAlgorithm {
+    /// Digest size in bytes for this algorithm.
+    pub const fn digest_len(self) -> usize {
+        match self {
+            Self::Sha1 => 20,
+            Self::Sha256 | Self::Sha3_256 => 32,
+            Self::Sha384 | Self::Sha3_384 => 48,
+            Self::Sha512 | Self::Sha3_512 => 64,
+        }
+    }
+}
+
+impl fmt::Display for MeasurementAlgorithm {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Sha256Digest(")?;
-        for byte in self.0 {
+        formatter.write_str(match self {
+            Self::Sha1 => "SHA-1",
+            Self::Sha256 => "SHA-256",
+            Self::Sha384 => "SHA-384",
+            Self::Sha512 => "SHA-512",
+            Self::Sha3_256 => "SHA3-256",
+            Self::Sha3_384 => "SHA3-384",
+            Self::Sha3_512 => "SHA3-512",
+        })
+    }
+}
+
+/// One active register bank on a measurement device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MeasurementBank {
+    pub algorithm: MeasurementAlgorithm,
+    pub registers: MeasurementSet,
+}
+
+/// One digest extended into a register bank.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MeasurementDigest {
+    Sha1([u8; 20]),
+    Sha256([u8; 32]),
+    Sha384([u8; 48]),
+    Sha512([u8; 64]),
+    Sha3_256([u8; 32]),
+    Sha3_384([u8; 48]),
+    Sha3_512([u8; 64]),
+}
+
+impl MeasurementDigest {
+    /// The bank algorithm this digest belongs to.
+    pub const fn algorithm(&self) -> MeasurementAlgorithm {
+        match self {
+            Self::Sha1(_) => MeasurementAlgorithm::Sha1,
+            Self::Sha256(_) => MeasurementAlgorithm::Sha256,
+            Self::Sha384(_) => MeasurementAlgorithm::Sha384,
+            Self::Sha512(_) => MeasurementAlgorithm::Sha512,
+            Self::Sha3_256(_) => MeasurementAlgorithm::Sha3_256,
+            Self::Sha3_384(_) => MeasurementAlgorithm::Sha3_384,
+            Self::Sha3_512(_) => MeasurementAlgorithm::Sha3_512,
+        }
+    }
+
+    /// Raw digest bytes.
+    pub const fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Sha1(bytes) => bytes,
+            Self::Sha256(bytes) | Self::Sha3_256(bytes) => bytes,
+            Self::Sha384(bytes) | Self::Sha3_384(bytes) => bytes,
+            Self::Sha512(bytes) | Self::Sha3_512(bytes) => bytes,
+        }
+    }
+}
+
+impl fmt::Debug for MeasurementDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "MeasurementDigest({}:", self.algorithm())?;
+        for byte in self.as_bytes() {
             write!(formatter, "{byte:02x}")?;
         }
         formatter.write_str(")")
@@ -197,6 +281,24 @@ pub enum MeasuredBootError {
     /// value for it.
     #[error("the measurement device has no SHA-256 value for {register}")]
     NoSuchRegister { register: MeasurementRegister },
+    /// An extend did not carry a digest for an active bank that keeps `register`.
+    #[error("extending {register} is missing a digest for active bank {algorithm}")]
+    MissingBankDigest {
+        register: MeasurementRegister,
+        algorithm: MeasurementAlgorithm,
+    },
+    /// An extend supplied more than one digest for the same bank.
+    #[error("extending {register} supplied algorithm {algorithm} more than once")]
+    DuplicateBankDigest {
+        register: MeasurementRegister,
+        algorithm: MeasurementAlgorithm,
+    },
+    /// An extend supplied a digest for a bank that does not keep `register`.
+    #[error("extending {register} supplied a digest for inactive bank {algorithm}")]
+    UnexpectedBankDigest {
+        register: MeasurementRegister,
+        algorithm: MeasurementAlgorithm,
+    },
     /// The device did not reach a state it must reach to make progress.
     #[error("the measurement device did not reach {state} within {waited_ms} ms")]
     Timeout { state: &'static str, waited_ms: u64 },
@@ -244,11 +346,16 @@ pub trait MeasuredBoot: Send + 'static {
     /// its loader.
     fn kernel_image_registers(&self) -> MeasurementSet;
 
-    /// Folds `digest` into `register`'s SHA-256 value.
+    /// The active PCR banks the device keeps. Every bank listed carries a
+    /// non-empty set of registers, and one of them is SHA-256.
+    fn banks(&self) -> &[MeasurementBank];
+
+    /// Folds `digests` into `register` across every active bank that keeps
+    /// `register`. `digests` must carry exactly one digest per such bank.
     fn extend<'a>(
         &'a mut self,
         register: MeasurementRegister,
-        digest: &'a Sha256Digest,
+        digests: &'a [MeasurementDigest],
     ) -> impl Future<Output = Result<(), MeasuredBootError>> + Send + 'a;
 
     /// The secret stored by [`MeasuredBoot::store_sealed`], released only
@@ -267,6 +374,56 @@ pub trait MeasuredBoot: Send + 'static {
     ) -> impl Future<Output = Result<(), MeasuredBootError>> + Send + 'a;
 }
 
+/// Validates that `digests` provides exactly one digest for every active bank
+/// in `banks` that keeps `register`, with no duplicates and no digests for
+/// banks that do not keep `register`.
+pub fn validate_extend_digests(
+    banks: &[MeasurementBank],
+    register: MeasurementRegister,
+    digests: &[MeasurementDigest],
+) -> Result<(), MeasuredBootError> {
+    let sha256_has_register = banks.iter().any(|bank| {
+        bank.algorithm == MeasurementAlgorithm::Sha256 && bank.registers.contains(register)
+    });
+    if !sha256_has_register {
+        return Err(MeasuredBootError::NoSuchRegister { register });
+    }
+    for (index, digest) in digests.iter().enumerate() {
+        let algorithm = digest.algorithm();
+        if digests[..index]
+            .iter()
+            .any(|earlier| earlier.algorithm() == algorithm)
+        {
+            return Err(MeasuredBootError::DuplicateBankDigest {
+                register,
+                algorithm,
+            });
+        }
+        let expected = banks
+            .iter()
+            .any(|bank| bank.algorithm == algorithm && bank.registers.contains(register));
+        if !expected {
+            return Err(MeasuredBootError::UnexpectedBankDigest {
+                register,
+                algorithm,
+            });
+        }
+    }
+    for bank in banks {
+        if bank.registers.contains(register)
+            && !digests
+                .iter()
+                .any(|digest| digest.algorithm() == bank.algorithm)
+        {
+            return Err(MeasuredBootError::MissingBankDigest {
+                register,
+                algorithm: bank.algorithm,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The measurement device of a platform that has none.
 ///
 /// It has no value, so `Option<NoMeasuredBoot>` is always `None`.
@@ -278,10 +435,14 @@ impl MeasuredBoot for NoMeasuredBoot {
         match *self {}
     }
 
+    fn banks(&self) -> &[MeasurementBank] {
+        match *self {}
+    }
+
     async fn extend(
         &mut self,
         _register: MeasurementRegister,
-        _digest: &Sha256Digest,
+        _digests: &[MeasurementDigest],
     ) -> Result<(), MeasuredBootError> {
         match *self {}
     }
