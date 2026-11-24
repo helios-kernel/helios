@@ -886,6 +886,32 @@ fn a_program_load_floor_is_the_widest_grant_that_loads() {
 }
 
 #[test]
+fn read_program_file_bounded_rejects_oversized_inputs_before_reading() {
+    let namespace = namespace();
+    let _ = create_file(&namespace, "input.wasm", b"0123456789");
+    let rejected = block_on(super::read_program_file_bounded(
+        &namespace,
+        "/input.wasm",
+        "/",
+        9,
+    ))
+    .expect("stat succeeds");
+    assert!(matches!(rejected, super::BoundedProgramFile::TooLarge(10)));
+    let accepted = block_on(super::read_program_file_bounded(
+        &namespace,
+        "/input.wasm",
+        "/",
+        10,
+    ))
+    .expect("file within limit reads");
+    assert!(matches!(
+        accepted,
+        super::BoundedProgramFile::Contents(FileContents::Written(bytes))
+            if bytes.as_ref() == b"0123456789"
+    ));
+}
+
+#[test]
 fn an_append_resolves_with_the_end_of_file_it_reached() {
     let namespace = namespace();
     let appender = create_file(&namespace, "log", b"abc");

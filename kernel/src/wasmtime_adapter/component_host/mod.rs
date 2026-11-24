@@ -45,7 +45,6 @@ use crate::wasmtime_adapter::bindings::program::bindings as program_bindings;
 use crate::wasmtime_adapter::config::AotCompileHint;
 use crate::wasmtime_adapter::cwasm;
 use crate::wasmtime_adapter::wasi::ChannelStreamProducer;
-use crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode as FsErrorCode;
 use crate::{
     HeapStats, LlvmProfile, PerfSample, ProfileScope, StatsSample, TraceEvent, TraceField,
     TraceFilter, TraceLevel, TraceValue,
@@ -1042,10 +1041,15 @@ macro_rules! impl_program_bindings {
                         access.get().runtime_state.program_service(),
                         ProgramExecContext::from_store(access.get()),
                         access.get().process_authority().clone(),
+                        access
+                            .get()
+                            .runtime_state
+                            .settings()
+                            .get::<crate::CompilerMaxInputBytesSetting>(),
                     ))
                 });
                 async move {
-                    let (service, context, caller_authority) = snapshot?;
+                    let (service, context, caller_authority, max_input_bytes) = snapshot?;
                     let Some(service) = service else {
                         return Ok(Err($bindings::helios::system::programs::ExecError {
                             kind: $bindings::helios::system::programs::ExecErrorKind::Unavailable,
@@ -1062,10 +1066,31 @@ macro_rules! impl_program_bindings {
                         Ok(hint) => hint,
                         Err(error) => return Ok(Err($convert_error(error))),
                     };
-                    let source = match read_program_source(
+                    // Validate the destination path and authority before
+                    // reading the source or running the compiler.
+                    let dest_absolute = match crate::resolve_guest_path(
+                        "/",
+                        &request.destination_path,
+                    ) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            return Ok(Err($convert_error(map_program_host_error(
+                                ProgramHostOperation::WriteAotArtifact,
+                                map_component_fs_path_error_to_wasmtime(error),
+                            ))));
+                        }
+                    };
+                    if !caller_authority.can_create_or_replace_path(&dest_absolute) {
+                        return Ok(Err($convert_error(ProgramExecError {
+                            kind: ProgramExecErrorKind::PermissionDenied,
+                            detail: ProgramExecErrorDetail::ProgramArtifactDestinationNotGranted,
+                        })));
+                    }
+                    let source = match read_program_source_bounded(
                         accessor,
                         &request.source_path,
                         &caller_authority,
+                        max_input_bytes,
                     )
                     .await
                     {
@@ -1084,40 +1109,35 @@ macro_rules! impl_program_bindings {
                             detail: "aot only accepts raw wasm inputs".to_owned(),
                         }));
                     };
+                    let (namespace, now_nanos) = accessor.with(|mut access| {
+                        let store_data = access.get();
+                        (store_data.filesystem().clone(), store_data.now_nanos())
+                    });
                     // The compile runs in its own session task, which stops
-                    // the compile when this call is dropped.
-                    let artifact = match service
-                        .aot(&compile_authority, &context, &wasm, hint, request.profile)
+                    // the compile when this call is dropped, and streams the
+                    // signed artifact directly from plugin memory to disk.
+                    let written = match service
+                        .aot_to_file(
+                            &compile_authority,
+                            &context,
+                            &wasm,
+                            hint,
+                            request.profile,
+                            service::AotDestination {
+                                namespace,
+                                absolute: dest_absolute,
+                                now: now_nanos,
+                            },
+                        )
                         .await
                     {
-                        Ok(artifact) => artifact,
+                        Ok(written) => written,
                         Err(error) => return Ok(Err($convert_error(error))),
                     };
-                    let write_cpu = context.cpu();
-                    let write_serial = context.write_serial();
-                    match write_program_artifact(
-                        accessor,
-                        &request.destination_path,
-                        &artifact.signed,
-                        &caller_authority,
-                        &write_cpu,
-                        write_serial,
-                        request.profile,
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => return Ok(Err($convert_error(error))),
-                        Err(error) => {
-                            return Ok(Err($convert_error(map_program_host_error(
-                                ProgramHostOperation::WriteAotArtifact,
-                                error,
-                            ))));
-                        }
-                    }
+                    let _ = written.bytes;
                     Ok(Ok($bindings::helios::system::programs::AotResult {
                         destination_path: request.destination_path,
-                        worker_threads: artifact.worker_threads,
+                        worker_threads: written.worker_threads,
                     }))
                 }
             }
@@ -1364,6 +1384,9 @@ macro_rules! impl_authority_conversion {
                             rights |= match right {
                                 $bindings::helios::system::programs::MachineRight::ControlProcessors => {
                                     crate::MachineAuthorityRights::CONTROL_PROCESSORS
+                                }
+                                $bindings::helios::system::programs::MachineRight::Virtualize => {
+                                    crate::MachineAuthorityRights::VIRTUALIZE
                                 }
                             };
                         }
@@ -1646,15 +1669,16 @@ mod authority_tests {
     };
     use crate::{
         ClockAuthorityRights, DeviceClassRights, DiagnosticAuthorityRights,
-        DirectoryAuthorityRights, DirectoryPreopen, LinkAuthorityRights, NetworkAuthorityRights,
-        ProcessAuthority, ProcessAuthorityRights, SettingsAuthorityRights, TerminalAuthorityRights,
+        DirectoryAuthorityRights, DirectoryPreopen, LinkAuthorityRights, MachineAuthorityRights,
+        NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityRights, SettingsAuthorityRights,
+        TerminalAuthorityRights,
     };
 
     use program_wit::programs::{
         CapabilityGrant, ClockGrant, ClockRight, DeviceClass, DeviceGrant, DiagnosticsGrant,
-        DiagnosticsRight, DirectoryGrant, FilesystemRight, LinkGrant, LinkRight, NetworkGrant,
-        NetworkRight, ProcessGrant, ProcessRight, SettingsGrant, SettingsRight, TerminalGrant,
-        TerminalRight,
+        DiagnosticsRight, DirectoryGrant, FilesystemRight, LinkGrant, LinkRight, MachineGrant,
+        MachineRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight, SettingsGrant,
+        SettingsRight, TerminalGrant, TerminalRight,
     };
 
     fn directory_grant(
@@ -1699,6 +1723,10 @@ mod authority_tests {
 
     fn settings_grant(rights: Vec<SettingsRight>) -> CapabilityGrant {
         CapabilityGrant::Settings(SettingsGrant { rights })
+    }
+
+    fn machine_grant(rights: Vec<MachineRight>) -> CapabilityGrant {
+        CapabilityGrant::Machine(MachineGrant { rights })
     }
 
     #[test]
@@ -1825,6 +1853,52 @@ mod authority_tests {
         .expect("the debugger holds the settings right");
 
         assert_eq!(child.settings_rights(), SettingsAuthorityRights::WRITE);
+    }
+
+    #[test]
+    fn virtualize_grant_derives_from_caller_authority_and_refuses_escalation() {
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_machine_rights(MachineAuthorityRights::VIRTUALIZE);
+
+        let child = build_program_child_authority(
+            &caller,
+            vec![machine_grant(vec![MachineRight::Virtualize])],
+        )
+        .expect("a caller holding virtualize may hand it on");
+        assert_eq!(child.machine_rights(), MachineAuthorityRights::VIRTUALIZE);
+
+        let error = build_program_child_authority(
+            &ProcessAuthority::root(),
+            vec![machine_grant(vec![MachineRight::Virtualize])],
+        )
+        .expect_err("root authority holds no virtualize right to hand on");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+
+        let mut cpu_ctrl_only = ProcessAuthority::empty();
+        cpu_ctrl_only.grant_machine_rights(MachineAuthorityRights::CONTROL_PROCESSORS);
+        let error = build_program_child_authority(
+            &cpu_ctrl_only,
+            vec![machine_grant(vec![MachineRight::Virtualize])],
+        )
+        .expect_err("control-processors right must not escalate to virtualize");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+
+        let error = build_program_child_authority(&caller, vec![machine_grant(Vec::new())])
+            .expect_err("an empty machine grant is a mistake");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn debugger_authority_hands_the_virtualize_right_to_what_it_launches() {
+        let debugger = super::debugger_authority();
+
+        let child = build_program_child_authority(
+            &debugger,
+            vec![machine_grant(vec![MachineRight::Virtualize])],
+        )
+        .expect("the debugger holds the virtualize right");
+
+        assert_eq!(child.machine_rights(), MachineAuthorityRights::VIRTUALIZE);
     }
 
     #[test]
@@ -2228,68 +2302,44 @@ where
     Ok(Ok(ProgramSource::from_file(contents)))
 }
 
-async fn write_program_artifact<T, CpuImpl, Net, StorageImpl>(
+async fn read_program_source_bounded<T, CpuImpl, Net, StorageImpl>(
     accessor: &Accessor<T, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     path: &str,
-    bytes: &[u8],
     authority: &ProcessAuthority,
-    cpu: &CpuImpl,
-    write_serial: crate::DebugSerialWriter,
-    profile: bool,
-) -> wasmtime::Result<Result<(), crate::ProgramExecError>>
+    max_bytes: u64,
+) -> wasmtime::Result<Result<ProgramSource, crate::ProgramExecError>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let started_ns = if profile {
-        crate::monotonic_nanos(cpu)
-    } else {
-        0
-    };
     let absolute =
         crate::resolve_guest_path("/", path).map_err(map_component_fs_path_error_to_wasmtime)?;
-    if !authority.can_create_or_replace_path(&absolute) {
+    let Some(floor) = authority.program_load_floor(&absolute) else {
         return Ok(Err(ProgramExecError {
             kind: ProgramExecErrorKind::PermissionDenied,
-            detail: ProgramExecErrorDetail::ProgramArtifactDestinationNotGranted,
+            detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
         }));
-    }
-    let (namespace, now_nanos) = accessor.with(|mut access| {
-        let store_data = access.get();
-        (store_data.filesystem().clone(), store_data.now_nanos())
-    });
-    crate::wasmtime_adapter::wasi::write_program_file(&namespace, &absolute, bytes, now_nanos)
-        .await
-        .map_err(map_fs_error_to_program_exec)?;
-    if profile {
-        write_serial.emit_fmt(format_args!(
-            "aot-write us={} bytes={}\n",
-            crate::monotonic_nanos(cpu).saturating_sub(started_ns) / 1_000,
-            bytes.len(),
-        ));
-    }
-    Ok(Ok(()))
-}
-
-fn map_fs_error_to_program_exec(error: FsErrorCode) -> crate::ProgramExecError {
-    tracing::error!(?error, "filesystem operation failed during program exec");
-    let kind = match error {
-        FsErrorCode::NoEntry | FsErrorCode::NotDirectory | FsErrorCode::BadDescriptor => {
-            crate::ProgramExecErrorKind::InvalidPath
-        }
-        FsErrorCode::ReadOnly
-        | FsErrorCode::NotPermitted
-        | FsErrorCode::Exist
-        | FsErrorCode::IsDirectory
-        | FsErrorCode::IllegalByteSequence
-        | FsErrorCode::Invalid
-        | FsErrorCode::Overflow => crate::ProgramExecErrorKind::InvalidPath,
-        _ => crate::ProgramExecErrorKind::Internal,
     };
-    crate::ProgramExecError {
-        kind,
-        detail: ProgramExecErrorDetail::FilesystemOperationFailed,
+    let namespace = accessor.with(|mut access| access.get().filesystem().clone());
+    match crate::wasmtime_adapter::wasi::read_program_file_bounded(
+        &namespace, &absolute, floor, max_bytes,
+    )
+    .await
+    {
+        Ok(crate::wasmtime_adapter::wasi::BoundedProgramFile::Contents(contents)) => {
+            Ok(Ok(ProgramSource::from_file(contents)))
+        }
+        Ok(crate::wasmtime_adapter::wasi::BoundedProgramFile::TooLarge(bytes)) => {
+            Ok(Err(ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidBinary,
+                detail: ProgramExecErrorDetail::CompilerInputTooLarge {
+                    bytes,
+                    limit: max_bytes,
+                },
+            }))
+        }
+        Err(error) => Ok(Err(ProgramExecError::from_source_read_error(error))),
     }
 }
 
@@ -2373,7 +2423,8 @@ where
 
 /// The authority the embedded debugger runs with: everything `root`
 /// grants, plus every device class, the machine-observation right, the
-/// settings-write right and the control-processors right.
+/// settings-write right, the control-processors right and the virtualize
+/// right.
 /// The debugger claims no device itself; it holds the classes because a
 /// program can be handed only what its launcher holds, and the inspector
 /// session runs desktop, input and audio programs through it. It holds
@@ -2382,13 +2433,17 @@ where
 /// shell it launches, whose programs configure the machine. It holds
 /// the control-processors right both for its own
 /// `helios:system/processors` RPC and because the session runs `cpu`
-/// through it.
+/// through it, and the virtualize right because the session runs `vmm`
+/// through its shell.
 fn debugger_authority() -> ProcessAuthority {
     let mut authority = ProcessAuthority::root();
     authority.grant_device_classes(DeviceClassRights::all());
     authority.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
     authority.grant_settings_rights(SettingsAuthorityRights::WRITE);
-    authority.grant_machine_rights(crate::MachineAuthorityRights::CONTROL_PROCESSORS);
+    authority.grant_machine_rights(
+        crate::MachineAuthorityRights::CONTROL_PROCESSORS
+            | crate::MachineAuthorityRights::VIRTUALIZE,
+    );
     authority
 }
 

@@ -266,6 +266,11 @@ pub struct Image {
 }
 
 impl Image {
+    /// The verified image body bytes (everything before the signature footer).
+    pub const fn body(&self) -> &'static [u8] {
+        self.bytes
+    }
+
     /// Verifies a signed `helios-bootfs` image and parses it.
     ///
     /// The body is hashed once and its signature checked against
