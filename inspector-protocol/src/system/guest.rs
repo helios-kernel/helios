@@ -551,6 +551,7 @@ fn map_machine_right_to_host(right: programs::MachineRight) -> host_programs::Ma
     match right {
         programs::MachineRight::Control => host_programs::MachineRight::Control,
         programs::MachineRight::Identity => host_programs::MachineRight::Identity,
+        programs::MachineRight::Virtualize => host_programs::MachineRight::Virtualize,
     }
 }
 

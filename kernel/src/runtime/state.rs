@@ -1354,8 +1354,13 @@ where
         self.inner.payload.has_system_component()
     }
 
-    /// SHA-256 of the payload body whose signature the kernel verified,
-    /// the value bring-up measures before it reads the sealed seed.
+    /// Verified payload body bytes extended into the measured-boot device
+    /// across every active bank before bring-up reads the sealed seed.
+    pub fn payload_body(&self) -> &'static [u8] {
+        self.inner.payload.body()
+    }
+
+    /// SHA-256 of the payload body whose signature the kernel verified.
     pub fn payload_digest(&self) -> helios_artifact::bootfs::Digest256 {
         self.inner.payload.digest()
     }

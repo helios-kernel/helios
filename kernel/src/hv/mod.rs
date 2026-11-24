@@ -266,6 +266,7 @@ pub fn create_vm<C: Cpu>(
     cpu: &C,
     pool: &'static UserMemoryPool,
     memory_limit: usize,
+    _cap: crate::VirtualizeCap,
 ) -> Result<VirtualMachine<<C::Hypervisor as Hypervisor>::Space>, VmError> {
     let hv = cpu.hv().ok_or(HvError::Unavailable)?;
     Ok(VirtualMachine::new(hv.create_space()?, pool, memory_limit))
@@ -277,6 +278,7 @@ pub fn create_vm_observed<C: Cpu>(
     cpu: &C,
     pool: &'static UserMemoryPool,
     memory_limit: usize,
+    _cap: crate::VirtualizeCap,
     registry: &HvTelemetryRegistry,
     owner_instance: Option<crate::InstanceId>,
 ) -> Result<VirtualMachine<<C::Hypervisor as Hypervisor>::Space>, VmError> {

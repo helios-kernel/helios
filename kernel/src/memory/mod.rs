@@ -47,8 +47,8 @@ pub use compressed::{
 };
 pub use entropy::{
     ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, HardwareEntropySource,
-    NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RootEntropy,
-    RootEntropyHandle, install_entropy_device, seed_root_entropy,
+    NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RandomBytesLimitSetting,
+    RootEntropy, RootEntropyHandle, install_entropy_device, seed_root_entropy,
 };
 #[cfg(feature = "wasmtime-runtime")]
 pub(crate) use fiber_stack::fiber_stack_arena_installed;

@@ -224,6 +224,12 @@ pub fn ipc_grant(
     })
 }
 
+/// Create hardware virtual machines (`helios:hv/virtualization`), for a
+/// trusted launcher that runs VMMs on the machine owner's behalf.
+pub fn virtualize_grant() -> CapabilityGrant {
+    machine_grant(vec![MachineRight::Virtualize])
+}
+
 pub fn root_process_grant() -> CapabilityGrant {
     process_grant(vec![
         ProcessRight::Spawn,

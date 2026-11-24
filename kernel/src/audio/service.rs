@@ -250,7 +250,8 @@ pub struct PeriodRing {
     /// host call at a time, so there is never a second stop to answer.
     stop: ConcurrentQueue<oneshot::Sender<Result<(), AudioServiceError>>>,
     /// Set by the playback task once it has stopped the stream and let
-    /// the device release what it allocated.
+    /// the device release what it allocated, or once a refused release
+    /// faulted the stream.
     ///
     /// A `stop` is normally answered by that task. It does not have to
     /// arrive first: a player whose material simply ran out ends the
@@ -258,11 +259,15 @@ pub struct PeriodRing {
     /// player gets round to asking. This word is what lets the late
     /// caller answer itself instead of waiting for a task that is
     /// already serving somebody else.
-    finished: AtomicBool,
+    teardown: AtomicU8,
     /// Bytes the producer has committed, which is what the device is
     /// asked to play.
     committed_bytes: AtomicU64,
 }
+
+const TEARDOWN_PENDING: u8 = 0;
+const TEARDOWN_OK: u8 = 1;
+const TEARDOWN_FAULT: u8 = 2;
 
 impl PeriodRing {
     /// A ring over `buffers`, playing `period_bytes` of each.
@@ -297,7 +302,7 @@ impl PeriodRing {
             reclaimed: Notify::new(),
             closed: AtomicBool::new(false),
             stop: ConcurrentQueue::bounded(1),
-            finished: AtomicBool::new(false),
+            teardown: AtomicU8::new(TEARDOWN_PENDING),
             committed_bytes: AtomicU64::new(0),
         }
     }
@@ -355,7 +360,7 @@ impl PeriodRing {
         // finished at any point up to here, and whichever of the two
         // sides observes the other answers the caller. Both observing it
         // is harmless — the second finds the queue empty.
-        if self.finished.load(Ordering::Acquire) {
+        if self.teardown.load(Ordering::Acquire) != TEARDOWN_PENDING {
             self.answer_stops();
         }
     }
@@ -365,18 +370,36 @@ impl PeriodRing {
     ///
     /// Called by the playback task, once, as it leaves the stream.
     pub fn finish_teardown(&self) {
-        self.finished.store(true, Ordering::Release);
+        let _ = self.teardown.compare_exchange(
+            TEARDOWN_PENDING,
+            TEARDOWN_OK,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.answer_stops();
+    }
+
+    /// Say that teardown faulted — a device refused to release the stream
+    /// while writes were still in flight — and answer every waiting stop
+    /// with [`AudioServiceError::DeviceFault`] without dropping the ring.
+    pub fn fail_teardown(&self) {
+        self.teardown.store(TEARDOWN_FAULT, Ordering::Release);
         self.answer_stops();
     }
 
     /// Whether the playback task has finished tearing the stream down.
     pub fn is_finished(&self) -> bool {
-        self.finished.load(Ordering::Acquire)
+        self.teardown.load(Ordering::Acquire) != TEARDOWN_PENDING
     }
 
     fn answer_stops(&self) {
+        let outcome = if self.teardown.load(Ordering::Acquire) == TEARDOWN_FAULT {
+            Err(AudioServiceError::DeviceFault)
+        } else {
+            Ok(())
+        };
         while let Ok(reply) = self.stop.pop() {
-            let _ = reply.send(Ok(()));
+            let _ = reply.send(outcome);
         }
     }
 
@@ -606,6 +629,9 @@ impl PeriodWriter {
             self.current.is_none(),
             "a writer has at most one cursor out at a time"
         );
+        if self.ring.is_closed() {
+            return;
+        }
         if cursor.filled == cursor.capacity {
             self.ring.commit(cursor.index);
         } else {
@@ -616,13 +642,17 @@ impl PeriodWriter {
     /// End this writer's half of the stream.
     ///
     /// A period the producer left part-written is committed with its
-    /// tail zeroed. That is the one place the kernel adds silence, and
-    /// it is not a substitute for samples that did not arrive: it is
-    /// what makes the samples that did arrive playable at all, because
-    /// the device takes whole periods and would otherwise play whatever
-    /// the rest of the buffer held.
+    /// tail zeroed, unless the ring has already closed. That is the one
+    /// place the kernel adds silence, and it is not a substitute for
+    /// samples that did not arrive: it is what makes the samples that
+    /// did arrive playable at all, because the device takes whole
+    /// periods and would otherwise play whatever the rest of the buffer
+    /// held. Once the ring is closed nobody will play another period,
+    /// so `finish` touches no period bytes.
     pub fn finish(&mut self) {
-        if let Some((index, filled)) = self.current.take() {
+        if let Some((index, filled)) = self.current.take()
+            && !self.ring.is_closed()
+        {
             // SAFETY: as `poll_write`; the period is still this task's.
             let period = unsafe { self.ring.period_mut(index) };
             period[filled..].fill(0);

@@ -2613,6 +2613,7 @@ version = "0.1.0"
 dependencies = [
  "askama",
  "clap",
+ "directories",
  "ed25519-dalek",
  "fatfs",
  "helios-artifact",
@@ -2865,6 +2866,7 @@ dependencies = [
  "futures-lite",
  "futures-util",
  "gimli",
+ "helios-artifact",
  "helios-hal",
  "helios-inspector-protocol",
  "helios-profdata",
@@ -2955,7 +2957,9 @@ dependencies = [
  "pin-project-lite",
  "rand_chacha",
  "rand_core 0.6.4",
+ "sha1",
  "sha2 0.11.0",
+ "sha3",
  "siphasher",
  "slab",
  "smallvec",
@@ -3123,10 +3127,13 @@ dependencies = [
 name = "helios-tpm"
 version = "0.1.0"
 dependencies = [
+ "arrayvec",
  "helios-hal",
  "hex",
  "serde",
  "serde_json",
+ "sha1",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.21",
  "tpm2-protocol",
@@ -3278,6 +3285,9 @@ dependencies = [
 name = "helios-workspace-root"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
  "toml",
@@ -6120,6 +6130,17 @@ dependencies = [
  "scopeguard",
  "unescaper",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.1",
+ "digest 0.11.3",
 ]
 
 [[package]]
