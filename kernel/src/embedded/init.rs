@@ -26,6 +26,7 @@ const EMBEDDED_SYSTEM_COMPONENT_PATH: &str = "bin/debugger";
 #[derive(Clone, Copy)]
 pub struct BootPayload {
     init: EmbeddedInit,
+    body: &'static [u8],
     digest: Digest256,
 }
 
@@ -102,6 +103,7 @@ impl BootPayload {
             }
         }
         Ok(Self {
+            body: image.body(),
             digest: signed.digest,
             init: EmbeddedInit {
                 component: EmbeddedComponent::new(init_component.path(), init_component.data()),
@@ -156,6 +158,12 @@ impl BootPayload {
             unsafe { core::slice::from_raw_parts(module.address as *const u8, module.size) };
         Self::parse(bytes)
             .unwrap_or_else(|error| panic!("helios-bootfs module is not a valid payload: {error}"))
+    }
+
+    /// Verified image body bytes, the payload extended into the measured-boot
+    /// device across every active bank.
+    pub const fn body(&self) -> &'static [u8] {
+        self.body
     }
 
     /// SHA-256 of the verified image body, the value its signature

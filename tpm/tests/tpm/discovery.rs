@@ -10,18 +10,18 @@
 //! themselves.
 
 use helios_hal::boot::MeasurementLogFormat;
-use helios_hal::measured_boot::{MeasuredBoot, MeasurementRegister};
+use helios_hal::measured_boot::{MeasuredBoot, MeasurementAlgorithm, MeasurementRegister};
 use helios_tpm::{
     Discovery, EV_IPL, Event, EventLog, EventLogError, InterfaceDescription, InterfaceError,
-    KERNEL_IMAGE_REGISTERS, LIMINE_KERNEL_IMAGE, LoaderLog, QualifyError, Unqualified, discover,
-    qualify,
+    KERNEL_IMAGE_REGISTERS, LIMINE_KERNEL_IMAGE, LoaderLog, OpenError, QualifyError, Tpm,
+    Unqualified, discover, qualify,
 };
 use tpm2_protocol::TpmWriter;
 use tpm2_protocol::basic::TpmUint32;
 use tpm2_protocol::constant::TPM_MAX_COMMAND_SIZE;
 use tpm2_protocol::data::{
-    TpmCap, TpmPt, TpmRc, TpmRcBase, TpmiYesNo, TpmlTaggedTpmProperty, TpmsCapabilityData,
-    TpmsTaggedProperty, TpmuCapabilities,
+    TpmAlgId, TpmCap, TpmPt, TpmRc, TpmRcBase, TpmiYesNo, TpmlPcrSelection, TpmlTaggedTpmProperty,
+    TpmsCapabilityData, TpmsPcrSelect, TpmsPcrSelection, TpmsTaggedProperty, TpmuCapabilities,
 };
 use tpm2_protocol::frame::{TpmGetCapabilityResponse, tpm_marshal_response};
 
@@ -419,4 +419,63 @@ fn a_register_page_of_another_interface_stops_the_boot() {
 fn the_kernel_image_is_measured_into_a_register_it_is_sealed_to() {
     assert!(KERNEL_IMAGE_REGISTERS.contains(LIMINE_KERNEL_IMAGE.register));
     assert!(KERNEL_IMAGE_REGISTERS.contains(MeasurementRegister::new(4)));
+}
+
+fn pcrs_response(banks: &[(TpmAlgId, [u8; 3])]) -> Vec<u8> {
+    let mut selection = TpmlPcrSelection::new();
+    for &(hash, mask) in banks {
+        selection
+            .try_push(TpmsPcrSelection {
+                hash,
+                pcr_select: TpmsPcrSelect::try_from(&mask[..]).unwrap(),
+            })
+            .unwrap();
+    }
+    let response = TpmGetCapabilityResponse {
+        handles: [],
+        more_data: TpmiYesNo(false),
+        capability_data: TpmsCapabilityData {
+            capability: TpmCap::Pcrs,
+            data: TpmuCapabilities::Pcrs(selection),
+        },
+    };
+    let mut buffer = [0; TPM_MAX_COMMAND_SIZE];
+    let mut writer = TpmWriter::new(&mut buffer);
+    tpm_marshal_response(&response, TpmRc::Fmt0(TpmRcBase::Success), &[], &mut writer).unwrap();
+    let len = writer.len();
+    buffer[..len].to_vec()
+}
+
+#[test]
+fn an_active_unsupported_bank_is_refused_and_an_inactive_one_is_ignored() {
+    let pcr_query = load_recording().phase("seal").remove(0).command;
+
+    // Active SM3 bank alongside SHA-256 must be refused rather than left stale.
+    let replay = Replay::new(vec![Exchange {
+        command: pcr_query.clone(),
+        response: pcrs_response(&[
+            (TpmAlgId::Sha256, [0xff, 0xff, 0xff]),
+            (TpmAlgId::Sm3_256, [0xff, 0xff, 0xff]),
+        ]),
+    }]);
+    assert_eq!(
+        complete(Tpm::open(replay.clone(), KERNEL_IMAGE_REGISTERS)).err(),
+        Some(OpenError::UnsupportedBank {
+            algorithm: TpmAlgId::Sm3_256.value(),
+        })
+    );
+    replay.finish();
+
+    // Inactive SM3 bank (all-zero select bitmap) is skipped.
+    let replay = Replay::new(vec![Exchange {
+        command: pcr_query,
+        response: pcrs_response(&[
+            (TpmAlgId::Sha256, [0xff, 0xff, 0xff]),
+            (TpmAlgId::Sm3_256, [0x00, 0x00, 0x00]),
+        ]),
+    }]);
+    let tpm = complete(Tpm::open(replay.clone(), KERNEL_IMAGE_REGISTERS)).unwrap();
+    assert_eq!(tpm.banks().len(), 1);
+    assert_eq!(tpm.banks()[0].algorithm, MeasurementAlgorithm::Sha256);
+    replay.finish();
 }
