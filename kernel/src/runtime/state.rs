@@ -151,7 +151,7 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// line: every process creation reads them and the profile counters
     /// above are written constantly. Its words are written by whichever
     /// processor serves a write (see [`crate::Settings`]).
-    settings: CachePadded<Settings>,
+    settings: Arc<CachePadded<Settings>>,
 }
 
 struct HeapPerfSnapshot {
@@ -349,6 +349,8 @@ where
         payload: BootPayload,
         guest_isa: crate::isa::GuestIsa,
     ) -> Self {
+        let settings = Arc::new(CachePadded::new(Settings::default()));
+        let memory_storage = crate::vfs::MemoryStorageBudget::for_default_pool(settings.clone());
         Self {
             inner: Arc::new(RuntimeStateInner {
                 boot_ticks,
@@ -385,9 +387,10 @@ where
                 boot_init_launched: AtomicBool::new(false),
                 boot_init_completed: AtomicBool::new(false),
                 boot_init_ready: Notify::new(),
-                namespace: Namespace::new(MountTable::new(
+                namespace: Namespace::new(MountTable::with_storage(
                     BootFs::new(payload.bootfs(), BOOT_DEVICE),
                     processor_count,
+                    memory_storage,
                 )),
                 tracing: TraceLog::new(DEFAULT_TRACE_HISTORY_CAPACITY),
                 profiles: ProfileSink::new(
@@ -396,7 +399,7 @@ where
                 ),
                 instructions: InstructionSampler::new(processor_count),
                 heap_perf_snapshot: HeapPerfSnapshot::new(),
-                settings: CachePadded::new(Settings::default()),
+                settings,
             }),
         }
     }
@@ -1274,8 +1277,13 @@ where
         self.inner.payload.has_system_component()
     }
 
-    /// SHA-256 of the payload body whose signature the kernel verified,
-    /// the value bring-up measures before it reads the sealed seed.
+    /// Verified payload body bytes extended into the measured-boot device
+    /// across every active bank before bring-up reads the sealed seed.
+    pub fn payload_body(&self) -> &'static [u8] {
+        self.inner.payload.body()
+    }
+
+    /// SHA-256 of the payload body whose signature the kernel verified.
     pub fn payload_digest(&self) -> helios_artifact::bootfs::Digest256 {
         self.inner.payload.digest()
     }

@@ -7103,6 +7103,50 @@ mod tests {
     }
 
     #[test]
+    fn closed_peer_window_reports_the_persist_deadline_not_a_past_pacing_time() {
+        let mut socket = established_fixed_pacing_socket(PacingRate::from_bytes_per_second(1_000));
+        assert_eq!(socket.queue_send(b"abcdefgh"), 8);
+        let sent_at = TCP_INITIAL_RTO_NANOS + 1;
+        socket
+            .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
+            .expect("first paced segment should transmit immediately");
+        // The peer acknowledges everything and closes its window, long
+        // after the pacing time the send left behind.
+        let now = sent_at + 1_000_000_000;
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 16,
+                flags: TcpFlags::ACK,
+                window_size: 0,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            now,
+        );
+        assert_eq!(socket.queue_send(b"ijkl"), 4);
+        assert_eq!(
+            socket.take_transmit_segment(now, TcpSegmentBudget::wire_segments(usize::MAX)),
+            None
+        );
+
+        let deadline = socket
+            .next_deadline_nanos()
+            .expect("queued data behind a closed window keeps the persist timer");
+        assert!(
+            deadline > now,
+            "deadline {deadline} must lie after now {now}, not at the stale pacing time"
+        );
+        assert_eq!(
+            Some(deadline),
+            socket.persist_timer.map(TcpPersistTimer::deadline_nanos)
+        );
+    }
+
+    #[test]
     fn pacing_rate_delays_next_data_segment() {
         // Four payload bytes a segment at 1000 B/s: 4 ms of line time a
         // segment and, at two segments, an 8 ms burst allowance.

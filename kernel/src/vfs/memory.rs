@@ -1,14 +1,19 @@
-//! A writable filesystem held entirely in kernel memory.
+//! A writable filesystem held in user-pool frames, metadata in kernel memory.
 //!
 //! The tree is an inode table and a name index ordered by path, so the
 //! names below one directory form one contiguous range and a hard link is
-//! a second name for the same inode rather than a copy of it.
+//! a second name for the same inode rather than a copy of it. Regular file
+//! bytes live in [`PagedBytes`] user-pool frames bounded machine-wide by
+//! [`MemoryStorageSetting`] (`fs.memory-storage`) and attributed to the
+//! creating instance's [`StorageShare`], so the kernel heap does not grow
+//! with file sizes and sparse holes commit no frames.
 //!
 //! Concurrency contract: one spin mutex guards a tree. Every operation
-//! takes it for its own body, which never awaits and never allocates while
-//! another processor could be waiting for more than the copy of the bytes
-//! it writes, and no lock is held across an `.await`. No interrupt handler
-//! reaches a tree, so the lock does not mask interrupts.
+//! takes it for its own body, which never awaits; frames detached by a
+//! truncate, unlink, or overwrite are freed after the tree mutex is
+//! released. Frame reservations take the user pool lock inside the tree
+//! mutex, and the pool never calls into any filesystem. No interrupt
+//! handler reaches a tree, so the tree lock does not mask interrupts.
 //!
 //! A tree may be the upper layer of an overlay ([`super::RootFs`]). It
 //! then also records what the overlay hid of the layer below: whiteouts,
@@ -26,8 +31,10 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::future::Future;
 use core::ops::Bound;
+use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use bytes::{Bytes, BytesMut};
+use crossbeam_utils::CachePadded;
 use hashbrown::{HashMap, HashSet};
 use helios_btrfs::DeviceNumber;
 use helios_btrfs::write::{Attributes, Special};
@@ -36,10 +43,13 @@ use helios_hal::fs::{
     Metadata, NodeId, NodeKind, OpenFlags, Opened, OwnedFsPath, PreparedWrite, RenameMode,
     WritePosition, WriteProgress,
 };
+use helios_hal::pmm::PhysFrame;
 use spin::Mutex;
 use triomphe::Arc;
 
 use super::{UnixAttributes, UnixFsError, UnixNodeMetadata, cmp_to_children};
+use crate::memory::{DetachedPages, FrameReservation, PagedBytes, UserMemoryPool};
+use crate::{Setting, SettingUnit, Settings, StorageShare};
 
 const ROOT_INODE: u64 = 1;
 const ROOT_UNIX: UnixAttributes = UnixAttributes {
@@ -81,10 +91,304 @@ pub enum XattrSetMode {
     Replace,
 }
 
-/// A tree in kernel memory. Clones share the tree.
+/// The machine-wide cap on user-pool bytes held by in-memory filesystems
+/// (`fs.memory-storage`). Defaults at boot to half of the installed user
+/// memory pool, matching Linux tmpfs (`50%` of RAM).
+pub struct MemoryStorageSetting;
+
+impl Setting for MemoryStorageSetting {
+    const NAME: &'static str = "fs.memory-storage";
+    const DESCRIPTION: &'static str = "Total user-pool bytes held by in-memory filesystems.";
+    const UNIT: SettingUnit = SettingUnit::Bytes;
+    type Value = u64;
+    // Initialised at boot from half the user memory pool via `initial()`;
+    // an operator who writes `0` genuinely caps in-memory storage at zero.
+    const DEFAULT: u64 = 0;
+
+    fn initial() -> u64 {
+        (default_memory_storage_pool().stats().total_bytes / 2) as u64
+    }
+
+    fn to_raw(value: u64) -> u64 {
+        value
+    }
+
+    fn from_raw(raw: u64) -> u64 {
+        raw
+    }
+}
+
+/// The user pool backing in-memory filesystems and preview1 state on this machine.
+pub(crate) fn default_memory_storage_pool() -> &'static UserMemoryPool {
+    #[cfg(not(test))]
+    {
+        crate::memory::installed_user_memory_pool()
+            .expect("the user memory pool is installed before in-memory storage")
+    }
+    #[cfg(test)]
+    {
+        crate::memory::installed_user_memory_pool().unwrap_or_else(test_memory_storage_pool)
+    }
+}
+
+/// A process-wide 16 MiB user pool used only by unit tests that construct a
+/// [`MemoryFs`] or [`Settings`] without booting a full machine.
+#[cfg(test)]
+fn test_memory_storage_pool() -> &'static UserMemoryPool {
+    static POOL: std::sync::OnceLock<&'static UserMemoryPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        const POOL_BYTES: usize = 16 * 1024 * 1024;
+        // Allocate page-aligned backing once for the test binary.
+        let backing: &'static mut [u8] = alloc::vec![0u8; POOL_BYTES + PhysFrame::SIZE].leak();
+        let raw = backing.as_mut_ptr() as usize;
+        let aligned = (raw + PhysFrame::SIZE - 1) & !(PhysFrame::SIZE - 1);
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(UserMemoryPool::single_node(
+            1,
+            &[(aligned, aligned + POOL_BYTES)],
+        ))) as &'static UserMemoryPool
+    })
+}
+
+enum BudgetSource {
+    /// Reads live `fs.memory-storage` from the machine's settings.
+    Settings(Arc<CachePadded<Settings>>),
+    /// Fixed byte cap for isolated filesystem unit tests.
+    #[cfg(test)]
+    Fixed(u64),
+}
+
+struct MemoryStorageBudgetInner {
+    pool: &'static UserMemoryPool,
+    source: BudgetSource,
+    /// Bytes currently committed across every [`MemoryFs`] sharing this budget.
+    /// Updated lock-free by whichever processor commits or frees file frames.
+    used_bytes: CachePadded<AtomicU64>,
+}
+
+/// Machine-wide byte budget shared by every [`MemoryFs`] on one machine
+/// (including every namespace's root overlay layer).
+///
+/// # Concurrency contract
+///
+/// - **Lock-free accounting.** Reservations use a CAS loop on `used_bytes`
+///   against the live [`MemoryStorageSetting`] value; releases use a single
+///   atomic subtraction.
+/// - **No global state.** Owned by the runtime state's mount table and passed
+///   explicitly to every [`MemoryFs`].
+#[derive(Clone)]
+pub struct MemoryStorageBudget {
+    inner: Arc<MemoryStorageBudgetInner>,
+}
+
+impl MemoryStorageBudget {
+    /// A budget drawing frames from `pool` and reading its byte cap live from
+    /// `settings`.
+    pub fn new(pool: &'static UserMemoryPool, settings: Arc<CachePadded<Settings>>) -> Self {
+        Self {
+            inner: Arc::new(MemoryStorageBudgetInner {
+                pool,
+                source: BudgetSource::Settings(settings),
+                used_bytes: CachePadded::new(AtomicU64::new(0)),
+            }),
+        }
+    }
+
+    /// A budget over the machine's installed user memory pool and `settings`.
+    pub fn for_default_pool(settings: Arc<CachePadded<Settings>>) -> Self {
+        Self::new(default_memory_storage_pool(), settings)
+    }
+
+    /// A test budget backed by the default test pool with half-pool capacity.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let pool = default_memory_storage_pool();
+        Self::with_limit(pool, (pool.stats().total_bytes / 2) as u64)
+    }
+
+    /// A test budget backed by an explicit `pool` and fixed `limit_bytes`.
+    #[cfg(test)]
+    pub(crate) fn with_limit(pool: &'static UserMemoryPool, limit_bytes: u64) -> Self {
+        Self {
+            inner: Arc::new(MemoryStorageBudgetInner {
+                pool,
+                source: BudgetSource::Fixed(limit_bytes),
+                used_bytes: CachePadded::new(AtomicU64::new(0)),
+            }),
+        }
+    }
+
+    /// The user pool this budget draws file frames from.
+    pub fn pool(&self) -> &'static UserMemoryPool {
+        self.inner.pool
+    }
+
+    /// Bytes currently committed across all trees sharing this budget.
+    pub fn used_bytes(&self) -> u64 {
+        self.inner.used_bytes.load(AtomicOrdering::Acquire)
+    }
+
+    /// Current byte cap enforced by this budget.
+    pub fn limit_bytes(&self) -> u64 {
+        match &self.inner.source {
+            BudgetSource::Settings(settings) => settings.get::<MemoryStorageSetting>(),
+            #[cfg(test)]
+            BudgetSource::Fixed(limit) => *limit,
+        }
+    }
+
+    fn try_reserve(&self, bytes: u64) -> FsResult<BudgetReservation<'_>> {
+        if bytes == 0 {
+            return Ok(BudgetReservation {
+                budget: None,
+                bytes: 0,
+            });
+        }
+        let limit = self.limit_bytes();
+        let mut current = self.inner.used_bytes.load(AtomicOrdering::Acquire);
+        loop {
+            let next = current.checked_add(bytes).ok_or(FsError::NoSpace)?;
+            if next > limit {
+                return Err(FsError::NoSpace);
+            }
+            match self.inner.used_bytes.compare_exchange_weak(
+                current,
+                next,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(BudgetReservation {
+                        budget: Some(self),
+                        bytes,
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn release(&self, bytes: u64) {
+        if bytes > 0 {
+            let previous = self
+                .inner
+                .used_bytes
+                .fetch_sub(bytes, AtomicOrdering::AcqRel);
+            debug_assert!(
+                previous >= bytes,
+                "memory storage budget underflowed: {previous} < {bytes}"
+            );
+        }
+    }
+}
+
+/// RAII claim against [`MemoryStorageBudget`]: refunded on drop unless
+/// committed via [`Self::commit`].
+struct BudgetReservation<'a> {
+    budget: Option<&'a MemoryStorageBudget>,
+    bytes: u64,
+}
+
+impl BudgetReservation<'_> {
+    fn commit(mut self, actual_bytes: u64) {
+        debug_assert!(
+            actual_bytes <= self.bytes,
+            "committed {actual_bytes} bytes exceeded reserved {}",
+            self.bytes
+        );
+        let surplus = self.bytes - actual_bytes;
+        if let Some(budget) = self.budget.take()
+            && surplus > 0
+        {
+            budget.release(surplus);
+        }
+        self.bytes = 0;
+    }
+}
+
+impl Drop for BudgetReservation<'_> {
+    fn drop(&mut self) {
+        if let Some(budget) = self.budget.take()
+            && self.bytes > 0
+        {
+            budget.release(self.bytes);
+        }
+    }
+}
+
+/// A regular file's bytes in user-pool frames, tied to its creator's storage
+/// share and the machine's memory-storage budget.
+struct PagedFile {
+    pages: PagedBytes,
+    creator: Arc<StorageShare>,
+    budget: MemoryStorageBudget,
+}
+
+impl PagedFile {
+    fn new(budget: MemoryStorageBudget, creator: Arc<StorageShare>) -> Self {
+        let pages = PagedBytes::new(budget.pool());
+        Self {
+            pages,
+            creator,
+            budget,
+        }
+    }
+
+    fn with_base(budget: MemoryStorageBudget, base: Bytes, creator: Arc<StorageShare>) -> Self {
+        let pages = PagedBytes::with_base(budget.pool(), base);
+        Self {
+            pages,
+            creator,
+            budget,
+        }
+    }
+
+    fn set_len(&mut self, len: u64) -> DetachedPages {
+        let before = self.pages.frames();
+        let detached = self.pages.set_len(len);
+        let freed_bytes = (before - self.pages.frames()) * PhysFrame::SIZE as u64;
+        if freed_bytes > 0 {
+            self.creator.sub(freed_bytes);
+            self.budget.release(freed_bytes);
+        }
+        detached
+    }
+}
+
+impl Drop for PagedFile {
+    fn drop(&mut self) {
+        let bytes = self.pages.frames() * PhysFrame::SIZE as u64;
+        if bytes > 0 {
+            self.creator.sub(bytes);
+            self.budget.release(bytes);
+        }
+    }
+}
+
+enum InodeContents {
+    /// A regular file backed by sparse user-pool frames.
+    File(PagedFile),
+    /// A symbolic link's target text.
+    Symlink(Bytes),
+    /// Directories, device nodes, FIFOs and sockets hold no contents.
+    Empty,
+}
+
+impl InodeContents {
+    fn size(&self) -> u64 {
+        match self {
+            Self::File(file) => file.pages.len(),
+            Self::Symlink(target) => target.len() as u64,
+            Self::Empty => 0,
+        }
+    }
+}
+
+/// A tree whose metadata lives in kernel memory and whose file bytes live in
+/// user-pool frames. Clones share the tree.
 #[derive(Clone)]
 pub struct MemoryFs {
     device: DeviceId,
+    budget: MemoryStorageBudget,
     state: Arc<Mutex<MemoryState>>,
 }
 
@@ -101,8 +405,7 @@ struct Inode {
     kind: NodeKind,
     unix: UnixAttributes,
     rdev: DeviceNumber,
-    /// A file's bytes or a symbolic link's target text.
-    contents: Bytes,
+    contents: InodeContents,
     xattrs: BTreeMap<String, Bytes>,
     link_count: u64,
     access_nanos: u64,
@@ -137,8 +440,9 @@ pub(super) struct UpperView {
 
 impl MemoryFs {
     /// An empty tree with only its root directory (`0755`, owned by
-    /// `0:0`, as `RAMFS_DEFAULT_MODE` in `fs/ramfs/inode.c`).
-    pub fn new(device: DeviceId) -> Self {
+    /// `0:0`, as `RAMFS_DEFAULT_MODE` in `fs/ramfs/inode.c`), drawing file
+    /// frames through `budget`.
+    pub fn with_budget(device: DeviceId, budget: MemoryStorageBudget) -> Self {
         let mut inodes = HashMap::new();
         inodes.insert(
             ROOT_INODE,
@@ -146,7 +450,7 @@ impl MemoryFs {
                 kind: NodeKind::Directory,
                 unix: ROOT_UNIX,
                 rdev: DeviceNumber::default(),
-                contents: Bytes::new(),
+                contents: InodeContents::Empty,
                 xattrs: BTreeMap::new(),
                 link_count: 1,
                 access_nanos: 0,
@@ -156,6 +460,7 @@ impl MemoryFs {
         );
         Self {
             device,
+            budget,
             state: Arc::new(Mutex::new(MemoryState {
                 names: BTreeMap::new(),
                 inodes,
@@ -164,6 +469,13 @@ impl MemoryFs {
                 opaque: HashSet::new(),
             })),
         }
+    }
+
+    /// An empty tree for unit tests that do not construct a full runtime
+    /// state, backed by the test memory-storage budget.
+    #[cfg(test)]
+    pub fn new(device: DeviceId) -> Self {
+        Self::with_budget(device, MemoryStorageBudget::for_test())
     }
 
     pub fn device(&self) -> DeviceId {
@@ -196,10 +508,11 @@ impl MemoryFs {
 
     /// Copies an object of the layer below up to `path`, keeping its
     /// times and Unix attributes: `contents` is a file's bytes or a link's
-    /// target, and empty for a directory, which stays merging. When the
-    /// tree has an object there already, another copy-up won and this one
-    /// does nothing; when the layer below no longer shows there, the
-    /// object was removed meanwhile: [`FsError::NoEntry`].
+    /// target, and empty for a directory, which stays merging. Regular files
+    /// keep `contents` as a zero-frame copy-on-write base until written.
+    /// When the tree has an object there already, another copy-up won and
+    /// this one does nothing; when the layer below no longer shows there,
+    /// the object was removed meanwhile: [`FsError::NoEntry`].
     pub(super) fn copy_up(
         &self,
         path: FsPath<'_>,
@@ -207,6 +520,7 @@ impl MemoryFs {
         unix: UnixAttributes,
         contents: Bytes,
         original: &Metadata,
+        payer: Option<&crate::StoragePayer>,
     ) -> FsResult<()> {
         let mut state = self.state.lock();
         if state.inode_of(path).is_ok() {
@@ -216,12 +530,23 @@ impl MemoryFs {
             return Err(FsError::NoEntry);
         }
         state.require_new_name(path)?;
+        let stored = match kind {
+            NodeKind::File => {
+                let share = payer.map_or_else(
+                    || Arc::new(StorageShare::default()),
+                    |payer| payer.share().clone(),
+                );
+                InodeContents::File(PagedFile::with_base(self.budget.clone(), contents, share))
+            }
+            NodeKind::Symlink => InodeContents::Symlink(contents),
+            _ => InodeContents::Empty,
+        };
         let number = state.insert(
             path,
             kind,
             unix,
             DeviceNumber::default(),
-            contents,
+            stored,
             original.modified_nanos,
         );
         let inode = state
@@ -261,7 +586,10 @@ impl MemoryFs {
             NodeKind::File,
             unix,
             DeviceNumber::default(),
-            Bytes::new(),
+            InodeContents::File(PagedFile::new(
+                self.budget.clone(),
+                Arc::new(StorageShare::default()),
+            )),
             now,
         );
         state.metadata(self.device, path)
@@ -283,7 +611,7 @@ impl MemoryFs {
             NodeKind::Directory,
             unix,
             DeviceNumber::default(),
-            Bytes::new(),
+            InodeContents::Empty,
             now,
         );
         Ok(())
@@ -306,7 +634,7 @@ impl MemoryFs {
             NodeKind::Symlink,
             unix,
             DeviceNumber::default(),
-            Bytes::copy_from_slice(target.as_bytes()),
+            InodeContents::Symlink(Bytes::copy_from_slice(target.as_bytes())),
             now,
         );
         Ok(())
@@ -330,7 +658,7 @@ impl MemoryFs {
         };
         let mut state = self.state.lock();
         state.require_new_name(path)?;
-        state.insert(path, kind, unix, rdev, Bytes::new(), now);
+        state.insert(path, kind, unix, rdev, InodeContents::Empty, now);
         Ok(())
     }
 
@@ -473,7 +801,9 @@ impl MemoryFs {
         flags: OpenFlags,
         attributes: Attributes,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<Opened<OwnedFsPath>, UnixFsError> {
+        let mut _detached: Option<DetachedPages> = None;
         let mut state = self.state.lock();
         let metadata = match state.metadata(self.device, path) {
             Ok(metadata) => {
@@ -493,7 +823,7 @@ impl MemoryFs {
                     NodeKind::File,
                     unix,
                     DeviceNumber::default(),
-                    Bytes::new(),
+                    InodeContents::File(PagedFile::new(self.budget.clone(), payer.share().clone())),
                     now,
                 );
                 state.metadata(self.device, path)?
@@ -511,7 +841,9 @@ impl MemoryFs {
             if inode.kind == NodeKind::Directory {
                 return Err(FsError::IsDirectory.into());
             }
-            inode.contents.clear();
+            if let InodeContents::File(file) = &mut inode.contents {
+                _detached = Some(file.set_len(0));
+            }
             inode.modified_nanos = now;
             inode.status_nanos = now;
         }
@@ -536,7 +868,7 @@ impl MemoryFs {
             NodeKind::Directory,
             unix,
             DeviceNumber::default(),
-            Bytes::new(),
+            InodeContents::Empty,
             now,
         );
         Ok(())
@@ -557,7 +889,7 @@ impl MemoryFs {
             NodeKind::Symlink,
             unix,
             DeviceNumber::default(),
-            Bytes::copy_from_slice(target.as_bytes()),
+            InodeContents::Symlink(Bytes::copy_from_slice(target.as_bytes())),
             now,
         );
         Ok(())
@@ -579,7 +911,7 @@ impl MemoryFs {
         let mut state = self.state.lock();
         let unix = Self::resolve_create_unix(&state, path, kind, attributes)?;
         state.require_new_name(path)?;
-        state.insert(path, kind, unix, rdev, Bytes::new(), now);
+        state.insert(path, kind, unix, rdev, InodeContents::Empty, now);
         Ok(())
     }
 
@@ -660,6 +992,7 @@ impl MemoryFs {
                 FsError::IsDirectory
             });
         }
+        let mut _dropped: Option<Inode> = None;
         let mut state = self.state.lock();
         match state.inode(path) {
             Ok((_, inode)) => {
@@ -682,7 +1015,7 @@ impl MemoryFs {
                 let parent = state.inodes.get_mut(&parent).expect("parent inode exists");
                 parent.modified_nanos = now;
                 parent.status_nanos = now;
-                state.remove_name(path);
+                _dropped = state.remove_name(path);
             }
             Err(FsError::NoEntry) if whiteout && state.beneath(path) => {}
             Err(error) => return Err(error),
@@ -713,6 +1046,7 @@ impl MemoryFs {
         if source.is_root() || destination.is_root() {
             return Err(FsError::NotPermitted);
         }
+        let mut _dropped: Option<Inode> = None;
         let mut state = self.state.lock();
         let (source_inode, source_kind) = {
             let (number, inode) = state.inode(source)?;
@@ -758,7 +1092,7 @@ impl MemoryFs {
                 .get_mut(&dest_inode)
                 .expect("replaced inode exists")
                 .status_nanos = now;
-            state.remove_name(destination);
+            _dropped = state.remove_name(destination);
             if dest_is_dir {
                 state.drop_whiteouts_below(destination);
             }
@@ -967,7 +1301,7 @@ impl MemoryState {
             kind: inode.kind,
             link_count: inode.link_count,
             size: match inode.kind {
-                NodeKind::File | NodeKind::Symlink => inode.contents.len() as u64,
+                NodeKind::File | NodeKind::Symlink => inode.contents.size(),
                 // The tree creates only files, directories and symlinks;
                 // a report-only node has no contents here.
                 NodeKind::Directory
@@ -1014,7 +1348,7 @@ impl MemoryState {
         kind: NodeKind,
         unix: UnixAttributes,
         rdev: DeviceNumber,
-        contents: Bytes,
+        contents: InodeContents,
         now: u64,
     ) -> u64 {
         let number = self.next_inode;
@@ -1088,8 +1422,9 @@ impl MemoryState {
         }
     }
 
-    /// Drops the name at `path`, and the inode with its last name.
-    fn remove_name(&mut self, path: FsPath<'_>) {
+    /// Drops the name at `path`, returning the inode when its last name goes
+    /// so the caller frees any file frames outside the tree lock.
+    fn remove_name(&mut self, path: FsPath<'_>) -> Option<Inode> {
         let number = self
             .names
             .remove(path.as_str())
@@ -1100,9 +1435,10 @@ impl MemoryState {
             .expect("every name refers to a live inode");
         inode.link_count -= 1;
         if inode.link_count == 0 {
-            self.inodes.remove(&number);
             self.opaque.remove(&number);
+            return self.inodes.remove(&number);
         }
+        None
     }
 
     /// Every name below the directory at `path`, in order.
@@ -1131,37 +1467,31 @@ impl MemoryState {
         })
     }
 
-    /// Replaces a file's bytes with what `edit` makes of them.
-    fn edit_contents(
-        &mut self,
-        path: FsPath<'_>,
-        now: u64,
-        edit: impl FnOnce(&mut BytesMut) -> FsResult<()>,
-    ) -> FsResult<()> {
+    /// Sets the logical length of the regular file at `path`, returning any
+    /// detached subtrees for the caller to free outside the tree lock.
+    fn set_file_len(&mut self, path: FsPath<'_>, len: u64, now: u64) -> FsResult<DetachedPages> {
         let inode = self.inode_mut(path)?;
         inode.kind.require_regular()?;
-        let contents = core::mem::take(&mut inode.contents);
-        let mut contents = contents
-            .try_into_mut()
-            .unwrap_or_else(|shared| BytesMut::from(shared.as_ref()));
-        let edited = edit(&mut contents);
-        inode.contents = contents.freeze();
-        edited?;
+        let InodeContents::File(file) = &mut inode.contents else {
+            unreachable!("every regular file carries PagedFile contents");
+        };
+        let detached = file.set_len(len);
         inode.modified_nanos = now;
         inode.status_nanos = now;
-        Ok(())
+        Ok(detached)
     }
 }
 
 /// A write to a [`MemoryFs`], staged at once: its one round is the whole
-/// write, and filling writes straight into the file's
-/// own storage under the tree's lock.
+/// write, and filling writes straight into the file's user-pool frames
+/// under the tree's lock.
 pub struct MemoryWrite {
     fs: MemoryFs,
     path: OwnedFsPath,
     position: WritePosition,
     len: usize,
     now: u64,
+    payer: crate::StoragePayer,
 }
 
 impl MemoryWrite {
@@ -1173,6 +1503,7 @@ impl MemoryWrite {
         position: WritePosition,
         len: usize,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> FsResult<Self> {
         fs.state.lock().inode(path)?.1.kind.require_regular()?;
         Ok(Self {
@@ -1181,19 +1512,21 @@ impl MemoryWrite {
             position,
             len,
             now,
+            payer: payer.clone(),
         })
     }
 
     /// Lands the write and resolves with the offset it began at. The
     /// checks of [`Self::prepare`] are made again under the lock, since
     /// the file may have changed in between.
-    pub(super) fn land(self, mut fill: impl FnMut(usize, &mut [u8])) -> FsResult<Landed> {
+    pub(super) fn land(self, fill: impl FnMut(usize, &mut [u8])) -> FsResult<Landed> {
         self.fs.write_now(
             self.path.as_path(),
             self.position,
             self.len,
             self.now,
-            |destination| fill(0, destination),
+            &self.payer,
+            fill,
         )
     }
 }
@@ -1216,35 +1549,51 @@ impl PreparedWrite for MemoryWrite {
 
 impl MemoryFs {
     /// Writes `len` bytes at `position` at once: `fill` writes straight
-    /// into the file's storage.
+    /// into the file's user-pool frames one page run at a time.
     pub(super) fn write_now(
         &self,
         path: FsPath<'_>,
         position: WritePosition,
         len: usize,
         now: u64,
-        fill: impl FnOnce(&mut [u8]),
+        _payer: &crate::StoragePayer,
+        mut fill: impl FnMut(usize, &mut [u8]),
     ) -> FsResult<Landed> {
-        let mut landed = 0;
-        self.state.lock().edit_contents(path, now, |contents| {
-            let at = match position {
-                WritePosition::At(offset) => {
-                    usize::try_from(offset).map_err(|_| FsError::Overflow)?
-                }
-                WritePosition::End => contents.len(),
-            };
-            let end = at.checked_add(len).ok_or(FsError::Overflow)?;
-            if contents.len() < end {
-                contents.resize(end, 0);
+        let mut state = self.state.lock();
+        let inode = state.inode_mut(path)?;
+        inode.kind.require_regular()?;
+        let InodeContents::File(file) = &mut inode.contents else {
+            unreachable!("every regular file carries PagedFile contents");
+        };
+        let at = match position {
+            WritePosition::At(offset) => offset,
+            WritePosition::End => file.pages.len(),
+        };
+        let end = at.checked_add(len as u64).ok_or(FsError::Overflow)?;
+        if len > 0 {
+            let needed = file.pages.frames_to_commit(at..end);
+            let needed_bytes = needed
+                .checked_mul(PhysFrame::SIZE as u64)
+                .ok_or(FsError::NoSpace)?;
+            let budget_res = self.budget.try_reserve(needed_bytes)?;
+            let mut frames = FrameReservation::take(self.budget.pool(), needed)
+                .map_err(|_| FsError::OutOfMemory)?;
+            let before_frames = file.pages.frames();
+            let mut done = 0usize;
+            file.pages.write(at, len, &mut frames, |run| {
+                fill(done, run);
+                done += run.len();
+            });
+            debug_assert_eq!(done, len, "page runs cover the whole write");
+            let added_bytes = (file.pages.frames() - before_frames) * PhysFrame::SIZE as u64;
+            budget_res.commit(added_bytes);
+            if added_bytes > 0 {
+                file.creator.add(added_bytes);
             }
-            fill(&mut contents[at..end]);
-            landed = at as u64;
-            Ok(())
-        })?;
-        Ok(Landed {
-            offset: landed,
-            len,
-        })
+        }
+        inode.modified_nanos = now;
+        inode.status_nanos = now;
+        Ok(Landed { offset: at, len })
     }
 }
 
@@ -1293,6 +1642,7 @@ impl MemoryFs {
 }
 
 impl FileSystem for MemoryFs {
+    type Payer = crate::StoragePayer;
     super::delegate_path_handles!();
     type Write = MemoryWrite;
     type Dir = MemoryDir;
@@ -1306,7 +1656,9 @@ impl FileSystem for MemoryFs {
         path: FsPath<'_>,
         flags: OpenFlags,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> FsResult<helios_hal::fs::Opened<OwnedFsPath>> {
+        let mut _detached: Option<DetachedPages> = None;
         let mut state = self.state.lock();
         match state.inode(path) {
             Ok((_, inode)) => {
@@ -1320,10 +1672,7 @@ impl FileSystem for MemoryFs {
                     return Err(FsError::NotDirectory);
                 }
                 if flags.contains(OpenFlags::TRUNCATE) {
-                    state.edit_contents(path, now, |contents| {
-                        contents.clear();
-                        Ok(())
-                    })?;
+                    _detached = Some(state.set_file_len(path, 0, now)?);
                 }
             }
             Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
@@ -1337,7 +1686,7 @@ impl FileSystem for MemoryFs {
                     NodeKind::File,
                     unix,
                     DeviceNumber::default(),
-                    Bytes::new(),
+                    InodeContents::File(PagedFile::new(self.budget.clone(), payer.share().clone())),
                     now,
                 );
             }
@@ -1354,12 +1703,18 @@ impl FileSystem for MemoryFs {
         let state = self.state.lock();
         let (_, inode) = state.inode(path)?;
         inode.kind.require_regular()?;
-        let offset = usize::try_from(offset).map_err(|_| FsError::Overflow)?;
-        if offset >= inode.contents.len() {
+        let InodeContents::File(file) = &inode.contents else {
+            unreachable!("every regular file carries PagedFile contents");
+        };
+        if offset >= file.pages.len() || max_bytes == 0 {
             return Ok(Bytes::new());
         }
-        let end = offset.saturating_add(max_bytes).min(inode.contents.len());
-        Ok(inode.contents.slice(offset..end))
+        let available = usize::try_from(file.pages.len() - offset).unwrap_or(usize::MAX);
+        let count = max_bytes.min(available);
+        let mut out = BytesMut::zeroed(count);
+        let copied = file.pages.read(offset, &mut out);
+        out.truncate(copied);
+        Ok(out.freeze())
     }
 
     fn prepare_write<'a>(
@@ -1368,16 +1723,21 @@ impl FileSystem for MemoryFs {
         position: WritePosition,
         len: usize,
         now: u64,
+        payer: &'a crate::StoragePayer,
     ) -> impl Future<Output = FsResult<MemoryWrite>> + Send + 'a {
-        core::future::ready(MemoryWrite::prepare(self, path, position, len, now))
+        core::future::ready(MemoryWrite::prepare(self, path, position, len, now, payer))
     }
 
-    async fn set_size(&self, path: FsPath<'_>, size: u64, now: u64) -> FsResult<()> {
-        let size = usize::try_from(size).map_err(|_| FsError::Overflow)?;
-        self.state.lock().edit_contents(path, now, |contents| {
-            contents.resize(size, 0);
-            Ok(())
-        })
+    async fn set_size(
+        &self,
+        path: FsPath<'_>,
+        size: u64,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
+        let detached = self.state.lock().set_file_len(path, size, now)?;
+        drop(detached);
+        Ok(())
     }
 
     async fn set_times(
@@ -1386,6 +1746,7 @@ impl FileSystem for MemoryFs {
         access_nanos: Option<u64>,
         modified_nanos: Option<u64>,
         now: u64,
+        _payer: &crate::StoragePayer,
     ) -> FsResult<()> {
         let mut state = self.state.lock();
         let inode = state.inode_mut(path)?;
@@ -1412,7 +1773,12 @@ impl FileSystem for MemoryFs {
         })
     }
 
-    async fn create_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn create_directory(
+        &self,
+        path: FsPath<'_>,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         let mut state = self.state.lock();
         state.require_new_name(path)?;
         let unix = state.inherited_unix(path, NodeKind::Directory)?;
@@ -1421,17 +1787,27 @@ impl FileSystem for MemoryFs {
             NodeKind::Directory,
             unix,
             DeviceNumber::default(),
-            Bytes::new(),
+            InodeContents::Empty,
             now,
         );
         Ok(())
     }
 
-    async fn remove_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn remove_directory(
+        &self,
+        path: FsPath<'_>,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         self.remove(path, true, false, now)
     }
 
-    async fn unlink(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn unlink(
+        &self,
+        path: FsPath<'_>,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         self.remove(path, false, false, now)
     }
 
@@ -1441,11 +1817,18 @@ impl FileSystem for MemoryFs {
         destination: FsPath<'_>,
         mode: RenameMode,
         now: u64,
+        _payer: &crate::StoragePayer,
     ) -> FsResult<()> {
         self.rename_over(source, destination, mode, now, false)
     }
 
-    async fn link(&self, existing: FsPath<'_>, link: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn link(
+        &self,
+        existing: FsPath<'_>,
+        link: FsPath<'_>,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         let mut state = self.state.lock();
         let (number, inode) = state.inode(existing)?;
         if inode.kind == NodeKind::Directory {
@@ -1463,7 +1846,13 @@ impl FileSystem for MemoryFs {
         Ok(())
     }
 
-    async fn symlink(&self, target: &str, link: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn symlink(
+        &self,
+        target: &str,
+        link: FsPath<'_>,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         let mut state = self.state.lock();
         state.require_new_name(link)?;
         let unix = state.inherited_unix(link, NodeKind::Symlink)?;
@@ -1472,7 +1861,7 @@ impl FileSystem for MemoryFs {
             NodeKind::Symlink,
             unix,
             DeviceNumber::default(),
-            Bytes::copy_from_slice(target.as_bytes()),
+            InodeContents::Symlink(Bytes::copy_from_slice(target.as_bytes())),
             now,
         );
         Ok(())
@@ -1481,10 +1870,10 @@ impl FileSystem for MemoryFs {
     async fn read_link(&self, path: FsPath<'_>) -> FsResult<String> {
         let state = self.state.lock();
         let (_, inode) = state.inode(path)?;
-        if inode.kind != NodeKind::Symlink {
+        let InodeContents::Symlink(target) = &inode.contents else {
             return Err(FsError::Invalid);
-        }
-        core::str::from_utf8(&inode.contents)
+        };
+        core::str::from_utf8(target)
             .map(String::from)
             .map_err(|_| FsError::IllegalByteSequence)
     }
@@ -1543,26 +1932,32 @@ mod tests {
         const ROUNDS: usize = 200;
 
         let fs = tree();
-        block_on(fs.open(path("existing"), OpenFlags::CREATE, 0)).expect("creates");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.open(path("existing"), OpenFlags::CREATE, 0, &payer)).expect("creates");
         for round in 0..ROUNDS {
             let name = alloc::format!("raced-{round}");
             let barrier = Barrier::new(RACERS);
             let outcomes: Vec<Result<(), FsError>> = thread::scope(|scope| {
                 let racers: Vec<_> = (0..RACERS)
                     .map(|racer| {
-                        let (fs, name, barrier) = (&fs, &name, &barrier);
+                        let (fs, name, barrier, payer) = (&fs, &name, &barrier, &payer);
                         scope.spawn(move || {
                             let new = path(name);
                             barrier.wait();
                             block_on(async {
                                 match racer % 4 {
                                     0 => fs
-                                        .open(new, OpenFlags::CREATE | OpenFlags::EXCLUSIVE, 1)
+                                        .open(
+                                            new,
+                                            OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                                            1,
+                                            payer,
+                                        )
                                         .await
                                         .map(drop),
-                                    1 => fs.create_directory(new, 1).await,
-                                    2 => fs.symlink("existing", new, 1).await,
-                                    _ => fs.link(path("existing"), new, 1).await,
+                                    1 => fs.create_directory(new, 1, payer).await,
+                                    2 => fs.symlink("existing", new, 1, payer).await,
+                                    _ => fs.link(path("existing"), new, 1, payer).await,
                                 }
                             })
                         })
@@ -1588,8 +1983,9 @@ mod tests {
     #[test]
     fn a_write_is_refused_while_staging_and_a_dropped_one_changes_nothing() {
         let fs = tree();
-        block_on(fs.create_directory(path("d"), 1)).expect("creates the directory");
-        block_on(fs.open(path("f"), OpenFlags::CREATE, 1)).expect("creates the file");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.create_directory(path("d"), 1, &payer)).expect("creates the directory");
+        block_on(fs.open(path("f"), OpenFlags::CREATE, 1, &payer)).expect("creates the file");
         block_on(write_bytes(
             &fs,
             path("f"),
@@ -1600,16 +1996,16 @@ mod tests {
         .expect("writes");
 
         assert!(matches!(
-            block_on(fs.prepare_write(path("d"), WritePosition::At(0), 1, 3)),
+            block_on(fs.prepare_write(path("d"), WritePosition::At(0), 1, 3, &payer)),
             Err(FsError::IsDirectory)
         ));
         assert!(matches!(
-            block_on(fs.prepare_write(path("missing"), WritePosition::End, 1, 3)),
+            block_on(fs.prepare_write(path("missing"), WritePosition::End, 1, 3, &payer)),
             Err(FsError::NoEntry)
         ));
         // Staged, then dropped at the end of the statement.
         assert_eq!(
-            block_on(fs.prepare_write(path("f"), WritePosition::At(0), 4, 3))
+            block_on(fs.prepare_write(path("f"), WritePosition::At(0), 4, 3, &payer))
                 .expect("stages")
                 .staged_len(),
             4
@@ -1626,7 +2022,8 @@ mod tests {
     #[test]
     fn creates_writes_and_reads_back_positionally() {
         let fs = tree();
-        block_on(fs.open(path("f"), OpenFlags::CREATE, 5)).expect("creates");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.open(path("f"), OpenFlags::CREATE, 5, &payer)).expect("creates");
         assert_eq!(
             block_on(write_bytes(&fs, path("f"), WritePosition::At(2), b"cd", 6)),
             Ok(2),
@@ -1634,8 +2031,8 @@ mod tests {
         );
         // The filesystem stages the whole write in one round and hands its
         // own storage to the filler.
-        let staged =
-            block_on(fs.prepare_write(path("f"), WritePosition::End, 2, 7)).expect("stages");
+        let staged = block_on(fs.prepare_write(path("f"), WritePosition::End, 2, 7, &payer))
+            .expect("stages");
         assert_eq!(staged.staged_len(), 2);
         assert!(matches!(
             block_on(
@@ -1652,14 +2049,15 @@ mod tests {
         assert_eq!(read.as_ref(), b"\0\0cdef");
         let stat = block_on(fs.stat(path("f"))).expect("stats");
         assert_eq!((stat.size, stat.modified_nanos), (6, 7));
-        block_on(fs.open(path("f"), OpenFlags::TRUNCATE, 8)).expect("truncates");
+        block_on(fs.open(path("f"), OpenFlags::TRUNCATE, 8, &payer)).expect("truncates");
         assert_eq!(block_on(fs.stat(path("f"))).expect("stats").size, 0);
     }
 
     #[test]
     fn a_filled_write_outlives_its_source() {
         let fs = tree();
-        block_on(fs.open(path("f"), OpenFlags::CREATE, 0)).expect("creates");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.open(path("f"), OpenFlags::CREATE, 0, &payer)).expect("creates");
         let source = "文件・ファイル・파일".as_bytes().to_vec();
         let staged = {
             let preparing_fs = fs.clone();
@@ -1669,6 +2067,7 @@ mod tests {
                 WritePosition::At(0),
                 source.len(),
                 1,
+                &payer,
             ))
             .expect("stages")
         };
@@ -1688,8 +2087,9 @@ mod tests {
     #[test]
     fn a_hard_link_shares_the_inode_until_the_last_name_goes() {
         let fs = tree();
-        block_on(fs.open(path("a"), OpenFlags::CREATE, 0)).expect("creates");
-        block_on(fs.link(path("a"), path("b"), 1)).expect("links");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.open(path("a"), OpenFlags::CREATE, 0, &payer)).expect("creates");
+        block_on(fs.link(path("a"), path("b"), 1, &payer)).expect("links");
         block_on(write_bytes(
             &fs,
             path("b"),
@@ -1709,31 +2109,45 @@ mod tests {
             (a.link_count, a.id),
             (2, block_on(fs.stat(path("b"))).expect("stats").id)
         );
-        block_on(fs.unlink(path("a"), 7_000_000_000)).expect("unlinks");
+        block_on(fs.unlink(path("a"), 7_000_000_000, &payer)).expect("unlinks");
         assert_eq!(block_on(fs.stat(path("b"))).expect("stats").link_count, 1);
     }
 
     #[test]
     fn rename_noreplace_refuses_any_destination_and_exchange_needs_both() {
         let fs = tree();
-        block_on(fs.create_directory(path("d"), 0)).expect("creates");
-        block_on(fs.open(path("f"), OpenFlags::CREATE, 0)).expect("creates");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.create_directory(path("d"), 0, &payer)).expect("creates");
+        block_on(fs.open(path("f"), OpenFlags::CREATE, 0, &payer)).expect("creates");
         for (source, destination) in [("d", "f"), ("f", "d"), ("f", "f")] {
             assert_eq!(
-                block_on(fs.rename(path(source), path(destination), RenameMode::NoReplace, 1)),
+                block_on(fs.rename(
+                    path(source),
+                    path(destination),
+                    RenameMode::NoReplace,
+                    1,
+                    &payer,
+                )),
                 Err(FsError::Exists),
                 "{source} over {destination}"
             );
         }
         assert_eq!(
-            block_on(fs.rename(path("none"), path("f"), RenameMode::NoReplace, 1)),
+            block_on(fs.rename(path("none"), path("f"), RenameMode::NoReplace, 1, &payer)),
             Err(FsError::NoEntry)
         );
-        block_on(fs.rename(path("f"), path("g"), RenameMode::NoReplace, 1)).expect("renames");
+        block_on(fs.rename(path("f"), path("g"), RenameMode::NoReplace, 1, &payer))
+            .expect("renames");
         assert_eq!(names(&fs, ""), ["d", "g"]);
         for (source, destination) in [("g", "none"), ("none", "g"), ("none", "never")] {
             assert_eq!(
-                block_on(fs.rename(path(source), path(destination), RenameMode::Exchange, 1)),
+                block_on(fs.rename(
+                    path(source),
+                    path(destination),
+                    RenameMode::Exchange,
+                    1,
+                    &payer,
+                )),
                 Err(FsError::NoEntry),
                 "{source} with {destination}"
             );
@@ -1743,37 +2157,46 @@ mod tests {
     #[test]
     fn rename_exchange_swaps_subtrees_and_refuses_an_ancestor() {
         let fs = tree();
-        block_on(fs.create_directory(path("a"), 0)).expect("creates");
-        block_on(fs.open(path("a/inner"), OpenFlags::CREATE, 0)).expect("creates");
-        block_on(fs.create_directory(path("b"), 0)).expect("creates");
-        block_on(fs.create_directory(path("b/deeper"), 0)).expect("creates");
-        block_on(fs.open(path("b/deeper/leaf"), OpenFlags::CREATE, 0)).expect("creates");
-        block_on(fs.open(path("file"), OpenFlags::CREATE, 0)).expect("creates");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.create_directory(path("a"), 0, &payer)).expect("creates");
+        block_on(fs.open(path("a/inner"), OpenFlags::CREATE, 0, &payer)).expect("creates");
+        block_on(fs.create_directory(path("b"), 0, &payer)).expect("creates");
+        block_on(fs.create_directory(path("b/deeper"), 0, &payer)).expect("creates");
+        block_on(fs.open(path("b/deeper/leaf"), OpenFlags::CREATE, 0, &payer)).expect("creates");
+        block_on(fs.open(path("file"), OpenFlags::CREATE, 0, &payer)).expect("creates");
         let identity = |name: &str| block_on(fs.stat(path(name))).expect("stats").id;
         let (a, b, file) = (identity("a"), identity("b"), identity("file"));
         assert_eq!(
-            block_on(fs.rename(path("a"), path("a/inner"), RenameMode::Exchange, 1)),
+            block_on(fs.rename(path("a"), path("a/inner"), RenameMode::Exchange, 1, &payer)),
             Err(FsError::Invalid)
         );
         assert_eq!(
-            block_on(fs.rename(path("b/deeper"), path("b"), RenameMode::Exchange, 1)),
+            block_on(fs.rename(path("b/deeper"), path("b"), RenameMode::Exchange, 1, &payer)),
             Err(FsError::Invalid)
         );
-        block_on(fs.rename(path("a"), path("b"), RenameMode::Exchange, 2)).expect("exchanges");
+        block_on(fs.rename(path("a"), path("b"), RenameMode::Exchange, 2, &payer))
+            .expect("exchanges");
         assert_eq!((identity("a"), identity("b")), (b, a));
         assert_eq!(names(&fs, "a"), ["deeper"]);
         assert_eq!(names(&fs, "a/deeper"), ["leaf"]);
         assert_eq!(names(&fs, "b"), ["inner"]);
         // A file against a directory, and an object against itself.
-        block_on(fs.rename(path("file"), path("a/deeper"), RenameMode::Exchange, 3))
-            .expect("exchanges");
+        block_on(fs.rename(
+            path("file"),
+            path("a/deeper"),
+            RenameMode::Exchange,
+            3,
+            &payer,
+        ))
+        .expect("exchanges");
         assert_eq!(names(&fs, "file"), ["leaf"]);
         assert_eq!(
             block_on(fs.stat(path("a/deeper"))).expect("stats").kind,
             NodeKind::File
         );
         assert_eq!(identity("a/deeper"), file);
-        block_on(fs.rename(path("b"), path("b"), RenameMode::Exchange, 4)).expect("a no-op");
+        block_on(fs.rename(path("b"), path("b"), RenameMode::Exchange, 4, &payer))
+            .expect("a no-op");
         assert_eq!(names(&fs, "b"), ["inner"]);
         assert_eq!(names(&fs, ""), ["a", "b", "file"]);
     }
@@ -1781,31 +2204,34 @@ mod tests {
     #[test]
     fn rename_replace_overwrites_existing_file_and_empty_directory() {
         let fs = tree();
-        block_on(fs.open(path("a"), OpenFlags::CREATE, 0)).expect("creates a");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.open(path("a"), OpenFlags::CREATE, 0, &payer)).expect("creates a");
         block_on(write_bytes(&fs, path("a"), WritePosition::At(0), b"new", 1)).expect("writes a");
-        block_on(fs.open(path("b"), OpenFlags::CREATE, 0)).expect("creates b");
+        block_on(fs.open(path("b"), OpenFlags::CREATE, 0, &payer)).expect("creates b");
         block_on(write_bytes(&fs, path("b"), WritePosition::At(0), b"old", 1)).expect("writes b");
-        block_on(fs.create_directory(path("d1"), 0)).expect("creates d1");
-        block_on(fs.create_directory(path("d2"), 0)).expect("creates d2");
-        block_on(fs.open(path("d2/child"), OpenFlags::CREATE, 0)).expect("creates d2/child");
-        block_on(fs.create_directory(path("empty"), 0)).expect("creates empty");
+        block_on(fs.create_directory(path("d1"), 0, &payer)).expect("creates d1");
+        block_on(fs.create_directory(path("d2"), 0, &payer)).expect("creates d2");
+        block_on(fs.open(path("d2/child"), OpenFlags::CREATE, 0, &payer))
+            .expect("creates d2/child");
+        block_on(fs.create_directory(path("empty"), 0, &payer)).expect("creates empty");
 
         // File over dir -> IsDirectory; dir over file -> NotDirectory; dir over non-empty -> NotEmpty.
         assert_eq!(
-            block_on(fs.rename(path("a"), path("d1"), RenameMode::Replace, 2)),
+            block_on(fs.rename(path("a"), path("d1"), RenameMode::Replace, 2, &payer)),
             Err(FsError::IsDirectory)
         );
         assert_eq!(
-            block_on(fs.rename(path("d1"), path("a"), RenameMode::Replace, 2)),
+            block_on(fs.rename(path("d1"), path("a"), RenameMode::Replace, 2, &payer)),
             Err(FsError::NotDirectory)
         );
         assert_eq!(
-            block_on(fs.rename(path("d1"), path("d2"), RenameMode::Replace, 2)),
+            block_on(fs.rename(path("d1"), path("d2"), RenameMode::Replace, 2, &payer)),
             Err(FsError::NotEmpty)
         );
 
         // File replaces existing file atomically.
-        block_on(fs.rename(path("a"), path("b"), RenameMode::Replace, 3)).expect("replaces file");
+        block_on(fs.rename(path("a"), path("b"), RenameMode::Replace, 3, &payer))
+            .expect("replaces file");
         assert_eq!(block_on(fs.stat(path("a"))), Err(FsError::NoEntry));
         assert_eq!(
             block_on(fs.read_at(path("b"), 0, 16))
@@ -1815,7 +2241,7 @@ mod tests {
         );
 
         // Directory replaces existing empty directory.
-        block_on(fs.rename(path("d2"), path("empty"), RenameMode::Replace, 4))
+        block_on(fs.rename(path("d2"), path("empty"), RenameMode::Replace, 4, &payer))
             .expect("replaces empty dir");
         assert_eq!(block_on(fs.stat(path("d2"))), Err(FsError::NoEntry));
         assert_eq!(names(&fs, "empty"), ["child"]);
@@ -1824,20 +2250,21 @@ mod tests {
     #[test]
     fn rename_moves_a_subtree_and_refuses_moving_into_itself() {
         let fs = tree();
-        block_on(fs.create_directory(path("d"), 0)).expect("creates");
-        block_on(fs.open(path("d/f"), OpenFlags::CREATE, 0)).expect("creates");
-        block_on(fs.create_directory(path("dx"), 0)).expect("creates a prefix sibling");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.create_directory(path("d"), 0, &payer)).expect("creates");
+        block_on(fs.open(path("d/f"), OpenFlags::CREATE, 0, &payer)).expect("creates");
+        block_on(fs.create_directory(path("dx"), 0, &payer)).expect("creates a prefix sibling");
         // Sorts between `d` and `d/f`.
-        block_on(fs.open(path("d.x"), OpenFlags::CREATE, 0)).expect("creates");
+        block_on(fs.open(path("d.x"), OpenFlags::CREATE, 0, &payer)).expect("creates");
         assert_eq!(
-            block_on(fs.rename(path("d"), path("d/inner"), RenameMode::Replace, 1)),
+            block_on(fs.rename(path("d"), path("d/inner"), RenameMode::Replace, 1, &payer)),
             Err(FsError::NotPermitted)
         );
-        block_on(fs.rename(path("d"), path("e"), RenameMode::Replace, 1)).expect("renames");
+        block_on(fs.rename(path("d"), path("e"), RenameMode::Replace, 1, &payer)).expect("renames");
         assert_eq!(names(&fs, ""), ["d.x", "dx", "e"]);
         assert_eq!(names(&fs, "e"), ["f"]);
         assert_eq!(
-            block_on(fs.remove_directory(path("e"), 7_000_000_000)),
+            block_on(fs.remove_directory(path("e"), 7_000_000_000, &payer)),
             Err(FsError::NotEmpty)
         );
     }
@@ -1845,10 +2272,11 @@ mod tests {
     #[test]
     fn listing_skips_grandchildren_and_resumes() {
         let fs = tree();
+        let payer = crate::StoragePayer::for_test();
         for directory in ["a", "a/b", "c"] {
-            block_on(fs.create_directory(path(directory), 0)).expect("creates");
+            block_on(fs.create_directory(path(directory), 0, &payer)).expect("creates");
         }
-        block_on(fs.symlink("a", path("l"), 0)).expect("links");
+        block_on(fs.symlink("a", path("l"), 0, &payer)).expect("links");
         assert_eq!(names(&fs, ""), ["a", "c", "l"]);
         let dir = block_on(fs.open_dir(FsPath::ROOT)).expect("opens");
         let first = block_on(dir.read(DirCookie::START, 1)).expect("lists");
@@ -1863,6 +2291,7 @@ mod tests {
         use crate::UnixAttributes;
 
         let fs = tree();
+        let payer = crate::StoragePayer::for_test();
         let directories = [
             ("中文目录", 0o2775, 1000, 100),
             ("日本語のディレクトリ", 0o1777, 0, 0),
@@ -1880,11 +2309,11 @@ mod tests {
             )
             .expect("creates directory");
             let file = alloc::format!("{name}/ファイル");
-            block_on(fs.open(path(&file), OpenFlags::CREATE, 20)).expect("creates file");
+            block_on(fs.open(path(&file), OpenFlags::CREATE, 20, &payer)).expect("creates file");
             let child = alloc::format!("{name}/하위");
-            block_on(fs.create_directory(path(&child), 20)).expect("creates subdirectory");
+            block_on(fs.create_directory(path(&child), 20, &payer)).expect("creates subdirectory");
             let link = alloc::format!("{name}/链接");
-            block_on(fs.symlink("ファイル", path(&link), 20)).expect("creates symlink");
+            block_on(fs.symlink("ファイル", path(&link), 20, &payer)).expect("creates symlink");
 
             assert_eq!(
                 fs.unix_metadata(path(&file)).expect("file").attributes,
@@ -1982,7 +2411,13 @@ mod tests {
             assert_eq!(meta.rdev, expected_rdev, "{name}");
             assert_eq!(meta.attributes, owner(0o6640), "{name}");
             assert_eq!(
-                block_on(fs.open(path(name), OpenFlags::empty(), 3)).map(drop),
+                block_on(fs.open(
+                    path(name),
+                    OpenFlags::empty(),
+                    3,
+                    &crate::StoragePayer::for_test(),
+                ))
+                .map(drop),
                 Err(open_err),
                 "{name}"
             );
@@ -2148,9 +2583,16 @@ mod tests {
             6,
         ))
         .expect("writes");
-        block_on(fs.link(path("suid"), path("suid-hard"), 7)).expect("links");
-        block_on(fs.rename(path("chr"), path("chr-moved"), RenameMode::Replace, 8))
-            .expect("renames device node");
+        let payer = crate::StoragePayer::for_test();
+        block_on(fs.link(path("suid"), path("suid-hard"), 7, &payer)).expect("links");
+        block_on(fs.rename(
+            path("chr"),
+            path("chr-moved"),
+            RenameMode::Replace,
+            8,
+            &payer,
+        ))
+        .expect("renames device node");
         assert_eq!(
             fs.unix_metadata(path("suid-hard")).unwrap().attributes,
             owner(0o4755)
@@ -2194,5 +2636,193 @@ mod tests {
                 gid: 200,
             }
         );
+    }
+
+    fn isolated_user_pool(frames: usize) -> &'static crate::memory::UserMemoryPool {
+        let bytes = frames * helios_hal::pmm::PhysFrame::SIZE;
+        let backing: &'static mut [u8] =
+            alloc::vec![0u8; bytes + helios_hal::pmm::PhysFrame::SIZE].leak();
+        let raw = backing.as_mut_ptr() as usize;
+        let aligned =
+            (raw + helios_hal::pmm::PhysFrame::SIZE - 1) & !(helios_hal::pmm::PhysFrame::SIZE - 1);
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(
+            crate::memory::UserMemoryPool::single_node(1, &[(aligned, aligned + bytes)]),
+        ))
+    }
+
+    #[test]
+    fn sparse_truncate_commits_no_frames_and_budget_bounds_writes() {
+        let page = helios_hal::pmm::PhysFrame::SIZE as u64;
+        // 64-frame pool, 4-frame machine budget across two trees sharing it.
+        let pool = isolated_user_pool(64);
+        let baseline = pool.stats().allocated_bytes as u64;
+        let budget = super::MemoryStorageBudget::with_limit(pool, 4 * page);
+        let first = MemoryFs::with_budget(DeviceId::new(10), budget.clone());
+        let second = MemoryFs::with_budget(DeviceId::new(11), budget.clone());
+
+        let registry = crate::InstanceRegistry::new();
+        let creator = registry.register("creator-中文-日本語-한국어", 0);
+        let writer = registry.register("writer", 0);
+        let creator_payer = creator.storage_payer();
+        let writer_payer = writer.storage_payer();
+
+        block_on(first.open(path("sparse"), OpenFlags::CREATE, 1, &creator_payer))
+            .expect("create sparse file");
+        // Extending far past both budget and pool commits zero frames.
+        let huge = 16 * 1024 * 1024_u64;
+        block_on(first.set_size(path("sparse"), huge, 2, &creator_payer))
+            .expect("sparse set_size succeeds");
+        assert_eq!(block_on(first.stat(path("sparse"))).unwrap().size, huge);
+        assert_eq!(budget.used_bytes(), 0);
+        assert_eq!(creator.storage_bytes(), 0);
+        assert_eq!(creator.memory_bytes(), 0);
+        assert_eq!(pool.stats().allocated_bytes as u64, baseline);
+        assert_eq!(
+            block_on(first.read_at(path("sparse"), huge - 16, 16)).unwrap(),
+            &[0u8; 16][..]
+        );
+
+        // Writing 2 data pages (plus 1 index node = 3 frames) fits inside the
+        // 4-frame budget; another instance writing into creator's file charges
+        // creator's StorageShare and never counts against creator.memory_bytes().
+        let two_pages = alloc::vec![0x5a_u8; 2 * page as usize];
+        block_on(helios_hal::fs::write_with(
+            &first,
+            path("sparse"),
+            WritePosition::At(0),
+            two_pages.len(),
+            3,
+            &writer_payer,
+            |offset, dst| dst.copy_from_slice(&two_pages[offset..offset + dst.len()]),
+        ))
+        .expect("write within budget succeeds");
+        assert_eq!(budget.used_bytes(), 3 * page);
+        assert_eq!(creator.storage_bytes(), 3 * page);
+        assert_eq!(writer.storage_bytes(), 0);
+        assert_eq!(creator.memory_bytes(), 0);
+        assert_eq!(pool.stats().allocated_bytes as u64, baseline + 3 * page);
+
+        // Writing 2 more pages into a second tree sharing the same budget
+        // exceeds the 4-frame cap and returns FsError::NoSpace without
+        // leaking budget or frames.
+        block_on(second.open(path("other"), OpenFlags::CREATE, 4, &writer_payer))
+            .expect("create second file");
+        assert_eq!(
+            block_on(helios_hal::fs::write_with(
+                &second,
+                path("other"),
+                WritePosition::At(0),
+                two_pages.len(),
+                5,
+                &writer_payer,
+                |offset, dst| dst.copy_from_slice(&two_pages[offset..offset + dst.len()]),
+            )),
+            Err(FsError::NoSpace)
+        );
+        assert_eq!(budget.used_bytes(), 3 * page);
+        assert_eq!(writer.storage_bytes(), 0);
+        assert_eq!(pool.stats().allocated_bytes as u64, baseline + 3 * page);
+
+        // Hard-linking keeps frames charged until the last name is unlinked.
+        block_on(first.link(path("sparse"), path("alias"), 6, &creator_payer)).expect("hard link");
+        block_on(first.unlink(path("sparse"), 7, &creator_payer)).expect("unlink original");
+        assert_eq!(budget.used_bytes(), 3 * page);
+        assert_eq!(creator.storage_bytes(), 3 * page);
+
+        // Truncating down to 1 page releases both the dropped page and the
+        // collapsed index root back to the pool and budget.
+        block_on(first.set_size(path("alias"), page, 8, &creator_payer)).expect("truncate down");
+        assert_eq!(budget.used_bytes(), page);
+        assert_eq!(creator.storage_bytes(), page);
+        assert_eq!(pool.stats().allocated_bytes as u64, baseline + page);
+
+        // Unlinking the last name returns every remaining frame.
+        block_on(first.unlink(path("alias"), 9, &creator_payer)).expect("unlink last link");
+        assert_eq!(budget.used_bytes(), 0);
+        assert_eq!(creator.storage_bytes(), 0);
+        assert_eq!(pool.stats().allocated_bytes as u64, baseline);
+    }
+
+    #[test]
+    fn pool_exhaustion_returns_out_of_memory_and_live_setting_gates_writes() {
+        let page = helios_hal::pmm::PhysFrame::SIZE as u64;
+        // Drain a 64-frame pool down to 2 free frames, with live settings
+        // initially allowing 1 frame, then raised to 8 frames (above free
+        // pool capacity).
+        let pool = isolated_user_pool(64);
+        let free_frames = (pool.stats().total_bytes - pool.stats().allocated_bytes) / page as usize;
+        let _drain = crate::memory::FrameReservation::take(pool, (free_frames - 2) as u64)
+            .expect("drain leaves 2 free frames");
+        let drained_allocated = pool.stats().allocated_bytes as u64;
+
+        let settings =
+            triomphe::Arc::new(crossbeam_utils::CachePadded::new(crate::Settings::default()));
+        let mut authority = crate::ProcessAuthority::empty();
+        authority.grant_settings_rights(crate::SettingsAuthorityRights::WRITE);
+        let proof = authority.derive_write_settings_cap().expect("write cap");
+        settings.set::<super::MemoryStorageSetting>(&proof, page);
+
+        let budget = super::MemoryStorageBudget::new(pool, settings.clone());
+        let fs = MemoryFs::with_budget(DeviceId::new(12), budget.clone());
+        let registry = crate::InstanceRegistry::new();
+        let owner = registry.register("live-setting", 0);
+        let payer = owner.storage_payer();
+
+        block_on(fs.open(path("data"), OpenFlags::CREATE, 1, &payer)).expect("create");
+        let two_pages = alloc::vec![0xaa_u8; 2 * page as usize];
+        // Refused by the 1-frame setting cap -> NoSpace.
+        assert_eq!(
+            block_on(helios_hal::fs::write_with(
+                &fs,
+                path("data"),
+                WritePosition::At(0),
+                two_pages.len(),
+                2,
+                &payer,
+                |offset, dst| dst.copy_from_slice(&two_pages[offset..offset + dst.len()]),
+            )),
+            Err(FsError::NoSpace)
+        );
+        assert_eq!(budget.used_bytes(), 0);
+
+        // Raising fs.memory-storage above the 2 free frames means a 2-page
+        // write (which needs 3 frames: 2 data + 1 index) passes the setting
+        // check and hits user-pool exhaustion -> OutOfMemory, leaving budget
+        // and pool untouched.
+        settings.set::<super::MemoryStorageSetting>(&proof, 8 * page);
+        assert_eq!(
+            block_on(helios_hal::fs::write_with(
+                &fs,
+                path("data"),
+                WritePosition::At(0),
+                two_pages.len(),
+                3,
+                &payer,
+                |offset, dst| dst.copy_from_slice(&two_pages[offset..offset + dst.len()]),
+            )),
+            Err(FsError::OutOfMemory)
+        );
+        assert_eq!(budget.used_bytes(), 0);
+        assert_eq!(owner.storage_bytes(), 0);
+        assert_eq!(pool.stats().allocated_bytes as u64, drained_allocated);
+
+        // A 1-page write fits in the 2 free frames and drops cleanly with the tree.
+        let one_page = alloc::vec![0xbb_u8; page as usize];
+        block_on(helios_hal::fs::write_with(
+            &fs,
+            path("data"),
+            WritePosition::At(0),
+            one_page.len(),
+            4,
+            &payer,
+            |offset, dst| dst.copy_from_slice(&one_page[offset..offset + dst.len()]),
+        ))
+        .expect("1-page write succeeds");
+        assert_eq!(budget.used_bytes(), page);
+        assert_eq!(owner.storage_bytes(), page);
+        drop(fs);
+        assert_eq!(budget.used_bytes(), 0);
+        assert_eq!(owner.storage_bytes(), 0);
+        assert_eq!(pool.stats().allocated_bytes as u64, drained_allocated);
     }
 }

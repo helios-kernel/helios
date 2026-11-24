@@ -722,6 +722,7 @@ fn proc_exec_with_unreadable_environment_fails_with_efault_and_caller_keeps_runn
             mount: None,
             open: None,
         };
+        let payer = crate::StoragePayer::for_test();
         let created = wasi_fs::open_at(
             &ns,
             root_dir.grant().expect("root directory grant"),
@@ -730,6 +731,7 @@ fn proc_exec_with_unreadable_environment_fails_with_efault_and_caller_keeps_runn
             fs_types::OpenFlags::CREATE,
             FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
             1,
+            &payer,
         )
         .await
         .expect("creates /prog.wasm");
@@ -739,6 +741,7 @@ fn proc_exec_with_unreadable_environment_fails_with_efault_and_caller_keeps_runn
             helios_hal::fs::WritePosition::At(0),
             b"\0asm\x01\0\0\0",
             1,
+            &payer,
         )
         .await
         .expect("writes /prog.wasm");
@@ -1634,7 +1637,8 @@ mod linux_tests {
     async fn create_container_file(fs: &crate::vfs::MemoryFs, path: &str, data: &[u8]) {
         use helios_hal::fs::{FileSystem, FsPath, OpenFlags, WritePosition};
         let path = FsPath::new(path).unwrap();
-        let _ = fs.open(path, OpenFlags::CREATE, 0).await.unwrap();
+        let payer = crate::StoragePayer::for_test();
+        let _ = fs.open(path, OpenFlags::CREATE, 0, &payer).await.unwrap();
         crate::vfs::write_bytes(fs, path, WritePosition::At(0), data, 0)
             .await
             .unwrap();
@@ -2436,9 +2440,10 @@ mod linux_tests {
             use helios_hal::fs::{FileSystem, FsPath};
             let ns = store.data().filesystem().clone();
             let root = ns.resolve("/").expect("root resolves");
+            let payer = crate::StoragePayer::for_test();
             block_on(
                 root.fs()
-                    .create_directory(FsPath::new("priv-root").unwrap(), 0),
+                    .create_directory(FsPath::new("priv-root").unwrap(), 0, &payer),
             )
             .expect("mkdir /priv-root");
             let priv_fs = crate::vfs::MemoryFs::new(ns.table().allocate_device());
@@ -3181,6 +3186,7 @@ mod linux_tests {
                             gid,
                             umask: 0,
                         };
+                        let payer = crate::StoragePayer::for_test();
                         btrfs
                             .open_unix(
                                 FsPath::new(&p).unwrap(),
@@ -3196,6 +3202,7 @@ mod linux_tests {
                             WritePosition::At(0),
                             data.len(),
                             now,
+                            &payer,
                             |offset, dst| dst.copy_from_slice(&data[offset..offset + dst.len()]),
                         )
                         .await
@@ -3243,6 +3250,7 @@ mod linux_tests {
 
                 // Populate a setuid binary on a shared (NO_SUID) MemoryFs mount.
                 let shared_mem = MemoryFs::new(DeviceId::new(221));
+                let payer = crate::StoragePayer::for_test();
                 shared_mem
                     .open_unix(
                         FsPath::new("suid_bin").unwrap(),
@@ -3254,6 +3262,7 @@ mod linux_tests {
                             umask: 0,
                         },
                         now,
+                        &payer,
                     )
                     .expect("create shared suid_bin");
                 write_with(
@@ -3262,6 +3271,7 @@ mod linux_tests {
                     WritePosition::At(0),
                     elf_bytes.len(),
                     now,
+                    &payer,
                     |offset, dst| dst.copy_from_slice(&elf_bytes[offset..offset + dst.len()]),
                 )
                 .await

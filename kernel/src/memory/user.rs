@@ -977,15 +977,9 @@ pub(crate) fn installed_user_memory_pool() -> Option<&'static UserMemoryPool> {
 }
 
 /// The memory step of a processor going offline: every frame it holds
-/// for itself — its page-fault reserve and its frame-slab lists — goes
-/// back to the buddy of the node the frame lies on. Run on the departing
-/// processor.
-///
-/// The reserve is released first and in this processor's name, so its
-/// frames land on this processor's lists for their nodes, which the
-/// drain after it then empties.
+/// for itself in its frame-slab lists goes back to the buddy of the node
+/// the frame lies on. Run on the departing processor.
 pub(crate) fn release_processor_frames(processor: ProcessorId) {
-    super::frame_reserve::release(processor);
     if let Some(pool) = installed_user_memory_pool() {
         pool.release_processor_frames(processor);
     }

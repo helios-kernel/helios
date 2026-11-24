@@ -1,6 +1,7 @@
 use alloc::alloc::{alloc, alloc_zeroed, dealloc};
 use core::alloc::Layout;
 use core::future::Future;
+use core::marker::PhantomData;
 use core::ptr::NonNull;
 
 use futures_lite::future::yield_now;
@@ -9,6 +10,7 @@ use helios_hal::io::{IoError, IoResult};
 use helios_hal::iommu::{DmaAccess, DmaTranslation, PhysicalRange};
 use helios_hal::mmio;
 use helios_hal::pmm::PhysFrame;
+use helios_hal::tagging::{AllocationTags, NoAllocationTags, Tag, TagSet, TaggedView};
 
 pub trait DeviceBus: Send + Sync + 'static {
     type DmaPool: DmaMemory;
@@ -48,31 +50,84 @@ pub struct IdentityDmaBuffer {
     layout: Layout,
 }
 
-#[derive(Clone, Copy)]
-pub struct OffsetDmaPool {
-    virtual_to_physical_offset: usize,
+/// A pool over the kernel's direct map. On a processor that checks memory
+/// tags (`A::checking()`), each allocation is reached through the tagged
+/// view, carries a tag of its own and is bordered by two redzones, so a
+/// linear overrun in either direction lands on a granule no live tag
+/// matches. Otherwise the allocation is exactly the layout asked for.
+///
+/// Concurrency contract: the pool is an immutable value, built once while
+/// the device is brought up, and every operation is lock-free. Allocation
+/// and release run at queue bring-up and teardown, each owning the
+/// granules it tags; the submission path only translates addresses.
+pub struct OffsetDmaPool<A = NoAllocationTags> {
+    view: TaggedView,
+    tags: PhantomData<fn() -> A>,
 }
 
-pub struct OffsetDmaBuffer {
+/// One ring from an [`OffsetDmaPool`]: the object, reached through the
+/// tagged view, inside an allocation that also holds its redzones.
+pub struct OffsetDmaBuffer<A: AllocationTags = NoAllocationTags> {
+    /// The tagged-view pointer carrying the object's tag.
     ptr: NonNull<u8>,
-    layout: Layout,
+    /// The object's range in the tagged view, without its logical tag.
+    object: NonNull<[u8]>,
+    /// The allocation that holds the object and its redzones, in the
+    /// direct map, and the layout it was allocated with.
+    allocation: NonNull<u8>,
+    allocation_layout: Layout,
+    /// Bytes of each redzone, zero when the pool allocated none.
+    redzone: usize,
     physical_address: u64,
+    tags: PhantomData<fn() -> A>,
 }
 
-impl OffsetDmaPool {
+impl<A> Clone for OffsetDmaPool<A> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<A> Copy for OffsetDmaPool<A> {}
+
+impl OffsetDmaPool<NoAllocationTags> {
+    /// A pool over a direct map at `virtual_to_physical_offset`, on
+    /// hardware that stores no allocation tags.
     pub const fn new(virtual_to_physical_offset: usize) -> Self {
         Self {
-            virtual_to_physical_offset,
+            view: TaggedView::direct_map(virtual_to_physical_offset),
+            tags: PhantomData,
+        }
+    }
+}
+
+impl<A: AllocationTags> OffsetDmaPool<A> {
+    /// A pool whose rings are reached through `view`.
+    ///
+    /// # Safety
+    ///
+    /// When `A::checking()` is true, `view` is tag-capable for every
+    /// physical address the heap hands out, with `line_bytes` and
+    /// `A::GRANULE_BYTES` powers of two, so that the ranges the pool gives
+    /// `A::assign` and `A::store` meet the contract of those functions.
+    pub const unsafe fn tagged(view: TaggedView) -> Self {
+        Self {
+            view,
+            tags: PhantomData,
         }
     }
 
     fn translate(self, ptr: *const u8) -> IoResult<u64> {
-        let virtual_address = ptr as usize;
-        let physical_address = virtual_address
-            .checked_sub(self.virtual_to_physical_offset)
-            .ok_or(IoError::OutOfBounds)?;
-        Ok(physical_address as u64)
+        self.view
+            .physical(A::strip(ptr as usize))
+            .ok_or(IoError::OutOfBounds)
     }
+}
+
+/// The range of `len` bytes at `addr`.
+fn range_at(addr: usize, len: usize) -> NonNull<[u8]> {
+    let start = NonNull::new(addr as *mut u8).expect("a mapped range does not start at null");
+    NonNull::slice_from_raw_parts(start, len)
 }
 
 #[derive(Clone)]
@@ -225,39 +280,89 @@ impl DmaMemory for IdentityDmaPool {
     }
 }
 
-impl OffsetDmaPool {
-    fn carve(&self, layout: Layout, zeroed: bool) -> Result<OffsetDmaBuffer, DmaError> {
+impl<A: AllocationTags> OffsetDmaPool<A> {
+    /// With checking on, the allocation is `[redzone][object][redzone]`.
+    /// The unit is the larger of a tag granule and the view's line, so
+    /// neither a granule nor a cache-writeback line is shared with a heap
+    /// neighbour reached through the direct map; the object is `layout`
+    /// aligned and padded to it, and each redzone is one unit.
+    fn carve(&self, layout: Layout, zeroed: bool) -> Result<OffsetDmaBuffer<A>, DmaError> {
+        let (object_layout, redzone) = if A::checking() {
+            let unit = A::GRANULE_BYTES.max(self.view.line_bytes());
+            let object = layout
+                .align_to(unit)
+                .map_err(|_| DmaError::Exhausted {
+                    bytes: layout.size(),
+                })?
+                .pad_to_align();
+            (object, unit)
+        } else {
+            (layout, 0)
+        };
+        let allocation_size =
+            object_layout
+                .size()
+                .checked_add(2 * redzone)
+                .ok_or(DmaError::Exhausted {
+                    bytes: layout.size(),
+                })?;
+        let allocation_layout = Layout::from_size_align(allocation_size, object_layout.align())
+            .map_err(|_| DmaError::Exhausted {
+                bytes: allocation_size,
+            })?;
+
         // SAFETY: the callers pass non-zero-sized layouts, as the
         // allocator requires.
-        let ptr = unsafe {
+        let allocation = unsafe {
             if zeroed {
-                alloc_zeroed(layout)
+                alloc_zeroed(allocation_layout)
             } else {
-                alloc(layout)
+                alloc(allocation_layout)
             }
         };
-        let ptr = NonNull::new(ptr).ok_or(DmaError::Exhausted {
-            bytes: layout.size(),
+        let allocation = NonNull::new(allocation).ok_or(DmaError::Exhausted {
+            bytes: allocation_layout.size(),
         })?;
-        let physical_address = self.translate(ptr.as_ptr()).map_err(|_| {
-            // SAFETY: `ptr` was allocated above with `layout` and is not
-            // used again.
-            unsafe { dealloc(ptr.as_ptr(), layout) };
-            DmaError::Unreachable {
-                address: ptr.as_ptr() as usize,
-                bytes: layout.size(),
+        let direct_object = allocation.as_ptr() as usize + redzone;
+        let Some(physical_address) = self.view.physical(direct_object) else {
+            // SAFETY: allocated above with this layout and not yet shared.
+            unsafe { dealloc(allocation.as_ptr(), allocation_layout) };
+            return Err(DmaError::Unreachable {
+                address: direct_object,
+                bytes: object_layout.size(),
+            });
+        };
+
+        let view_object = self.view.tagged(direct_object);
+        let len = object_layout.size();
+        let tag = if redzone == 0 {
+            Tag::UNCHECKED
+        } else {
+            // SAFETY: the allocation is this call's alone, and the view
+            // maps it tag-capable (`tagged`'s contract). The redzones and
+            // the object are `unit`-aligned multiples of `unit`.
+            unsafe {
+                A::store(range_at(view_object - redzone, redzone), Tag::FREE);
+                A::store(range_at(view_object + len, redzone), Tag::FREE);
+                A::assign(range_at(view_object, len), TagSet::EMPTY)
             }
-        })?;
+        };
+        let ptr = NonNull::new(A::apply(view_object, tag) as *mut u8)
+            .expect("a tagged ring address is not null");
         Ok(OffsetDmaBuffer {
             ptr,
-            layout,
+            object: range_at(view_object, len),
+            allocation,
+            allocation_layout,
+            redzone,
             physical_address,
+            tags: PhantomData,
         })
     }
 }
 
-impl DmaMemory for OffsetDmaPool {
-    type Buffer = OffsetDmaBuffer;
+impl<A: AllocationTags> DmaMemory for OffsetDmaPool<A> {
+    type Buffer = OffsetDmaBuffer<A>;
     type ForeignMapping = DeviceAddress;
 
     fn allocate_resident(
@@ -519,7 +624,7 @@ impl DmaBuffer for IdentityDmaBuffer {
     }
 }
 
-impl DmaBuffer for OffsetDmaBuffer {
+impl<A: AllocationTags> DmaBuffer for OffsetDmaBuffer<A> {
     fn device_address(&self) -> DeviceAddress {
         DeviceAddress::new(self.physical_address)
     }
@@ -529,7 +634,7 @@ impl DmaBuffer for OffsetDmaBuffer {
     }
 
     fn len(&self) -> usize {
-        self.layout.size()
+        self.object.len()
     }
 }
 
@@ -549,19 +654,18 @@ impl AsMut<[u8]> for IdentityDmaBuffer {
     }
 }
 
-impl AsRef<[u8]> for OffsetDmaBuffer {
+impl<A: AllocationTags> AsRef<[u8]> for OffsetDmaBuffer<A> {
     fn as_ref(&self) -> &[u8] {
-        // SAFETY: the buffer owns `layout.size()` zero-initialised bytes
-        // for as long as it lives.
-        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.layout.size()) }
+        // SAFETY: the buffer owns `object.len()` bytes for as long as it lives.
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.object.len()) }
     }
 }
 
-impl AsMut<[u8]> for OffsetDmaBuffer {
+impl<A: AllocationTags> AsMut<[u8]> for OffsetDmaBuffer<A> {
     fn as_mut(&mut self) -> &mut [u8] {
         // SAFETY: as above, and `&mut self` is the only way to this memory
         // from the CPU.
-        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.object.len()) }
     }
 }
 
@@ -585,11 +689,19 @@ impl Drop for IdentityDmaBuffer {
     }
 }
 
-impl Drop for OffsetDmaBuffer {
+impl<A: AllocationTags> Drop for OffsetDmaBuffer<A> {
+    /// Returns the object to the free tag, so a stale ring pointer no longer
+    /// matches, then frees the whole allocation through its direct-map
+    /// pointer: the allocator writes its own metadata through the pointer
+    /// it is given.
     fn drop(&mut self) {
-        unsafe {
-            dealloc(self.ptr.as_ptr(), self.layout);
+        if self.redzone != 0 {
+            // SAFETY: the object is this buffer's alone and was tagged
+            // through the same view at allocation.
+            unsafe { A::store(self.object, Tag::FREE) };
         }
+        // SAFETY: allocated in `carve` with this layout.
+        unsafe { dealloc(self.allocation.as_ptr(), self.allocation_layout) };
     }
 }
 
@@ -627,8 +739,8 @@ impl<P: DmaMemory> DeviceBus for MmioBus<P> {
 
 unsafe impl Send for IdentityDmaBuffer {}
 unsafe impl Sync for IdentityDmaBuffer {}
-unsafe impl Send for OffsetDmaBuffer {}
-unsafe impl Sync for OffsetDmaBuffer {}
+unsafe impl<A: AllocationTags> Send for OffsetDmaBuffer<A> {}
+unsafe impl<A: AllocationTags> Sync for OffsetDmaBuffer<A> {}
 
 unsafe impl<P: Send> Send for MmioBus<P> {}
 unsafe impl<P: Sync> Sync for MmioBus<P> {}
@@ -644,9 +756,195 @@ mod tests {
     use core::task::{Context, Poll, Waker};
 
     use helios_hal::dma::{DeviceAddress, DmaAddressing, DmaBuffer, DmaError, DmaMemory};
+    use helios_hal::io::IoError;
     use helios_hal::iommu::{DmaAccess, DmaTranslation, DmaWindow, IoVirtAddr};
+    use helios_hal::tagging::{AllocationTags, Tag, TagSet, TaggedView};
 
     use super::{IdentityDmaPool, OffsetDmaPool, PlatformDmaPool};
+    use crate::testing::{RecordingTags, TagOp};
+
+    /// A direct map whose heap pointers are well above its offset, and a
+    /// tagged view beyond every host heap address, so the two views never
+    /// translate the same canonical address. The test pools never
+    /// dereference a pointer in the tagged view.
+    const DIRECT_OFFSET: usize = 0x10_0000;
+    const TAGGED_OFFSET: usize = 1 << 47;
+    const SPAN: usize = 1 << 47;
+    const LINE: usize = 64;
+    /// The redzone unit: the larger of `RecordingTags`' granule and `LINE`.
+    const UNIT: usize = 64;
+
+    fn view() -> TaggedView {
+        TaggedView::new(DIRECT_OFFSET, TAGGED_OFFSET, SPAN, LINE)
+    }
+
+    fn tagged_pool<const CHECKING: bool>() -> OffsetDmaPool<RecordingTags<CHECKING>> {
+        // SAFETY: `RecordingTags` touches no memory.
+        unsafe { OffsetDmaPool::tagged(view()) }
+    }
+
+    /// A 6-byte, 2-aligned driver area: smaller and less aligned than a
+    /// granule or a line.
+    fn ring_layout() -> Layout {
+        Layout::from_size_align(6, 2).expect("layout")
+    }
+
+    fn object_address(buffer: &impl DmaBuffer) -> usize {
+        RecordingTags::<true>::strip(buffer.as_ptr() as usize)
+    }
+
+    #[test]
+    fn tagged_ring_is_padded_to_granule_and_line() {
+        let pool = tagged_pool::<true>();
+        let buffer = pool
+            .allocate(ring_layout(), DmaAccess::READ | DmaAccess::WRITE)
+            .expect("allocation");
+        let object = object_address(&buffer);
+
+        assert_eq!(buffer.len(), LINE);
+        assert_eq!(object % LINE, 0);
+        assert_eq!(
+            (buffer.device_address().get() as usize + DIRECT_OFFSET) % LINE,
+            0
+        );
+        assert!(RecordingTags::<true>::take().contains(&TagOp::Assign {
+            addr: object,
+            len: LINE,
+            avoid: TagSet::EMPTY,
+        }));
+    }
+
+    #[test]
+    fn tagged_ring_pointer_is_in_the_view_and_carries_its_tag() {
+        let pool = tagged_pool::<true>();
+        let buffer = pool
+            .allocate(ring_layout(), DmaAccess::READ | DmaAccess::WRITE)
+            .expect("allocation");
+        let pointer = buffer.as_ptr() as usize;
+
+        assert_eq!(
+            object_address(&buffer),
+            buffer.device_address().get() as usize + TAGGED_OFFSET
+        );
+        assert_eq!(pointer >> (usize::BITS - 8), 0x5);
+        assert_eq!(
+            Tag::new((pointer >> (usize::BITS - 8)) as u8),
+            RecordingTags::<true>::ASSIGNED
+        );
+    }
+
+    #[test]
+    fn ring_physical_address_comes_from_the_direct_map() {
+        let pool = tagged_pool::<true>();
+        let buffer = pool
+            .allocate(ring_layout(), DmaAccess::READ | DmaAccess::WRITE)
+            .expect("allocation");
+        let direct = buffer.device_address().get() as usize + DIRECT_OFFSET;
+
+        // The direct-map address of the object, and the redzone on each
+        // side of it, is the zeroed heap allocation itself.
+        // SAFETY: the pool allocated `UNIT + LINE + UNIT` bytes there.
+        let allocation = unsafe { core::slice::from_raw_parts((direct - UNIT) as *const u8, 192) };
+        assert!(allocation.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn dma_addr_strips_and_accepts_both_views() {
+        let pool = tagged_pool::<true>();
+        let buffer = pool
+            .allocate(ring_layout(), DmaAccess::READ | DmaAccess::WRITE)
+            .expect("allocation");
+        let physical = buffer.device_address().get();
+        let direct = (physical as usize + DIRECT_OFFSET) as *const u8;
+
+        assert_eq!(pool.translate(buffer.as_ptr()), Ok(physical));
+        assert_eq!(
+            pool.translate(buffer.as_ptr().wrapping_add(0x10)),
+            Ok(physical + 0x10)
+        );
+        assert_eq!(pool.translate(direct), Ok(physical));
+        assert_eq!(pool.translate(0x10 as *const u8), Err(IoError::OutOfBounds));
+    }
+
+    #[test]
+    fn a_dropped_ring_goes_back_to_the_free_tag() {
+        let pool = tagged_pool::<true>();
+        let buffer = pool
+            .allocate(ring_layout(), DmaAccess::READ | DmaAccess::WRITE)
+            .expect("allocation");
+        let object = object_address(&buffer);
+        RecordingTags::<true>::take();
+
+        drop(buffer);
+
+        assert_eq!(
+            RecordingTags::<true>::take(),
+            [TagOp::Store {
+                addr: object,
+                len: LINE,
+                tag: Tag::FREE,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_tagged_ring_is_bordered_by_free_tagged_redzones() {
+        let pool = tagged_pool::<true>();
+        let buffer = pool
+            .allocate(ring_layout(), DmaAccess::READ | DmaAccess::WRITE)
+            .expect("allocation");
+        let object = object_address(&buffer);
+        let free = |addr| TagOp::Store {
+            addr,
+            len: UNIT,
+            tag: Tag::FREE,
+        };
+
+        let ops = RecordingTags::<true>::take();
+        assert_eq!(ops.len(), 3, "two redzones and the object: {ops:?}");
+        assert!(ops.contains(&free(object - UNIT)), "{ops:?}");
+        assert!(ops.contains(&free(object + buffer.len())), "{ops:?}");
+        assert!(
+            ops.contains(&TagOp::Assign {
+                addr: object,
+                len: buffer.len(),
+                avoid: TagSet::EMPTY,
+            }),
+            "{ops:?}"
+        );
+    }
+
+    #[test]
+    fn an_unchecked_pool_allocates_no_redzones() {
+        let pool = tagged_pool::<false>();
+        let buffer = pool
+            .allocate(ring_layout(), DmaAccess::READ | DmaAccess::WRITE)
+            .expect("allocation");
+
+        assert_eq!(buffer.len(), ring_layout().size());
+        assert_eq!(buffer.as_ptr() as usize >> (usize::BITS - 8), 0xf);
+        assert_eq!(RecordingTags::<false>::take(), []);
+        drop(buffer);
+        assert_eq!(RecordingTags::<false>::take(), []);
+    }
+
+    #[test]
+    fn an_untagged_pool_keeps_the_layout_and_the_direct_pointer() {
+        let pool = OffsetDmaPool::new(0x10);
+        let buffer = pool
+            .allocate(ring_layout(), DmaAccess::READ | DmaAccess::WRITE)
+            .expect("allocation");
+
+        assert_eq!(buffer.len(), ring_layout().size());
+        assert_eq!(
+            buffer.device_address().get(),
+            buffer.as_ptr() as usize as u64 - 0x10
+        );
+        assert_eq!(
+            pool.device_range(buffer.as_ref()),
+            Ok(buffer.device_address())
+        );
+    }
 
     /// A platform with no translation unit hands the device physical
     /// addresses and must not ask it to negotiate anything.

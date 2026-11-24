@@ -734,6 +734,7 @@ pub(super) fn fs_errno(error: FsOpError) -> u64 {
             FsError::Busy => EBUSY,
             FsError::Unsupported => EOPNOTSUPP,
             FsError::IllegalByteSequence => EILSEQ,
+            FsError::OutOfMemory => ENOMEM,
             FsError::Io => EIO,
         },
     })

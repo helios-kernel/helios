@@ -36,6 +36,9 @@ pub(super) use btrfs::add_btrfs_to_linker;
 mod shared_memory_plugin;
 use shared_memory_plugin::*;
 mod compiler;
+pub(crate) use compiler::AotDestination;
+#[cfg(test)]
+pub(super) use compiler::map_aot_fs_error;
 use compiler::*;
 mod exec;
 use exec::*;
@@ -113,7 +116,7 @@ use helios_compiler_abi::{
     HELIOS_COMPILER_PTHREAD_SELF_OFFSET,
 };
 use helios_hal::fs::WritePosition;
-use helios_hal::measured_boot::{MeasuredBoot, Sha256Digest};
+use helios_hal::measured_boot::MeasuredBoot;
 use helios_hal::watchdog::Watchdog;
 use helios_unix::OpenFile;
 use helios_unix::{DescriptorLimit, GuestAddress};
@@ -148,25 +151,26 @@ type CompilerPluginHandle<CpuImpl, Net, StorageImpl> =
     Arc<CompilerPluginRuntime<CpuImpl, Net, StorageImpl>>;
 
 /// What one compile session takes from its requester: the compiler plugin's
-/// artifact, the input, and how to compile it.
-struct CompileJob {
+/// artifact, the input, how to compile it, and where its output lands.
+struct CompileJob<StorageImpl: crate::Storage> {
     compiler_payload: Bytes,
     wasm: Bytes,
     hint: AotCompileHint,
     profile: bool,
+    sink: CompileOutputSink<StorageImpl>,
 }
 
 /// How a compile's body ended, with the phase timestamps and live worker count.
 struct CompileEnd {
-    result: Result<(Vec<u8>, CompilerThreadReports), ProgramExecError>,
+    result: Result<(CompileOutput, CompilerThreadReports), ProgramExecError>,
     worker_threads: u32,
     phases: CompilerPhaseTimestamps,
 }
 
-/// What [`UserProgramService::aot`] produced.
-pub(crate) struct AotArtifact {
-    /// The signed `cwasm` artifact.
-    pub(crate) signed: Vec<u8>,
+/// What [`UserProgramService::aot_to_file`] produced.
+pub(crate) struct AotWritten {
+    /// Total signed artifact bytes written to the destination file.
+    pub(crate) bytes: usize,
     /// The live worker count the compiler plugin was told to compile with,
     /// reported so a caller comparing this compile with another can hold the
     /// count fixed.
@@ -187,7 +191,6 @@ struct CompilerPhaseTimestamps {
     response_done_ns: u64,
     tasks_joined_ns: u64,
     signed_ns: u64,
-    verified_ns: u64,
     plugin_cached: bool,
 }
 
@@ -363,14 +366,6 @@ where
 {
     pub(crate) fn spawner(&self) -> crate::Spawner<CpuImpl> {
         self.spawner.clone()
-    }
-
-    pub(crate) fn cpu(&self) -> CpuImpl {
-        self.cpu.clone()
-    }
-
-    pub(crate) fn write_serial(&self) -> crate::DebugSerialWriter {
-        self.write_serial
     }
 }
 
@@ -763,7 +758,7 @@ where
     let mut measured_boot = kernel.take_measured_boot();
     let cwasm_signing_key = crate::signing_key::settle_signing_key_at_bring_up(
         measured_boot.as_mut(),
-        &Sha256Digest(debug_state.payload_digest()),
+        debug_state.payload_body(),
         debug_state.root_entropy(),
     );
     // Selected by the backend when it built the runtime state, before any
@@ -1111,7 +1106,7 @@ where
     // As Linux syncs and unmounts before it powers off: what the writable
     // mounts hold reaches their devices before the machine goes down.
     kernel.run_local_future(async move { namespace.sync_writable_mounts().await });
-    report_fiber_stack_demand_commits(&cpu);
+    report_fiber_stack_commits(&cpu);
     cpu.shutdown()
 }
 
@@ -1231,6 +1226,7 @@ where
     if helios_hal::cpu::current_processor() == topology.bootstrap_processor {
         crate::control_flow::ReturnAddressCoverage::of(&cpu, env!("HELIOS_BUILD_TARGET"))
             .log(topology.configured_processors);
+        crate::memory_tagging::log(&cpu);
         launch_boot_init(
             &cpu,
             &kernel,
@@ -1277,11 +1273,11 @@ where
 /// Prints what the fiber-stack arena did over this boot, per processor.
 ///
 /// The arena's whole claim is that a live instance costs the stack it
-/// touched rather than the stack it might, and a demand commit is the
+/// touched rather than the stack it might, and a reserve commit is the
 /// event that makes that true. Counting them per processor is also what
-/// shows the fault path running on every processor rather than only on
+/// shows the reserve path running on every processor rather than only on
 /// the one that created the stack.
-fn report_fiber_stack_demand_commits<CpuImpl: Cpu>(cpu: &CpuImpl) {
+fn report_fiber_stack_commits<CpuImpl: Cpu>(cpu: &CpuImpl) {
     let Some(stats) = crate::fiber_stack_arena_stats() else {
         return;
     };
@@ -1293,8 +1289,8 @@ fn report_fiber_stack_demand_commits<CpuImpl: Cpu>(cpu: &CpuImpl) {
         tracing::info!(
             target: "helios_kernel::fiber_stack",
             processor = processor.id(),
-            demand_commits = crate::fiber_stack_demand_commits_on(processor),
-            "fiber stack demand commits resolved on this processor"
+            reserve_commits = crate::fiber_stack_reserve_commits_on(processor),
+            "fiber stack reserve commits resolved on this processor"
         );
     }
     tracing::info!(
@@ -1303,14 +1299,13 @@ fn report_fiber_stack_demand_commits<CpuImpl: Cpu>(cpu: &CpuImpl) {
         live_slots = stats.live_slots,
         warm_slots = stats.warm_slots,
         retained_bytes = stats.retained_bytes,
-        demand_commits = stats.demand_commits,
         committed_bytes = stats.committed_bytes,
         eager_bytes = stats.eager_bytes,
         released_stacks = stats.released_stacks,
         released_committed_bytes = stats.released_committed_bytes,
         released_eager_bytes = stats.released_eager_bytes,
-        reserve_bytes = crate::page_fault_frame_reserve_bytes(),
-        demand_committed_pages = stats.demand_committed_pages,
+        reserve_commits = stats.reserve_commits,
+        reserve_committed_pages = stats.reserve_committed_pages,
         "fiber stack arena totals for this boot"
     );
 }
@@ -2169,16 +2164,32 @@ where
         ))
     }
 
-    pub(crate) async fn aot(
+    pub(crate) async fn aot_to_file(
         &self,
         compile: &CompileAuthority,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
-    ) -> Result<AotArtifact, ProgramExecError> {
-        self.compile_raw_component_to_signed_artifact(compile, exec_context, wasm, hint, profile)
-            .await
+        destination: AotDestination<StorageImpl>,
+    ) -> Result<AotWritten, ProgramExecError> {
+        let (output, worker_threads) = self
+            .compile_raw_component(
+                compile,
+                exec_context,
+                wasm,
+                hint,
+                profile,
+                CompileOutputSink::WriteSignedFile(destination),
+            )
+            .await?;
+        match output {
+            CompileOutput::WrittenBytes(bytes) => Ok(AotWritten {
+                bytes,
+                worker_threads,
+            }),
+            CompileOutput::Payload(_) => unreachable!("WriteSignedFile returns WrittenBytes"),
+        }
     }
 
     async fn load_executable(
@@ -2229,17 +2240,22 @@ where
                 let _profile = artifact_profile::classify_raw_wasm(wasm)
                     .map_err(map_artifact_profile_error)?;
                 let hint = hint.unwrap_or(AotCompileHint::Performance);
-                let compiled = self
-                    .compile_raw_component_to_signed_artifact(
+                let (output, _) = self
+                    .compile_raw_component(
                         compile,
                         exec_context,
                         wasm,
                         hint,
                         false,
+                        CompileOutputSink::ReturnPayload,
                     )
                     .await?;
-                let signed = Bytes::from(compiled.signed);
-                trusted_signed_payload(&signed, &self.inner.cwasm_signing_key)?
+                match output {
+                    CompileOutput::Payload(payload) => Bytes::from(payload),
+                    CompileOutput::WrittenBytes(_) => {
+                        unreachable!("ReturnPayload returns Payload")
+                    }
+                }
             }
         };
         timeline.record(&self.inner.clock_cpu, LaunchPhase::ArtifactTrust);
@@ -2451,14 +2467,21 @@ where
         Ok(WasmtimeCompiledComponent { component })
     }
 
-    async fn compile_raw_component_to_signed_artifact(
+    async fn compile_raw_component(
         &self,
-        _: &CompileAuthority,
+        compile: &CompileAuthority,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
-    ) -> Result<AotArtifact, ProgramExecError> {
+        sink: CompileOutputSink<StorageImpl>,
+    ) -> Result<(CompileOutput, u32), ProgramExecError> {
+        let _ = compile;
+        let limit = exec_context
+            .runtime_state
+            .settings()
+            .get::<crate::CompilerMaxInputBytesSetting>();
+        check_compiler_input_limit(wasm.len() as u64, limit)?;
         let phases = CompilerPhaseTimestamps {
             processor: if profile {
                 helios_hal::cpu::current_processor().id()
@@ -2478,6 +2501,7 @@ where
             wasm: wasm.clone(),
             hint,
             profile,
+            sink,
         };
         // The compile runs in a task of its own, whichever route asked for
         // it, and this call holds only the receiving half of its reply: the
@@ -2504,13 +2528,13 @@ where
 
     /// The compile session task: waits for the session slot, runs the compile
     /// with core affinity until every worker is joined, condemns the compile
-    /// if its requester leaves, and replies with the signed artifact.
+    /// if its requester leaves, and replies with the output.
     async fn compile_session(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
-        job: CompileJob,
+        job: CompileJob<StorageImpl>,
         phases: CompilerPhaseTimestamps,
-        reply: futures::channel::oneshot::Sender<Result<AotArtifact, ProgramExecError>>,
+        reply: futures::channel::oneshot::Sender<Result<(CompileOutput, u32), ProgramExecError>>,
     ) {
         let profile = job.profile;
         run_shared_memory_session(
@@ -2546,51 +2570,37 @@ where
                     self.run_compile(exec_context, job, instance, phases),
                 )
             },
-            |end| self.sign_compiled(exec_context, profile, end),
+            |end| self.finish_compiled(exec_context, profile, end),
         )
         .await;
     }
 
-    /// Signs what a finished compile produced with this boot's key and
-    /// reports its phases.
-    fn sign_compiled(
+    /// Reports compile phases and hands back the compiled output.
+    fn finish_compiled(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         profile: bool,
         end: CompileEnd,
-    ) -> Result<AotArtifact, ProgramExecError> {
+    ) -> Result<(CompileOutput, u32), ProgramExecError> {
         let CompileEnd {
             result,
             worker_threads,
-            mut phases,
+            phases,
         } = end;
-        let (payload, thread_reports) = result?;
-        let signed = cwasm::sign_artifact_payload(&payload, &self.inner.cwasm_signing_key)
-            .map_err(map_artifact_trust_error)?;
-        phases.signed_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
-        } else {
-            0
-        };
-        cwasm::verify_signed_artifact(UntrustedCwasm::new(&signed), &self.inner.cwasm_signing_key)
-            .map_err(map_artifact_trust_error)?;
-        phases.verified_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
-        } else {
-            0
-        };
+        let (output, thread_reports) = result?;
         if profile {
+            let output_bytes = match &output {
+                CompileOutput::Payload(payload) => payload.len(),
+                CompileOutput::WrittenBytes(bytes) => *bytes,
+            };
             emit_compiler_phase_report(
                 exec_context.write_serial,
                 phases,
                 &thread_reports,
-                signed.len(),
+                output_bytes,
             );
         }
-        Ok(AotArtifact {
-            signed,
-            worker_threads,
-        })
+        Ok((output, worker_threads))
     }
 
     /// The compile proper, run with the compile slot held: the plugin's call,
@@ -2599,7 +2609,7 @@ where
     async fn run_compile(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
-        job: CompileJob,
+        job: CompileJob<StorageImpl>,
         instance: crate::RegisteredInstance,
         mut phases: CompilerPhaseTimestamps,
     ) -> CompileEnd {
@@ -2608,6 +2618,7 @@ where
             wasm,
             hint,
             profile,
+            sink,
         } = job;
         phases.slot_acquired_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
@@ -2630,6 +2641,7 @@ where
                     guest_isa: self.inner.guest_isa,
                     hint,
                     profile,
+                    sink,
                 },
                 affinity_plan,
                 &mut phases,
@@ -2699,10 +2711,10 @@ where
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         compiler_payload: &Bytes,
         compiler_instance: crate::RegisteredInstance,
-        request: CompileRequest,
+        request: CompileRequest<StorageImpl>,
         affinity_plan: CoreAffinityPlan,
         phases: &mut CompilerPhaseTimestamps,
-    ) -> Result<Vec<u8>, ProgramExecError> {
+    ) -> Result<CompileOutput, ProgramExecError> {
         let profile = request.profile;
         let (plugin, plugin_cached) = self
             .ensure_compiler_plugin(exec_context, compiler_payload, affinity_plan.worker_count())
@@ -2759,9 +2771,9 @@ where
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         plugin: &CompilerPluginHandle<CpuImpl, Net, StorageImpl>,
         context: CompilerCompileContext<CpuImpl, Net, StorageImpl>,
-        request: CompileRequest,
+        request: CompileRequest<StorageImpl>,
         phases: &mut CompilerPhaseTimestamps,
-    ) -> Result<Vec<u8>, ProgramExecError> {
+    ) -> Result<CompileOutput, ProgramExecError> {
         let profile = request.profile;
         let engine = self.inner.engine.raw();
         let store_data = CompilerCoreStore::new(context);
@@ -2817,15 +2829,16 @@ where
         let outstanding_before =
             compiler_outstanding_bytes(&drive, &mut store, &exports.outstanding).await?;
         let mut allocations = CompilerAllocations::new();
-        let outcome = Self::call_compiler(
-            &drive,
-            &mut store,
-            &exports,
-            &mut allocations,
-            request,
-            phases,
-        )
-        .await;
+        let outcome = self
+            .call_compiler(
+                &drive,
+                &mut store,
+                &exports,
+                &mut allocations,
+                request,
+                phases,
+            )
+            .await;
         // A call into the plugin that failed leaves its allocator in an
         // unknown state, so nothing is freed and the memory dies with the
         // runtime; every other end returns the call's allocations. A release
@@ -2847,11 +2860,12 @@ where
     /// `allocations` and releases them according to the returned
     /// [`CompilerCallOutcome`].
     async fn call_compiler(
+        &self,
         drive: &CompilerStoreDrive<CpuImpl>,
         store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
         exports: &CompilerExports,
         allocations: &mut CompilerAllocations,
-        request: CompileRequest,
+        request: CompileRequest<StorageImpl>,
         phases: &mut CompilerPhaseTimestamps,
     ) -> CompilerCallOutcome {
         let CompileRequest {
@@ -2859,10 +2873,23 @@ where
             guest_isa,
             hint,
             profile,
+            sink,
         } = request;
         let target = guest_isa.compile_target();
         let isa_level = target.level().name().as_bytes();
         let target = target.triple().as_bytes();
+        let wasm_len = match compiler_abi_u32(wasm.len()) {
+            Ok(len) => len,
+            Err(error) => return Ok(Err(error)),
+        };
+        let target_len = match compiler_abi_u32(target.len()) {
+            Ok(len) => len,
+            Err(error) => return Ok(Err(error)),
+        };
+        let isa_level_len = match compiler_abi_u32(isa_level.len()) {
+            Ok(len) => len,
+            Err(error) => return Ok(Err(error)),
+        };
         let wasm_ptr = allocations
             .alloc(drive, &mut *store, &exports.alloc, wasm.len(), 1)
             .await?;
@@ -2890,11 +2917,11 @@ where
                 AotCompileHint::Performance => CompilerAbiHint::Performance,
             }),
             wasm_ptr,
-            wasm_len: wasm.len() as u32,
+            wasm_len,
             target_ptr,
-            target_len: target.len() as u32,
+            target_len,
             isa_level_ptr,
-            isa_level_len: isa_level.len() as u32,
+            isa_level_len,
             flags: if profile {
                 helios_compiler_abi::HELIOS_COMPILER_REQUEST_PROFILE
             } else {
@@ -2945,10 +2972,16 @@ where
             0
         };
         let response_ptr = response_ptr.map_err(map_program_runtime_error)? as u32;
-        Ok(
-            accept_compiler_response(store.data(), allocations, response_ptr, profile, phases)
-                .await,
+        Ok(compiler::accept_compiler_response(
+            store.data(),
+            allocations,
+            response_ptr,
+            profile,
+            sink,
+            &self.inner.cwasm_signing_key,
+            phases,
         )
+        .await)
     }
 
     fn read_compiler_plugin_artifact(
@@ -3087,7 +3120,7 @@ fn emit_compiler_phase_report(
     output_bytes: usize,
 ) {
     write_serial.emit_fmt(format_args!(
-        "aot-phases processor={} plugin_cached={} slot_us={} plugin_us={} instantiate_us={} input_us={} compile_us={} diagnostic_us={} output_copy_us={} join_us={} sign_us={} verify_us={} output_bytes={}\n",
+        "aot-phases processor={} plugin_cached={} slot_us={} plugin_us={} instantiate_us={} input_us={} compile_us={} diagnostic_us={} output_copy_us={} join_us={} sign_us={} output_bytes={}\n",
         phases.processor,
         phases.plugin_cached,
         phase_us(phases.entered_ns, phases.slot_acquired_ns),
@@ -3099,7 +3132,6 @@ fn emit_compiler_phase_report(
         phase_us(phases.diagnostic_done_ns, phases.response_done_ns),
         phase_us(phases.response_done_ns, phases.tasks_joined_ns),
         phase_us(phases.tasks_joined_ns, phases.signed_ns),
-        phase_us(phases.signed_ns, phases.verified_ns),
         output_bytes,
     ));
     for report in thread_reports {
@@ -3418,6 +3450,53 @@ mod tests {
             validate_preview1_program_import("wasi_unstable", import)
                 .expect("wasi_unstable imports should validate as preview1");
         }
+    }
+
+    /// A stack-reserve commit the user pool refuses ends the guest's call
+    /// with the pool's refusal, and the program service classifies that as
+    /// running out of memory, whatever context the runtime wraps it in. The
+    /// adapter asks the OOM killer to cover the bytes the pool could not
+    /// give.
+    #[test]
+    fn a_refused_stack_reserve_ends_the_call_as_out_of_memory() {
+        use crate::wasmtime_adapter::store::answer_stack_reserve;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        let engine = crate::wasmtime_adapter::engine::build_component_engine_for_platform(
+            &crate::test_support::TestCpu::without_entropy(),
+        )
+        .expect("the component engine builds on the test platform");
+        let mut store = wasmtime::Store::new(&engine, ());
+        let condemned_for = Arc::new(AtomicUsize::new(0));
+        let seen = condemned_for.clone();
+        store.stack_reserve_callback(move |_context, _sp| {
+            let shortfall = crate::ProgramOutOfMemory {
+                requested_bytes: 4096,
+                available_bytes: 0,
+                pool_bytes: 1 << 20,
+                reserved_bytes: 0,
+            };
+            answer_stack_reserve(
+                Err(crate::StackReserveError::OutOfMemory(shortfall)),
+                |requested_bytes| seen.store(requested_bytes, Ordering::Relaxed),
+            )
+        });
+        let host = wasmtime::Func::wrap(&mut store, || {});
+
+        let error = futures_lite::future::block_on(host.call_async(&mut store, &[], &mut []))
+            .expect_err("the entry into wasm asks for the reserve, and the pool refuses it");
+
+        assert_eq!(
+            condemned_for.load(Ordering::Relaxed),
+            4096,
+            "the OOM killer was asked to cover the refused bytes"
+        );
+        let error = map_program_runtime_error(error);
+        assert_eq!(
+            error.kind,
+            ProgramExecErrorKind::OutOfMemory,
+            "a refused reserve is the same out-of-memory a refused grow is: {error:?}"
+        );
     }
 
     #[test]
@@ -4151,7 +4230,10 @@ mod tests {
         );
         parent.grant_diagnostic_rights(crate::DiagnosticAuthorityRights::OBSERVE_MACHINE);
         parent.grant_settings_rights(crate::SettingsAuthorityRights::WRITE);
-        parent.grant_machine_rights(crate::MachineAuthorityRights::CONTROL_PROCESSORS);
+        parent.grant_machine_rights(
+            crate::MachineAuthorityRights::CONTROL_PROCESSORS
+                | crate::MachineAuthorityRights::VIRTUALIZE,
+        );
 
         let child = wasix_proc_spawn_inherited_non_directory_authority(&parent);
 
@@ -4185,6 +4267,7 @@ mod tests {
         assert_eq!(
             child.machine_rights(),
             crate::MachineAuthorityRights::CONTROL_PROCESSORS
+                | crate::MachineAuthorityRights::VIRTUALIZE
         );
         assert!(parent.contains_authority(&child));
     }
