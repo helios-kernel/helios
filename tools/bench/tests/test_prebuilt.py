@@ -66,9 +66,9 @@ def host(tmp_path, monkeypatch) -> dict[str, Path]:
     target = tmp_path / "target"
     prebuild = target / "kernel-prebuild" / "aarch64-unknown-none" / "kernel-release"
     paths = {
-        "inspector": tmp_path / "bin" / "helios-inspector",
+        "inspector": tmp_path / "bin" / "helios",
         "cli": tmp_path / "bin" / "helios-cli",
-        "kernel": target / "aarch64-unknown-none" / "kernel-release" / "helios",
+        "kernel": target / "aarch64-unknown-none" / "kernel-release" / "helios-kernel",
         "bootfs": prebuild / "helios-bootfs",
         "plugin": prebuild / "compiler_plugin.wasm",
         "native": tmp_path / "native",
@@ -97,7 +97,7 @@ def test_the_error_lists_every_missing_path(tmp_path, host) -> None:
         assert str(path) in message
     for name in natives:
         assert str(host["native"] / "aarch64" / name) in message
-    assert str(host["inspector"]) not in message
+    assert f"- {host['inspector']} " not in message
 
 
 def test_nothing_is_missing_once_everything_is_in_place(tmp_path, host) -> None:

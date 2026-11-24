@@ -235,12 +235,17 @@ const RISCV64GC: IsaLevel = IsaLevel::floor("riscv64gc", &[]);
 /// returning.
 pub(crate) const SIGN_RETURN_ADDRESS: &str = "sign_return_address";
 
-// `sign_return_address` emits HINT-space instructions, which do nothing on a
-// processor that does not enforce them, so it holds at every level and asks
-// the probe nothing (the fork's `check_compatible_with_isa_flag` accepts it
-// on any host). `has_pauth` is not enabled: it would allow the non-HINT
-// forms, which need the feature.
-const AARCH64_SETTINGS: &[&str] = &[SIGN_RETURN_ADDRESS];
+/// The Cranelift setting that emits HINT-space BTI landing pads at every
+/// indirect-branch target (function entries, `br_table` targets, exception
+/// handlers) and routes indirect tail calls through `x16`.
+pub(crate) const USE_BTI: &str = "use_bti";
+
+// Both `sign_return_address` and `use_bti` emit HINT-space instructions,
+// which do nothing on a processor that does not enforce them, so they hold
+// at every level and ask the probe nothing (the fork's
+// `check_compatible_with_isa_flag` accepts them on any host). `has_pauth`
+// is not enabled: it would allow the non-HINT forms, which need the feature.
+const AARCH64_SETTINGS: &[&str] = &[SIGN_RETURN_ADDRESS, USE_BTI];
 
 /// The chain of levels a target's cwasm artifacts can be compiled for, and
 /// the code-generation settings every one of them enables.
@@ -533,7 +538,10 @@ mod tests {
         let expected: [(&str, &[&str]); 4] = [
             (X86, X86_FLOOR),
             ("x86_64-unknown-linux-gnu", X86_FLOOR),
-            (AARCH64, &["has_lse", "has_fp16", "sign_return_address"]),
+            (
+                AARCH64,
+                &["has_lse", "has_fp16", "sign_return_address", "use_bti"],
+            ),
             (RISCV, &[]),
         ];
         for (target, flags) in expected {
@@ -565,7 +573,13 @@ mod tests {
         let aarch64 = CwasmTarget::new(AARCH64, "aarch64-lse-fp16-dotprod").unwrap();
         assert_eq!(
             aarch64.cranelift_flags().collect::<Vec<_>>(),
-            ["has_lse", "has_fp16", "has_dotprod", "sign_return_address"]
+            [
+                "has_lse",
+                "has_fp16",
+                "has_dotprod",
+                "sign_return_address",
+                "use_bti",
+            ]
         );
     }
 
@@ -594,10 +608,10 @@ mod tests {
             }
         }
         fn silent_on_settings(name: &str) -> Option<bool> {
-            (name != SIGN_RETURN_ADDRESS).then_some(true)
+            (name != SIGN_RETURN_ADDRESS && name != USE_BTI).then_some(true)
         }
         let levels = cwasm_target_isa_levels(AARCH64);
-        assert_eq!(levels.cranelift_settings(), [SIGN_RETURN_ADDRESS]);
+        assert_eq!(levels.cranelift_settings(), [SIGN_RETURN_ADDRESS, USE_BTI]);
         assert_eq!(
             levels.select(Some(silent_on_settings)).unwrap().name(),
             "aarch64-lse-fp16-dotprod"

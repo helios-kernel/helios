@@ -403,7 +403,7 @@ def is_stale_helios_benchmark_process(command: str) -> bool:
     argv0 = command.split(None, 1)[0] if command.strip() else ""
     executable = Path(argv0).name
     inspector_workload = (
-        executable == "helios-inspector"
+        executable == "helios"
         and " vm " in f" {command} "
         and " workload-bench" in f" {command} "
     )
@@ -734,7 +734,7 @@ def workload_bench_script() -> Path:
 def inspector_bin() -> Path:
     return Path(
         os.environ.get(
-            "HELIOS_INSPECTOR_BIN", str(repo_root() / "target" / "release" / "helios-inspector")
+            "HELIOS_INSPECTOR_BIN", str(repo_root() / "target" / "release" / "helios")
         )
     )
 
@@ -866,7 +866,7 @@ def image_tools(image: HeliosImage) -> tuple[Path, Path]:
     if own_checkout(image):
         return inspector_bin(), helios_cli_bin()
     release = image.workspace_root / "target" / "release"
-    return release / "helios-inspector", release / "helios-cli"
+    return release / "helios", release / "helios-cli"
 
 
 def require_image_tools(image: HeliosImage) -> None:

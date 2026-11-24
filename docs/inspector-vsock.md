@@ -54,7 +54,7 @@ rather than attaching to the wrong machine.
 
 ```bash
 sudo modprobe vhost_vsock
-./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+./target/release/helios vm --arch riscv64 --release --memory 2G \
     --rpc-transport vsock \
     --boot-program dash --boot-program debugger --no-compiler-plugin \
     shell -c 'echo ok'

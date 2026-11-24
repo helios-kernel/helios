@@ -58,7 +58,7 @@ def collect_workloads(
         log = output.with_suffix(".jsonl")
         with services.serve() as endpoints, log.open("w") as records:
             command = [
-                str(checkout / "target/release/helios-inspector"),
+                str(checkout / "target/release/helios"),
                 "vm",
                 "--arch",
                 lane.helios_arch,

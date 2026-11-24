@@ -1,11 +1,15 @@
-//! Return-address signing on every processor (Arm FEAT_PAuth, key A).
+//! Return-address signing (Arm FEAT_PAuth, key A) and Branch Target
+//! Identification (Arm FEAT_BTI) on every processor.
 //!
-//! The image is compiled with `-Zbranch-protection=pac-ret`
+//! The image is compiled with `-Zbranch-protection=bti,pac-ret`
 //! (`.cargo/config.toml`, checked by `build.rs`), so every function that saves
-//! `LR` signs it with `paciasp` and authenticates it with `autiasp`. Both are
-//! HINT encodings that do nothing until `SCTLR_EL1.EnIA` is set. This module
-//! gives the machine one instruction key, installs it in each processor's
-//! `APIAKey` registers and sets `EnIA` on that processor.
+//! `LR` signs it with `paciasp` and authenticates it with `autiasp`, and every
+//! indirect-branch target begins with a `bti` landing pad. All of those are
+//! HINT encodings that do nothing until `SCTLR_EL1.EnIA` is set and executable
+//! pages are marked guarded (`GP`). This module gives the machine one
+//! instruction key, installs it in each processor's `APIAKey` registers, sets
+//! `EnIA` (and `BT1` where `FEAT_BTI` is implemented) on every processor, and
+//! coordinates guarded-page marking of kernel and runtime executable memory.
 //!
 //! # Concurrency contract
 //!
@@ -35,7 +39,7 @@
 //! `aarch64_kernel_main` and `aarch64_secondary_main`, which never return,
 //! and every function either calls before the enable has returned.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arm_sysregs::el1::accessors::{
     read_id_aa64isar1_el1, read_id_aa64isar2_el1, write_apiakeyhi_el1, write_apiakeylo_el1,
@@ -43,7 +47,7 @@ use arm_sysregs::el1::accessors::{
 use arm_sysregs::el1::registers::{
     ApiakeyhiEl1, ApiakeyloEl1, IdAa64isar1El1, IdAa64isar2El1, SctlrEl1,
 };
-use helios_hal::cpu::ReturnAddressSigning;
+use helios_hal::cpu::{ControlFlowIntegrity, ReturnAddressSigning};
 use helios_kernel::RootEntropy;
 use zeroize::Zeroize;
 
@@ -53,9 +57,21 @@ use zeroize::Zeroize;
 /// (Linux `arch/arm64/tools/sysreg`, enums `APA`, `API`, `APA3`).
 const FIELD_FPAC: u8 = 0b0100;
 
+/// `ID_AA64PFR1_EL1.BT` is bits `[3:0]` and reads `>= 1` when `FEAT_BTI` is
+/// implemented (Arm Architecture Reference Manual, `ID_AA64PFR1_EL1`).
+const ID_AA64PFR1_BT_MASK: u64 = 0xf;
+
+/// `SCTLR_EL1.BT1` (bit 36): restricts `PACIASP`/`PACIBSP` at EL1 to call
+/// landing pads (`BLR`, `BR x16`, `BR x17`) rather than arbitrary `BR xN`
+/// (Arm Architecture Reference Manual, `SCTLR_EL1`).
+const SCTLR_EL1_BT1: u64 = 1 << 36;
+
 /// `ESR_ELx.EC` is bits `[31:26]`.
 pub(crate) const ESR_EC_SHIFT: usize = 26;
 pub(crate) const ESR_EC_MASK: usize = 0x3f;
+/// `ESR_ELx.EC` of a Branch Target Exception (`ESR_ELx_EC_BTI` in Linux
+/// `arch/arm64/include/asm/esr.h`).
+const ESR_EC_BTI: usize = 0x0d;
 /// `ESR_ELx.EC` of a failed FEAT_FPAC authentication (`ESR_ELx_EC_FPAC` in
 /// Linux `arch/arm64/include/asm/esr.h`).
 const ESR_EC_FPAC: usize = 0x1c;
@@ -66,6 +82,31 @@ const ESR_EC_INSTRUCTION_ABORT_SAME: usize = 0x21;
 
 /// Bytes of the 128-bit `APIAKey`.
 const INSTRUCTION_KEY_BYTES: usize = 16;
+
+/// Whether the machine's processors implement `FEAT_BTI` and executable pages
+/// carry the Guarded Page (`GP`) attribute. Written once on the bootstrap
+/// processor before any executable page is mapped or any secondary starts.
+static BTI_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether executable pages on this machine should set the Stage-1 `GP` bit.
+pub(crate) fn branch_target_identification_enabled() -> bool {
+    BTI_ENABLED.load(Ordering::Acquire)
+}
+
+/// Reads `ID_AA64PFR1_EL1` and returns whether this processor implements
+/// `FEAT_BTI`.
+fn probe_bti() -> bool {
+    let pfr1: u64;
+    // SAFETY: `ID_AA64PFR1_EL1` is an EL1-readable identification register.
+    unsafe {
+        core::arch::asm!(
+            "mrs {pfr1}, id_aa64pfr1_el1",
+            pfr1 = out(reg) pfr1,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    (pfr1 & ID_AA64PFR1_BT_MASK) >= 1
+}
 
 /// This processor's address-authentication ID fields.
 struct IdRegisters {
@@ -98,20 +139,29 @@ impl IdRegisters {
     }
 }
 
-/// The signing capability of the bootstrap processor.
+/// The control-flow integrity capabilities of the bootstrap processor.
 ///
-/// An image compiled with `-Zbranch-protection=pac-ret` and run without
+/// An image compiled with `-Zbranch-protection=bti,pac-ret` and run without
 /// address authentication would sign nothing, so the machine does not boot.
-pub(crate) fn bootstrap_capability() -> ReturnAddressSigning {
+/// `FEAT_BTI` is enabled wherever the processor implements it; on processors
+/// without it, the HINT-space `bti` instructions execute as no-ops and `GP`
+/// and `SCTLR_EL1.BT1` remain clear.
+pub(crate) fn bootstrap_capability() -> ControlFlowIntegrity {
     let ids = IdRegisters::read();
-    ids.signing().unwrap_or_else(|| {
+    let signing = ids.signing().unwrap_or_else(|| {
         panic!(
             "AArch64 bootstrap processor lacks FEAT_PAuth, which this image's return-address \
              signing requires (ID_AA64ISAR1_EL1={:#x}, ID_AA64ISAR2_EL1={:#x})",
             ids.isar1.bits(),
             ids.isar2.bits(),
         )
-    })
+    });
+    let branch_targets_identified = probe_bti();
+    BTI_ENABLED.store(branch_targets_identified, Ordering::Release);
+    ControlFlowIntegrity {
+        return_addresses: Some(signing),
+        branch_targets_identified,
+    }
 }
 
 /// The machine's 128-bit instruction key, as the two `APIAKey` registers.
@@ -223,10 +273,13 @@ pub(crate) unsafe fn install_bootstrap_key(shared: &SharedInstructionKey, root: 
 /// `SCTLR_EL1.EnIA` is still clear on this processor, and the bootstrap
 /// processor published the key before it started this one.
 pub(crate) unsafe fn install_secondary_key(
-    required: ReturnAddressSigning,
+    required: ControlFlowIntegrity,
     shared: &SharedInstructionKey,
     mpidr: u64,
 ) {
+    let required_signing = required
+        .return_addresses
+        .expect("bootstrap processor enabled FEAT_PAuth");
     let ids = IdRegisters::read();
     let own = ids.signing();
     assert!(
@@ -237,11 +290,20 @@ pub(crate) unsafe fn install_secondary_key(
         ids.isar2.bits(),
     );
     assert!(
-        own.is_some_and(|own| own.faults_at_authentication || !required.faults_at_authentication),
+        own.is_some_and(|own| {
+            own.faults_at_authentication || !required_signing.faults_at_authentication
+        }),
         "AArch64 processor MPIDR {mpidr:#x} lacks FEAT_FPAC that the bootstrap processor reported \
          (ID_AA64ISAR1_EL1={:#x}, ID_AA64ISAR2_EL1={:#x})",
         ids.isar1.bits(),
         ids.isar2.bits(),
+    );
+    let own_bti = probe_bti();
+    assert_eq!(
+        own_bti, required.branch_targets_identified,
+        "AArch64 processor MPIDR {mpidr:#x} disagrees with the bootstrap processor on FEAT_BTI \
+         (secondary={own_bti}, bootstrap={})",
+        required.branch_targets_identified
     );
     let mut key = shared.load();
     // SAFETY: the caller guarantees `EnIA` is clear.
@@ -250,15 +312,16 @@ pub(crate) unsafe fn install_secondary_key(
 }
 
 /// Turns on pointer authentication with key A for this processor's
-/// instructions, and turns the other three enables off.
+/// instructions, turns the other three enables off, and sets `SCTLR_EL1.BT1`
+/// when `enable_bti` is true.
 ///
 /// Limine's `SCTLR_EL1` is not established, and the claim depends on exactly
-/// one key being enabled, so `EnIB`, `EnDA` and `EnDB` are cleared. `BT0` and
-/// `BT1` are left alone.
+/// one key being enabled, so `EnIB`, `EnDA` and `EnDB` are cleared. `BT0` is
+/// left alone.
 ///
 /// This function is naked, so it has no prologue: a normal function would run
 /// `paciasp` with `EnIA` clear and `autiasp` with it set, and fault. It
-/// clobbers `x0`.
+/// clobbers `x1`.
 ///
 /// # Safety
 ///
@@ -266,20 +329,26 @@ pub(crate) unsafe fn install_secondary_key(
 /// (those saved `LR` unsigned), so it is one of the two `-> !` entry
 /// functions, and the key is installed in this processor's registers.
 #[unsafe(naked)]
-pub(crate) unsafe extern "C" fn enable_instruction_key_a() {
+pub(crate) unsafe extern "C" fn enable_instruction_key_a(enable_bti: bool) {
     core::arch::naked_asm!(
-        "mrs x0, sctlr_el1",
-        "orr x0, x0, #{enia}",
-        "bic x0, x0, #{enib}",
-        "bic x0, x0, #{enda}",
-        "bic x0, x0, #{endb}",
-        "msr sctlr_el1, x0",
+        "hint #34",
+        "mrs x1, sctlr_el1",
+        "orr x1, x1, #{enia}",
+        "bic x1, x1, #{enib}",
+        "bic x1, x1, #{enda}",
+        "bic x1, x1, #{endb}",
+        "bic x1, x1, #{bt1}",
+        "cbz x0, 1f",
+        "orr x1, x1, #{bt1}",
+        "1:",
+        "msr sctlr_el1, x1",
         "isb",
         "ret",
         enia = const SctlrEl1::ENIA.bits(),
         enib = const SctlrEl1::ENIB.bits(),
         enda = const SctlrEl1::ENDA.bits(),
         endb = const SctlrEl1::ENDB.bits(),
+        bt1 = const SCTLR_EL1_BT1,
     )
 }
 
@@ -300,6 +369,7 @@ const SELF_TEST_PAC_BIT: u64 = 1 << 54;
 #[unsafe(naked)]
 unsafe extern "C" fn corrupt_signed_return_address() {
     core::arch::naked_asm!(
+        "hint #34",
         "paciasp",
         "eor x30, x30, #{bit}",
         "autiasp",
@@ -324,6 +394,45 @@ pub(crate) unsafe fn self_test() {
     panic!(
         "return-address signing self-test: a return address with a corrupted authentication code \
          was accepted"
+    );
+}
+
+/// Makes an indirect call (`blr x9`) to a `nop` (not a `bti` or `paciasp`
+/// landing pad) inside a guarded kernel text page. With `FEAT_BTI` and `GP`
+/// active, the target instruction must raise a Branch Target Exception
+/// (`ESR_EL1.EC = 0x0d`).
+#[cfg(helios_bti_self_test)]
+#[unsafe(naked)]
+unsafe extern "C" fn call_non_landing_pad() {
+    core::arch::naked_asm!(
+        "hint #34",
+        "adr x9, 1f",
+        "blr x9",
+        "ret",
+        "1:",
+        "nop",
+        "ret",
+    )
+}
+
+/// Proves at run time that an indirect call to a non-landing-pad instruction
+/// on a guarded kernel text page raises a Branch Target Exception, for the
+/// image built with `HELIOS_BTI_SELF_TEST`.
+///
+/// # Safety
+///
+/// Kernel text pages have `GP` set and `FEAT_BTI` is active on this processor.
+#[cfg(helios_bti_self_test)]
+pub(crate) unsafe fn bti_self_test() {
+    assert!(
+        branch_target_identification_enabled(),
+        "branch target identification self-test requires a processor implementing FEAT_BTI"
+    );
+    // SAFETY: touches no memory; returns only if BTI enforcement did not fire.
+    unsafe { call_non_landing_pad() };
+    panic!(
+        "branch target identification self-test: an indirect call to a non-landing-pad \
+         instruction was accepted"
     );
 }
 
@@ -357,13 +466,16 @@ fn strip_pointer_authentication_code(pointer: usize) -> usize {
     pointer as usize
 }
 
-/// Panics when a synchronous exception is a failed return-address
-/// authentication; returns otherwise.
+/// Panics when a synchronous exception is a Branch Target Exception or a
+/// failed return-address authentication; returns otherwise.
 ///
-/// A guest cannot form a native return address, so a failure means a
-/// corrupted host stack or a compiler bug, and the exception is never handed
-/// to the runtime.
+/// A guest cannot form a native return address or branch to an arbitrary
+/// unguarded host address, so a failure means a corrupted host stack, a
+/// corrupted indirect target, or a compiler bug, and the exception is never
+/// handed to the runtime.
 ///
+/// * Under `FEAT_BTI` a bad indirect branch into a guarded page raises
+///   `ESR_ELx.EC` `0x0d`.
 /// * With FEAT_FPAC the authenticating instruction itself raises the
 ///   exception (`ESR_ELx.EC` `0x1c`).
 /// * Without it `autiasp` leaves a poisoned `LR`, and the `ret` through it
@@ -371,6 +483,10 @@ fn strip_pointer_authentication_code(pointer: usize) -> usize {
 ///   not strip away.
 pub(crate) fn refuse_authentication_failure(esr_el1: usize, far_el1: usize, elr_el1: u64) {
     match (esr_el1 >> ESR_EC_SHIFT) & ESR_EC_MASK {
+        ESR_EC_BTI => panic!(
+            "control-flow violation: branch target identification failed at {elr_el1:#x} \
+             esr={esr_el1:#x}"
+        ),
         ESR_EC_FPAC => panic!(
             "control-flow violation: pointer authentication failed at {elr_el1:#x} \
              esr={esr_el1:#x}"

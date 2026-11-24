@@ -579,7 +579,7 @@ mod tests {
 
     /// The marker `CwasmCodeProtection::module_version` puts in the version
     /// string, which sits uncompressed in the artifact's engine section.
-    const SIGNING_MARKER: &[u8] = b"+return-address-signing";
+    const SIGNING_MARKER: &[u8] = b"+return-address-signing+bti";
 
     fn contains_marker(bytes: &[u8]) -> bool {
         bytes
@@ -641,6 +641,7 @@ mod tests {
             .expect("the engine config builds");
         let version = CwasmCodeProtection {
             return_addresses_signed: true,
+            branch_targets_identified: true,
         }
         .module_version(ModuleVersionStrategy::WasmtimeVersion.as_str())
         .expect("signed code has its own version");

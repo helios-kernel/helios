@@ -2346,6 +2346,7 @@ pub(crate) async fn shutdown<R: Resources, Net: Network<R::Network>>(
         return 0;
     }
 
+    let _ = poll_connecting(&sock, net).await;
     if let Some(tcp) = sock.tcp_state() {
         let TcpSocket::Connected { stream, .. } = tcp else {
             return errno(ENOTCONN);

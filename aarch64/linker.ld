@@ -14,6 +14,7 @@ PHDRS
 
 SECTIONS
 {
+    __helios_text_start = KERNEL_VMA;
     . = KERNEL_VMA + SIZEOF_HEADERS;
 
     .text : AT(ADDR(.text) - KERNEL_VMA + KERNEL_LMA) {
@@ -22,6 +23,7 @@ SECTIONS
     } :text
 
     . = ALIGN(PAGE_SIZE);
+    __helios_text_end = .;
     .rodata : AT(ADDR(.rodata) - KERNEL_VMA + KERNEL_LMA) {
         *(.rodata .rodata.*)
         *(.srodata .srodata.*)
