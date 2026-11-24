@@ -106,6 +106,8 @@ enum WasmProgramsError {
         first: String,
         second: String,
     },
+    #[error("unknown guest program(s): {unknown}")]
+    UnknownPrograms { unknown: String },
 }
 
 /// Why the root signing keypair could not be read or written.
@@ -687,6 +689,8 @@ enum ProfileFetchError {
 }
 
 const COMPILER_PLUGIN_BOOTFS_PATH: &str = "bin/compiler.cwasm";
+/// The program name `wasm-build --program` uses for the in-kernel compiler plugin.
+const COMPILER_PLUGIN_NAME: &str = "compiler-plugin";
 const COMPILER_PLUGIN_MANIFEST: &str = "compiler-plugin/Cargo.toml";
 const COMPILER_PLUGIN_TARGET_DIR: &str = "compiler-plugin-target";
 const COMPILER_PLUGIN_TRIPLE: &str = "wasm32-wasip1-threads";
@@ -819,6 +823,13 @@ struct WasmBuildCommand {
     profile: String,
     #[arg(long)]
     cargo: PathBuf,
+    /// Restrict the build to the named guest programs (`compiler-plugin` or
+    /// directory names under `programs/`). Repeat for multiple programs. When
+    /// omitted, the compiler plugin and every program under `programs/` are
+    /// built. Library components plugged by a selected program are included
+    /// automatically.
+    #[arg(long = "program", value_name = "NAME")]
+    programs: Vec<String>,
     #[command(flatten)]
     cache: CacheArgs,
 }
@@ -1952,13 +1963,100 @@ fn program_dirs(programs_root: &Path) -> Result<Vec<(String, PathBuf)>, BootProg
     Ok(dirs)
 }
 
-/// Builds the compiler plugin and every program under `programs/` into
-/// `<out-dir>/<profile>/`, one file per artifact name: the wasm every
-/// target's boot payload is precompiled from.
+/// Guest wasm build targets chosen by `wasm-build`.
+struct SelectedWasmBuild {
+    compiler_plugin: bool,
+    programs: Vec<ProgramManifest>,
+}
+
+/// Resolves `--program` filters against `programs/` and `compiler-plugin`.
+///
+/// An empty request builds the compiler plugin and every program under
+/// `programs/`. A non-empty request rejects unknown names up front and
+/// automatically pulls in any library component a selected program plugs.
+fn select_wasm_programs(
+    requested: &[String],
+    available: Vec<ProgramManifest>,
+) -> Result<SelectedWasmBuild, WasmProgramsError> {
+    if requested.is_empty() {
+        return Ok(SelectedWasmBuild {
+            compiler_plugin: true,
+            programs: available,
+        });
+    }
+
+    let by_name: BTreeMap<String, ProgramManifest> = available
+        .into_iter()
+        .map(|manifest| (manifest.command.clone(), manifest))
+        .collect();
+    let requested_set: BTreeSet<&str> = requested.iter().map(String::as_str).collect();
+    let unknown: Vec<&str> = requested_set
+        .iter()
+        .copied()
+        .filter(|name| *name != COMPILER_PLUGIN_NAME && !by_name.contains_key(*name))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(WasmProgramsError::UnknownPrograms {
+            unknown: unknown.join(", "),
+        });
+    }
+
+    let compiler_plugin = requested_set.contains(COMPILER_PLUGIN_NAME);
+    let mut expanded: BTreeSet<String> = requested_set
+        .iter()
+        .filter(|name| **name != COMPILER_PLUGIN_NAME)
+        .map(|name| (*name).to_owned())
+        .collect();
+
+    let mut plugs_to_add = Vec::new();
+    for name in &expanded {
+        let manifest = &by_name[name];
+        for plug in &manifest.role.plugs {
+            let Some(library) = by_name.get(plug) else {
+                return Err(BootProgramError::UnknownPlug {
+                    command: manifest.command.clone(),
+                    plug: plug.clone(),
+                }
+                .into());
+            };
+            if !library.role.library {
+                return Err(BootProgramError::UnknownPlug {
+                    command: manifest.command.clone(),
+                    plug: plug.clone(),
+                }
+                .into());
+            }
+            plugs_to_add.push(plug.clone());
+        }
+    }
+    expanded.extend(plugs_to_add);
+
+    let programs = by_name
+        .into_iter()
+        .filter(|(name, _)| expanded.contains(name))
+        .map(|(_, manifest)| manifest)
+        .collect();
+    Ok(SelectedWasmBuild {
+        compiler_plugin,
+        programs,
+    })
+}
+
+/// Builds the compiler plugin and programs under `programs/` (or the subset
+/// named by `--program`) into `<out-dir>/<profile>/`, one file per artifact
+/// name: the wasm every target's boot payload is precompiled from.
 fn run_wasm_build(
     command: &WasmBuildCommand,
     workspace_root: &WorkspaceRoot,
 ) -> Result<(), WasmProgramsError> {
+    let mut program_entries = program_dirs(&workspace_root.join(Path::new("programs")))?;
+    program_entries.sort();
+    let available = program_entries
+        .into_iter()
+        .map(|(command_name, path)| read_program_manifest(&command_name, &path.join("Cargo.toml")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let selection = select_wasm_programs(&command.programs, available)?;
+
     let dest = command.out_dir.join(profile_dir_name(&command.profile));
     fs::create_dir_all(&dest).map_err(|source| WasmProgramsError::CreateDir {
         path: dest.display().to_string(),
@@ -1979,14 +2077,11 @@ fn run_wasm_build(
     };
 
     // The compiler plugin builds first and longest, so it takes the first
-    // worker; every target directory's programs follow.
-    let mut programs = program_dirs(&workspace_root.join(Path::new("programs")))?;
-    programs.sort();
+    // worker when selected; every target directory's programs follow.
     let mut groups = BTreeMap::<String, Vec<(usize, ProgramManifest)>>::new();
     let mut venus_protocol = false;
     let mut boringssl = false;
-    for (index, (command_name, path)) in programs.into_iter().enumerate() {
-        let manifest = read_program_manifest(&command_name, &path.join("Cargo.toml"))?;
+    for (index, manifest) in selection.programs.into_iter().enumerate() {
         let requirements = read_wasm_requirements(&manifest.manifest_path)?;
         venus_protocol |= requirements.venus_protocol;
         boringssl |= requirements.boringssl;
@@ -2004,7 +2099,10 @@ fn run_wasm_build(
     if boringssl {
         wasi_sdk::ensure(workspace_root.path(), COMPONENT_TRIPLE).map_err(WasmBuildError::from)?;
     }
-    let jobs = std::iter::once(WasmJob::CompilerPlugin)
+    let jobs = selection
+        .compiler_plugin
+        .then_some(WasmJob::CompilerPlugin)
+        .into_iter()
         .chain(groups.into_values().map(WasmJob::Programs))
         .collect::<Vec<_>>();
     let mut built = run_wasm_jobs(&builder, &jobs)?;
@@ -3849,6 +3947,138 @@ mod tests {
             error.to_string().contains("quickjs requires wasm SIMD"),
             "unexpected error: {error}"
         );
+    }
+
+    fn test_program_manifest(command: &str, role: ProgramRole) -> ProgramManifest {
+        ProgramManifest {
+            command: command.to_owned(),
+            manifest_path: PathBuf::from(format!("programs/{command}/Cargo.toml")),
+            artifact_name: format!("helios_{}.wasm", command.replace('-', "_")),
+            role,
+        }
+    }
+
+    fn sample_program_manifests() -> Vec<ProgramManifest> {
+        vec![
+            test_program_manifest("compositor", ProgramRole::default()),
+            test_program_manifest("debugger", ProgramRole::default()),
+            test_program_manifest("init", ProgramRole::default()),
+            test_program_manifest(
+                "pride-flag",
+                ProgramRole {
+                    library: false,
+                    plugs: vec!["webgpu".to_owned()],
+                },
+            ),
+            test_program_manifest(
+                "webgpu",
+                ProgramRole {
+                    library: true,
+                    plugs: Vec::new(),
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn wasm_build_without_programs_selects_compiler_plugin_and_all_programs() {
+        let selected = select_wasm_programs(&[], sample_program_manifests())
+            .expect("empty selection selects all");
+        assert!(selected.compiler_plugin);
+        let names: Vec<_> = selected
+            .programs
+            .iter()
+            .map(|m| m.command.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["compositor", "debugger", "init", "pride-flag", "webgpu"]
+        );
+    }
+
+    #[test]
+    fn wasm_build_subset_selects_only_named_programs_and_deduplicates() {
+        let requested = vec![
+            "debugger".to_owned(),
+            "init".to_owned(),
+            "debugger".to_owned(),
+        ];
+        let selected = select_wasm_programs(&requested, sample_program_manifests())
+            .expect("valid subset resolves");
+        assert!(!selected.compiler_plugin);
+        let names: Vec<_> = selected
+            .programs
+            .iter()
+            .map(|m| m.command.as_str())
+            .collect();
+        assert_eq!(names, ["debugger", "init"]);
+    }
+
+    #[test]
+    fn wasm_build_subset_includes_plugged_library_components() {
+        let requested = vec!["pride-flag".to_owned()];
+        let selected = select_wasm_programs(&requested, sample_program_manifests())
+            .expect("plugged libraries are included automatically");
+        assert!(!selected.compiler_plugin);
+        let names: Vec<_> = selected
+            .programs
+            .iter()
+            .map(|m| m.command.as_str())
+            .collect();
+        assert_eq!(names, ["pride-flag", "webgpu"]);
+    }
+
+    #[test]
+    fn wasm_build_subset_can_select_compiler_plugin_alone() {
+        let requested = vec![COMPILER_PLUGIN_NAME.to_owned()];
+        let selected = select_wasm_programs(&requested, sample_program_manifests())
+            .expect("compiler-plugin alone is valid");
+        assert!(selected.compiler_plugin);
+        assert!(selected.programs.is_empty());
+    }
+
+    #[test]
+    fn wasm_build_rejects_unknown_program_names() {
+        let requested = vec![
+            "init".to_owned(),
+            "missing-b".to_owned(),
+            "missing-a".to_owned(),
+        ];
+        let error = select_wasm_programs(&requested, sample_program_manifests())
+            .err()
+            .expect("unknown program names must fail fast");
+        assert!(
+            matches!(
+                &error,
+                WasmProgramsError::UnknownPrograms { unknown } if unknown == "missing-a, missing-b"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn wasm_build_cli_parses_repeatable_program_flags() {
+        let parsed = Cli::try_parse_from([
+            "helios-cli",
+            "wasm-build",
+            "--out-dir",
+            "/tmp/out",
+            "--profile",
+            "debug",
+            "--cargo",
+            "cargo",
+            "--program",
+            "init",
+            "--program",
+            "debugger",
+            "--program",
+            "compiler-plugin",
+        ])
+        .expect("repeatable --program flags parse");
+        let Commands::WasmBuild(command) = parsed.command else {
+            panic!("expected WasmBuild command");
+        };
+        assert_eq!(command.programs, ["init", "debugger", "compiler-plugin"]);
     }
 
     fn test_artifact(
