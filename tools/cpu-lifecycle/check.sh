@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Boots an x86-64 guest under KVM, takes its highest processor offline
 # and back eight times while the in-kernel compiler and a fetch over
-# virtio-net run (tools/cpu-lifecycle/guest.sh), and asserts the typed
+# virtio-net run (tools/cpu-lifecycle/guest.nu), and asserts the typed
 # answers `cpu` printed and that the guest kept working.
 #
 #   check.sh <inspector> <runtime-dir> [vm option...]
@@ -22,11 +22,11 @@ out="$runtime/shell.out"
 
 "$inspector" vm --arch x86-64 --release --memory 2G --accel kvm \
     --runtime-dir "$runtime" --keep-runtime-dir \
-    --boot-program dash --boot-program debugger --boot-program cpu \
+    --boot-program nu --boot-program debugger --boot-program cpu \
     --boot-program http-client \
     --shared-dir artifacts/wasi-tools \
     "$@" \
-    shell "$here/guest.sh" 2>&1 >"$out" | tee "$runtime/inspector.log"
+    shell --shell /bin/nu "$here/guest.nu" 2>&1 >"$out" | tee "$runtime/inspector.log"
 cat "$out"
 
 fail() {

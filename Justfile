@@ -92,7 +92,7 @@ clippy-host:
         --exclude helios-date --exclude helios-debugger --exclude helios-display-test \
         --exclude helios-gpu-test --exclude helios-http-client \
         --exclude helios-init --exclude helios-input-test \
-        --exclude helios-oob-load --exclude helios-perf \
+        --exclude helios-nu-shell --exclude helios-oob-load --exclude helios-perf \
         --exclude helios-ping --exclude helios-pride-flag --exclude helios-procbench \
         --exclude helios-sched-tasks --exclude helios-stack-test --exclude helios-surface-test \
         --exclude helios-sysctl --exclude helios-webgpu-provider \
@@ -111,7 +111,7 @@ clippy-programs:
     # them would unify those features and fail to build.
     for package in helios-audio-test helios-compositor helios-cpu helios-date helios-debugger helios-display-test helios-gpu-test \
         helios-http-client \
-        helios-init helios-input-test helios-oob-load helios-perf helios-ping helios-pride-flag \
+        helios-init helios-input-test helios-nu-shell helios-oob-load helios-perf helios-ping helios-pride-flag \
         helios-procbench helios-sched-tasks helios-stack-test helios-surface-test helios-sysctl helios-webgpu-provider; do
         cargo clippy -p "${package}" --all-targets -- -D warnings
     done
@@ -200,6 +200,8 @@ test-libraries:
     cargo nextest run -p helios-venus -p helios-venus-gen --features helios-venus/driver
     # The HTTP client plugin's host unit, HTTP/2, and HTTP/3 tests.
     cargo nextest run -p helios-http-client
+    # The shared async Nushell evaluator, Helios commands, and completion core.
+    cargo nextest run -p helios-nu
     # The ACPI library runs QEMU's own CPU hotplug AML, from the pinned
     # tables the fetch below hash-verifies.
     just acpi-tables-fetch

@@ -5,6 +5,7 @@ edition = "2024"
 autobins = false
 
 [dependencies]
+futures-lite = { version = "2.6.1", default-features = false }
 helios-api = { path = "../../../api", default-features = false, features = ["http"] }
 helios-curl-write-out = { path = "../curl-write-out" }
 thiserror = "2.0.17"

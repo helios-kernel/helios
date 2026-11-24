@@ -170,7 +170,7 @@
     "surfaces": ["x86", "kernel", "unix", "btrfs_src", "host_tools", "programs"],
     "helios-cli": ["x64"],
     "guest-wasm": "release",
-    "guest-programs": ["init", "compiler-plugin", "debugger", "cpu", "http-client"],
+    "guest-programs": ["init", "compiler-plugin", "debugger", "cpu", "http-client", "nu"],
     "wasi-artifacts": true
   },
   "smoke-x86-64-venus": {
@@ -179,7 +179,7 @@
     "exclusive": true,
     "helios-cli": ["x64"],
     "guest-wasm": "debug",
-    "guest-programs": ["init", "debugger", "gpu-test", "compositor", "pride-flag"],
+    "guest-programs": ["init", "debugger", "gpu-test", "compositor", "pride-flag", "nu"],
     "wasi-artifacts": true
   },
   "test-btrfs-upstream": {
