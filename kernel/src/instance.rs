@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::hint::spin_loop;
@@ -300,14 +301,40 @@ pub struct RegisteredInstance {
     entry: NonNull<InstanceEntry>,
 }
 
+/// Non-blocking guard pinning a live instance against concurrent
+/// [`InstanceRegistry::while_off_processor`] holds (swap eviction) during a
+/// bounded cross-instance inspect copy.
+pub struct InspectReadPin {
+    instance: RegisteredInstance,
+}
+
+impl Drop for InspectReadPin {
+    fn drop(&mut self) {
+        self.instance
+            .entry()
+            .inspect_readers
+            .fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Bounded history of retired instances' immutable ancestor chains so
+/// trace events and profile samples emitted by short-lived descendants
+/// remain attributable to an ancestor's subtree after those descendants
+/// exit.
+const RETIRED_ANCESTOR_CAPACITY: usize = 1024;
+
 struct InstanceRegistryInner {
     next_id: AtomicU64,
     entries: Mutex<Slab<Box<InstanceEntry>>>,
+    retired_ancestors: Mutex<VecDeque<(InstanceId, Arc<[InstanceId]>)>>,
     sampling: Mutex<SamplingState>,
 }
 
 struct InstanceEntry {
     id: InstanceId,
+    /// Immutable root-to-parent ancestor chain fixed when this instance
+    /// was registered. Empty for a top-level instance.
+    ancestors: Arc<[InstanceId]>,
     name: String,
     started_at: u64,
     memory_bytes: AtomicU64,
@@ -372,6 +399,9 @@ struct InstanceEntry {
     /// creation and the OOM killer, and none of that should cost a turn
     /// begin a miss.
     off_processor_holds: CachePadded<AtomicUsize>,
+    /// Active cross-instance inspect readers pinning this instance's resident
+    /// user pages against concurrent swap eviction (`while_off_processor`).
+    inspect_readers: CachePadded<AtomicUsize>,
     /// Where the instance's global tasks are queued. Shared with every
     /// [`crate::InstanceSpawner`] of the instance, whose tasks may
     /// outlive this entry.
@@ -456,12 +486,12 @@ impl TaskHome for Arc<InstanceHome> {
 
 #[derive(Default)]
 struct SamplingState {
-    last_at: Option<u64>,
     totals: Vec<SampleTotal>,
 }
 
 struct SampleTotal {
     id: InstanceId,
+    last_at: u64,
     active_nanos: u64,
 }
 
@@ -471,13 +501,14 @@ impl InstanceRegistry {
             inner: Arc::new(InstanceRegistryInner {
                 next_id: AtomicU64::new(1),
                 entries: Mutex::new(Slab::new()),
+                retired_ancestors: Mutex::new(VecDeque::with_capacity(RETIRED_ANCESTOR_CAPACITY)),
                 sampling: Mutex::new(SamplingState::default()),
             }),
         }
     }
 
     pub fn register(&self, name: impl Into<String>, started_at: u64) -> RegisteredInstance {
-        self.register_with_policy(name, started_at, OomPolicy::UserProgram)
+        self.register_child_with_policy(None, name, started_at, OomPolicy::UserProgram)
     }
 
     /// Register under an explicit OOM policy. Kernel plugins and system
@@ -488,10 +519,59 @@ impl InstanceRegistry {
         started_at: u64,
         policy: OomPolicy,
     ) -> RegisteredInstance {
+        self.register_child_with_policy(None, name, started_at, policy)
+    }
+
+    /// Register a child user program under `parent`, recording an
+    /// immutable root-to-parent ancestor chain derived from `parent`'s
+    /// own chain.
+    pub fn register_child(
+        &self,
+        parent: Option<InstanceId>,
+        name: impl Into<String>,
+        started_at: u64,
+    ) -> RegisteredInstance {
+        self.register_child_with_policy(parent, name, started_at, OomPolicy::UserProgram)
+    }
+
+    /// Register under `parent` and an explicit OOM policy.
+    pub fn register_child_with_policy(
+        &self,
+        parent: Option<InstanceId>,
+        name: impl Into<String>,
+        started_at: u64,
+        policy: OomPolicy,
+    ) -> RegisteredInstance {
         let id = InstanceId(self.inner.next_id.fetch_add(1, Ordering::AcqRel));
+        let name = name.into();
+        let home = Arc::new(InstanceHome::provisional(current_processor()));
+        let mut entries = self.inner.entries.lock();
+        let ancestors: Arc<[InstanceId]> = match parent {
+            None => Arc::from(&[][..]),
+            Some(parent_id) => {
+                let parent_chain = entries
+                    .iter()
+                    .find_map(|(_, entry)| (entry.id == parent_id).then(|| entry.ancestors.clone()))
+                    .or_else(|| {
+                        self.inner.retired_ancestors.lock().iter().rev().find_map(
+                            |(retired_id, chain)| (*retired_id == parent_id).then(|| chain.clone()),
+                        )
+                    });
+                match parent_chain {
+                    Some(prefix) => {
+                        let mut chain = Vec::with_capacity(prefix.len() + 1);
+                        chain.extend_from_slice(&prefix);
+                        chain.push(parent_id);
+                        Arc::from(chain)
+                    }
+                    None => Arc::from([parent_id].as_slice()),
+                }
+            }
+        };
         let entry = Box::new(InstanceEntry {
             id,
-            name: name.into(),
+            ancestors,
+            name,
             started_at,
             memory_bytes: AtomicU64::new(0),
             kernel_bytes: AtomicU64::new(0),
@@ -506,15 +586,53 @@ impl InstanceRegistry {
             condemned_kernel_bytes: AtomicU64::new(0),
             handle_count: AtomicUsize::new(1),
             off_processor_holds: CachePadded::new(AtomicUsize::new(0)),
-            home: Arc::new(InstanceHome::provisional(current_processor())),
+            inspect_readers: CachePadded::new(AtomicUsize::new(0)),
+            home,
         });
         let entry_ptr = NonNull::from(entry.as_ref());
-        let entry_slot = self.inner.entries.lock().insert(entry);
+        let entry_slot = entries.insert(entry);
+        drop(entries);
         RegisteredInstance {
             registry: self.clone(),
             entry_slot,
             entry: entry_ptr,
         }
+    }
+
+    /// Returns the immutable root-to-parent ancestor chain of `id` when
+    /// `id` is live or retained in the retired-ancestor ring.
+    pub fn ancestors(&self, id: InstanceId) -> Option<Arc<[InstanceId]>> {
+        if let Some(chain) = self
+            .inner
+            .entries
+            .lock()
+            .iter()
+            .find_map(|(_, entry)| (entry.id == id).then(|| entry.ancestors.clone()))
+        {
+            return Some(chain);
+        }
+        self.inner
+            .retired_ancestors
+            .lock()
+            .iter()
+            .rev()
+            .find_map(|(retired_id, chain)| (*retired_id == id).then(|| chain.clone()))
+    }
+
+    /// Whether `id` names a live or retained retired instance issued by
+    /// this registry.
+    pub fn is_known(&self, id: InstanceId) -> bool {
+        self.ancestors(id).is_some()
+    }
+
+    /// Whether `target` lies inside the subtree rooted at `root` (`root`
+    /// itself or a descendant whose immutable ancestor chain contains
+    /// `root`), even if intermediate ancestors have already exited.
+    pub fn is_in_subtree(&self, root: InstanceId, target: InstanceId) -> bool {
+        let Some(ancestors) = self.ancestors(target) else {
+            return false;
+        };
+        target == root || ancestors.contains(&root)
     }
 
     /// Pick a victim instance using the standard `memory / restart cost`
@@ -639,6 +757,12 @@ impl InstanceRegistry {
             .pending_bytes
             .saturating_add(condemned_bytes.of(pool));
         drop(entries);
+        crate::audit::instance_kill(
+            None,
+            victim.id,
+            KillReason::OutOfMemory,
+            KillOutcome::Requested,
+        );
         OomKillDecision {
             outcome: OomKillOutcome::Condemned(victim),
             condemned,
@@ -760,7 +884,9 @@ impl InstanceRegistry {
         let instance = self.handle(id).ok_or(OffProcessorRefused::NoSuchInstance)?;
         let entry = instance.entry();
         let hold = OffProcessorHold::raise(entry);
-        if entry.stores.lock().any_on_processor() {
+        if entry.stores.lock().any_on_processor()
+            || entry.inspect_readers.load(Ordering::SeqCst) != 0
+        {
             return Err(OffProcessorRefused::OnProcessor);
         }
         let output = work(&OffProcessor {
@@ -769,6 +895,23 @@ impl InstanceRegistry {
         });
         drop(hold);
         Ok(output)
+    }
+
+    /// Non-blocking pin that prevents [`Self::while_off_processor`] (swap
+    /// eviction) from detaching pages of `id` while a cross-instance inspect
+    /// reader validates residency and copies out of `id`'s linear memory.
+    ///
+    /// Returns `None` immediately when `id` is gone or an off-processor hold
+    /// is already in flight.
+    pub fn try_pin_for_read(&self, id: InstanceId) -> Option<InspectReadPin> {
+        let instance = self.handle(id)?;
+        let entry = instance.entry();
+        entry.inspect_readers.fetch_add(1, Ordering::SeqCst);
+        if entry.off_processor_holds.load(Ordering::SeqCst) != 0 {
+            entry.inspect_readers.fetch_sub(1, Ordering::Release);
+            return None;
+        }
+        Some(InspectReadPin { instance })
     }
 
     /// A new handle on the live instance `id`.
@@ -799,36 +942,65 @@ impl InstanceRegistry {
     }
 
     pub fn snapshot(&self, now_nanos: u64) -> Vec<InstanceSnapshot> {
+        self.snapshot_scoped(
+            now_nanos,
+            InstanceId::from_raw(0),
+            crate::AuthorityScope::Machine,
+        )
+    }
+
+    /// Snapshots every live instance visible to `caller` under `scope`,
+    /// updating per-instance CPU sampling windows only for the instances
+    /// included in the returned snapshot.
+    pub fn snapshot_scoped(
+        &self,
+        now_nanos: u64,
+        caller: InstanceId,
+        scope: crate::AuthorityScope,
+    ) -> Vec<InstanceSnapshot> {
         let entries = self.inner.entries.lock();
         let mut sampling = self.inner.sampling.lock();
-        let elapsed_nanos = sampling
-            .last_at
-            .map(|last_at| now_nanos.saturating_sub(last_at))
-            .unwrap_or(0);
-        sampling.last_at = Some(now_nanos);
-
         let mut snapshots = Vec::with_capacity(entries.len());
-        let mut next_totals = Vec::with_capacity(entries.len());
 
         for (_, entry) in entries.iter() {
-            let total_active_nanos = entry.stores.lock().processor_time(now_nanos).active_nanos;
-            let previous_total = sampling
-                .totals
-                .iter()
-                .find(|sample| sample.id == entry.id)
-                .map(|sample| sample.active_nanos)
-                .unwrap_or(total_active_nanos);
-            let delta_active_nanos = total_active_nanos.saturating_sub(previous_total);
-            let cpu_busy = delta_active_nanos
-                .saturating_mul(1_000)
-                .checked_div(elapsed_nanos)
-                .unwrap_or(0)
-                .min(1_000) as u16;
+            let visible = match scope {
+                crate::AuthorityScope::Machine => true,
+                crate::AuthorityScope::Own => entry.id == caller,
+                crate::AuthorityScope::Subtree(root) => {
+                    entry.id == root || entry.ancestors.contains(&root)
+                }
+            };
+            if !visible {
+                continue;
+            }
 
-            next_totals.push(SampleTotal {
-                id: entry.id,
-                active_nanos: total_active_nanos,
-            });
+            let total_active_nanos = entry.stores.lock().processor_time(now_nanos).active_nanos;
+            let cpu_busy = match sampling
+                .totals
+                .iter_mut()
+                .find(|sample| sample.id == entry.id)
+            {
+                Some(sample) => {
+                    let elapsed_nanos = now_nanos.saturating_sub(sample.last_at);
+                    let delta_active_nanos = total_active_nanos.saturating_sub(sample.active_nanos);
+                    sample.last_at = now_nanos;
+                    sample.active_nanos = total_active_nanos;
+                    delta_active_nanos
+                        .saturating_mul(1_000)
+                        .checked_div(elapsed_nanos)
+                        .unwrap_or(0)
+                        .min(1_000) as u16
+                }
+                None => {
+                    sampling.totals.push(SampleTotal {
+                        id: entry.id,
+                        last_at: now_nanos,
+                        active_nanos: total_active_nanos,
+                    });
+                    0
+                }
+            };
+
             snapshots.push(InstanceSnapshot {
                 id: entry.id,
                 name: entry.name.clone(),
@@ -841,7 +1013,6 @@ impl InstanceRegistry {
         }
 
         snapshots.sort_by_key(|snapshot| snapshot.id);
-        sampling.totals = next_totals;
         snapshots
     }
 
@@ -1024,6 +1195,22 @@ impl RegisteredInstance {
 
     pub fn id(&self) -> InstanceId {
         self.entry().id
+    }
+
+    /// Immutable root-to-parent ancestor chain recorded when this
+    /// instance was registered.
+    pub fn ancestors(&self) -> &[InstanceId] {
+        &self.entry().ancestors
+    }
+
+    /// Direct parent of this instance at registration time, if any.
+    pub fn parent_id(&self) -> Option<InstanceId> {
+        self.entry().ancestors.last().copied()
+    }
+
+    /// Whether this instance is `root` or descends from `root`.
+    pub fn in_subtree_of(&self, root: InstanceId) -> bool {
+        self.id() == root || self.ancestors().contains(&root)
     }
 
     pub fn name(&self) -> &str {
@@ -1300,6 +1487,7 @@ impl Drop for RegisteredInstance {
             return;
         }
         let id = entry.id;
+        let ancestors = entry.ancestors.clone();
         let mut entries = self.registry.inner.entries.lock();
         if entries
             .get(self.entry_slot)
@@ -1310,6 +1498,13 @@ impl Drop for RegisteredInstance {
             panic!("registered instance entry disappeared before final handle drop");
         }
         drop(entries);
+        {
+            let mut retired = self.registry.inner.retired_ancestors.lock();
+            if retired.len() == RETIRED_ANCESTOR_CAPACITY {
+                let _ = retired.pop_front();
+            }
+            retired.push_back((id, ancestors));
+        }
         self.registry
             .inner
             .sampling
@@ -2051,6 +2246,56 @@ mod tests {
 
         drop(clone);
         assert!(registry.snapshot(2).is_empty());
+    }
+
+    #[test]
+    fn ancestor_chain_persists_across_intermediate_parent_exit_and_child_retirement() {
+        use crate::AuthorityScope;
+
+        let registry = InstanceRegistry::new();
+        let root = registry.register("init", 0);
+        let root_id = root.id();
+        assert!(root.ancestors().is_empty());
+        assert_eq!(root.parent_id(), None);
+
+        let middle = registry.register_child(Some(root_id), "supervisor", 1);
+        let middle_id = middle.id();
+        assert_eq!(middle.ancestors(), &[root_id]);
+        assert_eq!(middle.parent_id(), Some(root_id));
+
+        let leaf = registry.register_child(Some(middle_id), "worker", 2);
+        let leaf_id = leaf.id();
+        assert_eq!(leaf.ancestors(), &[root_id, middle_id]);
+        assert_eq!(leaf.parent_id(), Some(middle_id));
+
+        let sibling = registry.register("unrelated", 3);
+        let sibling_id = sibling.id();
+
+        // Drop the intermediate parent; `leaf` must remain in `Subtree(root)`.
+        drop(middle);
+        assert!(registry.is_in_subtree(root_id, root_id));
+        assert!(registry.is_in_subtree(root_id, middle_id));
+        assert!(registry.is_in_subtree(root_id, leaf_id));
+        assert!(registry.is_in_subtree(middle_id, leaf_id));
+        assert!(!registry.is_in_subtree(middle_id, root_id));
+        assert!(!registry.is_in_subtree(root_id, sibling_id));
+        assert!(!registry.is_in_subtree(
+            super::InstanceId::from_raw(999_999),
+            super::InstanceId::from_raw(999_999)
+        ));
+
+        let subtree_snap = registry.snapshot_scoped(10, root_id, AuthorityScope::Subtree(root_id));
+        let ids: alloc::vec::Vec<_> = subtree_snap.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![root_id, leaf_id]);
+
+        let own_snap = registry.snapshot_scoped(10, leaf_id, AuthorityScope::Own);
+        assert_eq!(own_snap.len(), 1);
+        assert_eq!(own_snap[0].id, leaf_id);
+
+        // Once `leaf` also retires, its ancestor chain stays in the retired ring
+        // for observation attribution.
+        drop(leaf);
+        assert!(registry.is_in_subtree(root_id, leaf_id));
     }
 
     #[test]

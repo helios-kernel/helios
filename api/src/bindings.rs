@@ -52,6 +52,45 @@ compile_error!(
     "`processors` is part of the `init` and `debugger` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
 );
 
+#[cfg(all(
+    feature = "ipc",
+    any(
+        feature = "http-handler",
+        feature = "compositor",
+        feature = "webgpu",
+        feature = "webgpu-provider"
+    )
+))]
+compile_error!(
+    "`ipc` is part of the `init` and `debugger` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
+);
+
+#[cfg(all(
+    feature = "machine-identity",
+    any(
+        feature = "http-handler",
+        feature = "compositor",
+        feature = "webgpu",
+        feature = "webgpu-provider"
+    )
+))]
+compile_error!(
+    "`machine-identity` is part of the `init` and `debugger` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
+);
+
+#[cfg(all(
+    feature = "snapshot",
+    any(
+        feature = "http-handler",
+        feature = "compositor",
+        feature = "webgpu",
+        feature = "webgpu-provider"
+    )
+))]
+compile_error!(
+    "`snapshot` is part of the `init` and `debugger` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
+);
+
 #[cfg(any(
     all(
         feature = "webgpu-provider",

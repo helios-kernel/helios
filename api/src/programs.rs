@@ -12,14 +12,14 @@ use crate::wit_bindgen::{FutureReader, StreamReader};
 use futures_lite::future::zip;
 
 pub use crate::bindings::helios::system::programs::{
-    AotHint, AotRequest, AotResult, CapabilityGrant, ChildTermination, ClockGrant, ClockRight,
-    ContainerConfig, ContainerCredentials, ContainerExecRequest, ContainerIdentity, ContainerMount,
-    ContainerMountSharing, ContainerSpawnRequest, DeviceClass, DeviceGrant, DiagnosticsGrant,
-    DiagnosticsRight, DirectoryGrant, ExecError, ExecErrorKind, ExecOutput, ExecRequest,
-    ExecResult, ExitStatus, FilesystemRight, LinkGrant, LinkRight, MachineGrant, MachineRight,
-    MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight, SettingsGrant,
-    SettingsRight, SignalTermination, SpawnError, SpawnErrorKind, SpawnRequest, TerminalGrant,
-    TerminalRight,
+    AotHint, AotRequest, AotResult, AuthorityScope, CapabilityGrant, ChildTermination, ClockGrant,
+    ClockRight, ContainerConfig, ContainerCredentials, ContainerExecRequest, ContainerIdentity,
+    ContainerMount, ContainerMountSharing, ContainerSpawnRequest, DeviceClass, DeviceGrant,
+    DiagnosticsGrant, DirectoryGrant, ExecError, ExecErrorKind, ExecOutput, ExecRequest,
+    ExecResult, ExitStatus, FilesystemRight, IpcGrant, LinkGrant, LinkRight, MachineGrant,
+    MachineRight, MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight,
+    SettingsGrant, SettingsRight, SignalTermination, SpawnError, SpawnErrorKind, SpawnRequest,
+    TerminalGrant, TerminalRight,
 };
 
 impl PartialEq for ChildTermination {
@@ -153,17 +153,35 @@ pub fn all_device_classes_grant() -> CapabilityGrant {
     ])
 }
 
-/// Build a diagnostics grant. A program holds a right only when its
-/// parent granted it, so the rights must be a subset of the caller's.
-pub fn diagnostics_grant(rights: Vec<DiagnosticsRight>) -> CapabilityGrant {
-    CapabilityGrant::Diagnostics(DiagnosticsGrant { rights })
+/// Build a single orthogonal diagnostics capability grant.
+pub fn diagnostics_grant(grant: DiagnosticsGrant) -> CapabilityGrant {
+    CapabilityGrant::Diagnostics(grant)
 }
 
-/// Control the machine's tracing and profiling and read every
-/// instance's records, for a trusted launcher that runs programs on the
-/// machine owner's behalf.
-pub fn observe_machine_grant() -> CapabilityGrant {
-    diagnostics_grant(vec![DiagnosticsRight::ObserveMachine])
+/// Grant `helios:system/instances.snapshot` and `helios:system/inspect` read
+/// visibility within `scope`.
+pub fn inspect_read_grant(scope: AuthorityScope) -> CapabilityGrant {
+    CapabilityGrant::Diagnostics(DiagnosticsGrant::InspectRead(scope))
+}
+
+/// Grant `helios:system/tracing` read visibility within `scope`.
+pub fn trace_read_grant(scope: AuthorityScope) -> CapabilityGrant {
+    CapabilityGrant::Diagnostics(DiagnosticsGrant::TraceRead(scope))
+}
+
+/// Grant `helios:system/profiling` read visibility within `scope`.
+pub fn profile_read_grant(scope: AuthorityScope) -> CapabilityGrant {
+    CapabilityGrant::Diagnostics(DiagnosticsGrant::ProfileRead(scope))
+}
+
+/// Grant mutation of global diagnostic gates and profilers.
+pub fn diagnostics_control_grant() -> CapabilityGrant {
+    CapabilityGrant::Diagnostics(DiagnosticsGrant::Control)
+}
+
+/// Grant `helios:system/instances.kill` within `scope`.
+pub fn instance_control_grant(scope: AuthorityScope) -> CapabilityGrant {
+    CapabilityGrant::InstanceControl(scope)
 }
 
 /// Build a settings grant. A program holds a right only when its parent
@@ -184,10 +202,26 @@ pub fn machine_grant(rights: Vec<MachineRight>) -> CapabilityGrant {
     CapabilityGrant::Machine(MachineGrant { rights })
 }
 
-/// Take processors offline and bring them online, for a trusted
-/// launcher that runs programs on the machine owner's behalf.
-pub fn control_processors_grant() -> CapabilityGrant {
-    machine_grant(vec![MachineRight::ControlProcessors])
+/// Grant `machine-right.control` (processor online/offline transitions and
+/// VMM snapshot holds).
+pub fn machine_control_grant() -> CapabilityGrant {
+    machine_grant(vec![MachineRight::Control])
+}
+
+/// Grant `machine-right.identity` (Ed25519 machine-identity signing).
+pub fn machine_identity_grant() -> CapabilityGrant {
+    machine_grant(vec![MachineRight::Identity])
+}
+
+/// Transfer a duplex IPC channel endpoint into a spawned child under `name`.
+pub fn ipc_grant(
+    name: impl Into<String>,
+    endpoint: crate::bindings::helios::system::ipc::Endpoint,
+) -> CapabilityGrant {
+    CapabilityGrant::Ipc(IpcGrant {
+        name: name.into(),
+        endpoint,
+    })
 }
 
 /// Create hardware virtual machines (`helios:hv/virtualization`), for a

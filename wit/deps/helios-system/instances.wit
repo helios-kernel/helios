@@ -27,6 +27,8 @@ interface instances {
     /// The instance is already on its way out, because the out-of-memory
     /// killer or an earlier request already condemned it.
     already-stopping,
+    /// The caller does not hold `instance-control` covering that instance.
+    denied,
   }
 
   /// Returns the current live program instances visible to the privileged caller.

@@ -5,7 +5,7 @@ use crate::bindings::helios::system::profiling as raw;
 pub use crate::bindings::helios::system::profiling::{
     ControlError, Filter, FoldedSample, InstructionProfile, InstructionProfileError,
     InstructionSample, MetricFilter, MetricSample, MonoNanos, ProfileSection, RawProfileError,
-    SampledCode, Scope, WasmFunction,
+    SampledCode, SamplingSession, Scope, WasmFunction,
 };
 
 /// Turns kernel-side profile sampling on or off for the machine.
@@ -42,21 +42,23 @@ pub fn metrics(filter: &MetricFilter, limit: u32) -> Result<Vec<MetricSample>, F
     raw::metrics(filter, limit)
 }
 
-/// Starts or stops the kernel's instruction-address sampling, independently
-/// of [`set_enabled`]. Sampling shortens every processor's timer period, so
-/// it perturbs timings; starting discards an earlier run's samples.
+/// Starts the kernel's instruction-address sampling, independently of
+/// [`set_enabled`], returning an active [`SamplingSession`] whose drop stops
+/// sampling and restores normal processor timer behavior. Starting discards
+/// an earlier run's samples.
 ///
-/// A backend that does not sample instruction addresses says so, and an
-/// instance without the right to observe the machine is refused with
-/// [`InstructionProfileError::Denied`].
-pub fn set_instruction_sampling(enabled: bool) -> Result<(), InstructionProfileError> {
-    raw::set_instruction_sampling(enabled)
+/// Refused with [`InstructionProfileError::Denied`] unless the instance holds
+/// `diagnostics.control`, or [`InstructionProfileError::Busy`] when another
+/// session is already active.
+pub fn start_instruction_sampling() -> Result<SamplingSession, InstructionProfileError> {
+    raw::start_instruction_sampling()
 }
 
 /// Returns the instruction addresses the kernel sampled since sampling last
 /// started, attributed to the code they executed.
 ///
-/// Refused as [`set_instruction_sampling`] is.
+/// Refused with [`InstructionProfileError::Denied`] unless the instance holds
+/// machine-wide `profile-read`.
 pub fn instruction_samples() -> Result<InstructionProfile, InstructionProfileError> {
     raw::instruction_samples()
 }

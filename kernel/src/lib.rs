@@ -7,6 +7,7 @@ extern crate self as helios_kernel;
 extern crate std;
 
 mod audio;
+pub mod audit;
 mod bootfs;
 mod bring_up;
 mod buffer;
@@ -21,8 +22,10 @@ mod gpu;
 mod host_fs;
 pub mod hv;
 mod input;
+pub mod inspect;
 mod instance;
 mod io;
+mod ipc;
 #[cfg(feature = "wasmtime-runtime")]
 mod isa;
 #[cfg(feature = "wasmtime-runtime")]
@@ -89,17 +92,18 @@ pub use component::{
     ComponentOutputStreamKind, ComponentRawMutex, ComponentRawMutexGuard, ComponentRawRwLock,
     ComponentRawRwLockReadGuard, ComponentRawRwLockWriteGuard, ComponentResourceTableError,
     ComponentRunResult, ComponentRuntimeEngine, ComponentRuntimeFactory, ComponentRuntimeState,
-    ComponentSerialPort, ComponentStoreData, ComponentTcpBackend, ComponentTcpStream,
-    ComponentUdpBackend, ComponentUdpSocket, ComponentWorld, FIBER_STACK_COMMIT_STEP,
-    FIBER_STACK_ENTRY_RESERVE, FIBER_STACK_HOST_RESERVE, InstanceKilled, LocalOutputSink,
-    PerProcessorProvider, ProviderAlreadyInstalled, ProviderError, ProviderReceiver,
-    ProviderSender, ProviderSlot, RawMutexGuardResource, RawMutexResource,
+    ComponentSamplingSession, ComponentSerialPort, ComponentSnapshotHold, ComponentStoreData,
+    ComponentTcpBackend, ComponentTcpStream, ComponentUdpBackend, ComponentUdpSocket,
+    ComponentWorld, FIBER_STACK_COMMIT_STEP, FIBER_STACK_ENTRY_RESERVE, FIBER_STACK_HOST_RESERVE,
+    InstanceKilled, LocalOutputSink, PerProcessorProvider, ProviderAlreadyInstalled, ProviderError,
+    ProviderReceiver, ProviderSender, ProviderSlot, RawMutexGuardResource, RawMutexResource,
     RawRwLockReadGuardResource, RawRwLockResource, RawRwLockWriteGuardResource,
-    RetiredNetworkHandle, SerialPortResource, SocketRetirementQueue, SocketRetirementSender,
-    StoreSocketRetirement, TcpStreamResource, UdpSocketResource, directory_prefix,
-    map_resource_table_error, parent_path, path_is_within_directory, provider_channel,
-    resolve_absolute_path, resolve_child_path, resolve_guest_path, retire_queued_handles,
-    store_kernel_heap_bytes, strip_directory_prefix, wait_until_runtime_deadline,
+    RetiredNetworkHandle, SerialPortResource, SnapshotRetirementSender, SocketRetirementQueue,
+    SocketRetirementSender, StoreSocketRetirement, TcpStreamResource, UdpSocketResource,
+    directory_prefix, map_resource_table_error, parent_path, path_is_within_directory,
+    provider_channel, resolve_absolute_path, resolve_child_path, resolve_guest_path,
+    retire_queued_handles, store_kernel_heap_bytes, strip_directory_prefix,
+    wait_until_runtime_deadline,
 };
 pub use device::{
     DEFAULT_DMA_BUDGET_BYTES, DeviceGrant, DeviceGrantRegistry, DeviceInterruptHooks,
@@ -119,19 +123,20 @@ pub use exec::{
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
     Executor, ExecutorRunStats, FoldedProfileSample, FreezeError, FrozenMachine, GUEST_TIME_SLICE,
     IdleOutcome, InstanceSpawner, JoinHandle, KernelClock, LocalJoinHandle,
-    MAX_FILTER_PREFIX_BYTES, MAX_FILTER_PREFIXES, Mutex, MutexGuard, Notified, Notify,
-    NotifyWaiter, ObservationScope, OfflineError, OfflineRefusal, OnlineError, OnlineSet,
-    OwnInstance, OwnedRawMutexLease, OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease,
-    PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, PinnedSpawnError,
-    PinnedTasks, PrefixSet, PrefixSetError, PressureLevel, ProcessorControl, ProcessorLifecycle,
-    ProfileFilter, ProfileHistory, ProfileScope, ProfileSink, ProgressChanged, ProgressMark,
-    ProgressSignal, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease, RawRwLockWriteLease,
-    ReadyLink, RwLock, RwLockReadGuard, RwLockWriteGuard, SequenceSignal, SharedTimeline,
-    SignalTimeline, Sleep, Spawner, StatsSample, TaskCapacityError, TaskFunding, Timeline,
-    TimelineError, TimelinePoint, TimelineSource, Timer, TraceEvent, TraceField, TraceFilter,
-    TraceHistory, TraceLevel, TraceLog, TraceValue, UptimeClock, YieldNow, elapsed_millis,
-    matches_perf_metric_filter, matches_profile_filter, matches_trace_filter, monotonic_nanos,
-    online_processor_count, parse_console_text, wait_timelines, wall_clock_offset_nanos, yield_now,
+    MAX_FILTER_PREFIX_BYTES, MAX_FILTER_PREFIXES, MachineObservation, Mutex, MutexGuard,
+    NoObservation, Notified, Notify, NotifyWaiter, ObservationScope, OfflineError, OfflineRefusal,
+    OnlineError, OnlineSet, OwnInstance, OwnedRawMutexLease, OwnedRawRwLockReadLease,
+    OwnedRawRwLockWriteLease, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample,
+    PinnedSpawnError, PinnedTasks, PrefixSet, PrefixSetError, PressureLevel, ProcessorControl,
+    ProcessorLifecycle, ProfileFilter, ProfileHistory, ProfileScope, ProfileSink, ProgressChanged,
+    ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease,
+    RawRwLockWriteLease, ReadyLink, RwLock, RwLockReadGuard, RwLockWriteGuard, SequenceSignal,
+    SharedTimeline, SignalTimeline, Sleep, Spawner, SubtreeObservation, TaskCapacityError,
+    TaskFunding, Timeline, TimelineError, TimelinePoint, TimelineSource, Timer, TraceEvent,
+    TraceField, TraceFilter, TraceHistory, TraceLevel, TraceLog, TraceValue, UptimeClock, YieldNow,
+    elapsed_millis, matches_perf_metric_filter, matches_profile_filter, matches_trace_filter,
+    monotonic_nanos, online_processor_count, parse_console_text, wait_timelines,
+    wall_clock_offset_nanos, yield_now,
 };
 pub use gpu::{
     BlobCreate, BlobHold, BlobMapping, CompletionSignal, Gpu3dOwnership, Gpu3dService,
@@ -155,12 +160,21 @@ pub use input::{
     InputLedSender, InputOwnership, InputService, InputServiceError, MAX_CLAIMED_DEVICES,
     MAX_REPORT_EVENTS, install_input_devices,
 };
+pub use inspect::{
+    ComponentPublication, DEFAULT_INSPECT_LIMIT, INSPECT_FORMAT_VERSION, INSPECT_HEADER_BYTES,
+    INSPECT_HEADER_MAGIC, InspectEntry, InspectPublication, InspectPublishError, InspectRegistry,
+    InspectSnapshot, InspectValue, KernelTelemetrySnapshot, MAX_BLOB_VALUE_BYTES,
+    MAX_COMPONENT_ENTRIES, MAX_INSPECT_LIMIT, MAX_INSPECT_SPAN_BYTES, MAX_PUBLICATION_NAME_BYTES,
+    MAX_PUBLICATIONS_PER_INSTANCE, MAX_RELATIVE_PATH_BYTES, MAX_SEQLOCK_RETRIES,
+    MAX_TEXT_VALUE_BYTES, PublicationStatus, emit_kernel_entries, is_valid_publication_name,
+    is_valid_relative_path,
+};
 pub use instance::{
-    CondemnedMemory, InstanceActivity, InstanceId, InstanceProfileTotal, InstanceRegistry,
-    InstanceSnapshot, KernelHeapCharge, KillOutcome, KillReason, MemoryPool, OOM_RECLAIM_GRACE,
-    OffProcessor, OffProcessorRefused, OomKillDecision, OomKillOutcome, OomPolicy, OomVictim,
-    ProcessorTurn, RegisteredInstance, StoragePayer, StorageShare, StoreTurns, UserMemoryCharge,
-    allow_instance_resource_growth,
+    CondemnedMemory, InspectReadPin, InstanceActivity, InstanceId, InstanceProfileTotal,
+    InstanceRegistry, InstanceSnapshot, KernelHeapCharge, KillOutcome, KillReason, MemoryPool,
+    OOM_RECLAIM_GRACE, OffProcessor, OffProcessorRefused, OomKillDecision, OomKillOutcome,
+    OomPolicy, OomVictim, ProcessorTurn, RegisteredInstance, StoragePayer, StorageShare,
+    StoreTurns, UserMemoryCharge, allow_instance_resource_growth,
 };
 pub use io::{
     BlockCache, BlockCacheError, BlockCacheLimits, BlockInstallError, BlockMut, BlockPages,
@@ -175,6 +189,10 @@ pub use io::{
     TryWrite, admit_block_devices, byte_channel, emit_panic_report, install_block_devices,
     install_scratch_swap, read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
 };
+pub use ipc::{
+    IPC_MAX_CHUNK_BYTES, IpcEndpoint, IpcEndpointGrants, IpcError, IpcGrantError,
+    MAX_IPC_GRANT_NAME_BYTES, MAX_IPC_GRANTS, ipc_channel,
+};
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
     dispatch_native_trap, install_native_trap_handler,
@@ -183,8 +201,8 @@ pub use limine_tpm_event_log::LimineTpmEventLogRequest;
 #[cfg(feature = "linux")]
 pub use linux_container::{
     ContainerConfig, ContainerError, ContainerFilesystem, ContainerId, ContainerMount,
-    ContainerMountSpec, ContainerNodeInfo, ContainerProcessGuard, ContainerResolved,
-    LinuxContainer,
+    ContainerMountSnapshot, ContainerMountSpec, ContainerNodeInfo, ContainerProcessGuard,
+    ContainerResolved, LinuxContainer, LinuxContainerSnapshot,
 };
 pub use machine::{
     AdvanceCause, DeviceResets, GENERATION_PROBE_INTERVAL, Generation, MachineGeneration,
@@ -234,27 +252,29 @@ pub use network::{
     validate_http_path_with_query, validate_http_status_code,
 };
 pub use process::{
-    AudioClaimCap, BtrfsDedupeCap, BtrfsDeviceAdminCap, BtrfsMountAdminCap, BtrfsReceiveCap,
-    BtrfsReflinkCap, BtrfsSendCap, BtrfsSnapshotCap, BtrfsSubvolCreateCap, BtrfsSubvolDeleteCap,
-    BtrfsSubvolReadCap, BtrfsSubvolReadOnlyCap, ClockAuthorityRights, CompileAuthority,
-    CompilerMaxInputBytesSetting, ComponentStdioRefusal, ControlProcessorsCap,
+    AudioClaimCap, AuthorityScope, BtrfsDedupeCap, BtrfsDeviceAdminCap, BtrfsMountAdminCap,
+    BtrfsReceiveCap, BtrfsReflinkCap, BtrfsSendCap, BtrfsSnapshotCap, BtrfsSubvolCreateCap,
+    BtrfsSubvolDeleteCap, BtrfsSubvolReadCap, BtrfsSubvolReadOnlyCap, ClockAuthorityRights,
+    CompileAuthority, CompilerMaxInputBytesSetting, ComponentStdioRefusal,
     DEFAULT_COMPILER_MAX_INPUT_BYTES, DeviceClassRights, DeviceGrantClaimCap,
-    DiagnosticAuthorityRights, DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen,
-    DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority, GpuOpenCap, InputClaimCap,
-    JoinAuthority, LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap, LinuxImageRefusal,
-    MachineAuthorityRights, MountAuthorityRights, MountCap, MulticastCap, NetworkAdminCap,
-    NetworkAuthorityRights, NetworkCap, ObserveMachineCap, PrivilegedBindCap, ProcessAuthority,
-    ProcessAuthorityError, ProcessAuthorityRights, ProgramExecError, ProgramExecErrorDetail,
-    ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, SetWallClockCap,
-    SettingsAuthorityRights, SignalAuthority, SpawnAuthority, SymlinkCreateCap, SymlinkReadCap,
-    TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, TtyControlCap, UdpCap,
-    UnbindableStdio, UnmountCap, VirtualizeCap, WriteSettingsCap,
+    DiagnosticAuthorityRights, DiagnosticsControlCap, DirectoryAuthorityRights, DirectoryCap,
+    DirectoryPreopen, DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority, GpuOpenCap,
+    InputClaimCap, InspectReadCap, InstanceControlCap, JoinAuthority, LinkAuthorityRights,
+    LinkSourceCap, LinkTargetDirectoryCap, LinuxImageRefusal, MachineAuthorityRights,
+    MachineControlCap, MachineIdentityCap, MountAuthorityRights, MountCap, MulticastCap,
+    NetworkAdminCap, NetworkAuthorityRights, NetworkCap, PrivilegedBindCap, ProcessAuthority,
+    ProcessAuthorityError, ProcessAuthorityRights, ProfileReadCap, ProgramExecError,
+    ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory, RequestedAuthorityScope,
+    RuntimeMessage, SetWallClockCap, SettingsAuthorityRights, SignalAuthority, SpawnAuthority,
+    SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap,
+    TerminalOutputCap, TraceReadCap, TtyControlCap, UdpCap, UnbindableStdio, UnmountCap,
+    VirtualizeCap, WriteSettingsCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
     KernelLlvmProfile, LlvmProfile, LlvmProfileError, MAX_PROFILE_READ, ProfileSection,
     SAMPLE_DRAIN_INTERVAL_MILLIS, SAMPLE_RING_CAPACITY, SampleCapture, SampledCode,
-    WasmFunctionSample,
+    SamplingSession, WasmFunctionSample,
 };
 pub use runtime::{
     AuthorityDomain, ComponentHostNetwork, ComponentNetworkService, ComponentNetworkState,
@@ -262,17 +282,20 @@ pub use runtime::{
     HostFileSystem, HostFilledWrite, HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore,
     HostWrite, HttpsRecord, Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress,
     NetworkPacketPump, ObjectIdentity, PacketFrame, PingError, PingErrorKind, PingReply,
-    RegisteredTcpReadBuffer, RuntimeState, SocketReadiness, TcpAccepted, TcpConnectPoll, TcpError,
-    TcpErrorKind, TcpListener, TcpReadInto, TcpReadProgress, TcpWriteProgress, UdpBinding,
-    UdpDatagram, UdpError, UdpErrorKind,
+    RegisteredTcpReadBuffer, RuntimeState, SnapshotHold, SnapshotHoldBusy, SocketReadiness,
+    TcpAccepted, TcpConnectPoll, TcpError, TcpErrorKind, TcpListener, TcpReadInto, TcpReadProgress,
+    TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use settings::{
     Holds, SETTING_COUNT, Setting, SettingCell, SettingEntry, SettingUnit, SettingValue,
     SettingWriteError, Settings,
 };
 pub use signing_key::{
-    CwasmSigningKey, PAYLOAD_REGISTER, ProvisionCause, SeedSource, SettledSigningKey,
-    SigningKeyError, settle_signing_key,
+    CwasmSigningKey, MACHINE_IDENTITY_INFO, MACHINE_IDENTITY_SIGNATURE_PREFIX,
+    MAX_MACHINE_IDENTITY_CHALLENGE_BYTES, MAX_MACHINE_IDENTITY_DOMAIN_BYTES, MachineIdentityKey,
+    MachineIdentitySignError, MachineIdentityVerifyError, PAYLOAD_REGISTER, ProvisionCause,
+    SeedSource, SettledSigningKey, SigningKeyError, machine_identity_signing_message,
+    settle_signing_key,
 };
 pub use surface::{
     MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurface, ReturnedSurfaces,

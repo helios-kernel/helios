@@ -407,6 +407,7 @@ pub(super) async fn run_program_executable<CpuImpl, Net, StorageImpl>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
+    ipc_grants: crate::IpcEndpointGrants,
     filesystem: Option<Namespace<StorageImpl>>,
     descriptors: DescriptorOrigin<Net>,
     signal_state: WasixSignalState,
@@ -451,6 +452,7 @@ where
                         argv,
                         env,
                         authority,
+                        ipc_grants,
                         filesystem,
                         signal_state,
                         spawner,
@@ -1308,12 +1310,17 @@ where
                             .runtime_state
                             .root_namespace()
                     });
+                    let ephemeral = Arc::new(crate::LinuxContainer::ephemeral(
+                        id,
+                        replacement.authority.clone(),
+                        namespace,
+                    ));
+                    replacement_state
+                        .exec_context
+                        .runtime_state
+                        .register_container(&ephemeral);
                     Some(LinuxContainerLaunch {
-                        container: Arc::new(crate::LinuxContainer::ephemeral(
-                            id,
-                            replacement.authority.clone(),
-                            namespace,
-                        )),
+                        container: ephemeral,
                         credentials: None,
                     })
                 } else {
@@ -1324,6 +1331,7 @@ where
                 replacement.argv,
                 replacement.env,
                 replacement.authority,
+                crate::IpcEndpointGrants::new(),
                 replacement.filesystem,
                 replacement.descriptors,
                 replacement.signal_state,
@@ -1355,6 +1363,7 @@ pub(super) async fn run_program_component<CpuImpl, Net, StorageImpl>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
+    ipc_grants: crate::IpcEndpointGrants,
     filesystem: Option<Namespace<StorageImpl>>,
     signal_state: WasixSignalState,
     spawner: crate::InstanceSpawner<CpuImpl>,
@@ -1407,7 +1416,6 @@ where
             exec_context.runtime_state.clone(),
             exec_context.instance_registry,
             launched_instance,
-            None,
             filesystem,
             argv,
             env,
@@ -1415,7 +1423,8 @@ where
             output_mode,
             exec_context.read_serial,
             exec_context.write_serial,
-        ),
+        )
+        .with_ipc_grants(ipc_grants),
         Some(signal_state.clone()),
     );
     if let Some(store_prepare_started) = store_prepare_started {
