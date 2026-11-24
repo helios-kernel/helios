@@ -2039,7 +2039,7 @@ jobs:
           set -o pipefail
           runtime="$GITHUB_WORKSPACE/smoke-runtime/iommu"
           mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm --iommu --desktop --audiodev none \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
