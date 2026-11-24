@@ -227,8 +227,16 @@ def grub(config):
 
 
 def host_target():
+    # A cold `rustup` proxy may download the pinned toolchain and targets from
+    # `rust-toolchain.toml` on the first `rustc` invocation, which can take
+    # longer than 30 seconds.
     info = subprocess.run(
-        ["rustc", "-vV"], check=True, capture_output=True, text=True, timeout=30
+        ["rustc", "-vV"],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        timeout=300,
     ).stdout
     for line in info.splitlines():
         if line.startswith("host: "):

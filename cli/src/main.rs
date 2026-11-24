@@ -4132,6 +4132,7 @@ mod tests {
                 ProgramRole {
                     library: false,
                     plugs: vec!["webgpu".to_owned()],
+                    ..ProgramRole::default()
                 },
             ),
             test_program_manifest(
@@ -4139,6 +4140,7 @@ mod tests {
                 ProgramRole {
                     library: true,
                     plugs: Vec::new(),
+                    ..ProgramRole::default()
                 },
             ),
         ]
