@@ -143,10 +143,14 @@ where
 
     if verify_writes {
         let pointer = range.start.raw() as *mut u32;
-        unsafe {
-            pointer.write_volatile(0xdead_beef);
-            assert_eq!(pointer.read_volatile(), 0xdead_beef);
-        }
+        // SAFETY: `range` was committed with `READ | WRITE` across at least
+        // one page-aligned page, and `verify_writes` asserts committed pages
+        // are directly writable in the caller's address space.
+        unsafe { pointer.write_volatile(0xdead_beef) };
+        // SAFETY: `pointer` remains mapped and readable for `u32` (page-aligned),
+        // and the volatile write above initialized the word.
+        let read_back = unsafe { pointer.read_volatile() };
+        assert_eq!(read_back, 0xdead_beef);
     }
 
     address_space.decommit(range).expect("decommit");

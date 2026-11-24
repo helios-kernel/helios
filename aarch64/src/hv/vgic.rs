@@ -18,6 +18,8 @@ const EOI_MAINTENANCE: u64 = 1 << 41;
 macro_rules! read {
     ($reg:ident) => {{
         let value;
+        // SAFETY: reading an EL2 virtual GIC system register (`ich_*_el2`) at
+        // EL2 touches no memory and only reads the calling CPU's interface.
         unsafe { asm!(concat!("mrs {value}, ", stringify!($reg)), value = out(reg) value,
             options(nomem, nostack, preserves_flags)); }
         value
@@ -25,6 +27,8 @@ macro_rules! read {
 }
 macro_rules! write {
     ($reg:ident, $value:expr) => {{
+        // SAFETY: writing an EL2 virtual GIC system register (`ich_*_el2`)
+        // affects only this CPU's virtual interrupt state under masked IRQs.
         unsafe { asm!(concat!("msr ", stringify!($reg), ", {value}"), value = in(reg) $value,
             options(nomem, nostack, preserves_flags)); }
     }};
@@ -211,6 +215,8 @@ impl Vgic {
             ich_hcr_el2,
             1u64 | (1 << 10) | if self.window { 1 << 1 } else { 0 }
         );
+        // SAFETY: `isb` synchronizes the preceding `ich_hcr_el2` write and
+        // takes no operands.
         unsafe {
             asm!("isb", options(nostack, preserves_flags));
         }
@@ -218,6 +224,8 @@ impl Vgic {
 
     pub(super) fn detach(&mut self) {
         write!(ich_hcr_el2, 0u64);
+        // SAFETY: `isb` synchronizes disabling `ich_hcr_el2` before reading
+        // back the virtual GIC registers.
         unsafe {
             asm!("isb", options(nostack, preserves_flags));
         }

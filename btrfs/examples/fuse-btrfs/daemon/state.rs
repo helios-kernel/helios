@@ -170,7 +170,8 @@ pub struct State<S = Device, B = DeviceBacking> {
 
 /// The host's memory, which holds the writer's dirty data.
 fn host_memory_bytes() -> u64 {
-    // SAFETY: `sysinfo` writes only the struct it is given.
+    // SAFETY: `libc::sysinfo` is a C `#[repr(C)]` struct of integer and
+    // fixed-size byte-array fields, so an all-zero bit pattern is valid.
     let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
     // SAFETY: `info` is a valid, writable `struct sysinfo`.
     let status = unsafe { libc::sysinfo(&mut info) };

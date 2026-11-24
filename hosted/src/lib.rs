@@ -57,6 +57,12 @@ impl helios_hal::critical_section::LocalInterruptMask for HostedInterruptMask {
         false
     }
 
+    /// Restores the hosted interrupt state from [`Self::mask`].
+    ///
+    /// # Safety
+    ///
+    /// `was_enabled` must be the value returned by the matching
+    /// [`Self::mask`] call on this thread (`false` on hosted).
     unsafe fn restore(was_enabled: bool) {
         debug_assert!(
             !was_enabled,

@@ -169,11 +169,12 @@ impl SwapLeafFormat for ModelFormat {
         let frame = self.frame_of(page);
         self.set_leaf(page, swap_word(token));
         if let Some(byte) = self.late_store.take() {
-            // SAFETY: the frame is still allocated; it is the test's.
-            unsafe {
-                frame.as_ptr().write(byte);
-                frame.as_ptr().add(PAGE - 1).write(byte);
-            }
+            // SAFETY: `frame` is still allocated and exclusively owned by this test.
+            unsafe { frame.as_ptr().write(byte) };
+            // SAFETY: `PAGE - 1 < PAGE`, so the offset stays within `frame`.
+            let tail = unsafe { frame.as_ptr().add(PAGE - 1) };
+            // SAFETY: `tail` points to the last byte of the live `frame`.
+            unsafe { tail.write(byte) };
         }
         self.allocated_at_detach.set(allocated_bytes());
         Ok(frame)

@@ -15,6 +15,8 @@ pub(super) struct Features {
 macro_rules! read {
     ($reg:ident) => {{
         let value: u64;
+        // SAFETY: reading an AArch64 architectural ID register via `mrs` has
+        // no side effects and touches no memory.
         unsafe { asm!(concat!("mrs {value}, ", stringify!($reg)), value = out(reg) value,
             options(nomem, nostack, preserves_flags)); }
         value

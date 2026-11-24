@@ -30,11 +30,12 @@ const PAT_TYPE_WRITE_COMBINING: u64 = 0x01;
 pub(crate) fn program_page_attribute_table() {
     let shift = WRITE_COMBINING_ENTRY * 8;
     // SAFETY: `IA32_PAT` exists on every processor this backend boots
-    // (PAT support is architectural on x86-64), and the only entry the
+    // (PAT support is architectural on x86-64).
+    let table = unsafe { rdmsr(IA32_PAT) };
+    let table = (table & !(0xff << shift)) | (PAT_TYPE_WRITE_COMBINING << shift);
+    // SAFETY: `IA32_PAT` is architectural on x86-64, and the only entry this
     // write changes is one no mapping selects yet.
     unsafe {
-        let table = rdmsr(IA32_PAT);
-        let table = (table & !(0xff << shift)) | (PAT_TYPE_WRITE_COMBINING << shift);
         wrmsr(IA32_PAT, table);
     }
 }

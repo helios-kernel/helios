@@ -305,7 +305,13 @@ fn is_message_field(field: &tracing::field::Field) -> bool {
     field.name().contains("message")
 }
 
+// SAFETY: `console` is only accessed through `&mut *self.console.get()` by the
+// single winner of `flushing`, and `queue`, `buffers`, `flushing`, and
+// `next_span_id` are thread-safe when `Console: Send`.
 unsafe impl<Console: Send> Send for KernelConsoleSubscriber<Console> {}
+// SAFETY: `try_flush` serializes all access to `self.console` using `flushing`
+// with `AcqRel`/`Acquire`/`Release` ordering, so `Console` is never accessed
+// concurrently and only requires `Console: Send`; the remaining fields are `Sync`.
 unsafe impl<Console: Send> Sync for KernelConsoleSubscriber<Console> {}
 
 #[cfg(test)]

@@ -182,7 +182,9 @@ impl LinearImage {
             image,
             memory: None,
         };
+        // SAFETY: `image` is a live Vulkan image created on `raw_device`.
         let requirements = unsafe { raw_device.get_image_memory_requirements(image) };
+        // SAFETY: `physical` belongs to the retained `instance`.
         let memory_properties = unsafe { instance.get_physical_device_memory_properties(physical) };
         let memory_type = memory_properties
             .memory_types_as_slice()
@@ -204,10 +206,18 @@ impl LinearImage {
             .memory_type_index(memory_type)
             .push_next(&mut dedicated)
             .push_next(&mut export);
+        // SAFETY: `raw_device` is alive, the `dedicated` and `export` chain
+        // structures live for the call, and `memory_type` is an index into
+        // `memory_properties` compatible with `image`.
         let memory = unsafe { raw_device.allocate_memory(&memory_info, None) }?;
         allocation.memory = Some(memory);
+        // SAFETY: `image` and `memory` belong to `raw_device`, `memory` was
+        // allocated with `requirements.size` and `memory_type`, and offset `0`
+        // satisfies `requirements.alignment`.
         unsafe { raw_device.bind_image_memory(image, memory, 0) }?;
         let subresource = vk::ImageSubresource::default().aspect_mask(vk::ImageAspectFlags::COLOR);
+        // SAFETY: `image` is a live `LINEAR`-tiling color image on `raw_device`
+        // with mip level 0 and array layer 0.
         let layout = unsafe { raw_device.get_image_subresource_layout(image, subresource) };
         let layout = image_layout(width, height, pixel_format, layout.offset, layout.row_pitch)?;
         // SAFETY: dedicated memory backs this live linear image at offset zero;
@@ -296,16 +306,21 @@ impl LinearImage {
         // Hold the snatch guard while recording its native image handle.
         let source_hal =
             unsafe { global.texture_as_hal::<Vulkan>(source) }.ok_or(device::DeviceError::Lost)?;
-        // SAFETY: the first command buffer establishes COPY_SRC; both buffers
-        // execute in one submission. Core tracks the source in that submission,
-        // and the device timeline retains the destination until it completes.
-        let recorded = unsafe {
-            global.command_encoder_as_hal_mut::<Vulkan, _, _>(copy, |encoder| {
-                let encoder = encoder.ok_or(device::DeviceError::Lost)?;
+        let record = encoder_callback(|encoder| {
+            let encoder = encoder.ok_or(device::DeviceError::Lost)?;
+            // SAFETY: the first command buffer establishes COPY_SRC; both
+            // buffers execute in one submission, `copy` is recording on this
+            // device's queue family, `source_hal` is a live Vulkan texture on
+            // this device, core tracks the source in that submission, and the
+            // device timeline retains the destination until it completes.
+            unsafe {
                 self.record_copy_and_release(encoder.raw_handle(), source_hal.raw_handle());
-                Ok::<(), device::DeviceError>(())
-            })
-        };
+            }
+            Ok::<(), device::DeviceError>(())
+        });
+        // SAFETY: `copy` is a live Vulkan command encoder on this device; its
+        // raw handle is not manually destroyed and the guard drops on return.
+        let recorded = unsafe { global.command_encoder_as_hal_mut::<Vulkan, _, _>(copy, record) };
         drop(source_hal);
         recorded?;
         let copy = scratch.finish(copy)?;
@@ -352,7 +367,8 @@ impl LinearImage {
             .dst_subresource(layers)
             .extent(self.extent);
         let release = release_barrier(self.image, self.queue_family);
-        // SAFETY: forwarded from the recording and resource lifetime contract.
+        // SAFETY: forwarded from the recording and resource lifetime contract;
+        // `prepare` transitions `self.image` to `TRANSFER_DST_OPTIMAL`.
         unsafe {
             self.raw_device.cmd_pipeline_barrier(
                 commands,
@@ -363,6 +379,10 @@ impl LinearImage {
                 &[],
                 &[prepare],
             );
+        }
+        // SAFETY: forwarded from the recording and resource lifetime contract;
+        // `self.image` was transitioned to `TRANSFER_DST_OPTIMAL` above.
+        unsafe {
             self.raw_device.cmd_copy_image(
                 commands,
                 source,
@@ -371,6 +391,10 @@ impl LinearImage {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &[copy],
             );
+        }
+        // SAFETY: forwarded from the recording and resource lifetime contract;
+        // `release` transitions `self.image` to `QUEUE_FAMILY_FOREIGN_EXT`.
+        unsafe {
             self.raw_device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -382,6 +406,12 @@ impl LinearImage {
             );
         }
     }
+}
+
+fn encoder_callback<R>(
+    callback: impl FnOnce(Option<&mut <Vulkan as wgpu_hal::Api>::CommandEncoder>) -> R,
+) -> impl FnOnce(Option<&mut <Vulkan as wgpu_hal::Api>::CommandEncoder>) -> R {
+    callback
 }
 
 fn color_range() -> vk::ImageSubresourceRange {
@@ -408,10 +438,14 @@ fn release_barrier(image: vk::Image, queue_family: u32) -> vk::ImageMemoryBarrie
 impl Drop for LinearImage {
     fn drop(&mut self) {
         // SAFETY: the device timeline drops an image only once the queue no
-        // longer uses it, and before the device; the SDK export retains
-        // storage for any later compositor access.
+        // longer uses it, and before the device.
         unsafe {
             self.raw_device.destroy_image(self.image, None);
+        }
+        // SAFETY: `self.image` was destroyed above, no queue work uses
+        // `self.memory`, and the SDK export retains storage independently for
+        // any later compositor access.
+        unsafe {
             self.raw_device.free_memory(self.memory, None);
         }
     }
@@ -424,11 +458,15 @@ struct Allocation {
 }
 impl Drop for Allocation {
     fn drop(&mut self) {
-        // SAFETY: construction has not submitted this image. Destroy its binding
-        // before freeing the memory, including every partial-construction path.
+        // SAFETY: construction has not submitted this image, and `raw_device`
+        // outlives this rollback guard.
         unsafe {
             self.raw_device.destroy_image(self.image, None);
-            if let Some(memory) = self.memory {
+        }
+        if let Some(memory) = self.memory {
+            // SAFETY: the image binding was destroyed above (including on
+            // partial-construction paths), and `memory` is unreferenced.
+            unsafe {
                 self.raw_device.free_memory(memory, None);
             }
         }

@@ -27,25 +27,29 @@ unsafe extern "system" fn allocate<F: Factory>(
     allocator: *const vk::AllocationCallbacks<'_>,
     output: *mut vk::DeviceMemory,
 ) -> vk::Result {
-    // SAFETY: Vulkan requires writable output and a live device.
+    // SAFETY: Vulkan requires writable output.
     unsafe { *output = vk::DeviceMemory::null() };
+    // SAFETY: Vulkan supplies a live device belonging to this factory.
     let owner = unsafe { shared::<F>(object(device)) };
+    // SAFETY: the live device's dispatch header is immutable after creation.
     let device_id = unsafe { (*object(device)).id };
     let mut state = owner.lock();
     if state.fault.is_some() {
         return vk::Result::ERROR_DEVICE_LOST;
     }
+    // SAFETY: Vulkan supplies valid allocation callbacks or null for default allocation.
     let allocator = unsafe { HostAllocator::new(allocator, vk::SystemAllocationScope::OBJECT) };
     let result = (|| -> Result<vk::Result, Error<TransportError<F>>> {
-        // SAFETY: the create-info remains live throughout this Vulkan call.
+        // SAFETY: the allocate-info remains live throughout this Vulkan call.
+        let allocate_info = unsafe { &*info };
         let allocation = Memory {
-            size: unsafe { (*info).allocation_size },
+            size: allocate_info.allocation_size,
             host_visible: state
                 .devices
                 .get(&device_id)
                 .unwrap()
                 .memory_properties
-                .memory_types[unsafe { (*info).memory_type_index } as usize]
+                .memory_types[allocate_info.memory_type_index as usize]
                 .property_flags
                 .contains(vk::MemoryPropertyFlags::HOST_VISIBLE),
             resource: None,
@@ -56,8 +60,8 @@ unsafe extern "system" fn allocate<F: Factory>(
             Err(_) => return Ok(vk::Result::ERROR_OUT_OF_HOST_MEMORY),
         };
         let external = state.devices.get(&device_id).unwrap().external;
-        // SAFETY: the allocate-info and its chain are live for this call.
-        let rewritten = unsafe { super::external::allocate_info(external, &*info) };
+        // SAFETY: `allocate_info` and its `pNext` chain are live for this call.
+        let rewritten = unsafe { super::external::allocate_info(external, allocate_info) };
         let renderer_info = rewritten.as_ref().map_or(info, Rewritten::head);
         let mut handle = wire::VkDeviceMemory(state.connection.object_id()?);
         // SAFETY: callback pointers are guest-only; the renderer allocates
@@ -95,9 +99,9 @@ unsafe extern "system" fn free<F: Factory>(
     if memory == vk::DeviceMemory::null() {
         return;
     }
-    // SAFETY: Vulkan requires a live allocation owned by device, without
-    // pending GPU accesses or resources still bound to it.
+    // SAFETY: Vulkan requires a live device owned by this factory.
     let owner = unsafe { shared::<F>(object(device)) };
+    // SAFETY: the live device's dispatch header is immutable after creation.
     let device_id = unsafe { (*object(device)).id };
     let mut state = owner.lock();
     let allocation = state
@@ -110,6 +114,7 @@ unsafe extern "system" fn free<F: Factory>(
     // Revoke guest mappings even after device loss, before renderer release.
     drop(allocation);
     if state.fault.is_none() {
+        // SAFETY: the device and memory allocation are live with no pending accesses.
         let result = unsafe {
             wire::vn_call_vkFreeMemory(
                 &mut state.connection,
@@ -132,24 +137,25 @@ unsafe extern "system" fn map<F: Factory>(
     _flags: vk::MemoryMapFlags,
     output: *mut *mut c_void,
 ) -> vk::Result {
-    // SAFETY: Vulkan supplies a writable output pointer and valid range.
+    // SAFETY: Vulkan supplies a writable output pointer.
     unsafe { *output = null_mut() };
-    // SAFETY: the Vulkan caller owns this device and allocation.
-    let result = unsafe {
-        with_memory::<F, _>(device, memory, |allocation| {
-            let pointer = allocation.resource.as_mut().unwrap().map()?;
-            let allocation_size = allocation.size;
-            let end = if size == vk::WHOLE_SIZE {
-                allocation_size
-            } else {
-                offset + size
-            };
-            allocation.active = Some(offset..end);
-            // SAFETY: Vulkan validates the range against the allocation.
-            *output = pointer.as_ptr().add(offset as usize).cast();
-            Ok(())
-        })
+    let call = |allocation: &mut Memory<F::Transport>| {
+        let pointer = allocation.resource.as_mut().unwrap().map()?;
+        let allocation_size = allocation.size;
+        let end = if size == vk::WHOLE_SIZE {
+            allocation_size
+        } else {
+            offset + size
+        };
+        allocation.active = Some(offset..end);
+        // SAFETY: Vulkan validates `offset` against the allocation size.
+        let mapped = unsafe { pointer.as_ptr().add(offset as usize) };
+        // SAFETY: Vulkan supplies a writable output pointer for `vkMapMemory`.
+        unsafe { *output = mapped.cast() };
+        Ok(())
     };
+    // SAFETY: the Vulkan caller owns this device and allocation.
+    let result = unsafe { with_memory::<F, _>(device, memory, call) };
     result.map_or_else(|error| error, |()| vk::Result::SUCCESS)
 }
 
@@ -171,6 +177,11 @@ pub(crate) unsafe fn with_blob<F: Factory, R>(
     }
 }
 
+/// Lock the instance and run `visit` on a device memory allocation, exporting
+/// its blob resource on first access.
+///
+/// # Safety
+/// `device` must belong to `F` and `memory` must be a live allocation on `device`.
 unsafe fn with_memory<F: Factory, R>(
     device: vk::Device,
     memory: vk::DeviceMemory,
@@ -178,6 +189,7 @@ unsafe fn with_memory<F: Factory, R>(
 ) -> Result<R, vk::Result> {
     // SAFETY: the caller supplies a live device of this factory.
     let owner = unsafe { shared::<F>(object(device)) };
+    // SAFETY: the live device's dispatch header is immutable after creation.
     let device_id = unsafe { (*object(device)).id };
     let mut state = owner.lock();
     if state.fault.is_some() {
@@ -219,9 +231,10 @@ unsafe fn with_memory<F: Factory, R>(
 }
 
 unsafe extern "system" fn unmap<F: Factory>(device: vk::Device, memory: vk::DeviceMemory) {
-    // SAFETY: Vulkan requires a live, currently mapped allocation.
+    // SAFETY: Vulkan supplies a live device whose dispatch header is immutable.
+    let device_id = unsafe { (*object(device)).id };
+    // SAFETY: Vulkan requires a live, currently mapped allocation on `device`.
     unsafe {
-        let device_id = (*object(device)).id;
         invoke_void::<F>(object(device), |state| {
             let memory = state
                 .devices

@@ -22,7 +22,7 @@
 //! would have been told; there is no controller, so nothing races.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use helios_hal::device::{DeviceRegion, DeviceRegionAttributes, DmaCapability, DmaPlacement};
 use helios_hal::iommu::{DmaTranslation, PhysicalRange};
@@ -130,10 +130,16 @@ impl HostedDeviceMemory {
 
     /// The backend's own view of the registers, for a test that wants to
     /// prove an owner's write reached the device.
-    fn as_slice(&self) -> &[u8] {
-        // SAFETY: the mapping is live for the life of the process and
-        // covers exactly `bytes`.
-        unsafe { std::slice::from_raw_parts(self.base as *const u8, self.bytes) }
+    ///
+    /// Exposed as `[AtomicU8]` rather than `[u8]` because the same shared
+    /// file pages can be concurrently mutated through an owner's aliased
+    /// mapping.
+    fn as_slice(&self) -> &[AtomicU8] {
+        // SAFETY: the mapping is live for the life of the process, covers
+        // `bytes` initialised bytes, and `AtomicU8` has alignment 1 with
+        // interior mutability so concurrent writes through an aliased shared
+        // mapping do not violate shared-reference immutability.
+        unsafe { std::slice::from_raw_parts(self.base as *const AtomicU8, self.bytes) }
     }
 }
 
@@ -173,7 +179,7 @@ pub fn device_address_space() -> &'static HostedAddressSpace {
 }
 
 /// The backend's own view of the device's registers.
-pub fn device_registers() -> &'static [u8] {
+pub fn device_registers() -> &'static [AtomicU8] {
     platform().memory.as_slice()
 }
 

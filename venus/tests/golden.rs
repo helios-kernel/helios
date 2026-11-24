@@ -29,7 +29,7 @@ fn enumerate_instance_version_request() {
     let mut version = 0u32;
     let mut buffer = [0xAAu8; 32];
     let mut encoder = Encoder::new(&mut buffer, &protocol);
-    // SAFETY: `version` is live.
+    // SAFETY: `version` points to a live `u32` for the command encoding.
     unsafe { vn_encode_vkEnumerateInstanceVersion(&mut encoder, 0, &mut version) };
     let written = encoder.finish().unwrap();
 
@@ -43,7 +43,7 @@ fn enumerate_instance_version_request() {
     // The padding after the data is zero, not what the buffer held.
     assert_eq!(written, 16);
 
-    // SAFETY: `version` is live.
+    // SAFETY: `version` points to a live `u32` for the size calculation.
     let size = unsafe { vn_sizeof_vkEnumerateInstanceVersion(&protocol, &mut version) };
     assert_eq!(size, Ok(16));
 }
@@ -60,7 +60,7 @@ fn enumerate_instance_version_reply() {
 
     let mut version = 0u32;
     let mut decoder = Decoder::new(&reply);
-    // SAFETY: `version` is live.
+    // SAFETY: `version` points to a live writable `u32` for the reply decode.
     let result = unsafe { vn_decode_vkEnumerateInstanceVersion_reply(&mut decoder, &mut version) };
     assert_eq!(decoder.finish(), Ok(reply.len()));
     assert_eq!(result, VK_SUCCESS);
@@ -68,7 +68,7 @@ fn enumerate_instance_version_reply() {
 
     // And the size the reply is expected to have.
     let protocol = protocol();
-    // SAFETY: `version` is live.
+    // SAFETY: `version` points to a live `u32` for the reply size calculation.
     let size = unsafe { vn_sizeof_vkEnumerateInstanceVersion_reply(&protocol, &mut version) };
     assert_eq!(size, Ok(reply.len()));
 }
@@ -78,7 +78,7 @@ fn a_short_reply_fails_instead_of_reading_past_it() {
     let reply = u32le(VK_COMMAND_TYPE_vkEnumerateInstanceVersion_EXT.0 as u32);
     let mut version = 7u32;
     let mut decoder = Decoder::new(&reply);
-    // SAFETY: `version` is live.
+    // SAFETY: `version` points to a live writable `u32` for the reply decode.
     unsafe { vn_decode_vkEnumerateInstanceVersion_reply(&mut decoder, &mut version) };
     assert!(matches!(
         decoder.finish(),
@@ -94,7 +94,7 @@ fn a_reply_to_another_command_fails() {
     reply.extend(u64le(0));
     let mut version = 0u32;
     let mut decoder = Decoder::new(&reply);
-    // SAFETY: `version` is live.
+    // SAFETY: `version` points to a live writable `u32` for the reply decode.
     unsafe { vn_decode_vkEnumerateInstanceVersion_reply(&mut decoder, &mut version) };
     assert!(matches!(
         decoder.finish(),
@@ -108,7 +108,7 @@ fn a_buffer_that_is_too_small_reports_the_size_it_needs() {
     let mut version = 0u32;
     let mut buffer = [0u8; 8];
     let mut encoder = Encoder::new(&mut buffer, &protocol);
-    // SAFETY: `version` is live.
+    // SAFETY: `version` points to a live `u32` for the command encoding.
     unsafe { vn_encode_vkEnumerateInstanceVersion(&mut encoder, 0, &mut version) };
     assert_eq!(
         encoder.finish(),
@@ -139,7 +139,7 @@ fn application_info_with_a_name() {
     let info = application_info(c"hi".as_ptr());
     let mut buffer = [0u8; 128];
     let mut encoder = Encoder::new(&mut buffer, &protocol);
-    // SAFETY: `info` is live and its string is terminated.
+    // SAFETY: `info` is live and `pApplicationName` points to a NUL-terminated C string.
     unsafe { vn_encode_VkApplicationInfo(&mut encoder, &info) };
     let written = encoder.finish().unwrap();
 
@@ -154,8 +154,8 @@ fn application_info_with_a_name() {
     expected.extend(u32le(api_version(1, 3)));
     assert_eq!(&buffer[..written], expected);
 
-    // SAFETY: as above.
     let mut sizer = Sizer::new(&protocol);
+    // SAFETY: `info` is live and `pApplicationName` points to a NUL-terminated C string.
     unsafe { vn_encode_VkApplicationInfo(&mut sizer, &info) };
     assert_eq!(sizer.finish(), Ok(expected.len()));
 }
@@ -168,7 +168,7 @@ fn an_unterminated_string_array_is_refused() {
     let mut properties = [0x41 as c_char; 256];
     let mut buffer = [0u8; 512];
     let mut encoder = Encoder::new(&mut buffer, &protocol);
-    // SAFETY: the array is live and has the 256 bytes the wire asks for.
+    // SAFETY: `properties` points to 256 readable `c_char` bytes.
     unsafe {
         helios_venus::encode_char_array(&mut encoder, properties.as_mut_ptr(), properties.len());
     }
@@ -183,7 +183,7 @@ fn size_t_arrays_widen_for_a_guest_with_32_bit_pointers() {
     let values = [1u32, 2, 0xFFFF_FFFF];
     let mut buffer = [0u8; 64];
     let mut encoder = Encoder::new(&mut buffer, &protocol);
-    // SAFETY: `values` is live.
+    // SAFETY: `values` points to 3 initialized `u32` elements.
     unsafe { encode_widened_array(&mut encoder, values.as_ptr(), values.len()) };
     let written = encoder.finish().unwrap();
     let mut expected = Vec::new();
@@ -194,7 +194,7 @@ fn size_t_arrays_widen_for_a_guest_with_32_bit_pointers() {
 
     let mut decoded = [0u32; 3];
     let mut decoder = Decoder::new(&expected);
-    // SAFETY: `decoded` is live.
+    // SAFETY: `decoded` points to writable storage for 3 `u32` elements.
     unsafe { decode_widened_array(&mut decoder, decoded.as_mut_ptr(), decoded.len()) };
     assert_eq!(decoder.finish(), Ok(expected.len()));
     assert_eq!(decoded, values);
@@ -203,7 +203,7 @@ fn size_t_arrays_widen_for_a_guest_with_32_bit_pointers() {
     let too_large = u64le(1 << 32);
     let mut decoder = Decoder::new(&too_large);
     let mut one = [0u32; 1];
-    // SAFETY: `one` is live.
+    // SAFETY: `one` points to writable storage for 1 `u32` element.
     unsafe { decode_widened_array(&mut decoder, one.as_mut_ptr(), 1) };
     assert_eq!(
         decoder.finish(),
@@ -223,12 +223,12 @@ fn handles_encode_as_their_object_ids() {
 
     let mut out = [0u8; 32];
     let mut encoder = Encoder::new(&mut out, &protocol);
-    // SAFETY: the handles are live.
-    unsafe {
-        vn_encode_VkInstance(&mut encoder, &instance);
-        vn_encode_VkBuffer(&mut encoder, &buffer_handle);
-        vn_encode_VkInstance(&mut encoder, &null_instance);
-    }
+    // SAFETY: `instance` holds a pointer to the live `ObjectBase` `object`.
+    unsafe { vn_encode_VkInstance(&mut encoder, &instance) };
+    // SAFETY: `buffer_handle` is a value-type non-dispatchable handle.
+    unsafe { vn_encode_VkBuffer(&mut encoder, &buffer_handle) };
+    // SAFETY: `null_instance` carries a null pointer, which `handle_id` accepts.
+    unsafe { vn_encode_VkInstance(&mut encoder, &null_instance) };
     let written = encoder.finish().unwrap();
     let mut expected = Vec::new();
     expected.extend(u64le(0x1122_3344_5566_7788));

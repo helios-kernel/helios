@@ -68,7 +68,10 @@ pub(crate) struct FrameSlabCache {
     shards: PerProcessor<FrameShard>,
 }
 
+// SAFETY: every cached frame on the freelist is owned exclusively by this
+// list and access to `head` is serialised by `IrqSafeMutex`.
 unsafe impl Send for FrameList {}
+// SAFETY: `head` is guarded by `IrqSafeMutex` and `cached_frames` is atomic.
 unsafe impl Sync for FrameList {}
 
 impl FrameList {
@@ -86,6 +89,8 @@ impl FrameList {
     fn allocate_observed(&self, observe: impl FnOnce()) -> Option<NonNull<u8>> {
         self.head.with(|head| {
             let frame = NonNull::new(*head)?;
+            // SAFETY: every node in the freelist is an exclusively owned,
+            // page-aligned frame initialised with a `FreeFrame` header when pushed.
             let next = unsafe { frame.as_ref().next };
             observe();
             *head = next;
@@ -102,6 +107,8 @@ impl FrameList {
                 return false;
             }
             let mut frame = frame.cast::<FreeFrame>();
+            // SAFETY: `frame` is a caller-owned, page-aligned 4 KiB frame not
+            // aliased elsewhere, and the list lock is held.
             unsafe { frame.as_mut().next = *head };
             *head = frame.as_ptr();
             self.cached_frames.store(cached + 1, Ordering::Release);
@@ -115,6 +122,8 @@ impl FrameList {
             core::mem::replace(head, core::ptr::null_mut())
         });
         while let Some(frame) = NonNull::new(head) {
+            // SAFETY: the detached list chain is owned exclusively by this
+            // drain pass and `frame` is read before being handed to `release`.
             head = unsafe { frame.as_ref().next };
             release(frame.cast());
         }
@@ -252,8 +261,9 @@ mod tests {
         let total_frames = 3 * SLAB_RETAIN_DIVISOR;
         let base = backing.as_mut_ptr().cast::<u8>();
         for index in 0..3 {
-            let frame =
-                NonNull::new(unsafe { base.add(index * PhysFrame::SIZE) }).expect("backing frame");
+            // SAFETY: `backing` contains 4 frames (`2 * 2`), so `index < 3` is in bounds.
+            let ptr = unsafe { base.add(index * PhysFrame::SIZE) };
+            let frame = NonNull::new(ptr).expect("backing frame");
             assert!(cache.deallocate_on(p(0), NODE_0, frame, total_frames));
         }
         std::thread::scope(|scope| {
@@ -316,17 +326,20 @@ mod tests {
                 !owners[index].swap(true, Ordering::AcqRel),
                 "frame has two owners"
             );
+            // SAFETY: `owners[index]` guarantees exclusive access to this frame.
             unsafe { frame.as_ptr().write_bytes(index as u8, PhysFrame::SIZE) };
             std::thread::yield_now();
+            // SAFETY: `owners[index]` guarantees exclusive access and all
+            // `PhysFrame::SIZE` bytes were written above.
             let bytes = unsafe { core::slice::from_raw_parts(frame.as_ptr(), PhysFrame::SIZE) };
             assert!(bytes.iter().all(|&byte| byte == index as u8));
             owners[index].store(false, Ordering::Release);
             return_frame(frame);
         };
         for index in 0..owners.len() {
-            return_frame(
-                NonNull::new(unsafe { base.add(index * PhysFrame::SIZE) }).expect("frame"),
-            );
+            // SAFETY: `backing` holds 4 * 2 = 8 frames and `index < 8`.
+            let ptr = unsafe { base.add(index * PhysFrame::SIZE) };
+            return_frame(NonNull::new(ptr).expect("frame"));
         }
         std::thread::scope(|scope| {
             for processor in 0..3 {
@@ -373,8 +386,10 @@ mod tests {
         let cache = cache(2, 1);
         let mut backing = Box::new(AlignedFrames([0; PhysFrame::SIZE * 2]));
         let first = NonNull::new(backing.0.as_mut_ptr()).expect("first frame pointer");
-        let second = NonNull::new(unsafe { backing.0.as_mut_ptr().add(PhysFrame::SIZE) })
-            .expect("second frame pointer");
+        // SAFETY: `backing.0` spans `PhysFrame::SIZE * 2` bytes, so adding
+        // `PhysFrame::SIZE` points to the second frame inside `backing`.
+        let second_ptr = unsafe { backing.0.as_mut_ptr().add(PhysFrame::SIZE) };
+        let second = NonNull::new(second_ptr).expect("second frame pointer");
 
         assert!(cache.deallocate_on(p(0), NODE_0, first, 128));
         assert!(cache.deallocate_on(p(1), NODE_0, second, 128));
@@ -392,8 +407,10 @@ mod tests {
         let cache = cache(1, 1);
         let mut backing = Box::new(AlignedFrames([0; PhysFrame::SIZE * 2]));
         let first = NonNull::new(backing.0.as_mut_ptr()).expect("first frame pointer");
-        let second = NonNull::new(unsafe { backing.0.as_mut_ptr().add(PhysFrame::SIZE) })
-            .expect("second frame pointer");
+        // SAFETY: `backing.0` spans `PhysFrame::SIZE * 2` bytes, so adding
+        // `PhysFrame::SIZE` points to the second frame inside `backing`.
+        let second_ptr = unsafe { backing.0.as_mut_ptr().add(PhysFrame::SIZE) };
+        let second = NonNull::new(second_ptr).expect("second frame pointer");
 
         assert!(cache.deallocate_on(p(0), NODE_0, first, 128));
 
@@ -413,8 +430,10 @@ mod tests {
         let cache = cache(2, 1);
         let mut backing = Box::new(AlignedFrames([0; PhysFrame::SIZE * 2]));
         let first = NonNull::new(backing.0.as_mut_ptr()).expect("first frame pointer");
-        let second = NonNull::new(unsafe { backing.0.as_mut_ptr().add(PhysFrame::SIZE) })
-            .expect("second frame pointer");
+        // SAFETY: `backing.0` spans `PhysFrame::SIZE * 2` bytes, so adding
+        // `PhysFrame::SIZE` points to the second frame inside `backing`.
+        let second_ptr = unsafe { backing.0.as_mut_ptr().add(PhysFrame::SIZE) };
+        let second = NonNull::new(second_ptr).expect("second frame pointer");
 
         // 128 frames give each of two processors one frame of room.
         assert!(cache.deallocate_on(p(0), NODE_0, first, 128));

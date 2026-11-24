@@ -711,10 +711,20 @@ impl<T> DerefMut for RwLockWriteGuard<'_, T> {
     }
 }
 
+// SAFETY: `Mutex<T>` owns `T` via `UnsafeCell<T>` and `RawMutex` (`Arc<AsyncMutex<()>>`)
+// is `Send`, so transferring ownership across threads is sound when `T: Send`.
 unsafe impl<T: Send> Send for Mutex<T> {}
+// SAFETY: `&Mutex<T>` only grants access to `T` via `MutexGuard`, which holds an
+// exclusive `RawMutexLease` (`AsyncMutexGuard<()>`), ensuring mutually exclusive
+// access across threads and happens-before synchronization when `T: Send`.
 unsafe impl<T: Send> Sync for Mutex<T> {}
 
+// SAFETY: `RwLock<T>` owns `T` via `UnsafeCell<T>` and `RawRwLock` (`Arc<AsyncRwLock<()>>`)
+// is `Send`, so transferring ownership across threads is sound when `T: Send`.
 unsafe impl<T: Send> Send for RwLock<T> {}
+// SAFETY: `&RwLock<T>` gates shared `&T` access behind `RwLockReadGuard` (requiring
+// `T: Sync`) and exclusive `&mut T` access behind `RwLockWriteGuard` (requiring `T: Send`),
+// synchronized by `RawRwLock` (`AsyncRwLock<()>`).
 unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
 
 #[cfg(test)]

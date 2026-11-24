@@ -103,7 +103,14 @@ impl ComponentRuntimeEngine for WasmtimeEngine {
     type Compiled = WasmtimeCompiledComponent;
     type Error = wasmtime::Error;
 
-    fn compile(&self, bytes: &[u8]) -> Result<Self::Compiled, Self::Error> {
+    /// Deserializes a precompiled `.cwasm` component artifact.
+    ///
+    /// # Safety
+    ///
+    /// Caller guarantees `bytes` is a trusted precompiled `.cwasm` artifact
+    /// produced for `self.engine`'s target and configuration.
+    unsafe fn compile(&self, bytes: &[u8]) -> Result<Self::Compiled, Self::Error> {
+        // SAFETY: forwarded from caller's `ComponentRuntimeEngine::compile` contract.
         let component = unsafe { Component::deserialize(&self.engine, bytes)? };
         Ok(WasmtimeCompiledComponent { component })
     }

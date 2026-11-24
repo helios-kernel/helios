@@ -139,8 +139,10 @@ fn load_table<H: Handler>(
     // crate already validated, and the handler maps physical memory.
     let mapping =
         unsafe { PhysicalMapping::<_, u8>::new(table.phys_address, length, handler.clone()) };
-    // SAFETY: the mapping covers `length` bytes and outlives the slice.
-    let bytes = unsafe { core::slice::from_raw_parts(mapping.as_ptr(), length) };
+    // SAFETY: `mapping` is live and points to the mapped ACPI table bytes.
+    let ptr = unsafe { mapping.as_ptr() };
+    // SAFETY: the mapping covers `length` readable bytes and outlives `bytes`.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, length) };
     load_definition_block(interpreter, bytes, table.phys_address)
 }
 

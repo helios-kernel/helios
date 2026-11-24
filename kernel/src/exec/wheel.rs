@@ -234,13 +234,23 @@ impl SleepNode {
         unsafe { UnsafeCell::raw_get(&raw const (*node.as_ptr()).links) }
     }
 
-    /// The node's filed tick. Safety as for [`Self::links`].
+    /// The node's filed tick.
+    ///
+    /// # Safety
+    ///
+    /// `node` is live. The caller holds the wheel lock before it reads or
+    /// writes through the pointer.
     unsafe fn deadline_tick(node: NonNull<Self>) -> *mut u64 {
         // SAFETY: as in `links`.
         unsafe { UnsafeCell::raw_get(&raw const (*node.as_ptr()).deadline_tick) }
     }
 
-    /// The list the node is on. Safety as for [`Self::links`].
+    /// The list the node is on.
+    ///
+    /// # Safety
+    ///
+    /// `node` is live. The caller holds the wheel lock before it reads or
+    /// writes through the pointer.
     unsafe fn place(node: NonNull<Self>) -> *mut Option<Place> {
         // SAFETY: as in `links`.
         unsafe { UnsafeCell::raw_get(&raw const (*node.as_ptr()).place) }
@@ -303,18 +313,27 @@ impl List {
     /// The caller holds the wheel lock, `node` is live and on no list, and
     /// every node on this list is live.
     unsafe fn push_front(&mut self, node: NonNull<SleepNode>) {
-        // SAFETY: `node` and the current head are live and the lock is
-        // held (the caller's contract), so their links are this caller's
-        // to write.
+        // SAFETY: `node` is live and the lock is held (the caller's contract).
+        let links = unsafe { SleepNode::links(node) };
+        // SAFETY: `node` is on no list and the lock is held, so its links are
+        // this caller's to write.
         unsafe {
-            *SleepNode::links(node) = Links {
+            *links = Links {
                 prev: None,
                 next: self.head,
             };
-            match self.head {
-                Some(head) => (*SleepNode::links(head)).prev = Some(node),
-                None => self.tail = Some(node),
+        }
+        match self.head {
+            Some(head) => {
+                // SAFETY: `head` is on this list and live, and the lock is held.
+                let head_links = unsafe { SleepNode::links(head) };
+                // SAFETY: `head` is live and the lock is held, so its links are
+                // this caller's to write.
+                unsafe {
+                    (*head_links).prev = Some(node);
+                }
             }
+            None => self.tail = Some(node),
         }
         self.head = Some(node);
     }
@@ -324,25 +343,45 @@ impl List {
     /// The caller holds the wheel lock, `node` is on this list, and every
     /// node on it is live.
     unsafe fn remove(&mut self, node: NonNull<SleepNode>) {
-        // SAFETY: `node` and its neighbours are on this list and live, and
-        // the lock is held (the caller's contract).
+        // SAFETY: `node` is on this list and live, and the lock is held.
+        let node_links = unsafe { SleepNode::links(node) };
+        // SAFETY: `node` is live and the lock is held, so its links are this
+        // caller's to read.
+        let Links { prev, next } = unsafe { *node_links };
+        match prev {
+            Some(prev) => {
+                // SAFETY: `prev` is on this list and live, and the lock is held.
+                let prev_links = unsafe { SleepNode::links(prev) };
+                // SAFETY: `prev` is live and the lock is held, so its links are
+                // this caller's to write.
+                unsafe {
+                    (*prev_links).next = next;
+                }
+            }
+            None => {
+                debug_assert_eq!(self.head, Some(node));
+                self.head = next;
+            }
+        }
+        match next {
+            Some(next) => {
+                // SAFETY: `next` is on this list and live, and the lock is held.
+                let next_links = unsafe { SleepNode::links(next) };
+                // SAFETY: `next` is live and the lock is held, so its links are
+                // this caller's to write.
+                unsafe {
+                    (*next_links).prev = prev;
+                }
+            }
+            None => {
+                debug_assert_eq!(self.tail, Some(node));
+                self.tail = prev;
+            }
+        }
+        // SAFETY: `node` is live and the lock is held, so its links are this
+        // caller's to write.
         unsafe {
-            let Links { prev, next } = *SleepNode::links(node);
-            match prev {
-                Some(prev) => (*SleepNode::links(prev)).next = next,
-                None => {
-                    debug_assert_eq!(self.head, Some(node));
-                    self.head = next;
-                }
-            }
-            match next {
-                Some(next) => (*SleepNode::links(next)).prev = prev,
-                None => {
-                    debug_assert_eq!(self.tail, Some(node));
-                    self.tail = prev;
-                }
-            }
-            *SleepNode::links(node) = Links::UNLINKED;
+            *node_links = Links::UNLINKED;
         }
     }
 
@@ -368,7 +407,10 @@ impl List {
             count += 1;
             // SAFETY: `current` is on this list and live (the caller's
             // contract), and the lock is held.
-            node = unsafe { (*SleepNode::links(current)).next };
+            let links = unsafe { SleepNode::links(current) };
+            // SAFETY: `links` points to `current`'s `Links` field under the
+            // wheel lock.
+            node = unsafe { (*links).next };
         }
         count
     }
@@ -438,16 +480,24 @@ impl TimingWheel {
         node: NonNull<SleepNode>,
         deadline_tick: u64,
     ) {
-        // SAFETY: the node is live and pinned (the caller's contract), and
+        // SAFETY: `node` is live and pinned (the caller's contract), and
         // `&mut self` is the wheel lock.
+        let live = unsafe { node.as_ref() };
+        debug_assert_eq!(live.state(), NodeState::Idle);
+        // SAFETY: `node` is live and the lock is held.
+        let tick_ptr = unsafe { SleepNode::deadline_tick(node) };
+        // SAFETY: `node` is `Idle` and the lock is held, so its deadline tick is
+        // this caller's to write.
         unsafe {
-            debug_assert_eq!(node.as_ref().state(), NodeState::Idle);
-            *SleepNode::deadline_tick(node) = deadline_tick;
-            self.insert(node, deadline_tick);
-            node.as_ref().set_home(home);
-            // `Release`: a reader that sees `Registered` sees the home.
-            node.as_ref().store_state(NodeState::Registered);
+            *tick_ptr = deadline_tick;
         }
+        // SAFETY: the lock is held and `node` is live and on no list.
+        unsafe {
+            self.insert(node, deadline_tick);
+        }
+        live.set_home(home);
+        // `Release`: a reader that sees `Registered` sees the home.
+        live.store_state(NodeState::Registered);
     }
 
     /// Moves up to `limit` registered nodes from this wheel to `to`, whose
@@ -481,15 +531,18 @@ impl TimingWheel {
                 return moved;
             };
             // SAFETY: `pop_any` has just unlinked `node` under this lock, so
-            // it was registered and is live (the lifetime invariant); `to`'s
-            // lock is held too, so filing it there and naming that lock its
-            // home is this caller's to do.
+            // it was registered and is live (the lifetime invariant).
+            let tick_ptr = unsafe { SleepNode::deadline_tick(node) };
+            // SAFETY: `node` is live and both wheel locks are held.
+            let tick = unsafe { *tick_ptr };
+            // SAFETY: `to`'s lock is held and `node` is live and on no list.
             unsafe {
-                let tick = *SleepNode::deadline_tick(node);
                 to.insert(node, tick);
-                node.as_ref().set_home(to_home);
-                moved.earliest_tick = Some(moved.earliest_tick.map_or(tick, |t| t.min(tick)));
             }
+            // SAFETY: `node` is live under `to`'s lock until deregistered.
+            let live = unsafe { node.as_ref() };
+            live.set_home(to_home);
+            moved.earliest_tick = Some(moved.earliest_tick.map_or(tick, |t| t.min(tick)));
         }
         moved.emptied = self.is_empty();
         moved
@@ -634,16 +687,26 @@ impl TimingWheel {
             &mut self.slots[expiration.level][expiration.slot],
             List::new(),
         );
-        // SAFETY: every node on the taken list was on a wheel list and is
-        // live (the lifetime invariant), and `&mut self` is the lock, held
-        // throughout, so no dropper can look for a node while it is off
-        // every list here.
-        unsafe {
-            while let Some(node) = taken.pop_back() {
-                let when = *SleepNode::deadline_tick(node);
-                if when <= expiration.deadline {
+        loop {
+            // SAFETY: every node on `taken` was on a wheel list and is live
+            // (the lifetime invariant), and `&mut self` holds the lock
+            // throughout, so no dropper can reach a node while it is unlinked.
+            let Some(node) = (unsafe { taken.pop_back() }) else {
+                break;
+            };
+            // SAFETY: `node` is live and the lock is held.
+            let when_ptr = unsafe { SleepNode::deadline_tick(node) };
+            // SAFETY: `node` is live and the lock is held, so its deadline tick
+            // is this caller's to read.
+            let when = unsafe { *when_ptr };
+            if when <= expiration.deadline {
+                // SAFETY: the lock is held and `node` is live and on no list.
+                unsafe {
                     self.push_pending(node);
-                } else {
+                }
+            } else {
+                // SAFETY: the lock is held and `node` is live and on no list.
+                unsafe {
                     self.file(node, level_for(expiration.deadline, when), when);
                 }
             }
@@ -660,11 +723,14 @@ impl TimingWheel {
     ///
     /// The lock is held and `node` is live and on no list.
     unsafe fn insert(&mut self, node: NonNull<SleepNode>, when: u64) {
-        // SAFETY: the caller's contract.
-        unsafe {
-            if when <= self.elapsed {
+        if when <= self.elapsed {
+            // SAFETY: the lock is held and `node` is live and on no list.
+            unsafe {
                 self.push_pending(node);
-            } else {
+            }
+        } else {
+            // SAFETY: the lock is held and `node` is live and on no list.
+            unsafe {
                 self.file(node, level_for(self.elapsed, when), when);
             }
         }
@@ -681,16 +747,18 @@ impl TimingWheel {
         let list = &mut self.slots[level][slot];
         // SAFETY: every node on a wheel list is live (the lifetime
         // invariant) and `&mut self` is the lock.
-        unsafe {
-            let node = list
-                .pop_back()
-                .expect("an occupied wheel slot holds a node");
-            if list.is_empty() {
-                self.occupied[level] &= !occupied_bit(slot);
-            }
-            *SleepNode::place(node) = None;
-            Some(node)
+        let node = unsafe { list.pop_back() }.expect("an occupied wheel slot holds a node");
+        if list.is_empty() {
+            self.occupied[level] &= !occupied_bit(slot);
         }
+        // SAFETY: `node` is live and the lock is held.
+        let place = unsafe { SleepNode::place(node) };
+        // SAFETY: `node` is live and the lock is held, so its `place` is this
+        // caller's to clear.
+        unsafe {
+            *place = None;
+        }
+        Some(node)
     }
 
     /// # Safety
@@ -698,10 +766,17 @@ impl TimingWheel {
     /// The lock is held and `node` is live and on no list.
     unsafe fn file(&mut self, node: NonNull<SleepNode>, level: usize, when: u64) {
         let slot = slot_for(when, level);
-        // SAFETY: the caller's contract.
+        // SAFETY: the lock is held, `node` is live and on no list, and every
+        // node in this slot is live.
         unsafe {
             self.slots[level][slot].push_front(node);
-            *SleepNode::place(node) = Some(Place::Slot {
+        }
+        // SAFETY: `node` is live and the lock is held.
+        let place = unsafe { SleepNode::place(node) };
+        // SAFETY: `node` is live and the lock is held, so its `place` is this
+        // caller's to write.
+        unsafe {
+            *place = Some(Place::Slot {
                 level: level as u8,
                 slot: slot as u8,
             });
@@ -713,21 +788,32 @@ impl TimingWheel {
     ///
     /// The lock is held and `node` is live and on no list.
     unsafe fn push_pending(&mut self, node: NonNull<SleepNode>) {
-        // SAFETY: the caller's contract.
+        // SAFETY: the lock is held, `node` is live and on no list, and every
+        // node in `pending` is live.
         unsafe {
             self.pending.push_front(node);
-            *SleepNode::place(node) = Some(Place::Pending);
+        }
+        // SAFETY: `node` is live and the lock is held.
+        let place = unsafe { SleepNode::place(node) };
+        // SAFETY: `node` is live and the lock is held, so its `place` is this
+        // caller's to write.
+        unsafe {
+            *place = Some(Place::Pending);
         }
     }
 
     fn pop_pending(&mut self) -> Option<NonNull<SleepNode>> {
         // SAFETY: every node on `pending` is live (the lifetime invariant)
         // and `&mut self` is the lock.
+        let node = unsafe { self.pending.pop_back() }?;
+        // SAFETY: `node` is live and the lock is held.
+        let place = unsafe { SleepNode::place(node) };
+        // SAFETY: `node` is live and the lock is held, so its `place` is this
+        // caller's to clear.
         unsafe {
-            let node = self.pending.pop_back()?;
-            *SleepNode::place(node) = None;
-            Some(node)
+            *place = None;
         }
+        Some(node)
     }
 
     /// # Safety
@@ -735,21 +821,32 @@ impl TimingWheel {
     /// The lock is held and `node` is live and on the list its `place`
     /// names.
     unsafe fn unlink(&mut self, node: NonNull<SleepNode>) {
-        // SAFETY: the caller's contract; `place` is written only under the
-        // lock, alongside the list it names.
-        unsafe {
-            match (*SleepNode::place(node)).take() {
-                Some(Place::Pending) => self.pending.remove(node),
-                Some(Place::Slot { level, slot }) => {
-                    let (level, slot) = (usize::from(level), usize::from(slot));
-                    let list = &mut self.slots[level][slot];
-                    list.remove(node);
-                    if list.is_empty() {
-                        self.occupied[level] &= !occupied_bit(slot);
-                    }
+        // SAFETY: `node` is live and the lock is held (the caller's contract).
+        let place_ptr = unsafe { SleepNode::place(node) };
+        // SAFETY: `place` is written only under the lock, alongside the list
+        // it names.
+        let place = unsafe { (*place_ptr).take() };
+        match place {
+            Some(Place::Pending) => {
+                // SAFETY: `node` is on `pending`, every node on it is live, and
+                // the lock is held.
+                unsafe {
+                    self.pending.remove(node);
                 }
-                None => panic!("a registered sleep node is on no wheel list"),
             }
+            Some(Place::Slot { level, slot }) => {
+                let (level, slot) = (usize::from(level), usize::from(slot));
+                let list = &mut self.slots[level][slot];
+                // SAFETY: `node` is on this slot's list, every node on it is
+                // live, and the lock is held.
+                unsafe {
+                    list.remove(node);
+                }
+                if list.is_empty() {
+                    self.occupied[level] &= !occupied_bit(slot);
+                }
+            }
+            None => panic!("a registered sleep node is on no wheel list"),
         }
     }
 }

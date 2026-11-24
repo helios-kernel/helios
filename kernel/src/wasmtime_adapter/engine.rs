@@ -76,6 +76,8 @@ fn build_engine_for_platform<P: Cpu + Clone>(
     let mut config = build_component_engine_config(target);
     config.concurrency_support(concurrency_support);
     if let Some(probe) = platform.native_feature_probe() {
+        // SAFETY: `probe` is the `Cpu` backend's hardware feature probe, which
+        // accurately reports the running processor's supported ISA features.
         unsafe {
             config.detect_host_feature(probe);
         }

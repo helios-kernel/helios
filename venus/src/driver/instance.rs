@@ -46,6 +46,10 @@ pub(super) fn object<H: Handle>(handle: H) -> *mut ObjectBase {
     handle.as_raw() as usize as *mut ObjectBase
 }
 
+/// Upgrade the shared instance state from a live dispatchable object handle.
+///
+/// # Safety
+/// `object` must point to a live `Dispatch<F>` header whose instance outlives this call.
 pub(super) unsafe fn shared<F: Factory>(object: *mut ObjectBase) -> Arc<Shared<F>> {
     // SAFETY: the caller supplies a live dispatchable handle of this factory.
     unsafe { &*object.cast::<Dispatch<F>>() }
@@ -82,6 +86,10 @@ impl<F: Factory> State<F> {
     }
 }
 
+/// Acquire the instance submission lock and run `call` if the instance is not faulted.
+///
+/// # Safety
+/// `object` must point to a live `Dispatch<F>` header belonging to `F`.
 pub(super) unsafe fn invoke<F: Factory, R>(
     object: *mut ObjectBase,
     call: impl FnOnce(&mut State<F>) -> Result<R, Error<TransportError<F>>>,
@@ -95,6 +103,10 @@ pub(super) unsafe fn invoke<F: Factory, R>(
     call(&mut state).map_err(|error| state.fail(error))
 }
 
+/// Acquire the instance submission lock and run a command returning a `wire::VkResult`.
+///
+/// # Safety
+/// `object` must point to a live `Dispatch<F>` header belonging to `F`.
 pub(super) unsafe fn invoke_result<F: Factory>(
     object: *mut ObjectBase,
     call: impl FnOnce(&mut State<F>) -> Result<wire::VkResult, Error<TransportError<F>>>,
@@ -113,6 +125,9 @@ pub(super) unsafe fn invoke_result<F: Factory>(
 
 /// Captures completion points while serializing submission, then suspends
 /// without the lock so other threads can submit future signals.
+///
+/// # Safety
+/// `object` must point to a live `Dispatch<F>` header belonging to `F`.
 pub(super) unsafe fn wait_for_points<F: Factory>(
     object: *mut ObjectBase,
     wait_all: bool,
@@ -149,6 +164,10 @@ pub(super) unsafe fn wait_for_points<F: Factory>(
     }
 }
 
+/// Acquire the instance submission lock and run a void-returning Vulkan command.
+///
+/// # Safety
+/// `object` must point to a live `Dispatch<F>` header belonging to `F`.
 pub(super) unsafe fn invoke_void<F: Factory>(
     object: *mut ObjectBase,
     call: impl FnOnce(&mut State<F>) -> Result<(), Error<TransportError<F>>>,
@@ -231,17 +250,21 @@ pub(super) unsafe fn write_properties<T: Copy>(
     output: *mut T,
     items: &[T],
 ) -> vk::Result {
-    // SAFETY: forwarded from the caller.
-    let written = unsafe {
-        if output.is_null() {
-            *count = items.len() as u32;
-            return vk::Result::SUCCESS;
-        }
-        let written = (*count as usize).min(items.len());
-        core::ptr::copy_nonoverlapping(items.as_ptr(), output, written);
-        *count = written as u32;
-        written
-    };
+    if output.is_null() {
+        // SAFETY: `count` is writable when `output` is null.
+        unsafe { *count = items.len() as u32 };
+        return vk::Result::SUCCESS;
+    }
+    // SAFETY: `count` is readable as forwarded from the caller.
+    let capacity = unsafe { *count as usize };
+    let written = capacity.min(items.len());
+    if written != 0 {
+        // SAFETY: `output` has room for `capacity >= written` elements and does
+        // not overlap `items`.
+        unsafe { core::ptr::copy_nonoverlapping(items.as_ptr(), output, written) };
+    }
+    // SAFETY: `count` is writable as forwarded from the caller.
+    unsafe { *count = written as u32 };
     if written < items.len() {
         vk::Result::INCOMPLETE
     } else {
@@ -276,6 +299,12 @@ unsafe extern "system" fn create_instance<F: Factory>(
     unsafe { create_on_connection::<F>(connection, info, allocator, output) }
 }
 
+/// Create a Vulkan instance on an already-opened renderer connection.
+///
+/// # Safety
+/// `info`, `allocator`, and `output` must satisfy Vulkan's `vkCreateInstance`
+/// contract, with `allocator` callback userdata outliving the instance and all
+/// child allocations.
 pub(super) unsafe fn create_on_connection<F: Factory>(
     connection: Connection<F::Transport>,
     info: *const vk::InstanceCreateInfo<'_>,
@@ -286,13 +315,25 @@ pub(super) unsafe fn create_on_connection<F: Factory>(
     unsafe { *output = vk::Instance::null() };
     // Instance extensions are implemented in the guest. virglrenderer requires
     // an empty extension list and enables its own host-side extensions.
+    // SAFETY: `info` points to a live `VkInstanceCreateInfo` for this call.
     let mut renderer_info = unsafe { *info };
     if renderer_info.enabled_layer_count != 0 {
         return vk::Result::ERROR_LAYER_NOT_PRESENT;
     }
-    for index in 0..renderer_info.enabled_extension_count as usize {
-        // SAFETY: Vulkan requires enabled_extension_count live C-string pointers.
-        let name = unsafe { CStr::from_ptr(*renderer_info.pp_enabled_extension_names.add(index)) };
+    let extension_names = if renderer_info.enabled_extension_count == 0 {
+        &[]
+    } else {
+        // SAFETY: `pp_enabled_extension_names` has `enabled_extension_count` live pointers.
+        unsafe {
+            core::slice::from_raw_parts(
+                renderer_info.pp_enabled_extension_names,
+                renderer_info.enabled_extension_count as usize,
+            )
+        }
+    };
+    for &pointer in extension_names {
+        // SAFETY: each entry in `pp_enabled_extension_names` is a NUL-terminated C string.
+        let name = unsafe { CStr::from_ptr(pointer) };
         if !supported_extensions()
             .iter()
             .any(|(supported, _)| *supported == name)
@@ -302,6 +343,7 @@ pub(super) unsafe fn create_on_connection<F: Factory>(
     }
     renderer_info.enabled_extension_count = 0;
     renderer_info.pp_enabled_extension_names = null();
+    // SAFETY: `allocator` is null or points to valid Vulkan allocation callbacks.
     let allocator = unsafe { HostAllocator::new(allocator, vk::SystemAllocationScope::INSTANCE) };
     let owner = Arc::new(Exclusive::new(State::<F> {
         connection,
@@ -364,9 +406,11 @@ unsafe extern "system" fn destroy_instance<F: Factory>(
         return;
     }
     let pointer = instance.as_raw() as usize as *mut Instance<F>;
-    // SAFETY: the instance was allocated by create_instance and Vulkan
-    // requires every device and concurrent instance call to have finished.
-    let instance = unsafe { Box::from_raw_in(pointer, (*pointer).allocator) };
+    // SAFETY: `pointer` addresses a live `Instance<F>` whose allocator is immutable.
+    let allocator = unsafe { (*pointer).allocator };
+    // SAFETY: the instance was allocated by `create_on_connection` with `allocator`
+    // and Vulkan requires every device and concurrent instance call to have finished.
+    let instance = unsafe { Box::from_raw_in(pointer, allocator) };
     let mut state = instance.owner.lock();
     let handle = wire::VkInstance((&raw const instance.dispatch.base).cast_mut());
     // SAFETY: the remote instance is live and all device children are gone.
@@ -456,8 +500,11 @@ unsafe extern "system" fn enumerate_physical_devices<F: Factory>(
     for (index, object) in objects.iter().take(written).enumerate() {
         let handle = vk::PhysicalDevice::from_raw((&raw const **object) as usize as u64);
         // SAFETY: index is below the caller's output capacity.
-        unsafe { output.add(index).write(handle) };
+        let slot = unsafe { output.add(index) };
+        // SAFETY: `slot` is aligned and writable.
+        unsafe { slot.write(handle) };
     }
+    // SAFETY: `count` is writable as supplied by Vulkan.
     unsafe { *count = written as u32 };
     if written < objects.len() {
         vk::Result::INCOMPLETE
@@ -466,6 +513,11 @@ unsafe extern "system" fn enumerate_physical_devices<F: Factory>(
     }
 }
 
+/// Resolve a Vulkan instance or global entry point by name.
+///
+/// # Safety
+/// `name` must be a valid NUL-terminated C string, and if `instance` is
+/// non-null it must be a live `VkInstance` created by `F`.
 pub(super) unsafe extern "system" fn get_instance_proc_addr<F: Factory>(
     instance: vk::Instance,
     name: *const c_char,
@@ -489,5 +541,6 @@ pub(super) unsafe extern "system" fn get_instance_proc_addr<F: Factory>(
                 .or_else(|| super::generated::lookup::<F>(name, false));
         }
     };
+    // SAFETY: Vulkan restores the function signature named by the lookup.
     Some(unsafe { core::mem::transmute::<*const (), unsafe extern "system" fn()>(pointer) })
 }

@@ -88,7 +88,9 @@ impl<'a, T> Deref for MutexGuard<'a, T> {
 
 impl<'a, T> DerefMut for MutexGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: same as above, with exclusive mutable access.
+        // SAFETY: the host only yields this guard after acquiring exclusive
+        // access for the lifetime of the guard resource, and `&mut self`
+        // prevents aliasing while this reference lives.
         unsafe { &mut *self.value }
     }
 }
@@ -156,15 +158,25 @@ impl<'a, T> Deref for RwLockWriteGuard<'a, T> {
 
 impl<'a, T> DerefMut for RwLockWriteGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: same as above, with mutable access.
+        // SAFETY: the host only yields this guard after acquiring exclusive
+        // write access for the lifetime of the guard resource, and `&mut self`
+        // prevents aliasing while this reference lives.
         unsafe { &mut *self.value }
     }
 }
 
+// SAFETY: `Mutex<T>` uniquely owns `T` and `RawMutex` is a thread-safe host
+// resource handle, so moving `Mutex<T>` across threads requires only `T: Send`.
 unsafe impl<T: Send> Send for Mutex<T> {}
+// SAFETY: `Mutex<T>` serializes all access to `T` through the host `RawMutex`,
+// so sharing `&Mutex<T>` across threads requires only `T: Send`.
 unsafe impl<T: Send> Sync for Mutex<T> {}
 
+// SAFETY: `RwLock<T>` owns `T` and `RawRwLock` is a thread-safe host resource
+// handle, so moving `RwLock<T>` across threads is sound when `T: Send + Sync`.
 unsafe impl<T: Send + Sync> Send for RwLock<T> {}
+// SAFETY: `RwLock<T>` enforces shared-reader / exclusive-writer access via the
+// host `RawRwLock`, so sharing `&RwLock<T>` across threads is sound when `T: Send + Sync`.
 unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
 
 /// Absolute nanoseconds in the WASI monotonic clock's epoch.

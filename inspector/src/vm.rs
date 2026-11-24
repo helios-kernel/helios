@@ -6404,18 +6404,22 @@ fn keep_off_the_terminal(child: &mut Command) {
     child.process_group(0);
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: the closure runs in the child between fork and exec;
-        // `prctl` sets one flag on the calling task and allocates
-        // nothing, takes no lock and touches no memory the parent
-        // shares.
+        let set_pdeathsig = || {
+            // SAFETY: `PR_SET_PDEATHSIG` takes a scalar signal (`SIGKILL`) and
+            // no pointers, and `prctl` updates only the calling child task's
+            // parent-death signal without allocating or locking.
+            if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        };
+        // SAFETY: the closure runs in the child between fork and exec; it
+        // calls only `prctl` and `last_os_error` (reading thread-local
+        // `errno`) and allocates nothing, takes no lock, and touches no memory
+        // the parent shares.
         unsafe {
-            child.pre_exec(|| {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
+            child.pre_exec(set_pdeathsig);
         }
     }
 }

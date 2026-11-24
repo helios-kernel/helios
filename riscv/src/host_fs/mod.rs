@@ -59,6 +59,10 @@ fn discover_9p_device(fdt: &Fdt<'_>) -> Option<(HostFsTransportService, PlicInte
         .interrupt
         .and_then(PlicInterrupt::from_specifier)
         .unwrap_or_else(|| panic!("virtio-9p node at {base:#x} has no valid interrupt source"));
+    // SAFETY: `candidate` comes from `mmio_candidates(fdt)` and matched
+    // `DeviceType::_9P` on the bootstrap hart before interrupts are unmasked,
+    // so `header..header + candidate.size` is an identity-mapped VirtIO MMIO
+    // 9P register block with exclusive driver access.
     let device =
         unsafe { helios_virtio::p9_from_mmio(header, candidate.size) }.unwrap_or_else(|error| {
             panic!("failed to initialize virtio-9p device at {base:#x}: {error}")

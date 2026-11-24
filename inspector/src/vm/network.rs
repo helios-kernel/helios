@@ -1243,8 +1243,12 @@ fn is_root() -> bool {
 /// `sudo`.
 fn invoking_credentials() -> (u32, u32) {
     let from_env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse().ok());
-    // SAFETY: `getuid`/`getgid` read process credentials and cannot fail.
-    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    // SAFETY: `getuid` takes no pointers, reads the calling process's real
+    // user ID from the kernel, and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    // SAFETY: `getgid` takes no pointers, reads the calling process's real
+    // group ID from the kernel, and cannot fail.
+    let gid = unsafe { libc::getgid() };
     (
         from_env("SUDO_UID").unwrap_or(uid),
         from_env("SUDO_GID").unwrap_or(gid),

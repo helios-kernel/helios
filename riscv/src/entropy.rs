@@ -91,6 +91,10 @@ fn discover_entropy_device(fdt: &Fdt<'_>) -> Option<(VirtioEntropyDevice, PlicIn
         .interrupt
         .and_then(PlicInterrupt::from_specifier)
         .unwrap_or_else(|| panic!("virtio-rng node at {base:#x} has no valid interrupt source"));
+    // SAFETY: `candidate` comes from `mmio_candidates(fdt)` and matched
+    // `DeviceType::Entropy` on the bootstrap hart before interrupts are
+    // unmasked, so `header..header + candidate.size` is an identity-mapped
+    // VirtIO MMIO entropy register block with exclusive driver access.
     let device =
         unsafe { helios_virtio::rng_from_mmio(header, candidate.size) }.unwrap_or_else(|error| {
             panic!("failed to initialize virtio-rng device at {base:#x}: {error}")

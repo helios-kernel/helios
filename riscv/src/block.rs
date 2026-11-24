@@ -106,6 +106,10 @@ fn discover_block_devices(cpu: &RiscvCpu, fdt: &Fdt<'_>) -> Vec<BlockInterrupt> 
                 .unwrap_or_else(|| {
                     panic!("virtio-blk node at {base:#x} has no valid interrupt source")
                 });
+            // SAFETY: `candidate` comes from `mmio_candidates(fdt)` and matched
+            // `DeviceType::Block` on the bootstrap hart before interrupts are
+            // unmasked, so `header..header + candidate.size` is an identity-mapped
+            // VirtIO MMIO block register block with exclusive driver access.
             let device = unsafe {
                 helios_virtio::block_from_mmio(
                     header,

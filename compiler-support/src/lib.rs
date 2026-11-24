@@ -439,6 +439,9 @@ pub fn codegen_config(target: &CwasmTarget<'_>, hint: AotCompileHint) -> Result<
             source,
         })?;
     for flag in target.cranelift_flags() {
+        // SAFETY: `target.cranelift_flags()` yields only the ISA feature flags
+        // and target settings defined for `target`'s `CwasmTarget`, which are
+        // verified against host probes and `module_version` at load time.
         unsafe {
             config.cranelift_flag_enable(flag);
         }
@@ -629,6 +632,8 @@ mod tests {
         let same = build_engine_config(&target, AotCompileHint::Performance, 1)
             .expect("the engine config builds");
         let same_engine = Engine::new(&same).expect("the engine builds");
+        // SAFETY: `artifact.bytes` is the unmodified output of
+        // `precompile_artifact` produced earlier in this test.
         unsafe { Module::deserialize(&same_engine, &artifact.bytes) }
             .expect("an artifact deserializes into an engine with the config it was built under");
 
@@ -643,6 +648,8 @@ mod tests {
             .module_version(ModuleVersionStrategy::Custom(version))
             .expect("the version string is accepted");
         let engine = Engine::new(&requiring_signed).expect("the engine builds");
+        // SAFETY: `artifact.bytes` is the unmodified output of
+        // `precompile_artifact` produced earlier in this test.
         let error = unsafe { Module::deserialize(&engine, &artifact.bytes) }
             .expect_err("unsigned code must not load into an engine that requires signing");
         let debug = format!("{error:?}");
@@ -789,6 +796,8 @@ mod tests {
                 let artifact =
                     precompile_artifact(module_bytes, &host_target, AotCompileHint::Performance)
                         .expect("host artifact precompiles");
+                // SAFETY: `artifact.bytes` is the unmodified output of
+                // `precompile_artifact` for `host_target` produced just above.
                 let module = unsafe { wasmtime::Module::deserialize(&engine, &artifact.bytes) }
                     .expect("host artifact deserializes");
                 let mut store = wasmtime::Store::new(&engine, ());
@@ -853,11 +862,16 @@ mod tests {
                 .expect("the minimal module precompiles");
             let mut config = build_engine_config(target, AotCompileHint::Performance, 1)
                 .expect("the engine config builds");
+            // SAFETY: the deserialized `Module` below is never instantiated or
+            // executed; this test only inspects which feature probes Wasmtime
+            // queries and whether denied features are rejected.
             unsafe {
                 config.detect_host_feature(recording_probe);
             }
             let engine = Engine::new(&config).expect("the engine builds");
             ASKED.with(|asked| asked.borrow_mut().clear());
+            // SAFETY: `artifact.bytes` is the unmodified output of
+            // `precompile_artifact` produced in this function.
             let outcome = unsafe { Module::deserialize(&engine, &artifact.bytes) };
             (ASKED.with(|asked| asked.take()), outcome)
         }

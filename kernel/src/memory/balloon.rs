@@ -560,7 +560,10 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
                 run_frames /= 2;
                 continue;
             };
-            let mut ranges = [unsafe { range_bytes(range) }];
+            // SAFETY: `range` was just allocated exclusively to this service by
+            // `self.pool.allocate` and has not been handed back yet.
+            let bytes = unsafe { range_bytes(range) };
+            let mut ranges = [bytes];
             if let Err(error) = self.device.inflate(&mut ranges).await {
                 // The host never took the frames, so they are still the
                 // guest's; handing them back is the only correct move.
@@ -594,7 +597,10 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
             if self.held_frames() - run.frame_count < target || self.device_reset_unsynced() {
                 break;
             }
-            let mut ranges = [unsafe { range_bytes(run) }];
+            // SAFETY: `run` is held exclusively in `self.runs` and has not been
+            // returned to the pool yet.
+            let bytes = unsafe { range_bytes(run) };
+            let mut ranges = [bytes];
             if let Err(error) = self.device.deflate(&mut ranges).await {
                 tracing::warn!(?error, "memory balloon deflate request failed");
                 break;
@@ -643,7 +649,10 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
                     move |run| {
                         let device = device.clone();
                         async move {
-                            let mut ranges = [unsafe { range_bytes(run) }];
+                            // SAFETY: `free_runs` holds `run` reserved exclusively
+                            // for the duration of this async visit.
+                            let bytes = unsafe { range_bytes(run) };
+                            let mut ranges = [bytes];
                             if let Err(error) = device.hint_free_pages(&mut ranges).await {
                                 tracing::warn!(?error, "memory balloon free-page hint failed");
                             }
@@ -732,7 +741,10 @@ where
                 named += run.frame_count;
                 let device = reporter.clone();
                 async move {
-                    let mut ranges = [unsafe { range_bytes(run) }];
+                    // SAFETY: `free_runs` holds `run` reserved exclusively for
+                    // the duration of this async visit.
+                    let bytes = unsafe { range_bytes(run) };
+                    let mut ranges = [bytes];
                     if let Err(error) = device.report_free(&mut ranges).await {
                         tracing::warn!(?error, "memory balloon free-page report failed");
                     }
@@ -848,8 +860,11 @@ const fn pages_to_bytes(pages: u32) -> u64 {
 ///
 /// `range` must be a run the caller holds exclusively — one the pool
 /// allocated to it, or one reserved for the length of a
-/// [`PhysFrameAllocator::free_runs`] visit.
+/// [`PhysFrameAllocator::free_runs`] visit — and the returned `'a` slice
+/// must neither outlive that exclusive hold nor alias another reference.
 unsafe fn range_bytes<'a>(range: PhysFrameRange) -> &'a mut [u8] {
+    // SAFETY: `range` spans `range.byte_size()` valid, exclusively held
+    // direct-map bytes starting at `range.start.phys_addr()` for `'a`.
     unsafe {
         core::slice::from_raw_parts_mut(range.start.phys_addr() as *mut u8, range.byte_size())
     }
@@ -878,6 +893,8 @@ mod tests {
     /// A pool over a leaked, page-aligned block of host memory.
     fn pool(bytes: usize) -> &'static UserMemoryPool {
         let layout = Layout::from_size_align(bytes, PhysFrame::SIZE).expect("pool layout");
+        // SAFETY: `bytes` is a non-zero test pool size and the allocation is
+        // intentionally leaked for the `'static` test pool lifetime.
         let start = unsafe { alloc::alloc::alloc(layout) } as usize;
         assert!(start != 0, "host allocation for the user pool failed");
         Box::leak(Box::new(UserMemoryPool::single_node(

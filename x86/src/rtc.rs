@@ -118,6 +118,9 @@ pub(crate) fn discover(rsdp_address: usize, physical_memory_offset: usize) -> Op
         tsc_base: 0,
         timebase: Timebase::new(1),
     };
+    // SAFETY: `rsdp_address` is the RSDP physical address handed over by
+    // Limine, and `from_rsdp` validates its signature and checksum before
+    // reading tables through `PhysicalOffsetAcpiHandler`.
     let tables = unsafe { acpi::AcpiTables::from_rsdp(handler, rsdp_address) }
         .unwrap_or_else(|error| panic!("failed to parse ACPI tables for the FADT: {error:?}"));
     let fadt = tables.find_table::<Fadt>()?;
@@ -136,13 +139,14 @@ pub(crate) fn discover(rsdp_address: usize, physical_memory_offset: usize) -> Op
 }
 
 fn read_register(register: u8) -> u8 {
-    // SAFETY: the CMOS index/data pair is a fixed ISA port pair, and
-    // this backend drives it from the bootstrap processor only, so no
-    // other reader can observe the index between the two accesses.
+    // SAFETY: the CMOS index port `0x70` is a fixed ISA port driven from the
+    // bootstrap processor only before secondaries start.
     unsafe {
         PortWriteOnly::new(CMOS_INDEX_PORT).write(register);
-        Port::<u8>::new(CMOS_DATA_PORT).read()
     }
+    // SAFETY: the CMOS data port `0x71` is a fixed ISA port, and no other
+    // reader can alter the index written above on this single-processor path.
+    unsafe { Port::<u8>::new(CMOS_DATA_PORT).read() }
 }
 
 /// Waits out the bank's once-a-second update window.

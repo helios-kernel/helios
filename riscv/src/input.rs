@@ -90,6 +90,10 @@ fn discover_input_devices(fdt: &Fdt<'_>) -> Vec<InputInterrupt> {
                 .unwrap_or_else(|| {
                     panic!("virtio-input node at {base:#x} has no valid interrupt source")
                 });
+            // SAFETY: `candidate` comes from `mmio_candidates(fdt)` and matched
+            // `DeviceType::Input` on the bootstrap hart before interrupts are
+            // unmasked, so `header..header + candidate.size` is an identity-mapped
+            // VirtIO MMIO input register block with exclusive driver access.
             let device = unsafe { helios_virtio::input_from_mmio(header, candidate.size) }
                 .unwrap_or_else(|error| {
                     panic!("failed to initialize virtio-input device at {base:#x}: {error}")

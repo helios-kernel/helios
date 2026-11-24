@@ -63,6 +63,8 @@ impl ConfigRegionAccess for EnhancedPciConfigAccess {
         let Some(config_address) = self.config_address(address, offset) else {
             return u32::MAX;
         };
+        // SAFETY: `config_address` checked 4-byte alignment and bounds within
+        // the 4 KiB ECAM space and mapped the page uncacheable.
         unsafe { (config_address as *const u32).read_volatile() }
     }
 
@@ -70,6 +72,8 @@ impl ConfigRegionAccess for EnhancedPciConfigAccess {
         let config_address = self
             .config_address(address, offset)
             .unwrap_or_else(|| panic!("PCI ECAM region was missing for {address}"));
+        // SAFETY: `config_address` checked 4-byte alignment and bounds within
+        // the 4 KiB ECAM space and mapped the page uncacheable.
         unsafe { (config_address as *mut u32).write_volatile(value) };
     }
 }
@@ -79,6 +83,8 @@ impl i6300esb::PciConfigIo for EnhancedPciConfigAccess {
         let config_address = self
             .byte_address(address, offset)
             .unwrap_or_else(|| panic!("PCI ECAM region was missing for {address}"));
+        // SAFETY: `byte_address` checked bounds within the 4 KiB ECAM space
+        // and mapped the page uncacheable.
         unsafe { (config_address as *const u8).read_volatile() }
     }
 
@@ -90,6 +96,8 @@ impl i6300esb::PciConfigIo for EnhancedPciConfigAccess {
         let config_address = self
             .byte_address(address, offset)
             .unwrap_or_else(|| panic!("PCI ECAM region was missing for {address}"));
+        // SAFETY: `offset` is 2-byte aligned and `byte_address` checked bounds
+        // within the 4 KiB ECAM space and mapped the page uncacheable.
         unsafe { (config_address as *const u16).read_volatile() }
     }
 
@@ -97,6 +105,8 @@ impl i6300esb::PciConfigIo for EnhancedPciConfigAccess {
         let config_address = self
             .byte_address(address, offset)
             .unwrap_or_else(|| panic!("PCI ECAM region was missing for {address}"));
+        // SAFETY: `byte_address` checked bounds within the 4 KiB ECAM space
+        // and mapped the page uncacheable.
         unsafe { (config_address as *mut u8).write_volatile(value) };
     }
 
@@ -108,6 +118,8 @@ impl i6300esb::PciConfigIo for EnhancedPciConfigAccess {
         let config_address = self
             .byte_address(address, offset)
             .unwrap_or_else(|| panic!("PCI ECAM region was missing for {address}"));
+        // SAFETY: `offset` is 2-byte aligned and `byte_address` checked bounds
+        // within the 4 KiB ECAM space and mapped the page uncacheable.
         unsafe { (config_address as *mut u16).write_volatile(value) };
     }
 }

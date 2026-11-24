@@ -517,6 +517,8 @@ fn set_times_impl(
         timespec_from_optional_nanos(access_nanos)?,
         timespec_from_optional_nanos(modified_nanos)?,
     ];
+    // SAFETY: `path` is a NUL-terminated `CString` and `times` is a valid
+    // two-element `libc::timespec` array, both alive across the call.
     let result = unsafe {
         libc::utimensat(
             libc::AT_FDCWD,

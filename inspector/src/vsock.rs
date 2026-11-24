@@ -224,14 +224,15 @@ impl AsyncVsockStream {
     }
 }
 
+// SAFETY: `AsyncVsockStream`'s `Read` and `Write` implementations only
+// forward to `self.stream` and never move out or drop the underlying socket.
 #[cfg(target_os = "linux")]
 unsafe impl async_io::IoSafe for AsyncVsockStream {}
 
 #[cfg(target_os = "linux")]
 impl std::os::fd::AsFd for AsyncVsockStream {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        use std::os::fd::AsRawFd as _;
-        unsafe { std::os::fd::BorrowedFd::borrow_raw(self.stream.as_raw_fd()) }
+        self.stream.as_fd()
     }
 }
 

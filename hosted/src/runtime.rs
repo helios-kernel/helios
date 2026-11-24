@@ -196,8 +196,17 @@ enum SlotRun {
 }
 
 struct HeapReservation {
-    backing: Box<[u8]>,
+    /// Leaked host allocation handed to the kernel's bootstrap allocator.
+    /// Kept as a raw pointer with mutable provenance (never a `Box<[u8]>`) so
+    /// the kernel holds exclusive mutable access for the life of the process.
+    backing: NonNull<[u8]>,
 }
+
+// SAFETY: `HeapReservation` never dereferences `backing`; it only passes the
+// leaked host allocation's pointer to `MemoryRegion::new` during bring-up.
+unsafe impl Send for HeapReservation {}
+// SAFETY: `HeapReservation` never dereferences `backing` across threads.
+unsafe impl Sync for HeapReservation {}
 
 struct TimerCommand {
     processor: ProcessorId,
@@ -613,15 +622,15 @@ impl ProcessorSlot {
 
 impl HeapReservation {
     fn new(bytes: usize) -> Self {
-        Self {
-            backing: vec![0u8; bytes].into_boxed_slice(),
-        }
+        let raw = Box::into_raw(vec![0u8; bytes].into_boxed_slice());
+        let backing = NonNull::new(raw).expect("Box::into_raw returned null");
+        Self { backing }
     }
 
     fn as_memory_region(&self) -> MemoryRegion {
-        // SAFETY: the reservation is host memory nothing else touches, and
-        // the machine that owns it lives as long as the kernel runs.
-        unsafe { MemoryRegion::new(NonNull::from(self.backing.as_ref()), NodeId::FIRST) }
+        // SAFETY: `self.backing` is a leaked host allocation with writable
+        // provenance that nothing else accesses and that outlives the kernel.
+        unsafe { MemoryRegion::new(self.backing, NodeId::FIRST) }
     }
 }
 

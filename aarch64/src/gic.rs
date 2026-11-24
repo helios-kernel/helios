@@ -114,10 +114,13 @@ impl Gic {
             physical_memory_offset,
         ) as *mut GicrSgi)
         .unwrap_or_else(|| panic!("AArch64 GIC redistributor mapped to a null address"));
-        // SAFETY: both windows were just mapped as device memory from
+        // SAFETY: the distributor window was just mapped as device memory from
         // the platform's own description, and this is the only driver
         // instance the kernel constructs.
         let distributor = unsafe { UniqueMmioPointer::new(distributor) };
+        // SAFETY: `distributor` and `redistributor` were just mapped as
+        // device memory covering `processor_count` redistributor frames, and
+        // this is the only `GicV3` instance constructed.
         let mut gic = unsafe { GicV3::new(distributor, redistributor, processor_count) }
             .unwrap_or_else(|error| panic!("AArch64 GICv3 initialisation failed: {error}"));
         let bootstrap = redistributor_index(&mut gic, bootstrap_mpidr, processor_count);

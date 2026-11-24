@@ -38,6 +38,8 @@ pub use context::Registers;
 macro_rules! read {
     ($reg:ident) => {{
         let value: u64;
+        // SAFETY: reading an EL1/EL2 system register via `mrs` at EL2 touches
+        // no memory and reads only the calling processor's register state.
         unsafe { asm!(concat!("mrs {value}, ", stringify!($reg)),
             value = out(reg) value, options(nomem, nostack, preserves_flags)); }
         value
@@ -46,6 +48,8 @@ macro_rules! read {
 macro_rules! write {
     ($reg:ident, $value:expr) => {{
         let value: u64 = $value;
+        // SAFETY: writing an EL2 virtualization control register affects only
+        // the calling processor's vCPU entry/exit state under masked IRQs.
         unsafe { asm!(concat!("msr ", stringify!($reg), ", {value}"),
             value = in(reg) value, options(nomem, nostack, preserves_flags)); }
     }};
@@ -130,15 +134,17 @@ impl HypervisorContract for Hypervisor {
         for frame in frames {
             for offset in (0..PhysFrame::SIZE).step_by(line) {
                 let address = frame.phys_addr() + offset;
-                // Clean to PoC, as required for an EL1 Linux Image with its
-                // MMU disabled; PoU alone does not establish that contract.
+                // SAFETY: `address` is a direct-map virtual address within the
+                // caller-owned frame, and `dc cvac` cleans that cache line to
+                // PoC as required for an EL1 Linux Image with its MMU disabled.
                 unsafe {
                     asm!("dc cvac, {address}", address = in(reg) address, options(nostack));
                 }
             }
         }
-        // Guest instruction addresses need not match the host aliases used
-        // above, so invalidate all inner-shareable instruction caches.
+        // SAFETY: `dsb ish`, `ic ialluis`, `dsb ish`, and `isb` complete the
+        // data cache clean and invalidate all inner-shareable instruction
+        // caches without touching memory.
         unsafe {
             asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack));
         }
@@ -223,6 +229,8 @@ unsafe impl Stage2Space for Space {
         frames: &[PhysFrame],
         flags: PageFlags,
     ) -> Result<(), HvError> {
+        // SAFETY: forwarded under the `Stage2Space::map_pages` contract, which
+        // requires `frames` to be exclusively owned for the guest mapping.
         unsafe { self.tables.map(range, frames, flags) }
     }
     async fn unmap_pages(&self, range: GuestRange) -> Result<(), HvError> {
@@ -340,13 +348,15 @@ impl Vcpu {
             .map(|(_, deadline, _)| deadline)
             .min()
             .unwrap_or(0);
+        // SAFETY: `isb` synchronizes the EL2 virtualization control writes
+        // before swapping debug state and entering the guest.
         unsafe {
             asm!("isb", options(nostack, preserves_flags));
         }
+        let host_debug = self.debug.enter();
         // SAFETY: preparation validated the mode, Stage-2 owns all guest
         // translations, and CNTHP plus HCR.IMO bound entry independently of
         // the guest's interrupt masks. The assembly restores the host first.
-        let host_debug = self.debug.enter();
         unsafe {
             helios_aarch64_enter_guest(&mut self.context);
         }
@@ -361,6 +371,8 @@ impl Vcpu {
         write!(vpidr_el2, saved_vpidr);
         write!(cptr_el2, saved_cptr);
         write!(mdcr_el2, saved_mdcr);
+        // SAFETY: `isb` orders restoring the host EL2 system registers before
+        // returning to host execution and unmasking interrupts.
         unsafe {
             asm!("isb", options(nostack, preserves_flags));
         }

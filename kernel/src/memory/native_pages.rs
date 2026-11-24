@@ -144,6 +144,8 @@ struct SharedFrame(NonNull<u8>);
 // memory pool; shared frames stay read-only in hardware until copied or
 // unwrapped by the sole surviving owner.
 unsafe impl Send for SharedFrame {}
+// SAFETY: `SharedFrame` only holds an immutable `NonNull<u8>` pointing to a
+// read-only shared frame whose drop frees the frame once the last `Arc` ends.
 unsafe impl Sync for SharedFrame {}
 
 impl SharedFrame {
@@ -552,9 +554,11 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
             return Ok(0);
         };
         let offset = (address - first) as usize;
-        // SAFETY: `address` is 4-byte aligned inside `first`'s 4 KiB frame,
-        // which stays allocated while `state` is locked.
-        let word = unsafe { &*frame.as_ptr().add(offset).cast::<AtomicU32>() };
+        // SAFETY: `offset < PAGE`, so the offset stays within `first`'s 4 KiB frame.
+        let ptr = unsafe { frame.as_ptr().add(offset) }.cast::<AtomicU32>();
+        // SAFETY: `address` is 4-byte aligned and `frame` stays allocated while
+        // `state` is locked.
+        let word = unsafe { &*ptr };
         Ok(u32::from_le(word.load(Ordering::SeqCst)))
     }
 
@@ -580,8 +584,11 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
             .and_then(|page| page.frame)
             .expect("atomic store commits a discarded page first");
         let offset = (address - first) as usize;
-        // SAFETY: as in `atomic_load_u32`.
-        let word = unsafe { &*frame.as_ptr().add(offset).cast::<AtomicU32>() };
+        // SAFETY: `offset < PAGE`, so the offset stays within `first`'s 4 KiB frame.
+        let ptr = unsafe { frame.as_ptr().add(offset) }.cast::<AtomicU32>();
+        // SAFETY: `address` is 4-byte aligned and `frame` stays allocated while
+        // `state` is locked.
+        let word = unsafe { &*ptr };
         word.store(value.to_le(), Ordering::SeqCst);
         Ok(())
     }
@@ -613,8 +620,11 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
             .and_then(|page| page.frame)
             .expect("atomic compare-exchange commits a discarded page first");
         let offset = (address - first) as usize;
-        // SAFETY: as in `atomic_load_u32`.
-        let word = unsafe { &*frame.as_ptr().add(offset).cast::<AtomicU32>() };
+        // SAFETY: `offset < PAGE`, so the offset stays within `first`'s 4 KiB frame.
+        let ptr = unsafe { frame.as_ptr().add(offset) }.cast::<AtomicU32>();
+        // SAFETY: `address` is 4-byte aligned and `frame` stays allocated while
+        // `state` is locked.
+        let word = unsafe { &*ptr };
         Ok(word
             .compare_exchange(
                 expected.to_le(),
@@ -1255,8 +1265,8 @@ impl NativePages {
             }
             let skip = address.saturating_sub(base) as usize;
             let take = ((base + PAGE).min(end_addr) - base.max(address)) as usize;
-            // SAFETY: `skip` lies inside this page's frame.
-            let start = unsafe { NonNull::new_unchecked(frame.ptr().as_ptr().add(skip)) };
+            // SAFETY: `skip < PAGE`, so `frame.ptr().add(skip)` stays inside this page's frame.
+            let start = unsafe { frame.ptr().add(skip) };
             emit(Some(start), take);
             cursor = base + PAGE;
         }
@@ -1277,10 +1287,12 @@ impl NativePages {
         self.runs(address, length, PageFlags::READ, |run, bytes, offset| {
             let target = &mut output[offset..offset + bytes];
             match run {
-                // SAFETY: the run lies inside frames this index owns, which
-                // stay allocated while the owner's lock is held.
-                Some(run) => target
-                    .copy_from_slice(unsafe { core::slice::from_raw_parts(run.as_ptr(), bytes) }),
+                Some(run) => {
+                    // SAFETY: the run lies inside frames this index owns, which
+                    // stay allocated while the owner's lock is held.
+                    let src = unsafe { core::slice::from_raw_parts(run.as_ptr(), bytes) };
+                    target.copy_from_slice(src);
+                }
                 None => target.fill(0),
             }
         })
@@ -1289,10 +1301,16 @@ impl NativePages {
     /// Copies `bytes` to `address`, every page of which must be writable
     /// and committed; `access` is the access the copy requires, empty for
     /// the initial contents a fresh mapping receives.
-    pub fn write(&self, address: u64, bytes: &[u8], access: PageFlags) -> Result<(), NativeError> {
+    pub fn write(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+        access: PageFlags,
+    ) -> Result<(), NativeError> {
         self.runs(address, bytes.len(), access, |run, length, offset| {
             let run = run.expect("a write commits every discarded page first");
-            // SAFETY: as in `read`.
+            // SAFETY: `self` is borrowed mutably and the run lies inside frames
+            // this index owns exclusively for the call.
             let target = unsafe { core::slice::from_raw_parts_mut(run.as_ptr(), length) };
             target.copy_from_slice(&bytes[offset..offset + length]);
         })

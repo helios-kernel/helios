@@ -161,11 +161,13 @@ unsafe impl UserTranslation for X86Tables {
         // `protect` widens its leaf.
         let parents =
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-        // SAFETY: the page is not mapped and the frame is fresh; the root and
-        // every lower-half table are owned by this space and reached through
-        // the kernel direct map.
+        // SAFETY: the root and every lower-half table are owned by this
+        // space and reached through the kernel direct map.
+        let mut mapper = unsafe { OffsetPageTable::new(&mut self.root, offset) };
+        // SAFETY: the page is not mapped and the frame is fresh; `mapper`
+        // owns the lower-half tables and `self.tables` supplies zeroed frames.
         let mapped = unsafe {
-            OffsetPageTable::new(&mut self.root, offset).map_to_with_table_flags(
+            mapper.map_to_with_table_flags(
                 page,
                 frame,
                 page_table_flags(flags),
@@ -200,7 +202,8 @@ unsafe impl UserTranslation for X86Tables {
             .expect("an installed page is page aligned");
         // SAFETY: the page maps a frame of this space; only its access
         // changes, and the caller invalidates a narrowing.
-        match unsafe { self.mapper().update_flags(page, page_table_flags(flags)) } {
+        let updated = unsafe { self.mapper().update_flags(page, page_table_flags(flags)) };
+        match updated {
             Ok(flush) => flush.ignore(),
             Err(error) => panic!("changing the access of user page {base:#x}: {error:?}"),
         }
@@ -245,11 +248,15 @@ impl X86Tables {
         let kernel_words = unsafe { &*(kernel as *const [u64; 512]) };
         let root_words = core::ptr::from_mut(&mut *self.root).cast::<u64>();
         for (index, &entry) in kernel_words.iter().enumerate().skip(256) {
-            // SAFETY: `index < 512` and `self.root` is uniquely borrowed under
-            // the space lock.
-            unsafe {
-                let slot = root_words.add(index);
-                if slot.read_volatile() != entry {
+            // SAFETY: `index < 512` is within the 512-entry PML4 `self.root`
+            // uniquely borrowed under the space lock.
+            let slot = unsafe { root_words.add(index) };
+            // SAFETY: `slot` points to an aligned `u64` entry in `self.root`.
+            let current = unsafe { slot.read_volatile() };
+            if current != entry {
+                // SAFETY: `slot` points to an exclusively owned upper-half
+                // PML4 entry in `self.root`.
+                unsafe {
                     slot.write_volatile(entry);
                 }
             }
@@ -323,13 +330,20 @@ impl Registers {
         let word = Self::word(register)?;
         // SAFETY: the frame is `repr(C)` and made of `u64` words only, and
         // `word` names one of them.
-        Ok(unsafe { (self as *const Self as *const u64).add(word).read() })
+        let slot = unsafe { (self as *const Self as *const u64).add(word) };
+        // SAFETY: `slot` points to a valid initialized `u64` field of `self`.
+        let value = unsafe { slot.read() };
+        Ok(value)
     }
 
     fn set(&mut self, register: RegisterId, value: u64) -> Result<(), NativeError> {
         let word = Self::word(register)?;
-        // SAFETY: as in `get`.
-        unsafe { (self as *mut Self as *mut u64).add(word).write(value) };
+        // SAFETY: the frame is `repr(C)` and made of `u64` words only, and
+        // `word` names one of them.
+        let slot = unsafe { (self as *mut Self as *mut u64).add(word) };
+        // SAFETY: `slot` points to an exclusively borrowed `u64` field of
+        // `self`.
+        unsafe { slot.write(value) };
         Ok(())
     }
 }
@@ -341,9 +355,9 @@ struct AlignedBytes {
 impl AlignedBytes {
     fn new(size: usize, align: usize) -> Result<Self, NativeError> {
         let layout = Layout::from_size_align(size, align).expect("native allocation layout");
-        // SAFETY: layout is nonempty and valid; Drop uses the same layout.
-        let pointer =
-            NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(NativeError::OutOfMemory)?;
+        // SAFETY: `layout` is nonempty and valid; `Drop` uses the same layout.
+        let raw = unsafe { alloc_zeroed(layout) };
+        let pointer = NonNull::new(raw).ok_or(NativeError::OutOfMemory)?;
         Ok(Self { pointer, layout })
     }
 }
@@ -608,24 +622,47 @@ unsafe impl UserContext for X86Context {
         // Counted until the exit below has written the kernel's CR3 back.
         let slice = space.begin_slice();
         self.switch.user_cr3 = slice.with_tables(X86Tables::root);
-        let fault_address = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        let fault_address = x86_64::instructions::interrupts::without_interrupts(|| {
             self.switch.self_pointer = core::ptr::from_mut(&mut self.switch) as u64;
             let (kernel_frame, kernel_flags) = Cr3::read_raw();
             self.switch.kernel_cr3 =
                 kernel_frame.start_address().as_u64() | u64::from(kernel_flags);
-            self.switch.kernel_fs = rdmsr(FS_BASE);
-            self.switch.kernel_gs = rdmsr(GS_BASE);
-            let old_kernel_gs = rdmsr(KERNEL_GS_BASE);
-            wrmsr(KERNEL_GS_BASE, self.switch.self_pointer);
-            wrmsr(GS_BASE, 0);
+            // SAFETY: `FS_BASE` (`0xc000_0100`) is architectural on x86-64.
+            self.switch.kernel_fs = unsafe { rdmsr(FS_BASE) };
+            // SAFETY: `GS_BASE` (`0xc000_0101`) is architectural on x86-64.
+            self.switch.kernel_gs = unsafe { rdmsr(GS_BASE) };
+            // SAFETY: `KERNEL_GS_BASE` (`0xc000_0102`) is architectural on x86-64.
+            let old_kernel_gs = unsafe { rdmsr(KERNEL_GS_BASE) };
+            // SAFETY: interrupts are masked and `self_pointer` is a canonical
+            // pointer to `self.switch`, preserved until restored below.
+            unsafe { wrmsr(KERNEL_GS_BASE, self.switch.self_pointer) };
+            // SAFETY: interrupts are masked; zeroing `GS_BASE` before user
+            // entry ensures `swapgs` swaps in `KERNEL_GS_BASE`.
+            unsafe { wrmsr(GS_BASE, 0) };
             // SYSCALL loads kernel CS=8 and SS=16; return uses IRET, not SYSRET.
-            wrmsr(STAR, 8 << 32);
-            wrmsr(LSTAR, helios_x86_native_syscall as *const () as u64);
-            wrmsr(FMASK, u32::MAX as u64);
-            wrmsr(EFER, rdmsr(EFER) | 1);
-            helios_x86_native_enter(&mut self.switch);
-            wrmsr(GS_BASE, self.switch.kernel_gs);
-            wrmsr(KERNEL_GS_BASE, old_kernel_gs);
+            // SAFETY: `STAR` is architectural with `SCE` enabled below; CS=8 /
+            // SS=16 match the kernel GDT selectors.
+            unsafe { wrmsr(STAR, 8 << 32) };
+            // SAFETY: `LSTAR` is set to the canonical kernel entry stub
+            // `helios_x86_native_syscall`.
+            unsafe { wrmsr(LSTAR, helios_x86_native_syscall as *const () as u64) };
+            // SAFETY: `FMASK` masks all architectural RFLAGS bits on `SYSCALL`.
+            unsafe { wrmsr(FMASK, u32::MAX as u64) };
+            // SAFETY: `IA32_EFER` is architectural on x86-64.
+            let efer = unsafe { rdmsr(EFER) };
+            // SAFETY: sets `EFER.SCE` while preserving the remaining `EFER` bits.
+            unsafe { wrmsr(EFER, efer | 1) };
+            // SAFETY: interrupts are masked, `user_cr3` maps this space's
+            // lower half and the kernel's upper half, `user_fs` and user
+            // `rip`/`rsp` are canonical lower-half addresses, and the assembly
+            // restores kernel `CR3`, `FS_BASE`, and XSTATE before returning.
+            unsafe { helios_x86_native_enter(&mut self.switch) };
+            // SAFETY: restores the kernel `GS_BASE` saved above before unmasking
+            // interrupts.
+            unsafe { wrmsr(GS_BASE, self.switch.kernel_gs) };
+            // SAFETY: restores the `KERNEL_GS_BASE` saved above before
+            // unmasking interrupts.
+            unsafe { wrmsr(KERNEL_GS_BASE, old_kernel_gs) };
             // Interrupts stay masked from the user fault to here, so CR2 is
             // still the user fault's address.
             Cr2::read_raw()

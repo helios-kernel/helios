@@ -26,10 +26,21 @@ pub extern "C" fn helios_compiler_pthread_self_offset() -> u32 {
     core::ptr::addr_of_mut!(__wasilibc_pthread_self).addr() as u32
 }
 
+/// Initializes the wasi-libc thread pointer and runs static C constructors.
+///
+/// # Safety
+///
+/// `thread_pointer` must be a valid, aligned address of this instance's
+/// static TLS / pthread control block in linear memory, and this function must
+/// be called once before any multi-threaded or constructor-dependent code runs.
 #[unsafe(no_mangle)]
-pub extern "C" fn helios_compiler_initialize(thread_pointer: u32) {
+pub unsafe extern "C" fn helios_compiler_initialize(thread_pointer: u32) {
+    // SAFETY: caller guarantees `thread_pointer` points to a valid wasi-libc
+    // thread control block in linear memory.
     let status = unsafe { __init_tp(thread_pointer as *mut core::ffi::c_void) };
     assert_eq!(status, 0, "failed to initialize wasi-libc thread pointer");
+    // SAFETY: the thread pointer is initialized above, and this initializer is
+    // invoked once before any constructor-dependent plugin code runs.
     unsafe {
         __wasm_call_ctors();
     }
@@ -60,6 +71,8 @@ pub extern "C" fn helios_compiler_alloc(len: usize, align: usize) -> *mut u8 {
         0,
         "zero-length buffers are never allocated across the compiler ABI"
     );
+    // SAFETY: `layout` is valid (`Layout::from_size_align` succeeded) and has
+    // non-zero size (asserted above).
     let ptr = unsafe { std::alloc::alloc(layout) };
     if !ptr.is_null() {
         add_outstanding(len);
@@ -79,6 +92,8 @@ pub extern "C" fn helios_compiler_alloc(len: usize, align: usize) -> *mut u8 {
 pub unsafe extern "C" fn helios_compiler_free(ptr: *mut u8, len: usize, align: usize) {
     let layout = std::alloc::Layout::from_size_align(len, align)
         .unwrap_or_else(|error| panic!("invalid compiler free layout: {error}"));
+    // SAFETY: caller guarantees `ptr` came from `helios_compiler_alloc` or
+    // `hand_over` with the same `(len, align)` layout and has not been freed.
     unsafe {
         std::alloc::dealloc(ptr, layout);
     }
@@ -97,10 +112,17 @@ pub extern "C" fn helios_compiler_outstanding_bytes() -> u32 {
 ///
 /// # Safety
 ///
-/// `request_ptr..request_ptr + request_len` must be a readable range of
-/// this module's linear memory holding an encoded compile request.
+/// `request_ptr..request_ptr + request_len` must be a readable, immutable
+/// range of this module's linear memory holding an encoded compile request,
+/// and every non-zero `(ptr, len)` slice referenced by its
+/// `CompilerRequestHeader` (`wasm`, `target`, `isa_level`) must likewise name a
+/// non-null, readable, immutable range of linear memory (`len <= isize::MAX`)
+/// for the duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn helios_compiler_compile(request_ptr: u32, request_len: u32) -> u32 {
+    // SAFETY: caller guarantees `request_ptr..request_ptr + request_len` and
+    // any non-zero buffers named in its header are valid readable ranges of
+    // linear memory for the duration of this call.
     let request = unsafe { read_request(request_ptr, request_len) };
     match request {
         Ok(request) => compile(request),
@@ -120,10 +142,18 @@ struct CompileRequest<'a> {
     profile: bool,
 }
 
+/// # Safety
+///
+/// `request_ptr..request_ptr + request_len` (when `request_len != 0`) and every
+/// non-zero `(ptr, len)` range inside the decoded `CompilerRequestHeader` must
+/// be non-null, readable, immutable ranges of linear memory (`len <= isize::MAX`)
+/// valid for `'a`.
 unsafe fn read_request<'a>(
     request_ptr: u32,
     request_len: u32,
 ) -> Result<CompileRequest<'a>, String> {
+    // SAFETY: caller guarantees `request_ptr..request_ptr + request_len` is
+    // readable and immutable for `'a` when `request_len` is non-zero.
     let request = unsafe { slice_from_abi(request_ptr, request_len) };
     let Some((header, _)) = request.split_first_chunk::<{ CompilerRequestHeader::SIZE }>() else {
         return Err(format!(
@@ -138,10 +168,16 @@ unsafe fn read_request<'a>(
             header.abi_version, HELIOS_COMPILER_ABI_VERSION
         ));
     }
+    // SAFETY: caller guarantees `header.wasm_ptr..header.wasm_ptr + header.wasm_len`
+    // is readable and immutable for `'a` when `header.wasm_len` is non-zero.
     let wasm = unsafe { slice_from_abi(header.wasm_ptr, header.wasm_len) };
+    // SAFETY: caller guarantees `header.target_ptr..header.target_ptr + header.target_len`
+    // is readable and immutable for `'a` when `header.target_len` is non-zero.
     let target = unsafe { slice_from_abi(header.target_ptr, header.target_len) };
     let target = core::str::from_utf8(target)
         .map_err(|error| format!("compiler target triple is not UTF-8: {error}"))?;
+    // SAFETY: caller guarantees `header.isa_level_ptr..header.isa_level_ptr + header.isa_level_len`
+    // is readable and immutable for `'a` when `header.isa_level_len` is non-zero.
     let isa_level = unsafe { slice_from_abi(header.isa_level_ptr, header.isa_level_len) };
     let isa_level = core::str::from_utf8(isa_level)
         .map_err(|error| format!("compiler ISA level is not UTF-8: {error}"))?;
@@ -170,11 +206,15 @@ fn compile_target<'a>(triple: &'a str, isa_level: &str) -> Result<CwasmTarget<'a
 ///
 /// # Safety
 ///
-/// A non-zero `len` names a readable range of this module's linear memory.
+/// When `len` is non-zero, `ptr` must be non-null, `len as usize <= isize::MAX`,
+/// and `ptr..ptr + len` must be a readable, immutable range of this module's
+/// linear memory for `'a`.
 unsafe fn slice_from_abi<'a>(ptr: u32, len: u32) -> &'a [u8] {
     if len == 0 {
         return &[];
     }
+    // SAFETY: `len` is non-zero and the caller guarantees `ptr` is non-null
+    // and `ptr..ptr + len` is a valid, immutable slice in linear memory for `'a`.
     unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) }
 }
 

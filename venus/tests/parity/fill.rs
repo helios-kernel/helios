@@ -258,7 +258,14 @@ impl<'a> Filler<'a> {
                 .size as usize
         };
         if !ty.is_pointer() && self.an.reg.types[ty.base].name == "char" {
-            // SAFETY: a character array has `count >= 3` bytes.
+            if count < 3 {
+                return error(format!(
+                    "{owner}.{}: char array length {count} is too short for a terminated string",
+                    var.name
+                ));
+            }
+            // SAFETY: `count >= 3` bytes are allocated and zero-initialized at `at`,
+            // so writing 2 bytes leaves a NUL terminator at byte 2.
             unsafe { std::ptr::copy_nonoverlapping(b"ab".as_ptr(), at, 2) };
             return Ok(());
         }
@@ -303,8 +310,11 @@ impl<'a> Filler<'a> {
             1 if is_blob(&self.an.reg, var) => {
                 let block = self.arena.alloc(CAPACITY * 8);
                 for i in 0..CAPACITY * 8 {
-                    // SAFETY: inside the block just allocated.
-                    unsafe { *block.add(i) = (self.next_value() & 0xFF) as u8 };
+                    let byte = (self.next_value() & 0xFF) as u8;
+                    // SAFETY: `i < CAPACITY * 8`, so `block.add(i)` stays within the allocated block.
+                    let slot = unsafe { block.add(i) };
+                    // SAFETY: `slot` points to an exclusive writable `u8` in the arena block.
+                    unsafe { *slot = byte };
                 }
                 block
             }
@@ -318,8 +328,10 @@ impl<'a> Filler<'a> {
                     } else {
                         self.elements(var, ty.base, depth, owner)?
                     };
-                    // SAFETY: `i < count` pointer slots were allocated.
-                    unsafe { *outer.cast::<*mut u8>().add(i) = inner };
+                    // SAFETY: `i < count` and `outer` has `count * POINTER_SIZE` bytes allocated.
+                    let slot = unsafe { outer.cast::<*mut u8>().add(i) };
+                    // SAFETY: `slot` points to an aligned writable `*mut u8` slot in `outer`.
+                    unsafe { *slot = inner };
                 }
                 outer
             }
@@ -330,14 +342,14 @@ impl<'a> Filler<'a> {
                 ));
             }
         };
-        // SAFETY: `at` is the storage of one pointer.
-        unsafe { *at.cast::<*mut u8>() = pointer };
+        // SAFETY: `at` points to `POINTER_SIZE` writable bytes for this pointer.
+        unsafe { at.cast::<*mut u8>().write_unaligned(pointer) };
         Ok(())
     }
 
     fn string(&mut self) -> *mut u8 {
         let block = self.arena.alloc(16);
-        // SAFETY: the block has 16 bytes.
+        // SAFETY: `block` has 16 writable bytes and `c"ab"` has 3 readable bytes.
         unsafe { std::ptr::copy_nonoverlapping(c"ab".as_ptr().cast::<u8>(), block, 3) };
         block
     }
@@ -381,10 +393,12 @@ impl<'a> Filler<'a> {
                 match ty.name.as_str() {
                     // Finite values: a NaN would compare unequal as floats
                     // and says nothing about the encoder.
+                    // SAFETY: `at` points to 4 writable bytes for this `float` scalar.
                     "float" => unsafe {
                         at.cast::<f32>()
                             .write_unaligned((value % 1000) as f32 / 8.0)
                     },
+                    // SAFETY: `at` points to 8 writable bytes for this `double` scalar.
                     "double" => unsafe {
                         at.cast::<f64>()
                             .write_unaligned((value % 1000) as f64 / 8.0)
@@ -430,11 +444,10 @@ impl<'a> Filler<'a> {
                 let id = 0x1000 + (self.next_value() & 0xFFFF_FFFF);
                 if ty.dispatchable {
                     let object = self.arena.alloc(16);
-                    // SAFETY: the object has 16 bytes, its id at the start.
-                    unsafe {
-                        object.cast::<u64>().write(id);
-                        at.cast::<*mut u8>().write(object);
-                    }
+                    // SAFETY: `object` was allocated with 16 bytes aligned for `u64` in the arena.
+                    unsafe { object.cast::<u64>().write(id) };
+                    // SAFETY: `at` points to `POINTER_SIZE` writable bytes for this handle.
+                    unsafe { at.cast::<*mut u8>().write_unaligned(object) };
                 } else {
                     // SAFETY: a non-dispatchable handle is 8 bytes.
                     unsafe { at.cast::<u64>().write_unaligned(id) };
@@ -547,11 +560,12 @@ impl<'a> Filler<'a> {
         }
         if self.cfg.pnext == PNext::ChainWithUnknown {
             let unknown = self.arena.alloc(16);
-            // SAFETY: the block has 16 bytes: sType, padding, pNext.
-            unsafe {
-                unknown.cast::<u32>().write(UNKNOWN_STRUCTURE_TYPE);
-                unknown.add(8).cast::<*mut u8>().write(next);
-            }
+            // SAFETY: `unknown` is a 16-byte arena allocation aligned for `u32` at offset 0.
+            unsafe { unknown.cast::<u32>().write(UNKNOWN_STRUCTURE_TYPE) };
+            // SAFETY: offset 8 is within the 16-byte `unknown` allocation.
+            let pnext_slot = unsafe { unknown.add(8) };
+            // SAFETY: `pnext_slot` is 8-byte aligned and holds 8 writable bytes for `pNext`.
+            unsafe { pnext_slot.cast::<*mut u8>().write(next) };
             next = unknown;
         }
         Ok(next)
@@ -685,6 +699,7 @@ fn split_index(segment: &str) -> (&str, bool) {
 /// `at` must point to `size` writable bytes.
 unsafe fn write_int(at: *mut u8, size: usize, value: u64) {
     let bytes = value.to_le_bytes();
-    // SAFETY: by the contract, and `size <= 8`.
+    // SAFETY: `at` is valid for `size >= size.min(8)` writable bytes by the
+    // caller, and `bytes` is a distinct 8-byte array.
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, size.min(8)) };
 }
