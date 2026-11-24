@@ -17,7 +17,7 @@ use helios_kernel::{ExternalInterruptHandler, HardwareEntropySource, RootEntropy
 use triomphe::Arc;
 
 type Aarch64VirtioRngDevice = helios_virtio::VirtioRngDevice<
-    helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>,
+    helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<crate::Aarch64DmaPool>>,
 >;
 
 #[derive(Clone)]
@@ -110,7 +110,7 @@ fn discover_entropy_device(
     let virtual_base = crate::mmio_virtual_base(candidate.region.base, physical_memory_offset);
     let header = core::ptr::NonNull::new(virtual_base as *mut u8)
         .unwrap_or_else(|| panic!("virtio MMIO base {virtual_base:#x} was unexpectedly null"));
-    let dma = helios_virtio::OffsetDmaPool::new(physical_memory_offset);
+    let dma = crate::dma_pool();
     let device =
         unsafe { helios_virtio::rng_from_mmio_with_dma(header, candidate.region.size, dma) }
             .unwrap_or_else(|error| {

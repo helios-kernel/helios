@@ -587,7 +587,7 @@ jobs:
           name: helios-wasm-${{ matrix.profile }}
           path: ${{ runner.temp }}/wasm-programs/${{ matrix.profile }}
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 14
       - name: Prune the guest wasm cache
         if: always() && (matrix.programs == 'all' || github.event_name == 'schedule')
         uses: ./helios/.github/actions/prune-artifact-cache
@@ -995,6 +995,31 @@ jobs:
           grep -Fqx oob-load:before-fault oob-load-smoke.out
           grep -Fqx guest-alive oob-load-smoke.out
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
+      - name: Exercise guest fiber-stack growth and overflow
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/stack-test"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program stack-test \
+            --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/stack-test host-call && /bin/stack-test large-frame && (/bin/stack-test recurse; echo after-recurse) && (/bin/stack-test large-frame-overflow; echo after-large-frame-overflow)' \
+            2>&1 > stack-test-smoke.out | tee "$runtime/inspector.log"
+          cat stack-test-smoke.out
+          cat "$runtime/guest-tracing.log"
+          grep -Fqx stack-test:host-call:ok stack-test-smoke.out
+          grep -Fqx stack-test:large-frame:ok stack-test-smoke.out
+          grep -Fqx stack-test:recurse:before stack-test-smoke.out
+          grep -Fqx after-recurse stack-test-smoke.out
+          grep -Fqx stack-test:large-frame-overflow:before stack-test-smoke.out
+          grep -Fqx after-large-frame-overflow stack-test-smoke.out
+          ! grep -Fq 'Kernel panic' stack-test-smoke.out "$runtime/inspector.log"
       - uses: ./helios/.github/actions/vhost-vsock
       - name: Boot riscv64 guest with the inspector RPC on vsock
         timeout-minutes: 5
@@ -1068,22 +1093,41 @@ jobs:
         if: ${{ !cancelled() && hashFiles('helios/target/release/helios-inspector') != '' }}
         working-directory: helios
         run: ./target/release/helios-inspector vm --arch riscv64 --release build
-      # The image a `--no-build` boot needs on another host, laid out as
-      # the paths under `target/` the inspector reads: unpacked into
-      # `target/`, it is the whole installation (docs/boot.md). The
-      # manifest and the key files are not part of it: nothing on the
-      # `--no-build` path reads them, and the manifest records this
-      # runner's absolute paths. The root key pair is generated per
-      # build, so the signing key the kernel carries belongs to this
-      # image alone.
-      - name: Upload the guest image
+      # Stage the prebuilt kernel (`helios-kernel-riscv64-release`) and full
+      # bootable image (`helios-image-riscv64-release`) with typed manifests
+      # (#1218). Neither carries any root secret key.
+      - name: Stage prebuilt kernel and image artifacts
+        id: stage-prebuilt
         if: always() && steps.guest-image.outcome == 'success'
+        working-directory: helios
+        run: |
+          set -euo pipefail
+          "$HELIOS_CLI_BIN" artifact-stage \
+            --kind kernel --arch riscv64 --profile release \
+            --out-dir "$RUNNER_TEMP/stage-kernel-riscv64" \
+            --kernel target/riscv64gc-unknown-none-elf/kernel-release/helios \
+            --root-public-key target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-root-public.key
+          "$HELIOS_CLI_BIN" artifact-stage \
+            --kind image --arch riscv64 --profile release \
+            --out-dir "$RUNNER_TEMP/stage-image-riscv64" \
+            --kernel target/riscv64gc-unknown-none-elf/kernel-release/helios \
+            --root-public-key target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-root-public.key \
+            --bootfs target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-bootfs \
+            --compiler-plugin target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/compiler_plugin.wasm
+      - name: Upload the prebuilt kernel
+        if: always() && steps.stage-prebuilt.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: helios-guest-riscv64
-          path: |
-            helios/target/riscv64gc-unknown-none-elf/kernel-release/helios
-            helios/target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-bootfs
+          name: helios-kernel-riscv64-release
+          path: ${{ runner.temp }}/stage-kernel-riscv64
+          if-no-files-found: error
+          retention-days: 90
+      - name: Upload the prebuilt image
+        if: always() && steps.stage-prebuilt.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-image-riscv64-release
+          path: ${{ runner.temp }}/stage-image-riscv64
           if-no-files-found: error
           retention-days: 90
       - name: Prune the precompiled cwasm cache
@@ -1256,6 +1300,10 @@ jobs:
           # Every processor installed the machine's key and enabled
           # return-address signing before the kernel ran anything else.
           grep -F 'return-address signing enabled on every processor' "$runtime/inspector.log"
+          # Under TCG the inspector enables QEMU's allocation-tag storage by
+          # default, so every processor enables synchronous tag checking and
+          # passes its bring-up self-check.
+          grep -F 'memory tagging enabled on every processor' "$runtime/inspector.log"
           # The `virt` board's PL061 GPIO controller is hardware the
           # kernel has no driver for, so discovery offers it to a
           # user-mode one. This asserts the whole path from the device
@@ -1341,12 +1389,35 @@ jobs:
           grep -Fqx ok boot-acpi.out
           grep -F 'platform described by acpi' "$runtime/inspector.log"
           grep -F 'return-address signing enabled on every processor' "$runtime/inspector.log"
+          grep -F 'memory tagging enabled on every processor' "$runtime/inspector.log"
           # The ACPI walk looks for virtio transports by hardware id and
           # names nothing else, so an ACPI-described machine publishes
           # no grants. Asserting the absence keeps that a stated fact
           # rather than something that quietly starts or stops being
           # true.
           ! grep -qF 'device grant published' "$runtime/inspector.log"
+      # On a machine without FEAT_MTE2 (`--mte off`, matching HVF or pre-v8.5
+      # hardware), the backend leaves memory tagging disabled and reports it.
+      - name: Boot aarch64 guest without memory tagging
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/mte-off"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            --accel tcg --mte off \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-mte-off.out | tee "$runtime/inspector.log"
+          cat boot-mte-off.out
+          grep -Fqx ok boot-mte-off.out
+          grep -F 'memory tagging not enabled by this backend' "$runtime/inspector.log"
       - name: Run static Linux programs through dash
         timeout-minutes: 10
         shell: bash
@@ -1465,6 +1536,31 @@ jobs:
           grep -Fqx oob-load:before-fault oob-load-smoke.out
           grep -Fqx guest-alive oob-load-smoke.out
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
+      - name: Exercise guest fiber-stack growth and overflow
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/stack-test"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            --accel tcg \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program stack-test \
+            --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/stack-test host-call && /bin/stack-test large-frame && (/bin/stack-test recurse; echo after-recurse) && (/bin/stack-test large-frame-overflow; echo after-large-frame-overflow)' \
+            2>&1 > stack-test-smoke.out | tee "$runtime/inspector.log"
+          cat stack-test-smoke.out
+          cat "$runtime/guest-tracing.log"
+          grep -Fqx stack-test:host-call:ok stack-test-smoke.out
+          grep -Fqx stack-test:large-frame:ok stack-test-smoke.out
+          grep -Fqx stack-test:recurse:before stack-test-smoke.out
+          grep -Fqx after-recurse stack-test-smoke.out
+          grep -Fqx stack-test:large-frame-overflow:before stack-test-smoke.out
+          grep -Fqx after-large-frame-overflow stack-test-smoke.out
+          ! grep -Fq 'Kernel panic' stack-test-smoke.out "$runtime/inspector.log"
       - uses: ./helios/.github/actions/swtpm
       # Measured boot (#602): the kernel's signing seed is sealed in the
       # TPM to the boot chain. The ACPI description is the boot whose
@@ -1626,25 +1722,45 @@ jobs:
         if: ${{ !cancelled() && hashFiles('helios/target/release/helios-inspector') != '' }}
         working-directory: helios
         run: ./target/release/helios-inspector vm --arch aarch64 --release build
-      # The image a `--no-build` boot needs on another host, laid out as
-      # the paths under `target/` the inspector reads: unpacked into
-      # `target/`, it is the whole installation (docs/boot.md). The
-      # manifest and the key files are not part of it: nothing on the
-      # `--no-build` path reads them, and the manifest records this
-      # runner's absolute paths. The root key pair is generated per
-      # build, so the signing key the kernel carries belongs to this
-      # image alone. The compiler plugin's core module rides along: the
-      # bench's Linux + Wasmtime column runs the build the bootfs
-      # precompiled (tools/bench/native/build.sh, compiler-host/).
-      - name: Upload the guest image
+      # Stage the prebuilt kernel (`helios-kernel-aarch64-release`) and full
+      # bootable image (`helios-image-aarch64-release`, including `kernel.uefi.img`
+      # and `compiler_plugin.wasm`) with typed manifests (#1218).
+      - name: Stage prebuilt kernel and image artifacts
+        id: stage-prebuilt
         if: always() && steps.guest-image.outcome == 'success'
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+        run: |
+          set -euo pipefail
+          "$HELIOS_CLI_BIN" artifact-stage \
+            --kind kernel --arch aarch64 --profile release \
+            --out-dir "$RUNNER_TEMP/stage-kernel-aarch64" \
+            --kernel target/aarch64-unknown-none/kernel-release/helios \
+            --root-public-key target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-root-public.key
+          "$HELIOS_CLI_BIN" artifact-stage \
+            --kind image --arch aarch64 --profile release \
+            --out-dir "$RUNNER_TEMP/stage-image-aarch64" \
+            --kernel target/aarch64-unknown-none/kernel-release/helios \
+            --root-public-key target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-root-public.key \
+            --bootfs target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs \
+            --compiler-plugin target/kernel-prebuild/aarch64-unknown-none/kernel-release/compiler_plugin.wasm \
+            --build-uefi-image
+      - name: Upload the prebuilt kernel
+        if: always() && steps.stage-prebuilt.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: helios-guest-aarch64
-          path: |
-            helios/target/aarch64-unknown-none/kernel-release/helios
-            helios/target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs
-            helios/target/kernel-prebuild/aarch64-unknown-none/kernel-release/compiler_plugin.wasm
+          name: helios-kernel-aarch64-release
+          path: ${{ runner.temp }}/stage-kernel-aarch64
+          if-no-files-found: error
+          retention-days: 90
+      - name: Upload the prebuilt image
+        if: always() && steps.stage-prebuilt.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-image-aarch64-release
+          path: ${{ runner.temp }}/stage-image-aarch64
           if-no-files-found: error
           retention-days: 90
       - name: Prune the precompiled cwasm cache
@@ -1747,6 +1863,59 @@ jobs:
         run: |
           cargo test -p helios-inspector -- --ignored --nocapture --exact \
             vm::tests::cfi_self_test_panics_aarch64
+      - name: Refuse a tag mismatch
+        timeout-minutes: 60
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          cargo test -p helios-inspector -- --ignored --nocapture --exact \
+            vm::tests::mte_self_test_panics_aarch64
+      - name: Stage prebuilt CFI kernel and image artifacts
+        id: stage-prebuilt
+        if: >-
+          always() && !cancelled() &&
+          hashFiles('helios/target/debug/helios-cli') != '' &&
+          hashFiles('helios/target/aarch64-unknown-none/debug/helios') != '' &&
+          hashFiles('helios/target/kernel-prebuild/aarch64-unknown-none/debug/helios-bootfs') != ''
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+        run: |
+          set -euo pipefail
+          ./target/debug/helios-cli artifact-stage \
+            --kind kernel --arch aarch64 --profile debug-cfi \
+            --out-dir "$RUNNER_TEMP/stage-kernel-aarch64-cfi" \
+            --kernel target/aarch64-unknown-none/debug/helios \
+            --root-public-key target/kernel-prebuild/aarch64-unknown-none/debug/helios-root-public.key
+          ./target/debug/helios-cli artifact-stage \
+            --kind image --arch aarch64 --profile debug-cfi \
+            --program debugger --program init \
+            --out-dir "$RUNNER_TEMP/stage-image-aarch64-cfi" \
+            --kernel target/aarch64-unknown-none/debug/helios \
+            --root-public-key target/kernel-prebuild/aarch64-unknown-none/debug/helios-root-public.key \
+            --bootfs target/kernel-prebuild/aarch64-unknown-none/debug/helios-bootfs \
+            --build-uefi-image
+      - name: Upload the prebuilt CFI kernel
+        if: always() && steps.stage-prebuilt.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-kernel-aarch64-debug-cfi
+          path: ${{ runner.temp }}/stage-kernel-aarch64-cfi
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload the prebuilt CFI image
+        if: always() && steps.stage-prebuilt.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-image-aarch64-debug-cfi
+          path: ${{ runner.temp }}/stage-image-aarch64-cfi
+          if-no-files-found: error
+          retention-days: 14
 
   smoke-x86-64:
     name: smoke-x86-64
@@ -2236,6 +2405,31 @@ jobs:
           grep -Fqx oob-load:before-fault oob-load-smoke.out
           grep -Fqx guest-alive oob-load-smoke.out
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
+      - name: Exercise guest fiber-stack growth and overflow
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/stack-test"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program stack-test \
+            --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/stack-test host-call && /bin/stack-test large-frame && (/bin/stack-test recurse; echo after-recurse) && (/bin/stack-test large-frame-overflow; echo after-large-frame-overflow)' \
+            2>&1 > stack-test-smoke.out | tee "$runtime/inspector.log"
+          cat stack-test-smoke.out
+          cat "$runtime/guest-tracing.log"
+          grep -Fqx stack-test:host-call:ok stack-test-smoke.out
+          grep -Fqx stack-test:large-frame:ok stack-test-smoke.out
+          grep -Fqx stack-test:recurse:before stack-test-smoke.out
+          grep -Fqx after-recurse stack-test-smoke.out
+          grep -Fqx stack-test:large-frame-overflow:before stack-test-smoke.out
+          grep -Fqx after-large-frame-overflow stack-test-smoke.out
+          ! grep -Fq 'Kernel panic' stack-test-smoke.out "$runtime/inspector.log"
       - name: Boot with online-capable processors that are not present
         timeout-minutes: 5
         shell: bash
@@ -2885,25 +3079,42 @@ jobs:
         if: ${{ !cancelled() && hashFiles('helios/target/release/helios-inspector') != '' }}
         working-directory: helios
         run: ./target/release/helios-inspector vm --arch x86-64 --release build
-      # The image a `--no-build` boot needs on another host, laid out as
-      # the paths under `target/` the inspector reads: unpacked into
-      # `target/`, it is the whole installation (docs/boot.md). The
-      # manifest and the key files are not part of it: nothing on the
-      # `--no-build` path reads them, and the manifest records this
-      # runner's absolute paths. The root key pair is generated per
-      # build, so the signing key the kernel carries belongs to this
-      # image alone. The compiler plugin's core module rides along: the
-      # bench's Linux + Wasmtime column runs the build the bootfs
-      # precompiled (tools/bench/native/build.sh, compiler-host/).
-      - name: Upload the guest image
+      # Stage the prebuilt kernel (`helios-kernel-x86-64-release`) and full
+      # bootable image (`helios-image-x86-64-release`, including `kernel.uefi.img`
+      # and `compiler_plugin.wasm`) with typed manifests (#1218).
+      - name: Stage prebuilt kernel and image artifacts
+        id: stage-prebuilt
         if: always() && steps.guest-image.outcome == 'success'
+        working-directory: helios
+        run: |
+          set -euo pipefail
+          "$HELIOS_CLI_BIN" artifact-stage \
+            --kind kernel --arch x86-64 --profile release \
+            --out-dir "$RUNNER_TEMP/stage-kernel-x86-64" \
+            --kernel target/x86_64-unknown-none/profile-use/helios \
+            --root-public-key target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-root-public.key
+          "$HELIOS_CLI_BIN" artifact-stage \
+            --kind image --arch x86-64 --profile release \
+            --out-dir "$RUNNER_TEMP/stage-image-x86-64" \
+            --kernel target/x86_64-unknown-none/profile-use/helios \
+            --root-public-key target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-root-public.key \
+            --bootfs target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs \
+            --compiler-plugin target/kernel-prebuild/x86_64-unknown-none/profile-use/compiler_plugin.wasm \
+            --build-uefi-image
+      - name: Upload the prebuilt kernel
+        if: always() && steps.stage-prebuilt.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: helios-guest-x86-64
-          path: |
-            helios/target/x86_64-unknown-none/profile-use/helios
-            helios/target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs
-            helios/target/kernel-prebuild/x86_64-unknown-none/profile-use/compiler_plugin.wasm
+          name: helios-kernel-x86-64-release
+          path: ${{ runner.temp }}/stage-kernel-x86-64
+          if-no-files-found: error
+          retention-days: 90
+      - name: Upload the prebuilt image
+        if: always() && steps.stage-prebuilt.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-image-x86-64-release
+          path: ${{ runner.temp }}/stage-image-x86-64
           if-no-files-found: error
           retention-days: 90
       - name: Prune the precompiled cwasm cache
@@ -3044,6 +3255,48 @@ jobs:
           name: smoke-x86-64-cpu-hotplug-runtime
           path: smoke-runtime/cpu-hotplug
           if-no-files-found: ignore
+          retention-days: 14
+      # Upload the built x86-64 release kernel and image only when `smoke-x86-64`
+      # is not part of the same run (avoids a duplicate artifact name when both
+      # heavy lanes run together).
+      - name: Stage prebuilt kernel and image artifacts
+        id: stage-prebuilt
+        if: >-
+          always() && !cancelled() &&
+          !contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64') &&
+          hashFiles('helios/target/x86_64-unknown-none/profile-use/helios') != '' &&
+          hashFiles('helios/target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs') != ''
+        working-directory: helios
+        run: |
+          set -euo pipefail
+          "$HELIOS_CLI_BIN" artifact-stage \
+            --kind kernel --arch x86-64 --profile release \
+            --out-dir "$RUNNER_TEMP/stage-kernel-x86-64-cpu" \
+            --kernel target/x86_64-unknown-none/profile-use/helios \
+            --root-public-key target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-root-public.key
+          "$HELIOS_CLI_BIN" artifact-stage \
+            --kind image --arch x86-64 --profile release \
+            --program cpu --program dash --program debugger --program init \
+            --out-dir "$RUNNER_TEMP/stage-image-x86-64-cpu" \
+            --kernel target/x86_64-unknown-none/profile-use/helios \
+            --root-public-key target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-root-public.key \
+            --bootfs target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs \
+            --build-uefi-image
+      - name: Upload the prebuilt kernel
+        if: always() && steps.stage-prebuilt.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-kernel-x86-64-release
+          path: ${{ runner.temp }}/stage-kernel-x86-64-cpu
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload the prebuilt image
+        if: always() && steps.stage-prebuilt.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-image-x86-64-release
+          path: ${{ runner.temp }}/stage-image-x86-64-cpu
+          if-no-files-found: error
           retention-days: 14
       - name: Prune the precompiled cwasm cache
         if: always()
@@ -3333,6 +3586,44 @@ jobs:
             helios/venus-smoke.out
           if-no-files-found: warn
           retention-days: 7
+      - name: Stage prebuilt debug kernel and image artifacts
+        id: stage-prebuilt
+        if: >-
+          always() && !cancelled() &&
+          hashFiles('helios/target/x86_64-unknown-none/debug/helios') != '' &&
+          hashFiles('helios/target/kernel-prebuild/x86_64-unknown-none/debug/helios-bootfs') != ''
+        working-directory: helios
+        run: |
+          set -euo pipefail
+          "$HELIOS_CLI_BIN" artifact-stage \
+            --kind kernel --arch x86-64 --profile debug \
+            --out-dir "$RUNNER_TEMP/stage-kernel-x86-64-debug" \
+            --kernel target/x86_64-unknown-none/debug/helios \
+            --root-public-key target/kernel-prebuild/x86_64-unknown-none/debug/helios-root-public.key
+          "$HELIOS_CLI_BIN" artifact-stage \
+            --kind image --arch x86-64 --profile debug \
+            --program compositor --program dash --program debugger --program init --program pride-flag \
+            --out-dir "$RUNNER_TEMP/stage-image-x86-64-debug" \
+            --kernel target/x86_64-unknown-none/debug/helios \
+            --root-public-key target/kernel-prebuild/x86_64-unknown-none/debug/helios-root-public.key \
+            --bootfs target/kernel-prebuild/x86_64-unknown-none/debug/helios-bootfs \
+            --build-uefi-image
+      - name: Upload the prebuilt debug kernel
+        if: always() && steps.stage-prebuilt.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-kernel-x86-64-debug
+          path: ${{ runner.temp }}/stage-kernel-x86-64-debug
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload the prebuilt debug image
+        if: always() && steps.stage-prebuilt.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-image-x86-64-debug
+          path: ${{ runner.temp }}/stage-image-x86-64-debug
+          if-no-files-found: error
+          retention-days: 14
       - name: Prune the precompiled cwasm cache
         if: always()
         uses: ./helios/.github/actions/prune-artifact-cache
@@ -3591,10 +3882,167 @@ jobs:
       SUITE: ${{ github.workspace }}/gvisor-syscalls
     steps: *linux-syscalls-build-steps
 
+  # Build the `linux`-featured release kernel, signed `helios-bootfs` (reusing
+  # `wasm-debug` guest userspace), Limine UEFI disk image and release
+  # `helios-inspector` ONCE per architecture (#1218). Every `linux-syscalls-*`
+  # shard downloads and boots this prebuilt image directly with zero compilation.
+  linux-syscalls-image-x86-64:
+    name: linux-syscalls-image (${{ matrix.vm_arch }})
+    needs: [changes, build-helios-cli-x64, kernel-profile, wasm-debug]
+    if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.build-helios-cli-x64.result == 'success' && needs.wasm-debug.result == 'success' && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            vm_arch: x86-64
+            target: x86_64-unknown-none
+            profile_dir: profile-use
+    env: &linux-syscalls-image-env
+      HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
+      HELIOS_ARTIFACT_CACHE: ${{ github.workspace }}/cwasm-cache
+      HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+      HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+    steps: &linux-syscalls-image-steps
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
+      - name: Record the job start
+        run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Restore the precompiled cwasm cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          key: helios-cwasm-linux-syscalls-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: helios-cwasm-linux-syscalls-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install host dependencies
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: libudev-dev just cmake ninja-build erofs-utils
+      - name: Stage Limine bootloader share
+        run: |
+          # The digest is the one of v12.9.6's `limine-binary.tar.gz`.
+          curl --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/limine-binary.tar.gz" \
+            https://github.com/limine-bootloader/limine/releases/download/v12.9.6/limine-binary.tar.gz
+          echo "b38aabb042b0c0f9f562b7741be3c1204838d7bbacfa78bb411c674bd5b984ee  $RUNNER_TEMP/limine-binary.tar.gz" \
+            | sha256sum --check -
+          mkdir -p "$GITHUB_WORKSPACE/limine"
+          tar -xzf "$RUNNER_TEMP/limine-binary.tar.gz" --strip-components=1 \
+            -C "$GITHUB_WORKSPACE/limine"
+          make -C "$GITHUB_WORKSPACE/limine"
+      - uses: ./helios/.github/actions/helios-cli
+        with:
+          profile: debug
+          download-only: "true"
+      - name: Build inspector
+        working-directory: helios
+        run: cargo build --release -p helios-inspector
+      # An x86-64 release kernel is built against the kernel profile, as
+      # in smoke-x86-64: the default branch's, or this run's when the
+      # change moves the profile's format.
+      - name: Fetch the kernel profile
+        if: matrix.arch == 'x86_64' && needs.changes.outputs.profile_format != 'true'
+        working-directory: helios
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          "$HELIOS_CLI_BIN" profile-fetch
+      - name: Fetch this run's kernel profile
+        if: matrix.arch == 'x86_64' && needs.changes.outputs.profile_format == 'true'
+        working-directory: helios
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          "$HELIOS_CLI_BIN" profile-fetch --run "${{ github.run_id }}"
+      - uses: ./helios/.github/actions/prebuilt-wasm
+        with:
+          profile: debug
+          path: helios/target/wasm-programs/debug
+      - name: Build the Linux guest image
+        working-directory: helios
+        run: |
+          ./target/release/helios-inspector vm --arch "${{ matrix.vm_arch }}" --release \
+            --guest-programs-profile debug \
+            --kernel-feature linux --boot-program debugger --no-compiler-plugin build
+      - name: Stage prebuilt kernel and image artifacts
+        working-directory: helios
+        run: |
+          set -euo pipefail
+          "$HELIOS_CLI_BIN" artifact-stage \
+            --kind kernel --arch "${{ matrix.vm_arch }}" --profile release-linux \
+            --kernel-feature linux \
+            --out-dir "$RUNNER_TEMP/stage-kernel" \
+            --kernel "target/${{ matrix.target }}/${{ matrix.profile_dir }}/helios" \
+            --root-public-key "target/kernel-prebuild/${{ matrix.target }}/${{ matrix.profile_dir }}/helios-root-public.key"
+          "$HELIOS_CLI_BIN" artifact-stage \
+            --kind image --arch "${{ matrix.vm_arch }}" --profile release-linux \
+            --kernel-feature linux \
+            --program debugger --program init \
+            --out-dir "$RUNNER_TEMP/stage-image" \
+            --kernel "target/${{ matrix.target }}/${{ matrix.profile_dir }}/helios" \
+            --root-public-key "target/kernel-prebuild/${{ matrix.target }}/${{ matrix.profile_dir }}/helios-root-public.key" \
+            --bootfs "target/kernel-prebuild/${{ matrix.target }}/${{ matrix.profile_dir }}/helios-bootfs" \
+            --build-uefi-image
+      - name: Upload the prebuilt Linux kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-kernel-${{ matrix.vm_arch }}-release-linux
+          path: ${{ runner.temp }}/stage-kernel
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload the prebuilt Linux image
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-image-${{ matrix.vm_arch }}-release-linux
+          path: ${{ runner.temp }}/stage-image
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload the release inspector for the shards
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-inspector-${{ matrix.vm_arch }}-release
+          path: helios/target/release/helios-inspector
+          if-no-files-found: error
+          retention-days: 1
+      - name: Prune the precompiled cwasm cache
+        if: always()
+        uses: ./helios/.github/actions/prune-artifact-cache
+        with:
+          cache-dir: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          since: ${{ env.HELIOS_CACHE_START }}
+
+  linux-syscalls-image-aarch64:
+    name: linux-syscalls-image (${{ matrix.vm_arch }})
+    needs: [changes, build-helios-cli-arm64, wasm-debug]
+    if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.build-helios-cli-arm64.result == 'success' && needs.wasm-debug.result == 'success' }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            vm_arch: aarch64
+            target: aarch64-unknown-none
+            profile_dir: kernel-release
+    env: *linux-syscalls-image-env
+    steps: *linux-syscalls-image-steps
+
   linux-syscalls-x86-64:
     name: linux-syscalls (${{ matrix.arch }} ${{ matrix.shard }}/${{ matrix.shards }})
-    needs: [changes, build-helios-cli-x64, kernel-profile, wasm-debug, linux-syscalls-build-x86-64]
-    if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.build-helios-cli-x64.result == 'success' && needs.linux-syscalls-build-x86-64.result == 'success' && needs.wasm-debug.result == 'success' && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
+    needs: [changes, linux-syscalls-build-x86-64, linux-syscalls-image-x86-64]
+    if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.linux-syscalls-build-x86-64.result == 'success' && needs.linux-syscalls-image-x86-64.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ needs.changes.outputs.linux_suite_mode == 'full' && 60 || 15 }}
     permissions:
@@ -3605,10 +4053,6 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.changes.outputs.linux_suite_x86_64_shards) }}
     env: &linux-syscalls-env
-      HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
-      HELIOS_ARTIFACT_CACHE: ${{ github.workspace }}/cwasm-cache
-      HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
-      HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
       HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
       # The QEMU smoke-aarch64 builds, for the same reason: Ubuntu 24.04's
       # asserts in its emulated GICv3 under multi-threaded TCG.
@@ -3616,6 +4060,8 @@ jobs:
       QEMU_SHA256: 079ffbff8a7111bbc89022107cbabf3bbfd614d5fc9d7cc675991196aca12482
       QEMU_PREFIX: ${{ github.workspace }}/qemu-install
       SUITE: ${{ github.workspace }}/gvisor-syscalls
+      PREBUILT_IMAGE: ${{ github.workspace }}/prebuilt-image
+      INSPECTOR_DIR: ${{ github.workspace }}/prebuilt-inspector
       RESULTS: ${{ github.workspace }}/gvisor-syscalls-results
     steps: &linux-syscalls-steps
       - uses: actions/checkout@v4
@@ -3650,24 +4096,23 @@ jobs:
             --bin-dir "$SUITE/bin" --cases "$SUITE/cases.txt" \
             --shard "${{ matrix.shard }}/${{ matrix.shards }}" --timeout 60 \
             --results "$RESULTS/native-${{ matrix.arch }}-${{ matrix.shard }}.jsonl"
-      - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Download the prebuilt Linux image
         if: steps.cases.outputs.count != '0'
-      - uses: ./helios/.github/actions/ci-root-key
-        if: steps.cases.outputs.count != '0'
+        uses: actions/download-artifact@v4
         with:
-          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
-      - name: Restore the precompiled cwasm cache
+          name: helios-image-${{ matrix.vm_arch }}-release-linux
+          path: ${{ env.PREBUILT_IMAGE }}
+      - name: Download the release inspector
         if: steps.cases.outputs.count != '0'
-        uses: ./helios/.github/actions/shared-cache
+        uses: actions/download-artifact@v4
         with:
-          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
-          key: helios-cwasm-linux-syscalls-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
-          restore-keys: helios-cwasm-linux-syscalls-${{ runner.os }}-${{ runner.arch }}-
+          name: helios-inspector-${{ matrix.vm_arch }}-release
+          path: ${{ env.INSPECTOR_DIR }}
       - name: Install host dependencies (x86_64)
         if: steps.cases.outputs.count != '0' && matrix.arch == 'x86_64'
         uses: ./helios/.github/actions/install-apt-packages
         with:
-          packages: libudev-dev just cmake ninja-build erofs-utils btrfs-progs qemu-system-x86 ovmf
+          packages: btrfs-progs qemu-system-x86 ovmf
       - name: Record QEMU and KVM availability (x86_64)
         if: steps.cases.outputs.count != '0' && matrix.arch == 'x86_64'
         run: |
@@ -3679,8 +4124,7 @@ jobs:
         uses: ./helios/.github/actions/install-apt-packages
         with:
           packages: >-
-            libudev-dev just cmake ninja-build erofs-utils btrfs-progs
-            python3-venv pkg-config flex bison
+            btrfs-progs ninja-build python3-venv pkg-config flex bison
             libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
       - name: Restore the pinned QEMU install prefix
         if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64'
@@ -3705,50 +4149,6 @@ jobs:
         if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64'
         run: |
           echo "${QEMU_PREFIX}/bin" >> "$GITHUB_PATH"
-      - name: Stage Limine bootloader share
-        if: steps.cases.outputs.count != '0'
-        run: |
-          # The digest is the one of v12.9.6's `limine-binary.tar.gz`.
-          curl --fail --silent --show-error --location \
-            --output "$RUNNER_TEMP/limine-binary.tar.gz" \
-            https://github.com/limine-bootloader/limine/releases/download/v12.9.6/limine-binary.tar.gz
-          echo "b38aabb042b0c0f9f562b7741be3c1204838d7bbacfa78bb411c674bd5b984ee  $RUNNER_TEMP/limine-binary.tar.gz" \
-            | sha256sum --check -
-          mkdir -p "$GITHUB_WORKSPACE/limine"
-          tar -xzf "$RUNNER_TEMP/limine-binary.tar.gz" --strip-components=1 \
-            -C "$GITHUB_WORKSPACE/limine"
-          make -C "$GITHUB_WORKSPACE/limine"
-      - uses: ./helios/.github/actions/helios-cli
-        if: steps.cases.outputs.count != '0'
-        with:
-          profile: debug
-          download-only: "true"
-      - name: Build inspector
-        if: steps.cases.outputs.count != '0'
-        working-directory: helios
-        run: cargo build --release -p helios-inspector
-      # An x86-64 release kernel is built against the kernel profile, as
-      # in smoke-x86-64: the default branch's, or this run's when the
-      # change moves the profile's format.
-      - name: Fetch the kernel profile
-        if: steps.cases.outputs.count != '0' && matrix.arch == 'x86_64' && needs.changes.outputs.profile_format != 'true'
-        working-directory: helios
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: >-
-          "$HELIOS_CLI_BIN" profile-fetch
-      - name: Fetch this run's kernel profile
-        if: steps.cases.outputs.count != '0' && matrix.arch == 'x86_64' && needs.changes.outputs.profile_format == 'true'
-        working-directory: helios
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: >-
-          "$HELIOS_CLI_BIN" profile-fetch --run "${{ github.run_id }}"
-      - uses: ./helios/.github/actions/prebuilt-wasm
-        if: steps.cases.outputs.count != '0'
-        with:
-          profile: debug
-          path: helios/target/wasm-programs/debug
       # Each case runs as its own guest process under the bound below,
       # and a case that takes the guest down costs that case and a boot.
       # The binaries reach the guest through the read-only host share at
@@ -3765,6 +4165,7 @@ jobs:
           CASE_TIMEOUT: ${{ matrix.accel == 'tcg' && 180 || 60 }}
         run: |
           set -euo pipefail
+          chmod +x "$INSPECTOR_DIR/helios-inspector"
           runtime="$RESULTS/runtime-${{ matrix.arch }}-${{ matrix.shard }}"
           mkdir -p "$runtime/tmp-root"
           chmod 1777 "$runtime/tmp-root"
@@ -3779,12 +4180,12 @@ jobs:
             --shard "${{ matrix.shard }}/${{ matrix.shards }}" \
             --results "$RESULTS/helios-${{ matrix.arch }}-${{ matrix.shard }}.jsonl" \
             --log "$runtime/inspector.log" \
-            -- ./target/release/helios-inspector vm --arch "$VM_ARCH" --release --memory 2G \
+            -- "$INSPECTOR_DIR/helios-inspector" vm --arch "$VM_ARCH" --release --memory 2G \
               --accel "$ACCEL" --kernel-feature linux \
+              --prebuilt image --prebuilt-dir "$PREBUILT_IMAGE" \
               --runtime-dir "$runtime" --keep-runtime-dir \
               --disk "$runtime/scratch.btrfs,serial=linux-suite-tmp" \
               --shared-dir "$SUITE/bin" \
-              --guest-programs-profile debug \
               --boot-program debugger --no-compiler-plugin \
               linux-suite --guest-dir /host --private-btrfs linux-suite-tmp \
               --case-timeout-seconds "$CASE_TIMEOUT"
@@ -3807,8 +4208,8 @@ jobs:
 
   linux-syscalls-aarch64:
     name: linux-syscalls (${{ matrix.arch }} ${{ matrix.shard }}/${{ matrix.shards }})
-    needs: [changes, build-helios-cli-arm64, wasm-debug, linux-syscalls-build-aarch64]
-    if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.build-helios-cli-arm64.result == 'success' && needs.linux-syscalls-build-aarch64.result == 'success' && needs.wasm-debug.result == 'success' }}
+    needs: [changes, linux-syscalls-build-aarch64, linux-syscalls-image-aarch64]
+    if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.linux-syscalls-build-aarch64.result == 'success' && needs.linux-syscalls-image-aarch64.result == 'success' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: ${{ needs.changes.outputs.linux_suite_mode == 'full' && 60 || 15 }}
     permissions:
@@ -3884,7 +4285,7 @@ jobs:
   gate:
     name: CI result
     if: always()
-    needs: [changes, build-helios-cli-x64, build-helios-cli-arm64, kernel-profile, wasi-artifacts, wasm-debug, wasm-release, checks-no-cli, checks, tests, smoke-riscv64, smoke-aarch64, smoke-aarch64-cfi, smoke-x86-64, smoke-x86-64-cpu-lifecycle, smoke-x86-64-venus, test-btrfs-upstream, test-btrfs-fstests, test-btrfs-fuzz, linux-syscalls-build-x86-64, linux-syscalls-build-aarch64, linux-syscalls-x86-64, linux-syscalls-aarch64, linux-syscalls-report]
+    needs: [changes, build-helios-cli-x64, build-helios-cli-arm64, kernel-profile, wasi-artifacts, wasm-debug, wasm-release, checks-no-cli, checks, tests, smoke-riscv64, smoke-aarch64, smoke-aarch64-cfi, smoke-x86-64, smoke-x86-64-cpu-lifecycle, smoke-x86-64-venus, test-btrfs-upstream, test-btrfs-fstests, test-btrfs-fuzz, linux-syscalls-build-x86-64, linux-syscalls-build-aarch64, linux-syscalls-image-x86-64, linux-syscalls-image-aarch64, linux-syscalls-x86-64, linux-syscalls-aarch64, linux-syscalls-report]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

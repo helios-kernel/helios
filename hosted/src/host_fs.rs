@@ -611,6 +611,10 @@ mod tests {
             let root = test_root();
             let gid = current_gid(&root);
             let share = HostShare::new(filesystem(&root));
+            crate::cpu::set_current_processor(helios_hal::cpu::ProcessorId::new(0));
+            let registry = helios_kernel::InstanceRegistry::new();
+            let instance = registry.register("host-fs-test", 0);
+            let payer = instance.storage_payer();
             for (directory, mode, file_mode, child_mode) in [
                 ("中文目录", 0o2750, 0o640, 0o2750),
                 ("日本語のディレクトリ", 0o777, 0o666, 0o777),
@@ -627,17 +631,18 @@ mod tests {
                         FsPath::new(&file).unwrap(),
                         OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
                         0,
+                        &payer,
                     )
                     .await
                     .expect("file must be created");
                 let child = at("하위");
                 share
-                    .create_directory(FsPath::new(&child).unwrap(), 0)
+                    .create_directory(FsPath::new(&child).unwrap(), 0, &payer)
                     .await
                     .expect("directory must be created");
                 let link = at("链接");
                 share
-                    .symlink("ファイル", FsPath::new(&link).unwrap(), 0)
+                    .symlink("ファイル", FsPath::new(&link).unwrap(), 0, &payer)
                     .await
                     .expect("link must be created");
                 let parent = std::fs::metadata(&path).expect("parent metadata");

@@ -2613,6 +2613,7 @@ version = "0.1.0"
 dependencies = [
  "askama",
  "clap",
+ "directories",
  "ed25519-dalek",
  "fatfs",
  "helios-artifact",
@@ -2865,6 +2866,7 @@ dependencies = [
  "futures-lite",
  "futures-util",
  "gimli",
+ "helios-artifact",
  "helios-hal",
  "helios-inspector-protocol",
  "helios-profdata",
@@ -3091,6 +3093,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-stack-test"
+version = "0.1.0"
+dependencies = [
+ "helios-api",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "helios-surface-test"
 version = "0.1.0"
 dependencies = [
@@ -3283,6 +3293,9 @@ dependencies = [
 name = "helios-workspace-root"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
  "toml",

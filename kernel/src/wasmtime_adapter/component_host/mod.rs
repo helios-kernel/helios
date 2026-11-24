@@ -1109,9 +1109,14 @@ macro_rules! impl_program_bindings {
                             detail: "aot only accepts raw wasm inputs".to_owned(),
                         }));
                     };
-                    let (namespace, now_nanos) = accessor.with(|mut access| {
+                    let (namespace, now_nanos, payer, requester) = accessor.with(|mut access| {
                         let store_data = access.get();
-                        (store_data.filesystem().clone(), store_data.now_nanos())
+                        (
+                            store_data.filesystem().clone(),
+                            store_data.now_nanos(),
+                            store_data.instance().storage_payer(),
+                            store_data.instance().id(),
+                        )
                     });
                     // The compile runs in its own session task, which stops
                     // the compile when this call is dropped, and streams the
@@ -1127,6 +1132,8 @@ macro_rules! impl_program_bindings {
                                 namespace,
                                 absolute: dest_absolute,
                                 now: now_nanos,
+                                payer,
+                                requester,
                             },
                         )
                         .await
@@ -5722,6 +5729,7 @@ fn convert_instance(instance: crate::InstanceSnapshot) -> debugger_wit::instance
         started_at: instance.started_at,
         uptime: instance.uptime,
         memory_bytes: instance.memory_bytes,
+        storage_bytes: instance.storage_bytes,
         cpu_busy: instance.cpu_busy,
     }
 }
@@ -5941,6 +5949,16 @@ mod tests {
     /// heartbeat its phase is over; the only thing that ends one is its
     /// guard going out of scope.
     const PHASES_PAST_THE_SHARE: usize = crate::TASK_ARENA_MIN_BYTES / 64 + 1;
+
+    /// An exec whose program image the user pool could not hold is a
+    /// memory failure.
+    #[test]
+    fn exec_maps_a_refused_frame_to_out_of_memory() {
+        let memory = super::service::map_aot_fs_error(
+            crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode::InsufficientMemory,
+        );
+        assert_eq!(memory.kind, crate::ProgramExecErrorKind::OutOfMemory);
+    }
 
     /// The heartbeat only writes in debug builds, and where it writes is
     /// not what these tests are about, so the port it reaches drops

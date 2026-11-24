@@ -297,8 +297,9 @@ fn seed_workspace_dirs(ns: &Namespace<UnsupportedStorage>) {
             mount: None,
             open: None,
         };
+        let payer = crate::StoragePayer::for_test();
         let grant = p1_grant(&root_dir).expect("root grant");
-        wasi_fs::create_directory_at(ns, grant, "workspace", 0)
+        wasi_fs::create_directory_at(ns, grant, "workspace", 0, &payer)
             .await
             .expect("create /workspace");
         let workspace_dir = FsDescriptor {
@@ -312,7 +313,7 @@ fn seed_workspace_dirs(ns: &Namespace<UnsupportedStorage>) {
             open: None,
         };
         let ws_grant = p1_grant(&workspace_dir).expect("workspace grant");
-        wasi_fs::create_directory_at(ns, ws_grant, "sub", 0)
+        wasi_fs::create_directory_at(ns, ws_grant, "sub", 0, &payer)
             .await
             .expect("create /workspace/sub");
     });

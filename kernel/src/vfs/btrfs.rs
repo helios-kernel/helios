@@ -818,29 +818,13 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> DirStream for BtrfsDir<
     }
 }
 
-impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<Device> {
-    type OpenHandle = BtrfsOpenHandle;
-    type Write = BtrfsWrite<Device>;
-    type Dir = BtrfsDir<Device>;
-
-    async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
-        self.metadata(&self.inode(&self.snapshot(), path).await?)
-    }
-
-    async fn stat_handle(&self, handle: &Self::OpenHandle) -> FsResult<Metadata> {
-        let reader = self.snapshot();
-        let inode = self
-            .inode_by_id(&reader, handle.tree(), handle.number())
-            .await?;
-        self.metadata(&inode)
-    }
-
-    async fn open(
+impl<Device: BlockDevice<Buffer = BlockPages> + 'static> BtrfsFs<Device> {
+    async fn open_inner(
         &self,
         path: FsPath<'_>,
         flags: OpenFlags,
         now: u64,
-    ) -> FsResult<Opened<Self::OpenHandle>> {
+    ) -> FsResult<Opened<BtrfsOpenHandle>> {
         if let Some(writer) = &self.inner.writer {
             return match writer
                 .execute(
@@ -888,12 +872,42 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
             handle: BtrfsOpenHandle::read_only(inode.tree(), inode.number()),
         })
     }
+}
+
+impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<Device> {
+    type Payer = crate::StoragePayer;
+    type OpenHandle = BtrfsOpenHandle;
+    type Write = BtrfsWrite<Device>;
+    type Dir = BtrfsDir<Device>;
+
+    async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
+        self.metadata(&self.inode(&self.snapshot(), path).await?)
+    }
+
+    async fn stat_handle(&self, handle: &Self::OpenHandle) -> FsResult<Metadata> {
+        let reader = self.snapshot();
+        let inode = self
+            .inode_by_id(&reader, handle.tree(), handle.number())
+            .await?;
+        self.metadata(&inode)
+    }
+
+    async fn open(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<Opened<Self::OpenHandle>> {
+        self.open_inner(path, flags, now).await
+    }
 
     async fn open_tmpfile(
         &self,
         directory: FsPath<'_>,
         exclusive: bool,
         now: u64,
+        _payer: &crate::StoragePayer,
     ) -> FsResult<Opened<Self::OpenHandle>> {
         let writer = self.inner.writer.as_ref().ok_or(FsError::ReadOnly)?;
         match writer
@@ -934,7 +948,7 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
     }
 
     async fn open_dir(&self, path: FsPath<'_>) -> FsResult<BtrfsDir<Device>> {
-        let opened = self.open(path, OpenFlags::DIRECTORY, 0).await?;
+        let opened = self.open_inner(path, OpenFlags::DIRECTORY, 0).await?;
         self.open_dir_handle(&opened.handle).await
     }
 
@@ -981,6 +995,7 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         position: WritePosition,
         len: usize,
         now: u64,
+        _payer: &crate::StoragePayer,
     ) -> FsResult<Self::Write> {
         prepared::prepare(self, path, position, len, now).await
     }
@@ -990,10 +1005,17 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         position: WritePosition,
         len: usize,
         now: u64,
+        _payer: &crate::StoragePayer,
     ) -> FsResult<Self::Write> {
         prepared::prepare_handle(self, handle, position, len, now).await
     }
-    async fn set_size(&self, path: FsPath<'_>, size: u64, now: u64) -> FsResult<()> {
+    async fn set_size(
+        &self,
+        path: FsPath<'_>,
+        size: u64,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         self.mutate(path, now, Operation::Truncate { size }).await
     }
     async fn set_size_handle(
@@ -1001,6 +1023,7 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         handle: &Self::OpenHandle,
         size: u64,
         now: u64,
+        _payer: &crate::StoragePayer,
     ) -> FsResult<()> {
         self.mutate_handle(handle, now, Operation::Truncate { size })
             .await
@@ -1011,6 +1034,7 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         access: Option<u64>,
         modified: Option<u64>,
         now: u64,
+        _payer: &crate::StoragePayer,
     ) -> FsResult<()> {
         self.mutate(path, now, Operation::Times { access, modified })
             .await
@@ -1021,19 +1045,35 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         access: Option<u64>,
         modified: Option<u64>,
         now: u64,
+        _payer: &crate::StoragePayer,
     ) -> FsResult<()> {
         self.mutate_handle(handle, now, Operation::Times { access, modified })
             .await
     }
-    async fn create_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn create_directory(
+        &self,
+        path: FsPath<'_>,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         self.mutate(path, now, Operation::CreateDirectory { attributes: None })
             .await
     }
-    async fn remove_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn remove_directory(
+        &self,
+        path: FsPath<'_>,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         self.mutate(path, now, Operation::Remove { directory: true })
             .await
     }
-    async fn unlink(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn unlink(
+        &self,
+        path: FsPath<'_>,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         self.mutate(path, now, Operation::Remove { directory: false })
             .await
     }
@@ -1043,6 +1083,7 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         destination: FsPath<'_>,
         mode: RenameMode,
         now: u64,
+        _payer: &crate::StoragePayer,
     ) -> FsResult<()> {
         self.mutate(
             source,
@@ -1054,7 +1095,13 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         )
         .await
     }
-    async fn link(&self, source: FsPath<'_>, destination: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn link(
+        &self,
+        source: FsPath<'_>,
+        destination: FsPath<'_>,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         self.mutate(
             source,
             now,
@@ -1069,6 +1116,7 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         handle: &Self::OpenHandle,
         destination: FsPath<'_>,
         now: u64,
+        _payer: &crate::StoragePayer,
     ) -> FsResult<()> {
         self.mutate_handle(
             handle,
@@ -1079,7 +1127,13 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         )
         .await
     }
-    async fn symlink(&self, target: &str, path: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn symlink(
+        &self,
+        target: &str,
+        path: FsPath<'_>,
+        now: u64,
+        _payer: &crate::StoragePayer,
+    ) -> FsResult<()> {
         self.mutate(
             path,
             now,
@@ -1280,7 +1334,9 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> BtrfsFs<Device> {
                 }
             };
         }
-        self.open(path, flags, now).await.map_err(UnixFsError::Fs)
+        self.open_inner(path, flags, now)
+            .await
+            .map_err(UnixFsError::Fs)
     }
 
     pub async fn create_directory_unix(
