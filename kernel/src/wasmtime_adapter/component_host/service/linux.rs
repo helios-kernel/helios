@@ -3166,9 +3166,11 @@ where
             .runtime_state
             .uptime_nanos(exec_context.cpu.now().ticks());
         let child_name = alloc::format!("linux-pid-{}", spawned.child.pid().get());
-        let child_instance = exec_context
-            .instance_registry
-            .register(child_name, started_at);
+        let child_instance = exec_context.instance_registry.register_child(
+            Some(self.shared.launched_instance.id()),
+            child_name,
+            started_at,
+        );
         let child_spawner = exec_context
             .spawner
             .instance_spawner(crate::TaskFunding::Instance, &child_instance);
@@ -4164,6 +4166,7 @@ where
                         argv,
                         env,
                         authority,
+                        crate::IpcEndpointGrants::new(),
                         wasm_runtime.filesystem,
                         // Exec keeps the process, so it keeps the process's limit.
                         DescriptorOrigin::SameProcess(descriptors),

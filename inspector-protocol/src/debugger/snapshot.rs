@@ -110,14 +110,18 @@ mod guest {
         }
         let encoded = match func {
             PREPARE_SNAPSHOT => {
-                let prepared = snapshot::prepare().await;
+                let hold = snapshot::prepare().await.map_err(|error| {
+                    DispatchError::protocol(format!("snapshot.prepare refused: {error}"))
+                })?;
+                let has_generation_id = hold.has_generation_id();
+                invocations.set_snapshot_hold(Some(hold));
                 postcard::to_allocvec(&SnapshotReadiness {
-                    has_generation_id: prepared.has_generation_id,
+                    has_generation_id,
                     other_invocations_in_flight: invocations.others() != 0,
                 })
             }
             _ => {
-                snapshot::finished();
+                invocations.set_snapshot_hold(None);
                 postcard::to_allocvec(&())
             }
         };

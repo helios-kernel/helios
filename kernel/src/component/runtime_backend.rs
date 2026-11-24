@@ -42,11 +42,11 @@ where
     pub runtime_state: RuntimeStateImpl,
     pub instance_registry: InstanceRegistry,
     pub instance: RegisteredInstance,
-    pub has_debug_port: bool,
     pub host_filesystem_state: RuntimeStateImpl,
     pub arguments: Vec<alloc::string::String>,
     pub environment: Vec<(alloc::string::String, alloc::string::String)>,
     pub process_authority: ProcessAuthority,
+    pub ipc_grants: crate::IpcEndpointGrants,
     pub output_mode: ComponentOutputMode,
     pub serial_reader: crate::SerialReader,
     pub serial_writer: crate::DebugSerialWriter,
@@ -68,7 +68,6 @@ where
         runtime_state: RuntimeStateImpl,
         instance_registry: InstanceRegistry,
         instance: RegisteredInstance,
-        has_debug_port: bool,
         host_filesystem_state: RuntimeStateImpl,
         arguments: Vec<alloc::string::String>,
         environment: Vec<(alloc::string::String, alloc::string::String)>,
@@ -84,16 +83,21 @@ where
             runtime_state,
             instance_registry,
             instance,
-            has_debug_port,
             host_filesystem_state,
             arguments,
             environment,
             process_authority,
+            ipc_grants: crate::IpcEndpointGrants::new(),
             output_mode,
             serial_reader,
             serial_writer,
             _host_fs: core::marker::PhantomData,
         }
+    }
+
+    pub fn with_ipc_grants(mut self, ipc_grants: crate::IpcEndpointGrants) -> Self {
+        self.ipc_grants = ipc_grants;
+        self
     }
 }
 

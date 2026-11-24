@@ -74,8 +74,9 @@ fn refusal_reason(refusal: InstructionProfileError) -> &'static str {
             "this architecture's backend does not sample instruction addresses (only x86-64 does)"
         }
         InstructionProfileError::Denied => {
-            "the session does not hold the right to observe the machine"
+            "the session does not hold the required diagnostic capability"
         }
+        InstructionProfileError::Busy => "another instruction-sampling session is already active",
     }
 }
 

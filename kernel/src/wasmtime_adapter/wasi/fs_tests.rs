@@ -2420,7 +2420,6 @@ fn memory_host_store_data() -> (
         runtime_state.clone(),
         registry,
         instance,
-        None,
         runtime_state.root_namespace().descend(),
         alloc::vec::Vec::new(),
         alloc::vec::Vec::new(),
