@@ -19,17 +19,21 @@ use crate::inspect::{
 };
 use crate::{AuthorityScope, InstanceRegistry, PrefixSet};
 
-/// Page-aligned (64 KiB) mock guest linear memory backed by `Vec<u64>` so
-/// every offset is 8-byte aligned for atomic 64-bit loads.
+/// Page-aligned (64 KiB) mock guest linear memory backed by `Box<[AtomicU64]>`
+/// so every offset is 8-byte aligned with interior mutability for atomic
+/// 64-bit loads.
 struct MockGuestMemory {
-    words: Box<[u64]>,
+    words: Box<[AtomicU64]>,
 }
 
 impl MockGuestMemory {
     fn pages(page_count: usize) -> Self {
         let total_bytes = page_count * (WASM_PAGE_BYTES as usize);
         Self {
-            words: vec![0u64; total_bytes / 8].into_boxed_slice(),
+            words: (0..total_bytes / 8)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         }
     }
 
@@ -44,15 +48,15 @@ impl MockGuestMemory {
         let start = page_index * (WASM_PAGE_BYTES as usize / 8);
         let len = WASM_PAGE_BYTES as usize / 8;
         let slice = &mut self.words[start..start + len];
-        // SAFETY: `u64` has no padding and is aligned to 8 bytes.
-        unsafe { core::slice::from_raw_parts_mut(slice.as_mut_ptr().cast::<u8>(), len * 8) }
+        let ptr = slice.as_mut_ptr().cast::<u8>();
+        // SAFETY: `AtomicU64` has the same size (8) and alignment (8) as `u64`
+        // with no padding, and `slice` is uniquely borrowed from `&mut self`.
+        unsafe { core::slice::from_raw_parts_mut(ptr, len * 8) }
     }
 
     fn generation_word(&self, page_index: usize) -> &AtomicU64 {
         let start = page_index * (WASM_PAGE_BYTES as usize / 8);
-        let ptr = self.words[start + 1..].as_ptr() as *mut u64;
-        // SAFETY: `words` is valid and 8-byte aligned for `&self`'s lifetime.
-        unsafe { AtomicU64::from_ptr(ptr) }
+        &self.words[start + 1]
     }
 }
 
