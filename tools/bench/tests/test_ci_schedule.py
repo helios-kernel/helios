@@ -677,12 +677,15 @@ def test_btrfs_fuzz_installs_toolchain_before_running_fuzz():
 def test_ci_speedup_caches_cli_qemu_inspector_and_prunes_main_caches(ci_jobs):
     for builder in ("build-helios-cli-x64", "build-helios-cli-arm64"):
         steps = ci_jobs[builder]["steps"]
-        rust_cache = next(
-            (step for step in steps if step.get("uses", "").startswith("Swatinem/rust-cache")),
+        assert not any(step.get("uses", "").startswith("Swatinem/rust-cache") for step in steps), builder
+        stow_cache = next(
+            (step for step in steps if step.get("name") == "Restore stow local cache"),
             None,
         )
-        assert rust_cache is not None, builder
-        assert "steps.cache.outputs.cache-hit != 'true'" in rust_cache["if"]
+        assert stow_cache is not None, builder
+        assert stow_cache["with"]["path"] == "~/.stow"
+        build_step = next(step for step in steps if "stow build" in step.get("run", ""))
+        assert build_step["env"].get("CARGO_PROFILE_RELEASE_PANIC") == "unwind", builder
 
     for image_job_name in ("linux-syscalls-image-x86-64", "linux-syscalls-image-aarch64"):
         steps = ci_jobs[image_job_name]["steps"]

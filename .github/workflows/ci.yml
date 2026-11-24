@@ -414,32 +414,35 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ steps.meta.outputs.dir }}
-          key: helios-cli-stable-v1-debug-${{ runner.os }}-${{ runner.arch }}-${{ steps.meta.outputs.input_hash }}
+          key: helios-cli-stable-v2-release-${{ runner.os }}-${{ runner.arch }}-${{ steps.meta.outputs.input_hash }}
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: ./helios/.github/actions/checkout-wasmtime
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@stable
       - if: steps.cache.outputs.cache-hit != 'true'
-        uses: Swatinem/rust-cache@v2
-        env:
-          RUSTUP_TOOLCHAIN: stable
+        name: Restore stow local cache
+        uses: ./helios/.github/actions/shared-cache
         with:
-          workspaces: helios
-          key: helios-cli-stable-${{ runner.arch }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          path: ~/.stow
+          key: stow-helios-cli-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: stow-helios-cli-v1-${{ runner.os }}-${{ runner.arch }}-
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: water-rs/stow@main
+      # Override workspace `[profile.release] panic = "abort"` back to `unwind`
+      # so `helios-cli` compiles under `stow`'s named `release` profile and hits
+      # public prebuilt artifacts instead of falling back to local-only compiles.
       - if: steps.cache.outputs.cache-hit != 'true'
-        name: Build helios-cli (debug)
+        name: Build helios-cli (release via stow)
         working-directory: helios
         env:
           DIR: ${{ steps.meta.outputs.dir }}
           RUSTUP_TOOLCHAIN: stable
+          CARGO_PROFILE_RELEASE_PANIC: unwind
         run: |
           set -euo pipefail
-          stow build --silent-compatible-upgrades -- -p helios-cli
+          stow build --silent-compatible-upgrades -- --release -p helios-cli
           mkdir -p "${DIR}"
-          cp "target/debug/helios-cli" "${DIR}/helios-cli"
+          cp "target/release/helios-cli" "${DIR}/helios-cli"
       - uses: actions/upload-artifact@v4
         with:
           name: helios-cli-debug-${{ runner.os }}-${{ runner.arch }}
@@ -4545,8 +4548,9 @@ jobs:
               re.compile(r"^(v0-rust-.+-Linux-(?:x64|arm64))-[0-9a-f]+-[0-9a-f]+$"),
               re.compile(r"^(helios-wasm-[^-]+-[^-]+-[^-]+)-\d+$"),
               re.compile(r"^(helios-cwasm-.+-[^-]+-[^-]+)-\d+$"),
-              re.compile(r"^(helios-cli-stable-v1-debug-[^-]+-[^-]+)-[0-9a-f]+$"),
-              re.compile(r"^(helios-inspector-v1-release-[^-]+-[^-]+)-[0-9a-f]+$"),
+              re.compile(r"^(stow-helios-cli-v1-[^-]+-[^-]+)-\d+$"),
+              re.compile(r"^(helios-cli-stable-v\d+-[^-]+-[^-]+-[^-]+)-[0-9a-f]+$"),
+              re.compile(r"^(helios-inspector-v\d+-release-[^-]+-[^-]+)-[0-9a-f]+$"),
           ]
           groups = collections.defaultdict(list)
           for entry in caches:
