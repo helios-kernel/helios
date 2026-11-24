@@ -30,10 +30,10 @@ use helios_hal::iommu::{
 
 /// How many devices one translation unit can confine.
 ///
-/// A helios platform exposes a network device, a host share, an entropy
-/// source and its disks; eight covers every machine the kernel boots on
-/// with room for the plugin-hosted drivers to come.
-pub const MAX_IOMMU_ENDPOINTS: usize = 8;
+/// A full desktop guest exposes network, host share, entropy, balloon,
+/// vsock, display, multiple input functions, sound, and several disks,
+/// with room left for plugin-hosted devices.
+pub const MAX_IOMMU_ENDPOINTS: usize = 32;
 
 /// What one confined device's domain covers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

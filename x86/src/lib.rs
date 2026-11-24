@@ -354,7 +354,11 @@ fn x86_kernel_main() -> ! {
                 )
                 .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
             )
-            .with_dma_model(DmaModel::Translated)
+            .with_dma_model(if iommu_topology.is_some() {
+                DmaModel::Iommu
+            } else {
+                DmaModel::Translated
+            })
             .with_devices(devices)
             .with_measured_boot(measured_boot),
     );
@@ -556,11 +560,16 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
     let mut routes = exceptions::DeviceInterruptRoutes::new();
     // Every virtio function the kernel is about to drive has to be in a
     // domain before it is programmed, so the whole set is confined in
-    // one pass first.
+    // one pass from the same discovered inventory.
     let confined: alloc::vec::Vec<pci_types::PciAddress> = host_share_function
         .into_iter()
         .chain(network_function)
         .chain(entropy_function)
+        .chain(balloon_function)
+        .chain(vsock_function)
+        .chain(display_function)
+        .chain(input_functions.iter().copied())
+        .chain(sound_function)
         .chain(block_functions.iter().copied())
         .collect();
     let confinement = iommu_topology.map(|topology| {
@@ -643,7 +652,7 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
             kernel,
             pci,
             address,
-            physical_memory_offset,
+            dma_pool(address),
             exceptions::VSOCK_INTERRUPT_VECTOR,
             destination_apic_id,
             debug_state,
@@ -672,7 +681,7 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
             kernel,
             pci,
             address,
-            physical_memory_offset,
+            dma_pool(address),
             debug_state.machine_generation_handle(),
         );
         debug_state.install_memory_balloon(handle);
