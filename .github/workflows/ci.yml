@@ -176,6 +176,7 @@ jobs:
             programs:
               - '!**/*.md'
               - 'programs/**'
+              - 'nu-shell/**'
               - 'api/**'
               - 'api-macro/**'
               - 'compiler-plugin/**'
@@ -2838,9 +2839,8 @@ jobs:
           # input device, draws a desktop, runs the shell in a terminal
           # on it, and puts what is typed at it on the screen.
           #
-          # No `--no-compiler-plugin` here, unlike the two boots above:
-          # the compositor spawns `/bin/dash`, which is a raw wasm the
-          # in-kernel compiler has to turn into an artifact first.
+          # The compositor spawns `/bin/nu` directly as a precompiled
+          # component from bootfs.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/desktop-compositor"
           captures="$GITHUB_WORKSPACE/desktop-scanout"
           mkdir -p "$runtime" "$captures"
@@ -2850,7 +2850,7 @@ jobs:
             --desktop --display none \
             --qemu-trace trace:virtio_gpu_update_cursor \
             --qemu-trace-log "$runtime/qemu-trace.log" \
-            --boot-program dash --boot-program debugger \
+            --boot-program nu --boot-program debugger \
             --boot-program compositor --boot-program surface-test \
             screendump \
               --run /bin/surface-test --run-wait-seconds 60 \
@@ -2923,7 +2923,7 @@ jobs:
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --desktop --display none \
-            --boot-program dash --boot-program debugger \
+            --boot-program nu --boot-program debugger \
             --boot-program compositor \
             screendump \
               --input tools/desktop/desktop-probe.input --input-interval-ms 150 \
@@ -3276,7 +3276,7 @@ jobs:
             --root-public-key target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-root-public.key
           "$HELIOS_CLI_BIN" artifact-stage \
             --kind image --arch x86-64 --profile release \
-            --program cpu --program dash --program debugger --program init \
+            --program cpu --program debugger --program init --program nu \
             --out-dir "$RUNNER_TEMP/stage-image-x86-64-cpu" \
             --kernel target/x86_64-unknown-none/profile-use/helios \
             --root-public-key target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-root-public.key \
@@ -3537,7 +3537,7 @@ jobs:
             --accel kvm --runtime-dir "$runtime" --keep-runtime-dir \
             --renderer virtio-gpu-gl --renderer-hostmem 256M \
             --display egl-headless \
-            --boot-program dash --boot-program debugger \
+            --boot-program nu --boot-program debugger \
             --boot-program compositor --boot-program pride-flag \
             --no-compiler-plugin \
             screendump --settle-seconds 20 --run /bin/pride-flag \
@@ -3602,7 +3602,7 @@ jobs:
             --root-public-key target/kernel-prebuild/x86_64-unknown-none/debug/helios-root-public.key
           "$HELIOS_CLI_BIN" artifact-stage \
             --kind image --arch x86-64 --profile debug \
-            --program compositor --program dash --program debugger --program init --program pride-flag \
+            --program compositor --program debugger --program init --program nu --program pride-flag \
             --out-dir "$RUNNER_TEMP/stage-image-x86-64-debug" \
             --kernel target/x86_64-unknown-none/debug/helios \
             --root-public-key target/kernel-prebuild/x86_64-unknown-none/debug/helios-root-public.key \
@@ -3735,6 +3735,9 @@ jobs:
           pattern: btrfs-upstream-*
           path: helios/target
           merge-multiple: true
+      - name: Install the pinned Rust toolchain
+        working-directory: helios
+        run: rustup toolchain install
       - name: Fuzz Helios with upstream seeds and AddressSanitizer
         working-directory: helios
         env:

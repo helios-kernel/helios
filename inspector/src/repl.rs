@@ -131,7 +131,8 @@ enum ReplBuiltin {
     Quit,
 }
 
-pub fn run(mut client: RpcClient) -> Result<(), ReplError> {
+pub fn run(mut client: RpcClient, shell: Option<&str>) -> Result<(), ReplError> {
+    let shell_path = shell.unwrap_or(REMOTE_SHELL_PATH);
     let editor = Rc::new(RefCell::new(build_editor()?));
     let mut terminal = InteractiveTerminal::new(Rc::clone(&editor));
 
@@ -165,6 +166,7 @@ pub fn run(mut client: RpcClient) -> Result<(), ReplError> {
             BuiltinParse::Remote(script) => {
                 match runtime::block_on(runtime::interruptible(run_shell_script(
                     &mut client,
+                    shell_path,
                     script,
                 )))
                 .map_err(|source| ReplError::Interrupt { source })?
@@ -195,14 +197,16 @@ pub async fn run_shell_command(
         (None, None) => return Err(ShellScriptError::MissingScript),
         (Some(_), Some(_)) => unreachable!("clap must reject conflicting shell inputs"),
     };
-    Ok(run_shell_script(client, script).await?)
+    let shell_path = command.shell.as_deref().unwrap_or(REMOTE_SHELL_PATH);
+    Ok(run_shell_script(client, shell_path, script).await?)
 }
 
 async fn run_shell_script(
     client: &mut RpcClient,
+    shell_path: &str,
     script: String,
 ) -> Result<ExecResult, ProgramError> {
-    programs::exec(client, REMOTE_SHELL_PATH, &["-c".to_owned(), script]).await
+    programs::exec(client, shell_path, &["-c".to_owned(), script]).await
 }
 
 fn read_program(editor: &SharedEditor) -> Result<Option<String>, ReplError> {
