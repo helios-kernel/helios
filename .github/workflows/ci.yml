@@ -3593,8 +3593,8 @@ jobs:
 
   linux-syscalls-x86-64:
     name: linux-syscalls (${{ matrix.arch }} ${{ matrix.shard }}/${{ matrix.shards }})
-    needs: [changes, build-helios-cli-x64, kernel-profile, wasm-release, linux-syscalls-build-x86-64]
-    if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.build-helios-cli-x64.result == 'success' && needs.linux-syscalls-build-x86-64.result == 'success' && needs.wasm-release.result == 'success' && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
+    needs: [changes, build-helios-cli-x64, kernel-profile, wasm-debug, linux-syscalls-build-x86-64]
+    if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.build-helios-cli-x64.result == 'success' && needs.linux-syscalls-build-x86-64.result == 'success' && needs.wasm-debug.result == 'success' && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ needs.changes.outputs.linux_suite_mode == 'full' && 60 || 15 }}
     permissions:
@@ -3747,8 +3747,8 @@ jobs:
       - uses: ./helios/.github/actions/prebuilt-wasm
         if: steps.cases.outputs.count != '0'
         with:
-          profile: release
-          path: helios/target/wasm-programs/release
+          profile: debug
+          path: helios/target/wasm-programs/debug
       # Each case runs as its own guest process under the bound below,
       # and a case that takes the guest down costs that case and a boot.
       # The binaries reach the guest through the read-only host share at
@@ -3784,6 +3784,7 @@ jobs:
               --runtime-dir "$runtime" --keep-runtime-dir \
               --disk "$runtime/scratch.btrfs,serial=linux-suite-tmp" \
               --shared-dir "$SUITE/bin" \
+              --guest-programs-profile debug \
               --boot-program debugger --no-compiler-plugin \
               linux-suite --guest-dir /host --private-btrfs linux-suite-tmp \
               --case-timeout-seconds "$CASE_TIMEOUT"
@@ -3806,8 +3807,8 @@ jobs:
 
   linux-syscalls-aarch64:
     name: linux-syscalls (${{ matrix.arch }} ${{ matrix.shard }}/${{ matrix.shards }})
-    needs: [changes, build-helios-cli-arm64, wasm-release, linux-syscalls-build-aarch64]
-    if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.build-helios-cli-arm64.result == 'success' && needs.linux-syscalls-build-aarch64.result == 'success' && needs.wasm-release.result == 'success' }}
+    needs: [changes, build-helios-cli-arm64, wasm-debug, linux-syscalls-build-aarch64]
+    if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.build-helios-cli-arm64.result == 'success' && needs.linux-syscalls-build-aarch64.result == 'success' && needs.wasm-debug.result == 'success' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: ${{ needs.changes.outputs.linux_suite_mode == 'full' && 60 || 15 }}
     permissions:

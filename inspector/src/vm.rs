@@ -957,6 +957,24 @@ enum VmVsockProfile {
     VhostVsockPci,
 }
 
+/// Which cargo profile the guest wasm programs in bootfs are built or fetched
+/// from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum GuestProgramsProfile {
+    Debug,
+    Release,
+}
+
+impl GuestProgramsProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Release => "release",
+        }
+    }
+}
+
 /// Which transport carries the inspector RPC to the guest debugger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1686,6 +1704,8 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) boot_programs: Vec<String>,
     #[serde(default)]
+    pub(crate) guest_programs_profile: Option<GuestProgramsProfile>,
+    #[serde(default)]
     pub(crate) no_compiler_plugin: Option<bool>,
     #[serde(default)]
     pub(crate) runtime_dir: Option<PathBuf>,
@@ -1938,6 +1958,11 @@ pub(crate) struct VmCommand {
     /// Restrict bootfs program prebuilds to a named program. Repeat for multiple programs.
     #[arg(long = "boot-program")]
     boot_programs: Vec<String>,
+
+    /// Override the cargo profile (`debug` or `release`) used to build or load
+    /// guest wasm programs for bootfs, independent of the kernel profile.
+    #[arg(long, value_enum)]
+    guest_programs_profile: Option<GuestProgramsProfile>,
 
     /// Omit the compiler kernel plugin from bootfs.
     #[arg(long, default_value_t = false)]
@@ -2590,6 +2615,9 @@ struct KernelBuildSpec {
     /// reads, and how it was asked for. `None` for every other kind.
     profile_use: Option<KernelProfileUse>,
     boot_programs: Vec<String>,
+    /// Explicit override for the guest wasm program profile; defaults to
+    /// [`KernelBuildProfile::guest_programs`] when `None`.
+    guest_programs_profile: Option<GuestProgramsProfile>,
     no_compiler_plugin: bool,
     /// The release signing key a build was told to use, absolute. `None`
     /// is a development build, whose key `kernel-prebuild` generates in
@@ -2796,6 +2824,9 @@ fn resolve_build(
         }
     }
     let no_compiler_plugin = command.no_compiler_plugin || file.no_compiler_plugin.unwrap_or(false);
+    let guest_programs_profile = command
+        .guest_programs_profile
+        .or(file.guest_programs_profile);
     // Absolute, because the prebuild and the kernel build each run in the
     // workspace root rather than the directory the inspector was invoked in.
     let root_secret_key = command
@@ -2814,6 +2845,7 @@ fn resolve_build(
         profile_use,
         kernel_features: command.kernel_features.clone(),
         boot_programs,
+        guest_programs_profile,
         no_compiler_plugin,
         root_secret_key,
         bootfs_root: command.bootfs_root.clone(),
@@ -3582,6 +3614,13 @@ fn bootfs_path(build: &KernelBuildSpec) -> Result<PathBuf, WorkspaceRootError> {
     Ok(kernel_prebuild_dir(build)?.join("helios-bootfs"))
 }
 
+impl KernelBuildSpec {
+    fn guest_programs_profile(&self) -> &'static str {
+        self.guest_programs_profile
+            .map_or_else(|| self.kind.guest_programs(), GuestProgramsProfile::as_str)
+    }
+}
+
 fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
     let cli = discover_helios_cli(command.kind)?;
     let repo_root = repo_root()?;
@@ -3595,7 +3634,7 @@ fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
         .arg("--target")
         .arg(command.profile.cargo_target)
         .arg("--profile")
-        .arg(command.kind.guest_programs())
+        .arg(command.guest_programs_profile())
         .arg("--cargo")
         .arg("cargo");
     for program in &command.boot_programs {
@@ -7998,6 +8037,7 @@ mod tests {
             profile_use: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
+            guest_programs_profile: None,
             no_compiler_plugin: true,
             root_secret_key: None,
             bootfs_root: None,
@@ -8047,6 +8087,7 @@ mod tests {
                     profile_use: None,
                     kernel_features: Vec::new(),
                     boot_programs: Vec::new(),
+                    guest_programs_profile: None,
                     no_compiler_plugin: true,
                     root_secret_key: None,
                     bootfs_root: None,
@@ -8571,6 +8612,7 @@ mod tests {
             profile_use: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
+            guest_programs_profile: None,
             no_compiler_plugin: false,
             root_secret_key: Some(PathBuf::from("/run/release/root.key")),
             bootfs_root: None,
@@ -8643,6 +8685,7 @@ mod tests {
             kill_after_lines: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
+            guest_programs_profile: None,
             no_compiler_plugin: false,
             bootfs_root: None,
             runtime_dir: None,
@@ -8716,6 +8759,7 @@ mod tests {
             kill_after_lines: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
+            guest_programs_profile: None,
             no_compiler_plugin: false,
             bootfs_root: None,
             runtime_dir: None,
@@ -9398,6 +9442,7 @@ mod tests {
             kill_after_lines: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
+            guest_programs_profile: None,
             no_compiler_plugin: false,
             bootfs_root: None,
             runtime_dir: None,
@@ -9552,6 +9597,7 @@ mod tests {
             profile_use: None,
             kernel_features: Vec::new(),
             boot_programs: vec!["debugger".to_owned()],
+            guest_programs_profile: None,
             no_compiler_plugin: true,
             root_secret_key: None,
             bootfs_root: None,
@@ -9773,6 +9819,7 @@ mod tests {
             profile_use: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
+            guest_programs_profile: None,
             no_compiler_plugin: false,
             root_secret_key: None,
             bootfs_root: None,
@@ -9944,5 +9991,26 @@ mod tests {
             stages: observed_stages.join(" | "),
             lines: recent_lines.join(" | "),
         })
+    }
+
+    #[test]
+    fn guest_programs_profile_override_decouples_bootfs_from_release_kernel() {
+        let mut build = KernelBuildSpec {
+            profile: &X86_64_VM_PROFILE,
+            kind: KernelBuildProfile::Release,
+            profile_use: None,
+            kernel_features: Vec::new(),
+            boot_programs: vec!["debugger".to_owned()],
+            guest_programs_profile: None,
+            no_compiler_plugin: true,
+            root_secret_key: None,
+            bootfs_root: None,
+        };
+        assert_eq!(build.guest_programs_profile(), "release");
+        build.guest_programs_profile = Some(GuestProgramsProfile::Debug);
+        assert_eq!(build.guest_programs_profile(), "debug");
+        build.kind = KernelBuildProfile::Debug;
+        build.guest_programs_profile = Some(GuestProgramsProfile::Release);
+        assert_eq!(build.guest_programs_profile(), "release");
     }
 }

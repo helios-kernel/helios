@@ -396,10 +396,10 @@ def test_wasm_jobs_drop_host_rust_cache_and_subset_programs_safely(ci_jobs, tmp_
     assert kernel_sel["wasm_release_programs"] == ""
     assert kernel_sel["wasi_artifacts"] == "false"
 
-    # Kernel + linux_abi PR: debug subset + release subset (`init`, `debugger`), no wasi-artifacts.
+    # Kernel + linux_abi PR: reuses debug subset (`init`, `debugger`), no wasm-release, no wasi-artifacts.
     linux_sel = select_lanes(ci_jobs, tmp_path, ["kernel", "linux_abi"], draft=False, heavy=False)
     assert json.loads(linux_sel["wasm_debug_programs"]) == ["debugger", "init"]
-    assert json.loads(linux_sel["wasm_release_programs"]) == ["debugger", "init"]
+    assert linux_sel["wasm_release_programs"] == ""
     assert linux_sel["wasi_artifacts"] == "false"
 
     # Venus smoke: debug subset includes GPU/desktop programs, needs wasi-artifacts.

@@ -200,7 +200,7 @@
     "surfaces": ["linux_abi"],
     "exclusive": true,
     "helios-cli": ["x64", "arm64"],
-    "guest-wasm": "release",
+    "guest-wasm": "debug",
     "guest-programs": ["init", "debugger"]
   },
   "linux-syscalls-full": {
@@ -208,7 +208,7 @@
     "surfaces": ["linux_abi"],
     "exclusive": true,
     "helios-cli": ["x64", "arm64"],
-    "guest-wasm": "release",
+    "guest-wasm": "debug",
     "guest-programs": ["init", "debugger"]
   },
   "test-btrfs-fuzz": {
