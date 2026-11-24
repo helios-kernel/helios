@@ -420,7 +420,7 @@ def test_tap_setup_matches_the_probe_queue_mode(jobs, probe, queues):
     )
     assert setup["env"]["TCP_PROBE"] == "${{ inputs.tcp_probe }}"
     script = setup["run"].replace('"$(nproc)"', '"8"')
-    script = script.replace("./target/release/helios-inspector", 'printf "%s\\n"')
+    script = script.replace("./target/release/helios", 'printf "%s\\n"')
     result = subprocess.run(
         ["bash", "-eu", "-c", script],
         check=True,
@@ -560,9 +560,9 @@ def test_benchmark_diagnostics_keep_symbols_but_not_kernels_or_keys(filename, jo
     )
     assert upload["if"] == condition
     paths = upload["with"]["path"].splitlines()
-    candidate = Path("helios/target/x86_64-unknown-none/kernel-release/helios")
+    candidate = Path("helios/target/x86_64-unknown-none/kernel-release/helios-kernel")
     baseline = Path(
-        "helios/target/perf-baselines/worktrees/baseline/target/x86_64-unknown-none/kernel-release/helios"
+        "helios/target/perf-baselines/worktrees/baseline/target/x86_64-unknown-none/kernel-release/helios-kernel"
     )
     kernels = [candidate, baseline] if job == "suite" else [candidate]
     snapshots = set()

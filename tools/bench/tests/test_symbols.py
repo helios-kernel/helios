@@ -66,7 +66,7 @@ def kernel_elf() -> bytes:
 def test_symbols_exclude_private_data_and_non_function_objects(tmp_path, kernel_elf):
     image = tmp_path / "helios"
     image.write_bytes(kernel_elf)
-    snapshot = kernel_symbols(image, "target/x86_64-unknown-none/kernel-release/helios")
+    snapshot = kernel_symbols(image, "target/x86_64-unknown-none/kernel-release/helios-kernel")
     assert snapshot["functions"] == [{"name": "sample_function", "address": 0x401000, "size": 1}]
     assert snapshot["sha256"] == hashlib.sha256(kernel_elf).hexdigest()
     assert snapshot["entry"] == 0x401000
@@ -90,8 +90,10 @@ def test_symbols_exclude_private_data_and_non_function_objects(tmp_path, kernel_
 def test_export_keeps_both_image_identities_without_copying_elfs(tmp_path, kernel_elf):
     root = tmp_path / "checkout"
     images = [
-        root / "target/x86_64-unknown-none/kernel-release/helios",
-        root / "target/perf-baselines/worktrees/baseline/target/x86_64-unknown-none/kernel-release/helios",
+        root / "target/x86_64-unknown-none/kernel-release/helios-kernel",
+        root
+        / "target/perf-baselines/worktrees/baseline"
+        / "target/x86_64-unknown-none/kernel-release/helios-kernel",
     ]
     for image in images:
         image.parent.mkdir(parents=True)
@@ -116,8 +118,10 @@ def test_export_finds_a_profile_use_release_kernel(tmp_path, kernel_elf):
     have to come from the image that was booted."""
     root = tmp_path / "checkout"
     images = [
-        root / "target/x86_64-unknown-none/profile-use/helios",
-        root / "target/perf-baselines/worktrees/baseline/target/x86_64-unknown-none/profile-use/helios",
+        root / "target/x86_64-unknown-none/profile-use/helios-kernel",
+        root
+        / "target/perf-baselines/worktrees/baseline"
+        / "target/x86_64-unknown-none/profile-use/helios-kernel",
     ]
     for image in images:
         image.parent.mkdir(parents=True)
@@ -138,10 +142,10 @@ def test_export_finds_a_kernel_built_against_a_named_profile(tmp_path, kernel_el
     column builds against its own collection (#384)."""
     root = tmp_path / "checkout"
     images = [
-        root / "target/pgo-kernels/6f1c9a2b3d4e5f60/x86_64-unknown-none/profile-use/helios",
+        root / "target/pgo-kernels/6f1c9a2b3d4e5f60/x86_64-unknown-none/profile-use/helios-kernel",
         root
         / "target/perf-baselines/worktrees/baseline/target/pgo-kernels/0a1b2c3d4e5f6071"
-        / "x86_64-unknown-none/profile-use/helios",
+        / "x86_64-unknown-none/profile-use/helios-kernel",
     ]
     for image in images:
         image.parent.mkdir(parents=True)

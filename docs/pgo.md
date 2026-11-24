@@ -262,14 +262,14 @@ job's step log truncated itself and hid everything after the builds
 inheriting it: the `no profile data available for function` lines are
 counted per crate and written, verbatim, to
 `<kernel>.pgo-uncovered.txt` beside the image the build produced (so
-`target/x86_64-unknown-none/profile-use/helios.pgo-uncovered.txt` for
+`target/x86_64-unknown-none/profile-use/helios-kernel.pgo-uncovered.txt` for
 the fetched-profile build, and the same name in the keyed directory of
 a named one, per the table below). Everything else — `Compiling`,
 `Finished`, other warnings, errors — reaches the log unchanged, and the
 build ends with one line naming what it redirected:
 
 ```text
-pgo uncovered functions: 18055 of 18648 (96.8%) in 18 crates (helios_x86 11800, wasmtime 3100, …); full list: /path/to/helios.pgo-uncovered.txt
+pgo uncovered functions: 18055 of 18648 (96.8%) in 18 crates (helios_x86 11800, wasmtime 3100, …); full list: /path/to/helios-kernel.pgo-uncovered.txt
 ```
 
 Both figures are read off the kernel image just built — rustc prints no
@@ -412,8 +412,8 @@ That pairing is what "refresh at release time" has to be measured
 against. Both columns are `profile-use` builds of one commit and what
 varies between them is the profile: the release's counts against the
 counts this run collected. The candidate boots
-`target/pgo-kernels/<digest>/x86_64-unknown-none/profile-use/helios` and
-the baseline `target/x86_64-unknown-none/profile-use/helios`, per the
+`target/pgo-kernels/<digest>/x86_64-unknown-none/profile-use/helios-kernel` and
+the baseline `target/x86_64-unknown-none/profile-use/helios-kernel`, per the
 table above; before they had two directories the job built both into the
 second one and the identical-images guard refused the run (#327). A
 candidate that does not beat the baseline says the release's profile

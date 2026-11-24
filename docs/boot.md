@@ -101,20 +101,20 @@ secret key:
 `helios-cli artifact-fetch` downloads any tier from the latest green CI run
 matching the current `HEAD` (falling back to the default branch, preferring
 `release` over `debug` unless `--profile` is specified) into the shared local
-cache, and `helios-inspector vm --prebuilt` wires it directly into a boot:
+cache, and `helios vm --prebuilt` wires it directly into a boot:
 
 ```bash
 # Boot the latest green full image directly (zero local compilation, no Limine needed)
-helios-inspector vm --arch x86-64 --prebuilt shell -c 'echo ok'
+helios vm --arch x86-64 --prebuilt shell -c 'echo ok'
 
 # Reuse prebuilt guest wasm while building only the local kernel and bootfs
-helios-inspector vm --arch x86-64 --prebuilt userspace shell -c 'echo ok'
+helios vm --arch x86-64 --prebuilt userspace shell -c 'echo ok'
 
 # Fetch a specific tier explicitly (or inspect its cached path as JSON)
 helios-cli artifact-fetch --kind image --arch aarch64 --json
 
 # Boot an already-downloaded prebuilt image directory offline (zero network)
-helios-inspector vm --arch aarch64 --release --prebuilt image --prebuilt-dir /path/to/image shell -c 'echo ok'
+helios vm --arch aarch64 --release --prebuilt image --prebuilt-dir /path/to/image shell -c 'echo ok'
 ```
 
 `--prebuilt kernel` requires either a `--bootfs` signed by the prebuilt

@@ -452,8 +452,8 @@ def test_each_image_is_booted_by_the_tooling_of_its_own_checkout(driver, tmp_pat
     order = boot_order(run_side(driver, tmp_path, images_of(driver, tmp_path, paired=True)))
 
     expected = {
-        "candidate": str(tmp_path / "candidate" / "target" / "release" / "helios-inspector"),
-        "baseline": str(tmp_path / "baseline" / "target" / "release" / "helios-inspector"),
+        "candidate": str(tmp_path / "candidate" / "target" / "release" / "helios"),
+        "baseline": str(tmp_path / "baseline" / "target" / "release" / "helios"),
     }
     for _harness, guest, inspector, _names in order:
         assert inspector == expected[guest]
@@ -467,7 +467,7 @@ def test_a_baseline_boot_without_its_own_inspector_is_refused(driver, tmp_path, 
     and it can never be answered by the candidate's inspector, which is
     the skew of #356.
     """
-    inspector = tmp_path / "baseline" / "target" / "release" / "helios-inspector"
+    inspector = tmp_path / "baseline" / "target" / "release" / "helios"
     monkeypatch.setenv("HELIOS_TEST_TOOLS_ABSENT", str(inspector))
     with pytest.raises(driver.HeliosRunFailed) as error:
         run_side(driver, tmp_path, images_of(driver, tmp_path, paired=True))
@@ -793,7 +793,7 @@ def test_a_kernel_path_that_fails_is_a_failure_not_an_empty_count(tmp_path) -> N
     """A nonzero `kernel-path` names what refused, rather than reading None."""
     lane = load_manifest().lane("x86-64-kvm")
     checkout = fake_checkout(tmp_path / "candidate")
-    inspector = checkout / "target" / "release" / "helios-inspector"
+    inspector = checkout / "target" / "release" / "helios"
     inspector.parent.mkdir(parents=True)
     inspector.write_text("#!/bin/sh\necho 'the profile is not in the store' >&2\nexit 3\n", encoding="utf-8")
     inspector.chmod(0o755)
@@ -960,7 +960,7 @@ def test_a_profile_use_pairing_plans_two_distinct_kernel_paths(tmp_path, monkeyp
     reads the fetched profile (#226), and one cargo profile is one output
     directory, so until #327 the second build overwrote the first and
     both images resolved to
-    `target/x86_64-unknown-none/profile-use/helios`: run 34437890235
+    `target/x86_64-unknown-none/profile-use/helios-kernel`: run 34437890235
     refused itself on the identical-images guard. The driver asks the
     inspector where each image lives, per image and with that image's
     profile in the question, so the pairing turns on the inspector
@@ -1444,7 +1444,7 @@ def test_a_baseline_that_predates_the_sampler_is_refused_before_any_boot(
     """Sampling one column alone is the bug, so a baseline whose own
     inspector cannot sample refuses the run, naming why, before either
     image boots."""
-    inspector = tmp_path / "baseline" / "target" / "release" / "helios-inspector"
+    inspector = tmp_path / "baseline" / "target" / "release" / "helios"
     monkeypatch.setenv("HELIOS_TEST_SAMPLER_ABSENT", str(inspector))
     with pytest.raises(driver.AsymmetricInstructionSampling) as error:
         sampled_side(driver, tmp_path, monkeypatch)

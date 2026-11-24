@@ -199,7 +199,7 @@ def main() -> int:
     parser.add_argument("--debug-kernel", dest="release", action="store_false")
     parser.add_argument(
         "--inspector",
-        default=REPO_ROOT / "target" / "release" / "helios-inspector",
+        default=REPO_ROOT / "target" / "release" / "helios",
         type=Path,
     )
     parser.add_argument(

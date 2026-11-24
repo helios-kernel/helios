@@ -118,7 +118,7 @@ if argv[-1] != "kernel-path":
     raise SystemExit(f"the stand-in answers kernel-path and nothing else: {argv}")
 root = Path(os.environ["HELIOS_WORKSPACE_ROOT"])
 build = hashlib.sha256(" ".join([str(root), *argv]).encode()).hexdigest()[:16]
-image = root / "target" / build / "helios"
+image = root / "target" / build / "helios-kernel"
 image.parent.mkdir(parents=True, exist_ok=True)
 image.write_text(build, encoding="utf-8")
 print(image)
@@ -128,7 +128,7 @@ print(image)
 def fake_inspector(root: Path) -> Path:
     """An inspector whose `kernel-path` answers without a build."""
     root.mkdir(parents=True, exist_ok=True)
-    inspector = root / "helios-inspector"
+    inspector = root / "helios"
     inspector.write_text(FAKE_INSPECTOR, encoding="utf-8")
     inspector.chmod(0o755)
     return inspector
