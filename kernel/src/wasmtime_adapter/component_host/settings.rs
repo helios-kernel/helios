@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn list_shows_the_machine_settings_with_their_units_and_values() {
-        use crate::RandomBytesLimitSetting;
+        use crate::{CompilerMaxInputBytesSetting, RandomBytesLimitSetting};
 
         let program = ordinary();
 
@@ -327,6 +327,11 @@ mod tests {
                     value: SettingValue::Count(1024),
                 },
                 SettingEntry {
+                    name: "compiler.max-input-bytes",
+                    description: CompilerMaxInputBytesSetting::DESCRIPTION,
+                    value: SettingValue::Bytes(crate::DEFAULT_COMPILER_MAX_INPUT_BYTES),
+                },
+                SettingEntry {
                     name: "random.max-bytes",
                     description: RandomBytesLimitSetting::DESCRIPTION,
                     value: SettingValue::Bytes(RandomBytesLimitSetting::DEFAULT),
@@ -334,14 +339,23 @@ mod tests {
             ]
         );
         let views = listing(&program);
-        assert_eq!(views.len(), 2);
+        assert_eq!(views.len(), 3);
         assert_eq!(views[0].name, "process.descriptor-limit");
         assert_eq!(views[0].description, DescriptorLimitSetting::DESCRIPTION);
         assert!(matches!(views[0].value, ValueView::Count(1024)));
-        assert_eq!(views[1].name, "random.max-bytes");
-        assert_eq!(views[1].description, RandomBytesLimitSetting::DESCRIPTION);
+        assert_eq!(views[1].name, "compiler.max-input-bytes");
+        assert_eq!(
+            views[1].description,
+            CompilerMaxInputBytesSetting::DESCRIPTION
+        );
         assert!(matches!(
             views[1].value,
+            ValueView::Bytes(crate::DEFAULT_COMPILER_MAX_INPUT_BYTES)
+        ));
+        assert_eq!(views[2].name, "random.max-bytes");
+        assert_eq!(views[2].description, RandomBytesLimitSetting::DESCRIPTION);
+        assert!(matches!(
+            views[2].value,
             ValueView::Bytes(bytes) if bytes == RandomBytesLimitSetting::DEFAULT
         ));
     }
