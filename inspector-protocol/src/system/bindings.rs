@@ -18,5 +18,6 @@ wit_bindgen::generate!({
         "container-config",
         "snapshot-hold",
         "sampling-session",
+        "publication",
     ],
 });

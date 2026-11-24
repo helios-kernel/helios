@@ -28,7 +28,7 @@ package helios:system@0.1.0;
 /// queue is full is a *whole report*: the kernel commits a report or
 /// drops it, never half of one, so a pointer never keeps one axis of a
 /// move it lost the other half of. Reports dropped that way are counted
-/// and published on `helios:system/stats`.
+/// and published under `/kernel/input` via `helios:system/inspect`.
 interface input {
   /// Why an input request was refused.
   enum error {

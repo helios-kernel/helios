@@ -53,7 +53,7 @@ const NETWORK_COUNTER_DEADLINE_SECONDS: u32 = 10;
 const GUEST_ISA_DEADLINE_SECONDS: u32 = 10;
 
 /// The instruction-set level the guest kernel compiled guest code for, as
-/// the guest reports it through `helios:system/stats`.
+/// the guest reports it through `helios:system/inspect`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct GuestIsa {
     /// The level name, such as `x86-64-v4`.
@@ -62,8 +62,8 @@ pub(crate) struct GuestIsa {
     pub(crate) extras: Vec<String>,
 }
 
-impl From<&helios_inspector_protocol::system::stats::Processors> for GuestIsa {
-    fn from(processors: &helios_inspector_protocol::system::stats::Processors) -> Self {
+impl From<&helios_inspector_protocol::system::inspect::Processors> for GuestIsa {
+    fn from(processors: &helios_inspector_protocol::system::inspect::Processors) -> Self {
         Self {
             level: processors.guest_isa_level.clone(),
             extras: processors.guest_isa_extras.clone(),
@@ -686,7 +686,13 @@ pub(crate) async fn run_inner(
         "guest ISA level",
         GUEST_ISA_DEADLINE_SECONDS,
         vcpus,
-        async { Ok::<_, WorkloadBenchError>(crate::system::fetch_stats(client).await?.processors) },
+        async {
+            Ok::<_, WorkloadBenchError>(
+                crate::system::fetch_kernel_snapshot_prefixes(client, &["/kernel/processors"], 256)
+                    .await?
+                    .processors,
+            )
+        },
     )
     .await?;
     write_record(&JsonlRecord::Run {
@@ -1531,7 +1537,12 @@ async fn write_guest_network_counters(
         "network counters",
         NETWORK_COUNTER_DEADLINE_SECONDS,
         vcpus,
-        async { Ok::<_, WorkloadBenchError>(crate::system::fetch_stats(client).await?) },
+        async {
+            Ok::<_, WorkloadBenchError>(
+                crate::system::fetch_kernel_snapshot_prefixes(client, &["/kernel/network"], 0)
+                    .await?,
+            )
+        },
     )
     .await;
     render_network_counters(
@@ -1549,7 +1560,7 @@ fn render_network_counters(
     sink: &mut impl std::io::Write,
     workload: &str,
     when: &str,
-    sample: Result<Option<helios_inspector_protocol::system::stats::Network>, WorkloadBenchError>,
+    sample: Result<Option<helios_inspector_protocol::system::inspect::Network>, WorkloadBenchError>,
 ) {
     let _ = writeln!(sink, "--- workload {workload} {when} network counters ---");
     match sample {
@@ -1829,7 +1840,7 @@ mod tests {
 
     #[test]
     fn network_counter_block_names_workload_and_moment_and_carries_orphans() {
-        use helios_inspector_protocol::system::stats::{Network, NetworkQueue};
+        use helios_inspector_protocol::system::inspect::{Network, NetworkQueue};
         let queue = NetworkQueue {
             id: 3,
             rx_frames: 0,
@@ -2091,7 +2102,7 @@ mod tests {
     /// as a list.
     #[test]
     fn the_run_record_carries_the_guest_isa() {
-        let processors = helios_inspector_protocol::system::stats::Processors {
+        let processors = helios_inspector_protocol::system::inspect::Processors {
             configured: 2,
             online: 2,
             utilization: Vec::new(),

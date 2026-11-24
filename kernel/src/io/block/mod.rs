@@ -158,7 +158,7 @@ pub struct BlockService {
 
 impl BlockService {
     /// What the scratch disk is and what the kernel has asked of it, for
-    /// `helios:system/stats`.
+    /// kernel telemetry inspection.
     pub fn stats(&self) -> BlockStats {
         self.scratch.snapshot()
     }
