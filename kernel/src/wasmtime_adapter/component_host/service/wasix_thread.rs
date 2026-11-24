@@ -529,6 +529,12 @@ where
         if stop? != p1::errno::SUCCESS {
             return p1_finish_errno_call(caller, p1::errno::NOTSUP).await;
         }
+        if let Some(errno) = caller.data_mut().asyncify.rewind_failure.take() {
+            // The pool could not hold the checkpoint: the call returns
+            // the refusal instead of a value that names a checkpoint
+            // nobody stored.
+            return p1_finish_errno_call(caller, errno).await;
+        }
         let Some(memory) = p1_async_memory(caller) else {
             return p1_finish_errno_call(caller, p1::errno::FAULT).await;
         };
@@ -550,22 +556,25 @@ where
     if stack_lower >= stack_pointer || stack_pointer > stack_upper {
         return p1_finish_errno_call(caller, p1::errno::INVAL).await;
     }
-    let memory_stack_len = match usize::try_from(stack_upper - stack_pointer) {
-        Ok(len) => len,
-        Err(_) => return p1_finish_errno_call(caller, p1::errno::OVERFLOW).await,
-    };
-    let memory_stack = match memory
-        .read_bytes(GuestAddress::wasm32(stack_pointer), memory_stack_len)
-        .await
-    {
-        Ok(bytes) => bytes,
-        Err(error) => return p1_finish_async_call(caller, Err(error.into())).await,
-    };
     let unwind_stack_begin = match stack_lower.checked_add(WASIX_ASYNCIFY_DATA_SIZE) {
         Some(begin) if begin <= stack_pointer => begin,
         _ => return p1_finish_errno_call(caller, p1::errno::OVERFLOW).await,
     };
     let stack_lower_address = GuestAddress::wasm32(stack_lower);
+    // The window is copied into charged pages before anything is written
+    // to the guest or the unwind starts, so a pool that cannot hold it
+    // answers `NOMEM` with the phase still `Idle`.
+    let memory_stack = match wasix_capture_stack_window(
+        caller.data(),
+        &memory,
+        stack_pointer,
+        stack_upper,
+    )
+    .await
+    {
+        Ok(pages) => pages,
+        Err(stop) => return p1_finish_async_call(caller, Err(stop)).await,
+    };
     let setup = async {
         memory
             .write_u32(stack_lower_address, unwind_stack_begin)

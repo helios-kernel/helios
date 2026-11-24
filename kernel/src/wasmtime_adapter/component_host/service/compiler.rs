@@ -37,6 +37,8 @@ pub(crate) struct AotDestination<StorageImpl: crate::Storage> {
     pub(crate) namespace: crate::Namespace<StorageImpl>,
     pub(crate) absolute: String,
     pub(crate) now: u64,
+    pub(crate) payer: crate::StoragePayer,
+    pub(crate) requester: crate::InstanceId,
 }
 
 /// Where the compiled output of one compile session lands.
@@ -761,7 +763,9 @@ pub(super) fn copy_payload_and_trailer(
 
 /// Maps a WASI filesystem error while streaming an AOT artifact to a
 /// [`ProgramExecError`].
-fn map_aot_fs_error(error: fs_types::ErrorCode) -> ProgramExecError {
+pub(in crate::wasmtime_adapter::component_host) fn map_aot_fs_error(
+    error: fs_types::ErrorCode,
+) -> ProgramExecError {
     tracing::error!(
         ?error,
         "filesystem operation failed during AOT output write"
@@ -777,6 +781,7 @@ fn map_aot_fs_error(error: fs_types::ErrorCode) -> ProgramExecError {
         | fs_types::ErrorCode::IllegalByteSequence
         | fs_types::ErrorCode::Invalid
         | fs_types::ErrorCode::Overflow => ProgramExecErrorKind::InvalidPath,
+        fs_types::ErrorCode::InsufficientMemory => ProgramExecErrorKind::OutOfMemory,
         _ => ProgramExecErrorKind::Internal,
     };
     ProgramExecError {
@@ -837,21 +842,36 @@ where
     } else {
         0
     };
+    let map_write_error = |error: fs_types::ErrorCode| {
+        if matches!(error, fs_types::ErrorCode::InsufficientMemory) {
+            crate::wasmtime_adapter::store::request_oom_kill(
+                &store.context.runtime_state,
+                &store.context.registry,
+                &store.context.cpu,
+                destination.requester,
+                crate::MemoryPool::User,
+                total_len.max(helios_hal::pmm::PhysFrame::SIZE),
+            );
+        }
+        map_aot_fs_error(error)
+    };
     let resolved = crate::wasmtime_adapter::wasi::open_program_file_for_write(
         &destination.namespace,
         &destination.absolute,
         destination.now,
+        &destination.payer,
     )
     .await
-    .map_err(map_aot_fs_error)?;
+    .map_err(map_write_error)?;
     let mut next = crate::wasmtime_adapter::wasi::prepare_resolved_write(
         &resolved,
         WritePosition::At(0),
         total_len,
         destination.now,
+        &destination.payer,
     )
     .await
-    .map_err(map_aot_fs_error)?;
+    .map_err(map_write_error)?;
     let mut written = 0usize;
     loop {
         let round_len = next.staged_len();
@@ -889,9 +909,11 @@ where
                 dst.copy_from_slice(&trailer[start..start + dst.len()]);
             })
         };
-        match filled.submit().await.map_err(|error| {
-            map_aot_fs_error(crate::wasmtime_adapter::wasi::fs_error_code(error))
-        })? {
+        match filled
+            .submit()
+            .await
+            .map_err(|error| map_write_error(crate::wasmtime_adapter::wasi::fs_error_code(error)))?
+        {
             WriteProgress::Done(landed) => {
                 if landed.len != total_len {
                     return Err(map_aot_fs_error(fs_types::ErrorCode::InsufficientSpace));

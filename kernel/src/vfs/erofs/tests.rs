@@ -238,16 +238,17 @@ fn assert_refusals(fs: &ErofsFs<MemoryDisk>) {
         block_on(fs.open_dir(path("hello.txt"))).map(drop),
         Err(FsError::NotDirectory)
     );
+    let payer = crate::StoragePayer::for_test();
     assert_eq!(
-        block_on(fs.open(path("new.txt"), OpenFlags::CREATE, 0)).map(drop),
+        block_on(fs.open(path("new.txt"), OpenFlags::CREATE, 0, &payer)).map(drop),
         Err(FsError::ReadOnly)
     );
     assert_eq!(
-        block_on(fs.open(path("hello.txt"), OpenFlags::TRUNCATE, 0)).map(drop),
+        block_on(fs.open(path("hello.txt"), OpenFlags::TRUNCATE, 0, &payer)).map(drop),
         Err(FsError::ReadOnly)
     );
     assert_eq!(
-        block_on(fs.open(path("hello.txt"), OpenFlags::DIRECTORY, 0)).map(drop),
+        block_on(fs.open(path("hello.txt"), OpenFlags::DIRECTORY, 0, &payer)).map(drop),
         Err(FsError::NotDirectory)
     );
     assert_eq!(
@@ -261,7 +262,7 @@ fn assert_refusals(fs: &ErofsFs<MemoryDisk>) {
         Err(FsError::ReadOnly)
     );
     assert_eq!(
-        block_on(fs.unlink(path("hello.txt"), 7_000_000_000)),
+        block_on(fs.unlink(path("hello.txt"), 7_000_000_000, &payer)),
         Err(FsError::ReadOnly)
     );
     // `docs/` holds six entries, `.` and `..` among them, in one block:
@@ -422,12 +423,13 @@ fn special_nodes_are_listed_and_statted_and_never_opened() {
     expected.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(listed, expected);
 
+    let payer = crate::StoragePayer::for_test();
     for (name, _, kind, refusal) in SPECIAL_NODES {
         let metadata = block_on(fs.stat(path(name))).expect("stat reports the node");
         assert_eq!(metadata.kind, kind, "{name}");
         assert_eq!(metadata.size, 0, "{name} holds no bytes");
         assert_eq!(
-            block_on(fs.open(path(name), OpenFlags::empty(), 0)).map(|_| ()),
+            block_on(fs.open(path(name), OpenFlags::empty(), 0, &payer)).map(|_| ()),
             Err(refusal),
             "open {name}"
         );
@@ -440,7 +442,7 @@ fn special_nodes_are_listed_and_statted_and_never_opened() {
 
     for (name, content) in CJK_FILES {
         assert_eq!(read_all(&fs, name).unwrap(), content.as_bytes());
-        block_on(fs.open(path(name), OpenFlags::empty(), 0)).expect("a regular file opens");
+        block_on(fs.open(path(name), OpenFlags::empty(), 0, &payer)).expect("a regular file opens");
     }
 }
 
