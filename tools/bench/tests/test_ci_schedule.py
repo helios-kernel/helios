@@ -196,6 +196,8 @@ def test_every_selected_review_job_has_a_fifteen_minute_limit(ci_jobs, tmp_path)
         {
             "linux-syscalls-build-x86-64",
             "linux-syscalls-build-aarch64",
+            "linux-syscalls-image-x86-64",
+            "linux-syscalls-image-aarch64",
             "linux-syscalls-x86-64",
             "linux-syscalls-aarch64",
             "linux-syscalls-report",
@@ -322,9 +324,14 @@ def test_helios_cli_producer_covers_every_selected_consumer_and_consumers_only_d
     assert ci_jobs["build-helios-cli-x64"]["runs-on"] == "ubuntu-24.04"
     assert ci_jobs["build-helios-cli-arm64"]["runs-on"] == "ubuntu-24.04-arm"
     assert "linux-syscalls-build-x86-64" in ci_jobs["linux-syscalls-x86-64"]["needs"]
+    assert "linux-syscalls-image-x86-64" in ci_jobs["linux-syscalls-x86-64"]["needs"]
     assert "linux-syscalls-build-aarch64" not in ci_jobs["linux-syscalls-x86-64"]["needs"]
+    assert "linux-syscalls-image-aarch64" not in ci_jobs["linux-syscalls-x86-64"]["needs"]
     assert "linux-syscalls-build-aarch64" in ci_jobs["linux-syscalls-aarch64"]["needs"]
+    assert "linux-syscalls-image-aarch64" in ci_jobs["linux-syscalls-aarch64"]["needs"]
     assert "linux-syscalls-build-x86-64" not in ci_jobs["linux-syscalls-aarch64"]["needs"]
+    assert "linux-syscalls-image-x86-64" not in ci_jobs["linux-syscalls-aarch64"]["needs"]
+    assert "kernel-profile" not in ci_jobs["linux-syscalls-image-aarch64"]["needs"]
     assert "kernel-profile" not in ci_jobs["linux-syscalls-aarch64"]["needs"]
     for name, job in ci_jobs.items():
         cli_steps = [
@@ -396,7 +403,8 @@ def test_wasm_jobs_drop_host_rust_cache_and_subset_programs_safely(ci_jobs, tmp_
     assert kernel_sel["wasm_release_programs"] == ""
     assert kernel_sel["wasi_artifacts"] == "false"
 
-    # Kernel + linux_abi PR: reuses debug subset (`init`, `debugger`), no wasm-release, no wasi-artifacts.
+    # Kernel + linux_abi PR: reuses debug subset (`init`, `debugger`) without triggering
+    # a separate `wasm-release` build, and needs no wasi-artifacts.
     linux_sel = select_lanes(ci_jobs, tmp_path, ["kernel", "linux_abi"], draft=False, heavy=False)
     assert json.loads(linux_sel["wasm_debug_programs"]) == ["debugger", "init"]
     assert linux_sel["wasm_release_programs"] == ""
@@ -447,6 +455,87 @@ def test_container_job_bash_steps_declare_shell_bash(ci_jobs):
             run = step.get("run", "")
             if bashisms.search(run):
                 assert step.get("shell") == "bash", (name, step.get("name"))
+
+
+def test_prebuilt_ci_artifacts_and_linux_syscalls_deduplication(ci_jobs):
+    # Tier 1 userspace artifacts retain 14 days.
+    for name in ("wasm-debug", "wasm-release"):
+        upload = next(
+            step for step in ci_jobs[name]["steps"] if step.get("uses") == "actions/upload-artifact@v4"
+        )
+        assert upload["with"]["name"] == "helios-wasm-${{ matrix.profile }}"
+        assert int(upload["with"]["retention-days"]) == 14
+
+    # No legacy `helios-guest-*` upload remains and no upload ever includes a secret key.
+    for job_name, job in ci_jobs.items():
+        for step in job.get("steps", []):
+            if step.get("uses") == "actions/upload-artifact@v4":
+                artifact_name = step["with"]["name"]
+                assert not artifact_name.startswith("helios-guest-"), (job_name, artifact_name)
+                assert "helios-root-secret.key" not in str(step["with"].get("path", "")), (
+                    job_name,
+                    artifact_name,
+                )
+
+    # Heavy smoke lanes upload 90-day kernel + image artifacts.
+    for job_name, arch in (
+        ("smoke-riscv64", "riscv64"),
+        ("smoke-aarch64", "aarch64"),
+        ("smoke-x86-64", "x86-64"),
+    ):
+        uploads = {
+            step["with"]["name"]: int(step["with"]["retention-days"])
+            for step in ci_jobs[job_name]["steps"]
+            if step.get("uses") == "actions/upload-artifact@v4"
+        }
+        assert uploads[f"helios-kernel-{arch}-release"] == 90
+        assert uploads[f"helios-image-{arch}-release"] == 90
+
+    # Other kernel-building smoke lanes upload 14-day kernel + image artifacts without colliding.
+    cpu_stage = next(
+        step for step in ci_jobs["smoke-x86-64-cpu-lifecycle"]["steps"] if step.get("id") == "stage-prebuilt"
+    )
+    assert "!contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64')" in cpu_stage["if"]
+    venus_uploads = {
+        step["with"]["name"]: int(step["with"]["retention-days"])
+        for step in ci_jobs["smoke-x86-64-venus"]["steps"]
+        if step.get("uses") == "actions/upload-artifact@v4"
+    }
+    assert venus_uploads["helios-kernel-x86-64-debug"] == 14
+    assert venus_uploads["helios-image-x86-64-debug"] == 14
+    cfi_uploads = {
+        step["with"]["name"]: int(step["with"]["retention-days"])
+        for step in ci_jobs["smoke-aarch64-cfi"]["steps"]
+        if step.get("uses") == "actions/upload-artifact@v4"
+    }
+    assert cfi_uploads["helios-kernel-aarch64-debug-cfi"] == 14
+    assert cfi_uploads["helios-image-aarch64-debug-cfi"] == 14
+
+    # `linux-syscalls-image-*` builds once per arch using `wasm-debug` (`--guest-programs-profile debug`)
+    # and shards boot the prebuilt image directly with zero local Rust/Limine compilation.
+    for image_job_name, shard_job_name in (
+        ("linux-syscalls-image-x86-64", "linux-syscalls-x86-64"),
+        ("linux-syscalls-image-aarch64", "linux-syscalls-aarch64"),
+    ):
+        image_job = ci_jobs[image_job_name]
+        assert "wasm-debug" in image_job["needs"]
+        assert "wasm-release" not in image_job["needs"]
+        build_step = next(
+            step for step in image_job["steps"] if step.get("name") == "Build the Linux guest image"
+        )
+        assert "--guest-programs-profile debug" in build_step["run"]
+
+        shard_job = ci_jobs[shard_job_name]
+        assert image_job_name in shard_job["needs"]
+        for step in shard_job["steps"]:
+            run = step.get("run", "")
+            assert "cargo build" not in run, (shard_job_name, step.get("name"))
+            assert "profile-fetch" not in run, (shard_job_name, step.get("name"))
+            assert "limine-binary" not in run, (shard_job_name, step.get("name"))
+        helios_step = next(
+            step for step in shard_job["steps"] if step.get("name") == "Run the shard on Helios"
+        )
+        assert "--prebuilt image --prebuilt-dir" in helios_step["run"]
 
 
 def test_workflows_target_single_main_branch():
