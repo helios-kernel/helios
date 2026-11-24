@@ -1342,8 +1342,9 @@ jobs:
           grep -Fqx ok boot-dt.out
           grep -F 'platform described by device-tree' "$runtime/inspector.log"
           # Every processor installed the machine's key and enabled
-          # return-address signing before the kernel ran anything else.
-          grep -F 'return-address signing enabled on every processor' "$runtime/inspector.log"
+          # return-address signing and BTI before the kernel ran anything else.
+          grep -F 'control-flow integrity enabled on every processor' "$runtime/inspector.log"
+          grep -F 'bti=true' "$runtime/inspector.log"
           # Under TCG the inspector enables QEMU's allocation-tag storage by
           # default, so every processor enables synchronous tag checking and
           # passes its bring-up self-check.
@@ -1432,7 +1433,8 @@ jobs:
           cat boot-acpi.out
           grep -Fqx ok boot-acpi.out
           grep -F 'platform described by acpi' "$runtime/inspector.log"
-          grep -F 'return-address signing enabled on every processor' "$runtime/inspector.log"
+          grep -F 'control-flow integrity enabled on every processor' "$runtime/inspector.log"
+          grep -F 'bti=true' "$runtime/inspector.log"
           grep -F 'memory tagging enabled on every processor' "$runtime/inspector.log"
           # The ACPI walk looks for virtio transports by hardware id and
           # names nothing else, so an ACPI-described machine publishes
@@ -1907,6 +1909,17 @@ jobs:
         run: |
           cargo test -p helios-inspector -- --ignored --nocapture --exact \
             vm::tests::cfi_self_test_panics_aarch64
+      - name: Refuse an unguarded indirect call (BTI)
+        timeout-minutes: 60
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          cargo test -p helios-inspector -- --ignored --nocapture --exact \
+            vm::tests::bti_self_test_panics_aarch64
       - name: Refuse a tag mismatch
         timeout-minutes: 60
         shell: bash

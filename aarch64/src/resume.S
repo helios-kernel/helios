@@ -110,6 +110,9 @@ __helios_aarch64_cpu_resume_end:
 .global __helios_aarch64_cpu_resume_virtual
 .type __helios_aarch64_cpu_resume_virtual, %function
 __helios_aarch64_cpu_resume_virtual:
+    // Reached via `br x3` from `__helios_aarch64_cpu_resume` after enabling
+    // the MMU on guarded kernel text.
+    hint #38
     ldr x1, [x0, #176]
     ldr x2, [x0, #184]
     msr ttbr0_el1, x2

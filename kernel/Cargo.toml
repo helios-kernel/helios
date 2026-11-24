@@ -35,6 +35,9 @@ wasmtime-bare-metal = [
     # processor's anchor block (`hal::cpu::GUEST_STACK_LIMIT_OFFSET`); the
     # backends answer the `wasmtime_processor_stack_limit` hook this links.
     "wasmtime/custom-processor-stack-limit",
+    # Every bare-metal AArch64 processor shares one instruction key A, so
+    # suspended fibers sign their saved return addresses against it (#370).
+    "wasmtime/fiber-return-address-signing",
 ]
 
 [dependencies]

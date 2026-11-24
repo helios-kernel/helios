@@ -11,6 +11,7 @@
 .global helios_aarch64_native_enter
 .type helios_aarch64_native_enter, %function
 helios_aarch64_native_enter:
+    hint #34
     stp x29, x30, [sp, #-0xa0]!
     stp x19, x20, [sp, #0x10]
     stp x21, x22, [sp, #0x20]
@@ -218,6 +219,7 @@ helios_aarch64_native_exit:
 .global helios_aarch64_isolation_load
 .type helios_aarch64_isolation_load, %function
 helios_aarch64_isolation_load:
+    hint #34
     ldr x1, [x0]
     ret
 .size helios_aarch64_isolation_load, . - helios_aarch64_isolation_load
@@ -225,6 +227,7 @@ helios_aarch64_isolation_load:
 .global helios_aarch64_isolation_store
 .type helios_aarch64_isolation_store, %function
 helios_aarch64_isolation_store:
+    hint #34
     str x0, [x0, #8]
     ret
 .size helios_aarch64_isolation_store, . - helios_aarch64_isolation_store

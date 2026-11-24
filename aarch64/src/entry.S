@@ -181,6 +181,7 @@ __helios_aarch64_sync_exception:
 .global __helios_aarch64_swap_fault_resume
 .type __helios_aarch64_swap_fault_resume, %function
 __helios_aarch64_swap_fault_resume:
+    hint #34
     msr daifset, #0x2
     mov sp, x0
     ldp x0, x1, [sp, #0x110]
@@ -247,6 +248,7 @@ __helios_aarch64_swap_fault_resume:
 .global __helios_aarch64_trap_hand_over
 .type __helios_aarch64_trap_hand_over, %function
 __helios_aarch64_trap_hand_over:
+    hint #34
     msr spsel, #1
     mov sp, x0
     msr sp_el0, x1
