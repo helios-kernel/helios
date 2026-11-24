@@ -152,6 +152,9 @@ struct MockNet {
     multicast_joins: Arc<Mutex<Vec<MulticastJoin>>>,
     udp_queue: Arc<Mutex<Vec<(Bytes, SocketAddr, usize)>>>,
     last_udp_timeout: Arc<Mutex<Option<u64>>>,
+    next_udp_id: Arc<core::sync::atomic::AtomicU64>,
+    live_udp: Arc<Mutex<Vec<u64>>>,
+    yield_udp_bind: Arc<core::sync::atomic::AtomicBool>,
 }
 
 impl Default for MockNet {
@@ -166,6 +169,22 @@ impl Default for MockNet {
             multicast_joins: Arc::new(Mutex::new(Vec::new())),
             udp_queue: Arc::new(Mutex::new(Vec::new())),
             last_udp_timeout: Arc::new(Mutex::new(None)),
+            next_udp_id: Arc::new(core::sync::atomic::AtomicU64::new(3)),
+            live_udp: Arc::new(Mutex::new(Vec::new())),
+            yield_udp_bind: Arc::new(core::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+struct YieldOnce(bool);
+impl Future for YieldOnce {
+    type Output = ();
+    fn poll(mut self: core::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            Poll::Pending
         }
     }
 }
@@ -183,7 +202,9 @@ impl SocketNetwork for MockNet {
     };
     fn tcp_close(&self, _: u64) {}
     fn tcp_listener_close(&self, _: u64) {}
-    fn udp_close(&self, _: u64) {}
+    fn udp_close(&self, id: u64) {
+        self.live_udp.lock().retain(|&live| live != id);
+    }
     fn packet_close(&self, _: u64) {}
 }
 
@@ -332,14 +353,37 @@ impl Network<MockNet> for Platform {
         _: u8,
     ) -> Result<(Arc<OwnedUdpSocket<MockNet>>, u16), u64> {
         self.check_udp_bind(local.port)?;
+        if self
+            .net
+            .yield_udp_bind
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            YieldOnce(false).await;
+        }
         let port = if local.port == 0 { 44000 } else { local.port };
-        Ok((OwnedUdpSocket::new(self.net.clone(), 3), port))
+        let id = self
+            .net
+            .next_udp_id
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.net.live_udp.lock().push(id);
+        Ok((OwnedUdpSocket::new(self.net.clone(), id), port))
     }
-    fn udp_connect(&self, _: u64, _: SocketAddr) -> Result<(), u64> {
-        self.check_udp_open()
+    fn udp_connect(&self, id: u64, _: SocketAddr) -> Result<(), u64> {
+        self.check_udp_open()?;
+        if !self.net.live_udp.lock().contains(&id) {
+            return Err(100); // ENETDOWN
+        }
+        Ok(())
     }
     fn udp_disconnect(&self, _: u64) -> Result<(), u64> {
         self.check_udp_open()
+    }
+    async fn udp_send(&self, id: u64, _: SocketAddr, bytes: &[u8], _: u64) -> Result<usize, u64> {
+        self.check_udp_open()?;
+        if !self.net.live_udp.lock().contains(&id) {
+            return Err(100); // ENETDOWN
+        }
+        Ok(bytes.len())
     }
     async fn udp_receive(
         &self,
@@ -1219,4 +1263,184 @@ fn poll_reports_pollrdhup_on_peer_close() {
             (1, POLLIN | POLLRDHUP)
         );
     }
+}
+
+#[test]
+fn concurrent_udp_lazy_bind_race_uses_winning_socket_handle() {
+    struct CaptureThread(Option<Process<MockResources>>);
+    impl Thread<MockResources> for CaptureThread {
+        fn thread_pointer(&self) -> u64 {
+            0
+        }
+        fn set_thread_pointer(&mut self, _: u64) -> Result<(), Denied> {
+            Ok(())
+        }
+        fn stack_pointer(&self) -> u64 {
+            0
+        }
+        fn spawn_thread(
+            &mut self,
+            child: Process<MockResources>,
+            _: SpawnedThread,
+        ) -> Result<(), SpawnError> {
+            self.0 = Some(child);
+            Ok(())
+        }
+    }
+
+    fn spawn_sibling(
+        proc: &mut Process<MockResources>,
+        abi: Abi,
+        mem: &mut Memory,
+        plat: &mut Platform,
+    ) -> Process<MockResources> {
+        const CLONE_THREAD_FLAGS: u64 =
+            0x0001_0000 | 0x0000_0100 | 0x0000_0200 | 0x0000_0400 | 0x0000_0800;
+        let call = Call {
+            number: syscall_num(abi, Operation::Clone),
+            arguments: [CLONE_THREAD_FLAGS, 0x2000, 0, 0, 0, 0],
+        };
+        let mut capture = CaptureThread(None);
+        match drive(dispatch(proc, call, mem, &mut capture, plat)) {
+            ControlFlow::Continue(helios_linux::syscall::SyscallOutcome::Return(tid)) => {
+                assert!(tid > 0 && tid < (1u64 << 32), "clone failed: {tid:#x}");
+            }
+            other => panic!("unexpected clone outcome: {other:?}"),
+        }
+        capture.0.expect("clone must hand back sibling thread")
+    }
+
+    let abi = Abi::Aarch64;
+    let mut proc = new_process(abi);
+    let mut mem = Memory::new(4096);
+    let mut plat = Platform {
+        net: MockNet {
+            allow_udp: true,
+            ..Default::default()
+        },
+        now: 0,
+    };
+    let mut sa = [0u8; 16];
+    sa[0..2].copy_from_slice(&2u16.to_le_bytes());
+    sa[2..4].copy_from_slice(&8080u16.to_be_bytes());
+    sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    mem.write(64, &sa).unwrap();
+    mem.write(128, b"ping").unwrap();
+
+    // Case 1: connect() suspends inside lazy udp_bind while a concurrent sendto()
+    // binds and installs its socket first. connect() must drop its losing socket
+    // and call udp_connect() on the installed handle rather than failing ENETDOWN.
+    {
+        let fd1 = call_op(
+            &mut proc,
+            abi,
+            Operation::Socket,
+            [2, 2, 0, 0, 0, 0],
+            &mut mem,
+            &mut plat,
+        );
+        let mut peer_proc = spawn_sibling(&mut proc, abi, &mut mem, &mut plat);
+        let mut peer_mem = mem.clone();
+        let mut peer_plat = Platform {
+            net: plat.net.clone(),
+            now: 0,
+        };
+        plat.net
+            .yield_udp_bind
+            .store(true, core::sync::atomic::Ordering::Release);
+        let connect_call = Call {
+            number: syscall_num(abi, Operation::Connect),
+            arguments: [fd1, 64, 16, 0, 0, 0],
+        };
+        let mut thread1 = NoThread;
+        let mut connect_fut = core::pin::pin!(dispatch(
+            &mut proc,
+            connect_call,
+            &mut mem,
+            &mut thread1,
+            &mut plat
+        ));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(connect_fut.as_mut().poll(&mut cx), Poll::Pending));
+
+        // Concurrent sendto() completes without yielding and installs the bound socket.
+        peer_plat
+            .net
+            .yield_udp_bind
+            .store(false, core::sync::atomic::Ordering::Release);
+        assert_eq!(
+            call_op(
+                &mut peer_proc,
+                abi,
+                Operation::Sendto,
+                [fd1, 128, 4, 0, 64, 16],
+                &mut peer_mem,
+                &mut peer_plat,
+            ),
+            4
+        );
+        assert!(matches!(
+            connect_fut.as_mut().poll(&mut cx),
+            Poll::Ready(ControlFlow::Continue(
+                helios_linux::syscall::SyscallOutcome::Return(0)
+            ))
+        ));
+    }
+
+    // Case 2: sendto() suspends inside lazy udp_bind while connect() wins the slot.
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let fd2 = call_op(
+        &mut proc,
+        abi,
+        Operation::Socket,
+        [2, 2, 0, 0, 0, 0],
+        &mut mem,
+        &mut plat,
+    );
+    let mut peer_proc2 = spawn_sibling(&mut proc, abi, &mut mem, &mut plat);
+    let mut peer_mem2 = mem.clone();
+    let mut peer_plat2 = Platform {
+        net: plat.net.clone(),
+        now: 0,
+    };
+    plat.net
+        .yield_udp_bind
+        .store(true, core::sync::atomic::Ordering::Release);
+    let sendto_call = Call {
+        number: syscall_num(abi, Operation::Sendto),
+        arguments: [fd2, 128, 4, 0, 64, 16],
+    };
+    let mut thread2 = NoThread;
+    let mut sendto_fut = core::pin::pin!(dispatch(
+        &mut proc,
+        sendto_call,
+        &mut mem,
+        &mut thread2,
+        &mut plat
+    ));
+    assert!(matches!(sendto_fut.as_mut().poll(&mut cx), Poll::Pending));
+
+    peer_plat2
+        .net
+        .yield_udp_bind
+        .store(false, core::sync::atomic::Ordering::Release);
+    assert_eq!(
+        call_op(
+            &mut peer_proc2,
+            abi,
+            Operation::Connect,
+            [fd2, 64, 16, 0, 0, 0],
+            &mut peer_mem2,
+            &mut peer_plat2,
+        ),
+        0
+    );
+    assert!(matches!(
+        sendto_fut.as_mut().poll(&mut cx),
+        Poll::Ready(ControlFlow::Continue(
+            helios_linux::syscall::SyscallOutcome::Return(4)
+        ))
+    ));
 }
