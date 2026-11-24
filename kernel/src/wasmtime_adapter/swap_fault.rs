@@ -25,8 +25,7 @@ use wasmtime::BlockOnCurrentFiberError;
 
 use crate::kernel_exception::{KernelException, dispatch_native_trap};
 use crate::memory::{
-    InterruptedContext, StackFault, SwapFaultError, installed_swap_handle, resolve_stack_fault,
-    swapped_token,
+    StackFault, SwapFaultError, classify_stack_fault, installed_swap_handle, swapped_token,
 };
 
 /// Reads the page at `addr` back in, blocking the fiber this is called
@@ -82,9 +81,6 @@ pub fn resolve_swap_fault_blocking(addr: VirtAddr) -> Result<(), SwapFaultError>
 /// fault on aarch64, a spurious-fault fence on riscv) have declined it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UserPageFault {
-    /// A reserved page inside a live fiber stack, committed in place. The
-    /// faulting instruction runs again.
-    Resolved,
     /// A swapped-out page. The entry redirects the faulting context onto
     /// a trampoline on its own stack, which calls
     /// [`run_swap_fault_trampoline`].
@@ -96,17 +92,12 @@ pub enum UserPageFault {
 }
 
 /// Classifies a fault at `addr` in the order every backend uses: the fiber
-/// stack arena first, because it resolves from the user pool without
-/// touching the swap tables, then the swap entry.
+/// stack arena first, because a fault on an uncommitted fiber stack page
+/// is a kernel defect and fails fast, then the swap entry.
 ///
-/// `interrupted` is what the backend's entry saved of the context the
-/// fault interrupted; see [`InterruptedContext`]. Safe to call from trap
-/// context: it waits only as [`resolve_stack_fault`] does.
-pub fn classify_user_page_fault(addr: VirtAddr, interrupted: InterruptedContext) -> UserPageFault {
-    let stack_fault = resolve_stack_fault(addr, interrupted);
-    if stack_fault == StackFault::Committed {
-        return UserPageFault::Resolved;
-    }
+/// Safe to call from trap context: it takes no locks.
+pub fn classify_user_page_fault(addr: VirtAddr) -> UserPageFault {
+    let stack_fault = classify_stack_fault(addr);
     if swapped_token(addr).is_some() {
         return UserPageFault::Swapped;
     }

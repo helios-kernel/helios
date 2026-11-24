@@ -1773,22 +1773,9 @@ extern "C" fn aarch64_handle_sync_exception(
         {
             return;
         }
-        // A fiber stack's page comes from the user pool's ordinary path
-        // when the interrupted context had IRQs unmasked (the pool's
-        // locks mask them while held, so it holds none), and from the
-        // per-processor reserve when it had them masked.
-        // SAFETY: the entry wrote a complete frame at `frame`.
-        let interrupted_spsr = unsafe { (*frame).spsr };
-        let interrupted = helios_kernel::InterruptedContext {
-            interrupts_enabled: interrupted_spsr & SPSR_IRQ_MASK == 0,
-        };
-        match helios_kernel::classify_user_page_fault(
-            helios_hal::vmm::VirtAddr::new(faulting_address),
-            interrupted,
-        ) {
-            // A reserved page inside a live fiber stack was a demand
-            // commit the kernel resolved in place.
-            helios_kernel::UserPageFault::Resolved => return,
+        match helios_kernel::classify_user_page_fault(helios_hal::vmm::VirtAddr::new(
+            faulting_address,
+        )) {
             // A swapped-out page is ours to resolve, and resolving it
             // means waiting for the swap device. Redirect the faulting
             // context onto a kernel trampoline running on its own stack,
