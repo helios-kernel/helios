@@ -31,6 +31,7 @@ futures-io = "0.3.34"
 futures-lite = "2.6.1"
 futures-util = { version = "0.3.31", default-features = false, features = ["io"] }
 gimli = { version = "0.33.0", default-features = false, features = ["read", "endian-reader", "std"] }
+helios-artifact.workspace = true
 helios-inspector-protocol.workspace = true
 helios-hal.workspace = true
 helios-profdata.workspace = true

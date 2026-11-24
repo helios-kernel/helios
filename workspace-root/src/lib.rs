@@ -13,6 +13,7 @@
 //! whose `Cargo.toml` declares a `[workspace]` table. Every failure is typed
 //! and names the directory it was looking at.
 
+pub mod prebuilt_manifest;
 pub mod root_key;
 
 use std::path::{Path, PathBuf};
