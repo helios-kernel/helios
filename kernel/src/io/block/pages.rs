@@ -44,6 +44,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use arrayvec::ArrayVec;
+use core::num::NonZeroUsize;
 use core::ptr::NonNull;
 
 use helios_hal::fs::{AnswerFlag, BlockBuffer, OwnedBlockBuffer};
@@ -62,14 +63,59 @@ const _: () = assert!(
     "a block buffer page is one page, aligned to a page"
 );
 
-/// Where one block of a cache request's bytes lives.
+/// Where one block of a cache request's bytes lives, packed into one
+/// tagged pointer so [`BlockPages`] stays half the size inside async
+/// I/O futures.
+///
+/// Bit 0 clear names a [`Page`]; bit 0 set names a [`CompressedPage`].
 #[derive(Clone, Copy)]
-enum Source {
+#[repr(transparent)]
+struct Source(NonNull<u8>);
+
+enum DecodedSource {
     /// The page buffer of a cache entry the run holds.
     Page(NonNull<Page>),
     /// The compressed page of a cache entry the run holds in write-back:
     /// a write's `fill` decompresses it into the driver's run.
     Compressed(NonNull<CompressedPage>),
+}
+
+const SOURCE_COMPRESSED_TAG: usize = 1;
+
+const _: () = assert!(
+    core::mem::align_of::<Page>() > SOURCE_COMPRESSED_TAG
+        && core::mem::align_of::<CompressedPage>() > SOURCE_COMPRESSED_TAG,
+    "source pointers leave bit 0 clear for the compressed-page tag"
+);
+
+const _: () = assert!(
+    core::mem::size_of::<Source>() == core::mem::size_of::<usize>(),
+    "each block source fits in one pointer word"
+);
+
+impl Source {
+    fn page(page: NonNull<Page>) -> Self {
+        Self(page.cast())
+    }
+
+    fn compressed(page: NonNull<CompressedPage>) -> Self {
+        Self(
+            page.cast::<u8>()
+                .map_addr(|addr| addr | SOURCE_COMPRESSED_TAG),
+        )
+    }
+
+    fn decode(self) -> DecodedSource {
+        if self.0.addr().get() & SOURCE_COMPRESSED_TAG == 0 {
+            DecodedSource::Page(self.0.cast())
+        } else {
+            let untagged = self.0.map_addr(|addr| {
+                NonZeroUsize::new(addr.get() & !SOURCE_COMPRESSED_TAG)
+                    .expect("aligned CompressedPage pointer stays non-null without tag bit")
+            });
+            DecodedSource::Compressed(untagged.cast())
+        }
+    }
 }
 
 impl Page {
@@ -120,13 +166,13 @@ impl BlockPages {
     /// Appends a page the request borrows from a cache entry the run
     /// holds.
     pub(super) fn push_borrowed(&mut self, page: NonNull<Page>) {
-        self.pages.push(Source::Page(page));
+        self.pages.push(Source::page(page));
     }
 
     /// Appends the compressed page of a cache entry the run holds in
     /// write-back, for `fill` to decompress.
     pub(super) fn push_compressed(&mut self, page: NonNull<CompressedPage>) {
-        self.pages.push(Source::Compressed(page));
+        self.pages.push(Source::compressed(page));
     }
 
     /// The cache blocks a cache request names.
@@ -173,15 +219,15 @@ impl BlockBuffer for BlockPages {
         }
         let (blocks, _) = to.as_chunks_mut::<CACHE_BLOCK_BYTES>();
         for (source, to) in self.pages.iter().zip(blocks) {
-            match *source {
+            match source.decode() {
                 // SAFETY: the page is a cache entry's the run holds in
                 // write-back, so nothing writes or frees it while the
                 // request carries it.
-                Source::Page(page) => to.copy_from_slice(&unsafe { page.as_ref() }.0),
+                DecodedSource::Page(page) => to.copy_from_slice(&unsafe { page.as_ref() }.0),
                 // SAFETY: the compressed page is a cache entry's the run
                 // holds in write-back, which no path frees or replaces
                 // until the write is answered.
-                Source::Compressed(page) => unsafe { page.as_ref() }.decompress_into(to),
+                DecodedSource::Compressed(page) => unsafe { page.as_ref() }.decompress_into(to),
             }
         }
     }
@@ -194,7 +240,7 @@ impl BlockBuffer for BlockPages {
         }
         let (blocks, _) = from.as_chunks::<CACHE_BLOCK_BYTES>();
         for (source, from) in self.pages.iter_mut().zip(blocks) {
-            let Source::Page(page) = source else {
+            let DecodedSource::Page(mut page) = source.decode() else {
                 panic!("a read request names a compressed block")
             };
             // SAFETY: the page is a cache entry's the run holds locked for
