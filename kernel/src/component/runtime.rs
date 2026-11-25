@@ -519,13 +519,28 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
     fn release_snapshot_hold(&self, token: u64);
 }
 
-pub(crate) struct ComponentExecutionContext<FileSystem> {
+/// Associates a store's filesystem type with its per-instance default Linux
+/// image representation without adding type parameters to [`ComponentStoreData`].
+pub trait StoreFilesystem {
+    type DefaultImage: Clone + Send + Sync + 'static;
+}
+
+impl<S: crate::Storage> StoreFilesystem for crate::Namespace<S> {
+    type DefaultImage = crate::DefaultLinuxImage<S>;
+}
+
+impl StoreFilesystem for () {
+    type DefaultImage = ();
+}
+
+pub(crate) struct ComponentExecutionContext<FileSystem: StoreFilesystem> {
     activity: InstanceActivity,
     filesystem: FileSystem,
     arguments: Vec<String>,
     environment: Vec<(String, String)>,
     process_authority: ProcessAuthority,
     ipc_grants: crate::IpcEndpointGrants,
+    default_linux_image: spin::Mutex<Option<FileSystem::DefaultImage>>,
     output_mode: ComponentOutputMode,
 }
 
@@ -538,14 +553,20 @@ pub struct ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTab
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
+    FileSystem: StoreFilesystem,
 {
     pub table: ResourceTableImpl,
+    /// Pre-bound listening sockets handed to this instance at spawn.
+    ///
+    /// Declared before `retirement` so any unclaimed TCP listeners still held
+    /// when the store drops push onto `retirement` before it drains.
+    pub inherited_sockets: crate::InheritedSockets,
     /// The handles of socket resources that have died, and the runtime
     /// state that closes them.
     ///
-    /// Declared after `table` on purpose: the table is torn down first,
-    /// so every socket resource still in it has already pushed what it
-    /// owned by the time this field's `Drop` drains the queue.
+    /// Declared after `table` and `inherited_sockets` on purpose: both are torn
+    /// down first, so every socket still open has already pushed what it owned
+    /// by the time this field's `Drop` drains the queue.
     pub retirement: super::StoreSocketRetirement<RuntimeStateImpl>,
     pub cpu: CpuImpl,
     timer: Timer<CpuImpl>,
@@ -582,7 +603,7 @@ where
     requested_exit: Option<u8>,
 }
 
-impl<FileSystem> ComponentExecutionContext<FileSystem> {
+impl<FileSystem: StoreFilesystem> ComponentExecutionContext<FileSystem> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         instance: RegisteredInstance,
@@ -600,6 +621,7 @@ impl<FileSystem> ComponentExecutionContext<FileSystem> {
             environment,
             process_authority,
             ipc_grants: crate::IpcEndpointGrants::new(),
+            default_linux_image: spin::Mutex::new(None),
             output_mode,
         }
     }
@@ -610,7 +632,7 @@ impl<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
-    FileSystem: Send,
+    FileSystem: StoreFilesystem + Send,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -633,6 +655,7 @@ where
         let clock = KernelClock::new(cpu.clone(), runtime_state.clone());
         Self {
             table,
+            inherited_sockets: crate::InheritedSockets::new(),
             retirement: super::StoreSocketRetirement::new(runtime_state.clone()),
             cpu,
             timer,
@@ -663,6 +686,32 @@ where
     pub fn with_ipc_grants(mut self, ipc_grants: crate::IpcEndpointGrants) -> Self {
         self.execution_context.ipc_grants = ipc_grants;
         self
+    }
+
+    /// Attaches an inherited default Linux image to this instance at spawn.
+    pub fn with_default_linux_image(self, image: Option<FileSystem::DefaultImage>) -> Self {
+        *self.execution_context.default_linux_image.lock() = image;
+        self
+    }
+
+    /// Attaches pre-bound listening sockets granted to this instance at spawn,
+    /// rebinding their TCP retirement senders to this store's retirement queue.
+    pub fn with_inherited_sockets(mut self, sockets: crate::InheritedSockets) -> Self {
+        sockets.rebind_retirement(self.retirement.sender());
+        self.inherited_sockets = sockets;
+        self
+    }
+
+    pub(crate) fn default_linux_image(&self) -> Option<FileSystem::DefaultImage> {
+        self.execution_context.default_linux_image.lock().clone()
+    }
+
+    pub(crate) fn set_default_linux_image(&self, image: Option<FileSystem::DefaultImage>) {
+        *self.execution_context.default_linux_image.lock() = image;
+    }
+
+    pub(crate) fn inherited_sockets(&self) -> &crate::InheritedSockets {
+        &self.inherited_sockets
     }
 
     /// Retires every network handle a dying socket resource queued

@@ -55,10 +55,10 @@ use helios_unix::FutexTable;
 use thiserror::Error;
 
 use crate::vfs::{
-    FileContents, Follow, HeldPath, MAX_MOUNTS, MAX_SYMLINK_DEPTH, MountFlags, MountGrant,
-    MountHold, MountSharing, MountedFs, Namespace, PrivateMountClaim, PrivateMountClaimError,
-    SharedOwner, Storage, UnixAttributes, UnixFsError, XattrSetMode, join_fs_path,
-    within_directory,
+    FileContents, Follow, HeldPath, MAX_MOUNTS, MAX_SYMLINK_DEPTH, MemoryFs, MountFlags,
+    MountGrant, MountHold, MountSharing, MountedFs, Namespace, OverlayFs, PinnedLower,
+    PrivateMountClaim, PrivateMountClaimError, SharedOwner, Storage, UnixAttributes, UnixFsError,
+    XattrSetMode, join_fs_path, within_directory,
 };
 use crate::{
     ClockAuthorityRights, DirectoryAuthorityRights, DirectoryPreopen, NetworkAuthorityRights,
@@ -150,6 +150,29 @@ impl ContainerId {
     }
 }
 
+/// How a container mount accesses its backing directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContainerMountSharing {
+    /// Exclusive claim over a [`MountSharing::Private`] backing mount.
+    Private,
+    /// Shared access to a [`MountSharing::Shared`] backing mount.
+    Shared,
+    /// Fresh private `UserMemoryPool`-backed [`OverlayFs`] upper tree layered
+    /// over a lock-free pinned read-only lower directory (`HeldPath<S>`).
+    /// Requires only read (and optional execute) authority on the lower
+    /// directory and performs zero disk writes on creation or teardown.
+    EphemeralOverlay,
+}
+
+impl From<MountSharing> for ContainerMountSharing {
+    fn from(sharing: MountSharing) -> Self {
+        match sharing {
+            MountSharing::Private => Self::Private,
+            MountSharing::Shared => Self::Shared,
+        }
+    }
+}
+
 /// Specification of one mount inside a container at creation time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContainerMountSpec {
@@ -160,9 +183,8 @@ pub struct ContainerMountSpec {
     /// Rights granted on this mount, attenuated from the creator's authority
     /// and bounded by the backing mount's rights.
     pub rights: DirectoryAuthorityRights,
-    /// Whether this mount is private to the container or shared. Must match
-    /// the backing mount's sharing kind, which never changes while it exists.
-    pub sharing: MountSharing,
+    /// How this mount is shared or overlaid over its backing directory.
+    pub sharing: ContainerMountSharing,
 }
 
 /// Configuration used to create a [`LinuxContainer`].
@@ -475,7 +497,12 @@ impl<'a, S: Storage> ContainerResolved<'a, S> {
         }
         match self
             .fs()
-            .remove_xattr(self.fs_path(), permissions::XATTR_SECURITY_CAPABILITY, now)
+            .remove_xattr(
+                self.fs_path(),
+                permissions::XATTR_SECURITY_CAPABILITY,
+                now,
+                payer,
+            )
             .await
         {
             Ok(()) | Err(UnixFsError::NoData) | Err(UnixFsError::Fs(FsError::Unsupported)) => {
@@ -2076,6 +2103,10 @@ impl<S: Storage> ContainerFilesystem<S> {
     }
 
     /// Removes extended attribute `name` at `raw_path`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the container xattr syscall surface (base_dir, path, follow, name, creds, timestamp, storage payer)"
+    )]
     pub async fn remove_xattr_at(
         &self,
         base_dir: &str,
@@ -2084,11 +2115,13 @@ impl<S: Storage> ContainerFilesystem<S> {
         name: &str,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         let (resolved, _) = self
             .walk_path_for(base_dir, raw_path, follow_final, creds)
             .await?;
-        self.remove_xattr_inner(&resolved, name, creds, now).await
+        self.remove_xattr_inner(&resolved, name, creds, now, payer)
+            .await
     }
 
     /// Removes extended attribute `name` on an already-resolved container path.
@@ -2098,9 +2131,11 @@ impl<S: Storage> ContainerFilesystem<S> {
         name: &str,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         let resolved = self.resolve(container_path)?;
-        self.remove_xattr_inner(&resolved, name, creds, now).await
+        self.remove_xattr_inner(&resolved, name, creds, now, payer)
+            .await
     }
 
     async fn remove_xattr_inner(
@@ -2109,6 +2144,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         name: &str,
         creds: &Credentials,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), FsOpError> {
         resolved.require_write()?;
         if !resolved.is_private() {
@@ -2120,7 +2156,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         permissions::check_xattr_permission(creds, meta, acl.as_deref(), name, true)?;
         resolved
             .fs()
-            .remove_xattr(resolved.fs_path(), name, now)
+            .remove_xattr(resolved.fs_path(), name, now, payer)
             .await
             .map_err(unix_to_op)
     }
@@ -2427,6 +2463,93 @@ impl<S: Storage> LinuxContainer<S> {
         }
     }
 
+    /// Creates a single-binary ephemeral Linux container whose `"/"` is a
+    /// fresh private `UserMemoryPool`-backed [`OverlayFs`] over a lock-free
+    /// pinned read-only `lower` directory (`HeldPath<S>`), with the child's
+    /// granted Helios host directories (`guest_name != "/"`) bind-mounted on
+    /// top for direct persistent host I/O.
+    ///
+    /// Performs zero disk writes on creation or teardown and takes no
+    /// exclusive claim on `lower`, allowing unrestricted concurrent containers
+    /// over the same read-only image tree.
+    pub fn ephemeral_with_overlay(
+        id: ContainerId,
+        authority: ProcessAuthority,
+        namespace: &Namespace<S>,
+        lower: HeldPath<S>,
+        credentials: Option<Credentials>,
+    ) -> Result<Self, ContainerError> {
+        let pinned = PinnedLower::from_held(lower).map_err(|error| ContainerError::Filesystem {
+            path: String::from("/"),
+            error,
+        })?;
+        let upper = MemoryFs::with_budget(
+            namespace.table().allocate_device(),
+            namespace.table().memory_storage(),
+        );
+        let overlay = OverlayFs::new(upper, pinned);
+        let overlay_grant = MountGrant {
+            rights: FileSystemRights::READ | FileSystemRights::WRITE,
+            sharing: MountSharing::Private,
+        };
+        let root_mount = ContainerMount {
+            target: String::from("/"),
+            backing: HeldPath::from_overlay(overlay, overlay_grant),
+            grant: overlay_grant,
+            authority_rights: DirectoryAuthorityRights::all(),
+            _private_claim: None,
+        };
+        let mut mounts = vec![root_mount];
+        for preopen in authority.directory_preopens() {
+            if preopen.guest_name() == "/" {
+                continue;
+            }
+            let Ok(target) = normalize_container_path(preopen.guest_name()) else {
+                continue;
+            };
+            if target == "/" || mounts.iter().any(|existing| existing.target == target) {
+                continue;
+            }
+            if mounts.len() > MAX_MOUNTS {
+                break;
+            }
+            if let Ok(resolved) = namespace.resolve(preopen.source_path()) {
+                let rights = effective_fs_rights(preopen.rights(), resolved.grant().rights);
+                mounts.push(ContainerMount {
+                    target,
+                    backing: resolved.held(),
+                    grant: MountGrant {
+                        rights,
+                        sharing: MountSharing::Shared,
+                    },
+                    authority_rights: preopen.rights(),
+                    _private_claim: None,
+                });
+            }
+        }
+        let shared_owner = SharedOwner { uid: 0, gid: 0 };
+        let mut default_credentials = credentials.unwrap_or_else(Credentials::root);
+        default_credentials
+            .capabilities
+            .clamp(authority_cap_ceiling_for(&authority));
+        Ok(Self {
+            id,
+            authority,
+            filesystem: ContainerFilesystem {
+                mounts,
+                shared_owner,
+            },
+            shared_owner,
+            default_credentials,
+            uts: spin::Mutex::new(ContainerUts {
+                hostname: UtsField::UNSET,
+                domainname: UtsField::UNSET,
+            }),
+            pids: PidNamespace::new(),
+            futex: FutexTable::new(),
+        })
+    }
+
     pub const fn id(&self) -> ContainerId {
         self.id
     }
@@ -2629,6 +2752,80 @@ async fn attach_container_mount<S: Storage>(
     spec: &ContainerMountSpec,
     container_authority: &mut ProcessAuthority,
 ) -> Result<ContainerMount<S>, ContainerError> {
+    if spec.sharing == ContainerMountSharing::EphemeralOverlay {
+        // An ephemeral overlay never mutates its read-only lower directory, so
+        // the caller only needs READ (plus EXECUTE when requested) on the lower
+        // path; writes stay in the container's private UserMemoryPool upper.
+        let lower_rights =
+            spec.rights & (DirectoryAuthorityRights::READ | DirectoryAuthorityRights::EXECUTE);
+        let preopen = caller_authority
+            .derive_directory_preopen(&spec.source_path, &spec.target_path, lower_rights)
+            .map_err(|source| ContainerError::Authority {
+                path: spec.source_path.clone(),
+                source,
+            })?;
+        let source = preopen.source_path();
+        let resolved = caller_namespace
+            .resolve_following(source, Follow::Within(source))
+            .await
+            .map_err(|error| ContainerError::Filesystem {
+                path: source.to_owned(),
+                error,
+            })?;
+        let metadata = resolved.fs().stat(resolved.path()).await.map_err(|error| {
+            ContainerError::Filesystem {
+                path: source.to_owned(),
+                error,
+            }
+        })?;
+        if metadata.kind != NodeKind::Directory {
+            return Err(ContainerError::NotADirectory {
+                path: source.to_owned(),
+            });
+        }
+        let pinned = PinnedLower::from_held(resolved.held()).map_err(|error| {
+            ContainerError::Filesystem {
+                path: source.to_owned(),
+                error,
+            }
+        })?;
+        let upper = MemoryFs::with_budget(
+            caller_namespace.table().allocate_device(),
+            caller_namespace.table().memory_storage(),
+        );
+        let overlay = OverlayFs::new(upper, pinned);
+        let grant = MountGrant {
+            rights: effective_fs_rights(
+                spec.rights,
+                FileSystemRights::READ | FileSystemRights::WRITE,
+            ),
+            sharing: MountSharing::Private,
+        };
+        let container_preopen = DirectoryPreopen::new(
+            spec.target_path.clone(),
+            spec.target_path.clone(),
+            spec.rights,
+        )
+        .map_err(|source| ContainerError::Authority {
+            path: spec.target_path.clone(),
+            source,
+        })?;
+        container_authority.insert_directory_preopen(container_preopen);
+        return Ok(ContainerMount {
+            target: spec.target_path.clone(),
+            backing: HeldPath::from_overlay(overlay, grant),
+            grant,
+            authority_rights: spec.rights,
+            _private_claim: None,
+        });
+    }
+
+    let requested_sharing = match spec.sharing {
+        ContainerMountSharing::Private => MountSharing::Private,
+        ContainerMountSharing::Shared => MountSharing::Shared,
+        ContainerMountSharing::EphemeralOverlay => unreachable!("handled above"),
+    };
+
     let preopen = caller_authority
         .derive_directory_preopen(&spec.source_path, &spec.target_path, spec.rights)
         .map_err(|source| ContainerError::Authority {
@@ -2668,14 +2865,14 @@ async fn attach_container_mount<S: Storage>(
             path: source.to_owned(),
         });
     }
-    if backing_grant.sharing != spec.sharing {
+    if backing_grant.sharing != requested_sharing {
         return Err(ContainerError::MountSharingMismatch {
             path: source.to_owned(),
             actual: backing_grant.sharing,
-            requested: spec.sharing,
+            requested: requested_sharing,
         });
     }
-    let private_claim = if spec.sharing == MountSharing::Private {
+    let private_claim = if requested_sharing == MountSharing::Private {
         match resolved.claim_private(container_id.raw()) {
             Ok(claim) => Some(claim),
             Err(PrivateMountClaimError::AlreadyClaimed) => {
@@ -2687,7 +2884,7 @@ async fn attach_container_mount<S: Storage>(
                 return Err(ContainerError::MountSharingMismatch {
                     path: source.to_owned(),
                     actual: backing_grant.sharing,
-                    requested: spec.sharing,
+                    requested: requested_sharing,
                 });
             }
         }
@@ -2708,7 +2905,7 @@ async fn attach_container_mount<S: Storage>(
 
     let grant = MountGrant {
         rights: effective_fs_rights(spec.rights, backing_grant.rights),
-        sharing: spec.sharing,
+        sharing: requested_sharing,
     };
     Ok(ContainerMount {
         target: spec.target_path.clone(),
@@ -2928,13 +3125,13 @@ mod tests {
                     source_path: String::from("/root-a"),
                     target_path: String::from("/"),
                     rights: RWX,
-                    sharing: MountSharing::Private,
+                    sharing: ContainerMountSharing::Private,
                 },
                 mounts: vec![ContainerMountSpec {
                     source_path: String::from("/shared"),
                     target_path: String::from("/data"),
                     rights: RX,
-                    sharing: MountSharing::Shared,
+                    sharing: ContainerMountSharing::Shared,
                 }],
                 shared_owner: SharedOwner {
                     uid: 1000,
@@ -2957,13 +3154,13 @@ mod tests {
                     source_path: String::from("/root-b"),
                     target_path: String::from("/"),
                     rights: RWX,
-                    sharing: MountSharing::Private,
+                    sharing: ContainerMountSharing::Private,
                 },
                 mounts: vec![ContainerMountSpec {
                     source_path: String::from("/shared"),
                     target_path: String::from("/shared"),
                     rights: RX,
-                    sharing: MountSharing::Shared,
+                    sharing: ContainerMountSharing::Shared,
                 }],
                 shared_owner: SharedOwner {
                     uid: 2000,
@@ -3087,7 +3284,7 @@ mod tests {
                     source_path: String::from("/root-a"),
                     target_path: String::from("/"),
                     rights: RWX,
-                    sharing: MountSharing::Private,
+                    sharing: ContainerMountSharing::Private,
                 },
                 mounts: Vec::new(),
                 shared_owner: SharedOwner { uid: 0, gid: 0 },
@@ -3115,7 +3312,7 @@ mod tests {
                     source_path: String::from("/root-a"),
                     target_path: String::from("/"),
                     rights: RWX,
-                    sharing: MountSharing::Private,
+                    sharing: ContainerMountSharing::Private,
                 },
                 mounts: Vec::new(),
                 shared_owner: SharedOwner { uid: 0, gid: 0 },
@@ -3150,7 +3347,7 @@ mod tests {
                     source_path: String::from("/ro"),
                     target_path: String::from("/"),
                     rights: RX,
-                    sharing: MountSharing::Private,
+                    sharing: ContainerMountSharing::Private,
                 },
                 mounts: Vec::new(),
                 shared_owner: SharedOwner { uid: 0, gid: 0 },
@@ -3175,7 +3372,7 @@ mod tests {
                     source_path: String::from("/priv"),
                     target_path: String::from("/"),
                     rights: RWX,
-                    sharing: MountSharing::Shared,
+                    sharing: ContainerMountSharing::Shared,
                 },
                 mounts: Vec::new(),
                 shared_owner: SharedOwner { uid: 0, gid: 0 },
@@ -3200,7 +3397,7 @@ mod tests {
                     source_path: String::from("/ro"),
                     target_path: String::from("/"),
                     rights: RWX,
-                    sharing: MountSharing::Shared,
+                    sharing: ContainerMountSharing::Shared,
                 },
                 mounts: Vec::new(),
                 shared_owner: SharedOwner { uid: 0, gid: 0 },
@@ -3227,7 +3424,7 @@ mod tests {
                     source_path: String::from("/priv"),
                     target_path: String::from("/"),
                     rights: RX,
-                    sharing: MountSharing::Private,
+                    sharing: ContainerMountSharing::Private,
                 },
                 mounts: Vec::new(),
                 shared_owner: SharedOwner { uid: 0, gid: 0 },
@@ -3257,7 +3454,7 @@ mod tests {
                     source_path: String::from("/noexec"),
                     target_path: String::from("/"),
                     rights: DirectoryAuthorityRights::READ,
-                    sharing: MountSharing::Shared,
+                    sharing: ContainerMountSharing::Shared,
                 },
                 mounts: Vec::new(),
                 shared_owner: SharedOwner { uid: 0, gid: 0 },
@@ -3351,13 +3548,13 @@ mod tests {
                     source_path: String::from("/root-a"),
                     target_path: String::from("/"),
                     rights: RWX,
-                    sharing: MountSharing::Private,
+                    sharing: ContainerMountSharing::Private,
                 },
                 mounts: vec![ContainerMountSpec {
                     source_path: String::from("/ro"),
                     target_path: String::from("/ro"),
                     rights: RX,
-                    sharing: MountSharing::Shared,
+                    sharing: ContainerMountSharing::Shared,
                 }],
                 shared_owner: SharedOwner { uid: 0, gid: 0 },
                 credentials: Credentials::root(),
@@ -3566,6 +3763,266 @@ mod tests {
                 .synthetic_etc_file("/etc/passwd", &resolvers)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn ephemeral_overlay_containers_share_readonly_lower_with_isolated_upper_and_direct_host_mounts()
+     {
+        let host_ns = test_namespace();
+        let ro = FileSystemRights::READ;
+        let rw = FileSystemRights::READ | FileSystemRights::WRITE;
+
+        let lower_img = mount_memory(&host_ns, "/root-a", ro, MountSharing::Shared);
+        let host_shared = mount_memory(&host_ns, "/shared", rw, MountSharing::Shared);
+        let payer = crate::StoragePayer::for_test();
+        block_on(async {
+            create_file(&lower_img, "conf", b"lower-v1").await;
+            create_file(&lower_img, "dropme", b"delete-in-a").await;
+            lower_img
+                .create_directory(FsPath::new("sub").unwrap(), 1, &payer)
+                .await
+                .unwrap();
+            create_file(&lower_img, "sub/old", b"hidden-by-opaque").await;
+            lower_img
+                .set_owner(FsPath::new("conf").unwrap(), Some(100), Some(101), 2)
+                .unwrap();
+            lower_img
+                .set_permissions(FsPath::new("conf").unwrap(), 0o4755, 3)
+                .unwrap();
+            lower_img
+                .set_xattr_unix(
+                    FsPath::new("conf").unwrap(),
+                    "security.capability",
+                    Bytes::from_static(b"cap-v2"),
+                    crate::vfs::XattrSetMode::Any,
+                    4,
+                )
+                .unwrap();
+        });
+
+        // Caller holds ONLY READ | EXECUTE on the read-only lower image (no WRITE!)
+        // and READ | WRITE | MUTATE_DIRECTORY on the host share.
+        let mut narrow_caller = ProcessAuthority::empty();
+        narrow_caller
+            .insert_directory_preopen(DirectoryPreopen::new("/root-a", "/root-a", RX).unwrap());
+        narrow_caller.insert_directory_preopen(
+            DirectoryPreopen::new(
+                "/shared",
+                "/shared",
+                DirectoryAuthorityRights::READ
+                    | DirectoryAuthorityRights::WRITE
+                    | DirectoryAuthorityRights::MUTATE_DIRECTORY,
+            )
+            .unwrap(),
+        );
+
+        let make_config = |host_name: &str| ContainerConfig {
+            root: ContainerMountSpec {
+                source_path: String::from("/root-a"),
+                target_path: String::from("/"),
+                rights: RWX,
+                sharing: ContainerMountSharing::EphemeralOverlay,
+            },
+            mounts: vec![ContainerMountSpec {
+                source_path: String::from("/shared"),
+                target_path: String::from("/work"),
+                rights: DirectoryAuthorityRights::READ
+                    | DirectoryAuthorityRights::WRITE
+                    | DirectoryAuthorityRights::MUTATE_DIRECTORY,
+                sharing: ContainerMountSharing::Shared,
+            }],
+            shared_owner: SharedOwner {
+                uid: 1000,
+                gid: 1000,
+            },
+            credentials: Credentials::root(),
+            hostname: UtsField::from_configured(host_name).unwrap(),
+            domainname: UtsField::UNSET,
+        };
+
+        // Two containers concurrently mount the exact same read-only lower tree.
+        let container_a = block_on(LinuxContainer::create(
+            ContainerId::new(NonZeroU64::new(501).unwrap()),
+            &narrow_caller,
+            &host_ns,
+            ProcessAuthority::empty(),
+            make_config("overlay-a"),
+        ))
+        .expect("container A creates over shared RO lower");
+        let container_b = block_on(LinuxContainer::create(
+            ContainerId::new(NonZeroU64::new(502).unwrap()),
+            &narrow_caller,
+            &host_ns,
+            ProcessAuthority::empty(),
+            make_config("overlay-b"),
+        ))
+        .expect("container B creates concurrently over same RO lower");
+
+        let root_creds = Credentials::root();
+        block_on(async {
+            // 1. Container A sees full Private Unix metadata & honours exec privileges.
+            let st_a = container_a.filesystem().stat("/conf").await.unwrap();
+            assert_eq!(st_a.unix.permissions, 0o4755);
+            assert_eq!(st_a.unix.uid, 100);
+            assert_eq!(st_a.unix.gid, 101);
+            assert!(st_a.flags.honours_exec_privileges());
+
+            // 2. Container A mutates its upper: modifies /conf, unlinks /dropme,
+            //    replaces /sub with an opaque dir, and writes a new suid + xattr file.
+            let trunc_open = OpenRequest {
+                read: true,
+                write: true,
+                create: false,
+                exclusive: false,
+                truncate: true,
+                directory: false,
+                nofollow: false,
+                path_only: false,
+                append: false,
+                sync: false,
+                dsync: false,
+                mode: 0o644,
+                umask: 0,
+            };
+            container_a
+                .filesystem()
+                .open_at("/", "/conf", trunc_open, &root_creds, 10, &payer)
+                .await
+                .unwrap();
+            let landed = container_a
+                .filesystem()
+                .write_at(
+                    "/conf",
+                    WritePosition::At(0),
+                    b"upper-a",
+                    &root_creds,
+                    11,
+                    &payer,
+                )
+                .await
+                .unwrap();
+            assert_eq!(landed.len, 7);
+
+            container_a
+                .filesystem()
+                .unlink_at("/", "/dropme", false, &root_creds, 12, &payer)
+                .await
+                .unwrap();
+            container_a
+                .filesystem()
+                .unlink_at("/", "/sub/old", false, &root_creds, 13, &payer)
+                .await
+                .unwrap();
+            container_a
+                .filesystem()
+                .unlink_at("/", "/sub", true, &root_creds, 14, &payer)
+                .await
+                .unwrap();
+            container_a
+                .filesystem()
+                .mkdir_at("/", "/sub", 0o755, 0, &root_creds, 15, &payer)
+                .await
+                .unwrap();
+
+            // 3. Container A writes persistent data through direct host bind mount `/work`.
+            let create_open = OpenRequest {
+                create: true,
+                ..trunc_open
+            };
+            container_a
+                .filesystem()
+                .open_at(
+                    "/",
+                    "/work/persisted.txt",
+                    create_open,
+                    &root_creds,
+                    16,
+                    &payer,
+                )
+                .await
+                .unwrap();
+            let cjk = "日本語 한국어 中文".as_bytes();
+            container_a
+                .filesystem()
+                .write_at(
+                    "/work/persisted.txt",
+                    WritePosition::At(0),
+                    cjk,
+                    &root_creds,
+                    17,
+                    &payer,
+                )
+                .await
+                .unwrap();
+
+            // 4. Container B is completely isolated from A's upper mutations,
+            //    yet sees A's direct host write on `/work/persisted.txt` immediately.
+            assert!(matches!(
+                container_a.filesystem().stat("/dropme").await,
+                Err(FsError::NoEntry)
+            ));
+            assert!(matches!(
+                container_a.filesystem().stat("/sub/old").await,
+                Err(FsError::NoEntry)
+            ));
+            assert!(container_b.filesystem().stat("/dropme").await.is_ok());
+            assert!(container_b.filesystem().stat("/sub/old").await.is_ok());
+            let b_conf = container_b
+                .filesystem()
+                .read_executable("/conf")
+                .await
+                .unwrap();
+            assert!(
+                matches!(b_conf, FileContents::Written(bytes) if bytes.as_ref() == b"lower-v1")
+            );
+            let b_read = container_b
+                .filesystem()
+                .read_at("/work/persisted.txt", 0, 64)
+                .await
+                .unwrap();
+            assert_eq!(b_read.as_ref(), cjk);
+
+            // 5. Lower image was never written to.
+            let lower_conf = lower_img
+                .read_at(FsPath::new("conf").unwrap(), 0, 64)
+                .await
+                .unwrap();
+            assert_eq!(lower_conf.as_ref(), b"lower-v1");
+            assert!(lower_img.stat(FsPath::new("dropme").unwrap()).await.is_ok());
+            assert!(
+                lower_img
+                    .stat(FsPath::new("sub/old").unwrap())
+                    .await
+                    .is_ok()
+            );
+
+            // 6. Unmounting `/root-a` is refused while overlays hold it, and succeeds
+            //    once both containers drop; `/shared/persisted.txt` persists on host.
+            let root_auth = ProcessAuthority::root();
+            assert!(
+                host_ns
+                    .unmount(&root_auth.derive_unmount_cap("/root-a").unwrap())
+                    .await
+                    .is_err()
+            );
+            drop(container_a);
+            assert!(
+                host_ns
+                    .unmount(&root_auth.derive_unmount_cap("/root-a").unwrap())
+                    .await
+                    .is_err()
+            );
+            drop(container_b);
+            host_ns
+                .unmount(&root_auth.derive_unmount_cap("/root-a").unwrap())
+                .await
+                .expect("unmount succeeds once overlays drop");
+            let host_persisted = host_shared
+                .read_at(FsPath::new("persisted.txt").unwrap(), 0, 64)
+                .await
+                .unwrap();
+            assert_eq!(host_persisted.as_ref(), cjk);
+        });
     }
 }
 
@@ -4449,7 +4906,15 @@ mod private_btrfs_tests {
         ) -> Result<(), FsOpError> {
             self.container
                 .filesystem()
-                .remove_xattr_at(cwd, path, follow, name, creds, self.now)
+                .remove_xattr_at(
+                    cwd,
+                    path,
+                    follow,
+                    name,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await
         }
         async fn remove_xattr_file(
@@ -4460,7 +4925,13 @@ mod private_btrfs_tests {
         ) -> Result<(), FsOpError> {
             self.container
                 .filesystem()
-                .remove_xattr_resolved(&file.path, name, creds, self.now)
+                .remove_xattr_resolved(
+                    &file.path,
+                    name,
+                    creds,
+                    self.now,
+                    &crate::StoragePayer::for_test(),
+                )
                 .await
         }
     }
@@ -4601,20 +5072,20 @@ mod private_btrfs_tests {
                             source_path: String::from("/priv"),
                             target_path: String::from("/"),
                             rights: RWX,
-                            sharing: MountSharing::Private,
+                            sharing: ContainerMountSharing::Private,
                         },
                         mounts: vec![
                             ContainerMountSpec {
                                 source_path: String::from("/ro_priv"),
                                 target_path: String::from("/ro"),
                                 rights: RX,
-                                sharing: MountSharing::Private,
+                                sharing: ContainerMountSharing::Private,
                             },
                             ContainerMountSpec {
                                 source_path: String::from("/shared"),
                                 target_path: String::from("/shared"),
                                 rights: RWX,
-                                sharing: MountSharing::Shared,
+                                sharing: ContainerMountSharing::Shared,
                             },
                         ],
                         shared_owner: SharedOwner { uid: 0, gid: 0 },

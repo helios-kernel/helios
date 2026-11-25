@@ -1191,8 +1191,8 @@ fn real_workspace_inspector_system_wit_world_generates_and_streams_child_stdio()
     use system_wit::InspectorSystemClient;
     use system_wit::helios::system::programs::{
         self, AotRequest, AotResult, ChildTermination, ContainerConfig, ContainerExecRequest,
-        ContainerSpawnRequest, ExecError, ExecOutput, ExecRequest, ExecResult, ExitStatus,
-        SpawnError, SpawnRequest,
+        ContainerSpawnRequest, DefaultLinuxImage, ExecError, ExecOutput, ExecRequest, ExecResult,
+        ExitStatus, InheritedSocket, SpawnError, SpawnRequest,
     };
 
     struct MockChild {
@@ -1205,6 +1205,8 @@ fn real_workspace_inspector_system_wit_world_generates_and_streams_child_stdio()
         type Child = MockChild;
         type Container = ();
         type Endpoint = ();
+        type TcpListener = ();
+        type VsockListener = ();
 
         async fn child_stdin(
             &self,
@@ -1236,6 +1238,10 @@ fn real_workspace_inspector_system_wit_world_generates_and_streams_child_stdio()
             (StreamReader::empty(), FutureReader::ready(Ok(())))
         }
 
+        async fn child_signal(&self, _self_: &Self::Child, _signal: u8) -> Result<(), SpawnError> {
+            Ok(())
+        }
+
         async fn child_wait(&self, self_: &Self::Child) -> Result<ExitStatus, SpawnError> {
             Ok(ExitStatus {
                 instance_id: self_.id,
@@ -1246,7 +1252,7 @@ fn real_workspace_inspector_system_wit_world_generates_and_streams_child_stdio()
         async fn container_spawn(
             &self,
             _self_: &Self::Container,
-            _request: ContainerSpawnRequest,
+            _request: ContainerSpawnRequest<Self::TcpListener, Self::VsockListener>,
         ) -> Result<Self::Child, SpawnError> {
             Ok(MockChild { id: 2 })
         }
@@ -1259,6 +1265,23 @@ fn real_workspace_inspector_system_wit_world_generates_and_streams_child_stdio()
             unreachable!()
         }
 
+        async fn set_default_image(
+            &self,
+            _image: Option<DefaultLinuxImage>,
+        ) -> Result<(), SpawnError> {
+            Ok(())
+        }
+
+        async fn get_default_image(&self) -> Option<DefaultLinuxImage> {
+            None
+        }
+
+        async fn take_inherited_sockets(
+            &self,
+        ) -> Vec<InheritedSocket<Self::TcpListener, Self::VsockListener>> {
+            Vec::new()
+        }
+
         async fn create_container(
             &self,
             _config: ContainerConfig<Self::Endpoint>,
@@ -1268,7 +1291,7 @@ fn real_workspace_inspector_system_wit_world_generates_and_streams_child_stdio()
 
         async fn spawn(
             &self,
-            request: SpawnRequest<Self::Endpoint>,
+            request: SpawnRequest<Self::Endpoint, Self::TcpListener, Self::VsockListener>,
         ) -> Result<Self::Child, SpawnError> {
             assert_eq!(request.name, "nu");
             Ok(MockChild { id: 42 })
@@ -1311,6 +1334,8 @@ fn real_workspace_inspector_system_wit_world_generates_and_streams_child_stdio()
                     args: vec!["-c".to_owned(), "ls".to_owned()],
                     env: Vec::new(),
                     path: "/bin/nu".to_owned(),
+                    cwd: None,
+                    sockets: Vec::new(),
                     capability_grants: Vec::new(),
                 })
                 .await

@@ -62,6 +62,12 @@ pub struct TcpStream {
     timeout: Duration,
 }
 
+/// Bound listening TCP socket backed by the kernel network service.
+pub struct TcpListener {
+    raw: raw::TcpListener,
+    timeout: Duration,
+}
+
 /// Bound UDP socket backed by the kernel network service.
 pub struct UdpSocket {
     raw: raw::UdpSocket,
@@ -147,6 +153,80 @@ impl TcpStream {
     }
 }
 
+impl TcpListener {
+    /// Binds a TCP listener to `local_address:local_port` (`0` requests an
+    /// ephemeral port).
+    pub async fn listen(
+        local_address: IpAddress,
+        local_port: u16,
+        backlog: u16,
+    ) -> io::Result<Self> {
+        let raw = raw::tcp_listen(local_address, local_port, backlog)
+            .await
+            .map_err(map_tcp_error)?;
+        Ok(Self {
+            raw,
+            timeout: DEFAULT_TCP_TIMEOUT,
+        })
+    }
+
+    /// Wraps a raw WIT `tcp-listener` resource (e.g. from `take_inherited_sockets`).
+    pub fn from_raw(raw: raw::TcpListener) -> Self {
+        Self {
+            raw,
+            timeout: DEFAULT_TCP_TIMEOUT,
+        }
+    }
+
+    /// Unwraps the underlying WIT `tcp-listener` resource for transfer into a
+    /// spawned child via `InheritedSocket::Tcp`.
+    pub fn into_raw(self) -> raw::TcpListener {
+        self.raw
+    }
+
+    /// Returns the local IP address and port this listener is bound to.
+    pub fn local_address(&self) -> (IpAddress, u16) {
+        self.raw.local_address()
+    }
+
+    /// Returns a copy of the current default operation timeout.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Replaces the default timeout used by [`accept`](Self::accept).
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
+    }
+
+    /// Waits up to `timeout` for an incoming connection to be queued without
+    /// consuming it. Returns `Ok(true)` when ready or `Ok(false)` on timeout.
+    pub async fn wait_readable(&self, timeout: Duration) -> io::Result<bool> {
+        self.raw
+            .wait_readable(duration_to_nanos(timeout))
+            .await
+            .map_err(map_tcp_error)
+    }
+
+    /// Accepts the next incoming TCP connection.
+    pub async fn accept(&self) -> io::Result<TcpStream> {
+        let raw = self
+            .raw
+            .accept(duration_to_nanos(self.timeout))
+            .await
+            .map_err(map_tcp_error)?;
+        Ok(TcpStream {
+            raw,
+            timeout: self.timeout,
+        })
+    }
+
+    /// Releases the bound TCP listener immediately.
+    pub async fn close(&self) -> io::Result<()> {
+        self.raw.close().await.map_err(map_tcp_error)
+    }
+}
+
 impl UdpSocket {
     /// Binds a UDP socket to `local_port` using the default operation timeout.
     pub async fn bind(local_port: u16) -> io::Result<Self> {
@@ -226,6 +306,8 @@ fn map_tcp_error(error: raw::TcpError) -> io::Error {
         TcpErrorKind::ConnectionReset => io::ErrorKind::ConnectionReset,
         TcpErrorKind::ConnectionAborted => io::ErrorKind::ConnectionAborted,
         TcpErrorKind::UnresolvedHost => io::ErrorKind::NotFound,
+        TcpErrorKind::PermissionDenied => io::ErrorKind::PermissionDenied,
+        TcpErrorKind::AddressInUse => io::ErrorKind::AddrInUse,
         TcpErrorKind::Unavailable => io::ErrorKind::ConnectionAborted,
         TcpErrorKind::Internal => io::ErrorKind::Other,
     };

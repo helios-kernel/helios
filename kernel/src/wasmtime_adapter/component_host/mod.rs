@@ -317,6 +317,15 @@ macro_rules! impl_program_bindings {
                 }
                 #[cfg(feature = "linux")]
                 {
+                    let $bindings::helios::system::programs::ContainerSpawnRequest {
+                        name,
+                        args,
+                        env,
+                        path,
+                        cwd,
+                        sockets,
+                        credentials,
+                    } = request;
                     let snapshot = accessor.with(|mut access| {
                         let service = access.get().runtime_state.program_service();
                         let context = ProgramExecContext::from_store(access.get());
@@ -333,19 +342,84 @@ macro_rules! impl_program_bindings {
                             }
                             None => None,
                         };
+                        let mut extracted_sockets = Vec::with_capacity(sockets.len());
+                        let mut socket_error: Option<ProgramExecError> = None;
+                        for socket in sockets {
+                            match socket {
+                                $bindings::helios::system::programs::InheritedSocket::Tcp(res) => {
+                                    let mut listener = access
+                                        .get()
+                                        .table
+                                        .delete(res)
+                                        .map_err(wasmtime::Error::from)?;
+                                    if socket_error.is_none() {
+                                        match crate::InheritedSocket::from_tcp_listener(
+                                            &mut listener,
+                                        ) {
+                                            Some(inherited) => extracted_sockets.push(inherited),
+                                            None => {
+                                                socket_error = Some(ProgramExecError {
+                                                    kind: ProgramExecErrorKind::Unavailable,
+                                                    detail:
+                                                        ProgramExecErrorDetail::HostOperationFailed,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                                $bindings::helios::system::programs::InheritedSocket::Vsock(
+                                    res,
+                                ) => {
+                                    let mut listener = access
+                                        .get()
+                                        .table
+                                        .delete(res)
+                                        .map_err(wasmtime::Error::from)?;
+                                    if socket_error.is_none() {
+                                        match listener.take() {
+                                            Some((vsock_service, id)) => {
+                                                extracted_sockets.push(
+                                                    crate::InheritedSocket::from_vsock_listener(
+                                                        vsock_service,
+                                                        id,
+                                                    ),
+                                                );
+                                            }
+                                            None => {
+                                                socket_error = Some(ProgramExecError {
+                                                    kind: ProgramExecErrorKind::Unavailable,
+                                                    detail:
+                                                        ProgramExecErrorDetail::HostOperationFailed,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let inherited_sockets = match socket_error {
+                            Some(error) => Err(error),
+                            None => Ok(crate::InheritedSockets::from_vec(extracted_sockets)),
+                        };
                         Ok::<_, wasmtime::Error>((
                             service,
                             context,
                             caller_authority,
                             cpu,
                             resolved_container,
+                            inherited_sockets,
                         ))
                     });
                     async move {
-                        let (service, context, caller_authority, cpu, resolved_container) =
-                            snapshot?;
-                        let mut launch =
-                            phases::Trace::begin(cpu, "container-spawn", &request.path);
+                        let (
+                            service,
+                            context,
+                            caller_authority,
+                            cpu,
+                            resolved_container,
+                            inherited_sockets,
+                        ) = snapshot?;
+                        let mut launch = phases::Trace::begin(cpu, "container-spawn", &path);
                         let (Some(service), Some(container_result)) =
                             (service, resolved_container)
                         else {
@@ -360,6 +434,13 @@ macro_rules! impl_program_bindings {
                             launch.refused(error.kind);
                             return Ok(Err($convert_error(error)));
                         }
+                        let inherited_sockets = match inherited_sockets {
+                            Ok(sockets) => sockets,
+                            Err(error) => {
+                                launch.refused(error.kind);
+                                return Ok(Err($convert_error(error)));
+                            }
+                        };
                         let container = match container_result {
                             Ok(container) => container,
                             Err(error) => {
@@ -367,8 +448,7 @@ macro_rules! impl_program_bindings {
                                 return Ok(Err($convert_error(error)));
                             }
                         };
-                        let credentials = match request
-                            .credentials
+                        let credentials = match credentials
                             .map($convert_container_credentials)
                             .transpose()
                         {
@@ -381,13 +461,15 @@ macro_rules! impl_program_bindings {
                         let spawned = match service
                             .spawn_in_container(
                                 context,
-                                &request.path,
+                                &path,
                                 service::ProgramLaunch::in_container(
-                                    ProgramArgv::launched(request.name, request.args),
-                                    request.env,
+                                    ProgramArgv::launched(name, args),
+                                    env,
                                     container,
                                     credentials,
                                 )
+                                .with_cwd(cwd)
+                                .with_inherited_sockets(inherited_sockets)
                                 .with_timeline(launch.timeline().for_task()),
                             )
                             .await
@@ -516,6 +598,7 @@ macro_rules! impl_program_bindings {
                                     container,
                                     credentials,
                                 )
+                                .with_cwd(request.cwd)
                                 .with_timeline(launch.timeline().clone()),
                             )
                             .await;
@@ -555,6 +638,35 @@ macro_rules! impl_program_bindings {
             ) -> wasmtime::Result<()> {
                 let _ = access.get().table.delete(child)?;
                 Ok(())
+            }
+
+            fn signal(
+                mut access: Access<'_, U, Self>,
+                child: wasmtime::component::Resource<ChildHandle>,
+                signal: u8,
+            ) -> wasmtime::Result<Result<(), $bindings::helios::system::programs::SpawnError>> {
+                let caller_authority = access.get().process_authority().clone();
+                if let Err(error) = caller_authority
+                    .derive_signal_authority()
+                    .map_err(map_process_authority_error)
+                {
+                    return Ok(Err($convert_error(error)));
+                }
+                let Some(sig) = helios_unix::Signal::new(signal) else {
+                    return Ok(Err($bindings::helios::system::programs::SpawnError {
+                        kind: $bindings::helios::system::programs::SpawnErrorKind::InvalidHint,
+                        detail: alloc::format!(
+                            "invalid POSIX signal number {signal}; expected 1..=64"
+                        ),
+                    }));
+                };
+                let handle = access
+                    .get()
+                    .table
+                    .get(&child)
+                    .map_err(wasmtime::Error::from)?;
+                handle.signal(sig);
+                Ok(Ok(()))
             }
 
             async fn wait(
@@ -736,6 +848,174 @@ macro_rules! impl_program_bindings {
             Net: ComponentHostNetwork,
             StorageImpl: crate::Storage,
         {
+            fn set_default_image(
+                accessor: &Accessor<U, Self>,
+                image: Option<$bindings::helios::system::programs::DefaultLinuxImage>,
+            ) -> impl core::future::Future<
+                Output = wasmtime::Result<
+                    Result<(), $bindings::helios::system::programs::SpawnError>,
+                >,
+            > + Send {
+                async move {
+                    let Some(image) = image else {
+                        accessor.with(|mut access| {
+                            access.get().set_default_linux_image(None);
+                        });
+                        return Ok(Ok(()));
+                    };
+                    let absolute = match crate::resolve_guest_path("/", &image.root_path) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            return Ok(Err($convert_error(map_program_host_error(
+                                ProgramHostOperation::ReadSpawnSource,
+                                map_component_fs_path_error_to_wasmtime(error),
+                            ))));
+                        }
+                    };
+                    let credentials = match image.credentials {
+                        Some(creds) => {
+                            if creds.supplementary_groups.len() > 65_536 {
+                                return Ok(Err($bindings::helios::system::programs::SpawnError {
+                                    kind:
+                                        $bindings::helios::system::programs::SpawnErrorKind::InvalidPath,
+                                    detail: "too many supplementary groups in default-linux-image credentials".to_owned(),
+                                }));
+                            }
+                            Some(crate::DefaultLinuxCredentials {
+                                uid: creds.uid,
+                                gid: creds.gid,
+                                supplementary_groups: creds.supplementary_groups,
+                            })
+                        }
+                        None => None,
+                    };
+                    let (caller_authority, caller_namespace) = accessor.with(|mut access| {
+                        let store = access.get();
+                        (store.process_authority().clone(), store.filesystem().clone())
+                    });
+                    if let Err(error) = caller_authority
+                        .derive_directory_cap(
+                            &absolute,
+                            &absolute,
+                            DirectoryAuthorityRights::READ | DirectoryAuthorityRights::EXECUTE,
+                        )
+                        .map_err(map_process_authority_error)
+                    {
+                        return Ok(Err($convert_error(error)));
+                    }
+                    let held = {
+                        let floor = caller_authority
+                            .program_load_floor(&absolute)
+                            .unwrap_or(&absolute);
+                        let resolved = match caller_namespace
+                            .resolve_following(&absolute, crate::Follow::Within(floor))
+                            .await
+                        {
+                            Ok(resolved) => resolved,
+                            Err(error) => {
+                                return Ok(Err($convert_error(
+                                    ProgramExecError::from_source_read_error(error),
+                                )));
+                            }
+                        };
+                        resolved.held()
+                    };
+                    let metadata = match helios_hal::fs::FileSystem::stat(
+                        held.resolved().fs(),
+                        held.resolved().path(),
+                    )
+                    .await
+                    {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            return Ok(Err($convert_error(
+                                ProgramExecError::from_source_read_error(error),
+                            )));
+                        }
+                    };
+                    if metadata.kind != helios_hal::fs::NodeKind::Directory {
+                        return Ok(Err($bindings::helios::system::programs::SpawnError {
+                            kind: $bindings::helios::system::programs::SpawnErrorKind::InvalidPath,
+                            detail: alloc::format!(
+                                "default Linux image root `{absolute}` is not a directory"
+                            ),
+                        }));
+                    }
+                    if let Err(error) = crate::PinnedLower::from_held(held.clone()) {
+                        return Ok(Err($convert_error(
+                            ProgramExecError::from_source_read_error(error),
+                        )));
+                    }
+                    let pinned = crate::DefaultLinuxImage {
+                        root_path: absolute,
+                        lower: held,
+                        env: image.env,
+                        credentials,
+                    };
+                    accessor.with(|mut access| {
+                        access.get().set_default_linux_image(Some(pinned));
+                    });
+                    Ok(Ok(()))
+                }
+            }
+
+            fn get_default_image(
+                mut access: Access<'_, U, Self>,
+            ) -> wasmtime::Result<Option<$bindings::helios::system::programs::DefaultLinuxImage>>
+            {
+                Ok(access.get().default_linux_image().map(|img| {
+                    $bindings::helios::system::programs::DefaultLinuxImage {
+                        root_path: img.root_path,
+                        env: img.env,
+                        credentials: img.credentials.map(|creds| {
+                            $bindings::helios::system::programs::ContainerCredentials {
+                                uid: creds.uid,
+                                gid: creds.gid,
+                                supplementary_groups: creds.supplementary_groups,
+                            }
+                        }),
+                    }
+                }))
+            }
+
+            fn take_inherited_sockets(
+                mut access: Access<'_, U, Self>,
+            ) -> wasmtime::Result<Vec<$bindings::helios::system::programs::InheritedSocket>> {
+                let store = access.get();
+                let raw_sockets = store.inherited_sockets().take_all();
+                let retire = store.retirement.sender();
+                let mut result = Vec::with_capacity(raw_sockets.len());
+                for mut sock in raw_sockets {
+                    if let Some((raw, local_address, local_port, hop_limit)) = sock.take_tcp() {
+                        let res = store
+                            .table
+                            .push(crate::ComponentTcpListener::new(
+                                raw,
+                                local_address,
+                                local_port,
+                                hop_limit,
+                                retire.clone(),
+                            ))
+                            .map_err(wasmtime::Error::from)?;
+                        result.push($bindings::helios::system::programs::InheritedSocket::Tcp(
+                            res,
+                        ));
+                    } else if let Some((vsock_service, listener_id)) = sock.take_vsock() {
+                        let res = store
+                            .table
+                            .push(vsock::ComponentVsockListener::new(
+                                vsock_service,
+                                listener_id,
+                            ))
+                            .map_err(wasmtime::Error::from)?;
+                        result.push(
+                            $bindings::helios::system::programs::InheritedSocket::Vsock(res),
+                        );
+                    }
+                }
+                Ok(result)
+            }
+
             fn create_container(
                 accessor: &Accessor<U, Self>,
                 config: $bindings::helios::system::programs::ContainerConfig,
@@ -873,10 +1153,65 @@ macro_rules! impl_program_bindings {
                     args,
                     env,
                     path,
+                    cwd,
+                    sockets,
                     capability_grants,
                 } = request;
                 let snapshot = accessor.with(|mut access| {
                     let extracted = $extract_grants(&mut access.get().table, capability_grants)?;
+                    let mut extracted_sockets = Vec::with_capacity(sockets.len());
+                    let mut socket_error: Option<ProgramExecError> = None;
+                    for socket in sockets {
+                        match socket {
+                            $bindings::helios::system::programs::InheritedSocket::Tcp(res) => {
+                                let mut listener = access
+                                    .get()
+                                    .table
+                                    .delete(res)
+                                    .map_err(wasmtime::Error::from)?;
+                                if socket_error.is_none() {
+                                    match crate::InheritedSocket::from_tcp_listener(&mut listener) {
+                                        Some(inherited) => extracted_sockets.push(inherited),
+                                        None => {
+                                            socket_error = Some(ProgramExecError {
+                                                kind: ProgramExecErrorKind::Unavailable,
+                                                detail: ProgramExecErrorDetail::HostOperationFailed,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            $bindings::helios::system::programs::InheritedSocket::Vsock(res) => {
+                                let mut listener = access
+                                    .get()
+                                    .table
+                                    .delete(res)
+                                    .map_err(wasmtime::Error::from)?;
+                                if socket_error.is_none() {
+                                    match listener.take() {
+                                        Some((vsock_service, id)) => {
+                                            extracted_sockets.push(
+                                                crate::InheritedSocket::from_vsock_listener(
+                                                    vsock_service,
+                                                    id,
+                                                ),
+                                            );
+                                        }
+                                        None => {
+                                            socket_error = Some(ProgramExecError {
+                                                kind: ProgramExecErrorKind::Unavailable,
+                                                detail: ProgramExecErrorDetail::HostOperationFailed,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let inherited_sockets = match socket_error {
+                        Some(error) => Err(error),
+                        None => Ok(crate::InheritedSockets::from_vec(extracted_sockets)),
+                    };
                     Ok::<_, wasmtime::Error>((
                         access.get().runtime_state.program_service(),
                         ProgramExecContext::from_store(access.get()),
@@ -887,7 +1222,9 @@ macro_rules! impl_program_bindings {
                         // caller's: it sees the caller's mounts, and its
                         // own stay its own.
                         access.get().filesystem().descend(),
+                        access.get().default_linux_image(),
                         extracted,
+                        inherited_sockets,
                     ))
                 });
                 async move {
@@ -898,7 +1235,9 @@ macro_rules! impl_program_bindings {
                         caller_id,
                         cpu,
                         namespace,
+                        caller_default_image,
                         (non_ipc_grants, ipc_result, _),
+                        inherited_sockets,
                     ) = snapshot?;
                     let mut launch = phases::Trace::begin(cpu, "spawn", &path);
                     let Some(service) = service else {
@@ -922,13 +1261,20 @@ macro_rules! impl_program_bindings {
                             return Ok(Err($convert_error(error)));
                         }
                     };
+                    let inherited_sockets = match inherited_sockets {
+                        Ok(sockets) => sockets,
+                        Err(error) => {
+                            launch.refused(error.kind);
+                            return Ok(Err($convert_error(error)));
+                        }
+                    };
                     let compile_authority = CompileAuthority::from(&spawn_authority);
                     let child_instance = context.instance_registry().register_child(
                         context.parent_instance_id(),
                         name.clone(),
                         context.now_uptime_nanos(),
                     );
-                    let child_authority = match $build_authority(
+                    let mut child_authority = match $build_authority(
                         &caller_authority,
                         caller_id,
                         Some(child_instance.id()),
@@ -941,8 +1287,90 @@ macro_rules! impl_program_bindings {
                             return Ok(Err($convert_error(error)));
                         }
                     };
-                    let source =
-                        match read_program_source(accessor, &path, &caller_authority).await {
+                    let host_read = read_program_source(accessor, &path, &caller_authority).await;
+                    #[cfg_attr(
+                        not(feature = "linux"),
+                        expect(
+                            unused_mut,
+                            reason = "argv is mutated by host #! shebang rewriting when the linux feature is enabled"
+                        )
+                    )]
+                    let mut argv = ProgramArgv::launched(name, args);
+                    let use_default_overlay = match &host_read {
+                        Ok(Ok(source)) => !source.is_wasm() && caller_default_image.is_some(),
+                        _ => caller_default_image.is_some(),
+                    };
+                    #[cfg(feature = "linux")]
+                    let spawned = if use_default_overlay {
+                        let default_image = caller_default_image
+                            .clone()
+                            .expect("use_default_overlay implies Some");
+                        let fallback_bytes = match host_read {
+                            Ok(Ok(ProgramSource::LinuxElf(bytes))) => Some(bytes),
+                            Ok(Ok(ProgramSource::RawWasm(bytes)))
+                                if service::parse_shebang(&bytes).is_some() =>
+                            {
+                                Some(bytes)
+                            }
+                            _ => None,
+                        };
+                        let container = match service.create_ephemeral_overlay_container(
+                            child_authority,
+                            &namespace,
+                            &default_image,
+                        ) {
+                            Ok(container) => container,
+                            Err(error) => {
+                                launch.refused(error.kind);
+                                return Ok(Err($convert_error(error)));
+                            }
+                        };
+                        accessor.with(|mut access| {
+                            access.get().runtime_state.register_container(&container);
+                        });
+                        let merged_env = service::merge_default_image_env(&default_image.env, env);
+                        match service
+                            .spawn_in_overlay_container(
+                                context,
+                                &path,
+                                fallback_bytes,
+                                service::ProgramLaunch::in_container(argv, merged_env, container, None)
+                                    .with_launched_instance(child_instance)
+                                    .with_ipc_grants(ipc_grants)
+                                    .with_default_linux_image(caller_default_image)
+                                    .with_inherited_sockets(inherited_sockets)
+                                    .with_cwd(cwd)
+                                    .with_timeline(launch.timeline().for_task()),
+                            )
+                            .await
+                        {
+                            Ok(child) => {
+                                launch.set_instance(child.instance_id);
+                                launch.disarm();
+                                let handle = accessor.with(|mut access| {
+                                    access
+                                        .get()
+                                        .table
+                                        .push(child)
+                                        .map_err(wasmtime::Error::from)
+                                })?;
+                                Ok(Ok(handle))
+                            }
+                            Err(error) => {
+                                launch.exit_error(&error);
+                                Ok(Err($convert_error(error)))
+                            }
+                        }
+                    } else {
+                        let resolved_cwd =
+                            match apply_requested_cwd(&mut child_authority, &namespace, cwd.as_deref()).await {
+                                Ok(resolved_cwd) => resolved_cwd,
+                                Err(error) => {
+                                    launch.refused(error.kind);
+                                    return Ok(Err($convert_error(error)));
+                                }
+                            };
+                        let initial_source = match host_read {
                             Ok(Ok(source)) => source,
                             Ok(Err(error)) => {
                                 launch.exit_error(&error);
@@ -957,44 +1385,128 @@ macro_rules! impl_program_bindings {
                                 return Ok(Err($convert_error(error)));
                             }
                         };
-                    launch.record(LaunchPhase::SourceRead);
-                    launch.record_source_bytes(source.payload_len());
-                    let spawned = match service
-                        .spawn(
-                            &compile_authority,
-                            context,
-                            source,
-                            None,
-                            service::ProgramLaunch::new(
-                                ProgramArgv::launched(name, args),
-                                env,
-                                child_authority,
-                                Some(namespace),
-                            )
-                            .with_launched_instance(child_instance)
-                            .with_ipc_grants(ipc_grants)
-                            .with_timeline(launch.timeline().for_task()),
+                        let source = match resolve_host_shebang_source(
+                            accessor,
+                            &path,
+                            &caller_authority,
+                            initial_source,
+                            &mut argv,
+                            ProgramHostOperation::ReadSpawnSource,
                         )
                         .await
-                    {
-                        Ok(child) => {
-                            launch.set_instance(child.instance_id);
-                            // The child's run task owns the line from
-                            // here — even a handle-push failure below is
-                            // the reply's problem, not the launch's.
-                            launch.disarm();
-                            let handle = accessor.with(|mut access| {
-                                access
-                                    .get()
-                                    .table
-                                    .push(child)
-                                    .map_err(wasmtime::Error::from)
-                            })?;
-                            Ok(Ok(handle))
+                        {
+                            Ok(source) => source,
+                            Err(error) => {
+                                launch.exit_error(&error);
+                                return Ok(Err($convert_error(error)));
+                            }
+                        };
+                        launch.record(LaunchPhase::SourceRead);
+                        launch.record_source_bytes(source.payload_len());
+                        match service
+                            .spawn(
+                                &compile_authority,
+                                context,
+                                source,
+                                None,
+                                service::ProgramLaunch::new(
+                                    argv,
+                                    env,
+                                    child_authority,
+                                    Some(namespace),
+                                )
+                                .with_launched_instance(child_instance)
+                                .with_ipc_grants(ipc_grants)
+                                .with_default_linux_image(caller_default_image)
+                                .with_inherited_sockets(inherited_sockets)
+                                .with_cwd(resolved_cwd)
+                                .with_timeline(launch.timeline().for_task()),
+                            )
+                            .await
+                        {
+                            Ok(child) => {
+                                launch.set_instance(child.instance_id);
+                                launch.disarm();
+                                let handle = accessor.with(|mut access| {
+                                    access
+                                        .get()
+                                        .table
+                                        .push(child)
+                                        .map_err(wasmtime::Error::from)
+                                })?;
+                                Ok(Ok(handle))
+                            }
+                            Err(error) => {
+                                launch.exit_error(&error);
+                                Ok(Err($convert_error(error)))
+                            }
                         }
-                        Err(error) => {
-                            launch.exit_error(&error);
-                            Ok(Err($convert_error(error)))
+                    };
+                    #[cfg(not(feature = "linux"))]
+                    let spawned = {
+                        let _ = use_default_overlay;
+                        let resolved_cwd =
+                            match apply_requested_cwd(&mut child_authority, &namespace, cwd.as_deref()).await {
+                                Ok(resolved_cwd) => resolved_cwd,
+                                Err(error) => {
+                                    launch.refused(error.kind);
+                                    return Ok(Err($convert_error(error)));
+                                }
+                            };
+                        let source = match host_read {
+                            Ok(Ok(source)) => source,
+                            Ok(Err(error)) => {
+                                launch.exit_error(&error);
+                                return Ok(Err($convert_error(error)));
+                            }
+                            Err(error) => {
+                                let error = map_program_host_error(
+                                    ProgramHostOperation::ReadSpawnSource,
+                                    error,
+                                );
+                                launch.exit_error(&error);
+                                return Ok(Err($convert_error(error)));
+                            }
+                        };
+                        launch.record(LaunchPhase::SourceRead);
+                        launch.record_source_bytes(source.payload_len());
+                        match service
+                            .spawn(
+                                &compile_authority,
+                                context,
+                                source,
+                                None,
+                                service::ProgramLaunch::new(
+                                    argv,
+                                    env,
+                                    child_authority,
+                                    Some(namespace),
+                                )
+                                .with_launched_instance(child_instance)
+                                .with_ipc_grants(ipc_grants)
+                                .with_default_linux_image(caller_default_image)
+                                .with_inherited_sockets(inherited_sockets)
+                                .with_cwd(resolved_cwd)
+                                .with_timeline(launch.timeline().for_task()),
+                            )
+                            .await
+                        {
+                            Ok(child) => {
+                                launch.set_instance(child.instance_id);
+                                launch.disarm();
+                                let handle = accessor.with(|mut access| {
+                                    access
+                                        .get()
+                                        .table
+                                        .push(child)
+                                        .map_err(wasmtime::Error::from)
+                                })?;
+                                Ok(Ok(handle))
+                            }
+                            Err(error) => {
+                                launch.exit_error(&error);
+                                Ok(Err($convert_error(error)))
+                            }
                         }
                     };
                     launch.record(LaunchPhase::Reply);
@@ -1018,6 +1530,7 @@ macro_rules! impl_program_bindings {
                     args,
                     env,
                     path,
+                    cwd,
                     stdin,
                     hint,
                     capability_grants,
@@ -1034,6 +1547,7 @@ macro_rules! impl_program_bindings {
                         // caller's: it sees the caller's mounts, and its
                         // own stay its own.
                         access.get().filesystem().descend(),
+                        access.get().default_linux_image(),
                         extracted,
                     ))
                 });
@@ -1045,6 +1559,7 @@ macro_rules! impl_program_bindings {
                         caller_id,
                         cpu,
                         namespace,
+                        caller_default_image,
                         (non_ipc_grants, ipc_result, _),
                     ) = snapshot?;
                     // Read before anything else the call does, so the
@@ -1078,7 +1593,7 @@ macro_rules! impl_program_bindings {
                         name.clone(),
                         context.now_uptime_nanos(),
                     );
-                    let child_authority = match $build_authority(
+                    let mut child_authority = match $build_authority(
                         &caller_authority,
                         caller_id,
                         Some(child_instance.id()),
@@ -1100,8 +1615,73 @@ macro_rules! impl_program_bindings {
                             return Ok(Err($convert_error(error)));
                         }
                     };
-                    let source =
-                        match read_program_source(accessor, &path, &caller_authority).await {
+                    let host_read = read_program_source(accessor, &path, &caller_authority).await;
+                    #[cfg_attr(
+                        not(feature = "linux"),
+                        expect(
+                            unused_mut,
+                            reason = "argv is mutated by host #! shebang rewriting when the linux feature is enabled"
+                        )
+                    )]
+                    let mut argv = ProgramArgv::launched(name, args);
+                    let use_default_overlay = match &host_read {
+                        Ok(Ok(source)) => !source.is_wasm() && caller_default_image.is_some(),
+                        _ => caller_default_image.is_some(),
+                    };
+                    #[cfg(feature = "linux")]
+                    let executed = if use_default_overlay {
+                        let default_image = caller_default_image
+                            .clone()
+                            .expect("use_default_overlay implies Some");
+                        let fallback_bytes = match host_read {
+                            Ok(Ok(ProgramSource::LinuxElf(bytes))) => Some(bytes),
+                            Ok(Ok(ProgramSource::RawWasm(bytes)))
+                                if service::parse_shebang(&bytes).is_some() =>
+                            {
+                                Some(bytes)
+                            }
+                            _ => None,
+                        };
+                        match service.create_ephemeral_overlay_container(
+                            child_authority,
+                            &namespace,
+                            &default_image,
+                        ) {
+                            Ok(container) => {
+                                accessor.with(|mut access| {
+                                    access.get().runtime_state.register_container(&container);
+                                });
+                                let merged_env =
+                                    service::merge_default_image_env(&default_image.env, env);
+                                service
+                                    .exec_in_overlay_container(
+                                        context,
+                                        &path,
+                                        fallback_bytes,
+                                        stdin,
+                                        service::ProgramLaunch::in_container(
+                                            argv, merged_env, container, None,
+                                        )
+                                        .with_launched_instance(child_instance)
+                                        .with_ipc_grants(ipc_grants)
+                                        .with_default_linux_image(caller_default_image)
+                                        .with_cwd(cwd)
+                                        .with_timeline(launch.timeline().clone()),
+                                    )
+                                    .await
+                            }
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        let resolved_cwd =
+                            match apply_requested_cwd(&mut child_authority, &namespace, cwd.as_deref()).await {
+                                Ok(resolved_cwd) => resolved_cwd,
+                                Err(error) => {
+                                    launch.refused(error.kind);
+                                    return Ok(Err($convert_error(error)));
+                                }
+                            };
+                        let initial_source = match host_read {
                             Ok(Ok(source)) => source,
                             Ok(Err(error)) => {
                                 launch.exit_error(&error);
@@ -1116,26 +1696,94 @@ macro_rules! impl_program_bindings {
                                 return Ok(Err($convert_error(error)));
                             }
                         };
-                    launch.record(LaunchPhase::SourceRead);
-                    launch.record_source_bytes(source.payload_len());
-                    let executed = service
-                        .exec_buffered(
-                            &compile_authority,
-                            context,
-                            source,
-                            hint,
-                            stdin,
-                            service::ProgramLaunch::new(
-                                ProgramArgv::launched(name, args),
-                                env,
-                                child_authority,
-                                Some(namespace),
-                            )
-                            .with_launched_instance(child_instance)
-                            .with_ipc_grants(ipc_grants)
-                            .with_timeline(launch.timeline().clone()),
+                        let source = match resolve_host_shebang_source(
+                            accessor,
+                            &path,
+                            &caller_authority,
+                            initial_source,
+                            &mut argv,
+                            ProgramHostOperation::ReadExecSource,
                         )
-                        .await;
+                        .await
+                        {
+                            Ok(source) => source,
+                            Err(error) => {
+                                launch.exit_error(&error);
+                                return Ok(Err($convert_error(error)));
+                            }
+                        };
+                        launch.record(LaunchPhase::SourceRead);
+                        launch.record_source_bytes(source.payload_len());
+                        service
+                            .exec_buffered(
+                                &compile_authority,
+                                context,
+                                source,
+                                hint,
+                                stdin,
+                                service::ProgramLaunch::new(
+                                    argv,
+                                    env,
+                                    child_authority,
+                                    Some(namespace),
+                                )
+                                .with_launched_instance(child_instance)
+                                .with_ipc_grants(ipc_grants)
+                                .with_default_linux_image(caller_default_image)
+                                .with_cwd(resolved_cwd)
+                                .with_timeline(launch.timeline().clone()),
+                            )
+                            .await
+                    };
+                    #[cfg(not(feature = "linux"))]
+                    let executed = {
+                        let _ = use_default_overlay;
+                        let resolved_cwd =
+                            match apply_requested_cwd(&mut child_authority, &namespace, cwd.as_deref()).await {
+                                Ok(resolved_cwd) => resolved_cwd,
+                                Err(error) => {
+                                    launch.refused(error.kind);
+                                    return Ok(Err($convert_error(error)));
+                                }
+                            };
+                        let source = match host_read {
+                            Ok(Ok(source)) => source,
+                            Ok(Err(error)) => {
+                                launch.exit_error(&error);
+                                return Ok(Err($convert_error(error)));
+                            }
+                            Err(error) => {
+                                let error = map_program_host_error(
+                                    ProgramHostOperation::ReadExecSource,
+                                    error,
+                                );
+                                launch.exit_error(&error);
+                                return Ok(Err($convert_error(error)));
+                            }
+                        };
+                        launch.record(LaunchPhase::SourceRead);
+                        launch.record_source_bytes(source.payload_len());
+                        service
+                            .exec_buffered(
+                                &compile_authority,
+                                context,
+                                source,
+                                hint,
+                                stdin,
+                                service::ProgramLaunch::new(
+                                    argv,
+                                    env,
+                                    child_authority,
+                                    Some(namespace),
+                                )
+                                .with_launched_instance(child_instance)
+                                .with_ipc_grants(ipc_grants)
+                                .with_default_linux_image(caller_default_image)
+                                .with_cwd(resolved_cwd)
+                                .with_timeline(launch.timeline().clone()),
+                            )
+                            .await
+                    };
                     match &executed {
                         Ok(result) => launch.set_instance(result.instance_id),
                         // The run task already marked the end for a
@@ -1730,10 +2378,13 @@ macro_rules! impl_container_config_conversion {
                 }
                 let sharing = match mount.sharing {
                     $bindings::helios::system::programs::ContainerMountSharing::Private => {
-                        crate::MountSharing::Private
+                        crate::ContainerMountSharing::Private
                     }
                     $bindings::helios::system::programs::ContainerMountSharing::Shared => {
-                        crate::MountSharing::Shared
+                        crate::ContainerMountSharing::Shared
+                    }
+                    $bindings::helios::system::programs::ContainerMountSharing::EphemeralOverlay => {
+                        crate::ContainerMountSharing::EphemeralOverlay
                     }
                 };
                 crate::ContainerMountSpec {
@@ -2677,6 +3328,111 @@ where
     Ok(Ok(ProgramSource::from_file(contents)))
 }
 
+async fn apply_requested_cwd<StorageImpl: crate::Storage>(
+    child_authority: &mut ProcessAuthority,
+    namespace: &crate::Namespace<StorageImpl>,
+    raw_cwd: Option<&str>,
+) -> Result<Option<String>, ProgramExecError> {
+    let Some(raw_cwd) = raw_cwd else {
+        return Ok(None);
+    };
+    let guest_cwd = crate::resolve_guest_path("/", raw_cwd).map_err(|_| ProgramExecError {
+        kind: ProgramExecErrorKind::InvalidPath,
+        detail: ProgramExecErrorDetail::InvalidProgramPath,
+    })?;
+    let covering = child_authority
+        .directory_preopens()
+        .iter()
+        .filter(|preopen| {
+            let name = preopen.guest_name();
+            if name == "/" {
+                true
+            } else if let Some(rest) = guest_cwd.strip_prefix(name) {
+                rest.is_empty() || rest.starts_with('/')
+            } else {
+                false
+            }
+        })
+        .max_by_key(|preopen| preopen.guest_name().len())
+        .cloned()
+        .ok_or(ProgramExecError {
+            kind: ProgramExecErrorKind::PermissionDenied,
+            detail: ProgramExecErrorDetail::ProcessAuthorityDenied,
+        })?;
+    let suffix = if covering.guest_name() == "/" {
+        guest_cwd.as_str()
+    } else {
+        guest_cwd.strip_prefix(covering.guest_name()).unwrap_or("")
+    };
+    let source_path = if suffix.is_empty() || suffix == "/" {
+        covering.source_path().to_owned()
+    } else if covering.source_path() == "/" {
+        suffix.to_owned()
+    } else {
+        alloc::format!("{}{suffix}", covering.source_path())
+    };
+    let cap = child_authority
+        .derive_directory_cap(&source_path, &guest_cwd, covering.rights())
+        .map_err(map_process_authority_error)?;
+    let resolved = namespace
+        .resolve(&source_path)
+        .map_err(ProgramExecError::from_source_read_error)?;
+    let metadata = helios_hal::fs::FileSystem::stat(resolved.fs(), resolved.path())
+        .await
+        .map_err(ProgramExecError::from_source_read_error)?;
+    if metadata.kind != helios_hal::fs::NodeKind::Directory {
+        return Err(ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidPath,
+            detail: ProgramExecErrorDetail::InvalidProgramPath,
+        });
+    }
+    child_authority.chdir(cap);
+    Ok(Some(guest_cwd))
+}
+
+#[cfg(feature = "linux")]
+async fn resolve_host_shebang_source<T, CpuImpl, Net, StorageImpl>(
+    accessor: &Accessor<T, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
+    initial_path: &str,
+    caller_authority: &ProcessAuthority,
+    mut source: ProgramSource,
+    argv: &mut ProgramArgv,
+    operation: ProgramHostOperation,
+) -> Result<ProgramSource, ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let mut current_path = initial_path.to_owned();
+    for depth in 0..=service::MAX_SHEBANG_DEPTH {
+        let shebang = match &source {
+            ProgramSource::RawWasm(bytes) => service::parse_shebang(bytes),
+            _ => None,
+        };
+        let Some((interp, opt_arg)) = shebang else {
+            return Ok(source);
+        };
+        if depth == service::MAX_SHEBANG_DEPTH {
+            return Err(ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidPath,
+                detail: ProgramExecErrorDetail::InvalidProgramPath,
+            });
+        }
+        argv.rewrite_shebang(interp.clone(), opt_arg, current_path);
+        current_path = interp;
+        source = match read_program_source(accessor, &current_path, caller_authority).await {
+            Ok(Ok(next)) => next,
+            Ok(Err(error)) => return Err(error),
+            Err(error) => return Err(map_program_host_error(operation, error)),
+        };
+    }
+    Err(ProgramExecError {
+        kind: ProgramExecErrorKind::InvalidPath,
+        detail: ProgramExecErrorDetail::InvalidProgramPath,
+    })
+}
+
 async fn read_program_source_bounded<T, CpuImpl, Net, StorageImpl>(
     accessor: &Accessor<T, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     path: &str,
@@ -3614,6 +4370,10 @@ fn tcp_connect_network_rights() -> NetworkAuthorityRights {
     NetworkAuthorityRights::TCP | NetworkAuthorityRights::DNS
 }
 
+fn tcp_bind_network_rights(local_port: u16) -> NetworkAuthorityRights {
+    NetworkAuthorityRights::TCP.bind_rights(local_port)
+}
+
 fn udp_bind_network_rights(local_port: u16) -> NetworkAuthorityRights {
     NetworkAuthorityRights::UDP.bind_rights(local_port)
 }
@@ -3633,6 +4393,16 @@ where
         |mut caller, rep| {
             let resource = Resource::<SbiTcpStream<Net>>::new_own(rep);
             caller.data_mut().table.delete(resource)?;
+            Ok(())
+        },
+    )?;
+    instance.resource(
+        "tcp-listener",
+        ResourceType::host::<crate::ComponentTcpListener>(),
+        |mut caller, rep| {
+            let resource = Resource::<crate::ComponentTcpListener>::new_own(rep);
+            caller.data_mut().table.delete(resource)?;
+            caller.data().retire_sockets();
             Ok(())
         },
     )?;
@@ -3874,6 +4644,146 @@ where
         },
     )?;
     instance.func_wrap_concurrent(
+        "tcp-listen",
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+         (local_address, local_port, backlog): (debugger_wit::net::IpAddress, u16, u16)| {
+            Box::pin(async move {
+                let required = tcp_bind_network_rights(local_port);
+                let (has_authority, service) = accessor.with(|mut access| {
+                    let store = access.get();
+                    Ok::<_, wasmtime::Error>((
+                        store
+                            .process_authority()
+                            .network_rights()
+                            .contains(required),
+                        store.runtime_state.network_service(),
+                    ))
+                })?;
+                if !has_authority {
+                    return Ok::<_, wasmtime::Error>((Err(debugger_wit::net::TcpError {
+                        kind: debugger_wit::net::TcpErrorKind::PermissionDenied,
+                        detail: "network authority is missing TCP or privileged-bind rights"
+                            .to_owned(),
+                    }),));
+                }
+                let Some(service) = service else {
+                    return Ok::<_, wasmtime::Error>((Err(unavailable_tcp_error()),));
+                };
+                let addr = from_wit_ip_address(local_address);
+                let hop_limit = helios_netstack::DEFAULT_HOP_LIMIT;
+                let response = match service
+                    .tcp_listen(addr, local_port, backlog, hop_limit)
+                    .await
+                {
+                    Ok(bound) => {
+                        let resource = accessor.with(|mut access| {
+                            let store = access.get();
+                            let retire = store.retirement.sender();
+                            store.table.push(crate::ComponentTcpListener::new(
+                                <Net::TcpListener as crate::NetworkHandle>::into_raw(
+                                    bound.listener,
+                                ),
+                                addr,
+                                bound.local_port,
+                                hop_limit,
+                                retire,
+                            ))
+                        })?;
+                        Ok(resource)
+                    }
+                    Err(error) => Err(convert_tcp_error(error)),
+                };
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap(
+        "[method]tcp-listener.local-address",
+        |caller: wasmtime::StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+         (resource,): (Resource<crate::ComponentTcpListener>,)| {
+            let listener = caller.data().table.get(&resource)?;
+            Ok(((
+                convert_ip_address(listener.local_address()),
+                listener.local_port(),
+            ),))
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "[method]tcp-listener.wait-readable",
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+         (resource, timeout): (Resource<crate::ComponentTcpListener>, u64)| {
+            Box::pin(async move {
+                let (service, raw) = accessor.with(|mut access| {
+                    let store = access.get();
+                    let listener = store.table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>((
+                        store.runtime_state.network_service(),
+                        listener.raw(),
+                    ))
+                })?;
+                let Some(raw) = raw else {
+                    return Ok::<_, wasmtime::Error>((Err(closed_tcp_listener_error()),));
+                };
+                let Some(service) = service else {
+                    return Ok::<_, wasmtime::Error>((Err(unavailable_tcp_error()),));
+                };
+                let handle = <Net::TcpListener as crate::NetworkHandle>::from_raw(raw);
+                let response = service
+                    .tcp_listener_wait_readable(handle, timeout)
+                    .await
+                    .map_err(convert_tcp_error);
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "[method]tcp-listener.accept",
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+         (resource, timeout): (Resource<crate::ComponentTcpListener>, u64)| {
+            Box::pin(async move {
+                let (service, raw) = accessor.with(|mut access| {
+                    let store = access.get();
+                    let listener = store.table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>((
+                        store.runtime_state.network_service(),
+                        listener.raw(),
+                    ))
+                })?;
+                let Some(raw) = raw else {
+                    return Ok::<_, wasmtime::Error>((Err(closed_tcp_listener_error()),));
+                };
+                let Some(service) = service else {
+                    return Ok::<_, wasmtime::Error>((Err(unavailable_tcp_error()),));
+                };
+                let handle = <Net::TcpListener as crate::NetworkHandle>::from_raw(raw);
+                let response =
+                    match service.tcp_accept(handle, timeout).await {
+                        Ok(accepted) => {
+                            let resource =
+                                accessor.with(|mut access| {
+                                    access.get().table.push(SbiTcpStream::new(
+                                        NetworkTcpBackend::new(service.clone(), accepted.stream),
+                                    ))
+                                })?;
+                            Ok(resource)
+                        }
+                        Err(error) => Err(convert_tcp_error(error)),
+                    };
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent_immediate(
+        "[method]tcp-listener.close",
+        |mut caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+         (resource,): (Resource<crate::ComponentTcpListener>,)| {
+            let listener = caller.data_mut().table.get_mut(&resource)?;
+            listener.close();
+            caller.data().retire_sockets();
+            Ok((Ok::<(), debugger_wit::net::TcpError>(()),))
+        },
+    )?;
+    instance.func_wrap_concurrent(
         "[method]udp-socket.receive",
         |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource, max_bytes, timeout): (Resource<SbiUdpSocket<Net>>, u32, u64)| {
@@ -3955,6 +4865,16 @@ where
         |mut caller, rep| {
             let resource = Resource::<SbiTcpStream<Net>>::new_own(rep);
             caller.data_mut().table.delete(resource)?;
+            Ok(())
+        },
+    )?;
+    instance.resource(
+        "tcp-listener",
+        ResourceType::host::<crate::ComponentTcpListener>(),
+        |mut caller, rep| {
+            let resource = Resource::<crate::ComponentTcpListener>::new_own(rep);
+            caller.data_mut().table.delete(resource)?;
+            caller.data().retire_sockets();
             Ok(())
         },
     )?;
@@ -4210,6 +5130,146 @@ where
          (resource,): (Resource<SbiTcpStream<Net>>,)| {
             let socket = caller.data_mut().table.get_mut(&resource)?;
             socket.resource.backend.close();
+            Ok((Ok::<(), program_wit::net::TcpError>(()),))
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "tcp-listen",
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+         (local_address, local_port, backlog): (program_wit::net::IpAddress, u16, u16)| {
+            Box::pin(async move {
+                let required = tcp_bind_network_rights(local_port);
+                let (has_authority, service) = accessor.with(|mut access| {
+                    let store = access.get();
+                    Ok::<_, wasmtime::Error>((
+                        store
+                            .process_authority()
+                            .network_rights()
+                            .contains(required),
+                        store.runtime_state.network_service(),
+                    ))
+                })?;
+                if !has_authority {
+                    return Ok::<_, wasmtime::Error>((Err(program_wit::net::TcpError {
+                        kind: program_wit::net::TcpErrorKind::PermissionDenied,
+                        detail: "network authority is missing TCP or privileged-bind rights"
+                            .to_owned(),
+                    }),));
+                }
+                let Some(service) = service else {
+                    return Ok::<_, wasmtime::Error>((Err(unavailable_program_tcp_error()),));
+                };
+                let addr = from_program_wit_ip_address(local_address);
+                let hop_limit = helios_netstack::DEFAULT_HOP_LIMIT;
+                let response = match service
+                    .tcp_listen(addr, local_port, backlog, hop_limit)
+                    .await
+                {
+                    Ok(bound) => {
+                        let resource = accessor.with(|mut access| {
+                            let store = access.get();
+                            let retire = store.retirement.sender();
+                            store.table.push(crate::ComponentTcpListener::new(
+                                <Net::TcpListener as crate::NetworkHandle>::into_raw(
+                                    bound.listener,
+                                ),
+                                addr,
+                                bound.local_port,
+                                hop_limit,
+                                retire,
+                            ))
+                        })?;
+                        Ok(resource)
+                    }
+                    Err(error) => Err(convert_program_tcp_error(error)),
+                };
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap(
+        "[method]tcp-listener.local-address",
+        |caller: wasmtime::StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+         (resource,): (Resource<crate::ComponentTcpListener>,)| {
+            let listener = caller.data().table.get(&resource)?;
+            Ok(((
+                convert_program_ip_address(listener.local_address()),
+                listener.local_port(),
+            ),))
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "[method]tcp-listener.wait-readable",
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+         (resource, timeout): (Resource<crate::ComponentTcpListener>, u64)| {
+            Box::pin(async move {
+                let (service, raw) = accessor.with(|mut access| {
+                    let store = access.get();
+                    let listener = store.table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>((
+                        store.runtime_state.network_service(),
+                        listener.raw(),
+                    ))
+                })?;
+                let Some(raw) = raw else {
+                    return Ok::<_, wasmtime::Error>((Err(closed_program_tcp_listener_error()),));
+                };
+                let Some(service) = service else {
+                    return Ok::<_, wasmtime::Error>((Err(unavailable_program_tcp_error()),));
+                };
+                let handle = <Net::TcpListener as crate::NetworkHandle>::from_raw(raw);
+                let response = service
+                    .tcp_listener_wait_readable(handle, timeout)
+                    .await
+                    .map_err(convert_program_tcp_error);
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "[method]tcp-listener.accept",
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+         (resource, timeout): (Resource<crate::ComponentTcpListener>, u64)| {
+            Box::pin(async move {
+                let (service, raw) = accessor.with(|mut access| {
+                    let store = access.get();
+                    let listener = store.table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>((
+                        store.runtime_state.network_service(),
+                        listener.raw(),
+                    ))
+                })?;
+                let Some(raw) = raw else {
+                    return Ok::<_, wasmtime::Error>((Err(closed_program_tcp_listener_error()),));
+                };
+                let Some(service) = service else {
+                    return Ok::<_, wasmtime::Error>((Err(unavailable_program_tcp_error()),));
+                };
+                let handle = <Net::TcpListener as crate::NetworkHandle>::from_raw(raw);
+                let response =
+                    match service.tcp_accept(handle, timeout).await {
+                        Ok(accepted) => {
+                            let resource =
+                                accessor.with(|mut access| {
+                                    access.get().table.push(SbiTcpStream::new(
+                                        NetworkTcpBackend::new(service.clone(), accepted.stream),
+                                    ))
+                                })?;
+                            Ok(resource)
+                        }
+                        Err(error) => Err(convert_program_tcp_error(error)),
+                    };
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent_immediate(
+        "[method]tcp-listener.close",
+        |mut caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+         (resource,): (Resource<crate::ComponentTcpListener>,)| {
+            let listener = caller.data_mut().table.get_mut(&resource)?;
+            listener.close();
+            caller.data().retire_sockets();
             Ok((Ok::<(), program_wit::net::TcpError>(()),))
         },
     )?;
@@ -4837,6 +5897,43 @@ fn convert_program_ip_address(address: crate::NetworkIpAddress) -> program_wit::
     }
 }
 
+fn ipv6_from_groups(
+    groups: (u16, u16, u16, u16, u16, u16, u16, u16),
+) -> helios_netstack::Ipv6Address {
+    let words = [
+        groups.0, groups.1, groups.2, groups.3, groups.4, groups.5, groups.6, groups.7,
+    ];
+    let mut octets = [0_u8; 16];
+    for (index, word) in words.into_iter().enumerate() {
+        let bytes = word.to_be_bytes();
+        octets[index * 2] = bytes[0];
+        octets[index * 2 + 1] = bytes[1];
+    }
+    helios_netstack::Ipv6Address::new(octets)
+}
+
+fn from_wit_ip_address(address: debugger_wit::net::IpAddress) -> crate::NetworkIpAddress {
+    match address {
+        debugger_wit::net::IpAddress::Ipv4((a, b, c, d)) => {
+            crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([a, b, c, d]))
+        }
+        debugger_wit::net::IpAddress::Ipv6(groups) => {
+            crate::NetworkIpAddress::Ipv6(ipv6_from_groups(groups))
+        }
+    }
+}
+
+fn from_program_wit_ip_address(address: program_wit::net::IpAddress) -> crate::NetworkIpAddress {
+    match address {
+        program_wit::net::IpAddress::Ipv4((a, b, c, d)) => {
+            crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([a, b, c, d]))
+        }
+        program_wit::net::IpAddress::Ipv6(groups) => {
+            crate::NetworkIpAddress::Ipv6(ipv6_from_groups(groups))
+        }
+    }
+}
+
 fn convert_ping_reply(reply: crate::PingReply) -> debugger_wit::net::PingReply {
     debugger_wit::net::PingReply {
         address: convert_ip_address(reply.address),
@@ -4961,6 +6058,20 @@ fn closed_program_tcp_error() -> program_wit::net::TcpError {
     }
 }
 
+fn closed_tcp_listener_error() -> debugger_wit::net::TcpError {
+    debugger_wit::net::TcpError {
+        kind: debugger_wit::net::TcpErrorKind::Unavailable,
+        detail: "TCP listener is closed".to_owned(),
+    }
+}
+
+fn closed_program_tcp_listener_error() -> program_wit::net::TcpError {
+    program_wit::net::TcpError {
+        kind: program_wit::net::TcpErrorKind::Unavailable,
+        detail: "TCP listener is closed".to_owned(),
+    }
+}
+
 /// A `tcp-stream.write` list copied into transmit memory, one send buffer
 /// per piece.
 ///
@@ -5062,7 +6173,14 @@ fn convert_tcp_error(error: crate::TcpError) -> debugger_wit::net::TcpError {
             crate::TcpErrorKind::ConnectionAborted => {
                 debugger_wit::net::TcpErrorKind::ConnectionAborted
             }
-            crate::TcpErrorKind::PermissionDenied => debugger_wit::net::TcpErrorKind::Unavailable,
+            crate::TcpErrorKind::PermissionDenied => {
+                debugger_wit::net::TcpErrorKind::PermissionDenied
+            }
+            crate::TcpErrorKind::Unavailable
+                if error.detail == crate::NetworkErrorDetail::TcpListenStartFailed =>
+            {
+                debugger_wit::net::TcpErrorKind::AddressInUse
+            }
             crate::TcpErrorKind::Unavailable => debugger_wit::net::TcpErrorKind::Unavailable,
             crate::TcpErrorKind::Internal => debugger_wit::net::TcpErrorKind::Internal,
         },
@@ -5079,7 +6197,14 @@ fn convert_program_tcp_error(error: crate::TcpError) -> program_wit::net::TcpErr
             crate::TcpErrorKind::ConnectionAborted => {
                 program_wit::net::TcpErrorKind::ConnectionAborted
             }
-            crate::TcpErrorKind::PermissionDenied => program_wit::net::TcpErrorKind::Unavailable,
+            crate::TcpErrorKind::PermissionDenied => {
+                program_wit::net::TcpErrorKind::PermissionDenied
+            }
+            crate::TcpErrorKind::Unavailable
+                if error.detail == crate::NetworkErrorDetail::TcpListenStartFailed =>
+            {
+                program_wit::net::TcpErrorKind::AddressInUse
+            }
             crate::TcpErrorKind::Unavailable => program_wit::net::TcpErrorKind::Unavailable,
             crate::TcpErrorKind::Internal => program_wit::net::TcpErrorKind::Internal,
         },

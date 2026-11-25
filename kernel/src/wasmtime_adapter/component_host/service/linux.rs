@@ -1952,10 +1952,11 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
-            .remove_xattr_at(cwd, path, follow, name, creds, now)
+            .remove_xattr_at(cwd, path, follow, name, creds, now, &payer)
             .await
     }
 
@@ -1966,10 +1967,11 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
-            .remove_xattr_resolved(&file.path, name, creds, now)
+            .remove_xattr_resolved(&file.path, name, creds, now, &payer)
             .await
     }
 }
@@ -2913,6 +2915,156 @@ where
             hangup: ready.hangup,
         })
     }
+
+    async fn vsock_accept(
+        &self,
+        listener: u64,
+        timeout_nanos: u64,
+    ) -> Result<syscall::AcceptedVsockStream<crate::UnixNetwork<Net>>, u64> {
+        let vsock = self
+            .shared
+            .runtime_state
+            .vsock_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let listener_id = crate::VsockListenerId::from_u64(listener);
+        let stream_id = if timeout_nanos == 0 {
+            vsock
+                .try_accept(listener_id)
+                .map_err(linux_errno_from_vsock_error)?
+                .ok_or(syscall::EAGAIN)?
+        } else {
+            vsock
+                .accept(listener_id, timeout_nanos)
+                .await
+                .map_err(linux_errno_from_vsock_error)?
+        };
+        let local = vsock
+            .local(stream_id)
+            .map_err(linux_errno_from_vsock_error)?;
+        let peer = vsock
+            .peer(stream_id)
+            .map_err(linux_errno_from_vsock_error)?;
+        let net = crate::UnixNetwork::with_vsock(
+            self.shared.runtime_state.network_service(),
+            Some(vsock),
+        );
+        let owned = OwnedVsockStream::new(net, stream_id.as_u64());
+        Ok(syscall::AcceptedVsockStream {
+            stream: owned,
+            local_cid: local.cid as u32,
+            local_port: local.port,
+            peer_cid: peer.cid as u32,
+            peer_port: peer.port,
+        })
+    }
+
+    async fn vsock_read(
+        &self,
+        stream: u64,
+        max_bytes: usize,
+        timeout_nanos: u64,
+    ) -> Result<Option<Bytes>, u64> {
+        let vsock = self
+            .shared
+            .runtime_state
+            .vsock_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let bytes = vsock
+            .read(
+                crate::VsockStreamId::from_u64(stream),
+                max_bytes,
+                timeout_nanos,
+            )
+            .await
+            .map_err(linux_errno_from_vsock_error)?;
+        Ok(bytes.map(Bytes::from))
+    }
+
+    async fn vsock_write(
+        &self,
+        stream: u64,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> Result<usize, u64> {
+        let vsock = self
+            .shared
+            .runtime_state
+            .vsock_service()
+            .ok_or(syscall::ENETDOWN)?;
+        vsock
+            .write(
+                crate::VsockStreamId::from_u64(stream),
+                &bytes,
+                timeout_nanos,
+            )
+            .await
+            .map_err(linux_errno_from_vsock_error)
+    }
+
+    async fn vsock_shutdown(&self, stream: u64, read: bool, write: bool) -> Result<(), u64> {
+        let vsock = self
+            .shared
+            .runtime_state
+            .vsock_service()
+            .ok_or(syscall::ENETDOWN)?;
+        vsock
+            .shutdown(
+                crate::VsockStreamId::from_u64(stream),
+                helios_hal::vsock::VsockShutdown {
+                    receive: read,
+                    send: write,
+                },
+            )
+            .await
+            .map_err(linux_errno_from_vsock_error)
+    }
+
+    async fn vsock_listener_readiness(&self, listener: u64) -> Result<syscall::SocketReady, u64> {
+        let vsock = self
+            .shared
+            .runtime_state
+            .vsock_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let readable = vsock
+            .listener_readable(crate::VsockListenerId::from_u64(listener))
+            .map_err(linux_errno_from_vsock_error)?;
+        Ok(syscall::SocketReady {
+            readable,
+            writable: false,
+            hangup: false,
+        })
+    }
+
+    async fn vsock_stream_readiness(&self, stream: u64) -> Result<syscall::SocketReady, u64> {
+        let vsock = self
+            .shared
+            .runtime_state
+            .vsock_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let ready = vsock
+            .stream_readiness(crate::VsockStreamId::from_u64(stream))
+            .map_err(linux_errno_from_vsock_error)?;
+        Ok(syscall::SocketReady {
+            readable: ready.readable,
+            writable: ready.writable,
+            hangup: ready.hangup,
+        })
+    }
+}
+
+fn linux_errno_from_vsock_error(error: crate::VsockError) -> u64 {
+    match error {
+        crate::VsockError::Timeout => syscall::ETIMEDOUT,
+        crate::VsockError::ConnectionRefused => syscall::ECONNREFUSED,
+        crate::VsockError::ConnectionReset => syscall::ECONNRESET,
+        crate::VsockError::Closed | crate::VsockError::UnknownHandle => syscall::EPIPE,
+        crate::VsockError::PortInUse { .. }
+        | crate::VsockError::NoEphemeralPort
+        | crate::VsockError::ListenerTableFull
+        | crate::VsockError::ConnectionTableFull => syscall::EADDRINUSE,
+        crate::VsockError::Unavailable => syscall::ENETDOWN,
+        crate::VsockError::Device(_) => 5, // EIO
+    }
 }
 
 fn linux_errno_from_control_error(error: NetworkControlError) -> u64 {
@@ -2930,29 +3082,7 @@ fn linux_errno_from_control_error(error: NetworkControlError) -> u64 {
     }
 }
 
-/// Parses a `#!` script header (`fs/binfmt_script.c`): returns
-/// `(interpreter, optional_argument)` from the first line (up to 256 bytes).
-fn parse_shebang(bytes: &[u8]) -> Option<(String, Option<String>)> {
-    if !bytes.starts_with(b"#!") {
-        return None;
-    }
-    let line = bytes[2..].split(|&b| b == b'\n').next().unwrap_or(&[]);
-    let line = &line[..line.len().min(256)];
-    let trimmed = core::str::from_utf8(line)
-        .ok()?
-        .trim_matches([' ', '\t', '\r']);
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut split = trimmed.splitn(2, [' ', '\t']);
-    let interp = split.next()?.to_owned();
-    let arg = split
-        .next()
-        .map(|s| s.trim_matches([' ', '\t']))
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned);
-    Some((interp, arg))
-}
+use super::parse_shebang;
 
 fn map_fs_error_to_exec(error: helios_hal::fs::FsError) -> ExecError {
     use helios_hal::fs::FsError;
@@ -4411,6 +4541,9 @@ where
                         env,
                         authority,
                         crate::IpcEndpointGrants::new(),
+                        None,
+                        crate::InheritedSockets::new(),
+                        None,
                         wasm_runtime.filesystem,
                         // Exec keeps the process, so it keeps the process's limit.
                         DescriptorOrigin::SameProcess(descriptors),
@@ -4504,6 +4637,8 @@ pub(super) async fn run_linux_process<CpuImpl, Net, StorageImpl>(
     env: Vec<(String, String)>,
     container: Arc<crate::LinuxContainer<StorageImpl>>,
     credentials: Option<syscall::Credentials>,
+    cwd: Option<String>,
+    inherited_sockets: crate::InheritedSockets,
     descriptors: DescriptorOrigin<Net>,
     signal_state: WasixSignalState,
     spawner: crate::InstanceSpawner<CpuImpl>,
@@ -4575,7 +4710,7 @@ where
         )),
     })?;
     let pid = process_guard.pid();
-    let table = match descriptors {
+    let mut table = match descriptors {
         DescriptorOrigin::Fresh => {
             let mut table = syscall::standard_streams::<LinuxResources<Net>>();
             table.limit = exec_context
@@ -4594,10 +4729,24 @@ where
             .into_slots(),
         DescriptorOrigin::SameProcess(table) => table.into_slots(),
     };
-    let initial_cwd = container
-        .authority()
-        .cwd()
-        .map(|preopen| String::from(preopen.guest_name()));
+    let unix_sockets =
+        inherited_sockets_to_unix_sockets(&exec_context.runtime_state, inherited_sockets)?;
+    for (index, socket) in unix_sockets.into_iter().enumerate() {
+        let fd = 3 + index;
+        if table.entries.len() <= fd {
+            table.entries.resize(fd + 1, None);
+        }
+        table.entries[fd] = Some(helios_unix::FileDescriptorEntry::new(
+            helios_unix::FileDescriptor::Socket(socket),
+            false,
+        ));
+    }
+    let initial_cwd = cwd.or_else(|| {
+        container
+            .authority()
+            .cwd()
+            .map(|preopen| String::from(preopen.guest_name()))
+    });
     let process = Process::<LinuxResources<Net>>::with_descriptors(
         executable.abi,
         pid,
@@ -5050,8 +5199,7 @@ mod tests {
         use crate::vfs::BOOT_DEVICE;
         use crate::{
             BootFs, ContainerConfig, ContainerId, ContainerMountSpec, DirectoryAuthorityRights,
-            EmbeddedBootDirectory, EmbeddedBootFs, LinuxContainer, MountSharing, ProcessAuthority,
-            SharedOwner,
+            EmbeddedBootDirectory, EmbeddedBootFs, LinuxContainer, ProcessAuthority, SharedOwner,
         };
         use core::task::{Context, Poll, Waker};
         use helios_linux::syscall::{Credentials, UtsField};
@@ -5074,7 +5222,7 @@ mod tests {
                         source_path: String::from("/root"),
                         target_path: String::from("/"),
                         rights: DirectoryAuthorityRights::READ | DirectoryAuthorityRights::EXECUTE,
-                        sharing: MountSharing::Shared,
+                        sharing: crate::ContainerMountSharing::Shared,
                     },
                     mounts: Vec::new(),
                     shared_owner: SharedOwner { uid: 0, gid: 0 },
@@ -5703,9 +5851,9 @@ mod tests {
         use crate::test_support::UnsupportedStorage;
         use crate::vfs::BOOT_DEVICE;
         use crate::{
-            BootFs, ContainerConfig, ContainerId, ContainerMountSpec, DirectoryAuthorityRights,
-            EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs, LinuxContainer, MountSharing,
-            ProcessAuthority, SharedOwner,
+            BootFs, ContainerConfig, ContainerId, ContainerMountSharing, ContainerMountSpec,
+            DirectoryAuthorityRights, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
+            LinuxContainer, ProcessAuthority, SharedOwner,
         };
         use helios_linux::syscall::{Credentials, UtsField};
 
@@ -5786,20 +5934,20 @@ mod tests {
                         source_path: String::from("/root"),
                         target_path: String::from("/"),
                         rights: DirectoryAuthorityRights::READ | DirectoryAuthorityRights::EXECUTE,
-                        sharing: MountSharing::Shared,
+                        sharing: ContainerMountSharing::Shared,
                     },
                     mounts: alloc::vec![
                         ContainerMountSpec {
                             source_path: String::from("/noexec_src"),
                             target_path: String::from("/noexec"),
                             rights: DirectoryAuthorityRights::READ,
-                            sharing: MountSharing::Shared,
+                            sharing: ContainerMountSharing::Shared,
                         },
                         ContainerMountSpec {
                             source_path: String::from("/noread_src"),
                             target_path: String::from("/noread"),
                             rights: DirectoryAuthorityRights::EXECUTE,
-                            sharing: MountSharing::Shared,
+                            sharing: ContainerMountSharing::Shared,
                         },
                     ],
                     shared_owner: SharedOwner { uid: 0, gid: 0 },

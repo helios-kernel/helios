@@ -1333,6 +1333,8 @@ mod linux_tests {
             Vec::new(),
             container,
             None,
+            None,
+            crate::InheritedSockets::new(),
             DescriptorOrigin::Fresh,
             signal_state.clone(),
             instance_spawner,
@@ -1792,6 +1794,8 @@ mod linux_tests {
                 Vec::new(),
                 container,
                 None,
+                None,
+                crate::InheritedSockets::new(),
                 DescriptorOrigin::Fresh,
                 signal_state,
                 instance_spawner,
@@ -1858,13 +1862,13 @@ mod linux_tests {
                         source_path: String::from("/root-a"),
                         target_path: String::from("/"),
                         rights: rwx,
-                        sharing: MountSharing::Private,
+                        sharing: crate::ContainerMountSharing::Private,
                     },
                     mounts: vec![ContainerMountSpec {
                         source_path: String::from("/shared"),
                         target_path: String::from("/shared"),
                         rights: rx,
-                        sharing: MountSharing::Shared,
+                        sharing: crate::ContainerMountSharing::Shared,
                     }],
                     shared_owner: SharedOwner {
                         uid: 1000,
@@ -1892,13 +1896,13 @@ mod linux_tests {
                         source_path: String::from("/root-b"),
                         target_path: String::from("/"),
                         rights: rwx,
-                        sharing: MountSharing::Private,
+                        sharing: crate::ContainerMountSharing::Private,
                     },
                     mounts: vec![ContainerMountSpec {
                         source_path: String::from("/shared"),
                         target_path: String::from("/shared"),
                         rights: rx,
-                        sharing: MountSharing::Shared,
+                        sharing: crate::ContainerMountSharing::Shared,
                     }],
                     shared_owner: SharedOwner {
                         uid: 2000,
@@ -2114,7 +2118,7 @@ mod linux_tests {
                         source_path: String::from("/root"),
                         target_path: String::from("/"),
                         rights: DirectoryAuthorityRights::READ | DirectoryAuthorityRights::EXECUTE,
-                        sharing: MountSharing::Private,
+                        sharing: crate::ContainerMountSharing::Private,
                     },
                     mounts: Vec::new(),
                     shared_owner: SharedOwner { uid: 0, gid: 0 },
@@ -2273,7 +2277,7 @@ mod linux_tests {
                 source_path: String::from("/box-a"),
                 target_path: String::from("/"),
                 rights: rwx,
-                sharing: MountSharing::Private,
+                sharing: crate::ContainerMountSharing::Private,
             },
             mounts: Vec::new(),
             shared_owner: SharedOwner { uid: 0, gid: 0 },
@@ -2655,6 +2659,8 @@ mod linux_tests {
                     args: Vec::new(),
                     env: Vec::new(),
                     path: String::from("/app"),
+                    cwd: None,
+                    sockets: Vec::new(),
                     credentials: Some(wit::ContainerCredentials {
                         uid: u32::MAX,
                         gid: 0,
@@ -2683,6 +2689,7 @@ mod linux_tests {
                     args: Vec::new(),
                     env: Vec::new(),
                     path: String::from("/app"),
+                    cwd: None,
                     stdin: Vec::new(),
                     credentials: Some(wit::ContainerCredentials {
                         uid: 0,
@@ -3400,13 +3407,13 @@ mod linux_tests {
                                 source_path: String::from("/priv"),
                                 target_path: String::from("/"),
                                 rights: RWX,
-                                sharing: MountSharing::Private,
+                                sharing: crate::ContainerMountSharing::Private,
                             },
                             mounts: vec![ContainerMountSpec {
                                 source_path: String::from("/shared"),
                                 target_path: String::from("/shared"),
                                 rights: RWX,
-                                sharing: MountSharing::Shared,
+                                sharing: crate::ContainerMountSharing::Shared,
                             }],
                             shared_owner: SharedOwner { uid: 0, gid: 0 },
                             credentials: Credentials::root(),
@@ -3478,6 +3485,8 @@ mod linux_tests {
                             Vec::new(),
                             container,
                             Some(initial_creds),
+                            None,
+                            crate::InheritedSockets::new(),
                             DescriptorOrigin::Fresh,
                             WasixSignalState::new(),
                             instance_spawner,
@@ -3718,13 +3727,947 @@ mod linux_tests {
     }
 
     #[test]
+    fn default_linux_image_set_get_permissions_and_per_instance_isolation() {
+        use super::super::program_bindings::helios::system::programs::{
+            self as wit, HostWithStore,
+        };
+        use crate::DirectoryAuthorityRights;
+        use helios_hal::fs::{FileSystem, FileSystemRights, FsPath, OpenFlags};
+
+        let engine = component_test_engine();
+        let rx = DirectoryAuthorityRights::READ | DirectoryAuthorityRights::EXECUTE;
+
+        let make_store = |auth: ProcessAuthority| {
+            wasmtime::Store::new(&engine, test_store::store_data_authorized(auth, |_| {}))
+        };
+
+        // Build a read-only image directory `/alpine` and a regular file `/not-a-dir`.
+        let mut store_a = make_store({
+            let mut auth = ProcessAuthority::empty();
+            auth.insert_directory_preopen(
+                crate::DirectoryPreopen::new("/alpine", "/alpine", rx).unwrap(),
+            );
+            auth.insert_directory_preopen(
+                crate::DirectoryPreopen::new("/not-a-dir", "/not-a-dir", rx).unwrap(),
+            );
+            auth
+        });
+        {
+            let ns = store_a.data().filesystem().clone();
+            let root = ns.resolve("/").unwrap();
+            let payer = crate::StoragePayer::for_test();
+            block_on(
+                root.fs()
+                    .create_directory(FsPath::new("alpine").unwrap(), 0, &payer),
+            )
+            .expect("mkdir /alpine");
+            let img_fs = crate::vfs::MemoryFs::new(ns.table().allocate_device());
+            block_on(
+                ns.mount(
+                    &ProcessAuthority::root()
+                        .derive_mount_cap("/alpine")
+                        .unwrap(),
+                    crate::MountedFs::Memory(img_fs),
+                    crate::MountGrant {
+                        rights: FileSystemRights::READ,
+                        sharing: crate::MountSharing::Shared,
+                    },
+                ),
+            )
+            .expect("mount RO /alpine");
+            block_on(root.fs().open(
+                FsPath::new("not-a-dir").unwrap(),
+                OpenFlags::CREATE,
+                1,
+                &payer,
+            ))
+            .expect("create /not-a-dir");
+        }
+
+        // Sibling store B starts with None.
+        let mut store_b = make_store(ProcessAuthority::root());
+
+        // 1. Caller with ONLY READ|EXECUTE (no WRITE) succeeds on `/alpine`.
+        let img = wit::DefaultLinuxImage {
+            root_path: String::from("/alpine"),
+            env: vec![
+                (String::from("PATH"), String::from("/usr/bin:/bin")),
+                (String::from("LANG"), String::from("C.UTF-8")),
+            ],
+            credentials: Some(wit::ContainerCredentials {
+                uid: 1000,
+                gid: 1000,
+                supplementary_groups: vec![10],
+            }),
+        };
+        let res = block_on(store_a.run_concurrent(async |accessor| {
+            <HasSelf<test_store::TestStoreData> as HostWithStore<_>>::set_default_image(
+                accessor,
+                Some(img.clone()),
+            )
+            .await
+        }))
+        .expect("concurrent")
+        .expect("host call");
+        assert!(res.is_ok(), "READ|EXECUTE authority suffices: {res:?}");
+
+        // 2. get_default_image returns the configured image on store A, while
+        //    store B still sees None (zero machine-wide global state).
+        let got_a = block_on(store_a.run_concurrent(async |accessor| {
+            accessor
+                .with(<HasSelf<test_store::TestStoreData> as HostWithStore<_>>::get_default_image)
+        }))
+        .expect("concurrent")
+        .expect("host call")
+        .expect("store A has default image");
+        assert_eq!(got_a.root_path, "/alpine");
+        assert_eq!(got_a.env, img.env);
+        assert_eq!(got_a.credentials.as_ref().unwrap().uid, 1000);
+
+        let got_b = block_on(store_b.run_concurrent(async |accessor| {
+            accessor
+                .with(<HasSelf<test_store::TestStoreData> as HostWithStore<_>>::get_default_image)
+        }))
+        .expect("concurrent")
+        .expect("host call");
+        assert!(got_b.is_none(), "sibling store must remain isolated");
+
+        // 3. Regular file is rejected with InvalidPath.
+        let non_dir = block_on(store_a.run_concurrent(async |accessor| {
+            <HasSelf<test_store::TestStoreData> as HostWithStore<_>>::set_default_image(
+                accessor,
+                Some(wit::DefaultLinuxImage {
+                    root_path: String::from("/not-a-dir"),
+                    env: Vec::new(),
+                    credentials: None,
+                }),
+            )
+            .await
+        }))
+        .expect("concurrent")
+        .expect("host call");
+        assert!(matches!(
+            non_dir,
+            Err(wit::SpawnError {
+                kind: wit::SpawnErrorKind::InvalidPath,
+                ..
+            })
+        ));
+
+        // 4. Caller missing EXECUTE (READ-only) is rejected with PermissionDenied.
+        let mut store_ro = make_store({
+            let mut auth = ProcessAuthority::empty();
+            auth.insert_directory_preopen(
+                crate::DirectoryPreopen::new("/alpine", "/alpine", DirectoryAuthorityRights::READ)
+                    .unwrap(),
+            );
+            auth
+        });
+        let denied = block_on(store_ro.run_concurrent(async |accessor| {
+            <HasSelf<test_store::TestStoreData> as HostWithStore<_>>::set_default_image(
+                accessor,
+                Some(img),
+            )
+            .await
+        }))
+        .expect("concurrent")
+        .expect("host call");
+        assert!(matches!(
+            denied,
+            Err(wit::SpawnError {
+                kind: wit::SpawnErrorKind::PermissionDenied,
+                ..
+            })
+        ));
+
+        // 5. Clearing with None resets get_default_image to None.
+        let cleared = block_on(store_a.run_concurrent(async |accessor| {
+            <HasSelf<test_store::TestStoreData> as HostWithStore<_>>::set_default_image(
+                accessor, None,
+            )
+            .await
+        }))
+        .expect("concurrent")
+        .expect("host call");
+        assert!(cleared.is_ok());
+        let after_clear = block_on(store_a.run_concurrent(async |accessor| {
+            accessor
+                .with(<HasSelf<test_store::TestStoreData> as HostWithStore<_>>::get_default_image)
+        }))
+        .expect("concurrent")
+        .expect("host call");
+        assert!(after_clear.is_none());
+    }
+
+    #[test]
+    fn default_linux_image_ephemeral_overlay_shebang_env_merge_and_cwd() {
+        use crate::vfs::{BOOT_DEVICE, MemoryFs};
+        use crate::{
+            BootFs, DefaultLinuxCredentials, DefaultLinuxImage, DirectoryAuthorityRights,
+            DirectoryPreopen, EmbeddedBootDirectory, EmbeddedBootFs, MountGrant, MountSharing,
+            MountedFs, Namespace,
+        };
+        use helios_hal::fs::{FileSystem, FileSystemRights, FsPath};
+
+        // 1. Unit-test parse_shebang, rewrite_shebang, and merge_default_image_env.
+        assert_eq!(
+            parse_shebang(b"#!/bin/sh -e\necho hi\n"),
+            Some((String::from("/bin/sh"), Some(String::from("-e"))))
+        );
+        assert_eq!(
+            parse_shebang(b"#!  /usr/bin/env   python3  \r\n"),
+            Some((String::from("/usr/bin/env"), Some(String::from("python3"))))
+        );
+        assert_eq!(parse_shebang(b"\x7fELF"), None);
+
+        let mut argv = ProgramArgv::launched("myscript", vec![String::from("arg1")]);
+        argv.rewrite_shebang(
+            String::from("/bin/sh"),
+            Some(String::from("-e")),
+            String::from("/bin/myscript"),
+        );
+        assert_eq!(
+            argv.into_vec(),
+            vec!["/bin/sh", "-e", "/bin/myscript", "arg1"]
+        );
+
+        let merged = merge_default_image_env(
+            &[
+                (String::from("PATH"), String::from("/usr/bin:/bin")),
+                (String::from("FOO"), String::from("from-image")),
+            ],
+            vec![
+                (String::from("FOO"), String::from("from-request")),
+                (String::from("EXTRA"), String::from("1")),
+            ],
+        );
+        assert_eq!(
+            merged,
+            vec![
+                (String::from("PATH"), String::from("/usr/bin:/bin")),
+                (String::from("FOO"), String::from("from-request")),
+                (String::from("EXTRA"), String::from("1")),
+            ]
+        );
+
+        // 2. Build a read-only image with `/bin/interp` (minimal ELF), `/bin/run.sh`
+        //    (`#!/bin/interp -x`), `/bin/loop.sh` (`#!/bin/loop.sh`), and `/work` subdir,
+        //    plus a writable host share `/host-dir`.
+        const BOOT_IMAGE: EmbeddedBootFs = EmbeddedBootFs::new(
+            &[
+                EmbeddedBootDirectory::new("img", 0),
+                EmbeddedBootDirectory::new("host-dir", 0),
+            ],
+            &[],
+        );
+        let ns = Namespace::<UnsupportedStorage>::new(crate::MountTable::new(
+            BootFs::new(BOOT_IMAGE, BOOT_DEVICE),
+            4,
+        ));
+        let root_auth = ProcessAuthority::root();
+        let payer = crate::StoragePayer::for_test();
+        let img_fs = MemoryFs::new(ns.table().allocate_device());
+        let host_fs = MemoryFs::new(ns.table().allocate_device());
+        block_on(async {
+            img_fs
+                .create_directory(FsPath::new("bin").unwrap(), 1, &payer)
+                .await
+                .unwrap();
+            img_fs
+                .create_directory(FsPath::new("app").unwrap(), 1, &payer)
+                .await
+                .unwrap();
+            create_container_file(&img_fs, "bin/interp", &minimal_x86_64_elf()).await;
+            create_container_file(&img_fs, "bin/run.sh", b"#!/bin/interp -x\necho ok\n").await;
+            create_container_file(&img_fs, "bin/loop.sh", b"#!/bin/loop.sh\n").await;
+            create_container_file(&host_fs, "data.txt", b"host-visible").await;
+            ns.mount(
+                &root_auth.derive_mount_cap("/img").unwrap(),
+                MountedFs::Memory(img_fs),
+                MountGrant {
+                    rights: FileSystemRights::READ,
+                    sharing: MountSharing::Shared,
+                },
+            )
+            .await
+            .unwrap();
+            ns.mount(
+                &root_auth.derive_mount_cap("/host-dir").unwrap(),
+                MountedFs::Memory(host_fs),
+                MountGrant {
+                    rights: FileSystemRights::READ | FileSystemRights::WRITE,
+                    sharing: MountSharing::Shared,
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let held_lower = ns.resolve("/img").unwrap().held();
+        let default_image = DefaultLinuxImage {
+            root_path: String::from("/img"),
+            lower: held_lower,
+            env: vec![(String::from("IMG_ENV"), String::from("yes"))],
+            credentials: Some(DefaultLinuxCredentials {
+                uid: 1000,
+                gid: 1000,
+                supplementary_groups: Vec::new(),
+            }),
+        };
+
+        let mut child_auth = ProcessAuthority::empty();
+        child_auth.insert_directory_preopen(
+            DirectoryPreopen::new(
+                "/host-dir",
+                "/mnt/host",
+                DirectoryAuthorityRights::READ | DirectoryAuthorityRights::WRITE,
+            )
+            .unwrap(),
+        );
+
+        let cpu = ScriptedLinuxCpu {
+            base: TestCpu::with_entropy(0x11),
+            script: ScriptState::new(Vec::new(), |_| {}),
+        };
+        let service = test_program_service(&cpu);
+        let container = service
+            .create_ephemeral_overlay_container(child_auth, &ns, &default_image)
+            .expect("create ephemeral overlay container");
+
+        // Verify host bind mount `/mnt/host` is overlaid on top of the ephemeral root
+        // and default credentials took effect.
+        assert_eq!(container.default_credentials().user.effective, 1000);
+        assert!(block_on(container.filesystem().stat("/mnt/host/data.txt")).is_ok());
+
+        // Verify `validate_container_cwd` accepts `/app` and rejects `/bin/interp`.
+        assert_eq!(
+            block_on(validate_container_cwd(&container, Some("/app"))).unwrap(),
+            Some(String::from("/app"))
+        );
+        assert!(matches!(
+            block_on(validate_container_cwd(&container, Some("/bin/interp"))),
+            Err(ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidPath,
+                ..
+            })
+        ));
+
+        // Verify `#!` script resolution rewrites argv and loads `/bin/interp`,
+        // and a recursive `#!` loop fails fast after MAX_SHEBANG_DEPTH.
+        let timeline = phases::Timeline::disabled();
+        let root_creds = helios_linux::syscall::Credentials::root();
+        let mut script_argv = ProgramArgv::launched("run.sh", vec![String::from("hello")]);
+        block_on(load_container_executable(
+            &cpu,
+            &container,
+            "/bin/run.sh",
+            &mut script_argv,
+            &root_creds,
+            &timeline,
+        ))
+        .expect("shebang script resolves to ELF interpreter");
+        assert_eq!(
+            script_argv.into_vec(),
+            vec!["/bin/interp", "-x", "/bin/run.sh", "hello"]
+        );
+
+        let mut loop_argv = ProgramArgv::launched("loop.sh", Vec::new());
+        let loop_err = block_on(load_container_executable(
+            &cpu,
+            &container,
+            "/bin/loop.sh",
+            &mut loop_argv,
+            &root_creds,
+            &timeline,
+        ));
+        assert!(matches!(
+            loop_err,
+            Err(ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidPath,
+                ..
+            })
+        ));
+
+        // Verify `getcwd` observes an explicit `cwd` override inside a Linux process.
+        const CWD_BUF: u64 = (SCRATCH_BASE + 0x200) as u64;
+        // 79 = getcwd, 231 = exit_group.
+        let cwd_script = ScriptState::new(
+            vec![
+                ScriptStep::Syscall {
+                    num: 79,
+                    args: [CWD_BUF, 64, 0, 0, 0, 0],
+                },
+                ScriptStep::Syscall {
+                    num: 231,
+                    args: [0, 0, 0, 0, 0, 0],
+                },
+            ],
+            |_| {},
+        );
+        let cwd_cpu = ScriptedLinuxCpu {
+            base: TestCpu::with_entropy(0x22),
+            script: cwd_script.clone(),
+        };
+        let cwd_exec = LinuxExecutable::load(&cwd_cpu, minimal_x86_64_elf()).unwrap();
+        let runtime_state = HostRuntimeState::<_, TestNetworkService, UnsupportedStorage>::new(
+            cwd_cpu.timebase(),
+            1,
+            0,
+            crate::BootPayload::for_tests(),
+            GuestIsa::for_build_target(cwd_cpu.native_feature_probe()),
+        );
+        runtime_state.install_root_entropy(triomphe::Arc::new(
+            crate::RootEntropy::from_platform(
+                &cwd_cpu,
+                None,
+                None,
+                crate::MachineGeneration::new(None),
+            )
+            .expect("entropy"),
+        ));
+        let executor = crate::Executor::isolated(
+            ProgressCounter::new(),
+            crate::test_support::single_node_pool(1),
+            ProcessorId::new(0),
+        );
+        let registry = crate::InstanceRegistry::new();
+        let instance = registry.register("cwd-child", 0);
+        let exec_context = ProgramExecContext {
+            cpu: cwd_cpu.clone(),
+            timer: executor.timer(cwd_cpu.clone()),
+            spawner: executor.spawner(cwd_cpu.clone()),
+            runtime_state,
+            instance_registry: registry,
+            parent_instance_id: None,
+            read_serial: |_, _| {},
+            write_serial: crate::DebugSerialWriter::of::<test_store::DiscardPort>(),
+        };
+        let (_stx, srx) = crate::byte_channel();
+        let (otx, _orx) = crate::byte_channel();
+        let (etx, _erx) = crate::byte_channel();
+        let spawner = executor
+            .spawner(cwd_cpu.clone())
+            .instance_spawner(crate::TaskFunding::Instance, &instance);
+        let exit = block_on(run_linux_process(
+            LinuxExecRuntime {
+                exec_context,
+                wasm: None,
+            },
+            ProgramArgv::launched("interp", Vec::new()),
+            Vec::new(),
+            container.clone(),
+            None,
+            Some(String::from("/app")),
+            crate::InheritedSockets::new(),
+            DescriptorOrigin::Fresh,
+            WasixSignalState::new(),
+            spawner,
+            instance,
+            OutputMode::Child {
+                stdin_rx: srx,
+                stdout_tx: otx,
+                stderr_tx: etx,
+            },
+            cwd_exec,
+            &timeline,
+        ))
+        .expect("cwd process completes");
+        assert_eq!(exit.termination, ChildTermination::Exited(0));
+        let cwd_len = cwd_script.results.lock()[0] as usize;
+        assert_eq!(cwd_len, b"/app\0".len());
+        let got_cwd = &cwd_script.memory.lock()[0x200..0x200 + cwd_len];
+        assert_eq!(got_cwd, b"/app\0");
+    }
+
+    #[test]
+    fn child_signal_enforces_authority_range_and_delivers_signal() {
+        use super::super::program_bindings::helios::system::programs::{
+            self as wit, HostChildWithStore,
+        };
+
+        let engine = component_test_engine();
+        let signal_state = WasixSignalState::new();
+        let make_handle = |state: WasixSignalState| {
+            let (_tx, rx) = futures::channel::oneshot::channel();
+            ChildHandle {
+                instance_id: crate::InstanceId::from_raw(77),
+                signal_state: state,
+                stdin: None,
+                stdout: None,
+                stderr: None,
+                exit: Some(rx),
+            }
+        };
+
+        // 1. Missing ProcessRight::Signal -> PermissionDenied.
+        let mut no_sig_store = wasmtime::Store::new(
+            &engine,
+            test_store::store_data_authorized(ProcessAuthority::empty(), |_| {}),
+        );
+        let h1 = no_sig_store
+            .data_mut()
+            .table
+            .push(make_handle(signal_state.clone()))
+            .unwrap();
+        let denied = block_on(no_sig_store.run_concurrent(async |accessor| {
+            accessor.with(|access| {
+                <HasSelf<test_store::TestStoreData> as HostChildWithStore<_>>::signal(
+                    access, h1, 15,
+                )
+            })
+        }))
+        .expect("concurrent")
+        .expect("host call");
+        assert!(matches!(
+            denied,
+            Err(wit::SpawnError {
+                kind: wit::SpawnErrorKind::PermissionDenied,
+                ..
+            })
+        ));
+
+        // 2. Authorized caller: invalid signal 0 and 65 rejected; signal 15 delivered.
+        let mut ok_store = wasmtime::Store::new(
+            &engine,
+            test_store::store_data_authorized(ProcessAuthority::root(), |_| {}),
+        );
+        let h2_rep = ok_store
+            .data_mut()
+            .table
+            .push(make_handle(signal_state.clone()))
+            .unwrap()
+            .rep();
+        let bad0 = block_on(ok_store.run_concurrent(async |accessor| {
+            accessor.with(|access| {
+                <HasSelf<test_store::TestStoreData> as HostChildWithStore<_>>::signal(
+                    access,
+                    wasmtime::component::Resource::new_borrow(h2_rep),
+                    0,
+                )
+            })
+        }))
+        .expect("concurrent")
+        .expect("host call");
+        assert!(matches!(
+            bad0,
+            Err(wit::SpawnError {
+                kind: wit::SpawnErrorKind::InvalidHint,
+                ..
+            })
+        ));
+
+        let delivered = block_on(ok_store.run_concurrent(async |accessor| {
+            accessor.with(|access| {
+                <HasSelf<test_store::TestStoreData> as HostChildWithStore<_>>::signal(
+                    access,
+                    wasmtime::component::Resource::new_borrow(h2_rep),
+                    15,
+                )
+            })
+        }))
+        .expect("concurrent")
+        .expect("host call");
+        assert!(delivered.is_ok());
+        assert_eq!(
+            signal_state.take_pending(),
+            Some(helios_unix::Signal::SIGTERM)
+        );
+    }
+
+    #[test]
+    fn inherited_tcp_and_vsock_listeners_handoff_to_wit_preview1_and_linux_fd3() {
+        use super::super::program_bindings::helios::system::programs::{
+            self as wit, HostWithStore,
+        };
+        use crate::vsock::{ComponentHostVsockService, VsockService};
+        use helios_hal::vsock::{
+            VsockAddress, VsockDelivery, VsockDevice, VsockOp, VsockPacketHeader, VsockReceived,
+        };
+
+        /// In-memory mock vsock transport that delivers queued packets from a
+        /// channel and records outbound packets.
+        struct MockVsockDevice {
+            cid: u64,
+            rx: Mutex<alloc::collections::VecDeque<(VsockPacketHeader, Vec<u8>)>>,
+            tx: Mutex<Vec<(VsockPacketHeader, Vec<u8>)>>,
+        }
+
+        impl MockVsockDevice {
+            fn new(cid: u64) -> Self {
+                Self {
+                    cid,
+                    rx: Mutex::new(alloc::collections::VecDeque::new()),
+                    tx: Mutex::new(Vec::new()),
+                }
+            }
+
+            fn enqueue(&self, header: VsockPacketHeader, payload: Vec<u8>) {
+                self.rx.lock().push_back((header, payload));
+            }
+        }
+
+        impl VsockDevice for MockVsockDevice {
+            fn guest_cid(&self) -> u64 {
+                self.cid
+            }
+
+            fn max_payload_bytes(&self) -> usize {
+                4096
+            }
+
+            async fn send(
+                &self,
+                header: VsockPacketHeader,
+                payload: &[u8],
+            ) -> helios_hal::io::IoResult<()> {
+                self.tx.lock().push((header, payload.to_vec()));
+                Ok(())
+            }
+
+            async fn receive_into(
+                &self,
+                payload: &mut [u8],
+            ) -> helios_hal::io::IoResult<VsockDelivery> {
+                loop {
+                    if let Some((hdr, data)) = self.rx.lock().pop_front() {
+                        payload[..data.len()].copy_from_slice(&data);
+                        return Ok(VsockDelivery::Packet(VsockReceived {
+                            header: hdr,
+                            payload_len: data.len(),
+                        }));
+                    }
+                    futures_lite::future::yield_now().await;
+                }
+            }
+        }
+
+        let cpu = TestCpu::with_entropy(0x33);
+        let vsock_executor = crate::Executor::isolated(
+            ProgressCounter::new(),
+            crate::test_support::single_node_pool(1),
+            ProcessorId::new(0),
+        );
+        let timer = vsock_executor.timer(cpu);
+        let dev = Arc::new(MockVsockDevice::new(7));
+        struct ArcVsockDevice(Arc<MockVsockDevice>);
+        impl VsockDevice for ArcVsockDevice {
+            fn guest_cid(&self) -> u64 {
+                self.0.guest_cid()
+            }
+            fn max_payload_bytes(&self) -> usize {
+                self.0.max_payload_bytes()
+            }
+            async fn send(
+                &self,
+                header: VsockPacketHeader,
+                payload: &[u8],
+            ) -> helios_hal::io::IoResult<()> {
+                self.0.send(header, payload).await
+            }
+            async fn receive_into(
+                &self,
+                payload: &mut [u8],
+            ) -> helios_hal::io::IoResult<VsockDelivery> {
+                self.0.receive_into(payload).await
+            }
+        }
+
+        let raw_vsock = VsockService::new(cpu, timer, ArcVsockDevice(dev.clone()));
+        let vsock_svc = ComponentHostVsockService::from_service(raw_vsock.clone());
+
+        // 1. Bind a vsock listener on port 9000; inject an incoming peer connect
+        //    packet + data payload BEFORE hand-off and pump one receive step.
+        let listener_id = vsock_svc.listen(9000, 4).expect("vsock listen");
+        assert!(!vsock_svc.listener_readable(listener_id).unwrap());
+
+        let vsock_hdr =
+            |src_port: u32, dst_port: u32, op: VsockOp, payload_len: u32| VsockPacketHeader {
+                source: VsockAddress::host(src_port),
+                destination: VsockAddress {
+                    cid: 7,
+                    port: dst_port,
+                },
+                op,
+                flags: 0,
+                payload_len,
+                buf_alloc: 65536,
+                fwd_cnt: 0,
+            };
+        dev.enqueue(vsock_hdr(50000, 9000, VsockOp::Request, 0), Vec::new());
+        dev.enqueue(vsock_hdr(50000, 9000, VsockOp::Data, 5), b"hello".to_vec());
+        // Drive the vsock pump just enough to ingest both queued packets.
+        block_on(async {
+            let mut pump = core::pin::pin!(raw_vsock.clone().run_forever());
+            let waker = futures::task::noop_waker_ref();
+            let mut cx = Context::from_waker(waker);
+            let _ = pump.as_mut().poll(&mut cx);
+            let _ = pump.as_mut().poll(&mut cx);
+        });
+        // Supervisor `wait_readable` observes readiness WITHOUT consuming the connection!
+        assert!(block_on(vsock_svc.wait_readable(listener_id, 1_000_000)).unwrap());
+        assert!(vsock_svc.listener_readable(listener_id).unwrap());
+
+        // 2. Wasm component hand-off: `take_inherited_sockets` returns `[Tcp, Vsock]`
+        //    once and `[]` on a second call.
+        let engine = component_test_engine();
+        let store_data = test_store::store_data_authorized(ProcessAuthority::root(), |_| {});
+        let net_svc = TestNetworkService::new();
+        store_data
+            .runtime_state
+            .install_network_service(net_svc.clone());
+        let retire = store_data.retirement.sender();
+        let tcp_raw =
+            crate::InheritedSocket::from_tcp_listener(&mut crate::ComponentTcpListener::new(
+                42,
+                crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
+                8080,
+                64,
+                retire,
+            ))
+            .unwrap();
+        let vsock_inherited =
+            crate::InheritedSocket::from_vsock_listener(vsock_svc.clone(), listener_id);
+        let mut child_store = wasmtime::Store::new(
+            &engine,
+            store_data.with_inherited_sockets(crate::InheritedSockets::from_vec(vec![
+                tcp_raw,
+                vsock_inherited,
+            ])),
+        );
+        let taken = block_on(child_store.run_concurrent(async |accessor| {
+            accessor.with(
+                <HasSelf<test_store::TestStoreData> as HostWithStore<_>>::take_inherited_sockets,
+            )
+        }))
+        .expect("concurrent")
+        .expect("host call");
+        assert_eq!(taken.len(), 2);
+        assert!(matches!(taken[0], wit::InheritedSocket::Tcp(_)));
+        assert!(matches!(taken[1], wit::InheritedSocket::Vsock(_)));
+        let taken_again = block_on(child_store.run_concurrent(async |accessor| {
+            accessor.with(
+                <HasSelf<test_store::TestStoreData> as HostWithStore<_>>::take_inherited_sockets,
+            )
+        }))
+        .expect("concurrent")
+        .expect("host call");
+        assert!(taken_again.is_empty());
+
+        // Move the vsock listener back out of the component table for Linux fd=3 hand-off!
+        let wit::InheritedSocket::Vsock(vsock_res) = &taken[1] else {
+            unreachable!();
+        };
+        let mut comp_vsock: super::super::ComponentVsockListener = child_store
+            .data_mut()
+            .table
+            .delete(wasmtime::component::Resource::new_own(vsock_res.rep()))
+            .unwrap();
+        let (reclaimed_svc, reclaimed_id) = comp_vsock.take().unwrap();
+
+        // 3. Preview1 / WASIX hand-off: inherited sockets occupy fd = 3+,
+        //    shifting preopened directories right behind them.
+        let mut wasix_auth = ProcessAuthority::empty();
+        wasix_auth.insert_directory_preopen(
+            crate::DirectoryPreopen::new("/", "/", crate::DirectoryAuthorityRights::READ).unwrap(),
+        );
+        let p1_sock = UnixSocket::<TestNetworkService>::from_vsock(VsockSocket::Listening {
+            listener: OwnedVsockListener::new(
+                crate::UnixNetwork::with_vsock(None, Some(reclaimed_svc.clone())),
+                reclaimed_id.as_u64(),
+            ),
+            local_cid: 7,
+            local_port: 9000,
+            options: unix_socket_options::<TestNetworkService>(),
+        });
+        let p1_table = Preview1DescriptorTable::from_authority_with_sockets(
+            &wasix_auth,
+            crate::DescriptorLimit::DEFAULT,
+            vec![p1_sock],
+        );
+        assert!(matches!(
+            p1_table.get(3),
+            Some(Preview1Descriptor::Socket(_))
+        ));
+        assert!(matches!(
+            p1_table.get(4),
+            Some(Preview1Descriptor::Preopen { .. })
+        ));
+        drop(p1_table);
+
+        // 4. Linux process hand-off: pre-bound vsock listener with queued connection
+        //    + payload arrives at fd = 3; Linux getsockname, getsockopt(SO_DOMAIN /
+        //    SO_ACCEPTCONN), accept4, and read receive the queued bytes with zero loss!
+        let linux_listener = vsock_svc.listen(9001, 4).expect("vsock listen 9001");
+        dev.enqueue(vsock_hdr(50001, 9001, VsockOp::Request, 0), Vec::new());
+        dev.enqueue(vsock_hdr(50001, 9001, VsockOp::Data, 5), b"hello".to_vec());
+        block_on(async {
+            let mut pump = core::pin::pin!(raw_vsock.clone().run_forever());
+            let waker = futures::task::noop_waker_ref();
+            let mut cx = Context::from_waker(waker);
+            let _ = pump.as_mut().poll(&mut cx);
+            let _ = pump.as_mut().poll(&mut cx);
+        });
+        assert!(block_on(vsock_svc.wait_readable(linux_listener, 1_000_000)).unwrap());
+
+        const ADDR_BUF: u64 = (SCRATCH_BASE + 0x300) as u64;
+        const ADDR_LEN: u64 = (SCRATCH_BASE + 0x320) as u64;
+        const OPT_VAL: u64 = (SCRATCH_BASE + 0x330) as u64;
+        const OPT_LEN: u64 = (SCRATCH_BASE + 0x340) as u64;
+        const READ_BUF: u64 = (SCRATCH_BASE + 0x360) as u64;
+        // 51 = getsockname, 55 = getsockopt, 288 = accept4, 0 = read, 231 = exit_group.
+        // SOL_SOCKET = 1, SO_ACCEPTCONN = 30, SO_DOMAIN = 39.
+        let sock_script = ScriptState::new(
+            vec![
+                ScriptStep::Syscall {
+                    num: 51,
+                    args: [3, ADDR_BUF, ADDR_LEN, 0, 0, 0],
+                },
+                ScriptStep::Syscall {
+                    num: 55,
+                    args: [3, 1, 39, OPT_VAL, OPT_LEN, 0],
+                },
+                ScriptStep::Syscall {
+                    num: 55,
+                    args: [3, 1, 30, OPT_VAL + 4, OPT_LEN, 0],
+                },
+                ScriptStep::Syscall {
+                    num: 288,
+                    args: [3, 0, 0, 0, 0, 0],
+                },
+                ScriptStep::Syscall {
+                    num: 0,
+                    args: [4, READ_BUF, 16, 0, 0, 0],
+                },
+                ScriptStep::Syscall {
+                    num: 231,
+                    args: [0, 0, 0, 0, 0, 0],
+                },
+            ],
+            |scratch| {
+                scratch[0x320..0x324].copy_from_slice(&16_u32.to_le_bytes());
+                scratch[0x340..0x344].copy_from_slice(&4_u32.to_le_bytes());
+            },
+        );
+        let linux_cpu = ScriptedLinuxCpu {
+            base: TestCpu::with_entropy(0x44),
+            script: sock_script.clone(),
+        };
+        let linux_exec = LinuxExecutable::load(&linux_cpu, minimal_x86_64_elf()).unwrap();
+        let ns = crate::Namespace::<UnsupportedStorage>::new(crate::MountTable::new(
+            crate::BootFs::new(
+                crate::EmbeddedBootFs::new(&[], &[]),
+                crate::vfs::BOOT_DEVICE,
+            ),
+            4,
+        ));
+        let runtime_state = HostRuntimeState::<_, TestNetworkService, UnsupportedStorage>::new(
+            linux_cpu.timebase(),
+            1,
+            0,
+            crate::BootPayload::for_tests(),
+            GuestIsa::for_build_target(linux_cpu.native_feature_probe()),
+        );
+        runtime_state.install_vsock_service(vsock_svc.clone());
+        runtime_state.install_root_entropy(triomphe::Arc::new(
+            crate::RootEntropy::from_platform(
+                &linux_cpu,
+                None,
+                None,
+                crate::MachineGeneration::new(None),
+            )
+            .expect("entropy"),
+        ));
+        let executor = crate::Executor::isolated(
+            ProgressCounter::new(),
+            crate::test_support::single_node_pool(1),
+            ProcessorId::new(0),
+        );
+        let registry = crate::InstanceRegistry::new();
+        let instance = registry.register("vsock-child", 0);
+        let exec_context = ProgramExecContext {
+            cpu: linux_cpu.clone(),
+            timer: executor.timer(linux_cpu.clone()),
+            spawner: executor.spawner(linux_cpu.clone()),
+            runtime_state,
+            instance_registry: registry,
+            parent_instance_id: None,
+            read_serial: |_, _| {},
+            write_serial: crate::DebugSerialWriter::of::<test_store::DiscardPort>(),
+        };
+        let container = Arc::new(crate::LinuxContainer::ephemeral(
+            crate::ContainerId::new(core::num::NonZeroU64::new(90).unwrap()),
+            ProcessAuthority::root(),
+            &ns,
+        ));
+        let (_stx, srx) = crate::byte_channel();
+        let (otx, _orx) = crate::byte_channel();
+        let (etx, _erx) = crate::byte_channel();
+        let spawner = executor
+            .spawner(linux_cpu.clone())
+            .instance_spawner(crate::TaskFunding::Instance, &instance);
+        let timeline = phases::Timeline::disabled();
+        let exit = block_on(run_linux_process(
+            LinuxExecRuntime {
+                exec_context,
+                wasm: None,
+            },
+            ProgramArgv::launched("vsock-srv", Vec::new()),
+            Vec::new(),
+            container,
+            None,
+            None,
+            crate::InheritedSockets::from_vec(vec![crate::InheritedSocket::from_vsock_listener(
+                vsock_svc.clone(),
+                linux_listener,
+            )]),
+            DescriptorOrigin::Fresh,
+            WasixSignalState::new(),
+            spawner,
+            instance,
+            OutputMode::Child {
+                stdin_rx: srx,
+                stdout_tx: otx,
+                stderr_tx: etx,
+            },
+            linux_exec,
+            &timeline,
+        ))
+        .expect("vsock server completes");
+        assert_eq!(exit.termination, ChildTermination::Exited(0));
+        let results = sock_script.results.lock().clone();
+        assert_eq!(results, vec![0, 0, 0, 4, 5]);
+        let scratch = sock_script.memory.lock();
+        // getsockname: AF_VSOCK (40), port 9001, cid 7.
+        assert_eq!(u16::from_le_bytes([scratch[0x300], scratch[0x301]]), 40);
+        assert_eq!(
+            u32::from_le_bytes(scratch[0x304..0x308].try_into().unwrap()),
+            9001
+        );
+        assert_eq!(
+            u32::from_le_bytes(scratch[0x308..0x30c].try_into().unwrap()),
+            7
+        );
+        // getsockopt SO_DOMAIN = 40 (AF_VSOCK), SO_ACCEPTCONN = 1.
+        assert_eq!(
+            u32::from_le_bytes(scratch[0x330..0x334].try_into().unwrap()),
+            40
+        );
+        assert_eq!(
+            u32::from_le_bytes(scratch[0x334..0x338].try_into().unwrap()),
+            1
+        );
+        // read(4) received the pre-queued "hello" bytes with zero loss!
+        assert_eq!(&scratch[0x360..0x365], b"hello");
+    }
+
+    #[test]
     fn execve_loads_dynamic_pie_with_pt_interp_and_enforces_interpreter_authority() {
         use crate::test_support::UnsupportedStorage;
         use crate::vfs::BOOT_DEVICE;
         use crate::{
-            BootFs, ContainerConfig, ContainerId, ContainerMountSpec, DirectoryAuthorityRights,
-            EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs, LinuxContainer, MountSharing,
-            ProcessAuthority, SharedOwner,
+            BootFs, ContainerConfig, ContainerId, ContainerMountSharing, ContainerMountSpec,
+            DirectoryAuthorityRights, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
+            LinuxContainer, ProcessAuthority, SharedOwner,
         };
         use alloc::collections::{BTreeMap, VecDeque};
         use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -4190,13 +5133,13 @@ mod linux_tests {
                             target_path: String::from("/"),
                             rights: DirectoryAuthorityRights::READ
                                 | DirectoryAuthorityRights::EXECUTE,
-                            sharing: MountSharing::Shared,
+                            sharing: ContainerMountSharing::Shared,
                         },
                         mounts: alloc::vec![ContainerMountSpec {
                             source_path: String::from("/noexec_src"),
                             target_path: String::from("/noexec"),
                             rights: DirectoryAuthorityRights::READ,
-                            sharing: MountSharing::Shared,
+                            sharing: ContainerMountSharing::Shared,
                         }],
                         shared_owner: SharedOwner { uid: 0, gid: 0 },
                         credentials: Credentials::root(),
@@ -4269,6 +5212,8 @@ mod linux_tests {
                 Vec::new(),
                 container,
                 Some(Credentials::root()),
+                None,
+                crate::InheritedSockets::new(),
                 DescriptorOrigin::Fresh,
                 WasixSignalState::new(),
                 instance_spawner,
