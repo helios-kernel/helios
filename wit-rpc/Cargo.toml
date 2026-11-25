@@ -3,6 +3,10 @@ name = "helios-wit-rpc"
 version = "0.1.0"
 edition.workspace = true
 
+[features]
+default = []
+inspector-rpc = []
+
 [dependencies]
 async-lock = "3.4.2"
 event-listener = "5.4.2"

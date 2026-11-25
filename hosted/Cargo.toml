@@ -21,7 +21,11 @@ tracing.workspace = true
 
 [dev-dependencies]
 helios-artifact.workspace = true
-helios-inspector-protocol.workspace = true
+helios-inspector-protocol = { workspace = true, features = ["host"] }
+helios-wit-rpc = { workspace = true, features = ["inspector-rpc"] }
+helios-workspace-root.workspace = true
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["alloc"] }
+futures-io = "0.3.34"
 tokio = { version = "1.48.0", features = ["rt-multi-thread"] }
 tokio-util = { version = "0.7.16", features = ["compat"] }
 tempfile.workspace = true

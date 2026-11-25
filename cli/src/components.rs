@@ -412,6 +412,15 @@ pub(crate) fn run_image_build(
             kind: BootAssetKind::File,
         });
     }
+    let prepared_inspector = crate::prepare_inspector_auth(&command.out_dir, None, None)?;
+    bootfs_assets.push(BootAsset {
+        path: helios_inspector_protocol::auth::INSPECTOR_POLICY_PATH
+            .trim_start_matches('/')
+            .to_owned(),
+        source: resolve_bootfs_source(&prepared_inspector.policy_path)
+            .map_err(PrebuildError::from)?,
+        kind: BootAssetKind::File,
+    });
 
     let userspace_payload_path = command.out_dir.join(USERSPACE_PAYLOAD_ARTIFACT_FILE);
     write_bootfs_image(
@@ -1216,8 +1225,8 @@ nonexistent_flag = 42
             },
             bootfs::WriteEntry {
                 kind: bootfs::EntryKind::File,
-                path: "bin/debugger",
-                data: b"synthetic-debugger",
+                path: "bin/inspector-host",
+                data: b"synthetic-inspector-host",
                 modified_nanos: 0,
             },
         ]);
@@ -1257,7 +1266,9 @@ nonexistent_flag = 42
                 "/plugins/compiler".to_owned(),
                 "/plugins/http-client".to_owned(),
                 "/plugins/compositor".to_owned(),
-                "/debugger".to_owned(),
+                "/inspector".to_owned(),
+                "/inspector/tls".to_owned(),
+                "/inspector/worker".to_owned(),
             ],
         };
 

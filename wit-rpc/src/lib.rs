@@ -8,18 +8,26 @@
 mod codec;
 mod endpoint;
 mod error;
+#[cfg(feature = "inspector-rpc")]
+pub mod inspector;
+#[cfg(feature = "inspector-rpc")]
+pub mod inspector_fs;
+#[cfg(feature = "inspector-rpc")]
+pub mod inspector_snapshot;
 mod resource;
 mod stream;
 
 pub use codec::{Decoder, Encoder, ErrorContext, RpcDecode, RpcEncode};
 pub use endpoint::{Dispatcher, Endpoint, EndpointConfig, ServerInvocation, Service};
 pub use error::{Result, RpcError};
-pub use helios_inspector_protocol::mux::{DEFAULT_STREAM_CREDIT_WINDOW, PeerHandle};
+pub use helios_inspector_protocol::mux::{
+    DEFAULT_STREAM_CREDIT_WINDOW, MaybeSend, MaybeSync, PeerHandle,
+};
 pub use helios_inspector_protocol::{TransportError, WireError};
 pub use helios_wit_rpc_macro::generate;
 pub use resource::{
-    EitherResource, HandleAllocator, RemoteResource, ResourceBorrow, ResourceEntry, ResourceTable,
-    ResourceTableInner,
+    EitherResource, HandleAllocator, RemoteResource, ResourceBorrow, ResourceEntry,
+    ResourceSlotAccess, ResourceTable, ResourceTableInner,
 };
 pub use stream::{FutureReader, FutureWriter, StreamReader, StreamWriter, future, stream};
 
@@ -34,9 +42,10 @@ pub mod __private {
     pub use crate::endpoint::{Dispatcher, ServerInvocation, Service};
     pub use crate::error::{Result, RpcError};
     pub use crate::resource::{
-        RemoteResource, ResourceBorrow, ResourceEntry, ResourceTable, ResourceTableInner,
+        RemoteResource, ResourceBorrow, ResourceEntry, ResourceSlotAccess, ResourceTable,
+        ResourceTableInner,
     };
     pub use crate::stream::{FutureReader, StreamReader};
     pub use helios_inspector_protocol::WireError;
-    pub use helios_inspector_protocol::mux::PeerHandle;
+    pub use helios_inspector_protocol::mux::{MaybeSend, MaybeSync, PeerHandle};
 }

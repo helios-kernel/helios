@@ -361,7 +361,15 @@ fn main() -> Result<(), InspectorError> {
 
             // Legacy serial `--device` path (supports `--boot-sync` and `stats` TUI directly).
             if let Some(device) = args.serial.device.as_deref() {
-                let client = connect_client(device, args.serial.baud, args.serial.boot_sync)?;
+                let options = ops_cli::build_session_options(&args.ops)?;
+                let identity = match &options.security {
+                    helios_ops::SecurityMode::Authenticated { identity, .. } => {
+                        Some(identity.as_ref())
+                    }
+                    helios_ops::SecurityMode::Plain => None,
+                };
+                let client =
+                    connect_client(device, args.serial.baud, args.serial.boot_sync, identity)?;
                 let target_uri = format!("serial://{device}?baud={}", args.serial.baud);
                 return Ok(run_connected(
                     client,
@@ -503,13 +511,31 @@ pub(crate) fn connect_client(
     device: &str,
     baud: u32,
     boot_sync: bool,
+    identity: Option<&helios_inspector_protocol::auth::ClientIdentity>,
 ) -> Result<serial::RpcClient, ConnectError> {
     runtime::block_on(async move {
         let io = serial::open(device, baud).await?;
         if boot_sync {
-            Ok(ready::connect_after_boot(io).await?)
+            Ok(ready::connect_after_boot(io, identity).await?)
         } else {
-            let mut client = io.into_client()?;
+            let (read, write) = io.into_split();
+            let mut client = match identity {
+                Some(identity) => serial::RpcClient::connect_authenticated(
+                    read,
+                    write,
+                    helios_inspector_protocol::auth::TransportKind::Serial,
+                    identity,
+                    None,
+                )
+                .await
+                .map_err(|err| match err {
+                    serial::AuthConnectError::Auth(source) => {
+                        ConnectError::Boot(ready::BootError::Auth { source })
+                    }
+                    serial::AuthConnectError::Driver(source) => ConnectError::Driver { source },
+                })?,
+                None => serial::RpcClient::new(read, write)?,
+            };
             ready::wait_until_ready(&mut client).await?;
             Ok(client)
         }
@@ -788,7 +814,7 @@ mod tests {
             "release",
             "--dynamic-components",
             "--boot-program",
-            "debugger",
+            "inspector-host",
             "--no-compiler-plugin",
         ])
         .expect("`helios image build` must parse");
@@ -796,7 +822,7 @@ mod tests {
             Some(Command::Image(image::ImageCommand::Build(args))) => {
                 assert!(args.dynamic_components);
                 assert_eq!(args.profile, "release");
-                assert_eq!(args.boot_programs, vec!["debugger"]);
+                assert_eq!(args.boot_programs, vec!["inspector-host"]);
                 let forwarded = image::build_cli_args(&args);
                 assert!(forwarded.contains(&"image-build".to_owned()));
                 assert!(forwarded.contains(&"--dynamic-components".to_owned()));

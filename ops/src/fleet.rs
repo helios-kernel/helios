@@ -4,7 +4,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use helios_inspector_protocol::system::{
+use helios_wit_rpc::inspector::helios::system::{
     inspect::SnapshotResult, instances::Instance, programs::ExecResult,
 };
 use tokio::sync::Semaphore;

@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use clap::{Args as ClapArgs, ValueEnum};
-use helios_inspector_protocol::RpcError;
-use helios_inspector_protocol::debugger::filesystem as debugger_fs;
-use helios_inspector_protocol::system::programs::{
+use helios_wit_rpc::RpcError;
+use helios_wit_rpc::inspector::helios::system::programs::{
     self as system_programs, ExecErrorKind, ExecResult,
 };
+use helios_wit_rpc::inspector_fs::{self, FsRpcError};
 use serde::{Deserialize, Serialize};
 
 use crate::programs::ProgramError;
@@ -62,8 +62,8 @@ pub(crate) struct GuestIsa {
     pub(crate) extras: Vec<String>,
 }
 
-impl From<&helios_inspector_protocol::system::inspect::Processors> for GuestIsa {
-    fn from(processors: &helios_inspector_protocol::system::inspect::Processors) -> Self {
+impl From<&helios_wit_rpc::inspector_snapshot::Processors> for GuestIsa {
+    fn from(processors: &helios_wit_rpc::inspector_snapshot::Processors) -> Self {
         Self {
             level: processors.guest_isa_level.clone(),
             extras: processors.guest_isa_extras.clone(),
@@ -130,7 +130,7 @@ pub(crate) enum WorkloadBenchError {
     UploadAotWasm {
         path: String,
         #[source]
-        source: RpcError,
+        source: FsRpcError,
     },
     #[error("failed to AOT compile workload {workload}: {source}")]
     AotCompile {
@@ -192,9 +192,8 @@ impl WorkloadBenchError {
     pub(crate) fn guest_panic(&self) -> Option<&str> {
         match self {
             Self::RunWorkload { source, .. } => source.guest_panic(),
-            Self::UploadAotWasm { source, .. } | Self::AotCompile { source, .. } => {
-                source.guest_panic()
-            }
+            Self::UploadAotWasm { source, .. } => source.guest_panic(),
+            Self::AotCompile { source, .. } => source.guest_panic(),
             Self::Guest { source } => source.guest_panic(),
             Self::WorkloadTimedOut { .. }
             | Self::GuestStepTimedOut { .. }
@@ -655,7 +654,12 @@ pub(crate) fn required_boot_programs(
     command: &WorkloadBenchCommand,
 ) -> Result<Vec<String>, WorkloadSelectionError> {
     let workloads = select_workloads(command)?;
-    let mut programs = vec!["dash".to_owned(), "debugger".to_owned()];
+    let mut programs = vec![
+        "dash".to_owned(),
+        "inspector-host".to_owned(),
+        "inspector-tls".to_owned(),
+        "inspector-worker".to_owned(),
+    ];
     for workload in workloads {
         if matches!(
             workload.runner,
@@ -1093,7 +1097,7 @@ async fn run_aot_workload(
         source,
     })?;
     if iteration == 1 {
-        debugger_fs::write(client, remote_path, &wasm, false)
+        inspector_fs::write_file(client, remote_path, &wasm, false)
             .await
             .map_err(|source| WorkloadBenchError::UploadAotWasm {
                 path: wasm_path.display().to_string(),
@@ -1102,20 +1106,18 @@ async fn run_aot_workload(
     }
 
     let started = Instant::now();
-    let outcome = system_programs::aot(
-        client,
-        &system_programs::AotRequest {
+    let outcome = system_programs::RpcClient::new(client.peer())
+        .aot(system_programs::AotRequest {
             source_path: remote_path.clone(),
             destination_path: destination_path.clone(),
             hint: system_programs::AotHint::Performance,
             profile: false,
-        },
-    )
-    .await
-    .map_err(|source| WorkloadBenchError::AotCompile {
-        workload: workload.name.clone(),
-        source,
-    })?;
+        })
+        .await
+        .map_err(|source| WorkloadBenchError::AotCompile {
+            workload: workload.name.clone(),
+            source,
+        })?;
     let elapsed_ms = elapsed_millis(started);
     let result = outcome.map_err(|error| WorkloadBenchError::AotRefused {
         workload: workload.name.clone(),
@@ -1560,7 +1562,7 @@ fn render_network_counters(
     sink: &mut impl std::io::Write,
     workload: &str,
     when: &str,
-    sample: Result<Option<helios_inspector_protocol::system::inspect::Network>, WorkloadBenchError>,
+    sample: Result<Option<helios_wit_rpc::inspector_snapshot::Network>, WorkloadBenchError>,
 ) {
     let _ = writeln!(sink, "--- workload {workload} {when} network counters ---");
     match sample {
@@ -1840,7 +1842,7 @@ mod tests {
 
     #[test]
     fn network_counter_block_names_workload_and_moment_and_carries_orphans() {
-        use helios_inspector_protocol::system::inspect::{Network, NetworkQueue};
+        use helios_wit_rpc::inspector_snapshot::{Network, NetworkQueue};
         let queue = NetworkQueue {
             id: 3,
             rx_frames: 0,
@@ -2102,7 +2104,7 @@ mod tests {
     /// as a list.
     #[test]
     fn the_run_record_carries_the_guest_isa() {
-        let processors = helios_inspector_protocol::system::inspect::Processors {
+        let processors = helios_wit_rpc::inspector_snapshot::Processors {
             configured: 2,
             online: 2,
             utilization: Vec::new(),

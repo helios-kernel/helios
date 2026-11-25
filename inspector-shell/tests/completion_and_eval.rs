@@ -1,7 +1,8 @@
-//! End-to-end integration tests for `helios-inspector-shell`:
+//! End-to-end integration tests for `helios-inspector-shell` over `helios-wit-rpc`
+//! (zero `helios:debugger/*`):
 //! - Live `<Tab>` completion via `helios_nu::complete_async` + `AsyncReedlineCompleter`
 //!   (commands, flags, downstream pipeline table columns, `/kernel/*` inspect paths,
-//!   live instances/monikers, diagnostic targets, VFS paths)
+//!   live instances/monikers, diagnostic targets, VFS paths over `wasi:filesystem`)
 //! - 150ms remote latency ceiling against a stalled guest
 //! - 1.5s TTL completion cache deduplicating repeated `<Tab>` presses
 //! - `helios nu -c '<pipeline>'`, `--local` host file I/O, `bundle`, and `fleet` commands.
@@ -12,18 +13,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_io::Async;
-use helios_inspector_protocol::debugger::filesystem::{DirectoryEntry, EntryKind};
-use helios_inspector_protocol::debugger::methods as dbg_methods;
-use helios_inspector_protocol::system::{
-    inspect::{
-        ComponentPublication, Entry as InspectEntry, PublicationStatus, SnapshotResult,
-        Value as InspectValue,
-    },
-    instances::Instance,
-    methods as sys_methods,
-    tracing::{Event as TraceEvent, Field as TraceField, Level as TraceLevel, Value as TraceValue},
-};
-use helios_inspector_protocol::wire::{Frame, read_frame, write_frame};
 use helios_inspector_shell::completer::CompletionSnapshot;
 use helios_inspector_shell::{
     AsyncReedlineCompleter, COMPLETION_CACHE_TTL, COMPLETION_REMOTE_TIMEOUT, HostEnv, OutputFormat,
@@ -31,27 +20,669 @@ use helios_inspector_shell::{
 };
 use helios_nu::{CompletionKind, ShellSession};
 use helios_ops::{Fleet, RpcConnection, Session, SessionOptions, Target};
+use helios_wit_rpc::inspector::helios::system::{
+    filters::FilterError,
+    inspect::{
+        self as rpc_inspect, ComponentPublication, Entry as InspectEntry, PublicationStatus, Query,
+        SnapshotResult, Value as InspectValue,
+    },
+    instances::{self as rpc_instances, Instance},
+    profiling::{
+        self as rpc_profiling, Filter as ProfileFilter, FoldedSample, MetricFilter, MetricSample,
+    },
+    tracing::{
+        self as rpc_tracing, Event as TraceEvent, Field as TraceField, Level as TraceLevel,
+        Value as TraceValue,
+    },
+};
+use helios_wit_rpc::inspector::wasi::filesystem::{
+    preopens as rpc_preopens,
+    types::{
+        self as rpc_fs, Advice, DescriptorFlags, DescriptorStat, DescriptorType, DirectoryEntry,
+        ErrorCode, Filesize, MetadataHashValue, NewTimestamp, OpenFlags, PathFlags,
+    },
+};
+use helios_wit_rpc::{
+    Dispatcher, Endpoint, FutureReader, ResourceEntry, ResourceSlotAccess, ServerInvocation,
+    StreamReader, WireError, future as rpc_future, stream as rpc_stream,
+};
 use reedline::{Completer as _, CompletionResult, CompletionStatus};
 use tempfile::TempDir;
 use tokio::sync::RwLock;
 
+#[derive(Default)]
 struct MockGuestCounters {
     inspect_calls: AtomicUsize,
     instances_calls: AtomicUsize,
     list_calls: AtomicUsize,
 }
 
-impl Default for MockGuestCounters {
-    fn default() -> Self {
-        Self {
-            inspect_calls: AtomicUsize::new(0),
-            instances_calls: AtomicUsize::new(0),
-            list_calls: AtomicUsize::new(0),
+#[derive(Clone)]
+struct MockDirHandle {
+    path: String,
+}
+
+enum MockResource {
+    Dir(Arc<MockDirHandle>),
+    Pub(Arc<()>),
+    Sampling(Arc<()>),
+}
+
+impl ResourceEntry for MockResource {
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Dir(_) => "descriptor",
+            Self::Pub(_) => "publication",
+            Self::Sampling(_) => "sampling-session",
         }
     }
 }
 
-/// Spawn an in-process mock guest speaking the real `helios-inspector-protocol` wire framing.
+impl ResourceSlotAccess<rpc_fs::Descriptor, MockDirHandle> for MockResource {
+    fn into_entry(arc: Arc<MockDirHandle>) -> Self {
+        Self::Dir(arc)
+    }
+    fn borrow_entry(&self) -> Option<&Arc<MockDirHandle>> {
+        match self {
+            Self::Dir(d) => Some(d),
+            _ => None,
+        }
+    }
+    fn take_entry(self) -> Result<Arc<MockDirHandle>, Self> {
+        match self {
+            Self::Dir(d) => Ok(d),
+            other => Err(other),
+        }
+    }
+}
+
+impl ResourceSlotAccess<rpc_inspect::Publication, ()> for MockResource {
+    fn into_entry(arc: Arc<()>) -> Self {
+        Self::Pub(arc)
+    }
+    fn borrow_entry(&self) -> Option<&Arc<()>> {
+        match self {
+            Self::Pub(p) => Some(p),
+            _ => None,
+        }
+    }
+    fn take_entry(self) -> Result<Arc<()>, Self> {
+        match self {
+            Self::Pub(p) => Ok(p),
+            other => Err(other),
+        }
+    }
+}
+
+impl ResourceSlotAccess<rpc_profiling::SamplingSession, ()> for MockResource {
+    fn into_entry(arc: Arc<()>) -> Self {
+        Self::Sampling(arc)
+    }
+    fn borrow_entry(&self) -> Option<&Arc<()>> {
+        match self {
+            Self::Sampling(s) => Some(s),
+            _ => None,
+        }
+    }
+    fn take_entry(self) -> Result<Arc<()>, Self> {
+        match self {
+            Self::Sampling(s) => Ok(s),
+            other => Err(other),
+        }
+    }
+}
+
+struct MockInspect {
+    counters: Arc<MockGuestCounters>,
+    delay: Duration,
+}
+
+impl rpc_inspect::RpcHandler for MockInspect {
+    type Publication = ();
+
+    async fn publish(
+        &self,
+        _name: String,
+        _span: helios_wit_rpc::inspector::helios::system::memory::Span,
+    ) -> Result<Self::Publication, rpc_inspect::PublishError> {
+        Ok(())
+    }
+
+    async fn snapshot(&self, _query: Query, _limit: u32) -> Result<SnapshotResult, FilterError> {
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.counters.inspect_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(SnapshotResult {
+            timestamp: 123_456_789,
+            truncated: false,
+            publications: vec![ComponentPublication {
+                instance_id: 7,
+                instance_name: "http-client".to_owned(),
+                name: "state".to_owned(),
+                generation: 1,
+                status: PublicationStatus::Ok,
+            }],
+            entries: vec![
+                InspectEntry {
+                    path: "/kernel/memory/total-bytes".to_owned(),
+                    value: InspectValue::Unsigned64(2 * 1024 * 1024 * 1024),
+                },
+                InspectEntry {
+                    path: "/kernel/memory/available-bytes".to_owned(),
+                    value: InspectValue::Unsigned64(1024 * 1024 * 1024),
+                },
+                InspectEntry {
+                    path: "/kernel/processors/online".to_owned(),
+                    value: InspectValue::Unsigned64(4),
+                },
+                InspectEntry {
+                    path: "/core/http-client/requests-total".to_owned(),
+                    value: InspectValue::Unsigned64(42),
+                },
+            ],
+        })
+    }
+}
+
+struct MockInstances {
+    counters: Arc<MockGuestCounters>,
+    delay: Duration,
+}
+
+impl rpc_instances::RpcHandler for MockInstances {
+    async fn snapshot(&self) -> Vec<Instance> {
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.counters.instances_calls.fetch_add(1, Ordering::SeqCst);
+        vec![
+            Instance {
+                id: 1,
+                name: "init".to_owned(),
+                started_at: 100,
+                uptime: 5_000_000_000,
+                memory_bytes: 4 * 1024 * 1024,
+                storage_bytes: 0,
+                cpu_busy: 12,
+            },
+            Instance {
+                id: 7,
+                name: "http-client".to_owned(),
+                started_at: 200,
+                uptime: 3_000_000_000,
+                memory_bytes: 8 * 1024 * 1024,
+                storage_bytes: 0,
+                cpu_busy: 45,
+            },
+        ]
+    }
+
+    async fn kill(&self, _id: u64) -> Result<(), rpc_instances::KillError> {
+        Ok(())
+    }
+}
+
+struct MockTracing;
+
+impl rpc_tracing::RpcHandler for MockTracing {
+    async fn recent(
+        &self,
+        _filter: rpc_tracing::Filter,
+        _limit: u32,
+    ) -> Result<Vec<TraceEvent>, FilterError> {
+        Ok(vec![TraceEvent {
+            timestamp: 1000,
+            level: TraceLevel::Info,
+            target: "helios_kernel::net::tcp".to_owned(),
+            fields: vec![TraceField {
+                key: "message".to_owned(),
+                value: TraceValue::Text("link up".to_owned()),
+            }],
+        }])
+    }
+
+    async fn subscribe(
+        &self,
+        _filter: rpc_tracing::Filter,
+    ) -> Result<StreamReader<TraceEvent>, FilterError> {
+        let (_tx, rx) = rpc_stream();
+        Ok(rx)
+    }
+
+    async fn set_target_enabled(
+        &self,
+        _target: String,
+        _enabled: bool,
+    ) -> Result<(), rpc_tracing::TargetError> {
+        Ok(())
+    }
+}
+
+struct MockProfiling;
+
+impl rpc_profiling::RpcHandler for MockProfiling {
+    type SamplingSession = ();
+
+    async fn set_enabled(&self, _enabled: bool) -> Result<(), rpc_profiling::ControlError> {
+        Ok(())
+    }
+
+    async fn clear(&self) -> Result<(), rpc_profiling::ControlError> {
+        Ok(())
+    }
+
+    async fn folded(
+        &self,
+        _filter: ProfileFilter,
+        _limit: u32,
+    ) -> Result<Vec<FoldedSample>, FilterError> {
+        Ok(Vec::new())
+    }
+
+    async fn metrics(
+        &self,
+        _filter: MetricFilter,
+        _limit: u32,
+    ) -> Result<Vec<MetricSample>, FilterError> {
+        Ok(Vec::new())
+    }
+
+    async fn start_instruction_sampling(
+        &self,
+    ) -> Result<Self::SamplingSession, rpc_profiling::InstructionProfileError> {
+        Ok(())
+    }
+
+    async fn instruction_samples(
+        &self,
+    ) -> Result<rpc_profiling::InstructionProfile, rpc_profiling::InstructionProfileError> {
+        Ok(rpc_profiling::InstructionProfile {
+            period_nanos: 1_000,
+            kernel_image_base: 0,
+            samples: Vec::new(),
+            dropped: 0,
+        })
+    }
+
+    async fn raw_profile_size(&self) -> Result<u64, rpc_profiling::RawProfileError> {
+        Ok(0)
+    }
+
+    async fn raw_profile_read(
+        &self,
+        _offset: u64,
+        _len: u32,
+    ) -> Result<Vec<u8>, rpc_profiling::RawProfileError> {
+        Ok(Vec::new())
+    }
+}
+
+struct MockPreopens;
+
+impl rpc_preopens::RpcHandler for MockPreopens {
+    type Descriptor = MockDirHandle;
+
+    async fn get_directories(&self) -> Vec<(Self::Descriptor, String)> {
+        vec![(
+            MockDirHandle {
+                path: "/".to_owned(),
+            },
+            "/".to_owned(),
+        )]
+    }
+}
+
+struct MockFs {
+    counters: Arc<MockGuestCounters>,
+}
+
+fn join_mock_path(base: &str, rel: &str) -> String {
+    let rel = rel.trim_matches('/');
+    if rel.is_empty() {
+        base.to_owned()
+    } else if base == "/" {
+        format!("/{rel}")
+    } else {
+        format!("{base}/{rel}")
+    }
+}
+
+fn mock_stat(ty: DescriptorType, size: u64) -> DescriptorStat {
+    DescriptorStat {
+        r#type: ty,
+        link_count: 1,
+        size,
+        data_access_timestamp: None,
+        data_modification_timestamp: None,
+        status_change_timestamp: None,
+    }
+}
+
+impl rpc_fs::RpcHandler for MockFs {
+    type Descriptor = MockDirHandle;
+
+    async fn descriptor_read_via_stream(
+        &self,
+        _self_: &Self::Descriptor,
+        _offset: Filesize,
+    ) -> (StreamReader<u8>, FutureReader<Result<(), ErrorCode>>) {
+        let (mut tx, rx) = rpc_stream::<u8>();
+        let (ftx, frx) = rpc_future::<Result<(), ErrorCode>>();
+        tokio::spawn(async move {
+            let _ = tx.send_batch(b"echo hello from guest\n".to_vec()).await;
+            let _ = tx.close().await;
+            let _ = ftx.resolve(Ok(())).await;
+        });
+        (rx, frx)
+    }
+
+    async fn descriptor_write_via_stream(
+        &self,
+        _self_: &Self::Descriptor,
+        mut data: StreamReader<u8>,
+        _offset: Filesize,
+    ) -> FutureReader<Result<(), ErrorCode>> {
+        let (ftx, frx) = rpc_future::<Result<(), ErrorCode>>();
+        tokio::spawn(async move {
+            while let Ok(Some(_)) = data.next_batch().await {}
+            let _ = ftx.resolve(Ok(())).await;
+        });
+        frx
+    }
+
+    async fn descriptor_append_via_stream(
+        &self,
+        _self_: &Self::Descriptor,
+        mut data: StreamReader<u8>,
+    ) -> FutureReader<Result<(), ErrorCode>> {
+        let (ftx, frx) = rpc_future::<Result<(), ErrorCode>>();
+        tokio::spawn(async move {
+            while let Ok(Some(_)) = data.next_batch().await {}
+            let _ = ftx.resolve(Ok(())).await;
+        });
+        frx
+    }
+
+    async fn descriptor_advise(
+        &self,
+        _self_: &Self::Descriptor,
+        _offset: Filesize,
+        _length: Filesize,
+        _advice: Advice,
+    ) -> Result<(), ErrorCode> {
+        Ok(())
+    }
+
+    async fn descriptor_sync_data(&self, _self_: &Self::Descriptor) -> Result<(), ErrorCode> {
+        Ok(())
+    }
+
+    async fn descriptor_get_flags(
+        &self,
+        _self_: &Self::Descriptor,
+    ) -> Result<DescriptorFlags, ErrorCode> {
+        Ok(DescriptorFlags::READ)
+    }
+
+    async fn descriptor_get_type(
+        &self,
+        _self_: &Self::Descriptor,
+    ) -> Result<DescriptorType, ErrorCode> {
+        Ok(DescriptorType::Directory)
+    }
+
+    async fn descriptor_set_size(
+        &self,
+        _self_: &Self::Descriptor,
+        _size: Filesize,
+    ) -> Result<(), ErrorCode> {
+        Ok(())
+    }
+
+    async fn descriptor_set_times(
+        &self,
+        _self_: &Self::Descriptor,
+        _data_access_timestamp: NewTimestamp,
+        _data_modification_timestamp: NewTimestamp,
+    ) -> Result<(), ErrorCode> {
+        Ok(())
+    }
+
+    async fn descriptor_read_directory(
+        &self,
+        self_: &Self::Descriptor,
+    ) -> (
+        StreamReader<DirectoryEntry>,
+        FutureReader<Result<(), ErrorCode>>,
+    ) {
+        self.counters.list_calls.fetch_add(1, Ordering::SeqCst);
+        let entries = match self_.path.as_str() {
+            "/" => vec![
+                DirectoryEntry {
+                    r#type: DescriptorType::Directory,
+                    name: "bin".to_owned(),
+                },
+                DirectoryEntry {
+                    r#type: DescriptorType::Directory,
+                    name: "etc".to_owned(),
+                },
+            ],
+            "/bin" => vec![
+                DirectoryEntry {
+                    r#type: DescriptorType::RegularFile,
+                    name: "nu".to_owned(),
+                },
+                DirectoryEntry {
+                    r#type: DescriptorType::RegularFile,
+                    name: "ping".to_owned(),
+                },
+            ],
+            "/etc" => vec![DirectoryEntry {
+                r#type: DescriptorType::RegularFile,
+                name: "rc.nu".to_owned(),
+            }],
+            _ => Vec::new(),
+        };
+        let (mut tx, rx) = rpc_stream::<DirectoryEntry>();
+        let (ftx, frx) = rpc_future::<Result<(), ErrorCode>>();
+        tokio::spawn(async move {
+            if !entries.is_empty() {
+                let _ = tx.send_batch(entries).await;
+            }
+            let _ = tx.close().await;
+            let _ = ftx.resolve(Ok(())).await;
+        });
+        (rx, frx)
+    }
+
+    async fn descriptor_sync(&self, _self_: &Self::Descriptor) -> Result<(), ErrorCode> {
+        Ok(())
+    }
+
+    async fn descriptor_create_directory_at(
+        &self,
+        _self_: &Self::Descriptor,
+        _path: String,
+    ) -> Result<(), ErrorCode> {
+        Ok(())
+    }
+
+    async fn descriptor_stat(
+        &self,
+        _self_: &Self::Descriptor,
+    ) -> Result<DescriptorStat, ErrorCode> {
+        Ok(mock_stat(DescriptorType::Directory, 0))
+    }
+
+    async fn descriptor_stat_at(
+        &self,
+        self_: &Self::Descriptor,
+        _path_flags: PathFlags,
+        path: String,
+    ) -> Result<DescriptorStat, ErrorCode> {
+        let full = join_mock_path(&self_.path, &path);
+        match full.as_str() {
+            "/" | "/bin" | "/etc" => Ok(mock_stat(DescriptorType::Directory, 0)),
+            "/bin/nu" | "/bin/ping" | "/etc/rc.nu" => {
+                Ok(mock_stat(DescriptorType::RegularFile, 22))
+            }
+            _ => Err(ErrorCode::NoEntry),
+        }
+    }
+
+    async fn descriptor_set_times_at(
+        &self,
+        _self_: &Self::Descriptor,
+        _path_flags: PathFlags,
+        _path: String,
+        _data_access_timestamp: NewTimestamp,
+        _data_modification_timestamp: NewTimestamp,
+    ) -> Result<(), ErrorCode> {
+        Ok(())
+    }
+
+    async fn descriptor_link_at(
+        &self,
+        _self_: &Self::Descriptor,
+        _old_path_flags: PathFlags,
+        _old_path: String,
+        _new_descriptor: &Self::Descriptor,
+        _new_path: String,
+    ) -> Result<(), ErrorCode> {
+        Ok(())
+    }
+
+    async fn descriptor_open_at(
+        &self,
+        self_: &Self::Descriptor,
+        _path_flags: PathFlags,
+        path: String,
+        _open_flags: OpenFlags,
+        _flags: DescriptorFlags,
+    ) -> Result<Self::Descriptor, ErrorCode> {
+        Ok(MockDirHandle {
+            path: join_mock_path(&self_.path, &path),
+        })
+    }
+
+    async fn descriptor_readlink_at(
+        &self,
+        _self_: &Self::Descriptor,
+        _path: String,
+    ) -> Result<String, ErrorCode> {
+        Err(ErrorCode::Invalid)
+    }
+
+    async fn descriptor_remove_directory_at(
+        &self,
+        _self_: &Self::Descriptor,
+        _path: String,
+    ) -> Result<(), ErrorCode> {
+        Ok(())
+    }
+
+    async fn descriptor_rename_at(
+        &self,
+        _self_: &Self::Descriptor,
+        _old_path: String,
+        _new_descriptor: &Self::Descriptor,
+        _new_path: String,
+    ) -> Result<(), ErrorCode> {
+        Ok(())
+    }
+
+    async fn descriptor_symlink_at(
+        &self,
+        _self_: &Self::Descriptor,
+        _old_path: String,
+        _new_path: String,
+    ) -> Result<(), ErrorCode> {
+        Ok(())
+    }
+
+    async fn descriptor_unlink_file_at(
+        &self,
+        _self_: &Self::Descriptor,
+        _path: String,
+    ) -> Result<(), ErrorCode> {
+        Ok(())
+    }
+
+    async fn descriptor_is_same_object(
+        &self,
+        self_: &Self::Descriptor,
+        other: &Self::Descriptor,
+    ) -> bool {
+        self_.path == other.path
+    }
+
+    async fn descriptor_metadata_hash(
+        &self,
+        _self_: &Self::Descriptor,
+    ) -> Result<MetadataHashValue, ErrorCode> {
+        Ok(MetadataHashValue { lower: 0, upper: 0 })
+    }
+
+    async fn descriptor_metadata_hash_at(
+        &self,
+        _self_: &Self::Descriptor,
+        _path_flags: PathFlags,
+        _path: String,
+    ) -> Result<MetadataHashValue, ErrorCode> {
+        Ok(MetadataHashValue { lower: 0, upper: 0 })
+    }
+}
+
+struct MockGuestDispatcher {
+    inspect: rpc_inspect::RpcServer<MockInspect>,
+    instances: rpc_instances::RpcServer<MockInstances>,
+    tracing: rpc_tracing::RpcServer<MockTracing>,
+    profiling: rpc_profiling::RpcServer<MockProfiling>,
+    preopens: rpc_preopens::RpcServer<MockPreopens>,
+    fs: rpc_fs::RpcServer<MockFs>,
+}
+
+impl Dispatcher for MockGuestDispatcher {
+    type Resource = MockResource;
+
+    fn supports(&self, instance: &str, func: &str) -> bool {
+        self.inspect.supports_call(instance, func)
+            || self.instances.supports_call(instance, func)
+            || self.tracing.supports_call(instance, func)
+            || self.profiling.supports_call(instance, func)
+            || self.preopens.supports_call(instance, func)
+            || self.fs.supports_call(instance, func)
+    }
+
+    async fn dispatch<'a>(
+        &'a self,
+        ctx: ServerInvocation<'a, Self::Resource>,
+        instance: &'a str,
+        func: &'a str,
+    ) -> Result<(), WireError> {
+        if self.inspect.supports_call(instance, func) {
+            self.inspect.dispatch_with(ctx, instance, func).await
+        } else if self.instances.supports_call(instance, func) {
+            self.instances.dispatch_with(ctx, instance, func).await
+        } else if self.tracing.supports_call(instance, func) {
+            self.tracing.dispatch_with(ctx, instance, func).await
+        } else if self.profiling.supports_call(instance, func) {
+            self.profiling.dispatch_with(ctx, instance, func).await
+        } else if self.preopens.supports_call(instance, func) {
+            self.preopens.dispatch_with(ctx, instance, func).await
+        } else if self.fs.supports_call(instance, func) {
+            self.fs.dispatch_with(ctx, instance, func).await
+        } else {
+            Err(WireError::MalformedPayload {
+                context: "MockGuestDispatcher".to_owned(),
+                detail: format!("unsupported {instance}.{func}"),
+            })
+        }
+    }
+}
+
+/// Spawn an in-process mock guest speaking the real `helios-wit-rpc` wire protocol.
 fn spawn_mock_guest(
     delay: Duration,
 ) -> (Session, Arc<MockGuestCounters>, tokio::task::JoinHandle<()>) {
@@ -68,211 +699,33 @@ fn spawn_mock_guest(
     let session = Session::from_connection(target, conn, SessionOptions::default());
 
     let guest_read = guest.try_clone().expect("clone guest read");
-    let mut reader = Async::new(guest_read).expect("register guest read");
-    let mut writer = Async::new(guest).expect("register guest write");
+    let reader = Async::new(guest_read).expect("register guest read");
+    let writer = Async::new(guest).expect("register guest write");
 
     let counters = Arc::new(MockGuestCounters::default());
-    let counters_clone = Arc::clone(&counters);
+    let dispatcher = MockGuestDispatcher {
+        inspect: rpc_inspect::RpcServer::new(MockInspect {
+            counters: Arc::clone(&counters),
+            delay,
+        }),
+        instances: rpc_instances::RpcServer::new(MockInstances {
+            counters: Arc::clone(&counters),
+            delay,
+        }),
+        tracing: rpc_tracing::RpcServer::new(MockTracing),
+        profiling: rpc_profiling::RpcServer::new(MockProfiling),
+        preopens: rpc_preopens::RpcServer::new(MockPreopens),
+        fs: rpc_fs::RpcServer::new(MockFs {
+            counters: Arc::clone(&counters),
+        }),
+    };
 
+    let endpoint = Endpoint::new(reader, writer, dispatcher);
     let handle = tokio::spawn(async move {
-        let mut active: std::collections::HashMap<u32, (String, String, Vec<u8>)> =
-            std::collections::HashMap::new();
-        while let Ok(Some(frame)) = read_frame(&mut reader).await {
-            match frame {
-                Frame::Open {
-                    invocation,
-                    instance,
-                    func,
-                } => {
-                    active.insert(invocation, (instance, func, Vec::new()));
-                    if write_frame(&mut writer, &Frame::Accept { invocation })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Frame::Data {
-                    invocation,
-                    payload,
-                    ..
-                } => {
-                    if let Some((_, _, buf)) = active.get_mut(&invocation) {
-                        buf.extend_from_slice(&payload);
-                    }
-                }
-                Frame::Close { invocation, path } if path.is_empty() => {
-                    let Some((instance, func, payload)) = active.remove(&invocation) else {
-                        continue;
-                    };
-                    if !delay.is_zero() {
-                        tokio::time::sleep(delay).await;
-                    }
-                    let reply = dispatch_mock(&counters_clone, &instance, &func, &payload);
-                    let _ = write_frame(
-                        &mut writer,
-                        &Frame::Data {
-                            invocation,
-                            path: Vec::new(),
-                            payload: reply,
-                        },
-                    )
-                    .await;
-                    let _ = write_frame(
-                        &mut writer,
-                        &Frame::Close {
-                            invocation,
-                            path: Vec::new(),
-                        },
-                    )
-                    .await;
-                }
-                _ => {}
-            }
-        }
+        let _ = endpoint.drive().await;
     });
 
     (session, counters, handle)
-}
-
-fn dispatch_mock(
-    counters: &MockGuestCounters,
-    instance: &str,
-    func: &str,
-    payload: &[u8],
-) -> Vec<u8> {
-    match (instance, func) {
-        (sys_methods::INSPECT_INSTANCE, sys_methods::INSPECT_SNAPSHOT) => {
-            counters.inspect_calls.fetch_add(1, Ordering::SeqCst);
-            let result: Result<
-                SnapshotResult,
-                helios_inspector_protocol::system::inspect::FilterError,
-            > = Ok(SnapshotResult {
-                timestamp: 123_456_789,
-                truncated: false,
-                publications: vec![ComponentPublication {
-                    instance_id: 7,
-                    instance_name: "http-client".to_owned(),
-                    name: "state".to_owned(),
-                    generation: 1,
-                    status: PublicationStatus::Ok,
-                }],
-                entries: vec![
-                    InspectEntry {
-                        path: "/kernel/memory/total-bytes".to_owned(),
-                        value: InspectValue::Unsigned64(2 * 1024 * 1024 * 1024),
-                    },
-                    InspectEntry {
-                        path: "/kernel/memory/available-bytes".to_owned(),
-                        value: InspectValue::Unsigned64(1024 * 1024 * 1024),
-                    },
-                    InspectEntry {
-                        path: "/kernel/processors/online".to_owned(),
-                        value: InspectValue::Unsigned64(4),
-                    },
-                    InspectEntry {
-                        path: "/core/http-client/requests-total".to_owned(),
-                        value: InspectValue::Unsigned64(42),
-                    },
-                ],
-            });
-            postcard::to_allocvec(&result).expect("encode inspect")
-        }
-        (sys_methods::INSTANCES_INSTANCE, sys_methods::INSTANCES_SNAPSHOT) => {
-            counters.instances_calls.fetch_add(1, Ordering::SeqCst);
-            let list = vec![
-                Instance {
-                    id: 1,
-                    name: "init".to_owned(),
-                    started_at: 100,
-                    uptime: 5_000_000_000,
-                    memory_bytes: 4 * 1024 * 1024,
-                    storage_bytes: 0,
-                    cpu_busy: 12,
-                },
-                Instance {
-                    id: 7,
-                    name: "http-client".to_owned(),
-                    started_at: 200,
-                    uptime: 3_000_000_000,
-                    memory_bytes: 8 * 1024 * 1024,
-                    storage_bytes: 0,
-                    cpu_busy: 45,
-                },
-            ];
-            postcard::to_allocvec(&list).expect("encode instances")
-        }
-        (sys_methods::TRACING_INSTANCE, sys_methods::TRACING_RECENT) => {
-            let events: Result<
-                Vec<TraceEvent>,
-                helios_inspector_protocol::system::tracing::FilterError,
-            > = Ok(vec![TraceEvent {
-                timestamp: 1000,
-                level: TraceLevel::Info,
-                target: "helios_kernel::net::tcp".to_owned(),
-                fields: vec![TraceField {
-                    key: "message".to_owned(),
-                    value: TraceValue::Text("link up".to_owned()),
-                }],
-            }]);
-            postcard::to_allocvec(&events).expect("encode tracing")
-        }
-        (dbg_methods::FILESYSTEM_INSTANCE, "list") => {
-            counters.list_calls.fetch_add(1, Ordering::SeqCst);
-            #[derive(serde::Deserialize)]
-            struct PathReq {
-                path: String,
-            }
-            let req: PathReq = postcard::from_bytes(payload).expect("decode path");
-            let entries = match req.path.as_str() {
-                "/" => vec![
-                    DirectoryEntry {
-                        name: "bin".to_owned(),
-                        kind: EntryKind::Directory,
-                    },
-                    DirectoryEntry {
-                        name: "etc".to_owned(),
-                        kind: EntryKind::Directory,
-                    },
-                ],
-                "/bin" => vec![
-                    DirectoryEntry {
-                        name: "nu".to_owned(),
-                        kind: EntryKind::File,
-                    },
-                    DirectoryEntry {
-                        name: "ping".to_owned(),
-                        kind: EntryKind::File,
-                    },
-                ],
-                "/etc" => vec![DirectoryEntry {
-                    name: "rc.nu".to_owned(),
-                    kind: EntryKind::File,
-                }],
-                _ => Vec::new(),
-            };
-            postcard::to_allocvec(&entries).expect("encode list")
-        }
-        (dbg_methods::FILESYSTEM_INSTANCE, "read") => {
-            let bytes = b"echo hello from guest\n".to_vec();
-            postcard::to_allocvec(&bytes).expect("encode read")
-        }
-        (sys_methods::PROFILING_INSTANCE, sys_methods::PROFILING_METRICS) => {
-            let res: Result<
-                Vec<helios_inspector_protocol::system::profiling::MetricSample>,
-                helios_inspector_protocol::system::profiling::FilterError,
-            > = Ok(Vec::new());
-            postcard::to_allocvec(&res).expect("encode metrics")
-        }
-        (sys_methods::PROFILING_INSTANCE, sys_methods::PROFILING_FOLDED) => {
-            let res: Result<
-                Vec<helios_inspector_protocol::system::profiling::FoldedSample>,
-                helios_inspector_protocol::system::profiling::FilterError,
-            > = Ok(Vec::new());
-            postcard::to_allocvec(&res).expect("encode folded")
-        }
-        _ => postcard::to_allocvec(&()).expect("encode unit"),
-    }
 }
 
 #[tokio::test]
@@ -366,7 +819,7 @@ async fn live_tab_completion_covers_commands_flags_columns_inspect_instances_vfs
         "expected live tracing target completion, got {diag_targets:?}"
     );
 
-    // 7. Live remote VFS paths
+    // 7. Live remote VFS paths (over `wasi:filesystem/{preopens,types}`)
     let vfs_paths = nu_session.complete("ls /etc/", 8).await;
     assert!(
         vfs_paths

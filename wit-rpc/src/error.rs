@@ -36,6 +36,19 @@ impl RpcError {
             Self::Rejected(_) | Self::StreamClosed | Self::FutureDropped | Self::Cancelled => None,
         }
     }
+
+    /// Extracts the guest kernel panic text if the failure originated from a
+    /// panicked guest console.
+    pub fn guest_panic(&self) -> Option<&str> {
+        match self {
+            Self::Transport(error) => error.guest_panic(),
+            Self::Wire(_)
+            | Self::Rejected(_)
+            | Self::StreamClosed
+            | Self::FutureDropped
+            | Self::Cancelled => None,
+        }
+    }
 }
 
 impl From<WireError> for RpcError {

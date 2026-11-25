@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 
 use futures_core::Stream;
 use helios_inspector_protocol::WireError;
-use helios_inspector_protocol::mux::{SubpathReader, SubpathWriter};
+use helios_inspector_protocol::mux::{MaybeSend, SubpathReader, SubpathWriter};
 
 use crate::codec::{
     Decoder, Encoder, InboundPipe, OutboundPipe, PendingInboundSubpath, PendingOutboundSubpath,
@@ -16,13 +16,22 @@ use crate::codec::{
 use crate::error::RpcError;
 use crate::resource::ResourceEntry;
 
+#[cfg(not(target_arch = "wasm32"))]
 type FuturePollFuture<T> = Pin<Box<dyn Future<Output = Result<T, RpcError>> + Send + 'static>>;
+#[cfg(target_arch = "wasm32")]
+type FuturePollFuture<T> = Pin<Box<dyn Future<Output = Result<T, RpcError>> + 'static>>;
+
+#[cfg(not(target_arch = "wasm32"))]
 type StreamPollFuture<T> = Pin<
     Box<
         dyn Future<Output = (Option<SubpathReader>, Result<Option<Vec<T>>, RpcError>)>
             + Send
             + 'static,
     >,
+>;
+#[cfg(target_arch = "wasm32")]
+type StreamPollFuture<T> = Pin<
+    Box<dyn Future<Output = (Option<SubpathReader>, Result<Option<Vec<T>>, RpcError>)> + 'static>,
 >;
 
 /// Creates a credit-flow-controlled WIT `stream<T>` pair `(StreamWriter<T>, StreamReader<T>)`.
@@ -395,7 +404,9 @@ async fn recv_stream_batch_from_reader<T: RpcDecode<core::convert::Infallible>>(
     }
 }
 
-impl<T: RpcDecode<core::convert::Infallible> + Unpin + Send + 'static> Stream for StreamReader<T> {
+impl<T: RpcDecode<core::convert::Infallible> + Unpin + MaybeSend + 'static> Stream
+    for StreamReader<T>
+{
     type Item = Result<T, RpcError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -689,7 +700,9 @@ async fn recv_future_value<T: RpcDecode<core::convert::Infallible>>(
     Ok(value)
 }
 
-impl<T: RpcDecode<core::convert::Infallible> + Unpin + Send + 'static> Future for FutureReader<T> {
+impl<T: RpcDecode<core::convert::Infallible> + Unpin + MaybeSend + 'static> Future
+    for FutureReader<T>
+{
     type Output = Result<T, RpcError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {

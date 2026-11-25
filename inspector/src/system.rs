@@ -5,7 +5,8 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::time::Duration;
 
-use helios_inspector_protocol::system::{inspect, instances, tracing};
+use helios_wit_rpc::inspector::helios::system::{filters, inspect, instances, tracing};
+use helios_wit_rpc::inspector_snapshot::KernelSnapshot;
 use nu_ansi_term::{Color, Style as AnsiStyle};
 
 use crate::TracingCommand;
@@ -37,12 +38,11 @@ pub enum SystemError {
     KillRefused { id: u64, reason: &'static str },
     #[error("the guest refused to enable the tracing target {target}: {detail}")]
     TargetRefused { target: String, detail: String },
-    #[error("the guest refused the filter for {what}: {source}")]
+    #[error("the guest refused the filter for {what}: {error:?}")]
     FilterRefused {
         /// What was being read, spelled the way the message reads it.
         what: &'static str,
-        #[source]
-        source: tracing::FilterError,
+        error: filters::FilterError,
     },
     #[error("failed to render a guest tracing event: {source}")]
     Render {
@@ -107,8 +107,11 @@ pub async fn fetch_inspect(
     prefixes: &[&str],
     limit: u32,
 ) -> Result<inspect::SnapshotResult, SystemError> {
+    let query = inspect::Query {
+        prefixes: prefixes.iter().map(|prefix| (*prefix).to_owned()).collect(),
+    };
     remote::call(
-        inspect::snapshot_prefixes(client, prefixes, limit),
+        inspect::RpcClient::new(client.clone()).snapshot(query, limit),
         "remote inspect snapshot",
     )
     .await
@@ -116,15 +119,15 @@ pub async fn fetch_inspect(
         what: "remote inspect snapshot",
         source,
     })?
-    .map_err(|source| SystemError::FilterRefused {
+    .map_err(|error| SystemError::FilterRefused {
         what: "remote inspect snapshot",
-        source,
+        error,
     })
 }
 
 pub async fn fetch_kernel_snapshot(
     client: &helios_ops::transport::ProtocolClient,
-) -> Result<inspect::KernelSnapshot, SystemError> {
+) -> Result<KernelSnapshot, SystemError> {
     fetch_kernel_snapshot_prefixes(client, &["/kernel/"], 0).await
 }
 
@@ -132,20 +135,23 @@ pub async fn fetch_kernel_snapshot_prefixes(
     client: &helios_ops::transport::ProtocolClient,
     prefixes: &[&str],
     limit: u32,
-) -> Result<inspect::KernelSnapshot, SystemError> {
+) -> Result<KernelSnapshot, SystemError> {
     let raw = fetch_inspect(client, prefixes, limit).await?;
-    Ok(inspect::KernelSnapshot::from_snapshot(&raw))
+    Ok(KernelSnapshot::from_snapshot(&raw))
 }
 
 pub async fn fetch_instances(
     client: &helios_ops::transport::ProtocolClient,
 ) -> Result<Vec<instances::Instance>, SystemError> {
-    remote::call(instances::snapshot(client), "remote instances snapshot")
-        .await
-        .map_err(|source| SystemError::Fetch {
-            what: "remote instances snapshot",
-            source,
-        })
+    remote::call(
+        instances::RpcClient::new(client.clone()).snapshot(),
+        "remote instances snapshot",
+    )
+    .await
+    .map_err(|source| SystemError::Fetch {
+        what: "remote instances snapshot",
+        source,
+    })
 }
 
 /// Prints the live instances, and stops one when asked to.
@@ -210,12 +216,15 @@ pub async fn kill_named_instance(client: &RpcClient, name: &str) -> Result<u64, 
 }
 
 async fn kill(client: &RpcClient, id: u64) -> Result<(), SystemError> {
-    let answer = remote::call(instances::kill(client, id), "remote instance kill")
-        .await
-        .map_err(|source| SystemError::Fetch {
-            what: "remote instance kill",
-            source,
-        })?;
+    let answer = remote::call(
+        instances::RpcClient::new(client.peer()).kill(id),
+        "remote instance kill",
+    )
+    .await
+    .map_err(|source| SystemError::Fetch {
+        what: "remote instance kill",
+        source,
+    })?;
     match answer {
         Ok(()) => Ok(()),
         Err(instances::KillError::NoSuchInstance) => Err(SystemError::KillRefused {
@@ -238,7 +247,7 @@ pub async fn fetch_tracing(
     config: &TracingConfig,
 ) -> Result<Vec<tracing::Event>, SystemError> {
     remote::call(
-        tracing::recent(client, &config.filter(), config.limit),
+        tracing::RpcClient::new(client.peer()).recent(config.filter(), config.limit),
         "remote tracing events",
     )
     .await
@@ -246,9 +255,9 @@ pub async fn fetch_tracing(
         what: "remote tracing events",
         source,
     })?
-    .map_err(|source| SystemError::FilterRefused {
+    .map_err(|error| SystemError::FilterRefused {
         what: "remote tracing events",
-        source,
+        error,
     })
 }
 
@@ -275,7 +284,7 @@ pub async fn enable_tracing_targets(
 ) -> Result<(), SystemError> {
     for target in targets {
         let refused = remote::call(
-            tracing::set_target_enabled(client, target, true),
+            tracing::RpcClient::new(client.peer()).set_target_enabled(target.clone(), true),
             "remote tracing target enablement",
         )
         .await
@@ -599,7 +608,7 @@ impl EmittedEvents {
 
 #[cfg(test)]
 mod tests {
-    use helios_inspector_protocol::system::tracing::{Event, Field, Level, Value};
+    use helios_wit_rpc::inspector::helios::system::tracing::{Event, Field, Level, Value};
 
     use super::{EmittedEvents, render_tracing_event, tracing_event_key};
 

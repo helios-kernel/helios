@@ -12,6 +12,7 @@ futures-lite = { version = "2.6.1", default-features = false, features = ["std"]
 helios-inspector-protocol = { workspace = true }
 helios-nu = { workspace = true }
 helios-ops = { workspace = true }
+helios-wit-rpc = { workspace = true, features = ["inspector-rpc"] }
 nu-ansi-term = { version = "0.50.3", default-features = false }
 nu-engine = { version = "=0.117.0", default-features = false }
 nu-parser = { version = "=0.117.0", default-features = false }

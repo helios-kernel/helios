@@ -98,6 +98,7 @@ impl Progress {
 pub(crate) enum Fault {
     Remote(String),
     Wire(WireError),
+    GuestPanicked(String),
 }
 
 impl Fault {
@@ -105,6 +106,10 @@ impl Fault {
         match self {
             Self::Remote(message) => io::Error::other(message.clone()),
             Self::Wire(error) => error.clone().into(),
+            Self::GuestPanicked(report) => TransportError::GuestPanicked {
+                report: report.clone(),
+            }
+            .into(),
         }
     }
 
@@ -112,6 +117,9 @@ impl Fault {
         match self {
             Self::Remote(message) => TransportError::Rejected(message.clone()),
             Self::Wire(error) => TransportError::Wire(error.clone()),
+            Self::GuestPanicked(report) => TransportError::GuestPanicked {
+                report: report.clone(),
+            },
         }
     }
 }

@@ -428,7 +428,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
 
     /// Like [`Self::boot`], running `after_providers` once mounts and kernel
     /// providers (`compiler`, `http-client`, `compositor`) are installed and
-    /// before remaining eager components (e.g. `/debugger`) start and
+    /// before remaining eager components (e.g. `/inspector`) start and
     /// `signal_ready()` is emitted.
     pub async fn boot_with_pre_ready_hook<F, Fut>(
         &mut self,
@@ -507,6 +507,40 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         Ok(count)
     }
 
+    /// Starts a configured non-realm component by moniker if not already running.
+    pub async fn start_component(
+        &mut self,
+        moniker: &str,
+    ) -> Result<ComponentStateRecord, SupervisorError> {
+        let idx = self
+            .find_index(moniker)
+            .ok_or_else(|| SupervisorError::UnknownComponent {
+                moniker: moniker.to_owned(),
+            })?;
+        if !self.components[idx].active {
+            return Err(SupervisorError::UnknownComponent {
+                moniker: moniker.to_owned(),
+            });
+        }
+        if !self.components[idx].node.runner.is_realm()
+            && !matches!(
+                self.components[idx].status,
+                ComponentStatus::Starting | ComponentStatus::Running
+            )
+        {
+            let sockets = self.bind_sockets_for(idx).await?;
+            let ipc = self.prepare_consumer_routes(idx);
+            self.activate_index(idx, sockets, ipc).await?;
+            self.drain_pending_work().await?;
+        }
+        self.inspect_records()
+            .into_iter()
+            .find(|rec| rec.moniker == moniker)
+            .ok_or_else(|| SupervisorError::UnknownComponent {
+                moniker: moniker.to_owned(),
+            })
+    }
+
     /// Gracefully stops a single component (sending `SIGTERM`, waiting up to `stop_timeout_ms`,
     /// then force-killing if needed).
     pub async fn stop_component(&mut self, moniker: &str) -> Result<(), SupervisorError> {
@@ -518,6 +552,15 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         self.stop_index(idx).await;
         self.publish_inspect();
         Ok(())
+    }
+
+    /// Stops and re-starts a configured component by moniker.
+    pub async fn restart_component(
+        &mut self,
+        moniker: &str,
+    ) -> Result<ComponentStateRecord, SupervisorError> {
+        self.stop_component(moniker).await?;
+        self.start_component(moniker).await
     }
 
     /// Gracefully stops every active running component in the topology.

@@ -89,9 +89,11 @@ clippy-host:
         --exclude helios \
         --exclude helios-aarch64 --exclude helios-riscv --exclude helios-x86 \
         --exclude helios-audio-test --exclude helios-compositor --exclude helios-cpu \
-        --exclude helios-date --exclude helios-debugger --exclude helios-display-test \
+        --exclude helios-date --exclude helios-display-test \
         --exclude helios-gpu-test --exclude helios-http-client \
         --exclude helios-init --exclude helios-input-test \
+        --exclude helios-inspector-host --exclude helios-inspector-tls \
+        --exclude helios-inspector-worker \
         --exclude helios-nu-shell --exclude helios-oob-load --exclude helios-perf \
         --exclude helios-ping --exclude helios-pride-flag --exclude helios-procbench \
         --exclude helios-sched-tasks --exclude helios-stack-test --exclude helios-surface-test \
@@ -109,9 +111,10 @@ clippy-programs:
     # One program per invocation: they select mutually exclusive
     # `helios-api` worlds, and a single invocation covering several of
     # them would unify those features and fail to build.
-    for package in helios-audio-test helios-compositor helios-cpu helios-date helios-debugger helios-display-test helios-gpu-test \
+    for package in helios-audio-test helios-compositor helios-cpu helios-date helios-display-test helios-gpu-test \
         helios-http-client \
-        helios-init helios-input-test helios-nu-shell helios-oob-load helios-perf helios-ping helios-pride-flag \
+        helios-init helios-input-test helios-inspector-host helios-inspector-tls helios-inspector-worker \
+        helios-nu-shell helios-oob-load helios-perf helios-ping helios-pride-flag \
         helios-procbench helios-sched-tasks helios-stack-test helios-surface-test helios-sysctl helios-vmm-program helios-webgpu-provider; do
         cargo clippy -p "${package}" --all-targets -- -D warnings
     done
@@ -130,7 +133,9 @@ test-kernel run_ignored="default":
         --target "${target}" \
         --profile "{{ default_profile }}" \
         --cargo cargo \
-        --boot-program debugger \
+        --boot-program inspector-host \
+        --boot-program inspector-tls \
+        --boot-program inspector-worker \
         --no-compiler-plugin
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
@@ -186,7 +191,7 @@ test-libraries:
         -p helios-nu \
         -p helios-oci \
         -p helios-acpi \
-        --features helios-btrfs/write,helios-venus/driver
+        --features helios-btrfs/write,helios-venus/driver,helios-wit-rpc/inspector-rpc
     # Guest programs with host unit tests select mutually exclusive `helios-api`
     # WIT worlds and cannot share one feature-unified cargo invocation.
     cargo nextest run -p helios-api --features hv,oci
@@ -366,7 +371,9 @@ test-embedded-debugger:
         --target "${target}" \
         --profile "{{ default_profile }}" \
         --cargo cargo \
-        --boot-program debugger \
+        --boot-program inspector-host \
+        --boot-program inspector-tls \
+        --boot-program inspector-worker \
         --no-compiler-plugin
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_BOOTFS="${out_dir}/helios-bootfs"

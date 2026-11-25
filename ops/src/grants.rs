@@ -4,7 +4,8 @@
 //! Enforces compile-time separation between non-filesystem container grants and
 //! filesystem [`DirectoryGrant`]s: container builders accept [`NonFsGrants`] only.
 
-use helios_inspector_protocol::system::programs::{
+use helios_wit_rpc::inspector::helios::system::ipc::Endpoint;
+use helios_wit_rpc::inspector::helios::system::programs::{
     AotHint, AuthorityScope, CapabilityGrant, ClockGrant, ClockRight, DeviceClass, DeviceGrant,
     DiagnosticsGrant, DirectoryGrant, ExecRequest, ExecResult, FilesystemRight, LinkGrant,
     LinkRight, MachineGrant, MachineRight, MountGrant, MountRight, NetworkGrant, NetworkRight,
@@ -33,7 +34,7 @@ pub enum NonFsGrant {
     Machine(MachineGrant),
 }
 
-impl From<NonFsGrant> for CapabilityGrant {
+impl From<NonFsGrant> for CapabilityGrant<Endpoint> {
     fn from(grant: NonFsGrant) -> Self {
         match grant {
             NonFsGrant::Network(g) => Self::Network(g),
@@ -248,7 +249,7 @@ impl NonFsGrants {
     }
 
     #[must_use]
-    pub fn into_capability_grants(self) -> Vec<CapabilityGrant> {
+    pub fn into_capability_grants(self) -> Vec<CapabilityGrant<Endpoint>> {
         self.grants.into_iter().map(Into::into).collect()
     }
 }
@@ -415,7 +416,7 @@ impl ProcessGrants {
     }
 
     #[must_use]
-    pub fn into_capability_grants(self) -> Vec<CapabilityGrant> {
+    pub fn into_capability_grants(self) -> Vec<CapabilityGrant<Endpoint>> {
         let mut out = Vec::with_capacity(self.directories.len() + self.non_fs.len());
         out.extend(self.directories.into_iter().map(CapabilityGrant::Directory));
         out.extend(self.non_fs.into_capability_grants());
@@ -542,7 +543,7 @@ impl Command {
 
     /// Build the wire [`ExecRequest`] for inspection or `Session::exec_request`.
     #[must_use]
-    pub fn into_exec_request(self) -> ExecRequest {
+    pub fn into_exec_request(self) -> ExecRequest<Endpoint> {
         ExecRequest {
             name: self.name.unwrap_or_else(|| self.path.clone()),
             args: self.args,
@@ -571,7 +572,7 @@ impl Command {
     /// Execute this command to completion on `session`.
     pub async fn exec(self, session: &Session) -> Result<ExecResult, OpsError> {
         let req = self.into_exec_request();
-        session.exec_request(&req).await
+        session.exec_request(req).await
     }
 
     /// Spawn this command on `session` and return a streaming [`Child`] handle.

@@ -764,7 +764,7 @@ def wasm_artifact_digests(workloads: list[dict]) -> dict[str, str]:
 
     with BOOT_ARTIFACTS.open("rb") as handle:
         boot = tomllib.load(handle)
-    needed = {"dash", "debugger"}
+    needed = {"dash", "inspector-host", "inspector-tls", "inspector-worker"}
     for workload in workloads:
         needed.update(workload.get("boot_programs", []))
     for artifact in boot["artifact"]:

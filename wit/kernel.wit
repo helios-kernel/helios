@@ -267,3 +267,21 @@ world inspector-system {
   import helios:system/instances@0.1.0;
   import helios:system/processors@0.1.0;
 }
+
+/// Full WIT-RPC world served by per-session `inspector-worker` components.
+world inspector-rpc {
+  import helios:system/programs@0.1.0;
+  import helios:system/mounts@0.1.0;
+  import helios:system/btrfs@0.1.0;
+  import helios:system/inspect@0.1.0;
+  import helios:system/tracing@0.1.0;
+  import helios:system/profiling@0.1.0;
+  import helios:system/instances@0.1.0;
+  import helios:system/snapshot@0.1.0;
+  import helios:system/processors@0.1.0;
+  import helios:system/net@0.1.0;
+  import helios:system/serial@0.1.0;
+  import helios:system/component-control@0.1.0;
+  import wasi:filesystem/types@0.3.0;
+  import wasi:filesystem/preopens@0.3.0;
+}

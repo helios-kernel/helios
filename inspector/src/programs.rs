@@ -1,12 +1,40 @@
 use std::path::{Component, Path};
 
-use helios_inspector_protocol::RpcError;
-use helios_inspector_protocol::debugger::programs as debugger_programs;
-use helios_inspector_protocol::system::programs::{ExecError, ExecErrorKind, ExecResult};
+use helios_wit_rpc::RpcError;
+use helios_wit_rpc::inspector::helios::system::ipc::Endpoint;
+use helios_wit_rpc::inspector::helios::system::programs::{
+    self as rpc_programs, AuthorityScope, CapabilityGrant, ClockGrant, ClockRight, ContainerConfig,
+    ContainerCredentials, ContainerExecRequest, ContainerIdentity, ContainerMount,
+    ContainerMountSharing, DeviceClass, DeviceGrant, DiagnosticsGrant, DirectoryGrant, ExecError,
+    ExecErrorKind, ExecRequest, ExecResult, FilesystemRight, LinkGrant, LinkRight, MachineGrant,
+    MachineRight, MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight,
+    SettingsGrant, SettingsRight, TerminalGrant, TerminalRight,
+};
+use helios_wit_rpc::inspector_fs;
 
 use crate::serial::RpcClient;
 
 pub(crate) const REMOTE_SHELL_PATH: &str = "/bin/dash";
+
+/// One container mount specification passed to [`exec_in_container`].
+#[derive(Debug, Clone)]
+pub(crate) struct ContainerMountBind {
+    pub(crate) source_path: String,
+    pub(crate) target_path: String,
+    pub(crate) writable: bool,
+    pub(crate) private: bool,
+}
+
+/// Request to execute a binary inside an isolated Linux container via
+/// `helios:system/programs.create-container` + `container.exec`.
+#[derive(Debug, Clone)]
+pub(crate) struct ExecInContainerRequest {
+    pub(crate) path: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) env: Vec<(String, String)>,
+    pub(crate) mounts: Vec<ContainerMountBind>,
+    pub(crate) scratch_dir: Option<String>,
+}
 
 /// Why a program the inspector asked the guest to run did not run.
 ///
@@ -22,10 +50,16 @@ pub(crate) enum ProgramError {
     PathParentTraversal { input: String },
     #[error("path {input:?} uses an unsupported path prefix")]
     PathPrefix { input: String },
-    #[error("failed to invoke remote programs.exec-path: {source}")]
+    #[error("failed to invoke remote programs.exec: {source}")]
     Invoke {
         #[source]
         source: RpcError,
+    },
+    #[error("failed to prepare container scratch directory {path:?}: {source}")]
+    PrepareScratchDir {
+        path: String,
+        #[source]
+        source: inspector_fs::FsRpcError,
     },
     #[error("{kind:?}: {detail}")]
     Refused { kind: ExecErrorKind, detail: String },
@@ -40,6 +74,7 @@ impl ProgramError {
     pub(crate) fn guest_panic(&self) -> Option<&str> {
         match self {
             Self::Invoke { source } => source.guest_panic(),
+            Self::PrepareScratchDir { source, .. } => source.guest_panic(),
             Self::PathNotUtf8 { .. }
             | Self::PathParentTraversal { .. }
             | Self::PathPrefix { .. }
@@ -57,13 +92,144 @@ impl From<ExecError> for ProgramError {
     }
 }
 
+/// Explicit grants requested by operator VM shell / harness commands.
+///
+/// The guest `inspector-worker` never synthesizes ambient grants; the kernel
+/// strictly checks every entry against the worker's attenuated `ProcessAuthority`.
+fn default_operator_grants() -> Vec<CapabilityGrant<Endpoint>> {
+    vec![
+        CapabilityGrant::Directory(DirectoryGrant {
+            source_path: "/".to_owned(),
+            guest_name: "/".to_owned(),
+            rights: vec![
+                FilesystemRight::Read,
+                FilesystemRight::Write,
+                FilesystemRight::MutateDirectory,
+                FilesystemRight::Execute,
+            ],
+        }),
+        CapabilityGrant::Network(NetworkGrant {
+            rights: vec![
+                NetworkRight::Tcp,
+                NetworkRight::Udp,
+                NetworkRight::Dns,
+                NetworkRight::PrivilegedBind,
+                NetworkRight::Multicast,
+                NetworkRight::Admin,
+            ],
+        }),
+        CapabilityGrant::Clock(ClockGrant {
+            rights: vec![ClockRight::SetWallClock],
+        }),
+        CapabilityGrant::Terminal(TerminalGrant {
+            rights: vec![
+                TerminalRight::Input,
+                TerminalRight::Output,
+                TerminalRight::Control,
+            ],
+        }),
+        CapabilityGrant::Process(ProcessGrant {
+            rights: vec![
+                ProcessRight::Spawn,
+                ProcessRight::Exec,
+                ProcessRight::Fork,
+                ProcessRight::Join,
+                ProcessRight::Signal,
+            ],
+        }),
+        CapabilityGrant::Link(LinkGrant {
+            rights: vec![
+                LinkRight::Source,
+                LinkRight::TargetDirectory,
+                LinkRight::SymlinkCreate,
+                LinkRight::SymlinkRead,
+            ],
+        }),
+        CapabilityGrant::Mount(MountGrant {
+            rights: vec![MountRight::Mount, MountRight::Unmount],
+        }),
+        CapabilityGrant::Device(DeviceGrant {
+            classes: vec![
+                DeviceClass::Display,
+                DeviceClass::Input,
+                DeviceClass::Gpu,
+                DeviceClass::Audio,
+            ],
+        }),
+        CapabilityGrant::Diagnostics(DiagnosticsGrant::InspectRead(AuthorityScope::Machine)),
+        CapabilityGrant::Diagnostics(DiagnosticsGrant::TraceRead(AuthorityScope::Machine)),
+        CapabilityGrant::Diagnostics(DiagnosticsGrant::ProfileRead(AuthorityScope::Machine)),
+        CapabilityGrant::Diagnostics(DiagnosticsGrant::Control),
+        CapabilityGrant::InstanceControl(AuthorityScope::Machine),
+        CapabilityGrant::Settings(SettingsGrant {
+            rights: vec![SettingsRight::Write],
+        }),
+        CapabilityGrant::Machine(MachineGrant {
+            rights: vec![MachineRight::Control, MachineRight::Virtualize],
+        }),
+    ]
+}
+
+fn default_container_non_fs_grants() -> Vec<CapabilityGrant<Endpoint>> {
+    vec![
+        CapabilityGrant::Network(NetworkGrant {
+            rights: vec![
+                NetworkRight::Tcp,
+                NetworkRight::Udp,
+                NetworkRight::Dns,
+                NetworkRight::PrivilegedBind,
+                NetworkRight::Multicast,
+                NetworkRight::Admin,
+            ],
+        }),
+        CapabilityGrant::Clock(ClockGrant {
+            rights: vec![ClockRight::SetWallClock],
+        }),
+        CapabilityGrant::Terminal(TerminalGrant {
+            rights: vec![
+                TerminalRight::Input,
+                TerminalRight::Output,
+                TerminalRight::Control,
+            ],
+        }),
+        CapabilityGrant::Process(ProcessGrant {
+            rights: vec![
+                ProcessRight::Spawn,
+                ProcessRight::Exec,
+                ProcessRight::Fork,
+                ProcessRight::Join,
+                ProcessRight::Signal,
+            ],
+        }),
+        CapabilityGrant::Link(LinkGrant {
+            rights: vec![
+                LinkRight::Source,
+                LinkRight::TargetDirectory,
+                LinkRight::SymlinkCreate,
+                LinkRight::SymlinkRead,
+            ],
+        }),
+    ]
+}
+
 pub async fn exec(
     client: &RpcClient,
     path: &str,
     args: &[String],
 ) -> Result<ExecResult, ProgramError> {
     let path = normalize_absolute(path)?;
-    let outcome = debugger_programs::exec_path(client, &path, args)
+    let request = ExecRequest {
+        name: path.clone(),
+        args: args.to_vec(),
+        env: Vec::new(),
+        path,
+        cwd: None,
+        stdin: Vec::new(),
+        hint: None,
+        capability_grants: default_operator_grants(),
+    };
+    let outcome = rpc_programs::RpcClient::new(client.peer())
+        .exec(request)
         .await
         .map_err(|source| ProgramError::Invoke { source })?;
     outcome.map_err(ProgramError::from)
@@ -71,10 +237,75 @@ pub async fn exec(
 
 pub async fn exec_in_container(
     client: &RpcClient,
-    mut request: debugger_programs::ExecInContainerRequest,
+    mut request: ExecInContainerRequest,
 ) -> Result<ExecResult, ProgramError> {
     request.path = normalize_absolute(&request.path)?;
-    let outcome = debugger_programs::exec_in_container(client, &request)
+    if let Some(scratch) = &request.scratch_dir {
+        inspector_fs::mkdir(client, scratch)
+            .await
+            .map_err(|source| ProgramError::PrepareScratchDir {
+                path: scratch.clone(),
+                source,
+            })?;
+    }
+    let root = ContainerMount {
+        source_path: "/".to_owned(),
+        target_path: "/".to_owned(),
+        rights: vec![FilesystemRight::Read, FilesystemRight::Execute],
+        sharing: ContainerMountSharing::Shared,
+    };
+    let mounts = request
+        .mounts
+        .into_iter()
+        .map(|bind| ContainerMount {
+            source_path: bind.source_path,
+            target_path: bind.target_path,
+            rights: if bind.writable {
+                vec![
+                    FilesystemRight::Read,
+                    FilesystemRight::Write,
+                    FilesystemRight::MutateDirectory,
+                    FilesystemRight::Execute,
+                ]
+            } else {
+                vec![FilesystemRight::Read, FilesystemRight::Execute]
+            },
+            sharing: if bind.private {
+                ContainerMountSharing::Private
+            } else {
+                ContainerMountSharing::Shared
+            },
+        })
+        .collect();
+    let config = ContainerConfig {
+        root,
+        mounts,
+        shared_owner: ContainerIdentity { uid: 0, gid: 0 },
+        credentials: ContainerCredentials {
+            uid: 0,
+            gid: 0,
+            supplementary_groups: Vec::new(),
+        },
+        hostname: "helios-container".to_owned(),
+        domainname: String::new(),
+        capability_grants: default_container_non_fs_grants(),
+    };
+    let container = rpc_programs::RpcClient::new(client.peer())
+        .create_container(config)
+        .await
+        .map_err(|source| ProgramError::Invoke { source })?
+        .map_err(ProgramError::from)?;
+    let exec_req = ContainerExecRequest {
+        name: request.path.clone(),
+        args: request.args,
+        env: request.env,
+        path: request.path,
+        cwd: None,
+        stdin: Vec::new(),
+        credentials: None,
+    };
+    let outcome = container
+        .exec(exec_req)
         .await
         .map_err(|source| ProgramError::Invoke { source })?;
     outcome.map_err(ProgramError::from)

@@ -5,9 +5,10 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use helios_inspector_protocol::system::tracing as sys_tracing;
 use helios_nu::{FileMetadata, FileType};
 use helios_ops::Session;
+use helios_wit_rpc::inspector::helios::system::tracing as sys_tracing;
+use helios_wit_rpc::inspector_fs::EntryKind;
 use tokio::sync::RwLock;
 
 /// Cache TTL for remote completion metadata (1.5 seconds).
@@ -245,9 +246,7 @@ impl RemoteCompletionCache {
         if let Some(entries) = self.fetch_bounded(session.list_dir("/bin")).await {
             let list: Vec<String> = entries
                 .into_iter()
-                .filter(|e| {
-                    e.kind == helios_inspector_protocol::debugger::filesystem::EntryKind::File
-                })
+                .filter(|e| e.kind == EntryKind::File)
                 .map(|e| e.name)
                 .collect();
             let mut guard = self.state.write().await;
@@ -278,13 +277,8 @@ impl RemoteCompletionCache {
                     path: entry.path,
                     name: entry.name,
                     file_type: match entry.kind {
-                        helios_inspector_protocol::debugger::filesystem::EntryKind::Directory => {
-                            FileType::Dir
-                        }
-                        helios_inspector_protocol::debugger::filesystem::EntryKind::File
-                        | helios_inspector_protocol::debugger::filesystem::EntryKind::Other => {
-                            FileType::File
-                        }
+                        EntryKind::Directory => FileType::Dir,
+                        EntryKind::File | EntryKind::Other => FileType::File,
                     },
                     size: 0,
                     modified: None,

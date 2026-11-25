@@ -18,6 +18,13 @@ pub const ROOT_SECRET_FILE: &str = "helios-root-secret.key";
 /// The root public key's file name inside a prebuild directory.
 pub const ROOT_PUBLIC_FILE: &str = "helios-root-public.key";
 
+/// The development inspector client Ed25519 secret key's file name inside a
+/// prebuild directory (mode 0600, never staged into bootfs or prebuilt artifacts).
+pub const INSPECTOR_CLIENT_SECRET_FILE: &str = "helios-inspector-client-secret.key";
+
+/// The encoded public [`AuthPolicy`] staged into bootfs at `etc/inspector/policy.postcard`.
+pub const INSPECTOR_POLICY_FILE: &str = "inspector-policy.postcard";
+
 /// The mode a secret key file is created with: its owner reads and writes
 /// it, and nobody else can open it.
 pub const SECRET_KEY_MODE: u32 = 0o600;

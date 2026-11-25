@@ -5,20 +5,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use helios_inspector_protocol::debugger::filesystem::EntryKind;
-use helios_inspector_protocol::system::{
+use helios_ops::{
+    Attenuation, BundleManifest, Child, DiagnosticBundle, GrantRight, IdentityProfile, OpsError,
+    RemoteEntry, RemoteStat, SecurityMode, SessionOptions, Target, TargetStore, TargetUri,
+};
+use helios_wit_rpc::inspector::helios::system::{
     inspect::{
-        ComponentPublication, Entry as InspectEntry, KernelSnapshot, MemoryPressure,
-        PublicationStatus, SnapshotResult, Value as InspectValue,
+        ComponentPublication, Entry as InspectEntry, PublicationStatus, SnapshotResult,
+        Value as InspectValue,
     },
     instances::Instance,
     programs::ExecResult,
     tracing::{Event as TraceEvent, Level as TraceLevel, Value as TraceValue},
 };
-use helios_ops::{
-    Attenuation, BundleManifest, Child, DiagnosticBundle, GrantRight, IdentityProfile, OpsError,
-    RemoteEntry, RemoteStat, SecurityMode, SessionOptions, Target, TargetStore, TargetUri,
-};
+use helios_wit_rpc::inspector_fs::EntryKind;
+use helios_wit_rpc::inspector_snapshot::{KernelSnapshot, MemoryPressure};
 use pyo3::IntoPyObjectExt as _;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -57,9 +58,12 @@ pub(crate) fn build_session_options(
         None => None,
     };
 
-    let security = match profile.as_ref().and_then(|id| id.cert.clone()) {
-        Some(cert) => SecurityMode::CapabilityTls { cert: Some(cert) },
-        None => SecurityMode::Plain,
+    let security = if let Some(profile) = profile.as_ref().filter(|p| p.secret_key_hex.is_some()) {
+        profile
+            .to_security_mode()
+            .map_err(|err| ops_err_to_py(OpsError::from(err)))?
+    } else {
+        SecurityMode::Plain
     };
 
     let timeout = match timeout_secs {
@@ -103,7 +107,7 @@ pub(crate) fn extract_target_arg(
     ))
 }
 
-/// Convert a [`helios_inspector_protocol::system::inspect::Value`] into a native Python object.
+/// Convert a [`InspectValue`] into a native Python object.
 pub(crate) fn inspect_value_to_py(py: Python<'_>, value: &InspectValue) -> PyResult<Py<PyAny>> {
     match value {
         InspectValue::Boolean(v) => v.into_py_any(py),

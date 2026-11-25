@@ -12,6 +12,7 @@ fatfs = "0.3.6"
 helios-artifact.workspace = true
 helios-compiler-support.workspace = true
 helios-component-manager = { path = "../component-manager", default-features = false, features = ["manifest"] }
+helios-inspector-protocol = { path = "../inspector-protocol", default-features = false, features = ["auth"] }
 helios-profdata.workspace = true
 helios-venus-gen.workspace = true
 helios-workspace-root.workspace = true

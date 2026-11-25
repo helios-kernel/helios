@@ -21,8 +21,9 @@ package helios:system@0.1.0;
 /// streams in its wire format.
 interface programs {
   use ipc.{endpoint};
-  use net.{tcp-listener};
-  use vsock.{vsock-listener};
+  use net.{tcp-listener, tcp-stream};
+  use serial.{serial-port};
+  use vsock.{vsock-listener, vsock-stream};
 
   /// Stable identifier for a live program instance, used by the observer.
   type instance-id = u64;
@@ -229,12 +230,16 @@ interface programs {
     ipc(ipc-grant),
   }
 
-  /// A pre-bound listening socket transferred into a spawned child at launch.
-  /// Linux and WASIX children receive these at deterministic descriptor slots
-  /// starting at `fd = 3`; Wasm components claim them via `take-inherited-sockets`.
+  /// A pre-bound socket or connected stream transferred into a spawned child
+  /// at launch. Linux and WASIX children receive listening sockets at
+  /// deterministic descriptor slots starting at `fd = 3`; Wasm components
+  /// claim all transferred handles via `take-inherited-sockets`.
   variant inherited-socket {
     tcp(tcp-listener),
     vsock(vsock-listener),
+    tcp-stream(tcp-stream),
+    vsock-stream(vsock-stream),
+    serial(serial-port),
   }
 
   /// Per-instance default Linux root image used when `exec` or `spawn` launches

@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "linux", "unix", "sync",
-    "aarch64", "acpi", "api", "api-macro", "artifact", "btrfs", "cli", "compiler-abi", "compiler-host", "compiler-plugin", "compiler-support", "component-manager", "firmware", "hal", "i6300esb", "hosted", "inspector-shell", "kernel", "netstack", "nu-shell", "oci", "ops", "profdata", "programs/audio-test", "programs/compositor", "programs/compositor/render", "programs/cpu", "programs/date", "programs/debugger", "programs/display-test", "programs/gpu-test", "programs/http-client", "programs/init", "programs/input-test", "programs/nu-shell", "programs/oob-load", "programs/perf", "programs/ping", "programs/pride-flag", "programs/procbench", "programs/sched-tasks", "programs/stack-test", "programs/surface-test", "programs/sysctl", "programs/vmm", "programs/webgpu", "riscv", "tools/branch-hints", "tools/desktop/check-text", "tpm", "venus", "venus-gen", "vmm", "webgpu", "wit-rpc", "wit-rpc-macro", "x86", "x86-vmm", "inspector", "inspector-protocol", "virtio", "workspace-root",
+    "aarch64", "acpi", "api", "api-macro", "artifact", "btrfs", "cli", "compiler-abi", "compiler-host", "compiler-plugin", "compiler-support", "component-manager", "firmware", "hal", "i6300esb", "hosted", "inspector-shell", "kernel", "netstack", "nu-shell", "oci", "ops", "profdata", "programs/audio-test", "programs/compositor", "programs/compositor/render", "programs/cpu", "programs/date", "programs/display-test", "programs/gpu-test", "programs/http-client", "programs/init", "programs/input-test", "programs/inspector-host", "programs/inspector-tls", "programs/inspector-worker", "programs/nu-shell", "programs/oob-load", "programs/perf", "programs/ping", "programs/pride-flag", "programs/procbench", "programs/sched-tasks", "programs/stack-test", "programs/surface-test", "programs/sysctl", "programs/vmm", "programs/webgpu", "riscv", "tools/branch-hints", "tools/desktop/check-text", "tpm", "venus", "venus-gen", "vmm", "webgpu", "wit-rpc", "wit-rpc-macro", "x86", "x86-vmm", "inspector", "inspector-protocol", "virtio", "workspace-root",
 ]
 exclude = ["ops-py"]
 resolver = "2"
@@ -67,6 +67,7 @@ helios-profdata = { path = "profdata" }
 helios-venus-gen = { path = "venus-gen", default-features = false }
 helios-virtio = { path = "virtio" }
 helios-vmm = { path = "vmm" }
+helios-wit-rpc = { path = "wit-rpc" }
 helios-wit-rpc-macro = { path = "wit-rpc-macro" }
 helios-tpm = { path = "tpm" }
 helios-workspace-root = { path = "workspace-root" }
@@ -108,7 +109,15 @@ debug = 0
 debug-assertions = false
 overflow-checks = false
 
-[profile.dev.package.helios-debugger]
+[profile.dev.package.helios-inspector-host]
+debug = 0
+opt-level = "z"
+
+[profile.dev.package.helios-inspector-tls]
+debug = 0
+opt-level = "z"
+
+[profile.dev.package.helios-inspector-worker]
 debug = 0
 opt-level = "z"
 

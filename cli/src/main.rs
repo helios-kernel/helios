@@ -22,6 +22,7 @@ use helios_artifact::{
     CwasmTarget, IsaLevelError, cwasm_target_isa_levels, cwasm_target_supports_wasm_simd,
 };
 use helios_compiler_support::AotCompileHint;
+use helios_inspector_protocol::auth::{AuthError, AuthPolicy, INSPECTOR_POLICY_PATH};
 use helios_profdata::{
     FetchedProfile, KERNEL_PROFILE_ARTIFACT, KERNEL_PROFILE_ASSET, KERNEL_PROFILE_WORKFLOW,
     KernelProfileStore, KernelProfileStoreError, ProfileUseError, RELEASE_REPOSITORY,
@@ -31,7 +32,8 @@ use helios_workspace_root::prebuilt_manifest::{
     PrebuiltManifestError, PrebuiltPrograms, read_manifest, write_manifest,
 };
 use helios_workspace_root::root_key::{
-    ROOT_PUBLIC_FILE, ROOT_SECRET_FILE, RootSecretReadError, SECRET_KEY_MODE, read_root_secret_seed,
+    INSPECTOR_CLIENT_SECRET_FILE, INSPECTOR_POLICY_FILE, ROOT_PUBLIC_FILE, ROOT_SECRET_FILE,
+    RootSecretReadError, SECRET_KEY_MODE, read_root_secret_seed,
 };
 use helios_workspace_root::{WorkspaceRoot, WorkspaceRootError};
 use mbrman::{BOOT_ACTIVE, CHS, MBR, MBRPartitionEntry};
@@ -190,6 +192,23 @@ pub(crate) enum PrebuildError {
     EncodeManifest {
         #[source]
         source: serde_json::Error,
+    },
+    #[error("failed to read inspector auth policy {path}: {source}")]
+    ReadInspectorPolicy {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("invalid inspector auth policy {path}: {source}")]
+    InvalidInspectorPolicy {
+        path: String,
+        #[source]
+        source: AuthError,
+    },
+    #[error("failed to encode inspector auth policy: {source}")]
+    EncodeInspectorPolicy {
+        #[source]
+        source: AuthError,
     },
 }
 
@@ -858,6 +877,29 @@ struct KernelPrebuildCommand {
     /// installed, and CI names its signing key through the environment.
     #[arg(long, value_name = "PATH", env = "HELIOS_ROOT_SECRET_KEY")]
     root_secret_key: Option<PathBuf>,
+    /// Authorize the Ed25519 public key derived from this 32-byte client
+    /// secret key file in `/etc/inspector/policy.postcard`.
+    ///
+    /// When neither this nor `--inspector-policy` is supplied, a mode-0600
+    /// development client key is generated in `--out-dir`
+    /// (`helios-inspector-client-secret.key`) and only its public key is
+    /// staged into bootfs.
+    #[arg(
+        long,
+        value_name = "PATH",
+        env = "HELIOS_INSPECTOR_CLIENT_KEY",
+        conflicts_with = "inspector_policy"
+    )]
+    inspector_client_key: Option<PathBuf>,
+    /// Stage this pre-encoded postcard `AuthPolicy` at
+    /// `etc/inspector/policy.postcard` instead of generating a local policy.
+    #[arg(
+        long,
+        value_name = "PATH",
+        env = "HELIOS_INSPECTOR_POLICY",
+        conflicts_with = "inspector_client_key"
+    )]
+    inspector_policy: Option<PathBuf>,
     #[command(flatten)]
     cache: CacheArgs,
 }
@@ -996,6 +1038,9 @@ struct PrebuildManifest {
     bootfs: PathBuf,
     root_public_key: PathBuf,
     root_secret_key: PathBuf,
+    inspector_policy: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inspector_client_secret_key: Option<PathBuf>,
     bootfs_assets: Vec<BootAsset>,
 }
 
@@ -1349,6 +1394,17 @@ fn run_kernel_prebuild(
         });
     }
 
+    let prepared_inspector = prepare_inspector_auth(
+        &command.out_dir,
+        command.inspector_client_key.as_deref(),
+        command.inspector_policy.as_deref(),
+    )?;
+    bootfs_assets.push(BootAsset {
+        path: INSPECTOR_POLICY_PATH.trim_start_matches('/').to_owned(),
+        source: resolve_bootfs_source(&prepared_inspector.policy_path)?,
+        kind: BootAssetKind::File,
+    });
+
     let bootfs_path = command.out_dir.join(BOOTFS_IMAGE_FILE);
     write_bootfs_image(
         &bootfs_path,
@@ -1373,6 +1429,12 @@ fn run_kernel_prebuild(
         bootfs: resolve(&bootfs_path)?,
         root_public_key: resolve(&root_public_path)?,
         root_secret_key: resolve(&root_secret_path)?,
+        inspector_policy: resolve(&prepared_inspector.policy_path)?,
+        inspector_client_secret_key: prepared_inspector
+            .client_secret_path
+            .as_deref()
+            .map(resolve)
+            .transpose()?,
         bootfs_assets,
     };
     let manifest_path = command.out_dir.join(PREBUILD_MANIFEST_FILE);
@@ -3349,6 +3411,108 @@ fn write_root_public_key(
     Ok(())
 }
 
+pub(crate) struct PreparedInspectorAuth {
+    pub(crate) policy_path: PathBuf,
+    pub(crate) client_secret_path: Option<PathBuf>,
+}
+
+/// Prepares the public inspector `AuthPolicy` staged at
+/// `etc/inspector/policy.postcard` and (unless `--inspector-policy` was passed)
+/// the owner-only development client key in `out_dir`.
+///
+/// Only the public key ever lands in `inspector-policy.postcard` and bootfs.
+pub(crate) fn prepare_inspector_auth(
+    out_dir: &Path,
+    supplied_client_key: Option<&Path>,
+    supplied_policy: Option<&Path>,
+) -> Result<PreparedInspectorAuth, PrebuildError> {
+    fs::create_dir_all(out_dir).map_err(|source| PrebuildError::CreateOutDir {
+        path: out_dir.display().to_string(),
+        source,
+    })?;
+    let policy_path = out_dir.join(INSPECTOR_POLICY_FILE);
+
+    if let Some(explicit_policy) = supplied_policy {
+        let raw =
+            fs::read(explicit_policy).map_err(|source| PrebuildError::ReadInspectorPolicy {
+                path: explicit_policy.display().to_string(),
+                source,
+            })?;
+        AuthPolicy::decode_postcard(&raw).map_err(|source| {
+            PrebuildError::InvalidInspectorPolicy {
+                path: explicit_policy.display().to_string(),
+                source,
+            }
+        })?;
+        write_if_changed(&policy_path, &raw)?;
+        return Ok(PreparedInspectorAuth {
+            policy_path,
+            client_secret_path: None,
+        });
+    }
+
+    let (client_secret_path, client_signing_key) = match supplied_client_key {
+        Some(path) => {
+            if !path.is_file() {
+                return Err(KeyError::SuppliedKeyMissing {
+                    path: path.display().to_string(),
+                }
+                .into());
+            }
+            (path.to_path_buf(), read_signing_key(path)?)
+        }
+        None => {
+            let generated = out_dir.join(INSPECTOR_CLIENT_SECRET_FILE);
+            let key = ensure_secret_signing_key(&generated)?;
+            (generated, key)
+        }
+    };
+
+    let public_bytes = VerifyingKey::from(&client_signing_key).to_bytes();
+    let policy = AuthPolicy::single_static_key("local-dev", public_bytes);
+    let encoded = policy
+        .encode_postcard()
+        .map_err(|source| PrebuildError::EncodeInspectorPolicy { source })?;
+    write_if_changed(&policy_path, &encoded)?;
+
+    Ok(PreparedInspectorAuth {
+        policy_path,
+        client_secret_path: Some(client_secret_path),
+    })
+}
+
+fn ensure_secret_signing_key(secret_path: &Path) -> Result<SigningKey, KeyError> {
+    if secret_path.is_file() {
+        return read_signing_key(secret_path);
+    }
+    let mut secret = SecretKey::default();
+    SysRng
+        .try_fill_bytes(&mut secret)
+        .map_err(|source| KeyError::Entropy { source })?;
+    let signing_key = SigningKey::from_bytes(&secret);
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(SECRET_KEY_MODE)
+        .open(secret_path)
+        .and_then(|mut file| file.write_all(&signing_key.to_bytes()))
+        .map_err(|source| KeyError::Write {
+            path: secret_path.display().to_string(),
+            source,
+        })?;
+    Ok(signing_key)
+}
+
+fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<(), PrebuildError> {
+    if fs::read(path).ok().as_deref() != Some(bytes) {
+        fs::write(path, bytes).map_err(|source| PrebuildError::Write {
+            path: path.display().to_string(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
 fn read_signing_key(path: &Path) -> Result<SigningKey, KeyError> {
     Ok(SigningKey::from_bytes(&read_root_secret_seed(path)?))
 }
@@ -4191,8 +4355,8 @@ mod tests {
     fn sample_program_manifests() -> Vec<ProgramManifest> {
         vec![
             test_program_manifest("compositor", ProgramRole::default()),
-            test_program_manifest("debugger", ProgramRole::default()),
             test_program_manifest("init", ProgramRole::default()),
+            test_program_manifest("inspector-host", ProgramRole::default()),
             test_program_manifest(
                 "pride-flag",
                 ProgramRole {
@@ -4224,16 +4388,22 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["compositor", "debugger", "init", "pride-flag", "webgpu"]
+            [
+                "compositor",
+                "init",
+                "inspector-host",
+                "pride-flag",
+                "webgpu"
+            ]
         );
     }
 
     #[test]
     fn wasm_build_subset_selects_only_named_programs_and_deduplicates() {
         let requested = vec![
-            "debugger".to_owned(),
+            "inspector-host".to_owned(),
             "init".to_owned(),
-            "debugger".to_owned(),
+            "inspector-host".to_owned(),
         ];
         let selected = select_wasm_programs(&requested, sample_program_manifests())
             .expect("valid subset resolves");
@@ -4243,7 +4413,7 @@ mod tests {
             .iter()
             .map(|m| m.command.as_str())
             .collect();
-        assert_eq!(names, ["debugger", "init"]);
+        assert_eq!(names, ["init", "inspector-host"]);
     }
 
     #[test]
@@ -4302,7 +4472,7 @@ mod tests {
             "--program",
             "init",
             "--program",
-            "debugger",
+            "inspector-host",
             "--program",
             "compiler-plugin",
         ])
@@ -4310,7 +4480,10 @@ mod tests {
         let Commands::WasmBuild(command) = parsed.command else {
             panic!("expected WasmBuild command");
         };
-        assert_eq!(command.programs, ["init", "debugger", "compiler-plugin"]);
+        assert_eq!(
+            command.programs,
+            ["init", "inspector-host", "compiler-plugin"]
+        );
     }
 
     fn test_artifact(

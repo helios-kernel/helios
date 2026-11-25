@@ -22,7 +22,7 @@ out="$runtime/shell.out"
 
 "$inspector" vm --arch x86-64 --release --memory 2G --accel kvm \
     --runtime-dir "$runtime" --keep-runtime-dir \
-    --boot-program nu --boot-program debugger --boot-program cpu \
+    --boot-program nu --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --boot-program cpu \
     --boot-program http-client \
     --shared-dir artifacts/wasi-tools \
     "$@" \

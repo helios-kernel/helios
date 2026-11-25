@@ -15,14 +15,17 @@ use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use console::{strip_ansi_codes, style};
 use directories::ProjectDirs;
 use helios_hal::fs::HOST_SHARE_MOUNT_TAG;
-use helios_inspector_protocol::debugger::filesystem as debugger_fs;
-use helios_inspector_protocol::system::inspect;
-use helios_inspector_protocol::system::profiling as system_profiling;
-use helios_inspector_protocol::system::programs as system_programs;
 use helios_profdata::{
     KernelProfileStore, KernelProfileStoreError, ProfileDigest, ProfileUseError,
 };
-use helios_workspace_root::root_key::{ROOT_PUBLIC_FILE, ROOT_SECRET_FILE};
+use helios_wit_rpc::inspector::helios::system::filters as system_filters;
+use helios_wit_rpc::inspector::helios::system::profiling as system_profiling;
+use helios_wit_rpc::inspector::helios::system::programs as system_programs;
+use helios_wit_rpc::inspector_fs;
+use helios_wit_rpc::inspector_snapshot as inspect;
+use helios_workspace_root::root_key::{
+    INSPECTOR_CLIENT_SECRET_FILE, ROOT_PUBLIC_FILE, ROOT_SECRET_FILE,
+};
 use helios_workspace_root::{WorkspaceRoot, WorkspaceRootError};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
@@ -627,21 +630,20 @@ pub(crate) enum ProfilingStepError {
         /// The profiling step, spelled the way the message reads it.
         step: &'static str,
         #[source]
-        source: helios_inspector_protocol::RpcError,
+        source: helios_wit_rpc::RpcError,
     },
     /// The guest answered a read but refused its filter as too large.
-    #[error("the guest refused the filter to {step}: {source}")]
+    #[error("the guest refused the filter to {step}: {error:?}")]
     FilterRefused {
         step: &'static str,
-        #[source]
-        source: system_profiling::FilterError,
+        error: system_filters::FilterError,
     },
     /// The guest answered a control but refused it: the session does not
     /// hold the right to observe the machine.
-    #[error("the guest refused to {step}: {source:?}")]
+    #[error("the guest refused to {step}: {error:?}")]
     ControlRefused {
         step: &'static str,
-        source: system_profiling::ControlError,
+        error: system_profiling::ControlError,
     },
 }
 
@@ -660,13 +662,13 @@ pub(crate) enum AotBenchError {
     Upload {
         path: String,
         #[source]
-        source: helios_inspector_protocol::RpcError,
+        source: inspector_fs::FsRpcError,
     },
     #[error("failed to AOT compile uploaded wasm iteration {iteration}: {source}")]
     Compile {
         iteration: u16,
         #[source]
-        source: helios_inspector_protocol::RpcError,
+        source: helios_wit_rpc::RpcError,
     },
     #[error("remote AOT iteration {iteration} failed: {kind:?}: {detail}")]
     Refused {
@@ -3986,6 +3988,36 @@ fn export_trusted_root_public_key<'a>(
     ))
 }
 
+fn resolve_vm_client_identity(
+    command: &ResolvedVmCommand,
+    ops: &crate::ops_cli::GlobalOpsFlags,
+) -> Option<helios_inspector_protocol::auth::ClientIdentity> {
+    if let Ok(options) = crate::ops_cli::build_session_options(ops)
+        && let helios_ops::SecurityMode::Authenticated { identity, .. } = options.security
+    {
+        return Some(*identity);
+    }
+    if let Ok(prebuild_dir) = kernel_prebuild_dir(&command.build) {
+        let key_path = prebuild_dir.join(INSPECTOR_CLIENT_SECRET_FILE);
+        if key_path.is_file()
+            && let Ok(identity) =
+                helios_inspector_protocol::auth::ClientIdentity::from_seed_file(&key_path)
+        {
+            return Some(identity);
+        }
+    }
+    if let Some(parent) = command.bootfs.parent() {
+        let key_path = parent.join(INSPECTOR_CLIENT_SECRET_FILE);
+        if key_path.is_file()
+            && let Ok(identity) =
+                helios_inspector_protocol::auth::ClientIdentity::from_seed_file(&key_path)
+        {
+            return Some(identity);
+        }
+    }
+    None
+}
+
 fn connect_and_run(
     command: &ResolvedVmCommand,
     runtime: &mut VmRuntime,
@@ -4000,6 +4032,7 @@ fn connect_and_run(
         runtime.debug_serial_log.clone(),
         command.kernel.clone(),
     );
+    let client_identity = resolve_vm_client_identity(command, ops);
     let (client, target_uri) = match runtime.take_transport()? {
         VmTransport::SerialSocket(socket_path) => {
             let socket = socket_path
@@ -4008,18 +4041,19 @@ fn connect_and_run(
                     path: socket_path.display().to_string(),
                 })?;
             let uri = format!("serial://{socket}?baud={}", command.baud);
-            let client = connect_client(socket, command.baud, true)
+            let client = connect_client(socket, command.baud, true, client_identity.as_ref())
                 .map_err(|source| VmSessionError::Connect { over: "", source })?;
             (client, Some(uri))
         }
         VmTransport::SerialIo(io) => {
+            let identity = client_identity.clone();
             let client = crate::runtime::block_on(async move {
-                crate::ready::connect_after_boot(io).await.map_err(|error| {
-                    VmSessionError::Connect {
+                crate::ready::connect_after_boot(io, identity.as_ref())
+                    .await
+                    .map_err(|error| VmSessionError::Connect {
                         over: " over QEMU stdio serial",
                         source: ConnectError::from(error),
-                    }
-                })
+                    })
             })?;
             (client, None)
         }
@@ -4038,6 +4072,7 @@ fn connect_and_run(
                 "vsock://{guest_cid}:{}",
                 helios_inspector_protocol::VSOCK_RPC_PORT
             );
+            let identity = client_identity.clone();
             let client = crate::runtime::block_on(async move {
                 let io = crate::serial::open(socket, baud)
                     .await
@@ -4056,8 +4091,25 @@ fn connect_and_run(
                 let (vsock_read, vsock_write) =
                     crate::vsock::connect(guest_cid, helios_inspector_protocol::VSOCK_RPC_PORT)
                         .await?;
-                let mut client =
-                    RpcClient::new(vsock_read, vsock_write).map_err(ConnectError::from)?;
+                let mut client = match identity.as_ref() {
+                    Some(identity) => RpcClient::connect_authenticated(
+                        vsock_read,
+                        vsock_write,
+                        helios_inspector_protocol::auth::TransportKind::Vsock,
+                        identity,
+                        None,
+                    )
+                    .await
+                    .map_err(|err| match err {
+                        crate::serial::AuthConnectError::Auth(source) => {
+                            ConnectError::Boot(crate::ready::BootError::Auth { source })
+                        }
+                        crate::serial::AuthConnectError::Driver(source) => {
+                            ConnectError::Driver { source }
+                        }
+                    })?,
+                    None => RpcClient::new(vsock_read, vsock_write).map_err(ConnectError::from)?,
+                };
                 crate::ready::wait_until_ready(&mut client)
                     .await
                     .map_err(ConnectError::from)?;
@@ -4408,8 +4460,7 @@ enum GuestRace {
 }
 
 /// How the `--run` program ended, once it did.
-type GuestRunOutcome =
-    Result<helios_inspector_protocol::system::programs::ExecResult, crate::programs::ProgramError>;
+type GuestRunOutcome = Result<system_programs::ExecResult, crate::programs::ProgramError>;
 
 fn display_command(program: &str, arguments: &[String]) -> String {
     let mut rendered = String::from(program);
@@ -4814,12 +4865,13 @@ fn run_workload_bench(
             || command.user_profile_output.is_some()
             || command.perf_metrics_output.is_some();
         let seconds = command.workload_timeout_seconds;
+        let profiling_client = system_profiling::RpcClient::new(client.peer());
         let before_profile = if collect_profile {
             guest_step_under_deadline("the profile reset", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
                     profiling_control_step(
                         "clear remote profile samples",
-                        system_profiling::clear(&client),
+                        profiling_client.clear(),
                     )
                     .await?,
                 )
@@ -4829,7 +4881,7 @@ fn run_workload_bench(
                 Ok::<_, VmSessionError>(
                     profiling_control_step(
                         "enable remote profiling",
-                        system_profiling::set_enabled(&client, true),
+                        profiling_client.set_enabled(true),
                     )
                     .await?,
                 )
@@ -4839,7 +4891,7 @@ fn run_workload_bench(
                 Ok::<_, VmSessionError>(
                     profiling_read_step(
                         "read initial remote profile samples",
-                        system_profiling::folded(&client, &profile_filter, 0),
+                        profiling_client.folded(profile_filter.clone(), 0),
                     )
                     .await?,
                 )
@@ -4849,32 +4901,36 @@ fn run_workload_bench(
             Vec::new()
         };
         let instruction_profile_output = command.instruction_profile_output();
-        if instruction_profile_output.is_some() {
-            guest_step_under_deadline("the instruction sampling start", seconds, &vcpus, async {
-                Ok::<_, VmSessionError>(instruction_profile::start(&client).await?)
-            })
-            .await?;
-        }
+        let sampling_session = if instruction_profile_output.is_some() {
+            Some(
+                guest_step_under_deadline(
+                    "the instruction sampling start",
+                    seconds,
+                    &vcpus,
+                    async { Ok::<_, VmSessionError>(instruction_profile::start(&client).await?) },
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
 
         if let Err(error) =
             crate::workload_bench::run_inner(&mut client, &command, &provenance, &vcpus).await
         {
+            drop(sampling_session);
             print_recent_guest_errors(&mut client, seconds, &vcpus).await;
             return Err(error.into());
         }
 
-        if instruction_profile_output.is_some() {
-            guest_step_under_deadline("the instruction sampling stop", seconds, &vcpus, async {
-                Ok::<_, VmSessionError>(instruction_profile::stop(&client).await?)
-            })
-            .await?;
-        }
+        drop(sampling_session);
+        let profiling_client = system_profiling::RpcClient::new(client.peer());
         if collect_profile {
             guest_step_under_deadline("the profiler stop", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
                     profiling_control_step(
                         "disable remote profiling",
-                        system_profiling::set_enabled(&client, false),
+                        profiling_client.set_enabled(false),
                     )
                     .await?,
                 )
@@ -4885,7 +4941,7 @@ fn run_workload_bench(
                     Ok::<_, VmSessionError>(
                         profiling_read_step(
                             "read final remote profile samples",
-                            system_profiling::folded(&client, &profile_filter, 0),
+                            profiling_client.folded(profile_filter.clone(), 0),
                         )
                         .await?,
                     )
@@ -4896,7 +4952,7 @@ fn run_workload_bench(
                     Ok::<_, VmSessionError>(
                         profiling_read_step(
                             "read final remote perf metrics",
-                            system_profiling::metrics(&client, &metric_filter, 0),
+                            profiling_client.metrics(metric_filter.clone(), 0),
                         )
                         .await?,
                     )
@@ -4926,7 +4982,7 @@ fn run_workload_bench(
 /// tells them apart in the message.
 async fn profiling_step<T>(
     step: &'static str,
-    call: impl std::future::Future<Output = Result<T, helios_inspector_protocol::RpcError>>,
+    call: impl std::future::Future<Output = Result<T, helios_wit_rpc::RpcError>>,
 ) -> Result<T, ProfilingStepError> {
     call.await
         .map_err(|source| ProfilingStepError::Rpc { step, source })
@@ -4937,30 +4993,24 @@ async fn profiling_step<T>(
 async fn profiling_control_step(
     step: &'static str,
     call: impl std::future::Future<
-        Output = Result<
-            Result<(), system_profiling::ControlError>,
-            helios_inspector_protocol::RpcError,
-        >,
+        Output = Result<Result<(), system_profiling::ControlError>, helios_wit_rpc::RpcError>,
     >,
 ) -> Result<(), ProfilingStepError> {
     profiling_step(step, call)
         .await?
-        .map_err(|source| ProfilingStepError::ControlRefused { step, source })
+        .map_err(|error| ProfilingStepError::ControlRefused { step, error })
 }
 
 /// A profiling read, whose filter the guest may refuse as too large.
 async fn profiling_read_step<T>(
     step: &'static str,
     call: impl std::future::Future<
-        Output = Result<
-            Result<T, system_profiling::FilterError>,
-            helios_inspector_protocol::RpcError,
-        >,
+        Output = Result<Result<T, system_filters::FilterError>, helios_wit_rpc::RpcError>,
     >,
 ) -> Result<T, ProfilingStepError> {
     profiling_step(step, call)
         .await?
-        .map_err(|source| ProfilingStepError::FilterRefused { step, source })
+        .map_err(|error| ProfilingStepError::FilterRefused { step, error })
 }
 
 /// Fetches and prints the guest's recent tracing events (info level and
@@ -4974,7 +5024,7 @@ async fn profiling_read_step<T>(
 async fn print_recent_guest_errors(client: &mut RpcClient, seconds: u32, vcpus: &VcpuStateCapture) {
     let mut config = crate::system::TracingConfig::new();
     config.limit = 100;
-    config.min_level = Some(helios_inspector_protocol::system::tracing::Level::Info);
+    config.min_level = Some(helios_wit_rpc::inspector::helios::system::tracing::Level::Info);
     let fetched = guest_step_under_deadline("the tracing fetch", seconds, vcpus, async {
         Ok::<_, WorkloadBenchError>(crate::system::fetch_tracing(client, &config).await?)
     })
@@ -5010,7 +5060,7 @@ fn run_aot_bench(
         let seconds = command.timeout_seconds;
         guest_step_under_deadline("the AOT upload", seconds, &vcpus, async {
             Ok::<_, VmSessionError>(
-                debugger_fs::write(&client, &command.remote_path, &wasm, false)
+                inspector_fs::write_file(&client, &command.remote_path, &wasm, false)
                     .await
                     .map_err(|source| AotBenchError::Upload {
                         path: command.wasm.display().to_string(),
@@ -5030,12 +5080,13 @@ fn run_aot_bench(
             || command.kernel_profile_output.is_some()
             || command.user_profile_output.is_some()
             || command.perf_metrics_output.is_some();
+        let profiling_client = system_profiling::RpcClient::new(client.peer());
         let before_profile = if collect_profile {
             guest_step_under_deadline("the profile reset", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
                     profiling_control_step(
                         "clear remote profile samples",
-                        system_profiling::clear(&client),
+                        profiling_client.clear(),
                     )
                     .await?,
                 )
@@ -5045,7 +5096,7 @@ fn run_aot_bench(
                 Ok::<_, VmSessionError>(
                     profiling_control_step(
                         "enable remote profiling",
-                        system_profiling::set_enabled(&client, true),
+                        profiling_client.set_enabled(true),
                     )
                     .await?,
                 )
@@ -5055,7 +5106,7 @@ fn run_aot_bench(
                 Ok::<_, VmSessionError>(
                     profiling_read_step(
                         "read initial remote profile samples",
-                        system_profiling::folded(&client, &profile_filter, 0),
+                        profiling_client.folded(profile_filter.clone(), 0),
                     )
                     .await?,
                 )
@@ -5077,28 +5128,34 @@ fn run_aot_bench(
             .map_err(|source| AotBenchError::Report { source })?;
         }
         let instruction_profile_output = command.instruction_profile_output();
-        if instruction_profile_output.is_some() {
-            guest_step_under_deadline("the instruction sampling start", seconds, &vcpus, async {
-                Ok::<_, VmSessionError>(instruction_profile::start(&client).await?)
-            })
-            .await?;
-        }
+        let sampling_session = if instruction_profile_output.is_some() {
+            Some(
+                guest_step_under_deadline(
+                    "the instruction sampling start",
+                    seconds,
+                    &vcpus,
+                    async { Ok::<_, VmSessionError>(instruction_profile::start(&client).await?) },
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let programs_client = system_programs::RpcClient::new(client.peer());
         for iteration in 1..=command.iterations {
             let started = Instant::now();
             let outcome =
                 guest_step_under_deadline("the AOT compilation", seconds, &vcpus, async {
                     Ok::<_, VmSessionError>(
-                        system_programs::aot(
-                            &client,
-                            &system_programs::AotRequest {
+                        programs_client
+                            .aot(system_programs::AotRequest {
                                 source_path: command.remote_path.clone(),
                                 destination_path: command.destination_path.clone(),
                                 hint: system_programs::AotHint::Performance,
                                 profile: command.compiler_timing,
-                            },
-                        )
-                        .await
-                        .map_err(|source| AotBenchError::Compile { iteration, source })?,
+                            })
+                            .await
+                            .map_err(|source| AotBenchError::Compile { iteration, source })?,
                     )
                 })
                 .await?;
@@ -5108,6 +5165,7 @@ fn run_aot_bench(
                     // Surface the guest-side error events before failing:
                     // the RPC error kind alone (e.g. `Internal`) does not
                     // say which runtime operation actually failed.
+                    drop(sampling_session);
                     print_recent_guest_errors(&mut client, seconds, &vcpus).await;
                     return Err(AotBenchError::Refused {
                         iteration,
@@ -5127,18 +5185,14 @@ fn run_aot_bench(
             )
             .map_err(|source| AotBenchError::Report { source })?;
         }
-        if instruction_profile_output.is_some() {
-            guest_step_under_deadline("the instruction sampling stop", seconds, &vcpus, async {
-                Ok::<_, VmSessionError>(instruction_profile::stop(&client).await?)
-            })
-            .await?;
-        }
+        drop(sampling_session);
+        let profiling_client = system_profiling::RpcClient::new(client.peer());
         if collect_profile {
             guest_step_under_deadline("the profiler stop", seconds, &vcpus, async {
                 Ok::<_, VmSessionError>(
                     profiling_control_step(
                         "disable remote profiling",
-                        system_profiling::set_enabled(&client, false),
+                        profiling_client.set_enabled(false),
                     )
                     .await?,
                 )
@@ -5149,7 +5203,7 @@ fn run_aot_bench(
                     Ok::<_, VmSessionError>(
                         profiling_read_step(
                             "read final remote profile samples",
-                            system_profiling::folded(&client, &profile_filter, 0),
+                            profiling_client.folded(profile_filter.clone(), 0),
                         )
                         .await?,
                     )
@@ -5160,7 +5214,7 @@ fn run_aot_bench(
                     Ok::<_, VmSessionError>(
                         profiling_read_step(
                             "read final remote perf metrics",
-                            system_profiling::metrics(&client, &metric_filter, 0),
+                            profiling_client.metrics(metric_filter.clone(), 0),
                         )
                         .await?,
                     )
@@ -5308,15 +5362,48 @@ fn write_profile_output(
     })
 }
 
+#[derive(Serialize)]
+struct MetricSampleJson<'a> {
+    scope: &'static str,
+    name: &'a str,
+    count: u64,
+    total_events: u64,
+    total_nanos: u64,
+    min_nanos: u64,
+    max_nanos: u64,
+    total_bytes: u64,
+    total_reference_cycles: u64,
+    total_cpu_cycles: u64,
+    total_instructions_retired: u64,
+}
+
 fn write_perf_metrics_output(
     output: &Path,
     metrics: &[system_profiling::MetricSample],
 ) -> Result<(), ProfileOutputError> {
-    let bytes =
-        serde_json::to_vec_pretty(metrics).map_err(|source| ProfileOutputError::Encode {
-            path: output.display().to_string(),
-            source,
-        })?;
+    let rows: Vec<MetricSampleJson<'_>> = metrics
+        .iter()
+        .map(|m| MetricSampleJson {
+            scope: match m.scope {
+                system_profiling::Scope::Kernel => "Kernel",
+                system_profiling::Scope::User => "User",
+            },
+            name: &m.name,
+            count: m.count,
+            total_events: m.total_events,
+            total_nanos: m.total_nanos,
+            min_nanos: m.min_nanos,
+            max_nanos: m.max_nanos,
+            total_bytes: m.total_bytes,
+            total_reference_cycles: m.total_reference_cycles,
+            total_cpu_cycles: m.total_cpu_cycles,
+            total_instructions_retired: m.total_instructions_retired,
+        })
+        .collect();
+    let bytes = serde_json::to_vec_pretty(&rows).map_err(|source| ProfileOutputError::Encode {
+        path: output.display().to_string(),
+        source,
+    })?;
     fs::write(output, bytes).map_err(|source| ProfileOutputError::Write {
         path: output.display().to_string(),
         source,
@@ -7450,9 +7537,6 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
 
-    use helios_inspector_protocol::debugger::programs as debugger_programs;
-    use helios_inspector_protocol::system::programs::ExecError;
-
     use super::*;
 
     /// Why one of the `#[ignore]`d guest integration tests failed.
@@ -7503,18 +7587,6 @@ mod tests {
         },
         #[error("timed out waiting for {what}")]
         TimedOut { what: &'static str },
-        #[error("{what} failed: {source}")]
-        Rpc {
-            what: &'static str,
-            #[source]
-            source: helios_inspector_protocol::RpcError,
-        },
-        #[error("{what} failed: {kind:?}: {detail}")]
-        Refused {
-            what: &'static str,
-            kind: system_programs::ExecErrorKind,
-            detail: String,
-        },
         #[error("{0}")]
         Program(#[from] crate::programs::ProgramError),
         #[error("failed to configure serial socket read timeout: {source}")]
@@ -7544,18 +7616,6 @@ mod tests {
             stages: String,
             lines: String,
         },
-    }
-
-    impl GuestTestFailure {
-        /// The guest's typed refusal of an `exec-path`, named by what was
-        /// being run.
-        fn refused(what: &'static str, error: ExecError) -> Self {
-            Self::Refused {
-                what,
-                kind: error.kind,
-                detail: error.detail,
-            }
-        }
     }
 
     const WATCHDOG_SELF_TEST_DELAY_MS: &str = "5000";
@@ -10328,7 +10388,11 @@ mod tests {
             kind: KernelBuildProfile::Debug,
             profile_use: None,
             kernel_features: Vec::new(),
-            boot_programs: vec!["debugger".to_owned()],
+            boot_programs: vec![
+                "inspector-host".to_owned(),
+                "inspector-tls".to_owned(),
+                "inspector-worker".to_owned(),
+            ],
             guest_programs_profile: None,
             prebuilt_wasm: None,
             skip_kernel_build: false,
@@ -10416,17 +10480,20 @@ mod tests {
             .socket_path()
             .to_str()
             .ok_or(GuestTestFailure::SocketPathNotUtf8)?;
-        let client = connect_client(socket, DEFAULT_BAUD, true).map_err(|source| {
-            GuestTestFailure::Connect {
-                purpose: "direct-exec",
-                source,
-            }
-        })?;
+        let identity =
+            resolve_vm_client_identity(&command, &crate::ops_cli::GlobalOpsFlags::default());
+        let client =
+            connect_client(socket, DEFAULT_BAUD, true, identity.as_ref()).map_err(|source| {
+                GuestTestFailure::Connect {
+                    purpose: "direct-exec",
+                    source,
+                }
+            })?;
 
         let curl = crate::runtime::block_on(async {
             crate::runtime::timeout(
                 DIRECT_EXEC_TIMEOUT,
-                debugger_programs::exec_path(
+                crate::programs::exec(
                     &client,
                     "/host/artifacts/wasi-tools/curl-stripped.wasm",
                     &["http://neverssl.com/".to_owned()],
@@ -10435,13 +10502,8 @@ mod tests {
             .await
         })
         .ok_or(GuestTestFailure::TimedOut {
-            what: "direct curl exec-path result",
-        })?
-        .map_err(|source| GuestTestFailure::Rpc {
-            what: "direct curl exec-path",
-            source,
-        })?
-        .map_err(|error| GuestTestFailure::refused("direct curl exec-path", error))?;
+            what: "direct curl exec result",
+        })??;
         assert_eq!(curl.exit_code, 0, "curl exited non-zero: {curl:?}");
         let curl_stdout = String::from_utf8_lossy(&curl.output.stdout).to_ascii_lowercase();
         assert!(
@@ -10464,17 +10526,20 @@ mod tests {
             .socket_path()
             .to_str()
             .ok_or(GuestTestFailure::SocketPathNotUtf8)?;
-        let client = connect_client(socket, DEFAULT_BAUD, true).map_err(|source| {
-            GuestTestFailure::Connect {
-                purpose: "direct-exec",
-                source,
-            }
-        })?;
+        let identity =
+            resolve_vm_client_identity(&command, &crate::ops_cli::GlobalOpsFlags::default());
+        let client =
+            connect_client(socket, DEFAULT_BAUD, true, identity.as_ref()).map_err(|source| {
+                GuestTestFailure::Connect {
+                    purpose: "direct-exec",
+                    source,
+                }
+            })?;
 
         let python = crate::runtime::block_on(async {
             crate::runtime::timeout(
                 DIRECT_EXEC_TIMEOUT,
-                debugger_programs::exec_path(
+                crate::programs::exec(
                     &client,
                     "/host/artifacts/python3-root/python3.wasm",
                     &["-c".to_owned(), "print(40+2)".to_owned()],
@@ -10483,13 +10548,8 @@ mod tests {
             .await
         })
         .ok_or(GuestTestFailure::TimedOut {
-            what: "direct CPython exec-path result",
-        })?
-        .map_err(|source| GuestTestFailure::Rpc {
-            what: "direct CPython exec-path",
-            source,
-        })?
-        .map_err(|error| GuestTestFailure::refused("direct CPython exec-path", error))?;
+            what: "direct CPython exec result",
+        })??;
         assert_eq!(python.exit_code, 0, "CPython exited non-zero: {python:?}");
         let python_stdout = String::from_utf8_lossy(&python.output.stdout);
         assert_eq!(python_stdout.trim(), "42", "unexpected CPython stdout");
@@ -10508,12 +10568,15 @@ mod tests {
             .socket_path()
             .to_str()
             .ok_or(GuestTestFailure::SocketPathNotUtf8)?;
-        let client = connect_client(socket, DEFAULT_BAUD, true).map_err(|source| {
-            GuestTestFailure::Connect {
-                purpose: "shell",
-                source,
-            }
-        })?;
+        let identity =
+            resolve_vm_client_identity(&command, &crate::ops_cli::GlobalOpsFlags::default());
+        let client =
+            connect_client(socket, DEFAULT_BAUD, true, identity.as_ref()).map_err(|source| {
+                GuestTestFailure::Connect {
+                    purpose: "shell",
+                    source,
+                }
+            })?;
 
         let python = crate::runtime::block_on(async {
             crate::runtime::timeout(
@@ -10777,8 +10840,10 @@ mod tests {
                 profile: "release-linux".to_owned(),
                 kernel_features: vec!["linux".to_owned()],
                 programs: Some(PrebuiltPrograms::Subset(vec![
-                    "debugger".to_owned(),
                     "init".to_owned(),
+                    "inspector-host".to_owned(),
+                    "inspector-tls".to_owned(),
+                    "inspector-worker".to_owned(),
                 ])),
                 files: vec![
                     KERNEL_IMAGE_FILE.to_owned(),
@@ -10797,7 +10862,11 @@ mod tests {
             release: true,
             no_build: false,
             kernel_features: vec!["linux".to_owned()],
-            boot_programs: vec!["debugger".to_owned()],
+            boot_programs: vec![
+                "inspector-host".to_owned(),
+                "inspector-tls".to_owned(),
+                "inspector-worker".to_owned(),
+            ],
             prebuilt: Some(VmPrebuiltMode::Image),
             prebuilt_dir: Some(dir.path().to_path_buf()),
             ..minimal_command()
@@ -10995,7 +11064,11 @@ mod tests {
             kind: KernelBuildProfile::Release,
             profile_use: None,
             kernel_features: Vec::new(),
-            boot_programs: vec!["debugger".to_owned()],
+            boot_programs: vec![
+                "inspector-host".to_owned(),
+                "inspector-tls".to_owned(),
+                "inspector-worker".to_owned(),
+            ],
             guest_programs_profile: None,
             prebuilt_wasm: None,
             skip_kernel_build: false,

@@ -25,7 +25,11 @@ use crate::error::{TransportError, WireError};
 use crate::transport::{
     Fault, MAX_INBOUND_PATHS, MAX_UNDELIVERED_BYTES, Progress, RAW_UPLOAD_CHUNK_BYTES,
 };
-use crate::wire::{Frame, read_frame, write_frame};
+#[cfg(not(feature = "host"))]
+use crate::wire::read_frame;
+#[cfg(feature = "host")]
+use crate::wire::read_frame_with_echo;
+use crate::wire::{Frame, write_frame};
 
 /// Default per-stream item credit window granted to a remote `stream<T>`
 /// producer.
@@ -56,8 +60,35 @@ impl Default for MuxConfig {
     }
 }
 
+/// Thread-safety marker equivalent to `Send` on multi-threaded host targets
+/// and unconditional on single-threaded `wasm32` guests where `wit-bindgen`
+/// component resources and host-call futures are `!Send`.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait MaybeSend: Send {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + ?Sized> MaybeSend for T {}
+
+/// Single-threaded `wasm32` guest relaxation of [`MaybeSend`].
+#[cfg(target_arch = "wasm32")]
+pub trait MaybeSend {}
+#[cfg(target_arch = "wasm32")]
+impl<T: ?Sized> MaybeSend for T {}
+
+/// Thread-safety marker equivalent to `Sync` on multi-threaded host targets
+/// and unconditional on single-threaded `wasm32` guests.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait MaybeSync: Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Sync + ?Sized> MaybeSync for T {}
+
+/// Single-threaded `wasm32` guest relaxation of [`MaybeSync`].
+#[cfg(target_arch = "wasm32")]
+pub trait MaybeSync {}
+#[cfg(target_arch = "wasm32")]
+impl<T: ?Sized> MaybeSync for T {}
+
 /// Service handler contract driven by [`drive_mux`].
-pub trait MuxDispatcher: Send + Sync + 'static {
+pub trait MuxDispatcher: MaybeSend + MaybeSync + 'static {
     /// Whether this peer serves `(instance, func)`.
     fn supports(&self, instance: &str, func: &str) -> bool;
 
@@ -69,16 +100,18 @@ pub trait MuxDispatcher: Send + Sync + 'static {
         call: InboundCall,
         instance: String,
         func: String,
-    ) -> impl Future<Output = Result<(), WireError>> + Send + '_;
+    ) -> impl Future<Output = Result<(), WireError>> + MaybeSend + '_;
 
     /// Drops a connection-local exported resource when the peer emits
     /// [`Frame::ResourceDrop`].
-    fn drop_resource(&self, handle: u32)
-    -> impl Future<Output = Result<(), WireError>> + Send + '_;
+    fn drop_resource(
+        &self,
+        handle: u32,
+    ) -> impl Future<Output = Result<(), WireError>> + MaybeSend + '_;
 
     /// Releases every remaining connection-scoped resource when the transport
     /// disconnects.
-    fn on_disconnect(&self) -> impl Future<Output = ()> + Send + '_;
+    fn on_disconnect(&self) -> impl Future<Output = ()> + MaybeSend + '_;
 }
 
 /// Cloneable, concrete connection handle for initiating outbound invocations
@@ -101,12 +134,15 @@ impl std::fmt::Debug for PeerHandle {
 struct MuxShared {
     config: MuxConfig,
     closed: AtomicBool,
+    #[cfg(feature = "host")]
+    echo_remote_serial: AtomicBool,
     next_invocation: AtomicU32,
     outbound: Mutex<HashMap<u32, Weak<CallCore>>>,
     /// Keeps `CallCore` alive while pre-buffered outbound streams/futures
     /// (`FutureReader::ready`, `StreamReader::from_vec`) wait for peer credit.
     buffered_keepalive: Mutex<HashMap<(CallSide, u32, u32), Arc<CallCore>>>,
     disconnect_reason: Mutex<Option<String>>,
+    guest_panic: Mutex<Option<String>>,
     progress: Progress,
 }
 
@@ -520,6 +556,18 @@ impl CallCore {
             let mut inbound = self.inbound.lock().await;
             if inbound.error.is_none() {
                 inbound.error = Some(Fault::Remote(message));
+            }
+        }
+        self.clear_prebuffered().await;
+        self.wake_writers(false).await;
+        self.progress.signal();
+    }
+
+    async fn fail_guest_panic(&self, report: String) {
+        {
+            let mut inbound = self.inbound.lock().await;
+            if inbound.error.is_none() {
+                inbound.error = Some(Fault::GuestPanicked(report));
             }
         }
         self.clear_prebuffered().await;
@@ -1084,6 +1132,19 @@ impl PeerHandle {
         self.state.closed.load(Ordering::Acquire)
     }
 
+    #[cfg(feature = "host")]
+    pub fn set_remote_serial_echo(&self, echo: bool) -> bool {
+        self.state.echo_remote_serial.swap(echo, Ordering::AcqRel)
+    }
+
+    pub async fn closed_error(&self) -> TransportError {
+        if let Some(report) = self.state.guest_panic.lock().await.clone() {
+            TransportError::GuestPanicked { report }
+        } else {
+            TransportError::Closed
+        }
+    }
+
     pub fn stream_credit_window(&self) -> u32 {
         self.state.config.stream_credit_window
     }
@@ -1106,7 +1167,7 @@ impl PeerHandle {
         func: &str,
     ) -> Result<OutboundCall, TransportError> {
         if self.is_closed() {
-            return Err(TransportError::Closed);
+            return Err(self.closed_error().await);
         }
         let id = self.state.next_invocation.fetch_add(1, Ordering::Relaxed);
         let core = CallCore::new(
@@ -1161,7 +1222,7 @@ impl PeerHandle {
             }
             if self.is_closed() {
                 call.root_completed = true;
-                return Err(TransportError::Closed);
+                return Err(self.closed_error().await);
             }
 
             futures_lite::future::or(
@@ -1181,10 +1242,13 @@ pub fn create_mux(config: MuxConfig) -> (PeerHandle, MuxDriverChannels) {
     let shared = Arc::new(MuxShared {
         config,
         closed: AtomicBool::new(false),
+        #[cfg(feature = "host")]
+        echo_remote_serial: AtomicBool::new(true),
         next_invocation: AtomicU32::new(1),
         outbound: Mutex::new(HashMap::new()),
         buffered_keepalive: Mutex::new(HashMap::new()),
         disconnect_reason: Mutex::new(None),
+        guest_panic: Mutex::new(None),
         progress: Progress::new(),
     });
     let handle = PeerHandle {
@@ -1252,7 +1316,7 @@ where
     let mut server_tasks = FuturesUnordered::new();
     let mut priority_outbox: VecDeque<(Frame, Option<Sender<io::Result<()>>>)> = VecDeque::new();
 
-    let mut read_fut = Box::pin(read_next_frame_owned(read));
+    let mut read_fut = Box::pin(read_next_frame_owned(read, Arc::clone(&shared)));
     let mut writer_slot = Some(write);
     let mut write_fut = None;
     let mut shutdown_requested = false;
@@ -1379,7 +1443,7 @@ where
                 }
                 Step::ServerDone(None) => {}
                 Step::FrameRead(reader_back, frame_res) => {
-                    read_fut = Box::pin(read_next_frame_owned(reader_back));
+                    read_fut = Box::pin(read_next_frame_owned(reader_back, Arc::clone(&shared)));
                     let Some(frame) =
                         frame_res.map_err(|source| TransportError::io("read mux frame", source))?
                     else {
@@ -1409,6 +1473,14 @@ where
     .await;
 
     shared.closed.store(true, Ordering::Release);
+    let panic_report = loop_outcome
+        .as_ref()
+        .err()
+        .and_then(TransportError::guest_panic)
+        .map(ToOwned::to_owned);
+    if let Some(report) = &panic_report {
+        *shared.guest_panic.lock().await = Some(report.clone());
+    }
     let reason = match &loop_outcome {
         Ok(()) => "transport disconnected".to_owned(),
         Err(err) => err.to_string(),
@@ -1424,7 +1496,11 @@ where
         .collect();
     shared.buffered_keepalive.lock().await.clear();
     for call in outbound_active {
-        call.fail_remote(reason.clone()).await;
+        if let Some(report) = &panic_report {
+            call.fail_guest_panic(report.clone()).await;
+        } else {
+            call.fail_remote(reason.clone()).await;
+        }
     }
     let inbound_active: Vec<Arc<CallCore>> =
         inbound_calls.values().filter_map(Weak::upgrade).collect();
@@ -1444,8 +1520,15 @@ where
 
 async fn read_next_frame_owned<R: AsyncRead + Unpin>(
     mut read: R,
+    shared: Arc<MuxShared>,
 ) -> (R, io::Result<Option<Frame>>) {
-    let res = read_frame(&mut read).await;
+    #[cfg(feature = "host")]
+    let res = read_frame_with_echo(&mut read, &shared.echo_remote_serial).await;
+    #[cfg(not(feature = "host"))]
+    let res = {
+        let _ = &shared;
+        read_frame(&mut read).await
+    };
     (read, res)
 }
 

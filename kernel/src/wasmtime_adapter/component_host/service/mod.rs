@@ -644,6 +644,11 @@ where
                 options: unix_socket_options::<Net>(),
             });
             result.push(sock);
+        } else {
+            return Err(ProgramExecError {
+                kind: ProgramExecErrorKind::Unavailable,
+                detail: ProgramExecErrorDetail::HostOperationFailed,
+            });
         }
     }
     Ok(result)

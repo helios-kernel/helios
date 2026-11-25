@@ -4,9 +4,14 @@
 //! Enforces compile-time separation between non-filesystem container grants
 //! ([`NonFsGrants`]) and filesystem mounts ([`ContainerMount`]).
 
-use helios_inspector_protocol::debugger::programs::{ContainerMountBind, ExecInContainerRequest};
-use helios_inspector_protocol::system::programs::{CapabilityGrant, ExecResult, FilesystemRight};
 use helios_oci::{OciError, PulledImage, ResolvedUser};
+use helios_wit_rpc::inspector::helios::system::ipc::Endpoint;
+use helios_wit_rpc::inspector::helios::system::programs::{
+    self as rpc_programs, CapabilityGrant, ContainerConfig as WireContainerConfig,
+    ContainerCredentials, ContainerExecRequest, ContainerIdentity,
+    ContainerMount as WireContainerMount, ContainerMountSharing as WireContainerMountSharing,
+    ExecResult, FilesystemRight,
+};
 
 use crate::error::OpsError;
 use crate::grants::NonFsGrants;
@@ -30,7 +35,7 @@ pub struct ContainerMount {
 }
 
 /// Validated container configuration assembled by [`ContainerBuilder`].
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ContainerConfig {
     pub root: ContainerMount,
     pub mounts: Vec<ContainerMount>,
@@ -39,7 +44,8 @@ pub struct ContainerConfig {
     pub credentials: ResolvedUser,
     pub hostname: String,
     pub domainname: String,
-    pub capability_grants: Vec<CapabilityGrant>,
+    pub grants: NonFsGrants,
+    pub capability_grants: Vec<CapabilityGrant<Endpoint>>,
     pub default_env: Vec<(String, String)>,
     pub default_cwd: Option<String>,
     pub entrypoint: Vec<String>,
@@ -281,7 +287,8 @@ impl ContainerBuilder {
             credentials: self.credentials,
             hostname: self.hostname,
             domainname: self.domainname,
-            capability_grants: self.grants.into_capability_grants(),
+            capability_grants: self.grants.clone().into_capability_grants(),
+            grants: self.grants,
             default_env: self.default_env,
             default_cwd: self.default_cwd,
             entrypoint: self.entrypoint,
@@ -300,7 +307,6 @@ impl ContainerBuilder {
 }
 
 /// Remote Linux container handle bound to a [`Session`].
-#[derive(Clone)]
 pub struct Container {
     session: Session,
     config: ContainerConfig,
@@ -321,7 +327,8 @@ impl Container {
         &self.config
     }
 
-    /// Execute `path` with `args` inside this container over the remote `Session`.
+    /// Execute `path` with `args` inside this container over the remote `Session`
+    /// using `helios:system/programs.create-container` + `container.exec`.
     pub async fn exec(
         &self,
         path: &str,
@@ -336,25 +343,61 @@ impl Container {
                 env.push((k.clone(), v.clone()));
             }
         }
-        let mounts = self
-            .config
-            .mounts
-            .iter()
-            .map(|m| ContainerMountBind {
-                source_path: m.source_path.clone(),
-                target_path: m.target_path.clone(),
-                writable: m.rights.contains(&FilesystemRight::Write),
-                private: m.sharing == ContainerMountSharing::Private,
-            })
-            .collect();
-        let req = ExecInContainerRequest {
-            path: path.to_owned(),
+        let map_mount = |m: &ContainerMount| WireContainerMount {
+            source_path: m.source_path.clone(),
+            target_path: m.target_path.clone(),
+            rights: m.rights.clone(),
+            sharing: match m.sharing {
+                ContainerMountSharing::Private => WireContainerMountSharing::Private,
+                ContainerMountSharing::Shared => WireContainerMountSharing::Shared,
+                ContainerMountSharing::EphemeralOverlay => {
+                    WireContainerMountSharing::EphemeralOverlay
+                }
+            },
+        };
+        let wire_cfg = WireContainerConfig {
+            root: map_mount(&self.config.root),
+            mounts: self.config.mounts.iter().map(map_mount).collect(),
+            shared_owner: ContainerIdentity {
+                uid: self.config.shared_owner_uid,
+                gid: self.config.shared_owner_gid,
+            },
+            credentials: ContainerCredentials {
+                uid: self.config.credentials.uid,
+                gid: self.config.credentials.gid,
+                supplementary_groups: self.config.credentials.supplementary_groups.clone(),
+            },
+            hostname: self.config.hostname.clone(),
+            domainname: self.config.domainname.clone(),
+            capability_grants: self.config.grants.clone().into_capability_grants(),
+        };
+        let exec_req = ContainerExecRequest {
+            name: path.to_owned(),
             args: args.to_vec(),
             env,
-            mounts,
-            scratch_dir: self.config.scratch_dir.clone(),
+            path: path.to_owned(),
+            cwd: self.config.default_cwd.clone(),
+            stdin: Vec::new(),
+            credentials: None,
         };
-        self.session.exec_in_container(&req).await
+        let client = rpc_programs::RpcClient::new(self.session.protocol_client().clone());
+        let container = client
+            .create_container(wire_cfg)
+            .await
+            .map_err(|source| OpsError::Rpc {
+                operation: "system.programs.create-container",
+                source,
+            })?
+            .map_err(OpsError::from)?;
+        let res = container
+            .exec(exec_req)
+            .await
+            .map_err(|source| OpsError::Rpc {
+                operation: "system.programs.container.exec",
+                source,
+            })?
+            .map_err(OpsError::from)?;
+        Ok(res)
     }
 
     /// Execute the container's OCI `Entrypoint` / `Cmd` (with optional `override_args`).
@@ -376,7 +419,7 @@ impl Container {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helios_inspector_protocol::system::programs::NetworkRight;
+    use helios_wit_rpc::inspector::helios::system::programs::NetworkRight;
     use std::collections::BTreeMap;
     use tempfile::TempDir;
 

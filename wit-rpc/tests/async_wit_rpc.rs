@@ -1206,7 +1206,10 @@ fn real_workspace_inspector_system_wit_world_generates_and_streams_child_stdio()
         type Container = ();
         type Endpoint = ();
         type TcpListener = ();
+        type TcpStream = ();
+        type SerialPort = ();
         type VsockListener = ();
+        type VsockStream = ();
 
         async fn child_stdin(
             &self,
@@ -1256,7 +1259,13 @@ fn real_workspace_inspector_system_wit_world_generates_and_streams_child_stdio()
         async fn container_spawn(
             &self,
             _self_: &Self::Container,
-            _request: ContainerSpawnRequest<Self::TcpListener, Self::VsockListener>,
+            _request: ContainerSpawnRequest<
+                Self::TcpListener,
+                Self::VsockListener,
+                Self::TcpStream,
+                Self::VsockStream,
+                Self::SerialPort,
+            >,
         ) -> Result<Self::Child, SpawnError> {
             Ok(MockChild { id: 2 })
         }
@@ -1282,7 +1291,15 @@ fn real_workspace_inspector_system_wit_world_generates_and_streams_child_stdio()
 
         async fn take_inherited_sockets(
             &self,
-        ) -> Vec<InheritedSocket<Self::TcpListener, Self::VsockListener>> {
+        ) -> Vec<
+            InheritedSocket<
+                Self::TcpListener,
+                Self::VsockListener,
+                Self::TcpStream,
+                Self::VsockStream,
+                Self::SerialPort,
+            >,
+        > {
             Vec::new()
         }
 
@@ -1295,7 +1312,14 @@ fn real_workspace_inspector_system_wit_world_generates_and_streams_child_stdio()
 
         async fn spawn(
             &self,
-            request: SpawnRequest<Self::Endpoint, Self::TcpListener, Self::VsockListener>,
+            request: SpawnRequest<
+                Self::TcpListener,
+                Self::VsockListener,
+                Self::TcpStream,
+                Self::VsockStream,
+                Self::SerialPort,
+                Self::Endpoint,
+            >,
         ) -> Result<Self::Child, SpawnError> {
             assert_eq!(request.name, "nu");
             Ok(MockChild { id: 42 })

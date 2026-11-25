@@ -81,6 +81,20 @@ pub async fn ping(host: &str, timeout: Duration) -> io::Result<PingReply> {
 }
 
 impl TcpStream {
+    /// Wraps a raw WIT `tcp-stream` resource (e.g. from `take_inherited_sockets`).
+    pub fn from_raw(raw: raw::TcpStream) -> Self {
+        Self {
+            raw,
+            timeout: DEFAULT_TCP_TIMEOUT,
+        }
+    }
+
+    /// Unwraps the underlying WIT `tcp-stream` resource for transfer into a
+    /// spawned child via `InheritedSocket::TcpStream`.
+    pub fn into_raw(self) -> raw::TcpStream {
+        self.raw
+    }
+
     /// Connects to `host:port` using the default operation timeout.
     pub async fn connect(host: &str, port: u16) -> io::Result<Self> {
         Self::connect_timeout(host, port, DEFAULT_TCP_TIMEOUT).await

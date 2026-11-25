@@ -3188,4 +3188,37 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn empty_authority_denies_all_privileged_operations_for_inspector_tls() {
+        let empty = ProcessAuthority::empty();
+        assert!(empty.derive_root_supervisor_cap().is_err());
+        assert!(empty.derive_machine_identity_cap().is_err());
+        assert!(empty.derive_machine_control_cap().is_err());
+        assert!(empty.derive_virtualize_cap().is_err());
+        assert!(empty.derive_spawn_authority().is_err());
+        assert!(empty.derive_exec_authority().is_err());
+        assert!(empty.derive_tcp_cap().is_err());
+        assert!(empty.derive_udp_cap().is_err());
+        assert!(empty.derive_dns_cap().is_err());
+        assert!(empty.derive_network_admin_cap().is_err());
+        assert!(empty.derive_terminal_input_cap().is_err());
+        assert!(empty.derive_terminal_output_cap().is_err());
+        assert!(empty.derive_inspect_read_cap().is_err());
+        assert!(empty.derive_trace_read_cap().is_err());
+        assert!(empty.derive_profile_read_cap().is_err());
+        assert!(empty.derive_diagnostics_control_cap().is_err());
+        assert!(empty.derive_instance_control_cap().is_err());
+        assert!(empty.derive_write_settings_cap().is_err());
+        assert!(empty.derive_mount_cap("/").is_err());
+        assert!(empty.derive_unmount_cap("/").is_err());
+        assert!(empty.derive_btrfs_subvol_read_cap("/").is_err());
+        assert!(
+            empty
+                .derive_directory_cap("/", "/", DirectoryAuthorityRights::READ)
+                .is_err()
+        );
+        assert!(!empty.can_load_program("/bin/inspector-worker"));
+        assert!(!empty.can_write_path("/etc/inspector/policy.postcard"));
+    }
 }

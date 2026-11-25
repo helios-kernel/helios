@@ -11,6 +11,9 @@
 //! host by `helios-cli`. Enabling `--features dynamic-components` opts into
 //! bounded runtime dynamic subtree mounting.
 
+#[cfg(feature = "dynamic-components")]
+mod component_control;
+
 mod generated_topology {
     #![expect(
         unused_imports,
@@ -435,9 +438,12 @@ struct HeliosRuntime {
     inspect: Rc<RefCell<Option<InspectPublisher>>>,
     start_instant: std::time::Instant,
     vsock_available: bool,
+    #[cfg(feature = "dynamic-components")]
+    control_tx: async_channel::Sender<component_control::ControlCommand>,
 }
 
 impl HeliosRuntime {
+    #[cfg(not(feature = "dynamic-components"))]
     fn new(vsock_available: bool) -> Self {
         let publisher = match InspectPublisher::create("components", INSPECT_BUFFER_BYTES) {
             Ok(publisher) => Some(publisher),
@@ -452,6 +458,28 @@ impl HeliosRuntime {
             inspect: Rc::new(RefCell::new(publisher)),
             start_instant: std::time::Instant::now(),
             vsock_available,
+        }
+    }
+
+    #[cfg(feature = "dynamic-components")]
+    fn new(
+        vsock_available: bool,
+        control_tx: async_channel::Sender<component_control::ControlCommand>,
+    ) -> Self {
+        let publisher = match InspectPublisher::create("components", INSPECT_BUFFER_BYTES) {
+            Ok(publisher) => Some(publisher),
+            Err(error) => {
+                eprintln!(
+                    "helios component-manager: failed to publish /components inspect: {error}"
+                );
+                None
+            }
+        };
+        Self {
+            inspect: Rc::new(RefCell::new(publisher)),
+            start_instant: std::time::Instant::now(),
+            vsock_available,
+            control_tx,
         }
     }
 }
@@ -626,6 +654,12 @@ impl SupervisorRuntime for HeliosRuntime {
                 for (name, HeliosIpcEnd(endpoint)) in args.ipc_channels {
                     grants.push(programs::ipc_grant(name, endpoint));
                 }
+                #[cfg(feature = "dynamic-components")]
+                if args.node.moniker.as_ref() == "/inspector" {
+                    let (srv_ep, cli_ep) = ipc::channel();
+                    component_control::spawn_control_endpoint(srv_ep, self.control_tx.clone());
+                    grants.push(programs::ipc_grant("component-control", cli_ep));
+                }
                 let child = root_supervisor::spawn(ManagedSpawnRequest {
                     name: args.node.instance_name.to_string(),
                     args: wasm.args.iter().map(|s| s.to_string()).collect(),
@@ -645,7 +679,7 @@ impl SupervisorRuntime for HeliosRuntime {
                 .map_err(|error| RuntimeError::Other {
                     detail: format!("spawning `{}`: {error}", args.node.moniker),
                 })?;
-                if args.node.instance_name.as_ref() == "debugger" && self.vsock_available {
+                if args.node.instance_name.as_ref() == "inspector-host" && self.vsock_available {
                     let (out_stream, out_future) = child.stdout();
                     let (err_stream, err_future) = child.stderr();
                     forward_child_stream(out_stream, out_future, false);
@@ -1148,6 +1182,11 @@ async fn main() -> io::Result<()> {
 
     let inventory = root_supervisor::hardware_inventory()
         .map_err(|error| io::Error::other(format!("reading hardware inventory: {error}")))?;
+    #[cfg(feature = "dynamic-components")]
+    let (control_tx, control_rx) = component_control::new_control_queue();
+    #[cfg(feature = "dynamic-components")]
+    let runtime = HeliosRuntime::new(inventory.vsock, control_tx);
+    #[cfg(not(feature = "dynamic-components"))]
     let runtime = HeliosRuntime::new(inventory.vsock);
     let mut supervisor = Supervisor::new(runtime, generated_topology::GENERATED_TOPOLOGY)
         .map_err(|error| io::Error::other(format!("initializing component-manager: {error}")))?;
@@ -1167,6 +1206,33 @@ async fn main() -> io::Result<()> {
         })
         .await
         .map_err(|error| io::Error::other(format!("booting component topology: {error}")))?;
+    #[cfg(feature = "dynamic-components")]
+    {
+        use futures_lite::future::FutureExt as _;
+        enum LoopItem {
+            Supervisor(Result<bool, helios_component_manager::SupervisorError>),
+            Control(Result<component_control::ControlCommand, async_channel::RecvError>),
+        }
+        loop {
+            let item = async { LoopItem::Supervisor(supervisor.step_once().await) }
+                .or(async { LoopItem::Control(control_rx.recv().await) })
+                .await;
+            match item {
+                LoopItem::Supervisor(Ok(true)) => {}
+                LoopItem::Supervisor(Ok(false)) => break,
+                LoopItem::Supervisor(Err(error)) => {
+                    return Err(io::Error::other(format!(
+                        "supervising component topology: {error}"
+                    )));
+                }
+                LoopItem::Control(Ok(cmd)) => {
+                    component_control::handle_control_command(&mut supervisor, cmd).await;
+                }
+                LoopItem::Control(Err(_)) => break,
+            }
+        }
+    }
+    #[cfg(not(feature = "dynamic-components"))]
     supervisor
         .run_until_done()
         .await
@@ -1189,7 +1255,32 @@ mod tests {
         assert!(topology.find_by_moniker("/plugins/compiler").is_some());
         assert!(topology.find_by_moniker("/plugins/http-client").is_some());
         assert!(topology.find_by_moniker("/plugins/compositor").is_some());
-        assert!(topology.find_by_moniker("/debugger").is_some());
+        assert!(topology.find_by_moniker("/debugger").is_none());
+        let inspector = &topology.nodes[topology
+            .find_by_moniker("/inspector")
+            .expect("/inspector manifest must exist")];
+        let tls = &topology.nodes[topology
+            .find_by_moniker("/inspector/tls")
+            .expect("/inspector/tls manifest must exist")];
+        let worker = &topology.nodes[topology
+            .find_by_moniker("/inspector/worker")
+            .expect("/inspector/worker manifest must exist")];
+        assert_eq!(
+            tls.capabilities,
+            helios_component_manager::CapabilityCeiling::EMPTY
+        );
+        assert!(
+            inspector
+                .capabilities
+                .machine
+                .contains(helios_component_manager::MachineRights::IDENTITY)
+        );
+        assert!(
+            !worker
+                .capabilities
+                .machine
+                .contains(helios_component_manager::MachineRights::IDENTITY)
+        );
     }
 
     #[test]

@@ -116,9 +116,7 @@ pub type SbiSerialPort = crate::ComponentSerialPort;
 
 pub use vsock::{ComponentVsockListener, ComponentVsockStream};
 
-pub type NetworkTcpBackend<Net> = crate::ComponentTcpBackend<Net>;
 pub type NetworkUdpBackend<Net> = crate::ComponentUdpBackend<Net>;
-pub type SbiTcpStream<Net> = crate::ComponentTcpStream<NetworkTcpBackend<Net>>;
 pub type SbiUdpSocket<Net> = crate::ComponentUdpSocket<NetworkUdpBackend<Net>>;
 pub type HostRuntimeState<CpuImpl, Net, StorageImpl> =
     crate::RuntimeState<UserProgramService<CpuImpl, Net, StorageImpl>, Net, StorageImpl>;
@@ -387,6 +385,68 @@ macro_rules! impl_program_bindings {
                                                 });
                                             }
                                         }
+                                    }
+                                }
+                                $bindings::helios::system::programs::InheritedSocket::TcpStream(
+                                    res,
+                                ) => {
+                                    let mut stream = access
+                                        .get()
+                                        .table
+                                        .delete(res)
+                                        .map_err(wasmtime::Error::from)?;
+                                    if socket_error.is_none() {
+                                        match crate::InheritedSocket::from_tcp_stream(&mut stream) {
+                                            Some(inherited) => extracted_sockets.push(inherited),
+                                            None => {
+                                                socket_error = Some(ProgramExecError {
+                                                    kind: ProgramExecErrorKind::Unavailable,
+                                                    detail:
+                                                        ProgramExecErrorDetail::HostOperationFailed,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                                $bindings::helios::system::programs::InheritedSocket::VsockStream(
+                                    res,
+                                ) => {
+                                    let mut stream = access
+                                        .get()
+                                        .table
+                                        .delete(res)
+                                        .map_err(wasmtime::Error::from)?;
+                                    if socket_error.is_none() {
+                                        match stream.take() {
+                                            Some((vsock_service, id)) => {
+                                                extracted_sockets.push(
+                                                    crate::InheritedSocket::from_vsock_stream(
+                                                        vsock_service,
+                                                        id,
+                                                    ),
+                                                );
+                                            }
+                                            None => {
+                                                socket_error = Some(ProgramExecError {
+                                                    kind: ProgramExecErrorKind::Unavailable,
+                                                    detail:
+                                                        ProgramExecErrorDetail::HostOperationFailed,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                                $bindings::helios::system::programs::InheritedSocket::Serial(
+                                    res,
+                                ) => {
+                                    let port = access
+                                        .get()
+                                        .table
+                                        .delete(res)
+                                        .map_err(wasmtime::Error::from)?;
+                                    if socket_error.is_none() {
+                                        extracted_sockets
+                                            .push(crate::InheritedSocket::from_serial_port(port));
                                     }
                                 }
                             }
@@ -1017,6 +1077,27 @@ macro_rules! impl_program_bindings {
                         result.push(
                             $bindings::helios::system::programs::InheritedSocket::Vsock(res),
                         );
+                    } else if let Some(raw) = sock.take_tcp_stream() {
+                        let res = store
+                            .table
+                            .push(crate::ComponentTcpStreamHandle::new(raw, retire.clone()))
+                            .map_err(wasmtime::Error::from)?;
+                        result.push(
+                            $bindings::helios::system::programs::InheritedSocket::TcpStream(res),
+                        );
+                    } else if let Some((vsock_service, stream_id)) = sock.take_vsock_stream() {
+                        let res = store
+                            .table
+                            .push(vsock::ComponentVsockStream::new(vsock_service, stream_id))
+                            .map_err(wasmtime::Error::from)?;
+                        result.push(
+                            $bindings::helios::system::programs::InheritedSocket::VsockStream(res),
+                        );
+                    } else if let Some(port) = sock.take_serial() {
+                        let res = store.table.push(port).map_err(wasmtime::Error::from)?;
+                        result.push(
+                            $bindings::helios::system::programs::InheritedSocket::Serial(res),
+                        );
                     }
                 }
                 Ok(result)
@@ -1210,6 +1291,64 @@ macro_rules! impl_program_bindings {
                                             });
                                         }
                                     }
+                                }
+                            }
+                            $bindings::helios::system::programs::InheritedSocket::TcpStream(
+                                res,
+                            ) => {
+                                let mut stream = access
+                                    .get()
+                                    .table
+                                    .delete(res)
+                                    .map_err(wasmtime::Error::from)?;
+                                if socket_error.is_none() {
+                                    match crate::InheritedSocket::from_tcp_stream(&mut stream) {
+                                        Some(inherited) => extracted_sockets.push(inherited),
+                                        None => {
+                                            socket_error = Some(ProgramExecError {
+                                                kind: ProgramExecErrorKind::Unavailable,
+                                                detail: ProgramExecErrorDetail::HostOperationFailed,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            $bindings::helios::system::programs::InheritedSocket::VsockStream(
+                                res,
+                            ) => {
+                                let mut stream = access
+                                    .get()
+                                    .table
+                                    .delete(res)
+                                    .map_err(wasmtime::Error::from)?;
+                                if socket_error.is_none() {
+                                    match stream.take() {
+                                        Some((vsock_service, id)) => {
+                                            extracted_sockets.push(
+                                                crate::InheritedSocket::from_vsock_stream(
+                                                    vsock_service,
+                                                    id,
+                                                ),
+                                            );
+                                        }
+                                        None => {
+                                            socket_error = Some(ProgramExecError {
+                                                kind: ProgramExecErrorKind::Unavailable,
+                                                detail: ProgramExecErrorDetail::HostOperationFailed,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            $bindings::helios::system::programs::InheritedSocket::Serial(res) => {
+                                let port = access
+                                    .get()
+                                    .table
+                                    .delete(res)
+                                    .map_err(wasmtime::Error::from)?;
+                                if socket_error.is_none() {
+                                    extracted_sockets
+                                        .push(crate::InheritedSocket::from_serial_port(port));
                                 }
                             }
                         }
@@ -4348,10 +4487,11 @@ where
     let mut instance = linker.instance(NET_INSTANCE)?;
     instance.resource(
         "tcp-stream",
-        ResourceType::host::<SbiTcpStream<Net>>(),
+        ResourceType::host::<crate::ComponentTcpStreamHandle>(),
         |mut caller, rep| {
-            let resource = Resource::<SbiTcpStream<Net>>::new_own(rep);
+            let resource = Resource::<crate::ComponentTcpStreamHandle>::new_own(rep);
             caller.data_mut().table.delete(resource)?;
+            caller.data().retire_sockets();
             Ok(())
         },
     )?;
@@ -4443,19 +4583,20 @@ where
                 };
                 let connected = service.tcp_connect(&host, port, timeout).await;
                 record_component_host_kernel_profile(profile, "program-net-tcp-connect");
-                let response =
-                    match connected {
-                        Ok(stream) => {
-                            let resource =
-                                accessor.with(|mut access| {
-                                    access.get().table.push(SbiTcpStream::new(
-                                        NetworkTcpBackend::new(service.clone(), stream),
-                                    ))
-                                })?;
-                            Ok(resource)
-                        }
-                        Err(error) => Err(convert_program_tcp_error(error)),
-                    };
+                let response = match connected {
+                    Ok(stream) => {
+                        let raw = crate::NetworkHandle::into_raw(stream);
+                        let resource = accessor.with(|mut access| {
+                            let store = access.get();
+                            let retire = store.retirement.sender();
+                            store
+                                .table
+                                .push(crate::ComponentTcpStreamHandle::new(raw, retire))
+                        })?;
+                        Ok(resource)
+                    }
+                    Err(error) => Err(convert_program_tcp_error(error)),
+                };
                 Ok::<_, wasmtime::Error>((response,))
             })
         },
@@ -4532,23 +4673,26 @@ where
     instance.func_wrap_concurrent(
         "[method]tcp-stream.read",
         |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
-         (resource, max_bytes, timeout): (Resource<SbiTcpStream<Net>>, u32, u64)| {
+         (resource, max_bytes, timeout): (Resource<crate::ComponentTcpStreamHandle>, u32, u64)| {
             Box::pin(async move {
-                let (socket, profile) = accessor.with(|mut access| {
-                    let socket = access.get().table.get(&resource)?;
+                let (service, raw, profile) = accessor.with(|mut access| {
+                    let store = access.get();
+                    let socket = store.table.get(&resource)?;
                     Ok::<_, wasmtime::Error>((
-                        (
-                            socket.resource.backend.service.clone(),
-                            socket.resource.backend.stream(),
-                        ),
-                        component_host_profile(access.get()),
+                        store.runtime_state.network_service(),
+                        socket.raw(),
+                        component_host_profile(store),
                     ))
                 })?;
                 let service_profile = profile.as_ref().map(ComponentHostProfile::restarted);
-                let Some(stream) = socket.1 else {
+                let Some(raw) = raw else {
                     return Ok::<_, wasmtime::Error>((Err(closed_program_tcp_error()),));
                 };
-                let response = socket.0.tcp_read(stream, max_bytes, timeout).await;
+                let Some(service) = service else {
+                    return Ok::<_, wasmtime::Error>((Err(unavailable_program_tcp_error()),));
+                };
+                let stream = <Net::TcpStream as crate::NetworkHandle>::from_raw(raw);
+                let response = service.tcp_read(stream, max_bytes, timeout).await;
                 let bytes = response
                     .as_ref()
                     .ok()
@@ -4583,20 +4727,33 @@ where
     instance.func_wrap_concurrent(
         "[method]tcp-stream.write",
         |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
-         (resource, bytes, timeout): (Resource<SbiTcpStream<Net>>, WasmList<u8>, u64)| {
+         (resource, bytes, timeout): (
+            Resource<crate::ComponentTcpStreamHandle>,
+            WasmList<u8>,
+            u64,
+        )| {
             Box::pin(async move {
-                let (service, stream, profile, payload) = accessor.with(|mut access| {
-                    let socket = access.get().table.get(&resource)?;
-                    let service = socket.resource.backend.service.clone();
-                    let stream = socket.resource.backend.stream();
-                    let profile = component_host_profile(access.get());
-                    let payload =
-                        stream.map(|_| sbi_tcp_payload(&service, bytes.as_le_slice(&access)));
-                    Ok::<_, wasmtime::Error>((service, stream, profile, payload))
+                let (service, raw, profile, payload) = accessor.with(|mut access| {
+                    let store = access.get();
+                    let socket = store.table.get(&resource)?;
+                    let service = store.runtime_state.network_service();
+                    let raw = socket.raw();
+                    let profile = component_host_profile(store);
+                    let payload = match (&service, raw) {
+                        (Some(svc), Some(_)) => {
+                            Some(sbi_tcp_payload(svc, bytes.as_le_slice(&access)))
+                        }
+                        _ => None,
+                    };
+                    Ok::<_, wasmtime::Error>((service, raw, profile, payload))
                 })?;
-                let (Some(stream), Some(payload)) = (stream, payload) else {
+                let Some(raw) = raw else {
                     return Ok::<_, wasmtime::Error>((Err(closed_program_tcp_error()),));
                 };
+                let (Some(service), Some(payload)) = (service, payload) else {
+                    return Ok::<_, wasmtime::Error>((Err(unavailable_program_tcp_error()),));
+                };
+                let stream = <Net::TcpStream as crate::NetworkHandle>::from_raw(raw);
                 let written = bytes.len() as u64;
                 let response = match payload {
                     Ok(pieces) => service
@@ -4614,9 +4771,10 @@ where
     instance.func_wrap_concurrent_immediate(
         "[method]tcp-stream.close",
         |mut caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
-         (resource,): (Resource<SbiTcpStream<Net>>,)| {
+         (resource,): (Resource<crate::ComponentTcpStreamHandle>,)| {
             let socket = caller.data_mut().table.get_mut(&resource)?;
-            socket.resource.backend.close();
+            socket.close();
+            caller.data().retire_sockets();
             Ok((Ok::<(), program_wit::net::TcpError>(()),))
         },
     )?;
@@ -4733,19 +4891,20 @@ where
                     return Ok::<_, wasmtime::Error>((Err(unavailable_program_tcp_error()),));
                 };
                 let handle = <Net::TcpListener as crate::NetworkHandle>::from_raw(raw);
-                let response =
-                    match service.tcp_accept(handle, timeout).await {
-                        Ok(accepted) => {
-                            let resource =
-                                accessor.with(|mut access| {
-                                    access.get().table.push(SbiTcpStream::new(
-                                        NetworkTcpBackend::new(service.clone(), accepted.stream),
-                                    ))
-                                })?;
-                            Ok(resource)
-                        }
-                        Err(error) => Err(convert_program_tcp_error(error)),
-                    };
+                let response = match service.tcp_accept(handle, timeout).await {
+                    Ok(accepted) => {
+                        let raw = crate::NetworkHandle::into_raw(accepted.stream);
+                        let resource = accessor.with(|mut access| {
+                            let store = access.get();
+                            let retire = store.retirement.sender();
+                            store
+                                .table
+                                .push(crate::ComponentTcpStreamHandle::new(raw, retire))
+                        })?;
+                        Ok(resource)
+                    }
+                    Err(error) => Err(convert_program_tcp_error(error)),
+                };
                 Ok::<_, wasmtime::Error>((response,))
             })
         },

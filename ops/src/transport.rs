@@ -1,5 +1,6 @@
-//! Unified async RPC transport layer (`serial://`, `vsock://`, `helios://` / `tcp://`)
-//! driving `helios-inspector-protocol::transport::Client` with zero `block_on`.
+//! Unified async RPC transport layer (`serial://`, `vsock://`, `helios://`, `helios+tls://`,
+//! `tcp://`) driving `helios-wit-rpc` (`Endpoint` + `PeerHandle`) with unified Ed25519 +
+//! `postcard` authentication and pure-Rust TLS 1.3 + RFC 8446 channel binding.
 
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
@@ -11,10 +12,13 @@ use std::time::{Duration, Instant};
 use async_io::Async;
 use async_net::TcpStream;
 use futures_io::{AsyncRead, AsyncWrite};
-use helios_inspector_protocol::transport::Client;
+use futures_util::AsyncReadExt as _;
+use helios_inspector_protocol::auth::{ClientIdentity, TransportKind, client_handshake};
+use helios_inspector_protocol::tls::{TlsClientStream, build_client_config};
+use helios_wit_rpc::{Endpoint, PeerHandle};
 
 use crate::error::TransportError;
-use crate::target::{CapabilityCert, TargetUri};
+use crate::target::TargetUri;
 
 const SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_CONNECT_POLL: Duration = Duration::from_millis(50);
@@ -27,26 +31,30 @@ pub trait RpcWrite: AsyncWrite + Unpin + Send {}
 impl<T> RpcRead for T where T: AsyncRead + Unpin + Send {}
 impl<T> RpcWrite for T where T: AsyncWrite + Unpin + Send {}
 
-/// Boxed async read half shared across serial, Unix socket, vsock, and TCP transports.
+/// Boxed async read half shared across serial, Unix socket, vsock, and TCP/TLS transports.
 pub type RpcReader = Box<dyn RpcRead>;
-/// Boxed async write half shared across serial, Unix socket, vsock, and TCP transports.
+/// Boxed async write half shared across serial, Unix socket, vsock, and TCP/TLS transports.
 pub type RpcWriter = Box<dyn RpcWrite>;
 
-/// Underlying `helios-inspector-protocol` client type used by [`RpcConnection`].
-pub type ProtocolClient = Client<RpcReader, RpcWriter>;
+/// Underlying `helios-wit-rpc` connection handle used by [`RpcConnection`].
+pub type ProtocolClient = PeerHandle;
 
-/// Security mode for `helios://` network connections.
-///
-/// Structured as an explicit handshake configuration so #1190's TLS 1.3 +
-/// Ed25519 [`CapabilityCert`] mutual authentication plugs directly into
-/// [`RpcConnection::connect`] without breaking callers.
+/// Authentication and transport security mode for [`RpcConnection::connect`].
 #[derive(Debug, Clone, Default)]
 pub enum SecurityMode {
-    /// Direct unencrypted stream (serial, local Unix socket, vsock, or `tcp://`).
+    /// Direct unauthenticated stream (for local mock tests or pre-authenticated links).
+    ///
+    /// `helios://` and `helios+tls://` refuse `Plain` with [`TransportError::AuthRequired`]
+    /// rather than downgrading to cleartext.
     #[default]
     Plain,
-    /// TLS + Ed25519 [`CapabilityCert`] handshake for remote `helios://` listeners.
-    CapabilityTls { cert: Option<CapabilityCert> },
+    /// Unified Ed25519 + `postcard` authentication (static key or CA-signed short-lived
+    /// `CapabilityCert` with optional offline monotonic attenuation), paired with pure-Rust
+    /// TLS 1.3 + RFC 8446 `tls-exporter` channel binding on `helios://` / `helios+tls://`.
+    Authenticated {
+        identity: Box<ClientIdentity>,
+        expected_machine_public_key: Option<[u8; 32]>,
+    },
 }
 
 /// Guard keeping the connection's background frame router alive until the last
@@ -77,13 +85,13 @@ pub struct RpcConnection {
 
 impl RpcConnection {
     /// Construct an [`RpcConnection`] from raw async read/write halves and spawn
-    /// the frame router on the current Tokio runtime (zero `block_on`).
+    /// the WIT-RPC frame multiplexer on the current Tokio runtime (zero `block_on`).
     #[must_use]
     pub fn from_split(read: RpcReader, write: RpcWriter) -> Self {
-        let client = Client::new(read, write);
-        let driver_client = client.clone();
+        let endpoint = Endpoint::new(read, write, ());
+        let client = endpoint.handle();
         let handle = tokio::spawn(async move {
-            let _ = driver_client.route_frames().await;
+            let _ = endpoint.drive().await;
         });
         Self {
             client,
@@ -102,35 +110,149 @@ impl RpcConnection {
 
     /// Connect asynchronously to `uri` using the requested [`SecurityMode`].
     pub async fn connect(uri: &TargetUri, security: &SecurityMode) -> Result<Self, TransportError> {
-        let (read, write) = match uri {
-            TargetUri::Serial { path, baud } => open_serial(path, *baud).await?,
-            TargetUri::Vsock { cid, port } => open_vsock(*cid, *port).await?,
-            TargetUri::Helios { host, port, tls } => {
-                if *tls || matches!(security, SecurityMode::CapabilityTls { .. }) {
-                    return Err(TransportError::TlsNotYetImplemented {
-                        host: host.clone(),
-                        port: *port,
-                    });
+        match uri {
+            TargetUri::Serial { path, baud } => {
+                let (mut read, mut write) = open_serial(path, *baud).await?;
+                if let SecurityMode::Authenticated {
+                    identity,
+                    expected_machine_public_key,
+                } = security
+                {
+                    client_handshake(
+                        &mut read,
+                        &mut write,
+                        TransportKind::Serial,
+                        identity,
+                        *expected_machine_public_key,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(|source| TransportError::AuthHandshake {
+                        endpoint: uri.to_uri_string(),
+                        source,
+                    })?;
                 }
-                open_tcp(host, *port).await?
+                Ok(Self::from_split(read, write))
             }
-        };
-        Ok(Self::from_split(read, write))
+            TargetUri::Vsock { cid, port } => {
+                let (mut read, mut write) = open_vsock(*cid, *port).await?;
+                if let SecurityMode::Authenticated {
+                    identity,
+                    expected_machine_public_key,
+                } = security
+                {
+                    client_handshake(
+                        &mut read,
+                        &mut write,
+                        TransportKind::Vsock,
+                        identity,
+                        *expected_machine_public_key,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(|source| TransportError::AuthHandshake {
+                        endpoint: uri.to_uri_string(),
+                        source,
+                    })?;
+                }
+                Ok(Self::from_split(read, write))
+            }
+            TargetUri::Helios { host, port, tls } => {
+                if *tls {
+                    let SecurityMode::Authenticated {
+                        identity,
+                        expected_machine_public_key,
+                    } = security
+                    else {
+                        return Err(TransportError::AuthRequired {
+                            host: host.clone(),
+                            port: *port,
+                        });
+                    };
+                    let address = format_tcp_addr(host, *port);
+                    let tcp = TcpStream::connect(&address).await.map_err(|source| {
+                        TransportError::ConnectTcp {
+                            address: address.clone(),
+                            source,
+                        }
+                    })?;
+                    let tls_cfg =
+                        build_client_config().map_err(|source| TransportError::TlsHandshake {
+                            address: address.clone(),
+                            source,
+                        })?;
+                    let tls_stream = TlsClientStream::connect(tcp.clone(), tcp, tls_cfg, host)
+                        .await
+                        .map_err(|source| TransportError::TlsHandshake {
+                            address: address.clone(),
+                            source,
+                        })?;
+                    let tls_binding = tls_stream.binding();
+                    let (mut read, mut write) = tls_stream.split();
+                    client_handshake(
+                        &mut read,
+                        &mut write,
+                        TransportKind::TcpTls,
+                        identity,
+                        *expected_machine_public_key,
+                        Some(tls_binding.channel_binding),
+                        Some(tls_binding.peer_cert_sha256),
+                    )
+                    .await
+                    .map_err(|source| TransportError::AuthHandshake {
+                        endpoint: uri.to_uri_string(),
+                        source,
+                    })?;
+                    Ok(Self::from_split(Box::new(read), Box::new(write)))
+                } else {
+                    let (mut read, mut write) = open_tcp(host, *port).await?;
+                    if let SecurityMode::Authenticated {
+                        identity,
+                        expected_machine_public_key,
+                    } = security
+                    {
+                        client_handshake(
+                            &mut read,
+                            &mut write,
+                            TransportKind::Vsock,
+                            identity,
+                            *expected_machine_public_key,
+                            None,
+                            None,
+                        )
+                        .await
+                        .map_err(|source| {
+                            TransportError::AuthHandshake {
+                                endpoint: uri.to_uri_string(),
+                                source,
+                            }
+                        })?;
+                    }
+                    Ok(Self::from_split(read, write))
+                }
+            }
+        }
     }
 
-    /// Borrow the underlying `helios-inspector-protocol` [`ProtocolClient`].
+    /// Borrow the underlying `helios-wit-rpc` [`PeerHandle`].
     #[must_use]
     pub fn client(&self) -> &ProtocolClient {
         &self.client
     }
 }
 
-async fn open_tcp(host: &str, port: u16) -> Result<(RpcReader, RpcWriter), TransportError> {
-    let address = if host.contains(':') {
+fn format_tcp_addr(host: &str, port: u16) -> String {
+    if host.contains(':') {
         format!("[{host}]:{port}")
     } else {
         format!("{host}:{port}")
-    };
+    }
+}
+
+async fn open_tcp(host: &str, port: u16) -> Result<(RpcReader, RpcWriter), TransportError> {
+    let address = format_tcp_addr(host, port);
     let stream =
         TcpStream::connect(&address)
             .await

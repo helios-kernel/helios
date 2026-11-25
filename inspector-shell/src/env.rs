@@ -10,8 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, FixedOffset, Utc};
-use helios_inspector_protocol::debugger::filesystem::EntryKind;
-use helios_inspector_protocol::system::{inspect as proto_inspect, tracing as proto_tracing};
 use helios_nu::{
     AsyncCommand, AsyncCommandContext, AsyncPipelineData, CustomCommandSpec, EnvError,
     ExecutableMatch, ExternalProcess, ExternalSpawnRequest, FileMetadata, FileType, HeliosEnv,
@@ -20,6 +18,10 @@ use helios_nu::{
     SysNetInfo, WatchEvent, normalize_vfs_path,
 };
 use helios_ops::{DiagnosticBundle, Fleet, OpsError, Session, SpawnRequest};
+use helios_wit_rpc::inspector::helios::system::{
+    inspect as proto_inspect, tracing as proto_tracing,
+};
+use helios_wit_rpc::inspector_fs::EntryKind;
 use nu_engine::CallExt as _;
 use nu_protocol::{
     Category, DataSource, NuGlob, PipelineMetadata, Record, ShellError, Signature, Span, Spanned,

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use async_lock::{Mutex, MutexGuard};
 use helios_inspector_protocol::WireError;
-use helios_inspector_protocol::mux::PeerHandle;
+use helios_inspector_protocol::mux::{MaybeSend, MaybeSync, PeerHandle};
 
 /// Connection-scoped monotonic `u32` handle allocator shared across all
 /// [`ResourceTable`] instances on one connection.
@@ -40,9 +40,20 @@ impl HandleAllocator {
 
 /// Static descriptor for concrete server-side resource entries stored in a
 /// connection's [`ResourceTable`].
-pub trait ResourceEntry: Send + Sync + 'static {
+pub trait ResourceEntry: MaybeSend + MaybeSync + 'static {
     /// Canonical WIT resource name for diagnostics and [`WireError::ResourceTypeMismatch`].
     fn kind_name(&self) -> &'static str;
+}
+
+/// Typed projection into a shared connection-scoped [`ResourceTable`] so
+/// resources returned by one WIT interface (for example
+/// `wasi:filesystem/preopens.get-directories`) can be borrowed, mutated, and
+/// dropped through another interface (for example `wasi:filesystem/types.descriptor`)
+/// with zero dynamic dispatch.
+pub trait ResourceSlotAccess<Marker, T>: ResourceEntry + Sized {
+    fn into_entry(arc: Arc<T>) -> Self;
+    fn borrow_entry(&self) -> Option<&Arc<T>>;
+    fn take_entry(self) -> Result<Arc<T>, Self>;
 }
 
 impl ResourceEntry for core::convert::Infallible {

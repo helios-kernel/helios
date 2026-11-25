@@ -35,7 +35,20 @@ pub(super) const VSOCK_INSTANCE: &str = "helios:system/vsock@0.1.0";
 /// The kernel-side view of an open `vsock-stream` resource.
 pub struct ComponentVsockStream {
     pub service: ComponentHostVsockService,
-    pub stream: VsockStreamId,
+    pub stream: Option<VsockStreamId>,
+}
+
+impl ComponentVsockStream {
+    pub fn new(service: ComponentHostVsockService, stream: VsockStreamId) -> Self {
+        Self {
+            service,
+            stream: Some(stream),
+        }
+    }
+
+    pub fn take(&mut self) -> Option<(ComponentHostVsockService, VsockStreamId)> {
+        self.stream.take().map(|id| (self.service.clone(), id))
+    }
 }
 
 /// The kernel-side view of a bound `vsock-listener` resource.
@@ -232,7 +245,9 @@ where
                 // A dropped handle is a closed connection; the peer is
                 // told rather than left waiting on a stream nothing will
                 // ever read again.
-                if let Err(error) = stream.service.close(stream.stream).await {
+                if let Some(id) = stream.stream
+                    && let Err(error) = stream.service.close(id).await
+                {
                     tracing::debug!(%error, "dropped vsock stream could not be closed cleanly");
                 }
                 Ok::<_, wasmtime::Error>(())
@@ -294,10 +309,10 @@ where
                 let response = match service.connect(peer, timeout).await {
                     Ok(stream) => {
                         let pushed = accessor.with(|mut access| {
-                            access.get().table.push(ComponentVsockStream {
-                                service: service.clone(),
-                                stream,
-                            })
+                            access
+                                .get()
+                                .table
+                                .push(ComponentVsockStream::new(service.clone(), stream))
                         })?;
                         Ok(pushed)
                     }
@@ -365,10 +380,10 @@ where
                 let response = match accepted {
                     Ok(stream) => {
                         let pushed = accessor.with(|mut access| {
-                            access.get().table.push(ComponentVsockStream {
-                                service: listener.0.clone(),
-                                stream,
-                            })
+                            access
+                                .get()
+                                .table
+                                .push(ComponentVsockStream::new(listener.0.clone(), stream))
                         })?;
                         Ok(pushed)
                     }
@@ -391,11 +406,15 @@ where
         |caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockStream>,)| {
             let stream = caller.data().table.get(&resource)?;
-            Ok((stream
-                .service
-                .peer(stream.stream)
-                .map(Bindings::address)
-                .map_err(convert_error::<Bindings>),))
+            let result = match stream.stream {
+                Some(id) => stream
+                    .service
+                    .peer(id)
+                    .map(Bindings::address)
+                    .map_err(convert_error::<Bindings>),
+                None => Err(convert_error::<Bindings>(VsockError::Closed)),
+            };
+            Ok((result,))
         },
     )?;
     instance.func_wrap_concurrent(
@@ -407,10 +426,15 @@ where
                     let stream = access.get().table.get(&resource)?;
                     Ok::<_, wasmtime::Error>((stream.service.clone(), stream.stream))
                 })?;
+                let Some(id) = stream.1 else {
+                    return Ok::<_, wasmtime::Error>((Err(convert_error::<Bindings>(
+                        VsockError::Closed,
+                    )),));
+                };
                 tracing::debug!(max_bytes, timeout, "vsock stream read requested");
                 let response = stream
                     .0
-                    .read(stream.1, max_bytes as usize, timeout)
+                    .read(id, max_bytes as usize, timeout)
                     .await
                     .map_err(convert_error::<Bindings>);
                 match &response {
@@ -433,10 +457,15 @@ where
                     let stream = access.get().table.get(&resource)?;
                     Ok::<_, wasmtime::Error>((stream.service.clone(), stream.stream))
                 })?;
+                let Some(id) = stream.1 else {
+                    return Ok::<_, wasmtime::Error>((Err(convert_error::<Bindings>(
+                        VsockError::Closed,
+                    )),));
+                };
                 tracing::debug!(len = bytes.len(), timeout, "vsock stream write requested");
                 let response = stream
                     .0
-                    .write(stream.1, &bytes, timeout)
+                    .write(id, &bytes, timeout)
                     .await
                     .map(|written| written as u64)
                     .map_err(convert_error::<Bindings>);
@@ -457,10 +486,15 @@ where
                     let stream = access.get().table.get(&resource)?;
                     Ok::<_, wasmtime::Error>((stream.service.clone(), stream.stream))
                 })?;
+                let Some(id) = stream.1 else {
+                    return Ok::<_, wasmtime::Error>((Err(convert_error::<Bindings>(
+                        VsockError::Closed,
+                    )),));
+                };
                 let response = stream
                     .0
                     .shutdown(
-                        stream.1,
+                        id,
                         VsockShutdown {
                             receive: false,
                             send: true,
@@ -478,14 +512,15 @@ where
          (resource,): (Resource<ComponentVsockStream>,)| {
             Box::pin(async move {
                 let stream = accessor.with(|mut access| {
-                    let stream = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>((stream.service.clone(), stream.stream))
+                    let stream = access.get().table.get_mut(&resource)?;
+                    Ok::<_, wasmtime::Error>(stream.take())
                 })?;
-                let response = stream
-                    .0
-                    .close(stream.1)
-                    .await
-                    .map_err(convert_error::<Bindings>);
+                let Some((service, id)) = stream else {
+                    return Ok::<_, wasmtime::Error>((Err(convert_error::<Bindings>(
+                        VsockError::Closed,
+                    )),));
+                };
+                let response = service.close(id).await.map_err(convert_error::<Bindings>);
                 Ok::<_, wasmtime::Error>((response,))
             })
         },
