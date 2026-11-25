@@ -317,9 +317,21 @@ impl Child {
         self.inner.stdin(data)
     }
 
+    /// Stable kernel instance identifier for this child process.
+    #[must_use]
+    pub fn instance_id(&self) -> u64 {
+        self.inner.instance_id()
+    }
+
     /// Deliver a POSIX signal (`1..=64`) to the child process.
     pub fn signal(&self, signal: u8) -> Result<(), SpawnError> {
         self.inner.signal(signal)
+    }
+
+    /// Await child completion, borrowing the handle so callers can race `wait_exit`
+    /// against cancellation and still send [`Self::signal`] before dropping.
+    pub async fn wait_exit(&self) -> Result<ExitStatus, SpawnError> {
+        self.inner.wait().await
     }
 
     /// Await child completion.

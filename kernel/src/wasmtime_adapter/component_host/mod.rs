@@ -634,6 +634,18 @@ macro_rules! impl_program_bindings {
                 Ok(())
             }
 
+            fn instance_id(
+                mut access: Access<'_, U, Self>,
+                child: wasmtime::component::Resource<ChildHandle>,
+            ) -> wasmtime::Result<u64> {
+                let handle = access
+                    .get()
+                    .table
+                    .get(&child)
+                    .map_err(wasmtime::Error::from)?;
+                Ok(handle.instance_id.raw())
+            }
+
             fn signal(
                 mut access: Access<'_, U, Self>,
                 child: wasmtime::component::Resource<ChildHandle>,

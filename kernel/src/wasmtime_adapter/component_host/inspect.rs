@@ -256,10 +256,21 @@ where
         };
         let instance_id = data.instance().id();
         let instance_name = String::from(data.instance().name());
-        let publication = match data.runtime_state.inspect_registry().publish(
+        let namespace = if name == "components"
+            && data
+                .process_authority()
+                .derive_root_supervisor_cap()
+                .is_ok()
+        {
+            crate::InspectNamespace::Components
+        } else {
+            crate::InspectNamespace::Instances
+        };
+        let publication = match data.runtime_state.inspect_registry().publish_in_namespace(
             instance_id,
             instance_name,
             name,
+            namespace,
             memory,
             span,
         ) {
@@ -460,6 +471,94 @@ mod tests {
             registry.publication_count(),
             0,
             "dropping Store must revoke any open InspectPublication before memory recycle"
+        );
+    }
+
+    #[test]
+    fn root_supervisor_components_namespace_publishes_under_components_prefix() {
+        let mut auth = ProcessAuthority::empty();
+        auth.grant_inspect_read(AuthorityScope::Machine);
+        auth.grant_root_supervisor();
+        let mut store = store_data_authorized(auth, |_| {});
+        let registry = store.runtime_state.inspect_registry().clone();
+        let inst_id = store.instance().id();
+
+        let mut backing: Box<[u64]> = vec![0u64; (WASM_PAGE_BYTES as usize) / 8].into_boxed_slice();
+        {
+            // SAFETY: `u64` slice is initialized and 8-byte aligned.
+            let bytes = unsafe {
+                core::slice::from_raw_parts_mut(
+                    backing.as_mut_ptr().cast::<u8>(),
+                    WASM_PAGE_BYTES as usize,
+                )
+            };
+            encode_buffer(
+                2,
+                &[
+                    (
+                        "plugins/compiler/state",
+                        InspectValue::Text(String::from("unstarted")),
+                    ),
+                    ("plugins/compiler/restarts", InspectValue::Unsigned64(0)),
+                    (
+                        "debugger/state",
+                        InspectValue::Text(String::from("running")),
+                    ),
+                    ("debugger/instance_id", InspectValue::Unsigned64(7)),
+                ],
+                bytes,
+            )
+            .unwrap();
+        }
+        let gm = GuestMemory::new(VirtAddr::new(backing.as_ptr() as usize), WASM_PAGE_BYTES);
+        let span = Span::new(0, WASM_PAGE_BYTES);
+
+        let _pub_handle = registry
+            .publish_in_namespace(
+                inst_id,
+                "component-manager",
+                "components",
+                crate::InspectNamespace::Components,
+                gm,
+                span,
+            )
+            .unwrap();
+
+        let snap = store
+            .snapshot(
+                inspect_wit::Query {
+                    prefixes: vec![String::from("/components/")],
+                },
+                0,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(snap.entries.len(), 4);
+        assert!(snap.entries.iter().any(|e| {
+            e.path == "/components/plugins/compiler/state"
+                && matches!(&e.value, inspect_wit::Value::Text(s) if s == "unstarted")
+        }));
+        assert!(snap.entries.iter().any(|e| {
+            e.path == "/components/debugger/instance_id"
+                && matches!(e.value, inspect_wit::Value::Unsigned64(7))
+        }));
+
+        // Prefix narrowing to `/components/plugins/` returns only plugin entries.
+        let filtered = store
+            .snapshot(
+                inspect_wit::Query {
+                    prefixes: vec![String::from("/components/plugins/")],
+                },
+                0,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(filtered.entries.len(), 2);
+        assert!(
+            filtered
+                .entries
+                .iter()
+                .all(|e| e.path.starts_with("/components/plugins/"))
         );
     }
 }

@@ -483,6 +483,9 @@ interface programs {
     /// Read the child's `wasi:cli/stderr` as a byte stream.
     stderr: func() -> tuple<stream<u8>, future<result>>;
 
+    /// Stable kernel instance identifier for this child process.
+    instance-id: func() -> instance-id;
+
     /// Deliver a POSIX signal number (`1..=64`) to the child process.
     signal: func(signal: u8) -> result<_, spawn-error>;
 

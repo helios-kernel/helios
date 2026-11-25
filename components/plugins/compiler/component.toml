@@ -1,0 +1,11 @@
+description = "In-kernel AOT compiler plugin (isolated core module)"
+name = "compiler-plugin"
+runner = "wasm"
+sharding = "singleton"
+provider = "compiler"
+program = "/bin/compiler.cwasm"
+optional = true
+startup = "lazy"
+lifecycle = "service"
+restart = "on-failure"
+oom_tier = "plugin"

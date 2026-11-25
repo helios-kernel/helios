@@ -154,17 +154,19 @@ mod tests {
         let root_name = root_init.component().name().to_owned();
         let observed_debugger = std::sync::Arc::new(AtomicBool::new(false));
         let observed_root = std::sync::Arc::new(AtomicBool::new(false));
+        let observed_components_inspect = std::sync::Arc::new(AtomicBool::new(false));
         let stop_timer = kernel.timer();
         let stop_state = debug_state.clone();
         let stop_cpu = cpu.clone();
         let stop_service = service.clone();
         let stop_observed_debugger = observed_debugger.clone();
         let stop_observed_root = observed_root.clone();
+        let stop_observed_components_inspect = observed_components_inspect.clone();
 
         // Once the root supervisor completes init, spawns `/bin/debugger`, and
         // invokes `signal-ready` (emitting `[KDBG run:begin]`), verify both
-        // instances are live and stop `/bin/debugger` so the root component
-        // finishes cleanly.
+        // instances are live, verify `/components/*` inspect publication, and
+        // stop `/bin/debugger` so the root component finishes cleanly.
         kernel.spawn_local_detached(async move {
             let deadline = Duration::from_secs(30);
             let mut waited = Duration::ZERO;
@@ -181,6 +183,43 @@ mod tests {
                     }
                     if let Some(debugger) = instances.iter().find(|inst| inst.name == "debugger") {
                         stop_observed_debugger.store(true, Ordering::Release);
+                        let prefixes = helios_kernel::PrefixSet::from_prefixes(["/components/"])
+                            .expect("valid /components/ inspect prefix");
+                        let inspect_snap = stop_state.inspect_registry().snapshot(
+                            now,
+                            debugger.id,
+                            Some(helios_kernel::AuthorityScope::Machine),
+                            &stop_state.instance_registry(),
+                            None,
+                            None,
+                            &prefixes,
+                            0,
+                        );
+                        let has_debugger_running = inspect_snap.entries.iter().any(|entry| {
+                            entry.path == "/components/debugger/state"
+                                && matches!(
+                                    &entry.value,
+                                    helios_kernel::InspectValue::Text(s) if s == "running"
+                                )
+                        });
+                        let has_debugger_id = inspect_snap.entries.iter().any(|entry| {
+                            entry.path == "/components/debugger/instance_id"
+                                && matches!(
+                                    entry.value,
+                                    helios_kernel::InspectValue::Unsigned64(id)
+                                        if id == debugger.id.raw()
+                                )
+                        });
+                        let has_compiler_unstarted = inspect_snap.entries.iter().any(|entry| {
+                            entry.path == "/components/plugins/compiler/state"
+                                && matches!(
+                                    &entry.value,
+                                    helios_kernel::InspectValue::Text(s) if s == "unstarted"
+                                )
+                        });
+                        if has_debugger_running && has_debugger_id && has_compiler_unstarted {
+                            stop_observed_components_inspect.store(true, Ordering::Release);
+                        }
                         let residency = helios_kernel::UserResidency::default();
                         let _ = stop_state.instance_registry().request_kill(
                             debugger.id,
@@ -217,6 +256,10 @@ mod tests {
         assert!(
             observed_debugger.load(Ordering::Acquire),
             "root supervisor must spawn /bin/debugger before signaling ready"
+        );
+        assert!(
+            observed_components_inspect.load(Ordering::Acquire),
+            "root component-manager must publish live /components/* state via helios:system/inspect"
         );
 
         let output = String::from_utf8(CAPTURED_SERIAL_OUT.lock().unwrap().clone())

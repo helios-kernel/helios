@@ -106,6 +106,15 @@ pub enum InspectPublishError {
     TooManyPublications,
 }
 
+/// Top-level namespace prefix under which a published inspect span appears.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InspectNamespace {
+    /// Ordinary component publication at `/instances/<instance_id>/<name>/*`.
+    Instances,
+    /// Root-supervisor component-manager publication at `/components/*`.
+    Components,
+}
+
 #[derive(Clone, Copy)]
 struct MappedSpan {
     /// Host virtual address of byte 0 of the span.
@@ -119,6 +128,7 @@ struct PublishedSpan {
     instance_id: InstanceId,
     instance_name: String,
     name: String,
+    namespace: InspectNamespace,
     /// `Some(MappedSpan)` while published; set to `None` under the write lock
     /// on revocation so readers never access memory after teardown.
     mapping: RwLock<Option<MappedSpan>>,
@@ -164,6 +174,31 @@ impl InspectRegistry {
         memory: GuestMemory,
         span: Span,
     ) -> Result<InspectPublication, InspectPublishError> {
+        self.publish_in_namespace(
+            instance_id,
+            instance_name,
+            name,
+            InspectNamespace::Instances,
+            memory,
+            span,
+        )
+    }
+
+    /// Registers a bounded span of `memory` owned by `instance_id` under the
+    /// specified [`InspectNamespace`].
+    ///
+    /// Only the root supervisor (`RootSupervisorCap`) may publish into
+    /// [`InspectNamespace::Components`], exposing live component state at
+    /// `/components/*`.
+    pub fn publish_in_namespace(
+        &self,
+        instance_id: InstanceId,
+        instance_name: impl Into<String>,
+        name: impl Into<String>,
+        namespace: InspectNamespace,
+        memory: GuestMemory,
+        span: Span,
+    ) -> Result<InspectPublication, InspectPublishError> {
         let name = name.into();
         if !is_valid_publication_name(&name) {
             return Err(InspectPublishError::InvalidName);
@@ -173,6 +208,11 @@ impl InspectRegistry {
         let mut table = self.inner.publications.lock();
         let mut owned_count = 0usize;
         for existing in table.iter() {
+            if namespace == InspectNamespace::Components
+                && existing.namespace == InspectNamespace::Components
+            {
+                return Err(InspectPublishError::DuplicateName);
+            }
             if existing.instance_id != instance_id {
                 continue;
             }
@@ -201,6 +241,7 @@ impl InspectRegistry {
             instance_id,
             instance_name: instance_name.into(),
             name,
+            namespace,
             mapping: RwLock::new(Some(mapped)),
         });
         table.push(entry.clone());
@@ -250,7 +291,7 @@ impl InspectRegistry {
             emit_kernel_entries(telemetry, prefixes, &mut entries);
         }
 
-        if prefixes.may_match_subtree("/instances") {
+        if prefixes.may_match_subtree("/instances") || prefixes.may_match_subtree("/components") {
             let candidates: Vec<Arc<PublishedSpan>> = {
                 let table = self.inner.publications.lock();
                 table
@@ -263,11 +304,14 @@ impl InspectRegistry {
             };
 
             for pub_entry in candidates {
-                let root_prefix = format!(
-                    "/instances/{}/{}",
-                    pub_entry.instance_id.raw(),
-                    pub_entry.name
-                );
+                let root_prefix = match pub_entry.namespace {
+                    InspectNamespace::Instances => format!(
+                        "/instances/{}/{}",
+                        pub_entry.instance_id.raw(),
+                        pub_entry.name
+                    ),
+                    InspectNamespace::Components => String::from("/components"),
+                };
                 if !prefixes.may_match_subtree(&root_prefix) {
                     continue;
                 }
