@@ -855,8 +855,8 @@ where
         let rs_wit::ProviderRequest {
             name,
             path,
-            capability_grants: _,
-            named_devices: _,
+            capability_grants,
+            named_devices,
             oom_policy,
         } = request;
         if name.is_empty() {
@@ -868,11 +868,25 @@ where
         let requested_policy = from_wit_oom_policy(oom_policy);
         let snapshot = accessor.with(|mut access| {
             let data = access.get();
+            // Always drain any owned IPC resource handles from the caller's
+            // resource table so rejected requests never leak table entries.
+            let (remaining_grants, ipc_grants, had_ipc) =
+                extract_program_ipc_grants(&mut data.table, capability_grants)?;
             if let Err(error) = require_root_supervisor(data) {
                 return Ok::<_, wasmtime::Error>(Err(error));
             }
             if let Err(error) = check_oom_ceiling(data.instance().oom_policy(), requested_policy) {
                 return Ok(Err(error));
+            }
+            if !remaining_grants.is_empty()
+                || had_ipc
+                || ipc_grants.is_err()
+                || !named_devices.is_empty()
+            {
+                return Ok(Err(supervisor_error(
+                    rs_wit::SupervisorErrorKind::InvalidArgument,
+                    "compiler provider runs as an isolated core module and accepts neither capability grants nor named device grants",
+                )));
             }
             let service = data.runtime_state.program_service();
             let context = ProgramExecContext::from_store(data);
@@ -1108,8 +1122,17 @@ where
         let caller_authority = data.process_authority().clone();
         let caller_id = data.instance().id();
         let runtime_state = data.runtime_state.clone();
-        let (remaining_grants, _ipc_grants, _had_ipc) =
+        let (remaining_grants, ipc_grants, had_ipc) =
             extract_program_ipc_grants(&mut data.table, capability_grants)?;
+        if let Err(error) = ipc_grants {
+            return Ok(Err(map_exec_error(error)));
+        }
+        if had_ipc {
+            return Ok(Err(supervisor_error(
+                rs_wit::SupervisorErrorKind::InvalidArgument,
+                "kernel provider endpoints do not accept IPC capability grants",
+            )));
+        }
         Ok(Ok((
             service,
             context,
@@ -2372,5 +2395,134 @@ mod tests {
             assert!(serial.contains("mounts_flushed=true"));
             assert!(serial.contains("unrecoverable trap after 3 restarts"));
         }
+    }
+
+    #[test]
+    fn provider_install_fails_fast_on_unsupported_grants_without_leaking_ipc_handles() {
+        use program_bindings::helios::system::programs as prog_wit;
+        use wasmtime::Store;
+        use wasmtime::component::HasSelf;
+
+        let cpu = TestCpu::with_entropy(0x88);
+        let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu);
+        let engine = <crate::wasmtime_adapter::WasmtimeComponentRuntime<TestCpu> as crate::ComponentRuntimeFactory<
+            TestCpu,
+            HostRuntimeState<TestCpu, TestNetworkService, UnsupportedStorage>,
+            UnsupportedStorage,
+        >>::create_engine(&runtime)
+        .expect("engine creates");
+
+        let mut root_auth = ProcessAuthority::root();
+        root_auth.grant_root_supervisor();
+        let mut store = Store::new(
+            engine.raw(),
+            test_store::store_data_authorized(root_auth, |_| {}),
+        );
+
+        // 1. Compiler provider rejects non-empty capability grants (and drains owned IPC handles).
+        let (ep_a, _ep_b) = crate::ipc_channel();
+        let ipc_res = store
+            .data_mut()
+            .table
+            .push(ep_a)
+            .expect("push ipc endpoint");
+        let ipc_rep = ipc_res.rep();
+        let compiler_ipc_err = block_on(store.run_concurrent(async move |accessor| {
+            <HasSelf<test_store::TestStoreData> as rs_wit::HostWithStore<_>>::install_compiler_provider(
+                accessor,
+                rs_wit::ProviderRequest {
+                    name: String::from("compiler"),
+                    path: String::from("/bin/compiler.cwasm"),
+                    capability_grants: alloc::vec![prog_wit::CapabilityGrant::Ipc(
+                        prog_wit::IpcGrant {
+                            name: String::from("chan"),
+                            endpoint: ipc_res,
+                        }
+                    )],
+                    named_devices: Vec::new(),
+                    oom_policy: rs_wit::OomPolicy::UserProgram,
+                },
+            )
+            .await
+        }))
+        .unwrap()
+        .unwrap()
+        .expect_err("compiler provider must reject capability grants");
+        assert_eq!(
+            compiler_ipc_err.kind,
+            rs_wit::SupervisorErrorKind::InvalidArgument
+        );
+        assert!(
+            store
+                .data()
+                .table
+                .get(&Resource::<crate::IpcEndpoint>::new_borrow(ipc_rep))
+                .is_err(),
+            "rejected compiler provider request must not leak IPC endpoint in resource table"
+        );
+
+        // 2. Compiler provider rejects non-empty named devices.
+        let compiler_dev_err = block_on(store.run_concurrent(async move |accessor| {
+            <HasSelf<test_store::TestStoreData> as rs_wit::HostWithStore<_>>::install_compiler_provider(
+                accessor,
+                rs_wit::ProviderRequest {
+                    name: String::from("compiler"),
+                    path: String::from("/bin/compiler.cwasm"),
+                    capability_grants: Vec::new(),
+                    named_devices: alloc::vec![String::from("pci:00:05.0")],
+                    oom_policy: rs_wit::OomPolicy::UserProgram,
+                },
+            )
+            .await
+        }))
+        .unwrap()
+        .unwrap()
+        .expect_err("compiler provider must reject named devices");
+        assert_eq!(
+            compiler_dev_err.kind,
+            rs_wit::SupervisorErrorKind::InvalidArgument
+        );
+
+        // 3. Component providers (http/surface) reject IPC grants and drain the handle.
+        let (ep_c, _ep_d) = crate::ipc_channel();
+        let ipc_res2 = store
+            .data_mut()
+            .table
+            .push(ep_c)
+            .expect("push second ipc endpoint");
+        let ipc_rep2 = ipc_res2.rep();
+        let http_ipc_err = block_on(store.run_concurrent(async move |accessor| {
+            <HasSelf<test_store::TestStoreData> as rs_wit::HostWithStore<_>>::install_http_provider(
+                accessor,
+                rs_wit::ProviderRequest {
+                    name: String::from("http-client"),
+                    path: String::from("/bin/http-client"),
+                    capability_grants: alloc::vec![prog_wit::CapabilityGrant::Ipc(
+                        prog_wit::IpcGrant {
+                            name: String::from("chan"),
+                            endpoint: ipc_res2,
+                        }
+                    )],
+                    named_devices: Vec::new(),
+                    oom_policy: rs_wit::OomPolicy::UserProgram,
+                },
+            )
+            .await
+        }))
+        .unwrap()
+        .unwrap()
+        .expect_err("component provider must reject IPC grants");
+        assert_eq!(
+            http_ipc_err.kind,
+            rs_wit::SupervisorErrorKind::InvalidArgument
+        );
+        assert!(
+            store
+                .data()
+                .table
+                .get(&Resource::<crate::IpcEndpoint>::new_borrow(ipc_rep2))
+                .is_err(),
+            "rejected component provider request must not leak IPC endpoint in resource table"
+        );
     }
 }

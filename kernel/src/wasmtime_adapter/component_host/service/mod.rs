@@ -2385,9 +2385,10 @@ where
         let preview1_core_linker = self.inner.preview1_core_linker.clone();
         let shared_memory_pool = self.inner.shared_memory_pool.clone();
         let core_module_instance_pre_cache = self.inner.core_module_instance_pre_cache.clone();
-        // Task funding follows the instance's OOM policy: user programs and
-        // kernel plugins draw from the arena's instance share so a spawn storm
-        // stops there, while system components draw from the kernel reserve.
+        // Task funding follows the instance's OOM policy (`OomPolicy::task_funding`):
+        // user programs draw from the arena's instance share so a spawn storm
+        // stops there, while kernel plugins and system components draw from the
+        // kernel reserve.
         let spawner = exec_context.spawner.instance_spawner(
             launched_instance.oom_policy().task_funding(),
             &launched_instance,
