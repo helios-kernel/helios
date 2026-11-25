@@ -8,8 +8,9 @@ use thiserror::Error;
 
 use crate::model::{
     AuthorityScopeSpec, CapabilityCeiling, ComponentNode, ComponentTopology, Criticality,
-    DirectoryGrantSpec, FsRights, IpAddrSpec, MachineRights, MountRights, NetRights, ProviderSlot,
-    RunnerSpec, SocketActivationSpec, WasmSharding,
+    DEFAULT_OCI_STORE_PATH, DirectoryGrantSpec, EscalationAction, FsRights, IpAddrSpec,
+    MachineRights, MountRights, NetRights, OomTier, ProviderSlot, RunnerSpec, SocketActivationSpec,
+    WasmSharding,
 };
 
 /// First unprivileged TCP port (`1..1024` requires `NetRights::PRIVILEGED_BIND`).
@@ -116,6 +117,14 @@ pub enum ValidationError {
         "dynamic mount refused under `{parent}`: parent realm does not allow `dynamic_mount = true`"
     )]
     DynamicMountNotPermitted { parent: String },
+    #[error("dynamic component `{moniker}` cannot declare `{setting}`: {reason}")]
+    DynamicCriticalityDenied {
+        moniker: String,
+        setting: &'static str,
+        reason: &'static str,
+    },
+    #[error("dynamic component `{moniker}` cannot claim kernel provider slot `{slot}`")]
+    DynamicProviderDenied { moniker: String, slot: &'static str },
 }
 
 /// Normalizes an absolute POSIX-like path, rejecting empty or traversal paths.
@@ -564,6 +573,35 @@ pub fn validate_dynamic_subtree(
                 parent_tier: enclosing.oom_tier.as_str(),
             });
         }
+        if node.critical == Criticality::System {
+            return Err(ValidationError::DynamicCriticalityDenied {
+                moniker: node.moniker.to_string(),
+                setting: "critical = \"system\"",
+                reason: "dynamic subtrees cannot halt or reboot the system",
+            });
+        }
+        if node.escalation == EscalationAction::Reboot {
+            return Err(ValidationError::DynamicCriticalityDenied {
+                moniker: node.moniker.to_string(),
+                setting: "escalation = \"reboot\"",
+                reason: "dynamic subtrees cannot configure system reboot escalation",
+            });
+        }
+        if (idx == 0 || node.parent_index.is_none()) && node.critical == Criticality::Parent {
+            return Err(ValidationError::DynamicCriticalityDenied {
+                moniker: node.moniker.to_string(),
+                setting: "critical = \"parent\"",
+                reason: "dynamic subtree root cannot tear down its static enclosing realm",
+            });
+        }
+        if let RunnerSpec::Wasm(wasm) = &node.runner
+            && let Some(slot) = wasm.provider
+        {
+            return Err(ValidationError::DynamicProviderDenied {
+                moniker: node.moniker.to_string(),
+                slot: slot.as_str(),
+            });
+        }
         validate_node_runner(node, &mut provider_slots)?;
         validate_node_mounts(node)?;
         validate_node_sockets(node, &mut bound_tcp, &mut bound_vsock)?;
@@ -714,38 +752,45 @@ fn validate_node_runner<'a>(
                     detail: "oci runner requires `oci.image` or `oci.rootfs`".to_owned(),
                 });
             }
-            if let Some(rootfs) = &spec.rootfs
-                && !directory_covered_by(
-                    node.capabilities.directories.as_ref(),
-                    rootfs.as_ref(),
-                    FsRights::READ.union(FsRights::EXECUTE),
-                )
-            {
-                return Err(ValidationError::CapabilityEscalation {
-                    child: node.moniker.to_string(),
-                    parent: node.moniker.to_string(),
-                    dimension: "oci.rootfs",
+            if node.oom_tier != OomTier::User {
+                return Err(ValidationError::InvalidRunnerConfig {
+                    moniker: node.moniker.to_string(),
                     detail: format!(
-                        "oci rootfs `{rootfs}` requires read+execute directory capability"
+                        "oci runner only supports `oom_tier = \"user\"` (found `{}`)",
+                        node.oom_tier.as_str()
                     ),
                 });
             }
+            if !node.capabilities.named_devices.is_empty() {
+                return Err(ValidationError::InvalidRunnerConfig {
+                    moniker: node.moniker.to_string(),
+                    detail: "oci runner cannot receive raw `named_devices` grants".to_owned(),
+                });
+            }
+            if let Some(rootfs) = &spec.rootfs {
+                validate_runner_path(
+                    node,
+                    "oci.rootfs",
+                    rootfs.as_ref(),
+                    FsRights::READ.union(FsRights::EXECUTE),
+                )?;
+            }
+            if let Some(store) = &spec.store {
+                validate_runner_path(node, "oci.store", store.as_ref(), FsRights::READ)?;
+            } else if spec.image.is_some() {
+                validate_runner_path(node, "oci.store", DEFAULT_OCI_STORE_PATH, FsRights::READ)?;
+            }
             for mount in spec.mounts.iter() {
-                if !directory_covered_by(
-                    node.capabilities.directories.as_ref(),
-                    mount.source.as_ref(),
-                    mount.rights,
-                ) {
-                    return Err(ValidationError::CapabilityEscalation {
-                        child: node.moniker.to_string(),
-                        parent: node.moniker.to_string(),
-                        dimension: "oci.mounts",
+                normalize_abs_path(mount.target.as_ref()).map_err(|reason| {
+                    ValidationError::InvalidRunnerConfig {
+                        moniker: node.moniker.to_string(),
                         detail: format!(
-                            "oci mount source `{}` exceeds component directory rights",
-                            mount.source
+                            "invalid `oci.mounts.target` path `{}`: {reason}",
+                            mount.target
                         ),
-                    });
-                }
+                    }
+                })?;
+                validate_runner_path(node, "oci.mounts", mount.source.as_ref(), mount.rights)?;
             }
         }
         RunnerSpec::Exec(spec) => {
@@ -787,9 +832,58 @@ fn validate_node_runner<'a>(
                     detail: "vm runner requires `machine = [..., \"virtualize\"]`".to_owned(),
                 });
             }
+            validate_runner_path(node, "vm.kernel", spec.kernel.as_ref(), FsRights::READ)?;
+            if let Some(initramfs) = &spec.initramfs {
+                validate_runner_path(node, "vm.initramfs", initramfs.as_ref(), FsRights::READ)?;
+            }
+            let rw = FsRights::READ.union(FsRights::WRITE);
+            if let Some(disk) = &spec.disk {
+                validate_runner_path(node, "vm.disk", disk.as_ref(), rw)?;
+            }
+            if let Some(rootfs_dir) = &spec.rootfs_dir {
+                validate_runner_path(node, "vm.rootfs_dir", rootfs_dir.as_ref(), rw)?;
+            }
+            for share in spec.share_dirs.iter() {
+                if share.tag.is_empty() {
+                    return Err(ValidationError::InvalidRunnerConfig {
+                        moniker: node.moniker.to_string(),
+                        detail: "vm.share_dirs entry requires a non-empty tag".to_owned(),
+                    });
+                }
+                validate_runner_path(node, "vm.share_dirs", share.host_path.as_ref(), rw)?;
+            }
         }
     }
     Ok(())
+}
+
+fn validate_runner_path(
+    node: &ComponentNode,
+    field: &'static str,
+    raw_path: &str,
+    required: FsRights,
+) -> Result<String, ValidationError> {
+    let normalized =
+        normalize_abs_path(raw_path).map_err(|reason| ValidationError::InvalidRunnerConfig {
+            moniker: node.moniker.to_string(),
+            detail: format!("invalid `{field}` path `{raw_path}`: {reason}"),
+        })?;
+    if !directory_covered_by(
+        node.capabilities.directories.as_ref(),
+        &normalized,
+        required,
+    ) {
+        return Err(ValidationError::CapabilityEscalation {
+            child: node.moniker.to_string(),
+            parent: node.moniker.to_string(),
+            dimension: field,
+            detail: format!(
+                "{field} `{raw_path}` requires rights 0b{:04b} outside component directory ceiling",
+                required.bits()
+            ),
+        });
+    }
+    Ok(normalized)
 }
 
 fn validate_node_mounts(node: &ComponentNode) -> Result<(), ValidationError> {
