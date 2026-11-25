@@ -1010,10 +1010,36 @@ fn convert_runner(moniker: &str, raw: &RawComponentManifest) -> Result<RunnerSpe
                     })
                 })
                 .collect::<Result<Vec<_>, ManifestError>>()?;
+            let rootfs = oci
+                .rootfs
+                .as_deref()
+                .map(|r| {
+                    normalize_abs_path(r).map(Cow::Owned).map_err(|reason| {
+                        ManifestError::InvalidField {
+                            moniker: moniker.to_owned(),
+                            field: "oci.rootfs",
+                            detail: format!("`{r}`: {reason}"),
+                        }
+                    })
+                })
+                .transpose()?;
+            let store = oci
+                .store
+                .as_deref()
+                .map(|s| {
+                    normalize_abs_path(s).map(Cow::Owned).map_err(|reason| {
+                        ManifestError::InvalidField {
+                            moniker: moniker.to_owned(),
+                            field: "oci.store",
+                            detail: format!("`{s}`: {reason}"),
+                        }
+                    })
+                })
+                .transpose()?;
             Ok(RunnerSpec::Oci(OciRunnerSpec {
                 image: oci.image.clone().map(Cow::Owned),
-                rootfs: oci.rootfs.clone().map(Cow::Owned),
-                store: oci.store.clone().map(Cow::Owned),
+                rootfs,
+                store,
                 hostname: Cow::Owned(
                     oci.hostname
                         .clone()
@@ -1065,6 +1091,51 @@ fn convert_runner(moniker: &str, raw: &RawComponentManifest) -> Result<RunnerSpe
                 field: "vm",
                 detail: "vm runner requires `[vm]` section".to_owned(),
             })?;
+            let kernel =
+                normalize_abs_path(&vm.kernel).map_err(|reason| ManifestError::InvalidField {
+                    moniker: moniker.to_owned(),
+                    field: "vm.kernel",
+                    detail: format!("`{}`: {reason}", vm.kernel),
+                })?;
+            let initramfs = vm
+                .initramfs
+                .as_deref()
+                .map(|p| {
+                    normalize_abs_path(p).map(Cow::Owned).map_err(|reason| {
+                        ManifestError::InvalidField {
+                            moniker: moniker.to_owned(),
+                            field: "vm.initramfs",
+                            detail: format!("`{p}`: {reason}"),
+                        }
+                    })
+                })
+                .transpose()?;
+            let disk = vm
+                .disk
+                .as_deref()
+                .map(|p| {
+                    normalize_abs_path(p).map(Cow::Owned).map_err(|reason| {
+                        ManifestError::InvalidField {
+                            moniker: moniker.to_owned(),
+                            field: "vm.disk",
+                            detail: format!("`{p}`: {reason}"),
+                        }
+                    })
+                })
+                .transpose()?;
+            let rootfs_dir = vm
+                .rootfs_dir
+                .as_deref()
+                .map(|p| {
+                    normalize_abs_path(p).map(Cow::Owned).map_err(|reason| {
+                        ManifestError::InvalidField {
+                            moniker: moniker.to_owned(),
+                            field: "vm.rootfs_dir",
+                            detail: format!("`{p}`: {reason}"),
+                        }
+                    })
+                })
+                .transpose()?;
             let mut share_dirs = Vec::with_capacity(vm.share_dirs.len());
             for spec in &vm.share_dirs {
                 let Some((tag, host_path)) = spec.split_once(':') else {
@@ -1081,19 +1152,26 @@ fn convert_runner(moniker: &str, raw: &RawComponentManifest) -> Result<RunnerSpe
                         detail: format!("invalid share_dir `{spec}` (empty tag or path)"),
                     });
                 }
+                let normalized_host_path = normalize_abs_path(host_path).map_err(|reason| {
+                    ManifestError::InvalidField {
+                        moniker: moniker.to_owned(),
+                        field: "vm.share_dirs",
+                        detail: format!("`{host_path}`: {reason}"),
+                    }
+                })?;
                 share_dirs.push(VmShareSpec {
                     tag: Cow::Owned(tag.to_owned()),
-                    host_path: Cow::Owned(host_path.to_owned()),
+                    host_path: Cow::Owned(normalized_host_path),
                 });
             }
             Ok(RunnerSpec::Vm(VmRunnerSpec {
-                kernel: Cow::Owned(vm.kernel.clone()),
-                initramfs: vm.initramfs.clone().map(Cow::Owned),
-                disk: vm.disk.clone().map(Cow::Owned),
+                kernel: Cow::Owned(kernel),
+                initramfs,
+                disk,
                 memory_mib: vm.memory_mib,
                 cpus: vm.cpus,
                 cmdline: vm.cmdline.clone().map(Cow::Owned),
-                rootfs_dir: vm.rootfs_dir.clone().map(Cow::Owned),
+                rootfs_dir,
                 share_dirs: Cow::Owned(share_dirs),
             }))
         }

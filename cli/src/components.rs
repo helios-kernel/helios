@@ -2,6 +2,7 @@
 //! three-part system image packaging (`helios-kernel`, signed
 //! `component-manager.cwasm`, and signed user-space components payload).
 
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -16,10 +17,9 @@ use helios_artifact::{
 };
 use helios_component_manager::{
     AuthorityScopeSpec, ComponentNode, ComponentTopology, ContainerMountSharingSpec, Criticality,
-    EscalationAction, HardwarePredicates, IpAddrSpec, LifecycleKind, ManifestError,
-    MountSharingSpec, MountSourceSpec, NameCeiling, OomTier, PortCeiling, ProviderSlot,
-    RestartPolicy, RunnerSpec, SocketActivationSpec, StartupPolicy, WasmSharding,
-    load_tree_from_dir,
+    EscalationAction, IpAddrSpec, LifecycleKind, ManifestError, MountSharingSpec, MountSourceSpec,
+    NameCeiling, OomTier, PortCeiling, ProviderSlot, RestartPolicy, RunnerSpec,
+    SocketActivationSpec, StartupPolicy, WasmSharding, load_tree_from_dir,
 };
 use helios_workspace_root::prebuilt_manifest::sha256_hex;
 use helios_workspace_root::{WorkspaceRoot, WorkspaceRootError};
@@ -537,8 +537,9 @@ pub(crate) fn run_image_build(
 /// Renders a validated [`ComponentTopology`] into static native Rust source code
 /// through the compile-time `askama` template (`cli/templates/component_topology.rs.askama`).
 pub fn render_topology_rust(topology: &ComponentTopology) -> Result<String, ComponentBuildError> {
-    let nodes = topology.nodes.iter().map(NodeView::from_node).collect();
-    let template = ComponentTopologyTemplate { nodes };
+    let template = ComponentTopologyTemplate {
+        nodes: topology.nodes.as_ref(),
+    };
     let mut rendered = template
         .render()
         .map_err(|source| ComponentBuildError::RenderTemplate { source })?;
@@ -578,473 +579,24 @@ fn detect_host_target() -> Result<String, ComponentBuildError> {
         })
 }
 
-fn rust_lit(s: &str) -> String {
-    format!("{s:?}")
+/// Zero-allocation wrapper that renders `&str` as an escaped Rust string literal.
+struct RustStrLit<'a>(&'a str);
+
+impl fmt::Display for RustStrLit<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.0, f)
+    }
 }
 
 #[derive(Template)]
 #[template(path = "component_topology.rs.askama", escape = "none")]
-struct ComponentTopologyTemplate {
-    nodes: Vec<NodeView>,
+struct ComponentTopologyTemplate<'a> {
+    nodes: &'a [ComponentNode],
 }
 
-struct NodeView {
-    moniker: String,
-    instance_name: String,
-    parent_index: String,
-    children_indices: Vec<usize>,
-    runner: RunnerView,
-    startup: &'static str,
-    lifecycle: &'static str,
-    requires: HardwarePredicates,
-    after: Vec<usize>,
-    mounts: Vec<MountView>,
-    restart: &'static str,
-    restart_backoff_ms: u64,
-    restart_backoff_max_ms: u64,
-    burst_limit: u32,
-    burst_window_ms: u64,
-    stop_timeout_ms: u64,
-    critical: &'static str,
-    escalation: &'static str,
-    oom_tier: &'static str,
-    dynamic_mount: bool,
-    capabilities: CapabilitiesView,
-    exposes: Vec<ExposeView>,
-    routes: Vec<RouteView>,
-    sockets: Vec<SocketView>,
-}
-
-enum RunnerView {
-    Realm,
-    Wasm(WasmRunnerView),
-    Oci(OciRunnerView),
-    Exec(ExecRunnerView),
-    Vm(VmRunnerView),
-}
-
-struct WasmRunnerView {
-    program: String,
-    sharding: &'static str,
-    provider: &'static str,
-    args: Vec<String>,
-    env: Vec<EnvVarView>,
-    cwd: Option<String>,
-    optional: bool,
-}
-
-struct OciRunnerView {
-    image: Option<String>,
-    rootfs: Option<String>,
-    store: Option<String>,
-    hostname: String,
-    uid: u32,
-    gid: u32,
-    entrypoint: Vec<String>,
-    cmd: Vec<String>,
-    env: Vec<EnvVarView>,
-    cwd: Option<String>,
-    mounts: Vec<ContainerMountView>,
-}
-
-struct ContainerMountView {
-    source: String,
-    target: String,
-    sharing: &'static str,
-    rights_bits: u8,
-}
-
-struct ExecRunnerView {
-    program: String,
-    args: Vec<String>,
-    env: Vec<EnvVarView>,
-    cwd: Option<String>,
-    optional: bool,
-}
-
-struct VmRunnerView {
-    kernel: String,
-    initramfs: Option<String>,
-    disk: Option<String>,
-    memory_mib: u64,
-    cpus: u32,
-    cmdline: Option<String>,
-    rootfs_dir: Option<String>,
-    share_dirs: Vec<VmShareView>,
-}
-
-struct VmShareView {
-    tag: String,
-    host_path: String,
-}
-
-struct EnvVarView {
-    key: String,
-    value: String,
-}
-
-struct MountView {
-    source_expr: String,
-    path: String,
-    sharing: &'static str,
-    read_only: bool,
-    compress: Option<String>,
-    commit: String,
-    max_inline: String,
-}
-
-struct DirectoryView {
-    source: String,
-    guest: String,
-    rights_bits: u8,
-}
-
-enum PortCeilingView {
-    Any,
-    Set(Vec<u16>),
-}
-
-enum VsockCeilingView {
-    Any,
-    Set(Vec<u32>),
-}
-
-enum NameCeilingView {
-    Any,
-    Set(Vec<String>),
-}
-
-struct CapabilitiesView {
-    directories: Vec<DirectoryView>,
-    network_bits: u8,
-    tcp_ports: PortCeilingView,
-    vsock_ports: VsockCeilingView,
-    clock_bits: u8,
-    terminal_bits: u8,
-    process_bits: u8,
-    link_bits: u8,
-    mount_bits: u8,
-    devices_bits: u8,
-    named_devices: NameCeilingView,
-    inspect_read: &'static str,
-    trace_read: &'static str,
-    profile_read: &'static str,
-    diagnostics_control: bool,
-    instance_control: &'static str,
-    settings_write: bool,
-    machine_bits: u8,
-    wit_interfaces: NameCeilingView,
-}
-
-struct ExposeView {
-    interface: String,
-    channel: String,
-}
-
-struct RouteView {
-    interface: String,
-    provider_index: usize,
-    provider_moniker: String,
-    provider_channel: String,
-    consumer_channel: String,
-}
-
-struct SocketView {
-    expr: String,
-}
-
-impl NodeView {
-    fn from_node(node: &ComponentNode) -> Self {
-        let parent_index = match node.parent_index {
-            Some(idx) => format!("Some({idx})"),
-            None => "None".to_owned(),
-        };
-        let runner = match &node.runner {
-            RunnerSpec::Realm => RunnerView::Realm,
-            RunnerSpec::Wasm(w) => RunnerView::Wasm(WasmRunnerView {
-                program: rust_lit(w.program.as_ref()),
-                sharding: match w.sharding {
-                    WasmSharding::Singleton => "WasmSharding::Singleton",
-                    WasmSharding::PerProcessor => "WasmSharding::PerProcessor",
-                },
-                provider: match w.provider {
-                    None => "None",
-                    Some(ProviderSlot::Compiler) => "Some(ProviderSlot::Compiler)",
-                    Some(ProviderSlot::HttpClient) => "Some(ProviderSlot::HttpClient)",
-                    Some(ProviderSlot::Surface) => "Some(ProviderSlot::Surface)",
-                },
-                args: w.args.iter().map(|s| rust_lit(s.as_ref())).collect(),
-                env: w
-                    .env
-                    .iter()
-                    .map(|e| EnvVarView {
-                        key: rust_lit(e.key.as_ref()),
-                        value: rust_lit(e.value.as_ref()),
-                    })
-                    .collect(),
-                cwd: w.cwd.as_deref().map(rust_lit),
-                optional: w.optional,
-            }),
-            RunnerSpec::Oci(o) => RunnerView::Oci(OciRunnerView {
-                image: o.image.as_deref().map(rust_lit),
-                rootfs: o.rootfs.as_deref().map(rust_lit),
-                store: o.store.as_deref().map(rust_lit),
-                hostname: rust_lit(o.hostname.as_ref()),
-                uid: o.uid,
-                gid: o.gid,
-                entrypoint: o.entrypoint.iter().map(|s| rust_lit(s.as_ref())).collect(),
-                cmd: o.cmd.iter().map(|s| rust_lit(s.as_ref())).collect(),
-                env: o
-                    .env
-                    .iter()
-                    .map(|e| EnvVarView {
-                        key: rust_lit(e.key.as_ref()),
-                        value: rust_lit(e.value.as_ref()),
-                    })
-                    .collect(),
-                cwd: o.cwd.as_deref().map(rust_lit),
-                mounts: o
-                    .mounts
-                    .iter()
-                    .map(|m| ContainerMountView {
-                        source: rust_lit(m.source.as_ref()),
-                        target: rust_lit(m.target.as_ref()),
-                        sharing: match m.sharing {
-                            ContainerMountSharingSpec::Private => {
-                                "ContainerMountSharingSpec::Private"
-                            }
-                            ContainerMountSharingSpec::Shared => {
-                                "ContainerMountSharingSpec::Shared"
-                            }
-                            ContainerMountSharingSpec::EphemeralOverlay => {
-                                "ContainerMountSharingSpec::EphemeralOverlay"
-                            }
-                        },
-                        rights_bits: m.rights.bits(),
-                    })
-                    .collect(),
-            }),
-            RunnerSpec::Exec(x) => RunnerView::Exec(ExecRunnerView {
-                program: rust_lit(x.program.as_ref()),
-                args: x.args.iter().map(|s| rust_lit(s.as_ref())).collect(),
-                env: x
-                    .env
-                    .iter()
-                    .map(|e| EnvVarView {
-                        key: rust_lit(e.key.as_ref()),
-                        value: rust_lit(e.value.as_ref()),
-                    })
-                    .collect(),
-                cwd: x.cwd.as_deref().map(rust_lit),
-                optional: x.optional,
-            }),
-            RunnerSpec::Vm(v) => RunnerView::Vm(VmRunnerView {
-                kernel: rust_lit(v.kernel.as_ref()),
-                initramfs: v.initramfs.as_deref().map(rust_lit),
-                disk: v.disk.as_deref().map(rust_lit),
-                memory_mib: v.memory_mib,
-                cpus: v.cpus,
-                cmdline: v.cmdline.as_deref().map(rust_lit),
-                rootfs_dir: v.rootfs_dir.as_deref().map(rust_lit),
-                share_dirs: v
-                    .share_dirs
-                    .iter()
-                    .map(|s| VmShareView {
-                        tag: rust_lit(s.tag.as_ref()),
-                        host_path: rust_lit(s.host_path.as_ref()),
-                    })
-                    .collect(),
-            }),
-        };
-
-        let mounts = node
-            .mounts
-            .iter()
-            .map(|m| {
-                let source_expr = match &m.source {
-                    MountSourceSpec::Memory => "MountSourceSpec::Memory".to_owned(),
-                    MountSourceSpec::BootImage => "MountSourceSpec::BootImage".to_owned(),
-                    MountSourceSpec::HostShare => "MountSourceSpec::HostShare".to_owned(),
-                    MountSourceSpec::Disk(s) => {
-                        format!("MountSourceSpec::Disk(Cow::Borrowed({}))", rust_lit(s))
-                    }
-                    MountSourceSpec::Btrfs(s) => {
-                        format!("MountSourceSpec::Btrfs(Cow::Borrowed({}))", rust_lit(s))
-                    }
-                };
-                MountView {
-                    source_expr,
-                    path: rust_lit(m.path.as_ref()),
-                    sharing: match m.sharing {
-                        MountSharingSpec::Private => "MountSharingSpec::Private",
-                        MountSharingSpec::Shared => "MountSharingSpec::Shared",
-                    },
-                    read_only: m.read_only,
-                    compress: m.compress.as_deref().map(rust_lit),
-                    commit: match m.commit {
-                        Some(v) => format!("Some({v})"),
-                        None => "None".to_owned(),
-                    },
-                    max_inline: match m.max_inline {
-                        Some(v) => format!("Some({v})"),
-                        None => "None".to_owned(),
-                    },
-                }
-            })
-            .collect();
-
-        let cap = &node.capabilities;
-        let capabilities = CapabilitiesView {
-            directories: cap
-                .directories
-                .iter()
-                .map(|d| DirectoryView {
-                    source: rust_lit(d.source.as_ref()),
-                    guest: rust_lit(d.guest.as_ref()),
-                    rights_bits: d.rights.bits(),
-                })
-                .collect(),
-            network_bits: cap.network.bits(),
-            tcp_ports: match &cap.tcp_ports {
-                PortCeiling::Any => PortCeilingView::Any,
-                PortCeiling::Set(ports) => PortCeilingView::Set(ports.to_vec()),
-            },
-            vsock_ports: match &cap.vsock_ports {
-                PortCeiling::Any => VsockCeilingView::Any,
-                PortCeiling::Set(ports) => VsockCeilingView::Set(ports.to_vec()),
-            },
-            clock_bits: cap.clock.bits(),
-            terminal_bits: cap.terminal.bits(),
-            process_bits: cap.process.bits(),
-            link_bits: cap.link.bits(),
-            mount_bits: cap.mount.bits(),
-            devices_bits: cap.devices.bits(),
-            named_devices: match &cap.named_devices {
-                NameCeiling::Any => NameCeilingView::Any,
-                NameCeiling::Set(items) => {
-                    NameCeilingView::Set(items.iter().map(|s| rust_lit(s.as_ref())).collect())
-                }
-            },
-            inspect_read: scope_expr(cap.inspect_read),
-            trace_read: scope_expr(cap.trace_read),
-            profile_read: scope_expr(cap.profile_read),
-            diagnostics_control: cap.diagnostics_control,
-            instance_control: scope_expr(cap.instance_control),
-            settings_write: cap.settings_write,
-            machine_bits: cap.machine.bits(),
-            wit_interfaces: match &cap.wit_interfaces {
-                NameCeiling::Any => NameCeilingView::Any,
-                NameCeiling::Set(items) => {
-                    NameCeilingView::Set(items.iter().map(|s| rust_lit(s.as_ref())).collect())
-                }
-            },
-        };
-
-        let exposes = node
-            .exposes
-            .iter()
-            .map(|e| ExposeView {
-                interface: rust_lit(e.interface.as_ref()),
-                channel: rust_lit(e.channel.as_ref()),
-            })
-            .collect();
-
-        let routes = node
-            .routes
-            .iter()
-            .map(|r| RouteView {
-                interface: rust_lit(r.interface.as_ref()),
-                provider_index: r.provider_index,
-                provider_moniker: rust_lit(r.provider_moniker.as_ref()),
-                provider_channel: rust_lit(r.provider_channel.as_ref()),
-                consumer_channel: rust_lit(r.consumer_channel.as_ref()),
-            })
-            .collect();
-
-        let sockets = node
-            .sockets
-            .iter()
-            .map(|s| {
-                let expr = match *s {
-                    SocketActivationSpec::Tcp {
-                        address,
-                        port,
-                        backlog,
-                    } => {
-                        let addr = match address {
-                            IpAddrSpec::V4(octets) => format!("IpAddrSpec::V4({octets:?})"),
-                            IpAddrSpec::V6(segs) => format!("IpAddrSpec::V6({segs:?})"),
-                        };
-                        format!(
-                            "SocketActivationSpec::Tcp {{ address: {addr}, port: {port}, backlog: {backlog} }}"
-                        )
-                    }
-                    SocketActivationSpec::Vsock { port, backlog } => {
-                        format!(
-                            "SocketActivationSpec::Vsock {{ port: {port}, backlog: {backlog} }}"
-                        )
-                    }
-                };
-                SocketView { expr }
-            })
-            .collect();
-
-        Self {
-            moniker: rust_lit(node.moniker.as_ref()),
-            instance_name: rust_lit(node.instance_name.as_ref()),
-            parent_index,
-            children_indices: node.children_indices.to_vec(),
-            runner,
-            startup: match node.startup {
-                StartupPolicy::Lazy => "StartupPolicy::Lazy",
-                StartupPolicy::Eager => "StartupPolicy::Eager",
-            },
-            lifecycle: match node.lifecycle {
-                LifecycleKind::Service => "LifecycleKind::Service",
-                LifecycleKind::Oneshot => "LifecycleKind::Oneshot",
-            },
-            requires: node.requires,
-            after: node.after.to_vec(),
-            mounts,
-            restart: match node.restart {
-                RestartPolicy::Never => "RestartPolicy::Never",
-                RestartPolicy::OnFailure => "RestartPolicy::OnFailure",
-                RestartPolicy::Always => "RestartPolicy::Always",
-            },
-            restart_backoff_ms: node.restart_backoff_ms,
-            restart_backoff_max_ms: node.restart_backoff_max_ms,
-            burst_limit: node.burst_limit,
-            burst_window_ms: node.burst_window_ms,
-            stop_timeout_ms: node.stop_timeout_ms,
-            critical: match node.critical {
-                Criticality::None => "Criticality::None",
-                Criticality::Parent => "Criticality::Parent",
-                Criticality::System => "Criticality::System",
-            },
-            escalation: match node.escalation {
-                EscalationAction::Halt => "EscalationAction::Halt",
-                EscalationAction::Reboot => "EscalationAction::Reboot",
-            },
-            oom_tier: match node.oom_tier {
-                OomTier::User => "OomTier::User",
-                OomTier::Plugin => "OomTier::Plugin",
-                OomTier::Protected => "OomTier::Protected",
-            },
-            dynamic_mount: node.dynamic_mount,
-            capabilities,
-            exposes,
-            routes,
-            sockets,
-        }
-    }
-}
-
-const fn scope_expr(scope: AuthorityScopeSpec) -> &'static str {
-    match scope {
-        AuthorityScopeSpec::None => "AuthorityScopeSpec::None",
-        AuthorityScopeSpec::Own => "AuthorityScopeSpec::Own",
-        AuthorityScopeSpec::Subtree => "AuthorityScopeSpec::Subtree",
-        AuthorityScopeSpec::Machine => "AuthorityScopeSpec::Machine",
+impl ComponentTopologyTemplate<'_> {
+    const fn str_lit(s: &str) -> RustStrLit<'_> {
+        RustStrLit(s)
     }
 }
 
@@ -1293,5 +845,180 @@ nonexistent_flag = 42
         let mut tampered_bootfs = bootfs_signed;
         tampered_bootfs[0] ^= 0xff;
         assert!(bootfs::verified_signer(&tampered_bootfs).is_err());
+    }
+
+    #[test]
+    fn structured_askama_template_renders_mounts_sockets_and_all_runners() {
+        use helios_component_manager::{
+            AuthorityScopeSpec, CapabilityCeiling, ComponentNode, ComponentTopology,
+            ContainerMountSharingSpec, ContainerMountSpec, Criticality, DirectoryGrantSpec,
+            EnvVarSpec, EscalationAction, ExecRunnerSpec, FsRights, HardwarePredicates, IpAddrSpec,
+            LifecycleKind, MachineRights, MountRights, MountSharingSpec, MountSourceSpec,
+            MountSpec, NetRights, OciRunnerSpec, OomTier, PortCeiling, RestartPolicy, RunnerSpec,
+            SocketActivationSpec, StartupPolicy, VmRunnerSpec, VmShareSpec,
+        };
+        use std::borrow::Cow;
+
+        let mut root = ComponentNode {
+            moniker: Cow::Borrowed("/"),
+            instance_name: Cow::Borrowed("root"),
+            parent_index: None,
+            children_indices: Cow::Borrowed(&[1, 2, 3]),
+            runner: RunnerSpec::Realm,
+            startup: StartupPolicy::Lazy,
+            lifecycle: LifecycleKind::Service,
+            requires: HardwarePredicates::NONE,
+            after: Cow::Borrowed(&[]),
+            mounts: Cow::Owned(vec![
+                MountSpec {
+                    source: MountSourceSpec::Memory,
+                    path: Cow::Borrowed("/tmp"),
+                    sharing: MountSharingSpec::Shared,
+                    read_only: false,
+                    compress: None,
+                    commit: None,
+                    max_inline: None,
+                },
+                MountSpec {
+                    source: MountSourceSpec::Btrfs(Cow::Borrowed("vol-0")),
+                    path: Cow::Borrowed("/data"),
+                    sharing: MountSharingSpec::Private,
+                    read_only: false,
+                    compress: Some(Cow::Borrowed("zstd:3")),
+                    commit: Some(30),
+                    max_inline: Some(4096),
+                },
+                MountSpec {
+                    source: MountSourceSpec::Disk(Cow::Borrowed("disk-0")),
+                    path: Cow::Borrowed("/mnt/raw"),
+                    sharing: MountSharingSpec::Shared,
+                    read_only: true,
+                    compress: None,
+                    commit: None,
+                    max_inline: None,
+                },
+            ]),
+            restart: RestartPolicy::Never,
+            restart_backoff_ms: 250,
+            restart_backoff_max_ms: 30_000,
+            burst_limit: 5,
+            burst_window_ms: 60_000,
+            stop_timeout_ms: 5_000,
+            critical: Criticality::None,
+            escalation: EscalationAction::Halt,
+            oom_tier: OomTier::Protected,
+            dynamic_mount: false,
+            capabilities: CapabilityCeiling {
+                directories: Cow::Owned(vec![DirectoryGrantSpec {
+                    source: Cow::Borrowed("/"),
+                    guest: Cow::Borrowed("/"),
+                    rights: FsRights::ALL,
+                }]),
+                network: NetRights::ALL,
+                tcp_ports: PortCeiling::Any,
+                vsock_ports: PortCeiling::Any,
+                mount: MountRights::ALL,
+                machine: MachineRights::ALL,
+                inspect_read: AuthorityScopeSpec::Machine,
+                ..CapabilityCeiling::EMPTY
+            },
+            exposes: Cow::Borrowed(&[]),
+            routes: Cow::Borrowed(&[]),
+            sockets: Cow::Borrowed(&[]),
+        };
+        let mut oci = root.clone();
+        oci.moniker = Cow::Borrowed("/oci");
+        oci.instance_name = Cow::Borrowed("oci");
+        oci.parent_index = Some(0);
+        oci.children_indices = Cow::Borrowed(&[]);
+        oci.mounts = Cow::Borrowed(&[]);
+        oci.oom_tier = OomTier::User;
+        oci.runner = RunnerSpec::Oci(OciRunnerSpec {
+            image: Some(Cow::Borrowed("alpine:3.20")),
+            rootfs: None,
+            store: Some(Cow::Borrowed("/var/lib/oci")),
+            hostname: Cow::Borrowed("oci"),
+            uid: 1000,
+            gid: 1000,
+            entrypoint: Cow::Borrowed(&[Cow::Borrowed("/bin/sh")]),
+            cmd: Cow::Borrowed(&[Cow::Borrowed("-c"), Cow::Borrowed("echo hi")]),
+            env: Cow::Owned(vec![EnvVarSpec {
+                key: Cow::Borrowed("K"),
+                value: Cow::Borrowed("V"),
+            }]),
+            cwd: Some(Cow::Borrowed("/app")),
+            mounts: Cow::Owned(vec![ContainerMountSpec {
+                source: Cow::Borrowed("/data"),
+                target: Cow::Borrowed("/data"),
+                sharing: ContainerMountSharingSpec::EphemeralOverlay,
+                rights: FsRights::READ,
+            }]),
+        });
+        oci.sockets = Cow::Owned(vec![
+            SocketActivationSpec::Tcp {
+                address: IpAddrSpec::V4([127, 0, 0, 1]),
+                port: 8080,
+                backlog: 64,
+            },
+            SocketActivationSpec::Tcp {
+                address: IpAddrSpec::V6([0, 0, 0, 0, 0, 0, 0, 1]),
+                port: 8443,
+                backlog: 32,
+            },
+            SocketActivationSpec::Vsock {
+                port: 5000,
+                backlog: 16,
+            },
+        ]);
+
+        let mut exec = oci.clone();
+        exec.moniker = Cow::Borrowed("/exec");
+        exec.instance_name = Cow::Borrowed("exec");
+        exec.sockets = Cow::Borrowed(&[]);
+        exec.runner = RunnerSpec::Exec(ExecRunnerSpec {
+            program: Cow::Borrowed("/bin/tool"),
+            args: Cow::Borrowed(&[Cow::Borrowed("--flag")]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: true,
+        });
+
+        let mut vm = exec.clone();
+        vm.moniker = Cow::Borrowed("/vm");
+        vm.instance_name = Cow::Borrowed("vm");
+        vm.runner = RunnerSpec::Vm(VmRunnerSpec {
+            kernel: Cow::Borrowed("/boot/Image"),
+            initramfs: Some(Cow::Borrowed("/boot/initrd")),
+            disk: Some(Cow::Borrowed("/vm/disk.raw")),
+            memory_mib: 256,
+            cpus: 2,
+            cmdline: Some(Cow::Borrowed("console=hvc0")),
+            rootfs_dir: Some(Cow::Borrowed("/vm/rootfs")),
+            share_dirs: Cow::Owned(vec![VmShareSpec {
+                tag: Cow::Borrowed("work"),
+                host_path: Cow::Borrowed("/vm/work"),
+            }]),
+        });
+        root.children_indices = Cow::Borrowed(&[1, 2, 3]);
+
+        let topology = ComponentTopology {
+            nodes: Cow::Owned(vec![root, oci, exec, vm]),
+        };
+        helios_component_manager::validate_topology(&topology).expect("topology validates");
+        let rendered = render_topology_rust(&topology).expect("template renders");
+        assert!(rendered.contains("parent_index: None,"));
+        assert!(rendered.contains("parent_index: Some(0),"));
+        assert!(rendered.contains("MountSourceSpec::Btrfs(Cow::Borrowed(\"vol-0\"))"));
+        assert!(rendered.contains("MountSourceSpec::Disk(Cow::Borrowed(\"disk-0\"))"));
+        assert!(rendered.contains("commit: Some(30),"));
+        assert!(rendered.contains("max_inline: Some(4096),"));
+        assert!(rendered.contains("IpAddrSpec::V4([127, 0, 0, 1]), port: 8080, backlog: 64"));
+        assert!(
+            rendered.contains("IpAddrSpec::V6([0, 0, 0, 0, 0, 0, 0, 1]), port: 8443, backlog: 32")
+        );
+        assert!(rendered.contains("SocketActivationSpec::Vsock { port: 5000, backlog: 16 }"));
+        assert!(rendered.contains("ContainerMountSharingSpec::EphemeralOverlay"));
+        assert!(rendered.contains("RunnerSpec::Exec(ExecRunnerSpec"));
+        assert!(rendered.contains("RunnerSpec::Vm(VmRunnerSpec"));
     }
 }
