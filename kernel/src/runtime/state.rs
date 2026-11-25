@@ -78,6 +78,9 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// This boot's Ed25519 machine identity key, settled alongside the
     /// compiler-signing key from the measured-boot or ephemeral seed.
     machine_identity: Once<crate::MachineIdentityKey>,
+    /// This boot's hibernate authentication key (present only when the
+    /// signing seed came from a TPM-sealed slot) and the seed's provenance.
+    hibernate_auth: Once<(Option<crate::HibernateAuthKey>, crate::SeedSource)>,
     /// Nonzero token of the active `snapshot-hold` keeping the 9p share quiet
     /// for a VM snapshot, or `0` when no hold is in force.
     snapshot_hold_token: AtomicU64,
@@ -407,6 +410,7 @@ where
                 root_entropy: Once::new(),
                 machine_generation: Once::new(),
                 machine_identity: Once::new(),
+                hibernate_auth: Once::new(),
                 snapshot_hold_token: AtomicU64::new(0),
                 next_snapshot_hold_token: AtomicU64::new(1),
                 wall_clock: crate::exec::WallClock::new(),
@@ -1097,6 +1101,38 @@ where
     /// This boot's Ed25519 machine identity key, once installed.
     pub fn machine_identity_key(&self) -> Option<&crate::MachineIdentityKey> {
         self.inner.machine_identity.get()
+    }
+
+    /// Publishes this boot's hibernate authentication key (when derived
+    /// from a TPM-sealed seed) and the seed's provenance.
+    pub fn install_hibernate_auth(
+        &self,
+        key: Option<crate::HibernateAuthKey>,
+        source: crate::SeedSource,
+    ) {
+        let mut installed = false;
+        self.inner.hibernate_auth.call_once(|| {
+            installed = true;
+            (key, source)
+        });
+        assert!(
+            installed,
+            "the hibernate authentication state was installed more than once"
+        );
+    }
+
+    /// This boot's hibernate image authentication key, when the boot
+    /// settled a non-ephemeral TPM-sealed seed.
+    pub fn hibernate_auth_key(&self) -> Option<&crate::HibernateAuthKey> {
+        self.inner
+            .hibernate_auth
+            .get()
+            .and_then(|(key, _)| key.as_ref())
+    }
+
+    /// Where this boot's signing seed came from, once settled.
+    pub fn signing_seed_source(&self) -> Option<crate::SeedSource> {
+        self.inner.hibernate_auth.get().map(|(_, source)| *source)
     }
 
     /// Acquires the exclusive snapshot hold and quiets the 9p host share
