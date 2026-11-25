@@ -18,6 +18,7 @@ pub mod debugger {
             with: {
                 "helios:system/programs.child": crate::ChildHandle,
                 "helios:system/programs.container": crate::ContainerHandle,
+                "helios:system/net.tcp-listener": crate::ComponentTcpListener,
                 "helios:system/inspect.publication": crate::wasmtime_adapter::component_host::InspectPublicationHandle,
                 "helios:system/ipc.endpoint": crate::IpcEndpoint,
                 "helios:system/snapshot.snapshot-hold": crate::ComponentSnapshotHold,
@@ -58,6 +59,7 @@ pub mod program {
             with: {
                 "helios:system/programs.child": crate::ChildHandle,
                 "helios:system/programs.container": crate::ContainerHandle,
+                "helios:system/net.tcp-listener": crate::ComponentTcpListener,
                 "helios:system/inspect.publication": crate::wasmtime_adapter::component_host::InspectPublicationHandle,
                 "helios:system/ipc.endpoint": crate::IpcEndpoint,
                 "helios:system/snapshot.snapshot-hold": crate::ComponentSnapshotHold,

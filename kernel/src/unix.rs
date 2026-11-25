@@ -36,11 +36,24 @@ impl Setting for DescriptorLimitSetting {
 /// on. It names the service's handle types and forwards the close calls,
 /// and adds nothing of its own.
 #[derive(Clone)]
-pub(crate) struct UnixNetwork<Service>(Service);
+pub(crate) struct UnixNetwork<Service> {
+    service: Option<Service>,
+    vsock: Option<crate::ComponentHostVsockService>,
+}
 
 impl<Service: ComponentNetworkService> UnixNetwork<Service> {
     pub(crate) const fn new(service: Service) -> Self {
-        Self(service)
+        Self {
+            service: Some(service),
+            vsock: None,
+        }
+    }
+
+    pub(crate) const fn with_vsock(
+        service: Option<Service>,
+        vsock: Option<crate::ComponentHostVsockService>,
+    ) -> Self {
+        Self { service, vsock }
     }
 }
 
@@ -60,19 +73,39 @@ impl<Service: ComponentNetworkService> SocketNetwork for UnixNetwork<Service> {
     };
 
     fn tcp_close(&self, stream: Self::TcpStream) {
-        self.0.tcp_close(stream);
+        if let Some(service) = self.service.as_ref() {
+            service.tcp_close(stream);
+        }
     }
 
     fn tcp_listener_close(&self, listener: Self::TcpListener) {
-        self.0.tcp_listener_close(listener);
+        if let Some(service) = self.service.as_ref() {
+            service.tcp_listener_close(listener);
+        }
     }
 
     fn udp_close(&self, socket: Self::UdpSocket) {
-        self.0.udp_close(socket);
+        if let Some(service) = self.service.as_ref() {
+            service.udp_close(socket);
+        }
     }
 
     fn packet_close(&self, socket: Self::PacketSocket) {
-        self.0.packet_close(socket);
+        if let Some(service) = self.service.as_ref() {
+            service.packet_close(socket);
+        }
+    }
+
+    fn vsock_listener_close(&self, listener: u64) {
+        if let Some(vsock) = self.vsock.as_ref() {
+            let _ = vsock.close_listener(crate::VsockListenerId::from_u64(listener));
+        }
+    }
+
+    fn vsock_stream_close(&self, stream: u64) {
+        if let Some(vsock) = self.vsock.as_ref() {
+            vsock.close_sync(crate::VsockStreamId::from_u64(stream));
+        }
     }
 }
 

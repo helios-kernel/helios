@@ -1,3 +1,6 @@
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::{
     ComponentNetworkService, RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource,
     RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource, TcpStreamResource,
@@ -208,6 +211,233 @@ pub struct ComponentRawRwLockReadGuard {
 
 pub struct ComponentRawRwLockWriteGuard {
     pub _resource: RawRwLockWriteGuardResource,
+}
+
+/// Concrete TCP listener resource for `helios:system/net.tcp-listener`.
+///
+/// Non-generic so `bindgen!` maps `helios:system/net.tcp-listener` directly to
+/// it across both component worlds; retires the underlying listener handle via
+/// [`crate::SocketRetirementSender`] on drop unless disarmed for hand-off.
+pub struct ComponentTcpListener {
+    raw: Option<u64>,
+    local_address: crate::NetworkIpAddress,
+    local_port: u16,
+    hop_limit: u8,
+    retire: crate::SocketRetirementSender,
+}
+
+impl ComponentTcpListener {
+    pub fn new(
+        raw: u64,
+        local_address: crate::NetworkIpAddress,
+        local_port: u16,
+        hop_limit: u8,
+        retire: crate::SocketRetirementSender,
+    ) -> Self {
+        Self {
+            raw: Some(raw),
+            local_address,
+            local_port,
+            hop_limit,
+            retire,
+        }
+    }
+
+    pub const fn raw(&self) -> Option<u64> {
+        self.raw
+    }
+
+    pub const fn local_address(&self) -> crate::NetworkIpAddress {
+        self.local_address
+    }
+
+    pub const fn local_port(&self) -> u16 {
+        self.local_port
+    }
+
+    pub const fn hop_limit(&self) -> u8 {
+        self.hop_limit
+    }
+
+    pub fn retirement(&self) -> crate::SocketRetirementSender {
+        self.retire.clone()
+    }
+
+    /// Disarms retirement and moves the underlying raw listener handle out.
+    pub fn take_raw(&mut self) -> Option<u64> {
+        self.raw.take()
+    }
+
+    /// Retires the listener immediately if still open.
+    pub fn close(&mut self) {
+        if let Some(raw) = self.raw.take() {
+            self.retire
+                .push(crate::RetiredNetworkHandle::TcpListener(raw));
+        }
+    }
+}
+
+impl Drop for ComponentTcpListener {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Pre-bound listening socket transferred to a spawned child at launch.
+///
+/// Retires the listener on drop if unclaimed or if the launch fails before the
+/// child adopts ownership.
+pub enum InheritedSocket {
+    Tcp {
+        raw: Option<u64>,
+        local_address: crate::NetworkIpAddress,
+        local_port: u16,
+        hop_limit: u8,
+        retire: crate::SocketRetirementSender,
+    },
+    Vsock {
+        service: crate::ComponentHostVsockService,
+        listener: Option<crate::VsockListenerId>,
+    },
+}
+
+impl InheritedSocket {
+    pub fn from_tcp_listener(listener: &mut ComponentTcpListener) -> Option<Self> {
+        let raw = listener.take_raw()?;
+        Some(Self::Tcp {
+            raw: Some(raw),
+            local_address: listener.local_address(),
+            local_port: listener.local_port(),
+            hop_limit: listener.hop_limit(),
+            retire: listener.retirement(),
+        })
+    }
+
+    pub fn from_vsock_listener(
+        service: crate::ComponentHostVsockService,
+        listener: crate::VsockListenerId,
+    ) -> Self {
+        Self::Vsock {
+            service,
+            listener: Some(listener),
+        }
+    }
+
+    pub fn rebind_retirement(&mut self, new_retire: crate::SocketRetirementSender) {
+        if let Self::Tcp { retire, .. } = self {
+            *retire = new_retire;
+        }
+    }
+
+    pub fn take_tcp(&mut self) -> Option<(u64, crate::NetworkIpAddress, u16, u8)> {
+        match self {
+            Self::Tcp {
+                raw,
+                local_address,
+                local_port,
+                hop_limit,
+                ..
+            } => raw
+                .take()
+                .map(|id| (id, *local_address, *local_port, *hop_limit)),
+            Self::Vsock { .. } => None,
+        }
+    }
+
+    pub fn take_vsock(
+        &mut self,
+    ) -> Option<(crate::ComponentHostVsockService, crate::VsockListenerId)> {
+        match self {
+            Self::Vsock { service, listener } => listener.take().map(|id| (service.clone(), id)),
+            Self::Tcp { .. } => None,
+        }
+    }
+}
+
+impl Drop for InheritedSocket {
+    fn drop(&mut self) {
+        match self {
+            Self::Tcp { raw, retire, .. } => {
+                if let Some(id) = raw.take() {
+                    retire.push(crate::RetiredNetworkHandle::TcpListener(id));
+                }
+            }
+            Self::Vsock { service, listener } => {
+                if let Some(id) = listener.take() {
+                    let _ = service.close_listener(id);
+                }
+            }
+        }
+    }
+}
+
+/// Ordered list of pre-bound listening sockets handed to a newly spawned child.
+///
+/// Claimed at most once (installed at `fd = 3+` for POSIX-descriptor processes,
+/// or returned to component guests via `take-inherited-sockets`).
+#[derive(Default)]
+pub struct InheritedSockets {
+    entries: spin::Mutex<Vec<InheritedSocket>>,
+}
+
+impl InheritedSockets {
+    pub const fn new() -> Self {
+        Self {
+            entries: spin::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn from_vec(sockets: Vec<InheritedSocket>) -> Self {
+        Self {
+            entries: spin::Mutex::new(sockets),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.lock().is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.lock().len()
+    }
+
+    pub fn rebind_retirement(&self, retire: crate::SocketRetirementSender) {
+        for socket in self.entries.lock().iter_mut() {
+            socket.rebind_retirement(retire.clone());
+        }
+    }
+
+    pub fn take_all(&self) -> Vec<InheritedSocket> {
+        core::mem::take(&mut *self.entries.lock())
+    }
+}
+
+/// Default Linux credentials carried by an instance's [`DefaultLinuxImage`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DefaultLinuxCredentials {
+    pub uid: u32,
+    pub gid: u32,
+    pub supplementary_groups: Vec<u32>,
+}
+
+/// Per-instance pinned read-only Linux root image inherited across child
+/// `spawn` and `exec` launches.
+pub struct DefaultLinuxImage<S: crate::Storage> {
+    pub root_path: String,
+    pub lower: crate::HeldPath<S>,
+    pub env: Vec<(String, String)>,
+    pub credentials: Option<DefaultLinuxCredentials>,
+}
+
+impl<S: crate::Storage> Clone for DefaultLinuxImage<S> {
+    fn clone(&self) -> Self {
+        Self {
+            root_path: self.root_path.clone(),
+            lower: self.lower.clone(),
+            env: self.env.clone(),
+            credentials: self.credentials.clone(),
+        }
+    }
 }
 
 #[cfg(all(test, feature = "wasmtime-runtime"))]

@@ -12,9 +12,9 @@ use bytes::Bytes;
 use core::future::Future;
 use helios_hal::fs::WritePosition;
 use helios_unix::{
-    OwnedPacketSocket, OwnedTcpListener, OwnedTcpStream, OwnedUdpSocket, PairRecvError, Socket,
-    SocketFamily, SocketFlag, SocketKind, SocketNetwork, SocketOptionError, SocketSize, SocketTime,
-    TcpSocket, TransportProtocol, UdpSocket,
+    OwnedPacketSocket, OwnedTcpListener, OwnedTcpStream, OwnedUdpSocket, OwnedVsockStream,
+    PairRecvError, Socket, SocketFamily, SocketFlag, SocketKind, SocketNetwork, SocketOptionError,
+    SocketSize, SocketTime, TcpSocket, TransportProtocol, UdpSocket, VsockSocket,
 };
 
 use super::io::descriptor_errno;
@@ -30,6 +30,7 @@ pub const AF_UNSPEC: u16 = 0;
 pub const AF_UNIX: u16 = 1;
 pub const AF_INET: u16 = 2;
 pub const AF_INET6: u16 = 10;
+pub const AF_VSOCK: u16 = 40;
 
 // Linux UAPI socket types and creation flags (`include/linux/net.h`).
 const SOCK_STREAM: u32 = 1;
@@ -137,6 +138,8 @@ const MAX_MMSG: usize = 1024;
 const SOCKADDR_IN_LEN: usize = 16;
 /// Size of `struct sockaddr_in6` (28 bytes).
 const SOCKADDR_IN6_LEN: usize = 28;
+/// Size of `struct sockaddr_vm` (16 bytes, `include/uapi/linux/vm_sockets.h`).
+const SOCKADDR_VM_LEN: usize = 16;
 /// Size of `struct msghdr` on 64-bit Linux (56 bytes).
 const MSGHDR_LEN: usize = 56;
 /// Size of `struct mmsghdr` on 64-bit Linux (64 bytes).
@@ -227,6 +230,16 @@ pub struct PacketFrameData {
 ///
 /// Every `Err(u64)` carries a positive Linux errno (e.g. `EACCES`, `EPERM`,
 /// `ECONNREFUSED`, `EAGAIN`).
+/// An accepted `AF_VSOCK` connection together with its local and peer
+/// `(cid, port)` endpoints.
+pub struct AcceptedVsockStream<N: SocketNetwork> {
+    pub stream: Arc<OwnedVsockStream<N>>,
+    pub local_cid: u32,
+    pub local_port: u32,
+    pub peer_cid: u32,
+    pub peer_port: u32,
+}
+
 pub trait Network<N: SocketNetwork> {
     fn to_ip(&self, address: N::Address) -> IpAddr;
     fn encode_ip(&self, ip: IpAddr) -> N::Address;
@@ -528,6 +541,61 @@ pub trait Network<N: SocketNetwork> {
         let _ = socket;
         core::future::ready(Err(ENETDOWN))
     }
+
+    fn vsock_accept(
+        &self,
+        listener: u64,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<AcceptedVsockStream<N>, u64>> + Send + '_ {
+        let _ = (listener, timeout_nanos);
+        core::future::ready(Err(EOPNOTSUPP))
+    }
+
+    fn vsock_read(
+        &self,
+        stream: u64,
+        max_bytes: usize,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<Option<Bytes>, u64>> + Send + '_ {
+        let _ = (stream, max_bytes, timeout_nanos);
+        core::future::ready(Err(EOPNOTSUPP))
+    }
+
+    fn vsock_write(
+        &self,
+        stream: u64,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<usize, u64>> + Send + '_ {
+        let _ = (stream, bytes, timeout_nanos);
+        core::future::ready(Err(EOPNOTSUPP))
+    }
+
+    fn vsock_shutdown(
+        &self,
+        stream: u64,
+        read: bool,
+        write: bool,
+    ) -> impl Future<Output = Result<(), u64>> + Send + '_ {
+        let _ = (stream, read, write);
+        core::future::ready(Err(EOPNOTSUPP))
+    }
+
+    fn vsock_listener_readiness(
+        &self,
+        listener: u64,
+    ) -> impl Future<Output = Result<SocketReady, u64>> + Send + '_ {
+        let _ = listener;
+        core::future::ready(Err(EOPNOTSUPP))
+    }
+
+    fn vsock_stream_readiness(
+        &self,
+        stream: u64,
+    ) -> impl Future<Output = Result<SocketReady, u64>> + Send + '_ {
+        let _ = stream;
+        core::future::ready(Err(EOPNOTSUPP))
+    }
 }
 
 fn get_socket<R: Resources>(
@@ -632,6 +700,25 @@ fn write_sockaddr_bytes<M: UserMemory>(
         .write(addrlen_ptr, &(encoded.len() as u32).to_le_bytes())
         .map_err(|_| EFAULT)?;
     Ok(())
+}
+
+fn encode_sockaddr_vm(cid: u32, port: u32, out: &mut [u8; SOCKADDR_VM_LEN]) {
+    out.fill(0);
+    out[0..2].copy_from_slice(&AF_VSOCK.to_ne_bytes());
+    out[4..8].copy_from_slice(&port.to_ne_bytes());
+    out[8..12].copy_from_slice(&cid.to_ne_bytes());
+}
+
+fn write_sockaddr_vm<M: UserMemory>(
+    memory: &mut M,
+    addr_ptr: u64,
+    addrlen_ptr: u64,
+    cid: u32,
+    port: u32,
+) -> Result<(), u64> {
+    let mut buf = [0u8; SOCKADDR_VM_LEN];
+    encode_sockaddr_vm(cid, port, &mut buf);
+    write_sockaddr_bytes(memory, addr_ptr, addrlen_ptr, &buf)
 }
 
 fn write_sockaddr<M: UserMemory>(
@@ -1078,6 +1165,50 @@ pub(crate) async fn accept<R: Resources, M: UserMemory, Net: Network<R::Network>
         Ok(sock) => sock,
         Err(err) => return errno(err),
     };
+    if let Some(vsock) = sock.vsock_state() {
+        let VsockSocket::Listening {
+            listener, options, ..
+        } = vsock
+        else {
+            return errno(EINVAL);
+        };
+        let nonblocking = sock.is_nonblocking();
+        let timeout = effective_timeout(options.time(SocketTime::AcceptTimeout), nonblocking);
+        let accepted = match net.vsock_accept(listener.id(), timeout).await {
+            Ok(accepted) => accepted,
+            Err(ETIMEDOUT) => return errno(EAGAIN),
+            Err(err) => return errno(err),
+        };
+        if let Err(err) = write_sockaddr_vm(
+            memory,
+            addr_ptr,
+            addrlen_ptr,
+            accepted.peer_cid,
+            accepted.peer_port,
+        ) {
+            return errno(err);
+        }
+        let accepted = Socket::<R::Network>::from_vsock(VsockSocket::Connected {
+            stream: accepted.stream,
+            local_cid: accepted.local_cid,
+            local_port: accepted.local_port,
+            peer_cid: accepted.peer_cid,
+            peer_port: accepted.peer_port,
+            options,
+        });
+        if flags & SOCK_NONBLOCK != 0 {
+            accepted.set_nonblocking(true);
+        }
+        let cloexec = flags & SOCK_CLOEXEC != 0;
+        let entry = Entry::<R>::new(Descriptor::<R>::Socket(accepted), cloexec);
+        if flags & SOCK_NONBLOCK != 0 {
+            entry.set_fdflags(helios_unix::FDFLAG_NONBLOCK);
+        }
+        return match descriptors.lock().insert_entry(entry) {
+            Ok(new_fd) => u64::from(new_fd),
+            Err(err) => descriptor_errno(err),
+        };
+    }
     let Some(tcp) = sock.tcp_state() else {
         return errno(EOPNOTSUPP);
     };
@@ -1358,6 +1489,24 @@ pub(crate) async fn getsockname<R: Resources, M: UserMemory, Net: Network<R::Net
             Err(err) => errno(err),
         };
     }
+    if let Some(vsock) = sock.vsock_state() {
+        let (cid, port) = match vsock {
+            VsockSocket::Listening {
+                local_cid,
+                local_port,
+                ..
+            }
+            | VsockSocket::Connected {
+                local_cid,
+                local_port,
+                ..
+            } => (local_cid, local_port),
+        };
+        return match write_sockaddr_vm(memory, addr_ptr, addrlen_ptr, cid, port) {
+            Ok(()) => 0,
+            Err(err) => errno(err),
+        };
+    }
     let addr = if let Some(tcp) = sock.tcp_state() {
         match tcp {
             TcpSocket::Unconnected { family, .. } => SocketAddr {
@@ -1430,6 +1579,19 @@ pub(crate) async fn getpeername<R: Resources, M: UserMemory, Net: Network<R::Net
         return match write_sockaddr_bytes(memory, addr_ptr, addrlen_ptr, &AF_UNIX.to_le_bytes()) {
             Ok(()) => 0,
             Err(err) => errno(err),
+        };
+    }
+    if let Some(vsock) = sock.vsock_state() {
+        return match vsock {
+            VsockSocket::Connected {
+                peer_cid,
+                peer_port,
+                ..
+            } => match write_sockaddr_vm(memory, addr_ptr, addrlen_ptr, peer_cid, peer_port) {
+                Ok(()) => 0,
+                Err(err) => errno(err),
+            },
+            VsockSocket::Listening { .. } => errno(ENOTCONN),
         };
     }
     let _ = poll_connecting(&sock, net).await;
@@ -1556,6 +1718,24 @@ pub(crate) async fn socket_send<N: SocketNetwork, Net: Network<N>>(
         };
         let timeout = effective_timeout(options.time(SocketTime::SendTimeout), nonblocking);
         return match net.tcp_write(stream.id(), Bytes::from(data), timeout).await {
+            Ok(written) => Ok(written),
+            Err(ETIMEDOUT) => Err(EAGAIN),
+            Err(err) => Err(err),
+        };
+    }
+
+    if let Some(vsock) = sock.vsock_state() {
+        let VsockSocket::Connected {
+            stream, options, ..
+        } = vsock
+        else {
+            return Err(EPIPE);
+        };
+        let timeout = effective_timeout(options.time(SocketTime::SendTimeout), nonblocking);
+        return match net
+            .vsock_write(stream.id(), Bytes::from(data), timeout)
+            .await
+        {
             Ok(written) => Ok(written),
             Err(ETIMEDOUT) => Err(EAGAIN),
             Err(err) => Err(err),
@@ -1784,6 +1964,66 @@ async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
             }
             let req = u32::try_from(need).unwrap_or(u32::MAX);
             match net.tcp_read(stream.id(), req, timeout, peek).await {
+                Ok(Some(chunk)) if !chunk.is_empty() => {
+                    received.extend_from_slice(&chunk);
+                    if !waitall {
+                        break;
+                    }
+                }
+                Ok(_) => break,
+                Err(ETIMEDOUT) => {
+                    if received.is_empty() {
+                        return Err(EAGAIN);
+                    }
+                    break;
+                }
+                Err(err) => {
+                    if received.is_empty() {
+                        return Err(err);
+                    }
+                    break;
+                }
+            }
+        }
+        let len = received.len();
+        return Ok(RecvResult {
+            data: Bytes::from(received),
+            peer: None,
+            full_len: len,
+            truncated: false,
+        });
+    }
+
+    if let Some(vsock) = sock.vsock_state() {
+        let VsockSocket::Connected {
+            stream, options, ..
+        } = vsock
+        else {
+            return Err(ENOTCONN);
+        };
+        if peek {
+            return Err(EOPNOTSUPP);
+        }
+        if max_len == 0 {
+            return Ok(RecvResult {
+                data: Bytes::new(),
+                peer: None,
+                full_len: 0,
+                truncated: false,
+            });
+        }
+        let timeout = effective_timeout_bounded(
+            options.time(SocketTime::ReceiveTimeout),
+            nonblocking,
+            timeout_bound,
+        );
+        let mut received = Vec::new();
+        loop {
+            let need = max_len.saturating_sub(received.len());
+            if need == 0 {
+                break;
+            }
+            match net.vsock_read(stream.id(), need, timeout).await {
                 Ok(Some(chunk)) if !chunk.is_empty() => {
                     received.extend_from_slice(&chunk);
                     if !waitall {
@@ -2359,6 +2599,22 @@ pub(crate) async fn shutdown<R: Resources, Net: Network<R::Network>>(
             if let Err(err) = net.tcp_shutdown_send(stream.id()).await {
                 return errno(err);
             }
+        }
+        return 0;
+    }
+
+    if let Some(vsock) = sock.vsock_state() {
+        let VsockSocket::Connected { stream, .. } = vsock else {
+            return errno(ENOTCONN);
+        };
+        if shut_rd {
+            sock.mark_shutdown_read();
+        }
+        if shut_wr {
+            sock.mark_shutdown_write();
+        }
+        if let Err(err) = net.vsock_shutdown(stream.id(), shut_rd, shut_wr).await {
+            return errno(err);
         }
         return 0;
     }
@@ -3013,6 +3269,8 @@ pub(crate) async fn getsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
                 i32::from(AF_NETLINK)
             } else if sock.is_packet() {
                 i32::from(AF_PACKET)
+            } else if sock.is_vsock() {
+                i32::from(AF_VSOCK)
             } else {
                 match sock.family() {
                     Some(SocketFamily::Ipv4) => i32::from(AF_INET),
@@ -3026,10 +3284,10 @@ pub(crate) async fn getsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
             }
         }
         (SOL_SOCKET, SO_ACCEPTCONN) => {
-            let listening: i32 = i32::from(matches!(
-                sock.tcp_state(),
-                Some(TcpSocket::Listening { .. })
-            ));
+            let listening: i32 = i32::from(
+                matches!(sock.tcp_state(), Some(TcpSocket::Listening { .. }))
+                    || matches!(sock.vsock_state(), Some(VsockSocket::Listening { .. })),
+            );
             match write_opt_bytes(memory, optval, optlen_ptr, &listening.to_le_bytes()) {
                 Ok(()) => 0,
                 Err(e) => errno(e),
@@ -3209,6 +3467,40 @@ pub(crate) async fn socket_epoll_ready<N: SocketNetwork, Net: Network<N>>(
                 Err(_) => EPOLLERR,
             },
             UdpSocket::Unbound { .. } => EPOLLOUT,
+        };
+        return ready & (interest | EPOLLERR | EPOLLHUP);
+    }
+
+    if let Some(vsock) = sock.vsock_state() {
+        let ready = match vsock {
+            VsockSocket::Connected { stream, .. } => {
+                match net.vsock_stream_readiness(stream.id()).await {
+                    Ok(state) => {
+                        let mut mask = 0;
+                        if state.readable || sock.is_shutdown_read() {
+                            mask |= EPOLLIN;
+                        }
+                        if state.writable && !sock.is_shutdown_write() {
+                            mask |= EPOLLOUT;
+                        }
+                        if state.hangup {
+                            mask |= EPOLLIN | EPOLLRDHUP;
+                            if sock.is_shutdown_write() || !state.writable {
+                                mask |= EPOLLHUP;
+                            }
+                        }
+                        mask
+                    }
+                    Err(_) => EPOLLERR | EPOLLHUP,
+                }
+            }
+            VsockSocket::Listening { listener, .. } => {
+                match net.vsock_listener_readiness(listener.id()).await {
+                    Ok(state) if state.readable => EPOLLIN,
+                    Ok(_) => 0,
+                    Err(_) => EPOLLERR,
+                }
+            }
         };
         return ready & (interest | EPOLLERR | EPOLLHUP);
     }

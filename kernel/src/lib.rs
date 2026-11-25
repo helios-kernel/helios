@@ -93,17 +93,18 @@ pub use component::{
     ComponentRawRwLockReadGuard, ComponentRawRwLockWriteGuard, ComponentResourceTableError,
     ComponentRunResult, ComponentRuntimeEngine, ComponentRuntimeFactory, ComponentRuntimeState,
     ComponentSamplingSession, ComponentSerialPort, ComponentSnapshotHold, ComponentStoreData,
-    ComponentTcpBackend, ComponentTcpStream, ComponentUdpBackend, ComponentUdpSocket,
-    ComponentWorld, FIBER_STACK_COMMIT_STEP, FIBER_STACK_ENTRY_RESERVE, FIBER_STACK_HOST_RESERVE,
-    InstanceKilled, LocalOutputSink, PerProcessorProvider, ProviderAlreadyInstalled, ProviderError,
-    ProviderReceiver, ProviderSender, ProviderSlot, RawMutexGuardResource, RawMutexResource,
-    RawRwLockReadGuardResource, RawRwLockResource, RawRwLockWriteGuardResource,
-    RetiredNetworkHandle, SerialPortResource, SnapshotRetirementSender, SocketRetirementQueue,
-    SocketRetirementSender, StoreSocketRetirement, TcpStreamResource, UdpSocketResource,
-    directory_prefix, map_resource_table_error, parent_path, path_is_within_directory,
-    provider_channel, resolve_absolute_path, resolve_child_path, resolve_guest_path,
-    retire_queued_handles, store_kernel_heap_bytes, strip_directory_prefix,
-    wait_until_runtime_deadline,
+    ComponentTcpBackend, ComponentTcpListener, ComponentTcpStream, ComponentUdpBackend,
+    ComponentUdpSocket, ComponentWorld, DefaultLinuxCredentials, DefaultLinuxImage,
+    FIBER_STACK_COMMIT_STEP, FIBER_STACK_ENTRY_RESERVE, FIBER_STACK_HOST_RESERVE, InheritedSocket,
+    InheritedSockets, InstanceKilled, LocalOutputSink, PerProcessorProvider,
+    ProviderAlreadyInstalled, ProviderError, ProviderReceiver, ProviderSender, ProviderSlot,
+    RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource, RawRwLockResource,
+    RawRwLockWriteGuardResource, RetiredNetworkHandle, SerialPortResource,
+    SnapshotRetirementSender, SocketRetirementQueue, SocketRetirementSender, StoreFilesystem,
+    StoreSocketRetirement, TcpStreamResource, UdpSocketResource, directory_prefix,
+    map_resource_table_error, parent_path, path_is_within_directory, provider_channel,
+    resolve_absolute_path, resolve_child_path, resolve_guest_path, retire_queued_handles,
+    store_kernel_heap_bytes, strip_directory_prefix, wait_until_runtime_deadline,
 };
 pub use device::{
     DEFAULT_DMA_BUDGET_BYTES, DeviceGrant, DeviceGrantRegistry, DeviceInterruptHooks,
@@ -201,8 +202,8 @@ pub use limine_tpm_event_log::LimineTpmEventLogRequest;
 #[cfg(feature = "linux")]
 pub use linux_container::{
     ContainerConfig, ContainerError, ContainerFilesystem, ContainerId, ContainerMount,
-    ContainerMountSnapshot, ContainerMountSpec, ContainerNodeInfo, ContainerProcessGuard,
-    ContainerResolved, LinuxContainer, LinuxContainerSnapshot,
+    ContainerMountSharing, ContainerMountSnapshot, ContainerMountSpec, ContainerNodeInfo,
+    ContainerProcessGuard, ContainerResolved, LinuxContainer, LinuxContainerSnapshot,
 };
 pub use machine::{
     AdvanceCause, DeviceResets, GENERATION_PROBE_INTERVAL, Generation, MachineGeneration,
@@ -310,9 +311,10 @@ pub use vfs::{
     MemoryFs, MemoryStorageBudget, MemoryStorageSetting, MemoryUnixMetadata, MemoryWrite,
     MountError, MountFlags, MountGrant, MountHold, MountRequest, MountRequestError, MountSharing,
     MountSource, MountTable, MountedFs, MountedOpenHandle, MountedWrite, Namespace, NoDisks,
-    PrivateMountClaim, PrivateMountClaimError, ROOT_GRANT, ROOT_LAYER_DEVICE, ReaderError,
-    Resolved, RootFs, RootWrite, SharedOwner, Storage, UnixAttributes, XattrSetMode,
-    object_identity, request_mount, request_unmount, symlink_target, within_directory,
+    OverlayFs, OverlayLower, PinnedLower, PrivateMountClaim, PrivateMountClaimError, ROOT_GRANT,
+    ROOT_LAYER_DEVICE, ReaderError, Resolved, RootFs, RootWrite, SharedOwner, Storage,
+    UnixAttributes, XattrSetMode, object_identity, request_mount, request_unmount, symlink_target,
+    within_directory,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,

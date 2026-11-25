@@ -63,7 +63,7 @@ pub use node::{FsDescriptor, FsDescriptorFlags};
 pub use request::{
     AttachedStorage, MountRequest, MountRequestError, MountSource, request_mount, request_unmount,
 };
-pub use root::{RootFs, RootWrite};
+pub use root::{OverlayLower, RootFs, RootWrite};
 pub use storage::{NoDisks, Storage};
 pub use unix::{
     MountFlags, MountGrant, MountSharing, SharedOwner, UnixAttributes, UnixFsError,
@@ -638,10 +638,333 @@ pub(crate) async fn write_bytes<F: FileSystem<Payer = crate::StoragePayer>>(
     Ok(landed.offset)
 }
 
+/// Non-recursive lower filesystem backing an [`OverlayFs`].
+///
+/// Covers every mountable filesystem kind except [`MountedFs::Overlay`] so
+/// async futures over `OverlayFs<S>` resolve statically with zero `dyn`
+/// dispatch and zero recursive future types.
+enum LowerFs<S: Storage> {
+    Root(RootFs),
+    Boot(BootFs),
+    Memory(MemoryFs),
+    Host(HostShare<S::HostShare>),
+    Erofs(ErofsFs<S::Disk>),
+    Btrfs(BtrfsFs<S::Disk>),
+}
+
+impl<S: Storage> Clone for LowerFs<S> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Root(fs) => Self::Root(fs.clone()),
+            Self::Boot(fs) => Self::Boot(fs.clone()),
+            Self::Memory(fs) => Self::Memory(fs.clone()),
+            Self::Host(fs) => Self::Host(fs.clone()),
+            Self::Erofs(fs) => Self::Erofs(fs.clone()),
+            Self::Btrfs(fs) => Self::Btrfs(fs.clone()),
+        }
+    }
+}
+
+/// Lock-free pinned read-only lower directory backing an ephemeral container
+/// [`OverlayFs`].
+///
+/// Retains the backing mount's [`MountHold`] so the lower filesystem cannot be
+/// unmounted while any overlay references it, while taking no exclusive
+/// private claim so arbitrarily many containers may share the same lower tree
+/// concurrently with zero disk writes on creation or teardown.
+pub struct PinnedLower<S: Storage> {
+    fs: LowerFs<S>,
+    prefix: OwnedFsPath,
+    /// Held for its drop effect: keeps the backing lower mount busy against unmount.
+    hold: Option<MountHold>,
+}
+
+impl<S: Storage> Clone for PinnedLower<S> {
+    fn clone(&self) -> Self {
+        Self {
+            fs: self.fs.clone(),
+            prefix: self.prefix.clone(),
+            hold: self.hold.clone(),
+        }
+    }
+}
+
+impl<S: Storage> PinnedLower<S> {
+    /// Pins `held` as the read-only lower directory of an [`OverlayFs`].
+    pub fn from_held(held: HeldPath<S>) -> FsResult<Self> {
+        let resolved = held.resolved();
+        let fs = match resolved.fs() {
+            MountedFs::Root(fs) => LowerFs::Root(fs.clone()),
+            MountedFs::Boot(fs) => LowerFs::Boot(fs.clone()),
+            MountedFs::Memory(fs) => LowerFs::Memory(fs.clone()),
+            MountedFs::Host(fs) => LowerFs::Host(fs.clone()),
+            MountedFs::Erofs(fs) => LowerFs::Erofs(fs.clone()),
+            MountedFs::Btrfs(fs) => LowerFs::Btrfs(fs.clone()),
+            MountedFs::Overlay(_) => return Err(FsError::Unsupported),
+        };
+        Ok(Self {
+            fs,
+            prefix: OwnedFsPath::from(resolved.path()),
+            hold: resolved.hold(),
+        })
+    }
+
+    fn resolve_inner(&self, path: FsPath<'_>) -> FsResult<OwnedFsPath> {
+        if path.is_root() {
+            return Ok(self.prefix.clone());
+        }
+        let joined = join_fs_path(self.prefix.as_path(), path.as_str());
+        let fs_path = FsPath::new(&joined).ok_or(FsError::Invalid)?;
+        Ok(OwnedFsPath::from(fs_path))
+    }
+}
+
+impl<S: Storage> OverlayLower for PinnedLower<S> {
+    async fn lower_stat<'a>(&'a self, path: FsPath<'a>) -> FsResult<Metadata> {
+        let inner = self.resolve_inner(path)?;
+        alloc::boxed::Box::pin(async move {
+            let p = inner.as_path();
+            match &self.fs {
+                LowerFs::Root(fs) => fs.stat(p).await,
+                LowerFs::Boot(fs) => fs.stat(p).await,
+                LowerFs::Memory(fs) => fs.stat(p).await,
+                LowerFs::Host(fs) => fs.stat(p).await,
+                LowerFs::Erofs(fs) => fs.stat(p).await,
+                LowerFs::Btrfs(fs) => fs.stat(p).await,
+            }
+        })
+        .await
+    }
+
+    async fn lower_open<'a>(
+        &'a self,
+        path: FsPath<'a>,
+        flags: OpenFlags,
+        now: u64,
+        payer: &'a crate::StoragePayer,
+    ) -> FsResult<Opened<OwnedFsPath>> {
+        let inner = self.resolve_inner(path)?;
+        let handle = OwnedFsPath::from(path);
+        alloc::boxed::Box::pin(async move {
+            let p = inner.as_path();
+            let metadata = match &self.fs {
+                LowerFs::Root(fs) => fs.open(p, flags, now, payer).await?.metadata,
+                LowerFs::Boot(fs) => fs.open(p, flags, now, payer).await?.metadata,
+                LowerFs::Memory(fs) => fs.open(p, flags, now, payer).await?.metadata,
+                LowerFs::Host(fs) => fs.open(p, flags, now, payer).await?.metadata,
+                LowerFs::Erofs(fs) => fs.open(p, flags, now, payer).await?.metadata,
+                LowerFs::Btrfs(fs) => fs.open(p, flags, now, payer).await?.metadata,
+            };
+            Ok(Opened { metadata, handle })
+        })
+        .await
+    }
+
+    async fn lower_read_at<'a>(
+        &'a self,
+        path: FsPath<'a>,
+        offset: u64,
+        max_bytes: usize,
+    ) -> FsResult<Bytes> {
+        let inner = self.resolve_inner(path)?;
+        alloc::boxed::Box::pin(async move {
+            let p = inner.as_path();
+            match &self.fs {
+                LowerFs::Root(fs) => fs.read_at(p, offset, max_bytes).await,
+                LowerFs::Boot(fs) => fs.read_at(p, offset, max_bytes).await,
+                LowerFs::Memory(fs) => fs.read_at(p, offset, max_bytes).await,
+                LowerFs::Host(fs) => fs.read_at(p, offset, max_bytes).await,
+                LowerFs::Erofs(fs) => fs.read_at(p, offset, max_bytes).await,
+                LowerFs::Btrfs(fs) => fs.read_at(p, offset, max_bytes).await,
+            }
+        })
+        .await
+    }
+
+    async fn lower_read_link<'a>(&'a self, path: FsPath<'a>) -> FsResult<String> {
+        let inner = self.resolve_inner(path)?;
+        alloc::boxed::Box::pin(async move {
+            let p = inner.as_path();
+            match &self.fs {
+                LowerFs::Root(fs) => fs.read_link(p).await,
+                LowerFs::Boot(fs) => fs.read_link(p).await,
+                LowerFs::Memory(fs) => fs.read_link(p).await,
+                LowerFs::Host(fs) => fs.read_link(p).await,
+                LowerFs::Erofs(fs) => fs.read_link(p).await,
+                LowerFs::Btrfs(fs) => fs.read_link(p).await,
+            }
+        })
+        .await
+    }
+
+    async fn lower_read_dir_batch<'a>(
+        &'a self,
+        path: FsPath<'a>,
+        cookie: DirCookie,
+        max_entries: usize,
+    ) -> FsResult<Vec<DirEntry>> {
+        let inner = self.resolve_inner(path)?;
+        alloc::boxed::Box::pin(async move {
+            let p = inner.as_path();
+            match &self.fs {
+                LowerFs::Root(fs) => fs.open_dir(p).await?.read(cookie, max_entries).await,
+                LowerFs::Boot(fs) => fs.open_dir(p).await?.read(cookie, max_entries).await,
+                LowerFs::Memory(fs) => fs.open_dir(p).await?.read(cookie, max_entries).await,
+                LowerFs::Host(fs) => fs.open_dir(p).await?.read(cookie, max_entries).await,
+                LowerFs::Erofs(fs) => fs.open_dir(p).await?.read(cookie, max_entries).await,
+                LowerFs::Btrfs(fs) => fs.open_dir(p).await?.read(cookie, max_entries).await,
+            }
+        })
+        .await
+    }
+
+    async fn lower_read_whole<'a>(&'a self, path: FsPath<'a>) -> FsResult<FileContents> {
+        let inner = self.resolve_inner(path)?;
+        alloc::boxed::Box::pin(async move {
+            let p = inner.as_path();
+            match &self.fs {
+                LowerFs::Root(fs) => fs.read_whole(p).await,
+                LowerFs::Boot(fs) => fs.file_contents(p).map(FileContents::Boot),
+                LowerFs::Memory(fs) => read_all(fs, p).await.map(FileContents::Written),
+                LowerFs::Host(fs) => read_all(fs, p).await.map(FileContents::Written),
+                LowerFs::Erofs(fs) => read_all(fs, p).await.map(FileContents::Written),
+                LowerFs::Btrfs(fs) => read_all(fs, p).await.map(FileContents::Written),
+            }
+        })
+        .await
+    }
+
+    fn lower_boot_file_contents(&self, path: FsPath<'_>) -> Option<BootfsBytes> {
+        let inner = self.resolve_inner(path).ok()?;
+        match &self.fs {
+            LowerFs::Boot(fs) => fs.file_contents(inner.as_path()).ok(),
+            _ => None,
+        }
+    }
+
+    async fn lower_unix_node_metadata<'a>(
+        &'a self,
+        path: FsPath<'a>,
+    ) -> Result<UnixNodeMetadata, UnixFsError> {
+        let inner = self.resolve_inner(path)?;
+        alloc::boxed::Box::pin(async move {
+            let p = inner.as_path();
+            match &self.fs {
+                LowerFs::Btrfs(fs) => fs.unix_metadata(p).await,
+                LowerFs::Memory(fs) => fs.unix_node_metadata(p),
+                LowerFs::Root(fs) => fs.unix_node_metadata(p).await,
+                LowerFs::Erofs(fs) => {
+                    let md = fs.stat(p).await?;
+                    let attributes = fs.unix_attributes(p).await?;
+                    Ok(UnixNodeMetadata {
+                        kind: md.kind,
+                        attributes,
+                        rdev: 0,
+                    })
+                }
+                LowerFs::Host(fs) => {
+                    let md = fs.stat(p).await?;
+                    let attributes = fs.unix_attributes(p).await?;
+                    Ok(UnixNodeMetadata {
+                        kind: md.kind,
+                        attributes,
+                        rdev: 0,
+                    })
+                }
+                LowerFs::Boot(fs) => {
+                    let md = fs.stat(p).await?;
+                    Ok(UnixNodeMetadata {
+                        kind: md.kind,
+                        attributes: root::BOOT_UNIX.inherited(md.kind),
+                        rdev: 0,
+                    })
+                }
+            }
+        })
+        .await
+    }
+
+    async fn lower_xattr<'a>(
+        &'a self,
+        path: FsPath<'a>,
+        name: &'a str,
+    ) -> Result<Option<Bytes>, UnixFsError> {
+        let inner = self.resolve_inner(path)?;
+        alloc::boxed::Box::pin(async move {
+            let p = inner.as_path();
+            match &self.fs {
+                LowerFs::Btrfs(fs) => fs.xattr(p, name).await,
+                LowerFs::Memory(fs) => Ok(fs.xattr(p, name)?),
+                LowerFs::Root(fs) => fs.xattr(p, name).await,
+                LowerFs::Boot(_) | LowerFs::Host(_) | LowerFs::Erofs(_) => {
+                    Err(FsError::Unsupported.into())
+                }
+            }
+        })
+        .await
+    }
+
+    async fn lower_list_xattrs<'a>(&'a self, path: FsPath<'a>) -> Result<Vec<String>, UnixFsError> {
+        let inner = self.resolve_inner(path)?;
+        alloc::boxed::Box::pin(async move {
+            let p = inner.as_path();
+            match &self.fs {
+                LowerFs::Btrfs(fs) => fs.list_xattrs(p).await,
+                LowerFs::Memory(fs) => Ok(fs.list_xattrs(p)?),
+                LowerFs::Root(fs) => fs.list_xattrs(p).await,
+                LowerFs::Boot(_) | LowerFs::Host(_) | LowerFs::Erofs(_) => {
+                    Err(FsError::Unsupported.into())
+                }
+            }
+        })
+        .await
+    }
+
+    async fn lower_sync<'a>(&'a self, path: FsPath<'a>) -> FsResult<()> {
+        let inner = self.resolve_inner(path)?;
+        alloc::boxed::Box::pin(async move {
+            let p = inner.as_path();
+            match &self.fs {
+                LowerFs::Root(fs) => fs.sync(p).await,
+                LowerFs::Boot(fs) => fs.sync(p).await,
+                LowerFs::Memory(fs) => fs.sync(p).await,
+                LowerFs::Host(fs) => fs.sync(p).await,
+                LowerFs::Erofs(fs) => fs.sync(p).await,
+                LowerFs::Btrfs(fs) => fs.sync(p).await,
+            }
+        })
+        .await
+    }
+
+    async fn lower_sync_data<'a>(&'a self, path: FsPath<'a>) -> FsResult<()> {
+        let inner = self.resolve_inner(path)?;
+        alloc::boxed::Box::pin(async move {
+            let p = inner.as_path();
+            match &self.fs {
+                LowerFs::Root(fs) => fs.sync_data(p).await,
+                LowerFs::Boot(fs) => fs.sync_data(p).await,
+                LowerFs::Memory(fs) => fs.sync_data(p).await,
+                LowerFs::Host(fs) => fs.sync_data(p).await,
+                LowerFs::Erofs(fs) => fs.sync_data(p).await,
+                LowerFs::Btrfs(fs) => fs.sync_data(p).await,
+            }
+        })
+        .await
+    }
+}
+
+/// An ephemeral container overlay: a private `UserMemoryPool`-backed
+/// [`MemoryFs`] upper tree over a lock-free pinned read-only lower directory
+/// ([`PinnedLower`]).
+pub type OverlayFs<S> = RootFs<PinnedLower<S>>;
+
 mount_kinds! {
     /// A namespace's root: its own tree over the boot image. Only the
     /// table's root is of this kind; [`MountTable::mount`] refuses it.
     Root(RootFs => OwnedFsPath),
+    /// An ephemeral container root overlay over a pinned read-only lower tree.
+    /// Lives exclusively inside a container's mount table; [`MountTable::mount`] refuses it.
+    Overlay(OverlayFs<S> => OwnedFsPath),
     /// The boot image on its own, read-only.
     Boot(BootFs => OwnedFsPath),
     /// A tree in kernel memory, shared by every namespace that sees it.
@@ -659,6 +982,7 @@ impl<S: Storage> MountedFs<S> {
     pub const fn kind_name(&self) -> &'static str {
         match self {
             Self::Root(_) => "root",
+            Self::Overlay(_) => "overlay",
             Self::Boot(_) => "boot",
             Self::Memory(_) => "memory",
             Self::Host(_) => "host",
@@ -672,6 +996,7 @@ impl<S: Storage> MountedFs<S> {
     pub fn overlay_pages(&self) -> u64 {
         match self {
             Self::Root(fs) => fs.upper().telemetry().overlay_pages,
+            Self::Overlay(fs) => fs.upper().telemetry().overlay_pages,
             Self::Memory(fs) => fs.telemetry().overlay_pages,
             Self::Boot(_) | Self::Host(_) | Self::Erofs(_) | Self::Btrfs(_) => 0,
         }
@@ -681,9 +1006,35 @@ impl<S: Storage> MountedFs<S> {
         match self {
             Self::Btrfs(fs) => fs.unix_metadata(path).await,
             Self::Memory(fs) => fs.unix_node_metadata(path),
-            Self::Root(fs) => fs.unix_node_metadata(path),
-            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => {
-                let md = self.stat(path).await?;
+            Self::Root(fs) => fs.unix_node_metadata(path).await,
+            Self::Overlay(fs) => alloc::boxed::Box::pin(fs.unix_node_metadata(path)).await,
+            Self::Erofs(fs) => {
+                let md = fs.stat(path).await?;
+                let attributes = fs.unix_attributes(path).await?;
+                Ok(UnixNodeMetadata {
+                    kind: md.kind,
+                    attributes,
+                    rdev: 0,
+                })
+            }
+            Self::Boot(fs) => {
+                let md = fs.stat(path).await?;
+                Ok(UnixNodeMetadata {
+                    kind: md.kind,
+                    attributes: UnixAttributes {
+                        permissions: if md.kind == NodeKind::Directory {
+                            0o755
+                        } else {
+                            0o644
+                        },
+                        uid: 0,
+                        gid: 0,
+                    },
+                    rdev: 0,
+                })
+            }
+            Self::Host(fs) => {
+                let md = fs.stat(path).await?;
                 Ok(UnixNodeMetadata {
                     kind: md.kind,
                     attributes: UnixAttributes {
@@ -708,7 +1059,12 @@ impl<S: Storage> MountedFs<S> {
         match (self, handle) {
             (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => fs.unix_metadata_handle(h).await,
             (Self::Memory(fs), MountedOpenHandle::Memory(p)) => fs.unix_node_metadata(p.as_path()),
-            (Self::Root(fs), MountedOpenHandle::Root(p)) => fs.unix_node_metadata(p.as_path()),
+            (Self::Root(fs), MountedOpenHandle::Root(p)) => {
+                fs.unix_node_metadata(p.as_path()).await
+            }
+            (Self::Overlay(fs), MountedOpenHandle::Overlay(p)) => {
+                alloc::boxed::Box::pin(fs.unix_node_metadata(p.as_path())).await
+            }
             (Self::Boot(fs), MountedOpenHandle::Boot(p)) => {
                 let md = fs.stat(p.as_path()).await?;
                 Ok(UnixNodeMetadata {
@@ -743,17 +1099,10 @@ impl<S: Storage> MountedFs<S> {
             }
             (Self::Erofs(fs), MountedOpenHandle::Erofs(p)) => {
                 let md = fs.stat(p.as_path()).await?;
+                let attributes = fs.unix_attributes(p.as_path()).await?;
                 Ok(UnixNodeMetadata {
                     kind: md.kind,
-                    attributes: UnixAttributes {
-                        permissions: if md.kind == NodeKind::Directory {
-                            0o755
-                        } else {
-                            0o644
-                        },
-                        uid: 0,
-                        gid: 0,
-                    },
+                    attributes,
                     rdev: 0,
                 })
             }
@@ -785,13 +1134,42 @@ impl<S: Storage> MountedFs<S> {
                 }),
             Self::Root(fs) => fs
                 .open_unix(path, flags, attributes, now, payer)
+                .await
                 .map(|o| Opened {
                     metadata: o.metadata,
                     handle: MountedOpenHandle::Root(o.handle),
                 }),
-            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => self
+            Self::Overlay(fs) => {
+                alloc::boxed::Box::pin(fs.open_unix(path, flags, attributes, now, payer))
+                    .await
+                    .map(|o| Opened {
+                        metadata: o.metadata,
+                        handle: MountedOpenHandle::Overlay(o.handle),
+                    })
+            }
+            Self::Boot(fs) => fs
                 .open(path, flags, now, payer)
                 .await
+                .map(|o| Opened {
+                    metadata: o.metadata,
+                    handle: MountedOpenHandle::Boot(o.handle),
+                })
+                .map_err(UnixFsError::Fs),
+            Self::Host(fs) => fs
+                .open(path, flags, now, payer)
+                .await
+                .map(|o| Opened {
+                    metadata: o.metadata,
+                    handle: MountedOpenHandle::Host(o.handle),
+                })
+                .map_err(UnixFsError::Fs),
+            Self::Erofs(fs) => fs
+                .open(path, flags, now, payer)
+                .await
+                .map(|o| Opened {
+                    metadata: o.metadata,
+                    handle: MountedOpenHandle::Erofs(o.handle),
+                })
                 .map_err(UnixFsError::Fs),
         }
     }
@@ -806,8 +1184,19 @@ impl<S: Storage> MountedFs<S> {
         match self {
             Self::Btrfs(fs) => fs.create_directory_unix(path, attributes, now).await,
             Self::Memory(fs) => fs.create_directory_unix(path, attributes, now),
-            Self::Root(fs) => fs.create_directory_unix(path, attributes, now),
-            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => self
+            Self::Root(fs) => fs.create_directory_unix(path, attributes, now).await,
+            Self::Overlay(fs) => {
+                alloc::boxed::Box::pin(fs.create_directory_unix(path, attributes, now)).await
+            }
+            Self::Boot(fs) => fs
+                .create_directory(path, now, payer)
+                .await
+                .map_err(UnixFsError::Fs),
+            Self::Host(fs) => fs
+                .create_directory(path, now, payer)
+                .await
+                .map_err(UnixFsError::Fs),
+            Self::Erofs(fs) => fs
                 .create_directory(path, now, payer)
                 .await
                 .map_err(UnixFsError::Fs),
@@ -825,8 +1214,19 @@ impl<S: Storage> MountedFs<S> {
         match self {
             Self::Btrfs(fs) => fs.symlink_unix(target, path, attributes, now).await,
             Self::Memory(fs) => fs.symlink_unix(target, path, attributes, now),
-            Self::Root(fs) => fs.symlink_unix(target, path, attributes, now),
-            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => self
+            Self::Root(fs) => fs.symlink_unix(target, path, attributes, now).await,
+            Self::Overlay(fs) => {
+                alloc::boxed::Box::pin(fs.symlink_unix(target, path, attributes, now)).await
+            }
+            Self::Boot(fs) => fs
+                .symlink(target, path, now, payer)
+                .await
+                .map_err(UnixFsError::Fs),
+            Self::Host(fs) => fs
+                .symlink(target, path, now, payer)
+                .await
+                .map_err(UnixFsError::Fs),
+            Self::Erofs(fs) => fs
                 .symlink(target, path, now, payer)
                 .await
                 .map_err(UnixFsError::Fs),
@@ -843,7 +1243,10 @@ impl<S: Storage> MountedFs<S> {
         match self {
             Self::Btrfs(fs) => fs.create_special(path, special, attributes, now).await,
             Self::Memory(fs) => fs.create_special_unix(path, special, attributes, now),
-            Self::Root(fs) => fs.create_special_unix(path, special, attributes, now),
+            Self::Root(fs) => fs.create_special_unix(path, special, attributes, now).await,
+            Self::Overlay(fs) => {
+                alloc::boxed::Box::pin(fs.create_special_unix(path, special, attributes, now)).await
+            }
             Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
             Self::Host(_) => Err(FsError::Unsupported.into()),
         }
@@ -859,7 +1262,10 @@ impl<S: Storage> MountedFs<S> {
         match self {
             Self::Btrfs(fs) => fs.set_permissions(path, permissions, now).await,
             Self::Memory(fs) => Ok(fs.set_permissions(path, permissions, now)?),
-            Self::Root(fs) => fs.set_permissions(path, permissions, now, payer),
+            Self::Root(fs) => fs.set_permissions(path, permissions, now, payer).await,
+            Self::Overlay(fs) => {
+                alloc::boxed::Box::pin(fs.set_permissions(path, permissions, now, payer)).await
+            }
             Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
             Self::Host(_) => Err(FsError::Unsupported.into()),
         }
@@ -881,6 +1287,11 @@ impl<S: Storage> MountedFs<S> {
             }
             (Self::Root(fs), MountedOpenHandle::Root(p)) => {
                 fs.set_permissions(p.as_path(), permissions, now, payer)
+                    .await
+            }
+            (Self::Overlay(fs), MountedOpenHandle::Overlay(p)) => {
+                alloc::boxed::Box::pin(fs.set_permissions(p.as_path(), permissions, now, payer))
+                    .await
             }
             (Self::Boot(_), MountedOpenHandle::Boot(_))
             | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
@@ -900,7 +1311,10 @@ impl<S: Storage> MountedFs<S> {
         match self {
             Self::Btrfs(fs) => fs.set_owner(path, uid, gid, now).await,
             Self::Memory(fs) => Ok(fs.set_owner(path, uid, gid, now)?),
-            Self::Root(fs) => fs.set_owner(path, uid, gid, now, payer),
+            Self::Root(fs) => fs.set_owner(path, uid, gid, now, payer).await,
+            Self::Overlay(fs) => {
+                alloc::boxed::Box::pin(fs.set_owner(path, uid, gid, now, payer)).await
+            }
             Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
             Self::Host(_) => Err(FsError::Unsupported.into()),
         }
@@ -922,7 +1336,10 @@ impl<S: Storage> MountedFs<S> {
                 Ok(fs.set_owner(p.as_path(), uid, gid, now)?)
             }
             (Self::Root(fs), MountedOpenHandle::Root(p)) => {
-                fs.set_owner(p.as_path(), uid, gid, now, payer)
+                fs.set_owner(p.as_path(), uid, gid, now, payer).await
+            }
+            (Self::Overlay(fs), MountedOpenHandle::Overlay(p)) => {
+                alloc::boxed::Box::pin(fs.set_owner(p.as_path(), uid, gid, now, payer)).await
             }
             (Self::Boot(_), MountedOpenHandle::Boot(_))
             | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
@@ -935,7 +1352,8 @@ impl<S: Storage> MountedFs<S> {
         match self {
             Self::Btrfs(fs) => fs.xattr(path, name).await,
             Self::Memory(fs) => Ok(fs.xattr(path, name)?),
-            Self::Root(fs) => fs.xattr(path, name),
+            Self::Root(fs) => fs.xattr(path, name).await,
+            Self::Overlay(fs) => alloc::boxed::Box::pin(fs.xattr(path, name)).await,
             Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => Err(FsError::Unsupported.into()),
         }
     }
@@ -948,7 +1366,10 @@ impl<S: Storage> MountedFs<S> {
         match (self, handle) {
             (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => fs.xattr_handle(h, name).await,
             (Self::Memory(fs), MountedOpenHandle::Memory(p)) => Ok(fs.xattr(p.as_path(), name)?),
-            (Self::Root(fs), MountedOpenHandle::Root(p)) => fs.xattr(p.as_path(), name),
+            (Self::Root(fs), MountedOpenHandle::Root(p)) => fs.xattr(p.as_path(), name).await,
+            (Self::Overlay(fs), MountedOpenHandle::Overlay(p)) => {
+                alloc::boxed::Box::pin(fs.xattr(p.as_path(), name)).await
+            }
             (Self::Boot(_), MountedOpenHandle::Boot(_))
             | (Self::Host(_), MountedOpenHandle::Host(_))
             | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::Unsupported.into()),
@@ -960,7 +1381,8 @@ impl<S: Storage> MountedFs<S> {
         match self {
             Self::Btrfs(fs) => fs.list_xattrs(path).await,
             Self::Memory(fs) => Ok(fs.list_xattrs(path)?),
-            Self::Root(fs) => fs.list_xattrs(path),
+            Self::Root(fs) => fs.list_xattrs(path).await,
+            Self::Overlay(fs) => alloc::boxed::Box::pin(fs.list_xattrs(path)).await,
             Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => Err(FsError::Unsupported.into()),
         }
     }
@@ -972,7 +1394,10 @@ impl<S: Storage> MountedFs<S> {
         match (self, handle) {
             (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => fs.list_xattrs_handle(h).await,
             (Self::Memory(fs), MountedOpenHandle::Memory(p)) => Ok(fs.list_xattrs(p.as_path())?),
-            (Self::Root(fs), MountedOpenHandle::Root(p)) => fs.list_xattrs(p.as_path()),
+            (Self::Root(fs), MountedOpenHandle::Root(p)) => fs.list_xattrs(p.as_path()).await,
+            (Self::Overlay(fs), MountedOpenHandle::Overlay(p)) => {
+                alloc::boxed::Box::pin(fs.list_xattrs(p.as_path())).await
+            }
             (Self::Boot(_), MountedOpenHandle::Boot(_))
             | (Self::Host(_), MountedOpenHandle::Host(_))
             | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::Unsupported.into()),
@@ -992,7 +1417,10 @@ impl<S: Storage> MountedFs<S> {
         match self {
             Self::Btrfs(fs) => fs.set_xattr(path, name, value, mode, now).await,
             Self::Memory(fs) => fs.set_xattr_unix(path, name, value, mode, now),
-            Self::Root(fs) => fs.set_xattr(path, name, value, mode, now, payer),
+            Self::Root(fs) => fs.set_xattr(path, name, value, mode, now, payer).await,
+            Self::Overlay(fs) => {
+                alloc::boxed::Box::pin(fs.set_xattr(path, name, value, mode, now, payer)).await
+            }
             Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
             Self::Host(_) => Err(FsError::Unsupported.into()),
         }
@@ -1016,6 +1444,11 @@ impl<S: Storage> MountedFs<S> {
             }
             (Self::Root(fs), MountedOpenHandle::Root(p)) => {
                 fs.set_xattr(p.as_path(), name, value, mode, now, payer)
+                    .await
+            }
+            (Self::Overlay(fs), MountedOpenHandle::Overlay(p)) => {
+                alloc::boxed::Box::pin(fs.set_xattr(p.as_path(), name, value, mode, now, payer))
+                    .await
             }
             (Self::Boot(_), MountedOpenHandle::Boot(_))
             | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
@@ -1029,11 +1462,15 @@ impl<S: Storage> MountedFs<S> {
         path: FsPath<'_>,
         name: &str,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), UnixFsError> {
         match self {
             Self::Btrfs(fs) => fs.remove_xattr(path, name, now).await,
             Self::Memory(fs) => fs.remove_xattr_unix(path, name, now),
-            Self::Root(fs) => fs.remove_xattr(path, name, now),
+            Self::Root(fs) => fs.remove_xattr(path, name, now, payer).await,
+            Self::Overlay(fs) => {
+                alloc::boxed::Box::pin(fs.remove_xattr(path, name, now, payer)).await
+            }
             Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
             Self::Host(_) => Err(FsError::Unsupported.into()),
         }
@@ -1044,6 +1481,7 @@ impl<S: Storage> MountedFs<S> {
         handle: &MountedOpenHandle,
         name: &str,
         now: u64,
+        payer: &crate::StoragePayer,
     ) -> Result<(), UnixFsError> {
         match (self, handle) {
             (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => {
@@ -1052,7 +1490,12 @@ impl<S: Storage> MountedFs<S> {
             (Self::Memory(fs), MountedOpenHandle::Memory(p)) => {
                 fs.remove_xattr_unix(p.as_path(), name, now)
             }
-            (Self::Root(fs), MountedOpenHandle::Root(p)) => fs.remove_xattr(p.as_path(), name, now),
+            (Self::Root(fs), MountedOpenHandle::Root(p)) => {
+                fs.remove_xattr(p.as_path(), name, now, payer).await
+            }
+            (Self::Overlay(fs), MountedOpenHandle::Overlay(p)) => {
+                alloc::boxed::Box::pin(fs.remove_xattr(p.as_path(), name, now, payer)).await
+            }
             (Self::Boot(_), MountedOpenHandle::Boot(_))
             | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
             (Self::Host(_), MountedOpenHandle::Host(_)) => Err(FsError::Unsupported.into()),
@@ -1572,7 +2015,7 @@ impl<S: Storage> MountTable<S> {
         if !valid_point(point) {
             return Err(MountError::InvalidPoint(point.to_owned()));
         }
-        if matches!(fs, MountedFs::Root(_)) {
+        if matches!(fs, MountedFs::Root(_) | MountedFs::Overlay(_)) {
             return Err(MountError::RootKind);
         }
         let _writer = self.inner.writer.lock();
@@ -1878,6 +2321,22 @@ impl<S: Storage> Clone for HeldPath<S> {
 }
 
 impl<S: Storage> HeldPath<S> {
+    /// Wraps a standalone container [`OverlayFs`] mounted at `"/"`.
+    ///
+    /// The overlay's [`PinnedLower`] already holds the backing lower mount
+    /// against unmount.
+    pub fn from_overlay(overlay: OverlayFs<S>, grant: MountGrant) -> Self {
+        Self(Arc::new(HeldInner {
+            fs: MountedFs::Overlay(overlay),
+            grant,
+            absolute: String::from("/"),
+            point_len: 0,
+            hold: None,
+            open: None,
+            private_owner: None,
+        }))
+    }
+
     /// The resolution this keeps, to operate through.
     pub fn resolved(&self) -> Resolved<'_, S> {
         let held = &*self.0;
@@ -1989,6 +2448,7 @@ impl<S: Storage> MountedFs<S> {
     pub async fn read_whole(&self, path: FsPath<'_>) -> FsResult<FileContents> {
         match self {
             Self::Root(root) => root.read_whole(path).await,
+            Self::Overlay(overlay) => overlay.read_whole(path).await,
             Self::Boot(boot) => boot.file_contents(path).map(FileContents::Boot),
             Self::Memory(fs) => read_all(fs, path).await.map(FileContents::Written),
             Self::Host(fs) => read_all(fs, path).await.map(FileContents::Written),
@@ -1998,13 +2458,14 @@ impl<S: Storage> MountedFs<S> {
     }
 
     /// The stored Unix attributes for `path` on every filesystem that records
-    /// them (`MemoryFs`, `RootFs`, `HostShare`, `ErofsFs`, `BtrfsFs`), or
+    /// them (`MemoryFs`, `RootFs`, `OverlayFs`, `HostShare`, `ErofsFs`, `BtrfsFs`), or
     /// default boot-image attributes for `BootFs` which stores no Unix
     /// ownership or mode bits.
     pub async fn unix_attributes(&self, path: FsPath<'_>) -> FsResult<UnixAttributes> {
         match self {
             Self::Memory(fs) => Ok(fs.unix_metadata(path)?.attributes),
-            Self::Root(root) => root.unix_attributes(path),
+            Self::Root(root) => root.unix_attributes(path).await,
+            Self::Overlay(overlay) => overlay.unix_attributes(path).await,
             Self::Host(share) => share.unix_attributes(path).await,
             Self::Erofs(fs) => fs.unix_attributes(path).await,
             Self::Btrfs(fs) => fs.unix_attributes(path).await,
@@ -2016,7 +2477,7 @@ impl<S: Storage> MountedFs<S> {
     }
 
     /// Updates Unix permission bits on filesystems that store them in memory
-    /// (`MemoryFs` and `RootFs`'s writable upper layer). No-op on backends
+    /// (`MemoryFs` and `RootFs`/`OverlayFs`'s writable upper layer). No-op on backends
     /// whose host or on-disk metadata sets creation permissions itself.
     pub fn apply_created_permissions(&self, path: FsPath<'_>, permissions: u32, now: u64) {
         let mode = permissions & 0o7777;
@@ -2026,6 +2487,9 @@ impl<S: Storage> MountedFs<S> {
             }
             Self::Root(root) => {
                 let _ = root.upper().set_permissions(path, mode, now);
+            }
+            Self::Overlay(overlay) => {
+                let _ = overlay.upper().set_permissions(path, mode, now);
             }
             Self::Boot(_) | Self::Host(_) | Self::Erofs(_) | Self::Btrfs(_) => {}
         }

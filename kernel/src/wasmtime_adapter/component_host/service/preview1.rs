@@ -66,6 +66,7 @@ where
     pub(super) threads: WasixImageThreads<CpuImpl, Net, StorageImpl>,
     pub(super) requested_exit: Option<u32>,
     pub(super) exec_replacement: Option<WasixExecReplacement<CpuImpl, Net, StorageImpl>>,
+    pub(super) default_linux_image: Option<crate::DefaultLinuxImage<StorageImpl>>,
 }
 
 impl<CpuImpl, Net, StorageImpl> Preview1ProgramStore<CpuImpl, Net, StorageImpl>
@@ -108,6 +109,7 @@ where
             descriptors,
             &authority,
             runtime_state.settings(),
+            Vec::new(),
         ));
         let clock = crate::KernelClock::new(cpu.clone(), runtime_state.clone());
         let wall_clock_cap = authority.derive_set_wall_clock_cap().ok();
@@ -159,7 +161,24 @@ where
             threads,
             requested_exit: None,
             exec_replacement: None,
+            default_linux_image: None,
         }
+    }
+
+    pub(super) fn with_default_linux_image(
+        mut self,
+        image: Option<crate::DefaultLinuxImage<StorageImpl>>,
+    ) -> Self {
+        self.default_linux_image = image;
+        self
+    }
+
+    pub(super) fn with_inherited_sockets(self, sockets: Vec<UnixSocket<Net>>) -> Self {
+        if !sockets.is_empty() {
+            self.descriptors
+                .with_mut(|table| install_preview1_inherited_sockets(table, sockets));
+        }
+        self
     }
 
     /// Builds a sibling thread's store within the same WASIX process.
@@ -221,6 +240,7 @@ where
             threads: self.threads.clone(),
             requested_exit: None,
             exec_replacement: None,
+            default_linux_image: self.default_linux_image.clone(),
         }
     }
 

@@ -38,8 +38,9 @@ pub use provider::{
 pub use resources::{
     ComponentRawMutex, ComponentRawMutexGuard, ComponentRawRwLock, ComponentRawRwLockReadGuard,
     ComponentRawRwLockWriteGuard, ComponentSamplingSession, ComponentSerialPort,
-    ComponentSnapshotHold, ComponentTcpBackend, ComponentTcpStream, ComponentUdpBackend,
-    ComponentUdpSocket,
+    ComponentSnapshotHold, ComponentTcpBackend, ComponentTcpListener, ComponentTcpStream,
+    ComponentUdpBackend, ComponentUdpSocket, DefaultLinuxCredentials, DefaultLinuxImage,
+    InheritedSocket, InheritedSockets,
 };
 pub use retire::{
     RetiredNetworkHandle, SnapshotRetirementSender, SocketRetirementQueue, SocketRetirementSender,
@@ -51,7 +52,7 @@ pub use runtime::{
     FIBER_STACK_COMMIT_STEP, FIBER_STACK_ENTRY_RESERVE, FIBER_STACK_HOST_RESERVE, InstanceKilled,
     LocalOutputSink, MAX_CONCURRENT_INSTANCES, MAX_CORE_INSTANCES_PER_COMPONENT,
     MAX_MEMORIES_PER_COMPONENT, MAX_POOLED_ADDRESS_SPACE, MAX_POOLED_USER_MEMORY,
-    MAX_TABLES_PER_COMPONENT, TABLES_PER_INSTANCE, store_kernel_heap_bytes,
+    MAX_TABLES_PER_COMPONENT, StoreFilesystem, TABLES_PER_INSTANCE, store_kernel_heap_bytes,
     wait_until_runtime_deadline,
 };
 pub use runtime_backend::{

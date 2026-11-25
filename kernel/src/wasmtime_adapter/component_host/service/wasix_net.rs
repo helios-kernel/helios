@@ -1563,7 +1563,12 @@ where
         Some(UnixSocketHandle::<Net>::UdpSocket(socket)) => service
             .udp_set_hop_limit(socket, hop_limit)
             .map_or_else(p1_errno_from_udp_error, |()| p1::errno::SUCCESS),
-        Some(UnixSocketHandle::<Net>::PacketSocket(_)) | None => p1::errno::SUCCESS,
+        Some(
+            UnixSocketHandle::<Net>::PacketSocket(_)
+            | UnixSocketHandle::<Net>::VsockListener(_)
+            | UnixSocketHandle::<Net>::VsockStream(_),
+        )
+        | None => p1::errno::SUCCESS,
     }
 }
 

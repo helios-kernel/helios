@@ -408,6 +408,9 @@ pub(super) async fn run_program_executable<CpuImpl, Net, StorageImpl>(
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     ipc_grants: crate::IpcEndpointGrants,
+    default_linux_image: Option<crate::DefaultLinuxImage<StorageImpl>>,
+    inherited_sockets: crate::InheritedSockets,
+    #[cfg_attr(not(feature = "linux"), allow(unused_variables))] cwd: Option<String>,
     filesystem: Option<Namespace<StorageImpl>>,
     descriptors: DescriptorOrigin<Net>,
     signal_state: WasixSignalState,
@@ -453,6 +456,8 @@ where
                         env,
                         authority,
                         ipc_grants,
+                        default_linux_image,
+                        inherited_sockets,
                         filesystem,
                         signal_state,
                         spawner,
@@ -478,6 +483,8 @@ where
                 argv,
                 env,
                 authority,
+                default_linux_image,
+                inherited_sockets,
                 filesystem,
                 descriptors,
                 signal_state,
@@ -520,6 +527,8 @@ where
                 env,
                 launch.container,
                 launch.credentials,
+                cwd,
+                inherited_sockets,
                 descriptors,
                 signal_state,
                 spawner,
@@ -536,6 +545,7 @@ where
                 argv,
                 env,
                 authority,
+                default_linux_image,
                 filesystem,
                 signal_state,
                 spawner,
@@ -566,6 +576,8 @@ pub(super) async fn run_program_core_module<CpuImpl, Net, StorageImpl>(
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
+    default_linux_image: Option<crate::DefaultLinuxImage<StorageImpl>>,
+    inherited_sockets: crate::InheritedSockets,
     filesystem: Option<Namespace<StorageImpl>>,
     descriptors: DescriptorOrigin<Net>,
     signal_state: WasixSignalState,
@@ -629,6 +641,8 @@ where
     let threads = WasixProcessThreads::new();
     let image = async {
         let store_prepare_profile = start_program_kernel_profile(&profile_runtime_state, &run_cpu);
+        let unix_sockets =
+            inherited_sockets_to_unix_sockets(&exec_context.runtime_state, inherited_sockets)?;
         let mut store = wasmtime::Store::new(
             engine.raw(),
             Preview1ProgramStore::<CpuImpl, Net, StorageImpl>::new(
@@ -654,7 +668,9 @@ where
                 Some(compiled.clone()),
                 wasix_abi,
                 threads.clone(),
-            ),
+            )
+            .with_default_linux_image(default_linux_image)
+            .with_inherited_sockets(unix_sockets),
         );
         let interrupts = configure_preview1_program_store(&mut store);
         record_program_kernel_profile_sample(store_prepare_profile, "core-store-prepare");
@@ -850,6 +866,7 @@ pub(super) async fn run_program_core_module_with_restore<CpuImpl, Net, StorageIm
     argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
+    default_linux_image: Option<crate::DefaultLinuxImage<StorageImpl>>,
     filesystem: Option<Namespace<StorageImpl>>,
     signal_state: WasixSignalState,
     spawner: crate::InstanceSpawner<CpuImpl>,
@@ -925,7 +942,8 @@ where
                 Some(compiled.clone()),
                 wasix_abi,
                 threads.clone(),
-            ),
+            )
+            .with_default_linux_image(default_linux_image),
         );
         store
             .data()
@@ -1332,6 +1350,9 @@ where
                 replacement.env,
                 replacement.authority,
                 crate::IpcEndpointGrants::new(),
+                None,
+                crate::InheritedSockets::new(),
+                None,
                 replacement.filesystem,
                 replacement.descriptors,
                 replacement.signal_state,
@@ -1364,6 +1385,8 @@ pub(super) async fn run_program_component<CpuImpl, Net, StorageImpl>(
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     ipc_grants: crate::IpcEndpointGrants,
+    default_linux_image: Option<crate::DefaultLinuxImage<StorageImpl>>,
+    inherited_sockets: crate::InheritedSockets,
     filesystem: Option<Namespace<StorageImpl>>,
     signal_state: WasixSignalState,
     spawner: crate::InstanceSpawner<CpuImpl>,
@@ -1424,7 +1447,9 @@ where
             exec_context.read_serial,
             exec_context.write_serial,
         )
-        .with_ipc_grants(ipc_grants),
+        .with_ipc_grants(ipc_grants)
+        .with_default_linux_image(default_linux_image)
+        .with_inherited_sockets(inherited_sockets),
         Some(signal_state.clone()),
     );
     if let Some(store_prepare_started) = store_prepare_started {

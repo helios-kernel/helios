@@ -421,6 +421,43 @@ where
         })
     }
 
+    /// Waits until `listener` has a queued connection ready to accept without
+    /// consuming it, returning `Ok(false)` when `timeout_nanos` elapses first.
+    pub async fn tcp_listener_wait_readable(
+        &self,
+        listener: TcpListenerId,
+        timeout_nanos: u64,
+    ) -> Result<bool, TcpError> {
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        loop {
+            let wait = self.any_shard_wait();
+            let start = self.accepting_shard_idx();
+            self.drive_tcp().await?;
+            let readable = self
+                .inner
+                .state
+                .find_in_replicas(start, |state| {
+                    let stack_socket = state.tcp_listener(listener)?.stack_socket;
+                    state
+                        .stack
+                        .tcp_accept_pending(stack_socket)
+                        .map(|pending| pending.then_some(()))
+                        .map_err(|_| TcpError {
+                            kind: TcpErrorKind::Unavailable,
+                            detail: NetworkErrorDetail::TcpListenerClosedUnexpectedly,
+                        })
+                })?
+                .is_some();
+            if readable {
+                return Ok(true);
+            }
+            if self.now_nanos() >= deadline_nanos {
+                return Ok(false);
+            }
+            self.wait_for_tcp_progress(wait, deadline_nanos).await;
+        }
+    }
+
     /// The shard an accept walk starts at: this processor's own, which
     /// is the one it can drain without touching another CPU's cache.
     fn accepting_shard_idx(&self) -> usize {

@@ -383,6 +383,8 @@ async fn second_instance() -> Result<(), GpuTestError> {
         args: vec![String::from("--child")],
         env: Vec::new(),
         path: String::from(SELF_PATH),
+        cwd: None,
+        sockets: Vec::new(),
         capability_grants: vec![device_grant(vec![DeviceClass::Gpu])],
     })
     .await

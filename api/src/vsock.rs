@@ -146,6 +146,20 @@ impl VsockListener {
         })
     }
 
+    /// Wraps a raw WIT `vsock-listener` resource (e.g. from `take_inherited_sockets`).
+    pub fn from_raw(raw: raw::VsockListener) -> Self {
+        Self {
+            raw,
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
+
+    /// Unwraps the underlying WIT `vsock-listener` resource for transfer into a
+    /// spawned child via `InheritedSocket::Vsock`.
+    pub fn into_raw(self) -> raw::VsockListener {
+        self.raw
+    }
+
     /// The port this listener is bound to.
     pub async fn port(&self) -> io::Result<u32> {
         self.raw.port().await.map_err(map_error)
@@ -157,6 +171,15 @@ impl VsockListener {
 
     pub fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
+    }
+
+    /// Waits up to `timeout` for a peer connection to be queued without
+    /// consuming it. Returns `Ok(true)` when ready or `Ok(false)` on timeout.
+    pub async fn wait_readable(&self, timeout: Duration) -> io::Result<bool> {
+        self.raw
+            .wait_readable(duration_to_nanos(timeout))
+            .await
+            .map_err(map_error)
     }
 
     /// Waits for the next connection.

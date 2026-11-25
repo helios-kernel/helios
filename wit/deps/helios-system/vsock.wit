@@ -69,6 +69,10 @@ interface vsock {
     /// an ephemeral port needs in order to name it.
     port: async func() -> result<u32, vsock-error>;
 
+    /// Waits up to `timeout` nanoseconds for a connection to be queued without
+    /// consuming it. Returns `true` when ready or `false` on timeout.
+    wait-readable: async func(timeout: mono-nanos) -> result<bool, vsock-error>;
+
     /// Waits for the next connection that completed its handshake.
     accept: async func(timeout: mono-nanos) -> result<vsock-stream, vsock-error>;
 

@@ -412,6 +412,8 @@ async fn start_shell(
             (String::from("HOME"), String::from("/")),
         ],
         path: String::from(SHELL_PATH),
+        cwd: None,
+        sockets: Vec::new(),
         capability_grants: vec![
             root_directory_grant(),
             root_terminal_grant(),

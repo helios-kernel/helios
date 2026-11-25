@@ -317,14 +317,14 @@ impl Drop for BudgetReservation<'_> {
 
 /// A regular file's bytes in user-pool frames, tied to its creator's storage
 /// share and the machine's memory-storage budget.
-struct PagedFile {
+pub(super) struct PagedFile {
     pages: PagedBytes,
     creator: Arc<StorageShare>,
     budget: MemoryStorageBudget,
 }
 
 impl PagedFile {
-    fn new(budget: MemoryStorageBudget, creator: Arc<StorageShare>) -> Self {
+    pub(super) fn new(budget: MemoryStorageBudget, creator: Arc<StorageShare>) -> Self {
         let pages = PagedBytes::new(budget.pool());
         Self {
             pages,
@@ -333,7 +333,11 @@ impl PagedFile {
         }
     }
 
-    fn with_base(budget: MemoryStorageBudget, base: Bytes, creator: Arc<StorageShare>) -> Self {
+    pub(super) fn with_base(
+        budget: MemoryStorageBudget,
+        base: Bytes,
+        creator: Arc<StorageShare>,
+    ) -> Self {
         let pages = PagedBytes::with_base(budget.pool(), base);
         Self {
             pages,
@@ -342,7 +346,40 @@ impl PagedFile {
         }
     }
 
-    fn set_len(&mut self, len: u64) -> DetachedPages {
+    /// Writes `data` at `offset` into user-pool frames bounded by this file's
+    /// [`MemoryStorageBudget`] and [`UserMemoryPool`]. Used during overlay
+    /// copy-up outside the tree lock so lower file bytes land directly in
+    /// user-pool frames instead of the kernel heap.
+    pub(super) fn write_chunk(&mut self, offset: u64, data: &[u8]) -> FsResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or(FsError::Overflow)?;
+        let needed = self.pages.frames_to_commit(offset..end);
+        let needed_bytes = needed
+            .checked_mul(PhysFrame::SIZE as u64)
+            .ok_or(FsError::NoSpace)?;
+        let budget_res = self.budget.try_reserve(needed_bytes)?;
+        let mut frames =
+            FrameReservation::take(self.budget.pool(), needed).map_err(|_| FsError::OutOfMemory)?;
+        let before_frames = self.pages.frames();
+        let mut done = 0usize;
+        self.pages.write(offset, data.len(), &mut frames, |run| {
+            run.copy_from_slice(&data[done..done + run.len()]);
+            done += run.len();
+        });
+        debug_assert_eq!(done, data.len(), "page runs cover the whole copy-up chunk");
+        let added_bytes = (self.pages.frames() - before_frames) * PhysFrame::SIZE as u64;
+        budget_res.commit(added_bytes);
+        if added_bytes > 0 {
+            self.creator.add(added_bytes);
+        }
+        Ok(())
+    }
+
+    pub(super) fn set_len(&mut self, len: u64) -> DetachedPages {
         let before = self.pages.frames();
         let detached = self.pages.set_len(len);
         let freed_bytes = (before - self.pages.frames()) * PhysFrame::SIZE as u64;
@@ -352,6 +389,19 @@ impl PagedFile {
         }
         detached
     }
+}
+
+/// Payload handed to [`MemoryFs::copy_up`] when promoting a lower-layer object
+/// into the upper layer.
+pub(super) enum CopyUpContents {
+    /// Zero-copy static boot-image bytes held as a copy-on-write base.
+    BootBase(Bytes),
+    /// Regular file bytes already staged into `UserMemoryPool` frames.
+    Paged(PagedFile),
+    /// Symbolic link target bytes.
+    Symlink(Bytes),
+    /// Directories and special nodes carry no payload bytes.
+    Empty,
 }
 
 impl Drop for PagedFile {
@@ -540,53 +590,77 @@ impl MemoryFs {
         })
     }
 
+    /// Allocates a fresh empty [`PagedFile`] bound to this tree's
+    /// [`MemoryStorageBudget`] and `payer`'s storage share, for staging a
+    /// lower-layer file into user-pool frames outside the tree lock.
+    pub(super) fn new_paged_file(&self, payer: Option<&crate::StoragePayer>) -> PagedFile {
+        let share = payer.map_or_else(
+            || Arc::new(StorageShare::default()),
+            |payer| payer.share().clone(),
+        );
+        PagedFile::new(self.budget.clone(), share)
+    }
+
     /// Copies an object of the layer below up to `path`, keeping its
-    /// times and Unix attributes: `contents` is a file's bytes or a link's
-    /// target, and empty for a directory, which stays merging. Regular files
-    /// keep `contents` as a zero-frame copy-on-write base until written.
+    /// times, Unix attributes, device number and extended attributes.
+    /// Regular files come either as a zero-copy boot base or as a
+    /// [`PagedFile`] already staged in `UserMemoryPool` frames.
     /// When the tree has an object there already, another copy-up won and
-    /// this one does nothing; when the layer below no longer shows there,
-    /// the object was removed meanwhile: [`FsError::NoEntry`].
+    /// this one drops its staged payload outside the tree lock and does
+    /// nothing; when the layer below no longer shows there, the object was
+    /// removed meanwhile: [`FsError::NoEntry`].
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn copy_up(
         &self,
         path: FsPath<'_>,
         kind: NodeKind,
         unix: UnixAttributes,
-        contents: Bytes,
+        rdev: DeviceNumber,
+        xattrs: BTreeMap<String, Bytes>,
+        contents: CopyUpContents,
         original: &Metadata,
         payer: Option<&crate::StoragePayer>,
     ) -> FsResult<()> {
+        let mut _discarded: Option<CopyUpContents> = None;
         let mut state = self.state.lock();
         if state.inode_of(path).is_ok() {
+            _discarded = Some(contents);
+            drop(state);
             return Ok(());
         }
         if !state.beneath(path) {
+            _discarded = Some(contents);
+            drop(state);
             return Err(FsError::NoEntry);
         }
-        state.require_new_name(path)?;
-        let stored = match kind {
-            NodeKind::File => {
+        if let Err(error) = state.require_new_name(path) {
+            _discarded = Some(contents);
+            drop(state);
+            return Err(error);
+        }
+        let stored = match (kind, contents) {
+            (NodeKind::File, CopyUpContents::BootBase(base)) => {
                 let share = payer.map_or_else(
                     || Arc::new(StorageShare::default()),
                     |payer| payer.share().clone(),
                 );
-                InodeContents::File(PagedFile::with_base(self.budget.clone(), contents, share))
+                InodeContents::File(PagedFile::with_base(self.budget.clone(), base, share))
             }
-            NodeKind::Symlink => InodeContents::Symlink(contents),
-            _ => InodeContents::Empty,
+            (NodeKind::File, CopyUpContents::Paged(file)) => InodeContents::File(file),
+            (NodeKind::Symlink, CopyUpContents::Symlink(target)) => InodeContents::Symlink(target),
+            (_, CopyUpContents::Empty) => InodeContents::Empty,
+            (_, other) => {
+                _discarded = Some(other);
+                drop(state);
+                return Err(FsError::Invalid);
+            }
         };
-        let number = state.insert(
-            path,
-            kind,
-            unix,
-            DeviceNumber::default(),
-            stored,
-            original.modified_nanos,
-        );
+        let number = state.insert(path, kind, unix, rdev, stored, original.modified_nanos);
         let inode = state
             .inodes
             .get_mut(&number)
             .expect("the inode was just inserted");
+        inode.xattrs = xattrs;
         inode.access_nanos = original.access_nanos;
         inode.status_nanos = original.status_nanos;
         Ok(())
@@ -1924,7 +1998,7 @@ impl FileSystem for MemoryFs {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use alloc::string::String;
     use alloc::vec::Vec;
 
@@ -2672,7 +2746,9 @@ mod tests {
         );
     }
 
-    fn isolated_user_pool(frames: usize) -> &'static crate::memory::UserMemoryPool {
+    pub(in crate::vfs) fn isolated_user_pool(
+        frames: usize,
+    ) -> &'static crate::memory::UserMemoryPool {
         let bytes = frames * helios_hal::pmm::PhysFrame::SIZE;
         let backing: &'static mut [u8] =
             alloc::vec![0u8; bytes + helios_hal::pmm::PhysFrame::SIZE].leak();

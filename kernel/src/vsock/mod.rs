@@ -182,6 +182,39 @@ where
         self.inner.table.lock().listener_port(listener)
     }
 
+    /// Non-destructive probe of whether `listener` has a queued connection.
+    pub fn listener_readable(&self, listener: VsockListenerId) -> Result<bool, VsockError> {
+        self.inner.table.lock().listener_readable(listener)
+    }
+
+    /// Waits until `listener` has a connection queued without accepting it,
+    /// returning `Ok(false)` if `timeout_nanos` expires first.
+    pub async fn wait_readable(
+        &self,
+        listener: VsockListenerId,
+        timeout_nanos: u64,
+    ) -> Result<bool, VsockError> {
+        let deadline = self.deadline(timeout_nanos);
+        loop {
+            let armed = self.arm();
+            if self.inner.table.lock().listener_readable(listener)? {
+                return Ok(true);
+            }
+            if self.expired(deadline) {
+                return Ok(false);
+            }
+            self.park(armed, deadline).await;
+        }
+    }
+
+    /// Non-blocking accept of the next connection queued on `listener`.
+    pub fn try_accept(
+        &self,
+        listener: VsockListenerId,
+    ) -> Result<Option<VsockStreamId>, VsockError> {
+        self.inner.table.lock().accept(listener)
+    }
+
     pub fn close_listener(&self, listener: VsockListenerId) -> Result<(), VsockError> {
         self.inner.table.lock().close_listener(listener)
     }
@@ -237,6 +270,17 @@ where
 
     pub fn peer(&self, stream: VsockStreamId) -> Result<VsockAddress, VsockError> {
         self.inner.table.lock().peer(stream)
+    }
+
+    pub fn local(&self, stream: VsockStreamId) -> Result<VsockAddress, VsockError> {
+        self.inner.table.lock().local(stream)
+    }
+
+    pub fn stream_readiness(
+        &self,
+        stream: VsockStreamId,
+    ) -> Result<crate::SocketReadiness, VsockError> {
+        self.inner.table.lock().stream_readiness(stream)
     }
 
     /// Reads up to `max_bytes` from a connection.
@@ -355,6 +399,11 @@ where
         Ok(())
     }
 
+    /// Synchronously retires a connection slot when owned by a `Drop` path.
+    pub fn close_sync(&self, stream: VsockStreamId) {
+        let _ = self.inner.table.lock().close(stream);
+    }
+
     async fn transmit(&self, header: VsockPacketHeader, payload: &[u8]) -> Result<(), VsockError> {
         tracing::debug!(
             op = ?header.op,
@@ -455,6 +504,16 @@ trait DynVsockService: Send + Sync {
 
     fn listener_port(&self, listener: VsockListenerId) -> Result<u32, VsockError>;
 
+    fn listener_readable(&self, listener: VsockListenerId) -> Result<bool, VsockError>;
+
+    fn wait_readable(
+        &self,
+        listener: VsockListenerId,
+        timeout_nanos: u64,
+    ) -> BoxFuture<'_, Result<bool, VsockError>>;
+
+    fn try_accept(&self, listener: VsockListenerId) -> Result<Option<VsockStreamId>, VsockError>;
+
     fn close_listener(&self, listener: VsockListenerId) -> Result<(), VsockError>;
 
     fn accept(
@@ -470,6 +529,11 @@ trait DynVsockService: Send + Sync {
     ) -> BoxFuture<'_, Result<VsockStreamId, VsockError>>;
 
     fn peer(&self, stream: VsockStreamId) -> Result<VsockAddress, VsockError>;
+
+    fn local(&self, stream: VsockStreamId) -> Result<VsockAddress, VsockError>;
+
+    fn stream_readiness(&self, stream: VsockStreamId)
+    -> Result<crate::SocketReadiness, VsockError>;
 
     fn read(
         &self,
@@ -492,6 +556,8 @@ trait DynVsockService: Send + Sync {
     ) -> BoxFuture<'_, Result<(), VsockError>>;
 
     fn close(&self, stream: VsockStreamId) -> BoxFuture<'_, Result<(), VsockError>>;
+
+    fn close_sync(&self, stream: VsockStreamId);
 }
 
 type BoxFuture<'a, T> = core::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -511,6 +577,22 @@ where
 
     fn listener_port(&self, listener: VsockListenerId) -> Result<u32, VsockError> {
         VsockService::listener_port(self, listener)
+    }
+
+    fn listener_readable(&self, listener: VsockListenerId) -> Result<bool, VsockError> {
+        VsockService::listener_readable(self, listener)
+    }
+
+    fn wait_readable(
+        &self,
+        listener: VsockListenerId,
+        timeout_nanos: u64,
+    ) -> BoxFuture<'_, Result<bool, VsockError>> {
+        Box::pin(VsockService::wait_readable(self, listener, timeout_nanos))
+    }
+
+    fn try_accept(&self, listener: VsockListenerId) -> Result<Option<VsockStreamId>, VsockError> {
+        VsockService::try_accept(self, listener)
     }
 
     fn close_listener(&self, listener: VsockListenerId) -> Result<(), VsockError> {
@@ -535,6 +617,17 @@ where
 
     fn peer(&self, stream: VsockStreamId) -> Result<VsockAddress, VsockError> {
         VsockService::peer(self, stream)
+    }
+
+    fn local(&self, stream: VsockStreamId) -> Result<VsockAddress, VsockError> {
+        VsockService::local(self, stream)
+    }
+
+    fn stream_readiness(
+        &self,
+        stream: VsockStreamId,
+    ) -> Result<crate::SocketReadiness, VsockError> {
+        VsockService::stream_readiness(self, stream)
     }
 
     fn read(
@@ -565,6 +658,10 @@ where
 
     fn close(&self, stream: VsockStreamId) -> BoxFuture<'_, Result<(), VsockError>> {
         Box::pin(VsockService::close(self, stream))
+    }
+
+    fn close_sync(&self, stream: VsockStreamId) {
+        VsockService::close_sync(self, stream);
     }
 }
 
@@ -598,6 +695,25 @@ impl ComponentHostVsockService {
         self.inner.listener_port(listener)
     }
 
+    pub fn listener_readable(&self, listener: VsockListenerId) -> Result<bool, VsockError> {
+        self.inner.listener_readable(listener)
+    }
+
+    pub fn wait_readable(
+        &self,
+        listener: VsockListenerId,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<bool, VsockError>> + Send + '_ {
+        self.inner.wait_readable(listener, timeout_nanos)
+    }
+
+    pub fn try_accept(
+        &self,
+        listener: VsockListenerId,
+    ) -> Result<Option<VsockStreamId>, VsockError> {
+        self.inner.try_accept(listener)
+    }
+
     pub fn close_listener(&self, listener: VsockListenerId) -> Result<(), VsockError> {
         self.inner.close_listener(listener)
     }
@@ -620,6 +736,17 @@ impl ComponentHostVsockService {
 
     pub fn peer(&self, stream: VsockStreamId) -> Result<VsockAddress, VsockError> {
         self.inner.peer(stream)
+    }
+
+    pub fn local(&self, stream: VsockStreamId) -> Result<VsockAddress, VsockError> {
+        self.inner.local(stream)
+    }
+
+    pub fn stream_readiness(
+        &self,
+        stream: VsockStreamId,
+    ) -> Result<crate::SocketReadiness, VsockError> {
+        self.inner.stream_readiness(stream)
     }
 
     pub fn read(
@@ -653,5 +780,9 @@ impl ComponentHostVsockService {
         stream: VsockStreamId,
     ) -> impl Future<Output = Result<(), VsockError>> + Send + '_ {
         self.inner.close(stream)
+    }
+
+    pub fn close_sync(&self, stream: VsockStreamId) {
+        self.inner.close_sync(stream);
     }
 }

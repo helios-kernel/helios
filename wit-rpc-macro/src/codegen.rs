@@ -1258,7 +1258,7 @@ fn generate_resource_proxy(ctx: &IfaceContext<'_>, ident: &Ident) -> TokenStream
                 self.inner.handle_id()
             }
 
-            pub fn peer(&self) -> &#rt::__private::PeerHandle {
+            pub fn rpc_peer(&self) -> &#rt::__private::PeerHandle {
                 self.inner.peer()
             }
 
@@ -1367,7 +1367,7 @@ fn generate_client_resource_methods(
                         &self,
                         #(#sig_params),*
                     ) -> #rt::__private::Result<#ret_ty> {
-                        let mut __call = self.peer().open_call(#instance_name, #wire_func).await?;
+                        let mut __call = self.rpc_peer().open_call(#instance_name, #wire_func).await?;
                         let __req = #rt::__private::encode_client_value(&__call, #encode_expr).await?;
                         __call.send_root_request(&__req).await?;
                         let __resp = __call.recv_root_response().await?;
@@ -1880,7 +1880,7 @@ fn wire_to_server_expr(ctx: &IfaceContext<'_>, ty: Type, expr: TokenStream) -> T
         }
         TypeDefKind::List(inner) => {
             let body = wire_to_server_expr(ctx, *inner, quote!(__v));
-            quote!(#expr.into_iter().map(|__v| #body).collect())
+            quote!(#expr.into_iter().map(|__v| #body).collect::<::std::vec::Vec<_>>())
         }
         TypeDefKind::FixedLengthList(inner, _) => {
             let body = wire_to_server_expr(ctx, *inner, quote!(__v));
@@ -1889,7 +1889,7 @@ fn wire_to_server_expr(ctx: &IfaceContext<'_>, ty: Type, expr: TokenStream) -> T
         TypeDefKind::Map(k, v) => {
             let kb = wire_to_server_expr(ctx, *k, quote!(__k));
             let vb = wire_to_server_expr(ctx, *v, quote!(__v));
-            quote!(#expr.into_iter().map(|(__k, __v)| (#kb, #vb)).collect())
+            quote!(#expr.into_iter().map(|(__k, __v)| (#kb, #vb)).collect::<::std::vec::Vec<_>>())
         }
         TypeDefKind::Tuple(Tuple { types }) => {
             if types.len() == 1 {
@@ -1972,7 +1972,7 @@ fn server_to_wire_expr(ctx: &IfaceContext<'_>, ty: Type, expr: TokenStream) -> T
         }
         TypeDefKind::List(inner) => {
             let body = server_to_wire_expr(ctx, *inner, quote!(__v));
-            quote!(#expr.into_iter().map(|__v| #body).collect())
+            quote!(#expr.into_iter().map(|__v| #body).collect::<::std::vec::Vec<_>>())
         }
         TypeDefKind::FixedLengthList(inner, _) => {
             let body = server_to_wire_expr(ctx, *inner, quote!(__v));
@@ -1981,7 +1981,7 @@ fn server_to_wire_expr(ctx: &IfaceContext<'_>, ty: Type, expr: TokenStream) -> T
         TypeDefKind::Map(k, v) => {
             let kb = server_to_wire_expr(ctx, *k, quote!(__k));
             let vb = server_to_wire_expr(ctx, *v, quote!(__v));
-            quote!(#expr.into_iter().map(|(__k, __v)| (#kb, #vb)).collect())
+            quote!(#expr.into_iter().map(|(__k, __v)| (#kb, #vb)).collect::<::std::vec::Vec<_>>())
         }
         TypeDefKind::Tuple(Tuple { types }) => {
             if types.len() == 1 {

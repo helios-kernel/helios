@@ -147,6 +147,7 @@ mod guest {
                     args: request.args,
                     env: Vec::new(),
                     path: request.path,
+                    cwd: None,
                     stdin: Vec::new(),
                     hint: None,
                     capability_grants: vec![
@@ -316,6 +317,7 @@ mod guest {
                 args: request.args,
                 env: request.env,
                 path: request.path,
+                cwd: None,
                 stdin: Vec::new(),
                 credentials: None,
             })

@@ -65,6 +65,16 @@ pub trait SocketNetwork: Clone + Send + Sync + 'static {
 
     /// Retires a link-layer packet tap socket.
     fn packet_close(&self, socket: Self::PacketSocket);
+
+    /// Retires a vsock listener handle.
+    fn vsock_listener_close(&self, listener: u64) {
+        let _ = listener;
+    }
+
+    /// Retires a connected vsock stream handle.
+    fn vsock_stream_close(&self, stream: u64) {
+        let _ = stream;
+    }
 }
 
 /// The per-socket facts of a network stack that options report.
@@ -248,6 +258,83 @@ impl<Net: SocketNetwork> Drop for OwnedPacketSocket<Net> {
     }
 }
 
+/// A vsock listener a socket owns, retired when its last owner drops.
+pub struct OwnedVsockListener<Net: SocketNetwork> {
+    network: Net,
+    listener: u64,
+}
+
+impl<Net: SocketNetwork> OwnedVsockListener<Net> {
+    pub fn new(network: Net, listener: u64) -> Arc<Self> {
+        Arc::new(Self { network, listener })
+    }
+
+    pub fn id(&self) -> u64 {
+        self.listener
+    }
+}
+
+impl<Net: SocketNetwork> Drop for OwnedVsockListener<Net> {
+    fn drop(&mut self) {
+        self.network.vsock_listener_close(self.listener);
+    }
+}
+
+/// A connected vsock stream a socket owns, retired when its last owner drops.
+pub struct OwnedVsockStream<Net: SocketNetwork> {
+    network: Net,
+    stream: u64,
+}
+
+impl<Net: SocketNetwork> OwnedVsockStream<Net> {
+    pub fn new(network: Net, stream: u64) -> Arc<Self> {
+        Arc::new(Self { network, stream })
+    }
+
+    pub fn id(&self) -> u64 {
+        self.stream
+    }
+}
+
+impl<Net: SocketNetwork> Drop for OwnedVsockStream<Net> {
+    fn drop(&mut self) {
+        self.network.vsock_stream_close(self.stream);
+    }
+}
+
+/// Shared state of a vsock stream socket (`AF_VSOCK`).
+#[derive(Clone)]
+pub enum VsockSocket<Net: SocketNetwork> {
+    Listening {
+        listener: Arc<OwnedVsockListener<Net>>,
+        local_cid: u32,
+        local_port: u32,
+        options: SocketOptions,
+    },
+    Connected {
+        stream: Arc<OwnedVsockStream<Net>>,
+        local_cid: u32,
+        local_port: u32,
+        peer_cid: u32,
+        peer_port: u32,
+        options: SocketOptions,
+    },
+}
+
+impl<Net: SocketNetwork> VsockSocket<Net> {
+    pub fn options(&self) -> &SocketOptions {
+        match self {
+            Self::Listening { options, .. } | Self::Connected { options, .. } => options,
+        }
+    }
+
+    fn options_mut(&mut self) -> &mut SocketOptions {
+        match self {
+            Self::Listening { options, .. } | Self::Connected { options, .. } => options,
+        }
+    }
+}
+
 /// Shared state of a netlink socket (`AF_NETLINK`).
 #[derive(Clone, Debug)]
 pub struct NetlinkSocket {
@@ -341,6 +428,7 @@ enum SocketBody<Net: SocketNetwork> {
     },
     Netlink(Mutex<NetlinkSocket>),
     Packet(Mutex<PacketSocket<Net>>),
+    Vsock(Mutex<VsockSocket<Net>>),
     UnixUnbound {
         options: Mutex<SocketOptions>,
     },
@@ -399,6 +487,8 @@ pub enum SocketHandle<Net: SocketNetwork> {
     TcpListener(Net::TcpListener),
     UdpSocket(Net::UdpSocket),
     PacketSocket(Net::PacketSocket),
+    VsockListener(u64),
+    VsockStream(u64),
 }
 
 impl<Net: SocketNetwork> Clone for SocketHandle<Net> {
@@ -422,6 +512,8 @@ where
             (Self::TcpListener(a), Self::TcpListener(b)) => a == b,
             (Self::UdpSocket(a), Self::UdpSocket(b)) => a == b,
             (Self::PacketSocket(a), Self::PacketSocket(b)) => a == b,
+            (Self::VsockListener(a), Self::VsockListener(b)) => a == b,
+            (Self::VsockStream(a), Self::VsockStream(b)) => a == b,
             _ => false,
         }
     }
@@ -453,6 +545,13 @@ where
             Self::UdpSocket(socket) => formatter.debug_tuple("UdpSocket").field(socket).finish(),
             Self::PacketSocket(socket) => {
                 formatter.debug_tuple("PacketSocket").field(socket).finish()
+            }
+            Self::VsockListener(listener) => formatter
+                .debug_tuple("VsockListener")
+                .field(listener)
+                .finish(),
+            Self::VsockStream(stream) => {
+                formatter.debug_tuple("VsockStream").field(stream).finish()
             }
         }
     }
@@ -622,6 +721,41 @@ impl<Net: SocketNetwork> Socket<Net> {
         }))
     }
 
+    /// Wraps an existing vsock socket state in a shared open description.
+    pub fn from_vsock(vsock: VsockSocket<Net>) -> Self {
+        Self(Arc::new(SharedSocket {
+            kind: SocketKind::Stream,
+            protocol: None,
+            nonblocking: AtomicBool::new(false),
+            pending_error: AtomicI32::new(0),
+            shutdown_read: AtomicBool::new(false),
+            shutdown_write: AtomicBool::new(false),
+            body: SocketBody::Vsock(Mutex::new(vsock)),
+        }))
+    }
+
+    /// Whether this socket is a vsock stream socket (`AF_VSOCK`).
+    pub fn is_vsock(&self) -> bool {
+        matches!(self.0.body, SocketBody::Vsock(_))
+    }
+
+    /// Snapshot of the vsock socket state, or `None` if not a vsock socket.
+    pub fn vsock_state(&self) -> Option<VsockSocket<Net>> {
+        match &self.0.body {
+            SocketBody::Vsock(vsock) => Some(vsock.lock().clone()),
+            _ => None,
+        }
+    }
+
+    /// Runs `f` synchronously against the vsock socket state under the short
+    /// socket lock. Never `.await` inside `f`.
+    pub fn with_vsock_mut<R>(&self, f: impl FnOnce(&mut VsockSocket<Net>) -> R) -> Option<R> {
+        match &self.0.body {
+            SocketBody::Vsock(vsock) => Some(f(&mut vsock.lock())),
+            _ => None,
+        }
+    }
+
     /// Whether this socket is a netlink socket.
     pub fn is_netlink(&self) -> bool {
         matches!(self.0.body, SocketBody::Netlink(_))
@@ -713,6 +847,7 @@ impl<Net: SocketNetwork> Socket<Net> {
             SocketBody::Pair { .. }
             | SocketBody::Netlink(_)
             | SocketBody::Packet(_)
+            | SocketBody::Vsock(_)
             | SocketBody::UnixUnbound { .. } => None,
         }
     }
@@ -860,6 +995,7 @@ impl<Net: SocketNetwork> Socket<Net> {
             | SocketBody::RawIp { options, .. } => *options.lock(),
             SocketBody::Netlink(nl) => nl.lock().options,
             SocketBody::Packet(pkt) => pkt.lock().options,
+            SocketBody::Vsock(vsock) => *vsock.lock().options(),
         }
     }
 
@@ -872,6 +1008,7 @@ impl<Net: SocketNetwork> Socket<Net> {
             | SocketBody::RawIp { options, .. } => f(&mut options.lock()),
             SocketBody::Netlink(nl) => f(&mut nl.lock().options),
             SocketBody::Packet(pkt) => f(&mut pkt.lock().options),
+            SocketBody::Vsock(vsock) => f(vsock.lock().options_mut()),
         }
     }
 
@@ -906,6 +1043,14 @@ impl<Net: SocketNetwork> Socket<Net> {
             | SocketBody::UnixUnbound { .. }
             | SocketBody::RawIp { .. } => None,
             SocketBody::Packet(pkt) => Some(SocketHandle::PacketSocket(pkt.lock().handle.id())),
+            SocketBody::Vsock(vsock) => match &*vsock.lock() {
+                VsockSocket::Listening { listener, .. } => {
+                    Some(SocketHandle::VsockListener(listener.id()))
+                }
+                VsockSocket::Connected { stream, .. } => {
+                    Some(SocketHandle::VsockStream(stream.id()))
+                }
+            },
         }
     }
 

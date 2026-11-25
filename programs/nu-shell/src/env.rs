@@ -427,6 +427,8 @@ impl HeliosEnv for GuestHeliosEnv {
                     args: request.args.clone(),
                     env: env_pairs.clone(),
                     path: resolved_path.clone(),
+                    cwd: None,
+                    sockets: Vec::new(),
                     capability_grants,
                 })
                 .await
@@ -449,6 +451,8 @@ impl HeliosEnv for GuestHeliosEnv {
                 args: request.args,
                 env: env_pairs,
                 path: resolved_path,
+                cwd: None,
+                sockets: Vec::new(),
                 capability_grants,
             })
             .await

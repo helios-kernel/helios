@@ -263,6 +263,13 @@ pub(super) struct ProgramLaunch<Net: ComponentHostNetwork, StorageImpl: crate::S
     launched_instance: Option<crate::RegisteredInstance>,
     /// IPC capability endpoints moved into the child at launch.
     ipc_grants: crate::IpcEndpointGrants,
+    /// Default Linux root image inherited by the child instance.
+    default_linux_image: Option<crate::DefaultLinuxImage<StorageImpl>>,
+    /// Pre-bound listening sockets handed off to the child (`fd = 3+` for
+    /// Linux/WASIX processes, or `take-inherited-sockets` for components).
+    inherited_sockets: crate::InheritedSockets,
+    /// Explicit initial working directory override for the child process.
+    cwd: Option<String>,
     /// The namespace the program runs in: the launcher's own tree when it
     /// shares it, or a tree descending from the launcher's. `None` for a
     /// program the kernel launches, which runs in a tree descending from
@@ -300,6 +307,9 @@ impl<Net: ComponentHostNetwork, StorageImpl: crate::Storage> ProgramLaunch<Net, 
             authority,
             launched_instance: None,
             ipc_grants: crate::IpcEndpointGrants::new(),
+            default_linux_image: None,
+            inherited_sockets: crate::InheritedSockets::new(),
+            cwd: None,
             filesystem,
             descriptors: DescriptorOrigin::Fresh,
             signal_dispositions: Vec::new(),
@@ -323,6 +333,9 @@ impl<Net: ComponentHostNetwork, StorageImpl: crate::Storage> ProgramLaunch<Net, 
             authority,
             launched_instance: None,
             ipc_grants: crate::IpcEndpointGrants::new(),
+            default_linux_image: None,
+            inherited_sockets: crate::InheritedSockets::new(),
+            cwd: None,
             filesystem: None,
             descriptors: DescriptorOrigin::Fresh,
             signal_dispositions: Vec::new(),
@@ -344,6 +357,24 @@ impl<Net: ComponentHostNetwork, StorageImpl: crate::Storage> ProgramLaunch<Net, 
 
     pub(super) fn with_ipc_grants(mut self, ipc_grants: crate::IpcEndpointGrants) -> Self {
         self.ipc_grants = ipc_grants;
+        self
+    }
+
+    pub(super) fn with_default_linux_image(
+        mut self,
+        image: Option<crate::DefaultLinuxImage<StorageImpl>>,
+    ) -> Self {
+        self.default_linux_image = image;
+        self
+    }
+
+    pub(super) fn with_inherited_sockets(mut self, sockets: crate::InheritedSockets) -> Self {
+        self.inherited_sockets = sockets;
+        self
+    }
+
+    pub(super) fn with_cwd(mut self, cwd: Option<String>) -> Self {
+        self.cwd = cwd;
         self
     }
 
@@ -474,12 +505,130 @@ struct ProgramSpawnRequest<Net: ComponentHostNetwork, StorageImpl: crate::Storag
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     ipc_grants: crate::IpcEndpointGrants,
+    default_linux_image: Option<crate::DefaultLinuxImage<StorageImpl>>,
+    inherited_sockets: crate::InheritedSockets,
+    cwd: Option<String>,
     filesystem: Option<Namespace<StorageImpl>>,
     descriptors: DescriptorOrigin<Net>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
     #[cfg(feature = "linux")]
     container: Option<LinuxContainerLaunch<StorageImpl>>,
+}
+
+/// Maximum `#!` interpreter indirections (`fs/binfmt_script.c` recursion cap).
+#[cfg(feature = "linux")]
+pub(super) const MAX_SHEBANG_DEPTH: usize = 4;
+
+/// Parses a `#!` script header (`fs/binfmt_script.c`): returns
+/// `(interpreter, optional_argument)` from the first line (up to 256 bytes).
+#[cfg(feature = "linux")]
+pub(super) fn parse_shebang(bytes: &[u8]) -> Option<(String, Option<String>)> {
+    if !bytes.starts_with(b"#!") {
+        return None;
+    }
+    let line = bytes[2..].split(|&b| b == b'\n').next().unwrap_or(&[]);
+    let line = &line[..line.len().min(256)];
+    let trimmed = core::str::from_utf8(line)
+        .ok()?
+        .trim_matches([' ', '\t', '\r']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut split = trimmed.splitn(2, [' ', '\t']);
+    let interp = split.next()?.to_owned();
+    let arg = split
+        .next()
+        .map(|s| s.trim_matches([' ', '\t']))
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    Some((interp, arg))
+}
+
+/// Merges inherited default-image base environment variables underneath explicit
+/// request environment variables (explicit entries override matching keys).
+#[cfg(feature = "linux")]
+pub(super) fn merge_default_image_env(
+    base: &[(String, String)],
+    explicit: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut merged = Vec::with_capacity(base.len() + explicit.len());
+    for (key, value) in base {
+        if !explicit.iter().any(|(override_key, _)| override_key == key) {
+            merged.push((key.clone(), value.clone()));
+        }
+    }
+    merged.extend(explicit);
+    merged
+}
+
+/// Converts transferred [`crate::InheritedSockets`] into shared UNIX socket
+/// objects installed at `fd = 3, 4, ...` for Linux and WASIX processes.
+pub(super) fn inherited_sockets_to_unix_sockets<CpuImpl, Net, StorageImpl>(
+    runtime_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
+    sockets: crate::InheritedSockets,
+) -> Result<Vec<UnixSocket<Net>>, ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let items = sockets.take_all();
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut result = Vec::with_capacity(items.len());
+    for mut item in items {
+        if let Some((raw, local_address, local_port, hop_limit)) = item.take_tcp() {
+            let service = runtime_state.network_service().ok_or(ProgramExecError {
+                kind: ProgramExecErrorKind::Unavailable,
+                detail: ProgramExecErrorDetail::HostOperationFailed,
+            })?;
+            let family = match local_address {
+                crate::NetworkIpAddress::Ipv4(_) => SocketFamily::Ipv4,
+                crate::NetworkIpAddress::Ipv6(_) => SocketFamily::Ipv6,
+            };
+            let options = unix_socket_options::<Net>();
+            let _ = options.size(SocketSize::Ttl);
+            let listener = OwnedTcpListener::new(
+                crate::UnixNetwork::with_vsock(Some(service), runtime_state.vsock_service()),
+                <Net::TcpListener as crate::NetworkHandle>::from_raw(raw),
+            );
+            let sock = UnixSocket::<Net>::from_tcp(UnixTcpSocket::<Net>::Listening {
+                family,
+                listener,
+                local_address,
+                local_port,
+                options,
+            });
+            let _ = sock.set_size(SocketSize::Ttl, u64::from(hop_limit));
+            result.push(sock);
+        } else if let Some((vsock_service, listener_id)) = item.take_vsock() {
+            let local_cid = vsock_service.guest_cid() as u32;
+            let local_port =
+                vsock_service
+                    .listener_port(listener_id)
+                    .map_err(|_| ProgramExecError {
+                        kind: ProgramExecErrorKind::Unavailable,
+                        detail: ProgramExecErrorDetail::HostOperationFailed,
+                    })?;
+            let owned = OwnedVsockListener::new(
+                crate::UnixNetwork::with_vsock(
+                    runtime_state.network_service(),
+                    Some(vsock_service),
+                ),
+                listener_id.as_u64(),
+            );
+            let sock = UnixSocket::<Net>::from_vsock(VsockSocket::Listening {
+                listener: owned,
+                local_cid,
+                local_port,
+                options: unix_socket_options::<Net>(),
+            });
+            result.push(sock);
+        }
+    }
+    Ok(result)
 }
 
 /// A program's bytes, classified by how far the kernel trusts them.
@@ -546,6 +695,17 @@ impl ProgramSource {
             Self::BootfsArtifact(bytes) => bytes.as_slice().len(),
         }
     }
+
+    /// Returns `true` when this source is a Wasm artifact (precompiled bootfs,
+    /// signed `cwasm`, or raw WebAssembly binary with `\0asm` magic).
+    pub(crate) fn is_wasm(&self) -> bool {
+        match self {
+            Self::BootfsArtifact(_) | Self::SignedArtifact(_) => true,
+            Self::RawWasm(bytes) => bytes.starts_with(b"\0asm"),
+            #[cfg(feature = "linux")]
+            Self::LinuxElf(_) => false,
+        }
+    }
 }
 
 #[cfg(feature = "linux")]
@@ -575,20 +735,44 @@ async fn load_container_executable<CpuImpl, StorageImpl>(
     cpu: &CpuImpl,
     container: &crate::LinuxContainer<StorageImpl>,
     path: &str,
+    argv: &mut ProgramArgv,
     timeline: &phases::Timeline,
 ) -> Result<LinuxExecutable, ProgramExecError>
 where
     CpuImpl: Cpu,
     StorageImpl: crate::Storage,
 {
-    let contents = container
-        .filesystem()
-        .read_executable(path)
-        .await
-        .map_err(ProgramExecError::from_source_read_error)?;
-    let bytes = match contents {
-        FileContents::Boot(boot) => Bytes::copy_from_slice(boot.as_slice()),
-        FileContents::Written(written) => written,
+    let mut current_path = path.to_owned();
+    let bytes = {
+        let mut resolved = None;
+        for depth in 0..=MAX_SHEBANG_DEPTH {
+            let contents = container
+                .filesystem()
+                .read_executable(&current_path)
+                .await
+                .map_err(ProgramExecError::from_source_read_error)?;
+            let bytes = match contents {
+                FileContents::Boot(boot) => Bytes::copy_from_slice(boot.as_slice()),
+                FileContents::Written(written) => written,
+            };
+            if let Some((interp, opt_arg)) = parse_shebang(&bytes) {
+                if depth == MAX_SHEBANG_DEPTH {
+                    return Err(ProgramExecError {
+                        kind: ProgramExecErrorKind::InvalidPath,
+                        detail: ProgramExecErrorDetail::InvalidProgramPath,
+                    });
+                }
+                argv.rewrite_shebang(interp.clone(), opt_arg, current_path);
+                current_path = interp;
+                continue;
+            }
+            resolved = Some(bytes);
+            break;
+        }
+        resolved.ok_or(ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidPath,
+            detail: ProgramExecErrorDetail::InvalidProgramPath,
+        })?
     };
     timeline.record(cpu, LaunchPhase::SourceRead);
     if !is_linux_elf(&bytes) {
@@ -601,6 +785,32 @@ where
     let loaded = LinuxExecutable::load(cpu, bytes)?;
     timeline.record(cpu, LaunchPhase::LoadComplete);
     Ok(loaded)
+}
+
+#[cfg(feature = "linux")]
+async fn validate_container_cwd<StorageImpl: crate::Storage>(
+    container: &crate::LinuxContainer<StorageImpl>,
+    cwd: Option<&str>,
+) -> Result<Option<String>, ProgramExecError> {
+    let Some(raw_cwd) = cwd else {
+        return Ok(None);
+    };
+    let normalized = crate::resolve_guest_path("/", raw_cwd).map_err(|_| ProgramExecError {
+        kind: ProgramExecErrorKind::InvalidPath,
+        detail: ProgramExecErrorDetail::InvalidProgramPath,
+    })?;
+    let stat = container
+        .filesystem()
+        .stat(&normalized)
+        .await
+        .map_err(ProgramExecError::from_source_read_error)?;
+    if stat.metadata.kind != helios_hal::fs::NodeKind::Directory {
+        return Err(ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidPath,
+            detail: ProgramExecErrorDetail::InvalidProgramPath,
+        });
+    }
+    Ok(Some(normalized))
 }
 
 /// Handle to a kernel Linux container stored in a component's resource table.
@@ -661,6 +871,11 @@ pub struct ChildHandle {
 impl ChildHandle {
     fn signal_state(&self) -> WasixSignalState {
         self.signal_state.clone()
+    }
+
+    /// Deliver a POSIX signal to the running child process.
+    pub fn signal(&self, signal: helios_unix::Signal) {
+        self.signal_state.raise(signal);
     }
 
     /// Take the writer end of the child's stdin. Dropping it delivers
@@ -1821,6 +2036,45 @@ where
         }
     }
 
+    /// Creates an ephemeral overlay Linux container backed by `default_image.lower`
+    /// as `"/"` (with a fresh `UserMemoryPool`-backed upper layer) and bind-mounts
+    /// the child's granted non-`"/"` host directories on top.
+    #[cfg(feature = "linux")]
+    pub(super) fn create_ephemeral_overlay_container(
+        &self,
+        authority: ProcessAuthority,
+        namespace: &Namespace<StorageImpl>,
+        default_image: &crate::DefaultLinuxImage<StorageImpl>,
+    ) -> Result<Arc<crate::LinuxContainer<StorageImpl>>, ProgramExecError> {
+        let credentials = match default_image.credentials.as_ref() {
+            Some(creds) => Some(
+                helios_linux::syscall::Credentials::try_for_ids(
+                    creds.uid,
+                    creds.gid,
+                    creds.supplementary_groups.clone(),
+                )
+                .map_err(|error| ProgramExecError {
+                    kind: ProgramExecErrorKind::InvalidPath,
+                    detail: ProgramExecErrorDetail::ContainerRefused(crate::RuntimeMessage::of(
+                        error,
+                    )),
+                })?,
+            ),
+            None => None,
+        };
+        let container = Arc::new(
+            crate::LinuxContainer::ephemeral_with_overlay(
+                self.allocate_container_id(),
+                authority,
+                namespace,
+                default_image.lower.clone(),
+                credentials,
+            )
+            .map_err(map_container_error)?,
+        );
+        Ok(container)
+    }
+
     /// Loads a Linux executable strictly from `container`'s own filesystem and
     /// spawns it inside `container`.
     #[cfg(feature = "linux")]
@@ -1828,7 +2082,7 @@ where
         &self,
         exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
         path: &str,
-        launch: ProgramLaunch<Net, StorageImpl>,
+        mut launch: ProgramLaunch<Net, StorageImpl>,
     ) -> Result<ChildHandle, ProgramExecError> {
         let container = launch
             .container
@@ -1836,9 +2090,15 @@ where
             .expect("container spawn carries a container")
             .container
             .clone();
-        let executable =
-            load_container_executable(&exec_context.cpu, &container, path, &launch.timeline)
-                .await?;
+        launch.cwd = validate_container_cwd(&container, launch.cwd.as_deref()).await?;
+        let executable = load_container_executable(
+            &exec_context.cpu,
+            &container,
+            path,
+            &mut launch.argv,
+            &launch.timeline,
+        )
+        .await?;
         self.spawn_loaded(exec_context, ProgramExecutable::Linux(executable), launch)
     }
 
@@ -1850,7 +2110,7 @@ where
         exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
         path: &str,
         stdin: Vec<u8>,
-        launch: ProgramLaunch<Net, StorageImpl>,
+        mut launch: ProgramLaunch<Net, StorageImpl>,
     ) -> Result<ExecResult, ProgramExecError> {
         let container = launch
             .container
@@ -1858,9 +2118,117 @@ where
             .expect("container exec carries a container")
             .container
             .clone();
-        let executable =
-            load_container_executable(&exec_context.cpu, &container, path, &launch.timeline)
-                .await?;
+        launch.cwd = validate_container_cwd(&container, launch.cwd.as_deref()).await?;
+        let executable = load_container_executable(
+            &exec_context.cpu,
+            &container,
+            path,
+            &mut launch.argv,
+            &launch.timeline,
+        )
+        .await?;
+        self.exec_loaded_buffered(
+            exec_context,
+            ProgramExecutable::Linux(executable),
+            stdin,
+            launch,
+        )
+        .await
+        .map(|(result, _)| result)
+    }
+
+    #[cfg(feature = "linux")]
+    async fn load_overlay_executable(
+        &self,
+        cpu: &CpuImpl,
+        container: &crate::LinuxContainer<StorageImpl>,
+        path: &str,
+        fallback_bytes: Option<Bytes>,
+        argv: &mut ProgramArgv,
+        timeline: &phases::Timeline,
+    ) -> Result<LinuxExecutable, ProgramExecError> {
+        match load_container_executable(cpu, container, path, argv, timeline).await {
+            Ok(executable) => Ok(executable),
+            Err(error)
+                if error.kind == ProgramExecErrorKind::NotFound && fallback_bytes.is_some() =>
+            {
+                let bytes = fallback_bytes.expect("checked is_some above");
+                if let Some((interp, opt_arg)) = parse_shebang(&bytes) {
+                    argv.rewrite_shebang(interp.clone(), opt_arg, path.to_owned());
+                    load_container_executable(cpu, container, &interp, argv, timeline).await
+                } else if is_linux_elf(&bytes) {
+                    timeline.record(cpu, LaunchPhase::SourceRead);
+                    timeline.record(cpu, LaunchPhase::LoadBegin);
+                    let loaded = LinuxExecutable::load(cpu, bytes)?;
+                    timeline.record(cpu, LaunchPhase::LoadComplete);
+                    Ok(loaded)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Spawns a Linux executable or `#!` script inside a freshly built
+    /// ephemeral overlay container (used when the caller has a default Linux
+    /// image configured).
+    #[cfg(feature = "linux")]
+    pub(super) async fn spawn_in_overlay_container(
+        &self,
+        exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        path: &str,
+        fallback_bytes: Option<Bytes>,
+        mut launch: ProgramLaunch<Net, StorageImpl>,
+    ) -> Result<ChildHandle, ProgramExecError> {
+        let container = launch
+            .container
+            .as_ref()
+            .expect("overlay spawn carries a container")
+            .container
+            .clone();
+        launch.cwd = validate_container_cwd(&container, launch.cwd.as_deref()).await?;
+        let executable = self
+            .load_overlay_executable(
+                &exec_context.cpu,
+                &container,
+                path,
+                fallback_bytes,
+                &mut launch.argv,
+                &launch.timeline,
+            )
+            .await?;
+        self.spawn_loaded(exec_context, ProgramExecutable::Linux(executable), launch)
+    }
+
+    /// Runs a Linux executable or `#!` script to completion inside a freshly
+    /// built ephemeral overlay container and returns buffered output.
+    #[cfg(feature = "linux")]
+    pub(super) async fn exec_in_overlay_container(
+        &self,
+        exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        path: &str,
+        fallback_bytes: Option<Bytes>,
+        stdin: Vec<u8>,
+        mut launch: ProgramLaunch<Net, StorageImpl>,
+    ) -> Result<ExecResult, ProgramExecError> {
+        let container = launch
+            .container
+            .as_ref()
+            .expect("overlay exec carries a container")
+            .container
+            .clone();
+        launch.cwd = validate_container_cwd(&container, launch.cwd.as_deref()).await?;
+        let executable = self
+            .load_overlay_executable(
+                &exec_context.cpu,
+                &container,
+                path,
+                fallback_bytes,
+                &mut launch.argv,
+                &launch.timeline,
+            )
+            .await?;
         self.exec_loaded_buffered(
             exec_context,
             ProgramExecutable::Linux(executable),
@@ -1967,6 +2335,9 @@ where
             authority,
             launched_instance,
             ipc_grants,
+            default_linux_image,
+            inherited_sockets,
+            cwd,
             filesystem,
             descriptors,
             signal_dispositions,
@@ -2025,6 +2396,9 @@ where
             env,
             authority,
             ipc_grants,
+            default_linux_image,
+            inherited_sockets,
+            cwd,
             filesystem,
             descriptors,
             signal_state: signal_state.clone(),
@@ -2057,6 +2431,9 @@ where
                 request.env,
                 request.authority,
                 request.ipc_grants,
+                request.default_linux_image,
+                request.inherited_sockets,
+                request.cwd,
                 request.filesystem,
                 request.descriptors,
                 request.signal_state,
@@ -3988,7 +4365,7 @@ mod tests {
 
         // 1. A process created before the change has the default.
         let mut running: TestDescriptorTable =
-            process_descriptors(DescriptorOrigin::Fresh, &authority, settings);
+            process_descriptors(DescriptorOrigin::Fresh, &authority, settings, Vec::new());
         assert_eq!(running.limit, DescriptorLimit::DEFAULT);
 
         // 2. The operator lowers the setting and is told what it was.
@@ -3999,7 +4376,7 @@ mod tests {
 
         // 3. A process created after it takes the new value.
         let mut created: TestDescriptorTable =
-            process_descriptors(DescriptorOrigin::Fresh, &authority, settings);
+            process_descriptors(DescriptorOrigin::Fresh, &authority, settings, Vec::new());
         assert_eq!(created.limit, DescriptorLimit::new(64));
 
         // 4. The running process still hands out numbers up to its own.
@@ -4034,6 +4411,7 @@ mod tests {
             DescriptorOrigin::SameProcess(running.clone_for_exec()),
             &authority,
             settings,
+            Vec::new(),
         );
         assert_eq!(exec.limit, DescriptorLimit::DEFAULT);
 
@@ -4043,6 +4421,7 @@ mod tests {
             DescriptorOrigin::NewProcess(running.clone()),
             &authority,
             settings,
+            Vec::new(),
         );
         assert_eq!(child.limit, DescriptorLimit::new(64));
         assert!(child.get(100).is_some());

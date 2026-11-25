@@ -113,6 +113,7 @@ async fn dispatch(
                 args: request.args,
                 env: request.env,
                 path: request.path,
+                cwd: None,
                 stdin: request.stdin,
                 hint: request.hint.map(map_aot_hint_to_host),
                 capability_grants: map_capability_grants_to_host(request.capability_grants),

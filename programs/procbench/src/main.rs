@@ -161,6 +161,8 @@ impl ChildSpec {
             args: self.args.clone(),
             env: Vec::new(),
             path: self.path.clone(),
+            cwd: None,
+            sockets: Vec::new(),
             capability_grants: Vec::new(),
         }
     }
@@ -380,6 +382,7 @@ async fn spawn_wait(count: u64, child: ChildSpec) -> Result<(), ProcbenchError> 
             args: child.args.clone(),
             env: Vec::new(),
             path: child.path.clone(),
+            cwd: None,
             stdin: Vec::new(),
             hint: None,
             capability_grants: Vec::new(),
