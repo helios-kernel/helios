@@ -20,7 +20,7 @@ http-handler = []
 http-kit-io = ["http-handler", "task", "dep:executor-core", "dep:futures-lite", "dep:http-kit-io", "dep:thiserror"]
 instances = []
 ipc = []
-hv = []
+hv = ["dep:thiserror", "dep:zerocopy"]
 io = ["dep:futures-io", "dep:futures-lite"]
 machine-identity = []
 mounts = []
@@ -47,8 +47,12 @@ futures-lite = { version = "2.6.1", optional = true }
 helios-api-macro = { path = "../api-macro" }
 helios-hal = { path = "../hal", optional = true }
 http-kit-io = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false, optional = true }
-thiserror = { version = "2.0.20", optional = true }
+thiserror = { version = "2.0.21", default-features = false, optional = true }
 wit-bindgen = { workspace = true, features = ["async", "async-spawn", "inter-task-wakeup", "macros", "realloc"] }
+zerocopy = { version = "0.8.57", default-features = false, features = ["derive"], optional = true }
+
+[dev-dependencies]
+futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
 
 [target.'cfg(all(target_os = "wasi", not(target_env = "p1")))'.dependencies]
 zenwave = { workspace = true, features = ["wasi-backend"], optional = true }

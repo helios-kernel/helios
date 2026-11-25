@@ -95,7 +95,7 @@ clippy-host:
         --exclude helios-nu-shell --exclude helios-oob-load --exclude helios-perf \
         --exclude helios-ping --exclude helios-pride-flag --exclude helios-procbench \
         --exclude helios-sched-tasks --exclude helios-stack-test --exclude helios-surface-test \
-        --exclude helios-sysctl --exclude helios-webgpu-provider \
+        --exclude helios-sysctl --exclude helios-vmm-program --exclude helios-webgpu-provider \
         -- -D warnings
 
 # Clippy each guest program on its own, denying warnings.
@@ -112,7 +112,7 @@ clippy-programs:
     for package in helios-audio-test helios-compositor helios-cpu helios-date helios-debugger helios-display-test helios-gpu-test \
         helios-http-client \
         helios-init helios-input-test helios-nu-shell helios-oob-load helios-perf helios-ping helios-pride-flag \
-        helios-procbench helios-sched-tasks helios-stack-test helios-surface-test helios-sysctl helios-webgpu-provider; do
+        helios-procbench helios-sched-tasks helios-stack-test helios-surface-test helios-sysctl helios-vmm-program helios-webgpu-provider; do
         cargo clippy -p "${package}" --all-targets -- -D warnings
     done
 
@@ -187,7 +187,9 @@ test-libraries:
         --features helios-btrfs/write,helios-venus/driver
     # Guest programs with host unit tests select mutually exclusive `helios-api`
     # WIT worlds and cannot share one feature-unified cargo invocation.
+    cargo nextest run -p helios-api --features hv
     cargo nextest run -p helios-vmm
+    cargo nextest run -p helios-vmm-program
     cargo nextest run -p helios-compositor-render -p helios-desktop-text-check
     cargo nextest run -p helios-sysctl
     cargo nextest run -p helios-http-client
