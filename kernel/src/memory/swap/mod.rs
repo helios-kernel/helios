@@ -95,9 +95,7 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
@@ -659,7 +657,7 @@ pub fn install_swap<CpuImpl, Backend>(
     backend: Backend,
     backend_name: &'static str,
     capacity_bytes: u64,
-) -> SwapHandle
+) -> Result<SwapHandle, Backend::Error>
 where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     Backend: SwapBackend,
@@ -667,6 +665,10 @@ where
     let hooks = installed_swap_hooks().unwrap_or_else(|| {
         panic!("swap backend installed before the address space published its swap hooks")
     });
+    // The staging page is the backend's: allocated before anything is
+    // published, so a backend that cannot supply it leaves swap
+    // uninstalled instead of half-installed.
+    let page = backend.buffer(PhysFrame::SIZE)?;
     let clock = SwapClock {
         timebase: cpu.timebase(),
         now_ticks: hooks.now_ticks,
@@ -686,7 +688,7 @@ where
         registry,
         cpu,
         map: SwapMap::new(),
-        page: vec![0_u8; PhysFrame::SIZE].into_boxed_slice(),
+        page: Some(page),
         report: SwapReport::default(),
     };
     spawner.spawn_local_detached(async move {
@@ -698,7 +700,7 @@ where
         capacity_bytes,
         "swap online"
     );
-    handle
+    Ok(handle)
 }
 
 /// What an index of the swap map holds.
@@ -830,8 +832,17 @@ struct SwapService<Backend: SwapBackend, CpuImpl> {
     cpu: CpuImpl,
     map: SwapMap<Backend::Token>,
     /// The one staging buffer every transfer goes through. Owning it
-    /// here is what keeps the fault path allocation-free.
-    page: Box<[u8]>,
+    /// here is what keeps the fault path allocation-free. The backend
+    /// allocated it, so it is memory the storage behind the backend can
+    /// transfer from and to in place; it may be longer than a page when
+    /// the storage works in whole units, and only its first page is the
+    /// page.
+    ///
+    /// A transfer moves it into the backend and gets it back with the
+    /// result. `None` only after a transfer whose device stopped answering
+    /// kept it (see [`helios_hal::dma`]): the next transfer asks the
+    /// backend for a new one ([`SwapService::take_page`]).
+    page: Option<Backend::Buffer>,
     /// What the last summary line reported, so the next one can report
     /// the difference. See [`SWAP_REPORT_INTERVAL`].
     report: SwapReport,
@@ -851,6 +862,16 @@ where
     Backend: SwapBackend,
     CpuImpl: Cpu + Clone,
 {
+    /// The staging buffer, for one transfer. It is back in `self.page`
+    /// once the transfer returns it; a device that kept the last one is
+    /// replaced here rather than at the next allocation-free fault.
+    fn take_page(&mut self) -> Result<Backend::Buffer, Backend::Error> {
+        match self.page.take() {
+            Some(page) => Ok(page),
+            None => self.backend.buffer(PhysFrame::SIZE),
+        }
+    }
+
     async fn run(mut self, timer: Timer<CpuImpl>) -> ! {
         loop {
             // Faults first: a blocked fiber is a guest that has stopped,
@@ -963,34 +984,45 @@ where
             Lookup::Lost => return Err(SwapFaultError::PageLost),
             Lookup::Vacant => return Err(SwapFaultError::UnknownToken),
         };
+        let page = self.take_page().map_err(|error| {
+            tracing::warn!(
+                target: "helios_kernel::swap",
+                addr = addr.raw(),
+                %error,
+                "swap backend could not supply a staging page"
+            );
+            SwapFaultError::Backend
+        })?;
         // A failed read leaves the extent with the backend and the index
         // with the page-table entry, exactly as they were.
-        self.backend
-            .swap_in(token, &mut self.page)
-            .await
-            .map_err(|error| {
+        let page = match self.backend.swap_in(token, page).await {
+            Ok(((), page)) => page,
+            Err(failure) => {
                 tracing::warn!(
                     target: "helios_kernel::swap",
                     addr = addr.raw(),
-                    %error,
+                    error = %failure.error,
                     "swap backend could not read a page back"
                 );
-                SwapFaultError::Backend
-            })?;
+                self.page = failure.buffers;
+                return Err(SwapFaultError::Backend);
+            }
+        };
         // The backend has consumed the extent, so the token is dead and
         // the staging buffer holds the page's only copy.
         self.map.vacate(handle);
         // The address space reads the flags the page had out of its own
         // bookkeeping, fills a fresh frame from the staging buffer, and
         // only publishes the mapping once the bytes are there.
-        if let Err(error) = (self.hooks.swap_in_page)(addr, &self.page) {
+        if let Err(error) = (self.hooks.swap_in_page)(addr, &page.as_ref()[..PhysFrame::SIZE]) {
             tracing::warn!(
                 target: "helios_kernel::swap",
                 addr = addr.raw(),
                 ?error,
                 "the address space refused to reinstate a page; returning it to the swap backend"
             );
-            if self.rehome(handle, addr).await.is_err() {
+            // `rehome` takes the page and puts it back in `self.page`.
+            if self.rehome(handle, addr, page).await.is_err() {
                 self.handle
                     .shared
                     .counters
@@ -999,6 +1031,7 @@ where
             }
             return Err(SwapFaultError::AddressSpace);
         }
+        self.page = Some(page);
         self.map.free(handle);
         let counters = &self.handle.shared.counters;
         counters.pages_in.fetch_add(1, Ordering::AcqRel);
@@ -1008,27 +1041,35 @@ where
         Ok(())
     }
 
-    /// Writes the staging buffer, which holds the only copy of the page
+    /// Writes `page`, the staging buffer holding the only copy of the page
     /// whose page-table entry carries `handle`, back to the backend under
-    /// that same index.
+    /// that same index. The buffer comes back to `self.page` whenever the
+    /// device returns it.
     ///
     /// When the backend refuses too, the page's bytes exist nowhere: the
     /// index is marked lost and stays reserved, so no other page can be
     /// handed it and a fault on it fails rather than reading a stale
     /// token, until the owning address space's teardown releases it.
-    async fn rehome(&mut self, handle: SwapToken, addr: VirtAddr) -> Result<(), ()> {
-        match self.backend.swap_out(&self.page).await {
-            Ok(token) => {
+    async fn rehome(
+        &mut self,
+        handle: SwapToken,
+        addr: VirtAddr,
+        page: Backend::Buffer,
+    ) -> Result<(), ()> {
+        match self.backend.swap_out(page).await {
+            Ok((token, page)) => {
+                self.page = Some(page);
                 self.map.fill(handle, token);
                 Ok(())
             }
-            Err(error) => {
+            Err(failure) => {
+                self.page = failure.buffers;
                 self.map.mark_lost(handle);
                 tracing::error!(
                     target: "helios_kernel::swap",
                     addr = addr.raw(),
                     index = handle.raw(),
-                    %error,
+                    error = %failure.error,
                     "swapped-out page lost: the swap backend refused it back and no other copy exists"
                 );
                 Err(())
@@ -1211,6 +1252,20 @@ where
             );
             return Err(());
         };
+        let mut page = match self.take_page() {
+            Ok(page) => page,
+            Err(error) => {
+                tracing::warn!(
+                    target: "helios_kernel::swap",
+                    addr = addr.raw(),
+                    %error,
+                    "swap backend could not supply a staging page"
+                );
+                // Nothing was detached, so the index goes straight back.
+                self.map.free(handle);
+                return Err(());
+            }
+        };
         // Detaching files the entry, replaces the leaf, shoots the TLB
         // down on every processor and only then copies the page into our
         // buffer and hands the frame back, all under the address space's
@@ -1219,10 +1274,9 @@ where
         // The hold around it keeps every store of the instance off every
         // processor until it is done.
         let hooks = self.hooks;
-        let page = &mut self.page;
-        let detached = self
-            .registry
-            .while_off_processor(instance, |off| hooks.detach_page(off, addr, handle, page));
+        let detached = self.registry.while_off_processor(instance, |off| {
+            hooks.detach_page(off, addr, handle, &mut page.as_mut()[..PhysFrame::SIZE])
+        });
         match detached {
             Ok(Ok(_flags)) => {}
             Ok(Err(error)) => {
@@ -1232,6 +1286,7 @@ where
                     ?error,
                     "page could not be detached for swap-out"
                 );
+                self.page = Some(page);
                 self.map.free(handle);
                 return Err(());
             }
@@ -1243,6 +1298,7 @@ where
                     %refused,
                     "instance cannot be held off the processors; leaving its pages"
                 );
+                self.page = Some(page);
                 self.map.free(handle);
                 return Err(());
             }
@@ -1251,19 +1307,37 @@ where
         // empty slot. A guest faulting on it in this window queues a
         // request that this same loop serves, and it only gets there
         // after this function returns, so the gap is never observed.
-        match self.backend.swap_out(&self.page).await {
-            Ok(token) => self.map.fill(handle, token),
-            Err(error) => {
+        match self.backend.swap_out(page).await {
+            Ok((token, page)) => {
+                self.page = Some(page);
+                self.map.fill(handle, token);
+            }
+            Err(failure) => {
+                // The device stopped answering with the page in flight and
+                // still holds the only copy of it: the page's bytes exist
+                // nowhere the kernel can reach, so the index is lost.
+                let Some(page) = failure.buffers else {
+                    self.map.mark_lost(handle);
+                    tracing::error!(
+                        target: "helios_kernel::swap",
+                        addr = addr.raw(),
+                        index = handle.raw(),
+                        error = %failure.error,
+                        "swap device stopped answering while it held a page; the page is lost"
+                    );
+                    return Err(());
+                };
                 tracing::warn!(
                     target: "helios_kernel::swap",
                     addr = addr.raw(),
-                    %error,
+                    error = %failure.error,
                     "swap backend refused a page; putting it back"
                 );
                 // The staging buffer holds the page's only copy. The index
                 // is released only once the page is resident again.
-                match (self.hooks.swap_in_page)(addr, &self.page) {
+                match (self.hooks.swap_in_page)(addr, &page.as_ref()[..PhysFrame::SIZE]) {
                     Ok(_) => {
+                        self.page = Some(page);
                         self.map.free(handle);
                         return Err(());
                     }
@@ -1278,7 +1352,7 @@ where
                         // The backend may have taken the write this time,
                         // which makes this a completed swap-out; if not,
                         // the page is lost and says so.
-                        self.rehome(handle, addr).await?;
+                        self.rehome(handle, addr, page).await?;
                     }
                 }
             }

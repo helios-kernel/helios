@@ -2458,16 +2458,13 @@ where
                 let fdflags = caller.data().descriptors.fdflags(fd)?;
                 let timeout =
                     wasix_effective_socket_timeout(options.time(SocketTime::SendTimeout), fdflags);
-                let written = p1_send_gathered(&memory, &mut gather, |chunk| {
-                    let (service, stream) = (&service, stream.id());
-                    async move {
-                        service
-                            .tcp_write_all_bytes(stream, Bytes::from(chunk), timeout)
-                            .await
-                            .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))
-                    }
-                })
-                .await?;
+                let mut stream = Preview1TcpStream {
+                    service: &service,
+                    stream: stream.id(),
+                    timeout,
+                    fdflags,
+                };
+                let written = p1_send_gathered(&memory, &mut gather, &mut stream).await?;
                 memory.write_u32(ret_size, written).await?;
                 Ok(p1::errno::SUCCESS)
             }
@@ -2476,10 +2473,11 @@ where
     }
     if let Some(writer) = socket.pair_writer() {
         let fdflags = caller.data().descriptors.fdflags(fd)?;
-        let written = p1_send_gathered(&memory, &mut gather, |chunk| {
-            p1_send_to_socketpair(&writer, chunk, fdflags)
-        })
-        .await?;
+        let mut stream = Preview1SocketpairStream {
+            writer: &writer,
+            fdflags,
+        };
+        let written = p1_send_gathered(&memory, &mut gather, &mut stream).await?;
         memory.write_u32(ret_size, written).await?;
         return Ok(p1::errno::SUCCESS);
     }
@@ -2583,8 +2581,11 @@ where
                             options.time(SocketTime::SendTimeout),
                             fdflags,
                         );
+                        let pieces = service.tcp_payload_pieces(bytes.len(), |offset, piece| {
+                            piece.copy_from_slice(&bytes[offset..][..piece.len()]);
+                        });
                         service
-                            .tcp_write_all_bytes(stream.id(), bytes, timeout)
+                            .tcp_write_all(stream.id(), pieces, timeout)
                             .await
                             .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))?;
                         Ok(written)

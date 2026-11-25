@@ -12,6 +12,7 @@ use helios_sync as child;
 pub(crate) use block::tests::{MemoryDisk, cache_over, cache_over_many};
 mod console;
 mod debug_serial;
+mod dma;
 mod interrupts;
 mod iommu;
 mod panic_console;
@@ -33,11 +34,19 @@ pub use console::RecordingConsole;
 pub use debug_serial::{
     DebugConsole, DebugSerialAccess, DebugSerialInterrupt, DebugSerialWriter, read_debug_serial,
 };
+pub use dma::{
+    ArenaBuffer, ArenaStats, ChunkClass, ChunkDomain, ChunkGrowth, ChunkSource,
+    DMA_ARENA_RETAINED_CHUNKS, DMA_ARENA_RETIRE_INTERVAL, DmaArena, DmaArenas, Elastic, Fixed,
+    GrowthDemand, LentChunk, SharedDmaArena, maintain_dma_arenas,
+};
 pub use interrupts::{
     ExternalInterruptHandler, ExternalInterruptRoutes, MAX_BLOCK_DEVICES, MAX_DEVICE_INTERRUPTS,
     MAX_INPUT_DEVICES, MAX_NETWORK_INTERRUPTS, wake_queue_owners,
 };
-pub use iommu::{IommuDomains, IommuEndpointStats, IommuReport, IommuStats, MAX_IOMMU_ENDPOINTS};
+pub use iommu::{
+    DeviceChunkDomain, DeviceForeignMapping, DirectChunkDomain, IommuChunkDomain, IommuDomains,
+    IommuEndpointStats, IommuForeignMapping, IommuReport, IommuStats, MAX_IOMMU_ENDPOINTS,
+};
 pub use panic_console::{PanicSerial, emit_panic_report};
 pub use poll_registry::{
     PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,

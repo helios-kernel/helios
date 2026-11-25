@@ -9,9 +9,10 @@
 //! storage, and every request still reaches its device by static
 //! dispatch.
 
+use helios_hal::dma::BufResult;
 use helios_hal::fs::{
-    BlockCompletion, BlockDevice, BlockDeviceCapabilities, BlockGeometry, BlockQueueTopology,
-    BlockRange, BlockSerial, IoResult,
+    BlockDevice, BlockDeviceCapabilities, BlockGeometry, BlockQueueTopology, BlockRange,
+    BlockSerial, IoResult,
 };
 
 use crate::{BlockPages, HostFileSystem};
@@ -35,7 +36,7 @@ pub enum NoDisks {}
 impl BlockDevice for NoDisks {
     type Buffer = BlockPages;
     type Waiter<'a>
-        = core::future::Pending<BlockCompletion<BlockPages>>
+        = core::future::Pending<BufResult<(), BlockPages>>
     where
         Self: 'a;
 

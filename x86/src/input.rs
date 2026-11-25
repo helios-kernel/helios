@@ -87,7 +87,7 @@ where
                 &pci.access(),
                 *address,
                 pci,
-                *dma,
+                dma.clone(),
                 Some(msix_vector),
             )
             .unwrap_or_else(|error| {

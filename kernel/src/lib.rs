@@ -106,12 +106,13 @@ pub use component::{
     wait_until_runtime_deadline,
 };
 pub use device::{
-    DEFAULT_DMA_BUDGET_BYTES, DeviceGrant, DeviceGrantRegistry, DeviceInterruptHooks,
-    DeviceInterruptRoute, DeviceName, DeviceOwnership, DeviceVmHooks, DmaBudget, DmaBuffer,
-    DmaBufferHandle, GrantError, GrantHandle, GrantInterrupt, GrantLease, GrantStats,
-    GrantedDeviceSnapshot, InterruptEvent, InterruptRelay, InterruptStats, MAX_DEVICE_NAME,
-    MAX_DMA_BUFFERS, MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS, MAX_GRANTS, PublishedDevice,
-    install_device_interrupt_hooks, install_device_vm_hooks,
+    DEFAULT_DMA_BUDGET_BYTES, DeviceDmaHooks, DeviceGrant, DeviceGrantRegistry,
+    DeviceInterruptHooks, DeviceInterruptRoute, DeviceName, DeviceOwnership, DeviceVmHooks,
+    DmaBudget, DmaBuffer, DmaBufferHandle, GrantError, GrantHandle, GrantInterrupt, GrantLease,
+    GrantStats, GrantedDeviceSnapshot, InterruptEvent, InterruptRelay, InterruptStats,
+    MAX_DEVICE_NAME, MAX_DMA_BUFFERS, MAX_GRANT_INTERRUPTS, MAX_GRANT_REGIONS, MAX_GRANTS,
+    PublishedDevice, install_device_dma_hooks, install_device_interrupt_hooks,
+    install_device_vm_hooks,
 };
 pub use display::{
     DisplayClaim, DisplayOwnership, DisplaySender, DisplayService, DisplayServiceError, FrameToken,
@@ -177,17 +178,21 @@ pub use instance::{
     StoreTurns, UserMemoryCharge, allow_instance_resource_growth,
 };
 pub use io::{
-    BlockCache, BlockCacheError, BlockCacheLimits, BlockInstallError, BlockMut, BlockPages,
-    BlockRef, BlockRouteError, BlockSelfCheckError, BlockService, BlockStats, ByteReadWait,
-    ByteReader, ByteWriteWait, ByteWriter, CACHE_BLOCK_BYTES, CacheLayoutError, CachedDisk,
-    CachedDiskStats, ClosedPeer, DebugConsole, DebugSerialAccess, DebugSerialInterrupt,
-    DebugSerialWriter, DiskRefusal, DiskRole, ExternalInterruptHandler, ExternalInterruptRoutes,
-    IommuDomains, IommuEndpointStats, IommuReport, IommuStats, MAX_BLOCK_DEVICES,
-    MAX_DEVICE_INTERRUPTS, MAX_INPUT_DEVICES, MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS,
-    PanicSerial, PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
-    RecordingConsole, SCRATCH_DISK_SERIAL, ScratchDisk, ScratchDiskStats, SerialReader, TryRead,
-    TryWrite, admit_block_devices, byte_channel, emit_panic_report, install_block_devices,
-    install_scratch_swap, read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
+    ArenaBuffer, ArenaStats, BlockCache, BlockCacheError, BlockCacheLimits, BlockInstallError,
+    BlockMut, BlockPages, BlockRef, BlockRouteError, BlockSelfCheckError, BlockService, BlockStats,
+    ByteReadWait, ByteReader, ByteWriteWait, ByteWriter, CACHE_BLOCK_BYTES, CacheLayoutError,
+    CachedDisk, CachedDiskStats, ChunkClass, ChunkDomain, ChunkGrowth, ChunkSource, ClosedPeer,
+    DMA_ARENA_RETAINED_CHUNKS, DMA_ARENA_RETIRE_INTERVAL, DebugConsole, DebugSerialAccess,
+    DebugSerialInterrupt, DebugSerialWriter, DeviceChunkDomain, DeviceForeignMapping,
+    DirectChunkDomain, DiskRefusal, DiskRole, DmaArena, DmaArenas, Elastic,
+    ExternalInterruptHandler, ExternalInterruptRoutes, Fixed, GrowthDemand, IommuChunkDomain,
+    IommuDomains, IommuEndpointStats, IommuForeignMapping, IommuReport, IommuStats, LentChunk,
+    MAX_BLOCK_DEVICES, MAX_DEVICE_INTERRUPTS, MAX_INPUT_DEVICES, MAX_IOMMU_ENDPOINTS,
+    MAX_NETWORK_INTERRUPTS, PanicSerial, PollKey, PollRegistration, PollRegistry,
+    PollRegistryError, PollSourceKind, RecordingConsole, SCRATCH_DISK_SERIAL, ScratchDisk,
+    ScratchDiskStats, SerialReader, SharedDmaArena, TryRead, TryWrite, admit_block_devices,
+    byte_channel, emit_panic_report, install_block_devices, install_scratch_swap,
+    maintain_dma_arenas, read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
 };
 pub use ipc::{
     IPC_MAX_CHUNK_BYTES, IpcEndpoint, IpcEndpointGrants, IpcError, IpcGrantError,
@@ -227,7 +232,7 @@ pub use memory::{
     SWAP_TICK, StackFault, StackReserveError, SwapDisabled, SwapEntry, SwapFaultError, SwapFaultIn,
     SwapHandle, SwapLeafFormat, SwapSpace, SwapStats, SwapVmHooks, TASK_ARENA_FRACTION,
     TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES, UserHeapStats, UserMemoryOwnerScope,
-    UserMemoryOwners, UserMemoryPool, UserResidency, UserTranslation, VaCursor,
+    UserMemoryOwners, UserMemoryPool, UserPoolChunks, UserResidency, UserTranslation, VaCursor,
     allocate_user_frame_uninit_on, allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed,
     allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, claim_fiber_stack,
     classify_stack_fault, commit_fiber_stack_reserve, configure_user_memory_owner_processors,
@@ -283,8 +288,9 @@ pub use runtime::{
     HostWrite, HttpsRecord, Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress,
     NetworkPacketPump, ObjectIdentity, PacketFrame, PingError, PingErrorKind, PingReply,
     RegisteredTcpReadBuffer, RuntimeState, SnapshotHold, SnapshotHoldBusy, SocketReadiness,
-    TcpAccepted, TcpConnectPoll, TcpError, TcpErrorKind, TcpListener, TcpReadInto, TcpReadProgress,
-    TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    TcpAccepted, TcpConnectPoll, TcpError, TcpErrorKind, TcpListener, TcpPayloadPieces,
+    TcpReadInto, TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram, UdpError,
+    UdpErrorKind,
 };
 pub use settings::{
     Holds, SETTING_COUNT, Setting, SettingCell, SettingEntry, SettingUnit, SettingValue,
