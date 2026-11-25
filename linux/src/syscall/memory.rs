@@ -293,8 +293,9 @@ pub(super) async fn flush_all_shared_mappings<R: Resources, M: UserMemory, F: fs
 }
 
 /// Propagates bytes written to `file` at `offset` into any active `MAP_SHARED`
-/// mappings of the same file in `process`, temporarily granting write access
-/// to read-only `MAP_SHARED` pages while copying.
+/// mappings of the same file in `process`, populating read-only `MAP_SHARED`
+/// pages through [`VirtualMemory::populate`] without temporarily granting user
+/// write access.
 pub(super) fn sync_write_to_shared_mappings<
     R: Resources,
     M: VirtualMemory,
@@ -349,25 +350,7 @@ pub(super) fn sync_write_to_shared_mappings<
             if copy_start < copy_end {
                 let slice_start = (src_off + (copy_start - addr)) as usize;
                 let slice_end = slice_start + (copy_end - copy_start) as usize;
-                if region.access.contains(PageFlags::WRITE) {
-                    let _ = memory.write(copy_start, &bytes[slice_start..slice_end]);
-                } else {
-                    let p_start = copy_start & !(PAGE - 1);
-                    let p_end = page_align(copy_end);
-                    let p_len = p_end - p_start;
-                    if p_len > 0
-                        && memory
-                            .protect(
-                                p_start,
-                                p_len,
-                                region.access | PageFlags::READ | PageFlags::WRITE,
-                            )
-                            .is_ok()
-                    {
-                        let _ = memory.write(copy_start, &bytes[slice_start..slice_end]);
-                        let _ = memory.protect(p_start, p_len, region.access);
-                    }
-                }
+                let _ = memory.populate(copy_start, &bytes[slice_start..slice_end]);
             }
             pos = copy_end.max(region.end);
         }
@@ -490,14 +473,6 @@ pub(super) async fn mmap<R: Resources, M: VirtualMemory, F: fs::Filesystem<R>>(
         return errno(ENOMEM);
     }
 
-    // Install the virtual range (temporarily writable if we need to copy file
-    // contents into a read-only or PROT_NONE mapping).
-    let initial_access = if file_backing.is_some() {
-        PageFlags::READ | PageFlags::WRITE
-    } else {
-        access
-    };
-
     let mapped_addr = {
         let _mm = process.shared.program_break.lock();
         if !is_fixed {
@@ -506,7 +481,7 @@ pub(super) async fn mmap<R: Resources, M: VirtualMemory, F: fs::Filesystem<R>>(
             // small invalid user pointers never alias a live mapping.
             const MMAP_MIN_ADDR: u64 = 65_536;
             let unfixed_hint = (hint & !(PAGE - 1)).max(MMAP_MIN_ADDR);
-            match memory.map_anywhere(unfixed_hint, length, initial_access) {
+            match memory.map_anywhere(unfixed_hint, length, access) {
                 Ok(addr) => addr,
                 Err(error) => return map_errno(error),
             }
@@ -519,7 +494,7 @@ pub(super) async fn mmap<R: Resources, M: VirtualMemory, F: fs::Filesystem<R>>(
                 remove_shared_range(process, hint, hint + length);
                 memory.unmap(hint, length);
             }
-            match memory.map_at(hint, length, initial_access) {
+            match memory.map_at(hint, length, access) {
                 Ok(()) => hint,
                 Err(error) => return map_errno(error),
             }
@@ -544,22 +519,18 @@ pub(super) async fn mmap<R: Resources, M: VirtualMemory, F: fs::Filesystem<R>>(
                 if bytes.is_empty() {
                     break;
                 }
-                if memory.write(mapped_addr + filled, &bytes).is_err() {
+                if let Err(error) = memory.populate(mapped_addr + filled, &bytes) {
                     let _mm = process.shared.program_break.lock();
                     memory.unmap(mapped_addr, length);
-                    return errno(EFAULT);
+                    return match error {
+                        MapError::OutOfMemory => errno(ENOMEM),
+                        MapError::Address | MapError::Occupied => errno(EFAULT),
+                    };
                 }
                 filled += bytes.len() as u64;
                 if bytes.len() < want {
                     break;
                 }
-            }
-        }
-        if initial_access != access {
-            let _mm = process.shared.program_break.lock();
-            if let Err(error) = memory.protect(mapped_addr, length, access) {
-                memory.unmap(mapped_addr, length);
-                return map_errno(error);
             }
         }
         if is_shared {
@@ -809,7 +780,6 @@ fn move_shared_range<R: Resources>(
 async fn populate_grown_shared_tail<R: Resources, M: VirtualMemory, F: fs::Filesystem<R>>(
     process: &Process<R>,
     tail: GrownSharedTail<R::File>,
-    region_access: PageFlags,
     memory: &mut M,
     fs: &mut F,
 ) {
@@ -818,50 +788,26 @@ async fn populate_grown_shared_tail<R: Resources, M: VirtualMemory, F: fs::Files
     };
     if tail.tail_file_offset < stat.size {
         let to_load = tail.tail_len.min(stat.size - tail.tail_file_offset);
-        let need_temp_write = !region_access.contains(PageFlags::WRITE);
-        if need_temp_write {
-            let _mm = process.shared.program_break.lock();
-            if memory
-                .protect(
-                    tail.tail_addr,
-                    tail.tail_len,
-                    PageFlags::READ | PageFlags::WRITE,
-                )
-                .is_err()
-            {
-                return;
-            }
-        }
         const CHUNK: usize = 64 * 1024;
         let mut filled = 0u64;
-        let mut ok = true;
         while filled < to_load {
             let want = (to_load - filled).min(CHUNK as u64) as usize;
             let Ok(bytes) = fs
                 .read_at(&tail.file, tail.tail_file_offset + filled, want)
                 .await
             else {
-                ok = false;
-                break;
+                return;
             };
             if bytes.is_empty() {
                 break;
             }
-            if memory.write(tail.tail_addr + filled, &bytes).is_err() {
-                ok = false;
-                break;
+            if memory.populate(tail.tail_addr + filled, &bytes).is_err() {
+                return;
             }
             filled += bytes.len() as u64;
             if bytes.len() < want {
                 break;
             }
-        }
-        if need_temp_write {
-            let _mm = process.shared.program_break.lock();
-            let _ = memory.protect(tail.tail_addr, tail.tail_len, region_access);
-        }
-        if !ok {
-            return;
         }
     }
     let mut guard = process.shared.shared_mappings.lock();
@@ -986,7 +932,7 @@ pub(super) async fn mremap<R: Resources, M: VirtualMemory, F: fs::Filesystem<R>>
         Err(err) => return err,
     };
     if let Some(tail) = grown_tail {
-        populate_grown_shared_tail(process, tail, region.access, memory, fs).await;
+        populate_grown_shared_tail(process, tail, memory, fs).await;
     }
     target
 }
@@ -1036,7 +982,7 @@ async fn mremap_to<R: Resources, M: VirtualMemory, F: fs::Filesystem<R>>(
         }
         old_length = new_length;
     }
-    let (target, region_access, grown_tail) = {
+    let (target, grown_tail) = {
         let _mm = process.shared.program_break.lock();
         let region = match memory.region(address, task) {
             Some(region) if region.start == address => region,
@@ -1066,10 +1012,10 @@ async fn mremap_to<R: Resources, M: VirtualMemory, F: fs::Filesystem<R>>(
             }
             memory.discard(address, old_length);
         }
-        (target, region.access, tail)
+        (target, tail)
     };
     if let Some(tail) = grown_tail {
-        populate_grown_shared_tail(process, tail, region_access, memory, fs).await;
+        populate_grown_shared_tail(process, tail, memory, fs).await;
     }
     target
 }
