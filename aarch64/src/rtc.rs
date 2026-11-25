@@ -26,10 +26,11 @@ impl RealTimeClock for Pl031Rtc {
     const SOURCE: &'static str = "pl031";
 
     fn read(&self) -> Result<UnixSeconds, RtcError> {
-        // SAFETY: `base` is the mapped device window the platform
-        // describes for its PL031, and `RTCDR` is a 32-bit read-only
-        // register at its start.
-        let seconds = unsafe { ((self.base + PL031_DATA) as *const u32).read_volatile() };
+        let data_register = (self.base + PL031_DATA) as *const u32;
+        // SAFETY: `map` verified `self.base` is mapped over at least
+        // `PL031_DATA + size_of::<u32>()` bytes of Device-nGnRnE memory and
+        // `data_register` is 4-byte aligned for reading `RTCDR`.
+        let seconds = unsafe { data_register.read_volatile() };
         Ok(UnixSeconds::new(u64::from(seconds)))
     }
 }
@@ -43,9 +44,17 @@ pub(crate) fn map(
     physical_memory_offset: usize,
     handoff: &LimineBootHandoff,
 ) -> Pl031Rtc {
-    assert!(region.size != 0, "AArch64 PL031 window has zero size");
-    crate::map_mmio_page(region.base, physical_memory_offset, handoff);
-    Pl031Rtc {
-        base: crate::mmio_virtual_base(region.base, physical_memory_offset),
-    }
+    assert!(
+        region.size >= PL031_DATA + core::mem::size_of::<u32>(),
+        "AArch64 PL031 window size {} is smaller than RTCDR",
+        region.size
+    );
+    crate::map_mmio_range(region.base, region.size, physical_memory_offset, handoff);
+    let base = crate::mmio_virtual_base(region.base, physical_memory_offset);
+    assert!(
+        (base + PL031_DATA).is_multiple_of(core::mem::align_of::<u32>()),
+        "AArch64 PL031 RTCDR address {:#x} is not 4-byte aligned",
+        base + PL031_DATA
+    );
+    Pl031Rtc { base }
 }

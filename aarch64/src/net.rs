@@ -243,6 +243,9 @@ fn init_network_device(
     let header = core::ptr::NonNull::new(virtual_base as *mut u8)
         .unwrap_or_else(|| panic!("virtio MMIO base {virtual_base:#x} was unexpectedly null"));
     let dma = crate::dma_pool();
+    // SAFETY: `header` points to the permanently mapped `size`-byte virtio-net
+    // MMIO register block from the platform device tree, and no other driver
+    // accesses this device's registers.
     let device = unsafe { helios_virtio::net_from_mmio_with_dma(header, size, dma, pair_budget) }
         .unwrap_or_else(|error| {
             panic!("failed to initialize virtio-net device at {physical_base:#x}: {error}")

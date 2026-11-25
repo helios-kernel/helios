@@ -15,7 +15,13 @@ impl HostAllocator {
     pub(super) fn with_scope(self, scope: SystemAllocationScope) -> Self {
         Self { scope, ..self }
     }
-    /// The caller supplies Vulkan-valid callbacks and their userdata lifetime.
+    /// Construct a host allocator from optional Vulkan allocation callbacks.
+    ///
+    /// # Safety
+    /// If `callbacks` is non-null, it must point to a live Vulkan
+    /// `AllocationCallbacks` with valid `pfn_allocation` and `pfn_free`
+    /// function pointers, and its `p_user_data` must be thread-safe and outlive
+    /// every object allocated with this `HostAllocator`.
     pub(super) unsafe fn new(
         callbacks: *const AllocationCallbacks<'_>,
         scope: SystemAllocationScope,
@@ -23,11 +29,13 @@ impl HostAllocator {
         let callbacks = if callbacks.is_null() {
             None
         } else {
+            // SAFETY: non-null `callbacks` points to a live Vulkan `AllocationCallbacks`.
+            let callbacks = unsafe { *callbacks };
             // SAFETY: Vulkan ties the callbacks' userdata to the allocated
             // objects' lifetime, not the create-info structure's borrow.
             Some(unsafe {
                 core::mem::transmute::<AllocationCallbacks<'_>, AllocationCallbacks<'static>>(
-                    *callbacks,
+                    callbacks,
                 )
             })
         };

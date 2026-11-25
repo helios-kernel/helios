@@ -160,6 +160,8 @@ global_asm!(
     native_users = const cfg!(feature = "native-users") as u8,
 );
 
+// SAFETY: these symbols are defined in `exceptions.S` with the C ABI expected
+// by the IDT exception stubs.
 #[cfg(feature = "native-users")]
 unsafe extern "C" {
     fn helios_x86_exception_debug();
@@ -173,6 +175,8 @@ unsafe extern "C" {
     fn helios_x86_exception_control_protection();
 }
 
+// SAFETY: these symbols are defined in `exceptions.S` with the C ABI expected
+// by the IDT exception and interrupt stubs.
 unsafe extern "C" {
     fn helios_x86_exception_divide_error();
     fn helios_x86_exception_breakpoint();
@@ -216,6 +220,9 @@ pub(crate) struct ProcessorIdt {
     table: UnsafeCell<InterruptDescriptorTable>,
 }
 
+// SAFETY: each `ProcessorIdt` belongs to one `ProcessorRuntime` and is
+// mutated and loaded only by its owning processor inside
+// `install_for_current_processor` with interrupts disabled.
 unsafe impl Sync for ProcessorIdt {}
 
 impl ProcessorIdt {
@@ -226,152 +233,227 @@ impl ProcessorIdt {
     }
 
     pub(crate) fn install(&self) {
+        // SAFETY: this runs on the owning processor with interrupts disabled
+        // inside `install_for_current_processor`, and nothing else reaches
+        // `self.table`.
         let table = unsafe { &mut *self.table.get() };
         *table = InterruptDescriptorTable::new();
+        // SAFETY: `helios_x86_exception_divide_error` is a valid IDT entry
+        // stub defined in `exceptions.S`.
         unsafe {
             table
                 .divide_error
                 .set_handler_addr(handler_address(helios_x86_exception_divide_error));
+        }
+        // SAFETY: `helios_x86_exception_breakpoint` is a valid IDT entry stub
+        // defined in `exceptions.S`.
+        unsafe {
             table
                 .breakpoint
                 .set_handler_addr(handler_address(helios_x86_exception_breakpoint));
+        }
+        // SAFETY: `helios_x86_exception_invalid_opcode` is a valid IDT entry
+        // stub defined in `exceptions.S`.
+        unsafe {
             table
                 .invalid_opcode
                 .set_handler_addr(handler_address(helios_x86_exception_invalid_opcode));
+        }
+        // SAFETY: `helios_x86_exception_general_protection` is a valid IDT
+        // entry stub defined in `exceptions.S`.
+        unsafe {
             table
                 .general_protection_fault
                 .set_handler_addr(handler_address(helios_x86_exception_general_protection));
-            // A page fault raised by a push below `rsp` cannot be taken
-            // on the interrupted stack: the processor's own push of the
-            // exception frame lands in the same unmapped page and faults
-            // during delivery, which is a double fault, and a double
-            // fault without a stack of its own is a triple fault and a
-            // reset. Both take a stack the TSS names.
+        }
+        // A page fault raised by a push below `rsp` cannot be taken
+        // on the interrupted stack: the processor's own push of the
+        // exception frame lands in the same unmapped page and faults
+        // during delivery, which is a double fault, and a double
+        // fault without a stack of its own is a triple fault and a
+        // reset. Both take a stack the TSS names.
+        //
+        // SAFETY: `helios_x86_exception_page_fault` is a valid IDT entry stub
+        // defined in `exceptions.S`.
+        let page_fault = unsafe {
             table
                 .page_fault
                 .set_handler_addr(handler_address(helios_x86_exception_page_fault))
-                .set_stack_index(PAGE_FAULT_IST_INDEX);
+        };
+        // SAFETY: `PAGE_FAULT_IST_INDEX` refers to a valid, 16-byte-aligned
+        // exception stack installed in this processor's TSS before this IDT is
+        // loaded.
+        unsafe {
+            page_fault.set_stack_index(PAGE_FAULT_IST_INDEX);
+        }
+        // SAFETY: `helios_x86_exception_double_fault` is a valid IDT entry stub
+        // defined in `exceptions.S`.
+        let double_fault = unsafe {
             table
                 .double_fault
                 .set_handler_addr(handler_address(helios_x86_exception_double_fault))
-                .set_stack_index(DOUBLE_FAULT_IST_INDEX);
+        };
+        // SAFETY: `DOUBLE_FAULT_IST_INDEX` refers to a valid, 16-byte-aligned
+        // exception stack installed in this processor's TSS before this IDT is
+        // loaded.
+        unsafe {
+            double_fault.set_stack_index(DOUBLE_FAULT_IST_INDEX);
+        }
+        // SAFETY: `helios_x86_exception_x87_floating_point` is a valid IDT
+        // entry stub defined in `exceptions.S`.
+        unsafe {
             table
                 .x87_floating_point
                 .set_handler_addr(handler_address(helios_x86_exception_x87_floating_point));
+        }
+        // SAFETY: `helios_x86_exception_simd_floating_point` is a valid IDT
+        // entry stub defined in `exceptions.S`.
+        unsafe {
             table
                 .simd_floating_point
                 .set_handler_addr(handler_address(helios_x86_exception_simd_floating_point));
-            install_interrupt(table, TIMER_INTERRUPT_VECTOR, helios_x86_interrupt_timer);
-            install_interrupt(table, WAKE_INTERRUPT_VECTOR, helios_x86_interrupt_wake);
-            install_interrupt(
-                table,
-                APIC_ERROR_INTERRUPT_VECTOR,
-                helios_x86_interrupt_apic_error,
-            );
-            install_interrupt(
-                table,
+        }
+        let fixed_interrupts: [(u8, unsafe extern "C" fn()); 12] = [
+            (TIMER_INTERRUPT_VECTOR, helios_x86_interrupt_timer),
+            (WAKE_INTERRUPT_VECTOR, helios_x86_interrupt_wake),
+            (APIC_ERROR_INTERRUPT_VECTOR, helios_x86_interrupt_apic_error),
+            (
                 TLB_SHOOTDOWN_INTERRUPT_VECTOR,
                 helios_x86_interrupt_tlb_shootdown,
-            );
-            install_interrupt(
-                table,
-                NETWORK_INTERRUPT_VECTOR,
-                helios_x86_interrupt_network,
-            );
-            let network_queue_stubs: [unsafe extern "C" fn(); MAX_NETWORK_QUEUE_VECTORS] = [
-                helios_x86_interrupt_network_queue_0,
-                helios_x86_interrupt_network_queue_1,
-                helios_x86_interrupt_network_queue_2,
-                helios_x86_interrupt_network_queue_3,
-                helios_x86_interrupt_network_queue_4,
-                helios_x86_interrupt_network_queue_5,
-                helios_x86_interrupt_network_queue_6,
-                helios_x86_interrupt_network_queue_7,
-            ];
-            for (vector, stub) in NETWORK_QUEUE_INTERRUPT_VECTORS
-                .iter()
-                .zip(network_queue_stubs)
-            {
-                install_interrupt(table, *vector, stub);
-            }
-            install_interrupt(
-                table,
-                HOST_FS_INTERRUPT_VECTOR,
-                helios_x86_interrupt_host_fs,
-            );
-            install_interrupt(
-                table,
-                ENTROPY_INTERRUPT_VECTOR,
-                helios_x86_interrupt_entropy,
-            );
-            install_interrupt(table, VSOCK_INTERRUPT_VECTOR, helios_x86_interrupt_vsock);
-            install_interrupt(
-                table,
-                DISPLAY_INTERRUPT_VECTOR,
-                helios_x86_interrupt_display,
-            );
-            let input_stubs: [unsafe extern "C" fn(); helios_kernel::MAX_INPUT_DEVICES] = [
-                helios_x86_interrupt_input_0,
-                helios_x86_interrupt_input_1,
-                helios_x86_interrupt_input_2,
-                helios_x86_interrupt_input_3,
-            ];
-            for (vector, stub) in INPUT_INTERRUPT_VECTORS.iter().zip(input_stubs) {
-                install_interrupt(table, *vector, stub);
-            }
-            install_interrupt(table, SOUND_INTERRUPT_VECTOR, helios_x86_interrupt_sound);
-            let block_stubs: [unsafe extern "C" fn(); helios_kernel::MAX_BLOCK_DEVICES] = [
-                helios_x86_interrupt_block_0,
-                helios_x86_interrupt_block_1,
-                helios_x86_interrupt_block_2,
-                helios_x86_interrupt_block_3,
-            ];
-            for (vector, stub) in BLOCK_INTERRUPT_VECTORS.iter().zip(block_stubs) {
-                install_interrupt(table, *vector, stub);
-            }
-            install_interrupt(
-                table,
+            ),
+            (NETWORK_INTERRUPT_VECTOR, helios_x86_interrupt_network),
+            (HOST_FS_INTERRUPT_VECTOR, helios_x86_interrupt_host_fs),
+            (ENTROPY_INTERRUPT_VECTOR, helios_x86_interrupt_entropy),
+            (VSOCK_INTERRUPT_VECTOR, helios_x86_interrupt_vsock),
+            (DISPLAY_INTERRUPT_VECTOR, helios_x86_interrupt_display),
+            (SOUND_INTERRUPT_VECTOR, helios_x86_interrupt_sound),
+            (
                 DEBUG_SERIAL_INTERRUPT_VECTOR,
                 helios_x86_interrupt_debug_serial,
-            );
-            install_interrupt(table, SCI_INTERRUPT_VECTOR, helios_x86_interrupt_sci);
-            #[cfg(feature = "native-users")]
-            {
-                // Ring-3 `int3` (`0xCC`) checks `CPL <= IDT[3].DPL` before
-                // delivering `#BP`, matching Linux `arch/x86/kernel/idt.c`
-                // (`SYSG(X86_TRAP_BP, ...)`).
+            ),
+            (SCI_INTERRUPT_VECTOR, helios_x86_interrupt_sci),
+        ];
+        let network_queue_stubs: [unsafe extern "C" fn(); MAX_NETWORK_QUEUE_VECTORS] = [
+            helios_x86_interrupt_network_queue_0,
+            helios_x86_interrupt_network_queue_1,
+            helios_x86_interrupt_network_queue_2,
+            helios_x86_interrupt_network_queue_3,
+            helios_x86_interrupt_network_queue_4,
+            helios_x86_interrupt_network_queue_5,
+            helios_x86_interrupt_network_queue_6,
+            helios_x86_interrupt_network_queue_7,
+        ];
+        let input_stubs: [unsafe extern "C" fn(); helios_kernel::MAX_INPUT_DEVICES] = [
+            helios_x86_interrupt_input_0,
+            helios_x86_interrupt_input_1,
+            helios_x86_interrupt_input_2,
+            helios_x86_interrupt_input_3,
+        ];
+        let block_stubs: [unsafe extern "C" fn(); helios_kernel::MAX_BLOCK_DEVICES] = [
+            helios_x86_interrupt_block_0,
+            helios_x86_interrupt_block_1,
+            helios_x86_interrupt_block_2,
+            helios_x86_interrupt_block_3,
+        ];
+        for (vector, stub) in fixed_interrupts
+            .into_iter()
+            .chain(
+                NETWORK_QUEUE_INTERRUPT_VECTORS
+                    .into_iter()
+                    .zip(network_queue_stubs),
+            )
+            .chain(INPUT_INTERRUPT_VECTORS.into_iter().zip(input_stubs))
+            .chain(BLOCK_INTERRUPT_VECTORS.into_iter().zip(block_stubs))
+        {
+            // SAFETY: each `stub` is a valid interrupt entry stub in
+            // `exceptions.S` and `INTERRUPT_IST_INDEX` refers to a valid,
+            // 16-byte-aligned stack in this processor's TSS.
+            unsafe {
+                install_interrupt(table, vector, stub);
+            }
+        }
+        #[cfg(feature = "native-users")]
+        {
+            // Ring-3 `int3` (`0xCC`) checks `CPL <= IDT[3].DPL` before
+            // delivering `#BP`, matching Linux `arch/x86/kernel/idt.c`
+            // (`SYSG(X86_TRAP_BP, ...)`).
+            //
+            // SAFETY: `helios_x86_exception_breakpoint` is a valid IDT entry
+            // stub defined in `exceptions.S`.
+            let breakpoint = unsafe {
                 table
                     .breakpoint
                     .set_handler_addr(handler_address(helios_x86_exception_breakpoint))
-                    .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+            };
+            breakpoint.set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+            // SAFETY: `helios_x86_exception_debug` is a valid IDT entry stub
+            // defined in `exceptions.S`.
+            unsafe {
                 table
                     .debug
                     .set_handler_addr(handler_address(helios_x86_exception_debug));
+            }
+            // SAFETY: `helios_x86_exception_overflow` is a valid IDT entry stub
+            // defined in `exceptions.S`.
+            unsafe {
                 table
                     .overflow
                     .set_handler_addr(handler_address(helios_x86_exception_overflow));
+            }
+            // SAFETY: `helios_x86_exception_bound` is a valid IDT entry stub
+            // defined in `exceptions.S`.
+            unsafe {
                 table
                     .bound_range_exceeded
                     .set_handler_addr(handler_address(helios_x86_exception_bound));
+            }
+            // SAFETY: `helios_x86_exception_device_unavailable` is a valid IDT
+            // entry stub defined in `exceptions.S`.
+            unsafe {
                 table
                     .device_not_available
                     .set_handler_addr(handler_address(helios_x86_exception_device_unavailable));
+            }
+            // SAFETY: `helios_x86_exception_invalid_tss` is a valid IDT entry
+            // stub defined in `exceptions.S`.
+            unsafe {
                 table
                     .invalid_tss
                     .set_handler_addr(handler_address(helios_x86_exception_invalid_tss));
+            }
+            // SAFETY: `helios_x86_exception_segment_missing` is a valid IDT
+            // entry stub defined in `exceptions.S`.
+            unsafe {
                 table
                     .segment_not_present
                     .set_handler_addr(handler_address(helios_x86_exception_segment_missing));
+            }
+            // SAFETY: `helios_x86_exception_stack_segment` is a valid IDT
+            // entry stub defined in `exceptions.S`.
+            unsafe {
                 table
                     .stack_segment_fault
                     .set_handler_addr(handler_address(helios_x86_exception_stack_segment));
+            }
+            // SAFETY: `helios_x86_exception_alignment` is a valid IDT entry
+            // stub defined in `exceptions.S`.
+            unsafe {
                 table
                     .alignment_check
                     .set_handler_addr(handler_address(helios_x86_exception_alignment));
+            }
+            // SAFETY: `helios_x86_exception_control_protection` is a valid IDT
+            // entry stub defined in `exceptions.S`.
+            unsafe {
                 table
                     .cp_protection_exception
                     .set_handler_addr(handler_address(helios_x86_exception_control_protection));
             }
+        }
+        // SAFETY: `table` lives in `ProcessorRuntime` for the lifetime of the
+        // processor, every entry installed above points to a valid stub, and
+        // interrupts are disabled while loading IDTR.
+        unsafe {
             table.load_unsafe();
         }
     }
@@ -438,8 +520,10 @@ impl ProcessorSegments {
             "x86 IST stack tops must be 16-byte aligned"
         );
         // SAFETY: this runs once per processor, on that processor, with
-        // interrupts disabled, and nothing else reaches these cells.
+        // interrupts disabled, and nothing else reaches this cell.
         let tss = unsafe { &mut *self.tss.get() };
+        // SAFETY: this runs once per processor, on that processor, with
+        // interrupts disabled, and nothing else reaches this cell.
         let gdt = unsafe { &mut *self.gdt.get() };
         *tss = TaskStateSegment::new();
         tss.interrupt_stack_table[usize::from(PAGE_FAULT_IST_INDEX)] =
@@ -451,10 +535,6 @@ impl ProcessorSegments {
         *gdt = GlobalDescriptorTable::new();
         let code = gdt.append(Descriptor::kernel_code_segment());
         let data = gdt.append(Descriptor::kernel_data_segment());
-        // SAFETY: the TSS lives in a `ProcessorRuntime` that
-        // `publish_anchor_identities` pinned at its final address before
-        // any processor was activated, so the descriptor's base stays
-        // valid for as long as the processor runs.
         #[cfg(feature = "native-users")]
         {
             let user_data = gdt.append(Descriptor::user_data_segment());
@@ -463,15 +543,40 @@ impl ProcessorSegments {
             assert_eq!(user_code.0, crate::native::USER_CODE);
             tss.privilege_stack_table[0] = VirtAddr::new(self.interrupt_stack.end as u64);
         }
-        let tss_selector = gdt.append(unsafe { Descriptor::tss_segment_unchecked(tss) });
-        // SAFETY: the table outlives the processor for the reason above;
-        // the selectors loaded are the ones this table just produced.
+        // SAFETY: the TSS lives in a `ProcessorRuntime` that
+        // `publish_anchor_identities` pinned at its final address before
+        // any processor was activated, so the descriptor's base stays
+        // valid for as long as the processor runs.
+        let tss_descriptor = unsafe { Descriptor::tss_segment_unchecked(tss) };
+        let tss_selector = gdt.append(tss_descriptor);
+        // SAFETY: `gdt` outlives the processor for the reason above and holds
+        // the selectors loaded below.
         unsafe {
             gdt.load_unsafe();
+        }
+        // SAFETY: `code` is the valid kernel code segment selector from the
+        // GDT loaded above.
+        unsafe {
             CS::set_reg(code);
+        }
+        // SAFETY: `data` is the valid kernel data segment selector from the
+        // GDT loaded above.
+        unsafe {
             SS::set_reg(data);
+        }
+        // SAFETY: `data` is the valid kernel data segment selector from the
+        // GDT loaded above.
+        unsafe {
             DS::set_reg(data);
+        }
+        // SAFETY: `data` is the valid kernel data segment selector from the
+        // GDT loaded above.
+        unsafe {
             ES::set_reg(data);
+        }
+        // SAFETY: `tss_selector` selects the valid TSS descriptor in the GDT
+        // loaded above, and its IST stacks are initialized and aligned.
+        unsafe {
             load_tss(tss_selector);
         }
     }
@@ -611,15 +716,24 @@ fn assert_frame_on_interrupt_stack(frame: &ExceptionFrame) {
 /// IST. Every external interrupt installs through here so none can be
 /// delivered on the interrupted stack; what that delivery loses is on
 /// [`INTERRUPT_IST_INDEX`].
+///
+/// # Safety
+///
+/// `stub` must be a valid IDT interrupt entry stub matching the kernel's
+/// interrupt dispatch ABI, and [`INTERRUPT_IST_INDEX`] must refer to a valid
+/// IST entry in the active processor's TSS before interrupts are enabled.
 unsafe fn install_interrupt(
     table: &mut InterruptDescriptorTable,
     vector: u8,
     stub: unsafe extern "C" fn(),
 ) {
+    let entry = &mut table[vector];
+    // SAFETY: caller guarantees `stub` is a valid interrupt entry stub.
+    let options = unsafe { entry.set_handler_addr(handler_address(stub)) };
+    // SAFETY: caller guarantees `INTERRUPT_IST_INDEX` names a valid TSS IST
+    // slot before interrupts are enabled.
     unsafe {
-        table[vector]
-            .set_handler_addr(handler_address(stub))
-            .set_stack_index(INTERRUPT_IST_INDEX);
+        options.set_stack_index(INTERRUPT_IST_INDEX);
     }
 }
 

@@ -169,6 +169,8 @@ pub(crate) fn allocate_trap_stack() -> Range<usize> {
 /// hart and nothing else may ever write `sscratch`; the entry and exit
 /// own that register from this point.
 pub(crate) unsafe fn seed_trap_stack(stack: &Range<usize>) {
+    // SAFETY: caller guarantees `stack` is this hart's trap stack and
+    // nothing else writes `sscratch` after this point.
     unsafe {
         asm!("csrw sscratch, {top}", top = in(reg) stack.end, options(nomem, nostack));
     }
@@ -199,16 +201,16 @@ pub(crate) fn assert_frame_on_trap_stack(frame: &TrapFrame, stack: &Range<usize>
 /// for a nested frame, whose exit leaves the hart inside the outer
 /// handler.
 fn trap_stack_top_for(frame: &TrapFrame) -> usize {
-    // SAFETY: the entry carves `TRAP_REGION_BYTES` per trap and writes
-    // the slot at `TRAP_FRAME_BYTES` above the frame; `frame` is one the
-    // entry built, which is what every caller holds.
-    unsafe {
-        core::ptr::from_ref(frame)
-            .cast::<u8>()
-            .add(TRAP_FRAME_BYTES)
-            .cast::<usize>()
-            .read()
-    }
+    // Compute the address via exposed integer provenance rather than
+    // `ptr::add` on `&TrapFrame`, since the `sscratch` slot sits immediately
+    // above `TrapFrame` inside the `TRAP_REGION_BYTES` allocation carved by
+    // `trap.S` on the hart's trap stack.
+    let slot = (core::ptr::from_ref(frame) as usize + TRAP_FRAME_BYTES) as *const usize;
+    // SAFETY: `trap.S` carved `TRAP_REGION_BYTES` (`TRAP_FRAME_BYTES + 16`)
+    // on this hart's trap stack (whose provenance was exposed in
+    // `allocate_trap_stack`) and initialized the 8-byte-aligned `sscratch`
+    // slot at `frame + TRAP_FRAME_BYTES`.
+    unsafe { slot.read() }
 }
 
 /// What the hand-over needs once the trap stack is gone: the exception
@@ -295,12 +297,16 @@ pub(crate) fn hand_over_trap(record: TrapHandOver, frame: &TrapFrame) -> HandOve
     let slot = runtime.hand_over_stack.end - core::mem::size_of::<TrapHandOver>();
     // SAFETY: the hand-over stack belongs to this hart and nothing runs on
     // it: the refusals above rule out a trap taken from a hand-over in
-    // progress, and none is suspended. The switch is entered from the
-    // dispatcher of an outermost frame, so `sscratch` is zero and `SIE`
-    // clear, with the slot the record was just written to and the top
-    // this frame's exit would have handed back.
+    // progress, and none is suspended. `slot` is 16-byte aligned within
+    // `runtime.hand_over_stack`.
     unsafe {
         (slot as *mut TrapHandOver).write(record);
+    }
+    // SAFETY: the switch is entered from the dispatcher of an outermost
+    // frame, so `sscratch` is zero and `SIE` clear, with `record` written
+    // at `slot` and `trap_stack_top` the top this frame's exit would have
+    // handed back.
+    unsafe {
         __helios_riscv_trap_hand_over(
             slot,
             trap_stack_top,
@@ -469,6 +475,8 @@ impl HandOverProbe {
 /// `sp` and `fp` must belong to a live frame that `pc` expects to resume
 /// into with no other register restored.
 unsafe fn resume_as_the_runtime_does(pc: usize, sp: usize, fp: usize) -> ! {
+    // SAFETY: caller guarantees `sp` and `fp` belong to a live frame that
+    // `pc` expects to resume into with no other registers restored.
     unsafe {
         asm!(
             "mv sp, a2",
@@ -588,8 +596,9 @@ pub(crate) fn verify_trap_hand_over() {
 /// The caller must not point `stvec` anywhere else afterwards: the entry
 /// and [`TrapFrame`] are one contract.
 pub(crate) unsafe fn install_trap_vector() {
-    // Direct mode is bit 0 of `stvec` clear, which the entry's four-byte
-    // alignment guarantees.
+    // SAFETY: `__helios_riscv_trap_entry` is four-byte aligned (so bit 0 of
+    // `stvec` is clear for direct mode), and the caller guarantees `stvec`
+    // stays pointed here for the trap entry / `TrapFrame` contract.
     unsafe {
         asm!(
             "csrw stvec, {vector}",

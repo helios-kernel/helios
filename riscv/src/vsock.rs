@@ -75,6 +75,10 @@ fn discover_vsock_device(fdt: &Fdt<'_>) -> Option<(VirtioVsockDevice, PlicInterr
         .interrupt
         .and_then(PlicInterrupt::from_specifier)
         .unwrap_or_else(|| panic!("virtio-vsock node at {base:#x} has no valid interrupt source"));
+    // SAFETY: `candidate` comes from `mmio_candidates(fdt)` and matched
+    // `DeviceType::Vsock` on the bootstrap hart before interrupts are
+    // unmasked, so `header..header + candidate.size` is an identity-mapped
+    // VirtIO MMIO vsock register block with exclusive driver access.
     let device =
         unsafe { helios_virtio::vsock_from_mmio(header, candidate.size) }.unwrap_or_else(|error| {
             panic!("failed to initialize virtio-vsock device at {base:#x}: {error}")

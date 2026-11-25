@@ -196,18 +196,24 @@ impl Aarch64Tables {
                 let next = zeroed_table()?;
                 self.tables.push(next);
                 let physical = next.as_ptr() as u64 - self.offset as u64;
-                // SAFETY: as above. The zeroed table is visible to the walker
-                // before the descriptor that names it (`dsb` in `publish`).
+                // SAFETY: `dsb ishst` ensures the zeroed child table is visible
+                // to table walkers before the descriptor below names it.
                 unsafe {
                     asm!("dsb ishst", options(nostack, preserves_flags));
+                }
+                // SAFETY: `entry` points into a table of this space under its
+                // lock, and the new child table was zeroed and published above.
+                unsafe {
                     entry.write_volatile(physical | TABLE | PXN_TABLE);
                 }
                 physical
             };
         }
         let index = (base >> 12) as usize & (ENTRIES - 1);
-        // SAFETY: the last-level table of `base`, as above.
-        Ok(unsafe { self.entries(table).add(index) })
+        // SAFETY: `table` is the last-level table of `base`, reached through
+        // the direct map, and `index` is below its 512 entries.
+        let leaf = unsafe { self.entries(table).add(index) };
+        Ok(leaf)
     }
 }
 
@@ -260,26 +266,35 @@ unsafe impl UserTranslation for Aarch64Tables {
 
     fn protect(&mut self, base: u64, flags: PageFlags) {
         let leaf = self.leaf(base).expect("an installed page has its tables");
+        // SAFETY: `leaf` is an aligned, mapped entry of this space under its
+        // lock.
+        let physical = unsafe { leaf.read_volatile() } & ADDRESS;
         // SAFETY: as in `install`. Only the access bits change, which the
         // Arm ARM's break-before-make rules do not require a break for; the
         // caller invalidates a narrowing.
         unsafe {
-            let physical = leaf.read_volatile() & ADDRESS;
             leaf.write_volatile(page_descriptor(physical, flags));
         }
         publish();
     }
 
     fn invalidate(&self, first: u64, last: u64) {
-        // SAFETY: TLB maintenance and barriers only. `vale1is` broadcasts
-        // to every processor in the inner-shareable domain, the `dsb ish`
-        // after it waits until each has completed it, and the operand is
-        // VA[55:12] with ASID 0, which every user page is tagged with.
+        // SAFETY: `dsb ishst` orders prior page-table writes before the TLB
+        // invalidations below.
         unsafe {
             asm!("dsb ishst", options(nostack, preserves_flags));
-            for base in (first..last).step_by(PAGE as usize) {
+        }
+        for base in (first..last).step_by(PAGE as usize) {
+            // SAFETY: `vale1is` broadcasts to every processor in the
+            // inner-shareable domain for `VA[55:12]` with ASID 0, which every
+            // user page is tagged with.
+            unsafe {
                 asm!("tlbi vale1is, {}", in(reg) base >> 12, options(nostack, preserves_flags));
             }
+        }
+        // SAFETY: `dsb ish` waits until every inner-shareable processor has
+        // completed the `tlbi`, and `isb` synchronizes the context.
+        unsafe {
             asm!("dsb ish", "isb", options(nostack, preserves_flags));
         }
     }
@@ -464,10 +479,14 @@ unsafe impl UserContext for Aarch64Context {
         let slice = space.begin_slice();
         self.switch.user_ttbr0 = slice.with_tables(|tables| tables.root_physical());
         let tcr: u64;
-        let daif: u64;
-        // SAFETY: reads a system register and masks IRQs on this processor.
+        // SAFETY: reading `tcr_el1` has no side effects and touches no memory.
         unsafe {
             asm!("mrs {}, tcr_el1", out(reg) tcr, options(nomem, nostack, preserves_flags));
+        }
+        let daif: u64;
+        // SAFETY: saves `daif` and masks IRQs on this processor until the
+        // matching restore after slice exit.
+        unsafe {
             asm!("mrs {}, daif", "msr daifset, #2", out(reg) daif, options(nostack));
         }
         self.switch.user_tcr =
@@ -683,6 +702,9 @@ pub(crate) fn verify_user_isolation(isolation: UserIsolation) {
             in("x2") data.raw(),
             out("x30") _,
         );
+    }
+    // SAFETY: restores the `daif` interrupt mask saved above.
+    unsafe {
         crate::write_daif(daif);
     }
     probe.code.store(0, Ordering::Relaxed);

@@ -116,7 +116,9 @@ pub unsafe fn instance_from_connection<F: Factory>(
             allocator.map_or(core::ptr::null(), |allocator| allocator),
             &mut handle,
         )
-        .result()?;
-        Ok(ash::Instance::load(entry::<F>().static_fn(), handle))
     }
+    .result()?;
+    // SAFETY: `create_on_connection` succeeded and produced a live instance
+    // handle dispatched by `entry::<F>()`.
+    Ok(unsafe { ash::Instance::load(entry::<F>().static_fn(), handle) })
 }

@@ -614,6 +614,7 @@ impl PeriodWriter {
             filled,
             capacity: period.len(),
             index,
+            _ring: self.ring.clone(),
         }))
     }
 
@@ -716,6 +717,8 @@ pub struct PeriodCursor {
     capacity: usize,
     /// The period's own index in its ring, so the writer can commit it.
     index: u8,
+    /// Retains the ring's pinned period pages for as long as the cursor lives.
+    _ring: Arc<PeriodRing>,
 }
 
 impl PeriodCursor {
@@ -730,9 +733,9 @@ impl PeriodCursor {
     /// [`Self::advance`] does — which is what keeps a partially consumed
     /// write from stranding bytes the caller was never told it took.
     pub(crate) fn tail(&mut self) -> &mut [u8] {
-        // SAFETY: `base` is the kernel alias of a pinned period whose
-        // ownership the ring's free list made exclusive to this task,
-        // and `room()` bytes follow `base + filled` inside it.
+        // SAFETY: `base` is the kernel alias of a pinned period kept alive
+        // by `_ring`, whose ownership the ring's free list made exclusive to
+        // this task, and `room()` bytes follow `base + filled` inside it.
         unsafe {
             core::slice::from_raw_parts_mut(
                 self.base.saturating_add(self.filled).raw() as *mut u8,

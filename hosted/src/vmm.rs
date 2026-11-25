@@ -237,6 +237,9 @@ impl HostedAddressSpace {
             let regions = tracker.committed_intersections(page_range)?;
             if regions.is_empty() {
                 if reclaim {
+                    // SAFETY: `cursor` is host-page aligned and `page_range`
+                    // lies inside a live reservation of this address space
+                    // with no remaining committed regions on this host page.
                     unsafe {
                         #[cfg(target_os = "linux")]
                         libc::madvise(cursor as *mut _, page_range.byte_len, libc::MADV_DONTNEED);
@@ -291,6 +294,9 @@ impl AddressSpace for HostedAddressSpace {
         if !byte_len.is_multiple_of(PAGE_SIZE) {
             return Err(AddressSpaceError::Misaligned);
         }
+        // SAFETY: `byte_len` is non-zero and page-aligned, and an anonymous
+        // `PROT_NONE` `mmap` with a null hint lets the host pick a fresh
+        // unmapped virtual range.
         let ptr = unsafe {
             libc::mmap(
                 ptr::null_mut(),
@@ -312,6 +318,9 @@ impl AddressSpace for HostedAddressSpace {
     fn release(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         let released = self.reservations.lock().unwrap().release(virt)?;
         self.swap.discard(self, released.swapped);
+        // SAFETY: `reservations.release(virt)` verified `virt` is an exact
+        // live reservation owned by this address space and removed it so it
+        // cannot be unmapped twice.
         let result = unsafe { libc::munmap(virt.start.raw() as *mut _, virt.byte_len) };
         if result != 0 {
             return Err(AddressSpaceError::NotReserved);
@@ -382,14 +391,22 @@ impl AddressSpace for HostedAddressSpace {
         set_protection(hull, libc::PROT_READ | libc::PROT_WRITE)?;
         let contents: Vec<Vec<u8>> = snapshots
             .iter()
-            .map(|region| unsafe {
-                core::slice::from_raw_parts(
-                    region.range.start.raw() as *const u8,
-                    region.range.byte_len,
-                )
+            .map(|region| {
+                // SAFETY: `hull` was just made `PROT_READ | PROT_WRITE`,
+                // `region.range` is a committed unsubstituted region inside
+                // `hull`, and the reservations lock is held.
+                unsafe {
+                    core::slice::from_raw_parts(
+                        region.range.start.raw() as *const u8,
+                        region.range.byte_len,
+                    )
+                }
                 .to_vec()
             })
             .collect();
+        // SAFETY: `hull.start` is host-page aligned and `hull` lies within a
+        // live anonymous `mmap` reservation whose committed regions in `hull`
+        // were just snapshotted.
         unsafe {
             #[cfg(target_os = "linux")]
             libc::madvise(
@@ -401,6 +418,9 @@ impl AddressSpace for HostedAddressSpace {
             libc::madvise(hull.start.raw() as *mut _, hull.byte_len, libc::MADV_FREE);
         }
         for (region, bytes) in snapshots.iter().zip(&contents) {
+            // SAFETY: `hull` is mapped read-write, `bytes` was cloned from
+            // `region.range` so its length equals `region.range.byte_len`, and
+            // the heap `Vec` cannot overlap the `mmap` reservation.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
@@ -444,11 +464,11 @@ impl AddressSpace for HostedAddressSpace {
             return Err(AddressSpaceError::OutOfFrames);
         };
         if !placement.accepts(base as u64, bytes as u64) {
-            // SAFETY: the mapping and the file are this call's own.
-            unsafe {
-                libc::munmap(base as *mut _, mapped_bytes);
-                libc::close(descriptor);
-            }
+            // SAFETY: `base` and `mapped_bytes` are the shared mapping this
+            // call just created and has not published.
+            unsafe { libc::munmap(base as *mut _, mapped_bytes) };
+            // SAFETY: `descriptor` is the file this call just made.
+            unsafe { libc::close(descriptor) };
             return Err(AddressSpaceError::OutOfFrames);
         }
         let owner = current_user_memory_owner(self.processor);
@@ -472,12 +492,13 @@ impl AddressSpace for HostedAddressSpace {
             .ok_or(AddressSpaceError::NotCommitted)?;
         let held = runs.swap_remove(index);
         drop(runs);
-        // SAFETY: the mapping and the file are the run's own, and the
-        // run is out of the list, so nothing frees them twice.
-        unsafe {
-            libc::munmap(held.base as *mut _, held.mapped_bytes);
-            libc::close(held.descriptor);
-        }
+        // SAFETY: `held.base` and `held.mapped_bytes` are the mapping owned by
+        // `held`, which was removed from `self.runs` so it cannot be unmapped
+        // twice.
+        unsafe { libc::munmap(held.base as *mut _, held.mapped_bytes) };
+        // SAFETY: `held.descriptor` is the file owned by `held`, which was
+        // removed from `self.runs` so it cannot be closed twice.
+        unsafe { libc::close(held.descriptor) };
         Ok(())
     }
 
@@ -768,12 +789,10 @@ pub(crate) fn shared_backing_file(bytes: usize) -> Result<i32, AddressSpaceError
     if descriptor < 0 {
         return Err(AddressSpaceError::OutOfFrames);
     }
-    // SAFETY: `path` is the nul-terminated name `mkstemp` filled in,
-    // and `descriptor` is a fresh, empty regular file.
-    let made = unsafe {
-        libc::unlink(path.as_ptr().cast()) == 0
-            && libc::ftruncate(descriptor, bytes as libc::off_t) == 0
-    };
+    // SAFETY: `path` is the NUL-terminated name `mkstemp` filled in.
+    let unlinked = unsafe { libc::unlink(path.as_ptr().cast()) } == 0;
+    // SAFETY: `descriptor` is the fresh, empty regular file `mkstemp` made.
+    let made = unlinked && unsafe { libc::ftruncate(descriptor, bytes as libc::off_t) } == 0;
     if !made {
         // SAFETY: `descriptor` is the file this call just made.
         unsafe { libc::close(descriptor) };
@@ -816,25 +835,28 @@ fn map_shared_aligned(descriptor: i32, bytes: usize, align: usize) -> Option<usi
             0,
         )
     };
-    // SAFETY: both ends of the reservation are address space this call
-    // owns and nothing is mapped in.
-    unsafe {
-        if mapped == libc::MAP_FAILED {
-            libc::munmap(region as *mut _, reserved);
-            return None;
-        }
-        if start > region {
-            libc::munmap(region as *mut _, start - region);
-        }
-        let end = start + bytes;
-        if region + reserved > end {
-            libc::munmap(end as *mut _, region + reserved - end);
-        }
+    if mapped == libc::MAP_FAILED {
+        // SAFETY: `region..region + reserved` is the reservation this call
+        // owns and failed to populate.
+        unsafe { libc::munmap(region as *mut _, reserved) };
+        return None;
+    }
+    if start > region {
+        // SAFETY: `region..start` is the unmapped leading portion of the
+        // reservation this call owns.
+        unsafe { libc::munmap(region as *mut _, start - region) };
+    }
+    let end = start + bytes;
+    if region + reserved > end {
+        // SAFETY: `end..region + reserved` is the unmapped trailing portion of
+        // the reservation this call owns.
+        unsafe { libc::munmap(end as *mut _, region + reserved - end) };
     }
     Some(start)
 }
 
 fn host_page_size() -> usize {
+    // SAFETY: `_SC_PAGESIZE` is a valid `sysconf` selector taking no pointers.
     let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     assert!(value > 0, "sysconf(_SC_PAGESIZE) failed");
     value as usize
@@ -843,6 +865,8 @@ fn host_page_size() -> usize {
 /// `range.start` must be host-page aligned; the kernel rounds the length
 /// up to the host page internally.
 fn set_protection(range: VirtRange, prot: i32) -> Result<(), AddressSpaceError> {
+    // SAFETY: `range.start` is host-page aligned and `range` lies inside a
+    // live reservation of this address space.
     let result = unsafe { libc::mprotect(range.start.raw() as *mut _, range.byte_len, prot) };
     if result == 0 {
         Ok(())
@@ -924,10 +948,12 @@ mod tests {
             .unwrap();
 
         let value: *mut u32 = range.start.raw() as *mut u32;
-        unsafe {
-            value.write_volatile(0xdead_beef);
-            assert_eq!(value.read_volatile(), 0xdead_beef);
-        }
+        // SAFETY: `range` is committed read-write, page-aligned (thus
+        // 4-byte aligned), and at least `PAGE_SIZE` bytes long.
+        unsafe { value.write_volatile(0xdead_beef) };
+        // SAFETY: `value` points to the same committed, readable `u32` word.
+        let read_back = unsafe { value.read_volatile() };
+        assert_eq!(read_back, 0xdead_beef);
 
         match address_space.translate(range.start) {
             Translation::Committed { flags, .. } => {
@@ -955,19 +981,20 @@ mod tests {
             .commit(second, PageFlags::READ | PageFlags::WRITE)
             .unwrap();
         let pointer = second.start.raw() as *mut u8;
-        unsafe {
-            pointer.write_volatile(0x5a);
-            assert_eq!(pointer.read_volatile(), 0x5a);
-        }
+        // SAFETY: `second` was just committed read-write and is non-empty.
+        unsafe { pointer.write_volatile(0x5a) };
+        // SAFETY: `pointer` points to the same committed, readable byte.
+        let before_decommit = unsafe { pointer.read_volatile() };
+        assert_eq!(before_decommit, 0x5a);
         address_space.decommit(first).unwrap();
         assert_eq!(address_space.translate(first.start), Translation::Reserved);
-        unsafe {
-            assert_eq!(
-                pointer.read_volatile(),
-                0x5a,
-                "partial host-page decommit must not disturb the neighbor region"
-            );
-        }
+        // SAFETY: `second` remains committed and readable after `first` was
+        // decommitted.
+        let after_decommit = unsafe { pointer.read_volatile() };
+        assert_eq!(
+            after_decommit, 0x5a,
+            "partial host-page decommit must not disturb the neighbor region"
+        );
         address_space.release(range).unwrap();
     }
 
@@ -1030,16 +1057,20 @@ mod tests {
             .commit(range, PageFlags::READ | PageFlags::WRITE)
             .unwrap();
         let pointer = range.start.raw() as *mut u8;
-        unsafe {
-            for byte in 0..(range.byte_len.min(256)) {
-                pointer.add(byte).write_volatile((byte & 0xff) as u8);
-            }
+        for byte in 0..(range.byte_len.min(256)) {
+            // SAFETY: `byte < range.byte_len`, and `range` is a committed
+            // read-write reservation.
+            let target = unsafe { pointer.add(byte) };
+            // SAFETY: `target` points to a committed, writable byte in `range`.
+            unsafe { target.write_volatile((byte & 0xff) as u8) };
         }
         address_space.relocate(range).expect("relocate succeeds");
-        unsafe {
-            for byte in 0..(range.byte_len.min(256)) {
-                assert_eq!(pointer.add(byte).read_volatile(), (byte & 0xff) as u8);
-            }
+        for byte in 0..(range.byte_len.min(256)) {
+            // SAFETY: `byte < range.byte_len`, and `range` remains committed.
+            let target = unsafe { pointer.add(byte) };
+            // SAFETY: `target` points to a committed, readable byte in `range`.
+            let actual = unsafe { target.read_volatile() };
+            assert_eq!(actual, (byte & 0xff) as u8);
         }
         address_space.release(range).unwrap();
     }
@@ -1053,17 +1084,22 @@ mod tests {
             .commit(range, PageFlags::READ | PageFlags::WRITE)
             .unwrap();
         let pointer = range.start.raw() as *mut u8;
-        unsafe {
-            for byte in 0..128 {
-                pointer.add(byte).write_volatile((byte ^ 0xa5) as u8);
-            }
+        for byte in 0..128 {
+            // SAFETY: `byte < 128 <= PAGE_SIZE == range.byte_len`, and `range`
+            // is a committed read-write reservation.
+            let target = unsafe { pointer.add(byte) };
+            // SAFETY: `target` points to a committed, writable byte in `range`.
+            unsafe { target.write_volatile((byte ^ 0xa5) as u8) };
         }
         address_space.protect(range, PageFlags::READ).unwrap();
         address_space.relocate(range).expect("relocate succeeds");
-        unsafe {
-            for byte in 0..128 {
-                assert_eq!(pointer.add(byte).read_volatile(), (byte ^ 0xa5) as u8);
-            }
+        for byte in 0..128 {
+            // SAFETY: `byte < 128 <= PAGE_SIZE == range.byte_len`, and `range`
+            // remains committed.
+            let target = unsafe { pointer.add(byte) };
+            // SAFETY: `target` points to a committed, readable byte in `range`.
+            let actual = unsafe { target.read_volatile() };
+            assert_eq!(actual, (byte ^ 0xa5) as u8);
         }
         match address_space.translate(range.start) {
             Translation::Committed { flags, .. } => assert_eq!(flags, PageFlags::READ),

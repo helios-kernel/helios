@@ -105,12 +105,19 @@ where
 /// An opaque compiled component artifact.
 pub trait CompiledComponent: Send + Sync + 'static {}
 
-/// A runtime engine that compiles component bytes into reusable artifacts.
+/// A runtime engine that loads precompiled component artifacts.
 pub trait ComponentRuntimeEngine: Clone + Send + Sync + 'static {
     type Compiled: CompiledComponent;
     type Error: core::fmt::Display + Send + 'static;
 
-    fn compile(&self, bytes: &[u8]) -> Result<Self::Compiled, Self::Error>;
+    /// Deserializes a precompiled component artifact into this engine.
+    ///
+    /// # Safety
+    ///
+    /// `bytes` must be a trusted precompiled artifact produced for this
+    /// engine's target and configuration (for example, a bootfs payload or an
+    /// artifact whose cryptographic signature was verified by the kernel).
+    unsafe fn compile(&self, bytes: &[u8]) -> Result<Self::Compiled, Self::Error>;
 }
 
 /// Result of running a component to completion.

@@ -220,17 +220,18 @@ impl Sink for Encoder<'_> {
     }
 
     unsafe fn write(&mut self, padded: usize, data: *const u8, len: usize) {
-        let end = self.position + padded;
+        let Some(end) = self.position.checked_add(padded) else {
+            self.fail(EncodeError::BufferTooSmall {
+                needed: usize::MAX,
+                capacity: self.buffer.len(),
+            });
+            return;
+        };
         if end <= self.buffer.len() {
-            // SAFETY: the caller guarantees `data` and `len`; the destination
-            // range was just checked against the buffer.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    data,
-                    self.buffer.as_mut_ptr().add(self.position),
-                    len,
-                );
-            }
+            let dst = self.buffer[self.position..end].as_mut_ptr();
+            // SAFETY: the caller guarantees `data` is valid for `len` bytes and
+            // `len <= padded`; `dst` points to `padded` writable bytes in `self.buffer`.
+            unsafe { core::ptr::copy_nonoverlapping(data, dst, len) };
             self.buffer[self.position + len..end].fill(0);
         }
         // Past the end only the position advances, so `finish` can say how
@@ -273,7 +274,13 @@ impl Sink for Sizer<'_> {
     }
 
     unsafe fn write(&mut self, padded: usize, _data: *const u8, _len: usize) {
-        self.size += padded;
+        match self.size.checked_add(padded) {
+            Some(size) => self.size = size,
+            None => self.fail(EncodeError::BufferTooSmall {
+                needed: usize::MAX,
+                capacity: 0,
+            }),
+        }
     }
 
     fn fail(&mut self, error: EncodeError) {
@@ -324,15 +331,18 @@ impl<'a> Decoder<'a> {
             unsafe { core::ptr::write_bytes(dst, 0, len) };
             return;
         }
-        // SAFETY: the source range was just checked; `dst` by the caller.
-        unsafe {
-            core::ptr::copy_nonoverlapping(self.buffer.as_ptr().add(self.position), dst, len);
-        }
+        let src = self.buffer[self.position..self.position + len].as_ptr();
+        // SAFETY: the source range was just checked; `dst` is valid for `len` bytes by the caller.
+        unsafe { core::ptr::copy_nonoverlapping(src, dst, len) };
         self.position += padded;
     }
 
     fn peek_u64(&self) -> u64 {
-        match self.buffer.get(self.position..self.position + 8) {
+        match self
+            .position
+            .checked_add(8)
+            .and_then(|end| self.buffer.get(self.position..end))
+        {
             Some(bytes) => u64::from_le_bytes(bytes.try_into().expect("an 8-byte range")),
             None => 0,
         }
@@ -374,12 +384,21 @@ macro_rules! scalar_primitive {
                 unsafe { decoder.read(padded(size_of::<Self>()), value.cast(), size_of::<Self>()) }
             }
             unsafe fn encode_array<S: Sink>(sink: &mut S, values: *const Self, count: usize) {
-                let size = size_of::<Self>() * count;
+                let Some(size) = size_of::<Self>().checked_mul(count) else {
+                    sink.fail(EncodeError::BufferTooSmall {
+                        needed: usize::MAX,
+                        capacity: 0,
+                    });
+                    return;
+                };
                 // SAFETY: by the contract of `encode_array`.
                 unsafe { sink.write(padded(size), values.cast(), size) }
             }
             unsafe fn decode_array(decoder: &mut Decoder<'_>, values: *mut Self, count: usize) {
-                let size = size_of::<Self>() * count;
+                let Some(size) = size_of::<Self>().checked_mul(count) else {
+                    decoder.fail(DecodeError::SizeTooLarge { size: count as u64 });
+                    return;
+                };
                 // SAFETY: by the contract of `decode_array`.
                 unsafe { decoder.read(padded(size), values.cast(), size) }
             }
@@ -441,8 +460,10 @@ impl Scalar for usize {
 /// `values` points to `count` initialized `u32`.
 pub unsafe fn encode_widened_array<S: Sink>(sink: &mut S, values: *const u32, count: usize) {
     for index in 0..count {
-        // SAFETY: by the contract.
-        let wide = u64::from(unsafe { *values.add(index) });
+        // SAFETY: `index < count`, so `values.add(index)` stays within the input array.
+        let ptr = unsafe { values.add(index) };
+        // SAFETY: `ptr` points to an initialized `u32` by the contract.
+        let wide = u64::from(unsafe { *ptr });
         // SAFETY: `wide` is a local `u64`.
         unsafe { sink.write(8, (&raw const wide).cast(), 8) }
     }
@@ -459,8 +480,12 @@ pub unsafe fn decode_widened_array(decoder: &mut Decoder<'_>, values: *mut u32, 
         // SAFETY: `wide` is a local `u64`.
         unsafe { decoder.read(8, (&raw mut wide).cast(), 8) };
         match u32::try_from(wide) {
-            // SAFETY: by the contract.
-            Ok(narrow) => unsafe { *values.add(index) = narrow },
+            Ok(narrow) => {
+                // SAFETY: `index < count`, so `values.add(index)` stays within the output array.
+                let slot = unsafe { values.add(index) };
+                // SAFETY: `slot` points to writable `u32` storage by the contract.
+                unsafe { *slot = narrow };
+            }
             Err(_) => decoder.fail(DecodeError::SizeTooLarge { size: wide }),
         }
     }
@@ -605,8 +630,10 @@ pub unsafe fn decode_char_array(decoder: &mut Decoder<'_>, data: *mut c_char, si
     if size == 0 {
         decoder.fail(DecodeError::EmptyString);
     } else {
-        // SAFETY: `size > 0` bytes are writable.
-        unsafe { *data.add(size - 1) = 0 };
+        // SAFETY: `size > 0`, so `size - 1 < size` and `data.add(size - 1)` is in bounds.
+        let last = unsafe { data.add(size - 1) };
+        // SAFETY: `last` points to writable storage by the contract.
+        unsafe { *last = 0 };
     }
 }
 

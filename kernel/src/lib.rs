@@ -548,6 +548,8 @@ impl KernelHeapState {
     /// Serves `layout` out of the heap, or answers null.
     fn allocate(&mut self, layout: Layout) -> *mut u8 {
         assert_ne!(layout.size(), 0, "kernel heap allocation has zero size");
+        // SAFETY: `layout` has non-zero size (asserted above) and `self` holds
+        // exclusive mutable access to `self.allocator`.
         unsafe { self.allocator.try_allocate(layout) }.map_or(ptr::null_mut(), ptr::NonNull::as_ptr)
     }
 
@@ -600,8 +602,11 @@ impl KernelAllocator {
     /// The range must be memory nothing else owns and it must outlive
     /// the kernel; see [`KernelHeapState::insert`].
     unsafe fn add_to_heap(&self, start: usize, end: usize) {
-        self.heap.with(|heap| unsafe {
-            heap.insert(start, end);
+        self.heap.with(|heap| {
+            // SAFETY: forwarded from the caller's `add_to_heap` contract.
+            unsafe {
+                heap.insert(start, end);
+            }
         });
     }
 
@@ -620,6 +625,8 @@ impl KernelAllocator {
     unsafe fn free(&self, ptr: *mut u8, layout: Layout, record: impl FnOnce(&mut HeapCounters)) {
         let ptr = ptr::NonNull::new(ptr).expect("the global allocator was handed a null pointer");
         self.heap.with(|heap| {
+            // SAFETY: forwarded from the caller's `free` contract (`ptr` was
+            // allocated from this heap under `layout`).
             unsafe { heap.deallocate(ptr, layout) };
             record(&mut heap.counters);
         });
@@ -696,6 +703,9 @@ impl KernelAllocator {
         };
         match memory::lend_user_memory_to_kernel_heap(wanted) {
             Some((start, end)) => {
+                // SAFETY: `lend_user_memory_to_kernel_heap` hands over an
+                // unaliased block from the `'static` user pool for good, so it
+                // outlives the kernel and nothing else owns it.
                 unsafe {
                     self.add_to_heap(start, end);
                 }
@@ -738,6 +748,9 @@ impl KernelAllocator {
     }
 }
 
+// SAFETY: `KernelAllocator` serialises all heap mutations through
+// `IrqSafeMutex`, upholds `GlobalAlloc` alignment/size requirements via
+// `talc::Talc`, and never unwinds or frees foreign pointers.
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let size = layout.size();
@@ -748,6 +761,8 @@ unsafe impl GlobalAlloc for KernelAllocator {
         let size = layout.size();
         let ptr = self.alloc_growing(layout, |counters| counters.record_alloc(size));
         if !ptr.is_null() {
+            // SAFETY: `ptr` is non-null, properly aligned, and points to a
+            // newly allocated, exclusively owned block of at least `size` bytes.
             unsafe {
                 ptr::write_bytes(ptr, 0, size);
             }
@@ -757,10 +772,14 @@ unsafe impl GlobalAlloc for KernelAllocator {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let size = layout.size();
+        // SAFETY: forwarded from `GlobalAlloc::dealloc`; `ptr` was allocated by
+        // this allocator with `layout`.
         unsafe { self.free(ptr, layout, |counters| counters.record_dealloc(size)) };
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: `GlobalAlloc::realloc` requires `new_size` to be non-zero
+        // and rounded up to `layout.align()` not to exceed `isize::MAX`.
         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
         // A reallocation is one operation: it is charged once, in the
         // free below, which is the critical section that ends it.
@@ -770,8 +789,15 @@ unsafe impl GlobalAlloc for KernelAllocator {
         }
 
         let old_size = layout.size();
+        // SAFETY: `ptr` and `new_ptr` are distinct live allocations of at least
+        // `old_size` and `new_size` bytes respectively, so `old_size.min(new_size)`
+        // bytes are valid to copy without overlap.
         unsafe {
             ptr::copy_nonoverlapping(ptr, new_ptr, old_size.min(new_size));
+        }
+        // SAFETY: forwarded from `GlobalAlloc::realloc`; `ptr` was allocated by
+        // this allocator with `layout` and is no longer used after the copy.
+        unsafe {
             self.free(ptr, layout, |counters| {
                 counters.record_realloc(old_size, new_size);
             });
@@ -1489,6 +1515,8 @@ where
     for region in bootstrap_first {
         let shares = splitter.split(region.start, region.end);
         if let Some(kernel) = shares.kernel {
+            // SAFETY: `shares.kernel` is a disjoint sub-range of a usable boot
+            // memory region that outlives the kernel and is not handed to the user pool.
             unsafe {
                 ALLOCATOR.add_to_heap(kernel.start, kernel.end);
             }
@@ -1857,6 +1885,8 @@ mod tests {
         let mut heap = Box::new(AlignedHeap([0; TEST_HEAP_BYTES]));
         let allocator = KernelAllocator::empty();
         let start = heap.0.as_mut_ptr() as usize;
+        // SAFETY: `heap` is an exclusively owned `Box<AlignedHeap>` that
+        // outlives `allocator` and is not accessed otherwise.
         unsafe {
             allocator.add_to_heap(start, start + TEST_HEAP_BYTES);
         }
@@ -1873,6 +1903,7 @@ mod tests {
 
         let mut live = ArrayVec::<*mut u8, 6>::new();
         for layout in layouts {
+            // SAFETY: every layout in `layouts` has non-zero size.
             let ptr = unsafe { GlobalAlloc::alloc(&allocator, layout) };
             assert!(!ptr.is_null(), "the test heap refused {layout:?}");
             assert!(
@@ -1892,6 +1923,8 @@ mod tests {
         assert_eq!(held.total_bytes, empty.total_bytes);
 
         for (ptr, layout) in live.into_iter().zip(layouts) {
+            // SAFETY: `ptr` was allocated by `allocator` with `layout` above
+            // and is not used after this deallocation.
             unsafe {
                 GlobalAlloc::dealloc(&allocator, ptr, layout);
             }
@@ -1908,6 +1941,8 @@ mod tests {
         let mut backing = Box::new(AlignedHeap([0; TEST_HEAP_BYTES]));
         let start = backing.0.as_mut_ptr() as usize;
         let mut heap = KernelHeapState::new();
+        // SAFETY: `backing` is an exclusively owned `Box<AlignedHeap>` that
+        // outlives `heap` and is not accessed otherwise.
         unsafe { heap.insert(start, start + TEST_HEAP_BYTES) };
         let empty_free = heap.free_bytes();
         let metadata = heap.allocated_bytes();
@@ -1928,9 +1963,13 @@ mod tests {
                 counters.allocated_bytes + counters.overhead_bytes()
             );
             assert!(heap.free_bytes() < before);
+            // SAFETY: `allocation` was returned by `heap.allocate(layout)`
+            // above and is not used after this deallocation.
             unsafe { heap.deallocate(allocation, layout) };
             assert_eq!(heap.free_bytes(), before);
         }
+        // SAFETY: `first` was returned by `heap.allocate(small)` above and is
+        // not used after this deallocation.
         unsafe { heap.deallocate(first, small) };
         assert_eq!(heap.free_bytes(), empty_free);
         assert_eq!(heap.allocated_bytes(), metadata);
@@ -1943,6 +1982,8 @@ mod tests {
         let mut heap = KernelHeapState::new();
         for region in [&mut first_region, &mut second_region] {
             let start = region.0.as_mut_ptr() as usize;
+            // SAFETY: `region` is an exclusively owned `Box<AlignedHeap>` that
+            // outlives `heap` and is not accessed otherwise.
             unsafe { heap.insert(start, start + TEST_HEAP_BYTES) };
         }
         let empty_free = heap.free_bytes();
@@ -1954,6 +1995,8 @@ mod tests {
                 break;
             };
             assert!((ptr.as_ptr() as usize).is_multiple_of(layout.align()));
+            // SAFETY: `ptr` is an exclusively owned, aligned, live allocation
+            // of `layout.size()` bytes returned by `heap.allocate(layout)`.
             unsafe { ptr.as_ptr().write_bytes(index as u8, layout.size()) };
             live.push((ptr, layout, index as u8));
         }
@@ -1965,8 +2008,12 @@ mod tests {
         );
         for parity in 0..2 {
             for &(ptr, layout, value) in live.iter().skip(parity).step_by(2) {
+                // SAFETY: `ptr` points to `layout.size()` initialized bytes of
+                // a live allocation still held by `heap`.
                 let bytes = unsafe { core::slice::from_raw_parts(ptr.as_ptr(), layout.size()) };
                 assert!(bytes.iter().all(|&byte| byte == value));
+                // SAFETY: `ptr` was returned by `heap.allocate(layout)` above,
+                // the slice borrow has ended, and `ptr` is not used again.
                 unsafe { heap.deallocate(ptr, layout) };
             }
         }
@@ -1985,6 +2032,8 @@ mod tests {
                 let mut heap = KernelHeapState::new();
                 if initialized {
                     let start = boot.0.as_mut_ptr() as usize;
+                    // SAFETY: `boot` is an exclusively owned `Box<AlignedHeap>`
+                    // that outlives `heap` and is not accessed otherwise.
                     unsafe { heap.insert(start, start + TEST_HEAP_BYTES) };
                 }
                 let layout = Layout::from_size_align(size, align).expect("valid growth layout");
@@ -1992,11 +2041,15 @@ mod tests {
                 assert!(bytes.is_power_of_two());
                 region = Box::<[u8]>::new_uninit_slice(bytes);
                 let start = region.as_mut_ptr() as usize;
+                // SAFETY: `region` is an exclusively owned `bytes`-byte buffer
+                // that outlives `heap` and is not accessed otherwise.
                 unsafe { heap.insert(start, start + bytes) };
                 let available = heap.free_bytes();
                 let ptr =
                     ptr::NonNull::new(heap.allocate(layout)).expect("grown heap serves request");
                 assert!((ptr.as_ptr() as usize).is_multiple_of(align));
+                // SAFETY: `ptr` was returned by `heap.allocate(layout)` above
+                // and is not used after this deallocation.
                 unsafe { heap.deallocate(ptr, layout) };
                 assert_eq!(heap.free_bytes(), available);
             }
@@ -2015,18 +2068,25 @@ mod tests {
         let mut heap = Box::new(AlignedHeap([0; TEST_HEAP_BYTES]));
         let allocator = KernelAllocator::empty();
         let start = heap.0.as_mut_ptr() as usize;
+        // SAFETY: `heap` is an exclusively owned `Box<AlignedHeap>` that
+        // outlives `allocator` and is not accessed otherwise.
         unsafe {
             allocator.add_to_heap(start, start + TEST_HEAP_BYTES);
         }
 
         let layout = Layout::from_size_align(64, 8).expect("valid allocation layout");
+        // SAFETY: `layout` has non-zero size (64 bytes).
         let ptr = unsafe { GlobalAlloc::alloc(&allocator, layout) };
         assert!(!ptr.is_null());
 
+        // SAFETY: `ptr` was allocated by `&allocator` with `layout`, `128` is
+        // non-zero, and `128` rounded to align 8 does not overflow `isize::MAX`.
         let reallocated = unsafe { GlobalAlloc::realloc(&allocator, ptr, layout, 128) };
         assert!(!reallocated.is_null());
 
         let grown_layout = Layout::from_size_align(128, 8).expect("valid grown layout");
+        // SAFETY: `reallocated` was returned by `GlobalAlloc::realloc` with
+        // `grown_layout` above and is not used after this deallocation.
         unsafe {
             GlobalAlloc::dealloc(&allocator, reallocated, grown_layout);
         }
@@ -2063,20 +2123,27 @@ mod tests {
         let mut heap = Box::new(AlignedHeap([0; TEST_HEAP_BYTES]));
         let allocator = KernelAllocator::empty();
         let start = heap.0.as_mut_ptr() as usize;
+        // SAFETY: `heap` is an exclusively owned `Box<AlignedHeap>` that
+        // outlives `allocator` and is not accessed otherwise.
         unsafe {
             allocator.add_to_heap(start, start + TEST_HEAP_BYTES);
         }
 
         let layout = Layout::from_size_align(64, 8).expect("valid allocation layout");
         critical_section::with(|_| {
+            // SAFETY: `layout` has non-zero size (64 bytes).
             let ptr = unsafe { GlobalAlloc::alloc(&allocator, layout) };
             assert!(
                 !ptr.is_null(),
                 "the kernel heap refused an allocation issued from inside a critical section"
             );
+            // SAFETY: `ptr` was allocated by `&allocator` with `layout`, `128` is
+            // non-zero, and `128` rounded to align 8 does not overflow `isize::MAX`.
             let grown = unsafe { GlobalAlloc::realloc(&allocator, ptr, layout, 128) };
             assert!(!grown.is_null());
             let grown_layout = Layout::from_size_align(128, 8).expect("valid grown layout");
+            // SAFETY: `grown` was returned by `GlobalAlloc::realloc` with
+            // `grown_layout` above and is not used after this deallocation.
             unsafe {
                 GlobalAlloc::dealloc(&allocator, grown, grown_layout);
             }

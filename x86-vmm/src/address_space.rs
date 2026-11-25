@@ -16,8 +16,10 @@
 
 use alloc::vec::Vec;
 use core::alloc::Layout;
+use core::mem::{align_of, size_of};
 use core::ptr;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use helios_hal::device::{DeviceRegion, DmaPlacement};
 use helios_hal::iommu::PhysicalRange;
@@ -56,6 +58,16 @@ pub const USER_VA_END: usize = 0x0000_4000_0000_0000;
 const PAGE: usize = PhysFrame::SIZE;
 /// Bytes one level-1 table maps: 512 four-kilobyte pages.
 const LEAF_TABLE_SPAN: usize = PAGE * 512;
+/// Physical-address field of a 4-level x86-64 page-table entry (bits 12..52;
+/// Intel SDM Vol. 3A, Tables 4-15, 4-17, and 4-18).
+const ENTRY_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+
+const _: () = {
+    assert!(size_of::<PageTable>() == 512 * size_of::<u64>());
+    assert!(align_of::<PageTable>() >= align_of::<AtomicU64>());
+    assert!(size_of::<PageTableEntry>() == size_of::<u64>());
+    assert!(align_of::<PageTableEntry>() == align_of::<AtomicU64>());
+};
 
 /// A leaf an unmap has retired but whose frame is not yet free.
 ///
@@ -99,12 +111,15 @@ const RETIRED: PageTableFlags = PageTableFlags::BIT_9;
 /// allocations under it take the machine's pools, whose interrupt-masking
 /// locks nothing holds across `state`.
 ///
-/// Not under `state`: `commit_demand_page`, `leaf_entry` and the walk
-/// `translate` makes after its tracker lookup walk tables lock-free,
-/// which is sound because no intermediate table is freed while the
-/// address space lives, and the one leaf `commit_demand_page` writes
-/// belongs to a prepared demand-commit region only its fiber faults on;
-/// and `allocate_run` and `free_run`, which change no translation.
+/// Not under `state`: `commit_demand_page` and `leaf_entry` walk tables
+/// lock-free via atomic entry loads and raw leaf-entry pointers (without
+/// forming `&PageTable` or `&mut PageTable`), which is sound because no
+/// intermediate table is freed while the address space lives, intermediate
+/// entries are published with `Release` stores, and the one leaf
+/// `commit_demand_page` writes belongs to a prepared demand-commit region
+/// only its fiber faults on; and `allocate_run` and `free_run`, which
+/// change no translation. `translate` holds `state` across both its tracker
+/// lookup and its table walk.
 /// `unmap_range`, `unmap_demand_pages`, `drop_substituted_leaves` and
 /// `drop_substituted_parts` take no lock themselves and are only called
 /// with `state` held.
@@ -428,23 +443,31 @@ impl<M: Machine> X86UserAddressSpace<M> {
         table: *mut PageTable,
         index: PageTableIndex,
     ) -> Result<*mut PageTable, AddressSpaceError> {
-        // SAFETY: `table` is a live page table reached through the
-        // machine's window, and the caller holds the reservation lock, so
-        // this is the only reference to the entry.
-        let table = unsafe { &mut *table };
-        let entry = &mut table[index];
-        if entry.is_unused() {
+        let slot = usize::from(index);
+        // SAFETY: `table` is a live 4 KiB-aligned page table of 512 8-byte
+        // entries reached through the machine's window, and `PageTableIndex`
+        // is guaranteed `< 512`.
+        let entry_ptr = unsafe { table.cast::<AtomicU64>().add(slot) };
+        // SAFETY: `entry_ptr` points to a live, 8-byte-aligned page-table
+        // entry that is never freed while the address space lives.
+        let entry = unsafe { &*entry_ptr };
+        let mut raw = entry.load(Ordering::Acquire);
+        if raw == 0 {
             let frame = self
                 .machine
                 .allocate_table()
                 .ok_or(AddressSpaceError::PageTableExhausted)?;
-            entry.set_frame(frame, PageTableFlags::PRESENT | PageTableFlags::WRITABLE);
+            raw = frame.start_address().as_u64()
+                | (PageTableFlags::PRESENT | PageTableFlags::WRITABLE).bits();
+            // Publish the freshly zeroed child table before any lock-free
+            // `leaf_entry` walk can follow this entry.
+            entry.store(raw, Ordering::Release);
         }
         assert!(
-            !entry.flags().contains(PageTableFlags::HUGE_PAGE),
+            !PageTableFlags::from_bits_truncate(raw).contains(PageTableFlags::HUGE_PAGE),
             "x86 user-VA walk hit a huge page where a table was expected"
         );
-        Ok(self.table_at(entry.addr()))
+        Ok(self.table_at(PhysAddr::new(raw & ENTRY_ADDR_MASK)))
     }
 
     /// The leaf entry for `virt`, or `None` when the walk runs into a
@@ -452,27 +475,36 @@ impl<M: Machine> X86UserAddressSpace<M> {
     ///
     /// Lock-free by construction: no table below a prepared
     /// demand-commit region is ever freed while the address space
-    /// lives, so a walk that finds one can keep going.
+    /// lives, so a walk that finds one can keep going. Uses raw pointers
+    /// and atomic loads so concurrent walks or demand faults in the same
+    /// table never alias `&mut PageTable`.
     fn leaf_entry(&self, virt: usize) -> Option<*mut PageTableEntry> {
         let page = Page::<Size4KiB>::containing_address(X86VirtAddr::new(virt as u64));
         let mut table = self.level_4_table();
         for index in [page.p4_index(), page.p3_index(), page.p2_index()] {
-            // SAFETY: `table` is a live page table in the machine's window.
-            let entry = &unsafe { &*table }[index];
-            if entry.is_unused() {
+            let slot = usize::from(index);
+            // SAFETY: `table` is a live 4 KiB-aligned page table of 512 8-byte
+            // entries in the machine's window, and `slot < 512`.
+            let entry_ptr = unsafe { table.cast::<AtomicU64>().add(slot) };
+            // SAFETY: `entry_ptr` points to a live, 8-byte-aligned entry that
+            // is never freed while the address space lives; `Acquire` pairs
+            // with `ensure_table`'s `Release` store.
+            let raw = unsafe { &*entry_ptr }.load(Ordering::Acquire);
+            if raw == 0 {
                 return None;
             }
             assert!(
-                !entry.flags().contains(PageTableFlags::HUGE_PAGE),
+                !PageTableFlags::from_bits_truncate(raw).contains(PageTableFlags::HUGE_PAGE),
                 "x86 user VA {virt:#x} resolves through a huge page"
             );
-            table = self.table_at(entry.addr());
+            table = self.table_at(PhysAddr::new(raw & ENTRY_ADDR_MASK));
         }
-        // SAFETY: `table` is the level-1 table for this address; the
-        // reference is turned straight back into a pointer, so nothing
-        // outlives this borrow.
-        let table = unsafe { &mut *table };
-        Some(ptr::from_mut(&mut table[page.p1_index()]))
+        let leaf_slot = usize::from(page.p1_index());
+        // SAFETY: `table` is the live level-1 page table of 512 entries for
+        // this address and `leaf_slot < 512`; computing the element pointer
+        // directly avoids forming `&mut PageTable` over sibling slots.
+        let leaf = unsafe { table.cast::<PageTableEntry>().add(leaf_slot) };
+        Some(leaf)
     }
 
     /// Walks every page of `virt`, unmapping the ones a demand commit
@@ -1083,7 +1115,10 @@ impl<M: Machine> AddressSpace for X86UserAddressSpace<M> {
         if addr.raw() < USER_VA_BASE || addr.raw() >= USER_VA_END {
             return Translation::Unmapped;
         }
-        let committed = match self.state.lock().lookup(addr) {
+        // Hold `state` across the table walk so `tables()` has exclusive
+        // access to the root table and cannot race a concurrent mutation.
+        let state = self.state.lock();
+        let committed = match state.lookup(addr) {
             ReservationLookup::Unreserved => return Translation::Unmapped,
             ReservationLookup::Reserved => return Translation::Reserved,
             ReservationLookup::Committed(region) => region,

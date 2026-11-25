@@ -116,18 +116,20 @@ pub(super) fn stop_current() {
         sie: 0,
         interrupts_enabled: 0,
     };
-    // SAFETY: reading `sscratch` and `sie` has no side effects.
+    // SAFETY: reading `sscratch` has no side effects.
     unsafe {
         asm!("csrr {}, sscratch", out(reg) context.sscratch, options(nomem, nostack));
+    }
+    // SAFETY: reading `sie` has no side effects.
+    unsafe {
         asm!("csrr {}, sie", out(reg) context.sie, options(nomem, nostack));
     }
     context.interrupts_enabled = usize::from(riscv::register::sstatus::read().sie());
 
-    // SAFETY: the departing hart answers no interrupt from here until it
-    // is restarted, and nothing it could take needs servicing: the kernel
-    // has torn its per-processor owners down.
+    riscv::interrupt::supervisor::disable();
+    // SAFETY: `sstatus.SIE` is already clear and this hart is stopping, so
+    // masking all supervisor interrupt enable bits in `sie` is safe.
     unsafe {
-        riscv::interrupt::supervisor::disable();
         asm!("csrw sie, zero", options(nomem, nostack));
     }
     // A far deadline withdraws the pending timer interrupt and leaves the
@@ -141,10 +143,14 @@ pub(super) fn stop_current() {
         __helios_hart_suspend(&raw mut context);
     }
 
-    // SAFETY: restoring the interrupt state the caller ran with.
+    // SAFETY: restoring the `sie` mask saved before stopping.
     unsafe {
         asm!("csrw sie, {}", in(reg) context.sie, options(nomem, nostack));
-        if context.interrupts_enabled != 0 {
+    }
+    if context.interrupts_enabled != 0 {
+        // SAFETY: interrupts were enabled on entry to `stop_current` and
+        // `sie` has just been restored.
+        unsafe {
             riscv::interrupt::supervisor::enable();
         }
     }
@@ -173,11 +179,23 @@ extern "C" fn helios_hart_resume(hart_id: usize, context: &SavedContext) -> ! {
     // Rejoin the running mask before the flush: see the module docs.
     mark_hart_online(hart);
     // SAFETY: the root table was installed at boot, before any hart
-    // stopped.
+    // stopped, and everything running here is in the identity-mapped window.
     unsafe {
         vmm::activate_paging();
+    }
+    // SAFETY: `stvec` points at this backend's trap entry and is never
+    // redirected elsewhere.
+    unsafe {
         trap::install_trap_vector();
+    }
+    // SAFETY: restores the hart's trap stack top saved in `context.sscratch`
+    // while supervisor interrupts are still masked.
+    unsafe {
         asm!("csrw sscratch, {}", in(reg) context.sscratch, options(nomem, nostack));
+    }
+    // SAFETY: clears any stale pending supervisor software interrupt bit
+    // (`sip.SSIP`) before resuming execution.
+    unsafe {
         asm!("csrc sip, {}", in(reg) 1usize << 1, options(nomem, nostack));
     }
     sbi_rt::set_timer(u64::MAX);

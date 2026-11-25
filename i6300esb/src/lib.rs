@@ -67,6 +67,8 @@ where
     };
 
     let timeout = configured_timeout_seconds();
+    // SAFETY: `find_i6300esb` verified `address` is a valid PCI Type 0 endpoint
+    // device, and `0x10` is the 4-byte-aligned BAR0 register in its header.
     let bar0 = unsafe { access.read(address, 0x10) };
     assert!(
         bar0 & 0x1 == 0,
@@ -268,10 +270,18 @@ where
 
     fn write_timer(&self, offset: usize, value: u32) {
         let address = (self.base_address + offset) as *mut u32;
+        // SAFETY: `self.base_address` is the translated MMIO mapping of BAR0,
+        // `initialize` enabled `MEMORY_ENABLE` before any MMIO write, `offset` is
+        // `ESB_TIMER1_REG` (`0x00`) or `ESB_TIMER2_REG` (`0x04`) (4-byte aligned
+        // within the 16-byte register block), and callers run inside `critical_section`.
         unsafe { address.write_volatile(value) }
     }
     fn write_reload(&self, value: u16) {
         let address = (self.base_address + ESB_RELOAD_REG) as *mut u16;
+        // SAFETY: `self.base_address` is the translated MMIO mapping of BAR0,
+        // `initialize` enabled `MEMORY_ENABLE` before any MMIO write, `ESB_RELOAD_REG`
+        // (`0x0c`) is 2-byte aligned within the 16-byte register block, and callers
+        // run inside `critical_section`.
         unsafe { address.write_volatile(value) }
     }
 

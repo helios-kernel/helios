@@ -7,6 +7,8 @@ use helios_hal::hv::IoAccess;
 macro_rules! read {
     ($reg:ident) => {{
         let value: u64;
+        // SAFETY: reading an EL1/EL2 debug system register via `mrs` at EL2
+        // touches no memory and only reads the calling CPU's register.
         unsafe { asm!(concat!("mrs {value}, ", stringify!($reg)), value = out(reg) value,
             options(nomem, nostack, preserves_flags)); }
         value
@@ -14,6 +16,9 @@ macro_rules! read {
 }
 macro_rules! write {
     ($reg:ident, $value:expr) => {{
+        // SAFETY: writing an EL1 debug system register affects only the
+        // calling CPU's debug state while local IRQs are masked and debug
+        // monitors are disabled.
         unsafe { asm!(concat!("msr ", stringify!($reg), ", {value}"), value = in(reg) $value,
             options(nomem, nostack, preserves_flags)); }
     }};
@@ -142,6 +147,8 @@ impl State {
         let mut state = Self::new(capabilities);
         state.locked = read!(oslsr_el1) & 2 != 0;
         write!(oslar_el1, 0u64);
+        // SAFETY: `isb` synchronizes the OS Lock unlock before reading the
+        // breakpoint and watchpoint registers.
         unsafe {
             asm!("isb", options(nomem, nostack, preserves_flags));
         }
@@ -172,6 +179,8 @@ impl State {
         {
             write_watchpoint(index, *value);
         }
+        // SAFETY: `isb` orders the debug register writes before guest entry
+        // or host resume.
         unsafe {
             asm!("isb", options(nomem, nostack, preserves_flags));
         }
@@ -179,6 +188,8 @@ impl State {
     pub(super) fn enter(&self) -> Host {
         let mdscr = read!(mdscr_el1);
         write!(mdscr_el1, 0u64);
+        // SAFETY: `isb` ensures debug monitors are disabled before capturing
+        // and replacing the breakpoint/watchpoint bank.
         unsafe {
             asm!("isb", options(nomem, nostack, preserves_flags));
         }
@@ -198,6 +209,8 @@ impl Host {
         self.state.install();
         write!(oslar_el1, u64::from(self.state.locked));
         write!(mdscr_el1, self.mdscr);
+        // SAFETY: `isb` orders restoring host `mdscr_el1` before resuming host
+        // execution.
         unsafe {
             asm!("isb", options(nomem, nostack, preserves_flags));
         }

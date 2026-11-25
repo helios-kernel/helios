@@ -820,7 +820,14 @@ struct NetQueuePair<T: VirtioTransport> {
     tx_state: SpinMutex<NetTxState<T>>,
 }
 
+// SAFETY: `T: VirtioTransport` is `Send + Sync + 'static`, `rx_state` and
+// `tx_state` are protected by their own mutexes, and `rx_returned`,
+// `rx_slots`, and `rx_reassembly` share only `Send + Sync` buffers under
+// ring-ownership discipline.
 unsafe impl<T: VirtioTransport> Send for NetQueuePair<T> {}
+// SAFETY: as above; every mutable field is guarded by `AsyncMutex` or
+// `SpinMutex`, or uses atomics (`interrupt_count`, `interrupt_owner`,
+// `rx_pool_stalls`) and `Notify`.
 unsafe impl<T: VirtioTransport> Sync for NetQueuePair<T> {}
 
 struct DescriptorBitSet {

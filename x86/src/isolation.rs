@@ -47,10 +47,15 @@ impl UserIsolation {
             };
         }
         let leaf = __cpuid_count(STRUCTURED_EXTENDED_FEATURES, 0);
-        let rdcl_no = leaf.edx & ARCH_CAPABILITIES != 0
-            // SAFETY: CPUID declares the MSR, and reading it has no side
+        let rdcl_no = if leaf.edx & ARCH_CAPABILITIES != 0 {
+            // SAFETY: CPUID leaf 0x7 subleaf 0 EDX[29] declares
+            // `IA32_ARCH_CAPABILITIES` is present, and reading it has no side
             // effect.
-            && unsafe { rdmsr(IA32_ARCH_CAPABILITIES) } & RDCL_NO != 0;
+            let caps = unsafe { rdmsr(IA32_ARCH_CAPABILITIES) };
+            caps & RDCL_NO != 0
+        } else {
+            false
+        };
         Self {
             smep: leaf.ebx & SMEP != 0,
             smap: leaf.ebx & SMAP != 0,

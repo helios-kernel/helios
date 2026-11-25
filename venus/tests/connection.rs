@@ -30,8 +30,12 @@ impl Memory {
     }
 
     fn word(&self, offset: usize) -> &AtomicU32 {
-        // SAFETY: the test accesses aligned control words atomically.
-        unsafe { &*self.pointer().as_ptr().add(offset).cast() }
+        // SAFETY: `offset` is a 64-byte-aligned control-word offset inside
+        // the mapped ring's `Box<[UnsafeCell<u32>]>`.
+        let pointer = unsafe { self.pointer().as_ptr().add(offset) };
+        // SAFETY: `pointer` is aligned for `AtomicU32`, inside the live
+        // allocation, and control words are accessed only atomically.
+        unsafe { &*pointer.cast() }
     }
 }
 
@@ -385,14 +389,17 @@ impl Recording {
         let capacity = memory.0.len() * 4 - Layout::BUFFER;
         let mut commands = Vec::new();
         for at in head..tail {
-            // SAFETY: the acquired tail published these bytes, and head
-            // has not yet released them to the producer.
-            commands.push(unsafe {
-                *memory
+            // SAFETY: `Layout::BUFFER + at as usize % capacity` stays inside
+            // the ring blob's `Memory` allocation.
+            let byte = unsafe {
+                memory
                     .pointer()
                     .as_ptr()
                     .add(Layout::BUFFER + at as usize % capacity)
-            });
+            };
+            // SAFETY: the acquired tail published this byte, and head has not
+            // yet released it to the producer.
+            commands.push(unsafe { *byte });
         }
         if !commands.is_empty()
             && word(&commands, 0) as i32 == VK_COMMAND_TYPE_vkExecuteCommandStreamsMESA_EXT.0
@@ -856,33 +863,33 @@ mod entry_tests {
                 configuration.idle_timeout,
             )
             .unwrap();
-            // SAFETY: the test renderer accepts these live creation structures.
-            unsafe {
-                let instance = helios_venus::driver::instance_from_connection::<TestFactory>(
+            // SAFETY: `connection` is an owned connection and the empty
+            // `InstanceCreateInfo` is live with no allocator callbacks.
+            let instance = unsafe {
+                helios_venus::driver::instance_from_connection::<TestFactory>(
                     connection,
                     &vk::InstanceCreateInfo::default(),
                     None,
                 )
-                .unwrap();
-                let physical = instance.enumerate_physical_devices().unwrap()[0];
-                let priorities = [1.0];
-                let queues = [vk::DeviceQueueCreateInfo::default()
-                    .queue_family_index(0)
-                    .queue_priorities(&priorities)];
-                let device = instance
-                    .create_device(
-                        physical,
-                        &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
-                        None,
-                    )
-                    .unwrap();
-                let queue = device.get_device_queue(0, 0);
-                Self {
-                    instance,
-                    device,
-                    queue,
-                    recorded,
-                }
+            }
+            .unwrap();
+            // SAFETY: `instance` is a live instance created from `connection` above.
+            let physical = unsafe { instance.enumerate_physical_devices() }.unwrap()[0];
+            let priorities = [1.0];
+            let queues = [vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(0)
+                .queue_priorities(&priorities)];
+            let device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
+            // SAFETY: `physical` belongs to `instance`, and `device_info`
+            // with `queues` and `priorities` is live for this call.
+            let device = unsafe { instance.create_device(physical, &device_info, None) }.unwrap();
+            // SAFETY: `device` is live and queue family 0 index 0 was created above.
+            let queue = unsafe { device.get_device_queue(0, 0) };
+            Self {
+                instance,
+                device,
+                queue,
+                recorded,
             }
         }
 
@@ -904,11 +911,10 @@ mod entry_tests {
 
     impl Drop for SyncDevice {
         fn drop(&mut self) {
-            // SAFETY: tests join their threads and destroy children before the fixture.
-            unsafe {
-                self.device.destroy_device(None);
-                self.instance.destroy_instance(None);
-            }
+            // SAFETY: tests join their threads and destroy child objects before the fixture drops.
+            unsafe { self.device.destroy_device(None) };
+            // SAFETY: `self.device` has already been destroyed above.
+            unsafe { self.instance.destroy_instance(None) };
         }
     }
 
@@ -916,317 +922,356 @@ mod entry_tests {
     fn fences_wait_for_future_submissions_and_reset_by_generation() {
         let fixture = SyncDevice::new();
         let device = &fixture.device;
-        // SAFETY: all handles are owned here; reset occurs after completion and threads join before destruction.
-        unsafe {
-            let fence = device
-                .create_fence(&vk::FenceCreateInfo::default(), None)
-                .unwrap();
-            assert!(!device.get_fence_status(fence).unwrap());
-            assert_eq!(
-                device.wait_for_fences(&[fence], true, 0),
-                Err(vk::Result::TIMEOUT)
-            );
-            let started = fixture.observe_latest_wait();
-            std::thread::scope(|scope| {
-                let waiting = scope.spawn(|| device.wait_for_fences(&[fence], true, 5_000_000_000));
-                started
-                    .recv_timeout(Duration::from_secs(1))
-                    .expect("fence wait is registered before submission");
-                device.queue_submit(fixture.queue, &[], fence).unwrap();
-                waiting.join().unwrap().unwrap();
+        // SAFETY: `device` is live and `FenceCreateInfo` is valid for this call.
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
+        // SAFETY: `fence` is a live fence owned by `device`.
+        let status = unsafe { device.get_fence_status(fence) }.unwrap();
+        assert!(!status);
+        // SAFETY: `fence` is a live fence owned by `device`.
+        let wait = unsafe { device.wait_for_fences(&[fence], true, 0) };
+        assert_eq!(wait, Err(vk::Result::TIMEOUT));
+        let started = fixture.observe_latest_wait();
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                // SAFETY: `device` and `fence` remain live until `scope` joins.
+                unsafe { device.wait_for_fences(&[fence], true, 5_000_000_000) }
             });
-            assert!(device.get_fence_status(fence).unwrap());
-            device.reset_fences(&[fence]).unwrap();
-            assert!(!device.get_fence_status(fence).unwrap());
-            assert_eq!(
-                device.wait_for_fences(&[fence], true, 0),
-                Err(vk::Result::TIMEOUT)
-            );
-            let signaled = device
-                .create_fence(
-                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                    None,
-                )
-                .unwrap();
-            device
-                .wait_for_fences(&[fence, signaled], false, 0)
-                .unwrap();
-            assert_eq!(
-                device.wait_for_fences(&[fence, signaled], true, 0),
-                Err(vk::Result::TIMEOUT)
-            );
-            device.queue_submit2(fixture.queue, &[], fence).unwrap();
-            device.wait_for_fences(&[fence, signaled], true, 0).unwrap();
-            device.destroy_fence(fence, None);
-            device.destroy_fence(signaled, None);
+            started
+                .recv_timeout(Duration::from_secs(1))
+                .expect("fence wait is registered before submission");
+            // SAFETY: `fixture.queue` and `fence` are live on `device` with no concurrent submit.
+            unsafe { device.queue_submit(fixture.queue, &[], fence) }.unwrap();
+            waiting.join().unwrap().unwrap();
+        });
+        // SAFETY: `fence` is a live fence owned by `device`.
+        let status = unsafe { device.get_fence_status(fence) }.unwrap();
+        assert!(status);
+        // SAFETY: `fence` is signaled and no wait or submission is active on it.
+        unsafe { device.reset_fences(&[fence]) }.unwrap();
+        // SAFETY: `fence` is a live fence owned by `device`.
+        let status = unsafe { device.get_fence_status(fence) }.unwrap();
+        assert!(!status);
+        // SAFETY: `fence` is a live fence owned by `device`.
+        let wait = unsafe { device.wait_for_fences(&[fence], true, 0) };
+        assert_eq!(wait, Err(vk::Result::TIMEOUT));
+        // SAFETY: `device` is live and `FenceCreateInfo` is valid for this call.
+        let signaled = unsafe {
+            device.create_fence(
+                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                None,
+            )
         }
+        .unwrap();
+        // SAFETY: `fence` and `signaled` are live fences owned by `device`.
+        unsafe { device.wait_for_fences(&[fence, signaled], false, 0) }.unwrap();
+        // SAFETY: `fence` and `signaled` are live fences owned by `device`.
+        let wait = unsafe { device.wait_for_fences(&[fence, signaled], true, 0) };
+        assert_eq!(wait, Err(vk::Result::TIMEOUT));
+        // SAFETY: `fixture.queue` and `fence` are live and `fence` is unsignaled.
+        unsafe { device.queue_submit2(fixture.queue, &[], fence) }.unwrap();
+        // SAFETY: `fence` and `signaled` are live fences owned by `device`.
+        unsafe { device.wait_for_fences(&[fence, signaled], true, 0) }.unwrap();
+        // SAFETY: `fence` has completed all waits and submissions.
+        unsafe { device.destroy_fence(fence, None) };
+        // SAFETY: `signaled` has completed all waits and submissions.
+        unsafe { device.destroy_fence(signaled, None) };
     }
 
     #[test]
     fn timeline_semaphore_waits_allow_future_cpu_signals_and_any_all_selection() {
         let fixture = SyncDevice::new();
         let device = &fixture.device;
-        // SAFETY: semaphore values advance, and every wait's arrays live until it returns.
-        unsafe {
-            let mut kind = vk::SemaphoreTypeCreateInfo::default()
-                .semaphore_type(vk::SemaphoreType::TIMELINE)
-                .initial_value(3);
-            let left = device
-                .create_semaphore(
-                    &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
-                    None,
-                )
-                .unwrap();
-            assert_eq!(device.get_semaphore_counter_value(left).unwrap(), 3);
-            let handles = [left];
-            let values = [4];
-            assert_eq!(
-                device.wait_semaphores(
-                    &vk::SemaphoreWaitInfo::default()
-                        .semaphores(&handles)
-                        .values(&values),
-                    0
-                ),
-                Err(vk::Result::TIMEOUT)
-            );
-            let started = fixture.observe_latest_wait();
-            std::thread::scope(|scope| {
-                let waiting = scope.spawn(|| {
+        let mut kind = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(3);
+        // SAFETY: `device` is live and `kind` remains live in the `pNext` chain.
+        let left = unsafe {
+            device.create_semaphore(
+                &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
+                None,
+            )
+        }
+        .unwrap();
+        // SAFETY: `left` is a live timeline semaphore owned by `device`.
+        let value = unsafe { device.get_semaphore_counter_value(left) }.unwrap();
+        assert_eq!(value, 3);
+        let handles = [left];
+        let values = [4];
+        // SAFETY: `handles` and `values` remain live for the wait call.
+        let wait = unsafe {
+            device.wait_semaphores(
+                &vk::SemaphoreWaitInfo::default()
+                    .semaphores(&handles)
+                    .values(&values),
+                0,
+            )
+        };
+        assert_eq!(wait, Err(vk::Result::TIMEOUT));
+        let started = fixture.observe_latest_wait();
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                // SAFETY: `device`, `handles`, and `values` outlive this scoped thread.
+                unsafe {
                     device.wait_semaphores(
                         &vk::SemaphoreWaitInfo::default()
                             .semaphores(&handles)
                             .values(&values),
                         5_000_000_000,
                     )
-                });
-                started
-                    .recv_timeout(Duration::from_secs(1))
-                    .expect("timeline wait is registered before CPU signal");
+                }
+            });
+            started
+                .recv_timeout(Duration::from_secs(1))
+                .expect("timeline wait is registered before CPU signal");
+            // SAFETY: `left` is a live timeline semaphore and 4 advances its value from 3.
+            unsafe {
                 device
                     .signal_semaphore(&vk::SemaphoreSignalInfo::default().semaphore(left).value(4))
-                    .unwrap();
-                waiting.join().unwrap().unwrap();
-            });
-            assert_eq!(device.get_semaphore_counter_value(left).unwrap(), 4);
-            kind.initial_value = 0;
-            let right = device
-                .create_semaphore(
-                    &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
-                    None,
-                )
-                .unwrap();
-            let handles = [left, right];
-            let values = [4, 1];
-            device
-                .wait_semaphores(
-                    &vk::SemaphoreWaitInfo::default()
-                        .flags(vk::SemaphoreWaitFlags::ANY)
-                        .semaphores(&handles)
-                        .values(&values),
-                    0,
-                )
-                .unwrap();
-            assert_eq!(
-                device.wait_semaphores(
-                    &vk::SemaphoreWaitInfo::default()
-                        .semaphores(&handles)
-                        .values(&values),
-                    0
-                ),
-                Err(vk::Result::TIMEOUT)
-            );
-            device.destroy_semaphore(left, None);
-            device.destroy_semaphore(right, None);
+            }
+            .unwrap();
+            waiting.join().unwrap().unwrap();
+        });
+        // SAFETY: `left` is a live timeline semaphore owned by `device`.
+        let value = unsafe { device.get_semaphore_counter_value(left) }.unwrap();
+        assert_eq!(value, 4);
+        kind.initial_value = 0;
+        // SAFETY: `device` is live and `kind` remains live in the `pNext` chain.
+        let right = unsafe {
+            device.create_semaphore(
+                &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
+                None,
+            )
         }
+        .unwrap();
+        let handles = [left, right];
+        let values = [4, 1];
+        // SAFETY: `handles` and `values` remain live for the wait call.
+        unsafe {
+            device.wait_semaphores(
+                &vk::SemaphoreWaitInfo::default()
+                    .flags(vk::SemaphoreWaitFlags::ANY)
+                    .semaphores(&handles)
+                    .values(&values),
+                0,
+            )
+        }
+        .unwrap();
+        // SAFETY: `handles` and `values` remain live for the wait call.
+        let wait = unsafe {
+            device.wait_semaphores(
+                &vk::SemaphoreWaitInfo::default()
+                    .semaphores(&handles)
+                    .values(&values),
+                0,
+            )
+        };
+        assert_eq!(wait, Err(vk::Result::TIMEOUT));
+        // SAFETY: all waits on `left` have finished before destruction.
+        unsafe { device.destroy_semaphore(left, None) };
+        // SAFETY: all waits on `right` have finished before destruction.
+        unsafe { device.destroy_semaphore(right, None) };
     }
 
     #[test]
     fn each_submit_batch_signals_its_timeline_values_before_the_next_batch() {
         let fixture = SyncDevice::new();
         let device = &fixture.device;
-        // SAFETY: all submissions use live semaphores and increasing timeline values.
-        unsafe {
-            let mut kind =
-                vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
-            let semaphore = device
-                .create_semaphore(
-                    &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
-                    None,
-                )
-                .unwrap();
-            let handles = [semaphore];
-            let first = [3];
-            let second = [7];
-            let mut first_timeline =
-                vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&first);
-            let mut second_timeline =
-                vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&second);
-            let submits = [
-                vk::SubmitInfo::default()
-                    .signal_semaphores(&handles)
-                    .push_next(&mut first_timeline),
-                vk::SubmitInfo::default()
-                    .signal_semaphores(&handles)
-                    .push_next(&mut second_timeline),
-            ];
-            let before = fixture
-                .recorded
-                .lock()
-                .unwrap()
-                .submitted
-                .iter()
-                .filter(|(ring, _)| *ring != 0)
-                .count();
-            device
-                .queue_submit(fixture.queue, &submits, vk::Fence::null())
-                .unwrap();
-            let after = fixture
-                .recorded
-                .lock()
-                .unwrap()
-                .submitted
-                .iter()
-                .filter(|(ring, _)| *ring != 0)
-                .count();
-            assert_eq!(after - before, 2);
-            device
-                .wait_semaphores(
-                    &vk::SemaphoreWaitInfo::default()
-                        .semaphores(&handles)
-                        .values(&second),
-                    0,
-                )
-                .unwrap();
-            assert_eq!(device.get_semaphore_counter_value(semaphore).unwrap(), 7);
-            let signals = [vk::SemaphoreSubmitInfo::default()
-                .semaphore(semaphore)
-                .value(11)
-                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-            device
-                .queue_submit2(
-                    fixture.queue,
-                    &[vk::SubmitInfo2::default().signal_semaphore_infos(&signals)],
-                    vk::Fence::null(),
-                )
-                .unwrap();
-            device
-                .wait_semaphores(
-                    &vk::SemaphoreWaitInfo::default()
-                        .semaphores(&handles)
-                        .values(&[11]),
-                    0,
-                )
-                .unwrap();
-            device.destroy_semaphore(semaphore, None);
+        let mut kind =
+            vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+        // SAFETY: `device` is live and `kind` remains live in the `pNext` chain.
+        let semaphore = unsafe {
+            device.create_semaphore(
+                &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
+                None,
+            )
         }
+        .unwrap();
+        let handles = [semaphore];
+        let first = [3];
+        let second = [7];
+        let mut first_timeline =
+            vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&first);
+        let mut second_timeline =
+            vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&second);
+        let submits = [
+            vk::SubmitInfo::default()
+                .signal_semaphores(&handles)
+                .push_next(&mut first_timeline),
+            vk::SubmitInfo::default()
+                .signal_semaphores(&handles)
+                .push_next(&mut second_timeline),
+        ];
+        let before = fixture
+            .recorded
+            .lock()
+            .unwrap()
+            .submitted
+            .iter()
+            .filter(|(ring, _)| *ring != 0)
+            .count();
+        // SAFETY: `fixture.queue` and `submits` with all chained timeline info are live.
+        unsafe { device.queue_submit(fixture.queue, &submits, vk::Fence::null()) }.unwrap();
+        let after = fixture
+            .recorded
+            .lock()
+            .unwrap()
+            .submitted
+            .iter()
+            .filter(|(ring, _)| *ring != 0)
+            .count();
+        assert_eq!(after - before, 2);
+        // SAFETY: `handles` and `second` remain live for the wait call.
+        unsafe {
+            device.wait_semaphores(
+                &vk::SemaphoreWaitInfo::default()
+                    .semaphores(&handles)
+                    .values(&second),
+                0,
+            )
+        }
+        .unwrap();
+        // SAFETY: `semaphore` is a live timeline semaphore owned by `device`.
+        let value = unsafe { device.get_semaphore_counter_value(semaphore) }.unwrap();
+        assert_eq!(value, 7);
+        let signals = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(semaphore)
+            .value(11)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        // SAFETY: `fixture.queue` and `signals` are live and advance the timeline to 11.
+        unsafe {
+            device.queue_submit2(
+                fixture.queue,
+                &[vk::SubmitInfo2::default().signal_semaphore_infos(&signals)],
+                vk::Fence::null(),
+            )
+        }
+        .unwrap();
+        // SAFETY: `handles` and the target value slice remain live for the wait call.
+        unsafe {
+            device.wait_semaphores(
+                &vk::SemaphoreWaitInfo::default()
+                    .semaphores(&handles)
+                    .values(&[11]),
+                0,
+            )
+        }
+        .unwrap();
+        // SAFETY: all submissions and waits on `semaphore` have completed.
+        unsafe { device.destroy_semaphore(semaphore, None) };
     }
 
     #[test]
     fn connection_failure_wakes_an_unsignaled_fence_wait() {
         let fixture = SyncDevice::new();
         let device = &fixture.device;
-        // SAFETY: the failure is injected through the recording transport; cleanup still uses live handles.
-        unsafe {
-            let fence = device
-                .create_fence(&vk::FenceCreateInfo::default(), None)
-                .unwrap();
-            let started = fixture.observe_latest_wait();
-            std::thread::scope(|scope| {
-                let waiting = scope.spawn(|| device.wait_for_fences(&[fence], true, 5_000_000_000));
-                started
-                    .recv_timeout(Duration::from_secs(1))
-                    .expect("fence wait is registered before failure");
-                fixture.recorded.lock().unwrap().premature_completion = true;
-                assert_eq!(
-                    device.create_buffer(
-                        &vk::BufferCreateInfo::default()
-                            .size(64)
-                            .usage(vk::BufferUsageFlags::STORAGE_BUFFER),
-                        None
-                    ),
-                    Err(vk::Result::ERROR_DEVICE_LOST)
-                );
-                assert_eq!(waiting.join().unwrap(), Err(vk::Result::ERROR_DEVICE_LOST));
+        // SAFETY: `device` is live and `FenceCreateInfo` is valid for this call.
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
+        let started = fixture.observe_latest_wait();
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                // SAFETY: `device` and `fence` remain live until `scope` joins.
+                unsafe { device.wait_for_fences(&[fence], true, 5_000_000_000) }
             });
-            device.destroy_fence(fence, None);
-        }
+            started
+                .recv_timeout(Duration::from_secs(1))
+                .expect("fence wait is registered before failure");
+            fixture.recorded.lock().unwrap().premature_completion = true;
+            // SAFETY: `device` is live and the `BufferCreateInfo` is valid for this call.
+            let buffer = unsafe {
+                device.create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(64)
+                        .usage(vk::BufferUsageFlags::STORAGE_BUFFER),
+                    None,
+                )
+            };
+            assert_eq!(buffer, Err(vk::Result::ERROR_DEVICE_LOST));
+            assert_eq!(waiting.join().unwrap(), Err(vk::Result::ERROR_DEVICE_LOST));
+        });
+        // SAFETY: the scoped wait thread has joined before destroying `fence`.
+        unsafe { device.destroy_fence(fence, None) };
     }
 
     #[test]
     fn renderer_device_loss_during_allocation_wakes_a_fence_wait() {
         let fixture = SyncDevice::new();
         let device = &fixture.device;
-        // SAFETY: the failure is injected through the recording transport; cleanup still uses live handles.
-        unsafe {
-            let fence = device
-                .create_fence(&vk::FenceCreateInfo::default(), None)
-                .unwrap();
-            let started = fixture.observe_latest_wait();
-            std::thread::scope(|scope| {
-                let waiting = scope.spawn(|| device.wait_for_fences(&[fence], true, 5_000_000_000));
-                started
-                    .recv_timeout(Duration::from_secs(1))
-                    .expect("fence wait is registered before failure");
-                fixture.recorded.lock().unwrap().result_override = Some((
-                    wire::VK_COMMAND_TYPE_vkAllocateMemory_EXT.0,
-                    vk::Result::ERROR_DEVICE_LOST.as_raw(),
-                ));
-                assert_eq!(
-                    device.allocate_memory(
-                        &vk::MemoryAllocateInfo::default()
-                            .allocation_size(4096)
-                            .memory_type_index(0),
-                        None
-                    ),
-                    Err(vk::Result::ERROR_DEVICE_LOST)
-                );
-                assert_eq!(waiting.join().unwrap(), Err(vk::Result::ERROR_DEVICE_LOST));
+        // SAFETY: `device` is live and `FenceCreateInfo` is valid for this call.
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
+        let started = fixture.observe_latest_wait();
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                // SAFETY: `device` and `fence` remain live until `scope` joins.
+                unsafe { device.wait_for_fences(&[fence], true, 5_000_000_000) }
             });
-            device.destroy_fence(fence, None);
-        }
+            started
+                .recv_timeout(Duration::from_secs(1))
+                .expect("fence wait is registered before failure");
+            fixture.recorded.lock().unwrap().result_override = Some((
+                wire::VK_COMMAND_TYPE_vkAllocateMemory_EXT.0,
+                vk::Result::ERROR_DEVICE_LOST.as_raw(),
+            ));
+            // SAFETY: `device` is live and `MemoryAllocateInfo` is valid for this call.
+            let allocation = unsafe {
+                device.allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(4096)
+                        .memory_type_index(0),
+                    None,
+                )
+            };
+            assert_eq!(allocation, Err(vk::Result::ERROR_DEVICE_LOST));
+            assert_eq!(waiting.join().unwrap(), Err(vk::Result::ERROR_DEVICE_LOST));
+        });
+        // SAFETY: the scoped wait thread has joined before destroying `fence`.
+        unsafe { device.destroy_fence(fence, None) };
     }
 
     #[test]
     fn instance_extensions_are_guest_capabilities_not_renderer_wire_extensions() {
         let entry = entry::<TestFactory>();
-        // SAFETY: all names and create-info arrays remain live for their calls.
-        unsafe {
-            let extensions = entry.enumerate_instance_extension_properties(None).unwrap();
-            assert_eq!(extensions.len(), 1);
-            assert_eq!(
-                extensions[0].extension_name_as_c_str().unwrap(),
-                ash::khr::get_physical_device_properties2::NAME
-            );
-            let names = [ash::khr::get_physical_device_properties2::NAME.as_ptr()];
-            let info = vk::InstanceCreateInfo::default().enabled_extension_names(&names);
-            let (transport, capset) = TestFactory::create().unwrap();
-            let recorded = transport.0.clone();
-            let config = TestFactory::configuration();
-            let connection =
-                Connection::new(transport, capset, config.layout, config.idle_timeout).unwrap();
-            let instance = helios_venus::driver::instance_from_connection::<TestFactory>(
-                connection, &info, None,
-            )
-            .unwrap();
-            let state = recorded.lock().unwrap();
-            let name = ash::khr::get_physical_device_properties2::NAME.to_bytes();
-            assert!(
-                state
-                    .consumed
-                    .iter()
-                    .all(|command| !command.windows(name.len()).any(|bytes| bytes == name))
-            );
-            drop(state);
-            instance.destroy_instance(None);
-            let unsupported = [c"VK_MESA_venus_protocol".as_ptr()];
-            assert!(matches!(
-                entry.create_instance(
-                    &vk::InstanceCreateInfo::default().enabled_extension_names(&unsupported),
-                    None
-                ),
-                Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT)
-            ));
+        // SAFETY: `entry` has no global mutable state and `None` requests global extensions.
+        let extensions = unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap();
+        assert_eq!(extensions.len(), 1);
+        assert_eq!(
+            extensions[0].extension_name_as_c_str().unwrap(),
+            ash::khr::get_physical_device_properties2::NAME
+        );
+        let names = [ash::khr::get_physical_device_properties2::NAME.as_ptr()];
+        let info = vk::InstanceCreateInfo::default().enabled_extension_names(&names);
+        let (transport, capset) = TestFactory::create().unwrap();
+        let recorded = transport.0.clone();
+        let config = TestFactory::configuration();
+        let connection =
+            Connection::new(transport, capset, config.layout, config.idle_timeout).unwrap();
+        // SAFETY: `connection` is owned and `info` with `names` is live for instance creation.
+        let instance = unsafe {
+            helios_venus::driver::instance_from_connection::<TestFactory>(connection, &info, None)
         }
+        .unwrap();
+        let state = recorded.lock().unwrap();
+        let name = ash::khr::get_physical_device_properties2::NAME.to_bytes();
+        assert!(
+            state
+                .consumed
+                .iter()
+                .all(|command| !command.windows(name.len()).any(|bytes| bytes == name))
+        );
+        drop(state);
+        // SAFETY: `instance` is live and has no child devices or active threads.
+        unsafe { instance.destroy_instance(None) };
+        let unsupported = [c"VK_MESA_venus_protocol".as_ptr()];
+        // SAFETY: `unsupported` holds a live NUL-terminated C string pointer for this call.
+        let result = unsafe {
+            entry.create_instance(
+                &vk::InstanceCreateInfo::default().enabled_extension_names(&unsupported),
+                None,
+            )
+        };
+        assert!(matches!(
+            result,
+            Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT)
+        ));
     }
 
     #[test]
@@ -1241,21 +1286,24 @@ mod entry_tests {
             configuration.idle_timeout,
         )
         .unwrap();
-        // SAFETY: the test owns the connection and the complete object tree.
-        unsafe {
-            let instance = helios_venus::driver::instance_from_connection::<TestFactory>(
+        // SAFETY: `connection` is owned and `InstanceCreateInfo` is valid for this call.
+        let instance = unsafe {
+            helios_venus::driver::instance_from_connection::<TestFactory>(
                 connection,
                 &vk::InstanceCreateInfo::default(),
                 None,
             )
-            .unwrap();
-            assert!(recorded.lock().unwrap().consumed.iter().any(|commands| {
-                word(commands, 0) as i32 == wire::VK_COMMAND_TYPE_vkSetReplyCommandStreamMESA_EXT.0
-                    && word(commands, 36) as i32 == wire::VK_COMMAND_TYPE_vkCreateInstance_EXT.0
-            }));
-            assert_eq!(instance.enumerate_physical_devices().unwrap().len(), 2);
-            instance.destroy_instance(None);
         }
+        .unwrap();
+        assert!(recorded.lock().unwrap().consumed.iter().any(|commands| {
+            word(commands, 0) as i32 == wire::VK_COMMAND_TYPE_vkSetReplyCommandStreamMESA_EXT.0
+                && word(commands, 36) as i32 == wire::VK_COMMAND_TYPE_vkCreateInstance_EXT.0
+        }));
+        // SAFETY: `instance` is a live instance created from `connection` above.
+        let physical = unsafe { instance.enumerate_physical_devices() }.unwrap();
+        assert_eq!(physical.len(), 2);
+        // SAFETY: `instance` is live and has no child devices or concurrent callers.
+        unsafe { instance.destroy_instance(None) };
         assert!(
             recorded
                 .lock()
@@ -1269,42 +1317,48 @@ mod entry_tests {
     #[test]
     fn ash_instances_have_independent_connections_and_stable_physical_handles() {
         let entry = entry::<TestFactory>();
-        // SAFETY: the factory's recorded renderer implements these requests.
-        unsafe {
-            assert_eq!(
-                entry.try_enumerate_instance_version().unwrap(),
-                Some(api_version(1, 3))
-            );
-            let info = vk::InstanceCreateInfo::default();
-            let first = entry.create_instance(&info, None).unwrap();
-            let second = entry.create_instance(&info, None).unwrap();
-            assert_ne!(first.handle(), second.handle());
-            let first_base = &*(first.handle().as_raw() as usize as *const ObjectBase);
-            let second_base = &*(second.handle().as_raw() as usize as *const ObjectBase);
-            assert_eq!(
-                first_base.id, second_base.id,
-                "each context owns its identifier space"
-            );
-            let physical = first.enumerate_physical_devices().unwrap();
-            assert_eq!(physical.len(), 2);
-            assert_eq!(physical, first.enumerate_physical_devices().unwrap());
-            assert_ne!(physical, second.enumerate_physical_devices().unwrap());
-            let mut count = 1;
-            let mut single = vk::PhysicalDevice::null();
-            assert_eq!(
-                (first.fp_v1_0().enumerate_physical_devices)(
-                    first.handle(),
-                    &mut count,
-                    &mut single
-                ),
-                vk::Result::INCOMPLETE
-            );
-            assert_eq!(count, 1);
-            assert_eq!(single, physical[0]);
-            first.destroy_instance(None);
-            assert_eq!(second.enumerate_physical_devices().unwrap().len(), 2);
-            second.destroy_instance(None);
-        }
+        // SAFETY: `entry` queries the instance version through `TestFactory`.
+        let version = unsafe { entry.try_enumerate_instance_version() }.unwrap();
+        assert_eq!(version, Some(api_version(1, 3)));
+        let info = vk::InstanceCreateInfo::default();
+        // SAFETY: `info` is live and `TestFactory` creates an independent instance.
+        let first = unsafe { entry.create_instance(&info, None) }.unwrap();
+        // SAFETY: `info` is live and `TestFactory` creates an independent instance.
+        let second = unsafe { entry.create_instance(&info, None) }.unwrap();
+        assert_ne!(first.handle(), second.handle());
+        // SAFETY: `first` is a live instance whose dispatchable handle begins with `ObjectBase`.
+        let first_base = unsafe { &*(first.handle().as_raw() as usize as *const ObjectBase) };
+        // SAFETY: `second` is a live instance whose dispatchable handle begins with `ObjectBase`.
+        let second_base = unsafe { &*(second.handle().as_raw() as usize as *const ObjectBase) };
+        assert_eq!(
+            first_base.id, second_base.id,
+            "each context owns its identifier space"
+        );
+        // SAFETY: `first` is a live instance created from `entry` above.
+        let physical = unsafe { first.enumerate_physical_devices() }.unwrap();
+        assert_eq!(physical.len(), 2);
+        // SAFETY: `first` is still a live instance.
+        let repeated = unsafe { first.enumerate_physical_devices() }.unwrap();
+        assert_eq!(physical, repeated);
+        // SAFETY: `second` is a live instance created from `entry` above.
+        let other = unsafe { second.enumerate_physical_devices() }.unwrap();
+        assert_ne!(physical, other);
+        let mut count = 1;
+        let mut single = vk::PhysicalDevice::null();
+        // SAFETY: `first` is live, and `count` and `single` point to writable storage for 1 device.
+        let result = unsafe {
+            (first.fp_v1_0().enumerate_physical_devices)(first.handle(), &mut count, &mut single)
+        };
+        assert_eq!(result, vk::Result::INCOMPLETE);
+        assert_eq!(count, 1);
+        assert_eq!(single, physical[0]);
+        // SAFETY: `first` is live and has no child devices or concurrent callers.
+        unsafe { first.destroy_instance(None) };
+        // SAFETY: `second` is still a live instance independent of `first`.
+        let second_physical = unsafe { second.enumerate_physical_devices() }.unwrap();
+        assert_eq!(second_physical.len(), 2);
+        // SAFETY: `second` is live and has no child devices or concurrent callers.
+        unsafe { second.destroy_instance(None) };
     }
 
     #[test]
@@ -1319,220 +1373,250 @@ mod entry_tests {
             configuration.idle_timeout,
         )
         .unwrap();
-        // SAFETY: the test owns every Vulkan object and joins both threads
-        // before destruction. Queue lookup does not externally synchronize
-        // with queue-idle or device-idle.
-        unsafe {
-            let instance = helios_venus::driver::instance_from_connection::<TestFactory>(
+        // SAFETY: `connection` is owned and `InstanceCreateInfo` is valid for this call.
+        let instance = unsafe {
+            helios_venus::driver::instance_from_connection::<TestFactory>(
                 connection,
                 &vk::InstanceCreateInfo::default(),
                 None,
             )
-            .unwrap();
-            let physical = instance.enumerate_physical_devices().unwrap()[0];
-            let priorities = [1.0];
-            let queues = [vk::DeviceQueueCreateInfo::default()
-                .queue_family_index(0)
-                .queue_priorities(&priorities)];
-            let device = instance
-                .create_device(
-                    physical,
-                    &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
-                    None,
-                )
-                .unwrap();
-            let queue = device.get_device_queue(0, 0);
-            for device_wide in [false, true] {
-                let (entered, started) = std::sync::mpsc::channel();
-                let (release, held) = std::sync::mpsc::channel();
-                recorded.lock().unwrap().gpu_wait_hold = Some((entered, held));
-                std::thread::scope(|scope| {
-                    let waiting = scope.spawn(|| {
-                        if device_wide {
-                            device.device_wait_idle()
-                        } else {
-                            device.queue_wait_idle(queue)
-                        }
-                    });
-                    started
-                        .recv_timeout(Duration::from_secs(5))
-                        .expect("idle call enters its GPU wait");
-                    let (completed, progress) = std::sync::mpsc::channel();
-                    let lookup_device = &device;
-                    let lookup = scope.spawn(move || {
-                        completed
-                            .send(lookup_device.get_device_queue(0, 0))
-                            .unwrap()
-                    });
-                    let result = progress.recv_timeout(Duration::from_secs(1));
-                    release.send(()).unwrap();
-                    waiting.join().unwrap().unwrap();
-                    lookup.join().unwrap();
-                    assert_eq!(
-                        result.expect("queue lookup progresses while GPU completion is held"),
-                        queue
-                    );
-                });
-            }
-            device.destroy_device(None);
-            instance.destroy_instance(None);
         }
+        .unwrap();
+        // SAFETY: `instance` is a live instance created from `connection` above.
+        let physical = unsafe { instance.enumerate_physical_devices() }.unwrap()[0];
+        let priorities = [1.0];
+        let queues = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(0)
+            .queue_priorities(&priorities)];
+        let device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
+        // SAFETY: `physical` belongs to `instance` and `device_info` is live for this call.
+        let device = unsafe { instance.create_device(physical, &device_info, None) }.unwrap();
+        // SAFETY: `device` is live and queue family 0 index 0 was created above.
+        let queue = unsafe { device.get_device_queue(0, 0) };
+        for device_wide in [false, true] {
+            let (entered, started) = std::sync::mpsc::channel();
+            let (release, held) = std::sync::mpsc::channel();
+            recorded.lock().unwrap().gpu_wait_hold = Some((entered, held));
+            std::thread::scope(|scope| {
+                let waiting = scope.spawn(|| {
+                    if device_wide {
+                        // SAFETY: `device` remains live until `scope` joins.
+                        unsafe { device.device_wait_idle() }
+                    } else {
+                        // SAFETY: `device` and `queue` remain live until `scope` joins.
+                        unsafe { device.queue_wait_idle(queue) }
+                    }
+                });
+                started
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("idle call enters its GPU wait");
+                let (completed, progress) = std::sync::mpsc::channel();
+                let lookup_device = &device;
+                let lookup = scope.spawn(move || {
+                    // SAFETY: `lookup_device` is live and queue lookup does not require external sync with idle waits.
+                    let queue = unsafe { lookup_device.get_device_queue(0, 0) };
+                    completed.send(queue).unwrap();
+                });
+                let result = progress.recv_timeout(Duration::from_secs(1));
+                release.send(()).unwrap();
+                waiting.join().unwrap().unwrap();
+                lookup.join().unwrap();
+                assert_eq!(
+                    result.expect("queue lookup progresses while GPU completion is held"),
+                    queue
+                );
+            });
+        }
+        // SAFETY: both scoped threads have joined and `device` has no active work.
+        unsafe { device.destroy_device(None) };
+        // SAFETY: `device` has been destroyed above.
+        unsafe { instance.destroy_instance(None) };
     }
 
     #[test]
     fn ash_devices_own_stable_queues_and_generated_object_ids() {
         let entry = entry::<TestFactory>();
-        // SAFETY: all objects below follow Vulkan creation and lifetime rules;
-        // the recorded transport supplies their renderer replies.
-        unsafe {
-            let instance = entry
-                .create_instance(&vk::InstanceCreateInfo::default(), None)
-                .unwrap();
-            let physical = instance.enumerate_physical_devices().unwrap()[0];
-            let priorities = [0.5, 1.0];
-            let queues = [vk::DeviceQueueCreateInfo::default()
-                .queue_family_index(0)
-                .queue_priorities(&priorities)];
-            let info = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
-            let first = instance.create_device(physical, &info, None).unwrap();
-            let second = instance.create_device(physical, &info, None).unwrap();
-            let queue = first.get_device_queue(0, 0);
-            assert_eq!(
-                queue,
-                first.get_device_queue2(
-                    &vk::DeviceQueueInfo2::default()
-                        .queue_family_index(0)
-                        .queue_index(0)
-                )
-            );
-            assert_ne!(queue, first.get_device_queue(0, 1));
-            assert_ne!(queue, second.get_device_queue(0, 0));
-            let buffer_info = vk::BufferCreateInfo::default()
-                .size(4096)
-                .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE);
-            let first_buffer = first.create_buffer(&buffer_info, None).unwrap();
-            let second_buffer = second.create_buffer(&buffer_info, None).unwrap();
-            assert_ne!(first_buffer, vk::Buffer::null());
-            assert_ne!(first_buffer, second_buffer);
-            first.destroy_buffer(first_buffer, None);
-            first.queue_wait_idle(queue).unwrap();
-            first.destroy_device(None);
-            second.destroy_buffer(second_buffer, None);
-            second.device_wait_idle().unwrap();
-            second.destroy_device(None);
-            instance.destroy_instance(None);
-        }
+        // SAFETY: `entry` creates an independent instance with default `InstanceCreateInfo`.
+        let instance =
+            unsafe { entry.create_instance(&vk::InstanceCreateInfo::default(), None) }.unwrap();
+        // SAFETY: `instance` is a live instance created from `entry` above.
+        let physical = unsafe { instance.enumerate_physical_devices() }.unwrap()[0];
+        let priorities = [0.5, 1.0];
+        let queues = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(0)
+            .queue_priorities(&priorities)];
+        let info = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
+        // SAFETY: `physical` belongs to `instance` and `info` with `queues` is live.
+        let first = unsafe { instance.create_device(physical, &info, None) }.unwrap();
+        // SAFETY: `physical` belongs to `instance` and `info` with `queues` is live.
+        let second = unsafe { instance.create_device(physical, &info, None) }.unwrap();
+        // SAFETY: `first` is live and queue family 0 index 0 was created above.
+        let queue = unsafe { first.get_device_queue(0, 0) };
+        // SAFETY: `first` is live and `DeviceQueueInfo2` names queue family 0 index 0.
+        let queue2 = unsafe {
+            first.get_device_queue2(
+                &vk::DeviceQueueInfo2::default()
+                    .queue_family_index(0)
+                    .queue_index(0),
+            )
+        };
+        assert_eq!(queue, queue2);
+        // SAFETY: `first` is live and queue family 0 index 1 was created above.
+        let other_index = unsafe { first.get_device_queue(0, 1) };
+        assert_ne!(queue, other_index);
+        // SAFETY: `second` is live and queue family 0 index 0 was created above.
+        let other_device = unsafe { second.get_device_queue(0, 0) };
+        assert_ne!(queue, other_device);
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(4096)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: `first` is live and `buffer_info` is valid for this call.
+        let first_buffer = unsafe { first.create_buffer(&buffer_info, None) }.unwrap();
+        // SAFETY: `second` is live and `buffer_info` is valid for this call.
+        let second_buffer = unsafe { second.create_buffer(&buffer_info, None) }.unwrap();
+        assert_ne!(first_buffer, vk::Buffer::null());
+        assert_ne!(first_buffer, second_buffer);
+        // SAFETY: `first_buffer` is owned by `first` with no pending GPU use.
+        unsafe { first.destroy_buffer(first_buffer, None) };
+        // SAFETY: `queue` is a live queue owned by `first`.
+        unsafe { first.queue_wait_idle(queue) }.unwrap();
+        // SAFETY: all children of `first` have been destroyed and the queue is idle.
+        unsafe { first.destroy_device(None) };
+        // SAFETY: `second_buffer` is owned by `second` with no pending GPU use.
+        unsafe { second.destroy_buffer(second_buffer, None) };
+        // SAFETY: `second` is a live device.
+        unsafe { second.device_wait_idle() }.unwrap();
+        // SAFETY: all children of `second` have been destroyed and the device is idle.
+        unsafe { second.destroy_device(None) };
+        // SAFETY: both child devices have been destroyed above.
+        unsafe { instance.destroy_instance(None) };
     }
 
     #[test]
     fn ash_command_buffers_dispatch_through_their_pool_owner() {
         let entry = entry::<TestFactory>();
-        // SAFETY: buffers are recorded and freed without any pending GPU use.
-        unsafe {
-            let instance = entry
-                .create_instance(&vk::InstanceCreateInfo::default(), None)
-                .unwrap();
-            let physical = instance.enumerate_physical_devices().unwrap()[0];
-            let priorities = [1.0];
-            let queues = [vk::DeviceQueueCreateInfo::default()
-                .queue_family_index(0)
-                .queue_priorities(&priorities)];
-            let device = instance
-                .create_device(
-                    physical,
-                    &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
-                    None,
-                )
-                .unwrap();
-            let pool = device
-                .create_command_pool(
-                    &vk::CommandPoolCreateInfo::default().queue_family_index(0),
-                    None,
-                )
-                .unwrap();
-            let buffers = device
-                .allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(3),
-                )
-                .unwrap();
-            assert_eq!(buffers.len(), 3);
-            assert_ne!(buffers[0], buffers[1]);
-            assert_ne!(buffers[1], buffers[2]);
-            for &buffer in &buffers {
-                device
-                    .begin_command_buffer(buffer, &vk::CommandBufferBeginInfo::default())
-                    .unwrap();
-                device.end_command_buffer(buffer).unwrap();
-            }
-            device.free_command_buffers(pool, &[buffers[0], vk::CommandBuffer::null()]);
-            // Pool destruction implicitly frees the remaining two buffers.
-            device.destroy_command_pool(pool, None);
-            device.device_wait_idle().unwrap();
-            device.destroy_device(None);
-            instance.destroy_instance(None);
+        // SAFETY: `entry` creates an independent instance with default `InstanceCreateInfo`.
+        let instance =
+            unsafe { entry.create_instance(&vk::InstanceCreateInfo::default(), None) }.unwrap();
+        // SAFETY: `instance` is a live instance created from `entry` above.
+        let physical = unsafe { instance.enumerate_physical_devices() }.unwrap()[0];
+        let priorities = [1.0];
+        let queues = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(0)
+            .queue_priorities(&priorities)];
+        let device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
+        // SAFETY: `physical` belongs to `instance` and `device_info` is live.
+        let device = unsafe { instance.create_device(physical, &device_info, None) }.unwrap();
+        // SAFETY: `device` is live and `CommandPoolCreateInfo` is valid for this call.
+        let pool = unsafe {
+            device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default().queue_family_index(0),
+                None,
+            )
         }
+        .unwrap();
+        // SAFETY: `device` and `pool` are live and `CommandBufferAllocateInfo` requests 3 primary buffers.
+        let buffers = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(3),
+            )
+        }
+        .unwrap();
+        assert_eq!(buffers.len(), 3);
+        assert_ne!(buffers[0], buffers[1]);
+        assert_ne!(buffers[1], buffers[2]);
+        for &buffer in &buffers {
+            // SAFETY: `buffer` is an allocated primary command buffer in initial state.
+            unsafe { device.begin_command_buffer(buffer, &vk::CommandBufferBeginInfo::default()) }
+                .unwrap();
+            // SAFETY: `buffer` is currently in recording state.
+            unsafe { device.end_command_buffer(buffer) }.unwrap();
+        }
+        // SAFETY: `buffers[0]` belongs to `pool` with no pending GPU work; null handles are allowed.
+        unsafe { device.free_command_buffers(pool, &[buffers[0], vk::CommandBuffer::null()]) };
+        // Pool destruction implicitly frees the remaining two buffers.
+        // SAFETY: `pool` has no command buffers in flight.
+        unsafe { device.destroy_command_pool(pool, None) };
+        // SAFETY: `device` is a live device.
+        unsafe { device.device_wait_idle() }.unwrap();
+        // SAFETY: all child pools are destroyed and `device` is idle.
+        unsafe { device.destroy_device(None) };
+        // SAFETY: `device` has been destroyed above.
+        unsafe { instance.destroy_instance(None) };
     }
 
     #[test]
     fn ash_memory_maps_offsets_and_retains_its_blob_across_remaps() {
         let entry = entry::<TestFactory>();
-        // SAFETY: the test owns every object and performs no GPU work while
-        // accessing its coherent mapped allocation.
-        unsafe {
-            let instance = entry
-                .create_instance(&vk::InstanceCreateInfo::default(), None)
-                .unwrap();
-            let physical = instance.enumerate_physical_devices().unwrap()[0];
-            let priorities = [1.0];
-            let queues = [vk::DeviceQueueCreateInfo::default()
-                .queue_family_index(0)
-                .queue_priorities(&priorities)];
-            let device = instance
-                .create_device(
-                    physical,
-                    &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
-                    None,
-                )
-                .unwrap();
-            let memory = device
-                .allocate_memory(
-                    &vk::MemoryAllocateInfo::default()
-                        .allocation_size(4096)
-                        .memory_type_index(0),
-                    None,
-                )
-                .unwrap();
-            let part = device
-                .map_memory(memory, 256, 256, vk::MemoryMapFlags::empty())
-                .unwrap()
-                .cast::<u32>();
-            for index in 0..8 {
-                part.add(index).write_volatile(index as u32 + 17);
-            }
-            let range = [vk::MappedMemoryRange::default()
-                .memory(memory)
-                .offset(256)
-                .size(256)];
-            device.flush_mapped_memory_ranges(&range).unwrap();
-            device.unmap_memory(memory);
-            let full = device
-                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-                .unwrap()
-                .cast::<u32>();
-            device.invalidate_mapped_memory_ranges(&range).unwrap();
-            assert_eq!(full.add(64), part);
-            for index in 0..8 {
-                assert_eq!(full.add(index + 64).read_volatile(), index as u32 + 17);
-            }
-            device.unmap_memory(memory);
-            device.free_memory(memory, None);
-            device.destroy_device(None);
-            instance.destroy_instance(None);
+        // SAFETY: `entry` creates an independent instance with default `InstanceCreateInfo`.
+        let instance =
+            unsafe { entry.create_instance(&vk::InstanceCreateInfo::default(), None) }.unwrap();
+        // SAFETY: `instance` is a live instance created from `entry` above.
+        let physical = unsafe { instance.enumerate_physical_devices() }.unwrap()[0];
+        let priorities = [1.0];
+        let queues = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(0)
+            .queue_priorities(&priorities)];
+        let device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
+        // SAFETY: `physical` belongs to `instance` and `device_info` is live.
+        let device = unsafe { instance.create_device(physical, &device_info, None) }.unwrap();
+        // SAFETY: `device` is live and `MemoryAllocateInfo` requests 4096 bytes on host-visible type 0.
+        let memory = unsafe {
+            device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(4096)
+                    .memory_type_index(0),
+                None,
+            )
         }
+        .unwrap();
+        // SAFETY: `memory` is a 4096-byte unmapped host-visible allocation on `device`.
+        let part = unsafe { device.map_memory(memory, 256, 256, vk::MemoryMapFlags::empty()) }
+            .unwrap()
+            .cast::<u32>();
+        for index in 0..8 {
+            // SAFETY: `index < 8` stays inside the 256-byte (`64` `u32`s) mapped window.
+            let word = unsafe { part.add(index) };
+            // SAFETY: `word` is 4-byte aligned, mapped, and not accessed by any GPU work.
+            unsafe { word.write_volatile(index as u32 + 17) };
+        }
+        let range = [vk::MappedMemoryRange::default()
+            .memory(memory)
+            .offset(256)
+            .size(256)];
+        // SAFETY: `range` covers the mapped 256..512 region of `memory`.
+        unsafe { device.flush_mapped_memory_ranges(&range) }.unwrap();
+        // SAFETY: `memory` is currently mapped on `device`.
+        unsafe { device.unmap_memory(memory) };
+        // SAFETY: `memory` is unmapped and `WHOLE_SIZE` maps all 4096 bytes.
+        let full =
+            unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }
+                .unwrap()
+                .cast::<u32>();
+        // SAFETY: `range` lies inside the full 0..4096 mapping of `memory`.
+        unsafe { device.invalidate_mapped_memory_ranges(&range) }.unwrap();
+        // SAFETY: `64` `u32`s equals the 256-byte offset inside the 4096-byte allocation.
+        let aliased = unsafe { full.add(64) };
+        assert_eq!(aliased, part);
+        for index in 0..8 {
+            // SAFETY: `index + 64 < 1024` stays inside the 4096-byte mapped allocation.
+            let word = unsafe { full.add(index + 64) };
+            // SAFETY: `word` is 4-byte aligned, mapped, and written earlier via `part`.
+            let value = unsafe { word.read_volatile() };
+            assert_eq!(value, index as u32 + 17);
+        }
+        // SAFETY: `memory` is currently mapped on `device`.
+        unsafe { device.unmap_memory(memory) };
+        // SAFETY: `memory` is unmapped and has no bound resources or pending GPU work.
+        unsafe { device.free_memory(memory, None) };
+        // SAFETY: all allocations on `device` have been freed.
+        unsafe { device.destroy_device(None) };
+        // SAFETY: `device` has been destroyed above.
+        unsafe { instance.destroy_instance(None) };
     }
 
     #[test]
@@ -1547,62 +1631,65 @@ mod entry_tests {
             configuration.idle_timeout,
         )
         .unwrap();
-        // SAFETY: the test owns all objects and submits no GPU work using
-        // this allocation; a recorded transport fault exercises cleanup.
-        unsafe {
-            let instance = helios_venus::driver::instance_from_connection::<TestFactory>(
+        // SAFETY: `connection` is owned and `InstanceCreateInfo` is valid for this call.
+        let instance = unsafe {
+            helios_venus::driver::instance_from_connection::<TestFactory>(
                 connection,
                 &vk::InstanceCreateInfo::default(),
                 None,
             )
-            .unwrap();
-            let physical = instance.enumerate_physical_devices().unwrap()[0];
-            let priorities = [1.0];
-            let queues = [vk::DeviceQueueCreateInfo::default()
-                .queue_family_index(0)
-                .queue_priorities(&priorities)];
-            let device = instance
-                .create_device(
-                    physical,
-                    &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
-                    None,
-                )
-                .unwrap();
-            let memory = device
-                .allocate_memory(
-                    &vk::MemoryAllocateInfo::default()
-                        .allocation_size(4096)
-                        .memory_type_index(0),
-                    None,
-                )
-                .unwrap();
-            device
-                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-                .unwrap();
-            let mapping = {
-                let mut recorded = recorded.lock().unwrap();
-                let mapping = recorded.blobs[&recorded.next].clone();
-                recorded.premature_completion = true;
-                mapping
-            };
-            assert!(mapping.upgrade().is_some());
-            let error = device
-                .create_buffer(
-                    &vk::BufferCreateInfo::default()
-                        .size(4096)
-                        .usage(vk::BufferUsageFlags::STORAGE_BUFFER),
-                    None,
-                )
-                .unwrap_err();
-            assert_eq!(error, vk::Result::ERROR_DEVICE_LOST);
-            device.free_memory(memory, None);
-            assert!(
-                mapping.upgrade().is_none(),
-                "device loss must not defer memory release to device destruction"
-            );
-            device.destroy_device(None);
-            instance.destroy_instance(None);
         }
+        .unwrap();
+        // SAFETY: `instance` is a live instance created from `connection` above.
+        let physical = unsafe { instance.enumerate_physical_devices() }.unwrap()[0];
+        let priorities = [1.0];
+        let queues = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(0)
+            .queue_priorities(&priorities)];
+        let device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
+        // SAFETY: `physical` belongs to `instance` and `device_info` is live.
+        let device = unsafe { instance.create_device(physical, &device_info, None) }.unwrap();
+        // SAFETY: `device` is live and `MemoryAllocateInfo` requests 4096 bytes on host-visible type 0.
+        let memory = unsafe {
+            device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(4096)
+                    .memory_type_index(0),
+                None,
+            )
+        }
+        .unwrap();
+        // SAFETY: `memory` is an unmapped 4096-byte host-visible allocation on `device`.
+        unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }
+            .unwrap();
+        let mapping = {
+            let mut recorded = recorded.lock().unwrap();
+            let mapping = recorded.blobs[&recorded.next].clone();
+            recorded.premature_completion = true;
+            mapping
+        };
+        assert!(mapping.upgrade().is_some());
+        // SAFETY: `device` is live and `BufferCreateInfo` is valid for this call.
+        let error = unsafe {
+            device.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(4096)
+                    .usage(vk::BufferUsageFlags::STORAGE_BUFFER),
+                None,
+            )
+        }
+        .unwrap_err();
+        assert_eq!(error, vk::Result::ERROR_DEVICE_LOST);
+        // SAFETY: `memory` is owned by `device` and no GPU work references it.
+        unsafe { device.free_memory(memory, None) };
+        assert!(
+            mapping.upgrade().is_none(),
+            "device loss must not defer memory release to device destruction"
+        );
+        // SAFETY: all allocations on `device` have been freed.
+        unsafe { device.destroy_device(None) };
+        // SAFETY: `device` has been destroyed above.
+        unsafe { instance.destroy_instance(None) };
     }
 
     #[derive(Default)]
@@ -1625,8 +1712,9 @@ mod entry_tests {
         if state.refuse {
             return core::ptr::null_mut();
         }
+        assert_ne!(size, 0, "Vulkan allocations must be nonempty");
         let layout = std::alloc::Layout::from_size_align(size, alignment).unwrap();
-        // SAFETY: the driver requests a valid nonempty object layout.
+        // SAFETY: `layout` has non-zero `size` and power-of-two `alignment`.
         let pointer = unsafe { std::alloc::alloc(layout) };
         if !pointer.is_null() {
             state.live.lock().unwrap().insert(pointer as usize, layout);
@@ -1670,17 +1758,19 @@ mod entry_tests {
         // SAFETY: the same valid callback parameters as allocation.
         let pointer = unsafe { allocate(user, size, alignment, scope) };
         if !pointer.is_null() && !old.is_null() {
+            // SAFETY: `user` points to the live `Allocations` supplied to the callbacks.
             let state = unsafe { &*user.cast::<Allocations>() };
             let old_size = state.live.lock().unwrap()[&(old as usize)].size();
-            // SAFETY: distinct live allocations; the smaller size bounds both.
+            // SAFETY: `old` and `pointer` are distinct live allocations of at least `old_size.min(size)` bytes.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     old.cast::<u8>(),
                     pointer.cast::<u8>(),
                     old_size.min(size),
                 );
-                release(user, old);
             }
+            // SAFETY: `old` is a live allocation owned by `user` that is no longer needed after copying.
+            unsafe { release(user, old) };
         }
         pointer
     }
@@ -1706,11 +1796,11 @@ mod entry_tests {
                 assert!(matches!(result, Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY)));
             } else {
                 let instance = result.unwrap();
-                // SAFETY: the instance is live and owns its physical devices.
-                unsafe {
-                    assert_eq!(instance.enumerate_physical_devices().unwrap().len(), 2);
-                    instance.destroy_instance(Some(&callbacks));
-                }
+                // SAFETY: `instance` is a live instance created with `callbacks` above.
+                let physical = unsafe { instance.enumerate_physical_devices() }.unwrap();
+                assert_eq!(physical.len(), 2);
+                // SAFETY: `instance` is live, has no child devices, and `callbacks` matches creation.
+                unsafe { instance.destroy_instance(Some(&callbacks)) };
                 assert_eq!(allocations.created.load(Ordering::Relaxed), 3);
             }
             assert!(allocations.live.lock().unwrap().is_empty());

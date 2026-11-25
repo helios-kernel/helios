@@ -170,8 +170,14 @@ impl Context {
 }
 
 unsafe extern "C" {
-    /// Caller has masked host IRQs, installed Stage-2, supplied timer bounds,
-    /// and validated the return mode. Arms the timer immediately before entry
-    /// and restores host state before returning.
+    /// Enters the guest described by `context` at EL1/EL0 and returns once
+    /// an exit has restored the host's EL2/EL1 state.
+    ///
+    /// # Safety
+    ///
+    /// `context` must point to a valid, exclusively owned `Context`. The caller
+    /// must have masked host IRQs, installed the guest's Stage-2 translation
+    /// (`vttbr_el2` / `vtcr_el2`), supplied valid `slice_ticks` /
+    /// `timer_deadline`, and validated the guest return mode in `pstate`.
     pub(super) fn helios_aarch64_enter_guest(context: *mut Context);
 }

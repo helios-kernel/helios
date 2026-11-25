@@ -208,6 +208,8 @@ impl CriticalSectionState {
         }
 
         if interrupts_were_enabled {
+            // SAFETY: `restore_state` recorded that interrupts were enabled
+            // before the matching `acquire` disabled them.
             unsafe { I::enable_interrupts() };
         }
     }
@@ -487,15 +489,19 @@ mod tests {
         let state = CriticalSectionState::new();
         run_as(ProcessorIdentity::bootstrapping(0));
 
+        // SAFETY: `outer` is paired with `release` below on this single-threaded test hart.
         let outer = unsafe { state.acquire::<TestInterruptOps>() };
         assert!(decode_is_outermost(outer));
+        // SAFETY: nested acquire paired with `release(inner)` below.
         let inner = unsafe { state.acquire::<TestInterruptOps>() };
         assert!(
             !decode_is_outermost(inner),
             "a processor re-entering its own section must nest"
         );
 
+        // SAFETY: `inner` was returned by the inner `acquire` on `state`.
         unsafe { state.release::<TestInterruptOps>(inner) };
+        // SAFETY: `outer` was returned by the outer `acquire` on `state`.
         unsafe { state.release::<TestInterruptOps>(outer) };
     }
 
@@ -515,11 +521,13 @@ mod tests {
 
         for hardware_id in 0..8 {
             run_as(ProcessorIdentity::bootstrapping(hardware_id));
+            // SAFETY: paired with `release(token)` at the end of this iteration.
             let token = unsafe { state.acquire::<TestInterruptOps>() };
             assert!(
                 decode_is_outermost(token),
                 "processor {hardware_id} was mistaken for a nested re-acquire                  by whichever processor held the section before it"
             );
+            // SAFETY: `token` came from the matching `acquire` on `state`.
             unsafe { state.release::<TestInterruptOps>(token) };
         }
     }
@@ -541,14 +549,17 @@ mod tests {
         let shared = ProcessorIdentity::bootstrapping(0);
 
         run_as(shared);
+        // SAFETY: paired with `release(first)` below (which intentionally panics on nested depth).
         let first = unsafe { state.acquire::<TestInterruptOps>() };
         assert!(decode_is_outermost(first));
 
         // A different processor, indistinguishable because it answers with the
         // same identity. It enters the section the first one still holds.
+        // SAFETY: simulates a second processor erroneously sharing `shared`; `release(first)` panics before unwinding.
         let second = unsafe { state.acquire::<TestInterruptOps>() };
         assert!(!decode_is_outermost(second));
 
+        // SAFETY: `first` came from the outermost `acquire` above and triggers the expected depth check panic.
         unsafe { state.release::<TestInterruptOps>(first) };
     }
 
@@ -557,16 +568,20 @@ mod tests {
         let state = CriticalSectionState::new();
 
         run_as(ProcessorIdentity::bootstrapping(1));
+        // SAFETY: paired with `release(bootstrapping)` on the next line.
         let bootstrapping = unsafe { state.acquire::<TestInterruptOps>() };
         assert!(decode_is_outermost(bootstrapping));
+        // SAFETY: `bootstrapping` came from the matching `acquire` on `state`.
         unsafe { state.release::<TestInterruptOps>(bootstrapping) };
 
         run_as(ProcessorIdentity::installed(&FIRST_RUNTIME));
+        // SAFETY: paired with `release(installed)` below.
         let installed = unsafe { state.acquire::<TestInterruptOps>() };
         assert!(
             decode_is_outermost(installed),
             "installing a runtime must not make a processor look like the              bootstrapping owner that came before it"
         );
+        // SAFETY: `installed` came from the matching `acquire` on `state`.
         unsafe { state.release::<TestInterruptOps>(installed) };
     }
 }

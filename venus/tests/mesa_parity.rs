@@ -331,7 +331,10 @@ fn encoders_match_mesas_generator() {
         let enabled: Vec<u8> = (0..=MAX_EXTENSION_NUMBER)
             .map(|n| u8::from(protocol.has_extension(n)))
             .collect();
-        mesa.set_protocol(api_version(scenario.api.0, scenario.api.1), &enabled)
+        // SAFETY: `enabled` covers `0..=MAX_EXTENSION_NUMBER`, remains live and
+        // unmodified for all driver calls in this scenario, and no other thread
+        // accesses `mesa`.
+        unsafe { mesa.set_protocol(api_version(scenario.api.0, scenario.api.1), &enabled) }
             .unwrap_or_else(|e| panic!("{e}"));
 
         for (index, entry) in generated::COMMANDS.iter().enumerate() {
@@ -357,10 +360,11 @@ fn encoders_match_mesas_generator() {
             let driver = &drivers[index];
 
             // SAFETY: `args` points to the filled storage of every parameter,
-            // which `filler` keeps alive.
+            // which `filler` keeps alive, and `enabled` remains live for `mesa`.
             let mesa_size = unsafe { driver.sizeof(&mut args) };
             let mut mesa = vec![0u8; mesa_size];
-            // SAFETY: as above.
+            // SAFETY: `args` points to the filled storage kept alive by `filler`,
+            // `mesa` is a writable `mesa_size`-byte buffer, and `enabled` is live.
             let (mesa_len, overflow) =
                 unsafe { driver.encode(&mut mesa, GENERATE_REPLY, &mut args) };
             if overflow || mesa_len != mesa_size {
@@ -388,7 +392,8 @@ fn encoders_match_mesas_generator() {
                 );
             }
 
-            // SAFETY: as above.
+            // SAFETY: `args` points to the filled storage of every parameter,
+            // which `filler` keeps alive for the duration of the call.
             let rust_size = unsafe { (entry.sizeof)(&protocol, &args) };
             if rust_size != Ok(mesa_size) {
                 failures.add(
@@ -400,7 +405,8 @@ fn encoders_match_mesas_generator() {
             total += mesa_size;
             let mut rust = vec![0u8; mesa_size];
             let mut encoder = Encoder::new(&mut rust, &protocol);
-            // SAFETY: as above.
+            // SAFETY: `args` points to the filled storage of every parameter,
+            // which `filler` keeps alive for the duration of the call.
             unsafe { (entry.encode)(&mut encoder, GENERATE_REPLY, &args) };
             match encoder.finish() {
                 Ok(written) if written == mesa_size => {
@@ -416,9 +422,11 @@ fn encoders_match_mesas_generator() {
             }
             compared += 1;
 
-            // SAFETY: as above.
+            // SAFETY: `args` points to the filled storage of every parameter,
+            // which `filler` keeps alive, and `enabled` remains live for `mesa`.
             let mesa_reply_size = unsafe { driver.sizeof_reply(&mut args) };
-            // SAFETY: as above.
+            // SAFETY: `args` points to the filled storage of every parameter,
+            // which `filler` keeps alive for the duration of the call.
             let rust_reply_size = unsafe { (entry.sizeof_reply)(&protocol, &args) };
             if rust_reply_size != Ok(mesa_reply_size) {
                 failures.add(
@@ -438,7 +446,8 @@ fn encoders_match_mesas_generator() {
             };
             let ret = RETURN_VALUE & mask;
             let mut mesa_reply = vec![0u8; mesa_reply_size];
-            // SAFETY: as above.
+            // SAFETY: `args` points to the filled storage kept alive by `filler`,
+            // and `mesa_reply` is a writable `mesa_reply_size`-byte buffer.
             let (len, overflow) =
                 unsafe { renderers[index].encode_reply(&mut mesa_reply, ret, &mut args) };
             if overflow || len != mesa_reply_size {
@@ -451,7 +460,8 @@ fn encoders_match_mesas_generator() {
             }
             let mut rust_reply = vec![0u8; mesa_reply_size];
             let mut encoder = Encoder::new(&mut rust_reply, &protocol);
-            // SAFETY: as above.
+            // SAFETY: `args` points to the filled storage of every parameter,
+            // which `filler` keeps alive for the duration of the call.
             unsafe { (entry.encode_reply)(&mut encoder, ret.to_le_bytes(), &args) };
             match encoder.finish() {
                 Ok(written) if written == mesa_reply_size => {
@@ -474,7 +484,8 @@ fn encoders_match_mesas_generator() {
                 .expect("the first fill of these arguments worked");
             let other_args: Vec<*mut c_void> = other_storage.iter().map(|p| p.cast()).collect();
             let mut decoder = Decoder::new(&mesa_reply);
-            // SAFETY: `other_args` points to the filled storage of every parameter.
+            // SAFETY: `other_args` points to the filled writable storage of
+            // every parameter, which `other` keeps alive.
             let decoded = unsafe { (entry.decode_reply)(&mut decoder, &other_args) };
             match decoder.finish() {
                 Ok(consumed) if consumed == mesa_reply.len() => {}
@@ -496,7 +507,8 @@ fn encoders_match_mesas_generator() {
             }
             let mut again = vec![0u8; mesa_reply_size];
             let mut encoder = Encoder::new(&mut again, &protocol);
-            // SAFETY: as above.
+            // SAFETY: `other_args` points to the filled storage of every
+            // parameter, which `other` keeps alive for the duration of the call.
             unsafe { (entry.encode_reply)(&mut encoder, decoded, &other_args) };
             match encoder.finish() {
                 Ok(_) => {

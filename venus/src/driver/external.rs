@@ -298,7 +298,10 @@ fn probe<T: Transport>(
 impl<F: Factory> State<F> {
     /// A physical device's external memory, determined from the renderer on
     /// first use.
-    pub(super) fn physical_external(
+    ///
+    /// # Safety
+    /// `physical` must be a live physical device belonging to this instance.
+    pub(super) unsafe fn physical_external(
         &mut self,
         physical: vk::PhysicalDevice,
     ) -> Result<Result<&PhysicalExternal, vk::Result>, Error<TransportError<F>>> {
@@ -319,21 +322,27 @@ impl<F: Factory> State<F> {
     }
 }
 
+/// Query the physical device's external memory capabilities.
+///
+/// # Safety
+/// `physical` must be a live physical device belonging to `F`.
 unsafe fn physical_memory<F: Factory>(
     physical: vk::PhysicalDevice,
 ) -> Result<ExternalMemory, vk::Result> {
+    let call = |state: &mut State<F>| {
+        // SAFETY: `physical` belongs to this instance.
+        let memory = unsafe { state.physical_external(physical) }?.map(|external| external.memory);
+        Ok(memory.map_err(|result| state.finish(Ok(result))))
+    };
     // SAFETY: the Vulkan caller supplies a live physical device.
-    unsafe {
-        invoke::<F, _>(object(physical), |state| {
-            let memory = state
-                .physical_external(physical)?
-                .map(|external| external.memory);
-            Ok(memory.map_err(|result| state.finish(Ok(result))))
-        })
-    }?
+    unsafe { invoke::<F, _>(object(physical), call) }?
 }
 
-fn device_memory<F: Factory>(device: vk::Device) -> ExternalMemory {
+/// Read the immutable external memory configuration of a live logical device.
+///
+/// # Safety
+/// `device` must be a live `VkDevice` handle belonging to `F`.
+unsafe fn device_memory<F: Factory>(device: vk::Device) -> ExternalMemory {
     // SAFETY: a live device handle addresses its Device, whose external
     // memory is immutable after creation.
     unsafe { (*object(device).cast::<Device<F>>()).external }
@@ -349,18 +358,18 @@ unsafe extern "system" fn enumerate_device_extensions<F: Factory>(
     if !layer.is_null() {
         return vk::Result::ERROR_LAYER_NOT_PRESENT;
     }
-    // SAFETY: Vulkan supplies a live physical device, a writable count and
-    // the declared output capacity.
-    let result = unsafe {
-        invoke_result::<F>(object(physical), |state| {
-            Ok(match state.physical_external(physical)? {
-                Ok(external) => wire::VkResult(
-                    write_properties(count, properties, &external.extensions).as_raw(),
-                ),
-                Err(result) => wire::VkResult(result.as_raw()),
-            })
+    let call = |state: &mut State<F>| {
+        // SAFETY: `physical` is a live physical device belonging to this instance.
+        Ok(match unsafe { state.physical_external(physical) }? {
+            Ok(external) => wire::VkResult(
+                // SAFETY: Vulkan supplies a writable count and the declared output capacity.
+                unsafe { write_properties(count, properties, &external.extensions) }.as_raw(),
+            ),
+            Err(result) => wire::VkResult(result.as_raw()),
         })
     };
+    // SAFETY: Vulkan supplies a live physical device.
+    let result = unsafe { invoke_result::<F>(object(physical), call) };
     vk::Result::from_raw(result.0)
 }
 
@@ -369,49 +378,58 @@ unsafe extern "system" fn image_format_properties2<F: Factory>(
     info: *const vk::PhysicalDeviceImageFormatInfo2<'_>,
     properties: *mut vk::ImageFormatProperties2<'_>,
 ) -> vk::Result {
-    // SAFETY: Vulkan supplies live input and output chains.
-    unsafe {
-        let requested =
-            chain::next::<vk::PhysicalDeviceExternalImageFormatInfo<'_>>((*info).p_next)
-                .map(|external| external.handle_type)
-                .filter(|handle| !handle.is_empty());
-        let forward = |info: *const vk::PhysicalDeviceImageFormatInfo2<'_>| {
-            vk::Result::from_raw(
-                super::generated::vkGetPhysicalDeviceImageFormatProperties2::<F>(
-                    wire::VkPhysicalDevice(object(physical)),
-                    info.cast(),
-                    properties.cast(),
-                )
-                .0,
+    // SAFETY: Vulkan supplies a live input structure.
+    let info_ref = unsafe { &*info };
+    // SAFETY: `info_ref.p_next` is null or a live `pNext` chain for this call.
+    let requested =
+        unsafe { chain::next::<vk::PhysicalDeviceExternalImageFormatInfo<'_>>(info_ref.p_next) }
+            .map(|external| external.handle_type)
+            .filter(|handle| !handle.is_empty());
+    let forward = |info: *const vk::PhysicalDeviceImageFormatInfo2<'_>| {
+        // SAFETY: Vulkan supplies live physical device, input, and writable output chains.
+        let result = unsafe {
+            super::generated::vkGetPhysicalDeviceImageFormatProperties2::<F>(
+                wire::VkPhysicalDevice(object(physical)),
+                info.cast(),
+                properties.cast(),
             )
         };
-        let Some(requested) = requested else {
-            return forward(info);
-        };
-        let memory = match physical_memory::<F>(physical) {
-            Ok(memory) => memory,
-            Err(result) => return result,
-        };
-        if !requested.intersects(memory.offered()) {
-            return vk::Result::ERROR_FORMAT_NOT_SUPPORTED;
-        }
-        let rewritten = memory.rewrite(requested).and_then(|handle| {
+        vk::Result::from_raw(result.0)
+    };
+    let Some(requested) = requested else {
+        return forward(info);
+    };
+    // SAFETY: `physical` is a live physical device belonging to `F`.
+    let memory = match unsafe { physical_memory::<F>(physical) } {
+        Ok(memory) => memory,
+        Err(result) => return result,
+    };
+    if !requested.intersects(memory.offered()) {
+        return vk::Result::ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    let rewritten = memory.rewrite(requested).and_then(|handle| {
+        // SAFETY: `info_ref` has a live `pNext` chain for this call.
+        unsafe {
             chain::rewrite(
-                &*info,
+                info_ref,
                 |external: &mut vk::PhysicalDeviceExternalImageFormatInfo<'_>| {
                     external.handle_type = handle;
                 },
             )
-        });
-        let result = forward(rewritten.as_ref().map_or(info, Rewritten::head));
-        if result == vk::Result::SUCCESS
-            && let Some(external) =
-                chain::next_mut::<vk::ExternalImageFormatProperties<'_>>((*properties).p_next)
-        {
+        }
+    });
+    let result = forward(rewritten.as_ref().map_or(info, Rewritten::head));
+    if result == vk::Result::SUCCESS {
+        // SAFETY: Vulkan supplies a live, writable output structure.
+        let props_next = unsafe { (*properties).p_next };
+        // SAFETY: `props_next` is a live, writable `pNext` chain with no other borrows.
+        let external =
+            unsafe { chain::next_mut::<vk::ExternalImageFormatProperties<'_>>(props_next) };
+        if let Some(external) = external {
             memory.answer(&mut external.external_memory_properties);
         }
-        result
     }
+    result
 }
 
 unsafe extern "system" fn external_buffer_properties<F: Factory>(
@@ -419,28 +437,36 @@ unsafe extern "system" fn external_buffer_properties<F: Factory>(
     info: *const vk::PhysicalDeviceExternalBufferInfo<'_>,
     properties: *mut vk::ExternalBufferProperties<'_>,
 ) {
-    // SAFETY: Vulkan supplies a live input structure and writable output.
-    unsafe {
-        let requested = (*info).handle_type;
-        // A failed query records device loss, observable by later results.
-        let Ok(memory) = physical_memory::<F>(physical) else {
-            return;
-        };
-        if !requested.intersects(memory.offered()) {
+    // SAFETY: Vulkan supplies a live `PhysicalDeviceExternalBufferInfo`.
+    let info_ref = unsafe { &*info };
+    let requested = info_ref.handle_type;
+    // A failed query records device loss, observable by later results.
+    // SAFETY: `physical` is a live physical device belonging to `F`.
+    let Ok(memory) = (unsafe { physical_memory::<F>(physical) }) else {
+        return;
+    };
+    if !requested.intersects(memory.offered()) {
+        // SAFETY: Vulkan supplies a writable `ExternalBufferProperties` output.
+        unsafe {
             (*properties).external_memory_properties = ExternalMemory::unsupported(requested);
-            return;
         }
-        let mut renderer_info = *info;
-        if let Some(handle) = memory.rewrite(requested) {
-            renderer_info.handle_type = handle;
-        }
+        return;
+    }
+    let mut renderer_info = *info_ref;
+    if let Some(handle) = memory.rewrite(requested) {
+        renderer_info.handle_type = handle;
+    }
+    // SAFETY: `physical`, `renderer_info`, and `properties` satisfy Vulkan's query contract.
+    unsafe {
         super::generated::vkGetPhysicalDeviceExternalBufferProperties::<F>(
             wire::VkPhysicalDevice(object(physical)),
             (&raw const renderer_info).cast(),
             properties.cast(),
         );
-        memory.answer(&mut (*properties).external_memory_properties);
     }
+    // SAFETY: Vulkan supplies a live, writable `ExternalBufferProperties` output.
+    let external_props = unsafe { &mut (*properties).external_memory_properties };
+    memory.answer(external_props);
 }
 
 /// An image create-info with the renderer's handle types, or `None` when the
@@ -453,10 +479,11 @@ unsafe fn image_info<'a>(
     info: &vk::ImageCreateInfo<'a>,
 ) -> Option<Rewritten<vk::ImageCreateInfo<'a>>> {
     // SAFETY: forwarded from the caller.
+    let requested =
+        unsafe { chain::next::<vk::ExternalMemoryImageCreateInfo<'_>>(info.p_next) }?.handle_types;
+    let handle = memory.rewrite(requested)?;
+    // SAFETY: forwarded from the caller.
     unsafe {
-        let requested =
-            chain::next::<vk::ExternalMemoryImageCreateInfo<'_>>(info.p_next)?.handle_types;
-        let handle = memory.rewrite(requested)?;
         chain::rewrite(
             info,
             |external: &mut vk::ExternalMemoryImageCreateInfo<'_>| {
@@ -476,10 +503,11 @@ unsafe fn buffer_info<'a>(
     info: &vk::BufferCreateInfo<'a>,
 ) -> Option<Rewritten<vk::BufferCreateInfo<'a>>> {
     // SAFETY: forwarded from the caller.
+    let requested =
+        unsafe { chain::next::<vk::ExternalMemoryBufferCreateInfo<'_>>(info.p_next) }?.handle_types;
+    let handle = memory.rewrite(requested)?;
+    // SAFETY: forwarded from the caller.
     unsafe {
-        let requested =
-            chain::next::<vk::ExternalMemoryBufferCreateInfo<'_>>(info.p_next)?.handle_types;
-        let handle = memory.rewrite(requested)?;
         chain::rewrite(
             info,
             |external: &mut vk::ExternalMemoryBufferCreateInfo<'_>| {
@@ -499,9 +527,11 @@ pub(super) unsafe fn allocate_info<'a>(
     info: &vk::MemoryAllocateInfo<'a>,
 ) -> Option<Rewritten<vk::MemoryAllocateInfo<'a>>> {
     // SAFETY: forwarded from the caller.
+    let requested =
+        unsafe { chain::next::<vk::ExportMemoryAllocateInfo<'_>>(info.p_next) }?.handle_types;
+    let handle = memory.rewrite(requested)?;
+    // SAFETY: forwarded from the caller.
     unsafe {
-        let requested = chain::next::<vk::ExportMemoryAllocateInfo<'_>>(info.p_next)?.handle_types;
-        let handle = memory.rewrite(requested)?;
         chain::rewrite(info, |export: &mut vk::ExportMemoryAllocateInfo<'_>| {
             export.handle_types = handle;
         })
@@ -514,18 +544,23 @@ unsafe extern "system" fn create_image<F: Factory>(
     allocator: *const vk::AllocationCallbacks<'_>,
     output: *mut vk::Image,
 ) -> vk::Result {
-    // SAFETY: Vulkan supplies a live device, create-info and output slot.
-    unsafe {
-        let rewritten = image_info(device_memory::<F>(device), &*info);
-        let info = rewritten.as_ref().map_or(info, Rewritten::head);
-        let result = super::generated::vkCreateImage::<F>(
+    // SAFETY: Vulkan supplies a live device handle of `F`.
+    let memory = unsafe { device_memory::<F>(device) };
+    // SAFETY: Vulkan supplies a live `ImageCreateInfo` for this call.
+    let create_info = unsafe { &*info };
+    // SAFETY: `create_info` has a live `pNext` chain for this call.
+    let rewritten = unsafe { image_info(memory, create_info) };
+    let info = rewritten.as_ref().map_or(info, Rewritten::head);
+    // SAFETY: Vulkan supplies a live device, create-info, callbacks, and output slot.
+    let result = unsafe {
+        super::generated::vkCreateImage::<F>(
             wire::VkDevice(object(device)),
             info.cast(),
             allocator.cast(),
             output.cast(),
-        );
-        vk::Result::from_raw(result.0)
-    }
+        )
+    };
+    vk::Result::from_raw(result.0)
 }
 
 unsafe extern "system" fn create_buffer<F: Factory>(
@@ -534,18 +569,23 @@ unsafe extern "system" fn create_buffer<F: Factory>(
     allocator: *const vk::AllocationCallbacks<'_>,
     output: *mut vk::Buffer,
 ) -> vk::Result {
-    // SAFETY: Vulkan supplies a live device, create-info and output slot.
-    unsafe {
-        let rewritten = buffer_info(device_memory::<F>(device), &*info);
-        let info = rewritten.as_ref().map_or(info, Rewritten::head);
-        let result = super::generated::vkCreateBuffer::<F>(
+    // SAFETY: Vulkan supplies a live device handle of `F`.
+    let memory = unsafe { device_memory::<F>(device) };
+    // SAFETY: Vulkan supplies a live `BufferCreateInfo` for this call.
+    let create_info = unsafe { &*info };
+    // SAFETY: `create_info` has a live `pNext` chain for this call.
+    let rewritten = unsafe { buffer_info(memory, create_info) };
+    let info = rewritten.as_ref().map_or(info, Rewritten::head);
+    // SAFETY: Vulkan supplies a live device, create-info, callbacks, and output slot.
+    let result = unsafe {
+        super::generated::vkCreateBuffer::<F>(
             wire::VkDevice(object(device)),
             info.cast(),
             allocator.cast(),
             output.cast(),
-        );
-        vk::Result::from_raw(result.0)
-    }
+        )
+    };
+    vk::Result::from_raw(result.0)
 }
 
 unsafe extern "system" fn device_image_memory_requirements<F: Factory>(
@@ -553,13 +593,20 @@ unsafe extern "system" fn device_image_memory_requirements<F: Factory>(
     info: *const vk::DeviceImageMemoryRequirements<'_>,
     requirements: *mut vk::MemoryRequirements2<'_>,
 ) {
-    // SAFETY: Vulkan supplies a live device, query and output chain.
+    // SAFETY: Vulkan supplies a live device handle of `F`.
+    let memory = unsafe { device_memory::<F>(device) };
+    // SAFETY: Vulkan supplies a live `DeviceImageMemoryRequirements` structure.
+    let req_info = unsafe { &*info };
+    // SAFETY: `req_info.p_create_info` points to a live `ImageCreateInfo`.
+    let create_info = unsafe { &*req_info.p_create_info };
+    // SAFETY: `create_info` has a live `pNext` chain for this call.
+    let rewritten = unsafe { image_info(memory, create_info) };
+    let mut renderer_info = *req_info;
+    if let Some(rewritten) = &rewritten {
+        renderer_info.p_create_info = rewritten.head();
+    }
+    // SAFETY: Vulkan supplies a live device, query structure, and output chain.
     unsafe {
-        let rewritten = image_info(device_memory::<F>(device), &*(*info).p_create_info);
-        let mut renderer_info = *info;
-        if let Some(rewritten) = &rewritten {
-            renderer_info.p_create_info = rewritten.head();
-        }
         super::generated::vkGetDeviceImageMemoryRequirements::<F>(
             wire::VkDevice(object(device)),
             (&raw const renderer_info).cast(),
@@ -573,13 +620,20 @@ unsafe extern "system" fn device_buffer_memory_requirements<F: Factory>(
     info: *const vk::DeviceBufferMemoryRequirements<'_>,
     requirements: *mut vk::MemoryRequirements2<'_>,
 ) {
-    // SAFETY: Vulkan supplies a live device, query and output chain.
+    // SAFETY: Vulkan supplies a live device handle of `F`.
+    let memory = unsafe { device_memory::<F>(device) };
+    // SAFETY: Vulkan supplies a live `DeviceBufferMemoryRequirements` structure.
+    let req_info = unsafe { &*info };
+    // SAFETY: `req_info.p_create_info` points to a live `BufferCreateInfo`.
+    let create_info = unsafe { &*req_info.p_create_info };
+    // SAFETY: `create_info` has a live `pNext` chain for this call.
+    let rewritten = unsafe { buffer_info(memory, create_info) };
+    let mut renderer_info = *req_info;
+    if let Some(rewritten) = &rewritten {
+        renderer_info.p_create_info = rewritten.head();
+    }
+    // SAFETY: Vulkan supplies a live device, query structure, and output chain.
     unsafe {
-        let rewritten = buffer_info(device_memory::<F>(device), &*(*info).p_create_info);
-        let mut renderer_info = *info;
-        if let Some(rewritten) = &rewritten {
-            renderer_info.p_create_info = rewritten.head();
-        }
         super::generated::vkGetDeviceBufferMemoryRequirements::<F>(
             wire::VkDevice(object(device)),
             (&raw const renderer_info).cast(),
@@ -804,28 +858,47 @@ mod tests {
             p_next: (&raw const export).cast(),
             ..Default::default()
         };
-        // SAFETY: every chain is live for the test.
-        unsafe {
-            let image = image_info(memory, &image).unwrap();
-            let image = &*image.head();
-            assert_eq!(image.tiling, vk::ImageTiling::LINEAR);
-            let external = chain::next::<vk::ExternalMemoryImageCreateInfo<'_>>(image.p_next);
-            assert_eq!(external.unwrap().handle_types, HandleTypes::DMA_BUF_EXT);
+        // SAFETY: `image` and its chain are live for the test.
+        let image = unsafe { image_info(memory, &image) }.unwrap();
+        // SAFETY: the rewritten head lives as long as `image`.
+        let image = unsafe { &*image.head() };
+        assert_eq!(image.tiling, vk::ImageTiling::LINEAR);
+        // SAFETY: `image.p_next` is a live chain for the test.
+        let rewritten_image_external =
+            unsafe { chain::next::<vk::ExternalMemoryImageCreateInfo<'_>>(image.p_next) };
+        assert_eq!(
+            rewritten_image_external.unwrap().handle_types,
+            HandleTypes::DMA_BUF_EXT
+        );
 
-            let buffer = buffer_info(memory, &buffer).unwrap();
-            let buffer = &*buffer.head();
-            assert_eq!(buffer.size, 64);
-            let external = chain::next::<vk::ExternalMemoryBufferCreateInfo<'_>>(buffer.p_next);
-            assert_eq!(external.unwrap().handle_types, HandleTypes::DMA_BUF_EXT);
+        // SAFETY: `buffer` and its chain are live for the test.
+        let buffer = unsafe { buffer_info(memory, &buffer) }.unwrap();
+        // SAFETY: the rewritten head lives as long as `buffer`.
+        let buffer = unsafe { &*buffer.head() };
+        assert_eq!(buffer.size, 64);
+        // SAFETY: `buffer.p_next` is a live chain for the test.
+        let rewritten_buffer_external =
+            unsafe { chain::next::<vk::ExternalMemoryBufferCreateInfo<'_>>(buffer.p_next) };
+        assert_eq!(
+            rewritten_buffer_external.unwrap().handle_types,
+            HandleTypes::DMA_BUF_EXT
+        );
 
-            let rewritten = allocate_info(memory, &allocation).unwrap();
-            let allocation = &*rewritten.head();
-            let export = chain::next::<vk::ExportMemoryAllocateInfo<'_>>(allocation.p_next);
-            assert_eq!(export.unwrap().handle_types, HandleTypes::DMA_BUF_EXT);
-            assert!(
-                chain::next::<vk::MemoryDedicatedAllocateInfo<'_>>(allocation.p_next).is_some()
-            );
-        }
+        // SAFETY: `allocation` and its chain are live for the test.
+        let rewritten = unsafe { allocate_info(memory, &allocation) }.unwrap();
+        // SAFETY: the rewritten head lives as long as `rewritten`.
+        let allocation = unsafe { &*rewritten.head() };
+        // SAFETY: `allocation.p_next` is a live chain for the test.
+        let rewritten_export =
+            unsafe { chain::next::<vk::ExportMemoryAllocateInfo<'_>>(allocation.p_next) };
+        assert_eq!(
+            rewritten_export.unwrap().handle_types,
+            HandleTypes::DMA_BUF_EXT
+        );
+        // SAFETY: `allocation.p_next` is a live chain for the test.
+        let dedicated =
+            unsafe { chain::next::<vk::MemoryDedicatedAllocateInfo<'_>>(allocation.p_next) };
+        assert!(dedicated.is_some());
         assert_eq!(external.handle_types, HandleTypes::OPAQUE_FD);
         assert_eq!(export.handle_types, HandleTypes::OPAQUE_FD);
 
@@ -836,6 +909,7 @@ mod tests {
             ..Default::default()
         };
         // SAFETY: the chain is live for the test.
-        assert!(unsafe { allocate_info(memory, &allocation) }.is_none());
+        let unchanged = unsafe { allocate_info(memory, &allocation) };
+        assert!(unchanged.is_none());
     }
 }

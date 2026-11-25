@@ -139,11 +139,12 @@ impl Mtrrs {
             .enumerate()
         {
             let (base_msr, mask_msr) = variable_range_msrs(index);
-            // SAFETY: `index` is below `IA32_MTRRCAP.VCNT`.
-            unsafe {
-                range.base = rdmsr(base_msr);
-                range.mask = rdmsr(mask_msr);
-            }
+            // SAFETY: `base_msr` is `IA32_MTRR_PHYSBASEn` for `index` below
+            // `IA32_MTRRCAP.VCNT`.
+            range.base = unsafe { rdmsr(base_msr) };
+            // SAFETY: `mask_msr` is `IA32_MTRR_PHYSMASKn` for `index` below
+            // `IA32_MTRRCAP.VCNT`.
+            range.mask = unsafe { rdmsr(mask_msr) };
         }
         Self(Some(configuration))
     }
@@ -178,40 +179,70 @@ impl Mtrrs {
         x86_64::instructions::interrupts::without_interrupts(|| {
             let cr0 = Cr0::read();
             let cr4 = Cr4::read();
-            // SAFETY: the sequence is the SDM's; it ends with the caches
-            // flushed, the TLB flushed and `CR0`/`CR4` as they were, and
-            // runs with interrupts masked, so nothing observes the
-            // intermediate memory types.
+            // The sequence follows Intel SDM Vol. 3A §12.11.8 with interrupts
+            // masked so nothing on this processor observes intermediate types.
+            // SAFETY: setting `CR0.CD=1, NW=0` enters no-fill cache mode at
+            // ring 0 while MTRRs are updated.
             unsafe {
-                // `CD` = 1, `NW` = 0: no-fill cache mode.
                 Cr0::write((cr0 | Cr0Flags::CACHE_DISABLE) - Cr0Flags::NOT_WRITE_THROUGH);
-                flush_caches();
-                if cr4.contains(Cr4Flags::PAGE_GLOBAL) {
+            }
+            flush_caches();
+            if cr4.contains(Cr4Flags::PAGE_GLOBAL) {
+                // SAFETY: clearing `CR4.PGE` allows the subsequent `CR3` write
+                // to flush global TLB entries per the SDM MTRR procedure.
+                unsafe {
                     Cr4::write(cr4 - Cr4Flags::PAGE_GLOBAL);
                 }
-                flush_tlb();
+            }
+            flush_tlb();
+            // SAFETY: `IA32_MTRR_DEF_TYPE` exists because MTRRs are supported;
+            // clearing `E` disables MTRRs while ranges are programmed.
+            unsafe {
                 wrmsr(
                     IA32_MTRR_DEF_TYPE,
                     configuration.def_type & !DEF_TYPE_ENABLE,
                 );
-                if capability.fixed_ranges {
-                    for (value, msr) in configuration.fixed.iter().zip(FIXED_RANGE_MSRS) {
+            }
+            if capability.fixed_ranges {
+                for (value, msr) in configuration.fixed.iter().zip(FIXED_RANGE_MSRS) {
+                    // SAFETY: `IA32_MTRRCAP.FIX` is set and `msr` is a valid
+                    // fixed-range MTRR captured from the BSP.
+                    unsafe {
                         wrmsr(msr, *value);
                     }
                 }
-                for (index, range) in configuration.variable[..capability.variable_ranges]
-                    .iter()
-                    .enumerate()
-                {
-                    let (base_msr, mask_msr) = variable_range_msrs(index);
+            }
+            for (index, range) in configuration.variable[..capability.variable_ranges]
+                .iter()
+                .enumerate()
+            {
+                let (base_msr, mask_msr) = variable_range_msrs(index);
+                // SAFETY: `index` is below `IA32_MTRRCAP.VCNT`, matching the
+                // capability verified against the BSP above.
+                unsafe {
                     wrmsr(base_msr, range.base);
+                }
+                // SAFETY: `index` is below `IA32_MTRRCAP.VCNT`, matching the
+                // capability verified against the BSP above.
+                unsafe {
                     wrmsr(mask_msr, range.mask);
                 }
+            }
+            // SAFETY: restores the BSP's `IA32_MTRR_DEF_TYPE` after all fixed
+            // and variable MTRRs have been programmed.
+            unsafe {
                 wrmsr(IA32_MTRR_DEF_TYPE, configuration.def_type);
-                flush_caches();
-                flush_tlb();
+            }
+            flush_caches();
+            flush_tlb();
+            // SAFETY: restores the original `CR0` cache mode after flushing
+            // caches and TLBs.
+            unsafe {
                 Cr0::write(cr0);
-                if cr4.contains(Cr4Flags::PAGE_GLOBAL) {
+            }
+            if cr4.contains(Cr4Flags::PAGE_GLOBAL) {
+                // SAFETY: restores `CR4.PGE` after the MTRR sequence completes.
+                unsafe {
                     Cr4::write(cr4);
                 }
             }

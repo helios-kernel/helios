@@ -122,19 +122,37 @@ impl FirmwareTreeLocator {
 
     /// The configuration table array the system table names.
     fn configuration_table(&self, system_table: &SystemTable) -> &'static [ConfigurationTable] {
+        let count = system_table.number_of_table_entries;
+        if count == 0 {
+            return &[];
+        }
+        let physical = system_table.configuration_table as usize;
+        assert!(
+            physical != 0,
+            "EFI system table reports {count} configuration entries at a null address"
+        );
         // The system table holds the array's physical address: Limine
         // never calls `SetVirtualAddressMap`, so every address the
         // firmware's tables hold is still the physical one.
-        let array = system_table.configuration_table as usize + self.physical_memory_offset;
+        let array = physical
+            .checked_add(self.physical_memory_offset)
+            .expect("EFI configuration table virtual address overflow");
+        let array_ptr = array as *const ConfigurationTable;
+        assert!(
+            array_ptr.is_aligned(),
+            "EFI configuration table pointer {array:#x} is misaligned"
+        );
+        assert!(
+            count
+                .checked_mul(core::mem::size_of::<ConfigurationTable>())
+                .is_some_and(|bytes| bytes <= isize::MAX as usize),
+            "EFI configuration table byte length exceeds isize::MAX"
+        );
         // SAFETY: base revision 5 and later map the configuration table
         // array as `RESERVED_MAPPED`, and the system table counts its
-        // entries (UEFI 2.10, section 4.3); nothing writes it.
-        unsafe {
-            core::slice::from_raw_parts(
-                array as *const ConfigurationTable,
-                system_table.number_of_table_entries,
-            )
-        }
+        // entries (UEFI 2.10, section 4.3); pointer validity, alignment,
+        // and byte length were checked above, and nothing writes it.
+        unsafe { core::slice::from_raw_parts(array_ptr, count) }
     }
 
     /// The tree at `physical`, once its memory-map entry shows the direct
@@ -144,7 +162,7 @@ impl FirmwareTreeLocator {
         let entry = self
             .memory_map
             .iter()
-            .find(|entry| (entry.base..entry.base + entry.length).contains(&address))
+            .find(|entry| (entry.base..entry.base.saturating_add(entry.length)).contains(&address))
             .ok_or(FirmwareTreeError::OutsideMemoryMap { physical })?;
         if !FIRMWARE_TREE_MEMORY_TYPES.contains(&entry.type_) {
             return Err(FirmwareTreeError::MemoryType {
@@ -152,16 +170,17 @@ impl FirmwareTreeLocator {
                 memory_type: entry.type_,
             });
         }
-        let available = (entry.base + entry.length - address) as usize;
+        let available = usize::try_from(entry.base.saturating_add(entry.length) - address)
+            .ok()
+            .filter(|&len| len <= isize::MAX as usize)
+            .expect("EFI firmware tree memory-map slice length exceeds isize::MAX");
+        let ptr = physical
+            .checked_add(self.physical_memory_offset)
+            .expect("EFI firmware tree virtual address overflow") as *const u8;
         // SAFETY: the bytes from `physical` to the end of its memory-map
         // entry are firmware memory the direct map covers and nothing
         // writes for the life of the kernel, by the type just checked.
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                (physical + self.physical_memory_offset) as *const u8,
-                available,
-            )
-        };
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, available) };
         let malformed = |reason: FdtError| FirmwareTreeError::Malformed { physical, reason };
         // `Fdt::new` refuses a blob whose header claims more bytes than
         // the slice holds, so a tree that runs past its entry is refused

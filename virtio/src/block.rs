@@ -2297,10 +2297,16 @@ fn map_block_status(status: u8) -> IoResult<()> {
 }
 
 fn as_bytes<T>(value: &T) -> &[u8] {
+    // SAFETY: `value` is a valid shared reference to `size_of::<T>()`
+    // initialized bytes (callers pass `#[repr(C)]` request structs with no
+    // padding), and `u8` has alignment 1.
     unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
 }
 
 fn as_bytes_slice<T>(values: &[T]) -> &[u8] {
+    // SAFETY: `values` is a valid shared slice of `size_of_val(values)`
+    // initialized bytes (callers pass `#[repr(C)]` segment structs with no
+    // padding), and `u8` has alignment 1.
     unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) }
 }
 

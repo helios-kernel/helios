@@ -67,30 +67,44 @@ impl LegacyPciConfigAccess {
     pub(crate) fn read_u8(&self, address: PciAddress, offset: u16) -> u8 {
         let aligned_offset = offset & !0b11;
         let shift = ((offset & 0b11) * 8) as u32;
-        ((unsafe { self.read(address, aligned_offset) } >> shift) & 0xff) as u8
+        // SAFETY: `aligned_offset` is 4-byte aligned and `LegacyPciConfigAccess::read`
+        // validates segment 0 and the 256-byte legacy configuration space bounds.
+        let word = unsafe { self.read(address, aligned_offset) };
+        ((word >> shift) & 0xff) as u8
     }
 
     pub(crate) fn read_u16(&self, address: PciAddress, offset: u16) -> u16 {
         let aligned_offset = offset & !0b11;
         let shift = ((offset & 0b10) * 8) as u32;
-        ((unsafe { self.read(address, aligned_offset) } >> shift) & 0xffff) as u16
+        // SAFETY: `aligned_offset` is 4-byte aligned and `LegacyPciConfigAccess::read`
+        // validates segment 0 and the 256-byte legacy configuration space bounds.
+        let word = unsafe { self.read(address, aligned_offset) };
+        ((word >> shift) & 0xffff) as u16
     }
 
     pub(crate) fn write_u8(&self, address: PciAddress, offset: u16, value: u8) {
         let aligned_offset = offset & !0b11;
         let shift = ((offset & 0b11) * 8) as u32;
+        // SAFETY: `aligned_offset` is 4-byte aligned and `LegacyPciConfigAccess::read`
+        // validates segment 0 and the 256-byte legacy configuration space bounds.
         let mut data = unsafe { self.read(address, aligned_offset) };
         data &= !(0xff_u32 << shift);
         data |= u32::from(value) << shift;
+        // SAFETY: `aligned_offset` is 4-byte aligned, within the 256-byte legacy
+        // configuration space, and read-modify-writes only the target byte.
         unsafe { self.write(address, aligned_offset, data) };
     }
 
     pub(crate) fn write_u16(&self, address: PciAddress, offset: u16, value: u16) {
         let aligned_offset = offset & !0b11;
         let shift = ((offset & 0b10) * 8) as u32;
+        // SAFETY: `aligned_offset` is 4-byte aligned and `LegacyPciConfigAccess::read`
+        // validates segment 0 and the 256-byte legacy configuration space bounds.
         let mut data = unsafe { self.read(address, aligned_offset) };
         data &= !(0xffff_u32 << shift);
         data |= u32::from(value) << shift;
+        // SAFETY: `aligned_offset` is 4-byte aligned, within the 256-byte legacy
+        // configuration space, and read-modify-writes only the target 16-bit word.
         unsafe { self.write(address, aligned_offset, data) };
     }
 
@@ -119,18 +133,35 @@ impl LegacyPciConfigAccess {
 
 impl ConfigRegionAccess for LegacyPciConfigAccess {
     unsafe fn read(&self, address: PciAddress, offset: u16) -> u32 {
-        critical_section::with(|_| unsafe {
-            PortWriteOnly::<u32>::new(PCI_CONFIG_ADDRESS_PORT)
-                .write(Self::config_address(address, offset));
-            PortReadOnly::<u32>::new(PCI_CONFIG_DATA_PORT).read()
+        let config_address = Self::config_address(address, offset);
+        critical_section::with(|_| {
+            // SAFETY: `0x0cf8` is the standard x86 PCI configuration address port,
+            // and `critical_section::with` serializes the address/data port pair
+            // across processors and interrupts.
+            unsafe {
+                PortWriteOnly::<u32>::new(PCI_CONFIG_ADDRESS_PORT).write(config_address);
+            }
+            // SAFETY: `0x0cfc` is the standard x86 PCI configuration data port,
+            // latched by the preceding address write in this critical section.
+            unsafe { PortReadOnly::<u32>::new(PCI_CONFIG_DATA_PORT).read() }
         })
     }
 
     unsafe fn write(&self, address: PciAddress, offset: u16, value: u32) {
-        critical_section::with(|_| unsafe {
-            PortWriteOnly::<u32>::new(PCI_CONFIG_ADDRESS_PORT)
-                .write(Self::config_address(address, offset));
-            PortWriteOnly::<u32>::new(PCI_CONFIG_DATA_PORT).write(value);
+        let config_address = Self::config_address(address, offset);
+        critical_section::with(|_| {
+            // SAFETY: `0x0cf8` is the standard x86 PCI configuration address port,
+            // and `critical_section::with` serializes the address/data port pair
+            // across processors and interrupts.
+            unsafe {
+                PortWriteOnly::<u32>::new(PCI_CONFIG_ADDRESS_PORT).write(config_address);
+            }
+            // SAFETY: `0x0cfc` is the standard x86 PCI configuration data port,
+            // latched by the preceding address write in this critical section,
+            // and the caller guarantees this configuration register write is valid.
+            unsafe {
+                PortWriteOnly::<u32>::new(PCI_CONFIG_DATA_PORT).write(value);
+            }
         });
     }
 }
@@ -411,6 +442,22 @@ impl MsixTable {
         self.write_entry(entry, message);
     }
 
+    /// Writes one 32-bit MSI-X table register inside a validated entry.
+    ///
+    /// # Safety
+    ///
+    /// `entry` must point to the start of a mapped 16-byte MSI-X table entry,
+    /// `byte_offset` must be a 4-byte aligned register offset within that
+    /// entry, and the caller must serialize writes to that entry.
+    unsafe fn write_entry_dword(entry: *mut u32, byte_offset: usize, value: u32) {
+        // SAFETY: the caller guarantees `byte_offset` stays within the mapped
+        // 16-byte MSI-X table entry pointed to by `entry`.
+        let register = unsafe { entry.byte_add(byte_offset) };
+        // SAFETY: `register` is a 4-byte aligned, mapped MMIO register inside
+        // the MSI-X table entry, serialized by the caller.
+        unsafe { register.write_volatile(value) };
+    }
+
     fn write_entry(self, index: u16, message: MsixMessage) {
         assert!(
             index < self.entries,
@@ -426,22 +473,34 @@ impl MsixTable {
         };
         let message_address =
             MSI_ADDRESS_BASE | (u64::from(message.destination_apic_id) << MSI_DESTINATION_SHIFT);
-        // SAFETY: each offset is an aligned dword register of this
-        // entry, inside the mapped window.
+        // SAFETY: `MSIX_ENTRY_VECTOR_CONTROL` is an aligned dword register in
+        // `entry`, inside the mapped MSI-X table.
         unsafe {
-            entry
-                .byte_add(MSIX_ENTRY_VECTOR_CONTROL)
-                .write_volatile(MSIX_VECTOR_CONTROL_MASKED);
-            entry
-                .byte_add(MSIX_ENTRY_ADDRESS_LOW)
-                .write_volatile(message_address as u32);
-            entry
-                .byte_add(MSIX_ENTRY_ADDRESS_HIGH)
-                .write_volatile((message_address >> 32) as u32);
-            entry
-                .byte_add(MSIX_ENTRY_DATA)
-                .write_volatile(u32::from(message.vector));
-            entry.byte_add(MSIX_ENTRY_VECTOR_CONTROL).write_volatile(0);
+            Self::write_entry_dword(entry, MSIX_ENTRY_VECTOR_CONTROL, MSIX_VECTOR_CONTROL_MASKED);
+        }
+        // SAFETY: `MSIX_ENTRY_ADDRESS_LOW` is an aligned dword register in
+        // `entry`, inside the mapped MSI-X table.
+        unsafe {
+            Self::write_entry_dword(entry, MSIX_ENTRY_ADDRESS_LOW, message_address as u32);
+        }
+        // SAFETY: `MSIX_ENTRY_ADDRESS_HIGH` is an aligned dword register in
+        // `entry`, inside the mapped MSI-X table.
+        unsafe {
+            Self::write_entry_dword(
+                entry,
+                MSIX_ENTRY_ADDRESS_HIGH,
+                (message_address >> 32) as u32,
+            );
+        }
+        // SAFETY: `MSIX_ENTRY_DATA` is an aligned dword register in `entry`,
+        // inside the mapped MSI-X table.
+        unsafe {
+            Self::write_entry_dword(entry, MSIX_ENTRY_DATA, u32::from(message.vector));
+        }
+        // SAFETY: `MSIX_ENTRY_VECTOR_CONTROL` is an aligned dword register in
+        // `entry`, inside the mapped MSI-X table; unmasking last commits the entry.
+        unsafe {
+            Self::write_entry_dword(entry, MSIX_ENTRY_VECTOR_CONTROL, 0);
         }
     }
 }

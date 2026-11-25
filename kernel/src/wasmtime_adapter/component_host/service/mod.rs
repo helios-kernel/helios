@@ -2787,6 +2787,8 @@ where
         }
 
         super::emit_program_stage_marker(write_serial, "program:deserialize-core-begin");
+        // SAFETY: `payload` comes from bootfs, a signature-verified `cwasm`, or the in-kernel
+        // compiler plugin targeting this engine's configuration.
         let module = unsafe { Module::deserialize(self.inner.engine.raw(), payload.as_ref()) }
             .map_err(map_program_runtime_error)?;
         validate_preview1_program_module_imports(&module)?;
@@ -2818,6 +2820,8 @@ where
         &self,
         payload: &[u8],
     ) -> Result<WasmtimeCompiledComponent, ProgramExecError> {
+        // SAFETY: `payload` comes from bootfs, a signature-verified `cwasm`, or the in-kernel
+        // compiler plugin targeting this engine's configuration.
         let component = unsafe { Component::deserialize(self.inner.engine.raw(), payload) }
             .map_err(|error| {
                 tracing::error!(?error, "program component deserialization failed");
@@ -3431,6 +3435,7 @@ where
         );
 
         let engine = self.inner.engine.raw();
+        // SAFETY: `compiler_payload` is the precompiled compiler plugin read from bootfs.
         let module = unsafe { Module::deserialize(engine, compiler_payload.as_ref()) }
             .map_err(map_program_runtime_error)?;
         let code = self.inner.code_map.register_module(compiler_path, &module);
@@ -5394,6 +5399,8 @@ mod tests {
         let mut pool = SharedMemoryPool::new(spec.byte_size() * 2);
         let memory = SharedMemory::new(&engine, spec.memory_type().unwrap()).unwrap();
         let ptr = memory.data().as_ptr().cast::<u8>() as *mut u8;
+        // SAFETY: `memory` was created with 1 page (65,536 bytes) and is unshared here, so byte
+        // 0 is in bounds and exclusively accessed.
         unsafe {
             ptr.write(0xa5);
         }
@@ -5408,6 +5415,8 @@ mod tests {
         let reused = pool.acquire(&engine, spec).unwrap();
         assert_eq!(pool.resident_bytes, 0);
         assert!(pool.buckets.contains_key(&spec));
+        // SAFETY: `reused` has 1 page (65,536 bytes) and was just acquired exclusively from
+        // `pool`, so byte 0 is valid to read with no concurrent writers.
         let zeroed = unsafe { reused.data()[0].get().read() };
         assert_eq!(zeroed, 0);
     }

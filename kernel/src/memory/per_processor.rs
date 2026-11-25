@@ -316,8 +316,11 @@ impl<Source: NodeMemory> LocalMemory<'_, Source> {
             self.carve(layout).cast::<T>()
         };
         for index in 0..len {
-            // SAFETY: `index < len` elements fit in the carve.
-            unsafe { ptr.add(index).write(init(index)) };
+            let value = init(index);
+            // SAFETY: `index < len`, so `ptr.add(index)` stays within the carved slice.
+            let slot = unsafe { ptr.add(index) };
+            // SAFETY: `slot` is an uninitialised element inside the exclusive carve.
+            unsafe { slot.write(value) };
         }
         LocalSlice { ptr, len }
     }
@@ -332,6 +335,7 @@ pub struct LocalSlice<T> {
 
 // SAFETY: a `LocalSlice` owns its elements exclusively, like a `Box<[T]>`.
 unsafe impl<T: Send> Send for LocalSlice<T> {}
+// SAFETY: a `LocalSlice` exposes shared references `&[T]`, so it is `Sync` whenever `T` is `Sync`.
 unsafe impl<T: Sync> Sync for LocalSlice<T> {}
 
 impl<T> Deref for LocalSlice<T> {
@@ -365,9 +369,10 @@ pub struct PerProcessor<T> {
     blocks: Box<[NonNull<CachePadded<T>>]>,
 }
 
+// SAFETY: the table owns one `CachePadded<T>` per processor and drops them on drop, so it is `Send` when `T: Send`.
+unsafe impl<T: Send> Send for PerProcessor<T> {}
 // SAFETY: the table is immutable and each block is a `T` shared by
 // reference, so the table is as thread-safe as `T`.
-unsafe impl<T: Send> Send for PerProcessor<T> {}
 unsafe impl<T: Send + Sync> Sync for PerProcessor<T> {}
 
 impl<T> PerProcessor<T> {
@@ -632,9 +637,9 @@ mod tests {
         let memory = HostMemory::new(1, 1 << 20);
         let table = PerProcessor::build(locality, &arenas, &memory, |_, local| {
             let bytes = local.carve_zeroed(Layout::from_size_align(256, 16).unwrap());
-            unsafe { core::slice::from_raw_parts(bytes.as_ptr(), 256) }
-                .iter()
-                .all(|byte| *byte == 0)
+            // SAFETY: `bytes` is a freshly zeroed 256-byte carve owned by this test.
+            let slice = unsafe { core::slice::from_raw_parts(bytes.as_ptr(), 256) };
+            slice.iter().all(|byte| *byte == 0)
         });
         assert!(*table.get(ProcessorId::new(0)));
     }

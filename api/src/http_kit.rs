@@ -360,7 +360,9 @@ impl Read for ReadHalf {
                 for (slot, byte) in buf.as_uninit().iter_mut().zip(&bytes) {
                     slot.write(*byte);
                 }
-                // SAFETY: the first `received` bytes were written just above.
+                // SAFETY: `self.receive(capacity)` reads at most `capacity <=
+                // buf.as_uninit().len()` bytes, so the `zip` loop above
+                // initialized the first `received` bytes of `buf`.
                 unsafe { buf.set_len(received) };
                 BufResult(Ok(received), buf)
             }

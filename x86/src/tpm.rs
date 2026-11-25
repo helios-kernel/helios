@@ -74,10 +74,12 @@ pub(crate) fn discover(
             LOCALITY_BYTES,
         )
     };
-    // SAFETY: Limine's event log lives in bootloader-reclaimable memory,
-    // which this backend never hands to the allocator (`boot.rs`), in
-    // the direct map the response points into.
-    let log = measurement_log.map(|log| unsafe { LoaderLog::mapped(&log) });
+    let log = measurement_log.map(|log| {
+        // SAFETY: Limine's event log lives in bootloader-reclaimable memory,
+        // which this backend never hands to the allocator (`boot.rs`), in
+        // the direct map the response points into.
+        unsafe { LoaderLog::mapped(&log) }
+    });
     helios_kernel::complete_device_future_at_bring_up(helios_tpm::discover(
         InterfaceDescription::AcpiStartMethod(table.start_method()),
         window,
@@ -116,5 +118,6 @@ fn tpm2_table(rsdp_address: usize, physical_memory_offset: usize) -> Option<&'st
     // SAFETY: the address and length come from the RSDT entry the
     // firmware published, and firmware tables sit inside the direct
     // physical map the bootloader established.
-    Some(unsafe { core::slice::from_raw_parts(virtual_address as *const u8, length) })
+    let bytes = unsafe { core::slice::from_raw_parts(virtual_address as *const u8, length) };
+    Some(bytes)
 }

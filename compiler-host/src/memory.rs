@@ -31,7 +31,8 @@ fn checked_range(
     if !in_bounds {
         return Err(GuestMemoryAccess { start, len, size });
     }
-    // SAFETY: `start` is within the slice, checked above.
+    // SAFETY: `start as usize <= size` was checked above, so `.add(start as usize)`
+    // stays within or one-past-the-end of `data`.
     Ok(unsafe { data.as_ptr().cast::<u8>().cast_mut().add(start as usize) })
 }
 

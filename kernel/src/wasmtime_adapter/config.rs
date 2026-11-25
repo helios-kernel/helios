@@ -29,10 +29,10 @@ pub fn build_target_engine_config(target: &str) -> Config {
         target_os = "none",
         not(target_feature = "soft-float")
     ))]
+    // SAFETY: Helios' custom x86 bare-metal target uses the hardware floating-point
+    // ABI, so Wasmtime's x86_64-unknown-none soft-float guard does not
+    // apply to this kernel build.
     unsafe {
-        // Helios' custom x86 bare-metal target uses the hardware floating-point
-        // ABI, so Wasmtime's x86_64-unknown-none soft-float guard does not
-        // apply to this kernel build.
         config.x86_float_abi_ok(true);
     }
     // The engine has no compiler, so it cannot compare an artifact's signing

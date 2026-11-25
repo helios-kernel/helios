@@ -2278,6 +2278,9 @@ where
             return None;
         }
         self.remove_indices(index);
+        // SAFETY: `self.occupied[index]` was checked above; it is set to `true` only
+        // after `place` initializes the slot and cleared immediately below so the
+        // moved-out `TcpSocket` cannot be read or dropped again.
         let socket = unsafe { self.slot_storage_mut(index).assume_init_read() };
         self.occupied[index] = false;
         self.terminal_errors[index] = None;
@@ -2374,11 +2377,15 @@ where
 
     fn slot_ref(&self, index: usize) -> &TcpSocket<C> {
         let (chunk, slot) = socket_slot_chunk(index);
+        // SAFETY: all callers (`get` and `Clone` over `active[..active_len]`) only
+        // pass `index` when `self.occupied[index]` is `true`, so the slot is initialized.
         unsafe { self.chunk_ref(chunk)[slot].assume_init_ref() }
     }
 
     fn slot_mut(&mut self, index: usize) -> &mut TcpSocket<C> {
         let (chunk, slot) = socket_slot_chunk(index);
+        // SAFETY: the sole caller (`get_mut`) checks `self.occupied[index]` is `true`,
+        // so the slot holds an initialized `TcpSocket`.
         unsafe { self.chunk_mut(chunk)[slot].assume_init_mut() }
     }
 
@@ -2433,7 +2440,7 @@ where
                     .as_ref()
                     .map(|_| Box::<[TcpSocket<C>]>::new_uninit_slice(TCP_SOCKET_SLAB_CHUNK_SLOTS))
             }),
-            occupied: self.occupied,
+            occupied: core::array::from_fn(|_| false),
             free: self.free,
             free_len: self.free_len,
             half_open_free: self.half_open_free,
@@ -2450,6 +2457,7 @@ where
             cloned
                 .slot_storage_mut(index)
                 .write(self.slot_ref(index).clone());
+            cloned.occupied[index] = true;
         }
         cloned
     }
@@ -2476,6 +2484,9 @@ where
         for active_slot in 0..self.active_len {
             let index = self.active[active_slot];
             if self.occupied[index] {
+                // SAFETY: `self.occupied[index]` is `true` only while the slot holds an
+                // initialized `TcpSocket`, and clearing it immediately below ensures it is
+                // dropped at most once.
                 unsafe {
                     self.slot_storage_mut(index).assume_init_drop();
                 }

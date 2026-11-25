@@ -225,9 +225,15 @@ impl<T: VirtioTransport> SplitRing<T> {
                 flags: entry_flags(entry.writable, !last),
                 next: if last { 0 } else { (position + 1) as u16 },
             };
-            unsafe {
-                table.add(position).write_volatile(descriptor);
-            }
+            // SAFETY: `position < chain.len() <= tables.entries()`, so
+            // the offset stays inside `head`'s pre-allocated indirect
+            // table.
+            let dst = unsafe { table.add(position) };
+            // SAFETY: `dst` points to a valid, aligned `Descriptor`
+            // slot in `head`'s indirect table, and `head` is freshly
+            // allocated so the device cannot read it until `publish`
+            // advances `avail_idx`.
+            unsafe { dst.write_volatile(descriptor) };
         }
 
         let descriptor = Descriptor {
@@ -348,81 +354,90 @@ impl<T: VirtioTransport> SplitRing<T> {
     }
 
     fn write_desc(&self, index: u16) {
-        unsafe {
-            self.descriptors
-                .as_ptr()
-                .cast::<Descriptor>()
-                .add(usize::from(index))
-                .write_volatile(self.desc_shadow[usize::from(index)]);
-        }
+        let base = self.descriptors.as_ptr().cast::<Descriptor>();
+        // SAFETY: `index` is a valid ring descriptor index
+        // (`< self.core.size`, bounded by `self.desc_shadow`), so the
+        // offset stays within `self.descriptors`.
+        let dst = unsafe { base.add(usize::from(index)) };
+        // SAFETY: `dst` points to a valid, 16-byte-aligned
+        // `Descriptor` slot owned by the driver until `avail_idx` is
+        // published.
+        unsafe { dst.write_volatile(self.desc_shadow[usize::from(index)]) };
     }
 
     fn write_avail_ring(&self, slot: u16, head: u16) {
-        unsafe {
-            self.driver_area
-                .as_ptr()
-                .cast::<u16>()
-                .add(2 + usize::from(slot))
-                .write_volatile(head);
-        }
+        let base = self.driver_area.as_ptr().cast::<u16>();
+        // SAFETY: `slot < self.core.size`, and `driver_area` holds
+        // `2 + size + 1` `u16` entries (`flags`, `idx`, `ring[size]`,
+        // `used_event`), so `2 + slot` stays inside the allocation.
+        let dst = unsafe { base.add(2 + usize::from(slot)) };
+        // SAFETY: `dst` is valid, 2-byte-aligned, and driver-owned
+        // until `avail_idx` is published.
+        unsafe { dst.write_volatile(head) };
     }
 
     fn write_avail_idx(&self, index: u16) {
-        unsafe {
-            self.driver_area
-                .as_ptr()
-                .cast::<u16>()
-                .add(1)
-                .write_volatile(index);
-        }
+        let base = self.driver_area.as_ptr().cast::<u16>();
+        // SAFETY: `driver_area` is at least `4 + size * 2 + 2` bytes,
+        // so `u16` offset 1 (`avail.idx`) is inside the allocation.
+        let dst = unsafe { base.add(1) };
+        // SAFETY: `dst` is valid, 2-byte-aligned, and only written by
+        // the driver.
+        unsafe { dst.write_volatile(index) };
     }
 
     fn read_used_idx(&self) -> u16 {
-        unsafe {
-            self.device_area
-                .as_ptr()
-                .cast::<u16>()
-                .add(1)
-                .read_volatile()
-        }
+        let base = self.device_area.as_ptr().cast::<u16>();
+        // SAFETY: `device_area` is `4 + size * size_of::<UsedElem>() + 2`
+        // bytes, so `u16` offset 1 (`used.idx`) is inside the allocation.
+        let ptr = unsafe { base.add(1) };
+        // SAFETY: `ptr` points to the resident, 2-byte-aligned
+        // `used.idx` field in `device_area`.
+        unsafe { ptr.read_volatile() }
     }
 
     fn read_used_flags(&self) -> u16 {
+        // SAFETY: `device_area` is a resident, 4-byte-aligned DMA
+        // buffer of at least 6 bytes, so offset 0 (`used.flags`) is
+        // valid and aligned for `u16`.
         unsafe { self.device_area.as_ptr().cast::<u16>().read_volatile() }
     }
 
     /// Device-written avail_event: the available index after which the
     /// device wants its next notification.
     fn read_avail_event(&self) -> u16 {
-        unsafe {
-            self.device_area
-                .as_ptr()
-                .add(4 + usize::from(self.core.size) * size_of::<UsedElem>())
-                .cast::<u16>()
-                .read_volatile()
-        }
+        let base = self.device_area.as_ptr();
+        // SAFETY: `device_area` has length
+        // `4 + size * size_of::<UsedElem>() + 2`, so this offset is the
+        // trailing `u16` (`avail_event`) inside the allocation.
+        let ptr = unsafe { base.add(4 + usize::from(self.core.size) * size_of::<UsedElem>()) };
+        // SAFETY: `ptr` is valid and 2-byte-aligned inside the resident
+        // `device_area` buffer.
+        unsafe { ptr.cast::<u16>().read_volatile() }
     }
 
     /// Publishes how far the driver has consumed the used ring so the
     /// device can suppress interrupts for completions already seen.
     fn write_used_event(&self, index: u16) {
-        unsafe {
-            self.driver_area
-                .as_ptr()
-                .add(4 + usize::from(self.core.size) * 2)
-                .cast::<u16>()
-                .write_volatile(index);
-        }
+        let base = self.driver_area.as_ptr();
+        // SAFETY: `driver_area` has length `4 + size * 2 + 2`, so this
+        // offset is the trailing `u16` (`used_event`) inside the
+        // allocation.
+        let ptr = unsafe { base.add(4 + usize::from(self.core.size) * 2) };
+        // SAFETY: `ptr` is valid, 2-byte-aligned inside `driver_area`,
+        // and written only by the driver.
+        unsafe { ptr.cast::<u16>().write_volatile(index) };
     }
 
     fn read_used_elem(&self, slot: u16) -> UsedElem {
-        unsafe {
-            self.device_area
-                .as_ptr()
-                .add(4 + (usize::from(slot) * size_of::<UsedElem>()))
-                .cast::<UsedElem>()
-                .read_volatile()
-        }
+        let base = self.device_area.as_ptr();
+        // SAFETY: `slot < self.core.size`, so
+        // `4 + slot * size_of::<UsedElem>()` points to an element inside
+        // `device_area`.
+        let ptr = unsafe { base.add(4 + (usize::from(slot) * size_of::<UsedElem>())) };
+        // SAFETY: `ptr` is valid and 4-byte-aligned for `UsedElem`
+        // inside the resident `device_area` allocation.
+        unsafe { ptr.cast::<UsedElem>().read_volatile() }
     }
 }
 
@@ -438,6 +453,9 @@ fn entry_flags(writable: bool, has_next: bool) -> u16 {
 }
 
 fn zero<B: DmaBuffer>(buffer: &B) {
+    // SAFETY: `buffer` is a resident DMA allocation of `buffer.len()`
+    // bytes, and `zero` is only called during `reprogram` under `&mut
+    // self` after the device queue has been reset.
     unsafe {
         buffer.as_ptr().write_bytes(0, buffer.len());
     }
@@ -455,13 +473,13 @@ fn device_area_len(size: u16) -> usize {
 impl<T: VirtioTransport> SplitRing<T> {
     /// Descriptor `index` as the device would read it.
     pub(super) fn descriptor(&self, index: u16) -> Descriptor {
-        unsafe {
-            self.descriptors
-                .as_ptr()
-                .cast::<Descriptor>()
-                .add(usize::from(index))
-                .read_volatile()
-        }
+        let base = self.descriptors.as_ptr().cast::<Descriptor>();
+        // SAFETY: test callers pass `index < self.core.size`, staying
+        // within `self.descriptors`.
+        let ptr = unsafe { base.add(usize::from(index)) };
+        // SAFETY: `ptr` points to a valid, 16-byte-aligned
+        // `Descriptor` inside the resident descriptor table.
+        unsafe { ptr.read_volatile() }
     }
 
     /// Entry `slot` of the indirect table belonging to chain `id`.
@@ -471,39 +489,43 @@ impl<T: VirtioTransport> SplitRing<T> {
             .indirect
             .as_ref()
             .expect("queue has no indirect tables");
-        unsafe {
-            tables
-                .table_ptr(id)
-                .cast::<Descriptor>()
-                .add(slot)
-                .read_volatile()
-        }
+        let base = tables.table_ptr(id).cast::<Descriptor>();
+        // SAFETY: `table_ptr` checked `id` is in range, and test callers
+        // pass `slot < tables.entries()` inside `id`'s indirect table.
+        let ptr = unsafe { base.add(slot) };
+        // SAFETY: `ptr` points to a valid, 16-byte-aligned
+        // `Descriptor` inside `id`'s resident indirect table.
+        unsafe { ptr.read_volatile() }
     }
 
     /// The available index the device can currently see.
     pub(super) fn published_avail_idx(&self) -> u16 {
-        unsafe {
-            self.driver_area
-                .as_ptr()
-                .cast::<u16>()
-                .add(1)
-                .read_volatile()
-        }
+        let base = self.driver_area.as_ptr().cast::<u16>();
+        // SAFETY: `driver_area` holds at least `4 + size * 2 + 2`
+        // bytes, so `u16` offset 1 (`avail.idx`) is inside the buffer.
+        let ptr = unsafe { base.add(1) };
+        // SAFETY: `ptr` is valid and 2-byte-aligned inside
+        // `driver_area`.
+        unsafe { ptr.read_volatile() }
     }
 
     /// The used event the driver last published.
     pub(super) fn published_used_event(&self) -> u16 {
-        unsafe {
-            self.driver_area
-                .as_ptr()
-                .add(4 + usize::from(self.core.size) * 2)
-                .cast::<u16>()
-                .read_volatile()
-        }
+        let base = self.driver_area.as_ptr();
+        // SAFETY: `driver_area` has length `4 + size * 2 + 2`, so this
+        // offset is the trailing `u16` (`used_event`) inside the
+        // allocation.
+        let ptr = unsafe { base.add(4 + usize::from(self.core.size) * 2) };
+        // SAFETY: `ptr` is valid and 2-byte-aligned inside
+        // `driver_area`.
+        unsafe { ptr.cast::<u16>().read_volatile() }
     }
 
     /// Device side: suppress or allow notifications without event index.
     pub(super) fn device_set_used_flags(&self, flags: u16) {
+        // SAFETY: `device_area` is a resident, 4-byte-aligned DMA
+        // buffer of at least 6 bytes, so offset 0 (`used.flags`) is
+        // valid and aligned for `u16`.
         unsafe {
             self.device_area
                 .as_ptr()
@@ -514,13 +536,14 @@ impl<T: VirtioTransport> SplitRing<T> {
 
     /// Device side: publish the available index it wants a kick at.
     pub(super) fn device_set_avail_event(&self, value: u16) {
-        unsafe {
-            self.device_area
-                .as_ptr()
-                .add(4 + usize::from(self.core.size) * size_of::<UsedElem>())
-                .cast::<u16>()
-                .write_volatile(value);
-        }
+        let base = self.device_area.as_ptr();
+        // SAFETY: `device_area` has length
+        // `4 + size * size_of::<UsedElem>() + 2`, so this offset is the
+        // trailing `u16` (`avail_event`) inside the allocation.
+        let ptr = unsafe { base.add(4 + usize::from(self.core.size) * size_of::<UsedElem>()) };
+        // SAFETY: `ptr` is valid and 2-byte-aligned inside
+        // `device_area`.
+        unsafe { ptr.cast::<u16>().write_volatile(value) };
     }
 
     /// Device side: the buffers of chain `id`, in chain order, as
@@ -581,18 +604,24 @@ impl<T: VirtioTransport> SplitRing<T> {
     pub(super) fn device_complete_raw(&self, id: u32, len: u32) {
         let used_idx = self.read_used_idx();
         let slot = used_idx & (self.core.size - 1);
+        let base = self.device_area.as_ptr();
+        // SAFETY: `slot < self.core.size`, so
+        // `4 + slot * size_of::<UsedElem>()` points to an element inside
+        // `device_area`.
+        let elem_ptr = unsafe { base.add(4 + usize::from(slot) * size_of::<UsedElem>()) };
+        // SAFETY: `elem_ptr` is valid and 4-byte-aligned for `UsedElem`
+        // inside the resident `device_area` allocation.
         unsafe {
-            self.device_area
-                .as_ptr()
-                .add(4 + usize::from(slot) * size_of::<UsedElem>())
+            elem_ptr
                 .cast::<UsedElem>()
-                .write_volatile(UsedElem { id, len });
-            self.device_area
-                .as_ptr()
-                .cast::<u16>()
-                .add(1)
-                .write_volatile(used_idx.wrapping_add(1));
-        }
+                .write_volatile(UsedElem { id, len })
+        };
+        // SAFETY: `device_area` is at least 6 bytes, so `u16` offset 1
+        // (`used.idx`) is inside the allocation.
+        let idx_ptr = unsafe { base.cast::<u16>().add(1) };
+        // SAFETY: `idx_ptr` is valid and 2-byte-aligned inside
+        // `device_area`.
+        unsafe { idx_ptr.write_volatile(used_idx.wrapping_add(1)) };
     }
 
     /// Device side: report `chains` completions with a single used entry
@@ -600,20 +629,24 @@ impl<T: VirtioTransport> SplitRing<T> {
     pub(super) fn device_complete_batch(&self, final_id: u16, len: u32, chains: u16) {
         let used_idx = self.read_used_idx();
         let slot = used_idx.wrapping_add(chains - 1) & (self.core.size - 1);
+        let base = self.device_area.as_ptr();
+        // SAFETY: `slot < self.core.size`, so
+        // `4 + slot * size_of::<UsedElem>()` points to an element inside
+        // `device_area`.
+        let elem_ptr = unsafe { base.add(4 + usize::from(slot) * size_of::<UsedElem>()) };
+        // SAFETY: `elem_ptr` is valid and 4-byte-aligned for `UsedElem`
+        // inside the resident `device_area` allocation.
         unsafe {
-            self.device_area
-                .as_ptr()
-                .add(4 + usize::from(slot) * size_of::<UsedElem>())
-                .cast::<UsedElem>()
-                .write_volatile(UsedElem {
-                    id: u32::from(final_id),
-                    len,
-                });
-            self.device_area
-                .as_ptr()
-                .cast::<u16>()
-                .add(1)
-                .write_volatile(used_idx.wrapping_add(chains));
+            elem_ptr.cast::<UsedElem>().write_volatile(UsedElem {
+                id: u32::from(final_id),
+                len,
+            });
         }
+        // SAFETY: `device_area` is at least 6 bytes, so `u16` offset 1
+        // (`used.idx`) is inside the allocation.
+        let idx_ptr = unsafe { base.cast::<u16>().add(1) };
+        // SAFETY: `idx_ptr` is valid and 2-byte-aligned inside
+        // `device_area`.
+        unsafe { idx_ptr.write_volatile(used_idx.wrapping_add(chains)) };
     }
 }

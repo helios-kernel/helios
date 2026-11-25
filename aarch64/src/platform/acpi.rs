@@ -262,14 +262,19 @@ fn tpm(
     };
     // `SdtHeader` is packed, so the field is copied out first.
     let length = header.length as usize;
-    // SAFETY: the address and length come from the RSDT entry the
+    // SAFETY: `physical_address` and `length` come from the RSDT entry the
     // firmware published, and firmware tables sit in the direct map.
-    let bytes = unsafe {
-        let mapping = tables
+    let mapping = unsafe {
+        tables
             .handler
-            .map_physical_region::<u8>(physical_address, length);
-        core::slice::from_raw_parts(mapping.virtual_start().as_ptr(), length)
+            .map_physical_region::<u8>(physical_address, length)
     };
+    // SAFETY: `bytes` below only reads from `virtual_start` through an
+    // immutable slice of the static ACPI table, creating no mutable alias.
+    let virtual_start = unsafe { mapping.virtual_start() };
+    // SAFETY: `mapping` covers `length` bytes of the static ACPI table in the
+    // direct map and `unmap_physical_region` is a no-op.
+    let bytes = unsafe { core::slice::from_raw_parts(virtual_start.as_ptr(), length) };
     let table = AcpiTpm2::parse(bytes).map_err(AcpiError::Tpm2)?;
     let interface = InterfaceDescription::AcpiStartMethod(table.start_method());
     Ok(Some(match table.locality().map_err(AcpiError::Tpm2)? {
@@ -499,50 +504,60 @@ impl Handler for Aarch64AcpiHandler {
         physical_address: usize,
         size: usize,
     ) -> RawPhysicalMapping<T> {
+        let virtual_start = self.physical_to_virtual(physical_address);
         // SAFETY: the virtual address is the direct-map alias of the
         // physical range, which no other mapping of this handler aliases
         // mutably, and `unmap_physical_region` has nothing to undo.
-        unsafe {
-            RawPhysicalMapping::new(
-                physical_address,
-                self.physical_to_virtual(physical_address),
-                size,
-                size,
-            )
-        }
+        unsafe { RawPhysicalMapping::new(physical_address, virtual_start, size, size) }
     }
 
     unsafe fn unmap_physical_region<T>(&self, _region: RawPhysicalMapping<T>) {}
 
     fn read_u8(&self, address: usize) -> u8 {
+        // SAFETY: the `acpi` AML interpreter guarantees `address` is a valid
+        // mapped `u8` location for this `Handler::read_u8` request.
         unsafe { (address as *const u8).read_volatile() }
     }
 
     fn read_u16(&self, address: usize) -> u16 {
+        // SAFETY: the `acpi` AML interpreter guarantees `address` is a valid
+        // aligned, mapped `u16` location for this `Handler::read_u16` request.
         unsafe { (address as *const u16).read_volatile() }
     }
 
     fn read_u32(&self, address: usize) -> u32 {
+        // SAFETY: the `acpi` AML interpreter guarantees `address` is a valid
+        // aligned, mapped `u32` location for this `Handler::read_u32` request.
         unsafe { (address as *const u32).read_volatile() }
     }
 
     fn read_u64(&self, address: usize) -> u64 {
+        // SAFETY: the `acpi` AML interpreter guarantees `address` is a valid
+        // aligned, mapped `u64` location for this `Handler::read_u64` request.
         unsafe { (address as *const u64).read_volatile() }
     }
 
     fn write_u8(&self, address: usize, value: u8) {
+        // SAFETY: the `acpi` AML interpreter guarantees `address` is a valid
+        // writable, mapped `u8` location for this `Handler::write_u8` request.
         unsafe { (address as *mut u8).write_volatile(value) }
     }
 
     fn write_u16(&self, address: usize, value: u16) {
+        // SAFETY: the `acpi` AML interpreter guarantees `address` is a valid
+        // aligned, writable, mapped `u16` location for this `Handler::write_u16` request.
         unsafe { (address as *mut u16).write_volatile(value) }
     }
 
     fn write_u32(&self, address: usize, value: u32) {
+        // SAFETY: the `acpi` AML interpreter guarantees `address` is a valid
+        // aligned, writable, mapped `u32` location for this `Handler::write_u32` request.
         unsafe { (address as *mut u32).write_volatile(value) }
     }
 
     fn write_u64(&self, address: usize, value: u64) {
+        // SAFETY: the `acpi` AML interpreter guarantees `address` is a valid
+        // aligned, writable, mapped `u64` location for this `Handler::write_u64` request.
         unsafe { (address as *mut u64).write_volatile(value) }
     }
 

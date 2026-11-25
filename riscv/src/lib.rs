@@ -118,11 +118,19 @@ impl ByteSerial for DebugTransport {
     /// Idempotent, and callable from interrupt context: a register
     /// write, no lock, no allocation.
     fn enable_receive_interrupt(&self) {
-        unsafe { ((self.uart_base + UART_IER) as *mut u8).write_volatile(UART_IER_RDI) };
+        let ier = (self.uart_base + UART_IER) as *mut u8;
+        // SAFETY: `uart_base` came from the FDT node's `reg` window and is
+        // identity-mapped 16550 MMIO; `UART_IER` is the 1-byte interrupt-enable
+        // register and the divisor latch was cleared during `publish_debug_transport`.
+        unsafe { ier.write_volatile(UART_IER_RDI) };
     }
 
     fn disable_receive_interrupt(&self) {
-        unsafe { ((self.uart_base + UART_IER) as *mut u8).write_volatile(0) };
+        let ier = (self.uart_base + UART_IER) as *mut u8;
+        // SAFETY: `uart_base` came from the FDT node's `reg` window and is
+        // identity-mapped 16550 MMIO; `UART_IER` is the 1-byte interrupt-enable
+        // register.
+        unsafe { ier.write_volatile(0) };
     }
 }
 
@@ -131,6 +139,8 @@ use helios_virtio::DeviceType;
 /// RISC-V MMIO is identity-mapped, so candidates are probed at their
 /// physical base directly.
 pub(crate) fn matches_virtio_mmio_device(base: usize, expected: DeviceType) -> bool {
+    // SAFETY: `base` came from `helios_virtio::mmio_candidates(fdt)`, and
+    // RISC-V identity-maps physical MMIO addresses.
     unsafe { helios_virtio::mmio_device_matches(base, expected) }
 }
 
@@ -224,8 +234,12 @@ impl ComputeContextTemplate {
     pub fn capture_current() -> Self {
         let gp: usize;
         let tp: usize;
+        // SAFETY: reading `gp` has no side effects and modifies no memory or flags.
         unsafe {
             asm!("mv {}, gp", out(reg) gp, options(nomem, nostack, preserves_flags));
+        }
+        // SAFETY: reading `tp` has no side effects and modifies no memory or flags.
+        unsafe {
             asm!("mv {}, tp", out(reg) tp, options(nomem, nostack, preserves_flags));
         }
 
@@ -291,9 +305,7 @@ impl ComputeTaskContext {
 }
 
 fn aligned_stack_top(stack: NonNull<[u8]>) -> usize {
-    let stack = stack.as_ptr();
-    let len = unsafe { (&*stack).len() };
-    let top = stack.cast::<u8>() as usize + len;
+    let top = stack.cast::<u8>().as_ptr() as usize + stack.len();
     top & !0xF
 }
 
@@ -313,6 +325,8 @@ impl helios_hal::critical_section::InterruptOps for SupervisorInterruptOps {
     }
 
     unsafe fn enable_interrupts() {
+        // SAFETY: the caller upholds `InterruptOps::enable_interrupts` that
+        // supervisor interrupts may be enabled here.
         unsafe { riscv::interrupt::supervisor::enable() };
     }
 
@@ -329,12 +343,16 @@ critical_section::set_impl!(SupervisorCriticalSection);
 // and need only to keep this processor's interrupt handler out.
 helios_hal::critical_section::set_local_interrupt_mask_impl!(SupervisorInterruptOps);
 
+// SAFETY: `CRITICAL_SECTION_STATE` synchronises supervisor-mode critical
+// sections across harts using each hart's `ProcessorIdentity` from `tp`.
 unsafe impl critical_section::Impl for SupervisorCriticalSection {
     unsafe fn acquire() -> usize {
+        // SAFETY: the caller pairs each `acquire` with a matching `release`.
         unsafe { CRITICAL_SECTION_STATE.acquire::<SupervisorInterruptOps>() }
     }
 
     unsafe fn release(restore_state: usize) {
+        // SAFETY: `restore_state` was returned by the matching `acquire`.
         unsafe { CRITICAL_SECTION_STATE.release::<SupervisorInterruptOps>(restore_state) }
     }
 }
@@ -361,7 +379,7 @@ struct HartRuntime {
     /// The PLIC domains this hart takes interrupts for, if any; the
     /// `SupervisorExternal` trap arm claims from them.
     external_interrupts: Option<net::HartInterrupts>,
-    program_service: Option<debug_state::ProgramService>,
+    program_service: Once<debug_state::ProgramService>,
     /// The stack a kernel exception the kernel did not resolve is handed
     /// to the runtime from (`trap::hand_over_trap`). It is not the trap
     /// stack because the hand-over gives that back before the runtime's
@@ -484,14 +502,13 @@ pub struct RiscvWakeOnlyMask {
 impl Drop for RiscvWakeOnlyMask {
     fn drop(&mut self) {
         compiler_fence(Ordering::SeqCst);
-        // SAFETY: restores the bits read when the mask was raised.
-        unsafe {
-            if self.timer {
-                riscv::register::sie::set_stimer();
-            }
-            if self.external {
-                riscv::register::sie::set_sext();
-            }
+        if self.timer {
+            // SAFETY: restores the `sie.STIE` bit saved when the mask was raised.
+            unsafe { riscv::register::sie::set_stimer() };
+        }
+        if self.external {
+            // SAFETY: restores the `sie.SEIE` bit saved when the mask was raised.
+            unsafe { riscv::register::sie::set_sext() };
         }
     }
 }
@@ -524,11 +541,10 @@ impl Cpu for RiscvCpu {
         // supervisor interrupt on this hart.
         let sie = riscv::register::sie::read();
         let (timer, external) = (sie.stimer(), sie.sext());
-        // SAFETY: both bits are put back when the guard drops.
-        unsafe {
-            riscv::register::sie::clear_stimer();
-            riscv::register::sie::clear_sext();
-        }
+        // SAFETY: `RiscvWakeOnlyMask` restores `stimer` when dropped.
+        unsafe { riscv::register::sie::clear_stimer() };
+        // SAFETY: `RiscvWakeOnlyMask` restores `sext` when dropped.
+        unsafe { riscv::register::sie::clear_sext() };
         compiler_fence(Ordering::SeqCst);
         RiscvWakeOnlyMask {
             timer,
@@ -701,7 +717,7 @@ fn trap_dispatch(tf: &mut TrapFrame) {
         Ok(Trap::Interrupt(Interrupt::SupervisorTimer)) => {
             // Every hart's timer interrupt ends the slice of every guest
             // on the machine that has run one.
-            if let Some(program_service) = current_hart_runtime().program_service.as_ref() {
+            if let Some(program_service) = current_hart_runtime().program_service.get() {
                 program_service.preempt_overdue_guests();
             }
             current_hart_runtime().timer.handle_interrupt();
@@ -710,6 +726,8 @@ fn trap_dispatch(tf: &mut TrapFrame) {
             if let Some(runtime) = installed_hart_runtime() {
                 runtime.hand_over_probe.record_interrupt(tf);
             }
+            // SAFETY: clears the pending supervisor software interrupt after
+            // recording it in `hand_over_probe`.
             unsafe {
                 riscv::register::sip::clear_ssoft();
             }
@@ -744,6 +762,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     // distinguishable; sharing one sentinel makes a second hart's acquire look
     // like the first hart's nested re-acquire and voids mutual exclusion.
     write_hart_identity(ProcessorIdentity::bootstrapping(hart_id));
+    // SAFETY: OpenSBI (or `sbi_rt::hart_start` for secondaries) passes a
+    // valid device-tree blob physical address in `fdt_addr`, and physical
+    // memory is directly addressable before paging is enabled.
     let fdt = unsafe { Fdt::from_ptr(fdt_addr as *const u8) }
         .expect("OpenSBI did not provide a valid FDT");
     let mut cpus = fdt.cpus().filter(|cpu| cpu_is_usable(*cpu));
@@ -798,11 +819,15 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         );
     }
     if current_hart == bootstrap_processor {
+        // SAFETY: only the bootstrap hart executes this branch, once, before
+        // any hart activates paging or releases early-boot secondaries.
         unsafe {
             vmm::install_kernel_paging();
         }
         vmm::install_runtime_memory_hooks();
     }
+    // SAFETY: `install_kernel_paging` completed on the bootstrap hart before
+    // this hart reached here, and every address in flight is identity-mapped.
     unsafe {
         vmm::activate_paging();
     }
@@ -998,14 +1023,14 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         // follow-up to #59.
         helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapHooks);
     }
-    let mut hart_runtime = HartRuntime {
+    let hart_runtime = HartRuntime {
         trap_stack: trap::allocate_trap_stack(),
         guest_stack_limit: AtomicUsize::new(usize::MAX),
         hart_id: current_hart,
         timer: kernel.timer(),
         wasmtime_tls: WasmtimeTlsSlots::new(),
         external_interrupts: net::HartInterrupts::of(current_hart),
-        program_service: None,
+        program_service: Once::new(),
         hand_over_stack: trap::allocate_trap_stack(),
         hand_over_probe: trap::HandOverProbe::new(),
     };
@@ -1030,7 +1055,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             panic!("RISC-V hart {hart_id} started before program service installation")
         })
     });
-    hart_runtime.program_service = Some(program_service);
+    hart_runtime.program_service.call_once(|| program_service);
+    // SAFETY: `hart_runtime` is installed with its trap stack, hand-over
+    // stack, external interrupts, and `program_service` initialised.
     unsafe {
         configure_interrupts();
     }
@@ -1059,6 +1086,9 @@ fn shared_debug_state(
         .call_once(|| {
             // The Sv48 identity map is already active, so the initrd's
             // physical range reads directly.
+            // SAFETY: `initrd` is a non-empty valid physical range from `/chosen`
+            // reserved out of allocator memory, readable through the identity map,
+            // and immutable for the kernel's lifetime.
             let bytes =
                 unsafe { core::slice::from_raw_parts(initrd.start as *const u8, initrd.len()) };
             let payload = helios_kernel::BootPayload::parse(bytes).unwrap_or_else(|error| {
@@ -1269,6 +1299,8 @@ fn hart_is_online(hart: ProcessorId) -> bool {
 /// (SBI specification, chapter 8 "RFENCE Extension", function 0) has every
 /// hart the firmware runs execute `fence.i`.
 fn fence_instruction_streams() {
+    // SAFETY: `fence.i` synchronises this hart's instruction fetches with
+    // stores to executable memory and touches no memory or stack operands.
     unsafe {
         core::arch::asm!("fence.i", options(nostack, preserves_flags));
     }
@@ -1288,6 +1320,8 @@ fn release_early_boot_harts() {
     // Rust code is safe to execute, publish the release gate so the other harts
     // can proceed into `helios_kernel::init`, which will park them again until
     // full kernel bootstrap is complete.
+    // SAFETY: bootstrap initialisation of shared early-boot state is complete
+    // and secondary harts are spinning in `_mp_hook` waiting on this release.
     unsafe {
         _release_mp_harts();
     }
@@ -1402,14 +1436,25 @@ extern "C" fn wasmtime_init_traps(handler: KernelNativeTrapHandler) -> i32 {
     0
 }
 
+/// # Safety
+/// Must be called once per hart after [`HartRuntime::install`] has seeded its
+/// trap stack and hand-over stack and populated `program_service`.
 unsafe fn configure_interrupts() {
-    unsafe {
-        trap::install_trap_vector();
-        riscv::register::sie::set_ssoft();
-        riscv::register::sie::set_stimer();
-        riscv::register::sie::set_sext();
-        riscv::register::sstatus::set_sie();
-    }
+    // SAFETY: the caller guarantees `HartRuntime::install` already seeded
+    // `sscratch` with this hart's trap stack.
+    unsafe { trap::install_trap_vector() };
+    // SAFETY: the trap vector is installed, so supervisor software interrupts
+    // can be handled safely.
+    unsafe { riscv::register::sie::set_ssoft() };
+    // SAFETY: the trap vector and timer are ready to handle supervisor timer
+    // interrupts.
+    unsafe { riscv::register::sie::set_stimer() };
+    // SAFETY: the trap vector and PLIC dispatch are ready to handle
+    // supervisor external interrupts.
+    unsafe { riscv::register::sie::set_sext() };
+    // SAFETY: `stvec` and `sie` are configured, so enabling supervisor
+    // interrupts is safe.
+    unsafe { riscv::register::sstatus::set_sie() };
     // The entry is live from here, so this is the first moment the hart can
     // prove it round-trips the floating-point file. §3.4: every hart proves
     // it for itself, because `FS` and the trap vector are per-hart state.
@@ -1541,12 +1586,16 @@ fn fatal_panic(info: &core::panic::PanicInfo<'_>) -> ! {
 }
 
 fn mask_interrupts() {
-    unsafe {
-        riscv::interrupt::supervisor::disable();
-        riscv::register::sie::clear_ssoft();
-        riscv::register::sie::clear_stimer();
-        riscv::register::sie::clear_sext();
-    }
+    riscv::interrupt::supervisor::disable();
+    // SAFETY: masking all supervisor interrupts on a panicking hart before
+    // emitting the panic report and halting.
+    unsafe { riscv::register::sie::clear_ssoft() };
+    // SAFETY: masking all supervisor interrupts on a panicking hart before
+    // emitting the panic report and halting.
+    unsafe { riscv::register::sie::clear_stimer() };
+    // SAFETY: masking all supervisor interrupts on a panicking hart before
+    // emitting the panic report and halting.
+    unsafe { riscv::register::sie::clear_sext() };
     compiler_fence(Ordering::SeqCst);
 }
 
@@ -1572,6 +1621,7 @@ fn trap_origin(tf: &TrapFrame) -> TrapOrigin {
 
 fn current_hart_runtime_ptr() -> usize {
     let runtime_ptr: usize;
+    // SAFETY: reading `tp` has no side effects and modifies no memory or flags.
     unsafe {
         asm!("mv {}, tp", out(reg) runtime_ptr, options(nomem, nostack, preserves_flags));
     }
@@ -1587,6 +1637,8 @@ fn read_hart_identity() -> ProcessorIdentity {
 }
 
 fn write_hart_identity(identity: ProcessorIdentity) {
+    // SAFETY: `tp` is reserved by this kernel for the current hart's
+    // `ProcessorIdentity` word; `options(nostack, preserves_flags)` holds.
     unsafe {
         asm!("mv tp, {}", in(reg) identity.raw(), options(nostack, preserves_flags));
     }

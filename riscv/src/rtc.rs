@@ -28,14 +28,14 @@ impl RealTimeClock for GoldfishRtc {
 
     fn read(&self) -> Result<UnixSeconds, RtcError> {
         // SAFETY: `base` is the identity-mapped device window of the
-        // goldfish node the device tree describes, and both registers
-        // are 32-bit reads at its start. The low half must be read
-        // first: that read is what latches the high half.
-        let (low, high) = unsafe {
-            let low = ((self.base + GOLDFISH_TIME_LOW) as *const u32).read_volatile();
-            let high = ((self.base + GOLDFISH_TIME_HIGH) as *const u32).read_volatile();
-            (low, high)
-        };
+        // goldfish node the device tree describes, and `GOLDFISH_TIME_LOW`
+        // is a 32-bit aligned register at offset 0. Reading it first latches
+        // `TIME_HIGH`.
+        let low = unsafe { ((self.base + GOLDFISH_TIME_LOW) as *const u32).read_volatile() };
+        // SAFETY: `GOLDFISH_TIME_HIGH` is the adjacent 32-bit aligned register
+        // at offset 4 in the same identity-mapped goldfish RTC window, latched
+        // by the `TIME_LOW` read above.
+        let high = unsafe { ((self.base + GOLDFISH_TIME_HIGH) as *const u32).read_volatile() };
         let nanos = (u64::from(high) << 32) | u64::from(low);
         Ok(UnixSeconds::new(nanos / NANOS_PER_SECOND))
     }
