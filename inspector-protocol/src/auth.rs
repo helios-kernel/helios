@@ -916,12 +916,12 @@ pub enum ServerAuthResult {
 /// Control-channel request from zero-authority `inspector-tls` to `inspector-host`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TlsControlRequest {
-    /// Request `inspector-host` to sign the TLS 1.3 channel binding and peer
-    /// ephemeral SPKI digest using `helios:system/machine-identity`.
+    /// Request `inspector-host` to generate a fresh CSPRNG `server_nonce` and
+    /// sign the TLS 1.3 channel binding and peer ephemeral SPKI digest using
+    /// `helios:system/machine-identity`.
     SignHandshake {
         channel_binding: [u8; 32],
         tls_spki_sha256: [u8; 32],
-        server_nonce: [u8; 32],
     },
     /// Request `inspector-host` to verify [`ClientAuth`], spawn the attenuated
     /// `inspector-worker` bound to the session's data IPC channel, and return

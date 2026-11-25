@@ -118,29 +118,16 @@ impl DefaultImageStore {
 
     /// Atomically write the preferences document to disk.
     pub fn save(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|source| OciError::Io {
-                operation: "create parent directory for user default images",
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
         let payload = serde_json::to_vec_pretty(&self.doc).map_err(|source| OciError::Json {
             subject: "user default images store",
             source,
         })?;
-        let tmp_path = self.path.with_extension("json.tmp");
-        fs::write(&tmp_path, &payload).map_err(|source| OciError::Io {
-            operation: "write temporary user default images",
-            path: tmp_path.clone(),
-            source,
-        })?;
-        fs::rename(&tmp_path, &self.path).map_err(|source| OciError::Io {
-            operation: "commit user default images",
-            path: self.path.clone(),
-            source,
-        })?;
-        Ok(())
+        crate::store::atomic_write_file(
+            &self.path,
+            &payload,
+            "write temporary user default images",
+            "commit user default images",
+        )
     }
 }
 
@@ -215,5 +202,44 @@ mod tests {
         let reloaded = DefaultImageStore::load(&path).unwrap();
         assert!(reloaded.get("alice@helios.internal").unwrap().is_none());
         assert_eq!(reloaded.get("bob@helios.internal").unwrap(), Some(&bob_img));
+    }
+
+    #[test]
+    fn concurrent_saves_do_not_race_on_temp_files() {
+        let dir = TempDir::new().unwrap();
+        let path = DefaultImageStore::path_in_store(dir.path());
+        DefaultImageStore::load(&path).unwrap().save().unwrap();
+
+        std::thread::scope(|scope| {
+            for tid in 0..8 {
+                let path = path.clone();
+                scope.spawn(move || {
+                    for iter in 0..20 {
+                        let mut store = DefaultImageStore::load(&path).unwrap();
+                        let img = UserDefaultImage {
+                            image_ref: format!("registry-1.docker.io/library/app:{tid}-{iter}"),
+                            rootfs_path: format!("/oci/layers/{tid}-{iter}"),
+                            env: vec![],
+                            credentials: ResolvedUser::default(),
+                        };
+                        store
+                            .set(&format!("user-{tid}@helios.internal"), img)
+                            .unwrap();
+                    }
+                });
+            }
+        });
+
+        let reloaded = DefaultImageStore::load(&path).expect("valid JSON after concurrent saves");
+        assert!(!reloaded.entries().is_empty());
+        let leftover_temps: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftover_temps.is_empty(),
+            "unexpected leftover temp files: {leftover_temps:?}"
+        );
     }
 }
