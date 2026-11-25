@@ -7,6 +7,57 @@ use thiserror::Error;
 
 use crate::{Setting, SettingUnit};
 
+/// Operator setting for the maximum number of live component resource-table
+/// entries per store (`process.max-component-handles`).
+pub struct ComponentHandleLimitSetting;
+
+impl ComponentHandleLimitSetting {
+    /// Default per-store component resource-table entry limit.
+    pub const DEFAULT_LIMIT: usize = 4096;
+}
+
+impl Setting for ComponentHandleLimitSetting {
+    const NAME: &'static str = "process.max-component-handles";
+    const DESCRIPTION: &'static str = "Maximum live component resource handles a store may hold.";
+    const UNIT: SettingUnit = SettingUnit::Count;
+    type Value = usize;
+    const DEFAULT: usize = Self::DEFAULT_LIMIT;
+
+    fn to_raw(value: usize) -> u64 {
+        value as u64
+    }
+
+    fn from_raw(raw: u64) -> usize {
+        usize::try_from(raw).unwrap_or(usize::MAX)
+    }
+}
+
+/// Operator setting for the maximum combined stdout+stderr bytes buffered by
+/// `helios:system/programs.exec` (`programs.max-buffered-exec-bytes`).
+pub struct BufferedExecOutputLimitSetting;
+
+impl BufferedExecOutputLimitSetting {
+    /// Default combined stdout+stderr buffer limit for buffered `exec` (4 MiB).
+    pub const DEFAULT_LIMIT: usize = 4 * 1024 * 1024;
+}
+
+impl Setting for BufferedExecOutputLimitSetting {
+    const NAME: &'static str = "programs.max-buffered-exec-bytes";
+    const DESCRIPTION: &'static str =
+        "Maximum combined stdout and stderr bytes buffered by a single exec call.";
+    const UNIT: SettingUnit = SettingUnit::Bytes;
+    type Value = usize;
+    const DEFAULT: usize = Self::DEFAULT_LIMIT;
+
+    fn to_raw(value: usize) -> u64 {
+        value as u64
+    }
+
+    fn from_raw(raw: u64) -> usize {
+        usize::try_from(raw).unwrap_or(usize::MAX)
+    }
+}
+
 /// Default upper bound on a raw WebAssembly input handed to the in-kernel
 /// compiler (64 MiB), adjustable at runtime through [`CompilerMaxInputBytesSetting`].
 pub const DEFAULT_COMPILER_MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
@@ -284,6 +335,8 @@ pub enum ProgramExecErrorDetail {
     GuestMemoryTypeMismatch,
     #[error("the executor has no task capacity left for another instance")]
     ExecutorTaskCapacityExhausted,
+    #[error("buffered child output exceeded the configured limit")]
+    OutputLimitExceeded,
     #[error("internal invariant was violated")]
     InternalInvariant,
     #[error("{0}")]
@@ -419,6 +472,7 @@ impl ProgramExecErrorDetail {
             Self::ExecutorTaskCapacityExhausted => {
                 "the executor has no task capacity left for another instance"
             }
+            Self::OutputLimitExceeded => "buffered child output exceeded the configured limit",
             Self::InternalInvariant => "internal invariant was violated",
             // The descriptor and what it holds are in the error's
             // `Display`; `as_str` has no storage to format them into.
