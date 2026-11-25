@@ -176,10 +176,12 @@ impl HeliosEnv for HostEnv {
             capability_grants.push(translated);
         }
 
+        let cwd = (!capability_grants.is_empty() && !request.cwd.is_empty()).then_some(request.cwd);
         let spawn_req = SpawnRequest {
             path: program_path,
             args: request.args,
             env: request.env.into_iter().collect(),
+            cwd,
             stdin: stdin_bytes,
             capability_grants,
         };
