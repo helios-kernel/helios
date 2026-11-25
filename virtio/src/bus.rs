@@ -161,12 +161,18 @@ impl<P> MmioBus<P> {
             "MMIO access misaligned"
         );
 
+        // SAFETY: `MmioBus::new` guarantees `self.base..self.base + self.size`
+        // is a valid mapped MMIO aperture, and the check above ensures
+        // `offset + 4 <= self.size`.
         unsafe { self.base.as_ptr().add(offset).cast::<u32>() }
     }
 
     fn checked_byte_ptr(&self, offset: usize) -> *mut u8 {
         assert!(offset < self.size, "MMIO byte access out of range");
 
+        // SAFETY: `MmioBus::new` guarantees `self.base..self.base + self.size`
+        // is a valid mapped MMIO aperture, and the check above ensures
+        // `offset < self.size`.
         unsafe { self.base.as_ptr().add(offset) }
     }
 
@@ -180,6 +186,9 @@ impl<P> MmioBus<P> {
             "MMIO half-word access misaligned"
         );
 
+        // SAFETY: `MmioBus::new` guarantees `self.base..self.base + self.size`
+        // is a valid mapped MMIO aperture, and the check above ensures
+        // `offset + 2 <= self.size`.
         unsafe { self.base.as_ptr().add(offset).cast::<u16>() }
     }
 }
@@ -190,14 +199,14 @@ const HEAP_RUN_BYTES: usize = isize::MAX as usize & !(PhysFrame::SIZE - 1);
 
 impl IdentityDmaPool {
     fn carve(&self, layout: Layout, zeroed: bool) -> Result<IdentityDmaBuffer, DmaError> {
-        // SAFETY: the callers pass non-zero-sized layouts, as the
-        // allocator requires.
-        let ptr = unsafe {
-            if zeroed {
-                alloc_zeroed(layout)
-            } else {
-                alloc(layout)
-            }
+        let ptr = if zeroed {
+            // SAFETY: the callers pass non-zero-sized layouts, as the
+            // allocator requires.
+            unsafe { alloc_zeroed(layout) }
+        } else {
+            // SAFETY: the callers pass non-zero-sized layouts, as the
+            // allocator requires.
+            unsafe { alloc(layout) }
         };
         let ptr = NonNull::new(ptr).ok_or(DmaError::Exhausted {
             bytes: layout.size(),
@@ -311,14 +320,14 @@ impl<A: AllocationTags> OffsetDmaPool<A> {
                 bytes: allocation_size,
             })?;
 
-        // SAFETY: the callers pass non-zero-sized layouts, as the
-        // allocator requires.
-        let allocation = unsafe {
-            if zeroed {
-                alloc_zeroed(allocation_layout)
-            } else {
-                alloc(allocation_layout)
-            }
+        let allocation = if zeroed {
+            // SAFETY: the callers pass non-zero-sized layouts, as the
+            // allocator requires.
+            unsafe { alloc_zeroed(allocation_layout) }
+        } else {
+            // SAFETY: the callers pass non-zero-sized layouts, as the
+            // allocator requires.
+            unsafe { alloc(allocation_layout) }
         };
         let allocation = NonNull::new(allocation).ok_or(DmaError::Exhausted {
             bytes: allocation_layout.size(),
@@ -338,14 +347,22 @@ impl<A: AllocationTags> OffsetDmaPool<A> {
         let tag = if redzone == 0 {
             Tag::UNCHECKED
         } else {
-            // SAFETY: the allocation is this call's alone, and the view
-            // maps it tag-capable (`tagged`'s contract). The redzones and
-            // the object are `unit`-aligned multiples of `unit`.
+            // SAFETY: the leading redzone lies inside this call's exclusive
+            // allocation, is `unit`-aligned and `unit` bytes long, and `view`
+            // maps it tag-capable (`OffsetDmaPool::tagged`'s contract).
             unsafe {
                 A::store(range_at(view_object - redzone, redzone), Tag::FREE);
-                A::store(range_at(view_object + len, redzone), Tag::FREE);
-                A::assign(range_at(view_object, len), TagSet::EMPTY)
             }
+            // SAFETY: the trailing redzone lies inside this call's exclusive
+            // allocation, is `unit`-aligned and `unit` bytes long, and `view`
+            // maps it tag-capable (`OffsetDmaPool::tagged`'s contract).
+            unsafe {
+                A::store(range_at(view_object + len, redzone), Tag::FREE);
+            }
+            // SAFETY: the object range lies inside this call's exclusive
+            // allocation, is `unit`-aligned and a multiple of `unit`, and `view`
+            // maps it tag-capable (`OffsetDmaPool::tagged`'s contract).
+            unsafe { A::assign(range_at(view_object, len), TagSet::EMPTY) }
         };
         let ptr = NonNull::new(A::apply(view_object, tag) as *mut u8)
             .expect("a tagged ring address is not null");
@@ -683,6 +700,8 @@ impl<B: AsMut<[u8]>> AsMut<[u8]> for PlatformDmaBuffer<B> {
 
 impl Drop for IdentityDmaBuffer {
     fn drop(&mut self) {
+        // SAFETY: `self.ptr` was allocated in `IdentityDmaPool::carve` with
+        // `self.layout` and is freed once on drop.
         unsafe {
             dealloc(self.ptr.as_ptr(), self.layout);
         }
@@ -709,24 +728,34 @@ impl<P: DmaMemory> DeviceBus for MmioBus<P> {
     type DmaPool = P;
 
     fn read_u8(&self, offset: usize) -> u8 {
+        // SAFETY: `checked_byte_ptr` bounds-checks `offset` within the
+        // permanently mapped MMIO aperture (`MmioBus::new`'s contract).
         unsafe { mmio::read_u8(self.checked_byte_ptr(offset)) }
     }
 
     fn read_u16(&self, offset: usize) -> u16 {
+        // SAFETY: `checked_half_ptr` bounds- and alignment-checks `offset`
+        // within the permanently mapped MMIO aperture (`MmioBus::new`'s contract).
         unsafe { mmio::read_u16(self.checked_half_ptr(offset)) }
     }
 
     fn read_u32(&self, offset: usize) -> u32 {
+        // SAFETY: `checked_ptr` bounds- and alignment-checks `offset`
+        // within the permanently mapped MMIO aperture (`MmioBus::new`'s contract).
         unsafe { mmio::read_u32(self.checked_ptr(offset)) }
     }
 
     fn write_u8(&self, offset: usize, value: u8) {
+        // SAFETY: `checked_byte_ptr` bounds-checks `offset` within the
+        // permanently mapped MMIO aperture (`MmioBus::new`'s contract).
         unsafe {
             mmio::write_u8(self.checked_byte_ptr(offset), value);
         }
     }
 
     fn write_u32(&self, offset: usize, value: u32) {
+        // SAFETY: `checked_ptr` bounds- and alignment-checks `offset`
+        // within the permanently mapped MMIO aperture (`MmioBus::new`'s contract).
         unsafe {
             mmio::write_u32(self.checked_ptr(offset), value);
         }
@@ -737,12 +766,24 @@ impl<P: DmaMemory> DeviceBus for MmioBus<P> {
     }
 }
 
+// SAFETY: `IdentityDmaBuffer` uniquely owns its heap allocation and carries no
+// thread-local state.
 unsafe impl Send for IdentityDmaBuffer {}
+// SAFETY: `IdentityDmaBuffer` exposes only shared reads through `&self`;
+// mutation requires `&mut self`.
 unsafe impl Sync for IdentityDmaBuffer {}
+// SAFETY: `OffsetDmaBuffer` uniquely owns its heap allocation and `A` is
+// `AllocationTags: Send + Sync`.
 unsafe impl<A: AllocationTags> Send for OffsetDmaBuffer<A> {}
+// SAFETY: `OffsetDmaBuffer` exposes only shared reads through `&self` and `A`
+// is `Sync`; mutation requires `&mut self`.
 unsafe impl<A: AllocationTags> Sync for OffsetDmaBuffer<A> {}
 
+// SAFETY: `MmioBus<P>` holds a permanently mapped MMIO aperture pointer and
+// `P: Send`; `MmioBus::new` permits cross-thread use.
 unsafe impl<P: Send> Send for MmioBus<P> {}
+// SAFETY: `MmioBus<P>` performs MMIO register accesses via `checked_*_ptr`
+// under `MmioBus::new`'s aliasing contract, and `P: Sync`.
 unsafe impl<P: Sync> Sync for MmioBus<P> {}
 
 #[cfg(test)]
@@ -971,7 +1012,12 @@ mod tests {
     /// The bytes `offset..offset + len` of `buffer`.
     fn buffer_bytes<B: DmaBuffer>(buffer: &B, offset: usize, len: usize) -> &[u8] {
         assert!(offset + len <= buffer.len());
-        unsafe { core::slice::from_raw_parts(buffer.as_ptr().add(offset), len) }
+        // SAFETY: the assertion above guarantees `offset <= buffer.len()`, so
+        // `ptr` stays within `buffer`'s allocation.
+        let ptr = unsafe { buffer.as_ptr().add(offset) };
+        // SAFETY: `ptr..ptr + len` lies within `buffer` and is valid for shared
+        // reads for the lifetime of `&B`.
+        unsafe { core::slice::from_raw_parts(ptr, len) }
     }
 
     #[test]

@@ -145,9 +145,15 @@ impl<T: VirtioTransport> RingOps<T> for PackedRing<T> {
                     id: 0,
                     flags: if entry.writable { DESC_F_WRITE } else { 0 },
                 };
-                unsafe {
-                    table.add(slot).write_volatile(descriptor);
-                }
+                // SAFETY: `slot < chain.len() <= tables.entries()`, so
+                // the offset stays inside `id`'s pre-allocated indirect
+                // table.
+                let dst = unsafe { table.add(slot) };
+                // SAFETY: `dst` points to a valid, aligned
+                // `PackedDescriptor` slot in `id`'s indirect table, and
+                // `id` is freshly allocated so the device cannot read it
+                // until the head descriptor is published below.
+                unsafe { dst.write_volatile(descriptor) };
             }
             self.write_descriptor_body(
                 head_position,
@@ -363,18 +369,32 @@ impl<T: VirtioTransport> PackedRing<T> {
         } else {
             (0, EVENT_FLAG_ENABLE)
         };
-        unsafe {
-            let base = self.driver_event.as_ptr().cast::<u16>();
-            base.write_volatile(off_wrap);
-            base.add(1).write_volatile(flags);
-        }
+        let base = self.driver_event.as_ptr().cast::<u16>();
+        // SAFETY: `driver_event` is a resident 4-byte, 4-byte-aligned
+        // DMA buffer owned by `self`, so offset 0 is a valid, aligned
+        // `u16` field written only by the driver.
+        unsafe { base.write_volatile(off_wrap) };
+        // SAFETY: `driver_event` holds two `u16` fields (4 bytes), so
+        // `base.add(1)` stays within the allocation.
+        let flags_ptr = unsafe { base.add(1) };
+        // SAFETY: `flags_ptr` is valid and 2-byte-aligned inside
+        // `driver_event` and written only by the driver.
+        unsafe { flags_ptr.write_volatile(flags) };
     }
 
     fn read_device_event(&self) -> (u16, u16) {
-        unsafe {
-            let base = self.device_event.as_ptr().cast::<u16>();
-            (base.read_volatile(), base.add(1).read_volatile())
-        }
+        let base = self.device_event.as_ptr().cast::<u16>();
+        // SAFETY: `device_event` is a resident 4-byte, 4-byte-aligned
+        // DMA buffer owned by `self`, so offset 0 is a valid, aligned
+        // `u16` field.
+        let off_wrap = unsafe { base.read_volatile() };
+        // SAFETY: `device_event` holds two `u16` fields (4 bytes), so
+        // `base.add(1)` stays within the allocation.
+        let flags_ptr = unsafe { base.add(1) };
+        // SAFETY: `flags_ptr` is valid and 2-byte-aligned inside
+        // `device_event`.
+        let flags = unsafe { flags_ptr.read_volatile() };
+        (off_wrap, flags)
     }
 
     fn descriptor_ptr(&self, position: u16) -> *mut PackedDescriptor {
@@ -382,6 +402,8 @@ impl<T: VirtioTransport> PackedRing<T> {
             position < self.core.size,
             "virtqueue ring position {position} is outside the ring"
         );
+        // SAFETY: `position < self.core.size` was just checked, and
+        // `self.descriptors` holds `self.core.size` `PackedDescriptor`s.
         unsafe {
             self.descriptors
                 .as_ptr()
@@ -391,28 +413,41 @@ impl<T: VirtioTransport> PackedRing<T> {
     }
 
     fn read_descriptor(&self, position: u16) -> PackedDescriptor {
-        unsafe { self.descriptor_ptr(position).read_volatile() }
+        let ptr = self.descriptor_ptr(position);
+        // SAFETY: `descriptor_ptr` verified `position < self.core.size`,
+        // and `self.descriptors` is resident and aligned for
+        // `PackedDescriptor` for the lifetime of `self`.
+        unsafe { ptr.read_volatile() }
     }
 
     /// Writes everything but the ownership flags, which the caller
     /// publishes afterwards.
     fn write_descriptor_body(&self, position: u16, addr: u64, len: u32, id: u16) {
         let base = self.descriptor_ptr(position).cast::<u8>();
-        unsafe {
-            base.cast::<u64>().write_volatile(addr);
-            base.add(8).cast::<u32>().write_volatile(len);
-            base.add(12).cast::<u16>().write_volatile(id);
-        }
+        // SAFETY: `descriptor_ptr` checked `position < self.core.size`,
+        // the descriptor is 16-byte aligned, and `addr` is at offset 0
+        // before the head flags expose this descriptor to the device.
+        unsafe { base.cast::<u64>().write_volatile(addr) };
+        // SAFETY: offset 8 stays within the 16-byte `PackedDescriptor`.
+        let len_ptr = unsafe { base.add(8) };
+        // SAFETY: `len_ptr` is 4-byte aligned (descriptor is 16-byte
+        // aligned + 8) and inside the descriptor at `position`.
+        unsafe { len_ptr.cast::<u32>().write_volatile(len) };
+        // SAFETY: offset 12 stays within the 16-byte `PackedDescriptor`.
+        let id_ptr = unsafe { base.add(12) };
+        // SAFETY: `id_ptr` is 2-byte aligned (descriptor is 16-byte
+        // aligned + 12) and inside the descriptor at `position`.
+        unsafe { id_ptr.cast::<u16>().write_volatile(id) };
     }
 
     fn write_descriptor_flags(&self, position: u16, flags: u16) {
-        unsafe {
-            self.descriptor_ptr(position)
-                .cast::<u8>()
-                .add(14)
-                .cast::<u16>()
-                .write_volatile(flags);
-        }
+        let base = self.descriptor_ptr(position).cast::<u8>();
+        // SAFETY: offset 14 (`flags`) stays within the 16-byte
+        // `PackedDescriptor` at `position`.
+        let flags_ptr = unsafe { base.add(14) };
+        // SAFETY: `flags_ptr` is 2-byte aligned (16-byte aligned + 14)
+        // and inside the resident descriptor ring.
+        unsafe { flags_ptr.cast::<u16>().write_volatile(flags) };
     }
 }
 
@@ -428,6 +463,9 @@ fn is_used(flags: u16, used_wrap: bool) -> bool {
 }
 
 fn zero<B: DmaBuffer>(buffer: &B) {
+    // SAFETY: `buffer` is a resident DMA allocation of `buffer.len()`
+    // bytes, and `zero` is only called during `reprogram` under `&mut
+    // self` after the device queue has been reset.
     unsafe {
         buffer.as_ptr().write_bytes(0, buffer.len());
     }
@@ -445,30 +483,45 @@ impl<T: VirtioTransport> PackedRing<T> {
             .indirect
             .as_ref()
             .expect("queue has no indirect tables");
-        unsafe {
-            tables
-                .table_ptr(id)
-                .cast::<PackedDescriptor>()
-                .add(slot)
-                .read_volatile()
-        }
+        let base = tables.table_ptr(id).cast::<PackedDescriptor>();
+        // SAFETY: `table_ptr` checked `id` is in range, and test callers
+        // index `slot < tables.entries()` inside `id`'s indirect table.
+        let ptr = unsafe { base.add(slot) };
+        // SAFETY: `ptr` points to a valid, aligned `PackedDescriptor`
+        // inside `id`'s resident indirect table.
+        unsafe { ptr.read_volatile() }
     }
 
     /// The used-buffer suppression state the driver published.
     pub(super) fn driver_event(&self) -> (u16, u16) {
-        unsafe {
-            let base = self.driver_event.as_ptr().cast::<u16>();
-            (base.read_volatile(), base.add(1).read_volatile())
-        }
+        let base = self.driver_event.as_ptr().cast::<u16>();
+        // SAFETY: `driver_event` is a resident 4-byte, 4-byte-aligned
+        // DMA buffer owned by `self`, so offset 0 is a valid, aligned
+        // `u16` field.
+        let off_wrap = unsafe { base.read_volatile() };
+        // SAFETY: `driver_event` holds two `u16` fields (4 bytes), so
+        // `base.add(1)` stays within the allocation.
+        let flags_ptr = unsafe { base.add(1) };
+        // SAFETY: `flags_ptr` is valid and 2-byte-aligned inside
+        // `driver_event`.
+        let flags = unsafe { flags_ptr.read_volatile() };
+        (off_wrap, flags)
     }
 
     /// Device side: publish an available-buffer suppression state.
     pub(super) fn device_set_event(&self, off_wrap: u16, flags: u16) {
-        unsafe {
-            let base = self.device_event.as_ptr().cast::<u16>();
-            base.write_volatile(off_wrap);
-            base.add(1).write_volatile(flags);
-        }
+        let base = self.device_event.as_ptr().cast::<u16>();
+        // SAFETY: `device_event` is a resident 4-byte, 4-byte-aligned
+        // DMA buffer owned by `self`, so offset 0 is a valid, aligned
+        // `u16` field written only by the test device in single-threaded
+        // tests.
+        unsafe { base.write_volatile(off_wrap) };
+        // SAFETY: `device_event` holds two `u16` fields (4 bytes), so
+        // `base.add(1)` stays within the allocation.
+        let flags_ptr = unsafe { base.add(1) };
+        // SAFETY: `flags_ptr` is valid and 2-byte-aligned inside
+        // `device_event`.
+        unsafe { flags_ptr.write_volatile(flags) };
     }
 
     /// Device side: mark the chain `id` used at ring position `position`

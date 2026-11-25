@@ -2875,13 +2875,15 @@ mod tests {
 
         // A slice that ends exactly at the chunk's end is whole; one byte
         // further, into the guard region the source left, is refused.
-        // SAFETY: the chunk's block is followed by a guard of the same
-        // size, so both slices are inside live host memory.
-        let (whole, past) = unsafe {
-            (
-                core::slice::from_raw_parts((limit - PAGE_BYTES) as *const u8, PAGE_BYTES),
-                core::slice::from_raw_parts((limit - PAGE_BYTES) as *const u8, PAGE_BYTES + 1),
-            )
+        // SAFETY: `limit - PAGE_BYTES..limit` is the last unallocated page of
+        // chunk 0 inside `TestSource`'s live zeroed host allocation.
+        let whole =
+            unsafe { core::slice::from_raw_parts((limit - PAGE_BYTES) as *const u8, PAGE_BYTES) };
+        // SAFETY: `TestSource` allocates an extra guard chunk after the chunks
+        // it lends, so extending one byte past `limit` stays within the same
+        // live zeroed host allocation.
+        let past = unsafe {
+            core::slice::from_raw_parts((limit - PAGE_BYTES) as *const u8, PAGE_BYTES + 1)
         };
         assert_eq!(
             arena.device_range(whole),

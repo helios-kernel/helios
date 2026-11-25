@@ -135,11 +135,21 @@ pub fn mmio_candidates<'f>(fdt: &'f Fdt<'f>) -> impl Iterator<Item = MmioCandida
 /// `virtual_base` must point at a currently mapped MMIO window with at
 /// least the first three 32-bit registers readable.
 pub unsafe fn mmio_device_matches(virtual_base: usize, expected: DeviceType) -> bool {
-    unsafe {
-        read_u32(virtual_base + REG_MAGIC_VALUE) == MAGIC_VALUE
-            && read_u32(virtual_base + REG_VERSION) == MODERN_VERSION
-            && read_u32(virtual_base + REG_DEVICE_ID) == expected as u32
+    // SAFETY: caller guarantees `virtual_base` points at a mapped
+    // virtio-mmio register window with the first three 32-bit registers
+    // readable; `REG_MAGIC_VALUE` is the first 32-bit register.
+    let magic = unsafe { read_u32(virtual_base + REG_MAGIC_VALUE) };
+    if magic != MAGIC_VALUE {
+        return false;
     }
+    // SAFETY: as above; `REG_VERSION` is the second 32-bit register.
+    let version = unsafe { read_u32(virtual_base + REG_VERSION) };
+    if version != MODERN_VERSION {
+        return false;
+    }
+    // SAFETY: as above; `REG_DEVICE_ID` is the third 32-bit register.
+    let device_id = unsafe { read_u32(virtual_base + REG_DEVICE_ID) };
+    device_id == expected as u32
 }
 
 /// Decodes the first entry of `node`'s `interrupts` property against
@@ -458,6 +468,8 @@ fn reg_cells_to_usize(bytes: &[u8], name: &str) -> usize {
 }
 
 unsafe fn read_u32(address: usize) -> u32 {
+    // SAFETY: caller guarantees `address` points to a mapped, naturally
+    // aligned 32-bit MMIO register valid to read.
     unsafe { mmio::read_u32(address as *const u32) }
 }
 

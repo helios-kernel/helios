@@ -70,6 +70,8 @@ impl MmioRegisterBus {
 
     /// The last value written to (or preset in) `offset`.
     pub(crate) fn register(&self, offset: usize) -> u32 {
+        // SAFETY: no concurrent `&mut` reference to `registers` exists; the
+        // borrow is confined to copying this single `u32` register word.
         unsafe { (*self.registers.get())[offset / 4] }
     }
 }
@@ -102,6 +104,8 @@ impl DeviceBus for MmioRegisterBus {
     }
 
     fn write_u32(&self, offset: usize, value: u32) {
+        // SAFETY: no concurrent reference to `registers` exists; the mutable
+        // borrow is confined to writing this single `u32` register word.
         unsafe {
             (*self.registers.get())[offset / 4] = value;
         }
@@ -112,7 +116,10 @@ impl DeviceBus for MmioRegisterBus {
     }
 }
 
+// SAFETY: `MmioRegisterBus` is a test register file whose accesses are
+// sequentially ordered by the test harness and whose `IdentityDmaPool` is `Send`.
 unsafe impl Send for MmioRegisterBus {}
+// SAFETY: as above; register reads and writes do not race across threads.
 unsafe impl Sync for MmioRegisterBus {}
 
 /// Host-memory bus: virtqueue rings are ordinary heap allocations whose
@@ -142,6 +149,8 @@ impl<P: DmaMemory> DeviceBus for HeapBus<P> {
     }
 
     fn read_u32(&self, offset: usize) -> u32 {
+        // SAFETY: no concurrent `&mut` reference to `config` exists; the borrow
+        // is confined to copying this single `u32` word.
         unsafe { (*self.config.get())[offset / 4] }
     }
 
@@ -153,6 +162,8 @@ impl<P: DmaMemory> DeviceBus for HeapBus<P> {
     }
 
     fn write_u32(&self, offset: usize, value: u32) {
+        // SAFETY: no concurrent reference to `config` exists; the mutable borrow
+        // is confined to writing this single `u32` word.
         unsafe {
             (*self.config.get())[offset / 4] = value;
         }
@@ -165,7 +176,11 @@ impl<P: DmaMemory> DeviceBus for HeapBus<P> {
     }
 }
 
+// SAFETY: `P: Send` and test configuration register accesses to `config` are
+// sequentially ordered by the test harness.
 unsafe impl<P: Send> Send for HeapBus<P> {}
+// SAFETY: `P: Sync` and test configuration register accesses to `config` do not
+// race across threads.
 unsafe impl<P: Sync> Sync for HeapBus<P> {}
 
 /// How a [`FakeTransport`] presents itself to a driver.
@@ -661,7 +676,10 @@ pub(crate) struct WindowDmaBuffer {
     device_address: DeviceAddress,
 }
 
+// SAFETY: the buffer names a disjoint range of `WindowArena` memory, which the
+// test keeps alive via `WindowDmaPool` for as long as any buffer is in use.
 unsafe impl Send for WindowDmaBuffer {}
+// SAFETY: as above; shared access is read-only and mutable access requires `&mut self`.
 unsafe impl Sync for WindowDmaBuffer {}
 
 impl WindowDmaPool {
@@ -1252,6 +1270,8 @@ impl DmaBuffer for WindowDmaBuffer {
 impl WindowDmaBuffer {
     /// The buffer as guest memory a driver can be handed.
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: the buffer owns `len` bytes of the pool's arena and
+        // nothing else names them.
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }

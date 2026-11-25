@@ -348,6 +348,8 @@ impl<B: DmaBuffer> IndirectTables<B> {
             offset + self.stride <= self.memory.len(),
             "indirect table {id} is outside the queue's table memory"
         );
+        // SAFETY: `offset + self.stride <= self.memory.len()` was just
+        // checked, so `offset` stays within the resident DMA buffer.
         unsafe { self.memory.as_ptr().add(offset) }
     }
 

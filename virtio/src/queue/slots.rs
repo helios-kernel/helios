@@ -505,14 +505,13 @@ impl<B: DmaBuffer> SlotPool<B> {
             "slot {index} is outside the {} of this pool",
             self.count
         );
-        // SAFETY: the slot lies inside the allocation, and `&mut self`
-        // is the only handle to it.
-        unsafe {
-            core::slice::from_raw_parts_mut(
-                self.buffer.as_ptr().add(index * self.slot_bytes),
-                self.slot_bytes,
-            )
-        }
+        // SAFETY: `index < self.count` was just checked, so
+        // `index * self.slot_bytes` stays within the `count * slot_bytes`
+        // allocation.
+        let ptr = unsafe { self.buffer.as_ptr().add(index * self.slot_bytes) };
+        // SAFETY: `ptr` points to `self.slot_bytes` valid bytes inside
+        // `self.buffer`, and `&mut self` guarantees exclusive access.
+        unsafe { core::slice::from_raw_parts_mut(ptr, self.slot_bytes) }
     }
 }
 
