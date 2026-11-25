@@ -1,7 +1,7 @@
 //! Thin CLI frontend over [`helios_vmm::MicroVm`].
 
 use clap::Parser;
-use helios_vmm::{ExitReason, MicroVm, VirtioNetConfig, VirtioVsockConfig};
+use helios_vmm::{ExitReason, MicroVm};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -39,12 +39,6 @@ struct Cli {
     /// Mount a granted host directory tree as `virtio-fs` rootfs (`tag=rootfs`).
     #[arg(long = "rootfs-dir", value_name = "PATH")]
     rootfs_dir: Option<String>,
-    /// Attach a `virtio-net` device.
-    #[arg(long)]
-    net: bool,
-    /// Attach a `virtio-vsock` device with the given guest CID (>= 3).
-    #[arg(long)]
-    vsock_cid: Option<u64>,
 }
 
 fn parse_share_dir(spec: &str) -> Result<(&str, &str), CliError> {
@@ -81,12 +75,6 @@ fn build_vm(cli: Cli) -> Result<MicroVm, CliError> {
     for spec in &cli.share_dirs {
         let (tag, path) = parse_share_dir(spec)?;
         builder = builder.share_dir(tag, path)?;
-    }
-    if cli.net {
-        builder = builder.virtio_net(VirtioNetConfig::default());
-    }
-    if let Some(cid) = cli.vsock_cid {
-        builder = builder.virtio_vsock(VirtioVsockConfig::new(cid)?);
     }
     Ok(builder.build_vm()?)
 }

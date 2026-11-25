@@ -8,7 +8,7 @@ use tracing::debug;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use super::backend::{
-    DT_DIR, EBADF, EINVAL, ENODATA, ENOENT, ENOSYS, ENOTDIR, EROFS, FsBackend, FsMetadata,
+    DT_DIR, EBADF, EINVAL, ENODATA, ENOENT, ENOSYS, ENOTDIR, ENXIO, EROFS, FsBackend, FsMetadata,
     FsOpenOptions, FsResult, FsTimeUpdate, validate_name,
 };
 
@@ -86,6 +86,7 @@ const W_OK: u32 = 2;
 
 const MAX_WRITE_BYTES: u32 = 64 * 1024;
 const MAX_PAGES: u16 = 32;
+pub const MAX_READ_BYTES: u32 = (MAX_PAGES as u32) * 4096;
 
 #[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
@@ -477,17 +478,28 @@ impl<B: FsBackend> FuseSession<B> {
         self.inodes.len()
     }
 
-    /// Dispatches one FUSE request buffer and returns `Some(reply_bytes)` or
-    /// `None` for one-way operations (`FUSE_FORGET`, `FUSE_BATCH_FORGET`).
-    pub async fn handle_request(&mut self, request: &[u8]) -> Option<Vec<u8>> {
-        if request.len() < core::mem::size_of::<FuseInHeader>() {
+    /// Dispatches one FUSE request buffer bounded by the writable reply buffer
+    /// capacity `max_reply_bytes`, returning `Some(reply_bytes)` or `None` for
+    /// one-way operations (`FUSE_FORGET`, `FUSE_BATCH_FORGET`).
+    pub async fn handle_request(
+        &mut self,
+        request: &[u8],
+        max_reply_bytes: usize,
+    ) -> Option<Vec<u8>> {
+        let in_hdr_len = core::mem::size_of::<FuseInHeader>();
+        if request.len() < in_hdr_len {
             return Some(error_reply(0, EINVAL));
         }
-        let header = FuseInHeader::read_from_bytes(&request[..40]).ok()?;
+        let header = FuseInHeader::read_from_bytes(&request[..in_hdr_len]).ok()?;
+        let header_len = u32::from_le(header.len) as usize;
         let opcode = u32::from_le(header.opcode);
         let unique = u64::from_le(header.unique);
         let nodeid = u64::from_le(header.nodeid);
-        let body = &request[40..];
+        if header_len < in_hdr_len || header_len > request.len() {
+            return Some(error_reply(unique, EINVAL));
+        }
+        let body = &request[in_hdr_len..header_len];
+        let max_payload = max_reply_bytes.saturating_sub(core::mem::size_of::<FuseOutHeader>());
 
         match opcode {
             FUSE_FORGET => {
@@ -530,15 +542,15 @@ impl<B: FsBackend> FuseSession<B> {
             FUSE_RENAME2 => self.op_rename(nodeid, body, true).await,
             FUSE_LINK => self.op_link(nodeid, body).await,
             FUSE_OPEN => self.op_open(nodeid, body).await,
-            FUSE_READ => self.op_read(body).await,
+            FUSE_READ => self.op_read(body, max_payload).await,
             FUSE_WRITE => self.op_write(body).await,
             FUSE_STATFS => self.op_statfs(),
             FUSE_RELEASE => self.op_release(body),
             FUSE_FSYNC => self.op_fsync(body).await,
             FUSE_FLUSH => self.op_flush(body).await,
             FUSE_OPENDIR => self.op_opendir(nodeid).await,
-            FUSE_READDIR => self.op_readdir(body, false).await,
-            FUSE_READDIRPLUS => self.op_readdir(body, true).await,
+            FUSE_READDIR => self.op_readdir(body, false, max_payload).await,
+            FUSE_READDIRPLUS => self.op_readdir(body, true, max_payload).await,
             FUSE_RELEASEDIR => self.op_releasedir(body),
             FUSE_FSYNCDIR => Ok(Vec::new()),
             FUSE_ACCESS => self.op_access(nodeid, body).await,
@@ -892,15 +904,14 @@ impl<B: FsBackend> FuseSession<B> {
         Ok(out)
     }
 
-    async fn op_read(&self, body: &[u8]) -> FsResult<Vec<u8>> {
+    async fn op_read(&self, body: &[u8], max_payload: usize) -> FsResult<Vec<u8>> {
         let (req, _) = FuseReadIn::read_from_prefix(body).map_err(|_| EINVAL)?;
         let open = self.open_files.get(&u64::from_le(req.fh)).ok_or(EBADF)?;
+        let capped = (u32::from_le(req.size) as usize)
+            .min(MAX_READ_BYTES as usize)
+            .min(max_payload) as u32;
         self.backend
-            .read_file(
-                &open.handle,
-                u64::from_le(req.offset),
-                u32::from_le(req.size),
-            )
+            .read_file(&open.handle, u64::from_le(req.offset), capped)
             .await
     }
 
@@ -994,11 +1005,20 @@ impl<B: FsBackend> FuseSession<B> {
         Ok(list)
     }
 
-    async fn op_readdir(&mut self, body: &[u8], plus: bool) -> FsResult<Vec<u8>> {
+    async fn op_readdir(
+        &mut self,
+        body: &[u8],
+        plus: bool,
+        max_payload: usize,
+    ) -> FsResult<Vec<u8>> {
         let (req, _) = FuseReadIn::read_from_prefix(body).map_err(|_| EINVAL)?;
         let fh = u64::from_le(req.fh);
-        let offset = u64::from_le(req.offset) as usize;
-        let max_bytes = u32::from_le(req.size) as usize;
+        let Ok(offset) = usize::try_from(u64::from_le(req.offset)) else {
+            return Ok(Vec::new());
+        };
+        let max_bytes = (u32::from_le(req.size) as usize)
+            .min(MAX_READ_BYTES as usize)
+            .min(max_payload);
 
         let dir_nodeid = self.open_dirs.get(&fh).ok_or(EBADF)?.nodeid;
         // Re-snapshot when guest rewinds to offset 0 so fresh mutations appear.
@@ -1073,8 +1093,14 @@ impl<B: FsBackend> FuseSession<B> {
                 };
                 out.extend_from_slice(dirent.as_bytes());
             } else {
+                // Non-plus READDIR does not take lookup references, so reuse an
+                // already-interned inode if present or synthesize a stable non-interned
+                // ino without leaking unreferenced entries into the inode table.
                 let ino = if let Some(child_path) = rel_path {
-                    self.intern_inode(child_path, 0)
+                    self.path_to_inode
+                        .get(&child_path)
+                        .copied()
+                        .unwrap_or_else(|| synthetic_dirent_ino(&child_path))
                 } else if name == "." {
                     dir_nodeid
                 } else {
@@ -1138,14 +1164,14 @@ impl<B: FsBackend> FuseSession<B> {
             3 => {
                 // SEEK_DATA
                 if offset >= size {
-                    return Err(super::backend::ENODATA);
+                    return Err(ENXIO);
                 }
                 offset
             }
             4 => {
                 // SEEK_HOLE
                 if offset >= size {
-                    return Err(super::backend::ENODATA);
+                    return Err(ENXIO);
                 }
                 size
             }
@@ -1236,6 +1262,21 @@ fn ok_reply(unique: u64, payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(header.as_bytes());
     out.extend_from_slice(payload);
     out
+}
+
+fn synthetic_dirent_ino(path: &[String]) -> u64 {
+    // 64-bit FNV-1a with bit 63 set so synthetic dirent numbers never collide
+    // with sequential interned node IDs or FUSE_ROOT_ID.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for segment in path {
+        for &byte in segment.as_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash ^= u64::from(b'/');
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash | (1u64 << 63)
 }
 
 fn error_reply(unique: u64, errno: i32) -> Vec<u8> {

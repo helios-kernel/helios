@@ -159,6 +159,11 @@ pub trait VirtioModel {
     const FEATURES: u64;
     const REQUIRED: u64;
 
+    /// Device feature bits offered to the guest; defaults to [`Self::FEATURES`].
+    fn features(&self) -> u64 {
+        Self::FEATURES
+    }
+
     fn queues(&self) -> &[Queue];
     fn queues_mut(&mut self) -> &mut [Queue];
     fn configuration(&self, offset: u64, width: IoWidth) -> u64;
@@ -361,8 +366,9 @@ impl<M: VirtioModel> VirtioMmio<M> {
                         self.reset_transport();
                     } else {
                         self.status = value;
+                        let offered = self.model.features();
                         if value & FEATURES_OK != 0
-                            && (self.driver_features & !M::FEATURES != 0
+                            && (self.driver_features & !offered != 0
                                 || self.driver_features & M::REQUIRED != M::REQUIRED)
                         {
                             self.status &= !FEATURES_OK;
@@ -386,7 +392,7 @@ impl<M: VirtioModel> VirtioMmio<M> {
             0x00c => 0x4845_4c49, // "HELI"
             0x010 => {
                 if self.feature_select < 2 {
-                    (M::FEATURES >> (self.feature_select * 32)) & u64::from(u32::MAX)
+                    (self.model.features() >> (self.feature_select * 32)) & u64::from(u32::MAX)
                 } else {
                     0
                 }

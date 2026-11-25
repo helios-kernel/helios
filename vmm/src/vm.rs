@@ -26,8 +26,8 @@ use crate::virtio::block::VirtioBlock;
 use crate::virtio::console::{ConsoleSink, StdoutConsoleSink, VirtioConsole};
 use crate::virtio::fs::backend::{FsBackend, WasiFsBackend};
 use crate::virtio::fs::{ROOTFS_TAG, VirtioFs, VirtioFsShareConfig};
-use crate::virtio::net::{ChannelNetBackend, NetBackend, VirtioNet, VirtioNetConfig};
-use crate::virtio::vsock::{ChannelVsockBackend, VirtioVsock, VirtioVsockConfig, VsockBackend};
+use crate::virtio::net::{NetBackend, VirtioNet, VirtioNetConfig};
+use crate::virtio::vsock::{VirtioVsock, VirtioVsockConfig, VsockBackend, VsockPacket};
 
 /// Default Linux kernel command line when booting an initramfs.
 pub const DEFAULT_INITRAMFS_CMDLINE: &str =
@@ -477,6 +477,38 @@ impl<F: FsBackend> DeviceSet<F> {
     }
 }
 
+/// Fail-fast placeholder net backend used by [`MicroVm::run`] when no `virtio-net`
+/// device is configured.
+struct UnattachedNetBackend;
+
+impl NetBackend for UnattachedNetBackend {
+    fn try_recv_frame(&mut self) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn send_frame(&mut self, _frame: Vec<u8>) -> Result<()> {
+        Err(Error::Config(
+            "virtio-net requires run_with_backends with a live NetBackend",
+        ))
+    }
+}
+
+/// Fail-fast placeholder vsock backend used by [`MicroVm::run`] when no `virtio-vsock`
+/// device is configured.
+struct UnattachedVsockBackend;
+
+impl VsockBackend for UnattachedVsockBackend {
+    fn on_guest_tx(&mut self, _packet: VsockPacket) -> Result<()> {
+        Err(Error::Config(
+            "virtio-vsock requires run_with_backends with a live VsockBackend",
+        ))
+    }
+
+    fn try_recv_rx(&mut self) -> Option<VsockPacket> {
+        None
+    }
+}
+
 /// Reusable async hardware virtual machine built via [`MicroVm::builder`].
 pub struct MicroVm {
     config: MicroVmConfig,
@@ -495,9 +527,47 @@ impl MicroVm {
         &self.config
     }
 
-    /// Boots and runs the virtual machine until the guest shuts down or an
-    /// error occurs.
+    fn validate_default_run_backends(&self) -> Result<()> {
+        if self.config.net.is_some() {
+            return Err(Error::Config(
+                "virtio-net requires MicroVm::run_with_backends with a live NetBackend",
+            ));
+        }
+        if self.config.vsock.is_some() {
+            return Err(Error::Config(
+                "virtio-vsock requires MicroVm::run_with_backends with a live VsockBackend",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Boots and runs the virtual machine using WASI stdout for console output.
+    ///
+    /// Fails fast if `virtio-net` or `virtio-vsock` is enabled without a live
+    /// backend; supply backends via [`Self::run_with_backends`].
     pub async fn run(&self) -> Result<ExitReason> {
+        self.validate_default_run_backends()?;
+        self.run_with_backends(
+            StdoutConsoleSink,
+            UnattachedNetBackend,
+            UnattachedVsockBackend,
+        )
+        .await
+    }
+
+    /// Boots and runs the virtual machine with caller-supplied console, network,
+    /// and vsock backends (zero `dyn` dispatch).
+    pub async fn run_with_backends<S, N, V>(
+        &self,
+        mut console_sink: S,
+        mut net_backend: N,
+        mut vsock_backend: V,
+    ) -> Result<ExitReason>
+    where
+        S: ConsoleSink,
+        N: NetBackend,
+        V: VsockBackend,
+    {
         let vm = Vm::create(self.config.memory_bytes)?;
         let memory = vm.allocate_memory(
             RAM_BASE,
@@ -639,9 +709,6 @@ impl MicroVm {
             .await
             .map_err(|_| Error::ChannelClosed)?;
 
-        let mut console_sink = StdoutConsoleSink;
-        let mut net_backend = ChannelNetBackend::default();
-        let mut vsock_backend = ChannelVsockBackend::rejecting_unknown_ports();
         let mut input = VecDeque::new();
         let mut input_waiting = false;
 
@@ -878,7 +945,9 @@ mod tests {
     use super::*;
     use crate::virtio::fs::backend::HostFsBackend;
     use crate::virtio::fs::fuse::*;
+    use crate::virtio::net::ChannelNetBackend;
     use crate::virtio::test_support::*;
+    use crate::virtio::vsock::ChannelVsockBackend;
     use crate::virtio::{DRIVER_OK, VirtioModel};
     use helios_api::hv::{IoWidth, IoWrite, IrqLevel};
     use std::cell::RefCell;
@@ -941,6 +1010,29 @@ mod tests {
         assert_eq!(cfg.fs_shares.len(), 2);
         assert_eq!(cfg.fs_shares[0].tag, ROOTFS_TAG);
         assert_eq!(cfg.fs_shares[1].tag, "work");
+
+        // MicroVm::run() fails fast if net or vsock has no live backend.
+        let vm_with_net = MicroVm::from_config(cfg);
+        assert!(matches!(
+            vm_with_net.validate_default_run_backends(),
+            Err(Error::Config(_))
+        ));
+        let vm_with_vsock = MicroVm::builder()
+            .kernel("/host/Image")
+            .initramfs("/host/initramfs.gz")
+            .virtio_vsock(VirtioVsockConfig::new(5).unwrap())
+            .build_vm()
+            .unwrap();
+        assert!(matches!(
+            vm_with_vsock.validate_default_run_backends(),
+            Err(Error::Config(_))
+        ));
+        let vm_plain = MicroVm::builder()
+            .kernel("/host/Image")
+            .initramfs("/host/initramfs.gz")
+            .build_vm()
+            .unwrap();
+        assert!(vm_plain.validate_default_run_backends().is_ok());
 
         // Duplicate tags rejected.
         assert!(

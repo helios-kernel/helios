@@ -45,6 +45,14 @@ impl VirtioModel for BlockModel {
     const FEATURES: u64 = VERSION_1 | VIRTIO_BLK_F_RO;
     const REQUIRED: u64 = VERSION_1;
 
+    fn features(&self) -> u64 {
+        if self.read_only {
+            VERSION_1 | VIRTIO_BLK_F_RO
+        } else {
+            VERSION_1
+        }
+    }
+
     fn queues(&self) -> &[Queue] {
         &self.queues
     }
@@ -174,6 +182,44 @@ mod tests {
             self.0.borrow_mut()[start..start + bytes.len()].copy_from_slice(&bytes);
             Ok(())
         }
+    }
+
+    #[test]
+    fn block_advertises_ro_feature_only_when_read_only() {
+        use helios_api::hv::{IoAccess, IoWrite};
+        let ram = test_ram(4096);
+        let mut rw = VirtioBlock::block(VirtioSlot::at(1).unwrap(), 8, false);
+        let mut ro = VirtioBlock::block(VirtioSlot::at(1).unwrap(), 8, true);
+
+        let low_rw = rw
+            .mmio_access(0x010, IoAccess::Read(IoWidth::Dword), &ram)
+            .unwrap();
+        let low_ro = ro
+            .mmio_access(0x010, IoAccess::Read(IoWidth::Dword), &ram)
+            .unwrap();
+        assert_eq!(low_rw & VIRTIO_BLK_F_RO, 0);
+        assert_ne!(low_ro & VIRTIO_BLK_F_RO, 0);
+
+        // Negotiating VIRTIO_BLK_F_RO on an RW disk must fail FEATURES_OK.
+        let write_dw = |v: u64| {
+            IoAccess::Write(IoWrite {
+                width: IoWidth::Dword,
+                value: v,
+            })
+        };
+        rw.mmio_access(0x024, write_dw(0), &ram).unwrap();
+        rw.mmio_access(0x020, write_dw(VIRTIO_BLK_F_RO), &ram)
+            .unwrap();
+        rw.mmio_access(0x024, write_dw(1), &ram).unwrap();
+        rw.mmio_access(0x020, write_dw(1), &ram).unwrap();
+        rw.mmio_access(0x070, write_dw(u64::from(super::super::FEATURES_OK)), &ram)
+            .unwrap();
+        assert_eq!(
+            rw.mmio_access(0x070, IoAccess::Read(IoWidth::Dword), &ram)
+                .unwrap()
+                & u64::from(super::super::FEATURES_OK),
+            0
+        );
     }
 
     #[test]

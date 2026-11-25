@@ -28,6 +28,7 @@ use crate::error::{Error, Result};
 pub const EPERM: i32 = 1;
 pub const ENOENT: i32 = 2;
 pub const EIO: i32 = 5;
+pub const ENXIO: i32 = 6;
 pub const EBADF: i32 = 9;
 pub const ENOMEM: i32 = 12;
 pub const EACCES: i32 = 13;
@@ -1021,9 +1022,16 @@ impl FsBackend for HostFsBackend {
         if let Some(t) = to_sys(mtime) {
             times = times.set_modified(t);
         }
-        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&full) {
-            file.set_times(times).map_err(map_io_error)?;
-        }
+        let meta = std::fs::symlink_metadata(&full).map_err(map_io_error)?;
+        let file = if meta.is_dir() {
+            std::fs::File::open(&full).map_err(map_io_error)?
+        } else {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&full)
+                .map_err(map_io_error)?
+        };
+        file.set_times(times).map_err(map_io_error)?;
         Ok(())
     }
 
@@ -1104,6 +1112,7 @@ impl FsBackend for HostFsBackend {
 
     async fn read_dir(&self, path: &[String]) -> FsResult<Vec<FsDirEntry>> {
         let full = self.resolve_confined(path)?;
+        self.verify_not_escaping_symlink(&full)?;
         let iter = std::fs::read_dir(&full).map_err(map_io_error)?;
         let mut entries = Vec::new();
         for entry in iter {
