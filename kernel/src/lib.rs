@@ -164,8 +164,8 @@ pub use input::{
 };
 pub use inspect::{
     ComponentPublication, DEFAULT_INSPECT_LIMIT, INSPECT_FORMAT_VERSION, INSPECT_HEADER_BYTES,
-    INSPECT_HEADER_MAGIC, InspectEntry, InspectPublication, InspectPublishError, InspectRegistry,
-    InspectSnapshot, InspectValue, KernelTelemetrySnapshot, MAX_BLOB_VALUE_BYTES,
+    INSPECT_HEADER_MAGIC, InspectEntry, InspectNamespace, InspectPublication, InspectPublishError,
+    InspectRegistry, InspectSnapshot, InspectValue, KernelTelemetrySnapshot, MAX_BLOB_VALUE_BYTES,
     MAX_COMPONENT_ENTRIES, MAX_INSPECT_LIMIT, MAX_INSPECT_SPAN_BYTES, MAX_PUBLICATION_NAME_BYTES,
     MAX_PUBLICATIONS_PER_INSTANCE, MAX_RELATIVE_PATH_BYTES, MAX_SEQLOCK_RETRIES,
     MAX_TEXT_VALUE_BYTES, PublicationStatus, emit_kernel_entries, is_valid_publication_name,
