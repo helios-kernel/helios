@@ -9,9 +9,9 @@ use zrip_decode::streaming::FrameDecoder;
 use crate::reference::Digest;
 use crate::spec::LayerCompression;
 
-/// Upper bound on uncompressed bytes yielded by a single zstd layer (4 GiB on 64-bit,
+/// Upper bound on uncompressed bytes yielded by a single layer (4 GiB on 64-bit,
 /// capped to 1 GiB on 32-bit `wasm32-wasip3`).
-const MAX_ZSTD_LAYER_BYTES: usize = {
+pub const MAX_LAYER_BYTES: usize = {
     #[cfg(target_pointer_width = "32")]
     {
         1024 * 1024 * 1024 // 1 GiB
@@ -22,34 +22,95 @@ const MAX_ZSTD_LAYER_BYTES: usize = {
     }
 };
 
-/// Streaming layer decoder over any `std::io::Read` source.
-pub enum LayerDecoder<R: Read> {
+/// Typed error attached to [`io::Error`] when a layer stream exceeds its uncompressed byte limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("uncompressed layer exceeds maximum size of {limit} bytes")]
+pub struct LayerSizeLimitError {
+    pub limit: u64,
+}
+
+enum LayerDecoderInner<R: Read> {
     None(R),
     Gzip(Box<MultiGzDecoder<R>>),
     Zstd(Box<FrameDecoder<R>>),
 }
 
+/// Streaming layer decoder over any `std::io::Read` source, bounded by [`MAX_LAYER_BYTES`].
+pub struct LayerDecoder<R: Read> {
+    inner: LayerDecoderInner<R>,
+    bytes_read: u64,
+    max_bytes: u64,
+}
+
 impl<R: Read> LayerDecoder<R> {
-    /// Wrap `reader` with the streaming decompressor matching `compression`.
+    /// Wrap `reader` with the streaming decompressor matching `compression`, bounded by [`MAX_LAYER_BYTES`].
     pub fn new(reader: R, compression: LayerCompression) -> Self {
-        match compression {
-            LayerCompression::None => Self::None(reader),
-            LayerCompression::Gzip => Self::Gzip(Box::new(MultiGzDecoder::new(reader))),
-            LayerCompression::Zstd => Self::Zstd(Box::new(FrameDecoder::with_limit(
-                reader,
-                MAX_ZSTD_LAYER_BYTES,
-            ))),
+        Self::with_limit(reader, compression, MAX_LAYER_BYTES)
+    }
+
+    /// Wrap `reader` with the streaming decompressor matching `compression`, enforcing an explicit
+    /// `max_bytes` uncompressed output limit across all compression formats.
+    pub fn with_limit(reader: R, compression: LayerCompression, max_bytes: usize) -> Self {
+        let inner = match compression {
+            LayerCompression::None => LayerDecoderInner::None(reader),
+            LayerCompression::Gzip => {
+                LayerDecoderInner::Gzip(Box::new(MultiGzDecoder::new(reader)))
+            }
+            LayerCompression::Zstd => {
+                LayerDecoderInner::Zstd(Box::new(FrameDecoder::with_limit(reader, max_bytes)))
+            }
+        };
+        Self {
+            inner,
+            bytes_read: 0,
+            max_bytes: max_bytes as u64,
+        }
+    }
+
+    fn read_inner(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match &mut self.inner {
+            LayerDecoderInner::None(inner) => inner.read(buf),
+            LayerDecoderInner::Gzip(inner) => inner.read(buf),
+            LayerDecoderInner::Zstd(inner) => inner.read(buf),
         }
     }
 }
 
 impl<R: Read> Read for LayerDecoder<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::None(inner) => inner.read(buf),
-            Self::Gzip(inner) => inner.read(buf),
-            Self::Zstd(inner) => inner.read(buf),
+        if buf.is_empty() {
+            return Ok(0);
         }
+        let remaining = self.max_bytes.saturating_sub(self.bytes_read);
+        if remaining == 0 {
+            let mut probe = [0u8; 1];
+            let n = self.read_inner(&mut probe)?;
+            if n == 0 {
+                return Ok(0);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                LayerSizeLimitError {
+                    limit: self.max_bytes,
+                },
+            ));
+        }
+
+        let max_read = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        let cap = buf.len().min(max_read);
+        let n = self.read_inner(&mut buf[..cap])?;
+        if n as u64 > remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                LayerSizeLimitError {
+                    limit: self.max_bytes,
+                },
+            ));
+        }
+        self.bytes_read += n as u64;
+        Ok(n)
     }
 }
 
@@ -142,5 +203,49 @@ mod tests {
         assert_eq!(zst_out, payload);
         assert_eq!(zst_len, payload.len() as u64);
         assert_eq!(zst_diff_id, expected_digest);
+    }
+
+    #[test]
+    fn enforces_byte_limit_across_none_gzip_and_zstd() {
+        let limit = 4096;
+        let exact = vec![0x5Au8; limit];
+        let over = vec![0x5Au8; limit + 1];
+
+        let mut gz_exact_enc = GzEncoder::new(Vec::new(), Compression::default());
+        gz_exact_enc.write_all(&exact).unwrap();
+        let gz_exact = gz_exact_enc.finish().unwrap();
+
+        let mut gz_bomb_enc = GzEncoder::new(Vec::new(), Compression::default());
+        gz_bomb_enc.write_all(&vec![0u8; 256 * 1024]).unwrap();
+        let gz_bomb = gz_bomb_enc.finish().unwrap();
+
+        let zst_exact = zrip_encode::compress(&exact, 1).unwrap();
+        let zst_over = zrip_encode::compress(&over, 1).unwrap();
+
+        for (compression, exact_bytes, over_bytes) in [
+            (LayerCompression::None, exact.as_slice(), over.as_slice()),
+            (
+                LayerCompression::Gzip,
+                gz_exact.as_slice(),
+                gz_bomb.as_slice(),
+            ),
+            (
+                LayerCompression::Zstd,
+                zst_exact.as_slice(),
+                zst_over.as_slice(),
+            ),
+        ] {
+            let mut ok_out = Vec::new();
+            LayerDecoder::with_limit(io::Cursor::new(exact_bytes), compression, limit)
+                .read_to_end(&mut ok_out)
+                .expect("exact limit payload should succeed");
+            assert_eq!(ok_out.len(), limit);
+
+            let mut too_big = Vec::new();
+            let err = LayerDecoder::with_limit(io::Cursor::new(over_bytes), compression, limit)
+                .read_to_end(&mut too_big)
+                .expect_err("oversized payload must be cut off");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
     }
 }
