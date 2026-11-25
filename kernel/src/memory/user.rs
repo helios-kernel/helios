@@ -46,8 +46,9 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::future::Future;
+use core::ops::Range;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use arrayvec::ArrayVec;
 use crossbeam_utils::CachePadded;
@@ -57,6 +58,8 @@ use helios_hal::pmm::{
     FrameAllocError, FrameAllocStats, PhysFrame, PhysFrameAllocator, PhysFrameRange,
 };
 
+use crate::exec::{ProgressMark, ProgressSignal};
+use crate::io::{ChunkSource, LentChunk};
 use crate::memory::frame_pool::FramePool;
 use crate::memory::frame_slab::FrameSlabCache;
 use crate::memory::irq_safe::IrqSafeMutex;
@@ -82,6 +85,17 @@ pub struct UserMemoryPool {
     /// sits on its node, and the heap grows from that node's memory
     /// order.
     bootstrap: ProcessorId,
+    /// The lowest address and one past the highest address of the regions
+    /// [`Self::new`] was given: every block the pool lends lies in between.
+    span_start: usize,
+    span_end: usize,
+    /// A borrower was refused a chunk and waits for memory to come back,
+    /// and nothing has come back since. Written by a refused borrower
+    /// (`want_chunk`) and cleared by the one free that wins the `swap`.
+    /// Alone on its line: every free on every processor reads it.
+    chunk_wanted: CachePadded<AtomicBool>,
+    /// Raised past a waiter's mark by the free that clears `chunk_wanted`.
+    returned_signal: ProgressSignal,
 }
 
 /// One node's share of the pool.
@@ -254,6 +268,8 @@ impl UserMemoryPool {
         };
         let frame_slab = FrameSlabCache::new(&locality, &arenas, &buddies);
         let off_node = PerProcessor::build(&locality, &arenas, &buddies, |_, _| AtomicU64::new(0));
+        let span_start = runs.iter().map(|run| run.start).min().unwrap_or(0);
+        let span_end = runs.iter().map(|run| run.end).max().unwrap_or(0);
         Self {
             nodes,
             frame_slab,
@@ -261,6 +277,58 @@ impl UserMemoryPool {
             arenas,
             locality,
             bootstrap,
+            span_start,
+            span_end,
+            chunk_wanted: CachePadded::new(AtomicBool::new(false)),
+            returned_signal: ProgressSignal::new(),
+        }
+    }
+
+    /// The kernel addresses every block the pool lends lies in.
+    pub fn span(&self) -> Range<usize> {
+        self.span_start..self.span_end
+    }
+
+    /// After a refused [`Self::lend_chunk`]: marks the pool wanted, so the
+    /// next free raises the return signal, and samples that signal.
+    ///
+    /// The caller lends once more and only if that is refused too parks on
+    /// [`Self::chunk_returned`] with the mark. Wait-free.
+    ///
+    /// Needs no fence, unlike an arena's `want_space`. The lend takes each
+    /// node's buddy lock, and on failure each frame-slab shard's lock in
+    /// turn (`allocate_block`), and every free runs inside one of those
+    /// locks before the check of `chunk_wanted` that follows it (see
+    /// [`Self::note_returned`]). Either the free's section precedes the
+    /// lend's on that lock, and the lend sees the memory; or the lend's
+    /// section precedes the free's, the flag store precedes the lend, and
+    /// the lock's release/acquire hands it to the free, whose check then
+    /// sees it.
+    pub fn want_chunk(&self) -> ProgressMark {
+        let mark = self.returned_signal.mark();
+        self.chunk_wanted.store(true, Ordering::Relaxed);
+        mark
+    }
+
+    /// Resolves once memory came back to the pool after `mark`.
+    ///
+    /// Resolving says a lend is worth asking for again, not that it will
+    /// succeed.
+    pub fn chunk_returned(&self, mark: ProgressMark) -> impl Future<Output = ()> + Send + '_ {
+        self.returned_signal.changed(mark)
+    }
+
+    /// The gate at the end of every free: raises the return signal when a
+    /// borrower waits for memory.
+    ///
+    /// One relaxed load of a line only a refused borrower writes. Wait-free
+    /// without a waiter, and otherwise one interrupt-safe broadcast, so it
+    /// is safe in an interrupt handler on any processor.
+    fn note_returned(&self) {
+        if self.chunk_wanted.load(Ordering::Relaxed)
+            && self.chunk_wanted.swap(false, Ordering::AcqRel)
+        {
+            self.returned_signal.signal();
         }
     }
 
@@ -285,13 +353,14 @@ impl UserMemoryPool {
             .unwrap_or_else(|| panic!("node {} owns user memory but has no pool", node.index()))
     }
 
-    /// Hands `bytes` of the pool to the kernel heap, for good.
+    /// Lends `bytes` of the pool to a kernel owner that keeps it.
     ///
     /// This is the run-time half of the boot memory policy: the pool is
     /// seeded with everything the machine has and the kernel heap takes
     /// what it turns out to need out of it, rather than both guessing
-    /// their share at boot. See [`super::policy`] for why the transfer
-    /// is one-way.
+    /// their share at boot. See [`super::policy`] for why the heap's
+    /// transfer is one-way. A lender that can give a block back, such as
+    /// a device's DMA arena, returns it with [`Self::take_back`].
     ///
     /// The kernel heap is one heap for the whole machine, so the block
     /// comes from the bootstrap processor's memory order — where the
@@ -303,26 +372,46 @@ impl UserMemoryPool {
     ///
     /// `bytes` must be a power of two, and the block comes back aligned
     /// to its own size, so the pool loses one buddy rather than a
-    /// straddling pair.
+    /// straddling pair. The result is the block's `[start, end)` range.
     ///
     /// Called from inside the global allocator, so it must not itself
     /// allocate on the kernel heap — which is why it goes straight to a
     /// node's buddy, skipping both the free-page reporting check and the
-    /// frame slab.
-    pub(crate) fn lend_to_kernel_heap(&self, bytes: usize) -> Option<(usize, usize)> {
+    /// frame slab. The block's contents are unspecified: memory the pool
+    /// showed to a free-page consumer may have been discarded, and a
+    /// lender zeroes what it hands on.
+    pub(crate) fn lend_chunk(&self, bytes: usize) -> Option<(usize, usize)> {
         debug_assert!(bytes.is_power_of_two(), "a lend is one buddy block");
         let size = buddy_allocation_size(Layout::from_size_align(bytes, bytes).ok()?);
         let home = self.locality.node_of(self.bootstrap);
         self.locality.memory_order(home).iter().find_map(|&node| {
             let pool = self.node_pool(node)?;
             let ptr = self.allocate_block(node, pool, size)?;
-            // The node never sees this memory again, so it must stop
-            // counting towards the frame-slab capacity the node sizes
-            // from its own total.
+            // While lent, the memory must stop counting towards the
+            // frame-slab capacity the node sizes from its own total.
             pool.total_bytes.fetch_sub(size, Ordering::Release);
             let start = ptr.as_ptr() as usize;
             Some((start, start + size))
         })
+    }
+
+    /// Takes back a block [`Self::lend_chunk`] lent, as the pool's free
+    /// memory again.
+    ///
+    /// `start..end` is exactly the range the lend returned, and nothing
+    /// refers to it any more.
+    pub(crate) fn take_back(&self, start: usize, end: usize) {
+        let bytes = end - start;
+        debug_assert!(bytes.is_power_of_two(), "a lend is one buddy block");
+        // SAFETY: `start..end` is a buddy block `lend_chunk` lent out and
+        // the lender no longer uses.
+        unsafe { return_to_nodes(&self.nodes, &self.locality, start, bytes) };
+        self.note_returned();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lend_to_kernel_heap(&self, bytes: usize) -> Option<(usize, usize)> {
+        self.lend_chunk(bytes)
     }
 
     /// Runs `act` with the home node's buddy heap lock held, as another
@@ -641,12 +730,50 @@ impl UserMemoryPool {
                 .frame_slab
                 .deallocate_on(processor, node, ptr, total_frames)
             {
+                self.note_returned();
                 return;
             }
         }
         pool.heap.with(|heap| unsafe {
             heap.deallocate(ptr, buddy_allocation_size(layout));
         });
+        self.note_returned();
+    }
+}
+
+/// The user memory pool as an arena's [`ChunkSource`]: a chunk is one buddy
+/// block lent by [`UserMemoryPool::lend_chunk`] and given back by
+/// [`UserMemoryPool::take_back`].
+#[derive(Clone, Copy)]
+pub struct UserPoolChunks(&'static UserMemoryPool);
+
+impl UserPoolChunks {
+    pub const fn new(pool: &'static UserMemoryPool) -> Self {
+        Self(pool)
+    }
+}
+
+impl ChunkSource for UserPoolChunks {
+    fn lend(&self, bytes: usize) -> Option<LentChunk> {
+        let (start, end) = self.0.lend_chunk(bytes)?;
+        Some(LentChunk::new(start, end - start))
+    }
+
+    fn take_back(&self, chunk: LentChunk) {
+        self.0
+            .take_back(chunk.start(), chunk.start() + chunk.bytes());
+    }
+
+    fn span(&self) -> Range<usize> {
+        self.0.span()
+    }
+
+    fn want_chunk(&self) -> ProgressMark {
+        self.0.want_chunk()
+    }
+
+    fn chunk_returned(&self, mark: ProgressMark) -> impl Future<Output = ()> + Send + '_ {
+        self.0.chunk_returned(mark)
     }
 }
 
@@ -894,9 +1021,10 @@ pub(crate) fn user_pool_available_bytes() -> usize {
     installed_user_memory_pool().map_or(0, |pool| pool.stats().available_bytes())
 }
 
-/// See [`UserMemoryPool::lend_to_kernel_heap`].
+/// The kernel heap's lend, which it never gives back. See
+/// [`UserMemoryPool::lend_chunk`].
 pub(crate) fn lend_user_memory_to_kernel_heap(bytes: usize) -> Option<(usize, usize)> {
-    installed_user_memory_pool()?.lend_to_kernel_heap(bytes)
+    installed_user_memory_pool()?.lend_chunk(bytes)
 }
 
 /// See [`UserMemoryPool::largest_servable_bytes`].
@@ -1707,6 +1835,114 @@ mod tests {
             node_1.total_bytes.load(Ordering::Acquire),
             before - 64 * 1024
         );
+    }
+
+    /// A lender that gives its block back leaves the pool as it found it:
+    /// the buddy block is free again and the frame-slab capacity, which
+    /// the lend subtracted, is restored.
+    #[test]
+    fn a_lent_chunk_comes_back_as_the_pools_free_memory() {
+        let pool = pool(4 * 1024 * 1024);
+        let before = pool.stats();
+        let node_0 = pool.owning_pool(NodeId::FIRST);
+        let capacity = node_0.total_bytes.load(Ordering::Acquire);
+        let chunk_bytes = 64 * 1024;
+
+        let (start, end) = pool.lend_chunk(chunk_bytes).expect("the pool has room");
+        assert_eq!(end - start, chunk_bytes);
+        assert_eq!(start % chunk_bytes, 0, "a lend is aligned to its own size");
+        assert_eq!(
+            pool.stats().allocated_bytes,
+            before.allocated_bytes + chunk_bytes,
+            "a lent chunk is out of the pool's free memory"
+        );
+        assert_eq!(
+            node_0.total_bytes.load(Ordering::Acquire),
+            capacity - chunk_bytes,
+            "a lent chunk is out of the frame-slab capacity"
+        );
+
+        pool.take_back(start, end);
+        assert_eq!(pool.stats(), before);
+        assert_eq!(node_0.total_bytes.load(Ordering::Acquire), capacity);
+        assert!(
+            pool.lend_chunk(chunk_bytes).is_some(),
+            "the returned block serves the next lend"
+        );
+    }
+
+    #[test]
+    fn a_wanted_chunk_is_signalled_by_the_next_free_and_only_then() {
+        let pool = pool(4 * 1024 * 1024);
+        let frame = Layout::from_size_align(PhysFrame::SIZE, PhysFrame::SIZE).expect("frame");
+        let run = Layout::from_size_align(4 * PhysFrame::SIZE, PhysFrame::SIZE).expect("run");
+        let frames = [
+            pool.allocate_zeroed(frame).expect("a frame"),
+            pool.allocate_zeroed(frame).expect("a frame"),
+            pool.allocate_zeroed(frame).expect("a frame"),
+        ];
+        let blocks = [
+            pool.allocate_zeroed(run).expect("a run"),
+            pool.allocate_zeroed(run).expect("a run"),
+        ];
+
+        // Nobody wants a chunk: a free raises nothing.
+        let start = pool.returned_signal.mark();
+        pool.deallocate_bytes(frames[0], frame);
+        assert_eq!(pool.returned_signal.mark(), start, "a free with no waiter");
+
+        // One refused borrower: the next free, a slab-cached single frame,
+        // raises the signal once, and a second free finds the flag clear.
+        let mark = pool.want_chunk();
+        assert_eq!(mark, start);
+        pool.deallocate_bytes(frames[1], frame);
+        assert_eq!(
+            pool.frame_slab.cached_bytes(NodeId::FIRST),
+            2 * PhysFrame::SIZE,
+            "the frames were cached by the slab, not freed to the buddy heap"
+        );
+        assert_eq!(
+            pool.returned_signal.mark().generation(),
+            mark.generation() + 1
+        );
+        pool.deallocate_bytes(frames[2], frame);
+        assert_eq!(
+            pool.returned_signal.mark().generation(),
+            mark.generation() + 1,
+            "one signal per wait"
+        );
+
+        // The same for a free that goes to the buddy heap.
+        let mark = pool.want_chunk();
+        pool.deallocate_bytes(blocks[0], run);
+        assert_eq!(
+            pool.returned_signal.mark().generation(),
+            mark.generation() + 1
+        );
+        pool.deallocate_bytes(blocks[1], run);
+        assert_eq!(
+            pool.returned_signal.mark().generation(),
+            mark.generation() + 1
+        );
+    }
+
+    #[test]
+    fn the_pool_serves_as_an_arenas_chunk_source() {
+        let pool: &'static UserMemoryPool = Box::leak(Box::new(pool(4 * 1024 * 1024)));
+        let source = UserPoolChunks::new(pool);
+        let chunk_bytes = 64 * 1024;
+        let span = source.span();
+        let chunk = source.lend(chunk_bytes).expect("the pool has room");
+        assert_eq!(chunk.bytes(), chunk_bytes);
+        assert_eq!(chunk.start() % chunk_bytes, 0);
+        assert!(
+            span.contains(&chunk.start()) && span.contains(&(chunk.start() + chunk_bytes - 1)),
+            "a lent chunk lies inside the span {span:x?}"
+        );
+        let mark = source.want_chunk();
+        source.take_back(chunk);
+        block_on(source.chunk_returned(mark));
+        assert!(source.lend(chunk_bytes).is_some());
     }
 
     /// A run handed back through `deallocate_reported` is one whose

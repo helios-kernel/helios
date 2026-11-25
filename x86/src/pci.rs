@@ -13,7 +13,10 @@ use core::ptr::NonNull;
 use helios_hal::io::{IoError, IoResult};
 use helios_virtio::{DeviceType, PciMmioMapper};
 use pci_types::capability::PciCapability;
-use pci_types::{Bar, CommandRegister, ConfigRegionAccess, EndpointHeader, PciAddress, PciHeader};
+use pci_types::{
+    Bar, CommandRegister, ConfigRegionAccess, EndpointHeader, PciAddress, PciHeader,
+    PciPciBridgeHeader,
+};
 use x86_64::instructions::port::{PortReadOnly, PortWriteOnly};
 
 const PCI_CONFIG_ADDRESS_PORT: u16 = 0x0cf8;
@@ -152,44 +155,75 @@ impl PciRoot {
         self.access
     }
 
-    /// Every function present in segment 0.
-    ///
-    /// Buses are walked exhaustively rather than followed through
-    /// bridge secondary-bus registers: with a single configuration
-    /// segment the bus number alone addresses a function, and the walk
-    /// then covers devices behind bridges without the kernel having to
-    /// re-derive the firmware's bridge numbering.
+    /// Every function present in segment 0, discovered by walking root bus 0
+    /// and following PCI-to-PCI bridges.
     ///
     /// A slot is probed at function 0 alone unless that function is
     /// there and sets the multi-function bit of its header type: the PCI
     /// Local Bus Specification requires every device to implement
     /// function 0 and to set that bit when it implements any other, so
     /// an empty slot costs one configuration read instead of eight.
-    /// Under a hypervisor every one of those reads is a pair of port
-    /// accesses that exit to the device model.
-    fn functions(&self) -> impl Iterator<Item = PciAddress> + '_ {
-        (0..=u8::MAX).flat_map(move |bus| {
-            (0..PCI_MAX_DEVICES).flat_map(move |device| {
+    /// Following bridges visits only populated buses rather than all 256,
+    /// avoiding tens of thousands of hypervisor port-I/O exits at boot.
+    fn walk_functions(&self) -> Vec<PciAddress> {
+        let mut visited = [0_u64; 4];
+        let mut pending = Vec::new();
+        let mark_bus = |bus: u8, visited: &mut [u64; 4], pending: &mut Vec<u8>| {
+            let word = &mut visited[usize::from(bus / 64)];
+            let bit = 1_u64 << (bus % 64);
+            if *word & bit == 0 {
+                *word |= bit;
+                pending.push(bus);
+            }
+        };
+
+        // Always scan bus 0; if the host bridge at 00:00.0 is multi-function,
+        // each present function represents an additional root bus.
+        mark_bus(0, &mut visited, &mut pending);
+        let root_host = PciHeader::new(PciAddress::new(0, 0, 0, 0));
+        if root_host.id(self.access).0 != PCI_INVALID_VENDOR_ID
+            && root_host.has_multiple_functions(self.access)
+        {
+            for function in 1..PCI_MAX_FUNCTIONS {
+                let candidate = PciAddress::new(0, 0, 0, function);
+                if PciHeader::new(candidate).id(self.access).0 != PCI_INVALID_VENDOR_ID {
+                    mark_bus(function, &mut visited, &mut pending);
+                }
+            }
+        }
+
+        let mut found = Vec::new();
+        let mut cursor = 0;
+        while cursor < pending.len() {
+            let bus = pending[cursor];
+            cursor += 1;
+            for device in 0..PCI_MAX_DEVICES {
                 let first = PciAddress::new(0, bus, device, 0);
                 let header = PciHeader::new(first);
                 let (vendor_id, _) = header.id(self.access);
-                let functions = if vendor_id == PCI_INVALID_VENDOR_ID {
-                    0
-                } else if header.has_multiple_functions(self.access) {
+                if vendor_id == PCI_INVALID_VENDOR_ID {
+                    continue;
+                }
+                let function_count = if header.has_multiple_functions(self.access) {
                     PCI_MAX_FUNCTIONS
                 } else {
                     1
                 };
-                (0..functions).filter_map(move |function| {
-                    if function == 0 {
-                        return Some(first);
-                    }
+                for function in 0..function_count {
                     let address = PciAddress::new(0, bus, device, function);
-                    let (vendor_id, _) = PciHeader::new(address).id(self.access);
-                    (vendor_id != PCI_INVALID_VENDOR_ID).then_some(address)
-                })
-            })
-        })
+                    let header = PciHeader::new(address);
+                    if function != 0 && header.id(self.access).0 == PCI_INVALID_VENDOR_ID {
+                        continue;
+                    }
+                    found.push(address);
+                    if let Some(bridge) = PciPciBridgeHeader::from_header(header, self.access) {
+                        let secondary = bridge.secondary_bus_number(self.access);
+                        mark_bus(secondary, &mut visited, &mut pending);
+                    }
+                }
+            }
+        }
+        found
     }
 
     /// Every virtio function in segment 0, found by one walk of the bus.
@@ -199,7 +233,8 @@ impl PciRoot {
     /// classes the backend drives.
     pub(crate) fn virtio_functions(&self) -> VirtioFunctions {
         let functions = self
-            .functions()
+            .walk_functions()
+            .into_iter()
             .filter_map(|address| {
                 helios_virtio::virtio_pci_device_type(&self.access, address)
                     .map(|device_type| (address, device_type))
@@ -419,9 +454,21 @@ pub(crate) struct VirtioFunctions {
 }
 
 impl VirtioFunctions {
-    /// Locates the first modern virtio function of the requested type.
+    /// Locates the first modern virtio function of the requested type that
+    /// exposes an MSI-X capability.
     pub(crate) fn find_virtio_function(&self, device_type: DeviceType) -> Option<PciAddress> {
         self.find_virtio_functions(device_type).next()
+    }
+
+    /// Locates the first modern virtio function of the requested type,
+    /// regardless of whether it exposes an MSI-X capability.
+    ///
+    /// Used by drivers that poll ISR status instead of binding MSI-X
+    /// (`virtio-balloon-pci`).
+    pub(crate) fn find_virtio_function_any(&self, device_type: DeviceType) -> Option<PciAddress> {
+        self.functions.iter().find_map(|(address, function_type)| {
+            (*function_type == device_type).then_some(*address)
+        })
     }
 
     /// Every modern virtio function of the requested type, in bus order.

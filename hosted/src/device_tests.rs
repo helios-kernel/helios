@@ -21,7 +21,7 @@ use helios_kernel::{
 
 use crate::device::{
     HOSTED_DEVICE_INTERRUPT, HOSTED_DEVICE_NAME, device_address_space, device_registers,
-    hosted_device_grants, interrupt_controller_counts,
+    dma_quiesce_count, hosted_device_grants, interrupt_controller_counts,
 };
 use crate::vmm::host_mapping_granule;
 
@@ -332,8 +332,14 @@ fn a_ring_is_freed_only_after_the_device_lets_go() {
         "the device's run lives on"
     );
 
+    let quiesce_before = dma_quiesce_count();
     drop(lease);
 
+    assert_eq!(
+        dma_quiesce_count() - quiesce_before,
+        1,
+        "reclaiming the lease asks the platform to quiesce DMA before freeing the ring"
+    );
     // The direct translation makes the device address the run's own, so
     // freeing it again is how the test asks whether it is still held.
     assert_eq!(

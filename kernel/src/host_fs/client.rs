@@ -67,13 +67,14 @@ extern crate alloc;
 use alloc::borrow::ToOwned;
 use alloc::string::String;
 use alloc::vec::Vec;
-use bytes::BytesMut;
+use concurrent_queue::ConcurrentQueue;
 use core::future::Future;
+use core::ops::Deref;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use helios_hal::cpu::{Cpu, HardwarePerfCounters};
+use helios_hal::dma::BufResult;
 use helios_hal::fs::{Landed, NodeKind, WritePosition, WriteProgress};
 use helios_hal::io::IoError;
-use objectpool::{Pool, ReusableObject};
 use slab::Slab;
 use spin::Mutex as SpinMutex;
 use triomphe::Arc;
@@ -97,10 +98,11 @@ const P9_MIN_MSIZE: u32 = 8192;
 /// Subtracting it from the msize gives the payload a message may carry
 /// in either direction.
 const P9_MAX_FIXED_HEADER_BYTES: u32 = 23;
-/// Maximum capacity a returning request buffer is allowed to retain
-/// before it gets re-allocated. Caps memory pressure when a single
-/// large 9p TWRITE temporarily inflates a buffer.
-const P9_BUFFER_RETAINED_CAPACITY: usize = (P9_REQUESTED_MSIZE as usize).next_power_of_two();
+/// Capacity of every request and response buffer the transport lends
+/// this client: the largest message the session can ever carry, since
+/// the server never grants more than `P9_REQUESTED_MSIZE`. A transport
+/// buffer cannot grow, so it is sized once, up front.
+const P9_BUFFER_BYTES: usize = P9_REQUESTED_MSIZE as usize;
 const P9_VERSION: &str = "9P2000.L";
 const P9_NOTAG: u16 = u16::MAX;
 const P9_NOFID: u32 = u32::MAX;
@@ -163,7 +165,6 @@ const P9_RGETATTR_LEN: usize = 160;
 /// Where the `tag[2]` field of every message starts, after `size[4]
 /// type[1]`.
 const P9_TAG_OFFSET: usize = 5;
-const P9_DEFAULT_REQUEST_BODY_BYTES: usize = 256;
 const P9_TWRITE_FIXED_BODY_BYTES: usize = 4 + 8 + 4;
 /// Where a `Twrite`'s payload starts: the header, then `fid[4]
 /// offset[8] count[4]`.
@@ -248,15 +249,142 @@ pub trait HostFsTransport: Clone + Send + Sync + 'static {
     /// pipeline, and the buffers that feed it, from this.
     fn pipeline_depth(&self) -> usize;
 
-    /// Submits a fully-formed 9p Tmessage and resolves with the
-    /// reply. The request buffer is borrowed for the duration of the
-    /// future so that callers may pool and recycle it.
-    fn request<'a>(
-        &'a self,
-        bytes: &'a [u8],
-        response: &'a mut BytesMut,
+    /// A buffer the device can reach, of exactly `capacity` bytes. The
+    /// client builds each Tmessage in one and receives each Rmessage in
+    /// another, so a request is never copied between the client and the
+    /// device.
+    type Buffer: AsRef<[u8]> + AsMut<[u8]> + Send + Sync + 'static;
+
+    /// Allocates one transport buffer of `capacity` bytes.
+    fn buffer(&self, capacity: usize) -> Result<Self::Buffer, IoError>;
+
+    /// Submits the first `request_len` bytes of `request`, a fully-formed
+    /// 9p Tmessage, and resolves with the length of the reply the device
+    /// wrote at the start of `response`, together with both buffers as
+    /// `(request, response)`. The device may write at most `response_len`
+    /// bytes.
+    ///
+    /// Both buffers move into the request and belong to the device until
+    /// it returns the chain (see [`helios_hal::dma`]'s "Buffers a request
+    /// owns"). A request whose future is dropped mid-flight — a guest
+    /// that cancels a stream read, an instance killed in a host call —
+    /// leaves them with the device, which frees them when it completes;
+    /// they never reach the caller's pool while the device can still write
+    /// them.
+    fn request(
+        &self,
+        request: Self::Buffer,
+        request_len: usize,
+        response: Self::Buffer,
         response_len: usize,
-    ) -> impl Future<Output = Result<(), IoError>> + Send + 'a;
+    ) -> impl Future<Output = BufResult<usize, (Self::Buffer, Self::Buffer)>> + Send + '_;
+}
+
+/// Free transport buffers, parked for the next request.
+///
+/// Concurrency contract: the queue is lock-free; a buffer is taken by
+/// whichever task needs one and returned from any task's drop. It holds
+/// at most the transport's pipeline depth, the most buffers one
+/// direction can have in flight, so a returning buffer beyond that is
+/// freed. A buffer lent to the transport is not the pool's: it comes back
+/// only through the request that lent it, after the device let it go, and
+/// a request dropped mid-flight never returns it at all — the device's
+/// completion frees it and the pool allocates a fresh one on its next
+/// miss.
+struct BufferPool<Buffer> {
+    free: ConcurrentQueue<Buffer>,
+}
+
+impl<Buffer> BufferPool<Buffer> {
+    fn new(depth: usize) -> Self {
+        Self {
+            free: ConcurrentQueue::bounded(depth),
+        }
+    }
+}
+
+/// A buffer on loan from a [`BufferPool`]; it returns when dropped.
+struct Lease<Buffer> {
+    buffer: Option<Buffer>,
+    pool: Arc<BufferPool<Buffer>>,
+}
+
+impl<Buffer> Lease<Buffer> {
+    fn buffer(&self) -> &Buffer {
+        self.buffer
+            .as_ref()
+            .expect("a lease holds its buffer until dropped")
+    }
+
+    fn buffer_mut(&mut self) -> &mut Buffer {
+        self.buffer
+            .as_mut()
+            .expect("a lease holds its buffer until dropped")
+    }
+
+    /// The buffer itself, to lend to the transport. The pool no longer
+    /// knows it; [`Lease::returned`] puts it back on loan once the
+    /// transport hands it back.
+    fn into_buffer(mut self) -> Buffer {
+        self.buffer
+            .take()
+            .expect("a lease holds its buffer until dropped")
+    }
+
+    /// A buffer the transport handed back, on loan from `pool` again.
+    fn returned(buffer: Buffer, pool: &Arc<BufferPool<Buffer>>) -> Self {
+        Self {
+            buffer: Some(buffer),
+            pool: pool.clone(),
+        }
+    }
+}
+
+impl<Buffer> Drop for Lease<Buffer> {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            // A full pool drops the surplus buffer.
+            let _ = self.pool.free.push(buffer);
+        }
+    }
+}
+
+/// The `Rmessage` a request was answered with: the first `len` bytes of
+/// the response buffer, which goes back to the pool when this drops.
+struct P9Reply<Buffer: AsRef<[u8]>> {
+    lease: Lease<Buffer>,
+    len: usize,
+}
+
+impl<Buffer: AsRef<[u8]>> Deref for P9Reply<Buffer> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.lease.buffer().as_ref()[..self.len]
+    }
+}
+
+/// Appends to the body of the Tmessage being built in a transport
+/// buffer. A message that outgrows the buffer is remembered and
+/// reported once, by the exchange that sent it, rather than at every
+/// field.
+struct MessageWriter<'a> {
+    bytes: &'a mut [u8],
+    len: usize,
+    overflowed: bool,
+}
+
+impl MessageWriter<'_> {
+    fn extend_from_slice(&mut self, data: &[u8]) {
+        let end = self.len.saturating_add(data.len());
+        match self.bytes.get_mut(self.len..end) {
+            Some(room) => {
+                room.copy_from_slice(data);
+                self.len = end;
+            }
+            None => self.overflowed = true,
+        }
+    }
 }
 
 /// An established 9p session: what the server granted and the fid every
@@ -616,8 +744,8 @@ struct ClientInner<Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
     tags: HandleAllocator,
     fids: HandleAllocator,
     cache: HostFsCache,
-    request_buffers: Pool<BytesMut>,
-    response_buffers: Pool<BytesMut>,
+    request_buffers: Arc<BufferPool<Transport::Buffer>>,
+    response_buffers: Arc<BufferPool<Transport::Buffer>>,
     /// How many request buffers the pool keeps: the transport's pipeline
     /// depth, and the most frames one round of a staged write holds.
     request_depth: usize,
@@ -667,8 +795,8 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
                 ),
                 fids: HandleAllocator::new(depth, P9_NOFID, "fid", "9p fid space exhausted"),
                 cache: HostFsCache::new(profiles.clone()),
-                request_buffers: Pool::bounded(depth, BytesMut::new, reset_p9_buffer),
-                response_buffers: Pool::bounded(depth, BytesMut::new, reset_p9_buffer),
+                request_buffers: Arc::new(BufferPool::new(depth)),
+                response_buffers: Arc::new(BufferPool::new(depth)),
                 request_depth: depth,
                 abandoned: AbandonedFids {
                     pending: AtomicBool::new(false),
@@ -679,6 +807,23 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
                 profiles,
             }),
         }
+    }
+
+    /// A message buffer from `pool`, or a fresh one from the transport
+    /// when none is parked.
+    fn lease(
+        &self,
+        pool: &Arc<BufferPool<Transport::Buffer>>,
+    ) -> Result<Lease<Transport::Buffer>, HostFsError> {
+        let buffer = match pool.free.pop() {
+            Ok(buffer) => buffer,
+            Err(_) => self
+                .inner
+                .transport
+                .buffer(P9_BUFFER_BYTES)
+                .map_err(HostFsError::Transport)?,
+        };
+        Ok(Lease::returned(buffer, pool))
     }
 
     /// How the session's caches have been serving the kernel.
@@ -900,7 +1045,6 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
             .exchange(
                 P9_NOTAG,
                 P9Message::Version,
-                P9_DEFAULT_REQUEST_BODY_BYTES,
                 |body| {
                     push_u32(body, P9_REQUESTED_MSIZE);
                     push_string(body, dialect);
@@ -930,24 +1074,12 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
     async fn transact(
         &self,
         ty: P9Message,
-        body: impl FnOnce(&mut BytesMut),
+        body: impl FnOnce(&mut MessageWriter<'_>),
         response_len: usize,
-    ) -> Result<ReusableObject<BytesMut>, HostFsError> {
-        self.transact_with_capacity(ty, P9_DEFAULT_REQUEST_BODY_BYTES, body, response_len)
-            .await
-    }
-
-    async fn transact_with_capacity(
-        &self,
-        ty: P9Message,
-        body_capacity: usize,
-        body: impl FnOnce(&mut BytesMut),
-        response_len: usize,
-    ) -> Result<ReusableObject<BytesMut>, HostFsError> {
+    ) -> Result<P9Reply<Transport::Buffer>, HostFsError> {
         let tag = self.inner.tags.allocate()?;
         let value = u16::try_from(tag.value()).expect("a 9p tag is bounded below NOTAG");
-        self.exchange(value, ty, body_capacity, body, response_len)
-            .await
+        self.exchange(value, ty, body, response_len).await
     }
 
     /// Encodes one Tmessage, hands it to the transport and validates the
@@ -962,21 +1094,28 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         &self,
         tag: u16,
         ty: P9Message,
-        body_capacity: usize,
-        body: impl FnOnce(&mut BytesMut),
+        body: impl FnOnce(&mut MessageWriter<'_>),
         response_len: usize,
-    ) -> Result<ReusableObject<BytesMut>, HostFsError> {
-        let mut request = self.inner.request_buffers.get_owned();
-        request.clear();
-        request.reserve(P9_HEADER_LEN + body_capacity);
-        request.extend_from_slice(&0_u32.to_le_bytes());
-        request.extend_from_slice(&[ty.wire()]);
-        request.extend_from_slice(&tag.to_le_bytes());
-        body(&mut request);
+    ) -> Result<P9Reply<Transport::Buffer>, HostFsError> {
+        let mut request = self.lease(&self.inner.request_buffers)?;
+        let mut writer = MessageWriter {
+            bytes: request.buffer_mut().as_mut(),
+            len: 0,
+            overflowed: false,
+        };
+        writer.extend_from_slice(&0_u32.to_le_bytes());
+        writer.extend_from_slice(&[ty.wire()]);
+        writer.extend_from_slice(&tag.to_le_bytes());
+        body(&mut writer);
+        if writer.overflowed {
+            return Err(HostFsError::Protocol("request too large"));
+        }
+        let request_len = writer.len;
         let size =
-            u32::try_from(request.len()).map_err(|_| HostFsError::Protocol("request too large"))?;
-        request[..4].copy_from_slice(&size.to_le_bytes());
-        self.send_frame(tag, ty, request, response_len).await
+            u32::try_from(request_len).map_err(|_| HostFsError::Protocol("request too large"))?;
+        request.buffer_mut().as_mut()[..4].copy_from_slice(&size.to_le_bytes());
+        self.send_frame(tag, ty, request, request_len, response_len)
+            .await
     }
 
     /// Hands a fully encoded Tmessage carrying `tag` to the transport and
@@ -986,17 +1125,50 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         &self,
         tag: u16,
         ty: P9Message,
-        request: ReusableObject<BytesMut>,
+        request: Lease<Transport::Buffer>,
+        request_len: usize,
         response_len: usize,
-    ) -> Result<ReusableObject<BytesMut>, HostFsError> {
-        let mut response = self.inner.response_buffers.get_owned();
+    ) -> Result<P9Reply<Transport::Buffer>, HostFsError> {
+        let response = self.lease(&self.inner.response_buffers)?;
         let submitted = self.profile_start();
-        self.inner
+        // Both buffers leave the pool for the length of the request: they
+        // are the device's until it hands them back, and a request dropped
+        // here leaves them with it.
+        let outcome = self
+            .inner
             .transport
-            .request(&request, &mut response, response_len)
-            .await
-            .map_err(HostFsError::Transport)?;
-        drop(request);
+            .request(
+                request.into_buffer(),
+                request_len,
+                response.into_buffer(),
+                response_len,
+            )
+            .await;
+        let (reply_len, response) = match outcome {
+            Ok((reply_len, (request, response))) => {
+                drop(Lease::returned(request, &self.inner.request_buffers));
+                (
+                    reply_len,
+                    Lease::returned(response, &self.inner.response_buffers),
+                )
+            }
+            Err(failure) => {
+                if let Some((request, response)) = failure.buffers {
+                    drop(Lease::returned(request, &self.inner.request_buffers));
+                    drop(Lease::returned(response, &self.inner.response_buffers));
+                }
+                return Err(HostFsError::Transport(failure.error));
+            }
+        };
+        if reply_len > response_len {
+            return Err(HostFsError::Protocol(
+                "reply longer than the buffer offered",
+            ));
+        }
+        let response = P9Reply {
+            lease: response,
+            len: reply_len,
+        };
         if response.len() < P9_HEADER_LEN {
             return Err(HostFsError::Protocol("response shorter than 9p header"));
         }
@@ -1074,7 +1246,6 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
                     parent_fid,
                     new_fid,
                     count,
-                    name_bytes,
                     segments.by_ref().take(usize::from(count)),
                 )
                 .await;
@@ -1098,20 +1269,17 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         }
     }
 
-    /// One `Twalk` of `count` elements totalling `name_bytes` encoded
-    /// bytes, which must all be walked.
+    /// One `Twalk` of `count` elements, which must all be walked.
     async fn walk_step<'a>(
         &self,
         parent_fid: u32,
         new_fid: u32,
         count: u16,
-        name_bytes: usize,
         names: impl Iterator<Item = P9Str<'a>>,
     ) -> Result<(), HostFsError> {
         let response = self
-            .transact_with_capacity(
+            .transact(
                 P9Message::Walk,
-                P9_TWALK_FIXED_LEN - P9_HEADER_LEN + name_bytes,
                 |body| {
                     push_u32(body, parent_fid);
                     push_u32(body, new_fid);
@@ -1515,7 +1683,10 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
                     staged_from: 0,
                     frames: Vec::with_capacity(self.inner.request_depth),
                 };
-                write.stage_round();
+                if let Err(error) = write.stage_round() {
+                    write.finish(false).await;
+                    return Err(error);
+                }
                 Ok(write)
             }
             Err(error) => {
@@ -2226,6 +2397,13 @@ fn p9_optional_timestamp(flag: u32, nanos: Option<u64>) -> (u32, u64, u64) {
     (flag, nanos / 1_000_000_000, nanos % 1_000_000_000)
 }
 
+/// One staged `Twrite` frame in a transport buffer: its leased buffer and
+/// total encoded frame length (header + payload).
+struct StagedWriteFrame<Buffer> {
+    buffer: Lease<Buffer>,
+    len: usize,
+}
+
 /// A host-share write staged as `Twrite` frames: the client's
 /// [`HostWrite`].
 ///
@@ -2253,7 +2431,7 @@ pub struct HostFsWrite<Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
     /// Where this round's bytes start, as an offset into the write.
     staged_from: usize,
     /// This round's frames, in write order.
-    frames: Vec<ReusableObject<BytesMut>>,
+    frames: Vec<StagedWriteFrame<Transport::Buffer>>,
 }
 
 /// A round of a [`HostFsWrite`] whose frames are filled.
@@ -2264,7 +2442,7 @@ pub struct FilledHostFsWrite<Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
 impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsWrite<Transport, CpuImpl> {
     /// Readies the frames of the round that starts at `staged_from`: the
     /// header of each `Twrite`, and a payload region of its length.
-    fn stage_round(&mut self) {
+    fn stage_round(&mut self) -> Result<(), HostFsError> {
         let chunk = self.session.payload_chunk();
         let fid = *self
             .fid
@@ -2277,27 +2455,35 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsWrite<Transport, Cp
             let count = (end - at).min(chunk);
             let offset = self.landed + at as u64;
             let frame_len = P9_HEADER_LEN + write_request_body_capacity(count);
-            let mut frame = self.client.inner.request_buffers.get_owned();
-            frame.clear();
-            frame.reserve(frame_len);
-            frame.extend_from_slice(
+            let mut frame = self.client.lease(&self.client.inner.request_buffers)?;
+            let mut writer = MessageWriter {
+                bytes: frame.buffer_mut().as_mut(),
+                len: 0,
+                overflowed: false,
+            };
+            writer.extend_from_slice(
                 &u32::try_from(frame_len)
                     .expect("a Twrite frame is bounded by the msize")
                     .to_le_bytes(),
             );
-            frame.extend_from_slice(&[P9Message::Write.wire()]);
+            writer.extend_from_slice(&[P9Message::Write.wire()]);
             // The tag is the sender's to fill in.
-            push_u16(&mut frame, P9_NOTAG);
-            push_u32(&mut frame, fid);
-            push_u64(&mut frame, offset);
+            push_u16(&mut writer, P9_NOTAG);
+            push_u32(&mut writer, fid);
+            push_u64(&mut writer, offset);
             push_u32(
-                &mut frame,
+                &mut writer,
                 u32::try_from(count).expect("a Twrite payload is bounded by the msize"),
             );
-            frame.resize(frame_len, 0);
-            self.frames.push(frame);
+            debug_assert!(!writer.overflowed && writer.len == P9_TWRITE_HEADER_LEN);
+            debug_assert!(frame_len <= frame.buffer().as_ref().len());
+            self.frames.push(StagedWriteFrame {
+                buffer: frame,
+                len: frame_len,
+            });
             at += count;
         }
+        Ok(())
     }
 
     /// One past the last byte of the round that starts at `staged_from`.
@@ -2314,12 +2500,19 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsWrite<Transport, Cp
     async fn send_round(&mut self) -> Result<(), HostFsError> {
         let client = &self.client;
         for mut frame in self.frames.drain(..) {
-            let count = frame.len() - P9_TWRITE_HEADER_LEN;
+            let count = frame.len - P9_TWRITE_HEADER_LEN;
             let tag = client.inner.tags.allocate()?;
             let value = u16::try_from(tag.value()).expect("a 9p tag is bounded below NOTAG");
-            frame[P9_TAG_OFFSET..P9_HEADER_LEN].copy_from_slice(&value.to_le_bytes());
+            frame.buffer.buffer_mut().as_mut()[P9_TAG_OFFSET..P9_HEADER_LEN]
+                .copy_from_slice(&value.to_le_bytes());
             let response = client
-                .send_frame(value, P9Message::Write, frame, P9_SMALL_REPLY_LEN)
+                .send_frame(
+                    value,
+                    P9Message::Write,
+                    frame.buffer,
+                    frame.len,
+                    P9_SMALL_REPLY_LEN,
+                )
                 .await?;
             let written = usize::try_from(read_u32_le(&response, P9_HEADER_LEN)?)
                 .map_err(|_| HostFsError::Protocol("write count overflowed usize"))?;
@@ -2360,7 +2553,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostWrite
     {
         let mut at = self.staged_from;
         for frame in &mut self.frames {
-            let payload = &mut frame[P9_TWRITE_HEADER_LEN..];
+            let payload = &mut frame.buffer.buffer_mut().as_mut()[P9_TWRITE_HEADER_LEN..frame.len];
             fill(at, payload);
             at += payload.len();
         }
@@ -2387,7 +2580,10 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFilledWrite
                 len: write.len,
             }));
         }
-        write.stage_round();
+        if let Err(error) = write.stage_round() {
+            write.finish(false).await;
+            return Err(error);
+        }
         Ok(WriteProgress::More(write))
     }
 }
@@ -2414,29 +2610,19 @@ fn write_request_body_capacity(payload_len: usize) -> usize {
         .expect("9p write request capacity overflowed")
 }
 
-fn reset_p9_buffer(buf: &mut BytesMut) {
-    buf.clear();
-    if buf.capacity() > P9_BUFFER_RETAINED_CAPACITY {
-        // Shrink any one-shot oversize back so the pool does not
-        // permanently hold inflated buffers from a transient large
-        // 9p TWRITE.
-        *buf = BytesMut::with_capacity(P9_BUFFER_RETAINED_CAPACITY);
-    }
-}
-
-fn push_u16(buf: &mut BytesMut, value: u16) {
+fn push_u16(buf: &mut MessageWriter<'_>, value: u16) {
     buf.extend_from_slice(&value.to_le_bytes());
 }
 
-fn push_u32(buf: &mut BytesMut, value: u32) {
+fn push_u32(buf: &mut MessageWriter<'_>, value: u32) {
     buf.extend_from_slice(&value.to_le_bytes());
 }
 
-fn push_u64(buf: &mut BytesMut, value: u64) {
+fn push_u64(buf: &mut MessageWriter<'_>, value: u64) {
     buf.extend_from_slice(&value.to_le_bytes());
 }
 
-fn push_string(buf: &mut BytesMut, value: P9Str<'_>) {
+fn push_string(buf: &mut MessageWriter<'_>, value: P9Str<'_>) {
     push_u16(buf, value.len());
     buf.extend_from_slice(value.as_str().as_bytes());
 }
@@ -2653,6 +2839,7 @@ mod tests {
     use super::*;
     use crate::HostShare;
     use crate::test_support::ManualClockCpu;
+    use alloc::vec;
     use core::pin::pin;
     use futures_lite::future::{block_on, poll_once, zip};
     use helios_hal::fs::{DirCookie, DirStream, FileSystem, FsError, FsPath, OpenFlags};
@@ -2805,14 +2992,6 @@ mod tests {
             parse_getattr_reply(&reply),
             Err(HostFsError::Protocol(_))
         ));
-    }
-
-    #[test]
-    fn write_request_capacity_accounts_for_payload() {
-        assert_eq!(
-            write_request_body_capacity(4096),
-            P9_TWRITE_FIXED_BODY_BYTES + 4096
-        );
     }
 
     /// The single file the fake server serves under any path.
@@ -3121,12 +3300,20 @@ mod tests {
             self.inner.depth
         }
 
-        fn request<'a>(
-            &'a self,
-            bytes: &'a [u8],
-            response: &'a mut BytesMut,
+        type Buffer = Vec<u8>;
+
+        fn buffer(&self, capacity: usize) -> Result<Vec<u8>, IoError> {
+            Ok(vec![0; capacity])
+        }
+
+        fn request(
+            &self,
+            request: Vec<u8>,
+            request_len: usize,
+            mut response: Vec<u8>,
             response_len: usize,
-        ) -> impl Future<Output = Result<(), IoError>> + Send + 'a {
+        ) -> impl Future<Output = BufResult<usize, (Vec<u8>, Vec<u8>)>> + Send + '_ {
+            let bytes = &request[..request_len];
             let reply = self.answer(bytes);
             let tag = u16::from_le_bytes([bytes[5], bytes[6]]);
             async move {
@@ -3138,8 +3325,7 @@ mod tests {
                     "a {} byte reply does not fit the {response_len} byte response buffer",
                     reply.len()
                 );
-                response.clear();
-                response.extend_from_slice(&reply);
+                response[..reply.len()].copy_from_slice(&reply);
                 let mut log = self.inner.log.lock();
                 let index = log
                     .outstanding
@@ -3147,7 +3333,8 @@ mod tests {
                     .position(|outstanding| *outstanding == tag)
                     .expect("a reply must answer an outstanding request");
                 log.outstanding.remove(index);
-                Ok(())
+                drop(log);
+                Ok((reply.len(), (request, response)))
             }
         }
     }

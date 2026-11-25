@@ -2289,15 +2289,41 @@ where
         timeout_nanos: u64,
     ) -> Result<usize, u64> {
         self.check_tcp_open()?;
+        if bytes.is_empty() {
+            return Ok(0);
+        }
         let service = self
             .shared
             .runtime_state
             .network_service()
             .ok_or(syscall::ENETDOWN)?;
-        service
-            .tcp_write_some_bytes(stream, bytes, timeout_nanos)
-            .await
-            .map_err(linux_errno_from_tcp_error)
+        let len = bytes.len().min(helios_netstack::TCP_TRANSMIT_BUFFER_BYTES);
+        match service.tcp_payload(len, |piece| piece.copy_from_slice(&bytes[..len])) {
+            Ok(payload) => service
+                .tcp_write_some_bytes(stream, payload, timeout_nanos)
+                .await
+                .map_err(linux_errno_from_tcp_error),
+            Err(error)
+                if matches!(
+                    error.detail,
+                    crate::NetworkErrorDetail::TransmitMemoryReplenishing
+                        | crate::NetworkErrorDetail::TransmitMemoryExhausted
+                ) =>
+            {
+                if timeout_nanos == 0 {
+                    return Err(syscall::ETIMEDOUT);
+                }
+                let pieces = service.tcp_payload_pieces(len, |offset, piece| {
+                    piece.copy_from_slice(&bytes[offset..][..piece.len()]);
+                });
+                service
+                    .tcp_write_all(stream, pieces, timeout_nanos)
+                    .await
+                    .map(|()| len)
+                    .map_err(linux_errno_from_tcp_error)
+            }
+            Err(error) => Err(linux_errno_from_tcp_error(error)),
+        }
     }
 
     async fn tcp_shutdown_send(&self, stream: Net::TcpStream) -> Result<(), u64> {

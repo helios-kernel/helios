@@ -4787,10 +4787,6 @@ where
         }
     }
 
-    pub fn tcp_send(&mut self, socket: SocketId, bytes: &[u8]) -> Result<usize, StackError> {
-        Ok(self.tcp_socket_mut(socket)?.queue_send(bytes))
-    }
-
     pub fn tcp_send_bytes(
         &mut self,
         socket: SocketId,
@@ -11763,7 +11759,7 @@ mod tests {
         const FIRST_DATA_SEQUENCE: u32 = 8;
         stack.replace_neighbors(core::iter::empty());
         stack
-            .tcp_send(socket, b"hello")
+            .tcp_send_bytes(socket, &mut Bytes::from_static(b"hello"))
             .expect("data should queue on the established socket");
 
         stack
@@ -11881,7 +11877,7 @@ mod tests {
 
         stack.replace_neighbors(core::iter::empty());
         stack
-            .tcp_send(socket, b"hello")
+            .tcp_send_bytes(socket, &mut Bytes::from_static(b"hello"))
             .expect("data should queue on the established socket");
         stack
             .drive_tcp(StackInstant::from_nanos(13))
@@ -11960,7 +11956,7 @@ mod tests {
         );
         let payload = vec![0x5a_u8; TCP_SCATTER_MIN_PAYLOAD_BYTES];
         stack
-            .tcp_send(socket, &payload)
+            .tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload))
             .expect("bulk TCP send should queue");
         stack
             .drive_tcp(StackInstant::from_nanos(2))
@@ -11990,7 +11986,7 @@ mod tests {
         );
         let payload = vec![0x5a_u8; TCP_SCATTER_MIN_PAYLOAD_BYTES];
         stack
-            .tcp_send(socket, &payload)
+            .tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload))
             .expect("bulk TCP send should queue");
         stack
             .drive_tcp(StackInstant::from_nanos(2))
@@ -12018,7 +12014,7 @@ mod tests {
         );
         let payload: Vec<u8> = (0..40 * 1024).map(|index| index as u8).collect();
         let queued = stack
-            .tcp_send(socket, &payload)
+            .tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload))
             .expect("bulk TCP send should queue");
         assert_eq!(queued, payload.len());
         stack
@@ -12075,7 +12071,7 @@ mod tests {
         );
         let payload: Vec<u8> = (0..40 * 1024).map(|index| index as u8).collect();
         stack
-            .tcp_send(socket, &payload)
+            .tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload))
             .expect("bulk TCP send should queue");
         stack
             .drive_tcp(StackInstant::from_nanos(2))
@@ -12111,7 +12107,7 @@ mod tests {
         );
         let payload: Vec<u8> = (0..40 * 1024).map(|index| index as u8).collect();
         stack
-            .tcp_send(socket, &payload)
+            .tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload))
             .expect("bulk TCP send should queue");
         stack
             .drive_tcp(StackInstant::from_nanos(2))
@@ -14329,7 +14325,10 @@ mod tests {
         assert_eq!((live.sockets, live.orphan_sockets), (1, 0));
         assert_eq!(live.orphan_send_queued_bytes, 0);
 
-        assert_eq!(stack.tcp_send(socket, PAYLOAD), Ok(PAYLOAD.len()));
+        assert_eq!(
+            stack.tcp_send_bytes(socket, &mut Bytes::from_static(PAYLOAD)),
+            Ok(PAYLOAD.len())
+        );
         assert_eq!(
             stack.close_tcp_socket(socket, StackInstant::from_nanos(2)),
             Ok(TcpCloseOutcome::Finishing)
@@ -14861,7 +14860,7 @@ mod tests {
         );
         assert_eq!(
             stack
-                .tcp_send(accepted, b"hello")
+                .tcp_send_bytes(accepted, &mut Bytes::from_static(b"hello"))
                 .expect("the accepted connection should still send"),
             5
         );
@@ -15267,7 +15266,7 @@ mod tests {
         );
         assert_ne!(accepted.socket, outbound);
         assert_eq!(
-            stack.tcp_send(accepted.socket, b"hello"),
+            stack.tcp_send_bytes(accepted.socket, &mut Bytes::from_static(b"hello")),
             Ok(5),
             "an accepted connection is an ordinary slab socket"
         );
@@ -15972,7 +15971,12 @@ mod tests {
                 StackInstant::from_nanos(2),
             )
             .expect("payload should request an ACK");
-        assert_eq!(stack.tcp_send(socket, b"w").unwrap(), 1);
+        assert_eq!(
+            stack
+                .tcp_send_bytes(socket, &mut Bytes::from_static(b"w"))
+                .unwrap(),
+            1
+        );
 
         stack
             .drive_tcp(StackInstant::from_nanos(3))
@@ -16047,7 +16051,10 @@ mod tests {
             .take_outbound()
             .expect("handshake ACK frame should be queued");
         // The error has to quote a segment the connection has in flight.
-        assert_eq!(stack.tcp_send(socket, b"x"), Ok(1));
+        assert_eq!(
+            stack.tcp_send_bytes(socket, &mut Bytes::from_static(b"x")),
+            Ok(1)
+        );
         stack
             .drive_tcp(StackInstant::from_nanos(2))
             .expect("first data should be queued");
@@ -16078,7 +16085,10 @@ mod tests {
         while stack.take_outbound().is_some() {}
 
         let payload = [0u8; 1024];
-        assert_eq!(stack.tcp_send(socket, &payload), Ok(payload.len()));
+        assert_eq!(
+            stack.tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload)),
+            Ok(payload.len())
+        );
         // A millisecond on: the first data segment set a pacing deadline
         // (BBR paces from its first packet, at the initial window per
         // millisecond until a round trip is measured), and this test is
@@ -16161,7 +16171,10 @@ mod tests {
             .expect("handshake ACK frame should be queued");
 
         let payload = [0u8; 1024];
-        assert_eq!(stack.tcp_send(socket, &payload), Ok(payload.len()));
+        assert_eq!(
+            stack.tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload)),
+            Ok(payload.len())
+        );
         stack
             .drive_tcp(StackInstant::from_nanos(2))
             .expect("full-size TCP data should be queued");
@@ -16679,7 +16692,10 @@ mod tests {
         assert!(stack.receive_backpressured());
 
         // Data in flight to a peer that never answers again.
-        assert_eq!(stack.tcp_send(socket, b"unanswered"), Ok(10));
+        assert_eq!(
+            stack.tcp_send_bytes(socket, &mut Bytes::from_static(b"unanswered")),
+            Ok(10)
+        );
         while stack.take_event().is_some() {}
         let mut closes = 0;
         let mut now = 1_000_000_000u64;
@@ -20523,7 +20539,10 @@ mod tests {
         let sockets = establish_flows(&mut stack, 30, false);
         for (flow, socket) in sockets.iter().enumerate() {
             let payload = flow_payload(flow as u16);
-            assert_eq!(stack.tcp_send(*socket, &payload), Ok(payload.len()));
+            assert_eq!(
+                stack.tcp_send_bytes(*socket, &mut Bytes::copy_from_slice(&payload)),
+                Ok(payload.len())
+            );
         }
         stack.drive_tcp(at(2)).expect("data should be queued");
         let frames = drain_flow_frames(&mut stack);
@@ -20541,7 +20560,10 @@ mod tests {
         let sockets = establish_flows(&mut stack, OLD_BURST, false);
         for (flow, socket) in sockets.iter().enumerate() {
             let payload = flow_payload(flow as u16);
-            assert_eq!(stack.tcp_send(*socket, &payload), Ok(payload.len()));
+            assert_eq!(
+                stack.tcp_send_bytes(*socket, &mut Bytes::copy_from_slice(&payload)),
+                Ok(payload.len())
+            );
         }
         // Leave room for half of the data frames.
         for _ in 0..MAX_OUTBOUND_FRAMES - usize::from(OLD_BURST) / 2 {
@@ -20591,7 +20613,10 @@ mod tests {
         settle(&mut stack, 2);
 
         let payload = flow_payload(1);
-        assert_eq!(stack.tcp_send(sender, &payload), Ok(payload.len()));
+        assert_eq!(
+            stack.tcp_send_bytes(sender, &mut Bytes::copy_from_slice(&payload)),
+            Ok(payload.len())
+        );
         for _ in 0..MAX_OUTBOUND_FRAMES {
             stack
                 .queue_arp_reply(FLOW_LOCAL, FLOW_PEER, PEER_MAC)
@@ -20715,11 +20740,17 @@ mod tests {
         // data on every drive the test makes.
         let busy = vec![0x42; 16 * 1024];
         for socket in &sockets[..usize::from(late)] {
-            assert_eq!(stack.tcp_send(*socket, &busy), Ok(busy.len()));
+            assert_eq!(
+                stack.tcp_send_bytes(*socket, &mut Bytes::copy_from_slice(&busy)),
+                Ok(busy.len())
+            );
         }
         let payload = flow_payload(late);
         assert_eq!(
-            stack.tcp_send(sockets[usize::from(late)], &payload),
+            stack.tcp_send_bytes(
+                sockets[usize::from(late)],
+                &mut Bytes::copy_from_slice(&payload),
+            ),
             Ok(payload.len())
         );
 
@@ -20834,7 +20865,10 @@ mod tests {
         let mut stack = flow_stack_with(OpenWindow { pacing_rate: None }, true);
         let socket = establish_flows(&mut stack, 1, false)[0];
         let payload = bulk_payload();
-        assert_eq!(stack.tcp_send(socket, &payload), Ok(payload.len()));
+        assert_eq!(
+            stack.tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload)),
+            Ok(payload.len())
+        );
 
         stack.drive_tcp(at(2)).expect("one drive");
         let frames = drain_flow_frames(&mut stack);
@@ -20868,7 +20902,10 @@ mod tests {
         );
         let socket = establish_flows(&mut stack, 1, false)[0];
         let payload = bulk_payload();
-        assert_eq!(stack.tcp_send(socket, &payload), Ok(payload.len()));
+        assert_eq!(
+            stack.tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload)),
+            Ok(payload.len())
+        );
 
         let start = 2;
         stack.drive_tcp(at(start)).expect("first drive");
@@ -20893,7 +20930,7 @@ mod tests {
         for step in 0..2_000u64 {
             let now = start + step * 10_000;
             // The application always has more to send.
-            let _ = stack.tcp_send(socket, &payload);
+            let _ = stack.tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload));
             stack.drive_tcp(at(now)).expect("drive");
             let more = drain_flow_frames(&mut stack);
             if !more.is_empty() {
@@ -20916,14 +20953,17 @@ mod tests {
         let sockets = establish_flows(&mut stack, 2, false);
         let payload = bulk_payload();
         for socket in &sockets {
-            assert_eq!(stack.tcp_send(*socket, &payload), Ok(payload.len()));
+            assert_eq!(
+                stack.tcp_send_bytes(*socket, &mut Bytes::copy_from_slice(&payload)),
+                Ok(payload.len())
+            );
         }
 
         let mut served = [0usize; 2];
         for drive in 0..4u64 {
             // Both senders always have more to send.
             for socket in &sockets {
-                let _ = stack.tcp_send(*socket, &payload);
+                let _ = stack.tcp_send_bytes(*socket, &mut Bytes::copy_from_slice(&payload));
             }
             stack.drive_tcp(at(2 + drive)).expect("drive");
             let frames = drain_flow_frames(&mut stack);
@@ -20960,7 +21000,10 @@ mod tests {
             .map(|flow| bulk_payload().into_iter().map(|byte| byte ^ flow).collect())
             .collect();
         for (socket, data) in sockets.iter().zip(&data) {
-            assert_eq!(stack.tcp_send(*socket, data), Ok(data.len()));
+            assert_eq!(
+                stack.tcp_send_bytes(*socket, &mut Bytes::copy_from_slice(data)),
+                Ok(data.len())
+            );
         }
 
         // The first flow's burst fills the queue with data still owed,
@@ -21033,7 +21076,10 @@ mod tests {
             stack.learn_neighbor(flow_peer_neighbor());
             let socket = establish_flows(&mut stack, 1, false)[0];
             let payload = vec![0x5a; 4 * MSS];
-            assert_eq!(stack.tcp_send(socket, &payload), Ok(payload.len()));
+            assert_eq!(
+                stack.tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload)),
+                Ok(payload.len())
+            );
             let original = settle(&mut stack, 2);
             assert_eq!(original.len(), 4);
 
@@ -21053,7 +21099,10 @@ mod tests {
             );
             // Slow start has room for two lost segments. New data waits
             // behind the losses, even if the outbound queue fills midway.
-            assert_eq!(stack.tcp_send(socket, b"new data"), Ok(8));
+            assert_eq!(
+                stack.tcp_send_bytes(socket, &mut Bytes::from_static(b"new data")),
+                Ok(8)
+            );
             for _ in slots..MAX_OUTBOUND_FRAMES {
                 stack
                     .queue_arp_reply(FLOW_LOCAL, FLOW_PEER, PEER_MAC)
@@ -21095,7 +21144,10 @@ mod tests {
         let sockets = establish_flows(&mut stack, CROWD, false);
         for (flow, socket) in sockets.iter().enumerate() {
             let payload = flow_payload(flow as u16);
-            assert_eq!(stack.tcp_send(*socket, &payload), Ok(payload.len()));
+            assert_eq!(
+                stack.tcp_send_bytes(*socket, &mut Bytes::copy_from_slice(&payload)),
+                Ok(payload.len())
+            );
         }
         assert_eq!(settle(&mut stack, 2).len(), usize::from(CROWD));
 
@@ -21127,7 +21179,10 @@ mod tests {
         // The peer's entry leaves the cache with the connection open.
         stack.replace_neighbors(core::iter::empty());
         let payload = flow_payload(0);
-        assert_eq!(stack.tcp_send(socket, &payload), Ok(payload.len()));
+        assert_eq!(
+            stack.tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload)),
+            Ok(payload.len())
+        );
         stack
             .drive_tcp(at(2))
             .expect("an unresolved next hop leaves the data pending");
@@ -21148,7 +21203,10 @@ mod tests {
         let socket = establish_flows(&mut stack, 1, false)[0];
         stack.replace_neighbors(core::iter::empty());
         let payload = flow_payload(0);
-        assert_eq!(stack.tcp_send(socket, &payload), Ok(payload.len()));
+        assert_eq!(
+            stack.tcp_send_bytes(socket, &mut Bytes::copy_from_slice(&payload)),
+            Ok(payload.len())
+        );
 
         // A driver that runs the stack every 100 ms for four seconds, far
         // inside the retransmission timeout.

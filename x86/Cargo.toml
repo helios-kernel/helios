@@ -23,7 +23,6 @@ helios-kernel = { workspace = true, default-features = false, features = ["wasmt
 helios-virtio.workspace = true
 helios-tpm.workspace = true
 helios-x86-vmm.workspace = true
-bytes = { version = "1.10.1", default-features = false }
 # The kernel saves only the legacy FXSAVE x87/SSE state on interrupt entry,
 # so it must not contain libm's CPUID-dispatched FMA/FMA4 paths.
 libm = { version = "0.2.16", default-features = false, features = ["force-soft-floats"] }

@@ -81,6 +81,7 @@ impl DeviceGrantRegistry {
                 grant,
                 relay,
                 claimed: AtomicBool::new(false),
+                quarantine: spin::Mutex::new(Vec::new()),
             });
             published
                 .try_push(device)

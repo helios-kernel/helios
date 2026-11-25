@@ -7287,7 +7287,7 @@ fn configure_vsock_device(
         VmVsockProfile::VhostVsockPci => "vhost-vsock-pci",
     });
     device.set("guest-cid", guest_cid);
-    queues.apply(&mut device);
+    apply_transport(vsock == VmVsockProfile::VhostVsockPci, queues, &mut device);
     qemu.arg("-device").arg(device.to_string());
 }
 
