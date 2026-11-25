@@ -58,11 +58,17 @@ fn command_entry(an: &Analysis, id: TypeId) -> Result<(TokenStream, TokenStream)
     let name = ty.name.as_str();
     let command_const = ident(&format!("VK_COMMAND_TYPE_{name}_EXT"));
 
-    let mut reads = Vec::new();
+    let mut arg_names = Vec::new();
+    let mut arg_reads = Vec::new();
     for (index, var) in ty.variables.iter().enumerate() {
         let var_ty = decl_type(an, &var.ty, &var.name)?;
+        let arg = ident(&format!("arg_{index}"));
         let index = Literal::usize_unsuffixed(index);
-        reads.push(quote!(::core::ptr::read(args[#index] as *const #var_ty)));
+        arg_reads.push(quote! {
+            #[comment = " SAFETY: caller provides a valid pointer to parameter storage in `args`."]
+            let #arg = unsafe { ::core::ptr::read(args[#index] as *const #var_ty) };
+        });
+        arg_names.push(arg);
     }
 
     let ret_ty = match &ty.ret {
@@ -90,7 +96,10 @@ fn command_entry(an: &Analysis, id: TypeId) -> Result<(TokenStream, TokenStream)
         Some(ret_ty) => (
             quote! {
                 const { assert!(::core::mem::size_of::<#ret_ty>() <= 8) };
-                let ret: #ret_ty = ::core::ptr::read_unaligned(ret.as_ptr() as *const #ret_ty);
+                #[comment = " SAFETY: `ret` is an 8-byte buffer and `size_of::<#ret_ty>() <= 8`."]
+                let ret: #ret_ty = unsafe {
+                    ::core::ptr::read_unaligned(ret.as_ptr() as *const #ret_ty)
+                };
             },
             quote!(ret,),
         ),
@@ -98,13 +107,19 @@ fn command_entry(an: &Analysis, id: TypeId) -> Result<(TokenStream, TokenStream)
     };
     let decode_call = match &ret_ty {
         Some(ret_ty) => quote! {
-            let value: #ret_ty = #decode_reply_fn(decoder, #(#reads),*);
+            #[comment = " SAFETY: arguments read from `args` satisfy the command's reply contract."]
+            let value: #ret_ty = unsafe { #decode_reply_fn(decoder, #(#arg_names),*) };
             let mut bytes: ReturnBytes = [0; 8];
-            ::core::ptr::write_unaligned(bytes.as_mut_ptr() as *mut #ret_ty, value);
+            const { assert!(::core::mem::size_of::<#ret_ty>() <= 8) };
+            #[comment = " SAFETY: `bytes` is an 8-byte buffer and `size_of::<#ret_ty>() <= 8`."]
+            unsafe {
+                ::core::ptr::write_unaligned(bytes.as_mut_ptr() as *mut #ret_ty, value);
+            }
             bytes
         },
         None => quote! {
-            #decode_reply_fn(decoder, #(#reads),*);
+            #[comment = " SAFETY: arguments read from `args` satisfy the command's reply contract."]
+            unsafe { #decode_reply_fn(decoder, #(#arg_names),*) };
             [0; 8]
         },
     };
@@ -114,36 +129,43 @@ fn command_entry(an: &Analysis, id: TypeId) -> Result<(TokenStream, TokenStream)
             protocol: &RendererProtocol,
             args: &[*mut ::core::ffi::c_void],
         ) -> Result<usize, EncodeError> {
-            unsafe { #sizeof_fn(protocol, #(#reads),*) }
+            #(#arg_reads)*
+            #[comment = " SAFETY: arguments read from `args` satisfy the command's wire contract."]
+            unsafe { #sizeof_fn(protocol, #(#arg_names),*) }
         }
         unsafe fn #w_encode(
             encoder: &mut Encoder<'_>,
             flags: u32,
             args: &[*mut ::core::ffi::c_void],
         ) {
-            unsafe { #encode_fn(encoder, flags, #(#reads),*) }
+            #(#arg_reads)*
+            #[comment = " SAFETY: arguments read from `args` satisfy the command's wire contract."]
+            unsafe { #encode_fn(encoder, flags, #(#arg_names),*) };
         }
         unsafe fn #w_sizeof_reply(
             protocol: &RendererProtocol,
             args: &[*mut ::core::ffi::c_void],
         ) -> Result<usize, EncodeError> {
-            unsafe { #sizeof_reply_fn(protocol, #(#reads),*) }
+            #(#arg_reads)*
+            #[comment = " SAFETY: arguments read from `args` satisfy the command's wire contract."]
+            unsafe { #sizeof_reply_fn(protocol, #(#arg_names),*) }
         }
         unsafe fn #w_encode_reply(
             encoder: &mut Encoder<'_>,
             ret: ReturnBytes,
             args: &[*mut ::core::ffi::c_void],
         ) {
-            unsafe {
-                #ret_read
-                #encode_reply_fn(encoder, #ret_arg #(#reads),*)
-            }
+            #ret_read
+            #(#arg_reads)*
+            #[comment = " SAFETY: arguments and return value satisfy the command's reply contract."]
+            unsafe { #encode_reply_fn(encoder, #ret_arg #(#arg_names),*) };
         }
         unsafe fn #w_decode_reply(
             decoder: &mut Decoder<'_>,
             args: &[*mut ::core::ffi::c_void],
         ) -> ReturnBytes {
-            unsafe { #decode_call }
+            #(#arg_reads)*
+            #decode_call
         }
     };
 

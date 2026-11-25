@@ -156,15 +156,17 @@ impl GenerationIdWindow {
 
     /// Reads the identifier currently in the window.
     pub fn read(&self) -> VmGenerationId {
-        // SAFETY: `new` promised 16 readable, 8-aligned bytes for the
-        // life of the window.
-        let words = unsafe {
-            [
-                self.ptr.as_ptr().read_volatile(),
-                self.ptr.as_ptr().add(1).read_volatile(),
-            ]
-        };
-        VmGenerationId::from_words(words)
+        let base = self.ptr.as_ptr();
+        // SAFETY: `new` promised the first 8 bytes at `ptr` are mapped,
+        // readable, and 8-byte aligned for the life of the window.
+        let low = unsafe { base.read_volatile() };
+        // SAFETY: `new` promised 16 contiguous bytes starting at `ptr`, so
+        // advancing by one `u64` (8 bytes) stays within that allocation.
+        let high_ptr = unsafe { base.add(1) };
+        // SAFETY: `high_ptr` addresses the second 8-byte aligned word inside
+        // the 16-byte readable window `new` promised.
+        let high = unsafe { high_ptr.read_volatile() };
+        VmGenerationId::from_words([low, high])
     }
 }
 

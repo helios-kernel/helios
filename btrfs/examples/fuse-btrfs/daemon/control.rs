@@ -404,7 +404,8 @@ mod tests {
         // Make the image read-only so initial open uses `Storage::ReadOnly`.
         // Skip only when running as root (UID 0 bypasses DAC read-only mode
         // bits on regular files, whereas block devices use `BLKROGET`).
-        // SAFETY: `geteuid` has no preconditions.
+        // SAFETY: `geteuid` takes no pointers, reads the calling process's
+        // effective user ID, and cannot fail.
         if unsafe { libc::geteuid() } == 0 {
             return;
         }

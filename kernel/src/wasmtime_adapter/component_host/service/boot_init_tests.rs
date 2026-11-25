@@ -127,6 +127,8 @@ fn boot_payload_exposes_init_component_and_argv0_on_runtime_state() {
 fn run_root_component_once_returns_error_when_artifact_is_invalid() {
     let backing: &'static mut [u8] =
         Box::leak(alloc::vec![0u8; 64 * 1024 * 1024].into_boxed_slice());
+    // SAFETY: `backing` is a leaked `'static` slice owned exclusively by this
+    // test's bootstrap allocator, so it outlives the test kernel.
     let region = unsafe {
         helios_hal::memory::MemoryRegion::new(
             core::ptr::NonNull::from(backing),

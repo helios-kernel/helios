@@ -52,24 +52,28 @@ pub struct InstrumentedKernelProfile;
 
 impl InstrumentedKernelProfile {
     fn image(&self) -> Result<RawProfile<'static>, LlvmProfileError> {
-        // SAFETY: each pair bounds one linked section, so the bytes between
-        // them are readable for the life of the kernel image. The counter
-        // section is written by instrumented code while it is read, which is
-        // why the spans never become shared references.
-        let (counters, data, names) = unsafe {
-            (
-                span(
-                    &raw const __start___llvm_prf_cnts,
-                    &raw const __stop___llvm_prf_cnts,
-                ),
-                span(
-                    &raw const __start___llvm_prf_data,
-                    &raw const __stop___llvm_prf_data,
-                ),
-                span(
-                    &raw const __start___llvm_prf_names,
-                    &raw const __stop___llvm_prf_names,
-                ),
+        // SAFETY: `__start___llvm_prf_cnts` and `__stop___llvm_prf_cnts` bound
+        // the linked counter section, which stays mapped for `'static`.
+        let counters = unsafe {
+            span(
+                &raw const __start___llvm_prf_cnts,
+                &raw const __stop___llvm_prf_cnts,
+            )
+        };
+        // SAFETY: `__start___llvm_prf_data` and `__stop___llvm_prf_data` bound
+        // the linked profile data section, which stays mapped for `'static`.
+        let data = unsafe {
+            span(
+                &raw const __start___llvm_prf_data,
+                &raw const __stop___llvm_prf_data,
+            )
+        };
+        // SAFETY: `__start___llvm_prf_names` and `__stop___llvm_prf_names` bound
+        // the linked profile names section, which stays mapped for `'static`.
+        let names = unsafe {
+            span(
+                &raw const __start___llvm_prf_names,
+                &raw const __stop___llvm_prf_names,
             )
         };
         // SAFETY: the version word is a link-time constant in the image.

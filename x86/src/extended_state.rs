@@ -148,11 +148,15 @@ fn supported_xcr0() -> u64 {
 /// Sets CR4.OSXSAVE and XCR0 on the executing processor and checks the
 /// write took.
 fn program(xcr0: u64) {
+    // SAFETY: `supported_xcr0` verified CPUID leaf 0xD and XSAVE support;
+    // enabling `CR4.OSXSAVE` exposes `XGETBV`/`XSETBV` to ring 0.
     unsafe {
         Cr4::update(|flags| flags.insert(Cr4Flags::OSXSAVE));
     }
     let low = xcr0 as u32;
     let high = (xcr0 >> 32) as u32;
+    // SAFETY: `CR4.OSXSAVE` is enabled and `xcr0` was masked against CPUID
+    // leaf `(0xD, 0)` with complete x87/SSE/AVX/AVX-512 bit combinations.
     unsafe {
         core::arch::asm!(
             "xsetbv",
@@ -162,6 +166,7 @@ fn program(xcr0: u64) {
             options(nostack, preserves_flags),
         );
     }
+    // SAFETY: `CR4.OSXSAVE` is enabled and `XCR0` (`ecx = 0`) is always valid.
     let read_back = unsafe {
         let eax: u32;
         let edx: u32;

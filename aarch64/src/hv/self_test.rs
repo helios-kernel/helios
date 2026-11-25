@@ -95,28 +95,26 @@ pub(crate) async fn run(cpu: crate::Aarch64Cpu, control: ProcessorControl<crate:
         0xd518_cc20,
         0xd400_0002,
     ];
+    let code_ptr = core::ptr::with_exposed_provenance_mut::<u32>(address);
+    // SAFETY: `address` came from `allocate_user_run_zeroed_on` with a full
+    // 4 KiB frame (`instructions.len() * 4 <= PhysFrame::SIZE`) and 4 KiB
+    // alignment, and `page` uniquely owns it here.
+    let code = unsafe { core::slice::from_raw_parts_mut(code_ptr, instructions.len()) };
+    code.copy_from_slice(&instructions);
+    let hv = cpu.hv().expect("HV self-test requires EL2 VHE");
+    // SAFETY: `address` points to the exclusively owned test frame above,
+    // which is mapped in the kernel direct map.
     unsafe {
-        for (index, instruction) in instructions.into_iter().enumerate() {
-            core::ptr::with_exposed_provenance_mut::<u32>(address)
-                .add(index)
-                .write(instruction);
-        }
-        cpu.hv()
-            .expect("HV self-test requires EL2 VHE")
-            .synchronize_memory(&[PhysFrame::from_phys_addr(address)]);
+        hv.synchronize_memory(&[PhysFrame::from_phys_addr(address)]);
     }
-    let space = Arc::new(
-        cpu.hv()
-            .expect("HV self-test requires EL2 VHE")
-            .create_space()
-            .unwrap(),
-    );
+    let space = Arc::new(hv.create_space().unwrap());
     let range = GuestRange::new(GuestAddress(0x4000_0000), PhysFrame::SIZE).unwrap();
-    assert_eq!(
-        unsafe { space.map_pages(range, &[], PageFlags::READ) },
-        Err(HvError::InvalidRange)
-    );
+    // SAFETY: the empty slice fails range validation before mapping any frame.
+    let empty_map = unsafe { space.map_pages(range, &[], PageFlags::READ) };
+    assert_eq!(empty_map, Err(HvError::InvalidRange));
     assert!(!space.tables.contains(range.start()));
+    // SAFETY: `page` uniquely owns the frame at `address` and outlives
+    // `space` (dropped before `page` at the end of `run`).
     unsafe {
         space
             .map_pages(
@@ -133,6 +131,8 @@ pub(crate) async fn run(cpu: crate::Aarch64Cpu, control: ProcessorControl<crate:
     helios_hal::critical_section::with_local_interrupts_masked(|| {
         vcpu.vgic.install();
         let maintenance: u64;
+        // SAFETY: reading `ich_misr_el2` at EL2 with interrupts masked has no
+        // side effects and touches no memory.
         unsafe {
             asm!("mrs {maintenance}, ich_misr_el2", maintenance = out(reg) maintenance,
                 options(nomem, nostack));
@@ -214,6 +214,8 @@ pub(crate) async fn run(cpu: crate::Aarch64Cpu, control: ProcessorControl<crate:
     // Program the detached guest virtual timer, then execute WFI. Its
     // hardware bank is disabled while the host awaits the saved deadline.
     let counter: u64;
+    // SAFETY: reading the architected physical counter `cntpct_el0` touches
+    // no memory and has no side effects.
     unsafe {
         asm!("mrs {counter}, cntpct_el0", counter = out(reg) counter, options(nomem, nostack));
     }

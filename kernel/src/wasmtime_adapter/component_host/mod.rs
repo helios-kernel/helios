@@ -3772,12 +3772,12 @@ where
     );
     let artifact = component.bootfs_bytes();
     let trusted = cwasm::trust_bootfs_artifact(&artifact);
-    let compiled = crate::wasmtime_adapter::WasmtimeCompiledComponent {
-        component: unsafe {
-            wasmtime::component::Component::deserialize(engine.raw(), trusted.payload())
-        }
-        .map_err(RootComponentError::LoadComponent)?,
-    };
+    // SAFETY: `trusted` comes from the signature-verified bootfs image
+    // (`trust_bootfs_artifact`), built for `engine`'s target and configuration.
+    let component =
+        unsafe { wasmtime::component::Component::deserialize(engine.raw(), trusted.payload()) }
+            .map_err(RootComponentError::LoadComponent)?;
+    let compiled = crate::wasmtime_adapter::WasmtimeCompiledComponent { component };
     write_serial.emit_stage_marker("component:ok");
 
     write_serial.emit_stage_marker("instantiate:begin");

@@ -252,6 +252,10 @@ fn sum_words_scalar(bytes: &[u8]) -> u32 {
     sum
 }
 
+/// # Safety
+///
+/// The caller must guarantee the `aarch64` `neon` target feature is enabled
+/// at runtime on the executing CPU.
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 #[inline(always)]
 unsafe fn sum_words_neon(bytes: &[u8]) -> u32 {
@@ -278,34 +282,54 @@ unsafe fn sum_words_neon(bytes: &[u8]) -> u32 {
     // of 16-byte iterations is 4096, giving each lane a worst case of
     // about 0x2_0000 * 4096 ≈ 2^30 — well inside u32 headroom.
     //
-    // SAFETY (whole-block): caller has guaranteed the `+neon` target
-    // feature is active (cfg gate above). All intrinsic calls below
-    // touch only the input slice and stay within `bytes.len()`.
-    //
     // Two-way unroll keeps two independent vpadalq dependency chains
     // in flight so Apple/Arm cores with multiple NEON pipes do not
     // stall on a single accumulator.
+    // SAFETY: `+neon` is enabled by the `cfg` gate; `vdupq_n_u32` is a pure register init.
     let mut acc0: uint32x4_t = unsafe { vdupq_n_u32(0) };
+    // SAFETY: `+neon` is enabled by the `cfg` gate; `vdupq_n_u32` is a pure register init.
     let mut acc1: uint32x4_t = unsafe { vdupq_n_u32(0) };
     let mut offset = 0usize;
     let unroll_limit = bytes.len() & !31;
     while offset < unroll_limit {
-        let v0 = unsafe { vld1q_u8(bytes.as_ptr().add(offset)) };
-        let v1 = unsafe { vld1q_u8(bytes.as_ptr().add(offset + 16)) };
-        let w0 = unsafe { vreinterpretq_u16_u8(vrev16q_u8(v0)) };
-        let w1 = unsafe { vreinterpretq_u16_u8(vrev16q_u8(v1)) };
+        // SAFETY: `offset < (bytes.len() & !31)`, so `offset + 16 <= bytes.len()`
+        // and all 16 bytes are within `bytes`; `+neon` is enabled by the `cfg` gate.
+        let v0 = unsafe { vld1q_u8(bytes.as_ptr().wrapping_add(offset)) };
+        // SAFETY: `offset < (bytes.len() & !31)`, so `offset + 32 <= bytes.len()`
+        // and all 16 bytes at `offset + 16` are within `bytes`; `+neon` is enabled by the `cfg` gate.
+        let v1 = unsafe { vld1q_u8(bytes.as_ptr().wrapping_add(offset + 16)) };
+        // SAFETY: `+neon` is enabled by the `cfg` gate; `vrev16q_u8` is a pure register op.
+        let r0 = unsafe { vrev16q_u8(v0) };
+        // SAFETY: `+neon` is enabled by the `cfg` gate; `vreinterpretq_u16_u8` is a pure register cast.
+        let w0 = unsafe { vreinterpretq_u16_u8(r0) };
+        // SAFETY: `+neon` is enabled by the `cfg` gate; `vrev16q_u8` is a pure register op.
+        let r1 = unsafe { vrev16q_u8(v1) };
+        // SAFETY: `+neon` is enabled by the `cfg` gate; `vreinterpretq_u16_u8` is a pure register cast.
+        let w1 = unsafe { vreinterpretq_u16_u8(r1) };
+        // SAFETY: `+neon` is enabled by the `cfg` gate; `vpadalq_u16` is a pure register accumulate.
         acc0 = unsafe { vpadalq_u16(acc0, w0) };
+        // SAFETY: `+neon` is enabled by the `cfg` gate; `vpadalq_u16` is a pure register accumulate.
         acc1 = unsafe { vpadalq_u16(acc1, w1) };
         offset += 32;
     }
     let limit = bytes.len() & !15;
     while offset < limit {
-        let v = unsafe { vld1q_u8(bytes.as_ptr().add(offset)) };
-        let words = unsafe { vreinterpretq_u16_u8(vrev16q_u8(v)) };
+        // SAFETY: `offset < (bytes.len() & !15)`, so `offset + 16 <= bytes.len()`
+        // and all 16 bytes are within `bytes`; `+neon` is enabled by the `cfg` gate.
+        let v = unsafe { vld1q_u8(bytes.as_ptr().wrapping_add(offset)) };
+        // SAFETY: `+neon` is enabled by the `cfg` gate; `vrev16q_u8` is a pure register op.
+        let reversed = unsafe { vrev16q_u8(v) };
+        // SAFETY: `+neon` is enabled by the `cfg` gate; `vreinterpretq_u16_u8` is a pure register cast.
+        let words = unsafe { vreinterpretq_u16_u8(reversed) };
+        // SAFETY: `+neon` is enabled by the `cfg` gate; `vpadalq_u16` is a pure register accumulate.
         acc0 = unsafe { vpadalq_u16(acc0, words) };
         offset += 16;
     }
-    let mut sum = unsafe { vaddvq_u32(acc0).wrapping_add(vaddvq_u32(acc1)) };
+    // SAFETY: `+neon` is enabled by the `cfg` gate; `vaddvq_u32` is a pure register reduction.
+    let sum0 = unsafe { vaddvq_u32(acc0) };
+    // SAFETY: `+neon` is enabled by the `cfg` gate; `vaddvq_u32` is a pure register reduction.
+    let sum1 = unsafe { vaddvq_u32(acc1) };
+    let mut sum = sum0.wrapping_add(sum1);
 
     let tail = &bytes[offset..];
     let (words, remainder) = tail.as_chunks::<2>();

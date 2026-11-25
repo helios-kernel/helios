@@ -155,12 +155,19 @@ critical_section::set_impl!(X86CriticalSection);
 // and need only to keep this processor's interrupt handler out.
 helios_hal::critical_section::set_local_interrupt_mask_impl!(X86InterruptOps);
 
+// SAFETY: `CRITICAL_SECTION_STATE` masks interrupts on the current processor
+// and serializes cross-processor entry via a re-entrant spinlock keyed by
+// `X86InterruptOps::current_identity()`, upholding `critical_section::Impl`.
 unsafe impl critical_section::Impl for X86CriticalSection {
     unsafe fn acquire() -> usize {
+        // SAFETY: `critical_section` pairs every `acquire` with a matching
+        // `release` carrying the returned token.
         unsafe { CRITICAL_SECTION_STATE.acquire::<X86InterruptOps>() }
     }
 
     unsafe fn release(restore_state: usize) {
+        // SAFETY: `critical_section` guarantees `restore_state` came from the
+        // matching `acquire` on `CRITICAL_SECTION_STATE`.
         unsafe { CRITICAL_SECTION_STATE.release::<X86InterruptOps>(restore_state) }
     }
 }
@@ -838,6 +845,8 @@ fn pre_heap_acpi_tables(
         tsc_base: 0,
         timebase: Timebase::new(1),
     };
+    // SAFETY: `rsdp_address` comes from the bootloader's Limine handoff and
+    // `handler` maps physical ACPI tables via the bootloader's direct physical map.
     unsafe { AcpiTables::from_rsdp(handler, rsdp_address) }
         .unwrap_or_else(|error| panic!("failed to parse ACPI tables before the heap: {error:?}"))
 }
@@ -1133,6 +1142,9 @@ impl Cpu for X86Cpu {
             x86_64::instructions::interrupts::enable();
             return;
         }
+        // SAFETY: interrupts were disabled above after checking `wake_pending`,
+        // and `sti; hlt` atomically enables interrupts and halts until the next
+        // unmasked interrupt arrives.
         unsafe {
             core::arch::asm!("sti; hlt", options(nomem, nostack));
         }
@@ -1267,6 +1279,8 @@ impl Cpu for X86Cpu {
     }
 
     fn reboot(&self) -> ! {
+        // SAFETY: `0x64` is the standard x86 8042 keyboard-controller command
+        // port, and writing `0xfe` pulses the CPU reset line to reboot.
         unsafe {
             PortWriteOnly::new(0x64).write(0xfe_u8);
         }
@@ -1304,6 +1318,8 @@ unsafe fn rdrand64_enabled() -> Option<u64> {
 }
 
 fn rdrand64() -> u64 {
+    // SAFETY: `fill_entropy` checked `x86_has_rdrand()` (CPUID.01H:ECX[30])
+    // before calling `fill_with_rdrand`.
     unsafe { rdrand64_enabled() }.expect("x86 RDRAND failed after retries")
 }
 
@@ -1330,6 +1346,9 @@ extern "C" fn secondary_start_rust(
     boot: *const smp::BootContext,
     runtime: *const smp::ProcessorRuntime,
 ) -> ! {
+    // SAFETY: the secondary wakeup trampoline passes the immutable static
+    // `BootContext` pointer initialized by the bootstrap processor before
+    // starting secondaries.
     let boot = unsafe { &*boot };
     // CR0 and the FPU/SSE control bits are set by the secondary wakeup
     // trampoline; this checks the CR0 it left.
@@ -1367,6 +1386,8 @@ extern "C" fn secondary_start_rust(
          the bootstrap processor; Helios requires every processor to offer the same features",
         __cpuid(1).ebx >> 24
     );
+    // SAFETY: the secondary wakeup trampoline passes this processor's
+    // per-processor `ProcessorRuntime` allocated for the kernel's lifetime.
     let runtime = unsafe { &*runtime };
     smp::activate_runtime(runtime);
     smp::current_runtime().attach_local_apic();
@@ -1405,6 +1426,8 @@ fn detect_x86_native_feature(feature: &str) -> Option<bool> {
     fn xgetbv0() -> u64 {
         let eax: u32;
         let edx: u32;
+        // SAFETY: the caller checked CPUID.01H:ECX[27] (OSXSAVE) so `xgetbv`
+        // with `ecx = 0` is supported and reads XCR0 without side effects.
         unsafe {
             asm!(
                 "xgetbv",
@@ -1456,6 +1479,8 @@ fn detect_x86_native_feature(feature: &str) -> Option<bool> {
 }
 
 fn read_tsc() -> u64 {
+    // SAFETY: x86_64 always provides the `rdtsc` instruction, and reading the
+    // timestamp counter has no memory side effects.
     unsafe { _rdtsc() }
 }
 
@@ -1491,38 +1516,61 @@ fn calibrate_tsc_via_pit() -> u64 {
     let pit_count = u16::try_from(PIT_BASE_HZ / PIT_CALIBRATION_HZ)
         .expect("PIT calibration divisor overflowed u16");
 
+    let mut speaker: Port<u8> = Port::new(PIT_SPEAKER_GATE);
+    // SAFETY: `PIT_SPEAKER_GATE` (`0x61`) is the standard x86 system control
+    // port B for PIT channel 2 gating, and calibration runs once on the
+    // bootstrap processor before APs start.
+    let speaker_state = unsafe { speaker.read() };
+
+    // Route PIT channel 2 output to the gate without enabling the speaker.
+    // SAFETY: `PIT_SPEAKER_GATE` (`0x61`) gates PIT channel 2; preserving the
+    // remaining bits keeps unrelated system control lines unchanged.
     unsafe {
-        let mut speaker: Port<u8> = Port::new(PIT_SPEAKER_GATE);
-        let speaker_state = speaker.read();
-
-        // Route PIT channel 2 output to the gate without enabling the speaker.
         speaker.write((speaker_state | 0x01) & !0x02);
-
-        let mut command: PortWriteOnly<u8> = PortWriteOnly::new(PIT_COMMAND);
-        let mut channel2: PortWriteOnly<u8> = PortWriteOnly::new(PIT_CHANNEL2_DATA);
-        command.write(0xB0);
-        channel2.write((pit_count & 0x00ff) as u8);
-        channel2.write((pit_count >> 8) as u8);
-
-        let start = read_tsc();
-        loop {
-            let state = speaker.read();
-            if state & 0x20 != 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-        let elapsed = read_tsc().saturating_sub(start);
-
-        speaker.write(speaker_state);
-
-        let tsc_hz = elapsed.saturating_mul(PIT_CALIBRATION_HZ);
-        assert!(
-            tsc_hz != 0,
-            "PIT-based TSC calibration produced zero frequency"
-        );
-        tsc_hz
     }
+
+    let mut command: PortWriteOnly<u8> = PortWriteOnly::new(PIT_COMMAND);
+    let mut channel2: PortWriteOnly<u8> = PortWriteOnly::new(PIT_CHANNEL2_DATA);
+    // SAFETY: `PIT_COMMAND` (`0x43`) is the standard 8254 PIT mode/command port;
+    // `0xb0` selects channel 2, lobyte/hibyte, mode 0.
+    unsafe {
+        command.write(0xB0);
+    }
+    // SAFETY: `PIT_CHANNEL2_DATA` (`0x42`) is the 8254 PIT channel 2 data port,
+    // expecting the low byte of the count after the `0xb0` command.
+    unsafe {
+        channel2.write((pit_count & 0x00ff) as u8);
+    }
+    // SAFETY: `PIT_CHANNEL2_DATA` (`0x42`) expects the high byte of the count
+    // after the low byte written above.
+    unsafe {
+        channel2.write((pit_count >> 8) as u8);
+    }
+
+    let start = read_tsc();
+    loop {
+        // SAFETY: `PIT_SPEAKER_GATE` (`0x61`) bit 5 reflects PIT channel 2
+        // output state.
+        let state = unsafe { speaker.read() };
+        if state & 0x20 != 0 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    let elapsed = read_tsc().saturating_sub(start);
+
+    // SAFETY: restores the `PIT_SPEAKER_GATE` (`0x61`) state read before
+    // calibration.
+    unsafe {
+        speaker.write(speaker_state);
+    }
+
+    let tsc_hz = elapsed.saturating_mul(PIT_CALIBRATION_HZ);
+    assert!(
+        tsc_hz != 0,
+        "PIT-based TSC calibration produced zero frequency"
+    );
+    tsc_hz
 }
 
 /// Configures COM1, exactly once, on the bootstrap processor before it
@@ -1544,18 +1592,26 @@ fn calibrate_tsc_via_pit() -> u64 {
 /// marker that reached the inspector as `"[KDBG engine:o"` because the
 /// `k]\n` behind it was cleared out of the FIFO.
 fn serial_uart_init() {
-    unsafe {
-        PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(0x00_u8);
-        PortWriteOnly::new(COM1_LINE_CONTROL).write(0x80_u8);
-        PortWriteOnly::new(COM1_DATA).write(0x01_u8);
-        PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(0x00_u8);
-        PortWriteOnly::new(COM1_LINE_CONTROL).write(0x03_u8);
+    let setup_writes = [
+        (COM1_INTERRUPT_ENABLE, 0x00_u8),
+        (COM1_LINE_CONTROL, 0x80_u8),
+        (COM1_DATA, 0x01_u8),
+        (COM1_INTERRUPT_ENABLE, 0x00_u8),
+        (COM1_LINE_CONTROL, 0x03_u8),
         // The divisor latch is closed, so this reaches the real IER. The
         // receive interrupt stays off until the first input waiter arms
         // it through `ByteSerial::enable_receive_interrupt`.
-        PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(0x00_u8);
-        PortWriteOnly::new(COM1_FIFO_CONTROL).write(0xc7_u8);
-        PortWriteOnly::new(COM1_MODEM_CONTROL).write(0x0b_u8);
+        (COM1_INTERRUPT_ENABLE, 0x00_u8),
+        (COM1_FIFO_CONTROL, 0xc7_u8),
+        (COM1_MODEM_CONTROL, 0x0b_u8),
+    ];
+    for (port, value) in setup_writes {
+        // SAFETY: `port` is a standard COM1 16550 UART register (`0x3f8..=0x3fc`),
+        // and `serial_uart_init` runs once on the bootstrap processor before
+        // any other processor or console writer accesses the UART.
+        unsafe {
+            PortWriteOnly::new(port).write(value);
+        }
     }
 }
 
@@ -1564,13 +1620,15 @@ pub(crate) struct DebugSerial;
 
 impl ByteSerial for DebugSerial {
     fn try_read_byte(&self) -> Option<u8> {
-        unsafe {
-            let mut status: PortReadOnly<u8> = PortReadOnly::new(COM1_LINE_STATUS);
-            if status.read() & LSR_DATA_READY == 0 {
-                return None;
-            }
-            Some(Port::new(COM1_DATA).read())
+        let mut status: PortReadOnly<u8> = PortReadOnly::new(COM1_LINE_STATUS);
+        // SAFETY: `COM1_LINE_STATUS` (`0x3fd`) is the standard COM1 16550 LSR port.
+        let lsr = unsafe { status.read() };
+        if lsr & LSR_DATA_READY == 0 {
+            return None;
         }
+        // SAFETY: `COM1_DATA` (`0x3f8`) is the COM1 receive buffer register (DLAB
+        // is closed after `serial_uart_init`) and LSR reported data ready.
+        Some(unsafe { Port::new(COM1_DATA).read() })
     }
 
     fn write_bytes(&self, bytes: &[u8]) {
@@ -1583,12 +1641,16 @@ impl ByteSerial for DebugSerial {
     /// `serial_uart_init`, so the interrupt-enable register is the one
     /// at this offset; nothing else on the machine writes it.
     fn enable_receive_interrupt(&self) {
+        // SAFETY: `COM1_INTERRUPT_ENABLE` (`0x3f9`) is the COM1 16550 IER port,
+        // DLAB is closed after `serial_uart_init`, and no other code writes it.
         unsafe {
             PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(IER_RECEIVED_DATA);
         }
     }
 
     fn disable_receive_interrupt(&self) {
+        // SAFETY: `COM1_INTERRUPT_ENABLE` (`0x3f9`) is the COM1 16550 IER port,
+        // DLAB is closed after `serial_uart_init`, and no other code writes it.
         unsafe {
             PortWriteOnly::new(COM1_INTERRUPT_ENABLE).write(0x00_u8);
         }
@@ -1599,6 +1661,9 @@ fn serial_write_byte(byte: u8) {
     while !serial_tx_ready() {
         core::hint::spin_loop();
     }
+    // SAFETY: `COM1_DATA` (`0x3f8`) is the COM1 transmit holding register (DLAB
+    // is closed after `serial_uart_init`) and `serial_tx_ready` confirmed it
+    // is empty.
     unsafe {
         PortWriteOnly::new(COM1_DATA).write(byte);
     }
@@ -1620,10 +1685,9 @@ impl helios_kernel::PanicSerial for PanicConsolePort {
 }
 
 fn serial_tx_ready() -> bool {
-    unsafe {
-        let mut status: PortReadOnly<u8> = PortReadOnly::new(COM1_LINE_STATUS);
-        status.read() & LSR_TX_EMPTY != 0
-    }
+    let mut status: PortReadOnly<u8> = PortReadOnly::new(COM1_LINE_STATUS);
+    // SAFETY: `COM1_LINE_STATUS` (`0x3fd`) is the standard COM1 16550 LSR port.
+    unsafe { status.read() & LSR_TX_EMPTY != 0 }
 }
 
 /// The console that owns the right to write to COM1.

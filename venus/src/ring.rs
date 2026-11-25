@@ -107,9 +107,10 @@ impl<'a> Ring<'a> {
     }
 
     fn word(&self, offset: usize) -> &AtomicU32 {
-        // SAFETY: all control offsets preserve alignment, remain inside the
-        // mapping, and are only accessed atomically after initialisation.
-        unsafe { &*self.base.as_ptr().add(offset).cast::<AtomicU32>() }
+        // SAFETY: all control offsets preserve alignment and remain inside the mapping.
+        let ptr = unsafe { self.base.as_ptr().add(offset) }.cast::<AtomicU32>();
+        // SAFETY: control words are only accessed atomically after initialisation.
+        unsafe { &*ptr }
     }
 
     fn status(&self) -> Result<u32, RingError> {
@@ -166,15 +167,19 @@ impl<'a> Ring<'a> {
         }
         let offset = (self.tail & (capacity - 1)) as usize;
         let first = commands.len().min(capacity as usize - offset);
-        // SAFETY: the acquired head released these bytes to the producer.
-        // The renderer cannot read them until tail is published below. The
-        // source cannot alias the mapping under `new`'s contract.
-        unsafe {
-            let buffer = self.base.as_ptr().add(Layout::BUFFER);
-            buffer
-                .add(offset)
-                .copy_from_nonoverlapping(commands.as_ptr(), first);
-            buffer.copy_from_nonoverlapping(commands.as_ptr().add(first), commands.len() - first);
+        let (head, tail) = commands.split_at(first);
+        // SAFETY: `Layout::BUFFER` is within the `layout.size()`-byte mapping.
+        let buffer = unsafe { self.base.as_ptr().add(Layout::BUFFER) };
+        // SAFETY: `offset < capacity` and `head.len() <= capacity - offset`, so the
+        // destination lies inside the ring buffer and was released by head.
+        let dst = unsafe { buffer.add(offset) };
+        // SAFETY: `dst` is valid for `head.len()` bytes and `commands` cannot alias
+        // the mapping under `new`'s contract.
+        unsafe { dst.copy_from_nonoverlapping(head.as_ptr(), head.len()) };
+        if !tail.is_empty() {
+            // SAFETY: `tail.len() <= offset`, so `buffer..buffer + tail.len()` lies
+            // inside the ring buffer, was released by head, and cannot alias `commands`.
+            unsafe { buffer.copy_from_nonoverlapping(tail.as_ptr(), tail.len()) };
         }
         self.tail = self.tail.wrapping_add(commands.len() as u32);
         self.word(Layout::TAIL).store(self.tail, Ordering::SeqCst);
@@ -206,21 +211,18 @@ mod tests {
         }
 
         fn word(&self, offset: usize) -> &AtomicU32 {
-            // SAFETY: callers name control words, which are aligned and
-            // exclusively accessed through atomic operations.
-            unsafe { &*self.base().as_ptr().add(offset).cast::<AtomicU32>() }
+            // SAFETY: callers name control offsets inside the mapping, aligned for `AtomicU32`.
+            let ptr = unsafe { self.base().as_ptr().add(offset) }.cast::<AtomicU32>();
+            // SAFETY: control words are exclusively accessed through atomic operations.
+            unsafe { &*ptr }
         }
 
         fn read(&self, offset: usize, count: usize) -> Vec<u8> {
+            // SAFETY: `Layout::BUFFER + offset` lies within the test mapping.
+            let ptr = unsafe { self.base().as_ptr().add(Layout::BUFFER + offset) };
             // SAFETY: callers have acquired the published tail and have not
             // released head yet, so these bytes belong to the renderer.
-            unsafe {
-                core::slice::from_raw_parts(
-                    self.base().as_ptr().add(Layout::BUFFER + offset),
-                    count,
-                )
-                .to_vec()
-            }
+            unsafe { core::slice::from_raw_parts(ptr, count) }.to_vec()
         }
     }
 

@@ -92,6 +92,8 @@ pub struct Runtime {
 impl Runtime {
     pub async fn open() -> Result<Self, Error> {
         let hal = open_instance()?;
+        // SAFETY: `hal` is a freshly opened Venus Vulkan instance; `wgpu`
+        // takes ownership of it whole.
         let instance = unsafe { wgpu::Instance::from_hal::<wgpu_hal::api::Vulkan>(hal) };
         Ok(Self { instance })
     }
@@ -161,6 +163,8 @@ impl Device {
         // used only to submit a marker; it is dropped before any async wait.
         let hal = unsafe { self.raw.as_hal::<wgpu_hal::api::Vulkan>() }
             .expect("Helios WebGPU devices use the Vulkan backend");
+        // SAFETY: `hal.raw_queue()` is a live queue belonging to this device's
+        // Venus entry table, guarded by `hal` for the duration of the call.
         Ok(unsafe { helios::queue_completion(hal.raw_queue()) }?)
     }
 

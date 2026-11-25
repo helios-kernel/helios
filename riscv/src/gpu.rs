@@ -73,6 +73,10 @@ fn discover_display_device(fdt: &Fdt<'_>) -> Option<(VirtioDisplayDevice, PlicIn
         .interrupt
         .and_then(PlicInterrupt::from_specifier)
         .unwrap_or_else(|| panic!("virtio-gpu node at {base:#x} has no valid interrupt source"));
+    // SAFETY: `candidate` comes from `mmio_candidates(fdt)` and matched
+    // `DeviceType::Gpu` on the bootstrap hart before interrupts are unmasked,
+    // so `header..header + candidate.size` is an identity-mapped VirtIO MMIO
+    // GPU register block with exclusive driver access.
     let device =
         unsafe { helios_virtio::gpu_from_mmio(header, candidate.size) }.unwrap_or_else(|error| {
             panic!("failed to initialize virtio-gpu device at {base:#x}: {error}")

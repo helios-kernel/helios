@@ -27,13 +27,30 @@ fn sync_deadlock(primitive: &'static str) -> ! {
     panic!("runtime adapter {primitive} spin lock exceeded SYNC_SPIN_LIMIT — deadlock detected");
 }
 
+/// Borrows Wasmtime's lock storage slot as an [`AtomicUsize`].
+///
+/// # Safety
+///
+/// `storage` must be non-null, aligned to `align_of::<AtomicUsize>()`, and
+/// point to live lock storage for at least `'a` where all concurrent accesses
+/// are atomic.
 #[inline]
-unsafe fn atomic_from_storage(storage: *mut usize) -> &'static AtomicUsize {
+unsafe fn atomic_from_storage<'a>(storage: *mut usize) -> &'a AtomicUsize {
+    // SAFETY: caller guarantees `storage` is valid, aligned, and exclusively
+    // accessed via atomics for `'a`; `AtomicUsize` shares the layout of `usize`.
     unsafe { &*storage.cast::<AtomicUsize>() }
 }
 
+/// Acquires the mutex backed by `lock`.
+///
+/// # Safety
+///
+/// `lock` must be a valid, aligned pointer to Wasmtime's lock storage word
+/// for the duration of this call.
 #[unsafe(no_mangle)]
-pub extern "C" fn wasmtime_sync_lock_acquire(lock: *mut usize) {
+pub unsafe extern "C" fn wasmtime_sync_lock_acquire(lock: *mut usize) {
+    // SAFETY: caller guarantees `lock` points to valid, aligned lock storage
+    // for the duration of this call.
     let lock = unsafe { atomic_from_storage(lock) };
     let mut iterations = 0u64;
     while lock
@@ -53,17 +70,38 @@ pub extern "C" fn wasmtime_sync_lock_acquire(lock: *mut usize) {
     }
 }
 
+/// Releases the mutex backed by `lock`.
+///
+/// # Safety
+///
+/// `lock` must be a valid, aligned pointer to Wasmtime's lock storage word
+/// previously acquired via [`wasmtime_sync_lock_acquire`].
 #[unsafe(no_mangle)]
-pub extern "C" fn wasmtime_sync_lock_release(lock: *mut usize) {
+pub unsafe extern "C" fn wasmtime_sync_lock_release(lock: *mut usize) {
+    // SAFETY: caller guarantees `lock` points to valid, aligned lock storage
+    // for the duration of this call.
     let lock = unsafe { atomic_from_storage(lock) };
     lock.store(MUTEX_UNLOCKED, Ordering::Release);
 }
 
+/// Releases any resources associated with the mutex at `_lock`.
+///
+/// # Safety
+///
+/// `_lock` must point to lock storage that is no longer in use.
 #[unsafe(no_mangle)]
-pub extern "C" fn wasmtime_sync_lock_free(_lock: *mut usize) {}
+pub unsafe extern "C" fn wasmtime_sync_lock_free(_lock: *mut usize) {}
 
+/// Acquires a shared read lock on the rwlock backed by `lock`.
+///
+/// # Safety
+///
+/// `lock` must be a valid, aligned pointer to Wasmtime's rwlock storage word
+/// for the duration of this call.
 #[unsafe(no_mangle)]
-pub extern "C" fn wasmtime_sync_rwlock_read(lock: *mut usize) {
+pub unsafe extern "C" fn wasmtime_sync_rwlock_read(lock: *mut usize) {
+    // SAFETY: caller guarantees `lock` points to valid, aligned lock storage
+    // for the duration of this call.
     let lock = unsafe { atomic_from_storage(lock) };
     let mut iterations = 0u64;
     loop {
@@ -83,14 +121,30 @@ pub extern "C" fn wasmtime_sync_rwlock_read(lock: *mut usize) {
     }
 }
 
+/// Releases a shared read lock on the rwlock backed by `lock`.
+///
+/// # Safety
+///
+/// `lock` must be a valid, aligned pointer to Wasmtime's rwlock storage word
+/// previously acquired via [`wasmtime_sync_rwlock_read`].
 #[unsafe(no_mangle)]
-pub extern "C" fn wasmtime_sync_rwlock_read_release(lock: *mut usize) {
+pub unsafe extern "C" fn wasmtime_sync_rwlock_read_release(lock: *mut usize) {
+    // SAFETY: caller guarantees `lock` points to valid, aligned lock storage
+    // for the duration of this call.
     let lock = unsafe { atomic_from_storage(lock) };
     lock.fetch_sub(1, Ordering::Release);
 }
 
+/// Acquires an exclusive write lock on the rwlock backed by `lock`.
+///
+/// # Safety
+///
+/// `lock` must be a valid, aligned pointer to Wasmtime's rwlock storage word
+/// for the duration of this call.
 #[unsafe(no_mangle)]
-pub extern "C" fn wasmtime_sync_rwlock_write(lock: *mut usize) {
+pub unsafe extern "C" fn wasmtime_sync_rwlock_write(lock: *mut usize) {
+    // SAFETY: caller guarantees `lock` points to valid, aligned lock storage
+    // for the duration of this call.
     let lock = unsafe { atomic_from_storage(lock) };
     let mut iterations = 0u64;
     while lock
@@ -105,11 +159,24 @@ pub extern "C" fn wasmtime_sync_rwlock_write(lock: *mut usize) {
     }
 }
 
+/// Releases an exclusive write lock on the rwlock backed by `lock`.
+///
+/// # Safety
+///
+/// `lock` must be a valid, aligned pointer to Wasmtime's rwlock storage word
+/// previously acquired via [`wasmtime_sync_rwlock_write`].
 #[unsafe(no_mangle)]
-pub extern "C" fn wasmtime_sync_rwlock_write_release(lock: *mut usize) {
+pub unsafe extern "C" fn wasmtime_sync_rwlock_write_release(lock: *mut usize) {
+    // SAFETY: caller guarantees `lock` points to valid, aligned lock storage
+    // for the duration of this call.
     let lock = unsafe { atomic_from_storage(lock) };
     lock.store(0, Ordering::Release);
 }
 
+/// Releases any resources associated with the rwlock at `_lock`.
+///
+/// # Safety
+///
+/// `_lock` must point to rwlock storage that is no longer in use.
 #[unsafe(no_mangle)]
-pub extern "C" fn wasmtime_sync_rwlock_free(_lock: *mut usize) {}
+pub unsafe extern "C" fn wasmtime_sync_rwlock_free(_lock: *mut usize) {}

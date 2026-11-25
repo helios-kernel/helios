@@ -231,15 +231,27 @@ impl IoApics {
 }
 
 fn window_read(registers: usize, index: u32) -> u32 {
+    // SAFETY: `registers` points to the `IOREGSEL` 32-bit register inside a
+    // mapped uncacheable I/O APIC MMIO window, written only on BSP bring-up.
     unsafe {
         (registers as *mut u32).write_volatile(index);
-        ((registers + IOWIN_OFFSET) as *const u32).read_volatile()
     }
+    // SAFETY: `registers + IOWIN_OFFSET` points to the `IOWIN` 32-bit register
+    // inside the same mapped I/O APIC window, immediately after selecting
+    // `index`.
+    unsafe { ((registers + IOWIN_OFFSET) as *const u32).read_volatile() }
 }
 
 fn window_write(registers: usize, index: u32, value: u32) {
+    // SAFETY: `registers` points to the `IOREGSEL` 32-bit register inside a
+    // mapped uncacheable I/O APIC MMIO window, written only on BSP bring-up.
     unsafe {
         (registers as *mut u32).write_volatile(index);
+    }
+    // SAFETY: `registers + IOWIN_OFFSET` points to the `IOWIN` 32-bit register
+    // inside the same mapped I/O APIC window, immediately after selecting
+    // `index`.
+    unsafe {
         ((registers + IOWIN_OFFSET) as *mut u32).write_volatile(value);
     }
 }

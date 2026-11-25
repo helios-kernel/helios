@@ -7,6 +7,8 @@
 //! kernel's own tests assert about bookkeeping, these assert about the
 //! memory underneath it.
 
+use std::sync::atomic::Ordering;
+
 use helios_hal::iommu::PhysicalRange;
 use helios_hal::vmm::{
     AddressSpace, AddressSpaceError, PageFlags, Translation, VirtAddr, VirtRange,
@@ -155,6 +157,13 @@ fn reclaim(lease: GrantLease, views: &mut ViewTable) {
     drop(lease);
 }
 
+fn read_registers(len: usize) -> Vec<u8> {
+    device_registers()[..len]
+        .iter()
+        .map(|byte| byte.load(Ordering::Relaxed))
+        .collect()
+}
+
 /// A register write through the owner's view has to reach the device.
 /// That is the whole point of showing the region rather than offering a
 /// call per register: the two views are the same memory.
@@ -170,7 +179,7 @@ fn a_shown_region_is_the_device_itself_and_not_a_copy() {
         .expect("the register file is shown");
 
     memory.write(REGISTERS_AT.offset, b"helios");
-    assert_eq!(&device_registers()[..6], b"helios");
+    assert_eq!(read_registers(6), b"helios");
     // And the other way: what the device writes, the owner reads.
     assert_eq!(memory.read(REGISTERS_AT.offset, 6), b"helios");
     assert_eq!(
@@ -218,7 +227,7 @@ fn reclaim_puts_zeroed_memory_back_behind_the_owner_s_view() {
     );
     memory.write(REGISTERS_AT.offset, b"after!");
     assert_eq!(
-        &device_registers()[..6],
+        read_registers(6),
         b"before",
         "the owner's writes no longer reach the device"
     );
@@ -476,7 +485,7 @@ fn a_substituted_device_region_is_the_device_and_restore_leaves_it_alone() {
     let shown = view.start.raw() as *mut u8;
     // SAFETY: the view is mapped read-write and `unit` bytes long.
     unsafe { std::ptr::copy_nonoverlapping(b"subst!".as_ptr(), shown, 6) };
-    assert_eq!(&device_registers()[..6], b"subst!", "owner to device");
+    assert_eq!(read_registers(6), b"subst!", "owner to device");
     assert_eq!(
         space.substitute_device(view, region),
         Err(AddressSpaceError::Substituted)
@@ -488,11 +497,7 @@ fn a_substituted_device_region_is_the_device_and_restore_leaves_it_alone() {
     // long.
     let restored = unsafe { std::slice::from_raw_parts(shown, unit) };
     assert!(restored.iter().all(|byte| *byte == 0), "zeroed memory");
-    assert_eq!(
-        &device_registers()[..6],
-        b"subst!",
-        "the device is untouched"
-    );
+    assert_eq!(read_registers(6), b"subst!", "the device is untouched");
     space
         .release(range)
         .expect("the owner's memory is released");

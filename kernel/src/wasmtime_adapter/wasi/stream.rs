@@ -223,6 +223,8 @@ impl BytesStreamBuffer {
     }
 }
 
+// SAFETY: `take` passes only initialized `u8` bytes as `&[MaybeUninit<u8>]`
+// and advances the buffer cursor by `count`.
 unsafe impl WriteBuffer<u8> for BytesStreamBuffer {
     fn remaining(&self) -> &[u8] {
         &self.bytes[self.offset..]
@@ -238,7 +240,8 @@ unsafe impl WriteBuffer<u8> for BytesStreamBuffer {
         let slice = &self.remaining()[..count];
         // SAFETY: `u8` has no invalid bit patterns and the input slice is
         // fully initialized for every byte Wasmtime is allowed to take.
-        fun(unsafe { core::mem::transmute::<&[u8], &[MaybeUninit<u8>]>(slice) });
+        let uninit = unsafe { core::mem::transmute::<&[u8], &[MaybeUninit<u8>]>(slice) };
+        fun(uninit);
         self.skip(count);
     }
 }
@@ -894,7 +897,8 @@ pub(super) mod test_source {
         fn take(&mut self, count: usize, fun: &mut dyn FnMut(&[MaybeUninit<u8>])) {
             let bytes = &self.bytes[..count];
             // SAFETY: MaybeUninit<u8> has u8's layout and all bytes are initialized.
-            fun(unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast(), bytes.len()) });
+            let uninit = unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast(), bytes.len()) };
+            fun(uninit);
             self.bytes = &self.bytes[count..];
             self.reads.moved.fetch_add(count, Ordering::Relaxed);
         }

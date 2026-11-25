@@ -15,6 +15,9 @@ const BASE_FRAME: PageSize = PageSize::from_log2(PhysFrame::SIZE.ilog2() as u8);
 
 struct PoolProvenance;
 
+// SAFETY: `create` reconstructs a non-null direct-map pointer from a
+// previously exposed pool frame address, and `destroy` exposes that
+// provenance back as a `usize`.
 unsafe impl Provenance for PoolProvenance {
     unsafe fn create(address: usize) -> NonNull<u8> {
         NonNull::new(with_exposed_provenance_mut(address))
@@ -78,6 +81,8 @@ impl FramePool {
             .min(BASE_FRAME.log2() as u32 + FRAME_ORDERS as u32 - 1);
         self.allocator =
             SummaryBuddyAllocator::with_max_page(BASE_FRAME, PageSize::from_log2(max_shift as u8));
+        // SAFETY: `usable` lists disjoint physical memory regions backed by
+        // direct-mapped RAM owned exclusively by this user frame pool.
         unsafe { self.allocator.try_init(first, span, &usable) }
             .unwrap_or_else(|error| panic!("invalid user frame map: {error:?}"));
         self.total_bytes = total_bytes;
@@ -96,12 +101,21 @@ impl FramePool {
             .expect("user frame allocation is null"))
     }
 
+    /// Returns a block previously allocated by [`Self::allocate`] to the pool.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must have been returned by [`Self::allocate`] on this pool with
+    /// the exact same `bytes` block size, must not have been deallocated
+    /// already, and must have no remaining references or aliases.
     pub(super) unsafe fn deallocate(&mut self, ptr: NonNull<u8>, bytes: usize) {
         assert!(
             bytes.is_power_of_two() && bytes >= PhysFrame::SIZE,
             "invalid user frame block size {bytes}"
         );
         let page = PageSize::from_log2(bytes.ilog2() as u8);
+        // SAFETY: the caller guarantees `ptr` is an exclusively owned, live
+        // block of size `bytes` previously allocated from `self.allocator`.
         unsafe {
             self.allocator.deallocate_physical(
                 page,
@@ -133,7 +147,9 @@ mod tests {
     impl Backing {
         fn new(bytes: usize) -> Self {
             let layout = Layout::from_size_align(bytes, bytes).expect("test pool layout");
-            let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).expect("test pool backing");
+            // SAFETY: `bytes` is a non-zero power-of-two test backing size.
+            let raw = unsafe { alloc_zeroed(layout) };
+            let ptr = NonNull::new(raw).expect("test pool backing");
             Self { ptr, layout }
         }
 
@@ -148,6 +164,8 @@ mod tests {
 
     impl Drop for Backing {
         fn drop(&mut self) {
+            // SAFETY: `self.ptr` was allocated with `alloc_zeroed(self.layout)`
+            // in `Backing::new` and is freed once here.
             unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
         }
     }
@@ -174,18 +192,24 @@ mod tests {
             assert!(address >= start + metadata && address < backing.range().1);
             assert!(address < hole_start || address >= hole_end);
             assert!(addresses.insert(address), "live frame allocated twice");
+            // SAFETY: `ptr` is a freshly allocated, exclusively owned frame of
+            // `PhysFrame::SIZE` bytes within `backing`.
             unsafe { ptr.as_ptr().write_bytes(0xa5, PhysFrame::SIZE) };
             frames.push(ptr);
         }
         assert_eq!(frames.len() * PhysFrame::SIZE, available);
         assert_eq!(pool.allocated_bytes, pool.total_bytes);
         for ptr in &frames {
+            // SAFETY: `ptr` is a live frame owned by `frames` and was written
+            // above over all `PhysFrame::SIZE` bytes.
             let bytes = unsafe { core::slice::from_raw_parts(ptr.as_ptr(), PhysFrame::SIZE) };
             assert!(bytes.iter().all(|byte| *byte == 0xa5));
         }
         for parity in [0, 1] {
             for (index, ptr) in frames.iter().copied().enumerate() {
                 if index % 2 == parity {
+                    // SAFETY: `ptr` was allocated from `pool` with
+                    // `PhysFrame::SIZE` and is deallocated once.
                     unsafe { pool.deallocate(ptr, PhysFrame::SIZE) };
                 }
             }
@@ -212,6 +236,8 @@ mod tests {
             held.push((ptr, bytes));
         }
         for (ptr, bytes) in held.into_iter().rev() {
+            // SAFETY: `ptr` was allocated from `pool` with `bytes` and is
+            // deallocated once with no remaining aliases.
             unsafe { pool.deallocate(ptr, bytes) };
             assert_eq!(
                 pool.total_bytes - pool.allocated_bytes,

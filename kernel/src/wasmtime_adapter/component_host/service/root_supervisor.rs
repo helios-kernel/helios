@@ -2161,6 +2161,7 @@ mod tests {
     fn compiler_provider_install_replace_and_stop_manage_slot() {
         let backing: &'static mut [u8] =
             alloc::boxed::Box::leak(alloc::vec![0u8; 64 * 1024 * 1024].into_boxed_slice());
+        // SAFETY: `backing` is a valid, exclusively owned, leaked `'static` mutable slice of memory obtained via `Box::leak`, guaranteeing exclusive access, proper alignment, and valid lifetime for the test allocator region.
         let region = unsafe {
             helios_hal::memory::MemoryRegion::new(
                 core::ptr::NonNull::from(backing),

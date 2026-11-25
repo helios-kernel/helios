@@ -161,12 +161,17 @@ impl helios_netstack::TcpReceiveBuffer for RegisteredTcpReadBuffer<'_> {
                 if !self.present(at, span) {
                     break 'ranges;
                 }
+                // SAFETY: `taken < bytes.len()` is checked by the loop guard,
+                // so `bytes.as_ptr().add(taken)` stays within `bytes`.
+                let src = unsafe { bytes.as_ptr().add(taken) };
                 // SAFETY: the span lies inside the linear memory the
                 // constructor's contract names, on a page this step has
-                // just seen present, and it is copied before anything can
-                // await (see the type's concurrency notes).
+                // just seen present, `src` has at least `span` readable
+                // bytes (`span <= bytes.len() - taken`), and the copy
+                // completes before anything can await (see the type's
+                // concurrency notes).
                 unsafe {
-                    ptr::copy_nonoverlapping(bytes.as_ptr().add(taken), at as *mut u8, span);
+                    ptr::copy_nonoverlapping(src, at as *mut u8, span);
                 }
                 offset += span;
                 taken += span;

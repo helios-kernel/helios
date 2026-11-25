@@ -166,8 +166,10 @@ fn write_guest_bytes(memory: &SharedMemory, offset: usize, bytes: &[u8]) {
 
 fn read_guest_bytes(memory: &SharedMemory, offset: usize, len: usize) -> Vec<u8> {
     (0..len)
-        // SAFETY: test harness reads initialized scratch offsets within the 2-page SharedMemory.
-        .map(|idx| unsafe { memory.data()[offset + idx].get().read() })
+        .map(|idx| {
+            // SAFETY: test harness reads initialized scratch offsets within the 2-page SharedMemory.
+            unsafe { memory.data()[offset + idx].get().read() }
+        })
         .collect()
 }
 

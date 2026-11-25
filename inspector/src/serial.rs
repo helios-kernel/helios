@@ -249,6 +249,9 @@ pub(crate) fn open_pty_transport() -> Result<PtyTransport, SerialError> {
     // `c_char` is i8 on x86-64 Linux but u8 on aarch64 Linux; spell the
     // libc type so the buffer matches on both.
     let mut name = [0 as libc::c_char; 128];
+    // SAFETY: `master_fd` and `slave_fd` point to writable stack `c_int` locals,
+    // `name` provides 128 bytes for the `/dev/pts/...` or `/dev/ttys...` slave
+    // PTY pathname, and `termp`/`winp` may be null per `openpty(3)`.
     let status = unsafe {
         libc::openpty(
             &mut master_fd,
@@ -263,16 +266,22 @@ pub(crate) fn open_pty_transport() -> Result<PtyTransport, SerialError> {
             source: io::Error::last_os_error(),
         });
     }
-    configure_raw_pty(slave_fd)?;
+    // SAFETY: `openpty` succeeded (`status == 0`), returning a newly opened,
+    // exclusively owned master PTY descriptor in `master_fd`.
+    let master = unsafe { File::from_raw_fd(master_fd) };
+    // SAFETY: `openpty` succeeded (`status == 0`), returning a newly opened,
+    // exclusively owned slave PTY descriptor in `slave_fd` distinct from `master_fd`.
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    configure_raw_pty(slave.as_fd())?;
+    // SAFETY: `openpty` succeeded (`status == 0`), writing a NUL-terminated
+    // slave PTY pathname into `name`.
     let path = unsafe { CStr::from_ptr(name.as_ptr()) }
         .to_str()
         .map_err(|source| SerialError::PtyPathNotUtf8 { source })?;
-    configure_nonblocking(master_fd)?;
-    let master = unsafe { File::from_raw_fd(master_fd) };
+    configure_nonblocking(master.as_fd())?;
     let read = master
         .try_clone()
         .map_err(|source| SerialError::ClonePty { source })?;
-    let slave = unsafe { File::from_raw_fd(slave_fd) };
     Ok(PtyTransport {
         io: SerialIo {
             read: Box::new(Async::new(PtyFile::new(read)).map_err(|source| {
@@ -293,19 +302,26 @@ pub(crate) fn open_pty_transport() -> Result<PtyTransport, SerialError> {
     })
 }
 
-fn configure_raw_pty(fd: libc::c_int) -> Result<(), SerialError> {
+fn configure_raw_pty(fd: BorrowedFd<'_>) -> Result<(), SerialError> {
     let mut termios = core::mem::MaybeUninit::<libc::termios>::uninit();
-    if unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) } != 0 {
+    // SAFETY: `fd` is a valid open PTY descriptor (`BorrowedFd`) and
+    // `termios` is writable stack storage for `libc::termios`.
+    if unsafe { libc::tcgetattr(fd.as_raw_fd(), termios.as_mut_ptr()) } != 0 {
         return Err(SerialError::ConfigurePty {
             step: "inspect serial PTY termios",
             source: io::Error::last_os_error(),
         });
     }
+    // SAFETY: `tcgetattr` returned 0, so `termios` is fully initialized.
     let mut termios = unsafe { termios.assume_init() };
+    // SAFETY: `termios` is an initialized `libc::termios` passed by unique
+    // mutable reference.
     unsafe {
         libc::cfmakeraw(&mut termios);
     }
-    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) } != 0 {
+    // SAFETY: `fd` is a valid open PTY descriptor and `&termios` points to an
+    // initialized `libc::termios`.
+    if unsafe { libc::tcsetattr(fd.as_raw_fd(), libc::TCSANOW, &termios) } != 0 {
         return Err(SerialError::ConfigurePty {
             step: "configure serial PTY raw mode",
             source: io::Error::last_os_error(),
@@ -314,15 +330,19 @@ fn configure_raw_pty(fd: libc::c_int) -> Result<(), SerialError> {
     Ok(())
 }
 
-fn configure_nonblocking(fd: libc::c_int) -> Result<(), SerialError> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+fn configure_nonblocking(fd: BorrowedFd<'_>) -> Result<(), SerialError> {
+    // SAFETY: `fd` is a valid open file descriptor (`BorrowedFd`) and `F_GETFL`
+    // takes no extra arguments.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
     if flags < 0 {
         return Err(SerialError::ConfigurePty {
             step: "inspect serial PTY flags",
             source: io::Error::last_os_error(),
         });
     }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+    // SAFETY: `fd` is a valid open file descriptor (`BorrowedFd`) and `F_SETFL`
+    // takes a single `c_int` flags argument.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(SerialError::ConfigurePty {
             step: "configure serial PTY nonblocking",
             source: io::Error::last_os_error(),
@@ -341,6 +361,8 @@ impl PtyFile {
     }
 }
 
+// SAFETY: `PtyFile`'s `Read` and `Write` implementations only forward to
+// `self.file` and never move out or drop the underlying `File`.
 unsafe impl async_io::IoSafe for PtyFile {}
 
 impl AsFd for PtyFile {
@@ -392,10 +414,15 @@ impl AsyncSerialPort {
     }
 }
 
+// SAFETY: `AsyncSerialPort`'s `Read` and `Write` implementations only forward
+// to `self.port` and never move out or drop the underlying `TTYPort`.
 unsafe impl async_io::IoSafe for AsyncSerialPort {}
 
 impl AsFd for AsyncSerialPort {
     fn as_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: `self.port` owns its underlying TTY file descriptor and
+        // closes it only on drop, so the raw descriptor stays open and valid
+        // for the lifetime of `&self`.
         unsafe { BorrowedFd::borrow_raw(self.port.as_raw_fd()) }
     }
 }
@@ -426,6 +453,8 @@ impl AsyncChildStdout {
     }
 }
 
+// SAFETY: `AsyncChildStdout`'s `Read` implementation only forwards to
+// `self.stdout` and never moves out or drops the underlying `ChildStdout`.
 unsafe impl async_io::IoSafe for AsyncChildStdout {}
 
 impl AsFd for AsyncChildStdout {
@@ -450,6 +479,8 @@ impl AsyncChildStdin {
     }
 }
 
+// SAFETY: `AsyncChildStdin`'s `Write` implementation only forwards to
+// `self.stdin` and never moves out or drops the underlying `ChildStdin`.
 unsafe impl async_io::IoSafe for AsyncChildStdin {}
 
 impl AsFd for AsyncChildStdin {
@@ -551,6 +582,8 @@ impl AsyncUnixSocket {
     }
 }
 
+// SAFETY: `AsyncUnixSocket`'s `Read` and `Write` implementations only forward
+// to `self.socket` and never move out or drop the underlying `UnixStream`.
 unsafe impl async_io::IoSafe for AsyncUnixSocket {}
 
 impl AsFd for AsyncUnixSocket {

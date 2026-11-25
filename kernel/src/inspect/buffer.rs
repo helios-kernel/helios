@@ -133,11 +133,12 @@ struct ParsedHeader {
 
 fn load_aligned_word(base: usize, word_index: usize) -> u64 {
     let address = base + word_index * 8;
+    let ptr = core::ptr::with_exposed_provenance_mut(address);
     // SAFETY: Caller verified `base` is 8-byte aligned, mapped, resident, and
     // covers `word_index * 8 + 8` bytes for the duration of this copy. Using
     // `AtomicU64::load` avoids forming non-atomic Rust references over memory
     // that another processor may concurrently write.
-    let cell = unsafe { AtomicU64::from_ptr(core::ptr::with_exposed_provenance_mut(address)) };
+    let cell = unsafe { AtomicU64::from_ptr(ptr) };
     cell.load(Ordering::Acquire)
 }
 
@@ -179,10 +180,14 @@ fn parse_header_words(w0: u64, w1: u64, w2: u64, w3: u64, span_len: usize) -> Op
 /// duration of this call (enforced by holding the publication's read lock and
 /// the owning instance's swap read-pin after verifying residency).
 pub(crate) unsafe fn read_span_snapshot(base: usize, span_len: usize) -> SpanReadOutcome {
-    if !base.is_multiple_of(8) || span_len < INSPECT_HEADER_BYTES {
+    let span_len = span_len.min(MAX_INSPECT_SPAN_BYTES);
+    if !base.is_multiple_of(8)
+        || !span_len.is_multiple_of(8)
+        || span_len < INSPECT_HEADER_BYTES
+        || base.checked_add(span_len).is_none()
+    {
         return SpanReadOutcome::Corrupt { generation: 0 };
     }
-    let span_len = span_len.min(MAX_INSPECT_SPAN_BYTES);
     let mut last_generation = 0u64;
 
     for _ in 0..MAX_SEQLOCK_RETRIES {

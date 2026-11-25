@@ -34,13 +34,11 @@ pub use runtime::*;
     non_snake_case,
     non_camel_case_types,
     non_upper_case_globals,
-    clippy::missing_safety_doc,
     clippy::too_many_arguments,
     clippy::manual_div_ceil,
     clippy::unnecessary_cast,
     unused_variables,
-    unused_unsafe,
-    reason = "generated from vk.xml: Vulkan names, raw-pointer entry points that mirror the C ones, commands with as many parameters as the registry gives them, length expressions copied from the registry as written (`(samples + 31) / 32`, `size as u64` of a 64-bit size), reply walks that take every parameter of the command but read only its outputs, and structs whose members are all outputs"
+    reason = "generated from vk.xml: Vulkan names, commands with as many parameters as the registry gives them, length expressions copied from the registry as written (`(samples + 31) / 32`, `size as u64` of a 64-bit size), and reply walks that take every parameter of the command but read only its outputs"
 )]
 pub mod protocol {
     use crate::runtime::scalar_newtype;

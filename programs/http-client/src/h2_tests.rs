@@ -253,7 +253,8 @@ impl Read for DuplexRead {
                 for (slot, byte) in buf.as_uninit().iter_mut().zip(&bytes) {
                     slot.write(*byte);
                 }
-                // SAFETY: the first `len` bytes were initialized in the loop above.
+                // SAFETY: `self.pull(cap)` returns at most `cap = buf.as_uninit().len()`
+                // bytes, so the loop above initialized the first `len` bytes of `buf`.
                 unsafe { buf.set_len(len) };
                 BufResult(Ok(len), buf)
             }

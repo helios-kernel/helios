@@ -12,10 +12,13 @@ use crate::protocol as wire;
 /// The first member of `T`'s type in the chain that starts at `pointer`.
 ///
 /// # Safety
-/// `pointer` is null or the start of a live Vulkan `pNext` chain.
+/// `pointer` is null or the start of a live Vulkan `pNext` chain that remains
+/// valid and immutable for `'a`.
 pub(super) unsafe fn next<'a, T: vk::TaggedStructure>(pointer: *const c_void) -> Option<&'a T> {
     // SAFETY: forwarded from the caller.
-    unsafe { find(pointer, T::STRUCTURE_TYPE).map(|member| &*member.cast::<T>()) }
+    let member = unsafe { find(pointer, T::STRUCTURE_TYPE) }?;
+    // SAFETY: `find` returned a live member whose `sType` is `T::STRUCTURE_TYPE`.
+    Some(unsafe { &*member.cast::<T>() })
 }
 
 /// The first member of `T`'s type in an output chain, for the driver to
@@ -27,8 +30,10 @@ pub(super) unsafe fn next<'a, T: vk::TaggedStructure>(pointer: *const c_void) ->
 pub(super) unsafe fn next_mut<'a, T: vk::TaggedStructure>(
     pointer: *mut c_void,
 ) -> Option<&'a mut T> {
-    // SAFETY: forwarded from the caller; the chain is writable.
-    unsafe { find(pointer, T::STRUCTURE_TYPE).map(|member| &mut *member.cast_mut().cast::<T>()) }
+    // SAFETY: forwarded from the caller.
+    let member = unsafe { find(pointer, T::STRUCTURE_TYPE) }?;
+    // SAFETY: `find` returned a live, writable member that nothing else references for `'a`.
+    Some(unsafe { &mut *member.cast_mut().cast::<T>() })
 }
 
 /// # Safety
@@ -117,22 +122,23 @@ where
     // SAFETY: header addresses `head`'s sType and pNext.
     let mut member = unsafe { (*header).p_next }.cast_const();
     // The pNext slot the next copied member is linked into.
+    // SAFETY: `header` points to `head`'s initialized common header.
     let mut link = unsafe { &raw mut (*header).p_next };
     while !member.is_null() {
         // SAFETY: the caller's chain members are live and share the header.
-        let (s_type, next) = unsafe { ((*member).s_type, (*member).p_next) };
+        let header_ref = unsafe { &*member };
+        let (s_type, next) = (header_ref.s_type, header_ref.p_next);
         if s_type == T::STRUCTURE_TYPE {
             // SAFETY: a member with T's sType is a T.
             let mut target = unsafe { *member.cast::<T>() };
             edit(&mut target);
             // SAFETY: target is a live local of T's layout.
             let copy = unsafe { Member::copy((&raw const target).cast(), Layout::new::<T>()) };
-            // SAFETY: link is a pNext slot of `head` or of a copied member;
+            // SAFETY: `copy` owns a freshly allocated `T` whose `pNext` slot is writable.
+            unsafe { (*copy.header()).p_next = next };
+            // SAFETY: `link` is a `pNext` slot of `head` or of a copied member;
             // the tail after the target remains the caller's.
-            unsafe {
-                (*copy.header()).p_next = next;
-                *link = copy.header();
-            }
+            unsafe { *link = copy.header() };
             members.push(copy);
             return Some(Rewritten {
                 head,
@@ -144,6 +150,7 @@ where
             let copy = unsafe { Member::copy(member.cast(), layout) };
             // SAFETY: as above; the copy's pNext is relinked on the next copy.
             unsafe { *link = copy.header() };
+            // SAFETY: `copy.header()` points to the newly allocated member's header.
             link = unsafe { &raw mut (*copy.header()).p_next };
             members.push(copy);
         }
@@ -190,34 +197,37 @@ mod tests {
         );
         assert_eq!(list.p_next, (&raw const external).cast());
 
-        // SAFETY: the rewritten chain lives as long as `rewritten`.
-        unsafe {
-            let head = &*rewritten.head();
-            assert_eq!(head.format, vk::Format::B8G8R8A8_UNORM);
-            assert_ne!(head.p_next, original_next);
-            let copied_list = &*head.p_next.cast::<vk::ImageFormatListCreateInfo<'_>>();
-            assert_eq!(
-                copied_list.s_type,
-                vk::StructureType::IMAGE_FORMAT_LIST_CREATE_INFO
-            );
-            assert_eq!(copied_list.view_format_count, 1);
-            assert_eq!(copied_list.p_view_formats, formats.as_ptr());
-            let copied_external = &*copied_list
+        // SAFETY: the rewritten head lives as long as `rewritten`.
+        let head = unsafe { &*rewritten.head() };
+        assert_eq!(head.format, vk::Format::B8G8R8A8_UNORM);
+        assert_ne!(head.p_next, original_next);
+        // SAFETY: `head.p_next` points to the copied `ImageFormatListCreateInfo`.
+        let copied_list = unsafe { &*head.p_next.cast::<vk::ImageFormatListCreateInfo<'_>>() };
+        assert_eq!(
+            copied_list.s_type,
+            vk::StructureType::IMAGE_FORMAT_LIST_CREATE_INFO
+        );
+        assert_eq!(copied_list.view_format_count, 1);
+        assert_eq!(copied_list.p_view_formats, formats.as_ptr());
+        // SAFETY: `copied_list.p_next` points to the copied `ExternalMemoryImageCreateInfo`.
+        let copied_external = unsafe {
+            &*copied_list
                 .p_next
-                .cast::<vk::ExternalMemoryImageCreateInfo<'_>>();
-            assert_eq!(
-                copied_external.handle_types,
-                vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD
-            );
-            assert_ne!(
-                (copied_external as *const vk::ExternalMemoryImageCreateInfo<'_>).cast(),
-                (&raw const external).cast::<c_void>()
-            );
-            assert_eq!(copied_external.p_next, (&raw const tail).cast());
-            let found = next::<vk::ImageStencilUsageCreateInfo<'_>>(head.p_next)
-                .expect("the shared tail stays in the chain");
-            assert_eq!(found.stencil_usage, vk::ImageUsageFlags::SAMPLED);
-        }
+                .cast::<vk::ExternalMemoryImageCreateInfo<'_>>()
+        };
+        assert_eq!(
+            copied_external.handle_types,
+            vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD
+        );
+        assert_ne!(
+            (copied_external as *const vk::ExternalMemoryImageCreateInfo<'_>).cast(),
+            (&raw const external).cast::<c_void>()
+        );
+        assert_eq!(copied_external.p_next, (&raw const tail).cast());
+        // SAFETY: the rewritten chain lives as long as `rewritten`.
+        let found = unsafe { next::<vk::ImageStencilUsageCreateInfo<'_>>(head.p_next) }
+            .expect("the shared tail stays in the chain");
+        assert_eq!(found.stencil_usage, vk::ImageUsageFlags::SAMPLED);
     }
 
     #[test]
@@ -233,17 +243,16 @@ mod tests {
             })
         }
         .unwrap();
+        // SAFETY: the rewritten head lives as long as `rewritten`.
+        let head = unsafe { &*rewritten.head() };
+        assert_eq!(head.allocation_size, 4096);
         // SAFETY: the rewritten chain lives as long as `rewritten`.
-        unsafe {
-            let head = &*rewritten.head();
-            assert_eq!(head.allocation_size, 4096);
-            let copy = next::<vk::ExportMemoryAllocateInfo<'_>>(head.p_next).unwrap();
-            assert_eq!(
-                copy.handle_types,
-                vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD
-            );
-            assert!(copy.p_next.is_null());
-        }
+        let copy = unsafe { next::<vk::ExportMemoryAllocateInfo<'_>>(head.p_next) }.unwrap();
+        assert_eq!(
+            copy.handle_types,
+            vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD
+        );
+        assert!(copy.p_next.is_null());
         assert_eq!(
             export.handle_types,
             vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT
@@ -292,11 +301,10 @@ mod tests {
             })
         }
         .unwrap();
-        // SAFETY: the rewritten chain lives as long as `rewritten`.
-        unsafe {
-            let head = &*rewritten.head();
-            let first = &*head.p_next.cast::<vk::BaseInStructure<'_>>();
-            assert_eq!(first.s_type, vk::StructureType::EXPORT_MEMORY_ALLOCATE_INFO);
-        }
+        // SAFETY: the rewritten head lives as long as `rewritten`.
+        let head = unsafe { &*rewritten.head() };
+        // SAFETY: `head.p_next` points to the copied `ExportMemoryAllocateInfo`.
+        let first = unsafe { &*head.p_next.cast::<vk::BaseInStructure<'_>>() };
+        assert_eq!(first.s_type, vk::StructureType::EXPORT_MEMORY_ALLOCATE_INFO);
     }
 }

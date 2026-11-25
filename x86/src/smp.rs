@@ -430,6 +430,9 @@ pub(crate) fn build_boot_context(
     pool: &UserMemoryPool,
 ) -> &'static BootContext {
     let tsc_hz = handler.timebase.frequency();
+    // SAFETY: `rsdp_address` is the RSDP physical address from Limine, and
+    // `from_rsdp` validates its signature and checksum before reading tables
+    // through `PhysicalOffsetAcpiHandler`.
     let tables = unsafe { AcpiTables::from_rsdp(handler.clone(), rsdp_address) }
         .unwrap_or_else(|error| panic!("failed to parse ACPI tables: {error:?}"));
     let watchdog = crate::watchdog::discover(&tables, handler.physical_memory_offset);
@@ -589,12 +592,16 @@ pub(crate) fn install_bootstrap_anchor() {
     BOOTSTRAP_ANCHOR
         .identity
         .store(identity.raw(), Ordering::Relaxed);
+    // SAFETY: `BOOTSTRAP_ANCHOR` is a `'static` `ProcessorAnchor` and
+    // `IA32_FS_BASE` is architectural on x86-64.
     unsafe {
         wrmsr(IA32_FS_BASE, core::ptr::from_ref(&BOOTSTRAP_ANCHOR) as u64);
     }
 }
 
 pub(crate) fn activate_runtime(runtime: &ProcessorRuntime) {
+    // SAFETY: `runtime` points to this processor's `'static` `ProcessorSlot`
+    // anchor (`anchor` at offset 0), and `IA32_FS_BASE` is architectural.
     unsafe {
         wrmsr(IA32_FS_BASE, runtime as *const _ as u64);
     }
@@ -728,7 +735,11 @@ pub(crate) extern "C" fn resume_current_rust(
     boot: *const BootContext,
     runtime: *const ProcessorRuntime,
 ) -> ! {
+    // SAFETY: the wakeup trampoline passes the leaked `'static` `BootContext`
+    // pointer patched into the wakeup page.
     let boot = unsafe { &*boot };
+    // SAFETY: the wakeup trampoline passes this processor's `'static`
+    // `ProcessorRuntime` pointer patched into the wakeup page.
     let runtime = unsafe { &*runtime };
     crate::extended_state::enable_on_secondary_processor(boot.xcr0());
     boot.user_isolation().enable_on_secondary_processor();
@@ -804,6 +815,9 @@ fn rejoin_shootdown_targets() {
 #[inline(always)]
 fn anchor_identity_word() -> usize {
     let word: usize;
+    // SAFETY: `IA32_FS_BASE` points to this processor's `ProcessorAnchor`
+    // (`BOOTSTRAP_ANCHOR` or its slot's `ProcessorRuntime`) before any Rust
+    // instruction calls this, and `ANCHOR_IDENTITY_OFFSET` is verified above.
     unsafe {
         core::arch::asm!(
             "mov {word}, fs:[{offset}]",
@@ -820,6 +834,8 @@ fn anchor_identity_word() -> usize {
 #[inline(always)]
 fn anchor_logical_id() -> u16 {
     let logical_id: u16;
+    // SAFETY: `IA32_FS_BASE` points to this processor's `ProcessorAnchor`, and
+    // `ANCHOR_LOGICAL_ID_OFFSET` is verified by a compile-time `offset_of!`.
     unsafe {
         core::arch::asm!(
             "mov {logical_id:x}, fs:[{offset}]",
@@ -835,6 +851,9 @@ pub(crate) fn current_runtime() -> &'static ProcessorRuntime {
     let runtime = current_identity()
         .runtime_address()
         .unwrap_or_else(|| panic!("x86 processor runtime was not installed before use"));
+    // SAFETY: `ProcessorIdentity::runtime_address` is populated by
+    // `publish_anchor_identities` from `&slot.runtime` inside the leaked
+    // `'static` `BootContext`.
     unsafe { &*(runtime.get() as *const ProcessorRuntime) }
 }
 
@@ -960,12 +979,16 @@ impl ProcessorRuntime {
     fn set_timer_count(&self, count: u32) {
         assert!(count != 0, "x86 local APIC timer period would be zero");
         match self.apic_mode {
-            LocalApicMode::X2Apic => unsafe {
-                wrmsr(IA32_X2APIC_INIT_COUNT, u64::from(count));
-            },
+            LocalApicMode::X2Apic => {
+                // SAFETY: `apic_mode` is x2APIC and the local APIC is attached,
+                // so `IA32_X2APIC_INIT_COUNT` is valid on this processor.
+                unsafe {
+                    wrmsr(IA32_X2APIC_INIT_COUNT, u64::from(count));
+                }
+            }
             LocalApicMode::XApic { physical_base } => {
-                let apic_region = xapic_mmio_region(physical_base, self.physical_memory_offset);
-                write_xapic_register(apic_region, XAPIC_TIMER_INIT_COUNT, count);
+                let apic_base = xapic_mmio_base(physical_base, self.physical_memory_offset);
+                write_xapic_register(apic_base, XAPIC_TIMER_INIT_COUNT, count);
             }
         }
     }
@@ -975,19 +998,26 @@ impl ProcessorRuntime {
     /// [`enable_local_scheduler_timer`] re-arms without calibrating again.
     fn mask_local_timer(&self) {
         match self.apic_mode {
-            LocalApicMode::X2Apic => unsafe {
-                wrmsr(
-                    IA32_X2APIC_LVT_TIMER,
-                    rdmsr(IA32_X2APIC_LVT_TIMER) | APIC_TIMER_MASKED,
-                );
-                wrmsr(IA32_X2APIC_INIT_COUNT, 0);
-            },
+            LocalApicMode::X2Apic => {
+                // SAFETY: `apic_mode` is x2APIC, so `IA32_X2APIC_LVT_TIMER` is
+                // readable on this processor.
+                let lvt = unsafe { rdmsr(IA32_X2APIC_LVT_TIMER) };
+                // SAFETY: masks the local x2APIC timer interrupt on this
+                // processor.
+                unsafe {
+                    wrmsr(IA32_X2APIC_LVT_TIMER, lvt | APIC_TIMER_MASKED);
+                }
+                // SAFETY: stops the x2APIC timer countdown on this processor.
+                unsafe {
+                    wrmsr(IA32_X2APIC_INIT_COUNT, 0);
+                }
+            }
             LocalApicMode::XApic { physical_base } => {
-                let apic_region = xapic_mmio_region(physical_base, self.physical_memory_offset);
-                let lvt = u64::from(read_xapic_register(apic_region, XAPIC_LVT_TIMER))
-                    | APIC_TIMER_MASKED;
-                write_xapic_register(apic_region, XAPIC_LVT_TIMER, lvt as u32);
-                write_xapic_register(apic_region, XAPIC_TIMER_INIT_COUNT, 0);
+                let apic_base = xapic_mmio_base(physical_base, self.physical_memory_offset);
+                let lvt =
+                    u64::from(read_xapic_register(apic_base, XAPIC_LVT_TIMER)) | APIC_TIMER_MASKED;
+                write_xapic_register(apic_base, XAPIC_LVT_TIMER, lvt as u32);
+                write_xapic_register(apic_base, XAPIC_TIMER_INIT_COUNT, 0);
             }
         }
     }
@@ -1029,8 +1059,14 @@ impl ProcessorRuntime {
             LocalApicMode::X2Apic => {
                 let mut apic = X2APIC::new();
                 apic.attach();
+                // SAFETY: x2APIC is enabled above; writing `IA32_X2APIC_ESR`
+                // clears pending APIC error bits on this processor.
                 unsafe {
                     wrmsr(IA32_X2APIC_ESR, 0);
+                }
+                // SAFETY: x2APIC is enabled above; programs the LVT error
+                // vector to `APIC_ERROR_INTERRUPT_VECTOR`.
+                unsafe {
                     wrmsr(
                         IA32_X2APIC_LVT_ERROR,
                         u64::from(crate::exceptions::APIC_ERROR_INTERRUPT_VECTOR),
@@ -1038,8 +1074,8 @@ impl ProcessorRuntime {
                 }
             }
             LocalApicMode::XApic { physical_base } => {
-                let apic_region = xapic_mmio_region(physical_base, self.physical_memory_offset);
-                attach_xapic(apic_region);
+                let apic_base = xapic_mmio_base(physical_base, self.physical_memory_offset);
+                attach_xapic(apic_base);
             }
         }
     }
@@ -1322,21 +1358,23 @@ impl X86PlatformState {
             entry,
         );
 
-        unsafe {
+        // SAFETY: `wakeup_lock` serializes access to the identity-mapped wakeup
+        // page, and `slot.apic_id` names a valid secondary APIC ID.
+        let wake_result = unsafe {
             wake_application_processor(
                 slot.apic_id,
                 wakeup_page.physical_start,
                 self.physical_memory_offset,
                 self.timebase.frequency(),
             )
-            .unwrap_or_else(|message| {
-                panic!(
-                    "failed to wake x86 processor {} apic_id={}: {message}",
-                    processor.id(),
-                    slot.apic_id
-                )
-            });
-        }
+        };
+        wake_result.unwrap_or_else(|message| {
+            panic!(
+                "failed to wake x86 processor {} apic_id={}: {message}",
+                processor.id(),
+                slot.apic_id
+            )
+        });
 
         let deadline = read_tsc()
             .checked_add(self.timebase.frequency() / 2)
@@ -1391,6 +1429,8 @@ impl LocalApicMode {
         if cpuid.ecx & (1 << 21) != 0 {
             return Self::X2Apic;
         }
+        // SAFETY: `IA32_APIC_BASE` is architectural on x86-64 CPUs with a
+        // local APIC.
         let base = unsafe { rdmsr(x86::msr::IA32_APIC_BASE) };
         if base & (1 << 10) != 0 {
             return Self::X2Apic;
@@ -1553,10 +1593,20 @@ pub(crate) fn handle_tlb_shootdown_interrupt() {
 /// A WRMSR to an x2APIC register is not serializing, so the fence makes
 /// the stores the receiver reads (the shootdown range, a woken task)
 /// visible before the interrupt is sent.
+/// # Safety
+///
+/// The calling processor must be running in x2APIC mode with its local APIC
+/// enabled, and `icr` must specify a valid interrupt vector and destination.
 unsafe fn send_x2apic_ipi(icr: x86::apic::Icr) {
     let value = (u64::from(icr.upper()) << 32) | u64::from(icr.lower());
+    // SAFETY: `mfence; lfence` orders prior shared-memory writes before the
+    // non-serializing x2APIC ICR `wrmsr` below.
     unsafe {
         core::arch::asm!("mfence", "lfence", options(nostack, preserves_flags));
+    }
+    // SAFETY: caller guarantees x2APIC is enabled and `icr` carries a valid
+    // vector and destination.
+    unsafe {
         wrmsr(IA32_X2APIC_ICR, value);
     }
 }
@@ -1590,6 +1640,8 @@ pub(crate) fn send_wake_ipi(target_apic_id: u32) {
                 Level::Assert,
                 TriggerMode::Edge,
             );
+            // SAFETY: local APIC is attached in x2APIC mode and `icr` targets
+            // `target_apic_id` with `WAKE_INTERRUPT_VECTOR`.
             unsafe { send_x2apic_ipi(icr) };
         }
         LocalApicMode::XApic { physical_base } => {
@@ -1605,6 +1657,8 @@ pub(crate) fn send_wake_ipi(target_apic_id: u32) {
                 Level::Assert,
                 TriggerMode::Edge,
             );
+            // SAFETY: local APIC is attached in xAPIC mode and `icr` targets
+            // `target_apic_id` with `WAKE_INTERRUPT_VECTOR`.
             unsafe { apic.send_ipi(icr) };
         }
     }
@@ -1628,6 +1682,8 @@ fn send_tlb_shootdown_ipi_all_excluding_self() {
                 Level::Assert,
                 TriggerMode::Edge,
             );
+            // SAFETY: local APIC is attached in x2APIC mode and `icr` broadcasts
+            // `TLB_SHOOTDOWN_INTERRUPT_VECTOR` to all other processors.
             unsafe { send_x2apic_ipi(icr) };
         }
         LocalApicMode::XApic { physical_base } => {
@@ -1643,6 +1699,8 @@ fn send_tlb_shootdown_ipi_all_excluding_self() {
                 Level::Assert,
                 TriggerMode::Edge,
             );
+            // SAFETY: local APIC is attached in xAPIC mode and `icr` broadcasts
+            // `TLB_SHOOTDOWN_INTERRUPT_VECTOR` to all other processors.
             unsafe { apic.send_ipi(icr) };
         }
     }
@@ -1667,6 +1725,8 @@ fn enable_local_scheduler_timer(vector: u8) {
     match runtime.apic_mode() {
         LocalApicMode::X2Apic => {
             let initial_count = if calibrated != 0 {
+                // SAFETY: x2APIC is attached above; `IA32_X2APIC_DIV_CONF` sets
+                // the timer divide configuration on this processor.
                 unsafe {
                     wrmsr(IA32_X2APIC_DIV_CONF, u64::from(APIC_TIMER_DIVIDE_BY_ONE));
                 }
@@ -1680,62 +1740,78 @@ fn enable_local_scheduler_timer(vector: u8) {
             program_x2apic_periodic_timer(vector, initial_count);
         }
         LocalApicMode::XApic { physical_base } => {
-            let apic_region = xapic_mmio_region(physical_base, runtime.physical_memory_offset);
+            let apic_base = xapic_mmio_base(physical_base, runtime.physical_memory_offset);
             let initial_count = if calibrated != 0 {
-                write_xapic_register(apic_region, XAPIC_TIMER_DIV_CONF, APIC_TIMER_DIVIDE_BY_ONE);
+                write_xapic_register(apic_base, XAPIC_TIMER_DIV_CONF, APIC_TIMER_DIVIDE_BY_ONE);
                 calibrated
             } else {
-                calibrate_xapic_timer(apic_region, runtime.platform_tsc_hz())
+                calibrate_xapic_timer(apic_base, runtime.platform_tsc_hz())
             };
             runtime
                 .scheduler_tick_count
                 .store(initial_count, Ordering::Relaxed);
-            program_xapic_periodic_timer(apic_region, vector, initial_count);
+            program_xapic_periodic_timer(apic_base, vector, initial_count);
         }
     }
 }
 
-fn attach_xapic(apic_region: &[u32]) {
+fn attach_xapic(apic_base: *mut u32) {
+    // SAFETY: `IA32_APIC_BASE` is architectural on x86-64 CPUs with a local
+    // APIC.
+    let mut base = unsafe { rdmsr(IA32_APIC_BASE) };
+    base |= 1 << 11;
+    // SAFETY: sets bit 11 (APIC global enable) in `IA32_APIC_BASE`, preserving
+    // the remaining fields.
     unsafe {
-        let mut base = rdmsr(IA32_APIC_BASE);
-        base |= 1 << 11;
         wrmsr(IA32_APIC_BASE, base);
     }
-    write_xapic_register(apic_region, XAPIC_SVR, (1 << 8) | 15);
-    write_xapic_register(apic_region, XAPIC_ESR, 0);
+    write_xapic_register(apic_base, XAPIC_SVR, (1 << 8) | 15);
+    write_xapic_register(apic_base, XAPIC_ESR, 0);
     write_xapic_register(
-        apic_region,
+        apic_base,
         XAPIC_LVT_ERROR,
         u32::from(crate::exceptions::APIC_ERROR_INTERRUPT_VECTOR),
     );
 }
 
 fn calibrate_x2apic_timer(tsc_hz: u64) -> u32 {
+    // SAFETY: x2APIC is attached; sets timer divide configuration to 1.
     unsafe {
         wrmsr(IA32_X2APIC_DIV_CONF, u64::from(APIC_TIMER_DIVIDE_BY_ONE));
+    }
+    // SAFETY: masks the x2APIC LVT timer entry during calibration.
+    unsafe {
         wrmsr(
             IA32_X2APIC_LVT_TIMER,
             APIC_TIMER_MASKED | u64::from(crate::exceptions::TIMER_INTERRUPT_VECTOR),
         );
-        wrmsr(IA32_X2APIC_INIT_COUNT, u64::from(u32::MAX));
-        stall_microseconds(tsc_hz, APIC_TIMER_CALIBRATION_MICROS);
-        let current = rdmsr(IA32_X2APIC_CUR_COUNT) as u32;
-        wrmsr(IA32_X2APIC_INIT_COUNT, 0);
-        timer_elapsed_count(current)
     }
+    // SAFETY: starts the x2APIC timer countdown from `u32::MAX`.
+    unsafe {
+        wrmsr(IA32_X2APIC_INIT_COUNT, u64::from(u32::MAX));
+    }
+    stall_microseconds(tsc_hz, APIC_TIMER_CALIBRATION_MICROS);
+    // SAFETY: reads the remaining x2APIC timer count after the stall.
+    let current = unsafe { rdmsr(IA32_X2APIC_CUR_COUNT) } as u32;
+    // SAFETY: stops the calibration countdown by writing 0 to
+    // `IA32_X2APIC_INIT_COUNT`.
+    unsafe {
+        wrmsr(IA32_X2APIC_INIT_COUNT, 0);
+    }
+    timer_elapsed_count(current)
 }
 
-fn calibrate_xapic_timer(apic_region: &[u32], tsc_hz: u64) -> u32 {
-    write_xapic_register(apic_region, XAPIC_TIMER_DIV_CONF, APIC_TIMER_DIVIDE_BY_ONE);
+fn calibrate_xapic_timer(apic_base: *mut u32, tsc_hz: u64) -> u32 {
+    write_xapic_register(apic_base, XAPIC_TIMER_DIV_CONF, APIC_TIMER_DIVIDE_BY_ONE);
     write_xapic_register(
-        apic_region,
+        apic_base,
         XAPIC_LVT_TIMER,
         (APIC_TIMER_MASKED | u64::from(crate::exceptions::TIMER_INTERRUPT_VECTOR)) as u32,
     );
-    write_xapic_register(apic_region, XAPIC_TIMER_INIT_COUNT, u32::MAX);
+    write_xapic_register(apic_base, XAPIC_TIMER_INIT_COUNT, u32::MAX);
     stall_microseconds(tsc_hz, APIC_TIMER_CALIBRATION_MICROS);
-    let current = read_xapic_register(apic_region, XAPIC_TIMER_CURRENT_COUNT);
-    write_xapic_register(apic_region, XAPIC_TIMER_INIT_COUNT, 0);
+    let current = read_xapic_register(apic_base, XAPIC_TIMER_CURRENT_COUNT);
+    write_xapic_register(apic_base, XAPIC_TIMER_INIT_COUNT, 0);
     timer_elapsed_count(current)
 }
 
@@ -1749,23 +1825,29 @@ fn timer_elapsed_count(current: u32) -> u32 {
 }
 
 fn program_x2apic_periodic_timer(vector: u8, initial_count: u32) {
+    // SAFETY: x2APIC is attached; reads `IA32_X2APIC_LVT_TIMER` on this
+    // processor.
+    let existing = unsafe { rdmsr(IA32_X2APIC_LVT_TIMER) };
+    let lvt = (existing & !(APIC_TIMER_VECTOR_MASK | APIC_TIMER_MASKED | APIC_TIMER_MODE_MASK))
+        | u64::from(vector)
+        | APIC_TIMER_PERIODIC;
+    // SAFETY: arms periodic delivery on `vector` for this processor's x2APIC.
     unsafe {
-        let lvt = (rdmsr(IA32_X2APIC_LVT_TIMER)
-            & !(APIC_TIMER_VECTOR_MASK | APIC_TIMER_MASKED | APIC_TIMER_MODE_MASK))
-            | u64::from(vector)
-            | APIC_TIMER_PERIODIC;
         wrmsr(IA32_X2APIC_LVT_TIMER, lvt);
+    }
+    // SAFETY: sets the periodic countdown to `initial_count`.
+    unsafe {
         wrmsr(IA32_X2APIC_INIT_COUNT, u64::from(initial_count));
     }
 }
 
-fn program_xapic_periodic_timer(apic_region: &[u32], vector: u8, initial_count: u32) {
-    let lvt = (u64::from(read_xapic_register(apic_region, XAPIC_LVT_TIMER))
+fn program_xapic_periodic_timer(apic_base: *mut u32, vector: u8, initial_count: u32) {
+    let lvt = (u64::from(read_xapic_register(apic_base, XAPIC_LVT_TIMER))
         & !(APIC_TIMER_VECTOR_MASK | APIC_TIMER_MASKED | APIC_TIMER_MODE_MASK))
         | u64::from(vector)
         | APIC_TIMER_PERIODIC;
-    write_xapic_register(apic_region, XAPIC_LVT_TIMER, lvt as u32);
-    write_xapic_register(apic_region, XAPIC_TIMER_INIT_COUNT, initial_count);
+    write_xapic_register(apic_base, XAPIC_LVT_TIMER, lvt as u32);
+    write_xapic_register(apic_base, XAPIC_TIMER_INIT_COUNT, initial_count);
 }
 
 bitflags::bitflags! {
@@ -1787,14 +1869,19 @@ bitflags::bitflags! {
 pub(crate) fn handle_apic_error_interrupt() -> ! {
     let runtime = current_runtime();
     let esr = match runtime.apic_mode() {
-        LocalApicMode::X2Apic => unsafe {
-            wrmsr(IA32_X2APIC_ESR, 0);
-            rdmsr(IA32_X2APIC_ESR) as u32
-        },
+        LocalApicMode::X2Apic => {
+            // SAFETY: x2APIC is attached; writing 0 to `IA32_X2APIC_ESR`
+            // latches pending errors before reading.
+            unsafe {
+                wrmsr(IA32_X2APIC_ESR, 0);
+            }
+            // SAFETY: reads the latched `IA32_X2APIC_ESR` on this processor.
+            unsafe { rdmsr(IA32_X2APIC_ESR) as u32 }
+        }
         LocalApicMode::XApic { physical_base } => {
-            let apic_region = xapic_mmio_region(physical_base, runtime.physical_memory_offset);
-            write_xapic_register(apic_region, XAPIC_ESR, 0);
-            read_xapic_register(apic_region, XAPIC_ESR)
+            let apic_base = xapic_mmio_base(physical_base, runtime.physical_memory_offset);
+            write_xapic_register(apic_base, XAPIC_ESR, 0);
+            read_xapic_register(apic_base, XAPIC_ESR)
         }
     };
     let id = current_processor().id();
@@ -1804,15 +1891,31 @@ pub(crate) fn handle_apic_error_interrupt() -> ! {
     );
 }
 
-fn read_xapic_register(apic_region: &[u32], offset: u32) -> u32 {
+fn read_xapic_register(apic_base: *mut u32, offset: u32) -> u32 {
+    assert!(
+        offset.is_multiple_of(4) && (offset as usize) < WAKEUP_PAGE_BYTES,
+        "xAPIC register offset {offset:#x} out of range or unaligned"
+    );
     let index = (offset / 4) as usize;
-    unsafe { core::ptr::read_volatile(&apic_region[index]) }
+    // SAFETY: `apic_base` points to a mapped 4 KiB uncacheable xAPIC page and
+    // `index < WAKEUP_PAGE_BYTES / 4`.
+    let slot = unsafe { apic_base.add(index) };
+    // SAFETY: `slot` is 4-byte aligned and points to a mapped xAPIC register.
+    unsafe { core::ptr::read_volatile(slot) }
 }
 
-fn write_xapic_register(apic_region: &[u32], offset: u32, value: u32) {
+fn write_xapic_register(apic_base: *mut u32, offset: u32, value: u32) {
+    assert!(
+        offset.is_multiple_of(4) && (offset as usize) < WAKEUP_PAGE_BYTES,
+        "xAPIC register offset {offset:#x} out of range or unaligned"
+    );
     let index = (offset / 4) as usize;
+    // SAFETY: `apic_base` points to a mapped 4 KiB uncacheable xAPIC page and
+    // `index < WAKEUP_PAGE_BYTES / 4`.
+    let slot = unsafe { apic_base.add(index) };
+    // SAFETY: `slot` is 4-byte aligned and points to a mapped xAPIC register.
     unsafe {
-        core::ptr::write_volatile(apic_region.as_ptr().add(index) as *mut u32, value);
+        core::ptr::write_volatile(slot, value);
     }
 }
 
@@ -1831,6 +1934,14 @@ fn local_apic_eoi() {
     }
 }
 
+/// Sends INIT/SIPI startup IPIs to the processor identified by `apic_id` to
+/// begin executing at `wakeup_page_physical`.
+///
+/// # Safety
+///
+/// `wakeup_page_physical` must be 4 KiB aligned, below 1 MiB, identity-mapped,
+/// and populated with the secondary wakeup image; callers must hold
+/// `wakeup_lock` so concurrent startups do not race on the wakeup page.
 unsafe fn wake_application_processor(
     apic_id: u32,
     wakeup_page_physical: usize,
@@ -1873,18 +1984,24 @@ fn send_startup_ipis(
     startup_vector: u8,
     tsc_hz: u64,
 ) {
+    // SAFETY: local APIC is attached and `apic_id` is a valid target processor.
     unsafe {
         apic.ipi_init(apic_id);
     }
     stall_microseconds(tsc_hz, AP_STARTUP_INIT_ASSERT_MICROS);
+    // SAFETY: local APIC is attached; deasserts the INIT IPI sent above.
     unsafe {
         apic.ipi_init_deassert();
     }
     stall_microseconds(tsc_hz, AP_STARTUP_INTER_IPI_MICROS);
+    // SAFETY: local APIC is attached and `startup_vector` points to the
+    // identity-mapped 4 KiB wakeup page.
     unsafe {
         apic.ipi_startup(apic_id, startup_vector);
     }
     stall_microseconds(tsc_hz, AP_STARTUP_INTER_IPI_MICROS);
+    // SAFETY: second SIPI per Intel MP startup protocol to the same wakeup
+    // page.
     unsafe {
         apic.ipi_startup(apic_id, startup_vector);
     }
@@ -1898,11 +2015,17 @@ fn stall_microseconds(tsc_hz: u64, microseconds: u64) {
     }
 }
 
-fn xapic_mmio_region(physical_base: usize, physical_memory_offset: usize) -> &'static mut [u32] {
+fn xapic_mmio_base(physical_base: usize, physical_memory_offset: usize) -> *mut u32 {
     // The local APIC page is MMIO, not RAM: it is absent from the boot
     // memory map, so the HHDM does not cover it until it is mapped here.
-    let virtual_base = map_mmio_window(physical_memory_offset, physical_base, WAKEUP_PAGE_BYTES);
-    unsafe { core::slice::from_raw_parts_mut(virtual_base as *mut u32, WAKEUP_PAGE_BYTES / 4) }
+    map_mmio_window(physical_memory_offset, physical_base, WAKEUP_PAGE_BYTES) as *mut u32
+}
+
+fn xapic_mmio_region(physical_base: usize, physical_memory_offset: usize) -> &'static mut [u32] {
+    let base = xapic_mmio_base(physical_base, physical_memory_offset);
+    // SAFETY: `xapic_mmio_base` mapped the 4 KiB page-aligned xAPIC MMIO
+    // window (`WAKEUP_PAGE_BYTES / 4` `u32` registers) and never unmaps it.
+    unsafe { core::slice::from_raw_parts_mut(base, WAKEUP_PAGE_BYTES / 4) }
 }
 
 impl PhysicalOffsetAcpiHandler {
@@ -1938,58 +2061,80 @@ impl Handler for PhysicalOffsetAcpiHandler {
     unsafe fn unmap_physical_region<T>(&self, _region: RawPhysicalMapping<T>) {}
 
     fn read_u8(&self, address: usize) -> u8 {
+        // SAFETY: requires `address` to be a valid mapped `u8` location for
+        // this ACPI `Handler::read_u8` access.
         unsafe { (address as *const u8).read_volatile() }
     }
 
     fn read_u16(&self, address: usize) -> u16 {
+        // SAFETY: requires `address` to be a valid aligned, mapped `u16`
+        // location for this ACPI `Handler::read_u16` access.
         unsafe { (address as *const u16).read_volatile() }
     }
 
     fn read_u32(&self, address: usize) -> u32 {
+        // SAFETY: requires `address` to be a valid aligned, mapped `u32`
+        // location for this ACPI `Handler::read_u32` access.
         unsafe { (address as *const u32).read_volatile() }
     }
 
     fn read_u64(&self, address: usize) -> u64 {
+        // SAFETY: requires `address` to be a valid aligned, mapped `u64`
+        // location for this ACPI `Handler::read_u64` access.
         unsafe { (address as *const u64).read_volatile() }
     }
 
     fn write_u8(&self, address: usize, value: u8) {
+        // SAFETY: requires `address` to be a valid writable, mapped `u8`
+        // location for this ACPI `Handler::write_u8` access.
         unsafe { (address as *mut u8).write_volatile(value) }
     }
 
     fn write_u16(&self, address: usize, value: u16) {
+        // SAFETY: requires `address` to be a valid aligned, writable, mapped
+        // `u16` location for this ACPI `Handler::write_u16` access.
         unsafe { (address as *mut u16).write_volatile(value) }
     }
 
     fn write_u32(&self, address: usize, value: u32) {
+        // SAFETY: requires `address` to be a valid aligned, writable, mapped
+        // `u32` location for this ACPI `Handler::write_u32` access.
         unsafe { (address as *mut u32).write_volatile(value) }
     }
 
     fn write_u64(&self, address: usize, value: u64) {
+        // SAFETY: requires `address` to be a valid aligned, writable, mapped
+        // `u64` location for this ACPI `Handler::write_u64` access.
         unsafe { (address as *mut u64).write_volatile(value) }
     }
 
     fn read_io_u8(&self, port: u16) -> u8 {
+        // SAFETY: ACPI AML `SystemIO` read at ring 0 on the requested `port`.
         unsafe { x86_64::instructions::port::PortReadOnly::<u8>::new(port).read() }
     }
 
     fn read_io_u16(&self, port: u16) -> u16 {
+        // SAFETY: ACPI AML `SystemIO` read at ring 0 on the requested `port`.
         unsafe { x86_64::instructions::port::PortReadOnly::<u16>::new(port).read() }
     }
 
     fn read_io_u32(&self, port: u16) -> u32 {
+        // SAFETY: ACPI AML `SystemIO` read at ring 0 on the requested `port`.
         unsafe { x86_64::instructions::port::PortReadOnly::<u32>::new(port).read() }
     }
 
     fn write_io_u8(&self, port: u16, value: u8) {
+        // SAFETY: ACPI AML `SystemIO` write at ring 0 on the requested `port`.
         unsafe { x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(value) }
     }
 
     fn write_io_u16(&self, port: u16, value: u16) {
+        // SAFETY: ACPI AML `SystemIO` write at ring 0 on the requested `port`.
         unsafe { x86_64::instructions::port::PortWriteOnly::<u16>::new(port).write(value) }
     }
 
     fn write_io_u32(&self, port: u16, value: u32) {
+        // SAFETY: ACPI AML `SystemIO` write at ring 0 on the requested `port`.
         unsafe { x86_64::instructions::port::PortWriteOnly::<u32>::new(port).write(value) }
     }
 
@@ -2002,6 +2147,8 @@ impl Handler for PhysicalOffsetAcpiHandler {
     }
 
     fn read_pci_u32(&self, address: PciAddress, offset: u16) -> u32 {
+        // SAFETY: legacy PCI config space read at `address` + `offset`,
+        // masked against invalid accesses by `LegacyPciConfigAccess`.
         unsafe { LegacyPciConfigAccess::new().read(address, offset) }
     }
 
@@ -2014,6 +2161,8 @@ impl Handler for PhysicalOffsetAcpiHandler {
     }
 
     fn write_pci_u32(&self, address: PciAddress, offset: u16, value: u32) {
+        // SAFETY: legacy PCI config space write at `address` + `offset`,
+        // serialized by `LegacyPciConfigAccess`.
         unsafe { LegacyPciConfigAccess::new().write(address, offset, value) }
     }
 
@@ -2072,8 +2221,14 @@ fn prepare_wakeup_page(platform: &X86PlatformState, wakeup_page: &WakeupPage) {
         "x86 wakeup image exceeded one page: {} bytes",
         bytes.len()
     );
+    // SAFETY: `wakeup_page.virtual_start` points to the exclusively owned 4 KiB
+    // wakeup page mapped in the direct map before any AP starts.
     unsafe {
         core::ptr::write_bytes(wakeup_page.virtual_start as *mut u8, 0, WAKEUP_PAGE_BYTES);
+    }
+    // SAFETY: `bytes.len() <= WAKEUP_PAGE_BYTES` is asserted above, and the
+    // wakeup image in `.text`/`.rodata` does not overlap `wakeup_page`.
+    unsafe {
         core::ptr::copy_nonoverlapping(
             bytes.as_ptr(),
             wakeup_page.virtual_start as *mut u8,
@@ -2113,6 +2268,8 @@ fn write_u64_patch(image_start: usize, offset: usize, value: u64) {
     let address = image_start
         .checked_add(offset)
         .unwrap_or_else(|| panic!("x86 wakeup image patch overflow at offset {offset:#x}"));
+    // SAFETY: `offset` is an 8-byte aligned patch slot within the 4 KiB wakeup
+    // page, and the caller holds `wakeup_lock` while no AP is executing it.
     unsafe {
         (address as *mut u64).write_volatile(value);
     }
@@ -2128,6 +2285,8 @@ fn identity_map_wakeup_page(physical_memory_offset: usize, wakeup_physical: usiz
         .unwrap_or_else(|error| panic!("invalid x86 wakeup page address: {error:?}"));
     let frame = PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(wakeup_physical as u64))
         .unwrap_or_else(|error| panic!("invalid x86 wakeup frame address: {error:?}"));
+    // SAFETY: called on the BSP during bring-up before any AP starts, with
+    // `physical_memory_offset` covering the active page tables.
     let mut mapper = unsafe { current_mapper(physical_memory_offset) };
     if mapper.translate_page(page).is_ok() {
         return;
@@ -2135,17 +2294,19 @@ fn identity_map_wakeup_page(physical_memory_offset: usize, wakeup_physical: usiz
     let mut frame_allocator = DirectMappedFrameAllocator {
         physical_memory_offset,
     };
-    unsafe {
-        mapper
-            .map_to(
-                page,
-                frame,
-                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-                &mut frame_allocator,
-            )
-            .unwrap_or_else(|error| panic!("failed to identity-map x86 wakeup page: {error:?}"))
-            .flush();
-    }
+    // SAFETY: `page` is verified unmapped above, `frame` is the reserved
+    // wakeup page, and `frame_allocator` returns zeroed direct-mapped frames.
+    let flush = unsafe {
+        mapper.map_to(
+            page,
+            frame,
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+            &mut frame_allocator,
+        )
+    };
+    flush
+        .unwrap_or_else(|error| panic!("failed to identity-map x86 wakeup page: {error:?}"))
+        .flush();
 }
 
 pub(crate) fn map_mmio_window(
@@ -2167,6 +2328,8 @@ pub(crate) fn map_mmio_window(
     let mut frame_allocator = DirectMappedFrameAllocator {
         physical_memory_offset,
     };
+    // SAFETY: `physical_memory_offset` is the active HHDM offset covering the
+    // current `CR3` page-table hierarchy.
     let mut mapper = unsafe { current_mapper(physical_memory_offset) };
 
     for virtual_address in (map_start..map_start + map_bytes).step_by(PAGE_BYTES) {
@@ -2190,20 +2353,22 @@ pub(crate) fn map_mmio_window(
         let frame =
             PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(physical_address as u64))
                 .unwrap_or_else(|error| panic!("invalid x86 MMIO physical frame: {error:?}"));
-        unsafe {
-            mapper
-                .map_to(
-                    page,
-                    frame,
-                    PageTableFlags::PRESENT
-                        | PageTableFlags::WRITABLE
-                        | PageTableFlags::NO_CACHE
-                        | PageTableFlags::WRITE_THROUGH,
-                    &mut frame_allocator,
-                )
-                .unwrap_or_else(|error| panic!("failed to map x86 MMIO page: {error:?}"))
-                .flush();
-        }
+        // SAFETY: `page` is unmapped in the HHDM, `frame` is the corresponding
+        // physical MMIO frame, and `frame_allocator` returns zeroed tables.
+        let flush = unsafe {
+            mapper.map_to(
+                page,
+                frame,
+                PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::NO_CACHE
+                    | PageTableFlags::WRITE_THROUGH,
+                &mut frame_allocator,
+            )
+        };
+        flush
+            .unwrap_or_else(|error| panic!("failed to map x86 MMIO page: {error:?}"))
+            .flush();
     }
 
     virtual_start
@@ -2222,6 +2387,8 @@ pub(crate) fn ensure_hhdm_range_mapped(
             .unwrap_or_else(|| panic!("x86 HHDM mapping size overflow")),
         PAGE_BYTES,
     );
+    // SAFETY: `physical_memory_offset` is the active HHDM offset covering the
+    // current `CR3` page-table hierarchy.
     let mut mapper = unsafe { current_mapper(physical_memory_offset) };
     let mut frame_allocator = DirectMappedFrameAllocator {
         physical_memory_offset,
@@ -2241,17 +2408,19 @@ pub(crate) fn ensure_hhdm_range_mapped(
         let frame =
             PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(physical_address as u64))
                 .unwrap_or_else(|error| panic!("invalid x86 HHDM physical frame: {error:?}"));
-        unsafe {
-            mapper
-                .map_to(
-                    page,
-                    frame,
-                    PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-                    &mut frame_allocator,
-                )
-                .unwrap_or_else(|error| panic!("failed to map x86 HHDM page: {error:?}"))
-                .flush();
-        }
+        // SAFETY: `page` is unmapped in the HHDM, `frame` is its physical
+        // backing frame, and `frame_allocator` returns zeroed tables.
+        let flush = unsafe {
+            mapper.map_to(
+                page,
+                frame,
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                &mut frame_allocator,
+            )
+        };
+        flush
+            .unwrap_or_else(|error| panic!("failed to map x86 HHDM page: {error:?}"))
+            .flush();
     }
 }
 
@@ -2291,6 +2460,8 @@ fn current_level_4_table(physical_memory_offset: usize) -> &'static mut PageTabl
         .as_u64()
         .checked_add(physical_memory_offset as u64)
         .unwrap_or_else(|| panic!("x86 level-4 page table virtual address overflow"));
+    // SAFETY: `Cr3::read()` yields the active 4 KiB-aligned PML4 frame mapped
+    // through `physical_memory_offset`.
     unsafe { &mut *(virtual_address as *mut PageTable) }
 }
 
@@ -2309,6 +2480,8 @@ fn next_table_mut<'a>(
         .as_u64()
         .checked_add(physical_memory_offset as u64)
         .unwrap_or_else(|| panic!("{context} virtual address overflow"));
+    // SAFETY: `entry` is present and not a huge page, so `entry.addr()` is a
+    // 4 KiB-aligned child page-table frame mapped through the HHDM.
     unsafe { &mut *(virtual_address as *mut PageTable) }
 }
 
@@ -2396,6 +2569,8 @@ fn allocate_page_table(
         .as_u64()
         .checked_add(physical_memory_offset as u64)
         .unwrap_or_else(|| panic!("x86 page-table frame virtual address overflow"));
+    // SAFETY: `frame` is a freshly allocated, exclusive 4 KiB frame mapped at
+    // `virtual_address` via `physical_memory_offset`.
     let table = unsafe { &mut *(virtual_address as *mut PageTable) };
     table.zero();
     (frame, table)
@@ -2418,6 +2593,13 @@ fn parent_table_flags(flags: PageTableFlags) -> PageTableFlags {
     parent
 }
 
+/// Returns an `OffsetPageTable` over the active `CR3` level-4 page table.
+///
+/// # Safety
+///
+/// `physical_memory_offset` must be the valid HHDM offset covering the active
+/// page-table hierarchy, and the caller must ensure exclusive mutable access to
+/// the active page tables for the lifetime of the returned mapper.
 pub(crate) unsafe fn current_mapper(physical_memory_offset: usize) -> OffsetPageTable<'static> {
     let (level_4, _) = Cr3::read();
     let virtual_address = level_4
@@ -2425,7 +2607,11 @@ pub(crate) unsafe fn current_mapper(physical_memory_offset: usize) -> OffsetPage
         .as_u64()
         .checked_add(physical_memory_offset as u64)
         .unwrap_or_else(|| panic!("x86 level-4 page table virtual address overflow"));
+    // SAFETY: caller guarantees `physical_memory_offset` maps the active PML4
+    // frame and no concurrent mutable access aliases it.
     let table = unsafe { &mut *(virtual_address as *mut PageTable) };
+    // SAFETY: `table` is the active level-4 page table and
+    // `physical_memory_offset` maps all physical page-table frames.
     unsafe { OffsetPageTable::new(table, VirtAddr::new(physical_memory_offset as u64)) }
 }
 
@@ -2433,10 +2619,13 @@ pub(crate) struct DirectMappedFrameAllocator {
     pub(crate) physical_memory_offset: usize,
 }
 
+// SAFETY: each allocation returns a fresh, 4 KiB-aligned zeroed frame from the
+// kernel heap inside the direct physical map, never allocated twice.
 unsafe impl FrameAllocator<Size4KiB> for DirectMappedFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
         let layout = Layout::from_size_align(Size4KiB::SIZE as usize, Size4KiB::SIZE as usize)
             .unwrap_or_else(|_| panic!("failed to build x86 page-table frame layout"));
+        // SAFETY: `layout` has non-zero size 4096 and power-of-two alignment 4096.
         let pointer = unsafe { alloc_zeroed(layout) };
         let pointer = NonNull::new(pointer)
             .unwrap_or_else(|| panic!("failed to allocate x86 page-table frame"));
@@ -2480,36 +2669,42 @@ fn carve_aligned_zeroed(
 use helios_hal::{align_down, align_up};
 
 fn wakeup_image() -> &'static [u8] {
-    unsafe {
-        let start = &helios_x86_secondary_wakeup_start as *const u8 as usize;
-        let end = &helios_x86_secondary_wakeup_end as *const u8 as usize;
-        core::slice::from_raw_parts(start as *const u8, end - start)
-    }
+    let start = &raw const helios_x86_secondary_wakeup_start as usize;
+    let end = &raw const helios_x86_secondary_wakeup_end as usize;
+    // SAFETY: `start..end` spans the immutable secondary wakeup image emitted
+    // by `global_asm!` into the kernel image.
+    unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
 }
 
 fn wakeup_cr3_offset() -> usize {
-    unsafe { wakeup_symbol_offset(&helios_x86_secondary_wakeup_cr3) }
+    let symbol = &raw const helios_x86_secondary_wakeup_cr3;
+    wakeup_symbol_offset(symbol)
 }
 
 fn wakeup_stack_top_offset() -> usize {
-    unsafe { wakeup_symbol_offset(&helios_x86_secondary_wakeup_stack_top) }
+    let symbol = &raw const helios_x86_secondary_wakeup_stack_top;
+    wakeup_symbol_offset(symbol)
 }
 
 fn wakeup_context_offset() -> usize {
-    unsafe { wakeup_symbol_offset(&helios_x86_secondary_wakeup_context) }
+    let symbol = &raw const helios_x86_secondary_wakeup_context;
+    wakeup_symbol_offset(symbol)
 }
 
 fn wakeup_runtime_offset() -> usize {
-    unsafe { wakeup_symbol_offset(&helios_x86_secondary_wakeup_runtime) }
+    let symbol = &raw const helios_x86_secondary_wakeup_runtime;
+    wakeup_symbol_offset(symbol)
 }
 
 fn wakeup_entry_offset() -> usize {
-    unsafe { wakeup_symbol_offset(&helios_x86_secondary_wakeup_entry) }
+    let symbol = &raw const helios_x86_secondary_wakeup_entry;
+    wakeup_symbol_offset(symbol)
 }
 
-unsafe fn wakeup_symbol_offset(symbol: &'static u8) -> usize {
-    (symbol as *const u8 as usize)
-        .checked_sub(unsafe { &helios_x86_secondary_wakeup_start as *const u8 as usize })
+fn wakeup_symbol_offset(symbol: *const u8) -> usize {
+    let start = &raw const helios_x86_secondary_wakeup_start as usize;
+    (symbol as usize)
+        .checked_sub(start)
         .unwrap_or_else(|| panic!("x86 wakeup symbol precedes image start"))
 }
 

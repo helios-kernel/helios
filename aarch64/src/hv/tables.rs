@@ -24,13 +24,16 @@ impl TranslationRegime for BroadcastStage2 {
     type VaRange = VaRange;
 
     fn invalidate_va(_: VirtualAddress) {
-        // VTTBR selects the VMID, including cached guest Stage-1 translations.
-        // The caller/library supplies the surrounding publication barriers.
+        // SAFETY: `vttbr_el2` selects the VMID, including cached guest Stage-1
+        // translations, and the surrounding barriers publish table updates.
         unsafe { asm!("tlbi vmalls12e1is", options(nostack, preserves_flags)) };
     }
 
     unsafe fn activate(root: PhysicalAddress, vmid: usize, _: VaRange) -> usize {
         let previous;
+        // SAFETY: reading and writing `vttbr_el2` at EL2 under masked local
+        // interrupts only selects the active VMID/root for Stage-2 maintenance
+        // without enabling Stage-2 for VHE host accesses.
         unsafe {
             asm!(
                 "mrs {previous}, vttbr_el2",
@@ -46,6 +49,8 @@ impl TranslationRegime for BroadcastStage2 {
 
     unsafe fn deactivate(previous: usize, _: usize, _: VaRange) {
         flush();
+        // SAFETY: restores the previous `vttbr_el2` saved by `activate` after
+        // `flush()` completed broadcast Stage-2 TLB invalidation.
         unsafe {
             asm!("msr vttbr_el2, {previous}", "isb", previous = in(reg) previous,
                 options(nostack, preserves_flags));
@@ -100,13 +105,15 @@ impl Tables {
     fn with<R>(&self, op: impl FnOnce(&mut PageTables) -> R) -> R {
         with_local_interrupts_masked(|| {
             let mut pages = self.pages.lock();
-            // No guest can execute on this processor during a mutation.
-            // Selecting the root only selects the broadcast's VMID; it
-            // does not enable Stage-2 for the VHE host's own accesses.
+            // SAFETY: no guest can execute on this processor during a mutation
+            // with local interrupts masked, and `pages.root_address()` and
+            // `pages.asid()` are owned by this `Tables` instance.
             let previous = unsafe {
                 BroadcastStage2::activate(pages.root_address(), pages.asid(), VaRange::Lower)
             };
             let result = op(&mut pages);
+            // SAFETY: `previous` is the `vttbr_el2` value returned by the
+            // matching `activate` call on this processor.
             unsafe { BroadcastStage2::deactivate(previous, pages.asid(), VaRange::Lower) };
             result
         })
@@ -128,6 +135,13 @@ impl Tables {
         }) && present
     }
 
+    /// Maps `range` to `frames` in the Stage-2 page tables with `flags`.
+    ///
+    /// # Safety
+    ///
+    /// Every frame in `frames` must be exclusively owned by the caller for the
+    /// lifetime of its Stage-2 mapping and remain valid until unmapped and
+    /// flushed.
     pub(super) unsafe fn map(
         &self,
         range: GuestRange,
@@ -238,6 +252,9 @@ fn attributes(flags: PageFlags) -> Result<Stage2Attributes, HvError> {
 }
 
 pub(super) fn flush() {
+    // SAFETY: `dsb ishst`, `tlbi vmalls12e1is`, `dsb ish`, and `isb` perform
+    // inner-shareable Stage-2 TLB maintenance for the current VMID without
+    // touching memory.
     unsafe {
         asm!(
             "dsb ishst",

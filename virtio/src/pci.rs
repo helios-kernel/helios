@@ -241,30 +241,43 @@ impl BarWindow {
             offset.is_multiple_of(width),
             "virtio-pci window access at {offset:#x} is not {width}-byte aligned"
         );
+        // SAFETY: `self.base..self.base + self.len` is a valid mapped BAR
+        // window from `PciMmioMapper::map_region`, and the check above ensures
+        // `offset + width <= self.len`.
         unsafe { self.base.as_ptr().add(offset) }
     }
 
     fn read_u8(&self, offset: usize) -> u8 {
+        // SAFETY: `byte_ptr` bounds-checks `offset` within the mapped BAR window.
         unsafe { mmio::read_u8(self.byte_ptr(offset, 1)) }
     }
 
     fn read_u16(&self, offset: usize) -> u16 {
+        // SAFETY: `byte_ptr` bounds- and alignment-checks `offset` within the
+        // mapped BAR window.
         unsafe { mmio::read_u16(self.byte_ptr(offset, 2).cast::<u16>()) }
     }
 
     fn read_u32(&self, offset: usize) -> u32 {
+        // SAFETY: `byte_ptr` bounds- and alignment-checks `offset` within the
+        // mapped BAR window.
         unsafe { mmio::read_u32(self.byte_ptr(offset, 4).cast::<u32>()) }
     }
 
     fn write_u8(&self, offset: usize, value: u8) {
+        // SAFETY: `byte_ptr` bounds-checks `offset` within the mapped BAR window.
         unsafe { mmio::write_u8(self.byte_ptr(offset, 1), value) }
     }
 
     fn write_u16(&self, offset: usize, value: u16) {
+        // SAFETY: `byte_ptr` bounds- and alignment-checks `offset` within the
+        // mapped BAR window.
         unsafe { mmio::write_u16(self.byte_ptr(offset, 2).cast::<u16>(), value) }
     }
 
     fn write_u32(&self, offset: usize, value: u32) {
+        // SAFETY: `byte_ptr` bounds- and alignment-checks `offset` within the
+        // mapped BAR window.
         unsafe { mmio::write_u32(self.byte_ptr(offset, 4).cast::<u32>(), value) }
     }
 
@@ -276,7 +289,11 @@ impl BarWindow {
     }
 }
 
+// SAFETY: `BarWindow` owns a kernel-lifetime MMIO window pointer from
+// `PciMmioMapper::map_region` with no thread-local state.
 unsafe impl Send for BarWindow {}
+// SAFETY: `BarWindow` performs MMIO accesses coordinated by the transport's
+// bring-up and runtime concurrency contract.
 unsafe impl Sync for BarWindow {}
 
 /// Device-side view a virtio driver gets from a PCI function: the
@@ -741,21 +758,36 @@ fn parse_capabilities<A: ConfigRegionAccess>(
         };
         let address = location.address;
         let offset = location.offset;
+        // SAFETY: `address` and `offset` come from a walked vendor capability
+        // in `endpoint.capabilities(access)`, and `CAP_TYPE_WORD` is a
+        // dword-aligned field within `struct virtio_pci_cap`.
         let type_word = unsafe { access.read(address, offset + CAP_TYPE_WORD) };
         let cfg_type = (type_word >> 24) as u8;
+        // SAFETY: `address` and `offset` come from the same vendor capability,
+        // and `CAP_BAR_WORD` is a dword-aligned field within `struct virtio_pci_cap`.
         let bar_word = unsafe { access.read(address, offset + CAP_BAR_WORD) };
         let bar = bar_word as u8;
+        // SAFETY: `address` and `offset` come from the same vendor capability,
+        // and `CAP_OFFSET_WORD` is a dword-aligned field within `struct virtio_pci_cap`.
+        let cap_offset = unsafe { access.read(address, offset + CAP_OFFSET_WORD) };
+        // SAFETY: `address` and `offset` come from the same vendor capability,
+        // and `CAP_LENGTH_WORD` is a dword-aligned field within `struct virtio_pci_cap`.
+        let cap_length = unsafe { access.read(address, offset + CAP_LENGTH_WORD) };
         let region = VirtioCapability {
             bar,
-            offset: unsafe { access.read(address, offset + CAP_OFFSET_WORD) },
-            length: unsafe { access.read(address, offset + CAP_LENGTH_WORD) },
+            offset: cap_offset,
+            length: cap_length,
         };
         match cfg_type {
             VIRTIO_PCI_CAP_COMMON_CFG => capabilities.common = Some(region),
             VIRTIO_PCI_CAP_NOTIFY_CFG => {
                 capabilities.notify = Some(region);
-                capabilities.notify_off_multiplier =
-                    Some(unsafe { access.read(address, offset + CAP_NOTIFY_MULTIPLIER_WORD) });
+                // SAFETY: `cfg_type` is `VIRTIO_PCI_CAP_NOTIFY_CFG`, so this
+                // capability is `struct virtio_pci_notify_cap` and
+                // `CAP_NOTIFY_MULTIPLIER_WORD` is its dword-aligned multiplier field.
+                let multiplier =
+                    unsafe { access.read(address, offset + CAP_NOTIFY_MULTIPLIER_WORD) };
+                capabilities.notify_off_multiplier = Some(multiplier);
             }
             VIRTIO_PCI_CAP_ISR_CFG => capabilities.isr = Some(region),
             VIRTIO_PCI_CAP_DEVICE_CFG => capabilities.device = Some(region),
@@ -763,7 +795,13 @@ fn parse_capabilities<A: ConfigRegionAccess>(
                 // `struct virtio_pci_cap64` puts the high halves where
                 // the notification capability keeps its multiplier, and
                 // the region's own id in the byte after the BAR number.
+                // SAFETY: `cfg_type` is `VIRTIO_PCI_CAP_SHARED_MEMORY_CFG`, so
+                // this capability is `struct virtio_pci_cap64` and
+                // `CAP_OFFSET_HIGH_WORD` is its dword-aligned high offset field.
                 let offset_high = unsafe { access.read(address, offset + CAP_OFFSET_HIGH_WORD) };
+                // SAFETY: `cfg_type` is `VIRTIO_PCI_CAP_SHARED_MEMORY_CFG`, so
+                // this capability is `struct virtio_pci_cap64` and
+                // `CAP_LENGTH_HIGH_WORD` is its dword-aligned high length field.
                 let length_high = unsafe { access.read(address, offset + CAP_LENGTH_HIGH_WORD) };
                 // A function that publishes more windows than the table
                 // holds keeps the ones it declared first; the driver

@@ -76,6 +76,9 @@ macro_rules! mmio_accessors {
             #[cfg(target_arch = "aarch64")]
             let value = {
                 let value: $ty;
+                // SAFETY: `$read`'s caller guarantees `ptr` is mapped,
+                // naturally aligned for `$ty`, and valid to read at this
+                // point in the device protocol.
                 unsafe {
                     core::arch::asm!(
                         concat!($load, " {value:", $reg, "}, [{ptr}]"),
@@ -87,7 +90,12 @@ macro_rules! mmio_accessors {
                 value
             };
             #[cfg(not(target_arch = "aarch64"))]
-            let value = unsafe { ptr.read_volatile() };
+            let value = {
+                // SAFETY: `$read`'s caller guarantees `ptr` is mapped,
+                // naturally aligned for `$ty`, and valid to read at this
+                // point in the device protocol.
+                unsafe { ptr.read_volatile() }
+            };
 
             value
         }
@@ -106,17 +114,27 @@ macro_rules! mmio_accessors {
         #[inline]
         pub unsafe fn $write(ptr: *mut $ty, value: $ty) {
             #[cfg(target_arch = "aarch64")]
-            unsafe {
-                core::arch::asm!(
-                    concat!($store, " {value:", $reg, "}, [{ptr}]"),
-                    ptr = in(reg) ptr,
-                    value = in(reg) value,
-                    options(nostack, preserves_flags),
-                );
+            {
+                // SAFETY: `$write`'s caller guarantees `ptr` is mapped,
+                // naturally aligned for `$ty`, and valid to write at this
+                // point in the device protocol.
+                unsafe {
+                    core::arch::asm!(
+                        concat!($store, " {value:", $reg, "}, [{ptr}]"),
+                        ptr = in(reg) ptr,
+                        value = in(reg) value,
+                        options(nostack, preserves_flags),
+                    );
+                }
             }
             #[cfg(not(target_arch = "aarch64"))]
-            unsafe {
-                ptr.write_volatile(value);
+            {
+                // SAFETY: `$write`'s caller guarantees `ptr` is mapped,
+                // naturally aligned for `$ty`, and valid to write at this
+                // point in the device protocol.
+                unsafe {
+                    ptr.write_volatile(value);
+                }
             }
         }
     )*};

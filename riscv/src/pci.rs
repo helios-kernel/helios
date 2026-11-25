@@ -103,6 +103,9 @@ impl PciHostController {
                     address: 0, size, ..
                 } => {
                     let assigned = self.allocate_memory_bar(u64::from(size), false);
+                    // SAFETY: `slot` is an unassigned 32-bit memory BAR on
+                    // `endpoint`, and `assigned` is a size-aligned address
+                    // allocated from a non-overlapping 32-bit PCI memory window.
                     unsafe {
                         endpoint
                             .write_bar(slot, self.access, assigned as usize)
@@ -115,6 +118,9 @@ impl PciHostController {
                     address: 0, size, ..
                 } => {
                     let assigned = self.allocate_memory_bar(size, true);
+                    // SAFETY: `slot` is an unassigned 64-bit memory BAR on
+                    // `endpoint`, and `assigned` is a size-aligned address
+                    // allocated from a non-overlapping PCI memory window.
                     unsafe {
                         endpoint
                             .write_bar(slot, self.access, assigned as usize)
@@ -151,11 +157,15 @@ impl PciHostController {
 impl ConfigRegionAccess for EcamPciConfigAccess {
     unsafe fn read(&self, address: PciAddress, offset: u16) -> u32 {
         let config_address = self.config_address(address, offset);
+        // SAFETY: `config_address` validates segment, bus range, 4-byte alignment,
+        // and `< 4096` offset within the identity-mapped ECAM region.
         unsafe { (config_address as *const u32).read_volatile() }
     }
 
     unsafe fn write(&self, address: PciAddress, offset: u16, value: u32) {
         let config_address = self.config_address(address, offset);
+        // SAFETY: `config_address` validates segment, bus range, 4-byte alignment,
+        // and `< 4096` offset within the identity-mapped ECAM region.
         unsafe { (config_address as *mut u32).write_volatile(value) };
     }
 }
@@ -163,6 +173,8 @@ impl ConfigRegionAccess for EcamPciConfigAccess {
 impl i6300esb::PciConfigIo for EcamPciConfigAccess {
     fn read_u8(&self, address: PciAddress, offset: u16) -> u8 {
         let config_address = self.byte_address(address, offset);
+        // SAFETY: `byte_address` validates segment, bus range, and `< 4096`
+        // offset within the identity-mapped ECAM region.
         unsafe { (config_address as *const u8).read_volatile() }
     }
 
@@ -172,11 +184,15 @@ impl i6300esb::PciConfigIo for EcamPciConfigAccess {
             "PCI ECAM u16 access requires aligned offsets, got {offset:#x}"
         );
         let config_address = self.byte_address(address, offset);
+        // SAFETY: `byte_address` validates segment, bus range, and `< 4096`
+        // offset, and the assert above guarantees 2-byte alignment.
         unsafe { (config_address as *const u16).read_volatile() }
     }
 
     fn write_u8(&self, address: PciAddress, offset: u16, value: u8) {
         let config_address = self.byte_address(address, offset);
+        // SAFETY: `byte_address` validates segment, bus range, and `< 4096`
+        // offset within the identity-mapped ECAM region.
         unsafe { (config_address as *mut u8).write_volatile(value) };
     }
 
@@ -186,6 +202,8 @@ impl i6300esb::PciConfigIo for EcamPciConfigAccess {
             "PCI ECAM u16 access requires aligned offsets, got {offset:#x}"
         );
         let config_address = self.byte_address(address, offset);
+        // SAFETY: `byte_address` validates segment, bus range, and `< 4096`
+        // offset, and the assert above guarantees 2-byte alignment.
         unsafe { (config_address as *mut u16).write_volatile(value) };
     }
 }

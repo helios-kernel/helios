@@ -350,12 +350,11 @@ impl AllocationTags for Aarch64AllocationTags {
         debug_assert!(len.is_multiple_of(GRANULE_BYTES));
         let mut ptr = Self::apply(base, tag);
         let end = ptr + len;
-        // SAFETY: caller guarantees `range` is granule-aligned, canonical,
-        // tag-capable and exclusively owned; `CHECKING` guarantees FEAT_MTE2
-        // with `ATA` set. `DSB ISH` publishes the tag stores to the
-        // inner-shareable domain before returning.
-        unsafe {
-            while end - ptr >= 2 * GRANULE_BYTES {
+        while end - ptr >= 2 * GRANULE_BYTES {
+            // SAFETY: caller guarantees `range` is granule-aligned, canonical,
+            // tag-capable and exclusively owned, and `ptr + 32 <= end` is
+            // within `range`; `CHECKING` guarantees FEAT_MTE2 with `ATA` set.
+            unsafe {
                 asm!(
                     ".arch_extension memtag",
                     "st2g {ptr}, [{ptr}], #32",
@@ -363,7 +362,13 @@ impl AllocationTags for Aarch64AllocationTags {
                     options(nostack, preserves_flags),
                 );
             }
-            if ptr < end {
+        }
+        if ptr < end {
+            // SAFETY: caller guarantees `range` is granule-aligned, canonical,
+            // tag-capable and exclusively owned, and `ptr < end` leaves one
+            // granule within `range`; `CHECKING` guarantees FEAT_MTE2 with `ATA`
+            // set.
+            unsafe {
                 asm!(
                     ".arch_extension memtag",
                     "stg {ptr}, [{ptr}]",
@@ -371,6 +376,10 @@ impl AllocationTags for Aarch64AllocationTags {
                     options(nostack, preserves_flags),
                 );
             }
+        }
+        // SAFETY: `DSB ISH` publishes the preceding tag stores to the
+        // inner-shareable domain before returning and has no preconditions.
+        unsafe {
             asm!("dsb ish", options(nostack, preserves_flags));
         }
     }
@@ -563,9 +572,11 @@ pub(crate) fn verify_on_current_processor(mpidr: u64) {
         stored_tag, live_tag,
         "AArch64 MTE self-check on MPIDR {mpidr:#x} read back tag {stored_tag:?}, expected {live_tag:?}"
     );
-    // SAFETY: `tagged_ptr` carries the matching live tag; `canonical` carries
-    // `Tag::UNCHECKED` (`0xf`) which `TCMA1` accepts.
+    // SAFETY: `tagged_ptr` points to the allocated 64-byte probe buffer and
+    // carries the matching live tag.
     let tagged_byte = unsafe { tagged_ptr.read_volatile() };
+    // SAFETY: `canonical` points to the same allocated buffer with
+    // `Tag::UNCHECKED` (`0xf`), which `TCMA1` accepts without a tag check.
     let unchecked_byte = unsafe { (canonical as *const u8).read_volatile() };
     assert_eq!(tagged_byte, 0);
     assert_eq!(unchecked_byte, 0);
@@ -620,8 +631,12 @@ pub(crate) fn self_test() {
     // the synchronous tag check fault must fire and panic naming the granule
     // and its `0x0` allocation tag.
     // SAFETY: `OffsetDmaPool` allocates a mapped `Tag::FREE` redzone ahead of
-    // the object; the access is meant to trap synchronously on the tag mismatch.
-    let _ = unsafe { buffer.as_ptr().sub(GRANULE_BYTES).read_volatile() };
+    // the object, so stepping back one granule stays within the mapped pool
+    // allocation.
+    let redzone_ptr = unsafe { buffer.as_ptr().sub(GRANULE_BYTES) };
+    // SAFETY: `redzone_ptr` points to the mapped `Tag::FREE` redzone; the
+    // volatile read is meant to trap synchronously on the tag mismatch.
+    let _ = unsafe { redzone_ptr.read_volatile() };
     panic!("memory tagging self-test: a redzone read with a mismatched tag was accepted")
 }
 

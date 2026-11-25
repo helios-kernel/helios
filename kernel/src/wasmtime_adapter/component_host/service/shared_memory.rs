@@ -220,12 +220,12 @@ pub(super) async fn scrub_shared_memory(memory: &SharedMemory) {
         let chunk = SCRUB_CHUNK_BYTES.min(len - offset);
         // Re-derive the pointer each chunk: holding a raw pointer across
         // the yield would make the scrub future non-Send.
-        let base = memory.data().as_ptr().cast::<u8>() as *mut u8;
+        let dst = core::cell::UnsafeCell::raw_get(memory.data()[offset..offset + chunk].as_ptr());
         // SAFETY: the previous Store/Instance holders have been dropped
         // and the memory is owned by the scrub task until it re-enters
         // the pool, so no guest can observe the partial zeroing.
         unsafe {
-            core::ptr::write_bytes(base.add(offset), 0, chunk);
+            core::ptr::write_bytes(dst, 0, chunk);
         }
         offset += chunk;
         if offset < len {
@@ -412,11 +412,12 @@ pub(super) fn read_shared_memory(
         });
     }
     let mut bytes = Vec::with_capacity(len);
-    unsafe {
-        bytes.extend_from_slice(core::slice::from_raw_parts(
-            data.as_ptr().cast::<u8>().add(start),
-            len,
-        ));
+    for slot in &data[start..end] {
+        // SAFETY: `slot` is a live `UnsafeCell<u8>` in `memory.data()` and
+        // `AtomicU8` has identical size and alignment to `u8`, avoiding data
+        // races if another wasm thread concurrently accesses shared memory.
+        let atomic = unsafe { core::sync::atomic::AtomicU8::from_ptr(slot.get()) };
+        bytes.push(atomic.load(core::sync::atomic::Ordering::Relaxed));
     }
     Ok(bytes)
 }
@@ -445,12 +446,12 @@ pub(super) fn write_shared_memory(
             detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
         });
     }
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            data.as_ptr().cast::<u8>().add(start).cast_mut(),
-            bytes.len(),
-        );
+    for (slot, &byte) in data[start..end].iter().zip(bytes) {
+        // SAFETY: `slot` is a live `UnsafeCell<u8>` in `memory.data()` and
+        // `AtomicU8` has identical size and alignment to `u8`, avoiding data
+        // races if another wasm thread concurrently accesses shared memory.
+        let atomic = unsafe { core::sync::atomic::AtomicU8::from_ptr(slot.get()) };
+        atomic.store(byte, core::sync::atomic::Ordering::Relaxed);
     }
     Ok(())
 }

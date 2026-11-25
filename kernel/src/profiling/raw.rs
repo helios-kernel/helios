@@ -118,15 +118,13 @@ impl<'a> SectionSpan<'a> {
         debug_assert!(within + out.len() as u64 <= self.len);
         // SAFETY: `new`'s contract makes `start .. start + len` readable, and
         // the debug assertion above holds for every window `read_at` builds.
-        // A counter the instrumentation increments during the copy yields
-        // either its old or its new value, which is what a profile written
-        // from a running program always records.
+        let src = unsafe { self.start.add(within as usize) };
+        // SAFETY: `src` is valid for `out.len()` bytes within the section,
+        // `out` is a distinct mutable slice, and a counter incremented during
+        // the copy yields either its old or its new value without creating any
+        // shared Rust reference to the counter section.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                self.start.add(within as usize),
-                out.as_mut_ptr(),
-                out.len(),
-            );
+            core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), out.len());
         }
     }
 }

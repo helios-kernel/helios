@@ -191,6 +191,9 @@ pub(crate) fn discover(
         tsc_base: 0,
         timebase: Timebase::new(1),
     };
+    // SAFETY: `rsdp_address` comes from the bootloader's Limine handoff and
+    // `handler` translates ACPI physical addresses through the bootloader's
+    // direct physical map.
     let tables = unsafe { acpi::AcpiTables::from_rsdp(handler, rsdp_address) }
         .unwrap_or_else(|error| panic!("failed to parse ACPI tables for the VIOT: {error:?}"));
     let (physical_address, header) = tables

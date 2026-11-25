@@ -194,19 +194,19 @@ pub(crate) fn hand_over_trap(record: TrapHandOver, spsr: u64) -> HandOverRefusal
     // `TrapHandOver` is 16-byte aligned, so its size is a multiple of 16
     // and the slot below the 16-byte aligned top keeps SP aligned.
     let slot = hand_over_stack.end - core::mem::size_of::<TrapHandOver>();
+    let slot_ptr = slot as *mut TrapHandOver;
     // SAFETY: the hand-over stack belongs to this processor and nothing
     // runs on it: the refusals above rule out an exception taken from a
-    // hand-over in progress, and none is suspended. The switch is entered
-    // from this handler, on `SP_EL0` with IRQs masked, with the slot the
-    // record was just written to and this processor's exception stack.
-    unsafe {
-        (slot as *mut TrapHandOver).write(record);
-        __helios_aarch64_trap_hand_over(
-            slot,
-            runtime.exception_stack.range().end,
-            usize::from(spsr & SPSR_IRQ_MASK == 0),
-        )
-    }
+    // hand-over in progress, and none is suspended, so `slot_ptr` is
+    // aligned, writable, and unaliased.
+    unsafe { slot_ptr.write(record) };
+    let exception_stack_top = runtime.exception_stack.range().end;
+    let unmask_irq = usize::from(spsr & SPSR_IRQ_MASK == 0);
+    // SAFETY: the switch is entered from the synchronous handler on
+    // `SP_EL0` with IRQs masked, with `slot` holding the `TrapHandOver`
+    // just written at the top of this processor's hand-over stack and
+    // `exception_stack_top` pointing to this processor's exception stack.
+    unsafe { __helios_aarch64_trap_hand_over(slot, exception_stack_top, unmask_irq) }
 }
 
 /// The hand-over's Rust half, on the hand-over stack in the state the
@@ -307,16 +307,13 @@ impl HandOverProbe {
             .store(record.interrupted_sp, Ordering::Relaxed);
         self.hand_over_sp
             .store(current_stack_pointer(), Ordering::Relaxed);
+        let resume_pc = self.resume_pc.load(Ordering::Relaxed);
+        let resume_sp = self.resume_sp.load(Ordering::Relaxed);
+        let resume_fp = self.resume_fp.load(Ordering::Relaxed);
         // SAFETY: the probe recorded a landing in its own routine, with the
         // SP and FP of that routine's frame, which is live: the routine is
         // waiting on the `brk` this claims.
-        unsafe {
-            resume_as_the_runtime_does(
-                self.resume_pc.load(Ordering::Relaxed),
-                self.resume_sp.load(Ordering::Relaxed),
-                self.resume_fp.load(Ordering::Relaxed),
-            )
-        }
+        unsafe { resume_as_the_runtime_does(resume_pc, resume_sp, resume_fp) }
     }
 
     /// Records the frame of the interrupt the probe is waiting for.
@@ -356,6 +353,8 @@ impl HandOverProbe {
 /// `sp` and `fp` must belong to a live frame that `pc` expects to resume
 /// into with no other register restored.
 unsafe fn resume_as_the_runtime_does(pc: usize, sp: usize, fp: usize) -> ! {
+    // SAFETY: caller guarantees `sp` and `fp` belong to a live frame
+    // that `pc` expects to resume into with zeroed `x0`/`x1` payloads.
     unsafe {
         asm!(
             "mov sp, x2",

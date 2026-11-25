@@ -8,7 +8,9 @@ use ash::vk::{self, Handle};
 use super::Factory;
 use super::allocator::HostAllocator;
 use super::external::{ExternalMemory, enables_external_memory, renderer_device_extensions};
-use super::instance::{Dispatch, TransportError, invoke_void, object, shared, wait_for_points};
+use super::instance::{
+    Dispatch, State, TransportError, invoke_void, object, shared, wait_for_points,
+};
 use crate::connection::Error;
 use crate::protocol as wire;
 #[cfg(feature = "helios")]
@@ -48,6 +50,7 @@ pub(crate) unsafe fn completion<F: Factory>(
 ) -> Result<<F::Transport as Transport>::Signal, vk::Result> {
     // SAFETY: the caller supplies a live queue from this factory.
     let owner = unsafe { shared::<F>(object(queue)) };
+    // SAFETY: `Queue::ring` is immutable after device creation.
     let ring = unsafe { (*object(queue).cast::<Queue<F>>()).ring };
     let mut state = owner.lock();
     if state.fault.is_some() {
@@ -67,19 +70,26 @@ pub(crate) unsafe fn completion<F: Factory>(
     Ok(source)
 }
 
+/// Create a logical Vulkan device and its requested queues.
+///
+/// # Safety
+/// `physical`, `info`, `allocator`, and `output` must satisfy Vulkan's
+/// `vkCreateDevice` contract for a physical device owned by `F`.
 pub(super) unsafe extern "system" fn create_device<F: Factory>(
     physical: vk::PhysicalDevice,
     info: *const vk::DeviceCreateInfo<'_>,
     allocator: *const vk::AllocationCallbacks<'_>,
     output: *mut vk::Device,
 ) -> vk::Result {
-    // SAFETY: Vulkan supplies live input structures and writable output.
+    // SAFETY: Vulkan supplies a writable output pointer.
     unsafe { *output = vk::Device::null() };
+    // SAFETY: Vulkan supplies a live physical device belonging to this factory.
     let owner = unsafe { shared::<F>(object(physical)) };
     let mut state = owner.lock();
     if state.fault.is_some() {
         return vk::Result::ERROR_DEVICE_LOST;
     }
+    // SAFETY: Vulkan supplies valid allocation callbacks or null for default allocation.
     let allocator = unsafe { HostAllocator::new(allocator, vk::SystemAllocationScope::DEVICE) };
     let result = (|| -> Result<vk::Result, Error<TransportError<F>>> {
         let mut memory_properties = vk::PhysicalDeviceMemoryProperties::default();
@@ -93,14 +103,29 @@ pub(super) unsafe extern "system" fn create_device<F: Factory>(
         }?;
         // The guest implements the external memory extensions; the renderer
         // enables the ones its own handle type needs.
-        // SAFETY: Vulkan's device create-info specifies live extension names.
-        let application: Vec<&CStr> = unsafe {
-            (0..(*info).enabled_extension_count as usize)
-                .map(|index| CStr::from_ptr(*(*info).pp_enabled_extension_names.add(index)))
-                .collect()
+        // SAFETY: Vulkan supplies a live `DeviceCreateInfo` for this call.
+        let create_info = unsafe { &*info };
+        let extension_names = if create_info.enabled_extension_count == 0 {
+            &[]
+        } else {
+            // SAFETY: `pp_enabled_extension_names` has `enabled_extension_count` entries.
+            unsafe {
+                core::slice::from_raw_parts(
+                    create_info.pp_enabled_extension_names,
+                    create_info.enabled_extension_count as usize,
+                )
+            }
         };
+        let application: Vec<&CStr> = extension_names
+            .iter()
+            .map(|&name| {
+                // SAFETY: each entry in `pp_enabled_extension_names` is a live NUL-terminated C string.
+                unsafe { CStr::from_ptr(name) }
+            })
+            .collect();
         let external = if enables_external_memory(&application) {
-            match state.physical_external(physical)? {
+            // SAFETY: `physical` is a live physical device belonging to this instance.
+            match unsafe { state.physical_external(physical) }? {
                 Ok(physical) => physical.memory,
                 Err(result) => return Ok(result),
             }
@@ -113,9 +138,7 @@ pub(super) unsafe extern "system" fn create_device<F: Factory>(
         };
         let renderer_names: Option<Vec<*const c_char>> = renderer_extensions
             .map(|extensions| extensions.iter().map(|name| name.as_ptr()).collect());
-        // SAFETY: the copy shares the application's chain and queue array,
-        // which stay live for this call.
-        let mut renderer_info = unsafe { *info };
+        let mut renderer_info = *create_info;
         if let Some(names) = &renderer_names {
             renderer_info.enabled_extension_count = names.len() as u32;
             renderer_info.pp_enabled_extension_names = names.as_ptr();
@@ -142,12 +165,16 @@ pub(super) unsafe extern "system" fn create_device<F: Factory>(
             Err(_) => return Ok(vk::Result::ERROR_OUT_OF_HOST_MEMORY),
         };
         let mut timelines = state.timelines;
-        // SAFETY: Vulkan's device create-info specifies a live array.
-        let infos = unsafe {
-            core::slice::from_raw_parts(
-                (*info).p_queue_create_infos,
-                (*info).queue_create_info_count as usize,
-            )
+        let infos = if create_info.queue_create_info_count == 0 {
+            &[]
+        } else {
+            // SAFETY: Vulkan's device create-info specifies a live queue create-info array.
+            unsafe {
+                core::slice::from_raw_parts(
+                    create_info.p_queue_create_infos,
+                    create_info.queue_create_info_count as usize,
+                )
+            }
         };
         for queue_info in infos {
             for index in 0..queue_info.queue_count {
@@ -239,6 +266,7 @@ unsafe extern "system" fn destroy_device<F: Factory>(
         return;
     }
     let pointer = object(device);
+    // SAFETY: Vulkan supplies a live device handle belonging to this factory.
     let owner = unsafe { shared::<F>(pointer) };
     // SAFETY: the live device's dispatch header is immutable after creation.
     let id = unsafe { (*pointer).id };
@@ -260,6 +288,10 @@ unsafe extern "system" fn destroy_device<F: Factory>(
     }
 }
 
+/// Look up a queue created on `device` by family, index, and creation flags.
+///
+/// # Safety
+/// `device` must be a live device handle of `F` and `output` must be valid for writes.
 unsafe fn queue<F: Factory>(
     device: vk::Device,
     family: u32,
@@ -267,23 +299,24 @@ unsafe fn queue<F: Factory>(
     flags: vk::DeviceQueueCreateFlags,
     output: *mut vk::Queue,
 ) {
-    // SAFETY: Vulkan supplies a writable output and a live device.
-    unsafe {
-        *output = vk::Queue::null();
-        let id = (*object(device)).id;
-        invoke_void::<F>(object(device), |state| {
-            let device = &state.devices[&id];
-            let queue = device
-                .queues
-                .iter()
-                .find(|queue| {
-                    queue.family == family && queue.index == index && queue.flags == flags
-                })
-                .expect("Vulkan queue lookup names a queue requested at device creation");
-            *output = vk::Queue::from_raw((&raw const **queue) as usize as u64);
-            Ok(())
-        });
-    }
+    // SAFETY: Vulkan supplies a writable output pointer.
+    unsafe { *output = vk::Queue::null() };
+    // SAFETY: the live device's dispatch header is immutable after creation.
+    let id = unsafe { (*object(device)).id };
+    let call = |state: &mut State<F>| {
+        let device = &state.devices[&id];
+        let queue = device
+            .queues
+            .iter()
+            .find(|queue| queue.family == family && queue.index == index && queue.flags == flags)
+            .expect("Vulkan queue lookup names a queue requested at device creation");
+        let handle = vk::Queue::from_raw((&raw const **queue) as usize as u64);
+        // SAFETY: `output` is writable and unaliased for this call.
+        unsafe { *output = handle };
+        Ok(())
+    };
+    // SAFETY: `device` is a live dispatchable object of this factory.
+    unsafe { invoke_void::<F>(object(device), call) };
 }
 
 unsafe extern "system" fn get_device_queue<F: Factory>(
@@ -309,13 +342,15 @@ unsafe extern "system" fn get_device_queue2<F: Factory>(
     info: *const vk::DeviceQueueInfo2<'_>,
     output: *mut vk::Queue,
 ) {
-    // SAFETY: Vulkan requires a valid queue-info structure and output.
+    // SAFETY: Vulkan supplies a live `DeviceQueueInfo2` for this call.
+    let queue_info = unsafe { &*info };
+    // SAFETY: Vulkan requires a valid device and writable queue output.
     unsafe {
         queue::<F>(
             device,
-            (*info).queue_family_index,
-            (*info).queue_index,
-            (*info).flags,
+            queue_info.queue_family_index,
+            queue_info.queue_index,
+            queue_info.flags,
             output,
         )
     };
@@ -325,6 +360,7 @@ unsafe extern "system" fn queue_wait_idle<F: Factory>(queue: vk::Queue) -> vk::R
     let pointer = object(queue);
     // SAFETY: queue owns this immutable timeline assignment until destruction.
     let ring = unsafe { (*pointer.cast::<Queue<F>>()).ring };
+    // SAFETY: `pointer` is a live queue handle of this factory.
     unsafe {
         wait_for_points::<F>(pointer, true, u64::MAX, |state| {
             state.connection.completion_points(1u64 << ring)
@@ -335,6 +371,7 @@ unsafe extern "system" fn queue_wait_idle<F: Factory>(queue: vk::Queue) -> vk::R
 unsafe extern "system" fn device_wait_idle<F: Factory>(device: vk::Device) -> vk::Result {
     // SAFETY: device is live and its dispatch header is immutable.
     let id = unsafe { (*object(device)).id };
+    // SAFETY: `device` is a live device handle of this factory.
     unsafe {
         wait_for_points::<F>(object(device), true, u64::MAX, |state| {
             let timelines = state.devices[&id]

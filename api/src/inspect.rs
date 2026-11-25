@@ -304,10 +304,11 @@ mod publisher {
     }
 
     fn store_generation(bytes: &mut [u8], generation: u64) {
-        let ptr = bytes.as_mut_ptr().wrapping_add(8).cast::<u64>();
+        let ptr = bytes[8..16].as_mut_ptr().cast::<u64>();
         debug_assert!(ptr.is_aligned());
-        // SAFETY: `bytes` comes from a page-aligned `Block` of at least 64 KiB, so
-        // offset 8 is 8-byte aligned and uniquely owned during `update`.
+        // SAFETY: `bytes` comes from a page-aligned `Block` of at least 64 KiB
+        // (or an 8-byte-aligned test buffer), so `bytes[8..16]` is 8 initialized
+        // bytes at an 8-byte-aligned address and uniquely borrowed during `update`.
         let atomic = unsafe { AtomicU64::from_ptr(ptr) };
         atomic.store(generation, Ordering::Release);
     }
@@ -339,9 +340,11 @@ mod publisher {
         #[test]
         fn writer_encodes_valid_header_and_entries() {
             let mut words = [0u64; 64];
-            let bytes = unsafe {
-                core::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), words.len() * 8)
-            };
+            let ptr = words.as_mut_ptr().cast::<u8>();
+            let len = words.len() * 8;
+            // SAFETY: `words` is 64 initialized `u64` values (`len` contiguous
+            // bytes) uniquely borrowed for the lifetime of `bytes`.
+            let bytes = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
             initialize_header(bytes);
             assert_eq!(&bytes[0..4], &HEADER_MAGIC);
             assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), FORMAT_VERSION);

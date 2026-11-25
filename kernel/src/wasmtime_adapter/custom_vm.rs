@@ -68,6 +68,8 @@ fn hooks() -> &'static CustomVmHooks {
         !ptr.is_null(),
         "wasmtime called the custom-virtual-memory ABI before any backend installed hooks"
     );
+    // SAFETY: `HOOKS` is only written once by `install_hooks` with a valid
+    // `'static` reference, and we verified `ptr` is non-null above.
     unsafe { &*(ptr as *const CustomVmHooks) }
 }
 
@@ -167,31 +169,65 @@ fn protect_code_memory(ptr: *const u8, len: usize, prot_flags: u32, operation: &
     );
 }
 
+/// Allocates a new virtual-memory mapping of `size` bytes with `prot_flags`.
+///
+/// # Safety
+///
+/// Must be called through Wasmtime's custom-virtual-memory C ABI after
+/// [`install_hooks`], with `ret` pointing to writable storage for `*mut u8`.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn wasmtime_mmap_new(size: usize, prot_flags: u32, ret: &mut *mut u8) -> c_int {
     (hooks().mmap_new)(size, prot_flags, ret)
 }
 
+/// Remaps or changes permissions on an existing mapping at `addr`.
+///
+/// # Safety
+///
+/// `addr` and `size` must describe a live mapping previously returned by
+/// [`wasmtime_mmap_new`] after [`install_hooks`].
 #[unsafe(no_mangle)]
 unsafe extern "C" fn wasmtime_mmap_remap(addr: *mut u8, size: usize, prot_flags: u32) -> c_int {
     (hooks().mmap_remap)(addr, size, prot_flags)
 }
 
+/// Unmaps a previously allocated mapping at `ptr`.
+///
+/// # Safety
+///
+/// `ptr` and `size` must describe a live mapping previously returned by
+/// [`wasmtime_mmap_new`] with no remaining references to it.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn wasmtime_munmap(ptr: *mut u8, size: usize) -> c_int {
     (hooks().munmap)(ptr, size)
 }
 
+/// Updates page protections on `size` bytes starting at `ptr`.
+///
+/// # Safety
+///
+/// `ptr` and `size` must describe a live, page-aligned mapping created by
+/// [`wasmtime_mmap_new`].
 #[unsafe(no_mangle)]
 unsafe extern "C" fn wasmtime_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> c_int {
     (hooks().mprotect)(ptr, size, prot_flags)
 }
 
+/// Returns the platform page size in bytes.
+///
+/// # Safety
+///
+/// Must be called after [`install_hooks`].
 #[unsafe(no_mangle)]
 unsafe extern "C" fn wasmtime_page_size() -> usize {
     (hooks().page_size)()
 }
 
+/// Creates a copy-on-write memory image from `ptr[..len]`.
+///
+/// # Safety
+///
+/// `ptr` must be valid for reads of `len` bytes, and `ret` must be writable.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn wasmtime_memory_image_new(
     ptr: *const u8,
@@ -201,11 +237,24 @@ unsafe extern "C" fn wasmtime_memory_image_new(
     (hooks().memory_image_new)(ptr, len, ret)
 }
 
+/// Frees a memory image created by [`wasmtime_memory_image_new`].
+///
+/// # Safety
+///
+/// `image` must be null or a valid image pointer returned by
+/// [`wasmtime_memory_image_new`] that is no longer mapped or used.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn wasmtime_memory_image_free(image: *mut WasmtimeMemoryImage) {
     (hooks().memory_image_free)(image)
 }
 
+/// Maps a memory image into `[addr, addr + len)`.
+///
+/// # Safety
+///
+/// `image` must be a live image created by [`wasmtime_memory_image_new`], and
+/// `[addr, addr + len)` must lie within a live mapping from
+/// [`wasmtime_mmap_new`].
 #[unsafe(no_mangle)]
 unsafe extern "C" fn wasmtime_memory_image_map_at(
     image: *mut WasmtimeMemoryImage,

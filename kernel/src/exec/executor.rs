@@ -433,7 +433,11 @@ struct ArenaFuture<Fut> {
 // owning processor, and everything reachable from another processor —
 // the remote-free stack and the two counters — is atomic.
 unsafe impl Sync for TaskArena {}
+// SAFETY: the arena owns its backing bytes and `regions` (mutated only by the
+// owner); moving it between threads transfers ownership cleanly.
 unsafe impl Send for TaskArena {}
+// SAFETY: `ArenaFuture<Fut>` owns a `Fut` in the `TaskArena` (`TaskArena: Send + Sync`
+// via `NoWeakArc`), so moving `ArenaFuture<Fut>` when `Fut: Send` is safe.
 unsafe impl<Fut: Send> Send for ArenaFuture<Fut> {}
 
 impl ArenaBytes {
@@ -556,14 +560,18 @@ impl BuddyRegion {
 
     fn push_free(&mut self, offset: usize, class: usize) {
         let head = self.free_heads[class];
-        // SAFETY: the block is free, so its bytes are the region's to
-        // write, and the owner is the only writer.
+        // SAFETY: `offset` is a free block inside this arena, and the owner is
+        // the only writer of its `FreeNode` header.
         unsafe {
             self.node(offset).write(FreeNode {
                 next: head,
                 prev: TASK_ARENA_BLOCK_NULL,
             });
-            if head != TASK_ARENA_BLOCK_NULL {
+        }
+        if head != TASK_ARENA_BLOCK_NULL {
+            // SAFETY: `head` is the current free-list head in this region, so
+            // it is free and its `FreeNode` header is the owner's to write.
+            unsafe {
                 (*self.node(head)).prev = offset;
             }
         }
@@ -708,10 +716,12 @@ impl TaskArena {
         if funding == TaskFunding::Instance {
             arena.shared.instance_active.fetch_add(1, Ordering::AcqRel);
         }
-        // SAFETY: the block is this task's until it is released, and it
-        // is `class_bytes(class)` bytes of granule-aligned storage,
-        // which fits `Fut` by construction.
-        let ptr = unsafe { arena.bytes.ptr().add(start).cast::<Fut>() };
+        // SAFETY: the block is this task's until it is released, and `start`
+        // is inside the arena's single allocation.
+        let ptr = unsafe { arena.bytes.ptr().add(start) }.cast::<Fut>();
+        // SAFETY: `ptr` is properly aligned (`align <= TASK_ARENA_ALIGN`) and
+        // points to `class_bytes(class) >= size_of::<Fut>()` uninitialized,
+        // exclusively owned bytes.
         unsafe {
             ptr.write(future);
         }
@@ -751,9 +761,11 @@ impl TaskArena {
             .remote_free
             .swap(TASK_ARENA_BLOCK_NULL, Ordering::Acquire);
         while cursor != TASK_ARENA_BLOCK_NULL {
+            // SAFETY: `cursor` is a valid block offset within this arena's single allocation.
+            let node_ptr = unsafe { self.bytes.ptr().add(cursor) }.cast::<RemoteFreeNode>();
             // SAFETY: the block is free and carries the header its
             // release wrote; the `Acquire` swap published those writes.
-            let node = unsafe { self.bytes.ptr().add(cursor).cast::<RemoteFreeNode>().read() };
+            let node = unsafe { node_ptr.read() };
             regions[self.region_of(cursor) as usize].free(cursor, node.class);
             cursor = node.next;
         }
@@ -809,12 +821,23 @@ where
     type Output = Fut::Output;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        unsafe { Pin::new_unchecked(&mut *self.get_unchecked_mut().ptr.as_ptr()).poll(cx) }
+        // SAFETY: `ArenaFuture` is structurally pinned: moving `self` is
+        // forbidden once pinned, and `ptr` is never moved out of its block.
+        let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: `this.ptr` points to an initialized `Fut` owned exclusively
+        // by this `ArenaFuture` until `Drop`.
+        let future = unsafe { &mut *this.ptr.as_ptr() };
+        // SAFETY: `this.ptr` lives at a stable address in the task arena and
+        // is dropped in place before the block is released.
+        let pinned = unsafe { Pin::new_unchecked(future) };
+        pinned.poll(cx)
     }
 }
 
 impl<Fut> Drop for ArenaFuture<Fut> {
     fn drop(&mut self) {
+        // SAFETY: `self.ptr` points to a live, initialized `Fut` owned
+        // exclusively by this `ArenaFuture`, dropped once here before release.
         unsafe {
             ptr::drop_in_place(self.ptr.as_ptr());
         }

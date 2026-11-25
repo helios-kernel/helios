@@ -55,27 +55,30 @@ fn token(raw: u32) -> SwapToken {
 }
 
 fn fill(range: VirtRange, seed: u8) {
-    unsafe {
-        let bytes = range.start.raw() as *mut u8;
-        for index in 0..range.byte_len {
-            bytes
-                .add(index)
-                .write_volatile(seed.wrapping_add(index as u8));
-        }
+    let bytes = range.start.raw() as *mut u8;
+    for index in 0..range.byte_len {
+        // SAFETY: `index < range.byte_len`, and callers pass a committed
+        // read-write range of `range.byte_len` bytes.
+        let ptr = unsafe { bytes.add(index) };
+        // SAFETY: `ptr` points to a committed, writable byte inside `range`.
+        unsafe { ptr.write_volatile(seed.wrapping_add(index as u8)) };
     }
 }
 
 fn check(range: VirtRange, seed: u8) {
-    unsafe {
-        let bytes = range.start.raw() as *const u8;
-        for index in 0..range.byte_len {
-            assert_eq!(
-                bytes.add(index).read_volatile(),
-                seed.wrapping_add(index as u8),
-                "byte {index} of {:#x} came back wrong",
-                range.start.raw()
-            );
-        }
+    let bytes = range.start.raw() as *const u8;
+    for index in 0..range.byte_len {
+        // SAFETY: `index < range.byte_len`, and callers pass a committed
+        // readable range of `range.byte_len` bytes.
+        let ptr = unsafe { bytes.add(index) };
+        // SAFETY: `ptr` points to a committed, readable byte inside `range`.
+        let actual = unsafe { ptr.read_volatile() };
+        assert_eq!(
+            actual,
+            seed.wrapping_add(index as u8),
+            "byte {index} of {:#x} came back wrong",
+            range.start.raw()
+        );
     }
 }
 

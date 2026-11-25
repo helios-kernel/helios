@@ -45,6 +45,8 @@ pub unsafe fn block_from_mmio<C: QueueAffinity, B: BlockBuffer>(
     cpu: C,
     rights: BlockDeviceRights,
 ) -> IoResult<VirtioMmioBlockDevice<C, B>> {
+    // SAFETY: the caller guarantees `header..header + mmio_size` is a valid,
+    // permanently mapped MMIO register block with no aliasing violations.
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioBlockDevice::new_resource(transport, cpu, rights)
@@ -64,6 +66,8 @@ pub unsafe fn block_from_mmio_with_dma<C: QueueAffinity, P: DmaMemory, B: BlockB
     cpu: C,
     rights: BlockDeviceRights,
 ) -> IoResult<VirtioBlockResource<VirtioMmioTransport<MmioBus<P>>, C, B>> {
+    // SAFETY: the caller guarantees `header..header + mmio_size` is a valid,
+    // permanently mapped MMIO register block with no aliasing violations.
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioBlockDevice::new_resource(transport, cpu, rights)
@@ -85,6 +89,8 @@ pub unsafe fn net_from_mmio(
     mmio_size: usize,
     pair_budget: QueuePairBudget,
 ) -> IoResult<VirtioMmioNetDevice> {
+    // SAFETY: the caller guarantees `header..header + mmio_size` is a valid,
+    // permanently mapped MMIO register block with no aliasing violations.
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioNetDevice::new(transport, pair_budget)
@@ -111,6 +117,8 @@ pub unsafe fn net_from_mmio_with_dma<P>(
 where
     P: DmaMemory,
 {
+    // SAFETY: the caller guarantees `header..header + mmio_size` is a valid,
+    // permanently mapped MMIO register block with no aliasing violations.
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioNetDevice::new(transport, pair_budget)
@@ -124,6 +132,8 @@ where
 /// MMIO register block for a 9P device, and no other code may violate the
 /// transport's register access invariants while the returned driver is alive.
 pub unsafe fn p9_from_mmio(header: NonNull<u8>, mmio_size: usize) -> IoResult<VirtioMmio9pDevice> {
+    // SAFETY: the caller guarantees `header..header + mmio_size` is a valid,
+    // permanently mapped MMIO register block with no aliasing violations.
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     Virtio9pDevice::new(transport)
@@ -145,6 +155,8 @@ pub unsafe fn p9_from_mmio_with_dma<P>(
 where
     P: DmaMemory,
 {
+    // SAFETY: the caller guarantees `header..header + mmio_size` is a valid,
+    // permanently mapped MMIO register block with no aliasing violations.
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     Virtio9pDevice::new(transport)
@@ -161,6 +173,8 @@ pub unsafe fn rng_from_mmio(
     header: NonNull<u8>,
     mmio_size: usize,
 ) -> IoResult<VirtioMmioRngDevice> {
+    // SAFETY: the caller guarantees `header..header + mmio_size` is a valid,
+    // permanently mapped MMIO register block with no aliasing violations.
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioRngDevice::new(transport)
@@ -181,6 +195,8 @@ pub unsafe fn rng_from_mmio_with_dma<P>(
 where
     P: DmaMemory,
 {
+    // SAFETY: the caller guarantees `header..header + mmio_size` is a valid,
+    // permanently mapped MMIO register block with no aliasing violations.
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioRngDevice::new(transport)
@@ -199,6 +215,8 @@ pub unsafe fn balloon_from_mmio(
     header: NonNull<u8>,
     mmio_size: usize,
 ) -> IoResult<VirtioMmioBalloonDevice> {
+    // SAFETY: the caller guarantees `header..header + mmio_size` is a valid,
+    // permanently mapped MMIO register block with no aliasing violations.
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioBalloonDevice::new(transport)
@@ -219,6 +237,8 @@ pub unsafe fn balloon_from_mmio_with_dma<P>(
 where
     P: DmaMemory,
 {
+    // SAFETY: the caller guarantees `header..header + mmio_size` is a valid,
+    // permanently mapped MMIO register block with no aliasing violations.
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioBalloonDevice::new(transport)
@@ -238,6 +258,8 @@ pub unsafe fn gpu_from_mmio(
     header: NonNull<u8>,
     mmio_size: usize,
 ) -> IoResult<VirtioMmioGpuDevice> {
+    // SAFETY: the caller guarantees `header..header + mmio_size` is a valid,
+    // permanently mapped MMIO register block with no aliasing violations.
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     let device = VirtioGpuDevice::new(transport)?;
@@ -260,6 +282,8 @@ pub unsafe fn gpu_from_mmio_with_dma<P>(
 where
     P: DmaMemory,
 {
+    // SAFETY: the caller guarantees `header..header + mmio_size` is a valid,
+    // permanently mapped MMIO register block with no aliasing violations.
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     let device = VirtioGpuDevice::new(transport)?;
@@ -278,6 +302,8 @@ pub unsafe fn vsock_from_mmio(
     header: NonNull<u8>,
     mmio_size: usize,
 ) -> IoResult<VirtioMmioVsockDevice> {
+    // SAFETY: the caller guarantees `header..header + mmio_size` is a valid,
+    // permanently mapped MMIO register block with no aliasing violations.
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioVsockDevice::new(transport)
@@ -298,6 +324,8 @@ pub unsafe fn vsock_from_mmio_with_dma<P>(
 where
     P: DmaMemory,
 {
+    // SAFETY: the caller guarantees `header..header + mmio_size` is a valid,
+    // permanently mapped MMIO register block with no aliasing violations.
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioVsockDevice::new(transport)
@@ -317,6 +345,8 @@ pub unsafe fn input_from_mmio(
     header: NonNull<u8>,
     mmio_size: usize,
 ) -> IoResult<VirtioMmioInputDevice> {
+    // SAFETY: the caller guarantees `header..header + mmio_size` is a valid,
+    // permanently mapped MMIO register block with no aliasing violations.
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     let device = VirtioInputDevice::new(transport)?;
@@ -339,6 +369,8 @@ pub unsafe fn input_from_mmio_with_dma<P>(
 where
     P: DmaMemory,
 {
+    // SAFETY: the caller guarantees `header..header + mmio_size` is a valid,
+    // permanently mapped MMIO register block with no aliasing violations.
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     let device = VirtioInputDevice::new(transport)?;
@@ -357,6 +389,8 @@ pub unsafe fn snd_from_mmio(
     header: NonNull<u8>,
     mmio_size: usize,
 ) -> IoResult<VirtioMmioSndDevice> {
+    // SAFETY: the caller guarantees `header..header + mmio_size` is a valid,
+    // permanently mapped MMIO register block with no aliasing violations.
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     let device = VirtioSndDevice::new(transport)?;
@@ -379,6 +413,8 @@ pub unsafe fn snd_from_mmio_with_dma<P>(
 where
     P: DmaMemory,
 {
+    // SAFETY: the caller guarantees `header..header + mmio_size` is a valid,
+    // permanently mapped MMIO register block with no aliasing violations.
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     let device = VirtioSndDevice::new(transport)?;

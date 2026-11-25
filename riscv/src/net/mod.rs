@@ -684,6 +684,9 @@ fn discover_network_device(
         .interrupt
         .and_then(PlicInterrupt::from_specifier)
         .unwrap_or_else(|| panic!("virtio-net node at {base:#x} has no valid interrupt source"));
+    // SAFETY: `header` points to the identity-mapped `candidate.size`-byte
+    // virtio-net MMIO register block discovered in the device tree, and no
+    // other driver accesses this device's registers.
     let device = unsafe { helios_virtio::net_from_mmio(header, candidate.size, pair_budget) }
         .unwrap_or_else(|error| {
             panic!("failed to initialize virtio-net device at {base:#x}: {error}")

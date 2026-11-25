@@ -292,6 +292,9 @@ static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionStat
 #[repr(align(4096))]
 struct PageTable(UnsafeCell<[u64; PAGE_TABLE_ENTRIES]>);
 
+// SAFETY: the static `MMIO_PAGE_TABLE_*` instances are only mutated on the
+// bootstrap processor during early MMIO mapping before any secondary processor
+// starts.
 unsafe impl Sync for PageTable {}
 
 impl PageTable {
@@ -304,6 +307,9 @@ impl PageTable {
     }
 
     fn clear(&self) {
+        // SAFETY: `self.0` holds `[u64; PAGE_TABLE_ENTRIES]` and `clear` is
+        // called only while this static backing table is exclusively owned on
+        // the bootstrap processor before being linked into TTBR1.
         unsafe {
             core::ptr::write_bytes(self.as_mut_ptr(), 0, PAGE_TABLE_ENTRIES);
         }
@@ -701,6 +707,7 @@ struct Aarch64InterruptOps;
 impl helios_hal::critical_section::InterruptOps for Aarch64InterruptOps {
     fn interrupts_enabled() -> bool {
         let daif: u64;
+        // SAFETY: reading `DAIF` at EL1 has no side effects.
         unsafe {
             asm!("mrs {daif}, daif", daif = out(reg) daif, options(nomem, nostack, preserves_flags));
         }
@@ -738,12 +745,18 @@ critical_section::set_impl!(Aarch64CriticalSection);
 // and need only to keep this processor's interrupt handler out.
 helios_hal::critical_section::set_local_interrupt_mask_impl!(Aarch64InterruptOps);
 
+// SAFETY: `CRITICAL_SECTION_STATE` coordinates IRQ masking and nesting via
+// `Aarch64InterruptOps` per `critical_section::Impl`'s reentrancy contract.
 unsafe impl critical_section::Impl for Aarch64CriticalSection {
     unsafe fn acquire() -> usize {
+        // SAFETY: `Aarch64InterruptOps` masks IRQs and identifies the current
+        // processor via `tpidr_el1` or `MPIDR_EL1` per `acquire`'s contract.
         unsafe { CRITICAL_SECTION_STATE.acquire::<Aarch64InterruptOps>() }
     }
 
     unsafe fn release(restore_state: usize) {
+        // SAFETY: `restore_state` was returned by the matching `acquire` on
+        // this processor and the caller owns the critical section token.
         unsafe { CRITICAL_SECTION_STATE.release::<Aarch64InterruptOps>(restore_state) }
     }
 }
@@ -922,9 +935,13 @@ extern "C" fn aarch64_kernel_main() -> ! {
     // because this is the earliest point the DRBG is seeded on every
     // supported configuration, and everything after it is signed.
     // SAFETY: `SCTLR_EL1.EnIA` is clear, no secondary has started, and
-    // `aarch64_kernel_main` is `-> !`.
+    // `root_entropy` is seeded.
     unsafe {
         cfi::install_bootstrap_key(&platform_state.instruction_key, &root_entropy);
+    }
+    // SAFETY: `SCTLR_EL1.EnIA` is clear, the bootstrap key is installed above,
+    // no secondary has started, and `aarch64_kernel_main` is `-> !`.
+    unsafe {
         cfi::enable_instruction_key_a(
             platform_state
                 .control_flow_integrity
@@ -1253,6 +1270,7 @@ impl Cpu for Aarch64Cpu {
         // becomes a spin that burns a whole host core per processor.
         mask_irq();
         if !runtime.wake_pending.swap(false, Ordering::AcqRel) {
+            // SAFETY: `wfi` has no operands and touches no memory.
             unsafe {
                 asm!("wfi", options(nomem, nostack, preserves_flags));
             }
@@ -1351,8 +1369,14 @@ impl Cpu for Aarch64Cpu {
     }
 
     fn set_deadline(&self, deadline: Instant) {
+        // SAFETY: writing `CNTV_CVAL_EL0` programs only this processor's
+        // virtual timer comparator.
         unsafe {
             asm!("msr cntv_cval_el0, {deadline}", deadline = in(reg) deadline.ticks(), options(nomem, nostack, preserves_flags));
+        }
+        // SAFETY: writing `1` to `CNTV_CTL_EL0` enables and unmasks this
+        // processor's virtual timer.
+        unsafe {
             asm!("msr cntv_ctl_el0, {ctl}", ctl = in(reg) 1_u64, options(nomem, nostack, preserves_flags));
         }
     }
@@ -1450,10 +1474,16 @@ impl ProcessorRuntime {
 fn activate_processor_runtime(runtime: &'static ProcessorRuntime) {
     let ptr = runtime as *const _ as usize;
     let exception_stack_top = runtime.exception_stack.range().end;
+    // SAFETY: `runtime` is `&'static ProcessorRuntime`, so storing its address
+    // in `TPIDR_EL1` publishes a valid per-processor runtime pointer for this PE.
     unsafe {
         asm!("msr tpidr_el1, {ptr}", ptr = in(reg) ptr, options(nomem, nostack, preserves_flags));
-        // The kernel never leaves EL1 and always runs on SP_EL1, so
-        // SP_EL0 is free to hold the stack the IRQ entry switches to.
+    }
+    // The kernel never leaves EL1 and always runs on SP_EL1, so
+    // SP_EL0 is free to hold the stack the IRQ entry switches to.
+    // SAFETY: `exception_stack_top` is the 16-byte aligned top of this
+    // processor's static `ExceptionStack` and EL1 is running on `SP_EL1`.
+    unsafe {
         asm!("msr sp_el0, {top}", top = in(reg) exception_stack_top, options(nomem, nostack, preserves_flags));
     }
     cache_dc_zva_block_bytes(runtime);
@@ -1466,6 +1496,7 @@ fn activate_processor_runtime(runtime: &'static ProcessorRuntime) {
 /// and callers must fall through to a generic memset.
 fn cache_dc_zva_block_bytes(runtime: &ProcessorRuntime) {
     let dczid: u64;
+    // SAFETY: reading `DCZID_EL0` at EL1 has no side effects.
     unsafe {
         asm!(
             "mrs {v}, dczid_el0",
@@ -1502,20 +1533,29 @@ unsafe fn dc_zva_zero(mut ptr: *mut u8, mut size: usize, block_bytes: usize) {
     let misalignment = (ptr as usize) & block_mask;
     if misalignment != 0 {
         let prefix = (block_bytes - misalignment).min(size);
+        // SAFETY: caller guarantees `ptr..ptr + size` is writable and unshared,
+        // and `prefix <= size`.
         unsafe {
             core::ptr::write_bytes(ptr, 0, prefix);
-            ptr = ptr.add(prefix);
         }
+        // SAFETY: `prefix <= size`, so `ptr.add(prefix)` stays within the
+        // caller-guaranteed allocation.
+        ptr = unsafe { ptr.add(prefix) };
         size -= prefix;
     }
     while size >= block_bytes {
+        // SAFETY: `ptr` is aligned to `block_bytes` (the PE's `DCZID_EL0`
+        // block size) and at least `block_bytes` writable bytes remain.
         unsafe {
             asm!("dc zva, {p}", p = in(reg) ptr, options(nostack, preserves_flags));
-            ptr = ptr.add(block_bytes);
         }
+        // SAFETY: `block_bytes <= size`, so `ptr.add(block_bytes)` stays
+        // within the caller-guaranteed allocation.
+        ptr = unsafe { ptr.add(block_bytes) };
         size -= block_bytes;
     }
     if size > 0 {
+        // SAFETY: `ptr` points to the remaining `size` writable, unshared bytes.
         unsafe {
             core::ptr::write_bytes(ptr, 0, size);
         }
@@ -1535,11 +1575,15 @@ pub(crate) unsafe fn aarch64_zero_memory(ptr: *mut u8, size: usize) {
     let runtime = current_processor_runtime();
     let block_bytes = runtime.dc_zva_block_bytes.load(Ordering::Relaxed) as usize;
     if block_bytes == 0 {
+        // SAFETY: caller guarantees `ptr` points to `size` writable bytes.
         unsafe {
             core::ptr::write_bytes(ptr, 0, size);
         }
         return;
     }
+    // SAFETY: caller guarantees `ptr` points to `size` writable bytes and
+    // `block_bytes` is the nonzero power-of-two `DCZID_EL0` block size
+    // published by `activate_processor_runtime`.
     unsafe {
         dc_zva_zero(ptr, size, block_bytes);
     }
@@ -1575,6 +1619,9 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
         !state.is_null(),
         "AArch64 secondary processor started without a platform state pointer"
     );
+    // SAFETY: `start_processor` passed `self as *const _ as u64` as the
+    // extra argument for the `&'static Aarch64PlatformState` that outlives
+    // every secondary processor.
     let state = unsafe { &*state };
     let slot = state.processor_slot_by_mpidr(mp_info.mpidr);
     // Guest code is compiled once for the ISA level the bootstrap processor
@@ -1603,15 +1650,18 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     // before `started` is set, so `start_processor` returns for this
     // processor only after its enable, and the bootstrap processor wipes the
     // shared key only after every secondary has read it.
-    // SAFETY: `SCTLR_EL1.EnIA` is clear on this processor, the bootstrap
-    // processor published the key before it started this one, and
-    // `aarch64_secondary_main` is `-> !`.
+    // SAFETY: `SCTLR_EL1.EnIA` is clear on this processor and the bootstrap
+    // processor published the shared key before it started this one.
     unsafe {
         cfi::install_secondary_key(
             state.control_flow_integrity,
             &state.instruction_key,
             mp_info.mpidr,
         );
+    }
+    // SAFETY: `SCTLR_EL1.EnIA` is clear, the instruction key is installed
+    // above, and `aarch64_secondary_main` is `-> !`.
+    unsafe {
         cfi::enable_instruction_key_a(state.control_flow_integrity.branch_targets_identified);
     }
     state.user_isolation.enable_on_current_processor();
@@ -1664,15 +1714,28 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
 }
 
 fn prepare_current_processor() {
+    // SAFETY: setting all DAIF bits masks debug, SError, IRQ, and FIQ
+    // exceptions on this secondary processor during early bring-up.
     unsafe {
         asm!(
             "msr daifset, #0xf",
             options(nomem, nostack, preserves_flags)
         );
-        let cpacr: u64;
+    }
+    let cpacr: u64;
+    // SAFETY: reading `CPACR_EL1` at EL1 has no side effects.
+    unsafe {
         asm!("mrs {cpacr}, cpacr_el1", cpacr = out(reg) cpacr, options(nomem, nostack, preserves_flags));
-        let cpacr = cpacr | (0x3 << 20);
+    }
+    let cpacr = cpacr | (0x3 << 20);
+    // SAFETY: setting `CPACR_EL1.FPEN` (`0b11 << 20`) enables EL0/EL1 FP/SIMD
+    // access before any code or exception frame touches `q` registers.
+    unsafe {
         asm!("msr cpacr_el1, {cpacr}", cpacr = in(reg) cpacr, options(nomem, nostack, preserves_flags));
+    }
+    // SAFETY: `isb` synchronizes the `CPACR_EL1` write before any FP/SIMD
+    // instruction executes.
+    unsafe {
         asm!("isb", options(nostack, preserves_flags));
     }
     install_memory_attributes();
@@ -1690,13 +1753,20 @@ fn install_exception_vectors() {
     // previous entry did too.
     if read_processor_runtime() == 0 {
         let boot_stack_top = &raw const __helios_aarch64_boot_exception_stack_top as usize;
+        // SAFETY: `boot_stack_top` is the 16-byte aligned top of the static
+        // boot exception stack, and EL1 runs on `SP_EL1`.
         unsafe {
             asm!("msr sp_el0, {top}", top = in(reg) boot_stack_top, options(nomem, nostack, preserves_flags));
         }
     }
     let vectors = &raw const __helios_aarch64_exception_vectors as usize;
+    // SAFETY: `__helios_aarch64_exception_vectors` is the aligned EL1 vector
+    // table defined in `entry.S` and `SP_EL0` holds a valid stack.
     unsafe {
         asm!("msr vbar_el1, {vectors}", vectors = in(reg) vectors, options(nomem, nostack, preserves_flags));
+    }
+    // SAFETY: `isb` ensures subsequent instructions observe the new `VBAR_EL1`.
+    unsafe {
         asm!("isb", options(nostack, preserves_flags));
     }
 }
@@ -1717,20 +1787,24 @@ extern "C" fn aarch64_handle_sync_exception(
     // cannot be taken for a guest trap or a swap-in. A guest reaches its
     // memory through untagged pointers, so one is a kernel or runtime defect.
     if tagging::is_tag_check_fault(esr_el1) {
-        // SAFETY: `is_tag_check_fault` holds, so FEAT_MTE2 is active and `far`
-        // names a tag-capable granule; `frame` was written by entry.S.
-        if let Some(runtime) = installed_processor_runtime()
-            && unsafe { runtime.tag_check_probe.claim(esr_el1, far_el1) }
-        {
-            let frame = unsafe { &mut *frame };
-            frame.elr = frame.x[30];
-            return;
+        if let Some(runtime) = installed_processor_runtime() {
+            // SAFETY: `is_tag_check_fault` holds, so FEAT_MTE2 is active and
+            // `far_el1` names a tag-capable granule.
+            let claimed = unsafe { runtime.tag_check_probe.claim(esr_el1, far_el1) };
+            if claimed {
+                // SAFETY: the entry wrote a complete frame at `frame`, and nothing
+                // else touches it while this handler runs.
+                let frame = unsafe { &mut *frame };
+                frame.elr = frame.x[30];
+                return;
+            }
         }
         // SAFETY: the entry wrote a complete frame at `frame`, and nothing
-        // else touches it while this handler runs. A processor that took a
-        // tag check fault implements FEAT_MTE2, and a tag mismatch is only
-        // raised on a tag-capable mapping.
-        unsafe { tagging::report_tag_check_fault(esr_el1, far_el1, (*frame).elr) }
+        // else touches it while this handler runs.
+        let elr = unsafe { (*frame).elr };
+        // SAFETY: a processor that took a tag check fault implements FEAT_MTE2,
+        // and a tag mismatch is only raised on a tag-capable mapping.
+        unsafe { tagging::report_tag_check_fault(esr_el1, far_el1, elr) }
     }
     // A failed return-address authentication is never the runtime's: a
     // guest cannot form a native return address, so it is a corrupted host
@@ -1778,15 +1852,15 @@ extern "C" fn aarch64_handle_sync_exception(
         _ => (KernelExceptionCause::IllegalInstruction, None),
     };
     // The trap hand-over self-check's second trap is resolved in place.
-    // SAFETY: the entry wrote a complete frame at `frame`, and nothing
-    // else touches it while this handler runs.
     if cause == KernelExceptionCause::Breakpoint
         && let Some(runtime) = installed_processor_runtime()
-        && runtime
-            .hand_over_probe
-            .resolve_returning_trap(unsafe { &mut *frame })
     {
-        return;
+        // SAFETY: the entry wrote a complete frame at `frame`, and nothing
+        // else touches it while this handler runs.
+        let frame_ref = unsafe { &mut *frame };
+        if runtime.hand_over_probe.resolve_returning_trap(frame_ref) {
+            return;
+        }
     }
 
     let mut stack_fault = helios_kernel::StackFault::Elsewhere;
@@ -1860,23 +1934,33 @@ extern "C" fn aarch64_handle_sync_exception(
 /// the SP it recorded must be a live stack with a frame's worth of room
 /// below it.
 unsafe fn enter_swap_fault_trampoline(frame: *mut SyncTrapFrame, faulting_address: usize) {
-    let interrupted_sp = unsafe { (*frame).sp } as usize;
+    // SAFETY: caller guarantees `frame` is the complete frame written by the
+    // synchronous-exception entry and exclusively accessible here.
+    let frame_ref = unsafe { &mut *frame };
+    let interrupted_sp = frame_ref.sp as usize;
     assert!(
         interrupted_sp.is_multiple_of(16),
         "AArch64 fault took a context whose SP {interrupted_sp:#x} is not 16-byte aligned"
     );
     let landing = interrupted_sp - SYNC_FRAME_BYTES;
+    // SAFETY: caller guarantees the interrupted stack has at least
+    // `SYNC_FRAME_BYTES` of live space below `interrupted_sp`, which is
+    // disjoint from `frame` on the exception stack.
     unsafe {
-        core::ptr::copy_nonoverlapping(frame, landing as *mut SyncTrapFrame, 1);
-        (*frame).x[0] = landing as u64;
-        (*frame).x[1] = faulting_address as u64;
-        (*frame).elr = swap_fault_trampoline as *const () as usize as u64;
-        // The interrupted frame copied to `landing` preserves the original
-        // BTYPE for `__helios_aarch64_swap_fault_resume`; clear it for the
-        // `eret` into the trampoline itself.
-        (*frame).spsr &= !SPSR_BTYPE_MASK;
-        (*frame).sp = landing as u64;
+        core::ptr::copy_nonoverlapping(
+            core::ptr::from_ref(frame_ref),
+            landing as *mut SyncTrapFrame,
+            1,
+        );
     }
+    frame_ref.x[0] = landing as u64;
+    frame_ref.x[1] = faulting_address as u64;
+    frame_ref.elr = swap_fault_trampoline as *const () as usize as u64;
+    // The interrupted frame copied to `landing` preserves the original
+    // BTYPE for `__helios_aarch64_swap_fault_resume`; clear it for the
+    // `eret` into the trampoline itself.
+    frame_ref.spsr &= !SPSR_BTYPE_MASK;
+    frame_ref.sp = landing as u64;
 }
 
 /// Resolves a swapped-out page from the faulting context's own stack.
@@ -1897,7 +1981,8 @@ extern "C" fn swap_fault_trampoline(frame: *mut SyncTrapFrame, faulting_address:
     // trampoline runs with the interrupt mask the faulting context had
     // (`SPSR` was left alone), so what the runtime's unwind lands in runs
     // on that context's terms without a mask to restore.
-    let (elr_el1, frame_pointer) = unsafe { ((*frame).elr as usize, (*frame).x[29] as usize) };
+    let saved = unsafe { &*frame };
+    let (elr_el1, frame_pointer) = (saved.elr as usize, saved.x[29] as usize);
     helios_kernel::run_swap_fault_trampoline(
         helios_hal::vmm::VirtAddr::new(faulting_address),
         KernelException {
@@ -1973,6 +2058,7 @@ const SPSR_IRQ_MASK: u64 = 1 << 7;
 /// CurrentEL uses the same EL bits as SPSR.M; bit zero selects the stack.
 fn current_exception_level() -> u64 {
     let level;
+    // SAFETY: reading `CurrentEL` at EL1 has no side effects.
     unsafe {
         asm!("mrs {level}, CurrentEL", level = out(reg) level, options(nomem, nostack, preserves_flags));
     }
@@ -1980,6 +2066,7 @@ fn current_exception_level() -> u64 {
 }
 
 fn mask_irq() {
+    // SAFETY: setting `DAIF.I` masks only IRQ delivery on the calling processor.
     unsafe {
         asm!(
             "msr daifset, #0x2",
@@ -1990,6 +2077,7 @@ fn mask_irq() {
 
 fn read_daif() -> u64 {
     let daif: u64;
+    // SAFETY: reading `DAIF` at EL1 has no side effects.
     unsafe {
         asm!("mrs {daif}, daif", daif = out(reg) daif, options(nomem, nostack, preserves_flags));
     }
@@ -2004,6 +2092,8 @@ fn read_daif() -> u64 {
 /// restores a mask state the caller established rather than inventing
 /// one.
 unsafe fn write_daif(daif: u64) {
+    // SAFETY: caller guarantees `daif` came from `read_daif` on this
+    // processor, restoring its previous interrupt mask state.
     unsafe {
         asm!("msr daif, {daif}", daif = in(reg) daif, options(nomem, nostack, preserves_flags));
     }
@@ -2037,6 +2127,8 @@ fn take_pending_irq() {
 /// The calling processor's GIC CPU interface must be initialised and
 /// every interrupt routed to it must have a handler installed.
 unsafe fn unmask_irq() {
+    // SAFETY: caller guarantees this processor's GIC CPU interface is
+    // initialised and every interrupt routed to it has a handler installed.
     unsafe {
         asm!(
             "msr daifclr, #0x2",
@@ -2049,6 +2141,7 @@ unsafe fn unmask_irq() {
 /// every AArch64 implementation.
 fn read_mpidr_affinity() -> usize {
     let mpidr: u64;
+    // SAFETY: reading `MPIDR_EL1` at EL1 has no side effects.
     unsafe {
         asm!("mrs {mpidr}, mpidr_el1", mpidr = out(reg) mpidr, options(nomem, nostack, preserves_flags));
     }
@@ -2060,6 +2153,7 @@ fn read_mpidr_affinity() -> usize {
 
 fn read_processor_runtime() -> usize {
     let ptr: usize;
+    // SAFETY: reading `TPIDR_EL1` at EL1 has no side effects.
     unsafe {
         asm!("mrs {ptr}, tpidr_el1", ptr = out(reg) ptr, options(nomem, nostack, preserves_flags));
     }
@@ -2103,6 +2197,7 @@ fn aarch64_id_field(register: u64, shift: u8) -> u64 {
 
 fn read_id_aa64isar0_el1() -> u64 {
     let value: u64;
+    // SAFETY: reading `ID_AA64ISAR0_EL1` at EL1 has no side effects.
     unsafe {
         asm!("mrs {value}, id_aa64isar0_el1", value = out(reg) value, options(nomem, nostack, preserves_flags));
     }
@@ -2111,6 +2206,7 @@ fn read_id_aa64isar0_el1() -> u64 {
 
 fn read_id_aa64pfr0_el1() -> u64 {
     let value: u64;
+    // SAFETY: reading `ID_AA64PFR0_EL1` at EL1 has no side effects.
     unsafe {
         asm!("mrs {value}, id_aa64pfr0_el1", value = out(reg) value, options(nomem, nostack, preserves_flags));
     }
@@ -2119,6 +2215,7 @@ fn read_id_aa64pfr0_el1() -> u64 {
 
 fn read_id_aa64dfr0_el1() -> u64 {
     let value: u64;
+    // SAFETY: reading `ID_AA64DFR0_EL1` at EL1 has no side effects.
     unsafe {
         asm!("mrs {value}, id_aa64dfr0_el1", value = out(reg) value, options(nomem, nostack, preserves_flags));
     }
@@ -2134,16 +2231,27 @@ fn enable_pmu_for_current_processor() {
     if !aarch64_pmu_supported() {
         return;
     }
+    let enable_reset_and_64bit_cycle_counter = (1_u64 << 0) | (1_u64 << 2) | (1_u64 << 6);
+    // SAFETY: `aarch64_pmu_supported()` verified PMUv3 is present; enabling and
+    // resetting the 64-bit cycle counter in `PMCR_EL0` affects only this PE.
     unsafe {
-        let enable_reset_and_64bit_cycle_counter = (1_u64 << 0) | (1_u64 << 2) | (1_u64 << 6);
         asm!("msr pmcr_el0, {value}", value = in(reg) enable_reset_and_64bit_cycle_counter, options(nomem, nostack, preserves_flags));
+    }
+    // SAFETY: PMUv3 is present; setting bit 31 in `PMCNTENSET_EL0` enables the
+    // cycle counter `PMCCNTR_EL0` on this PE.
+    unsafe {
         asm!("msr pmcntenset_el0, {value}", value = in(reg) 1_u64 << 31, options(nomem, nostack, preserves_flags));
+    }
+    // SAFETY: `isb` synchronizes the PMU register writes before reading the counter.
+    unsafe {
         asm!("isb", options(nostack, preserves_flags));
     }
 }
 
 fn read_cycle_counter() -> u64 {
     let value: u64;
+    // SAFETY: callers check `aarch64_pmu_supported()` and PMU enablement ran
+    // during bring-up; reading `PMCCNTR_EL0` at EL1 has no side effects.
     unsafe {
         asm!("mrs {value}, pmccntr_el0", value = out(reg) value, options(nomem, nostack, preserves_flags));
     }
@@ -2170,6 +2278,9 @@ fn fill_with_rndr(buffer: &mut [u8]) -> Result<(), EntropyUnavailable> {
 fn read_rndr() -> Result<u64, EntropyUnavailable> {
     let value: u64;
     let failed: u64;
+    // SAFETY: `fill_with_rndr` verified `rndr_supported()` via
+    // `ID_AA64ISAR0_EL1.RNDR`; reading `RNDR` (`S3_3_C2_C4_0`) returns random
+    // bits and sets `NZCV.Z` on failure without touching memory.
     unsafe {
         asm!(
             "mrs {value}, S3_3_C2_C4_0",
@@ -2188,6 +2299,7 @@ fn read_rndr() -> Result<u64, EntropyUnavailable> {
 
 fn read_counter() -> u64 {
     let value: u64;
+    // SAFETY: reading `CNTVCT_EL0` at EL1 has no side effects.
     unsafe {
         asm!("mrs {value}, cntvct_el0", value = out(reg) value, options(nomem, nostack, preserves_flags));
     }
@@ -2198,6 +2310,7 @@ fn read_counter() -> u64 {
 /// into `CNTFRQ_EL0`.
 fn timebase() -> Timebase {
     let value: u64;
+    // SAFETY: reading `CNTFRQ_EL0` at EL1 has no side effects.
     unsafe {
         asm!("mrs {value}, cntfrq_el0", value = out(reg) value, options(nomem, nostack, preserves_flags));
     }
@@ -2217,6 +2330,9 @@ pub(crate) fn make_instructions_coherent(ptr: *const u8, len: usize) {
         .unwrap_or_else(|| panic!("AArch64 executable publish range overflow"));
     let mut address = start & !(cache_line_bytes() - 1);
     while address < end {
+        // SAFETY: `address` lies within the caller's `[ptr, ptr + len)`
+        // cache-line range and `dc cvau` cleans that line to PoU without
+        // mutating architectural state.
         unsafe {
             asm!("dc cvau, {addr}", addr = in(reg) address, options(nostack, preserves_flags));
         }
@@ -2224,11 +2340,16 @@ pub(crate) fn make_instructions_coherent(ptr: *const u8, len: usize) {
             .checked_add(cache_line_bytes())
             .unwrap_or_else(|| panic!("AArch64 data-cache clean iteration overflow"));
     }
+    // SAFETY: `dsb ish` ensures all `dc cvau` operations complete in the inner
+    // shareable domain before instruction cache invalidation.
     unsafe {
         asm!("dsb ish", options(nostack, preserves_flags));
     }
     let mut address = start & !(cache_line_bytes() - 1);
     while address < end {
+        // SAFETY: `address` lies within the caller's `[ptr, ptr + len)`
+        // cache-line range and `ic ivau` invalidates that line to PoU across
+        // the inner shareable domain.
         unsafe {
             asm!("ic ivau, {addr}", addr = in(reg) address, options(nostack, preserves_flags));
         }
@@ -2236,14 +2357,21 @@ pub(crate) fn make_instructions_coherent(ptr: *const u8, len: usize) {
             .checked_add(cache_line_bytes())
             .unwrap_or_else(|| panic!("AArch64 instruction-cache invalidate iteration overflow"));
     }
+    // SAFETY: `dsb ish` waits for all `ic ivau` invalidations across the inner
+    // shareable domain.
     unsafe {
         asm!("dsb ish", options(nostack, preserves_flags));
+    }
+    // SAFETY: `isb` flushes the local pipeline so subsequent instruction fetches
+    // observe the invalidated cache lines.
+    unsafe {
         asm!("isb", options(nostack, preserves_flags));
     }
 }
 
 fn cache_line_bytes() -> usize {
     let ctr_el0: u64;
+    // SAFETY: reading `CTR_EL0` at EL1 has no side effects.
     unsafe {
         asm!("mrs {ctr_el0}, ctr_el0", ctr_el0 = out(reg) ctr_el0, options(nomem, nostack, preserves_flags));
     }
@@ -2255,6 +2383,7 @@ fn cache_line_bytes() -> usize {
 /// the architectural 2048-byte maximum when `CWG` reads zero.
 pub(crate) fn cache_writeback_granule_bytes() -> usize {
     let ctr_el0: u64;
+    // SAFETY: reading `CTR_EL0` at EL1 has no side effects.
     unsafe {
         asm!("mrs {ctr_el0}, ctr_el0", ctr_el0 = out(reg) ctr_el0, options(nomem, nostack, preserves_flags));
     }
@@ -2279,6 +2408,7 @@ fn kernel_virtual_to_physical(virtual_address: usize, handoff: &LimineBootHandof
 
 fn read_ttbr1_el1() -> usize {
     let value: usize;
+    // SAFETY: reading `TTBR1_EL1` at EL1 has no side effects.
     unsafe {
         asm!("mrs {value}, ttbr1_el1", value = out(reg) value, options(nomem, nostack, preserves_flags));
     }
@@ -2297,6 +2427,7 @@ fn read_ttbr1_el1() -> usize {
 /// them, which every ordinary mapping uses.
 fn install_memory_attributes() {
     let mair: u64;
+    // SAFETY: reading `MAIR_EL1` at EL1 has no side effects.
     unsafe {
         asm!("mrs {mair}, mair_el1", mair = out(reg) mair, options(nomem, nostack, preserves_flags));
     }
@@ -2310,8 +2441,15 @@ fn install_memory_attributes() {
         attrs |= tagging::MAIR_NORMAL_TAGGED << tagged_shift;
     }
     let mair = (mair & !mask) | attrs;
+    // SAFETY: called during early processor bring-up before any mapping on
+    // this PE selects these attribute indexes; indexes outside `mask` keep
+    // their loader values.
     unsafe {
         asm!("msr mair_el1, {mair}", mair = in(reg) mair, options(nomem, nostack, preserves_flags));
+    }
+    // SAFETY: `isb` synchronizes the updated `MAIR_EL1` before subsequent
+    // memory accesses or mappings rely on it.
+    unsafe {
         asm!("isb", options(nostack, preserves_flags));
     }
 }
@@ -2343,7 +2481,11 @@ fn map_mmio_page(
             physical_memory_offset,
         );
     }
-    let entry = unsafe { table.add(indexes[2]).read_volatile() };
+    // SAFETY: `table` points to a 512-entry L2 page table mapped via the HHDM
+    // and `indexes[2]` is masked to `0..512`.
+    let slot = unsafe { table.add(indexes[2]) };
+    // SAFETY: `slot` is an aligned, mapped L2 page-table entry.
+    let entry = unsafe { slot.read_volatile() };
     if entry & PAGE_VALID != 0 {
         assert!(
             entry & PAGE_TABLE_DESCRIPTOR != PAGE_TABLE_DESCRIPTOR,
@@ -2361,12 +2503,27 @@ fn map_mmio_page(
         | PAGE_PXN
         | PAGE_UXN
         | BLOCK_DESCRIPTOR;
+    // SAFETY: `slot` is the aligned, mapped L2 entry checked invalid above;
+    // writing `descriptor` installs a Device-nGnRnE 2 MiB block mapping.
     unsafe {
-        table.add(indexes[2]).write_volatile(descriptor);
+        slot.write_volatile(descriptor);
+    }
+    // SAFETY: `dsb ishst` orders the descriptor store before TLB invalidation.
+    unsafe {
         asm!("dsb ishst", options(nostack, preserves_flags));
-        let va_page = block_virtual >> 12;
+    }
+    let va_page = block_virtual >> 12;
+    // SAFETY: `tlbi vae1is` invalidates any stale entry for `block_virtual`
+    // across the inner shareable domain.
+    unsafe {
         asm!("tlbi vae1is, {va_page}", va_page = in(reg) va_page, options(nostack, preserves_flags));
+    }
+    // SAFETY: `dsb ish` waits for the TLB invalidation to complete.
+    unsafe {
         asm!("dsb ish", options(nostack, preserves_flags));
+    }
+    // SAFETY: `isb` synchronizes instruction execution with the new mapping.
+    unsafe {
         asm!("isb", options(nostack, preserves_flags));
     }
 }
@@ -2398,7 +2555,11 @@ fn ensure_next_page_table(
     handoff: &LimineBootHandoff,
     physical_memory_offset: usize,
 ) -> *mut u64 {
-    let entry = unsafe { table.add(index).read_volatile() };
+    // SAFETY: `table` points to a 512-entry page table mapped via the HHDM
+    // and `index` is masked to `0..512`.
+    let slot = unsafe { table.add(index) };
+    // SAFETY: `slot` is an aligned, mapped page-table descriptor word.
+    let entry = unsafe { slot.read_volatile() };
     if entry & 0b11 == PAGE_TABLE_DESCRIPTOR {
         return table_from_physical((entry & PAGE_ADDRESS_MASK) as usize, physical_memory_offset);
     }
@@ -2414,8 +2575,14 @@ fn ensure_next_page_table(
     *next_backing_table += 1;
     backing_table.clear();
     let descriptor = backing_table.physical_address(handoff) as u64 | PAGE_TABLE_DESCRIPTOR;
+    // SAFETY: `slot` is the aligned, mapped entry checked invalid above and
+    // `backing_table` was zeroed before linking its physical address.
     unsafe {
-        table.add(index).write_volatile(descriptor);
+        slot.write_volatile(descriptor);
+    }
+    // SAFETY: `dsb ishst` orders the backing-table zeroing and descriptor store
+    // before subsequent page-table walks or lookups.
+    unsafe {
         asm!("dsb ishst", options(nostack, preserves_flags));
     }
     backing_table.as_mut_ptr()
@@ -2470,6 +2637,8 @@ fn matches_virtio_mmio_device(
 ) -> bool {
     map_mmio_page(physical_base, physical_memory_offset, handoff);
     let virtual_base = mmio_virtual_base(physical_base, physical_memory_offset);
+    // SAFETY: `map_mmio_page` mapped the 2 MiB block containing `virtual_base`
+    // as Device-nGnRnE memory.
     unsafe { helios_virtio::mmio_device_matches(virtual_base, expected) }
 }
 
@@ -2529,14 +2698,26 @@ impl DebugSerial {
     /// one eighth full — so a burst below it still raises the timeout
     /// interrupt once the line goes quiet.
     fn init(self) {
+        // SAFETY: `DebugSerial::map` mapped the PL011 MMIO page as
+        // Device-nGnRnE; `PL011_IMSC` is a 32-bit aligned control register.
         unsafe {
             ((self.base + PL011_IMSC) as *mut u32).write_volatile(0);
+        }
+        // SAFETY: `self.base + PL011_ICR` is a mapped, 32-bit aligned PL011
+        // interrupt clear register.
+        unsafe {
             ((self.base + PL011_ICR) as *mut u32).write_volatile(PL011_INT_RX | PL011_INT_RT);
+        }
+        // SAFETY: `self.base + PL011_IFLS` is a mapped, 32-bit aligned PL011
+        // FIFO level select register.
+        unsafe {
             ((self.base + PL011_IFLS) as *mut u32).write_volatile(0);
         }
     }
 
     fn read_flag(self) -> u32 {
+        // SAFETY: `self.base + PL011_FLAG` is a mapped, 32-bit aligned PL011
+        // flag register.
         unsafe { ((self.base + PL011_FLAG) as *const u32).read_volatile() }
     }
 
@@ -2544,6 +2725,8 @@ impl DebugSerial {
         if self.read_flag() & PL011_FLAG_RXFE != 0 {
             return None;
         }
+        // SAFETY: `self.base + PL011_DATA` is a mapped, 32-bit aligned PL011
+        // data register and `RXFE` is clear.
         Some(unsafe { ((self.base + PL011_DATA) as *const u32).read_volatile() as u8 })
     }
 
@@ -2551,6 +2734,8 @@ impl DebugSerial {
         while self.read_flag() & PL011_FLAG_TXFF != 0 {
             core::hint::spin_loop();
         }
+        // SAFETY: `self.base + PL011_DATA` is a mapped, 32-bit aligned PL011
+        // data register and `TXFF` was observed clear.
         unsafe {
             ((self.base + PL011_DATA) as *mut u32).write_volatile(u32::from(byte));
         }
@@ -2573,12 +2758,16 @@ impl ByteSerial for DebugSerial {
     /// read-modify-write. Idempotent, and callable from interrupt
     /// context: a register write, no lock, no allocation.
     fn enable_receive_interrupt(&self) {
+        // SAFETY: `self.base + PL011_IMSC` is a mapped, 32-bit aligned PL011
+        // interrupt mask register.
         unsafe {
             ((self.base + PL011_IMSC) as *mut u32).write_volatile(PL011_INT_RX | PL011_INT_RT)
         };
     }
 
     fn disable_receive_interrupt(&self) {
+        // SAFETY: `self.base + PL011_IMSC` is a mapped, 32-bit aligned PL011
+        // interrupt mask register.
         unsafe { ((self.base + PL011_IMSC) as *mut u32).write_volatile(0) };
     }
 }
@@ -2816,6 +3005,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     helios_kernel::emit_panic_report::<PanicConsolePort>(info);
     helios_kernel::panic_log(info);
     loop {
+        // SAFETY: `wfi` has no operands and touches no memory.
         unsafe {
             asm!("wfi", options(nomem, nostack, preserves_flags));
         }
@@ -2829,6 +3019,8 @@ extern "C" fn wasmtime_tls_get(slot: usize) -> *mut u8 {
     if runtime == 0 {
         return core::ptr::null_mut();
     }
+    // SAFETY: `runtime` is nonzero and `tpidr_el1` is only written by
+    // `activate_processor_runtime` with a `&'static ProcessorRuntime`.
     unsafe {
         (*(runtime as *const ProcessorRuntime))
             .wasmtime_tls

@@ -490,6 +490,8 @@ impl UserMemoryPool {
         layout: Layout,
     ) -> Result<NonNull<u8>, ProgramOutOfMemory> {
         let (ptr, size) = self.allocate_uninit(processor, layout)?;
+        // SAFETY: `allocate_uninit` returned an exclusively owned, aligned,
+        // live user-memory block of `size` bytes.
         unsafe {
             core::ptr::write_bytes(ptr.as_ptr(), 0, size);
         }
@@ -554,6 +556,8 @@ impl UserMemoryPool {
             .reported
             .take_bytes(ptr.as_ptr() as usize, size);
         if reported {
+            // SAFETY: `ptr` points to an exclusively owned, live block of
+            // `size` bytes just allocated from `node`'s pool.
             unsafe {
                 core::ptr::write_bytes(ptr.as_ptr(), 0, size);
             }
@@ -595,8 +599,12 @@ impl UserMemoryPool {
                 // paying to zero half a gigabyte to answer a question would
                 // be absurd.
                 if let Some(ptr) = self.allocate_block(node, pool, candidate) {
-                    pool.heap
-                        .with(|heap| unsafe { heap.deallocate(ptr, candidate) });
+                    pool.heap.with(|heap| {
+                        // SAFETY: `ptr` was just returned by `allocate_block`
+                        // from `node`'s pool with size `candidate` and has not
+                        // been aliased or freed.
+                        unsafe { heap.deallocate(ptr, candidate) }
+                    });
                     best = candidate;
                     break;
                 }
@@ -650,8 +658,13 @@ impl UserMemoryPool {
         pool.heap.with(|heap| {
             heap.allocate(size)
                 .or_else(|_| {
-                    self.frame_slab.drain(node, |ptr| unsafe {
-                        heap.deallocate(ptr, PhysFrame::SIZE);
+                    self.frame_slab.drain(node, |ptr| {
+                        // SAFETY: every cached frame on `node`'s frame slab was
+                        // allocated as a single `PhysFrame::SIZE` block from
+                        // `node`'s buddy and is now exclusively owned by the drain.
+                        unsafe {
+                            heap.deallocate(ptr, PhysFrame::SIZE);
+                        }
                     });
                     heap.allocate(size)
                 })
@@ -734,8 +747,12 @@ impl UserMemoryPool {
                 return;
             }
         }
-        pool.heap.with(|heap| unsafe {
-            heap.deallocate(ptr, buddy_allocation_size(layout));
+        pool.heap.with(|heap| {
+            // SAFETY: `ptr` is an exclusively owned `buddy_allocation_size(layout)`-byte
+            // block originally allocated from `node`'s buddy pool and not yet returned.
+            unsafe {
+                heap.deallocate(ptr, buddy_allocation_size(layout));
+            }
         });
         self.note_returned();
     }
@@ -813,6 +830,8 @@ impl PhysFrameAllocator for UserMemoryPool {
             })?;
         let size = buddy_allocation_size(layout);
         if !self.zero_if_reported(node, ptr, size) && zero_first_use {
+            // SAFETY: `ptr` points to an exclusively owned, live block of
+            // `size` bytes just allocated from `node`'s pool.
             unsafe {
                 core::ptr::write_bytes(ptr.as_ptr(), 0, size);
             }
@@ -972,6 +991,8 @@ pub(crate) fn installed_user_memory_pool() -> Option<&'static UserMemoryPool> {
     if ptr.is_null() {
         None
     } else {
+        // SAFETY: `USER_MEMORY_POOL` is only set once via `install_user_memory_pool`
+        // to a leaked `'static` allocation, published with `Release`/`Acquire`.
         Some(unsafe { &*ptr })
     }
 }
@@ -1204,6 +1225,7 @@ mod tests {
         );
         let layout = Layout::from_size_align(bytes + alignment + offset, PhysFrame::SIZE)
             .expect("pool layout");
+        // SAFETY: `alignment` is a power of two >= 1, so `layout` has non-zero size.
         let base = unsafe { alloc::alloc::alloc(layout) } as usize;
         assert!(base != 0, "host allocation for the user pool failed");
         let start = base.next_multiple_of(alignment) + offset;
@@ -1264,6 +1286,7 @@ mod tests {
     fn the_granularity_bound_overstates_what_the_pool_serves() {
         let bytes = 8 * 1024 * 1024;
         let layout = Layout::from_size_align(bytes * 2, bytes).expect("fragmented pool layout");
+        // SAFETY: `bytes * 2` is 16 MiB, so `layout` has non-zero size.
         let start = unsafe { alloc::alloc::alloc(layout) }.expose_provenance();
         assert_ne!(start, 0, "host allocation for fragmented pool failed");
         let pool = UserMemoryPool::single_node(
@@ -1371,6 +1394,8 @@ mod tests {
     }
 
     fn tail_byte(address: usize, bytes: usize) -> u8 {
+        // SAFETY: test callers pass the base and non-zero byte size of a live,
+        // initialized user-memory allocation, so the last byte is valid to read.
         unsafe { core::ptr::read_volatile((address + bytes - 1) as *const u8) }
     }
 
@@ -1435,6 +1460,8 @@ mod tests {
         let mut reported = None;
         assert_eq!(
             block_on(pool.free_runs(NodeId::FIRST, 16, 1, |run| {
+                // SAFETY: `run` is an exclusively owned, live frame range in
+                // the test pool's leaked host backing for the duration of this visit.
                 unsafe {
                     core::ptr::write_bytes(run.start.phys_addr() as *mut u8, 0xc3, run.byte_size());
                 }
@@ -1958,6 +1985,8 @@ mod tests {
 
         let run = PhysFrameAllocator::allocate(&pool, node, 16, false).expect("a 16-frame run");
         assert_eq!(node_of(&ranges, frame_ptr(run)), 1);
+        // SAFETY: `run` is an exclusively owned, live 16-frame range allocated
+        // from the test pool's leaked host backing.
         unsafe {
             core::ptr::write_bytes(run.start.phys_addr() as *mut u8, 0xc3, run.byte_size());
         }

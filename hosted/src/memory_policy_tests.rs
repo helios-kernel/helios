@@ -38,7 +38,11 @@ const DENSITY_WORKLOAD_INSTANCES: usize = 100;
 /// Page-aligned host memory standing in for the machine's usable
 /// frames, leaked for the life of the test process.
 fn leak_machine_memory(bytes: usize) -> (usize, usize) {
+    assert!(bytes > 0, "machine memory size must be non-zero");
     let layout = Layout::from_size_align(bytes, 4096).expect("a page-aligned machine");
+    // SAFETY: `bytes` is non-zero (asserted above), so `layout` has non-zero
+    // size; the allocation is checked for null below and intentionally leaked
+    // for the life of the test process.
     let start = unsafe { alloc(layout) };
     assert!(!start.is_null(), "the host would not lend {bytes} bytes");
     let start = start as usize;

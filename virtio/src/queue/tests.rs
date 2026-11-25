@@ -952,6 +952,8 @@ fn a_buffer_wholly_inside_the_window_translates_as_before() {
     let mut queue = VirtQueue::new(&transport, 0, 8, 2, features(VirtioFeatures::empty()))
         .expect("queue should initialize");
     let page = pool.pages(1);
+    // SAFETY: `pool.pages(1)` allocates one 4096-byte initialized
+    // DMA page that stays alive for the rest of the test.
     let bytes = unsafe { core::slice::from_raw_parts(page.as_ptr(), 4096) };
 
     let mut chain = empty_chain();

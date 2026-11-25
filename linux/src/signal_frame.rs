@@ -1062,6 +1062,9 @@ mod tests {
         }
     }
 
+    // SAFETY: `FakeContext` is an in-memory test context with `Space =
+    // Infallible`; `resume` can never be called with a `Space`, so it never
+    // enters hardware user mode or installs processor-local state.
     unsafe impl UserContext for FakeContext {
         type Space = Infallible;
         fn register(&self, register: RegisterId) -> Result<u64, NativeError> {

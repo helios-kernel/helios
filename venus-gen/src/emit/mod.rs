@@ -67,8 +67,11 @@ pub fn entry_source(an: &Analysis) -> Result<String, EmitError> {
         #functions
         pub(super) fn lookup<F: Factory>(name: &[u8], device_only: bool) -> Option<unsafe extern "system" fn()> {
             let pointer = match name { #arms _ => return None };
-            // SAFETY: Vulkan resolves the erased pointer by its command name.
-            Some(unsafe { core::mem::transmute::<*const (), unsafe extern "system" fn()>(pointer) })
+            #[comment = " SAFETY: Vulkan resolves the erased pointer by its command name."]
+            let pointer = unsafe {
+                core::mem::transmute::<*const (), unsafe extern "system" fn()>(pointer)
+            };
+            Some(pointer)
         }
     })
 }
@@ -77,7 +80,90 @@ fn format_tokens(tokens: TokenStream) -> Result<String, EmitError> {
     let file: syn::File = syn::parse2(tokens).map_err(|error| EmitError::Syntax {
         message: error.to_string(),
     })?;
-    Ok(prettyplease::unparse(&file))
+    Ok(expand_comment_attributes(&prettyplease::unparse(&file)))
+}
+
+/// Converts synthetic `#[comment = "..."]` attributes inserted by the emitters
+/// into real `//...` comment lines (`quote!` strips regular comments before
+/// `prettyplease` sees them).
+fn expand_comment_attributes(source: &str) -> String {
+    const PREFIX: &str = "#[comment = \"";
+    let mut out = String::with_capacity(source.len());
+    for line in source.split_inclusive('\n') {
+        let (body, newline) = match line.strip_suffix('\n') {
+            Some(stripped) => (stripped, "\n"),
+            None => (line, ""),
+        };
+        let indent_len = body.len() - body.trim_start_matches([' ', '\t']).len();
+        let indent = &body[..indent_len];
+        let trimmed = &body[indent_len..];
+        if let Some(rest) = trimmed.strip_prefix(PREFIX)
+            && let Some(raw) = rest.strip_suffix("\"]")
+        {
+            out.push_str(indent);
+            out.push_str("//");
+            push_unescaped(&mut out, raw);
+            out.push_str(newline);
+            continue;
+        }
+        let mut cursor = body;
+        while let Some(pos) = cursor.find(PREFIX) {
+            let before = &cursor[..pos];
+            let after_prefix = &cursor[pos + PREFIX.len()..];
+            let Some(end) = find_comment_end(after_prefix) else {
+                break;
+            };
+            let raw = &after_prefix[..end];
+            out.push_str(before.trim_end_matches(' '));
+            out.push('\n');
+            out.push_str(indent);
+            out.push_str("//");
+            push_unescaped(&mut out, raw);
+            out.push('\n');
+            out.push_str(indent);
+            cursor = after_prefix[end + 2..].trim_start_matches(' ');
+        }
+        out.push_str(cursor);
+        out.push_str(newline);
+    }
+    out
+}
+
+fn find_comment_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'"' && bytes[i + 1] == b']' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn push_unescaped(out: &mut String, raw: &str) {
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('n') => out.push(' '),
+                Some('t') => out.push('\t'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
 }
 
 pub fn protocol_tokens(an: &Analysis) -> Result<TokenStream, RegistryError> {

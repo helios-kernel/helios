@@ -170,48 +170,50 @@ impl Aarch64UserAddressSpace {
         )
     }
 
+    /// Reads one table descriptor at `index` and returns the HHDM pointer to
+    /// the child table if the descriptor is a valid table entry.
+    ///
+    /// # Safety
+    ///
+    /// `table` must point to a live, 4 KiB-aligned page-table frame whose
+    /// entries remain valid to read for the lifetime of `&self`.
+    unsafe fn child_table(&self, table: *mut u64, index: usize) -> Option<*mut u64> {
+        // SAFETY: the caller guarantees `table` is a live 512-entry page-table
+        // frame, and `index` is masked to `0..512`.
+        let slot = unsafe { table.add(index & 0x1ff) };
+        // SAFETY: `slot` points to an aligned 64-bit descriptor within `table`,
+        // which is never freed while the address space lives.
+        let entry = unsafe { slot.read_volatile() };
+        if entry & 0b11 != TABLE_DESCRIPTOR {
+            return None;
+        }
+        Some(((entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64)
+    }
+
     /// Reads the level-3 descriptor for `virt` whether or not it is
     /// valid, which is what tells a swap entry apart from an unmapped
     /// page. Lock-free: table frames are never freed while the address
     /// space lives and a 64-bit descriptor read is single-copy atomic.
     fn leaf_entry(&self, virt: usize) -> Option<u64> {
-        let l0 = self.root();
-        let l0_entry = unsafe { l0.add((virt >> 39) & 0x1ff).read_volatile() };
-        if l0_entry & 0b11 != TABLE_DESCRIPTOR {
-            return None;
-        }
-        let l1 = ((l0_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
-        let l1_entry = unsafe { l1.add((virt >> 30) & 0x1ff).read_volatile() };
-        if l1_entry & 0b11 != TABLE_DESCRIPTOR {
-            return None;
-        }
-        let l2 = ((l1_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
-        let l2_entry = unsafe { l2.add((virt >> 21) & 0x1ff).read_volatile() };
-        if l2_entry & 0b11 != TABLE_DESCRIPTOR {
-            return None;
-        }
-        let l3 = ((l2_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
-        Some(unsafe { l3.add((virt >> 12) & 0x1ff).read_volatile() })
+        let entry_ptr = self.leaf_ptr(virt)?;
+        // SAFETY: `leaf_ptr` walked live tables, which are never freed while
+        // the address space lives, to an aligned level-3 descriptor.
+        let entry = unsafe { entry_ptr.read_volatile() };
+        Some(entry)
     }
 
     fn leaf_ptr(&self, virt: usize) -> Option<*mut u64> {
         let l0 = self.root();
-        let l0_entry = unsafe { l0.add((virt >> 39) & 0x1ff).read_volatile() };
-        if l0_entry & 0b11 != TABLE_DESCRIPTOR {
-            return None;
-        }
-        let l1 = ((l0_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
-        let l1_entry = unsafe { l1.add((virt >> 30) & 0x1ff).read_volatile() };
-        if l1_entry & 0b11 != TABLE_DESCRIPTOR {
-            return None;
-        }
-        let l2 = ((l1_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
-        let l2_entry = unsafe { l2.add((virt >> 21) & 0x1ff).read_volatile() };
-        if l2_entry & 0b11 != TABLE_DESCRIPTOR {
-            return None;
-        }
-        let l3 = ((l2_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
-        Some(unsafe { l3.add((virt >> 12) & 0x1ff) })
+        // SAFETY: `TTBR1_EL1` points to the live root L0 table frame in HHDM.
+        let l1 = unsafe { self.child_table(l0, virt >> 39) }?;
+        // SAFETY: `l1` came from a valid L0 table descriptor in HHDM.
+        let l2 = unsafe { self.child_table(l1, virt >> 30) }?;
+        // SAFETY: `l2` came from a valid L1 table descriptor in HHDM.
+        let l3 = unsafe { self.child_table(l2, virt >> 21) }?;
+        // SAFETY: `l3` came from a valid L2 table descriptor in HHDM and the
+        // level-3 index is masked to `0..512`.
+        let slot = unsafe { l3.add((virt >> 12) & 0x1ff) };
+        Some(slot)
     }
 
     /// Resolves an access-flag fault by setting the bit the aging pass
@@ -259,6 +261,8 @@ impl Aarch64UserAddressSpace {
                 Err(changed) => entry = changed,
             }
         }
+        // SAFETY: barriers and an inner-shareable TLB invalidation for the
+        // page whose access flag was just updated.
         unsafe {
             flush_tlb_pages(virt, 1);
         }
@@ -278,7 +282,11 @@ impl Aarch64UserAddressSpace {
     }
 
     fn ensure_table(&self, parent: *mut u64, index: usize) -> *mut u64 {
+        // SAFETY: `parent` is a live 512-entry page-table frame in HHDM and
+        // `index` is masked to `0..512` by callers.
         let entry_ptr = unsafe { parent.add(index) };
+        // SAFETY: `entry_ptr` points to an aligned 64-bit descriptor in
+        // `parent`, and the caller holds `self.state`.
         let entry = unsafe { entry_ptr.read_volatile() };
         if entry & 0b11 == TABLE_DESCRIPTOR {
             let phys = (entry & PT_ADDR_MASK) as usize;
@@ -288,13 +296,20 @@ impl Aarch64UserAddressSpace {
             panic!("Aarch64 user-VA L? index {index:#x} collides with a non-table descriptor");
         }
         let layout = Layout::from_size_align(PAGE, PAGE).expect("PT layout");
+        // SAFETY: `layout` has non-zero 4 KiB size and alignment.
         let raw = unsafe { alloc_zeroed(layout) };
         let raw = NonNull::new(raw).expect("PT alloc");
         let virt = raw.as_ptr() as usize;
         let phys = virt - self.physical_memory_offset;
         let new_descriptor = (phys as u64) | TABLE_DESCRIPTOR;
+        // SAFETY: `entry_ptr` is an aligned, previously invalid slot in
+        // `parent`, `new_descriptor` references a zeroed 4 KiB table frame,
+        // and the caller holds `self.state`.
         unsafe {
             entry_ptr.write_volatile(new_descriptor);
+        }
+        // SAFETY: orders the new table descriptor before any later walk.
+        unsafe {
             asm!("dsb ishst", options(nostack, preserves_flags));
         }
         virt as *mut u64
@@ -379,6 +394,7 @@ impl Aarch64UserAddressSpace {
                     let l2_index = (virt >> 21) & 0x1ff;
                     // SAFETY: `l2` is a live kernel table frame and we hold `self.state`.
                     let entry_ptr = unsafe { l2.add(l2_index) };
+                    // SAFETY: `entry_ptr` points to an aligned 64-bit descriptor in `l2` and `self.state` is held.
                     let existing = unsafe { entry_ptr.read_volatile() };
                     assert!(
                         existing & VALID == 0,
@@ -396,6 +412,7 @@ impl Aarch64UserAddressSpace {
                     let l3_index = (virt >> 12) & 0x1ff;
                     // SAFETY: `l3` is a live kernel table frame and we hold `self.state`.
                     let entry_ptr = unsafe { l3.add(l3_index) };
+                    // SAFETY: `entry_ptr` points to an aligned 64-bit descriptor in `l3` and `self.state` is held.
                     let existing = unsafe { entry_ptr.read_volatile() };
                     assert!(
                         existing & VALID == 0,
@@ -437,12 +454,18 @@ impl Aarch64UserAddressSpace {
         let l2_index = (virt >> 21) & 0x1ff;
         let l3 = self.ensure_table(l2, l2_index);
         let l3_index = (virt >> 12) & 0x1ff;
+        // SAFETY: `l3` is a live 512-entry level-3 table frame in HHDM and
+        // `l3_index` is masked to `0..512`.
         let entry_ptr = unsafe { l3.add(l3_index) };
+        // SAFETY: `entry_ptr` points to an aligned 64-bit descriptor in `l3`
+        // and the caller holds `self.state`.
         let entry = unsafe { entry_ptr.read_volatile() };
         if entry & VALID != 0 {
             return Err(AddressSpaceError::Overlap);
         }
         let descriptor = (phys as u64) | flags | PAGE_DESCRIPTOR | AF | SH_INNER;
+        // SAFETY: `entry_ptr` is a previously invalid level-3 slot in `l3`,
+        // `descriptor` maps a zeroed user frame, and `self.state` is held.
         unsafe {
             entry_ptr.write_volatile(descriptor);
         }
@@ -451,6 +474,8 @@ impl Aarch64UserAddressSpace {
 
     fn unmap_4k(&self, virt: usize) -> Result<u64, AddressSpaceError> {
         let entry = self.unmap_4k_no_flush(virt)?;
+        // SAFETY: barriers and an inner-shareable TLB invalidation for the
+        // newly unmapped page.
         unsafe {
             flush_tlb_pages(virt, 1);
         }
@@ -458,31 +483,15 @@ impl Aarch64UserAddressSpace {
     }
 
     fn unmap_4k_no_flush(&self, virt: usize) -> Result<u64, AddressSpaceError> {
-        let l0 = self.root();
-        let l0_index = (virt >> 39) & 0x1ff;
-        let l0_entry = unsafe { l0.add(l0_index).read_volatile() };
-        if l0_entry & 0b11 != TABLE_DESCRIPTOR {
-            return Err(AddressSpaceError::NotCommitted);
-        }
-        let l1 = ((l0_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
-        let l1_index = (virt >> 30) & 0x1ff;
-        let l1_entry = unsafe { l1.add(l1_index).read_volatile() };
-        if l1_entry & 0b11 != TABLE_DESCRIPTOR {
-            return Err(AddressSpaceError::NotCommitted);
-        }
-        let l2 = ((l1_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
-        let l2_index = (virt >> 21) & 0x1ff;
-        let l2_entry = unsafe { l2.add(l2_index).read_volatile() };
-        if l2_entry & 0b11 != TABLE_DESCRIPTOR {
-            return Err(AddressSpaceError::NotCommitted);
-        }
-        let l3 = ((l2_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
-        let l3_index = (virt >> 12) & 0x1ff;
-        let entry_ptr = unsafe { l3.add(l3_index) };
+        let entry_ptr = self.leaf_ptr(virt).ok_or(AddressSpaceError::NotCommitted)?;
+        // SAFETY: `leaf_ptr` walked live tables to an aligned level-3
+        // descriptor, and the caller holds `self.state`.
         let entry = unsafe { entry_ptr.read_volatile() };
         if entry & VALID == 0 {
             return Err(AddressSpaceError::NotCommitted);
         }
+        // SAFETY: `entry_ptr` is a valid level-3 descriptor slot in a live
+        // table and the caller holds `self.state` across the unmap.
         unsafe {
             entry_ptr.write_volatile(0);
         }
@@ -490,27 +499,9 @@ impl Aarch64UserAddressSpace {
     }
 
     fn protect_4k_no_flush(&self, virt: usize, flags: u64) -> Result<u64, AddressSpaceError> {
-        let l0 = self.root();
-        let l0_index = (virt >> 39) & 0x1ff;
-        let l0_entry = unsafe { l0.add(l0_index).read_volatile() };
-        if l0_entry & 0b11 != TABLE_DESCRIPTOR {
-            return Err(AddressSpaceError::NotCommitted);
-        }
-        let l1 = ((l0_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
-        let l1_index = (virt >> 30) & 0x1ff;
-        let l1_entry = unsafe { l1.add(l1_index).read_volatile() };
-        if l1_entry & 0b11 != TABLE_DESCRIPTOR {
-            return Err(AddressSpaceError::NotCommitted);
-        }
-        let l2 = ((l1_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
-        let l2_index = (virt >> 21) & 0x1ff;
-        let l2_entry = unsafe { l2.add(l2_index).read_volatile() };
-        if l2_entry & 0b11 != TABLE_DESCRIPTOR {
-            return Err(AddressSpaceError::NotCommitted);
-        }
-        let l3 = ((l2_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
-        let l3_index = (virt >> 12) & 0x1ff;
-        let entry_ptr = unsafe { l3.add(l3_index) };
+        let entry_ptr = self.leaf_ptr(virt).ok_or(AddressSpaceError::NotCommitted)?;
+        // SAFETY: `leaf_ptr` walked live tables to an aligned level-3
+        // descriptor, and the caller holds `self.state`.
         let entry = unsafe { entry_ptr.read_volatile() };
         if entry & VALID == 0 {
             return Err(AddressSpaceError::NotCommitted);
@@ -520,6 +511,8 @@ impl Aarch64UserAddressSpace {
         // region keeps the attribute index it was mapped with.
         let flags = (flags & !ATTR_INDEX_MASK) | (entry & ATTR_INDEX_MASK);
         let new_descriptor = phys | flags | PAGE_DESCRIPTOR | AF | SH_INNER;
+        // SAFETY: `entry_ptr` is a valid level-3 descriptor slot in a live
+        // table and the caller holds `self.state` across the update.
         unsafe {
             entry_ptr.write_volatile(new_descriptor);
         }
@@ -527,23 +520,7 @@ impl Aarch64UserAddressSpace {
     }
 
     fn translate_4k(&self, virt: usize) -> Option<u64> {
-        let l0 = self.root();
-        let l0_entry = unsafe { l0.add((virt >> 39) & 0x1ff).read_volatile() };
-        if l0_entry & 0b11 != TABLE_DESCRIPTOR {
-            return None;
-        }
-        let l1 = ((l0_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
-        let l1_entry = unsafe { l1.add((virt >> 30) & 0x1ff).read_volatile() };
-        if l1_entry & 0b11 != TABLE_DESCRIPTOR {
-            return None;
-        }
-        let l2 = ((l1_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
-        let l2_entry = unsafe { l2.add((virt >> 21) & 0x1ff).read_volatile() };
-        if l2_entry & 0b11 != TABLE_DESCRIPTOR {
-            return None;
-        }
-        let l3 = ((l2_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
-        let entry = unsafe { l3.add((virt >> 12) & 0x1ff).read_volatile() };
+        let entry = self.leaf_entry(virt)?;
         if entry & VALID == 0 {
             return None;
         }
@@ -551,33 +528,30 @@ impl Aarch64UserAddressSpace {
     }
 
     fn replace_4k(&self, virt: usize, new_entry: u64) -> Result<u64, AddressSpaceError> {
-        let l0 = self.root();
-        let l0_entry = unsafe { l0.add((virt >> 39) & 0x1ff).read_volatile() };
-        if l0_entry & 0b11 != TABLE_DESCRIPTOR {
-            return Err(AddressSpaceError::NotCommitted);
-        }
-        let l1 = ((l0_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
-        let l1_entry = unsafe { l1.add((virt >> 30) & 0x1ff).read_volatile() };
-        if l1_entry & 0b11 != TABLE_DESCRIPTOR {
-            return Err(AddressSpaceError::NotCommitted);
-        }
-        let l2 = ((l1_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
-        let l2_entry = unsafe { l2.add((virt >> 21) & 0x1ff).read_volatile() };
-        if l2_entry & 0b11 != TABLE_DESCRIPTOR {
-            return Err(AddressSpaceError::NotCommitted);
-        }
-        let l3 = ((l2_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
-        let entry_ptr = unsafe { l3.add((virt >> 12) & 0x1ff) };
+        let entry_ptr = self.leaf_ptr(virt).ok_or(AddressSpaceError::NotCommitted)?;
+        // SAFETY: `leaf_ptr` walked live tables to an aligned level-3
+        // descriptor, and the caller holds `self.state`.
         let old_entry = unsafe { entry_ptr.read_volatile() };
         if old_entry & VALID == 0 {
             return Err(AddressSpaceError::NotCommitted);
         }
+        // SAFETY: `entry_ptr` is a valid level-3 descriptor slot in a live
+        // table and the caller holds `self.state` across the replacement.
         unsafe {
             entry_ptr.write_volatile(new_entry);
+        }
+        // SAFETY: orders the descriptor store before the TLB invalidation.
+        unsafe {
             asm!("dsb ishst", options(nostack, preserves_flags));
+        }
+        // SAFETY: broadcasts TLB invalidation for `virt` after `dsb ishst`.
+        unsafe {
             invalidate_tlb_one(virt);
-            asm!("dsb ish", options(nostack, preserves_flags));
-            asm!("isb", options(nostack, preserves_flags));
+        }
+        // SAFETY: waits for inner-shareable TLB invalidation and synchronizes
+        // instruction/context streams before returning.
+        unsafe {
+            asm!("dsb ish", "isb", options(nostack, preserves_flags));
         }
         Ok(old_entry)
     }
@@ -652,6 +626,9 @@ impl Aarch64UserAddressSpace {
                     return Err(error);
                 }
             };
+            // SAFETY: `old_phys` is a live committed frame and `new_phys` is a
+            // freshly allocated disjoint frame; both HHDM pointers are valid
+            // and writable/readable for `PAGE` bytes.
             unsafe {
                 ptr::copy_nonoverlapping(
                     self.hhdm_ptr(old_phys) as *const u8,
@@ -746,6 +723,8 @@ impl Aarch64UserAddressSpace {
     }
 
     fn flush_and_dealloc_entries(&self, start: usize, entries: &[u64]) {
+        // SAFETY: barriers and inner-shareable TLB invalidations for the
+        // unmapped pages before their physical frames are returned to the pool.
         unsafe {
             flush_tlb_pages(start, entries.len());
         }
@@ -783,7 +762,8 @@ impl Aarch64UserAddressSpace {
                 .ok_or(AddressSpaceError::NotCommitted)?;
             // SAFETY: the pointer came from a walk of live tables, which
             // are never freed while the address space lives.
-            if unsafe { leaf.read_volatile() } & VALID == 0 {
+            let entry = unsafe { leaf.read_volatile() };
+            if entry & VALID == 0 {
                 return Err(AddressSpaceError::NotCommitted);
             }
             leaves.push(leaf);
@@ -878,11 +858,13 @@ impl Aarch64UserAddressSpace {
         for leaf in &leaves {
             // SAFETY: as in `present_leaf_ptrs`, and the lock is held, so
             // nothing else rewrites this leaf.
+            let entry = unsafe { leaf.read_volatile() };
+            if entry & VALID != 0 {
+                replaced.push(entry);
+            }
+            // SAFETY: as in `present_leaf_ptrs`, and the lock is held across
+            // the break-before-make invalidation.
             unsafe {
-                let entry = leaf.read_volatile();
-                if entry & VALID != 0 {
-                    replaced.push(entry);
-                }
                 leaf.write_volatile(0);
             }
         }
@@ -964,6 +946,8 @@ impl Aarch64UserAddressSpace {
             mapped_pages += 1;
         }
         if mapped_pages != 0 {
+            // SAFETY: barriers and inner-shareable TLB invalidations for the
+            // newly committed pages.
             unsafe {
                 flush_tlb_pages(virt.start.raw(), mapped_pages);
             }
@@ -1026,6 +1010,8 @@ impl Aarch64UserAddressSpace {
                 Err(error) => {
                     self.rollback_partial_protect(virt.start.raw(), &old_entries);
                     if protected_pages != 0 {
+                        // SAFETY: barriers and inner-shareable TLB
+                        // invalidations for the rolled-back range.
                         unsafe {
                             flush_tlb_pages(virt.start.raw(), protected_pages);
                         }
@@ -1036,6 +1022,8 @@ impl Aarch64UserAddressSpace {
             protected_pages += 1;
         }
         if protected_pages != 0 {
+            // SAFETY: barriers and inner-shareable TLB invalidations for the
+            // newly protected pages.
             unsafe {
                 flush_tlb_pages(virt.start.raw(), protected_pages);
             }
@@ -1106,14 +1094,18 @@ impl SwapLeafFormat for Aarch64UserAddressSpace {
             // cache: publish them before the leaf makes them fetchable.
             crate::make_instructions_coherent(frame.as_ptr(), PAGE);
         }
-        // SAFETY: as above. The frame's bytes are ordered before the
-        // descriptor that exposes them, and the descriptor before any
-        // walk that can see it.
+        // SAFETY: orders the restored frame's bytes before the descriptor write.
         unsafe {
             asm!("dmb ishst", options(nostack, preserves_flags));
+        }
+        // SAFETY: as above; publishes the new page descriptor while holding
+        // `self.state`.
+        unsafe {
             entry_ptr.write_volatile(descriptor);
-            asm!("dsb ishst", options(nostack, preserves_flags));
-            asm!("isb", options(nostack, preserves_flags));
+        }
+        // SAFETY: orders the descriptor before any walk that can see it.
+        unsafe {
+            asm!("dsb ishst", "isb", options(nostack, preserves_flags));
         }
         Ok(())
     }
@@ -1123,7 +1115,8 @@ impl SwapLeafFormat for Aarch64UserAddressSpace {
             return;
         };
         // SAFETY: as in `attach`.
-        if swap_descriptor_token(unsafe { entry_ptr.read_volatile() }).is_none() {
+        let entry = unsafe { entry_ptr.read_volatile() };
+        if swap_descriptor_token(entry).is_none() {
             return;
         }
         // SAFETY: as above.
@@ -1426,12 +1419,14 @@ impl AddressSpace for Aarch64UserAddressSpace {
             return Err(AddressSpaceError::Overlap);
         }
         let descriptor = (phys as u64) | pte_flags | PAGE_DESCRIPTOR | AF | SH_INNER;
-        // SAFETY: as above; the store publishes a complete descriptor
-        // and the barrier orders it before any walk that can see it.
+        // SAFETY: as above; the store publishes a complete descriptor for the
+        // demand-committed page.
         unsafe {
             entry_ptr.write_volatile(descriptor);
-            asm!("dsb ishst", options(nostack, preserves_flags));
-            asm!("isb", options(nostack, preserves_flags));
+        }
+        // SAFETY: orders the descriptor before any walk that can see it.
+        unsafe {
+            asm!("dsb ishst", "isb", options(nostack, preserves_flags));
         }
         // No TLB maintenance and no shootdown: the architecture does not
         // let a TLB hold an invalid descriptor, so the page going from
@@ -1608,54 +1603,78 @@ pub(crate) fn guard_kernel_text(physical_memory_offset: usize) {
         let l1_idx = (va >> 30) & 0x1ff;
         let l2_idx = (va >> 21) & 0x1ff;
         let l3_idx = (va >> 12) & 0x1ff;
+        // SAFETY: `root` points to the live 512-entry L0 kernel table in HHDM
+        // and `l0_idx` is masked to `0..512`.
+        let l0_slot = unsafe { root.add(l0_idx) };
         // SAFETY: `TTBR1_EL1` holds the live 4-level kernel page table
-        // reachable through the HHDM, and no other processor is mutating
-        // kernel text mappings during bootstrap bring-up.
-        unsafe {
-            let l0_entry = root.add(l0_idx).read_volatile();
+        // reachable through HHDM, and no other processor mutates it during
+        // bootstrap bring-up.
+        let l0_entry = unsafe { l0_slot.read_volatile() };
+        assert!(
+            l0_entry & TABLE_DESCRIPTOR == TABLE_DESCRIPTOR,
+            "AArch64 kernel text {va:#x} has no L0 table descriptor"
+        );
+        let l1 = ((l0_entry & PT_ADDR_MASK) as usize + physical_memory_offset) as *mut u64;
+        // SAFETY: `l1` is a live 512-entry L1 table in HHDM and `l1_idx` is
+        // masked to `0..512`.
+        let l1_slot = unsafe { l1.add(l1_idx) };
+        // SAFETY: `l1_slot` points to an aligned L1 descriptor during single-core
+        // bootstrap bring-up.
+        let l1_entry = unsafe { l1_slot.read_volatile() };
+        assert!(
+            l1_entry & TABLE_DESCRIPTOR == TABLE_DESCRIPTOR,
+            "AArch64 kernel text {va:#x} is not mapped via an L1 table descriptor"
+        );
+        let l2 = ((l1_entry & PT_ADDR_MASK) as usize + physical_memory_offset) as *mut u64;
+        // SAFETY: `l2` is a live 512-entry L2 table in HHDM and `l2_idx` is
+        // masked to `0..512`.
+        let l2_slot = unsafe { l2.add(l2_idx) };
+        // SAFETY: `l2_slot` points to an aligned L2 descriptor during single-core
+        // bootstrap bring-up.
+        let l2_entry = unsafe { l2_slot.read_volatile() };
+        assert!(
+            l2_entry & VALID != 0,
+            "AArch64 kernel text {va:#x} has no valid L2 descriptor"
+        );
+        if l2_entry & TABLE_DESCRIPTOR != TABLE_DESCRIPTOR {
+            // 2 MiB block descriptor covering kernel text.
+            let block_span = 2 * 1024 * 1024;
+            let block_start = va & !(block_span - 1);
+            let block_end = block_start + block_span;
             assert!(
-                l0_entry & TABLE_DESCRIPTOR == TABLE_DESCRIPTOR,
-                "AArch64 kernel text {va:#x} has no L0 table descriptor"
+                block_start >= start && block_end <= end,
+                "AArch64 kernel text {va:#x} shares a 2 MiB block [{block_start:#x}, \
+                 {block_end:#x}) with non-text sections"
             );
-            let l1 = ((l0_entry & PT_ADDR_MASK) as usize + physical_memory_offset) as *mut u64;
-            let l1_entry = l1.add(l1_idx).read_volatile();
-            assert!(
-                l1_entry & TABLE_DESCRIPTOR == TABLE_DESCRIPTOR,
-                "AArch64 kernel text {va:#x} is not mapped via an L1 table descriptor"
-            );
-            let l2 = ((l1_entry & PT_ADDR_MASK) as usize + physical_memory_offset) as *mut u64;
-            let l2_entry = l2.add(l2_idx).read_volatile();
-            assert!(
-                l2_entry & VALID != 0,
-                "AArch64 kernel text {va:#x} has no valid L2 descriptor"
-            );
-            if l2_entry & TABLE_DESCRIPTOR != TABLE_DESCRIPTOR {
-                // 2 MiB block descriptor covering kernel text.
-                let block_span = 2 * 1024 * 1024;
-                let block_start = va & !(block_span - 1);
-                let block_end = block_start + block_span;
-                assert!(
-                    block_start >= start && block_end <= end,
-                    "AArch64 kernel text {va:#x} shares a 2 MiB block [{block_start:#x}, \
-                     {block_end:#x}) with non-text sections"
-                );
-                if l2_entry & PXN == 0 {
-                    l2.add(l2_idx).write_volatile(l2_entry | GP);
-                    guarded_entries += 1;
+            if l2_entry & PXN == 0 {
+                // SAFETY: `l2_slot` is a live executable 2 MiB kernel text
+                // block descriptor during single-core bootstrap bring-up.
+                unsafe {
+                    l2_slot.write_volatile(l2_entry | GP);
                 }
-                va = block_end;
-                continue;
-            }
-            let l3 = ((l2_entry & PT_ADDR_MASK) as usize + physical_memory_offset) as *mut u64;
-            let l3_entry = l3.add(l3_idx).read_volatile();
-            assert!(
-                l3_entry & VALID != 0,
-                "AArch64 kernel text {va:#x} has no valid L3 descriptor"
-            );
-            if l3_entry & PXN == 0 {
-                l3.add(l3_idx).write_volatile(l3_entry | GP);
                 guarded_entries += 1;
             }
+            va = block_end;
+            continue;
+        }
+        let l3 = ((l2_entry & PT_ADDR_MASK) as usize + physical_memory_offset) as *mut u64;
+        // SAFETY: `l3` is a live 512-entry L3 table in HHDM and `l3_idx` is
+        // masked to `0..512`.
+        let l3_slot = unsafe { l3.add(l3_idx) };
+        // SAFETY: `l3_slot` points to an aligned L3 descriptor during single-core
+        // bootstrap bring-up.
+        let l3_entry = unsafe { l3_slot.read_volatile() };
+        assert!(
+            l3_entry & VALID != 0,
+            "AArch64 kernel text {va:#x} has no valid L3 descriptor"
+        );
+        if l3_entry & PXN == 0 {
+            // SAFETY: `l3_slot` is a live executable 4 KiB kernel text page
+            // descriptor during single-core bootstrap bring-up.
+            unsafe {
+                l3_slot.write_volatile(l3_entry | GP);
+            }
+            guarded_entries += 1;
         }
         va += PAGE;
     }
@@ -1679,30 +1698,56 @@ pub(crate) fn guard_kernel_text(physical_memory_offset: usize) {
 
 fn read_ttbr1_el1() -> usize {
     let value: usize;
+    // SAFETY: reading `TTBR1_EL1` at EL1 has no side effects or memory-safety
+    // preconditions.
     unsafe {
         asm!("mrs {value}, ttbr1_el1", value = out(reg) value, options(nomem, nostack, preserves_flags));
     }
     value & PT_ADDR_MASK as usize
 }
 
+/// Invalidates the inner-shareable TLB entry for the page containing `virt`.
+///
+/// # Safety
+///
+/// Broadcasts an EL1 TLB invalidation for `virt >> 12`; the caller must
+/// bracket it with the `dsb ishst` and `dsb ish; isb` barriers required by
+/// ARMv8-A.
 unsafe fn invalidate_tlb_one(virt: usize) {
     let va_page = virt >> 12;
+    // SAFETY: `tlbi vaale1is` invalidates a translation entry by VA and has no
+    // memory-safety preconditions beyond executing at EL1.
     unsafe {
         asm!("tlbi vaale1is, {va_page}", va_page = in(reg) va_page, options(nostack, preserves_flags));
     }
 }
 
+/// Invalidates the inner-shareable TLB entries for `pages` consecutive 4 KiB
+/// pages starting at `start`.
+///
+/// # Safety
+///
+/// Broadcasts EL1 TLB invalidations across the inner-shareable domain; requires
+/// execution at EL1.
 unsafe fn flush_tlb_pages(start: usize, pages: usize) {
     if pages == 0 {
         return;
     }
+    // SAFETY: orders prior page-table writes before TLB invalidation.
     unsafe {
         asm!("dsb ishst", options(nostack, preserves_flags));
-        for page in 0..pages {
+    }
+    for page in 0..pages {
+        // SAFETY: `invalidate_tlb_one` is bracketed by `dsb ishst` above and
+        // `dsb ish; isb` below.
+        unsafe {
             invalidate_tlb_one(start + page * PAGE);
         }
-        asm!("dsb ish", options(nostack, preserves_flags));
-        asm!("isb", options(nostack, preserves_flags));
+    }
+    // SAFETY: waits for all inner-shareable TLB invalidations to complete and
+    // synchronizes the instruction stream.
+    unsafe {
+        asm!("dsb ish", "isb", options(nostack, preserves_flags));
     }
 }
 

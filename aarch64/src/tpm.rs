@@ -70,10 +70,12 @@ pub(crate) fn discover(
         .tables
         .measurement_log
         .as_ref()
-        // SAFETY: Limine's event log lives in bootloader-reclaimable
-        // memory, which this backend never hands to the allocator, in the
-        // direct map the response points into.
-        .map(|log: &MeasurementLog| unsafe { LoaderLog::mapped(log) });
+        .map(|log: &MeasurementLog| {
+            // SAFETY: Limine's event log lives in bootloader-reclaimable
+            // memory, which this backend never hands to the allocator, in the
+            // direct map the response points into.
+            unsafe { LoaderLog::mapped(log) }
+        });
     helios_kernel::complete_device_future_at_bring_up(helios_tpm::discover(
         interface, window, base, cpu, log,
     ))

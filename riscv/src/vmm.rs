@@ -67,7 +67,7 @@ use core::cell::UnsafeCell;
 use core::ffi::c_int;
 use core::ptr;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use helios_hal::device::{DeviceRegion, DeviceRegionAttributes, DmaPlacement};
 use helios_hal::iommu::PhysicalRange;
@@ -151,6 +151,10 @@ fn entry_phys(entry: u64) -> usize {
 #[repr(align(4096))]
 struct PageTable(UnsafeCell<[u64; PTE_COUNT]>);
 
+// SAFETY: `ROOT_TABLE` is only mutably accessed in `install_kernel_paging`
+// before paging is enabled; afterwards every hart shares it via `satp` and
+// mutations to user-VA entries are serialised by `RiscvUserAddressSpace::state`
+// with atomic operations on intermediate entries.
 unsafe impl Sync for PageTable {}
 
 impl PageTable {
@@ -225,6 +229,9 @@ pub unsafe fn activate_paging() {
         "Sv48 root table not installed before activate_paging"
     );
     let satp = SATP_MODE_SV48 | (root_phys as u64 >> PAGE_SHIFT);
+    // SAFETY: `install_kernel_paging` completed before this call, `satp`
+    // encodes Sv48 mode and the page-aligned physical address of `ROOT_TABLE`,
+    // and `sfence.vma zero, zero` flushes any stale translations on this hart.
     unsafe {
         core::arch::asm!(
             "csrw satp, {satp}",
@@ -328,23 +335,31 @@ impl RiscvUserAddressSpace {
         self.root_phys as *mut [u64; PTE_COUNT]
     }
 
-    fn ensure_intermediate(table: &mut [u64; PTE_COUNT], index: usize) -> &mut [u64; PTE_COUNT] {
-        let entry = &mut table[index];
-        if *entry & PTE_VALID != 0 {
+    fn ensure_intermediate(table: *mut [u64; PTE_COUNT], index: usize) -> *mut [u64; PTE_COUNT] {
+        debug_assert!(index < PTE_COUNT);
+        // SAFETY: `table` points to a live 4 KiB-aligned `[u64; PTE_COUNT]`
+        // page table and `index < PTE_COUNT`.
+        let entry_ptr = unsafe { table.cast::<u64>().add(index) };
+        // SAFETY: `entry_ptr` is aligned to `u64` and valid for the lifetime
+        // of the kernel's page tables; all intermediate PTE accesses are atomic.
+        let entry_atomic = unsafe { AtomicU64::from_ptr(entry_ptr) };
+        let entry = entry_atomic.load(Ordering::Acquire);
+        if entry & PTE_VALID != 0 {
             assert!(
-                *entry & PTE_LEAF_MASK == 0,
+                entry & PTE_LEAF_MASK == 0,
                 "Sv48 user-VA index {index:#x} collides with a leaf mapping"
             );
-            let phys = entry_phys(*entry);
-            return unsafe { &mut *(phys as *mut [u64; PTE_COUNT]) };
+            return entry_phys(entry) as *mut [u64; PTE_COUNT];
         }
         let layout = Layout::from_size_align(PAGE_SIZE, PAGE_SIZE)
             .expect("Sv48 page-table layout is well-formed");
+        // SAFETY: `layout` has non-zero `PAGE_SIZE` size and alignment.
         let raw = unsafe { alloc_zeroed(layout) };
         let raw = NonNull::new(raw).expect("Sv48 page-table allocation failed");
         let phys = raw.as_ptr() as usize;
-        *entry = ((phys as u64) >> PAGE_SHIFT) << PTE_PPN_SHIFT | PTE_VALID;
-        unsafe { &mut *(phys as *mut [u64; PTE_COUNT]) }
+        let new_entry = ((phys as u64) >> PAGE_SHIFT) << PTE_PPN_SHIFT | PTE_VALID;
+        entry_atomic.store(new_entry, Ordering::Release);
+        phys as *mut [u64; PTE_COUNT]
     }
 
     /// Pointer to the leaf entry for `virt`, allocating the
@@ -353,22 +368,31 @@ impl RiscvUserAddressSpace {
     /// The caller holds this address space's reservation lock, so no
     /// other hart is editing its tables.
     fn ensure_leaf_entry(&self, virt: usize) -> *mut u64 {
-        let mut table = unsafe { &mut *self.root_table() };
+        let mut table = self.root_table();
         for level in (1..LEVELS).rev() {
             table = Self::ensure_intermediate(table, level_index(virt, level));
         }
-        &mut table[level_index(virt, 0)]
+        // SAFETY: `table` is a live leaf page table and `level_index(virt, 0) < PTE_COUNT`.
+        unsafe { table.cast::<u64>().add(level_index(virt, 0)) }
     }
 
     /// Pointer to the leaf entry for `virt`, or `None` when the walk
     /// runs into a missing table.
     ///
-    /// The caller holds this address space's reservation lock, so no
-    /// other hart is editing its tables.
+    /// Intermediate entries are read with acquire ordering so a concurrent
+    /// `commit_demand_page` on another hart never aliases an `&mut` table
+    /// or observes a partially initialised intermediate table.
     fn leaf_entry(&self, virt: usize) -> Option<*mut u64> {
         let mut table = self.root_table();
         for level in (1..LEVELS).rev() {
-            let entry = unsafe { (*table)[level_index(virt, level)] };
+            let index = level_index(virt, level);
+            // SAFETY: `table` points to a live `[u64; PTE_COUNT]` page table
+            // and `index < PTE_COUNT`.
+            let entry_ptr = unsafe { table.cast::<u64>().add(index) };
+            // SAFETY: `entry_ptr` is aligned to `u64` and valid for the
+            // lifetime of the kernel's page tables; all intermediate PTE
+            // accesses are atomic.
+            let entry = unsafe { AtomicU64::from_ptr(entry_ptr) }.load(Ordering::Acquire);
             if entry & PTE_VALID == 0 {
                 return None;
             }
@@ -378,7 +402,8 @@ impl RiscvUserAddressSpace {
             );
             table = entry_phys(entry) as *mut [u64; PTE_COUNT];
         }
-        Some(unsafe { &raw mut (*table)[level_index(virt, 0)] })
+        // SAFETY: `table` is a live leaf page table and `level_index(virt, 0) < PTE_COUNT`.
+        Some(unsafe { table.cast::<u64>().add(level_index(virt, 0)) })
     }
 
     /// Builds every table level above the leaf for `virt`, leaving the
@@ -388,10 +413,7 @@ impl RiscvUserAddressSpace {
     /// what makes `ensure_intermediate`'s heap allocation safe here and
     /// impossible in fault context.
     fn ensure_leaf_table(&self, virt: usize) {
-        // SAFETY: the root table is a live page table reached through
-        // the HHDM, and the caller holds the reservation lock, so no
-        // other processor is editing this walk.
-        let mut table = unsafe { &mut *self.root_table() };
+        let mut table = self.root_table();
         for level in (1..LEVELS).rev() {
             table = Self::ensure_intermediate(table, level_index(virt, level));
         }
@@ -431,11 +453,15 @@ impl RiscvUserAddressSpace {
         flags: u64,
     ) -> Result<(), AddressSpaceError> {
         let entry_ptr = self.ensure_leaf_entry(virt);
+        // SAFETY: `entry_ptr` points to a live leaf PTE and the caller holds
+        // the reservation lock.
         let entry = unsafe { entry_ptr.read_volatile() };
         if entry & PTE_VALID != 0 {
             return Err(AddressSpaceError::Overlap);
         }
         let ppn = (phys as u64) >> PAGE_SHIFT;
+        // SAFETY: `entry_ptr` points to a live leaf PTE, the reservation lock
+        // is held, and `ppn` encodes the freshly allocated physical frame.
         unsafe {
             entry_ptr.write_volatile(
                 (ppn << PTE_PPN_SHIFT) | flags | PTE_VALID | PTE_ACCESSED | PTE_DIRTY,
@@ -448,10 +474,14 @@ impl RiscvUserAddressSpace {
         let entry_ptr = self
             .leaf_entry(virt)
             .ok_or(AddressSpaceError::NotCommitted)?;
+        // SAFETY: `entry_ptr` points to a live leaf PTE and the caller holds
+        // the reservation lock.
         let entry = unsafe { entry_ptr.read_volatile() };
         if entry & PTE_VALID == 0 {
             return Err(AddressSpaceError::NotCommitted);
         }
+        // SAFETY: `entry_ptr` points to a live leaf PTE and the reservation
+        // lock is held; the caller flushes the TLB before freeing the frame.
         unsafe {
             entry_ptr.write_volatile(0);
         }
@@ -462,11 +492,15 @@ impl RiscvUserAddressSpace {
         let entry_ptr = self
             .leaf_entry(virt)
             .ok_or(AddressSpaceError::NotCommitted)?;
+        // SAFETY: `entry_ptr` points to a live leaf PTE and the caller holds
+        // the reservation lock.
         let old_entry = unsafe { entry_ptr.read_volatile() };
         if old_entry & PTE_VALID == 0 {
             return Err(AddressSpaceError::NotCommitted);
         }
         let ppn = old_entry >> PTE_PPN_SHIFT;
+        // SAFETY: `entry_ptr` points to a live leaf PTE and the reservation
+        // lock is held.
         unsafe {
             entry_ptr.write_volatile(
                 (ppn << PTE_PPN_SHIFT) | flags | PTE_VALID | PTE_ACCESSED | PTE_DIRTY,
@@ -479,10 +513,14 @@ impl RiscvUserAddressSpace {
         let entry_ptr = self
             .leaf_entry(virt)
             .ok_or(AddressSpaceError::NotCommitted)?;
+        // SAFETY: `entry_ptr` points to a live leaf PTE and the caller holds
+        // the reservation lock.
         let old_entry = unsafe { entry_ptr.read_volatile() };
         if old_entry & PTE_VALID == 0 {
             return Err(AddressSpaceError::NotCommitted);
         }
+        // SAFETY: `entry_ptr` points to a live leaf PTE and the reservation
+        // lock is held.
         unsafe {
             entry_ptr.write_volatile(new_entry);
         }
@@ -490,7 +528,10 @@ impl RiscvUserAddressSpace {
     }
 
     fn translate_4k(&self, virt: usize) -> Option<(usize, u64)> {
-        let entry = unsafe { self.leaf_entry(virt)?.read_volatile() };
+        let entry_ptr = self.leaf_entry(virt)?;
+        // SAFETY: `entry_ptr` points to a live leaf PTE and the caller holds
+        // the reservation lock.
+        let entry = unsafe { entry_ptr.read_volatile() };
         if entry & PTE_VALID == 0 {
             return None;
         }
@@ -550,6 +591,9 @@ impl RiscvUserAddressSpace {
                     return Err(error);
                 }
             };
+            // SAFETY: `old_phys` is the committed frame from `translate_4k` and
+            // `new_phys` is a freshly allocated disjoint `PAGE_SIZE` frame, both
+            // directly addressable through the identity map.
             unsafe {
                 ptr::copy_nonoverlapping(old_phys as *const u8, new_phys as *mut u8, PAGE_SIZE);
             }
@@ -750,9 +794,13 @@ impl RiscvUserAddressSpace {
         let mut replaced = Vec::with_capacity(leaves.len());
         for (index, leaf) in leaves.into_iter().enumerate() {
             let ppn = ((physical + index * PAGE_SIZE) as u64) >> PAGE_SHIFT;
-            // SAFETY: as in `present_leaf_ptrs`.
+            // SAFETY: `leaf` came from `present_leaf_ptrs` and the caller
+            // holds the reservation lock.
+            let old_entry = unsafe { leaf.read_volatile() };
+            replaced.push(old_entry);
+            // SAFETY: `leaf` came from `present_leaf_ptrs`, the reservation
+            // lock is held, and the store replaces one valid leaf with another.
             unsafe {
-                replaced.push(leaf.read_volatile());
                 leaf.write_volatile(
                     (ppn << PTE_PPN_SHIFT) | pte_flags | PTE_VALID | PTE_ACCESSED | PTE_DIRTY,
                 );
@@ -1018,7 +1066,8 @@ impl AddressSpace for RiscvUserAddressSpace {
         }
         for ((leaf, phys), pte_flags) in leaves.into_iter().zip(fresh).zip(page_flags) {
             let ppn = (phys as u64) >> PAGE_SHIFT;
-            // SAFETY: as in `substitute_leaves`.
+            // SAFETY: `leaf` came from `present_leaf_ptrs`, the reservation
+            // lock is held, and `ppn` names a freshly allocated user frame.
             unsafe {
                 leaf.write_volatile(
                     (ppn << PTE_PPN_SHIFT) | pte_flags | PTE_VALID | PTE_ACCESSED | PTE_DIRTY,
@@ -1141,7 +1190,8 @@ impl AddressSpace for RiscvUserAddressSpace {
         if addr.raw() < USER_VA_BASE || addr.raw() >= USER_VA_END {
             return Translation::Unmapped;
         }
-        let committed = match self.state.lock().lookup(addr) {
+        let state = self.state.lock();
+        let committed = match state.lookup(addr) {
             ReservationLookup::Unreserved => return Translation::Unmapped,
             ReservationLookup::Reserved => return Translation::Reserved,
             ReservationLookup::Committed(region) => region,
@@ -1220,6 +1270,8 @@ fn flush_tlb_pages(start: usize, pages: usize) {
     }
     for page in 0..pages {
         let virt = start + page * PAGE_SIZE;
+        // SAFETY: `sfence.vma` with a virtual address operand is a
+        // supervisor-legal local TLB invalidation for `virt`.
         unsafe {
             core::arch::asm!(
                 "sfence.vma {addr}, zero",
