@@ -366,6 +366,8 @@ jobs:
     if: needs.changes.outputs.profile_format == 'true' && (contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64') || needs.changes.outputs.linux_suite_mode != 'none')
     permissions:
       contents: read
+      actions: read
+      packages: write
     uses: ./.github/workflows/kernel-profile.yml
 
   # Build `helios-cli` in `debug` profile once per needed host architecture on
@@ -380,6 +382,9 @@ jobs:
     if: needs.changes.outputs.cli_x64 == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
     steps: &build-helios-cli-steps
       - uses: actions/checkout@v4
         with:
@@ -414,20 +419,22 @@ jobs:
           echo "input_hash=${input_hash}" >> "$GITHUB_OUTPUT"
           echo "dir=${RUNNER_TEMP}/helios-cli-debug" >> "$GITHUB_OUTPUT"
       - id: cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/artifact-restore
         with:
+          name: helios-cli-stable-v2-release-${{ runner.os }}-${{ runner.arch }}-${{ steps.meta.outputs.input_hash }}
           path: ${{ steps.meta.outputs.dir }}
-          key: helios-cli-stable-v2-release-${{ runner.os }}-${{ runner.arch }}-${{ steps.meta.outputs.input_hash }}
-      - if: steps.cache.outputs.cache-hit != 'true'
+      - if: steps.cache.outputs.hit != 'true'
         uses: ./helios/.github/actions/checkout-wasmtime
-      - if: steps.cache.outputs.cache-hit != 'true'
+      - if: steps.cache.outputs.hit != 'true'
         uses: dtolnay/rust-toolchain@stable
-      - if: steps.cache.outputs.cache-hit != 'true'
+      - if: steps.cache.outputs.hit != 'true'
         uses: water-rs/stow@main
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Override workspace `[profile.release] panic = "abort"` back to `unwind`
       # so `helios-cli` compiles under `stow`'s named `release` profile and hits
       # public prebuilt artifacts instead of falling back to local-only compiles.
-      - if: steps.cache.outputs.cache-hit != 'true'
+      - if: steps.cache.outputs.hit != 'true'
         name: Build helios-cli (release via stow)
         working-directory: helios
         env:
@@ -439,6 +446,12 @@ jobs:
           stow build --silent-compatible-upgrades -- --release -p helios-cli
           mkdir -p "${DIR}"
           cp "target/release/helios-cli" "${DIR}/helios-cli"
+      - if: steps.cache.outputs.hit != 'true'
+        uses: ./helios/.github/actions/artifact-save
+        with:
+          name: helios-cli-stable-v2-release-${{ runner.os }}-${{ runner.arch }}-${{ steps.meta.outputs.input_hash }}
+          path: ${{ steps.meta.outputs.dir }}
+          retention-days: 30
       - uses: actions/upload-artifact@v4
         with:
           name: helios-cli-debug-${{ runner.os }}-${{ runner.arch }}
@@ -452,6 +465,9 @@ jobs:
     if: needs.changes.outputs.cli_arm64 == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
     steps: *build-helios-cli-steps
 
   # Stages the host-architecture-independent WASI/WASIX tooling artifacts
@@ -467,34 +483,34 @@ jobs:
     container:
       image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
     timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
         with:
           path: helios
       - name: Restore WASI tooling artifacts
         id: artifact-cache
-        uses: ./helios/.github/actions/shared-cache
+        uses: ./helios/.github/actions/ghcr-pull
         with:
-          path: |
-            helios/artifacts/wasi-tools
-            helios/artifacts/python3-root
-            helios/artifacts/wasix
-          key: wasi-artifacts-v2-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/tools/branch-hints/**', 'helios/api/**', 'helios/api-macro/**', 'helios/wit/**', 'helios/rust-toolchain.toml') }}
-      - if: steps.artifact-cache.outputs.cache-hit != 'true'
+          package: helios-wasi-artifacts
+          tag: v2-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/tools/branch-hints/**', 'helios/api/**', 'helios/api-macro/**', 'helios/wit/**', 'helios/rust-toolchain.toml') }}
+          root: helios/artifacts
+      - if: steps.artifact-cache.outputs.hit != 'true'
         uses: ./helios/.github/actions/checkout-wasmtime
-      - name: Restore Zig build cache
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
-        uses: ./helios/.github/actions/shared-cache
-        with:
-          path: ${{ github.workspace }}/.zig-cache
-          key: zig-build-v1-${{ runner.os }}-${{ runner.arch }}-0.13.0-wasi-artifacts-${{ hashFiles('helios/tools/wasi-apps/build.sh') }}
       - name: Stage WASI tooling artifacts
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        if: steps.artifact-cache.outputs.hit != 'true'
         working-directory: helios
-        env:
-          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
-          ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
         run: tools/wasi-apps/build.sh
+      - name: Publish WASI tooling artifacts to GHCR
+        if: steps.artifact-cache.outputs.hit != 'true'
+        uses: ./helios/.github/actions/ghcr-push
+        with:
+          package: helios-wasi-artifacts
+          tag: v2-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/tools/branch-hints/**', 'helios/api/**', 'helios/api-macro/**', 'helios/wit/**', 'helios/rust-toolchain.toml') }}
+          root: helios/artifacts
+          paths: wasi-tools python3-root wasix
       - uses: actions/upload-artifact@v4
         with:
           name: helios-wasi-artifacts
@@ -550,20 +566,11 @@ jobs:
       - name: Record the job start
         run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
       - name: Restore the guest wasm cache
-        uses: ./helios/.github/actions/shared-cache
+        uses: ./helios/.github/actions/artifact-restore
         with:
+          name: helios-wasm-cache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.profile }}
           path: ${{ github.workspace }}/wasm-cache
-          key: helios-wasm-${{ runner.os }}-${{ runner.arch }}-${{ matrix.profile }}-${{ github.run_id }}
-          restore-keys: helios-wasm-${{ runner.os }}-${{ runner.arch }}-${{ matrix.profile }}-
-      # Pinned `wasi-sdk-34` used by `helios-cli wasm-build` to cross-compile
-      # BoringSSL for `programs/http-client`; restored only when `http-client`
-      # is part of this build.
-      - name: Restore wasi-sdk-34 toolchain cache
-        if: matrix.programs == 'all' || contains(matrix.programs, '"http-client"')
-        uses: ./helios/.github/actions/shared-cache
-        with:
-          path: helios/target/wasi-sdk-34
-          key: helios-wasi-sdk-34-${{ runner.os }}-${{ runner.arch }}
+          branch: ${{ github.event.repository.default_branch }}
       # The guest programs build in the profile the matrix names; the tool
       # that drives them is downloaded directly from `build-helios-cli-x64`.
       - uses: ./helios/.github/actions/helios-cli
@@ -602,6 +609,13 @@ jobs:
         with:
           cache-dir: ${{ github.workspace }}/wasm-cache
           since: ${{ env.HELIOS_CACHE_START }}
+      - name: Save the guest wasm cache
+        if: success() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: ./helios/.github/actions/artifact-save
+        with:
+          name: helios-wasm-cache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.profile }}
+          path: ${{ github.workspace }}/wasm-cache
+          retention-days: 14
 
   wasm-release:
     name: wasm-programs (${{ matrix.profile }})
@@ -688,8 +702,8 @@ jobs:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
       # Compile, lint and test lanes restore their default-branch Rust
-      # cache. Only a `main` push writes one; other caches follow the same
-      # single-writer policy through shared-cache.
+      # cache. Only a `main` push writes one; incremental wasm/cwasm
+      # artifacts and GHCR prebuilts follow the same single-writer policy.
       # rust-cache hashes `rustc -vV` and `rustup run <t> rustc -vV` for
       # every installed toolchain (src/config.ts `getRustVersions`), run
       # from the checkout root where no `rust-toolchain.toml` applies. On
@@ -807,11 +821,11 @@ jobs:
       - name: Record the job start
         run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
       - name: Restore the precompiled cwasm cache
-        uses: ./helios/.github/actions/shared-cache
+        uses: ./helios/.github/actions/artifact-restore
         with:
+          name: helios-cwasm-cache-smoke-riscv64-${{ runner.os }}-${{ runner.arch }}
           path: ${{ env.HELIOS_ARTIFACT_CACHE }}
-          key: helios-cwasm-smoke-riscv64-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
-          restore-keys: helios-cwasm-smoke-riscv64-${{ runner.os }}-${{ runner.arch }}-
+          branch: ${{ github.event.repository.default_branch }}
       - name: Install host dependencies
         uses: ./helios/.github/actions/install-apt-packages
         with:
@@ -1144,6 +1158,13 @@ jobs:
         with:
           cache-dir: ${{ env.HELIOS_ARTIFACT_CACHE }}
           since: ${{ env.HELIOS_CACHE_START }}
+      - name: Save the precompiled cwasm cache
+        if: success() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: ./helios/.github/actions/artifact-save
+        with:
+          name: helios-cwasm-cache-smoke-riscv64-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          retention-days: 14
 
   # A native Arm Linux runner under multi-threaded TCG. This lane is a
   # functional check, not a performance surface: Arm runners publish no
@@ -1165,6 +1186,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      packages: write
     env:
       HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
       # The `cwasm` cache of `smoke-riscv64`, for this lane's prebuilds.
@@ -1181,11 +1203,11 @@ jobs:
       - name: Record the job start
         run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
       - name: Restore the precompiled cwasm cache
-        uses: ./helios/.github/actions/shared-cache
+        uses: ./helios/.github/actions/artifact-restore
         with:
+          name: helios-cwasm-cache-smoke-aarch64-${{ runner.os }}-${{ runner.arch }}
           path: ${{ env.HELIOS_ARTIFACT_CACHE }}
-          key: helios-cwasm-smoke-aarch64-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
-          restore-keys: helios-cwasm-smoke-aarch64-${{ runner.os }}-${{ runner.arch }}-
+          branch: ${{ github.event.repository.default_branch }}
       - name: Install host dependencies
         uses: ./helios/.github/actions/install-apt-packages
         with:
@@ -1739,6 +1761,13 @@ jobs:
         with:
           cache-dir: ${{ env.HELIOS_ARTIFACT_CACHE }}
           since: ${{ env.HELIOS_CACHE_START }}
+      - name: Save the precompiled cwasm cache
+        if: success() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: ./helios/.github/actions/artifact-save
+        with:
+          name: helios-cwasm-cache-smoke-aarch64-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          retention-days: 14
 
   # A kernel built with HELIOS_CFI_SELF_TEST corrupts a signed return
   # address once every processor has started, and the guest has to panic
@@ -1879,6 +1908,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      packages: write
     timeout-minutes: 40
     env:
       HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
@@ -1903,11 +1933,11 @@ jobs:
       - name: Record the job start
         run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
       - name: Restore the precompiled cwasm cache
-        uses: ./helios/.github/actions/shared-cache
+        uses: ./helios/.github/actions/artifact-restore
         with:
+          name: helios-cwasm-cache-smoke-x86-64-${{ runner.os }}-${{ runner.arch }}
           path: ${{ env.HELIOS_ARTIFACT_CACHE }}
-          key: helios-cwasm-smoke-x86-64-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
-          restore-keys: helios-cwasm-smoke-x86-64-${{ runner.os }}-${{ runner.arch }}-
+          branch: ${{ github.event.repository.default_branch }}
       - name: Install host dependencies
         uses: ./helios/.github/actions/install-apt-packages
         with:
@@ -3096,6 +3126,13 @@ jobs:
         with:
           cache-dir: ${{ env.HELIOS_ARTIFACT_CACHE }}
           since: ${{ env.HELIOS_CACHE_START }}
+      - name: Save the precompiled cwasm cache
+        if: success() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: ./helios/.github/actions/artifact-save
+        with:
+          name: helios-cwasm-cache-smoke-x86-64-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          retention-days: 14
 
   # The processor lifecycle end to end (#498): `cpu` takes the guest's
   # highest processor offline and back eight times while the in-kernel
@@ -3132,11 +3169,11 @@ jobs:
       - name: Record the job start
         run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
       - name: Restore the precompiled cwasm cache
-        uses: ./helios/.github/actions/shared-cache
+        uses: ./helios/.github/actions/artifact-restore
         with:
+          name: helios-cwasm-cache-smoke-x86-64-cpu-lifecycle-${{ runner.os }}-${{ runner.arch }}
           path: ${{ env.HELIOS_ARTIFACT_CACHE }}
-          key: helios-cwasm-smoke-x86-64-cpu-lifecycle-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
-          restore-keys: helios-cwasm-smoke-x86-64-cpu-lifecycle-${{ runner.os }}-${{ runner.arch }}-
+          branch: ${{ github.event.repository.default_branch }}
       - name: Install host dependencies
         uses: ./helios/.github/actions/install-apt-packages
         with:
@@ -3277,6 +3314,13 @@ jobs:
         with:
           cache-dir: ${{ env.HELIOS_ARTIFACT_CACHE }}
           since: ${{ env.HELIOS_CACHE_START }}
+      - name: Save the precompiled cwasm cache
+        if: success() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: ./helios/.github/actions/artifact-save
+        with:
+          name: helios-cwasm-cache-smoke-x86-64-cpu-lifecycle-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          retention-days: 14
 
   # The 3D path against a real renderer: `gpu-test` opens a virgl
   # context, retires a fence on it, maps a host blob and a guest blob,
@@ -3305,6 +3349,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      packages: write
     env:
       # The debug guest programs the lane's debug inspector prebuilds from.
       HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
@@ -3334,11 +3379,11 @@ jobs:
       - name: Record the job start
         run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
       - name: Restore the precompiled cwasm cache
-        uses: ./helios/.github/actions/shared-cache
+        uses: ./helios/.github/actions/artifact-restore
         with:
+          name: helios-cwasm-cache-smoke-x86-64-venus-${{ runner.os }}-${{ runner.arch }}
           path: ${{ env.HELIOS_ARTIFACT_CACHE }}
-          key: helios-cwasm-smoke-x86-64-venus-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
-          restore-keys: helios-cwasm-smoke-x86-64-venus-${{ runner.os }}-${{ runner.arch }}-
+          branch: ${{ github.event.repository.default_branch }}
       - name: Install host dependencies
         uses: ./helios/.github/actions/install-apt-packages
         with:
@@ -3370,14 +3415,15 @@ jobs:
           icd=/usr/share/vulkan/icd.d/lvp_icd.json
           test -f "$icd"
           echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
-      - name: Restore the pinned virglrenderer install prefix
-        id: virgl-cache
-        uses: ./helios/.github/actions/shared-cache
+      - name: Pull prebuilt QEMU and virglrenderer from GHCR
+        id: qemu-venus
+        uses: ./helios/.github/actions/ghcr-pull
         with:
-          path: ${{ env.VIRGL_PREFIX }}
-          key: virglrenderer-${{ env.VIRGL_VERSION }}-${{ matrix.image }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/virglrenderer-meson.args') }}
+          package: helios-qemu-venus
+          tag: ${{ env.QEMU_VERSION }}-virglrenderer-${{ env.VIRGL_VERSION }}-${{ matrix.image }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/x86_64-venus-configure.args', 'helios/.github/qemu/virglrenderer-meson.args') }}
+          root: ${{ github.workspace }}
       - name: Build the pinned virglrenderer
-        if: steps.virgl-cache.outputs.cache-hit != 'true'
+        if: steps.qemu-venus.outputs.hit != 'true'
         run: |
           set -euo pipefail
           tarball="virglrenderer-${VIRGL_VERSION}.tar.gz"
@@ -3389,16 +3435,8 @@ jobs:
           meson setup "virglrenderer-${VIRGL_VERSION}/build" "virglrenderer-${VIRGL_VERSION}" \
             --prefix="${VIRGL_PREFIX}" "${flags[@]}"
           ninja -C "virglrenderer-${VIRGL_VERSION}/build" install
-      - name: Restore the pinned QEMU install prefix
-        id: qemu-cache
-        uses: ./helios/.github/actions/shared-cache
-        with:
-          path: ${{ env.QEMU_PREFIX }}
-          # QEMU links the virglrenderer above, so its key carries that
-          # build's too.
-          key: qemu-venus-${{ env.QEMU_VERSION }}-virglrenderer-${{ env.VIRGL_VERSION }}-${{ matrix.image }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/x86_64-venus-configure.args', 'helios/.github/qemu/virglrenderer-meson.args') }}
       - name: Build the pinned QEMU
-        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        if: steps.qemu-venus.outputs.hit != 'true'
         env:
           PKG_CONFIG_PATH: ${{ env.VIRGL_PREFIX }}/lib/pkgconfig
         run: |
@@ -3415,6 +3453,14 @@ jobs:
           # OpenGL is on, and egl-headless needs it to open the render node.
           grep -E '^#define CONFIG_GBM\b' build/config-host.h
           ninja -C build install
+      - name: Publish prebuilt QEMU and virglrenderer to GHCR
+        if: steps.qemu-venus.outputs.hit != 'true'
+        uses: ./helios/.github/actions/ghcr-push
+        with:
+          package: helios-qemu-venus
+          tag: ${{ env.QEMU_VERSION }}-virglrenderer-${{ env.VIRGL_VERSION }}-${{ matrix.image }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/x86_64-venus-configure.args', 'helios/.github/qemu/virglrenderer-meson.args') }}
+          root: ${{ github.workspace }}
+          paths: virglrenderer-install qemu-install
       - name: Put the pinned QEMU and virglrenderer in use
         run: |
           echo "${QEMU_PREFIX}/bin" >> "$GITHUB_PATH"
@@ -3603,6 +3649,13 @@ jobs:
         with:
           cache-dir: ${{ env.HELIOS_ARTIFACT_CACHE }}
           since: ${{ env.HELIOS_CACHE_START }}
+      - name: Save the precompiled cwasm cache
+        if: success() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: ./helios/.github/actions/artifact-save
+        with:
+          name: helios-cwasm-cache-smoke-x86-64-venus-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          retention-days: 14
 
   test-btrfs-upstream:
     name: test-btrfs-upstream (${{ matrix.suite }})
@@ -3912,11 +3965,11 @@ jobs:
             echo "HELIOS_LIMINE_BIN=${GITHUB_WORKSPACE}/limine/limine"
           } >> "$GITHUB_ENV"
       - name: Restore the precompiled cwasm cache
-        uses: ./helios/.github/actions/shared-cache
+        uses: ./helios/.github/actions/artifact-restore
         with:
-          path: cwasm-cache
-          key: helios-cwasm-linux-syscalls-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
-          restore-keys: helios-cwasm-linux-syscalls-${{ runner.os }}-${{ runner.arch }}-
+          name: helios-cwasm-cache-linux-syscalls-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          branch: ${{ github.event.repository.default_branch }}
       - name: Make the pinned toolchain the only one rust-cache sees
         shell: bash
         working-directory: helios
@@ -3965,10 +4018,10 @@ jobs:
           echo "input_hash=${input_hash}" >> "$GITHUB_OUTPUT"
       - name: Restore cached release inspector
         id: inspector-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/artifact-restore
         with:
+          name: helios-inspector-v2-release-${{ runner.os }}-${{ runner.arch }}-${{ steps.inspector-meta.outputs.input_hash }}
           path: ${{ runner.temp }}/helios-inspector-release
-          key: helios-inspector-v2-release-${{ runner.os }}-${{ runner.arch }}-${{ steps.inspector-meta.outputs.input_hash }}
       - name: Stage Limine bootloader share
         shell: bash
         run: |
@@ -3988,7 +4041,7 @@ jobs:
           profile: debug
           download-only: "true"
       - name: Build inspector
-        if: steps.inspector-cache.outputs.cache-hit != 'true'
+        if: steps.inspector-cache.outputs.hit != 'true'
         shell: bash
         working-directory: helios
         env:
@@ -3998,8 +4051,15 @@ jobs:
           cargo build --release -p helios-inspector
           mkdir -p "${DIR}"
           cp "target/release/helios" "${DIR}/helios"
+      - name: Save release inspector artifact
+        if: steps.inspector-cache.outputs.hit != 'true'
+        uses: ./helios/.github/actions/artifact-save
+        with:
+          name: helios-inspector-v2-release-${{ runner.os }}-${{ runner.arch }}-${{ steps.inspector-meta.outputs.input_hash }}
+          path: ${{ runner.temp }}/helios-inspector-release
+          retention-days: 30
       - name: Stage cached release inspector
-        if: steps.inspector-cache.outputs.cache-hit == 'true'
+        if: steps.inspector-cache.outputs.hit == 'true'
         shell: bash
         working-directory: helios
         env:
@@ -4035,6 +4095,8 @@ jobs:
       - name: Build the Linux guest image
         shell: bash
         working-directory: helios
+        env:
+          HELIOS_INSPECTOR_BIN: ${{ github.workspace }}/helios/target/release/helios
         run: |
           set -euo pipefail
           ./target/release/helios vm --arch "${{ matrix.vm_arch }}" --release \
@@ -4087,6 +4149,13 @@ jobs:
         with:
           cache-dir: ${{ env.HELIOS_ARTIFACT_CACHE }}
           since: ${{ env.HELIOS_CACHE_START }}
+      - name: Save the precompiled cwasm cache
+        if: success() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: ./helios/.github/actions/artifact-save
+        with:
+          name: helios-cwasm-cache-linux-syscalls-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          retention-days: 14
 
   linux-syscalls-image-aarch64:
     name: linux-syscalls-image (${{ matrix.vm_arch }})
@@ -4367,11 +4436,7 @@ jobs:
 
           slot_patterns = [
               (re.compile(r"^(v0-rust-.+-Linux-(?:x64|arm64))-[0-9a-f]+-[0-9a-f]+$"), (1,)),
-              (re.compile(r"^(helios-wasm-[^-]+-[^-]+-[^-]+)-\d+$"), (1,)),
-              (re.compile(r"^(helios-cwasm-.+-[^-]+-[^-]+)-\d+$"), (1,)),
               (re.compile(r"^(stow-v1-(?:local|local-crates-io)-[^-]+-[^-]+)-[0-9a-f]+-(.+)-[0-9a-f]+$"), (1, 2)),
-              (re.compile(r"^(helios-cli-stable-v\d+-[^-]+-[^-]+-[^-]+)-[0-9a-f]+$"), (1,)),
-              (re.compile(r"^(helios-inspector-v\d+-release-[^-]+-[^-]+)-[0-9a-f]+$"), (1,)),
           ]
           groups = collections.defaultdict(list)
           for entry in caches:

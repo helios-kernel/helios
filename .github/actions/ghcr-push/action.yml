@@ -1,0 +1,83 @@
+name: Push prebuilt bundle to GHCR
+description: Pack and push a content-addressed `.tar.zst` OCI artifact to GHCR from the default branch using ORAS.
+inputs:
+  package:
+    description: Package name under `ghcr.io/<owner>/` (e.g. `helios-wasi-artifacts`).
+    required: true
+  tag:
+    description: Content-addressed OCI tag.
+    required: true
+  root:
+    description: Base directory relative to which `paths` are archived.
+    required: true
+  paths:
+    description: Space-separated relative paths or shell globs under `root` to archive.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Push prebuilt bundle to GHCR
+      if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.event_name != 'pull_request'
+      shell: bash
+      env:
+        PACKAGE: ${{ inputs.package }}
+        TAG: ${{ inputs.tag }}
+        ROOT: ${{ inputs.root }}
+        PATHS_EXPR: ${{ inputs.paths }}
+        OWNER: ${{ github.repository_owner }}
+        ACTOR: ${{ github.actor }}
+        GH_TOKEN: ${{ github.token }}
+        RUNNER_ARCH: ${{ runner.arch }}
+      run: |
+        set -euo pipefail
+        if ! command -v oras >/dev/null 2>&1; then
+          bin_dir="${RUNNER_TEMP}/oras-1.4.0"
+          if [[ -x "${bin_dir}/oras" ]]; then
+            export PATH="${bin_dir}:${PATH}"
+          else
+            case "${RUNNER_ARCH}" in
+              X64)
+                arch="amd64"
+                sha="d8e1dce2fd8ce996f1d901845b688eb0cf505a6082897606f053825bb47935d1"
+                ;;
+              ARM64)
+                arch="arm64"
+                sha="0791fc200831563e498638d30e8ee8aac20ad1da2610760120fe3f770e12a8a4"
+                ;;
+              *)
+                echo "::error::unsupported RUNNER_ARCH for oras: ${RUNNER_ARCH}"
+                exit 1
+                ;;
+            esac
+            archive="${RUNNER_TEMP}/oras_1.4.0_linux_${arch}.tar.gz"
+            curl --fail --silent --show-error --location --retry 5 --retry-all-errors \
+              --output "${archive}" \
+              "https://github.com/oras-project/oras/releases/download/v1.4.0/oras_1.4.0_linux_${arch}.tar.gz"
+            echo "${sha}  ${archive}" | sha256sum --check -
+            mkdir -p "${bin_dir}"
+            tar -xzf "${archive}" -C "${bin_dir}" oras
+            chmod 0755 "${bin_dir}/oras"
+            rm -f "${archive}"
+            export PATH="${bin_dir}:${PATH}"
+          fi
+        fi
+
+        owner_lc="$(printf '%s' "${OWNER}" | tr '[:upper:]' '[:lower:]')"
+        ref="ghcr.io/${owner_lc}/${PACKAGE}:${TAG}"
+
+        printf '%s' "${GH_TOKEN}" | oras login ghcr.io --username "${ACTOR}" --password-stdin
+
+        stage="$(mktemp -d "${RUNNER_TEMP}/ghcr-push.XXXXXX")"
+        trap 'rm -rf "${stage}"' EXIT
+
+        # Expand relative paths/globs inside ROOT safely without word-splitting hazards.
+        mapfile -t rel_paths < <(cd "${ROOT}" && eval "printf '%s\n' ${PATHS_EXPR}")
+        tar --zstd -cf "${stage}/bundle.tar.zst" -C "${ROOT}" "${rel_paths[@]}"
+
+        (
+          cd "${stage}"
+          oras push "${ref}" \
+            --artifact-type application/vnd.helios.ci.bundle.v1 \
+            bundle.tar.zst
+        )
+        echo "Pushed GHCR prebuilt ${ref}"

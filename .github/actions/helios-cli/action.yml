@@ -84,20 +84,20 @@ runs:
         path: ${{ steps.name.outputs.dir }}
     - id: cache
       if: inputs.download-only != 'true'
-      uses: actions/cache@v4
+      uses: ./helios/.github/actions/artifact-restore
       with:
+        name: helios-cli-${{ inputs.profile }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.name.outputs.input_hash }}
         path: ${{ steps.name.outputs.dir }}
-        key: helios-cli-${{ inputs.profile }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.name.outputs.input_hash }}
     # Absent until some job of this run has built it; that is the case the
     # build below covers, so a failed download is not a failure.
     - id: download
-      if: inputs.download-only != 'true' && steps.cache.outputs.cache-hit != 'true'
+      if: inputs.download-only != 'true' && steps.cache.outputs.hit != 'true'
       continue-on-error: true
       uses: actions/download-artifact@v4
       with:
         name: ${{ steps.name.outputs.artifact }}
         path: ${{ steps.name.outputs.dir }}
-    - if: inputs.download-only != 'true' && steps.cache.outputs.cache-hit != 'true' && steps.download.outcome != 'success'
+    - if: inputs.download-only != 'true' && steps.cache.outputs.hit != 'true' && steps.download.outcome != 'success'
       shell: bash
       working-directory: ${{ inputs.root }}
       env:
@@ -116,7 +116,7 @@ runs:
     # commit binary; keep the first upload live instead of deleting and
     # re-uploading it (`overwrite: true` deletes before uploading and races
     # concurrent readers).
-    - if: inputs.download-only != 'true' && steps.cache.outputs.cache-hit != 'true' && steps.download.outcome != 'success'
+    - if: inputs.download-only != 'true' && steps.cache.outputs.hit != 'true' && steps.download.outcome != 'success'
       continue-on-error: true
       uses: actions/upload-artifact@v4
       with:
@@ -124,6 +124,12 @@ runs:
         path: ${{ steps.name.outputs.dir }}/helios-cli
         if-no-files-found: error
         retention-days: 1
+    - if: inputs.download-only != 'true' && steps.cache.outputs.hit != 'true' && steps.download.outcome != 'success'
+      uses: ./helios/.github/actions/artifact-save
+      with:
+        name: helios-cli-${{ inputs.profile }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.name.outputs.input_hash }}
+        path: ${{ steps.name.outputs.dir }}
+        retention-days: 30
     - shell: bash
       env:
         DIR: ${{ steps.name.outputs.dir }}

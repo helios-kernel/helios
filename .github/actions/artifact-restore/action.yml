@@ -1,0 +1,63 @@
+name: Restore cross-run tarred artifact
+description: Restore the newest unexpired GitHub Actions artifact matching `name` (optionally scoped to `branch`) and untar `bundle.tar` into `path`, preserving permissions and mtimes.
+inputs:
+  name:
+    description: Artifact name.
+    required: true
+  path:
+    description: Destination directory to extract into.
+    required: true
+  branch:
+    description: Optional branch filter (`workflow_run.head_branch`), e.g. the default branch.
+    required: false
+    default: ""
+outputs:
+  hit:
+    description: "`true` if an artifact was restored."
+    value: ${{ steps.restore.outputs.hit }}
+runs:
+  using: composite
+  steps:
+    - id: restore
+      shell: bash
+      env:
+        ARTIFACT_NAME: ${{ inputs.name }}
+        DEST: ${{ inputs.path }}
+        BRANCH: ${{ inputs.branch }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        id="$(
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=30" \
+            --jq ".artifacts[] | select(.name == \"${ARTIFACT_NAME}\" and (.expired | not) and (\"${BRANCH}\" == \"\" or .workflow_run.head_branch == \"${BRANCH}\")) | .id" \
+            2>/dev/null | head -n 1 || true
+        )"
+        if [[ -z "${id}" ]]; then
+          echo "Cross-run artifact miss for ${ARTIFACT_NAME}"
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        tmp="$(mktemp -d "${RUNNER_TEMP}/artifact-restore.XXXXXX")"
+        trap 'rm -rf "${tmp}"' EXIT
+
+        if ! gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}/zip" > "${tmp}/artifact.zip" 2>/dev/null; then
+          echo "::warning::failed to download artifact ${ARTIFACT_NAME} (id=${id}); treating as miss"
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        mkdir -p "${tmp}/unzipped" "${DEST}"
+        if ! unzip -q "${tmp}/artifact.zip" -d "${tmp}/unzipped"; then
+          echo "::warning::failed to unzip artifact ${ARTIFACT_NAME} (id=${id}); treating as miss"
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [[ -f "${tmp}/unzipped/bundle.tar" ]]; then
+          tar -xf "${tmp}/unzipped/bundle.tar" -C "${DEST}"
+        else
+          cp -a "${tmp}/unzipped/." "${DEST}/"
+        fi
+        echo "Restored cross-run artifact ${ARTIFACT_NAME} (id=${id})"
+        echo "hit=true" >> "$GITHUB_OUTPUT"

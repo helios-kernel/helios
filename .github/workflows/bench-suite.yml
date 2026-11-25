@@ -115,6 +115,9 @@ jobs:
     if: needs.changes.outputs.tooling == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
     outputs:
       # Advisory unless this is a dedicated-runner event; `runs-on` below
       # reads it through the needs context, the only one it can read.
@@ -290,6 +293,10 @@ jobs:
     name: profile-columns-${{ matrix.column }}
     needs: tooling
     if: needs.tooling.outputs.per_column_profiles == 'true'
+    permissions:
+      contents: read
+      actions: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -319,6 +326,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      packages: write
     env:
       BENCH_ADVISORY: ${{ needs.tooling.outputs.advisory }}
       BENCH_PAIRED_ACCEPTANCE: ${{ needs.tooling.outputs.paired_acceptance }}
@@ -370,7 +378,8 @@ jobs:
           repository: ${{ needs.tooling.outputs.baseline_wasmtime_repository }}
           ref: ${{ needs.tooling.outputs.baseline_wasmtime_revision }}
           path: ${{ needs.tooling.outputs.baseline_fork_root }}/wasmtime
-      - uses: ./helios/.github/actions/bench-host
+      - id: bench-host
+        uses: ./helios/.github/actions/bench-host
         with:
           network-tools: ${{ matrix.net-backend == 'tap' }}
           guest-arch: ${{ matrix.guest-arch }}
@@ -505,6 +514,14 @@ jobs:
             args+=(--net-ifname "${HELIOS_NET_IFNAME}" --net-bridge "${HELIOS_NET_BRIDGE}" --net-queues "$(nproc)")
           fi
           uv run helios-bench "${args[@]}"
+      - name: Publish pinned Fedora VM assets to GHCR
+        if: matrix.guest-arch != '' && steps.bench-host.outputs.fedora-assets-hit != 'true'
+        uses: ./helios/.github/actions/ghcr-push
+        with:
+          package: helios-fedora-vm-assets
+          tag: ${{ matrix.guest-arch }}-${{ hashFiles('helios/tools/wasi-apps/fedora_qemu_baseline.py') }}
+          root: helios/target/perf-baselines/linux-vm/fedora-${{ matrix.guest-arch }}
+          paths: Fedora-Cloud-Base-*.qcow2 sources tools
       # Keep-going records failed workloads without failing this step.
       # Preserve their raw console and QEMU logs even when the suite
       # returns success, so the separate gate can name incomplete
@@ -589,6 +606,10 @@ jobs:
       && (github.event_name == 'workflow_dispatch'
       || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
       || github.event_name == 'schedule')
+    permissions:
+      contents: read
+      actions: read
+      packages: write
     uses: ./.github/workflows/kernel-profile.yml
 
   # The other half of docs/pgo.md: the profile the job above collected,
@@ -609,6 +630,7 @@ jobs:
       contents: read
       pull-requests: write
       actions: read
+      packages: write
     env:
       # The profile is collected from an x86-64 kernel, so this is the
       # lane that can spend it; a profile carries function hashes of the

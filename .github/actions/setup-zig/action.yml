@@ -1,5 +1,5 @@
-name: Install Zig with a shared build cache
-description: Keep one content-keyed build cache per job and architecture, written by the default branch.
+name: Install Zig
+description: Install the pinned Zig toolchain via GHCR or verified Zig community mirrors without caching `.zig-cache`.
 inputs:
   version:
     description: Zig version to install.
@@ -7,13 +7,123 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: mlugg/setup-zig@v2
+    - id: resolve
+      shell: bash
+      env:
+        ZIG_VERSION: ${{ inputs.version }}
+        RUNNER_OS: ${{ runner.os }}
+        RUNNER_ARCH: ${{ runner.arch }}
+      run: |
+        set -euo pipefail
+        if [[ "${RUNNER_OS}" != "Linux" ]]; then
+          echo "::error::unsupported OS for setup-zig: ${RUNNER_OS}"
+          exit 1
+        fi
+        case "${ZIG_VERSION}:${RUNNER_ARCH}" in
+          0.13.0:X64)
+            zig_arch="x86_64"
+            zig_sha="d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea"
+            ;;
+          0.13.0:ARM64)
+            zig_arch="aarch64"
+            zig_sha="041ac42323837eb5624068acd8b00cd5777dac4cf91179e8dad7a7e90dd0c556"
+            ;;
+          *)
+            echo "::error::unpinned Zig ${ZIG_VERSION} for ${RUNNER_OS}/${RUNNER_ARCH}"
+            exit 1
+            ;;
+        esac
+        dir="${RUNNER_TEMP}/zig-${ZIG_VERSION}"
+        installed="false"
+        if command -v zig >/dev/null 2>&1 && [[ "$(zig version)" == "${ZIG_VERSION}" ]]; then
+          echo "Zig ${ZIG_VERSION} already installed at $(command -v zig)"
+          installed="true"
+        elif [[ -x "${dir}/zig" ]] && [[ "$("${dir}/zig" version 2>/dev/null || true)" == "${ZIG_VERSION}" ]]; then
+          echo "Zig ${ZIG_VERSION} already present at ${dir}/zig"
+          installed="true"
+        fi
+        {
+          echo "installed=${installed}"
+          echo "zig_arch=${zig_arch}"
+          echo "zig_sha=${zig_sha}"
+          echo "dir=${dir}"
+        } >> "$GITHUB_OUTPUT"
+
+    - id: zig-ghcr
+      if: steps.resolve.outputs.installed != 'true'
+      uses: ./helios/.github/actions/ghcr-pull
       with:
-        version: ${{ inputs.version }}
-        # The upstream action saves a fresh build cache for every run.
-        # It still installs Zig and exports both cache directories here.
-        use-cache: false
-    - uses: ./helios/.github/actions/shared-cache
+        package: helios-zig
+        tag: v1-zig-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
+        root: ${{ steps.resolve.outputs.dir }}
+
+    - name: Download and verify pinned Zig toolchain
+      if: steps.resolve.outputs.installed != 'true' && steps.zig-ghcr.outputs.hit != 'true'
+      shell: bash
+      env:
+        ZIG_VERSION: ${{ inputs.version }}
+        ZIG_ARCH: ${{ steps.resolve.outputs.zig_arch }}
+        ZIG_SHA: ${{ steps.resolve.outputs.zig_sha }}
+        ZIG_DIR: ${{ steps.resolve.outputs.dir }}
+      run: |
+        set -euo pipefail
+        tarball="zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
+        archive="${RUNNER_TEMP}/${tarball}"
+        rm -f "${archive}.part" "${archive}"
+
+        urls=()
+        if mirrors="$(curl --fail --silent --show-error --location --connect-timeout 8 --max-time 15 \
+            https://ziglang.org/download/community-mirrors.txt 2>/dev/null)"; then
+          while IFS= read -r mirror; do
+            [[ "${mirror}" =~ ^https:// ]] || continue
+            urls+=("${mirror%/}/${tarball}?source=github-helios-ci")
+          done < <(printf '%s\n' "${mirrors}" | shuf)
+        fi
+        urls+=("https://ziglang.org/download/${ZIG_VERSION}/${tarball}")
+
+        downloaded="false"
+        for url in "${urls[@]}"; do
+          echo "Fetching ${tarball} from ${url%%\?*}"
+          if curl --fail --silent --show-error --location --connect-timeout 8 --max-time 60 \
+              --output "${archive}.part" "${url}"; then
+            if printf '%s  %s\n' "${ZIG_SHA}" "${archive}.part" | sha256sum --check -; then
+              mv "${archive}.part" "${archive}"
+              downloaded="true"
+              break
+            fi
+            echo "::warning::Checksum mismatch for ${url%%\?*}"
+          else
+            echo "::warning::Download failed from ${url%%\?*}"
+          fi
+          rm -f "${archive}.part"
+        done
+
+        if [[ "${downloaded}" != "true" ]]; then
+          echo "::error::Failed to download verified ${tarball} from any mirror or official endpoint"
+          exit 1
+        fi
+
+        mkdir -p "${ZIG_DIR}"
+        tar -xJf "${archive}" --strip-components=1 -C "${ZIG_DIR}"
+        rm -f "${archive}"
+
+    - if: steps.resolve.outputs.installed != 'true' && steps.zig-ghcr.outputs.hit != 'true'
+      uses: ./helios/.github/actions/ghcr-push
       with:
-        path: ${{ github.workspace }}/.zig-cache
-        key: zig-build-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ github.job }}-${{ hashFiles('helios/Cargo.lock', 'helios/rust-toolchain.toml', 'helios/tools/bench/native/**', 'helios/tools/wasi-apps/**') }}
+        package: helios-zig
+        tag: v1-zig-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
+        root: ${{ steps.resolve.outputs.dir }}
+        paths: .
+
+    - name: Expose Zig on PATH
+      shell: bash
+      env:
+        ZIG_DIR: ${{ steps.resolve.outputs.dir }}
+      run: |
+        set -euo pipefail
+        if [[ -x "${ZIG_DIR}/zig" ]]; then
+          echo "${ZIG_DIR}" >> "$GITHUB_PATH"
+          "${ZIG_DIR}/zig" version
+        else
+          zig version
+        fi

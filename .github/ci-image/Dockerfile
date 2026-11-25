@@ -15,6 +15,8 @@ ARG WASM_TOOLS_VERSION=1.263.0
 ARG UV_VERSION=0.13.9
 ARG ZIG_VERSION=0.13.0
 ARG GH_VERSION=2.105.0
+ARG ORAS_VERSION=1.4.0
+ARG WASI_SDK_VERSION=34
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -49,6 +51,7 @@ RUN apt-get update \
 
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
+    WASI_SDK_PATH=/opt/wasi-sdk-34 \
     PATH="/usr/local/cargo/bin:/usr/local/zig:${PATH}"
 
 RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
@@ -79,6 +82,9 @@ RUN set -eu; \
             uv_sha="a7fbaff2b9a271d85c1bdb540941090fd1ce011797b4abeb48e4dcd39c2471d5"; \
             zig_sha="d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea"; \
             gh_sha="79e7ab5db738c48777b696e374f8b428f0647debfb424f44d2f426370407fe2f"; \
+            oras_sha="d8e1dce2fd8ce996f1d901845b688eb0cf505a6082897606f053825bb47935d1"; \
+            wasi_sdk_arch="x86_64"; \
+            wasi_sdk_sha="b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"; \
             ;; \
         arm64) \
             gnu_triple="aarch64-unknown-linux-gnu"; \
@@ -91,6 +97,9 @@ RUN set -eu; \
             uv_sha="0797542018e541a9288855df555c8077eed06f7a47d206362030480e8ecc9f3d"; \
             zig_sha="041ac42323837eb5624068acd8b00cd5777dac4cf91179e8dad7a7e90dd0c556"; \
             gh_sha="b1278c75107423d818f1937fd92cafc9e5e9b606631568f68d7fb816f5885a02"; \
+            oras_sha="0791fc200831563e498638d30e8ee8aac20ad1da2610760120fe3f770e12a8a4"; \
+            wasi_sdk_arch="arm64"; \
+            wasi_sdk_sha="f7e243dff54d60bcc576e94d6166b69f410f2500ae4a9ceef34315be10e77971"; \
             ;; \
         *) \
             echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; \
@@ -127,7 +136,15 @@ RUN set -eu; \
         "${work}/gh.tar.gz" "${gh_sha}"; \
     tar -xzf "${work}/gh.tar.gz" --strip-components=2 -C /usr/local/bin \
         "gh_${GH_VERSION}_linux_${TARGETARCH}/bin/gh"; \
-    chmod 0755 /usr/local/cargo/bin/cargo-nextest /usr/local/cargo/bin/cargo-deny /usr/local/bin/wasm-tools /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/gh; \
+    fetch "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${TARGETARCH}.tar.gz" \
+        "${work}/oras.tar.gz" "${oras_sha}"; \
+    tar -xzf "${work}/oras.tar.gz" -C /usr/local/bin oras; \
+    fetch "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-${wasi_sdk_arch}-linux.tar.gz" \
+        "${work}/wasi-sdk.tar.gz" "${wasi_sdk_sha}"; \
+    mkdir -p "${WASI_SDK_PATH}"; \
+    tar -xzf "${work}/wasi-sdk.tar.gz" --strip-components=1 -C "${WASI_SDK_PATH}"; \
+    chmod -R a+rX "${WASI_SDK_PATH}"; \
+    chmod 0755 /usr/local/cargo/bin/cargo-nextest /usr/local/cargo/bin/cargo-deny /usr/local/bin/wasm-tools /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/gh /usr/local/bin/oras; \
     rustc --version; \
     cargo --version; \
     just --version; \
@@ -141,6 +158,7 @@ RUN set -eu; \
     uv --version; \
     zig version; \
     gh --version; \
+    oras version; \
     setfacl --version; \
     mkfs.btrfs --version; \
     command -v mkfs.erofs
