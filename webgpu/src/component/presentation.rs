@@ -308,13 +308,24 @@ impl LinearImage {
             unsafe { global.texture_as_hal::<Vulkan>(source) }.ok_or(device::DeviceError::Lost)?;
         let record = encoder_callback(|encoder| {
             let encoder = encoder.ok_or(device::DeviceError::Lost)?;
-            // SAFETY: the first command buffer establishes COPY_SRC; both
-            // buffers execute in one submission, `copy` is recording on this
-            // device's queue family, `source_hal` is a live Vulkan texture on
-            // this device, core tracks the source in that submission, and the
-            // device timeline retains the destination until it completes.
+            // SAFETY: `encoder` is a live recording Vulkan command encoder on
+            // this device; the returned handle is only used to record commands
+            // into this encoder before `record` returns.
+            let raw_encoder = unsafe { encoder.raw_handle() };
+            // SAFETY: `source_hal` holds the snatch guard for a live Vulkan
+            // texture on this device, and the handle is only recorded while
+            // that guard remains live.
+            let raw_source = unsafe { source_hal.raw_handle() };
+            // SAFETY: `raw_encoder` is recording on this device's queue family;
+            // `transition` initializes `source` and transitions it to
+            // `COPY_SRC` (`TRANSFER_SRC_OPTIMAL`) before `copy` executes in the
+            // same submission; the caller guarantees `source`'s format, extent,
+            // sample count, and `self` never having been submitted; core retains
+            // `source` until submission completion; and the device timeline
+            // retains `self` until completion before signaling the compositor's
+            // marker.
             unsafe {
-                self.record_copy_and_release(encoder.raw_handle(), source_hal.raw_handle());
+                self.record_copy_and_release(raw_encoder, raw_source);
             }
             Ok::<(), device::DeviceError>(())
         });

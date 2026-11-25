@@ -2669,48 +2669,40 @@ fn carve_aligned_zeroed(
 use helios_hal::{align_down, align_up};
 
 fn wakeup_image() -> &'static [u8] {
-    // SAFETY: linker symbol marking the start of the secondary wakeup image.
-    let start = unsafe { &raw const helios_x86_secondary_wakeup_start } as usize;
-    // SAFETY: linker symbol marking the end of the secondary wakeup image.
-    let end = unsafe { &raw const helios_x86_secondary_wakeup_end } as usize;
+    let start = &raw const helios_x86_secondary_wakeup_start as usize;
+    let end = &raw const helios_x86_secondary_wakeup_end as usize;
     // SAFETY: `start..end` spans the immutable secondary wakeup image emitted
     // by `global_asm!` into the kernel image.
     unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
 }
 
 fn wakeup_cr3_offset() -> usize {
-    // SAFETY: linker symbol within the secondary wakeup image.
-    let symbol = unsafe { &raw const helios_x86_secondary_wakeup_cr3 };
+    let symbol = &raw const helios_x86_secondary_wakeup_cr3;
     wakeup_symbol_offset(symbol)
 }
 
 fn wakeup_stack_top_offset() -> usize {
-    // SAFETY: linker symbol within the secondary wakeup image.
-    let symbol = unsafe { &raw const helios_x86_secondary_wakeup_stack_top };
+    let symbol = &raw const helios_x86_secondary_wakeup_stack_top;
     wakeup_symbol_offset(symbol)
 }
 
 fn wakeup_context_offset() -> usize {
-    // SAFETY: linker symbol within the secondary wakeup image.
-    let symbol = unsafe { &raw const helios_x86_secondary_wakeup_context };
+    let symbol = &raw const helios_x86_secondary_wakeup_context;
     wakeup_symbol_offset(symbol)
 }
 
 fn wakeup_runtime_offset() -> usize {
-    // SAFETY: linker symbol within the secondary wakeup image.
-    let symbol = unsafe { &raw const helios_x86_secondary_wakeup_runtime };
+    let symbol = &raw const helios_x86_secondary_wakeup_runtime;
     wakeup_symbol_offset(symbol)
 }
 
 fn wakeup_entry_offset() -> usize {
-    // SAFETY: linker symbol within the secondary wakeup image.
-    let symbol = unsafe { &raw const helios_x86_secondary_wakeup_entry };
+    let symbol = &raw const helios_x86_secondary_wakeup_entry;
     wakeup_symbol_offset(symbol)
 }
 
 fn wakeup_symbol_offset(symbol: *const u8) -> usize {
-    // SAFETY: linker symbol marking the start of the secondary wakeup image.
-    let start = unsafe { &raw const helios_x86_secondary_wakeup_start } as usize;
+    let start = &raw const helios_x86_secondary_wakeup_start as usize;
     (symbol as usize)
         .checked_sub(start)
         .unwrap_or_else(|| panic!("x86 wakeup symbol precedes image start"))

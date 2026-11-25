@@ -196,12 +196,12 @@ impl InstructionKey {
     /// authenticated against another key, and no return address signed with
     /// one is live.
     unsafe fn install(&self) {
-        // SAFETY: `APIAKey_EL1` takes any value, and the caller guarantees
-        // that nothing is signed under another one.
-        unsafe {
-            write_apiakeylo_el1(ApiakeyloEl1::from_bits_retain(self.lo));
-            write_apiakeyhi_el1(ApiakeyhiEl1::from_bits_retain(self.hi));
-        }
+        // SAFETY: `APIAKeyLo_EL1` takes any value, and the caller guarantees
+        // that nothing is signed under another key.
+        unsafe { write_apiakeylo_el1(ApiakeyloEl1::from_bits_retain(self.lo)) };
+        // SAFETY: `APIAKeyHi_EL1` takes any value, and the caller guarantees
+        // that nothing is signed under another key.
+        unsafe { write_apiakeyhi_el1(ApiakeyhiEl1::from_bits_retain(self.hi)) };
     }
 }
 

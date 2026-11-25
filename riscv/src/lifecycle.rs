@@ -126,12 +126,7 @@ pub(super) fn stop_current() {
     }
     context.interrupts_enabled = usize::from(riscv::register::sstatus::read().sie());
 
-    // SAFETY: the departing hart answers no interrupt from here until it
-    // is restarted, and nothing it could take needs servicing: the kernel
-    // has torn its per-processor owners down.
-    unsafe {
-        riscv::interrupt::supervisor::disable();
-    }
+    riscv::interrupt::supervisor::disable();
     // SAFETY: `sstatus.SIE` is already clear and this hart is stopping, so
     // masking all supervisor interrupt enable bits in `sie` is safe.
     unsafe {

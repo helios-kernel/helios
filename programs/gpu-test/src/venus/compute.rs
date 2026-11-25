@@ -262,7 +262,8 @@ pub(super) async fn run(
     resources.pending = true;
     // Ten seconds bounds this one-page functional smoke, including CI scheduling.
     let timeout = std::time::Duration::from_secs(10).as_nanos() as u64;
-    let completion = helios_venus::helios::queue_completion(queue)?;
+    // SAFETY: `queue` is live and originated from `helios_venus::helios::Context`'s entry table.
+    let completion = unsafe { helios_venus::helios::queue_completion(queue) }?;
     let deadline = helios_api::bindings::wasi::clocks::monotonic_clock::now() + timeout;
     if !helios_api::sync::wait_all(&[completion.point(1)], Some(deadline)).await? {
         return Err(Error::Synchronization(

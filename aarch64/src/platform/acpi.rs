@@ -269,9 +269,12 @@ fn tpm(
             .handler
             .map_physical_region::<u8>(physical_address, length)
     };
+    // SAFETY: `bytes` below only reads from `virtual_start` through an
+    // immutable slice of the static ACPI table, creating no mutable alias.
+    let virtual_start = unsafe { mapping.virtual_start() };
     // SAFETY: `mapping` covers `length` bytes of the static ACPI table in the
     // direct map and `unmap_physical_region` is a no-op.
-    let bytes = unsafe { core::slice::from_raw_parts(mapping.virtual_start().as_ptr(), length) };
+    let bytes = unsafe { core::slice::from_raw_parts(virtual_start.as_ptr(), length) };
     let table = AcpiTpm2::parse(bytes).map_err(AcpiError::Tpm2)?;
     let interface = InterfaceDescription::AcpiStartMethod(table.start_method());
     Ok(Some(match table.locality().map_err(AcpiError::Tpm2)? {

@@ -1787,16 +1787,17 @@ extern "C" fn aarch64_handle_sync_exception(
     // cannot be taken for a guest trap or a swap-in. A guest reaches its
     // memory through untagged pointers, so one is a kernel or runtime defect.
     if tagging::is_tag_check_fault(esr_el1) {
-        // SAFETY: `is_tag_check_fault` holds, so FEAT_MTE2 is active and `far`
-        // names a tag-capable granule.
-        if let Some(runtime) = installed_processor_runtime()
-            && unsafe { runtime.tag_check_probe.claim(esr_el1, far_el1) }
-        {
-            // SAFETY: the entry wrote a complete frame at `frame`, and nothing
-            // else touches it while this handler runs.
-            let frame = unsafe { &mut *frame };
-            frame.elr = frame.x[30];
-            return;
+        if let Some(runtime) = installed_processor_runtime() {
+            // SAFETY: `is_tag_check_fault` holds, so FEAT_MTE2 is active and
+            // `far_el1` names a tag-capable granule.
+            let claimed = unsafe { runtime.tag_check_probe.claim(esr_el1, far_el1) };
+            if claimed {
+                // SAFETY: the entry wrote a complete frame at `frame`, and nothing
+                // else touches it while this handler runs.
+                let frame = unsafe { &mut *frame };
+                frame.elr = frame.x[30];
+                return;
+            }
         }
         // SAFETY: the entry wrote a complete frame at `frame`, and nothing
         // else touches it while this handler runs.
@@ -1851,15 +1852,15 @@ extern "C" fn aarch64_handle_sync_exception(
         _ => (KernelExceptionCause::IllegalInstruction, None),
     };
     // The trap hand-over self-check's second trap is resolved in place.
-    // SAFETY: the entry wrote a complete frame at `frame`, and nothing
-    // else touches it while this handler runs.
     if cause == KernelExceptionCause::Breakpoint
         && let Some(runtime) = installed_processor_runtime()
-        && runtime
-            .hand_over_probe
-            .resolve_returning_trap(unsafe { &mut *frame })
     {
-        return;
+        // SAFETY: the entry wrote a complete frame at `frame`, and nothing
+        // else touches it while this handler runs.
+        let frame_ref = unsafe { &mut *frame };
+        if runtime.hand_over_probe.resolve_returning_trap(frame_ref) {
+            return;
+        }
     }
 
     let mut stack_fault = helios_kernel::StackFault::Elsewhere;
