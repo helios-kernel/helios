@@ -778,12 +778,6 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
     } else {
         tracing::info!("no virtio-snd function on the PCI bus; this machine has no sound device");
     }
-    // The x86 address space reserves and commits lazily, so a page could
-    // be taken away here — but the backend has not wired the other half:
-    // no `SwapVmHooks` table, so a not-present four-level entry carries no
-    // swap token and the fault handler has nothing to look the page up by.
-    // Extending swap to this backend is #25's follow-up to #59.
-    helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapHooks);
     if block_functions.is_empty() {
         tracing::warn!("virtio block device was not discovered on the PCI bus");
     }
@@ -1478,7 +1472,7 @@ fn detect_x86_native_feature(feature: &str) -> Option<bool> {
     }
 }
 
-fn read_tsc() -> u64 {
+pub(crate) fn read_tsc() -> u64 {
     // SAFETY: x86_64 always provides the `rdtsc` instruction, and reading the
     // timestamp counter has no memory side effects.
     unsafe { _rdtsc() }

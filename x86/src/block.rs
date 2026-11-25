@@ -99,8 +99,9 @@ where
         .map(|interrupt| interrupt.device.device.clone())
         .collect();
     let state = debug_state.clone();
-    // Swap is not wired on this backend (see the caller), so the scratch
-    // disk is proved and counted but nothing writes to it yet.
+    let spawner = kernel.spawner();
+    let timer = kernel.timer();
+    let swap_cpu = cpu.clone();
     if !devices.is_empty() {
         debug_state.begin_block_discovery();
     }
@@ -108,12 +109,23 @@ where
         kernel,
         root,
         devices,
-        move |service, _scratch, mount_sources| {
+        move |service, scratch, mount_sources| {
             state.install_block_service(service);
             if let Some(cache) = mount_sources {
                 state.install_mount_sources(cache);
             }
             state.finish_block_discovery();
+            if let Some(swap) = helios_kernel::install_scratch_swap(
+                state.instance_registry(),
+                scratch,
+                spawner,
+                timer,
+                swap_cpu,
+                "virtio-blk",
+                helios_virtio::VirtioBlockSwapBackend::new,
+            ) {
+                state.install_swap(swap);
+            }
         },
     );
     discovered
