@@ -183,11 +183,12 @@ test-libraries:
         -p helios-btrfs \
         -p helios-venus -p helios-venus-gen \
         -p helios-nu \
+        -p helios-oci \
         -p helios-acpi \
         --features helios-btrfs/write,helios-venus/driver
     # Guest programs with host unit tests select mutually exclusive `helios-api`
     # WIT worlds and cannot share one feature-unified cargo invocation.
-    cargo nextest run -p helios-api --features hv
+    cargo nextest run -p helios-api --features hv,oci
     cargo nextest run -p helios-vmm
     cargo nextest run -p helios-vmm-program
     cargo nextest run -p helios-compositor-render -p helios-desktop-text-check
@@ -338,6 +339,7 @@ check-host:
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     cargo check -p helios-kernel
     cargo check -p helios-hosted
+    cargo check -p helios-oci
     cargo check -p helios-ops
     cargo check -p helios-inspector-shell
     cargo check -p helios-inspector
