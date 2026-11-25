@@ -366,6 +366,8 @@ jobs:
     if: needs.changes.outputs.profile_format == 'true' && (contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64') || needs.changes.outputs.linux_suite_mode != 'none')
     permissions:
       contents: read
+      actions: read
+      packages: write
     uses: ./.github/workflows/kernel-profile.yml
 
   # Build `helios-cli` in `debug` profile once per needed host architecture on

@@ -290,6 +290,10 @@ jobs:
     name: profile-columns-${{ matrix.column }}
     needs: tooling
     if: needs.tooling.outputs.per_column_profiles == 'true'
+    permissions:
+      contents: read
+      actions: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -599,6 +603,10 @@ jobs:
       && (github.event_name == 'workflow_dispatch'
       || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
       || github.event_name == 'schedule')
+    permissions:
+      contents: read
+      actions: read
+      packages: write
     uses: ./.github/workflows/kernel-profile.yml
 
   # The other half of docs/pgo.md: the profile the job above collected,
