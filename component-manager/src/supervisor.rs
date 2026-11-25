@@ -254,6 +254,9 @@ enum SupervisorEvent<R: SupervisorRuntime> {
 
 struct ManagedComponent<R: SupervisorRuntime> {
     node: ComponentNode,
+    /// `false` once a dynamically mounted subtree has been unmounted so its
+    /// slot is excluded from lookups, inspect, realm resets, and collision checks.
+    active: bool,
     status: ComponentStatus,
     restarts: u64,
     instance_id: Option<u64>,
@@ -275,6 +278,7 @@ impl<R: SupervisorRuntime> ManagedComponent<R> {
     fn new(node: ComponentNode) -> Self {
         Self {
             node,
+            active: true,
             status: ComponentStatus::Unstarted,
             restarts: 0,
             instance_id: None,
@@ -364,11 +368,12 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         Ok(supervisor)
     }
 
-    /// Returns a snapshot of every component's live inspect record.
+    /// Returns a snapshot of every active component's live inspect record.
     #[must_use]
     pub fn inspect_records(&self) -> Vec<ComponentStateRecord> {
         self.components
             .iter()
+            .filter(|c| c.active)
             .map(ManagedComponent::record)
             .collect()
     }
@@ -406,16 +411,33 @@ impl<R: SupervisorRuntime> Supervisor<R> {
     pub fn find_index(&self, moniker: &str) -> Option<usize> {
         self.components
             .iter()
-            .position(|c| c.node.moniker.as_ref() == moniker)
+            .position(|c| c.active && c.node.moniker.as_ref() == moniker)
     }
 
     /// Brings up the root realm:
     /// 1. Subscribes to hardware hotplug updates (`subscribe_hardware`),
     /// 2. Attaches declarative `[[mounts]]` in realm hierarchy order,
-    /// 3. Pre-registers lazy kernel provider slots and arms lazy listening sockets (`wait_readable`),
-    /// 4. Starts `startup = "eager"` components whose `requires` predicates and `after` dependencies are satisfied,
+    /// 3. Pre-registers lazy kernel provider slots, arms lazy listening sockets (`wait_readable`),
+    ///    and starts eager kernel providers whose hardware predicates are satisfied,
+    /// 4. Starts remaining `startup = "eager"` components whose `requires` predicates and `after`
+    ///    dependencies are satisfied,
     /// 5. Publishes live `/components/*` inspect state and invokes `signal_ready()`.
     pub async fn boot(&mut self) -> Result<(), SupervisorError> {
+        self.boot_with_pre_ready_hook(|| async { Ok(()) }).await
+    }
+
+    /// Like [`Self::boot`], running `after_providers` once mounts and kernel
+    /// providers (`compiler`, `http-client`, `compositor`) are installed and
+    /// before remaining eager components (e.g. `/debugger`) start and
+    /// `signal_ready()` is emitted.
+    pub async fn boot_with_pre_ready_hook<F, Fut>(
+        &mut self,
+        after_providers: F,
+    ) -> Result<(), SupervisorError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(), RuntimeError>>,
+    {
         if let Some(hw_rx) = self.runtime.subscribe_hardware() {
             let tx = self.event_tx.clone();
             self.runtime.spawn_task(async move {
@@ -431,8 +453,16 @@ impl<R: SupervisorRuntime> Supervisor<R> {
             });
         }
 
-        let all_indices: Vec<usize> = (0..self.components.len()).collect();
-        self.bring_up_indices(&all_indices).await?;
+        let all_indices: Vec<usize> = (0..self.components.len())
+            .filter(|&idx| self.components[idx].active)
+            .collect();
+        self.bring_up_mounts_and_providers(&all_indices).await?;
+        self.drain_pending_work().await?;
+
+        after_providers().await?;
+
+        self.bring_up_remaining_eager(&all_indices).await?;
+        self.drain_pending_work().await?;
 
         if !self.ready_signaled {
             self.runtime.signal_ready().await?;
@@ -490,9 +520,12 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         Ok(())
     }
 
-    /// Gracefully stops every running component in the topology.
+    /// Gracefully stops every active running component in the topology.
     pub async fn shutdown_all(&mut self) {
-        let indices: Vec<usize> = (0..self.components.len()).rev().collect();
+        let indices: Vec<usize> = (0..self.components.len())
+            .rev()
+            .filter(|&idx| self.components[idx].active)
+            .collect();
         for idx in indices {
             self.stop_index(idx).await;
         }
@@ -501,11 +534,13 @@ impl<R: SupervisorRuntime> Supervisor<R> {
 
     fn has_active_work(&self) -> bool {
         self.components.iter().any(|c| {
-            matches!(
-                c.status,
-                ComponentStatus::Starting | ComponentStatus::Running
-            ) && !c.node.runner.is_realm()
-                && !is_lazy_provider_slot(&c.node)
+            c.active
+                && !c.node.runner.is_realm()
+                && (c.socket_armed
+                    || (matches!(
+                        c.status,
+                        ComponentStatus::Starting | ComponentStatus::Running
+                    ) && !is_lazy_provider_slot(&c.node)))
         })
     }
 
@@ -514,6 +549,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         self.runtime.publish_inspect(&records);
     }
 
+    #[cfg(feature = "dynamic-components")]
     async fn bring_up_indices(&mut self, indices: &[usize]) -> Result<(), SupervisorError> {
         self.bring_up_batch(indices).await?;
         self.drain_pending_work().await
@@ -525,6 +561,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         loop {
             if let Some(idx) = self.pending_eager_activations.pop_front() {
                 if idx < self.components.len()
+                    && self.components[idx].active
                     && !self.components[idx].node.runner.is_realm()
                     && self.components[idx].node.startup == StartupPolicy::Eager
                     && self.components[idx].status == ComponentStatus::Unstarted
@@ -541,8 +578,10 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                 continue;
             }
             if let Some(parent_idx) = self.pending_realm_resets.pop_front() {
-                let subtree = self.teardown_parent_realm(parent_idx).await;
-                self.bring_up_batch(&subtree).await?;
+                if parent_idx < self.components.len() && self.components[parent_idx].active {
+                    let subtree = self.teardown_parent_realm(parent_idx).await;
+                    self.bring_up_batch(&subtree).await?;
+                }
                 continue;
             }
             break;
@@ -551,8 +590,19 @@ impl<R: SupervisorRuntime> Supervisor<R> {
     }
 
     async fn bring_up_batch(&mut self, indices: &[usize]) -> Result<(), SupervisorError> {
+        self.bring_up_mounts_and_providers(indices).await?;
+        self.bring_up_remaining_eager(indices).await
+    }
+
+    async fn bring_up_mounts_and_providers(
+        &mut self,
+        indices: &[usize],
+    ) -> Result<(), SupervisorError> {
         // Phase 1: Mount declarative volumes in hierarchy order before starting any component.
         for &idx in indices {
+            if !self.components[idx].active {
+                continue;
+            }
             self.ensure_mounts(idx).await?;
             if self.components[idx].node.runner.is_realm() {
                 self.components[idx].status = ComponentStatus::Running;
@@ -560,28 +610,48 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         }
         self.publish_inspect();
 
-        // Phase 2: Pre-arm lazy listening sockets and lazy kernel provider slots.
+        // Phase 2: Pre-arm lazy listening sockets, register lazy kernel provider slots,
+        // and bring up eager kernel providers whose hardware requirements and dependencies
+        // are already satisfied.
         for &idx in indices {
-            if self.components[idx].node.runner.is_realm() {
+            if !self.components[idx].active || self.components[idx].node.runner.is_realm() {
                 continue;
             }
             if is_lazy_provider_slot(&self.components[idx].node) {
                 self.activate_index(idx, Vec::new(), Vec::new()).await?;
+            } else if is_provider_component(&self.components[idx].node)
+                && self.components[idx].node.startup == StartupPolicy::Eager
+                && self.components[idx].status == ComponentStatus::Unstarted
+                && self.components[idx]
+                    .node
+                    .requires
+                    .satisfied_by(&self.hardware)
+                && self.dependencies_satisfied(idx)
+            {
+                let sockets = self.bind_sockets_for(idx).await?;
+                let ipc = self.prepare_consumer_routes(idx);
+                self.activate_index(idx, sockets, ipc).await?;
             } else if self.components[idx].node.startup == StartupPolicy::Lazy
                 && !self.components[idx].node.sockets.is_empty()
             {
                 self.arm_lazy_sockets(idx).await?;
             }
         }
+        Ok(())
+    }
 
-        // Phase 3: Start eager components in topological `after` order (including
+    async fn bring_up_remaining_eager(&mut self, indices: &[usize]) -> Result<(), SupervisorError> {
+        // Phase 3: Start remaining eager components in topological `after` order (including
         // waiting for eager `oneshot` dependencies before dependents launch!).
         let ordered = self.topological_order(indices);
         for idx in ordered {
-            if self.components[idx].node.runner.is_realm() {
+            if !self.components[idx].active || self.components[idx].node.runner.is_realm() {
                 continue;
             }
             if self.components[idx].node.startup != StartupPolicy::Eager {
+                continue;
+            }
+            if self.components[idx].status != ComponentStatus::Unstarted {
                 continue;
             }
             if !self.components[idx]
@@ -868,6 +938,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                         .handle_unrecoverable_failure(
                             idx,
                             format!("provider install failed: {error}"),
+                            None,
                         )
                         .await;
                 }
@@ -914,7 +985,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                 self.components[idx].status = ComponentStatus::Failed;
                 self.components[idx].instance_id = None;
                 self.publish_inspect();
-                self.handle_termination(idx, false, format!("spawn failed: {error}"))
+                self.handle_termination(idx, false, format!("spawn failed: {error}"), None)
                     .await
             }
         }
@@ -927,7 +998,8 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                 let candidates: Vec<usize> = (0..self.components.len())
                     .filter(|&idx| {
                         let c = &self.components[idx];
-                        !c.node.runner.is_realm()
+                        c.active
+                            && !c.node.runner.is_realm()
                             && c.node.startup == StartupPolicy::Eager
                             && c.status == ComponentStatus::Unstarted
                             && c.node.requires.satisfied_by(&self.hardware)
@@ -946,7 +1018,9 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                 generation,
                 sockets,
             } => {
-                if index >= self.components.len() || self.components[index].generation != generation
+                if index >= self.components.len()
+                    || !self.components[index].active
+                    || self.components[index].generation != generation
                 {
                     return Ok(());
                 }
@@ -962,7 +1036,9 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                 channel_name,
                 endpoint,
             } => {
-                if index >= self.components.len() || self.components[index].generation != generation
+                if index >= self.components.len()
+                    || !self.components[index].active
+                    || self.components[index].generation != generation
                 {
                     return Ok(());
                 }
@@ -979,7 +1055,9 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                 }
             }
             SupervisorEvent::RestartTimerFired { index, generation } => {
-                if index >= self.components.len() || self.components[index].generation != generation
+                if index >= self.components.len()
+                    || !self.components[index].active
+                    || self.components[index].generation != generation
                 {
                     return Ok(());
                 }
@@ -992,13 +1070,15 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                 generation,
                 outcome,
             } => {
-                if index >= self.components.len() || self.components[index].generation != generation
+                if index >= self.components.len()
+                    || !self.components[index].active
+                    || self.components[index].generation != generation
                 {
                     return Ok(());
                 }
                 self.components[index].stop_tx = None;
                 self.components[index].stopped_rx = None;
-                self.components[index].instance_id = None;
+                let last_instance_id = self.components[index].instance_id.take();
                 match outcome {
                     ProviderOutcome::Replaced | ProviderOutcome::Stopped => {
                         self.components[index].status = ComponentStatus::Unstarted;
@@ -1006,12 +1086,22 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                         Ok(())
                     }
                     ProviderOutcome::Exited => {
-                        self.handle_termination(index, true, "provider exited".to_owned())
-                            .await
+                        self.handle_termination(
+                            index,
+                            true,
+                            "provider exited".to_owned(),
+                            last_instance_id,
+                        )
+                        .await
                     }
                     ProviderOutcome::Faulted(reason) => {
-                        self.handle_termination(index, false, format!("provider faulted: {reason}"))
-                            .await
+                        self.handle_termination(
+                            index,
+                            false,
+                            format!("provider faulted: {reason}"),
+                            last_instance_id,
+                        )
+                        .await
                     }
                 }
             }
@@ -1020,13 +1110,15 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                 generation,
                 outcome,
             } => {
-                if index >= self.components.len() || self.components[index].generation != generation
+                if index >= self.components.len()
+                    || !self.components[index].active
+                    || self.components[index].generation != generation
                 {
                     return Ok(());
                 }
                 self.components[index].stop_tx = None;
                 self.components[index].stopped_rx = None;
-                self.components[index].instance_id = None;
+                let last_instance_id = self.components[index].instance_id.take();
                 match outcome {
                     Ok(exit) if exit.is_operator_kill() => {
                         self.components[index].status = ComponentStatus::Completed;
@@ -1035,11 +1127,17 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                     }
                     Ok(exit) => {
                         let clean = exit.is_clean_success();
-                        self.handle_termination(index, clean, exit.describe()).await
+                        self.handle_termination(index, clean, exit.describe(), last_instance_id)
+                            .await
                     }
                     Err(error) => {
-                        self.handle_termination(index, false, format!("wait failed: {error}"))
-                            .await
+                        self.handle_termination(
+                            index,
+                            false,
+                            format!("wait failed: {error}"),
+                            last_instance_id,
+                        )
+                        .await
                     }
                 }
             }
@@ -1051,6 +1149,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         idx: usize,
         clean_success: bool,
         reason: String,
+        last_instance_id: Option<u64>,
     ) -> Result<(), SupervisorError> {
         let lifecycle = self.components[idx].node.lifecycle;
         let restart_policy = self.components[idx].node.restart;
@@ -1086,7 +1185,9 @@ impl<R: SupervisorRuntime> Supervisor<R> {
             }
             self.components[idx].status = ComponentStatus::Failed;
             self.publish_inspect();
-            return self.handle_unrecoverable_failure(idx, reason).await;
+            return self
+                .handle_unrecoverable_failure(idx, reason, last_instance_id)
+                .await;
         }
 
         // Enforce burst-window circuit breaker before scheduling a restart.
@@ -1110,6 +1211,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                     format!(
                         "restart burst limit ({limit} restarts within {window_ms}ms) exceeded; last exit: {reason}"
                     ),
+                    last_instance_id,
                 )
                 .await;
         }
@@ -1147,7 +1249,8 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         let dependents: Vec<usize> = (0..self.components.len())
             .filter(|&idx| {
                 let c = &self.components[idx];
-                !c.node.runner.is_realm()
+                c.active
+                    && !c.node.runner.is_realm()
                     && c.node.startup == StartupPolicy::Eager
                     && c.status == ComponentStatus::Unstarted
                     && c.node.after.contains(&completed_idx)
@@ -1164,6 +1267,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         &mut self,
         idx: usize,
         reason: String,
+        last_instance_id: Option<u64>,
     ) -> Result<(), SupervisorError> {
         let criticality = self.components[idx].node.critical;
         match criticality {
@@ -1176,7 +1280,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
             }
             Criticality::System => {
                 let component = self.components[idx].node.moniker.to_string();
-                let instance_id = self.components[idx].instance_id;
+                let instance_id = last_instance_id.or(self.components[idx].instance_id);
                 let restart_count =
                     u32::try_from(self.components[idx].restarts).unwrap_or(u32::MAX);
                 let action = self.components[idx].node.escalation;
@@ -1218,6 +1322,9 @@ impl<R: SupervisorRuntime> Supervisor<R> {
     }
 
     fn collect_subtree(&self, root_idx: usize, out: &mut Vec<usize>) {
+        if root_idx >= self.components.len() || !self.components[root_idx].active {
+            return;
+        }
         out.push(root_idx);
         let children: Vec<usize> = self.components[root_idx]
             .node
@@ -1226,7 +1333,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
             .copied()
             .collect();
         for child_idx in children {
-            if child_idx < self.components.len() {
+            if child_idx < self.components.len() && self.components[child_idx].active {
                 self.collect_subtree(child_idx, out);
             }
         }
@@ -1262,14 +1369,75 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                 })?;
         crate::authority::validate_dynamic_subtree(&self.components[parent_idx].node, &subtree)?;
 
+        // Check every incoming node (root AND descendants) for collisions against
+        // all currently active components: monikers, provider slots, TCP/vsock sockets.
+        let mut active_tcp: BTreeMap<(IpAddrSpec, u16), &str> = BTreeMap::new();
+        let mut active_vsock: BTreeMap<u32, &str> = BTreeMap::new();
+        let mut active_providers: BTreeMap<&'static str, &str> = BTreeMap::new();
+        for existing in self.components.iter().filter(|c| c.active) {
+            let existing_moniker = existing.node.moniker.as_ref();
+            if let RunnerSpec::Wasm(wasm) = &existing.node.runner
+                && let Some(slot) = wasm.provider
+            {
+                active_providers.insert(slot.as_str(), existing_moniker);
+            }
+            for sock in existing.node.sockets.iter() {
+                match *sock {
+                    SocketActivationSpec::Tcp { address, port, .. } => {
+                        active_tcp.insert((address, port), existing_moniker);
+                    }
+                    SocketActivationSpec::Vsock { port, .. } => {
+                        active_vsock.insert(port, existing_moniker);
+                    }
+                }
+            }
+        }
+        for node in subtree.nodes.iter() {
+            if self.find_index(node.moniker.as_ref()).is_some() {
+                return Err(ValidationError::DuplicateMoniker {
+                    moniker: node.moniker.to_string(),
+                }
+                .into());
+            }
+            if let RunnerSpec::Wasm(wasm) = &node.runner
+                && let Some(slot) = wasm.provider
+                && let Some(&first) = active_providers.get(slot.as_str())
+            {
+                return Err(ValidationError::DuplicateProviderSlot {
+                    slot: slot.as_str(),
+                    first: first.to_owned(),
+                    second: node.moniker.to_string(),
+                }
+                .into());
+            }
+            for sock in node.sockets.iter() {
+                match *sock {
+                    SocketActivationSpec::Tcp { address, port, .. } => {
+                        if let Some(&first) = active_tcp.get(&(address, port)) {
+                            return Err(ValidationError::DuplicateSocket {
+                                socket: format!("tcp:{address}:{port}"),
+                                first: first.to_owned(),
+                                second: node.moniker.to_string(),
+                            }
+                            .into());
+                        }
+                    }
+                    SocketActivationSpec::Vsock { port, .. } => {
+                        if let Some(&first) = active_vsock.get(&port) {
+                            return Err(ValidationError::DuplicateSocket {
+                                socket: format!("vsock:{port}"),
+                                first: first.to_owned(),
+                                second: node.moniker.to_string(),
+                            }
+                            .into());
+                        }
+                    }
+                }
+            }
+        }
+
         let base_idx = self.components.len();
         let root_moniker = subtree.nodes[0].moniker.to_string();
-        if self.find_index(&root_moniker).is_some() {
-            return Err(ValidationError::DuplicateMoniker {
-                moniker: root_moniker,
-            }
-            .into());
-        }
 
         let mut added_indices = Vec::with_capacity(subtree.nodes.len());
         for (offset, mut node) in subtree.nodes.into_owned().into_iter().enumerate() {
@@ -1317,9 +1485,20 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                 moniker: subtree_root_moniker.to_owned(),
             });
         };
+        if let Some(&root_idx) = indices.first()
+            && let Some(parent_idx) = self.components[root_idx].node.parent_index
+        {
+            let mut parent_children = self.components[parent_idx].node.children_indices.to_vec();
+            parent_children.retain(|&c| c != root_idx);
+            self.components[parent_idx].node.children_indices =
+                std::borrow::Cow::Owned(parent_children);
+        }
         for &idx in indices.iter().rev() {
             self.stop_index(idx).await;
+            self.components[idx].active = false;
             self.components[idx].status = ComponentStatus::Completed;
+            self.components[idx].pending_ipc.clear();
+            self.components[idx].socket_armed = false;
         }
         self.publish_inspect();
         Ok(())
@@ -1330,6 +1509,13 @@ impl<R: SupervisorRuntime> Supervisor<R> {
     pub fn dynamic_subtree_monikers(&self) -> Vec<String> {
         self.dynamic_subtrees.keys().cloned().collect()
     }
+}
+
+fn is_provider_component(node: &ComponentNode) -> bool {
+    matches!(
+        &node.runner,
+        RunnerSpec::Wasm(wasm) if wasm.provider.is_some()
+    )
 }
 
 fn is_lazy_provider_slot(node: &ComponentNode) -> bool {

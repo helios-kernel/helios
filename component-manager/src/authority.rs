@@ -544,6 +544,12 @@ pub fn validate_dynamic_subtree(
                     parent_index: p_idx,
                 })?
         };
+        if !is_direct_child_moniker(enclosing.moniker.as_ref(), node.moniker.as_ref()) {
+            return Err(ValidationError::InvalidMoniker {
+                moniker: node.moniker.to_string(),
+                reason: "dynamic component moniker must be a direct child of its enclosing realm",
+            });
+        }
         verify_monotonic_ceiling(
             enclosing.moniker.as_ref(),
             &enclosing.capabilities,
@@ -562,9 +568,38 @@ pub fn validate_dynamic_subtree(
         validate_node_mounts(node)?;
         validate_node_sockets(node, &mut bound_tcp, &mut bound_vsock)?;
         validate_node_channels(node, nodes)?;
+
+        for &dep_idx in node.after.iter() {
+            if dep_idx >= nodes.len() {
+                return Err(ValidationError::UnknownDependency {
+                    moniker: node.moniker.to_string(),
+                    dependency_index: dep_idx,
+                });
+            }
+        }
     }
     detect_dependency_cycles(nodes)?;
     Ok(())
+}
+
+/// Returns `true` iff `child_moniker` is a direct single-segment child of `parent_moniker`.
+#[must_use]
+pub fn is_direct_child_moniker(parent_moniker: &str, child_moniker: &str) -> bool {
+    if child_moniker == "/" || !child_moniker.starts_with('/') {
+        return false;
+    }
+    if parent_moniker == "/" {
+        let rest = &child_moniker[1..];
+        !rest.is_empty() && !rest.contains('/')
+    } else {
+        let Some(rest) = child_moniker.strip_prefix(parent_moniker) else {
+            return false;
+        };
+        let Some(segment) = rest.strip_prefix('/') else {
+            return false;
+        };
+        !segment.is_empty() && !segment.contains('/')
+    }
 }
 
 /// Validates a normalized component moniker (`"/"` or `"/a/b"` with `[A-Za-z0-9._-]`).

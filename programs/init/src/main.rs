@@ -341,24 +341,39 @@ impl ChildProcess for HeliosChild {
     }
 }
 
-struct HeliosProvider(ProviderHandle);
+struct HeliosProvider {
+    slot: ProviderSlot,
+    handle: ProviderHandle,
+}
 
 impl ProviderEndpoint for HeliosProvider {
     fn instance_id(&self) -> Option<u64> {
-        self.0.instance_id()
+        self.handle.instance_id()
     }
 
     async fn wait_exit(&self) -> ProviderOutcome {
-        match self.0.wait_exit().await {
-            ProviderExit::Exited => ProviderOutcome::Exited,
+        match self.handle.wait_exit().await {
+            ProviderExit::Exited => {
+                if self.slot == ProviderSlot::Surface {
+                    println!("the compositor died; rebuilding it");
+                    let _ = io::stdout().flush();
+                }
+                ProviderOutcome::Exited
+            }
             ProviderExit::Replaced => ProviderOutcome::Replaced,
             ProviderExit::Stopped => ProviderOutcome::Stopped,
-            ProviderExit::Faulted(msg) => ProviderOutcome::Faulted(msg),
+            ProviderExit::Faulted(msg) => {
+                if self.slot == ProviderSlot::Surface {
+                    println!("the compositor died; rebuilding it");
+                    let _ = io::stdout().flush();
+                }
+                ProviderOutcome::Faulted(msg)
+            }
         }
     }
 
     fn stop(&self) {
-        self.0.stop();
+        self.handle.stop();
     }
 }
 
@@ -587,7 +602,7 @@ impl SupervisorRuntime for HeliosRuntime {
         .map_err(|error| RuntimeError::Other {
             detail: format!("installing {} provider: {error}", slot.as_str()),
         })?;
-        Ok(HeliosProvider(handle))
+        Ok(HeliosProvider { slot, handle })
     }
 
     async fn spawn_component(
@@ -1128,10 +1143,6 @@ async fn main() -> io::Result<()> {
         print!("{text}");
     }
 
-    if Path::new(RC).exists() {
-        run_rc().await?;
-    }
-
     let _ = io::stdout().flush();
     let _ = io::stderr().flush();
 
@@ -1142,7 +1153,18 @@ async fn main() -> io::Result<()> {
         .map_err(|error| io::Error::other(format!("initializing component-manager: {error}")))?;
 
     supervisor
-        .boot()
+        .boot_with_pre_ready_hook(|| async {
+            if Path::new(RC).exists() {
+                run_rc()
+                    .await
+                    .map_err(|error| helios_component_manager::RuntimeError::Other {
+                        detail: format!("running {RC}: {error}"),
+                    })?;
+                let _ = io::stdout().flush();
+                let _ = io::stderr().flush();
+            }
+            Ok(())
+        })
         .await
         .map_err(|error| io::Error::other(format!("booting component topology: {error}")))?;
     supervisor

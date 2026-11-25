@@ -8,7 +8,7 @@ optional = true
 startup = "eager"
 requires = ["display", "input"]
 lifecycle = "service"
-restart = "on-failure"
+restart = "always"
 restart_backoff = "250ms"
 oom_tier = "plugin"
 

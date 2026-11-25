@@ -7,7 +7,7 @@ program = "/bin/http-client"
 optional = true
 startup = "lazy"
 lifecycle = "service"
-restart = "on-failure"
+restart = "always"
 restart_backoff = "100ms"
 oom_tier = "plugin"
 

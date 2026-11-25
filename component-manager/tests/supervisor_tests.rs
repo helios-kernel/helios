@@ -465,7 +465,9 @@ impl SupervisorRuntime for MockRuntime {
     }
 
     async fn signal_ready(&self) -> Result<(), RuntimeError> {
-        self.state.borrow_mut().ready_signaled = true;
+        let mut st = self.state.borrow_mut();
+        st.ready_signaled = true;
+        st.events_log.push("signal_ready".to_owned());
         Ok(())
     }
 
@@ -847,10 +849,15 @@ fn eager_hardware_predicates_and_hotplug_plus_oneshot_mount_ordering() {
 
     tasks.run_to_completion(sup.boot()).expect("boot");
 
-    // Verify exact ordering: mount `/var/data` -> oneshot `/setup` -> dependent OCI `/server`.
+    // Verify exact ordering: mount `/var/data` -> oneshot `/setup` -> dependent OCI `/server` -> `signal_ready`.
     assert_eq!(
         rt.state.borrow().events_log,
-        vec!["mount:/var/data", "spawn:/setup", "spawn:/server"]
+        vec![
+            "mount:/var/data",
+            "spawn:/setup",
+            "spawn:/server",
+            "signal_ready"
+        ]
     );
     assert_eq!(rt.state.borrow().spawned[0].runner_kind, "exec");
     assert_eq!(rt.state.borrow().spawned[1].runner_kind, "oci");
@@ -926,6 +933,9 @@ fn restart_exponential_backoff_burst_circuit_breaker_and_critical_system_escalat
     assert_eq!(rt.state.borrow().sleeps_ms, vec![100, 200, 250]);
 
     // 4th crash trips burst_limit=3 -> critical="system" triggers escalate_fatal(Reboot).
+    let expected_last_id = sup
+        .instance_id_of("/drivers/blk")
+        .expect("running child must have an instance_id before exiting");
     rt.finish_child("/drivers/blk", ExitOutcome::Exited(2));
     let err = tasks
         .run_to_completion(sup.step_once())
@@ -936,6 +946,7 @@ fn restart_exponential_backoff_burst_circuit_breaker_and_critical_system_escalat
     let reports = &rt.state.borrow().fatal_reports;
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].component, "/drivers/blk");
+    assert_eq!(reports[0].instance_id, Some(expected_last_id));
     assert_eq!(reports[0].restart_count, 3);
     assert_eq!(reports[0].action, EscalationAction::Reboot);
 }
@@ -1125,9 +1136,339 @@ tcp_ports = [9000]
     tasks
         .run_to_completion(sup.unmount_dynamic("/sandbox/plugin"))
         .expect("dynamic subtree unmounts cleanly");
-    assert_eq!(
-        sup.status_of("/sandbox/plugin"),
-        Some(ComponentStatus::Completed)
+    assert_eq!(sup.status_of("/sandbox/plugin"), None);
+    assert!(
+        !sup.inspect_records()
+            .iter()
+            .any(|rec| rec.moniker == "/sandbox/plugin"),
+        "unmounted dynamic component must disappear from /components/* inspect"
     );
     assert!(sup.dynamic_subtree_monikers().is_empty());
+
+    // Rejects moniker escape outside the parent realm (`/escape/app` under `/sandbox`).
+    let mut escaped_map = BTreeMap::new();
+    escaped_map.insert(
+        "/escape/app".to_owned(),
+        r#"
+runner = "wasm"
+program = "/bin/escape"
+"#
+        .to_owned(),
+    );
+    let err = tasks
+        .run_to_completion(sup.mount_dynamic_map("/sandbox", escaped_map))
+        .expect_err("moniker outside enclosing realm must be rejected");
+    assert!(err.to_string().contains("direct child"));
+
+    // Rejects out-of-bounds `node.after` index in `validate_dynamic_subtree` without panicking.
+    let mut bad_after_node = base_node(
+        "/sandbox/bad-after",
+        None,
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/bad-after"),
+            sharding: WasmSharding::Singleton,
+            provider: None,
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    bad_after_node.after = Cow::Borrowed(&[99]);
+    let bad_after_err = helios_component_manager::validate_dynamic_subtree(
+        sup.node_by_moniker("/sandbox").unwrap(),
+        &ComponentTopology {
+            nodes: Cow::Owned(vec![bad_after_node]),
+        },
+    )
+    .expect_err("out-of-bounds `after` index must return UnknownDependency");
+    assert!(matches!(
+        bad_after_err,
+        helios_component_manager::ValidationError::UnknownDependency {
+            dependency_index: 99,
+            ..
+        }
+    ));
+
+    // Remounting the previously unmounted moniker `/sandbox/plugin` succeeds cleanly,
+    // and duplicate socket collision against an active dynamic component is rejected!
+    let mut remount_map = BTreeMap::new();
+    remount_map.insert(
+        "/sandbox/plugin".to_owned(),
+        r#"
+runner = "wasm"
+program = "/bin/dyn-plugin"
+startup = "eager"
+[capabilities]
+network = ["tcp"]
+tcp_ports = [9000]
+[[sockets]]
+kind = "tcp"
+address = "0.0.0.0"
+port = 9000
+"#
+        .to_owned(),
+    );
+    let remounted = tasks
+        .run_to_completion(sup.mount_dynamic_map("/sandbox", remount_map))
+        .expect("remount after unmount must succeed");
+    assert_eq!(remounted, "/sandbox/plugin");
+    assert_eq!(rt.spawn_count("/sandbox/plugin"), 2);
+
+    let mut duplicate_sock_map = BTreeMap::new();
+    duplicate_sock_map.insert(
+        "/sandbox/clash".to_owned(),
+        r#"
+runner = "wasm"
+program = "/bin/clash"
+[capabilities]
+network = ["tcp"]
+tcp_ports = [9000]
+[[sockets]]
+kind = "tcp"
+address = "0.0.0.0"
+port = 9000
+"#
+        .to_owned(),
+    );
+    let clash_err = tasks
+        .run_to_completion(sup.mount_dynamic_map("/sandbox", duplicate_sock_map))
+        .expect_err("duplicate TCP socket against active component must fail");
+    assert!(clash_err.to_string().contains("duplicate socket binding"));
+
+    // Unmount `/sandbox/plugin`, then trigger a `critical = "parent"` failure on a sibling
+    // inside `/sandbox` to prove parent realm reset does NOT revive the unmounted subtree!
+    tasks
+        .run_to_completion(sup.unmount_dynamic("/sandbox/plugin"))
+        .expect("second unmount succeeds");
+    let mut trigger_map = BTreeMap::new();
+    trigger_map.insert(
+        "/sandbox/trigger".to_owned(),
+        r#"
+runner = "wasm"
+program = "/bin/trigger"
+startup = "eager"
+restart = "never"
+critical = "parent"
+"#
+        .to_owned(),
+    );
+    tasks
+        .run_to_completion(sup.mount_dynamic_map("/sandbox", trigger_map))
+        .expect("mount trigger");
+    rt.finish_child("/sandbox/trigger", ExitOutcome::Trapped);
+    tasks
+        .run_to_completion(sup.step_once())
+        .expect("parent realm reset succeeds");
+    assert_eq!(
+        rt.spawn_count("/sandbox/plugin"),
+        2,
+        "parent realm reset must never revive an unmounted dynamic subtree"
+    );
+    assert_eq!(sup.status_of("/sandbox/plugin"), None);
+}
+
+#[test]
+fn boot_with_pre_ready_hook_installs_providers_before_hook_and_services_after() {
+    let mut root = base_node("/", None, RunnerSpec::Realm);
+    root.children_indices = Cow::Borrowed(&[1, 2, 3]);
+    root.oom_tier = OomTier::Protected;
+    root.capabilities = full_root_ceiling();
+
+    let mut compiler = base_node(
+        "/compiler",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/compiler.cwasm"),
+            sharding: WasmSharding::Singleton,
+            provider: Some(ProviderSlot::Compiler),
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    compiler.startup = StartupPolicy::Lazy;
+
+    let mut compositor = base_node(
+        "/compositor",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/compositor"),
+            sharding: WasmSharding::Singleton,
+            provider: Some(ProviderSlot::Surface),
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    compositor.startup = StartupPolicy::Eager;
+    compositor.restart = RestartPolicy::Always;
+    compositor.restart_backoff_ms = 50;
+    compositor.requires = HardwarePredicates {
+        display: true,
+        input: true,
+        ..Default::default()
+    };
+
+    let mut debugger = base_node(
+        "/debugger",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/debugger"),
+            sharding: WasmSharding::Singleton,
+            provider: None,
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    debugger.startup = StartupPolicy::Eager;
+
+    let rt = MockRuntime::new(HardwareInventorySnapshot {
+        display: true,
+        input: true,
+        ..Default::default()
+    });
+    let tasks = rt.tasks.clone();
+    let mut sup = Supervisor::new(
+        rt.clone(),
+        ComponentTopology {
+            nodes: Cow::Owned(vec![root, compiler, compositor, debugger]),
+        },
+    )
+    .expect("valid topology");
+
+    let rt_hook = rt.clone();
+    tasks
+        .run_to_completion(sup.boot_with_pre_ready_hook(|| async move {
+            rt_hook
+                .state
+                .borrow_mut()
+                .events_log
+                .push("rc.nu".to_owned());
+            Ok(())
+        }))
+        .expect("boot_with_pre_ready_hook succeeds");
+
+    let log = rt.state.borrow().events_log.clone();
+    let compiler_pos = log
+        .iter()
+        .position(|e| e == "provider:compiler:/compiler")
+        .expect("compiler installed");
+    let compositor_pos = log
+        .iter()
+        .position(|e| e == "provider:surface:/compositor")
+        .expect("compositor installed");
+    let rc_pos = log
+        .iter()
+        .position(|e| e == "rc.nu")
+        .expect("pre-ready hook ran");
+    let debugger_pos = log
+        .iter()
+        .position(|e| e == "spawn:/debugger")
+        .expect("debugger spawned");
+    let ready_pos = log
+        .iter()
+        .position(|e| e == "signal_ready")
+        .expect("signal_ready emitted");
+
+    assert!(compiler_pos < rc_pos && compositor_pos < rc_pos);
+    assert!(rc_pos < debugger_pos && debugger_pos < ready_pos);
+
+    // Unexpected `ProviderOutcome::Exited` restarts compositor when `restart = "always"`.
+    let exit_tx = rt
+        .state
+        .borrow()
+        .providers
+        .iter()
+        .find(|(slot, _, _)| *slot == ProviderSlot::Surface)
+        .unwrap()
+        .2
+        .clone();
+    exit_tx.try_send(ProviderOutcome::Exited).unwrap();
+    tasks.run_to_completion(sup.step_once()).unwrap(); // ProviderExited -> schedules restart
+    tasks.run_to_completion(sup.step_once()).unwrap(); // RestartTimerFired -> reinstalls
+    assert_eq!(sup.restarts_of("/compositor"), Some(1));
+    assert_eq!(
+        rt.state
+            .borrow()
+            .providers
+            .iter()
+            .filter(|(slot, _, _)| *slot == ProviderSlot::Surface)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn lazy_socket_only_topology_stays_active_in_run_until_done() {
+    let mut root = base_node("/", None, RunnerSpec::Realm);
+    root.children_indices = Cow::Borrowed(&[1]);
+    root.oom_tier = OomTier::Protected;
+    root.capabilities = full_root_ceiling();
+
+    let mut svc = base_node(
+        "/svc",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/svc"),
+            sharding: WasmSharding::Singleton,
+            provider: None,
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    svc.startup = StartupPolicy::Lazy;
+    svc.capabilities.network = NetRights::TCP;
+    svc.capabilities.tcp_ports = PortCeiling::Set(Cow::Borrowed(&[8080]));
+    svc.sockets = Cow::Borrowed(&[SocketActivationSpec::Tcp {
+        address: IpAddrSpec::V4([0, 0, 0, 0]),
+        port: 8080,
+        backlog: 16,
+    }]);
+
+    let rt = MockRuntime::new(HardwareInventorySnapshot::default());
+    let tasks = rt.tasks.clone();
+    let mut sup = Supervisor::new(
+        rt.clone(),
+        ComponentTopology {
+            nodes: Cow::Owned(vec![root, svc]),
+        },
+    )
+    .expect("valid topology");
+
+    tasks.run_to_completion(sup.boot()).expect("boot");
+    assert_eq!(rt.spawn_count("/svc"), 0);
+
+    // Drive `run_until_done` by one poll: it must stay Pending (not return Ready(()))
+    // while `/svc`'s lazy listening socket is armed!
+    {
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut loop_fut = std::pin::pin!(sup.run_until_done());
+        assert!(
+            matches!(loop_fut.as_mut().poll(&mut cx), Poll::Pending),
+            "lazy-socket-only topology must remain active in run_until_done()"
+        );
+    }
+
+    // Deliver a TCP packet -> activates `/svc`; then stop `/svc` cleanly -> re-arms socket;
+    // `run_until_done()` must STILL stay Pending!
+    rt.deliver_tcp_packet(8080, b"PING");
+    tasks.run_to_completion(sup.step_once()).unwrap();
+    assert_eq!(rt.spawn_count("/svc"), 1);
+    rt.finish_child("/svc", ExitOutcome::Exited(0));
+    tasks.run_to_completion(sup.step_once()).unwrap();
+    {
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut loop_fut = std::pin::pin!(sup.run_until_done());
+        assert!(
+            matches!(loop_fut.as_mut().poll(&mut cx), Poll::Pending),
+            "re-armed lazy socket must keep run_until_done() active"
+        );
+    }
 }
