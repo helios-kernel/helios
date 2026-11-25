@@ -145,9 +145,13 @@ impl VirtioConsole {
         }
         while let Some(chain) = self.model.queues[3].pop(memory)? {
             let mut packet = [0; 8];
-            let mut copied = 0;
+            let mut copied = 0usize;
             for descriptor in chain.descriptors {
-                let end = copied + descriptor.length as usize;
+                let desc_len = usize::try_from(descriptor.length)
+                    .map_err(|_| Error::Virtio("console control request direction or length"))?;
+                let end = copied
+                    .checked_add(desc_len)
+                    .ok_or(Error::Virtio("console control request direction or length"))?;
                 if descriptor.writable || end > packet.len() {
                     return Err(Error::Virtio("console control request direction or length"));
                 }
@@ -244,7 +248,9 @@ impl VirtioConsole {
                     .min(TRANSFER_CHUNK_BYTES);
                 let bytes: Vec<u8> = input.drain(..count).collect();
                 memory.write_slice(descriptor.address, &bytes)?;
-                length += count as u32;
+                length = length
+                    .checked_add(count as u32)
+                    .ok_or(Error::Virtio("console input used length overflow"))?;
                 if input.is_empty() {
                     break;
                 }
@@ -360,5 +366,20 @@ mod tests {
         input.push_back(b'x');
         device.process_input(&ram, &mut input).unwrap();
         assert_eq!(input.len(), 1);
+    }
+
+    #[test]
+    fn console_control_rejects_oversized_multi_descriptor_chain() {
+        let ram = test_ram(4096);
+        let mut device = VirtioConsole::console(VirtioSlot::at(0).unwrap(), 80, 25);
+        device.status = DRIVER_OK;
+        device.model.queues[3] = enable_queue(&ram, 0, 4);
+        write_desc(&ram, &device.model.queues[3], 0, 1024, 4, 1, 1);
+        write_desc(&ram, &device.model.queues[3], 1, 1028, 8, 0, 0);
+        push_avail(&ram, &device.model.queues[3], 0, 0);
+        assert!(matches!(
+            device.process_control(&ram),
+            Err(Error::Virtio(_))
+        ));
     }
 }
