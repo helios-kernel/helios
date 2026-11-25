@@ -481,7 +481,7 @@ jobs:
     if: needs.changes.outputs.wasi_artifacts == 'true'
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
+      image: ghcr.io/helios-kernel/helios-ci:38a8eb115b6780e8c1615466bfc90cdb3f6c5b7d86f9e2985406a8341573cc62
     timeout-minutes: 15
     permissions:
       contents: read
@@ -541,7 +541,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.result == 'success' && needs.build-helios-cli-x64.result == 'success' && contains(fromJSON(needs.changes.outputs.wasm_profiles), 'debug') }}
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
+      image: ghcr.io/helios-kernel/helios-ci:38a8eb115b6780e8c1615466bfc90cdb3f6c5b7d86f9e2985406a8341573cc62
     timeout-minutes: 15
     permissions:
       contents: read
@@ -623,7 +623,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.result == 'success' && needs.build-helios-cli-x64.result == 'success' && contains(fromJSON(needs.changes.outputs.wasm_profiles), 'release') }}
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
+      image: ghcr.io/helios-kernel/helios-ci:38a8eb115b6780e8c1615466bfc90cdb3f6c5b7d86f9e2985406a8341573cc62
     timeout-minutes: 15
     permissions:
       contents: read
@@ -641,7 +641,7 @@ jobs:
     if: needs.changes.outputs.checks_no_cli != '[]'
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
+      image: ghcr.io/helios-kernel/helios-ci:38a8eb115b6780e8c1615466bfc90cdb3f6c5b7d86f9e2985406a8341573cc62
     timeout-minutes: 15
     permissions:
       contents: read
@@ -681,7 +681,7 @@ jobs:
     runs-on: ubuntu-24.04
     # `test-libraries` runs `just test-btrfs-mkfs` which uses `sudo mount -o loop`.
     container:
-      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
+      image: ghcr.io/helios-kernel/helios-ci:38a8eb115b6780e8c1615466bfc90cdb3f6c5b7d86f9e2985406a8341573cc62
       options: --privileged
     timeout-minutes: 15
     permissions:
@@ -761,7 +761,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.result == 'success' && needs.build-helios-cli-x64.result == 'success' && needs.changes.outputs.tests != '[]' }}
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
+      image: ghcr.io/helios-kernel/helios-ci:38a8eb115b6780e8c1615466bfc90cdb3f6c5b7d86f9e2985406a8341573cc62
     timeout-minutes: 15
     permissions:
       contents: read
@@ -3931,7 +3931,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.build-helios-cli-x64.result == 'success' && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
+      image: ghcr.io/helios-kernel/helios-ci:38a8eb115b6780e8c1615466bfc90cdb3f6c5b7d86f9e2985406a8341573cc62
     timeout-minutes: 15
     permissions:
       contents: read
@@ -4163,7 +4163,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.build-helios-cli-arm64.result == 'success' }}
     runs-on: ubuntu-24.04-arm
     container:
-      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
+      image: ghcr.io/helios-kernel/helios-ci:38a8eb115b6780e8c1615466bfc90cdb3f6c5b7d86f9e2985406a8341573cc62
     timeout-minutes: 15
     permissions:
       contents: read

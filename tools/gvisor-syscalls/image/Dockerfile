@@ -2,5 +2,5 @@
 # nothing else. The image is storage, never a runtime; the context is
 # build.sh's output directory.
 FROM scratch
-LABEL org.opencontainers.image.source=https://github.com/lexoliu/helios
+LABEL org.opencontainers.image.source=https://github.com/helios-kernel/helios
 COPY . /

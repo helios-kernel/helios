@@ -370,7 +370,7 @@ modules (`wasmtime::Instance::get_memory`) and not for components. The
 accessor returns `None` when the component instantiated no memory or more
 than one.
 
-CI checks out the same commit from `lexoliu/wasmtime` at depth one; the pin
+CI checks out the same commit from `helios-kernel/wasmtime` at depth one; the pin
 lives in one place, `.github/actions/checkout-wasmtime/action.yml`, and every
 workflow that needs the workspace to resolve uses that action. Update the pin
 there and the revision here in the same change.
