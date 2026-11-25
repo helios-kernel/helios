@@ -115,6 +115,9 @@ jobs:
     if: needs.changes.outputs.tooling == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
     outputs:
       # Advisory unless this is a dedicated-runner event; `runs-on` below
       # reads it through the needs context, the only one it can read.

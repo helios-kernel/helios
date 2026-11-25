@@ -1186,6 +1186,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      packages: write
     env:
       HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
       # The `cwasm` cache of `smoke-riscv64`, for this lane's prebuilds.
@@ -1907,6 +1908,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      packages: write
     timeout-minutes: 40
     env:
       HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
