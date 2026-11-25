@@ -210,6 +210,18 @@ impl VirtualMemory for Pages {
         }
         Some(candidate)
     }
+    fn populate(&mut self, address: u64, bytes: &[u8]) -> Result<(), MapError> {
+        for i in 0..bytes.len() {
+            let a = address.checked_add(i as u64).ok_or(MapError::Address)?;
+            if !self.0.contains_key(&(a & !(PAGE - 1))) {
+                return Err(MapError::Address);
+            }
+        }
+        for (i, &b) in bytes.iter().enumerate() {
+            self.fill(address + i as u64, 1, b);
+        }
+        Ok(())
+    }
 }
 
 struct NoThread;

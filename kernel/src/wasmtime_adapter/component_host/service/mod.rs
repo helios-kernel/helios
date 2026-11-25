@@ -575,6 +575,7 @@ async fn load_container_executable<CpuImpl, StorageImpl>(
     cpu: &CpuImpl,
     container: &crate::LinuxContainer<StorageImpl>,
     path: &str,
+    creds: &helios_linux::syscall::Credentials,
     timeline: &phases::Timeline,
 ) -> Result<LinuxExecutable, ProgramExecError>
 where
@@ -598,7 +599,15 @@ where
         });
     }
     timeline.record(cpu, LaunchPhase::LoadBegin);
-    let loaded = LinuxExecutable::load(cpu, bytes)?;
+    let loaded = LinuxExecutable::load_in_container(
+        cpu,
+        container,
+        "/",
+        bytes,
+        Some(path.to_owned()),
+        creds,
+    )
+    .await?;
     timeline.record(cpu, LaunchPhase::LoadComplete);
     Ok(loaded)
 }
@@ -1830,15 +1839,24 @@ where
         path: &str,
         launch: ProgramLaunch<Net, StorageImpl>,
     ) -> Result<ChildHandle, ProgramExecError> {
-        let container = launch
+        let container_launch = launch
             .container
             .as_ref()
-            .expect("container spawn carries a container")
-            .container
-            .clone();
-        let executable =
-            load_container_executable(&exec_context.cpu, &container, path, &launch.timeline)
-                .await?;
+            .expect("container spawn carries a container");
+        let container = container_launch.container.clone();
+        let mut creds = container_launch
+            .credentials
+            .clone()
+            .unwrap_or_else(|| container.default_credentials().clone());
+        container.clamp_credentials(&mut creds);
+        let executable = load_container_executable(
+            &exec_context.cpu,
+            &container,
+            path,
+            &creds,
+            &launch.timeline,
+        )
+        .await?;
         self.spawn_loaded(exec_context, ProgramExecutable::Linux(executable), launch)
     }
 
@@ -1852,15 +1870,24 @@ where
         stdin: Vec<u8>,
         launch: ProgramLaunch<Net, StorageImpl>,
     ) -> Result<ExecResult, ProgramExecError> {
-        let container = launch
+        let container_launch = launch
             .container
             .as_ref()
-            .expect("container exec carries a container")
-            .container
-            .clone();
-        let executable =
-            load_container_executable(&exec_context.cpu, &container, path, &launch.timeline)
-                .await?;
+            .expect("container exec carries a container");
+        let container = container_launch.container.clone();
+        let mut creds = container_launch
+            .credentials
+            .clone()
+            .unwrap_or_else(|| container.default_credentials().clone());
+        container.clamp_credentials(&mut creds);
+        let executable = load_container_executable(
+            &exec_context.cpu,
+            &container,
+            path,
+            &creds,
+            &launch.timeline,
+        )
+        .await?;
         self.exec_loaded_buffered(
             exec_context,
             ProgramExecutable::Linux(executable),
