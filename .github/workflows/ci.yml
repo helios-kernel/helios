@@ -1135,7 +1135,8 @@ jobs:
             --kernel target/riscv64gc-unknown-none-elf/kernel-release/helios-kernel \
             --root-public-key target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-root-public.key \
             --bootfs target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-bootfs \
-            --compiler-plugin target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/compiler_plugin.wasm
+            --compiler-plugin target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/compiler_plugin.wasm \
+            --inspector-client-key target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-inspector-client-secret.key
       - name: Upload the prebuilt kernel
         if: always() && steps.stage-prebuilt.outcome == 'success'
         uses: actions/upload-artifact@v4
@@ -1738,6 +1739,7 @@ jobs:
             --root-public-key target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-root-public.key \
             --bootfs target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs \
             --compiler-plugin target/kernel-prebuild/aarch64-unknown-none/kernel-release/compiler_plugin.wasm \
+            --inspector-client-key target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-inspector-client-secret.key \
             --build-uefi-image
       - name: Upload the prebuilt kernel
         if: always() && steps.stage-prebuilt.outcome == 'success'
@@ -1882,6 +1884,7 @@ jobs:
             --kernel target/aarch64-unknown-none/debug/helios-kernel \
             --root-public-key target/kernel-prebuild/aarch64-unknown-none/debug/helios-root-public.key \
             --bootfs target/kernel-prebuild/aarch64-unknown-none/debug/helios-bootfs \
+            --inspector-client-key target/kernel-prebuild/aarch64-unknown-none/debug/helios-inspector-client-secret.key \
             --build-uefi-image
       - name: Upload the prebuilt CFI kernel
         if: always() && steps.stage-prebuilt.outcome == 'success'
@@ -3103,6 +3106,7 @@ jobs:
             --root-public-key target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-root-public.key \
             --bootfs target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs \
             --compiler-plugin target/kernel-prebuild/x86_64-unknown-none/profile-use/compiler_plugin.wasm \
+            --inspector-client-key target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-inspector-client-secret.key \
             --build-uefi-image
       - name: Upload the prebuilt kernel
         if: always() && steps.stage-prebuilt.outcome == 'success'
@@ -3291,6 +3295,7 @@ jobs:
             --kernel target/x86_64-unknown-none/profile-use/helios-kernel \
             --root-public-key target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-root-public.key \
             --bootfs target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs \
+            --inspector-client-key target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-inspector-client-secret.key \
             --build-uefi-image
       - name: Upload the prebuilt kernel
         if: always() && steps.stage-prebuilt.outcome == 'success'
@@ -3626,6 +3631,7 @@ jobs:
             --kernel target/x86_64-unknown-none/debug/helios-kernel \
             --root-public-key target/kernel-prebuild/x86_64-unknown-none/debug/helios-root-public.key \
             --bootfs target/kernel-prebuild/x86_64-unknown-none/debug/helios-bootfs \
+            --inspector-client-key target/kernel-prebuild/x86_64-unknown-none/debug/helios-inspector-client-secret.key \
             --build-uefi-image
       - name: Upload the prebuilt debug kernel
         if: always() && steps.stage-prebuilt.outcome == 'success'
@@ -4121,6 +4127,7 @@ jobs:
             --kernel "target/${{ matrix.target }}/${{ matrix.profile_dir }}/helios-kernel" \
             --root-public-key "target/kernel-prebuild/${{ matrix.target }}/${{ matrix.profile_dir }}/helios-root-public.key" \
             --bootfs "target/kernel-prebuild/${{ matrix.target }}/${{ matrix.profile_dir }}/helios-bootfs" \
+            --inspector-client-key "target/kernel-prebuild/${{ matrix.target }}/${{ matrix.profile_dir }}/helios-inspector-client-secret.key" \
             --build-uefi-image
       - name: Upload the prebuilt Linux kernel
         uses: actions/upload-artifact@v4

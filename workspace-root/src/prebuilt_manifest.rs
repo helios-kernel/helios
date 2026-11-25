@@ -270,12 +270,14 @@ pub fn write_manifest(
     dir: &Path,
     manifest: &PrebuiltManifest,
 ) -> Result<PathBuf, PrebuiltManifestError> {
+    let allow_inspector_client_key = manifest.kind == PrebuiltArtifactKind::Image;
     if dir.join(ROOT_SECRET_FILE).exists()
-        || dir.join(INSPECTOR_CLIENT_SECRET_FILE).exists()
+        || (!allow_inspector_client_key && dir.join(INSPECTOR_CLIENT_SECRET_FILE).exists())
         || manifest.files.iter().any(|file| {
             let name = Path::new(file).file_name();
             name == Some(ROOT_SECRET_FILE.as_ref())
-                || name == Some(INSPECTOR_CLIENT_SECRET_FILE.as_ref())
+                || (!allow_inspector_client_key
+                    && name == Some(INSPECTOR_CLIENT_SECRET_FILE.as_ref()))
         })
     {
         return Err(PrebuiltManifestError::SecretKeyPresent {
@@ -300,7 +302,7 @@ pub fn write_manifest(
 /// checking that no root secret key is present, and confirming every declared
 /// file exists under `dir`.
 pub fn read_manifest(dir: &Path) -> Result<PrebuiltManifest, PrebuiltManifestError> {
-    if dir.join(ROOT_SECRET_FILE).exists() || dir.join(INSPECTOR_CLIENT_SECRET_FILE).exists() {
+    if dir.join(ROOT_SECRET_FILE).exists() {
         return Err(PrebuiltManifestError::SecretKeyPresent {
             dir: dir.display().to_string(),
         });
@@ -321,11 +323,18 @@ pub fn read_manifest(dir: &Path) -> Result<PrebuiltManifest, PrebuiltManifestErr
             found: manifest.schema_version,
         });
     }
+    let allow_inspector_client_key = manifest.kind == PrebuiltArtifactKind::Image;
+    if !allow_inspector_client_key && dir.join(INSPECTOR_CLIENT_SECRET_FILE).exists() {
+        return Err(PrebuiltManifestError::SecretKeyPresent {
+            dir: dir.display().to_string(),
+        });
+    }
     for entry in &manifest.files {
         validate_relative_entry(&path, entry)?;
         let file_name = Path::new(entry).file_name();
         if file_name == Some(ROOT_SECRET_FILE.as_ref())
-            || file_name == Some(INSPECTOR_CLIENT_SECRET_FILE.as_ref())
+            || (!allow_inspector_client_key
+                && file_name == Some(INSPECTOR_CLIENT_SECRET_FILE.as_ref()))
         {
             return Err(PrebuiltManifestError::SecretKeyPresent {
                 dir: dir.display().to_string(),

@@ -509,6 +509,11 @@ pub(crate) enum VmSessionError {
     Runtime(#[from] VmRuntimeError),
     #[error("socket path must be valid UTF-8: {path}")]
     SocketPathNotUtf8 { path: String },
+    #[error(
+        "missing inspector client identity key ({INSPECTOR_CLIENT_SECRET_FILE}); pass --identity <name|path>, set HELIOS_INSPECTOR_CLIENT_KEY, or place {INSPECTOR_CLIENT_SECRET_FILE} in one of: {}",
+        format_checked_paths(checked)
+    )]
+    MissingInspectorClientIdentity { checked: Vec<PathBuf> },
     #[error("failed to connect inspector RPC client{over}: {source}")]
     Connect {
         /// The transport the connection was attempted over, empty for the
@@ -3988,14 +3993,25 @@ fn export_trusted_root_public_key<'a>(
     ))
 }
 
+fn format_checked_paths(paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        return "<none>".to_owned();
+    }
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn resolve_vm_client_identity(
     command: &ResolvedVmCommand,
     ops: &crate::ops_cli::GlobalOpsFlags,
-) -> Option<helios_inspector_protocol::auth::ClientIdentity> {
+) -> Result<helios_inspector_protocol::auth::ClientIdentity, VmSessionError> {
     if let Ok(options) = crate::ops_cli::build_session_options(ops)
         && let helios_ops::SecurityMode::Authenticated { identity, .. } = options.security
     {
-        return Some(*identity);
+        return Ok(*identity);
     }
     let fallback_dir = kernel_prebuild_dir(&command.build).ok();
     resolve_vm_client_identity_from_dirs(command.bootfs.parent(), fallback_dir.as_deref())
@@ -4004,17 +4020,22 @@ fn resolve_vm_client_identity(
 fn resolve_vm_client_identity_from_dirs(
     bootfs_dir: Option<&Path>,
     prebuild_dir: Option<&Path>,
-) -> Option<helios_inspector_protocol::auth::ClientIdentity> {
+) -> Result<helios_inspector_protocol::auth::ClientIdentity, VmSessionError> {
+    let mut checked = Vec::new();
     for dir in [bootfs_dir, prebuild_dir].into_iter().flatten() {
+        if checked.iter().any(|existing: &PathBuf| existing == dir) {
+            continue;
+        }
         let key_path = dir.join(INSPECTOR_CLIENT_SECRET_FILE);
         if key_path.is_file()
             && let Ok(identity) =
                 helios_inspector_protocol::auth::ClientIdentity::from_seed_file(&key_path)
         {
-            return Some(identity);
+            return Ok(identity);
         }
+        checked.push(dir.to_path_buf());
     }
-    None
+    Err(VmSessionError::MissingInspectorClientIdentity { checked })
 }
 
 fn connect_and_run(
@@ -4031,7 +4052,7 @@ fn connect_and_run(
         runtime.debug_serial_log.clone(),
         command.kernel.clone(),
     );
-    let client_identity = resolve_vm_client_identity(command, ops);
+    let client_identity = resolve_vm_client_identity(command, ops)?;
     let (client, target_uri) = match runtime.take_transport()? {
         VmTransport::SerialSocket(socket_path) => {
             let socket = socket_path
@@ -4040,14 +4061,14 @@ fn connect_and_run(
                     path: socket_path.display().to_string(),
                 })?;
             let uri = format!("serial://{socket}?baud={}", command.baud);
-            let client = connect_client(socket, command.baud, true, client_identity.as_ref())
+            let client = connect_client(socket, command.baud, true, Some(&client_identity))
                 .map_err(|source| VmSessionError::Connect { over: "", source })?;
             (client, Some(uri))
         }
         VmTransport::SerialIo(io) => {
             let identity = client_identity.clone();
             let client = crate::runtime::block_on(async move {
-                crate::ready::connect_after_boot(io, identity.as_ref())
+                crate::ready::connect_after_boot(io, Some(&identity))
                     .await
                     .map_err(|error| VmSessionError::Connect {
                         over: " over QEMU stdio serial",
@@ -4090,25 +4111,22 @@ fn connect_and_run(
                 let (vsock_read, vsock_write) =
                     crate::vsock::connect(guest_cid, helios_inspector_protocol::VSOCK_RPC_PORT)
                         .await?;
-                let mut client = match identity.as_ref() {
-                    Some(identity) => RpcClient::connect_authenticated(
-                        vsock_read,
-                        vsock_write,
-                        helios_inspector_protocol::auth::TransportKind::Vsock,
-                        identity,
-                        None,
-                    )
-                    .await
-                    .map_err(|err| match err {
-                        crate::serial::AuthConnectError::Auth(source) => {
-                            ConnectError::Boot(crate::ready::BootError::Auth { source })
-                        }
-                        crate::serial::AuthConnectError::Driver(source) => {
-                            ConnectError::Driver { source }
-                        }
-                    })?,
-                    None => RpcClient::new(vsock_read, vsock_write).map_err(ConnectError::from)?,
-                };
+                let mut client = RpcClient::connect_authenticated(
+                    vsock_read,
+                    vsock_write,
+                    helios_inspector_protocol::auth::TransportKind::Vsock,
+                    &identity,
+                    None,
+                )
+                .await
+                .map_err(|err| match err {
+                    crate::serial::AuthConnectError::Auth(source) => {
+                        ConnectError::Boot(crate::ready::BootError::Auth { source })
+                    }
+                    crate::serial::AuthConnectError::Driver(source) => {
+                        ConnectError::Driver { source }
+                    }
+                })?;
                 crate::ready::wait_until_ready(&mut client)
                     .await
                     .map_err(ConnectError::from)?;
@@ -7561,6 +7579,8 @@ mod tests {
         #[error("{0}")]
         Runtime(#[from] VmRuntimeError),
         #[error("{0}")]
+        Session(#[from] VmSessionError),
+        #[error("{0}")]
         Step(#[from] BuildStepError),
         #[error("{0}")]
         WorkspaceRoot(#[from] WorkspaceRootError),
@@ -10484,9 +10504,9 @@ mod tests {
             .to_str()
             .ok_or(GuestTestFailure::SocketPathNotUtf8)?;
         let identity =
-            resolve_vm_client_identity(&command, &crate::ops_cli::GlobalOpsFlags::default());
+            resolve_vm_client_identity(&command, &crate::ops_cli::GlobalOpsFlags::default())?;
         let client =
-            connect_client(socket, DEFAULT_BAUD, true, identity.as_ref()).map_err(|source| {
+            connect_client(socket, DEFAULT_BAUD, true, Some(&identity)).map_err(|source| {
                 GuestTestFailure::Connect {
                     purpose: "direct-exec",
                     source,
@@ -10530,9 +10550,9 @@ mod tests {
             .to_str()
             .ok_or(GuestTestFailure::SocketPathNotUtf8)?;
         let identity =
-            resolve_vm_client_identity(&command, &crate::ops_cli::GlobalOpsFlags::default());
+            resolve_vm_client_identity(&command, &crate::ops_cli::GlobalOpsFlags::default())?;
         let client =
-            connect_client(socket, DEFAULT_BAUD, true, identity.as_ref()).map_err(|source| {
+            connect_client(socket, DEFAULT_BAUD, true, Some(&identity)).map_err(|source| {
                 GuestTestFailure::Connect {
                     purpose: "direct-exec",
                     source,
@@ -10572,9 +10592,9 @@ mod tests {
             .to_str()
             .ok_or(GuestTestFailure::SocketPathNotUtf8)?;
         let identity =
-            resolve_vm_client_identity(&command, &crate::ops_cli::GlobalOpsFlags::default());
+            resolve_vm_client_identity(&command, &crate::ops_cli::GlobalOpsFlags::default())?;
         let client =
-            connect_client(socket, DEFAULT_BAUD, true, identity.as_ref()).map_err(|source| {
+            connect_client(socket, DEFAULT_BAUD, true, Some(&identity)).map_err(|source| {
                 GuestTestFailure::Connect {
                     purpose: "shell",
                     source,
@@ -11166,5 +11186,33 @@ mod tests {
         let expected_prebuild =
             helios_inspector_protocol::auth::ClientIdentity::from_static_seed(prebuild_seed);
         assert_eq!(fallback.public_key(), expected_prebuild.public_key());
+
+        // Fails fast with MissingInspectorClientIdentity naming every checked directory when absent.
+        fs::remove_file(prebuild_dir.join(INSPECTOR_CLIENT_SECRET_FILE))
+            .expect("remove prebuild key");
+        let err = resolve_vm_client_identity_from_dirs(Some(&bootfs_dir), Some(&prebuild_dir))
+            .expect_err("missing inspector client key must fail fast");
+        let rendered = err.to_string();
+        assert!(
+            matches!(
+                err,
+                VmSessionError::MissingInspectorClientIdentity { ref checked }
+                    if checked == &[bootfs_dir.clone(), prebuild_dir.clone()]
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            rendered.contains("HELIOS_INSPECTOR_CLIENT_KEY"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("--identity"), "{rendered}");
+        assert!(
+            rendered.contains(&bootfs_dir.display().to_string()),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&prebuild_dir.display().to_string()),
+            "{rendered}"
+        );
     }
 }

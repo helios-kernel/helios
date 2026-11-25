@@ -19,7 +19,8 @@ pub const ROOT_SECRET_FILE: &str = "helios-root-secret.key";
 pub const ROOT_PUBLIC_FILE: &str = "helios-root-public.key";
 
 /// The development inspector client Ed25519 secret key's file name inside a
-/// prebuild directory (mode 0600, never staged into bootfs or prebuilt artifacts).
+/// prebuild directory (mode 0600, never staged into bootfs or `kernel` bundles;
+/// staged into `image` bundles only via explicit `--inspector-client-key`).
 pub const INSPECTOR_CLIENT_SECRET_FILE: &str = "helios-inspector-client-secret.key";
 
 /// The encoded public [`AuthPolicy`] staged into bootfs at `etc/inspector/policy.postcard`.
