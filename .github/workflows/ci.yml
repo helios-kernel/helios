@@ -4095,6 +4095,8 @@ jobs:
       - name: Build the Linux guest image
         shell: bash
         working-directory: helios
+        env:
+          HELIOS_INSPECTOR_BIN: ${{ github.workspace }}/helios/target/release/helios
         run: |
           set -euo pipefail
           ./target/release/helios vm --arch "${{ matrix.vm_arch }}" --release \

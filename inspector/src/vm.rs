@@ -3740,15 +3740,19 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
     if !restored && let Some(cache) = &cache {
         cache.store()?;
     }
-    run_step(
-        "building inspector",
-        command
-            .kind
-            .host()
-            .cargo_build_command(&repo_root)
-            .arg("-p")
-            .arg("helios-inspector"),
-    )?;
+    // An inspector named by `HELIOS_INSPECTOR_BIN` is already built and staged
+    // by the caller, so rebuilding the workspace binary is waste.
+    if std::env::var_os("HELIOS_INSPECTOR_BIN").is_none() {
+        run_step(
+            "building inspector",
+            command
+                .kind
+                .host()
+                .cargo_build_command(&repo_root)
+                .arg("-p")
+                .arg("helios-inspector"),
+        )?;
+    }
     Ok(())
 }
 
