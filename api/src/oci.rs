@@ -148,7 +148,10 @@ fn vec_to_uuid(bytes: &[u8]) -> Option<[u8; 16]> {
 
 fn map_btrfs_error(operation: &'static str, path: &Path, err: BtrfsError) -> SubvolumeError {
     match err.kind {
-        BtrfsErrorKind::NotBtrfs | BtrfsErrorKind::NotSubvolume => SubvolumeError::NotBtrfs {
+        BtrfsErrorKind::NotBtrfs => SubvolumeError::NotBtrfs {
+            path: path.to_path_buf(),
+        },
+        BtrfsErrorKind::NotSubvolume => SubvolumeError::NotSubvolume {
             path: path.to_path_buf(),
         },
         BtrfsErrorKind::AlreadyExists => SubvolumeError::AlreadyExists {

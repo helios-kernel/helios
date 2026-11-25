@@ -9,8 +9,8 @@ use zrip_decode::streaming::FrameDecoder;
 use crate::reference::Digest;
 use crate::spec::LayerCompression;
 
-/// Upper bound on uncompressed bytes yielded by a single zstd layer (2 GiB on 64-bit,
-/// capped cleanly to `usize::MAX / 2` on 32-bit `wasm32-wasip3`).
+/// Upper bound on uncompressed bytes yielded by a single zstd layer (4 GiB on 64-bit,
+/// capped to 1 GiB on 32-bit `wasm32-wasip3`).
 const MAX_ZSTD_LAYER_BYTES: usize = {
     #[cfg(target_pointer_width = "32")]
     {

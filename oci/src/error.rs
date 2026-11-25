@@ -11,6 +11,9 @@ pub enum SubvolumeError {
     /// The target path does not reside on a mounted btrfs volume.
     #[error("path `{path}` is not on a btrfs filesystem")]
     NotBtrfs { path: PathBuf },
+    /// The target path is on a btrfs volume, but is a regular directory rather than a subvolume root.
+    #[error("path `{path}` is not a btrfs subvolume root")]
+    NotSubvolume { path: PathBuf },
     /// Subvolume already exists at the requested path.
     #[error("subvolume already exists at `{path}`")]
     AlreadyExists { path: PathBuf },

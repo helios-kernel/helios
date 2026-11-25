@@ -5,10 +5,23 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{OciError, Result};
 use crate::reference::Digest;
+
+/// Deserialize an optional or explicit JSON `null` field as `T::default()`.
+///
+/// Real-world Docker Hub and BuildKit OCI manifests and configs routinely emit
+/// `"Entrypoint": null`, `"Cmd": null`, `"Env": null`, `"Labels": null`,
+/// `"config": null`, or `"annotations": null`.
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> core::result::Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 /// Media type constants defined by the OCI Image Spec and Docker Registry v2.2.
 pub mod media_type {
@@ -154,9 +167,17 @@ pub struct Descriptor {
     pub media_type: String,
     pub digest: Digest,
     pub size: u64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub urls: Vec<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub annotations: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<Platform>,
@@ -169,8 +190,13 @@ pub struct ImageIndex {
     pub schema_version: u32,
     #[serde(rename = "mediaType", default, skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub manifests: Vec<Descriptor>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub annotations: BTreeMap<String, String>,
 }
 
@@ -219,8 +245,13 @@ pub struct ImageManifest {
     #[serde(rename = "mediaType", default, skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
     pub config: Descriptor,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub layers: Vec<Descriptor>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub annotations: BTreeMap<String, String>,
 }
 
@@ -296,9 +327,13 @@ impl ManifestDocument {
 /// `rootfs` section of an OCI Image Config JSON.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootFs {
-    #[serde(rename = "type")]
+    #[serde(
+        rename = "type",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     pub kind: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub diff_ids: Vec<Digest>,
 }
 
@@ -307,15 +342,23 @@ pub struct RootFs {
 pub struct ImageRuntimeConfig {
     #[serde(rename = "User", default)]
     pub user: Option<String>,
-    #[serde(rename = "Env", default)]
+    #[serde(rename = "Env", default, deserialize_with = "deserialize_null_default")]
     pub env: Vec<String>,
-    #[serde(rename = "Entrypoint", default)]
+    #[serde(
+        rename = "Entrypoint",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     pub entrypoint: Vec<String>,
-    #[serde(rename = "Cmd", default)]
+    #[serde(rename = "Cmd", default, deserialize_with = "deserialize_null_default")]
     pub cmd: Vec<String>,
     #[serde(rename = "WorkingDir", default)]
     pub working_dir: Option<String>,
-    #[serde(rename = "Labels", default)]
+    #[serde(
+        rename = "Labels",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     pub labels: BTreeMap<String, String>,
     #[serde(rename = "StopSignal", default)]
     pub stop_signal: Option<String>,
@@ -514,13 +557,13 @@ fn lookup_group(rootfs: &Path, groupname: &str, spec: &str) -> Result<u32> {
 /// Top-level OCI Image Config JSON document.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageConfig {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub architecture: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub os: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub config: ImageRuntimeConfig,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub rootfs: RootFs,
 }
 
@@ -632,5 +675,62 @@ mod tests {
             index.select_linux(Arch::Aarch64).unwrap().digest,
             arm64_digest
         );
+    }
+
+    #[test]
+    fn deserializes_real_world_oci_json_with_explicit_null_fields() {
+        let digest = Digest::sha256(b"cfg");
+        let cfg_json = format!(
+            r#"{{
+                "architecture": "amd64",
+                "os": "linux",
+                "config": {{
+                    "User": null,
+                    "Env": null,
+                    "Entrypoint": null,
+                    "Cmd": null,
+                    "WorkingDir": null,
+                    "Labels": null
+                }},
+                "rootfs": {{
+                    "type": "layers",
+                    "diff_ids": ["{digest}"]
+                }}
+            }}"#
+        );
+        let parsed: ImageConfig = serde_json::from_str(&cfg_json).expect("config with null fields");
+        assert!(parsed.config.env.is_empty());
+        assert!(parsed.config.entrypoint.is_empty());
+        assert!(parsed.config.cmd.is_empty());
+        assert!(parsed.config.labels.is_empty());
+        assert_eq!(parsed.rootfs.diff_ids, vec![digest.clone()]);
+
+        let null_config_json = r#"{"architecture":"arm64","os":"linux","config":null,"rootfs":{"type":"layers","diff_ids":null}}"#;
+        let parsed_null: ImageConfig =
+            serde_json::from_str(null_config_json).expect("null config object");
+        assert_eq!(parsed_null.config, ImageRuntimeConfig::default());
+        assert!(parsed_null.rootfs.diff_ids.is_empty());
+
+        let manifest_json = format!(
+            r#"{{
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {{
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": "{digest}",
+                    "size": 128,
+                    "urls": null,
+                    "annotations": null
+                }},
+                "layers": null,
+                "annotations": null
+            }}"#
+        );
+        let manifest: ImageManifest =
+            serde_json::from_str(&manifest_json).expect("manifest with null fields");
+        assert!(manifest.config.urls.is_empty());
+        assert!(manifest.config.annotations.is_empty());
+        assert!(manifest.layers.is_empty());
+        assert!(manifest.annotations.is_empty());
     }
 }

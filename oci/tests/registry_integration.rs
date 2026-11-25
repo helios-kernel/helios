@@ -834,6 +834,11 @@ impl SubvolumeBackend for RecordingBtrfsBackend {
     }
 
     async fn subvolume_info(&self, path: &Path) -> Result<Option<SubvolumeMeta>, SubvolumeError> {
+        if path.file_name().and_then(|n| n.to_str()) == Some("layers") {
+            return Err(SubvolumeError::NotSubvolume {
+                path: path.to_path_buf(),
+            });
+        }
         Ok(self.subvolumes.lock().unwrap().get(path).cloned())
     }
 

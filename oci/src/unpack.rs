@@ -196,11 +196,18 @@ pub fn unpack_layer_into_dir<R: Read>(
 
         // 1. Handle OCI whiteouts before extracting normal files.
         if file_name == OPAQUE_WHITEOUT {
-            apply_opaque_whiteout(target_dir, parent_rel, &created_in_layer, &mut entries_meta)?;
+            apply_opaque_whiteout(
+                target_dir,
+                parent_rel,
+                digest,
+                &created_in_layer,
+                &mut entries_meta,
+            )?;
             continue;
         }
         if let Some(target_name) = file_name.strip_prefix(WHITEOUT_PREFIX) {
             if !target_name.is_empty() {
+                reject_symlink_components(target_dir, parent_rel, digest)?;
                 let victim_rel = if parent_rel.is_empty() {
                     target_name.to_owned()
                 } else {
@@ -229,16 +236,32 @@ pub fn unpack_layer_into_dir<R: Read>(
 
         match entry_type {
             EntryType::Directory => {
-                if let Ok(meta) = fs::symlink_metadata(&dest)
-                    && !meta.is_dir()
-                {
-                    remove_path_recursive(&dest)?;
+                ensure_parent_dirs(target_dir, parent_rel, digest, &mut entries_meta)?;
+                match fs::symlink_metadata(&dest) {
+                    Ok(meta) if meta.is_dir() => {}
+                    Ok(_) => {
+                        remove_path_recursive(&dest)?;
+                        fs::create_dir(&dest).map_err(|source| OciError::Io {
+                            operation: "create directory",
+                            path: dest.clone(),
+                            source,
+                        })?;
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        fs::create_dir(&dest).map_err(|source| OciError::Io {
+                            operation: "create directory",
+                            path: dest.clone(),
+                            source,
+                        })?;
+                    }
+                    Err(source) => {
+                        return Err(OciError::Io {
+                            operation: "stat directory",
+                            path: dest.clone(),
+                            source,
+                        });
+                    }
                 }
-                fs::create_dir_all(&dest).map_err(|source| OciError::Io {
-                    operation: "create directory",
-                    path: dest.clone(),
-                    source,
-                })?;
                 // Ensure writable while unpacking children; apply final mode after loop.
                 set_writable_for_unpack(&dest);
                 deferred_dir_modes.push(DeferredDirMode {
@@ -265,7 +288,7 @@ pub fn unpack_layer_into_dir<R: Read>(
                 created_in_layer.insert(rel_path);
             }
             EntryType::Regular | EntryType::Continuous => {
-                ensure_parent_dirs(target_dir, parent_rel, &mut entries_meta)?;
+                ensure_parent_dirs(target_dir, parent_rel, digest, &mut entries_meta)?;
                 if fs::symlink_metadata(&dest).is_ok() {
                     remove_path_recursive(&dest)?;
                 }
@@ -310,7 +333,7 @@ pub fn unpack_layer_into_dir<R: Read>(
                     })?
                     .to_string_lossy()
                     .into_owned();
-                ensure_parent_dirs(target_dir, parent_rel, &mut entries_meta)?;
+                ensure_parent_dirs(target_dir, parent_rel, digest, &mut entries_meta)?;
                 if fs::symlink_metadata(&dest).is_ok() {
                     remove_path_recursive(&dest)?;
                 }
@@ -351,7 +374,8 @@ pub fn unpack_layer_into_dir<R: Read>(
                         reason: "hardlink target points to root",
                     });
                 };
-                ensure_parent_dirs(target_dir, parent_rel, &mut entries_meta)?;
+                reject_symlink_components(target_dir, &target_rel, digest)?;
+                ensure_parent_dirs(target_dir, parent_rel, digest, &mut entries_meta)?;
                 if fs::symlink_metadata(&dest).is_ok() {
                     remove_path_recursive(&dest)?;
                 }
@@ -384,7 +408,7 @@ pub fn unpack_layer_into_dir<R: Read>(
                     EntryType::Block => NodeKind::BlockDevice,
                     _ => unreachable!(),
                 };
-                ensure_parent_dirs(target_dir, parent_rel, &mut entries_meta)?;
+                ensure_parent_dirs(target_dir, parent_rel, digest, &mut entries_meta)?;
                 // Record full device/FIFO metadata in the ledger; creating device nodes on
                 // unprivileged host filesystems requires CAP_MKNOD so we record them faithfully
                 // without failing unprivileged host extracts (btrfs send stream encodes real MKNOD/MKFIFO).
@@ -757,18 +781,61 @@ fn split_parent_name(rel_path: &str) -> (&str, &str) {
     }
 }
 
+/// Refuse any path whose existing components inside `target_dir` traverse a symlink.
+fn reject_symlink_components(target_dir: &Path, rel_path: &str, digest: &str) -> Result<()> {
+    if rel_path.is_empty() {
+        return Ok(());
+    }
+    let mut cur = target_dir.to_path_buf();
+    for seg in rel_path.split('/') {
+        cur.push(seg);
+        match fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(OciError::UnsafePath {
+                    digest: digest.to_owned(),
+                    path: rel_path.to_owned(),
+                    reason: "path traverses a symlink inside layer root",
+                });
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => break,
+            Err(source) => {
+                return Err(OciError::Io {
+                    operation: "inspect path component for symlink confinement",
+                    path: cur,
+                    source,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn apply_opaque_whiteout(
     target_dir: &Path,
     dir_rel: &str,
+    digest: &str,
     created_in_layer: &BTreeSet<String>,
     entries_meta: &mut BTreeMap<String, EntryUnixMetadata>,
 ) -> Result<()> {
+    reject_symlink_components(target_dir, dir_rel, digest)?;
     let dir_path = if dir_rel.is_empty() {
         target_dir.to_path_buf()
     } else {
         target_dir.join(dir_rel)
     };
-    if dir_path.is_dir() {
+    let is_real_dir = match fs::symlink_metadata(&dir_path) {
+        Ok(meta) => meta.is_dir() && !meta.file_type().is_symlink(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+        Err(source) => {
+            return Err(OciError::Io {
+                operation: "stat directory for opaque whiteout",
+                path: dir_path.clone(),
+                source,
+            });
+        }
+    };
+    if is_real_dir {
         let read_dir = fs::read_dir(&dir_path).map_err(|source| OciError::Io {
             operation: "read directory for opaque whiteout",
             path: dir_path.clone(),
@@ -890,6 +957,7 @@ fn remove_metadata_subtree(entries_meta: &mut BTreeMap<String, EntryUnixMetadata
 fn ensure_parent_dirs(
     target_dir: &Path,
     parent_rel: &str,
+    digest: &str,
     entries_meta: &mut BTreeMap<String, EntryUnixMetadata>,
 ) -> Result<()> {
     if parent_rel.is_empty() {
@@ -902,17 +970,37 @@ fn ensure_parent_dirs(
         }
         acc.push_str(seg);
         let full = target_dir.join(&acc);
-        if let Ok(meta) = fs::symlink_metadata(&full)
-            && !meta.is_dir()
-        {
-            remove_path_recursive(&full)?;
-        }
-        if !full.exists() {
-            fs::create_dir(&full).map_err(|source| OciError::Io {
-                operation: "create implicit parent directory",
-                path: full.clone(),
-                source,
-            })?;
+        match fs::symlink_metadata(&full) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(OciError::UnsafePath {
+                    digest: digest.to_owned(),
+                    path: parent_rel.to_owned(),
+                    reason: "parent path traverses a symlink inside layer root",
+                });
+            }
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                remove_path_recursive(&full)?;
+                fs::create_dir(&full).map_err(|source| OciError::Io {
+                    operation: "create implicit parent directory",
+                    path: full.clone(),
+                    source,
+                })?;
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&full).map_err(|source| OciError::Io {
+                    operation: "create implicit parent directory",
+                    path: full.clone(),
+                    source,
+                })?;
+            }
+            Err(source) => {
+                return Err(OciError::Io {
+                    operation: "stat implicit parent directory",
+                    path: full,
+                    source,
+                });
+            }
         }
         set_writable_for_unpack(&full);
         entries_meta
@@ -1277,5 +1365,117 @@ fn apply_unix_metadata(
     #[cfg(not(unix))]
     {
         let _ = (path, uid, gid, mode, xattrs, is_symlink);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn append_symlink(builder: &mut tar::Builder<Vec<u8>>, link: &str, target: &str) {
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_entry_type(EntryType::Symlink);
+        hdr.set_size(0);
+        hdr.set_mode(0o777);
+        hdr.set_cksum();
+        builder.append_link(&mut hdr, link, target).unwrap();
+    }
+
+    fn append_hardlink(builder: &mut tar::Builder<Vec<u8>>, link: &str, target: &str) {
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_entry_type(EntryType::Link);
+        hdr.set_size(0);
+        hdr.set_mode(0o644);
+        hdr.set_cksum();
+        builder.append_link(&mut hdr, link, target).unwrap();
+    }
+
+    fn append_dir(builder: &mut tar::Builder<Vec<u8>>, path: &str) {
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_entry_type(EntryType::Directory);
+        hdr.set_size(0);
+        hdr.set_mode(0o755);
+        hdr.set_cksum();
+        builder.append_data(&mut hdr, path, io::empty()).unwrap();
+    }
+
+    fn append_file(builder: &mut tar::Builder<Vec<u8>>, path: &str, body: &[u8]) {
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_entry_type(EntryType::Regular);
+        hdr.set_size(body.len() as u64);
+        hdr.set_mode(0o644);
+        hdr.set_cksum();
+        builder.append_data(&mut hdr, path, body).unwrap();
+    }
+
+    #[test]
+    fn blocks_directory_creation_through_symlink_escape() {
+        let outside = TempDir::new().unwrap();
+        let layer_root = TempDir::new().unwrap();
+
+        let mut tar = tar::Builder::new(Vec::new());
+        append_symlink(&mut tar, "escape", outside.path().to_str().unwrap());
+        append_dir(&mut tar, "escape/injected_dir");
+        let bytes = tar.into_inner().unwrap();
+
+        let err = unpack_layer_into_dir(bytes.as_slice(), layer_root.path(), "sha256:test", None)
+            .unwrap_err();
+        assert!(matches!(err, OciError::UnsafePath { .. }), "got {err:?}");
+        assert!(!outside.path().join("injected_dir").exists());
+    }
+
+    #[test]
+    fn blocks_hardlink_through_symlink_escape() {
+        let outside = TempDir::new().unwrap();
+        let secret = outside.path().join("secret.txt");
+        fs::write(&secret, b"top-secret").unwrap();
+        let layer_root = TempDir::new().unwrap();
+
+        let mut tar = tar::Builder::new(Vec::new());
+        append_symlink(&mut tar, "escape", outside.path().to_str().unwrap());
+        append_hardlink(&mut tar, "stolen.txt", "escape/secret.txt");
+        let bytes = tar.into_inner().unwrap();
+
+        let err = unpack_layer_into_dir(bytes.as_slice(), layer_root.path(), "sha256:test", None)
+            .unwrap_err();
+        assert!(matches!(err, OciError::UnsafePath { .. }), "got {err:?}");
+        assert!(!layer_root.path().join("stolen.txt").exists());
+    }
+
+    #[test]
+    fn blocks_explicit_whiteout_deletion_through_symlink_escape() {
+        let outside = TempDir::new().unwrap();
+        let victim = outside.path().join("victim.txt");
+        fs::write(&victim, b"do-not-delete").unwrap();
+        let layer_root = TempDir::new().unwrap();
+
+        let mut tar = tar::Builder::new(Vec::new());
+        append_symlink(&mut tar, "escape", outside.path().to_str().unwrap());
+        append_file(&mut tar, "escape/.wh.victim.txt", b"");
+        let bytes = tar.into_inner().unwrap();
+
+        let err = unpack_layer_into_dir(bytes.as_slice(), layer_root.path(), "sha256:test", None)
+            .unwrap_err();
+        assert!(matches!(err, OciError::UnsafePath { .. }), "got {err:?}");
+        assert!(victim.exists());
+    }
+
+    #[test]
+    fn blocks_opaque_whiteout_deletion_through_symlink_escape() {
+        let outside = TempDir::new().unwrap();
+        let victim = outside.path().join("keep.txt");
+        fs::write(&victim, b"do-not-wipe").unwrap();
+        let layer_root = TempDir::new().unwrap();
+
+        let mut tar = tar::Builder::new(Vec::new());
+        append_symlink(&mut tar, "escape", outside.path().to_str().unwrap());
+        append_file(&mut tar, "escape/.wh..wh..opq", b"");
+        let bytes = tar.into_inner().unwrap();
+
+        let err = unpack_layer_into_dir(bytes.as_slice(), layer_root.path(), "sha256:test", None)
+            .unwrap_err();
+        assert!(matches!(err, OciError::UnsafePath { .. }), "got {err:?}");
+        assert!(victim.exists());
     }
 }

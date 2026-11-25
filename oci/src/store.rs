@@ -448,7 +448,10 @@ impl<B: SubvolumeBackend> ImageStore<B> {
                     uuid: info.received_uuid.unwrap_or(info.uuid),
                     ctransid: info.ctransid,
                 }),
-                Ok(None) | Err(SubvolumeError::NotBtrfs { .. }) => None,
+                Ok(None)
+                | Err(SubvolumeError::NotBtrfs { .. } | SubvolumeError::NotSubvolume { .. }) => {
+                    None
+                }
                 Err(err) => return Err(OciError::Subvolume(err)),
             },
             None => None,
@@ -576,9 +579,11 @@ impl<B: SubvolumeBackend> ImageStore<B> {
         }
         let layers_dir = self.root.join("layers");
         // Probe if backend is btrfs via subvolume_info on layers_dir before buffering a send stream.
+        // `layers_dir` is a regular directory on a btrfs mount, so `NotSubvolume` confirms btrfs
+        // is active and `receive_subvolume` should proceed; only `NotBtrfs` opts out.
         match self.backend.subvolume_info(&layers_dir).await {
             Err(SubvolumeError::NotBtrfs { .. }) => return Ok(None),
-            Ok(_) | Err(SubvolumeError::NotFound { .. }) => {}
+            Ok(_) | Err(SubvolumeError::NotFound { .. } | SubvolumeError::NotSubvolume { .. }) => {}
             Err(err) => return Err(OciError::Subvolume(err)),
         }
 
