@@ -40,14 +40,15 @@
 //! covers all the guest state the properties above allow.
 //!
 //! Every other switch happens in Rust host code, where SysV makes vector
-//! registers and k-masks caller-saved, or inside that trampoline. Fiber
-//! switches therefore save only the callee-saved GPRs. MXCSR and the x87
-//! control word are callee-saved but unchanged across a switch. x86 has no
-//! asynchronous preemption and disables swap with
-//! `SwapDisabled::NoSwapHooks`; a stack fault commits in place and never
-//! blocks a fiber. A fiber that blocked inside a fault handler on x86 (swap,
-//! #25) would be interrupted at an arbitrary instruction and would need a full
-//! XSAVE of the enabled XCR0 set.
+//! registers and k-masks caller-saved, inside the stack-limit trampoline, or
+//! inside the swap-fault trampoline (`exceptions.rs`, `exceptions.S`). Fiber
+//! switches therefore save only the callee-saved GPRs, while MXCSR and the x87
+//! control word are callee-saved and unchanged across a switch. A page fault
+//! on a swapped-out page interrupts guest code at an arbitrary instruction and
+//! suspends the fiber, so its trampoline saves every enabled `XCR0` component
+//! on the faulting fiber's stack with `XSAVE64` before entering Rust and
+//! restores it with `XRSTOR64` before `iretq`, while ordinary interrupt and
+//! exception entry keeps `FXSAVE64`/`FXRSTOR64`.
 //!
 //! XCR0 is every user state component CPUID.(0DH,0):EDX:EAX reports, not
 //! only the vector components guest code uses. Under KVM, which is the
