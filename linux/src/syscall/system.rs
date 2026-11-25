@@ -48,6 +48,53 @@ pub trait System {
         self.cpu_nanos()
     }
 
+    /// Kernel/system CPU time for the calling thread in nanoseconds (`getrusage(RUSAGE_THREAD)`).
+    fn thread_sys_nanos(&self) -> u64 {
+        0
+    }
+
+    /// Kernel/system CPU time across every thread of the process in nanoseconds
+    /// (`times(2)` and `getrusage(RUSAGE_SELF)`).
+    fn process_sys_nanos(&self) -> u64 {
+        0
+    }
+
+    /// Peak resident set size of this process in KiB (`ru_maxrss` in `getrusage(2)`).
+    fn max_rss_kib(&self) -> u64 {
+        0
+    }
+
+    /// Checks container-level authority for `syslog(2)` (`klogctl`), returning
+    /// `Err(Denied)` when the container does not hold diagnostic/syslog rights.
+    fn syslog_check_authority(&self) -> Result<(), Denied> {
+        Ok(())
+    }
+
+    /// Capacity of the kernel log ring in bytes (`SYSLOG_ACTION_SIZE_BUFFER`).
+    fn syslog_buffer_size(&self) -> usize {
+        65_536
+    }
+
+    /// Unread bytes currently available in the kernel log ring (`SYSLOG_ACTION_SIZE_UNREAD`).
+    fn syslog_unread_size(&self) -> usize {
+        0
+    }
+
+    /// Reads up to `max_bytes` from the kernel log ring (`SYSLOG_ACTION_READ*`).
+    fn syslog_read(
+        &mut self,
+        _all: bool,
+        _clear: bool,
+        _max_bytes: usize,
+    ) -> Result<Vec<u8>, Denied> {
+        Ok(Vec::new())
+    }
+
+    /// Clears the kernel log ring read cursor (`SYSLOG_ACTION_CLEAR`).
+    fn syslog_clear(&mut self) -> Result<(), Denied> {
+        Ok(())
+    }
+
     /// Online processors available to this process (`sched_getaffinity`).
     fn processor_count(&self) -> u32 {
         1
@@ -308,6 +355,7 @@ pub const CAP_SYS_RESOURCE: u32 = 24;
 pub const CAP_SYS_TIME: u32 = 25;
 pub const CAP_MKNOD: u32 = 27;
 pub const CAP_SETFCAP: u32 = 31;
+pub const CAP_SYSLOG: u32 = 34;
 pub const CAP_LAST_CAP: u32 = 40;
 pub const CAP_FULL_SET: u64 = (1u64 << (CAP_LAST_CAP + 1)) - 1;
 
@@ -548,6 +596,39 @@ impl Default for Start {
     }
 }
 
+/// Accumulated CPU and peak-RSS accounting for `times(2)`, `getrusage(2)`,
+/// `wait4(2)`, and `waitid(2)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuUsage {
+    pub user_nanos: u64,
+    pub sys_nanos: u64,
+    pub max_rss_kib: u64,
+}
+
+impl CpuUsage {
+    pub fn accumulate(&mut self, child: Self) {
+        self.user_nanos = self.user_nanos.saturating_add(child.user_nanos);
+        self.sys_nanos = self.sys_nanos.saturating_add(child.sys_nanos);
+        self.max_rss_kib = self.max_rss_kib.max(child.max_rss_kib);
+    }
+
+    /// Encodes LP64 `struct rusage` (`include/uapi/linux/resource.h`, 144 bytes,
+    /// identical on x86-64 and aarch64).
+    pub fn encode_rusage(self) -> [u8; 144] {
+        let mut out = [0u8; 144];
+        let u_sec = (self.user_nanos / NANOS_PER_SECOND) as i64;
+        let u_usec = ((self.user_nanos % NANOS_PER_SECOND) / 1_000) as i64;
+        let s_sec = (self.sys_nanos / NANOS_PER_SECOND) as i64;
+        let s_usec = ((self.sys_nanos % NANOS_PER_SECOND) / 1_000) as i64;
+        out[0..8].copy_from_slice(&u_sec.to_le_bytes());
+        out[8..16].copy_from_slice(&u_usec.to_le_bytes());
+        out[16..24].copy_from_slice(&s_sec.to_le_bytes());
+        out[24..32].copy_from_slice(&s_usec.to_le_bytes());
+        out[32..40].copy_from_slice(&(self.max_rss_kib as i64).to_le_bytes());
+        out
+    }
+}
+
 /// The process-wide state these calls read and change, apart from the
 /// descriptor table whose limit is `RLIMIT_NOFILE`'s soft value.
 #[derive(Clone, Debug)]
@@ -555,7 +636,9 @@ pub(super) struct Attributes {
     values: [Rlimit; 16],
     open_files_ceiling: u64,
     pub(super) umask: u32,
-    nice: i32,
+    pub(super) nice: i32,
+    pub(super) personality: u32,
+    pub(super) dumpable: u8,
 }
 
 impl Attributes {
@@ -604,6 +687,8 @@ impl Attributes {
             // fs/fs_struct.c `init_fs`.
             umask: 0o022,
             nice: 0,
+            personality: 0, // PER_LINUX
+            dumpable: 1,    // SUID_DUMP_USER
         }
     }
 }
@@ -1432,15 +1517,60 @@ impl<R: Resources> Process<R> {
     }
 
     /// `prctl(option, arg2, arg3, arg4, arg5)` (`kernel/sys.c` `sys_prctl`,
-    /// Linux v6.12). Supports `PR_SET_NO_NEW_PRIVS` (38) and
-    /// `PR_GET_NO_NEW_PRIVS` (39); other options return `EINVAL`.
-    pub(super) fn prctl(&mut self, args: [u64; 6]) -> u64 {
+    /// Linux v6.12).
+    pub(super) fn prctl<M: UserMemory>(&mut self, args: [u64; 6], memory: &mut M) -> u64 {
         // `include/uapi/linux/prctl.h`, Linux v6.12.
+        const PR_SET_PDEATHSIG: i32 = 1;
+        const PR_GET_PDEATHSIG: i32 = 2;
+        const PR_GET_DUMPABLE: i32 = 3;
+        const PR_SET_DUMPABLE: i32 = 4;
         const PR_GET_KEEPCAPS: i32 = 7;
         const PR_SET_KEEPCAPS: i32 = 8;
+        const PR_SET_NAME: i32 = 15;
+        const PR_GET_NAME: i32 = 16;
+        const PR_CAPBSET_READ: i32 = 23;
+        const PR_CAPBSET_DROP: i32 = 24;
+        const PR_SET_CHILD_SUBREAPER: i32 = 36;
+        const PR_GET_CHILD_SUBREAPER: i32 = 37;
         const PR_SET_NO_NEW_PRIVS: i32 = 38;
         const PR_GET_NO_NEW_PRIVS: i32 = 39;
+        const PR_CAP_AMBIENT: i32 = 47;
+
+        const PR_CAP_AMBIENT_IS_SET: u64 = 1;
+        const PR_CAP_AMBIENT_RAISE: u64 = 2;
+        const PR_CAP_AMBIENT_LOWER: u64 = 3;
+        const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
+
         match args[0] as u32 as i32 {
+            PR_SET_PDEATHSIG => {
+                let raw = args[1];
+                let sig = if raw == 0 {
+                    None
+                } else {
+                    match u8::try_from(raw).ok().and_then(Signal::new) {
+                        Some(sig) => Some(sig),
+                        None => return errno(EINVAL),
+                    }
+                };
+                self.shared.pids.set_pdeathsig(self.pid(), sig);
+                0
+            }
+            PR_GET_PDEATHSIG => {
+                let val: i32 = self
+                    .shared
+                    .pids
+                    .get_pdeathsig(self.pid())
+                    .map_or(0, |s| i32::from(s.raw()));
+                write_result(memory, args[1], &val.to_le_bytes())
+            }
+            PR_GET_DUMPABLE => u64::from(self.shared.attributes.lock().dumpable),
+            PR_SET_DUMPABLE => {
+                if args[1] != 0 && args[1] != 1 {
+                    return errno(EINVAL);
+                }
+                self.shared.attributes.lock().dumpable = args[1] as u8;
+                0
+            }
             PR_GET_KEEPCAPS => u64::from(self.credentials.lock().keep_caps),
             PR_SET_KEEPCAPS => {
                 if args[1] != 0 && args[1] != 1 {
@@ -1448,6 +1578,58 @@ impl<R: Resources> Process<R> {
                 }
                 self.credentials.lock().keep_caps = args[1] == 1;
                 0
+            }
+            PR_SET_NAME => {
+                let mut comm = [0u8; 16];
+                for (i, slot) in comm[..15].iter_mut().enumerate() {
+                    let mut byte = [0u8; 1];
+                    if memory
+                        .read(args[1].wrapping_add(i as u64), &mut byte)
+                        .is_err()
+                    {
+                        return errno(EFAULT);
+                    }
+                    if byte[0] == 0 {
+                        break;
+                    }
+                    *slot = byte[0];
+                }
+                self.sched.lock().comm = comm;
+                0
+            }
+            PR_GET_NAME => {
+                let comm = self.sched.lock().comm;
+                write_result(memory, args[1], &comm)
+            }
+            PR_CAPBSET_READ => {
+                let cap = args[1];
+                if cap > u64::from(CAP_LAST_CAP) {
+                    return errno(EINVAL);
+                }
+                let set = self.credentials.lock().capabilities.bounding;
+                u64::from((set & (1u64 << cap)) != 0)
+            }
+            PR_CAPBSET_DROP => {
+                let cap = args[1];
+                if cap > u64::from(CAP_LAST_CAP) {
+                    return errno(EINVAL);
+                }
+                let mut creds = self.credentials.lock();
+                if !creds.capabilities.has_effective(CAP_SETPCAP) {
+                    return errno(EPERM);
+                }
+                creds.capabilities.bounding &= !(1u64 << cap);
+                0
+            }
+            PR_SET_CHILD_SUBREAPER => {
+                self.shared
+                    .pids
+                    .set_child_subreaper(self.pid(), args[1] != 0);
+                0
+            }
+            PR_GET_CHILD_SUBREAPER => {
+                let val: i32 = i32::from(self.shared.pids.get_child_subreaper(self.pid()));
+                write_result(memory, args[1], &val.to_le_bytes())
             }
             PR_SET_NO_NEW_PRIVS => {
                 if args[1] != 1 || args[2] != 0 || args[3] != 0 || args[4] != 0 {
@@ -1462,7 +1644,204 @@ impl<R: Resources> Process<R> {
                 }
                 u64::from(self.credentials.lock().no_new_privs)
             }
+            PR_CAP_AMBIENT => match args[1] {
+                PR_CAP_AMBIENT_IS_SET => {
+                    if args[3] != 0 || args[4] != 0 || args[2] > u64::from(CAP_LAST_CAP) {
+                        return errno(EINVAL);
+                    }
+                    let amb = self.credentials.lock().capabilities.ambient;
+                    u64::from((amb & (1u64 << args[2])) != 0)
+                }
+                PR_CAP_AMBIENT_RAISE => {
+                    if args[3] != 0 || args[4] != 0 || args[2] > u64::from(CAP_LAST_CAP) {
+                        return errno(EINVAL);
+                    }
+                    let bit = 1u64 << args[2];
+                    let mut creds = self.credentials.lock();
+                    if (creds.capabilities.permitted & bit) == 0
+                        || (creds.capabilities.inheritable & bit) == 0
+                    {
+                        return errno(EPERM);
+                    }
+                    creds.capabilities.ambient |= bit;
+                    0
+                }
+                PR_CAP_AMBIENT_LOWER => {
+                    if args[3] != 0 || args[4] != 0 || args[2] > u64::from(CAP_LAST_CAP) {
+                        return errno(EINVAL);
+                    }
+                    self.credentials.lock().capabilities.ambient &= !(1u64 << args[2]);
+                    0
+                }
+                PR_CAP_AMBIENT_CLEAR_ALL => {
+                    if args[2] != 0 || args[3] != 0 || args[4] != 0 {
+                        return errno(EINVAL);
+                    }
+                    self.credentials.lock().capabilities.ambient = 0;
+                    0
+                }
+                _ => errno(EINVAL),
+            },
             _ => errno(EINVAL),
         }
+    }
+
+    /// `personality(persona)` (`kernel/exec_domain.c`).
+    pub(super) fn personality(&mut self, args: [u64; 6]) -> u64 {
+        const PER_MASK: u32 = 0x00ff;
+        const QUERY_PERSONA: u32 = 0xffff_ffff;
+        let requested = args[0] as u32;
+        let mut attrs = self.shared.attributes.lock();
+        let previous = attrs.personality;
+        if requested == QUERY_PERSONA {
+            return u64::from(previous);
+        }
+        // Only `PER_LINUX` (0x00) execution domain is supported; harmless flag
+        // bits (e.g. `ADDR_NO_RANDOMIZE`, `UNAME26`, `READ_IMPLIES_EXEC`, etc.)
+        // are accepted.
+        if (requested & PER_MASK) != 0 {
+            return errno(EINVAL);
+        }
+        attrs.personality = requested;
+        u64::from(previous)
+    }
+}
+
+/// `times(buf)` (`kernel/sys.c`, `USER_HZ = 100`).
+pub(super) fn times<R: Resources, M: UserMemory, O: Clock + System>(
+    process: &Process<R>,
+    args: [u64; 6],
+    memory: &mut M,
+    output: &O,
+) -> u64 {
+    // Linux `USER_HZ = 100` -> 10_000_000 ns per tick.
+    const NANOS_PER_USER_TICK: u64 = NANOS_PER_SECOND / 100;
+    let buf = args[0];
+    if buf != 0 {
+        let utime = (output.process_cpu_nanos() / NANOS_PER_USER_TICK) as i64;
+        let stime = (output.process_sys_nanos() / NANOS_PER_USER_TICK) as i64;
+        let children = *process.shared.children_usage.lock();
+        let cutime = (children.user_nanos / NANOS_PER_USER_TICK) as i64;
+        let cstime = (children.sys_nanos / NANOS_PER_USER_TICK) as i64;
+        let mut out = [0u8; 32];
+        out[0..8].copy_from_slice(&utime.to_le_bytes());
+        out[8..16].copy_from_slice(&stime.to_le_bytes());
+        out[16..24].copy_from_slice(&cutime.to_le_bytes());
+        out[24..32].copy_from_slice(&cstime.to_le_bytes());
+        if memory.write(buf, &out).is_err() {
+            return errno(EFAULT);
+        }
+    }
+    output.now_nanos() / NANOS_PER_USER_TICK
+}
+
+/// `getrusage(who, usage)` (`kernel/sys.c`, `include/uapi/linux/resource.h`).
+pub(super) fn getrusage<R: Resources, M: UserMemory, O: System>(
+    process: &Process<R>,
+    args: [u64; 6],
+    memory: &mut M,
+    output: &O,
+) -> u64 {
+    const RUSAGE_SELF: i32 = 0;
+    const RUSAGE_CHILDREN: i32 = -1;
+    const RUSAGE_THREAD: i32 = 1;
+    let who = args[0] as u32 as i32;
+    let usage = match who {
+        RUSAGE_SELF => CpuUsage {
+            user_nanos: output.process_cpu_nanos(),
+            sys_nanos: output.process_sys_nanos(),
+            max_rss_kib: output.max_rss_kib(),
+        },
+        RUSAGE_CHILDREN => *process.shared.children_usage.lock(),
+        RUSAGE_THREAD => CpuUsage {
+            user_nanos: output.cpu_nanos(),
+            sys_nanos: output.thread_sys_nanos(),
+            max_rss_kib: output.max_rss_kib(),
+        },
+        _ => return errno(EINVAL),
+    };
+    write_result(memory, args[1], &usage.encode_rusage())
+}
+
+/// `syslog(type, bufp, len)` (`kernel/printk/printk.c` `do_syslog`).
+pub(super) fn syslog<R: Resources, M: UserMemory, O: System>(
+    process: &Process<R>,
+    args: [u64; 6],
+    memory: &mut M,
+    output: &mut O,
+) -> u64 {
+    const SYSLOG_ACTION_CLOSE: i32 = 0;
+    const SYSLOG_ACTION_OPEN: i32 = 1;
+    const SYSLOG_ACTION_READ: i32 = 2;
+    const SYSLOG_ACTION_READ_ALL: i32 = 3;
+    const SYSLOG_ACTION_READ_CLEAR: i32 = 4;
+    const SYSLOG_ACTION_CLEAR: i32 = 5;
+    const SYSLOG_ACTION_CONSOLE_OFF: i32 = 6;
+    const SYSLOG_ACTION_CONSOLE_ON: i32 = 7;
+    const SYSLOG_ACTION_CONSOLE_LEVEL: i32 = 8;
+    const SYSLOG_ACTION_SIZE_UNREAD: i32 = 9;
+    const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;
+
+    let action = args[0] as u32 as i32;
+    let buf_ptr = args[1];
+    let len = args[2] as u32 as i32;
+
+    if !(SYSLOG_ACTION_CLOSE..=SYSLOG_ACTION_SIZE_BUFFER).contains(&action) {
+        return errno(EINVAL);
+    }
+
+    let has_cap = {
+        let caps = process.credentials.lock().capabilities;
+        caps.has_effective(CAP_SYSLOG) || caps.has_effective(CAP_SYS_ADMIN)
+    };
+    if !has_cap || output.syslog_check_authority().is_err() {
+        return errno(EPERM);
+    }
+
+    match action {
+        SYSLOG_ACTION_CLOSE
+        | SYSLOG_ACTION_OPEN
+        | SYSLOG_ACTION_CONSOLE_OFF
+        | SYSLOG_ACTION_CONSOLE_ON => 0,
+        SYSLOG_ACTION_CONSOLE_LEVEL => {
+            if !(1..=8).contains(&len) {
+                return errno(EINVAL);
+            }
+            0
+        }
+        SYSLOG_ACTION_SIZE_BUFFER => output.syslog_buffer_size() as u64,
+        SYSLOG_ACTION_SIZE_UNREAD => output.syslog_unread_size() as u64,
+        SYSLOG_ACTION_CLEAR => match output.syslog_clear() {
+            Ok(()) => 0,
+            Err(Denied) => errno(EPERM),
+        },
+        SYSLOG_ACTION_READ | SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR => {
+            if len < 0 {
+                return errno(EINVAL);
+            }
+            if len == 0 {
+                return 0;
+            }
+            if buf_ptr == 0 {
+                return errno(EINVAL);
+            }
+            let max_bytes = len as usize;
+            if memory.check_writable(buf_ptr, max_bytes).is_err() {
+                return errno(EFAULT);
+            }
+            let all = matches!(action, SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR);
+            let clear = action == SYSLOG_ACTION_READ_CLEAR;
+            match output.syslog_read(all, clear, max_bytes) {
+                Ok(data) => {
+                    let count = data.len().min(max_bytes);
+                    if count > 0 && memory.write(buf_ptr, &data[..count]).is_err() {
+                        return errno(EFAULT);
+                    }
+                    count as u64
+                }
+                Err(Denied) => errno(EPERM),
+            }
+        }
+        _ => errno(EINVAL),
     }
 }

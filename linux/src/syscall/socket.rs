@@ -12,11 +12,13 @@ use bytes::Bytes;
 use core::future::Future;
 use helios_hal::fs::WritePosition;
 use helios_unix::{
-    OwnedPacketSocket, OwnedTcpListener, OwnedTcpStream, OwnedUdpSocket, OwnedVsockStream,
-    PairRecvError, Socket, SocketFamily, SocketFlag, SocketKind, SocketNetwork, SocketOptionError,
-    SocketSize, SocketTime, TcpSocket, TransportProtocol, UdpSocket, VsockSocket,
+    OwnedIcmpSocket, OwnedPacketSocket, OwnedTcpListener, OwnedTcpStream, OwnedUdpSocket,
+    OwnedVsockStream, PairRecvError, Socket, SocketFamily, SocketFlag, SocketKind, SocketNetwork,
+    SocketOptionError, SocketSize, SocketTime, TcpSocket, TransportProtocol, UdpSocket,
+    VsockSocket,
 };
 
+use super::icmp::{self, IPPROTO_ICMP, IPPROTO_ICMPV6, IcmpDatagram};
 use super::io::descriptor_errno;
 use super::netlink::{self, AF_NETLINK, NETLINK_ROUTE};
 use super::packet::{self, AF_PACKET, SockaddrLl};
@@ -49,6 +51,7 @@ const IPPROTO_IPV6: i32 = 41;
 // Linux UAPI `MSG_*` flags (`include/linux/socket.h`).
 const MSG_OOB: u32 = 0x01;
 pub(crate) const MSG_PEEK: u32 = 0x02;
+const MSG_CTRUNC: u32 = 0x08;
 pub(crate) const MSG_TRUNC: u32 = 0x20;
 pub(crate) const MSG_DONTWAIT: u32 = 0x40;
 const MSG_WAITALL: u32 = 0x100;
@@ -79,6 +82,7 @@ const SO_SNDLOWAT: i32 = 19;
 const SO_RCVTIMEO: i32 = 20;
 const SO_SNDTIMEO: i32 = 21;
 const SO_BINDTODEVICE: i32 = 25;
+const SO_TIMESTAMP: i32 = 29;
 const SO_ACCEPTCONN: i32 = 30;
 const SO_PROTOCOL: i32 = 38;
 const SO_DOMAIN: i32 = 39;
@@ -88,17 +92,24 @@ const PACKET_AUXDATA: i32 = 8;
 
 const TCP_NODELAY: i32 = 1;
 
+const IP_TOS: i32 = 1;
 const IP_TTL: i32 = 2;
+const IP_RECVTTL: i32 = 12;
 const IP_MULTICAST_TTL: i32 = 33;
 const IP_MULTICAST_LOOP: i32 = 34;
 const IP_ADD_MEMBERSHIP: i32 = 35;
 const IP_DROP_MEMBERSHIP: i32 = 36;
 
+const IPV6_CHECKSUM: i32 = 7;
 const IPV6_UNICAST_HOPS: i32 = 16;
 const IPV6_MULTICAST_LOOP: i32 = 19;
 const IPV6_ADD_MEMBERSHIP: i32 = 20;
 const IPV6_DROP_MEMBERSHIP: i32 = 21;
 const IPV6_V6ONLY: i32 = 26;
+const IPV6_RECVHOPLIMIT: i32 = 51;
+const IPV6_HOPLIMIT: i32 = 52;
+
+const ICMP6_FILTER: i32 = 1;
 
 // Linux errno values (`include/uapi/asm-generic/errno.h`).
 pub const EAGAIN: u64 = 11;
@@ -596,6 +607,63 @@ pub trait Network<N: SocketNetwork> {
         let _ = stream;
         core::future::ready(Err(EOPNOTSUPP))
     }
+
+    fn check_icmp_open(&self, is_raw: bool) -> Result<(), u64> {
+        let _ = is_raw;
+        Err(ENETDOWN)
+    }
+
+    fn icmp_open(
+        &self,
+        family: SocketFamily,
+        is_raw: bool,
+    ) -> Result<(Arc<OwnedIcmpSocket<N>>, u16), u64> {
+        let _ = (family, is_raw);
+        Err(ENETDOWN)
+    }
+
+    fn icmp_bind(&self, socket: u64, requested_id: u16) -> Result<u16, u64> {
+        let _ = (socket, requested_id);
+        Err(ENETDOWN)
+    }
+
+    fn icmp_send<'a>(
+        &'a self,
+        socket: u64,
+        destination: IpAddr,
+        identifier: u16,
+        sequence: u16,
+        payload: &'a [u8],
+        hop_limit: u8,
+    ) -> impl Future<Output = Result<(), u64>> + Send + 'a {
+        let _ = (
+            socket,
+            destination,
+            identifier,
+            sequence,
+            payload,
+            hop_limit,
+        );
+        core::future::ready(Err(ENETDOWN))
+    }
+
+    fn icmp_receive(
+        &self,
+        socket: u64,
+        timeout_nanos: u64,
+        peek: bool,
+    ) -> impl Future<Output = Result<Option<IcmpDatagram>, u64>> + Send + '_ {
+        let _ = (socket, timeout_nanos, peek);
+        core::future::ready(Err(ENETDOWN))
+    }
+
+    fn icmp_readiness(
+        &self,
+        socket: u64,
+    ) -> impl Future<Output = Result<SocketReady, u64>> + Send + '_ {
+        let _ = socket;
+        core::future::ready(Err(ENETDOWN))
+    }
 }
 
 fn get_socket<R: Resources>(
@@ -839,22 +907,48 @@ pub(crate) fn socket<R: Resources, Net: Network<R::Network>>(
                     Socket::<R::Network>::tcp(family)
                 }
                 SOCK_DGRAM => {
-                    if protocol != 0 && protocol != IPPROTO_UDP {
-                        return errno(EPROTONOSUPPORT);
+                    let is_icmp = (family == SocketFamily::Ipv4 && protocol == IPPROTO_ICMP)
+                        || (family == SocketFamily::Ipv6 && protocol == IPPROTO_ICMPV6);
+                    if is_icmp {
+                        if let Err(err) = net.check_icmp_open(false) {
+                            return errno(err);
+                        }
+                        let (handle, local_id) = match net.icmp_open(family, false) {
+                            Ok(opened) => opened,
+                            Err(err) => return errno(err),
+                        };
+                        Socket::<R::Network>::icmp(family, false, protocol, handle, local_id)
+                    } else {
+                        if protocol != 0 && protocol != IPPROTO_UDP {
+                            return errno(EPROTONOSUPPORT);
+                        }
+                        if let Err(err) = net.check_udp_open() {
+                            return errno(err);
+                        }
+                        Socket::<R::Network>::udp(family)
                     }
-                    if let Err(err) = net.check_udp_open() {
-                        return errno(err);
-                    }
-                    Socket::<R::Network>::udp(family)
                 }
                 SOCK_RAW => {
                     if !ctx.cap_net_raw {
                         return errno(EPERM);
                     }
-                    if !(0..=255).contains(&protocol) {
-                        return errno(EPROTONOSUPPORT);
+                    let is_icmp = (family == SocketFamily::Ipv4 && protocol == IPPROTO_ICMP)
+                        || (family == SocketFamily::Ipv6 && protocol == IPPROTO_ICMPV6);
+                    if is_icmp {
+                        if let Err(err) = net.check_icmp_open(true) {
+                            return errno(err);
+                        }
+                        let (handle, local_id) = match net.icmp_open(family, true) {
+                            Ok(opened) => opened,
+                            Err(err) => return errno(err),
+                        };
+                        Socket::<R::Network>::icmp(family, true, protocol, handle, local_id)
+                    } else {
+                        if !(0..=255).contains(&protocol) {
+                            return errno(EPROTONOSUPPORT);
+                        }
+                        Socket::<R::Network>::raw_ip(family, protocol)
                     }
-                    Socket::<R::Network>::raw_ip(family, protocol)
                 }
                 _ => return errno(EINVAL),
             }
@@ -1013,6 +1107,13 @@ pub(crate) async fn bind<R: Resources, M: UserMemory, Net: Network<R::Network>>(
     }) else {
         return errno(EAFNOSUPPORT);
     };
+
+    if sock.is_icmp() {
+        return match icmp::bind(&sock, target, net) {
+            Ok(()) => 0,
+            Err(err) => errno(err),
+        };
+    }
 
     if let Some(udp) = sock.udp_state() {
         let UdpSocket::Unbound { family, options } = udp else {
@@ -1305,6 +1406,13 @@ pub(crate) async fn connect<R: Resources, M: UserMemory, Net: Network<R::Network
         Err(err) => return errno(err),
     };
 
+    if sock.is_icmp() {
+        return match icmp::connect(&sock, parsed, net) {
+            Ok(()) => 0,
+            Err(err) => errno(err),
+        };
+    }
+
     if let Some(udp) = sock.udp_state() {
         let Some(remote) = parsed else {
             // `connect(..., AF_UNSPEC)` dissolves a UDP association.
@@ -1489,6 +1597,14 @@ pub(crate) async fn getsockname<R: Resources, M: UserMemory, Net: Network<R::Net
             Err(err) => errno(err),
         };
     }
+    if sock.is_icmp() {
+        return match icmp::getsockname(&sock, net)
+            .and_then(|addr| write_sockaddr(memory, addr_ptr, addrlen_ptr, addr))
+        {
+            Ok(()) => 0,
+            Err(err) => errno(err),
+        };
+    }
     if let Some(vsock) = sock.vsock_state() {
         let (cid, port) = match vsock {
             VsockSocket::Listening {
@@ -1577,6 +1693,14 @@ pub(crate) async fn getpeername<R: Resources, M: UserMemory, Net: Network<R::Net
     };
     if sock.is_pair() {
         return match write_sockaddr_bytes(memory, addr_ptr, addrlen_ptr, &AF_UNIX.to_le_bytes()) {
+            Ok(()) => 0,
+            Err(err) => errno(err),
+        };
+    }
+    if sock.is_icmp() {
+        return match icmp::getpeername(&sock, net)
+            .and_then(|addr| write_sockaddr(memory, addr_ptr, addrlen_ptr, addr))
+        {
             Ok(()) => 0,
             Err(err) => errno(err),
         };
@@ -1672,6 +1796,10 @@ pub(crate) async fn socket_send<N: SocketNetwork, Net: Network<N>>(
         Some(_) => return Err(EAFNOSUPPORT),
         None => None,
     };
+
+    if sock.is_icmp() {
+        return icmp::send(sock, &data, dest, net).await;
+    }
 
     if let Some(writer) = sock.pair_writer() {
         if dest.is_some() {
@@ -1821,6 +1949,7 @@ pub(crate) struct RecvResult {
     pub peer: Option<RecvPeer>,
     pub full_len: usize,
     pub truncated: bool,
+    pub icmp_ttl: Option<u8>,
 }
 
 /// Core receive routine shared by `read`, `recvfrom`, `recvmsg`, `recvmmsg`
@@ -1850,6 +1979,7 @@ async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
             peer: None,
             full_len: 0,
             truncated: false,
+            icmp_ttl: None,
         });
     }
     let nonblocking = sock.is_nonblocking() || (flags & MSG_DONTWAIT != 0);
@@ -1864,6 +1994,7 @@ async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
             peer: Some(RecvPeer::Netlink { pid: 0, groups: 0 }),
             full_len: orig_len,
             truncated,
+            icmp_ttl: None,
         });
     }
 
@@ -1881,6 +2012,25 @@ async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
             peer: Some(RecvPeer::Packet(sll)),
             full_len: orig_len,
             truncated,
+            icmp_ttl: None,
+        });
+    }
+
+    if sock.is_icmp() {
+        let options = sock.options();
+        let timeout = effective_timeout_bounded(
+            options.time(SocketTime::ReceiveTimeout),
+            nonblocking,
+            timeout_bound,
+        );
+        let (data, peer, full_len, ttl) = icmp::recv(sock, max_len, timeout, peek, net).await?;
+        let truncated = full_len > data.len();
+        return Ok(RecvResult {
+            data,
+            peer: Some(RecvPeer::Inet(peer)),
+            full_len,
+            truncated,
+            icmp_ttl: Some(ttl),
         });
     }
 
@@ -1891,6 +2041,7 @@ async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
                 peer: None,
                 full_len: 0,
                 truncated: false,
+                icmp_ttl: None,
             });
         }
         let mut received = Vec::new();
@@ -1923,6 +2074,7 @@ async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
             peer: None,
             full_len: len,
             truncated: false,
+            icmp_ttl: None,
         });
     }
 
@@ -1949,6 +2101,7 @@ async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
                 peer: None,
                 full_len: 0,
                 truncated: false,
+                icmp_ttl: None,
             });
         }
         let timeout = effective_timeout_bounded(
@@ -1991,6 +2144,7 @@ async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
             peer: None,
             full_len: len,
             truncated: false,
+            icmp_ttl: None,
         });
     }
 
@@ -2010,6 +2164,7 @@ async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
                 peer: None,
                 full_len: 0,
                 truncated: false,
+                icmp_ttl: None,
             });
         }
         let timeout = effective_timeout_bounded(
@@ -2051,6 +2206,7 @@ async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
             peer: None,
             full_len: len,
             truncated: false,
+            icmp_ttl: None,
         });
     }
 
@@ -2080,6 +2236,7 @@ async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
                     peer: Some(RecvPeer::Inet(peer)),
                     full_len: original_len,
                     truncated,
+                    icmp_ttl: None,
                 });
             }
             Ok(None) => return Err(EAGAIN),
@@ -2217,6 +2374,8 @@ struct MsgHdr {
     msg_namelen: u32,
     msg_iov: u64,
     msg_iovlen: usize,
+    msg_control: u64,
+    msg_controllen: u64,
     msg_flags: u32,
 }
 
@@ -2230,12 +2389,16 @@ fn read_msghdr<M: UserMemory>(memory: &M, ptr: u64) -> Result<MsgHdr, u64> {
     if raw_iovlen > UIO_MAXIOV as u64 {
         return Err(EMSGSIZE);
     }
+    let msg_control = u64::from_le_bytes(raw[32..40].try_into().unwrap());
+    let msg_controllen = u64::from_le_bytes(raw[40..48].try_into().unwrap());
     let msg_flags = u32::from_le_bytes(raw[48..52].try_into().unwrap());
     Ok(MsgHdr {
         msg_name,
         msg_namelen,
         msg_iov,
         msg_iovlen: raw_iovlen as usize,
+        msg_control,
+        msg_controllen,
         msg_flags,
     })
 }
@@ -2356,13 +2519,36 @@ async fn recvmsg_one<N: SocketNetwork, M: UserMemory, Net: Network<N>>(
     } else {
         0
     };
-    let out_flags = if result.truncated { MSG_TRUNC } else { 0 };
-    // Write back `msg_namelen`, `msg_controllen = 0`, and `msg_flags`.
+    let mut out_flags = if result.truncated { MSG_TRUNC } else { 0 };
+    let mut out_controllen = 0u64;
+    if let (Some(ttl), Some(icmp_state)) = (result.icmp_ttl, sock.icmp_state())
+        && icmp_state.recv_ttl
+        && hdr.msg_control != 0
+    {
+        const CMSG_LEN_I32: u64 = 20;
+        const CMSG_SPACE_I32: u64 = 24;
+        if hdr.msg_controllen >= CMSG_SPACE_I32 {
+            let (level, ty) = match icmp_state.family {
+                SocketFamily::Ipv4 => (IPPROTO_IP, IP_TTL),
+                SocketFamily::Ipv6 => (IPPROTO_IPV6, IPV6_HOPLIMIT),
+            };
+            let mut cmsg = [0u8; 24];
+            cmsg[0..8].copy_from_slice(&CMSG_LEN_I32.to_le_bytes());
+            cmsg[8..12].copy_from_slice(&level.to_le_bytes());
+            cmsg[12..16].copy_from_slice(&ty.to_le_bytes());
+            cmsg[16..20].copy_from_slice(&i32::from(ttl).to_le_bytes());
+            memory.write(hdr.msg_control, &cmsg).map_err(|_| EFAULT)?;
+            out_controllen = CMSG_SPACE_I32;
+        } else {
+            out_flags |= MSG_CTRUNC;
+        }
+    }
+    // Write back `msg_namelen`, `msg_controllen`, and `msg_flags`.
     memory
         .write(msg_ptr + 8, &out_namelen.to_le_bytes())
         .map_err(|_| EFAULT)?;
     memory
-        .write(msg_ptr + 40, &0u64.to_le_bytes())
+        .write(msg_ptr + 40, &out_controllen.to_le_bytes())
         .map_err(|_| EFAULT)?;
     memory
         .write(msg_ptr + 48, &out_flags.to_le_bytes())
@@ -2621,6 +2807,19 @@ pub(crate) async fn shutdown<R: Resources, Net: Network<R::Network>>(
 
     if let Some(udp) = sock.udp_state() {
         if !matches!(udp, UdpSocket::Bound { peer: Some(_), .. }) {
+            return errno(ENOTCONN);
+        }
+        if shut_rd {
+            sock.mark_shutdown_read();
+        }
+        if shut_wr {
+            sock.mark_shutdown_write();
+        }
+        return 0;
+    }
+
+    if let Some(icmp_state) = sock.icmp_state() {
+        if icmp_state.peer.is_none() {
             return errno(ENOTCONN);
         }
         if shut_rd {
@@ -3043,6 +3242,9 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
                         let _ = sock.with_packet_mut(|p| p.ifindex = ifindex);
                         return 0;
                     }
+                    if sock.is_icmp() {
+                        return 0;
+                    }
                     return errno(EOPNOTSUPP);
                 }
             };
@@ -3057,6 +3259,46 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
             } else {
                 0
             }
+        }
+        (IPPROTO_IP, IP_RECVTTL) if sock.is_icmp() => {
+            let val = match read_opt_i32(memory, optval, optlen) {
+                Ok(v) => v != 0,
+                Err(err) => return errno(err),
+            };
+            let _ = sock.with_icmp_mut(|slot| slot.recv_ttl = val);
+            0
+        }
+        (IPPROTO_IPV6, IPV6_RECVHOPLIMIT) if sock.is_icmp() => {
+            let val = match read_opt_i32(memory, optval, optlen) {
+                Ok(v) => v != 0,
+                Err(err) => return errno(err),
+            };
+            let _ = sock.with_icmp_mut(|slot| slot.recv_ttl = val);
+            0
+        }
+        (IPPROTO_IP, IP_TOS) => match read_opt_i32_or_u8(memory, optval, optlen) {
+            Ok(_) => 0,
+            Err(err) => errno(err),
+        },
+        (SOL_SOCKET, SO_TIMESTAMP) => match read_opt_i32(memory, optval, optlen) {
+            Ok(_) => 0,
+            Err(err) => errno(err),
+        },
+        (IPPROTO_IPV6, IPV6_CHECKSUM) if sock.is_icmp() => {
+            match read_opt_i32(memory, optval, optlen) {
+                Ok(_) => 0,
+                Err(err) => errno(err),
+            }
+        }
+        (IPPROTO_ICMPV6, ICMP6_FILTER) if sock.is_icmp() => {
+            if optlen > 0
+                && memory
+                    .read(optval, &mut vec![0u8; (optlen as usize).min(64)])
+                    .is_err()
+            {
+                return errno(EFAULT);
+            }
+            0
         }
         (SOL_PACKET, PACKET_AUXDATA) if sock.is_packet() => {
             let val = match read_opt_i32(memory, optval, optlen) {
@@ -3250,6 +3492,8 @@ pub(crate) async fn getsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
                 nl.protocol as i32
             } else if let Some(pkt) = sock.packet_state() {
                 i32::from(pkt.protocol.to_be())
+            } else if let Some(icmp_state) = sock.icmp_state() {
+                icmp_state.protocol
             } else if let Some(raw_proto) = sock.raw_ip_protocol() {
                 raw_proto
             } else {
@@ -3360,6 +3604,18 @@ pub(crate) async fn getsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
             raw[0..8].copy_from_slice(&sec.to_le_bytes());
             raw[8..16].copy_from_slice(&usec.to_le_bytes());
             match write_opt_bytes(memory, optval, optlen_ptr, &raw) {
+                Ok(()) => 0,
+                Err(e) => errno(e),
+            }
+        }
+        (IPPROTO_IP, IP_RECVTTL) | (IPPROTO_IPV6, IPV6_RECVHOPLIMIT) if sock.is_icmp() => {
+            let enabled = sock.icmp_state().is_some_and(|slot| slot.recv_ttl);
+            match write_opt_bytes(
+                memory,
+                optval,
+                optlen_ptr,
+                &i32::from(enabled).to_le_bytes(),
+            ) {
                 Ok(()) => 0,
                 Err(e) => errno(e),
             }
@@ -3519,6 +3775,23 @@ pub(crate) async fn socket_epoll_ready<N: SocketNetwork, Net: Network<N>>(
 
     if sock.is_packet() {
         let ready = match packet::readiness(sock, net).await {
+            Ok(state) => {
+                let mut mask = 0;
+                if state.readable {
+                    mask |= EPOLLIN;
+                }
+                if state.writable {
+                    mask |= EPOLLOUT;
+                }
+                mask
+            }
+            Err(_) => EPOLLERR,
+        };
+        return ready & (interest | EPOLLERR | EPOLLHUP);
+    }
+
+    if sock.is_icmp() {
+        let ready = match icmp::readiness(sock, net).await {
             Ok(state) => {
                 let mut mask = 0;
                 if state.readable {

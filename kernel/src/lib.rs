@@ -287,12 +287,12 @@ pub use runtime::{
     AuthorityDomain, ComponentHostNetwork, ComponentNetworkService, ComponentNetworkState,
     DnsError, DnsErrorKind, ExecOutput, ExecResult, FatalEscalationAction, FatalEscalationRecord,
     HostCreation, HostDirEntry, HostDirLimit, HostFileSystem, HostFilledWrite, HostFsError,
-    HostFsErrorKind, HostMetadata, HostShareRestore, HostWrite, HttpsRecord, Ipv4Address,
-    NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump, ObjectIdentity,
-    PacketFrame, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
-    SnapshotHold, SnapshotHoldBusy, SocketReadiness, TcpAccepted, TcpConnectPoll, TcpError,
-    TcpErrorKind, TcpListener, TcpPayloadPieces, TcpReadInto, TcpReadProgress, TcpWriteProgress,
-    UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    HostFsErrorKind, HostMetadata, HostShareRestore, HostWrite, HttpsRecord, IcmpEchoDatagram,
+    Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump,
+    ObjectIdentity, PacketFrame, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer,
+    RuntimeState, SnapshotHold, SnapshotHoldBusy, SocketReadiness, TcpAccepted, TcpConnectPoll,
+    TcpError, TcpErrorKind, TcpListener, TcpPayloadPieces, TcpReadInto, TcpReadProgress,
+    TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use settings::{
     Holds, SETTING_COUNT, Setting, SettingCell, SettingEntry, SettingUnit, SettingValue,
