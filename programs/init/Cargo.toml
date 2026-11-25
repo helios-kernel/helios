@@ -4,8 +4,29 @@ version = "0.1.0"
 edition.workspace = true
 autobins = false
 
+[package.metadata.helios]
+target-features = ["atomics"]
+
+[features]
+default = []
+# Opt-in: compiles runtime `component.toml` parsing and bounded dynamic subtree mounting
+# into the root `component-manager` binary. Off by default so zero TOML parser code links in.
+dynamic-components = ["helios-component-manager/dynamic-components"]
+
 [dependencies]
-helios-api = { path = "../../api", default-features = false, features = ["mounts", "programs", "root-supervisor", "task"] }
+async-channel = { version = "2.5.0", default-features = false }
+helios-api = { path = "../../api", default-features = false, features = [
+    "inspect-publish",
+    "ipc",
+    "mounts",
+    "net",
+    "oci",
+    "programs",
+    "root-supervisor",
+    "task",
+    "vsock",
+] }
+helios-component-manager = { workspace = true }
 
 [lib]
 name = "helios_init"

@@ -1,0 +1,24 @@
+description = "Per-processor sharded wasi:http/client kernel plugin"
+name = "http-client-plugin"
+runner = "wasm"
+sharding = "per-processor"
+provider = "http-client"
+program = "/bin/http-client"
+optional = true
+startup = "lazy"
+lifecycle = "service"
+restart = "on-failure"
+restart_backoff = "100ms"
+oom_tier = "plugin"
+
+[capabilities]
+directories = [
+  { source = "/", guest = "/", rights = ["read", "write", "mutate-directory", "execute"] },
+]
+network = ["tcp", "udp", "dns", "privileged-bind", "multicast", "admin"]
+allow_all_tcp_ports = true
+clock = ["set-wall-clock"]
+terminal = ["input", "output", "control"]
+process = ["spawn", "exec", "fork", "join", "signal"]
+link = ["source", "target-directory", "symlink-create", "symlink-read"]
+mount = ["mount", "unmount"]

@@ -1,0 +1,25 @@
+[package]
+name = "helios-component-manager"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+default = []
+# Enables `component.toml` directory-tree parsing and static/runtime manifest loading.
+# Off by default so the compiled `component-manager` binary links zero TOML parser code.
+manifest = ["dep:serde", "dep:toml"]
+# Enables bounded runtime dynamic subtree mounting under parent realms with `dynamic_mount = true`.
+dynamic-components = ["manifest"]
+
+[dependencies]
+async-channel = { version = "2.5.0", default-features = false }
+futures-lite = { version = "2.6.1", default-features = false, features = ["alloc"] }
+serde = { version = "1.0.228", default-features = false, features = ["derive", "std"], optional = true }
+thiserror = { version = "2.0.21", default-features = false }
+toml = { version = "0.8.23", default-features = false, features = ["parse"], optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

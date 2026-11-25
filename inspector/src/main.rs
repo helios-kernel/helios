@@ -1,4 +1,5 @@
 mod frame_reader;
+mod image;
 mod linux_suite;
 mod ops_cli;
 mod programs;
@@ -38,6 +39,8 @@ enum InspectorError {
     MissingTarget,
     #[error("{0}")]
     Vm(#[from] vm::VmError),
+    #[error("{0}")]
+    Image(#[from] image::ImageError),
     #[error("{0}")]
     Connect(#[from] ConnectError),
     #[error("{0}")]
@@ -203,6 +206,10 @@ enum Command {
     /// Boxed: the VM options dwarf every other subcommand's, and the
     /// parsed command is moved around by value.
     Vm(Box<vm::VmCommand>),
+    /// Validate component manifests, generate static Rust routing tables, and package
+    /// three-part Helios system images (`helios image build`).
+    #[command(subcommand)]
+    Image(image::ImageCommand),
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -304,6 +311,7 @@ fn main() -> Result<(), InspectorError> {
     let args = Args::parse();
     match args.command {
         Some(Command::Vm(command)) => Ok(vm::run(*command, args.ops)?),
+        Some(Command::Image(cmd)) => Ok(image::run(&cmd)?),
         Some(Command::Python(cmd)) => Ok(ops_cli::run_python_command(&args.ops, &cmd, None)?),
         Some(Command::Whoami) => Ok(ops_cli::run_whoami(&args.ops)?),
         Some(Command::Target(cmd)) => Ok(ops_cli::run_target_command(&cmd, args.ops.output)?),
@@ -342,6 +350,7 @@ fn main() -> Result<(), InspectorError> {
                 None => SessionCommand::Nu(NuCommand::default()),
                 Some(
                     Command::Vm(_)
+                    | Command::Image(_)
                     | Command::Python(_)
                     | Command::Login(_)
                     | Command::Whoami
@@ -673,6 +682,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{Args, Command};
+    use crate::image;
     use crate::ops_cli::CliOutputFormat;
     use clap::Parser;
 
@@ -762,6 +772,59 @@ mod tests {
         let repl_args =
             Args::try_parse_from(["helios", "repl"]).expect("repl alias for nu must parse");
         assert!(matches!(repl_args.command, Some(Command::Nu(_))));
+    }
+
+    #[test]
+    fn parses_image_build_and_codegen_subcommands() {
+        let build = Args::try_parse_from([
+            "helios",
+            "image",
+            "build",
+            "--components",
+            "components",
+            "--out-dir",
+            "/tmp/out",
+            "--profile",
+            "release",
+            "--dynamic-components",
+            "--boot-program",
+            "debugger",
+            "--no-compiler-plugin",
+        ])
+        .expect("`helios image build` must parse");
+        match build.command {
+            Some(Command::Image(image::ImageCommand::Build(args))) => {
+                assert!(args.dynamic_components);
+                assert_eq!(args.profile, "release");
+                assert_eq!(args.boot_programs, vec!["debugger"]);
+                let forwarded = image::build_cli_args(&args);
+                assert!(forwarded.contains(&"image-build".to_owned()));
+                assert!(forwarded.contains(&"--dynamic-components".to_owned()));
+                assert!(forwarded.contains(&"--no-compiler-plugin".to_owned()));
+            }
+            other => panic!("expected Image::Build, got {other:?}"),
+        }
+
+        let codegen = Args::try_parse_from([
+            "helios",
+            "image",
+            "codegen",
+            "--components",
+            "components",
+            "--out",
+            "/tmp/topology.rs",
+            "--verify-matches",
+            "programs/init/src/default_topology.rs",
+        ])
+        .expect("`helios image codegen` must parse");
+        match codegen.command {
+            Some(Command::Image(image::ImageCommand::Codegen(args))) => {
+                let forwarded = image::codegen_cli_args(&args);
+                assert!(forwarded.contains(&"component-codegen".to_owned()));
+                assert!(forwarded.contains(&"--verify-matches".to_owned()));
+            }
+            other => panic!("expected Image::Codegen, got {other:?}"),
+        }
     }
 
     #[test]

@@ -11,6 +11,7 @@ ed25519-dalek = { version = "3.0.0", default-features = false, features = ["allo
 fatfs = "0.3.6"
 helios-artifact.workspace = true
 helios-compiler-support.workspace = true
+helios-component-manager = { path = "../component-manager", default-features = false, features = ["manifest"] }
 helios-profdata.workspace = true
 helios-venus-gen.workspace = true
 helios-workspace-root.workspace = true
