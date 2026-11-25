@@ -19,7 +19,6 @@ arm-gic = "0.9.1"
 # The ID, key and control registers return-address signing programs. `arm-gic`
 # pins its sysreg subcrates to exactly 0.4.0, so this stays at that version.
 arm-sysregs = { version = "0.4.0", default-features = false, features = ["el1"] }
-bytes = { version = "1.12.1", default-features = false }
 critical-section = { version = "1.2.0", features = ["restore-state-usize"] }
 crossbeam-utils = { workspace = true, optional = true }
 fdt = { version = "0.1.5", default-features = false }

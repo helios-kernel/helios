@@ -20,7 +20,7 @@ where
         /// executable itself is moved through every launch path.
         restore: Box<CoreModuleRestore<Net>>,
     },
-    /// A static Linux executable the native host runs.
+    /// A Linux executable (`ET_EXEC` or `ET_DYN`) the native host runs.
     #[cfg(feature = "linux")]
     Linux(LinuxExecutable),
 }

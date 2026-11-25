@@ -1,4 +1,5 @@
-//! The Linux process host: a static Linux executable launched through the
+//! The Linux process host: a static or dynamic Linux executable (`ET_EXEC` or
+//! `ET_DYN`, with optional `PT_INTERP` dynamic linker) launched through the
 //! program service, as a wasm program is, run natively through the
 //! platform's [`helios_hal::native`] capability.
 //!
@@ -66,9 +67,13 @@ pub(super) fn is_linux_elf(bytes: &[u8]) -> bool {
     bytes.starts_with(ELF_MAGIC)
 }
 
-/// A validated static Linux executable, ready to map into a new process.
+/// A validated Linux executable (`ET_EXEC` or `ET_DYN`), optionally paired
+/// with its resolved `PT_INTERP` dynamic linker image, ready to map into a new
+/// process.
 pub(super) struct LinuxExecutable {
     image: Bytes,
+    interpreter: Option<Bytes>,
+    path: Option<String>,
     abi: Abi,
 }
 
@@ -87,8 +92,137 @@ impl LinuxExecutable {
             detail: ProgramExecErrorDetail::LinuxAbiUnsupported,
         })?;
         Image::parse(&image, abi, user_end(native)).map_err(image_error)?;
-        Ok(Self { image, abi })
+        Ok(Self {
+            image,
+            interpreter: None,
+            path: None,
+            abi,
+        })
     }
+
+    /// Validates `image` and, when it declares `PT_INTERP`, resolves and
+    /// validates the interpreter strictly inside `container`'s filesystem
+    /// under `READ | EXECUTE` authority and `creds`.
+    pub(super) async fn load_in_container<CpuImpl: Cpu, StorageImpl: crate::Storage>(
+        cpu: &CpuImpl,
+        container: &crate::LinuxContainer<StorageImpl>,
+        base_dir: &str,
+        image: Bytes,
+        exec_path: Option<String>,
+        creds: &syscall::Credentials,
+    ) -> Result<Self, ProgramExecError> {
+        let mut loaded = Self::load(cpu, image)?;
+        loaded.path = exec_path;
+        let native = cpu.native().map_err(native_unavailable)?;
+        let limit = user_end(native);
+        let interp_path = {
+            let parsed = Image::parse(&loaded.image, loaded.abi, limit).map_err(image_error)?;
+            parsed.interpreter().map(str::to_owned)
+        };
+        if let Some(interp_path) = interp_path {
+            let interp_bytes = read_interpreter_in_container(
+                container.filesystem(),
+                base_dir,
+                &interp_path,
+                creds,
+            )
+            .await
+            .map_err(map_fs_op_error_to_program)?;
+            if !is_linux_elf(&interp_bytes) {
+                return Err(ProgramExecError {
+                    kind: ProgramExecErrorKind::InvalidBinary,
+                    detail: ProgramExecErrorDetail::LinuxImageInvalid(
+                        crate::LinuxImageRefusal::Malformed,
+                    ),
+                });
+            }
+            Image::parse_interpreter(&interp_bytes, loaded.abi, limit).map_err(image_error)?;
+            loaded.interpreter = Some(interp_bytes);
+        }
+        Ok(loaded)
+    }
+
+    /// Validates `image` with an already-loaded optional interpreter image
+    /// (used by `prepare_exec_in_container` so filesystem errors preserve
+    /// exact Linux `execve` errnos).
+    fn load_with_interpreter<CpuImpl: Cpu>(
+        cpu: &CpuImpl,
+        image: Bytes,
+        interpreter: Option<Bytes>,
+        exec_path: Option<String>,
+    ) -> Result<Self, ProgramExecError> {
+        let mut loaded = Self::load(cpu, image)?;
+        loaded.path = exec_path;
+        if let Some(interp_bytes) = interpreter {
+            let native = cpu.native().map_err(native_unavailable)?;
+            if !is_linux_elf(&interp_bytes) {
+                return Err(ProgramExecError {
+                    kind: ProgramExecErrorKind::InvalidBinary,
+                    detail: ProgramExecErrorDetail::LinuxImageInvalid(
+                        crate::LinuxImageRefusal::Malformed,
+                    ),
+                });
+            }
+            Image::parse_interpreter(&interp_bytes, loaded.abi, user_end(native))
+                .map_err(image_error)?;
+            loaded.interpreter = Some(interp_bytes);
+        }
+        Ok(loaded)
+    }
+
+    fn interpreter_path<CpuImpl: Cpu>(
+        &self,
+        cpu: &CpuImpl,
+    ) -> Result<Option<String>, ProgramExecError> {
+        let native = cpu.native().map_err(native_unavailable)?;
+        let parsed = Image::parse(&self.image, self.abi, user_end(native)).map_err(image_error)?;
+        Ok(parsed.interpreter().map(str::to_owned))
+    }
+}
+
+/// Resolves and reads an ELF `PT_INTERP` dynamic linker strictly inside
+/// `container_fs` under `READ | EXECUTE` mount authority and `creds`
+/// (enforcing private-mount `MAY_EXEC` DAC/ACL checks and clamping symlinks
+/// and `..` to the container root).
+async fn read_interpreter_in_container<StorageImpl: crate::Storage>(
+    container_fs: &crate::ContainerFilesystem<StorageImpl>,
+    base_dir: &str,
+    interp_path: &str,
+    creds: &syscall::Credentials,
+) -> Result<Bytes, syscall::FsOpError> {
+    let (resolved, trailing_slash) = container_fs
+        .walk_path_for(base_dir, interp_path, true, creds)
+        .await?;
+    let meta = resolved.fs().stat(resolved.fs_path()).await?;
+    if meta.kind == NodeKind::Symlink {
+        return Err(FsError::Loop.into());
+    }
+    if meta.kind == NodeKind::Directory {
+        return Err(FsError::NotPermitted.into());
+    }
+    if trailing_slash {
+        return Err(FsError::NotDirectory.into());
+    }
+    if meta.kind != NodeKind::File {
+        return Err(FsError::NotPermitted.into());
+    }
+    let contents = resolved.check_exec_and_read(creds).await?;
+    Ok(match contents {
+        FileContents::Boot(boot) => Bytes::copy_from_slice(boot.as_slice()),
+        FileContents::Written(written) => written,
+    })
+}
+
+fn map_fs_op_error_to_program(error: syscall::FsOpError) -> ProgramExecError {
+    let fs_err = match error {
+        syscall::FsOpError::Fs(err) => err,
+        syscall::FsOpError::PermissionDenied => FsError::NotPermitted,
+        syscall::FsOpError::NoDevice
+        | syscall::FsOpError::NoData
+        | syscall::FsOpError::Range
+        | syscall::FsOpError::ArgTooBig => FsError::Io,
+    };
+    ProgramExecError::from_source_read_error(fs_err)
 }
 
 fn native_unavailable(reason: NativeUnavailable) -> ProgramExecError {
@@ -196,7 +330,7 @@ fn image_error(error: elf::Error) -> ProgramExecError {
     let refusal = match error {
         elf::Error::Parse(_) => crate::LinuxImageRefusal::Malformed,
         elf::Error::UnsupportedImage => crate::LinuxImageRefusal::Unsupported,
-        elf::Error::UnsupportedSegment => crate::LinuxImageRefusal::Dynamic,
+        elf::Error::InvalidInterpreter => crate::LinuxImageRefusal::Interpreter,
         elf::Error::InvalidSegment | elf::Error::Overlap => crate::LinuxImageRefusal::Segment,
         elf::Error::InvalidEntry => crate::LinuxImageRefusal::Entry,
     };
@@ -429,6 +563,17 @@ impl<Space: UserSpace> VirtualMemory for LinuxMemory<'_, Space> {
         self.space
             .free_range(VirtAddr::new(hint as usize), length as usize)
             .map(|start| start.raw() as u64)
+    }
+
+    fn populate(&mut self, address: u64, bytes: &[u8]) -> Result<(), MapError> {
+        match self.space.populate(VirtAddr::new(address as usize), bytes) {
+            Ok(()) => Ok(()),
+            Err(NativeError::OutOfMemory) => Err(MapError::OutOfMemory),
+            Err(NativeError::Address | NativeError::NotMapped) => Err(MapError::Address),
+            Err(error @ (NativeError::Overlap | NativeError::Register)) => {
+                panic!("populating a validated Linux mapping was refused: {error}")
+            }
+        }
     }
 }
 
@@ -2291,15 +2436,41 @@ where
         timeout_nanos: u64,
     ) -> Result<usize, u64> {
         self.check_tcp_open()?;
+        if bytes.is_empty() {
+            return Ok(0);
+        }
         let service = self
             .shared
             .runtime_state
             .network_service()
             .ok_or(syscall::ENETDOWN)?;
-        service
-            .tcp_write_some_bytes(stream, bytes, timeout_nanos)
-            .await
-            .map_err(linux_errno_from_tcp_error)
+        let len = bytes.len().min(helios_netstack::TCP_TRANSMIT_BUFFER_BYTES);
+        match service.tcp_payload(len, |piece| piece.copy_from_slice(&bytes[..len])) {
+            Ok(payload) => service
+                .tcp_write_some_bytes(stream, payload, timeout_nanos)
+                .await
+                .map_err(linux_errno_from_tcp_error),
+            Err(error)
+                if matches!(
+                    error.detail,
+                    crate::NetworkErrorDetail::TransmitMemoryReplenishing
+                        | crate::NetworkErrorDetail::TransmitMemoryExhausted
+                ) =>
+            {
+                if timeout_nanos == 0 {
+                    return Err(syscall::ETIMEDOUT);
+                }
+                let pieces = service.tcp_payload_pieces(len, |offset, piece| {
+                    piece.copy_from_slice(&bytes[offset..][..piece.len()]);
+                });
+                service
+                    .tcp_write_all(stream, pieces, timeout_nanos)
+                    .await
+                    .map(|()| len)
+                    .map_err(linux_errno_from_tcp_error)
+            }
+            Err(error) => Err(linux_errno_from_tcp_error(error)),
+        }
     }
 
     async fn tcp_shutdown_send(&self, stream: Net::TcpStream) -> Result<(), u64> {
@@ -3091,8 +3262,38 @@ where
         let source = ProgramSource::from_file(contents);
         match source {
             ProgramSource::LinuxElf(bytes) => {
-                let executable = LinuxExecutable::load(&shared.cpu, bytes)
+                let parsed_main = LinuxExecutable::load(&shared.cpu, bytes.clone())
                     .map_err(|error| map_program_error_to_exec(&error))?;
+                let interp_path = parsed_main
+                    .interpreter_path(&shared.cpu)
+                    .map_err(|error| map_program_error_to_exec(&error))?;
+                let interpreter = if let Some(interp_path) = interp_path {
+                    let interp_base_dir = cwd.lock().clone();
+                    Some(
+                        Box::pin(read_interpreter_in_container(
+                            fs,
+                            &interp_base_dir,
+                            &interp_path,
+                            &current_creds,
+                        ))
+                        .await
+                        .map_err(map_fs_op_error_to_exec)?,
+                    )
+                } else {
+                    None
+                };
+                let execfn = if spec.path.is_empty() {
+                    current_path.clone()
+                } else {
+                    spec.path.clone()
+                };
+                let executable = LinuxExecutable::load_with_interpreter(
+                    &shared.cpu,
+                    bytes,
+                    interpreter,
+                    Some(execfn),
+                )
+                .map_err(|error| map_program_error_to_exec(&error))?;
                 // Compute post-execve credentials strictly for the final binary
                 // (never an intermediate `#!` script, `fs/binfmt_script.c`),
                 // respecting `NO_SUID`, `PR_SET_NO_NEW_PRIVS`, and the
@@ -4013,6 +4214,26 @@ struct MappedLinuxImage<Native: NativeExecution> {
     program_break: u64,
 }
 
+fn map_elf_segments<Space: UserSpace>(
+    space: &Space,
+    image: &Image<'_>,
+    load_bias: u64,
+) -> Result<(), ProgramExecError> {
+    for segment in image.segments_at(load_bias) {
+        let mut flags = PageFlags::READ;
+        flags.set(PageFlags::WRITE, segment.writable);
+        flags.set(PageFlags::EXECUTE, segment.executable);
+        let range = VirtRange::new(
+            VirtAddr::new(segment.address as usize),
+            segment.memory_size as usize,
+        );
+        space
+            .map(range, segment.bytes, flags)
+            .map_err(native_error)?;
+    }
+    Ok(())
+}
+
 fn map_linux_image<Native: NativeExecution>(
     native: &Native,
     entropy: &crate::RootEntropy,
@@ -4022,40 +4243,57 @@ fn map_linux_image<Native: NativeExecution>(
     credentials: &syscall::Credentials,
     secure: bool,
 ) -> Result<MappedLinuxImage<Native>, ProgramExecError> {
-    let image =
-        Image::parse(&executable.image, executable.abi, user_end(native)).map_err(image_error)?;
+    let limit = user_end(native);
+    let image = Image::parse(&executable.image, executable.abi, limit).map_err(image_error)?;
+    let interp_image = match &executable.interpreter {
+        Some(bytes) => {
+            Some(Image::parse_interpreter(bytes, executable.abi, limit).map_err(image_error)?)
+        }
+        None => {
+            if image.interpreter().is_some() {
+                return Err(image_error(elf::Error::InvalidInterpreter));
+            }
+            None
+        }
+    };
+
     let space = Arc::new(native.create_space().map_err(native_error)?);
-    // The end of the highest segment: the stack never grows down past it,
-    // whatever its limit, so a wild pointer into the unmapped space below
-    // the stack stays a fault.
-    let mut image_end = 0;
-    for segment in image.segments() {
-        let mut flags = PageFlags::READ;
-        flags.set(PageFlags::WRITE, segment.writable);
-        flags.set(PageFlags::EXECUTE, segment.executable);
-        let range = VirtRange::new(
-            VirtAddr::new(segment.address as usize),
-            segment.memory_size as usize,
-        );
-        image_end = image_end.max(range.end().raw().next_multiple_of(PhysFrame::SIZE));
-        space
-            .map(range, segment.bytes, flags)
-            .map_err(native_error)?;
+    let user = native.user_range();
+    let (top, sigreturn_trampoline) =
+        map_sigreturn_trampoline(&*space, user, executable.abi).map_err(native_error)?;
+
+    let page_size = PhysFrame::SIZE as u64;
+    let placement = elf::plan_placement(
+        &image,
+        interp_image.as_ref(),
+        user.start.raw() as u64,
+        top,
+        page_size,
+    )
+    .map_err(image_error)?;
+
+    map_elf_segments(&*space, &image, placement.main_bias)?;
+    if let (Some(interp), Some(interp_bias)) = (&interp_image, placement.interpreter_bias) {
+        map_elf_segments(&*space, interp, interp_bias)?;
     }
 
     let arguments: Vec<&[u8]> = argv.iter().map(String::as_bytes).collect();
     let variables: Vec<&[u8]> = environment.iter().map(String::as_bytes).collect();
     let mut random = [0; 16];
     entropy.fill(&mut random);
-    let user = native.user_range();
-    let (top, sigreturn_trampoline) =
-        map_sigreturn_trampoline(&*space, user, executable.abi).map_err(native_error)?;
-    let executable_name = arguments.first().copied().unwrap_or(b"");
+    let executable_name = executable
+        .path
+        .as_deref()
+        .map(str::as_bytes)
+        .or_else(|| arguments.first().copied())
+        .unwrap_or(b"");
     let stack = helios_linux::stack::build(
         &helios_linux::stack::Startup {
-            entry: image.entry(),
-            page_size: PhysFrame::SIZE as u64,
-            headers: image.program_headers().map_err(image_error)?,
+            entry: placement.main_entry,
+            page_size,
+            headers: placement.program_headers,
+            interpreter_base: placement.at_base,
+            flags: 0,
             random,
             arguments: &arguments,
             environment: &variables,
@@ -4072,6 +4310,12 @@ fn map_linux_image<Native: NativeExecution>(
         kind: ProgramExecErrorKind::InvalidPath,
         detail: ProgramExecErrorDetail::InvalidProgramPath,
     })?;
+    if stack.base <= placement.image_end {
+        return Err(ProgramExecError {
+            kind: ProgramExecErrorKind::OutOfMemory,
+            detail: ProgramExecErrorDetail::NativeMemoryExhausted,
+        });
+    }
     space
         .map(
             VirtRange::new(VirtAddr::new(stack.base as usize), stack.bytes.len()),
@@ -4081,7 +4325,7 @@ fn map_linux_image<Native: NativeExecution>(
         .map_err(native_error)?;
     let context = native
         .create_context(
-            VirtAddr::new(image.entry() as usize),
+            VirtAddr::new(placement.initial_pc as usize),
             VirtAddr::new(stack.pointer as usize),
         )
         .map_err(native_error)?;
@@ -4091,9 +4335,9 @@ fn map_linux_image<Native: NativeExecution>(
         user,
         stack_top: top,
         stack_base: stack.base as usize,
-        image_end,
+        image_end: placement.image_end as usize,
         sigreturn_trampoline,
-        program_break: image.program_break(PhysFrame::SIZE as u64),
+        program_break: placement.program_break,
     })
 }
 
@@ -4130,7 +4374,7 @@ where
         );
         let mut main_exec: Option<ExecHandoff<CpuImpl, Net, StorageImpl>> = None;
         let main_and_siblings = async {
-            match drive_linux_thread(context, process, main_platform).await {
+            match Box::pin(drive_linux_thread(context, process, main_platform)).await {
                 ThreadRunEnd::Exec(prepared, exec_proc) => {
                     // Condemn any sibling threads so they drain before the
                     // address space is replaced.
@@ -4428,6 +4672,25 @@ where
         .collect();
     let mut credentials = credentials.unwrap_or_else(|| container.default_credentials().clone());
     container.clamp_credentials(&mut credentials);
+    let executable =
+        if executable.interpreter.is_none() && executable.interpreter_path(&cpu)?.is_some() {
+            let base_dir = container
+                .authority()
+                .cwd()
+                .map(|preopen| preopen.guest_name())
+                .unwrap_or("/");
+            Box::pin(LinuxExecutable::load_in_container(
+                &cpu,
+                &container,
+                base_dir,
+                executable.image,
+                executable.path,
+                &credentials,
+            ))
+            .await?
+        } else {
+            executable
+        };
     let initial_secure = credentials.user.effective != credentials.user.real
         || credentials.group.effective != credentials.group.real;
     let mapped = map_linux_image(
@@ -4536,13 +4799,13 @@ where
     });
 
     timeline.record(&cpu, LaunchPhase::GuestBegin);
-    drive_linux_process_lifecycle(
+    Box::pin(drive_linux_process_lifecycle(
         mapped.context,
         process,
         shared,
         Some(process_guard),
         timeline.clone(),
-    )
+    ))
     .await
 }
 
@@ -5085,5 +5348,771 @@ mod tests {
             .err(),
             Some(FsError::NoEntry)
         );
+    }
+
+    fn build_test_elf(abi: Abi, e_type: u16, base: u64, interp: Option<&[u8]>) -> Vec<u8> {
+        let mut bytes = alloc::vec![0u8; 2 * PhysFrame::SIZE];
+        bytes[0x1000..0x1008].copy_from_slice(b"ELF_CODE");
+        let mut phdrs: Vec<[u8; 56]> = Vec::new();
+        let push = |phdrs: &mut Vec<[u8; 56]>,
+                    p_type: u32,
+                    p_flags: u32,
+                    p_offset: u64,
+                    p_vaddr: u64,
+                    p_filesz: u64,
+                    p_memsz: u64,
+                    p_align: u64| {
+            let mut h = [0u8; 56];
+            h[0..4].copy_from_slice(&p_type.to_le_bytes());
+            h[4..8].copy_from_slice(&p_flags.to_le_bytes());
+            h[8..16].copy_from_slice(&p_offset.to_le_bytes());
+            h[16..24].copy_from_slice(&p_vaddr.to_le_bytes());
+            h[24..32].copy_from_slice(&p_vaddr.to_le_bytes());
+            h[32..40].copy_from_slice(&p_filesz.to_le_bytes());
+            h[40..48].copy_from_slice(&p_memsz.to_le_bytes());
+            h[48..56].copy_from_slice(&p_align.to_le_bytes());
+            phdrs.push(h);
+        };
+        if let Some(path) = interp {
+            let off = 0x300u64;
+            bytes[off as usize..off as usize + path.len()].copy_from_slice(path);
+            push(
+                &mut phdrs,
+                3, /* PT_INTERP */
+                4,
+                off,
+                base + off,
+                path.len() as u64,
+                path.len() as u64,
+                1,
+            );
+        }
+        push(&mut phdrs, 1, 4, 0, base, 0x500, 0x500, 4096);
+        push(&mut phdrs, 1, 5, 0x1000, base + 0x1000, 0x200, 0x200, 4096);
+        push(
+            &mut phdrs,
+            2, /* PT_DYNAMIC */
+            4,
+            0x400,
+            base + 0x400,
+            0x40,
+            0x40,
+            8,
+        );
+
+        bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        bytes[16..18].copy_from_slice(&e_type.to_le_bytes());
+        bytes[18..20].copy_from_slice(&abi.elf_machine().to_le_bytes());
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&(base + 0x1000).to_le_bytes());
+        bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&(phdrs.len() as u16).to_le_bytes());
+        for (i, h) in phdrs.iter().enumerate() {
+            let off = 64 + i * 56;
+            bytes[off..off + 56].copy_from_slice(h);
+        }
+        bytes
+    }
+
+    struct NativeTestContext {
+        entry: VirtAddr,
+        stack: VirtAddr,
+    }
+
+    // SAFETY: host unit test context never enters hardware user mode.
+    unsafe impl UserContext for NativeTestContext {
+        type Space = NativeSpace<DummyTables>;
+        fn register(&self, _: helios_hal::hv::RegisterId) -> Result<u64, NativeError> {
+            Ok(0)
+        }
+        fn set_register(
+            &mut self,
+            _: helios_hal::hv::RegisterId,
+            _: u64,
+        ) -> Result<(), NativeError> {
+            Ok(())
+        }
+        fn thread_pointer(&self) -> VirtAddr {
+            VirtAddr::new(PhysFrame::SIZE)
+        }
+        fn set_thread_pointer(&mut self, _: VirtAddr) -> Result<(), NativeError> {
+            Ok(())
+        }
+        fn extended_state(&self) -> helios_hal::native::ExtendedState {
+            helios_hal::native::ExtendedState::X86Xsave(alloc::vec![0; 576])
+        }
+        fn set_extended_state(
+            &mut self,
+            _: &helios_hal::native::ExtendedState,
+        ) -> Result<(), NativeError> {
+            Ok(())
+        }
+        fn try_clone(&self) -> Result<Self, NativeError> {
+            Ok(Self {
+                entry: self.entry,
+                stack: self.stack,
+            })
+        }
+        fn resume(&mut self, _: &Self::Space) -> Stop {
+            Stop::Interrupted
+        }
+    }
+
+    #[derive(Clone)]
+    struct NativeTestCpu {
+        isa: helios_hal::native::InstructionSet,
+        user_end: usize,
+    }
+
+    impl NativeExecution for NativeTestCpu {
+        type Space = NativeSpace<DummyTables>;
+        type Context = NativeTestContext;
+        fn instruction_set(&self) -> helios_hal::native::InstructionSet {
+            self.isa
+        }
+        fn user_range(&self) -> VirtRange {
+            VirtRange::new(
+                VirtAddr::new(PhysFrame::SIZE),
+                self.user_end - PhysFrame::SIZE,
+            )
+        }
+        fn create_space(&self) -> Result<Self::Space, NativeError> {
+            Ok(NativeSpace::new(
+                DummyTables,
+                PhysFrame::SIZE as u64,
+                self.user_end as u64,
+            ))
+        }
+        fn create_context(
+            &self,
+            entry: VirtAddr,
+            stack: VirtAddr,
+        ) -> Result<Self::Context, NativeError> {
+            Ok(NativeTestContext { entry, stack })
+        }
+    }
+
+    impl Cpu for NativeTestCpu {
+        type Hypervisor = core::convert::Infallible;
+        type Native = Self;
+        const TIMER_INTERRUPT: helios_hal::cpu::TimerInterrupt =
+            helios_hal::cpu::TimerInterrupt::Deadline;
+        fn native(&self) -> Result<&Self::Native, NativeUnavailable> {
+            Ok(self)
+        }
+        fn has_lazy_commit_virtual_memory(&self) -> bool {
+            true
+        }
+        fn processor_count(&self) -> usize {
+            1
+        }
+        fn bootstrap_processor(&self) -> helios_hal::cpu::ProcessorId {
+            helios_hal::cpu::ProcessorId::new(0)
+        }
+        fn park_current(&self) {}
+        type WakeOnlyMask = ();
+        fn mask_to_wake_only(&self) {}
+        fn park_wake_only(&self, _: &core::sync::atomic::AtomicU8, _: u8) {}
+        fn start_processor(&self, _: helios_hal::cpu::ProcessorId) {}
+        fn wake_processor(&self, _: helios_hal::cpu::ProcessorId) {}
+        fn stop_current(&self) {}
+        fn restart_processor(&self, _: helios_hal::cpu::ProcessorId) {}
+        fn now(&self) -> helios_hal::cpu::Instant {
+            helios_hal::cpu::Instant::new(0)
+        }
+        fn timebase(&self) -> helios_hal::cpu::Timebase {
+            helios_hal::cpu::Timebase::new(1_000_000_000)
+        }
+        fn set_deadline(&self, _: helios_hal::cpu::Instant) {}
+        fn publish_executable(&self, _: *const u8, _: usize) {}
+        fn unpublish_executable(&self, _: *const u8, _: usize) {}
+        fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
+            None
+        }
+        fn fill_entropy(
+            &self,
+            buffer: &mut [u8],
+        ) -> Result<helios_hal::entropy::EntropyQuality, helios_hal::entropy::EntropyUnavailable>
+        {
+            buffer.fill(0x42);
+            Ok(helios_hal::entropy::EntropyQuality::Cryptographic)
+        }
+        fn shutdown(&self) -> ! {
+            unreachable!()
+        }
+        fn reboot(&self) -> ! {
+            unreachable!()
+        }
+    }
+
+    fn poll_ready<T>(fut: impl core::future::Future<Output = T>) -> T {
+        use core::task::{Context, Poll, Waker};
+        let mut fut = core::pin::pin!(fut);
+        match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("test future unexpectedly pending"),
+        }
+    }
+
+    #[test]
+    fn file_backed_mmap_cow_across_fork_and_user_memory_pool_accounting() {
+        use helios_linux::syscall::dispatch;
+
+        #[derive(Clone)]
+        struct TestFile {
+            bytes: Bytes,
+            access: FileAccess,
+        }
+        struct TestRes;
+        impl Resources for TestRes {
+            type File = TestFile;
+            type Network = helios_unix::NoNetwork;
+            type Data = u64;
+        }
+        struct TestThread;
+        impl Thread<TestRes> for TestThread {
+            fn thread_pointer(&self) -> u64 {
+                0
+            }
+            fn set_thread_pointer(&mut self, _: u64) -> Result<(), Denied> {
+                Err(Denied)
+            }
+            fn spawn_thread(
+                &mut self,
+                _: Process<TestRes>,
+                _: SpawnedThread,
+            ) -> Result<(), SpawnError> {
+                unreachable!()
+            }
+        }
+        struct TestHost {
+            file: TestFile,
+        }
+        impl syscall::Network<helios_unix::NoNetwork> for TestHost {
+            fn to_ip(&self, a: core::convert::Infallible) -> syscall::IpAddr {
+                match a {}
+            }
+            fn encode_ip(&self, _: syscall::IpAddr) -> core::convert::Infallible {
+                unreachable!()
+            }
+        }
+        impl Stdio for TestHost {
+            async fn write(&mut self, _: Stream, _: &[u8]) -> Result<usize, WriteError> {
+                Err(WriteError::Io)
+            }
+            async fn read_input(&mut self, _: usize) -> Result<Bytes, Denied> {
+                Err(Denied)
+            }
+        }
+        impl syscall::Clock for TestHost {
+            fn now_nanos(&self) -> u64 {
+                0
+            }
+            async fn sleep_until(&self, _: u64) {}
+        }
+        impl System for TestHost {
+            fn realtime_nanos(&self) -> u64 {
+                0
+            }
+            fn set_realtime_nanos(&mut self, _: u64) -> Result<(), Denied> {
+                Err(Denied)
+            }
+            fn cpu_nanos(&self) -> u64 {
+                0
+            }
+            fn fill_random(&mut self, _: &mut [u8]) {}
+            fn memory(&self) -> MemoryTotals {
+                MemoryTotals {
+                    total_bytes: 0,
+                    free_bytes: 0,
+                }
+            }
+            fn process_count(&self) -> u32 {
+                1
+            }
+            fn kernel_version(&self) -> &str {
+                "test"
+            }
+        }
+        impl Tty for TestHost {}
+        impl Filesystem<TestRes> for TestHost {
+            fn file_access(&self, file: &TestFile) -> FileAccess {
+                file.access
+            }
+            fn can_exec_file(&self, _: &TestFile) -> bool {
+                true
+            }
+            fn same_file(&self, _: &TestFile, _: &TestFile) -> bool {
+                true
+            }
+            async fn open(
+                &mut self,
+                _: Option<&TestFile>,
+                _: &str,
+                _: &str,
+                _: OpenRequest,
+                _: &syscall::Credentials,
+            ) -> Result<TestFile, syscall::FsOpError> {
+                Ok(self.file.clone())
+            }
+            async fn stat_file(&self, file: &TestFile) -> Result<FileStat, syscall::FsOpError> {
+                Ok(FileStat {
+                    dev: 1,
+                    ino: 1,
+                    kind: NodeKind::File,
+                    permissions: 0o644,
+                    nlink: 1,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                    size: file.bytes.len() as u64,
+                    access_nanos: 0,
+                    modified_nanos: 0,
+                    status_nanos: 0,
+                })
+            }
+            async fn read_at(
+                &self,
+                file: &TestFile,
+                offset: u64,
+                max_bytes: usize,
+            ) -> Result<Bytes, syscall::FsOpError> {
+                let start = (offset as usize).min(file.bytes.len());
+                let end = start.saturating_add(max_bytes).min(file.bytes.len());
+                Ok(file.bytes.slice(start..end))
+            }
+        }
+
+        ensure_pool();
+        let page = PhysFrame::SIZE as u64;
+        let start = PhysFrame::SIZE;
+        let end = 1usize << 32;
+        let space = NativeSpace::new(DummyTables, start as u64, end as u64);
+        let user = VirtRange::new(VirtAddr::new(start), end - start);
+        let baseline = crate::memory::user_heap_stats().allocated_bytes;
+
+        // Open a 500-byte regular file via descriptors slot 3.
+        let mut payload = alloc::vec![0u8; 500];
+        payload[..16].copy_from_slice(b"FILE-MMAP-COW!!!");
+        let file = TestFile {
+            bytes: Bytes::from(payload),
+            access: FileAccess::ReadOnly,
+        };
+        let mut descs = syscall::standard_streams::<TestRes>();
+        let fd = descs
+            .insert_entry(helios_unix::FileDescriptorEntry::new(
+                helios_unix::FileDescriptor::File(helios_unix::OpenFile::new(file.clone())),
+                false,
+            ))
+            .expect("insert fd") as u64;
+
+        let mut process = Process::with_descriptors(
+            Abi::X86_64,
+            NonZeroU32::new(1).unwrap(),
+            0x50_0000,
+            descs,
+            Start::default(),
+        );
+        let mut host = TestHost { file };
+        let mut memory = LinuxMemory {
+            space: &space,
+            user,
+            stack_growth: None,
+        };
+        let mut call = |number: u64,
+                        arguments: [u64; 6],
+                        memory: &mut LinuxMemory<'_, NativeSpace<DummyTables>>|
+         -> u64 {
+            let mut thread = TestThread;
+            match poll_ready(dispatch(
+                &mut process,
+                Call { number, arguments },
+                memory,
+                &mut thread,
+                &mut host,
+            )) {
+                ControlFlow::Continue(SyscallOutcome::Return(v)) => v,
+                other => panic!("unexpected syscall outcome: {other:?}"),
+            }
+        };
+
+        const SYS_MMAP: u64 = 9;
+        const PROT_READ: u64 = 1;
+        const PROT_RW: u64 = 3;
+        const MAP_SHARED: u64 = 0x01;
+        const MAP_PRIVATE: u64 = 0x02;
+        const MAP_FIXED: u64 = 0x10;
+        const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
+
+        // Map 3 pages of a 500-byte file MAP_PRIVATE | PROT_RW:
+        // only page 0 commits a frame from UserMemoryPool; pages 1..2 stay uncommitted zero-tail!
+        let priv_addr = call(
+            SYS_MMAP,
+            [0x100_0000, 3 * page, PROT_RW, MAP_PRIVATE, fd, 0],
+            &mut memory,
+        );
+        assert_eq!(priv_addr, 0x100_0000);
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + PhysFrame::SIZE
+        );
+
+        // Read-only MAP_SHARED commits 1 frame and enforces read-only permissions.
+        let ro_shared = call(
+            SYS_MMAP,
+            [
+                0x200_0000,
+                2 * page,
+                PROT_READ,
+                MAP_SHARED | MAP_FIXED_NOREPLACE,
+                fd,
+                0,
+            ],
+            &mut memory,
+        );
+        assert_eq!(ro_shared, 0x200_0000);
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 2 * PhysFrame::SIZE
+        );
+        assert!(
+            space
+                .check_writable(VirtAddr::new(ro_shared as usize), 1)
+                .is_err()
+        );
+
+        // MAP_FIXED_NOREPLACE collides -> -EEXIST (17), MAP_FIXED replaces cleanly.
+        assert_eq!(
+            call(
+                SYS_MMAP,
+                [
+                    ro_shared,
+                    page,
+                    PROT_READ,
+                    MAP_PRIVATE | MAP_FIXED_NOREPLACE,
+                    fd,
+                    0
+                ],
+                &mut memory,
+            ),
+            17u64.wrapping_neg()
+        );
+        assert_eq!(
+            call(
+                SYS_MMAP,
+                [ro_shared, page, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0],
+                &mut memory,
+            ),
+            ro_shared
+        );
+
+        // Fork (`clone_cow`): 0 additional frames in UserMemoryPool; both spaces share page 0.
+        let child_space = space.clone_cow().unwrap();
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 2 * PhysFrame::SIZE
+        );
+        assert!(space.is_page_shared(VirtAddr::new(priv_addr as usize)));
+        assert!(child_space.is_page_shared(VirtAddr::new(priv_addr as usize)));
+
+        // Child write breaks CoW (+1 frame in UserMemoryPool); parent retains original bytes & zero-tail.
+        child_space
+            .write(VirtAddr::new(priv_addr as usize), b"CHILD-MUTATED!!!")
+            .unwrap();
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 3 * PhysFrame::SIZE
+        );
+        let mut parent_buf = [0xffu8; 32];
+        let mut child_buf = [0xffu8; 32];
+        let mut eof_tail = [0xffu8; 32];
+        space
+            .read(VirtAddr::new(priv_addr as usize), &mut parent_buf)
+            .unwrap();
+        child_space
+            .read(VirtAddr::new(priv_addr as usize), &mut child_buf)
+            .unwrap();
+        space
+            .read(VirtAddr::new((priv_addr + 500) as usize), &mut eof_tail)
+            .unwrap();
+        assert_eq!(&parent_buf[..16], b"FILE-MMAP-COW!!!");
+        assert_eq!(&child_buf[..16], b"CHILD-MUTATED!!!");
+        assert!(eof_tail.iter().all(|&b| b == 0));
+
+        drop(child_space);
+        drop(space);
+        assert_eq!(crate::memory::user_heap_stats().allocated_bytes, baseline);
+    }
+
+    #[test]
+    fn dynamic_elf_loading_and_interpreter_confinement_for_x86_64_and_aarch64() {
+        use crate::test_support::UnsupportedStorage;
+        use crate::vfs::BOOT_DEVICE;
+        use crate::{
+            BootFs, ContainerConfig, ContainerId, ContainerMountSharing, ContainerMountSpec,
+            DirectoryAuthorityRights, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
+            LinuxContainer, ProcessAuthority, SharedOwner,
+        };
+        use helios_linux::syscall::{Credentials, UtsField};
+
+        ensure_pool();
+        let entropy = crate::RootEntropy::from_platform(
+            &crate::test_support::TestCpu::with_entropy(0x42),
+            None,
+            None,
+            crate::MachineGeneration::new(None),
+        )
+        .expect("root entropy");
+
+        for (abi, isa, user_end) in [
+            (
+                Abi::X86_64,
+                helios_hal::native::InstructionSet::X86_64,
+                1usize << 32,
+            ),
+            (
+                Abi::Aarch64,
+                helios_hal::native::InstructionSet::Aarch64,
+                1usize << 32,
+            ),
+        ] {
+            let cpu = NativeTestCpu { isa, user_end };
+            let interp_elf: &'static [u8] =
+                Box::leak(build_test_elf(abi, 3, 0, None).into_boxed_slice());
+            let bad_recursive: &'static [u8] =
+                Box::leak(build_test_elf(abi, 3, 0, Some(b"/lib/ld.so\0")).into_boxed_slice());
+            let pie_main: &'static [u8] =
+                Box::leak(build_test_elf(abi, 3, 0, Some(b"/lib/ld.so\0")).into_boxed_slice());
+            let pie_escape: &'static [u8] = Box::leak(
+                build_test_elf(abi, 3, 0, Some(b"/../../../lib/ld.so\0")).into_boxed_slice(),
+            );
+            let pie_missing: &'static [u8] =
+                Box::leak(build_test_elf(abi, 3, 0, Some(b"/lib/missing.so\0")).into_boxed_slice());
+            let pie_recursive: &'static [u8] = Box::leak(
+                build_test_elf(abi, 3, 0, Some(b"/lib/bad_interp.so\0")).into_boxed_slice(),
+            );
+            let pie_noexec: &'static [u8] =
+                Box::leak(build_test_elf(abi, 3, 0, Some(b"/noexec/ld.so\0")).into_boxed_slice());
+            let pie_noread: &'static [u8] =
+                Box::leak(build_test_elf(abi, 3, 0, Some(b"/noread/ld.so\0")).into_boxed_slice());
+
+            let dirs: &'static [EmbeddedBootDirectory] = Box::leak(
+                alloc::vec![
+                    EmbeddedBootDirectory::new("root", 0),
+                    EmbeddedBootDirectory::new("root/bin", 0),
+                    EmbeddedBootDirectory::new("root/lib", 0),
+                    EmbeddedBootDirectory::new("root/noexec", 0),
+                    EmbeddedBootDirectory::new("root/noread", 0),
+                    EmbeddedBootDirectory::new("noexec_src", 0),
+                    EmbeddedBootDirectory::new("noread_src", 0),
+                ]
+                .into_boxed_slice(),
+            );
+            let entries: &'static [EmbeddedBootFile] = Box::leak(
+                alloc::vec![
+                    EmbeddedBootFile::new("root/lib/ld.so", interp_elf, 0),
+                    EmbeddedBootFile::new("root/lib/bad_interp.so", bad_recursive, 0),
+                    EmbeddedBootFile::new("root/bin/pie", pie_main, 0),
+                    EmbeddedBootFile::new("noexec_src/ld.so", interp_elf, 0),
+                    EmbeddedBootFile::new("noread_src/ld.so", interp_elf, 0),
+                ]
+                .into_boxed_slice(),
+            );
+            let boot_fs = BootFs::new(EmbeddedBootFs::new(dirs, entries), BOOT_DEVICE);
+            let host_ns =
+                crate::Namespace::<UnsupportedStorage>::new(crate::MountTable::new(boot_fs, 8));
+            let root_auth = ProcessAuthority::root();
+            let container = poll_ready(LinuxContainer::create(
+                ContainerId::new(core::num::NonZeroU64::new(1).unwrap()),
+                &root_auth,
+                &host_ns,
+                ProcessAuthority::root(),
+                ContainerConfig {
+                    root: ContainerMountSpec {
+                        source_path: String::from("/root"),
+                        target_path: String::from("/"),
+                        rights: DirectoryAuthorityRights::READ | DirectoryAuthorityRights::EXECUTE,
+                        sharing: ContainerMountSharing::Shared,
+                    },
+                    mounts: alloc::vec![
+                        ContainerMountSpec {
+                            source_path: String::from("/noexec_src"),
+                            target_path: String::from("/noexec"),
+                            rights: DirectoryAuthorityRights::READ,
+                            sharing: ContainerMountSharing::Shared,
+                        },
+                        ContainerMountSpec {
+                            source_path: String::from("/noread_src"),
+                            target_path: String::from("/noread"),
+                            rights: DirectoryAuthorityRights::EXECUTE,
+                            sharing: ContainerMountSharing::Shared,
+                        },
+                    ],
+                    shared_owner: SharedOwner { uid: 0, gid: 0 },
+                    credentials: Credentials::root(),
+                    hostname: UtsField::from_bytes(b"helios-elf").unwrap(),
+                    domainname: UtsField::from_bytes(b"").unwrap(),
+                },
+            ))
+            .expect("create container");
+
+            let creds = Credentials::root();
+
+            // 1. Valid ET_DYN + PT_INTERP loads and maps at non-overlapping bases with complete auxv.
+            let loaded = poll_ready(LinuxExecutable::load_in_container(
+                &cpu,
+                &container,
+                "/",
+                Bytes::from_static(pie_main),
+                Some(String::from("/bin/pie")),
+                &creds,
+            ))
+            .expect("load dynamic PIE");
+            let mapped = map_linux_image(
+                &cpu,
+                &entropy,
+                &loaded,
+                &[String::from("custom-argv0")],
+                &[String::from("PATH=/bin")],
+                &creds,
+                false,
+            )
+            .expect("map dynamic PIE");
+
+            // Parse auxv directly out of the mapped NativeSpace stack.
+            let read_u64 = |addr: u64| {
+                let mut raw = [0u8; 8];
+                mapped
+                    .space
+                    .read(VirtAddr::new(addr as usize), &mut raw)
+                    .unwrap();
+                u64::from_le_bytes(raw)
+            };
+            let mut cursor = mapped.context.stack.raw() as u64;
+            let argc = read_u64(cursor);
+            assert_eq!(argc, 1);
+            cursor += 8 + (argc + 1) * 8;
+            while read_u64(cursor) != 0 {
+                cursor += 8;
+            }
+            cursor += 8;
+            let mut auxv = alloc::collections::BTreeMap::new();
+            loop {
+                let tag = read_u64(cursor);
+                let val = read_u64(cursor + 8);
+                cursor += 16;
+                if tag == 0 {
+                    break;
+                }
+                auxv.insert(tag, val);
+            }
+            let at_phdr = *auxv.get(&3).expect("AT_PHDR");
+            let at_phent = *auxv.get(&4).expect("AT_PHENT");
+            let at_phnum = *auxv.get(&5).expect("AT_PHNUM");
+            let at_base = *auxv.get(&7).expect("AT_BASE");
+            let at_flags = *auxv.get(&8).expect("AT_FLAGS");
+            let at_entry = *auxv.get(&9).expect("AT_ENTRY");
+            let at_execfn = *auxv.get(&31).expect("AT_EXECFN");
+
+            assert_eq!(at_phent, 56);
+            assert_eq!(at_phnum, 4);
+            assert_eq!(at_flags, 0);
+            assert_ne!(at_base, 0);
+            assert_ne!(at_entry, mapped.context.entry.raw() as u64);
+            // Context entry is the interpreter's entry (at_base + 0x1000).
+            assert_eq!(mapped.context.entry.raw() as u64, at_base + 0x1000);
+            // Program headers at AT_PHDR match the main ELF's program headers.
+            let mut phdr_bytes = [0u8; 56];
+            mapped
+                .space
+                .read(VirtAddr::new(at_phdr as usize), &mut phdr_bytes)
+                .unwrap();
+            assert_eq!(&phdr_bytes, &pie_main[64..120]);
+            // Interpreter bytes at AT_BASE match the interpreter ELF magic.
+            let mut interp_magic = [0u8; 4];
+            mapped
+                .space
+                .read(VirtAddr::new(at_base as usize), &mut interp_magic)
+                .unwrap();
+            assert_eq!(&interp_magic, b"\x7fELF");
+            // AT_EXECFN carries the executed binary path (not argv[0]).
+            let mut execfn_bytes = [0u8; 8];
+            mapped
+                .space
+                .read(VirtAddr::new(at_execfn as usize), &mut execfn_bytes)
+                .unwrap();
+            assert_eq!(&execfn_bytes, b"/bin/pie");
+            // program_break sits below interpreter so brk growth succeeds.
+            assert!(mapped.program_break < at_base);
+
+            // 2. `..` traversal in PT_INTERP stays confined to container root.
+            poll_ready(LinuxExecutable::load_in_container(
+                &cpu,
+                &container,
+                "/",
+                Bytes::from_static(pie_escape),
+                Some(String::from("/bin/pie_escape")),
+                &creds,
+            ))
+            .expect("clamped container-relative PT_INTERP resolves inside root");
+
+            // 3. Missing interpreter -> NotFound.
+            let missing_err = poll_ready(LinuxExecutable::load_in_container(
+                &cpu,
+                &container,
+                "/",
+                Bytes::from_static(pie_missing),
+                None,
+                &creds,
+            ))
+            .err()
+            .expect("missing interpreter fails");
+            assert_eq!(missing_err.kind, ProgramExecErrorKind::NotFound);
+
+            // 4. Interpreter on READ-only (no EXECUTE) mount -> PermissionDenied.
+            let noexec_err = poll_ready(LinuxExecutable::load_in_container(
+                &cpu,
+                &container,
+                "/",
+                Bytes::from_static(pie_noexec),
+                None,
+                &creds,
+            ))
+            .err()
+            .expect("noexec interpreter fails");
+            assert_eq!(noexec_err.kind, ProgramExecErrorKind::PermissionDenied);
+
+            // 5. Interpreter on EXECUTE-only (no READ) mount -> PermissionDenied.
+            let noread_err = poll_ready(LinuxExecutable::load_in_container(
+                &cpu,
+                &container,
+                "/",
+                Bytes::from_static(pie_noread),
+                None,
+                &creds,
+            ))
+            .err()
+            .expect("noread interpreter fails");
+            assert_eq!(noread_err.kind, ProgramExecErrorKind::PermissionDenied);
+
+            // 6. Recursive PT_INTERP inside interpreter -> InvalidBinary(Interpreter).
+            let rec_err = poll_ready(LinuxExecutable::load_in_container(
+                &cpu,
+                &container,
+                "/",
+                Bytes::from_static(pie_recursive),
+                None,
+                &creds,
+            ))
+            .err()
+            .expect("recursive interpreter fails");
+            assert_eq!(rec_err.kind, ProgramExecErrorKind::InvalidBinary);
+            assert_eq!(
+                rec_err.detail,
+                ProgramExecErrorDetail::LinuxImageInvalid(crate::LinuxImageRefusal::Interpreter)
+            );
+        }
     }
 }

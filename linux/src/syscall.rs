@@ -206,6 +206,14 @@ pub trait VirtualMemory: UserMemory {
     /// The first free range of `length` bytes at or above `hint`, else
     /// anywhere.
     fn free_range(&self, hint: u64, length: u64) -> Option<u64>;
+
+    /// Populates already-mapped pages starting at `address` with `bytes`
+    /// regardless of their user write permission, committing frames from the
+    /// user memory pool on demand and returning [`MapError::OutOfMemory`] on
+    /// exhaustion.
+    fn populate(&mut self, address: u64, bytes: &[u8]) -> Result<(), MapError> {
+        self.write(address, bytes).map_err(|_| MapError::Address)
+    }
 }
 
 /// Initial stack and TLS overrides for a cloned thread.

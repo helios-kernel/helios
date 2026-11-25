@@ -4901,10 +4901,11 @@ where
         && let Some(writer) = socket.pair_writer()
     {
         let fdflags = caller.data().descriptors.fdflags(fd)?;
-        let written = p1_send_gathered(&memory, &mut gather, |chunk| {
-            p1_send_to_socketpair(&writer, chunk, fdflags)
-        })
-        .await?;
+        let mut stream = Preview1SocketpairStream {
+            writer: &writer,
+            fdflags,
+        };
+        let written = p1_send_gathered(&memory, &mut gather, &mut stream).await?;
         memory.write_u32(so_datalen, written).await?;
         return Ok(p1::errno::SUCCESS);
     }
@@ -4932,16 +4933,13 @@ where
     } else {
         u64::MAX
     };
-    let written = p1_send_gathered(&memory, &mut gather, |chunk| {
-        let (service, stream) = (&service, stream_id);
-        async move {
-            service
-                .tcp_write_all_bytes(stream, Bytes::from(chunk), timeout)
-                .await
-                .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))
-        }
-    })
-    .await?;
+    let mut stream = Preview1TcpStream {
+        service: &service,
+        stream: stream_id,
+        timeout,
+        fdflags,
+    };
+    let written = p1_send_gathered(&memory, &mut gather, &mut stream).await?;
     memory.write_u32(so_datalen, written).await?;
     Ok(p1::errno::SUCCESS)
 }
@@ -5070,6 +5068,88 @@ pub(super) async fn p1_send_to_socketpair(
         };
     }
     writer.write(bytes).await.map_err(|_| p1::errno::IO)
+}
+
+/// A socketpair's writer half, which a gathered send takes one chunk at a
+/// time ([`p1_send_to_socketpair`]).
+pub(super) struct Preview1SocketpairStream<'a> {
+    pub(super) writer: &'a crate::ByteWriter,
+    pub(super) fdflags: u16,
+}
+
+impl Preview1ChunkedStream for Preview1SocketpairStream<'_> {
+    async fn send(
+        &mut self,
+        memory: &Preview1AsyncMemory,
+        gather: &mut Preview1Gather,
+        len: usize,
+    ) -> Result<Result<(), i32>, GuestAccessError> {
+        let chunk = gather.next_chunk(memory).await?.unwrap_or_default();
+        debug_assert_eq!(chunk.len(), len, "a chunk is as long as the loop asked");
+        Ok(p1_send_to_socketpair(self.writer, chunk, self.fdflags).await)
+    }
+}
+
+/// A connected TCP stream, which a gathered send takes one chunk at a time
+/// straight from guest memory into transmit memory.
+///
+/// Each chunk brings its guest pages in and copies them into transmit memory
+/// in the same poll so no page can leave between the check and the copy. If
+/// transmit memory is short right now (so the fill closure did not run and
+/// `gather` was not advanced), the single chunk is staged once so
+/// `tcp_write_all` can wait for transmit space across polls. An empty chunk
+/// sends one empty payload.
+pub(super) struct Preview1TcpStream<'a, Net: crate::ComponentNetworkService> {
+    pub(super) service: &'a Net,
+    pub(super) stream: Net::TcpStream,
+    pub(super) timeout: u64,
+    pub(super) fdflags: u16,
+}
+
+impl<Net: crate::ComponentNetworkService> Preview1ChunkedStream for Preview1TcpStream<'_, Net> {
+    async fn send(
+        &mut self,
+        memory: &Preview1AsyncMemory,
+        gather: &mut Preview1Gather,
+        len: usize,
+    ) -> Result<Result<(), i32>, GuestAccessError> {
+        let written = if len == 0 {
+            self.service
+                .tcp_write_all_bytes(self.stream, Bytes::new(), self.timeout)
+                .await
+        } else {
+            gather.bring_in(memory, len).await?;
+            match self
+                .service
+                .tcp_payload(len, |piece| gather.fill_present(memory, piece))
+            {
+                Ok(payload) => {
+                    self.service
+                        .tcp_write_all_bytes(self.stream, payload, self.timeout)
+                        .await
+                }
+                Err(error)
+                    if matches!(
+                        error.detail,
+                        crate::NetworkErrorDetail::TransmitMemoryReplenishing
+                            | crate::NetworkErrorDetail::TransmitMemoryExhausted
+                    ) =>
+                {
+                    let chunk = gather.next_chunk(memory).await?.unwrap_or_default();
+                    let pieces = self
+                        .service
+                        .tcp_payload_pieces(chunk.len(), |offset, piece| {
+                            piece.copy_from_slice(&chunk[offset..][..piece.len()]);
+                        });
+                    self.service
+                        .tcp_write_all(self.stream, pieces, self.timeout)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        };
+        Ok(written.map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, self.fdflags)))
+    }
 }
 
 /// Write one chunk to stdout/stderr, respecting the descriptor's
@@ -6805,12 +6885,10 @@ mod tests {
             .copied()
             .collect();
         let mut gather = Preview1Gather::new(&memory, &layout).expect("buffers fit");
-        let mut chunks = Vec::new();
-        let sent = run(p1_send_gathered(&memory, &mut gather, |chunk| {
-            chunks.push(chunk);
-            core::future::ready(Ok(()))
-        }))
-        .expect("every chunk is taken");
+        let mut stream = RecordingStream::accepting(usize::MAX);
+        let sent =
+            run(p1_send_gathered(&memory, &mut gather, &mut stream)).expect("every chunk is taken");
+        let chunks = stream.chunks;
         assert_eq!(sent as usize, expected.len());
         assert!(chunks.len() > 1);
         assert!(
@@ -6838,22 +6916,20 @@ mod tests {
         ))
         .expect("fits");
 
-        let mut calls = 0;
         let mut gather = Preview1Gather::new(&memory, &layout).expect("fits");
-        let sent = run(p1_send_gathered(&memory, &mut gather, |_| {
-            calls += 1;
-            core::future::ready(if calls == 1 {
-                Ok(())
-            } else {
-                Err(p1::errno::AGAIN)
-            })
-        }));
+        let sent = run(p1_send_gathered(
+            &memory,
+            &mut gather,
+            &mut RecordingStream::accepting(1),
+        ));
         assert_eq!(sent, Ok(GUEST_IO_CHUNK_BYTES as u32));
 
         let mut gather = Preview1Gather::new(&memory, &layout).expect("fits");
-        let sent = run(p1_send_gathered(&memory, &mut gather, |_| {
-            core::future::ready(Err(p1::errno::AGAIN))
-        }));
+        let sent = run(p1_send_gathered(
+            &memory,
+            &mut gather,
+            &mut RecordingStream::accepting(0),
+        ));
         assert_eq!(sent, Err(P1Stop::Errno(p1::errno::AGAIN)));
     }
 
@@ -6869,13 +6945,45 @@ mod tests {
         ))
         .expect("empty");
         let mut gather = Preview1Gather::new(&memory, &layout).expect("empty");
-        let mut calls = Vec::new();
-        let sent = run(p1_send_gathered(&memory, &mut gather, |chunk| {
-            calls.push(chunk.len());
-            core::future::ready(Ok(()))
-        }));
+        let mut stream = RecordingStream::accepting(usize::MAX);
+        let sent = run(p1_send_gathered(&memory, &mut gather, &mut stream));
         assert_eq!(sent, Ok(0));
-        assert_eq!(calls, [0]);
+        assert_eq!(stream.chunks.iter().map(Vec::len).collect::<Vec<_>>(), [0]);
+    }
+
+    /// A stream for [`p1_send_gathered`] that records every chunk it was
+    /// handed.
+    struct RecordingStream {
+        chunks: Vec<Vec<u8>>,
+        /// How many more chunks it takes before it refuses one.
+        accepts: usize,
+    }
+
+    impl RecordingStream {
+        fn accepting(accepts: usize) -> Self {
+            Self {
+                chunks: Vec::new(),
+                accepts,
+            }
+        }
+    }
+
+    impl Preview1ChunkedStream for RecordingStream {
+        async fn send(
+            &mut self,
+            memory: &Preview1AsyncMemory,
+            gather: &mut Preview1Gather,
+            len: usize,
+        ) -> Result<Result<(), i32>, GuestAccessError> {
+            let mut chunk = vec![0; len];
+            gather.fill(memory, &mut chunk).await?;
+            self.chunks.push(chunk);
+            if self.accepts == 0 {
+                return Ok(Err(p1::errno::AGAIN));
+            }
+            self.accepts -= 1;
+            Ok(Ok(()))
+        }
     }
 
     /// Guest memory of `len` payload bytes followed by one iovec naming

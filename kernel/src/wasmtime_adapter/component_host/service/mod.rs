@@ -735,6 +735,7 @@ async fn load_container_executable<CpuImpl, StorageImpl>(
     container: &crate::LinuxContainer<StorageImpl>,
     path: &str,
     argv: &mut ProgramArgv,
+    creds: &helios_linux::syscall::Credentials,
     timeline: &phases::Timeline,
 ) -> Result<LinuxExecutable, ProgramExecError>
 where
@@ -781,7 +782,15 @@ where
         });
     }
     timeline.record(cpu, LaunchPhase::LoadBegin);
-    let loaded = LinuxExecutable::load(cpu, bytes)?;
+    let loaded = LinuxExecutable::load_in_container(
+        cpu,
+        container,
+        "/",
+        bytes,
+        Some(path.to_owned()),
+        creds,
+    )
+    .await?;
     timeline.record(cpu, LaunchPhase::LoadComplete);
     Ok(loaded)
 }
@@ -918,6 +927,114 @@ impl ChildHandle {
             }),
         }
     }
+}
+
+/// Drain `child`'s stdout and stderr into kernel buffers bounded by
+/// `max_output_bytes` (combined across both streams). If the child writes past
+/// the bound, it is condemned and interrupted immediately, the pipe readers are
+/// dropped so the child observes closed streams, the child is reaped, and the
+/// caller receives [`ProgramExecErrorDetail::OutputLimitExceeded`].
+async fn drain_child_output_bounded<CpuImpl, Net, StorageImpl>(
+    mut child: ChildHandle,
+    max_output_bytes: usize,
+    runtime_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
+    instance_registry: &crate::InstanceRegistry,
+    cpu: &CpuImpl,
+) -> Result<(ExecResult, Option<MemoryFs>), ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let child_id = child.instance_id;
+    let stdout_reader = child.take_stdout();
+    let stderr_reader = child.take_stderr();
+    let remaining_budget = core::sync::atomic::AtomicUsize::new(max_output_bytes);
+    let overflowed = core::sync::atomic::AtomicBool::new(false);
+
+    let reserve_or_kill = |chunk_len: usize| -> bool {
+        if overflowed.load(AtomicOrdering::Acquire) {
+            return false;
+        }
+        let admitted = remaining_budget
+            .try_update(
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+                |remaining| remaining.checked_sub(chunk_len),
+            )
+            .is_ok();
+        if !admitted {
+            if !overflowed.swap(true, AtomicOrdering::AcqRel) {
+                let residency = super::super::store::user_residency();
+                let now = monotonic_nanos(cpu);
+                instance_registry.request_kill(
+                    child_id,
+                    crate::KillReason::OutOfMemory,
+                    now,
+                    &residency,
+                );
+                super::deliver_kill(runtime_state, child_id);
+            }
+            return false;
+        }
+        true
+    };
+
+    let drain = |reader: Option<crate::ByteReader>| async {
+        let mut bytes = Vec::new();
+        if let Some(reader) = reader {
+            while let Some(chunk) = reader.read().await {
+                if !reserve_or_kill(chunk.len()) {
+                    drop(reader);
+                    break;
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+        }
+        bytes
+    };
+
+    let stdout_task = drain(stdout_reader);
+    let stderr_task = drain(stderr_reader);
+    let wait_task = child.wait();
+    let (stdout, (stderr, exit)) =
+        futures::future::join(stdout_task, futures::future::join(stderr_task, wait_task)).await;
+
+    if overflowed.load(AtomicOrdering::Acquire) {
+        return Err(ProgramExecError {
+            kind: ProgramExecErrorKind::OutOfMemory,
+            detail: ProgramExecErrorDetail::OutputLimitExceeded,
+        });
+    }
+
+    let exit = exit?;
+    let exit_code = match exit.termination {
+        helios_unix::ChildTermination::Exited(code) => code,
+        helios_unix::ChildTermination::Signaled(sig) => {
+            128u32.saturating_add(u32::from(sig.signal))
+        }
+        helios_unix::ChildTermination::Trapped => {
+            return Err(ProgramExecError {
+                kind: ProgramExecErrorKind::Internal,
+                detail: ProgramExecErrorDetail::ChildTrapped,
+            });
+        }
+        helios_unix::ChildTermination::Killed => {
+            return Err(ProgramExecError {
+                kind: ProgramExecErrorKind::Internal,
+                detail: ProgramExecErrorDetail::ChildKilled,
+            });
+        }
+    };
+
+    Ok((
+        ExecResult {
+            instance_id: exit.instance_id,
+            exit_code,
+            output: crate::ExecOutput { stdout, stderr },
+        },
+        exit.filesystem,
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -2083,18 +2200,23 @@ where
         path: &str,
         mut launch: ProgramLaunch<Net, StorageImpl>,
     ) -> Result<ChildHandle, ProgramExecError> {
-        let container = launch
+        let container_launch = launch
             .container
             .as_ref()
-            .expect("container spawn carries a container")
-            .container
-            .clone();
+            .expect("container spawn carries a container");
+        let container = container_launch.container.clone();
+        let mut creds = container_launch
+            .credentials
+            .clone()
+            .unwrap_or_else(|| container.default_credentials().clone());
+        container.clamp_credentials(&mut creds);
         launch.cwd = validate_container_cwd(&container, launch.cwd.as_deref()).await?;
         let executable = load_container_executable(
             &exec_context.cpu,
             &container,
             path,
             &mut launch.argv,
+            &creds,
             &launch.timeline,
         )
         .await?;
@@ -2111,18 +2233,23 @@ where
         stdin: Vec<u8>,
         mut launch: ProgramLaunch<Net, StorageImpl>,
     ) -> Result<ExecResult, ProgramExecError> {
-        let container = launch
+        let container_launch = launch
             .container
             .as_ref()
-            .expect("container exec carries a container")
-            .container
-            .clone();
+            .expect("container exec carries a container");
+        let container = container_launch.container.clone();
+        let mut creds = container_launch
+            .credentials
+            .clone()
+            .unwrap_or_else(|| container.default_credentials().clone());
+        container.clamp_credentials(&mut creds);
         launch.cwd = validate_container_cwd(&container, launch.cwd.as_deref()).await?;
         let executable = load_container_executable(
             &exec_context.cpu,
             &container,
             path,
             &mut launch.argv,
+            &creds,
             &launch.timeline,
         )
         .await?;
@@ -2138,15 +2265,15 @@ where
 
     #[cfg(feature = "linux")]
     async fn load_overlay_executable(
-        &self,
         cpu: &CpuImpl,
         container: &crate::LinuxContainer<StorageImpl>,
         path: &str,
         fallback_bytes: Option<Bytes>,
         argv: &mut ProgramArgv,
+        creds: &helios_linux::syscall::Credentials,
         timeline: &phases::Timeline,
     ) -> Result<LinuxExecutable, ProgramExecError> {
-        match load_container_executable(cpu, container, path, argv, timeline).await {
+        match load_container_executable(cpu, container, path, argv, creds, timeline).await {
             Ok(executable) => Ok(executable),
             Err(error)
                 if error.kind == ProgramExecErrorKind::NotFound && fallback_bytes.is_some() =>
@@ -2154,11 +2281,19 @@ where
                 let bytes = fallback_bytes.expect("checked is_some above");
                 if let Some((interp, opt_arg)) = parse_shebang(&bytes) {
                     argv.rewrite_shebang(interp.clone(), opt_arg, path.to_owned());
-                    load_container_executable(cpu, container, &interp, argv, timeline).await
+                    load_container_executable(cpu, container, &interp, argv, creds, timeline).await
                 } else if is_linux_elf(&bytes) {
                     timeline.record(cpu, LaunchPhase::SourceRead);
                     timeline.record(cpu, LaunchPhase::LoadBegin);
-                    let loaded = LinuxExecutable::load(cpu, bytes)?;
+                    let loaded = LinuxExecutable::load_in_container(
+                        cpu,
+                        container,
+                        "/",
+                        bytes,
+                        Some(path.to_owned()),
+                        creds,
+                    )
+                    .await?;
                     timeline.record(cpu, LaunchPhase::LoadComplete);
                     Ok(loaded)
                 } else {
@@ -2180,23 +2315,27 @@ where
         fallback_bytes: Option<Bytes>,
         mut launch: ProgramLaunch<Net, StorageImpl>,
     ) -> Result<ChildHandle, ProgramExecError> {
-        let container = launch
+        let container_launch = launch
             .container
             .as_ref()
-            .expect("overlay spawn carries a container")
-            .container
-            .clone();
+            .expect("overlay spawn carries a container");
+        let container = container_launch.container.clone();
+        let mut creds = container_launch
+            .credentials
+            .clone()
+            .unwrap_or_else(|| container.default_credentials().clone());
+        container.clamp_credentials(&mut creds);
         launch.cwd = validate_container_cwd(&container, launch.cwd.as_deref()).await?;
-        let executable = self
-            .load_overlay_executable(
-                &exec_context.cpu,
-                &container,
-                path,
-                fallback_bytes,
-                &mut launch.argv,
-                &launch.timeline,
-            )
-            .await?;
+        let executable = Self::load_overlay_executable(
+            &exec_context.cpu,
+            &container,
+            path,
+            fallback_bytes,
+            &mut launch.argv,
+            &creds,
+            &launch.timeline,
+        )
+        .await?;
         self.spawn_loaded(exec_context, ProgramExecutable::Linux(executable), launch)
     }
 
@@ -2211,23 +2350,27 @@ where
         stdin: Vec<u8>,
         mut launch: ProgramLaunch<Net, StorageImpl>,
     ) -> Result<ExecResult, ProgramExecError> {
-        let container = launch
+        let container_launch = launch
             .container
             .as_ref()
-            .expect("overlay exec carries a container")
-            .container
-            .clone();
+            .expect("overlay exec carries a container");
+        let container = container_launch.container.clone();
+        let mut creds = container_launch
+            .credentials
+            .clone()
+            .unwrap_or_else(|| container.default_credentials().clone());
+        container.clamp_credentials(&mut creds);
         launch.cwd = validate_container_cwd(&container, launch.cwd.as_deref()).await?;
-        let executable = self
-            .load_overlay_executable(
-                &exec_context.cpu,
-                &container,
-                path,
-                fallback_bytes,
-                &mut launch.argv,
-                &launch.timeline,
-            )
-            .await?;
+        let executable = Self::load_overlay_executable(
+            &exec_context.cpu,
+            &container,
+            path,
+            fallback_bytes,
+            &mut launch.argv,
+            &creds,
+            &launch.timeline,
+        )
+        .await?;
         self.exec_loaded_buffered(
             exec_context,
             ProgramExecutable::Linux(executable),
@@ -2530,6 +2673,12 @@ where
         stdin: Vec<u8>,
         launch: ProgramLaunch<Net, StorageImpl>,
     ) -> Result<(ExecResult, Option<MemoryFs>), ProgramExecError> {
+        let runtime_state = exec_context.runtime_state.clone();
+        let instance_registry = exec_context.instance_registry.clone();
+        let cpu = exec_context.cpu.clone();
+        let max_output_bytes = runtime_state
+            .settings()
+            .get::<crate::process::BufferedExecOutputLimitSetting>();
         let mut child = self.spawn_loaded(exec_context, executable, launch)?;
 
         // Feed stdin in one shot, then close the writer to signal EOF.
@@ -2542,59 +2691,14 @@ where
             drop(writer);
         }
 
-        let stdout_reader = child.take_stdout();
-        let stderr_reader = child.take_stderr();
-
-        let stdout_task = async move {
-            let mut bytes = Vec::new();
-            if let Some(reader) = stdout_reader {
-                while let Some(chunk) = reader.read().await {
-                    bytes.extend_from_slice(&chunk);
-                }
-            }
-            bytes
-        };
-        let stderr_task = async move {
-            let mut bytes = Vec::new();
-            if let Some(reader) = stderr_reader {
-                while let Some(chunk) = reader.read().await {
-                    bytes.extend_from_slice(&chunk);
-                }
-            }
-            bytes
-        };
-
-        let wait_task = child.wait();
-        let (stdout, (stderr, exit)) =
-            futures::future::join(stdout_task, futures::future::join(stderr_task, wait_task)).await;
-        let exit = exit?;
-        let exit_code = match exit.termination {
-            helios_unix::ChildTermination::Exited(code) => code,
-            helios_unix::ChildTermination::Signaled(sig) => {
-                128u32.saturating_add(u32::from(sig.signal))
-            }
-            helios_unix::ChildTermination::Trapped => {
-                return Err(ProgramExecError {
-                    kind: ProgramExecErrorKind::Internal,
-                    detail: ProgramExecErrorDetail::ChildTrapped,
-                });
-            }
-            helios_unix::ChildTermination::Killed => {
-                return Err(ProgramExecError {
-                    kind: ProgramExecErrorKind::Internal,
-                    detail: ProgramExecErrorDetail::ChildKilled,
-                });
-            }
-        };
-
-        Ok((
-            ExecResult {
-                instance_id: exit.instance_id,
-                exit_code,
-                output: crate::ExecOutput { stdout, stderr },
-            },
-            exit.filesystem,
-        ))
+        drain_child_output_bounded(
+            child,
+            max_output_bytes,
+            &runtime_state,
+            &instance_registry,
+            &cpu,
+        )
+        .await
     }
 
     pub(crate) async fn aot_to_file(

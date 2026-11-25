@@ -35,8 +35,9 @@
 //! # Concurrency contract
 //!
 //! Every entry point takes `&self` and may be called from any processor.
-//! Control commands go through the shared `submit_chain` /
-//! `await_completion` pair, so the control queue lock is held only long
+//! Control commands go through the shared `submit_control` /
+//! `await_completion` pair, with their bytes in per-descriptor control
+//! slots, so the control queue lock is held only long
 //! enough to publish a chain and is never held across an await: several
 //! tasks have commands in flight at once and completions are routed back
 //! by descriptor identifier. The cursor queue works the same way on its
@@ -61,17 +62,22 @@ use helios_hal::display::{
     ScanoutList,
 };
 use helios_hal::io::{IoError, IoResult};
-use helios_hal::iommu::PhysicalRange;
+use helios_hal::iommu::{DmaAccess, PhysicalRange};
 use helios_hal::pmm::PhysFrameRange;
 
-use crate::bus::{DeviceBus, DmaAddressing, DmaPool};
+use helios_hal::dma::{DmaForeignMapping, DmaMemory};
+
+use crate::bus::DeviceBus;
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate_with, renegotiate};
 use crate::inflight::{
-    InFlight, await_completion, drain_to_idle, reinitialize_requests, submit_chain_with_payload,
+    InFlight, await_completion, drain_to_idle, reinitialize_requests, submit_lent,
 };
-use crate::journal::Journal;
+use crate::journal::{Journal, allocate_dma_buffer};
 use crate::notify::Notify;
-use crate::queue::{VirtQueue, negotiated_queue_size};
+use crate::queue::{
+    ControlSlots, Lend, MAX_CHAIN_BUFFERS, Part, TransportBuffer, TransportForeignMapping,
+    VirtQueue, control_slots, exchange_blocking, negotiated_queue_size,
+};
 use crate::resume::{
     DeviceReset, Lost, PolledError, QuiesceError, ReinitError, conclude, driver_ok, polled_command,
 };
@@ -94,6 +100,15 @@ const CURSOR_QUEUE_SIZE: u16 = 16;
 /// A control chain is the request, the memory-entry table that only
 /// `RESOURCE_ATTACH_BACKING` carries, and the writable response.
 const CONTROL_CHAIN_LIMIT: u16 = 3;
+
+/// The largest control request a slot holds: a command header followed by
+/// the memory-entry table of a full backing, which `RESOURCE_CREATE_BLOB`
+/// carries with the longer command of the two that take one.
+const CONTROL_REQUEST_BYTES: usize =
+    render::CREATE_BLOB_BYTES + MAX_BACKING_RANGES * MEM_ENTRY_BYTES;
+/// The largest control response a slot holds: the EDID block, which is
+/// longer than every other reply.
+const CONTROL_RESPONSE_BYTES: usize = EDID_RESPONSE_BYTES;
 /// A cursor command is a single readable buffer: the device answers by
 /// returning the descriptor, not by writing a reply.
 const CURSOR_CHAIN_LIMIT: u16 = 1;
@@ -211,6 +226,40 @@ struct FramebufferRecord {
     id: FramebufferId,
     mode: DisplayMode,
     format: PixelFormat,
+}
+
+/// One frame buffer entry with its active foreign DMA mappings kept alive
+/// until the device has released the resource.
+struct FramebufferEntry<T: VirtioTransport> {
+    record: FramebufferRecord,
+    _backing: ArrayVec<TransportForeignMapping<T>, MAX_BACKING_RANGES>,
+}
+
+/// Buffers or foreign mappings lent to the control queue until the device
+/// completes the chain.
+pub(super) enum GpuLent<T: VirtioTransport> {
+    None,
+    Buffer(TransportBuffer<T>),
+    Foreign(TransportForeignMapping<T>),
+}
+
+#[expect(
+    clippy::derivable_impls,
+    reason = "derive(Default) would require T: Default on the transport parameter"
+)]
+impl<T: VirtioTransport> Default for GpuLent<T> {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl<T: VirtioTransport> Lend for GpuLent<T> {
+    fn lent(&mut self, index: usize) -> Option<&mut [u8]> {
+        match (index, self) {
+            (0, Self::Buffer(buffer)) => Some(buffer.as_mut()),
+            _ => None,
+        }
+    }
 }
 
 /// One resource as it has to be created again on a device that lost it.
@@ -416,9 +465,13 @@ impl RequestSubject {
 pub struct VirtioGpuDevice<T: VirtioTransport> {
     transport: T,
     control: AsyncMutex<VirtQueue<T>>,
-    control_inflight: InFlight<{ CONTROL_QUEUE_SIZE as usize }>,
+    control_inflight: InFlight<{ CONTROL_QUEUE_SIZE as usize }, GpuLent<T>>,
+    /// Every control command and its response, one slot per descriptor.
+    control_slots: ControlSlots<TransportBuffer<T>>,
     cursor: AsyncMutex<VirtQueue<T>>,
     cursor_inflight: InFlight<{ CURSOR_QUEUE_SIZE as usize }>,
+    /// Every cursor command, one slot per descriptor.
+    cursor_slots: ControlSlots<TransportBuffer<T>>,
     /// Raised by every device interrupt: a completion may be waiting on
     /// either queue.
     completions: Notify,
@@ -426,7 +479,7 @@ pub struct VirtioGpuDevice<T: VirtioTransport> {
     display_events: Notify,
     /// Frame buffers this device holds, and the geometry each was
     /// created with.
-    framebuffers: Mutex<ArrayVec<FramebufferRecord, MAX_FRAMEBUFFERS>>,
+    framebuffers: Mutex<ArrayVec<FramebufferEntry<T>, MAX_FRAMEBUFFERS>>,
     /// Next resource id to hand out. Resource ids are the driver's to
     /// choose and `0` is reserved, so the counter starts at one and
     /// never reuses: a stale id then names nothing rather than naming
@@ -443,7 +496,7 @@ pub struct VirtioGpuDevice<T: VirtioTransport> {
     contexts: Mutex<render::ContextRecords>,
     /// The blob resources this device holds, and where in the aperture
     /// each mapped one sits.
-    blobs: Mutex<render::BlobRecords>,
+    blobs: Mutex<render::BlobEntries<T>>,
     /// Raised whenever a fence retires on any context. A broadcast,
     /// because every reader of a timeline is owed the same event; each
     /// re-reads the timeline it is following for itself.
@@ -465,9 +518,9 @@ pub struct VirtioGpuDevice<T: VirtioTransport> {
     restorable: Mutex<Restorable>,
     /// Control commands submitted and not yet collected, whose
     /// acknowledgement updates `restorable`.
-    commands: Journal<GpuChange, { CONTROL_QUEUE_SIZE as usize }>,
+    commands: Journal<GpuChange, T, { CONTROL_QUEUE_SIZE as usize }>,
     /// The same for the cursor queue.
-    cursor_commands: Journal<GpuChange, { CURSOR_QUEUE_SIZE as usize }>,
+    cursor_commands: Journal<GpuChange, T, { CURSOR_QUEUE_SIZE as usize }>,
     /// Set once a restore command timed out and the device is lost.
     lost: Lost,
 }
@@ -481,16 +534,6 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
     pub fn new(transport: T) -> IoResult<Self> {
         if transport.device_type() != DeviceType::Gpu {
             return Err(IoError::Unsupported);
-        }
-        // A frame buffer's pages belong to the caller and are published
-        // to the device exactly as they are. Behind a translation unit
-        // they would have to be mapped into this device's domain first,
-        // and nothing here owns that domain, so the first scanout would
-        // fetch from an address the unit refuses.
-        if transport.bus().dma().addressing() != DmaAddressing::Physical {
-            return Err(IoError::InvalidDeviceConfig(
-                "virtio-gpu behind a translation unit has no domain for its caller-owned frame buffers",
-            ));
         }
 
         let features = negotiate_with(&transport, |offered| {
@@ -514,6 +557,13 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
             CURSOR_CHAIN_LIMIT,
             features,
         )?;
+        let control_table = control_slots(
+            &transport,
+            &control,
+            CONTROL_REQUEST_BYTES,
+            CONTROL_RESPONSE_BYTES,
+        )?;
+        let cursor_table = control_slots(&transport, &cursor, UPDATE_CURSOR_BYTES, 0)?;
 
         let scanout_count = transport.read_config_u32(CONFIG_NUM_SCANOUTS);
         if scanout_count == 0 || scanout_count as usize > MAX_SCANOUTS {
@@ -555,8 +605,10 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
             transport,
             control: AsyncMutex::new(control),
             control_inflight: InFlight::new(),
+            control_slots: control_table,
             cursor: AsyncMutex::new(cursor),
             cursor_inflight: InFlight::new(),
+            cursor_slots: cursor_table,
             completions: Notify::new(),
             display_events: Notify::new(),
             framebuffers: Mutex::new(ArrayVec::new()),
@@ -661,40 +713,67 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
     /// only long enough to publish the chain and is never held across
     /// an await, so several commands are in flight at once and
     /// completions are routed back by descriptor identifier.
+    ///
+    /// `request` is copied into the command's control slot, and the
+    /// device's response header is copied back out into `response`.
+    /// `payload` is a run of memory this driver holds no pointer to,
+    /// carried between the request and the response: the one command that
+    /// has such a body is `SUBMIT_3D`, whose command buffer is the
+    /// guest's own pinned pages, which the device reads where the guest
+    /// wrote them. `tail` is caller memory the device writes after the
+    /// response, which is where a capability set lands.
     pub(crate) async fn control_exchange(
         &self,
-        inputs: &[&[u8]],
-        outputs: &mut [&mut [u8]],
+        request: &[&[u8]],
+        response: &mut [u8],
+        tail: &mut [&mut [u8]],
     ) -> IoResult<u32> {
-        self.control_exchange_with_payload(inputs, None, outputs)
-            .await
-    }
-
-    /// [`Self::control_exchange`], with a run of memory this driver
-    /// holds no pointer to carried between the request and the reply.
-    ///
-    /// The one command that has such a body is `SUBMIT_3D`, whose
-    /// command buffer is the guest's own pinned pages: the device reads
-    /// them where the guest wrote them.
-    pub(crate) async fn control_exchange_with_payload(
-        &self,
-        inputs: &[&[u8]],
-        payload: Option<PhysicalRange>,
-        outputs: &mut [&mut [u8]],
-    ) -> IoResult<u32> {
-        let token = submit_chain_with_payload(
+        let tail_bytes: usize = tail.iter().map(|slice| slice.len()).sum();
+        let lent = if tail_bytes == 0 {
+            GpuLent::None
+        } else {
+            let buffer = allocate_dma_buffer(
+                self.transport.bus().dma(),
+                tail_bytes,
+                DmaAccess::WRITE,
+                false,
+            )
+            .await?;
+            GpuLent::Buffer(buffer)
+        };
+        let mut parts: ArrayVec<Part<'_>, MAX_CHAIN_BUFFERS> = ArrayVec::new();
+        for bytes in request {
+            parts.push(Part::Request(bytes));
+        }
+        parts.push(Part::Response(response.len()));
+        if tail_bytes != 0 {
+            parts.push(Part::LentWrite {
+                buffer: 0,
+                range: 0..tail_bytes,
+            });
+        }
+        let ticket = submit_lent(
             &self.control_inflight,
             &self.control,
             &self.transport,
-            inputs,
-            payload,
-            outputs,
+            &self.control_slots,
+            &parts,
+            lent,
         )
-        .await?;
-        await_completion(&self.control_inflight, &self.control, token, || {
-            self.completions.notified()
-        })
         .await
+        .map_err(|error| error.into_error())?;
+        let reply = await_completion(&self.control, ticket, || self.completions.notified()).await?;
+        response.copy_from_slice(reply.response());
+        let written = reply.written();
+        if let GpuLent::Buffer(buffer) = reply.into_lent() {
+            let mut offset = 0;
+            for slice in tail.iter_mut() {
+                let end = offset + slice.len();
+                slice.copy_from_slice(&buffer.as_ref()[offset..end]);
+                offset = end;
+            }
+        }
+        Ok(written)
     }
 
     /// Runs one 2D control command and checks the response header.
@@ -712,7 +791,7 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
         } else {
             &all_inputs[..]
         };
-        let written = self.control_exchange(inputs, &mut [&mut *response]).await?;
+        let written = self.control_exchange(inputs, response, &mut []).await?;
         if (written as usize) < CTRL_HEADER_BYTES {
             return Err(IoError::DeviceFault.into());
         }
@@ -728,60 +807,62 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
     /// The completion is also what records `change`: a cursor command
     /// carries no refusal, so the device took it when it returned the
     /// descriptor, and whoever reaps that completion applies the change.
+    /// The command travels in its control slot and has no answer buffer,
+    /// so a record whose queue faulted is forgotten like any other.
     async fn cursor_command(&self, request: &[u8], change: GpuChange) -> DisplayResult<()> {
-        let sent = self
+        let (sent, ticket, displaced) = self
             .cursor_commands
             .send(
                 &self.cursor_inflight,
                 &self.cursor,
                 &self.transport,
+                &self.cursor_slots,
                 &[request],
                 0,
                 change,
             )
             .await?;
-        let completed = await_completion(&self.cursor_inflight, &self.cursor, sent.token(), || {
-            self.completions.notified()
-        })
-        .await;
+        // The cancelled cursor command this one's identifier belonged to
+        // was consumed by the device, which is all a cursor command's
+        // acknowledgement is.
+        displaced.settle(|_| true, |change| self.restorable.lock().apply(change));
+        let completed =
+            await_completion(&self.cursor, ticket, || self.completions.notified()).await;
         if completed.is_ok() {
             sent.settle(|_| true, |change| self.restorable.lock().apply(change));
         }
         self.cursor_commands.forget(&sent);
-        completed?;
+        let _reply = completed?;
         Ok(())
     }
 
     /// One control round trip on the bring-up path, polled rather than
     /// awaited. See [`VirtioGpuDevice::read_topology`].
     ///
-    /// Both buffers are kernel-heap allocations rather than locals, and
-    /// that is not a style choice: this runs on the boot stack, which
-    /// the platform maps outside the window the device's DMA pool
-    /// translates, so a device handed a stack address reads and writes
-    /// memory that is not this buffer and answers with a completion
-    /// whose reply never arrives. Every later command builds its buffers
-    /// inside a task future, which lives in the kernel's task arena and
-    /// translates correctly.
+    /// The command and its reply travel in the control slot of the
+    /// chain's head descriptor, memory the device owns, and the reply is
+    /// copied out of it. Nothing the device reads or writes is on the
+    /// boot stack, which the platform maps outside what the device's DMA
+    /// pool translates.
     fn blocking_command(
         &self,
         request: &[u8],
         response_bytes: usize,
         expected: u32,
     ) -> DisplayResult<Vec<u8>> {
-        let request = request.to_vec();
         let mut response = vec![0_u8; response_bytes];
         let mut queue = self
             .control
             .try_lock()
             .expect("virtio-gpu bring-up runs alone on the bootstrap processor");
-        let token = queue.submit(
+        let written = exchange_blocking(
+            &self.control_inflight,
+            &mut queue,
             &self.transport,
-            &[request.as_slice()],
-            &mut [response.as_mut_slice()],
+            &self.control_slots,
+            &[Part::Request(request), Part::Response(response_bytes)],
+            &mut response,
         )?;
-        queue.notify(&self.transport);
-        let written = queue.reap_blocking(&self.transport, token)?;
         drop(queue);
         if (written as usize) < CTRL_HEADER_BYTES {
             return Err(IoError::DeviceFault.into());
@@ -829,30 +910,34 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
         } else {
             &all_inputs[..]
         };
-        let sent = self
+        let (sent, ticket, displaced) = self
             .commands
             .send(
                 &self.control_inflight,
                 &self.control,
                 &self.transport,
+                &self.control_slots,
                 inputs,
                 CTRL_HEADER_BYTES,
                 change,
             )
             .await?;
-        let written = await_completion(&self.control_inflight, &self.control, sent.token(), || {
-            self.completions.notified()
-        })
-        .await;
-        if written.is_ok() {
-            sent.settle(Self::accepted, |change| {
-                self.restorable.lock().apply(change)
-            });
-        }
+        // The cancelled command this one's identifier belonged to was
+        // answered by the device: its change is the record's to take.
+        displaced.settle(Self::accepted, |change| {
+            self.restorable.lock().apply(change)
+        });
+        // A command whose queue faulted stays filed: the device may still
+        // write its answer buffer (see `crate::journal`).
+        let reply = await_completion(&self.control, ticket, || self.completions.notified()).await?;
+        sent.settle(Self::accepted, |change| {
+            self.restorable.lock().apply(change)
+        });
         self.commands.forget(&sent);
-        if (written? as usize) < CTRL_HEADER_BYTES {
+        if (reply.written() as usize) < CTRL_HEADER_BYTES {
             return Err(IoError::DeviceFault.into());
         }
+        drop(reply);
         check_response(&sent.response(), RESP_OK_NODATA, subject)
     }
 
@@ -1059,8 +1144,8 @@ impl<T: VirtioTransport> VirtioGpuDevice<T> {
         self.framebuffers
             .lock()
             .iter()
-            .find(|record| record.id == framebuffer)
-            .copied()
+            .find(|entry| entry.record.id == framebuffer)
+            .map(|entry| entry.record)
             .ok_or(DisplayError::UnknownFramebuffer(framebuffer))
     }
 
@@ -1157,10 +1242,13 @@ impl<T: VirtioTransport> helios_hal::display::DisplayDevice for VirtioGpuDevice<
         if frame_bytes == 0 || backing_bytes < frame_bytes {
             return Err(DisplayError::InvalidParameter);
         }
-        let entries = encode_mem_entries(backing).map_err(|error| match error {
-            MemEntryError::Empty => DisplayError::InvalidParameter,
-            MemEntryError::Unrepresentable => DisplayError::Transport(IoError::DeviceFault),
-        })?;
+        let (entries, backing_mappings) =
+            encode_mem_entries(self.transport.bus().dma(), backing, DmaAccess::READ).map_err(
+                |error| match error {
+                    MemEntryError::Empty => DisplayError::InvalidParameter,
+                    MemEntryError::Unrepresentable => DisplayError::Transport(IoError::DeviceFault),
+                },
+            )?;
 
         let id = FramebufferId::new(self.next_resource.fetch_add(1, Ordering::Relaxed));
         // The record is claimed before the device is told, so a second
@@ -1169,11 +1257,16 @@ impl<T: VirtioTransport> helios_hal::display::DisplayDevice for VirtioGpuDevice<
         {
             let mut framebuffers = self.framebuffers.lock();
             if framebuffers.is_full() {
+                drop(framebuffers);
+                drop(backing_mappings);
                 return Err(DisplayError::TooManyFramebuffers {
                     limit: MAX_FRAMEBUFFERS,
                 });
             }
-            framebuffers.push(FramebufferRecord { id, mode, format });
+            framebuffers.push(FramebufferEntry {
+                record: FramebufferRecord { id, mode, format },
+                _backing: backing_mappings,
+            });
         }
         // The restore record takes the resource when the device
         // acknowledges the create, and marks it backed when it
@@ -1209,7 +1302,14 @@ impl<T: VirtioTransport> helios_hal::display::DisplayDevice for VirtioGpuDevice<
             Err(error) => Err(error),
         };
         if let Err(error) = attached {
-            self.framebuffers.lock().retain(|record| record.id != id);
+            let removed = {
+                let mut framebuffers = self.framebuffers.lock();
+                framebuffers
+                    .iter()
+                    .position(|held| held.record.id == id)
+                    .map(|index| framebuffers.swap_remove(index))
+            };
+            drop(removed);
             // The caller never learns this resource's id, so the device
             // is not asked to replay it.
             self.restorable
@@ -1253,10 +1353,16 @@ impl<T: VirtioTransport> helios_hal::display::DisplayDevice for VirtioGpuDevice<
         )
         .await?;
         // Only once the device has let the resource go: until then the
-        // caller's pages are still on loan to it.
-        self.framebuffers
-            .lock()
-            .retain(|held| held.id != framebuffer);
+        // caller's pages are still on loan to it. Drop outside the lock
+        // so unmapping foreign IOMMU entries never runs under the spin mutex.
+        let removed = {
+            let mut framebuffers = self.framebuffers.lock();
+            framebuffers
+                .iter()
+                .position(|held| held.record.id == framebuffer)
+                .map(|index| framebuffers.swap_remove(index))
+        };
+        drop(removed);
         Ok(())
     }
 
@@ -1552,31 +1658,47 @@ pub(crate) enum MemEntryError {
 /// The caller has already refused a backing store of more than
 /// [`MAX_BACKING_RANGES`] ranges, which is what makes the table a value
 /// rather than an allocation.
-pub(crate) fn encode_mem_entries(
+pub(crate) fn encode_mem_entries<P: DmaMemory>(
+    dma: &P,
     backing: &[PhysFrameRange],
-) -> Result<MemEntryTable, MemEntryError> {
+    access: DmaAccess,
+) -> Result<
+    (
+        MemEntryTable,
+        ArrayVec<P::ForeignMapping, MAX_BACKING_RANGES>,
+    ),
+    MemEntryError,
+> {
     assert!(
         backing.len() <= MAX_BACKING_RANGES,
         "a backing store of {} ranges reached the encoder past the {MAX_BACKING_RANGES}-range check",
         backing.len()
     );
     let mut table = MemEntryTable::new();
+    let mut mappings = ArrayVec::new();
     for range in backing {
         if range.is_empty() {
             return Err(MemEntryError::Empty);
         }
-        let address =
+        let physical =
             u64::try_from(range.start.phys_addr()).map_err(|_| MemEntryError::Unrepresentable)?;
         let length =
             u32::try_from(range.byte_size()).map_err(|_| MemEntryError::Unrepresentable)?;
+        let mapping = dma
+            .map_foreign(PhysicalRange::new(physical, u64::from(length)), access)
+            .map_err(|_| MemEntryError::Unrepresentable)?;
+        let address = mapping.device_address().get();
         let mut entry = [0_u8; MEM_ENTRY_BYTES];
         entry[0..8].copy_from_slice(&address.to_le_bytes());
         entry[8..12].copy_from_slice(&length.to_le_bytes());
         table
             .try_extend_from_slice(&entry)
             .expect("the range count is bounded by MAX_BACKING_RANGES");
+        mappings
+            .try_push(mapping)
+            .expect("the range count is bounded by MAX_BACKING_RANGES");
     }
-    Ok(table)
+    Ok((table, mappings))
 }
 
 fn encode_set_scanout(

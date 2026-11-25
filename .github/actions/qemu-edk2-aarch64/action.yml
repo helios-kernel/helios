@@ -1,0 +1,35 @@
+name: Stage QEMU prebuilt AArch64 EDK2 firmware
+description: >-
+  Downloads and SHA-256-verifies QEMU's prebuilt `edk2-aarch64-code.fd` and
+  `edk2-arm-vars.fd` from the pinned QEMU v10.2.1 release and exports
+  `HELIOS_EDK2_AARCH64_CODE`. Avoids Ubuntu 26.04's `qemu-efi-aarch64`
+  (2025.11-3ubuntu7.3), which loops on a level-2 Prefetch Abort at `0x5200`
+  under `-cpu max`.
+runs:
+  using: composite
+  steps:
+    - name: Stage QEMU prebuilt AArch64 EDK2 firmware
+      shell: bash
+      run: |
+        set -euo pipefail
+        dir="${RUNNER_TEMP}/qemu-edk2-aarch64"
+        mkdir -p "${dir}"
+        base="https://gitlab.com/qemu-project/qemu/-/raw/v10.2.1/pc-bios"
+        fetch_bz2() {
+          local name="$1"
+          local sha="$2"
+          local archive="${dir}/${name}.bz2"
+          local out="${dir}/${name}"
+          curl --fail --silent --show-error --location --retry 5 --retry-all-errors \
+            --output "${archive}" "${base}/${name}.bz2"
+          echo "${sha}  ${archive}" | sha256sum --check -
+          python3 -c '
+        import bz2, shutil, sys
+        with bz2.open(sys.argv[1], "rb") as src, open(sys.argv[2], "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        ' "${archive}" "${out}"
+          rm -f "${archive}"
+        }
+        fetch_bz2 edk2-aarch64-code.fd c023444108b7a132fdebf70c4765cd2dd9af2a9ff7d001a743aaabe87c20a458
+        fetch_bz2 edk2-arm-vars.fd 0011d83b5e67c691a58e3ae25a2e7fdf1d245a73d1b2b8bccb24af1a8c2e2523
+        echo "HELIOS_EDK2_AARCH64_CODE=${dir}/edk2-aarch64-code.fd" >> "$GITHUB_ENV"

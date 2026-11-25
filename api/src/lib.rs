@@ -2,9 +2,9 @@
 //!
 //! Each capability area lives behind a Cargo feature so programs only
 //! link the WIT interfaces they use: `btrfs`, `fs`, `http`, `http-handler`, `http-kit-io`,
-//! `inspect`, `inspect-publish`, `io`, `ipc`, `machine-identity`, `mounts`, `net`, `programs`,
-//! `serial`, `settings`, `snapshot`, `sync`, `task`, `tracing`, `profiling`, `instances`,
-//! `display`, `gpu`, `input`, `surface`,
+//! `hv`, `inspect`, `inspect-publish`, `io`, `ipc`, `machine-identity`, `mounts`, `net`,
+//! `programs`, `serial`, `settings`, `snapshot`, `sync`, `task`, `tracing`, `profiling`,
+//! `instances`, `display`, `gpu`, `input`, `surface`,
 //! `compositor`, `audio`, `vsock`, and `channel`. `bindings` exposes the raw generated WIT
 //! bindings for anything the typed helpers do not cover, and
 //! [`main`](macro@main) wraps a program's async entry point.
@@ -14,8 +14,6 @@ pub mod audio;
 pub mod bindings;
 #[cfg(feature = "btrfs")]
 pub mod btrfs;
-#[cfg(feature = "hv")]
-pub use bindings::helios::hv::virtualization as hv;
 #[cfg(feature = "channel")]
 pub mod channel;
 #[cfg(feature = "compositor")]
@@ -35,6 +33,8 @@ pub mod gpu;
 pub mod http;
 #[cfg(feature = "http-kit-io")]
 pub mod http_kit;
+#[cfg(feature = "hv")]
+pub mod hv;
 #[cfg(feature = "input")]
 pub mod input;
 #[cfg(feature = "inspect")]

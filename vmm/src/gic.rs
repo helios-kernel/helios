@@ -1,10 +1,13 @@
-//! GICv3 distributor/redistributors. One device task owns all MMIO state;
-//! virtual CPU interfaces, timer interrupts and EOI run in the HAL backend.
-use crate::{
-    Error, Result,
-    boot::{GICD, GICR},
-};
-use helios_api::hv::{IoAccess, IoWidth, IrqLevel, Vm};
+//! GICv3 distributor and redistributor emulation on the static MMIO bus.
+//!
+//! One device task owns all MMIO state; virtual CPU interfaces, timer
+//! interrupts, and EOI run in the kernel/HAL backend.
+
+use helios_api::hv::{GuestPhysAddr, IoAccess, IoWidth, IrqLevel, MmioDevice, MmioRange};
+
+use crate::boot::{GICD, GICD_SIZE, GICR, GICR_STRIDE};
+use crate::error::{Error, Result};
+use crate::hv_backend::IrqTarget;
 
 #[derive(Default)]
 struct Bank {
@@ -52,6 +55,7 @@ impl Bank {
     }
 }
 
+/// Emulated ARM GICv3 distributor (SPIs 32..63) and per-vCPU redistributors.
 pub struct Gic {
     control: u32,
     shared: Bank,
@@ -75,7 +79,31 @@ impl Gic {
         }
     }
 
-    pub fn access(&mut self, address: u64, access: IoAccess) -> Result<u64> {
+    pub fn distributor_range(&self) -> MmioRange {
+        MmioRange::new(GICD, GICD_SIZE).expect("GICD MMIO range is valid")
+    }
+
+    pub fn redistributor_range(&self) -> MmioRange {
+        MmioRange::new(GICR, (self.local.len() as u64) * GICR_STRIDE)
+            .expect("GICR MMIO range is valid")
+    }
+
+    pub fn access_distributor(&mut self, offset: u64, access: IoAccess) -> Result<u64> {
+        let address = GICD
+            .checked_add(offset)
+            .ok_or(Error::Gic("distributor address overflow"))?;
+        self.access(address, access)
+    }
+
+    pub fn access_redistributor(&mut self, offset: u64, access: IoAccess) -> Result<u64> {
+        let address = GICR
+            .checked_add(offset)
+            .ok_or(Error::Gic("redistributor address overflow"))?;
+        self.access(address, access)
+    }
+
+    pub fn access(&mut self, address: GuestPhysAddr, access: IoAccess) -> Result<u64> {
+        let raw_addr = address.raw();
         let (width, value) = match access {
             IoAccess::Read(width) => (width, None),
             IoAccess::Write(write) => (write.width, Some(write.value)),
@@ -86,11 +114,10 @@ impl Gic {
             IoWidth::Dword => 4,
             IoWidth::Qword => 8,
         };
-        if !address.is_multiple_of(width as u64) {
+        if !raw_addr.is_multiple_of(width as u64) {
             return Err(Error::Gic("unaligned access"));
         }
-        if (GICD..GICD + 0x10000).contains(&address) {
-            let offset = address - GICD;
+        if let Some(offset) = self.distributor_range().offset(address) {
             if (0x6100..0x6200).contains(&offset) {
                 let index = ((offset - 0x6100) / 8) as usize;
                 let shift = (offset & 7) * 8;
@@ -133,9 +160,12 @@ impl Gic {
                 _ => 0,
             });
         }
-        let relative = address.checked_sub(GICR).ok_or(Error::Gic("address"))?;
-        let index = (relative / 0x20000) as usize;
-        let offset = relative % 0x20000;
+        let relative = self
+            .redistributor_range()
+            .offset(address)
+            .ok_or(Error::Gic("address"))?;
+        let index = (relative / GICR_STRIDE) as usize;
+        let offset = relative % GICR_STRIDE;
         let bank = self
             .local
             .get_mut(index)
@@ -175,7 +205,10 @@ impl Gic {
     }
 
     pub fn line(&mut self, number: u32, asserted: bool) {
-        let bit = 1 << (number - 32);
+        if !(32..64).contains(&number) {
+            return;
+        }
+        let bit = 1u32 << (number - 32);
         if asserted {
             self.lines |= bit;
         } else {
@@ -183,7 +216,7 @@ impl Gic {
         }
     }
 
-    pub fn sync(&mut self, vm: &Vm) -> Result<()> {
+    pub fn sync(&mut self, target_vm: &impl IrqTarget) -> Result<()> {
         for index in 0..32 {
             let bit = 1 << index;
             let route = self.routes[index];
@@ -199,10 +232,10 @@ impl Gic {
             let desired = active.then_some(target);
             if self.delivered[index] != desired {
                 if let Some(cpu) = self.delivered[index] {
-                    vm.set_irq_line(cpu, index as u32 + 32, IrqLevel::Deassert)?;
+                    target_vm.set_irq_line(cpu, index as u32 + 32, IrqLevel::Deassert)?;
                 }
                 if let Some(cpu) = desired {
-                    vm.set_irq_line(cpu, index as u32 + 32, IrqLevel::Assert)?;
+                    target_vm.set_irq_line(cpu, index as u32 + 32, IrqLevel::Assert)?;
                 }
                 self.delivered[index] = desired;
             }
@@ -211,7 +244,7 @@ impl Gic {
             let pending = bank.pending & bank.enabled & bank.group;
             for number in 0..32 {
                 if pending & (1 << number) != 0 {
-                    vm.set_irq_line(cpu as u32, number, IrqLevel::Pulse)?;
+                    target_vm.set_irq_line(cpu as u32, number, IrqLevel::Pulse)?;
                     bank.pending &= !(1 << number);
                 }
             }
@@ -241,6 +274,43 @@ impl Gic {
     }
 }
 
+/// Static MMIO bus wrapper for [`Gic`] covering both GICD and GICR windows.
+pub struct GicBus<'a>(pub &'a mut Gic);
+
+impl<Ctx> helios_api::hv::MmioBus<Ctx> for GicBus<'_> {
+    type Error = Error;
+
+    fn dispatch(
+        &mut self,
+        address: GuestPhysAddr,
+        access: IoAccess,
+        _ctx: &Ctx,
+    ) -> Result<Option<u64>> {
+        if self.0.distributor_range().contains(address)
+            || self.0.redistributor_range().contains(address)
+        {
+            self.0.access(address, access).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Single-range distributor adapter when mounting GICD directly as an [`MmioDevice`].
+pub struct GicDistributor<'a>(pub &'a mut Gic);
+
+impl<Ctx> MmioDevice<Ctx> for GicDistributor<'_> {
+    type Error = Error;
+
+    fn range(&self) -> MmioRange {
+        self.0.distributor_range()
+    }
+
+    fn access(&mut self, offset: u64, access: IoAccess, _ctx: &Ctx) -> Result<u64> {
+        self.0.access_distributor(offset, access)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,14 +336,16 @@ mod tests {
     fn redistributors_have_distinct_affinity_and_last_flags() {
         let mut gic = Gic::new(2);
         let read = IoAccess::Read(IoWidth::Qword);
-        let first = gic.access(GICR + 8, read).unwrap();
-        let second = gic.access(GICR + 0x20000 + 8, read).unwrap();
+        let first = gic.access(GICR.checked_add(8).unwrap(), read).unwrap();
+        let second = gic
+            .access(GICR.checked_add(GICR_STRIDE + 8).unwrap(), read)
+            .unwrap();
         assert_eq!(first >> 32, 0);
         assert_eq!(second >> 32, 1);
         assert_eq!(first & 16, 0);
         assert_eq!(second & 16, 16);
         gic.access(
-            GICR + 0x14,
+            GICR.checked_add(0x14).unwrap(),
             IoAccess::Write(IoWrite {
                 width: IoWidth::Dword,
                 value: 0,
@@ -281,13 +353,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            gic.access(GICR + 0x14, IoAccess::Read(IoWidth::Dword))
-                .unwrap(),
+            gic.access(
+                GICR.checked_add(0x14).unwrap(),
+                IoAccess::Read(IoWidth::Dword)
+            )
+            .unwrap(),
             0
         );
         assert_eq!(
-            gic.access(GICR + 0x20000 + 0x14, IoAccess::Read(IoWidth::Dword))
-                .unwrap(),
+            gic.access(
+                GICR.checked_add(GICR_STRIDE + 0x14).unwrap(),
+                IoAccess::Read(IoWidth::Dword),
+            )
+            .unwrap(),
             6
         );
     }

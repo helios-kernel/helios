@@ -3022,7 +3022,6 @@ dependencies = [
  "acpi",
  "arm-gic",
  "arm-sysregs",
- "bytes",
  "critical-section",
  "crossbeam-utils",
  "fdt",
@@ -3069,6 +3068,7 @@ dependencies = [
  "thiserror 2.0.21",
  "wit-bindgen 0.63.0",
  "zenwave",
+ "zerocopy 0.8.57",
 ]
 
 [[package]]
@@ -3708,7 +3708,6 @@ name = "helios-riscv"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
- "bytes",
  "critical-section",
  "fdt",
  "helios-firmware",
@@ -3871,11 +3870,23 @@ name = "helios-vmm"
 version = "0.1.0"
 dependencies = [
  "async-channel",
- "clap",
  "futures-lite",
  "helios-api",
+ "tempfile",
  "thiserror 2.0.21",
+ "tracing",
  "vm-fdt",
+ "zerocopy 0.8.57",
+]
+
+[[package]]
+name = "helios-vmm-program"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "helios-api",
+ "helios-vmm",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3951,7 +3962,6 @@ version = "0.1.0"
 dependencies = [
  "acpi",
  "bitflags 2.13.1",
- "bytes",
  "critical-section",
  "helios-acpi",
  "helios-artifact",

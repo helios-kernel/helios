@@ -64,7 +64,8 @@ pub(crate) use platform::device_vm_hooks;
 #[cfg(test)]
 pub(crate) use platform::test_hooks;
 pub use platform::{
-    DeviceInterruptHooks, DeviceVmHooks, install_device_interrupt_hooks, install_device_vm_hooks,
+    DeviceDmaHooks, DeviceInterruptHooks, DeviceVmHooks, install_device_dma_hooks,
+    install_device_interrupt_hooks, install_device_vm_hooks,
 };
 pub use registry::{DeviceGrantRegistry, DeviceInterruptRoute, GrantedDeviceSnapshot, MAX_GRANTS};
 
@@ -282,11 +283,17 @@ mod tests {
             4,
             "both regions are restored, each with its own shootdown"
         );
-        let tail = &test_hooks::changes()[test_hooks::changes().len() - 2..];
+        let tail = &test_hooks::changes()[test_hooks::changes().len() - 3..];
         assert!(
-            tail.iter()
-                .all(|change| matches!(change, MappingChange::Restore(_))),
-            "reclaim ends in zeroed memory put back, not in anything else"
+            matches!(
+                tail,
+                [
+                    MappingChange::Restore(_),
+                    MappingChange::Restore(_),
+                    MappingChange::Quiesced
+                ]
+            ),
+            "reclaim puts zeroed memory back for both regions and quiesces DMA"
         );
         assert!(views.is_empty());
     }
@@ -613,5 +620,99 @@ mod tests {
         let registry = registry(&["test:alpha"]);
 
         assert!(!registry.forward(GrantInterrupt::new(99)));
+    }
+
+    #[test]
+    fn reclaim_quiesces_dma_before_freeing_pinned_buffers() {
+        let registry = registry(&["test:alpha"]);
+        test_hooks::set_quiesce_succeeds(true);
+        let mut views = ViewTable::new();
+        let mut lease = registry
+            .claim(test_caps::device("test:alpha"), views.group())
+            .expect("the device is free");
+        lease
+            .dma_alloc(4096, &mut views, memory(), pages(3, 1))
+            .expect("the ring fits the budget");
+
+        let mark = test_hooks::changes().len();
+        lease.end_views(&mut views).expect("the owner's view ends");
+        drop(lease);
+
+        let after = &test_hooks::changes()[mark..];
+        let quiesced = after
+            .iter()
+            .position(|change| matches!(change, MappingChange::Quiesced))
+            .expect("platform DMA quiesce runs on reclaim");
+        let freed = after
+            .iter()
+            .position(|change| matches!(change, MappingChange::Freed(_)))
+            .expect("the ring is freed once quiesced");
+        assert!(
+            quiesced < freed,
+            "the device must be quiesced before its pinned frames return to the pool"
+        );
+        assert_eq!(
+            test_hooks::quiesced().last(),
+            Some(&DeviceName::new("test:alpha").expect("short"))
+        );
+        assert_eq!(
+            registry
+                .device("test:alpha")
+                .expect("published")
+                .quarantined_buffers(),
+            0
+        );
+    }
+
+    #[test]
+    fn unquiesced_reclaim_quarantines_pinned_buffers_until_next_owner_releases_them() {
+        let registry = registry(&["test:alpha"]);
+        test_hooks::set_quiesce_succeeds(false);
+        let mut views = ViewTable::new();
+        let mut lease = registry
+            .claim(test_caps::device("test:alpha"), views.group())
+            .expect("the device is free");
+        lease
+            .dma_alloc(4096, &mut views, memory(), pages(3, 1))
+            .expect("the ring fits the budget");
+
+        let mark = test_hooks::changes().len();
+        lease.end_views(&mut views).expect("the owner's view ends");
+        drop(lease);
+
+        let after = &test_hooks::changes()[mark..];
+        assert!(
+            after
+                .iter()
+                .any(|change| matches!(change, MappingChange::Quiesced)),
+            "reclaim attempts to quiesce the device"
+        );
+        assert!(
+            !after
+                .iter()
+                .any(|change| matches!(change, MappingChange::Freed(_))),
+            "pinned frames must not return to the pool while DMA may still be active"
+        );
+        let published = registry.device("test:alpha").expect("published");
+        assert_eq!(published.quarantined_buffers(), 1);
+        assert_eq!(published.quarantined_bytes(), WASM_PAGE_BYTES);
+
+        // Once a replacement driver claims the device and resets it, it
+        // releases the quarantined buffers back to the pool.
+        let mut next = registry
+            .claim(test_caps::device("test:alpha"), views.group())
+            .expect("the next owner can claim the device");
+        let release_mark = test_hooks::changes().len();
+        assert_eq!(next.release_quarantine(), 1);
+        assert_eq!(published.quarantined_buffers(), 0);
+        assert!(
+            test_hooks::changes()[release_mark..]
+                .iter()
+                .any(|change| matches!(change, MappingChange::Freed(_))),
+            "releasing quarantine returns the frames to the pool"
+        );
+
+        test_hooks::set_quiesce_succeeds(true);
+        drop(next);
     }
 }

@@ -306,6 +306,14 @@ pub unsafe trait UserSpace: Send + Sync + 'static {
     /// whole length; nothing is written otherwise.
     fn write(&self, address: VirtAddr, bytes: &[u8]) -> Result<(), NativeError>;
 
+    /// Copies `bytes` into already-mapped pages starting at `address`
+    /// regardless of their user write permission, committing uncommitted
+    /// frames from the user memory pool and breaking copy-on-write sharing as
+    /// needed. Fails with [`NativeError::OutOfMemory`] if user memory is
+    /// exhausted, or [`NativeError::NotMapped`] / [`NativeError::Address`] if
+    /// any byte falls outside a mapped user page.
+    fn populate(&self, address: VirtAddr, bytes: &[u8]) -> Result<(), NativeError>;
+
     /// Atomically loads the 32-bit little-endian word at the 4-byte-aligned
     /// `address`, coherent with user-mode atomic operations on every
     /// processor. Fails with [`NativeError::Address`] when `address` is
@@ -499,6 +507,9 @@ unsafe impl UserSpace for Infallible {
         match *self {}
     }
     fn write(&self, _: VirtAddr, _: &[u8]) -> Result<(), NativeError> {
+        match *self {}
+    }
+    fn populate(&self, _: VirtAddr, _: &[u8]) -> Result<(), NativeError> {
         match *self {}
     }
     fn atomic_load_u32(&self, _: VirtAddr) -> Result<u32, NativeError> {
