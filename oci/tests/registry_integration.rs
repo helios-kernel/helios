@@ -992,3 +992,183 @@ fn materializes_multi_layer_oci_image_through_btrfs_subvolume_lifecycle_and_send
         registry.shutdown(handle);
     });
 }
+
+#[test]
+fn scratch_repull_preserves_btrfs_backed_and_concurrent_pulls_succeed() {
+    futures_lite::future::block_on(async {
+        let layer0_tar = build_layer0_tar();
+        let layer0_diff_id = Digest::sha256(&layer0_tar);
+        let layer0_gz = gzip_bytes(&layer0_tar);
+
+        let mut state = RegistryState::default();
+        let (_scratch_digest, scratch_manifest) =
+            build_single_arch_manifest_and_config(Arch::X86_64, &[], &mut state);
+        state.manifests.insert(
+            "scratch".to_owned(),
+            (media_type::OCI_MANIFEST.to_owned(), scratch_manifest),
+        );
+
+        let (_app_digest, app_manifest) = build_single_arch_manifest_and_config(
+            Arch::X86_64,
+            &[(media_type::OCI_LAYER_TAR_GZIP, &layer0_gz, layer0_diff_id)],
+            &mut state,
+        );
+        state.manifests.insert(
+            "app".to_owned(),
+            (media_type::OCI_MANIFEST.to_owned(), app_manifest),
+        );
+
+        let (registry, handle) = MockRegistry::start(state).await;
+
+        // 1. 0-layer scratch image re-pull preserves btrfs_backed = true when subvolume exists.
+        let scratch_ref = ImageReference::parse(&format!(
+            "http://{}/demo/empty:scratch",
+            registry.host_port()
+        ))
+        .unwrap();
+        let tmp_btrfs = TempDir::new().unwrap();
+        let btrfs_store =
+            ImageStore::open(tmp_btrfs.path(), RecordingBtrfsBackend::new(false)).unwrap();
+        let mut client = RegistryClient::new();
+        let first_scratch = btrfs_store
+            .pull(&mut client, &scratch_ref, Arch::X86_64)
+            .await
+            .unwrap();
+        assert!(first_scratch.btrfs_backed);
+        let second_scratch = btrfs_store
+            .pull(&mut client, &scratch_ref, Arch::X86_64)
+            .await
+            .unwrap();
+        assert!(
+            second_scratch.btrfs_backed,
+            "0-layer scratch re-pull must preserve btrfs_backed = true"
+        );
+
+        // DirectoryBackend 0-layer pull & re-pull remain btrfs_backed = false.
+        let tmp_dir = TempDir::new().unwrap();
+        let dir_store = ImageStore::open_directory(tmp_dir.path()).unwrap();
+        assert!(
+            !dir_store
+                .pull(&mut client, &scratch_ref, Arch::X86_64)
+                .await
+                .unwrap()
+                .btrfs_backed
+        );
+        assert!(
+            !dir_store
+                .pull(&mut client, &scratch_ref, Arch::X86_64)
+                .await
+                .unwrap()
+                .btrfs_backed
+        );
+
+        // 2. Concurrent pulls into the same directory ImageStore must not race on staging/.
+        let app_ref =
+            ImageReference::parse(&format!("http://{}/demo/app:app", registry.host_port()))
+                .unwrap();
+        let store_root = tmp_dir.path().to_path_buf();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let store_root = store_root.clone();
+                let app_ref = app_ref.clone();
+                scope.spawn(move || {
+                    futures_lite::future::block_on(async move {
+                        let store = ImageStore::open_directory(&store_root).unwrap();
+                        let mut c = RegistryClient::new();
+                        let pulled = store.pull(&mut c, &app_ref, Arch::X86_64).await.unwrap();
+                        assert!(pulled.rootfs_path().join("etc/passwd").is_file());
+                    });
+                });
+            }
+        });
+        let staging_leftovers: Vec<_> = std::fs::read_dir(tmp_dir.path().join("staging"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            staging_leftovers.is_empty(),
+            "staging directory should have no leftovers: {staging_leftovers:?}"
+        );
+
+        registry.shutdown(handle);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn non_btrfs_multi_layer_pull_preserves_hardlinks_and_dir_modes() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    futures_lite::future::block_on(async {
+        let mut l0 = tar::Builder::new(Vec::new());
+        append_dir(&mut l0, "usr", 0o755);
+        append_dir(&mut l0, "usr/bin", 0o755);
+        append_dir(&mut l0, "opt", 0o755);
+        append_dir(&mut l0, "opt/sgid", 0o2755);
+        append_dir(&mut l0, "opt/ro", 0o555);
+        append_pax_file(&mut l0, "usr/bin/busybox", b"busybox-bin", 0o755, 0, 0, &[]);
+        let mut hl_hdr = tar::Header::new_gnu();
+        hl_hdr.set_entry_type(tar::EntryType::Link);
+        hl_hdr.set_size(0);
+        hl_hdr.set_mode(0o755);
+        hl_hdr.set_cksum();
+        l0.append_link(&mut hl_hdr, "opt/sgid/sh", "usr/bin/busybox")
+            .unwrap();
+        let l0_tar = l0.into_inner().unwrap();
+        let l0_diff = Digest::sha256(&l0_tar);
+        let l0_gz = gzip_bytes(&l0_tar);
+
+        let mut l1 = tar::Builder::new(Vec::new());
+        append_pax_file(&mut l1, "top.txt", b"top-level", 0o644, 0, 0, &[]);
+        append_pax_file(&mut l1, "opt/sgid/extra.txt", b"extra", 0o644, 0, 0, &[]);
+        let l1_tar = l1.into_inner().unwrap();
+        let l1_diff = Digest::sha256(&l1_tar);
+        let l1_zst = zrip_encode::compress(&l1_tar, 1).unwrap();
+
+        let mut state = RegistryState::default();
+        let (_digest, manifest_bytes) = build_single_arch_manifest_and_config(
+            Arch::X86_64,
+            &[
+                (media_type::OCI_LAYER_TAR_GZIP, &l0_gz, l0_diff),
+                (media_type::OCI_LAYER_TAR_ZSTD, &l1_zst, l1_diff),
+            ],
+            &mut state,
+        );
+        state.manifests.insert(
+            "latest".to_owned(),
+            (media_type::OCI_MANIFEST.to_owned(), manifest_bytes),
+        );
+
+        let (registry, handle) = MockRegistry::start(state).await;
+        let tmp = TempDir::new().unwrap();
+        let store = ImageStore::open_directory(tmp.path()).unwrap();
+        let reference = ImageReference::parse(&format!(
+            "http://{}/demo/hardlink:latest",
+            registry.host_port()
+        ))
+        .unwrap();
+        let mut client = RegistryClient::new();
+        let pulled = store
+            .pull(&mut client, &reference, Arch::X86_64)
+            .await
+            .unwrap();
+        let root = pulled.rootfs_path();
+
+        let busybox_meta = std::fs::symlink_metadata(root.join("usr/bin/busybox")).unwrap();
+        let sh_meta = std::fs::symlink_metadata(root.join("opt/sgid/sh")).unwrap();
+        assert_eq!(busybox_meta.ino(), sh_meta.ino());
+        assert_eq!(busybox_meta.nlink(), 2);
+
+        let sgid_meta = std::fs::symlink_metadata(root.join("opt/sgid")).unwrap();
+        assert_eq!(sgid_meta.permissions().mode() & 0o7777, 0o2555);
+        let ro_meta = std::fs::symlink_metadata(root.join("opt/ro")).unwrap();
+        assert_eq!(ro_meta.permissions().mode() & 0o7777, 0o555);
+        assert_eq!(std::fs::read(root.join("top.txt")).unwrap(), b"top-level");
+        assert_eq!(
+            std::fs::read(root.join("opt/sgid/extra.txt")).unwrap(),
+            b"extra"
+        );
+
+        registry.shutdown(handle);
+    });
+}
