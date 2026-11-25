@@ -2,7 +2,7 @@
 //! Linux subsystem, one case per process, each under a bound.
 //!
 //! A case is one gtest case of one static Linux test binary, started
-//! through `programs.exec-path` with `--gtest_filter=<Suite.Case>`, the
+//! through `helios:system/programs.exec` with `--gtest_filter=<Suite.Case>`, the
 //! way gVisor's own runner starts a case natively
 //! (`test/runner/main.go`, `runTestCaseNative`). A case that outlives its
 //! bound is killed by the instance name its launch registered, so an
@@ -25,13 +25,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use clap::Args as ClapArgs;
-use helios_inspector_protocol::RpcError;
-use helios_inspector_protocol::debugger::filesystem::{self as debugger_fs, MountBtrfsRequest};
-use helios_inspector_protocol::debugger::programs::{ContainerMountBind, ExecInContainerRequest};
-use helios_inspector_protocol::system::programs::{ExecErrorKind, ExecResult};
+use helios_wit_rpc::inspector::helios::system::programs::{ExecErrorKind, ExecResult};
+use helios_wit_rpc::inspector_fs::{self, FsRpcError, MountBtrfsRequest};
 use serde::Serialize;
 
-use crate::programs::ProgramError;
+use crate::programs::{ContainerMountBind, ExecInContainerRequest, ProgramError};
 use crate::serial::RpcClient;
 use crate::system::{self, SystemError};
 use crate::vm::VcpuStateCapture;
@@ -112,7 +110,7 @@ pub(crate) enum LinuxSuiteError {
     MountPrivateBtrfs {
         serial: String,
         #[source]
-        source: RpcError,
+        source: FsRpcError,
     },
     #[error("the guest stopped answering while it ran {binary} {case}: {source}")]
     GuestLost {
@@ -174,7 +172,18 @@ enum CaseEnd {
         stderr: String,
     },
     /// The program service refused to start the binary.
-    Refused { kind: ExecErrorKind, detail: String },
+    Refused {
+        #[serde(serialize_with = "serialize_exec_error_kind")]
+        kind: ExecErrorKind,
+        detail: String,
+    },
+}
+
+fn serialize_exec_error_kind<S>(kind: &ExecErrorKind, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&format!("{kind:?}"))
 }
 
 pub(crate) async fn run(
@@ -194,13 +203,16 @@ pub(crate) async fn run(
     let mut results = BufWriter::new(file);
     let guest_dir = command.guest_dir.trim_end_matches('/');
     if let Some(serial) = command.private_btrfs.as_deref() {
-        debugger_fs::mount_btrfs(
+        inspector_fs::mount_btrfs(
             client,
             &MountBtrfsRequest {
-                serial: serial.to_owned(),
+                disk: serial.to_owned(),
                 path: "/tmp".to_owned(),
                 read_only: false,
-                private: true,
+                shared: false,
+                compress: None,
+                commit: None,
+                max_inline: None,
             },
         )
         .await

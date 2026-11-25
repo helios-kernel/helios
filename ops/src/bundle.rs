@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use helios_inspector_protocol::system::{
+use helios_wit_rpc::inspector::helios::system::{
     inspect::{self, SnapshotResult},
     instances::Instance,
     profiling::{Filter as ProfileFilter, FoldedSample, MetricFilter, MetricSample},

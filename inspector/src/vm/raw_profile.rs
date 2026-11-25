@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::Args as ClapArgs;
-use helios_inspector_protocol::RpcError;
-use helios_inspector_protocol::system::profiling::{
+use helios_wit_rpc::RpcError;
+use helios_wit_rpc::inspector::helios::system::profiling::{
     self as system_profiling, ProfileSection, RawProfileError,
 };
 
@@ -187,7 +187,9 @@ async fn collect(
     let profdata_tool = super::find_executable_in_path("llvm-profdata")
         .ok_or(RawProfileCollectError::ProfdataMissing)?;
 
-    let size = system_profiling::raw_profile_size(client)
+    let profiling_client = system_profiling::RpcClient::new(client.peer());
+    let size = profiling_client
+        .raw_profile_size()
         .await
         .map_err(|source| RawProfileCollectError::AskSize { source })?
         .map_err(GuestProfileRefusal::from)?;
@@ -205,7 +207,8 @@ async fn collect(
     let mut file = File::create(raw).map_err(on_file("create"))?;
     let mut offset = 0u64;
     while offset < size {
-        let window = system_profiling::raw_profile_read(client, offset, WINDOW_BYTES)
+        let window = profiling_client
+            .raw_profile_read(offset, WINDOW_BYTES)
             .await
             .map_err(|source| RawProfileCollectError::ReadWindow {
                 offset,

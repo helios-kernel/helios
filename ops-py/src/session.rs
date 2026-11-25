@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use helios_inspector_protocol::system::tracing as sys_tracing;
+use helios_wit_rpc::inspector::helios::system::tracing as sys_tracing;
 use helios_ops::{
     Attenuation, DiagnosticBundle, GrantRight, OpsError, Session, SpawnRequest, TargetStore,
 };
@@ -241,7 +241,7 @@ impl PySession {
         })
     }
 
-    /// Execute a program by path via `debugger.programs.exec-path`.
+    /// Execute a program by path via `helios:system/programs.exec`.
     #[pyo3(signature = (path, args=None))]
     fn exec<'py>(
         &self,

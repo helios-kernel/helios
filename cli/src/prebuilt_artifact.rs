@@ -12,12 +12,14 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Cursor};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use clap::{Parser, ValueEnum};
 use directories::ProjectDirs;
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use helios_artifact::bootfs::{self, BootfsError, Fingerprint};
 use helios_workspace_root::prebuilt_manifest::{
     BOOTFS_IMAGE_FILE, COMPILER_PLUGIN_FILE, KERNEL_IMAGE_FILE, PREBUILT_SCHEMA_VERSION,
@@ -25,7 +27,9 @@ use helios_workspace_root::prebuilt_manifest::{
     UEFI_DISK_IMAGE_FILE, artifact_name, artifact_profile_label, read_manifest,
     read_root_public_key, sha256_hex, write_manifest,
 };
-use helios_workspace_root::root_key::{ROOT_PUBLIC_FILE, ROOT_SECRET_FILE};
+use helios_workspace_root::root_key::{
+    INSPECTOR_CLIENT_SECRET_FILE, ROOT_PUBLIC_FILE, ROOT_SECRET_FILE, SECRET_KEY_MODE,
+};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use thiserror::Error;
@@ -111,6 +115,10 @@ pub(crate) struct ArtifactStageCommand {
     /// Optional `compiler_plugin.wasm` to include in `--kind image`.
     #[arg(long)]
     pub(crate) compiler_plugin: Option<PathBuf>,
+    /// Optional 32-byte Ed25519 inspector client key (`helios-inspector-client-secret.key`)
+    /// to stage into `--kind image` so CI shards and `helios vm --prebuilt image` can authenticate.
+    #[arg(long)]
+    pub(crate) inspector_client_key: Option<PathBuf>,
     /// Kernel features enabled in this build (repeatable).
     #[arg(long = "kernel-feature")]
     pub(crate) kernel_features: Vec<String>,
@@ -199,11 +207,21 @@ pub(crate) enum ArtifactStageError {
         source: io::Error,
     },
     #[error(
-        "refusing --root-public-key {path}: secret key files ({ROOT_SECRET_FILE}) must never be staged into a prebuilt artifact"
+        "refusing {path}: secret key files ({ROOT_SECRET_FILE}) must never be staged into a prebuilt artifact"
     )]
     SecretKeyInput { path: String },
     #[error("--root-public-key {path} is not a valid Ed25519 verifying key")]
     InvalidRootPublicKey { path: String },
+    #[error(
+        "--inspector-client-key {path} must hold a 32-byte Ed25519 secret seed, found {len} bytes"
+    )]
+    InvalidInspectorClientKey { path: String, len: usize },
+    #[error("failed to set permissions on {path}: {source}")]
+    SetPermissions {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
     #[error("--kind image requires --bootfs")]
     MissingBootfs,
     #[error("--kind kernel must not include image-only option {option}")]
@@ -381,6 +399,11 @@ pub(crate) fn run_stage(
                 option: "--compiler-plugin",
             });
         }
+        if command.inspector_client_key.is_some() {
+            return Err(ArtifactStageError::UnexpectedOptionForKernel {
+                option: "--inspector-client-key",
+            });
+        }
     }
 
     fs::create_dir_all(&command.out_dir).map_err(|source| ArtifactStageError::CreateDir {
@@ -474,6 +497,40 @@ pub(crate) fn run_stage(
                 }
                 copy_into(plugin, &command.out_dir.join(COMPILER_PLUGIN_FILE))?;
                 files.insert(COMPILER_PLUGIN_FILE.to_owned());
+            }
+
+            if let Some(client_key) = &command.inspector_client_key {
+                if client_key.file_name() == Some(ROOT_SECRET_FILE.as_ref()) {
+                    return Err(ArtifactStageError::SecretKeyInput {
+                        path: client_key.display().to_string(),
+                    });
+                }
+                if !client_key.is_file() {
+                    return Err(ArtifactStageError::InputMissing {
+                        path: client_key.display().to_string(),
+                    });
+                }
+                let raw = fs::read(client_key).map_err(|source| ArtifactStageError::Read {
+                    path: client_key.display().to_string(),
+                    source,
+                })?;
+                let seed: [u8; 32] = raw.as_slice().try_into().map_err(|_| {
+                    ArtifactStageError::InvalidInspectorClientKey {
+                        path: client_key.display().to_string(),
+                        len: raw.len(),
+                    }
+                })?;
+                // Validate that the seed constructs a signing key cleanly.
+                let _ = SigningKey::from_bytes(&seed);
+                let staged_key = command.out_dir.join(INSPECTOR_CLIENT_SECRET_FILE);
+                copy_into(client_key, &staged_key)?;
+                #[cfg(unix)]
+                fs::set_permissions(&staged_key, fs::Permissions::from_mode(SECRET_KEY_MODE))
+                    .map_err(|source| ArtifactStageError::SetPermissions {
+                        path: staged_key.display().to_string(),
+                        source,
+                    })?;
+                files.insert(INSPECTOR_CLIENT_SECRET_FILE.to_owned());
             }
 
             Some(if command.programs.is_empty() {
@@ -1018,9 +1075,19 @@ fn extract_zip_safely(
             })?;
         io::copy(&mut entry, &mut out).map_err(|source| ArtifactFetchError::ExtractEntry {
             artifact: artifact_id,
-            entry: raw_name,
+            entry: raw_name.clone(),
             source,
         })?;
+        #[cfg(unix)]
+        if rel.file_name() == Some(INSPECTOR_CLIENT_SECRET_FILE.as_ref()) {
+            fs::set_permissions(&target, fs::Permissions::from_mode(SECRET_KEY_MODE)).map_err(
+                |source| ArtifactFetchError::ExtractEntry {
+                    artifact: artifact_id,
+                    entry: raw_name,
+                    source,
+                },
+            )?;
+        }
     }
     Ok(())
 }
@@ -1065,7 +1132,6 @@ fn safe_zip_relative_path(artifact_id: u64, raw_name: &str) -> Result<PathBuf, A
 mod tests {
     use super::*;
     use crate::GithubWorkflowRun;
-    use ed25519_dalek::SigningKey;
     use helios_artifact::bootfs::{EntryKind, WriteEntry, sign_image, write_image};
     use helios_workspace_root::prebuilt_manifest::PREBUILT_MANIFEST_FILE;
     use std::io::Write;
@@ -1207,6 +1273,7 @@ mod tests {
                 build_uefi_image: false,
                 baud: 115_200,
                 compiler_plugin: None,
+                inspector_client_key: None,
                 kernel_features: vec!["linux".to_owned()],
                 programs: vec!["debugger".to_owned(), "init".to_owned()],
                 commit: Some("deadbeef".to_owned()),
@@ -1234,6 +1301,7 @@ mod tests {
                 build_uefi_image: false,
                 baud: 115_200,
                 compiler_plugin: None,
+                inspector_client_key: None,
                 kernel_features: vec!["linux".to_owned()],
                 programs: vec!["debugger".to_owned(), "init".to_owned()],
                 commit: Some("deadbeef".to_owned()),
@@ -1280,6 +1348,7 @@ mod tests {
                 build_uefi_image: false,
                 baud: 115_200,
                 compiler_plugin: None,
+                inspector_client_key: None,
                 kernel_features: Vec::new(),
                 programs: Vec::new(),
                 commit: Some("abc1234".to_owned()),
@@ -1309,5 +1378,178 @@ mod tests {
         assert_eq!(fetch.arch.as_deref(), Some("x86-64"));
         assert!(fetch.profile.is_none());
         assert!(fetch.json);
+    }
+
+    #[test]
+    fn artifact_stage_image_with_inspector_client_key_stages_0600_and_validates_manifest() {
+        let src = TempDir::new().expect("src dir");
+        let out = TempDir::new().expect("out dir");
+        let kernel = src.path().join("helios");
+        fs::write(&kernel, b"elf-bytes").expect("write kernel");
+
+        let (bootfs_bytes, pub_a) = make_signed_bootfs(&[11_u8; 32]);
+        let bootfs_path = src.path().join("helios-bootfs");
+        fs::write(&bootfs_path, bootfs_bytes).expect("write bootfs");
+        let pub_a_path = src.path().join("helios-root-public.key");
+        fs::write(&pub_a_path, pub_a).expect("write pub a");
+        let client_key_path = src.path().join(INSPECTOR_CLIENT_SECRET_FILE);
+        fs::write(&client_key_path, [0x42_u8; 32]).expect("write inspector client key");
+
+        let staged_dir = out.path().join("image-with-key");
+        run_stage(
+            ArtifactStageCommand {
+                kind: StageKind::Image,
+                arch: "x86-64".to_owned(),
+                profile: "release-linux".to_owned(),
+                out_dir: staged_dir.clone(),
+                kernel,
+                root_public_key: pub_a_path,
+                bootfs: Some(bootfs_path),
+                uefi_image: None,
+                build_uefi_image: false,
+                baud: 115_200,
+                compiler_plugin: None,
+                inspector_client_key: Some(client_key_path),
+                kernel_features: vec!["linux".to_owned()],
+                programs: vec!["init".to_owned(), "inspector-host".to_owned()],
+                commit: Some("deadbeef".to_owned()),
+            },
+            None,
+        )
+        .expect("image with inspector client key must stage cleanly");
+
+        let staged_key = staged_dir.join(INSPECTOR_CLIENT_SECRET_FILE);
+        assert!(staged_key.is_file());
+        assert_eq!(
+            fs::read(&staged_key).expect("read staged key"),
+            [0x42_u8; 32]
+        );
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&staged_key)
+                .expect("staged key metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, SECRET_KEY_MODE);
+        }
+
+        let manifest = read_manifest(&staged_dir).expect("read_manifest must succeed");
+        assert!(
+            manifest
+                .files
+                .iter()
+                .any(|f| f == INSPECTOR_CLIENT_SECRET_FILE),
+            "manifest.json must list {INSPECTOR_CLIENT_SECRET_FILE}"
+        );
+    }
+
+    #[test]
+    fn artifact_stage_kernel_rejects_inspector_client_key() {
+        let src = TempDir::new().expect("src dir");
+        let out = TempDir::new().expect("out dir");
+        let kernel = src.path().join("helios");
+        fs::write(&kernel, b"elf").expect("write kernel");
+        let (_, pub_a) = make_signed_bootfs(&[11_u8; 32]);
+        let pub_a_path = src.path().join("helios-root-public.key");
+        fs::write(&pub_a_path, pub_a).expect("write pub a");
+        let client_key_path = src.path().join(INSPECTOR_CLIENT_SECRET_FILE);
+        fs::write(&client_key_path, [0x42_u8; 32]).expect("write client key");
+
+        let err = run_stage(
+            ArtifactStageCommand {
+                kind: StageKind::Kernel,
+                arch: "x86-64".to_owned(),
+                profile: "release-linux".to_owned(),
+                out_dir: out.path().join("kernel"),
+                kernel,
+                root_public_key: pub_a_path,
+                bootfs: None,
+                uefi_image: None,
+                build_uefi_image: false,
+                baud: 115_200,
+                compiler_plugin: None,
+                inspector_client_key: Some(client_key_path),
+                kernel_features: Vec::new(),
+                programs: Vec::new(),
+                commit: Some("abc1234".to_owned()),
+            },
+            None,
+        )
+        .expect_err("kernel stage must reject --inspector-client-key");
+        assert!(matches!(
+            err,
+            ArtifactStageError::UnexpectedOptionForKernel {
+                option: "--inspector-client-key"
+            }
+        ));
+    }
+
+    #[test]
+    fn artifact_stage_inspector_client_key_rejects_root_secret_and_invalid_length() {
+        let src = TempDir::new().expect("src dir");
+        let out = TempDir::new().expect("out dir");
+        let kernel = src.path().join("helios");
+        fs::write(&kernel, b"elf").expect("write kernel");
+        let (bootfs_bytes, pub_a) = make_signed_bootfs(&[11_u8; 32]);
+        let bootfs_path = src.path().join("helios-bootfs");
+        fs::write(&bootfs_path, bootfs_bytes).expect("write bootfs");
+        let pub_a_path = src.path().join("helios-root-public.key");
+        fs::write(&pub_a_path, pub_a).expect("write pub a");
+
+        // Passing helios-root-secret.key as --inspector-client-key must be rejected.
+        let root_secret = src.path().join(ROOT_SECRET_FILE);
+        fs::write(&root_secret, [0x99_u8; 32]).expect("write root secret");
+        let err = run_stage(
+            ArtifactStageCommand {
+                kind: StageKind::Image,
+                arch: "x86-64".to_owned(),
+                profile: "release-linux".to_owned(),
+                out_dir: out.path().join("reject-root-secret"),
+                kernel: kernel.clone(),
+                root_public_key: pub_a_path.clone(),
+                bootfs: Some(bootfs_path.clone()),
+                uefi_image: None,
+                build_uefi_image: false,
+                baud: 115_200,
+                compiler_plugin: None,
+                inspector_client_key: Some(root_secret),
+                kernel_features: Vec::new(),
+                programs: Vec::new(),
+                commit: Some("abc1234".to_owned()),
+            },
+            None,
+        )
+        .expect_err("root secret key passed to --inspector-client-key must fail");
+        assert!(matches!(err, ArtifactStageError::SecretKeyInput { .. }));
+
+        // Invalid length seed file must be rejected.
+        let bad_key = src.path().join("bad-client.key");
+        fs::write(&bad_key, [0x11_u8; 16]).expect("write short key");
+        let err = run_stage(
+            ArtifactStageCommand {
+                kind: StageKind::Image,
+                arch: "x86-64".to_owned(),
+                profile: "release-linux".to_owned(),
+                out_dir: out.path().join("reject-bad-len"),
+                kernel,
+                root_public_key: pub_a_path,
+                bootfs: Some(bootfs_path),
+                uefi_image: None,
+                build_uefi_image: false,
+                baud: 115_200,
+                compiler_plugin: None,
+                inspector_client_key: Some(bad_key),
+                kernel_features: Vec::new(),
+                programs: Vec::new(),
+                commit: Some("abc1234".to_owned()),
+            },
+            None,
+        )
+        .expect_err("non-32-byte inspector client key must fail");
+        assert!(matches!(
+            err,
+            ArtifactStageError::InvalidInspectorClientKey { len: 16, .. }
+        ));
     }
 }

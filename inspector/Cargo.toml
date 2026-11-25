@@ -42,6 +42,7 @@ helios-nu.workspace = true
 helios-ops.workspace = true
 helios-hal.workspace = true
 helios-profdata.workspace = true
+helios-wit-rpc = { workspace = true, features = ["inspector-rpc"] }
 helios-workspace-root.workspace = true
 # Searches the kernel image for the root secret's bytes.
 memchr = { version = "2.8.3", default-features = false, features = ["std"] }

@@ -11,7 +11,9 @@
 //!
 //! Zero `block_on` and zero `anyhow` appear in production code.
 
+pub use helios_inspector_protocol;
 pub use helios_oci;
+pub use helios_wit_rpc;
 pub use zenwave;
 
 pub mod bundle;

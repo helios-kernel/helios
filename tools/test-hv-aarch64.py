@@ -28,7 +28,8 @@ def main():
     command = [
         args.inspector, "vm", "--arch", "aarch64", "--accel", "tcg",
         "--cpu", "max", "--smp", "3", "--boot-program", "init",
-        "--boot-program", "debugger", "--qemu-arg=-machine",
+        "--boot-program", "inspector-host", "--boot-program", "inspector-tls",
+        "--boot-program", "inspector-worker", "--qemu-arg=-machine",
         "--qemu-arg=virtualization=on", "--runtime-dir", str(args.runtime_dir),
         "--keep-runtime-dir",
     ]

@@ -19,6 +19,7 @@ pub mod program {
                 "helios:system/programs.child": crate::ChildHandle,
                 "helios:system/programs.container": crate::ContainerHandle,
                 "helios:system/net.tcp-listener": crate::ComponentTcpListener,
+                "helios:system/net.tcp-stream": crate::ComponentTcpStreamHandle,
                 "helios:system/inspect.publication": crate::wasmtime_adapter::component_host::InspectPublicationHandle,
                 "helios:system/ipc.endpoint": crate::IpcEndpoint,
                 "helios:system/snapshot.snapshot-hold": crate::ComponentSnapshotHold,

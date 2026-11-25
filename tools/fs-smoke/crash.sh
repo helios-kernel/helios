@@ -45,7 +45,7 @@ boot() {
     --bootfs-root "$runtime/bootfs" \
     --disk "$runtime/image.btrfs,serial=btrfs-smoke" \
     --shared-dir "$runtime/share" --shared-dir-writable \
-    --boot-program nu --boot-program debugger \
+    --boot-program nu --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
     --boot-program ls --boot-program cat --boot-program python3 \
     --no-compiler-plugin \
     "$@" \

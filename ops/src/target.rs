@@ -87,6 +87,10 @@ impl TargetUri {
             return Ok(Self::Vsock { cid, port });
         }
 
+        if let Some(rest) = trimmed.strip_prefix("helios+tls://") {
+            return parse_host_port(raw, rest, true);
+        }
+
         if let Some(rest) = trimmed.strip_prefix("helios://") {
             return parse_host_port(raw, rest, true);
         }
@@ -97,7 +101,9 @@ impl TargetUri {
 
         Err(TargetError::InvalidUri {
             uri: raw.to_owned(),
-            reason: "expected scheme `helios://`, `tcp://`, `vsock://`, or `serial://`".to_owned(),
+            reason:
+                "expected scheme `helios://`, `helios+tls://`, `tcp://`, `vsock://`, or `serial://`"
+                    .to_owned(),
         })
     }
 
@@ -624,9 +630,76 @@ pub struct IdentityProfile {
     pub authority_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert: Option<CapabilityCert>,
+    /// Hex-encoded 32-byte Ed25519 client secret seed for unified inspector auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_key_hex: Option<String>,
+    /// Hex-encoded `postcard` [`helios_inspector_protocol::auth::CapabilityCert`]
+    /// (for CA-signed short-lived certificates with optional offline attenuation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_cert_postcard_hex: Option<String>,
+    /// Optional hex-encoded 32-byte pinned `MachineIdentity` Ed25519 public key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_machine_public_key_hex: Option<String>,
 }
 
 impl IdentityProfile {
+    /// Converts this profile into a wire [`helios_inspector_protocol::auth::ClientIdentity`].
+    pub fn to_client_identity(
+        &self,
+    ) -> Result<helios_inspector_protocol::auth::ClientIdentity, AuthError> {
+        let secret_hex =
+            self.secret_key_hex
+                .as_deref()
+                .ok_or_else(|| AuthError::InvalidIdentity {
+                    name: self.name.clone(),
+                    detail: "missing `secret_key_hex` in identity profile".to_owned(),
+                })?;
+        let secret_bytes =
+            decode_hex_32(secret_hex).map_err(|detail| AuthError::InvalidIdentity {
+                name: self.name.clone(),
+                detail,
+            })?;
+        if let Some(cert_hex) = &self.capability_cert_postcard_hex {
+            let cert_bytes = decode_hex(cert_hex).map_err(|detail| AuthError::InvalidIdentity {
+                name: self.name.clone(),
+                detail,
+            })?;
+            let cert =
+                helios_inspector_protocol::auth::CapabilityCert::decode_postcard(&cert_bytes)
+                    .map_err(|err| AuthError::InvalidIdentity {
+                        name: self.name.clone(),
+                        detail: format!("invalid postcard CapabilityCert: {err}"),
+                    })?;
+            Ok(
+                helios_inspector_protocol::auth::ClientIdentity::from_capability_cert(
+                    secret_bytes,
+                    cert,
+                    Vec::new(),
+                ),
+            )
+        } else {
+            Ok(helios_inspector_protocol::auth::ClientIdentity::from_static_seed(secret_bytes))
+        }
+    }
+
+    /// Converts this profile into a [`crate::SecurityMode::Authenticated`] configuration.
+    pub fn to_security_mode(&self) -> Result<crate::SecurityMode, AuthError> {
+        let identity = self.to_client_identity()?;
+        let expected_machine_public_key = match &self.expected_machine_public_key_hex {
+            Some(hex) => Some(
+                decode_hex_32(hex).map_err(|detail| AuthError::InvalidIdentity {
+                    name: self.name.clone(),
+                    detail,
+                })?,
+            ),
+            None => None,
+        };
+        Ok(crate::SecurityMode::Authenticated {
+            identity: Box::new(identity),
+            expected_machine_public_key,
+        })
+    }
+
     /// Default path for the named identity profile.
     #[must_use]
     pub fn path_for(name: &str) -> PathBuf {
@@ -666,6 +739,32 @@ impl IdentityProfile {
         })?;
         Ok(path)
     }
+}
+
+fn decode_hex(raw: &str) -> Result<Vec<u8>, String> {
+    let trimmed = raw.trim();
+    if !trimmed.len().is_multiple_of(2) {
+        return Err("hex string must have even length".to_owned());
+    }
+    let mut out = Vec::with_capacity(trimmed.len() / 2);
+    let bytes = trimmed.as_bytes();
+    for pair in bytes.as_chunks::<2>().0 {
+        let hi = (pair[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| "invalid hex digit".to_owned())?;
+        let lo = (pair[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| "invalid hex digit".to_owned())?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Ok(out)
+}
+
+fn decode_hex_32(raw: &str) -> Result<[u8; 32], String> {
+    let bytes = decode_hex(raw)?;
+    bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("expected 32-byte key, got {} bytes", v.len()))
 }
 
 #[cfg(test)]

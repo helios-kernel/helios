@@ -319,6 +319,10 @@ pub const fn exponential_backoff_ms(base_ms: u64, max_ms: u64, attempt: u32) -> 
     }
 }
 
+/// Opaque pending event returned by [`Supervisor::recv_event`] and consumed by
+/// [`Supervisor::handle_pending_event`].
+pub struct PendingEvent<R: SupervisorRuntime>(SupervisorEvent<R>);
+
 /// Stateful, async-first component supervisor driving a validated [`ComponentTopology`].
 pub struct Supervisor<R: SupervisorRuntime> {
     runtime: R,
@@ -428,7 +432,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
 
     /// Like [`Self::boot`], running `after_providers` once mounts and kernel
     /// providers (`compiler`, `http-client`, `compositor`) are installed and
-    /// before remaining eager components (e.g. `/debugger`) start and
+    /// before remaining eager components (e.g. `/inspector`) start and
     /// `signal_ready()` is emitted.
     pub async fn boot_with_pre_ready_hook<F, Fut>(
         &mut self,
@@ -475,24 +479,43 @@ impl<R: SupervisorRuntime> Supervisor<R> {
     /// or a `critical = "system"` component escalates fatally.
     pub async fn run_until_done(&mut self) -> Result<(), SupervisorError> {
         while self.has_active_work() {
-            let Ok(event) = self.event_rx.recv().await else {
+            let Some(event) = self.recv_event().await else {
                 break;
             };
-            self.handle_event(event).await?;
-            self.drain_pending_work().await?;
+            self.handle_pending_event(event).await?;
         }
         Ok(())
     }
 
+    /// Cancel-safely awaits the next internal supervisor event without mutating
+    /// supervisor state.
+    ///
+    /// Callers multiplexing external control channels (such as
+    /// `helios:system/component-control`) should race `recv_event()` against
+    /// their control channel and then pass any received [`PendingEvent`] to
+    /// [`Self::handle_pending_event`] uninterrupted.
+    pub async fn recv_event(&self) -> Option<PendingEvent<R>> {
+        self.event_rx.recv().await.ok().map(PendingEvent)
+    }
+
+    /// Applies one event received from [`Self::recv_event`] and drains any
+    /// resulting eager activations or realm resets to completion.
+    pub async fn handle_pending_event(
+        &mut self,
+        event: PendingEvent<R>,
+    ) -> Result<(), SupervisorError> {
+        self.handle_event(event.0).await?;
+        self.drain_pending_work().await
+    }
+
     /// Processes a single pending supervisor event (useful for deterministic step-by-step tests).
     pub async fn step_once(&mut self) -> Result<bool, SupervisorError> {
-        match self.event_rx.recv().await {
-            Ok(event) => {
-                self.handle_event(event).await?;
-                self.drain_pending_work().await?;
+        match self.recv_event().await {
+            Some(event) => {
+                self.handle_pending_event(event).await?;
                 Ok(true)
             }
-            Err(_) => Ok(false),
+            None => Ok(false),
         }
     }
 
@@ -505,6 +528,40 @@ impl<R: SupervisorRuntime> Supervisor<R> {
             count += 1;
         }
         Ok(count)
+    }
+
+    /// Starts a configured non-realm component by moniker if not already running.
+    pub async fn start_component(
+        &mut self,
+        moniker: &str,
+    ) -> Result<ComponentStateRecord, SupervisorError> {
+        let idx = self
+            .find_index(moniker)
+            .ok_or_else(|| SupervisorError::UnknownComponent {
+                moniker: moniker.to_owned(),
+            })?;
+        if !self.components[idx].active {
+            return Err(SupervisorError::UnknownComponent {
+                moniker: moniker.to_owned(),
+            });
+        }
+        if !self.components[idx].node.runner.is_realm()
+            && !matches!(
+                self.components[idx].status,
+                ComponentStatus::Starting | ComponentStatus::Running
+            )
+        {
+            let sockets = self.bind_sockets_for(idx).await?;
+            let ipc = self.prepare_consumer_routes(idx);
+            self.activate_index(idx, sockets, ipc).await?;
+            self.drain_pending_work().await?;
+        }
+        self.inspect_records()
+            .into_iter()
+            .find(|rec| rec.moniker == moniker)
+            .ok_or_else(|| SupervisorError::UnknownComponent {
+                moniker: moniker.to_owned(),
+            })
     }
 
     /// Gracefully stops a single component (sending `SIGTERM`, waiting up to `stop_timeout_ms`,
@@ -520,6 +577,15 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         Ok(())
     }
 
+    /// Stops and re-starts a configured component by moniker.
+    pub async fn restart_component(
+        &mut self,
+        moniker: &str,
+    ) -> Result<ComponentStateRecord, SupervisorError> {
+        self.stop_component(moniker).await?;
+        self.start_component(moniker).await
+    }
+
     /// Gracefully stops every active running component in the topology.
     pub async fn shutdown_all(&mut self) {
         let indices: Vec<usize> = (0..self.components.len())
@@ -532,7 +598,10 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         self.publish_inspect();
     }
 
-    fn has_active_work(&self) -> bool {
+    /// Returns `true` while any non-realm active component is running, starting,
+    /// or holding an armed lazy socket listener.
+    #[must_use]
+    pub fn has_active_work(&self) -> bool {
         self.components.iter().any(|c| {
             c.active
                 && !c.node.runner.is_realm()

@@ -64,9 +64,11 @@ hardware support lives in thin adaptation crates.
 | `api/` | Async userland SDK for programs built as wasm components |
 | `api-macro/` | `#[helios_api::main]` proc macro |
 | `programs/init/` | Embedded init component |
-| `programs/debugger/` | Debugger component that exports `helios:system/*` back over RPC |
+| `programs/inspector-host/` | Privilege-separated inspector control plane (Ed25519 + `postcard` auth, `MachineIdentity` signing, worker spawning) |
+| `programs/inspector-tls/` | Zero-authority pure-Rust TLS 1.3 terminator (`ProcessAuthority::empty()`) |
+| `programs/inspector-worker/` | Per-session attenuated `helios-wit-rpc` bridge executing under kernel `ProcessAuthority` |
 | `inspector/` | Host-side CLI (`shell`, `stats`, `tracing`, `repl`, `vm`) |
-| `inspector-protocol/` | Shared RPC types between inspector and guest debugger |
+| `inspector-protocol/` | Shared authentication, TLS 1.3, and wire-framing primitives for inspector sessions |
 | `virtio/` | virtio device type definitions shared across backends |
 | `wit/` | Helios WIT worlds and WASI dependency snapshots |
 

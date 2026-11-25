@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 use futures_lite::future;
-use helios_inspector_protocol::system::inspect::{self, MemoryPressure};
-use helios_inspector_protocol::system::instances;
+use helios_wit_rpc::inspector::helios::system::instances;
+use helios_wit_rpc::inspector_snapshot::{self as inspect, MemoryPressure};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};

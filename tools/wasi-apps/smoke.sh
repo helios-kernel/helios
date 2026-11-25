@@ -176,7 +176,7 @@ run_wall_clock_smoke() {
     local output
     if ! output="$("${cargo_bin}" "${vm_args[@]}" \
         --boot-program dash \
-        --boot-program debugger \
+        --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
         --boot-program date \
         --no-compiler-plugin \
         shell -c '/bin/date' 2>&1)"; then
@@ -217,7 +217,7 @@ run_smoke \
     dash:42 \
     -- \
     --boot-program dash \
-    --boot-program debugger \
+    --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
     --no-compiler-plugin \
     shell \
     -c \
@@ -233,7 +233,7 @@ run_smoke \
     pipe:ok \
     -- \
     --boot-program dash \
-    --boot-program debugger \
+    --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
     --boot-program cat \
     --boot-program mkdir \
     --no-compiler-plugin \
@@ -249,7 +249,7 @@ run_smoke \
     cwd:/ \
     -- \
     --boot-program dash \
-    --boot-program debugger \
+    --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
     --boot-program bash \
     --boot-program mkdir \
     --boot-program cat \
@@ -264,7 +264,7 @@ run_smoke \
     status:7 \
     -- \
     --boot-program dash \
-    --boot-program debugger \
+    --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
     --boot-program bash \
     --no-compiler-plugin \
     shell \
@@ -276,7 +276,7 @@ run_smoke \
     42 \
     -- \
     --boot-program dash \
-    --boot-program debugger \
+    --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
     --boot-program quickjs \
     --no-compiler-plugin \
     shell \
@@ -288,7 +288,7 @@ run_smoke \
     thread-futex:ok \
     -- \
     --boot-program dash \
-    --boot-program debugger \
+    --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
     --boot-program wasix-thread-futex \
     --no-compiler-plugin \
     shell \
@@ -300,7 +300,7 @@ run_smoke \
     continuation:ok \
     -- \
     --boot-program dash \
-    --boot-program debugger \
+    --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
     --boot-program wasix-continuation \
     --no-compiler-plugin \
     shell \
@@ -312,7 +312,7 @@ run_smoke \
     atomic-wait-timeout:ok \
     -- \
     --boot-program dash \
-    --boot-program debugger \
+    --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
     --boot-program wasix-atomic-wait-timeout \
     --no-compiler-plugin \
     shell \
@@ -324,7 +324,7 @@ run_smoke \
     atomic-wait-kill:ok \
     -- \
     --boot-program dash \
-    --boot-program debugger \
+    --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
     --boot-program wasix-atomic-wait-kill \
     --no-compiler-plugin \
     shell \
@@ -337,7 +337,7 @@ run_smoke \
     orphan-threads:exit=0 \
     -- \
     --boot-program dash \
-    --boot-program debugger \
+    --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
     --boot-program wasix-orphan-threads \
     --no-compiler-plugin \
     shell \
@@ -350,7 +350,7 @@ run_smoke \
     thread-proc-exit:exit=7 \
     -- \
     --boot-program dash \
-    --boot-program debugger \
+    --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
     --boot-program wasix-thread-proc-exit \
     --no-compiler-plugin \
     shell \
@@ -364,7 +364,7 @@ run_smoke \
     thread-exec:exit=0 \
     -- \
     --boot-program dash \
-    --boot-program debugger \
+    --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
     --boot-program wasix-thread-exec \
     --no-compiler-plugin \
     shell \
@@ -381,7 +381,7 @@ run_smoke \
     thread-trap:exit=29 \
     -- \
     --boot-program dash \
-    --boot-program debugger \
+    --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
     --boot-program wasix-thread-trap \
     --no-compiler-plugin \
     shell \
@@ -400,7 +400,7 @@ run_smoke \
     forged:refused \
     -- \
     --boot-program dash \
-    --boot-program debugger \
+    --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
     --boot-program python3 \
     --boot-program wasix-atomic-wait-timeout \
     --no-compiler-plugin \
@@ -413,7 +413,7 @@ run_smoke \
     '{"ok":"a"}' \
     -- \
     --boot-program dash \
-    --boot-program debugger \
+    --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
     --boot-program python3 \
     --no-compiler-plugin \
     shell \
@@ -427,7 +427,7 @@ run_smoke \
     'bytes from 10.0.2.2' \
     -- \
     --boot-program dash \
-    --boot-program debugger \
+    --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
     --boot-program ping \
     --no-compiler-plugin \
     shell \
@@ -440,7 +440,7 @@ if [[ "${HELIOS_WASI_SMOKE_CURL:-0}" == "1" ]]; then
         'bytes from ' \
         -- \
         --boot-program dash \
-        --boot-program debugger \
+        --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
         --boot-program ping \
         --no-compiler-plugin \
         shell \
@@ -454,7 +454,7 @@ if [[ "${HELIOS_WASI_SMOKE_CURL:-0}" == "1" ]]; then
         'success' \
         -- \
         --boot-program dash \
-        --boot-program debugger \
+        --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
         --boot-program curl \
         --boot-program http-client \
         --no-compiler-plugin \
@@ -470,7 +470,7 @@ if [[ "${HELIOS_WASI_SMOKE_CURL:-0}" == "1" ]]; then
         'success' \
         -- \
         --boot-program dash \
-        --boot-program debugger \
+        --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
         --boot-program curl \
         --boot-program http-client \
         --no-compiler-plugin \
@@ -486,7 +486,7 @@ if [[ "${HELIOS_WASI_SMOKE_CURL:-0}" == "1" ]]; then
         'success' \
         -- \
         --boot-program dash \
-        --boot-program debugger \
+        --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
         --boot-program curl \
         --boot-program http-client \
         --no-compiler-plugin \
@@ -505,7 +505,7 @@ if [[ "${HELIOS_WASI_SMOKE_CURL:-0}" == "1" ]]; then
             'TlsCertificateError' \
             -- \
             --boot-program dash \
-            --boot-program debugger \
+            --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --boot-program curl \
             --boot-program http-client \
             --no-compiler-plugin \

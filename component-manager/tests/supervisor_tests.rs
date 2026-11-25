@@ -1472,3 +1472,76 @@ fn lazy_socket_only_topology_stays_active_in_run_until_done() {
         );
     }
 }
+
+#[test]
+fn cancel_safe_event_loop_handles_control_and_exits_when_inactive() {
+    use futures_lite::FutureExt as _;
+
+    let mut root = base_node("/", None, RunnerSpec::Realm);
+    root.children_indices = Cow::Borrowed(&[1]);
+    root.oom_tier = OomTier::Protected;
+    root.capabilities = full_root_ceiling();
+
+    let mut svc = base_node(
+        "/svc",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/svc"),
+            sharding: WasmSharding::Singleton,
+            provider: None,
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    svc.startup = StartupPolicy::Eager;
+    svc.restart = RestartPolicy::Never;
+
+    let rt = MockRuntime::new(HardwareInventorySnapshot::default());
+    let tasks = rt.tasks.clone();
+    let mut sup = Supervisor::new(
+        rt.clone(),
+        ComponentTopology {
+            nodes: Cow::Owned(vec![root, svc]),
+        },
+    )
+    .expect("supervisor");
+    tasks.run_to_completion(sup.boot()).expect("boot");
+    assert!(sup.has_active_work());
+    assert_eq!(sup.status_of("/svc"), Some(ComponentStatus::Running));
+
+    let (ctrl_tx, ctrl_rx) = async_channel::unbounded::<&'static str>();
+    ctrl_tx.try_send("ping").expect("send control");
+
+    // 1. Control message cancels only `recv_event()` (never mutates supervisor state).
+    let mut handled_control = false;
+    tasks.run_to_completion(async {
+        enum Item<E> {
+            Event(Option<E>),
+            Control(&'static str),
+        }
+        let item = async { Item::Event(sup.recv_event().await) }
+            .or(async { Item::Control(ctrl_rx.recv().await.expect("ctrl")) })
+            .await;
+        match item {
+            Item::Control("ping") => handled_control = true,
+            _ => panic!("expected control command first"),
+        }
+    });
+    assert!(handled_control);
+    assert!(sup.has_active_work());
+
+    // 2. Child exits cleanly -> `handle_pending_event` runs to completion and `has_active_work()` becomes false.
+    rt.finish_child("/svc", ExitOutcome::Exited(0));
+    tasks.run_to_completion(async {
+        while sup.has_active_work() {
+            let Some(ev) = sup.recv_event().await else {
+                break;
+            };
+            sup.handle_pending_event(ev).await.expect("handle event");
+        }
+    });
+    assert!(!sup.has_active_work());
+    assert_eq!(sup.status_of("/svc"), Some(ComponentStatus::Completed));
+}

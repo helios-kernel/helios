@@ -600,11 +600,11 @@ mod tests {
         write_image_dir(
             dir.path(),
             true,
-            PrebuiltPrograms::Subset(vec!["debugger".to_owned(), "init".to_owned()]),
+            PrebuiltPrograms::Subset(vec!["init".to_owned(), "inspector-host".to_owned()]),
         );
 
         let features = vec!["linux".to_owned()];
-        let programs = vec!["debugger".to_owned()];
+        let programs = vec!["inspector-host".to_owned()];
         let request = PrebuiltRequest {
             mode: VmPrebuiltMode::Image,
             arch: VmArch::X86_64,

@@ -133,18 +133,44 @@ pub(crate) use helios_ops::transport::{RpcReader, RpcWriter};
 
 #[derive(Clone)]
 pub(crate) struct RpcClient {
-    client: helios_inspector_protocol::transport::Client<RpcReader, RpcWriter>,
+    client: helios_wit_rpc::PeerHandle,
     driver: std::sync::Arc<crate::frame_reader::FrameReader>,
 }
 
 impl RpcClient {
     pub(crate) fn new(read: RpcReader, write: RpcWriter) -> io::Result<Self> {
-        let client = helios_inspector_protocol::transport::Client::new(read, write);
-        let driver = crate::frame_reader::FrameReader::start(&client)?;
+        let (client, driver) = crate::frame_reader::FrameReader::start(read, write)?;
         Ok(Self {
             client,
             driver: std::sync::Arc::new(driver),
         })
+    }
+
+    /// Runs the unified Ed25519 + `postcard` authentication handshake over
+    /// `(read, write)` and starts the WIT-RPC frame driver once accepted.
+    pub(crate) async fn connect_authenticated(
+        mut read: RpcReader,
+        mut write: RpcWriter,
+        transport: helios_inspector_protocol::auth::TransportKind,
+        identity: &helios_inspector_protocol::auth::ClientIdentity,
+        expected_machine_public_key: Option<[u8; 32]>,
+    ) -> Result<Self, AuthConnectError> {
+        let _accepted = helios_inspector_protocol::auth::client_handshake(
+            &mut read,
+            &mut write,
+            transport,
+            identity,
+            expected_machine_public_key,
+            None,
+            None,
+        )
+        .await?;
+        Ok(Self::new(read, write)?)
+    }
+
+    /// Cheaply clone the underlying `helios-wit-rpc` peer handle.
+    pub(crate) fn peer(&self) -> helios_wit_rpc::PeerHandle {
+        self.client.clone()
     }
 
     /// Wrap this already-connected client into a [`helios_ops::RpcConnection`]
@@ -157,8 +183,17 @@ impl RpcClient {
     }
 }
 
+/// Why an authenticated inspector connection could not be established.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AuthConnectError {
+    #[error("inspector authentication handshake failed: {0}")]
+    Auth(#[from] helios_inspector_protocol::auth::AuthError),
+    #[error("failed to start RPC frame driver: {0}")]
+    Driver(#[from] io::Error),
+}
+
 impl std::ops::Deref for RpcClient {
-    type Target = helios_inspector_protocol::transport::Client<RpcReader, RpcWriter>;
+    type Target = helios_wit_rpc::PeerHandle;
 
     fn deref(&self) -> &Self::Target {
         &self.client
@@ -364,11 +399,6 @@ fn is_unix_socket(device: &str) -> Result<bool, SerialError> {
 }
 
 impl SerialIo {
-    pub(crate) fn into_client(self) -> io::Result<RpcClient> {
-        let (read, write) = self.into_split();
-        RpcClient::new(read, write)
-    }
-
     pub(crate) fn into_split(self) -> (RpcReader, RpcWriter) {
         (self.read, self.write)
     }

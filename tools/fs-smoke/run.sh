@@ -20,7 +20,7 @@ mkfs.btrfs -q -f --rootdir "$runtime/tree" "$runtime/image.btrfs"
   --bootfs-root "$runtime/bootfs" \
   --disk "$runtime/image.erofs,serial=erofs-smoke,readonly" \
   --disk "$runtime/image.btrfs,serial=btrfs-smoke" \
-  --boot-program nu --boot-program debugger \
+  --boot-program nu --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
   --boot-program ls --boot-program cat --boot-program python3 \
   --no-compiler-plugin \
   shell --shell /bin/nu -c 'true' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"

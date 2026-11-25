@@ -419,5 +419,35 @@ fn loads_default_repository_components_directory_cleanly() {
     assert!(topology.find_by_moniker("/plugins/compiler").is_some());
     assert!(topology.find_by_moniker("/plugins/http-client").is_some());
     assert!(topology.find_by_moniker("/plugins/compositor").is_some());
-    assert!(topology.find_by_moniker("/debugger").is_some());
+    assert!(topology.find_by_moniker("/debugger").is_none());
+
+    let inspector = &topology.nodes[topology
+        .find_by_moniker("/inspector")
+        .expect("/inspector manifest must exist")];
+    let inspector_tls = &topology.nodes[topology
+        .find_by_moniker("/inspector/tls")
+        .expect("/inspector/tls manifest must exist")];
+    let inspector_worker = &topology.nodes[topology
+        .find_by_moniker("/inspector/worker")
+        .expect("/inspector/worker manifest must exist")];
+
+    assert_eq!(
+        inspector_tls.capabilities,
+        helios_component_manager::CapabilityCeiling::EMPTY,
+        "/inspector/tls must statically declare empty capabilities"
+    );
+    assert!(
+        inspector
+            .capabilities
+            .machine
+            .contains(helios_component_manager::MachineRights::IDENTITY),
+        "/inspector holds machine.identity for handshake signing"
+    );
+    assert!(
+        !inspector_worker
+            .capabilities
+            .machine
+            .contains(helios_component_manager::MachineRights::IDENTITY),
+        "/inspector/worker must never hold machine.identity"
+    );
 }

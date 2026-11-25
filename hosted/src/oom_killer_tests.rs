@@ -100,7 +100,7 @@ fn pick_prefers_low_restart_cost_per_byte() {
 #[test]
 fn system_components_are_never_oom_victims() {
     let registry = registry_on_processor_zero();
-    let system = registry.register_with_policy("debugger", 0, OomPolicy::SystemComponent);
+    let system = registry.register_with_policy("inspector-host", 0, OomPolicy::SystemComponent);
     system.set_memory_bytes(1024 * 1024 * 1024);
 
     assert!(

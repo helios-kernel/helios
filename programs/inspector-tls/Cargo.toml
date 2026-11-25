@@ -1,0 +1,20 @@
+[package]
+name = "helios-inspector-tls"
+version = "0.1.0"
+edition.workspace = true
+autobins = false
+
+[dependencies]
+futures-io = { version = "0.3.34", default-features = false, features = ["std"] }
+futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
+futures-util = { version = "0.3.31", default-features = false, features = ["std", "async-await", "io"] }
+helios-api = { path = "../../api", default-features = false, features = ["ipc", "net", "programs"] }
+helios-inspector-protocol = { path = "../../inspector-protocol", default-features = false, features = ["tls"] }
+
+[lib]
+name = "helios_inspector_tls"
+path = "src/main.rs"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true

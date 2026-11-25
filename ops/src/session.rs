@@ -1,32 +1,34 @@
-//! Async-first [`Session`] handle for a single Helios node.
+//! Async-first [`Session`] handle for a single Helios node over `helios-wit-rpc`.
 
 use std::future::Future;
 use std::path::{Component, Path};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use helios_inspector_protocol::RpcError;
-use helios_inspector_protocol::debugger::filesystem::{
-    self as dbg_fs, DirectoryEntry, EntryKind, MountBtrfsRequest,
-};
-use helios_inspector_protocol::debugger::programs as dbg_programs;
-use helios_inspector_protocol::debugger::snapshot::{self as dbg_snapshot, SnapshotReadiness};
-use helios_inspector_protocol::system::{
-    inspect::{self, KernelSnapshot, SnapshotResult},
-    instances::{self, Instance},
-    processors::{self, ProcessorSets},
+use helios_wit_rpc::RpcError;
+use helios_wit_rpc::inspector::helios::system::{
+    component_control::{self as rpc_cc, ComponentStatus},
+    inspect::{self as rpc_inspect, Query, SnapshotResult},
+    instances::{self as rpc_instances, Instance},
+    ipc::Endpoint as WireIpcEndpoint,
+    processors::{self as rpc_processors, ProcessorSets},
     profiling::{
-        self, Filter as ProfileFilter, FoldedSample, InstructionProfile, MetricFilter, MetricSample,
+        self as rpc_profiling, Filter as ProfileFilter, FoldedSample, InstructionProfile,
+        MetricFilter, MetricSample,
     },
     programs::{
-        self, AuthorityScope, CapabilityGrant, ClockGrant, ClockRight, DeviceClass, DeviceGrant,
-        DiagnosticsGrant, DirectoryGrant, ExecRequest, ExecResult, FilesystemRight, LinkGrant,
-        LinkRight, MachineGrant, MachineRight, MountGrant, MountRight, NetworkGrant, NetworkRight,
-        ProcessGrant, ProcessRight, SettingsGrant, SettingsRight, TerminalGrant, TerminalRight,
+        self as rpc_programs, AuthorityScope, CapabilityGrant, ClockGrant, ClockRight, DeviceClass,
+        DeviceGrant, DiagnosticsGrant, DirectoryGrant, ExecRequest, ExecResult, FilesystemRight,
+        LinkGrant, LinkRight, MachineGrant, MachineRight, MountGrant, MountRight, NetworkGrant,
+        NetworkRight, ProcessGrant, ProcessRight, SettingsGrant, SettingsRight, TerminalGrant,
+        TerminalRight,
     },
-    tracing as sys_tracing,
+    snapshot::{self as rpc_snapshot, SnapshotHold as RemoteSnapshotHold},
+    tracing as rpc_tracing,
 };
+use helios_wit_rpc::inspector_fs::{self, EntryKind, MountBtrfsRequest};
+use helios_wit_rpc::inspector_snapshot::KernelSnapshot;
 
 use crate::error::OpsError;
 use crate::target::{
@@ -61,14 +63,14 @@ impl Default for SessionOptions {
 }
 
 /// Request parameters for [`Session::spawn`].
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SpawnRequest {
     pub path: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cwd: Option<String>,
     pub stdin: Vec<u8>,
-    pub capability_grants: Vec<CapabilityGrant>,
+    pub capability_grants: Vec<CapabilityGrant<WireIpcEndpoint>>,
 }
 
 impl SpawnRequest {
@@ -87,7 +89,7 @@ impl SpawnRequest {
 
 /// Parse a CLI `--grant` string (e.g. `dir:/tmp:rw`, `net:tcp,dns`, `inspect:own`,
 /// `diagnostics:control`, `terminal:all`, `process:spawn,exec`) into a typed [`CapabilityGrant`].
-pub fn parse_capability_grant(spec: &str) -> Result<CapabilityGrant, OpsError> {
+pub fn parse_capability_grant(spec: &str) -> Result<CapabilityGrant<WireIpcEndpoint>, OpsError> {
     let trimmed = spec.trim();
     if trimmed.is_empty() {
         return Err(OpsError::InvalidGrant {
@@ -111,7 +113,7 @@ pub fn parse_grant_spec(
     kind: &str,
     target: &str,
     mode: Option<&str>,
-) -> Result<CapabilityGrant, OpsError> {
+) -> Result<CapabilityGrant<WireIpcEndpoint>, OpsError> {
     let spec_display = match mode {
         Some(m) if !m.is_empty() => format!("{kind}:{target}:{m}"),
         _ if !target.is_empty() => format!("{kind}:{target}"),
@@ -343,7 +345,7 @@ pub fn parse_grant_spec(
         }
         "machine" => {
             let tokens = if target.is_empty() || target.eq_ignore_ascii_case("all") {
-                vec!["control", "identity"]
+                vec!["control", "identity", "virtualize"]
             } else {
                 target.split(',').collect()
             };
@@ -352,6 +354,7 @@ pub fn parse_grant_spec(
                 let r = match tok.trim().to_ascii_lowercase().as_str() {
                     "control" => MachineRight::Control,
                     "identity" => MachineRight::Identity,
+                    "virtualize" => MachineRight::Virtualize,
                     other => {
                         return Err(OpsError::InvalidGrant {
                             spec: spec_display,
@@ -426,14 +429,20 @@ impl Child {
     }
 }
 
-/// RAII handle holding the guest's VMM snapshot preparation state.
+/// Snapshot readiness flags reported by `helios:system/snapshot.snapshot-hold`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotReadiness {
+    pub has_generation_id: bool,
+}
+
+/// RAII handle holding the guest's VMM snapshot preparation state over the
+/// standard `helios:system/snapshot.snapshot-hold` WIT resource.
 ///
-/// Call [`Self::release`] explicitly to await `snapshot_finished`; dropping an
-/// unreleased hold triggers a best-effort async release on the active runtime.
+/// Dropping this handle automatically emits `Frame::ResourceDrop` to the
+/// remote `inspector-worker`, releasing the kernel's snapshot hold.
 pub struct SnapshotHold {
-    connection: RpcConnection,
+    handle: Option<RemoteSnapshotHold>,
     readiness: SnapshotReadiness,
-    released: AtomicBool,
 }
 
 impl SnapshotHold {
@@ -444,29 +453,9 @@ impl SnapshotHold {
     }
 
     /// End the snapshot hold on the guest so its host share re-attaches.
-    pub async fn release(self) -> Result<(), OpsError> {
-        self.released.store(true, Ordering::Release);
-        dbg_snapshot::snapshot_finished(self.connection.client())
-            .await
-            .map_err(|source| OpsError::Rpc {
-                operation: "debugger.snapshot.snapshot-finished",
-                source,
-            })
-    }
-}
-
-impl Drop for SnapshotHold {
-    fn drop(&mut self) {
-        if !self.released.swap(true, Ordering::AcqRel) {
-            let conn = self.connection.clone();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    if let Err(err) = dbg_snapshot::snapshot_finished(conn.client()).await {
-                        tracing::warn!("failed to release SnapshotHold on drop: {err}");
-                    }
-                });
-            }
-        }
+    pub async fn release(mut self) -> Result<(), OpsError> {
+        drop(self.handle.take());
+        Ok(())
     }
 }
 
@@ -493,6 +482,7 @@ pub struct Session {
     target: Target,
     connection: RpcConnection,
     options: SessionOptions,
+    sampling_session: Arc<tokio::sync::Mutex<Option<rpc_profiling::SamplingSession>>>,
 }
 
 impl Session {
@@ -504,6 +494,7 @@ impl Session {
             target: target.clone(),
             connection,
             options,
+            sampling_session: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -518,6 +509,7 @@ impl Session {
             target,
             connection,
             options,
+            sampling_session: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -533,7 +525,7 @@ impl Session {
         &self.options
     }
 
-    /// Borrow the underlying protocol RPC client.
+    /// Borrow the underlying `helios-wit-rpc` [`ProtocolClient`].
     #[must_use]
     pub fn protocol_client(&self) -> &ProtocolClient {
         self.connection.client()
@@ -584,13 +576,12 @@ impl Session {
     pub async fn inspect(&self, prefixes: &[&str], limit: u32) -> Result<SnapshotResult, OpsError> {
         self.require_right(GrantRight::Inspect)?;
         let active_scope = normalize_scope(self.options.attenuation.effective_scope());
-        let scoped_owned: Vec<String>;
-        let effective_prefixes: Vec<&str> = if active_scope == "/" {
-            prefixes.to_vec()
+        let effective_prefixes: Vec<String> = if active_scope == "/" {
+            prefixes.iter().map(|p| (*p).to_owned()).collect()
         } else if prefixes.is_empty() {
-            vec![active_scope.as_str()]
+            vec![active_scope.clone()]
         } else {
-            scoped_owned = prefixes
+            prefixes
                 .iter()
                 .map(|p| {
                     let candidate = if p.starts_with('/') {
@@ -610,19 +601,24 @@ impl Session {
                         Ok(candidate)
                     }
                 })
-                .collect::<Result<Vec<_>, _>>()?;
-            scoped_owned.iter().map(String::as_str).collect()
+                .collect::<Result<Vec<_>, _>>()?
         };
 
+        let client = rpc_inspect::RpcClient::new(self.connection.client().clone());
         let answer = self
             .call(
                 "system.inspect.snapshot",
-                inspect::snapshot_prefixes(self.connection.client(), &effective_prefixes, limit),
+                client.snapshot(
+                    Query {
+                        prefixes: effective_prefixes,
+                    },
+                    limit,
+                ),
             )
             .await?;
-        let mut snapshot = answer.map_err(|source| OpsError::FilterRefused {
+        let mut snapshot = answer.map_err(|error| OpsError::FilterRefused {
             operation: "system.inspect.snapshot",
-            source,
+            error,
         })?;
         if active_scope != "/" {
             snapshot
@@ -641,11 +637,9 @@ impl Session {
     /// List live instances (`ps`).
     pub async fn instances(&self) -> Result<Vec<Instance>, OpsError> {
         self.require_right(GrantRight::InstanceRead)?;
+        let client = rpc_instances::RpcClient::new(self.connection.client().clone());
         let mut live = self
-            .call(
-                "system.instances.snapshot",
-                instances::snapshot(self.connection.client()),
-            )
+            .call("system.instances.snapshot", client.snapshot())
             .await?;
         let active_scope = normalize_scope(self.options.attenuation.effective_scope());
         if active_scope != "/" {
@@ -662,13 +656,9 @@ impl Session {
     /// Request termination of instance `id`.
     pub async fn kill(&self, id: u64) -> Result<(), OpsError> {
         self.require_right(GrantRight::InstanceControl)?;
-        let answer = self
-            .call(
-                "system.instances.kill",
-                instances::kill(self.connection.client(), id),
-            )
-            .await?;
-        answer.map_err(|source| OpsError::KillRefused { id, source })
+        let client = rpc_instances::RpcClient::new(self.connection.client().clone());
+        let answer = self.call("system.instances.kill", client.kill(id)).await?;
+        answer.map_err(|error| OpsError::KillRefused { id, error })
     }
 
     /// Resolve a live instance by name and request its termination.
@@ -685,22 +675,75 @@ impl Session {
         Ok(id)
     }
 
+    /// List configured components via opt-in `helios:system/component-control`.
+    pub async fn list_components(&self) -> Result<Vec<ComponentStatus>, OpsError> {
+        self.require_right(GrantRight::InstanceRead)?;
+        let client = rpc_cc::RpcClient::new(self.connection.client().clone());
+        let answer = self
+            .call(
+                "system.component-control.list-components",
+                client.list_components(),
+            )
+            .await?;
+        answer.map_err(|err| OpsError::from_component_control("list-components", err))
+    }
+
+    /// Start a component by moniker via opt-in `helios:system/component-control`.
+    pub async fn start_component(&self, moniker: &str) -> Result<ComponentStatus, OpsError> {
+        self.require_right(GrantRight::InstanceControl)?;
+        let client = rpc_cc::RpcClient::new(self.connection.client().clone());
+        let answer = self
+            .call(
+                "system.component-control.start",
+                client.start(moniker.to_owned()),
+            )
+            .await?;
+        answer.map_err(|err| OpsError::from_component_control("start", err))
+    }
+
+    /// Stop a component by moniker via opt-in `helios:system/component-control`.
+    pub async fn stop_component(&self, moniker: &str) -> Result<(), OpsError> {
+        self.require_right(GrantRight::InstanceControl)?;
+        let client = rpc_cc::RpcClient::new(self.connection.client().clone());
+        let answer = self
+            .call(
+                "system.component-control.stop",
+                client.stop(moniker.to_owned()),
+            )
+            .await?;
+        answer.map_err(|err| OpsError::from_component_control("stop", err))
+    }
+
+    /// Restart a component by moniker via opt-in `helios:system/component-control`.
+    pub async fn restart_component(&self, moniker: &str) -> Result<ComponentStatus, OpsError> {
+        self.require_right(GrantRight::InstanceControl)?;
+        let client = rpc_cc::RpcClient::new(self.connection.client().clone());
+        let answer = self
+            .call(
+                "system.component-control.restart",
+                client.restart(moniker.to_owned()),
+            )
+            .await?;
+        answer.map_err(|err| OpsError::from_component_control("restart", err))
+    }
+
     /// Fetch recent guest tracing events matching `filter`.
     pub async fn trace_recent(
         &self,
-        filter: &sys_tracing::Filter,
+        filter: &rpc_tracing::Filter,
         limit: u32,
-    ) -> Result<Vec<sys_tracing::Event>, OpsError> {
+    ) -> Result<Vec<rpc_tracing::Event>, OpsError> {
         self.require_right(GrantRight::Trace)?;
+        let client = rpc_tracing::RpcClient::new(self.connection.client().clone());
         let answer = self
             .call(
                 "system.tracing.recent",
-                sys_tracing::recent(self.connection.client(), filter, limit),
+                client.recent(filter.clone(), limit),
             )
             .await?;
-        answer.map_err(|source| OpsError::FilterRefused {
+        answer.map_err(|error| OpsError::FilterRefused {
             operation: "system.tracing.recent",
-            source,
+            error,
         })
     }
 
@@ -711,45 +754,40 @@ impl Session {
         enabled: bool,
     ) -> Result<(), OpsError> {
         self.require_right(GrantRight::Trace)?;
+        let client = rpc_tracing::RpcClient::new(self.connection.client().clone());
         let answer = self
             .call(
                 "system.tracing.set-target-enabled",
-                sys_tracing::set_target_enabled(self.connection.client(), target, enabled),
+                client.set_target_enabled(target.to_owned(), enabled),
             )
             .await?;
-        answer.map_err(|source| OpsError::TraceTargetRefused {
+        answer.map_err(|error| OpsError::TraceTargetRefused {
             target: target.to_owned(),
-            source,
+            error,
         })
     }
 
     /// Toggle guest profiling collection.
     pub async fn profile_set_enabled(&self, enabled: bool) -> Result<(), OpsError> {
         self.require_right(GrantRight::Profile)?;
+        let client = rpc_profiling::RpcClient::new(self.connection.client().clone());
         let answer = self
-            .call(
-                "system.profiling.set-enabled",
-                profiling::set_enabled(self.connection.client(), enabled),
-            )
+            .call("system.profiling.set-enabled", client.set_enabled(enabled))
             .await?;
-        answer.map_err(|source| OpsError::ProfilingControlRefused {
+        answer.map_err(|error| OpsError::ProfilingControlRefused {
             operation: "set-enabled",
-            source,
+            error,
         })
     }
 
     /// Clear collected guest profile samples.
     pub async fn profile_clear(&self) -> Result<(), OpsError> {
         self.require_right(GrantRight::Profile)?;
-        let answer = self
-            .call(
-                "system.profiling.clear",
-                profiling::clear(self.connection.client()),
-            )
-            .await?;
-        answer.map_err(|source| OpsError::ProfilingControlRefused {
+        let client = rpc_profiling::RpcClient::new(self.connection.client().clone());
+        let answer = self.call("system.profiling.clear", client.clear()).await?;
+        answer.map_err(|error| OpsError::ProfilingControlRefused {
             operation: "clear",
-            source,
+            error,
         })
     }
 
@@ -760,15 +798,16 @@ impl Session {
         limit: u32,
     ) -> Result<Vec<FoldedSample>, OpsError> {
         self.require_right(GrantRight::Profile)?;
+        let client = rpc_profiling::RpcClient::new(self.connection.client().clone());
         let answer = self
             .call(
                 "system.profiling.folded",
-                profiling::folded(self.connection.client(), filter, limit),
+                client.folded(filter.clone(), limit),
             )
             .await?;
-        answer.map_err(|source| OpsError::FilterRefused {
+        answer.map_err(|error| OpsError::FilterRefused {
             operation: "system.profiling.folded",
-            source,
+            error,
         })
     }
 
@@ -779,60 +818,74 @@ impl Session {
         limit: u32,
     ) -> Result<Vec<MetricSample>, OpsError> {
         self.require_right(GrantRight::Profile)?;
+        let client = rpc_profiling::RpcClient::new(self.connection.client().clone());
         let answer = self
             .call(
                 "system.profiling.metrics",
-                profiling::metrics(self.connection.client(), filter, limit),
+                client.metrics(filter.clone(), limit),
             )
             .await?;
-        answer.map_err(|source| OpsError::FilterRefused {
+        answer.map_err(|error| OpsError::FilterRefused {
             operation: "system.profiling.metrics",
-            source,
+            error,
         })
     }
 
-    /// Start or stop kernel instruction sampling.
+    /// Start or stop kernel instruction sampling via the RAII `sampling-session` resource.
     pub async fn profile_set_instruction_sampling(&self, enabled: bool) -> Result<(), OpsError> {
         self.require_right(GrantRight::Profile)?;
-        let answer = self
-            .call(
-                "system.profiling.set-instruction-sampling",
-                profiling::set_instruction_sampling(self.connection.client(), enabled),
-            )
-            .await?;
-        answer.map_err(|source| OpsError::InstructionProfileRefused {
-            operation: "set-instruction-sampling",
-            source,
-        })
+        let mut slot = self.sampling_session.lock().await;
+        if enabled {
+            if slot.is_some() {
+                return Ok(());
+            }
+            let client = rpc_profiling::RpcClient::new(self.connection.client().clone());
+            let answer = self
+                .call(
+                    "system.profiling.start-instruction-sampling",
+                    client.start_instruction_sampling(),
+                )
+                .await?;
+            let lease = answer.map_err(|error| OpsError::InstructionProfileRefused {
+                operation: "start-instruction-sampling",
+                error,
+            })?;
+            *slot = Some(lease);
+        } else {
+            let _ = slot.take();
+        }
+        Ok(())
     }
 
     /// Retrieve collected kernel instruction samples.
     pub async fn profile_instruction_samples(&self) -> Result<InstructionProfile, OpsError> {
         self.require_right(GrantRight::Profile)?;
+        let client = rpc_profiling::RpcClient::new(self.connection.client().clone());
         let answer = self
             .call(
                 "system.profiling.instruction-samples",
-                profiling::instruction_samples(self.connection.client()),
+                client.instruction_samples(),
             )
             .await?;
-        answer.map_err(|source| OpsError::InstructionProfileRefused {
+        answer.map_err(|error| OpsError::InstructionProfileRefused {
             operation: "instruction-samples",
-            source,
+            error,
         })
     }
 
     /// Read the complete LLVM raw profile buffer from an instrumented kernel.
     pub async fn profile_raw_collect(&self) -> Result<Vec<u8>, OpsError> {
         self.require_right(GrantRight::Profile)?;
+        let client = rpc_profiling::RpcClient::new(self.connection.client().clone());
         let total_size = self
             .call(
                 "system.profiling.raw-profile-size",
-                profiling::raw_profile_size(self.connection.client()),
+                client.raw_profile_size(),
             )
             .await?
-            .map_err(|source| OpsError::RawProfileRefused {
+            .map_err(|error| OpsError::RawProfileRefused {
                 operation: "raw-profile-size",
-                source,
+                error,
             })?;
         let mut out = Vec::with_capacity(usize::try_from(total_size).unwrap_or(0));
         let mut offset = 0_u64;
@@ -843,12 +896,12 @@ impl Session {
             let chunk = self
                 .call(
                     "system.profiling.raw-profile-read",
-                    profiling::raw_profile_read(self.connection.client(), offset, len),
+                    client.raw_profile_read(offset, len),
                 )
                 .await?
-                .map_err(|source| OpsError::RawProfileRefused {
+                .map_err(|error| OpsError::RawProfileRefused {
                     operation: "raw-profile-read",
-                    source,
+                    error,
                 })?;
             if chunk.is_empty() {
                 break;
@@ -862,64 +915,63 @@ impl Session {
     /// Query possible and online processor sets.
     pub async fn processors_sets(&self) -> Result<ProcessorSets, OpsError> {
         self.require_right(GrantRight::Processors)?;
-        self.call(
-            "system.processors.sets",
-            processors::sets(self.connection.client()),
-        )
-        .await
+        let client = rpc_processors::RpcClient::new(self.connection.client().clone());
+        self.call("system.processors.sets", client.sets()).await
     }
 
     /// Take processor `id` offline.
     pub async fn processor_offline(&self, id: u32) -> Result<(), OpsError> {
         self.require_right(GrantRight::Processors)?;
+        let client = rpc_processors::RpcClient::new(self.connection.client().clone());
         let answer = self
-            .call(
-                "system.processors.offline",
-                processors::offline(self.connection.client(), id),
-            )
+            .call("system.processors.offline", client.offline(id))
             .await?;
-        answer.map_err(|source| OpsError::ProcessorOfflineRefused {
+        answer.map_err(|error| OpsError::ProcessorOfflineRefused {
             processor: id,
-            source,
+            error,
         })
     }
 
     /// Bring processor `id` online.
     pub async fn processor_online(&self, id: u32) -> Result<(), OpsError> {
         self.require_right(GrantRight::Processors)?;
+        let client = rpc_processors::RpcClient::new(self.connection.client().clone());
         let answer = self
-            .call(
-                "system.processors.online",
-                processors::online(self.connection.client(), id),
-            )
+            .call("system.processors.online", client.online(id))
             .await?;
-        answer.map_err(|source| OpsError::ProcessorOnlineRefused {
+        answer.map_err(|error| OpsError::ProcessorOnlineRefused {
             processor: id,
-            source,
+            error,
         })
     }
 
-    /// Execute a program by path via `debugger.programs.exec-path`.
+    /// Execute a program by path via `helios:system/programs.exec` with no
+    /// hardcoded implicit root capability grants.
     pub async fn exec(&self, path: &str, args: &[String]) -> Result<ExecResult, OpsError> {
         self.require_right(GrantRight::Exec)?;
         let normalized = normalize_absolute_path(path)?;
-        let answer = self
-            .call(
-                "debugger.programs.exec-path",
-                dbg_programs::exec_path(self.connection.client(), &normalized, args),
-            )
-            .await?;
-        answer.map_err(OpsError::from)
+        let req = ExecRequest {
+            name: normalized.clone(),
+            args: args.to_vec(),
+            env: Vec::new(),
+            path: normalized,
+            cwd: None,
+            stdin: Vec::new(),
+            hint: None,
+            capability_grants: Vec::new(),
+        };
+        self.exec_request(req).await
     }
 
     /// Execute a full [`ExecRequest`] via `helios:system/programs.exec`.
-    pub async fn exec_request(&self, request: &ExecRequest) -> Result<ExecResult, OpsError> {
+    pub async fn exec_request(
+        &self,
+        request: ExecRequest<WireIpcEndpoint>,
+    ) -> Result<ExecResult, OpsError> {
         self.require_right(GrantRight::Exec)?;
+        let client = rpc_programs::RpcClient::new(self.connection.client().clone());
         let answer = self
-            .call(
-                "system.programs.exec",
-                programs::exec(self.connection.client(), request),
-            )
+            .call("system.programs.exec", client.exec(request))
             .await?;
         answer.map_err(OpsError::from)
     }
@@ -928,21 +980,6 @@ impl Session {
     #[must_use]
     pub fn command(&self, path: impl Into<String>) -> crate::grants::Command {
         crate::grants::Command::new(path)
-    }
-
-    /// Execute a Linux binary inside a container via `debugger.programs.exec-in-container`.
-    pub async fn exec_in_container(
-        &self,
-        request: &dbg_programs::ExecInContainerRequest,
-    ) -> Result<ExecResult, OpsError> {
-        self.require_right(GrantRight::Exec)?;
-        let answer = self
-            .call(
-                "debugger.programs.exec-in-container",
-                dbg_programs::exec_in_container(self.connection.client(), request),
-            )
-            .await?;
-        answer.map_err(OpsError::from)
     }
 
     /// Persist this authenticated session principal's default Linux image preference
@@ -983,25 +1020,17 @@ impl Session {
         let session = self.clone();
         let instance_slot = Arc::clone(&instance_id);
         tokio::spawn(async move {
-            let outcome = if request.env.is_empty()
-                && request.cwd.is_none()
-                && request.stdin.is_empty()
-                && request.capability_grants.is_empty()
-            {
-                session.exec(&path, &request.args).await
-            } else {
-                let req = ExecRequest {
-                    name: path.clone(),
-                    args: request.args,
-                    env: request.env,
-                    path: path.clone(),
-                    cwd: request.cwd,
-                    stdin: request.stdin,
-                    hint: None,
-                    capability_grants: request.capability_grants,
-                };
-                session.exec_request(&req).await
+            let req = ExecRequest {
+                name: path.clone(),
+                args: request.args,
+                env: request.env,
+                path,
+                cwd: request.cwd,
+                stdin: request.stdin,
+                hint: None,
+                capability_grants: request.capability_grants,
             };
+            let outcome = session.exec_request(req).await;
 
             match outcome {
                 Ok(res) => {
@@ -1032,32 +1061,37 @@ impl Session {
     /// Prepare the guest for a VMM snapshot and return an RAII [`SnapshotHold`].
     pub async fn snapshot_hold(&self) -> Result<SnapshotHold, OpsError> {
         self.require_right(GrantRight::Snapshot)?;
-        let readiness = self
+        let client = rpc_snapshot::RpcClient::new(self.connection.client().clone());
+        let handle = self
+            .call("system.snapshot.prepare", client.prepare())
+            .await?
+            .map_err(|error| OpsError::SnapshotRefused { error })?;
+        let has_generation_id = self
             .call(
-                "debugger.snapshot.prepare-snapshot",
-                dbg_snapshot::prepare_snapshot(self.connection.client()),
+                "system.snapshot.has-generation-id",
+                handle.has_generation_id(),
             )
             .await?;
         Ok(SnapshotHold {
-            connection: self.connection.clone(),
-            readiness,
-            released: AtomicBool::new(false),
+            handle: Some(handle),
+            readiness: SnapshotReadiness { has_generation_id },
         })
     }
 
-    /// List directory entries on the remote VFS.
+    /// List directory entries on the remote VFS via `wasi:filesystem/{preopens,types}`.
     pub async fn list_dir(&self, path: &str) -> Result<Vec<RemoteEntry>, OpsError> {
         self.require_right(GrantRight::FilesystemRead)?;
         let dir = normalize_absolute_path(path)?;
-        let raw: Vec<DirectoryEntry> = self
-            .call(
-                "debugger.filesystem.list",
-                dbg_fs::list(self.connection.client(), &dir),
-            )
-            .await?;
+        let raw = tokio::time::timeout(
+            self.options.timeout,
+            inspector_fs::list_dir(self.connection.client(), &dir),
+        )
+        .await
+        .map_err(|_| OpsError::TimedOut {
+            operation: "wasi:filesystem.read-directory",
+        })??;
         Ok(raw
             .into_iter()
-            .filter(|entry| entry.name != "." && entry.name != "..")
             .map(|entry| {
                 let full_path = if dir == "/" {
                     format!("/{}", entry.name)
@@ -1073,132 +1107,163 @@ impl Session {
             .collect())
     }
 
-    /// Stat a single path on the remote VFS.
+    /// Stat a single path on the remote VFS via `wasi:filesystem/{preopens,types}`.
     pub async fn stat(&self, path: &str) -> Result<RemoteStat, OpsError> {
         self.require_right(GrantRight::FilesystemRead)?;
         let normalized = normalize_absolute_path(path)?;
-        if normalized == "/" {
-            return Ok(RemoteStat {
-                path: "/".to_owned(),
-                name: "/".to_owned(),
-                kind: EntryKind::Directory,
-                size: 0,
-            });
-        }
-        let parent = Path::new(&normalized)
-            .parent()
-            .and_then(Path::to_str)
-            .unwrap_or("/");
-        let name = Path::new(&normalized)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(&normalized);
-        let entries = self.list_dir(parent).await?;
-        let Some(found) = entries.into_iter().find(|e| e.name == name) else {
-            return Err(OpsError::NotFound { path: normalized });
-        };
-        let size = if found.kind == EntryKind::File {
-            self.read_file(&normalized)
-                .await
-                .map_or(0, |b| b.len() as u64)
+        let st = tokio::time::timeout(
+            self.options.timeout,
+            inspector_fs::stat(self.connection.client(), &normalized),
+        )
+        .await
+        .map_err(|_| OpsError::TimedOut {
+            operation: "wasi:filesystem.stat",
+        })?
+        .map_err(|err| match err {
+            inspector_fs::FsRpcError::Fs {
+                code: helios_wit_rpc::inspector::wasi::filesystem::types::ErrorCode::NoEntry,
+                ..
+            } => OpsError::NotFound {
+                path: normalized.clone(),
+            },
+            other => OpsError::Fs(other),
+        })?;
+        let name = if normalized == "/" {
+            "/".to_owned()
         } else {
-            0
+            Path::new(&normalized)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&normalized)
+                .to_owned()
         };
         Ok(RemoteStat {
             path: normalized,
-            name: found.name,
-            kind: found.kind,
-            size,
+            name,
+            kind: st.kind,
+            size: st.size,
         })
     }
 
-    /// Read a file from the remote VFS.
+    /// Read a file from the remote VFS via `wasi:filesystem/{preopens,types}`.
     pub async fn read_file(&self, path: &str) -> Result<Vec<u8>, OpsError> {
         self.require_right(GrantRight::FilesystemRead)?;
         let normalized = normalize_absolute_path(path)?;
-        self.call(
-            "debugger.filesystem.read",
-            dbg_fs::read(self.connection.client(), &normalized),
+        tokio::time::timeout(
+            self.options.timeout,
+            inspector_fs::read_file(self.connection.client(), &normalized),
         )
         .await
+        .map_err(|_| OpsError::TimedOut {
+            operation: "wasi:filesystem.read-via-stream",
+        })?
+        .map_err(OpsError::from)
     }
 
-    /// Write or append bytes to a file on the remote VFS.
+    /// Write or append bytes to a file on the remote VFS via `wasi:filesystem/{preopens,types}`.
     pub async fn write_file(&self, path: &str, data: &[u8], append: bool) -> Result<(), OpsError> {
         self.require_right(GrantRight::FilesystemWrite)?;
         let normalized = normalize_absolute_path(path)?;
-        self.call(
-            "debugger.filesystem.write",
-            dbg_fs::write(self.connection.client(), &normalized, data, append),
+        tokio::time::timeout(
+            self.options.timeout,
+            inspector_fs::write_file(self.connection.client(), &normalized, data, append),
         )
         .await
+        .map_err(|_| OpsError::TimedOut {
+            operation: "wasi:filesystem.write-via-stream",
+        })?
+        .map_err(OpsError::from)
     }
 
-    /// Create a directory on the remote VFS.
+    /// Create a directory on the remote VFS via `wasi:filesystem/{preopens,types}`.
     pub async fn mkdir(&self, path: &str) -> Result<(), OpsError> {
         self.require_right(GrantRight::FilesystemWrite)?;
         let normalized = normalize_absolute_path(path)?;
-        self.call(
-            "debugger.filesystem.create-directory",
-            dbg_fs::mkdir(self.connection.client(), &normalized),
+        tokio::time::timeout(
+            self.options.timeout,
+            inspector_fs::mkdir(self.connection.client(), &normalized),
         )
         .await
+        .map_err(|_| OpsError::TimedOut {
+            operation: "wasi:filesystem.create-directory-at",
+        })?
+        .map_err(OpsError::from)
     }
 
-    /// Remove a file or directory on the remote VFS.
+    /// Remove a file or directory on the remote VFS via `wasi:filesystem/{preopens,types}`.
     pub async fn remove(&self, path: &str) -> Result<(), OpsError> {
         self.require_right(GrantRight::FilesystemWrite)?;
         let normalized = normalize_absolute_path(path)?;
-        self.call(
-            "debugger.filesystem.remove",
-            dbg_fs::remove(self.connection.client(), &normalized),
+        tokio::time::timeout(
+            self.options.timeout,
+            inspector_fs::remove(self.connection.client(), &normalized),
         )
         .await
+        .map_err(|_| OpsError::TimedOut {
+            operation: "wasi:filesystem.remove",
+        })?
+        .map_err(OpsError::from)
     }
 
-    /// Copy a file on the remote VFS.
+    /// Copy a file on the remote VFS via `wasi:filesystem/{preopens,types}`.
     pub async fn copy(&self, source: &str, destination: &str) -> Result<(), OpsError> {
         self.require_right(GrantRight::FilesystemWrite)?;
         let src = normalize_absolute_path(source)?;
         let dst = normalize_absolute_path(destination)?;
-        self.call(
-            "debugger.filesystem.copy",
-            dbg_fs::copy(self.connection.client(), &src, &dst),
+        tokio::time::timeout(
+            self.options.timeout,
+            inspector_fs::copy(self.connection.client(), &src, &dst),
         )
         .await
+        .map_err(|_| OpsError::TimedOut {
+            operation: "wasi:filesystem.copy",
+        })?
+        .map_err(OpsError::from)
     }
 
-    /// Rename / move a file or directory on the remote VFS.
+    /// Rename / move a file or directory on the remote VFS via `wasi:filesystem/{preopens,types}`.
     pub async fn rename(&self, source: &str, destination: &str) -> Result<(), OpsError> {
         self.require_right(GrantRight::FilesystemWrite)?;
         let src = normalize_absolute_path(source)?;
         let dst = normalize_absolute_path(destination)?;
-        self.call(
-            "debugger.filesystem.move",
-            dbg_fs::move_path(self.connection.client(), &src, &dst),
+        tokio::time::timeout(
+            self.options.timeout,
+            inspector_fs::rename(self.connection.client(), &src, &dst),
         )
         .await
+        .map_err(|_| OpsError::TimedOut {
+            operation: "wasi:filesystem.rename-at",
+        })?
+        .map_err(OpsError::from)
     }
 
-    /// Touch a file on the remote VFS.
+    /// Touch a file on the remote VFS via `wasi:filesystem/{preopens,types}`.
     pub async fn touch(&self, path: &str) -> Result<(), OpsError> {
         self.require_right(GrantRight::FilesystemWrite)?;
         let normalized = normalize_absolute_path(path)?;
-        self.call(
-            "debugger.filesystem.touch",
-            dbg_fs::touch(self.connection.client(), &normalized),
+        tokio::time::timeout(
+            self.options.timeout,
+            inspector_fs::touch(self.connection.client(), &normalized),
         )
         .await
+        .map_err(|_| OpsError::TimedOut {
+            operation: "wasi:filesystem.touch",
+        })?
+        .map_err(OpsError::from)
     }
 
-    /// Mount a btrfs volume on the remote guest.
+    /// Mount a btrfs volume on the remote guest via `helios:system/mounts.mount`.
     pub async fn mount_btrfs(&self, request: &MountBtrfsRequest) -> Result<(), OpsError> {
         self.require_right(GrantRight::FilesystemWrite)?;
-        self.call(
-            "debugger.filesystem.mount-btrfs",
-            dbg_fs::mount_btrfs(self.connection.client(), request),
+        tokio::time::timeout(
+            self.options.timeout,
+            inspector_fs::mount_btrfs(self.connection.client(), request),
         )
         .await
+        .map_err(|_| OpsError::TimedOut {
+            operation: "helios:system/mounts.mount",
+        })?
+        .map_err(OpsError::from)
     }
 }
 
@@ -1328,16 +1393,130 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn helios_tls_uri_fails_fast_instead_of_downgrading_to_cleartext() {
-        let uri = TargetUri::parse("helios://127.0.0.1:9443").expect("parse helios uri");
-        let err = RpcConnection::connect(&uri, &SecurityMode::Plain)
+    async fn helios_tls_uri_requires_authenticated_mode_and_never_downgrades() {
+        for raw in ["helios://127.0.0.1:9443", "helios+tls://127.0.0.1:9443"] {
+            let uri = TargetUri::parse(raw).expect("parse helios uri");
+            let err = RpcConnection::connect(&uri, &SecurityMode::Plain)
+                .await
+                .err()
+                .expect("helios:// must refuse Plain mode");
+            assert!(matches!(
+                err,
+                crate::error::TransportError::AuthRequired { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn helios_tls_end_to_end_authenticates_and_invokes_wit_rpc() {
+        use futures_util::AsyncReadExt as _;
+        use helios_inspector_protocol::auth::{
+            AuthPolicy, ClientIdentity, MACHINE_IDENTITY_HANDSHAKE_DOMAIN, SessionGrants,
+            TransportKind, server_handshake, sign_machine_identity_seed,
+        };
+        use helios_inspector_protocol::tls::{TlsServerStream, build_ephemeral_server_config};
+        use helios_wit_rpc::Endpoint;
+        use helios_wit_rpc::inspector::helios::system::inspect::{
+            self as rpc_inspect, Entry, Value,
+        };
+
+        struct FakeInspect;
+        impl rpc_inspect::RpcHandler for FakeInspect {
+            type Publication = ();
+            async fn publish(
+                &self,
+                _name: String,
+                _span: helios_wit_rpc::inspector::helios::system::memory::Span,
+            ) -> Result<Self::Publication, rpc_inspect::PublishError> {
+                Ok(())
+            }
+            async fn snapshot(
+                &self,
+                _query: Query,
+                _limit: u32,
+            ) -> Result<
+                SnapshotResult,
+                helios_wit_rpc::inspector::helios::system::filters::FilterError,
+            > {
+                Ok(SnapshotResult {
+                    timestamp: 42,
+                    truncated: false,
+                    publications: Vec::new(),
+                    entries: vec![Entry {
+                        path: "/kernel/clock/uptime-nanos".to_owned(),
+                        value: Value::Unsigned64(1234),
+                    }],
+                })
+            }
+        }
+
+        let machine_seed = [0x11_u8; 32];
+        let machine_pub = ClientIdentity::from_static_seed(machine_seed).public_key();
+        let client_seed = [0x22_u8; 32];
+        let client_identity = ClientIdentity::from_static_seed(client_seed);
+        let policy = AuthPolicy::single_static_key("ops-test", client_identity.public_key());
+
+        let listener = async_net::TcpListener::bind("127.0.0.1:0")
             .await
-            .err()
-            .expect("helios:// must fail fast until #1190 TLS lands");
-        assert!(matches!(
-            err,
-            crate::error::TransportError::TlsNotYetImplemented { .. }
-        ));
+            .expect("bind tcp");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server_task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let (cfg, spki_sha256) = build_ephemeral_server_config().expect("server tls config");
+            let tls = TlsServerStream::accept(tcp.clone(), tcp, cfg, spki_sha256)
+                .await
+                .expect("tls accept");
+            let tls_binding = tls.binding();
+            let (mut r, mut w) = tls.split();
+            let verified = server_handshake(
+                &mut r,
+                &mut w,
+                TransportKind::TcpTls,
+                &policy,
+                &SessionGrants::full_worker_ceiling(),
+                machine_pub,
+                1_700_000_000,
+                7,
+                Some(tls_binding.channel_binding),
+                Some(tls_binding.peer_cert_sha256),
+                |challenge| {
+                    Ok(sign_machine_identity_seed(
+                        &machine_seed,
+                        MACHINE_IDENTITY_HANDSHAKE_DOMAIN,
+                        challenge,
+                    ))
+                },
+            )
+            .await
+            .expect("server handshake");
+            assert_eq!(verified.principal, "ops-test");
+            let ep = Endpoint::new(r, w, rpc_inspect::RpcServer::new(FakeInspect));
+            let _ = ep.drive().await;
+        });
+
+        let target = Target::new(
+            "tls-node",
+            format!("helios+tls://127.0.0.1:{}", addr.port()),
+        )
+        .expect("target");
+        let session = Session::connect(
+            &target,
+            SessionOptions {
+                security: SecurityMode::Authenticated {
+                    identity: Box::new(client_identity),
+                    expected_machine_public_key: Some(machine_pub),
+                },
+                ..SessionOptions::default()
+            },
+        )
+        .await
+        .expect("connect over helios+tls://");
+
+        let snap = session.kernel_snapshot().await.expect("kernel_snapshot");
+        assert_eq!(snap.uptime, 1234);
+        drop(session);
+        let _ = server_task.await;
     }
 
     #[test]

@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::root_key::ROOT_SECRET_FILE;
+use crate::root_key::{INSPECTOR_CLIENT_SECRET_FILE, ROOT_SECRET_FILE};
 
 /// File name of the manifest stored inside every prebuilt artifact directory.
 pub const PREBUILT_MANIFEST_FILE: &str = "manifest.json";
@@ -270,11 +270,15 @@ pub fn write_manifest(
     dir: &Path,
     manifest: &PrebuiltManifest,
 ) -> Result<PathBuf, PrebuiltManifestError> {
+    let allow_inspector_client_key = manifest.kind == PrebuiltArtifactKind::Image;
     if dir.join(ROOT_SECRET_FILE).exists()
-        || manifest
-            .files
-            .iter()
-            .any(|file| Path::new(file).file_name() == Some(ROOT_SECRET_FILE.as_ref()))
+        || (!allow_inspector_client_key && dir.join(INSPECTOR_CLIENT_SECRET_FILE).exists())
+        || manifest.files.iter().any(|file| {
+            let name = Path::new(file).file_name();
+            name == Some(ROOT_SECRET_FILE.as_ref())
+                || (!allow_inspector_client_key
+                    && name == Some(INSPECTOR_CLIENT_SECRET_FILE.as_ref()))
+        })
     {
         return Err(PrebuiltManifestError::SecretKeyPresent {
             dir: dir.display().to_string(),
@@ -319,9 +323,19 @@ pub fn read_manifest(dir: &Path) -> Result<PrebuiltManifest, PrebuiltManifestErr
             found: manifest.schema_version,
         });
     }
+    let allow_inspector_client_key = manifest.kind == PrebuiltArtifactKind::Image;
+    if !allow_inspector_client_key && dir.join(INSPECTOR_CLIENT_SECRET_FILE).exists() {
+        return Err(PrebuiltManifestError::SecretKeyPresent {
+            dir: dir.display().to_string(),
+        });
+    }
     for entry in &manifest.files {
         validate_relative_entry(&path, entry)?;
-        if Path::new(entry).file_name() == Some(ROOT_SECRET_FILE.as_ref()) {
+        let file_name = Path::new(entry).file_name();
+        if file_name == Some(ROOT_SECRET_FILE.as_ref())
+            || (!allow_inspector_client_key
+                && file_name == Some(INSPECTOR_CLIENT_SECRET_FILE.as_ref()))
+        {
             return Err(PrebuiltManifestError::SecretKeyPresent {
                 dir: dir.display().to_string(),
             });
@@ -372,8 +386,10 @@ mod tests {
             profile: "release-linux".to_owned(),
             kernel_features: vec!["linux".to_owned()],
             programs: Some(PrebuiltPrograms::Subset(vec![
-                "debugger".to_owned(),
                 "init".to_owned(),
+                "inspector-host".to_owned(),
+                "inspector-tls".to_owned(),
+                "inspector-worker".to_owned(),
             ])),
             files: vec![
                 KERNEL_IMAGE_FILE.to_owned(),
@@ -471,9 +487,9 @@ mod tests {
                 .is_empty()
         );
 
-        let subset = PrebuiltPrograms::Subset(vec!["debugger".to_owned(), "init".to_owned()]);
+        let subset = PrebuiltPrograms::Subset(vec!["inspector-host".to_owned(), "init".to_owned()]);
         assert_eq!(
-            subset.missing(&["debugger".to_owned(), "cpu".to_owned()]),
+            subset.missing(&["inspector-host".to_owned(), "cpu".to_owned()]),
             vec!["cpu"]
         );
     }

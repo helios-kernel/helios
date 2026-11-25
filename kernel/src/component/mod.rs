@@ -39,8 +39,8 @@ pub use resources::{
     ComponentRawMutex, ComponentRawMutexGuard, ComponentRawRwLock, ComponentRawRwLockReadGuard,
     ComponentRawRwLockWriteGuard, ComponentSamplingSession, ComponentSerialPort,
     ComponentSnapshotHold, ComponentTcpBackend, ComponentTcpListener, ComponentTcpStream,
-    ComponentUdpBackend, ComponentUdpSocket, DefaultLinuxCredentials, DefaultLinuxImage,
-    InheritedSocket, InheritedSockets,
+    ComponentTcpStreamHandle, ComponentUdpBackend, ComponentUdpSocket, DefaultLinuxCredentials,
+    DefaultLinuxImage, InheritedSocket, InheritedSockets,
 };
 pub use retire::{
     RetiredNetworkHandle, SnapshotRetirementSender, SocketRetirementQueue, SocketRetirementSender,

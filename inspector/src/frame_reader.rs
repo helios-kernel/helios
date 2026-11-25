@@ -3,45 +3,50 @@ use std::thread::JoinHandle;
 
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::future;
-use helios_inspector_protocol::transport::Client;
+use helios_wit_rpc::{Endpoint, PeerHandle};
 
 use crate::runtime;
 
-/// Owns the connection driver independently of any RPC future. Dropping the
-/// last session handle stops the driver, closes the connection and joins its
-/// thread. The executor races a stop channel, without polling or a Tokio runtime.
+/// Owns the WIT-RPC connection driver independently of any RPC future. Dropping
+/// the last session handle stops the driver, closes the connection and joins
+/// its thread. The executor races a stop channel, without polling or a Tokio
+/// runtime.
 pub(crate) struct FrameReader {
     stop: async_channel::Sender<()>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl FrameReader {
-    pub(crate) fn start<R, W>(client: &Client<R, W>) -> io::Result<Self>
+    pub(crate) fn start<R, W>(read: R, write: W) -> io::Result<(PeerHandle, Self)>
     where
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
         let (stop, stopped) = async_channel::bounded::<()>(1);
-        let client = client.clone();
+        let endpoint = Endpoint::new(read, write, ());
+        let handle = endpoint.handle();
         let thread = std::thread::Builder::new()
             .name("rpc-frame-reader".to_owned())
             .spawn(move || {
                 runtime::block_on(future::or(
                     async {
                         // A transport that fails or closes is recorded on
-                        // the client, and every call in flight or made
+                        // the peer handle, and every call in flight or made
                         // later reports it.
-                        let _ = client.route_frames().await;
+                        let _ = endpoint.drive().await;
                     },
                     async {
                         let _ = stopped.recv().await;
                     },
                 ));
             })?;
-        Ok(Self {
-            stop,
-            thread: Some(thread),
-        })
+        Ok((
+            handle,
+            Self {
+                stop,
+                thread: Some(thread),
+            },
+        ))
     }
 }
 
@@ -64,7 +69,6 @@ mod tests {
     use std::time::Duration;
 
     use async_io::Async;
-    use helios_inspector_protocol::transport::Client;
 
     use super::FrameReader;
 
@@ -86,11 +90,11 @@ mod tests {
     #[test]
     fn guest_is_drained_while_no_call_is_in_flight() {
         let (host, mut guest) = UnixStream::pair().expect("create socket pair");
-        let client = Client::new(
+        let (_handle, reader) = FrameReader::start(
             Async::new(host.try_clone().expect("clone read half")).expect("register read half"),
             Async::new(host).expect("register write half"),
-        );
-        let reader = FrameReader::start(&client).expect("start reader");
+        )
+        .expect("start reader");
 
         let (done, finished) = mpsc::channel();
         let guest_thread = std::thread::spawn(move || {

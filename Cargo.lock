@@ -2990,7 +2990,6 @@ dependencies = [
  "atomic-polyfill",
  "hash32",
  "rustc_version",
- "serde",
  "spin 0.9.9",
  "stable_deref_trait",
 ]
@@ -3167,6 +3166,7 @@ dependencies = [
  "helios-artifact",
  "helios-compiler-support",
  "helios-component-manager",
+ "helios-inspector-protocol",
  "helios-profdata",
  "helios-venus-gen",
  "helios-workspace-root",
@@ -3286,16 +3286,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "helios-debugger"
-version = "0.1.0"
-dependencies = [
- "futures-io",
- "helios-api",
- "helios-inspector-protocol",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "helios-desktop-text-check"
 version = "0.1.0"
 dependencies = [
@@ -3357,12 +3347,16 @@ dependencies = [
  "blocking",
  "critical-section",
  "crossbeam-channel",
+ "ed25519-dalek",
+ "futures-io",
  "futures-lite",
  "getrandom 0.3.4",
  "helios-artifact",
  "helios-hal",
  "helios-inspector-protocol",
  "helios-kernel",
+ "helios-wit-rpc",
+ "helios-workspace-root",
  "libc",
  "mimalloc",
  "tempfile",
@@ -3398,8 +3392,11 @@ name = "helios-init"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "futures-io",
+ "futures-lite",
  "helios-api",
  "helios-component-manager",
+ "helios-wit-rpc",
 ]
 
 [[package]]
@@ -3436,6 +3433,7 @@ dependencies = [
  "helios-nu",
  "helios-ops",
  "helios-profdata",
+ "helios-wit-rpc",
  "helios-workspace-root",
  "iced-x86",
  "indicatif",
@@ -3462,25 +3460,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-inspector-host"
+version = "0.1.0"
+dependencies = [
+ "futures-io",
+ "futures-lite",
+ "futures-util",
+ "helios-api",
+ "helios-inspector-protocol",
+ "helios-wit-rpc",
+]
+
+[[package]]
 name = "helios-inspector-protocol"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "async-io",
  "async-lock",
  "bytes",
+ "ed25519-dalek",
  "event-listener",
  "futures-core",
  "futures-io",
  "futures-lite",
  "futures-util",
- "helios-api",
+ "getrandom 0.4.3",
  "postcard",
+ "rustls",
+ "rustls-pure",
  "serde",
+ "sha2 0.11.0",
  "strip-ansi-escapes",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
- "wit-bindgen 0.63.0",
 ]
 
 [[package]]
@@ -3497,6 +3511,7 @@ dependencies = [
  "helios-inspector-protocol",
  "helios-nu",
  "helios-ops",
+ "helios-wit-rpc",
  "nu-ansi-term",
  "nu-engine",
  "nu-parser",
@@ -3509,6 +3524,29 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "helios-inspector-tls"
+version = "0.1.0"
+dependencies = [
+ "futures-io",
+ "futures-lite",
+ "futures-util",
+ "helios-api",
+ "helios-inspector-protocol",
+]
+
+[[package]]
+name = "helios-inspector-worker"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "futures-io",
+ "futures-lite",
+ "futures-util",
+ "helios-api",
+ "helios-wit-rpc",
 ]
 
 [[package]]
@@ -3685,8 +3723,10 @@ dependencies = [
  "directories",
  "futures-io",
  "futures-lite",
+ "futures-util",
  "helios-inspector-protocol",
  "helios-oci",
+ "helios-wit-rpc",
  "serde",
  "serde_json",
  "serialport",
@@ -6942,7 +6982,6 @@ dependencies = [
  "cobs",
  "embedded-io 0.4.0",
  "embedded-io 0.6.1",
- "heapless",
  "serde",
 ]
 

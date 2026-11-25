@@ -119,7 +119,7 @@ async def test_live_session_all_operations_and_attenuation(tmp_path: Path) -> No
         # exec & spawn (with capability grants)
         exec_res = await session.exec("/bin/ping", ["-c", "1"])
         assert exec_res.exit_code == 0
-        assert exec_res.stdout_text == "exec-path ok\n"
+        assert exec_res.stdout_text == "exec ok\n"
 
         child = await session.spawn(
             "/bin/ping",

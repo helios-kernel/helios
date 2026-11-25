@@ -283,9 +283,55 @@ impl Drop for ComponentTcpListener {
     }
 }
 
-/// Pre-bound listening socket transferred to a spawned child at launch.
+/// Concrete TCP stream resource for `helios:system/net.tcp-stream`.
 ///
-/// Retires the listener on drop if unclaimed or if the launch fails before the
+/// Non-generic so `bindgen!` maps `helios:system/net.tcp-stream` directly to
+/// it across component worlds; retires the underlying stream handle via
+/// [`crate::SocketRetirementSender`] on drop unless disarmed for hand-off.
+pub struct ComponentTcpStreamHandle {
+    raw: Option<u64>,
+    retire: crate::SocketRetirementSender,
+}
+
+impl ComponentTcpStreamHandle {
+    pub fn new(raw: u64, retire: crate::SocketRetirementSender) -> Self {
+        Self {
+            raw: Some(raw),
+            retire,
+        }
+    }
+
+    pub const fn raw(&self) -> Option<u64> {
+        self.raw
+    }
+
+    pub fn retirement(&self) -> crate::SocketRetirementSender {
+        self.retire.clone()
+    }
+
+    /// Disarms retirement and moves the underlying raw stream handle out.
+    pub fn take_raw(&mut self) -> Option<u64> {
+        self.raw.take()
+    }
+
+    /// Retires the stream immediately if still open.
+    pub fn close(&mut self) {
+        if let Some(raw) = self.raw.take() {
+            self.retire
+                .push(crate::RetiredNetworkHandle::TcpStream(raw));
+        }
+    }
+}
+
+impl Drop for ComponentTcpStreamHandle {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Pre-bound socket or connected stream transferred to a spawned child at launch.
+///
+/// Retires the handle on drop if unclaimed or if the launch fails before the
 /// child adopts ownership.
 pub enum InheritedSocket {
     Tcp {
@@ -298,6 +344,17 @@ pub enum InheritedSocket {
     Vsock {
         service: crate::ComponentHostVsockService,
         listener: Option<crate::VsockListenerId>,
+    },
+    TcpStream {
+        raw: Option<u64>,
+        retire: crate::SocketRetirementSender,
+    },
+    VsockStream {
+        service: crate::ComponentHostVsockService,
+        stream: Option<crate::VsockStreamId>,
+    },
+    Serial {
+        port: Option<ComponentSerialPort>,
     },
 }
 
@@ -323,9 +380,34 @@ impl InheritedSocket {
         }
     }
 
+    pub fn from_tcp_stream(stream: &mut ComponentTcpStreamHandle) -> Option<Self> {
+        let raw = stream.take_raw()?;
+        Some(Self::TcpStream {
+            raw: Some(raw),
+            retire: stream.retirement(),
+        })
+    }
+
+    pub fn from_vsock_stream(
+        service: crate::ComponentHostVsockService,
+        stream: crate::VsockStreamId,
+    ) -> Self {
+        Self::VsockStream {
+            service,
+            stream: Some(stream),
+        }
+    }
+
+    pub fn from_serial_port(port: ComponentSerialPort) -> Self {
+        Self::Serial { port: Some(port) }
+    }
+
     pub fn rebind_retirement(&mut self, new_retire: crate::SocketRetirementSender) {
-        if let Self::Tcp { retire, .. } = self {
-            *retire = new_retire;
+        match self {
+            Self::Tcp { retire, .. } | Self::TcpStream { retire, .. } => {
+                *retire = new_retire;
+            }
+            Self::Vsock { .. } | Self::VsockStream { .. } | Self::Serial { .. } => {}
         }
     }
 
@@ -340,7 +422,10 @@ impl InheritedSocket {
             } => raw
                 .take()
                 .map(|id| (id, *local_address, *local_port, *hop_limit)),
-            Self::Vsock { .. } => None,
+            Self::Vsock { .. }
+            | Self::TcpStream { .. }
+            | Self::VsockStream { .. }
+            | Self::Serial { .. } => None,
         }
     }
 
@@ -349,7 +434,42 @@ impl InheritedSocket {
     ) -> Option<(crate::ComponentHostVsockService, crate::VsockListenerId)> {
         match self {
             Self::Vsock { service, listener } => listener.take().map(|id| (service.clone(), id)),
-            Self::Tcp { .. } => None,
+            Self::Tcp { .. }
+            | Self::TcpStream { .. }
+            | Self::VsockStream { .. }
+            | Self::Serial { .. } => None,
+        }
+    }
+
+    pub fn take_tcp_stream(&mut self) -> Option<u64> {
+        match self {
+            Self::TcpStream { raw, .. } => raw.take(),
+            Self::Tcp { .. }
+            | Self::Vsock { .. }
+            | Self::VsockStream { .. }
+            | Self::Serial { .. } => None,
+        }
+    }
+
+    pub fn take_vsock_stream(
+        &mut self,
+    ) -> Option<(crate::ComponentHostVsockService, crate::VsockStreamId)> {
+        match self {
+            Self::VsockStream { service, stream } => stream.take().map(|id| (service.clone(), id)),
+            Self::Tcp { .. }
+            | Self::Vsock { .. }
+            | Self::TcpStream { .. }
+            | Self::Serial { .. } => None,
+        }
+    }
+
+    pub fn take_serial(&mut self) -> Option<ComponentSerialPort> {
+        match self {
+            Self::Serial { port } => port.take(),
+            Self::Tcp { .. }
+            | Self::Vsock { .. }
+            | Self::TcpStream { .. }
+            | Self::VsockStream { .. } => None,
         }
     }
 }
@@ -366,6 +486,19 @@ impl Drop for InheritedSocket {
                 if let Some(id) = listener.take() {
                     let _ = service.close_listener(id);
                 }
+            }
+            Self::TcpStream { raw, retire } => {
+                if let Some(id) = raw.take() {
+                    retire.push(crate::RetiredNetworkHandle::TcpStream(id));
+                }
+            }
+            Self::VsockStream { service, stream } => {
+                if let Some(id) = stream.take() {
+                    service.close_sync(id);
+                }
+            }
+            Self::Serial { port } => {
+                let _ = port.take();
             }
         }
     }

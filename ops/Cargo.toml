@@ -10,8 +10,10 @@ async-net = { version = "2.0.0", default-features = false }
 directories = { version = "6.0.0", default-features = false }
 futures-io = { version = "0.3.34", default-features = false, features = ["std"] }
 futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
+futures-util = { version = "0.3.31", default-features = false, features = ["std", "io"] }
 helios-inspector-protocol = { workspace = true }
 helios-oci = { workspace = true }
+helios-wit-rpc = { workspace = true, features = ["inspector-rpc"] }
 serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
 serialport = { version = "4.10.1", default-features = false }

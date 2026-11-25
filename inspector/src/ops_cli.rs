@@ -9,16 +9,17 @@ use std::process::Command;
 use std::time::Duration;
 
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
-use helios_inspector_protocol::system::{
-    inspect as proto_inspect,
-    profiling::{Filter as ProfileFilter, MetricFilter},
-    tracing as proto_tracing,
-};
+use helios_inspector_protocol::auth::ClientIdentity;
 use helios_inspector_shell::{HostEnv, OutputFormat as ShellOutputFormat, ReplError};
 use helios_ops::{
     Attenuation, CapabilityCert, DEFAULT_FLEET_CONCURRENCY, DiagnosticBundle, Fleet, GrantRight,
     IdentityProfile, OpsError, Session, SessionOptions, SpawnRequest, Target, TargetError,
     TargetStore, http,
+};
+use helios_wit_rpc::inspector::helios::system::{
+    inspect as proto_inspect,
+    profiling::{Filter as ProfileFilter, MetricFilter},
+    tracing as proto_tracing,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
@@ -378,9 +379,24 @@ pub(crate) fn build_session_options(flags: &GlobalOpsFlags) -> Result<SessionOpt
         Some(name_or_path) => Some(IdentityProfile::load(name_or_path).map_err(OpsError::from)?),
         None => IdentityProfile::load("default").ok(),
     };
-    let security = match identity.as_ref().and_then(|id| id.cert.clone()) {
-        Some(cert) => helios_ops::SecurityMode::CapabilityTls { cert: Some(cert) },
-        None => helios_ops::SecurityMode::Plain,
+    let security = if let Some(profile) = identity.as_ref().filter(|p| p.secret_key_hex.is_some()) {
+        profile.to_security_mode().map_err(OpsError::from)?
+    } else if let Ok(key_path) = std::env::var("HELIOS_INSPECTOR_CLIENT_KEY")
+        && !key_path.trim().is_empty()
+    {
+        let client_identity = ClientIdentity::from_seed_file(std::path::Path::new(&key_path))
+            .map_err(|err| {
+                OpsError::Auth(helios_ops::AuthError::InvalidIdentity {
+                    name: key_path,
+                    detail: err.to_string(),
+                })
+            })?;
+        helios_ops::SecurityMode::Authenticated {
+            identity: Box::new(client_identity),
+            expected_machine_public_key: None,
+        }
+    } else {
+        helios_ops::SecurityMode::Plain
     };
     Ok(SessionOptions {
         attenuation: Attenuation {
@@ -563,6 +579,9 @@ pub(crate) async fn run_login(cmd: &LoginCommand) -> Result<(), OpsCliError> {
         principal: principal.clone(),
         authority_url: cmd.authority.clone(),
         cert,
+        secret_key_hex: None,
+        capability_cert_postcard_hex: None,
+        expected_machine_public_key_hex: None,
     };
     let saved_path = profile.save().map_err(OpsError::from)?;
     println!(

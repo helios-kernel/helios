@@ -397,16 +397,26 @@ def test_wasm_jobs_drop_host_rust_cache_and_subset_programs_safely(ci_jobs, tmp_
     assert draft_sel["wasm_release_programs"] == ""
     assert draft_sel["wasi_artifacts"] == "false"
 
-    # Kernel PR: debug subset only (`init`, `debugger`), no compiler-plugin, no wasi-artifacts.
+    # Kernel PR: debug subset only (`init`, `inspector-*`), no compiler-plugin, no wasi-artifacts.
     kernel_sel = select_lanes(ci_jobs, tmp_path, ["kernel"], draft=False, heavy=False)
-    assert json.loads(kernel_sel["wasm_debug_programs"]) == ["debugger", "init"]
+    assert json.loads(kernel_sel["wasm_debug_programs"]) == [
+        "init",
+        "inspector-host",
+        "inspector-tls",
+        "inspector-worker",
+    ]
     assert kernel_sel["wasm_release_programs"] == ""
     assert kernel_sel["wasi_artifacts"] == "false"
 
-    # Kernel + linux_abi PR: reuses debug subset (`init`, `debugger`) without triggering
+    # Kernel + linux_abi PR: reuses debug subset (`init`, `inspector-*`) without triggering
     # a separate `wasm-release` build, and needs no wasi-artifacts.
     linux_sel = select_lanes(ci_jobs, tmp_path, ["kernel", "linux_abi"], draft=False, heavy=False)
-    assert json.loads(linux_sel["wasm_debug_programs"]) == ["debugger", "init"]
+    assert json.loads(linux_sel["wasm_debug_programs"]) == [
+        "init",
+        "inspector-host",
+        "inspector-tls",
+        "inspector-worker",
+    ]
     assert linux_sel["wasm_release_programs"] == ""
     assert linux_sel["wasi_artifacts"] == "false"
 
@@ -414,9 +424,11 @@ def test_wasm_jobs_drop_host_rust_cache_and_subset_programs_safely(ci_jobs, tmp_
     venus_sel = select_lanes(ci_jobs, tmp_path, ["gpu"], draft=False, heavy=True)
     assert json.loads(venus_sel["wasm_debug_programs"]) == [
         "compositor",
-        "debugger",
         "gpu-test",
         "init",
+        "inspector-host",
+        "inspector-tls",
+        "inspector-worker",
         "nu",
         "pride-flag",
     ]

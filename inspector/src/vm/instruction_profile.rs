@@ -20,8 +20,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use askama::Template as _;
-use helios_inspector_protocol::system::profiling::{
+use helios_wit_rpc::inspector::helios::system::profiling::{
     self as system_profiling, InstructionProfile, InstructionProfileError, SampledCode,
+    SamplingSession,
 };
 
 use super::kernel_image::{
@@ -41,12 +42,12 @@ pub(crate) enum InstructionProfileOutputError {
     Control {
         enabled: bool,
         #[source]
-        source: helios_inspector_protocol::RpcError,
+        source: helios_wit_rpc::RpcError,
     },
     #[error("failed to read the guest's instruction samples: {source}")]
     Read {
         #[source]
-        source: helios_inspector_protocol::RpcError,
+        source: helios_wit_rpc::RpcError,
     },
     #[error("the guest kernel cannot produce an instruction profile: {}", refusal_reason(*.refusal))]
     Refused { refusal: InstructionProfileError },
@@ -85,36 +86,31 @@ fn refusal_reason(refusal: InstructionProfileError) -> &'static str {
 /// Sampling is its own control, separate from the scoped profiler, because
 /// it shortens every guest processor's timer period and so perturbs the
 /// timings it runs under: only a run that asked for an instruction profile
-/// starts it. Starting discards the samples of any earlier run.
-pub(crate) async fn start(client: &RpcClient) -> Result<(), InstructionProfileOutputError> {
-    set_sampling(client, true).await
-}
-
-/// Stops the guest's instruction sampling, once the workload is done and
-/// before its samples are read.
-pub(crate) async fn stop(client: &RpcClient) -> Result<(), InstructionProfileOutputError> {
-    set_sampling(client, false).await
-}
-
-async fn set_sampling(
+/// starts it. Starting discards the samples of any earlier run, and dropping
+/// the returned [`SamplingSession`] stops sampling.
+pub(crate) async fn start(
     client: &RpcClient,
-    enabled: bool,
-) -> Result<(), InstructionProfileOutputError> {
-    system_profiling::set_instruction_sampling(client, enabled)
+) -> Result<SamplingSession, InstructionProfileOutputError> {
+    system_profiling::RpcClient::new(client.peer())
+        .start_instruction_sampling()
         .await
-        .map_err(|source| InstructionProfileOutputError::Control { enabled, source })?
+        .map_err(|source| InstructionProfileOutputError::Control {
+            enabled: true,
+            source,
+        })?
         .map_err(|refusal| InstructionProfileOutputError::Refused { refusal })
 }
 
-/// Reads the guest's instruction samples, taken between [`start`] and
-/// [`stop`], and writes them to `output`, naming native addresses against
+/// Reads the guest's instruction samples, taken while the [`SamplingSession`]
+/// was held, and writes them to `output`, naming native addresses against
 /// the kernel image at `kernel`.
 pub(crate) async fn collect(
     client: &RpcClient,
     kernel: &Path,
     output: &Path,
 ) -> Result<(), InstructionProfileOutputError> {
-    let profile = system_profiling::instruction_samples(client)
+    let profile = system_profiling::RpcClient::new(client.peer())
+        .instruction_samples()
         .await
         .map_err(|source| InstructionProfileOutputError::Read { source })?
         .map_err(|refusal| InstructionProfileOutputError::Refused { refusal })?;
@@ -242,7 +238,7 @@ mod tests {
 
     use gimli::write::{Address, AttributeValue, DwarfUnit, EndianVec, Sections, UnitEntryId};
     use gimli::{Encoding, Format, LittleEndian, RunTimeEndian};
-    use helios_inspector_protocol::system::profiling::{
+    use helios_wit_rpc::inspector::helios::system::profiling::{
         InstructionProfile, InstructionSample, SampledCode, WasmFunction,
     };
 

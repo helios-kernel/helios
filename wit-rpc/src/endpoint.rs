@@ -3,8 +3,8 @@ use std::future::Future;
 use futures_io::{AsyncRead, AsyncWrite};
 use helios_inspector_protocol::WireError;
 use helios_inspector_protocol::mux::{
-    DEFAULT_STREAM_CREDIT_WINDOW, InboundCall, MuxConfig, MuxDispatcher, MuxDriverChannels,
-    PeerHandle, create_mux, drive_mux,
+    DEFAULT_STREAM_CREDIT_WINDOW, InboundCall, MaybeSend, MaybeSync, MuxConfig, MuxDispatcher,
+    MuxDriverChannels, PeerHandle, create_mux, drive_mux,
 };
 
 use crate::codec::{RpcDecode, RpcEncode, decode_server_request, encode_server_response};
@@ -70,7 +70,7 @@ impl<'a, R: ResourceEntry> ServerInvocation<'a, R> {
 
 /// Server-side WIT interface router contract implemented by generated
 /// `Server<H>` adapters.
-pub trait Dispatcher: Send + Sync + 'static {
+pub trait Dispatcher: MaybeSend + MaybeSync + 'static {
     type Resource: ResourceEntry;
 
     fn supports(&self, instance: &str, func: &str) -> bool;
@@ -80,7 +80,7 @@ pub trait Dispatcher: Send + Sync + 'static {
         ctx: ServerInvocation<'a, Self::Resource>,
         instance: &'a str,
         func: &'a str,
-    ) -> impl Future<Output = Result<(), WireError>> + Send + 'a;
+    ) -> impl Future<Output = Result<(), WireError>> + MaybeSend + 'a;
 }
 
 /// Composable service set bound to a connection's shared [`HandleAllocator`].
@@ -88,7 +88,7 @@ pub trait Dispatcher: Send + Sync + 'static {
 /// Implemented automatically for `()`, every [`Dispatcher`], and `(A, B)` pairs
 /// so multiple generated interface servers (including ones exporting stateful
 /// resources) compose on one [`Endpoint`] with zero dynamic dispatch.
-pub trait Service: Send + Sync + 'static {
+pub trait Service: MaybeSend + MaybeSync + 'static {
     type Bound: MuxDispatcher;
 
     fn bind(self, allocator: &HandleAllocator) -> Self::Bound;

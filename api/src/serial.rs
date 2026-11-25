@@ -18,6 +18,17 @@ pub async fn debug_port() -> Option<DebugPort> {
 }
 
 impl DebugPort {
+    /// Wraps a raw WIT `serial-port` resource (e.g. from `take_inherited_sockets`).
+    pub fn from_raw(raw: SerialPort) -> Self {
+        Self { raw }
+    }
+
+    /// Unwraps the underlying WIT `serial-port` resource for transfer into a
+    /// spawned child via `InheritedSocket::Serial`.
+    pub fn into_raw(self) -> SerialPort {
+        self.raw
+    }
+
     pub async fn rights(&self) -> SerialRights {
         self.raw.rights().await
     }

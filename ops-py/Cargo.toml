@@ -18,6 +18,7 @@ extension-module = ["pyo3/extension-module"]
 async-channel = { version = "2.5.0", default-features = false }
 helios-inspector-protocol = { path = "../inspector-protocol" }
 helios-ops = { path = "../ops" }
+helios-wit-rpc = { path = "../wit-rpc", features = ["inspector-rpc"] }
 pyo3 = { version = "0.30.1", default-features = false, features = ["abi3-py311", "macros"] }
 pyo3-async-runtimes = { version = "0.30.0", default-features = false, features = ["tokio-runtime"] }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }

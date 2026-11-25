@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use helios_inspector_protocol::RpcError;
+use helios_wit_rpc::RpcError;
 
 use crate::runtime;
 

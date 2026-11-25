@@ -1535,7 +1535,7 @@ fn generate_server_items(
 
     let assoc_types = ctx.resources.iter().map(|meta| {
         let assoc = &meta.assoc_ident;
-        quote!(type #assoc: Send + Sync + 'static;)
+        quote!(type #assoc: #rt::__private::MaybeSend + #rt::__private::MaybeSync + 'static;)
     });
 
     let mut trait_methods = Vec::new();
@@ -1577,7 +1577,7 @@ fn generate_server_items(
             fn #handler_fn_ident<'a>(
                 &'a self,
                 #(#trait_params),*
-            ) -> impl ::core::future::Future<Output = #trait_ret_ty> + Send + 'a;
+            ) -> impl ::core::future::Future<Output = #trait_ret_ty> + #rt::__private::MaybeSend + 'a;
         });
 
         let decode_stmt = if wire_param_tys.is_empty() {
@@ -1650,8 +1650,19 @@ fn generate_server_items(
         }
     };
 
+    let shared_bounds = ctx.resources.iter().map(|meta| {
+        let assoc = &meta.assoc_ident;
+        let marker = &meta.client_path;
+        quote!(#rt::__private::ResourceSlotAccess<#marker, __H::#assoc>)
+    });
+    let shared_where = if ctx.resources.is_empty() {
+        quote!(where __R: #rt::__private::ResourceEntry)
+    } else {
+        quote!(where __R: #rt::__private::ResourceEntry #(+ #shared_bounds)*)
+    };
+
     quote! {
-        pub trait RpcHandler: Send + Sync + 'static {
+        pub trait RpcHandler: #rt::__private::MaybeSend + #rt::__private::MaybeSync + 'static {
             #(#assoc_types)*
             #(#trait_methods)*
         }
@@ -1666,6 +1677,27 @@ fn generate_server_items(
             pub fn new(handler: __H) -> Self {
                 Self(handler)
             }
+
+            pub fn supports_call(&self, __instance: &str, __func: &str) -> bool {
+                #supports_body
+            }
+
+            pub async fn dispatch_with<'a, __R>(
+                &'a self,
+                __ctx: #rt::__private::ServerInvocation<'a, __R>,
+                __instance: &'a str,
+                __func: &'a str,
+            ) -> ::core::result::Result<(), #rt::__private::WireError>
+            #shared_where
+            {
+                match __func {
+                    #(#dispatch_arms,)*
+                    _ => ::core::result::Result::Err(#rt::__private::WireError::MalformedPayload {
+                        context: "Dispatcher::dispatch".to_owned(),
+                        detail: ::std::format!("unsupported method {__instance}.{__func}"),
+                    }),
+                }
+            }
         }
 
         #server_alias
@@ -1674,7 +1706,7 @@ fn generate_server_items(
             type Resource = RpcServerResource<__H>;
 
             fn supports(&self, __instance: &str, __func: &str) -> bool {
-                #supports_body
+                self.supports_call(__instance, __func)
             }
 
             async fn dispatch<'a>(
@@ -1683,13 +1715,7 @@ fn generate_server_items(
                 __instance: &'a str,
                 __func: &'a str,
             ) -> ::core::result::Result<(), #rt::__private::WireError> {
-                match __func {
-                    #(#dispatch_arms,)*
-                    _ => ::core::result::Result::Err(#rt::__private::WireError::MalformedPayload {
-                        context: "Dispatcher::dispatch".to_owned(),
-                        detail: ::std::format!("unsupported method {__instance}.{__func}"),
-                    }),
-                }
+                self.dispatch_with(__ctx, __instance, __func).await
             }
         }
     }
@@ -1753,39 +1779,68 @@ fn generate_server_resource_enum(ctx: &IfaceContext<'_>) -> TokenStream {
             }
         };
 
+        let marker = &meta.client_path;
         quote! {
+            impl<__H: RpcHandler> #rt::__private::ResourceSlotAccess<#marker, __H::#assoc>
+                for RpcServerResource<__H>
+            {
+                fn into_entry(__arc: ::std::sync::Arc<__H::#assoc>) -> Self {
+                    Self::#var(__arc)
+                }
+
+                fn borrow_entry(&self) -> ::core::option::Option<&::std::sync::Arc<__H::#assoc>> {
+                    match self {
+                        #project_arm
+                    }
+                }
+
+                fn take_entry(
+                    self,
+                ) -> ::core::result::Result<::std::sync::Arc<__H::#assoc>, Self> {
+                    match self {
+                        #extract_arm
+                    }
+                }
+            }
+
             #[doc(hidden)]
             pub struct #own_wrap<__H: RpcHandler>(pub __H::#assoc);
 
-            impl<__H: RpcHandler> #rt::__private::RpcEncode<RpcServerResource<__H>> for #own_wrap<__H> {
+            impl<__H: RpcHandler, __R> #rt::__private::RpcEncode<__R> for #own_wrap<__H>
+            where
+                __R: #rt::__private::ResourceSlotAccess<#marker, __H::#assoc>,
+            {
                 const MIN_WIRE_SIZE: usize = 4;
 
                 fn rpc_encode(
                     self,
-                    __enc: &mut #rt::__private::Encoder<'_, RpcServerResource<__H>>,
+                    __enc: &mut #rt::__private::Encoder<'_, __R>,
                 ) -> ::core::result::Result<(), #rt::__private::WireError> {
                     let __handle = __enc
                         .resources_mut()?
-                        .insert(RpcServerResource::#var(::std::sync::Arc::new(self.0)))?;
+                        .insert(<__R as #rt::__private::ResourceSlotAccess<#marker, __H::#assoc>>::into_entry(
+                            ::std::sync::Arc::new(self.0),
+                        ))?;
                     __enc.write_u32(__handle);
                     ::core::result::Result::Ok(())
                 }
             }
 
-            impl<__H: RpcHandler> #rt::__private::RpcDecode<RpcServerResource<__H>> for #own_wrap<__H> {
+            impl<__H: RpcHandler, __R> #rt::__private::RpcDecode<__R> for #own_wrap<__H>
+            where
+                __R: #rt::__private::ResourceSlotAccess<#marker, __H::#assoc>,
+            {
                 const MIN_WIRE_SIZE: usize = 4;
 
                 fn rpc_decode(
-                    __dec: &mut #rt::__private::Decoder<'_, RpcServerResource<__H>>,
+                    __dec: &mut #rt::__private::Decoder<'_, __R>,
                 ) -> ::core::result::Result<Self, #rt::__private::WireError> {
                     let __handle = __dec.read_u32()?;
                     let __owned = __dec.resources_mut()?.take(
                         __handle,
                         #wit_name,
-                        |__entry| match __entry {
-                            #extract_arm
-                        },
-                        RpcServerResource::#var,
+                        <__R as #rt::__private::ResourceSlotAccess<#marker, __H::#assoc>>::take_entry,
+                        <__R as #rt::__private::ResourceSlotAccess<#marker, __H::#assoc>>::into_entry,
                     )?;
                     ::core::result::Result::Ok(Self(__owned))
                 }
@@ -1796,16 +1851,21 @@ fn generate_server_resource_enum(ctx: &IfaceContext<'_>) -> TokenStream {
                 pub #rt::__private::ResourceBorrow<__H::#assoc>,
             );
 
-            impl<__H: RpcHandler> #rt::__private::RpcDecode<RpcServerResource<__H>> for #borrow_wrap<__H> {
+            impl<__H: RpcHandler, __R> #rt::__private::RpcDecode<__R> for #borrow_wrap<__H>
+            where
+                __R: #rt::__private::ResourceSlotAccess<#marker, __H::#assoc>,
+            {
                 const MIN_WIRE_SIZE: usize = 4;
 
                 fn rpc_decode(
-                    __dec: &mut #rt::__private::Decoder<'_, RpcServerResource<__H>>,
+                    __dec: &mut #rt::__private::Decoder<'_, __R>,
                 ) -> ::core::result::Result<Self, #rt::__private::WireError> {
                     let __handle = __dec.read_u32()?;
-                    let __borrow = __dec.resources()?.borrow(__handle, #wit_name, |__entry| match __entry {
-                        #project_arm
-                    })?;
+                    let __borrow = __dec.resources()?.borrow(
+                        __handle,
+                        #wit_name,
+                        <__R as #rt::__private::ResourceSlotAccess<#marker, __H::#assoc>>::borrow_entry,
+                    )?;
                     ::core::result::Result::Ok(Self(__borrow))
                 }
             }

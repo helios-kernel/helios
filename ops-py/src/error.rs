@@ -49,6 +49,7 @@ pub(crate) fn ops_err_to_py(err: OpsError) -> PyErr {
         OpsError::Target(_) => TargetError::new_err(err.to_string()),
         OpsError::TimedOut { .. }
         | OpsError::Rpc { .. }
+        | OpsError::Fs(_)
         | OpsError::FilterRefused { .. }
         | OpsError::NoInstanceNamed { .. }
         | OpsError::KillRefused { .. }
@@ -58,9 +59,12 @@ pub(crate) fn ops_err_to_py(err: OpsError) -> PyErr {
         | OpsError::RawProfileRefused { .. }
         | OpsError::ProcessorOfflineRefused { .. }
         | OpsError::ProcessorOnlineRefused { .. }
+        | OpsError::SnapshotRefused { .. }
+        | OpsError::ComponentControlRefused { .. }
         | OpsError::ExecRefused { .. } => RpcError::new_err(err.to_string()),
         OpsError::Auth(_)
         | OpsError::Http(_)
+        | OpsError::Oci(_)
         | OpsError::Bundle(_)
         | OpsError::InvalidPath { .. }
         | OpsError::NotFound { .. }

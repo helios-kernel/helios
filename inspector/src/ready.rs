@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use futures_io::AsyncRead;
 use futures_lite::io::{AsyncReadExt, Cursor};
-use helios_inspector_protocol::RpcError;
-use helios_inspector_protocol::system::inspect;
+use helios_inspector_protocol::auth::{AuthError, ClientIdentity, TransportKind, client_handshake};
+use helios_wit_rpc::RpcError;
+use helios_wit_rpc::inspector::helios::system::inspect;
 
 use crate::runtime;
 use crate::serial::{RpcClient, RpcReader, SerialIo};
@@ -25,30 +26,35 @@ pub(crate) enum BootError {
         #[from]
         source: io::Error,
     },
-    #[error("timed out waiting for the embedded debugger cold-start markers")]
+    #[error("inspector authentication handshake failed: {source}")]
+    Auth {
+        #[from]
+        source: AuthError,
+    },
+    #[error("timed out waiting for the inspector cold-start markers")]
     MarkersTimedOut,
     #[error("failed to read kernel boot markers from the debug serial link: {source}")]
     ReadMarkers {
         #[source]
         source: io::Error,
     },
-    #[error("debug serial link closed before the embedded debugger entered wasi:cli/run")]
+    #[error("debug serial link closed before the inspector entered wasi:cli/run")]
     LinkClosedBeforeRun,
-    #[error("kernel panicked before the embedded debugger entered wasi:cli/run: {report}{trailer}")]
+    #[error("kernel panicked before the inspector entered wasi:cli/run: {report}{trailer}")]
     GuestPanicked { report: String, trailer: String },
     #[error("debug serial preamble contained non-utf8 bytes: {source}")]
     PreambleNotUtf8 {
         #[source]
         source: core::str::Utf8Error,
     },
-    #[error("a debugger stage marker shared its serial line with other output: {line:?}")]
+    #[error("an inspector stage marker shared its serial line with other output: {line:?}")]
     MarkerSharesLine { line: String },
-    #[error("multiple debugger stage markers appeared on one serial line: {line:?}")]
+    #[error("multiple inspector stage markers appeared on one serial line: {line:?}")]
     MultipleMarkersOnLine { line: String },
     #[error("timed out waiting for remote inspect readiness probe")]
     ReadinessProbeTimedOut,
     #[error(
-        "failed to fetch initial remote inspect snapshot while waiting for debugger readiness: \
+        "failed to fetch initial remote inspect snapshot while waiting for inspector readiness: \
          {source}"
     )]
     ReadinessProbeFailed {
@@ -91,9 +97,24 @@ fn boot_sync_timeout() -> Duration {
         .unwrap_or(BOOT_SYNC_TIMEOUT)
 }
 
-pub(crate) async fn connect_after_boot(io: SerialIo) -> Result<RpcClient, BootError> {
-    let (read, write) = io.into_split();
-    let read = wait_for_boot(read).await?;
+pub(crate) async fn connect_after_boot(
+    io: SerialIo,
+    identity: Option<&ClientIdentity>,
+) -> Result<RpcClient, BootError> {
+    let (read, mut write) = io.into_split();
+    let mut read = wait_for_boot(read).await?;
+    if let Some(identity) = identity {
+        let _accepted = client_handshake(
+            &mut read,
+            &mut write,
+            TransportKind::Serial,
+            identity,
+            None,
+            None,
+            None,
+        )
+        .await?;
+    }
     let mut client = RpcClient::new(read, write)?;
     wait_until_ready(&mut client).await?;
     Ok(client)
@@ -157,9 +178,15 @@ pub(crate) fn echo_serial_console(read: RpcReader) {
 }
 
 pub(crate) async fn wait_until_ready(client: &mut RpcClient) -> Result<(), BootError> {
+    let inspect_client = inspect::RpcClient::new(client.peer());
     let _ = runtime::timeout(
         READY_PROBE_TIMEOUT,
-        inspect::snapshot_prefixes(client, &["/kernel/clock"], 16),
+        inspect_client.snapshot(
+            inspect::Query {
+                prefixes: vec!["/kernel/clock".to_owned()],
+            },
+            16,
+        ),
     )
     .await
     .ok_or(BootError::ReadinessProbeTimedOut)?

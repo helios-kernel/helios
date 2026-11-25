@@ -1,0 +1,39 @@
+package helios:system@0.1.0;
+
+/// Opt-in dynamic component-topology control exposed by `component-manager`
+/// over an `ipc::channel` when compiled with `--features dynamic-components`.
+interface component-control {
+  enum control-error-kind {
+    permission-denied,
+    not-found,
+    already-exists,
+    invalid-argument,
+    unavailable,
+    internal,
+  }
+
+  record control-error {
+    kind: control-error-kind,
+    detail: string,
+  }
+
+  record component-status {
+    moniker: string,
+    program: string,
+    state: string,
+    instance-id: option<u64>,
+    restarts: u64,
+  }
+
+  /// Lists live and configured components under the caller's authorized scope.
+  list-components: async func() -> result<list<component-status>, control-error>;
+
+  /// Starts a configured component by moniker.
+  start: async func(moniker: string) -> result<component-status, control-error>;
+
+  /// Stops a running component by moniker.
+  stop: async func(moniker: string) -> result<_, control-error>;
+
+  /// Restarts a configured component by moniker.
+  restart: async func(moniker: string) -> result<component-status, control-error>;
+}

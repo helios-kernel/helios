@@ -1,8 +1,8 @@
-description = "System debugger component (supervised until /inspector/* replaces it in #1190)"
-name = "debugger"
+description = "Privilege-separated inspector host daemon: verifies Ed25519 credentials, signs MachineIdentity challenges, and spawns attenuated per-session workers"
+name = "inspector-host"
 runner = "wasm"
 sharding = "singleton"
-program = "/bin/debugger"
+program = "/bin/inspector-host"
 optional = true
 startup = "eager"
 lifecycle = "service"

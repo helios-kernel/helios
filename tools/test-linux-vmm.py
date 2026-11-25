@@ -36,7 +36,7 @@ def main():
                "--qemu-arg=virtualization=on", "--shared-dir", str(args.assets.resolve()),
                "--shared-dir-writable", "--runtime-dir", str(args.runtime_dir),
                "--keep-runtime-dir", "--no-compiler-plugin"]
-    for program in ("init", "debugger", "nu", "vmm"):
+    for program in ("init", "inspector-host", "inspector-tls", "inspector-worker", "nu", "vmm"):
         command.extend(["--boot-program", program])
     if args.no_build:
         command.append("--no-build")

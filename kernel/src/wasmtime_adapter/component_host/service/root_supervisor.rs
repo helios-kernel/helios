@@ -701,6 +701,41 @@ where
                             }
                         }
                     }
+                    program_bindings::helios::system::programs::InheritedSocket::TcpStream(res) => {
+                        let mut stream = data.table.delete(res)?;
+                        match crate::InheritedSocket::from_tcp_stream(&mut stream) {
+                            Some(inherited) => extracted_sockets.push(inherited),
+                            None => {
+                                return Ok(Err(supervisor_error(
+                                    rs_wit::SupervisorErrorKind::Unavailable,
+                                    "inherited TCP stream is closed",
+                                )));
+                            }
+                        }
+                    }
+                    program_bindings::helios::system::programs::InheritedSocket::VsockStream(
+                        res,
+                    ) => {
+                        let mut stream = data.table.delete(res)?;
+                        match stream.take() {
+                            Some((vsock_service, id)) => {
+                                extracted_sockets.push(crate::InheritedSocket::from_vsock_stream(
+                                    vsock_service,
+                                    id,
+                                ));
+                            }
+                            None => {
+                                return Ok(Err(supervisor_error(
+                                    rs_wit::SupervisorErrorKind::Unavailable,
+                                    "inherited vsock stream is closed",
+                                )));
+                            }
+                        }
+                    }
+                    program_bindings::helios::system::programs::InheritedSocket::Serial(res) => {
+                        let port = data.table.delete(res)?;
+                        extracted_sockets.push(crate::InheritedSocket::from_serial_port(port));
+                    }
                 }
             }
             Ok(Ok((

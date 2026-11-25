@@ -170,7 +170,7 @@ exec 3<>"$fifo"
 "$inspector" vm --arch x86-64 "${profile[@]}" --memory 2G --accel "$accel" \
     --smp 2 --max-processors 4 \
     --runtime-dir "$runtime" --keep-runtime-dir \
-    --boot-program nu --boot-program debugger --boot-program cpu \
+    --boot-program nu --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --boot-program cpu \
     --no-compiler-plugin \
     "${vm_options[@]}" \
     repl --shell /bin/nu <&3 2>"$runtime/inspector.log" >"$out" &

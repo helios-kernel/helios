@@ -1,6 +1,6 @@
 use std::fs;
 
-use helios_inspector_protocol::system::programs::ExecResult;
+use helios_wit_rpc::inspector::helios::system::programs::ExecResult;
 
 use crate::ShellCommand;
 use crate::programs::{self, ProgramError, REMOTE_SHELL_PATH};

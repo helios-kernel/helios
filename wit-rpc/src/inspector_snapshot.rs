@@ -1,18 +1,8 @@
+//! Typed `/kernel/*` snapshot decoder over `helios_wit_rpc::inspector::helios::system::inspect`.
+
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
-
-pub use super::bindings::helios::system::filters::FilterError;
-pub use super::bindings::helios::system::inspect::{
-    ComponentPublication, Entry, MonoNanos, PublicationStatus, Query, SnapshotResult, Value,
-};
-
-/// Wire payload for `helios:system/inspect.snapshot`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SnapshotRequest {
-    pub query: Query,
-    pub limit: u32,
-}
+use crate::inspector::helios::system::inspect::{MonoNanos, SnapshotResult, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryPressure {
@@ -242,6 +232,7 @@ pub struct KernelSnapshot {
 
 impl KernelSnapshot {
     /// Decodes `/kernel/*` inspect entries into a typed [`KernelSnapshot`].
+    #[must_use]
     pub fn from_snapshot(snapshot: &SnapshotResult) -> Self {
         let map: BTreeMap<&str, &Value> = snapshot
             .entries
@@ -630,69 +621,10 @@ impl KernelSnapshot {
     }
 }
 
-#[cfg(feature = "host")]
-mod host {
-    use super::*;
-    use crate::error::{RpcError, TransportError};
-    use crate::system::methods::{INSPECT_INSTANCE, INSPECT_SNAPSHOT};
-    use crate::transport::Client;
-    use futures_io::{AsyncRead, AsyncWrite};
-
-    pub async fn snapshot<R, W>(
-        client: &Client<R, W>,
-        query: &Query,
-        limit: u32,
-    ) -> Result<Result<SnapshotResult, FilterError>, RpcError>
-    where
-        R: AsyncRead + Send + Unpin + 'static,
-        W: AsyncWrite + Send + Unpin + 'static,
-    {
-        let payload = postcard::to_allocvec(&SnapshotRequest {
-            query: query.clone(),
-            limit,
-        })
-        .map_err(|source| RpcError::Encode {
-            instance: INSPECT_INSTANCE,
-            func: INSPECT_SNAPSHOT,
-            source,
-        })?;
-        let bytes = client
-            .invoke_raw(INSPECT_INSTANCE, INSPECT_SNAPSHOT, payload)
-            .await
-            .map_err(|source: TransportError| RpcError::Invoke {
-                instance: INSPECT_INSTANCE,
-                func: INSPECT_SNAPSHOT,
-                source,
-            })?;
-        postcard::from_bytes(&bytes).map_err(|source| RpcError::Decode {
-            instance: INSPECT_INSTANCE,
-            func: INSPECT_SNAPSHOT,
-            source,
-        })
-    }
-
-    pub async fn snapshot_prefixes<R, W>(
-        client: &Client<R, W>,
-        prefixes: &[&str],
-        limit: u32,
-    ) -> Result<Result<SnapshotResult, FilterError>, RpcError>
-    where
-        R: AsyncRead + Send + Unpin + 'static,
-        W: AsyncWrite + Send + Unpin + 'static,
-    {
-        let query = Query {
-            prefixes: prefixes.iter().map(|prefix| (*prefix).to_owned()).collect(),
-        };
-        snapshot(client, &query, limit).await
-    }
-}
-
-#[cfg(feature = "host")]
-pub use host::*;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inspector::helios::system::inspect::Entry;
 
     #[test]
     fn kernel_snapshot_decodes_core_container_and_hv_subtrees() {

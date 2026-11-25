@@ -53,6 +53,20 @@ pub struct VsockListener {
 }
 
 impl VsockStream {
+    /// Wraps a raw WIT `vsock-stream` resource (e.g. from `take_inherited_sockets`).
+    pub fn from_raw(raw: raw::VsockStream) -> Self {
+        Self {
+            raw,
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
+
+    /// Unwraps the underlying WIT `vsock-stream` resource for transfer into a
+    /// spawned child via `InheritedSocket::VsockStream`.
+    pub fn into_raw(self) -> raw::VsockStream {
+        self.raw
+    }
+
     /// Connects to `port` on the host using the default timeout.
     pub async fn connect_host(port: u32) -> io::Result<Self> {
         Self::connect(

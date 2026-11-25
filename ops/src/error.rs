@@ -3,14 +3,19 @@
 use std::io;
 use std::path::PathBuf;
 
-use helios_inspector_protocol::RpcError;
-use helios_inspector_protocol::system::{
+use helios_inspector_protocol::auth::AuthError as ProtocolAuthError;
+use helios_inspector_protocol::tls::TlsError;
+use helios_wit_rpc::RpcError;
+use helios_wit_rpc::inspector::helios::system::{
+    component_control::ControlError as ComponentControlError,
+    filters::FilterError,
     instances::KillError,
     processors::{OfflineError, OnlineError},
     profiling::{ControlError, InstructionProfileError, RawProfileError},
     programs::{ExecError, ExecErrorKind},
-    tracing::{FilterError, TargetError as TraceTargetError},
+    tracing::TargetError as TraceTargetError,
 };
+use helios_wit_rpc::inspector_fs::FsRpcError;
 
 /// Top-level error returned by [`crate::Session`], [`crate::Fleet`], and SDK helpers.
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +32,8 @@ pub enum OpsError {
     Bundle(#[from] BundleError),
     #[error("{0}")]
     Oci(#[from] helios_oci::OciError),
+    #[error("{0}")]
+    Fs(#[from] FsRpcError),
     #[error("timed out waiting for {operation}")]
     TimedOut { operation: &'static str },
     #[error("remote RPC `{operation}` failed: {source}")]
@@ -35,42 +42,49 @@ pub enum OpsError {
         #[source]
         source: RpcError,
     },
-    #[error("remote filter for `{operation}` refused: {source:?}")]
+    #[error("remote filter for `{operation}` refused: {error:?}")]
     FilterRefused {
         operation: &'static str,
-        source: FilterError,
+        error: FilterError,
     },
     #[error("no live instance is named `{name}`")]
     NoInstanceNamed { name: String },
-    #[error("guest refused to stop instance {id}: {source:?}")]
-    KillRefused { id: u64, source: KillError },
-    #[error("guest refused tracing target `{target}`: {source:?}")]
+    #[error("guest refused to stop instance {id}: {error:?}")]
+    KillRefused { id: u64, error: KillError },
+    #[error("guest refused tracing target `{target}`: {error:?}")]
     TraceTargetRefused {
         target: String,
-        source: TraceTargetError,
+        error: TraceTargetError,
     },
-    #[error("guest refused profiling control `{operation}`: {source:?}")]
+    #[error("guest refused profiling control `{operation}`: {error:?}")]
     ProfilingControlRefused {
         operation: &'static str,
-        source: ControlError,
+        error: ControlError,
     },
-    #[error("guest refused instruction profiling `{operation}`: {source:?}")]
+    #[error("guest refused instruction profiling `{operation}`: {error:?}")]
     InstructionProfileRefused {
         operation: &'static str,
-        source: InstructionProfileError,
+        error: InstructionProfileError,
     },
-    #[error("guest refused raw profile `{operation}`: {source:?}")]
+    #[error("guest refused raw profile `{operation}`: {error:?}")]
     RawProfileRefused {
         operation: &'static str,
-        source: RawProfileError,
+        error: RawProfileError,
     },
-    #[error("guest refused processor offline for CPU {processor}: {source:?}")]
-    ProcessorOfflineRefused {
-        processor: u32,
-        source: OfflineError,
+    #[error("guest refused processor offline for CPU {processor}: {error:?}")]
+    ProcessorOfflineRefused { processor: u32, error: OfflineError },
+    #[error("guest refused processor online for CPU {processor}: {error:?}")]
+    ProcessorOnlineRefused { processor: u32, error: OnlineError },
+    #[error("guest refused snapshot prepare: {error:?}")]
+    SnapshotRefused {
+        error: helios_wit_rpc::inspector::helios::system::snapshot::SnapshotError,
     },
-    #[error("guest refused processor online for CPU {processor}: {source:?}")]
-    ProcessorOnlineRefused { processor: u32, source: OnlineError },
+    #[error("component-control `{operation}` refused ({kind:?}): {detail}")]
+    ComponentControlRefused {
+        operation: &'static str,
+        kind: helios_wit_rpc::inspector::helios::system::component_control::ControlErrorKind,
+        detail: String,
+    },
     #[error("program execution refused ({kind:?}): {detail}")]
     ExecRefused { kind: ExecErrorKind, detail: String },
     #[error("path `{path}` is invalid: {reason}")]
@@ -89,7 +103,16 @@ impl OpsError {
     pub fn guest_panic(&self) -> Option<&str> {
         match self {
             Self::Rpc { source, .. } => source.guest_panic(),
+            Self::Fs(err) => err.guest_panic(),
             _ => None,
+        }
+    }
+
+    pub fn from_component_control(operation: &'static str, err: ComponentControlError) -> Self {
+        Self::ComponentControlRefused {
+            operation,
+            kind: err.kind,
+            detail: err.detail,
         }
     }
 }
@@ -141,7 +164,7 @@ pub enum TargetError {
     },
 }
 
-/// Errors opening or driving an async transport (`serial://`, `vsock://`, `helios://`).
+/// Errors opening or driving an async transport (`serial://`, `vsock://`, `helios://`, `helios+tls://`).
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     #[error("failed to inspect serial device `{device}`: {source}")]
@@ -202,10 +225,22 @@ pub enum TransportError {
         source: io::Error,
     },
     #[error(
-        "TLS + Ed25519 CapabilityCert handshake for `helios://{host}:{port}` is not yet implemented \
-         (tracked by #1190); use explicit `tcp://{host}:{port}` for plaintext development links"
+        "TLS + Ed25519 authentication is required for `helios://{host}:{port}`; supply an identity \
+         via `--identity` or `SecurityMode::Authenticated`"
     )]
-    TlsNotYetImplemented { host: String, port: u16 },
+    AuthRequired { host: String, port: u16 },
+    #[error("TLS 1.3 handshake to `{address}` failed: {source}")]
+    TlsHandshake {
+        address: String,
+        #[source]
+        source: TlsError,
+    },
+    #[error("Ed25519 inspector authentication handshake on `{endpoint}` failed: {source}")]
+    AuthHandshake {
+        endpoint: String,
+        #[source]
+        source: ProtocolAuthError,
+    },
 }
 
 /// Errors loading or exchanging operator identities and capability certificates.
@@ -234,6 +269,8 @@ pub enum AuthError {
         #[source]
         source: toml::ser::Error,
     },
+    #[error("identity `{name}` is invalid: {detail}")]
+    InvalidIdentity { name: String, detail: String },
     #[error("authority CA at `{url}` returned HTTP {status}: {detail}")]
     AuthorityRejected {
         url: String,
