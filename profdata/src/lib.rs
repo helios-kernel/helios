@@ -62,7 +62,7 @@ pub const FETCH_COMMAND: &str = "helios-cli profile-fetch";
 /// This is where Helios publishes, the way `checkout-wasmtime` pins where
 /// the vendored Wasmtime comes from. `helios-cli profile-fetch --repo`
 /// overrides it for a fork.
-pub const RELEASE_REPOSITORY: &str = "helios-kernel/helios";
+pub const RELEASE_REPOSITORY: &str = "lexoliu/helios";
 
 /// `IndexedInstrProf::Magic`, the first eight bytes of a merged profile
 /// read as a little-endian word: the ASCII `\xfflprofi\x81`.

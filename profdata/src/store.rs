@@ -262,14 +262,14 @@ mod tests {
 
     fn release() -> FetchedProfile {
         FetchedProfile::Release {
-            repository: "helios-kernel/helios".to_owned(),
+            repository: "lexoliu/helios".to_owned(),
             tag: "helios-v0.1.0".to_owned(),
         }
     }
 
     fn collection() -> FetchedProfile {
         FetchedProfile::Collection {
-            repository: "helios-kernel/helios".to_owned(),
+            repository: "lexoliu/helios".to_owned(),
             run_id: 34_424_416_974,
             head_branch: "dev".to_owned(),
             head_sha: "85d20bcd0a1b2c3d4e5f60718293a4b5c6d7e8f9".to_owned(),
