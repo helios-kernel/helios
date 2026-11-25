@@ -2,7 +2,7 @@
 //! Linux subsystem, one case per process, each under a bound.
 //!
 //! A case is one gtest case of one static Linux test binary, started
-//! through `programs.exec-path` with `--gtest_filter=<Suite.Case>`, the
+//! through `helios:system/programs.exec` with `--gtest_filter=<Suite.Case>`, the
 //! way gVisor's own runner starts a case natively
 //! (`test/runner/main.go`, `runTestCaseNative`). A case that outlives its
 //! bound is killed by the instance name its launch registered, so an

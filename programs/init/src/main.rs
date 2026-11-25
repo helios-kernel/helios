@@ -1210,21 +1210,23 @@ async fn main() -> io::Result<()> {
     {
         use futures_lite::future::FutureExt as _;
         enum LoopItem {
-            Supervisor(Result<bool, helios_component_manager::SupervisorError>),
+            Event(Option<helios_component_manager::PendingEvent<HeliosRuntime>>),
             Control(Result<component_control::ControlCommand, async_channel::RecvError>),
         }
-        loop {
-            let item = async { LoopItem::Supervisor(supervisor.step_once().await) }
+        while supervisor.has_active_work() {
+            let item = async { LoopItem::Event(supervisor.recv_event().await) }
                 .or(async { LoopItem::Control(control_rx.recv().await) })
                 .await;
             match item {
-                LoopItem::Supervisor(Ok(true)) => {}
-                LoopItem::Supervisor(Ok(false)) => break,
-                LoopItem::Supervisor(Err(error)) => {
-                    return Err(io::Error::other(format!(
-                        "supervising component topology: {error}"
-                    )));
+                LoopItem::Event(Some(event)) => {
+                    supervisor
+                        .handle_pending_event(event)
+                        .await
+                        .map_err(|error| {
+                            io::Error::other(format!("supervising component topology: {error}"))
+                        })?;
                 }
+                LoopItem::Event(None) => break,
                 LoopItem::Control(Ok(cmd)) => {
                     component_control::handle_control_command(&mut supervisor, cmd).await;
                 }

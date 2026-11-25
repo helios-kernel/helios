@@ -319,6 +319,10 @@ pub const fn exponential_backoff_ms(base_ms: u64, max_ms: u64, attempt: u32) -> 
     }
 }
 
+/// Opaque pending event returned by [`Supervisor::recv_event`] and consumed by
+/// [`Supervisor::handle_pending_event`].
+pub struct PendingEvent<R: SupervisorRuntime>(SupervisorEvent<R>);
+
 /// Stateful, async-first component supervisor driving a validated [`ComponentTopology`].
 pub struct Supervisor<R: SupervisorRuntime> {
     runtime: R,
@@ -475,24 +479,43 @@ impl<R: SupervisorRuntime> Supervisor<R> {
     /// or a `critical = "system"` component escalates fatally.
     pub async fn run_until_done(&mut self) -> Result<(), SupervisorError> {
         while self.has_active_work() {
-            let Ok(event) = self.event_rx.recv().await else {
+            let Some(event) = self.recv_event().await else {
                 break;
             };
-            self.handle_event(event).await?;
-            self.drain_pending_work().await?;
+            self.handle_pending_event(event).await?;
         }
         Ok(())
     }
 
+    /// Cancel-safely awaits the next internal supervisor event without mutating
+    /// supervisor state.
+    ///
+    /// Callers multiplexing external control channels (such as
+    /// `helios:system/component-control`) should race `recv_event()` against
+    /// their control channel and then pass any received [`PendingEvent`] to
+    /// [`Self::handle_pending_event`] uninterrupted.
+    pub async fn recv_event(&self) -> Option<PendingEvent<R>> {
+        self.event_rx.recv().await.ok().map(PendingEvent)
+    }
+
+    /// Applies one event received from [`Self::recv_event`] and drains any
+    /// resulting eager activations or realm resets to completion.
+    pub async fn handle_pending_event(
+        &mut self,
+        event: PendingEvent<R>,
+    ) -> Result<(), SupervisorError> {
+        self.handle_event(event.0).await?;
+        self.drain_pending_work().await
+    }
+
     /// Processes a single pending supervisor event (useful for deterministic step-by-step tests).
     pub async fn step_once(&mut self) -> Result<bool, SupervisorError> {
-        match self.event_rx.recv().await {
-            Ok(event) => {
-                self.handle_event(event).await?;
-                self.drain_pending_work().await?;
+        match self.recv_event().await {
+            Some(event) => {
+                self.handle_pending_event(event).await?;
                 Ok(true)
             }
-            Err(_) => Ok(false),
+            None => Ok(false),
         }
     }
 
@@ -575,7 +598,10 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         self.publish_inspect();
     }
 
-    fn has_active_work(&self) -> bool {
+    /// Returns `true` while any non-realm active component is running, starting,
+    /// or holding an armed lazy socket listener.
+    #[must_use]
+    pub fn has_active_work(&self) -> bool {
         self.components.iter().any(|c| {
             c.active
                 && !c.node.runner.is_realm()

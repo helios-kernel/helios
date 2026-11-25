@@ -3997,17 +3997,16 @@ fn resolve_vm_client_identity(
     {
         return Some(*identity);
     }
-    if let Ok(prebuild_dir) = kernel_prebuild_dir(&command.build) {
-        let key_path = prebuild_dir.join(INSPECTOR_CLIENT_SECRET_FILE);
-        if key_path.is_file()
-            && let Ok(identity) =
-                helios_inspector_protocol::auth::ClientIdentity::from_seed_file(&key_path)
-        {
-            return Some(identity);
-        }
-    }
-    if let Some(parent) = command.bootfs.parent() {
-        let key_path = parent.join(INSPECTOR_CLIENT_SECRET_FILE);
+    let fallback_dir = kernel_prebuild_dir(&command.build).ok();
+    resolve_vm_client_identity_from_dirs(command.bootfs.parent(), fallback_dir.as_deref())
+}
+
+fn resolve_vm_client_identity_from_dirs(
+    bootfs_dir: Option<&Path>,
+    prebuild_dir: Option<&Path>,
+) -> Option<helios_inspector_protocol::auth::ClientIdentity> {
+    for dir in [bootfs_dir, prebuild_dir].into_iter().flatten() {
+        let key_path = dir.join(INSPECTOR_CLIENT_SECRET_FILE);
         if key_path.is_file()
             && let Ok(identity) =
                 helios_inspector_protocol::auth::ClientIdentity::from_seed_file(&key_path)
@@ -11130,5 +11129,38 @@ mod tests {
         let status = run_command_piped_to_spinner("concurrent-streams", &mut command, &bar)
             .expect("sh should spawn and drain cleanly");
         assert_eq!(status.code(), Some(7));
+    }
+
+    #[test]
+    fn resolve_vm_client_identity_prefers_bootfs_dir_over_prebuild_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bootfs_dir = dir.path().join("custom-image");
+        let prebuild_dir = dir.path().join("prebuild");
+        fs::create_dir_all(&bootfs_dir).expect("create bootfs_dir");
+        fs::create_dir_all(&prebuild_dir).expect("create prebuild_dir");
+
+        let bootfs_seed = [0x11u8; 32];
+        let prebuild_seed = [0x22u8; 32];
+        fs::write(bootfs_dir.join(INSPECTOR_CLIENT_SECRET_FILE), bootfs_seed)
+            .expect("write bootfs key");
+        fs::write(
+            prebuild_dir.join(INSPECTOR_CLIENT_SECRET_FILE),
+            prebuild_seed,
+        )
+        .expect("write prebuild key");
+
+        let resolved = resolve_vm_client_identity_from_dirs(Some(&bootfs_dir), Some(&prebuild_dir))
+            .expect("identity resolved");
+        let expected_bootfs =
+            helios_inspector_protocol::auth::ClientIdentity::from_static_seed(bootfs_seed);
+        assert_eq!(resolved.public_key(), expected_bootfs.public_key());
+
+        // Falls back to prebuild_dir when bootfs_dir has no key.
+        fs::remove_file(bootfs_dir.join(INSPECTOR_CLIENT_SECRET_FILE)).expect("remove bootfs key");
+        let fallback = resolve_vm_client_identity_from_dirs(Some(&bootfs_dir), Some(&prebuild_dir))
+            .expect("fallback identity resolved");
+        let expected_prebuild =
+            helios_inspector_protocol::auth::ClientIdentity::from_static_seed(prebuild_seed);
+        assert_eq!(fallback.public_key(), expected_prebuild.public_key());
     }
 }

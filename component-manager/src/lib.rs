@@ -41,8 +41,8 @@ pub use model::{
     VmShareSpec, WasmRunnerSpec, WasmSharding,
 };
 pub use supervisor::{
-    BoundSocket, ChildProcess, ExitOutcome, FatalEscalation, IpcChannelEnd, ProviderEndpoint,
-    ProviderOutcome, RuntimeError, SIGKILL, SIGTERM, SpawnComponentArgs, Supervisor,
-    SupervisorError, SupervisorRuntime, TcpSocketListener, VsockSocketListener,
+    BoundSocket, ChildProcess, ExitOutcome, FatalEscalation, IpcChannelEnd, PendingEvent,
+    ProviderEndpoint, ProviderOutcome, RuntimeError, SIGKILL, SIGTERM, SpawnComponentArgs,
+    Supervisor, SupervisorError, SupervisorRuntime, TcpSocketListener, VsockSocketListener,
     exponential_backoff_ms,
 };

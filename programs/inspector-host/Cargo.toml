@@ -8,7 +8,7 @@ autobins = false
 futures-io = { version = "0.3.34", default-features = false, features = ["std"] }
 futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
 futures-util = { version = "0.3.31", default-features = false, features = ["std", "async-await"] }
-helios-api = { path = "../../api", default-features = false, features = ["fs", "ipc", "machine-identity", "net", "programs", "serial", "vsock"] }
+helios-api = { path = "../../api", default-features = false, features = ["fs", "inspect", "ipc", "machine-identity", "net", "programs", "serial", "vsock"] }
 helios-inspector-protocol = { path = "../../inspector-protocol", default-features = false, features = ["auth"] }
 helios-wit-rpc = { workspace = true, default-features = false, features = ["inspector-rpc"] }
 

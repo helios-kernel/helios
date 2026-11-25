@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures_io::{AsyncRead, AsyncWrite};
-use futures_lite::future;
 use futures_lite::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use helios_api::ipc::{self, Endpoint as IpcEndpoint};
 use helios_api::net::TcpStream;
@@ -182,7 +181,20 @@ async fn main() -> Result<(), String> {
         }
     };
 
-    let _ = future::zip(net_to_worker, worker_to_net).await;
+    let mut net_to_worker = std::pin::pin!(net_to_worker);
+    let mut worker_to_net = std::pin::pin!(worker_to_net);
+    match futures_util::future::select(net_to_worker.as_mut(), worker_to_net.as_mut()).await {
+        // Worker exited and closed TLS: tear down immediately without waiting
+        // forever on a stalled remote TCP peer.
+        futures_util::future::Either::Right((_, _)) => {
+            data.close_write();
+        }
+        // Client reached EOF/error: finish draining any final worker reply
+        // through TLS before tearing down.
+        futures_util::future::Either::Left((_, remaining_worker_to_net)) => {
+            let _ = remaining_worker_to_net.await;
+        }
+    }
     Ok(())
 }
 
