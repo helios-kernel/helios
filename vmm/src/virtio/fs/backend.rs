@@ -38,6 +38,7 @@ pub const EXDEV: i32 = 18;
 pub const ENOTDIR: i32 = 20;
 pub const EISDIR: i32 = 21;
 pub const EINVAL: i32 = 22;
+pub const EMFILE: i32 = 24;
 pub const ENOSPC: i32 = 28;
 pub const ESPIPE: i32 = 29;
 pub const EROFS: i32 = 30;
@@ -219,6 +220,54 @@ pub fn validate_name(name: &str) -> FsResult<()> {
     Ok(())
 }
 
+/// Validates raw symlink target text stored for guest-side resolution.
+///
+/// Absolute targets (such as `/usr/bin/busybox` inside a `--rootfs-dir` tree)
+/// are permitted because neither [`WasiFsBackend`] nor [`HostFsBackend`] ever
+/// follows symlinks during host path traversal; the guest kernel VFS resolves
+/// the target returned by `FUSE_READLINK`.
+pub fn validate_symlink_target(target: &str) -> FsResult<()> {
+    if target.is_empty() || target.contains('\0') {
+        return Err(EINVAL);
+    }
+    Ok(())
+}
+
+/// Computes the WASI directory descriptor flags required for a share directory.
+///
+/// Writable directories must carry `WRITE` alongside `READ | MUTATE_DIRECTORY`
+/// so child `open_at(..., DescriptorFlags::WRITE)` calls satisfy the kernel's
+/// `base_flags` attenuation check instead of failing with `EROFS`.
+pub(crate) fn directory_open_flags(read_only: bool) -> DescriptorFlags {
+    if read_only {
+        DescriptorFlags::READ
+    } else {
+        DescriptorFlags::READ | DescriptorFlags::WRITE | DescriptorFlags::MUTATE_DIRECTORY
+    }
+}
+
+/// Computes the WASI `(OpenFlags, DescriptorFlags)` pair for [`FsOpenOptions`].
+pub(crate) fn file_open_flags(options: FsOpenOptions) -> (OpenFlags, DescriptorFlags) {
+    let mut open_flags = OpenFlags::empty();
+    if options.create {
+        open_flags = open_flags | OpenFlags::CREATE;
+    }
+    if options.exclusive {
+        open_flags = open_flags | OpenFlags::EXCLUSIVE;
+    }
+    if options.truncate {
+        open_flags = open_flags | OpenFlags::TRUNCATE;
+    }
+    let mut desc_flags = DescriptorFlags::empty();
+    if options.read || !options.write {
+        desc_flags = desc_flags | DescriptorFlags::READ;
+    }
+    if options.write {
+        desc_flags = desc_flags | DescriptorFlags::WRITE;
+    }
+    (open_flags, desc_flags)
+}
+
 /// Validates a host share path into relative components, rejecting `..` traversal.
 fn normalize_host_path(path: &str) -> Result<Vec<String>> {
     let mut parts = Vec::new();
@@ -328,11 +377,7 @@ impl WasiFsBackend {
             .into_iter()
             .find(|(_, name)| name == "/")
             .ok_or(Error::MissingRoot)?;
-        let flags = if read_only {
-            DescriptorFlags::READ
-        } else {
-            DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY
-        };
+        let flags = directory_open_flags(read_only);
         for seg in components {
             dir = dir
                 .open_at(PathFlags::SYMLINK_FOLLOW, seg, OpenFlags::DIRECTORY, flags)
@@ -344,10 +389,6 @@ impl WasiFsBackend {
         })
     }
 
-    fn join_relative(path: &[String]) -> String {
-        path.join("/")
-    }
-
     async fn open_parent<'a>(
         &'a self,
         path: &'a [String],
@@ -357,22 +398,18 @@ impl WasiFsBackend {
         if parent_parts.is_empty() {
             return Ok((None, name.as_str()));
         }
-        let flags = if self.read_only {
-            DescriptorFlags::READ
-        } else {
-            DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY
-        };
-        let parent = self
-            .root
-            .open_at(
-                PathFlags::empty(),
-                Self::join_relative(parent_parts),
-                OpenFlags::DIRECTORY,
-                flags,
-            )
-            .await
-            .map_err(map_wasi_error)?;
-        Ok((Some(parent), name.as_str()))
+        let flags = directory_open_flags(self.read_only);
+        let mut current: Option<Descriptor> = None;
+        for seg in parent_parts {
+            validate_name(seg)?;
+            let base = current.as_ref().unwrap_or(&self.root);
+            let next = base
+                .open_at(PathFlags::empty(), seg.clone(), OpenFlags::DIRECTORY, flags)
+                .await
+                .map_err(map_wasi_error)?;
+            current = Some(next);
+        }
+        Ok((current, name.as_str()))
     }
 }
 
@@ -387,8 +424,9 @@ impl FsBackend for WasiFsBackend {
         let stat = if path.is_empty() {
             self.root.stat().await.map_err(map_wasi_error)?
         } else {
-            self.root
-                .stat_at(PathFlags::empty(), Self::join_relative(path))
+            let (parent, name) = self.open_parent(path).await?;
+            let base = parent.as_ref().unwrap_or(&self.root);
+            base.stat_at(PathFlags::empty(), name.to_owned())
                 .await
                 .map_err(map_wasi_error)?
         };
@@ -406,23 +444,7 @@ impl FsBackend for WasiFsBackend {
         if self.read_only && (options.write || options.create || options.truncate) {
             return Err(EROFS);
         }
-        let mut open_flags = OpenFlags::empty();
-        if options.create {
-            open_flags = open_flags | OpenFlags::CREATE;
-        }
-        if options.exclusive {
-            open_flags = open_flags | OpenFlags::EXCLUSIVE;
-        }
-        if options.truncate {
-            open_flags = open_flags | OpenFlags::TRUNCATE;
-        }
-        let mut desc_flags = DescriptorFlags::empty();
-        if options.read || !options.write {
-            desc_flags = desc_flags | DescriptorFlags::READ;
-        }
-        if options.write {
-            desc_flags = desc_flags | DescriptorFlags::WRITE;
-        }
+        let (open_flags, desc_flags) = file_open_flags(options);
         let (parent, name) = self.open_parent(path).await?;
         let base = parent.as_ref().unwrap_or(&self.root);
         let descriptor = base
@@ -548,8 +570,9 @@ impl FsBackend for WasiFsBackend {
                 .await
                 .map_err(map_wasi_error)
         } else {
-            self.root
-                .set_times_at(PathFlags::empty(), Self::join_relative(path), atime, mtime)
+            let (parent, name) = self.open_parent(path).await?;
+            let base = parent.as_ref().unwrap_or(&self.root);
+            base.set_times_at(PathFlags::empty(), name.to_owned(), atime, mtime)
                 .await
                 .map_err(map_wasi_error)
         }
@@ -627,16 +650,17 @@ impl FsBackend for WasiFsBackend {
         let dir_owned = if path.is_empty() {
             None
         } else {
+            let (parent, name) = self.open_parent(path).await?;
+            let base = parent.as_ref().unwrap_or(&self.root);
             Some(
-                self.root
-                    .open_at(
-                        PathFlags::empty(),
-                        Self::join_relative(path),
-                        OpenFlags::DIRECTORY,
-                        DescriptorFlags::READ,
-                    )
-                    .await
-                    .map_err(map_wasi_error)?,
+                base.open_at(
+                    PathFlags::empty(),
+                    name.to_owned(),
+                    OpenFlags::DIRECTORY,
+                    DescriptorFlags::READ,
+                )
+                .await
+                .map_err(map_wasi_error)?,
             )
         };
         let dir = dir_owned.as_ref().unwrap_or(&self.root);
@@ -677,9 +701,7 @@ impl FsBackend for WasiFsBackend {
         if self.read_only {
             return Err(EROFS);
         }
-        if target.starts_with('/') {
-            return Err(EPERM);
-        }
+        validate_symlink_target(target)?;
         let (parent, name) = self.open_parent(link_path).await?;
         let base = parent.as_ref().unwrap_or(&self.root);
         base.symlink_at(target.to_owned(), name.to_owned())
@@ -717,10 +739,74 @@ impl FsBackend for WasiFsBackend {
     }
 }
 
+/// Platform `open(2)` bitmasks for [`HostFsBackend`] Unix leaf opens.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+mod unix_open_flags {
+    // BSD / macOS `<sys/fcntl.h>`.
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+    ))]
+    pub const O_NOFOLLOW: i32 = 0x0100;
+    // Linux `<arch/arm64/include/uapi/asm/fcntl.h>`.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(target_arch = "aarch64", target_arch = "arm"),
+    ))]
+    pub const O_NOFOLLOW: i32 = 0o100000;
+    // Linux `<uapi/asm-generic/fcntl.h>`.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(any(target_arch = "aarch64", target_arch = "arm")),
+    ))]
+    pub const O_NOFOLLOW: i32 = 0o400000;
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+    ))]
+    pub const O_CREAT: i32 = 0x0200;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub const O_CREAT: i32 = 0o100;
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+    ))]
+    pub const O_TRUNC: i32 = 0x0400;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub const O_TRUNC: i32 = 0o1000;
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+    ))]
+    pub const O_EXCL: i32 = 0x0800;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub const O_EXCL: i32 = 0o200;
+}
+
 /// Host `std::fs` backend confined strictly within a canonical root directory.
 ///
-/// Rejects path traversal and any intermediate symlink whose target escapes
-/// the share root.
+/// Rejects path traversal and refuses to follow any symlink on parent or leaf
+/// host operations; symlink targets are stored and returned raw for guest VFS
+/// resolution.
 #[cfg(not(target_arch = "wasm32"))]
 pub struct HostFsBackend {
     root: PathBuf,
@@ -745,7 +831,7 @@ impl HostFsBackend {
     }
 
     /// Resolves `path` under `self.root`, ensuring every component is validated
-    /// and no ancestor directory escapes `self.root` via symlinks.
+    /// and no ancestor directory is a symlink or escapes `self.root`.
     fn resolve_confined(&self, path: &[String]) -> FsResult<PathBuf> {
         let mut current = self.root.clone();
         for (idx, seg) in path.iter().enumerate() {
@@ -753,26 +839,29 @@ impl HostFsBackend {
             current.push(seg);
             let is_last = idx + 1 == path.len();
             if !is_last {
-                let canon = std::fs::canonicalize(&current).map_err(map_io_error)?;
-                if !canon.starts_with(&self.root) {
-                    return Err(EACCES);
+                self.verify_not_escaping_symlink(&current)?;
+                let meta = std::fs::symlink_metadata(&current).map_err(map_io_error)?;
+                if meta.file_type().is_symlink() {
+                    return Err(ELOOP);
                 }
-                current = canon;
+                if !meta.is_dir() {
+                    return Err(ENOTDIR);
+                }
             }
         }
         Ok(current)
     }
 
-    /// Confirms that a final path (when following symlinks, e.g. for `open`)
-    /// stays inside `self.root`.
+    /// Rejects a symlink whose resolved host target escapes `self.root` with
+    /// `EACCES`. Leaf opens additionally pass `O_NOFOLLOW` on Unix so even a
+    /// concurrent symlink swap cannot follow any symlink.
     fn verify_not_escaping_symlink(&self, target: &Path) -> FsResult<()> {
         if let Ok(meta) = std::fs::symlink_metadata(target)
             && meta.file_type().is_symlink()
+            && let Ok(canon) = std::fs::canonicalize(target)
+            && !canon.starts_with(&self.root)
         {
-            let canon = std::fs::canonicalize(target).map_err(map_io_error)?;
-            if !canon.starts_with(&self.root) {
-                return Err(EACCES);
-            }
+            return Err(EACCES);
         }
         Ok(())
     }
@@ -798,7 +887,10 @@ fn map_io_error(error: std::io::Error) -> i32 {
             ErrorKind::InvalidFilename => ENAMETOOLONG,
             ErrorKind::Unsupported => ENOSYS,
             _ => match raw {
+                // EBADF = 9, EMFILE = 24 on both Linux and macOS;
                 // macOS ENOTEMPTY = 66, ELOOP = 62; Linux ELOOP = 40.
+                9 => EBADF,
+                24 => EMFILE,
                 66 => ENOTEMPTY,
                 62 | 40 => ELOOP,
                 _ => EIO,
@@ -889,18 +981,56 @@ impl FsBackend for HostFsBackend {
         let full = self.resolve_confined(path)?;
         self.verify_not_escaping_symlink(&full)?;
         let mut opts = std::fs::OpenOptions::new();
-        opts.read(options.read || !options.write);
-        opts.write(options.write);
-        if options.create && options.exclusive {
-            opts.create_new(true);
-        } else {
-            opts.create(options.create);
-        }
-        opts.truncate(options.truncate);
         #[cfg(unix)]
-        if options.create && options.mode != 0 {
+        {
             use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(options.mode & 0o7777);
+            if options.write {
+                opts.read(options.read);
+                opts.write(true);
+                if options.create && options.exclusive {
+                    opts.create_new(true);
+                } else {
+                    opts.create(options.create);
+                }
+                opts.truncate(options.truncate);
+                opts.custom_flags(unix_open_flags::O_NOFOLLOW);
+            } else {
+                // `std::fs::OpenOptions` rejects `.create(true)` without `.write(true)`
+                // with `EINVAL`, whereas POSIX `open(2)` permits `O_RDONLY | O_CREAT`.
+                // Pass creation flags via `custom_flags` alongside `O_NOFOLLOW` so the
+                // resulting file descriptor stays strictly read-only.
+                opts.read(true).write(false);
+                let mut extra = unix_open_flags::O_NOFOLLOW;
+                if options.create {
+                    extra |= unix_open_flags::O_CREAT;
+                    if options.exclusive {
+                        extra |= unix_open_flags::O_EXCL;
+                    }
+                }
+                if options.truncate {
+                    extra |= unix_open_flags::O_TRUNC;
+                }
+                opts.custom_flags(extra);
+            }
+            if options.create && options.mode != 0 {
+                opts.mode(options.mode & 0o7777);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if let Ok(meta) = std::fs::symlink_metadata(&full)
+                && meta.file_type().is_symlink()
+            {
+                return Err(ELOOP);
+            }
+            opts.read(options.read || !options.write);
+            opts.write(options.write);
+            if options.create && options.exclusive {
+                opts.create_new(true);
+            } else {
+                opts.create(options.create);
+            }
+            opts.truncate(options.truncate);
         }
         let file = opts.open(&full).map_err(map_io_error)?;
         let meta = file.metadata().map_err(map_io_error)?;
@@ -988,10 +1118,20 @@ impl FsBackend for HostFsBackend {
         }
         let full = self.resolve_confined(path)?;
         self.verify_not_escaping_symlink(&full)?;
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&full)
-            .map_err(map_io_error)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(unix_open_flags::O_NOFOLLOW);
+        }
+        #[cfg(not(unix))]
+        if let Ok(meta) = std::fs::symlink_metadata(&full)
+            && meta.file_type().is_symlink()
+        {
+            return Err(ELOOP);
+        }
+        let file = opts.open(&full).map_err(map_io_error)?;
         file.set_len(size).map_err(map_io_error)
     }
 
@@ -1023,14 +1163,21 @@ impl FsBackend for HostFsBackend {
             times = times.set_modified(t);
         }
         let meta = std::fs::symlink_metadata(&full).map_err(map_io_error)?;
-        let file = if meta.is_dir() {
-            std::fs::File::open(&full).map_err(map_io_error)?
+        if meta.file_type().is_symlink() {
+            return Err(ELOOP);
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        if meta.is_dir() {
+            opts.read(true);
         } else {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&full)
-                .map_err(map_io_error)?
-        };
+            opts.write(true);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(unix_open_flags::O_NOFOLLOW);
+        }
+        let file = opts.open(&full).map_err(map_io_error)?;
         file.set_times(times).map_err(map_io_error)?;
         Ok(())
     }
@@ -1043,9 +1190,14 @@ impl FsBackend for HostFsBackend {
         self.verify_not_escaping_symlink(&full)?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(unix_open_flags::O_NOFOLLOW)
+                .open(&full)
+                .map_err(map_io_error)?;
             let perms = std::fs::Permissions::from_mode(mode & 0o7777);
-            std::fs::set_permissions(&full, perms).map_err(map_io_error)?;
+            file.set_permissions(perms).map_err(map_io_error)?;
         }
         #[cfg(not(unix))]
         let _ = mode;
@@ -1113,6 +1265,10 @@ impl FsBackend for HostFsBackend {
     async fn read_dir(&self, path: &[String]) -> FsResult<Vec<FsDirEntry>> {
         let full = self.resolve_confined(path)?;
         self.verify_not_escaping_symlink(&full)?;
+        let meta = std::fs::symlink_metadata(&full).map_err(map_io_error)?;
+        if meta.file_type().is_symlink() {
+            return Err(ELOOP);
+        }
         let iter = std::fs::read_dir(&full).map_err(map_io_error)?;
         let mut entries = Vec::new();
         for entry in iter {
@@ -1146,9 +1302,7 @@ impl FsBackend for HostFsBackend {
         if self.read_only {
             return Err(EROFS);
         }
-        if target.starts_with('/') {
-            return Err(EPERM);
-        }
+        validate_symlink_target(target)?;
         let full = self.resolve_confined(link_path)?;
         #[cfg(unix)]
         std::os::unix::fs::symlink(target, &full).map_err(map_io_error)?;
