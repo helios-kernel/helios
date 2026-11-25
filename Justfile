@@ -13,7 +13,7 @@ default_profile := "debug"
 # tools `test-host-tools` tests besides the compiler host; each recipe and its
 # `warm-` twin read the one list.
 kernel_unit_packages := "-p helios-hal -p helios-virtio -p helios-netstack -p helios-artifact -p helios-kernel"
-host_tool_packages := "-p helios-ops -p helios-inspector-shell -p helios-inspector -p helios-nu -p helios-artifact -p helios-profdata -p helios-cli -p helios-compiler-support"
+host_tool_packages := "-p helios-ops -p helios-inspector-shell -p helios-inspector -p helios-nu -p helios-artifact -p helios-profdata -p helios-cli -p helios-compiler-support -p helios-compiler-host"
 
 # The one bare-metal target whose rustflags carry `-Zbranch-protection`, which
 # rustc refuses to mix with a precompiled `core`, `alloc` or
@@ -138,13 +138,10 @@ test-kernel run_ignored="default":
     # The Linux process host is behind a feature the run above leaves off.
     cargo nextest run -p helios-kernel --lib --features linux --run-ignored "{{ run_ignored }}"
     cargo nextest run -p helios-kernel --test hal_layering
-    # The x86 user address space's page-table code, the code the x86
-    # kernel runs, over host memory and real threads.
-    cargo nextest run -p helios-x86-vmm
-    # The hosted backend boots the same kernel on the host OS; its tests
-    # cover the memory-policy density checks and the OOM killer, and
-    # `embedded_debugger_is_provisioned` reads the prebuild payload above.
-    HELIOS_BOOTFS="${out_dir}/helios-bootfs" cargo nextest run -p helios-hosted
+    # The x86 user address space's page-table code (over host memory and real
+    # threads) and the hosted backend (memory-policy density checks, OOM killer,
+    # and `embedded_debugger_is_provisioned` reading the prebuild payload above).
+    HELIOS_BOOTFS="${out_dir}/helios-bootfs" cargo nextest run -p helios-x86-vmm -p helios-hosted
 
 # Compile every test binary `test-kernel` runs and run none of them. The
 # binaries depend on the trusted-root keys and on nothing the prebuild's
@@ -162,51 +159,40 @@ warm-test-kernel:
     cargo nextest run --no-run {{ kernel_unit_packages }} --lib
     cargo nextest run --no-run -p helios-kernel --lib --features linux
     cargo nextest run --no-run -p helios-kernel --test hal_layering
-    cargo nextest run --no-run -p helios-x86-vmm
-    HELIOS_BOOTFS="${out_dir}/helios-bootfs" cargo nextest run --no-run -p helios-hosted
+    HELIOS_BOOTFS="${out_dir}/helios-bootfs" cargo nextest run --no-run -p helios-x86-vmm -p helios-hosted
 
 test-libraries:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo nextest run -p helios-sync --features runtime
-    cargo nextest run -p helios-unix --features runtime
-    cargo nextest run -p helios-linux --features runtime
-    cargo nextest run -p helios-firmware
-    cargo nextest run -p helios-api --features hv
-    cargo nextest run -p helios-vmm
-    cargo nextest run -p helios-workspace-root --lib
-    # The TPM driver: both interfaces against register models that
-    # enforce their state machines, and the sealing scenario replayed
-    # from its committed swtpm recording.
-    cargo nextest run -p helios-tpm
-    # What the desktop draws with — damage tracking, focus routing, the
-    # terminal grid — is a plain library (`programs/compositor/render`)
-    # and is tested here rather than only inside a boot, alongside the
-    # capture check that links it.
-    cargo nextest run -p helios-compositor-render -p helios-desktop-text-check
-    cargo nextest run -p helios-inspector-protocol -p helios-wit-rpc
-    # A guest program's pure parts (argument and value parsing, output
-    # lines) run on the host.
-    cargo nextest run -p helios-sysctl
-    # Btrfs reader and transaction tests use images two pure-Rust writers build.
-    # Images from `mkfs.btrfs` need btrfs-progs and run in
-    # `test-btrfs-mkfs`.
-    cargo nextest run -p helios-btrfs --features write
     # The Venus protocol is generated from pinned venus-protocol inputs that
     # the CLI fetches and hash-verifies; the parity test then compares the
-    # generated encoders with the pinned Mesa generator's output. The
-    # driver's entry points and handle-type translation are behind its
-    # `driver` feature.
+    # generated encoders with the pinned Mesa generator's output. The ACPI
+    # library runs QEMU's own CPU hotplug AML from pinned tables.
     {{ cli }} venus-protocol-fetch
-    cargo nextest run -p helios-venus -p helios-venus-gen --features helios-venus/driver
-    # The HTTP client plugin's host unit, HTTP/2, and HTTP/3 tests.
-    cargo nextest run -p helios-http-client
-    # The shared async Nushell evaluator, Helios commands, and completion core.
-    cargo nextest run -p helios-nu
-    # The ACPI library runs QEMU's own CPU hotplug AML, from the pinned
-    # tables the fetch below hash-verifies.
     just acpi-tables-fetch
-    cargo nextest run -p helios-acpi
+    cargo nextest run -p helios-sync -p helios-unix -p helios-linux \
+        --features helios-sync/runtime,helios-unix/runtime,helios-linux/runtime
+    cargo nextest run -p helios-workspace-root --lib
+    # Batch the non-guest-world host library crates into one cargo invocation so
+    # compilation and linking run in parallel. Btrfs `mkfs.btrfs` tests need
+    # btrfs-progs and run in `test-btrfs-mkfs`.
+    cargo nextest run \
+        -p helios-firmware \
+        -p helios-tpm \
+        -p helios-inspector-protocol -p helios-wit-rpc \
+        -p helios-btrfs \
+        -p helios-venus -p helios-venus-gen \
+        -p helios-nu \
+        -p helios-acpi \
+        --features helios-btrfs/write,helios-venus/driver
+    # Guest programs with host unit tests select mutually exclusive `helios-api`
+    # WIT worlds and cannot share one feature-unified cargo invocation.
+    cargo nextest run -p helios-api --features hv
+    cargo nextest run -p helios-vmm
+    cargo nextest run -p helios-vmm-program
+    cargo nextest run -p helios-compositor-render -p helios-desktop-text-check
+    cargo nextest run -p helios-sysctl
+    cargo nextest run -p helios-http-client
     python3 "{{ repo_root }}/x86/tests/interrupt_state.py"
 
 test-host-tools:
@@ -231,15 +217,13 @@ test-host-tools:
         echo "compiler plugin wasm is missing: $plugin" >&2
         exit 1
     fi
-    cargo nextest run {{ host_tool_packages }}
-    HELIOS_COMPILER_PLUGIN_WASM="$plugin" cargo nextest run -p helios-compiler-host
+    HELIOS_COMPILER_PLUGIN_WASM="$plugin" cargo nextest run {{ host_tool_packages }}
 
 # Compile every test binary `test-host-tools` runs and run none of them; CI
 # runs it while the compiler plugin is still building, which only the
 # compiler-host test reads, when it runs.
 warm-test-host-tools:
     cargo nextest run --no-run {{ host_tool_packages }}
-    cargo nextest run --no-run -p helios-compiler-host
 
 # Mount the images `mkfs.btrfs --rootdir` builds, one per checksum type and
 # node size. Needs btrfs-progs on PATH; CI's test-libraries lane installs it.
