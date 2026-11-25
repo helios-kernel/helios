@@ -22,11 +22,14 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV
 use std::num::NonZeroU16;
 #[cfg(unix)]
 use std::path::Path;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
 use executor_core::LocalExecutor;
-use executor_core::async_task::{AsyncTask, spawn_local};
+use executor_core::async_task::{AsyncTask, Runnable, spawn_local};
 use futures_lite::stream::{Stream, once_future};
 #[cfg(unix)]
 use http_kit_io::DialUnix;
@@ -680,6 +683,134 @@ impl DatagramSocket for UdpSocket {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HeliosExecutor;
 
+/// Single-threaded wake state shared between a spawned `async_task::Runnable`,
+/// its completion guard, and the one [`DriveLocalTask`] polling it on the
+/// component-model executor.
+///
+/// Driving each spawned task through one persistent [`DriveLocalTask`] avoids
+/// calling `wit_bindgen::rt::async_support::spawn_local` from inside a
+/// `Waker`: a waker can fire while `wit_bindgen`'s `FuturesUnordered` is
+/// dropping its final task (which trips `assert!(!spawned)` on
+/// `Poll::Ready(None)`) or during teardown when no component task is active.
+/// Instead, the schedule callback stores the runnable and wakes the driver's
+/// `Waker` (delivered across component tasks via `inter-task-wakeup`).
+struct LocalTaskState {
+    runnable: Option<Runnable>,
+    waker: Option<Waker>,
+    done: bool,
+}
+
+impl LocalTaskState {
+    fn schedule(&mut self, runnable: Runnable) -> Option<Waker> {
+        self.runnable = Some(runnable);
+        self.waker.take()
+    }
+
+    fn finish(&mut self) -> Option<Waker> {
+        self.done = true;
+        self.waker.take()
+    }
+}
+
+struct DoneGuard(Arc<Mutex<LocalTaskState>>);
+
+impl Drop for DoneGuard {
+    fn drop(&mut self) {
+        let waker = self
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .finish();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+struct DriveLocalTask {
+    state: Arc<Mutex<LocalTaskState>>,
+}
+
+impl Drop for DriveLocalTask {
+    fn drop(&mut self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.waker = None;
+        state.runnable = None;
+    }
+}
+
+impl Future for DriveLocalTask {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let runnable = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Some(runnable) = state.runnable.take() {
+                Some(runnable)
+            } else if state.done {
+                return Poll::Ready(());
+            } else {
+                state.waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+        };
+        if let Some(runnable) = runnable {
+            runnable.run();
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.runnable.is_some() {
+            // Poll at most once per turn so self-waking tasks yield to sibling
+            // futures on the component executor rather than spinning in place.
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        } else if state.done {
+            Poll::Ready(())
+        } else {
+            state.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+fn build_local_task<Fut>(future: Fut) -> (DriveLocalTask, AsyncTask<Fut::Output>)
+where
+    Fut: Future + 'static,
+{
+    let state = Arc::new(Mutex::new(LocalTaskState {
+        runnable: None,
+        waker: None,
+        done: false,
+    }));
+    let guard = DoneGuard(Arc::clone(&state));
+    let schedule_state = Arc::clone(&state);
+    let (runnable, task) = spawn_local(
+        async move {
+            let _guard = guard;
+            future.await
+        },
+        move |runnable| {
+            let waker = schedule_state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .schedule(runnable);
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        },
+    );
+    runnable.schedule();
+    (DriveLocalTask { state }, task)
+}
+
 impl LocalExecutor for HeliosExecutor {
     type Task<T: 'static> = AsyncTask<T>;
 
@@ -687,23 +818,23 @@ impl LocalExecutor for HeliosExecutor {
     where
         Fut: Future + 'static,
     {
-        // Each wake-up schedules the task's next poll as a task of the
-        // component's own executor.
-        let (runnable, task) = spawn_local(future, |runnable| {
-            crate::task::spawn(async move {
-                runnable.run();
-            });
-        });
-        runnable.schedule();
+        let (driver, task) = build_local_task(future);
+        crate::task::spawn(driver);
         task
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::future::Future;
     use std::io;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
     use std::num::NonZeroU16;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
 
     use http_kit_io::RecvMeta;
 
@@ -874,5 +1005,138 @@ mod tests {
                 .expect("socket_error preserves SocketError inner error");
             assert!(inner.downcast_ref::<SocketError>().is_some());
         }
+    }
+
+    #[test]
+    fn drive_local_task_completes_across_external_wakes() {
+        struct FlagWaker(AtomicBool);
+        impl Wake for FlagWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let ready = Rc::new(Cell::new(false));
+        let waiter: Rc<RefCell<Option<Waker>>> = Rc::new(RefCell::new(None));
+        let ready_clone = Rc::clone(&ready);
+        let waiter_clone = Rc::clone(&waiter);
+
+        let (driver, task) = super::build_local_task(std::future::poll_fn(move |cx| {
+            if ready_clone.get() {
+                Poll::Ready(42u32)
+            } else {
+                *waiter_clone.borrow_mut() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }));
+        let mut driver = std::pin::pin!(driver);
+
+        let flag = Arc::new(FlagWaker(AtomicBool::new(false)));
+        let driver_waker = Waker::from(Arc::clone(&flag));
+        let mut cx = Context::from_waker(&driver_waker);
+
+        // First poll runs the spawned future once and parks without re-waking.
+        assert_eq!(driver.as_mut().poll(&mut cx), Poll::Pending);
+        assert!(!flag.0.load(Ordering::Relaxed));
+
+        // Waking the inner future from outside (as a Drop in another task does)
+        // wakes only the driver's Waker without spawning a new executor task.
+        ready.set(true);
+        waiter.borrow_mut().take().unwrap().wake();
+        assert!(flag.0.load(Ordering::Relaxed));
+
+        // Second poll completes both the inner future and the driver.
+        assert_eq!(driver.as_mut().poll(&mut cx), Poll::Ready(()));
+        assert_eq!(futures_lite::future::block_on(task), 42);
+    }
+
+    #[test]
+    fn drive_local_task_yields_once_per_poll_on_self_wake() {
+        struct CountWaker(AtomicUsize);
+        impl Wake for CountWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let polls = Rc::new(Cell::new(0usize));
+        let polls_clone = Rc::clone(&polls);
+        let (driver, task) = super::build_local_task(std::future::poll_fn(move |cx| {
+            let n = polls_clone.get() + 1;
+            polls_clone.set(n);
+            if n < 3 {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(n)
+            }
+        }));
+        let mut driver = std::pin::pin!(driver);
+        let counter = Arc::new(CountWaker(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(driver.as_mut().poll(&mut cx), Poll::Pending);
+        assert_eq!(polls.get(), 1);
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+
+        assert_eq!(driver.as_mut().poll(&mut cx), Poll::Pending);
+        assert_eq!(polls.get(), 2);
+        assert_eq!(counter.0.load(Ordering::Relaxed), 2);
+
+        assert_eq!(driver.as_mut().poll(&mut cx), Poll::Ready(()));
+        assert_eq!(polls.get(), 3);
+        assert_eq!(futures_lite::future::block_on(task), 3);
+    }
+
+    #[test]
+    fn drive_local_task_finishes_when_task_handle_is_dropped() {
+        struct FlagWaker(AtomicBool);
+        impl Wake for FlagWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let (driver, task) = super::build_local_task(std::future::pending::<()>());
+        let mut driver = std::pin::pin!(driver);
+        let flag = Arc::new(FlagWaker(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&flag));
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(driver.as_mut().poll(&mut cx), Poll::Pending);
+        assert!(!flag.0.load(Ordering::Relaxed));
+
+        drop(task);
+        assert!(flag.0.load(Ordering::Relaxed));
+        assert_eq!(driver.as_mut().poll(&mut cx), Poll::Ready(()));
+    }
+
+    #[test]
+    fn drive_local_task_ignores_wakes_after_driver_is_dropped() {
+        let waiter: Rc<RefCell<Option<Waker>>> = Rc::new(RefCell::new(None));
+        let waiter_clone = Rc::clone(&waiter);
+        let (driver, _task) = super::build_local_task(std::future::poll_fn(move |cx| {
+            *waiter_clone.borrow_mut() = Some(cx.waker().clone());
+            Poll::<()>::Pending
+        }));
+        let mut driver = Box::pin(driver);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        assert_eq!(driver.as_mut().poll(&mut cx), Poll::Pending);
+        drop(driver);
+
+        // Must not panic even when woken outside any executor context.
+        waiter.borrow_mut().take().unwrap().wake();
     }
 }
