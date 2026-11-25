@@ -16,7 +16,7 @@ const CASTAGNOLI: Crc<u32, Table<16>> = Crc::<u32, Table<16>>::new(&CRC_32_ISCSI
 const STREAM_MAGIC: &[u8; 13] = b"btrfs-stream\0";
 const STREAM_VERSION_1: u32 = 1;
 /// Maximum data chunk per `WRITE` command (`BTRFS_SEND_READ_SIZE`, fits in `u16` TLV length).
-const WRITE_CHUNK_BYTES: usize = 48 * 1024;
+pub(crate) const WRITE_CHUNK_BYTES: usize = 48 * 1024;
 
 mod cmd {
     pub const SUBVOL: u16 = 1;
@@ -165,14 +165,32 @@ impl BtrfsSendBuilder {
         self.push_cmd(cmd::RMDIR, |c| c.bytes(attr::PATH, rel_path.as_bytes()))
     }
 
+    /// Current encoded byte length of the buffered btrfs send stream.
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        self.out.len()
+    }
+
+    pub fn write_chunk(&mut self, rel_path: &str, offset: u64, chunk: &[u8]) -> Result<()> {
+        if chunk.len() > WRITE_CHUNK_BYTES {
+            return Err(OciError::SendStream {
+                detail: format!(
+                    "write chunk {} exceeds {WRITE_CHUNK_BYTES} bytes",
+                    chunk.len()
+                ),
+            });
+        }
+        self.push_cmd(cmd::WRITE, |c| {
+            c.bytes(attr::PATH, rel_path.as_bytes())?;
+            c.u64(attr::FILE_OFFSET, offset);
+            c.bytes(attr::DATA, chunk)
+        })
+    }
+
     pub fn write_all(&mut self, rel_path: &str, data: &[u8]) -> Result<()> {
         let mut offset = 0u64;
         for chunk in data.chunks(WRITE_CHUNK_BYTES) {
-            self.push_cmd(cmd::WRITE, |c| {
-                c.bytes(attr::PATH, rel_path.as_bytes())?;
-                c.u64(attr::FILE_OFFSET, offset);
-                c.bytes(attr::DATA, chunk)
-            })?;
+            self.write_chunk(rel_path, offset, chunk)?;
             offset += chunk.len() as u64;
         }
         Ok(())
