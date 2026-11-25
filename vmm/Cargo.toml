@@ -1,0 +1,20 @@
+[package]
+name = "helios-vmm"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+async-channel = { version = "2.5.0", default-features = false }
+futures-lite = { version = "2.6.1", default-features = false, features = ["alloc"] }
+helios-api = { path = "../api", default-features = false, features = ["hv", "io", "task"] }
+thiserror = { version = "2.0.21", default-features = false }
+tracing = { workspace = true }
+vm-fdt = { version = "0.3.0", default-features = false, features = ["std"] }
+zerocopy = { version = "0.8.57", default-features = false, features = ["derive"] }
+
+[dev-dependencies]
+futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,19 +1,20 @@
 [package]
-name = "helios-vmm"
+name = "helios-vmm-program"
 version = "0.1.0"
 edition.workspace = true
 autobins = false
 
+[package.metadata.helios]
+command = "vmm"
+
 [dependencies]
-helios-api = { path = "../../api", default-features = false, features = ["hv", "io", "task"] }
-thiserror = { version = "2.0.21", default-features = false }
 clap = { version = "4.6.6", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
-async-channel = { version = "2.5.0", default-features = false }
-futures-lite = { version = "2.6.1", default-features = false }
-vm-fdt = { version = "0.3.0", default-features = false, features = ["std"] }
+helios-api = { path = "../../api", default-features = false, features = ["hv", "io", "task"] }
+helios-vmm = { workspace = true }
+thiserror = { version = "2.0.21", default-features = false }
 
 [lib]
-name = "helios_vmm"
+name = "helios_vmm_program"
 path = "src/main.rs"
 crate-type = ["cdylib"]
 
