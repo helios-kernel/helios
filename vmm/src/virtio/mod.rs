@@ -75,6 +75,16 @@ impl Queue {
         *self = Self::default();
     }
 
+    /// Returns whether the guest has at least one unconsumed descriptor chain
+    /// posted to this queue's available ring.
+    pub fn has_available(&self, memory: &impl GuestMemory) -> Result<bool> {
+        if !self.ready {
+            return Ok(false);
+        }
+        let available = memory.read_u16(GuestPhysAddr::new(self.available + 2))?;
+        Ok(available != self.next_available)
+    }
+
     pub fn pop(&mut self, memory: &impl GuestMemory) -> Result<Option<Chain>> {
         if !self.ready {
             return Ok(None);

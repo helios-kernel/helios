@@ -220,6 +220,7 @@ pub struct Encoder<'a, R: ResourceEntry = core::convert::Infallible> {
     call: Option<&'a CallHandle>,
     resources: Option<&'a mut ResourceTableInner<R>>,
     outbound_subpaths: Vec<PendingOutboundSubpath>,
+    inserted_handles: Vec<u32>,
 }
 
 impl<'a, R: ResourceEntry> Encoder<'a, R> {
@@ -232,6 +233,7 @@ impl<'a, R: ResourceEntry> Encoder<'a, R> {
             call,
             resources,
             outbound_subpaths: Vec::new(),
+            inserted_handles: Vec::new(),
         }
     }
 
@@ -246,6 +248,15 @@ impl<'a, R: ResourceEntry> Encoder<'a, R> {
                 context: "Encoder::resources_mut".to_owned(),
                 detail: "resource table is unavailable in this encoding context".to_owned(),
             })
+    }
+
+    /// Inserts a newly exported `own<R>` resource into the connection table and
+    /// records its handle so encoding errors or cancelled response transmission
+    /// can roll it back without leaking table entries.
+    pub fn insert_resource(&mut self, value: R) -> Result<u32, WireError> {
+        let handle = self.resources_mut()?.insert(value)?;
+        self.inserted_handles.push(handle);
+        Ok(handle)
     }
 
     pub fn alloc_subpath_id(&self) -> Result<u32, WireError> {
@@ -264,6 +275,14 @@ impl<'a, R: ResourceEntry> Encoder<'a, R> {
 
     pub fn finish(self) -> (Vec<u8>, Vec<PendingOutboundSubpath>) {
         (self.bytes, self.outbound_subpaths)
+    }
+
+    pub(crate) fn finish_with_handles(self) -> (Vec<u8>, Vec<PendingOutboundSubpath>, Vec<u32>) {
+        (self.bytes, self.outbound_subpaths, self.inserted_handles)
+    }
+
+    pub(crate) fn take_inserted_handles(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.inserted_handles)
     }
 
     pub fn write_u8(&mut self, value: u8) {
@@ -537,26 +556,60 @@ where
     Ok(value)
 }
 
+/// Encoded server response payload plus the outbound sub-paths and `own<R>`
+/// resource handles inserted during encoding so callers can roll handles back
+/// if response transmission fails or is cancelled mid-`.await`.
+pub(crate) struct EncodedServerResponse {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) subpaths: Vec<PendingOutboundSubpath>,
+    pub(crate) inserted_handles: Vec<u32>,
+}
+
 /// Server-side helper to encode response values with access to the
-/// connection's [`ResourceTable`], releasing the table lock before `.await`.
-pub async fn encode_server_response<R, T>(
+/// connection's [`ResourceTable`], releasing the table lock before `.await` and
+/// rolling back any partially inserted handles if encoding itself fails.
+pub(crate) async fn encode_server_response<R, T>(
     call: &InboundCall,
     resources: &ResourceTable<R>,
     value: T,
-) -> Result<Vec<u8>, WireError>
+) -> Result<EncodedServerResponse, WireError>
 where
     R: ResourceEntry,
     T: RpcEncode<R>,
 {
     let handle = call.call_handle();
-    let (bytes, subpaths) = {
+    let encoded = {
         let mut table = resources.lock().await;
         let mut encoder = Encoder::new(Some(&handle), Some(&mut *table));
-        value.rpc_encode(&mut encoder)?;
-        encoder.finish()
+        match value.rpc_encode(&mut encoder) {
+            Ok(()) => {
+                let (bytes, subpaths, inserted_handles) = encoder.finish_with_handles();
+                Ok(EncodedServerResponse {
+                    bytes,
+                    subpaths,
+                    inserted_handles,
+                })
+            }
+            Err(err) => {
+                let handles = encoder.take_inserted_handles();
+                drop(encoder);
+                let mut rolled_back = Vec::with_capacity(handles.len());
+                for id in handles {
+                    if let Some(entry) = table.remove_unconditional(id) {
+                        rolled_back.push(entry);
+                    }
+                }
+                Err((err, rolled_back))
+            }
+        }
     };
-    activate_outbound_subpaths(&handle, subpaths).await;
-    Ok(bytes)
+    match encoded {
+        Ok(resp) => Ok(resp),
+        Err((err, rolled_back)) => {
+            drop(rolled_back);
+            Err(err)
+        }
+    }
 }
 
 /// Wire encoding contract for WIT values, handles, streams, and futures.

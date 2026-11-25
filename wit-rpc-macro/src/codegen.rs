@@ -1596,18 +1596,24 @@ fn generate_server_items(
             }
         };
 
-        let invoke_and_encode = match func.result {
+        let dispatch_body = match func.result {
             None => {
                 quote! {
-                    self.0.#handler_fn_ident(#(#call_arg_exprs),*).await;
+                    {
+                        #decode_stmt
+                        self.0.#handler_fn_ident(#(#call_arg_exprs),*).await;
+                    }
                     __ctx.encode_response(()).await
                 }
             }
             Some(ret_ty) => {
                 let wrapped_ret = server_to_wire_expr(ctx, ret_ty, quote!(__ret));
                 quote! {
-                    let __ret = self.0.#handler_fn_ident(#(#call_arg_exprs),*).await;
-                    let __wire_ret = #wrapped_ret;
+                    let __wire_ret = {
+                        #decode_stmt
+                        let __ret = self.0.#handler_fn_ident(#(#call_arg_exprs),*).await;
+                        #wrapped_ret
+                    };
                     __ctx.encode_response(__wire_ret).await
                 }
             }
@@ -1615,8 +1621,7 @@ fn generate_server_items(
 
         dispatch_arms.push(quote! {
             #wire_func => {
-                #decode_stmt
-                #invoke_and_encode
+                #dispatch_body
             }
         });
     }
@@ -1816,11 +1821,11 @@ fn generate_server_resource_enum(ctx: &IfaceContext<'_>) -> TokenStream {
                     self,
                     __enc: &mut #rt::__private::Encoder<'_, __R>,
                 ) -> ::core::result::Result<(), #rt::__private::WireError> {
-                    let __handle = __enc
-                        .resources_mut()?
-                        .insert(<__R as #rt::__private::ResourceSlotAccess<#marker, __H::#assoc>>::into_entry(
+                    let __handle = __enc.insert_resource(
+                        <__R as #rt::__private::ResourceSlotAccess<#marker, __H::#assoc>>::into_entry(
                             ::std::sync::Arc::new(self.0),
-                        ))?;
+                        ),
+                    )?;
                     __enc.write_u32(__handle);
                     ::core::result::Result::Ok(())
                 }

@@ -31,14 +31,14 @@ pub use manifest::{
 pub use model::{
     AuthorityScopeSpec, CapabilityCeiling, ClockRights, ComponentNode, ComponentStateRecord,
     ComponentStatus, ComponentTopology, ContainerMountSharingSpec, ContainerMountSpec, Criticality,
-    DEFAULT_BURST_LIMIT, DEFAULT_BURST_WINDOW_MS, DEFAULT_RESTART_BACKOFF_MAX_MS,
-    DEFAULT_RESTART_BACKOFF_MS, DEFAULT_SOCKET_BACKLOG, DEFAULT_STOP_TIMEOUT_MS, DeviceClasses,
-    DirectoryGrantSpec, EnvVarSpec, EscalationAction, ExecRunnerSpec, ExposeSpec, FsRights,
-    HardwareInventorySnapshot, HardwarePredicates, IpAddrSpec, LifecycleKind, LinkRights,
-    MachineRights, MountRights, MountSharingSpec, MountSourceSpec, MountSpec, NameCeiling,
-    NetRights, OciRunnerSpec, OomTier, PortCeiling, ProcessRights, ProviderSlot, RestartPolicy,
-    RouteSpec, RunnerSpec, SocketActivationSpec, StartupPolicy, TerminalRights, VmRunnerSpec,
-    VmShareSpec, WasmRunnerSpec, WasmSharding,
+    DEFAULT_BURST_LIMIT, DEFAULT_BURST_WINDOW_MS, DEFAULT_OCI_STORE_PATH,
+    DEFAULT_RESTART_BACKOFF_MAX_MS, DEFAULT_RESTART_BACKOFF_MS, DEFAULT_SOCKET_BACKLOG,
+    DEFAULT_STOP_TIMEOUT_MS, DeviceClasses, DirectoryGrantSpec, EnvVarSpec, EscalationAction,
+    ExecRunnerSpec, ExposeSpec, FsRights, HardwareInventorySnapshot, HardwarePredicates,
+    IpAddrSpec, LifecycleKind, LinkRights, MachineRights, MountRights, MountSharingSpec,
+    MountSourceSpec, MountSpec, NameCeiling, NetRights, OciRunnerSpec, OomTier, PortCeiling,
+    ProcessRights, ProviderSlot, RestartPolicy, RouteSpec, RunnerSpec, SocketActivationSpec,
+    StartupPolicy, TerminalRights, VmRunnerSpec, VmShareSpec, WasmRunnerSpec, WasmSharding,
 };
 pub use supervisor::{
     BoundSocket, ChildProcess, ExitOutcome, FatalEscalation, IpcChannelEnd, PendingEvent,

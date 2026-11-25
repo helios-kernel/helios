@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
+use std::rc::Rc;
 use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
@@ -242,14 +243,47 @@ enum SupervisorEvent<R: SupervisorRuntime> {
     IpcActivated {
         index: usize,
         generation: u64,
-        channel_name: String,
-        endpoint: R::IpcEnd,
     },
     RestartTimerFired {
         index: usize,
         generation: u64,
     },
     HardwareUpdated(HardwareInventorySnapshot),
+}
+
+/// Control messages sent to a per-exposed-channel IPC bridge task.
+enum BridgeMsg<I> {
+    AttachConsumer(I),
+    AttachProvider { generation: u64, proxy_end: I },
+    DetachProvider { next_generation: u64 },
+    ConsumerData { id: u64, bytes: Vec<u8> },
+    ConsumerClosed { id: u64 },
+    ProviderData { generation: u64, bytes: Vec<u8> },
+    ProviderClosed { generation: u64 },
+    Shutdown,
+}
+
+struct ExposedBridgeHandle<I> {
+    tx: Sender<BridgeMsg<I>>,
+}
+
+impl<I> Drop for ExposedBridgeHandle<I> {
+    fn drop(&mut self) {
+        let _ = self.tx.try_send(BridgeMsg::Shutdown);
+    }
+}
+
+type SocketReclaimReply<R> = Sender<
+    Vec<
+        BoundSocket<<R as SupervisorRuntime>::TcpListener, <R as SupervisorRuntime>::VsockListener>,
+    >,
+>;
+
+struct ArmedSockets<R: SupervisorRuntime> {
+    /// Send `Some(reply_tx)` to disarm and reclaim the bound sockets without rebinding,
+    /// or `None` to disarm and drop the bound sockets on component stop/teardown.
+    disarm_tx: Sender<Option<SocketReclaimReply<R>>>,
+    stopped_rx: Receiver<()>,
 }
 
 struct ManagedComponent<R: SupervisorRuntime> {
@@ -262,16 +296,21 @@ struct ManagedComponent<R: SupervisorRuntime> {
     instance_id: Option<u64>,
     generation: u64,
     consecutive_failures: u32,
+    /// Monotonic timestamp when this component last entered `Running`, used to
+    /// reset `consecutive_failures` after surviving at least `burst_window_ms`.
+    started_at_ms: Option<u64>,
     burst_timestamps_ms: VecDeque<u64>,
     mounted: bool,
-    /// Active stop signal sender for the running child/provider/watcher task.
+    /// True while a kernel provider slot handle is installed and monitored.
+    provider_installed: bool,
+    /// Active stop signal sender for the running child or provider watcher task.
     stop_tx: Option<Sender<()>>,
-    /// Confirmation receiver resolved once the running task finishes stopping.
+    /// Confirmation receiver resolved once the running child/provider task finishes stopping.
     stopped_rx: Option<Receiver<()>>,
-    /// Pending IPC endpoints queued for this component on its next launch.
-    pending_ipc: Vec<(String, R::IpcEnd)>,
-    /// True if a socket activation watcher is currently armed for this component.
-    socket_armed: bool,
+    /// Persistent IPC bridge tasks keyed by exposed channel name.
+    exposed_bridges: BTreeMap<String, ExposedBridgeHandle<R::IpcEnd>>,
+    /// Active lazy socket activation watcher holding pre-bound listening sockets.
+    armed_sockets: Option<ArmedSockets<R>>,
 }
 
 impl<R: SupervisorRuntime> ManagedComponent<R> {
@@ -284,12 +323,14 @@ impl<R: SupervisorRuntime> ManagedComponent<R> {
             instance_id: None,
             generation: 1,
             consecutive_failures: 0,
+            started_at_ms: None,
             burst_timestamps_ms: VecDeque::new(),
             mounted: false,
+            provider_installed: false,
             stop_tx: None,
             stopped_rx: None,
-            pending_ipc: Vec::new(),
-            socket_armed: false,
+            exposed_bridges: BTreeMap::new(),
+            armed_sockets: None,
         }
     }
 
@@ -332,6 +373,8 @@ pub struct Supervisor<R: SupervisorRuntime> {
     event_rx: Receiver<SupervisorEvent<R>>,
     /// Track whether `signal_ready` has been emitted.
     ready_signaled: bool,
+    /// True once `shutdown_all` has been invoked so `has_active_work()` returns `false`.
+    shutting_down: bool,
     /// Enclosing parent realm indices queued for teardown + restart after a
     /// `critical = "parent"` failure (drained iteratively to avoid async recursion).
     pending_realm_resets: VecDeque<usize>,
@@ -363,6 +406,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
             event_tx,
             event_rx,
             ready_signaled: false,
+            shutting_down: false,
             pending_realm_resets: VecDeque::new(),
             pending_eager_activations: VecDeque::new(),
             #[cfg(feature = "dynamic-components")]
@@ -551,7 +595,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                 ComponentStatus::Starting | ComponentStatus::Running
             )
         {
-            let sockets = self.bind_sockets_for(idx).await?;
+            let sockets = self.acquire_sockets_for(idx).await?;
             let ipc = self.prepare_consumer_routes(idx);
             self.activate_index(idx, sockets, ipc).await?;
             self.drain_pending_work().await?;
@@ -588,28 +632,55 @@ impl<R: SupervisorRuntime> Supervisor<R> {
 
     /// Gracefully stops every active running component in the topology.
     pub async fn shutdown_all(&mut self) {
+        self.shutting_down = true;
         let indices: Vec<usize> = (0..self.components.len())
             .rev()
             .filter(|&idx| self.components[idx].active)
             .collect();
         for idx in indices {
             self.stop_index(idx).await;
+            self.components[idx].exposed_bridges.clear();
         }
         self.publish_inspect();
     }
 
-    /// Returns `true` while any non-realm active component is running, starting,
-    /// or holding an armed lazy socket listener.
+    /// Returns `true` while any active component is running, starting, holding an
+    /// installed kernel provider slot, holding an armed lazy socket listener,
+    /// reachable via lazy IPC routes, or hosting dynamic mounts.
     #[must_use]
     pub fn has_active_work(&self) -> bool {
-        self.components.iter().any(|c| {
-            c.active
-                && !c.node.runner.is_realm()
-                && (c.socket_armed
-                    || (matches!(
-                        c.status,
-                        ComponentStatus::Starting | ComponentStatus::Running
-                    ) && !is_lazy_provider_slot(&c.node)))
+        if self.shutting_down {
+            return false;
+        }
+        self.components.iter().enumerate().any(|(idx, c)| {
+            if !c.active {
+                return false;
+            }
+            if c.node.dynamic_mount && self.ready_signaled {
+                return true;
+            }
+            if c.node.runner.is_realm() {
+                return false;
+            }
+            c.armed_sockets.is_some()
+                || c.provider_installed
+                || matches!(
+                    c.status,
+                    ComponentStatus::Starting | ComponentStatus::Running
+                )
+                || (c.node.startup == StartupPolicy::Lazy
+                    && (!c.exposed_bridges.is_empty() || self.is_ipc_route_target(idx)))
+        })
+    }
+
+    fn is_ipc_route_target(&self, provider_idx: usize) -> bool {
+        self.components.iter().any(|other| {
+            other.active
+                && other
+                    .node
+                    .routes
+                    .iter()
+                    .any(|r| r.provider_index == provider_idx)
         })
     }
 
@@ -640,7 +711,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                         .satisfied_by(&self.hardware)
                     && self.dependencies_satisfied(idx)
                 {
-                    let sockets = self.bind_sockets_for(idx).await?;
+                    let sockets = self.acquire_sockets_for(idx).await?;
                     let ipc = self.prepare_consumer_routes(idx);
                     self.activate_index(idx, sockets, ipc).await?;
                 }
@@ -697,7 +768,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                     .satisfied_by(&self.hardware)
                 && self.dependencies_satisfied(idx)
             {
-                let sockets = self.bind_sockets_for(idx).await?;
+                let sockets = self.acquire_sockets_for(idx).await?;
                 let ipc = self.prepare_consumer_routes(idx);
                 self.activate_index(idx, sockets, ipc).await?;
             } else if self.components[idx].node.startup == StartupPolicy::Lazy
@@ -733,7 +804,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
             if !self.dependencies_satisfied(idx) {
                 continue;
             }
-            let sockets = self.bind_sockets_for(idx).await?;
+            let sockets = self.acquire_sockets_for(idx).await?;
             let ipc = self.prepare_consumer_routes(idx);
             self.activate_index(idx, sockets, ipc).await?;
 
@@ -838,49 +909,169 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         Ok(bound)
     }
 
+    /// Reclaims already-bound listening sockets from an armed lazy socket watcher
+    /// when present (avoiding `AddrInUse`), or binds fresh sockets otherwise.
+    async fn acquire_sockets_for(
+        &mut self,
+        idx: usize,
+    ) -> Result<Vec<BoundSocket<R::TcpListener, R::VsockListener>>, SupervisorError> {
+        if let Some(armed) = self.components[idx].armed_sockets.take() {
+            let generation = self.components[idx].generation;
+            let (reply_tx, reply_rx) = async_channel::bounded(1);
+            let _ = armed.disarm_tx.send(Some(reply_tx)).await;
+            let reclaimed = reply_rx.recv().await.ok();
+            let _ = armed.stopped_rx.recv().await;
+            if let Some(sockets) = reclaimed {
+                return Ok(sockets);
+            }
+            // The watcher may have observed readiness and posted `SocketActivated`
+            // just before receiving disarm; recover those exact sockets from the queue.
+            if let Some(sockets) = self.take_queued_socket_activation(idx, generation) {
+                return Ok(sockets);
+            }
+        }
+        self.bind_sockets_for(idx).await
+    }
+
+    fn take_queued_socket_activation(
+        &self,
+        target_idx: usize,
+        target_generation: u64,
+    ) -> Option<Vec<BoundSocket<R::TcpListener, R::VsockListener>>> {
+        let mut preserved = Vec::new();
+        let mut found = None;
+        while let Ok(event) = self.event_rx.try_recv() {
+            match event {
+                SupervisorEvent::SocketActivated {
+                    index,
+                    generation,
+                    sockets,
+                } if index == target_idx && generation == target_generation && found.is_none() => {
+                    found = Some(sockets);
+                }
+                other => preserved.push(other),
+            }
+        }
+        for event in preserved {
+            let _ = self.event_tx.try_send(event);
+        }
+        found
+    }
+
+    async fn disarm_lazy_sockets(&mut self, idx: usize) {
+        if let Some(armed) = self.components[idx].armed_sockets.take() {
+            let _ = armed.disarm_tx.send(None).await;
+            let _ = armed.stopped_rx.recv().await;
+        }
+    }
+
     async fn arm_lazy_sockets(&mut self, idx: usize) -> Result<(), SupervisorError> {
-        if self.components[idx].socket_armed || self.components[idx].node.sockets.is_empty() {
+        if self.components[idx].armed_sockets.is_some()
+            || self.components[idx].node.sockets.is_empty()
+        {
             return Ok(());
         }
         let bound = self.bind_sockets_for(idx).await?;
         if bound.is_empty() {
             return Ok(());
         }
-        self.components[idx].socket_armed = true;
         let generation = self.components[idx].generation;
-        let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
+        let (disarm_tx, disarm_rx) = async_channel::bounded::<Option<SocketReclaimReply<R>>>(1);
         let (stopped_tx, stopped_rx) = async_channel::bounded::<()>(1);
-        self.components[idx].stop_tx = Some(stop_tx);
-        self.components[idx].stopped_rx = Some(stopped_rx);
+        self.components[idx].armed_sockets = Some(ArmedSockets {
+            disarm_tx,
+            stopped_rx,
+        });
         let event_tx = self.event_tx.clone();
 
         self.runtime.spawn_task(async move {
+            enum SocketWatchOutcome<T, V> {
+                Readable,
+                Disarmed(Option<Sender<Vec<BoundSocket<T, V>>>>),
+            }
+
             let mut sockets = bound;
-            let triggered = wait_any_socket_readable(&sockets)
-                .or(async {
-                    let _ = stop_rx.recv().await;
-                    false
-                })
-                .await;
-            if triggered {
-                let _ = event_tx
-                    .send(SupervisorEvent::SocketActivated {
-                        index: idx,
-                        generation,
-                        sockets: std::mem::take(&mut sockets),
-                    })
-                    .await;
+            let outcome = async {
+                if wait_any_socket_readable(&sockets).await {
+                    SocketWatchOutcome::Readable
+                } else {
+                    SocketWatchOutcome::Disarmed(None)
+                }
+            }
+            .or(async {
+                let reply = disarm_rx.recv().await.ok().flatten();
+                SocketWatchOutcome::Disarmed(reply)
+            })
+            .await;
+
+            match outcome {
+                SocketWatchOutcome::Readable => {
+                    let _ = event_tx
+                        .send(SupervisorEvent::SocketActivated {
+                            index: idx,
+                            generation,
+                            sockets: std::mem::take(&mut sockets),
+                        })
+                        .await;
+                }
+                SocketWatchOutcome::Disarmed(Some(reply_tx)) => {
+                    let _ = reply_tx.send(std::mem::take(&mut sockets)).await;
+                }
+                SocketWatchOutcome::Disarmed(None) => {}
             }
             let _ = stopped_tx.send(()).await;
         });
         Ok(())
     }
 
-    /// Pre-creates duplex IPC channels for every `[[use]]` route declared by `consumer_idx`.
+    /// Returns (creating on demand) the persistent supervisor-side IPC bridge
+    /// for `(provider_idx, channel_name)`.
+    fn ensure_exposed_bridge(
+        &mut self,
+        provider_idx: usize,
+        channel_name: &str,
+    ) -> Sender<BridgeMsg<R::IpcEnd>> {
+        if let Some(handle) = self.components[provider_idx]
+            .exposed_bridges
+            .get(channel_name)
+        {
+            return handle.tx.clone();
+        }
+        let generation = self.components[provider_idx].generation;
+        let (tx, rx) = async_channel::unbounded();
+        let bridge_tx = tx.clone();
+        let runtime = self.runtime.clone();
+        let event_tx = self.event_tx.clone();
+        self.runtime.spawn_task(run_exposed_channel_bridge(
+            provider_idx,
+            generation,
+            bridge_tx,
+            rx,
+            runtime,
+            event_tx,
+        ));
+        self.components[provider_idx].exposed_bridges.insert(
+            channel_name.to_owned(),
+            ExposedBridgeHandle { tx: tx.clone() },
+        );
+        tx
+    }
+
+    fn detach_exposed_bridges(&self, idx: usize) {
+        let next_generation = self.components[idx].generation;
+        for handle in self.components[idx].exposed_bridges.values() {
+            let _ = handle
+                .tx
+                .try_send(BridgeMsg::DetachProvider { next_generation });
+        }
+    }
+
+    /// Pre-creates duplex IPC channels for every `[[use]]` route declared by `consumer_idx`
+    /// and attaches each provider-side end to the target provider's persistent channel bridge.
     ///
-    /// If the target provider is lazy and currently `unstarted`, arms a zero-first-packet-loss
-    /// activation watcher on the provider side so the first incoming frame instantiates the
-    /// provider and delivers those exact bytes with zero loss.
+    /// Frames sent to an unstarted lazy provider are buffered with zero loss and trigger
+    /// lazy activation; frames sent to an already-running or restarted provider flow
+    /// immediately without stranding endpoints.
     fn prepare_consumer_routes(&mut self, consumer_idx: usize) -> Vec<(String, R::IpcEnd)> {
         let routes = self.components[consumer_idx].node.routes.clone();
         let mut consumer_ends = Vec::with_capacity(routes.len());
@@ -888,40 +1079,9 @@ impl<R: SupervisorRuntime> Supervisor<R> {
             let (client_end, server_end) = self.runtime.ipc_channel();
             consumer_ends.push((route.consumer_channel.to_string(), client_end));
 
-            let provider_idx = route.provider_index;
-            let provider_channel = route.provider_channel.to_string();
-            let provider = &mut self.components[provider_idx];
-            if provider.node.startup == StartupPolicy::Lazy
-                && provider.status == ComponentStatus::Unstarted
-            {
-                let generation = provider.generation;
-                let runtime = self.runtime.clone();
-                let event_tx = self.event_tx.clone();
-                self.runtime.spawn_task(async move {
-                    // Park on the first incoming IPC frame without instantiating the target.
-                    match server_end.read(IPC_PROXY_CHUNK_BYTES).await {
-                        Ok(Some(first_frame)) if !first_frame.is_empty() => {
-                            let (proxy_end, provider_end) = runtime.ipc_channel();
-                            // Buffer the first frame into the provider's channel immediately so
-                            // zero bytes are lost before or during instantiation.
-                            let _ = proxy_end.write(first_frame).await;
-                            let _ = event_tx
-                                .send(SupervisorEvent::IpcActivated {
-                                    index: provider_idx,
-                                    generation,
-                                    channel_name: provider_channel,
-                                    endpoint: provider_end,
-                                })
-                                .await;
-                            // Continue forwarding duplex traffic transparently between consumer and provider.
-                            pump_duplex_ipc(server_end, proxy_end).await;
-                        }
-                        _ => {}
-                    }
-                });
-            } else {
-                provider.pending_ipc.push((provider_channel, server_end));
-            }
+            let bridge_tx =
+                self.ensure_exposed_bridge(route.provider_index, route.provider_channel.as_ref());
+            let _ = bridge_tx.try_send(BridgeMsg::AttachConsumer(server_end));
         }
         consumer_ends
     }
@@ -941,9 +1101,6 @@ impl<R: SupervisorRuntime> Supervisor<R> {
             return Ok(());
         }
 
-        // Drain any pending IPC endpoints routed to this component.
-        ipc_channels.append(&mut self.components[idx].pending_ipc);
-        self.components[idx].socket_armed = false;
         self.components[idx].status = ComponentStatus::Starting;
         self.publish_inspect();
 
@@ -959,9 +1116,12 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                     let instance_id = provider.instance_id();
                     // Lazy provider slots (`compiler`, `http-client`) have no Wasm Store until first request.
                     self.components[idx].instance_id = instance_id;
+                    self.components[idx].provider_installed = true;
                     self.components[idx].status = if instance_id.is_some() {
+                        self.components[idx].started_at_ms = Some(self.runtime.now_ms());
                         ComponentStatus::Running
                     } else {
+                        self.components[idx].started_at_ms = None;
                         ComponentStatus::Unstarted
                     };
                     let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
@@ -1001,6 +1161,8 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                     return Ok(());
                 }
                 Err(error) => {
+                    self.components[idx].provider_installed = false;
+                    self.components[idx].started_at_ms = None;
                     self.components[idx].status = ComponentStatus::Failed;
                     self.publish_inspect();
                     return self
@@ -1014,6 +1176,17 @@ impl<R: SupervisorRuntime> Supervisor<R> {
             }
         }
 
+        // Wire every exposed channel on this component through its persistent bridge so
+        // pre-existing, concurrent, and future consumers all deliver seamlessly.
+        let mut pending_bridge_attachments = Vec::with_capacity(node.exposes.len());
+        for expose in node.exposes.iter() {
+            let channel_name = expose.channel.to_string();
+            let bridge_tx = self.ensure_exposed_bridge(idx, &channel_name);
+            let (proxy_end, provider_end) = self.runtime.ipc_channel();
+            ipc_channels.push((channel_name, provider_end));
+            pending_bridge_attachments.push((bridge_tx, proxy_end));
+        }
+
         // Standard component spawn (`wasm`, `oci`, `exec`, `vm`).
         let args = SpawnComponentArgs {
             node: node.clone(),
@@ -1024,7 +1197,14 @@ impl<R: SupervisorRuntime> Supervisor<R> {
             Ok(child) => {
                 let instance_id = child.instance_id();
                 self.components[idx].instance_id = instance_id;
+                self.components[idx].started_at_ms = Some(self.runtime.now_ms());
                 self.components[idx].status = ComponentStatus::Running;
+                for (bridge_tx, proxy_end) in pending_bridge_attachments {
+                    let _ = bridge_tx.try_send(BridgeMsg::AttachProvider {
+                        generation,
+                        proxy_end,
+                    });
+                }
                 let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
                 let (stopped_tx, stopped_rx) = async_channel::bounded::<()>(1);
                 self.components[idx].stop_tx = Some(stop_tx);
@@ -1053,6 +1233,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
             Err(error) => {
                 self.components[idx].status = ComponentStatus::Failed;
                 self.components[idx].instance_id = None;
+                self.components[idx].started_at_ms = None;
                 self.publish_inspect();
                 self.handle_termination(idx, false, format!("spawn failed: {error}"), None)
                     .await
@@ -1076,7 +1257,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                     })
                     .collect();
                 for idx in candidates {
-                    let sockets = self.bind_sockets_for(idx).await?;
+                    let sockets = self.acquire_sockets_for(idx).await?;
                     let ipc = self.prepare_consumer_routes(idx);
                     self.activate_index(idx, sockets, ipc).await?;
                 }
@@ -1093,33 +1274,25 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                 {
                     return Ok(());
                 }
-                self.components[index].stop_tx = None;
-                self.components[index].stopped_rx = None;
-                self.components[index].socket_armed = false;
+                self.components[index].armed_sockets = None;
                 let ipc = self.prepare_consumer_routes(index);
                 self.activate_index(index, sockets, ipc).await
             }
-            SupervisorEvent::IpcActivated {
-                index,
-                generation,
-                channel_name,
-                endpoint,
-            } => {
+            SupervisorEvent::IpcActivated { index, generation } => {
                 if index >= self.components.len()
                     || !self.components[index].active
                     || self.components[index].generation != generation
                 {
                     return Ok(());
                 }
-                if self.components[index].status == ComponentStatus::Unstarted {
-                    let sockets = self.bind_sockets_for(index).await?;
-                    let mut ipc = self.prepare_consumer_routes(index);
-                    ipc.push((channel_name, endpoint));
+                if matches!(
+                    self.components[index].status,
+                    ComponentStatus::Unstarted | ComponentStatus::Completed
+                ) {
+                    let sockets = self.acquire_sockets_for(index).await?;
+                    let ipc = self.prepare_consumer_routes(index);
                     self.activate_index(index, sockets, ipc).await
                 } else {
-                    self.components[index]
-                        .pending_ipc
-                        .push((channel_name, endpoint));
                     Ok(())
                 }
             }
@@ -1130,7 +1303,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                 {
                     return Ok(());
                 }
-                let sockets = self.bind_sockets_for(index).await?;
+                let sockets = self.acquire_sockets_for(index).await?;
                 let ipc = self.prepare_consumer_routes(index);
                 self.activate_index(index, sockets, ipc).await
             }
@@ -1145,11 +1318,13 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                 {
                     return Ok(());
                 }
+                self.components[index].provider_installed = false;
                 self.components[index].stop_tx = None;
                 self.components[index].stopped_rx = None;
                 let last_instance_id = self.components[index].instance_id.take();
                 match outcome {
                     ProviderOutcome::Replaced | ProviderOutcome::Stopped => {
+                        self.components[index].started_at_ms = None;
                         self.components[index].status = ComponentStatus::Unstarted;
                         self.publish_inspect();
                         Ok(())
@@ -1187,9 +1362,11 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                 }
                 self.components[index].stop_tx = None;
                 self.components[index].stopped_rx = None;
+                self.detach_exposed_bridges(index);
                 let last_instance_id = self.components[index].instance_id.take();
                 match outcome {
                     Ok(exit) if exit.is_operator_kill() => {
+                        self.components[index].started_at_ms = None;
                         self.components[index].status = ComponentStatus::Completed;
                         self.publish_inspect();
                         Ok(())
@@ -1220,6 +1397,14 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         reason: String,
         last_instance_id: Option<u64>,
     ) -> Result<(), SupervisorError> {
+        let now = self.runtime.now_ms();
+        let window_ms = self.components[idx].node.burst_window_ms;
+        if let Some(started_at_ms) = self.components[idx].started_at_ms.take()
+            && now.saturating_sub(started_at_ms) >= window_ms
+        {
+            self.components[idx].consecutive_failures = 0;
+        }
+
         let lifecycle = self.components[idx].node.lifecycle;
         let restart_policy = self.components[idx].node.restart;
 
@@ -1243,6 +1428,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         if !should_restart {
             if clean_success {
                 self.components[idx].status = ComponentStatus::Completed;
+                self.components[idx].consecutive_failures = 0;
                 self.publish_inspect();
                 // Re-arm lazy listening sockets when a lazy service stops cleanly.
                 if self.components[idx].node.startup == StartupPolicy::Lazy
@@ -1260,8 +1446,6 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         }
 
         // Enforce burst-window circuit breaker before scheduling a restart.
-        let now = self.runtime.now_ms();
-        let window_ms = self.components[idx].node.burst_window_ms;
         let limit = self.components[idx].node.burst_limit;
         let burst = &mut self.components[idx].burst_timestamps_ms;
         while let Some(&oldest) = burst.front() {
@@ -1376,13 +1560,12 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         // Stop descendants first, then parent.
         for &idx in subtree.iter().rev() {
             self.stop_index(idx).await;
-            self.components[idx].generation = self.components[idx].generation.wrapping_add(1);
             self.components[idx].status = ComponentStatus::Unstarted;
             self.components[idx].instance_id = None;
             self.components[idx].consecutive_failures = 0;
+            self.components[idx].started_at_ms = None;
             self.components[idx].burst_timestamps_ms.clear();
-            self.components[idx].socket_armed = false;
-            self.components[idx].pending_ipc.clear();
+            self.components[idx].provider_installed = false;
         }
         self.components[parent_idx].restarts =
             self.components[parent_idx].restarts.saturating_add(1);
@@ -1410,7 +1593,10 @@ impl<R: SupervisorRuntime> Supervisor<R> {
 
     async fn stop_index(&mut self, idx: usize) {
         self.components[idx].generation = self.components[idx].generation.wrapping_add(1);
-        self.components[idx].socket_armed = false;
+        self.disarm_lazy_sockets(idx).await;
+        self.detach_exposed_bridges(idx);
+        self.components[idx].provider_installed = false;
+        self.components[idx].started_at_ms = None;
         let stop_tx = self.components[idx].stop_tx.take();
         let stopped_rx = self.components[idx].stopped_rx.take();
         if let Some(tx) = stop_tx {
@@ -1566,8 +1752,7 @@ impl<R: SupervisorRuntime> Supervisor<R> {
             self.stop_index(idx).await;
             self.components[idx].active = false;
             self.components[idx].status = ComponentStatus::Completed;
-            self.components[idx].pending_ipc.clear();
-            self.components[idx].socket_armed = false;
+            self.components[idx].exposed_bridges.clear();
         }
         self.publish_inspect();
         Ok(())
@@ -1648,31 +1833,190 @@ async fn wait_one_socket<T: TcpSocketListener, V: VsockSocketListener>(
     }
 }
 
-/// Pumps bytes bidirectionally between `left` and `right` until both halves close.
-async fn pump_duplex_ipc<I: IpcChannelEnd>(left: I, right: I) {
-    let a_to_b = async {
-        while let Ok(Some(bytes)) = left.read(IPC_PROXY_CHUNK_BYTES).await {
-            if bytes.is_empty() {
-                continue;
+/// Persistent supervisor-side duplex IPC bridge for one exposed channel on a provider.
+///
+/// Decouples consumer connections from provider process lifetimes so:
+/// - Lazy unstarted providers activate on the first incoming consumer frame with zero byte loss,
+/// - Concurrent consumers attaching before or during activation all deliver cleanly,
+/// - Consumers connecting to an already-running or restarted provider route immediately without hanging.
+async fn run_exposed_channel_bridge<R: SupervisorRuntime>(
+    provider_idx: usize,
+    initial_generation: u64,
+    bridge_tx: Sender<BridgeMsg<R::IpcEnd>>,
+    bridge_rx: Receiver<BridgeMsg<R::IpcEnd>>,
+    runtime: R,
+    event_tx: Sender<SupervisorEvent<R>>,
+) {
+    struct ActiveProvider {
+        generation: u64,
+        write_tx: Sender<Vec<u8>>,
+    }
+
+    let mut expected_generation = initial_generation;
+    let mut activation_requested = false;
+    let mut active_provider: Option<ActiveProvider> = None;
+    let mut next_consumer_id: u64 = 1;
+    let mut consumers: BTreeMap<u64, Sender<Vec<u8>>> = BTreeMap::new();
+    let mut active_consumer: Option<u64> = None;
+    let mut pending_frames: VecDeque<(u64, Vec<u8>)> = VecDeque::new();
+
+    while let Ok(msg) = bridge_rx.recv().await {
+        match msg {
+            BridgeMsg::Shutdown => break,
+            BridgeMsg::AttachConsumer(server_end) => {
+                let id = next_consumer_id;
+                next_consumer_id = next_consumer_id.saturating_add(1);
+                let ep = Rc::new(server_end);
+                let (reply_tx, reply_rx) = async_channel::unbounded::<Vec<u8>>();
+                consumers.insert(id, reply_tx);
+
+                let reader_ep = Rc::clone(&ep);
+                let reader_tx = bridge_tx.clone();
+                runtime.spawn_task(async move {
+                    while let Ok(Some(bytes)) = reader_ep.read(IPC_PROXY_CHUNK_BYTES).await {
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        if reader_tx
+                            .send(BridgeMsg::ConsumerData { id, bytes })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    let _ = reader_tx.send(BridgeMsg::ConsumerClosed { id }).await;
+                });
+
+                runtime.spawn_task(async move {
+                    while let Ok(bytes) = reply_rx.recv().await {
+                        if ep.write(bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    ep.close_write();
+                });
             }
-            if right.write(bytes).await.is_err() {
-                break;
+            BridgeMsg::ConsumerData { id, bytes } => {
+                if !consumers.contains_key(&id) {
+                    continue;
+                }
+                if let Some(provider) = active_provider.as_ref() {
+                    active_consumer = Some(id);
+                    if provider.write_tx.send(bytes.clone()).await.is_err() {
+                        active_provider = None;
+                        pending_frames.push_back((id, bytes));
+                        if !activation_requested {
+                            activation_requested = true;
+                            let _ = event_tx
+                                .send(SupervisorEvent::IpcActivated {
+                                    index: provider_idx,
+                                    generation: expected_generation,
+                                })
+                                .await;
+                        }
+                    }
+                } else {
+                    pending_frames.push_back((id, bytes));
+                    if !activation_requested {
+                        activation_requested = true;
+                        let _ = event_tx
+                            .send(SupervisorEvent::IpcActivated {
+                                index: provider_idx,
+                                generation: expected_generation,
+                            })
+                            .await;
+                    }
+                }
+            }
+            BridgeMsg::ConsumerClosed { id } => {
+                consumers.remove(&id);
+                if active_consumer == Some(id) {
+                    active_consumer = consumers.keys().next().copied();
+                }
+            }
+            BridgeMsg::AttachProvider {
+                generation,
+                proxy_end,
+            } => {
+                expected_generation = generation;
+                activation_requested = false;
+                drop(active_provider.take());
+
+                let ep = Rc::new(proxy_end);
+                let (write_tx, write_rx) = async_channel::unbounded::<Vec<u8>>();
+
+                let reader_ep = Rc::clone(&ep);
+                let reader_tx = bridge_tx.clone();
+                runtime.spawn_task(async move {
+                    while let Ok(Some(bytes)) = reader_ep.read(IPC_PROXY_CHUNK_BYTES).await {
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        if reader_tx
+                            .send(BridgeMsg::ProviderData { generation, bytes })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    let _ = reader_tx
+                        .send(BridgeMsg::ProviderClosed { generation })
+                        .await;
+                });
+
+                runtime.spawn_task(async move {
+                    while let Ok(bytes) = write_rx.recv().await {
+                        if ep.write(bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    ep.close_write();
+                });
+
+                while let Some((cid, frame)) = pending_frames.pop_front() {
+                    if consumers.contains_key(&cid) {
+                        active_consumer = Some(cid);
+                    }
+                    if write_tx.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+                active_provider = Some(ActiveProvider {
+                    generation,
+                    write_tx,
+                });
+            }
+            BridgeMsg::DetachProvider { next_generation } => {
+                expected_generation = next_generation;
+                active_provider = None;
+                activation_requested = false;
+            }
+            BridgeMsg::ProviderData { generation, bytes } => {
+                if !active_provider
+                    .as_ref()
+                    .is_some_and(|provider| provider.generation == generation)
+                {
+                    continue;
+                }
+                let target = active_consumer.or_else(|| consumers.keys().next().copied());
+                if let Some(cid) = target
+                    && let Some(reply_tx) = consumers.get(&cid)
+                {
+                    let _ = reply_tx.send(bytes).await;
+                }
+            }
+            BridgeMsg::ProviderClosed { generation } => {
+                if active_provider
+                    .as_ref()
+                    .is_some_and(|provider| provider.generation == generation)
+                {
+                    active_provider = None;
+                }
             }
         }
-        right.close_write();
-    };
-    let b_to_a = async {
-        while let Ok(Some(bytes)) = right.read(IPC_PROXY_CHUNK_BYTES).await {
-            if bytes.is_empty() {
-                continue;
-            }
-            if left.write(bytes).await.is_err() {
-                break;
-            }
-        }
-        left.close_write();
-    };
-    future::zip(a_to_b, b_to_a).await;
+    }
 }
 
 /// Drives a running child handle until it exits naturally OR `stop_rx` triggers
