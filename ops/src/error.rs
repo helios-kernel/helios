@@ -25,6 +25,8 @@ pub enum OpsError {
     Http(#[from] HttpError),
     #[error("{0}")]
     Bundle(#[from] BundleError),
+    #[error("{0}")]
+    Oci(#[from] helios_oci::OciError),
     #[error("timed out waiting for {operation}")]
     TimedOut { operation: &'static str },
     #[error("remote RPC `{operation}` failed: {source}")]
