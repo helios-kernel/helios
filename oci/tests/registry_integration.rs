@@ -354,8 +354,12 @@ fn build_layer0_tar() -> Vec<u8> {
         0,
         &[],
     );
-    // SUID + security.capability binary!
-    let cap_bytes = [0x01, 0x00, 0x00, 0x02, 0x00, 0x20, 0x00, 0x00];
+    // SUID + real 20-byte Linux `struct vfs_cap_data` (`VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE`,
+    // `CAP_NET_RAW = 1 << 13`; `include/uapi/linux/capability.h`).
+    let cap_bytes: [u8; 20] = [
+        0x01, 0x00, 0x00, 0x02, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
     append_pax_file(
         &mut builder,
         "usr/bin/ping",
@@ -631,7 +635,12 @@ fn pulls_multi_arch_bearer_gzip_and_zstd_whiteouts_cjk_and_chain_id_cache() {
         assert_eq!(ping.mode, 0o4755);
         assert_eq!(
             ping.xattrs.get("security.capability").map(Vec::as_slice),
-            Some(&[0x01, 0x00, 0x00, 0x02, 0x00, 0x20, 0x00, 0x00][..])
+            Some(
+                &[
+                    0x01, 0x00, 0x00, 0x02, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                ][..]
+            )
         );
         let app_dir = top_meta.entries.get("app").expect("app dir meta");
         assert_eq!(app_dir.mode, 0o2755);

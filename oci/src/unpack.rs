@@ -1890,6 +1890,21 @@ pub(crate) fn set_writable_for_unpack(path: &Path) {
 }
 
 #[cfg(unix)]
+fn is_ignorable_xattr_set_error(name: &str, err: &io::Error) -> bool {
+    if is_ignorable_metadata_error(err) {
+        return true;
+    }
+    // Host kernel LSM/capability validators (`cap_convert_nscap`, SELinux, POSIX ACLs)
+    // reject foreign-kernel `security.*` / `system.*` / `trusted.*` blobs with `EINVAL`
+    // during unprivileged directory-backend extraction while `LayerMetadataIndex` and
+    // btrfs send streams preserve the exact raw bytes.
+    err.raw_os_error() == Some(libc::EINVAL)
+        && (name.starts_with("security.")
+            || name.starts_with("system.")
+            || name.starts_with("trusted."))
+}
+
+#[cfg(unix)]
 fn is_ignorable_metadata_error(err: &io::Error) -> bool {
     if matches!(
         err.kind(),
@@ -2232,7 +2247,7 @@ fn apply_unix_metadata(
                 };
                 if rc != 0 {
                     let err = io::Error::last_os_error();
-                    if !is_ignorable_metadata_error(&err) {
+                    if !is_ignorable_xattr_set_error(name, &err) {
                         return Err(OciError::Io {
                             operation: "set extended attribute",
                             path: path.to_path_buf(),
@@ -2256,7 +2271,7 @@ fn apply_unix_metadata(
                 };
                 if rc != 0 {
                     let err = io::Error::last_os_error();
-                    if !is_ignorable_metadata_error(&err) {
+                    if !is_ignorable_xattr_set_error(name, &err) {
                         return Err(OciError::Io {
                             operation: "set extended attribute",
                             path: path.to_path_buf(),
