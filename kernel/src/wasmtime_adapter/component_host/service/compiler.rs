@@ -64,6 +64,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
+    pub(super) generation: u64,
     pub(super) instance_pre: Arc<InstancePre<CompilerCoreStore<CpuImpl, Net, StorageImpl>>>,
     pub(super) shared: Arc<SharedMemoryCoreShared<CompilerCoreStore<CpuImpl, Net, StorageImpl>>>,
     /// The linker-reserved main-thread TLS block, initialised once by the

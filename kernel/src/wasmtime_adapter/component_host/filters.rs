@@ -23,7 +23,7 @@ use crate::{
     TraceLevel,
 };
 
-use super::{debugger_wit, program_wit};
+use super::program_wit;
 
 /// `helios:system/tracing.level`.
 #[derive(ComponentType, Lift)]
@@ -199,28 +199,17 @@ macro_rules! impl_filter_error_conversion {
     };
 }
 
-impl_filter_error_conversion!(debugger_wit);
 impl_filter_error_conversion!(program_wit);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A guest that is refused learns the limit, in both worlds' own
-    /// `filter-error` types.
     #[test]
     fn a_refusal_names_the_limit_it_exceeded() {
         let count = crate::MAX_FILTER_PREFIXES as u32;
         let bytes = crate::MAX_FILTER_PREFIX_BYTES as u32;
 
-        assert!(matches!(
-            debugger_wit::filters::FilterError::from(PrefixSetError::TooManyPrefixes),
-            debugger_wit::filters::FilterError::TooManyPrefixes(limit) if limit == count
-        ));
-        assert!(matches!(
-            debugger_wit::filters::FilterError::from(PrefixSetError::PrefixTooLong),
-            debugger_wit::filters::FilterError::PrefixTooLong(limit) if limit == bytes
-        ));
         assert!(matches!(
             program_wit::filters::FilterError::from(PrefixSetError::TooManyPrefixes),
             program_wit::filters::FilterError::TooManyPrefixes(limit) if limit == count

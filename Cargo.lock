@@ -3064,6 +3064,7 @@ dependencies = [
  "futures-lite",
  "helios-api-macro",
  "helios-hal",
+ "helios-oci",
  "http-kit-io",
  "thiserror 2.0.21",
  "wit-bindgen 0.63.0",
@@ -3626,6 +3627,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-oci"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "async-net",
+ "base64 0.22.1",
+ "crc",
+ "flate2",
+ "futures-lite",
+ "helios-btrfs",
+ "libc",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+ "zenwave",
+ "zrip-core",
+ "zrip-decode",
+ "zrip-encode",
+]
+
+[[package]]
 name = "helios-oob-load"
 version = "0.1.0"
 dependencies = [
@@ -3644,6 +3671,7 @@ dependencies = [
  "futures-io",
  "futures-lite",
  "helios-inspector-protocol",
+ "helios-oci",
  "serde",
  "serde_json",
  "serialport",
@@ -3872,6 +3900,7 @@ dependencies = [
  "async-channel",
  "futures-lite",
  "helios-api",
+ "helios-oci",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",

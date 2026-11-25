@@ -1,26 +1,22 @@
-//! Shared runner, lifecycle step, and instantiation helpers for WASI 0.3 kernel
-//! plugins.
-//!
-//! Two kinds of WASI 0.3 kernel plugins live under `service/`:
-//! - Singleton plugins with exclusive hardware ownership (such as `compositor`)
-//!   that run one instance via [`crate::ProviderSlot`].
-//! - Per-processor sharded plugins (such as `http-client`) that share one
-//!   precompiled [`PreparedComponent`] across all cores while lazily running a
-//!   core-local `Store` on every processor serving [`PerProcessorProvider`].
+//! Shared per-processor shard runner, lifecycle step, and store helpers for
+//! root-supervisor-managed kernel providers.
 //!
 //! # Concurrency contract
 //!
-//! - [`PerProcessorPluginStep`] is `!Send` (holds `RefCell` around this
+//! - [`PerProcessorHttpStep`] is `!Send` (holds `RefCell` around this
 //!   processor's local task handle) and lives exclusively on the processor it
 //!   starts on, matching [`super::NetworkStep`].
-//! - `in_flight` tracks active dispatched requests inside this shard's `Store`
-//!   on the owning processor alone (no cross-core contention).
+//! - `in_flight` tracks active dispatched HTTP exchanges inside this shard's
+//!   `Store` on the owning processor alone (no cross-core contention).
 //! - `offline(successor)` refuses with [`OfflineRefusal::PinnedTasks`] while
 //!   `in_flight > 0`; once idle (`0`), it atomically marks this shard
-//!   redirected in [`PerProcessorProvider`], forwards queued un-popped requests
-//!   to `successor`, and cancels the local supervisor task so `ExecutorStep`
-//!   drops the idle `Store` (flushing socket FINs through `NetworkStep`) and
-//!   clears `local_live`.
+//!   redirected in [`PerProcessorProvider`], forwards queued un-popped
+//!   exchanges to `successor`, and cancels the local shard task so
+//!   `ExecutorStep` drops the idle `Store` (flushing socket FINs through
+//!   `NetworkStep`) before executor teardown.
+//! - Provider activation, hot-replacement, and deactivation are driven purely
+//!   by the root supervisor through `helios:system/root-supervisor`; no plugin
+//!   path, authority, or restart loop is hardcoded here.
 
 use alloc::sync::Arc as AllocArc;
 use core::cell::RefCell;
@@ -30,50 +26,38 @@ use crossbeam_utils::CachePadded;
 use helios_hal::cpu::{Cpu, ProcessorId, current_processor};
 use helios_hal::measured_boot::MeasuredBoot;
 use helios_hal::watchdog::Watchdog;
-use wasmtime::component::{Accessor, Instance, InstancePre, ResourceTable};
+use wasmtime::component::{Accessor, ResourceTable};
 
+use super::root_supervisor::HttpProviderRegistration;
 use super::*;
-use crate::PerProcessorProvider;
 use crate::exec::{LocalJoinHandle, OfflineRefusal, PinnedTasks, ProcessorStep};
 use crate::wasmtime_adapter::preemption::StoreInterrupts;
+use crate::wasmtime_adapter::wasi::WasiRequest;
+use crate::wasmtime_adapter::wasi::http::kernel_error_code;
+use crate::wasmtime_adapter::wasi::http_bindings::{HttpHost, exports};
+use crate::{HttpErrorCode, HttpExchange, OomPolicy};
 
-/// Prepares one bootfs plugin artifact into a shared [`PreparedComponent`].
-pub(super) fn load_kernel_plugin_instance_pre<CpuImpl, Net, StorageImpl>(
-    service: &UserProgramService<CpuImpl, Net, StorageImpl>,
-    bootfs_path: &str,
-    artifact: &BootfsBytes,
-    write_serial: crate::DebugSerialWriter,
-    started_at: u64,
-) -> Result<PreparedComponent<CpuImpl, Net, StorageImpl>, ProgramExecError>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let payload = trusted_bootfs_payload(artifact);
-    service.load_precompiled_component(
-        bootfs_path,
-        payload,
-        write_serial,
-        started_at,
-        &phases::Timeline::disabled(),
-    )
-}
+/// Per-processor HTTP exchanges that may be queued before `wasi:http/client.send`
+/// applies backpressure to callers on that core.
+pub(super) const HTTP_PROVIDER_QUEUE_DEPTH: usize = 16;
 
-/// Identity and capability settings for instantiating one kernel plugin store.
-pub(super) struct KernelPluginSpec<'a> {
+/// Identity, memory-policy, and capability settings for instantiating one
+/// root-supervisor-managed provider store.
+pub(super) struct ProviderStoreSpec<'a> {
     pub(super) instance_name: &'a str,
     pub(super) bootfs_path: &'a str,
     pub(super) authority: ProcessAuthority,
+    pub(super) oom_policy: OomPolicy,
     pub(super) started_at: u64,
 }
 
-/// Allocates a [`Store`] with `TaskFunding::Kernel`, `OomPolicy::KernelPlugin`,
-/// and the caller-supplied authority.
-pub(super) fn open_kernel_plugin_store<CpuImpl, Net, StorageImpl>(
+/// Allocates a [`wasmtime::Store`] for a root-supervisor-managed provider with
+/// its bounded [`OomPolicy`], derived [`crate::TaskFunding`], and attenuated
+/// [`ProcessAuthority`].
+pub(super) fn open_provider_store<CpuImpl, Net, StorageImpl>(
     service: &UserProgramService<CpuImpl, Net, StorageImpl>,
     exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
-    spec: KernelPluginSpec<'_>,
+    spec: ProviderStoreSpec<'_>,
 ) -> (
     wasmtime::Store<StoreData<CpuImpl, Net, StorageImpl>>,
     StoreInterrupts<CpuImpl>,
@@ -85,10 +69,11 @@ where
     StorageImpl: crate::Storage,
 {
     let registry = exec_context.runtime_state.instance_registry();
-    let instance = registry.register_with_policy(
+    let instance = registry.register_child_with_policy(
+        exec_context.parent_instance_id,
         spec.instance_name,
         spec.started_at,
-        crate::OomPolicy::KernelPlugin,
+        spec.oom_policy,
     );
     let instance_id = instance.id();
     let (store, interrupts) = crate::wasmtime_adapter::store_with_state(
@@ -97,11 +82,9 @@ where
             ResourceTable::new(),
             exec_context.cpu.clone(),
             exec_context.timer.clone(),
-            // Kernel plugins draw from the arena's kernel reserve so user-mode
-            // load cannot starve core infrastructure.
             exec_context
                 .spawner
-                .instance_spawner(crate::TaskFunding::Kernel, &instance),
+                .instance_spawner(spec.oom_policy.task_funding(), &instance),
             exec_context.runtime_state.clone(),
             registry,
             instance,
@@ -118,13 +101,13 @@ where
 }
 
 /// RAII guard keeping a shard's in-flight request count elevated until the
-/// dispatched plugin task completes, traps, or drops.
+/// dispatched provider task completes, traps, or drops.
 pub(super) struct PluginInFlight {
     count: AllocArc<CachePadded<AtomicUsize>>,
 }
 
 impl PluginInFlight {
-    fn acquire(count: &AllocArc<CachePadded<AtomicUsize>>) -> Self {
+    pub(super) fn acquire(count: &AllocArc<CachePadded<AtomicUsize>>) -> Self {
         count.fetch_add(1, Ordering::AcqRel);
         Self {
             count: count.clone(),
@@ -139,50 +122,14 @@ impl Drop for PluginInFlight {
     }
 }
 
-/// Contract implemented by each per-processor sharded WASI 0.3 kernel plugin.
-pub(super) trait PerProcessorWasiPlugin<CpuImpl, Net, StorageImpl>:
-    Clone + Send + Sync + 'static
+/// Core-local lifecycle step driving whichever per-processor `wasi:http/client`
+/// provider the root supervisor currently has installed.
+pub(super) struct PerProcessorHttpStep<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    type Request: Send + 'static;
-    type Guest: Clone + 'static;
-
-    fn bootfs_path(&self) -> &'static str;
-    fn instance_name(&self) -> &'static str;
-    fn authority(&self) -> ProcessAuthority;
-    fn provider<'a>(
-        &'a self,
-        runtime_state: &'a HostRuntimeState<CpuImpl, Net, StorageImpl>,
-    ) -> &'a PerProcessorProvider<Self::Request>;
-    fn precompiled<'a>(
-        &self,
-        service: &'a UserProgramService<CpuImpl, Net, StorageImpl>,
-    ) -> Option<&'a InstancePre<StoreData<CpuImpl, Net, StorageImpl>>>;
-    fn bind_guest(
-        &self,
-        store: &mut wasmtime::Store<StoreData<CpuImpl, Net, StorageImpl>>,
-        instance: &Instance,
-    ) -> Result<Self::Guest, wasmtime::Error>;
-    fn dispatch(
-        &self,
-        accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
-        guest: &Self::Guest,
-        request: Self::Request,
-        in_flight: PluginInFlight,
-    ) -> wasmtime::Result<()>;
-}
-
-/// Core-local supervisor step for a sharded WASI 0.3 kernel plugin.
-pub(super) struct PerProcessorPluginStep<P, CpuImpl, Net, StorageImpl>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    plugin: P,
     debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     cpu: CpuImpl,
     spawner: crate::Spawner<CpuImpl>,
@@ -191,26 +138,26 @@ where
     supervisor: RefCell<Option<LocalJoinHandle<()>>>,
 }
 
-impl<P, CpuImpl, Net, StorageImpl> PerProcessorPluginStep<P, CpuImpl, Net, StorageImpl>
+impl<CpuImpl, Net, StorageImpl> PerProcessorHttpStep<CpuImpl, Net, StorageImpl>
 where
-    P: PerProcessorWasiPlugin<CpuImpl, Net, StorageImpl>,
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    /// Starts this processor's lazy plugin shard on boot bring-up.
+    /// Starts this processor's lazy HTTP shard listener on boot bring-up.
+    ///
+    /// Parks with zero stores allocated until the root supervisor installs an
+    /// HTTP provider and an exchange arrives on this processor.
     pub(super) fn start<WatchdogImpl, MeasuredBootImpl>(
         cpu: &CpuImpl,
         kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
         debug_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
-        plugin: P,
     ) -> Self
     where
         WatchdogImpl: Watchdog + Clone,
         MeasuredBootImpl: MeasuredBoot,
     {
         let step = Self {
-            plugin,
             debug_state: debug_state.clone(),
             cpu: cpu.clone(),
             spawner: kernel.spawner(),
@@ -223,33 +170,20 @@ where
     }
 
     fn online_on(&self, processor: ProcessorId) {
-        self.plugin
-            .provider(&self.debug_state)
-            .activate_shard(processor);
-        let plugin = self.plugin.clone();
+        self.debug_state.http_client().activate_shard(processor);
         let debug_state = self.debug_state.clone();
         let cpu = self.cpu.clone();
         let spawner = self.spawner.clone();
         let timer = self.timer.clone();
         let in_flight = self.in_flight.clone();
         let handle = self.spawner.spawn_local(async move {
-            run_shard_supervisor(
-                plugin,
-                debug_state,
-                cpu,
-                spawner,
-                timer,
-                processor,
-                in_flight,
-            )
-            .await;
+            run_http_shard_loop(debug_state, cpu, spawner, timer, processor, in_flight).await;
         });
         let previous = self.supervisor.replace(Some(handle));
         assert!(
             previous.is_none(),
-            "processor {} started {} shard supervisor twice",
+            "processor {} started http shard supervisor twice",
             processor.id(),
-            self.plugin.instance_name(),
         );
     }
 
@@ -262,18 +196,16 @@ where
         if live != 0 {
             return Err(OfflineRefusal::PinnedTasks(PinnedTasks { processor, live }));
         }
-        self.plugin
-            .provider(&self.debug_state)
+        self.debug_state
+            .http_client()
             .redirect_shard(processor, successor);
         drop(self.supervisor.borrow_mut().take());
         Ok(())
     }
 }
 
-impl<P, CpuImpl, Net, StorageImpl> ProcessorStep
-    for PerProcessorPluginStep<P, CpuImpl, Net, StorageImpl>
+impl<CpuImpl, Net, StorageImpl> ProcessorStep for PerProcessorHttpStep<CpuImpl, Net, StorageImpl>
 where
-    P: PerProcessorWasiPlugin<CpuImpl, Net, StorageImpl>,
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
@@ -303,8 +235,7 @@ where
     }
 }
 
-async fn run_shard_supervisor<P, CpuImpl, Net, StorageImpl>(
-    plugin: P,
+async fn run_http_shard_loop<CpuImpl, Net, StorageImpl>(
     debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     cpu: CpuImpl,
     spawner: crate::Spawner<CpuImpl>,
@@ -312,15 +243,11 @@ async fn run_shard_supervisor<P, CpuImpl, Net, StorageImpl>(
     processor: ProcessorId,
     in_flight: AllocArc<CachePadded<AtomicUsize>>,
 ) where
-    P: PerProcessorWasiPlugin<CpuImpl, Net, StorageImpl>,
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
     let service = debug_state.wait_for_program_service().await;
-    if plugin.precompiled(&service).is_none() {
-        return;
-    }
     let exec_context = ProgramExecContext {
         cpu,
         timer,
@@ -331,102 +258,185 @@ async fn run_shard_supervisor<P, CpuImpl, Net, StorageImpl>(
         read_serial: service.inner.plugin_read_serial,
         write_serial: service.inner.plugin_write_serial,
     };
-    let provider = plugin.provider(&debug_state);
+    let provider = debug_state.http_client();
     loop {
-        // Lazily defer instantiation until a request arrives on this core.
-        let Some(first) = provider.recv_on(processor).await else {
-            return;
+        let changed = provider.changed();
+        let Some(registration) = service.http_provider_registration() else {
+            changed.await;
+            continue;
         };
-        match run_shard_once(
-            &plugin,
+        if !provider.is_installed() || provider.generation() != registration.generation {
+            changed.await;
+            continue;
+        }
+        // Lazily defer store instantiation until an exchange actually arrives
+        // on this processor for this active generation.
+        let Some(first) = provider
+            .recv_on_for_generation(processor, registration.generation)
+            .await
+        else {
+            continue;
+        };
+        if let Err(error) = run_http_shard_once(
             &service,
             &exec_context,
+            &registration,
             processor,
             first,
             &in_flight,
         )
         .await
         {
-            Ok(()) => return,
-            Err(error) if plugin_runtime_should_be_recycled(&error) => {
-                tracing::warn!(
-                    target: "helios_kernel::supervisor",
-                    plugin = plugin.instance_name(),
-                    processor = processor.id(),
-                    ?error,
-                    "per-processor plugin shard died; rebuilding on next request"
-                );
-            }
-            Err(error) => {
-                tracing::error!(
-                    target: "helios_kernel::supervisor",
-                    plugin = plugin.instance_name(),
-                    processor = processor.id(),
-                    ?error,
-                    "per-processor plugin shard failed unrecoverably"
-                );
-                return;
-            }
+            tracing::warn!(
+                target: "helios_kernel::supervisor",
+                plugin = registration.name.as_str(),
+                processor = processor.id(),
+                ?error,
+                "per-processor http provider shard faulted; notifying root supervisor"
+            );
+            service.fault_http_provider(
+                &debug_state,
+                registration.generation,
+                alloc::format!("processor {} shard faulted: {error:?}", processor.id()),
+            );
         }
     }
 }
 
-async fn run_shard_once<P, CpuImpl, Net, StorageImpl>(
-    plugin: &P,
+async fn run_http_shard_once<CpuImpl, Net, StorageImpl>(
     service: &UserProgramService<CpuImpl, Net, StorageImpl>,
     exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
+    registration: &HttpProviderRegistration<CpuImpl, Net, StorageImpl>,
     processor: ProcessorId,
-    first: P::Request,
+    first: HttpExchange,
     in_flight: &AllocArc<CachePadded<AtomicUsize>>,
 ) -> Result<(), ProgramExecError>
 where
-    P: PerProcessorWasiPlugin<CpuImpl, Net, StorageImpl>,
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let instance_pre = plugin
-        .precompiled(service)
-        .expect("plugin precompiled component checked by shard supervisor");
     let started_at = exec_context
         .runtime_state
         .uptime_nanos(exec_context.cpu.now().ticks());
-
-    let (mut store, interrupts, _) = open_kernel_plugin_store(
+    let mut shard_context = exec_context.clone();
+    shard_context.parent_instance_id = registration.parent_instance_id;
+    let (mut store, interrupts, _) = open_provider_store(
         service,
-        exec_context,
-        KernelPluginSpec {
-            instance_name: plugin.instance_name(),
-            bootfs_path: plugin.bootfs_path(),
-            authority: plugin.authority(),
+        &shard_context,
+        ProviderStoreSpec {
+            instance_name: &registration.name,
+            bootfs_path: &registration.path,
+            authority: registration.authority.clone(),
+            oom_policy: registration.oom_policy,
             started_at,
         },
     );
 
     let turns = store.data().guest_turns();
     let wasm_instance = interrupts
-        .drive(turns.drive(instance_pre.instantiate_async(&mut store)))
+        .drive(turns.drive(registration.precompiled.instantiate_async(&mut store)))
         .await
         .map_err(map_program_runtime_error)?;
-    let guest = plugin
-        .bind_guest(&mut store, &wasm_instance)
-        .map_err(map_program_runtime_error)?;
+    let handler = HttpHost::new(&mut store, &wasm_instance).map_err(map_program_runtime_error)?;
+    let guest = handler.wasi_http_handler().clone();
 
-    let provider = plugin.provider(&exec_context.runtime_state);
+    let provider = exec_context.runtime_state.http_client();
+    let generation = registration.generation;
     let mut first = Some(first);
     let turns = store.data().guest_turns();
     interrupts
         .drive(turns.drive(store.run_concurrent(async move |accessor| {
-            let req = first.take().expect("the first request is dispatched once");
-            plugin.dispatch(accessor, &guest, req, PluginInFlight::acquire(in_flight))?;
-            while let Some(req) = provider.recv_on(processor).await {
-                plugin.dispatch(accessor, &guest, req, PluginInFlight::acquire(in_flight))?;
+            let req = first.take().expect("the first exchange is dispatched once");
+            let dispatch_guest = guest.clone();
+            let guard = PluginInFlight::acquire(in_flight);
+            accessor.spawn(async move |accessor| {
+                handle_http_exchange::<CpuImpl, Net, StorageImpl>(
+                    accessor,
+                    dispatch_guest,
+                    req,
+                    guard,
+                )
+                .await
+            })?;
+            while let Some(req) = provider.recv_on_for_generation(processor, generation).await {
+                let dispatch_guest = guest.clone();
+                let guard = PluginInFlight::acquire(in_flight);
+                accessor.spawn(async move |accessor| {
+                    handle_http_exchange::<CpuImpl, Net, StorageImpl>(
+                        accessor,
+                        dispatch_guest,
+                        req,
+                        guard,
+                    )
+                    .await
+                })?;
             }
             Ok::<(), wasmtime::Error>(())
         })))
         .await
         .and_then(|result| result)
         .map_err(map_program_runtime_error)
+}
+
+/// One `wasi:http/handler.handle` call, start to finish.
+async fn handle_http_exchange<CpuImpl, Net, StorageImpl>(
+    accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+    guest: exports::wasi::http::handler::Guest,
+    exchange: HttpExchange,
+    _in_flight: PluginInFlight,
+) -> wasmtime::Result<()>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let HttpExchange {
+        head,
+        body,
+        response,
+    } = exchange;
+
+    let request =
+        accessor.with(|mut access| access.get().table.push(WasiRequest::from_host(head, body)));
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => {
+            let _ = response.send(Err(http_internal_error(&error)));
+            return Err(error.into());
+        }
+    };
+
+    match guest.call_handle(accessor, request).await {
+        Ok(Ok(produced)) => {
+            let converted = accessor.with(|mut access| {
+                let produced = access.get().table.delete(produced)?;
+                produced.into_host_response(&mut access)
+            });
+            match converted {
+                Ok(http_response) => {
+                    let _ = response.send(Ok(http_response));
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = response.send(Err(http_internal_error(&error)));
+                    Err(error)
+                }
+            }
+        }
+        Ok(Err(code)) => {
+            let _ = response.send(Err(kernel_error_code(code)));
+            Ok(())
+        }
+        Err(trap) => {
+            let _ = response.send(Err(http_internal_error(&trap)));
+            Err(trap)
+        }
+    }
+}
+
+fn http_internal_error(error: &impl core::fmt::Debug) -> HttpErrorCode {
+    HttpErrorCode::InternalError(Some(alloc::format!("{error:?}")))
 }
 
 #[cfg(test)]
@@ -440,78 +450,8 @@ mod tests {
     use crate::Executor;
     use crate::test_support::{RecordingSmpCpu, TestCpu, TestNetworkService, UnsupportedStorage};
 
-    #[derive(Clone)]
-    struct DummyShardedPlugin {
-        provider: AllocArc<PerProcessorProvider<u32>>,
-    }
-
-    impl PerProcessorWasiPlugin<RecordingSmpCpu, TestNetworkService, UnsupportedStorage>
-        for DummyShardedPlugin
-    {
-        type Request = u32;
-        type Guest = ();
-
-        fn bootfs_path(&self) -> &'static str {
-            "/bin/dummy"
-        }
-
-        fn instance_name(&self) -> &'static str {
-            "dummy-plugin"
-        }
-
-        fn authority(&self) -> ProcessAuthority {
-            ProcessAuthority::empty()
-        }
-
-        fn provider<'a>(
-            &'a self,
-            _runtime_state: &'a HostRuntimeState<
-                RecordingSmpCpu,
-                TestNetworkService,
-                UnsupportedStorage,
-            >,
-        ) -> &'a PerProcessorProvider<u32> {
-            &self.provider
-        }
-
-        fn precompiled<'a>(
-            &self,
-            _service: &'a UserProgramService<
-                RecordingSmpCpu,
-                TestNetworkService,
-                UnsupportedStorage,
-            >,
-        ) -> Option<
-            &'a InstancePre<StoreData<RecordingSmpCpu, TestNetworkService, UnsupportedStorage>>,
-        > {
-            None
-        }
-
-        fn bind_guest(
-            &self,
-            _store: &mut wasmtime::Store<
-                StoreData<RecordingSmpCpu, TestNetworkService, UnsupportedStorage>,
-            >,
-            _instance: &Instance,
-        ) -> Result<(), wasmtime::Error> {
-            Ok(())
-        }
-
-        fn dispatch(
-            &self,
-            _accessor: &Accessor<
-                StoreData<RecordingSmpCpu, TestNetworkService, UnsupportedStorage>,
-            >,
-            _guest: &(),
-            _request: u32,
-            _in_flight: PluginInFlight,
-        ) -> wasmtime::Result<()> {
-            Ok(())
-        }
-    }
-
     #[test]
-    fn per_processor_step_refuses_while_in_flight_redirects_and_clears_local_live_when_idle() {
+    fn per_processor_http_step_refuses_while_in_flight_redirects_and_clears_local_live_when_idle() {
         let pool = crate::test_support::TestMachine {
             processor_nodes: alloc::vec![0, 0],
             distances: alloc::vec![10],
@@ -541,18 +481,13 @@ mod tests {
             GuestIsa::for_build_target(TestCpu::with_entropy(1).native_feature_probe()),
         );
 
-        let plugin = DummyShardedPlugin {
-            provider: AllocArc::new(PerProcessorProvider::new()),
-        };
-        plugin
-            .provider
-            .install(pool, 4)
-            .expect("install dummy shards");
+        let generation = runtime_state.http_client().install_or_activate(pool, 4);
+        assert_eq!(generation, 1);
+
         let spawner1 = executor1.spawner(cpu1.clone());
         let timer1 = executor1.timer(cpu1.clone());
-        let step1 = PerProcessorPluginStep {
-            plugin: plugin.clone(),
-            debug_state: runtime_state,
+        let step1 = PerProcessorHttpStep {
+            debug_state: runtime_state.clone(),
             cpu: cpu1.clone(),
             spawner: spawner1.clone(),
             timer: timer1,
@@ -562,7 +497,7 @@ mod tests {
         let handle = spawner1.spawn_local(pending::<()>());
         *step1.supervisor.borrow_mut() = Some(handle);
 
-        // Simulate an active in-flight exchange on processor 1.
+        // Simulate an active in-flight HTTP exchange on processor 1.
         let active = PluginInFlight::acquire(&step1.in_flight);
         assert_eq!(
             step1.offline_on(p1, p0),
@@ -573,21 +508,64 @@ mod tests {
         );
         assert!(step1.supervisor.borrow().is_some());
 
-        // Drop the in-flight guard and queue a message on core 1 before going offline.
+        // Drop the in-flight guard and enqueue an HTTP exchange on core 1 before going offline.
         drop(active);
         crate::test_processor_identity::set(p1);
-        block_on(plugin.provider.send(42)).expect("queue onto core 1 shard");
+        let (tx, _rx) = futures::channel::oneshot::channel();
+        let (_body_tx, body_rx) = crate::byte_channel();
+        let (_trailers_tx, trailers_rx) = futures::channel::oneshot::channel();
+        let (result_tx, _result_rx) = futures::channel::oneshot::channel();
+        let exchange = crate::HttpExchange {
+            head: crate::HttpRequestHead {
+                method: crate::HttpMethod::Get,
+                scheme: Some(crate::HttpScheme::Http),
+                authority: Some(String::from("example.test")),
+                path_with_query: Some(String::from("/")),
+                headers: crate::HttpFields::new_mutable(),
+                options: None,
+            },
+            body: crate::HttpBody {
+                contents: body_rx,
+                trailers: trailers_rx,
+                result: result_tx,
+            },
+            response: tx,
+        };
+        block_on(runtime_state.http_client().send(exchange)).expect("queue onto core 1 shard");
 
         assert_eq!(step1.offline_on(p1, p0), Ok(()));
-        assert_eq!(plugin.provider.try_recv_on(p0), Ok(42));
+        assert!(runtime_state.http_client().try_recv_on(p0).is_ok());
         assert_eq!(executor1.take_offline(&cpu1, p0), Ok(()));
 
-        // Coming back online reactivates shard 1 cleanly.
+        // Coming back online reactivates shard 1 cleanly, and hot-replacing bumps generation.
         executor0.group().bring_processor_online(p1);
         step1.online_on(p1);
+        let next_gen = runtime_state.http_client().install_or_activate(pool, 4);
+        assert_eq!(next_gen, 2);
         crate::test_processor_identity::set(p1);
-        block_on(plugin.provider.send(99)).expect("reactivated shard 1 accepts work");
-        assert_eq!(plugin.provider.try_recv_on(p1), Ok(99));
+        let (tx2, _rx2) = futures::channel::oneshot::channel();
+        let (_body_tx2, body_rx2) = crate::byte_channel();
+        let (_trailers_tx2, trailers_rx2) = futures::channel::oneshot::channel();
+        let (result_tx2, _result_rx2) = futures::channel::oneshot::channel();
+        let exchange2 = crate::HttpExchange {
+            head: crate::HttpRequestHead {
+                method: crate::HttpMethod::Get,
+                scheme: Some(crate::HttpScheme::Http),
+                authority: Some(String::from("example.test")),
+                path_with_query: Some(String::from("/next")),
+                headers: crate::HttpFields::new_mutable(),
+                options: None,
+            },
+            body: crate::HttpBody {
+                contents: body_rx2,
+                trailers: trailers_rx2,
+                result: result_tx2,
+            },
+            response: tx2,
+        };
+        block_on(runtime_state.http_client().send(exchange2))
+            .expect("reactivated shard 1 accepts work");
+        assert!(runtime_state.http_client().try_recv_on(p1).is_ok());
         drop(step1.supervisor.borrow_mut().take());
         let _ = cpu0;
     }

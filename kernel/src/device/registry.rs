@@ -18,7 +18,7 @@
 //! and safe from any processor; [`DeviceGrantRegistry::forward`] is
 //! additionally safe from interrupt context.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arrayvec::ArrayVec;
 use spin::Once;
@@ -33,6 +33,7 @@ use super::platform::device_hooks_installed;
 use crate::buffer::ViewGroup;
 use crate::io::ExternalInterruptHandler;
 use crate::process::DeviceGrantClaimCap;
+use crate::{Notify, NotifyWaiter};
 
 /// Devices one machine may grant away.
 ///
@@ -44,13 +45,35 @@ pub const MAX_GRANTS: usize = 8;
 /// The set of devices discovery published, and their owners.
 pub struct DeviceGrantRegistry {
     devices: Once<ArrayVec<Arc<PublishedDevice>, MAX_GRANTS>>,
+    version: AtomicU64,
+    changed: Notify,
 }
 
 impl DeviceGrantRegistry {
     pub const fn new() -> Self {
         Self {
             devices: Once::new(),
+            version: AtomicU64::new(0),
+            changed: Notify::new(),
         }
+    }
+
+    /// Monotonic version bumped whenever discovery publishes device grants.
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    /// Waiter notified whenever discovery publishes device grants.
+    pub fn changed_waiter(&self) -> NotifyWaiter {
+        self.changed.waiter()
+    }
+
+    pub fn poll_changed(
+        &self,
+        cx: &mut core::task::Context<'_>,
+        waiter: &mut NotifyWaiter,
+    ) -> core::task::Poll<()> {
+        self.changed.poll_notified(cx, waiter)
     }
 
     /// Publish everything discovery found. Called once, during
@@ -104,6 +127,8 @@ impl DeviceGrantRegistry {
                 "device grant published"
             );
         }
+        self.version.fetch_add(1, Ordering::AcqRel);
+        self.changed.notify_all();
         Ok(())
     }
 

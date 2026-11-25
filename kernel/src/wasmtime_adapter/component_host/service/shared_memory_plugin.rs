@@ -614,22 +614,11 @@ mod tests {
         let plan = CoreAffinityPlan::capture(&cpu, online, ProcessorId::new(3));
         assert_eq!(plan.main(), ProcessorId::new(3));
         assert!(!plan.targets.contains(&ProcessorId::new(2)));
-        if cfg!(feature = "embedded-debugger") {
-            assert!(!plan.targets.contains(&ProcessorId::new(1)));
-            assert_eq!(
-                plan.targets.as_slice(),
-                &[ProcessorId::new(3), ProcessorId::new(0)]
-            );
-        } else {
-            assert_eq!(
-                plan.targets.as_slice(),
-                &[
-                    ProcessorId::new(3),
-                    ProcessorId::new(0),
-                    ProcessorId::new(1)
-                ]
-            );
-        }
+        assert!(!plan.targets.contains(&ProcessorId::new(1)));
+        assert_eq!(
+            plan.targets.as_slice(),
+            &[ProcessorId::new(3), ProcessorId::new(0)]
+        );
 
         // Simulate core 3 going offline between capture and thread spawn:
         // spawning for core 3 falls back to the next online core in the plan (0).

@@ -10,11 +10,7 @@ unix = ["dep:helios-unix", "helios-unix/runtime"]
 # runs it natively through `Cpu::native`. Off by default; a build without it
 # compiles none of `helios-linux`.
 linux = ["wasmtime-runtime", "dep:helios-linux", "helios-linux/runtime"]
-default = ["wasmtime-host", "embedded-debugger"]
-# Autostart of the embedded debugger system component. Production kernels
-# can drop it; the prebuild bootfs contents are controlled separately by
-# the kernel-prebuild manifest.
-embedded-debugger = []
+default = ["wasmtime-host"]
 # Adapter-only runtime support; the core kernel and HAL no-default path must
 # not depend on it.
 wasmtime-runtime = ["unix", "dep:wasmtime"]

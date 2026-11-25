@@ -28,32 +28,15 @@ world init {
   import wasi:http/client@0.3.0;
 }
 
-world debugger{
-  include wasi:cli/command@0.3.0;
-  import helios:hv/virtualization@0.1.0;
-  import helios:system/programs@0.1.0;
-  import helios:system/ipc@0.1.0;
-  import helios:system/machine-identity@0.1.0;
-  import helios:system/mounts@0.1.0;
-  import helios:system/btrfs@0.1.0;
-  import helios:system/net@0.1.0;
-  import helios:system/vsock@0.1.0;
-  import helios:system/inspect@0.1.0;
-  import helios:system/tracing@0.1.0;
-  import helios:system/profiling@0.1.0;
-  import helios:system/settings@0.1.0;
-  import helios:system/sync@0.1.0;
-  import helios:system/serial@0.1.0;
-  import helios:system/instances@0.1.0;
-  import helios:system/snapshot@0.1.0;
-  import helios:system/display@0.1.0;
-  import helios:system/input@0.1.0;
-  import helios:system/surface@0.1.0;
-  import helios:system/gpu@0.1.0;
-  import helios:system/audio@0.1.0;
-  import helios:system/processors@0.1.0;
-  import wasi:http/types@0.3.0;
-  import wasi:http/client@0.3.0;
+world root-supervisor {
+  include init;
+  import helios:system/root-supervisor@0.1.0;
+}
+
+/// World the kernel generates its own `helios:system/root-supervisor`
+/// bindings from, keeping bindgen scoped to the one root-only interface.
+world root-supervisor-host {
+  import helios:system/root-supervisor@0.1.0;
 }
 
 /// World implemented by the `http-client` kernel plugin: it speaks HTTP over
@@ -216,9 +199,8 @@ world audio-host {
 /// bindings from.
 ///
 /// Separate from the program worlds for the reason `audio-host` is: the
-/// kernel serves this one interface to both the `init` and `debugger`
-/// worlds, and one generated type set keeps the two from mapping the
-/// lifecycle's result twice.
+/// kernel serves this one interface across the `init` and `root-supervisor`
+/// worlds, and one generated type set keeps the lifecycle's result mapped once.
 world processors-host {
   import helios:system/processors@0.1.0;
 }
@@ -226,8 +208,8 @@ world processors-host {
 /// World the kernel generates its own `helios:system/btrfs` bindings from.
 ///
 /// Separate from the program worlds for the same reason `processors-host` is:
-/// the kernel serves this one interface to both the `init` and `debugger`
-/// worlds, and one generated type set keeps the two from mapping results twice.
+/// the kernel serves this one interface across the `init` and `root-supervisor`
+/// worlds, and one generated type set keeps results mapped once.
 world btrfs-host {
   import helios:system/btrfs@0.1.0;
 }

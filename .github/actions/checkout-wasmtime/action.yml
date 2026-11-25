@@ -14,7 +14,7 @@ runs:
   steps:
     - uses: actions/checkout@v4
       with:
-        repository: lexoliu/wasmtime
+        repository: helios-kernel/wasmtime
         # Branch `helios/security-52`.
         ref: b3d6003675b47b86a089dc7e741a3a25cd8e2061
         path: ${{ inputs.path }}

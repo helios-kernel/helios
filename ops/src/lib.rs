@@ -11,12 +11,15 @@
 //!
 //! Zero `block_on` and zero `anyhow` appear in production code.
 
+pub use helios_oci;
 pub use zenwave;
 
 pub mod bundle;
 pub mod error;
 pub mod fleet;
+pub mod grants;
 pub mod http;
+pub mod linux;
 pub mod session;
 pub mod target;
 pub mod transport;
@@ -24,6 +27,7 @@ pub mod transport;
 pub use bundle::{BundleEntry, BundleManifest, DiagnosticBundle};
 pub use error::{AuthError, BundleError, HttpError, OpsError, TargetError, TransportError};
 pub use fleet::{DEFAULT_FLEET_CONCURRENCY, Fleet, NodeOutcome};
+pub use grants::{Command, NonFsGrant, NonFsGrants, ProcessGrants};
 pub use session::{
     Child, RemoteEntry, RemoteStat, Session, SessionOptions, SnapshotHold, SpawnRequest,
 };

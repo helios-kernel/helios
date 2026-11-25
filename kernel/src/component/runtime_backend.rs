@@ -13,11 +13,12 @@ use helios_hal::cpu::Cpu;
 /// component.
 #[derive(Clone, Copy, Debug)]
 pub enum ComponentWorld {
-    /// The system (debugger) world — includes programs, net, stats, tracing,
-    /// profiling, instances, serial, sync.
-    System,
-    /// The launched-program world — includes programs, net, stats, tracing,
-    /// profiling, serial, sync, but not instances.
+    /// The single root supervisor world — includes every program interface
+    /// plus the exclusive, non-delegable `helios:system/root-supervisor`
+    /// interface.
+    RootSupervisor,
+    /// The ordinary launched-program world — never binds
+    /// `helios:system/root-supervisor`.
     Program,
 }
 

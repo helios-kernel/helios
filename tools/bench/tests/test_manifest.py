@@ -30,7 +30,7 @@ def test_manifest_lanes_are_complete() -> None:
 def test_pins_come_from_their_single_sources() -> None:
     pin = vendored_wasmtime_pin()
     revision = pin.revision
-    assert pin.repository == "lexoliu/wasmtime"
+    assert pin.repository == "helios-kernel/wasmtime"
     assert len(revision) == 40
     action = (REPO_ROOT / ".github/actions/checkout-wasmtime/action.yml").read_text(encoding="utf-8")
     assert revision in action

@@ -1,7 +1,6 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::time::Duration;
 use spin::Mutex;
 
 use helios_artifact::bootfs::{self, EntryKind};
@@ -10,7 +9,8 @@ use helios_hal::numa::SingleNode;
 use helios_hal::serial::ByteSerial;
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
 
-use super::{boot_init_output_mode, install_component_host_program_service, launch_boot_init};
+use super::super::root_component_output_mode;
+use super::{install_component_host_program_service, run_root_component_once};
 use crate::component::{ComponentInputRoute, ComponentOutputMode, ComponentOutputRoute};
 use crate::test_support::{TestCpu, TestNetworkService, UnsupportedStorage};
 use crate::wasmtime_adapter::cwasm::sign_bootfs_image_for_tests;
@@ -84,10 +84,10 @@ fn signed_test_payload(init_name: &str, init_bytes: &[u8], argv0: &str) -> crate
 }
 
 #[test]
-fn boot_init_stdio_keeps_serial_input_for_debugger_when_system_component_exists() {
-    let alongside_debugger = boot_init_output_mode(true, true);
+fn root_component_stdio_keeps_serial_input_for_supervised_children() {
+    let with_serial = root_component_output_mode(true);
     assert!(matches!(
-        alongside_debugger,
+        with_serial,
         ComponentOutputMode::RoutedChild {
             stdin: ComponentInputRoute::Closed,
             stdout: ComponentOutputRoute::Serial,
@@ -95,14 +95,8 @@ fn boot_init_stdio_keeps_serial_input_for_debugger_when_system_component_exists(
         }
     ));
 
-    let standalone = boot_init_output_mode(true, false);
-    assert!(matches!(standalone, ComponentOutputMode::Serial));
-
-    let headless_with_debugger = boot_init_output_mode(false, true);
-    assert!(matches!(headless_with_debugger, ComponentOutputMode::Trace));
-
-    let headless_standalone = boot_init_output_mode(false, false);
-    assert!(matches!(headless_standalone, ComponentOutputMode::Trace));
+    let headless = root_component_output_mode(false);
+    assert!(matches!(headless, ComponentOutputMode::Trace));
 }
 
 #[test]
@@ -127,50 +121,10 @@ fn boot_payload_exposes_init_component_and_argv0_on_runtime_state() {
         b"synthetic-bytes"
     );
     assert_eq!(state.embedded_init().argv0(), "/sbin/init");
-    assert!(!state.boot_init_completed());
 }
 
 #[test]
-fn wait_for_boot_init_stays_pending_before_launch_and_wakes_on_completion() {
-    use core::future::Future;
-    use core::pin::pin;
-    use core::task::{Context, Poll, Waker};
-
-    let cpu = TestCpu::with_entropy(0x73);
-    let payload = signed_test_payload("init_component.cwasm", b"synthetic-bytes", "/init.wasm");
-    let state: crate::HostRuntimeState<TestCpu, TestNetworkService, UnsupportedStorage> =
-        crate::RuntimeState::new(
-            cpu.timebase(),
-            2,
-            0,
-            payload,
-            crate::GuestIsa::for_build_target(cpu.native_feature_probe()),
-        );
-
-    // Simulate a secondary processor reaching `wait_for_boot_init()`
-    // before the bootstrap processor has even called `launch_boot_init()`.
-    let mut waiter = pin!(state.wait_for_boot_init());
-    let mut cx = Context::from_waker(Waker::noop());
-    assert!(
-        matches!(waiter.as_mut().poll(&mut cx), Poll::Pending),
-        "wait_for_boot_init must stay Pending before boot init is launched"
-    );
-
-    state.mark_boot_init_launched();
-    assert!(
-        matches!(waiter.as_mut().poll(&mut cx), Poll::Pending),
-        "wait_for_boot_init must stay Pending while boot init is still running"
-    );
-
-    state.mark_boot_init_completed();
-    assert!(
-        matches!(waiter.as_mut().poll(&mut cx), Poll::Ready(())),
-        "wait_for_boot_init must resolve once boot init completes"
-    );
-}
-
-#[test]
-fn launch_boot_init_completes_and_wakes_system_waiters_even_when_artifact_is_invalid() {
+fn run_root_component_once_returns_error_when_artifact_is_invalid() {
     let backing: &'static mut [u8] =
         Box::leak(alloc::vec![0u8; 64 * 1024 * 1024].into_boxed_slice());
     // SAFETY: `backing` is a leaked `'static` slice owned exclusively by this
@@ -222,33 +176,17 @@ fn launch_boot_init_completes_and_wakes_system_waiters_even_when_artifact_is_inv
     );
     assert!(installed.is_some());
 
-    launch_boot_init(
-        &cpu,
+    let result = run_root_component_once(
+        debug_state.embedded_init(),
+        cpu,
         &kernel,
-        &debug_state,
+        debug_state,
         |_, _| {},
         RECORDING_WRITER,
-        true,
     );
-    assert!(!debug_state.boot_init_completed());
-
-    let wait_state = debug_state.clone();
-    let timer = kernel.timer();
-    kernel.run_local_future(async move {
-        futures_lite::future::or(
-            async {
-                wait_state.wait_for_boot_init().await;
-            },
-            async {
-                timer.sleep_for(Duration::from_secs(5)).await;
-                panic!("timed out waiting for boot init completion");
-            },
-        )
-        .await;
-    });
     assert!(
-        debug_state.boot_init_completed(),
-        "completion guard must release system component waiters even when init fails to load"
+        result.is_err(),
+        "an invalid root component artifact must fail cleanly instead of panicking"
     );
     let _ = String::from_utf8_lossy(&RECORDED_SERIAL.lock());
 }

@@ -4,7 +4,7 @@
 
 FROM ubuntu:24.04
 
-LABEL org.opencontainers.image.source=https://github.com/lexoliu/helios
+LABEL org.opencontainers.image.source=https://github.com/helios-kernel/helios
 
 ARG TARGETARCH
 ARG DEBIAN_FRONTEND=noninteractive

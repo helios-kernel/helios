@@ -45,6 +45,8 @@ pub mod instances;
 pub mod io;
 #[cfg(feature = "ipc")]
 pub mod ipc;
+#[cfg(feature = "programs")]
+pub mod linux;
 #[cfg(feature = "machine-identity")]
 pub mod machine_identity;
 #[cfg(any(
@@ -58,6 +60,8 @@ pub mod memory;
 pub mod mounts;
 #[cfg(feature = "net")]
 pub mod net;
+#[cfg(feature = "oci")]
+pub mod oci;
 pub mod prelude;
 #[cfg(feature = "processors")]
 pub mod processors;
@@ -65,6 +69,8 @@ pub mod processors;
 pub mod profiling;
 #[cfg(feature = "programs")]
 pub mod programs;
+#[cfg(feature = "root-supervisor")]
+pub mod root_supervisor;
 #[cfg(feature = "serial")]
 pub mod serial;
 #[cfg(feature = "settings")]

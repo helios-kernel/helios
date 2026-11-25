@@ -62,6 +62,29 @@ impl OomPolicy {
     pub const fn is_victim_candidate(self) -> bool {
         self.restart_cost().is_some()
     }
+
+    /// Monotonic privilege rank used to enforce caller `OomPolicy` ceilings.
+    pub const fn privilege_rank(self) -> u8 {
+        match self {
+            Self::UserProgram => 0,
+            Self::KernelPlugin => 1,
+            Self::SystemComponent => 2,
+        }
+    }
+
+    /// Whether a caller running under `self` may assign `requested` to a
+    /// managed child instance (`requested <= self`).
+    pub const fn admits(self, requested: Self) -> bool {
+        requested.privilege_rank() <= self.privilege_rank()
+    }
+
+    /// Executor task-arena funding class for instances under this policy.
+    pub const fn task_funding(self) -> crate::TaskFunding {
+        match self {
+            Self::UserProgram => crate::TaskFunding::Instance,
+            Self::KernelPlugin | Self::SystemComponent => crate::TaskFunding::Kernel,
+        }
+    }
 }
 
 /// One of the kernel's two memory ownership domains.
