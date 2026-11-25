@@ -42,7 +42,35 @@ pub struct ComponentVsockStream {
 /// The kernel-side view of a bound `vsock-listener` resource.
 pub struct ComponentVsockListener {
     pub service: ComponentHostVsockService,
-    pub listener: VsockListenerId,
+    pub listener: Option<VsockListenerId>,
+}
+
+impl ComponentVsockListener {
+    pub fn new(service: ComponentHostVsockService, listener: VsockListenerId) -> Self {
+        Self {
+            service,
+            listener: Some(listener),
+        }
+    }
+
+    pub fn take(&mut self) -> Option<(ComponentHostVsockService, VsockListenerId)> {
+        self.listener.take().map(|id| (self.service.clone(), id))
+    }
+
+    pub fn close(&mut self) -> Result<(), VsockError> {
+        let id = self.listener.take().ok_or(VsockError::Closed)?;
+        self.service.close_listener(id)
+    }
+}
+
+impl Drop for ComponentVsockListener {
+    fn drop(&mut self) {
+        if let Some(id) = self.listener.take()
+            && let Err(error) = self.service.close_listener(id)
+        {
+            tracing::debug!(%error, "dropped vsock listener was already gone");
+        }
+    }
 }
 
 /// One world's generated types for `helios:system/vsock`.
@@ -253,10 +281,7 @@ where
         ResourceType::host::<ComponentVsockListener>(),
         |mut caller, rep| {
             let resource = Resource::<ComponentVsockListener>::new_own(rep);
-            let listener = caller.data_mut().table.delete(resource)?;
-            if let Err(error) = listener.service.close_listener(listener.listener) {
-                tracing::debug!(%error, "dropped vsock listener was already gone");
-            }
+            let _ = caller.data_mut().table.delete(resource)?;
             Ok(())
         },
     )?;
@@ -286,7 +311,7 @@ where
             let resource = caller
                 .data_mut()
                 .table
-                .push(ComponentVsockListener { service, listener })?;
+                .push(ComponentVsockListener::new(service, listener))?;
             Ok((Ok(resource),))
         },
     )?;
@@ -324,10 +349,37 @@ where
         |caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockListener>,)| {
             let listener = caller.data().table.get(&resource)?;
-            Ok((listener
-                .service
-                .listener_port(listener.listener)
-                .map_err(convert_error::<Bindings>),))
+            let result = match listener.listener {
+                Some(id) => listener
+                    .service
+                    .listener_port(id)
+                    .map_err(convert_error::<Bindings>),
+                None => Err(convert_error::<Bindings>(VsockError::Closed)),
+            };
+            Ok((result,))
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "[method]vsock-listener.wait-readable",
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+         (resource, timeout): (Resource<ComponentVsockListener>, u64)| {
+            Box::pin(async move {
+                let listener = accessor.with(|mut access| {
+                    let listener = access.get().table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>((listener.service.clone(), listener.listener))
+                })?;
+                let Some(id) = listener.1 else {
+                    return Ok::<_, wasmtime::Error>((Err(convert_error::<Bindings>(
+                        VsockError::Closed,
+                    )),));
+                };
+                let response = listener
+                    .0
+                    .wait_readable(id, timeout)
+                    .await
+                    .map_err(convert_error::<Bindings>);
+                Ok::<_, wasmtime::Error>((response,))
+            })
         },
     )?;
     instance.func_wrap_concurrent(
@@ -339,8 +391,13 @@ where
                     let listener = access.get().table.get(&resource)?;
                     Ok::<_, wasmtime::Error>((listener.service.clone(), listener.listener))
                 })?;
+                let Some(id) = listener.1 else {
+                    return Ok::<_, wasmtime::Error>((Err(convert_error::<Bindings>(
+                        VsockError::Closed,
+                    )),));
+                };
                 tracing::debug!(timeout, "vsock listener accept requested");
-                let accepted = listener.0.accept(listener.1, timeout).await;
+                let accepted = listener.0.accept(id, timeout).await;
                 tracing::debug!(ok = accepted.is_ok(), "vsock listener accept returned");
                 let response = match accepted {
                     Ok(stream) => {
@@ -360,13 +417,10 @@ where
     )?;
     instance.func_wrap_concurrent_immediate(
         "[method]vsock-listener.close",
-        |caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+        |mut caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockListener>,)| {
-            let listener = caller.data().table.get(&resource)?;
-            Ok((listener
-                .service
-                .close_listener(listener.listener)
-                .map_err(convert_error::<Bindings>),))
+            let listener = caller.data_mut().table.get_mut(&resource)?;
+            Ok((listener.close().map_err(convert_error::<Bindings>),))
         },
     )?;
     instance.func_wrap_concurrent_immediate(

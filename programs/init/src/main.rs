@@ -240,6 +240,7 @@ async fn run_rc() -> io::Result<()> {
         args: vec![RC.to_owned()],
         env: vec![("PATH".to_owned(), "/bin".to_owned())],
         path: SHELL.to_owned(),
+        cwd: None,
         stdin: Vec::new(),
         hint: None,
         capability_grants: vec![

@@ -37,6 +37,10 @@ interface net {
     connection-reset,
     /// The connection was aborted before the stream ended.
     connection-aborted,
+    /// The caller's authority does not cover this operation or port.
+    permission-denied,
+    /// The requested local address and port are already bound.
+    address-in-use,
     unavailable,
     internal,
   }
@@ -100,6 +104,21 @@ interface net {
     close: async func() -> result<_, tcp-error>;
   }
 
+  resource tcp-listener {
+    /// The local IP address and port this listener is bound to.
+    local-address: func() -> tuple<ip-address, u16>;
+
+    /// Waits up to `timeout` nanoseconds for an incoming connection to be queued
+    /// without consuming it. Returns `true` when ready or `false` on timeout.
+    wait-readable: async func(timeout: mono-nanos) -> result<bool, tcp-error>;
+
+    /// Accepts the next queued TCP connection.
+    accept: async func(timeout: mono-nanos) -> result<tcp-stream, tcp-error>;
+
+    /// Releases the bound TCP listener immediately.
+    close: async func() -> result<_, tcp-error>;
+  }
+
   resource udp-socket {
     /// Receives one datagram from the bound local port.
     ///
@@ -118,6 +137,9 @@ interface net {
 
   /// Resolves `host` and opens an outbound TCP stream to `port`.
   tcp-connect: async func(host: string, port: u16, timeout: mono-nanos) -> result<tcp-stream, tcp-error>;
+
+  /// Binds a TCP listener to `local-address:local-port`. `0` requests an ephemeral port.
+  tcp-listen: async func(local-address: ip-address, local-port: u16, backlog: u16) -> result<tcp-listener, tcp-error>;
 
   /// Binds a UDP socket to `local-port`. `0` requests an ephemeral port.
   udp-bind: async func(local-port: u16) -> result<udp-socket, udp-error>;

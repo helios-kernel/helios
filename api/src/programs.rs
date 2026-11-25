@@ -14,12 +14,12 @@ use futures_lite::future::zip;
 pub use crate::bindings::helios::system::programs::{
     AotHint, AotRequest, AotResult, AuthorityScope, CapabilityGrant, ChildTermination, ClockGrant,
     ClockRight, ContainerConfig, ContainerCredentials, ContainerExecRequest, ContainerIdentity,
-    ContainerMount, ContainerMountSharing, ContainerSpawnRequest, DeviceClass, DeviceGrant,
-    DiagnosticsGrant, DirectoryGrant, ExecError, ExecErrorKind, ExecOutput, ExecRequest,
-    ExecResult, ExitStatus, FilesystemRight, IpcGrant, LinkGrant, LinkRight, MachineGrant,
-    MachineRight, MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight,
-    SettingsGrant, SettingsRight, SignalTermination, SpawnError, SpawnErrorKind, SpawnRequest,
-    TerminalGrant, TerminalRight,
+    ContainerMount, ContainerMountSharing, ContainerSpawnRequest, DefaultLinuxImage, DeviceClass,
+    DeviceGrant, DiagnosticsGrant, DirectoryGrant, ExecError, ExecErrorKind, ExecOutput,
+    ExecRequest, ExecResult, ExitStatus, FilesystemRight, InheritedSocket, IpcGrant, LinkGrant,
+    LinkRight, MachineGrant, MachineRight, MountGrant, MountRight, NetworkGrant, NetworkRight,
+    ProcessGrant, ProcessRight, SettingsGrant, SettingsRight, SignalTermination, SpawnError,
+    SpawnErrorKind, SpawnRequest, TerminalGrant, TerminalRight,
 };
 
 impl PartialEq for ChildTermination {
@@ -312,6 +312,11 @@ impl Child {
         self.inner.stdin(data)
     }
 
+    /// Deliver a POSIX signal (`1..=64`) to the child process.
+    pub fn signal(&self, signal: u8) -> Result<(), SpawnError> {
+        self.inner.signal(signal)
+    }
+
     /// Await child completion.
     pub async fn wait(self) -> Result<ExitStatus, SpawnError> {
         self.inner.wait().await
@@ -380,6 +385,21 @@ pub async fn exec(request: ExecRequest) -> Result<ExecResult, ExecError> {
 /// Spawn a program and return the live handle.
 pub async fn spawn(request: SpawnRequest) -> Result<Child, SpawnError> {
     Child::spawn(request).await
+}
+
+/// Set or clear this instance's default Linux root image.
+pub async fn set_default_image(image: Option<DefaultLinuxImage>) -> Result<(), SpawnError> {
+    raw::set_default_image(image).await
+}
+
+/// Return this instance's current default Linux root image, if any.
+pub fn get_default_image() -> Option<DefaultLinuxImage> {
+    raw::get_default_image()
+}
+
+/// Claim pre-bound listening sockets handed to this instance at spawn.
+pub fn take_inherited_sockets() -> Vec<InheritedSocket> {
+    raw::take_inherited_sockets()
 }
 
 /// Ahead-of-time compile a raw program artifact into a signed `cwasm` file.

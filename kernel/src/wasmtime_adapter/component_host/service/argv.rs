@@ -69,6 +69,26 @@ impl ProgramArgv {
         &self.program_name
     }
 
+    /// Rewrites `argv` for one `#!` script hop (`fs/binfmt_script.c`):
+    /// `argv[0]` becomes `interpreter`, followed by `optional_arg` (if present),
+    /// `script_path`, and the original `argv[1..]`.
+    #[cfg(feature = "linux")]
+    pub(crate) fn rewrite_shebang(
+        &mut self,
+        interpreter: String,
+        optional_arg: Option<String>,
+        script_path: String,
+    ) {
+        let mut new_args = Vec::with_capacity(self.arguments.len() + 2);
+        if let Some(arg) = optional_arg {
+            new_args.push(arg);
+        }
+        new_args.push(script_path);
+        new_args.append(&mut self.arguments);
+        self.program_name = interpreter;
+        self.arguments = new_args;
+    }
+
     /// The flattened argument vector handed to the guest.
     pub(crate) fn into_vec(self) -> Vec<String> {
         let mut argv = Vec::with_capacity(self.arguments.len() + 1);

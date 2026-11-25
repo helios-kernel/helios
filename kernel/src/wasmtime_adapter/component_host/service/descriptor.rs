@@ -661,17 +661,51 @@ pub(super) fn process_descriptors<Net: ComponentHostNetwork>(
     origin: DescriptorOrigin<Net>,
     authority: &ProcessAuthority,
     settings: &Settings,
+    inherited_sockets: Vec<UnixSocket<Net>>,
 ) -> Preview1DescriptorTable<Net> {
     match origin {
-        DescriptorOrigin::Fresh => Preview1DescriptorTable::from_authority(
+        DescriptorOrigin::Fresh => Preview1DescriptorTable::from_authority_with_sockets(
             authority,
             settings.get::<DescriptorLimitSetting>(),
+            inherited_sockets,
         ),
-        DescriptorOrigin::NewProcess(table) => {
-            table.for_new_process(settings.get::<DescriptorLimitSetting>())
+        DescriptorOrigin::NewProcess(mut table) => {
+            table = table.for_new_process(settings.get::<DescriptorLimitSetting>());
+            install_preview1_inherited_sockets(&mut table, inherited_sockets);
+            table
         }
-        DescriptorOrigin::SameProcess(table) => table,
+        DescriptorOrigin::SameProcess(mut table) => {
+            install_preview1_inherited_sockets(&mut table, inherited_sockets);
+            table
+        }
     }
+}
+
+pub(super) fn install_preview1_inherited_sockets<Net: ComponentHostNetwork>(
+    table: &mut Preview1DescriptorTable<Net>,
+    sockets: Vec<UnixSocket<Net>>,
+) {
+    if sockets.is_empty() {
+        return;
+    }
+    // Shift existing preopens (installed starting at fd = 3) so inherited
+    // sockets deterministically occupy fd = 3, 4, ... without clobbering
+    // directory preopens.
+    let tail = if table.entries.len() > 3 {
+        table.entries.split_off(3)
+    } else {
+        Vec::new()
+    };
+    while table.entries.len() < 3 {
+        table.entries.push(None);
+    }
+    for socket in sockets {
+        table.entries.push(Some(Preview1DescriptorEntry::new(
+            Preview1Descriptor::Socket(socket),
+            false,
+        )));
+    }
+    table.entries.extend(tail);
 }
 fn descriptor_errno(error: helios_unix::DescriptorTableError) -> i32 {
     match error {
@@ -696,9 +730,11 @@ pub(super) type UnixSocketHandle<Net> = helios_unix::SocketHandle<crate::UnixNet
 pub(super) const fn unix_socket_options<Net: ComponentHostNetwork>() -> SocketOptions {
     SocketOptions::for_network::<crate::UnixNetwork<Net>>()
 }
+#[cfg(feature = "linux")]
+pub(super) use helios_unix::OwnedVsockStream;
 pub(super) use helios_unix::{
-    OwnedTcpListener, OwnedTcpStream, OwnedUdpSocket, SocketFamily, SocketFlag, SocketKind,
-    SocketOptionError, SocketOptions, SocketSize, SocketTime,
+    OwnedTcpListener, OwnedTcpStream, OwnedUdpSocket, OwnedVsockListener, SocketFamily, SocketFlag,
+    SocketKind, SocketOptionError, SocketOptions, SocketSize, SocketTime, VsockSocket,
 };
 
 pub(super) type EpollDescriptor = helios_unix::Epoll<EpollUserData>;
@@ -1003,6 +1039,27 @@ where
             .packet_readiness(socket)
             .await
             .map_err(p1_errno_from_udp_error)?,
+        UnixSocketHandle::<Net>::VsockListener(listener) => {
+            let Some(vsock) = caller.data().runtime_state.vsock_service() else {
+                return Err(p1::errno::NETDOWN);
+            };
+            let readable = vsock
+                .listener_readable(crate::VsockListenerId::from_u64(listener))
+                .map_err(|_| p1::errno::IO)?;
+            crate::SocketReadiness {
+                readable,
+                writable: false,
+                hangup: false,
+            }
+        }
+        UnixSocketHandle::<Net>::VsockStream(stream) => {
+            let Some(vsock) = caller.data().runtime_state.vsock_service() else {
+                return Err(p1::errno::NETDOWN);
+            };
+            vsock
+                .stream_readiness(crate::VsockStreamId::from_u64(stream))
+                .map_err(|_| p1::errno::IO)?
+        }
     };
     Ok(p1_readiness_from_socket(readiness, event_type))
 }
@@ -1426,9 +1483,13 @@ pub(super) fn guest_path_suffix<'a>(path: &'a str, preopen: &str) -> &'a str {
 }
 
 impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
-    pub(super) fn from_authority(authority: &ProcessAuthority, limit: DescriptorLimit) -> Self {
+    pub(super) fn from_authority_with_sockets(
+        authority: &ProcessAuthority,
+        limit: DescriptorLimit,
+        inherited_sockets: Vec<UnixSocket<Net>>,
+    ) -> Self {
         let preopens = authority.directory_preopens();
-        let mut entries = Vec::with_capacity(3 + preopens.len());
+        let mut entries = Vec::with_capacity(3 + inherited_sockets.len() + preopens.len());
         entries.push(Some(Preview1DescriptorEntry::new(
             Preview1Descriptor::Stdin {
                 carry: Bytes::new(),
@@ -1443,6 +1504,12 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
             Preview1Descriptor::Stderr,
             false,
         )));
+        for socket in inherited_sockets {
+            entries.push(Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Socket(socket),
+                false,
+            )));
+        }
         let mut table = Self::from_entries_with_limit(entries, limit);
         for preopen in preopens {
             let descriptor = FsDescriptor {

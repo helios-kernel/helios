@@ -640,6 +640,14 @@ where
         NetworkService::tcp_listener_readiness(self, listener).await
     }
 
+    async fn tcp_listener_wait_readable(
+        &self,
+        listener: Self::TcpListener,
+        timeout_nanos: u64,
+    ) -> Result<bool, TcpError> {
+        NetworkService::tcp_listener_wait_readable(self, listener, timeout_nanos).await
+    }
+
     async fn udp_readiness(&self, socket: Self::UdpSocket) -> Result<SocketReadiness, UdpError> {
         NetworkService::udp_readiness(self, socket).await
     }

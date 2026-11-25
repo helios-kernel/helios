@@ -944,6 +944,21 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         listener: Self::TcpListener,
     ) -> impl Future<Output = Result<SocketReadiness, TcpError>> + Send + '_;
 
+    /// Wait up to `timeout_nanos` for `listener` to have a queued connection
+    /// without consuming it. Returns `Ok(false)` on timeout.
+    fn tcp_listener_wait_readable(
+        &self,
+        listener: Self::TcpListener,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<bool, TcpError>> + Send + '_ {
+        let _ = timeout_nanos;
+        async move {
+            self.tcp_listener_readiness(listener)
+                .await
+                .map(|readiness| readiness.readable)
+        }
+    }
+
     /// Probe a bound datagram socket without consuming a queued datagram.
     fn udp_readiness(
         &self,

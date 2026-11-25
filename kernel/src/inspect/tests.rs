@@ -746,7 +746,7 @@ fn kernel_containers_telemetry_reports_mounts_pids_uts_and_overlay_pages() {
                 source_path: String::from("/box"),
                 target_path: String::from("/"),
                 rights: DirectoryAuthorityRights::READ | DirectoryAuthorityRights::WRITE,
-                sharing: MountSharing::Private,
+                sharing: crate::ContainerMountSharing::Private,
             },
             mounts: Vec::new(),
             shared_owner: SharedOwner {

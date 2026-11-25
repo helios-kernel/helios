@@ -389,6 +389,12 @@ impl VsockTable {
         Ok(self.listener(listener)?.port)
     }
 
+    /// Whether `listener` has at least one completed connection waiting
+    /// to be accepted, without dequeuing it.
+    pub fn listener_readable(&self, listener: VsockListenerId) -> Result<bool, VsockError> {
+        Ok(!self.listener(listener)?.queued.is_empty())
+    }
+
     /// Takes the next connection queued on `listener`, if any.
     pub fn accept(
         &mut self,
@@ -436,6 +442,31 @@ impl VsockTable {
 
     pub fn peer(&self, stream: VsockStreamId) -> Result<VsockAddress, VsockError> {
         Ok(self.connection(stream)?.peer)
+    }
+
+    pub fn local(&self, stream: VsockStreamId) -> Result<VsockAddress, VsockError> {
+        Ok(self.connection(stream)?.local)
+    }
+
+    /// Non-destructive readiness probe of a connected stream.
+    pub fn stream_readiness(
+        &self,
+        stream: VsockStreamId,
+    ) -> Result<crate::SocketReadiness, VsockError> {
+        let connection = self.connection(stream)?;
+        let closed = matches!(connection.state, ConnectionState::Closed(_));
+        let hangup = connection.peer_shutdown.send || connection.peer_shutdown.is_full() || closed;
+        let readable = connection.receive.len() > 0 || connection.at_eof() || closed;
+        let writable = connection.state == ConnectionState::Established
+            && !connection.local_shutdown.send
+            && !connection.peer_shutdown.receive
+            && !connection.transmitting
+            && connection.peer_free() > 0;
+        Ok(crate::SocketReadiness {
+            readable,
+            writable,
+            hangup,
+        })
     }
 
     /// Authorises as much of `len` bytes as the peer's window allows.
