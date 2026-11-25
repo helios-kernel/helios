@@ -3674,6 +3674,7 @@ where
                 signal_dispositions,
                 #[cfg(feature = "linux")]
                 container: None,
+                oom_policy: crate::OomPolicy::UserProgram,
                 timeline: trace.timeline().for_task(),
             },
             prepared_io.output_mode,

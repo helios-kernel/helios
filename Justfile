@@ -36,7 +36,7 @@ check-target target package:
     build_std="{{ if target == build_std_target { build_std_flag } else { "" } }}"
     # Unquoted on purpose: an empty value must expand to no argument.
     cargo check ${build_std} -p helios-kernel \
-        --no-default-features --features wasmtime-bare-metal,embedded-debugger \
+        --no-default-features --features wasmtime-bare-metal \
         --target "{{ target }}"
     cargo check ${build_std} -p "{{ package }}" --target "{{ target }}"
 
@@ -280,7 +280,7 @@ clippy-target target package:
     # Unquoted on purpose: an empty value must expand to no argument.
     cargo clippy ${build_std} \
         -p helios-kernel --no-default-features \
-        --features wasmtime-bare-metal,embedded-debugger \
+        --features wasmtime-bare-metal \
         --target "{{ target }}" -- -D warnings
     cargo clippy ${build_std} \
         -p "{{ package }}" --target "{{ target }}" -- -D warnings

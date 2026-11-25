@@ -9,7 +9,9 @@
 mod state;
 mod types;
 
-pub use state::{RuntimeState, SnapshotHold, SnapshotHoldBusy};
+pub use state::{
+    FatalEscalationAction, FatalEscalationRecord, RuntimeState, SnapshotHold, SnapshotHoldBusy,
+};
 pub use types::{
     AuthorityDomain, ComponentHostNetwork, ComponentNetworkService, ComponentNetworkState,
     DnsError, DnsErrorKind, ExecOutput, ExecResult, HostCreation, HostDirEntry, HostDirLimit,

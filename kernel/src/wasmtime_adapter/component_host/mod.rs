@@ -25,11 +25,10 @@ use crate::{
 };
 use crate::{
     ComponentCache, ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
-    ComponentStoreData, EmbeddedComponent, ExecResult, InstanceId, ProgramExecError,
-    ProgramExecErrorDetail, ProgramExecErrorKind, RawMutex, RawMutexGuardResource,
-    RawMutexResource, RawRwLock, RawRwLockReadGuardResource, RawRwLockResource,
-    RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis, largest_servable_user_bytes,
-    monotonic_nanos, user_heap_stats,
+    ComponentStoreData, ExecResult, InstanceId, ProgramExecError, ProgramExecErrorDetail,
+    ProgramExecErrorKind, RawMutex, RawMutexGuardResource, RawMutexResource, RawRwLock,
+    RawRwLockReadGuardResource, RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource,
+    elapsed_millis, largest_servable_user_bytes, monotonic_nanos, user_heap_stats,
 };
 use helios_hal::cpu::Cpu;
 use smallvec::SmallVec;
@@ -42,7 +41,6 @@ use wasmtime::component::{
 use wasmtime::{self, Engine, Store, StoreContextMut};
 
 use crate::exec::phases::{self, LaunchPhase};
-use crate::wasmtime_adapter::bindings::debugger::bindings as debugger_bindings;
 use crate::wasmtime_adapter::bindings::program::bindings as program_bindings;
 use crate::wasmtime_adapter::config::AotCompileHint;
 use crate::wasmtime_adapter::cwasm;
@@ -53,9 +51,6 @@ use crate::{
 };
 use filters::{MetricFilterView, ProfileFilterView, TraceFilterView};
 use observation::{Denied, Refused, TargetRefusal, Visibility};
-// The two generated worlds spell every shared type identically, so each keeps
-// its own short alias rather than importing the names themselves.
-use debugger_bindings::helios::system as debugger_wit;
 use program_bindings::helios::system as program_wit;
 
 const SYNC_INSTANCE: &str = "helios:system/sync@0.1.0";
@@ -104,10 +99,10 @@ pub use helios_unix::{ChildTermination, SignalTermination};
 pub use service::{
     BlobHandle, ChildExit, ChildHandle, ClientImageSurfaceHandle, ClientSurfaceHandle,
     CommandBufferHandle, ContainerHandle, ContextHandle, DisplayHandle, GpuHandle,
-    InputDeviceHandle, PlaybackHandle, SurfaceHandle, UserProgramService,
-    install_component_host_program_service, install_program_service, launch_boot_init,
-    run_component_host_processor_forever, run_embedded_component_forever,
-    run_program_workers_forever,
+    InputDeviceHandle, PlaybackHandle, ProviderHandle, SurfaceHandle, UserProgramService,
+    install_component_host_program_service, install_program_service,
+    run_component_host_processor_forever, run_program_workers_forever, run_root_component_forever,
+    run_root_component_once,
 };
 pub(crate) use service::{
     Preview1SignalExit, ProgramArgv, ProgramExecContext, ProgramSource, WasixSignalState,
@@ -209,7 +204,7 @@ where
 
 #[derive(Clone, Copy)]
 pub enum ComponentBindingSet {
-    System,
+    RootSupervisor,
     Program,
 }
 pub type SbiRawMutex = crate::ComponentRawMutex;
@@ -243,7 +238,6 @@ macro_rules! impl_requested_aot_hint {
     };
 }
 
-impl_requested_aot_hint!(debugger_bindings);
 impl_requested_aot_hint!(program_bindings);
 
 macro_rules! impl_program_bindings {
@@ -2323,11 +2317,6 @@ macro_rules! impl_authority_conversion {
 }
 
 impl_authority_conversion!(
-    extract_debugger_ipc_grants,
-    build_debugger_child_authority,
-    debugger_bindings
-);
-impl_authority_conversion!(
     extract_program_ipc_grants,
     build_program_child_authority,
     program_bindings
@@ -2446,13 +2435,6 @@ macro_rules! impl_container_config_conversion {
 
 #[cfg(feature = "linux")]
 impl_container_config_conversion!(
-    convert_debugger_container_config,
-    convert_debugger_container_credentials,
-    debugger_bindings,
-    build_debugger_child_authority
-);
-#[cfg(feature = "linux")]
-impl_container_config_conversion!(
     convert_program_container_config,
     convert_program_container_credentials,
     program_bindings,
@@ -2503,15 +2485,6 @@ fn require_compile_authority(
 }
 
 impl_program_bindings!(
-    debugger_bindings,
-    convert_launch_result,
-    convert_launch_error,
-    extract_debugger_ipc_grants,
-    build_debugger_child_authority,
-    convert_debugger_container_config,
-    convert_debugger_container_credentials
-);
-impl_program_bindings!(
     program_bindings,
     convert_program_launch_result,
     convert_program_launch_error,
@@ -2559,7 +2532,7 @@ mod lowering_tests {
 mod hint_tests {
     use super::{
         AotCompileHint, ProgramExecErrorDetail, ProgramExecErrorKind, RequestedAotHint,
-        debugger_bindings, program_bindings,
+        program_bindings,
     };
 
     macro_rules! hint_cases {
@@ -2594,7 +2567,6 @@ mod hint_tests {
         };
     }
 
-    hint_cases!(debugger, debugger_bindings);
     hint_cases!(program, program_bindings);
 }
 
@@ -2812,12 +2784,31 @@ mod authority_tests {
         assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
     }
 
+    fn test_root_supervisor_authority() -> ProcessAuthority {
+        use helios_hal::cpu::Cpu;
+        let cpu = crate::test_support::TestCpu::with_entropy(0x42);
+        let state: super::HostRuntimeState<
+            crate::test_support::TestCpu,
+            crate::test_support::TestNetworkService,
+            crate::test_support::UnsupportedStorage,
+        > = crate::RuntimeState::new(
+            cpu.timebase(),
+            1,
+            0,
+            crate::BootPayload::for_tests(),
+            crate::GuestIsa::for_build_target(cpu.native_feature_probe()),
+        );
+        super::service::root_supervisor_authority(&state)
+    }
+
     #[test]
-    fn debugger_authority_hands_explicit_observation_and_machine_rights_to_what_it_launches() {
-        let debugger = super::debugger_authority();
+    fn root_supervisor_authority_hands_explicit_observation_and_machine_rights_to_what_it_launches()
+    {
+        let root = test_root_supervisor_authority();
+        assert!(root.is_root_supervisor());
 
         let child = build_child_authority(
-            &debugger,
+            &root,
             vec![
                 CapabilityGrant::Diagnostics(DiagnosticsGrant::InspectRead(WitScope::Machine)),
                 CapabilityGrant::Diagnostics(DiagnosticsGrant::TraceRead(WitScope::Machine)),
@@ -2827,8 +2818,11 @@ mod authority_tests {
                 machine_grant(vec![MachineRight::Control, MachineRight::Identity]),
             ],
         )
-        .expect("the debugger holds explicit machine observation, control, and identity rights");
+        .expect(
+            "the root supervisor holds explicit machine observation, control, and identity rights",
+        );
 
+        assert!(!child.is_root_supervisor());
         assert_eq!(child.inspect_read_scope(), Some(AuthorityScope::Machine));
         assert_eq!(child.trace_read_scope(), Some(AuthorityScope::Machine));
         assert_eq!(child.profile_read_scope(), Some(AuthorityScope::Machine));
@@ -2884,14 +2878,14 @@ mod authority_tests {
     /// programs the debugger launches, so the debugger holds the right it
     /// hands on.
     #[test]
-    fn debugger_authority_hands_the_settings_right_to_what_it_launches() {
-        let debugger = super::debugger_authority();
+    fn root_supervisor_authority_hands_the_settings_right_to_what_it_launches() {
+        let root = test_root_supervisor_authority();
 
-        let child =
-            build_child_authority(&debugger, vec![settings_grant(vec![SettingsRight::Write])])
-                .expect("the debugger holds the settings right");
+        let child = build_child_authority(&root, vec![settings_grant(vec![SettingsRight::Write])])
+            .expect("the root supervisor holds the settings right");
 
         assert_eq!(child.settings_rights(), SettingsAuthorityRights::WRITE);
+        assert!(!child.is_root_supervisor());
     }
 
     #[test]
@@ -2926,16 +2920,15 @@ mod authority_tests {
     }
 
     #[test]
-    fn debugger_authority_hands_the_virtualize_right_to_what_it_launches() {
-        let debugger = super::debugger_authority();
+    fn root_supervisor_authority_hands_the_virtualize_right_to_what_it_launches() {
+        let root = test_root_supervisor_authority();
 
-        let child = build_child_authority(
-            &debugger,
-            vec![machine_grant(vec![MachineRight::Virtualize])],
-        )
-        .expect("the debugger holds the virtualize right");
+        let child =
+            build_child_authority(&root, vec![machine_grant(vec![MachineRight::Virtualize])])
+                .expect("the root supervisor holds the virtualize right");
 
         assert_eq!(child.machine_rights(), MachineAuthorityRights::VIRTUALIZE);
+        assert!(!child.is_root_supervisor());
     }
 
     #[test]
@@ -2954,11 +2947,11 @@ mod authority_tests {
     /// is bounded by what the debugger holds, which is every class and no
     /// named device.
     #[test]
-    fn debugger_authority_hands_every_device_class_to_what_it_launches() {
-        let debugger = super::debugger_authority();
+    fn root_supervisor_authority_hands_every_device_class_to_what_it_launches() {
+        let root = test_root_supervisor_authority();
 
         let child = build_child_authority(
-            &debugger,
+            &root,
             vec![device_grant(vec![
                 DeviceClass::Display,
                 DeviceClass::Input,
@@ -2966,11 +2959,12 @@ mod authority_tests {
                 DeviceClass::Audio,
             ])],
         )
-        .expect("the debugger holds every device class");
+        .expect("the root supervisor holds every device class");
 
         assert_eq!(child.device_class_rights(), DeviceClassRights::all());
         assert!(child.granted_devices().is_empty());
-        assert!(debugger.granted_devices().is_empty());
+        assert!(root.granted_devices().is_empty());
+        assert!(!child.is_root_supervisor());
     }
 
     #[test]
@@ -3281,10 +3275,10 @@ mod authority_tests {
             5_000_000_000,
         ))
         .expect_err("missing network service must fail cleanly");
-        let debugger_unavailable = super::convert_net_resolve_https_error(unavailable);
+        let program_unavailable = super::convert_program_net_resolve_https_error(unavailable);
         assert!(matches!(
-            debugger_unavailable.kind,
-            super::debugger_wit::net::DnsErrorKind::Unavailable
+            program_unavailable.kind,
+            super::program_wit::net::DnsErrorKind::Unavailable
         ));
 
         let sample = crate::HttpsRecord {
@@ -3292,14 +3286,10 @@ mod authority_tests {
             port: Some(8443),
             ttl_nanos: 120_000_000_000,
         };
-        let dbg = super::convert_https_record(sample.clone());
         let prog = super::convert_program_https_record(sample);
-        assert_eq!(
-            (dbg.alpn, dbg.port, dbg.ttl),
-            (prog.alpn, prog.port, prog.ttl)
-        );
-        assert_eq!(dbg.port, Some(8443));
-        assert_eq!(dbg.ttl, 120_000_000_000);
+        assert_eq!(prog.alpn, alloc::vec!["h3", "h2"]);
+        assert_eq!(prog.port, Some(8443));
+        assert_eq!(prog.ttl, 120_000_000_000);
     }
 }
 
@@ -3516,7 +3506,8 @@ fn map_process_authority_error(error: ProcessAuthorityError) -> crate::ProgramEx
         | ProcessAuthorityError::EmptySettingsRights
         | ProcessAuthorityError::SettingsGrantExceedsAuthority(_)
         | ProcessAuthorityError::EmptyMachineRights
-        | ProcessAuthorityError::MachineGrantExceedsAuthority(_) => {
+        | ProcessAuthorityError::MachineGrantExceedsAuthority(_)
+        | ProcessAuthorityError::RootSupervisorDenied => {
             crate::ProgramExecErrorKind::PermissionDenied
         }
     };
@@ -3560,42 +3551,31 @@ where
     pub(super) write_serial: crate::DebugSerialWriter,
 }
 
-/// The authority the embedded debugger runs with: everything `root`
-/// grants, plus every device class, the machine-observation right, the
-/// settings-write right, the control-processors right and the virtualize
-/// right.
-/// The debugger claims no device itself; it holds the classes because a
-/// program can be handed only what its launcher holds, and the inspector
-/// session runs desktop, input and audio programs through it. It holds
-/// the observation right for the same reason: the inspector session
-/// runs `perf` through it. The settings-write right is held for the
-/// shell it launches, whose programs configure the machine. It holds
-/// the control-processors right both for its own
-/// `helios:system/processors` RPC and because the session runs `cpu`
-/// through it, and the virtualize right because the session runs `vmm`
-/// through its shell.
-fn debugger_authority() -> ProcessAuthority {
-    let mut authority = ProcessAuthority::root();
-    authority.grant_device_classes(DeviceClassRights::all());
-    authority.grant_inspect_read(AuthorityScope::Machine);
-    authority.grant_trace_read(AuthorityScope::Machine);
-    authority.grant_profile_read(AuthorityScope::Machine);
-    authority.grant_diagnostic_rights(DiagnosticAuthorityRights::CONTROL);
-    authority.grant_instance_control(AuthorityScope::Machine);
-    authority.grant_settings_rights(SettingsAuthorityRights::WRITE);
-    authority.grant_machine_rights(
-        crate::MachineAuthorityRights::CONTROL
-            | crate::MachineAuthorityRights::IDENTITY
-            | crate::MachineAuthorityRights::VIRTUALIZE,
-    );
-    authority
+/// Selects stdio routing for the single signed root component (`init` /
+/// `component-manager`).
+///
+/// When the platform exposes a debug UART, the root component's stdout and
+/// stderr write to the debug serial line as line-framed segments, while stdin
+/// stays closed so the root supervisor never consumes incoming serial RPC bytes
+/// meant for supervised children (such as `/bin/debugger`). On headless
+/// platforms with no debug UART, output goes to observer trace records.
+pub(crate) fn root_component_output_mode(has_debug_serial: bool) -> OutputMode {
+    if has_debug_serial {
+        OutputMode::RoutedChild {
+            stdin: crate::ComponentInputRoute::Closed,
+            stdout: crate::ComponentOutputRoute::Serial,
+            stderr: crate::ComponentOutputRoute::Serial,
+        }
+    } else {
+        OutputMode::Trace
+    }
 }
 
-async fn run_system_component<CpuImpl, Net, StorageImpl>(
-    component: EmbeddedComponent,
-    world: ComponentBindingSet,
+async fn run_root_component<CpuImpl, Net, StorageImpl>(
+    init: crate::EmbeddedInit,
     host: SystemComponentHost<CpuImpl, Net, StorageImpl>,
-) -> Result<(), DebuggerError>
+    has_debug_serial: bool,
+) -> Result<(), RootComponentError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -3615,17 +3595,16 @@ where
         write_serial,
     } = host;
 
+    let component = init.component();
     let component_name = component.name();
-    // Wait for the payload's boot `init` to finish its mounts, console
-    // banner, and `/etc/rc` before emitting debugger stage markers or
-    // claiming the serial line for RPC framing.
-    debug_state.wait_for_boot_init().await;
+    let argv0 = init.argv0();
     let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu.clone());
 
     write_serial.emit_stage_marker("engine:new");
     tracing::info!(
         component = component_name,
-        "creating system component engine"
+        argv0,
+        "creating root supervisor component engine"
     );
     let engine =
         <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as ComponentRuntimeFactory<
@@ -3633,12 +3612,12 @@ where
             HostRuntimeState<CpuImpl, Net, StorageImpl>,
             StorageImpl,
         >>::create_engine(&runtime)
-        .map_err(DebuggerError::CreateEngine)?;
+        .map_err(RootComponentError::CreateEngine)?;
     write_serial.emit_stage_marker("engine:ok");
 
     tracing::info!(
         component = component_name,
-        "loading embedded system component artifact"
+        "loading signed root supervisor component artifact"
     );
     let artifact = component.bootfs_bytes();
     let trusted = cwasm::trust_bootfs_artifact(&artifact);
@@ -3646,12 +3625,16 @@ where
         component: unsafe {
             wasmtime::component::Component::deserialize(engine.raw(), trusted.payload())
         }
-        .map_err(DebuggerError::LoadComponent)?,
+        .map_err(RootComponentError::LoadComponent)?,
     };
     write_serial.emit_stage_marker("component:ok");
 
     write_serial.emit_stage_marker("instantiate:begin");
-    tracing::info!(component = component_name, "instantiating system component");
+    tracing::info!(
+        component = component_name,
+        argv0,
+        "instantiating root supervisor component"
+    );
     let instance_registry = debug_state.instance_registry();
     let instance = instance_registry.register_with_policy(
         component_name,
@@ -3659,17 +3642,14 @@ where
         crate::OomPolicy::SystemComponent,
     );
 
-    let component_world = match world {
-        ComponentBindingSet::System => ComponentWorld::System,
-        ComponentBindingSet::Program => ComponentWorld::Program,
-    };
     let instantiate_cpu = cpu.clone();
     let instantiate_timer = timer.clone();
-    // A system component is kernel infrastructure, so its tasks are
-    // funded from the arena's kernel reserve: user-mode load fills the
-    // instance share and stops there.
+    // The root supervisor is kernel infrastructure, so its tasks are funded
+    // from the arena's kernel reserve: user-mode load fills the instance
+    // share and stops there.
     let instantiate_spawner = spawner.instance_spawner(crate::TaskFunding::Kernel, &instance);
 
+    let authority = service::root_supervisor_authority(&debug_state);
     let context = ComponentExecContext::new(
         cpu,
         timer,
@@ -3678,15 +3658,15 @@ where
         instance_registry,
         instance,
         debug_state.clone(),
+        alloc::vec![argv0.to_owned()],
         Vec::new(),
-        Vec::new(),
-        debugger_authority(),
-        OutputMode::Serial,
+        authority,
+        root_component_output_mode(has_debug_serial),
         read_serial,
         write_serial,
     );
 
-    let executor = runtime.instantiate(&engine, &compiled, component_world, context);
+    let executor = runtime.instantiate(&engine, &compiled, ComponentWorld::RootSupervisor, context);
     let instantiate_started_at = monotonic_nanos(&instantiate_cpu);
     let instantiate_heartbeat = spawn_component_phase_heartbeat(
         &instantiate_spawner,
@@ -3699,23 +3679,32 @@ where
             started_at: instantiate_started_at,
         },
     )
-    .map_err(DebuggerError::TaskCapacity)?;
+    .map_err(RootComponentError::TaskCapacity)?;
     let executor = executor.await;
     drop(instantiate_heartbeat);
-    let executor = executor.map_err(DebuggerError::InstantiateComponent)?;
+    let executor = executor.map_err(RootComponentError::InstantiateComponent)?;
     write_serial.emit_stage_marker("instantiate:ok");
 
-    tracing::info!(component = component_name, "entering wasi:cli/run");
-    write_serial.emit_stage_marker("run:begin");
+    tracing::info!(
+        component = component_name,
+        argv0,
+        "entering root supervisor wasi:cli/run"
+    );
 
-    let result = executor.run().await.map_err(DebuggerError::RunComponent)?;
+    let result = executor
+        .run()
+        .await
+        .map_err(RootComponentError::RunComponent)?;
 
     write_serial.emit_stage_marker("run:ok");
-    tracing::info!(component = component_name, "wasi:cli/run returned");
+    tracing::info!(
+        component = component_name,
+        "root supervisor wasi:cli/run returned"
+    );
 
     match result.status {
         ComponentExitStatus::Ok => Ok(()),
-        ComponentExitStatus::Failed => Err(DebuggerError::GuestFailed),
+        ComponentExitStatus::Failed => Err(RootComponentError::GuestFailed),
     }
 }
 
@@ -3742,9 +3731,9 @@ where
     inspect::add_inspect_to_linker(&mut linker)?;
     instances_snapshot::add_instances_to_linker(&mut linker)?;
     instances_snapshot::add_snapshot_to_linker(&mut linker)?;
-    match world {
-        ComponentBindingSet::System => add_system_to_linker(&mut linker)?,
-        ComponentBindingSet::Program => add_program_world_to_linker(&mut linker)?,
+    add_program_world_to_linker(&mut linker)?;
+    if matches!(world, ComponentBindingSet::RootSupervisor) {
+        service::add_root_supervisor_to_linker(&mut linker)?;
     }
     Ok(linker)
 }
@@ -3918,33 +3907,6 @@ where
         .interrupts()
         .register(instance, &store, store.data().cpu.clone());
     (store, interrupts)
-}
-
-fn add_system_to_linker<CpuImpl, Net, StorageImpl>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
-) -> wasmtime::Result<()>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    add_programs_to_linker(linker)?;
-    mounts::add_mounts_to_linker(linker)?;
-    service::add_btrfs_to_linker(linker)?;
-    add_net_to_linker(linker)?;
-    vsock::add_vsock_to_linker::<vsock::DebuggerVsock, _, _, _>(linker)?;
-    device::add_device_to_linker(linker)?;
-    service::add_display_to_linker(linker)?;
-    service::add_input_to_linker(linker)?;
-    service::add_surface_to_linker(linker)?;
-    service::add_gpu_to_linker(linker)?;
-    service::add_audio_to_linker(linker)?;
-    service::add_processors_to_linker(linker)?;
-    service::add_hv_to_linker(linker)?;
-    add_tracing_to_linker(linker)?;
-    debugger_profiling::add_to_linker(linker)?;
-    add_settings_to_linker(linker)?;
-    Ok(())
 }
 
 struct ComponentHostProfile<CpuImpl, Net, StorageImpl>
@@ -4160,7 +4122,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    debugger_wit::serial::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
+    program_wit::serial::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
         linker,
         |state| state,
     )?;
@@ -4306,21 +4268,6 @@ where
     timeline::add_to_linker(&mut instance)
 }
 
-fn add_programs_to_linker<CpuImpl, Net, StorageImpl>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
-) -> wasmtime::Result<()>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    debugger_wit::programs::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
-        linker,
-        |state| state,
-    )?;
-    Ok(())
-}
-
 fn add_programs_to_program_linker<CpuImpl, Net, StorageImpl>(
     linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
@@ -4376,478 +4323,6 @@ fn tcp_bind_network_rights(local_port: u16) -> NetworkAuthorityRights {
 
 fn udp_bind_network_rights(local_port: u16) -> NetworkAuthorityRights {
     NetworkAuthorityRights::UDP.bind_rights(local_port)
-}
-
-fn add_net_to_linker<CpuImpl, Net, StorageImpl>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
-) -> wasmtime::Result<()>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let mut instance = linker.instance(NET_INSTANCE)?;
-    instance.resource(
-        "tcp-stream",
-        ResourceType::host::<SbiTcpStream<Net>>(),
-        |mut caller, rep| {
-            let resource = Resource::<SbiTcpStream<Net>>::new_own(rep);
-            caller.data_mut().table.delete(resource)?;
-            Ok(())
-        },
-    )?;
-    instance.resource(
-        "tcp-listener",
-        ResourceType::host::<crate::ComponentTcpListener>(),
-        |mut caller, rep| {
-            let resource = Resource::<crate::ComponentTcpListener>::new_own(rep);
-            caller.data_mut().table.delete(resource)?;
-            caller.data().retire_sockets();
-            Ok(())
-        },
-    )?;
-    instance.resource(
-        "udp-socket",
-        ResourceType::host::<SbiUdpSocket<Net>>(),
-        |mut caller, rep| {
-            let resource = Resource::<SbiUdpSocket<Net>>::new_own(rep);
-            caller.data_mut().table.delete(resource)?;
-            Ok(())
-        },
-    )?;
-    instance.func_wrap_concurrent(
-        "ping",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
-         (host, timeout): (String, u64)| {
-            Box::pin(async move {
-                let has_authority = accessor.with(|mut access| {
-                    Ok::<_, wasmtime::Error>(
-                        access
-                            .get()
-                            .process_authority()
-                            .network_rights()
-                            .contains(dns_network_rights()),
-                    )
-                })?;
-                if !has_authority {
-                    return Ok::<_, wasmtime::Error>((Err(debugger_wit::net::PingError {
-                        kind: debugger_wit::net::PingErrorKind::Unavailable,
-                        detail: "network authority is missing DNS rights".to_owned(),
-                    }),));
-                }
-                let service = accessor.with(|mut access| {
-                    Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
-                })?;
-                let Some(service) = service else {
-                    return Ok::<_, wasmtime::Error>((Err(debugger_wit::net::PingError {
-                        kind: debugger_wit::net::PingErrorKind::Unavailable,
-                        detail: "network service is unavailable on this machine".to_owned(),
-                    }),));
-                };
-                let response = service
-                    .ping(&host, timeout)
-                    .await
-                    .map(convert_ping_reply)
-                    .map_err(convert_ping_error);
-                Ok::<_, wasmtime::Error>((response,))
-            })
-        },
-    )?;
-    instance.func_wrap_concurrent(
-        "tcp-connect",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
-         (host, port, timeout): (String, u16, u64)| {
-            Box::pin(async move {
-                let has_authority = accessor.with(|mut access| {
-                    Ok::<_, wasmtime::Error>(
-                        access
-                            .get()
-                            .process_authority()
-                            .network_rights()
-                            .contains(tcp_connect_network_rights()),
-                    )
-                })?;
-                if !has_authority {
-                    return Ok::<_, wasmtime::Error>((Err(unavailable_tcp_authority_error()),));
-                }
-                let (service, profile) = accessor.with(|mut access| {
-                    let store = access.get();
-                    Ok::<_, wasmtime::Error>((
-                        store.runtime_state.network_service(),
-                        component_host_profile(store),
-                    ))
-                })?;
-                let Some(service) = service else {
-                    return Ok::<_, wasmtime::Error>((Err(unavailable_tcp_error()),));
-                };
-                let connected = service.tcp_connect(&host, port, timeout).await;
-                record_component_host_kernel_profile(profile, "system-net-tcp-connect");
-                let response =
-                    match connected {
-                        Ok(stream) => {
-                            let resource =
-                                accessor.with(|mut access| {
-                                    access.get().table.push(SbiTcpStream::new(
-                                        NetworkTcpBackend::new(service.clone(), stream),
-                                    ))
-                                })?;
-                            Ok(resource)
-                        }
-                        Err(error) => Err(convert_tcp_error(error)),
-                    };
-                Ok::<_, wasmtime::Error>((response,))
-            })
-        },
-    )?;
-    instance.func_wrap_concurrent(
-        "udp-bind",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>, (local_port,): (u16,)| {
-            Box::pin(async move {
-                let required = udp_bind_network_rights(local_port);
-                let has_authority = accessor.with(|mut access| {
-                    Ok::<_, wasmtime::Error>(
-                        access
-                            .get()
-                            .process_authority()
-                            .network_rights()
-                            .contains(required),
-                    )
-                })?;
-                if !has_authority {
-                    return Ok::<_, wasmtime::Error>((Err(unavailable_udp_authority_error()),));
-                }
-                let service = accessor.with(|mut access| {
-                    Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
-                })?;
-                let Some(service) = service else {
-                    return Ok::<_, wasmtime::Error>((Err(unavailable_udp_error()),));
-                };
-                let bound = service
-                    .udp_bind(
-                        crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
-                        local_port,
-                    )
-                    .await;
-                let response =
-                    match bound {
-                        Ok(binding) => {
-                            let resource =
-                                accessor.with(|mut access| {
-                                    access.get().table.push(SbiUdpSocket::new(
-                                        NetworkUdpBackend::new(service.clone(), binding.socket),
-                                    ))
-                                })?;
-                            Ok(resource)
-                        }
-                        Err(error) => Err(convert_udp_error(error)),
-                    };
-                Ok::<_, wasmtime::Error>((response,))
-            })
-        },
-    )?;
-    instance.func_wrap_concurrent(
-        "resolve-https",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
-         (host, port, timeout): (String, u16, u64)| {
-            Box::pin(async move {
-                let (has_authority, service) = accessor.with(|mut access| {
-                    let store = access.get();
-                    Ok::<_, wasmtime::Error>((
-                        store.process_authority().derive_dns_cap().is_ok(),
-                        store.runtime_state.network_service(),
-                    ))
-                })?;
-                let response =
-                    execute_net_resolve_https(has_authority, service, &host, port, timeout)
-                        .await
-                        .map(|record| record.map(convert_https_record))
-                        .map_err(convert_net_resolve_https_error);
-                Ok::<_, wasmtime::Error>((response,))
-            })
-        },
-    )?;
-    instance.func_wrap_concurrent(
-        "[method]tcp-stream.read",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
-         (resource, max_bytes, timeout): (Resource<SbiTcpStream<Net>>, u32, u64)| {
-            Box::pin(async move {
-                let (socket, profile) = accessor.with(|mut access| {
-                    let socket = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>((
-                        (
-                            socket.resource.backend.service.clone(),
-                            socket.resource.backend.stream(),
-                        ),
-                        component_host_profile(access.get()),
-                    ))
-                })?;
-                let Some(stream) = socket.1 else {
-                    return Ok::<_, wasmtime::Error>((Err(closed_tcp_error()),));
-                };
-                let response = socket.0.tcp_read(stream, max_bytes, timeout).await;
-                let bytes = response
-                    .as_ref()
-                    .ok()
-                    .and_then(Option::as_ref)
-                    .map_or(0, Bytes::len);
-                let response = response
-                    .map(|bytes| bytes.map(lower_bytes_to_vec))
-                    .map_err(convert_tcp_error);
-                record_component_host_kernel_profile_events_bytes(
-                    profile,
-                    "system-net-tcp-read",
-                    1,
-                    component_host_usize_to_u64(bytes, "system TCP read byte count"),
-                );
-                Ok::<_, wasmtime::Error>((response,))
-            })
-        },
-    )?;
-    instance.func_wrap_concurrent(
-        "[method]tcp-stream.write",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
-         (resource, bytes, timeout): (Resource<SbiTcpStream<Net>>, WasmList<u8>, u64)| {
-            Box::pin(async move {
-                let (service, stream, profile, payload) = accessor.with(|mut access| {
-                    let socket = access.get().table.get(&resource)?;
-                    let service = socket.resource.backend.service.clone();
-                    let stream = socket.resource.backend.stream();
-                    let profile = component_host_profile(access.get());
-                    let payload =
-                        stream.map(|_| sbi_tcp_payload(&service, bytes.as_le_slice(&access)));
-                    Ok::<_, wasmtime::Error>((service, stream, profile, payload))
-                })?;
-                let (Some(stream), Some(payload)) = (stream, payload) else {
-                    return Ok::<_, wasmtime::Error>((Err(closed_tcp_error()),));
-                };
-                let written = bytes.len() as u64;
-                let response = match payload {
-                    Ok(pieces) => service
-                        .tcp_write_all(stream, pieces.into_iter().map(Ok), timeout)
-                        .await
-                        .map(|()| written),
-                    Err(error) => Err(error),
-                }
-                .map_err(convert_tcp_error);
-                record_component_host_kernel_profile(profile, "system-net-tcp-write");
-                Ok::<_, wasmtime::Error>((response,))
-            })
-        },
-    )?;
-    instance.func_wrap_concurrent_immediate(
-        "[method]tcp-stream.close",
-        |mut caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
-         (resource,): (Resource<SbiTcpStream<Net>>,)| {
-            let socket = caller.data_mut().table.get_mut(&resource)?;
-            socket.resource.backend.close();
-            Ok((Ok::<(), debugger_wit::net::TcpError>(()),))
-        },
-    )?;
-    instance.func_wrap_concurrent(
-        "tcp-listen",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
-         (local_address, local_port, backlog): (debugger_wit::net::IpAddress, u16, u16)| {
-            Box::pin(async move {
-                let required = tcp_bind_network_rights(local_port);
-                let (has_authority, service) = accessor.with(|mut access| {
-                    let store = access.get();
-                    Ok::<_, wasmtime::Error>((
-                        store
-                            .process_authority()
-                            .network_rights()
-                            .contains(required),
-                        store.runtime_state.network_service(),
-                    ))
-                })?;
-                if !has_authority {
-                    return Ok::<_, wasmtime::Error>((Err(debugger_wit::net::TcpError {
-                        kind: debugger_wit::net::TcpErrorKind::PermissionDenied,
-                        detail: "network authority is missing TCP or privileged-bind rights"
-                            .to_owned(),
-                    }),));
-                }
-                let Some(service) = service else {
-                    return Ok::<_, wasmtime::Error>((Err(unavailable_tcp_error()),));
-                };
-                let addr = from_wit_ip_address(local_address);
-                let hop_limit = helios_netstack::DEFAULT_HOP_LIMIT;
-                let response = match service
-                    .tcp_listen(addr, local_port, backlog, hop_limit)
-                    .await
-                {
-                    Ok(bound) => {
-                        let resource = accessor.with(|mut access| {
-                            let store = access.get();
-                            let retire = store.retirement.sender();
-                            store.table.push(crate::ComponentTcpListener::new(
-                                <Net::TcpListener as crate::NetworkHandle>::into_raw(
-                                    bound.listener,
-                                ),
-                                addr,
-                                bound.local_port,
-                                hop_limit,
-                                retire,
-                            ))
-                        })?;
-                        Ok(resource)
-                    }
-                    Err(error) => Err(convert_tcp_error(error)),
-                };
-                Ok::<_, wasmtime::Error>((response,))
-            })
-        },
-    )?;
-    instance.func_wrap(
-        "[method]tcp-listener.local-address",
-        |caller: wasmtime::StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
-         (resource,): (Resource<crate::ComponentTcpListener>,)| {
-            let listener = caller.data().table.get(&resource)?;
-            Ok(((
-                convert_ip_address(listener.local_address()),
-                listener.local_port(),
-            ),))
-        },
-    )?;
-    instance.func_wrap_concurrent(
-        "[method]tcp-listener.wait-readable",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
-         (resource, timeout): (Resource<crate::ComponentTcpListener>, u64)| {
-            Box::pin(async move {
-                let (service, raw) = accessor.with(|mut access| {
-                    let store = access.get();
-                    let listener = store.table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>((
-                        store.runtime_state.network_service(),
-                        listener.raw(),
-                    ))
-                })?;
-                let Some(raw) = raw else {
-                    return Ok::<_, wasmtime::Error>((Err(closed_tcp_listener_error()),));
-                };
-                let Some(service) = service else {
-                    return Ok::<_, wasmtime::Error>((Err(unavailable_tcp_error()),));
-                };
-                let handle = <Net::TcpListener as crate::NetworkHandle>::from_raw(raw);
-                let response = service
-                    .tcp_listener_wait_readable(handle, timeout)
-                    .await
-                    .map_err(convert_tcp_error);
-                Ok::<_, wasmtime::Error>((response,))
-            })
-        },
-    )?;
-    instance.func_wrap_concurrent(
-        "[method]tcp-listener.accept",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
-         (resource, timeout): (Resource<crate::ComponentTcpListener>, u64)| {
-            Box::pin(async move {
-                let (service, raw) = accessor.with(|mut access| {
-                    let store = access.get();
-                    let listener = store.table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>((
-                        store.runtime_state.network_service(),
-                        listener.raw(),
-                    ))
-                })?;
-                let Some(raw) = raw else {
-                    return Ok::<_, wasmtime::Error>((Err(closed_tcp_listener_error()),));
-                };
-                let Some(service) = service else {
-                    return Ok::<_, wasmtime::Error>((Err(unavailable_tcp_error()),));
-                };
-                let handle = <Net::TcpListener as crate::NetworkHandle>::from_raw(raw);
-                let response =
-                    match service.tcp_accept(handle, timeout).await {
-                        Ok(accepted) => {
-                            let resource =
-                                accessor.with(|mut access| {
-                                    access.get().table.push(SbiTcpStream::new(
-                                        NetworkTcpBackend::new(service.clone(), accepted.stream),
-                                    ))
-                                })?;
-                            Ok(resource)
-                        }
-                        Err(error) => Err(convert_tcp_error(error)),
-                    };
-                Ok::<_, wasmtime::Error>((response,))
-            })
-        },
-    )?;
-    instance.func_wrap_concurrent_immediate(
-        "[method]tcp-listener.close",
-        |mut caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
-         (resource,): (Resource<crate::ComponentTcpListener>,)| {
-            let listener = caller.data_mut().table.get_mut(&resource)?;
-            listener.close();
-            caller.data().retire_sockets();
-            Ok((Ok::<(), debugger_wit::net::TcpError>(()),))
-        },
-    )?;
-    instance.func_wrap_concurrent(
-        "[method]udp-socket.receive",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
-         (resource, max_bytes, timeout): (Resource<SbiUdpSocket<Net>>, u32, u64)| {
-            Box::pin(async move {
-                let socket = accessor.with(|mut access| {
-                    let socket = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>((
-                        socket.resource.backend.service.clone(),
-                        socket.resource.backend.socket(),
-                    ))
-                })?;
-                let Some(handle) = socket.1 else {
-                    return Ok::<_, wasmtime::Error>((Err(closed_udp_error()),));
-                };
-                let response = socket
-                    .0
-                    .udp_receive(handle, max_bytes, timeout)
-                    .await
-                    .map(|datagram| datagram.map(convert_udp_datagram))
-                    .map_err(convert_udp_error);
-                Ok::<_, wasmtime::Error>((response,))
-            })
-        },
-    )?;
-    instance.func_wrap_concurrent(
-        "[method]udp-socket.send",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
-         (resource, host, port, bytes, timeout): (
-            Resource<SbiUdpSocket<Net>>,
-            String,
-            u16,
-            Vec<u8>,
-            u64,
-        )| {
-            Box::pin(async move {
-                let socket = accessor.with(|mut access| {
-                    let socket = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>((
-                        socket.resource.backend.service.clone(),
-                        socket.resource.backend.socket(),
-                    ))
-                })?;
-                let Some(handle) = socket.1 else {
-                    return Ok::<_, wasmtime::Error>((Err(closed_udp_error()),));
-                };
-                let response = socket
-                    .0
-                    .udp_send(handle, &host, port, &bytes, timeout)
-                    .await
-                    .map_err(convert_udp_error);
-                Ok::<_, wasmtime::Error>((response,))
-            })
-        },
-    )?;
-    instance.func_wrap_concurrent_immediate(
-        "[method]udp-socket.close",
-        |mut caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
-         (resource,): (Resource<SbiUdpSocket<Net>>,)| {
-            let socket = caller.data_mut().table.get_mut(&resource)?;
-            socket.resource.backend.close();
-            Ok((Ok::<(), debugger_wit::net::UdpError>(()),))
-        },
-    )?;
-    Ok(())
 }
 
 fn add_net_to_program_linker<CpuImpl, Net, StorageImpl>(
@@ -5340,82 +4815,10 @@ where
     Ok(())
 }
 
-fn add_tracing_to_linker<CpuImpl, Net, StorageImpl>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
-) -> wasmtime::Result<()>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let mut instance = linker.instance(TRACING_INSTANCE)?;
-    instance.func_wrap_data_memory(
-        "set-target-enabled",
-        |data, memory, (target, enabled): (WasmStr, bool)| {
-            let target = target.to_str_in(memory)?;
-            let result =
-                observation::set_target_enabled(data, &target, enabled).map_err(|refusal| {
-                    match refusal {
-                        TargetRefusal::Denied => debugger_wit::tracing::TargetError::Denied,
-                        TargetRefusal::Unknown(error) => {
-                            debugger_wit::tracing::TargetError::UnknownTarget(error)
-                        }
-                    }
-                });
-            Ok((result,))
-        },
-    )?;
-    instance.func_wrap(
-        "recent",
-        |mut caller, (filter, limit): (TraceFilterView, u32)| {
-            let events = filter
-                .lift(&mut caller)?
-                .map(|filter| {
-                    observation::recent_events(caller.data(), &filter, limit)
-                        .into_iter()
-                        .map(|event| convert_event(&event))
-                        .collect::<Vec<_>>()
-                })
-                .map_err(debugger_wit::filters::FilterError::from);
-            Ok((events,))
-        },
-    )?;
-    instance.func_wrap("subscribe", |mut caller, (filter,): (TraceFilterView,)| {
-        let filter = match filter.lift(&mut caller)? {
-            Ok(filter) => filter,
-            Err(refusal) => {
-                return Ok((Err(debugger_wit::filters::FilterError::from(refusal)),));
-            }
-        };
-        // The stream fixes its scope here and keeps it for its life.
-        let visibility = Visibility::trace_of(caller.data());
-        let reader = match visibility {
-            Visibility::None(scope) => {
-                StreamReader::new(&mut caller, TracingStreamProducer::new(filter, scope))?
-            }
-            Visibility::Own(scope) => {
-                StreamReader::new(&mut caller, TracingStreamProducer::new(filter, scope))?
-            }
-            Visibility::Subtree(scope) => {
-                StreamReader::new(&mut caller, TracingStreamProducer::new(filter, scope))?
-            }
-            Visibility::Machine(scope) => {
-                StreamReader::new(&mut caller, TracingStreamProducer::new(filter, scope))?
-            }
-        };
-        Ok((Ok(reader),))
-    })?;
-    Ok(())
-}
-
-/// Registers `helios:system/settings` for both worlds.
+/// Registers `helios:system/settings`.
 ///
-/// Unlike the interfaces above, nothing here is written against a world's
-/// generated types: the listing, a row and the value cross as the views in
-/// `settings`, which name the interface's records by their component model
-/// shape. One registration therefore serves the debugger and program
-/// worlds, and the whole interface is registered, so neither can
-/// instantiate against a missing function.
+/// The listing, a row and the value cross as the views in `settings`, which
+/// name the interface's records by their component model shape.
 fn add_settings_to_linker<CpuImpl, Net, StorageImpl>(
     linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
@@ -5684,7 +5087,6 @@ macro_rules! impl_profiling_bindings {
     };
 }
 
-impl_profiling_bindings!(debugger_profiling, debugger_wit);
 impl_profiling_bindings!(program_profiling, program_wit);
 
 /// Copies one window of the kernel's own LLVM raw profile out of the image.
@@ -5781,51 +5183,6 @@ where
     Ok(())
 }
 
-fn convert_launch_error(error: crate::ProgramExecError) -> debugger_wit::programs::ExecError {
-    debugger_wit::programs::ExecError {
-        kind: match error.kind {
-            ProgramExecErrorKind::InvalidBinary => {
-                debugger_wit::programs::ExecErrorKind::InvalidBinary
-            }
-            ProgramExecErrorKind::MissingEntry => {
-                debugger_wit::programs::ExecErrorKind::MissingEntry
-            }
-            ProgramExecErrorKind::UnsupportedImport => {
-                debugger_wit::programs::ExecErrorKind::UnsupportedImport
-            }
-            ProgramExecErrorKind::InvalidSignature => {
-                debugger_wit::programs::ExecErrorKind::InvalidSignature
-            }
-            ProgramExecErrorKind::InvalidPath => debugger_wit::programs::ExecErrorKind::InvalidPath,
-            ProgramExecErrorKind::PermissionDenied => {
-                debugger_wit::programs::ExecErrorKind::PermissionDenied
-            }
-            ProgramExecErrorKind::InvalidHint => debugger_wit::programs::ExecErrorKind::InvalidHint,
-            ProgramExecErrorKind::OutOfMemory => debugger_wit::programs::ExecErrorKind::OutOfMemory,
-            ProgramExecErrorKind::Unavailable => debugger_wit::programs::ExecErrorKind::Unavailable,
-            ProgramExecErrorKind::Internal => debugger_wit::programs::ExecErrorKind::Internal,
-            ProgramExecErrorKind::NotFound => debugger_wit::programs::ExecErrorKind::NotFound,
-            ProgramExecErrorKind::Io => debugger_wit::programs::ExecErrorKind::Io,
-        },
-        detail: error.detail.as_str().to_owned(),
-    }
-}
-
-fn convert_launch_result(
-    result: crate::ExecResult,
-    launch_nanos: u64,
-) -> debugger_wit::programs::ExecResult {
-    debugger_wit::programs::ExecResult {
-        instance_id: result.instance_id.raw(),
-        exit_code: result.exit_code,
-        output: debugger_wit::programs::ExecOutput {
-            stdout: result.output.stdout,
-            stderr: result.output.stderr,
-        },
-        launch_nanos,
-    }
-}
-
 fn convert_program_launch_error(
     error: crate::ProgramExecError,
 ) -> program_wit::programs::ExecError {
@@ -5873,18 +5230,6 @@ fn convert_program_launch_result(
     }
 }
 
-fn convert_ip_address(address: crate::NetworkIpAddress) -> debugger_wit::net::IpAddress {
-    match address {
-        crate::NetworkIpAddress::Ipv4(address) => {
-            let octets = address.octets();
-            debugger_wit::net::IpAddress::Ipv4((octets[0], octets[1], octets[2], octets[3]))
-        }
-        crate::NetworkIpAddress::Ipv6(address) => {
-            debugger_wit::net::IpAddress::Ipv6(ipv6_address_groups(address))
-        }
-    }
-}
-
 fn convert_program_ip_address(address: crate::NetworkIpAddress) -> program_wit::net::IpAddress {
     match address {
         crate::NetworkIpAddress::Ipv4(address) => {
@@ -5912,17 +5257,6 @@ fn ipv6_from_groups(
     helios_netstack::Ipv6Address::new(octets)
 }
 
-fn from_wit_ip_address(address: debugger_wit::net::IpAddress) -> crate::NetworkIpAddress {
-    match address {
-        debugger_wit::net::IpAddress::Ipv4((a, b, c, d)) => {
-            crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([a, b, c, d]))
-        }
-        debugger_wit::net::IpAddress::Ipv6(groups) => {
-            crate::NetworkIpAddress::Ipv6(ipv6_from_groups(groups))
-        }
-    }
-}
-
 fn from_program_wit_ip_address(address: program_wit::net::IpAddress) -> crate::NetworkIpAddress {
     match address {
         program_wit::net::IpAddress::Ipv4((a, b, c, d)) => {
@@ -5934,33 +5268,11 @@ fn from_program_wit_ip_address(address: program_wit::net::IpAddress) -> crate::N
     }
 }
 
-fn convert_ping_reply(reply: crate::PingReply) -> debugger_wit::net::PingReply {
-    debugger_wit::net::PingReply {
-        address: convert_ip_address(reply.address),
-        round_trip: reply.round_trip_nanos,
-        payload_bytes: reply.payload_bytes,
-    }
-}
-
 fn convert_program_ping_reply(reply: crate::PingReply) -> program_wit::net::PingReply {
     program_wit::net::PingReply {
         address: convert_program_ip_address(reply.address),
         round_trip: reply.round_trip_nanos,
         payload_bytes: reply.payload_bytes,
-    }
-}
-
-fn convert_ping_error(error: crate::PingError) -> debugger_wit::net::PingError {
-    debugger_wit::net::PingError {
-        kind: match error.kind {
-            crate::PingErrorKind::UnresolvedHost => {
-                debugger_wit::net::PingErrorKind::UnresolvedHost
-            }
-            crate::PingErrorKind::Timeout => debugger_wit::net::PingErrorKind::Timeout,
-            crate::PingErrorKind::Unavailable => debugger_wit::net::PingErrorKind::Unavailable,
-            crate::PingErrorKind::Internal => debugger_wit::net::PingErrorKind::Internal,
-        },
-        detail: error.detail.as_str().to_owned(),
     }
 }
 
@@ -5976,43 +5288,11 @@ fn convert_program_ping_error(error: crate::PingError) -> program_wit::net::Ping
     }
 }
 
-fn convert_https_record(record: crate::HttpsRecord) -> debugger_wit::net::HttpsRecord {
-    debugger_wit::net::HttpsRecord {
-        alpn: record.alpn,
-        port: record.port,
-        ttl: record.ttl_nanos,
-    }
-}
-
 fn convert_program_https_record(record: crate::HttpsRecord) -> program_wit::net::HttpsRecord {
     program_wit::net::HttpsRecord {
         alpn: record.alpn,
         port: record.port,
         ttl: record.ttl_nanos,
-    }
-}
-
-fn convert_net_resolve_https_error(error: NetResolveHttpsError) -> debugger_wit::net::DnsError {
-    match error {
-        NetResolveHttpsError::MissingDnsAuthority => debugger_wit::net::DnsError {
-            kind: debugger_wit::net::DnsErrorKind::PermissionDenied,
-            detail: "network authority is missing DNS rights".to_owned(),
-        },
-        NetResolveHttpsError::ServiceUnavailable => debugger_wit::net::DnsError {
-            kind: debugger_wit::net::DnsErrorKind::Unavailable,
-            detail: "network service is unavailable on this machine".to_owned(),
-        },
-        NetResolveHttpsError::Lookup(error) => debugger_wit::net::DnsError {
-            kind: match error.kind {
-                crate::DnsErrorKind::UnresolvedHost => {
-                    debugger_wit::net::DnsErrorKind::UnresolvedHost
-                }
-                crate::DnsErrorKind::Timeout => debugger_wit::net::DnsErrorKind::Timeout,
-                crate::DnsErrorKind::Unavailable => debugger_wit::net::DnsErrorKind::Unavailable,
-                crate::DnsErrorKind::Internal => debugger_wit::net::DnsErrorKind::Internal,
-            },
-            detail: error.detail.as_str().to_owned(),
-        },
     }
 }
 
@@ -6044,24 +5324,10 @@ fn convert_program_net_resolve_https_error(
 
 /// The error a `tcp-stream` method answers once the guest has closed
 /// the stream but still holds its handle.
-fn closed_tcp_error() -> debugger_wit::net::TcpError {
-    debugger_wit::net::TcpError {
-        kind: debugger_wit::net::TcpErrorKind::Unavailable,
-        detail: "TCP stream is closed".to_owned(),
-    }
-}
-
 fn closed_program_tcp_error() -> program_wit::net::TcpError {
     program_wit::net::TcpError {
         kind: program_wit::net::TcpErrorKind::Unavailable,
         detail: "TCP stream is closed".to_owned(),
-    }
-}
-
-fn closed_tcp_listener_error() -> debugger_wit::net::TcpError {
-    debugger_wit::net::TcpError {
-        kind: debugger_wit::net::TcpErrorKind::Unavailable,
-        detail: "TCP listener is closed".to_owned(),
     }
 }
 
@@ -6090,20 +5356,6 @@ fn sbi_tcp_payload<Net: crate::ComponentNetworkService>(
         .collect()
 }
 
-fn unavailable_tcp_error() -> debugger_wit::net::TcpError {
-    debugger_wit::net::TcpError {
-        kind: debugger_wit::net::TcpErrorKind::Unavailable,
-        detail: "network service is unavailable on this machine".to_owned(),
-    }
-}
-
-fn unavailable_tcp_authority_error() -> debugger_wit::net::TcpError {
-    debugger_wit::net::TcpError {
-        kind: debugger_wit::net::TcpErrorKind::Unavailable,
-        detail: "network authority is missing TCP or DNS rights".to_owned(),
-    }
-}
-
 fn unavailable_program_tcp_error() -> program_wit::net::TcpError {
     program_wit::net::TcpError {
         kind: program_wit::net::TcpErrorKind::Unavailable,
@@ -6120,31 +5372,10 @@ fn unavailable_program_tcp_authority_error() -> program_wit::net::TcpError {
 
 /// The error a `udp-socket` method answers once the guest has closed
 /// the socket but still holds its handle.
-fn closed_udp_error() -> debugger_wit::net::UdpError {
-    debugger_wit::net::UdpError {
-        kind: debugger_wit::net::UdpErrorKind::Unavailable,
-        detail: "UDP socket is closed".to_owned(),
-    }
-}
-
 fn closed_program_udp_error() -> program_wit::net::UdpError {
     program_wit::net::UdpError {
         kind: program_wit::net::UdpErrorKind::Unavailable,
         detail: "UDP socket is closed".to_owned(),
-    }
-}
-
-fn unavailable_udp_error() -> debugger_wit::net::UdpError {
-    debugger_wit::net::UdpError {
-        kind: debugger_wit::net::UdpErrorKind::Unavailable,
-        detail: "network service is unavailable on this machine".to_owned(),
-    }
-}
-
-fn unavailable_udp_authority_error() -> debugger_wit::net::UdpError {
-    debugger_wit::net::UdpError {
-        kind: debugger_wit::net::UdpErrorKind::Unavailable,
-        detail: "network authority is missing UDP or privileged-bind rights".to_owned(),
     }
 }
 
@@ -6159,32 +5390,6 @@ fn unavailable_program_udp_authority_error() -> program_wit::net::UdpError {
     program_wit::net::UdpError {
         kind: program_wit::net::UdpErrorKind::Unavailable,
         detail: "network authority is missing UDP or privileged-bind rights".to_owned(),
-    }
-}
-
-fn convert_tcp_error(error: crate::TcpError) -> debugger_wit::net::TcpError {
-    debugger_wit::net::TcpError {
-        kind: match error.kind {
-            crate::TcpErrorKind::UnresolvedHost => debugger_wit::net::TcpErrorKind::UnresolvedHost,
-            crate::TcpErrorKind::Timeout => debugger_wit::net::TcpErrorKind::Timeout,
-            crate::TcpErrorKind::ConnectionReset => {
-                debugger_wit::net::TcpErrorKind::ConnectionReset
-            }
-            crate::TcpErrorKind::ConnectionAborted => {
-                debugger_wit::net::TcpErrorKind::ConnectionAborted
-            }
-            crate::TcpErrorKind::PermissionDenied => {
-                debugger_wit::net::TcpErrorKind::PermissionDenied
-            }
-            crate::TcpErrorKind::Unavailable
-                if error.detail == crate::NetworkErrorDetail::TcpListenStartFailed =>
-            {
-                debugger_wit::net::TcpErrorKind::AddressInUse
-            }
-            crate::TcpErrorKind::Unavailable => debugger_wit::net::TcpErrorKind::Unavailable,
-            crate::TcpErrorKind::Internal => debugger_wit::net::TcpErrorKind::Internal,
-        },
-        detail: error.detail.as_str().to_owned(),
     }
 }
 
@@ -6212,35 +5417,11 @@ fn convert_program_tcp_error(error: crate::TcpError) -> program_wit::net::TcpErr
     }
 }
 
-fn convert_udp_datagram(datagram: crate::UdpDatagram) -> debugger_wit::net::UdpDatagram {
-    debugger_wit::net::UdpDatagram {
-        address: convert_ip_address(datagram.address),
-        port: datagram.port,
-        bytes: lower_bytes_to_vec(datagram.bytes),
-    }
-}
-
 fn convert_program_udp_datagram(datagram: crate::UdpDatagram) -> program_wit::net::UdpDatagram {
     program_wit::net::UdpDatagram {
         address: convert_program_ip_address(datagram.address),
         port: datagram.port,
         bytes: lower_bytes_to_vec(datagram.bytes),
-    }
-}
-
-fn convert_udp_error(error: crate::UdpError) -> debugger_wit::net::UdpError {
-    debugger_wit::net::UdpError {
-        kind: match error.kind {
-            crate::UdpErrorKind::UnresolvedHost => debugger_wit::net::UdpErrorKind::UnresolvedHost,
-            crate::UdpErrorKind::Unsupported => debugger_wit::net::UdpErrorKind::Unavailable,
-            crate::UdpErrorKind::Timeout => debugger_wit::net::UdpErrorKind::Timeout,
-            crate::UdpErrorKind::PermissionDenied => {
-                debugger_wit::net::UdpErrorKind::PermissionDenied
-            }
-            crate::UdpErrorKind::Unavailable => debugger_wit::net::UdpErrorKind::Unavailable,
-            crate::UdpErrorKind::Internal => debugger_wit::net::UdpErrorKind::Internal,
-        },
-        detail: error.detail.as_str().to_owned(),
     }
 }
 
@@ -6266,7 +5447,7 @@ struct SerialPermissionDenied {
     operation: &'static str,
 }
 
-impl<CpuImpl, Net, StorageImpl> debugger_wit::serial::Host for StoreData<CpuImpl, Net, StorageImpl>
+impl<CpuImpl, Net, StorageImpl> program_wit::serial::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -6274,7 +5455,7 @@ where
 {
 }
 
-impl<CpuImpl, Net, StorageImpl, U> debugger_wit::serial::HostWithStore<U>
+impl<CpuImpl, Net, StorageImpl, U> program_wit::serial::HostWithStore<U>
     for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
@@ -6298,7 +5479,7 @@ where
     }
 }
 
-impl<CpuImpl, Net, StorageImpl> debugger_wit::serial::HostSerialPort
+impl<CpuImpl, Net, StorageImpl> program_wit::serial::HostSerialPort
     for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
@@ -6307,7 +5488,7 @@ where
 {
 }
 
-impl<CpuImpl, Net, StorageImpl, U> debugger_wit::serial::HostSerialPortWithStore<U>
+impl<CpuImpl, Net, StorageImpl, U> program_wit::serial::HostSerialPortWithStore<U>
     for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
@@ -6317,15 +5498,15 @@ where
     fn rights(
         mut access: Access<'_, U, Self>,
         resource: Resource<SbiSerialPort>,
-    ) -> wasmtime::Result<debugger_wit::serial::SerialRights> {
+    ) -> wasmtime::Result<program_wit::serial::SerialRights> {
         let port = access.get().table.get(&resource)?;
-        let mut rights = debugger_wit::serial::SerialRights::empty();
+        let mut rights = program_wit::serial::SerialRights::empty();
         if port.can_read {
-            rights |= debugger_wit::serial::SerialRights::READ;
+            rights |= program_wit::serial::SerialRights::READ;
         }
         if port.can_write {
-            rights |= debugger_wit::serial::SerialRights::WRITE
-                | debugger_wit::serial::SerialRights::FLUSH;
+            rights |=
+                program_wit::serial::SerialRights::WRITE | program_wit::serial::SerialRights::FLUSH;
         }
         Ok(rights)
     }
@@ -6408,7 +5589,7 @@ where
     }
 }
 
-impl<CpuImpl, Net, StorageImpl> debugger_wit::sync::Host for StoreData<CpuImpl, Net, StorageImpl>
+impl<CpuImpl, Net, StorageImpl> program_wit::sync::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -6416,7 +5597,7 @@ where
 {
 }
 
-impl<CpuImpl, Net, StorageImpl> debugger_wit::sync::HostRawMutex
+impl<CpuImpl, Net, StorageImpl> program_wit::sync::HostRawMutex
     for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
@@ -6425,7 +5606,7 @@ where
 {
 }
 
-impl<CpuImpl, Net, StorageImpl, U> debugger_wit::sync::HostRawMutexWithStore<U>
+impl<CpuImpl, Net, StorageImpl, U> program_wit::sync::HostRawMutexWithStore<U>
     for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
@@ -6465,7 +5646,7 @@ where
     }
 }
 
-impl<CpuImpl, Net, StorageImpl> debugger_wit::sync::HostRawMutexGuard
+impl<CpuImpl, Net, StorageImpl> program_wit::sync::HostRawMutexGuard
     for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
@@ -6474,7 +5655,7 @@ where
 {
 }
 
-impl<CpuImpl, Net, StorageImpl, U> debugger_wit::sync::HostRawMutexGuardWithStore<U>
+impl<CpuImpl, Net, StorageImpl, U> program_wit::sync::HostRawMutexGuardWithStore<U>
     for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
@@ -6490,7 +5671,7 @@ where
     }
 }
 
-impl<CpuImpl, Net, StorageImpl> debugger_wit::sync::HostRawRwLock
+impl<CpuImpl, Net, StorageImpl> program_wit::sync::HostRawRwLock
     for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
@@ -6499,7 +5680,7 @@ where
 {
 }
 
-impl<CpuImpl, Net, StorageImpl, U> debugger_wit::sync::HostRawRwLockWithStore<U>
+impl<CpuImpl, Net, StorageImpl, U> program_wit::sync::HostRawRwLockWithStore<U>
     for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
@@ -6554,7 +5735,7 @@ where
     }
 }
 
-impl<CpuImpl, Net, StorageImpl> debugger_wit::sync::HostRawRwLockReadGuard
+impl<CpuImpl, Net, StorageImpl> program_wit::sync::HostRawRwLockReadGuard
     for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
@@ -6563,7 +5744,7 @@ where
 {
 }
 
-impl<CpuImpl, Net, StorageImpl, U> debugger_wit::sync::HostRawRwLockReadGuardWithStore<U>
+impl<CpuImpl, Net, StorageImpl, U> program_wit::sync::HostRawRwLockReadGuardWithStore<U>
     for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
@@ -6579,7 +5760,7 @@ where
     }
 }
 
-impl<CpuImpl, Net, StorageImpl> debugger_wit::sync::HostRawRwLockWriteGuard
+impl<CpuImpl, Net, StorageImpl> program_wit::sync::HostRawRwLockWriteGuard
     for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
@@ -6588,7 +5769,7 @@ where
 {
 }
 
-impl<CpuImpl, Net, StorageImpl, U> debugger_wit::sync::HostRawRwLockWriteGuardWithStore<U>
+impl<CpuImpl, Net, StorageImpl, U> program_wit::sync::HostRawRwLockWriteGuardWithStore<U>
     for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     CpuImpl: Cpu + Clone,
@@ -6604,7 +5785,7 @@ where
     }
 }
 
-/// The debugger world's trace stream. It owns a filter, the scope it was
+/// The program world's trace stream. It owns a filter, the scope it was
 /// created with and a cursor, and no buffer: each poll runs on the store's
 /// task and asks the trace log for the next event the scope admits and the
 /// filter matches, which copies a bounded batch of pointers under the
@@ -6612,61 +5793,6 @@ where
 ///
 /// The scope is fixed when the stream is created, from the creator's
 /// authority at that moment, and the stream keeps it for its life.
-struct TracingStreamProducer<Scope> {
-    scope: Scope,
-    filter: TraceFilter,
-    cursor: u64,
-}
-
-impl<Scope> TracingStreamProducer<Scope> {
-    fn new(filter: TraceFilter, scope: Scope) -> Self {
-        Self {
-            scope,
-            filter,
-            cursor: 0,
-        }
-    }
-}
-
-impl<Scope, CpuImpl, Net, StorageImpl> StreamProducer<StoreData<CpuImpl, Net, StorageImpl>>
-    for TracingStreamProducer<Scope>
-where
-    Scope: crate::ObservationScope + Send + Unpin + 'static,
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    type Item = debugger_wit::tracing::Event;
-    type Buffer = Option<Self::Item>;
-
-    fn poll_produce<'a>(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        store: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
-        mut destination: Destination<'a, Self::Item, Self::Buffer>,
-        finish: bool,
-    ) -> Poll<wasmtime::Result<StreamResult>> {
-        if finish {
-            return Poll::Ready(Ok(StreamResult::Cancelled));
-        }
-
-        let this = &mut *self;
-        match store
-            .data()
-            .runtime_state
-            .next_after(&this.scope, &mut this.cursor, &this.filter)
-        {
-            Some(event) => {
-                destination.set_buffer(Some(convert_event(&event)));
-                Poll::Ready(Ok(StreamResult::Completed))
-            }
-            None => Poll::Pending,
-        }
-    }
-}
-
-/// The program world's trace stream, with the contract of
-/// [`TracingStreamProducer`].
 struct ProgramTracingStreamProducer<Scope> {
     scope: Scope,
     filter: TraceFilter,
@@ -6723,15 +5849,6 @@ where
 /// Lowers a shared history event. The history keeps its copy for other
 /// readers, so the guest's copy of each string is made here, after the
 /// history's lock is released.
-fn convert_event(event: &TraceEvent) -> debugger_wit::tracing::Event {
-    debugger_wit::tracing::Event {
-        timestamp: event.timestamp,
-        level: convert_level_from_local(event.level),
-        target: event.target.clone(),
-        fields: event.fields.iter().map(convert_field).collect(),
-    }
-}
-
 fn convert_program_event(event: &TraceEvent) -> program_wit::tracing::Event {
     program_wit::tracing::Event {
         timestamp: event.timestamp,
@@ -6741,28 +5858,10 @@ fn convert_program_event(event: &TraceEvent) -> program_wit::tracing::Event {
     }
 }
 
-fn convert_field(field: &TraceField) -> debugger_wit::tracing::Field {
-    debugger_wit::tracing::Field {
-        key: field.key.clone(),
-        value: convert_value(&field.value),
-    }
-}
-
 fn convert_program_field(field: &TraceField) -> program_wit::tracing::Field {
     program_wit::tracing::Field {
         key: field.key.clone(),
         value: convert_program_value(&field.value),
-    }
-}
-
-fn convert_value(value: &TraceValue) -> debugger_wit::tracing::Value {
-    match value {
-        TraceValue::Boolean(value) => debugger_wit::tracing::Value::Boolean(*value),
-        TraceValue::Signed64(value) => debugger_wit::tracing::Value::Signed64(*value),
-        TraceValue::Unsigned64(value) => debugger_wit::tracing::Value::Unsigned64(*value),
-        TraceValue::Float64(value) => debugger_wit::tracing::Value::Float64(*value),
-        TraceValue::Text(value) => debugger_wit::tracing::Value::Text(value.clone()),
-        TraceValue::Blob(value) => debugger_wit::tracing::Value::Blob(value.clone()),
     }
 }
 
@@ -6774,16 +5873,6 @@ fn convert_program_value(value: &TraceValue) -> program_wit::tracing::Value {
         TraceValue::Float64(value) => program_wit::tracing::Value::Float64(*value),
         TraceValue::Text(value) => program_wit::tracing::Value::Text(value.clone()),
         TraceValue::Blob(value) => program_wit::tracing::Value::Blob(value.clone()),
-    }
-}
-
-fn convert_level_from_local(level: TraceLevel) -> debugger_wit::tracing::Level {
-    match level {
-        TraceLevel::Error => debugger_wit::tracing::Level::Error,
-        TraceLevel::Warn => debugger_wit::tracing::Level::Warn,
-        TraceLevel::Info => debugger_wit::tracing::Level::Info,
-        TraceLevel::Debug => debugger_wit::tracing::Level::Debug,
-        TraceLevel::Trace => debugger_wit::tracing::Level::Trace,
     }
 }
 
@@ -6809,18 +5898,18 @@ fn emit_program_stage_marker(write_serial: crate::DebugSerialWriter, stage: &str
 }
 
 #[derive(Debug, Error)]
-enum DebuggerError {
+pub enum RootComponentError {
     #[error("failed to initialize Wasmtime engine: {0:#}")]
     CreateEngine(wasmtime::Error),
-    #[error("failed to load embedded debugger component: {0:#}")]
+    #[error("failed to load root supervisor component: {0:#}")]
     LoadComponent(wasmtime::Error),
-    #[error("failed to instantiate debugger component: {0:#}")]
+    #[error("failed to instantiate root supervisor component: {0:#}")]
     InstantiateComponent(wasmtime::Error),
-    #[error("debugger component trapped: {0:#}")]
+    #[error("root supervisor component trapped: {0:#}")]
     RunComponent(wasmtime::Error),
-    #[error("debugger component returned a non-zero result")]
+    #[error("root supervisor component returned a non-zero result")]
     GuestFailed,
-    #[error("the executor has no task capacity left for the debugger component: {0}")]
+    #[error("the executor has no task capacity left for the root supervisor component: {0}")]
     TaskCapacity(crate::TaskCapacityError),
 }
 
@@ -7001,7 +6090,7 @@ mod tests {
 
     #[test]
     fn serial_debug_port_enforces_terminal_input_and_output_rights_independently() {
-        use super::debugger_wit::serial::{HostSerialPortWithStore, HostWithStore, SerialRights};
+        use super::program_wit::serial::{HostSerialPortWithStore, HostWithStore, SerialRights};
         use crate::wasmtime_adapter::component_host::service::test_store::{
             TestStoreData, store_data_authorized,
         };

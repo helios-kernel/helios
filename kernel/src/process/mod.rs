@@ -14,10 +14,10 @@ pub use authority::{
     LinkTargetDirectoryCap, MachineAuthorityRights, MachineControlCap, MachineIdentityCap,
     MountAuthorityRights, MountCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights,
     NetworkCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
-    ProfileReadCap, RequestedAuthorityScope, SetWallClockCap, SettingsAuthorityRights,
-    SignalAuthority, SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap,
-    TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, TraceReadCap, TtyControlCap,
-    UdpCap, UnmountCap, VirtualizeCap, WriteSettingsCap,
+    ProfileReadCap, RequestedAuthorityScope, RootSupervisorCap, SetWallClockCap,
+    SettingsAuthorityRights, SignalAuthority, SpawnAuthority, SymlinkCreateCap, SymlinkReadCap,
+    TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, TraceReadCap,
+    TtyControlCap, UdpCap, UnmountCap, VirtualizeCap, WriteSettingsCap,
 };
 pub use program_service::{
     BufferedExecOutputLimitSetting, CompilerMaxInputBytesSetting, ComponentHandleLimitSetting,

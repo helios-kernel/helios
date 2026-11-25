@@ -3,7 +3,7 @@ use crate::{
     SharedTimeline, SignalTimeline, Timeline, TimelineError, TimelineSource, wait_timelines,
     wait_until_runtime_deadline,
 };
-use debugger_wit::sync::{self, HostSignalSourceWithStore, HostTimelineWithStore, HostWithStore};
+use program_wit::sync::{self, HostSignalSourceWithStore, HostTimelineWithStore, HostWithStore};
 use wasmtime::component::LinkerInstance;
 
 fn lower_error(error: TimelineError) -> sync::Error {

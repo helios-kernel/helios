@@ -641,6 +641,12 @@ impl BtrfsDeviceAdminCap {
     }
 }
 
+/// Proof that the calling instance is the single root supervisor booted by
+/// the kernel. Non-delegable: never copied across `fork`, `spawn`, `exec`,
+/// or container creation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootSupervisorCap(());
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProcessAuthority {
     directory_preopens: Vec<DirectoryPreopen>,
@@ -662,6 +668,9 @@ pub struct ProcessAuthority {
     instance_control: Option<AuthorityScope>,
     settings: SettingsAuthorityRights,
     machine: MachineAuthorityRights,
+    /// Exclusive, non-delegable flag held solely by the single signed root
+    /// supervisor component booted by the kernel.
+    root_supervisor: bool,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -748,6 +757,8 @@ pub enum ProcessAuthorityError {
     EmptyMachineRights,
     #[error("machine grant exceeds caller authority: {0:?}")]
     MachineGrantExceedsAuthority(MachineAuthorityRights),
+    #[error("root-supervisor capability is exclusive to the kernel root component")]
+    RootSupervisorDenied,
 }
 
 impl DirectoryPreopen {
@@ -897,6 +908,7 @@ impl ProcessAuthority {
             instance_control: None,
             settings: SettingsAuthorityRights::empty(),
             machine: MachineAuthorityRights::empty(),
+            root_supervisor: false,
         }
     }
 
@@ -918,6 +930,7 @@ impl ProcessAuthority {
             && self.instance_control.is_none()
             && self.settings.is_empty()
             && self.machine.is_empty()
+            && !self.root_supervisor
     }
 
     /// Every right except the device, diagnostic, settings and machine ones.
@@ -980,11 +993,35 @@ impl ProcessAuthority {
         child.trace_read = strip_own_scope(child.trace_read);
         child.profile_read = strip_own_scope(child.profile_read);
         child.instance_control = strip_own_scope(child.instance_control);
+        child.root_supervisor = false;
         child
     }
 
     pub fn exec_preserved(&self) -> Self {
-        self.clone()
+        let mut child = self.clone();
+        child.root_supervisor = false;
+        child
+    }
+
+    /// Marks this authority as belonging to the single signed root supervisor
+    /// component booted by the kernel. Non-delegable: stripped on fork/exec
+    /// and never derivable through any child capability grant.
+    pub(crate) fn grant_root_supervisor(&mut self) {
+        self.root_supervisor = true;
+    }
+
+    /// Whether this authority holds the non-delegable root-supervisor right.
+    pub const fn is_root_supervisor(&self) -> bool {
+        self.root_supervisor
+    }
+
+    /// Derives proof that this instance is the kernel's root supervisor.
+    pub fn derive_root_supervisor_cap(&self) -> Result<RootSupervisorCap, ProcessAuthorityError> {
+        if self.root_supervisor {
+            Ok(RootSupervisorCap(()))
+        } else {
+            Err(ProcessAuthorityError::RootSupervisorDenied)
+        }
     }
 
     pub fn directory_preopens(&self) -> &[DirectoryPreopen] {

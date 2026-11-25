@@ -242,7 +242,8 @@ fn is_supported_component_import(name: &str) -> bool {
         || name.starts_with("wasi:random/")
         || name.starts_with("wasi:sockets/");
     (is_wasi && is_wasi_preview3_import(name))
-        || name.starts_with("helios:system/")
+        || (name.starts_with("helios:system/")
+            && !name.starts_with("helios:system/root-supervisor"))
         || name == "helios:hv/virtualization@0.1.0"
         || name.starts_with("import-func-")
 }

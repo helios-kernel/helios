@@ -10,7 +10,7 @@ use crate::wit_bindgen;
     )
 ))]
 compile_error!(
-    "`hv` is part of the `init` and `debugger` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
+    "`hv` is part of the `init` and `root-supervisor` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
 );
 
 #[cfg(all(
@@ -23,7 +23,7 @@ compile_error!(
     )
 ))]
 compile_error!(
-    "`btrfs` is part of the `init` and `debugger` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
+    "`btrfs` is part of the `init` and `root-supervisor` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
 );
 
 #[cfg(all(
@@ -36,7 +36,7 @@ compile_error!(
     )
 ))]
 compile_error!(
-    "`mounts` is part of the `init` and `debugger` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
+    "`mounts` is part of the `init` and `root-supervisor` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
 );
 
 #[cfg(all(
@@ -49,7 +49,7 @@ compile_error!(
     )
 ))]
 compile_error!(
-    "`processors` is part of the `init` and `debugger` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
+    "`processors` is part of the `init` and `root-supervisor` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
 );
 
 #[cfg(all(
@@ -62,7 +62,7 @@ compile_error!(
     )
 ))]
 compile_error!(
-    "`ipc` is part of the `init` and `debugger` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
+    "`ipc` is part of the `init` and `root-supervisor` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
 );
 
 #[cfg(all(
@@ -75,7 +75,7 @@ compile_error!(
     )
 ))]
 compile_error!(
-    "`machine-identity` is part of the `init` and `debugger` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
+    "`machine-identity` is part of the `init` and `root-supervisor` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
 );
 
 #[cfg(all(
@@ -88,14 +88,14 @@ compile_error!(
     )
 ))]
 compile_error!(
-    "`snapshot` is part of the `init` and `debugger` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
+    "`snapshot` is part of the `init` and `root-supervisor` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
 );
 
 #[cfg(any(
     all(
         feature = "webgpu-provider",
         any(
-            feature = "instances",
+            feature = "root-supervisor",
             feature = "http-handler",
             feature = "compositor",
             feature = "webgpu"
@@ -104,17 +104,17 @@ compile_error!(
     all(
         feature = "webgpu",
         any(
-            feature = "instances",
+            feature = "root-supervisor",
             feature = "http-handler",
             feature = "compositor"
         )
     ),
-    all(feature = "instances", feature = "http-handler"),
-    all(feature = "instances", feature = "compositor"),
+    all(feature = "root-supervisor", feature = "http-handler"),
+    all(feature = "root-supervisor", feature = "compositor"),
     all(feature = "http-handler", feature = "compositor"),
 ))]
 compile_error!(
-    "a component implements exactly one world: `instances` selects `debugger`, `http-handler` selects `http-handler`, `compositor` selects `compositor`, `webgpu` selects `webgpu` and `webgpu-provider` selects `webgpu-provider`, so enable at most one"
+    "a component implements exactly one world: `root-supervisor` selects `root-supervisor`, `http-handler` selects `http-handler`, `compositor` selects `compositor`, `webgpu` selects `webgpu` and `webgpu-provider` selects `webgpu-provider`, so enable at most one"
 );
 
 #[cfg(feature = "compositor")]
@@ -136,7 +136,7 @@ crate::wit_bindgen::generate!({
 });
 
 #[cfg(all(
-    feature = "instances",
+    feature = "root-supervisor",
     not(feature = "http-handler"),
     not(feature = "compositor"),
     not(feature = "webgpu"),
@@ -144,14 +144,14 @@ crate::wit_bindgen::generate!({
 ))]
 crate::wit_bindgen::generate!({
     path: "../wit",
-    world: "debugger",
+    world: "root-supervisor",
     generate_all,
     default_bindings_module: "bindings",
     pub_export_macro: true,
 });
 
 #[cfg(all(
-    not(feature = "instances"),
+    not(feature = "root-supervisor"),
     not(feature = "http-handler"),
     not(feature = "compositor"),
     not(feature = "webgpu"),

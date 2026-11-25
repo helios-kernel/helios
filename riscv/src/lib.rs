@@ -821,16 +821,11 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     let has_debug_transport = publish_debug_transport(DebugTransport::discover(&fdt));
     let watchdog = shared_watchdog(&fdt);
     let has_vsock = vsock::has_vsock_device(&fdt);
-    // The boot UART carries kernel tracing unless the embedded system
-    // component needs the line to itself for its RPC framing. It needs
-    // the line only when the machine has no vsock device: with one, the
-    // component serves its RPC there and the UART stays a console, which
-    // is the whole reason the vsock transport exists. A machine whose
-    // device tree describes no console has no line to carry it at all.
-    let console = kernel_console(
-        debug_state.clone(),
-        has_debug_transport && (!debug_state.has_system_component() || has_vsock),
-    );
+    // The boot UART carries kernel tracing when a vsock device is present for
+    // inspector RPC framing, keeping the UART clear for binary serial RPC on
+    // machines without vsock. A machine whose device tree describes no console
+    // has no line to carry it at all.
+    let console = kernel_console(debug_state.clone(), has_debug_transport && has_vsock);
     let cpu = RiscvCpu::new(bootstrap_processor, hart_count, timebase, fdt_addr);
     let mut devices = DeviceInventory::new();
     if has_debug_transport {

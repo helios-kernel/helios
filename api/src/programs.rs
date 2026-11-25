@@ -262,6 +262,11 @@ impl core::fmt::Display for StdinClosed {
 impl std::error::Error for StdinClosed {}
 
 impl Child {
+    #[cfg(feature = "root-supervisor")]
+    pub(crate) fn from_raw(inner: raw::Child) -> Self {
+        Self { inner }
+    }
+
     /// Launch a program and return a live [`Child`] handle.
     pub async fn spawn(request: SpawnRequest) -> Result<Self, SpawnError> {
         let inner = raw::spawn(request).await?;

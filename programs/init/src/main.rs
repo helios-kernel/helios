@@ -26,13 +26,28 @@
 use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::path::Path;
+use std::time::Duration;
 
 use helios_api::mounts::{self, MountRequest, MountSharing, MountSource};
-use helios_api::programs::{self, ExecRequest};
+use helios_api::programs::{
+    self, AuthorityScope, CapabilityGrant, ChildTermination, ClockRight, DeviceClass, ExecRequest,
+    MachineRight, NetworkRight,
+};
+use helios_api::root_supervisor::{
+    self, EscalationAction, FatalReport, ManagedSpawnRequest, OomPolicy, ProviderExit,
+    ProviderHandle, ProviderRequest,
+};
+use helios_api::task;
 
 const FSTAB: &str = "/etc/fstab";
 const RC: &str = "/etc/rc.nu";
 const SHELL: &str = "/bin/nu";
+const COMPILER_PATH: &str = "/bin/compiler.cwasm";
+const HTTP_CLIENT_PATH: &str = "/bin/http-client";
+const COMPOSITOR_PATH: &str = "/bin/compositor";
+const DEBUGGER_PATH: &str = "/bin/debugger";
+const COMPOSITOR_RESTART_BACKOFF: Duration = Duration::from_millis(250);
+const HTTP_CLIENT_RESTART_BACKOFF: Duration = Duration::from_millis(100);
 
 /// One line of `/etc/fstab`.
 struct Mount {
@@ -267,6 +282,148 @@ async fn run_rc() -> io::Result<()> {
     Ok(())
 }
 
+fn all_network_grant() -> CapabilityGrant {
+    programs::network_grant(vec![
+        NetworkRight::Tcp,
+        NetworkRight::Udp,
+        NetworkRight::Dns,
+        NetworkRight::PrivilegedBind,
+        NetworkRight::Multicast,
+        NetworkRight::Admin,
+    ])
+}
+
+fn all_clock_grant() -> CapabilityGrant {
+    programs::clock_grant(vec![ClockRight::SetWallClock])
+}
+
+fn plugin_base_grants() -> Vec<CapabilityGrant> {
+    vec![
+        programs::root_directory_grant(),
+        programs::root_link_grant(),
+        programs::root_process_grant(),
+        programs::root_terminal_grant(),
+        programs::root_mount_grant(),
+        all_network_grant(),
+        all_clock_grant(),
+    ]
+}
+
+fn compositor_request() -> ProviderRequest {
+    let mut grants = plugin_base_grants();
+    grants.push(programs::device_grant(vec![
+        DeviceClass::Display,
+        DeviceClass::Input,
+    ]));
+    ProviderRequest {
+        name: "compositor-plugin".to_owned(),
+        path: COMPOSITOR_PATH.to_owned(),
+        capability_grants: grants,
+        named_devices: Vec::new(),
+        oom_policy: OomPolicy::KernelPlugin,
+    }
+}
+
+fn http_client_request() -> ProviderRequest {
+    ProviderRequest {
+        name: "http-client-plugin".to_owned(),
+        path: HTTP_CLIENT_PATH.to_owned(),
+        capability_grants: plugin_base_grants(),
+        named_devices: Vec::new(),
+        oom_policy: OomPolicy::KernelPlugin,
+    }
+}
+
+fn debugger_grants() -> Vec<CapabilityGrant> {
+    let mut grants = plugin_base_grants();
+    grants.extend([
+        programs::all_device_classes_grant(),
+        programs::inspect_read_grant(AuthorityScope::Machine),
+        programs::trace_read_grant(AuthorityScope::Machine),
+        programs::profile_read_grant(AuthorityScope::Machine),
+        programs::diagnostics_control_grant(),
+        programs::instance_control_grant(AuthorityScope::Machine),
+        programs::write_settings_grant(),
+        programs::machine_grant(vec![
+            MachineRight::Control,
+            MachineRight::Identity,
+            MachineRight::Virtualize,
+        ]),
+    ]);
+    grants
+}
+
+fn forward_child_stream(
+    mut stream: helios_api::wit_bindgen::StreamReader<u8>,
+    future: helios_api::wit_bindgen::FutureReader<Result<(), ()>>,
+    to_stderr: bool,
+) {
+    task::spawn(async move {
+        const CHUNK: usize = 8 * 1024;
+        loop {
+            let buf = Vec::with_capacity(CHUNK);
+            let (result, chunk) = stream.read(buf).await;
+            if !chunk.is_empty() {
+                if to_stderr {
+                    let _ = io::stderr().write_all(&chunk);
+                    let _ = io::stderr().flush();
+                } else {
+                    let _ = io::stdout().write_all(&chunk);
+                    let _ = io::stdout().flush();
+                }
+            }
+            if helios_api::stream_closed(result) {
+                break;
+            }
+        }
+        let _ = std::future::IntoFuture::into_future(future).await;
+    });
+}
+
+fn supervise_compositor(initial: ProviderHandle) {
+    task::spawn(async move {
+        let mut handle = initial;
+        loop {
+            match handle.wait_exit().await {
+                ProviderExit::Replaced | ProviderExit::Stopped => break,
+                ProviderExit::Exited | ProviderExit::Faulted(_) => {
+                    println!("the compositor died; rebuilding it");
+                    let _ = io::stdout().flush();
+                    task::sleep(COMPOSITOR_RESTART_BACKOFF).await;
+                    match root_supervisor::install_surface_provider(compositor_request()).await {
+                        Ok(next) => handle = next,
+                        Err(error) => {
+                            eprintln!("helios init: failed to rebuild compositor: {error}");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn supervise_http_client(initial: ProviderHandle) {
+    task::spawn(async move {
+        let mut handle = initial;
+        loop {
+            match handle.wait_exit().await {
+                ProviderExit::Replaced | ProviderExit::Stopped => break,
+                ProviderExit::Exited | ProviderExit::Faulted(_) => {
+                    task::sleep(HTTP_CLIENT_RESTART_BACKOFF).await;
+                    match root_supervisor::install_http_provider(http_client_request()).await {
+                        Ok(next) => handle = next,
+                        Err(error) => {
+                            eprintln!("helios init: failed to rebuild http-client: {error}");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
 #[helios_api::main]
 async fn main() -> io::Result<()> {
     let root = Path::new("/");
@@ -302,11 +459,116 @@ async fn main() -> io::Result<()> {
     let text = fs::read_to_string("/init.txt")?;
     print!("{text}");
 
+    let inventory = root_supervisor::hardware_inventory()
+        .map_err(|error| io::Error::other(format!("reading hardware inventory: {error}")))?;
+
+    let _compiler_handle = if Path::new(COMPILER_PATH).exists() {
+        Some(
+            root_supervisor::install_compiler_provider(ProviderRequest {
+                name: "compiler-plugin".to_owned(),
+                path: COMPILER_PATH.to_owned(),
+                capability_grants: Vec::new(),
+                named_devices: Vec::new(),
+                oom_policy: OomPolicy::KernelPlugin,
+            })
+            .await
+            .map_err(|error| io::Error::other(format!("installing compiler provider: {error}")))?,
+        )
+    } else {
+        None
+    };
+
+    let http_handle = if Path::new(HTTP_CLIENT_PATH).exists() {
+        Some(
+            root_supervisor::install_http_provider(http_client_request())
+                .await
+                .map_err(|error| {
+                    io::Error::other(format!("installing http-client provider: {error}"))
+                })?,
+        )
+    } else {
+        None
+    };
+
+    let compositor_handle =
+        if inventory.display && inventory.input && Path::new(COMPOSITOR_PATH).exists() {
+            Some(
+                root_supervisor::install_surface_provider(compositor_request())
+                    .await
+                    .map_err(|error| {
+                        io::Error::other(format!("installing compositor provider: {error}"))
+                    })?,
+            )
+        } else {
+            None
+        };
+
     if Path::new(RC).exists() {
         run_rc().await?;
     }
 
-    Ok(())
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+
+    if Path::new(DEBUGGER_PATH).exists() {
+        let debugger = root_supervisor::spawn(ManagedSpawnRequest {
+            name: "debugger".to_owned(),
+            args: Vec::new(),
+            env: Vec::new(),
+            path: DEBUGGER_PATH.to_owned(),
+            cwd: None,
+            sockets: Vec::new(),
+            capability_grants: debugger_grants(),
+            named_devices: Vec::new(),
+            oom_policy: OomPolicy::SystemComponent,
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("spawning {DEBUGGER_PATH}: {error}")))?;
+
+        if inventory.vsock {
+            let (out_stream, out_future) = debugger.stdout();
+            let (err_stream, err_future) = debugger.stderr();
+            forward_child_stream(out_stream, out_future, false);
+            forward_child_stream(err_stream, err_future, true);
+        }
+
+        if let Some(handle) = compositor_handle {
+            supervise_compositor(handle);
+        }
+        if let Some(handle) = http_handle {
+            supervise_http_client(handle);
+        }
+
+        root_supervisor::signal_ready()
+            .await
+            .map_err(|error| io::Error::other(format!("signaling root readiness: {error}")))?;
+
+        let status = debugger
+            .wait()
+            .await
+            .map_err(|error| io::Error::other(format!("waiting for debugger: {:?}", error.kind)))?;
+        match status.termination {
+            ChildTermination::Exited(0) | ChildTermination::Killed => Ok(()),
+            termination => {
+                let _ = root_supervisor::escalate_fatal(FatalReport {
+                    component: "debugger".to_owned(),
+                    instance_id: Some(status.instance_id),
+                    reason: format!("system debugger terminated unexpectedly: {termination}"),
+                    restart_count: 0,
+                    action: EscalationAction::Halt,
+                })
+                .await;
+                Err(io::Error::other(format!(
+                    "system debugger terminated unexpectedly: {termination}"
+                )))
+            }
+        }
+    } else {
+        root_supervisor::signal_ready()
+            .await
+            .map_err(|error| io::Error::other(format!("signaling root readiness: {error}")))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

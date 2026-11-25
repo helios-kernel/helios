@@ -1,0 +1,184 @@
+package helios:system@0.1.0;
+
+/// Root-only kernel supervisor bindings.
+///
+/// Granted exclusively to the single signed root component booted by the
+/// kernel (`component-manager` / root supervisor). This interface is never
+/// bound into ordinary program linkers and its authority is non-delegable:
+/// neither `spawn`, `exec`, `fork`, nor container creation can transfer it
+/// to any child instance.
+interface root-supervisor {
+  use programs.{capability-grant, child, inherited-socket, instance-id};
+
+  /// Memory-pressure protection class assigned to a managed instance.
+  ///
+  /// Bounded by the caller's own `OomPolicy` ceiling: a supervisor may only
+  /// assign a policy less than or equal to its own.
+  enum oom-policy {
+    user-program,
+    kernel-plugin,
+    system-component,
+  }
+
+  enum supervisor-error-kind {
+    permission-denied,
+    invalid-argument,
+    invalid-binary,
+    invalid-path,
+    not-found,
+    io,
+    out-of-memory,
+    unavailable,
+    internal,
+  }
+
+  record supervisor-error {
+    kind: supervisor-error-kind,
+    detail: string,
+  }
+
+  /// One hardware device published by kernel discovery for user-mode drivers.
+  record device-grant-info {
+    name: string,
+    regions: u32,
+    interrupt-count: u32,
+    dma-budget-bytes: u64,
+    confined: bool,
+    claimed: bool,
+  }
+
+  /// Snapshot of discovered user-mode device grants and platform hardware
+  /// capabilities so drivers and desktop components activate against real
+  /// machine state.
+  record hardware-inventory {
+    devices: list<device-grant-info>,
+    display: bool,
+    input: bool,
+    input-device-count: u32,
+    gpu: bool,
+    audio: bool,
+    hv: bool,
+    native: bool,
+    vsock: bool,
+  }
+
+  /// Action taken when escalating an unrecoverable failure of a
+  /// `critical = "system"` component.
+  enum escalation-action {
+    /// Flush writable mounts where safe, emit the fatal diagnostic report,
+    /// and halt/power off the machine.
+    halt,
+    /// Flush writable mounts where safe, emit the fatal diagnostic report,
+    /// and reboot the machine.
+    reboot,
+  }
+
+  /// Structured fatal diagnostic report for a `critical = "system"` failure.
+  record fatal-report {
+    /// Component name (must be non-empty).
+    component: string,
+    /// Instance identifier of the failed component, when instantiated.
+    instance-id: option<instance-id>,
+    /// Human-readable cause of the unrecoverable failure (must be non-empty).
+    reason: string,
+    /// Restart attempts exhausted before escalating.
+    restart-count: u32,
+    /// Terminal platform action after flushing mounts and emitting the report.
+    action: escalation-action,
+  }
+
+  /// Spawn request for a managed component or native process with an explicit
+  /// bounded `oom-policy` and optional named hardware device grants.
+  record managed-spawn-request {
+    name: string,
+    args: list<string>,
+    env: list<tuple<string, string>>,
+    path: string,
+    cwd: option<string>,
+    sockets: list<inherited-socket>,
+    capability-grants: list<capability-grant>,
+    /// Discovered raw hardware `DeviceName`s granted to this instance
+    /// (for user-mode `device-driver` components).
+    named-devices: list<string>,
+    /// Bounded OOM protection class (must not exceed the caller's own ceiling).
+    oom-policy: oom-policy,
+  }
+
+  /// Configuration for installing or replacing a kernel-forwarded provider
+  /// endpoint (`surface` compositor, per-processor `wasi:http/client`, or
+  /// AOT `compiler` session slot).
+  record provider-request {
+    /// Instance-registry name for this provider (e.g. `"compositor-plugin"`).
+    name: string,
+    /// Guest path to the signed/bootfs component or core module artifact.
+    path: string,
+    /// Attenuated capabilities granted to the provider instance(s).
+    capability-grants: list<capability-grant>,
+    /// Discovered raw hardware `DeviceName`s granted to the provider.
+    named-devices: list<string>,
+    /// Bounded OOM protection class (must not exceed the caller's own ceiling).
+    oom-policy: oom-policy,
+  }
+
+  /// Why a supervised kernel provider instance or registration ended.
+  variant provider-exit {
+    /// The provider returned cleanly from its entry point.
+    exited,
+    /// Another `install-*-provider` call replaced this endpoint.
+    replaced,
+    /// The supervisor explicitly stopped or dropped the handle.
+    stopped,
+    /// The provider trapped, hit OOM, was killed, or violated its ABI.
+    faulted(string),
+  }
+
+  /// Owned handle to an installed kernel provider endpoint.
+  ///
+  /// Dropping the handle stops the provider and uninstalls it from its kernel
+  /// slot if it is still the active generation.
+  resource provider-handle {
+    /// Instance ID of the running provider, when singleton-instantiated.
+    instance-id: func() -> option<instance-id>;
+
+    /// Await termination or fault of this provider endpoint so the root
+    /// supervisor can apply restart, replacement, or escalation policy.
+    wait-exit: async func() -> provider-exit;
+
+    /// Stop this provider and detach it from its kernel slot if still active.
+    stop: func();
+  }
+
+  /// Read the current discovered hardware devices and platform capability
+  /// inventory.
+  get-hardware-inventory: func() -> result<hardware-inventory, supervisor-error>;
+
+  /// Subscribe to hardware inventory changes. Emits the current inventory
+  /// immediately and a fresh snapshot whenever discovery publishes devices
+  /// or hardware services come online.
+  subscribe-hardware: func() -> result<stream<hardware-inventory>, supervisor-error>;
+
+  /// Spawn a managed component or process with a bounded `oom-policy` and
+  /// optional named hardware device grants.
+  spawn: async func(request: managed-spawn-request) -> result<child, supervisor-error>;
+
+  /// Install or atomically replace the singleton `helios:system/surface`
+  /// compositor provider (`ProviderSlot<SurfaceRequest>`).
+  install-surface-provider: async func(request: provider-request) -> result<provider-handle, supervisor-error>;
+
+  /// Install or atomically replace the per-processor sharded
+  /// `wasi:http/client` provider (`PerProcessorProvider<HttpExchange>`),
+  /// preserving `ProcessorStep` CPU-offline draining and redirection.
+  install-http-provider: async func(request: provider-request) -> result<provider-handle, supervisor-error>;
+
+  /// Install or atomically replace the AOT `compiler` session provider.
+  install-compiler-provider: async func(request: provider-request) -> result<provider-handle, supervisor-error>;
+
+  /// Signal that root bring-up has completed: flushes writable mounts and
+  /// emits the boot-readiness stage marker on the debug serial transport.
+  signal-ready: async func() -> result<_, supervisor-error>;
+
+  /// Escalate an unrecoverable failure of a `critical = "system"` component
+  /// into a controlled kernel halt or reboot after flushing writable mounts
+  /// where safe and emitting a structured fatal diagnostic report.
+  escalate-fatal: async func(report: fatal-report) -> result<_, supervisor-error>;
+}

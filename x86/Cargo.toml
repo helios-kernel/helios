@@ -7,8 +7,7 @@ edition.workspace = true
 # Native user execution (`helios_hal::native`): ring-three address spaces
 # and contexts, and the exception stubs that route user traps to them.
 native-users = []
-default = ["embedded-debugger"]
-embedded-debugger = ["helios-kernel/embedded-debugger"]
+default = []
 
 [dependencies]
 acpi = { workspace = true, features = ["aml"] }
