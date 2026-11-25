@@ -1238,6 +1238,10 @@ fn real_workspace_inspector_system_wit_world_generates_and_streams_child_stdio()
             (StreamReader::empty(), FutureReader::ready(Ok(())))
         }
 
+        async fn child_instance_id(&self, self_: &Self::Child) -> u64 {
+            self_.id
+        }
+
         async fn child_signal(&self, _self_: &Self::Child, _signal: u8) -> Result<(), SpawnError> {
             Ok(())
         }

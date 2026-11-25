@@ -181,6 +181,7 @@ test-libraries:
         -p helios-tpm \
         -p helios-inspector-protocol -p helios-wit-rpc \
         -p helios-btrfs \
+        -p helios-component-manager \
         -p helios-venus -p helios-venus-gen \
         -p helios-nu \
         -p helios-oci \
@@ -194,6 +195,7 @@ test-libraries:
     cargo nextest run -p helios-compositor-render -p helios-desktop-text-check
     cargo nextest run -p helios-sysctl
     cargo nextest run -p helios-http-client
+    cargo nextest run -p helios-component-manager --features dynamic-components
     python3 "{{ repo_root }}/x86/tests/interrupt_state.py"
 
 test-host-tools:
@@ -338,6 +340,8 @@ check-host:
     {{ cli }} kernel-keys --out-dir "${out_dir}"
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     cargo check -p helios-kernel
+    cargo check -p helios-component-manager
+    cargo check -p helios-component-manager --features dynamic-components
     cargo check -p helios-hosted
     cargo check -p helios-oci
     cargo check -p helios-ops

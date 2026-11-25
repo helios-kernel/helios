@@ -44,6 +44,7 @@ use wit_component::ComponentEncoder;
 
 mod artifact_cache;
 mod boot_kernel;
+mod components;
 mod kernel_image;
 mod prebuilt_artifact;
 mod venus_fetch;
@@ -62,6 +63,8 @@ enum CliError {
     ArtifactFetch(#[from] prebuilt_artifact::ArtifactFetchError),
     #[error("{0}")]
     ArtifactStage(#[from] prebuilt_artifact::ArtifactStageError),
+    #[error("{0}")]
+    ComponentBuild(#[from] components::ComponentBuildError),
     #[error("{0}")]
     KernelImage(#[from] kernel_image::KernelImageError),
     #[error("{0}")]
@@ -146,7 +149,7 @@ enum KeyError {
 /// Why the kernel-prebuild manifest and the bootfs it describes could
 /// not be produced.
 #[derive(Debug, thiserror::Error)]
-enum PrebuildError {
+pub(crate) enum PrebuildError {
     #[error("{0}")]
     WorkspaceRoot(#[from] WorkspaceRootError),
     #[error("{0}")]
@@ -192,7 +195,7 @@ enum PrebuildError {
 
 /// Why one wasm program could not be built into an artifact.
 #[derive(Debug, thiserror::Error)]
-enum WasmBuildError {
+pub(crate) enum WasmBuildError {
     #[error("failed to parse wasm build settings in {path}: {source}")]
     ManifestSettings {
         path: String,
@@ -599,12 +602,12 @@ pub(crate) enum LimineError {
 const PREBUILD_MANIFEST_FILE: &str = "kernel-prebuild.json";
 /// The payload `kernel-prebuild` writes beside the manifest: the whole
 /// user payload the kernel used to link in, delivered as a boot module.
-const BOOTFS_IMAGE_FILE: &str = "helios-bootfs";
-const DEFAULT_INIT_ARGV0: &str = "/init.wasm";
+pub(crate) const BOOTFS_IMAGE_FILE: &str = "helios-bootfs";
+pub(crate) const DEFAULT_INIT_ARGV0: &str = "/init.wasm";
 /// The boot-program name `programs/init` answers to, published at
 /// `bin/init` like every other boot program.
-const INIT_COMMAND: &str = "init";
-const DEFAULT_BOOT_ARTIFACTS_MANIFEST: &str = "tools/wasi-apps/boot-artifacts.toml";
+pub(crate) const INIT_COMMAND: &str = "init";
+pub(crate) const DEFAULT_BOOT_ARTIFACTS_MANIFEST: &str = "tools/wasi-apps/boot-artifacts.toml";
 /// Why the kernel profile did not reach the store.
 ///
 /// A fetch either leaves a profile this toolchain can build against in
@@ -729,7 +732,7 @@ const COMPILER_PLUGIN_TRIPLE: &str = "wasm32-wasip1-threads";
 /// The file the compiler plugin's `cdylib` builds to.
 const COMPILER_PLUGIN_WASM: &str = "helios_compiler_plugin.wasm";
 /// The file `programs/init` builds to.
-const INIT_WASM: &str = "helios_init.wasm";
+pub(crate) const INIT_WASM: &str = "helios_init.wasm";
 const COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES: usize = 512 * 1024 * 1024;
 const LIMINE_IMAGE_BYTES: u64 = 768 * 1024 * 1024;
 const LIMINE_PARTITION_START_LBA: u32 = 2048;
@@ -767,6 +770,13 @@ enum Commands {
     /// Stage a `kernel` or full bootable `image` artifact directory with its
     /// typed `manifest.json`.
     ArtifactStage(prebuilt_artifact::ArtifactStageCommand),
+    /// Parse and statically validate a `component.toml` directory tree and emit
+    /// static native Rust routing tables and supervisor definitions.
+    ComponentCodegen(components::ComponentCodegenCommand),
+    /// Validate a `component.toml` directory tree, compile/sign `component-manager`,
+    /// and package the three-part system image (`helios-kernel`, `component-manager.cwasm`,
+    /// and `userspace-components.bootfs`).
+    ImageBuild(components::ImageBuildCommand),
     /// Prepare the root keypair that compile and lint checks read,
     /// without building a boot payload.
     KernelKeys {
@@ -789,7 +799,7 @@ enum Commands {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum Hint {
+pub(crate) enum Hint {
     Balanced,
     Performance,
 }
@@ -990,15 +1000,15 @@ struct PrebuildManifest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct BootAsset {
-    path: String,
-    source: PathBuf,
-    kind: BootAssetKind,
+pub(crate) struct BootAsset {
+    pub(crate) path: String,
+    pub(crate) source: PathBuf,
+    pub(crate) kind: BootAssetKind,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum BootAssetKind {
+pub(crate) enum BootAssetKind {
     Directory,
     File,
 }
@@ -1029,21 +1039,21 @@ struct ExternalBootArtifact {
 ///
 /// They travel together because each asset is compiled by the same cargo, for
 /// the same profile and target, and resolved against the same checkout.
-struct BootBuild<'a> {
-    wasm: &'a WasmSource<'a>,
-    out_dir: &'a Path,
+pub(crate) struct BootBuild<'a> {
+    pub(crate) wasm: &'a WasmSource<'a>,
+    pub(crate) out_dir: &'a Path,
     /// The level every boot artifact is compiled for: the target's floor.
-    target: &'a CwasmTarget<'a>,
-    workspace_root: &'a WorkspaceRoot,
+    pub(crate) target: &'a CwasmTarget<'a>,
+    pub(crate) workspace_root: &'a WorkspaceRoot,
     /// Where a precompiled artifact is taken from and kept, when a cache
     /// directory was named.
-    precompile: Option<&'a PrecompileCache<'a>>,
+    pub(crate) precompile: Option<&'a PrecompileCache<'a>>,
 }
 
 /// Where the architecture-independent guest wasm of a boot payload comes
 /// from: compiled by this run, or read from the directory `wasm-build`
 /// wrote. Only the precompile to a target is the payload's own work.
-enum WasmSource<'a> {
+pub(crate) enum WasmSource<'a> {
     Build(WasmBuilder<'a>),
     Prebuilt {
         /// The profile's own directory of the prebuilt tree.
@@ -1053,15 +1063,23 @@ enum WasmSource<'a> {
 }
 
 /// What one `cargo build` of a guest program needs besides the program.
-struct WasmBuilder<'a> {
-    cargo: &'a Path,
-    profile: &'a str,
+pub(crate) struct WasmBuilder<'a> {
+    pub(crate) cargo: &'a Path,
+    pub(crate) profile: &'a str,
     /// Where cargo's target directories go.
-    out_dir: &'a Path,
-    workspace_root: &'a WorkspaceRoot,
+    pub(crate) out_dir: &'a Path,
+    pub(crate) workspace_root: &'a WorkspaceRoot,
     /// Where a built wasm is taken from and kept, when a cache directory
     /// was named.
-    cache: Option<&'a ArtifactCache>,
+    pub(crate) cache: Option<&'a ArtifactCache>,
+}
+
+/// Extra options passed when compiling `component-manager` (`programs/init`)
+/// from a validated `component.toml` directory tree.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ComponentBuildProfile<'a> {
+    pub(crate) extra_features: &'a [&'a str],
+    pub(crate) generated_topology_rs: Option<&'a Path>,
 }
 
 impl<'a> WasmSource<'a> {
@@ -1211,6 +1229,14 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 command,
                 root.as_ref().map(WorkspaceRoot::path),
             )?)
+        }
+        Commands::ComponentCodegen(command) => Ok(components::run_component_codegen(
+            &command,
+            cli.workspace_root.as_deref(),
+        )?),
+        Commands::ImageBuild(command) => {
+            let _ = components::run_image_build(command, cli.workspace_root.as_deref())?;
+            Ok(())
         }
         Commands::KernelKeys { out_dir } => {
             prepare_root_key(&out_dir, None)?;
@@ -1368,7 +1394,7 @@ fn run_kernel_prebuild(
 /// the init component and its `argv0`. Only empty directories get an
 /// entry; a directory holding a file exists implicitly, which is the
 /// same rule the kernel's bootfs view has always applied.
-fn write_bootfs_image(
+pub(crate) fn write_bootfs_image(
     image_path: &Path,
     bootfs_root: &Path,
     assets: &[BootAsset],
@@ -1867,7 +1893,7 @@ impl Seek for FileSlice<'_> {
     }
 }
 
-fn build_compiler_plugin_asset(build: &BootBuild<'_>) -> Result<BootAsset, BootfsError> {
+pub(crate) fn build_compiler_plugin_asset(build: &BootBuild<'_>) -> Result<BootAsset, BootfsError> {
     let wasm_path = build.wasm.compiler_plugin()?;
     let wasm = fs::read(&wasm_path).map_err(|source| BootfsError::Read {
         path: wasm_path.display().to_string(),
@@ -1908,14 +1934,14 @@ fn write_bootfs_artifact(path: &Path, bytes: Vec<u8>) -> Result<(), BootfsError>
 }
 
 /// The absolute path the manifest records for one bootfs asset.
-fn resolve_bootfs_source(path: &Path) -> Result<PathBuf, BootfsError> {
+pub(crate) fn resolve_bootfs_source(path: &Path) -> Result<PathBuf, BootfsError> {
     fs::canonicalize(path).map_err(|source| BootfsError::Resolve {
         path: path.display().to_string(),
         source,
     })
 }
 
-fn selected_boot_programs(
+pub(crate) fn selected_boot_programs(
     boot_programs: Vec<String>,
 ) -> Result<Option<BTreeSet<String>>, BootProgramError> {
     if !boot_programs.is_empty() {
@@ -1942,7 +1968,7 @@ fn selected_boot_programs(
     Ok(Some(selected))
 }
 
-fn build_boot_program_assets(
+pub(crate) fn build_boot_program_assets(
     build: &BootBuild<'_>,
     selected_programs: &Option<BTreeSet<String>>,
     boot_artifacts_manifest: &Path,
@@ -2410,7 +2436,7 @@ fn read_external_boot_artifacts(
     Ok(manifest.artifact)
 }
 
-fn validate_external_boot_artifact_sources(
+pub(crate) fn validate_external_boot_artifact_sources(
     path: &Path,
     target: &str,
     selected_programs: &Option<BTreeSet<String>>,
@@ -2878,13 +2904,34 @@ impl WasmBuilder<'_> {
         manifest_path: &Path,
         artifact_name: &str,
     ) -> Result<PathBuf, WasmBuildError> {
-        let requirements = read_wasm_requirements(manifest_path)?;
-        self.build(
+        self.component_with_options(
             manifest_path,
-            &component_target_dir(&requirements),
+            artifact_name,
+            ComponentBuildProfile::default(),
+        )
+    }
+
+    /// Builds a `wasm32-wasip3` component with optional extra Cargo features and
+    /// generated topology file override (`HELIOS_COMPONENT_TOPOLOGY_RS`).
+    pub(crate) fn component_with_options(
+        &self,
+        manifest_path: &Path,
+        artifact_name: &str,
+        options: ComponentBuildProfile<'_>,
+    ) -> Result<PathBuf, WasmBuildError> {
+        let requirements = read_wasm_requirements(manifest_path)?;
+        let mut target_dir_name = component_target_dir(&requirements);
+        if !options.extra_features.is_empty() {
+            target_dir_name.push('-');
+            target_dir_name.push_str(&options.extra_features.join("-"));
+        }
+        self.build_with_options(
+            manifest_path,
+            &target_dir_name,
             COMPONENT_TRIPLE,
             artifact_name,
             &requirements,
+            options,
         )
     }
 
@@ -2894,12 +2941,13 @@ impl WasmBuilder<'_> {
             .workspace_root
             .join(Path::new(COMPILER_PLUGIN_MANIFEST));
         let requirements = read_wasm_requirements(&manifest_path)?;
-        self.build(
+        self.build_with_options(
             &manifest_path,
             COMPILER_PLUGIN_TARGET_DIR,
             COMPILER_PLUGIN_TRIPLE,
             COMPILER_PLUGIN_WASM,
             &requirements,
+            ComponentBuildProfile::default(),
         )
     }
 
@@ -2907,13 +2955,14 @@ impl WasmBuilder<'_> {
     /// directory `target_dir_name`, or takes the wasm from the cache when
     /// every input of an earlier build is unchanged. Either way the wasm
     /// is at the path cargo would have left it.
-    fn build(
+    fn build_with_options(
         &self,
         manifest_path: &Path,
         target_dir_name: &str,
         target_triple: &str,
         artifact_name: &str,
         requirements: &WasmRequirements,
+        options: ComponentBuildProfile<'_>,
     ) -> Result<PathBuf, WasmBuildError> {
         let target_dir = self.out_dir.join(target_dir_name);
         let artifact = target_dir
@@ -2983,7 +3032,15 @@ impl WasmBuilder<'_> {
         if self.profile == "release" {
             command.arg("--release");
         }
+        if !options.extra_features.is_empty() {
+            command
+                .arg("--features")
+                .arg(options.extra_features.join(","));
+        }
         command.envs(environment);
+        if let Some(topology_path) = options.generated_topology_rs {
+            command.env("HELIOS_COMPONENT_TOPOLOGY_RS", topology_path);
+        }
         command.env_remove("RUSTFLAGS");
         if requirements.boringssl {
             let sdk = wasi_sdk::ensure(self.workspace_root.path(), target_triple)?;
@@ -3169,7 +3226,7 @@ fn wasm_rustflags(target_triple: &str, features: &[String]) -> Vec<String> {
 /// to keep, so its report is captured as the whole chain it renders and
 /// carried in the variant that names the step — the alternative would be
 /// to lose everything the encoder said about why the module was refused.
-fn encode_component(path: &Path) -> Result<Vec<u8>, WasmBuildError> {
+pub(crate) fn encode_component(path: &Path) -> Result<Vec<u8>, WasmBuildError> {
     let wasm = fs::read(path).map_err(|source| WasmBuildError::Read {
         path: path.display().to_string(),
         source,
@@ -3191,13 +3248,13 @@ fn encode_component(path: &Path) -> Result<Vec<u8>, WasmBuildError> {
         })
 }
 
-struct PreparedRootKey {
-    root_public_path: PathBuf,
-    root_secret_path: PathBuf,
-    root_signing_key: SigningKey,
+pub(crate) struct PreparedRootKey {
+    pub(crate) root_public_path: PathBuf,
+    pub(crate) root_secret_path: PathBuf,
+    pub(crate) root_signing_key: SigningKey,
 }
 
-fn prepare_root_key(
+pub(crate) fn prepare_root_key(
     out_dir: &Path,
     supplied: Option<&Path>,
 ) -> Result<PreparedRootKey, PrebuildError> {
@@ -3738,9 +3795,18 @@ mod tests {
             toml::from_str(include_str!("../../programs/init/Cargo.toml")).unwrap();
         assert!(!init.package.metadata.helios.venus_protocol);
         assert!(!init.package.metadata.helios.boringssl);
-        assert!(init.package.metadata.helios.target_features.is_empty());
+        assert_eq!(init.package.metadata.helios.target_features, ["atomics"]);
         assert_eq!(
             component_target_dir(&init.package.metadata.helios),
+            format!("{COMPONENT_PROGRAMS_TARGET_DIR}-atomics")
+        );
+        let date: WasmBuildSettings =
+            toml::from_str(include_str!("../../programs/date/Cargo.toml")).unwrap();
+        assert!(!date.package.metadata.helios.venus_protocol);
+        assert!(!date.package.metadata.helios.boringssl);
+        assert!(date.package.metadata.helios.target_features.is_empty());
+        assert_eq!(
+            component_target_dir(&date.package.metadata.helios),
             COMPONENT_PROGRAMS_TARGET_DIR
         );
     }

@@ -1,0 +1,33 @@
+description = "System debugger component (supervised until /inspector/* replaces it in #1190)"
+name = "debugger"
+runner = "wasm"
+sharding = "singleton"
+program = "/bin/debugger"
+optional = true
+startup = "eager"
+lifecycle = "service"
+restart = "never"
+critical = "system"
+escalation = "halt"
+oom_tier = "protected"
+
+[capabilities]
+directories = [
+  { source = "/", guest = "/", rights = ["read", "write", "mutate-directory", "execute"] },
+]
+network = ["tcp", "udp", "dns", "privileged-bind", "multicast", "admin"]
+allow_all_tcp_ports = true
+allow_all_vsock_ports = true
+clock = ["set-wall-clock"]
+terminal = ["input", "output", "control"]
+process = ["spawn", "exec", "fork", "join", "signal"]
+link = ["source", "target-directory", "symlink-create", "symlink-read"]
+mount = ["mount", "unmount"]
+devices = ["display", "input", "gpu", "audio"]
+inspect_read = "machine"
+trace_read = "machine"
+profile_read = "machine"
+diagnostics_control = true
+instance_control = "machine"
+settings_write = true
+machine = ["control", "identity", "virtualize"]

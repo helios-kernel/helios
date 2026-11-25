@@ -3166,6 +3166,7 @@ dependencies = [
  "fatfs",
  "helios-artifact",
  "helios-compiler-support",
+ "helios-component-manager",
  "helios-profdata",
  "helios-venus-gen",
  "helios-workspace-root",
@@ -3237,6 +3238,18 @@ dependencies = [
  "thiserror 2.0.21",
  "wasmparser 0.263.0",
  "wasmtime",
+]
+
+[[package]]
+name = "helios-component-manager"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "futures-lite",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -3384,7 +3397,9 @@ dependencies = [
 name = "helios-init"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "helios-api",
+ "helios-component-manager",
 ]
 
 [[package]]
