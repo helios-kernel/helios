@@ -11,12 +11,13 @@ extern crate alloc;
 use alloc::sync::Arc;
 
 use helios_kernel::ExternalInterruptHandler;
-use helios_virtio::{DeviceType, OffsetDmaPool, VirtioPciTransport, VirtioVsockDevice};
+use helios_virtio::{DeviceType, VirtioPciTransport, VirtioVsockDevice};
 use pci_types::PciAddress;
 
+use crate::iommu::X86DmaPool;
 use crate::pci::{PciRoot, VirtioFunctions};
 
-type X86VirtioVsockDevice = VirtioVsockDevice<VirtioPciTransport<OffsetDmaPool>>;
+type X86VirtioVsockDevice = VirtioVsockDevice<VirtioPciTransport<X86DmaPool>>;
 
 /// The interrupt route's view of the platform's vsock function.
 ///
@@ -47,7 +48,7 @@ pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     kernel: &helios_kernel::Kernel<crate::X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     pci: &PciRoot,
     address: PciAddress,
-    physical_memory_offset: usize,
+    dma: X86DmaPool,
     vector: u8,
     destination_apic_id: u32,
     debug_state: &crate::debug_state::RuntimeState,
@@ -57,16 +58,10 @@ where
     MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let msix_vector = pci.bind_msix_vector(address, vector, destination_apic_id);
-    let device = helios_virtio::vsock_from_pci(
-        &pci.access(),
-        address,
-        pci,
-        OffsetDmaPool::new(physical_memory_offset),
-        Some(msix_vector),
-    )
-    .unwrap_or_else(|error| {
-        panic!("failed to initialize the virtio-vsock function at {address}: {error}")
-    });
+    let device = helios_virtio::vsock_from_pci(&pci.access(), address, pci, dma, Some(msix_vector))
+        .unwrap_or_else(|error| {
+            panic!("failed to initialize the virtio-vsock function at {address}: {error}")
+        });
     let device = Arc::new(device);
     let service = helios_kernel::install_vsock_device(kernel, cpu, device.clone());
     let guest_cid = service.guest_cid();

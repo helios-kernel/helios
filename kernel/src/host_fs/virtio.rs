@@ -11,9 +11,9 @@
 //! [`ExternalInterruptHandler::handle_interrupt`] only acknowledges the
 //! device and wakes the waiters, from any processor.
 
-use bytes::BytesMut;
+use helios_hal::dma::BufResult;
 use helios_hal::io::IoError;
-use helios_virtio::{Virtio9pDevice, VirtioTransport};
+use helios_virtio::{TransportBuffer, Virtio9pDevice, VirtioTransport};
 use triomphe::Arc;
 
 use crate::{ExternalInterruptHandler, HostFsTransport};
@@ -57,17 +57,21 @@ impl<T: VirtioTransport> HostFsTransport for Virtio9pTransport<T> {
         self.device.pipeline_depth()
     }
 
-    async fn request<'a>(
-        &'a self,
-        bytes: &'a [u8],
-        response: &'a mut BytesMut,
+    type Buffer = TransportBuffer<T>;
+
+    fn buffer(&self, capacity: usize) -> Result<Self::Buffer, IoError> {
+        self.device.buffer(capacity)
+    }
+
+    async fn request(
+        &self,
+        request: Self::Buffer,
+        request_len: usize,
+        response: Self::Buffer,
         response_len: usize,
-    ) -> Result<(), IoError> {
-        response.clear();
-        response.resize(response_len, 0);
-        let used = self.device.request(bytes, response).await?;
-        let used = usize::try_from(used).map_err(|_| IoError::DeviceFault)?;
-        response.truncate(used);
-        Ok(())
+    ) -> BufResult<usize, (Self::Buffer, Self::Buffer)> {
+        self.device
+            .request(request, request_len, response, response_len)
+            .await
     }
 }

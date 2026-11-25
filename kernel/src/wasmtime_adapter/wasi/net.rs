@@ -2,6 +2,8 @@ use core::convert::Infallible;
 use core::task::Waker;
 use pin_project_lite::pin_project;
 
+use wasmtime::AsContextMut;
+
 use crate::{ComponentHostNetwork, NetworkHandle, RetiredNetworkHandle, SocketRetirementSender};
 
 use super::*;
@@ -1244,18 +1246,34 @@ where
         // `stream.write`, so it is reported only once the source is empty.
         loop {
             if this.pending.is_none() {
-                // One chunk per write, the size preview1's `sock_send`
-                // moves to the same socket.
-                let bytes = read_bounded_chunk(&mut source, &mut store, GUEST_IO_CHUNK_BYTES)?;
-                if bytes.is_empty() {
+                // The guest's buffer stays lent to the stream until it is
+                // marked read, so one chunk of it at a time (at most
+                // `GUEST_IO_CHUNK_BYTES`, matching preview1's `sock_send`,
+                // and never more than one send buffer) is copied straight
+                // into transmit memory, and the rest waits in place for the
+                // next pass of this loop.
+                let mut source = source.reborrow().as_direct(store.as_context_mut());
+                let bytes = source.remaining()?;
+                let available = bytes.len();
+                if available == 0 {
                     complete_socket_transfer(this.completion, Ok(()));
                     return Poll::Ready(Ok(StreamResult::Completed));
                 }
-                let write = (*this.start)(
-                    this.connection.clone(),
-                    this.service.clone(),
-                    Bytes::from(bytes),
+                let len = bounded_chunk_len(
+                    available,
+                    GUEST_IO_CHUNK_BYTES.min(helios_netstack::TCP_TRANSMIT_BUFFER_BYTES),
                 );
+                let piece = match this.service.tcp_payload(len, |piece| {
+                    piece.copy_from_slice(&bytes[..len]);
+                }) {
+                    Ok(piece) => piece,
+                    Err(error) => {
+                        complete_socket_transfer(this.completion, Err(map_p3_tcp_error(error)));
+                        return Poll::Ready(Ok(StreamResult::Dropped));
+                    }
+                };
+                source.mark_read(len);
+                let write = (*this.start)(this.connection.clone(), this.service.clone(), piece);
                 this.pending.set(Some(write));
             }
 

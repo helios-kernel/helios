@@ -60,11 +60,11 @@ struct ShownRegion {
 }
 
 /// One pinned buffer as the lease records it: the device's attachment
-/// to the run, held until the grant ends.
+/// to the run, held until the grant ends and DMA is quiesced.
 struct PinnedDma {
     /// Held, never read: this reference is what keeps the run pinned
     /// while the device may still address it.
-    _attachment: Buffer,
+    attachment: Buffer,
     descriptor: DmaBuffer,
 }
 
@@ -83,8 +83,9 @@ pub struct GrantStats {
     pub interrupts: InterruptStats,
 }
 
-/// What the registry keeps for one published device: the grant itself
-/// and the relay its interrupts arrive on.
+/// What the registry keeps for one published device: the grant itself,
+/// the relay its interrupts arrive on, and any pinned DMA buffers held
+/// back when a previous owner's lease could not quiesce the hardware.
 ///
 /// Shared, because a backend registers its interrupt route against the
 /// relay at boot and that route outlives every owner the device has.
@@ -92,6 +93,12 @@ pub struct PublishedDevice {
     pub(super) grant: DeviceGrant,
     pub(super) relay: InterruptRelay,
     pub(super) claimed: core::sync::atomic::AtomicBool,
+    /// Pinned DMA buffers from reclaimed leases where the platform
+    /// could not prove bus mastering stopped. Kept pinned so in-flight
+    /// DMA cannot overwrite frames handed to another tenant, until a
+    /// subsequent owner resets the hardware and calls
+    /// [`GrantLease::release_quarantine`].
+    pub(super) quarantine: spin::Mutex<alloc::vec::Vec<Buffer>>,
 }
 
 impl PublishedDevice {
@@ -106,6 +113,21 @@ impl PublishedDevice {
     /// Whether the device currently has an owner.
     pub fn is_claimed(&self) -> bool {
         self.claimed.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Buffers held in quarantine because an earlier owner could not
+    /// quiesce the device's DMA before releasing it.
+    pub fn quarantined_buffers(&self) -> usize {
+        self.quarantine.lock().len()
+    }
+
+    /// Total bytes held in quarantine on this device.
+    pub fn quarantined_bytes(&self) -> u64 {
+        self.quarantine
+            .lock()
+            .iter()
+            .map(|buffer| buffer.physical().bytes)
+            .sum()
     }
 }
 
@@ -246,7 +268,7 @@ impl GrantLease {
         };
         self.pinned_bytes += physical.bytes;
         self.buffers.push(PinnedDma {
-            _attachment: buffer,
+            attachment: buffer,
             descriptor,
         });
         Ok(descriptor)
@@ -285,25 +307,70 @@ impl GrantLease {
     pub fn end_views(&self, views: &mut ViewTable) -> Result<(), ViewError> {
         views.end_group(self.views)
     }
+
+    /// Release any DMA buffers quarantined from an earlier owner whose
+    /// lease could not quiesce the device.
+    ///
+    /// Called by the new owner only after it has reset the hardware so
+    /// no in-flight DMA from the previous driver can still reference
+    /// those frames. Returns the number of buffers released.
+    pub fn release_quarantine(&mut self) -> usize {
+        let released = {
+            let mut quarantine = self.device.quarantine.lock();
+            core::mem::take(&mut *quarantine)
+        };
+        let count = released.len();
+        drop(released);
+        count
+    }
 }
 
 impl Drop for GrantLease {
     fn drop(&mut self) {
         self.device.relay.quiesce();
         let buffers = self.buffers.len();
-        // The device's attachment to every ring goes here; a ring whose
-        // view is somehow still live keeps its run until that view ends,
-        // so nothing the owner can still reach is freed.
-        self.buffers.clear();
+        let descriptors: ArrayVec<DmaBuffer, MAX_DMA_BUFFERS> = self
+            .buffers
+            .iter()
+            .map(|pinned| pinned.descriptor)
+            .collect();
+        let quiesced = super::platform::quiesce_device_dma(&self.device.grant, &descriptors);
+        let quarantined = if self.buffers.is_empty() || quiesced {
+            // The platform proved the device cannot DMA into these
+            // buffers anymore (or none were pinned); dropping the
+            // attachments releases their runs once any lingering owner
+            // view has ended.
+            self.buffers.clear();
+            0
+        } else {
+            // Neither bus-master disable, function reset, nor IOMMU
+            // unmap succeeded; keep the frames pinned with the device
+            // until a replacement owner resets it.
+            let mut quarantine = self.device.quarantine.lock();
+            let count = self.buffers.len();
+            quarantine.extend(self.buffers.drain(..).map(|pinned| pinned.attachment));
+            count
+        };
         self.device
             .claimed
             .store(false, core::sync::atomic::Ordering::Release);
-        tracing::info!(
-            target: "helios_kernel::device",
-            device = %self.device.grant.name(),
-            regions = self.regions.iter().flatten().count(),
-            buffers,
-            "device grant reclaimed"
-        );
+        if quarantined > 0 {
+            tracing::warn!(
+                target: "helios_kernel::device",
+                device = %self.device.grant.name(),
+                regions = self.regions.iter().flatten().count(),
+                buffers,
+                quarantined,
+                "device grant reclaimed with unquiesced DMA buffers quarantined"
+            );
+        } else {
+            tracing::info!(
+                target: "helios_kernel::device",
+                device = %self.device.grant.name(),
+                regions = self.regions.iter().flatten().count(),
+                buffers,
+                "device grant reclaimed"
+            );
+        }
     }
 }

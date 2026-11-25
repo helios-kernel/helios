@@ -16,12 +16,13 @@ use core::time::Duration;
 
 use helios_hal::cpu::Cpu;
 use helios_kernel::{BalloonHandle, Timer};
-use helios_virtio::{DeviceType, OffsetDmaPool, VirtioBalloonDevice, VirtioPciTransport};
+use helios_virtio::{DeviceType, VirtioBalloonDevice, VirtioPciTransport};
 use pci_types::PciAddress;
 
+use crate::iommu::X86DmaPool;
 use crate::pci::{PciRoot, VirtioFunctions};
 
-type X86VirtioBalloonDevice = VirtioBalloonDevice<VirtioPciTransport<OffsetDmaPool>>;
+type X86VirtioBalloonDevice = VirtioBalloonDevice<VirtioPciTransport<X86DmaPool>>;
 
 /// How often the function's interrupt status is read.
 ///
@@ -35,7 +36,7 @@ const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// The PCI function that carries the platform's memory balloon.
 pub(crate) fn discover(virtio: &VirtioFunctions) -> Option<PciAddress> {
-    virtio.find_virtio_function(DeviceType::MemoryBalloon)
+    virtio.find_virtio_function_any(DeviceType::MemoryBalloon)
 }
 
 /// Brings up the virtio-balloon function at `address` and hands it to
@@ -44,23 +45,17 @@ pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     kernel: &helios_kernel::Kernel<crate::X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     pci: &PciRoot,
     address: PciAddress,
-    physical_memory_offset: usize,
+    dma: X86DmaPool,
     generation: helios_kernel::MachineGenerationHandle,
 ) -> BalloonHandle
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
     MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
-    let device = helios_virtio::balloon_from_pci(
-        &pci.access(),
-        address,
-        pci,
-        OffsetDmaPool::new(physical_memory_offset),
-        None,
-    )
-    .unwrap_or_else(|error| {
-        panic!("failed to initialize the virtio-balloon function at {address}: {error}")
-    });
+    let device = helios_virtio::balloon_from_pci(&pci.access(), address, pci, dma, None)
+        .unwrap_or_else(|error| {
+            panic!("failed to initialize the virtio-balloon function at {address}: {error}")
+        });
     let device = Arc::new(device);
     let handle = helios_kernel::install_memory_balloon(kernel, device.clone(), generation);
     // Local, like the balloon tasks it wakes: `install_memory_balloon`

@@ -1126,7 +1126,7 @@ impl Preview1Gather {
     /// Copies the next `destination.len()` bytes, which is at most
     /// [`Self::remaining`], into `destination`, from pages the caller saw
     /// present in this poll ([`Self::bring_in`]).
-    fn fill_present(&mut self, memory: &Preview1AsyncMemory, destination: &mut [u8]) {
+    pub(super) fn fill_present(&mut self, memory: &Preview1AsyncMemory, destination: &mut [u8]) {
         debug_assert!(
             destination.len() <= self.remaining,
             "a gathered round is no longer than what is left"
@@ -1178,24 +1178,30 @@ impl Preview1Gather {
     }
 }
 
-/// Sends everything `gather` still holds through `send`, one chunk at a
-/// time, and reports how many bytes went. An empty transfer reaches `send`
+/// A stream a gathered send goes out on, one chunk at a time.
+pub(super) trait Preview1ChunkedStream {
+    /// Takes the next `len` bytes out of `gather` and sends them.
+    fn send(
+        &mut self,
+        memory: &Preview1AsyncMemory,
+        gather: &mut Preview1Gather,
+        len: usize,
+    ) -> impl Future<Output = Result<Result<(), i32>, GuestAccessError>> + Send;
+}
+
+/// Sends everything `gather` still holds on `stream`, one chunk at a
+/// time, and reports how many bytes went. An empty transfer reaches `stream`
 /// once. A refusal after some chunks went leaves them sent: the guest meets
 /// the refusal on its next call.
-pub(super) async fn p1_send_gathered<SendChunk, ChunkSent>(
+pub(super) async fn p1_send_gathered(
     memory: &Preview1AsyncMemory,
     gather: &mut Preview1Gather,
-    mut send: SendChunk,
-) -> Result<u32, P1Stop>
-where
-    SendChunk: FnMut(Vec<u8>) -> ChunkSent,
-    ChunkSent: Future<Output = Result<(), i32>>,
-{
+    stream: &mut impl Preview1ChunkedStream,
+) -> Result<u32, P1Stop> {
     let mut sent = 0_u32;
     loop {
-        let chunk = gather.next_chunk(memory).await?.unwrap_or_default();
-        let len = chunk.len();
-        match send(chunk).await {
+        let len = gather.next_len();
+        match stream.send(memory, gather, len).await? {
             // The iovecs' sum fits a `u32`, so no count of it overflows.
             Ok(()) => sent += len as u32,
             Err(_) if sent > 0 => break,

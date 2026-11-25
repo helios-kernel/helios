@@ -89,7 +89,7 @@ pub use swap::{
 #[cfg(test)]
 pub(crate) use swap::{GUEST_SWAP_PAGE, GuestSwap};
 pub use user::{
-    MemoryNodeStats, UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on,
+    MemoryNodeStats, UserHeapStats, UserMemoryPool, UserPoolChunks, allocate_user_frame_uninit_on,
     allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
     allocate_user_run_zeroed_on, deallocate_user_frame, deallocate_user_frame_on,
     deallocate_user_run_on, install_user_memory_pool, largest_servable_user_bytes, locality,

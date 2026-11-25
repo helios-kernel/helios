@@ -26,6 +26,9 @@ use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{AddressSpaceError, PageFlags, VirtAddr, VirtRange};
 use spin::Once;
 
+use super::grant::DeviceGrant;
+use super::lease::DmaBuffer;
+
 /// The address space's surface for buffers and the views of them.
 pub struct DeviceVmHooks {
     /// Take a physically contiguous run of `bytes`, zeroed and mapped
@@ -99,8 +102,26 @@ pub struct DeviceInterruptHooks {
     pub unmask: fn(u32),
 }
 
+/// The platform's surface for stopping a granted device's bus mastering
+/// when its owner lets go or is killed.
+///
+/// Called from task context in [`GrantLease`](super::GrantLease)'s drop
+/// before any pinned DMA buffer returns to the pool.
+pub struct DeviceDmaHooks {
+    /// Stop `grant` from issuing DMA into `buffers` — by disabling bus
+    /// mastering, resetting the function, or unmapping `buffers` from its
+    /// IOMMU domain.
+    ///
+    /// Returns `true` only when hardware guarantees no further DMA from
+    /// `grant` can reach `buffers` after this call returns. Returning
+    /// `false` leaves those buffers quarantined on the published device
+    /// until a later owner resets the hardware and releases them.
+    pub quiesce: fn(&DeviceGrant, &[DmaBuffer]) -> bool,
+}
+
 static VM_HOOKS: Once<&'static DeviceVmHooks> = Once::new();
 static INTERRUPT_HOOKS: Once<&'static DeviceInterruptHooks> = Once::new();
+static DMA_HOOKS: Once<&'static DeviceDmaHooks> = Once::new();
 
 /// Install the backend's buffer and view surface. Called once during
 /// bring-up, before any grant is published.
@@ -120,6 +141,29 @@ pub fn install_device_interrupt_hooks(hooks: &'static DeviceInterruptHooks) {
         core::ptr::eq(*installed, hooks),
         "device interrupt hooks were installed more than once"
     );
+}
+
+/// Install the backend's DMA-quiesce surface. Called once during
+/// bring-up, before any grant is published.
+///
+/// Optional: a backend that installs no table cannot prove a granted
+/// device stopped bus mastering, so reclaimed DMA buffers stay
+/// quarantined with the device rather than returning to the pool.
+pub fn install_device_dma_hooks(hooks: &'static DeviceDmaHooks) {
+    let installed = DMA_HOOKS.call_once(|| hooks);
+    assert!(
+        core::ptr::eq(*installed, hooks),
+        "device DMA hooks were installed more than once"
+    );
+}
+
+/// Ask the platform to stop `grant`'s DMA into `buffers` before they are
+/// returned to the pool. Returns `false` when no DMA-quiesce hook is
+/// installed or the platform cannot guarantee the device is quiet.
+pub(crate) fn quiesce_device_dma(grant: &DeviceGrant, buffers: &[DmaBuffer]) -> bool {
+    DMA_HOOKS
+        .get()
+        .is_some_and(|hooks| (hooks.quiesce)(grant, buffers))
 }
 
 /// The installed buffer and view surface.
@@ -169,7 +213,8 @@ pub(crate) mod test_hooks {
     //! has that thread's recording free it, so every test keeps its
     //! buffers on the thread that allocated them.
 
-    use super::{DeviceInterruptHooks, DeviceVmHooks};
+    use super::{DeviceDmaHooks, DeviceInterruptHooks, DeviceVmHooks};
+    use crate::device::{DeviceGrant, DeviceName, DmaBuffer};
     use alloc::alloc::{Layout, alloc_zeroed, dealloc};
     use alloc::vec::Vec;
     use core::cell::RefCell;
@@ -183,6 +228,7 @@ pub(crate) mod test_hooks {
     pub enum MappingChange {
         Allocated(PhysicalRange),
         Freed(PhysicalRange),
+        Quiesced,
         SubstituteMemory(VirtRange, PhysicalRange),
         /// A device's own range shown at `VirtRange`, under the access
         /// rules it was shown with: what decides the memory type the
@@ -202,6 +248,8 @@ pub(crate) mod test_hooks {
         shootdowns: u64,
         masked: Vec<u32>,
         unmasked: Vec<u32>,
+        quiesced: Vec<DeviceName>,
+        quiesce_refused: bool,
         /// Host memory standing in for the runs `allocate_run` hands
         /// out, keyed by their address.
         ///
@@ -337,12 +385,35 @@ pub(crate) mod test_hooks {
         kernel_alias,
     };
 
+    fn quiesce(grant: &DeviceGrant, _buffers: &[DmaBuffer]) -> bool {
+        RECORDING.with(|recording| {
+            let mut recording = recording.borrow_mut();
+            recording.quiesced.push(*grant.name());
+            recording.changes.push(MappingChange::Quiesced);
+            !recording.quiesce_refused
+        })
+    }
+
     static INTERRUPTS: DeviceInterruptHooks = DeviceInterruptHooks { mask, unmask };
+    static DMA: DeviceDmaHooks = DeviceDmaHooks { quiesce };
 
     /// Install the recording tables, idempotently.
     pub fn install() {
         super::VM_HOOKS.call_once(|| &VM);
         super::INTERRUPT_HOOKS.call_once(|| &INTERRUPTS);
+        super::DMA_HOOKS.call_once(|| &DMA);
+    }
+
+    /// Control whether this test thread's platform DMA quiesce succeeds.
+    pub fn set_quiesce_succeeds(succeeds: bool) {
+        RECORDING.with(|recording| {
+            recording.borrow_mut().quiesce_refused = !succeeds;
+        });
+    }
+
+    /// Devices this test's thread has asked the platform to quiesce.
+    pub fn quiesced() -> Vec<DeviceName> {
+        RECORDING.with(|recording| recording.borrow().quiesced.clone())
     }
 
     /// Shootdowns this test's thread has issued.

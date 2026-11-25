@@ -24,8 +24,10 @@ use core::arch::asm;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
+use helios_hal::dma::{DmaBuffer, DmaMemory};
+use helios_hal::iommu::DmaAccess;
 use helios_hal::tagging::{AllocationTags, MemoryTagging, Tag, TagChecking, TagSet, TaggedView};
-use helios_virtio::{DmaBuffer, DmaPool, OffsetDmaPool};
+use helios_virtio::OffsetDmaPool;
 use spin::Once;
 
 use crate::cfi::{ESR_EC_MASK, ESR_EC_SHIFT};
@@ -542,9 +544,11 @@ pub(crate) fn verify_on_current_processor(mpidr: u64) {
     }
     let pool = dma_pool();
     let layout = Layout::from_size_align(64, 64).expect("probe buffer layout");
-    let buffer = pool.allocate_zeroed(layout).unwrap_or_else(|error| {
-        panic!("AArch64 MTE self-check on MPIDR {mpidr:#x} could not allocate buffer: {error}")
-    });
+    let buffer = pool
+        .allocate(layout, DmaAccess::READ | DmaAccess::WRITE)
+        .unwrap_or_else(|error| {
+            panic!("AArch64 MTE self-check on MPIDR {mpidr:#x} could not allocate buffer: {error}")
+        });
     let tagged_ptr = buffer.as_ptr();
     let live_tag = logical_tag(tagged_ptr as usize);
     let canonical = strip(tagged_ptr as usize);
@@ -610,7 +614,7 @@ pub(crate) fn self_test() {
     let pool = dma_pool();
     let layout = Layout::from_size_align(64, 64).expect("self-test buffer layout");
     let buffer = pool
-        .allocate_zeroed(layout)
+        .allocate(layout, DmaAccess::READ | DmaAccess::WRITE)
         .expect("memory tagging self-test buffer allocation");
     // Step into the leading `Tag::FREE` redzone using the object's live tag:
     // the synchronous tag check fault must fire and panic naming the granule
