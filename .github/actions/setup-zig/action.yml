@@ -1,5 +1,5 @@
-name: Install Zig with a shared build cache
-description: Keep one content-keyed build cache per job and architecture, written by the default branch.
+name: Install Zig
+description: Install the pinned Zig toolchain from the official release tarball without caching `.zig-cache`.
 inputs:
   version:
     description: Zig version to install.
@@ -7,13 +7,46 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: mlugg/setup-zig@v2
-      with:
-        version: ${{ inputs.version }}
-        # The upstream action saves a fresh build cache for every run.
-        # It still installs Zig and exports both cache directories here.
-        use-cache: false
-    - uses: ./helios/.github/actions/shared-cache
-      with:
-        path: ${{ github.workspace }}/.zig-cache
-        key: zig-build-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ github.job }}-${{ hashFiles('helios/Cargo.lock', 'helios/rust-toolchain.toml', 'helios/tools/bench/native/**', 'helios/tools/wasi-apps/**') }}
+    - name: Install pinned Zig toolchain
+      shell: bash
+      env:
+        ZIG_VERSION: ${{ inputs.version }}
+        RUNNER_OS: ${{ runner.os }}
+        RUNNER_ARCH: ${{ runner.arch }}
+      run: |
+        set -euo pipefail
+        if command -v zig >/dev/null 2>&1 && [[ "$(zig version)" == "${ZIG_VERSION}" ]]; then
+          echo "Zig ${ZIG_VERSION} already installed at $(command -v zig)"
+          exit 0
+        fi
+        if [[ "${RUNNER_OS}" != "Linux" ]]; then
+          echo "::error::unsupported OS for setup-zig: ${RUNNER_OS}"
+          exit 1
+        fi
+        case "${ZIG_VERSION}:${RUNNER_ARCH}" in
+          0.13.0:X64)
+            zig_arch="x86_64"
+            zig_sha="d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea"
+            ;;
+          0.13.0:ARM64)
+            zig_arch="aarch64"
+            zig_sha="041ac42323837eb5624068acd8b00cd5777dac4cf91179e8dad7a7e90dd0c556"
+            ;;
+          *)
+            echo "::error::unpinned Zig ${ZIG_VERSION} for ${RUNNER_OS}/${RUNNER_ARCH}"
+            exit 1
+            ;;
+        esac
+        dir="${RUNNER_TEMP}/zig-${ZIG_VERSION}"
+        archive="${RUNNER_TEMP}/zig-linux-${zig_arch}-${ZIG_VERSION}.tar.xz"
+        if [[ ! -x "${dir}/zig" ]]; then
+          curl --fail --silent --show-error --location --retry 5 --retry-all-errors \
+            --output "${archive}" \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${zig_arch}-${ZIG_VERSION}.tar.xz"
+          echo "${zig_sha}  ${archive}" | sha256sum --check -
+          mkdir -p "${dir}"
+          tar -xJf "${archive}" --strip-components=1 -C "${dir}"
+          rm -f "${archive}"
+        fi
+        echo "${dir}" >> "$GITHUB_PATH"
+        "${dir}/zig" version

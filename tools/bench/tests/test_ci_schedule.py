@@ -433,11 +433,11 @@ def test_wasi_artifacts_produced_once_and_decoupled_from_root_cargo(ci_jobs):
     cache_step = next(
         step for step in producer["steps"] if step.get("name") == "Restore WASI tooling artifacts"
     )
-    key = cache_step["with"]["key"]
-    assert "Cargo.toml" not in key
-    assert "Cargo.lock" not in key
-    assert "docs/wasmtime.md" not in key
-    assert ".cargo/config.toml" not in key
+    tag = cache_step["with"]["tag"]
+    assert "Cargo.toml" not in tag
+    assert "Cargo.lock" not in tag
+    assert "docs/wasmtime.md" not in tag
+    assert ".cargo/config.toml" not in tag
 
     for name, job in ci_jobs.items():
         if name == "wasi-artifacts":
@@ -678,14 +678,23 @@ def test_ci_speedup_caches_cli_qemu_inspector_and_prunes_main_caches(ci_jobs):
     for builder in ("build-helios-cli-x64", "build-helios-cli-arm64"):
         steps = ci_jobs[builder]["steps"]
         assert not any(step.get("uses", "").startswith("Swatinem/rust-cache") for step in steps), builder
+        assert not any(step.get("uses", "").startswith("actions/cache") for step in steps), builder
         assert not any(step.get("with", {}).get("path") == "~/.stow" for step in steps), builder
-        assert any(step.get("uses") == "water-rs/stow@main" for step in steps), builder
+        stow_step = next(step for step in steps if step.get("uses") == "water-rs/stow@main")
+        assert stow_step["with"]["save-if"] == "${{ github.ref == 'refs/heads/main' }}", builder
         build_step = next(step for step in steps if "stow build" in step.get("run", ""))
         assert build_step["env"].get("CARGO_PROFILE_RELEASE_PANIC") == "unwind", builder
 
     for image_job_name in ("linux-syscalls-image-x86-64", "linux-syscalls-image-aarch64"):
         steps = ci_jobs[image_job_name]["steps"]
-        assert any(step.get("id") == "inspector-cache" for step in steps), image_job_name
+        inspector_step = next(step for step in steps if step.get("id") == "inspector-cache")
+        assert inspector_step["uses"] == "./helios/.github/actions/artifact-restore", image_job_name
+
+    for job_name, job in ci_jobs.items():
+        for step in job.get("steps", []):
+            uses = step.get("uses", "")
+            assert not uses.startswith("actions/cache"), (job_name, uses)
+            assert uses != "./helios/.github/actions/shared-cache", (job_name, uses)
 
     build_arm_steps = ci_jobs["linux-syscalls-build-aarch64"]["steps"]
     assert any(

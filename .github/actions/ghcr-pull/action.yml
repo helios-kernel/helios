@@ -1,0 +1,99 @@
+name: Pull prebuilt bundle from GHCR
+description: Pull and unpack a content-addressed `.tar.zst` OCI artifact from GHCR using ORAS without a Docker daemon.
+inputs:
+  package:
+    description: Package name under `ghcr.io/<owner>/` (e.g. `helios-wasi-artifacts`).
+    required: true
+  tag:
+    description: Content-addressed OCI tag.
+    required: true
+  root:
+    description: Destination directory to extract `bundle.tar.zst` into.
+    required: true
+outputs:
+  hit:
+    description: "`true` if the prebuilt OCI artifact was pulled and extracted."
+    value: ${{ steps.pull.outputs.hit }}
+runs:
+  using: composite
+  steps:
+    - id: pull
+      shell: bash
+      env:
+        PACKAGE: ${{ inputs.package }}
+        TAG: ${{ inputs.tag }}
+        ROOT: ${{ inputs.root }}
+        OWNER: ${{ github.repository_owner }}
+        ACTOR: ${{ github.actor }}
+        GH_TOKEN: ${{ github.token }}
+        RUNNER_ARCH: ${{ runner.arch }}
+      run: |
+        set -euo pipefail
+        ensure_oras() {
+          if command -v oras >/dev/null 2>&1; then
+            return 0
+          fi
+          local bin_dir="${RUNNER_TEMP}/oras-1.4.0"
+          if [[ -x "${bin_dir}/oras" ]]; then
+            export PATH="${bin_dir}:${PATH}"
+            echo "${bin_dir}" >> "$GITHUB_PATH"
+            return 0
+          fi
+          local arch sha
+          case "${RUNNER_ARCH}" in
+            X64)
+              arch="amd64"
+              sha="d8e1dce2fd8ce996f1d901845b688eb0cf505a6082897606f053825bb47935d1"
+              ;;
+            ARM64)
+              arch="arm64"
+              sha="0791fc200831563e498638d30e8ee8aac20ad1da2610760120fe3f770e12a8a4"
+              ;;
+            *)
+              echo "::error::unsupported RUNNER_ARCH for oras: ${RUNNER_ARCH}"
+              exit 1
+              ;;
+          esac
+          local archive="${RUNNER_TEMP}/oras_1.4.0_linux_${arch}.tar.gz"
+          curl --fail --silent --show-error --location --retry 5 --retry-all-errors \
+            --output "${archive}" \
+            "https://github.com/oras-project/oras/releases/download/v1.4.0/oras_1.4.0_linux_${arch}.tar.gz"
+          echo "${sha}  ${archive}" | sha256sum --check -
+          mkdir -p "${bin_dir}"
+          tar -xzf "${archive}" -C "${bin_dir}" oras
+          chmod 0755 "${bin_dir}/oras"
+          rm -f "${archive}"
+          export PATH="${bin_dir}:${PATH}"
+          echo "${bin_dir}" >> "$GITHUB_PATH"
+        }
+
+        ensure_oras
+        owner_lc="$(printf '%s' "${OWNER}" | tr '[:upper:]' '[:lower:]')"
+        ref="ghcr.io/${owner_lc}/${PACKAGE}:${TAG}"
+
+        if [[ -n "${GH_TOKEN}" ]]; then
+          printf '%s' "${GH_TOKEN}" | oras login ghcr.io --username "${ACTOR}" --password-stdin >/dev/null 2>&1 || true
+        fi
+
+        tmp="$(mktemp -d "${RUNNER_TEMP}/ghcr-pull.XXXXXX")"
+        trap 'rm -rf "${tmp}"' EXIT
+
+        set +e
+        pull_out="$(oras pull "${ref}" --output "${tmp}" 2>&1)"
+        rc=$?
+        set -e
+
+        if [[ ${rc} -eq 0 && -f "${tmp}/bundle.tar.zst" ]]; then
+          mkdir -p "${ROOT}"
+          tar --zstd -xf "${tmp}/bundle.tar.zst" -C "${ROOT}"
+          echo "Pulled GHCR prebuilt ${ref}"
+          echo "hit=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if grep -qiE 'not found|manifest unknown|404' <<< "${pull_out}"; then
+          echo "GHCR prebuilt miss for ${ref}"
+        else
+          echo "::warning::GHCR pull failed for ${ref} (rc=${rc}); falling back to build: ${pull_out}"
+        fi
+        echo "hit=false" >> "$GITHUB_OUTPUT"
