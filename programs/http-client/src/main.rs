@@ -104,7 +104,7 @@ async fn handle(request: types::Request) -> Result<types::Response, ErrorCode> {
         let options = request.get_options();
         timeouts(options.as_ref())
     };
-    let (mut http, scheme, outcome, verdict) = request::into_http(request)?;
+    let (mut http, scheme, outcome, verdict) = request::into_http(request).await?;
     http.extensions_mut().insert(timeouts);
     // The caller's verdict on its body settles from the body or from the
     // exchange, whichever ends first, so it waits on both in a task of its
