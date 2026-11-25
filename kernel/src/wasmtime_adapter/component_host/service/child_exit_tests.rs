@@ -1026,6 +1026,9 @@ mod linux_tests {
         fn write(&self, _: VirtAddr, _: &[u8]) -> Result<(), NativeError> {
             Ok(())
         }
+        fn populate(&self, _: VirtAddr, _: &[u8]) -> Result<(), NativeError> {
+            Ok(())
+        }
         fn atomic_load_u32(&self, _: VirtAddr) -> Result<u32, NativeError> {
             Ok(0)
         }
@@ -1488,6 +1491,9 @@ mod linux_tests {
             } else {
                 Err(NativeError::NotMapped)
             }
+        }
+        fn populate(&self, addr: VirtAddr, input: &[u8]) -> Result<(), NativeError> {
+            self.write(addr, input)
         }
         fn atomic_load_u32(&self, _: VirtAddr) -> Result<u32, NativeError> {
             Ok(0)
@@ -2870,6 +2876,10 @@ mod linux_tests {
                 self.write_bytes(address.raw(), bytes);
                 Ok(())
             }
+            fn populate(&self, address: VirtAddr, bytes: &[u8]) -> Result<(), NativeError> {
+                self.write_bytes(address.raw(), bytes);
+                Ok(())
+            }
             fn resolve_fault(&self, _: VirtAddr, _: PageFlags) -> Result<(), NativeError> {
                 Ok(())
             }
@@ -3710,6 +3720,598 @@ mod linux_tests {
             };
 
             futures::future::join(Box::pin(client), Box::pin(btrfs_service.run(timer))).await;
+        });
+    }
+
+    #[test]
+    fn execve_loads_dynamic_pie_with_pt_interp_and_enforces_interpreter_authority() {
+        use crate::test_support::UnsupportedStorage;
+        use crate::vfs::BOOT_DEVICE;
+        use crate::{
+            BootFs, ContainerConfig, ContainerId, ContainerMountSpec, DirectoryAuthorityRights,
+            EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs, LinuxContainer, MountSharing,
+            ProcessAuthority, SharedOwner,
+        };
+        use alloc::collections::{BTreeMap, VecDeque};
+        use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use helios_hal::cpu::{Instant, Timebase, TimerInterrupt};
+        use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
+        use helios_hal::hv::RegisterId;
+        use helios_hal::native::{
+            ExtendedState, InstructionSet, Mapping, NativeError, NativeExecution,
+            NativeUnavailable, Stop, UserContext, UserSpace,
+        };
+        use helios_hal::pmm::PhysFrame;
+        use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
+        use helios_linux::syscall::{Credentials, UtsField};
+
+        fn build_x86_elf(e_type: u16, base: u64, interp: Option<&[u8]>) -> Vec<u8> {
+            let mut bytes = alloc::vec![0u8; 2 * PhysFrame::SIZE];
+            let mut phdrs: Vec<[u8; 56]> = Vec::new();
+            let push = |phdrs: &mut Vec<[u8; 56]>,
+                        p_type: u32,
+                        p_flags: u32,
+                        p_offset: u64,
+                        p_vaddr: u64,
+                        p_filesz: u64,
+                        p_memsz: u64,
+                        p_align: u64| {
+                let mut h = [0u8; 56];
+                h[0..4].copy_from_slice(&p_type.to_le_bytes());
+                h[4..8].copy_from_slice(&p_flags.to_le_bytes());
+                h[8..16].copy_from_slice(&p_offset.to_le_bytes());
+                h[16..24].copy_from_slice(&p_vaddr.to_le_bytes());
+                h[24..32].copy_from_slice(&p_vaddr.to_le_bytes());
+                h[32..40].copy_from_slice(&p_filesz.to_le_bytes());
+                h[40..48].copy_from_slice(&p_memsz.to_le_bytes());
+                h[48..56].copy_from_slice(&p_align.to_le_bytes());
+                phdrs.push(h);
+            };
+            if let Some(path) = interp {
+                let off = 0x300u64;
+                bytes[off as usize..off as usize + path.len()].copy_from_slice(path);
+                push(
+                    &mut phdrs,
+                    3,
+                    4,
+                    off,
+                    base + off,
+                    path.len() as u64,
+                    path.len() as u64,
+                    1,
+                );
+            }
+            push(&mut phdrs, 1, 4, 0, base, 0x500, 0x500, 4096);
+            push(&mut phdrs, 1, 5, 0x1000, base + 0x1000, 0x200, 0x200, 4096);
+            push(&mut phdrs, 2, 4, 0x400, base + 0x400, 0x40, 0x40, 8);
+            bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+            bytes[16..18].copy_from_slice(&e_type.to_le_bytes());
+            bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+            bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+            bytes[24..32].copy_from_slice(&(base + 0x1000).to_le_bytes());
+            bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+            bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+            bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+            bytes[56..58].copy_from_slice(&(phdrs.len() as u16).to_le_bytes());
+            for (i, h) in phdrs.iter().enumerate() {
+                bytes[64 + i * 56..64 + (i + 1) * 56].copy_from_slice(h);
+            }
+            bytes
+        }
+
+        #[derive(Default)]
+        struct DynMapSpace {
+            bytes: spin::Mutex<BTreeMap<usize, u8>>,
+        }
+        impl DynMapSpace {
+            fn write_bytes(&self, addr: usize, data: &[u8]) {
+                let mut map = self.bytes.lock();
+                for (i, &b) in data.iter().enumerate() {
+                    map.insert(addr + i, b);
+                }
+            }
+            fn read_u64(&self, addr: usize) -> u64 {
+                let map = self.bytes.lock();
+                let mut buf = [0u8; 8];
+                for (i, slot) in buf.iter_mut().enumerate() {
+                    *slot = map.get(&(addr + i)).copied().unwrap_or(0);
+                }
+                u64::from_le_bytes(buf)
+            }
+            fn read_cstr(&self, addr: usize) -> String {
+                let map = self.bytes.lock();
+                let mut out = Vec::new();
+                let mut cur = addr;
+                while let Some(&b) = map.get(&cur) {
+                    if b == 0 {
+                        break;
+                    }
+                    out.push(b);
+                    cur += 1;
+                }
+                String::from_utf8(out).unwrap()
+            }
+        }
+        // SAFETY: host test double, never enters hardware user mode.
+        unsafe impl UserSpace for DynMapSpace {
+            fn map(
+                &self,
+                range: VirtRange,
+                initial: &[u8],
+                _: PageFlags,
+            ) -> Result<(), NativeError> {
+                let start = range.start.raw();
+                let mut map = self.bytes.lock();
+                for i in 0..range.byte_len {
+                    map.insert(start + i, initial.get(i).copied().unwrap_or(0));
+                }
+                Ok(())
+            }
+            fn map_anywhere(
+                &self,
+                hint: VirtAddr,
+                len: usize,
+                _: PageFlags,
+            ) -> Result<VirtRange, NativeError> {
+                Ok(VirtRange::new(hint, len))
+            }
+            fn read(&self, addr: VirtAddr, out: &mut [u8]) -> Result<(), NativeError> {
+                let map = self.bytes.lock();
+                for (i, slot) in out.iter_mut().enumerate() {
+                    *slot = map.get(&(addr.raw() + i)).copied().unwrap_or(0);
+                }
+                Ok(())
+            }
+            fn check_writable(&self, _: VirtAddr, _: usize) -> Result<(), NativeError> {
+                Ok(())
+            }
+            fn write(&self, addr: VirtAddr, data: &[u8]) -> Result<(), NativeError> {
+                self.write_bytes(addr.raw(), data);
+                Ok(())
+            }
+            fn populate(&self, addr: VirtAddr, data: &[u8]) -> Result<(), NativeError> {
+                self.write_bytes(addr.raw(), data);
+                Ok(())
+            }
+            fn atomic_load_u32(&self, _: VirtAddr) -> Result<u32, NativeError> {
+                Ok(0)
+            }
+            fn atomic_store_u32(&self, _: VirtAddr, _: u32) -> Result<(), NativeError> {
+                Ok(())
+            }
+            fn atomic_compare_exchange_u32(
+                &self,
+                _: VirtAddr,
+                expected: u32,
+                _: u32,
+            ) -> Result<Result<u32, u32>, NativeError> {
+                Ok(Ok(expected))
+            }
+            fn unmap(&self, _: VirtRange) -> Result<(), NativeError> {
+                Ok(())
+            }
+            fn protect(&self, _: VirtRange, _: PageFlags) -> Result<(), NativeError> {
+                Ok(())
+            }
+            fn discard(&self, _: VirtRange) -> Result<(), NativeError> {
+                Ok(())
+            }
+            fn remap(&self, _: VirtRange, _: VirtRange) -> Result<(), NativeError> {
+                Ok(())
+            }
+            fn resolve_fault(&self, _: VirtAddr, _: PageFlags) -> Result<(), NativeError> {
+                Ok(())
+            }
+            fn mapping(&self, _: VirtRange) -> Option<Mapping> {
+                None
+            }
+            fn free_range(&self, hint: VirtAddr, _: usize) -> Option<VirtAddr> {
+                Some(hint)
+            }
+            fn clone_cow(&self) -> Result<Self, NativeError> {
+                Ok(Self {
+                    bytes: spin::Mutex::new(self.bytes.lock().clone()),
+                })
+            }
+        }
+
+        struct DynStep {
+            writes: Vec<(usize, Vec<u8>)>,
+            regs: [u64; 7],
+        }
+        #[derive(Default)]
+        struct DynState {
+            steps: VecDeque<DynStep>,
+            results: Vec<u64>,
+            entries: Vec<u64>,
+            auxvs: Vec<BTreeMap<u64, u64>>,
+            execfns: Vec<String>,
+        }
+        #[derive(Clone)]
+        struct DynCpu {
+            base: TestCpu,
+            state: Arc<spin::Mutex<DynState>>,
+        }
+        struct DynCtx {
+            state: Arc<spin::Mutex<DynState>>,
+            regs: [u64; 7],
+            entry: u64,
+            sp: u64,
+            tp: VirtAddr,
+            started: AtomicUsize,
+        }
+        // SAFETY: host test double, never enters hardware user mode.
+        unsafe impl UserContext for DynCtx {
+            type Space = DynMapSpace;
+            fn register(&self, reg: RegisterId) -> Result<u64, NativeError> {
+                match reg {
+                    RegisterId::X86Gpr(0) => Ok(self.regs[0]),
+                    RegisterId::X86Gpr(7) => Ok(self.regs[1]),
+                    RegisterId::X86Gpr(6) => Ok(self.regs[2]),
+                    RegisterId::X86Gpr(2) => Ok(self.regs[3]),
+                    RegisterId::X86Gpr(10) => Ok(self.regs[4]),
+                    RegisterId::X86Gpr(8) => Ok(self.regs[5]),
+                    RegisterId::X86Gpr(9) => Ok(self.regs[6]),
+                    RegisterId::X86Gpr(4) => Ok(self.sp),
+                    RegisterId::X86Gpr(_) => Ok(0),
+                    _ => Err(NativeError::Register),
+                }
+            }
+            fn set_register(&mut self, reg: RegisterId, val: u64) -> Result<(), NativeError> {
+                if matches!(reg, RegisterId::X86Gpr(0)) {
+                    self.regs[0] = val;
+                    self.state.lock().results.push(val);
+                    Ok(())
+                } else {
+                    Err(NativeError::Register)
+                }
+            }
+            fn thread_pointer(&self) -> VirtAddr {
+                self.tp
+            }
+            fn set_thread_pointer(&mut self, addr: VirtAddr) -> Result<(), NativeError> {
+                self.tp = addr;
+                Ok(())
+            }
+            fn extended_state(&self) -> ExtendedState {
+                ExtendedState::X86Xsave(alloc::vec![0; 576])
+            }
+            fn set_extended_state(&mut self, _: &ExtendedState) -> Result<(), NativeError> {
+                Ok(())
+            }
+            fn try_clone(&self) -> Result<Self, NativeError> {
+                Ok(Self {
+                    state: self.state.clone(),
+                    regs: self.regs,
+                    entry: self.entry,
+                    sp: self.sp,
+                    tp: self.tp,
+                    started: AtomicUsize::new(0),
+                })
+            }
+            fn resume(&mut self, space: &DynMapSpace) -> Stop {
+                if self.started.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
+                    let mut cursor = self.sp as usize;
+                    let argc = space.read_u64(cursor) as usize;
+                    cursor += 8 + (argc + 1) * 8;
+                    while space.read_u64(cursor) != 0 {
+                        cursor += 8;
+                    }
+                    cursor += 8;
+                    let mut auxv = BTreeMap::new();
+                    loop {
+                        let tag = space.read_u64(cursor);
+                        let val = space.read_u64(cursor + 8);
+                        cursor += 16;
+                        if tag == 0 {
+                            break;
+                        }
+                        auxv.insert(tag, val);
+                    }
+                    let execfn = auxv
+                        .get(&31)
+                        .map(|&p| space.read_cstr(p as usize))
+                        .unwrap_or_default();
+                    let mut st = self.state.lock();
+                    st.entries.push(self.entry);
+                    st.auxvs.push(auxv);
+                    st.execfns.push(execfn);
+                }
+                match self.state.lock().steps.pop_front() {
+                    Some(step) => {
+                        for (addr, data) in &step.writes {
+                            space.write_bytes(*addr, data);
+                        }
+                        self.regs = step.regs;
+                        Stop::SystemCall
+                    }
+                    None => {
+                        self.regs = [231, 0, 0, 0, 0, 0, 0];
+                        Stop::SystemCall
+                    }
+                }
+            }
+        }
+        impl NativeExecution for DynCpu {
+            type Space = DynMapSpace;
+            type Context = DynCtx;
+            fn instruction_set(&self) -> InstructionSet {
+                InstructionSet::X86_64
+            }
+            fn user_range(&self) -> VirtRange {
+                VirtRange::new(
+                    VirtAddr::new(PhysFrame::SIZE),
+                    (1usize << 47) - 2 * PhysFrame::SIZE,
+                )
+            }
+            fn create_space(&self) -> Result<Self::Space, NativeError> {
+                Ok(DynMapSpace::default())
+            }
+            fn create_context(
+                &self,
+                entry: VirtAddr,
+                sp: VirtAddr,
+            ) -> Result<Self::Context, NativeError> {
+                Ok(DynCtx {
+                    state: self.state.clone(),
+                    regs: [0; 7],
+                    entry: entry.raw() as u64,
+                    sp: sp.raw() as u64,
+                    tp: VirtAddr::new(PhysFrame::SIZE),
+                    started: AtomicUsize::new(0),
+                })
+            }
+        }
+        impl Cpu for DynCpu {
+            type Hypervisor = core::convert::Infallible;
+            type Native = Self;
+            const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+            fn native(&self) -> Result<&Self::Native, NativeUnavailable> {
+                Ok(self)
+            }
+            fn has_lazy_commit_virtual_memory(&self) -> bool {
+                true
+            }
+            fn processor_count(&self) -> usize {
+                1
+            }
+            fn bootstrap_processor(&self) -> ProcessorId {
+                ProcessorId::new(0)
+            }
+            fn park_current(&self) {}
+            type WakeOnlyMask = ();
+            fn mask_to_wake_only(&self) {}
+            fn park_wake_only(&self, _: &core::sync::atomic::AtomicU8, _: u8) {}
+            fn start_processor(&self, _: ProcessorId) {}
+            fn wake_processor(&self, _: ProcessorId) {}
+            fn stop_current(&self) {}
+            fn restart_processor(&self, _: ProcessorId) {}
+            fn now(&self) -> Instant {
+                self.base.now()
+            }
+            fn timebase(&self) -> Timebase {
+                self.base.timebase()
+            }
+            fn set_deadline(&self, _: Instant) {}
+            fn publish_executable(&self, _: *const u8, _: usize) {}
+            fn unpublish_executable(&self, _: *const u8, _: usize) {}
+            fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
+                self.base.native_feature_probe()
+            }
+            fn fill_entropy(
+                &self,
+                buffer: &mut [u8],
+            ) -> Result<EntropyQuality, EntropyUnavailable> {
+                self.base.fill_entropy(buffer)
+            }
+            fn shutdown(&self) -> ! {
+                unreachable!()
+            }
+            fn reboot(&self) -> ! {
+                unreachable!()
+            }
+        }
+
+        const SYS_EXECVE: u64 = 59;
+        const SYS_EXIT_GROUP: u64 = 231;
+        const ENOENT_NEG: u64 = 2u64.wrapping_neg();
+        const ENOEXEC_NEG: u64 = 8u64.wrapping_neg();
+        const EACCES_NEG: u64 = 13u64.wrapping_neg();
+
+        let step_execve = |path: &str| -> DynStep {
+            let mut path_bytes = path.as_bytes().to_vec();
+            path_bytes.push(0);
+            let mut argv_bytes = Vec::new();
+            argv_bytes.extend_from_slice(&0x10_0000u64.to_le_bytes());
+            argv_bytes.extend_from_slice(&0u64.to_le_bytes());
+            let envp_bytes = 0u64.to_le_bytes().to_vec();
+            DynStep {
+                writes: alloc::vec![
+                    (0x10_0000, path_bytes),
+                    (0x10_0200, argv_bytes),
+                    (0x10_0300, envp_bytes),
+                ],
+                regs: [SYS_EXECVE, 0x10_0000, 0x10_0200, 0x10_0300, 0, 0, 0],
+            }
+        };
+
+        let interp_elf: &'static [u8] = Box::leak(build_x86_elf(3, 0, None).into_boxed_slice());
+        let bad_recursive: &'static [u8] =
+            Box::leak(build_x86_elf(3, 0, Some(b"/lib/ld.so\0")).into_boxed_slice());
+        let dyn_pie: &'static [u8] =
+            Box::leak(build_x86_elf(3, 0, Some(b"/lib/ld.so\0")).into_boxed_slice());
+        let dyn_missing: &'static [u8] =
+            Box::leak(build_x86_elf(3, 0, Some(b"/lib/missing.so\0")).into_boxed_slice());
+        let dyn_noexec: &'static [u8] =
+            Box::leak(build_x86_elf(3, 0, Some(b"/noexec/ld.so\0")).into_boxed_slice());
+        let dyn_recursive: &'static [u8] =
+            Box::leak(build_x86_elf(3, 0, Some(b"/lib/bad_interp.so\0")).into_boxed_slice());
+
+        let dirs: &'static [EmbeddedBootDirectory] = Box::leak(
+            alloc::vec![
+                EmbeddedBootDirectory::new("root", 0),
+                EmbeddedBootDirectory::new("root/bin", 0),
+                EmbeddedBootDirectory::new("root/lib", 0),
+                EmbeddedBootDirectory::new("root/noexec", 0),
+                EmbeddedBootDirectory::new("noexec_src", 0),
+            ]
+            .into_boxed_slice(),
+        );
+        let entries: &'static [EmbeddedBootFile] = Box::leak(
+            alloc::vec![
+                EmbeddedBootFile::new("root/lib/ld.so", interp_elf, 0),
+                EmbeddedBootFile::new("root/lib/bad_interp.so", bad_recursive, 0),
+                EmbeddedBootFile::new("root/bin/dyn_pie", dyn_pie, 0),
+                EmbeddedBootFile::new("root/bin/dyn_missing", dyn_missing, 0),
+                EmbeddedBootFile::new("root/bin/dyn_noexec", dyn_noexec, 0),
+                EmbeddedBootFile::new("root/bin/dyn_recursive", dyn_recursive, 0),
+                EmbeddedBootFile::new("noexec_src/ld.so", interp_elf, 0),
+            ]
+            .into_boxed_slice(),
+        );
+        let boot_fs = BootFs::new(EmbeddedBootFs::new(dirs, entries), BOOT_DEVICE);
+        let host_ns =
+            crate::Namespace::<UnsupportedStorage>::new(crate::MountTable::new(boot_fs, 8));
+        let root_auth = ProcessAuthority::root();
+
+        block_on(async {
+            let entropy = triomphe::Arc::new(
+                crate::RootEntropy::from_platform(
+                    &TestCpu::with_entropy(0x33),
+                    None,
+                    None,
+                    crate::MachineGeneration::new(None),
+                )
+                .expect("entropy"),
+            );
+            let container = Arc::new(
+                LinuxContainer::create(
+                    ContainerId::new(core::num::NonZeroU64::new(1).unwrap()),
+                    &root_auth,
+                    &host_ns,
+                    ProcessAuthority::root(),
+                    ContainerConfig {
+                        root: ContainerMountSpec {
+                            source_path: String::from("/root"),
+                            target_path: String::from("/"),
+                            rights: DirectoryAuthorityRights::READ
+                                | DirectoryAuthorityRights::EXECUTE,
+                            sharing: MountSharing::Shared,
+                        },
+                        mounts: alloc::vec![ContainerMountSpec {
+                            source_path: String::from("/noexec_src"),
+                            target_path: String::from("/noexec"),
+                            rights: DirectoryAuthorityRights::READ,
+                            sharing: MountSharing::Shared,
+                        }],
+                        shared_owner: SharedOwner { uid: 0, gid: 0 },
+                        credentials: Credentials::root(),
+                        hostname: UtsField::from_bytes(b"helios-dyn").unwrap(),
+                        domainname: UtsField::from_bytes(b"").unwrap(),
+                    },
+                )
+                .await
+                .expect("create container"),
+            );
+
+            let state = Arc::new(spin::Mutex::new(DynState {
+                steps: VecDeque::from(alloc::vec![
+                    step_execve("/bin/dyn_missing"),
+                    step_execve("/bin/dyn_noexec"),
+                    step_execve("/bin/dyn_recursive"),
+                    step_execve("/bin/dyn_pie"),
+                    DynStep {
+                        writes: Vec::new(),
+                        regs: [SYS_EXIT_GROUP, 0, 0, 0, 0, 0, 0],
+                    },
+                ]),
+                ..DynState::default()
+            }));
+            let cpu = DynCpu {
+                base: TestCpu::with_entropy(0x33),
+                state: state.clone(),
+            };
+            let runtime_state: HostRuntimeState<DynCpu, TestNetworkService, UnsupportedStorage> =
+                crate::RuntimeState::new(
+                    cpu.timebase(),
+                    1,
+                    0,
+                    crate::BootPayload::for_tests(),
+                    GuestIsa::for_build_target(cpu.native_feature_probe()),
+                );
+            runtime_state.install_root_entropy(entropy);
+            let executor = crate::Executor::isolated(
+                ProgressCounter::new(),
+                crate::test_support::single_node_pool(1),
+                ProcessorId::new(0),
+            );
+            let registry = crate::InstanceRegistry::new();
+            let instance = registry.register("linux-dyn-execve", 0);
+            let exec_context = ProgramExecContext {
+                cpu: cpu.clone(),
+                timer: executor.timer(cpu.clone()),
+                spawner: executor.spawner(cpu.clone()),
+                runtime_state,
+                instance_registry: registry,
+                parent_instance_id: None,
+                read_serial: |_, _| {},
+                write_serial: crate::DebugSerialWriter::of::<test_store::DiscardPort>(),
+            };
+            let initial_exe =
+                LinuxExecutable::load(&cpu, minimal_x86_64_elf()).expect("load initial static ELF");
+            let (_stdin_tx, stdin_rx) = crate::byte_channel();
+            let (stdout_tx, _stdout_rx) = crate::byte_channel();
+            let (stderr_tx, _stderr_rx) = crate::byte_channel();
+            let instance_spawner = executor
+                .spawner(cpu.clone())
+                .instance_spawner(crate::TaskFunding::Instance, &instance);
+            let timeline = phases::Timeline::begin(&cpu, "spawn", "/linux/dyn-execve");
+            let exit = Box::pin(run_linux_process(
+                LinuxExecRuntime {
+                    exec_context,
+                    wasm: None,
+                },
+                ProgramArgv::launched("initial-static", Vec::new()),
+                Vec::new(),
+                container,
+                Some(Credentials::root()),
+                DescriptorOrigin::Fresh,
+                WasixSignalState::new(),
+                instance_spawner,
+                instance,
+                OutputMode::Child {
+                    stdin_rx,
+                    stdout_tx,
+                    stderr_tx,
+                },
+                initial_exe,
+                &timeline,
+            ))
+            .await
+            .expect("run_linux_process");
+            assert_eq!(exit.termination, ChildTermination::Exited(0));
+
+            let st = state.lock();
+            // Three failed execve attempts return exact Linux errnos without killing caller;
+            // fourth execve succeeds into /bin/dyn_pie + /lib/ld.so!
+            assert_eq!(st.results, alloc::vec![ENOENT_NEG, EACCES_NEG, ENOEXEC_NEG]);
+            assert_eq!(st.auxvs.len(), 2);
+            // Initial static image had AT_BASE == 0.
+            assert_eq!(st.auxvs[0].get(&7), Some(&0));
+            assert_eq!(st.auxvs[0].get(&8), Some(&0));
+            // Post-execve dynamic PIE has AT_BASE != 0, AT_FLAGS == 0, AT_PHENT == 56,
+            // AT_PHNUM == 4, AT_ENTRY != initial_pc (initial_pc == interpreter entry),
+            // and AT_EXECFN == "/bin/dyn_pie".
+            let dyn_auxv = &st.auxvs[1];
+            let at_base = *dyn_auxv.get(&7).expect("AT_BASE");
+            let at_entry = *dyn_auxv.get(&9).expect("AT_ENTRY");
+            assert_ne!(at_base, 0);
+            assert_eq!(dyn_auxv.get(&4), Some(&56));
+            assert_eq!(dyn_auxv.get(&5), Some(&4));
+            assert_eq!(dyn_auxv.get(&8), Some(&0));
+            assert_ne!(at_entry, st.entries[1]);
+            assert_eq!(st.entries[1], at_base + 0x1000);
+            assert_eq!(st.execfns[1], "/bin/dyn_pie");
         });
     }
 }

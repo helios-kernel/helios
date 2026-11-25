@@ -423,10 +423,10 @@ impl<Tables: UserTranslation> SpaceState<Tables> {
         }
     }
 
-    /// Gives every uncommitted page of `[first, last)` a private frame and
-    /// breaks copy-on-write on any shared page so a kernel write never mutates
-    /// another space's frame.
-    fn ensure_writable_private_range(
+    /// Gives every uncommitted page of `[first, last)` a private frame with
+    /// its mapped flags and breaks copy-on-write on any shared page so a
+    /// kernel write never mutates another space's frame.
+    fn ensure_private_range(
         &mut self,
         space: &NativeSpace<Tables>,
         first: u64,
@@ -535,8 +535,22 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
             return Ok(());
         }
         let (first, last) = state.pages.span(address, bytes.len() as u64)?;
-        state.ensure_writable_private_range(self, first, last)?;
+        state.ensure_private_range(self, first, last)?;
         state.pages.write(address, bytes, PageFlags::WRITE)
+    }
+
+    fn populate(&self, address: VirtAddr, bytes: &[u8]) -> Result<(), NativeError> {
+        let address = address.raw() as u64;
+        let mut state = self.shared.state.lock();
+        state
+            .pages
+            .check(address, bytes.len(), PageFlags::empty())?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let (first, last) = state.pages.span(address, bytes.len() as u64)?;
+        state.ensure_private_range(self, first, last)?;
+        state.pages.write(address, bytes, PageFlags::empty())
     }
 
     fn atomic_load_u32(&self, address: VirtAddr) -> Result<u32, NativeError> {
@@ -1974,6 +1988,81 @@ mod tests {
             .read(VirtAddr::new(0x40_000), &mut child_move)
             .unwrap();
         assert_eq!(&child_move, b"move");
+
+        drop(child);
+        drop(parent);
+        assert_eq!(crate::memory::user_heap_stats().allocated_bytes, baseline);
+    }
+
+    #[test]
+    fn populate_writes_readonly_and_exec_pages_without_widening_ptes_and_breaks_cow() {
+        ensure_pool();
+        let parent_tables = TrackingTables::new();
+        let parent = NativeSpace::new(parent_tables.clone(), PAGE, 1 << 47);
+        let rx = PageFlags::READ | PageFlags::EXECUTE;
+        let range = |start: usize, pages: usize| {
+            VirtRange::new(VirtAddr::new(start), pages * PAGE as usize)
+        };
+        let baseline = crate::memory::user_heap_stats().allocated_bytes;
+
+        // Reserve 2 RX pages and 1 PROT_NONE page (0 frames committed yet).
+        parent.map(range(0x10_000, 2), &[], rx).unwrap();
+        parent
+            .map(range(0x20_000, 1), &[], PageFlags::empty())
+            .unwrap();
+        assert_eq!(crate::memory::user_heap_stats().allocated_bytes, baseline);
+
+        // Populate only page 0 of RX and page 0 of PROT_NONE: PTEs keep exact
+        // non-writable flags and untouched EOF tail page commits 0 frames.
+        parent
+            .populate(VirtAddr::new(0x10_000), b"exec-bytes")
+            .unwrap();
+        parent
+            .populate(VirtAddr::new(0x20_000), b"hidden-bytes")
+            .unwrap();
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 2 * PAGE as usize
+        );
+        assert_eq!(parent_tables.pte(0x10_000).map(|(_, f)| f), Some(rx));
+        assert_eq!(parent_tables.pte(0x11_000), None);
+        assert_eq!(
+            parent_tables.pte(0x20_000).map(|(_, f)| f),
+            Some(PageFlags::empty())
+        );
+
+        // Reveal PROT_NONE via protect(READ) and verify populated bytes + zero tail.
+        parent.protect(range(0x20_000, 1), PageFlags::READ).unwrap();
+        let mut out = [0xffu8; 32];
+        parent.read(VirtAddr::new(0x20_000), &mut out).unwrap();
+        assert_eq!(&out[..12], b"hidden-bytes");
+        assert!(out[12..].iter().all(|&b| b == 0));
+
+        // CoW clone shares both frames (0 new frames); populating parent's
+        // read-only page breaks CoW privately without mutating child or
+        // granting WRITE in hardware.
+        let child = parent.clone_cow().unwrap();
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 2 * PAGE as usize
+        );
+        parent
+            .populate(VirtAddr::new(0x20_000), b"PARENT-SYNC!")
+            .unwrap();
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 3 * PAGE as usize
+        );
+        assert_eq!(
+            parent_tables.pte(0x20_000).map(|(_, f)| f),
+            Some(PageFlags::READ)
+        );
+        let mut p_seen = [0u8; 12];
+        let mut c_seen = [0u8; 12];
+        parent.read(VirtAddr::new(0x20_000), &mut p_seen).unwrap();
+        child.read(VirtAddr::new(0x20_000), &mut c_seen).unwrap();
+        assert_eq!(&p_seen, b"PARENT-SYNC!");
+        assert_eq!(&c_seen, b"hidden-bytes");
 
         drop(child);
         drop(parent);

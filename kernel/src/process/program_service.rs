@@ -345,7 +345,7 @@ pub enum ProgramExecErrorDetail {
     NativeExecutionUnavailable(NativeUnavailable),
     #[error("no Linux ABI is decoded for this platform's instruction set")]
     LinuxAbiUnsupported,
-    #[error("the Linux executable is not a static image this kernel loads: {0}")]
+    #[error("the Linux executable is not an ELF image this kernel loads: {0}")]
     LinuxImageInvalid(LinuxImageRefusal),
     #[error("user memory for a native process is exhausted")]
     NativeMemoryExhausted,
@@ -360,10 +360,10 @@ pub enum ProgramExecErrorDetail {
 pub enum LinuxImageRefusal {
     #[error("it is not a well-formed ELF file")]
     Malformed,
-    #[error("it is not a little-endian static x86-64 ET_EXEC image")]
+    #[error("it is not a little-endian ET_EXEC or ET_DYN image for this architecture")]
     Unsupported,
-    #[error("it needs an interpreter or dynamic relocation")]
-    Dynamic,
+    #[error("its interpreter segment or interpreter image is invalid")]
+    Interpreter,
     #[error("a load segment's range, alignment or permissions are invalid")]
     Segment,
     #[error("its entry point is not in executable file-backed bytes")]
@@ -488,7 +488,7 @@ impl ProgramExecErrorDetail {
             // The refusal is in the error's `Display`; `as_str` has no
             // storage to format it into.
             Self::LinuxImageInvalid(_) => {
-                "the Linux executable is not a static image this kernel loads"
+                "the Linux executable is not an ELF image this kernel loads"
             }
             Self::NativeMemoryExhausted => "user memory for a native process is exhausted",
             Self::LinuxSubsystemUnavailable => "the Linux subsystem is not enabled in this kernel",

@@ -1,0 +1,41 @@
+name: Save cross-run tarred artifact
+description: Archive `path` into `bundle.tar` (preserving permissions and mtimes) and upload it as a GitHub Actions artifact.
+inputs:
+  name:
+    description: Artifact name.
+    required: true
+  path:
+    description: Directory whose contents are archived and uploaded.
+    required: true
+  retention-days:
+    description: Artifact retention days.
+    required: false
+    default: "14"
+runs:
+  using: composite
+  steps:
+    - name: Pack directory into tar archive
+      id: pack
+      shell: bash
+      env:
+        SRC: ${{ inputs.path }}
+      run: |
+        set -euo pipefail
+        stage="$(mktemp -d "${RUNNER_TEMP}/artifact-save.XXXXXX")"
+        mkdir -p "${SRC}"
+        tar -cf "${stage}/bundle.tar" -C "${SRC}" .
+        echo "stage=${stage}" >> "$GITHUB_OUTPUT"
+        echo "bundle=${stage}/bundle.tar" >> "$GITHUB_OUTPUT"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ steps.pack.outputs.bundle }}
+        retention-days: ${{ inputs.retention-days }}
+        if-no-files-found: error
+        overwrite: true
+    - name: Clean temporary archive
+      if: always()
+      shell: bash
+      env:
+        STAGE: ${{ steps.pack.outputs.stage }}
+      run: rm -rf "${STAGE}"
