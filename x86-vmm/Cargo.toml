@@ -15,7 +15,7 @@ x86_64 = { version = "0.15.3", default-features = false }
 [dev-dependencies]
 # The kernel builds only with a runtime selected; the host tests take the
 # one its own unit tests run with.
-helios-kernel = { workspace = true, features = ["wasmtime-host", "embedded-debugger"] }
+helios-kernel = { workspace = true, features = ["wasmtime-host"] }
 
 [lints]
 workspace = true

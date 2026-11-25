@@ -3,6 +3,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     use helios_hal::cpu::{Cpu, ProcessorId};
     use helios_hal::numa::SingleNode;
@@ -74,13 +76,32 @@ mod tests {
             .unwrap_or_else(|error| panic!("{} is not a valid payload: {error}", bootfs.display()))
     }
 
-    fn run_payload_init(has_system_component: bool) -> (String, Vec<u8>) {
+    #[test]
+    fn embedded_debugger_is_provisioned() {
+        let payload = test_payload();
+        let debugger = payload
+            .bootfs()
+            .files()
+            .iter()
+            .find(|file| file.path() == "bin/debugger")
+            .expect("kernel prebuild bootfs must carry /bin/debugger");
+        assert!(
+            !debugger.contents().is_empty(),
+            "embedded debugger payload must not be empty"
+        );
+
+        let init = payload.embedded_init();
+        assert_eq!(init.argv0(), "/init.wasm");
+        assert!(
+            !init.component().bytes().is_empty(),
+            "embedded init component payload must not be empty"
+        );
+    }
+
+    #[test]
+    fn embedded_debugger_boots_alongside_payload_init() {
         CAPTURED_SERIAL_OUT.lock().unwrap().clear();
-        {
-            let mut incoming = CAPTURED_SERIAL_IN.lock().unwrap();
-            incoming.clear();
-            incoming.extend(b"\xff\x00HRPC\xaa\x55".iter().copied());
-        }
+        CAPTURED_SERIAL_IN.lock().unwrap().clear();
 
         let bootstrap = ProcessorId::new(0);
         let machine = HostedMachine::new(1, bootstrap, DEFAULT_HEAP_BYTES);
@@ -120,7 +141,7 @@ mod tests {
         ));
         debug_state.seed_wall_clock(cpu.now().ticks(), &HostRtc);
 
-        helios_kernel::install_component_host_program_service(
+        let service = helios_kernel::install_component_host_program_service(
             &kernel,
             &cpu,
             &debug_state,
@@ -129,82 +150,96 @@ mod tests {
         )
         .expect("bootstrap processor installs program service");
 
-        helios_kernel::launch_boot_init(
-            &cpu,
+        let root_init = debug_state.embedded_init();
+        let root_name = root_init.component().name().to_owned();
+        let observed_debugger = std::sync::Arc::new(AtomicBool::new(false));
+        let observed_root = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_timer = kernel.timer();
+        let stop_state = debug_state.clone();
+        let stop_cpu = cpu.clone();
+        let stop_service = service.clone();
+        let stop_observed_debugger = observed_debugger.clone();
+        let stop_observed_root = observed_root.clone();
+
+        // Once the root supervisor completes init, spawns `/bin/debugger`, and
+        // invokes `signal-ready` (emitting `[KDBG run:begin]`), verify both
+        // instances are live and stop `/bin/debugger` so the root component
+        // finishes cleanly.
+        kernel.spawn_local_detached(async move {
+            let deadline = Duration::from_secs(30);
+            let mut waited = Duration::ZERO;
+            while waited < deadline {
+                let ready = {
+                    let bytes = CAPTURED_SERIAL_OUT.lock().unwrap();
+                    String::from_utf8_lossy(&bytes).contains("[KDBG run:begin]")
+                };
+                if ready {
+                    let now = stop_state.uptime_nanos(stop_cpu.now().ticks());
+                    let instances = stop_state.instance_registry().snapshot(now);
+                    if instances.iter().any(|inst| inst.name == root_name) {
+                        stop_observed_root.store(true, Ordering::Release);
+                    }
+                    if let Some(debugger) = instances.iter().find(|inst| inst.name == "debugger") {
+                        stop_observed_debugger.store(true, Ordering::Release);
+                        let residency = helios_kernel::UserResidency::default();
+                        let _ = stop_state.instance_registry().request_kill(
+                            debugger.id,
+                            helios_kernel::KillReason::Operator,
+                            now,
+                            &residency,
+                        );
+                        stop_service.interrupt_instance(debugger.id);
+                        CAPTURED_SERIAL_IN.lock().unwrap().push_back(0);
+                        TEST_DEBUG_CONSOLE.receive_signal().notify_all();
+                        return;
+                    }
+                }
+                stop_timer.sleep_for(Duration::from_millis(5)).await;
+                waited += Duration::from_millis(5);
+            }
+            panic!("timed out waiting for root supervisor readiness and debugger launch");
+        });
+
+        helios_kernel::run_root_component_once(
+            root_init,
+            cpu,
             &kernel,
-            &debug_state,
+            debug_state,
             read_captured_serial,
             CAPTURED_SERIAL_WRITER,
-            has_system_component,
-        );
+        )
+        .expect("root supervisor component must boot and exit cleanly");
 
-        let wait_state = debug_state.clone();
-        kernel.run_local_future(async move {
-            wait_state.wait_for_boot_init().await;
-        });
-        assert!(debug_state.boot_init_completed());
+        assert!(
+            observed_root.load(Ordering::Acquire),
+            "root supervisor component instance must be live at readiness"
+        );
+        assert!(
+            observed_debugger.load(Ordering::Acquire),
+            "root supervisor must spawn /bin/debugger before signaling ready"
+        );
 
         let output = String::from_utf8(CAPTURED_SERIAL_OUT.lock().unwrap().clone())
             .expect("init serial output must be valid UTF-8");
-        let remaining_in: Vec<u8> = CAPTURED_SERIAL_IN.lock().unwrap().iter().copied().collect();
-        (output, remaining_in)
-    }
-
-    #[test]
-    fn embedded_debugger_is_provisioned() {
-        let payload = test_payload();
-        let component = payload
-            .system_component()
-            .expect("kernel prebuild bootfs must carry /bin/debugger");
-        assert_eq!(component.name(), "bin/debugger");
-        assert!(
-            !component.bytes().is_empty(),
-            "embedded debugger payload must not be empty"
-        );
-
-        let init = payload.embedded_init();
-        assert_eq!(init.argv0(), "/init.wasm");
-        assert!(
-            !init.component().bytes().is_empty(),
-            "embedded init component payload must not be empty"
-        );
-    }
-
-    #[test]
-    fn embedded_debugger_boots_alongside_payload_init() {
-        let (output, remaining_in) = run_payload_init(true);
         assert!(
             output
                 .lines()
                 .any(|line| line == "helios init: online root=/"),
-            "boot init must emit its online banner, got:\n{output}"
+            "root supervisor must emit its online banner, got:\n{output}"
         );
         assert!(
             output.lines().any(|line| line == "file init.txt"),
-            "boot init must list root bootfs entries, got:\n{output}"
+            "root supervisor must list root bootfs entries, got:\n{output}"
         );
+        let init_txt_pos = output
+            .find("Helios init loaded from bootfs.")
+            .unwrap_or_else(|| panic!("root supervisor must print /init.txt, got:\n{output}"));
+        let ready_pos = output.find("[KDBG run:begin]").unwrap_or_else(|| {
+            panic!("root supervisor must emit [KDBG run:begin], got:\n{output}")
+        });
         assert!(
-            output.contains("Helios init loaded from bootfs."),
-            "boot init must print /init.txt, got:\n{output}"
-        );
-        assert_eq!(
-            remaining_in, b"\xff\x00HRPC\xaa\x55",
-            "boot init must not consume incoming debugger RPC bytes when system component is present"
-        );
-    }
-
-    #[test]
-    fn payload_init_runs_without_embedded_debugger() {
-        let (output, _) = run_payload_init(false);
-        assert!(
-            output
-                .lines()
-                .any(|line| line == "helios init: online root=/"),
-            "standalone boot init must emit its online banner, got:\n{output}"
-        );
-        assert!(
-            output.contains("Helios init loaded from bootfs."),
-            "standalone boot init must print /init.txt, got:\n{output}"
+            init_txt_pos < ready_pos,
+            "boot-readiness marker must follow init banner output, got:\n{output}"
         );
     }
 }

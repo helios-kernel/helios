@@ -271,10 +271,10 @@ pub use process::{
     NetworkAdminCap, NetworkAuthorityRights, NetworkCap, PrivilegedBindCap, ProcessAuthority,
     ProcessAuthorityError, ProcessAuthorityRights, ProfileReadCap, ProgramExecError,
     ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory, RequestedAuthorityScope,
-    RuntimeMessage, SetWallClockCap, SettingsAuthorityRights, SignalAuthority, SpawnAuthority,
-    SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap,
-    TerminalOutputCap, TraceReadCap, TtyControlCap, UdpCap, UnbindableStdio, UnmountCap,
-    VirtualizeCap, WriteSettingsCap,
+    RootSupervisorCap, RuntimeMessage, SetWallClockCap, SettingsAuthorityRights, SignalAuthority,
+    SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights,
+    TerminalInputCap, TerminalOutputCap, TraceReadCap, TtyControlCap, UdpCap, UnbindableStdio,
+    UnmountCap, VirtualizeCap, WriteSettingsCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
@@ -284,14 +284,14 @@ pub use profiling::{
 };
 pub use runtime::{
     AuthorityDomain, ComponentHostNetwork, ComponentNetworkService, ComponentNetworkState,
-    DnsError, DnsErrorKind, ExecOutput, ExecResult, HostCreation, HostDirEntry, HostDirLimit,
-    HostFileSystem, HostFilledWrite, HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore,
-    HostWrite, HttpsRecord, Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress,
-    NetworkPacketPump, ObjectIdentity, PacketFrame, PingError, PingErrorKind, PingReply,
-    RegisteredTcpReadBuffer, RuntimeState, SnapshotHold, SnapshotHoldBusy, SocketReadiness,
-    TcpAccepted, TcpConnectPoll, TcpError, TcpErrorKind, TcpListener, TcpPayloadPieces,
-    TcpReadInto, TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram, UdpError,
-    UdpErrorKind,
+    DnsError, DnsErrorKind, ExecOutput, ExecResult, FatalEscalationAction, FatalEscalationRecord,
+    HostCreation, HostDirEntry, HostDirLimit, HostFileSystem, HostFilledWrite, HostFsError,
+    HostFsErrorKind, HostMetadata, HostShareRestore, HostWrite, HttpsRecord, Ipv4Address,
+    NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump, ObjectIdentity,
+    PacketFrame, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
+    SnapshotHold, SnapshotHoldBusy, SocketReadiness, TcpAccepted, TcpConnectPoll, TcpError,
+    TcpErrorKind, TcpListener, TcpPayloadPieces, TcpReadInto, TcpReadProgress, TcpWriteProgress,
+    UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use settings::{
     Holds, SETTING_COUNT, Setting, SettingCell, SettingEntry, SettingUnit, SettingValue,
@@ -330,12 +330,12 @@ pub use vsock::{
 #[cfg(feature = "wasmtime-runtime")]
 pub use wasmtime_adapter::component_host::{
     ChildExit, ChildHandle, ChildTermination, ComponentBindingSet, ComponentHostProcessorRole,
-    ContainerHandle, HostRuntimeState, SignalTermination, UserProgramService,
-    component_host_processor_role, component_host_processors_to_start,
+    ContainerHandle, HostRuntimeState, ProviderHandle, RootComponentError, SignalTermination,
+    UserProgramService, component_host_processor_role, component_host_processors_to_start,
     component_host_system_processor, component_host_worker_count,
-    install_component_host_program_service, install_program_service, launch_boot_init,
-    run_component_host_processor_forever, run_embedded_component_forever,
-    run_program_workers_forever, system_component_should_run_on,
+    install_component_host_program_service, install_program_service,
+    run_component_host_processor_forever, run_program_workers_forever, run_root_component_forever,
+    run_root_component_once, system_component_should_run_on,
 };
 // Concrete runtime helpers are crate-internal only.
 // External consumers use the ComponentRuntimeFactory trait.

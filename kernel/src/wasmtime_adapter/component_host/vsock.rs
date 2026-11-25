@@ -25,7 +25,6 @@ use wasmtime::component::{
     Access, Accessor, ComponentType, Lift, Linker, Lower, Resource, ResourceType,
 };
 
-use crate::wasmtime_adapter::bindings::debugger::bindings as debugger_bindings;
 use crate::wasmtime_adapter::bindings::program::bindings as program_bindings;
 use crate::{ComponentHostVsockService, VsockError, VsockListenerId, VsockStreamId};
 
@@ -137,42 +136,6 @@ fn denied<Bindings: VsockBindings>() -> Bindings::Error {
         VsockErrorKind::PermissionDenied,
         "this component does not hold the host-link capability".to_string(),
     )
-}
-
-/// Marker for the `debugger` world's generated vsock types.
-pub(super) struct DebuggerVsock;
-
-impl VsockBindings for DebuggerVsock {
-    type Error = debugger_bindings::helios::system::vsock::VsockError;
-    type Address = debugger_bindings::helios::system::vsock::VsockAddress;
-
-    fn error(kind: VsockErrorKind, detail: String) -> Self::Error {
-        use debugger_bindings::helios::system::vsock::VsockErrorKind as Wit;
-        Self::Error {
-            kind: match kind {
-                VsockErrorKind::Unavailable => Wit::Unavailable,
-                VsockErrorKind::AddressInUse => Wit::AddressInUse,
-                VsockErrorKind::ConnectionRefused => Wit::ConnectionRefused,
-                VsockErrorKind::ConnectionReset => Wit::ConnectionReset,
-                VsockErrorKind::Closed => Wit::Closed,
-                VsockErrorKind::Timeout => Wit::Timeout,
-                VsockErrorKind::PermissionDenied => Wit::PermissionDenied,
-                VsockErrorKind::Internal => Wit::Internal,
-            },
-            detail,
-        }
-    }
-
-    fn address(address: VsockAddress) -> Self::Address {
-        Self::Address {
-            cid: address.cid,
-            port: address.port,
-        }
-    }
-
-    fn to_address(address: &Self::Address) -> VsockAddress {
-        VsockAddress::new(address.cid, address.port)
-    }
 }
 
 /// Marker for the `init` world's generated vsock types.
@@ -532,20 +495,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{DebuggerVsock, ProgramVsock, authorise, debugger_bindings, program_bindings};
+    use super::{ProgramVsock, authorise, program_bindings};
     use crate::wasmtime_adapter::component_host::service::test_store::store_data_authorized;
     use crate::{MachineAuthorityRights, ProcessAuthority, TerminalAuthorityRights};
 
     #[test]
     fn vsock_denies_root_and_terminal_authorities_and_requires_machine_control() {
         let root_store = store_data_authorized(ProcessAuthority::root(), |_| {});
-        assert!(matches!(
-            authorise::<DebuggerVsock, _, _, _>(&root_store),
-            Err(debugger_bindings::helios::system::vsock::VsockError {
-                kind: debugger_bindings::helios::system::vsock::VsockErrorKind::PermissionDenied,
-                ..
-            })
-        ));
         assert!(matches!(
             authorise::<ProgramVsock, _, _, _>(&root_store),
             Err(program_bindings::helios::system::vsock::VsockError {

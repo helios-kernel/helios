@@ -4,8 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [features]
-default = ["embedded-debugger"]
-embedded-debugger = ["helios-kernel/embedded-debugger"]
+default = []
 
 [dependencies]
 blocking = "1.6.2"

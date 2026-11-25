@@ -331,30 +331,6 @@ pub(super) struct WasixProcessSnapshot<Net: ComponentHostNetwork> {
     pub(super) rewind_stack: SharedPages,
 }
 
-/// The kernel-provisioned artifact at `path`, read from the boot payload
-/// itself rather than from a filesystem a guest can write to.
-pub(super) fn read_bootfs_artifact<CpuImpl, Net, StorageImpl>(
-    runtime_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
-    path: &str,
-) -> Option<BootfsBytes>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let inside = path
-        .strip_prefix('/')
-        .expect("a boot artifact is named by an absolute guest path");
-    let path = helios_hal::fs::FsPath::new(inside)
-        .expect("a boot artifact path is a normalized filesystem path");
-    runtime_state
-        .root_namespace()
-        .table()
-        .boot()
-        .file_contents(path)
-        .ok()
-}
-
 impl<Net: ComponentHostNetwork> WasixAsyncifyState<Net> {
     pub(super) const fn new() -> Self {
         Self {

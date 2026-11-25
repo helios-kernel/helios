@@ -65,6 +65,8 @@ pub mod processors;
 pub mod profiling;
 #[cfg(feature = "programs")]
 pub mod programs;
+#[cfg(feature = "root-supervisor")]
+pub mod root_supervisor;
 #[cfg(feature = "serial")]
 pub mod serial;
 #[cfg(feature = "settings")]

@@ -63,32 +63,6 @@ fn await_program_wit_wait(
     .expect("wait host call succeeds")
 }
 
-fn await_debugger_wit_wait(
-    handle: ChildHandle,
-) -> Result<
-    super::super::debugger_bindings::helios::system::programs::ExitStatus,
-    super::super::debugger_bindings::helios::system::programs::SpawnError,
-> {
-    use super::super::debugger_bindings::helios::system::programs::HostChildWithStore;
-
-    let engine = component_test_engine();
-    let mut store = wasmtime::Store::new(
-        &engine,
-        test_store::store_data_authorized(ProcessAuthority::root(), |_| {}),
-    );
-    let resource = store
-        .data_mut()
-        .table
-        .push(handle)
-        .expect("resource table admits child handle");
-    block_on(store.run_concurrent(async move |accessor| {
-        <HasSelf<test_store::TestStoreData> as HostChildWithStore<_>>::wait(accessor, resource)
-            .await
-    }))
-    .expect("concurrent run succeeds")
-    .expect("wait host call succeeds")
-}
-
 #[test]
 fn buffered_exec_kills_an_endless_writer_at_the_configured_output_limit() {
     let data = test_store::store_data_authorized(ProcessAuthority::empty(), |_| {});
@@ -160,7 +134,6 @@ fn buffered_exec_kills_an_endless_writer_at_the_configured_output_limit() {
 
 #[test]
 fn child_wait_reports_each_of_the_four_endings_distinctly() {
-    use super::super::debugger_bindings::helios::system::programs as dbg_wit;
     use super::super::program_bindings::helios::system::programs as prog_wit;
 
     let cases = [
@@ -213,30 +186,6 @@ fn child_wait_reports_each_of_the_four_endings_distinctly() {
             (ChildTermination::Trapped, prog_wit::ChildTermination::Trapped)
             | (ChildTermination::Killed, prog_wit::ChildTermination::Killed) => {}
             other => panic!("mismatched program WIT termination: {other:?}"),
-        }
-
-        let dbg_status = await_debugger_wit_wait(child_handle_with_result(id, Ok(expected)))
-            .expect("debugger WIT child.wait reports termination");
-        assert_eq!(dbg_status.instance_id, raw_id);
-        match (expected, dbg_status.termination) {
-            (ChildTermination::Exited(a), dbg_wit::ChildTermination::Exited(b)) => {
-                assert_eq!(a, b);
-            }
-            (
-                ChildTermination::Signaled(SignalTermination {
-                    signal: a_sig,
-                    core_dumped: a_core,
-                }),
-                dbg_wit::ChildTermination::Signaled(dbg_wit::SignalTermination {
-                    signal: b_sig,
-                    core_dumped: b_core,
-                }),
-            ) => {
-                assert_eq!((a_sig, a_core), (b_sig, b_core));
-            }
-            (ChildTermination::Trapped, dbg_wit::ChildTermination::Trapped)
-            | (ChildTermination::Killed, dbg_wit::ChildTermination::Killed) => {}
-            other => panic!("mismatched debugger WIT termination: {other:?}"),
         }
     }
 
@@ -2198,7 +2147,10 @@ mod linux_tests {
                 component_instance_pre_cache: Mutex::new(ComponentCache::new(1 << 20)),
                 core_module_cache: Mutex::new(ComponentCache::new(1 << 20)),
                 core_module_instance_pre_cache: Arc::new(Mutex::new(ComponentCache::new(1 << 20))),
-                compiler_artifact: None,
+                next_provider_generation: core::sync::atomic::AtomicU64::new(1),
+                surface_provider: Mutex::new(None),
+                http_provider: Mutex::new(None),
+                compiler_registration: Mutex::new(None),
                 cwasm_signing_key: crate::signing_key::CwasmSigningKey::from_seed(
                     &helios_hal::measured_boot::SealedSecret::new(
                         [0x42; helios_hal::measured_boot::SealedSecret::LEN],
@@ -2209,7 +2161,6 @@ mod linux_tests {
                 compile_slot: SharedMemorySessionSlot::new(),
                 code_map: CodeMap::new(),
                 clock_cpu: cpu.clone(),
-                http_client_pre: spin::Once::new(),
                 plugin_read_serial: |_, _| {},
                 plugin_write_serial: crate::DebugSerialWriter::of::<test_store::DiscardPort>(),
                 next_container_id: core::sync::atomic::AtomicU64::new(1),

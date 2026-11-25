@@ -14,8 +14,6 @@ use crate::{EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs, EmbeddedCom
 /// Limine entry's `module_path`, the hosted `--bootfs` argument.
 const BOOTFS_MODULE_NAME: &[u8] = b"helios-bootfs";
 
-const EMBEDDED_SYSTEM_COMPONENT_PATH: &str = "bin/debugger";
-
 /// The user payload a backend handed the kernel, parsed into the views
 /// the rest of the runtime reads.
 ///
@@ -186,24 +184,6 @@ impl BootPayload {
     /// carries it.
     pub fn boot_component(&self, path: &str) -> Option<EmbeddedComponent> {
         self.init.boot_component(path)
-    }
-
-    /// The embedded debugger system component, when the
-    /// `embedded-debugger` feature is enabled and the payload's bootfs
-    /// carries it. Kernels built without the feature never autostart a
-    /// system component.
-    pub fn system_component(&self) -> Option<EmbeddedComponent> {
-        if cfg!(feature = "embedded-debugger") {
-            self.boot_component(EMBEDDED_SYSTEM_COMPONENT_PATH)
-        } else {
-            None
-        }
-    }
-
-    /// Whether this payload carries a system component this build would
-    /// autostart.
-    pub fn has_system_component(&self) -> bool {
-        self.system_component().is_some()
     }
 }
 

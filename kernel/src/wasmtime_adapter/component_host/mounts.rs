@@ -20,7 +20,7 @@ use helios_hal::cpu::Cpu;
 use helios_hal::fs::BlockSerial;
 use wasmtime::component::{Accessor, HasSelf, Linker};
 
-use super::{StoreData, debugger_bindings, program_bindings};
+use super::{StoreData, program_bindings};
 use crate::{
     ComponentHostNetwork, ErofsError, MountError, MountRequestError, MountSharing, MountSource,
 };
@@ -265,7 +265,6 @@ macro_rules! impl_mount_bindings {
     };
 }
 
-impl_mount_bindings!(debugger_bindings, debugger_mounts, add_mounts_to_linker);
 impl_mount_bindings!(
     program_bindings,
     program_mounts,

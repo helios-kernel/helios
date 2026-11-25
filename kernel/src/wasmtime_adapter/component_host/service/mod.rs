@@ -44,12 +44,14 @@ mod exec;
 use exec::*;
 mod component_plugin;
 use component_plugin::*;
-mod http_plugin;
-use http_plugin::*;
 mod network_step;
 use network_step::NetworkStep;
-mod compositor_plugin;
-use compositor_plugin::*;
+mod root_supervisor;
+pub use root_supervisor::ProviderHandle;
+use root_supervisor::{
+    CompilerProviderRegistration, HttpProviderRegistration, SurfaceProviderRegistration,
+};
+pub(super) use root_supervisor::{add_root_supervisor_to_linker, root_supervisor_authority};
 mod preview1;
 use preview1::*;
 #[cfg(test)]
@@ -128,7 +130,6 @@ use wasmtime::{
     Caller, ExternType, InstancePre, Linker as CoreLinker, MemoryType, Module, SharedMemory, Val,
 };
 
-const COMPILER_PLUGIN_PATH: &str = "/bin/compiler.cwasm";
 const RAYON_NUM_THREADS_ENV: &[u8] = b"RAYON_NUM_THREADS=";
 const WASM_PAGE_SIZE: usize = 64 * 1024;
 const PROGRAM_SHARED_MEMORY_MAX_PAGES: u32 = 8192;
@@ -151,10 +152,16 @@ type CompilerThreadReports = SmallVec<[SharedMemoryThreadReport; 8]>;
 type CompilerPluginHandle<CpuImpl, Net, StorageImpl> =
     Arc<CompilerPluginRuntime<CpuImpl, Net, StorageImpl>>;
 
-/// What one compile session takes from its requester: the compiler plugin's
-/// artifact, the input, how to compile it, and where its output lands.
+/// What one compile session takes from its requester: the registered compiler
+/// provider's metadata and artifact, the input, how to compile it, and where
+/// its output lands.
 struct CompileJob<StorageImpl: crate::Storage> {
+    compiler_generation: u64,
+    compiler_name: String,
+    compiler_path: String,
     compiler_payload: Bytes,
+    compiler_oom_policy: crate::OomPolicy,
+    compiler_parent_instance_id: Option<crate::InstanceId>,
     wasm: Bytes,
     hint: AotCompileHint,
     profile: bool,
@@ -284,6 +291,8 @@ pub(super) struct ProgramLaunch<Net: ComponentHostNetwork, StorageImpl: crate::S
     /// container bounded by `authority`.
     #[cfg(feature = "linux")]
     container: Option<LinuxContainerLaunch<StorageImpl>>,
+    /// OOM protection tier assigned to the launched instance.
+    oom_policy: crate::OomPolicy,
     /// The launch's phase timeline: [`phases::Timeline::disabled`]
     /// when the launch-phase target is off or the launcher is not a
     /// launch call (plugin loads record nothing).
@@ -315,6 +324,7 @@ impl<Net: ComponentHostNetwork, StorageImpl: crate::Storage> ProgramLaunch<Net, 
             signal_dispositions: Vec::new(),
             #[cfg(feature = "linux")]
             container: None,
+            oom_policy: crate::OomPolicy::UserProgram,
             timeline: phases::Timeline::disabled(),
         }
     }
@@ -343,8 +353,14 @@ impl<Net: ComponentHostNetwork, StorageImpl: crate::Storage> ProgramLaunch<Net, 
                 container,
                 credentials,
             }),
+            oom_policy: crate::OomPolicy::UserProgram,
             timeline: phases::Timeline::disabled(),
         }
+    }
+
+    pub(super) fn with_oom_policy(mut self, oom_policy: crate::OomPolicy) -> Self {
+        self.oom_policy = oom_policy;
+        self
     }
 
     pub(super) fn with_launched_instance(
@@ -453,7 +469,14 @@ where
     // InstancePre moved the median from 53 ms to 50-51 ms. Cache only modules
     // whose imports are independent of per-process shared-memory binding.
     core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, Net, StorageImpl>,
-    compiler_artifact: Option<BootfsBytes>,
+    /// Monotonic generation counter for root-supervisor provider registrations.
+    next_provider_generation: core::sync::atomic::AtomicU64,
+    /// Active singleton `surface` (compositor) provider installed by the root supervisor.
+    surface_provider: Mutex<Option<SurfaceProviderRegistration>>,
+    /// Active per-processor `wasi:http/client` provider installed by the root supervisor.
+    http_provider: Mutex<Option<Arc<HttpProviderRegistration<CpuImpl, Net, StorageImpl>>>>,
+    /// Active AOT `compiler` provider installed by the root supervisor.
+    compiler_registration: Mutex<Option<CompilerProviderRegistration>>,
     /// The key the compiler plugin's output is signed with, and the only
     /// key a written `cwasm` verifies against. Settled at bring-up,
     /// before this service exists, and never replaced.
@@ -462,9 +485,8 @@ where
     guest_isa: GuestIsa,
     /// Lazily-built compiler kernel-plugin runtime. The plugin's
     /// `wasmtime::Module`, `InstancePre`, and 512 MiB `SharedMemory` are
-    /// allocated on first compile and reused for every subsequent call,
-    /// turning the plugin into a long-lived kernel resident — no more
-    /// per-call buddy-heap churn that previously OOM'd after one compile.
+    /// allocated on first compile and reused for subsequent calls of the
+    /// same provider generation.
     compiler_plugin: Mutex<Option<Arc<CompilerPluginRuntime<CpuImpl, Net, StorageImpl>>>>,
     /// Serialises compile calls. The cached `SharedMemory` is the
     /// plugin's only scratch surface; concurrent calls would race on
@@ -477,9 +499,6 @@ where
     /// instruction sampler to name.
     code_map: CodeMap,
     clock_cpu: CpuImpl,
-    /// Shared precompiled `http-client` plugin component, instantiated lazily
-    /// per processor on every core hosting [`NetworkStep`].
-    http_client_pre: spin::Once<Option<PreparedComponent<CpuImpl, Net, StorageImpl>>>,
     plugin_read_serial: crate::SerialReader,
     plugin_write_serial: crate::DebugSerialWriter,
     #[cfg(feature = "linux")]
@@ -1144,7 +1163,6 @@ where
         .unwrap_or_else(|error| panic!("failed to create launched-program engine: {error:#}"));
     let preview1_core_linker = preview1_program_linker(engine.raw())
         .unwrap_or_else(|error| panic!("failed to create preview1 program linker: {error:#}"));
-    let compiler_artifact = read_bootfs_artifact(debug_state, COMPILER_PLUGIN_PATH);
     let service = UserProgramService {
         inner: Arc::new(UserProgramServiceInner {
             runtime,
@@ -1157,14 +1175,16 @@ where
             component_instance_pre_cache: Mutex::new(ComponentCache::new(cache_budget)),
             core_module_cache: Mutex::new(ComponentCache::new(cache_budget)),
             core_module_instance_pre_cache: Arc::new(Mutex::new(ComponentCache::new(cache_budget))),
-            compiler_artifact,
+            next_provider_generation: core::sync::atomic::AtomicU64::new(1),
+            surface_provider: Mutex::new(None),
+            http_provider: Mutex::new(None),
+            compiler_registration: Mutex::new(None),
             cwasm_signing_key,
             guest_isa,
             compiler_plugin: Mutex::new(None),
             compile_slot: SharedMemorySessionSlot::new(),
             code_map: CodeMap::new(),
             clock_cpu: cpu.clone(),
-            http_client_pre: spin::Once::new(),
             plugin_read_serial: read_serial,
             plugin_write_serial: write_serial,
             #[cfg(feature = "linux")]
@@ -1176,21 +1196,8 @@ where
             _marker: core::marker::PhantomData,
         }),
     };
-    let http_pre = provision_http_client_plugin(&service, cpu, debug_state, write_serial);
-    service.inner.http_client_pre.call_once(|| http_pre);
     debug_state.install_program_service(service.clone());
     spawn_instruction_sample_drain(kernel, &service, debug_state);
-    let plugin_context = ProgramExecContext {
-        cpu: cpu.clone(),
-        timer: kernel.timer(),
-        spawner: kernel.spawner(),
-        runtime_state: debug_state.clone(),
-        instance_registry: debug_state.instance_registry(),
-        parent_instance_id: None,
-        read_serial,
-        write_serial,
-    };
-    install_compositor_plugin(&service, plugin_context);
     service
 }
 
@@ -1226,193 +1233,57 @@ fn spawn_instruction_sample_drain<CpuImpl, Net, StorageImpl, WatchdogImpl, Measu
     });
 }
 
-struct BootInitCompletionGuard<CpuImpl, Net, StorageImpl>(
-    HostRuntimeState<CpuImpl, Net, StorageImpl>,
-)
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage;
-
-impl<CpuImpl, Net, StorageImpl> Drop for BootInitCompletionGuard<CpuImpl, Net, StorageImpl>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    fn drop(&mut self) {
-        self.0.mark_boot_init_completed();
-    }
-}
-
-/// Selects stdio routing for the payload's boot `init` component.
+/// Runs the signed root supervisor component (`init` / `component-manager`)
+/// once on the calling processor and returns its outcome after flushing any
+/// writable mounts.
 ///
-/// When a system component (`bin/debugger`) is provisioned, `init`'s
-/// standard output and error still write to the debug UART as line-framed
-/// console segments before the debugger enters `wasi:cli/run`, while
-/// standard input stays closed so `init` never consumes incoming bytes
-/// meant for the debugger's serial RPC transport. Without a system
-/// component, `init` owns the full serial console when the platform
-/// exposes a debug UART, and falls back to observer trace output on
-/// platforms with no UART.
-pub(crate) fn boot_init_output_mode(
-    has_debug_serial: bool,
-    has_system_component: bool,
-) -> OutputMode {
-    if !has_debug_serial {
-        OutputMode::Trace
-    } else if has_system_component {
-        OutputMode::RoutedChild {
-            stdin: crate::ComponentInputRoute::Closed,
-            stdout: crate::ComponentOutputRoute::Serial,
-            stderr: crate::ComponentOutputRoute::Serial,
-        }
-    } else {
-        OutputMode::Serial
-    }
-}
-
-/// Schedules the payload's `EmbeddedInit::component()` to run on the
-/// calling bootstrap processor.
-///
-/// Shared across every backend (`aarch64`, `riscv`, `x86`, `hosted`) so
-/// bare-metal and hosted boots run the same bring-up orchestration, with
-/// or without `embedded-debugger`.
-pub fn launch_boot_init<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
-    cpu: &CpuImpl,
+/// Bare-metal and hosted boots invoke [`run_root_component_forever`]; hosted
+/// integration tests call this entry directly to observe the root component's
+/// full bring-up and exit without shutting down the test process.
+pub fn run_root_component_once<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
+    init: crate::EmbeddedInit,
+    cpu: CpuImpl,
     kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
-    debug_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
+    debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     read_serial: crate::SerialReader,
     write_serial: crate::DebugSerialWriter,
-    has_system_component: bool,
-) where
+) -> Result<(), RootComponentError>
+where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
     MeasuredBootImpl: MeasuredBoot,
 {
-    let service = debug_state
-        .program_service()
-        .expect("program service must be installed before launching boot init");
-    debug_state.mark_boot_init_launched();
-    let completion = BootInitCompletionGuard(debug_state.clone());
-    let output_mode =
-        boot_init_output_mode(kernel.devices().has_debug_serial, has_system_component);
-    let exec_context = ProgramExecContext {
-        cpu: cpu.clone(),
-        timer: kernel.timer(),
-        spawner: kernel.spawner(),
-        runtime_state: debug_state.clone(),
-        instance_registry: debug_state.instance_registry(),
-        parent_instance_id: None,
-        read_serial,
-        write_serial,
-    };
-    let debug_state = debug_state.clone();
-    kernel.spawn_local_detached(async move {
-        let _completion = completion;
-        run_boot_init(service, exec_context, debug_state, output_mode).await;
-    });
-}
-
-async fn run_boot_init<CpuImpl, Net, StorageImpl>(
-    service: UserProgramService<CpuImpl, Net, StorageImpl>,
-    exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
-    debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
-    output_mode: OutputMode,
-) where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let init = debug_state.embedded_init();
-    let component = init.component();
-    let component_name = component.name();
-    let argv0 = init.argv0();
-    tracing::info!(
-        component = component_name,
-        argv0,
-        "launching boot init component"
-    );
-    let authority = ProcessAuthority::root();
-    let spawn_authority = authority
-        .derive_spawn_authority()
-        .expect("root process authority grants spawn");
-    let compile_authority = CompileAuthority::from(&spawn_authority);
-    let source = ProgramSource::from_file(FileContents::Boot(component.bootfs_bytes()));
-    let launch = ProgramLaunch::new(
-        ProgramArgv::launched(argv0, Vec::new()),
-        Vec::new(),
-        authority,
-        None,
-    );
-    let child = match service
-        .spawn_with_output_mode(
-            &compile_authority,
-            exec_context,
-            source,
-            launch,
-            output_mode,
-            ChildStdio {
-                stdin: None,
-                stdout: None,
-                stderr: None,
+    let component_name = init.component().name();
+    let has_debug_serial = kernel.devices().has_debug_serial;
+    let stack = system_component_profile_stack(component_name);
+    let namespace = debug_state.root_namespace().clone();
+    let result = kernel.run_local_future(ProfiledSystemComponentFuture::new(
+        run_root_component(
+            init,
+            super::SystemComponentHost {
+                cpu: cpu.clone(),
+                timer: kernel.timer(),
+                spawner: kernel.spawner(),
+                debug_state: debug_state.clone(),
+                read_serial,
+                write_serial,
             },
-        )
-        .await
-    {
-        Ok(child) => child,
-        Err(error) => {
-            tracing::error!(
-                component = component_name,
-                argv0,
-                ?error,
-                "failed to launch boot init component"
-            );
-            return;
-        }
-    };
-
-    match child.wait().await {
-        Ok(exit) => match exit.termination {
-            helios_unix::ChildTermination::Exited(0) => {
-                tracing::info!(
-                    component = component_name,
-                    argv0,
-                    instance = exit.instance_id.raw(),
-                    "boot init component exited cleanly"
-                );
-            }
-            termination => {
-                tracing::error!(
-                    component = component_name,
-                    argv0,
-                    instance = exit.instance_id.raw(),
-                    ?termination,
-                    "boot init component exited unsuccessfully"
-                );
-            }
-        },
-        Err(error) => {
-            tracing::error!(
-                component = component_name,
-                argv0,
-                ?error,
-                "boot init component wait failed"
-            );
-        }
-    }
-
-    // Settle any writable mounts `init` created before its namespace
-    // dropped, so on-disk mutations from `/etc/rc` are durable before
-    // the system component opens inspector sessions.
-    debug_state.root_namespace().sync_writable_mounts().await;
+            has_debug_serial,
+        ),
+        cpu,
+        debug_state,
+        stack,
+    ));
+    // As Linux syncs and unmounts before it powers off: what the writable
+    // mounts hold reaches their devices before the machine goes down.
+    kernel.run_local_future(async move { namespace.sync_writable_mounts().await });
+    result
 }
 
-pub fn run_embedded_component_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
-    component: EmbeddedComponent,
-    world: ComponentBindingSet,
+pub fn run_root_component_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
+    init: crate::EmbeddedInit,
     cpu: CpuImpl,
     kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
@@ -1426,55 +1297,32 @@ where
     WatchdogImpl: Watchdog + Clone,
     MeasuredBootImpl: MeasuredBoot,
 {
-    let component_name = component.name();
-    // Wait for the payload's boot `init` to complete before emitting any
-    // debugger stage markers or tracing records onto the shared serial
-    // console, so SMP boots never interleave debugger bring-up lines with
-    // `init` or `/etc/rc` output.
-    let wait_state = debug_state.clone();
-    kernel.run_local_future(async move {
-        wait_state.wait_for_boot_init().await;
-    });
+    let component_name = init.component().name();
     write_serial.emit_stage_marker("boot");
     write_serial.emit_stage_marker("component-host:trace-begin");
     tracing::info!(
         component = component_name,
-        "launching embedded system component"
+        argv0 = init.argv0(),
+        "launching root supervisor component"
     );
     write_serial.emit_stage_marker("component-host:run-local-begin");
-    let stack = system_component_profile_stack(component_name);
-    let namespace = debug_state.root_namespace().clone();
-    kernel
-        .run_local_future(ProfiledSystemComponentFuture::new(
-            run_system_component(
-                component,
-                world,
-                super::SystemComponentHost {
-                    cpu: cpu.clone(),
-                    timer: kernel.timer(),
-                    spawner: kernel.spawner(),
-                    debug_state: debug_state.clone(),
-                    read_serial,
-                    write_serial,
-                },
-            ),
-            cpu.clone(),
-            debug_state,
-            stack,
-        ))
-        .unwrap_or_else(|error| {
-            write_serial
-                .emit_error_marker("error failed-system-component", format_args!("{error:#}"));
-            panic!("failed to exec embedded system component:\n{error:#}");
-        });
+    run_root_component_once(
+        init,
+        cpu.clone(),
+        kernel,
+        debug_state,
+        read_serial,
+        write_serial,
+    )
+    .unwrap_or_else(|error| {
+        write_serial.emit_error_marker("error failed-root-component", format_args!("{error:#}"));
+        panic!("failed to exec root supervisor component:\n{error:#}");
+    });
     write_serial.emit_stage_marker("done");
     tracing::info!(
         component = component_name,
-        "embedded system component exited cleanly"
+        "root supervisor component exited cleanly"
     );
-    // As Linux syncs and unmounts before it powers off: what the writable
-    // mounts hold reaches their devices before the machine goes down.
-    kernel.run_local_future(async move { namespace.sync_writable_mounts().await });
     report_fiber_stack_commits(&cpu);
     cpu.shutdown()
 }
@@ -1555,7 +1403,7 @@ where
     // processor as local tasks: the plugins come up after `NetworkStep` and
     // go down before it on processor offline.
     let network = NetworkStep::start(&kernel, &debug_state);
-    let http_client = PerProcessorPluginStep::start(&cpu, &kernel, &debug_state, HttpClientPlugin);
+    let http_client = PerProcessorHttpStep::start(&cpu, &kernel, &debug_state);
     let steps = (network, http_client);
     kernel.run_with_steps(&steps)
 }
@@ -1581,11 +1429,12 @@ where
     MeasuredBootImpl: MeasuredBoot,
 {
     // Started before the role dispatch decides what else the processor
-    // does: every processor's pump and lazy WASI 0.3 plugin shards run locally
-    // here. A processor running an embedded component keeps the steps alive
-    // without lending them to a lifecycle, since it never goes offline.
+    // does: every processor's pump and lazy per-processor HTTP provider shard
+    // run locally here. A processor running the root supervisor keeps the
+    // steps alive without lending them to a lifecycle, since it never goes
+    // offline.
     let network = NetworkStep::start(&kernel, &debug_state);
-    let http_client = PerProcessorPluginStep::start(&cpu, &kernel, &debug_state, HttpClientPlugin);
+    let http_client = PerProcessorHttpStep::start(&cpu, &kernel, &debug_state);
     let steps = (network, http_client);
     let topology = kernel.topology();
     // Every backend's bootstrap processor reaches here only after starting
@@ -1596,14 +1445,6 @@ where
         crate::control_flow::ReturnAddressCoverage::of(&cpu, env!("HELIOS_BUILD_TARGET"))
             .log(topology.configured_processors);
         crate::memory_tagging::log(&cpu);
-        launch_boot_init(
-            &cpu,
-            &kernel,
-            &debug_state,
-            read_serial,
-            write_serial,
-            debug_state.has_system_component(),
-        );
     }
     match component_host_processor_role(
         helios_hal::cpu::current_processor(),
@@ -1614,27 +1455,14 @@ where
             run_kernel_processor_forever(cpu, kernel, debug_state, &steps);
         }
         ComponentHostProcessorRole::SharedRuntime | ComponentHostProcessorRole::SystemComponent => {
-            match debug_state.system_component() {
-                Some(component) => run_embedded_component_forever(
-                    component,
-                    ComponentBindingSet::System,
-                    cpu,
-                    &kernel,
-                    debug_state,
-                    read_serial,
-                    write_serial,
-                ),
-                None => {
-                    // A build that embeds the debugger must also embed
-                    // the system component that launches it, so an empty
-                    // slot there is a packaging error rather than the
-                    // ordinary no-component boot.
-                    if cfg!(feature = "embedded-debugger") {
-                        panic!("embedded init bootfs is missing the system component");
-                    }
-                    run_kernel_processor_forever(cpu, kernel, debug_state, &steps);
-                }
-            }
+            run_root_component_forever(
+                debug_state.embedded_init(),
+                cpu,
+                &kernel,
+                debug_state,
+                read_serial,
+                write_serial,
+            )
         }
     }
 }
@@ -2054,7 +1882,7 @@ where
 
     /// Interrupts every store of `instance`, so a kill whose flag is set
     /// reaches the guest wherever it is.
-    pub(crate) fn interrupt_instance(&self, instance: crate::InstanceId) {
+    pub fn interrupt_instance(&self, instance: crate::InstanceId) {
         self.inner.engine.interrupts().interrupt_instance(instance);
     }
 
@@ -2485,6 +2313,7 @@ where
             signal_dispositions,
             #[cfg(feature = "linux")]
             container,
+            oom_policy,
             timeline,
         } = launch;
         #[cfg(feature = "linux")]
@@ -2515,10 +2344,11 @@ where
             .runtime_state
             .uptime_nanos(exec_context.cpu.now().ticks());
         let launched_instance = launched_instance.unwrap_or_else(|| {
-            exec_context.instance_registry.register_child(
+            exec_context.instance_registry.register_child_with_policy(
                 exec_context.parent_instance_id,
                 argv.program_name().to_owned(),
                 started_at,
+                oom_policy,
             )
         });
         let instance_id = launched_instance.id();
@@ -2555,14 +2385,13 @@ where
         let preview1_core_linker = self.inner.preview1_core_linker.clone();
         let shared_memory_pool = self.inner.shared_memory_pool.clone();
         let core_module_instance_pre_cache = self.inner.core_module_instance_pre_cache.clone();
-        // Everything this instance runs — its own task and every WASI
-        // future its store spawns later — is funded from the arena's
-        // instance share. A spawn storm therefore walks that share
-        // empty and is refused right here, instead of taking the
-        // executor capacity the kernel needs for its own tasks.
-        let spawner = exec_context
-            .spawner
-            .instance_spawner(crate::TaskFunding::Instance, &launched_instance);
+        // Task funding follows the instance's OOM policy: user programs and
+        // kernel plugins draw from the arena's instance share so a spawn storm
+        // stops there, while system components draw from the kernel reserve.
+        let spawner = exec_context.spawner.instance_spawner(
+            launched_instance.oom_policy().task_funding(),
+            &launched_instance,
+        );
         let run_spawner = spawner.clone();
         let progress = spawner.progress_counter();
 
@@ -3032,9 +2861,19 @@ where
             },
             ..CompilerPhaseTimestamps::default()
         };
-        let compiler_artifact = self.read_compiler_plugin_artifact(exec_context)?;
+        let registration = self
+            .compiler_provider_registration()
+            .ok_or(ProgramExecError {
+                kind: ProgramExecErrorKind::Unavailable,
+                detail: ProgramExecErrorDetail::CompilerUnavailable,
+            })?;
         let job = CompileJob {
-            compiler_payload: trusted_bootfs_payload(&compiler_artifact),
+            compiler_generation: registration.generation,
+            compiler_name: registration.name,
+            compiler_path: registration.path,
+            compiler_payload: registration.payload,
+            compiler_oom_policy: registration.oom_policy,
+            compiler_parent_instance_id: registration.parent_instance_id,
             wasm: wasm.clone(),
             hint,
             profile,
@@ -3081,10 +2920,11 @@ where
                 let started_at = exec_context
                     .runtime_state
                     .uptime_nanos(exec_context.cpu.now().ticks());
-                let instance = exec_context.instance_registry.register_with_policy(
-                    "compiler-plugin",
+                let instance = exec_context.instance_registry.register_child_with_policy(
+                    job.compiler_parent_instance_id,
+                    job.compiler_name.clone(),
                     started_at,
-                    crate::OomPolicy::KernelPlugin,
+                    job.compiler_oom_policy,
                 );
                 let condemn = {
                     let registry = exec_context.instance_registry.clone();
@@ -3151,7 +2991,12 @@ where
         mut phases: CompilerPhaseTimestamps,
     ) -> CompileEnd {
         let CompileJob {
+            compiler_generation,
+            compiler_name: _,
+            compiler_path,
             compiler_payload,
+            compiler_oom_policy: _,
+            compiler_parent_instance_id: _,
             wasm,
             hint,
             profile,
@@ -3171,6 +3016,8 @@ where
         let result = self
             .invoke_compiler_inner(
                 exec_context,
+                compiler_generation,
+                &compiler_path,
                 &compiler_payload,
                 instance,
                 CompileRequest {
@@ -3194,20 +3041,25 @@ where
         } else {
             0
         };
-        // Plugin supervisor: on a kill or fatal-state error, drop the
-        // cached runtime so the next call rebuilds the Module +
-        // SharedMemory + InstancePre from scratch. This is the
-        // auto-restart path the user-spec calls for ("内核插件需要有
-        // 自动重启的功能").
+        // On a kill or fatal-state error, drop the cached runtime for this
+        // generation so the next compile rebuilds from the currently installed
+        // compiler provider artifact.
         if let Err(error) = &result
             && plugin_runtime_should_be_recycled(error)
         {
             tracing::warn!(
                 target: "helios_kernel::supervisor",
                 detail = %error.detail,
+                generation = compiler_generation,
                 "compiler plugin runtime invalidated; next compile rebuilds from scratch"
             );
-            *self.inner.compiler_plugin.lock() = None;
+            let mut slot = self.inner.compiler_plugin.lock();
+            if slot
+                .as_ref()
+                .is_some_and(|cached| cached.generation == compiler_generation)
+            {
+                *slot = None;
+            }
         }
         CompileEnd {
             result: result.map(|payload| (payload, thread_reports)),
@@ -3243,9 +3095,15 @@ where
         reports
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal compile-session handoff carries provider metadata and timing state"
+    )]
     async fn invoke_compiler_inner(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        compiler_generation: u64,
+        compiler_path: &str,
         compiler_payload: &Bytes,
         compiler_instance: crate::RegisteredInstance,
         request: CompileRequest<StorageImpl>,
@@ -3254,7 +3112,13 @@ where
     ) -> Result<CompileOutput, ProgramExecError> {
         let profile = request.profile;
         let (plugin, plugin_cached) = self
-            .ensure_compiler_plugin(exec_context, compiler_payload, affinity_plan.worker_count())
+            .ensure_compiler_plugin(
+                exec_context,
+                compiler_generation,
+                compiler_path,
+                compiler_payload,
+                affinity_plan.worker_count(),
+            )
             .await?;
         plugin.shared.begin_session(&affinity_plan);
         phases.plugin_cached = plugin_cached;
@@ -3521,23 +3385,11 @@ where
         .await)
     }
 
-    fn read_compiler_plugin_artifact(
-        &self,
-        exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
-    ) -> Result<BootfsBytes, ProgramExecError> {
-        self.inner
-            .compiler_artifact
-            .or_else(|| read_bootfs_artifact(&exec_context.runtime_state, COMPILER_PLUGIN_PATH))
-            .ok_or(ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidPath,
-                detail: ProgramExecErrorDetail::CompilerUnavailable,
-            })
-    }
-
-    /// Build the compiler kernel-plugin runtime on first compile, reuse
-    /// it forever after. The cached `wasmtime::Module`, `InstancePre`
-    /// and 512 MiB `SharedMemory` are stable across calls; per-call work
-    /// drops to a fresh `wasmtime::Store` and `instance_pre.instantiate`.
+    /// Build the compiler kernel-plugin runtime on first compile for a
+    /// provider generation, reuse it for subsequent compiles of the same
+    /// generation. The cached `wasmtime::Module`, `InstancePre` and
+    /// `SharedMemory` are stable across calls; per-call work drops to a fresh
+    /// `wasmtime::Store` and `instance_pre.instantiate`.
     ///
     /// Called only with the compile slot held, which is what makes the
     /// build exclusive: nothing else builds or discards the cached runtime
@@ -3546,11 +3398,15 @@ where
     async fn ensure_compiler_plugin(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        compiler_generation: u64,
+        compiler_path: &str,
         compiler_payload: &Bytes,
         worker_threads: u32,
     ) -> Result<(CompilerPluginHandle<CpuImpl, Net, StorageImpl>, bool), ProgramExecError> {
         let cached = self.inner.compiler_plugin.lock().clone();
-        if let Some(plugin) = cached {
+        if let Some(plugin) = cached
+            && plugin.generation == compiler_generation
+        {
             return Ok((plugin, true));
         }
 
@@ -3568,16 +3424,15 @@ where
 
         tracing::info!(
             worker_threads,
-            "building cached compiler plugin runtime (one-time per kernel boot)"
+            generation = compiler_generation,
+            path = compiler_path,
+            "building cached compiler plugin runtime"
         );
 
         let engine = self.inner.engine.raw();
         let module = unsafe { Module::deserialize(engine, compiler_payload.as_ref()) }
             .map_err(map_program_runtime_error)?;
-        let code = self
-            .inner
-            .code_map
-            .register_module(COMPILER_PLUGIN_PATH, &module);
+        let code = self.inner.code_map.register_module(compiler_path, &module);
         let shared_memory = compiler_shared_memory(engine, &module)?;
         let shared = Arc::new(SharedMemoryCoreShared::new(
             shared_memory.clone(),
@@ -3640,6 +3495,7 @@ where
 
         let _ = module; // InstancePre holds the Module via Arc internally.
         let plugin = Arc::new(CompilerPluginRuntime {
+            generation: compiler_generation,
             instance_pre,
             shared,
             main_thread_tls_base,

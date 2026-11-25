@@ -9,11 +9,11 @@ use crate::hv::HvTelemetryRegistry;
 use crate::inspect::{InspectRegistry, KernelTelemetrySnapshot};
 use crate::{
     BOOT_DEVICE, BootFs, BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
-    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedComponent, EmbeddedInit, FoldedProfileSample,
-    HEAP_SIZE_CLASS_COUNT, HOST_SHARE_GUEST_MOUNT_PATH, HeapStats, HostShare, InstanceId,
-    InstanceRegistry, InstructionSampler, MountTable, MountedFs, Namespace, Notify,
-    PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileScope,
-    ProfileSink, Settings, TraceEvent, TraceFilter, TraceLog,
+    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedInit, FoldedProfileSample, HEAP_SIZE_CLASS_COUNT,
+    HOST_SHARE_GUEST_MOUNT_PATH, HeapStats, HostShare, InstanceId, InstanceRegistry,
+    InstructionSampler, MountTable, MountedFs, Namespace, Notify, NotifyWaiter, PerfMetricFilter,
+    PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink,
+    Settings, TraceEvent, TraceFilter, TraceLog,
 };
 use crate::{MachineGeneration, MachineGenerationHandle, RootEntropy, RootEntropyHandle};
 use crate::{MountGrant, MountSharing};
@@ -30,6 +30,26 @@ use crate::component::{ComponentRuntimeState, PerProcessorProvider, ProviderSlot
 use crate::device::DeviceGrantRegistry;
 use crate::network::HttpExchange;
 use crate::{AttachedStorage, BlockCache, BlockService, HostFileSystem, Storage};
+
+/// Terminal platform action requested by the root supervisor when a
+/// `critical = "system"` component fails unrecoverably.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FatalEscalationAction {
+    Halt,
+    Reboot,
+}
+
+/// Structured fatal diagnostic record emitted during a controlled root
+/// supervisor escalation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FatalEscalationRecord {
+    pub component: alloc::string::String,
+    pub instance_id: Option<InstanceId>,
+    pub reason: alloc::string::String,
+    pub restart_count: u32,
+    pub action: FatalEscalationAction,
+    pub mounts_flushed: bool,
+}
 
 #[derive(Clone)]
 pub struct RuntimeState<ProgramService, NetworkService, StorageImpl: Storage> {
@@ -136,13 +156,17 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// device up. Empty on a machine with no vsock device, where the
     /// runtime adapter answers `unavailable` rather than trapping.
     vsock_service: Once<ComponentHostVsockService>,
-    /// The user payload the backend handed the kernel — init component,
+    /// The user payload the backend handed the kernel — root component,
     /// `argv0`, and the boot filesystem it carries — parsed from the
     /// boot module at bring-up.
     payload: BootPayload,
-    boot_init_launched: AtomicBool,
-    boot_init_completed: AtomicBool,
-    boot_init_ready: Notify,
+    /// Monotonic counter bumped whenever a hardware service (`display`,
+    /// `input`, `gpu3d`, `audio`, `vsock`) comes online, combined with
+    /// `device_grants.version()` for `root-supervisor.subscribe-hardware`.
+    hardware_version: AtomicU64,
+    hardware_changed: Notify,
+    /// Last structured fatal escalation recorded before halt/reboot.
+    fatal_escalation: Mutex<Option<FatalEscalationRecord>>,
     /// The root namespace: the kernel's own process tree, which every
     /// program's tree descends from. Its root is the payload's boot
     /// filesystem; the host share joins its table once a backend installs
@@ -405,9 +429,9 @@ where
                 audio_service: Once::new(),
                 vsock_service: Once::new(),
                 payload,
-                boot_init_launched: AtomicBool::new(false),
-                boot_init_completed: AtomicBool::new(false),
-                boot_init_ready: Notify::new(),
+                hardware_version: AtomicU64::new(0),
+                hardware_changed: Notify::new(),
+                fatal_escalation: Mutex::new(None),
                 namespace: Namespace::new(MountTable::with_storage(
                     BootFs::new(payload.bootfs(), BOOT_DEVICE),
                     processor_count,
@@ -938,6 +962,7 @@ where
             service
         });
         assert!(installed, "the display service was installed twice");
+        self.notify_hardware_changed();
     }
 
     pub fn display_service(&self) -> Option<crate::display::DisplayService> {
@@ -958,6 +983,7 @@ where
             service
         });
         assert!(installed, "the input service was installed twice");
+        self.notify_hardware_changed();
     }
 
     pub fn input_service(&self) -> Option<crate::input::InputService> {
@@ -978,6 +1004,7 @@ where
             service
         });
         assert!(installed, "the 3D service was installed twice");
+        self.notify_hardware_changed();
     }
 
     pub fn gpu3d_service(&self) -> Option<crate::gpu::Gpu3dService> {
@@ -991,10 +1018,10 @@ where
 
     /// The hand-off slot for the `compositor` kernel plugin.
     ///
-    /// The plugin supervisor installs the queue during startup; every
-    /// `helios:system/surface` call sends its work through it. The slot
-    /// stays empty when the plugin is not provisioned, which that
-    /// binding reports to the guest as `unavailable`.
+    /// The root supervisor installs or replaces the queue through
+    /// `helios:system/root-supervisor`; every `helios:system/surface` call
+    /// sends its work through it. The slot stays empty when no compositor is
+    /// installed, which that binding reports to the guest as `unavailable`.
     pub fn compositor(&self) -> &ProviderSlot<crate::surface::SurfaceRequest> {
         &self.inner.compositor
     }
@@ -1013,6 +1040,7 @@ where
             service
         });
         assert!(installed, "the audio service was installed twice");
+        self.notify_hardware_changed();
     }
 
     pub fn audio_service(&self) -> Option<crate::audio::AudioService> {
@@ -1295,66 +1323,76 @@ where
             service
         });
         assert!(installed, "vsock service was installed more than once");
+        self.notify_hardware_changed();
     }
 
     pub fn vsock_service(&self) -> Option<ComponentHostVsockService> {
         self.inner.vsock_service.get().cloned()
     }
 
-    /// The boot-time init component and `argv0` this payload carries.
-    pub fn embedded_init(&self) -> EmbeddedInit {
-        self.inner.payload.embedded_init()
+    fn notify_hardware_changed(&self) {
+        self.inner.hardware_version.fetch_add(1, Ordering::AcqRel);
+        self.inner.hardware_changed.notify_all();
     }
 
-    /// Marks that the bootstrap processor has scheduled the payload's
-    /// boot `init` component to run.
-    pub(crate) fn mark_boot_init_launched(&self) {
-        assert!(
-            !self.inner.boot_init_launched.swap(true, Ordering::AcqRel),
-            "boot init was launched more than once"
-        );
-    }
-
-    /// Marks that the payload's boot `init` component has finished its
-    /// bring-up run and wakes any system component waiting for it.
-    pub(crate) fn mark_boot_init_completed(&self) {
+    /// Monotonic hardware-inventory generation combining platform hardware
+    /// services and published user-mode device grants.
+    pub fn hardware_generation(&self) -> u64 {
         self.inner
-            .boot_init_completed
-            .store(true, Ordering::Release);
-        self.inner.boot_init_ready.notify_all();
+            .hardware_version
+            .load(Ordering::Acquire)
+            .wrapping_add(self.inner.device_grants.version())
     }
 
-    /// Whether the payload's boot `init` component has finished running.
-    pub fn boot_init_completed(&self) -> bool {
-        self.inner.boot_init_completed.load(Ordering::Acquire)
+    /// Waiter pair for observing changes to either platform hardware services
+    /// or published user-mode device grants.
+    pub fn hardware_waiters(&self) -> (NotifyWaiter, NotifyWaiter) {
+        (
+            self.inner.hardware_changed.waiter(),
+            self.inner.device_grants.changed_waiter(),
+        )
     }
 
-    /// Waits until the payload's boot `init` component has finished.
-    ///
-    /// Waits unconditionally rather than checking `boot_init_launched`: on
-    /// SMP boots a secondary processor can reach the system component entry
-    /// before the bootstrap processor schedules `init`, so checking
-    /// `boot_init_launched` here would let it bypass the barrier.
-    pub async fn wait_for_boot_init(&self) {
-        loop {
-            let ready = self.inner.boot_init_ready.notified();
-            if self.inner.boot_init_completed.load(Ordering::Acquire) {
-                return;
-            }
-            ready.await;
+    /// Polls for any hardware-inventory generation change since the armed
+    /// waiters were registered.
+    pub fn poll_hardware_changed(
+        &self,
+        cx: &mut core::task::Context<'_>,
+        service_waiter: &mut NotifyWaiter,
+        device_waiter: &mut NotifyWaiter,
+        seen_generation: u64,
+    ) -> core::task::Poll<u64> {
+        let current = self.hardware_generation();
+        if current != seen_generation {
+            return core::task::Poll::Ready(current);
+        }
+        let _ = self
+            .inner
+            .hardware_changed
+            .poll_notified(cx, service_waiter);
+        let _ = self.inner.device_grants.poll_changed(cx, device_waiter);
+        let after = self.hardware_generation();
+        if after != seen_generation {
+            core::task::Poll::Ready(after)
+        } else {
+            core::task::Poll::Pending
         }
     }
 
-    /// The system component this payload carries, when this build would
-    /// autostart one.
-    pub fn system_component(&self) -> Option<EmbeddedComponent> {
-        self.inner.payload.system_component()
+    /// Records the structured fatal escalation emitted by the root supervisor
+    /// before halting or rebooting the machine.
+    pub fn record_fatal_escalation(&self, record: FatalEscalationRecord) {
+        *self.inner.fatal_escalation.lock() = Some(record);
     }
 
-    /// Whether the payload carries a system component this build would
-    /// autostart.
-    pub fn has_system_component(&self) -> bool {
-        self.inner.payload.has_system_component()
+    /// Returns the last structured fatal escalation recorded on this runtime.
+    pub fn last_fatal_escalation(&self) -> Option<FatalEscalationRecord> {
+        self.inner.fatal_escalation.lock().clone()
+    }
+
+    /// The boot-time root component and `argv0` this payload carries.
+    pub fn embedded_init(&self) -> EmbeddedInit {
+        self.inner.payload.embedded_init()
     }
 
     /// Verified payload body bytes extended into the measured-boot device
