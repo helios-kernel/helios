@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::vec::Vec;
 
 use thiserror::Error;
-pub use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+pub use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 pub use crate::bindings::helios::hv::virtualization as raw;
 pub use crate::bindings::helios::hv::virtualization::{
@@ -293,14 +293,10 @@ pub trait GuestMemory {
         Ok(buf)
     }
 
-    fn read_pod<T: FromBytes + Immutable>(&self, address: GuestPhysAddr) -> Result<T> {
-        let size = core::mem::size_of::<T>();
-        let mut buf = vec![0u8; size];
-        self.read_slice(address, &mut buf)?;
-        T::read_from_bytes(&buf).map_err(|_| Error::LengthMismatch {
-            expected: size,
-            length: buf.len(),
-        })
+    fn read_pod<T: FromBytes + IntoBytes + Immutable>(&self, address: GuestPhysAddr) -> Result<T> {
+        let mut value = T::new_zeroed();
+        self.read_slice(address, value.as_mut_bytes())?;
+        Ok(value)
     }
 
     fn write_pod<T: IntoBytes + Immutable>(&self, address: GuestPhysAddr, value: &T) -> Result<()> {
@@ -426,7 +422,10 @@ impl<B: MemoryBackend> GuestRegion<B> {
     }
 
     /// Reads a plain-old-data value of type `T` from `address`.
-    pub fn read_pod<T: FromBytes + Immutable>(&self, address: GuestPhysAddr) -> Result<T> {
+    pub fn read_pod<T: FromBytes + IntoBytes + Immutable>(
+        &self,
+        address: GuestPhysAddr,
+    ) -> Result<T> {
         <Self as GuestMemory>::read_pod(self, address)
     }
 
@@ -1798,6 +1797,38 @@ mod tests {
         let addr = GuestPhysAddr::new(0x4000_0100);
         region.write_pod(addr, &header).unwrap();
         assert_eq!(region.read_pod::<TestHeader>(addr).unwrap(), header);
+        region
+            .write_u8(GuestPhysAddr::new(0x4000_0200), 0xab)
+            .unwrap();
+        assert_eq!(
+            region.read_u8(GuestPhysAddr::new(0x4000_0200)).unwrap(),
+            0xab
+        );
+        region
+            .write_u16(GuestPhysAddr::new(0x4000_0202), 0x1234)
+            .unwrap();
+        assert_eq!(
+            region.read_u16(GuestPhysAddr::new(0x4000_0202)).unwrap(),
+            0x1234
+        );
+        region
+            .write_u32(GuestPhysAddr::new(0x4000_0204), 0xdead_beef)
+            .unwrap();
+        assert_eq!(
+            region.read_u32(GuestPhysAddr::new(0x4000_0204)).unwrap(),
+            0xdead_beef
+        );
+        region
+            .write_u64(GuestPhysAddr::new(0x4000_0208), 0x0123_4567_89ab_cdef)
+            .unwrap();
+        assert_eq!(
+            region.read_u64(GuestPhysAddr::new(0x4000_0208)).unwrap(),
+            0x0123_4567_89ab_cdef
+        );
+        assert!(matches!(
+            region.read_pod::<TestHeader>(GuestPhysAddr::new(0x4000_3ff8)),
+            Err(Error::OutOfBounds { .. })
+        ));
 
         // Streaming load does NOT implicitly publish.
         let mut source = ChunkList {

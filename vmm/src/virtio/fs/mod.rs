@@ -163,9 +163,10 @@ impl<B: FsBackend> VirtioFs<B> {
             return Err(Error::Virtio("virtio-fs queue index out of range"));
         }
         while let Some(chain) = self.model.queues[queue_index].pop(memory)? {
-            let mut request_bytes = Vec::new();
+            let mut readable_descs = Vec::new();
             let mut writable = Vec::new();
             let mut seen_writable = false;
+            let mut request_len = 0usize;
             for desc in chain.descriptors {
                 if desc.writable {
                     seen_writable = true;
@@ -176,9 +177,20 @@ impl<B: FsBackend> VirtioFs<B> {
                             "readable descriptor after writable descriptor in virtio-fs chain",
                         ));
                     }
-                    let chunk = memory.read_bytes(desc.address, desc.length as usize)?;
-                    request_bytes.extend_from_slice(&chunk);
+                    let desc_len = usize::try_from(desc.length)
+                        .map_err(|_| Error::Virtio("virtio-fs request descriptor overflow"))?;
+                    request_len = request_len
+                        .checked_add(desc_len)
+                        .filter(|&n| n <= fuse::MAX_REQUEST_BYTES)
+                        .ok_or(Error::Virtio("virtio-fs request exceeds maximum length"))?;
+                    readable_descs.push(desc);
                 }
+            }
+
+            let mut request_bytes = Vec::with_capacity(request_len);
+            for desc in readable_descs {
+                let chunk = memory.read_bytes(desc.address, desc.length as usize)?;
+                request_bytes.extend_from_slice(&chunk);
             }
 
             let writable_capacity = writable
@@ -206,7 +218,8 @@ impl<B: FsBackend> VirtioFs<B> {
                             "virtio-fs writable descriptor chain shorter than FUSE reply",
                         ));
                     }
-                    written as u32
+                    u32::try_from(written)
+                        .map_err(|_| Error::Virtio("virtio-fs reply length overflow"))?
                 }
             };
 
@@ -815,14 +828,28 @@ mod tests {
                 .unwrap();
             assert_eq!(i32::from_le(parse_reply(&reply).0.error), -EEXIST);
 
-            // Absolute symlink target rejected with -EPERM; relative symlink + READLINK succeeds.
+            // Guest-resolved absolute symlink targets (e.g. `/usr/bin/busybox`)
+            // are stored and read back verbatim, while host open refuses symlinks.
             let reply = call(
                 &mut session,
-                &build_req(FUSE_SYMLINK, 4, FUSE_ROOT_ID, b"bad_link\0/etc/passwd\0"),
+                &build_req(
+                    FUSE_SYMLINK,
+                    4,
+                    FUSE_ROOT_ID,
+                    b"abs_link\0/usr/bin/busybox\0",
+                ),
             )
             .await
             .unwrap();
-            assert_eq!(i32::from_le(parse_reply(&reply).0.error), -EPERM);
+            let (hdr, body) = parse_reply(&reply);
+            assert_eq!(i32::from_le(hdr.error), 0);
+            let abs_node = u64::from_le(FuseEntryOut::read_from_prefix(body).unwrap().0.nodeid);
+            let reply = call(&mut session, &build_req(FUSE_READLINK, 40, abs_node, &[]))
+                .await
+                .unwrap();
+            let (hdr, target) = parse_reply(&reply);
+            assert_eq!(i32::from_le(hdr.error), 0);
+            assert_eq!(target, b"/usr/bin/busybox");
 
             let reply = call(
                 &mut session,
@@ -841,14 +868,14 @@ mod tests {
             assert_eq!(i32::from_le(hdr.error), 0);
             assert_eq!(target, b"a.txt");
 
-            // BATCH_FORGET evicts all three non-root inodes.
+            // BATCH_FORGET evicts all four non-root inodes.
             let mut batch = FuseBatchForgetIn {
-                count: 3u32.to_le(),
+                count: 4u32.to_le(),
                 dummy: 0,
             }
             .as_bytes()
             .to_vec();
-            for id in [a_node, b_node, link_node] {
+            for id in [a_node, b_node, abs_node, link_node] {
                 batch.extend_from_slice(
                     FuseForgetOne {
                         nodeid: id.to_le(),
@@ -1007,6 +1034,663 @@ mod tests {
                 let res = session.backend().read_dir(&["escape_dir".to_owned()]).await;
                 assert_eq!(res, Err(EACCES));
             }
+        });
+    }
+
+    #[test]
+    fn wasi_directory_flags_satisfy_base_flags_attenuation_for_writable_opens() {
+        use helios_api::bindings::wasi::filesystem::types::DescriptorFlags;
+
+        // Mirrors `kernel/src/wasmtime_adapter/wasi/fs.rs::validate_descriptor_flags_within_base`.
+        let contains = |base: DescriptorFlags, flags: DescriptorFlags| (base & flags) == flags;
+        let validate = |base: DescriptorFlags, requested: DescriptorFlags| -> FsResult<()> {
+            let authority =
+                DescriptorFlags::READ | DescriptorFlags::WRITE | DescriptorFlags::MUTATE_DIRECTORY;
+            if !contains(base, requested & authority) {
+                return Err(EROFS);
+            }
+            Ok(())
+        };
+
+        let rw_dir = backend::directory_open_flags(false);
+        assert!(contains(rw_dir, DescriptorFlags::READ));
+        assert!(contains(rw_dir, DescriptorFlags::WRITE));
+        assert!(contains(rw_dir, DescriptorFlags::MUTATE_DIRECTORY));
+
+        for opts in [
+            FsOpenOptions {
+                read: true,
+                ..FsOpenOptions::default()
+            },
+            FsOpenOptions {
+                write: true,
+                ..FsOpenOptions::default()
+            },
+            FsOpenOptions {
+                read: true,
+                write: true,
+                create: true,
+                truncate: true,
+                ..FsOpenOptions::default()
+            },
+            FsOpenOptions {
+                read: true,
+                write: false,
+                create: true,
+                ..FsOpenOptions::default()
+            },
+        ] {
+            let (_, file_flags) = backend::file_open_flags(opts);
+            assert_eq!(validate(rw_dir, file_flags), Ok(()));
+        }
+
+        // Read-only directory permits READ but rejects WRITE with EROFS.
+        let ro_dir = backend::directory_open_flags(true);
+        assert_eq!(
+            validate(
+                ro_dir,
+                backend::file_open_flags(FsOpenOptions {
+                    read: true,
+                    ..FsOpenOptions::default()
+                })
+                .1
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate(
+                ro_dir,
+                backend::file_open_flags(FsOpenOptions {
+                    write: true,
+                    ..FsOpenOptions::default()
+                })
+                .1
+            ),
+            Err(EROFS)
+        );
+    }
+
+    #[test]
+    fn fuse_unlink_recreate_rename_with_open_fd_does_not_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = HostFsBackend::new(dir.path(), false).unwrap();
+        let mut session = FuseSession::new(backend);
+
+        futures_lite::future::block_on(async {
+            // 1. Create `file.txt` -> node1 / fh1 and write "old-content".
+            let mut create_body = FuseCreateIn {
+                flags: 2u32.to_le(), // O_RDWR
+                mode: 0o644u32.to_le(),
+                umask: 0,
+                open_flags: 0,
+            }
+            .as_bytes()
+            .to_vec();
+            create_body.extend_from_slice(b"file.txt\0");
+            let reply = call(
+                &mut session,
+                &build_req(FUSE_CREATE, 1, FUSE_ROOT_ID, &create_body),
+            )
+            .await
+            .unwrap();
+            let (hdr, body) = parse_reply(&reply);
+            assert_eq!(i32::from_le(hdr.error), 0);
+            let (entry1, rest) = FuseEntryOut::read_from_prefix(body).unwrap();
+            let (open1, _) = FuseOpenOut::read_from_prefix(rest).unwrap();
+            let node1 = u64::from_le(entry1.nodeid);
+            let fh1 = u64::from_le(open1.fh);
+
+            let mut w1 = FuseWriteIn {
+                fh: fh1.to_le(),
+                offset: 0,
+                size: 11u32.to_le(),
+                ..FuseWriteIn::default()
+            }
+            .as_bytes()
+            .to_vec();
+            w1.extend_from_slice(b"old-content");
+            let reply = call(&mut session, &build_req(FUSE_WRITE, 2, node1, &w1))
+                .await
+                .unwrap();
+            assert_eq!(i32::from_le(parse_reply(&reply).0.error), 0);
+
+            // 2. Unlink `file.txt` while fh1 remains open.
+            let reply = call(
+                &mut session,
+                &build_req(FUSE_UNLINK, 3, FUSE_ROOT_ID, b"file.txt\0"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(i32::from_le(parse_reply(&reply).0.error), 0);
+
+            // Handle-based getattr, ftruncate, and read still succeed on unlinked node1.
+            let reply = call(
+                &mut session,
+                &build_req(
+                    FUSE_GETATTR,
+                    4,
+                    node1,
+                    FuseGetattrIn {
+                        getattr_flags: 1u32.to_le(),
+                        dummy: 0,
+                        fh: fh1.to_le(),
+                    }
+                    .as_bytes(),
+                ),
+            )
+            .await
+            .unwrap();
+            let (hdr, body) = parse_reply(&reply);
+            assert_eq!(i32::from_le(hdr.error), 0);
+            assert_eq!(
+                u64::from_le(FuseAttrOut::read_from_prefix(body).unwrap().0.attr.size),
+                11
+            );
+
+            // Path-based open on unlinked node1 fails cleanly with -ENOENT.
+            let reply = call(
+                &mut session,
+                &build_req(FUSE_OPEN, 5, node1, FuseOpenIn::default().as_bytes()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(i32::from_le(parse_reply(&reply).0.error), -ENOENT);
+
+            // 3. Recreate `file.txt` -> must allocate a distinct node2 != node1!
+            let reply = call(
+                &mut session,
+                &build_req(FUSE_CREATE, 6, FUSE_ROOT_ID, &create_body),
+            )
+            .await
+            .unwrap();
+            let (hdr, body) = parse_reply(&reply);
+            assert_eq!(i32::from_le(hdr.error), 0);
+            let (entry2, rest) = FuseEntryOut::read_from_prefix(body).unwrap();
+            let (open2, _) = FuseOpenOut::read_from_prefix(rest).unwrap();
+            let node2 = u64::from_le(entry2.nodeid);
+            let fh2 = u64::from_le(open2.fh);
+            assert_ne!(node2, node1);
+
+            let mut w2 = FuseWriteIn {
+                fh: fh2.to_le(),
+                offset: 0,
+                size: 11u32.to_le(),
+                ..FuseWriteIn::default()
+            }
+            .as_bytes()
+            .to_vec();
+            w2.extend_from_slice(b"new-content");
+            let reply = call(&mut session, &build_req(FUSE_WRITE, 7, node2, &w2))
+                .await
+                .unwrap();
+            assert_eq!(i32::from_le(parse_reply(&reply).0.error), 0);
+
+            // 4. Rename `file.txt` -> `moved.txt`: must rewrite ONLY live node2, not unlinked node1!
+            let mut rename_body = FuseRenameIn {
+                newdir: FUSE_ROOT_ID.to_le(),
+            }
+            .as_bytes()
+            .to_vec();
+            rename_body.extend_from_slice(b"file.txt\0moved.txt\0");
+            let reply = call(
+                &mut session,
+                &build_req(FUSE_RENAME, 8, FUSE_ROOT_ID, &rename_body),
+            )
+            .await
+            .unwrap();
+            assert_eq!(i32::from_le(parse_reply(&reply).0.error), 0);
+
+            // Unlinked node1 STILL refuses path-based open (was not rewritten to `moved.txt`)
+            // and fh1 still reads "old-content".
+            let reply = call(
+                &mut session,
+                &build_req(FUSE_OPEN, 9, node1, FuseOpenIn::default().as_bytes()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(i32::from_le(parse_reply(&reply).0.error), -ENOENT);
+
+            let reply = call(
+                &mut session,
+                &build_req(
+                    FUSE_READ,
+                    10,
+                    node1,
+                    FuseReadIn {
+                        fh: fh1.to_le(),
+                        offset: 0,
+                        size: 64u32.to_le(),
+                        ..FuseReadIn::default()
+                    }
+                    .as_bytes(),
+                ),
+            )
+            .await
+            .unwrap();
+            let (hdr, data1) = parse_reply(&reply);
+            assert_eq!(i32::from_le(hdr.error), 0);
+            assert_eq!(data1, b"old-content");
+
+            // Live node2 opens `moved.txt` and reads "new-content".
+            let reply = call(
+                &mut session,
+                &build_req(FUSE_OPEN, 11, node2, FuseOpenIn::default().as_bytes()),
+            )
+            .await
+            .unwrap();
+            let (hdr, body) = parse_reply(&reply);
+            assert_eq!(i32::from_le(hdr.error), 0);
+            let fh2_reopened = u64::from_le(FuseOpenOut::read_from_prefix(body).unwrap().0.fh);
+            let reply = call(
+                &mut session,
+                &build_req(
+                    FUSE_READ,
+                    12,
+                    node2,
+                    FuseReadIn {
+                        fh: fh2_reopened.to_le(),
+                        offset: 0,
+                        size: 64u32.to_le(),
+                        ..FuseReadIn::default()
+                    }
+                    .as_bytes(),
+                ),
+            )
+            .await
+            .unwrap();
+            let (hdr, data2) = parse_reply(&reply);
+            assert_eq!(i32::from_le(hdr.error), 0);
+            assert_eq!(data2, b"new-content");
+        });
+    }
+
+    #[test]
+    fn fuse_hardlink_preserves_nodeid_and_create_rdonly_honors_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = HostFsBackend::new(dir.path(), false).unwrap();
+        let mut session = FuseSession::new(backend);
+
+        futures_lite::future::block_on(async {
+            // 1. FUSE_CREATE with O_RDONLY (flags = 0) creates the file but keeps fh read-only.
+            let mut create_ro = FuseCreateIn {
+                flags: 0u32.to_le(), // O_RDONLY
+                mode: 0o644u32.to_le(),
+                umask: 0,
+                open_flags: 0,
+            }
+            .as_bytes()
+            .to_vec();
+            create_ro.extend_from_slice(b"ro_created.txt\0");
+            let reply = call(
+                &mut session,
+                &build_req(FUSE_CREATE, 1, FUSE_ROOT_ID, &create_ro),
+            )
+            .await
+            .unwrap();
+            let (hdr, body) = parse_reply(&reply);
+            assert_eq!(i32::from_le(hdr.error), 0);
+            let (entry, rest) = FuseEntryOut::read_from_prefix(body).unwrap();
+            let (open, _) = FuseOpenOut::read_from_prefix(rest).unwrap();
+            let ro_node = u64::from_le(entry.nodeid);
+            let ro_fh = u64::from_le(open.fh);
+            assert!(dir.path().join("ro_created.txt").is_file());
+
+            // Writing to the O_RDONLY handle must fail with -EBADF.
+            let mut write_body = FuseWriteIn {
+                fh: ro_fh.to_le(),
+                offset: 0,
+                size: 4u32.to_le(),
+                ..FuseWriteIn::default()
+            }
+            .as_bytes()
+            .to_vec();
+            write_body.extend_from_slice(b"nope");
+            let reply = call(
+                &mut session,
+                &build_req(FUSE_WRITE, 2, ro_node, &write_body),
+            )
+            .await
+            .unwrap();
+            assert_eq!(i32::from_le(parse_reply(&reply).0.error), -EBADF);
+
+            // Reading from the O_RDONLY handle succeeds.
+            let reply = call(
+                &mut session,
+                &build_req(
+                    FUSE_READ,
+                    3,
+                    ro_node,
+                    FuseReadIn {
+                        fh: ro_fh.to_le(),
+                        offset: 0,
+                        size: 16u32.to_le(),
+                        ..FuseReadIn::default()
+                    }
+                    .as_bytes(),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(i32::from_le(parse_reply(&reply).0.error), 0);
+
+            // 2. Hardlink preserves `oldnodeid` and keeps the inode live after unlinking the first path.
+            let mut link_body = FuseLinkIn {
+                oldnodeid: ro_node.to_le(),
+            }
+            .as_bytes()
+            .to_vec();
+            link_body.extend_from_slice(b"hardlink.txt\0");
+            let reply = call(
+                &mut session,
+                &build_req(FUSE_LINK, 4, FUSE_ROOT_ID, &link_body),
+            )
+            .await
+            .unwrap();
+            let (hdr, body) = parse_reply(&reply);
+            assert_eq!(i32::from_le(hdr.error), 0);
+            let (link_entry, _) = FuseEntryOut::read_from_prefix(body).unwrap();
+            assert_eq!(u64::from_le(link_entry.nodeid), ro_node);
+            assert_eq!(u64::from_le(link_entry.attr.ino), ro_node);
+
+            let reply = call(
+                &mut session,
+                &build_req(FUSE_LOOKUP, 5, FUSE_ROOT_ID, b"hardlink.txt\0"),
+            )
+            .await
+            .unwrap();
+            let (hdr, body) = parse_reply(&reply);
+            assert_eq!(i32::from_le(hdr.error), 0);
+            assert_eq!(
+                u64::from_le(FuseEntryOut::read_from_prefix(body).unwrap().0.nodeid),
+                ro_node
+            );
+
+            // Unlink original path; inode stays reachable via `hardlink.txt`.
+            let reply = call(
+                &mut session,
+                &build_req(FUSE_UNLINK, 6, FUSE_ROOT_ID, b"ro_created.txt\0"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(i32::from_le(parse_reply(&reply).0.error), 0);
+
+            let reply = call(
+                &mut session,
+                &build_req(FUSE_OPEN, 7, ro_node, FuseOpenIn::default().as_bytes()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(i32::from_le(parse_reply(&reply).0.error), 0);
+        });
+    }
+
+    #[test]
+    fn fuse_enforces_table_limits_and_virtio_fs_tx_chain_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["f1", "f2", "f3"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let backend = HostFsBackend::new(dir.path(), false).unwrap();
+        let mut session = FuseSession::with_limits(
+            backend,
+            FuseLimits {
+                max_inodes: 3, // root + 2 files
+                max_open_files: 2,
+                max_open_dirs: 2,
+            },
+        );
+
+        futures_lite::future::block_on(async {
+            // Inode limit: lookup f1 and f2 succeed; f3 fails with -ENOMEM.
+            let r1 = call(
+                &mut session,
+                &build_req(FUSE_LOOKUP, 1, FUSE_ROOT_ID, b"f1\0"),
+            )
+            .await
+            .unwrap();
+            let n1 = u64::from_le(
+                FuseEntryOut::read_from_prefix(parse_reply(&r1).1)
+                    .unwrap()
+                    .0
+                    .nodeid,
+            );
+            let r2 = call(
+                &mut session,
+                &build_req(FUSE_LOOKUP, 2, FUSE_ROOT_ID, b"f2\0"),
+            )
+            .await
+            .unwrap();
+            let n2 = u64::from_le(
+                FuseEntryOut::read_from_prefix(parse_reply(&r2).1)
+                    .unwrap()
+                    .0
+                    .nodeid,
+            );
+            let r3 = call(
+                &mut session,
+                &build_req(FUSE_LOOKUP, 3, FUSE_ROOT_ID, b"f3\0"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(i32::from_le(parse_reply(&r3).0.error), -ENOMEM);
+
+            // Open file limit: 2 opens succeed; 3rd fails with -EMFILE.
+            let o1 = call(
+                &mut session,
+                &build_req(FUSE_OPEN, 4, n1, FuseOpenIn::default().as_bytes()),
+            )
+            .await
+            .unwrap();
+            let fh1 = u64::from_le(
+                FuseOpenOut::read_from_prefix(parse_reply(&o1).1)
+                    .unwrap()
+                    .0
+                    .fh,
+            );
+            let o2 = call(
+                &mut session,
+                &build_req(FUSE_OPEN, 5, n2, FuseOpenIn::default().as_bytes()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(i32::from_le(parse_reply(&o2).0.error), 0);
+            let o3 = call(
+                &mut session,
+                &build_req(FUSE_OPEN, 6, n1, FuseOpenIn::default().as_bytes()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(i32::from_le(parse_reply(&o3).0.error), -EMFILE);
+            assert_eq!(session.open_file_count(), 2);
+
+            // Release fh1 + forget n1 frees both a file slot and an inode slot.
+            call(
+                &mut session,
+                &build_req(
+                    FUSE_RELEASE,
+                    7,
+                    n1,
+                    FuseReleaseIn {
+                        fh: fh1.to_le(),
+                        ..FuseReleaseIn::default()
+                    }
+                    .as_bytes(),
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(
+                call(
+                    &mut session,
+                    &build_req(
+                        FUSE_FORGET,
+                        8,
+                        n1,
+                        FuseForgetIn {
+                            nlookup: 1u64.to_le()
+                        }
+                        .as_bytes(),
+                    ),
+                )
+                .await
+                .is_none()
+            );
+            let r3_ok = call(
+                &mut session,
+                &build_req(FUSE_LOOKUP, 9, FUSE_ROOT_ID, b"f3\0"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(i32::from_le(parse_reply(&r3_ok).0.error), 0);
+
+            // Open dir limit: 2 succeed, 3rd fails with -EMFILE.
+            for seq in 10..12u64 {
+                let d = call(
+                    &mut session,
+                    &build_req(
+                        FUSE_OPENDIR,
+                        seq,
+                        FUSE_ROOT_ID,
+                        FuseOpenIn::default().as_bytes(),
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(i32::from_le(parse_reply(&d).0.error), 0);
+            }
+            let d3 = call(
+                &mut session,
+                &build_req(
+                    FUSE_OPENDIR,
+                    12,
+                    FUSE_ROOT_ID,
+                    FuseOpenIn::default().as_bytes(),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(i32::from_le(parse_reply(&d3).0.error), -EMFILE);
+            assert_eq!(session.open_dir_count(), 2);
+        });
+
+        // Oversized virtio-fs TX chain (> MAX_REQUEST_BYTES) fails before allocating.
+        let ram = test_ram(128 * 1024);
+        let backend = HostFsBackend::new(dir.path(), false).unwrap();
+        let mut dev = VirtioFs::fs(VirtioSlot::at(4).unwrap(), "rootfs", backend).unwrap();
+        dev.status = DRIVER_OK;
+        dev.model.queues[1] = enable_queue(&ram, 0, 4);
+        write_desc(
+            &ram,
+            &dev.model.queues[1],
+            0,
+            4096,
+            (MAX_REQUEST_BYTES + 1) as u32,
+            0,
+            0,
+        );
+        push_avail(&ram, &dev.model.queues[1], 0, 0);
+        assert!(matches!(
+            futures_lite::future::block_on(dev.process_queue(&ram, 1)),
+            Err(Error::Virtio(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_fs_symlink_confinement_refuses_host_follow_with_o_nofollow() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real_dir")).unwrap();
+        std::fs::write(dir.path().join("real_dir/inside.txt"), b"ok").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real_dir"), dir.path().join("dir_link"))
+            .unwrap();
+        std::os::unix::fs::symlink("/usr/bin/busybox", dir.path().join("busybox_link")).unwrap();
+        std::os::unix::fs::symlink("real_dir/inside.txt", dir.path().join("rel_link")).unwrap();
+
+        let backend = HostFsBackend::new(dir.path(), false).unwrap();
+        futures_lite::future::block_on(async {
+            // Raw readlink returns absolute and relative targets verbatim.
+            assert_eq!(
+                backend.readlink(&["busybox_link".to_owned()]).await,
+                Ok("/usr/bin/busybox".to_owned())
+            );
+            assert_eq!(
+                backend.readlink(&["rel_link".to_owned()]).await,
+                Ok("real_dir/inside.txt".to_owned())
+            );
+
+            // Opening any symlink (internal or absolute) is refused by O_NOFOLLOW (-ELOOP).
+            assert_eq!(
+                backend
+                    .open_file(
+                        &["rel_link".to_owned()],
+                        FsOpenOptions {
+                            read: true,
+                            ..FsOpenOptions::default()
+                        },
+                    )
+                    .await
+                    .err(),
+                Some(ELOOP)
+            );
+            assert_eq!(
+                backend
+                    .open_file(
+                        &["busybox_link".to_owned()],
+                        FsOpenOptions {
+                            read: true,
+                            ..FsOpenOptions::default()
+                        },
+                    )
+                    .await
+                    .err(),
+                Some(ELOOP)
+            );
+
+            // set_size_path, set_times, set_mode, and read_dir refuse symlinks with ELOOP.
+            assert_eq!(
+                backend.set_size_path(&["rel_link".to_owned()], 0).await,
+                Err(ELOOP)
+            );
+            assert_eq!(
+                backend
+                    .set_times(
+                        &["rel_link".to_owned()],
+                        FsTimeUpdate::Now,
+                        FsTimeUpdate::Now
+                    )
+                    .await,
+                Err(ELOOP)
+            );
+            assert_eq!(
+                backend.set_mode(&["rel_link".to_owned()], 0o600).await,
+                Err(ELOOP)
+            );
+            assert_eq!(backend.read_dir(&["dir_link".to_owned()]).await, Err(ELOOP));
+
+            // Traversing through an intermediate symlink parent is refused with ELOOP.
+            assert_eq!(
+                backend
+                    .stat(&["dir_link".to_owned(), "inside.txt".to_owned()])
+                    .await,
+                Err(ELOOP)
+            );
+
+            // Guest-resolved CJK + absolute symlink target round-trip works; empty target rejected.
+            let cjk_target = "/usr/bin/工具_ツール_도구";
+            assert!(
+                backend
+                    .symlink(&["cjk_abs".to_owned()], cjk_target)
+                    .await
+                    .is_ok()
+            );
+            assert_eq!(
+                backend.readlink(&["cjk_abs".to_owned()]).await,
+                Ok(cjk_target.to_owned())
+            );
+            assert_eq!(
+                backend.symlink(&["empty_target".to_owned()], "").await,
+                Err(EINVAL)
+            );
         });
     }
 }

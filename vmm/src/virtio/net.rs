@@ -29,6 +29,10 @@ pub struct VirtioNetHdr {
 
 const NET_HDR_LEN: usize = core::mem::size_of::<VirtioNetHdr>();
 
+/// Maximum total byte length of one guest TX descriptor chain (`virtio_net_hdr_v1`
+/// plus a 64 KiB Ethernet/IP frame), preventing unbounded VMM allocation.
+pub const MAX_NET_TX_BYTES: usize = NET_HDR_LEN + 65_536;
+
 /// Zero-`dyn` Ethernet frame transport attached to [`VirtioNet`].
 pub trait NetBackend {
     fn try_recv_frame(&mut self) -> Option<Vec<u8>>;
@@ -75,6 +79,7 @@ pub struct NetModel {
     queues: [Queue; 2],
     config: VirtioNetConfig,
     link_up: bool,
+    pending_rx: Option<Vec<u8>>,
 }
 
 impl NetModel {
@@ -83,6 +88,7 @@ impl NetModel {
             queues: [Queue::default(), Queue::default()],
             config,
             link_up: true,
+            pending_rx: None,
         }
     }
 
@@ -123,6 +129,7 @@ impl VirtioModel for NetModel {
         for queue in &mut self.queues {
             queue.reset();
         }
+        self.pending_rx = None;
     }
 }
 
@@ -143,11 +150,20 @@ impl VirtioNet {
             return Ok(());
         }
         while let Some(chain) = self.model.queues[1].pop(memory)? {
-            let mut packet = Vec::new();
+            let mut total_len = 0usize;
             for desc in &chain.descriptors {
                 if desc.writable {
                     return Err(Error::Virtio("writable descriptor in net tx chain"));
                 }
+                let desc_len = usize::try_from(desc.length)
+                    .map_err(|_| Error::Virtio("net tx descriptor length overflow"))?;
+                total_len = total_len
+                    .checked_add(desc_len)
+                    .filter(|&n| n <= MAX_NET_TX_BYTES)
+                    .ok_or(Error::Virtio("net tx frame exceeds maximum length"))?;
+            }
+            let mut packet = Vec::with_capacity(total_len);
+            for desc in &chain.descriptors {
                 let chunk = memory.read_bytes(desc.address, desc.length as usize)?;
                 packet.extend_from_slice(&chunk);
             }
@@ -172,17 +188,31 @@ impl VirtioNet {
         if !self.driver_ok() {
             return Ok(());
         }
-        while let Some(frame) = backend.try_recv_frame() {
+        loop {
+            if !self.model.queues[0].has_available(memory)? {
+                break;
+            }
+            let frame = match self.model.pending_rx.take() {
+                Some(frame) => frame,
+                None => match backend.try_recv_frame() {
+                    Some(frame) => frame,
+                    None => break,
+                },
+            };
             let Some(chain) = self.model.queues[0].pop(memory)? else {
-                // Re-queue is handled by callers that preserve unread frames; here
-                // stop draining once RX descriptors are exhausted.
+                self.model.pending_rx = Some(frame);
                 break;
             };
             let hdr = VirtioNetHdr {
                 num_buffers: 1u16.to_le(),
                 ..VirtioNetHdr::default()
             };
-            let mut full = Vec::with_capacity(NET_HDR_LEN + frame.len());
+            let total_len = NET_HDR_LEN
+                .checked_add(frame.len())
+                .ok_or(Error::Virtio("virtio-net rx frame length overflow"))?;
+            let used_len = u32::try_from(total_len)
+                .map_err(|_| Error::Virtio("virtio-net rx frame length overflow"))?;
+            let mut full = Vec::with_capacity(total_len);
             full.extend_from_slice(hdr.as_bytes());
             full.extend_from_slice(&frame);
 
@@ -203,7 +233,7 @@ impl VirtioNet {
             if offset != full.len() {
                 return Err(Error::Virtio("virtio-net rx buffer shorter than frame"));
             }
-            if self.model.queues[0].complete(memory, chain.head, full.len() as u32)? {
+            if self.model.queues[0].complete(memory, chain.head, used_len)? {
                 self.interrupt |= 1;
             }
         }
@@ -266,5 +296,54 @@ mod tests {
         assert_eq!(rx_len, NET_HDR_LEN + 12);
         let got = ram.read_bytes(GuestPhysAddr::new(3072), rx_len).unwrap();
         assert_eq!(&got[NET_HDR_LEN..], b"eth-rx-frame");
+    }
+
+    #[test]
+    fn net_rejects_oversized_tx_chain_and_preserves_rx_when_ring_empty() {
+        let ram = test_ram(128 * 1024);
+        let mut net = VirtioNet::net(VirtioSlot::at(2).unwrap(), VirtioNetConfig::default());
+        net.status = DRIVER_OK;
+        net.model.queues[0] = enable_queue(&ram, 0, 4);
+        net.model.queues[1] = enable_queue(&ram, 512, 4);
+        let mut backend = ChannelNetBackend::default();
+
+        // 1. Oversized TX descriptor chain (> MAX_NET_TX_BYTES) fails cleanly.
+        write_desc(
+            &ram,
+            &net.model.queues[1],
+            0,
+            4096,
+            (MAX_NET_TX_BYTES + 1) as u32,
+            0,
+            0,
+        );
+        push_avail(&ram, &net.model.queues[1], 0, 0);
+        assert!(matches!(
+            net.process_tx(&ram, &mut backend),
+            Err(Error::Virtio(_))
+        ));
+        assert!(backend.tx.is_empty());
+
+        // 2. Host RX frames are preserved while guest RX ring is empty and delivered on refill.
+        backend.rx.push_back(b"frame-one".to_vec());
+        backend.rx.push_back(b"frame-two".to_vec());
+        net.process_rx(&ram, &mut backend).unwrap();
+        assert_eq!(used_idx(&ram, &net.model.queues[0]), 0);
+
+        write_desc(&ram, &net.model.queues[0], 0, 2048, 256, 2, 0);
+        push_avail(&ram, &net.model.queues[0], 0, 0);
+        net.process_rx(&ram, &mut backend).unwrap();
+        assert_eq!(used_idx(&ram, &net.model.queues[0]), 1);
+        let len1 = used_len(&ram, &net.model.queues[0], 0) as usize;
+        let got1 = ram.read_bytes(GuestPhysAddr::new(2048), len1).unwrap();
+        assert_eq!(&got1[NET_HDR_LEN..], b"frame-one");
+
+        write_desc(&ram, &net.model.queues[0], 1, 3072, 256, 2, 0);
+        push_avail(&ram, &net.model.queues[0], 1, 1);
+        net.process_rx(&ram, &mut backend).unwrap();
+        assert_eq!(used_idx(&ram, &net.model.queues[0]), 2);
+        let len2 = used_len(&ram, &net.model.queues[0], 1) as usize;
+        let got2 = ram.read_bytes(GuestPhysAddr::new(3072), len2).unwrap();
+        assert_eq!(&got2[NET_HDR_LEN..], b"frame-two");
     }
 }
