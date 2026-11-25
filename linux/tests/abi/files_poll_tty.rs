@@ -232,6 +232,21 @@ impl VirtualMemory for PageMem {
             None
         }
     }
+    fn populate(&mut self, address: u64, bytes: &[u8]) -> Result<(), MapError> {
+        for i in 0..bytes.len() {
+            let a = address.checked_add(i as u64).ok_or(MapError::Address)?;
+            if !self.pages.contains_key(&(a & !(PAGE - 1))) {
+                return Err(MapError::Address);
+            }
+        }
+        for (i, &b) in bytes.iter().enumerate() {
+            let a = address + i as u64;
+            let base = a & !(PAGE - 1);
+            let (_, data) = self.pages.get_mut(&base).unwrap();
+            data[(a % PAGE) as usize] = b;
+        }
+        Ok(())
+    }
 }
 
 struct DummyThread;
@@ -1563,4 +1578,244 @@ fn sendfile_regular_file_same_fd_o_append_and_readonly_offset() {
         err(EFAULT)
     );
     assert_eq!(host.files.lock().unwrap()[&1], before);
+}
+
+#[test]
+fn file_backed_mmap_private_eof_zero_tail_fixed_noreplace_and_oom() {
+    struct OomPageMem {
+        inner: PageMem,
+        fail_populate_oom: bool,
+    }
+    impl UserMemory for OomPageMem {
+        fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+            self.inner.read(address, output)
+        }
+        fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
+            self.inner.check_writable(address, length)
+        }
+        fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
+            self.inner.write(address, bytes)
+        }
+        fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+            self.inner.atomic_load_u32(address)
+        }
+        fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+            self.inner.atomic_store_u32(address, value)
+        }
+        fn atomic_compare_exchange_u32(
+            &mut self,
+            address: u64,
+            expected: u32,
+            desired: u32,
+        ) -> Result<Result<u32, u32>, MemoryFault> {
+            self.inner
+                .atomic_compare_exchange_u32(address, expected, desired)
+        }
+    }
+    impl VirtualMemory for OomPageMem {
+        fn lowest_address(&self) -> u64 {
+            self.inner.lowest_address()
+        }
+        fn map_anywhere(
+            &mut self,
+            hint: u64,
+            length: u64,
+            access: PageFlags,
+        ) -> Result<u64, MapError> {
+            self.inner.map_anywhere(hint, length, access)
+        }
+        fn map_at(&mut self, address: u64, length: u64, access: PageFlags) -> Result<(), MapError> {
+            self.inner.map_at(address, length, access)
+        }
+        fn unmap(&mut self, address: u64, length: u64) {
+            self.inner.unmap(address, length)
+        }
+        fn protect(
+            &mut self,
+            address: u64,
+            length: u64,
+            access: PageFlags,
+        ) -> Result<(), MapError> {
+            self.inner.protect(address, length, access)
+        }
+        fn discard(&mut self, address: u64, length: u64) {
+            self.inner.discard(address, length)
+        }
+        fn remap(
+            &mut self,
+            from: u64,
+            length: u64,
+            to: u64,
+            new_length: u64,
+        ) -> Result<(), MapError> {
+            self.inner.remap(from, length, to, new_length)
+        }
+        fn region(&self, start: u64, end: u64) -> Option<Region> {
+            self.inner.region(start, end)
+        }
+        fn free_range(&self, hint: u64, length: u64) -> Option<u64> {
+            self.inner.free_range(hint, length)
+        }
+        fn populate(&mut self, address: u64, bytes: &[u8]) -> Result<(), MapError> {
+            if self.fail_populate_oom {
+                return Err(MapError::OutOfMemory);
+            }
+            self.inner.populate(address, bytes)
+        }
+    }
+
+    const EEXIST: u64 = 17;
+    const MAP_SHARED: u64 = 0x01;
+    const MAP_PRIVATE: u64 = 0x02;
+    const MAP_FIXED: u64 = 0x10;
+    const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
+
+    for abi in [Abi::X86_64, Abi::Aarch64] {
+        let mut process = Process::<MemRes>::new(abi, NonZeroU32::new(1).unwrap(), 0x40_0000);
+        let mut mem = OomPageMem {
+            inner: PageMem::default(),
+            fail_populate_oom: false,
+        };
+        let mut host = MockHost::default();
+        // 5000-byte file: page 0 = 'X', page 1 = 904 bytes of 'Y' then EOF.
+        let mut content = vec![b'X'; PAGE as usize];
+        content.extend(core::iter::repeat_n(b'Y', 904));
+        host.files.lock().unwrap().insert(1, content.clone());
+
+        let buf = 0x10_0000;
+        mem.write(buf, b"/mapped\0").unwrap();
+        let fd = {
+            let mut thread = DummyThread;
+            let mut fut = core::pin::pin!(dispatch(
+                &mut process,
+                Call {
+                    number: syscall_num(abi, Operation::Openat),
+                    arguments: [(-100i32) as u32 as u64, buf, 0 /* O_RDONLY */, 0, 0, 0],
+                },
+                &mut mem,
+                &mut thread,
+                &mut host,
+            ));
+            match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(ControlFlow::Continue(SyscallOutcome::Return(v))) => v,
+                other => panic!("openat failed: {other:?}"),
+            }
+        };
+        assert!(fd >= 3);
+
+        let files = host.files.clone();
+        let mut call_op = |op: Operation, args: [u64; 6], mem: &mut OomPageMem| -> u64 {
+            let mut thread = DummyThread;
+            let mut fut = core::pin::pin!(dispatch(
+                &mut process,
+                Call {
+                    number: syscall_num(abi, op),
+                    arguments: args,
+                },
+                mem,
+                &mut thread,
+                &mut host,
+            ));
+            match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(ControlFlow::Continue(SyscallOutcome::Return(v))) => v,
+                other => panic!("syscall {op:?} failed: {other:?}"),
+            }
+        };
+
+        // 1. MAP_PRIVATE at offset = 4096 for 2 pages -> 904 bytes 'Y' + zero tail + zero page.
+        let priv_addr = call_op(
+            Operation::Mmap,
+            [0, 2 * PAGE, 3 /* RW */, MAP_PRIVATE, fd, PAGE],
+            &mut mem,
+        );
+        assert!(priv_addr >= PAGE);
+        let mut page0 = vec![0xffu8; PAGE as usize];
+        let mut page1 = vec![0xffu8; PAGE as usize];
+        mem.read(priv_addr, &mut page0).unwrap();
+        mem.read(priv_addr + PAGE, &mut page1).unwrap();
+        assert!(page0[..904].iter().all(|&b| b == b'Y'));
+        assert!(page0[904..].iter().all(|&b| b == 0));
+        assert!(page1.iter().all(|&b| b == 0));
+
+        // Private write stays private and never mutates backing file.
+        mem.write(priv_addr, b"PRIV").unwrap();
+        assert_eq!(
+            call_op(
+                Operation::Munmap,
+                [priv_addr, 2 * PAGE, 0, 0, 0, 0],
+                &mut mem
+            ),
+            0
+        );
+        assert_eq!(files.lock().unwrap()[&1], content);
+
+        // 2. Read-only MAP_SHARED with MAP_FIXED_NOREPLACE and MAP_FIXED replacement.
+        let fixed_addr = 0x50_0000;
+        assert_eq!(
+            call_op(
+                Operation::Mmap,
+                [
+                    fixed_addr,
+                    PAGE,
+                    1, /* PROT_READ */
+                    MAP_SHARED | MAP_FIXED_NOREPLACE,
+                    fd,
+                    0,
+                ],
+                &mut mem,
+            ),
+            fixed_addr
+        );
+        assert!(mem.check_writable(fixed_addr, 1).is_err());
+        let mut sample = [0u8; 4];
+        mem.read(fixed_addr, &mut sample).unwrap();
+        assert_eq!(&sample, b"XXXX");
+
+        // MAP_FIXED_NOREPLACE over existing mapping returns -EEXIST without altering bytes.
+        assert_eq!(
+            call_op(
+                Operation::Mmap,
+                [
+                    fixed_addr,
+                    PAGE,
+                    1,
+                    MAP_PRIVATE | MAP_FIXED_NOREPLACE,
+                    fd,
+                    PAGE,
+                ],
+                &mut mem,
+            ),
+            err(EEXIST)
+        );
+        mem.read(fixed_addr, &mut sample).unwrap();
+        assert_eq!(&sample, b"XXXX");
+
+        // MAP_FIXED replaces existing mapping with offset=PAGE contents ('YYYY' + zero tail).
+        assert_eq!(
+            call_op(
+                Operation::Mmap,
+                [fixed_addr, PAGE, 1, MAP_PRIVATE | MAP_FIXED, fd, PAGE],
+                &mut mem,
+            ),
+            fixed_addr
+        );
+        mem.read(fixed_addr, &mut sample).unwrap();
+        assert_eq!(&sample, b"YYYY");
+        let mut tail = [0xffu8; 16];
+        mem.read(fixed_addr + 904, &mut tail).unwrap();
+        assert!(tail.iter().all(|&b| b == 0));
+
+        // 3. OOM during populate rolls back the mapping and returns -ENOMEM (not -EFAULT).
+        mem.fail_populate_oom = true;
+        let oom_addr = 0x60_0000;
+        assert_eq!(
+            call_op(
+                Operation::Mmap,
+                [oom_addr, PAGE, 1, MAP_PRIVATE | MAP_FIXED_NOREPLACE, fd, 0,],
+                &mut mem,
+            ),
+            err(ENOMEM)
+        );
+        assert!(mem.region(oom_addr, oom_addr + PAGE).is_none());
+    }
 }

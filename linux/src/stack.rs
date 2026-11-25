@@ -1,4 +1,5 @@
-//! AMD64 System V process entry stack for static Linux executables.
+//! System V process entry stack for static and dynamic Linux executables
+//! (`x86-64` and `aarch64`, Linux `fs/binfmt_elf.c` `create_elf_tables`).
 
 use alloc::vec::Vec;
 
@@ -11,9 +12,15 @@ pub enum Error {
 }
 
 pub struct Startup<'a> {
+    /// Entry point of the main executable (`AT_ENTRY`).
     pub entry: u64,
     pub page_size: u64,
     pub headers: crate::elf::ProgramHeaders,
+    /// Load address of the ELF interpreter (`AT_BASE`), or `0` when none is
+    /// loaded.
+    pub interpreter_base: u64,
+    /// Auxiliary flags (`AT_FLAGS`, `0` per Linux `fs/binfmt_elf.c`).
+    pub flags: u64,
     pub random: [u8; 16],
     /// `argv`, `argv[0]` included.
     pub arguments: &'a [&'a [u8]],
@@ -39,12 +46,14 @@ pub struct InitialStack {
     pub pointer: u64,
 }
 
-// AMD64 psABI and Linux uapi/linux/auxvec.h auxiliary tags.
+// System V ABI and Linux `include/uapi/linux/auxvec.h` auxiliary tags.
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
 const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
+const AT_BASE: u64 = 7;
+const AT_FLAGS: u64 = 8;
 const AT_ENTRY: u64 = 9;
 const AT_UID: u64 = 11;
 const AT_EUID: u64 = 12;
@@ -70,7 +79,7 @@ pub fn build(startup: &Startup<'_>, top: u64) -> Result<InitialStack, Error> {
         }
         string_bytes += string.len() + 1;
     }
-    let auxiliary = 13;
+    let auxiliary = 15;
     let words = 1 + startup.arguments.len() + 1 + startup.environment.len() + 1 + auxiliary * 2;
     let random_offset_from_top = string_bytes + 16;
     // The vector sits below the random bytes, aligned so `argc` is at a
@@ -116,6 +125,10 @@ pub fn build(startup: &Startup<'_>, top: u64) -> Result<InitialStack, Error> {
         startup.headers.count,
         AT_PAGESZ,
         startup.page_size,
+        AT_BASE,
+        startup.interpreter_base,
+        AT_FLAGS,
+        startup.flags,
         AT_ENTRY,
         startup.entry,
         AT_UID,

@@ -415,10 +415,11 @@ fn a_writable_executable_segment_loads_writable_and_executable() {
 }
 
 #[test]
-fn refuses_truncated_dynamic_unknown_flags_and_kernel_addresses() {
+fn refuses_truncated_relocatable_unknown_flags_and_kernel_addresses() {
     assert!(parse(&image()[..40]).is_err());
+    // ET_REL (1) is not a loadable executable or PIE image.
     let mut bytes = image();
-    bytes[16..18].copy_from_slice(&3_u16.to_le_bytes());
+    bytes[16..18].copy_from_slice(&1_u16.to_le_bytes());
     assert!(matches!(parse(&bytes), Err(Error::UnsupportedImage)));
     // A p_flags bit beyond PF_R, PF_W and PF_X.
     let mut bytes = image();
@@ -448,6 +449,8 @@ fn initial_stack_is_aligned_and_contains_linux_arguments() {
             address: 0x400040,
             count: 3,
         },
+        interpreter_base: 0x7fff_f7dd_0000,
+        flags: 0,
         random: [7; 16],
         arguments: &arguments,
         environment: &environment,
@@ -468,7 +471,7 @@ fn initial_stack_is_aligned_and_contains_linux_arguments() {
         .as_chunks::<8>()
         .0
         .iter()
-        .take(34)
+        .take(38)
         .map(|word| u64::from_le_bytes(*word))
         .collect();
     let string = |address: u64| {
@@ -484,17 +487,39 @@ fn initial_stack_is_aligned_and_contains_linux_arguments() {
     assert_eq!(string(words[6]), environment[0]);
     assert_eq!(words[7], 0);
     assert_eq!(
-        &words[8..28],
+        &words[8..32],
         &[
-            3, 0x400040, 4, 56, 5, 3, 6, 4096, 9, 0x401000, 11, 1000, 12, 0, 13, 100, 14, 200, 23,
-            1
+            3,
+            0x400040,
+            4,
+            56,
+            5,
+            3,
+            6,
+            4096,
+            7,
+            0x7fff_f7dd_0000,
+            8,
+            0,
+            9,
+            0x401000,
+            11,
+            1000,
+            12,
+            0,
+            13,
+            100,
+            14,
+            200,
+            23,
+            1,
         ]
     );
-    assert_eq!(words[28], 25);
-    assert_eq!(&stack.bytes[at(words[29])..at(words[29]) + 16], &[7; 16]);
-    assert_eq!(words[30], 31);
-    assert_eq!(string(words[31]), b"/bin/args");
-    assert_eq!(&words[32..34], &[0, 0]);
+    assert_eq!(words[32], 25);
+    assert_eq!(&stack.bytes[at(words[33])..at(words[33]) + 16], &[7; 16]);
+    assert_eq!(words[34], 31);
+    assert_eq!(string(words[35]), b"/bin/args");
+    assert_eq!(&words[36..38], &[0, 0]);
     let bad: [&[u8]; 1] = [b"bad\0arg"];
     let refused = helios_linux::stack::Startup {
         arguments: &bad,
@@ -1221,4 +1246,327 @@ fn invalid_pipe_destination_does_not_consume_data_and_dup_shares_nonblocking() {
         3
     );
     assert_eq!(&memory.0[32..35], b"abc");
+}
+
+fn build_elf_image(
+    abi: Abi,
+    e_type: u16,
+    base_vaddr: u64,
+    interp: Option<&[u8]>,
+    with_dynamic: bool,
+    with_tbss_tls: bool,
+) -> Vec<u8> {
+    // 3 pages of file content:
+    // - page 0 (0x0000..0x1000): ELF header, phdrs, optional PT_INTERP string
+    // - page 1 (0x1000..0x2000): executable text segment (entry at +0x1040)
+    // - page 2 (0x2000..0x3000): data file backing for a mid-page PT_LOAD at
+    //   p_vaddr = base_vaddr + 0x2dc0, p_offset = 0x1dc0 (matching page offset).
+    let mut bytes = vec![0u8; 3 * 4096];
+    // Tag page 1 leading bytes before 0x1dc0 and data bytes at 0x1dc0..0x20c0
+    // so mid-page elf_map leading bytes and segment bytes are observable.
+    bytes[0x1000..0x1008].copy_from_slice(b"CODEHEAD");
+    bytes[0x1040..0x1044].copy_from_slice(&[0x90, 0x90, 0x90, 0xc3]);
+    bytes[0x1d00..0x1d08].copy_from_slice(b"PRELOAD!");
+    bytes[0x1dc0..0x1dc8].copy_from_slice(b"DATAINIT");
+
+    let mut phdrs: Vec<[u8; 56]> = Vec::new();
+    let push_phdr = |phdrs: &mut Vec<[u8; 56]>,
+                     p_type: u32,
+                     p_flags: u32,
+                     p_offset: u64,
+                     p_vaddr: u64,
+                     p_filesz: u64,
+                     p_memsz: u64,
+                     p_align: u64| {
+        let mut h = [0u8; 56];
+        h[0..4].copy_from_slice(&p_type.to_le_bytes());
+        h[4..8].copy_from_slice(&p_flags.to_le_bytes());
+        h[8..16].copy_from_slice(&p_offset.to_le_bytes());
+        h[16..24].copy_from_slice(&p_vaddr.to_le_bytes());
+        h[24..32].copy_from_slice(&p_vaddr.to_le_bytes());
+        h[32..40].copy_from_slice(&p_filesz.to_le_bytes());
+        h[40..48].copy_from_slice(&p_memsz.to_le_bytes());
+        h[48..56].copy_from_slice(&p_align.to_le_bytes());
+        phdrs.push(h);
+    };
+
+    if let Some(path) = interp {
+        let off = 0x300u64;
+        bytes[off as usize..off as usize + path.len()].copy_from_slice(path);
+        push_phdr(
+            &mut phdrs,
+            3, /* PT_INTERP */
+            4,
+            off,
+            base_vaddr + off,
+            path.len() as u64,
+            path.len() as u64,
+            1,
+        );
+    }
+    // PT_LOAD 0: RO headers + interp string
+    push_phdr(
+        &mut phdrs, 1, /* PT_LOAD */
+        4, /* PF_R */
+        0, base_vaddr, 0x600, 0x600, 4096,
+    );
+    // PT_LOAD 1: RX code
+    push_phdr(
+        &mut phdrs,
+        1, /* PT_LOAD */
+        5, /* PF_R | PF_X */
+        0x1000,
+        base_vaddr + 0x1000,
+        0x400,
+        0x400,
+        4096,
+    );
+    // PT_LOAD 2: RW mid-page data + BSS tail spanning into next page
+    push_phdr(
+        &mut phdrs,
+        1, /* PT_LOAD */
+        6, /* PF_R | PF_W */
+        0x1dc0,
+        base_vaddr + 0x2dc0,
+        0x300,
+        0x1500,
+        4096,
+    );
+    if with_dynamic {
+        push_phdr(
+            &mut phdrs,
+            2, /* PT_DYNAMIC */
+            6,
+            0x1dc0,
+            base_vaddr + 0x2dc0,
+            0x80,
+            0x80,
+            8,
+        );
+    }
+    if with_tbss_tls {
+        // .tbss-only PT_TLS (p_filesz == 0, p_memsz == 64, p_align == 64)
+        push_phdr(
+            &mut phdrs,
+            7, /* PT_TLS */
+            4,
+            0x20c0,
+            base_vaddr + 0x30c0,
+            0,
+            64,
+            64,
+        );
+    }
+
+    bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    bytes[16..18].copy_from_slice(&e_type.to_le_bytes());
+    bytes[18..20].copy_from_slice(&abi.elf_machine().to_le_bytes());
+    bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+    bytes[24..32].copy_from_slice(&(base_vaddr + 0x1040).to_le_bytes());
+    bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
+    bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
+    bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
+    bytes[56..58].copy_from_slice(&(phdrs.len() as u16).to_le_bytes());
+    for (i, h) in phdrs.iter().enumerate() {
+        let start = 64 + i * 56;
+        bytes[start..start + 56].copy_from_slice(h);
+    }
+    bytes
+}
+
+#[test]
+fn et_dyn_pie_and_pt_interp_placement_and_auxv_for_x86_64_and_aarch64() {
+    use helios_linux::elf::{ImageKind, plan_placement};
+
+    for (abi, interp_str) in [
+        (Abi::X86_64, "/lib/ld-musl-x86_64.so.1"),
+        (Abi::Aarch64, "/lib/ld-musl-aarch64.so.1"),
+    ] {
+        let user_end = abi.task_size();
+        let stack_top = user_end - 8192;
+
+        // 1. Static PIE (ET_DYN with PT_DYNAMIC + .tbss-only PT_TLS, no PT_INTERP).
+        let static_pie_bytes = build_elf_image(abi, 3 /* ET_DYN */, 0, None, true, true);
+        let static_pie = Image::parse(&static_pie_bytes, abi, user_end).unwrap();
+        assert_eq!(static_pie.kind(), ImageKind::Dynamic);
+        assert!(static_pie.is_dynamic());
+        assert_eq!(static_pie.interpreter(), None);
+
+        let static_place = plan_placement(&static_pie, None, 4096, stack_top, 4096).unwrap();
+        assert!(static_place.main_bias >= 65_536);
+        assert_eq!(static_place.main_bias % 4096, 0);
+        assert_eq!(static_place.interpreter_bias, None);
+        assert_eq!(static_place.at_base, 0);
+        assert_eq!(static_place.main_entry, static_place.main_bias + 0x1040);
+        assert_eq!(static_place.initial_pc, static_place.main_entry);
+        assert_eq!(
+            static_place.program_headers.address,
+            static_place.main_bias + 64
+        );
+        assert_eq!(static_place.program_headers.count, 5);
+        assert_eq!(
+            static_place.program_break,
+            (static_place.main_bias + 0x2dc0 + 0x1500).next_multiple_of(4096)
+        );
+        // Verify mid-page PT_LOAD includes leading page bytes from ELF_PAGESTART(p_offset).
+        let data_seg = static_pie
+            .segments_at(static_place.main_bias)
+            .nth(2)
+            .unwrap();
+        assert_eq!(data_seg.address, static_place.main_bias + 0x2000);
+        assert_eq!(data_seg.memory_size, 0xdc0 + 0x1500);
+        assert_eq!(&data_seg.bytes[0xd00..0xd08], b"PRELOAD!");
+        assert_eq!(&data_seg.bytes[0xdc0..0xdc8], b"DATAINIT");
+
+        // 2. Dynamic PIE (ET_DYN + PT_INTERP) paired with ET_DYN interpreter.
+        let mut interp_cstr = interp_str.as_bytes().to_vec();
+        interp_cstr.push(0);
+        let dyn_pie_bytes =
+            build_elf_image(abi, 3 /* ET_DYN */, 0, Some(&interp_cstr), true, true);
+        let interp_bytes = build_elf_image(abi, 3 /* ET_DYN */, 0, None, true, false);
+        let dyn_pie = Image::parse(&dyn_pie_bytes, abi, user_end).unwrap();
+        let interp = Image::parse_interpreter(&interp_bytes, abi, user_end).unwrap();
+        assert_eq!(dyn_pie.interpreter(), Some(interp_str));
+
+        let dyn_place = plan_placement(&dyn_pie, Some(&interp), 4096, stack_top, 4096).unwrap();
+        let interp_bias = dyn_place.interpreter_bias.expect("interpreter placed");
+        assert!(dyn_place.main_bias >= 65_536);
+        assert_eq!(dyn_place.at_base, interp_bias);
+        assert_ne!(dyn_place.at_base, 0);
+        assert_eq!(dyn_place.main_entry, dyn_place.main_bias + 0x1040);
+        assert_eq!(dyn_place.initial_pc, interp_bias + 0x1040);
+        assert_ne!(dyn_place.initial_pc, dyn_place.main_entry);
+        // Main and interpreter segments must be strictly non-overlapping.
+        for m in dyn_pie.segments_at(dyn_place.main_bias) {
+            let m_start = m.address & !4095;
+            let m_end = (m.address + m.memory_size).next_multiple_of(4096);
+            for i in interp.segments_at(interp_bias) {
+                let i_start = i.address & !4095;
+                let i_end = (i.address + i.memory_size).next_multiple_of(4096);
+                assert!(
+                    m_end <= i_start || i_end <= m_start,
+                    "main [{m_start:#x}, {m_end:#x}) overlaps interp [{i_start:#x}, {i_end:#x})"
+                );
+            }
+        }
+        // program_break is strictly at main's end, leaving room for brk below interp.
+        assert!(dyn_place.program_break < interp_bias);
+        assert!(dyn_place.image_end < stack_top);
+
+        // Build initial stack and verify every required auxv entry.
+        let execfn = "/usr/bin/dyn-中文-日本語-한국어".as_bytes();
+        let args: [&[u8]; 2] = [execfn, b"--check"];
+        let env: [&[u8]; 1] = [b"LD_DEBUG=1"];
+        let stack = helios_linux::stack::build(
+            &helios_linux::stack::Startup {
+                entry: dyn_place.main_entry,
+                page_size: 4096,
+                headers: dyn_place.program_headers,
+                interpreter_base: dyn_place.at_base,
+                flags: 0,
+                random: [0x5a; 16],
+                arguments: &args,
+                environment: &env,
+                executable: execfn,
+                uid: 1000,
+                euid: 1000,
+                gid: 1000,
+                egid: 1000,
+                secure: false,
+            },
+            stack_top,
+        )
+        .unwrap();
+        assert!(stack.base > dyn_place.image_end);
+        let at = |addr: u64| (addr - stack.base) as usize;
+        let read_u64 = |addr: u64| {
+            let o = at(addr);
+            u64::from_le_bytes(stack.bytes[o..o + 8].try_into().unwrap())
+        };
+        let mut cursor = stack.pointer;
+        let argc = read_u64(cursor);
+        assert_eq!(argc, 2);
+        cursor += 8 + (argc + 1) * 8;
+        while read_u64(cursor) != 0 {
+            cursor += 8;
+        }
+        cursor += 8;
+        let mut auxv = std::collections::BTreeMap::new();
+        loop {
+            let tag = read_u64(cursor);
+            let val = read_u64(cursor + 8);
+            cursor += 16;
+            if tag == 0 {
+                break;
+            }
+            auxv.insert(tag, val);
+        }
+        assert_eq!(auxv.get(&3), Some(&dyn_place.program_headers.address)); // AT_PHDR
+        assert_eq!(auxv.get(&4), Some(&56)); // AT_PHENT
+        assert_eq!(auxv.get(&5), Some(&dyn_place.program_headers.count)); // AT_PHNUM
+        assert_eq!(auxv.get(&6), Some(&4096)); // AT_PAGESZ
+        assert_eq!(auxv.get(&7), Some(&dyn_place.at_base)); // AT_BASE
+        assert_eq!(auxv.get(&8), Some(&0)); // AT_FLAGS
+        assert_eq!(auxv.get(&9), Some(&dyn_place.main_entry)); // AT_ENTRY
+        let execfn_ptr = *auxv.get(&31).expect("AT_EXECFN");
+        let start = at(execfn_ptr);
+        let end = start + stack.bytes[start..].iter().position(|&b| b == 0).unwrap();
+        assert_eq!(&stack.bytes[start..end], execfn);
+
+        // 3. Dynamic non-PIE (ET_EXEC + PT_INTERP) paired with ET_DYN interpreter.
+        let dyn_exec_bytes = build_elf_image(
+            abi,
+            2, /* ET_EXEC */
+            0x40_0000,
+            Some(&interp_cstr),
+            true,
+            false,
+        );
+        let dyn_exec = Image::parse(&dyn_exec_bytes, abi, user_end).unwrap();
+        assert_eq!(dyn_exec.kind(), ImageKind::Executable);
+        let exec_place = plan_placement(&dyn_exec, Some(&interp), 4096, stack_top, 4096).unwrap();
+        assert_eq!(exec_place.main_bias, 0);
+        assert_eq!(exec_place.main_entry, 0x40_1040);
+        assert_ne!(exec_place.at_base, 0);
+        assert_eq!(
+            exec_place.initial_pc,
+            exec_place.interpreter_bias.unwrap() + 0x1040
+        );
+        assert_eq!(
+            exec_place.program_break,
+            (0x40_2dc0u64 + 0x1500).next_multiple_of(4096)
+        );
+        assert!(exec_place.program_break < exec_place.interpreter_bias.unwrap());
+    }
+}
+
+#[test]
+fn pt_interp_validation_refuses_malformed_duplicate_and_recursive_interpreters() {
+    // Missing trailing NUL in PT_INTERP -> InvalidInterpreter.
+    let no_nul = build_elf_image(Abi::X86_64, 3, 0, Some(b"/lib/ld.so"), true, false);
+    assert!(matches!(
+        Image::parse(&no_nul, Abi::X86_64, USER_END),
+        Err(Error::InvalidInterpreter)
+    ));
+
+    // Empty interpreter string ("\0") -> InvalidInterpreter.
+    let empty_interp = build_elf_image(Abi::X86_64, 3, 0, Some(b"\0"), true, false);
+    assert!(matches!(
+        Image::parse(&empty_interp, Abi::X86_64, USER_END),
+        Err(Error::InvalidInterpreter)
+    ));
+
+    // Recursive PT_INTERP inside an interpreter image -> InvalidInterpreter.
+    let interp_with_interp = build_elf_image(Abi::X86_64, 3, 0, Some(b"/lib/ld.so\0"), true, false);
+    assert!(matches!(
+        Image::parse_interpreter(&interp_with_interp, Abi::X86_64, USER_END),
+        Err(Error::InvalidInterpreter)
+    ));
+
+    // Cross-architecture refusal.
+    let arm_pie = build_elf_image(Abi::Aarch64, 3, 0, None, true, false);
+    assert!(matches!(
+        Image::parse(&arm_pie, Abi::X86_64, USER_END),
+        Err(Error::UnsupportedImage)
+    ));
 }
