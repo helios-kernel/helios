@@ -406,3 +406,774 @@ pub fn take_inherited_sockets() -> Vec<InheritedSocket> {
 pub async fn aot(request: AotRequest) -> Result<AotResult, ExecError> {
     raw::aot(request).await
 }
+
+/// Non-filesystem capability grant that may be attached to a Linux [`crate::linux::Container`].
+///
+/// Intentionally omits [`DirectoryGrant`]: containers receive filesystem authority
+/// exclusively through `ContainerConfig.root` and `ContainerConfig.mounts`, enforcing
+/// separation at compile time.
+pub enum NonFsGrant {
+    Network(NetworkGrant),
+    Clock(ClockGrant),
+    Terminal(TerminalGrant),
+    Process(ProcessGrant),
+    Link(LinkGrant),
+    Mount(MountGrant),
+    Device(DeviceGrant),
+    Diagnostics(DiagnosticsGrant),
+    InstanceControl(AuthorityScope),
+    Settings(SettingsGrant),
+    Machine(MachineGrant),
+    Ipc(IpcGrant),
+}
+
+impl From<NonFsGrant> for CapabilityGrant {
+    fn from(grant: NonFsGrant) -> Self {
+        match grant {
+            NonFsGrant::Network(g) => Self::Network(g),
+            NonFsGrant::Clock(g) => Self::Clock(g),
+            NonFsGrant::Terminal(g) => Self::Terminal(g),
+            NonFsGrant::Process(g) => Self::Process(g),
+            NonFsGrant::Link(g) => Self::Link(g),
+            NonFsGrant::Mount(g) => Self::Mount(g),
+            NonFsGrant::Device(g) => Self::Device(g),
+            NonFsGrant::Diagnostics(g) => Self::Diagnostics(g),
+            NonFsGrant::InstanceControl(s) => Self::InstanceControl(s),
+            NonFsGrant::Settings(g) => Self::Settings(g),
+            NonFsGrant::Machine(g) => Self::Machine(g),
+            NonFsGrant::Ipc(g) => Self::Ipc(g),
+        }
+    }
+}
+
+/// Fluent, typed builder for non-filesystem capability grants.
+///
+/// Accepted by [`crate::linux::ContainerBuilder::grants`]; rejects [`DirectoryGrant`]
+/// and [`ProcessGrants`] at compile time.
+///
+/// ```compile_fail
+/// use helios_api::linux::Container;
+/// use helios_api::programs::ProcessGrants;
+///
+/// let process_grants = ProcessGrants::new().bind_dir_rw("/workspace");
+/// let _ = Container::ephemeral("/oci/alpine").grants(process_grants);
+/// ```
+#[derive(Default)]
+pub struct NonFsGrants {
+    grants: Vec<NonFsGrant>,
+}
+
+impl NonFsGrants {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { grants: Vec::new() }
+    }
+
+    #[must_use]
+    pub fn grant(mut self, grant: NonFsGrant) -> Self {
+        self.grants.push(grant);
+        self
+    }
+
+    #[must_use]
+    pub fn network(self, rights: Vec<NetworkRight>) -> Self {
+        self.grant(NonFsGrant::Network(NetworkGrant { rights }))
+    }
+
+    #[must_use]
+    pub fn full_network(self) -> Self {
+        self.network(vec![
+            NetworkRight::Tcp,
+            NetworkRight::Udp,
+            NetworkRight::Dns,
+            NetworkRight::PrivilegedBind,
+            NetworkRight::Multicast,
+            NetworkRight::Admin,
+        ])
+    }
+
+    #[must_use]
+    pub fn clock(self, rights: Vec<ClockRight>) -> Self {
+        self.grant(NonFsGrant::Clock(ClockGrant { rights }))
+    }
+
+    #[must_use]
+    pub fn set_wall_clock(self) -> Self {
+        self.clock(vec![ClockRight::SetWallClock])
+    }
+
+    #[must_use]
+    pub fn terminal(self, rights: Vec<TerminalRight>) -> Self {
+        self.grant(NonFsGrant::Terminal(TerminalGrant { rights }))
+    }
+
+    #[must_use]
+    pub fn all_terminal(self) -> Self {
+        self.terminal(vec![
+            TerminalRight::Input,
+            TerminalRight::Output,
+            TerminalRight::Control,
+        ])
+    }
+
+    #[must_use]
+    pub fn process(self, rights: Vec<ProcessRight>) -> Self {
+        self.grant(NonFsGrant::Process(ProcessGrant { rights }))
+    }
+
+    #[must_use]
+    pub fn all_process(self) -> Self {
+        self.process(vec![
+            ProcessRight::Spawn,
+            ProcessRight::Exec,
+            ProcessRight::Fork,
+            ProcessRight::Join,
+            ProcessRight::Signal,
+        ])
+    }
+
+    #[must_use]
+    pub fn link(self, rights: Vec<LinkRight>) -> Self {
+        self.grant(NonFsGrant::Link(LinkGrant { rights }))
+    }
+
+    #[must_use]
+    pub fn all_link(self) -> Self {
+        self.link(vec![
+            LinkRight::Source,
+            LinkRight::TargetDirectory,
+            LinkRight::SymlinkCreate,
+            LinkRight::SymlinkRead,
+        ])
+    }
+
+    #[must_use]
+    pub fn mount(self, rights: Vec<MountRight>) -> Self {
+        self.grant(NonFsGrant::Mount(MountGrant { rights }))
+    }
+
+    #[must_use]
+    pub fn all_mount(self) -> Self {
+        self.mount(vec![MountRight::Mount, MountRight::Unmount])
+    }
+
+    #[must_use]
+    pub fn device(self, classes: Vec<DeviceClass>) -> Self {
+        self.grant(NonFsGrant::Device(DeviceGrant { classes }))
+    }
+
+    #[must_use]
+    pub fn all_devices(self) -> Self {
+        self.device(vec![
+            DeviceClass::Display,
+            DeviceClass::Input,
+            DeviceClass::Gpu,
+            DeviceClass::Audio,
+        ])
+    }
+
+    #[must_use]
+    pub fn diagnostics(self, grant: DiagnosticsGrant) -> Self {
+        self.grant(NonFsGrant::Diagnostics(grant))
+    }
+
+    #[must_use]
+    pub fn inspect_read(self, scope: AuthorityScope) -> Self {
+        self.diagnostics(DiagnosticsGrant::InspectRead(scope))
+    }
+
+    #[must_use]
+    pub fn trace_read(self, scope: AuthorityScope) -> Self {
+        self.diagnostics(DiagnosticsGrant::TraceRead(scope))
+    }
+
+    #[must_use]
+    pub fn profile_read(self, scope: AuthorityScope) -> Self {
+        self.diagnostics(DiagnosticsGrant::ProfileRead(scope))
+    }
+
+    #[must_use]
+    pub fn diagnostics_control(self) -> Self {
+        self.diagnostics(DiagnosticsGrant::Control)
+    }
+
+    #[must_use]
+    pub fn instance_control(self, scope: AuthorityScope) -> Self {
+        self.grant(NonFsGrant::InstanceControl(scope))
+    }
+
+    #[must_use]
+    pub fn settings(self, rights: Vec<SettingsRight>) -> Self {
+        self.grant(NonFsGrant::Settings(SettingsGrant { rights }))
+    }
+
+    #[must_use]
+    pub fn write_settings(self) -> Self {
+        self.settings(vec![SettingsRight::Write])
+    }
+
+    #[must_use]
+    pub fn machine(self, rights: Vec<MachineRight>) -> Self {
+        self.grant(NonFsGrant::Machine(MachineGrant { rights }))
+    }
+
+    #[must_use]
+    pub fn machine_control(self) -> Self {
+        self.machine(vec![MachineRight::Control])
+    }
+
+    #[must_use]
+    pub fn machine_identity(self) -> Self {
+        self.machine(vec![MachineRight::Identity])
+    }
+
+    #[must_use]
+    pub fn virtualize(self) -> Self {
+        self.machine(vec![MachineRight::Virtualize])
+    }
+
+    #[must_use]
+    pub fn ipc(
+        self,
+        name: impl Into<String>,
+        endpoint: crate::bindings::helios::system::ipc::Endpoint,
+    ) -> Self {
+        self.grant(NonFsGrant::Ipc(IpcGrant {
+            name: name.into(),
+            endpoint,
+        }))
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.grants.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.grants.is_empty()
+    }
+
+    /// Convert into WIT [`CapabilityGrant`] values (statically guaranteed to contain
+    /// zero [`CapabilityGrant::Directory`] entries).
+    #[must_use]
+    pub fn into_capability_grants(self) -> Vec<CapabilityGrant> {
+        self.grants.into_iter().map(Into::into).collect()
+    }
+}
+
+/// Fluent, typed capability builder for direct process launches (`programs::Command`,
+/// `programs::exec`, `programs::spawn`).
+///
+/// Combines explicit Helios [`DirectoryGrant`]s (which are bind-mounted directly for
+/// persistent host I/O on Linux binaries) with [`NonFsGrants`].
+#[derive(Default)]
+pub struct ProcessGrants {
+    directories: Vec<DirectoryGrant>,
+    non_fs: NonFsGrants,
+}
+
+impl From<NonFsGrants> for ProcessGrants {
+    fn from(non_fs: NonFsGrants) -> Self {
+        Self {
+            directories: Vec::new(),
+            non_fs,
+        }
+    }
+}
+
+impl ProcessGrants {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            directories: Vec::new(),
+            non_fs: NonFsGrants::new(),
+        }
+    }
+
+    /// Add an explicit [`DirectoryGrant`].
+    #[must_use]
+    pub fn directory_grant(mut self, grant: DirectoryGrant) -> Self {
+        self.directories.push(grant);
+        self
+    }
+
+    /// Grant directory `source_path` as `guest_name` with explicit `rights`.
+    #[must_use]
+    pub fn directory(
+        self,
+        source_path: impl Into<String>,
+        guest_name: impl Into<String>,
+        rights: Vec<FilesystemRight>,
+    ) -> Self {
+        self.directory_grant(DirectoryGrant {
+            source_path: source_path.into(),
+            guest_name: guest_name.into(),
+            rights,
+        })
+    }
+
+    /// Grant directory read-only (`Read`).
+    #[must_use]
+    pub fn directory_ro(
+        self,
+        source_path: impl Into<String>,
+        guest_name: impl Into<String>,
+    ) -> Self {
+        self.directory(source_path, guest_name, vec![FilesystemRight::Read])
+    }
+
+    /// Grant directory read+execute (`Read | Execute`).
+    #[must_use]
+    pub fn directory_rx(
+        self,
+        source_path: impl Into<String>,
+        guest_name: impl Into<String>,
+    ) -> Self {
+        self.directory(
+            source_path,
+            guest_name,
+            vec![FilesystemRight::Read, FilesystemRight::Execute],
+        )
+    }
+
+    /// Grant directory read+write (`Read | Write | MutateDirectory`).
+    #[must_use]
+    pub fn directory_rw(
+        self,
+        source_path: impl Into<String>,
+        guest_name: impl Into<String>,
+    ) -> Self {
+        self.directory(
+            source_path,
+            guest_name,
+            vec![
+                FilesystemRight::Read,
+                FilesystemRight::Write,
+                FilesystemRight::MutateDirectory,
+            ],
+        )
+    }
+
+    /// Grant directory read+write+execute (`Read | Write | MutateDirectory | Execute`).
+    #[must_use]
+    pub fn directory_rwx(
+        self,
+        source_path: impl Into<String>,
+        guest_name: impl Into<String>,
+    ) -> Self {
+        self.directory(
+            source_path,
+            guest_name,
+            vec![
+                FilesystemRight::Read,
+                FilesystemRight::Write,
+                FilesystemRight::MutateDirectory,
+                FilesystemRight::Execute,
+            ],
+        )
+    }
+
+    /// Bind-mount a Helios host directory at the same path read-only.
+    #[must_use]
+    pub fn bind_dir_ro(self, path: impl Into<String>) -> Self {
+        let p = path.into();
+        self.directory_ro(p.clone(), p)
+    }
+
+    /// Bind-mount a Helios host directory at the same path read+execute.
+    #[must_use]
+    pub fn bind_dir_rx(self, path: impl Into<String>) -> Self {
+        let p = path.into();
+        self.directory_rx(p.clone(), p)
+    }
+
+    /// Bind-mount a Helios host directory at the same path read+write.
+    #[must_use]
+    pub fn bind_dir_rw(self, path: impl Into<String>) -> Self {
+        let p = path.into();
+        self.directory_rw(p.clone(), p)
+    }
+
+    /// Bind-mount a Helios host directory at the same path read+write+execute.
+    #[must_use]
+    pub fn bind_dir_rwx(self, path: impl Into<String>) -> Self {
+        let p = path.into();
+        self.directory_rwx(p.clone(), p)
+    }
+
+    /// Grant full root preopen (`/`).
+    #[must_use]
+    pub fn root_directory(self) -> Self {
+        self.directory_rwx("/", "/")
+    }
+
+    /// Merge a [`NonFsGrants`] bundle into this [`ProcessGrants`].
+    #[must_use]
+    pub fn with_non_fs(mut self, non_fs: NonFsGrants) -> Self {
+        self.non_fs.grants.extend(non_fs.grants);
+        self
+    }
+
+    #[must_use]
+    pub fn network(mut self, rights: Vec<NetworkRight>) -> Self {
+        self.non_fs = self.non_fs.network(rights);
+        self
+    }
+
+    #[must_use]
+    pub fn full_network(mut self) -> Self {
+        self.non_fs = self.non_fs.full_network();
+        self
+    }
+
+    #[must_use]
+    pub fn clock(mut self, rights: Vec<ClockRight>) -> Self {
+        self.non_fs = self.non_fs.clock(rights);
+        self
+    }
+
+    #[must_use]
+    pub fn terminal(mut self, rights: Vec<TerminalRight>) -> Self {
+        self.non_fs = self.non_fs.terminal(rights);
+        self
+    }
+
+    #[must_use]
+    pub fn all_terminal(mut self) -> Self {
+        self.non_fs = self.non_fs.all_terminal();
+        self
+    }
+
+    #[must_use]
+    pub fn process(mut self, rights: Vec<ProcessRight>) -> Self {
+        self.non_fs = self.non_fs.process(rights);
+        self
+    }
+
+    #[must_use]
+    pub fn all_process(mut self) -> Self {
+        self.non_fs = self.non_fs.all_process();
+        self
+    }
+
+    #[must_use]
+    pub fn link(mut self, rights: Vec<LinkRight>) -> Self {
+        self.non_fs = self.non_fs.link(rights);
+        self
+    }
+
+    #[must_use]
+    pub fn all_link(mut self) -> Self {
+        self.non_fs = self.non_fs.all_link();
+        self
+    }
+
+    #[must_use]
+    pub fn mount(mut self, rights: Vec<MountRight>) -> Self {
+        self.non_fs = self.non_fs.mount(rights);
+        self
+    }
+
+    #[must_use]
+    pub fn all_mount(mut self) -> Self {
+        self.non_fs = self.non_fs.all_mount();
+        self
+    }
+
+    #[must_use]
+    pub fn device(mut self, classes: Vec<DeviceClass>) -> Self {
+        self.non_fs = self.non_fs.device(classes);
+        self
+    }
+
+    #[must_use]
+    pub fn all_devices(mut self) -> Self {
+        self.non_fs = self.non_fs.all_devices();
+        self
+    }
+
+    #[must_use]
+    pub fn diagnostics(mut self, grant: DiagnosticsGrant) -> Self {
+        self.non_fs = self.non_fs.diagnostics(grant);
+        self
+    }
+
+    #[must_use]
+    pub fn instance_control(mut self, scope: AuthorityScope) -> Self {
+        self.non_fs = self.non_fs.instance_control(scope);
+        self
+    }
+
+    #[must_use]
+    pub fn settings(mut self, rights: Vec<SettingsRight>) -> Self {
+        self.non_fs = self.non_fs.settings(rights);
+        self
+    }
+
+    #[must_use]
+    pub fn machine(mut self, rights: Vec<MachineRight>) -> Self {
+        self.non_fs = self.non_fs.machine(rights);
+        self
+    }
+
+    #[must_use]
+    pub fn virtualize(mut self) -> Self {
+        self.non_fs = self.non_fs.virtualize();
+        self
+    }
+
+    #[must_use]
+    pub fn ipc(
+        mut self,
+        name: impl Into<String>,
+        endpoint: crate::bindings::helios::system::ipc::Endpoint,
+    ) -> Self {
+        self.non_fs = self.non_fs.ipc(name, endpoint);
+        self
+    }
+
+    /// Convert into the flat WIT `list<capability-grant>` accepted by [`ExecRequest`] and
+    /// [`SpawnRequest`].
+    #[must_use]
+    pub fn into_capability_grants(self) -> Vec<CapabilityGrant> {
+        let mut out = Vec::with_capacity(self.directories.len() + self.non_fs.len());
+        out.extend(self.directories.into_iter().map(CapabilityGrant::Directory));
+        out.extend(self.non_fs.into_capability_grants());
+        out
+    }
+}
+
+/// Fluent command builder for directly executing or spawning Wasm components or Linux ELF
+/// binaries through the unified `helios:system/programs` interface.
+///
+/// When `path` names a Linux ELF binary (or `#!` script), the kernel automatically creates
+/// a dedicated per-binary container over the caller's process-tree-inherited
+/// [`set_default_image`] ephemeral overlay (or bare Linux syscalls when unset) while
+/// bind-mounting granted Helios host directories directly for persistent host I/O.
+pub struct Command {
+    path: String,
+    name: Option<String>,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    cwd: Option<String>,
+    stdin: Vec<u8>,
+    hint: Option<AotHint>,
+    sockets: Vec<InheritedSocket>,
+    grants: ProcessGrants,
+}
+
+impl Command {
+    /// Start building a command targeting executable `path`.
+    #[must_use]
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            name: None,
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+            stdin: Vec::new(),
+            hint: None,
+            sockets: Vec::new(),
+            grants: ProcessGrants::new(),
+        }
+    }
+
+    /// Override `argv[0]` / instance name (defaults to `path`).
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Append one command-line argument.
+    #[must_use]
+    pub fn arg(mut self, arg: impl Into<String>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    /// Append multiple command-line arguments.
+    #[must_use]
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// Set an environment variable (merged on top of any inherited default Linux image `env`).
+    #[must_use]
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Extend environment variables.
+    #[must_use]
+    pub fn envs<I, K, V>(mut self, vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        for (k, v) in vars {
+            self.env.push((k.into(), v.into()));
+        }
+        self
+    }
+
+    /// Set the working directory for the launched process.
+    #[must_use]
+    pub fn cwd(mut self, dir: impl Into<String>) -> Self {
+        self.cwd = Some(dir.into());
+        self
+    }
+
+    /// Supply buffered standard input bytes (used by [`Self::exec`]).
+    #[must_use]
+    pub fn stdin(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.stdin = bytes.into();
+        self
+    }
+
+    /// Set an optional AOT compilation hint for Wasm programs (used by [`Self::exec`]).
+    #[must_use]
+    pub const fn aot_hint(mut self, hint: AotHint) -> Self {
+        self.hint = Some(hint);
+        self
+    }
+
+    /// Hand off a pre-bound listening socket to the spawned child (`fd = 3+` on Linux).
+    #[must_use]
+    pub fn socket(mut self, socket: InheritedSocket) -> Self {
+        self.sockets.push(socket);
+        self
+    }
+
+    /// Replace the command's [`ProcessGrants`].
+    #[must_use]
+    pub fn grants(mut self, grants: ProcessGrants) -> Self {
+        self.grants = grants;
+        self
+    }
+
+    /// Mutate the command's [`ProcessGrants`] inline.
+    #[must_use]
+    pub fn with_grants(mut self, configure: impl FnOnce(ProcessGrants) -> ProcessGrants) -> Self {
+        self.grants = configure(self.grants);
+        self
+    }
+
+    /// Convenience helper: grant a Helios host directory read-only at the same path.
+    #[must_use]
+    pub fn dir_ro(mut self, path: impl Into<String>) -> Self {
+        self.grants = self.grants.bind_dir_ro(path);
+        self
+    }
+
+    /// Convenience helper: grant a Helios host directory read+write at the same path.
+    #[must_use]
+    pub fn dir_rw(mut self, path: impl Into<String>) -> Self {
+        self.grants = self.grants.bind_dir_rw(path);
+        self
+    }
+
+    /// Convenience helper: grant a Helios host directory read+write+execute at the same path.
+    #[must_use]
+    pub fn dir_rwx(mut self, path: impl Into<String>) -> Self {
+        self.grants = self.grants.bind_dir_rwx(path);
+        self
+    }
+
+    /// Build the WIT [`ExecRequest`] without executing it.
+    #[must_use]
+    pub fn into_exec_request(self) -> ExecRequest {
+        ExecRequest {
+            name: self.name.unwrap_or_else(|| self.path.clone()),
+            args: self.args,
+            env: self.env,
+            path: self.path,
+            cwd: self.cwd,
+            stdin: self.stdin,
+            hint: self.hint,
+            capability_grants: self.grants.into_capability_grants(),
+        }
+    }
+
+    /// Build the WIT [`SpawnRequest`] without spawning it.
+    #[must_use]
+    pub fn into_spawn_request(self) -> SpawnRequest {
+        SpawnRequest {
+            name: self.name.unwrap_or_else(|| self.path.clone()),
+            args: self.args,
+            env: self.env,
+            path: self.path,
+            cwd: self.cwd,
+            sockets: self.sockets,
+            capability_grants: self.grants.into_capability_grants(),
+        }
+    }
+
+    /// Execute the command to completion and return buffered stdout/stderr + exit code.
+    pub async fn exec(self) -> Result<ExecResult, ExecError> {
+        exec(self.into_exec_request()).await
+    }
+
+    /// Spawn the command and return a streaming [`Child`] handle.
+    pub async fn spawn(self) -> Result<Child, SpawnError> {
+        spawn(self.into_spawn_request()).await
+    }
+}
+
+/// Construct a new [`Command`] for `path`.
+#[must_use]
+pub fn command(path: impl Into<String>) -> Command {
+    Command::new(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_grants_and_command_build_exec_and_spawn_requests() {
+        let non_fs = NonFsGrants::new()
+            .network(vec![NetworkRight::Tcp, NetworkRight::Dns])
+            .all_terminal();
+        let grants = ProcessGrants::from(non_fs)
+            .bind_dir_rw("/workspace")
+            .directory_ro("/etc/ssl", "/etc/ssl");
+
+        let exec_req = Command::new("/usr/bin/python3")
+            .name("python3")
+            .args(["-c", "print('hello')"])
+            .env("PYTHONUNBUFFERED", "1")
+            .cwd("/workspace")
+            .stdin(b"input".to_vec())
+            .grants(grants)
+            .into_exec_request();
+
+        assert_eq!(exec_req.name, "python3");
+        assert_eq!(exec_req.path, "/usr/bin/python3");
+        assert_eq!(exec_req.cwd.as_deref(), Some("/workspace"));
+        assert_eq!(exec_req.stdin, b"input");
+        assert_eq!(exec_req.capability_grants.len(), 4);
+        assert!(matches!(
+            &exec_req.capability_grants[0],
+            CapabilityGrant::Directory(d) if d.source_path == "/workspace" && d.guest_name == "/workspace"
+        ));
+
+        let spawn_req = command("/bin/busybox")
+            .arg("sh")
+            .cwd("/tmp")
+            .dir_rwx("/data")
+            .into_spawn_request();
+        assert_eq!(spawn_req.name, "/bin/busybox");
+        assert_eq!(spawn_req.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(spawn_req.capability_grants.len(), 1);
+    }
+}

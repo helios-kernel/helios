@@ -33,6 +33,7 @@ pub struct ExecRequest {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub path: String,
+    pub cwd: Option<String>,
     pub stdin: Vec<u8>,
     pub hint: Option<AotHint>,
     pub capability_grants: Vec<CapabilityGrant>,

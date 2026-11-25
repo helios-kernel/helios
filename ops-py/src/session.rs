@@ -280,6 +280,7 @@ impl PySession {
             path,
             args: args.unwrap_or_default(),
             env: env.unwrap_or_default().into_iter().collect(),
+            cwd: None,
             stdin: stdin.unwrap_or_default(),
             capability_grants,
         };

@@ -66,6 +66,7 @@ pub struct SpawnRequest {
     pub path: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    pub cwd: Option<String>,
     pub stdin: Vec<u8>,
     pub capability_grants: Vec<CapabilityGrant>,
 }
@@ -77,6 +78,7 @@ impl SpawnRequest {
             path: path.into(),
             args,
             env: Vec::new(),
+            cwd: None,
             stdin: Vec::new(),
             capability_grants: Vec::new(),
         }
@@ -922,6 +924,53 @@ impl Session {
         answer.map_err(OpsError::from)
     }
 
+    /// Construct a fluent [`crate::Command`] bound for execution on this session.
+    #[must_use]
+    pub fn command(&self, path: impl Into<String>) -> crate::grants::Command {
+        crate::grants::Command::new(path)
+    }
+
+    /// Execute a Linux binary inside a container via `debugger.programs.exec-in-container`.
+    pub async fn exec_in_container(
+        &self,
+        request: &dbg_programs::ExecInContainerRequest,
+    ) -> Result<ExecResult, OpsError> {
+        self.require_right(GrantRight::Exec)?;
+        let answer = self
+            .call(
+                "debugger.programs.exec-in-container",
+                dbg_programs::exec_in_container(self.connection.client(), request),
+            )
+            .await?;
+        answer.map_err(OpsError::from)
+    }
+
+    /// Persist this authenticated session principal's default Linux image preference
+    /// inside `store_root` (`helios_oci::DefaultImageStore`).
+    pub fn set_user_default_image(
+        &self,
+        store_root: &Path,
+        image: &helios_oci::PulledImage,
+    ) -> Result<helios_oci::UserDefaultImage, OpsError> {
+        let mut store = helios_oci::DefaultImageStore::load(
+            helios_oci::DefaultImageStore::path_in_store(store_root),
+        )?;
+        let pref = helios_oci::UserDefaultImage::from_pulled_image(image)?;
+        store.set(&self.whoami(), pref.clone())?;
+        Ok(pref)
+    }
+
+    /// Look up this authenticated session principal's persisted default Linux image preference.
+    pub fn get_user_default_image(
+        &self,
+        store_root: &Path,
+    ) -> Result<Option<helios_oci::UserDefaultImage>, OpsError> {
+        let store = helios_oci::DefaultImageStore::load(
+            helios_oci::DefaultImageStore::path_in_store(store_root),
+        )?;
+        Ok(store.get(&self.whoami())?.cloned())
+    }
+
     /// Spawn a remote program and expose async stdout, stderr, signal, and wait handles.
     pub async fn spawn(&self, request: SpawnRequest) -> Result<Child, OpsError> {
         self.require_right(GrantRight::Exec)?;
@@ -935,6 +984,7 @@ impl Session {
         let instance_slot = Arc::clone(&instance_id);
         tokio::spawn(async move {
             let outcome = if request.env.is_empty()
+                && request.cwd.is_none()
                 && request.stdin.is_empty()
                 && request.capability_grants.is_empty()
             {
@@ -945,6 +995,7 @@ impl Session {
                     args: request.args,
                     env: request.env,
                     path: path.clone(),
+                    cwd: request.cwd,
                     stdin: request.stdin,
                     hint: None,
                     capability_grants: request.capability_grants,
