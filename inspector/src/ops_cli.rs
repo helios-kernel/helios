@@ -1043,6 +1043,7 @@ pub(crate) async fn run_spawn(session: &Session, cmd: &SpawnCommand) -> Result<(
             path: cmd.path.clone(),
             args: cmd.args.clone(),
             env,
+            cwd: None,
             stdin: Vec::new(),
             capability_grants,
         })

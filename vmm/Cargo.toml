@@ -14,6 +14,7 @@ zerocopy = { version = "0.8.57", default-features = false, features = ["derive"]
 
 [dev-dependencies]
 futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
+helios-oci = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]
