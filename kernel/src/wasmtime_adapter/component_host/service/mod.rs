@@ -589,7 +589,6 @@ where
                 crate::NetworkIpAddress::Ipv6(_) => SocketFamily::Ipv6,
             };
             let options = unix_socket_options::<Net>();
-            let _ = options.size(SocketSize::Ttl);
             let listener = OwnedTcpListener::new(
                 crate::UnixNetwork::with_vsock(Some(service), runtime_state.vsock_service()),
                 <Net::TcpListener as crate::NetworkHandle>::from_raw(raw),

@@ -1287,7 +1287,13 @@ macro_rules! impl_program_bindings {
                         }
                     };
                     let host_read = read_program_source(accessor, &path, &caller_authority).await;
-                    #[cfg_attr(not(feature = "linux"), allow(unused_mut))]
+                    #[cfg_attr(
+                        not(feature = "linux"),
+                        expect(
+                            unused_mut,
+                            reason = "argv is mutated by host #! shebang rewriting when the linux feature is enabled"
+                        )
+                    )]
                     let mut argv = ProgramArgv::launched(name, args);
                     let use_default_overlay = match &host_read {
                         Ok(Ok(source)) => !source.is_wasm() && caller_default_image.is_some(),
@@ -1609,7 +1615,13 @@ macro_rules! impl_program_bindings {
                         }
                     };
                     let host_read = read_program_source(accessor, &path, &caller_authority).await;
-                    #[cfg_attr(not(feature = "linux"), allow(unused_mut))]
+                    #[cfg_attr(
+                        not(feature = "linux"),
+                        expect(
+                            unused_mut,
+                            reason = "argv is mutated by host #! shebang rewriting when the linux feature is enabled"
+                        )
+                    )]
                     let mut argv = ProgramArgv::launched(name, args);
                     let use_default_overlay = match &host_read {
                         Ok(Ok(source)) => !source.is_wasm() && caller_default_image.is_some(),

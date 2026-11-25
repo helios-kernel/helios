@@ -410,7 +410,14 @@ pub(super) async fn run_program_executable<CpuImpl, Net, StorageImpl>(
     ipc_grants: crate::IpcEndpointGrants,
     default_linux_image: Option<crate::DefaultLinuxImage<StorageImpl>>,
     inherited_sockets: crate::InheritedSockets,
-    #[cfg_attr(not(feature = "linux"), allow(unused_variables))] cwd: Option<String>,
+    #[cfg_attr(
+        not(feature = "linux"),
+        expect(
+            unused_variables,
+            reason = "initial cwd is forwarded into native Linux process startup when the linux feature is enabled"
+        )
+    )]
+    cwd: Option<String>,
     filesystem: Option<Namespace<StorageImpl>>,
     descriptors: DescriptorOrigin<Net>,
     signal_state: WasixSignalState,

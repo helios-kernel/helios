@@ -2103,7 +2103,10 @@ impl<S: Storage> ContainerFilesystem<S> {
     }
 
     /// Removes extended attribute `name` at `raw_path`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the container xattr syscall surface (base_dir, path, follow, name, creds, timestamp, storage payer)"
+    )]
     pub async fn remove_xattr_at(
         &self,
         base_dir: &str,

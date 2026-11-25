@@ -691,7 +691,6 @@ pub(super) fn install_preview1_inherited_sockets<Net: ComponentHostNetwork>(
     // Shift existing preopens (installed starting at fd = 3) so inherited
     // sockets deterministically occupy fd = 3, 4, ... without clobbering
     // directory preopens.
-    let shift = sockets.len();
     let tail = if table.entries.len() > 3 {
         table.entries.split_off(3)
     } else {
@@ -706,7 +705,6 @@ pub(super) fn install_preview1_inherited_sockets<Net: ComponentHostNetwork>(
             false,
         )));
     }
-    let _ = shift;
     table.entries.extend(tail);
 }
 fn descriptor_errno(error: helios_unix::DescriptorTableError) -> i32 {

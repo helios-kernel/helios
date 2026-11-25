@@ -609,7 +609,10 @@ impl MemoryFs {
     /// this one drops its staged payload outside the tree lock and does
     /// nothing; when the layer below no longer shows there, the object was
     /// removed meanwhile: [`FsError::NoEntry`].
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "copy-up installs kind, Unix attributes, device number, xattrs, staged payload, original timestamps, and storage payer atomically under one tree lock"
+    )]
     pub(super) fn copy_up(
         &self,
         path: FsPath<'_>,
