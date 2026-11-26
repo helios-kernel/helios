@@ -183,11 +183,13 @@ pub trait SupervisorRuntime: Clone + 'static {
         backlog: u32,
     ) -> impl Future<Output = Result<Self::VsockListener, RuntimeError>>;
 
-    /// Installs a kernel provider slot (`compiler`, `http-client`, `surface`).
+    /// Installs a kernel provider slot (`compiler`, `http-client`, `surface`),
+    /// passing any supervisor-routed IPC channel endpoints for singleton slots.
     fn install_provider(
         &self,
         slot: ProviderSlot,
         node: &ComponentNode,
+        ipc_channels: Vec<(String, Self::IpcEnd)>,
     ) -> impl Future<Output = Result<Self::Provider, RuntimeError>>;
 
     /// Spawns a `wasm`, `oci`, `exec`, or `vm` component with attenuated authority,
@@ -1111,7 +1113,28 @@ impl<R: SupervisorRuntime> Supervisor<R> {
         if let RunnerSpec::Wasm(wasm) = &node.runner
             && let Some(slot) = wasm.provider
         {
-            match self.runtime.install_provider(slot, &node).await {
+            // Singleton surface providers can expose and consume supervisor-routed
+            // IPC channels through persistent bridges, matching standard components.
+            let mut pending_bridge_attachments = Vec::new();
+            let provider_ipc = if slot == ProviderSlot::Surface {
+                pending_bridge_attachments.reserve(node.exposes.len());
+                for expose in node.exposes.iter() {
+                    let channel_name = expose.channel.to_string();
+                    let bridge_tx = self.ensure_exposed_bridge(idx, &channel_name);
+                    let (proxy_end, provider_end) = self.runtime.ipc_channel();
+                    ipc_channels.push((channel_name, provider_end));
+                    pending_bridge_attachments.push((bridge_tx, proxy_end));
+                }
+                ipc_channels
+            } else {
+                Vec::new()
+            };
+
+            match self
+                .runtime
+                .install_provider(slot, &node, provider_ipc)
+                .await
+            {
                 Ok(provider) => {
                     let instance_id = provider.instance_id();
                     // Lazy provider slots (`compiler`, `http-client`) have no Wasm Store until first request.
@@ -1124,6 +1147,12 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                         self.components[idx].started_at_ms = None;
                         ComponentStatus::Unstarted
                     };
+                    for (bridge_tx, proxy_end) in pending_bridge_attachments {
+                        let _ = bridge_tx.try_send(BridgeMsg::AttachProvider {
+                            generation,
+                            proxy_end,
+                        });
+                    }
                     let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
                     let (stopped_tx, stopped_rx) = async_channel::bounded::<()>(1);
                     self.components[idx].stop_tx = Some(stop_tx);
@@ -1321,6 +1350,12 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                 self.components[index].provider_installed = false;
                 self.components[index].stop_tx = None;
                 self.components[index].stopped_rx = None;
+                // Advance generation before detaching exposed bridges so any late
+                // `ProviderClosed` from the exiting generation's reader task
+                // cannot clear a restarted provider attached on the next generation.
+                self.components[index].generation =
+                    self.components[index].generation.wrapping_add(1);
+                self.detach_exposed_bridges(index);
                 let last_instance_id = self.components[index].instance_id.take();
                 match outcome {
                     ProviderOutcome::Replaced | ProviderOutcome::Stopped => {
@@ -1362,6 +1397,8 @@ impl<R: SupervisorRuntime> Supervisor<R> {
                 }
                 self.components[index].stop_tx = None;
                 self.components[index].stopped_rx = None;
+                self.components[index].generation =
+                    self.components[index].generation.wrapping_add(1);
                 self.detach_exposed_bridges(index);
                 let last_instance_id = self.components[index].instance_id.take();
                 match outcome {

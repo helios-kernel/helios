@@ -52,6 +52,9 @@ pub(super) struct ProviderStoreSpec<'a> {
     /// Pre-registered instance when `prepare_component_provider` allocated the
     /// provider's [`crate::InstanceId`] upfront to resolve `Subtree(None)` grants.
     pub(super) registered_instance: Option<crate::RegisteredInstance>,
+    /// IPC endpoint capabilities granted to a singleton provider (empty for
+    /// per-processor sharded providers).
+    pub(super) ipc_grants: crate::IpcEndpointGrants,
 }
 
 /// Allocates a [`wasmtime::Store`] for a root-supervisor-managed provider with
@@ -100,7 +103,8 @@ where
             OutputMode::Serial,
             exec_context.read_serial,
             exec_context.write_serial,
-        ),
+        )
+        .with_ipc_grants(spec.ipc_grants),
     );
     (store, interrupts, instance_id)
 }
@@ -336,6 +340,7 @@ where
             oom_policy: registration.oom_policy,
             started_at,
             registered_instance: None,
+            ipc_grants: crate::IpcEndpointGrants::new(),
         },
     );
 
