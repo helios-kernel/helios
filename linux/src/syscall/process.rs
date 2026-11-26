@@ -623,12 +623,30 @@ pub(super) async fn clone_process<
             Arc::new(spin::Mutex::new(process.shared.root.lock().clone())),
         )
     };
-    let child_shared_mappings = if share_vm {
-        process.shared.shared_mappings.clone()
+    let (child_shared_mappings, inherited_shmids) = if share_vm {
+        (process.shared.shared_mappings.clone(), Vec::new())
     } else {
-        Arc::new(spin::Mutex::new(
-            process.shared.shared_mappings.lock().clone(),
-        ))
+        let (cloned, shmids) = super::memory::clone_vmas_for_fork(process);
+        for &shmid in &shmids {
+            fs.shm_fork_attach(shmid);
+        }
+        (Arc::new(spin::Mutex::new(cloned)), shmids)
+    };
+    let child_memfds: Vec<(i32, R::File)> = {
+        let table = child_descriptors.lock();
+        table
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| {
+                let entry = slot.as_ref()?;
+                let helios_unix::FileDescriptor::File(open) = &entry.descriptor else {
+                    return None;
+                };
+                fs.memfd_handle(open.node())
+                    .map(|_| (idx as i32, open.node().clone()))
+            })
+            .collect()
     };
 
     let child = Process {
@@ -642,6 +660,13 @@ pub(super) async fn clone_process<
             cwd: child_cwd,
             root: child_root,
             shared_mappings: child_shared_mappings,
+            next_shm_attach_id: AtomicU64::new(
+                process
+                    .shared
+                    .next_shm_attach_id
+                    .load(Ordering::Relaxed)
+                    .max(1),
+            ),
             stdin_lock: helios_sync::RawMutex::new(),
             stdin_carry: spin::Mutex::new(child_stdin_carry),
             attributes: spin::Mutex::new(child_attrs),
@@ -673,12 +698,18 @@ pub(super) async fn clone_process<
         child_tid_addr,
     }) {
         Ok(()) => {
+            if !child_memfds.is_empty() {
+                fs.sync_process_memfds(child_pid.get(), &child_memfds);
+            }
             if let Some(done) = vfork_done {
                 done.wait().await;
             }
             u64::from(child_pid.get())
         }
         Err(error) => {
+            for shmid in inherited_shmids {
+                fs.shm_fork_rollback(shmid);
+            }
             process.shared.pids.release_process(child_pid);
             errno(match error {
                 SpawnError::OutOfMemory => ENOMEM,

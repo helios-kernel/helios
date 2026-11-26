@@ -3,7 +3,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use helios_sync::{RawMutex, RawMutexLease};
 use spin::Mutex;
 
-use crate::FileLockTable;
+use crate::{FileLockTable, MemfdHold};
 
 static NEXT_OPEN_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -50,6 +50,7 @@ struct OpenFileDescription<Node> {
     offset: AtomicU64,
     position_lock: RawMutex,
     flock_table: Mutex<Option<FileLockTable>>,
+    memfd_hold: Option<MemfdHold>,
 }
 
 impl<Node> Drop for OpenFileDescription<Node> {
@@ -100,12 +101,33 @@ impl<Node> OpenFile<Node> {
             offset: AtomicU64::new(offset),
             position_lock: RawMutex::new(),
             flock_table: Mutex::new(None),
+            memfd_hold: None,
+        }))
+    }
+
+    /// A new open file description of a `memfd_create(2)` inode holding an RAII
+    /// [`MemfdHold`] so the underlying shared object stays live until the last
+    /// duplicate descriptor closes.
+    pub fn with_memfd_hold(node: Node, hold: MemfdHold) -> Self {
+        let id = OpenFileId(NEXT_OPEN_FILE_ID.fetch_add(1, Ordering::Relaxed));
+        Self(Arc::new(OpenFileDescription {
+            id,
+            node,
+            offset: AtomicU64::new(0),
+            position_lock: RawMutex::new(),
+            flock_table: Mutex::new(None),
+            memfd_hold: Some(hold),
         }))
     }
 
     /// Unique identifier of this open file description (shared across `dup`/`fork`).
     pub fn id(&self) -> OpenFileId {
         self.0.id
+    }
+
+    /// Whether this open file description holds a `memfd_create(2)` lease.
+    pub fn is_memfd(&self) -> bool {
+        self.0.memfd_hold.is_some()
     }
 
     /// Registers `table` so any BSD `flock` held by this open file description

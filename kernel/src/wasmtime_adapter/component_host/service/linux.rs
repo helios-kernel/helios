@@ -414,12 +414,45 @@ impl SharedVma {
     }
 }
 
+/// One entry in [`SharedMemoryTable::objects`]. `staging_refs` protects an
+/// in-flight `mmap`/`shmat` object across `MAP_FIXED`/`SHM_REMAP` unmaps until
+/// its VMA is installed, while entries with `staging_refs == 0` and zero active
+/// VMAs are dropped immediately to reclaim `UserMemoryPool` frames.
+struct SharedObjectEntry {
+    object: crate::SharedPageObject,
+    file_key: Option<(u64, u64)>,
+    staging_refs: usize,
+}
+
 /// Process-local table of [`crate::SharedPageObject`]s and active shared VMAs.
-#[derive(Clone)]
 struct SharedMemoryTable {
     next_id: u64,
-    objects: alloc::collections::BTreeMap<u64, (crate::SharedPageObject, Option<(u64, u64)>)>,
+    objects: alloc::collections::BTreeMap<u64, SharedObjectEntry>,
     vmas: Vec<SharedVma>,
+}
+
+impl Clone for SharedMemoryTable {
+    fn clone(&self) -> Self {
+        let objects = self
+            .objects
+            .iter()
+            .map(|(&id, entry)| {
+                (
+                    id,
+                    SharedObjectEntry {
+                        object: entry.object.clone(),
+                        file_key: entry.file_key,
+                        staging_refs: 0,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            next_id: self.next_id,
+            objects,
+            vmas: self.vmas.clone(),
+        }
+    }
 }
 
 impl SharedMemoryTable {
@@ -437,33 +470,70 @@ impl SharedMemoryTable {
         file_key: Option<(u64, u64)>,
     ) -> u64 {
         if let Some(key) = file_key {
-            for (&id, (_, existing_key)) in &self.objects {
-                if *existing_key == Some(key) {
+            for (&id, entry) in &mut self.objects {
+                if entry.file_key == Some(key) {
+                    entry.staging_refs = entry.staging_refs.saturating_add(1);
                     return id;
                 }
             }
         }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
-        self.objects.insert(id, (object, file_key));
+        self.objects.insert(
+            id,
+            SharedObjectEntry {
+                object,
+                file_key,
+                staging_refs: 1,
+            },
+        );
         id
     }
 
+    fn consume_staging(&mut self, id: u64) {
+        if let Some(entry) = self.objects.get_mut(&id) {
+            entry.staging_refs = entry.staging_refs.saturating_sub(1);
+        }
+    }
+
+    fn prune_if_unused(&mut self, id: u64) {
+        let has_vma = self.vmas.iter().any(|vma| vma.object_id == id);
+        if !has_vma
+            && self
+                .objects
+                .get(&id)
+                .is_some_and(|entry| entry.staging_refs == 0)
+        {
+            self.objects.remove(&id);
+        }
+    }
+
+    fn release_object(&mut self, id: u64) {
+        self.consume_staging(id);
+        self.prune_if_unused(id);
+    }
+
     fn get_object(&self, id: u64) -> Option<crate::SharedPageObject> {
-        self.objects.get(&id).map(|(obj, _)| obj.clone())
+        self.objects.get(&id).map(|entry| entry.object.clone())
     }
 
     fn get_entry(&self, id: u64) -> Option<(crate::SharedPageObject, Option<(u64, u64)>)> {
-        self.objects.get(&id).map(|(obj, key)| (obj.clone(), *key))
+        self.objects
+            .get(&id)
+            .map(|entry| (entry.object.clone(), entry.file_key))
     }
 
     fn remove_vma_range(&mut self, start: u64, end: u64) {
         let mut next = Vec::with_capacity(self.vmas.len());
+        let mut touched_ids = Vec::new();
         for vma in self.vmas.drain(..) {
             let v_end = vma.end();
             if v_end <= start || vma.start >= end {
                 next.push(vma);
                 continue;
+            }
+            if !touched_ids.contains(&vma.object_id) {
+                touched_ids.push(vma.object_id);
             }
             if vma.start < start {
                 next.push(SharedVma {
@@ -488,6 +558,9 @@ impl SharedMemoryTable {
             }
         }
         self.vmas = next;
+        for id in touched_ids {
+            self.prune_if_unused(id);
+        }
     }
 
     fn remap_vma_range(&mut self, from: u64, old_len: u64, to: u64, new_len: u64) {
@@ -872,6 +945,19 @@ impl<Space: UserSpace> VirtualMemory for LinuxMemory<'_, Space> {
         shared_mem.lock().insert_object(object, Some((dev, ino)))
     }
 
+    fn acquire_sysv_shm(&mut self, shmid: i32) -> u64 {
+        let Some(shared_mem) = self.shared_mem else {
+            return 0;
+        };
+        let Some(object) = self
+            .shared_files
+            .and_then(|cache| cache.get_sysv_shm(shmid))
+        else {
+            return 0;
+        };
+        shared_mem.lock().insert_object(object, None)
+    }
+
     fn load_shared_page(
         &mut self,
         object_id: u64,
@@ -892,7 +978,7 @@ impl<Space: UserSpace> VirtualMemory for LinuxMemory<'_, Space> {
 
     fn release_shared_object(&mut self, object_id: u64) {
         if let Some(shared_mem) = self.shared_mem {
-            shared_mem.lock().objects.remove(&object_id);
+            shared_mem.lock().release_object(object_id);
         }
     }
 
@@ -919,7 +1005,9 @@ impl<Space: UserSpace> VirtualMemory for LinuxMemory<'_, Space> {
                 let _ = self.space.unmap(page_range(address, length));
                 return Err(err);
             }
-            shared_mem.lock().vmas.push(SharedVma {
+            let mut guard = shared_mem.lock();
+            guard.consume_staging(object_id);
+            guard.vmas.push(SharedVma {
                 start: address,
                 len: length,
                 object_id,
@@ -961,7 +1049,9 @@ impl<Space: UserSpace> VirtualMemory for LinuxMemory<'_, Space> {
                 let _ = self.space.unmap(range);
                 return Err(err);
             }
-            shared_mem.lock().vmas.push(SharedVma {
+            let mut guard = shared_mem.lock();
+            guard.consume_staging(object_id);
+            guard.vmas.push(SharedVma {
                 start: address,
                 len: length,
                 object_id,
@@ -1090,7 +1180,10 @@ impl<Space: UserSpace> LinuxMemory<'_, Space> {
         let Some(shared_mem) = self.shared_mem else {
             return Ok(());
         };
-        let Some((stage_obj, _)) = shared_mem.lock().objects.remove(&stage_id) else {
+        let Some(SharedObjectEntry {
+            object: stage_obj, ..
+        }) = shared_mem.lock().objects.remove(&stage_id)
+        else {
             return Ok(());
         };
         let page_size = PhysFrame::SIZE as u64;
@@ -1460,6 +1553,7 @@ where
             return;
         }
         let registry = self.shared.container.proc_registry();
+        self.shared.container.sysv_shm().refresh_proc();
         registry.set_cpu_count(crate::online_processor_count().max(1) as u32);
         registry.set_uptime_nanos(
             self.shared
@@ -2234,6 +2328,11 @@ where
     }
 
     fn can_exec_file(&self, file: &FsDescriptor) -> bool {
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            return true;
+        }
         self.shared.container.filesystem().can_exec(&file.path)
     }
 
@@ -2357,6 +2456,48 @@ where
             Ok(crate::ContainerOpenOutcome::ProcFd { pid, fd, .. }) => {
                 if pid == self.shared.pid.get() {
                     Ok(Some(OpenOutcome::ReopenFd { fd }))
+                } else if let Some(memfd_id) =
+                    self.shared.container.memfds().lookup_process_fd(pid, fd)
+                {
+                    let target_uid = self
+                        .shared
+                        .container
+                        .proc_registry()
+                        .process(pid)
+                        .map(|rec| rec.credentials.user.effective);
+                    let allowed = target_uid.is_some_and(|uid| {
+                        creds.user.effective == uid
+                            || creds.capabilities.has_effective(syscall::CAP_DAC_OVERRIDE)
+                    });
+                    if !allowed {
+                        return Err(syscall::FsOpError::Fs(FsError::NotPermitted));
+                    }
+                    let (id, memfd_path, handle) = self
+                        .shared
+                        .container
+                        .memfds()
+                        .reopen(memfd_id, request, creds, now)?;
+                    let mut flags = FsDescriptorFlags::empty();
+                    if request.read {
+                        flags |= FsDescriptorFlags::READ;
+                    }
+                    if request.write {
+                        flags |= FsDescriptorFlags::WRITE;
+                    }
+                    let desc = FsDescriptor {
+                        path: memfd_path,
+                        kind: ComponentFsNodeKind::File,
+                        flags,
+                        identity: Some(id),
+                        mount: None,
+                        open: None,
+                    };
+                    Ok(Some(OpenOutcome::Descriptor(
+                        helios_unix::FileDescriptor::File(helios_unix::OpenFile::with_memfd_hold(
+                            desc,
+                            handle.acquire_hold(),
+                        )),
+                    )))
                 } else {
                     Err(syscall::FsOpError::PermissionDenied)
                 }
@@ -2437,6 +2578,11 @@ where
         &self,
         file: &FsDescriptor,
     ) -> Result<syscall::FsStat, syscall::FsOpError> {
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            return Ok(syscall::FsStat::synthetic_virtual(syscall::TMPFS_MAGIC));
+        }
         let fs = self.shared.container.filesystem();
         match fs.resolve(&file.path) {
             Ok(resolved) => Ok(container_resolved_fs_stat(&resolved)),
@@ -2461,6 +2607,11 @@ where
     }
 
     async fn sync_fs(&self, file: &FsDescriptor) -> Result<(), syscall::FsOpError> {
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            return Ok(());
+        }
         let fs = self.shared.container.filesystem();
         match fs.sync(&file.path, false).await {
             Ok(()) | Err(syscall::FsOpError::Fs(FsError::ReadOnly | FsError::Unsupported)) => {
@@ -2567,6 +2718,11 @@ where
     }
 
     async fn stat_file(&self, file: &FsDescriptor) -> Result<FileStat, syscall::FsOpError> {
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            return self.shared.container.memfds().stat(id);
+        }
         match self
             .shared
             .container
@@ -2645,6 +2801,15 @@ where
         offset: u64,
         max_bytes: usize,
     ) -> Result<Bytes, syscall::FsOpError> {
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            return self
+                .shared
+                .container
+                .memfds()
+                .read_at(id, offset, max_bytes);
+        }
         self.refresh_proc_if_needed(&file.path, "").await;
         match self
             .shared
@@ -2706,6 +2871,26 @@ where
         creds: &syscall::Credentials,
     ) -> Result<Landed, syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            let result = self
+                .shared
+                .container
+                .memfds()
+                .write_at(id, position, bytes, now);
+            if matches!(result, Err(syscall::FsOpError::Fs(FsError::OutOfMemory))) {
+                crate::wasmtime_adapter::store::request_oom_kill(
+                    &self.shared.runtime_state,
+                    &self.shared.runtime_state.instance_registry(),
+                    &self.shared.cpu,
+                    self.shared.launched_instance.id(),
+                    crate::MemoryPool::User,
+                    bytes.len().max(helios_hal::pmm::PhysFrame::SIZE),
+                );
+            }
+            return result;
+        }
         let payer = self.shared.launched_instance.storage_payer();
         let result = self
             .shared
@@ -2766,6 +2951,22 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            self.shared.container.memfds().set_size(id, size, now)?;
+            let key = (id.domain().raw(), id.local());
+            let eof_page = size.div_ceil(PhysFrame::SIZE as u64) * PhysFrame::SIZE as u64;
+            let discard_ranges = self
+                .shared
+                .shared_mem
+                .lock()
+                .pages_beyond_eof(key, eof_page);
+            for (start, end) in discard_ranges {
+                let _ = self.shared.space.discard(page_range(start, end - start));
+            }
+            return Ok(());
+        }
         let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
@@ -2832,6 +3033,11 @@ where
     }
 
     async fn sync(&self, file: &FsDescriptor, data_only: bool) -> Result<(), syscall::FsOpError> {
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            return Ok(());
+        }
         self.shared
             .container
             .filesystem()
@@ -3034,6 +3240,15 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            return self
+                .shared
+                .container
+                .memfds()
+                .set_times(id, access, modified, creds, now);
+        }
         let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
@@ -3068,6 +3283,11 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            return self.shared.container.memfds().chmod(id, mode, creds, now);
+        }
         let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
@@ -3104,6 +3324,15 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            return self
+                .shared
+                .container
+                .memfds()
+                .chown(id, uid, gid, creds, now);
+        }
         let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
@@ -3232,6 +3461,241 @@ where
             .filesystem()
             .remove_xattr_resolved(&file.path, name, creds, now, &payer)
             .await
+    }
+
+    fn create_memfd(
+        &mut self,
+        name: &str,
+        flags: u32,
+        creds: &syscall::Credentials,
+    ) -> Result<(FsDescriptor, helios_unix::MemfdHandle), syscall::FsOpError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        let (id, path, handle) = self
+            .shared
+            .container
+            .memfds()
+            .create(name, flags, creds, now);
+        let desc = FsDescriptor {
+            path,
+            kind: ComponentFsNodeKind::File,
+            flags: FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
+            identity: Some(id),
+            mount: None,
+            open: None,
+        };
+        Ok((desc, handle))
+    }
+
+    fn reopen_memfd(
+        &mut self,
+        file: &FsDescriptor,
+        request: OpenRequest,
+        creds: &syscall::Credentials,
+    ) -> Result<Option<(FsDescriptor, helios_unix::MemfdHandle)>, syscall::FsOpError> {
+        let Some(id) = file.identity else {
+            return Ok(None);
+        };
+        if !self.shared.container.memfds().owns_identity(id) {
+            return Ok(None);
+        }
+        let now = self.shared.clock.lock().system_time_nanos();
+        let (reopened_id, path, handle) = self
+            .shared
+            .container
+            .memfds()
+            .reopen(id, request, creds, now)?;
+        let mut flags = FsDescriptorFlags::empty();
+        if request.read {
+            flags |= FsDescriptorFlags::READ;
+        }
+        if request.write {
+            flags |= FsDescriptorFlags::WRITE;
+        }
+        let desc = FsDescriptor {
+            path,
+            kind: ComponentFsNodeKind::File,
+            flags,
+            identity: Some(reopened_id),
+            mount: None,
+            open: None,
+        };
+        Ok(Some((desc, handle)))
+    }
+
+    fn memfd_handle(&self, file: &FsDescriptor) -> Option<helios_unix::MemfdHandle> {
+        let id = file.identity?;
+        self.shared.container.memfds().handle(id)
+    }
+
+    fn memfd_get_seals(&self, file: &FsDescriptor) -> Option<u32> {
+        let id = file.identity?;
+        self.shared.container.memfds().get_seals(id)
+    }
+
+    fn memfd_add_seals(
+        &mut self,
+        file: &FsDescriptor,
+        seals: u32,
+    ) -> Result<(), syscall::FsOpError> {
+        let Some(id) = file.identity else {
+            return Err(syscall::FsOpError::Fs(FsError::Invalid));
+        };
+        self.shared.container.memfds().add_seals(id, seals)
+    }
+
+    fn memfd_acquire_writable_map(
+        &self,
+        file: &FsDescriptor,
+    ) -> Result<Option<helios_unix::MemfdWritableMapHold>, syscall::FsOpError> {
+        let Some(id) = file.identity else {
+            return Ok(None);
+        };
+        self.shared.container.memfds().acquire_writable_map(id)
+    }
+
+    fn reap_memfds(&self) {
+        self.shared.container.memfds().reap_unreferenced();
+    }
+
+    fn sync_process_memfds(&self, pid: u32, fds: &[(i32, FsDescriptor)]) {
+        let memfds = self.shared.container.memfds();
+        let mapped: Vec<(i32, u64)> = fds
+            .iter()
+            .filter_map(|(fd, desc)| {
+                let id = desc.identity?;
+                memfds.owns_identity(id).then_some((*fd, id.local()))
+            })
+            .collect();
+        memfds.set_process_fds(pid, mapped);
+        if pid == self.shared.pid.get() {
+            let snapshot = snapshot_process_fds(&self.shared.descriptors_handle.lock());
+            self.shared
+                .container
+                .proc_registry()
+                .update_process(pid, |rec| rec.fds = snapshot);
+        } else {
+            self.shared
+                .container
+                .proc_registry()
+                .update_process(pid, |rec| {
+                    rec.fds.retain(|entry| !entry.target.starts_with("/memfd:"));
+                    for (fd, desc) in fds {
+                        rec.fds.push(crate::ProcFdEntry {
+                            fd: *fd,
+                            target: desc.path.clone(),
+                            pos: 0,
+                            flags: 0,
+                            mnt_id: 1,
+                        });
+                    }
+                });
+        }
+    }
+
+    fn shm_get(
+        &mut self,
+        key: i32,
+        size: u64,
+        flags: u32,
+        pid: u32,
+        creds: &syscall::Credentials,
+        now_secs: i64,
+    ) -> Result<i32, u64> {
+        self.shared
+            .container
+            .sysv_shm()
+            .shmget(key, size, flags, pid, creds, now_secs)
+    }
+
+    fn shm_prepare_attach(
+        &mut self,
+        shmid: i32,
+        read_only: bool,
+        exec: bool,
+        creds: &syscall::Credentials,
+    ) -> Result<u64, u64> {
+        self.shared
+            .container
+            .sysv_shm()
+            .prepare_attach(shmid, read_only, exec, creds)
+    }
+
+    fn shm_commit_attach(&mut self, shmid: i32, pid: u32, now_secs: i64) {
+        self.shared
+            .container
+            .sysv_shm()
+            .commit_attach(shmid, pid, now_secs);
+    }
+
+    fn shm_detach(&mut self, shmid: i32, pid: u32, now_secs: i64) {
+        self.shared
+            .container
+            .sysv_shm()
+            .detach(shmid, pid, now_secs);
+    }
+
+    fn shm_fork_attach(&mut self, shmid: i32) {
+        self.shared.container.sysv_shm().fork_attach(shmid);
+    }
+
+    fn shm_fork_rollback(&mut self, shmid: i32) {
+        self.shared.container.sysv_shm().fork_rollback(shmid);
+    }
+
+    fn shm_ctl_stat(
+        &self,
+        shmid: i32,
+        by_index: bool,
+        check_perms: bool,
+        creds: &syscall::Credentials,
+    ) -> Result<(i32, syscall::ShmStat), u64> {
+        self.shared
+            .container
+            .sysv_shm()
+            .ctl_stat(shmid, by_index, check_perms, creds)
+    }
+
+    fn shm_ctl_set(
+        &mut self,
+        shmid: i32,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        creds: &syscall::Credentials,
+        now_secs: i64,
+    ) -> Result<(), u64> {
+        self.shared
+            .container
+            .sysv_shm()
+            .ctl_set(shmid, uid, gid, mode, creds, now_secs)
+    }
+
+    fn shm_ctl_rmid(
+        &mut self,
+        shmid: i32,
+        creds: &syscall::Credentials,
+        now_secs: i64,
+    ) -> Result<(), u64> {
+        self.shared
+            .container
+            .sysv_shm()
+            .ctl_rmid(shmid, creds, now_secs)
+    }
+
+    fn shm_ctl_lock(
+        &mut self,
+        shmid: i32,
+        lock: bool,
+        creds: &syscall::Credentials,
+    ) -> Result<(), u64> {
+        self.shared
+            .container
+            .sysv_shm()
+            .ctl_lock(shmid, lock, creds)
+    }
+
+    fn shm_ctl_info(&self) -> (i32, syscall::ShmUsageInfo) {
+        self.shared.container.sysv_shm().ctl_info()
     }
 }
 
@@ -6027,6 +6491,10 @@ where
         shared_files: Some(shared.container.shared_files()),
     };
     flush_shared_mappings_boxed(&process, &memory, &mut platform).await;
+    if process.observer().all_threads_exited() {
+        let now_secs = (syscall::System::realtime_nanos(&platform) / 1_000_000_000) as i64;
+        process.cleanup_ipc_on_exit(now_secs, &mut platform);
+    }
     ThreadRunEnd::Exited
 }
 
@@ -6391,7 +6859,15 @@ where
                         &credentials,
                         secure,
                     )?;
+                    let mut exec_platform =
+                        LinuxThreadPlatform::new(shared.clone(), exec_proc.pid());
+                    let now_secs =
+                        (syscall::System::realtime_nanos(&exec_platform) / 1_000_000_000) as i64;
+                    exec_proc.detach_sysv_shm(now_secs, &mut exec_platform);
                     exec_proc.commit_linux_exec(mapped.program_break, credentials);
+                    exec_proc.sync_memfds(&exec_platform);
+                    shared.container.memfds().reap_unreferenced();
+                    drop(exec_platform);
                     let next_shared = Arc::new(LinuxShared {
                         cpu: shared.cpu.clone(),
                         timer: shared.timer.clone(),
@@ -6461,7 +6937,18 @@ where
                     argv,
                     env,
                 } => {
+                    let mut exec_platform =
+                        LinuxThreadPlatform::new(shared.clone(), exec_proc.pid());
+                    let now_secs =
+                        (syscall::System::realtime_nanos(&exec_platform) / 1_000_000_000) as i64;
+                    exec_proc.detach_sysv_shm(now_secs, &mut exec_platform);
                     let (surviving_slots, ignored) = exec_proc.commit_wasm_exec();
+                    shared
+                        .container
+                        .memfds()
+                        .remove_process_fds(exec_proc.pid().get());
+                    shared.container.memfds().reap_unreferenced();
+                    drop(exec_platform);
                     let thread_signals = exec_proc.thread_signals().clone();
                     let descriptors = Preview1DescriptorTable::from_slots(surviving_slots);
                     let signal_dispositions: Vec<WasixSignalDisposition> = ignored
@@ -6516,9 +7003,12 @@ where
         let instance_id = shared.launched_instance.id();
         let fatal = shared.take_fatal();
         let termination = observer.termination();
+        let container = shared.container.clone();
         drop(observer);
         drop(proc_signals);
         drop(shared);
+        container.memfds().remove_process_fds(pid.get());
+        container.memfds().reap_unreferenced();
 
         return match fatal {
             Some(error) => Err(error),

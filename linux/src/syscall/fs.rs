@@ -858,6 +858,140 @@ pub trait Filesystem<R: Resources> {
     ) -> impl Future<Output = Result<(), FsOpError>> + Send {
         async { Err(FsOpError::Fs(FsError::Unsupported)) }
     }
+
+    /// Creates a new anonymous memory-backed file (`memfd_create(2)`).
+    fn create_memfd(
+        &mut self,
+        _name: &str,
+        _flags: u32,
+        _creds: &Credentials,
+    ) -> Result<(R::File, helios_unix::MemfdHandle), FsOpError> {
+        Err(FsOpError::Fs(FsError::Unsupported))
+    }
+
+    /// Reopens an existing `memfd` descriptor (via `/proc/<pid>/fd/<n>`) with
+    /// an independent open file description and requested access mode.
+    fn reopen_memfd(
+        &mut self,
+        _file: &R::File,
+        _request: OpenRequest,
+        _creds: &Credentials,
+    ) -> Result<Option<(R::File, helios_unix::MemfdHandle)>, FsOpError> {
+        Ok(None)
+    }
+
+    /// Returns the shared lifecycle handle if `file` refers to a `memfd`.
+    fn memfd_handle(&self, _file: &R::File) -> Option<helios_unix::MemfdHandle> {
+        None
+    }
+
+    /// Returns the current `F_SEAL_*` bitmask if `file` refers to a `memfd`.
+    fn memfd_get_seals(&self, _file: &R::File) -> Option<u32> {
+        None
+    }
+
+    /// Atomically adds `seals` to a `memfd` (`fcntl(F_ADD_SEALS)`).
+    fn memfd_add_seals(&mut self, _file: &R::File, _seals: u32) -> Result<(), FsOpError> {
+        Err(FsOpError::Fs(FsError::Invalid))
+    }
+
+    /// Atomically checks write seals and acquires a writable `MAP_SHARED`
+    /// hold on a `memfd` so concurrent `F_ADD_SEALS(F_SEAL_WRITE)` cannot race.
+    fn memfd_acquire_writable_map(
+        &self,
+        _file: &R::File,
+    ) -> Result<Option<helios_unix::MemfdWritableMapHold>, FsOpError> {
+        Ok(None)
+    }
+
+    /// Drops any `memfd` inodes whose last open file description and mapping
+    /// have been released, reclaiming frames from `UserMemoryPool`.
+    fn reap_memfds(&self) {}
+
+    /// Synchronizes `pid`'s currently open `memfd` descriptors for cross-process
+    /// `/proc/<pid>/fd/<n>` inspection and reopening.
+    fn sync_process_memfds(&self, _pid: u32, _fds: &[(i32, R::File)]) {}
+
+    /// SysV `shmget(2)`.
+    fn shm_get(
+        &mut self,
+        _key: i32,
+        _size: u64,
+        _flags: u32,
+        _pid: u32,
+        _creds: &Credentials,
+        _now_secs: i64,
+    ) -> Result<i32, u64> {
+        Err(ENOSYS)
+    }
+
+    /// Validates `shmat(2)` permissions and returns the segment size in bytes.
+    fn shm_prepare_attach(
+        &mut self,
+        _shmid: i32,
+        _read_only: bool,
+        _exec: bool,
+        _creds: &Credentials,
+    ) -> Result<u64, u64> {
+        Err(ENOSYS)
+    }
+
+    /// Records a completed `shmat(2)` attachment (`shm_nattch += 1`, `shm_atime`, `shm_lpid`).
+    fn shm_commit_attach(&mut self, _shmid: i32, _pid: u32, _now_secs: i64) {}
+
+    /// Records a detached SysV shared memory mapping (`shm_nattch -= 1`, `shm_dtime`,
+    /// `shm_lpid`, destroying the segment immediately if `SHM_DEST && nattch == 0`).
+    fn shm_detach(&mut self, _shmid: i32, _pid: u32, _now_secs: i64) {}
+
+    /// Increments `shm_nattch` when a child inherits an attached segment via `fork(2)`.
+    fn shm_fork_attach(&mut self, _shmid: i32) {}
+
+    /// Rolls back [`Self::shm_fork_attach`] if spawning the forked child fails.
+    fn shm_fork_rollback(&mut self, _shmid: i32) {}
+
+    /// `shmctl(IPC_STAT | SHM_STAT | SHM_STAT_ANY)`.
+    fn shm_ctl_stat(
+        &self,
+        _shmid: i32,
+        _by_index: bool,
+        _check_perms: bool,
+        _creds: &Credentials,
+    ) -> Result<(i32, super::shm::ShmStat), u64> {
+        Err(ENOSYS)
+    }
+
+    /// `shmctl(IPC_SET)`.
+    fn shm_ctl_set(
+        &mut self,
+        _shmid: i32,
+        _uid: u32,
+        _gid: u32,
+        _mode: u32,
+        _creds: &Credentials,
+        _now_secs: i64,
+    ) -> Result<(), u64> {
+        Err(ENOSYS)
+    }
+
+    /// `shmctl(IPC_RMID)`.
+    fn shm_ctl_rmid(
+        &mut self,
+        _shmid: i32,
+        _creds: &Credentials,
+        _now_secs: i64,
+    ) -> Result<(), u64> {
+        Err(ENOSYS)
+    }
+
+    /// `shmctl(SHM_LOCK | SHM_UNLOCK)`.
+    fn shm_ctl_lock(&mut self, _shmid: i32, _lock: bool, _creds: &Credentials) -> Result<(), u64> {
+        Err(ENOSYS)
+    }
+
+    /// `shmctl(IPC_INFO | SHM_INFO)`: returns `(max_index, usage_info)`.
+    fn shm_ctl_info(&self) -> (i32, super::shm::ShmUsageInfo) {
+        (0, super::shm::ShmUsageInfo::default())
+    }
 }
 
 pub(super) fn fs_errno(error: FsOpError) -> u64 {
@@ -1339,17 +1473,23 @@ pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R> + tty::
             // description gets an independent offset; for pipes/FIFOs/sockets/
             // PTYs/stdio/pseudo devices, clone the live descriptor handle.
             match &existing.descriptor {
-                FileDescriptor::File(open) => {
-                    if let Some(target_path) = fs.file_path(open.node()) {
-                        let target_path = alloc::string::String::from(target_path);
-                        match fs.open(None, "/", &target_path, request, &creds).await {
-                            Ok(file) => FileDescriptor::File(OpenFile::new(file)),
-                            Err(error) => return SyscallOutcome::Return(fs_errno(error)),
-                        }
-                    } else {
-                        existing.descriptor
+                FileDescriptor::File(open) => match fs.reopen_memfd(open.node(), request, &creds) {
+                    Ok(Some((file, handle))) => {
+                        FileDescriptor::File(OpenFile::with_memfd_hold(file, handle.acquire_hold()))
                     }
-                }
+                    Ok(None) => {
+                        if let Some(target_path) = fs.file_path(open.node()) {
+                            let target_path = alloc::string::String::from(target_path);
+                            match fs.open(None, "/", &target_path, request, &creds).await {
+                                Ok(file) => FileDescriptor::File(OpenFile::new(file)),
+                                Err(error) => return SyscallOutcome::Return(fs_errno(error)),
+                            }
+                        } else {
+                            existing.descriptor
+                        }
+                    }
+                    Err(error) => return SyscallOutcome::Return(fs_errno(error)),
+                },
                 _ => existing.descriptor,
             }
         }
@@ -1394,20 +1534,28 @@ pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R> + tty::
         }
         Err(error) => return SyscallOutcome::Return(fs_errno(error)),
     };
+    let is_memfd =
+        matches!(&descriptor, FileDescriptor::File(open) if fs.memfd_handle(open.node()).is_some());
     let entry = Entry::<R>::new(descriptor, cloexec);
     let mut fdflags = linux_to_fdflags(abi, flags);
     if path_only {
         fdflags = FDFLAG_PATH;
     }
     entry.set_fdflags(fdflags);
-    SyscallOutcome::Return(
-        process
-            .shared
-            .descriptors
-            .lock()
-            .insert_entry(entry)
-            .map_or_else(io::descriptor_errno, u64::from),
-    )
+    let result = process
+        .shared
+        .descriptors
+        .lock()
+        .insert_entry(entry)
+        .map_or_else(io::descriptor_errno, u64::from);
+    if is_memfd {
+        if result <= i32::MAX as u64 {
+            super::shm::sync_process_memfds(process, fs);
+        } else {
+            fs.reap_memfds();
+        }
+    }
+    SyscallOutcome::Return(result)
 }
 
 pub(super) const fn open_to_openat_args(args: [u64; 6]) -> [u64; 6] {
@@ -2688,6 +2836,11 @@ pub(super) async fn write_file<R: Resources, M: VirtualMemory, F: Filesystem<R>>
     if fs.file_is_directory(open.node()) {
         return errno(EISDIR);
     }
+    if let Some(seals) = fs.memfd_get_seals(open.node())
+        && seals & (helios_unix::F_SEAL_WRITE | helios_unix::F_SEAL_FUTURE_WRITE) != 0
+    {
+        return errno(EPERM);
+    }
     if let Some(off) = explicit_offset
         && off < 0
     {
@@ -3500,8 +3653,19 @@ pub(super) fn close_range<R: Resources, F: Filesystem<R>>(
             }
         }
     }
+    let mut closed_memfd = false;
     for entry in &closed_entries {
+        if let Some(open) = entry_file::<R>(entry)
+            && fs.memfd_handle(open.node()).is_some()
+        {
+            closed_memfd = true;
+        }
         super::fs_extra::release_posix_locks_for_entry(process, entry, fs);
+    }
+    drop(closed_entries);
+    if closed_memfd {
+        fs.reap_memfds();
+        super::shm::sync_process_memfds(process, fs);
     }
     0
 }

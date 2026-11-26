@@ -28,6 +28,7 @@ mod packet;
 pub mod permissions;
 mod poll;
 mod process;
+pub mod shm;
 mod signal;
 mod socket;
 mod system;
@@ -49,6 +50,14 @@ pub use netlink::{AF_NETLINK, NETLINK_ROUTE};
 pub use packet::AF_PACKET;
 pub use process::{
     AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, ExecError, ExecSpec, SpawnedProcess, VforkDone,
+};
+pub use shm::{
+    CAP_IPC_LOCK, CAP_IPC_OWNER, IPC_64, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_NOWAIT, IPC_PRIVATE,
+    IPC_RMID, IPC_SET, IPC_STAT, MFD_ALLOW_SEALING, MFD_CLOEXEC, MFD_EXEC, MFD_HUGETLB,
+    MFD_NOEXEC_SEAL, SHM_DEST, SHM_EXEC, SHM_HUGETLB, SHM_INFO, SHM_INFO_BYTES, SHM_LOCK,
+    SHM_LOCKED, SHM_NORESERVE, SHM_RDONLY, SHM_REMAP, SHM_RND, SHM_STAT, SHM_STAT_ANY, SHM_UNLOCK,
+    SHMALL, SHMID64_DS_BYTES, SHMINFO64_BYTES, SHMLBA, SHMMAX, SHMMIN, SHMMNI, SHMSEG, ShmPerm,
+    ShmStat, ShmUsageInfo, check_ipc_owner_or_admin, check_ipc_perms, encode_shminfo64,
 };
 pub use signal::{ProcessSignals, SignalDelivery, SyscallRestart, ThreadSignalSlot};
 pub use socket::{
@@ -249,6 +258,12 @@ pub trait VirtualMemory: UserMemory {
     /// Acquires or creates the container-wide shared memory object for a
     /// regular file identified by `(dev, ino)` (`0` when unsupported).
     fn acquire_shared_file(&mut self, _dev: u64, _ino: u64) -> u64 {
+        0
+    }
+
+    /// Acquires the container-wide shared memory object for SysV shared memory
+    /// segment `shmid` (`0` when unsupported by a lightweight test mock).
+    fn acquire_sysv_shm(&mut self, _shmid: i32) -> u64 {
         0
     }
 
@@ -605,6 +620,7 @@ struct ProcessShared<R: Resources> {
     cwd: Arc<spin::Mutex<String>>,
     root: Arc<spin::Mutex<String>>,
     shared_mappings: Arc<spin::Mutex<Vec<memory::SharedFileMapping<R::File>>>>,
+    next_shm_attach_id: AtomicU64,
     stdin_lock: RawMutex,
     stdin_carry: spin::Mutex<Bytes>,
     attributes: spin::Mutex<system::Attributes>,
@@ -724,6 +740,7 @@ impl<R: Resources> Process<R> {
                 cwd: Arc::new(spin::Mutex::new(initial_cwd)),
                 root: Arc::new(spin::Mutex::new(String::from("/"))),
                 shared_mappings: Arc::new(spin::Mutex::new(Vec::new())),
+                next_shm_attach_id: AtomicU64::new(1),
                 stdin_lock: RawMutex::new(),
                 stdin_carry: spin::Mutex::new(initial_stdin_carry),
                 attributes: spin::Mutex::new(system::Attributes::new(start, open_files)),
@@ -751,6 +768,36 @@ impl<R: Resources> Process<R> {
         fs: &mut F,
     ) {
         memory::flush_all_shared_mappings(self, memory, fs).await;
+    }
+
+    /// Detaches all remaining SysV shared memory segments and drops any sole-
+    /// owner `memfd` mappings/descriptors on `execve` or final process exit.
+    pub fn detach_sysv_shm<F: Filesystem<R>>(&self, now_secs: i64, fs: &mut F) {
+        let shmids = memory::drain_sysv_shm_for_detach(self);
+        let pid = self.pid().get();
+        for shmid in shmids {
+            fs.shm_detach(shmid, pid, now_secs);
+        }
+    }
+
+    /// Releases sole-owner VMAs, SysV shared memory attachments, and `memfd`
+    /// descriptors on final process exit (called after the last thread ends).
+    pub fn cleanup_ipc_on_exit<F: Filesystem<R>>(&self, now_secs: i64, fs: &mut F) {
+        self.detach_sysv_shm(now_secs, fs);
+        if Arc::strong_count(&self.shared.shared_mappings) == 1 {
+            self.shared.shared_mappings.lock().clear();
+        }
+        if Arc::strong_count(&self.shared.descriptors) == 1 {
+            *self.shared.descriptors.lock() = DescriptorSlots::from_entries(Vec::new());
+        }
+        fs.sync_process_memfds(self.pid().get(), &[]);
+        fs.reap_memfds();
+    }
+
+    /// Synchronises this process's live `memfd` descriptor slots with `fs`
+    /// (for cross-process `/proc/<pid>/fd/<n>` reopen after `execve`).
+    pub fn sync_memfds<F: Filesystem<R>>(&self, fs: &F) {
+        shm::sync_process_memfds(self, fs);
     }
 
     /// Process-wide signal and interval-timer state shared across all threads
@@ -1060,6 +1107,7 @@ impl<R: Resources> Process<R> {
             cwd: Arc::new(spin::Mutex::new(self.shared.cwd.lock().clone())),
             root: Arc::new(spin::Mutex::new(self.shared.root.lock().clone())),
             shared_mappings: Arc::new(spin::Mutex::new(Vec::new())),
+            next_shm_attach_id: AtomicU64::new(1),
             stdin_lock: RawMutex::new(),
             stdin_carry: spin::Mutex::new(self.shared.stdin_carry.lock().clone()),
             attributes: spin::Mutex::new(self.shared.attributes.lock().clone()),
@@ -1134,9 +1182,9 @@ impl<R: Resources> Process<R> {
         }
     }
 
-    fn finish_syscall_exit(&mut self, exit: Exit) {
+    fn finish_syscall_exit(&mut self, exit: Exit) -> bool {
         if self.exited {
-            return;
+            return false;
         }
         self.exited = true;
         self.shared.signals.unregister_thread(self.tid);
@@ -1151,6 +1199,7 @@ impl<R: Resources> Process<R> {
                 .release_posix_for_process(self.shared.identity);
             self.signal_vfork_done();
         }
+        all_exited
     }
 }
 
@@ -1201,6 +1250,7 @@ pub async fn dispatch<
         | Operation::Msync
         | Operation::Mremap
         | Operation::Madvise
+        | Operation::Shmat
         | Operation::SchedYield
         | Operation::Clone
         | Operation::Clone3
@@ -1398,7 +1448,13 @@ pub async fn dispatch<
                 Err(err) => (io::descriptor_errno(err), None),
             };
             if let Some(entry) = closed {
+                let is_memfd = matches!(&entry.descriptor, Descriptor::<R>::File(open) if output.memfd_handle(open.node()).is_some());
                 fs_extra::release_posix_locks_for_entry(process, &entry, output);
+                drop(entry);
+                if is_memfd {
+                    output.reap_memfds();
+                    shm::sync_process_memfds(process, output);
+                }
             }
             SyscallOutcome::Return(result)
         }
@@ -1424,8 +1480,13 @@ pub async fn dispatch<
             ))
         }
         Operation::Dup | Operation::Dup2 | Operation::Dup3 => {
-            let (result, overwritten) = {
+            let (result, overwritten, src_is_memfd) = {
                 let mut table = process.shared.descriptors.lock();
+                let src_memfd = table
+                    .get_entry(arguments[0] as u32 as i32)
+                    .is_some_and(|e| {
+                        matches!(&e.descriptor, Descriptor::<R>::File(open) if output.memfd_handle(open.node()).is_some())
+                    });
                 let prev = if matches!(operation, Operation::Dup2 | Operation::Dup3)
                     && arguments[0] as u32 != arguments[1] as u32
                 {
@@ -1434,12 +1495,22 @@ pub async fn dispatch<
                     None
                 };
                 let res = io::duplicate::<R, _>(abi, &mut table, operation, arguments, output);
-                (res, prev)
+                (res, prev, src_memfd)
             };
+            let mut touched_memfd = src_is_memfd && result <= i32::MAX as u64;
             if result <= i32::MAX as u64
                 && let Some(entry) = overwritten
             {
+                if matches!(&entry.descriptor, Descriptor::<R>::File(open) if output.memfd_handle(open.node()).is_some())
+                {
+                    touched_memfd = true;
+                }
                 fs_extra::release_posix_locks_for_entry(process, &entry, output);
+                drop(entry);
+            }
+            if touched_memfd {
+                output.reap_memfds();
+                shm::sync_process_memfds(process, output);
             }
             SyscallOutcome::Return(result)
         }
@@ -1447,14 +1518,36 @@ pub async fn dispatch<
             let cmd = arguments[1] as u32;
             if matches!(cmd, 5..=7) {
                 dispatch_fs_extra(operation, process, arguments, memory, output).await
+            } else if matches!(cmd, shm::F_ADD_SEALS | shm::F_GET_SEALS) {
+                SyscallOutcome::Return(shm::fcntl_seals(
+                    process,
+                    arguments[0] as u32 as i32,
+                    cmd,
+                    arguments[2],
+                    output,
+                ))
             } else {
-                SyscallOutcome::Return(io::duplicate::<R, _>(
+                let res = io::duplicate::<R, _>(
                     abi,
                     &mut process.shared.descriptors.lock(),
                     Operation::Fcntl,
                     arguments,
                     output,
-                ))
+                );
+                if matches!(cmd, 0 | 1030) && res <= i32::MAX as u64 {
+                    let is_memfd = process
+                        .shared
+                        .descriptors
+                        .lock()
+                        .get_entry(res as i32)
+                        .is_some_and(|e| {
+                            matches!(&e.descriptor, Descriptor::<R>::File(open) if output.memfd_handle(open.node()).is_some())
+                        });
+                    if is_memfd {
+                        shm::sync_process_memfds(process, output);
+                    }
+                }
+                SyscallOutcome::Return(res)
             }
         }
         Operation::Eventfd | Operation::Eventfd2 => SyscallOutcome::Return(io::event::<R>(
@@ -1483,6 +1576,14 @@ pub async fn dispatch<
             arguments[0],
             memory,
         )),
+        Operation::MemfdCreate => {
+            SyscallOutcome::Return(shm::memfd_create(process, arguments, memory, output))
+        }
+        Operation::Shmget => SyscallOutcome::Return(shm::shmget(process, arguments, output)),
+        Operation::Shmdt => SyscallOutcome::Return(shm::shmdt(process, arguments, memory, output)),
+        Operation::Shmctl => {
+            SyscallOutcome::Return(shm::shmctl(process, arguments, memory, output))
+        }
         Operation::SchedGetaffinity => SyscallOutcome::Return(thread::sched_getaffinity(
             process, arguments, memory, output,
         )),
@@ -1662,7 +1763,10 @@ async fn dispatch_proc_mem<
             } else {
                 Exit::Thread(status)
             };
-            process.finish_syscall_exit(exit);
+            if process.finish_syscall_exit(exit) {
+                let now_secs = (output.realtime_nanos() / 1_000_000_000) as i64;
+                process.cleanup_ipc_on_exit(now_secs, output);
+            }
             return ControlFlow::Break(exit);
         }
         Operation::Mmap => match fs::prepare_mmap_pseudo_zero(process, arguments) {
@@ -1682,6 +1786,9 @@ async fn dispatch_proc_mem<
         ),
         Operation::Madvise => {
             SyscallOutcome::Return(memory::madvise_boxed(process, arguments, memory, output).await)
+        }
+        Operation::Shmat => {
+            SyscallOutcome::Return(shm::shmat(process, abi, arguments, memory, output).await)
         }
         Operation::SchedYield => SyscallOutcome::Return(thread::sched_yield().await),
         Operation::Clone => {

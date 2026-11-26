@@ -28,7 +28,7 @@ use helios_hal::fs::{
     Metadata, NodeId, NodeKind, OpenFlags, Opened, OwnedFsPath, PreparedWrite, RenameMode,
     WritePosition, WriteProgress,
 };
-use helios_linux::syscall::{Credentials, NGROUPS_MAX, RELEASE, UtsField};
+use helios_linux::syscall::{Credentials, NGROUPS_MAX, RELEASE, ShmStat, UtsField};
 use triomphe::Arc;
 
 use super::{UnixAttributes, UnixFsError, UnixNodeMetadata, delegate_path_handles};
@@ -311,6 +311,7 @@ struct ProcRegistryInner {
     uts: Arc<spin::Mutex<SharedUts>>,
     mounts: spin::Mutex<Vec<ProcMountEntry>>,
     net: spin::Mutex<ContainerNetSnapshot>,
+    sysvipc_shm: spin::Mutex<Vec<(i32, ShmStat, u64, u64)>>,
     cpu_count: AtomicU32,
     total_forks: AtomicU32,
     last_pid: AtomicU32,
@@ -331,6 +332,7 @@ impl ProcRegistry {
                 uts,
                 mounts: spin::Mutex::new(Vec::new()),
                 net: spin::Mutex::new(ContainerNetSnapshot::default()),
+                sysvipc_shm: spin::Mutex::new(Vec::new()),
                 cpu_count: AtomicU32::new(cpu_count.max(1)),
                 total_forks: AtomicU32::new(0),
                 last_pid: AtomicU32::new(0),
@@ -361,6 +363,11 @@ impl ProcRegistry {
 
     pub fn net_snapshot(&self) -> ContainerNetSnapshot {
         self.inner.net.lock().clone()
+    }
+
+    /// Replaces the container's `/proc/sysvipc/shm` snapshot with `(shmid, stat, rss_bytes, swap_bytes)` rows.
+    pub fn set_sysvipc_shm(&self, entries: Vec<(i32, ShmStat, u64, u64)>) {
+        *self.inner.sysvipc_shm.lock() = entries;
     }
 
     pub fn uts(&self) -> &Arc<spin::Mutex<SharedUts>> {
@@ -545,6 +552,11 @@ impl ProcFs {
                 (String::from("stat"), NodeKind::File, path_ino("stat")),
                 (String::from("sys"), NodeKind::Directory, path_ino("sys")),
                 (
+                    String::from("sysvipc"),
+                    NodeKind::Directory,
+                    path_ino("sysvipc"),
+                ),
+                (
                     String::from("thread-self"),
                     NodeKind::Symlink,
                     path_ino("thread-self"),
@@ -701,6 +713,17 @@ impl ProcFs {
             "sys/kernel/ngroups_max" => {
                 return Ok(self.ro_file(s, format!("{NGROUPS_MAX}\n").into_bytes()));
             }
+            "sysvipc" => {
+                return Ok(ProcNode::Dir {
+                    ino: path_ino(s),
+                    entries: alloc::vec![(
+                        String::from("shm"),
+                        NodeKind::File,
+                        path_ino("sysvipc/shm"),
+                    )],
+                });
+            }
+            "sysvipc/shm" => return Ok(self.ro_file(s, self.render_sysvipc_shm().into_bytes())),
             _ => {}
         }
 
@@ -1093,6 +1116,38 @@ impl ProcFs {
             let _ = writeln!(out, "cache size\t: 4096 KB");
             let _ = writeln!(out, "cpu cores\t: {cpus}");
             let _ = writeln!(out);
+        }
+        out
+    }
+
+    /// Renders `/proc/sysvipc/shm` matching Linux v6.12 `ipc/shm.c`
+    /// `sysvipc_shm_proc_show` (64-bit `SIZE_SPEC = "%21lu"`).
+    fn render_sysvipc_shm(&self) -> String {
+        let segments = self.registry.inner.sysvipc_shm.lock();
+        let mut out = String::from(
+            "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n",
+        );
+        for (shmid, stat, rss, swap) in segments.iter() {
+            let _ = writeln!(
+                out,
+                "{:>10} {:>10}  {:>4o} {:>21} {:>5} {:>5}  {:>5} {:>5} {:>5} {:>5} {:>5} {:>10} {:>10} {:>10} {:>21} {:>21}",
+                stat.perm.key,
+                shmid,
+                stat.perm.mode,
+                stat.segsz,
+                stat.cpid,
+                stat.lpid,
+                stat.nattch,
+                stat.perm.uid,
+                stat.perm.gid,
+                stat.perm.cuid,
+                stat.perm.cgid,
+                stat.atime,
+                stat.dtime,
+                stat.ctime,
+                rss,
+                swap,
+            );
         }
         out
     }
@@ -1742,5 +1797,58 @@ mod tests {
                 "expected None for parse_proc_fd_path({path:?})"
             );
         }
+    }
+
+    #[test]
+    fn proc_sysvipc_shm_renders_header_and_segments() {
+        let fs = test_proc_fs();
+        assert_eq!(
+            fs.stat_sync(FsPath::new("sysvipc").unwrap()).unwrap().kind,
+            NodeKind::Directory
+        );
+        assert_eq!(
+            fs.stat_sync(FsPath::new("sysvipc/shm").unwrap())
+                .unwrap()
+                .kind,
+            NodeKind::File
+        );
+        let empty = fs.render_sysvipc_shm();
+        assert!(empty.starts_with("       key      shmid perms"));
+        assert_eq!(empty.lines().count(), 1);
+
+        fs.registry().set_sysvipc_shm(alloc::vec![(
+            32768,
+            ShmStat {
+                perm: helios_linux::syscall::ShmPerm {
+                    key: 0x1234,
+                    uid: 1000,
+                    gid: 1000,
+                    cuid: 1000,
+                    cgid: 1000,
+                    mode: 0o600,
+                    seq: 1,
+                },
+                segsz: 8192,
+                atime: 10,
+                dtime: 0,
+                ctime: 5,
+                cpid: 42,
+                lpid: 42,
+                nattch: 2,
+            },
+            4096,
+            0,
+        )]);
+        let rendered = fs.render_sysvipc_shm();
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let cols: Vec<&str> = lines[1].split_whitespace().collect();
+        assert_eq!(
+            cols,
+            [
+                "4660", "32768", "600", "8192", "42", "42", "2", "1000", "1000", "1000", "1000",
+                "10", "0", "5", "4096", "0"
+            ]
+        );
     }
 }
