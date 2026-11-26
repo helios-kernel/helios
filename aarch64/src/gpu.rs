@@ -18,12 +18,18 @@ use crate::iommu::{self, Aarch64DmaArenas, Aarch64VirtioTransport, Confinement};
 use crate::pci::{PciRoot, VirtioFunctions};
 use crate::platform::PlatformDescription;
 
-type Aarch64VirtioGpuDevice = VirtioGpuDevice<Aarch64VirtioTransport>;
+pub(crate) type Aarch64VirtioGpuDevice = VirtioGpuDevice<Aarch64VirtioTransport>;
 
 /// The interrupt route's view of the platform's display engine.
 #[derive(Clone)]
 pub(crate) struct VirtioDisplayDevice {
     device: Arc<Aarch64VirtioGpuDevice>,
+}
+
+impl VirtioDisplayDevice {
+    pub(crate) fn device(&self) -> &Arc<Aarch64VirtioGpuDevice> {
+        &self.device
+    }
 }
 
 /// The display device the bootstrap processor brought up, together with

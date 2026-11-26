@@ -6,7 +6,7 @@ use core::ptr::NonNull;
 
 use helios_hal::boot::{BootMemoryKind, BootMemoryRegion};
 use helios_hal::cpu::{
-    Aarch64SnapshotContext, BspSnapshotContext, ProcessorId, Riscv64SnapshotContext,
+    Aarch64SnapshotContext, BspSnapshotContext, ProcessorId, ResumeHandoff, Riscv64SnapshotContext,
     X86_64SnapshotContext,
 };
 use helios_hal::measured_boot::{NoMeasuredBoot, SealedSecret};
@@ -792,7 +792,12 @@ fn atomic_snapshot_reservation_exhaustion_thaws_and_releases_frames() {
         ) -> Result<SnapshotPoint, SnapshotUnsupported> {
             *context = BspSnapshotContext::hosted(7);
             if self.resume_mode {
-                Ok(SnapshotPoint::Resumed)
+                Ok(SnapshotPoint::Resumed(ResumeHandoff {
+                    image_id: [0x44; 16],
+                    fresh_entropy: [0x99; 32],
+                    rtc_unix_nanos: Some(1_760_000_000_000_000_000),
+                    boot_monotonic_ticks: 12345,
+                }))
             } else {
                 Ok(SnapshotPoint::Captured)
             }
@@ -906,7 +911,7 @@ fn atomic_snapshot_reservation_exhaustion_thaws_and_releases_frames() {
         || {},
     ))
     .expect("resume path succeeds");
-    assert!(matches!(resumed, SnapshotOutcome::Resumed));
+    assert!(matches!(resumed, SnapshotOutcome::Resumed(h) if h.image_id == [0x44; 16]));
     pool.drain_all_frame_slabs();
     assert_eq!(pool.stats().allocated_bytes, allocated_before);
 
@@ -1099,4 +1104,319 @@ fn write_image_to_storage_orders_payload_flush_before_header_and_invalidation_cl
         HibernateHeader::decode_verified(&storage.data[..HEADER_BYTES], &key),
         Err(HibernateError::InvalidMagic)
     );
+}
+
+#[test]
+fn plan_frame_placement_keeps_displaced_trampoline_and_table_disjoint_from_targets_and_boot() {
+    use super::format::ChunkDescriptor;
+    use super::resume::plan_frame_placement;
+    use alloc::collections::BTreeSet;
+
+    let p = PhysFrame::SIZE as u64;
+    // Usable physical RAM: frames 0..64.
+    let usable = [FrameRun::new(0, 64)];
+    // Boot kernel occupies frames 0..8 (kernel image + stack) and 20..26 (boot heap).
+    let protected = [0..(8 * p), (20 * p)..(26 * p)];
+
+    // Image chunks target:
+    // - frames 2..10 (2..8 collide with boot, 8..10 are direct!)
+    // - frames 18..24 (18..20 direct, 20..24 collide with boot!)
+    // - frames 30..34 (30..34 direct!)
+    let chunks = [
+        ChunkDescriptor {
+            start_phys_frame: 2,
+            frame_count: 8,
+            uncompressed_len: 8 * PhysFrame::SIZE as u32,
+            compressed_len: 100,
+            flags: 0,
+            data_offset: HEADER_BYTES as u64,
+            sha256: [0; 32],
+        },
+        ChunkDescriptor {
+            start_phys_frame: 18,
+            frame_count: 6,
+            uncompressed_len: 6 * PhysFrame::SIZE as u32,
+            compressed_len: 100,
+            flags: 0,
+            data_offset: (HEADER_BYTES + 100) as u64,
+            sha256: [0; 32],
+        },
+        ChunkDescriptor {
+            start_phys_frame: 30,
+            frame_count: 4,
+            uncompressed_len: 4 * PhysFrame::SIZE as u32,
+            compressed_len: 100,
+            flags: 0,
+            data_offset: (HEADER_BYTES + 200) as u64,
+            sha256: [0; 32],
+        },
+    ];
+
+    let plan = plan_frame_placement(&chunks, &usable, &protected, 5)
+        .expect("64 usable frames easily satisfy 10 displaced + 5 table + 1 tramp + 1 copy table");
+
+    // 2..8 (6 frames) + 20..24 (4 frames) = 10 displaced frames;
+    // 8..10 (2) + 18..20 (2) + 30..34 (4) = 8 direct frames.
+    assert_eq!(plan.direct_frames, 8);
+    assert_eq!(plan.displaced_copies.len(), 10);
+    assert_eq!(plan.trampoline_table_frames.len(), 5);
+    assert_ne!(plan.copy_table_phys, 0);
+    assert_eq!(plan.copy_table_pages, 1);
+
+    // Collect every forbidden frame for safe allocations: all image targets + all boot protected.
+    let mut forbidden = BTreeSet::new();
+    for f in 0..8 {
+        forbidden.insert(f * p);
+    }
+    for f in 20..26 {
+        forbidden.insert(f * p);
+    }
+    for f in 2..10 {
+        forbidden.insert(f * p);
+    }
+    for f in 18..24 {
+        forbidden.insert(f * p);
+    }
+    for f in 30..34 {
+        forbidden.insert(f * p);
+    }
+
+    // Verify every safe allocation is unique and strictly outside `forbidden`.
+    let mut safe_used = BTreeSet::new();
+    assert!(!forbidden.contains(&plan.trampoline_phys));
+    assert!(safe_used.insert(plan.trampoline_phys));
+
+    for &tbl in &plan.trampoline_table_frames {
+        assert!(!forbidden.contains(&tbl), "table frame {tbl:#x} collides");
+        assert!(safe_used.insert(tbl), "duplicate table frame {tbl:#x}");
+    }
+
+    for i in 0..plan.copy_table_pages {
+        let addr = plan.copy_table_phys + i * p;
+        assert!(!forbidden.contains(&addr), "copy table {addr:#x} collides");
+        assert!(safe_used.insert(addr), "duplicate copy table {addr:#x}");
+    }
+
+    let mut displaced_dsts = BTreeSet::new();
+    for copy in &plan.displaced_copies {
+        assert!(
+            !forbidden.contains(&copy.src_phys),
+            "displaced src {:#x} overlaps image targets or boot protected memory",
+            copy.src_phys
+        );
+        assert!(
+            safe_used.insert(copy.src_phys),
+            "displaced src {:#x} reused across safe pool",
+            copy.src_phys
+        );
+        assert!(
+            displaced_dsts.insert(copy.dst_phys),
+            "duplicate displaced dst {:#x}",
+            copy.dst_phys
+        );
+    }
+
+    // Verify chunk placements match direct vs displaced exactly.
+    let mut seen_displaced = 0_usize;
+    for (chunk, placement) in chunks.iter().zip(&plan.chunk_placements) {
+        assert_eq!(placement.start_phys_frame, chunk.start_phys_frame);
+        assert_eq!(placement.staging_phys.len(), chunk.frame_count as usize);
+        for (i, &staging) in placement.staging_phys.iter().enumerate() {
+            let dst = (chunk.start_phys_frame + i as u64) * p;
+            if staging != dst {
+                assert_eq!(plan.displaced_copies[seen_displaced].src_phys, staging);
+                assert_eq!(plan.displaced_copies[seen_displaced].dst_phys, dst);
+                seen_displaced += 1;
+            }
+        }
+    }
+    assert_eq!(seen_displaced, plan.displaced_copies.len());
+}
+
+#[test]
+fn plan_frame_placement_reports_insufficient_restore_memory_when_pool_exhausted() {
+    use super::format::ChunkDescriptor;
+    use super::resume::plan_frame_placement;
+
+    let p = PhysFrame::SIZE as u64;
+    // Only 10 usable frames total, 4 protected, image needs 4 displaced + 5 table + 1 trampoline.
+    let usable = [FrameRun::new(0, 10)];
+    let protected_range = 0..(4 * p);
+    let chunks = [ChunkDescriptor {
+        start_phys_frame: 0,
+        frame_count: 4,
+        uncompressed_len: 4 * PhysFrame::SIZE as u32,
+        compressed_len: 100,
+        flags: 0,
+        data_offset: HEADER_BYTES as u64,
+        sha256: [0; 32],
+    }];
+
+    let err = plan_frame_placement(&chunks, &usable, core::slice::from_ref(&protected_range), 5)
+        .expect_err("6 free frames cannot satisfy 5 table + 1 tramp + 1 copy table + 4 displaced");
+    assert!(matches!(
+        err,
+        HibernateError::InsufficientRestoreMemory { .. }
+    ));
+}
+
+#[test]
+fn iommu_first_device_controller_ordering_is_enforced_on_quiesce_and_reinit() {
+    use super::storage::{HibernateDeviceController, HibernateDeviceError};
+
+    struct OrderedDeviceController {
+        log: Vec<&'static str>,
+        has_iommu: bool,
+    }
+
+    impl HibernateDeviceController for OrderedDeviceController {
+        fn quiesce_all(&mut self) -> Result<(), HibernateDeviceError> {
+            self.log.push("quiesce:virtio-blk");
+            self.log.push("quiesce:virtio-net");
+            self.log.push("quiesce:virtio-gpu");
+            if self.has_iommu {
+                self.log.push("quiesce:virtio-iommu");
+            }
+            Ok(())
+        }
+
+        fn reinitialize_all(&mut self) -> Result<(), HibernateDeviceError> {
+            if self.has_iommu {
+                self.log.push("reinit:virtio-iommu");
+            }
+            self.log.push("reinit:virtio-blk");
+            self.log.push("reinit:virtio-net");
+            self.log.push("reinit:virtio-gpu");
+            Ok(())
+        }
+    }
+
+    let mut controller = OrderedDeviceController {
+        log: Vec::new(),
+        has_iommu: true,
+    };
+    controller.quiesce_all().expect("quiesce succeeds");
+    controller.reinitialize_all().expect("reinit succeeds");
+
+    let quiesce_iommu = controller
+        .log
+        .iter()
+        .position(|&e| e == "quiesce:virtio-iommu")
+        .expect("iommu quiesced");
+    let reinit_iommu = controller
+        .log
+        .iter()
+        .position(|&e| e == "reinit:virtio-iommu")
+        .expect("iommu reinitialized");
+    for (idx, &entry) in controller.log.iter().enumerate() {
+        if entry.starts_with("quiesce:") && entry != "quiesce:virtio-iommu" {
+            assert!(
+                idx < quiesce_iommu,
+                "{entry} must quiesce BEFORE virtio-iommu"
+            );
+        }
+        if entry.starts_with("reinit:") && entry != "reinit:virtio-iommu" {
+            assert!(
+                idx > reinit_iommu,
+                "{entry} must reinitialize AFTER virtio-iommu"
+            );
+        }
+    }
+}
+
+#[test]
+fn probe_and_load_returns_no_image_on_blank_disk_and_invalidates_on_refusal() {
+    use super::resume::{ResumeProbe, probe_and_load_hibernate_image};
+    use super::storage::{HIBERNATE_SECTOR_BYTES, HibernateStorage, HibernateStorageError};
+
+    struct MemDisk(Vec<u8>);
+    impl HibernateStorage for MemDisk {
+        fn capacity_bytes(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn sector_size(&self) -> usize {
+            HIBERNATE_SECTOR_BYTES
+        }
+        fn reinitialize_for_write(&mut self) -> Result<(), HibernateStorageError> {
+            Ok(())
+        }
+        fn write_sectors(
+            &mut self,
+            start_sector: u64,
+            data: &[u8],
+        ) -> Result<(), HibernateStorageError> {
+            let off = (start_sector as usize) * HIBERNATE_SECTOR_BYTES;
+            self.0[off..off + data.len()].copy_from_slice(data);
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<(), HibernateStorageError> {
+            Ok(())
+        }
+        fn read_sectors(
+            &mut self,
+            start_sector: u64,
+            dst: &mut [u8],
+        ) -> Result<(), HibernateStorageError> {
+            let off = (start_sector as usize) * HIBERNATE_SECTOR_BYTES;
+            dst.copy_from_slice(&self.0[off..off + dst.len()]);
+            Ok(())
+        }
+    }
+
+    let key = auth_key(0xd1);
+    let identity = sample_identity();
+    let usable = [FrameRun::new(0, 128)];
+
+    // 1. Blank disk -> NoImage.
+    let mut blank = MemDisk(vec![0_u8; 256 * 1024]);
+    let probe = probe_and_load_hibernate_image(
+        &mut blank,
+        Some(&key),
+        &identity,
+        128,
+        &usable,
+        &[],
+        2,
+        |_, _| {},
+        || {},
+    );
+    assert!(matches!(probe, ResumeProbe::NoImage));
+
+    // 2. Valid image probed with NO TPM key -> Refused(NoAuthenticationKey) AND
+    //    sector 0..8 invalidated on disk so second probe returns NoImage.
+    let runs = [FrameRun::new(4, 6)];
+    let (mut image, _, _) = build_synthetic_image(&key, identity, &runs, 128, 4);
+    image.resize(256 * 1024, 0);
+    let mut disk = MemDisk(image);
+    let probe = probe_and_load_hibernate_image(
+        &mut disk,
+        None,
+        &identity,
+        128,
+        &usable,
+        &[],
+        2,
+        |_, _| {},
+        || {},
+    );
+    assert!(matches!(
+        probe,
+        ResumeProbe::Refused(HibernateError::NoAuthenticationKey)
+    ));
+    assert!(
+        disk.0[..HEADER_BYTES].iter().all(|&b| b == 0),
+        "refusal must invalidate header on disk"
+    );
+    let second_probe = probe_and_load_hibernate_image(
+        &mut disk,
+        Some(&key),
+        &identity,
+        128,
+        &usable,
+        &[],
+        2,
+        |_, _| {},
+        || {},
+    );
+    assert!(matches!(second_probe, ResumeProbe::NoImage));
 }

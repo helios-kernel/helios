@@ -148,8 +148,16 @@ impl Cpu for HostedCpu {
         self.machine.restart_processor(processor);
     }
 
+    fn wait_processor_stopped(&self, processor: ProcessorId) {
+        self.machine.wait_processor_stopped(processor);
+    }
+
     fn now(&self) -> Instant {
         self.machine.now()
+    }
+
+    fn continue_timebase(&self, floor: Instant) {
+        self.machine.continue_timebase(floor);
     }
 
     fn timebase(&self) -> Timebase {
@@ -190,7 +198,16 @@ impl Cpu for HostedCpu {
         context: &mut BspSnapshotContext,
     ) -> Result<SnapshotPoint, SnapshotUnsupported> {
         *context = BspSnapshotContext::hosted(u64::from(current_processor().id()));
+        #[cfg(test)]
+        if let Some(handoff) = self.machine.take_next_resume_handoff() {
+            return Ok(SnapshotPoint::Resumed(handoff));
+        }
         Ok(SnapshotPoint::Captured)
+    }
+
+    #[cfg(test)]
+    fn restore_bsp_post_resume_state(&self) {
+        self.machine.record_bsp_post_resume_restore();
     }
 
     fn shutdown(&self) -> ! {

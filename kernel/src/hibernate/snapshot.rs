@@ -7,7 +7,7 @@ use core::ops::Range;
 use core::time::Duration;
 
 use helios_hal::boot::BootMemoryMetadata;
-use helios_hal::cpu::{BspSnapshotContext, Cpu, SnapshotPoint};
+use helios_hal::cpu::{BspSnapshotContext, Cpu, ResumeHandoff, SnapshotPoint};
 use helios_hal::measured_boot::MeasuredBoot;
 use helios_hal::pmm::{PhysFrame, PhysFrameRange};
 use helios_hal::watchdog::Watchdog;
@@ -634,8 +634,9 @@ pub enum SnapshotOutcome<'pool, CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog> {
     /// `CapturedSnapshot::writer` while `CapturedSnapshot::frozen` holds the
     /// machine still so the caller can write the image to storage.
     Captured(Box<CapturedSnapshot<'pool, CpuImpl, WatchdogImpl>>),
-    /// Control resumed from a restored hibernate image on the BSP.
-    Resumed,
+    /// Control resumed from a restored hibernate image on the BSP, carrying
+    /// the boot kernel's [`ResumeHandoff`].
+    Resumed(ResumeHandoff),
 }
 
 /// Parameters for [`capture_atomic_snapshot`].
@@ -709,10 +710,10 @@ where
     // Double-return snapshot point on the BSP.
     let mut bsp_context = BspSnapshotContext::empty();
     match cpu.capture_bsp_state(&mut bsp_context)? {
-        SnapshotPoint::Resumed => {
+        SnapshotPoint::Resumed(handoff) => {
             // Returning here drops `frozen` (thawing all processors) and
             // `writer` (returning reserved frames to the user pool).
-            return Ok(SnapshotOutcome::Resumed);
+            return Ok(SnapshotOutcome::Resumed(handoff));
         }
         SnapshotPoint::Captured => {}
     }

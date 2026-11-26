@@ -31,6 +31,12 @@ impl<T: VirtioTransport> Virtio9pTransport<T> {
             device: Arc::new(device),
         }
     }
+
+    /// The underlying virtio-9p driver, for hibernate quiesce, reinitialization,
+    /// and negotiated-feature inspection.
+    pub fn device(&self) -> &Virtio9pDevice<T> {
+        &self.device
+    }
 }
 
 // Not derived: a derive would require `T: Clone`, and the device is shared.

@@ -308,7 +308,8 @@ pub use signing_key::{
     MACHINE_IDENTITY_SIGNATURE_PREFIX, MAX_MACHINE_IDENTITY_CHALLENGE_BYTES,
     MAX_MACHINE_IDENTITY_DOMAIN_BYTES, MachineIdentityKey, MachineIdentitySignError,
     MachineIdentityVerifyError, PAYLOAD_REGISTER, ProvisionCause, SeedSource, SettledSigningKey,
-    SigningKeyError, machine_identity_signing_message, settle_signing_key,
+    SigningKeyError, machine_identity_signing_message, settle_boot_signing_keys,
+    settle_signing_key,
 };
 pub use surface::{
     MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurface, ReturnedSurfaces,
@@ -1107,6 +1108,25 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
     ) -> Result<FrozenMachine<CpuImpl, WatchdogImpl>, FreezeError> {
         self.executor
             .freeze(
+                &self.timer,
+                self.watchdog.clone(),
+                arrival_deadline,
+                interrupt_guests,
+            )
+            .await
+    }
+
+    /// Freezes the machine for hibernation: stops every online secondary
+    /// through [`Cpu::stop_current`] so its architectural context is saved in
+    /// RAM before snapshotting, and restarts every stopped secondary through
+    /// [`Cpu::restart_processor`] when the returned [`FrozenMachine`] thaws.
+    pub async fn freeze_for_hibernate(
+        &self,
+        arrival_deadline: Duration,
+        interrupt_guests: impl FnOnce(),
+    ) -> Result<FrozenMachine<CpuImpl, WatchdogImpl>, FreezeError> {
+        self.executor
+            .freeze_for_hibernate(
                 &self.timer,
                 self.watchdog.clone(),
                 arrival_deadline,

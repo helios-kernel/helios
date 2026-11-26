@@ -37,6 +37,12 @@ pub(crate) struct VirtioBlockDevice {
     inner: Aarch64VirtioBlockDevice,
 }
 
+impl VirtioBlockDevice {
+    pub(crate) fn device(&self) -> &Aarch64VirtioBlockDevice {
+        &self.inner
+    }
+}
+
 /// One block device the bootstrap processor brought up, together with
 /// the interrupt the firmware routes it to.
 pub(crate) struct BlockInterrupt {

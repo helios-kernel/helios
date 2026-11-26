@@ -14,8 +14,8 @@ use crate::iommu::{self, Aarch64DmaArenas, Aarch64VirtioTransport, Confinement};
 use crate::pci::{PciRoot, VirtioFunctions};
 use crate::platform::PlatformDescription;
 
-type Aarch64VirtioNetTransport = Aarch64VirtioTransport;
-type Aarch64VirtioNetDevice = VirtioNetDevice<Aarch64VirtioNetTransport>;
+pub(crate) type Aarch64VirtioNetTransport = Aarch64VirtioTransport;
+pub(crate) type Aarch64VirtioNetDevice = VirtioNetDevice<Aarch64VirtioNetTransport>;
 
 #[derive(Clone)]
 pub(crate) struct VirtioNetworkDevice {
@@ -27,6 +27,12 @@ pub(crate) struct VirtioNetworkDevice {
     /// owns them. Waking the owners is the only steering a single-line
     /// transport can do.
     cpu: crate::Aarch64Cpu,
+}
+
+impl VirtioNetworkDevice {
+    pub(crate) fn device(&self) -> &Arc<Aarch64VirtioNetDevice> {
+        &self.inner
+    }
 }
 
 impl ExternalInterruptHandler for VirtioNetworkDevice {

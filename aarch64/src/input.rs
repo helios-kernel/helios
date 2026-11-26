@@ -18,12 +18,18 @@ use crate::iommu::{self, Aarch64DmaArenas, Aarch64VirtioTransport, Confinement};
 use crate::pci::{PciRoot, VirtioFunctions};
 use crate::platform::PlatformDescription;
 
-type Aarch64VirtioInputDevice = RawVirtioInputDevice<Aarch64VirtioTransport>;
+pub(crate) type Aarch64VirtioInputDevice = RawVirtioInputDevice<Aarch64VirtioTransport>;
 
 /// The interrupt route's view of one input device.
 #[derive(Clone)]
 pub(crate) struct VirtioInputDevice {
     inner: Arc<Aarch64VirtioInputDevice>,
+}
+
+impl VirtioInputDevice {
+    pub(crate) fn device(&self) -> &Arc<Aarch64VirtioInputDevice> {
+        &self.inner
+    }
 }
 
 /// One input device the bootstrap processor brought up, together with

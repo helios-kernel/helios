@@ -82,6 +82,7 @@ const SEED_DOMAIN: &[u8] = b"helios.entropy.root.seed.v1";
 const RESEED_DOMAIN: &[u8] = b"helios.entropy.root.reseed.v1";
 const DERIVE_DOMAIN: &[u8] = b"helios.entropy.pool.derive.v1";
 const REKEY_DOMAIN: &[u8] = b"helios.entropy.root.rekey.v1";
+const RESUME_MIX_DOMAIN: &[u8] = b"helios.entropy.root.resume-mix.v1";
 
 /// A kernel image that reaches this has no way to produce unpredictable
 /// bytes, so it cannot serve a guest's random source, seed an address-space
@@ -220,6 +221,29 @@ impl RootEntropy {
         let mut state = self.state.lock();
         Self::fold(&mut state, material);
         state.sources.cpu = true;
+    }
+
+    /// Mixes fresh boot-kernel entropy into the root DRBG immediately after
+    /// resuming from a hibernate image, ensuring every subsequent draw
+    /// diverges from pre-hibernate output even before the async reseed task
+    /// runs.
+    pub fn mix_resume_entropy(&self, fresh_entropy: &[u8; 32]) {
+        let (latest, cause) = self.generation.latest_advance();
+        let mut state = self.state.lock();
+        let mut carry = [0_u8; 32];
+        state.drbg.fill_bytes(&mut carry);
+
+        let mut hash = Sha256::new();
+        hash.update(RESUME_MIX_DOMAIN);
+        hash.update(carry);
+        hash.update(fresh_entropy);
+        hash.update(cause);
+        hash.update(latest.get().to_le_bytes());
+        state.drbg = ChaCha20Rng::from_seed(hash.finalize().into());
+        state.generation = latest;
+        state.rekeys = state.rekeys.saturating_add(1);
+        state.reseeds = state.reseeds.saturating_add(1);
+        state.generated = 0;
     }
 
     fn fold(state: &mut RootState, material: &[u8; ROOT_ENTROPY_MATERIAL_BYTES]) {

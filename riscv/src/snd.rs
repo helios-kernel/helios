@@ -18,10 +18,18 @@ use crate::iommu::{self, Confinement, RiscvDmaArenas, RiscvVirtioTransport};
 use crate::net::PlicInterrupt;
 use crate::pci::{PciHostController, VirtioFunctions};
 
+pub(crate) type RiscvVirtioSndDevice = VirtioSndDevice<RiscvVirtioTransport>;
+
 /// The interrupt route's view of the machine's sound device.
 #[derive(Clone)]
 pub(crate) struct VirtioSoundDevice {
-    inner: Arc<VirtioSndDevice<RiscvVirtioTransport>>,
+    inner: Arc<RiscvVirtioSndDevice>,
+}
+
+impl VirtioSoundDevice {
+    pub(crate) fn device(&self) -> &Arc<RiscvVirtioSndDevice> {
+        &self.inner
+    }
 }
 
 /// The sound device the bootstrap hart brought up, together with the
@@ -44,9 +52,9 @@ pub(crate) fn has_sound_device(fdt: &Fdt<'_>, pci_virtio: Option<&VirtioFunction
 
 /// Brings the platform's sound device up and hands it to the kernel.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn install<WatchdogImpl>(
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     cpu: &crate::RiscvCpu,
-    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl>,
+    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl, MeasuredBootImpl>,
     fdt: &Fdt<'_>,
     pci: Option<&PciHostController>,
     pci_virtio: Option<&VirtioFunctions>,
@@ -56,6 +64,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> Option<SoundInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let (device, line) = discover_sound_device(cpu, fdt, pci, pci_virtio, arenas, confinement)?;
     let service = helios_kernel::install_audio_device(kernel, device.inner.clone());

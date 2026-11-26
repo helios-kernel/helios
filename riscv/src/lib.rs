@@ -7,6 +7,7 @@ mod block;
 mod device;
 mod entropy;
 mod gpu;
+mod hibernate;
 mod host_fs;
 mod input;
 mod iommu;
@@ -14,6 +15,7 @@ mod net;
 mod pci;
 mod rtc;
 mod snd;
+mod tpm;
 mod vsock;
 mod watchdog;
 
@@ -154,7 +156,7 @@ pub(crate) fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: DeviceType) -> 
 use core::arch::{asm, global_asm};
 use core::num::NonZeroUsize;
 use core::ops::Range;
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering, compiler_fence};
+use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering, compiler_fence};
 
 use arrayvec::ArrayVec;
 use fdt::Fdt;
@@ -164,9 +166,9 @@ use helios_hal::boot::{
     BootReservedRanges, KernelImageSections, KernelSectionRange, usable_node_regions,
 };
 use helios_hal::cpu::{
-    BspSnapshotContext, Cpu, GUEST_STACK_LIMIT_OFFSET, Instant, ProcessorId,
-    Riscv64SnapshotContext, SnapshotPoint, SnapshotUnsupported, Timebase, TimerInterrupt,
-    current_processor,
+    BspSnapshotContext, Cpu, GUEST_STACK_LIMIT_OFFSET, Instant, ProcessorId, ResumeHandoff,
+    ResumeHandoffWire, Riscv64SnapshotContext, SnapshotPoint, SnapshotUnsupported, Timebase,
+    TimerInterrupt, current_processor,
 };
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::memory::MemoryRegion;
@@ -213,6 +215,10 @@ static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionStat
     helios_hal::critical_section::CriticalSectionState::new();
 static DEBUG_STATE: Once<debug_state::RuntimeState> = Once::new();
 static WATCHDOG_STATE: Once<watchdog::RiscvWatchdog> = Once::new();
+/// Shared monotonic tick offset added to the RISC-V `time` CSR so [`Cpu::now`]
+/// continues strictly forward across hibernate/resume and [`Cpu::set_deadline`]
+/// translates deadlines back into raw `time` CSR ticks for `sbi_rt::set_timer`.
+static TIMEBASE_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 use core::ptr::NonNull;
 
@@ -620,6 +626,27 @@ impl Cpu for RiscvCpu {
         lifecycle::restart_processor(hart);
     }
 
+    fn wait_processor_stopped(&self, hart: ProcessorId) {
+        lifecycle::wait_hart_stopped(hart);
+    }
+
+    fn restore_bsp_post_resume_state(&self) {
+        // SAFETY: `sscratch` was restored by the restore trampoline before
+        // returning here.
+        unsafe { trap::install_trap_vector() };
+        if let Some(runtime) = installed_hart_runtime()
+            && let Some(interrupts) = runtime.external_interrupts
+        {
+            interrupts.open();
+        }
+        sbi_rt::set_timer(u64::MAX);
+        // SAFETY: clears any stale pending supervisor software interrupt bit
+        // while supervisor interrupts are masked.
+        unsafe {
+            riscv::register::sip::clear_ssoft();
+        }
+    }
+
     fn wake_processor(&self, hart: ProcessorId) {
         if current_processor() == hart {
             return;
@@ -647,7 +674,14 @@ impl Cpu for RiscvCpu {
     }
 
     fn now(&self) -> Instant {
-        Instant::new(riscv::register::time::read64())
+        let offset = TIMEBASE_OFFSET.load(Ordering::Acquire);
+        Instant::new(riscv::register::time::read64().saturating_add(offset))
+    }
+
+    fn continue_timebase(&self, floor: Instant) {
+        let raw = riscv::register::time::read64();
+        let new_offset = floor.ticks().saturating_add(1).saturating_sub(raw);
+        TIMEBASE_OFFSET.store(new_offset, Ordering::Release);
     }
 
     fn timebase(&self) -> Timebase {
@@ -655,7 +689,8 @@ impl Cpu for RiscvCpu {
     }
 
     fn set_deadline(&self, deadline: Instant) {
-        sbi_rt::set_timer(deadline.ticks());
+        let offset = TIMEBASE_OFFSET.load(Ordering::Acquire);
+        sbi_rt::set_timer(deadline.ticks().saturating_sub(offset));
     }
 
     fn publish_executable(&self, ptr: *const u8, len: usize) {
@@ -718,12 +753,24 @@ impl Cpu for RiscvCpu {
 
         // SAFETY: `&raw mut raw` is a valid, aligned `Riscv64SnapshotContext`
         // matching the offsets pinned for `__helios_riscv_capture_bsp_state`.
-        let status = unsafe { __helios_riscv_capture_bsp_state(&raw mut raw) };
-        if status == 0 {
+        let result = unsafe { __helios_riscv_capture_bsp_state(&raw mut raw) };
+        if result.status == 0 {
             *context = BspSnapshotContext::from_riscv64(&raw);
             Ok(SnapshotPoint::Captured)
         } else {
-            Ok(SnapshotPoint::Resumed)
+            let handoff_ptr = core::ptr::with_exposed_provenance_mut::<ResumeHandoffWire>(
+                result.handoff_phys as usize,
+            );
+            // SAFETY: RISC-V identity-maps physical RAM, and the restore
+            // trampoline wrote a valid `ResumeHandoffWire` at
+            // `result.handoff_phys` on the safe trampoline page.
+            let wire = unsafe { core::ptr::read(handoff_ptr) };
+            // Wipe the handoff copy (which contains fresh boot entropy) once consumed.
+            // SAFETY: `handoff_ptr` is exclusively owned by this resuming BSP.
+            unsafe {
+                core::ptr::write_volatile(handoff_ptr, ResumeHandoffWire::default());
+            }
+            Ok(SnapshotPoint::Resumed(ResumeHandoff::from_wire(wire)))
         }
     }
 
@@ -881,9 +928,6 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     unsafe {
         vmm::activate_paging();
     }
-    if current_hart == bootstrap_processor {
-        release_early_boot_harts();
-    }
     let user_pool = (current_hart == bootstrap_processor).then(|| {
         helios_kernel::prime_bootstrap_allocator(
             memory_regions.iter().copied(),
@@ -931,10 +975,15 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     let has_display = gpu::has_display_device(&fdt, pci_virtio.as_ref());
     let input_count = input::count_input_devices(&fdt, pci_virtio.as_ref());
     let has_sound = snd::has_sound_device(&fdt, pci_virtio.as_ref());
+    let (measured_boot, measured_boot_discovery) = if current_hart == bootstrap_processor {
+        tpm::discover(&fdt, cpu.clone())
+    } else {
+        (None, helios_tpm::Discovery::NotDescribed)
+    };
     let boot_memory =
         collect_boot_memory_metadata(&fdt, fdt_addr, &initrd, &debug_state.payload_digest());
     let kernel = helios_kernel::init_with_watchdog(
-        helios_kernel::Platform::with_watchdog(console, cpu.clone(), watchdog)
+        helios_kernel::Platform::with_watchdog(console, cpu.clone(), watchdog.clone())
             .with_topology(
                 ProcessorTopology::start_all_secondaries(bootstrap_processor, hart_count)
                     .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
@@ -946,8 +995,16 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
                 DmaModel::Identity
             })
             .with_devices(devices)
+            .with_measured_boot(measured_boot)
             .with_boot_memory(boot_memory),
     );
+    if current_hart == bootstrap_processor {
+        if measured_boot_discovery.is_refusal() {
+            tracing::warn!("{measured_boot_discovery}");
+        } else {
+            tracing::info!("{measured_boot_discovery}");
+        }
+    }
     // Only the bootstrap hart brings devices up.
     if let Some(pool) = user_pool {
         if !has_display {
@@ -1009,6 +1066,13 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             generation,
         );
         debug_state.install_root_entropy(root_entropy.clone());
+        // Settle the TPM-sealed machine seed early so `HibernateAuthKey` is
+        // available for the early-boot resume probe below without settling twice.
+        helios_kernel::settle_boot_signing_keys(&kernel, &debug_state);
+        // The calendar is read once, on the bootstrap hart, before any
+        // component can ask what time it is. The hart timer carries wall
+        // time forward from that reading; only a machine restore re-reads
+        // it, which the reactions task does with the same clock.
         let rtc = rtc::discover(&fdt);
         match &rtc {
             Some(rtc) => {
@@ -1020,7 +1084,11 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
                 );
             }
         }
-        helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
+        let mut hibernate_devices = hibernate::RiscvHibernateDevices::new(
+            cpu.clone(),
+            debug_state.machine_generation_handle(),
+        );
+        hibernate_devices.iommu = confinement.as_ref().map(iommu::Confinement::device);
 
         // A machine may carry several PLICs — QEMU's `virt` gives every
         // socket its own and wires devices to different ones — so each
@@ -1054,6 +1122,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             confinement.as_mut(),
             &debug_state,
         ) {
+            hibernate_devices.network = Some(network.device.device().clone());
             domains.attach_network(network);
         }
         if let Some(host_fs) = host_fs::install(
@@ -1065,9 +1134,11 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             confinement.as_mut(),
             &debug_state,
         ) {
+            hibernate_devices.host_fs = Some(host_fs.transport.clone());
             domains.attach_host_fs(host_fs);
         }
         if let Some(entropy) = entropy_device {
+            hibernate_devices.entropy = Some(entropy.device.device().clone());
             entropy::install(&kernel, &entropy, root_entropy.clone());
             domains.attach_entropy(entropy);
         }
@@ -1081,6 +1152,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             confinement.as_mut(),
             debug_state.machine_generation_handle(),
         ) {
+            hibernate_devices.balloon = Some(balloon.handler.device().clone());
             debug_state.install_memory_balloon(balloon.handle.clone());
             domains.attach_balloon(balloon);
         }
@@ -1094,6 +1166,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             confinement.as_mut(),
             &debug_state,
         ) {
+            hibernate_devices.vsock = Some(vsock.device.device().clone());
             domains.attach_vsock(vsock);
         }
         if let Some(display) = gpu::install(
@@ -1106,6 +1179,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             confinement.as_mut(),
             &debug_state,
         ) {
+            hibernate_devices.display = Some(display.device.device().clone());
             domains.attach_display(display);
         }
         for device in input::install(
@@ -1118,6 +1192,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             confinement.as_mut(),
             &debug_state,
         ) {
+            hibernate_devices
+                .inputs
+                .push(device.device.device().clone());
             domains.attach_input(device);
         }
         if let Some(sound) = snd::install(
@@ -1130,6 +1207,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             confinement.as_mut(),
             &debug_state,
         ) {
+            hibernate_devices.sound = Some(sound.device.device().clone());
             domains.attach_sound(sound);
         }
         for block in block::install(
@@ -1141,20 +1219,39 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             &mut dma_arenas,
             confinement.as_mut(),
             &debug_state,
-            root_entropy,
+            root_entropy.clone(),
         ) {
+            hibernate_devices.blocks.push(block.device.device().clone());
             domains.attach_block(block);
         }
         kernel.spawn_detached(helios_kernel::maintain_dma_arenas(
             dma_arenas,
             kernel.timer(),
         ));
+        // Early-boot hibernate resume probe: runs on the bootstrap hart with
+        // interrupts disabled, BEFORE starting secondary harts, enabling
+        // swap/init, or unmasking interrupts. If a valid authenticated
+        // hibernate image is present on `"helios-hibernate"`, enters the
+        // restore trampoline and never returns.
+        hibernate::probe_and_resume_if_present(
+            &cpu,
+            &kernel,
+            &watchdog,
+            &debug_state,
+            pool,
+            &root_entropy,
+            rtc.as_ref(),
+            &mut hibernate_devices,
+            &[],
+        );
+        helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
         let grants = device::publish_grants(&fdt, debug_state.device_grants(), &domains);
         for (line, route) in grants {
             domains.attach_device(line, route);
         }
         net::publish_interrupt_domains(domains);
         helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapHooks);
+        release_early_boot_harts();
     }
     let hart_runtime = HartRuntime {
         trap_stack: trap::allocate_trap_stack(),
@@ -1258,6 +1355,12 @@ fn shared_watchdog(fdt: &Fdt<'_>) -> watchdog::RiscvWatchdog {
     WATCHDOG_STATE.call_once(|| watchdog::discover(fdt)).clone()
 }
 
+#[repr(C)]
+struct RiscvCaptureResult {
+    status: u64,
+    handoff_phys: u64,
+}
+
 unsafe extern "C" {
     static __stext: u8;
     static __etext: u8;
@@ -1275,7 +1378,7 @@ unsafe extern "C" {
     static _secondary_start: u8;
     static _hart_restart: u8;
     fn _release_mp_harts();
-    fn __helios_riscv_capture_bsp_state(ctx: *mut Riscv64SnapshotContext) -> u64;
+    fn __helios_riscv_capture_bsp_state(ctx: *mut Riscv64SnapshotContext) -> RiscvCaptureResult;
 }
 
 const _: () = {

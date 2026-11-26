@@ -40,6 +40,7 @@ helios_x86_capture_bsp_state:
     stmxcsr dword ptr [rdi + 0x78]
     fnstcw word ptr [rdi + 0x7c]
     xor eax, eax
+    xor edx, edx
     ret
 
 # extern "C" fn helios_x86_resume_bsp_state(ctx: *const X86_64SnapshotContext) -> !

@@ -11,6 +11,7 @@ mod entropy;
 mod exceptions;
 mod extended_state;
 mod gpu;
+mod hibernate;
 mod host_fs;
 mod hotplug;
 mod input;
@@ -67,8 +68,8 @@ use helios_hal::boot::{
     usable_node_regions, usable_region_segments,
 };
 use helios_hal::cpu::{
-    BspSnapshotContext, Cpu, Instant, ProcessorId, SnapshotPoint, SnapshotUnsupported, Timebase,
-    TimerInterrupt, X86_64SnapshotContext, current_processor,
+    BspSnapshotContext, Cpu, Instant, ProcessorId, ResumeHandoff, ResumeHandoffWire, SnapshotPoint,
+    SnapshotUnsupported, Timebase, TimerInterrupt, X86_64SnapshotContext, current_processor,
 };
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
@@ -263,6 +264,7 @@ fn x86_kernel_main() -> ! {
         // this one, the bootstrap processor.
         ProcessorId::new(0),
     );
+    let wakeup_page_phys = reserved_wakeup_page.start as u64;
     let wakeup_page = (processor_count > 1).then_some(reserved_wakeup_page);
     let timebase = Timebase::new(detect_tsc_frequency_hz());
     let tsc_base = read_tsc();
@@ -478,6 +480,9 @@ fn x86_kernel_main() -> ! {
         machine_generation,
     );
     debug_state.install_root_entropy(root_entropy.clone());
+    // Settle the TPM-sealed machine seed early so `HibernateAuthKey` is
+    // available for the early-boot resume probe without settling TPM twice.
+    helios_kernel::settle_boot_signing_keys(&kernel, &debug_state);
     // The calendar is read once, here, before any component can ask
     // what time it is. The TSC carries wall time forward from that
     // reading; only a machine restore re-reads it, which the reactions
@@ -491,11 +496,10 @@ fn x86_kernel_main() -> ! {
             tracing::warn!("the FADT points at no readable CMOS clock; wall time reads as uptime");
         }
     }
-    helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
     // Devices are brought up while the bootstrap processor still runs
     // with interrupts masked, so their MSI-X routes are published before
     // the first message can be delivered.
-    install_pci_devices(
+    let mut hibernate_devices = install_pci_devices(
         &cpu,
         &kernel,
         &pci,
@@ -514,6 +518,23 @@ fn x86_kernel_main() -> ! {
         &debug_state,
         root_entropy.clone(),
     );
+    // Early-boot hibernate resume probe: runs synchronously on the BSP with
+    // interrupts still masked, BEFORE starting secondaries, enabling swap, or
+    // launching `init`. Diverges into the restore trampoline on a valid image.
+    let wakeup_page_range =
+        wakeup_page_phys..wakeup_page_phys + helios_hal::pmm::PhysFrame::SIZE as u64;
+    hibernate::probe_and_resume_if_present(
+        &cpu,
+        &kernel,
+        &debug_state,
+        pool,
+        &root_entropy,
+        rtc.as_ref(),
+        &mut hibernate_devices,
+        physical_memory_offset,
+        core::slice::from_ref(&wakeup_page_range),
+    );
+    helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
     // The SCI is routed with this processor's interrupts still masked,
     // after its latch is installed, so no delivery precedes its handler.
     let processor_hotplug = hotplug::install(&cpu, &acpi_tables, acpi_namespace, acpi_recorder);
@@ -578,13 +599,16 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
     block_functions: &[pci_types::PciAddress],
     debug_state: &debug_state::RuntimeState,
     root_entropy: helios_kernel::RootEntropyHandle,
-) where
+) -> hibernate::X86HibernateDevices
+where
     WatchdogImpl: Watchdog + Clone,
     MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let destination_apic_id = cpu.bootstrap_apic_id();
     let processors = cpu.processor_count();
     let mut routes = exceptions::DeviceInterruptRoutes::new();
+    let mut hibernate_devices =
+        hibernate::X86HibernateDevices::new(cpu.clone(), debug_state.machine_generation_handle());
     // Every virtio function the kernel is about to drive has to be in a
     // domain before it is programmed, so the whole set is confined in
     // one pass from the same discovered inventory.
@@ -602,6 +626,7 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
     let mut confinement = iommu_topology
         .map(|topology| iommu::confine_devices(pci, topology, physical_memory_offset, &confined));
     if let Some(confinement) = &confinement {
+        hibernate_devices.iommu = Some(confinement.device());
         let report = confinement.report();
         debug_state.install_iommu_report(report.clone());
         // The unit has no interrupt of its own to report a fault on, so
@@ -635,6 +660,7 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
             destination_apic_id,
             debug_state,
         );
+        hibernate_devices.host_fs = Some(transport.clone());
         routes.set_host_fs(exceptions::HOST_FS_INTERRUPT_VECTOR, transport);
     } else {
         tracing::warn!("virtio 9p device was not discovered on the PCI bus");
@@ -662,6 +688,7 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
             },
             debug_state,
         );
+        hibernate_devices.network = Some(interrupts.configuration.device().clone());
         for (vector, handler) in interrupts.queues {
             routes.add_network(vector, handler);
         }
@@ -690,6 +717,7 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
             destination_apic_id,
             root_entropy.clone(),
         );
+        hibernate_devices.entropy = Some(device.device().clone());
         routes.set_entropy(exceptions::ENTROPY_INTERRUPT_VECTOR, device);
     } else {
         tracing::warn!("virtio entropy device was not discovered on the PCI bus");
@@ -713,6 +741,7 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
             destination_apic_id,
             debug_state,
         );
+        hibernate_devices.vsock = Some(device.device().clone());
         routes.set_vsock(exceptions::VSOCK_INTERRUPT_VECTOR, device);
     } else {
         tracing::warn!("virtio vsock device was not discovered on the PCI bus");
@@ -736,6 +765,7 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
             destination_apic_id,
             debug_state,
         );
+        hibernate_devices.display = Some(device.device().clone());
         routes.set_display(exceptions::DISPLAY_INTERRUPT_VECTOR, device);
     } else {
         tracing::info!("no virtio-gpu function on the PCI bus; this machine has no display");
@@ -749,14 +779,15 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
             iommu::SMALL_DMA_CHUNK_BYTES,
             processors,
         );
-        let handle = balloon::install(
+        let installed = balloon::install(
             kernel,
             pci,
             address,
             dma,
             debug_state.machine_generation_handle(),
         );
-        debug_state.install_memory_balloon(handle);
+        hibernate_devices.balloon = Some(installed.device);
+        debug_state.install_memory_balloon(installed.handle);
     }
     if input_functions.is_empty() {
         tracing::info!("no virtio-input function on the PCI bus; this machine has no input device");
@@ -783,6 +814,9 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
         destination_apic_id,
         debug_state,
     ) {
+        hibernate_devices
+            .inputs
+            .push(device.device.device().clone());
         routes.add_input(device.vector, device.device);
     }
     if let Some(address) = sound_function {
@@ -803,6 +837,7 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
             destination_apic_id,
             debug_state,
         );
+        hibernate_devices.sound = Some(device.device().clone());
         routes.set_sound(exceptions::SOUND_INTERRUPT_VECTOR, device);
     } else {
         tracing::info!("no virtio-snd function on the PCI bus; this machine has no sound device");
@@ -834,6 +869,7 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
         debug_state,
         root_entropy,
     ) {
+        hibernate_devices.blocks.push(block.device.device().clone());
         routes.add_block(block.vector, block.device);
     }
     kernel.spawn_detached(helios_kernel::maintain_dma_arenas(
@@ -854,6 +890,7 @@ fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
         exceptions::DEBUG_SERIAL_INTERRUPT_VECTOR,
         destination_apic_id,
     );
+    hibernate_devices
 }
 
 /// The ACPI tables, opened before the bootstrap allocator is primed.
@@ -920,6 +957,12 @@ impl ProcessorIdentities for MadtProcessors {
 #[cfg(target_os = "none")]
 global_asm!(include_str!("snapshot.S"));
 
+#[repr(C)]
+struct X86CaptureResult {
+    status: u64,
+    handoff_phys: u64,
+}
+
 unsafe extern "C" {
     static __helios_text_start: u8;
     static __helios_text_end: u8;
@@ -929,7 +972,7 @@ unsafe extern "C" {
     static __helios_data_end: u8;
     static __helios_bss_start: u8;
     static __helios_bss_end: u8;
-    fn helios_x86_capture_bsp_state(ctx: *mut X86_64SnapshotContext) -> u64;
+    fn helios_x86_capture_bsp_state(ctx: *mut X86_64SnapshotContext) -> X86CaptureResult;
 }
 
 const _: () = {
@@ -1399,7 +1442,13 @@ impl Cpu for X86Cpu {
     }
 
     fn now(&self) -> Instant {
-        Instant::new(read_tsc().saturating_sub(self.state.tsc_base()))
+        let offset = self.state.timebase_offset();
+        let base = self.state.tsc_base();
+        Instant::new(read_tsc().saturating_sub(base).saturating_add(offset))
+    }
+
+    fn continue_timebase(&self, floor: Instant) {
+        self.state.continue_timebase(read_tsc(), floor.ticks());
     }
 
     fn timebase(&self) -> Timebase {
@@ -1461,13 +1510,42 @@ impl Cpu for X86Cpu {
         };
         // SAFETY: `&raw mut raw` is a valid, aligned `X86_64SnapshotContext`
         // matching the offsets pinned for `helios_x86_capture_bsp_state`.
-        let status = unsafe { helios_x86_capture_bsp_state(&raw mut raw) };
-        if status == 0 {
+        let result = unsafe { helios_x86_capture_bsp_state(&raw mut raw) };
+        if result.status == 0 {
             *context = BspSnapshotContext::from_x86_64(&raw);
             Ok(SnapshotPoint::Captured)
         } else {
-            Ok(SnapshotPoint::Resumed)
+            let handoff_virt = (result.handoff_phys as usize)
+                .checked_add(self.state.physical_memory_offset())
+                .expect("hibernate resume handoff address overflows HHDM");
+            let wire_ptr =
+                core::ptr::with_exposed_provenance_mut::<ResumeHandoffWire>(handoff_virt);
+            // SAFETY: `result.handoff_phys` points to the `ResumeHandoffWire`
+            // placed on the safe trampoline page by the boot kernel, readable
+            // in the image kernel's HHDM while the machine is still frozen.
+            let wire = unsafe { core::ptr::read_volatile(wire_ptr) };
+            // SAFETY: wipe fresh entropy from the free trampoline page after reading.
+            unsafe {
+                core::ptr::write_bytes(wire_ptr, 0, 1);
+            }
+            Ok(SnapshotPoint::Resumed(ResumeHandoff::from_wire(wire)))
         }
+    }
+
+    fn wait_processor_stopped(&self, processor: ProcessorId) {
+        while !self.state.has_stopped(processor) {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn restore_bsp_post_resume_state(&self) {
+        self.state.restore_bsp_post_resume_state();
+        // Keep `CR8` at wake-only priority while enabling `IF=1`, matching
+        // `FrozenMachine`'s contract until `thaw()` drops the wake-only mask.
+        // SAFETY: `CR8` is the task-priority register; raising it holds off
+        // device and timer interrupts while admitting wake/shootdown IPIs.
+        unsafe { write_cr8(exceptions::WAKE_ONLY_TASK_PRIORITY) };
+        x86_64::instructions::interrupts::enable();
     }
 
     fn shutdown(&self) -> ! {

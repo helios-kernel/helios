@@ -23,6 +23,7 @@
 //!   error on mismatch.
 
 pub mod format;
+pub mod resume;
 pub mod snapshot;
 pub mod storage;
 pub mod verify;
@@ -36,6 +37,12 @@ pub use format::{
     HEADER_MAC_BYTES, HEADER_MAC_OFFSET, HEADER_MAGIC, HibernateHeader, HibernateIdentity,
     MAX_CHUNKS, hash_device_inventory, hash_firmware_memory_map, hash_negotiated_features,
 };
+pub use helios_hal::cpu::{DisplacedFrameCopy, ResumeHandoff, ResumeHandoffWire};
+pub use resume::{
+    ChunkPlacement, FramePlacementPlan, LoadedHibernateImage, ResumeProbe, build_machine_identity,
+    build_machine_identity_with_hashes, collect_boot_protected_ranges, plan_frame_placement,
+    probe_and_load_hibernate_image, usable_physical_frame_runs,
+};
 pub use snapshot::{
     AtomicSnapshotParams, CapturedSnapshot, EncodeParams, FrameRun, ReservationWriter,
     SnapshotConfig, SnapshotOutcome, SnapshotSink, capture_atomic_snapshot,
@@ -43,9 +50,10 @@ pub use snapshot::{
 };
 pub use storage::{
     HIBERNATE_HEADER_SECTORS, HIBERNATE_SECTOR_BYTES, HibernateDeviceController,
-    HibernateDeviceError, HibernateOutcome, HibernateStorage, HibernateStorageError,
-    VirtioBlockHibernateStorage, hibernate_to_disk, hibernate_to_disk_with_power_off,
-    invalidate_hibernate_header, required_disk_bytes, validate_sector_size, write_image_to_storage,
+    HibernateDeviceError, HibernateOutcome, HibernateStorage, HibernateStorageError, ResumeTargets,
+    VirtioBlockHibernateStorage, hibernate_machine, hibernate_to_disk,
+    hibernate_to_disk_with_power_off, invalidate_hibernate_header, required_disk_bytes,
+    validate_sector_size, write_image_to_storage,
 };
 pub use verify::{
     VerifiedHibernateImage, decode_image_into, verify_identity, verify_image_header_and_table,
@@ -223,4 +231,18 @@ pub enum HibernateError {
     /// Quiescing or reinitializing platform devices failed.
     #[error("hibernate device lifecycle error: {0}")]
     Device(#[from] HibernateDeviceError),
+
+    /// Not enough free non-colliding physical frames are available on the boot
+    /// machine to stage displaced image frames and the restore trampoline.
+    #[error(
+        "insufficient safe physical frames for hibernate restore: needed {needed_frames} frames, available {available_frames} frames"
+    )]
+    InsufficientRestoreMemory {
+        needed_frames: u64,
+        available_frames: u64,
+    },
+
+    /// Required boot metadata for constructing [`HibernateIdentity`] was missing.
+    #[error("hibernate identity input unavailable: {reason}")]
+    InvalidIdentityInput { reason: &'static str },
 }

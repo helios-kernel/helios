@@ -3811,6 +3811,7 @@ dependencies = [
  "helios-firmware",
  "helios-hal",
  "helios-kernel",
+ "helios-tpm",
  "helios-virtio",
  "i6300esb",
  "ns16550a",

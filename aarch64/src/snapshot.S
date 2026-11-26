@@ -33,6 +33,7 @@ __helios_aarch64_capture_bsp_state:
     mrs x1, fpcr
     str x1, [x0, #0xa8]
     mov x0, #0
+    mov x1, #0
     ret
 .size __helios_aarch64_capture_bsp_state, . - __helios_aarch64_capture_bsp_state
 

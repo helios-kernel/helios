@@ -160,7 +160,7 @@ use alloc::boxed::Box;
 use core::future::poll_fn;
 use core::marker::PhantomData;
 use core::pin::pin;
-use core::sync::atomic::{AtomicU8, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use core::task::Poll;
 use core::time::Duration;
 
@@ -241,6 +241,10 @@ struct Control {
     phase: AtomicU8,
     hold: AtomicU8,
     freezer: AtomicU16,
+    /// Set by the freezer during phase 2 of a hibernate freeze, instructing
+    /// already-parked secondaries to transition into [`Cpu::stop_current`] so
+    /// their architectural state is saved and hardware cores stop cleanly.
+    stop_secondaries: AtomicBool,
 }
 
 impl FreezeBarrier {
@@ -250,6 +254,7 @@ impl FreezeBarrier {
                 phase: AtomicU8::new(Phase::Running as u8),
                 hold: AtomicU8::new(0),
                 freezer: AtomicU16::new(0),
+                stop_secondaries: AtomicBool::new(false),
             }),
             arrivals: (0..processors)
                 .map(|_| CachePadded::new(AtomicU8::new(NOT_ARRIVED)))
@@ -302,7 +307,7 @@ impl FreezeBarrier {
             return;
         }
         // From the arrival to the end of the freeze no handler runs here.
-        let _masked = LocalInterruptsMasked::new();
+        let mut masked = Some(LocalInterruptsMasked::new());
         let arrival = &self.arrivals[usize::from(processor.id())];
         loop {
             let freezer = ProcessorId::new(self.control.freezer.load(Ordering::Relaxed));
@@ -310,6 +315,27 @@ impl FreezeBarrier {
             self.arrived.notify_all();
             cpu.wake_processor(freezer);
             cpu.park_wake_only(hold, held);
+            if self.control.stop_secondaries.load(Ordering::Acquire) {
+                let stop_held = hold.load(Ordering::Acquire);
+                if stop_held & HELD != 0 {
+                    // Narrow to wake/shootdown-only BEFORE lifting the local
+                    // interrupt flag so no device or timer interrupt can fire
+                    // in the gap while x86's `stop_current` still sees `IF=1`
+                    // to leave the shootdown set safely.
+                    let wake_mask = cpu.mask_to_wake_only();
+                    drop(masked.take());
+                    arrival.store(stop_held, Ordering::Release);
+                    cpu.stop_current();
+                    arrival.store(NOT_ARRIVED, Ordering::Release);
+                    drop(wake_mask);
+                    held = hold.load(Ordering::Acquire);
+                    if held & HELD == 0 {
+                        return;
+                    }
+                    masked = Some(LocalInterruptsMasked::new());
+                    continue;
+                }
+            }
             arrival.store(NOT_ARRIVED, Ordering::Release);
             held = hold.load(Ordering::Acquire);
             if held & HELD == 0 {
@@ -385,6 +411,22 @@ impl FreezeBarrier {
         }
     }
 
+    /// Restarts every online secondary that transitioned into
+    /// [`Cpu::stop_current`] during a hibernate freeze.
+    fn restart_secondaries<CpuImpl: Cpu>(
+        &self,
+        cpu: &CpuImpl,
+        online: &OnlineSet,
+        freezer: ProcessorId,
+    ) {
+        for index in 0..self.arrivals.len() {
+            let processor = processor_at(index);
+            if processor != freezer && online.contains(processor) {
+                cpu.restart_processor(processor);
+            }
+        }
+    }
+
     /// Releases the secondaries, in the order of the module
     /// documentation, and returns once every one has left its park.
     fn release<CpuImpl: Cpu>(
@@ -393,22 +435,31 @@ impl FreezeBarrier {
         online: &OnlineSet,
         freezer: ProcessorId,
         held: u8,
+        stopped_secondaries: bool,
     ) {
         self.control
             .phase
             .store(Phase::Thawing as u8, Ordering::Release);
+        self.control
+            .stop_secondaries
+            .store(false, Ordering::Release);
         self.control.hold.store(held & !HELD, Ordering::Release);
-        // Every parked processor is online: it joined the set before it
-        // could reach a boundary, and none leaves it while the freezer
+        // Every parked or stopped processor is online: it joined the set before
+        // it could reach a boundary, and none leaves it while the freezer
         // holds the transition lock.
-        self.wake_secondaries(cpu, online, freezer);
+        if stopped_secondaries {
+            self.restart_secondaries(cpu, online, freezer);
+        } else {
+            self.wake_secondaries(cpu, online, freezer);
+        }
         for (index, arrival) in self.arrivals.iter().enumerate() {
             if index == usize::from(freezer.id()) {
                 continue;
             }
-            // A secondary that parked is a few instructions from leaving
-            // once `hold` changes; one that never arrived is not waited
-            // for, and finds `hold` released when it does.
+            // A secondary that parked or stopped is a few instructions from
+            // leaving once `hold` changes or `restart_processor` returns it;
+            // one that never arrived is not waited for, and finds `hold`
+            // released when it does.
             while arrival.load(Ordering::Acquire) == held {
                 core::hint::spin_loop();
             }
@@ -450,6 +501,7 @@ struct Release<CpuImpl: Cpu + Clone> {
     cpu: CpuImpl,
     freezer: ProcessorId,
     held: u8,
+    stopped_secondaries: bool,
     /// The lifecycle's transition lock, held from before `hold` is set
     /// until the release has finished: no processor joins or leaves the
     /// online set by an offline or online while the barrier counts it.
@@ -459,9 +511,13 @@ struct Release<CpuImpl: Cpu + Clone> {
 
 impl<CpuImpl: Cpu + Clone> Drop for Release<CpuImpl> {
     fn drop(&mut self) {
-        self.group
-            .freeze
-            .release(&self.cpu, self.group.online(), self.freezer, self.held);
+        self.group.freeze.release(
+            &self.cpu,
+            self.group.online(),
+            self.freezer,
+            self.held,
+            self.stopped_secondaries,
+        );
     }
 }
 
@@ -539,6 +595,36 @@ impl Executor {
         arrival_deadline: Duration,
         interrupt_guests: impl FnOnce(),
     ) -> Result<FrozenMachine<CpuImpl, WatchdogImpl>, FreezeError> {
+        self.freeze_inner(timer, watchdog, arrival_deadline, interrupt_guests, false)
+            .await
+    }
+
+    /// Freezes every online processor at a scheduler boundary and then transitions
+    /// every online secondary into [`Cpu::stop_current`], waiting until each
+    /// secondary has saved its architectural state and stopped in hardware.
+    ///
+    /// Dropping or thawing the returned [`FrozenMachine`] restarts every stopped
+    /// secondary via [`Cpu::restart_processor`] and waits until all of them have
+    /// resumed and rejoined the scheduler.
+    pub async fn freeze_for_hibernate<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog>(
+        &self,
+        timer: &Timer<CpuImpl>,
+        watchdog: WatchdogImpl,
+        arrival_deadline: Duration,
+        interrupt_guests: impl FnOnce(),
+    ) -> Result<FrozenMachine<CpuImpl, WatchdogImpl>, FreezeError> {
+        self.freeze_inner(timer, watchdog, arrival_deadline, interrupt_guests, true)
+            .await
+    }
+
+    async fn freeze_inner<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog>(
+        &self,
+        timer: &Timer<CpuImpl>,
+        watchdog: WatchdogImpl,
+        arrival_deadline: Duration,
+        interrupt_guests: impl FnOnce(),
+        stop_secondaries: bool,
+    ) -> Result<FrozenMachine<CpuImpl, WatchdogImpl>, FreezeError> {
         // Held for the whole future, and moved into the answer at its
         // end, so that the future is `!Send` (a value that nothing uses
         // later is not kept across an await, and would not count): the
@@ -573,6 +659,10 @@ impl Executor {
         let held = (generation << 1) | HELD;
         barrier
             .control
+            .stop_secondaries
+            .store(false, Ordering::Relaxed);
+        barrier
+            .control
             .freezer
             .store(freezer.id(), Ordering::Relaxed);
         // `SeqCst`, before any read of the online set: the freezer's half
@@ -580,11 +670,12 @@ impl Executor {
         barrier.control.hold.store(held, Ordering::SeqCst);
         // From here a drop, whether of the guard or of this future,
         // releases the machine.
-        let release = Release {
+        let mut release = Release {
             group,
             cpu: cpu.clone(),
             freezer,
             held,
+            stopped_secondaries: false,
             _transition: transition,
         };
 
@@ -620,6 +711,31 @@ impl Executor {
         // No await from here: this processor polls nothing else until the
         // guard is dropped.
         let mask = cpu.mask_to_wake_only();
+        if stop_secondaries && online.count() > 1 {
+            // Phase 2: every online secondary is already parked at a scheduler
+            // boundary. Advance `hold` with `stop_secondaries = true` so each
+            // secondary saves its architectural state and enters `stop_current`.
+            let stop_gen = ((held >> 1) + 1) % GENERATIONS;
+            let stop_held = (stop_gen << 1) | HELD;
+            barrier
+                .control
+                .stop_secondaries
+                .store(true, Ordering::Release);
+            barrier.control.hold.store(stop_held, Ordering::SeqCst);
+            release.held = stop_held;
+            release.stopped_secondaries = true;
+            barrier.wake_secondaries(cpu, online, freezer);
+            for index in 0..barrier.arrivals.len() {
+                let processor = processor_at(index);
+                if processor == freezer || !online.contains(processor) {
+                    continue;
+                }
+                while barrier.arrivals[index].load(Ordering::Acquire) != stop_held {
+                    core::hint::spin_loop();
+                }
+                cpu.wait_processor_stopped(processor);
+            }
+        }
         barrier
             .control
             .phase

@@ -17,6 +17,7 @@
 //! acknowledging and ending an interrupt are `ICC_*_EL1` system-register
 //! accesses private to the running processor.
 
+use alloc::vec::Vec;
 use core::ptr::NonNull;
 
 use arm_gic::gicv3::registers::{Gicd, GicrSgi};
@@ -69,9 +70,24 @@ const WAKE_ONLY_PRIORITY_MASK: u8 = DEVICE_PRIORITY;
 /// bits 32..40. `GICR_TYPER.Affinity` is reported in the same shape.
 const MPIDR_AFFINITY_MASK: u64 = 0x0000_00ff_00ff_ffff;
 
+/// Recorded distributor configuration for one device SPI so post-resume
+/// reinitialization restores every routed interrupt identically.
+#[derive(Clone, Copy)]
+struct DeviceInterruptRecord {
+    intid: IntId,
+    trigger: Trigger,
+    mpidr: u64,
+    enabled: bool,
+}
+
+struct GicState {
+    gic: GicV3<'static>,
+    device_interrupts: Vec<DeviceInterruptRecord>,
+}
+
 /// The platform's interrupt controller.
 pub(crate) struct Gic {
-    inner: Mutex<GicV3<'static>>,
+    inner: Mutex<GicState>,
     processor_count: usize,
 }
 
@@ -82,7 +98,17 @@ impl Gic {
     /// Every writer goes through here; see the module comment for why
     /// the two have to be taken together.
     fn with_registers<R>(&self, act: impl FnOnce(&mut GicV3<'static>) -> R) -> R {
-        critical_section::with(|_| act(&mut self.inner.lock()))
+        critical_section::with(|_| {
+            let mut state = self.inner.lock();
+            act(&mut state.gic)
+        })
+    }
+
+    fn with_state<R>(&self, act: impl FnOnce(&mut GicState) -> R) -> R {
+        critical_section::with(|_| {
+            let mut state = self.inner.lock();
+            act(&mut state)
+        })
     }
 
     /// Maps the controller, configures the distributor, and brings up
@@ -132,7 +158,10 @@ impl Gic {
             description.redistributor.base,
         );
         Self {
-            inner: Mutex::new(gic),
+            inner: Mutex::new(GicState {
+                gic,
+                device_interrupts: Vec::new(),
+            }),
             processor_count,
         }
     }
@@ -216,20 +245,24 @@ impl Gic {
     /// Routes a device interrupt to the processor with `mpidr` and
     /// enables it with the trigger mode the device tree declared.
     pub(crate) fn enable_device_interrupt(&self, intid: IntId, trigger: Trigger, mpidr: u64) {
-        self.with_registers(|gic| {
-            gic.set_interrupt_priority(intid, None, DEVICE_PRIORITY)
-                .unwrap_or_else(|error| {
-                    panic!("AArch64 GIC could not set the priority of {intid:?}: {error}")
+        self.with_state(|state| {
+            configure_device_interrupt(&mut state.gic, intid, trigger, mpidr, true);
+            if let Some(existing) = state
+                .device_interrupts
+                .iter_mut()
+                .find(|record| record.intid == intid)
+            {
+                existing.trigger = trigger;
+                existing.mpidr = mpidr;
+                existing.enabled = true;
+            } else {
+                state.device_interrupts.push(DeviceInterruptRecord {
+                    intid,
+                    trigger,
+                    mpidr,
+                    enabled: true,
                 });
-            gic.distributor()
-                .set_routing(intid, Some(mpidr & MPIDR_AFFINITY_MASK))
-                .unwrap_or_else(|error| panic!("AArch64 GIC could not route {intid:?}: {error}"));
-            gic.set_trigger(intid, None, trigger)
-                .unwrap_or_else(|error| {
-                    panic!("AArch64 GIC could not set the trigger of {intid:?}: {error}")
-                });
-            gic.enable_interrupt(intid, None, true)
-                .unwrap_or_else(|error| panic!("AArch64 GIC could not enable {intid:?}: {error}"));
+            }
         });
         tracing::info!("GICv3 routed {intid:?} to mpidr={mpidr:#x} trigger={trigger:?}");
     }
@@ -250,13 +283,66 @@ impl Gic {
     /// section inside [`Gic::with_registers`] is what keeps the second
     /// from landing on a processor whose own task holds the lock.
     pub(crate) fn set_device_interrupt_enabled(&self, intid: IntId, enabled: bool) {
-        self.with_registers(|gic| {
-            gic.enable_interrupt(intid, None, enabled)
+        self.with_state(|state| {
+            state
+                .gic
+                .enable_interrupt(intid, None, enabled)
                 .unwrap_or_else(|error| {
                     panic!("AArch64 GIC could not set the enable of {intid:?}: {error}")
                 });
+            if let Some(existing) = state
+                .device_interrupts
+                .iter_mut()
+                .find(|record| record.intid == intid)
+            {
+                existing.enabled = enabled;
+            }
         });
     }
+
+    /// Re-initializes the distributor, replays every recorded device SPI route,
+    /// and re-attaches the bootstrap processor's CPU interface after resuming
+    /// from a hibernate image.
+    pub(crate) fn reinitialize_after_resume(&self, bootstrap_mpidr: u64) {
+        self.with_state(|state| {
+            let bootstrap =
+                redistributor_index(&mut state.gic, bootstrap_mpidr, self.processor_count);
+            state.gic.setup(bootstrap);
+            state.gic.enable_all_interrupts(false);
+            for record in &state.device_interrupts {
+                configure_device_interrupt(
+                    &mut state.gic,
+                    record.intid,
+                    record.trigger,
+                    record.mpidr,
+                    record.enabled,
+                );
+            }
+        });
+        self.attach_current_processor(bootstrap_mpidr);
+    }
+}
+
+fn configure_device_interrupt(
+    gic: &mut GicV3<'static>,
+    intid: IntId,
+    trigger: Trigger,
+    mpidr: u64,
+    enabled: bool,
+) {
+    gic.set_interrupt_priority(intid, None, DEVICE_PRIORITY)
+        .unwrap_or_else(|error| {
+            panic!("AArch64 GIC could not set the priority of {intid:?}: {error}")
+        });
+    gic.distributor()
+        .set_routing(intid, Some(mpidr & MPIDR_AFFINITY_MASK))
+        .unwrap_or_else(|error| panic!("AArch64 GIC could not route {intid:?}: {error}"));
+    gic.set_trigger(intid, None, trigger)
+        .unwrap_or_else(|error| {
+            panic!("AArch64 GIC could not set the trigger of {intid:?}: {error}")
+        });
+    gic.enable_interrupt(intid, None, enabled)
+        .unwrap_or_else(|error| panic!("AArch64 GIC could not enable {intid:?}: {error}"));
 }
 
 /// Sends the wake SGI to the single processor with `mpidr`.
