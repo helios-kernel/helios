@@ -9,6 +9,8 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
+
 use super::qemu::QemuOptions;
 
 /// Longest serial a virtio-blk device reports: its identification
@@ -19,7 +21,7 @@ pub(crate) const MAX_DISK_SERIAL_BYTES: usize = 20;
 const SPEC_SHAPE: &str = "<image>,serial=<name>[,readonly]";
 
 /// One `--disk <image>,serial=<name>[,readonly]`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct VmDiskSpec {
     pub(crate) image: PathBuf,
     pub(crate) serial: String,
@@ -44,7 +46,7 @@ pub(crate) enum DiskSpecError {
         "--disk serial {serial:?} is {len} bytes; a virtio-blk device reports at most {MAX_DISK_SERIAL_BYTES}"
     )]
     SerialTooLong { serial: String, len: usize },
-    #[error("--disk serial {serial:?} is the scratch disk's, which the inspector attaches itself")]
+    #[error("--disk serial {serial:?} is reserved by a disk the inspector attaches itself")]
     ReservedSerial { serial: String },
     #[error("two --disk images share the serial {serial:?}; the guest tells disks apart by serial")]
     DuplicateSerial { serial: String },
@@ -102,13 +104,14 @@ impl FromStr for VmDiskSpec {
 }
 
 /// Refuses a set of disks the guest could not tell apart from each other
-/// or from the scratch disk.
+/// or from any inspector-managed disk (`helios-data`, and `helios-hibernate`
+/// when `--hibernate-disk-size` is set).
 pub(crate) fn validate_disks(
     disks: &[VmDiskSpec],
-    scratch_serial: &str,
+    reserved_serials: &[&str],
 ) -> Result<(), DiskSpecError> {
     for (index, disk) in disks.iter().enumerate() {
-        if disk.serial == scratch_serial {
+        if reserved_serials.contains(&disk.serial.as_str()) {
             return Err(DiskSpecError::ReservedSerial {
                 serial: disk.serial.clone(),
             });
@@ -210,19 +213,32 @@ mod tests {
         };
 
         assert_eq!(
-            validate_disks(&[disk("helios-data")], "helios-data"),
+            validate_disks(&[disk("helios-data")], &["helios-data"]),
             Err(DiskSpecError::ReservedSerial {
                 serial: "helios-data".to_owned()
             })
         );
         assert_eq!(
-            validate_disks(&[disk("home"), disk("home")], "helios-data"),
+            validate_disks(
+                &[disk("helios-hibernate")],
+                &["helios-data", "helios-hibernate"]
+            ),
+            Err(DiskSpecError::ReservedSerial {
+                serial: "helios-hibernate".to_owned()
+            })
+        );
+        assert_eq!(
+            validate_disks(&[disk("helios-hibernate")], &["helios-data"]),
+            Ok(())
+        );
+        assert_eq!(
+            validate_disks(&[disk("home"), disk("home")], &["helios-data"]),
             Err(DiskSpecError::DuplicateSerial {
                 serial: "home".to_owned()
             })
         );
         assert_eq!(
-            validate_disks(&[disk("home"), disk("rootfs")], "helios-data"),
+            validate_disks(&[disk("home"), disk("rootfs")], &["helios-data"]),
             Ok(())
         );
     }

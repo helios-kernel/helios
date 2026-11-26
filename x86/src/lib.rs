@@ -534,6 +534,16 @@ fn x86_kernel_main() -> ! {
         physical_memory_offset,
         core::slice::from_ref(&wakeup_page_range),
     );
+    let hibernate_receiver = debug_state.install_hibernate_service();
+    kernel.spawn_local_detached(hibernate::serve_hibernate_requests(
+        cpu.clone(),
+        kernel.hibernate_handle(),
+        debug_state.clone(),
+        pool,
+        hibernate_devices,
+        hibernate_receiver,
+        DEBUG_SERIAL_WRITER,
+    ));
     helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
     // The SCI is routed with this processor's interrupts still masked,
     // after its latch is installed, so no delivery precedes its handler.

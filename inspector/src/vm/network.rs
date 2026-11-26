@@ -741,6 +741,21 @@ pub(crate) struct VmNetwork {
 }
 
 impl VmNetwork {
+    /// Exports the resolved network configuration back to [`VmNetworkFile`]
+    /// so `hibernate-vm.json` preserves every option verbatim.
+    pub(crate) fn to_file(&self) -> VmNetworkFile {
+        VmNetworkFile {
+            backend: Some(self.backend),
+            queues: self.queues,
+            ifname: self.ifname.clone(),
+            bridge: self.bridge.clone(),
+            socket_vmnet_path: self.socket_vmnet_path.clone(),
+            socket_vmnet_client: self.socket_vmnet_client.clone(),
+            device_props: self.device_props.clone(),
+            pcap: self.pcap.clone(),
+        }
+    }
+
     /// Merges command-line arguments over config-file values.
     pub(crate) fn resolve(args: VmNetworkArgs, file: VmNetworkFile) -> Self {
         let device_props = if args.device_props.is_empty() {

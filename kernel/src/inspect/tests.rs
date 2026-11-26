@@ -61,6 +61,18 @@ impl MockGuestMemory {
 }
 
 #[test]
+fn kernel_tree_publishes_machine_generation() {
+    let mut snapshot = minimal_kernel_snapshot();
+    snapshot.machine_generation = 42;
+    let filters = PrefixSet::from_prefixes(["/kernel/machine/generation"]).unwrap();
+    let mut entries = Vec::new();
+    emit_kernel_entries(&snapshot, &filters, &mut entries);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "/kernel/machine/generation");
+    assert_eq!(entries[0].value, InspectValue::Unsigned64(42));
+}
+
+#[test]
 fn publication_name_and_relative_path_validation_enforce_bounds() {
     assert!(is_valid_publication_name("vmm"));
     assert!(is_valid_publication_name("http_client-0.1"));
@@ -818,6 +830,7 @@ fn minimal_kernel_snapshot() -> KernelTelemetrySnapshot {
         timestamp: 1234,
         uptime: 1234,
         wall_clock: 5678,
+        machine_generation: 1,
         configured_processors: 2,
         online_processors: 2,
         guest_isa_level: "x86-64-v3",

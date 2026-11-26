@@ -21,6 +21,7 @@ use helios_profdata::{
 use helios_wit_rpc::inspector::helios::system::filters as system_filters;
 use helios_wit_rpc::inspector::helios::system::profiling as system_profiling;
 use helios_wit_rpc::inspector::helios::system::programs as system_programs;
+use helios_wit_rpc::inspector::helios::system::snapshot as system_snapshot;
 use helios_wit_rpc::inspector_fs;
 use helios_wit_rpc::inspector_snapshot as inspect;
 use helios_workspace_root::root_key::{
@@ -31,6 +32,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
+#[cfg(test)]
+use crate::connect_client;
+use crate::ready::BootExpectation;
 use crate::serial::RpcClient;
 use crate::stats_tui::format_bytes;
 use crate::system::{self, SystemError};
@@ -39,7 +43,8 @@ use crate::workload_bench::{
     WorkloadSelectionError, guest_step_under_deadline,
 };
 use crate::{
-    ConnectError, InterruptError, SessionCommand, SessionError, connect_client, run_connected,
+    ConnectError, InterruptError, SessionCommand, SessionError, connect_client_with_expectation,
+    run_connected,
 };
 
 mod disk;
@@ -201,6 +206,22 @@ pub(crate) enum VmConfigError {
     NoNativeAccelerator(#[from] NoNativeAccelerator),
     #[error("--data-disk-size must be greater than zero")]
     ZeroDataDiskSize,
+    #[error("--hibernate-disk-size must be greater than zero")]
+    ZeroHibernateDiskSize,
+    #[error("failed to read hibernate VM manifest {path}: {source}")]
+    ReadHibernateManifest {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to decode hibernate VM manifest {path}: {source}")]
+    DecodeHibernateManifest {
+        path: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("unsupported hibernate VM manifest version {version} in {path}")]
+    UnsupportedHibernateManifestVersion { path: String, version: u32 },
     #[error("{0}")]
     DiskSpec(#[from] DiskSpecError),
     #[error("--disk image {path} cannot be opened: {source}")]
@@ -425,6 +446,39 @@ pub(crate) enum VmRuntimeError {
         #[source]
         source: io::Error,
     },
+    #[error("failed to create hibernate disk image {path}: {source}")]
+    CreateHibernateDisk {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to size hibernate disk image {path}: {source}")]
+    SizeHibernateDisk {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("resume runtime directory is missing required disk image {path}")]
+    MissingResumeDisk { path: String },
+    #[error("failed to encode hibernate VM manifest {path}: {source}")]
+    EncodeHibernateManifest {
+        path: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to write hibernate VM manifest {path}: {source}")]
+    WriteHibernateManifest {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to rotate previous boot log {from} to {to}: {source}")]
+    RotateResumeLog {
+        from: String,
+        to: String,
+        #[source]
+        source: io::Error,
+    },
     #[error("QEMU option paths must be valid UTF-8: {path}")]
     OptionPathNotUtf8 { path: String },
     #[error("{env_var} does not point to a file: {path}")]
@@ -622,6 +676,34 @@ pub(crate) enum VmSessionError {
     Profiling(#[from] ProfilingStepError),
     #[error("{0}")]
     InstructionProfile(#[from] instruction_profile::InstructionProfileOutputError),
+    #[error("failed to run pre-hibernate guest command: {source}")]
+    HibernateBeforeShell {
+        #[source]
+        source: crate::programs::ProgramError,
+    },
+    #[error("pre-hibernate guest command exited with status {exit_code}")]
+    HibernateBeforeShellExited { exit_code: u32 },
+    #[error("failed to write pre-hibernate command output: {source}")]
+    HibernateBeforeShellOutput {
+        #[source]
+        source: io::Error,
+    },
+    #[error("guest refused hibernate: {error}")]
+    HibernateRefused { error: String },
+    #[error("timed out waiting {seconds}s for QEMU to power off after hibernate{detail}")]
+    HibernatePowerOffTimedOut { seconds: u64, detail: String },
+    #[error("QEMU exited abnormally ({status}) while powering off after hibernate{detail}")]
+    HibernatePowerOffFailed {
+        status: std::process::ExitStatus,
+        detail: String,
+    },
+    #[error("failed to poll QEMU exit state after hibernate: {source}")]
+    HibernatePollExit {
+        #[source]
+        source: io::Error,
+    },
+    #[error("guest panicked while hibernating (check debug-serial.log)")]
+    HibernateGuestPanicked,
 }
 
 /// One profiling RPC around a bench run, named by the step it was for.
@@ -731,6 +813,15 @@ const DEFAULT_DATA_DISK_BYTES: u64 = 256 * 1024 * 1024;
 /// The serial the guest kernel identifies its own disk by. Nothing else
 /// on the bus carries it, so the boot image is never mistaken for it.
 const DATA_DISK_SERIAL: &str = "helios-data";
+/// The serial the guest kernel identifies its dedicated hibernate disk by.
+const HIBERNATE_DISK_SERIAL: &str = "helios-hibernate";
+/// File name of the hibernate disk image inside the runtime directory.
+const HIBERNATE_DISK_FILE: &str = "hibernate.img";
+/// Typed JSON manifest saved in the runtime directory by `vm hibernate`
+/// and loaded by `vm --resume` to reproduce the exact machine identity.
+const HIBERNATE_MANIFEST_FILE: &str = "hibernate-vm.json";
+const HIBERNATE_MANIFEST_VERSION: u32 = 1;
+const DEFAULT_HIBERNATE_POWER_OFF_TIMEOUT_SECS: u64 = 60;
 /// Where `vm --debug` puts the gdbstub. QEMU binds `tcp::1234` on every
 /// interface, and whoever reaches the stub owns the guest's registers and
 /// memory, so the default names the loopback address; a wider bind is
@@ -845,7 +936,8 @@ enum VmHostShareProfile {
 }
 
 /// What the guest may do to the directory `--shared-dir` exports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 enum HostShareAccess {
     /// QEMU refuses every write the guest sends.
     ReadOnly,
@@ -938,7 +1030,7 @@ pub(crate) enum VmGpuRenderer {
 }
 
 /// A renderer a session asked for, and what the machine around it needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct VmRendererConfig {
     kind: VmGpuRenderer,
     /// The size of the host-visible aperture a mappable blob is placed
@@ -1029,7 +1121,8 @@ pub(crate) enum VmRpcTransport {
 /// The five are exclusive by construction rather than by a rule spread over
 /// booleans: each names one cargo profile, one `target/<triple>/` directory,
 /// and whether the image carries LLVM instrumentation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 enum KernelBuildProfile {
     /// Cargo's `dev` profile, the default.
     #[default]
@@ -1369,9 +1462,9 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     input: VmInputProfile::VirtioInputMmio,
     sound: VmSoundProfile::VirtioSoundMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
-    // The riscv kernel keeps its per-boot signing seed and takes no
-    // measured-boot device.
-    tpm: None,
+    // QEMU's riscv64 `virt` machine attaches `tpm-tis-device` on the platform
+    // bus; measured boot still requires a firmware event log (#1292).
+    tpm: Some(VmTpmProfile::TisMmio),
     profile_generate_linker_script: Some("riscv/profile-generate.x"),
     release_kernel_profile: false,
 };
@@ -1437,7 +1530,8 @@ pub(crate) enum VirtioCompletionOrder {
 
 /// Whether the machine's virtio-PCI devices sit behind its
 /// virtio-iommu.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum VirtioPlatformAccess {
     /// The device issues physical addresses.
     #[default]
@@ -1450,7 +1544,7 @@ pub(crate) enum VirtioPlatformAccess {
 /// The behaviour every virtio device the inspector creates is asked for:
 /// its virtqueue layout, and whether its DMA goes through the machine's
 /// translation unit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub(crate) struct VirtioDeviceProfile {
     ring: VirtioRingLayout,
     completion: VirtioCompletionOrder,
@@ -1657,7 +1751,8 @@ impl VmDisplayBackend {
 /// file and needs no host audio at all, so it is the sink a headless
 /// runner records with; anything else names a backend of the host's own
 /// and is QEMU's to refuse.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub(crate) enum VmAudioDev {
     #[default]
     None,
@@ -1809,6 +1904,8 @@ pub(crate) struct VmConfigFile {
     pub(crate) keep_runtime_dir: Option<bool>,
     #[serde(default)]
     pub(crate) data_disk_size: Option<u64>,
+    #[serde(default)]
+    pub(crate) hibernate_disk_size: Option<u64>,
     /// `--disk` entries, in the same `<image>,serial=<name>[,readonly]`
     /// form; the command line's are attached after these.
     #[serde(default)]
@@ -2031,6 +2128,19 @@ pub(crate) struct VmCommand {
     #[arg(long)]
     data_disk_size: Option<u64>,
 
+    /// Size of the dedicated hibernate disk (`hibernate.img`, serial `helios-hibernate`),
+    /// in bytes or QEMU size syntax (`256M`, `1G`).
+    #[arg(long, value_name = "SIZE", value_parser = qmp::parse_size)]
+    hibernate_disk_size: Option<u64>,
+
+    /// Resume a previously hibernated guest from its retained runtime directory.
+    ///
+    /// Loads `hibernate-vm.json` from `DIR`, reuses `data.img`, `hibernate.img`,
+    /// firmware NVRAM, and TPM state in place, verifies the guest resumes rather
+    /// than cold-booting, and then runs the requested session command.
+    #[arg(long, value_name = "DIR")]
+    resume: Option<PathBuf>,
+
     /// Attach a raw disk image the guest can mount, found by its serial:
     /// `<image>,serial=<name>[,readonly]`. Repeat for more disks.
     #[arg(long = "disk", value_name = "IMAGE,serial=NAME[,readonly]")]
@@ -2221,7 +2331,7 @@ pub(crate) struct VmCommand {
 
     /// Give the guest a TPM 2.0 for measured boot, emulated on the host:
     /// `swtpm` behind QEMU's `tpm-crb` on x86-64 and `tpm-tis-device` on
-    /// aarch64. Refused on riscv64, whose kernel takes none.
+    /// aarch64 and riscv64.
     #[arg(long, value_enum, value_name = "BACKEND")]
     tpm: Option<VmTpmBackend>,
 
@@ -2277,6 +2387,8 @@ enum VmSessionCommand {
     Instances(crate::InstancesCommand),
     AotBench(AotBenchCommand),
     WorkloadBench(WorkloadBenchCommand),
+    /// Trigger a guest hibernate and wait for QEMU to power off cleanly.
+    Hibernate(HibernateCommand),
     /// Move the guest's memory balloon and watch the guest follow.
     Balloon(BalloonCommand),
     /// Write the guest's current scanout to a PNG.
@@ -2338,6 +2450,30 @@ enum VmSessionCommand {
     NetSetup(NetSetupCommand),
     /// Remove the host state `net-setup` provisioned.
     NetTeardown(NetTeardownCommand),
+}
+
+/// Triggers a guest hibernate (`helios:system/snapshot.hibernate`), optionally
+/// running a guest shell command beforehand to establish live RAM state, and
+/// waits for QEMU to power off cleanly.
+#[derive(Debug, Clone, ClapArgs)]
+pub(crate) struct HibernateCommand {
+    /// Guest shell binary used to run `--before-command` prior to hibernating.
+    #[arg(
+        long = "before-shell",
+        value_name = "PATH",
+        default_value = "/bin/dash"
+    )]
+    before_shell: String,
+
+    /// Optional command run inside the guest via `--before-shell -c`
+    /// immediately before invoking the `hibernate` RPC.
+    #[arg(short = 'c', long = "before-command", value_name = "COMMAND")]
+    before_command: Option<String>,
+
+    /// Maximum seconds to wait for QEMU to power off cleanly after sending
+    /// the `hibernate` RPC.
+    #[arg(long, default_value_t = DEFAULT_HIBERNATE_POWER_OFF_TIMEOUT_SECS)]
+    power_off_timeout_seconds: u64,
 }
 
 /// Drives the QMP `balloon` command against the running guest.
@@ -2611,6 +2747,11 @@ struct ResolvedVmCommand {
     shared_dir: Option<PathBuf>,
     shared_dir_access: HostShareAccess,
     data_disk_bytes: u64,
+    /// Size of the dedicated `helios-hibernate` disk (`hibernate.img`), when
+    /// attached.
+    hibernate_disk_bytes: Option<u64>,
+    /// Whether this boot is resuming an earlier hibernated VM (`--resume`).
+    resume: bool,
     /// `--disk` images, their paths canonical, in attach order.
     disks: Vec<VmDiskSpec>,
     gdb: Option<String>,
@@ -2651,6 +2792,7 @@ struct ResolvedVmCommand {
 #[derive(Debug, Clone)]
 enum ResolvedVmSessionCommand {
     Session(SessionCommand),
+    Hibernate(HibernateCommand),
     AotBench(AotBenchCommand),
     WorkloadBench(WorkloadBenchCommand),
     Balloon(BalloonCommand),
@@ -2673,6 +2815,7 @@ impl ResolvedVmSessionCommand {
             Self::Screendump(_) => Some("screendump"),
             Self::Input(_) => Some("input"),
             Self::Session(_)
+            | Self::Hibernate(_)
             | Self::AotBench(_)
             | Self::WorkloadBench(_)
             | Self::Profile(_)
@@ -3176,7 +3319,272 @@ fn smp_argument(smp: u16, max_processors: Option<u16>) -> String {
     }
 }
 
+/// Persisted VM hardware and boot-artifact specification saved by `vm hibernate`
+/// into `<runtime-dir>/hibernate-vm.json` so `vm --resume <runtime-dir>`
+/// reconstructs the exact machine identity (`HibernateIdentity`) and reuses
+/// the same disks, firmware NVRAM, and TPM state directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HibernateVmManifest {
+    version: u32,
+    arch: VmArch,
+    build_kind: KernelBuildProfile,
+    qemu_bin: PathBuf,
+    kernel: PathBuf,
+    bootfs: PathBuf,
+    uefi_image: Option<PathBuf>,
+    smp: u16,
+    max_processors: Option<u16>,
+    memory: String,
+    numa_nodes: Option<u16>,
+    numa_distance: Option<u8>,
+    guest_ram: VmGuestRam,
+    bios: Option<String>,
+    baud: u32,
+    cpu: Option<String>,
+    accel: Vec<String>,
+    shared_dir: Option<PathBuf>,
+    shared_dir_access: HostShareAccess,
+    data_disk_bytes: u64,
+    hibernate_disk_bytes: Option<u64>,
+    disks: Vec<VmDiskSpec>,
+    qemu_arg: Vec<String>,
+    acpi: bool,
+    iommu: bool,
+    mte: bool,
+    desktop: bool,
+    display: VmDisplayBackend,
+    renderer: Option<VmRendererConfig>,
+    audiodev: VmAudioDev,
+    tpm: Option<VmTpmBackend>,
+    tpm_state_dir: Option<PathBuf>,
+    virtio_devices: VirtioDeviceProfile,
+    rpc_transport: VmRpcTransport,
+    vsock_cid: u32,
+    network: VmNetworkFile,
+}
+
+impl HibernateVmManifest {
+    fn from_resolved(command: &ResolvedVmCommand, runtime_dir: &Path, artifact: &Path) -> Self {
+        let canonical_or =
+            |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let uefi_image = (command.profile.boot_artifact == VmBootArtifactKind::LimineUefiDiskImage)
+            .then(|| canonical_or(artifact));
+        let guest_ram = match command.guest_ram {
+            ResolvedGuestRam::Lazy => VmGuestRam::Lazy,
+            ResolvedGuestRam::Prealloc { .. } => VmGuestRam::Prealloc,
+        };
+        let (tpm, tpm_state_dir) = match &command.tpm {
+            Some(tpm) => (
+                Some(tpm.backend()),
+                Some(canonical_or(&tpm.state_dir(runtime_dir))),
+            ),
+            None => (None, None),
+        };
+        Self {
+            version: HIBERNATE_MANIFEST_VERSION,
+            arch: command.profile.arch,
+            build_kind: command.build.kind,
+            qemu_bin: command.qemu_bin.clone(),
+            kernel: canonical_or(&command.kernel),
+            bootfs: canonical_or(&command.bootfs),
+            uefi_image,
+            smp: command.smp,
+            max_processors: command.max_processors,
+            memory: command.memory.clone(),
+            numa_nodes: command.numa.as_ref().map(NumaMachine::nodes),
+            numa_distance: command.numa.as_ref().and_then(NumaMachine::distance),
+            guest_ram,
+            bios: command.bios.clone(),
+            baud: command.baud,
+            cpu: command.cpu.clone(),
+            accel: command.accel.clone(),
+            shared_dir: command.shared_dir.clone(),
+            shared_dir_access: command.shared_dir_access,
+            data_disk_bytes: command.data_disk_bytes,
+            hibernate_disk_bytes: command.hibernate_disk_bytes,
+            disks: command.disks.clone(),
+            qemu_arg: command.qemu_arg.clone(),
+            acpi: command.acpi,
+            iommu: command.iommu,
+            mte: command.mte,
+            desktop: command.desktop,
+            display: command.display,
+            renderer: command.renderer.clone(),
+            audiodev: command.audiodev.clone(),
+            tpm,
+            tpm_state_dir,
+            virtio_devices: command.virtio_devices,
+            rpc_transport: command.rpc_transport,
+            vsock_cid: command.vsock_cid,
+            network: command.network.to_file(),
+        }
+    }
+}
+
+fn write_hibernate_manifest(
+    command: &ResolvedVmCommand,
+    runtime_dir: &Path,
+    artifact: &Path,
+) -> Result<(), VmRuntimeError> {
+    let manifest_path = runtime_dir.join(HIBERNATE_MANIFEST_FILE);
+    let manifest = HibernateVmManifest::from_resolved(command, runtime_dir, artifact);
+    let bytes = serde_json::to_vec_pretty(&manifest).map_err(|source| {
+        VmRuntimeError::EncodeHibernateManifest {
+            path: manifest_path.display().to_string(),
+            source,
+        }
+    })?;
+    fs::write(&manifest_path, bytes).map_err(|source| VmRuntimeError::WriteHibernateManifest {
+        path: manifest_path.display().to_string(),
+        source,
+    })
+}
+
+fn resolve_resume(
+    resume_dir: PathBuf,
+    mut command: VmCommand,
+) -> Result<ResolvedVmCommand, VmConfigError> {
+    let manifest_path = resume_dir.join(HIBERNATE_MANIFEST_FILE);
+    let bytes =
+        fs::read(&manifest_path).map_err(|source| VmConfigError::ReadHibernateManifest {
+            path: manifest_path.display().to_string(),
+            source,
+        })?;
+    let manifest: HibernateVmManifest = serde_json::from_slice(&bytes).map_err(|source| {
+        VmConfigError::DecodeHibernateManifest {
+            path: manifest_path.display().to_string(),
+            source,
+        }
+    })?;
+    if manifest.version != HIBERNATE_MANIFEST_VERSION {
+        return Err(VmConfigError::UnsupportedHibernateManifestVersion {
+            path: manifest_path.display().to_string(),
+            version: manifest.version,
+        });
+    }
+    let session_command: Option<ResolvedVmSessionCommand> = command.command.take().map(Into::into);
+    let profile = manifest.arch.profile();
+    let build = KernelBuildSpec {
+        profile,
+        kind: manifest.build_kind,
+        profile_use: None,
+        kernel_features: Vec::new(),
+        boot_programs: Vec::new(),
+        guest_programs_profile: None,
+        prebuilt_wasm: None,
+        skip_kernel_build: true,
+        no_compiler_plugin: false,
+        root_secret_key: None,
+        bootfs_root: None,
+        init_wasm: None,
+        components: None,
+    };
+    let numa = NumaMachine::resolve(
+        manifest.numa_nodes,
+        manifest.numa_distance,
+        manifest.smp,
+        manifest.max_processors,
+        &manifest.memory,
+    )?;
+    let guest_ram = ResolvedGuestRam::resolve(manifest.guest_ram)?;
+    let tpm = VmTpm::resolve(
+        manifest.tpm,
+        manifest.tpm_state_dir,
+        profile.tpm,
+        arch_label(manifest.arch),
+    )?;
+    if manifest.rpc_transport == VmRpcTransport::Vsock {
+        crate::vsock::preflight()?;
+        if command.serial_stdio || command.serial_pty {
+            return Err(VmConfigError::VsockWithSerialConsole);
+        }
+        if manifest.vsock_cid < 3 {
+            return Err(VmConfigError::ReservedVsockCid);
+        }
+    }
+    let effective_profile = profile.for_iommu(manifest.iommu);
+    let network = VmNetwork::resolve(command.network, manifest.network);
+    let qemu_net = effective_profile
+        .network
+        .map(|device| {
+            network.render(
+                device,
+                manifest.virtio_devices,
+                manifest.smp,
+                HostPlatform::current(),
+            )
+        })
+        .transpose()?;
+    if command.gdb_wait && command.gdb.is_none() {
+        return Err(VmConfigError::GdbWaitWithoutGdb);
+    }
+    if command.serial_stdio && matches!(command.monitor.as_deref(), Some("stdio")) {
+        return Err(VmConfigError::SerialStdioWithMonitorStdio);
+    }
+
+    Ok(ResolvedVmCommand {
+        profile,
+        build,
+        qemu_bin: manifest.qemu_bin,
+        kernel: manifest.kernel,
+        bootfs: manifest.bootfs,
+        uefi_image: manifest.uefi_image,
+        socket: command.socket,
+        serial_stdio: command.serial_stdio,
+        serial_pty: command.serial_pty,
+        no_build: true,
+        smp: manifest.smp,
+        max_processors: manifest.max_processors,
+        memory: manifest.memory,
+        numa,
+        guest_ram,
+        bios: manifest.bios,
+        baud: manifest.baud,
+        cpu: manifest.cpu,
+        accel: manifest.accel,
+        shared_dir: manifest.shared_dir,
+        shared_dir_access: manifest.shared_dir_access,
+        data_disk_bytes: manifest.data_disk_bytes,
+        hibernate_disk_bytes: manifest.hibernate_disk_bytes,
+        resume: true,
+        disks: manifest.disks,
+        gdb: command.gdb,
+        gdb_wait: command.gdb_wait,
+        monitor: command.monitor,
+        qmp: command.qmp,
+        qemu_log: command.qemu_log,
+        debug_serial_log: command.debug_serial_log,
+        qemu_trace: command.qemu_trace,
+        qemu_trace_log: command.qemu_trace_log,
+        qemu_arg: manifest.qemu_arg,
+        enable_targets: command.enable_targets,
+        kill_after_lines: command.kill_after_lines,
+        runtime_dir: Some(resume_dir),
+        keep_runtime_dir: true,
+        acpi: manifest.acpi,
+        iommu: manifest.iommu,
+        mte: manifest.mte,
+        desktop: manifest.desktop,
+        display: manifest.display,
+        renderer: manifest.renderer,
+        audiodev: manifest.audiodev,
+        tpm,
+        virtio_devices: manifest.virtio_devices,
+        rpc_transport: manifest.rpc_transport,
+        vsock_cid: manifest.vsock_cid,
+        network,
+        qemu_net,
+        needs_qmp: session_command
+            .as_ref()
+            .is_some_and(ResolvedVmSessionCommand::needs_qmp),
+        command: session_command,
+    })
+}
+
 fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
+    if let Some(resume_dir) = command.resume.take() {
+        return resolve_resume(resume_dir, command);
+    }
     let file = load_config_file(command.config.as_deref())?;
     let session_command: Option<ResolvedVmSessionCommand> = command.command.take().map(Into::into);
     let mut build = resolve_build(&command, &file, session_command.as_ref())?;
@@ -3347,7 +3755,11 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
     if data_disk_bytes == 0 {
         return Err(VmConfigError::ZeroDataDiskSize);
     }
-    let disks = resolve_disks(file.disk, command.disks)?;
+    let hibernate_disk_bytes = command.hibernate_disk_size.or(file.hibernate_disk_size);
+    if hibernate_disk_bytes == Some(0) {
+        return Err(VmConfigError::ZeroHibernateDiskSize);
+    }
+    let disks = resolve_disks(file.disk, command.disks, hibernate_disk_bytes.is_some())?;
     let gdb = command
         .gdb
         .or(file.gdb)
@@ -3391,8 +3803,13 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
     let mut enable_targets = file.enable_targets;
     enable_targets.extend(command.enable_targets);
     let runtime_dir = command.runtime_dir.or(file.runtime_dir);
-    let keep_runtime_dir =
-        debug || command.keep_runtime_dir || file.keep_runtime_dir.unwrap_or(false);
+    let keep_runtime_dir = debug
+        || command.keep_runtime_dir
+        || file.keep_runtime_dir.unwrap_or(false)
+        || matches!(
+            session_command,
+            Some(ResolvedVmSessionCommand::Hibernate(_))
+        );
     let acpi = command.acpi || file.acpi.unwrap_or(false);
     if acpi && profile.acpi_machine.is_none() {
         return Err(VmConfigError::AcpiUnavailable {
@@ -3477,6 +3894,8 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         shared_dir,
         shared_dir_access,
         data_disk_bytes,
+        hibernate_disk_bytes,
+        resume: false,
         disks,
         gdb,
         gdb_wait,
@@ -4134,6 +4553,11 @@ fn connect_and_run(
         command.kernel.clone(),
     );
     let client_identity = resolve_vm_client_identity(command, ops)?;
+    let boot_expectation = if command.resume {
+        BootExpectation::Resume
+    } else {
+        BootExpectation::ColdBoot
+    };
     let (client, target_uri) = match runtime.take_transport()? {
         VmTransport::SerialSocket(socket_path) => {
             let socket = socket_path
@@ -4142,19 +4566,28 @@ fn connect_and_run(
                     path: socket_path.display().to_string(),
                 })?;
             let uri = format!("serial://{socket}?baud={}", command.baud);
-            let client = connect_client(socket, command.baud, true, Some(&client_identity))
-                .map_err(|source| VmSessionError::Connect { over: "", source })?;
+            let client = connect_client_with_expectation(
+                socket,
+                command.baud,
+                Some(boot_expectation),
+                Some(&client_identity),
+            )
+            .map_err(|source| VmSessionError::Connect { over: "", source })?;
             (client, Some(uri))
         }
         VmTransport::SerialIo(io) => {
             let identity = client_identity.clone();
             let client = crate::runtime::block_on(async move {
-                crate::ready::connect_after_boot(io, Some(&identity))
-                    .await
-                    .map_err(|error| VmSessionError::Connect {
-                        over: " over QEMU stdio serial",
-                        source: ConnectError::from(error),
-                    })
+                crate::ready::connect_after_boot_with_expectation(
+                    io,
+                    Some(&identity),
+                    boot_expectation,
+                )
+                .await
+                .map_err(|error| VmSessionError::Connect {
+                    over: " over QEMU stdio serial",
+                    source: ConnectError::from(error),
+                })
             })?;
             (client, None)
         }
@@ -4179,7 +4612,7 @@ fn connect_and_run(
                     .await
                     .map_err(ConnectError::from)?;
                 let (read, _write) = io.into_split();
-                let read = crate::ready::wait_for_boot(read)
+                let read = crate::ready::wait_for_boot_with_expectation(read, boot_expectation)
                     .await
                     .map_err(ConnectError::from)?;
                 // The console echo starts before the RPC connection, not
@@ -4234,6 +4667,9 @@ fn connect_and_run(
         })?;
     }
     match command.command.clone() {
+        Some(ResolvedVmSessionCommand::Hibernate(hibernate)) => {
+            run_hibernate(client, hibernate, runtime)
+        }
         Some(ResolvedVmSessionCommand::AotBench(aot_command)) => {
             run_aot_bench(client, aot_command, vcpus, command.kernel.clone())
         }
@@ -4300,6 +4736,71 @@ enum VsockSessionError {
         #[from]
         source: ConnectError,
     },
+}
+
+/// Runs the optional `--before-command` inside the guest, triggers
+/// `helios:system/snapshot.hibernate`, and waits for QEMU to power off cleanly.
+fn run_hibernate(
+    client: RpcClient,
+    command: HibernateCommand,
+    runtime: &mut VmRuntime,
+) -> Result<(), VmSessionError> {
+    use std::io::Write as _;
+
+    let rpc_timeout = Duration::from_secs(command.power_off_timeout_seconds.max(600));
+    let power_off_timeout = Duration::from_secs(command.power_off_timeout_seconds);
+
+    let rpc_detail: Option<String> = crate::runtime::block_on(async move {
+        if let Some(script) = &command.before_command {
+            let result = crate::programs::exec(
+                &client,
+                &command.before_shell,
+                &["-c".to_owned(), script.clone()],
+            )
+            .await
+            .map_err(|source| VmSessionError::HibernateBeforeShell { source })?;
+            {
+                let mut stdout = io::stdout().lock();
+                stdout
+                    .write_all(&result.output.stdout)
+                    .map_err(|source| VmSessionError::HibernateBeforeShellOutput { source })?;
+                stdout
+                    .flush()
+                    .map_err(|source| VmSessionError::HibernateBeforeShellOutput { source })?;
+            }
+            {
+                let mut stderr = io::stderr().lock();
+                stderr
+                    .write_all(&result.output.stderr)
+                    .map_err(|source| VmSessionError::HibernateBeforeShellOutput { source })?;
+                stderr
+                    .flush()
+                    .map_err(|source| VmSessionError::HibernateBeforeShellOutput { source })?;
+            }
+            if result.exit_code != 0 {
+                return Err(VmSessionError::HibernateBeforeShellExited {
+                    exit_code: result.exit_code,
+                });
+            }
+        }
+
+        let snapshot_client = system_snapshot::RpcClient::new(client.peer());
+        let outcome = crate::runtime::timeout(rpc_timeout, snapshot_client.hibernate()).await;
+        drop(client);
+        match outcome {
+            Some(Ok(Err(error))) => Err(VmSessionError::HibernateRefused {
+                error: format!("{error:?}"),
+            }),
+            Some(Ok(Ok(()))) => Ok(None),
+            Some(Err(rpc_error)) => Ok(Some(format!(" (RPC closed with: {rpc_error})"))),
+            None => Err(VmSessionError::HibernatePowerOffTimedOut {
+                seconds: rpc_timeout.as_secs(),
+                detail: " while awaiting hibernate RPC".to_owned(),
+            }),
+        }
+    })?;
+
+    runtime.wait_for_clean_exit(power_off_timeout, rpc_detail.as_deref().unwrap_or(""))
 }
 
 /// Moves the guest's balloon through the targets the caller named,
@@ -6440,9 +6941,26 @@ impl VmRuntime {
         if !command.serial_stdio && serial_pty.is_none() {
             prepare_socket_path(&socket_path)?;
         }
+        if command.resume {
+            rotate_resume_log(&qemu_log)?;
+            if !command.serial_stdio && serial_pty.is_none() {
+                let serial_log = command
+                    .debug_serial_log
+                    .clone()
+                    .unwrap_or_else(|| runtime_dir.path().join(DEBUG_SERIAL_LOG_NAME));
+                rotate_resume_log(&serial_log)?;
+            }
+        }
         prepare_log_path(&qemu_log)?;
         let artifact = prepare_boot_artifact(command, Some(runtime_dir.path()))?;
         let data_disk = prepare_data_disk(command, runtime_dir.path())?;
+        let hibernate_disk = prepare_hibernate_disk(command, runtime_dir.path())?;
+        if matches!(
+            command.command,
+            Some(ResolvedVmSessionCommand::Hibernate(_))
+        ) {
+            write_hibernate_manifest(command, runtime_dir.path(), &artifact)?;
+        }
         // QEMU connects to the emulator's control socket while it builds
         // the machine, so the emulator is listening first.
         let swtpm = command
@@ -6576,7 +7094,13 @@ impl VmRuntime {
             }
             VmBootArtifactKind::LimineUefiDiskImage => {}
         }
-        configure_machine_devices(&mut qemu, command, &artifact, &data_disk);
+        configure_machine_devices(
+            &mut qemu,
+            command,
+            &artifact,
+            &data_disk,
+            hibernate_disk.as_deref(),
+        );
         if let (Some(tpm), Some(swtpm)) = (&command.tpm, &swtpm) {
             tpm.apply(&mut qemu, &qemu_option_value(swtpm.socket())?);
         }
@@ -6676,6 +7200,48 @@ impl VmRuntime {
             self.qemu_log.display(),
             tail.trim()
         )
+    }
+
+    fn wait_for_clean_exit(
+        &mut self,
+        timeout: Duration,
+        detail: &str,
+    ) -> Result<(), VmSessionError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self
+                .child
+                .try_wait()
+                .map_err(|source| VmSessionError::HibernatePollExit { source })?
+            {
+                Some(status) => {
+                    if !status.success() {
+                        return Err(VmSessionError::HibernatePowerOffFailed {
+                            status,
+                            detail: detail.to_owned(),
+                        });
+                    }
+                    if let Some(log_path) = &self.debug_serial_log
+                        && let Ok(bytes) = fs::read(log_path)
+                    {
+                        let text = String::from_utf8_lossy(&bytes);
+                        if text.contains("panicked at") || text.contains("Kernel panic") {
+                            return Err(VmSessionError::HibernateGuestPanicked);
+                        }
+                    }
+                    return Ok(());
+                }
+                None if Instant::now() < deadline => {
+                    std::thread::sleep(SOCKET_POLL_INTERVAL);
+                }
+                None => {
+                    return Err(VmSessionError::HibernatePowerOffTimedOut {
+                        seconds: timeout.as_secs(),
+                        detail: detail.to_owned(),
+                    });
+                }
+            }
+        }
     }
 
     fn shutdown(&mut self) {
@@ -6964,7 +7530,8 @@ fn repo_root() -> Result<PathBuf, WorkspaceRootError> {
     Ok(WorkspaceRoot::resolve(None)?.path().to_path_buf())
 }
 
-/// Creates the scratch disk image this VM's guest kernel will own.
+/// Creates the scratch disk image this VM's guest kernel will own, or reuses
+/// the existing image in place when resuming a hibernated VM.
 ///
 /// It lives in the runtime directory, so every VM gets a disk of its own
 /// and a retained runtime directory keeps whatever the guest wrote.
@@ -6973,6 +7540,14 @@ fn prepare_data_disk(
     runtime_dir: &Path,
 ) -> Result<PathBuf, VmRuntimeError> {
     let image = runtime_dir.join("data.img");
+    if command.resume {
+        if !image.is_file() {
+            return Err(VmRuntimeError::MissingResumeDisk {
+                path: image.display().to_string(),
+            });
+        }
+        return Ok(image);
+    }
     let file = fs::File::create(&image).map_err(|source| VmRuntimeError::CreateDataDisk {
         path: image.display().to_string(),
         source,
@@ -6983,6 +7558,57 @@ fn prepare_data_disk(
             source,
         })?;
     Ok(image)
+}
+
+/// Creates the dedicated hibernate disk image (`hibernate.img`, serial
+/// `helios-hibernate`) when `--hibernate-disk-size` is configured, or reuses
+/// the existing image in place on `--resume`.
+fn prepare_hibernate_disk(
+    command: &ResolvedVmCommand,
+    runtime_dir: &Path,
+) -> Result<Option<PathBuf>, VmRuntimeError> {
+    let Some(bytes) = command.hibernate_disk_bytes else {
+        return Ok(None);
+    };
+    let image = runtime_dir.join(HIBERNATE_DISK_FILE);
+    if command.resume {
+        if !image.is_file() {
+            return Err(VmRuntimeError::MissingResumeDisk {
+                path: image.display().to_string(),
+            });
+        }
+        return Ok(Some(image));
+    }
+    let file = fs::File::create(&image).map_err(|source| VmRuntimeError::CreateHibernateDisk {
+        path: image.display().to_string(),
+        source,
+    })?;
+    file.set_len(bytes)
+        .map_err(|source| VmRuntimeError::SizeHibernateDisk {
+            path: image.display().to_string(),
+            source,
+        })?;
+    Ok(Some(image))
+}
+
+fn rotate_resume_log(path: &Path) -> Result<(), VmRuntimeError> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "boot.log".to_owned());
+    let rotated_name = match file_name.rsplit_once('.') {
+        Some((stem, ext)) => format!("{stem}.pre-resume.{ext}"),
+        None => format!("{file_name}.pre-resume"),
+    };
+    let destination = path.with_file_name(rotated_name);
+    fs::rename(path, &destination).map_err(|source| VmRuntimeError::RotateResumeLog {
+        from: path.display().to_string(),
+        to: destination.display().to_string(),
+        source,
+    })
 }
 
 fn configure_firmware(
@@ -6996,13 +7622,15 @@ fn configure_firmware(
     }
     if command.profile.boot_artifact == VmBootArtifactKind::LimineUefiDiskImage {
         let code = discover_qemu_edk2_code(command.profile.arch, &command.qemu_bin)?;
-        let vars_template = discover_qemu_edk2_vars(command.profile.arch, &code)?;
         let vars = runtime_dir.join(format!("edk2-{}-vars.fd", arch_label(command.profile.arch)));
-        fs::copy(&vars_template, &vars).map_err(|source| VmRuntimeError::Edk2VarsCopy {
-            vars: vars.display().to_string(),
-            template: vars_template.display().to_string(),
-            source,
-        })?;
+        if !(command.resume && vars.is_file()) {
+            let vars_template = discover_qemu_edk2_vars(command.profile.arch, &code)?;
+            fs::copy(&vars_template, &vars).map_err(|source| VmRuntimeError::Edk2VarsCopy {
+                vars: vars.display().to_string(),
+                template: vars_template.display().to_string(),
+                source,
+            })?;
+        }
         qemu.arg("-drive").arg(format!(
             "if=pflash,format=raw,readonly=on,file={}",
             code.display()
@@ -7158,19 +7786,53 @@ fn configure_data_disk(
     qemu.arg("-device").arg(device.to_string());
 }
 
+/// Attaches the dedicated hibernate disk (`serial=helios-hibernate`) on the
+/// profile's block transport.
+fn configure_hibernate_disk(
+    qemu: &mut Command,
+    data_disk: VmDataDiskProfile,
+    image: &Path,
+    queues: VirtioDeviceProfile,
+) {
+    let mut drive = QemuOptions::keyed();
+    drive.set("if", "none");
+    drive.set("format", "raw");
+    drive.set("file", image.display());
+    drive.set("id", "hibernate");
+    qemu.arg("-drive").arg(drive.to_string());
+    let mut device = QemuOptions::new(match data_disk {
+        VmDataDiskProfile::VirtioMmio => "virtio-blk-device",
+        VmDataDiskProfile::VirtioPci => "virtio-blk-pci",
+    });
+    device.set("drive", "hibernate");
+    device.set("serial", HIBERNATE_DISK_SERIAL);
+    apply_transport(
+        data_disk == VmDataDiskProfile::VirtioPci,
+        queues,
+        &mut device,
+    );
+    qemu.arg("-device").arg(device.to_string());
+}
+
 /// The `--disk` images to attach: the config file's, then the command
 /// line's, each image opened by its canonical path so a relative path
 /// means the same disk whatever directory QEMU runs in.
 fn resolve_disks(
     file: Vec<String>,
     command: Vec<VmDiskSpec>,
+    reserve_hibernate_serial: bool,
 ) -> Result<Vec<VmDiskSpec>, VmConfigError> {
     let mut disks = file
         .iter()
         .map(|spec| spec.parse::<VmDiskSpec>())
         .collect::<Result<Vec<_>, _>>()?;
     disks.extend(command);
-    validate_disks(&disks, DATA_DISK_SERIAL)?;
+    let reserved: &[&str] = if reserve_hibernate_serial {
+        &[DATA_DISK_SERIAL, HIBERNATE_DISK_SERIAL]
+    } else {
+        &[DATA_DISK_SERIAL]
+    };
+    validate_disks(&disks, reserved)?;
     for disk in &mut disks {
         disk.image = fs::canonicalize(&disk.image).map_err(|source| VmConfigError::DiskImage {
             path: disk.image.display().to_string(),
@@ -7337,6 +7999,7 @@ fn configure_machine_devices(
     command: &ResolvedVmCommand,
     artifact: &Path,
     data_disk: &Path,
+    hibernate_disk: Option<&Path>,
 ) {
     let effective = command.profile.for_iommu(command.iommu);
     // The unit has to be realised before the functions it protects:
@@ -7353,6 +8016,14 @@ fn configure_machine_devices(
         configure_boot_disk(qemu, boot_disk, artifact, command.virtio_devices);
     }
     configure_data_disk(qemu, effective.data_disk, data_disk, command.virtio_devices);
+    if let Some(hibernate_disk) = hibernate_disk {
+        configure_hibernate_disk(
+            qemu,
+            effective.data_disk,
+            hibernate_disk,
+            command.virtio_devices,
+        );
+    }
     configure_disks(
         qemu,
         effective.data_disk,
@@ -7626,6 +8297,7 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Instances(command) => {
                 Self::Session(SessionCommand::Instances(command))
             }
+            VmSessionCommand::Hibernate(command) => Self::Hibernate(command),
             VmSessionCommand::AotBench(command) => Self::AotBench(command),
             VmSessionCommand::WorkloadBench(command) => Self::WorkloadBench(command),
             VmSessionCommand::Balloon(command) => Self::Balloon(command),
@@ -9523,6 +10195,8 @@ mod tests {
             shared_dir: None,
             shared_dir_writable: false,
             data_disk_size: None,
+            hibernate_disk_size: None,
+            resume: None,
             disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
@@ -9604,6 +10278,8 @@ mod tests {
             shared_dir: None,
             shared_dir_writable: false,
             data_disk_size: None,
+            hibernate_disk_size: None,
+            resume: None,
             disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
@@ -10066,7 +10742,7 @@ mod tests {
             }
 
             let mut qemu = Command::new("qemu");
-            configure_machine_devices(&mut qemu, &resolved, &artifact, &data_disk);
+            configure_machine_devices(&mut qemu, &resolved, &artifact, &data_disk, None);
             let args: Vec<String> = qemu
                 .get_args()
                 .map(|argument| argument.to_string_lossy().into_owned())
@@ -10154,7 +10830,7 @@ mod tests {
             })
             .expect("default non-IOMMU boot resolves");
             let mut qemu = Command::new("qemu");
-            configure_machine_devices(&mut qemu, &resolved, &artifact, &data_disk);
+            configure_machine_devices(&mut qemu, &resolved, &artifact, &data_disk, None);
             let args: Vec<String> = qemu
                 .get_args()
                 .map(|argument| argument.to_string_lossy().into_owned())
@@ -10283,17 +10959,20 @@ mod tests {
         );
     }
 
-    /// aarch64 puts its TPM on the platform bus in both firmware
-    /// descriptions; riscv64 takes none, and says so before anything is
-    /// built.
+    /// aarch64 and riscv64 put their TPM on the platform bus; `--tpm-state`
+    /// without `--tpm` is still refused before anything is built.
     #[test]
     fn the_tpm_front_end_follows_the_machine() {
         let tempdir =
             tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
         let config = tempdir.path().join("missing-vm.json");
-        for acpi in [false, true] {
+        for (arch, acpi) in [
+            (VmArch::Aarch64, false),
+            (VmArch::Aarch64, true),
+            (VmArch::Riscv64, false),
+        ] {
             let tpm = resolve(VmCommand {
-                arch: VmArch::Aarch64,
+                arch,
                 acpi,
                 tpm: Some(VmTpmBackend::Swtpm),
                 config: Some(config.clone()),
@@ -10307,23 +10986,9 @@ mod tests {
             assert!(
                 qemu.get_args()
                     .any(|argument| argument == "tpm-tis-device,tpmdev=tpm0"),
-                "acpi={acpi}"
+                "arch={arch:?} acpi={acpi}"
             );
         }
-        let error = resolve(VmCommand {
-            arch: VmArch::Riscv64,
-            tpm: Some(VmTpmBackend::Swtpm),
-            config: Some(config.clone()),
-            ..minimal_command()
-        })
-        .expect_err("riscv64 takes no measured-boot device");
-        assert!(
-            matches!(
-                error,
-                VmConfigError::Tpm(VmTpmError::Unavailable { arch: "riscv64" })
-            ),
-            "{error}"
-        );
         let error = resolve(VmCommand {
             tpm_state: Some(tempdir.path().join("tpm-state")),
             config: Some(config),
@@ -10405,6 +11070,8 @@ mod tests {
             shared_dir: None,
             shared_dir_writable: false,
             data_disk_size: None,
+            hibernate_disk_size: None,
+            resume: None,
             disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
@@ -10676,6 +11343,8 @@ mod tests {
             shared_dir: None,
             shared_dir_access: HostShareAccess::ReadOnly,
             data_disk_bytes: DEFAULT_DATA_DISK_BYTES,
+            hibernate_disk_bytes: None,
+            resume: false,
             disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
@@ -10903,6 +11572,8 @@ mod tests {
             shared_dir: Some(repo_root().expect("workspace root must resolve")),
             shared_dir_access: HostShareAccess::ReadOnly,
             data_disk_bytes: DEFAULT_DATA_DISK_BYTES,
+            hibernate_disk_bytes: None,
+            resume: false,
             disks: Vec::new(),
             gdb: None,
             gdb_wait: false,
@@ -11441,6 +12112,193 @@ mod tests {
         assert!(
             rendered.contains(&prebuild_dir.display().to_string()),
             "{rendered}"
+        );
+    }
+
+    #[test]
+    fn hibernate_disk_flag_and_attachment_work_across_profiles() {
+        use clap::Parser;
+
+        let parsed = crate::Args::try_parse_from([
+            "helios-inspector",
+            "vm",
+            "--arch",
+            "x86-64",
+            "--accel",
+            "tcg",
+            "--hibernate-disk-size",
+            "256M",
+            "hibernate",
+            "--before-shell",
+            "/bin/dash",
+            "-c",
+            "echo live > /tmp/state",
+        ])
+        .expect("vm --hibernate-disk-size 256M hibernate parses");
+        let Some(crate::Command::Vm(vm)) = parsed.command else {
+            panic!("expected Vm command");
+        };
+        assert_eq!(vm.hibernate_disk_size, Some(256 * 1024 * 1024));
+        assert!(matches!(
+            vm.command,
+            Some(VmSessionCommand::Hibernate(ref h))
+                if h.before_shell == "/bin/dash"
+                    && h.before_command.as_deref() == Some("echo live > /tmp/state")
+        ));
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = tempdir.path().join("missing-vm.json");
+        let zero = resolve(VmCommand {
+            hibernate_disk_size: Some(0),
+            config: Some(config.clone()),
+            ..minimal_command()
+        })
+        .expect_err("zero hibernate disk size must be refused");
+        assert!(matches!(zero, VmConfigError::ZeroHibernateDiskSize));
+
+        let raw_disk = tempdir.path().join("extra.img");
+        fs::write(&raw_disk, b"").expect("create dummy disk");
+        let spec: VmDiskSpec = format!("{},serial=helios-hibernate", raw_disk.display())
+            .parse()
+            .expect("valid disk spec");
+        // Allowed via --disk when --hibernate-disk-size is not set (e.g. refusal smokes).
+        let explicit = resolve(VmCommand {
+            disks: vec![spec.clone()],
+            config: Some(config.clone()),
+            ..minimal_command()
+        })
+        .expect("explicit --disk serial=helios-hibernate allowed without --hibernate-disk-size");
+        assert_eq!(explicit.disks.len(), 1);
+
+        // Refused when --hibernate-disk-size already owns `helios-hibernate`.
+        let conflict = resolve(VmCommand {
+            hibernate_disk_size: Some(64 * 1024 * 1024),
+            disks: vec![spec],
+            config: Some(config.clone()),
+            ..minimal_command()
+        })
+        .expect_err("conflicting --disk serial=helios-hibernate must be refused");
+        assert!(matches!(conflict, VmConfigError::DiskSpec(_)));
+
+        let artifact = tempdir.path().join("boot.img");
+        let data_disk = tempdir.path().join("data.img");
+        let hib_disk = tempdir.path().join("hibernate.img");
+        for (arch, iommu, expected_dev) in [
+            (
+                VmArch::X86_64,
+                false,
+                "virtio-blk-pci,drive=hibernate,serial=helios-hibernate",
+            ),
+            (
+                VmArch::Aarch64,
+                false,
+                "virtio-blk-device,drive=hibernate,serial=helios-hibernate",
+            ),
+            (
+                VmArch::Aarch64,
+                true,
+                "virtio-blk-pci,drive=hibernate,serial=helios-hibernate,disable-legacy=on,iommu_platform=on",
+            ),
+            (
+                VmArch::Riscv64,
+                false,
+                "virtio-blk-device,drive=hibernate,serial=helios-hibernate",
+            ),
+        ] {
+            let resolved = resolve(VmCommand {
+                arch,
+                iommu,
+                hibernate_disk_size: Some(256 * 1024 * 1024),
+                config: Some(config.clone()),
+                ..minimal_command()
+            })
+            .expect("resolve with hibernate disk");
+            let mut qemu = Command::new("qemu");
+            configure_machine_devices(&mut qemu, &resolved, &artifact, &data_disk, Some(&hib_disk));
+            let args: Vec<String> = qemu
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                args.iter().any(|arg| arg == expected_dev),
+                "arch={arch:?} iommu={iommu}: missing {expected_dev} in {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hibernate_manifest_roundtrip_and_resume_preserves_disks_without_truncating() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let runtime_dir = tempdir.path().join("hib-runtime");
+        fs::create_dir_all(&runtime_dir).expect("create runtime_dir");
+        let config = tempdir.path().join("missing-vm.json");
+        let uefi_img = runtime_dir.join("kernel.uefi.img");
+        fs::write(&uefi_img, b"uefi-payload").expect("write uefi image");
+
+        let resolved = resolve(VmCommand {
+            arch: VmArch::Aarch64,
+            acpi: true,
+            smp: Some(4),
+            memory: Some("2G".to_owned()),
+            tpm: Some(VmTpmBackend::Swtpm),
+            hibernate_disk_size: Some(128 * 1024 * 1024),
+            runtime_dir: Some(runtime_dir.clone()),
+            config: Some(config),
+            command: Some(VmSessionCommand::Hibernate(HibernateCommand {
+                before_shell: "/bin/dash".to_owned(),
+                before_command: None,
+                power_off_timeout_seconds: 60,
+            })),
+            ..minimal_command()
+        })
+        .expect("hibernate command resolves");
+        assert!(resolved.keep_runtime_dir);
+        assert!(!resolved.resume);
+
+        write_hibernate_manifest(&resolved, &runtime_dir, &uefi_img)
+            .expect("write hibernate manifest");
+
+        // Write sentinel bytes into data.img and hibernate.img so we can prove
+        // resume reuses them in place without truncating.
+        let data_path = runtime_dir.join("data.img");
+        let hib_path = runtime_dir.join(HIBERNATE_DISK_FILE);
+        fs::write(&data_path, b"existing-data-disk-bytes").expect("write data.img");
+        fs::write(&hib_path, b"existing-hibernate-image-bytes").expect("write hibernate.img");
+
+        let resumed = resolve(VmCommand {
+            resume: Some(runtime_dir.clone()),
+            ..minimal_command()
+        })
+        .expect("resume resolves from hibernate-vm.json");
+        assert!(resumed.resume);
+        assert!(resumed.no_build);
+        assert!(resumed.keep_runtime_dir);
+        assert_eq!(resumed.profile.arch, VmArch::Aarch64);
+        assert!(resumed.acpi);
+        assert_eq!(resumed.smp, 4);
+        assert_eq!(resumed.memory, "2G");
+        assert_eq!(resumed.hibernate_disk_bytes, Some(128 * 1024 * 1024));
+        assert_eq!(
+            resumed.uefi_image,
+            Some(fs::canonicalize(&uefi_img).expect("canonical uefi"))
+        );
+        let tpm = resumed.tpm.as_ref().expect("TPM preserved on resume");
+        assert_eq!(tpm.backend(), VmTpmBackend::Swtpm);
+        assert_eq!(tpm.state_dir(&runtime_dir), runtime_dir.join("tpm"));
+
+        let prepared_data = prepare_data_disk(&resumed, &runtime_dir).expect("reuse data.img");
+        let prepared_hib = prepare_hibernate_disk(&resumed, &runtime_dir)
+            .expect("reuse hibernate.img")
+            .expect("hibernate disk present");
+        assert_eq!(prepared_data, data_path);
+        assert_eq!(prepared_hib, hib_path);
+        assert_eq!(
+            fs::read(&data_path).expect("read data.img"),
+            b"existing-data-disk-bytes"
+        );
+        assert_eq!(
+            fs::read(&hib_path).expect("read hibernate.img"),
+            b"existing-hibernate-image-bytes"
         );
     }
 }

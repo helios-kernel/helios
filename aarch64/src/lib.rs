@@ -1279,6 +1279,16 @@ extern "C" fn aarch64_kernel_main() -> ! {
         physical_memory_offset,
         &[],
     );
+    let hibernate_receiver = debug_state.install_hibernate_service();
+    kernel.spawn_local_detached(hibernate::serve_hibernate_requests(
+        cpu,
+        kernel.hibernate_handle(),
+        debug_state.clone(),
+        pool,
+        hibernate_devices,
+        hibernate_receiver,
+        DEBUG_SERIAL_WRITER,
+    ));
     helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
 
     // Everything the kernel drives itself has claimed its interrupt by

@@ -444,6 +444,7 @@ macro_rules! impl_program_bindings {
                                         .table
                                         .delete(res)
                                         .map_err(wasmtime::Error::from)?;
+                                    access.get().decrement_serial_ports_held();
                                     if socket_error.is_none() {
                                         extracted_sockets
                                             .push(crate::InheritedSocket::from_serial_port(port));
@@ -1094,6 +1095,7 @@ macro_rules! impl_program_bindings {
                         );
                     } else if let Some(port) = sock.take_serial() {
                         let res = store.table.push(port).map_err(wasmtime::Error::from)?;
+                        store.increment_serial_ports_held();
                         result.push(
                             $bindings::helios::system::programs::InheritedSocket::Serial(res),
                         );
@@ -1345,6 +1347,7 @@ macro_rules! impl_program_bindings {
                                     .table
                                     .delete(res)
                                     .map_err(wasmtime::Error::from)?;
+                                access.get().decrement_serial_ports_held();
                                 if socket_error.is_none() {
                                     extracted_sockets
                                         .push(crate::InheritedSocket::from_serial_port(port));
@@ -5643,11 +5646,22 @@ where
         if !can_read && !can_write {
             return Ok(None);
         }
-        Ok(Some(access.get().table.push(SbiSerialPort {
+        let store = access.get();
+        let resource = store.table.push(SbiSerialPort {
             can_read,
             can_write,
             _resource: SerialPortResource,
-        })?))
+        })?;
+        store.increment_serial_ports_held();
+        // If a serial `inspector-worker` just resumed from hibernation and
+        // released `DebugPort`, emit `[KDBG resume:ok]` now that
+        // `inspector-host` has reclaimed the port and is about to enter
+        // `server_handshake`, guaranteeing zero race with the resuming client's
+        // `ClientHello`.
+        if store.runtime_state.take_deferred_resume_marker() {
+            store.serial_writer().emit_stage_marker("resume:ok");
+        }
+        Ok(Some(resource))
     }
 }
 
@@ -5688,6 +5702,7 @@ where
         resource: Resource<SbiSerialPort>,
     ) -> wasmtime::Result<()> {
         let _ = access.get().table.delete(resource)?;
+        access.get().decrement_serial_ports_held();
         Ok(())
     }
 

@@ -553,10 +553,24 @@ pub(crate) fn connect_client(
     boot_sync: bool,
     identity: Option<&helios_inspector_protocol::auth::ClientIdentity>,
 ) -> Result<serial::RpcClient, ConnectError> {
+    connect_client_with_expectation(
+        device,
+        baud,
+        boot_sync.then_some(ready::BootExpectation::ColdBoot),
+        identity,
+    )
+}
+
+pub(crate) fn connect_client_with_expectation(
+    device: &str,
+    baud: u32,
+    boot_expectation: Option<ready::BootExpectation>,
+    identity: Option<&helios_inspector_protocol::auth::ClientIdentity>,
+) -> Result<serial::RpcClient, ConnectError> {
     runtime::block_on(async move {
         let io = serial::open(device, baud).await?;
-        if boot_sync {
-            Ok(ready::connect_after_boot(io, identity).await?)
+        if let Some(expectation) = boot_expectation {
+            Ok(ready::connect_after_boot_with_expectation(io, identity, expectation).await?)
         } else {
             let (read, write) = io.into_split();
             let mut client = match identity {

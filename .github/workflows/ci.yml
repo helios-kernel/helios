@@ -838,7 +838,7 @@ jobs:
         with:
           packages: >-
             libudev-dev just cmake ninja-build erofs-utils btrfs-progs
-            qemu-system-misc opensbi
+            qemu-system-misc opensbi swtpm
       - name: Record QEMU version
         run: qemu-system-riscv64 --version
       - name: Download WASI tooling artifacts
@@ -1118,6 +1118,32 @@ jobs:
         run: |
           python3 tools/wasi-apps/tls-smoke.py --arch riscv64 --accel tcg \
             --runtime-dir "$GITHUB_WORKSPACE/smoke-runtime/curl-https"
+      - uses: ./helios/.github/actions/swtpm
+      # OpenSBI / QEMU does not supply a TCG firmware event log on riscv64 yet
+      # (#1292), so `tpm/src/boot.rs` refuses to qualify the TPM (`NoEventLog`)
+      # and hibernate must return `NoAuthenticationKey` cleanly rather than
+      # writing an unauthenticated image.
+      - name: Refuse hibernate on riscv64 without firmware TPM event log
+        timeout-minutes: 15
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/hibernate-refusal"
+          mkdir -p "$runtime"
+          if ./target/release/helios vm --arch riscv64 --release --memory 2G \
+            --accel tcg --tpm swtpm --hibernate-disk-size 256M \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
+            --no-compiler-plugin \
+            hibernate > "$runtime/hibernate.out" 2> "$runtime/inspector.log"; then
+            echo 'expected riscv64 hibernate to fail with NoAuthenticationKey (#1292)'
+            exit 1
+          fi
+          cat "$runtime/inspector.log"
+          grep -F 'NoAuthenticationKey' "$runtime/inspector.log"
       - name: Upload the inspector runtime directories
         if: failure()
         uses: actions/upload-artifact@v4
@@ -1768,6 +1794,162 @@ jobs:
           second="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/dt-2/debug-serial.log" provisioned-and-sealed state-changed)"
           echo "signer: first boot $first, second boot $second"
           test "$first" != "$second"
+      # End-to-end hibernate and resume on aarch64 ACPI (#578): hibernate with
+      # live RAM state and pre-hibernate entropy, resume after wall-clock sleep,
+      # assert live state, generation advance, fresh entropy, wall clock, second-
+      # boot cold boot, tampered-image refusal, and changed-payload refusal.
+      - name: Hibernate and resume aarch64 ACPI guest
+        timeout-minutes: 30
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -euo pipefail
+          hib_dir="$GITHUB_WORKSPACE/smoke-runtime-measured/hibernate-aarch64-acpi"
+          tampered_dir="$GITHUB_WORKSPACE/smoke-runtime-measured/hibernate-aarch64-tampered"
+          changed_dir="$GITHUB_WORKSPACE/smoke-runtime-measured/hibernate-aarch64-changed"
+          cold_dir="$GITHUB_WORKSPACE/smoke-runtime-measured/hibernate-aarch64-second-boot"
+          rm -rf "$hib_dir" "$tampered_dir" "$changed_dir" "$cold_dir"
+          mkdir -p "$hib_dir" "$tampered_dir" "$changed_dir" "$cold_dir"
+
+          # Boot 1: establish live RAM state + entropy sample, then hibernate.
+          ./target/release/helios vm --arch aarch64 --release --memory 2G --acpi \
+            --accel tcg --tpm swtpm --hibernate-disk-size 256M \
+            --runtime-dir "$hib_dir" --keep-runtime-dir \
+            --boot-program dash --boot-program cat --boot-program head --boot-program date \
+            --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
+            --no-compiler-plugin \
+            hibernate --power-off-timeout-seconds 180 \
+            --before-shell /bin/dash \
+            -c 'echo hib-ram-state-ok > /tmp/hib-live; head -c 64 /dev/urandom > /tmp/entropy-before; printf "head -c 64 /dev/urandom\n" > /tmp/read-entropy.sh' \
+            2>&1 | tee "$hib_dir/inspector.hibernate.log"
+
+          bootfs_saved="$hib_dir/helios-bootfs.saved"
+          cp target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs "$bootfs_saved"
+
+          # Clone hibernate disk + TPM state BEFORE resuming (resuming invalidates the header).
+          cp "$hib_dir/hibernate.img" "$tampered_dir/hibernate.img"
+          cp -r "$hib_dir/tpm" "$tampered_dir/tpm"
+          cp "$hib_dir/hibernate.img" "$changed_dir/hibernate.img"
+          cp -r "$hib_dir/tpm" "$changed_dir/tpm"
+
+          # Advance wall clock before resuming.
+          sleep 2
+
+          # Boot 2: resume once and verify RAM state, generation, entropy, and wall clock.
+          # shellcheck disable=SC2016
+          ./target/release/helios vm --resume "$hib_dir" \
+            nu -c 'let gen = (fleet inspect /kernel/machine/generation | first | get value); let live = (fleet exec /bin/cat /tmp/hib-live | first | get stdout | str trim); let wall = (fleet exec /bin/date | first | get stdout | str trim); let e1 = (fleet exec /bin/cat /tmp/entropy-before | first | get stdout); let e2 = (fleet exec /bin/dash /tmp/read-entropy.sh | first | get stdout); if ($e1 | is-empty) or ($e2 | is-empty) or ($e1 == $e2) { error make { msg: "entropy did not change across hibernate/resume" } }; print $"generation=($gen)"; print $"live=($live)"; print $"wall=($wall)"; print "entropy=changed"' \
+            2>&1 > "$hib_dir/resume.out" | tee "$hib_dir/inspector.resume.log"
+          host_after="$(date +%s)"
+          cat "$hib_dir/resume.out"
+          grep -aF 'resumed from hibernate image' "$hib_dir/debug-serial.log"
+          grep -Fqx 'live=hib-ram-state-ok' "$hib_dir/resume.out"
+          grep -Fqx 'entropy=changed' "$hib_dir/resume.out"
+          gen="$(sed -n 's/^generation=//p' "$hib_dir/resume.out")"
+          test "$gen" -ge 2
+          guest_ts="$(sed -n 's/^wall=unix_seconds=//p' "$hib_dir/resume.out")"
+          diff_ts=$((guest_ts - host_after))
+          test "$diff_ts" -ge -5 -a "$diff_ts" -le 5
+
+          # Second boot against the already-resumed image must NOT resume.
+          if ./target/release/helios vm --resume "$hib_dir" \
+            shell --shell /bin/dash -c 'echo should-not-resume' \
+            > "$cold_dir/resume-fail.out" 2> "$cold_dir/resume-fail.log"; then
+            echo 'expected second --resume against invalidated hibernate image to fail'
+            exit 1
+          fi
+          ./target/release/helios vm --arch aarch64 --release --memory 2G --acpi \
+            --accel tcg --no-build --bootfs "$bootfs_saved" \
+            --tpm swtpm --tpm-state "$hib_dir/tpm" \
+            --disk "$hib_dir/hibernate.img,serial=helios-hibernate" \
+            --runtime-dir "$cold_dir" --keep-runtime-dir \
+            shell --shell /bin/dash -c 'echo cold:ok' \
+            2>&1 > "$cold_dir/shell.out" | tee "$cold_dir/inspector.log"
+          grep -Fqx 'cold:ok' "$cold_dir/shell.out"
+          if grep -aF 'resumed from hibernate image' "$cold_dir/debug-serial.log"; then
+            echo 'unexpected resume on second boot after header invalidation'
+            exit 1
+          fi
+
+          # Tampered hibernate image must be refused and fall through to cold boot.
+          python3 - "$tampered_dir/hibernate.img" <<'PY'
+          import sys
+          with open(sys.argv[1], "r+b") as f:
+              f.seek(4096 + 64)
+              b = f.read(1)
+              assert len(b) == 1
+              f.seek(4096 + 64)
+              f.write(bytes([b[0] ^ 0xFF]))
+          PY
+          ./target/release/helios vm --arch aarch64 --release --memory 2G --acpi \
+            --accel tcg --no-build --bootfs "$bootfs_saved" \
+            --tpm swtpm --tpm-state "$tampered_dir/tpm" \
+            --disk "$tampered_dir/hibernate.img,serial=helios-hibernate" \
+            --runtime-dir "$tampered_dir" --keep-runtime-dir \
+            shell --shell /bin/dash -c 'echo tampered:cold' \
+            2>&1 > "$tampered_dir/shell.out" | tee "$tampered_dir/inspector.log"
+          grep -Fqx 'tampered:cold' "$tampered_dir/shell.out"
+          grep -aF 'hibernate image refused' "$tampered_dir/debug-serial.log"
+          if grep -aF 'resumed from hibernate image' "$tampered_dir/debug-serial.log"; then
+            echo 'unexpected resume from tampered hibernate image'
+            exit 1
+          fi
+
+          # Different payload (changed PCR 9 / identity) must refuse hibernate and cold-boot.
+          ./target/release/helios vm --arch aarch64 --release --memory 2G --acpi \
+            --accel tcg --tpm swtpm --tpm-state "$changed_dir/tpm" \
+            --disk "$changed_dir/hibernate.img,serial=helios-hibernate" \
+            --runtime-dir "$changed_dir" --keep-runtime-dir \
+            --boot-program dash --boot-program cat --boot-program head --boot-program date --boot-program ls \
+            --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
+            --no-compiler-plugin \
+            shell --shell /bin/dash -c 'echo changed:cold' \
+            2>&1 > "$changed_dir/shell.out" | tee "$changed_dir/inspector.log"
+          grep -Fqx 'changed:cold' "$changed_dir/shell.out"
+          grep -aF 'hibernate image refused' "$changed_dir/debug-serial.log"
+          if grep -aF 'resumed from hibernate image' "$changed_dir/debug-serial.log"; then
+            echo 'unexpected resume from changed payload'
+            exit 1
+          fi
+      # Under QEMU's default device-tree boot, fresh `/chosen/rng-seed` and
+      # `kaslr-seed` change PCR 9 on every boot (#602), so a hibernated DT guest
+      # cannot unseal its hibernate authentication key and must refuse resume.
+      - name: Verify aarch64 device-tree hibernate refusal under #602 sealing policy
+        timeout-minutes: 20
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -euo pipefail
+          dt_dir="$GITHUB_WORKSPACE/smoke-runtime-measured/hibernate-aarch64-dt"
+          rm -rf "$dt_dir"
+          mkdir -p "$dt_dir"
+          ./target/release/helios vm --arch aarch64 --release --memory 2G \
+            --accel tcg --tpm swtpm --hibernate-disk-size 256M \
+            --runtime-dir "$dt_dir" --keep-runtime-dir \
+            --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
+            --no-compiler-plugin \
+            hibernate --power-off-timeout-seconds 180 \
+            2>&1 | tee "$dt_dir/inspector.hibernate.log"
+          if ./target/release/helios vm --resume "$dt_dir" \
+            shell --shell /bin/dash -c 'echo should-not-resume' \
+            > "$dt_dir/resume.out" 2> "$dt_dir/inspector.resume.log"; then
+            echo 'expected aarch64 device-tree --resume to fail under #602 PCR 9 sealing policy'
+            exit 1
+          fi
+          cat "$dt_dir/inspector.resume.log"
+          grep -aF 'hibernate image refused' "$dt_dir/debug-serial.log"
+          if grep -aF 'resumed from hibernate image' "$dt_dir/debug-serial.log"; then
+            echo 'unexpected resume on aarch64 device-tree boot'
+            exit 1
+          fi
       - name: Upload the inspector runtime directories
         if: failure()
         uses: actions/upload-artifact@v4
@@ -2270,6 +2452,122 @@ jobs:
           retained="$(cat "$RUNNER_TEMP/tpm-signer-x86-64")"
           echo "signer: retained $retained, after the change $changed"
           test "$changed" != "$retained"
+      # End-to-end hibernate and resume on x86-64 KVM (#578): hibernate with
+      # live RAM state and pre-hibernate entropy, resume after wall-clock sleep,
+      # assert live state, generation advance, fresh entropy, wall clock, second-
+      # boot cold boot, tampered-image refusal, and changed-payload refusal.
+      - name: Hibernate and resume x86-64 guest
+        timeout-minutes: 15
+        shell: bash
+        working-directory: helios
+        run: |
+          set -euo pipefail
+          hib_dir="$GITHUB_WORKSPACE/smoke-runtime-measured/hibernate-x86-64"
+          tampered_dir="$GITHUB_WORKSPACE/smoke-runtime-measured/hibernate-x86-64-tampered"
+          changed_dir="$GITHUB_WORKSPACE/smoke-runtime-measured/hibernate-x86-64-changed"
+          cold_dir="$GITHUB_WORKSPACE/smoke-runtime-measured/hibernate-x86-64-second-boot"
+          rm -rf "$hib_dir" "$tampered_dir" "$changed_dir" "$cold_dir"
+          mkdir -p "$hib_dir" "$tampered_dir" "$changed_dir" "$cold_dir"
+
+          # Boot 1: establish live RAM state + entropy sample, then hibernate.
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
+            --accel kvm --tpm swtpm --hibernate-disk-size 256M \
+            --runtime-dir "$hib_dir" --keep-runtime-dir \
+            --boot-program dash --boot-program cat --boot-program head --boot-program date \
+            --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
+            --no-compiler-plugin \
+            hibernate --before-shell /bin/dash \
+            -c 'echo hib-ram-state-ok > /tmp/hib-live; head -c 64 /dev/urandom > /tmp/entropy-before; printf "head -c 64 /dev/urandom\n" > /tmp/read-entropy.sh' \
+            2>&1 | tee "$hib_dir/inspector.hibernate.log"
+
+          bootfs_saved="$hib_dir/helios-bootfs.saved"
+          cp target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs "$bootfs_saved"
+
+          # Clone hibernate disk + TPM state BEFORE resuming (resuming invalidates the header).
+          cp "$hib_dir/hibernate.img" "$tampered_dir/hibernate.img"
+          cp -r "$hib_dir/tpm" "$tampered_dir/tpm"
+          cp "$hib_dir/hibernate.img" "$changed_dir/hibernate.img"
+          cp -r "$hib_dir/tpm" "$changed_dir/tpm"
+
+          # Advance wall clock before resuming.
+          sleep 2
+
+          # Boot 2: resume once and verify RAM state, generation, entropy, and wall clock.
+          # shellcheck disable=SC2016
+          ./target/release/helios vm --resume "$hib_dir" \
+            nu -c 'let gen = (fleet inspect /kernel/machine/generation | first | get value); let live = (fleet exec /bin/cat /tmp/hib-live | first | get stdout | str trim); let wall = (fleet exec /bin/date | first | get stdout | str trim); let e1 = (fleet exec /bin/cat /tmp/entropy-before | first | get stdout); let e2 = (fleet exec /bin/dash /tmp/read-entropy.sh | first | get stdout); if ($e1 | is-empty) or ($e2 | is-empty) or ($e1 == $e2) { error make { msg: "entropy did not change across hibernate/resume" } }; print $"generation=($gen)"; print $"live=($live)"; print $"wall=($wall)"; print "entropy=changed"' \
+            2>&1 > "$hib_dir/resume.out" | tee "$hib_dir/inspector.resume.log"
+          host_after="$(date +%s)"
+          cat "$hib_dir/resume.out"
+          grep -aF 'resumed from hibernate image' "$hib_dir/debug-serial.log"
+          grep -Fqx 'live=hib-ram-state-ok' "$hib_dir/resume.out"
+          grep -Fqx 'entropy=changed' "$hib_dir/resume.out"
+          gen="$(sed -n 's/^generation=//p' "$hib_dir/resume.out")"
+          test "$gen" -ge 2
+          guest_ts="$(sed -n 's/^wall=unix_seconds=//p' "$hib_dir/resume.out")"
+          diff_ts=$((guest_ts - host_after))
+          test "$diff_ts" -ge -5 -a "$diff_ts" -le 5
+
+          # Second boot against the already-resumed image must NOT resume.
+          if ./target/release/helios vm --resume "$hib_dir" \
+            shell --shell /bin/dash -c 'echo should-not-resume' \
+            > "$cold_dir/resume-fail.out" 2> "$cold_dir/resume-fail.log"; then
+            echo 'expected second --resume against invalidated hibernate image to fail'
+            exit 1
+          fi
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
+            --accel kvm --no-build --bootfs "$bootfs_saved" \
+            --tpm swtpm --tpm-state "$hib_dir/tpm" \
+            --disk "$hib_dir/hibernate.img,serial=helios-hibernate" \
+            --runtime-dir "$cold_dir" --keep-runtime-dir \
+            shell --shell /bin/dash -c 'echo cold:ok' \
+            2>&1 > "$cold_dir/shell.out" | tee "$cold_dir/inspector.log"
+          grep -Fqx 'cold:ok' "$cold_dir/shell.out"
+          if grep -aF 'resumed from hibernate image' "$cold_dir/debug-serial.log"; then
+            echo 'unexpected resume on second boot after header invalidation'
+            exit 1
+          fi
+
+          # Tampered hibernate image must be refused and fall through to cold boot.
+          python3 - "$tampered_dir/hibernate.img" <<'PY'
+          import sys
+          with open(sys.argv[1], "r+b") as f:
+              f.seek(4096 + 64)
+              b = f.read(1)
+              assert len(b) == 1
+              f.seek(4096 + 64)
+              f.write(bytes([b[0] ^ 0xFF]))
+          PY
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
+            --accel kvm --no-build --bootfs "$bootfs_saved" \
+            --tpm swtpm --tpm-state "$tampered_dir/tpm" \
+            --disk "$tampered_dir/hibernate.img,serial=helios-hibernate" \
+            --runtime-dir "$tampered_dir" --keep-runtime-dir \
+            shell --shell /bin/dash -c 'echo tampered:cold' \
+            2>&1 > "$tampered_dir/shell.out" | tee "$tampered_dir/inspector.log"
+          grep -Fqx 'tampered:cold' "$tampered_dir/shell.out"
+          grep -aF 'hibernate image refused' "$tampered_dir/debug-serial.log"
+          if grep -aF 'resumed from hibernate image' "$tampered_dir/debug-serial.log"; then
+            echo 'unexpected resume from tampered hibernate image'
+            exit 1
+          fi
+
+          # Different payload (changed PCR 9 / identity) must refuse hibernate and cold-boot.
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
+            --accel kvm --tpm swtpm --tpm-state "$changed_dir/tpm" \
+            --disk "$changed_dir/hibernate.img,serial=helios-hibernate" \
+            --runtime-dir "$changed_dir" --keep-runtime-dir \
+            --boot-program dash --boot-program cat --boot-program head --boot-program date --boot-program ls \
+            --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
+            --no-compiler-plugin \
+            shell --shell /bin/dash -c 'echo changed:cold' \
+            2>&1 > "$changed_dir/shell.out" | tee "$changed_dir/inspector.log"
+          grep -Fqx 'changed:cold' "$changed_dir/shell.out"
+          grep -aF 'hibernate image refused' "$changed_dir/debug-serial.log"
+          if grep -aF 'resumed from hibernate image' "$changed_dir/debug-serial.log"; then
+            echo 'unexpected resume from changed payload'
+            exit 1
+          fi
       - name: Run the coreutils applets through dash
         timeout-minutes: 5
         shell: bash

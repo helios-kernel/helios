@@ -26,17 +26,20 @@ use core::time::Duration;
 use helios_hal::cpu::{
     Cpu, DisplacedFrameCopy, ResumeHandoff, ResumeHandoffWire, Riscv64SnapshotContext,
 };
+use helios_hal::fs::BlockDevice as _;
 use helios_hal::pmm::PhysFrame;
 use helios_hal::rtc::RealTimeClock;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::hibernate::{
-    DeviceFeatureRecord, HibernateDeviceController, HibernateDeviceError, LoadedHibernateImage,
-    ResumeProbe, VirtioBlockHibernateStorage, build_machine_identity,
-    collect_boot_protected_ranges, probe_and_load_hibernate_image, usable_physical_frame_runs,
+    DeviceFeatureRecord, HIBERNATE_FREEZE_DEADLINE, HibernateDeviceController,
+    HibernateDeviceError, HibernateOutcome, HibernateRequest, HibernateRequestError,
+    LoadedHibernateImage, ResumeProbe, VirtioBlockHibernateStorage, build_machine_identity,
+    collect_boot_protected_ranges, compute_hibernate_reservation_bytes,
+    hibernate_machine_with_handle, probe_and_load_hibernate_image, usable_physical_frame_runs,
 };
 use helios_kernel::{
-    HIBERNATE_DISK_SERIAL, Kernel, MachineGenerationHandle, ResetDevice, RootEntropy,
-    UserMemoryPool,
+    DebugSerialWriter, HIBERNATE_DISK_SERIAL, HibernateHandle, Kernel, MachineGenerationHandle,
+    ProviderReceiver, ResetDevice, RootEntropy, UserMemoryPool,
 };
 use helios_virtio::DeviceType;
 
@@ -62,6 +65,10 @@ unsafe extern "C" {
 /// Polled I/O deadline for early-boot hibernate disk discovery, verification,
 /// and device quiesce/reinitialization.
 const POLLED_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Polled I/O deadline for writing the compressed hibernate image and
+/// invalidating its header on resume (generous for slow emulated targets).
+const HIBERNATE_IO_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Parameter block written at offset `0x000` of the safe 4 KiB trampoline page
 /// (`trampoline_phys`, identity-mapped on RISC-V) before entering
@@ -114,6 +121,7 @@ pub(crate) struct RiscvHibernateDevices {
     pub(crate) inputs: Vec<Arc<RiscvVirtioInputDevice>>,
     pub(crate) sound: Option<Arc<RiscvVirtioSndDevice>>,
     pub(crate) blocks: Vec<RiscvVirtioBlockDevice>,
+    pub(crate) hibernate_block: Option<RiscvVirtioBlockDevice>,
 }
 
 impl RiscvHibernateDevices {
@@ -131,6 +139,7 @@ impl RiscvHibernateDevices {
             inputs: Vec::new(),
             sound: None,
             blocks: Vec::new(),
+            hibernate_block: None,
         }
     }
 
@@ -439,6 +448,7 @@ pub(crate) fn probe_and_resume_if_present<WatchdogImpl, MeasuredBootImpl>(
     let Some(hibernate_blk) = find_hibernate_block_device(cpu, &devices.blocks) else {
         return;
     };
+    devices.hibernate_block = Some(hibernate_blk.clone());
 
     let feature_records = devices.feature_records();
     // SAFETY: `boot_memory.kernel_sections.text` and `rodata` describe the
@@ -535,6 +545,89 @@ pub(crate) fn probe_and_resume_if_present<WatchdogImpl, MeasuredBootImpl>(
     );
 
     enter_restore_trampoline(&loaded, handoff)
+}
+
+/// BSP-pinned detached task serving guest `helios:system/snapshot.hibernate`
+/// requests on RISC-V 64.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "BSP hibernate server takes explicit static-dispatch dependencies"
+)]
+pub(crate) async fn serve_hibernate_requests<WatchdogImpl>(
+    cpu: RiscvCpu,
+    handle: HibernateHandle<RiscvCpu, WatchdogImpl>,
+    debug_state: crate::debug_state::RuntimeState,
+    pool: &'static UserMemoryPool,
+    mut devices: RiscvHibernateDevices,
+    receiver: ProviderReceiver<HibernateRequest>,
+    debug_serial: DebugSerialWriter,
+    mirror_to_uart: bool,
+) where
+    WatchdogImpl: Watchdog + Clone,
+{
+    while let Some(request) = receiver.recv().await {
+        let Some(hibernate_blk) = devices.hibernate_block.clone() else {
+            request.respond(Err(HibernateRequestError::NoHibernateDisk));
+            continue;
+        };
+        let feature_records = devices.feature_records();
+        let machine = helios_kernel::machine_memory();
+        let disk_bytes = hibernate_blk.geometry().capacity_bytes();
+        let reservation_bytes = compute_hibernate_reservation_bytes(
+            machine.usable_bytes,
+            machine.free_bytes,
+            disk_bytes,
+        );
+        let cpu_for_storage = cpu.clone();
+        let deadline = cpu
+            .now()
+            .ticks()
+            .saturating_add(cpu.timebase().duration_to_ticks(HIBERNATE_IO_TIMEOUT));
+        let mut storage = VirtioBlockHibernateStorage::new(hibernate_blk, move || {
+            cpu_for_storage.now().ticks() >= deadline
+        });
+        let program_service = debug_state.program_service();
+        // SAFETY: `handle.boot_memory()` describes the running kernel's
+        // immutable identity-mapped `.text` and `.rodata` sections.
+        let outcome = unsafe {
+            hibernate_machine_with_handle(
+                &handle,
+                &cpu,
+                &debug_state,
+                pool,
+                &feature_records,
+                reservation_bytes,
+                HIBERNATE_FREEZE_DEADLINE,
+                &mut storage,
+                &mut devices,
+                || {
+                    if let Some(ref service) = program_service {
+                        service.interrupt_running_guests();
+                    }
+                },
+            )
+            .await
+        };
+        match outcome {
+            Ok(HibernateOutcome::Resumed) => {
+                if !mirror_to_uart {
+                    let generation = debug_state.machine_generation().current().get();
+                    debug_serial.emit_fmt(format_args!(
+                        "\nINFO helios_kernel::hibernate::storage: resumed from hibernate image generation={generation}\n"
+                    ));
+                }
+                if request.defer_resume_marker() {
+                    debug_state.arm_deferred_resume_marker();
+                } else {
+                    debug_serial.emit_stage_marker("resume:ok");
+                }
+                request.respond(Ok(HibernateOutcome::Resumed));
+            }
+            other => {
+                request.respond(other.map_err(HibernateRequestError::from));
+            }
+        }
+    }
 }
 
 fn find_hibernate_block_device(

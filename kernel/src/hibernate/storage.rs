@@ -51,7 +51,7 @@ use super::snapshot::{
 };
 use crate::machine::{AdvanceCause, MachineGeneration};
 use crate::memory::{RootEntropy, UserMemoryPool};
-use crate::{Kernel, RuntimeState};
+use crate::{HibernateHandle, Kernel, RuntimeState};
 
 /// Canonical 512-byte sector size for the hibernate on-disk layout.
 pub const HIBERNATE_SECTOR_BYTES: usize = 512;
@@ -614,27 +614,20 @@ where
     Ok(HibernateOutcome::Resumed)
 }
 
-/// Orchestrates the complete hibernate-to-disk workflow and invokes `power_off`
-/// only after the final header flush succeeds while the machine is still frozen.
-///
-/// Production callers should use [`hibernate_to_disk`] or [`hibernate_machine`],
-/// which pass `|| cpu.shutdown()`. Tests that cannot exit the host process use
-/// this entry point with a recording power-off hook.
 #[expect(
     clippy::too_many_arguments,
     reason = "explicit static-dispatch dependencies keep the kernel free of global state and dynamic dispatch"
 )]
-pub async fn hibernate_to_disk_with_power_off<
+async fn hibernate_to_disk_with_handle_and_power_off<
     CpuImpl,
     WatchdogImpl,
-    MeasuredBootImpl,
     Storage,
     Devices,
     ReseedWallClock,
     InterruptGuests,
     PowerOff,
 >(
-    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    handle: &HibernateHandle<CpuImpl, WatchdogImpl>,
     cpu: &CpuImpl,
     user_pool: &UserMemoryPool,
     params: AtomicSnapshotParams<'_>,
@@ -647,7 +640,6 @@ pub async fn hibernate_to_disk_with_power_off<
 where
     CpuImpl: Cpu + Clone,
     WatchdogImpl: Watchdog + Clone,
-    MeasuredBootImpl: MeasuredBoot,
     Storage: HibernateStorage,
     Devices: HibernateDeviceController,
     ReseedWallClock: FnOnce(u64, u64),
@@ -665,12 +657,12 @@ where
 
     // 1. Verify authentication key and boot metadata exist before doing work.
     let auth_key = auth_key.ok_or(HibernateError::NoAuthenticationKey)?;
-    let boot_memory = kernel
+    let boot_memory = handle
         .boot_memory()
         .ok_or(HibernateError::MissingBootMemoryMetadata)?;
 
     // 2. Pre-freeze disk capacity check: refuse an undersized disk BEFORE
-    //    reserving memory or calling `Kernel::freeze_for_hibernate(...)`.
+    //    reserving memory or calling `freeze_for_hibernate(...)`.
     let sector_size = storage.sector_size();
     let required_bytes = required_disk_bytes(reservation_bytes, sector_size)?;
     let disk_bytes = storage.capacity_bytes();
@@ -693,7 +685,7 @@ where
 
     // 4. Freeze all processors at a scheduler boundary, stop all online
     //    secondaries into their saved resume contexts, and quiesce all devices.
-    let frozen = kernel
+    let frozen = handle
         .freeze_for_hibernate(arrival_deadline, interrupt_guests)
         .await?;
     if let Err(error) = devices.quiesce_all() {
@@ -808,6 +800,60 @@ where
     })
 }
 
+/// Orchestrates the complete hibernate-to-disk workflow and invokes `power_off`
+/// only after the final header flush succeeds while the machine is still frozen.
+///
+/// Production callers should use [`hibernate_to_disk`] or [`hibernate_machine`],
+/// which pass `|| cpu.shutdown()`. Tests that cannot exit the host process use
+/// this entry point with a recording power-off hook.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit static-dispatch dependencies keep the kernel free of global state and dynamic dispatch"
+)]
+pub async fn hibernate_to_disk_with_power_off<
+    CpuImpl,
+    WatchdogImpl,
+    MeasuredBootImpl,
+    Storage,
+    Devices,
+    ReseedWallClock,
+    InterruptGuests,
+    PowerOff,
+>(
+    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    cpu: &CpuImpl,
+    user_pool: &UserMemoryPool,
+    params: AtomicSnapshotParams<'_>,
+    resume_targets: ResumeTargets<'_, ReseedWallClock>,
+    storage: &mut Storage,
+    devices: &mut Devices,
+    interrupt_guests: InterruptGuests,
+    power_off: PowerOff,
+) -> Result<HibernateOutcome, HibernateError>
+where
+    CpuImpl: Cpu + Clone,
+    WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
+    Storage: HibernateStorage,
+    Devices: HibernateDeviceController,
+    ReseedWallClock: FnOnce(u64, u64),
+    InterruptGuests: FnOnce(),
+    PowerOff: FnOnce(),
+{
+    hibernate_to_disk_with_handle_and_power_off(
+        &kernel.hibernate_handle(),
+        cpu,
+        user_pool,
+        params,
+        resume_targets,
+        storage,
+        devices,
+        interrupt_guests,
+        power_off,
+    )
+    .await
+}
+
 /// Full production hibernate-to-disk entry point: writes and flushes the
 /// authenticated hibernate image and powers off the machine via
 /// [`Cpu::shutdown`].
@@ -852,6 +898,91 @@ where
         user_pool,
         params,
         resume_targets,
+        storage,
+        devices,
+        interrupt_guests,
+        || cpu.shutdown(),
+    )
+    .await
+}
+
+/// High-level machine hibernate entry point taking an owned [`HibernateHandle`]
+/// so a BSP-pinned detached task can trigger hibernation without borrowing the
+/// [`Kernel`] owned by the BSP run loop.
+///
+/// # Safety
+///
+/// `handle.boot_memory()`'s immutable `.text` and `.rodata` descriptors must
+/// point to valid mapped kernel sections (always true on bare-metal boots).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit static-dispatch dependencies keep the kernel free of global state and dynamic dispatch"
+)]
+pub async unsafe fn hibernate_machine_with_handle<
+    CpuImpl,
+    WatchdogImpl,
+    ProgramService,
+    NetworkService,
+    StorageImpl,
+    HibStorage,
+    Devices,
+    InterruptGuests,
+>(
+    handle: &HibernateHandle<CpuImpl, WatchdogImpl>,
+    cpu: &CpuImpl,
+    runtime_state: &RuntimeState<ProgramService, NetworkService, StorageImpl>,
+    user_pool: &UserMemoryPool,
+    feature_records: &[DeviceFeatureRecord],
+    reservation_bytes: usize,
+    arrival_deadline: Duration,
+    storage: &mut HibStorage,
+    devices: &mut Devices,
+    interrupt_guests: InterruptGuests,
+) -> Result<HibernateOutcome, HibernateError>
+where
+    CpuImpl: Cpu + Clone,
+    WatchdogImpl: Watchdog + Clone,
+    ProgramService: Clone,
+    NetworkService: Clone,
+    StorageImpl: crate::Storage,
+    HibStorage: HibernateStorage,
+    Devices: HibernateDeviceController,
+    InterruptGuests: FnOnce(),
+{
+    let boot_memory = handle
+        .boot_memory()
+        .ok_or(HibernateError::MissingBootMemoryMetadata)?;
+    // SAFETY: forwarded from `hibernate_machine_with_handle`'s contract.
+    let identity = unsafe {
+        build_machine_identity(
+            boot_memory,
+            handle.topology().configured_processors as u32,
+            handle.devices(),
+            handle.dma_model(),
+            feature_records,
+        )
+    }?;
+    let mut image_id = [0_u8; 16];
+    runtime_state.root_entropy().fill(&mut image_id);
+    let balloon = runtime_state.memory_balloon();
+
+    hibernate_to_disk_with_handle_and_power_off(
+        handle,
+        cpu,
+        user_pool,
+        AtomicSnapshotParams {
+            balloon: balloon.as_ref(),
+            auth_key: runtime_state.hibernate_auth_key(),
+            identity,
+            reservation_bytes,
+            arrival_deadline,
+            config: SnapshotConfig::new(image_id),
+        },
+        ResumeTargets {
+            machine_generation: runtime_state.machine_generation(),
+            root_entropy: runtime_state.root_entropy(),
+            reseed_wall_clock: |ticks, nanos| runtime_state.reseed_wall_clock_nanos(ticks, nanos),
+        },
         storage,
         devices,
         interrupt_guests,
@@ -909,43 +1040,21 @@ where
     Devices: HibernateDeviceController,
     InterruptGuests: FnOnce(),
 {
-    let boot_memory = kernel
-        .boot_memory()
-        .ok_or(HibernateError::MissingBootMemoryMetadata)?;
+    let handle = kernel.hibernate_handle();
     // SAFETY: forwarded from `hibernate_machine`'s contract.
-    let identity = unsafe {
-        build_machine_identity(
-            boot_memory,
-            kernel.topology().configured_processors as u32,
-            kernel.devices(),
-            kernel.dma_model(),
+    unsafe {
+        hibernate_machine_with_handle(
+            &handle,
+            cpu,
+            runtime_state,
+            user_pool,
             feature_records,
-        )
-    }?;
-    let mut image_id = [0_u8; 16];
-    runtime_state.root_entropy().fill(&mut image_id);
-    let balloon = runtime_state.memory_balloon();
-
-    hibernate_to_disk(
-        kernel,
-        cpu,
-        user_pool,
-        AtomicSnapshotParams {
-            balloon: balloon.as_ref(),
-            auth_key: runtime_state.hibernate_auth_key(),
-            identity,
             reservation_bytes,
             arrival_deadline,
-            config: SnapshotConfig::new(image_id),
-        },
-        ResumeTargets {
-            machine_generation: runtime_state.machine_generation(),
-            root_entropy: runtime_state.root_entropy(),
-            reseed_wall_clock: |ticks, nanos| runtime_state.reseed_wall_clock_nanos(ticks, nanos),
-        },
-        storage,
-        devices,
-        interrupt_guests,
-    )
-    .await
+            storage,
+            devices,
+            interrupt_guests,
+        )
+        .await
+    }
 }

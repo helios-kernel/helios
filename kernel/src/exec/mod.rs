@@ -41,6 +41,7 @@ pub use executor::{
     PinnedTasks, READY_BATCH_TASKS, Spawner, TaskCapacityError, TaskFunding,
 };
 pub(crate) use executor::{TaskHome, task_arena_bytes};
+pub(crate) use freeze::FreezeHandle;
 pub use freeze::{FreezeError, FrozenMachine};
 pub use idle::IdleOutcome;
 pub use in_flight::InFlight;

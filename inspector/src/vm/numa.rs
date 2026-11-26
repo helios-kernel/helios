@@ -94,6 +94,14 @@ pub(crate) struct NumaMachine {
 }
 
 impl NumaMachine {
+    pub(crate) const fn nodes(&self) -> u16 {
+        self.nodes
+    }
+
+    pub(crate) const fn distance(&self) -> Option<u8> {
+        self.distance
+    }
+
     /// Validates the two flags against the machine's `-smp`, its
     /// `maxcpus` and `-m`. `max_processors` is at least `smp`, which
     /// `resolve` checked first.

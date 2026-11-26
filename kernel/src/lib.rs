@@ -981,6 +981,53 @@ const MAX_BOOT_MEMORY_REGIONS: usize = 128;
 /// user pool has already refused once.
 const KERNEL_HEAP_TOP_UP_BACKOFF: usize = 1024;
 
+/// Owned static-dispatch handle derived from [`Kernel::hibernate_handle`] so a
+/// BSP-pinned detached task can freeze the machine and capture a hibernate
+/// snapshot without borrowing the [`Kernel`] owned by the BSP run loop.
+#[derive(Clone)]
+pub struct HibernateHandle<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> {
+    freeze: exec::FreezeHandle,
+    timer: Timer<CpuImpl>,
+    watchdog: WatchdogImpl,
+    topology: ProcessorTopology,
+    dma_model: DmaModel,
+    devices: DeviceInventory,
+    boot_memory: Option<helios_hal::boot::BootMemoryMetadata>,
+}
+
+impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> HibernateHandle<CpuImpl, WatchdogImpl> {
+    pub fn topology(&self) -> ProcessorTopology {
+        self.topology
+    }
+
+    pub fn dma_model(&self) -> DmaModel {
+        self.dma_model
+    }
+
+    pub fn devices(&self) -> DeviceInventory {
+        self.devices
+    }
+
+    pub fn boot_memory(&self) -> Option<&helios_hal::boot::BootMemoryMetadata> {
+        self.boot_memory.as_ref()
+    }
+
+    pub async fn freeze_for_hibernate(
+        &self,
+        arrival_deadline: Duration,
+        interrupt_guests: impl FnOnce(),
+    ) -> Result<FrozenMachine<CpuImpl, WatchdogImpl>, FreezeError> {
+        self.freeze
+            .freeze_for_hibernate(
+                &self.timer,
+                self.watchdog.clone(),
+                arrival_deadline,
+                interrupt_guests,
+            )
+            .await
+    }
+}
+
 pub struct Kernel<
     CpuImpl: Cpu + Clone,
     WatchdogImpl: Watchdog + Clone = NoWatchdog,
@@ -1133,6 +1180,20 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
                 interrupt_guests,
             )
             .await
+    }
+
+    /// Creates an owned [`HibernateHandle`] for a BSP-pinned hibernate service
+    /// task spawned with [`Self::spawn_local_detached`].
+    pub fn hibernate_handle(&self) -> HibernateHandle<CpuImpl, WatchdogImpl> {
+        HibernateHandle {
+            freeze: self.executor.freeze_handle(),
+            timer: self.timer.clone(),
+            watchdog: self.watchdog.clone(),
+            topology: self.topology,
+            dma_model: self.dma_model,
+            devices: self.devices,
+            boot_memory: self.boot_memory.clone(),
+        }
     }
 
     pub fn run_until_stalled(&self) -> usize {
