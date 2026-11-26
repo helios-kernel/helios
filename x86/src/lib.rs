@@ -432,6 +432,24 @@ fn x86_kernel_main() -> ! {
     let acpi_recorder = helios_acpi::NotifyRecorder::new(acpi_handler);
     let acpi_namespace = helios_acpi::load_namespace(&acpi_tables, &acpi_recorder)
         .unwrap_or_else(|error| panic!("x86 ACPI: {error}"));
+    match discover_acpi_s5(&acpi_tables, &acpi_namespace) {
+        Some(s5) => {
+            tracing::info!(
+                pm1a_cnt_port = format_args!("{:#x}", s5.pm1a_cnt_port),
+                pm1b_cnt_port = ?s5.pm1b_cnt_port,
+                slp_typ_a = s5.slp_typ_a,
+                slp_typ_b = s5.slp_typ_b,
+                "ACPI S5 soft-off discovered"
+            );
+            cpu.platform_state().install_acpi_s5(s5);
+        }
+        None => {
+            tracing::warn!(
+                "ACPI S5 soft-off parameters (FADT PM1a_CNT_BLK / \\_S5) not found; \
+                 shutdown will halt in cli; hlt"
+            );
+        }
+    }
     let vmgenid_window = vmgenid::discover(&acpi_namespace, physical_memory_offset);
     let machine_generation =
         helios_kernel::MachineGeneration::new(vmgenid_window.map(|found| found.window));
@@ -1459,8 +1477,29 @@ impl Cpu for X86Cpu {
     }
 
     fn shutdown(&self) -> ! {
+        x86_64::instructions::interrupts::disable();
+        if let Some(s5) = self.state.acpi_s5() {
+            // SAFETY: `pm1a_cnt_port` is the ACPI FADT PM1a_CNT_BLK I/O port
+            // validated during ACPI bring-up; writing `(SLP_TYPa << 10) | SLP_EN`
+            // triggers an ACPI S5 soft-off (ACPI 6.5 §4.8.3.2.1).
+            unsafe {
+                PortWriteOnly::<u16>::new(s5.pm1a_cnt_port).write(s5.pm1a_value());
+            }
+            if let Some(pm1b_port) = s5.pm1b_cnt_port {
+                // SAFETY: `pm1b_port` is the ACPI FADT PM1b_CNT_BLK I/O port
+                // validated during ACPI bring-up; writing `(SLP_TYPb << 10) | SLP_EN`
+                // completes the ACPI S5 soft-off transition.
+                unsafe {
+                    PortWriteOnly::<u16>::new(pm1b_port).write(s5.pm1b_value());
+                }
+            }
+        }
         loop {
-            core::hint::spin_loop();
+            // SAFETY: interrupts are disabled and the machine is powered down
+            // or awaiting external power removal; `cli; hlt` halts indefinitely.
+            unsafe {
+                core::arch::asm!("cli; hlt", options(nomem, nostack));
+            }
         }
     }
 
@@ -1474,6 +1513,49 @@ impl Cpu for X86Cpu {
             core::hint::spin_loop();
         }
     }
+}
+
+/// Parses the FADT `PM1a_CNT_BLK` (and optional `PM1b_CNT_BLK`) I/O ports
+/// and evaluates the AML `\_S5` sleep-type package so [`X86Cpu::shutdown`]
+/// can power off the machine cleanly via ACPI S5.
+fn discover_acpi_s5<H: acpi::Handler>(
+    tables: &AcpiTables<H>,
+    namespace: &smp::AcpiNamespace,
+) -> Option<smp::AcpiS5Shutdown> {
+    use core::str::FromStr;
+
+    let fadt = tables.find_table::<acpi::sdt::fadt::Fadt>()?;
+    let pm1a = fadt.pm1a_control_block().ok()?;
+    if pm1a.address_space != acpi::address::AddressSpace::SystemIo || pm1a.address == 0 {
+        return None;
+    }
+    let pm1a_cnt_port = u16::try_from(pm1a.address).ok()?;
+
+    let pm1b_cnt_port = fadt.pm1b_control_block().ok().flatten().and_then(|gas| {
+        (gas.address_space == acpi::address::AddressSpace::SystemIo && gas.address != 0)
+            .then(|| u16::try_from(gas.address).ok())
+            .flatten()
+    });
+
+    let s5_name = acpi::aml::namespace::AmlName::from_str("\\_S5").ok()?;
+    let s5_obj = namespace
+        .evaluate_if_present(s5_name, alloc::vec::Vec::new())
+        .ok()??;
+    let acpi::aml::object::Object::Package(elements) = &*s5_obj else {
+        return None;
+    };
+    let slp_typ_a = (elements.first()?.as_integer().ok()? & 0x7) as u8;
+    let slp_typ_b = elements
+        .get(1)
+        .and_then(|element| element.as_integer().ok())
+        .map_or(slp_typ_a, |value| (value & 0x7) as u8);
+
+    Some(smp::AcpiS5Shutdown {
+        pm1a_cnt_port,
+        pm1b_cnt_port,
+        slp_typ_a,
+        slp_typ_b,
+    })
 }
 
 fn x86_has_rdrand() -> bool {

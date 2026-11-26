@@ -64,6 +64,14 @@ use cache::{CacheDisk, DiskLayout};
 /// the kernel may write to for itself.
 pub const SCRATCH_DISK_SERIAL: &str = "helios-data";
 
+/// The serial the platform gives the dedicated disk that holds hibernate
+/// images.
+///
+/// Classified strictly by serial alongside [`SCRATCH_DISK_SERIAL`] so a
+/// hibernate image disk is never treated as a mount source or scratch swap
+/// disk.
+pub const HIBERNATE_DISK_SERIAL: &str = "helios-hibernate";
+
 /// How often the cache re-reads the machine's memory pressure: the
 /// cadence swap reads it at, so both answer the same reading.
 const RECLAIM_TICK: Duration = crate::SWAP_TICK;
@@ -73,6 +81,8 @@ const RECLAIM_TICK: Duration = crate::SWAP_TICK;
 pub enum DiskRole {
     /// The kernel's own disk, which backs swap.
     Scratch,
+    /// The kernel's dedicated hibernate image disk.
+    Hibernate,
     /// A disk the mount layer may mount, looked up by its serial.
     MountSource,
     /// A disk with no name — the boot image — which the kernel leaves
@@ -86,6 +96,8 @@ impl DiskRole {
             Self::Unused
         } else if serial.as_bytes() == SCRATCH_DISK_SERIAL.as_bytes() {
             Self::Scratch
+        } else if serial.as_bytes() == HIBERNATE_DISK_SERIAL.as_bytes() {
+            Self::Hibernate
         } else {
             Self::MountSource
         }
@@ -103,6 +115,10 @@ pub enum BlockInstallError {
         "more than one block device reported the serial {SCRATCH_DISK_SERIAL:?}; the kernel cannot tell which one it owns"
     )]
     DuplicateScratchDisk,
+    #[error(
+        "more than one block device reported the serial {HIBERNATE_DISK_SERIAL:?}; the kernel cannot tell which one holds hibernate images"
+    )]
+    DuplicateHibernateDisk,
     #[error("scratch disk self check failed: {0}")]
     SelfCheck(#[from] BlockSelfCheckError),
 }
@@ -172,6 +188,7 @@ impl BlockService {
 /// The disks [`identify`] sorted by role.
 struct Identified<Device> {
     scratch: Device,
+    hibernate: Option<Device>,
     mount_sources: ArrayVec<(BlockSerial, Device), MAX_BLOCK_DEVICES>,
 }
 
@@ -181,6 +198,7 @@ where
     Device: BlockDevice,
 {
     let mut scratch = None;
+    let mut hibernate = None;
     let mut mount_sources = ArrayVec::new();
     for device in devices {
         let serial = match device.serial().await {
@@ -208,6 +226,12 @@ where
                     "block device identified as the kernel scratch disk"
                 );
             }
+            DiskRole::Hibernate => {
+                if hibernate.replace(device).is_some() {
+                    return Err(BlockInstallError::DuplicateHibernateDisk);
+                }
+                tracing::info!(?serial, "block device identified as the hibernate disk");
+            }
             DiskRole::MountSource => {
                 if mount_sources.iter().any(|(taken, _)| *taken == serial) {
                     let refusal = DiskRefusal::DuplicateSerial { serial };
@@ -228,6 +252,7 @@ where
     }
     Ok(Identified {
         scratch: scratch.ok_or(BlockInstallError::NoScratchDisk)?,
+        hibernate,
         mount_sources,
     })
 }
@@ -304,13 +329,14 @@ where
 }
 
 /// Identifies the devices a backend brought up, proves the scratch disk,
-/// puts the mount sources behind the block cache and publishes both.
+/// puts the mount sources behind the block cache, separates the dedicated
+/// hibernate disk when present, and publishes them.
 ///
-/// `install` receives the service, the scratch disk for swap, and the
-/// block cache over the mount sources when there are any, both typed as
-/// the backend's device. The identification task and the cache's
-/// reclaim task run on the calling processor; every other request a
-/// disk sees is issued by the task that needs it, on its own processor.
+/// `install` receives the service, the scratch disk for swap, the block
+/// cache over the mount sources when there are any, and the dedicated
+/// hibernate disk (`helios-hibernate`) when present, all typed as the
+/// backend's device. The hibernate disk is never placed into `BlockCache`
+/// or `ScratchDisk`.
 pub fn install_block_devices<CpuImpl, WatchdogImpl, MeasuredBootImpl, Device, Install>(
     kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     root: RootEntropyHandle,
@@ -321,7 +347,8 @@ pub fn install_block_devices<CpuImpl, WatchdogImpl, MeasuredBootImpl, Device, In
     WatchdogImpl: Watchdog + Clone,
     MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
     Device: BlockDevice<Buffer = BlockPages> + 'static,
-    Install: FnOnce(BlockService, ScratchDisk<Device>, Option<BlockCache<Device>>) + 'static,
+    Install: FnOnce(BlockService, ScratchDisk<Device>, Option<BlockCache<Device>>, Option<Device>)
+        + 'static,
 {
     if devices.is_empty() {
         tracing::warn!("no block device was discovered on the platform bus");
@@ -340,6 +367,17 @@ pub fn install_block_devices<CpuImpl, WatchdogImpl, MeasuredBootImpl, Device, In
             panic!("{}", BlockInstallError::SelfCheck(error));
         }
         log_scratch_disk(&scratch);
+
+        if let Some(hibernate) = &identified.hibernate {
+            let geometry = hibernate.geometry();
+            tracing::info!(
+                serial = HIBERNATE_DISK_SERIAL,
+                capacity_bytes = geometry.capacity_bytes(),
+                block_bytes = geometry.logical_block_bytes,
+                read_only = hibernate.is_read_only(),
+                "hibernate disk online"
+            );
+        }
 
         let usable_bytes = crate::machine_memory().usable_bytes;
         let limits = BlockCacheLimits::for_machine(usable_bytes);
@@ -361,7 +399,7 @@ pub fn install_block_devices<CpuImpl, WatchdogImpl, MeasuredBootImpl, Device, In
             scratch: scratch.stats_handle(),
             pool,
         };
-        install(service, scratch, cache);
+        install(service, scratch, cache, identified.hibernate);
     });
 }
 
