@@ -99,10 +99,73 @@ const ESRCH: u64 = 3;
 const E2BIG: u64 = 7;
 const EAGAIN: u64 = 11;
 
+/// Per-thread scheduling, CPU affinity, I/O priority, and task name (`comm`)
+/// state (`include/linux/sched.h`, `block/ioprio.c`).
+#[derive(Clone, Debug)]
+pub(super) struct ThreadSchedState {
+    pub policy: i32,
+    pub priority: i32,
+    pub reset_on_fork: bool,
+    /// Stored CPU affinity bitmask words; empty means all online CPUs.
+    pub affinity: Vec<u64>,
+    /// Packed `ioprio` (`(class << 13) | data`); `0` = `IOPRIO_CLASS_NONE`.
+    pub ioprio: u16,
+    /// 16-byte NUL-terminated task name (`PR_SET_NAME` / `PR_GET_NAME`).
+    pub comm: [u8; 16],
+}
+
+impl Default for ThreadSchedState {
+    fn default() -> Self {
+        Self {
+            policy: SCHED_NORMAL,
+            priority: 0,
+            reset_on_fork: false,
+            affinity: Vec::new(),
+            ioprio: 0,
+            comm: [0u8; 16],
+        }
+    }
+}
+
+impl ThreadSchedState {
+    /// Linux `kernel/fork.c` `sched_fork`: `SCHED_RESET_ON_FORK` resets RT/FIFO/RR
+    /// policies back to `SCHED_NORMAL` with priority 0 in the child.
+    pub(super) fn clone_for_fork(&self) -> Self {
+        let mut cloned = self.clone();
+        if cloned.reset_on_fork {
+            cloned.policy = SCHED_NORMAL;
+            cloned.priority = 0;
+            cloned.reset_on_fork = false;
+        }
+        cloned
+    }
+}
+
+// Linux UAPI `include/uapi/linux/sched.h` scheduling policies.
+const SCHED_NORMAL: i32 = 0;
+const SCHED_FIFO: i32 = 1;
+const SCHED_RR: i32 = 2;
+const SCHED_BATCH: i32 = 3;
+const SCHED_IDLE: i32 = 5;
+const SCHED_RESET_ON_FORK: i32 = 0x4000_0000;
+
+// Linux UAPI `include/uapi/linux/ioprio.h`.
+const IOPRIO_WHO_PROCESS: i32 = 1;
+const IOPRIO_WHO_PGRP: i32 = 2;
+const IOPRIO_WHO_USER: i32 = 3;
+const IOPRIO_CLASS_SHIFT: u32 = 13;
+const IOPRIO_CLASS_NONE: u16 = 0;
+const IOPRIO_CLASS_RT: u16 = 1;
+const IOPRIO_CLASS_BE: u16 = 2;
+const IOPRIO_CLASS_IDLE: u16 = 3;
+const IOPRIO_PRIO_MASK: u16 = (1 << IOPRIO_CLASS_SHIFT) - 1;
+const IOPRIO_NR_LEVELS: u16 = 8;
+
 struct RegisteredThread {
     tgid: NonZeroU32,
     slot: Arc<ThreadSignalSlot>,
     credentials: Arc<spin::Mutex<Credentials>>,
+    sched: Arc<spin::Mutex<ThreadSchedState>>,
 }
 
 struct PidNamespaceState {
@@ -116,6 +179,7 @@ struct PidNamespaceState {
 struct PidNamespaceInner {
     state: spin::Mutex<PidNamespaceState>,
     wait_changed: Notify,
+    file_locks: helios_unix::FileLockTable,
 }
 
 impl PidNamespaceState {
@@ -203,8 +267,15 @@ impl PidNamespace {
                     threads: BTreeMap::new(),
                 }),
                 wait_changed: Notify::new(),
+                file_locks: helios_unix::FileLockTable::new(),
             }),
         }
+    }
+
+    /// Container-wide advisory file lock table (`flock(2)` and POSIX `fcntl(2)`
+    /// record locks) shared by every process inside this namespace.
+    pub fn file_locks(&self) -> helios_unix::FileLockTable {
+        self.inner.file_locks.clone()
     }
 
     /// A private namespace seeded with one process `leader`, for standalone
@@ -227,6 +298,7 @@ impl PidNamespace {
                     threads: BTreeMap::new(),
                 }),
                 wait_changed: Notify::new(),
+                file_locks: helios_unix::FileLockTable::new(),
             }),
         }
     }
@@ -286,25 +358,31 @@ impl PidNamespace {
         tgid: NonZeroU32,
         signals: Arc<ProcessSignals>,
         credentials: Arc<spin::Mutex<Credentials>>,
+        sched: Arc<spin::Mutex<ThreadSchedState>>,
     ) {
         let mut state = self.inner.state.lock();
         state.allocated.insert(tgid.get());
         state.processes.insert(
             tgid.get(),
-            ProcessTreeRecord::new_root(tgid, signals, credentials),
+            ProcessTreeRecord::new_root(tgid, signals, credentials, sched),
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal child-process registration mirrors Linux copy_process fields"
+    )]
     pub(super) fn register_child_process(
         &self,
         pid: NonZeroU32,
         ppid: u32,
+        parent_tid: u32,
         pgid: NonZeroU32,
         sid: NonZeroU32,
         exit_signal: Option<Signal>,
         signals: Arc<ProcessSignals>,
         credentials: Arc<spin::Mutex<Credentials>>,
+        sched: Arc<spin::Mutex<ThreadSchedState>>,
     ) {
         let mut state = self.inner.state.lock();
         state.allocated.insert(pid.get());
@@ -312,15 +390,79 @@ impl PidNamespace {
             pid.get(),
             ProcessTreeRecord {
                 ppid,
+                parent_tid,
                 pgid,
                 sid,
                 exit_signal,
                 has_execed: false,
+                is_child_subreaper: false,
+                pdeathsig: None,
+                usage: super::system::CpuUsage::default(),
                 state: ChildWaitState::Running,
                 signals,
                 credentials,
+                sched,
             },
         );
+    }
+
+    /// Updates `PR_SET_PDEATHSIG` for `pid`.
+    pub(super) fn set_pdeathsig(&self, pid: NonZeroU32, signal: Option<Signal>) {
+        if let Some(record) = self.inner.state.lock().processes.get_mut(&pid.get()) {
+            record.pdeathsig = signal;
+        }
+    }
+
+    /// Reads `PR_GET_PDEATHSIG` for `pid`.
+    pub(super) fn get_pdeathsig(&self, pid: NonZeroU32) -> Option<Signal> {
+        self.inner
+            .state
+            .lock()
+            .processes
+            .get(&pid.get())
+            .and_then(|record| record.pdeathsig)
+    }
+
+    /// Updates `PR_SET_CHILD_SUBREAPER` for `pid`.
+    pub(super) fn set_child_subreaper(&self, pid: NonZeroU32, enabled: bool) {
+        if let Some(record) = self.inner.state.lock().processes.get_mut(&pid.get()) {
+            record.is_child_subreaper = enabled;
+        }
+    }
+
+    /// Reads `PR_GET_CHILD_SUBREAPER` for `pid`.
+    pub(super) fn get_child_subreaper(&self, pid: NonZeroU32) -> bool {
+        self.inner
+            .state
+            .lock()
+            .processes
+            .get(&pid.get())
+            .is_some_and(|record| record.is_child_subreaper)
+    }
+
+    /// Records the process's accumulated CPU/RSS usage so its parent observes it
+    /// in `wait4`/`waitid` and `getrusage(RUSAGE_CHILDREN)`/`times`.
+    pub fn record_usage(&self, pid: NonZeroU32, usage: super::system::CpuUsage) {
+        if let Some(record) = self.inner.state.lock().processes.get_mut(&pid.get()) {
+            record.usage = usage;
+        }
+    }
+
+    /// Delivers `PR_SET_PDEATHSIG` to any live child forked by `exiting_tid`
+    /// (`kernel/exit.c` `forget_original_parent`).
+    pub(super) fn deliver_pdeathsig_for_thread(&self, exiting_tid: NonZeroU32) {
+        let targets: Vec<(Arc<ProcessSignals>, Signal)> = {
+            let state = self.inner.state.lock();
+            state
+                .processes
+                .values()
+                .filter(|child| child.is_live() && child.parent_tid == exiting_tid.get())
+                .filter_map(|child| child.pdeathsig.map(|sig| (child.signals.clone(), sig)))
+                .collect()
+        };
+        for (child_signals, sig) in targets {
+            let _ = child_signals.raise_process(crate::signal_frame::SigInfo::from_kernel(sig));
+        }
     }
 
     /// Replaces the credential handle recorded for process `pid` (used when a
@@ -425,9 +567,11 @@ impl PidNamespace {
         self.inner.wait_changed.notify_all();
     }
 
-    /// Transitions `pid` to exited/zombie state, reparents any children of
-    /// `pid` to PID 1, auto-reaps if the parent is gone or ignores `SIGCHLD` /
-    /// sets `SA_NOCLDWAIT`, and notifies parent (`SIGCHLD` + `wait_changed`).
+    /// Transitions `pid` to exited/zombie state, delivers `PR_SET_PDEATHSIG` to
+    /// children, reparents any surviving children to the nearest live
+    /// `PR_SET_CHILD_SUBREAPER` ancestor (or PID 1), auto-reaps if the parent is
+    /// gone or ignores `SIGCHLD` / sets `SA_NOCLDWAIT`, and notifies parent
+    /// (`SIGCHLD` + `wait_changed`).
     pub fn mark_exited(&self, pid: NonZeroU32, termination: ChildTermination) {
         let mut signals_to_send: Vec<(Arc<ProcessSignals>, crate::signal_frame::SigInfo)> =
             Vec::new();
@@ -442,37 +586,75 @@ impl PidNamespace {
             let ppid = record.ppid;
             let exit_signal = record.exit_signal;
             let child_uid = record.real_uid();
+            let self_usage = record.usage;
 
             state.threads.remove(&pid.get());
             state.live_processes = state.live_processes.saturating_sub(1);
 
-            // Reparent surviving children of `pid` to container init (PID 1),
-            // or auto-reap their zombies if PID 1 is absent or is `pid` itself.
-            let init_alive = pid.get() != 1
+            // Walk ancestors for the nearest live child subreaper (`kernel/exit.c`
+            // `find_child_reaper`), falling back to container init (PID 1).
+            let mut reaper_pid: Option<u32> = None;
+            let mut ancestor = ppid;
+            let mut depth = 0usize;
+            while ancestor != 0 && ancestor != pid.get() && depth < 1024 {
+                depth += 1;
+                let Some(anc) = state.processes.get(&ancestor) else {
+                    break;
+                };
+                if anc.is_live() && anc.is_child_subreaper {
+                    reaper_pid = Some(ancestor);
+                    break;
+                }
+                if anc.ppid == ancestor {
+                    break;
+                }
+                ancestor = anc.ppid;
+            }
+            if reaper_pid.is_none()
+                && pid.get() != 1
                 && state
                     .processes
                     .get(&1)
-                    .is_some_and(ProcessTreeRecord::is_live);
-            let init_auto_reap = init_alive
-                && state
+                    .is_some_and(ProcessTreeRecord::is_live)
+            {
+                reaper_pid = Some(1);
+            }
+            let reaper_auto_reap = reaper_pid.is_some_and(|rpid| {
+                state
                     .processes
-                    .get(&1)
-                    .is_some_and(|init| init.signals.sigchld_auto_reap());
+                    .get(&rpid)
+                    .is_some_and(|reaper| reaper.signals.sigchld_auto_reap())
+            });
             let mut reparented_zombies = Vec::new();
             let mut auto_reap_children = Vec::new();
             for (&child_pid, child) in state.processes.iter_mut() {
                 if child.ppid == pid.get() {
-                    if init_alive {
-                        child.ppid = 1;
+                    if child.is_live()
+                        && let Some(death_sig) = child.pdeathsig
+                    {
+                        signals_to_send.push((
+                            child.signals.clone(),
+                            crate::signal_frame::SigInfo::from_kernel(death_sig),
+                        ));
+                    }
+                    if let Some(new_parent) = reaper_pid {
+                        child.ppid = new_parent;
+                        child.parent_tid = new_parent;
                         if let ChildWaitState::Exited(term) = child.state {
-                            if init_auto_reap {
+                            if reaper_auto_reap {
                                 auto_reap_children.push(child_pid);
                             } else {
-                                reparented_zombies.push((child_pid, child.real_uid(), term));
+                                reparented_zombies.push((
+                                    child_pid,
+                                    child.real_uid(),
+                                    term,
+                                    child.usage,
+                                ));
                             }
                         }
                     } else {
                         child.ppid = 0;
+                        child.parent_tid = 0;
                         if !child.is_live() {
                             auto_reap_children.push(child_pid);
                         }
@@ -484,15 +666,17 @@ impl PidNamespace {
                 state.allocated.remove(&child_pid);
             }
             if !reparented_zombies.is_empty()
-                && let Some(init) = state.processes.get(&1)
+                && let Some(new_parent) = reaper_pid
+                && let Some(reaper) = state.processes.get(&new_parent)
             {
-                for (zpid, zuid, term) in reparented_zombies {
+                for (zpid, zuid, term, usage) in reparented_zombies {
                     let event = WaitEvent {
                         pid: zpid,
                         uid: zuid,
                         kind: WaitEventKind::Exited(term),
+                        usage,
                     };
-                    signals_to_send.push((init.signals.clone(), event.encode_siginfo()));
+                    signals_to_send.push((reaper.signals.clone(), event.encode_siginfo()));
                 }
             }
 
@@ -522,6 +706,7 @@ impl PidNamespace {
                                     pid: pid.get(),
                                     uid: child_uid,
                                     kind: WaitEventKind::Exited(termination),
+                                    usage: self_usage,
                                 }
                                 .encode_siginfo()
                             } else {
@@ -602,6 +787,7 @@ impl PidNamespace {
                         pid,
                         uid: record.real_uid(),
                         kind,
+                        usage: record.usage,
                     },
                 ));
                 break;
@@ -750,6 +936,7 @@ impl PidNamespace {
         tgid: NonZeroU32,
         slot: Arc<ThreadSignalSlot>,
         credentials: Arc<spin::Mutex<Credentials>>,
+        sched: Arc<spin::Mutex<ThreadSchedState>>,
     ) {
         self.inner.state.lock().threads.insert(
             slot.tid().get(),
@@ -757,8 +944,41 @@ impl PidNamespace {
                 tgid,
                 slot,
                 credentials,
+                sched,
             },
         );
+    }
+
+    pub(super) fn lookup_sched_target(&self, id: u32) -> Option<SchedTarget> {
+        let state = self.inner.state.lock();
+        if let Some(thread) = state.threads.get(&id) {
+            return Some((thread.sched.clone(), thread.credentials.clone()));
+        }
+        state
+            .processes
+            .get(&id)
+            .filter(|entry| entry.is_live())
+            .map(|entry| (entry.sched.clone(), entry.credentials.clone()))
+    }
+
+    pub(super) fn sched_targets_for_pgrp(&self, pgid: u32) -> Vec<SchedTarget> {
+        let state = self.inner.state.lock();
+        state
+            .processes
+            .values()
+            .filter(|entry| entry.is_live() && entry.pgid.get() == pgid)
+            .map(|entry| (entry.sched.clone(), entry.credentials.clone()))
+            .collect()
+    }
+
+    pub(super) fn sched_targets_for_user(&self, uid: u32) -> Vec<SchedTarget> {
+        let state = self.inner.state.lock();
+        state
+            .processes
+            .values()
+            .filter(|entry| entry.is_live() && entry.real_uid() == uid)
+            .map(|entry| (entry.sched.clone(), entry.credentials.clone()))
+            .collect()
     }
 
     pub(super) fn unregister_thread(&self, tid: NonZeroU32) {
@@ -912,6 +1132,7 @@ impl ThreadGroup {
             self.live.swap_remove(pos);
             self.pids.unregister_thread(tid);
             if tid != self.leader {
+                self.pids.deliver_pdeathsig_for_thread(tid);
                 self.pids.release_tid(tid);
             }
         }
@@ -1178,18 +1399,22 @@ fn spawn_parsed_clone<R: Resources, M: UserMemory, T: Thread<R>>(
         .signals
         .register_thread(tid, process.signals.current_mask());
     // Child thread inherits a copy of the caller's credentials (`kernel/cred.c`
-    // `copy_creds`) so per-thread raw `setresuid`/`capset`/`prctl` syscalls do
-    // not mutate sibling threads.
+    // `copy_creds`) and scheduling state so per-thread syscalls do not mutate
+    // sibling threads.
     let child_creds = Arc::new(spin::Mutex::new(process.credentials.lock().clone()));
-    process
-        .shared
-        .pids
-        .register_thread(process.pid(), thread_signals.clone(), child_creds.clone());
+    let child_sched = Arc::new(spin::Mutex::new(process.sched.lock().clone()));
+    process.shared.pids.register_thread(
+        process.pid(),
+        thread_signals.clone(),
+        child_creds.clone(),
+        child_sched.clone(),
+    );
     let child = Process {
         shared: process.shared.clone(),
         tid,
         signals: thread_signals,
         credentials: child_creds,
+        sched: child_sched,
         clear_child_tid: if parsed.flags & CLONE_CHILD_CLEARTID != 0 {
             parsed.child_tid
         } else {
@@ -1227,6 +1452,34 @@ pub(super) async fn sched_yield() -> u64 {
     0
 }
 
+fn can_modify_sched(caller: &Credentials, target: &Credentials) -> bool {
+    caller.capabilities.has_effective(CAP_SYS_NICE)
+        || caller.user.effective == target.user.effective
+        || caller.user.effective == target.user.real
+}
+
+type SchedTarget = (
+    Arc<spin::Mutex<ThreadSchedState>>,
+    Arc<spin::Mutex<Credentials>>,
+);
+type OptSchedTarget = (
+    Arc<spin::Mutex<ThreadSchedState>>,
+    Option<Arc<spin::Mutex<Credentials>>>,
+);
+
+fn resolve_sched_target<R: Resources>(
+    process: &Process<R>,
+    pid: i32,
+) -> Result<OptSchedTarget, u64> {
+    if pid == 0 || pid as u32 == process.tid.get() {
+        return Ok((process.sched.clone(), None));
+    }
+    match process.shared.pids.lookup_sched_target(pid as u32) {
+        Some((sched, creds)) => Ok((sched, Some(creds))),
+        None => Err(ESRCH),
+    }
+}
+
 /// `sched_getaffinity(pid, cpusetsize, mask)` (`kernel/sched/syscalls.c`).
 ///
 /// Raw kernel syscall returns the byte length written to `mask` (a multiple
@@ -1240,21 +1493,439 @@ pub(super) fn sched_getaffinity<R: Resources, M: UserMemory, O: System>(
     let pid = args[0] as u32 as i32;
     let len = args[1] as u32 as usize;
     let cpus = output.processor_count().max(1) as usize;
-    let required = cpus.div_ceil(64) * 8;
+    let words = cpus.div_ceil(64);
+    let required = words * 8;
     if !len.is_multiple_of(8) || len < required {
         return errno(EINVAL);
     }
-    if pid < 0 || (pid != 0 && !process.shared.threads.lock().contains(pid as u32)) {
+    if pid < 0 {
         return errno(ESRCH);
     }
+    let (sched_arc, _) = match resolve_sched_target(process, pid) {
+        Ok(pair) => pair,
+        Err(err) => return errno(err),
+    };
+    let stored = sched_arc.lock().affinity.clone();
     let mut mask = vec![0u8; required];
-    for cpu in 0..cpus {
-        mask[cpu / 8] |= 1 << (cpu % 8);
+    if stored.is_empty() {
+        for cpu in 0..cpus {
+            mask[cpu / 8] |= 1 << (cpu % 8);
+        }
+    } else {
+        for (i, word) in stored.iter().take(words).enumerate() {
+            let mut w = *word;
+            if i == words - 1 && !cpus.is_multiple_of(64) {
+                w &= (1u64 << (cpus % 64)) - 1;
+            }
+            mask[i * 8..(i + 1) * 8].copy_from_slice(&w.to_le_bytes());
+        }
     }
     if memory.write(args[2], &mask).is_err() {
         return errno(EFAULT);
     }
     required as u64
+}
+
+/// `sched_setaffinity(pid, cpusetsize, mask)` (`kernel/sched/syscalls.c`).
+pub(super) fn sched_setaffinity<R: Resources, M: UserMemory, O: System>(
+    process: &Process<R>,
+    args: [u64; 6],
+    memory: &M,
+    output: &O,
+) -> u64 {
+    let pid = args[0] as u32 as i32;
+    let len = args[1] as u32 as usize;
+    let mask_ptr = args[2];
+    if len == 0 {
+        return errno(EINVAL);
+    }
+    let cpus = output.processor_count().max(1) as usize;
+    let words = cpus.div_ceil(64);
+    let read_len = len.min(words * 8);
+    let mut raw = vec![0u8; read_len];
+    if memory.read(mask_ptr, &mut raw).is_err() {
+        return errno(EFAULT);
+    }
+    if pid < 0 {
+        return errno(ESRCH);
+    }
+    let (sched_arc, target_creds) = match resolve_sched_target(process, pid) {
+        Ok(pair) => pair,
+        Err(err) => return errno(err),
+    };
+    if let Some(target_creds) = target_creds {
+        let caller = process.credentials.lock().clone();
+        let target = target_creds.lock().clone();
+        if !can_modify_sched(&caller, &target) {
+            return errno(EPERM);
+        }
+    }
+    let mut intersected = vec![0u64; words];
+    let mut any_online = false;
+    for cpu in 0..cpus {
+        let byte_idx = cpu / 8;
+        if byte_idx < raw.len() && (raw[byte_idx] & (1 << (cpu % 8))) != 0 {
+            intersected[cpu / 64] |= 1u64 << (cpu % 64);
+            any_online = true;
+        }
+    }
+    if !any_online {
+        return errno(EINVAL);
+    }
+    sched_arc.lock().affinity = intersected;
+    0
+}
+
+fn valid_sched_policy(policy: i32) -> bool {
+    matches!(
+        policy,
+        SCHED_NORMAL | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE
+    )
+}
+
+fn valid_sched_priority(policy: i32, prio: i32) -> bool {
+    match policy {
+        SCHED_FIFO | SCHED_RR => (1..=99).contains(&prio),
+        SCHED_NORMAL | SCHED_BATCH | SCHED_IDLE => prio == 0,
+        _ => false,
+    }
+}
+
+/// `sched_get_priority_max(policy)` (`kernel/sched/syscalls.c`).
+pub(super) fn sched_get_priority_max(args: [u64; 6]) -> u64 {
+    match args[0] as u32 as i32 {
+        SCHED_FIFO | SCHED_RR => 99,
+        SCHED_NORMAL | SCHED_BATCH | SCHED_IDLE => 0,
+        _ => errno(EINVAL),
+    }
+}
+
+/// `sched_get_priority_min(policy)` (`kernel/sched/syscalls.c`).
+pub(super) fn sched_get_priority_min(args: [u64; 6]) -> u64 {
+    match args[0] as u32 as i32 {
+        SCHED_FIFO | SCHED_RR => 1,
+        SCHED_NORMAL | SCHED_BATCH | SCHED_IDLE => 0,
+        _ => errno(EINVAL),
+    }
+}
+
+/// `sched_getscheduler(pid)` (`kernel/sched/syscalls.c`).
+pub(super) fn sched_getscheduler<R: Resources>(process: &Process<R>, args: [u64; 6]) -> u64 {
+    let pid = args[0] as u32 as i32;
+    if pid < 0 {
+        return errno(EINVAL);
+    }
+    let (sched_arc, _) = match resolve_sched_target(process, pid) {
+        Ok(pair) => pair,
+        Err(err) => return errno(err),
+    };
+    let sched = sched_arc.lock();
+    let mut out = sched.policy;
+    if sched.reset_on_fork {
+        out |= SCHED_RESET_ON_FORK;
+    }
+    out as u32 as u64
+}
+
+/// `sched_setscheduler(pid, policy, param)` (`kernel/sched/syscalls.c`).
+pub(super) fn sched_setscheduler<R: Resources, M: UserMemory>(
+    process: &Process<R>,
+    args: [u64; 6],
+    memory: &M,
+) -> u64 {
+    let pid = args[0] as u32 as i32;
+    let raw_policy = args[1] as u32 as i32;
+    let param_ptr = args[2];
+    if pid < 0 || param_ptr == 0 {
+        return errno(EINVAL);
+    }
+    let mut raw = [0u8; 4];
+    if memory.read(param_ptr, &mut raw).is_err() {
+        return errno(EFAULT);
+    }
+    let prio = i32::from_le_bytes(raw);
+    let reset_on_fork = raw_policy & SCHED_RESET_ON_FORK != 0;
+    let policy = raw_policy & !SCHED_RESET_ON_FORK;
+    if !valid_sched_policy(policy) || !valid_sched_priority(policy, prio) {
+        return errno(EINVAL);
+    }
+    let (sched_arc, target_creds) = match resolve_sched_target(process, pid) {
+        Ok(pair) => pair,
+        Err(err) => return errno(err),
+    };
+    let caller = process.credentials.lock().clone();
+    if let Some(target_creds) = target_creds {
+        let target = target_creds.lock().clone();
+        if !can_modify_sched(&caller, &target) {
+            return errno(EPERM);
+        }
+    }
+    if matches!(policy, SCHED_FIFO | SCHED_RR) && !caller.capabilities.has_effective(CAP_SYS_NICE) {
+        let rtprio = process.limit(Resource::Rtprio).current;
+        if (prio as u64) > rtprio {
+            return errno(EPERM);
+        }
+    }
+    let mut sched = sched_arc.lock();
+    sched.policy = policy;
+    sched.priority = prio;
+    sched.reset_on_fork = reset_on_fork;
+    0
+}
+
+/// `sched_getparam(pid, param)` (`kernel/sched/syscalls.c`).
+pub(super) fn sched_getparam<R: Resources, M: UserMemory>(
+    process: &Process<R>,
+    args: [u64; 6],
+    memory: &mut M,
+) -> u64 {
+    let pid = args[0] as u32 as i32;
+    let param_ptr = args[1];
+    if pid < 0 || param_ptr == 0 {
+        return errno(EINVAL);
+    }
+    let (sched_arc, _) = match resolve_sched_target(process, pid) {
+        Ok(pair) => pair,
+        Err(err) => return errno(err),
+    };
+    let prio = sched_arc.lock().priority;
+    if memory.write(param_ptr, &prio.to_le_bytes()).is_err() {
+        return errno(EFAULT);
+    }
+    0
+}
+
+/// `sched_setparam(pid, param)` (`kernel/sched/syscalls.c`).
+pub(super) fn sched_setparam<R: Resources, M: UserMemory>(
+    process: &Process<R>,
+    args: [u64; 6],
+    memory: &M,
+) -> u64 {
+    let pid = args[0] as u32 as i32;
+    let param_ptr = args[1];
+    if pid < 0 || param_ptr == 0 {
+        return errno(EINVAL);
+    }
+    let mut raw = [0u8; 4];
+    if memory.read(param_ptr, &mut raw).is_err() {
+        return errno(EFAULT);
+    }
+    let prio = i32::from_le_bytes(raw);
+    let (sched_arc, target_creds) = match resolve_sched_target(process, pid) {
+        Ok(pair) => pair,
+        Err(err) => return errno(err),
+    };
+    let caller = process.credentials.lock().clone();
+    if let Some(target_creds) = target_creds {
+        let target = target_creds.lock().clone();
+        if !can_modify_sched(&caller, &target) {
+            return errno(EPERM);
+        }
+    }
+    let mut sched = sched_arc.lock();
+    if !valid_sched_priority(sched.policy, prio) {
+        return errno(EINVAL);
+    }
+    if matches!(sched.policy, SCHED_FIFO | SCHED_RR)
+        && !caller.capabilities.has_effective(CAP_SYS_NICE)
+    {
+        let rtprio = process.limit(Resource::Rtprio).current;
+        if (prio as u64) > rtprio {
+            return errno(EPERM);
+        }
+    }
+    sched.priority = prio;
+    0
+}
+
+/// `ioprio_set(which, who, ioprio)` (`block/ioprio.c`).
+pub(super) fn ioprio_set<R: Resources>(process: &Process<R>, args: [u64; 6]) -> u64 {
+    let which = args[0] as u32 as i32;
+    let who = args[1] as u32 as i32;
+    let raw_ioprio = args[2] as u32 as i32;
+    if raw_ioprio < 0 || raw_ioprio > i32::from(u16::MAX) {
+        return errno(EINVAL);
+    }
+    let ioprio = raw_ioprio as u16;
+    let class = ioprio >> IOPRIO_CLASS_SHIFT;
+    let data = ioprio & IOPRIO_PRIO_MASK;
+    let caller = process.credentials.lock().clone();
+    match class {
+        IOPRIO_CLASS_NONE => {
+            if data != 0 {
+                return errno(EINVAL);
+            }
+        }
+        IOPRIO_CLASS_RT => {
+            if data >= IOPRIO_NR_LEVELS {
+                return errno(EINVAL);
+            }
+            if !caller.capabilities.has_effective(CAP_SYS_NICE)
+                && !caller.capabilities.has_effective(CAP_SYS_ADMIN)
+            {
+                return errno(EPERM);
+            }
+        }
+        IOPRIO_CLASS_BE => {
+            if data >= IOPRIO_NR_LEVELS {
+                return errno(EINVAL);
+            }
+        }
+        IOPRIO_CLASS_IDLE => {
+            if data >= IOPRIO_NR_LEVELS {
+                return errno(EINVAL);
+            }
+        }
+        _ => return errno(EINVAL),
+    }
+
+    let targets: Vec<OptSchedTarget> = match which {
+        IOPRIO_WHO_PROCESS => {
+            if who < 0 {
+                return errno(ESRCH);
+            }
+            match resolve_sched_target(process, who) {
+                Ok(pair) => vec![pair],
+                Err(err) => return errno(err),
+            }
+        }
+        IOPRIO_WHO_PGRP => {
+            if who < 0 {
+                return errno(ESRCH);
+            }
+            let pgid = if who == 0 {
+                process
+                    .shared
+                    .pids
+                    .pgid(process.pid().get())
+                    .unwrap_or_else(|| process.pid())
+                    .get()
+            } else {
+                who as u32
+            };
+            process
+                .shared
+                .pids
+                .sched_targets_for_pgrp(pgid)
+                .into_iter()
+                .map(|(s, c)| (s, Some(c)))
+                .collect()
+        }
+        IOPRIO_WHO_USER => {
+            if who < 0 {
+                return errno(ESRCH);
+            }
+            let uid = if who == 0 {
+                caller.user.real
+            } else {
+                who as u32
+            };
+            process
+                .shared
+                .pids
+                .sched_targets_for_user(uid)
+                .into_iter()
+                .map(|(s, c)| (s, Some(c)))
+                .collect()
+        }
+        _ => return errno(EINVAL),
+    };
+
+    if targets.is_empty() {
+        return errno(ESRCH);
+    }
+    for (_, target_creds) in &targets {
+        if let Some(target_creds) = target_creds {
+            let target = target_creds.lock().clone();
+            if !can_modify_sched(&caller, &target) {
+                return errno(EPERM);
+            }
+        }
+    }
+    for (sched, _) in targets {
+        sched.lock().ioprio = ioprio;
+    }
+    0
+}
+
+fn effective_ioprio(stored: u16, nice: i32) -> u16 {
+    if (stored >> IOPRIO_CLASS_SHIFT) == IOPRIO_CLASS_NONE {
+        // Linux `include/linux/ioprio.h` `task_nice_ioprio`: default BE level `(nice + 20) / 5`.
+        let level = ((nice + 20) / 5).clamp(0, 7) as u16;
+        (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | level
+    } else {
+        stored
+    }
+}
+
+/// `ioprio_get(which, who)` (`block/ioprio.c`).
+pub(super) fn ioprio_get<R: Resources>(process: &Process<R>, args: [u64; 6]) -> u64 {
+    let which = args[0] as u32 as i32;
+    let who = args[1] as u32 as i32;
+    let nice = process.shared.attributes.lock().nice;
+    let targets: Vec<Arc<spin::Mutex<ThreadSchedState>>> = match which {
+        IOPRIO_WHO_PROCESS => {
+            if who < 0 {
+                return errno(ESRCH);
+            }
+            match resolve_sched_target(process, who) {
+                Ok((sched, _)) => vec![sched],
+                Err(err) => return errno(err),
+            }
+        }
+        IOPRIO_WHO_PGRP => {
+            if who < 0 {
+                return errno(ESRCH);
+            }
+            let pgid = if who == 0 {
+                process
+                    .shared
+                    .pids
+                    .pgid(process.pid().get())
+                    .unwrap_or_else(|| process.pid())
+                    .get()
+            } else {
+                who as u32
+            };
+            process
+                .shared
+                .pids
+                .sched_targets_for_pgrp(pgid)
+                .into_iter()
+                .map(|(s, _)| s)
+                .collect()
+        }
+        IOPRIO_WHO_USER => {
+            if who < 0 {
+                return errno(ESRCH);
+            }
+            let uid = if who == 0 {
+                process.credentials.lock().user.real
+            } else {
+                who as u32
+            };
+            process
+                .shared
+                .pids
+                .sched_targets_for_user(uid)
+                .into_iter()
+                .map(|(s, _)| s)
+                .collect()
+        }
+        _ => return errno(EINVAL),
+    };
+    if targets.is_empty() {
+        return errno(ESRCH);
+    }
+    let mut best: Option<u16> = None;
+    for sched in targets {
+        let val = effective_ioprio(sched.lock().ioprio, nice);
+        best = Some(match best {
+            Some(prev) => prev.min(val),
+            None => val,
+        });
+    }
+    u64::from(best.unwrap_or(0))
 }
 
 /// `nanosleep(req, rem)` (`kernel/time/hrtimer.c`).

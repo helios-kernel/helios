@@ -96,6 +96,12 @@ impl<Service: ComponentNetworkService> SocketNetwork for UnixNetwork<Service> {
         }
     }
 
+    fn icmp_close(&self, socket: u64) {
+        if let Some(service) = self.service.as_ref() {
+            service.icmp_close(socket);
+        }
+    }
+
     fn vsock_listener_close(&self, listener: u64) {
         if let Some(vsock) = self.vsock.as_ref() {
             let _ = vsock.close_listener(crate::VsockListenerId::from_u64(listener));

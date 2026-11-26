@@ -19,6 +19,7 @@ mod display;
 mod embedded;
 mod exec;
 mod gpu;
+pub mod hibernate;
 mod host_fs;
 pub mod hv;
 mod input;
@@ -223,29 +224,30 @@ pub use memory::{
     DEFAULT_COMPRESSION_LEVEL, DEFAULT_POOL_PERCENT, Decommitted, DetachedPages,
     ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, FIBER_STACK_GUARD_BYTES,
     FREE_PAGE_REPORT_INTERVAL, FiberStack, FiberStackArenaStats, FiberStackError,
-    FiberStackVmHooks, FrameReservation, FrameShortage, HardwareEntropySource, IDLE_SWAP_AFTER,
-    INCOMPRESSIBLE_BYTES, InstalledAddressSpace, KERNEL_HEAP_BOOTSTRAP_BYTES,
-    KERNEL_HEAP_GROWTH_CHUNK_BYTES, KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES,
-    KERNEL_HEAP_RESERVE_FRACTION, LocalMemory, LocalSlice, Locality, MemoryNodeStats, MemoryOwner,
-    NativePage, NativePages, NativeSlice, NativeSpace, NoCryptographicEntropy, NoEntropyDevice,
-    NodeLocalArena, NodeMemory, NodeRun, PagedBytes, PerProcessor, ROOT_ENTROPY_MATERIAL_BYTES,
-    RandomBytesLimitSetting, RegionShares, ReleasedReservation, ReservationLookup,
-    ReservationTracker, ResidencyVmHooks, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES,
-    SWAP_TICK, StackFault, StackReserveError, SwapDisabled, SwapEntry, SwapFaultError, SwapFaultIn,
-    SwapHandle, SwapLeafFormat, SwapSpace, SwapStats, SwapVmHooks, TASK_ARENA_FRACTION,
-    TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES, UserHeapStats, UserMemoryOwnerScope,
-    UserMemoryOwners, UserMemoryPool, UserPoolChunks, UserResidency, UserTranslation, VaCursor,
-    allocate_user_frame_uninit_on, allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed,
-    allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, claim_fiber_stack,
-    classify_stack_fault, commit_fiber_stack_reserve, configure_user_memory_owner_processors,
-    current_user_memory_owner, deallocate_user_frame, deallocate_user_frame_on,
-    deallocate_user_run_on, disable_swap, enter_user_memory_owner, fiber_stack_arena_stats,
-    fiber_stack_reserve_commits_on, install_entropy_device, install_fiber_stack_arena,
-    install_fiber_stack_hooks, install_memory_balloon, install_residency_hooks, install_swap,
-    install_swap_hooks, install_user_memory_pool, installed_swap_handle, installed_swap_hooks,
-    kernel_reserve_for, largest_servable_user_bytes, ranges_outside, residency_vm_hooks,
-    seed_root_entropy, swap_vm_hooks, swapped_token, task_arena_bytes_for, user_frame_node,
-    user_heap_stats, user_mapping_kernel_heap_bytes, user_node_stats, validate_range,
+    FiberStackVmHooks, FrameReservation, FrameShortage, HardwareEntropySource,
+    HibernateReservation, IDLE_SWAP_AFTER, INCOMPRESSIBLE_BYTES, InstalledAddressSpace,
+    KERNEL_HEAP_BOOTSTRAP_BYTES, KERNEL_HEAP_GROWTH_CHUNK_BYTES, KERNEL_HEAP_MAX_BOOT_FRACTION,
+    KERNEL_HEAP_MIN_RESERVE_BYTES, KERNEL_HEAP_RESERVE_FRACTION, LocalMemory, LocalSlice, Locality,
+    MemoryNodeStats, MemoryOwner, NativePage, NativePages, NativeSlice, NativeSpace,
+    NoCryptographicEntropy, NoEntropyDevice, NodeLocalArena, NodeMemory, NodeRun, PagedBytes,
+    PerProcessor, ROOT_ENTROPY_MATERIAL_BYTES, RandomBytesLimitSetting, RegionShares,
+    ReleasedReservation, ReservationLookup, ReservationTracker, ResidencyVmHooks, RootEntropy,
+    RootEntropyHandle, SWAP_BATCH_BYTES, SWAP_TICK, StackFault, StackReserveError, SwapDisabled,
+    SwapEntry, SwapFaultError, SwapFaultIn, SwapHandle, SwapLeafFormat, SwapSpace, SwapStats,
+    SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES,
+    UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, UserPoolChunks,
+    UserResidency, UserTranslation, VaCursor, allocate_user_frame_uninit_on,
+    allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
+    allocate_user_run_zeroed_on, claim_fiber_stack, classify_stack_fault,
+    commit_fiber_stack_reserve, configure_user_memory_owner_processors, current_user_memory_owner,
+    deallocate_user_frame, deallocate_user_frame_on, deallocate_user_run_on, disable_swap,
+    enter_user_memory_owner, fiber_stack_arena_stats, fiber_stack_reserve_commits_on,
+    install_entropy_device, install_fiber_stack_arena, install_fiber_stack_hooks,
+    install_memory_balloon, install_residency_hooks, install_swap, install_swap_hooks,
+    install_user_memory_pool, installed_swap_handle, installed_swap_hooks, kernel_reserve_for,
+    largest_servable_user_bytes, ranges_outside, residency_vm_hooks, seed_root_entropy,
+    swap_vm_hooks, swapped_token, task_arena_bytes_for, user_frame_node, user_heap_stats,
+    user_mapping_kernel_heap_bytes, user_node_stats, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -287,23 +289,23 @@ pub use runtime::{
     AuthorityDomain, ComponentHostNetwork, ComponentNetworkService, ComponentNetworkState,
     DnsError, DnsErrorKind, ExecOutput, ExecResult, FatalEscalationAction, FatalEscalationRecord,
     HostCreation, HostDirEntry, HostDirLimit, HostFileSystem, HostFilledWrite, HostFsError,
-    HostFsErrorKind, HostMetadata, HostShareRestore, HostWrite, HttpsRecord, Ipv4Address,
-    NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump, ObjectIdentity,
-    PacketFrame, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
-    SnapshotHold, SnapshotHoldBusy, SocketReadiness, TcpAccepted, TcpConnectPoll, TcpError,
-    TcpErrorKind, TcpListener, TcpPayloadPieces, TcpReadInto, TcpReadProgress, TcpWriteProgress,
-    UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    HostFsErrorKind, HostMetadata, HostShareRestore, HostWrite, HttpsRecord, IcmpEchoDatagram,
+    Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump,
+    ObjectIdentity, PacketFrame, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer,
+    RuntimeState, SnapshotHold, SnapshotHoldBusy, SocketReadiness, TcpAccepted, TcpConnectPoll,
+    TcpError, TcpErrorKind, TcpListener, TcpPayloadPieces, TcpReadInto, TcpReadProgress,
+    TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use settings::{
     Holds, SETTING_COUNT, Setting, SettingCell, SettingEntry, SettingUnit, SettingValue,
     SettingWriteError, Settings,
 };
 pub use signing_key::{
-    CwasmSigningKey, MACHINE_IDENTITY_INFO, MACHINE_IDENTITY_SIGNATURE_PREFIX,
-    MAX_MACHINE_IDENTITY_CHALLENGE_BYTES, MAX_MACHINE_IDENTITY_DOMAIN_BYTES, MachineIdentityKey,
-    MachineIdentitySignError, MachineIdentityVerifyError, PAYLOAD_REGISTER, ProvisionCause,
-    SeedSource, SettledSigningKey, SigningKeyError, machine_identity_signing_message,
-    settle_signing_key,
+    CwasmSigningKey, HIBERNATE_AUTH_INFO, HibernateAuthKey, MACHINE_IDENTITY_INFO,
+    MACHINE_IDENTITY_SIGNATURE_PREFIX, MAX_MACHINE_IDENTITY_CHALLENGE_BYTES,
+    MAX_MACHINE_IDENTITY_DOMAIN_BYTES, MachineIdentityKey, MachineIdentitySignError,
+    MachineIdentityVerifyError, PAYLOAD_REGISTER, ProvisionCause, SeedSource, SettledSigningKey,
+    SigningKeyError, machine_identity_signing_message, settle_signing_key,
 };
 pub use surface::{
     MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurface, ReturnedSurfaces,
@@ -397,6 +399,10 @@ use crate::memory::IrqSafeMutex;
 /// free lists to unlink and coalesce the adjacent free blocks.
 type KernelHeap = Talc<Manual, DefaultBinning>;
 pub const HEAP_SIZE_CLASS_COUNT: usize = 12;
+/// Maximum number of claimed `(start, end)` heap regions tracked without
+/// heap allocation inside [`KernelAllocator`]. Covers initial boot regions
+/// plus on-demand growth blocks lent from the user pool.
+pub const MAX_KERNEL_HEAP_REGIONS: usize = 256;
 const BOOT_UNINITIALIZED: u8 = 0;
 const BOOT_INITIALIZING: u8 = 1;
 const BOOT_READY: u8 = 2;
@@ -451,6 +457,10 @@ impl HeapStats {
 struct KernelHeapState {
     allocator: KernelHeap,
     counters: HeapCounters,
+    /// Every `(start, end)` direct-map range claimed by `allocator` (initial
+    /// boot regions + every `lend_chunk` growth block), recorded without
+    /// allocating so snapshot enumeration can include the entire kernel heap.
+    regions: ArrayVec<(usize, usize), MAX_KERNEL_HEAP_REGIONS>,
 }
 
 /// The heap and its counters share the same IRQ-safe lock.
@@ -468,6 +478,7 @@ impl KernelHeapState {
         Self {
             allocator: Talc::new(Manual),
             counters: HeapCounters::new(),
+            regions: ArrayVec::new_const(),
         }
     }
 
@@ -529,6 +540,11 @@ impl KernelHeapState {
         unsafe { self.allocator.claim(start.as_ptr(), len) }.unwrap_or_else(|| {
             panic!("kernel heap region of {len} bytes is too small to establish allocator metadata")
         });
+        self.regions
+            .try_push((start.as_ptr() as usize, end))
+            .unwrap_or_else(|_| {
+                panic!("kernel heap claimed more than {MAX_KERNEL_HEAP_REGIONS} disjoint regions")
+            });
     }
 
     fn growth_bytes(&self, layout: Layout) -> Option<usize> {
@@ -741,6 +757,10 @@ impl KernelAllocator {
 
     fn stats(&self) -> HeapStats {
         self.heap.with(|heap| heap.stats())
+    }
+
+    fn claimed_regions(&self) -> ArrayVec<(usize, usize), MAX_KERNEL_HEAP_REGIONS> {
+        self.heap.with(|heap| heap.regions.clone())
     }
 
     fn set_size_class_metrics_enabled(&self, enabled: bool) {
@@ -972,6 +992,7 @@ pub struct Kernel<
     topology: ProcessorTopology,
     dma_model: DmaModel,
     devices: DeviceInventory,
+    boot_memory: Option<helios_hal::boot::BootMemoryMetadata>,
 }
 
 impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: MeasuredBoot>
@@ -1001,6 +1022,10 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
 
     pub fn devices(&self) -> DeviceInventory {
         self.devices
+    }
+
+    pub fn boot_memory(&self) -> Option<&helios_hal::boot::BootMemoryMetadata> {
+        self.boot_memory.as_ref()
     }
 
     pub fn spawn<Fut>(&self, future: Fut) -> JoinHandle<Fut::Output>
@@ -1338,6 +1363,7 @@ where
         dma_model,
         devices,
         measured_boot,
+        boot_memory,
     } = platform;
     let current_processor = current_processor();
     // The device is settled once, by the bootstrap processor's bring-up;
@@ -1420,6 +1446,7 @@ where
         topology,
         dma_model,
         devices,
+        boot_memory,
     };
     #[cfg(helios_watchdog_self_test)]
     assert!(
@@ -1693,6 +1720,13 @@ pub fn panic_log_message(
 
 pub fn heap_stats() -> HeapStats {
     ALLOCATOR.stats()
+}
+
+/// Every `(start, end)` direct-map range currently claimed by the kernel
+/// global allocator (initial boot regions plus every growth block lent from
+/// the user pool), returned without allocating on the heap.
+pub fn kernel_heap_regions() -> ArrayVec<(usize, usize), MAX_KERNEL_HEAP_REGIONS> {
+    ALLOCATOR.claimed_regions()
 }
 
 pub fn set_kernel_heap_size_class_metrics_enabled(enabled: bool) {

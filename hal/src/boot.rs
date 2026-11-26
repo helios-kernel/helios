@@ -13,10 +13,144 @@ pub const MAX_BOOT_RESERVED_RANGES: usize = 4;
 /// reserved range is subtracted from it.
 pub const MAX_USABLE_REGION_SEGMENTS: usize = 6;
 
+/// Maximum firmware memory-map entries carried in [`BootMemoryMetadata`].
+pub const MAX_FIRMWARE_MEMORY_MAP_ENTRIES: usize = 128;
+
+/// Maximum bootloader-reclaimable ranges carried in [`BootMemoryMetadata`].
+pub const MAX_BOOTLOADER_RECLAIMABLE_RANGES: usize = 32;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootMemoryKind {
     Usable,
+    /// Memory used by the bootloader (page tables, boot structures) that
+    /// remains live until the kernel replaces every reference to it.
+    BootloaderReclaimable,
     Reserved,
+}
+
+impl BootMemoryKind {
+    /// Stable wire discriminant for canonical memory-map hashing.
+    pub const fn tag(self) -> u32 {
+        match self {
+            Self::Usable => 0,
+            Self::BootloaderReclaimable => 1,
+            Self::Reserved => 2,
+        }
+    }
+}
+
+/// A half-open `[start, end)` physical address range recorded at boot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BootPhysicalRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+impl BootPhysicalRange {
+    pub const fn new(start: u64, end: u64) -> Self {
+        Self { start, end }
+    }
+
+    pub const fn from_start_len(start: u64, len: u64) -> Self {
+        Self {
+            start,
+            end: start.saturating_add(len),
+        }
+    }
+
+    pub const fn len(self) -> u64 {
+        self.end.saturating_sub(self.start)
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.end <= self.start
+    }
+}
+
+/// Physical and virtual location of one linked kernel section.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KernelSectionRange {
+    pub physical_start: u64,
+    pub virtual_start: u64,
+    pub len: u64,
+}
+
+impl KernelSectionRange {
+    pub const fn new(physical_start: u64, virtual_start: u64, len: u64) -> Self {
+        Self {
+            physical_start,
+            virtual_start,
+            len,
+        }
+    }
+
+    pub const fn physical_end(self) -> u64 {
+        self.physical_start.saturating_add(self.len)
+    }
+
+    pub const fn virtual_end(self) -> u64 {
+        self.virtual_start.saturating_add(self.len)
+    }
+
+    pub const fn physical_range(self) -> BootPhysicalRange {
+        BootPhysicalRange::from_start_len(self.physical_start, self.len)
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Immutable and writable sections of the running kernel image, as laid
+/// out by the linker script and placed in physical memory by the loader.
+///
+/// `text` and `rodata` are immutable after bring-up and identify the
+/// kernel image; `data`, `bss`, and optional `uninit`/`stack` ranges hold
+/// writable kernel state that a full-memory snapshot must preserve.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KernelImageSections {
+    pub text: KernelSectionRange,
+    pub rodata: KernelSectionRange,
+    pub data: KernelSectionRange,
+    pub bss: KernelSectionRange,
+    /// Optional writable `.uninit` section (present on RISC-V).
+    pub uninit: Option<KernelSectionRange>,
+    /// Optional statically linked kernel stack section (present on RISC-V).
+    pub stack: Option<KernelSectionRange>,
+}
+
+/// Physical location and SHA-256 digest of the verified boot payload
+/// handed to the kernel at bring-up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BootPayloadMetadata {
+    pub physical_address: u64,
+    pub len: u64,
+    pub sha256: [u8; 32],
+}
+
+/// Boot-time memory layout and firmware-owned ranges preserved for full
+/// machine identity verification and atomic memory snapshots.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BootMemoryMetadata {
+    pub kernel_sections: KernelImageSections,
+    pub bootloader_reclaimable: ArrayVec<BootPhysicalRange, MAX_BOOTLOADER_RECLAIMABLE_RANGES>,
+    pub device_tree_blob: Option<BootPhysicalRange>,
+    pub firmware_memory_map: ArrayVec<BootMemoryRegion, MAX_FIRMWARE_MEMORY_MAP_ENTRIES>,
+    pub boot_payload: Option<BootPayloadMetadata>,
+    /// Direct-map offset (`virtual = physical + physical_memory_offset`),
+    /// `0` on identity-mapped backends.
+    pub physical_memory_offset: usize,
+}
+
+impl BootMemoryMetadata {
+    /// Highest physical address covered by any firmware memory-map entry.
+    pub fn max_physical_address(&self) -> u64 {
+        self.firmware_memory_map
+            .iter()
+            .map(|region| region.end)
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

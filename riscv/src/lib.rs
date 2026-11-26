@@ -158,9 +158,13 @@ use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering, compiler_fence};
 use arrayvec::ArrayVec;
 use fdt::Fdt;
 use helios_firmware::{DeviceTreeNuma, ProcessorIdentities};
-use helios_hal::boot::{BootMemoryKind, BootMemoryRegion, BootReservedRanges, usable_node_regions};
+use helios_hal::boot::{
+    BootMemoryKind, BootMemoryMetadata, BootMemoryRegion, BootPayloadMetadata, BootPhysicalRange,
+    BootReservedRanges, KernelImageSections, KernelSectionRange, usable_node_regions,
+};
 use helios_hal::cpu::{
-    Cpu, GUEST_STACK_LIMIT_OFFSET, Instant, ProcessorId, Timebase, TimerInterrupt,
+    BspSnapshotContext, Cpu, GUEST_STACK_LIMIT_OFFSET, Instant, ProcessorId,
+    Riscv64SnapshotContext, SnapshotPoint, SnapshotUnsupported, Timebase, TimerInterrupt,
     current_processor,
 };
 use helios_hal::critical_section::ProcessorIdentity;
@@ -184,6 +188,7 @@ pub use trap::{GeneralRegs, TrapFrame};
 
 global_asm!(include_str!("mp_hook.S"));
 global_asm!(include_str!("secondary_entry.S"));
+global_asm!(include_str!("snapshot.S"));
 
 const UNINITIALIZED_BOOT_HART: usize = usize::MAX;
 /// One bit of [`ONLINE_HARTS`] per hart id.
@@ -677,6 +682,50 @@ impl Cpu for RiscvCpu {
         true
     }
 
+    fn capture_bsp_state(
+        &self,
+        context: &mut BspSnapshotContext,
+    ) -> Result<SnapshotPoint, SnapshotUnsupported> {
+        let sscratch: u64;
+        let sie: u64;
+        let satp: u64;
+        let stvec: u64;
+        // SAFETY: reading `sscratch` has no side effects.
+        unsafe {
+            asm!("csrr {}, sscratch", out(reg) sscratch, options(nomem, nostack));
+        }
+        // SAFETY: reading `sie` has no side effects.
+        unsafe {
+            asm!("csrr {}, sie", out(reg) sie, options(nomem, nostack));
+        }
+        // SAFETY: reading `satp` has no side effects.
+        unsafe {
+            asm!("csrr {}, satp", out(reg) satp, options(nomem, nostack));
+        }
+        // SAFETY: reading `stvec` has no side effects.
+        unsafe {
+            asm!("csrr {}, stvec", out(reg) stvec, options(nomem, nostack));
+        }
+        let mut raw = Riscv64SnapshotContext {
+            sscratch,
+            sie,
+            satp,
+            stvec,
+            sstatus: riscv::register::sstatus::read().bits() as u64,
+            ..Riscv64SnapshotContext::default()
+        };
+
+        // SAFETY: `&raw mut raw` is a valid, aligned `Riscv64SnapshotContext`
+        // matching the offsets pinned for `__helios_riscv_capture_bsp_state`.
+        let status = unsafe { __helios_riscv_capture_bsp_state(&raw mut raw) };
+        if status == 0 {
+            *context = BspSnapshotContext::from_riscv64(&raw);
+            Ok(SnapshotPoint::Captured)
+        } else {
+            Ok(SnapshotPoint::Resumed)
+        }
+    }
+
     fn shutdown(&self) -> ! {
         sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
         halt_forever()
@@ -884,6 +933,8 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     if !snd::has_sound_device(&fdt) {
         tracing::info!("no virtio-snd node in the device tree; this machine has no sound device");
     }
+    let boot_memory =
+        collect_boot_memory_metadata(&fdt, fdt_addr, &initrd, &debug_state.payload_digest());
     let kernel = helios_kernel::init_with_watchdog(
         helios_kernel::Platform::with_watchdog(console, cpu.clone(), watchdog)
             .with_topology(
@@ -892,7 +943,8 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             )
             .with_timer_frequency_hz(timebase.frequency())
             .with_dma_model(DmaModel::Identity)
-            .with_devices(devices),
+            .with_devices(devices)
+            .with_boot_memory(boot_memory),
     );
     // The root DRBG is seeded once, on the bootstrap hart, before
     // anything can ask for random bytes. RISC-V has no unprivileged
@@ -1126,11 +1178,98 @@ fn shared_watchdog(fdt: &Fdt<'_>) -> watchdog::RiscvWatchdog {
 }
 
 unsafe extern "C" {
+    static __stext: u8;
+    static __etext: u8;
+    static __srodata: u8;
+    static __erodata: u8;
+    static __sdata: u8;
+    static __edata: u8;
+    static __sbss: u8;
     static __ebss: u8;
+    static __suninit: u8;
+    static __euninit: u8;
+    static __estack: u8;
+    static __sstack: u8;
     static _stack_start: u8;
     static _secondary_start: u8;
     static _hart_restart: u8;
     fn _release_mp_harts();
+    fn __helios_riscv_capture_bsp_state(ctx: *mut Riscv64SnapshotContext) -> u64;
+}
+
+const _: () = {
+    assert!(core::mem::offset_of!(Riscv64SnapshotContext, ra) == 0x00);
+    assert!(core::mem::offset_of!(Riscv64SnapshotContext, sp) == 0x08);
+    assert!(core::mem::offset_of!(Riscv64SnapshotContext, gp) == 0x10);
+    assert!(core::mem::offset_of!(Riscv64SnapshotContext, tp) == 0x18);
+    assert!(core::mem::offset_of!(Riscv64SnapshotContext, s) == 0x20);
+    assert!(core::mem::offset_of!(Riscv64SnapshotContext, fs) == 0x80);
+    assert!(core::mem::offset_of!(Riscv64SnapshotContext, fcsr) == 0xe0);
+};
+
+fn riscv_section_range(start_sym: *const u8, end_sym: *const u8) -> KernelSectionRange {
+    let start = start_sym.addr() as u64;
+    let end = end_sym.addr() as u64;
+    let len = end
+        .checked_sub(start)
+        .unwrap_or_else(|| panic!("RISC-V kernel section end {end:#x} precedes start {start:#x}"));
+    KernelSectionRange::new(start, start, len)
+}
+
+fn collect_boot_memory_metadata(
+    fdt: &Fdt<'_>,
+    fdt_addr: usize,
+    initrd: &Range<usize>,
+    payload_sha256: &[u8; 32],
+) -> BootMemoryMetadata {
+    let uninit = riscv_section_range(&raw const __suninit, &raw const __euninit);
+    let stack = riscv_section_range(&raw const __estack, &raw const __sstack);
+    let mut metadata = BootMemoryMetadata {
+        kernel_sections: KernelImageSections {
+            text: riscv_section_range(&raw const __stext, &raw const __etext),
+            rodata: riscv_section_range(&raw const __srodata, &raw const __erodata),
+            data: riscv_section_range(&raw const __sdata, &raw const __edata),
+            bss: riscv_section_range(&raw const __sbss, &raw const __ebss),
+            uninit: (!uninit.is_empty()).then_some(uninit),
+            stack: (!stack.is_empty()).then_some(stack),
+        },
+        device_tree_blob: Some(BootPhysicalRange::from_start_len(
+            fdt_addr as u64,
+            fdt.total_size() as u64,
+        )),
+        boot_payload: Some(BootPayloadMetadata {
+            physical_address: initrd.start as u64,
+            len: initrd.len() as u64,
+            sha256: *payload_sha256,
+        }),
+        physical_memory_offset: 0,
+        ..BootMemoryMetadata::default()
+    };
+
+    for region in fdt
+        .all_nodes()
+        .filter(|node| {
+            node.property("device_type")
+                .is_some_and(|property| property.value == b"memory\0")
+        })
+        .flat_map(|node| {
+            node.reg().unwrap_or_else(|| {
+                panic!("FDT memory node {} has no usable reg property", node.name)
+            })
+        })
+    {
+        let start = region.starting_address as u64;
+        let end = start
+            .checked_add(region.size.unwrap_or(0) as u64)
+            .expect("FDT memory region overflows u64");
+        let _ = metadata.firmware_memory_map.try_push(BootMemoryRegion {
+            start,
+            end,
+            kind: BootMemoryKind::Usable,
+        });
+    }
+
+    metadata
 }
 
 fn allocator_window() -> Range<usize> {
