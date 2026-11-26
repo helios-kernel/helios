@@ -13,15 +13,19 @@ use helios_kernel::{
     DebugSerialInterrupt, DeviceInterruptRoute, ExternalInterruptHandler, ExternalInterruptRoutes,
     GrantInterrupt, InterfaceCapabilities, InterfaceEventMark, Kernel, LinkState, NetworkDevice,
 };
-use helios_virtio::{InterruptController, MmioInterrupt};
+use helios_virtio::{
+    DeviceType, InterruptController, MmioInterrupt, VirtioBusTransport, VirtioNetDevice,
+};
 use plic::Plic;
 use spin::{Mutex, Once};
 
 use crate::RiscvCpu;
 use crate::debug_state::RuntimeState;
+use crate::iommu::{self, Confinement, RiscvDmaArenas, RiscvVirtioTransport};
+use crate::pci::{PciHostController, VirtioFunctions};
 
-type RiscvVirtioNetTransport = helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus>;
-type RiscvVirtioNetDevice = helios_virtio::VirtioNetDevice<RiscvVirtioNetTransport>;
+type RiscvVirtioNetTransport = RiscvVirtioTransport;
+type RiscvVirtioNetDevice = VirtioNetDevice<RiscvVirtioNetTransport>;
 
 #[derive(Clone)]
 pub(crate) struct VirtioNetworkDevice {
@@ -185,10 +189,15 @@ pub(crate) struct NetworkInterrupt {
     device: VirtioNetworkDevice,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn install_network_service<WatchdogImpl>(
     cpu: &RiscvCpu,
     kernel: &Kernel<RiscvCpu, WatchdogImpl>,
     fdt: &Fdt<'_>,
+    pci: Option<&PciHostController>,
+    pci_virtio: Option<&VirtioFunctions>,
+    arenas: &mut RiscvDmaArenas,
+    confinement: Option<&mut Confinement>,
     debug_state: &RuntimeState,
 ) -> Option<NetworkInterrupt>
 where
@@ -199,7 +208,9 @@ where
     // advertising more pairs than the machine has harts is clamped to
     // what has a pump rather than left to collect frames nobody drains.
     let pair_budget = helios_virtio::QueuePairBudget::new(cpu.processor_count());
-    let Some((device, line)) = discover_network_device(cpu, fdt, pair_budget) else {
+    let Some((device, line)) =
+        discover_network_device(cpu, fdt, pci, pci_virtio, arenas, confinement, pair_budget)
+    else {
         tracing::warn!("virtio network device was not discovered on the platform bus");
         return None;
     };
@@ -236,10 +247,13 @@ impl ExternalInterrupts {
     }
 
     /// Give `source` a priority and record it for the taking hart to
-    /// enable in [`Self::open`].
+    /// enable in [`Self::open`]. Shared PCI INTx lines may attach multiple
+    /// devices to the same source, so the armed list is deduplicated.
     fn enable_source(&mut self, source: InterruptSourceId) {
         self.plic.set_priority(source, 1);
-        self.armed.push(source);
+        if !self.armed.contains(&source) {
+            self.armed.push(source);
+        }
         self.routed = true;
     }
 
@@ -537,8 +551,9 @@ impl HartInterrupts {
     }
 }
 
-pub(crate) fn has_network_device(fdt: &Fdt<'_>) -> bool {
-    crate::count_virtio_mmio_devices(fdt, helios_virtio::DeviceType::Network) != 0
+pub(crate) fn has_network_device(fdt: &Fdt<'_>, pci_virtio: Option<&VirtioFunctions>) -> bool {
+    pci_virtio.is_some_and(|v| v.count(DeviceType::Network) != 0)
+        || crate::count_virtio_mmio_devices(fdt, DeviceType::Network) != 0
 }
 
 impl NetworkDevice for VirtioNetworkDevice {
@@ -672,11 +687,48 @@ impl plic::InterruptSource for InterruptSourceId {
 fn discover_network_device(
     cpu: &RiscvCpu,
     fdt: &Fdt<'_>,
+    pci: Option<&PciHostController>,
+    pci_virtio: Option<&VirtioFunctions>,
+    arenas: &mut RiscvDmaArenas,
+    confinement: Option<&mut Confinement>,
     pair_budget: helios_virtio::QueuePairBudget,
 ) -> Option<(VirtioNetworkDevice, PlicInterrupt)> {
-    let candidate = helios_virtio::mmio_candidates(fdt).find(|candidate| {
-        crate::matches_virtio_mmio_device(candidate.base, helios_virtio::DeviceType::Network)
-    })?;
+    if let (Some(pci), Some(function)) =
+        (pci, pci_virtio.and_then(|v| v.first(DeviceType::Network)))
+    {
+        pci.assign_unassigned_memory_bars(function.address);
+        let dma = iommu::dma_pool(
+            arenas,
+            confinement,
+            Some(function.address),
+            iommu::LARGE_DMA_CHUNK_BYTES,
+            cpu.processor_count(),
+        );
+        let transport =
+            VirtioBusTransport::pci(&pci.config_access(), function.address, pci, dma, None)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "failed to initialize virtio-net PCI transport at {}: {error}",
+                        function.address
+                    )
+                });
+        let device = VirtioNetDevice::new(transport, pair_budget).unwrap_or_else(|error| {
+            panic!(
+                "failed to initialize virtio-net PCI device at {}: {error}",
+                function.address
+            )
+        });
+        return Some((
+            VirtioNetworkDevice {
+                inner: Arc::new(device),
+                cpu: cpu.clone(),
+            },
+            function.line,
+        ));
+    }
+
+    let candidate = helios_virtio::mmio_candidates(fdt)
+        .find(|candidate| crate::matches_virtio_mmio_device(candidate.base, DeviceType::Network))?;
     let base = candidate.base;
     let header = core::ptr::NonNull::new(base as *mut u8)
         .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
@@ -684,13 +736,23 @@ fn discover_network_device(
         .interrupt
         .and_then(PlicInterrupt::from_specifier)
         .unwrap_or_else(|| panic!("virtio-net node at {base:#x} has no valid interrupt source"));
+    let dma = iommu::dma_pool(
+        arenas,
+        None,
+        None,
+        iommu::LARGE_DMA_CHUNK_BYTES,
+        cpu.processor_count(),
+    );
     // SAFETY: `header` points to the identity-mapped `candidate.size`-byte
     // virtio-net MMIO register block discovered in the device tree, and no
     // other driver accesses this device's registers.
-    let device = unsafe { helios_virtio::net_from_mmio(header, candidate.size, pair_budget) }
+    let transport = unsafe { VirtioBusTransport::mmio(header, candidate.size, dma) }
         .unwrap_or_else(|error| {
-            panic!("failed to initialize virtio-net device at {base:#x}: {error}")
+            panic!("failed to initialize virtio-net MMIO transport at {base:#x}: {error}")
         });
+    let device = VirtioNetDevice::new(transport, pair_budget).unwrap_or_else(|error| {
+        panic!("failed to initialize virtio-net device at {base:#x}: {error}")
+    });
     Some((
         VirtioNetworkDevice {
             inner: Arc::new(device),

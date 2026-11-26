@@ -17,9 +17,9 @@ extern crate alloc;
 use alloc::sync::Arc;
 use core::time::Duration;
 
-use acpi::sdt::SdtHeader;
+use helios_firmware::{VIOT_SIGNATURE, VirtioIommuTopology, parse_viot};
 use helios_hal::cpu::{Cpu, Timebase};
-use helios_hal::iommu::{EndpointId, PhysicalRange};
+use helios_hal::iommu::PhysicalRange;
 use helios_kernel::{
     DeviceChunkDomain, DirectChunkDomain, DmaArenas, Elastic, IommuChunkDomain, IommuDomains,
     IommuReport, MAX_IOMMU_ENDPOINTS, SharedDmaArena, Timer, UserPoolChunks,
@@ -55,99 +55,8 @@ pub(crate) const LARGE_DMA_CHUNK_BYTES: usize = 2 << 20;
 /// low-bandwidth devices (entropy, balloon, vsock, input, sound).
 pub(crate) const SMALL_DMA_CHUNK_BYTES: usize = 256 << 10;
 
-/// The `VIOT` signature, which the vendored `acpi` crate has no
-/// constant for and cannot be handed one: its `Signature` type has no
-/// public constructor, so the table is found by walking the headers.
-const VIOT_SIGNATURE: &str = "VIOT";
-
-/// `struct acpi_table_viot` after the common SDT header.
-const VIOT_NODE_COUNT: usize = 0x00;
-const VIOT_NODE_OFFSET: usize = 0x02;
-
-/// Node types (VIOT specification §3).
-const NODE_PCI_RANGE: u8 = 1;
-const NODE_VIRTIO_IOMMU_PCI: u8 = 3;
-
-/// `struct acpi_viot_header` field offsets, from the start of a node.
-const NODE_TYPE: usize = 0x00;
-const NODE_LENGTH: usize = 0x02;
-
-/// `struct acpi_viot_pci_range` field offsets.
-const PCI_RANGE_ENDPOINT_START: usize = 0x04;
-const PCI_RANGE_SEGMENT_START: usize = 0x08;
-const PCI_RANGE_SEGMENT_END: usize = 0x0a;
-const PCI_RANGE_BDF_START: usize = 0x0c;
-const PCI_RANGE_BDF_END: usize = 0x0e;
-const PCI_RANGE_OUTPUT_NODE: usize = 0x10;
-const PCI_RANGE_BYTES: usize = 24;
-
-/// `struct acpi_viot_virtio_iommu_pci` field offsets.
-const VIRTIO_IOMMU_SEGMENT: usize = 0x04;
-const VIRTIO_IOMMU_BDF: usize = 0x06;
-const VIRTIO_IOMMU_BYTES: usize = 16;
-
-/// PCI range nodes one VIOT may declare. q35 describes its whole bus
-/// with one; four leaves room for a machine that splits it.
-const MAX_PCI_RANGES: usize = 4;
-
-/// The translation unit as VIOT describes it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct IommuTopology {
-    /// The PCI function the virtio-iommu itself sits on.
-    unit: PciAddress,
-    ranges: [Option<PciRange>; MAX_PCI_RANGES],
-}
-
-/// One span of PCI functions and the endpoint identities they are known
-/// by.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PciRange {
-    endpoint_start: u32,
-    segment_start: u16,
-    segment_end: u16,
-    bdf_start: u16,
-    bdf_end: u16,
-}
-
-impl PciRange {
-    fn endpoint_of(&self, address: PciAddress) -> Option<EndpointId> {
-        let segment = address.segment();
-        let bdf = bus_device_function(address);
-        if segment < self.segment_start
-            || segment > self.segment_end
-            || bdf < self.bdf_start
-            || bdf > self.bdf_end
-        {
-            return None;
-        }
-        Some(EndpointId::new(
-            self.endpoint_start + u32::from(bdf - self.bdf_start),
-        ))
-    }
-}
-
-impl IommuTopology {
-    /// The PCI function the virtio-iommu itself sits on.
-    pub(crate) fn unit(&self) -> PciAddress {
-        self.unit
-    }
-
-    /// The endpoint identity the unit knows `address` by, or `None` when
-    /// the topology puts that function outside its reach.
-    ///
-    /// The unit's own function is deliberately excluded: a translation
-    /// unit publishes its request and event rings at physical addresses
-    /// and must never be attached to one of its own domains.
-    pub(crate) fn endpoint_of(&self, address: PciAddress) -> Option<EndpointId> {
-        if address == self.unit {
-            return None;
-        }
-        self.ranges
-            .iter()
-            .flatten()
-            .find_map(|range| range.endpoint_of(address))
-    }
-}
+/// The translation unit as ACPI VIOT describes it.
+pub(crate) type IommuTopology = VirtioIommuTopology;
 
 /// The unit the platform exposes, once it has been brought up.
 pub(crate) type X86VirtioIommuDevice = VirtioIommuDevice<VirtioPciTransport<OffsetDmaPool>>;
@@ -211,7 +120,7 @@ pub(crate) fn discover(
     // firmware published, and the whole table sits inside the direct
     // physical map the bootloader established.
     let table = unsafe { core::slice::from_raw_parts(virtual_address as *const u8, length) };
-    Some(parse_viot(table))
+    Some(parse_viot(table).unwrap_or_else(|error| panic!("ACPI VIOT table is invalid: {error}")))
 }
 
 /// Brings the unit at `address` up.
@@ -385,113 +294,3 @@ pub(crate) fn dma_pool(
 /// the interrupt controller, so every domain maps it at its own physical
 /// address.
 pub(crate) const MSI_DOORBELL: PhysicalRange = PhysicalRange::new(0xfee0_0000, 0x10_0000);
-
-fn bus_device_function(address: PciAddress) -> u16 {
-    (u16::from(address.bus()) << 8)
-        | (u16::from(address.device()) << 3)
-        | u16::from(address.function())
-}
-
-fn parse_viot(table: &[u8]) -> IommuTopology {
-    let header_bytes = core::mem::size_of::<SdtHeader>();
-    let body = &table[header_bytes..];
-    let node_count = usize::from(read_u16(body, VIOT_NODE_COUNT));
-    let node_offset = usize::from(read_u16(body, VIOT_NODE_OFFSET));
-    assert!(
-        node_offset >= header_bytes,
-        "ACPI VIOT node array starts inside the table header"
-    );
-
-    let mut unit = None;
-    let mut ranges = [const { None }; MAX_PCI_RANGES];
-    let mut found_ranges = 0;
-    let mut offset = node_offset;
-    for _ in 0..node_count {
-        assert!(
-            offset + NODE_LENGTH + 2 <= table.len(),
-            "ACPI VIOT node at {offset:#x} runs past the table"
-        );
-        let node_type = table[offset + NODE_TYPE];
-        let length = usize::from(read_u16(table, offset + NODE_LENGTH));
-        assert!(
-            length != 0 && offset + length <= table.len(),
-            "ACPI VIOT node at {offset:#x} declares an unusable length {length}"
-        );
-        let node = &table[offset..offset + length];
-        match node_type {
-            NODE_VIRTIO_IOMMU_PCI => {
-                assert!(
-                    length >= VIRTIO_IOMMU_BYTES,
-                    "ACPI VIOT virtio-pci node is shorter than the layout"
-                );
-                let segment = read_u16(node, VIRTIO_IOMMU_SEGMENT);
-                let bdf = read_u16(node, VIRTIO_IOMMU_BDF);
-                assert!(
-                    unit.replace(pci_address(segment, bdf)).is_none(),
-                    "ACPI VIOT declares more than one virtio-iommu"
-                );
-            }
-            NODE_PCI_RANGE => {
-                assert!(
-                    length >= PCI_RANGE_BYTES,
-                    "ACPI VIOT PCI range node is shorter than the layout"
-                );
-                assert!(
-                    found_ranges < MAX_PCI_RANGES,
-                    "ACPI VIOT declares more than {MAX_PCI_RANGES} PCI ranges"
-                );
-                // The output node is the offset of the unit node this
-                // range translates through. helios drives one unit, so a
-                // range pointing anywhere else is a topology it cannot
-                // honour.
-                let output_node = usize::from(read_u16(node, PCI_RANGE_OUTPUT_NODE));
-                assert!(
-                    output_node >= node_offset && output_node < table.len(),
-                    "ACPI VIOT PCI range points at node offset {output_node:#x}, which is not a node"
-                );
-                assert_eq!(
-                    table[output_node + NODE_TYPE],
-                    NODE_VIRTIO_IOMMU_PCI,
-                    "ACPI VIOT PCI range translates through a unit helios does not drive"
-                );
-                ranges[found_ranges] = Some(PciRange {
-                    endpoint_start: read_u32(node, PCI_RANGE_ENDPOINT_START),
-                    segment_start: read_u16(node, PCI_RANGE_SEGMENT_START),
-                    segment_end: read_u16(node, PCI_RANGE_SEGMENT_END),
-                    bdf_start: read_u16(node, PCI_RANGE_BDF_START),
-                    bdf_end: read_u16(node, PCI_RANGE_BDF_END),
-                });
-                found_ranges += 1;
-            }
-            _ => {}
-        }
-        offset += length;
-    }
-
-    IommuTopology {
-        unit: unit.unwrap_or_else(|| panic!("ACPI VIOT declares no virtio-iommu unit")),
-        ranges,
-    }
-}
-
-fn pci_address(segment: u16, bdf: u16) -> PciAddress {
-    PciAddress::new(
-        segment,
-        (bdf >> 8) as u8,
-        ((bdf >> 3) & 0x1f) as u8,
-        (bdf & 0x7) as u8,
-    )
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ])
-}

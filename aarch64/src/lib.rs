@@ -233,23 +233,19 @@ mod host_fs;
 #[cfg(feature = "hv")]
 pub mod hv;
 mod input;
+mod iommu;
 mod isolation;
 mod lifecycle;
 #[cfg(feature = "native-users")]
 mod native;
 mod net;
+mod pci;
 mod platform;
 mod rtc;
 mod snd;
 mod tagging;
 mod tpm;
 mod vsock;
-
-pub(crate) type Aarch64DmaPool = helios_virtio::OffsetDmaPool<tagging::Aarch64AllocationTags>;
-
-pub(crate) fn dma_pool() -> Aarch64DmaPool {
-    tagging::dma_pool()
-}
 
 mod debug_state {
     /// The network service this machine's virtio-net device backs.
@@ -868,34 +864,30 @@ extern "C" fn aarch64_kernel_main() -> ! {
         read_counter,
         Some(DEBUG_SERIAL_WRITER),
     );
+    let pci = platform.pci.map(pci::PciRoot::new);
+    let pci_virtio = pci.as_ref().map(pci::PciRoot::virtio_functions);
+    let iommu_topology = platform.iommu;
+
     let mut devices = DeviceInventory::new().with_debug_serial();
-    if host_fs::has_9p_device(&platform) {
+    if host_fs::has_9p_device(&platform, pci_virtio.as_ref()) {
         devices = devices.with_host_share();
     }
-    if net::has_network_device(&platform) {
+    if net::has_network_device(&platform, pci_virtio.as_ref()) {
         devices = devices.with_network();
     }
-    if entropy::has_entropy_device(&platform) {
+    if entropy::has_entropy_device(&platform, pci_virtio.as_ref()) {
         devices = devices.with_entropy_device();
     }
-    if balloon::has_balloon_device(&platform) {
+    if balloon::has_balloon_device(&platform, pci_virtio.as_ref()) {
         devices = devices.with_memory_balloon();
     }
-    if vsock::has_vsock_device(&platform) {
+    if vsock::has_vsock_device(&platform, pci_virtio.as_ref()) {
         devices = devices.with_vsock();
     }
-    if !gpu::has_display_device(&platform) {
-        tracing::info!("no virtio-gpu node on the platform bus; this machine has no display");
-    }
-    if input::count_input_devices(&platform) == 0 {
-        tracing::info!(
-            "no virtio-input node on the platform bus; this machine has no input device"
-        );
-    }
-    if !snd::has_sound_device(&platform) {
-        tracing::info!("no virtio-snd node on the platform bus; this machine has no sound device");
-    }
-    let block_device_count = block::count_block_devices(&platform);
+    let has_display = gpu::has_display_device(&platform, pci_virtio.as_ref());
+    let input_count = input::count_input_devices(&platform, pci_virtio.as_ref());
+    let has_sound = snd::has_sound_device(&platform, pci_virtio.as_ref());
+    let block_device_count = block::count_block_devices(&platform, pci_virtio.as_ref());
     if block_device_count != 0 {
         devices = devices.with_block_devices(block_device_count);
     }
@@ -919,11 +911,24 @@ extern "C" fn aarch64_kernel_main() -> ! {
                 .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
             )
             .with_timer_frequency_hz(cpu.timebase().frequency())
-            .with_dma_model(DmaModel::Translated)
+            .with_dma_model(if iommu_topology.is_some() {
+                DmaModel::Iommu
+            } else {
+                DmaModel::Translated
+            })
             .with_devices(devices)
             .with_measured_boot(measured_boot)
             .with_boot_memory(boot_memory),
     );
+    if !has_display {
+        tracing::info!("no virtio-gpu device discovered; this machine has no display");
+    }
+    if input_count == 0 {
+        tracing::info!("no virtio-input device discovered; this machine has no input device");
+    }
+    if !has_sound {
+        tracing::info!("no virtio-snd device discovered; this machine has no sound device");
+    }
     if measured_boot_discovery.is_refusal() {
         tracing::warn!("{measured_boot_discovery}");
     } else {
@@ -938,13 +943,45 @@ extern "C" fn aarch64_kernel_main() -> ! {
         platform.virtio.len(),
         platform.rtc.is_some(),
     );
-    // The entropy device comes up before the root DRBG is seeded,
-    // because on this platform it can be the only source there is: an
-    // ACPI-described machine has no `/chosen/rng-seed`, and a processor
-    // without `FEAT_RNG` has no `RNDR`. Its interrupt is routed later,
-    // with every other device's; the bring-up read polls the used ring
-    // and needs none.
-    let entropy_device = entropy::bring_up(&platform, physical_memory_offset, &handoff);
+    // Confine every virtio-PCI function in its own domain before any driver
+    // (including PCI virtio-rng) touches its queues.
+    let mut confinement = match (pci.as_ref(), pci_virtio.as_ref(), iommu_topology) {
+        (Some(pci), Some(pci_virtio), Some(topology)) => {
+            let confined = pci_virtio.addresses();
+            let confinement =
+                iommu::confine_devices(pci, topology, physical_memory_offset, &confined);
+            let report = confinement.report();
+            debug_state.install_iommu_report(report.clone());
+            kernel.spawn_detached(iommu::watch_faults(
+                confinement.device(),
+                report,
+                kernel.timer(),
+            ));
+            Some(confinement)
+        }
+        _ => {
+            tracing::info!(
+                "no virtio-iommu in the {} topology; device DMA reaches physical memory directly",
+                platform.source
+            );
+            None
+        }
+    };
+    let mut dma_arenas = iommu::Aarch64DmaArenas::new(helios_kernel::UserPoolChunks::new(pool));
+    // The entropy device comes up after IOMMU confinement (so a PCI
+    // virtio-rng is never touched unconfined) and before the root DRBG is
+    // seeded (so an ACPI-described machine without `FEAT_RNG` still seeds
+    // from hardware entropy).
+    let entropy_device = entropy::bring_up(
+        &platform,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
+        physical_memory_offset,
+        &handoff,
+        cpu.processor_count(),
+    );
     // The root DRBG is seeded before any component can ask for random
     // bytes: `RNDR` where the processor implements it, whatever seed
     // the bootloader left behind, and a read of the entropy device.
@@ -1037,15 +1074,20 @@ extern "C" fn aarch64_kernel_main() -> ! {
     device::install_hooks(gic);
 
     let mut routes = DeviceInterruptRoutes::new();
-    // The console UART is a device the kernel drives itself: its SPI is
-    // routed to the bootstrap processor and enabled exactly like the
-    // virtio transports'. The handler masks the receive line at the port
-    // and raises the debug console's receive signal; the waiter re-arms
-    // the line while it listens.
-    gic.enable_device_interrupt(
+    // Shared PCI INTx lines bind multiple virtio functions to the same
+    // GICv3 SPI; track enabled SPIs so each is configured once before being
+    // enabled in GICD_ICFGR/GICD_ISENABLER.
+    let mut enabled_spis = alloc::vec::Vec::new();
+    let bootstrap_mpidr = platform_state.bootstrap_mpidr();
+    let mut enable_spi = |intid: IntId, trigger: arm_gic::Trigger| {
+        if !enabled_spis.contains(&intid) {
+            gic.enable_device_interrupt(intid, trigger, bootstrap_mpidr);
+            enabled_spis.push(intid);
+        }
+    };
+    enable_spi(
         platform.console.interrupt.intid(),
         platform.console.interrupt.trigger,
-        platform_state.bootstrap_mpidr(),
     );
     routes.set_debug_serial(
         platform.console.interrupt.intid(),
@@ -1054,53 +1096,50 @@ extern "C" fn aarch64_kernel_main() -> ! {
     if let Some(host_fs) = host_fs::install(
         &cpu,
         &platform,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
         physical_memory_offset,
         &handoff,
         &debug_state,
     ) {
-        gic.enable_device_interrupt(
-            host_fs.interrupt,
-            host_fs.trigger,
-            platform_state.bootstrap_mpidr(),
-        );
+        enable_spi(host_fs.interrupt, host_fs.trigger);
         routes.set_host_fs(host_fs.interrupt, host_fs.transport);
     }
     if let Some(network) = net::install(
         &cpu,
         &kernel,
         &platform,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
         physical_memory_offset,
         &handoff,
         &debug_state,
     ) {
-        gic.enable_device_interrupt(
-            network.interrupt,
-            network.trigger,
-            platform_state.bootstrap_mpidr(),
-        );
+        enable_spi(network.interrupt, network.trigger);
         routes.add_network(network.interrupt, network.device);
     }
     if let Some(entropy) = entropy_device {
         entropy::install(&kernel, &entropy, root_entropy.clone());
-        gic.enable_device_interrupt(
-            entropy.interrupt,
-            entropy.trigger,
-            platform_state.bootstrap_mpidr(),
-        );
+        enable_spi(entropy.interrupt, entropy.trigger);
         routes.set_entropy(entropy.interrupt, entropy.device);
     }
     if let Some(balloon) = balloon::install(
+        &cpu,
         &kernel,
         &platform,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
         physical_memory_offset,
         &handoff,
         debug_state.machine_generation_handle(),
     ) {
-        gic.enable_device_interrupt(
-            balloon.interrupt,
-            balloon.trigger,
-            platform_state.bootstrap_mpidr(),
-        );
+        enable_spi(balloon.interrupt, balloon.trigger);
         debug_state.install_memory_balloon(balloon.handle);
         routes.set_balloon(balloon.interrupt, balloon.handler);
     }
@@ -1108,76 +1147,82 @@ extern "C" fn aarch64_kernel_main() -> ! {
         &kernel,
         &cpu,
         &platform,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
         physical_memory_offset,
         &handoff,
         &debug_state,
     ) {
-        gic.enable_device_interrupt(
-            vsock.interrupt,
-            vsock.trigger,
-            platform_state.bootstrap_mpidr(),
-        );
+        enable_spi(vsock.interrupt, vsock.trigger);
         routes.set_vsock(vsock.interrupt, vsock.device);
     }
     if let Some(display) = gpu::install(
         &cpu,
         &kernel,
         &platform,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
         physical_memory_offset,
         &handoff,
         &debug_state,
     ) {
-        gic.enable_device_interrupt(
-            display.interrupt,
-            display.trigger,
-            platform_state.bootstrap_mpidr(),
-        );
+        enable_spi(display.interrupt, display.trigger);
         routes.set_display(display.interrupt, display.device);
     }
     for device in input::install(
+        &cpu,
         &kernel,
         &platform,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
         physical_memory_offset,
         &handoff,
         &debug_state,
     ) {
-        gic.enable_device_interrupt(
-            device.interrupt,
-            device.trigger,
-            platform_state.bootstrap_mpidr(),
-        );
+        enable_spi(device.interrupt, device.trigger);
         routes.add_input(device.interrupt, device.device);
     }
     if let Some(sound) = snd::install(
+        &cpu,
         &kernel,
         &platform,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
         physical_memory_offset,
         &handoff,
         &debug_state,
     ) {
-        gic.enable_device_interrupt(
-            sound.interrupt,
-            sound.trigger,
-            platform_state.bootstrap_mpidr(),
-        );
+        enable_spi(sound.interrupt, sound.trigger);
         routes.set_sound(sound.interrupt, sound.device);
     }
     for block in block::install(
         &cpu,
         &kernel,
         &platform,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
         physical_memory_offset,
         &handoff,
         &debug_state,
         root_entropy,
     ) {
-        gic.enable_device_interrupt(
-            block.interrupt,
-            block.trigger,
-            platform_state.bootstrap_mpidr(),
-        );
+        enable_spi(block.interrupt, block.trigger);
         routes.add_block(block.interrupt, block.device);
     }
+    kernel.spawn_detached(helios_kernel::maintain_dma_arenas(
+        dma_arenas,
+        kernel.timer(),
+    ));
 
     // Everything the kernel drives itself has claimed its interrupt by
     // now, so what the firmware described and nobody took is exactly

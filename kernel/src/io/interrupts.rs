@@ -285,33 +285,37 @@ where
         *slot = Some((source, route));
     }
 
-    /// Dispatches a claimed source to its handler. Returns false when no
-    /// route matches so the backend can fail fast with controller
+    /// Dispatches a claimed source to every matching handler. Returns false
+    /// when no route matches so the backend can fail fast with controller
     /// context in the message.
+    ///
+    /// PCI INTx lines are level-triggered and shared across multiple
+    /// functions, so every handler bound to `source` must be given a turn
+    /// to inspect and clear its interrupt status register rather than
+    /// stopping at the first match.
     #[must_use]
     pub fn route(&self, source: Source) -> bool {
-        if self.network.iter().any(|slot| dispatch(slot, source)) {
-            return true;
+        let mut handled = false;
+        for slot in &self.network {
+            handled |= dispatch(slot, source);
         }
-        if dispatch(&self.host_fs, source)
-            || dispatch(&self.entropy, source)
-            || dispatch(&self.balloon, source)
-            || dispatch(&self.vsock, source)
-            || dispatch(&self.display, source)
-            || dispatch(&self.debug_serial, source)
-        {
-            return true;
+        handled |= dispatch(&self.host_fs, source);
+        handled |= dispatch(&self.entropy, source);
+        handled |= dispatch(&self.balloon, source);
+        handled |= dispatch(&self.vsock, source);
+        handled |= dispatch(&self.display, source);
+        handled |= dispatch(&self.debug_serial, source);
+        for slot in &self.input {
+            handled |= dispatch(slot, source);
         }
-        if self.input.iter().any(|slot| dispatch(slot, source)) {
-            return true;
+        handled |= dispatch(&self.sound, source);
+        for slot in &self.block {
+            handled |= dispatch(slot, source);
         }
-        if dispatch(&self.sound, source) {
-            return true;
+        for slot in &self.device {
+            handled |= dispatch(slot, source);
         }
-        if self.block.iter().any(|slot| dispatch(slot, source)) {
-            return true;
-        }
-        self.device.iter().any(|slot| dispatch(slot, source))
+        handled
     }
 }
 
@@ -419,5 +423,57 @@ mod tests {
         super::wake_queue_owners(&cpu, core::iter::empty());
 
         assert!(cpu.woken().is_empty());
+    }
+
+    /// PCI INTx lines are shared across multiple functions on one IRQ
+    /// source; routing that source must invoke every handler bound to it
+    /// rather than stopping at the first match.
+    #[test]
+    fn shared_source_dispatches_every_matching_handler() {
+        use core::convert::Infallible;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::{ExternalInterruptHandler, ExternalInterruptRoutes};
+
+        struct CountingHandler(&'static AtomicUsize);
+
+        impl ExternalInterruptHandler for CountingHandler {
+            fn handle_interrupt(&self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        static NET_HITS: AtomicUsize = AtomicUsize::new(0);
+        static HOST_FS_HITS: AtomicUsize = AtomicUsize::new(0);
+        static BLOCK_A_HITS: AtomicUsize = AtomicUsize::new(0);
+        static BLOCK_B_HITS: AtomicUsize = AtomicUsize::new(0);
+        static OTHER_HITS: AtomicUsize = AtomicUsize::new(0);
+
+        let mut routes: ExternalInterruptRoutes<
+            u32,
+            CountingHandler,
+            CountingHandler,
+            CountingHandler,
+            Infallible,
+            Infallible,
+            Infallible,
+            Infallible,
+            Infallible,
+            CountingHandler,
+            Infallible,
+        > = ExternalInterruptRoutes::new();
+        routes.add_network(35, CountingHandler(&NET_HITS));
+        routes.set_host_fs(35, CountingHandler(&HOST_FS_HITS));
+        routes.set_entropy(36, CountingHandler(&OTHER_HITS));
+        routes.add_block(35, CountingHandler(&BLOCK_A_HITS));
+        routes.add_block(35, CountingHandler(&BLOCK_B_HITS));
+
+        assert!(routes.route(35));
+        assert!(!routes.route(99));
+        assert_eq!(NET_HITS.load(Ordering::Relaxed), 1);
+        assert_eq!(HOST_FS_HITS.load(Ordering::Relaxed), 1);
+        assert_eq!(BLOCK_A_HITS.load(Ordering::Relaxed), 1);
+        assert_eq!(BLOCK_B_HITS.load(Ordering::Relaxed), 1);
+        assert_eq!(OTHER_HITS.load(Ordering::Relaxed), 0);
     }
 }
