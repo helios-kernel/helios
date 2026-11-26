@@ -743,6 +743,19 @@ pub struct PacketFrame {
     pub original_len: usize,
 }
 
+/// One ICMP / ICMPv6 packet delivered to an open ICMP echo socket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IcmpEchoDatagram {
+    /// Remote sender IP address.
+    pub source: NetworkIpAddress,
+    /// Local destination IP address.
+    pub destination: NetworkIpAddress,
+    /// Received IPv4 TTL or IPv6 hop limit.
+    pub ttl: u8,
+    /// Raw ICMP / ICMPv6 payload starting at the ICMP type byte.
+    pub payload: Bytes,
+}
+
 #[derive(Clone, Debug)]
 pub struct UdpBinding<Socket> {
     pub socket: Socket,
@@ -1360,6 +1373,81 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
 
     /// Retires an `AF_PACKET` tap. Synchronous because `Drop` calls it.
     fn packet_close(&self, socket: u64) {
+        let _ = socket;
+    }
+
+    /// Opens an `IPPROTO_ICMP` / `IPPROTO_ICMPV6` echo socket, returning
+    /// `(socket_id, local_id)`.
+    fn icmp_open(&self, ipv6: bool, is_raw: bool) -> Result<(u64, u16), UdpError> {
+        let _ = (ipv6, is_raw);
+        Err(UdpError {
+            kind: UdpErrorKind::Unsupported,
+            detail: NetworkErrorDetail::UnsupportedAddressFamily,
+        })
+    }
+
+    /// Binds an open ICMP socket to `requested_id` (`0` allocates an ephemeral ID).
+    fn icmp_bind(&self, socket: u64, requested_id: u16) -> Result<u16, UdpError> {
+        let _ = (socket, requested_id);
+        Err(UdpError {
+            kind: UdpErrorKind::Unsupported,
+            detail: NetworkErrorDetail::UnsupportedAddressFamily,
+        })
+    }
+
+    /// Transmits an ICMP / ICMPv6 echo request on `socket`.
+    fn icmp_send<'a>(
+        &'a self,
+        socket: u64,
+        destination: NetworkIpAddress,
+        identifier: u16,
+        sequence: u16,
+        payload: &'a [u8],
+        hop_limit: u8,
+    ) -> impl Future<Output = Result<(), UdpError>> + Send + 'a {
+        let _ = (
+            socket,
+            destination,
+            identifier,
+            sequence,
+            payload,
+            hop_limit,
+        );
+        async {
+            Err(UdpError {
+                kind: UdpErrorKind::Unsupported,
+                detail: NetworkErrorDetail::UnsupportedAddressFamily,
+            })
+        }
+    }
+
+    /// Waits up to `timeout_nanos` for one ICMP / ICMPv6 packet on `socket`.
+    fn icmp_receive(
+        &self,
+        socket: u64,
+        timeout_nanos: u64,
+        peek: bool,
+    ) -> impl Future<Output = Result<Option<IcmpEchoDatagram>, UdpError>> + Send + '_ {
+        let _ = (socket, timeout_nanos, peek);
+        async {
+            Err(UdpError {
+                kind: UdpErrorKind::Unsupported,
+                detail: NetworkErrorDetail::UnsupportedAddressFamily,
+            })
+        }
+    }
+
+    /// Non-destructive readiness of an ICMP socket.
+    fn icmp_readiness(
+        &self,
+        socket: u64,
+    ) -> impl Future<Output = Result<SocketReadiness, UdpError>> + Send + '_ {
+        let _ = socket;
+        async { Ok(SocketReadiness::default()) }
+    }
+
+    /// Retires an ICMP echo socket. Synchronous because `Drop` calls it.
+    fn icmp_close(&self, socket: u64) {
         let _ = socket;
     }
 }

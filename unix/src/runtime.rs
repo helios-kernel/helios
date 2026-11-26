@@ -25,6 +25,9 @@ pub trait InterruptTarget: Clone + Send + Sync {
 mod readiness;
 pub use readiness::*;
 
+mod file_lock;
+pub use file_lock::*;
+
 mod open_file;
 pub use open_file::*;
 

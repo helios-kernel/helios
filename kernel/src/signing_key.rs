@@ -44,6 +44,7 @@ use helios_hal::measured_boot::{
     MeasurementDigest, MeasurementRegister, MeasurementSet, SealedSecret, UnsealRefused,
 };
 use hkdf::Hkdf;
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use sha3::{Sha3_256, Sha3_384, Sha3_512};
@@ -66,6 +67,12 @@ const CWASM_SIGNING_INFO: &[u8] = b"helios.cwasm-signing.v1";
 
 /// The HKDF-SHA256 `info` the machine identity Ed25519 key is expanded under.
 pub const MACHINE_IDENTITY_INFO: &[u8] = b"helios.machine-identity.v1";
+
+/// The HKDF-SHA256 `info` the hibernate image HMAC-SHA256 key is expanded under.
+pub const HIBERNATE_AUTH_INFO: &[u8] = b"helios.hibernate-image.v1";
+
+/// Domain separator for [`HibernateAuthKey::fingerprint`].
+const HIBERNATE_FINGERPRINT_PREFIX: &[u8] = b"helios.hibernate-auth-fingerprint.v1\0";
 
 /// Fixed protocol prefix prepended to every message signed by [`MachineIdentityKey`].
 pub const MACHINE_IDENTITY_SIGNATURE_PREFIX: &[u8] = b"helios.machine-identity.v1\0";
@@ -249,6 +256,64 @@ impl fmt::Debug for MachineIdentityKey {
     }
 }
 
+/// The symmetric HMAC-SHA256 key authenticating hibernate images.
+///
+/// Derived via HKDF-SHA256 under [`HIBERNATE_AUTH_INFO`] from the 32-byte
+/// machine seed, and only ever materialized when that seed came from a
+/// non-ephemeral TPM-sealed slot ([`SeedSource::Unsealed`] or
+/// [`SeedSource::Provisioned`]). An ephemeral seed yields no key so
+/// hibernate refuses to produce or accept unauthenticated images.
+///
+/// Key bytes are zeroized on drop and never printed by `Debug`.
+pub struct HibernateAuthKey {
+    key: Zeroizing<[u8; 32]>,
+}
+
+impl HibernateAuthKey {
+    /// Expands the hibernate authentication key from `seed`.
+    pub(crate) fn from_seed(seed: &SealedSecret) -> Self {
+        let mut okm = Zeroizing::new([0_u8; 32]);
+        Hkdf::<Sha256>::new(None, seed.expose())
+            .expand(HIBERNATE_AUTH_INFO, okm.as_mut_slice())
+            .unwrap_or_else(|_| {
+                panic!("HKDF-SHA256 expands up to 8160 bytes, and a hibernate key is 32")
+            });
+        Self { key: okm }
+    }
+
+    /// Computes a 32-byte HMAC-SHA256 tag over `message`.
+    pub fn compute_mac(&self, message: &[u8]) -> [u8; 32] {
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.key.as_slice())
+            .expect("HMAC-SHA256 accepts keys of any length");
+        mac.update(message);
+        mac.finalize().into_bytes().into()
+    }
+
+    /// Verifies `expected_tag` over `message` in constant time.
+    pub fn verify_mac(&self, message: &[u8], expected_tag: &[u8; 32]) -> bool {
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.key.as_slice())
+            .expect("HMAC-SHA256 accepts keys of any length");
+        mac.update(message);
+        mac.verify_slice(expected_tag).is_ok()
+    }
+
+    /// Non-secret diagnostic fingerprint derived by hashing the key under
+    /// a dedicated domain prefix.
+    pub fn fingerprint(&self) -> Fingerprint {
+        let mut hasher = Sha256::new();
+        hasher.update(HIBERNATE_FINGERPRINT_PREFIX);
+        hasher.update(self.key.as_slice());
+        let digest: [u8; 32] = hasher.finalize().into();
+        Fingerprint::of(&digest)
+    }
+}
+
+impl fmt::Debug for HibernateAuthKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "HibernateAuthKey({})", self.fingerprint())
+    }
+}
+
 /// Where this boot's seed came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeedSource {
@@ -318,12 +383,16 @@ pub enum SigningKeyError {
     },
 }
 
-/// This boot's compiler-signing and machine-identity keys and where their
-/// shared seed came from.
+/// This boot's compiler-signing, machine-identity, and hibernate-image
+/// keys and where their shared seed came from.
 #[derive(Debug)]
 pub struct SettledSigningKey {
     pub key: CwasmSigningKey,
     pub machine_identity: MachineIdentityKey,
+    /// Present only when the seed came from a TPM-sealed slot
+    /// ([`SeedSource::Unsealed`] or [`SeedSource::Provisioned`]); `None`
+    /// for [`SeedSource::Ephemeral`].
+    pub hibernate_auth: Option<HibernateAuthKey>,
     pub source: SeedSource,
     /// The registers the seed is sealed to; empty for an ephemeral seed.
     pub bound_to: MeasurementSet,
@@ -366,6 +435,7 @@ pub async fn settle_signing_key<Device: MeasuredBoot>(
         return Ok(SettledSigningKey {
             key: CwasmSigningKey::from_seed(&seed),
             machine_identity: MachineIdentityKey::from_seed(&seed),
+            hibernate_auth: None,
             source: SeedSource::Ephemeral,
             bound_to: MeasurementSet::empty(),
         });
@@ -391,6 +461,7 @@ pub async fn settle_signing_key<Device: MeasuredBoot>(
             return Ok(SettledSigningKey {
                 key: CwasmSigningKey::from_seed(&seed),
                 machine_identity: MachineIdentityKey::from_seed(&seed),
+                hibernate_auth: Some(HibernateAuthKey::from_seed(&seed)),
                 source: SeedSource::Unsealed,
                 bound_to,
             });
@@ -416,6 +487,7 @@ pub async fn settle_signing_key<Device: MeasuredBoot>(
     Ok(SettledSigningKey {
         key: CwasmSigningKey::from_seed(&seed),
         machine_identity: MachineIdentityKey::from_seed(&seed),
+        hibernate_auth: Some(HibernateAuthKey::from_seed(&seed)),
         source: SeedSource::Provisioned(cause),
         bound_to,
     })
@@ -431,7 +503,7 @@ pub(crate) fn settle_signing_key_at_bring_up<Device: MeasuredBoot>(
     measured_boot: Option<&mut Device>,
     payload: &[u8],
     entropy: &RootEntropy,
-) -> (CwasmSigningKey, MachineIdentityKey) {
+) -> SettledSigningKey {
     let settled =
         complete_device_future_at_bring_up(settle_signing_key(measured_boot, payload, entropy))
             .unwrap_or_else(|error| {
@@ -453,9 +525,10 @@ pub(crate) fn settle_signing_key_at_bring_up<Device: MeasuredBoot>(
         bound_to = format_args!("{:#x}", settled.bound_to.bits()),
         signer = %settled.key.fingerprint(),
         identity = %settled.machine_identity.fingerprint(),
+        hibernate_auth = settled.hibernate_auth.is_some(),
         "compiler-signing key settled"
     );
-    (settled.key, settled.machine_identity)
+    settled
 }
 
 /// A new seed from the root DRBG, written straight into the secret.
@@ -867,6 +940,59 @@ mod tests {
             Err(MachineIdentitySignError::ChallengeTooLarge {
                 limit: MAX_MACHINE_IDENTITY_CHALLENGE_BYTES as u32,
             })
+        );
+    }
+
+    #[test]
+    fn hibernate_auth_key_requires_sealed_seed_and_authenticates_messages() {
+        // Ephemeral seeds never materialize a hibernate authentication key.
+        let eph = ephemeral(1);
+        assert_eq!(eph.source, SeedSource::Ephemeral);
+        assert!(
+            eph.hibernate_auth.is_none(),
+            "ephemeral seed must not produce a HibernateAuthKey"
+        );
+
+        // Sealed boots materialize the same key across provisioned and unsealed boots.
+        let mut device = MeasuredBootModel::new(KERNEL_IMAGE);
+        let first = boot(&mut device, 1, &payload(0x0b)).unwrap();
+        assert!(matches!(first.source, SeedSource::Provisioned(_)));
+        let first_key = first
+            .hibernate_auth
+            .as_ref()
+            .expect("provisioned TPM seed yields HibernateAuthKey");
+
+        let second = boot(&mut device, 2, &payload(0x0b)).unwrap();
+        assert_eq!(second.source, SeedSource::Unsealed);
+        let second_key = second
+            .hibernate_auth
+            .as_ref()
+            .expect("unsealed TPM seed yields HibernateAuthKey");
+        assert_eq!(first_key.fingerprint(), second_key.fingerprint());
+
+        let tag = first_key.compute_mac(b"hibernate-header-bytes");
+        assert!(second_key.verify_mac(b"hibernate-header-bytes", &tag));
+        let mut bad_tag = tag;
+        bad_tag[0] ^= 0x80;
+        assert!(!second_key.verify_mac(b"hibernate-header-bytes", &bad_tag));
+        assert!(!second_key.verify_mac(b"tampered-header-bytes", &tag));
+
+        // Domain-separated from cwasm and machine identity keys.
+        let seed = SealedSecret::new([0x5a; SealedSecret::LEN]);
+        let hib = HibernateAuthKey::from_seed(&seed);
+        let mut expected = [0_u8; 32];
+        Hkdf::<Sha256>::new(None, seed.expose())
+            .expand(HIBERNATE_AUTH_INFO, &mut expected)
+            .unwrap();
+        let mut ref_mac = Hmac::<Sha256>::new_from_slice(&expected).unwrap();
+        ref_mac.update(b"check");
+        let ref_tag: [u8; 32] = ref_mac.finalize().into_bytes().into();
+        assert_eq!(hib.compute_mac(b"check"), ref_tag);
+
+        // Debug prints only the non-secret fingerprint.
+        assert_eq!(
+            alloc::format!("{hib:?}"),
+            alloc::format!("HibernateAuthKey({})", hib.fingerprint())
         );
     }
 }

@@ -41,8 +41,8 @@ use helios_inspector_protocol::auth::{
     AUTH_PROTOCOL_VERSION, AuthError, AuthPolicy, DEFAULT_INSPECTOR_TCP_PORT,
     INSPECTOR_POLICY_PATH, MACHINE_IDENTITY_HANDSHAKE_DOMAIN, ServerAuthResult, ServerHello,
     SessionGrants, TlsControlRequest, TlsControlResponse, TransportKind,
-    compute_handshake_challenge, read_auth_message, server_handshake, verify_client_auth,
-    write_auth_message,
+    compute_handshake_challenge, random_32, read_auth_message, server_handshake,
+    verify_client_auth, write_auth_message,
 };
 
 use crate::grants::session_grants_to_kernel;
@@ -52,12 +52,116 @@ const INSPECTOR_TLS_PATH: &str = "/bin/inspector-tls";
 const INSPECTOR_WORKER_PATH: &str = "/bin/inspector-worker";
 const LISTENER_BACKLOG: u16 = 32;
 const VSOCK_BACKLOG: u32 = 32;
+/// Maximum concurrent in-flight unauthenticated handshakes across TCP and vsock.
+const MAX_CONCURRENT_HANDSHAKES: usize = 16;
+/// Deadline for completing the TLS/auth handshake before aborting the session
+/// and terminating `inspector-tls`.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Brief grace window for `inspector-tls` to flush an `AuthDecision::Rejected`
+/// or final TLS `close_notify` before `SIGKILL`.
+const TLS_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// POSIX `SIGKILL` signal number delivered via `Child::signal`.
+const SIGKILL: u8 = 9;
+
+struct HandshakeLimiter {
+    tx: helios_api::channel::Sender<()>,
+    rx: helios_api::channel::Receiver<()>,
+}
+
+struct HandshakePermit {
+    tx: helios_api::channel::Sender<()>,
+}
+
+impl HandshakeLimiter {
+    fn new(limit: usize) -> Self {
+        let cap = limit.max(1);
+        let (tx, rx) = helios_api::channel::bounded(cap);
+        for _ in 0..cap {
+            let _ = tx.try_send(());
+        }
+        Self { tx, rx }
+    }
+
+    async fn acquire(&self) -> HandshakePermit {
+        let _ = self.rx.recv().await;
+        HandshakePermit {
+            tx: self.tx.clone(),
+        }
+    }
+}
+
+impl Drop for HandshakePermit {
+    fn drop(&mut self) {
+        let _ = self.tx.try_send(());
+    }
+}
+
+async fn with_timeout<F, T>(duration: Duration, fut: F) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    let mut fut = std::pin::pin!(fut);
+    let mut timer = std::pin::pin!(helios_api::task::sleep(duration));
+    match futures_util::future::select(fut.as_mut(), timer.as_mut()).await {
+        futures_util::future::Either::Left((val, _)) => Some(val),
+        futures_util::future::Either::Right(((), _)) => None,
+    }
+}
+
+/// Immediately sends `SIGKILL` to `child` and waits for the kernel to reap it.
+async fn kill_and_reap(child: Child) {
+    let _ = child.signal(SIGKILL);
+    let _ = child.wait().await;
+}
+
+/// Gives `child` a short grace period to exit cleanly, then force-kills and
+/// reaps it so a stalled remote TCP peer cannot pin a `tls_child` forever.
+async fn reap_with_grace_or_kill(child: Child, grace: Duration) {
+    if with_timeout(grace, child.wait_exit()).await.is_some() {
+        return;
+    }
+    kill_and_reap(child).await;
+}
+
+/// Generates a fresh CSPRNG `server_nonce` inside `inspector-host` and signs
+/// the TLS 1.3 channel binding and ephemeral cert digest with `MachineIdentity`.
+fn sign_tls_handshake_with<F>(
+    machine_public_key: [u8; 32],
+    now_unix: u64,
+    channel_binding: [u8; 32],
+    tls_spki_sha256: [u8; 32],
+    sign_challenge: F,
+) -> Result<ServerHello, AuthError>
+where
+    F: FnOnce(&[u8; 32]) -> Result<[u8; 64], AuthError>,
+{
+    let server_nonce = random_32()?;
+    let challenge = compute_handshake_challenge(
+        AUTH_PROTOCOL_VERSION,
+        TransportKind::TcpTls,
+        server_nonce,
+        now_unix,
+        Some(channel_binding),
+        Some(tls_spki_sha256),
+    );
+    let machine_signature = sign_challenge(&challenge)?;
+    Ok(ServerHello {
+        protocol_version: AUTH_PROTOCOL_VERSION,
+        transport: TransportKind::TcpTls,
+        machine_public_key,
+        server_nonce,
+        server_unix_time: now_unix,
+        tls_binding_required: true,
+        machine_signature,
+    })
+}
 
 struct HostContext {
     policy: AuthPolicy,
     worker_ceiling: SessionGrants,
     machine_public_key: [u8; 32],
     next_session_id: AtomicU64,
+    handshake_limiter: HandshakeLimiter,
     component_control_upstream: Option<Arc<helios_wit_rpc::PeerHandle>>,
 }
 
@@ -142,6 +246,7 @@ async fn main() -> Result<(), String> {
         worker_ceiling: SessionGrants::full_worker_ceiling(),
         machine_public_key,
         next_session_id: AtomicU64::new(1),
+        handshake_limiter: HandshakeLimiter::new(MAX_CONCURRENT_HANDSHAKES),
         component_control_upstream,
     });
 
@@ -213,31 +318,33 @@ async fn main() -> Result<(), String> {
 
 async fn run_tcp_accept_loop(ctx: Arc<HostContext>, listener: TcpListener) -> Result<(), String> {
     let mut sessions: FuturesUnordered<Pin<Box<dyn Future<Output = ()>>>> = FuturesUnordered::new();
-    let mut next_accept = Box::pin(accept_tcp_owned(listener));
+    let mut next_accept = Box::pin(accept_tcp_owned(Arc::clone(&ctx), listener));
 
     loop {
         if sessions.is_empty() {
-            let (listener_back, accepted) = next_accept.await;
-            next_accept = Box::pin(accept_tcp_owned(listener_back));
+            let (listener_back, permit, accepted) = next_accept.await;
+            next_accept = Box::pin(accept_tcp_owned(Arc::clone(&ctx), listener_back));
             match accepted {
                 Ok(stream) => {
                     let ctx = Arc::clone(&ctx);
-                    sessions.push(Box::pin(handle_tcp_session(ctx, stream)));
+                    sessions.push(Box::pin(handle_tcp_session(ctx, stream, permit)));
                 }
                 Err(err) => {
+                    drop(permit);
                     eprintln!("inspector-host tcp accept error: {err}");
                 }
             }
         } else {
             match futures_util::future::select(next_accept.as_mut(), sessions.next()).await {
-                futures_util::future::Either::Left(((listener_back, accepted), _)) => {
-                    next_accept.set(accept_tcp_owned(listener_back));
+                futures_util::future::Either::Left(((listener_back, permit, accepted), _)) => {
+                    next_accept.set(accept_tcp_owned(Arc::clone(&ctx), listener_back));
                     match accepted {
                         Ok(stream) => {
                             let ctx = Arc::clone(&ctx);
-                            sessions.push(Box::pin(handle_tcp_session(ctx, stream)));
+                            sessions.push(Box::pin(handle_tcp_session(ctx, stream, permit)));
                         }
                         Err(err) => {
+                            drop(permit);
                             eprintln!("inspector-host tcp accept error: {err}");
                         }
                     }
@@ -248,12 +355,184 @@ async fn run_tcp_accept_loop(ctx: Arc<HostContext>, listener: TcpListener) -> Re
     }
 }
 
-async fn accept_tcp_owned(listener: TcpListener) -> (TcpListener, std::io::Result<TcpStream>) {
+async fn accept_tcp_owned(
+    ctx: Arc<HostContext>,
+    listener: TcpListener,
+) -> (TcpListener, HandshakePermit, std::io::Result<TcpStream>) {
+    let permit = ctx.handshake_limiter.acquire().await;
     let res = listener.accept().await;
-    (listener, res)
+    (listener, permit, res)
 }
 
-async fn handle_tcp_session(ctx: Arc<HostContext>, stream: TcpStream) {
+enum TcpHandshakeOutcome {
+    Accepted(Child, Option<ComponentControlBridge>),
+    Rejected,
+    Abort,
+}
+
+async fn run_tcp_control_handshake(
+    ctx: &HostContext,
+    session_id: u64,
+    ctrl_io: &mut IpcIo,
+    worker_data: ipc::Endpoint,
+) -> TcpHandshakeOutcome {
+    // Step 1: Receive `SignHandshake` from `inspector-tls`, generate a fresh
+    // CSPRNG `server_nonce` inside `inspector-host`, and sign via `MachineIdentity`.
+    let req: TlsControlRequest = match read_auth_message(ctrl_io).await {
+        Ok(req) => req,
+        Err(err) => {
+            eprintln!("inspector-host session {session_id}: control read failed: {err}");
+            return TcpHandshakeOutcome::Abort;
+        }
+    };
+    let (expected_binding, signed_hello) = match req {
+        TlsControlRequest::SignHandshake {
+            channel_binding,
+            tls_spki_sha256,
+        } => {
+            let now = current_unix_time();
+            match sign_tls_handshake_with(
+                ctx.machine_public_key,
+                now,
+                channel_binding,
+                tls_spki_sha256,
+                |challenge| ctx.sign_challenge(challenge),
+            ) {
+                Ok(hello) => (channel_binding, hello),
+                Err(err) => {
+                    let _ =
+                        write_auth_message(ctrl_io, &TlsControlResponse::Error(err.to_string()))
+                            .await;
+                    return TcpHandshakeOutcome::Abort;
+                }
+            }
+        }
+        other => {
+            let _ = write_auth_message(
+                ctrl_io,
+                &TlsControlResponse::Error(format!("expected SignHandshake, got {other:?}")),
+            )
+            .await;
+            return TcpHandshakeOutcome::Abort;
+        }
+    };
+
+    if write_auth_message(
+        ctrl_io,
+        &TlsControlResponse::HandshakeSigned(signed_hello.clone()),
+    )
+    .await
+    .is_err()
+    {
+        return TcpHandshakeOutcome::Abort;
+    }
+
+    // Step 2: Receive `ClientAuth` forwarded by `inspector-tls`, verify Ed25519
+    // credentials + RFC 8446 channel binding, and spawn attenuated `inspector-worker`.
+    let auth_req: TlsControlRequest = match read_auth_message(ctrl_io).await {
+        Ok(req) => req,
+        Err(_) => return TcpHandshakeOutcome::Abort,
+    };
+    match auth_req {
+        TlsControlRequest::Authenticate {
+            server_hello,
+            channel_binding,
+            client_auth,
+        } => {
+            if server_hello != signed_hello || channel_binding != expected_binding {
+                let decision = ServerAuthResult::Rejected {
+                    code: helios_inspector_protocol::auth::AuthRejectCode::WrongChannelBinding,
+                    detail: "TLS handshake transcript or channel binding mismatch".to_owned(),
+                };
+                let _ =
+                    write_auth_message(ctrl_io, &TlsControlResponse::AuthDecision(decision)).await;
+                TcpHandshakeOutcome::Rejected
+            } else {
+                let now = current_unix_time();
+                match verify_client_auth(
+                    &ctx.policy,
+                    &ctx.worker_ceiling,
+                    &signed_hello,
+                    Some(expected_binding),
+                    &client_auth,
+                    now,
+                ) {
+                    Ok(verified) => {
+                        let mut grants = session_grants_to_kernel(&verified.granted);
+                        grants.push(ipc_grant("rpc", worker_data));
+                        let cc_task = attach_component_control(
+                            ctx,
+                            &verified.granted.component_control,
+                            &mut grants,
+                        );
+                        match programs::spawn(SpawnRequest {
+                            name: format!("inspector-worker-{session_id}"),
+                            args: Vec::new(),
+                            env: Vec::new(),
+                            path: INSPECTOR_WORKER_PATH.to_owned(),
+                            cwd: None,
+                            sockets: Vec::new(),
+                            capability_grants: grants,
+                        })
+                        .await
+                        {
+                            Ok(worker) => {
+                                let decision = ServerAuthResult::Accepted {
+                                    granted: verified.granted,
+                                    session_id,
+                                };
+                                let _ = write_auth_message(
+                                    ctrl_io,
+                                    &TlsControlResponse::AuthDecision(decision),
+                                )
+                                .await;
+                                TcpHandshakeOutcome::Accepted(worker, cc_task)
+                            }
+                            Err(err) => {
+                                let decision = ServerAuthResult::Rejected {
+                                    code: helios_inspector_protocol::auth::AuthRejectCode::Internal,
+                                    detail: format!("failed to spawn inspector-worker: {err:?}"),
+                                };
+                                let _ = write_auth_message(
+                                    ctrl_io,
+                                    &TlsControlResponse::AuthDecision(decision),
+                                )
+                                .await;
+                                TcpHandshakeOutcome::Rejected
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let decision = ServerAuthResult::Rejected {
+                            code: err.reject_code(),
+                            detail: err.to_string(),
+                        };
+                        let _ = write_auth_message(
+                            ctrl_io,
+                            &TlsControlResponse::AuthDecision(decision),
+                        )
+                        .await;
+                        TcpHandshakeOutcome::Rejected
+                    }
+                }
+            }
+        }
+        other => {
+            let _ = write_auth_message(
+                ctrl_io,
+                &TlsControlResponse::Error(format!("expected Authenticate, got {other:?}")),
+            )
+            .await;
+            TcpHandshakeOutcome::Abort
+        }
+    }
+}
+
+async fn handle_tcp_session(
+    ctx: Arc<HostContext>,
+    stream: TcpStream,
+    handshake_permit: HandshakePermit,
+) {
     let session_id = ctx.next_session();
     let (host_ctrl, tls_ctrl) = ipc::channel();
     let (tls_data, worker_data) = ipc::channel();
@@ -279,190 +558,39 @@ async fn handle_tcp_session(ctx: Arc<HostContext>, stream: TcpStream) {
     };
 
     let mut ctrl_io = IpcIo::new(host_ctrl);
-
-    // Step 1: Receive `SignHandshake` from `inspector-tls` and sign via `MachineIdentity`.
-    let req: TlsControlRequest = match read_auth_message(&mut ctrl_io).await {
-        Ok(req) => req,
-        Err(err) => {
-            eprintln!("inspector-host session {session_id}: control read failed: {err}");
-            let _ = tls_child.wait().await;
-            return;
-        }
-    };
-    let (expected_binding, signed_hello) = match req {
-        TlsControlRequest::SignHandshake {
-            channel_binding,
-            tls_spki_sha256,
-            server_nonce,
-        } => {
-            let now = current_unix_time();
-            let challenge = compute_handshake_challenge(
-                AUTH_PROTOCOL_VERSION,
-                TransportKind::TcpTls,
-                server_nonce,
-                now,
-                Some(channel_binding),
-                Some(tls_spki_sha256),
-            );
-            match ctx.sign_challenge(&challenge) {
-                Ok(machine_signature) => {
-                    let hello = ServerHello {
-                        protocol_version: AUTH_PROTOCOL_VERSION,
-                        transport: TransportKind::TcpTls,
-                        machine_public_key: ctx.machine_public_key,
-                        server_nonce,
-                        server_unix_time: now,
-                        tls_binding_required: true,
-                        machine_signature,
-                    };
-                    (channel_binding, hello)
-                }
-                Err(err) => {
-                    let _ = write_auth_message(
-                        &mut ctrl_io,
-                        &TlsControlResponse::Error(err.to_string()),
-                    )
-                    .await;
-                    let _ = tls_child.wait().await;
-                    return;
-                }
-            }
-        }
-        other => {
-            let _ = write_auth_message(
-                &mut ctrl_io,
-                &TlsControlResponse::Error(format!("expected SignHandshake, got {other:?}")),
-            )
-            .await;
-            let _ = tls_child.wait().await;
-            return;
-        }
-    };
-
-    if write_auth_message(
-        &mut ctrl_io,
-        &TlsControlResponse::HandshakeSigned(signed_hello.clone()),
+    let outcome = with_timeout(
+        HANDSHAKE_TIMEOUT,
+        run_tcp_control_handshake(&ctx, session_id, &mut ctrl_io, worker_data),
     )
-    .await
-    .is_err()
-    {
-        let _ = tls_child.wait().await;
-        return;
-    }
-
-    // Step 2: Receive `ClientAuth` forwarded by `inspector-tls`, verify Ed25519
-    // credentials + RFC 8446 channel binding, and spawn attenuated `inspector-worker`.
-    let auth_req: TlsControlRequest = match read_auth_message(&mut ctrl_io).await {
-        Ok(req) => req,
-        Err(_) => {
-            let _ = tls_child.wait().await;
-            return;
-        }
-    };
-    let worker_child: Option<(Child, Option<ComponentControlBridge>)> = match auth_req {
-        TlsControlRequest::Authenticate {
-            server_hello,
-            channel_binding,
-            client_auth,
-        } => {
-            if server_hello != signed_hello || channel_binding != expected_binding {
-                let decision = ServerAuthResult::Rejected {
-                    code: helios_inspector_protocol::auth::AuthRejectCode::WrongChannelBinding,
-                    detail: "TLS handshake transcript or channel binding mismatch".to_owned(),
-                };
-                let _ =
-                    write_auth_message(&mut ctrl_io, &TlsControlResponse::AuthDecision(decision))
-                        .await;
-                None
-            } else {
-                let now = current_unix_time();
-                match verify_client_auth(
-                    &ctx.policy,
-                    &ctx.worker_ceiling,
-                    &signed_hello,
-                    Some(expected_binding),
-                    &client_auth,
-                    now,
-                ) {
-                    Ok(verified) => {
-                        let mut grants = session_grants_to_kernel(&verified.granted);
-                        grants.push(ipc_grant("rpc", worker_data));
-                        let cc_task = attach_component_control(
-                            &ctx,
-                            &verified.granted.component_control,
-                            &mut grants,
-                        );
-                        match programs::spawn(SpawnRequest {
-                            name: format!("inspector-worker-{session_id}"),
-                            args: Vec::new(),
-                            env: Vec::new(),
-                            path: INSPECTOR_WORKER_PATH.to_owned(),
-                            cwd: None,
-                            sockets: Vec::new(),
-                            capability_grants: grants,
-                        })
-                        .await
-                        {
-                            Ok(worker) => {
-                                let decision = ServerAuthResult::Accepted {
-                                    granted: verified.granted,
-                                    session_id,
-                                };
-                                let _ = write_auth_message(
-                                    &mut ctrl_io,
-                                    &TlsControlResponse::AuthDecision(decision),
-                                )
-                                .await;
-                                Some((worker, cc_task))
-                            }
-                            Err(err) => {
-                                let decision = ServerAuthResult::Rejected {
-                                    code: helios_inspector_protocol::auth::AuthRejectCode::Internal,
-                                    detail: format!("failed to spawn inspector-worker: {err:?}"),
-                                };
-                                let _ = write_auth_message(
-                                    &mut ctrl_io,
-                                    &TlsControlResponse::AuthDecision(decision),
-                                )
-                                .await;
-                                None
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        let decision = ServerAuthResult::Rejected {
-                            code: err.reject_code(),
-                            detail: err.to_string(),
-                        };
-                        let _ = write_auth_message(
-                            &mut ctrl_io,
-                            &TlsControlResponse::AuthDecision(decision),
-                        )
-                        .await;
-                        None
-                    }
-                }
-            }
-        }
-        other => {
-            let _ = write_auth_message(
-                &mut ctrl_io,
-                &TlsControlResponse::Error(format!("expected Authenticate, got {other:?}")),
-            )
-            .await;
-            None
-        }
-    };
+    .await;
 
     // Drop the control channel immediately — `inspector-host` is now 100% off
     // the post-handshake data path (`inspector-tls` <-> `inspector-worker` flow
     // directly over `data`/`rpc` IPC).
     drop(ctrl_io);
 
-    if let Some((worker, cc_task)) = worker_child {
-        wait_worker_and_control(worker, cc_task).await;
+    match outcome {
+        Some(TcpHandshakeOutcome::Accepted(worker, cc_task)) => {
+            // Release the handshake slot as soon as authentication succeeds so
+            // long-lived sessions never starve new handshakes.
+            drop(handshake_permit);
+            wait_worker_and_control(worker, cc_task).await;
+            reap_with_grace_or_kill(tls_child, TLS_SHUTDOWN_GRACE).await;
+        }
+        Some(TcpHandshakeOutcome::Rejected) => {
+            reap_with_grace_or_kill(tls_child, TLS_SHUTDOWN_GRACE).await;
+            drop(handshake_permit);
+        }
+        Some(TcpHandshakeOutcome::Abort) => {
+            kill_and_reap(tls_child).await;
+            drop(handshake_permit);
+        }
+        None => {
+            eprintln!("inspector-host session {session_id}: handshake timed out");
+            kill_and_reap(tls_child).await;
+            drop(handshake_permit);
+        }
     }
-    let _ = tls_child.wait().await;
 }
 
 fn attach_component_control(
@@ -505,31 +633,33 @@ async fn run_vsock_accept_loop(
     listener: VsockListener,
 ) -> Result<(), String> {
     let mut sessions: FuturesUnordered<Pin<Box<dyn Future<Output = ()>>>> = FuturesUnordered::new();
-    let mut next_accept = Box::pin(accept_vsock_owned(listener));
+    let mut next_accept = Box::pin(accept_vsock_owned(Arc::clone(&ctx), listener));
 
     loop {
         if sessions.is_empty() {
-            let (listener_back, accepted) = next_accept.await;
-            next_accept = Box::pin(accept_vsock_owned(listener_back));
+            let (listener_back, permit, accepted) = next_accept.await;
+            next_accept = Box::pin(accept_vsock_owned(Arc::clone(&ctx), listener_back));
             match accepted {
                 Ok(stream) => {
                     let ctx = Arc::clone(&ctx);
-                    sessions.push(Box::pin(handle_vsock_session(ctx, stream)));
+                    sessions.push(Box::pin(handle_vsock_session(ctx, stream, permit)));
                 }
                 Err(err) => {
+                    drop(permit);
                     eprintln!("inspector-host vsock accept error: {err}");
                 }
             }
         } else {
             match futures_util::future::select(next_accept.as_mut(), sessions.next()).await {
-                futures_util::future::Either::Left(((listener_back, accepted), _)) => {
-                    next_accept.set(accept_vsock_owned(listener_back));
+                futures_util::future::Either::Left(((listener_back, permit, accepted), _)) => {
+                    next_accept.set(accept_vsock_owned(Arc::clone(&ctx), listener_back));
                     match accepted {
                         Ok(stream) => {
                             let ctx = Arc::clone(&ctx);
-                            sessions.push(Box::pin(handle_vsock_session(ctx, stream)));
+                            sessions.push(Box::pin(handle_vsock_session(ctx, stream, permit)));
                         }
                         Err(err) => {
+                            drop(permit);
                             eprintln!("inspector-host vsock accept error: {err}");
                         }
                     }
@@ -541,13 +671,19 @@ async fn run_vsock_accept_loop(
 }
 
 async fn accept_vsock_owned(
+    ctx: Arc<HostContext>,
     listener: VsockListener,
-) -> (VsockListener, std::io::Result<VsockStream>) {
+) -> (VsockListener, HandshakePermit, std::io::Result<VsockStream>) {
+    let permit = ctx.handshake_limiter.acquire().await;
     let res = listener.accept().await;
-    (listener, res)
+    (listener, permit, res)
 }
 
-async fn handle_vsock_session(ctx: Arc<HostContext>, mut stream: VsockStream) {
+async fn handle_vsock_session(
+    ctx: Arc<HostContext>,
+    mut stream: VsockStream,
+    handshake_permit: HandshakePermit,
+) {
     stream.set_timeout(vsock::NO_DEADLINE);
     let session_id = ctx.next_session();
     let mut io = UnbufferedVsockIo::new(stream);
@@ -555,28 +691,37 @@ async fn handle_vsock_session(ctx: Arc<HostContext>, mut stream: VsockStream) {
 
     let verified = {
         let (mut read, mut write) = futures_util::AsyncReadExt::split(&mut io);
-        match server_handshake(
-            &mut read,
-            &mut write,
-            TransportKind::Vsock,
-            &ctx.policy,
-            &ctx.worker_ceiling,
-            ctx.machine_public_key,
-            now,
-            session_id,
-            None,
-            None,
-            |challenge| ctx.sign_challenge(challenge),
+        match with_timeout(
+            HANDSHAKE_TIMEOUT,
+            server_handshake(
+                &mut read,
+                &mut write,
+                TransportKind::Vsock,
+                &ctx.policy,
+                &ctx.worker_ceiling,
+                ctx.machine_public_key,
+                now,
+                session_id,
+                None,
+                None,
+                |challenge| ctx.sign_challenge(challenge),
+            ),
         )
         .await
         {
-            Ok(v) => v,
-            Err(err) => {
+            Some(Ok(v)) => v,
+            Some(Err(err)) => {
                 eprintln!("inspector-host vsock session {session_id} rejected: {err}");
+                return;
+            }
+            None => {
+                eprintln!("inspector-host vsock session {session_id} handshake timed out");
                 return;
             }
         }
     };
+
+    drop(handshake_permit);
 
     // Hand the connected `VsockStream` directly to the attenuated worker and
     // exit the post-handshake data path completely.
@@ -664,5 +809,84 @@ async fn handle_serial_session(ctx: Arc<HostContext>, port: DebugPort) {
         Err(err) => {
             eprintln!("inspector-host failed to spawn serial worker {session_id}: {err:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use helios_inspector_protocol::auth::{sign_machine_identity_seed, verify_server_hello};
+
+    use super::*;
+
+    #[test]
+    fn host_generates_fresh_server_nonce_independently_of_tls_request() {
+        let machine_seed = [0x42; 32];
+        let machine_pub =
+            helios_inspector_protocol::auth::ClientIdentity::from_static_seed(machine_seed)
+                .public_key();
+        let binding = [0x11; 32];
+        let spki = [0x22; 32];
+
+        let hello_a =
+            sign_tls_handshake_with(machine_pub, 1_700_000_000, binding, spki, |challenge| {
+                Ok(sign_machine_identity_seed(
+                    &machine_seed,
+                    MACHINE_IDENTITY_HANDSHAKE_DOMAIN,
+                    challenge,
+                ))
+            })
+            .expect("first host-signed hello");
+        let hello_b =
+            sign_tls_handshake_with(machine_pub, 1_700_000_000, binding, spki, |challenge| {
+                Ok(sign_machine_identity_seed(
+                    &machine_seed,
+                    MACHINE_IDENTITY_HANDSHAKE_DOMAIN,
+                    challenge,
+                ))
+            })
+            .expect("second host-signed hello");
+
+        assert_ne!(hello_a.server_nonce, [0u8; 32]);
+        assert_ne!(hello_b.server_nonce, [0u8; 32]);
+        assert_ne!(
+            hello_a.server_nonce, hello_b.server_nonce,
+            "inspector-host must generate a fresh CSPRNG server_nonce per handshake"
+        );
+        verify_server_hello(
+            &hello_a,
+            TransportKind::TcpTls,
+            Some(machine_pub),
+            Some(binding),
+            Some(spki),
+        )
+        .expect("hello_a signature must verify");
+        verify_server_hello(
+            &hello_b,
+            TransportKind::TcpTls,
+            Some(machine_pub),
+            Some(binding),
+            Some(spki),
+        )
+        .expect("hello_b signature must verify");
+    }
+
+    #[test]
+    fn handshake_limiter_enforces_concurrency_cap_and_releases_on_drop() {
+        futures_lite::future::block_on(async {
+            let limiter = HandshakeLimiter::new(2);
+            let p1 = limiter.acquire().await;
+            let p2 = limiter.acquire().await;
+            let mut third = std::pin::pin!(limiter.acquire());
+            assert!(
+                futures_lite::future::poll_once(third.as_mut())
+                    .await
+                    .is_none(),
+                "third handshake must park when cap is reached"
+            );
+            drop(p1);
+            let p3 = third.await;
+            drop(p2);
+            drop(p3);
+        });
     }
 }

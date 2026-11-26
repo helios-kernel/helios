@@ -322,7 +322,15 @@ impl rpc_programs::RpcHandler for ProgramsBridge {
         self.spawner.spawn(async move {
             let mut buf = Vec::with_capacity(16 * 1024);
             loop {
-                let (res, chunk) = wit_rx.read(buf).await;
+                let (res, chunk) = {
+                    let mut read_fut = std::pin::pin!(wit_rx.read(buf));
+                    let mut closed_fut = std::pin::pin!(rpc_tx.closed());
+                    match futures_util::future::select(read_fut.as_mut(), closed_fut.as_mut()).await
+                    {
+                        futures_util::future::Either::Left((pair, _)) => pair,
+                        futures_util::future::Either::Right(((), _)) => break,
+                    }
+                };
                 if !chunk.is_empty() {
                     if rpc_tx.send_batch(chunk).await.is_err() {
                         break;
@@ -335,9 +343,19 @@ impl rpc_programs::RpcHandler for ProgramsBridge {
                     break;
                 }
             }
+            drop(wit_rx);
             let _ = rpc_tx.close().await;
-            let outcome = done_wit.await;
-            let _ = fut_tx.resolve(outcome).await;
+            let outcome = {
+                let mut done_fut = std::pin::pin!(std::future::IntoFuture::into_future(done_wit));
+                let mut cancel_fut = std::pin::pin!(fut_tx.cancelled());
+                match futures_util::future::select(done_fut.as_mut(), cancel_fut.as_mut()).await {
+                    futures_util::future::Either::Left((outcome, _)) => Some(outcome),
+                    futures_util::future::Either::Right(((), _)) => None,
+                }
+            };
+            if let Some(outcome) = outcome {
+                let _ = fut_tx.resolve(outcome).await;
+            }
         });
         (rpc_rx, fut_rx)
     }
@@ -352,7 +370,15 @@ impl rpc_programs::RpcHandler for ProgramsBridge {
         self.spawner.spawn(async move {
             let mut buf = Vec::with_capacity(16 * 1024);
             loop {
-                let (res, chunk) = wit_rx.read(buf).await;
+                let (res, chunk) = {
+                    let mut read_fut = std::pin::pin!(wit_rx.read(buf));
+                    let mut closed_fut = std::pin::pin!(rpc_tx.closed());
+                    match futures_util::future::select(read_fut.as_mut(), closed_fut.as_mut()).await
+                    {
+                        futures_util::future::Either::Left((pair, _)) => pair,
+                        futures_util::future::Either::Right(((), _)) => break,
+                    }
+                };
                 if !chunk.is_empty() {
                     if rpc_tx.send_batch(chunk).await.is_err() {
                         break;
@@ -365,9 +391,19 @@ impl rpc_programs::RpcHandler for ProgramsBridge {
                     break;
                 }
             }
+            drop(wit_rx);
             let _ = rpc_tx.close().await;
-            let outcome = done_wit.await;
-            let _ = fut_tx.resolve(outcome).await;
+            let outcome = {
+                let mut done_fut = std::pin::pin!(std::future::IntoFuture::into_future(done_wit));
+                let mut cancel_fut = std::pin::pin!(fut_tx.cancelled());
+                match futures_util::future::select(done_fut.as_mut(), cancel_fut.as_mut()).await {
+                    futures_util::future::Either::Left((outcome, _)) => Some(outcome),
+                    futures_util::future::Either::Right(((), _)) => None,
+                }
+            };
+            if let Some(outcome) = outcome {
+                let _ = fut_tx.resolve(outcome).await;
+            }
         });
         (rpc_rx, fut_rx)
     }
@@ -1151,7 +1187,15 @@ impl rpc_tracing::RpcHandler for TracingBridge {
         self.spawner.spawn(async move {
             let mut buf = Vec::with_capacity(16);
             loop {
-                let (res, batch) = wit_rx.read(buf).await;
+                let (res, batch) = {
+                    let mut read_fut = std::pin::pin!(wit_rx.read(buf));
+                    let mut closed_fut = std::pin::pin!(rpc_tx.closed());
+                    match futures_util::future::select(read_fut.as_mut(), closed_fut.as_mut()).await
+                    {
+                        futures_util::future::Either::Left((pair, _)) => pair,
+                        futures_util::future::Either::Right(((), _)) => break,
+                    }
+                };
                 if !batch.is_empty() {
                     let mapped: Vec<rpc_tracing::Event> =
                         batch.into_iter().map(map_trace_event).collect();
@@ -1166,6 +1210,7 @@ impl rpc_tracing::RpcHandler for TracingBridge {
                     break;
                 }
             }
+            drop(wit_rx);
             let _ = rpc_tx.close().await;
         });
         Ok(rpc_rx)
@@ -1748,7 +1793,15 @@ impl rpc_fs::RpcHandler for FilesystemBridge {
         self.spawner.spawn(async move {
             let mut buf = Vec::with_capacity(32 * 1024);
             loop {
-                let (res, chunk) = wit_rx.read(buf).await;
+                let (res, chunk) = {
+                    let mut read_fut = std::pin::pin!(wit_rx.read(buf));
+                    let mut closed_fut = std::pin::pin!(rpc_tx.closed());
+                    match futures_util::future::select(read_fut.as_mut(), closed_fut.as_mut()).await
+                    {
+                        futures_util::future::Either::Left((pair, _)) => pair,
+                        futures_util::future::Either::Right(((), _)) => break,
+                    }
+                };
                 if !chunk.is_empty() {
                     if rpc_tx.send_batch(chunk).await.is_err() {
                         break;
@@ -1761,9 +1814,19 @@ impl rpc_fs::RpcHandler for FilesystemBridge {
                     break;
                 }
             }
+            drop(wit_rx);
             let _ = rpc_tx.close().await;
-            let outcome = done_wit.await.map_err(map_fs_error);
-            let _ = fut_tx.resolve(outcome).await;
+            let outcome = {
+                let mut done_fut = std::pin::pin!(std::future::IntoFuture::into_future(done_wit));
+                let mut cancel_fut = std::pin::pin!(fut_tx.cancelled());
+                match futures_util::future::select(done_fut.as_mut(), cancel_fut.as_mut()).await {
+                    futures_util::future::Either::Left((outcome, _)) => Some(outcome),
+                    futures_util::future::Either::Right(((), _)) => None,
+                }
+            };
+            if let Some(outcome) = outcome {
+                let _ = fut_tx.resolve(outcome.map_err(map_fs_error)).await;
+            }
         });
         (rpc_rx, fut_rx)
     }
@@ -1903,7 +1966,15 @@ impl rpc_fs::RpcHandler for FilesystemBridge {
         self.spawner.spawn(async move {
             let mut buf = Vec::with_capacity(64);
             loop {
-                let (res, entries) = wit_rx.read(buf).await;
+                let (res, entries) = {
+                    let mut read_fut = std::pin::pin!(wit_rx.read(buf));
+                    let mut closed_fut = std::pin::pin!(rpc_tx.closed());
+                    match futures_util::future::select(read_fut.as_mut(), closed_fut.as_mut()).await
+                    {
+                        futures_util::future::Either::Left((pair, _)) => pair,
+                        futures_util::future::Either::Right(((), _)) => break,
+                    }
+                };
                 if !entries.is_empty() {
                     let mapped: Vec<rpc_fs::DirectoryEntry> = entries
                         .into_iter()
@@ -1923,9 +1994,19 @@ impl rpc_fs::RpcHandler for FilesystemBridge {
                     break;
                 }
             }
+            drop(wit_rx);
             let _ = rpc_tx.close().await;
-            let outcome = done_wit.await.map_err(map_fs_error);
-            let _ = fut_tx.resolve(outcome).await;
+            let outcome = {
+                let mut done_fut = std::pin::pin!(std::future::IntoFuture::into_future(done_wit));
+                let mut cancel_fut = std::pin::pin!(fut_tx.cancelled());
+                match futures_util::future::select(done_fut.as_mut(), cancel_fut.as_mut()).await {
+                    futures_util::future::Either::Left((outcome, _)) => Some(outcome),
+                    futures_util::future::Either::Right(((), _)) => None,
+                }
+            };
+            if let Some(outcome) = outcome {
+                let _ = fut_tx.resolve(outcome.map_err(map_fs_error)).await;
+            }
         });
         (rpc_rx, fut_rx)
     }

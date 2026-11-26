@@ -47,6 +47,10 @@ pub struct VirtioVsockHdr {
 pub const VSOCK_HDR_LEN: usize = core::mem::size_of::<VirtioVsockHdr>();
 const _: () = assert!(VSOCK_HDR_LEN == 44);
 
+/// Maximum total byte length of one guest TX vsock descriptor chain (header plus
+/// Linux `VIRTIO_VSOCK_MAX_PKT_BUF_SIZE` = 64 KiB payload).
+pub const MAX_VSOCK_PACKET_BYTES: usize = VSOCK_HDR_LEN + 64 * 1024;
+
 /// One framed vsock packet (header + payload).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VsockPacket {
@@ -128,6 +132,7 @@ impl VirtioVsockConfig {
 pub struct VsockModel {
     queues: [Queue; 3],
     config: VirtioVsockConfig,
+    pending_rx: Option<VsockPacket>,
 }
 
 impl VsockModel {
@@ -135,6 +140,7 @@ impl VsockModel {
         Self {
             queues: core::array::from_fn(|_| Queue::default()),
             config,
+            pending_rx: None,
         }
     }
 
@@ -165,6 +171,7 @@ impl VirtioModel for VsockModel {
         for queue in &mut self.queues {
             queue.reset();
         }
+        self.pending_rx = None;
     }
 }
 
@@ -184,11 +191,20 @@ impl VirtioVsock {
             return Ok(());
         }
         while let Some(chain) = self.model.queues[1].pop(memory)? {
-            let mut raw = Vec::new();
+            let mut total_len = 0usize;
             for desc in &chain.descriptors {
                 if desc.writable {
                     return Err(Error::Virtio("writable descriptor in vsock tx chain"));
                 }
+                let desc_len = usize::try_from(desc.length)
+                    .map_err(|_| Error::Virtio("vsock tx descriptor length overflow"))?;
+                total_len = total_len
+                    .checked_add(desc_len)
+                    .filter(|&n| n <= MAX_VSOCK_PACKET_BYTES)
+                    .ok_or(Error::Virtio("vsock tx packet exceeds maximum length"))?;
+            }
+            let mut raw = Vec::with_capacity(total_len);
+            for desc in &chain.descriptors {
                 let chunk = memory.read_bytes(desc.address, desc.length as usize)?;
                 raw.extend_from_slice(&chunk);
             }
@@ -197,11 +213,15 @@ impl VirtioVsock {
             }
             let header = VirtioVsockHdr::read_from_bytes(&raw[..VSOCK_HDR_LEN])
                 .map_err(|_| Error::Virtio("invalid virtio-vsock header"))?;
-            let declared_len = header.len.get() as usize;
-            if raw.len() < VSOCK_HDR_LEN + declared_len {
+            let declared_len = usize::try_from(header.len.get())
+                .map_err(|_| Error::Virtio("virtio-vsock tx payload length overflow"))?;
+            let expected_len = VSOCK_HDR_LEN
+                .checked_add(declared_len)
+                .ok_or(Error::Virtio("virtio-vsock tx payload length overflow"))?;
+            if raw.len() < expected_len {
                 return Err(Error::Virtio("truncated virtio-vsock tx payload"));
             }
-            let payload = raw[VSOCK_HDR_LEN..VSOCK_HDR_LEN + declared_len].to_vec();
+            let payload = raw[VSOCK_HDR_LEN..expected_len].to_vec();
             backend.on_guest_tx(VsockPacket { header, payload })?;
             if self.model.queues[1].complete(memory, chain.head, 0)? {
                 self.interrupt |= 1;
@@ -218,11 +238,27 @@ impl VirtioVsock {
         if !self.driver_ok() {
             return Ok(());
         }
-        while let Some(packet) = backend.try_recv_rx() {
+        loop {
+            if !self.model.queues[0].has_available(memory)? {
+                break;
+            }
+            let packet = match self.model.pending_rx.take() {
+                Some(packet) => packet,
+                None => match backend.try_recv_rx() {
+                    Some(packet) => packet,
+                    None => break,
+                },
+            };
             let Some(chain) = self.model.queues[0].pop(memory)? else {
+                self.model.pending_rx = Some(packet);
                 break;
             };
-            let mut bytes = Vec::with_capacity(VSOCK_HDR_LEN + packet.payload.len());
+            let total_len = VSOCK_HDR_LEN
+                .checked_add(packet.payload.len())
+                .ok_or(Error::Virtio("virtio-vsock rx packet length overflow"))?;
+            let used_len = u32::try_from(total_len)
+                .map_err(|_| Error::Virtio("virtio-vsock rx packet length overflow"))?;
+            let mut bytes = Vec::with_capacity(total_len);
             bytes.extend_from_slice(packet.header.as_bytes());
             bytes.extend_from_slice(&packet.payload);
 
@@ -243,7 +279,7 @@ impl VirtioVsock {
             if offset != bytes.len() {
                 return Err(Error::Virtio("virtio-vsock rx buffer shorter than packet"));
             }
-            if self.model.queues[0].complete(memory, chain.head, bytes.len() as u32)? {
+            if self.model.queues[0].complete(memory, chain.head, used_len)? {
                 self.interrupt |= 1;
             }
         }
@@ -307,5 +343,124 @@ mod tests {
         assert_eq!(reply.op.get(), VIRTIO_VSOCK_OP_RST);
         assert_eq!(reply.src_cid.get(), VSOCK_HOST_CID);
         assert_eq!(reply.dst_cid.get(), 42);
+    }
+
+    #[test]
+    fn vsock_rejects_u32_max_header_len_and_oversized_tx_chain() {
+        let ram = test_ram(128 * 1024);
+        let cfg = VirtioVsockConfig::new(7).unwrap();
+        let mut vsock = VirtioVsock::vsock(VirtioSlot::at(3).unwrap(), cfg);
+        vsock.status = DRIVER_OK;
+        vsock.model.queues[0] = enable_queue(&ram, 0, 4);
+        vsock.model.queues[1] = enable_queue(&ram, 512, 4);
+        let mut backend = ChannelVsockBackend::default();
+
+        // 1. header.len = u32::MAX (would wrap `VSOCK_HDR_LEN + len` on 32-bit wasm32).
+        for bad_len in [u32::MAX, u32::MAX - (VSOCK_HDR_LEN as u32) + 1] {
+            let hdr = VirtioVsockHdr {
+                src_cid: U64::new(7),
+                dst_cid: U64::new(VSOCK_HOST_CID),
+                src_port: U32::new(100),
+                dst_port: U32::new(200),
+                len: U32::new(bad_len),
+                kind: U16::new(VIRTIO_VSOCK_TYPE_STREAM),
+                op: U16::new(VIRTIO_VSOCK_OP_RW),
+                flags: U32::new(0),
+                buf_alloc: U32::new(0),
+                fwd_cnt: U32::new(0),
+            };
+            ram.write_pod(GuestPhysAddr::new(2048), &hdr).unwrap();
+            write_desc(
+                &ram,
+                &vsock.model.queues[1],
+                0,
+                2048,
+                VSOCK_HDR_LEN as u32,
+                0,
+                0,
+            );
+            let slot = vsock.model.queues[1].next_available;
+            push_avail(&ram, &vsock.model.queues[1], slot, 0);
+            assert!(matches!(
+                vsock.process_tx(&ram, &mut backend),
+                Err(Error::Virtio(_))
+            ));
+            assert!(backend.tx_packets.is_empty());
+        }
+
+        // 2. TX descriptor chain exceeding MAX_VSOCK_PACKET_BYTES is rejected before reading.
+        write_desc(
+            &ram,
+            &vsock.model.queues[1],
+            1,
+            4096,
+            (MAX_VSOCK_PACKET_BYTES + 1) as u32,
+            0,
+            0,
+        );
+        let slot = vsock.model.queues[1].next_available;
+        push_avail(&ram, &vsock.model.queues[1], slot, 1);
+        assert!(matches!(
+            vsock.process_tx(&ram, &mut backend),
+            Err(Error::Virtio(_))
+        ));
+    }
+
+    #[test]
+    fn vsock_preserves_rx_packets_when_guest_rx_ring_is_empty() {
+        let ram = test_ram(8192);
+        let cfg = VirtioVsockConfig::new(9).unwrap();
+        let mut vsock = VirtioVsock::vsock(VirtioSlot::at(3).unwrap(), cfg);
+        vsock.status = DRIVER_OK;
+        vsock.model.queues[0] = enable_queue(&ram, 0, 4);
+        let mut backend = ChannelVsockBackend::default();
+
+        for seq in [1u32, 2u32] {
+            backend.rx_packets.push_back(VsockPacket {
+                header: VirtioVsockHdr {
+                    src_cid: U64::new(VSOCK_HOST_CID),
+                    dst_cid: U64::new(9),
+                    src_port: U32::new(80),
+                    dst_port: U32::new(seq),
+                    len: U32::new(4),
+                    kind: U16::new(VIRTIO_VSOCK_TYPE_STREAM),
+                    op: U16::new(VIRTIO_VSOCK_OP_RW),
+                    flags: U32::new(0),
+                    buf_alloc: U32::new(4096),
+                    fwd_cnt: U32::new(0),
+                },
+                payload: seq.to_le_bytes().to_vec(),
+            });
+        }
+
+        // RX ring is empty: process_rx must not consume or drop either packet.
+        vsock.process_rx(&ram, &mut backend).unwrap();
+        assert_eq!(used_idx(&ram, &vsock.model.queues[0]), 0);
+
+        // Guest posts 1 RX descriptor: receives packet 1, preserves packet 2.
+        write_desc(&ram, &vsock.model.queues[0], 0, 2048, 128, 2, 0);
+        push_avail(&ram, &vsock.model.queues[0], 0, 0);
+        vsock.process_rx(&ram, &mut backend).unwrap();
+        assert_eq!(used_idx(&ram, &vsock.model.queues[0]), 1);
+        let hdr1: VirtioVsockHdr = ram.read_pod(GuestPhysAddr::new(2048)).unwrap();
+        assert_eq!(hdr1.dst_port.get(), 1);
+        assert_eq!(
+            ram.read_bytes(GuestPhysAddr::new(2048 + VSOCK_HDR_LEN as u64), 4)
+                .unwrap(),
+            1u32.to_le_bytes()
+        );
+
+        // Guest refills RX ring with a 2nd descriptor: receives packet 2.
+        write_desc(&ram, &vsock.model.queues[0], 1, 3072, 128, 2, 0);
+        push_avail(&ram, &vsock.model.queues[0], 1, 1);
+        vsock.process_rx(&ram, &mut backend).unwrap();
+        assert_eq!(used_idx(&ram, &vsock.model.queues[0]), 2);
+        let hdr2: VirtioVsockHdr = ram.read_pod(GuestPhysAddr::new(3072)).unwrap();
+        assert_eq!(hdr2.dst_port.get(), 2);
+        assert_eq!(
+            ram.read_bytes(GuestPhysAddr::new(3072 + VSOCK_HDR_LEN as u64), 4)
+                .unwrap(),
+            2u32.to_le_bytes()
+        );
     }
 }

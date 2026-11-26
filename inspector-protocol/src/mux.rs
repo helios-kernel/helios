@@ -8,7 +8,7 @@
 //! `futures_io::AsyncRead + futures_io::AsyncWrite` byte stream on both host
 //! (`std`) and `wasm32-wasip3` guest targets.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -35,6 +35,15 @@ use crate::wire::{Frame, write_frame};
 /// producer.
 pub const DEFAULT_STREAM_CREDIT_WINDOW: u32 = 8;
 
+/// Default maximum concurrent inbound invocations accepted on one mux
+/// connection before excess `Frame::Open` requests are rejected.
+pub const DEFAULT_MAX_CONCURRENT_INBOUND_CALLS: usize = 64;
+
+/// Default maximum queued control/reply frames buffered in `drive_mux`'s
+/// priority outbox before polling further inbound frames pauses to apply
+/// transport backpressure.
+pub const DEFAULT_MAX_PRIORITY_OUTBOX_FRAMES: usize = 256;
+
 /// Direction tags placed at `path[0]` so two symmetric peers may open the same
 /// numeric `invocation` ID concurrently without any path ambiguity.
 const DIR_CALLER_TO_CALLEE: u32 = 0;
@@ -48,6 +57,8 @@ pub struct MuxConfig {
     pub stream_credit_window: u32,
     pub max_inbound_paths: usize,
     pub max_undelivered_bytes: usize,
+    pub max_concurrent_inbound_calls: usize,
+    pub max_priority_outbox_frames: usize,
 }
 
 impl Default for MuxConfig {
@@ -56,6 +67,8 @@ impl Default for MuxConfig {
             stream_credit_window: DEFAULT_STREAM_CREDIT_WINDOW,
             max_inbound_paths: MAX_INBOUND_PATHS,
             max_undelivered_bytes: MAX_UNDELIVERED_BYTES,
+            max_concurrent_inbound_calls: DEFAULT_MAX_CONCURRENT_INBOUND_CALLS,
+            max_priority_outbox_frames: DEFAULT_MAX_PRIORITY_OUTBOX_FRAMES,
         }
     }
 }
@@ -134,6 +147,7 @@ impl std::fmt::Debug for PeerHandle {
 struct MuxShared {
     config: MuxConfig,
     closed: AtomicBool,
+    shutdown: AtomicBool,
     #[cfg(feature = "host")]
     echo_remote_serial: AtomicBool,
     next_invocation: AtomicU32,
@@ -153,6 +167,7 @@ struct QueuedFrame {
 
 enum ControlEvent {
     Frame(Frame),
+    LocalDropSubpath { core: Arc<CallCore>, path: Vec<u32> },
     Shutdown,
 }
 
@@ -192,43 +207,76 @@ enum OpenReply {
 }
 
 #[derive(Default)]
+struct ActivePath {
+    chunks: VecDeque<Bytes>,
+    peer_closed: bool,
+    credits: Option<u32>,
+}
+
+#[derive(Default)]
 struct InboundPathTable {
-    chunks: HashMap<Vec<u32>, VecDeque<Bytes>>,
-    closed: HashSet<Vec<u32>>,
-    credits: HashMap<Vec<u32>, u32>,
+    active: HashMap<Vec<u32>, ActivePath>,
+    /// Compact tombstones for locally-finished/dropped sub-paths awaiting the
+    /// peer's `Frame::Close`. Maps `path -> remaining_granted_credits` so late
+    /// legitimately credited frames are discarded without leaking
+    /// `undelivered_bytes` while excess frames still fail with
+    /// `StreamCreditExceeded`.
+    draining: HashMap<Vec<u32>, u32>,
+    draining_order: VecDeque<Vec<u32>>,
     undelivered_bytes: usize,
     error: Option<Fault>,
 }
 
 impl InboundPathTable {
-    fn admits_path(&self, path: &[u32], max_paths: usize) -> bool {
-        if self.chunks.contains_key(path)
-            || self.closed.contains(path)
-            || self.credits.contains_key(path)
-        {
-            return true;
+    fn admits_active_path(&self, path: &[u32], max_paths: usize) -> bool {
+        self.active.contains_key(path) || self.active.len() < max_paths
+    }
+
+    fn insert_draining(&mut self, path: Vec<u32>, remaining_credits: u32, max_paths: usize) {
+        let cap = max_paths.saturating_mul(4).max(64);
+        if let Some(existing) = self.draining.get_mut(&path) {
+            *existing = remaining_credits;
+            return;
         }
-        let mut distinct = self.chunks.len();
-        for closed in &self.closed {
-            if !self.chunks.contains_key(closed) {
-                distinct += 1;
-            }
+        while self.draining.len() >= cap {
+            let Some(oldest) = self.draining_order.pop_front() else {
+                break;
+            };
+            self.draining.remove(&oldest);
         }
-        for credited in self.credits.keys() {
-            if !self.chunks.contains_key(credited) && !self.closed.contains(credited) {
-                distinct += 1;
-            }
+        self.draining.insert(path.clone(), remaining_credits);
+        self.draining_order.push_back(path);
+        if self.draining_order.len() > cap.saturating_mul(2) {
+            self.draining_order
+                .retain(|queued| self.draining.contains_key(queued));
         }
-        distinct < max_paths
+    }
+
+    fn remove_draining(&mut self, path: &[u32]) -> bool {
+        self.draining.remove(path).is_some()
+    }
+
+    /// Reclaims buffered chunks and active path slot immediately when a local
+    /// `SubpathReader` is dropped before peer EOF.
+    fn local_drop_subpath(&mut self, path: &[u32], max_paths: usize) {
+        let Some(entry) = self.active.remove(path) else {
+            return;
+        };
+        let released: usize = entry.chunks.iter().map(Bytes::len).sum();
+        self.undelivered_bytes = self.undelivered_bytes.saturating_sub(released);
+        if !entry.peer_closed {
+            let remaining = entry.credits.unwrap_or(0);
+            self.insert_draining(path.to_vec(), remaining, max_paths);
+        }
     }
 
     fn fail_wire(&mut self, error: WireError) {
         if self.error.is_none() {
             self.error = Some(Fault::Wire(error));
         }
-        self.chunks.clear();
-        self.closed.clear();
-        self.credits.clear();
+        self.active.clear();
+        self.draining.clear();
+        self.draining_order.clear();
         self.undelivered_bytes = 0;
     }
 }
@@ -300,6 +348,12 @@ impl CallCore {
         }
     }
 
+    async fn send_control_async(&self, frame: Frame) {
+        if !self.shared.closed.load(Ordering::Acquire) {
+            let _ = self.control_tx.send(ControlEvent::Frame(frame)).await;
+        }
+    }
+
     async fn failure_error(&self) -> Option<TransportError> {
         self.inbound
             .lock()
@@ -316,7 +370,24 @@ impl CallCore {
             if inbound.error.is_some() {
                 return Ok(());
             }
-            if !inbound.admits_path(&path, self.shared.config.max_inbound_paths) {
+            if path.len() >= 2
+                && let Some(remaining) = inbound.draining.get_mut(&path)
+            {
+                // Local reader already dropped/completed before peer EOF:
+                // discard legitimately credited late frames without buffering
+                // or touching `undelivered_bytes`, while still rejecting any
+                // frame sent past the granted credit window.
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Ok(());
+                }
+                let err = WireError::StreamCreditExceeded {
+                    invocation: self.invocation,
+                    path,
+                };
+                inbound.fail_wire(err.clone());
+                wire_fault = Some(err);
+            } else if !inbound.admits_active_path(&path, self.shared.config.max_inbound_paths) {
                 let err = WireError::TooManyInboundPaths {
                     invocation: self.invocation,
                     max: self.shared.config.max_inbound_paths,
@@ -326,8 +397,11 @@ impl CallCore {
             } else if path.len() >= 2 {
                 let current_bytes = inbound.undelivered_bytes;
                 let max_bytes = self.shared.config.max_undelivered_bytes;
-                match inbound.credits.get_mut(&path) {
-                    Some(credits) if *credits > 0 => {
+                match inbound.active.get_mut(&path).and_then(|entry| {
+                    let credits = entry.credits.as_mut()?;
+                    Some((credits, &mut entry.chunks))
+                }) {
+                    Some((credits, chunks)) if *credits > 0 => {
                         if current_bytes + payload.len() > max_bytes {
                             let held = current_bytes + payload.len();
                             let err = WireError::InboundBacklogExceeded {
@@ -339,8 +413,8 @@ impl CallCore {
                             wire_fault = Some(err);
                         } else {
                             *credits -= 1;
+                            chunks.push_back(payload.clone());
                             inbound.undelivered_bytes += payload.len();
-                            inbound.chunks.entry(path).or_default().push_back(payload);
                         }
                     }
                     _ => {
@@ -365,7 +439,12 @@ impl CallCore {
                 wire_fault = Some(err);
             } else {
                 inbound.undelivered_bytes += payload.len();
-                inbound.chunks.entry(path).or_default().push_back(payload);
+                inbound
+                    .active
+                    .entry(path)
+                    .or_default()
+                    .chunks
+                    .push_back(payload);
             }
         }
         if wire_fault.is_some() {
@@ -386,8 +465,11 @@ impl CallCore {
             if inbound.error.is_some() {
                 return Ok(());
             }
-            if inbound.admits_path(&path, self.shared.config.max_inbound_paths) {
-                inbound.closed.insert(path);
+            if path.len() >= 2 && inbound.remove_draining(&path) {
+                return Ok(());
+            }
+            if inbound.admits_active_path(&path, self.shared.config.max_inbound_paths) {
+                inbound.active.entry(path).or_default().peer_closed = true;
             } else {
                 let err = WireError::TooManyInboundPaths {
                     invocation: self.invocation,
@@ -427,7 +509,7 @@ impl CallCore {
         path: Vec<u32>,
         sub_id: u32,
         credits: u32,
-    ) -> Result<(), WireError> {
+    ) -> Result<Vec<Frame>, WireError> {
         if credits == 0 {
             let err = WireError::CreditOverflow {
                 invocation: self.invocation,
@@ -462,15 +544,16 @@ impl CallCore {
 
         if let Some((payloads, finished)) = buffered_action {
             let out_path = vec![self.side.out_data_dir(), sub_id];
+            let mut frames = Vec::with_capacity(payloads.len() + usize::from(finished));
             for payload in payloads {
-                self.send_control(Frame::Data {
+                frames.push(Frame::Data {
                     invocation: self.invocation,
                     path: out_path.clone(),
                     payload,
                 });
             }
             if finished {
-                self.send_control(Frame::Close {
+                frames.push(Frame::Close {
                     invocation: self.invocation,
                     path: out_path,
                 });
@@ -480,7 +563,7 @@ impl CallCore {
                     sub_id,
                 ));
             }
-            return Ok(());
+            return Ok(frames);
         }
 
         let slot = self.writers.lock().await.get(&sub_id).cloned();
@@ -512,7 +595,7 @@ impl CallCore {
                 }
             }
         }
-        Ok(())
+        Ok(Vec::new())
     }
 
     async fn clear_prebuffered(&self) {
@@ -659,6 +742,9 @@ pub struct SubpathWriter {
 
 impl Drop for SubpathWriter {
     fn drop(&mut self) {
+        if let Some(mut writers) = self.core.writers.try_lock() {
+            writers.remove(&self.sub_id);
+        }
         if !self.closed {
             self.core.send_control(Frame::Close {
                 invocation: self.core.invocation,
@@ -684,6 +770,17 @@ impl Drop for SubpathReader {
                 invocation: self.core.invocation,
                 path: vec![self.core.side.out_stop_dir(), self.sub_id],
             });
+            if let Some(mut inbound) = self.core.inbound.try_lock() {
+                inbound.local_drop_subpath(&self.path, self.core.shared.config.max_inbound_paths);
+            } else if !self.core.shared.closed.load(Ordering::Acquire) {
+                let _ = self
+                    .core
+                    .control_tx
+                    .try_send(ControlEvent::LocalDropSubpath {
+                        core: Arc::clone(&self.core),
+                        path: std::mem::take(&mut self.path),
+                    });
+            }
         }
     }
 }
@@ -906,6 +1003,7 @@ impl SubpathWriter {
             return Ok(());
         }
         self.closed = true;
+        self.core.writers.lock().await.remove(&self.sub_id);
         self.core
             .send_frame(Frame::Close {
                 invocation: self.core.invocation,
@@ -940,25 +1038,54 @@ impl SubpathReader {
 
             let outcome = {
                 let mut inbound = self.core.inbound.lock().await;
-                if let Some(queue) = inbound.chunks.get_mut(&self.path)
-                    && let Some(chunk) = queue.pop_front()
+                let max_paths = self.core.shared.config.max_inbound_paths;
+                if let Some(entry) = inbound.active.get_mut(&self.path)
+                    && let Some(chunk) = entry.chunks.pop_front()
                 {
-                    if queue.is_empty() {
-                        inbound.chunks.remove(&self.path);
-                    }
-                    inbound.undelivered_bytes -= chunk.len();
-                    let is_closed = inbound.closed.contains(&self.path);
+                    let peer_closed = entry.peer_closed;
                     let replenish = if self.replenish_credits
-                        && !is_closed
-                        && let Some(credits) = inbound.credits.get_mut(&self.path)
+                        && !peer_closed
+                        && let Some(credits) = entry.credits.as_mut()
                     {
                         *credits = credits.saturating_add(1);
                         true
                     } else {
                         false
                     };
+                    let chunk_len = chunk.len();
+                    if !self.replenish_credits {
+                        // Single-shot future sub-path completes after its one
+                        // payload: reclaim the active slot immediately so
+                        // sequential futures never accumulate in `active`. If
+                        // the peer's trailing `Frame::Close` has not arrived
+                        // yet, leave a 0-credit tombstone so that `Close` is
+                        // absorbed cleanly while any duplicate `Data` fails
+                        // with `StreamCreditExceeded`.
+                        if let Some(removed) = inbound.active.remove(&self.path) {
+                            let extra_bytes: usize = removed.chunks.iter().map(Bytes::len).sum();
+                            inbound.undelivered_bytes = inbound
+                                .undelivered_bytes
+                                .saturating_sub(chunk_len + extra_bytes);
+                            if !removed.peer_closed {
+                                inbound.insert_draining(self.path.clone(), 0, max_paths);
+                            }
+                        } else {
+                            inbound.undelivered_bytes =
+                                inbound.undelivered_bytes.saturating_sub(chunk_len);
+                        }
+                    } else {
+                        inbound.undelivered_bytes =
+                            inbound.undelivered_bytes.saturating_sub(chunk_len);
+                    }
                     Some(Ok(Some((chunk, replenish))))
-                } else if inbound.closed.contains(&self.path) {
+                } else if inbound
+                    .active
+                    .get(&self.path)
+                    .is_some_and(|entry| entry.peer_closed)
+                {
+                    // Peer EOF observed and all chunks drained: reclaim the
+                    // sub-path slot completely.
+                    inbound.active.remove(&self.path);
                     Some(Ok(None))
                 } else {
                     inbound
@@ -971,11 +1098,13 @@ impl SubpathReader {
             match outcome {
                 Some(Ok(Some((chunk, replenish)))) => {
                     if replenish {
-                        self.core.send_control(Frame::Credit {
-                            invocation: self.core.invocation,
-                            path: self.path.clone(),
-                            credits: 1,
-                        });
+                        self.core
+                            .send_control_async(Frame::Credit {
+                                invocation: self.core.invocation,
+                                path: self.path.clone(),
+                                credits: 1,
+                            })
+                            .await;
                     } else if !self.replenish_credits {
                         // Single-shot future sub-paths never replenish credit
                         // and are complete after the single value frame; mark
@@ -1014,9 +1143,9 @@ async fn open_reader(
 ) -> Result<SubpathReader, TransportError> {
     let window = credit_window.max(1);
     let path = vec![core.side.in_data_dir(), sub_id];
-    {
+    let send_credit = {
         let mut inbound = core.inbound.lock().await;
-        if !inbound.admits_path(&path, core.shared.config.max_inbound_paths) {
+        if !inbound.admits_active_path(&path, core.shared.config.max_inbound_paths) {
             let err = WireError::TooManyInboundPaths {
                 invocation: core.invocation,
                 max: core.shared.config.max_inbound_paths,
@@ -1024,13 +1153,23 @@ async fn open_reader(
             inbound.fail_wire(err.clone());
             return Err(TransportError::Wire(err));
         }
-        inbound.credits.insert(path.clone(), window);
+        let entry = inbound.active.entry(path.clone()).or_default();
+        if entry.peer_closed {
+            entry.credits = Some(0);
+            false
+        } else {
+            entry.credits = Some(window);
+            true
+        }
+    };
+    if send_credit {
+        core.send_control_async(Frame::Credit {
+            invocation: core.invocation,
+            path: path.clone(),
+            credits: window,
+        })
+        .await;
     }
-    core.send_control(Frame::Credit {
-        invocation: core.invocation,
-        path: path.clone(),
-        credits: window,
-    });
     Ok(SubpathReader {
         core: Arc::clone(core),
         sub_id,
@@ -1066,19 +1205,26 @@ async fn recv_root_all(core: &Arc<CallCore>) -> Result<Vec<u8>, TransportError> 
 
         let step = {
             let mut inbound = core.inbound.lock().await;
-            if let Some(queue) = inbound.chunks.get_mut(&path) {
+            if let Some(entry) = inbound.active.get_mut(&path) {
                 let mut drained = Vec::new();
                 let mut released = 0usize;
-                while let Some(chunk) = queue.pop_front() {
+                while let Some(chunk) = entry.chunks.pop_front() {
                     released += chunk.len();
                     drained.extend_from_slice(&chunk);
                 }
-                inbound.chunks.remove(&path);
-                inbound.undelivered_bytes -= released;
-                let done = inbound.closed.contains(&path);
-                Some(Ok((drained, done)))
-            } else if inbound.closed.contains(&path) {
-                Some(Ok((Vec::new(), true)))
+                let done = entry.peer_closed;
+                if done {
+                    inbound.active.remove(&path);
+                }
+                inbound.undelivered_bytes = inbound.undelivered_bytes.saturating_sub(released);
+                if !drained.is_empty() || done {
+                    Some(Ok((drained, done)))
+                } else {
+                    inbound
+                        .error
+                        .as_ref()
+                        .map(|fault| Err(fault.to_transport()))
+                }
             } else {
                 inbound
                     .error
@@ -1150,6 +1296,8 @@ impl PeerHandle {
     }
 
     pub fn close(&self) {
+        self.state.shutdown.store(true, Ordering::Release);
+        self.state.progress.signal();
         let _ = self.control_tx.try_send(ControlEvent::Shutdown);
     }
 
@@ -1237,11 +1385,14 @@ impl PeerHandle {
 /// Creates a connected `(PeerHandle, MuxDriverChannels)` pair ready to be
 /// driven by [`drive_mux`].
 pub fn create_mux(config: MuxConfig) -> (PeerHandle, MuxDriverChannels) {
+    let max_outbox = config.max_priority_outbox_frames.max(1);
+    let control_cap = max_outbox.saturating_mul(2).max(64);
     let (outgoing_tx, outgoing_rx) = async_channel::bounded(8);
-    let (control_tx, control_rx) = async_channel::unbounded();
+    let (control_tx, control_rx) = async_channel::bounded(control_cap);
     let shared = Arc::new(MuxShared {
         config,
         closed: AtomicBool::new(false),
+        shutdown: AtomicBool::new(false),
         #[cfg(feature = "host")]
         echo_remote_serial: AtomicBool::new(true),
         next_invocation: AtomicU32::new(1),
@@ -1323,6 +1474,7 @@ where
     let mut control_rx = std::pin::pin!(control_rx);
     let mut outgoing_rx = std::pin::pin!(outgoing_rx);
 
+    let max_priority_outbox = shared.config.max_priority_outbox_frames.max(1);
     let loop_outcome: Result<(), TransportError> = async {
         enum Step<R> {
             FrameRead(R, io::Result<Option<Frame>>),
@@ -1330,16 +1482,27 @@ where
             Outgoing(QueuedFrame),
             ServerDone(Option<(u32, WireError)>),
             WriteDone,
+            ShutdownSignalled,
         }
 
         loop {
-            while let Ok(ctrl) = control_rx.try_recv() {
-                match ctrl {
-                    ControlEvent::Frame(frame) => priority_outbox.push_back((frame, None)),
-                    ControlEvent::Shutdown => {
+            if shared.shutdown.load(Ordering::Acquire) {
+                shutdown_requested = true;
+            }
+            while !shutdown_requested && priority_outbox.len() < max_priority_outbox {
+                match control_rx.try_recv() {
+                    Ok(ControlEvent::Frame(frame)) => priority_outbox.push_back((frame, None)),
+                    Ok(ControlEvent::LocalDropSubpath { core, path }) => {
+                        core.inbound
+                            .lock()
+                            .await
+                            .local_drop_subpath(&path, shared.config.max_inbound_paths);
+                    }
+                    Ok(ControlEvent::Shutdown) => {
                         shutdown_requested = true;
                         break;
                     }
+                    Err(_) => break,
                 }
             }
             if shutdown_requested && write_fut.is_none() && priority_outbox.is_empty() {
@@ -1368,7 +1531,15 @@ where
                 return Ok(());
             }
 
+            let outbox_has_room = priority_outbox.len() < max_priority_outbox;
+            let shutdown_mark = shared.progress.mark();
+            let mut shutdown_wait = std::pin::pin!(shared.progress.changed(shutdown_mark));
+
             let step = std::future::poll_fn(|cx| {
+                if !shutdown_requested && shared.shutdown.load(Ordering::Acquire) {
+                    return Poll::Ready(Ok(Step::ShutdownSignalled));
+                }
+
                 if let Some(active_write) = write_fut.as_mut()
                     && let Poll::Ready((w, ack, res)) = active_write.as_mut().poll(cx)
                 {
@@ -1397,23 +1568,34 @@ where
                     return Poll::Ready(Ok(Step::ServerDone(done)));
                 }
 
+                // Pause polling inbound frames whenever `priority_outbox` is at
+                // its bound so TCP/IPC backpressure propagates to the peer
+                // instead of growing server memory without bound.
                 if !shutdown_requested
+                    && outbox_has_room
                     && let Poll::Ready((r, frame_res)) = read_fut.as_mut().poll(cx)
                 {
                     return Poll::Ready(Ok(Step::FrameRead(r, frame_res)));
                 }
 
                 if !shutdown_requested {
-                    if let Poll::Ready(Some(ctrl)) =
-                        futures_core::Stream::poll_next(control_rx.as_mut(), cx)
+                    if outbox_has_room
+                        && let Poll::Ready(Some(ctrl)) =
+                            futures_core::Stream::poll_next(control_rx.as_mut(), cx)
                     {
                         return Poll::Ready(Ok(Step::Control(ctrl)));
                     }
                     if write_fut.is_none()
+                        && outbox_has_room
                         && let Poll::Ready(Some(queued)) =
                             futures_core::Stream::poll_next(outgoing_rx.as_mut(), cx)
                     {
                         return Poll::Ready(Ok(Step::Outgoing(queued)));
+                    }
+                    if let Poll::Ready(()) = shutdown_wait.as_mut().poll(cx)
+                        && shared.shutdown.load(Ordering::Acquire)
+                    {
+                        return Poll::Ready(Ok(Step::ShutdownSignalled));
                     }
                 }
 
@@ -1423,8 +1605,17 @@ where
 
             match step {
                 Step::WriteDone => {}
+                Step::ShutdownSignalled => {
+                    shutdown_requested = true;
+                }
                 Step::Control(ControlEvent::Frame(frame)) => {
                     priority_outbox.push_back((frame, None));
+                }
+                Step::Control(ControlEvent::LocalDropSubpath { core, path }) => {
+                    core.inbound
+                        .lock()
+                        .await
+                        .local_drop_subpath(&path, shared.config.max_inbound_paths);
                 }
                 Step::Control(ControlEvent::Shutdown) => {
                     shutdown_requested = true;
@@ -1455,6 +1646,7 @@ where
                         dispatcher,
                         &mut inbound_calls,
                         &mut priority_outbox,
+                        server_tasks.len(),
                         frame,
                     )
                     .await?
@@ -1576,12 +1768,17 @@ async fn run_inbound_invocation<D: MuxDispatcher>(
     let dispatch_fut = dispatcher.dispatch(call, instance, func);
     let cancel_fut = async {
         loop {
-            let mark = core.progress.mark();
+            let call_mark = core.progress.mark();
+            let conn_mark = core.shared.progress.mark();
             if core.cancelled.load(Ordering::Acquire) || core.shared.closed.load(Ordering::Acquire)
             {
                 return;
             }
-            core.progress.changed(mark).await;
+            futures_lite::future::or(
+                core.progress.changed(call_mark),
+                core.shared.progress.changed(conn_mark),
+            )
+            .await;
         }
     };
 
@@ -1603,6 +1800,7 @@ async fn route_mux_frame<D: MuxDispatcher>(
     dispatcher: &D,
     inbound_calls: &mut HashMap<u32, Weak<CallCore>>,
     priority_outbox: &mut VecDeque<(Frame, Option<Sender<io::Result<()>>>)>,
+    active_server_tasks: usize,
     frame: Frame,
 ) -> Result<Option<InboundLaunch>, TransportError> {
     match frame {
@@ -1616,6 +1814,19 @@ async fn route_mux_frame<D: MuxDispatcher>(
                     Frame::Reject {
                         invocation,
                         message: format!("no handler registered for {instance}.{func}"),
+                    },
+                    None,
+                ));
+                return Ok(None);
+            }
+            let max_concurrent = shared.config.max_concurrent_inbound_calls.max(1);
+            if active_server_tasks >= max_concurrent {
+                priority_outbox.push_back((
+                    Frame::Reject {
+                        invocation,
+                        message: format!(
+                            "concurrent inbound invocation limit ({max_concurrent}) reached"
+                        ),
                     },
                     None,
                 ));
@@ -1773,22 +1984,33 @@ async fn route_mux_frame<D: MuxDispatcher>(
             let sub_id = path[1];
             match path[0] {
                 DIR_CALLER_TO_CALLEE => {
-                    if let Some(core) = resolve_outbound(shared, invocation).await {
-                        let _ = core.grant_credit(path, sub_id, credits).await;
+                    if let Some(core) = resolve_outbound(shared, invocation).await
+                        && let Ok(frames) = core.grant_credit(path, sub_id, credits).await
+                    {
+                        for frame in frames {
+                            priority_outbox.push_back((frame, None));
+                        }
                     }
                 }
                 DIR_CALLEE_TO_CALLER => {
-                    if let Some(core) = resolve_inbound(inbound_calls, invocation)
-                        && let Err(wire_err) = core.grant_credit(path, sub_id, credits).await
-                    {
-                        core.cancel_from_peer().await;
-                        priority_outbox.push_back((
-                            Frame::Fault {
-                                invocation,
-                                error: wire_err,
-                            },
-                            None,
-                        ));
+                    if let Some(core) = resolve_inbound(inbound_calls, invocation) {
+                        match core.grant_credit(path, sub_id, credits).await {
+                            Ok(frames) => {
+                                for frame in frames {
+                                    priority_outbox.push_back((frame, None));
+                                }
+                            }
+                            Err(wire_err) => {
+                                core.cancel_from_peer().await;
+                                priority_outbox.push_back((
+                                    Frame::Fault {
+                                        invocation,
+                                        error: wire_err,
+                                    },
+                                    None,
+                                ));
+                            }
+                        }
                     }
                 }
                 _ => {
@@ -1807,5 +2029,374 @@ async fn route_mux_frame<D: MuxDispatcher>(
                 .map_err(TransportError::Wire)?;
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::task::Context;
+
+    use super::*;
+
+    struct PipeReader {
+        rx: Pin<Box<Receiver<Vec<u8>>>>,
+        buf: Vec<u8>,
+        pos: usize,
+        eof: bool,
+    }
+
+    type PipeSendFuture =
+        Pin<Box<dyn Future<Output = Result<(), async_channel::SendError<Vec<u8>>>> + Send>>;
+
+    struct PipeWriter {
+        tx: Sender<Vec<u8>>,
+        pending: Option<(usize, PipeSendFuture)>,
+    }
+
+    fn duplex_pipe(cap: usize) -> ((PipeReader, PipeWriter), (PipeReader, PipeWriter)) {
+        let (a_tx, b_rx) = async_channel::bounded(cap);
+        let (b_tx, a_rx) = async_channel::bounded(cap);
+        (
+            (
+                PipeReader {
+                    rx: Box::pin(a_rx),
+                    buf: Vec::new(),
+                    pos: 0,
+                    eof: false,
+                },
+                PipeWriter {
+                    tx: a_tx,
+                    pending: None,
+                },
+            ),
+            (
+                PipeReader {
+                    rx: Box::pin(b_rx),
+                    buf: Vec::new(),
+                    pos: 0,
+                    eof: false,
+                },
+                PipeWriter {
+                    tx: b_tx,
+                    pending: None,
+                },
+            ),
+        )
+    }
+
+    impl AsyncRead for PipeReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            out: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            if out.is_empty() || self.eof {
+                return Poll::Ready(Ok(0));
+            }
+            loop {
+                if self.pos < self.buf.len() {
+                    let n = (self.buf.len() - self.pos).min(out.len());
+                    out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+                    self.pos += n;
+                    if self.pos == self.buf.len() {
+                        self.buf.clear();
+                        self.pos = 0;
+                    }
+                    return Poll::Ready(Ok(n));
+                }
+                match futures_core::Stream::poll_next(self.rx.as_mut(), cx) {
+                    Poll::Ready(Some(chunk)) => {
+                        if !chunk.is_empty() {
+                            self.buf = chunk;
+                            self.pos = 0;
+                        }
+                    }
+                    Poll::Ready(None) => {
+                        self.eof = true;
+                        return Poll::Ready(Ok(0));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+    }
+
+    impl AsyncWrite for PipeWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            if self.pending.is_none() {
+                let tx = self.tx.clone();
+                let data = buf.to_vec();
+                let len = data.len();
+                self.pending = Some((len, Box::pin(async move { tx.send(data).await })));
+            }
+            let (len, fut) = self.pending.as_mut().expect("pending write");
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => {
+                    let written = *len;
+                    self.pending = None;
+                    Poll::Ready(Ok(written))
+                }
+                Poll::Ready(Err(_)) => {
+                    self.pending = None;
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "pipe closed",
+                    )))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.tx.close();
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct NoopDispatcher;
+    impl MuxDispatcher for NoopDispatcher {
+        fn supports(&self, _instance: &str, _func: &str) -> bool {
+            false
+        }
+        async fn dispatch(
+            &self,
+            _call: InboundCall,
+            _instance: String,
+            _func: String,
+        ) -> Result<(), WireError> {
+            Ok(())
+        }
+        async fn drop_resource(&self, _handle: u32) -> Result<(), WireError> {
+            Ok(())
+        }
+        async fn on_disconnect(&self) {}
+    }
+
+    struct SequentialStreamsDispatcher {
+        count: u32,
+    }
+    impl MuxDispatcher for SequentialStreamsDispatcher {
+        fn supports(&self, instance: &str, func: &str) -> bool {
+            instance == "test:mux" && func == "many-streams"
+        }
+        async fn dispatch(
+            &self,
+            call: InboundCall,
+            _instance: String,
+            _func: String,
+        ) -> Result<(), WireError> {
+            let _ = call.recv_root_request().await;
+            let handle = call.call_handle();
+            // Send 120 sequential sub-path streams on ONE invocation.
+            call.send_root_response(&self.count.to_le_bytes())
+                .await
+                .map_err(|err| WireError::MalformedPayload {
+                    context: "send_root_response".to_owned(),
+                    detail: err.to_string(),
+                })?;
+            for sub_id in 1..=self.count {
+                let mut writer = handle.register_writer(sub_id).await;
+                let _ = writer.send(sub_id.to_le_bytes().to_vec()).await;
+                let _ = writer.close().await;
+            }
+            Ok(())
+        }
+        async fn drop_resource(&self, _handle: u32) -> Result<(), WireError> {
+            Ok(())
+        }
+        async fn on_disconnect(&self) {}
+    }
+
+    #[test]
+    fn more_than_hundred_sequential_streams_in_one_invocation_reclaim_inbound_paths() {
+        futures_lite::future::block_on(async {
+            let ((c_r, c_w), (s_r, s_w)) = duplex_pipe(32);
+            let config = MuxConfig {
+                max_inbound_paths: 8,
+                ..MuxConfig::default()
+            };
+            let (client_peer, client_ch) = create_mux(config);
+            let (server_peer, server_ch) = create_mux(config);
+            let server_disp = SequentialStreamsDispatcher { count: 120 };
+
+            let client_task = async {
+                let mut call = client_peer
+                    .open_call("test:mux", "many-streams")
+                    .await
+                    .expect("open call");
+                call.send_root_request(&[]).await.expect("send req");
+                let resp = call.recv_root_response().await.expect("recv resp");
+                let count = u32::from_le_bytes(resp.try_into().expect("u32 count"));
+                assert_eq!(count, 120);
+                let handle = call.call_handle();
+
+                for sub_id in 1..=count {
+                    let mut reader = handle.open_reader(sub_id, 2).await.expect("open stream");
+                    let item = reader
+                        .recv()
+                        .await
+                        .expect("recv item")
+                        .expect("expected payload");
+                    assert_eq!(item.as_ref(), &sub_id.to_le_bytes());
+                    assert_eq!(reader.recv().await.expect("recv eof"), None);
+                }
+                assert_eq!(
+                    call.core.inbound.lock().await.active.len(),
+                    0,
+                    "all completed stream paths must be reclaimed"
+                );
+                client_peer.close();
+                server_peer.close();
+            };
+
+            let drivers = futures_lite::future::zip(
+                drive_mux(c_r, c_w, client_ch, &NoopDispatcher),
+                drive_mux(s_r, s_w, server_ch, &server_disp),
+            );
+            let ((), _) = futures_lite::future::zip(client_task, drivers).await;
+        });
+    }
+
+    #[test]
+    fn subpath_reader_drop_reclaims_buffered_bytes_and_discards_late_frames() {
+        futures_lite::future::block_on(async {
+            let config = MuxConfig {
+                max_inbound_paths: 4,
+                max_undelivered_bytes: 1024,
+                ..MuxConfig::default()
+            };
+            let (peer, _channels) = create_mux(config);
+            let core = CallCore::new(
+                1,
+                CallSide::Caller,
+                Arc::clone(&peer.state),
+                peer.outgoing_tx.clone(),
+                peer.control_tx.clone(),
+            );
+            let handle = CallHandle {
+                core: Arc::clone(&core),
+            };
+            let reader = handle.open_reader(1, 4).await.expect("open reader");
+            let path = vec![DIR_CALLEE_TO_CALLER, 1];
+
+            // Buffer 2 chunks totaling 600 bytes before dropping the reader.
+            core.push_data(path.clone(), Bytes::from(vec![0xaa; 300]))
+                .await
+                .expect("push 1");
+            core.push_data(path.clone(), Bytes::from(vec![0xbb; 300]))
+                .await
+                .expect("push 2");
+            assert_eq!(core.inbound.lock().await.undelivered_bytes, 600);
+
+            // Dropping the reader immediately releases buffered bytes and frees
+            // the active path slot, moving remaining 2 credits into `draining`.
+            drop(reader);
+            {
+                let inbound = core.inbound.lock().await;
+                assert_eq!(inbound.undelivered_bytes, 0);
+                assert!(!inbound.active.contains_key(&path));
+                assert_eq!(inbound.draining.get(&path), Some(&2));
+            }
+
+            // Two legitimately credited in-flight frames are discarded safely
+            // without accumulating `undelivered_bytes`.
+            core.push_data(path.clone(), Bytes::from(vec![0xcc; 500]))
+                .await
+                .expect("late frame 1 discarded");
+            core.push_data(path.clone(), Bytes::from(vec![0xdd; 500]))
+                .await
+                .expect("late frame 2 discarded");
+            assert_eq!(core.inbound.lock().await.undelivered_bytes, 0);
+
+            // Peer Close clears the draining tombstone completely.
+            core.push_close(path.clone())
+                .await
+                .expect("late close absorbed");
+            assert!(!core.inbound.lock().await.draining.contains_key(&path));
+        });
+    }
+
+    #[test]
+    fn concurrent_inbound_call_limit_rejects_excess_opens() {
+        struct HoldDispatcher {
+            release: Arc<Progress>,
+        }
+        impl MuxDispatcher for HoldDispatcher {
+            fn supports(&self, instance: &str, func: &str) -> bool {
+                instance == "test:limit" && func == "hold"
+            }
+            async fn dispatch(
+                &self,
+                call: InboundCall,
+                _instance: String,
+                _func: String,
+            ) -> Result<(), WireError> {
+                let mark = self.release.mark();
+                self.release.changed(mark).await;
+                let _ = call.send_root_response(b"ok").await;
+                Ok(())
+            }
+            async fn drop_resource(&self, _handle: u32) -> Result<(), WireError> {
+                Ok(())
+            }
+            async fn on_disconnect(&self) {}
+        }
+
+        futures_lite::future::block_on(async {
+            let ((c_r, c_w), (s_r, s_w)) = duplex_pipe(32);
+            let server_cfg = MuxConfig {
+                max_concurrent_inbound_calls: 2,
+                ..MuxConfig::default()
+            };
+            let (client_peer, client_ch) = create_mux(MuxConfig::default());
+            let (server_peer, server_ch) = create_mux(server_cfg);
+            let release = Arc::new(Progress::new());
+            let disp = HoldDispatcher {
+                release: Arc::clone(&release),
+            };
+
+            let test_fut = async {
+                let mut call1 = client_peer
+                    .open_call("test:limit", "hold")
+                    .await
+                    .expect("call 1 accepted");
+                let mut call2 = client_peer
+                    .open_call("test:limit", "hold")
+                    .await
+                    .expect("call 2 accepted");
+                let err = client_peer
+                    .open_call("test:limit", "hold")
+                    .await
+                    .err()
+                    .expect("call 3 must be rejected at concurrent limit");
+                assert!(
+                    matches!(err, TransportError::Rejected(ref msg) if msg.contains("limit")),
+                    "unexpected error: {err:?}"
+                );
+                release.signal();
+                assert_eq!(call1.recv_root_response().await.expect("resp 1"), b"ok");
+                assert_eq!(call2.recv_root_response().await.expect("resp 2"), b"ok");
+                client_peer.close();
+                server_peer.close();
+            };
+
+            let drivers = futures_lite::future::zip(
+                drive_mux(c_r, c_w, client_ch, &NoopDispatcher),
+                drive_mux(s_r, s_w, server_ch, &disp),
+            );
+            let ((), _) = futures_lite::future::zip(test_fut, drivers).await;
+        });
     }
 }

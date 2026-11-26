@@ -1039,6 +1039,10 @@ where
             .packet_readiness(socket)
             .await
             .map_err(p1_errno_from_udp_error)?,
+        UnixSocketHandle::<Net>::IcmpSocket(socket) => service
+            .icmp_readiness(socket)
+            .await
+            .map_err(p1_errno_from_udp_error)?,
         UnixSocketHandle::<Net>::VsockListener(listener) => {
             let Some(vsock) = caller.data().runtime_state.vsock_service() else {
                 return Err(p1::errno::NETDOWN);

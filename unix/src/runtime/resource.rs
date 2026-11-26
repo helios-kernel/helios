@@ -83,6 +83,11 @@ impl PipeInode {
     pub fn set_mode(&self, mode: u32) {
         self.0.lock().mode = mode & 0o7777;
     }
+
+    /// Whether `self` and `other` refer to the same underlying anonymous pipe.
+    pub fn same_pipe(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 impl Default for PipeInode {

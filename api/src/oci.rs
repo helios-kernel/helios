@@ -36,7 +36,7 @@ impl SubvolumeBackend for BtrfsSubvolumeBackend {
         let info = btrfs::create_subvolume(p)
             .await
             .map_err(|err| map_btrfs_error("create-subvolume", path, err))?;
-        Ok(map_subvol_info(info))
+        map_subvol_info("create-subvolume", path, info)
     }
 
     async fn snapshot_subvolume(
@@ -50,7 +50,7 @@ impl SubvolumeBackend for BtrfsSubvolumeBackend {
         let info = btrfs::snapshot_subvolume(src, dst, read_only)
             .await
             .map_err(|err| map_btrfs_error("snapshot-subvolume", destination, err))?;
-        Ok(map_subvol_info(info))
+        map_subvol_info("snapshot-subvolume", destination, info)
     }
 
     async fn set_subvolume_read_only(
@@ -77,7 +77,7 @@ impl SubvolumeBackend for BtrfsSubvolumeBackend {
     ) -> core::result::Result<Option<SubvolumeMeta>, SubvolumeError> {
         let p = path.to_string_lossy().into_owned();
         match btrfs::subvolume_info(p).await {
-            Ok(info) => Ok(Some(map_subvol_info(info))),
+            Ok(info) => Ok(Some(map_subvol_info("subvolume-info", path, info)?)),
             Err(err) if err.kind == BtrfsErrorKind::NotFound => Ok(None),
             Err(err) => Err(map_btrfs_error("subvolume-info", path, err)),
         }
@@ -92,7 +92,11 @@ impl SubvolumeBackend for BtrfsSubvolumeBackend {
         let info = btrfs::receive_subvolume(dst, stream)
             .await
             .map_err(|err| map_btrfs_error("receive-subvolume", destination_parent, err))?;
-        Ok(Some(map_subvol_info(info)))
+        Ok(Some(map_subvol_info(
+            "receive-subvolume",
+            destination_parent,
+            info,
+        )?))
     }
 }
 
@@ -131,19 +135,37 @@ pub async fn set_default_image_from_oci(
         .map_err(OciDefaultImageError::Spawn)
 }
 
-fn map_subvol_info(info: SubvolumeInfo) -> SubvolumeMeta {
-    let uuid = vec_to_uuid(&info.uuid).unwrap_or([0; 16]);
-    let received_uuid = info.received_uuid.as_deref().and_then(vec_to_uuid);
-    SubvolumeMeta {
+fn map_subvol_info(
+    operation: &'static str,
+    path: &Path,
+    info: SubvolumeInfo,
+) -> core::result::Result<SubvolumeMeta, SubvolumeError> {
+    let uuid = parse_uuid(operation, path, "uuid", &info.uuid)?;
+    let received_uuid = info
+        .received_uuid
+        .as_deref()
+        .map(|bytes| parse_uuid(operation, path, "received_uuid", bytes))
+        .transpose()?;
+    Ok(SubvolumeMeta {
         uuid,
         received_uuid,
         ctransid: info.ctransid,
         read_only: info.read_only,
-    }
+    })
 }
 
-fn vec_to_uuid(bytes: &[u8]) -> Option<[u8; 16]> {
-    bytes.try_into().ok()
+fn parse_uuid(
+    operation: &'static str,
+    path: &Path,
+    field: &'static str,
+    bytes: &[u8],
+) -> core::result::Result<[u8; 16], SubvolumeError> {
+    bytes.try_into().map_err(|_| SubvolumeError::MalformedUuid {
+        operation,
+        path: path.to_path_buf(),
+        field,
+        actual_len: bytes.len(),
+    })
 }
 
 fn map_btrfs_error(operation: &'static str, path: &Path, err: BtrfsError) -> SubvolumeError {
@@ -169,5 +191,76 @@ fn map_btrfs_error(operation: &'static str, path: &Path, err: BtrfsError) -> Sub
             path: path.to_path_buf(),
             detail: format!("{:?}: {}", err.kind, err.detail),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_subvol_info(
+        uuid: Vec<u8>,
+        received_uuid: Option<Vec<u8>>,
+        ctransid: u64,
+        read_only: bool,
+    ) -> SubvolumeInfo {
+        SubvolumeInfo {
+            id: 256,
+            parent_id: None,
+            path: String::from("layers/test"),
+            uuid,
+            parent_uuid: None,
+            received_uuid,
+            generation: ctransid,
+            ctransid,
+            otransid: ctransid,
+            stransid: 0,
+            rtransid: 0,
+            read_only,
+        }
+    }
+
+    #[test]
+    fn map_subvol_info_rejects_malformed_uuids() {
+        let ok = map_subvol_info(
+            "subvolume-info",
+            Path::new("/layers/base"),
+            test_subvol_info(vec![0x11; 16], Some(vec![0x22; 16]), 42, true),
+        )
+        .expect("valid 16-byte uuids");
+        assert_eq!(ok.uuid, [0x11; 16]);
+        assert_eq!(ok.received_uuid, Some([0x22; 16]));
+
+        let short_uuid = map_subvol_info(
+            "create-subvolume",
+            Path::new("/layers/bad"),
+            test_subvol_info(vec![0x11; 4], None, 1, false),
+        )
+        .expect_err("short uuid must fail fast");
+        assert!(matches!(
+            short_uuid,
+            SubvolumeError::MalformedUuid {
+                operation: "create-subvolume",
+                field: "uuid",
+                actual_len: 4,
+                ..
+            }
+        ));
+
+        let bad_received = map_subvol_info(
+            "receive-subvolume",
+            Path::new("/layers"),
+            test_subvol_info(vec![0x11; 16], Some(vec![0x33; 20]), 1, true),
+        )
+        .expect_err("malformed received_uuid must fail fast");
+        assert!(matches!(
+            bad_received,
+            SubvolumeError::MalformedUuid {
+                operation: "receive-subvolume",
+                field: "received_uuid",
+                actual_len: 20,
+                ..
+            }
+        ));
     }
 }

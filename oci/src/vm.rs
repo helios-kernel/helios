@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{OciError, Result, SubvolumeError};
 use crate::store::{DirectoryBackend, PulledImage, SubvolumeBackend};
-use crate::unpack::{copy_tree_recursive, remove_path_recursive};
+use crate::unpack::{copy_tree_recursive, make_tree_writable, remove_path_recursive};
 
 /// Virtio 1.2 §5.11.4 maximum UTF-8 byte length of a `virtio-fs` mount tag.
 pub const MAX_VIRTIO_FS_TAG_BYTES: usize = 36;
@@ -99,12 +99,14 @@ impl OciVmRootfs {
                 Ok(_) => true,
                 Err(SubvolumeError::NotBtrfs { .. }) => {
                     copy_tree_recursive(&image.rootfs_path, &overlay_path)?;
+                    make_tree_writable(&overlay_path);
                     false
                 }
                 Err(err) => return Err(OciError::Subvolume(err)),
             }
         } else {
             copy_tree_recursive(&image.rootfs_path, &overlay_path)?;
+            make_tree_writable(&overlay_path);
             false
         };
 
