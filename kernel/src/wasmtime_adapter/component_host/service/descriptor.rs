@@ -1039,6 +1039,10 @@ where
             .packet_readiness(socket)
             .await
             .map_err(p1_errno_from_udp_error)?,
+        UnixSocketHandle::<Net>::IcmpSocket(socket) => service
+            .icmp_readiness(socket)
+            .await
+            .map_err(p1_errno_from_udp_error)?,
         UnixSocketHandle::<Net>::VsockListener(listener) => {
             let Some(vsock) = caller.data().runtime_state.vsock_service() else {
                 return Err(p1::errno::NETDOWN);
@@ -1851,10 +1855,16 @@ fn unbindable_stdio<Net: ComponentHostNetwork>(
         Preview1Descriptor::Stdin { carry } if !carry.is_empty() => UnbindableStdio::ReadAhead,
         Preview1Descriptor::Stdin { .. }
         | Preview1Descriptor::PipeRead { .. }
+        | Preview1Descriptor::FifoRead(_)
         | Preview1Descriptor::Stdout
         | Preview1Descriptor::Stderr
         | Preview1Descriptor::PipeWrite { .. }
-        | Preview1Descriptor::NullDevice => UnbindableStdio::WrongDirection,
+        | Preview1Descriptor::FifoWrite(_)
+        | Preview1Descriptor::FifoReadWrite(_)
+        | Preview1Descriptor::NullDevice
+        | Preview1Descriptor::PseudoDevice(_)
+        | Preview1Descriptor::PtyMaster(_)
+        | Preview1Descriptor::PtySlave(_) => UnbindableStdio::WrongDirection,
         Preview1Descriptor::File(_) => UnbindableStdio::File,
         Preview1Descriptor::Preopen { .. } => UnbindableStdio::Directory,
         Preview1Descriptor::Socket(_) => UnbindableStdio::Socket,
@@ -1923,12 +1933,21 @@ pub(super) fn p1_descriptor_rights<Net: ComponentHostNetwork>(
         Preview1Descriptor::Stdout | Preview1Descriptor::Stderr => {
             P1_RIGHT_FD_WRITE | P1_RIGHT_POLL_FD_READWRITE
         }
-        Preview1Descriptor::PipeRead { .. } => P1_RIGHT_FD_READ | P1_RIGHT_POLL_FD_READWRITE,
-        Preview1Descriptor::PipeWrite { .. } => P1_RIGHT_FD_WRITE | P1_RIGHT_POLL_FD_READWRITE,
+        Preview1Descriptor::PipeRead { .. } | Preview1Descriptor::FifoRead(_) => {
+            P1_RIGHT_FD_READ | P1_RIGHT_POLL_FD_READWRITE
+        }
+        Preview1Descriptor::PipeWrite { .. } | Preview1Descriptor::FifoWrite(_) => {
+            P1_RIGHT_FD_WRITE | P1_RIGHT_POLL_FD_READWRITE
+        }
+        Preview1Descriptor::FifoReadWrite(_)
+        | Preview1Descriptor::PtyMaster(_)
+        | Preview1Descriptor::PtySlave(_) => {
+            P1_RIGHT_FD_READ | P1_RIGHT_FD_WRITE | P1_RIGHT_POLL_FD_READWRITE
+        }
         Preview1Descriptor::Event(_) => {
             P1_RIGHT_FD_READ | P1_RIGHT_FD_WRITE | P1_RIGHT_POLL_FD_READWRITE
         }
-        Preview1Descriptor::NullDevice => {
+        Preview1Descriptor::NullDevice | Preview1Descriptor::PseudoDevice(_) => {
             P1_RIGHT_FD_READ
                 | P1_RIGHT_FD_WRITE
                 | P1_RIGHT_FD_FDSTAT_SET_FLAGS

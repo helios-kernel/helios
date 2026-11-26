@@ -303,7 +303,7 @@ unreachable from the dead store.
 ## Seeing them
 
 A granted device is an ordinary part of the machine's inventory, not a
-hidden one, so `helios-inspector stats` lists them beside the
+hidden one, so `helios stats` lists them beside the
 instances: the name discovery published, whether an instance holds it,
 how much register space the grant covers, how many lines it raises, and
 the forwarded-to-masked counts. A device whose masked count stays equal

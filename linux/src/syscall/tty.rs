@@ -5,18 +5,30 @@
 //! `termios.h`, and `ioctls.h` (identical on x86-64 and aarch64).
 
 use super::*;
-use helios_unix::FDFLAG_NONBLOCK;
+use helios_unix::{FDFLAG_NONBLOCK, PtyTermios, PtyWinsize};
 
 // include/uapi/asm-generic/ioctls.h
 pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
 pub const TCSETSW: u32 = 0x5403;
 pub const TCSETSF: u32 = 0x5404;
+pub const TIOCSCTTY: u32 = 0x540E;
+pub const TIOCGPGRP: u32 = 0x540F;
+pub const TIOCSPGRP: u32 = 0x5410;
 pub const TIOCGWINSZ: u32 = 0x5413;
 pub const TIOCSWINSZ: u32 = 0x5414;
+pub const FIONREAD: u32 = 0x541B;
 pub const FIONBIO: u32 = 0x5421;
+pub const TIOCNOTTY: u32 = 0x5422;
+pub const TIOCGSID: u32 = 0x5429;
 pub const FIONCLEX: u32 = 0x5450;
 pub const FIOCLEX: u32 = 0x5451;
+/// `_IOR('T', 0x30, unsigned int)`: get UNIX98 PTY number.
+pub const TIOCGPTN: u32 = 0x8004_5430;
+/// `_IOW('T', 0x31, int)`: lock/unlock UNIX98 PTY slave.
+pub const TIOCSPTLCK: u32 = 0x4004_5431;
+/// `_IOR('T', 0x39, int)`: query UNIX98 PTY slave lock state.
+pub const TIOCGPTLCK: u32 = 0x8004_5439;
 
 // include/uapi/asm-generic/termbits-common.h and termbits.h
 pub const ICRNL: u32 = 0x0100;
@@ -143,6 +155,28 @@ impl Termios {
             cc,
         }
     }
+
+    pub const fn from_pty(pty: PtyTermios) -> Self {
+        Self {
+            iflag: pty.iflag,
+            oflag: pty.oflag,
+            cflag: pty.cflag,
+            lflag: pty.lflag,
+            line: pty.line,
+            cc: pty.cc,
+        }
+    }
+
+    pub const fn into_pty(self) -> PtyTermios {
+        PtyTermios {
+            iflag: self.iflag,
+            oflag: self.oflag,
+            cflag: self.cflag,
+            lflag: self.lflag,
+            line: self.line,
+            cc: self.cc,
+        }
+    }
 }
 
 /// Linux `struct winsize` (8 bytes on both x86-64 and aarch64).
@@ -177,6 +211,24 @@ impl Winsize {
             cols: u16::from_le_bytes(bytes[2..4].try_into().unwrap()),
             xpixel: u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
             ypixel: u16::from_le_bytes(bytes[6..8].try_into().unwrap()),
+        }
+    }
+
+    pub const fn from_pty(pty: PtyWinsize) -> Self {
+        Self {
+            rows: pty.rows,
+            cols: pty.cols,
+            xpixel: pty.xpixel,
+            ypixel: pty.ypixel,
+        }
+    }
+
+    pub const fn into_pty(self) -> PtyWinsize {
+        PtyWinsize {
+            rows: self.rows,
+            cols: self.cols,
+            xpixel: self.xpixel,
+            ypixel: self.ypixel,
         }
     }
 }
@@ -216,6 +268,12 @@ pub trait Tty {
     fn set_winsize(&mut self, _stream: TtyStream, _winsize: Winsize) -> Result<(), TtyError> {
         Err(TtyError::NotTty)
     }
+
+    fn controlling_pty(&self) -> Option<helios_unix::PtySlave> {
+        None
+    }
+
+    fn set_controlling_pty(&mut self, _pty: Option<helios_unix::PtySlave>) {}
 }
 
 fn tty_errno(error: TtyError) -> u64 {
@@ -286,14 +344,266 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
         return 0;
     }
 
+    if request == FIONREAD {
+        let available = match &entry.descriptor {
+            FileDescriptor::PtyMaster(master) => Some(master.readable_bytes()),
+            FileDescriptor::PtySlave(slave) => Some(slave.readable_bytes()),
+            FileDescriptor::FifoRead(reader) => Some(reader.buffered_bytes()),
+            FileDescriptor::FifoReadWrite(rw) => Some(rw.buffered_bytes()),
+            FileDescriptor::PipeRead { .. } => Some(0),
+            FileDescriptor::Stdin { .. } => Some(process.shared.stdin_carry.lock().len()),
+            _ => None,
+        };
+        if let Some(bytes) = available {
+            let count = i32::try_from(bytes).unwrap_or(i32::MAX);
+            return match memory.write(arg, &count.to_le_bytes()) {
+                Ok(()) => 0,
+                Err(_) => errno(EFAULT),
+            };
+        }
+        return errno(ENOTTY);
+    }
+
+    if let FileDescriptor::PtyMaster(master) = &entry.descriptor {
+        return match request {
+            TIOCGPTN => match memory.write(arg, &master.index().to_le_bytes()) {
+                Ok(()) => 0,
+                Err(_) => errno(EFAULT),
+            },
+            TIOCSPTLCK => {
+                let mut raw = [0u8; 4];
+                if memory.read(arg, &mut raw).is_err() {
+                    return errno(EFAULT);
+                }
+                master.set_locked(i32::from_le_bytes(raw) != 0);
+                0
+            }
+            TIOCGPTLCK => {
+                let locked = i32::from(master.is_locked());
+                match memory.write(arg, &locked.to_le_bytes()) {
+                    Ok(()) => 0,
+                    Err(_) => errno(EFAULT),
+                }
+            }
+            TCGETS => {
+                let termios = Termios::from_pty(master.termios());
+                match memory.write(arg, &termios.to_bytes()) {
+                    Ok(()) => 0,
+                    Err(_) => errno(EFAULT),
+                }
+            }
+            TCSETS | TCSETSW | TCSETSF => {
+                let mut raw = [0u8; TERMIOS_SIZE];
+                if memory.read(arg, &mut raw).is_err() {
+                    return errno(EFAULT);
+                }
+                master.set_termios(Termios::from_bytes(&raw).into_pty(), request == TCSETSF);
+                0
+            }
+            TIOCGWINSZ => {
+                let ws = Winsize::from_pty(master.winsize());
+                match memory.write(arg, &ws.to_bytes()) {
+                    Ok(()) => 0,
+                    Err(_) => errno(EFAULT),
+                }
+            }
+            TIOCSWINSZ => {
+                let mut raw = [0u8; WINSIZE_SIZE];
+                if memory.read(arg, &mut raw).is_err() {
+                    return errno(EFAULT);
+                }
+                master.set_winsize(Winsize::from_bytes(&raw).into_pty());
+                0
+            }
+            TIOCGPGRP => {
+                let pgrp = master.fg_pgrp() as i32;
+                match memory.write(arg, &pgrp.to_le_bytes()) {
+                    Ok(()) => 0,
+                    Err(_) => errno(EFAULT),
+                }
+            }
+            TIOCSPGRP => {
+                let mut raw = [0u8; 4];
+                if memory.read(arg, &mut raw).is_err() {
+                    return errno(EFAULT);
+                }
+                let pgrp = i32::from_le_bytes(raw);
+                if pgrp <= 0 {
+                    return errno(EINVAL);
+                }
+                master.set_fg_pgrp(pgrp as u32);
+                0
+            }
+            TIOCGSID => match master.session_id() {
+                Some(sid) => match memory.write(arg, &(sid as i32).to_le_bytes()) {
+                    Ok(()) => 0,
+                    Err(_) => errno(EFAULT),
+                },
+                None => errno(ENOTTY),
+            },
+            _ => errno(ENOTTY),
+        };
+    }
+
+    if let FileDescriptor::PtySlave(slave) = &entry.descriptor {
+        return match request {
+            TCGETS => {
+                let termios = Termios::from_pty(slave.termios());
+                match memory.write(arg, &termios.to_bytes()) {
+                    Ok(()) => 0,
+                    Err(_) => errno(EFAULT),
+                }
+            }
+            TCSETS | TCSETSW | TCSETSF => {
+                let mut raw = [0u8; TERMIOS_SIZE];
+                if memory.read(arg, &mut raw).is_err() {
+                    return errno(EFAULT);
+                }
+                slave.set_termios(Termios::from_bytes(&raw).into_pty(), request == TCSETSF);
+                0
+            }
+            TIOCGWINSZ => {
+                let ws = Winsize::from_pty(slave.winsize());
+                match memory.write(arg, &ws.to_bytes()) {
+                    Ok(()) => 0,
+                    Err(_) => errno(EFAULT),
+                }
+            }
+            TIOCSWINSZ => {
+                let mut raw = [0u8; WINSIZE_SIZE];
+                if memory.read(arg, &mut raw).is_err() {
+                    return errno(EFAULT);
+                }
+                slave.set_winsize(Winsize::from_bytes(&raw).into_pty());
+                0
+            }
+            TIOCSCTTY => {
+                let pid = process.pid().get();
+                let sid = process
+                    .shared
+                    .pids
+                    .sid(pid)
+                    .map_or(pid, core::num::NonZeroU32::get);
+                let pgid = process.shared.signals.pgid();
+                if let Some(current_ctty) = tty.controlling_pty()
+                    && current_ctty.same_pty(slave)
+                {
+                    return 0;
+                }
+                if pid != sid || tty.controlling_pty().is_some() {
+                    return errno(EPERM);
+                }
+                if let Some(owner_sid) = slave.session_id()
+                    && owner_sid != sid
+                {
+                    let steal = arg == 1
+                        && process
+                            .credentials
+                            .lock()
+                            .capabilities
+                            .has_effective(CAP_SYS_ADMIN);
+                    if !steal {
+                        return errno(EPERM);
+                    }
+                }
+                slave.set_session_id(Some(sid));
+                slave.set_fg_pgrp(pgid);
+                tty.set_controlling_pty(Some(slave.clone()));
+                0
+            }
+            TIOCNOTTY => {
+                let pid = process.pid().get();
+                let sid = process
+                    .shared
+                    .pids
+                    .sid(pid)
+                    .map_or(pid, core::num::NonZeroU32::get);
+                if let Some(current_ctty) = tty.controlling_pty()
+                    && current_ctty.same_pty(slave)
+                {
+                    if slave.session_id() == Some(sid) {
+                        slave.set_session_id(None);
+                    }
+                    tty.set_controlling_pty(None);
+                    0
+                } else {
+                    errno(ENOTTY)
+                }
+            }
+            TIOCGPGRP => {
+                let pgrp = slave.fg_pgrp();
+                let reported = if pgrp != 0 {
+                    pgrp as i32
+                } else {
+                    process.shared.signals.pgid() as i32
+                };
+                match memory.write(arg, &reported.to_le_bytes()) {
+                    Ok(()) => 0,
+                    Err(_) => errno(EFAULT),
+                }
+            }
+            TIOCSPGRP => {
+                let mut raw = [0u8; 4];
+                if memory.read(arg, &mut raw).is_err() {
+                    return errno(EFAULT);
+                }
+                let pgrp = i32::from_le_bytes(raw);
+                if pgrp <= 0 {
+                    return errno(EINVAL);
+                }
+                slave.set_fg_pgrp(pgrp as u32);
+                0
+            }
+            TIOCGSID => match slave.session_id() {
+                Some(sid) => match memory.write(arg, &(sid as i32).to_le_bytes()) {
+                    Ok(()) => 0,
+                    Err(_) => errno(EFAULT),
+                },
+                None => errno(ENOTTY),
+            },
+            _ => errno(ENOTTY),
+        };
+    }
+
     let stream = match &entry.descriptor {
         FileDescriptor::Stdin { .. } => TtyStream::Stdin,
         FileDescriptor::Stdout => TtyStream::Stdout,
         FileDescriptor::Stderr => TtyStream::Stderr,
+        FileDescriptor::PseudoDevice(dev)
+            if matches!(
+                dev.kind,
+                helios_unix::PseudoDeviceKind::Tty | helios_unix::PseudoDeviceKind::Console
+            ) =>
+        {
+            TtyStream::Stdin
+        }
         _ => return errno(ENOTTY),
     };
 
     match request {
+        TIOCGPGRP => {
+            if !tty.is_tty(stream) {
+                return errno(ENOTTY);
+            }
+            let pgrp = process.shared.signals.pgid() as i32;
+            match memory.write(arg, &pgrp.to_le_bytes()) {
+                Ok(()) => 0,
+                Err(_) => errno(EFAULT),
+            }
+        }
+        TIOCSPGRP => {
+            if !tty.is_tty(stream) {
+                return errno(ENOTTY);
+            }
+            let mut raw = [0u8; 4];
+            if memory.read(arg, &mut raw).is_err() {
+                return errno(EFAULT);
+            }
+            if i32::from_le_bytes(raw) <= 0 {
+                return errno(EINVAL);
+            }
+            0
+        }
         TCGETS => match tty.get_termios(stream) {
             Ok(termios) => match memory.write(arg, &termios.to_bytes()) {
                 Ok(()) => 0,

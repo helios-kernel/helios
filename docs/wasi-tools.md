@@ -159,7 +159,7 @@ root, boot artifact sources — resolve against the checkout the CLI is *run*
 in: the nearest directory at or above the current one whose `Cargo.toml`
 declares `[workspace]`. Running outside a checkout is a hard error naming the
 directory that was searched; pass `--workspace-root <path>` or set
-`HELIOS_WORKSPACE_ROOT` to name the checkout explicitly. `helios-inspector`
+`HELIOS_WORKSPACE_ROOT` to name the checkout explicitly. `helios`
 resolves its own repository paths the same way, so a binary built in one
 worktree and reused from another operates on the tree it is run in.
 

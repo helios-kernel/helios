@@ -2,7 +2,7 @@ name: Install the CI root signing key
 description: >-
   Writes the key CI signs boot payloads with to a file in the runner's
   temporary directory and exports its path as `HELIOS_ROOT_SECRET_KEY`,
-  which `helios-inspector vm` and `helios-cli kernel-prebuild` read as
+  which `helios vm` and `helios-cli kernel-prebuild` read as
   `--root-secret-key`. Every CI kernel image then embeds one public key, so
   an image built by one job boots a payload built by another (#1023). The
   key signs CI's payloads and nothing else; a release signs with its own

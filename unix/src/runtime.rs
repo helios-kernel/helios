@@ -25,11 +25,23 @@ pub trait InterruptTarget: Clone + Send + Sync {
 mod readiness;
 pub use readiness::*;
 
+mod file_lock;
+pub use file_lock::*;
+
 mod open_file;
 pub use open_file::*;
 
 mod resource;
 pub use resource::*;
+
+mod fifo;
+pub use fifo::*;
+
+mod pseudo;
+pub use pseudo::*;
+
+mod pty;
+pub use pty::*;
 
 mod socket;
 pub use socket::*;

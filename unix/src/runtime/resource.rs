@@ -1,4 +1,7 @@
-use crate::{Epoll, EventFd, OpenFile, Socket, SocketNetwork};
+use crate::{
+    Epoll, EventFd, FifoReadWrite, FifoReader, FifoWriter, OpenFile, PseudoDevice, PtyMaster,
+    PtySlave, Socket, SocketNetwork,
+};
 use alloc::string::String;
 use alloc::sync::Arc;
 use bytes::Bytes;
@@ -37,24 +40,32 @@ pub struct FileDescriptorEntry<File: Clone, Net: SocketNetwork, Data: Clone> {
     fdflags: Arc<AtomicU16>,
 }
 
-/// Ownership and mode of an anonymous `pipefs` inode shared by both ends of a pipe.
+/// Ownership and mode of an anonymous `pipefs` or named FIFO inode shared by both ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PipeAttrs {
+    pub dev: u64,
+    pub ino: u64,
     pub uid: u32,
     pub gid: u32,
     pub mode: u32,
 }
 
-/// Shared handle to an anonymous pipe's inode metadata (`fs/pipe.c`).
+/// Shared handle to a pipe or named FIFO's inode metadata (`fs/pipe.c`).
 #[derive(Clone, Debug)]
 pub struct PipeInode(Arc<spin::Mutex<PipeAttrs>>);
 
 impl PipeInode {
     pub fn new(uid: u32, gid: u32) -> Self {
+        Self::with_identity(1, 1, uid, gid, 0o600)
+    }
+
+    pub fn with_identity(dev: u64, ino: u64, uid: u32, gid: u32, mode: u32) -> Self {
         Self(Arc::new(spin::Mutex::new(PipeAttrs {
+            dev,
+            ino,
             uid,
             gid,
-            mode: 0o600,
+            mode: mode & 0o7777,
         })))
     }
 
@@ -71,6 +82,11 @@ impl PipeInode {
 
     pub fn set_mode(&self, mode: u32) {
         self.0.lock().mode = mode & 0o7777;
+    }
+
+    /// Whether `self` and `other` refer to the same underlying anonymous pipe.
+    pub fn same_pipe(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -95,6 +111,9 @@ pub enum FileDescriptor<File: Clone, Net: SocketNetwork, Data: Clone> {
         writer: ByteWriter,
         inode: PipeInode,
     },
+    FifoRead(FifoReader),
+    FifoWrite(FifoWriter),
+    FifoReadWrite(FifoReadWrite),
     Event(EventFd),
     Preopen {
         guest_name: String,
@@ -102,6 +121,9 @@ pub enum FileDescriptor<File: Clone, Net: SocketNetwork, Data: Clone> {
     },
     File(OpenFile<File>),
     NullDevice,
+    PseudoDevice(PseudoDevice),
+    PtyMaster(PtyMaster),
+    PtySlave(PtySlave),
     Socket(Socket<Net>),
     Epoll(Epoll<Data>),
 }

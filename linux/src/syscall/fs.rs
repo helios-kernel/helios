@@ -30,6 +30,7 @@ pub const O_WRONLY: u64 = 1;
 pub const O_RDWR: u64 = 2;
 pub const O_CREAT: u64 = 1 << 6;
 pub const O_EXCL: u64 = 1 << 7;
+pub const O_NOCTTY: u64 = 1 << 8;
 pub const O_TRUNC: u64 = 1 << 9;
 pub const O_APPEND: u64 = 1 << 10;
 pub const O_NONBLOCK: u64 = 1 << 11;
@@ -185,6 +186,8 @@ pub struct OpenRequest {
     pub nofollow: bool,
     pub path_only: bool,
     pub append: bool,
+    pub nonblock: bool,
+    pub noctty: bool,
     pub sync: bool,
     pub dsync: bool,
     /// Raw creation permissions (`mode & 0o7777`) before applying `umask`.
@@ -192,6 +195,24 @@ pub struct OpenRequest {
     /// Calling process's `umask` (`0o777`), skipped when the parent directory
     /// carries a POSIX default ACL (`fs/posix_acl.c` `posix_acl_create`).
     pub umask: u32,
+}
+
+/// Result of [`Filesystem::open_descriptor`].
+pub enum OpenOutcome<R: Resources> {
+    /// Opened a file, pseudo device, named FIFO, or PTY master directly.
+    Descriptor(Descriptor<R>),
+    /// Opened `/proc/self/fd/<n>` (or `/dev/fd/<n>`, `/dev/stdin`..`stderr`):
+    /// duplicate/reopen the caller's existing descriptor `fd`.
+    ReopenFd { fd: i32 },
+    /// Opened `/dev/tty` or `/dev/console`: bind to the process's controlling
+    /// PTY if attached, else `fallback`, else `ENXIO`.
+    ControllingTty { fallback: Option<Descriptor<R>> },
+    /// Opened `/dev/pts/<n>` slave: attach as controlling PTY if the caller is
+    /// a session leader without one and `!noctty`.
+    PtySlave {
+        slave: helios_unix::PtySlave,
+        noctty: bool,
+    },
 }
 
 /// Timestamp update for `utimensat`.
@@ -343,6 +364,79 @@ impl FileStat {
     }
 }
 
+// Linux UAPI `include/uapi/linux/magic.h` filesystem magic numbers.
+pub const BTRFS_SUPER_MAGIC: i64 = 0x9123_683e;
+pub const TMPFS_MAGIC: i64 = 0x0102_1994;
+pub const EROFS_SUPER_MAGIC_V1: i64 = 0xe0f5_e1e2;
+pub const V9FS_MAGIC: i64 = 0x0102_1997;
+pub const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c_7630;
+pub const PROC_SUPER_MAGIC: i64 = 0x9fa0;
+pub const SYSFS_MAGIC: i64 = 0x6265_6572;
+pub const PIPEFS_MAGIC: i64 = 0x5049_5045;
+pub const SOCKFS_MAGIC: i64 = 0x534f_434b;
+pub const ANON_INODE_FS_MAGIC: i64 = 0x0904_1934;
+
+// Linux UAPI `include/linux/statfs.h` `ST_*` mount flags.
+pub const ST_RDONLY: i64 = 0x0001;
+pub const ST_NOSUID: i64 = 0x0002;
+pub const ST_NODEV: i64 = 0x0004;
+pub const ST_NOEXEC: i64 = 0x0008;
+pub const ST_VALID: i64 = 0x0020;
+
+/// Filesystem statistics for `statfs(2)` / `fstatfs(2)`
+/// (`include/uapi/asm-generic/statfs.h` LP64 `struct statfs`, 120 bytes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FsStat {
+    pub f_type: i64,
+    pub f_bsize: i64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_fsid: [i32; 2],
+    pub f_namelen: i64,
+    pub f_frsize: i64,
+    pub f_flags: i64,
+}
+
+impl FsStat {
+    pub const fn synthetic_virtual(f_type: i64) -> Self {
+        Self {
+            f_type,
+            f_bsize: 4096,
+            f_blocks: 0,
+            f_bfree: 0,
+            f_bavail: 0,
+            f_files: 0,
+            f_ffree: 0,
+            f_fsid: [0, 0],
+            f_namelen: 255,
+            f_frsize: 4096,
+            f_flags: ST_VALID,
+        }
+    }
+
+    /// Encodes LP64 `struct statfs` (120 bytes, identical on x86-64 and aarch64).
+    pub fn write_statfs(self) -> [u8; 120] {
+        let mut out = [0u8; 120];
+        out[0..8].copy_from_slice(&self.f_type.to_le_bytes());
+        out[8..16].copy_from_slice(&self.f_bsize.to_le_bytes());
+        out[16..24].copy_from_slice(&self.f_blocks.to_le_bytes());
+        out[24..32].copy_from_slice(&self.f_bfree.to_le_bytes());
+        out[32..40].copy_from_slice(&self.f_bavail.to_le_bytes());
+        out[40..48].copy_from_slice(&self.f_files.to_le_bytes());
+        out[48..56].copy_from_slice(&self.f_ffree.to_le_bytes());
+        out[56..60].copy_from_slice(&self.f_fsid[0].to_le_bytes());
+        out[60..64].copy_from_slice(&self.f_fsid[1].to_le_bytes());
+        out[64..72].copy_from_slice(&self.f_namelen.to_le_bytes());
+        out[72..80].copy_from_slice(&self.f_frsize.to_le_bytes());
+        out[80..88].copy_from_slice(&self.f_flags.to_le_bytes());
+        // `f_spare[4]` at 88..120 stays zeroed.
+        out
+    }
+}
+
 /// Container-bounded filesystem operations provided by the kernel's Linux host.
 pub trait Filesystem<R: Resources> {
     fn file_access(&self, _file: &R::File) -> FileAccess {
@@ -363,6 +457,62 @@ pub trait Filesystem<R: Resources> {
 
     fn same_file(&self, _a: &R::File, _b: &R::File) -> bool {
         false
+    }
+
+    /// Whether standalone tests without a mounted `/dev` fall back to a
+    /// synthetic `/dev/null` on `NoEntry`. Real containers mount `DevFs` and
+    /// return `false`.
+    fn has_synthetic_dev_fallback(&self) -> bool {
+        true
+    }
+
+    /// Optional extended open hook returning rich descriptors (character
+    /// devices, PTYs, named FIFOs, `/proc/self/fd/<n>` reopens). Returning
+    /// `Ok(None)` falls back to [`Self::open`].
+    fn open_descriptor(
+        &mut self,
+        _base: Option<&R::File>,
+        _cwd: &str,
+        _path: &str,
+        _request: OpenRequest,
+        _creds: &Credentials,
+    ) -> impl Future<Output = Result<Option<OpenOutcome<R>>, FsOpError>> + Send {
+        async { Ok(None) }
+    }
+
+    /// Stable `(dev, ino)` key identifying the underlying file for `flock(2)`
+    /// and POSIX `fcntl(2)` record locks.
+    fn file_lock_key(&self, _file: &R::File) -> Option<helios_unix::FileLockKey> {
+        None
+    }
+
+    /// Filesystem statistics for `path` (`statfs(2)`).
+    fn statfs_path(
+        &self,
+        _base: Option<&R::File>,
+        _cwd: &str,
+        _path: &str,
+        _creds: &Credentials,
+    ) -> impl Future<Output = Result<FsStat, FsOpError>> + Send {
+        async { Err(FsOpError::Fs(FsError::Unsupported)) }
+    }
+
+    /// Filesystem statistics for open file descriptor `file` (`fstatfs(2)`).
+    fn statfs_file(
+        &self,
+        _file: &R::File,
+    ) -> impl Future<Output = Result<FsStat, FsOpError>> + Send {
+        async { Err(FsOpError::Fs(FsError::Unsupported)) }
+    }
+
+    /// Flushes all writable mounts in the container (`sync(2)`).
+    fn sync_all(&self) -> impl Future<Output = Result<(), FsOpError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Flushes the mount containing `file` (`syncfs(2)`).
+    fn sync_fs(&self, _file: &R::File) -> impl Future<Output = Result<(), FsOpError>> + Send {
+        async { Ok(()) }
     }
 
     fn open(
@@ -874,12 +1024,144 @@ fn dirfd_file<R: Resources, F: Filesystem<R>>(
     Ok(Some(file))
 }
 
-fn entry_file<R: Resources>(entry: &Entry<R>) -> Option<OpenFile<R::File>> {
+pub(super) fn entry_file<R: Resources>(entry: &Entry<R>) -> Option<OpenFile<R::File>> {
     match &entry.descriptor {
         FileDescriptor::File(open) => Some(open.clone()),
         FileDescriptor::Preopen { descriptor, .. } => Some(OpenFile::new(descriptor.clone())),
         _ => None,
     }
+}
+
+/// Checks whether normalized container path `path` is equal to or strictly
+/// inside normalized chroot prefix `root`.
+fn path_within_root(path: &str, root: &str) -> bool {
+    if root == "/" {
+        return true;
+    }
+    path == root
+        || (path.len() > root.len()
+            && path.starts_with(root)
+            && path.as_bytes()[root.len()] == b'/')
+}
+
+/// Clamps `path` relative to `base_dir` within `root` when `root != "/"`,
+/// resolving symlinks strictly inside `root` so neither `..` nor absolute
+/// symlink targets can escape the chroot boundary (`fs/namei.c`).
+///
+/// When `root == "/"`, returns `(cwd, path)` directly with zero extra I/O.
+pub(super) async fn resolve_in_chroot<R: Resources, F: Filesystem<R>>(
+    process: &Process<R>,
+    base: Option<&R::File>,
+    raw_path: &str,
+    follow_final: bool,
+    creds: &Credentials,
+    fs: &F,
+) -> Result<(String, String), u64> {
+    let cwd = process.shared.cwd.lock().clone();
+    let root = process.shared.root.lock().clone();
+    if root == "/" {
+        return Ok((cwd, String::from(raw_path)));
+    }
+    let base_dir = String::from(base.and_then(|f| fs.file_path(f)).unwrap_or(cwd.as_str()));
+    alloc::boxed::Box::pin(resolve_in_chroot_slow(
+        cwd,
+        root,
+        base_dir,
+        raw_path,
+        follow_final,
+        creds,
+        fs,
+    ))
+    .await
+}
+
+async fn resolve_in_chroot_slow<R: Resources, F: Filesystem<R>>(
+    cwd: String,
+    root: String,
+    base_dir: String,
+    raw_path: &str,
+    follow_final: bool,
+    creds: &Credentials,
+    fs: &F,
+) -> Result<(String, String), u64> {
+    const MAX_SYMLINK_DEPTH: usize = 40;
+    let root_segs: Vec<&str> = root.split('/').filter(|s| !s.is_empty()).collect();
+    let clamp_at_root = raw_path.starts_with('/') || path_within_root(&base_dir, &root);
+    let min_depth = if clamp_at_root { root_segs.len() } else { 0 };
+    let trailing_slash = raw_path.ends_with('/') && raw_path != "/";
+
+    let mut current: Vec<String> = if raw_path.starts_with('/') {
+        root_segs.iter().map(|s| String::from(*s)).collect()
+    } else {
+        base_dir
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect()
+    };
+    let mut pending: Vec<String> = raw_path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .rev()
+        .map(String::from)
+        .collect();
+    let mut symlinks_followed = 0usize;
+
+    while let Some(seg) = pending.pop() {
+        if seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            if current.len() > min_depth {
+                current.pop();
+            }
+            continue;
+        }
+        current.push(seg);
+        let is_last = pending.is_empty();
+        let should_follow = !is_last || follow_final || trailing_slash;
+        if should_follow {
+            let candidate = join_segments(&current);
+            if let Ok((stat, _)) = fs.stat_path(None, "/", &candidate, false, creds).await
+                && stat.kind == NodeKind::Symlink
+            {
+                symlinks_followed += 1;
+                if symlinks_followed > MAX_SYMLINK_DEPTH {
+                    return Err(errno(ELOOP));
+                }
+                let target = fs
+                    .read_link(None, "/", &candidate, creds)
+                    .await
+                    .map_err(fs_errno)?;
+                if target.starts_with('/') {
+                    current = root_segs.iter().map(|s| String::from(*s)).collect();
+                } else {
+                    current.pop();
+                }
+                for tseg in target.split('/').filter(|s| !s.is_empty()).rev() {
+                    pending.push(String::from(tseg));
+                }
+            }
+        }
+    }
+
+    let mut resolved = join_segments(&current);
+    if trailing_slash && resolved != "/" {
+        resolved.push('/');
+    }
+    Ok((cwd, resolved))
+}
+
+fn join_segments(segs: &[String]) -> String {
+    if segs.is_empty() {
+        return String::from("/");
+    }
+    let mut out = String::new();
+    for seg in segs {
+        out.push('/');
+        out.push_str(seg);
+    }
+    out
 }
 
 fn is_dev_null_path<R: Resources, F: Filesystem<R>>(
@@ -924,7 +1206,7 @@ fn synthetic_dev_null_stat() -> FileStat {
     }
 }
 
-fn process_creds<R: Resources>(process: &Process<R>) -> Credentials {
+pub(super) fn process_creds<R: Resources>(process: &Process<R>) -> Credentials {
     process.credentials.lock().clone()
 }
 
@@ -964,20 +1246,20 @@ fn read_xattr_name<M: UserMemory>(memory: &M, address: u64) -> Result<String, u6
     }
 }
 
-pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R>>(
+pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R> + tty::Tty>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &M,
     fs: &mut F,
-) -> u64 {
+) -> SyscallOutcome {
     let abi = process.shared.abi;
     let dirfd = args[0] as u32 as i32;
     let path = match read_user_path(memory, args[1]) {
         Ok(path) => path,
-        Err(err) => return err,
+        Err(err) => return SyscallOutcome::Return(err),
     };
     if path.is_empty() {
-        return errno(ENOENT);
+        return SyscallOutcome::Return(errno(ENOENT));
     }
     let flags = args[2] as u32 as u64;
     let raw_mode = args[3] as u32;
@@ -987,7 +1269,7 @@ pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R>>(
     let path_only = flags & O_PATH != 0;
     let accmode = flags & O_ACCMODE;
     if !path_only && accmode == 3 {
-        return errno(EINVAL);
+        return SyscallOutcome::Return(errno(EINVAL));
     }
     let read = !path_only && matches!(accmode, O_RDONLY | O_RDWR);
     let write = !path_only && matches!(accmode, O_WRONLY | O_RDWR);
@@ -1001,6 +1283,8 @@ pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         nofollow: flags & abi.o_nofollow() != 0,
         path_only,
         append: !path_only && (flags & O_APPEND != 0),
+        nonblock: !path_only && (flags & O_NONBLOCK != 0),
+        noctty: flags & O_NOCTTY != 0,
         sync: !path_only && (flags & O_SYNC_BIT != 0),
         dsync: !path_only && (flags & O_DSYNC != 0),
         mode,
@@ -1009,25 +1293,106 @@ pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R>>(
 
     let base = match dirfd_file(process, dirfd, &path, false, fs) {
         Ok(base) => base,
-        Err(err) => return err,
+        Err(err) => return SyscallOutcome::Return(err),
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, base.as_ref(), &path, !request.nofollow, &creds, fs).await
+        {
+            Ok(pair) => pair,
+            Err(err) => return SyscallOutcome::Return(err),
+        };
+    let open_base = if resolved_path.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
     let cloexec = flags & O_CLOEXEC != 0;
-    let descriptor = match fs.open(base.as_ref(), &cwd, &path, request, &creds).await {
-        Ok(file) => FileDescriptor::File(OpenFile::new(file)),
+    let opened = match process
+        .signals
+        .interruptible(fs.open_descriptor(open_base, &cwd, &resolved_path, request, &creds))
+        .await
+    {
+        signal::WaitOutcome::Ready(Ok(Some(outcome))) => Ok(outcome),
+        signal::WaitOutcome::Ready(Ok(None)) => match process
+            .signals
+            .interruptible(fs.open(open_base, &cwd, &resolved_path, request, &creds))
+            .await
+        {
+            signal::WaitOutcome::Ready(result) => result
+                .map(|file| OpenOutcome::Descriptor(FileDescriptor::File(OpenFile::new(file)))),
+            signal::WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
+        },
+        signal::WaitOutcome::Ready(Err(error)) => Err(error),
+        signal::WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
+    };
+    let descriptor = match opened {
+        Ok(OpenOutcome::Descriptor(desc)) => desc,
+        Ok(OpenOutcome::ReopenFd { fd }) => {
+            let Some(existing) = process.shared.descriptors.lock().get_entry(fd).cloned() else {
+                return SyscallOutcome::Return(errno(ENOENT));
+            };
+            if existing.fdflags() & FDFLAG_PATH != 0 && !request.path_only {
+                return SyscallOutcome::Return(errno(EBADF));
+            }
+            // Re-open regular files through the filesystem so the new open
+            // description gets an independent offset; for pipes/FIFOs/sockets/
+            // PTYs/stdio/pseudo devices, clone the live descriptor handle.
+            match &existing.descriptor {
+                FileDescriptor::File(open) => {
+                    if let Some(target_path) = fs.file_path(open.node()) {
+                        let target_path = alloc::string::String::from(target_path);
+                        match fs.open(None, "/", &target_path, request, &creds).await {
+                            Ok(file) => FileDescriptor::File(OpenFile::new(file)),
+                            Err(error) => return SyscallOutcome::Return(fs_errno(error)),
+                        }
+                    } else {
+                        existing.descriptor
+                    }
+                }
+                _ => existing.descriptor,
+            }
+        }
+        Ok(OpenOutcome::ControllingTty { fallback }) => {
+            if let Some(ctty) = fs.controlling_pty() {
+                FileDescriptor::PtySlave(ctty)
+            } else if let Some(fb) = fallback {
+                fb
+            } else {
+                return SyscallOutcome::Return(errno(ENXIO));
+            }
+        }
+        Ok(OpenOutcome::PtySlave { slave, noctty }) => {
+            let sid = process
+                .shared
+                .pids
+                .sid(process.pid().get())
+                .map_or(process.pid().get(), core::num::NonZeroU32::get);
+            let pgid = process.shared.signals.pgid();
+            if !noctty
+                && process.pid().get() == sid
+                && fs.controlling_pty().is_none()
+                && slave.session_id().is_none()
+            {
+                slave.set_session_id(Some(sid));
+                slave.set_fg_pgrp(pgid);
+                fs.set_controlling_pty(Some(slave.clone()));
+            }
+            FileDescriptor::PtySlave(slave)
+        }
         Err(FsOpError::Fs(FsError::NoEntry))
-            if is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
+            if fs.has_synthetic_dev_fallback()
+                && is_dev_null_path(open_base, &cwd, &resolved_path, fs) =>
         {
             if path.ends_with('/') || request.directory {
-                return errno(ENOTDIR);
+                return SyscallOutcome::Return(errno(ENOTDIR));
             }
             if request.create && request.exclusive {
-                return errno(EEXIST);
+                return SyscallOutcome::Return(errno(EEXIST));
             }
             FileDescriptor::NullDevice
         }
-        Err(error) => return fs_errno(error),
+        Err(error) => return SyscallOutcome::Return(fs_errno(error)),
     };
     let entry = Entry::<R>::new(descriptor, cloexec);
     let mut fdflags = linux_to_fdflags(abi, flags);
@@ -1035,52 +1400,139 @@ pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         fdflags = FDFLAG_PATH;
     }
     entry.set_fdflags(fdflags);
-    process
-        .shared
-        .descriptors
-        .lock()
-        .insert_entry(entry)
-        .map_or_else(io::descriptor_errno, u64::from)
+    SyscallOutcome::Return(
+        process
+            .shared
+            .descriptors
+            .lock()
+            .insert_entry(entry)
+            .map_or_else(io::descriptor_errno, u64::from),
+    )
 }
 
-pub(super) async fn open<R: Resources, M: UserMemory, F: Filesystem<R>>(
-    process: &Process<R>,
-    args: [u64; 6],
-    memory: &M,
-    fs: &mut F,
-) -> u64 {
-    openat(
-        process,
-        [AT_FDCWD as u32 as u64, args[0], args[1], args[2], 0, 0],
-        memory,
-        fs,
-    )
-    .await
+pub(super) const fn open_to_openat_args(args: [u64; 6]) -> [u64; 6] {
+    [AT_FDCWD as u32 as u64, args[0], args[1], args[2], 0, 0]
 }
 
-pub(super) async fn creat<R: Resources, M: UserMemory, F: Filesystem<R>>(
-    process: &Process<R>,
-    args: [u64; 6],
-    memory: &M,
-    fs: &mut F,
-) -> u64 {
-    openat(
-        process,
-        [
-            AT_FDCWD as u32 as u64,
-            args[0],
-            O_CREAT | O_WRONLY | O_TRUNC,
-            args[1],
-            0,
-            0,
-        ],
-        memory,
-        fs,
-    )
-    .await
+pub(super) const fn creat_to_openat_args(args: [u64; 6]) -> [u64; 6] {
+    [
+        AT_FDCWD as u32 as u64,
+        args[0],
+        O_CREAT | O_WRONLY | O_TRUNC,
+        args[1],
+        0,
+        0,
+    ]
 }
 
 fn synthetic_stat<R: Resources, T: tty::Tty>(entry: &Entry<R>, tty: &T) -> FileStat {
+    match &entry.descriptor {
+        FileDescriptor::PseudoDevice(dev) => {
+            return FileStat {
+                dev: dev.dev,
+                ino: dev.ino,
+                kind: NodeKind::CharacterDevice,
+                permissions: dev.mode,
+                nlink: 1,
+                uid: dev.uid,
+                gid: dev.gid,
+                rdev: dev.rdev,
+                size: 0,
+                access_nanos: 0,
+                modified_nanos: 0,
+                status_nanos: 0,
+            };
+        }
+        FileDescriptor::FifoRead(r) => {
+            let attrs = r.inode().attrs();
+            return FileStat {
+                dev: attrs.dev,
+                ino: attrs.ino,
+                kind: NodeKind::Fifo,
+                permissions: attrs.mode,
+                nlink: 1,
+                uid: attrs.uid,
+                gid: attrs.gid,
+                rdev: 0,
+                size: 0,
+                access_nanos: 0,
+                modified_nanos: 0,
+                status_nanos: 0,
+            };
+        }
+        FileDescriptor::FifoWrite(w) => {
+            let attrs = w.inode().attrs();
+            return FileStat {
+                dev: attrs.dev,
+                ino: attrs.ino,
+                kind: NodeKind::Fifo,
+                permissions: attrs.mode,
+                nlink: 1,
+                uid: attrs.uid,
+                gid: attrs.gid,
+                rdev: 0,
+                size: 0,
+                access_nanos: 0,
+                modified_nanos: 0,
+                status_nanos: 0,
+            };
+        }
+        FileDescriptor::FifoReadWrite(rw) => {
+            let attrs = rw.inode().attrs();
+            return FileStat {
+                dev: attrs.dev,
+                ino: attrs.ino,
+                kind: NodeKind::Fifo,
+                permissions: attrs.mode,
+                nlink: 1,
+                uid: attrs.uid,
+                gid: attrs.gid,
+                rdev: 0,
+                size: 0,
+                access_nanos: 0,
+                modified_nanos: 0,
+                status_nanos: 0,
+            };
+        }
+        FileDescriptor::PtyMaster(master) => {
+            let (uid, gid, _) = master.attrs();
+            return FileStat {
+                dev: 1,
+                ino: 1,
+                kind: NodeKind::CharacterDevice,
+                permissions: 0o666,
+                nlink: 1,
+                uid,
+                gid,
+                rdev: helios_unix::encode_dev(helios_unix::CHAR_MAJOR_TTY, 2),
+                size: 0,
+                access_nanos: 0,
+                modified_nanos: 0,
+                status_nanos: 0,
+            };
+        }
+        FileDescriptor::PtySlave(slave) => {
+            let (uid, gid, mode) = slave.attrs();
+            return FileStat {
+                dev: 1,
+                ino: u64::from(slave.index()) + 3,
+                kind: NodeKind::CharacterDevice,
+                permissions: mode,
+                nlink: 1,
+                uid,
+                gid,
+                rdev: helios_unix::encode_dev(
+                    helios_unix::CHAR_MAJOR_UNIX98_PTY_SLAVE,
+                    slave.index(),
+                ),
+                size: 0,
+                access_nanos: 0,
+                modified_nanos: 0,
+                status_nanos: 0,
+            };
+        }
+        _ => {}
+    }
     let (kind, permissions, uid, gid) = match &entry.descriptor {
         FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } => {
             let attrs = inode.attrs();
@@ -1111,6 +1563,12 @@ fn synthetic_stat<R: Resources, T: tty::Tty>(entry: &Entry<R>, tty: &T) -> FileS
         FileDescriptor::Socket(_) => (NodeKind::Socket, 0o777, 0, 0),
         FileDescriptor::Event(_) | FileDescriptor::Epoll(_) => (NodeKind::File, 0o600, 0, 0),
         FileDescriptor::File(_) | FileDescriptor::Preopen { .. } => (NodeKind::File, 0o644, 0, 0),
+        FileDescriptor::PseudoDevice(_)
+        | FileDescriptor::FifoRead(_)
+        | FileDescriptor::FifoWrite(_)
+        | FileDescriptor::FifoReadWrite(_)
+        | FileDescriptor::PtyMaster(_)
+        | FileDescriptor::PtySlave(_) => unreachable!("handled above"),
     };
     FileStat {
         dev: 1,
@@ -1207,16 +1665,26 @@ pub(super) async fn newfstatat<R: Resources, M: UserMemory, F: Filesystem<R>, T:
             Ok(base) => base,
             Err(err) => return err,
         };
-        let cwd = process.shared.cwd.lock().clone();
         let creds = process_creds(process);
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        let (cwd, resolved_path) =
+            match resolve_in_chroot(process, base.as_ref(), &path, follow, &creds, fs).await {
+                Ok(pair) => pair,
+                Err(err) => return err,
+            };
+        let stat_base = if resolved_path.starts_with('/') {
+            None
+        } else {
+            base.as_ref()
+        };
         match fs
-            .stat_path(base.as_ref(), &cwd, &path, follow, &creds)
+            .stat_path(stat_base, &cwd, &resolved_path, follow, &creds)
             .await
         {
             Ok((stat, _)) => stat,
             Err(FsOpError::Fs(FsError::NoEntry))
-                if is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
+                if fs.has_synthetic_dev_fallback()
+                    && is_dev_null_path(stat_base, &cwd, &resolved_path, fs) =>
             {
                 if path.ends_with('/') {
                     return errno(ENOTDIR);
@@ -1296,16 +1764,26 @@ pub(super) async fn statx<R: Resources, M: UserMemory, F: Filesystem<R>, T: tty:
             Ok(base) => base,
             Err(err) => return err,
         };
-        let cwd = process.shared.cwd.lock().clone();
         let creds = process_creds(process);
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        let (cwd, resolved_path) =
+            match resolve_in_chroot(process, base.as_ref(), &path, follow, &creds, fs).await {
+                Ok(pair) => pair,
+                Err(err) => return err,
+            };
+        let stat_base = if resolved_path.starts_with('/') {
+            None
+        } else {
+            base.as_ref()
+        };
         match fs
-            .stat_path(base.as_ref(), &cwd, &path, follow, &creds)
+            .stat_path(stat_base, &cwd, &resolved_path, follow, &creds)
             .await
         {
             Ok((stat, _)) => stat,
             Err(FsOpError::Fs(FsError::NoEntry))
-                if is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
+                if fs.has_synthetic_dev_fallback()
+                    && is_dev_null_path(stat_base, &cwd, &resolved_path, fs) =>
             {
                 if path.ends_with('/') {
                     return errno(ENOTDIR);
@@ -1349,15 +1827,24 @@ pub(super) async fn faccessat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
     let use_effective = flags & AT_EACCESS != 0;
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, base.as_ref(), &path, follow, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_base = if resolved_path.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
     match fs
         .access_path(
-            base.as_ref(),
+            eff_base,
             &cwd,
-            &path,
+            &resolved_path,
             AccessCheck {
                 read: mode & 4 != 0,
                 write: mode & 2 != 0,
@@ -1371,7 +1858,8 @@ pub(super) async fn faccessat<R: Resources, M: UserMemory, F: Filesystem<R>>(
     {
         Ok(()) => 0,
         Err(FsOpError::Fs(FsError::NoEntry))
-            if is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
+            if fs.has_synthetic_dev_fallback()
+                && is_dev_null_path(eff_base, &cwd, &resolved_path, fs) =>
         {
             if path.ends_with('/') {
                 errno(ENOTDIR)
@@ -1423,9 +1911,21 @@ pub(super) async fn readlinkat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
-    let target = match fs.read_link(base.as_ref(), &cwd, &path, &creds).await {
+    let (cwd, resolved_path) = if path.is_empty() {
+        (process.shared.cwd.lock().clone(), path)
+    } else {
+        match resolve_in_chroot(process, base.as_ref(), &path, false, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        }
+    };
+    let eff_base = if resolved_path.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
+    let target = match fs.read_link(eff_base, &cwd, &resolved_path, &creds).await {
         Ok(target) => target,
         Err(error) => return fs_errno(error),
     };
@@ -1473,10 +1973,19 @@ pub(super) async fn mkdirat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, base.as_ref(), &path, false, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_base = if resolved_path.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
     match fs
-        .mkdir(base.as_ref(), &cwd, &path, mode, umask, &creds)
+        .mkdir(eff_base, &cwd, &resolved_path, mode, umask, &creds)
         .await
     {
         Ok(()) => 0,
@@ -1521,13 +2030,22 @@ pub(super) async fn unlinkat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, base.as_ref(), &path, false, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_base = if resolved_path.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
     match fs
         .unlink(
-            base.as_ref(),
+            eff_base,
             &cwd,
-            &path,
+            &resolved_path,
             flags & AT_REMOVEDIR != 0,
             &creds,
         )
@@ -1590,14 +2108,33 @@ pub(super) async fn renameat2<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
+    let (cwd, resolved_old) =
+        match resolve_in_chroot(process, old_base.as_ref(), &old_path, false, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let (_, resolved_new) =
+        match resolve_in_chroot(process, new_base.as_ref(), &new_path, false, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_old = if resolved_old.starts_with('/') {
+        None
+    } else {
+        old_base.as_ref()
+    };
+    let eff_new = if resolved_new.starts_with('/') {
+        None
+    } else {
+        new_base.as_ref()
+    };
     match fs
         .rename(
-            old_base.as_ref(),
-            &old_path,
-            new_base.as_ref(),
-            &new_path,
+            eff_old,
+            &resolved_old,
+            eff_new,
+            &resolved_new,
             &cwd,
             mode,
             &creds,
@@ -1664,17 +2201,49 @@ pub(super) async fn linkat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
-    match fs
-        .link(
+    let follow_old = flags & AT_SYMLINK_FOLLOW != 0;
+    let (cwd, resolved_old) = if old_path.is_empty() {
+        (process.shared.cwd.lock().clone(), old_path)
+    } else {
+        match resolve_in_chroot(
+            process,
             old_base.as_ref(),
             &old_path,
-            new_base.as_ref(),
-            &new_path,
+            follow_old,
+            &creds,
+            fs,
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        }
+    };
+    let (_, resolved_new) =
+        match resolve_in_chroot(process, new_base.as_ref(), &new_path, false, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_old = if resolved_old.starts_with('/') {
+        None
+    } else {
+        old_base.as_ref()
+    };
+    let eff_new = if resolved_new.starts_with('/') {
+        None
+    } else {
+        new_base.as_ref()
+    };
+    match fs
+        .link(
+            eff_old,
+            &resolved_old,
+            eff_new,
+            &resolved_new,
             &cwd,
             LinkOptions {
-                follow: flags & AT_SYMLINK_FOLLOW != 0,
+                follow: follow_old,
                 empty_path,
             },
             &creds,
@@ -1730,10 +2299,19 @@ pub(super) async fn symlinkat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
+    let (cwd, resolved_link) =
+        match resolve_in_chroot(process, base.as_ref(), &link_path, false, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_base = if resolved_link.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
     match fs
-        .symlink(&target, base.as_ref(), &cwd, &link_path, &creds)
+        .symlink(&target, eff_base, &cwd, &resolved_link, &creds)
         .await
     {
         Ok(()) => 0,
@@ -1846,11 +2424,28 @@ pub(super) async fn utimensat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, base.as_ref(), &path, follow, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_base = if resolved_path.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
     match fs
-        .set_times_path(base.as_ref(), &cwd, &path, follow, access, modified, &creds)
+        .set_times_path(
+            eff_base,
+            &cwd,
+            &resolved_path,
+            follow,
+            access,
+            modified,
+            &creds,
+        )
         .await
     {
         Ok(()) => 0,
@@ -1871,9 +2466,13 @@ pub(super) async fn chdir<R: Resources, M: UserMemory, F: Filesystem<R>>(
     if path.is_empty() {
         return errno(ENOENT);
     }
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
-    let (stat, canonical) = match fs.stat_path(None, &cwd, &path, true, &creds).await {
+    let (cwd, resolved_path) = match resolve_in_chroot(process, None, &path, true, &creds, fs).await
+    {
+        Ok(pair) => pair,
+        Err(err) => return err,
+    };
+    let (stat, canonical) = match fs.stat_path(None, &cwd, &resolved_path, true, &creds).await {
         Ok(pair) => pair,
         Err(error) => return fs_errno(error),
     };
@@ -1884,7 +2483,7 @@ pub(super) async fn chdir<R: Resources, M: UserMemory, F: Filesystem<R>>(
         .access_path(
             None,
             &cwd,
-            &path,
+            &resolved_path,
             AccessCheck {
                 read: false,
                 write: false,
@@ -1937,12 +2536,22 @@ pub(super) fn getcwd<R: Resources, M: UserMemory>(
     let buf = args[0];
     let size = args[1] as usize;
     let cwd = process.shared.cwd.lock().clone();
-    let needed = cwd.len() + 1;
+    let root = process.shared.root.lock().clone();
+    let visible = if root == "/" {
+        cwd
+    } else if cwd == root {
+        String::from("/")
+    } else if path_within_root(&cwd, &root) {
+        String::from(&cwd[root.len()..])
+    } else {
+        alloc::format!("(unreachable){cwd}")
+    };
+    let needed = visible.len() + 1;
     if size < needed {
         return errno(ERANGE);
     }
     let mut out = Vec::with_capacity(needed);
-    out.extend_from_slice(cwd.as_bytes());
+    out.extend_from_slice(visible.as_bytes());
     out.push(0);
     match memory.write(buf, &out) {
         Ok(()) => needed as u64,
@@ -2196,11 +2805,66 @@ pub(super) async fn write_file<R: Resources, M: VirtualMemory, F: Filesystem<R>>
     written
 }
 
-pub(super) async fn pread64<R: Resources, M: UserMemory, F: Filesystem<R>>(
+fn is_seekable_mem_device<R: Resources>(entry: &Entry<R>) -> bool {
+    matches!(entry.descriptor, FileDescriptor::NullDevice)
+        || matches!(
+            entry.descriptor,
+            FileDescriptor::PseudoDevice(dev)
+                if matches!(
+                    dev.kind,
+                    helios_unix::PseudoDeviceKind::Null
+                        | helios_unix::PseudoDeviceKind::Zero
+                        | helios_unix::PseudoDeviceKind::Full
+                        | helios_unix::PseudoDeviceKind::Random
+                        | helios_unix::PseudoDeviceKind::Urandom
+                )
+        )
+}
+
+/// Rewrites `mmap(2)` arguments targeting `/dev/zero` into an anonymous
+/// zero-filled mapping after enforcing descriptor read/write permissions.
+pub(super) fn prepare_mmap_pseudo_zero<R: Resources>(
+    process: &Process<R>,
+    args: [u64; 6],
+) -> Result<[u64; 6], u64> {
+    const MAP_TYPE: u64 = 0x0f;
+    const MAP_SHARED: u64 = 0x01;
+    const MAP_SHARED_VALIDATE: u64 = 0x03;
+    const MAP_ANONYMOUS: u64 = 0x20;
+    const PROT_WRITE: u64 = 0x2;
+
+    let [hint, length, prot, flags, fd_raw, offset] = args;
+    if flags & MAP_ANONYMOUS != 0 {
+        return Ok(args);
+    }
+    let fd = fd_raw as u32 as i32;
+    let Some(entry) = process.shared.descriptors.lock().get_entry(fd).cloned() else {
+        return Ok(args);
+    };
+    if entry.fdflags() & FDFLAG_PATH != 0 {
+        return Ok(args);
+    }
+    let FileDescriptor::PseudoDevice(dev) = entry.descriptor else {
+        return Ok(args);
+    };
+    if dev.kind != helios_unix::PseudoDeviceKind::Zero {
+        return Ok(args);
+    }
+    if !dev.readable {
+        return Err(errno(EACCES));
+    }
+    let is_shared = matches!(flags & MAP_TYPE, MAP_SHARED | MAP_SHARED_VALIDATE);
+    if is_shared && (prot & PROT_WRITE != 0) && !dev.writable {
+        return Err(errno(EACCES));
+    }
+    Ok([hint, length, prot, flags | MAP_ANONYMOUS, fd_raw, offset])
+}
+
+pub(super) async fn pread64<R: Resources, M: UserMemory, O: Stdio + System + Filesystem<R>>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
-    fs: &mut F,
+    fs: &mut O,
 ) -> u64 {
     let Some(entry) = process
         .shared
@@ -2211,6 +2875,15 @@ pub(super) async fn pread64<R: Resources, M: UserMemory, F: Filesystem<R>>(
     else {
         return errno(EBADF);
     };
+    if is_seekable_mem_device::<R>(&entry) {
+        if (args[3] as i64) < 0 {
+            return errno(EINVAL);
+        }
+        return match io::read_resource::<R, _, _>(process, &entry, args, memory, fs).await {
+            SyscallOutcome::Return(n) => n,
+            _ => errno(EINTR),
+        };
+    }
     if entry_file::<R>(&entry).is_none() {
         return errno(ESPIPE);
     }
@@ -2226,11 +2899,11 @@ pub(super) async fn pread64<R: Resources, M: UserMemory, F: Filesystem<R>>(
     .await
 }
 
-pub(super) async fn pwrite64<R: Resources, M: VirtualMemory, F: Filesystem<R>>(
+pub(super) async fn pwrite64<R: Resources, M: VirtualMemory, O: Stdio + System + Filesystem<R>>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
-    fs: &mut F,
+    fs: &mut O,
 ) -> u64 {
     let Some(entry) = process
         .shared
@@ -2241,6 +2914,15 @@ pub(super) async fn pwrite64<R: Resources, M: VirtualMemory, F: Filesystem<R>>(
     else {
         return errno(EBADF);
     };
+    if is_seekable_mem_device::<R>(&entry) {
+        if (args[3] as i64) < 0 {
+            return errno(EINVAL);
+        }
+        return match io::write_resource::<R, _, _>(process, &entry, args, memory, fs).await {
+            SyscallOutcome::Return(n) => n,
+            _ => errno(EINTR),
+        };
+    }
     if entry_file::<R>(&entry).is_none() {
         return errno(ESPIPE);
     }
@@ -2294,7 +2976,7 @@ fn read_iovecs<M: UserMemory>(
 pub(super) async fn readv_common<
     R: Resources,
     M: UserMemory,
-    O: Stdio + Filesystem<R> + Network<R::Network>,
+    O: Stdio + System + Filesystem<R> + Network<R::Network>,
 >(
     process: &Process<R>,
     args: [u64; 6],
@@ -2315,7 +2997,10 @@ pub(super) async fn readv_common<
     else {
         return SyscallOutcome::Return(errno(EBADF));
     };
-    if explicit_offset.is_some() && entry_file::<R>(&entry).is_none() {
+    if explicit_offset.is_some()
+        && entry_file::<R>(&entry).is_none()
+        && !is_seekable_mem_device::<R>(&entry)
+    {
         return SyscallOutcome::Return(errno(ESPIPE));
     }
     if let Some(off) = explicit_offset
@@ -2421,7 +3106,7 @@ pub(super) async fn readv_common<
 pub(super) async fn writev_common<
     R: Resources,
     M: VirtualMemory,
-    O: Stdio + Filesystem<R> + Network<R::Network>,
+    O: Stdio + System + Filesystem<R> + Network<R::Network>,
 >(
     process: &Process<R>,
     args: [u64; 6],
@@ -2442,7 +3127,10 @@ pub(super) async fn writev_common<
     else {
         return SyscallOutcome::Return(errno(EBADF));
     };
-    if explicit_offset.is_some() && entry_file::<R>(&entry).is_none() {
+    if explicit_offset.is_some()
+        && entry_file::<R>(&entry).is_none()
+        && !is_seekable_mem_device::<R>(&entry)
+    {
         return SyscallOutcome::Return(errno(ESPIPE));
     }
     if let Some(off) = explicit_offset
@@ -2553,7 +3241,7 @@ pub(super) async fn lseek<R: Resources, F: Filesystem<R>>(
     if entry.fdflags() & FDFLAG_PATH != 0 {
         return errno(EBADF);
     }
-    if matches!(entry.descriptor, FileDescriptor::NullDevice) {
+    if is_seekable_mem_device::<R>(&entry) {
         return 0;
     }
     let Some(open) = entry_file::<R>(&entry) else {
@@ -2738,9 +3426,16 @@ pub(super) async fn truncate<R: Resources, M: UserMemory, F: Filesystem<R>>(
     if path.is_empty() {
         return errno(ENOENT);
     }
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
-    match fs.set_size_path(&cwd, &path, length as u64, &creds).await {
+    let (cwd, resolved_path) = match resolve_in_chroot(process, None, &path, true, &creds, fs).await
+    {
+        Ok(pair) => pair,
+        Err(err) => return err,
+    };
+    match fs
+        .set_size_path(&cwd, &resolved_path, length as u64, &creds)
+        .await
+    {
         Ok(()) => 0,
         Err(error) => fs_errno(error),
     }
@@ -2770,32 +3465,43 @@ pub(super) async fn fsync<R: Resources, M: UserMemory, F: Filesystem<R>>(
     }
 }
 
-pub(super) fn close_range<R: Resources>(process: &Process<R>, args: [u64; 6]) -> u64 {
+pub(super) fn close_range<R: Resources, F: Filesystem<R>>(
+    process: &Process<R>,
+    args: [u64; 6],
+    fs: &F,
+) -> u64 {
     let first = args[0] as u32;
     let last = args[1] as u32;
     let flags = args[2] as u32 as u64;
     if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || first > last {
         return errno(EINVAL);
     }
-    let mut table = process.shared.descriptors.lock();
-    let len = table.entries.len();
-    let start = (first as usize).min(len);
-    let end = (last as usize).min(len.saturating_sub(1));
-    if start >= len {
-        return 0;
+    let mut closed_entries = Vec::new();
+    {
+        let mut table = process.shared.descriptors.lock();
+        let len = table.entries.len();
+        let start = (first as usize).min(len);
+        let end = (last as usize).min(len.saturating_sub(1));
+        if start >= len {
+            return 0;
+        }
+        if flags & CLOSE_RANGE_CLOEXEC != 0 {
+            for slot in &mut table.entries[start..=end] {
+                if let Some(entry) = slot.as_mut() {
+                    entry.close_on_exec = true;
+                }
+            }
+        } else {
+            for fd in start..=end {
+                if let Some(entry) = table.entries[fd].clone() {
+                    let _ = table.close(fd as i32);
+                    closed_entries.push(entry);
+                }
+            }
+        }
     }
-    if flags & CLOSE_RANGE_CLOEXEC != 0 {
-        for slot in &mut table.entries[start..=end] {
-            if let Some(entry) = slot.as_mut() {
-                entry.close_on_exec = true;
-            }
-        }
-    } else {
-        for fd in start..=end {
-            if table.entries[fd].is_some() {
-                let _ = table.close(fd as i32);
-            }
-        }
+    for entry in &closed_entries {
+        super::fs_extra::release_posix_locks_for_entry(process, entry, fs);
     }
     0
 }
@@ -2844,10 +3550,19 @@ pub(super) async fn fchmodat2<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, base.as_ref(), &path, follow, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_base = if resolved_path.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
     match fs
-        .chmod_path(base.as_ref(), &cwd, &path, follow, mode, &creds)
+        .chmod_path(eff_base, &cwd, &resolved_path, follow, mode, &creds)
         .await
     {
         Ok(()) => 0,
@@ -2885,9 +3600,15 @@ pub(super) async fn fchmod<R: Resources, F: Filesystem<R>>(
         return errno(EBADF);
     }
     let creds = process_creds(process);
-    if let FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } =
-        &entry.descriptor
-    {
+    if let Some(inode) = match &entry.descriptor {
+        FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } => {
+            Some(inode)
+        }
+        FileDescriptor::FifoRead(r) => Some(r.inode()),
+        FileDescriptor::FifoWrite(w) => Some(w.inode()),
+        FileDescriptor::FifoReadWrite(rw) => Some(rw.inode()),
+        _ => None,
+    } {
         let attrs = inode.attrs();
         let meta = permissions::InodeMeta {
             kind: NodeKind::Fifo,
@@ -2898,6 +3619,22 @@ pub(super) async fn fchmod<R: Resources, F: Filesystem<R>>(
         return match permissions::check_chmod(&creds, meta, mode) {
             Ok(new_mode) => {
                 inode.set_mode(new_mode);
+                0
+            }
+            Err(error) => fs_errno(error),
+        };
+    }
+    if let FileDescriptor::PtySlave(slave) = &entry.descriptor {
+        let (uid, gid, cur_mode) = slave.attrs();
+        let meta = permissions::InodeMeta {
+            kind: NodeKind::CharacterDevice,
+            uid,
+            gid,
+            mode: cur_mode,
+        };
+        return match permissions::check_chmod(&creds, meta, mode) {
+            Ok(new_mode) => {
+                slave.set_mode(new_mode);
                 0
             }
             Err(error) => fs_errno(error),
@@ -2946,9 +3683,15 @@ pub(super) async fn fchownat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         let Some(entry) = process.shared.descriptors.lock().get_entry(dirfd).cloned() else {
             return errno(EBADF);
         };
-        if let FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } =
-            &entry.descriptor
-        {
+        if let Some(inode) = match &entry.descriptor {
+            FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } => {
+                Some(inode)
+            }
+            FileDescriptor::FifoRead(r) => Some(r.inode()),
+            FileDescriptor::FifoWrite(w) => Some(w.inode()),
+            FileDescriptor::FifoReadWrite(rw) => Some(rw.inode()),
+            _ => None,
+        } {
             return chown_pipe(inode, &creds, uid, gid);
         }
         let Some(open) = entry_file::<R>(&entry) else {
@@ -2963,10 +3706,19 @@ pub(super) async fn fchownat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, base.as_ref(), &path, follow, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_base = if resolved_path.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
     match fs
-        .chown_path(base.as_ref(), &cwd, &path, follow, uid, gid, &creds)
+        .chown_path(eff_base, &cwd, &resolved_path, follow, uid, gid, &creds)
         .await
     {
         Ok(()) => 0,
@@ -3041,10 +3793,32 @@ pub(super) async fn fchown<R: Resources, F: Filesystem<R>>(
         return errno(EBADF);
     }
     let creds = process_creds(process);
-    if let FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } =
-        &entry.descriptor
-    {
+    if let Some(inode) = match &entry.descriptor {
+        FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } => {
+            Some(inode)
+        }
+        FileDescriptor::FifoRead(r) => Some(r.inode()),
+        FileDescriptor::FifoWrite(w) => Some(w.inode()),
+        FileDescriptor::FifoReadWrite(rw) => Some(rw.inode()),
+        _ => None,
+    } {
         return chown_pipe(inode, &creds, uid, gid);
+    }
+    if let FileDescriptor::PtySlave(slave) = &entry.descriptor {
+        let (cur_uid, cur_gid, cur_mode) = slave.attrs();
+        let meta = permissions::InodeMeta {
+            kind: NodeKind::CharacterDevice,
+            uid: cur_uid,
+            gid: cur_gid,
+            mode: cur_mode,
+        };
+        return match permissions::check_chown(&creds, meta, uid, gid) {
+            Ok(result) => {
+                slave.set_owner(result.uid, result.gid);
+                0
+            }
+            Err(error) => fs_errno(error),
+        };
     }
     let Some(open) = entry_file::<R>(&entry) else {
         return errno(EINVAL);
@@ -3082,9 +3856,27 @@ pub(super) async fn mknodat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, base.as_ref(), &path, false, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_base = if resolved_path.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
     match fs
-        .mknod(base.as_ref(), &cwd, &path, kind, mode, umask, rdev, &creds)
+        .mknod(
+            eff_base,
+            &cwd,
+            &resolved_path,
+            kind,
+            mode,
+            umask,
+            rdev,
+            &creds,
+        )
         .await
     {
         Ok(()) => 0,
@@ -3147,10 +3939,14 @@ pub(super) async fn setxattr_path<R: Resources, M: UserMemory, F: Filesystem<R>>
     if !value.is_empty() && memory.read(args[2], &mut value).is_err() {
         return errno(EFAULT);
     }
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, None, &path, follow, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
     match fs
-        .set_xattr_path(&cwd, &path, follow, &name, &value, mode, &creds)
+        .set_xattr_path(&cwd, &resolved_path, follow, &name, &value, mode, &creds)
         .await
     {
         Ok(()) => 0,
@@ -3232,9 +4028,16 @@ pub(super) async fn getxattr_path<R: Resources, M: UserMemory, F: Filesystem<R>>
         Ok(name) => name,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
-    match fs.get_xattr_path(&cwd, &path, follow, &name, &creds).await {
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, None, &path, follow, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    match fs
+        .get_xattr_path(&cwd, &resolved_path, follow, &name, &creds)
+        .await
+    {
         Ok(data) => finish_xattr_read(memory, args[2], args[3], &data),
         Err(error) => fs_errno(error),
     }
@@ -3294,9 +4097,16 @@ pub(super) async fn listxattr_path<R: Resources, M: UserMemory, F: Filesystem<R>
     if path.is_empty() {
         return errno(ENOENT);
     }
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
-    let names = match fs.list_xattrs_path(&cwd, &path, follow, &creds).await {
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, None, &path, follow, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let names = match fs
+        .list_xattrs_path(&cwd, &resolved_path, follow, &creds)
+        .await
+    {
         Ok(names) => names,
         Err(error) => return fs_errno(error),
     };
@@ -3353,10 +4163,14 @@ pub(super) async fn removexattr_path<R: Resources, M: UserMemory, F: Filesystem<
         Ok(name) => name,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, None, &path, follow, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
     match fs
-        .remove_xattr_path(&cwd, &path, follow, &name, &creds)
+        .remove_xattr_path(&cwd, &resolved_path, follow, &name, &creds)
         .await
     {
         Ok(()) => 0,

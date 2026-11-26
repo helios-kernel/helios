@@ -100,7 +100,7 @@ pub(crate) enum KernelSymbolsError {
     },
     #[error(
         "kernel image {path} carries no DWARF (.debug_info), so its addresses cannot be \
-         expanded into inline chains; build it with `helios-inspector vm` and one of \
+         expanded into inline chains; build it with `helios vm` and one of \
          --release, --profile-generate, --profile-use or --kernel-debug, which keep debuginfo"
     )]
     NoDebugInfo { path: String },

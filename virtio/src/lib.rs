@@ -31,8 +31,8 @@ pub use balloon::{
     BALLOON_PAGE_SIZE, FREE_PAGE_CMD_ID_DONE, FREE_PAGE_CMD_ID_STOP, VirtioBalloonDevice,
 };
 pub use block::{
-    BlockRequestCounts, QueueAffinity, SECTOR_SIZE, VirtioBlockDevice, VirtioBlockResource,
-    VirtioBlockSwapBackend, VirtioBlockSwapError, VirtioBlockSwapToken,
+    BlockRequestCounts, PolledBlockError, QueueAffinity, SECTOR_SIZE, VirtioBlockDevice,
+    VirtioBlockResource, VirtioBlockSwapBackend, VirtioBlockSwapError, VirtioBlockSwapToken,
 };
 pub use bus::{
     DeviceBus, IdentityDmaBuffer, IdentityDmaPool, MmioBus, OffsetDmaBuffer, OffsetDmaPool,

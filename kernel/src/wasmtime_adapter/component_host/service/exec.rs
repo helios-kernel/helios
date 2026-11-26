@@ -2102,7 +2102,7 @@ where
         memory_pages,
         descriptors: store.data().descriptors.snapshot(),
         filesystem: store.data().filesystem.root_layer(),
-        authority: store.data().effective_authority(),
+        authority: store.data().effective_authority().fork_inherited(),
         cwd: store.data().cwd.get(),
         arguments: store.data().arguments.clone(),
         environment: store.data().environment.clone(),
@@ -2280,7 +2280,7 @@ where
         ProgramLaunch::new(
             argv,
             environment,
-            store.data().effective_authority(),
+            store.data().effective_authority().fork_inherited(),
             Some(store.data().filesystem.clone()),
         ),
         output_mode,

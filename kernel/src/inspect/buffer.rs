@@ -22,14 +22,16 @@
 //! [`MAX_SEQLOCK_RETRIES`] attempts so an active or adversarial writer never
 //! stalls a reader.
 
+use alloc::collections::BinaryHeap;
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
+use core::cmp::Ordering as CmpOrdering;
 use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 use thiserror::Error;
 
-use super::InspectValue;
+use super::{InspectEntry, InspectValue};
+use crate::PrefixSet;
 
 /// Four-byte magic identifying a Helios inspect span header (`b"HINS"`).
 pub const INSPECT_HEADER_MAGIC: [u8; 4] = *b"HINS";
@@ -82,16 +84,9 @@ const VALUE_TAG_BLOB: u8 = 5;
 /// Validated outcome of one bounded lock-free read of a component inspect span.
 #[derive(Debug)]
 pub(crate) enum SpanReadOutcome {
-    Ok {
-        generation: u64,
-        entries: Vec<(String, InspectValue)>,
-    },
-    Busy {
-        generation: u64,
-    },
-    Corrupt {
-        generation: u64,
-    },
+    Ok { generation: u64, truncated: bool },
+    Busy { generation: u64 },
+    Corrupt { generation: u64 },
 }
 
 /// Validates a component publication name (one path segment under
@@ -172,14 +167,29 @@ fn parse_header_words(w0: u64, w1: u64, w2: u64, w3: u64, span_len: usize) -> Op
 }
 
 /// Performs a bounded, non-blocking lock-free read of a component inspect span
-/// starting at host virtual address `base` of byte length `span_len`.
+/// starting at host virtual address `base` of byte length `span_len`, reusing
+/// `scratch` across seqlock retries and materialising at most `max_entries`
+/// lexicographically smallest entries admitted by `prefixes` into `out`.
 ///
 /// # Safety
 ///
 /// `base..base + span_len` must remain mapped and resident for the entire
 /// duration of this call (enforced by holding the publication's read lock and
 /// the owning instance's swap read-pin after verifying residency).
-pub(crate) unsafe fn read_span_snapshot(base: usize, span_len: usize) -> SpanReadOutcome {
+#[expect(
+    clippy::too_many_arguments,
+    reason = "bounded lock-free span reader takes reusable scratch buffers alongside prefix filter and entry cap"
+)]
+pub(crate) unsafe fn read_span_snapshot(
+    base: usize,
+    span_len: usize,
+    scratch: &mut Vec<u8>,
+    path_buf: &mut String,
+    root_prefix: &str,
+    prefixes: &PrefixSet,
+    max_entries: usize,
+    out: &mut Vec<InspectEntry>,
+) -> SpanReadOutcome {
     let span_len = span_len.min(MAX_INSPECT_SPAN_BYTES);
     if !base.is_multiple_of(8)
         || !span_len.is_multiple_of(8)
@@ -214,19 +224,21 @@ pub(crate) unsafe fn read_span_snapshot(base: usize, span_len: usize) -> SpanRea
             };
         };
 
-        let mut payload = vec![0u8; header.payload_len];
+        // Reuse one scratch allocation across all seqlock retries and
+        // publications instead of allocating a fresh buffer per retry.
+        scratch.resize(header.payload_len, 0);
         let full_words = header.payload_len / 8;
         for index in 0..full_words {
             let word = load_aligned_word(base, 4 + index);
             let start = index * 8;
-            payload[start..start + 8].copy_from_slice(&word.to_le_bytes());
+            scratch[start..start + 8].copy_from_slice(&word.to_le_bytes());
         }
         let remainder = header.payload_len % 8;
         if remainder != 0 {
             let word = load_aligned_word(base, 4 + full_words);
             let bytes = word.to_le_bytes();
             let start = full_words * 8;
-            payload[start..start + remainder].copy_from_slice(&bytes[..remainder]);
+            scratch[start..start + remainder].copy_from_slice(&bytes[..remainder]);
         }
 
         fence(Ordering::Acquire);
@@ -236,10 +248,18 @@ pub(crate) unsafe fn read_span_snapshot(base: usize, span_len: usize) -> SpanRea
             continue;
         }
 
-        return match decode_payload(&payload, header.entry_count) {
-            Some(entries) => SpanReadOutcome::Ok {
+        return match decode_payload_bounded(
+            scratch,
+            header.entry_count,
+            path_buf,
+            root_prefix,
+            prefixes,
+            max_entries,
+            out,
+        ) {
+            Some(truncated) => SpanReadOutcome::Ok {
                 generation: header.generation,
-                entries,
+                truncated,
             },
             None => SpanReadOutcome::Corrupt {
                 generation: header.generation,
@@ -280,8 +300,70 @@ fn take_u64(slice: &mut &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(bytes))
 }
 
-fn decode_payload(mut bytes: &[u8], entry_count: usize) -> Option<Vec<(String, InspectValue)>> {
-    let mut entries = Vec::with_capacity(entry_count.min(64));
+#[derive(Clone, Copy)]
+enum BorrowedInspectValue<'a> {
+    Boolean(bool),
+    Signed64(i64),
+    Unsigned64(u64),
+    Float64(f64),
+    Text(&'a str),
+    Blob(&'a [u8]),
+}
+
+impl BorrowedInspectValue<'_> {
+    fn into_owned(self) -> InspectValue {
+        match self {
+            Self::Boolean(v) => InspectValue::Boolean(v),
+            Self::Signed64(v) => InspectValue::Signed64(v),
+            Self::Unsigned64(v) => InspectValue::Unsigned64(v),
+            Self::Float64(v) => InspectValue::Float64(v),
+            Self::Text(v) => InspectValue::Text(String::from(v)),
+            Self::Blob(v) => InspectValue::Blob(v.to_vec()),
+        }
+    }
+}
+
+/// Max-heap item ordered by `rel_path` so a bounded heap of size `max_entries`
+/// retains the `max_entries` lexicographically smallest admitted entries
+/// without allocating `String` or `Blob` payloads for displaced entries.
+struct BoundedCandidate<'a> {
+    rel_path: &'a str,
+    value: BorrowedInspectValue<'a>,
+}
+
+impl PartialEq for BoundedCandidate<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.rel_path == other.rel_path
+    }
+}
+
+impl Eq for BoundedCandidate<'_> {}
+
+impl PartialOrd for BoundedCandidate<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BoundedCandidate<'_> {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.rel_path.cmp(other.rel_path)
+    }
+}
+
+fn decode_payload_bounded(
+    mut bytes: &[u8],
+    entry_count: usize,
+    path_buf: &mut String,
+    root_prefix: &str,
+    prefixes: &PrefixSet,
+    max_entries: usize,
+    out: &mut Vec<InspectEntry>,
+) -> Option<bool> {
+    let mut winners: BinaryHeap<BoundedCandidate<'_>> =
+        BinaryHeap::with_capacity(max_entries.min(entry_count).min(64));
+    let mut truncated = false;
+
     for _ in 0..entry_count {
         let path_len = usize::from(take_u16(&mut bytes)?);
         let tag = take_u8(&mut bytes)?;
@@ -290,21 +372,23 @@ fn decode_payload(mut bytes: &[u8], entry_count: usize) -> Option<Vec<(String, I
             return None;
         }
         let path_bytes = take(&mut bytes, path_len)?;
-        let path = core::str::from_utf8(path_bytes).ok()?;
-        if !is_valid_relative_path(path) {
+        let rel_path = core::str::from_utf8(path_bytes).ok()?;
+        if !is_valid_relative_path(rel_path) {
             return None;
         }
         let value = match tag {
             VALUE_TAG_BOOLEAN => match take_u8(&mut bytes)? {
-                0 => InspectValue::Boolean(false),
-                1 => InspectValue::Boolean(true),
+                0 => BorrowedInspectValue::Boolean(false),
+                1 => BorrowedInspectValue::Boolean(true),
                 _ => return None,
             },
-            VALUE_TAG_SIGNED64 => {
-                InspectValue::Signed64(i64::from_le_bytes(take(&mut bytes, 8)?.try_into().ok()?))
+            VALUE_TAG_SIGNED64 => BorrowedInspectValue::Signed64(i64::from_le_bytes(
+                take(&mut bytes, 8)?.try_into().ok()?,
+            )),
+            VALUE_TAG_UNSIGNED64 => BorrowedInspectValue::Unsigned64(take_u64(&mut bytes)?),
+            VALUE_TAG_FLOAT64 => {
+                BorrowedInspectValue::Float64(f64::from_bits(take_u64(&mut bytes)?))
             }
-            VALUE_TAG_UNSIGNED64 => InspectValue::Unsigned64(take_u64(&mut bytes)?),
-            VALUE_TAG_FLOAT64 => InspectValue::Float64(f64::from_bits(take_u64(&mut bytes)?)),
             VALUE_TAG_TEXT => {
                 let len = take_u32(&mut bytes)? as usize;
                 if len > MAX_TEXT_VALUE_BYTES {
@@ -312,7 +396,7 @@ fn decode_payload(mut bytes: &[u8], entry_count: usize) -> Option<Vec<(String, I
                 }
                 let raw = take(&mut bytes, len)?;
                 let text = core::str::from_utf8(raw).ok()?;
-                InspectValue::Text(String::from(text))
+                BorrowedInspectValue::Text(text)
             }
             VALUE_TAG_BLOB => {
                 let len = take_u32(&mut bytes)? as usize;
@@ -320,16 +404,52 @@ fn decode_payload(mut bytes: &[u8], entry_count: usize) -> Option<Vec<(String, I
                     return None;
                 }
                 let raw = take(&mut bytes, len)?;
-                InspectValue::Blob(raw.to_vec())
+                BorrowedInspectValue::Blob(raw)
             }
             _ => return None,
         };
-        entries.push((String::from(path), value));
+
+        // Check admission against the reused path scratch buffer without
+        // allocating per-entry strings or blobs for skipped entries.
+        path_buf.clear();
+        path_buf.push_str(root_prefix);
+        path_buf.push('/');
+        path_buf.push_str(rel_path);
+        if !prefixes.admits(path_buf) {
+            continue;
+        }
+        if max_entries == 0 {
+            truncated = true;
+            continue;
+        }
+        if winners.len() < max_entries {
+            winners.push(BoundedCandidate { rel_path, value });
+        } else {
+            truncated = true;
+            if let Some(mut largest) = winners.peek_mut()
+                && rel_path < largest.rel_path
+            {
+                *largest = BoundedCandidate { rel_path, value };
+            }
+        }
     }
     if !bytes.is_empty() {
         return None;
     }
-    Some(entries)
+
+    let sorted = winners.into_sorted_vec();
+    out.reserve(sorted.len());
+    for candidate in sorted {
+        let mut full_path = String::with_capacity(root_prefix.len() + 1 + candidate.rel_path.len());
+        full_path.push_str(root_prefix);
+        full_path.push('/');
+        full_path.push_str(candidate.rel_path);
+        out.push(InspectEntry {
+            path: full_path,
+            value: candidate.value.into_owned(),
+        });
+    }
+    Some(truncated)
 }
 
 /// Why encoding an inspect buffer failed (used by tests and in-kernel writers).
