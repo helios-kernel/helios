@@ -194,9 +194,9 @@ pub use io::{
     MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS, PanicSerial, PollKey, PollRegistration,
     PollRegistry, PollRegistryError, PollSourceKind, RecordingConsole, SCRATCH_DISK_SERIAL,
     ScratchDisk, ScratchDiskStats, SerialReader, SharedDmaArena, TryRead, TryWrite,
-    admit_block_devices, byte_channel, emit_panic_report, install_block_devices,
-    install_scratch_swap, maintain_dma_arenas, read_debug_serial, read_serial, try_read_serial,
-    wake_queue_owners,
+    admit_block_devices, attach_panic_framebuffer, byte_channel, detach_panic_framebuffer,
+    emit_panic_report, install_block_devices, install_scratch_swap, maintain_dma_arenas,
+    read_debug_serial, read_serial, try_read_serial, wake_queue_owners,
 };
 pub use ipc::{
     IPC_MAX_CHUNK_BYTES, IpcEndpoint, IpcEndpointGrants, IpcError, IpcGrantError,

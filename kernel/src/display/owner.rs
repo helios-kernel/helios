@@ -72,6 +72,9 @@ where
     MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
     Device: DisplayDevice + Clone,
 {
+    // The native display driver now owns the scanout hardware; stop routing
+    // fatal panic text into the firmware GOP linear framebuffer.
+    crate::detach_panic_framebuffer();
     let (shared, control_rx, cursor_rx) = display_channels();
 
     {

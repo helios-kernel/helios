@@ -640,13 +640,49 @@ pub struct IdentityProfile {
     /// Optional hex-encoded 32-byte pinned `MachineIdentity` Ed25519 public key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_machine_public_key_hex: Option<String>,
+    /// Enrolled operator account backing this identity when resolved from
+    /// `~/.config/helios/accounts/<username>.toml`.
+    #[serde(skip)]
+    pub account: Option<crate::account::OperatorAccount>,
 }
 
 impl IdentityProfile {
+    /// Returns `true` when this profile holds either an Ed25519 secret key or
+    /// an enrolled hardware/software operator account.
+    #[must_use]
+    pub fn has_client_credentials(&self) -> bool {
+        self.account.is_some() || self.secret_key_hex.is_some()
+    }
+
+    /// Wraps an enrolled [`crate::account::OperatorAccount`] as an
+    /// [`IdentityProfile`] so `--identity <username>` works uniformly across
+    /// `helios` CLI commands.
+    #[must_use]
+    pub fn from_account(account: crate::account::OperatorAccount) -> Self {
+        Self {
+            name: account.username.clone(),
+            principal: account.username.clone(),
+            authority_url: None,
+            cert: None,
+            secret_key_hex: None,
+            capability_cert_postcard_hex: None,
+            expected_machine_public_key_hex: None,
+            account: Some(account),
+        }
+    }
+
     /// Converts this profile into a wire [`helios_inspector_protocol::auth::ClientIdentity`].
     pub fn to_client_identity(
         &self,
     ) -> Result<helios_inspector_protocol::auth::ClientIdentity, AuthError> {
+        if let Some(account) = &self.account {
+            return account
+                .to_client_identity()
+                .map_err(|err| AuthError::InvalidIdentity {
+                    name: self.name.clone(),
+                    detail: err.to_string(),
+                });
+        }
         let secret_hex =
             self.secret_key_hex
                 .as_deref()
@@ -708,18 +744,42 @@ impl IdentityProfile {
             .join(format!("{name}.toml"))
     }
 
-    /// Load an identity profile from a file path or profile name.
+    /// Load an identity profile from a file path, `~/.config/helios/identities/<name>.toml`,
+    /// or fall back to an enrolled operator account under `~/.config/helios/accounts/<username>.toml`.
     pub fn load(name_or_path: &str) -> Result<Self, AuthError> {
-        let path = if Path::new(name_or_path).exists() {
-            PathBuf::from(name_or_path)
-        } else {
-            Self::path_for(name_or_path)
-        };
-        let content = fs::read_to_string(&path).map_err(|source| AuthError::ReadIdentity {
-            path: path.clone(),
-            source,
-        })?;
-        toml::from_str(&content).map_err(|source| AuthError::ParseIdentity { path, source })
+        let direct = Path::new(name_or_path);
+        if direct.exists() {
+            let content = fs::read_to_string(direct).map_err(|source| AuthError::ReadIdentity {
+                path: direct.to_path_buf(),
+                source,
+            })?;
+            if let Ok(profile) = toml::from_str::<Self>(&content) {
+                return Ok(profile);
+            }
+            if let Ok(account) = crate::account::AccountStore::load_file(direct) {
+                return Ok(Self::from_account(account));
+            }
+            return toml::from_str(&content).map_err(|source| AuthError::ParseIdentity {
+                path: direct.to_path_buf(),
+                source,
+            });
+        }
+
+        let path = Self::path_for(name_or_path);
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                toml::from_str(&content).map_err(|source| AuthError::ParseIdentity { path, source })
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if let Ok(account) =
+                    crate::account::AccountStore::default_store().load(name_or_path)
+                {
+                    return Ok(Self::from_account(account));
+                }
+                Err(AuthError::ReadIdentity { path, source: err })
+            }
+            Err(source) => Err(AuthError::ReadIdentity { path, source }),
+        }
     }
 
     /// Persist this identity profile to disk with `0600` permissions on Unix.
@@ -927,12 +987,44 @@ mod tests {
             secret_key_hex: Some(seed_hex),
             capability_cert_postcard_hex: Some(cert_hex),
             expected_machine_public_key_hex: None,
+            account: None,
         };
         let security = profile.to_security_mode().expect("to_security_mode");
         assert!(matches!(
             security,
             crate::SecurityMode::Authenticated { ref identity, .. }
                 if matches!(identity.as_ref(), ClientIdentity::CapabilityCert { .. })
+        ));
+    }
+
+    #[test]
+    fn identity_profile_loads_operator_account_file_and_builds_security_mode() {
+        use crate::account::{AccountAuthenticatorChoice, AccountStore, CreateAccountRequest};
+        use helios_inspector_protocol::auth::ClientIdentity;
+
+        let dir = TempDir::new().expect("tempdir");
+        let store = AccountStore::new(dir.path().join("accounts"));
+        let account = store
+            .create(CreateAccountRequest::new(
+                "alice",
+                AccountAuthenticatorChoice::SoftwareP256,
+            ))
+            .expect("create software p256 account");
+
+        let account_path = store.path_for(&account.username);
+        let loaded = IdentityProfile::load(account_path.to_str().expect("utf8 path"))
+            .expect("IdentityProfile::load must accept operator account TOML");
+        assert_eq!(loaded.name, "alice");
+        assert_eq!(loaded.principal, "alice");
+        assert!(loaded.has_client_credentials());
+
+        let security = loaded
+            .to_security_mode()
+            .expect("account profile must convert to SecurityMode::Authenticated");
+        assert!(matches!(
+            security,
+            crate::SecurityMode::Authenticated { ref identity, .. }
+                if matches!(identity.as_ref(), ClientIdentity::Account { username, .. } if username == "alice")
         ));
     }
 }

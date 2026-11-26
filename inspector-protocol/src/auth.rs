@@ -11,11 +11,15 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use futures_io::{AsyncRead, AsyncWrite};
+use p256::ecdsa::{
+    Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey,
+};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
+use sha2::{Digest as _, Sha256, Sha512};
 use thiserror::Error;
 
 /// Default TCP port for `helios://` (`tcp+tls`) inspector endpoints.
@@ -23,6 +27,10 @@ pub const DEFAULT_INSPECTOR_TCP_PORT: u16 = 9443;
 
 /// Bootfs/VFS path where `inspector-host` loads its serialized [`AuthPolicy`].
 pub const INSPECTOR_POLICY_PATH: &str = "/etc/inspector/policy.postcard";
+
+/// Bootfs/VFS path where authorized operator accounts ([`AccountPolicy`]) are
+/// staged for on-screen console login and remote account authentication.
+pub const HELIOS_ACCOUNTS_POLICY_PATH: &str = "/etc/helios/accounts.postcard";
 
 /// Host-only filename (mode `0600`) holding the dev/test Ed25519 client seed
 /// paired with the public key written into [`INSPECTOR_POLICY_PATH`] by
@@ -32,6 +40,24 @@ pub const INSPECTOR_CLIENT_KEY_FILE: &str = "inspector-client-secret.key";
 /// Domain label passed to `helios:system/machine-identity.sign` when signing
 /// the inspector handshake challenge.
 pub const MACHINE_IDENTITY_HANDSHAKE_DOMAIN: &str = "inspector-handshake";
+
+/// Domain-separation prefix for on-screen guest terminal login challenges.
+pub const CONSOLE_LOGIN_DOMAIN: &[u8] = b"helios.console.login.v1\0";
+
+/// OpenSSH `SSHSIG` namespace used when signing Helios authentication
+/// challenges with FIDO2 `-sk` keys via `ssh-keygen -Y sign`.
+pub const FIDO2_SSHSIG_NAMESPACE: &str = "helios.auth";
+
+/// Default FIDO2 relying-party application string for Helios operator keys.
+pub const DEFAULT_FIDO2_APPLICATION: &str = "ssh:helios";
+
+/// CTAP2 / FIDO2 authenticator data flag bit 0: User Presence (physical touch).
+/// Defined in WebAuthn / CTAP2 authenticator data specification (bit 0 = 0x01).
+pub const FIDO2_FLAG_UP: u8 = 0x01;
+
+/// CTAP2 / FIDO2 authenticator data flag bit 2: User Verification (PIN / biometric).
+/// Defined in WebAuthn / CTAP2 authenticator data specification (bit 2 = 0x04).
+pub const FIDO2_FLAG_UV: u8 = 0x04;
 
 /// RFC 8446 `tls-exporter` label used to derive the 32-byte channel binding on
 /// `tcp+tls` inspector connections.
@@ -692,6 +718,285 @@ impl AuthPolicy {
     }
 }
 
+/// Supported operator authentication public-key algorithms.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AuthPublicKey {
+    /// Raw 32-byte Ed25519 verifying key.
+    Ed25519([u8; 32]),
+    /// SEC1-compressed 33-byte NIST P-256 public key (used by macOS Touch ID
+    /// and software P-256 keys).
+    P256(#[serde(with = "serde_bytes_33")] [u8; 33]),
+    /// FIDO2 security key using Ed25519 (`sk-ssh-ed25519@openssh.com`).
+    Fido2Ed25519 {
+        public_key: [u8; 32],
+        application: String,
+        require_uv: bool,
+    },
+    /// FIDO2 security key using NIST P-256 (`sk-ecdsa-sha2-nistp256@openssh.com`).
+    Fido2P256 {
+        #[serde(with = "serde_bytes_33")]
+        public_key: [u8; 33],
+        application: String,
+        require_uv: bool,
+    },
+}
+
+impl AuthPublicKey {
+    /// Validates the cryptographic point / key encoding and FIDO2 parameters.
+    pub fn validate(&self) -> Result<(), AuthError> {
+        match self {
+            Self::Ed25519(bytes) => {
+                VerifyingKey::from_bytes(bytes).map_err(|_| AuthError::Malformed {
+                    detail: "invalid Ed25519 public key".to_owned(),
+                })?;
+            }
+            Self::P256(sec1) => {
+                validate_compressed_p256_sec1(sec1)?;
+            }
+            Self::Fido2Ed25519 {
+                public_key,
+                application,
+                ..
+            } => {
+                if application.is_empty() {
+                    return Err(AuthError::Malformed {
+                        detail: "FIDO2 application string must not be empty".to_owned(),
+                    });
+                }
+                VerifyingKey::from_bytes(public_key).map_err(|_| AuthError::Malformed {
+                    detail: "invalid FIDO2 Ed25519 public key".to_owned(),
+                })?;
+            }
+            Self::Fido2P256 {
+                public_key,
+                application,
+                ..
+            } => {
+                if application.is_empty() {
+                    return Err(AuthError::Malformed {
+                        detail: "FIDO2 application string must not be empty".to_owned(),
+                    });
+                }
+                validate_compressed_p256_sec1(public_key)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Short stable algorithm identifier for diagnostics and CLI tables.
+    #[must_use]
+    pub const fn algorithm_name(&self) -> &'static str {
+        match self {
+            Self::Ed25519(_) => "ed25519",
+            Self::P256(_) => "p256",
+            Self::Fido2Ed25519 { .. } => "fido2-ed25519",
+            Self::Fido2P256 { .. } => "fido2-p256",
+        }
+    }
+
+    /// Raw public-key bytes (32 bytes for Ed25519, 33 bytes SEC1 compressed for P-256).
+    #[must_use]
+    pub fn raw_key_bytes(&self) -> &[u8] {
+        match self {
+            Self::Ed25519(pk) | Self::Fido2Ed25519 { public_key: pk, .. } => pk,
+            Self::P256(pk) | Self::Fido2P256 { public_key: pk, .. } => pk,
+        }
+    }
+
+    /// Canonical SHA-256 fingerprint covering the algorithm, key bytes, and
+    /// FIDO2 relying-party parameters.
+    #[must_use]
+    pub fn fingerprint_sha256(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.algorithm_name().as_bytes());
+        hasher.update([0u8]);
+        hasher.update(self.raw_key_bytes());
+        match self {
+            Self::Fido2Ed25519 {
+                application,
+                require_uv,
+                ..
+            }
+            | Self::Fido2P256 {
+                application,
+                require_uv,
+                ..
+            } => {
+                hasher.update((application.len() as u32).to_be_bytes());
+                hasher.update(application.as_bytes());
+                hasher.update([u8::from(*require_uv)]);
+            }
+            Self::Ed25519(_) | Self::P256(_) => {}
+        }
+        let digest = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        out
+    }
+}
+
+/// Hash algorithm recorded inside an OpenSSH `SSHSIG` signature envelope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SshSigHashAlg {
+    Sha256,
+    Sha512,
+}
+
+impl SshSigHashAlg {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sha256 => "sha256",
+            Self::Sha512 => "sha512",
+        }
+    }
+}
+
+/// How the signed challenge bytes are framed into the FIDO2 `clientDataHash`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Fido2MessageMode {
+    /// Native CTAP2 assertion where `clientDataHash = SHA256(message)`.
+    Direct,
+    /// OpenSSH `PROTOCOL.sshsig` + `PROTOCOL.u2f` assertion produced by
+    /// `ssh-keygen -Y sign -n helios.auth`, where
+    /// `clientDataHash = SHA256(sshsig_wrapper("helios.auth", hash_alg, message))`.
+    SshSig { hash_alg: SshSigHashAlg },
+}
+
+/// Cryptographic proof of possession for an [`AuthPublicKey`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthProof {
+    Ed25519(#[serde(with = "serde_bytes_64")] [u8; 64]),
+    /// Fixed-size 64-byte big-endian `r || s` ECDSA SHA-256 signature over NIST P-256.
+    P256(#[serde(with = "serde_bytes_64")] [u8; 64]),
+    /// FIDO2 Ed25519 hardware assertion (`SHA256(application) || flags || counter || clientDataHash`).
+    Fido2Ed25519 {
+        flags: u8,
+        counter: u32,
+        #[serde(with = "serde_bytes_64")]
+        signature: [u8; 64],
+        mode: Fido2MessageMode,
+    },
+    /// FIDO2 P-256 hardware assertion (`SHA256(application) || flags || counter || clientDataHash`),
+    /// with fixed-size 64-byte `r || s` signature.
+    Fido2P256 {
+        flags: u8,
+        counter: u32,
+        #[serde(with = "serde_bytes_64")]
+        signature: [u8; 64],
+        mode: Fido2MessageMode,
+    },
+}
+
+/// Authorized hardware-backed or software operator account.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizedAccount {
+    pub username: String,
+    pub public_key: AuthPublicKey,
+    pub grants: SessionGrants,
+    pub allowed_transports: TransportMask,
+}
+
+impl AuthorizedAccount {
+    /// Validates username, public key, and capability grants.
+    pub fn validate(&self) -> Result<(), AuthError> {
+        if self.username.is_empty() {
+            return Err(AuthError::Malformed {
+                detail: "authorized account username must not be empty".to_owned(),
+            });
+        }
+        self.public_key.validate()?;
+        self.grants.validate()?;
+        Ok(())
+    }
+}
+
+/// Companion policy file staged at [`HELIOS_ACCOUNTS_POLICY_PATH`] containing
+/// authorized operator accounts (Touch ID, FIDO2, P-256, Ed25519).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountPolicy {
+    pub version: u16,
+    pub accounts: Vec<AuthorizedAccount>,
+}
+
+impl AccountPolicy {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            version: AUTH_PROTOCOL_VERSION,
+            accounts: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn single_account(account: AuthorizedAccount) -> Self {
+        Self {
+            version: AUTH_PROTOCOL_VERSION,
+            accounts: vec![account],
+        }
+    }
+
+    pub fn encode_postcard(&self) -> Result<Vec<u8>, AuthError> {
+        for account in &self.accounts {
+            account.validate()?;
+        }
+        postcard::to_allocvec(self).map_err(|source| AuthError::Encode {
+            context: "AccountPolicy",
+            source,
+        })
+    }
+
+    pub fn decode_postcard(bytes: &[u8]) -> Result<Self, AuthError> {
+        let policy: Self = postcard::from_bytes(bytes).map_err(|source| AuthError::Decode {
+            context: "AccountPolicy",
+            source,
+        })?;
+        if policy.version != AUTH_PROTOCOL_VERSION {
+            return Err(AuthError::UnsupportedVersion {
+                version: policy.version,
+            });
+        }
+        for account in &policy.accounts {
+            account.validate()?;
+        }
+        Ok(policy)
+    }
+
+    #[must_use]
+    pub fn find_account(&self, username: &str) -> Option<&AuthorizedAccount> {
+        self.accounts.iter().find(|acct| acct.username == username)
+    }
+}
+
+/// Domain-separated on-screen guest terminal login challenge emitted by the
+/// guest console authenticator and bound to the guest's `MachineIdentity`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleLoginChallenge {
+    pub request_id: u64,
+    pub username: String,
+    pub machine_public_key: [u8; 32],
+    pub challenge_nonce: [u8; 32],
+    pub issued_at_unix: u64,
+}
+
+/// Client response proving possession of the operator account key for a
+/// [`ConsoleLoginChallenge`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleLoginProof {
+    pub request_id: u64,
+    pub username: String,
+    pub public_key: AuthPublicKey,
+    pub proof: AuthProof,
+}
+
+/// Verified operator account session returned by [`verify_console_login`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedAccountSession {
+    pub username: String,
+    pub public_key: AuthPublicKey,
+    pub grants: SessionGrants,
+}
+
 /// Signed body of a short-lived Authority CA [`CapabilityCert`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityCertPayload {
@@ -848,6 +1153,14 @@ pub enum ClientCredential {
         cert: CapabilityCert,
         attenuations: Vec<AttenuationLink>,
     },
+    /// Operator account backed by Touch ID (P-256), FIDO2 security key, or
+    /// software Ed25519/P-256 credentials.
+    Account {
+        username: String,
+        public_key: AuthPublicKey,
+        /// Optional narrower grants requested below the account's ceiling.
+        requested_grants: Option<SessionGrants>,
+    },
 }
 
 /// Client-to-server handshake opener sent before [`ServerHello`] so serial and
@@ -877,8 +1190,7 @@ pub struct ClientAuth {
     pub credential: ClientCredential,
     pub channel_binding: Option<[u8; 32]>,
     pub client_nonce: [u8; 32],
-    #[serde(with = "serde_bytes_64")]
-    pub proof_signature: [u8; 64],
+    pub proof: AuthProof,
 }
 
 /// Machine-readable reason code when `inspector-host` rejects authentication.
@@ -961,10 +1273,20 @@ pub enum AuthError {
     },
     #[error("client key is not authorized by inspector policy")]
     UnknownKey,
+    #[error("operator account `{username}` is not authorized")]
+    UnknownAccount { username: String },
     #[error("capability certificate issuer CA is not trusted")]
     UntrustedCa,
-    #[error("Ed25519 signature verification failed ({context})")]
+    #[error("signature verification failed ({context})")]
     InvalidSignature { context: &'static str },
+    #[error("FIDO2 authenticator assertion is missing required User Presence (UP) flag")]
+    UserPresenceRequired,
+    #[error("FIDO2 authenticator assertion is missing required User Verification (UV) flag")]
+    UserVerificationRequired,
+    #[error("login challenge mismatch: {detail}")]
+    ChallengeMismatch { detail: String },
+    #[error("client credential signing failed: {detail}")]
+    SigningFailed { detail: String },
     #[error("credential expired at unix timestamp {expires_at} (now {now})")]
     Expired { expires_at: u64, now: u64 },
     #[error("credential is not valid until unix timestamp {not_before} (now {now})")]
@@ -1018,9 +1340,12 @@ impl AuthError {
     pub const fn reject_code(&self) -> AuthRejectCode {
         match self {
             Self::UnsupportedVersion { .. } => AuthRejectCode::UnsupportedVersion,
-            Self::UnknownKey => AuthRejectCode::UnknownKey,
+            Self::UnknownKey | Self::UnknownAccount { .. } => AuthRejectCode::UnknownKey,
             Self::UntrustedCa => AuthRejectCode::UntrustedCa,
-            Self::InvalidSignature { .. } => AuthRejectCode::InvalidSignature,
+            Self::InvalidSignature { .. }
+            | Self::UserPresenceRequired
+            | Self::UserVerificationRequired
+            | Self::ChallengeMismatch { .. } => AuthRejectCode::InvalidSignature,
             Self::Expired { .. } => AuthRejectCode::Expired,
             Self::NotYetValid { .. } => AuthRejectCode::NotYetValid,
             Self::TtlExceeded { .. } => AuthRejectCode::TtlExceeded,
@@ -1033,12 +1358,19 @@ impl AuthError {
             Self::ChainTooDeep { .. } => AuthRejectCode::ChainTooDeep,
             Self::Malformed { .. } | Self::Decode { .. } => AuthRejectCode::Malformed,
             Self::Rejected { code, .. } => *code,
-            Self::Encode { .. } | Self::Io { .. } | Self::UnexpectedEof => AuthRejectCode::Internal,
+            Self::SigningFailed { .. }
+            | Self::Encode { .. }
+            | Self::Io { .. }
+            | Self::UnexpectedEof => AuthRejectCode::Internal,
         }
     }
 }
 
-/// Client-side Ed25519 credential used to authenticate a session.
+/// On-demand signing callback used by hardware-backed operator accounts
+/// (Touch ID, FIDO2 security keys, or software P-256/Ed25519 keys).
+pub type AccountProofSigner = Arc<dyn Fn(&[u8]) -> Result<AuthProof, AuthError> + Send + Sync>;
+
+/// Client-side credential used to authenticate a session.
 #[derive(Clone)]
 pub enum ClientIdentity {
     StaticKey {
@@ -1049,6 +1381,12 @@ pub enum ClientIdentity {
         signing_key: [u8; 32],
         cert: Box<CapabilityCert>,
         attenuations: Vec<AttenuationLink>,
+    },
+    Account {
+        username: String,
+        public_key: AuthPublicKey,
+        requested_grants: Option<SessionGrants>,
+        signer: AccountProofSigner,
     },
 }
 
@@ -1068,6 +1406,17 @@ impl std::fmt::Debug for ClientIdentity {
                 .debug_struct("ClientIdentity::CapabilityCert")
                 .field("principal", &cert.payload.principal)
                 .field("attenuations", &attenuations.len())
+                .finish(),
+            Self::Account {
+                username,
+                public_key,
+                requested_grants,
+                ..
+            } => f
+                .debug_struct("ClientIdentity::Account")
+                .field("username", username)
+                .field("algorithm", &public_key.algorithm_name())
+                .field("requested_grants", requested_grants)
                 .finish(),
         }
     }
@@ -1108,6 +1457,23 @@ impl ClientIdentity {
         }
     }
 
+    /// Creates an operator-account client identity whose challenges are signed
+    /// on demand by `signer` (e.g. Touch ID or a FIDO2 security key).
+    #[must_use]
+    pub fn from_account_signer(
+        username: impl Into<String>,
+        public_key: AuthPublicKey,
+        requested_grants: Option<SessionGrants>,
+        signer: AccountProofSigner,
+    ) -> Self {
+        Self::Account {
+            username: username.into(),
+            public_key,
+            requested_grants,
+            signer,
+        }
+    }
+
     /// Loads a raw 32-byte Ed25519 secret seed file (e.g. `inspector-client-secret.key`).
     pub fn from_seed_file(path: &std::path::Path) -> Result<Self, AuthError> {
         let bytes = std::fs::read(path).map_err(|source| AuthError::Io {
@@ -1128,16 +1494,34 @@ impl ClientIdentity {
 
     #[must_use]
     pub fn public_key(&self) -> [u8; 32] {
-        let seed = match self {
+        match self {
             Self::StaticKey { signing_key, .. } | Self::CapabilityCert { signing_key, .. } => {
-                signing_key
+                SigningKey::from_bytes(signing_key)
+                    .verifying_key()
+                    .to_bytes()
             }
-        };
-        SigningKey::from_bytes(seed).verifying_key().to_bytes()
+            Self::Account { public_key, .. } => public_key.fingerprint_sha256(),
+        }
+    }
+
+    /// Returns the typed [`AuthPublicKey`] for this client identity.
+    #[must_use]
+    pub fn auth_public_key(&self) -> AuthPublicKey {
+        match self {
+            Self::StaticKey { signing_key, .. } | Self::CapabilityCert { signing_key, .. } => {
+                AuthPublicKey::Ed25519(
+                    SigningKey::from_bytes(signing_key)
+                        .verifying_key()
+                        .to_bytes(),
+                )
+            }
+            Self::Account { public_key, .. } => public_key.clone(),
+        }
     }
 
     /// Returns a copy requesting strictly narrowed grants (offline attenuation
-    /// for [`Self::CapabilityCert`], or explicit narrowed request for static keys).
+    /// for [`Self::CapabilityCert`], or explicit narrowed request for static
+    /// keys and operator accounts).
     pub fn with_attenuated_grants(
         &self,
         grants: SessionGrants,
@@ -1198,6 +1582,22 @@ impl ClientIdentity {
                     attenuations: next_links,
                 })
             }
+            Self::Account {
+                username,
+                public_key,
+                requested_grants,
+                signer,
+            } => {
+                if let Some(existing) = requested_grants {
+                    grants.check_subset_of(existing)?;
+                }
+                Ok(Self::Account {
+                    username: username.clone(),
+                    public_key: public_key.clone(),
+                    requested_grants: Some(grants),
+                    signer: Arc::clone(signer),
+                })
+            }
         }
     }
 
@@ -1209,28 +1609,29 @@ impl ClientIdentity {
         channel_binding: Option<[u8; 32]>,
         client_nonce: [u8; 32],
     ) -> Result<ClientAuth, AuthError> {
-        let (signing_key, credential) = match self {
+        let credential = match self {
             Self::StaticKey {
-                signing_key,
-                requested_grants,
-            } => (
-                SigningKey::from_bytes(signing_key),
-                ClientCredential::StaticKey {
-                    public_key: self.public_key(),
-                    requested_grants: requested_grants.clone(),
-                },
-            ),
+                requested_grants, ..
+            } => ClientCredential::StaticKey {
+                public_key: self.public_key(),
+                requested_grants: requested_grants.clone(),
+            },
             Self::CapabilityCert {
-                signing_key,
-                cert,
-                attenuations,
-            } => (
-                SigningKey::from_bytes(signing_key),
-                ClientCredential::CapabilityCert {
-                    cert: (**cert).clone(),
-                    attenuations: attenuations.clone(),
-                },
-            ),
+                cert, attenuations, ..
+            } => ClientCredential::CapabilityCert {
+                cert: (**cert).clone(),
+                attenuations: attenuations.clone(),
+            },
+            Self::Account {
+                username,
+                public_key,
+                requested_grants,
+                ..
+            } => ClientCredential::Account {
+                username: username.clone(),
+                public_key: public_key.clone(),
+                requested_grants: requested_grants.clone(),
+            },
         };
         let proof_msg = client_auth_proof_message(
             hello.machine_public_key,
@@ -1240,12 +1641,18 @@ impl ClientIdentity {
             channel_binding,
             &credential,
         )?;
-        let sig = signing_key.sign(&proof_msg);
+        let proof = match self {
+            Self::StaticKey { signing_key, .. } | Self::CapabilityCert { signing_key, .. } => {
+                let sig = SigningKey::from_bytes(signing_key).sign(&proof_msg);
+                AuthProof::Ed25519(sig.to_bytes())
+            }
+            Self::Account { signer, .. } => signer(&proof_msg)?,
+        };
         Ok(ClientAuth {
             credential,
             channel_binding,
             client_nonce,
-            proof_signature: sig.to_bytes(),
+            proof,
         })
     }
 }
@@ -1386,6 +1793,28 @@ pub fn verify_client_auth(
     auth: &ClientAuth,
     now_unix: u64,
 ) -> Result<VerifiedSession, AuthError> {
+    verify_client_auth_with_accounts(
+        policy,
+        &[],
+        host_ceiling,
+        hello,
+        expected_channel_binding,
+        auth,
+        now_unix,
+    )
+}
+
+/// Verifies [`ClientAuth`] against `policy`, authorized operator `accounts`,
+/// and `host_ceiling` on `inspector-host`.
+pub fn verify_client_auth_with_accounts(
+    policy: &AuthPolicy,
+    accounts: &[AuthorizedAccount],
+    host_ceiling: &SessionGrants,
+    hello: &ServerHello,
+    expected_channel_binding: Option<[u8; 32]>,
+    auth: &ClientAuth,
+    now_unix: u64,
+) -> Result<VerifiedSession, AuthError> {
     if hello.protocol_version != AUTH_PROTOCOL_VERSION {
         return Err(AuthError::UnsupportedVersion {
             version: hello.protocol_version,
@@ -1404,7 +1833,7 @@ pub fn verify_client_auth(
         }
     }
 
-    let (principal, leaf_public_key, effective_grants) = match &auth.credential {
+    let (principal, leaf_key, leaf_public_key, effective_grants) = match &auth.credential {
         ClientCredential::StaticKey {
             public_key,
             requested_grants,
@@ -1424,7 +1853,12 @@ pub fn verify_client_auth(
                 None => entry.grants.clone(),
             };
             grants.check_subset_of(host_ceiling)?;
-            (entry.label.clone(), *public_key, grants)
+            (
+                entry.label.clone(),
+                AuthPublicKey::Ed25519(*public_key),
+                *public_key,
+                grants,
+            )
         }
         ClientCredential::CapabilityCert { cert, attenuations } => {
             if attenuations.len() > MAX_ATTENUATION_CHAIN_DEPTH {
@@ -1584,7 +2018,43 @@ pub fn verify_client_auth(
                 });
             }
             current_grants.check_subset_of(host_ceiling)?;
-            (cert.payload.principal.clone(), current_key, current_grants)
+            (
+                cert.payload.principal.clone(),
+                AuthPublicKey::Ed25519(current_key),
+                current_key,
+                current_grants,
+            )
+        }
+        ClientCredential::Account {
+            username,
+            public_key,
+            requested_grants,
+        } => {
+            let entry = accounts
+                .iter()
+                .find(|acct| acct.username == *username)
+                .ok_or_else(|| AuthError::UnknownAccount {
+                    username: username.clone(),
+                })?;
+            if entry.public_key != *public_key {
+                return Err(AuthError::UnknownKey);
+            }
+            if !entry.allowed_transports.contains(hello.transport.as_mask()) {
+                return Err(AuthError::WrongTransport {
+                    transport: hello.transport,
+                });
+            }
+            let grants = match requested_grants {
+                Some(req) => entry.grants.attenuate(req)?,
+                None => entry.grants.clone(),
+            };
+            grants.check_subset_of(host_ceiling)?;
+            (
+                entry.username.clone(),
+                entry.public_key.clone(),
+                entry.public_key.fingerprint_sha256(),
+                grants,
+            )
         }
     };
 
@@ -1599,18 +2069,271 @@ pub fn verify_client_auth(
         auth.channel_binding,
         &auth.credential,
     )?;
-    verify_ed25519(
-        leaf_public_key,
-        &proof_msg,
-        auth.proof_signature,
-        "ClientAuth.proof_signature",
-    )?;
+    verify_auth_proof(&leaf_key, &proof_msg, &auth.proof, "ClientAuth.proof")?;
 
     Ok(VerifiedSession {
         principal,
         leaf_public_key,
         granted: effective_grants,
     })
+}
+
+/// Computes the domain-separated signing message for an on-screen guest
+/// terminal [`ConsoleLoginChallenge`].
+pub fn console_login_signing_message(
+    challenge: &ConsoleLoginChallenge,
+) -> Result<Vec<u8>, AuthError> {
+    if challenge.username.is_empty() {
+        return Err(AuthError::Malformed {
+            detail: "console login challenge username must not be empty".to_owned(),
+        });
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(challenge.request_id.to_le_bytes());
+    hasher.update((challenge.username.len() as u32).to_le_bytes());
+    hasher.update(challenge.username.as_bytes());
+    hasher.update(challenge.machine_public_key);
+    hasher.update(challenge.challenge_nonce);
+    hasher.update(challenge.issued_at_unix.to_le_bytes());
+    let digest = hasher.finalize();
+
+    let mut out = Vec::with_capacity(CONSOLE_LOGIN_DOMAIN.len() + 32);
+    out.extend_from_slice(CONSOLE_LOGIN_DOMAIN);
+    out.extend_from_slice(&digest);
+    Ok(out)
+}
+
+/// Verifies a [`ConsoleLoginProof`] against `expected_challenge` and the
+/// authorized operator `accounts` list.
+pub fn verify_console_login(
+    accounts: &[AuthorizedAccount],
+    expected_challenge: &ConsoleLoginChallenge,
+    response: &ConsoleLoginProof,
+) -> Result<VerifiedAccountSession, AuthError> {
+    if response.request_id != expected_challenge.request_id {
+        return Err(AuthError::ChallengeMismatch {
+            detail: format!(
+                "request_id {} does not match expected {}",
+                response.request_id, expected_challenge.request_id
+            ),
+        });
+    }
+    if response.username != expected_challenge.username {
+        return Err(AuthError::ChallengeMismatch {
+            detail: format!(
+                "username `{}` does not match expected `{}`",
+                response.username, expected_challenge.username
+            ),
+        });
+    }
+    let account = accounts
+        .iter()
+        .find(|acct| acct.username == expected_challenge.username)
+        .ok_or_else(|| AuthError::UnknownAccount {
+            username: expected_challenge.username.clone(),
+        })?;
+    account.validate()?;
+    if account.public_key != response.public_key {
+        return Err(AuthError::UnknownKey);
+    }
+
+    let message = console_login_signing_message(expected_challenge)?;
+    verify_auth_proof(
+        &account.public_key,
+        &message,
+        &response.proof,
+        "ConsoleLoginProof.proof",
+    )?;
+
+    Ok(VerifiedAccountSession {
+        username: account.username.clone(),
+        public_key: account.public_key.clone(),
+        grants: account.grants.clone(),
+    })
+}
+
+/// Builds the exact OpenSSH `PROTOCOL.sshsig` message wrapper signed by
+/// `ssh-keygen -Y sign -n <namespace>`:
+/// `b"SSHSIG" || string(namespace) || string("") || string(hash_alg) || string(H(message))`.
+#[must_use]
+pub fn sshsig_signed_wrapper(namespace: &str, hash_alg: SshSigHashAlg, message: &[u8]) -> Vec<u8> {
+    let hash_bytes: Vec<u8> = match hash_alg {
+        SshSigHashAlg::Sha256 => Sha256::digest(message).to_vec(),
+        SshSigHashAlg::Sha512 => Sha512::digest(message).to_vec(),
+    };
+    let alg_name = hash_alg.as_str().as_bytes();
+    let ns_bytes = namespace.as_bytes();
+    let mut out =
+        Vec::with_capacity(6 + 4 + ns_bytes.len() + 4 + 4 + alg_name.len() + 4 + hash_bytes.len());
+    out.extend_from_slice(b"SSHSIG");
+    push_ssh_string(&mut out, ns_bytes);
+    push_ssh_string(&mut out, b"");
+    push_ssh_string(&mut out, alg_name);
+    push_ssh_string(&mut out, &hash_bytes);
+    out
+}
+
+/// Computes the exact 69-byte FIDO2 / OpenSSH `PROTOCOL.u2f` assertion payload
+/// signed by a security key:
+/// `SHA256(application) || [flags] || counter.to_be_bytes() || clientDataHash`.
+#[must_use]
+pub fn fido2_assertion_transcript(
+    application: &str,
+    flags: u8,
+    counter: u32,
+    mode: Fido2MessageMode,
+    message: &[u8],
+) -> [u8; 69] {
+    let rp_id_hash = Sha256::digest(application.as_bytes());
+    let client_data_hash = match mode {
+        Fido2MessageMode::Direct => Sha256::digest(message),
+        Fido2MessageMode::SshSig { hash_alg } => {
+            let wrapper = sshsig_signed_wrapper(FIDO2_SSHSIG_NAMESPACE, hash_alg, message);
+            Sha256::digest(&wrapper)
+        }
+    };
+    let mut out = [0u8; 69];
+    out[..32].copy_from_slice(&rp_id_hash);
+    out[32] = flags;
+    out[33..37].copy_from_slice(&counter.to_be_bytes());
+    out[37..69].copy_from_slice(&client_data_hash);
+    out
+}
+
+/// Verifies `proof` against `public_key` over `message`, enforcing FIDO2 `UP`
+/// (and optional `UV`) flags when applicable.
+pub fn verify_auth_proof(
+    public_key: &AuthPublicKey,
+    message: &[u8],
+    proof: &AuthProof,
+    context: &'static str,
+) -> Result<(), AuthError> {
+    match (public_key, proof) {
+        (AuthPublicKey::Ed25519(pk), AuthProof::Ed25519(sig)) => {
+            verify_ed25519(*pk, message, *sig, context)
+        }
+        (AuthPublicKey::P256(pk), AuthProof::P256(sig)) => verify_p256(*pk, message, *sig, context),
+        (
+            AuthPublicKey::Fido2Ed25519 {
+                public_key,
+                application,
+                require_uv,
+            },
+            AuthProof::Fido2Ed25519 {
+                flags,
+                counter,
+                signature,
+                mode,
+            },
+        ) => {
+            check_fido2_flags(application, *flags, *require_uv)?;
+            let transcript =
+                fido2_assertion_transcript(application, *flags, *counter, *mode, message);
+            verify_ed25519(*public_key, &transcript, *signature, context)
+        }
+        (
+            AuthPublicKey::Fido2P256 {
+                public_key,
+                application,
+                require_uv,
+            },
+            AuthProof::Fido2P256 {
+                flags,
+                counter,
+                signature,
+                mode,
+            },
+        ) => {
+            check_fido2_flags(application, *flags, *require_uv)?;
+            let transcript =
+                fido2_assertion_transcript(application, *flags, *counter, *mode, message);
+            verify_p256(*public_key, &transcript, *signature, context)
+        }
+        _ => Err(AuthError::InvalidSignature { context }),
+    }
+}
+
+/// Derives the 33-byte SEC1 compressed NIST P-256 public key for a raw 32-byte
+/// secret scalar.
+pub fn p256_public_key_sec1(secret_scalar: &[u8; 32]) -> Result<[u8; 33], AuthError> {
+    let signing_key =
+        P256SigningKey::from_slice(secret_scalar).map_err(|_| AuthError::Malformed {
+            detail: "invalid NIST P-256 secret scalar".to_owned(),
+        })?;
+    let point = signing_key.verifying_key().to_sec1_point(true);
+    point
+        .as_bytes()
+        .try_into()
+        .map_err(|_| AuthError::Malformed {
+            detail: "compressed NIST P-256 SEC1 point must be 33 bytes".to_owned(),
+        })
+}
+
+/// Signs `message` with a raw 32-byte NIST P-256 secret scalar using RFC 6979
+/// deterministic ECDSA SHA-256, returning fixed-size 64-byte `r || s`.
+pub fn sign_p256_scalar(secret_scalar: &[u8; 32], message: &[u8]) -> Result<[u8; 64], AuthError> {
+    let signing_key =
+        P256SigningKey::from_slice(secret_scalar).map_err(|_| AuthError::Malformed {
+            detail: "invalid NIST P-256 secret scalar".to_owned(),
+        })?;
+    let sig: P256Signature = p256::ecdsa::signature::Signer::sign(&signing_key, message);
+    let bytes = sig.to_bytes();
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| AuthError::Malformed {
+            detail: "NIST P-256 signature must be 64 bytes".to_owned(),
+        })
+}
+
+fn push_ssh_string(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn check_fido2_flags(application: &str, flags: u8, require_uv: bool) -> Result<(), AuthError> {
+    if application.is_empty() {
+        return Err(AuthError::Malformed {
+            detail: "FIDO2 application string must not be empty".to_owned(),
+        });
+    }
+    if (flags & FIDO2_FLAG_UP) == 0 {
+        return Err(AuthError::UserPresenceRequired);
+    }
+    if require_uv && (flags & FIDO2_FLAG_UV) == 0 {
+        return Err(AuthError::UserVerificationRequired);
+    }
+    Ok(())
+}
+
+fn validate_compressed_p256_sec1(sec1: &[u8; 33]) -> Result<(), AuthError> {
+    if sec1[0] != 0x02 && sec1[0] != 0x03 {
+        return Err(AuthError::Malformed {
+            detail: "NIST P-256 public key must be SEC1 compressed (0x02 or 0x03 prefix)"
+                .to_owned(),
+        });
+    }
+    P256VerifyingKey::from_sec1_bytes(sec1).map_err(|_| AuthError::Malformed {
+        detail: "invalid NIST P-256 SEC1 public key".to_owned(),
+    })?;
+    Ok(())
+}
+
+fn verify_p256(
+    public_key: [u8; 33],
+    message: &[u8],
+    signature: [u8; 64],
+    context: &'static str,
+) -> Result<(), AuthError> {
+    if public_key[0] != 0x02 && public_key[0] != 0x03 {
+        return Err(AuthError::InvalidSignature { context });
+    }
+    let verifying_key = P256VerifyingKey::from_sec1_bytes(&public_key)
+        .map_err(|_| AuthError::InvalidSignature { context })?;
+    let sig = P256Signature::from_slice(&signature)
+        .map_err(|_| AuthError::InvalidSignature { context })?;
+    p256::ecdsa::signature::Verifier::verify(&verifying_key, message, &sig)
+        .map_err(|_| AuthError::InvalidSignature { context })
 }
 
 fn client_auth_proof_message(
@@ -1815,6 +2538,48 @@ where
     W: AsyncWrite + Unpin,
     F: FnOnce(&[u8; 32]) -> Result<[u8; 64], AuthError>,
 {
+    server_handshake_with_accounts(
+        read,
+        write,
+        transport,
+        policy,
+        &[],
+        host_ceiling,
+        machine_public_key,
+        now_unix,
+        session_id,
+        channel_binding,
+        tls_spki_sha256,
+        sign_challenge,
+    )
+    .await
+}
+
+/// Runs the server side of the unified inspector authentication handshake with
+/// both [`AuthPolicy`] and authorized operator [`AuthorizedAccount`]s.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "handshake takes explicit transport, policy, accounts, ceiling, identity, clock, and binding inputs with zero global state"
+)]
+pub async fn server_handshake_with_accounts<R, W, F>(
+    read: &mut R,
+    write: &mut W,
+    transport: TransportKind,
+    policy: &AuthPolicy,
+    accounts: &[AuthorizedAccount],
+    host_ceiling: &SessionGrants,
+    machine_public_key: [u8; 32],
+    now_unix: u64,
+    session_id: u64,
+    channel_binding: Option<[u8; 32]>,
+    tls_spki_sha256: Option<[u8; 32]>,
+    sign_challenge: F,
+) -> Result<VerifiedSession, AuthError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    F: FnOnce(&[u8; 32]) -> Result<[u8; 64], AuthError>,
+{
     let client_hello: ClientHello = read_auth_message(read).await?;
     if client_hello.protocol_version != AUTH_PROTOCOL_VERSION {
         return Err(AuthError::UnsupportedVersion {
@@ -1844,8 +2609,9 @@ where
     write_auth_message(write, &hello).await?;
 
     let client_auth: ClientAuth = read_auth_message(read).await?;
-    match verify_client_auth(
+    match verify_client_auth_with_accounts(
         policy,
+        accounts,
         host_ceiling,
         &hello,
         channel_binding,
@@ -1978,6 +2744,42 @@ async fn read_exact<R: AsyncRead + Unpin>(
     Ok(())
 }
 
+mod serde_bytes_33 {
+    use serde::{Deserializer, Serializer, de};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8; 33], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 33], D::Error> {
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = [u8; 33];
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a 33-byte SEC1 compressed NIST P-256 public key")
+            }
+
+            fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+                v.try_into().map_err(|_| E::invalid_length(v.len(), &self))
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = [0u8; 33];
+                for (idx, slot) in out.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| de::Error::invalid_length(idx, &self))?;
+                }
+                Ok(out)
+            }
+        }
+
+        deserializer.deserialize_bytes(Visitor)
+    }
+}
+
 mod serde_bytes_64 {
     use serde::{Deserializer, Serializer, de};
 
@@ -1992,7 +2794,7 @@ mod serde_bytes_64 {
             type Value = [u8; 64];
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a 64-byte Ed25519 signature")
+                f.write_str("a 64-byte cryptographic signature")
             }
 
             fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
@@ -2366,5 +3168,401 @@ mod tests {
         )
         .expect_err("wrong leaf signing key must fail");
         assert!(matches!(stolen_err, AuthError::InvalidSignature { .. }));
+    }
+
+    #[test]
+    fn multi_algorithm_console_login_verifies_ed25519_p256_and_fido2_and_rejects_bad_flags_or_context()
+     {
+        let machine = test_key(50);
+        let machine_pub = machine.verifying_key().to_bytes();
+        let challenge = ConsoleLoginChallenge {
+            request_id: 7,
+            username: "lexo".to_owned(),
+            machine_public_key: machine_pub,
+            challenge_nonce: [0x5a; 32],
+            issued_at_unix: 1_700_001_000,
+        };
+        let msg = console_login_signing_message(&challenge).expect("console login message");
+        let grants = SessionGrants {
+            inspect_read: Some(ScopeRule::Subtree("/core".to_owned())),
+            ..SessionGrants::empty()
+        };
+
+        // 1. Ed25519 account.
+        let ed_key = test_key(51);
+        let ed_pub = AuthPublicKey::Ed25519(ed_key.verifying_key().to_bytes());
+        let ed_account = AuthorizedAccount {
+            username: "lexo".to_owned(),
+            public_key: ed_pub.clone(),
+            grants: grants.clone(),
+            allowed_transports: TransportMask::ALL,
+        };
+        let ed_proof = ConsoleLoginProof {
+            request_id: challenge.request_id,
+            username: challenge.username.clone(),
+            public_key: ed_pub.clone(),
+            proof: AuthProof::Ed25519(ed_key.sign(&msg).to_bytes()),
+        };
+        let verified = verify_console_login(&[ed_account], &challenge, &ed_proof)
+            .expect("valid Ed25519 console login must verify");
+        assert_eq!(verified.username, "lexo");
+        assert_eq!(verified.grants, grants);
+
+        // 2. P-256 Touch ID account.
+        let p256_scalar = [0x17u8; 32];
+        let p256_pub_bytes = p256_public_key_sec1(&p256_scalar).expect("derive p256 sec1");
+        let p256_pub = AuthPublicKey::P256(p256_pub_bytes);
+        let p256_account = AuthorizedAccount {
+            username: "lexo".to_owned(),
+            public_key: p256_pub.clone(),
+            grants: grants.clone(),
+            allowed_transports: TransportMask::ALL,
+        };
+        let p256_sig = sign_p256_scalar(&p256_scalar, &msg).expect("sign p256");
+        let p256_proof = ConsoleLoginProof {
+            request_id: challenge.request_id,
+            username: challenge.username.clone(),
+            public_key: p256_pub.clone(),
+            proof: AuthProof::P256(p256_sig),
+        };
+        verify_console_login(std::slice::from_ref(&p256_account), &challenge, &p256_proof)
+            .expect("valid P-256 console login must verify");
+
+        // Wrong machine public key, wrong nonce, wrong username, wrong request_id must fail.
+        let mut wrong_machine = challenge.clone();
+        wrong_machine.machine_public_key[0] ^= 0xff;
+        assert!(matches!(
+            verify_console_login(
+                std::slice::from_ref(&p256_account),
+                &wrong_machine,
+                &p256_proof
+            ),
+            Err(AuthError::InvalidSignature { .. })
+        ));
+
+        let mut wrong_nonce = challenge.clone();
+        wrong_nonce.challenge_nonce[0] ^= 0x01;
+        assert!(matches!(
+            verify_console_login(
+                std::slice::from_ref(&p256_account),
+                &wrong_nonce,
+                &p256_proof
+            ),
+            Err(AuthError::InvalidSignature { .. })
+        ));
+
+        let mut wrong_user = p256_proof.clone();
+        wrong_user.username = "mallory".to_owned();
+        assert!(matches!(
+            verify_console_login(std::slice::from_ref(&p256_account), &challenge, &wrong_user),
+            Err(AuthError::ChallengeMismatch { .. })
+        ));
+
+        let mut wrong_req = p256_proof.clone();
+        wrong_req.request_id = 999;
+        assert!(matches!(
+            verify_console_login(std::slice::from_ref(&p256_account), &challenge, &wrong_req),
+            Err(AuthError::ChallengeMismatch { .. })
+        ));
+
+        // 3. FIDO2 Ed25519 (OpenSSH SSHSIG SHA-512) with UP + UV enforcement.
+        let fido_ed_key = test_key(52);
+        let fido_ed_pub = AuthPublicKey::Fido2Ed25519 {
+            public_key: fido_ed_key.verifying_key().to_bytes(),
+            application: DEFAULT_FIDO2_APPLICATION.to_owned(),
+            require_uv: true,
+        };
+        let fido_ed_account = AuthorizedAccount {
+            username: "lexo".to_owned(),
+            public_key: fido_ed_pub.clone(),
+            grants: grants.clone(),
+            allowed_transports: TransportMask::ALL,
+        };
+        let mode = Fido2MessageMode::SshSig {
+            hash_alg: SshSigHashAlg::Sha512,
+        };
+        let flags_up_uv = FIDO2_FLAG_UP | FIDO2_FLAG_UV;
+        let counter = 42u32;
+        let transcript =
+            fido2_assertion_transcript(DEFAULT_FIDO2_APPLICATION, flags_up_uv, counter, mode, &msg);
+        let fido_ed_proof = ConsoleLoginProof {
+            request_id: challenge.request_id,
+            username: challenge.username.clone(),
+            public_key: fido_ed_pub.clone(),
+            proof: AuthProof::Fido2Ed25519 {
+                flags: flags_up_uv,
+                counter,
+                signature: fido_ed_key.sign(&transcript).to_bytes(),
+                mode,
+            },
+        };
+        verify_console_login(
+            std::slice::from_ref(&fido_ed_account),
+            &challenge,
+            &fido_ed_proof,
+        )
+        .expect("valid FIDO2 Ed25519 SSHSIG proof must verify");
+
+        // Missing UP bit must fail with UserPresenceRequired.
+        let no_up_transcript = fido2_assertion_transcript(
+            DEFAULT_FIDO2_APPLICATION,
+            FIDO2_FLAG_UV,
+            counter,
+            mode,
+            &msg,
+        );
+        let no_up_proof = ConsoleLoginProof {
+            proof: AuthProof::Fido2Ed25519 {
+                flags: FIDO2_FLAG_UV,
+                counter,
+                signature: fido_ed_key.sign(&no_up_transcript).to_bytes(),
+                mode,
+            },
+            ..fido_ed_proof.clone()
+        };
+        assert!(matches!(
+            verify_console_login(
+                std::slice::from_ref(&fido_ed_account),
+                &challenge,
+                &no_up_proof
+            ),
+            Err(AuthError::UserPresenceRequired)
+        ));
+
+        // Missing UV bit when require_uv == true must fail with UserVerificationRequired.
+        let no_uv_transcript = fido2_assertion_transcript(
+            DEFAULT_FIDO2_APPLICATION,
+            FIDO2_FLAG_UP,
+            counter,
+            mode,
+            &msg,
+        );
+        let no_uv_proof = ConsoleLoginProof {
+            proof: AuthProof::Fido2Ed25519 {
+                flags: FIDO2_FLAG_UP,
+                counter,
+                signature: fido_ed_key.sign(&no_uv_transcript).to_bytes(),
+                mode,
+            },
+            ..fido_ed_proof.clone()
+        };
+        assert!(matches!(
+            verify_console_login(
+                std::slice::from_ref(&fido_ed_account),
+                &challenge,
+                &no_uv_proof
+            ),
+            Err(AuthError::UserVerificationRequired)
+        ));
+
+        // Wrong application (rpIdHash) must fail signature verification.
+        let wrong_app_transcript =
+            fido2_assertion_transcript("ssh:other-app", flags_up_uv, counter, mode, &msg);
+        let wrong_app_proof = ConsoleLoginProof {
+            proof: AuthProof::Fido2Ed25519 {
+                flags: flags_up_uv,
+                counter,
+                signature: fido_ed_key.sign(&wrong_app_transcript).to_bytes(),
+                mode,
+            },
+            ..fido_ed_proof
+        };
+        assert!(matches!(
+            verify_console_login(
+                std::slice::from_ref(&fido_ed_account),
+                &challenge,
+                &wrong_app_proof
+            ),
+            Err(AuthError::InvalidSignature { .. })
+        ));
+
+        // 4. FIDO2 P-256 (Direct + SSHSIG SHA-256) with AccountPolicy postcard round-trip.
+        let fido_p256_scalar = [0x29u8; 32];
+        let fido_p256_pub = AuthPublicKey::Fido2P256 {
+            public_key: p256_public_key_sec1(&fido_p256_scalar).expect("fido p256 sec1"),
+            application: DEFAULT_FIDO2_APPLICATION.to_owned(),
+            require_uv: false,
+        };
+        let policy = AccountPolicy::single_account(AuthorizedAccount {
+            username: "lexo".to_owned(),
+            public_key: fido_p256_pub.clone(),
+            grants: grants.clone(),
+            allowed_transports: TransportMask::ALL,
+        });
+        let encoded_policy = policy.encode_postcard().expect("encode AccountPolicy");
+        let decoded_policy =
+            AccountPolicy::decode_postcard(&encoded_policy).expect("decode AccountPolicy");
+        assert_eq!(decoded_policy, policy);
+
+        for fido_mode in [
+            Fido2MessageMode::Direct,
+            Fido2MessageMode::SshSig {
+                hash_alg: SshSigHashAlg::Sha256,
+            },
+        ] {
+            let p256_transcript = fido2_assertion_transcript(
+                DEFAULT_FIDO2_APPLICATION,
+                FIDO2_FLAG_UP,
+                99,
+                fido_mode,
+                &msg,
+            );
+            let sig =
+                sign_p256_scalar(&fido_p256_scalar, &p256_transcript).expect("sign fido p256");
+            let proof = ConsoleLoginProof {
+                request_id: challenge.request_id,
+                username: challenge.username.clone(),
+                public_key: fido_p256_pub.clone(),
+                proof: AuthProof::Fido2P256 {
+                    flags: FIDO2_FLAG_UP,
+                    counter: 99,
+                    signature: sig,
+                    mode: fido_mode,
+                },
+            };
+            verify_console_login(&decoded_policy.accounts, &challenge, &proof)
+                .expect("FIDO2 P-256 console login must verify");
+        }
+    }
+
+    #[test]
+    fn async_client_auth_handshake_authenticates_p256_and_fido2_accounts() {
+        use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let machine = test_key(70);
+            let machine_pub = machine.verifying_key().to_bytes();
+            let policy = AuthPolicy::empty();
+            let ceiling = SessionGrants::full_worker_ceiling();
+
+            // P-256 Touch ID style account identity.
+            let p256_scalar = [0x33u8; 32];
+            let p256_pub = AuthPublicKey::P256(p256_public_key_sec1(&p256_scalar).expect("sec1"));
+            let p256_grants = SessionGrants {
+                inspect_read: Some(ScopeRule::Subtree("/core".to_owned())),
+                ..SessionGrants::empty()
+            };
+            let p256_account = AuthorizedAccount {
+                username: "touchid_op".to_owned(),
+                public_key: p256_pub.clone(),
+                grants: p256_grants.clone(),
+                allowed_transports: TransportMask::ALL,
+            };
+            let p256_identity = ClientIdentity::from_account_signer(
+                "touchid_op",
+                p256_pub,
+                None,
+                Arc::new(move |msg| Ok(AuthProof::P256(sign_p256_scalar(&p256_scalar, msg)?))),
+            );
+
+            // FIDO2 Ed25519 SSHSIG account identity.
+            let fido_seed = [0x44u8; 32];
+            let fido_key = SigningKey::from_bytes(&fido_seed);
+            let fido_pub = AuthPublicKey::Fido2Ed25519 {
+                public_key: fido_key.verifying_key().to_bytes(),
+                application: DEFAULT_FIDO2_APPLICATION.to_owned(),
+                require_uv: true,
+            };
+            let fido_account = AuthorizedAccount {
+                username: "yubikey_op".to_owned(),
+                public_key: fido_pub.clone(),
+                grants: p256_grants.clone(),
+                allowed_transports: TransportMask::ALL,
+            };
+            let fido_identity = ClientIdentity::from_account_signer(
+                "yubikey_op",
+                fido_pub,
+                None,
+                Arc::new(move |msg| {
+                    let mode = Fido2MessageMode::SshSig {
+                        hash_alg: SshSigHashAlg::Sha512,
+                    };
+                    let flags = FIDO2_FLAG_UP | FIDO2_FLAG_UV;
+                    let counter = 5;
+                    let transcript = fido2_assertion_transcript(
+                        DEFAULT_FIDO2_APPLICATION,
+                        flags,
+                        counter,
+                        mode,
+                        msg,
+                    );
+                    let sig = SigningKey::from_bytes(&fido_seed)
+                        .sign(&transcript)
+                        .to_bytes();
+                    Ok(AuthProof::Fido2Ed25519 {
+                        flags,
+                        counter,
+                        signature: sig,
+                        mode,
+                    })
+                }),
+            );
+
+            let accounts = vec![p256_account, fido_account];
+            for (expected_user, identity) in
+                [("touchid_op", p256_identity), ("yubikey_op", fido_identity)]
+            {
+                let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+                let (client_r, client_w) = tokio::io::split(client_io);
+                let (server_r, server_w) = tokio::io::split(server_io);
+                let mut client_r = client_r.compat();
+                let mut client_w = client_w.compat_write();
+                let mut server_r = server_r.compat();
+                let mut server_w = server_w.compat_write();
+
+                let machine_seed = machine.to_bytes();
+                let server_accounts = accounts.clone();
+                let server_policy = policy.clone();
+                let server_ceiling = ceiling.clone();
+
+                let server_task = tokio::spawn(async move {
+                    server_handshake_with_accounts(
+                        &mut server_r,
+                        &mut server_w,
+                        TransportKind::Vsock,
+                        &server_policy,
+                        &server_accounts,
+                        &server_ceiling,
+                        machine_pub,
+                        1_700_002_000,
+                        123,
+                        None,
+                        None,
+                        |challenge| {
+                            Ok(sign_machine_identity_seed(
+                                &machine_seed,
+                                MACHINE_IDENTITY_HANDSHAKE_DOMAIN,
+                                challenge,
+                            ))
+                        },
+                    )
+                    .await
+                });
+
+                let (_hello, granted, session_id) = client_handshake(
+                    &mut client_r,
+                    &mut client_w,
+                    TransportKind::Vsock,
+                    &identity,
+                    Some(machine_pub),
+                    None,
+                    None,
+                )
+                .await
+                .expect("account client handshake must succeed");
+                let verified = server_task
+                    .await
+                    .expect("join server task")
+                    .expect("server handshake must verify account");
+                assert_eq!(session_id, 123);
+                assert_eq!(verified.principal, expected_user);
+                assert_eq!(granted, p256_grants);
+            }
+        });
     }
 }

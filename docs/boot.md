@@ -81,6 +81,37 @@ The parsed result is a `BootPayload`, which the backend hands
 kernel's view types — they are views over the payload image now instead
 of generated statics.
 
+## Bootloader splash and early framebuffer panic console
+
+On `x86-64` and `aarch64`, `helios-cli limine-uefi-image` rasterises the
+Helios emblem from `docs/logo.svg` in memory (`cli/src/splash.rs`) as a
+360×360 RGB8 PNG on `#FFFFFF` and writes it to `/boot/limine/splash.png`
+inside the FAT32 ESP alongside `limine.conf` — no binary image is committed
+to the repository. `cli/templates/limine.conf` configures Limine with
+`timeout: 0`, `verbose: no`, `terse: yes`, `wallpaper:
+boot():/boot/limine/splash.png`, `wallpaper_style: centered`,
+`backdrop: ffffff`, and a transparent zero-margin terminal overlay so the
+splash appears immediately whenever firmware exposes a linear GOP
+framebuffer, while headless boots with no framebuffer automatically fall
+back to UEFI serial output and `measured_boot: yes` continues extending
+TPM PCR 9.
+
+Both Limine backends advertise the framebuffer and flanterm-init-params
+requests so Limine preserves the rendered splash pixels across kernel
+handoff instead of clearing the screen to black, and maps the framebuffer
+writable in the higher-half direct map (reserved out of usable RAM and
+outside any PAT/MAIR slot the backends reconfigure). Each backend hands
+`Option<BootFramebuffer>` (`hal/src/boot.rs`) to
+`helios_kernel::attach_panic_framebuffer` right after reading the Limine
+handoff without touching any pixel during normal bring-up. If the kernel
+panics before a native display driver comes online, `PanicConsole`
+(`kernel/src/io/panic_console.rs`) renders the panic report onto the
+linear framebuffer alongside serial output using pure integer bitmap
+glyphs (zero heap allocation, zero floating-point or vector instructions).
+Once `install_display_device` brings `virtio-gpu` under kernel ownership,
+it calls `detach_panic_framebuffer` so post-handoff panics never write to
+stale firmware GOP memory.
+
 ## Booting a CI-built artifact without a rebuild
 
 CI uploads three tiers of prebuilt artifacts on demand — only for the lanes a

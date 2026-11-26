@@ -49,6 +49,7 @@ mod boot_kernel;
 mod components;
 mod kernel_image;
 mod prebuilt_artifact;
+mod splash;
 mod venus_fetch;
 mod wasi_sdk;
 
@@ -600,6 +601,11 @@ pub(crate) enum LimineError {
     RenderConfig {
         #[source]
         source: askama::Error,
+    },
+    #[error("failed to encode Limine splash PNG: {source}")]
+    EncodeSplash {
+        #[source]
+        source: png::EncodingError,
     },
     #[error("failed to open source file {path}: {source}")]
     OpenSource {
@@ -1876,6 +1882,22 @@ fn write_limine_fat_volume(
         limine.efi_bootloader_name,
         &limine.efi_bootloader,
     )?;
+    let splash_png =
+        splash::render_splash_png().map_err(|source| LimineError::EncodeSplash { source })?;
+    let splash_path = "/boot/limine/splash.png";
+    let mut splash_file =
+        limine_dir
+            .create_file("splash.png")
+            .map_err(|source| LimineError::CreateFatEntry {
+                path: splash_path,
+                source,
+            })?;
+    splash_file
+        .write_all(&splash_png)
+        .map_err(|source| LimineError::WriteFatEntry {
+            path: splash_path,
+            source,
+        })?;
     let config = LimineConfigTemplate { baud }
         .render()
         .map_err(|source| LimineError::RenderConfig { source })?;
@@ -4617,6 +4639,75 @@ mod tests {
             command.programs,
             ["init", "inspector-host", "compiler-plugin"]
         );
+    }
+
+    #[test]
+    fn limine_config_and_fat_volume_embed_splash_png() {
+        let rendered = LimineConfigTemplate { baud: 115_200 }
+            .render()
+            .expect("limine.conf template renders");
+        assert!(rendered.contains("timeout: 0"));
+        assert!(rendered.contains("verbose: no"));
+        assert!(rendered.contains("terse: yes"));
+        assert!(rendered.contains("serial: no"));
+        assert!(rendered.contains("serial_baudrate: 115200"));
+        assert!(rendered.contains("wallpaper: boot():/boot/limine/splash.png"));
+        assert!(rendered.contains("wallpaper_style: centered"));
+        assert!(rendered.contains("backdrop: ffffff"));
+        assert!(rendered.contains("term_background: ffffffff"));
+        assert!(rendered.contains("measured_boot: yes"));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let efi = dir.path().join("BOOTX64.EFI");
+        let bootfs = dir.path().join("helios-bootfs");
+        let image = dir.path().join("limine.img");
+        fs::write(&efi, b"EFI-STUB").expect("write efi stub");
+        fs::write(&bootfs, b"BOOTFS-STUB").expect("write bootfs stub");
+        let limine = LimineToolchain {
+            efi_bootloader: efi,
+            efi_bootloader_name: "BOOTX64.EFI",
+        };
+        let image_bytes = 64 * 1024 * 1024;
+        let mut image_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&image)
+            .expect("create image");
+        image_file.set_len(image_bytes).expect("size image");
+        write_limine_mbr(&mut image_file, image_bytes).expect("write mbr");
+        write_limine_fat_volume(
+            &mut image_file,
+            image_bytes,
+            b"ELF",
+            &bootfs,
+            &limine,
+            115_200,
+        )
+        .expect("write fat volume");
+
+        let partition_offset = u64::from(LIMINE_PARTITION_START_LBA) * LIMINE_SECTOR_BYTES;
+        let partition_len = image_bytes - partition_offset;
+        let partition = FileSlice::new(&mut image_file, partition_offset, partition_len);
+        let volume = FileSystem::new(partition, FsOptions::new()).expect("open fat32");
+        let mut splash_bytes = Vec::new();
+        volume
+            .root_dir()
+            .open_file("boot/limine/splash.png")
+            .expect("splash.png exists on ESP")
+            .read_to_end(&mut splash_bytes)
+            .expect("read splash.png");
+        assert!(splash_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+        let mut conf_bytes = Vec::new();
+        volume
+            .root_dir()
+            .open_file("boot/limine/limine.conf")
+            .expect("limine.conf exists on ESP")
+            .read_to_end(&mut conf_bytes)
+            .expect("read limine.conf");
+        assert_eq!(conf_bytes, rendered.as_bytes());
     }
 
     fn test_artifact(
