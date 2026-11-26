@@ -491,7 +491,14 @@ pub(super) async fn fallocate<R: Resources, M: VirtualMemory, F: Filesystem<R>>(
                 0
             } else {
                 // `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE`: zero `[offset, min(end, size))`
-                // without altering `st_size`.
+                // without altering `st_size`. On a sealed memfd (`F_SEAL_WRITE` or
+                // `F_SEAL_FUTURE_WRITE`), Linux `mm/shmem.c` `shmem_fallocate` refuses
+                // hole punching with `EPERM` even beyond EOF.
+                if let Some(seals) = fs.memfd_get_seals(open.node())
+                    && seals & (helios_unix::F_SEAL_WRITE | helios_unix::F_SEAL_FUTURE_WRITE) != 0
+                {
+                    return errno(EPERM);
+                }
                 let start = offset as u64;
                 let limit = (end as u64).min(stat.size);
                 if start >= limit {

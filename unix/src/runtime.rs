@@ -28,6 +28,9 @@ pub use readiness::*;
 mod file_lock;
 pub use file_lock::*;
 
+mod memfd;
+pub use memfd::*;
+
 mod open_file;
 pub use open_file::*;
 
