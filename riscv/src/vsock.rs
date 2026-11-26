@@ -26,6 +26,12 @@ pub(crate) struct VirtioVsockDevice {
     inner: Arc<helios_virtio::VirtioMmioVsockDevice>,
 }
 
+impl VirtioVsockDevice {
+    pub(crate) fn device(&self) -> &Arc<helios_virtio::VirtioMmioVsockDevice> {
+        &self.inner
+    }
+}
+
 /// The vsock device the bootstrap hart brought up, together with the
 /// PLIC line the device tree routes it to.
 pub(crate) struct VsockInterrupt {
@@ -45,14 +51,15 @@ pub(crate) fn has_vsock_device(fdt: &Fdt<'_>) -> bool {
 
 /// Brings up the vsock device and publishes it as the machine's host
 /// link.
-pub(crate) fn install<WatchdogImpl>(
-    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl>,
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
+    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl, MeasuredBootImpl>,
     cpu: &crate::RiscvCpu,
     fdt: &Fdt<'_>,
     debug_state: &crate::debug_state::RuntimeState,
 ) -> Option<VsockInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let (device, line) = discover_vsock_device(fdt)?;
     let service = helios_kernel::install_vsock_device(kernel, cpu, device.inner.clone());

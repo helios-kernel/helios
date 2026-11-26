@@ -49,6 +49,7 @@ __helios_riscv_capture_bsp_state:
     frcsr t0
     sd t0, 0xe0(a0)
     li a0, 0
+    li a1, 0
     ret
 
 .global __helios_riscv_resume_bsp_state

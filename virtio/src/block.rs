@@ -1288,6 +1288,74 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
         Ok(())
     }
 
+    /// Synchronously reads the device's identification serial (`VIRTIO_BLK_T_GET_ID`)
+    /// by polling queue 0's used ring.
+    ///
+    /// Used during early-boot hibernate resume before interrupts or the
+    /// executor are active so the bootstrap processor can identify the
+    /// `"helios-hibernate"` block device synchronously.
+    pub fn serial_polled(
+        &self,
+        mut expired: impl FnMut() -> bool,
+    ) -> Result<BlockSerial, PolledBlockError> {
+        if self.state.load(Ordering::SeqCst) != RUNNING {
+            return Err(IoError::DeviceFault.into());
+        }
+        let dma = self.transport.bus().dma();
+        let req_layout =
+            Layout::array::<u8>(size_of::<BlkReq>()).map_err(|_| IoError::OutOfBounds)?;
+        let mut req_buf = dma
+            .allocate(req_layout, DmaAccess::READ)
+            .map_err(IoError::from)?;
+        let header = BlkReq::new(ReqType::GetId, 0);
+        req_buf.as_mut()[..size_of::<BlkReq>()].copy_from_slice(as_bytes(&header));
+
+        let id_layout = Layout::array::<u8>(BLOCK_ID_BYTES).map_err(|_| IoError::OutOfBounds)?;
+        let mut id_buf = dma
+            .allocate(id_layout, DmaAccess::WRITE)
+            .map_err(IoError::from)?;
+        id_buf.as_mut()[..BLOCK_ID_BYTES].fill(0);
+
+        let status_layout = Layout::array::<u8>(1).map_err(|_| IoError::OutOfBounds)?;
+        let mut status_buf = dma
+            .allocate(status_layout, DmaAccess::WRITE)
+            .map_err(IoError::from)?;
+        status_buf.as_mut()[0] = STATUS_UNWRITTEN;
+
+        let queue = &self.queues[0];
+        let token = {
+            let mut ring = queue.ring.try_lock().ok_or(PolledBlockError::QueueBusy)?;
+            let inputs = [&req_buf.as_ref()[..size_of::<BlkReq>()]];
+            let mut outputs = [
+                &mut id_buf.as_mut()[..BLOCK_ID_BYTES],
+                &mut status_buf.as_mut()[..1],
+            ];
+            let token = ring.submit(&self.transport, &inputs, &mut outputs)?;
+            ring.notify(&self.transport);
+            token
+        };
+
+        let written = match self.poll_used_token(queue, token, &mut expired) {
+            Ok(written) => written,
+            Err(error) => {
+                // The device may still hold the chain; never free its DMA buffers.
+                core::mem::forget(req_buf);
+                core::mem::forget(id_buf);
+                core::mem::forget(status_buf);
+                return Err(error);
+            }
+        };
+        self.transport.ack_interrupt();
+        map_block_status(status_buf.as_ref()[0])?;
+        let id_written = usize::try_from(written)
+            .map_err(|_| IoError::DeviceFault)?
+            .checked_sub(size_of::<u8>())
+            .ok_or(IoError::DeviceFault)?
+            .min(BLOCK_ID_BYTES);
+        self.counters.count(ReqType::GetId);
+        BlockSerial::new(&id_buf.as_ref()[..id_written]).ok_or_else(|| IoError::DeviceFault.into())
+    }
+
     fn polled_read_chunk(
         &self,
         sector: u64,
@@ -2391,6 +2459,18 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockResource<T
             return Err(IoError::PermissionDenied.into());
         }
         self.object().flush_polled(expired)
+    }
+
+    /// Synchronously reads the device's identification serial by polling queue 0.
+    /// See [`VirtioBlockDevice::serial_polled`].
+    pub fn serial_polled(
+        &self,
+        expired: impl FnMut() -> bool,
+    ) -> Result<BlockSerial, PolledBlockError> {
+        if !self.rights().contains(BlockDeviceRights::READ) {
+            return Err(IoError::PermissionDenied.into());
+        }
+        self.object().serial_polled(expired)
     }
 
     /// The feature set the underlying device negotiated.

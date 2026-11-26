@@ -12,7 +12,7 @@ use alloc::sync::Arc;
 use arm_gic::{IntId, Trigger};
 use helios_kernel::{BalloonHandle, ExternalInterruptHandler, Kernel};
 
-type Aarch64VirtioBalloonDevice = helios_virtio::VirtioBalloonDevice<
+pub(crate) type Aarch64VirtioBalloonDevice = helios_virtio::VirtioBalloonDevice<
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<crate::Aarch64DmaPool>>,
 >;
 
@@ -23,6 +23,12 @@ type Aarch64VirtioBalloonDevice = helios_virtio::VirtioBalloonDevice<
 #[derive(Clone)]
 pub(crate) struct VirtioBalloonInterrupt {
     device: Arc<Aarch64VirtioBalloonDevice>,
+}
+
+impl VirtioBalloonInterrupt {
+    pub(crate) fn device(&self) -> &Arc<Aarch64VirtioBalloonDevice> {
+        &self.device
+    }
 }
 
 impl ExternalInterruptHandler for VirtioBalloonInterrupt {

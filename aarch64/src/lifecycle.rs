@@ -193,6 +193,10 @@ impl Psci {
         Self { conduit }
     }
 
+    pub(crate) fn conduit(self) -> PsciConduit {
+        self.conduit
+    }
+
     fn cpu_on(self, mpidr: u64, entry: u64, context: u64) -> Result<(), psci::Error> {
         fn call<C: Call>(mpidr: u64, entry: u64, context: u64) -> Result<(), psci::Error> {
             psci::cpu_on::<C>(mpidr, entry, context)
@@ -207,6 +211,38 @@ impl Psci {
         match self.conduit {
             PsciConduit::Hvc => psci::affinity_info::<Hvc>(mpidr, LowestAffinityLevel::All),
             PsciConduit::Smc => psci::affinity_info::<Smc>(mpidr, LowestAffinityLevel::All),
+        }
+    }
+
+    pub(crate) fn wait_affinity_off(self, mpidr: u64, timebase: Timebase) {
+        let target = mpidr & PSCI_TARGET_MASK;
+        let deadline = crate::read_counter()
+            .checked_add(timebase.frequency() * OFF_DEADLINE_SECONDS)
+            .unwrap_or_else(|| panic!("AArch64 processor power-off deadline overflow"));
+        loop {
+            let state = self.affinity_info(target).unwrap_or_else(|error| {
+                panic!("PSCI AFFINITY_INFO for {mpidr:#x} failed: {error}")
+            });
+            if state == AffinityState::Off {
+                return;
+            }
+            assert!(
+                crate::read_counter() <= deadline,
+                "AArch64 processor {mpidr:#x} did not power off \
+                 (PSCI AFFINITY_INFO reports {state:?})"
+            );
+            core::hint::spin_loop();
+        }
+    }
+
+    pub(crate) fn cpu_off_current(conduit: PsciConduit) -> ! {
+        let result = match conduit {
+            PsciConduit::Hvc => psci::cpu_off::<Hvc>(),
+            PsciConduit::Smc => psci::cpu_off::<Smc>(),
+        };
+        match result {
+            Ok(()) => panic!("PSCI CPU_OFF returned success, which the specification forbids"),
+            Err(error) => panic!("PSCI CPU_OFF failed on secondary processor: {error}"),
         }
     }
 
@@ -351,23 +387,7 @@ impl ProcessorPower {
             core::hint::spin_loop();
         }
         let target = mpidr & PSCI_TARGET_MASK;
-        let deadline = crate::read_counter()
-            .checked_add(timebase.frequency() * OFF_DEADLINE_SECONDS)
-            .unwrap_or_else(|| panic!("AArch64 processor power-off deadline overflow"));
-        loop {
-            let state = psci.affinity_info(target).unwrap_or_else(|error| {
-                panic!("PSCI AFFINITY_INFO for {mpidr:#x} failed: {error}")
-            });
-            if state == AffinityState::Off {
-                break;
-            }
-            assert!(
-                crate::read_counter() <= deadline,
-                "AArch64 processor {mpidr:#x} did not power off after it announced its stop \
-                 (PSCI AFFINITY_INFO reports {state:?})"
-            );
-            core::hint::spin_loop();
-        }
+        psci.wait_affinity_off(mpidr, timebase);
         // SAFETY: `Stopping` was published after these two words were
         // written, and nothing writes them again until the processor runs.
         let (entry, context) = unsafe {
@@ -376,6 +396,22 @@ impl ProcessorPower {
         };
         psci.cpu_on(target, entry, context)
             .unwrap_or_else(|error| panic!("PSCI CPU_ON for {mpidr:#x} failed: {error}"));
+    }
+
+    /// Waits until the processor has entered `STOPPING` and firmware reports
+    /// it powered off via `PSCI AFFINITY_INFO`.
+    pub(crate) fn wait_stopped(&self, psci: Psci, mpidr: u64, timebase: Timebase) {
+        let deadline = crate::read_counter()
+            .checked_add(timebase.frequency() * OFF_DEADLINE_SECONDS)
+            .unwrap_or_else(|| panic!("AArch64 processor stop wait deadline overflow"));
+        while self.state.load(Ordering::Acquire) != STOPPING {
+            assert!(
+                crate::read_counter() <= deadline,
+                "AArch64 processor {mpidr:#x} did not enter STOPPING state before deadline"
+            );
+            core::hint::spin_loop();
+        }
+        psci.wait_affinity_off(mpidr, timebase);
     }
 }
 

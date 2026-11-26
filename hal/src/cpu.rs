@@ -311,6 +311,80 @@ pub struct ReturnAddressSigning {
     pub faults_at_authentication: bool,
 }
 
+/// One 4 KiB physical page copy performed by an architecture restore
+/// trampoline when a hibernate image frame collided with boot-kernel memory.
+///
+/// Layout is fixed `#[repr(C)]` (`src_phys` at offset 0, `dst_phys` at
+/// offset 8, size 16 bytes) so assembly restore stubs can index it directly.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DisplacedFrameCopy {
+    pub src_phys: u64,
+    pub dst_phys: u64,
+}
+
+/// Fresh per-boot state passed from the boot kernel across the restore
+/// trampoline into the resumed image kernel's snapshot continuation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResumeHandoff {
+    /// 128-bit image identifier from the authenticated hibernate header.
+    pub image_id: [u8; 16],
+    /// Fresh 256-bit cryptographic entropy gathered by the boot kernel.
+    pub fresh_entropy: [u8; 32],
+    /// Wall-clock nanoseconds since the Unix epoch read from the boot kernel's
+    /// real-time clock, when available.
+    pub rtc_unix_nanos: Option<u64>,
+    /// Boot kernel monotonic tick counter when `rtc_unix_nanos` was sampled.
+    pub boot_monotonic_ticks: u64,
+}
+
+/// Fixed-layout POD wire encoding of [`ResumeHandoff`] placed on the restore
+/// trampoline page so assembly stubs can hand its physical address back into
+/// [`Cpu::capture_bsp_state`] across the page-table switch.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResumeHandoffWire {
+    pub image_id: [u8; 16],
+    pub fresh_entropy: [u8; 32],
+    pub has_rtc_unix_nanos: u64,
+    pub rtc_unix_nanos: u64,
+    pub boot_monotonic_ticks: u64,
+}
+
+impl ResumeHandoff {
+    pub const fn to_wire(self) -> ResumeHandoffWire {
+        match self.rtc_unix_nanos {
+            Some(nanos) => ResumeHandoffWire {
+                image_id: self.image_id,
+                fresh_entropy: self.fresh_entropy,
+                has_rtc_unix_nanos: 1,
+                rtc_unix_nanos: nanos,
+                boot_monotonic_ticks: self.boot_monotonic_ticks,
+            },
+            None => ResumeHandoffWire {
+                image_id: self.image_id,
+                fresh_entropy: self.fresh_entropy,
+                has_rtc_unix_nanos: 0,
+                rtc_unix_nanos: 0,
+                boot_monotonic_ticks: self.boot_monotonic_ticks,
+            },
+        }
+    }
+
+    pub const fn from_wire(wire: ResumeHandoffWire) -> Self {
+        Self {
+            image_id: wire.image_id,
+            fresh_entropy: wire.fresh_entropy,
+            rtc_unix_nanos: if wire.has_rtc_unix_nanos != 0 {
+                Some(wire.rtc_unix_nanos)
+            } else {
+                None
+            },
+            boot_monotonic_ticks: wire.boot_monotonic_ticks,
+        }
+    }
+}
+
 /// Result of capturing the bootstrap processor's architectural state at a
 /// double-return snapshot point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -320,8 +394,9 @@ pub enum SnapshotPoint {
     /// finalize the snapshot.
     Captured,
     /// Resume path: control was restored by jumping back into the saved
-    /// context, so execution is now running in the restored machine.
-    Resumed,
+    /// context, carrying the boot kernel's [`ResumeHandoff`] into the
+    /// restored machine.
+    Resumed(ResumeHandoff),
 }
 
 /// Architecture tag carried inside [`BspSnapshotContext`].
@@ -1020,13 +1095,31 @@ pub trait Cpu: Send + Sync + 'static {
     /// architectural context into `context` and returns
     /// `Ok(SnapshotPoint::Captured)`. When a restore stub later restores
     /// memory and jumps back into `context`, execution returns from this
-    /// call a second time with `Ok(SnapshotPoint::Resumed)`.
+    /// call a second time with `Ok(SnapshotPoint::Resumed(handoff))`.
     fn capture_bsp_state(
         &self,
         _context: &mut BspSnapshotContext,
     ) -> Result<SnapshotPoint, SnapshotUnsupported> {
         Err(SnapshotUnsupported)
     }
+
+    /// Waits until a secondary processor that entered [`Cpu::stop_current`]
+    /// has finished saving its state and reached its hardware stopped state.
+    ///
+    /// Used by hibernate freeze after every online secondary has committed to
+    /// stopping, before RAM is snapshotted, so every secondary's saved context
+    /// is guaranteed complete in memory.
+    fn wait_processor_stopped(&self, _processor: ProcessorId) {}
+
+    /// Restores bootstrap-processor architectural state that does not survive
+    /// power-off and a restore-trampoline transition (such as x86 XCR0,
+    /// SMEP/SMAP, PAT, MTRRs, APIC and IDT; AArch64 GICv3, PAC/MTE and PAN;
+    /// RISC-V PLIC, timer and trap vectors).
+    ///
+    /// Called on the bootstrap processor inside the
+    /// [`SnapshotPoint::Resumed`] continuation while the machine is still
+    /// frozen.
+    fn restore_bsp_post_resume_state(&self) {}
 
     /// Powers the machine off and never returns.
     fn shutdown(&self) -> !;

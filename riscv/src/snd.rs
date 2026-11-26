@@ -27,6 +27,12 @@ pub(crate) struct VirtioSoundDevice {
     inner: Arc<helios_virtio::VirtioMmioSndDevice>,
 }
 
+impl VirtioSoundDevice {
+    pub(crate) fn device(&self) -> &Arc<helios_virtio::VirtioMmioSndDevice> {
+        &self.inner
+    }
+}
+
 /// The sound device the bootstrap hart brought up, together with the
 /// PLIC line the device tree routes it to.
 pub(crate) struct SoundInterrupt {
@@ -45,13 +51,14 @@ pub(crate) fn has_sound_device(fdt: &Fdt<'_>) -> bool {
 }
 
 /// Brings the platform's sound device up and hands it to the kernel.
-pub(crate) fn install<WatchdogImpl>(
-    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl>,
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
+    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl, MeasuredBootImpl>,
     fdt: &Fdt<'_>,
     debug_state: &crate::debug_state::RuntimeState,
 ) -> Option<SoundInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let (device, line) = discover_sound_device(fdt)?;
     let service = helios_kernel::install_audio_device(kernel, device.inner.clone());

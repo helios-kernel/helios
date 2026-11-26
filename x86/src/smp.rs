@@ -1261,6 +1261,39 @@ impl X86PlatformState {
             || runtime.stop_state.load(Ordering::Acquire) == STOP_STOPPED
     }
 
+    /// The higher-half direct-map offset established by the bootloader.
+    pub(crate) fn physical_memory_offset(&self) -> usize {
+        self.processor_slot(self.bootstrap_processor())
+            .runtime
+            .physical_memory_offset
+    }
+
+    /// Restores bootstrap-processor architectural state that does not survive
+    /// power-off and the restore trampoline transition: XCR0, SMEP/SMAP, PAT,
+    /// MTRRs, local APIC, GDT/TSS/IDT, and COM1 I/O APIC redirection.
+    ///
+    /// Leaves `CR8` raised to [`crate::exceptions::WAKE_ONLY_TASK_PRIORITY`]
+    /// and re-enables `IF` so `FrozenMachine`'s wake-only interrupt mask holds
+    /// until thaw.
+    pub(crate) fn restore_bsp_post_resume_state(&self) {
+        // SAFETY: `boot_context_ptr` points to the immutable leaked `'static`
+        // `BootContext` created at boot.
+        let boot = unsafe { &*(self.boot_context_ptr() as *const BootContext) };
+        crate::extended_state::enable_on_secondary_processor(boot.xcr0());
+        boot.user_isolation().enable_on_secondary_processor();
+        crate::memory_type::program_page_attribute_table();
+        boot.mtrrs().apply();
+        let runtime = current_runtime();
+        runtime.reset_local_apic_state();
+        runtime.attach_local_apic();
+        crate::exceptions::install_for_current_processor();
+        self.io_apics().program_redirection(
+            crate::ioapic::COM1,
+            crate::exceptions::DEBUG_SERIAL_INTERRUPT_VECTOR,
+            self.processor_slot(self.bootstrap_processor()).apic_id,
+        );
+    }
+
     /// How long a processor the kernel has published as stopping may take
     /// to reach its halt, in TSC ticks: the stop path masks a timer,
     /// takes the shootdown lock and saves a few registers.

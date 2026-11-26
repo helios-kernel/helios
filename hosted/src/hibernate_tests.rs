@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use helios_hal::boot::{BootMemoryKind, BootMemoryMetadata, BootMemoryRegion};
-use helios_hal::cpu::{Cpu, ProcessorId};
+use helios_hal::cpu::{Cpu, ProcessorId, ResumeHandoff};
 use helios_hal::io::IoError;
 use helios_hal::measured_boot::{
     MeasuredBoot, MeasuredBootError, MeasurementAlgorithm, MeasurementBank, MeasurementDigest,
@@ -22,10 +22,11 @@ use helios_hal::numa::SingleNode;
 use helios_hal::pmm::PhysFrame;
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::hibernate::{
-    AtomicSnapshotParams, HEADER_BYTES, HIBERNATE_HEADER_SECTORS, HIBERNATE_SECTOR_BYTES,
-    HibernateDeviceController, HibernateDeviceError, HibernateError, HibernateHeader,
-    HibernateIdentity, HibernateOutcome, HibernateStorage, HibernateStorageError, SnapshotConfig,
-    decode_image_into, hibernate_to_disk_with_power_off, invalidate_hibernate_header,
+    AtomicSnapshotParams, FrameRun, HEADER_BYTES, HEADER_MAC_OFFSET, HIBERNATE_HEADER_SECTORS,
+    HIBERNATE_SECTOR_BYTES, HibernateDeviceController, HibernateDeviceError, HibernateError,
+    HibernateHeader, HibernateIdentity, HibernateOutcome, HibernateStorage, HibernateStorageError,
+    ResumeProbe, ResumeTargets, SnapshotConfig, decode_image_into,
+    hibernate_to_disk_with_power_off, invalidate_hibernate_header, probe_and_load_hibernate_image,
     verify_image_header_and_table,
 };
 use helios_kernel::{
@@ -572,6 +573,9 @@ fn hibernate_full_write_path_orders_flushes_powers_off_and_round_trips() {
             let mut devices = RecordingDeviceController::new(events_for_task.clone());
             let mut progress_during_poweroff = None;
 
+            let generation = MachineGeneration::new(None);
+            let entropy = RootEntropy::from_platform(&cpu, None, None, generation.clone())
+                .expect("hosted entropy");
             let outcome = hibernate_to_disk_with_power_off(
                 kernel,
                 &cpu,
@@ -583,6 +587,11 @@ fn hibernate_full_write_path_orders_flushes_powers_off_and_round_trips() {
                     reservation_bytes: RESERVATION_BYTES,
                     arrival_deadline: ARRIVAL_DEADLINE,
                     config: SnapshotConfig::new([0x76; 16]),
+                },
+                ResumeTargets {
+                    machine_generation: &generation,
+                    root_entropy: &entropy,
+                    reseed_wall_clock: |_, _| {},
                 },
                 &mut disk,
                 &mut devices,
@@ -789,6 +798,9 @@ fn hibernate_fault_injection_at_every_op_recovers_reservation_devices_and_tasks(
             let events = Arc::new(Mutex::new(Vec::new()));
             let mut disk = MemoryHibernateDisk::new(8 * 1024 * 1024, 4096, events.clone(), None);
             let mut devices = RecordingDeviceController::new(events);
+            let generation = MachineGeneration::new(None);
+            let entropy = RootEntropy::from_platform(&cpu, None, None, generation.clone())
+                .expect("hosted entropy");
             let res = hibernate_to_disk_with_power_off(
                 kernel,
                 &cpu,
@@ -800,6 +812,11 @@ fn hibernate_fault_injection_at_every_op_recovers_reservation_devices_and_tasks(
                     reservation_bytes: RESERVATION_BYTES,
                     arrival_deadline: ARRIVAL_DEADLINE,
                     config: SnapshotConfig::new([0x88; 16]),
+                },
+                ResumeTargets {
+                    machine_generation: &generation,
+                    root_entropy: &entropy,
+                    reseed_wall_clock: |_, _| {},
                 },
                 &mut disk,
                 &mut devices,
@@ -840,6 +857,9 @@ fn hibernate_fault_injection_at_every_op_recovers_reservation_devices_and_tasks(
                 let power_off_called = Arc::new(AtomicBool::new(false));
                 let power_off_flag = power_off_called.clone();
 
+                let generation = MachineGeneration::new(None);
+                let entropy = RootEntropy::from_platform(&cpu, None, None, generation.clone())
+                    .expect("hosted entropy");
                 let outcome = hibernate_to_disk_with_power_off(
                     kernel,
                     &cpu,
@@ -851,6 +871,11 @@ fn hibernate_fault_injection_at_every_op_recovers_reservation_devices_and_tasks(
                         reservation_bytes: RESERVATION_BYTES,
                         arrival_deadline: ARRIVAL_DEADLINE,
                         config: SnapshotConfig::new([0x99; 16]),
+                    },
+                    ResumeTargets {
+                        machine_generation: &generation,
+                        root_entropy: &entropy,
+                        reseed_wall_clock: |_, _| {},
                     },
                     &mut disk,
                     &mut devices,
@@ -935,6 +960,9 @@ fn hibernate_disk_too_small_refuses_before_freeze() {
             let power_off_called = Arc::new(AtomicBool::new(false));
             let power_off_inner = power_off_called.clone();
 
+            let generation = MachineGeneration::new(None);
+            let entropy = RootEntropy::from_platform(&cpu, None, None, generation.clone())
+                .expect("hosted entropy");
             let outcome = hibernate_to_disk_with_power_off(
                 kernel,
                 &cpu,
@@ -946,6 +974,11 @@ fn hibernate_disk_too_small_refuses_before_freeze() {
                     reservation_bytes: RESERVATION_BYTES,
                     arrival_deadline: ARRIVAL_DEADLINE,
                     config: SnapshotConfig::new([0xaa; 16]),
+                },
+                ResumeTargets {
+                    machine_generation: &generation,
+                    root_entropy: &entropy,
+                    reseed_wall_clock: |_, _| {},
                 },
                 &mut disk,
                 &mut devices,
@@ -1003,4 +1036,504 @@ fn hibernate_disk_too_small_refuses_before_freeze() {
     assert!(recorded_events.is_empty());
     assert!(!powered_off);
     assert_eq!(allocated_after, allocated_before);
+}
+
+/// End-to-end hosted resume simulation:
+/// 1. Hibernate writes an authenticated image containing identifiable CJK +
+///    binary user pages to `MemoryHibernateDisk`.
+/// 2. Boot kernel probes the disk via `probe_and_load_hibernate_image` with
+///    colliding boot-kernel protected ranges, verifies direct + displaced
+///    placement, and replays `DisplacedFrameCopy` into simulated RAM so every
+///    pattern frame matches byte-for-byte.
+/// 3. Returning into `SnapshotPoint::Resumed(handoff)` runs the full ordered
+///    continuation: restores BSP state, advances `MachineGeneration` with
+///    `AdvanceCause::ImageRestored`, mixes `fresh_entropy` into `RootEntropy`
+///    (causing immediate output divergence from pre-hibernate state), reseeds
+///    wall clock from RTC, reinitializes devices, invalidates the disk header
+///    so a second boot probe returns `ResumeProbe::NoImage`, restarts all
+///    stopped secondary processors, and thaws so every task keeps running.
+#[test]
+fn hibernate_end_to_end_boot_probe_restore_and_post_resume_continuation() {
+    let (machine, _turn) = machine();
+    let (stop, progress) = start_background_tasks(machine);
+    let identity = sample_identity();
+    let image_id = [0x57; 16];
+
+    // Allocate 8 identifiable user frames containing Chinese + Japanese + Korean
+    // text and structured bytes.
+    let pattern_pages = 8_usize;
+    let pattern_len = pattern_pages * PhysFrame::SIZE;
+    let pattern_layout = Layout::from_size_align(pattern_len, PhysFrame::SIZE).unwrap();
+    let (pattern_tx, pattern_rx) = bounded::<(usize, Vec<u8>)>(1);
+    let pool = machine.pool;
+    machine.on(0, move |_kernel, _cpu| {
+        let ptr = pool
+            .allocate_zeroed_on(ProcessorId::new(0), pattern_layout)
+            .expect("allocate CJK pattern user pages");
+        let seed_phrase = "冬眠恢复 / 冬眠復帰 / 동면 복귀 / hibernate-resume-577\n".as_bytes();
+        let mut expected = vec![0_u8; pattern_len];
+        for (i, byte) in expected.iter_mut().enumerate() {
+            *byte = seed_phrase[i % seed_phrase.len()] ^ ((i / PhysFrame::SIZE) as u8);
+        }
+        // SAFETY: `ptr` is an exclusively owned `pattern_len`-byte user allocation.
+        unsafe {
+            core::ptr::copy_nonoverlapping(expected.as_ptr(), ptr.as_ptr(), pattern_len);
+        }
+        pattern_tx.send((ptr.as_ptr() as usize, expected)).unwrap();
+    });
+    let (pattern_addr, pattern_expected) = recv(&pattern_rx);
+    let pattern_start_frame = ((pattern_addr - machine.phys_offset) / PhysFrame::SIZE) as u64;
+
+    // Step 1: Hibernate to disk.
+    let (hib_tx, hib_rx) = bounded(1);
+    machine.on(0, move |kernel, cpu| {
+        let cpu = cpu.clone();
+        kernel.spawn_local_detached(async move {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut disk = MemoryHibernateDisk::new(8 * 1024 * 1024, 4096, events.clone(), None);
+            let mut devices = RecordingDeviceController::new(events);
+            let generation = MachineGeneration::new(None);
+            let entropy = RootEntropy::from_platform(&cpu, None, None, generation.clone())
+                .expect("hosted entropy");
+            let outcome = hibernate_to_disk_with_power_off(
+                kernel,
+                &cpu,
+                machine.pool,
+                AtomicSnapshotParams {
+                    balloon: None,
+                    auth_key: Some(&machine.auth_key),
+                    identity,
+                    reservation_bytes: RESERVATION_BYTES,
+                    arrival_deadline: ARRIVAL_DEADLINE,
+                    config: SnapshotConfig::new(image_id),
+                },
+                ResumeTargets {
+                    machine_generation: &generation,
+                    root_entropy: &entropy,
+                    reseed_wall_clock: |_, _| {},
+                },
+                &mut disk,
+                &mut devices,
+                || {},
+                || {},
+            )
+            .await;
+            hib_tx.send((outcome, disk.bytes().to_vec())).unwrap();
+        });
+    });
+    let (hib_outcome, disk_bytes) = recv(&hib_rx);
+    assert!(matches!(
+        hib_outcome,
+        Ok(HibernateOutcome::PoweredOff { .. })
+    ));
+
+    // Step 2: Simulate fresh boot kernel probing & loading the hibernate image.
+    // Give the boot kernel a simulated physical RAM pool matching the machine
+    // size plus extra headroom, with a protected range colliding with the first
+    // half of our user pattern frames so both direct and displaced paths run!
+    let machine_max_frames = machine.phys_bytes.div_ceil(PhysFrame::SIZE as u64);
+    let usable_frames = [FrameRun::new(0, machine_max_frames + 4096)];
+    let p = PhysFrame::SIZE as u64;
+    let boot_protected_range = (pattern_start_frame * p)..((pattern_start_frame + 4) * p);
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut boot_disk = MemoryHibernateDisk::new(disk_bytes.len(), 4096, events, None);
+    boot_disk.bytes.copy_from_slice(&disk_bytes);
+
+    let mut staged_ram: BTreeMap<u64, [u8; PhysFrame::SIZE]> = BTreeMap::new();
+    let loaded = match probe_and_load_hibernate_image(
+        &mut boot_disk,
+        Some(&machine.auth_key),
+        &identity,
+        machine_max_frames,
+        &usable_frames,
+        core::slice::from_ref(&boot_protected_range),
+        4,
+        |dst_phys, frame_bytes| {
+            staged_ram.insert(dst_phys, *frame_bytes);
+        },
+        || {},
+    ) {
+        ResumeProbe::Ready(loaded) => loaded,
+        other => panic!("expected ResumeProbe::Ready, got {other:?}"),
+    };
+    assert_eq!(loaded.header.image_id, image_id);
+    assert!(
+        loaded.plan.direct_frames > 0,
+        "expected non-colliding direct frames"
+    );
+    assert!(
+        loaded.plan.displaced_copies.len() >= 4,
+        "expected colliding pattern frames to be displaced"
+    );
+
+    // Simulate the restore trampoline's linear `DisplacedFrameCopy` loop.
+    for copy in &loaded.plan.displaced_copies {
+        let src_bytes = *staged_ram
+            .get(&copy.src_phys)
+            .expect("displaced source frame staged");
+        staged_ram.insert(copy.dst_phys, src_bytes);
+    }
+    for i in 0..pattern_pages {
+        let phys = (pattern_start_frame + i as u64) * p;
+        let restored_frame = staged_ram
+            .get(&phys)
+            .expect("restored user pattern frame present in RAM");
+        let expected_slice = &pattern_expected[i * PhysFrame::SIZE..(i + 1) * PhysFrame::SIZE];
+        assert_eq!(
+            restored_frame.as_slice(),
+            expected_slice,
+            "restored frame {i} differs after trampoline copy loop"
+        );
+    }
+
+    // Step 3: Trigger the real `SnapshotPoint::Resumed(handoff)` continuation
+    // on the 4-processor hosted machine and verify every post-resume invariant.
+    let progress_baseline: Vec<usize> = progress.iter().map(|c| c.load(Ordering::SeqCst)).collect();
+    let restores_before = machine.machine.bsp_post_resume_restores();
+    let fresh_entropy = [0xec; 32];
+    let rtc_nanos = 1_795_000_000_000_000_000_u64;
+    machine.machine.set_next_resume_handoff(ResumeHandoff {
+        image_id,
+        fresh_entropy,
+        rtc_unix_nanos: Some(rtc_nanos),
+        boot_monotonic_ticks: 99_999,
+    });
+
+    let (res_tx, res_rx) = bounded(1);
+    machine.on(0, move |kernel, cpu| {
+        let cpu = cpu.clone();
+        kernel.spawn_local_detached(async move {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut disk = MemoryHibernateDisk::new(disk_bytes.len(), 4096, events.clone(), None);
+            disk.bytes.copy_from_slice(&disk_bytes);
+            let mut devices = RecordingDeviceController::new(events);
+
+            // Seed two deterministic-comparison-free RootEntropy state checks:
+            // record generation, pre-resume draw + rekey/reseed stats.
+            let generation = MachineGeneration::new(None);
+            let gen_before = generation.current().get();
+            let entropy = RootEntropy::from_platform(&cpu, None, None, generation.clone())
+                .expect("hosted entropy");
+            let mut pre_draw = [0_u8; 32];
+            entropy.fill(&mut pre_draw);
+            let rekeys_before = entropy.rekey_count();
+
+            let reseeded_wall = Arc::new(Mutex::new(None::<(u64, u64)>));
+            let reseeded_wall_cb = reseeded_wall.clone();
+
+            let outcome = hibernate_to_disk_with_power_off(
+                kernel,
+                &cpu,
+                machine.pool,
+                AtomicSnapshotParams {
+                    balloon: None,
+                    auth_key: Some(&machine.auth_key),
+                    identity,
+                    reservation_bytes: RESERVATION_BYTES,
+                    arrival_deadline: ARRIVAL_DEADLINE,
+                    config: SnapshotConfig::new(image_id),
+                },
+                ResumeTargets {
+                    machine_generation: &generation,
+                    root_entropy: &entropy,
+                    reseed_wall_clock: move |ticks, nanos| {
+                        *reseeded_wall_cb.lock().unwrap() = Some((ticks, nanos));
+                    },
+                },
+                &mut disk,
+                &mut devices,
+                || {},
+                || panic!("power_off must NOT run on SnapshotPoint::Resumed"),
+            )
+            .await;
+
+            let (latest_gen, latest_cause_bytes) = generation.latest_advance();
+            let gen_after = latest_gen.get();
+            let mut post_draw = [0_u8; 32];
+            entropy.fill(&mut post_draw);
+            let rekeys_after = entropy.rekey_count();
+
+            // Probe the SAME disk a second time: header must have been
+            // invalidated so a second boot cold-boots (`ResumeProbe::NoImage`).
+            let second_boot_probe = probe_and_load_hibernate_image(
+                &mut disk,
+                Some(&machine.auth_key),
+                &identity,
+                machine_max_frames,
+                &usable_frames,
+                core::slice::from_ref(&boot_protected_range),
+                4,
+                |_, _| {},
+                || {},
+            );
+
+            res_tx
+                .send((
+                    outcome,
+                    gen_before,
+                    gen_after,
+                    latest_cause_bytes,
+                    pre_draw,
+                    post_draw,
+                    rekeys_before,
+                    rekeys_after,
+                    *reseeded_wall.lock().unwrap(),
+                    devices.reinit_all_count,
+                    matches!(second_boot_probe, ResumeProbe::NoImage),
+                    disk.bytes()[..HEADER_BYTES].to_vec(),
+                ))
+                .unwrap();
+        });
+    });
+
+    let (
+        outcome,
+        gen_before,
+        gen_after,
+        latest_cause_bytes,
+        pre_draw,
+        post_draw,
+        rekeys_before,
+        rekeys_after,
+        reseeded_wall,
+        reinit_all_count,
+        second_boot_is_cold,
+        post_resume_header,
+    ) = recv(&res_rx);
+
+    assert_eq!(outcome, Ok(HibernateOutcome::Resumed));
+    assert_eq!(
+        machine.machine.bsp_post_resume_restores(),
+        restores_before + 1,
+        "BSP architectural state restore must run on resume"
+    );
+    assert_eq!(
+        gen_after,
+        gen_before + 1,
+        "MachineGeneration must advance on resume"
+    );
+    assert_eq!(
+        latest_cause_bytes, image_id,
+        "MachineGeneration advance must record the restored image_id"
+    );
+    assert_ne!(
+        post_draw, pre_draw,
+        "RootEntropy output must differ immediately after resume"
+    );
+    assert!(
+        rekeys_after > rekeys_before,
+        "RootEntropy must rekey immediately on resume"
+    );
+    assert_eq!(
+        reseeded_wall.map(|(_, nanos)| nanos),
+        Some(rtc_nanos),
+        "wall clock must be reseeded from boot kernel's RTC reading"
+    );
+    assert_eq!(
+        reinit_all_count, 1,
+        "devices.reinitialize_all() must run once on resume"
+    );
+    assert!(
+        second_boot_is_cold,
+        "second boot from the same disk must see ResumeProbe::NoImage (cold boot)"
+    );
+    assert!(
+        post_resume_header.iter().all(|&b| b == 0),
+        "disk header sector 0..8 must be zeroed on resume"
+    );
+
+    // Every processor (including all 3 restarted secondaries) must resume running tasks!
+    wait_for_all_tasks_to_advance(&progress, &progress_baseline);
+
+    // Clean up allocation and stop background tasks.
+    let (freed_tx, freed_rx) = bounded(1);
+    machine.on(0, move |_kernel, _cpu| {
+        let ptr = core::ptr::NonNull::new(pattern_addr as *mut u8).unwrap();
+        machine
+            .pool
+            .deallocate_bytes_on(ProcessorId::new(0), ptr, pattern_layout);
+        freed_tx.send(()).unwrap();
+    });
+    recv(&freed_rx);
+    stop.store(true, Ordering::Release);
+}
+
+/// Boot probe refusal tests:
+/// - Flipped header MAC byte -> `ResumeProbe::Refused(InvalidMac)`, header
+///   invalidated on disk, second probe returns `ResumeProbe::NoImage`.
+/// - Flipped chunk payload byte -> `ResumeProbe::Refused(ChunkChecksumMismatch)`,
+///   header invalidated on disk, second probe returns `ResumeProbe::NoImage`.
+/// - Different kernel build / mismatched `HibernateIdentity` ->
+///   `ResumeProbe::Refused(KernelTextMismatch)`, header invalidated on disk,
+///   second probe returns `ResumeProbe::NoImage`.
+#[test]
+fn hibernate_resume_probe_refuses_tampered_or_mismatched_images_and_invalidates_disk() {
+    let (machine, _turn) = machine();
+    let identity = sample_identity();
+
+    // Write one real valid hibernate image to copy into each tampered scenario.
+    let (hib_tx, hib_rx) = bounded(1);
+    machine.on(0, move |kernel, cpu| {
+        let cpu = cpu.clone();
+        kernel.spawn_local_detached(async move {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut disk = MemoryHibernateDisk::new(8 * 1024 * 1024, 4096, events.clone(), None);
+            let mut devices = RecordingDeviceController::new(events);
+            let generation = MachineGeneration::new(None);
+            let entropy = RootEntropy::from_platform(&cpu, None, None, generation.clone())
+                .expect("hosted entropy");
+            let outcome = hibernate_to_disk_with_power_off(
+                kernel,
+                &cpu,
+                machine.pool,
+                AtomicSnapshotParams {
+                    balloon: None,
+                    auth_key: Some(&machine.auth_key),
+                    identity,
+                    reservation_bytes: RESERVATION_BYTES,
+                    arrival_deadline: ARRIVAL_DEADLINE,
+                    config: SnapshotConfig::new([0x3c; 16]),
+                },
+                ResumeTargets {
+                    machine_generation: &generation,
+                    root_entropy: &entropy,
+                    reseed_wall_clock: |_, _| {},
+                },
+                &mut disk,
+                &mut devices,
+                || {},
+                || {},
+            )
+            .await;
+            hib_tx.send((outcome, disk.bytes().to_vec())).unwrap();
+        });
+    });
+    let (outcome, valid_disk) = recv(&hib_rx);
+    assert!(matches!(outcome, Ok(HibernateOutcome::PoweredOff { .. })));
+
+    let machine_max_frames = machine.phys_bytes.div_ceil(PhysFrame::SIZE as u64);
+    let usable = [FrameRun::new(0, machine_max_frames + 4096)];
+
+    // 1. Flipped MAC byte -> InvalidMac + invalidated on disk.
+    let mut bad_mac_disk = MemoryHibernateDisk::new(
+        valid_disk.len(),
+        4096,
+        Arc::new(Mutex::new(Vec::new())),
+        None,
+    );
+    bad_mac_disk.bytes.copy_from_slice(&valid_disk);
+    bad_mac_disk.bytes[HEADER_MAC_OFFSET + 3] ^= 0x40;
+    let probe = probe_and_load_hibernate_image(
+        &mut bad_mac_disk,
+        Some(&machine.auth_key),
+        &identity,
+        machine_max_frames,
+        &usable,
+        &[],
+        2,
+        |_, _| {},
+        || {},
+    );
+    assert!(matches!(
+        probe,
+        ResumeProbe::Refused(HibernateError::InvalidMac)
+    ));
+    assert!(bad_mac_disk.bytes[..HEADER_BYTES].iter().all(|&b| b == 0));
+    assert!(matches!(
+        probe_and_load_hibernate_image(
+            &mut bad_mac_disk,
+            Some(&machine.auth_key),
+            &identity,
+            machine_max_frames,
+            &usable,
+            &[],
+            2,
+            |_, _| {},
+            || {},
+        ),
+        ResumeProbe::NoImage
+    ));
+
+    // 2. Flipped chunk payload byte -> ChunkChecksumMismatch + invalidated on disk.
+    let mut bad_chunk_disk = MemoryHibernateDisk::new(
+        valid_disk.len(),
+        4096,
+        Arc::new(Mutex::new(Vec::new())),
+        None,
+    );
+    bad_chunk_disk.bytes.copy_from_slice(&valid_disk);
+    bad_chunk_disk.bytes[HEADER_BYTES + 16] ^= 0xff;
+    let probe = probe_and_load_hibernate_image(
+        &mut bad_chunk_disk,
+        Some(&machine.auth_key),
+        &identity,
+        machine_max_frames,
+        &usable,
+        &[],
+        2,
+        |_, _| {},
+        || {},
+    );
+    assert!(matches!(
+        probe,
+        ResumeProbe::Refused(HibernateError::ChunkChecksumMismatch { chunk_index: 0 })
+    ));
+    assert!(bad_chunk_disk.bytes[..HEADER_BYTES].iter().all(|&b| b == 0));
+    assert!(matches!(
+        probe_and_load_hibernate_image(
+            &mut bad_chunk_disk,
+            Some(&machine.auth_key),
+            &identity,
+            machine_max_frames,
+            &usable,
+            &[],
+            2,
+            |_, _| {},
+            || {},
+        ),
+        ResumeProbe::NoImage
+    ));
+
+    // 3. Different kernel build (mismatched kernel `.text` SHA-256) ->
+    //    KernelTextMismatch + invalidated on disk.
+    let mut different_kernel_identity = identity;
+    different_kernel_identity.kernel_text_sha256[0] ^= 0xaa;
+    let mut wrong_id_disk = MemoryHibernateDisk::new(
+        valid_disk.len(),
+        4096,
+        Arc::new(Mutex::new(Vec::new())),
+        None,
+    );
+    wrong_id_disk.bytes.copy_from_slice(&valid_disk);
+    let probe = probe_and_load_hibernate_image(
+        &mut wrong_id_disk,
+        Some(&machine.auth_key),
+        &different_kernel_identity,
+        machine_max_frames,
+        &usable,
+        &[],
+        2,
+        |_, _| {},
+        || {},
+    );
+    assert!(matches!(
+        probe,
+        ResumeProbe::Refused(HibernateError::KernelTextMismatch)
+    ));
+    assert!(wrong_id_disk.bytes[..HEADER_BYTES].iter().all(|&b| b == 0));
+    assert!(matches!(
+        probe_and_load_hibernate_image(
+            &mut wrong_id_disk,
+            Some(&machine.auth_key),
+            &different_kernel_identity,
+            machine_max_frames,
+            &usable,
+            &[],
+            2,
+            |_, _| {},
+            || {},
+        ),
+        ResumeProbe::NoImage
+    ));
 }

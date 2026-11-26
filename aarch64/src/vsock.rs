@@ -14,7 +14,7 @@ use crate::platform::PlatformDescription;
 use arm_gic::{IntId, Trigger};
 use helios_kernel::ExternalInterruptHandler;
 
-type Aarch64VirtioVsockDevice = helios_virtio::VirtioVsockDevice<
+pub(crate) type Aarch64VirtioVsockDevice = helios_virtio::VirtioVsockDevice<
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<crate::Aarch64DmaPool>>,
 >;
 
@@ -26,6 +26,12 @@ type Aarch64VirtioVsockDevice = helios_virtio::VirtioVsockDevice<
 #[derive(Clone)]
 pub(crate) struct VirtioVsockDevice {
     device: Arc<Aarch64VirtioVsockDevice>,
+}
+
+impl VirtioVsockDevice {
+    pub(crate) fn device(&self) -> &Arc<Aarch64VirtioVsockDevice> {
+        &self.device
+    }
 }
 
 /// The vsock device the bootstrap processor brought up, together with

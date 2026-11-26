@@ -27,6 +27,12 @@ pub(crate) struct VirtioDisplayDevice {
     inner: Arc<helios_virtio::VirtioMmioGpuDevice>,
 }
 
+impl VirtioDisplayDevice {
+    pub(crate) fn device(&self) -> &Arc<helios_virtio::VirtioMmioGpuDevice> {
+        &self.inner
+    }
+}
+
 /// The display device the bootstrap hart brought up, together with the
 /// PLIC line the device tree routes it to.
 pub(crate) struct DisplayInterrupt {
@@ -45,14 +51,15 @@ pub(crate) fn has_display_device(fdt: &Fdt<'_>) -> bool {
 }
 
 /// Brings the platform's display engine up and hands it to the kernel.
-pub(crate) fn install<WatchdogImpl>(
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     cpu: &crate::RiscvCpu,
-    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl>,
+    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl, MeasuredBootImpl>,
     fdt: &Fdt<'_>,
     debug_state: &crate::debug_state::RuntimeState,
 ) -> Option<DisplayInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let (device, line) = discover_display_device(fdt)?;
     let service = helios_kernel::install_display_device(kernel, cpu, device.inner.clone());

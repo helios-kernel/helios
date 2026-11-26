@@ -22,6 +22,12 @@ pub(crate) struct VirtioEntropyDevice {
     inner: Arc<helios_virtio::VirtioMmioRngDevice>,
 }
 
+impl VirtioEntropyDevice {
+    pub(crate) fn device(&self) -> &Arc<helios_virtio::VirtioMmioRngDevice> {
+        &self.inner
+    }
+}
+
 /// The entropy device the bootstrap hart brought up, together with the
 /// PLIC line the device tree routes it to.
 pub(crate) struct EntropyInterrupt {
@@ -69,12 +75,13 @@ pub(crate) fn bring_up(fdt: &Fdt<'_>) -> Option<EntropyInterrupt> {
 }
 
 /// Hands the device to the kernel's reseed task.
-pub(crate) fn install<WatchdogImpl>(
-    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl>,
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
+    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl, MeasuredBootImpl>,
     entropy: &EntropyInterrupt,
     root: helios_kernel::RootEntropyHandle,
 ) where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     helios_kernel::install_entropy_device(kernel, root, entropy.device.clone());
     tracing::info!("virtio entropy online irq={}", entropy.line.number());

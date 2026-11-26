@@ -15,7 +15,7 @@ use arm_gic::{IntId, Trigger};
 use crate::platform::PlatformDescription;
 use helios_kernel::ExternalInterruptHandler;
 
-type Aarch64VirtioGpuDevice = helios_virtio::VirtioGpuDevice<
+pub(crate) type Aarch64VirtioGpuDevice = helios_virtio::VirtioGpuDevice<
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<crate::Aarch64DmaPool>>,
 >;
 
@@ -27,6 +27,12 @@ type Aarch64VirtioGpuDevice = helios_virtio::VirtioGpuDevice<
 #[derive(Clone)]
 pub(crate) struct VirtioDisplayDevice {
     device: Arc<Aarch64VirtioGpuDevice>,
+}
+
+impl VirtioDisplayDevice {
+    pub(crate) fn device(&self) -> &Arc<Aarch64VirtioGpuDevice> {
+        &self.device
+    }
 }
 
 /// The display device the bootstrap processor brought up, together with

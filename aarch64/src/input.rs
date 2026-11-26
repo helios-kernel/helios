@@ -21,7 +21,7 @@ use arm_gic::{IntId, Trigger};
 use crate::platform::PlatformDescription;
 use helios_kernel::ExternalInterruptHandler;
 
-type Aarch64VirtioInputDevice = helios_virtio::VirtioInputDevice<
+pub(crate) type Aarch64VirtioInputDevice = helios_virtio::VirtioInputDevice<
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<crate::Aarch64DmaPool>>,
 >;
 
@@ -33,6 +33,12 @@ type Aarch64VirtioInputDevice = helios_virtio::VirtioInputDevice<
 #[derive(Clone)]
 pub(crate) struct VirtioInputDevice {
     inner: Arc<Aarch64VirtioInputDevice>,
+}
+
+impl VirtioInputDevice {
+    pub(crate) fn device(&self) -> &Arc<Aarch64VirtioInputDevice> {
+        &self.inner
+    }
 }
 
 /// One input device the bootstrap processor brought up, together with

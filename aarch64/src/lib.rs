@@ -21,8 +21,8 @@ use helios_hal::boot::{
 };
 use helios_hal::cpu::{
     Aarch64SnapshotContext, BspSnapshotContext, ControlFlowIntegrity, Cpu,
-    GUEST_STACK_LIMIT_OFFSET, HardwarePerfCounters, Instant, ProcessorId, SnapshotPoint,
-    SnapshotUnsupported, Timebase, TimerInterrupt,
+    GUEST_STACK_LIMIT_OFFSET, HardwarePerfCounters, Instant, ProcessorId, ResumeHandoff,
+    ResumeHandoffWire, SnapshotPoint, SnapshotUnsupported, Timebase, TimerInterrupt,
 };
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
@@ -117,6 +117,12 @@ global_asm!(
 #[cfg(target_os = "none")]
 global_asm!(include_str!("snapshot.S"));
 
+#[repr(C)]
+struct Aarch64CaptureResult {
+    status: u64,
+    handoff_phys: u64,
+}
+
 unsafe extern "C" {
     static __helios_aarch64_exception_vectors: u8;
     static __helios_aarch64_boot_exception_stack_top: u8;
@@ -128,7 +134,8 @@ unsafe extern "C" {
     static __helios_data_end: u8;
     static __helios_bss_start: u8;
     static __helios_bss_end: u8;
-    fn __helios_aarch64_capture_bsp_state(ctx: *mut Aarch64SnapshotContext) -> u64;
+    fn __helios_aarch64_capture_bsp_state(ctx: *mut Aarch64SnapshotContext)
+    -> Aarch64CaptureResult;
     /// Returns to a context saved by the synchronous-exception entry,
     /// from kernel code running on the interrupted stack.
     ///
@@ -229,6 +236,7 @@ mod entropy;
 mod gic;
 mod gpu;
 mod hand_over;
+mod hibernate;
 mod host_fs;
 #[cfg(feature = "hv")]
 pub mod hv;
@@ -475,6 +483,7 @@ struct Aarch64PlatformState {
     /// platform describes one.
     psci: Option<lifecycle::Psci>,
     timebase: Timebase,
+    physical_memory_offset: usize,
     /// Control-flow integrity capabilities probed on the bootstrap processor
     /// before any other starts and never written again (`cfi`).
     control_flow_integrity: ControlFlowIntegrity,
@@ -514,6 +523,7 @@ impl Aarch64PlatformState {
     /// resume context are found again when it comes back.
     fn from_limine_mp(
         timebase: Timebase,
+        physical_memory_offset: usize,
         pool: &UserMemoryPool,
         psci: Option<platform::PsciConduit>,
         memory_tagging: MemoryTagging,
@@ -538,6 +548,7 @@ impl Aarch64PlatformState {
             processors,
             psci: psci.map(lifecycle::Psci::new),
             timebase,
+            physical_memory_offset,
             control_flow_integrity: cfi::bootstrap_capability(),
             instruction_key: cfi::SharedInstructionKey::new(),
             memory_tagging,
@@ -848,8 +859,13 @@ extern "C" fn aarch64_kernel_main() -> ! {
     // `install_memory_attributes` and `install_user_address_space`, with
     // `EnIA` still clear and no secondary started.
     let memory_tagging = unsafe { tagging::init_bootstrap(physical_memory_offset, &handoff) };
-    let platform_state =
-        Aarch64PlatformState::from_limine_mp(timebase(), pool, platform.psci, memory_tagging);
+    let platform_state = Aarch64PlatformState::from_limine_mp(
+        timebase(),
+        physical_memory_offset,
+        pool,
+        platform.psci,
+        memory_tagging,
+    );
     activate_processor_runtime(platform_state.bootstrap_runtime());
 
     let cpu = Aarch64Cpu {
@@ -961,6 +977,9 @@ extern "C" fn aarch64_kernel_main() -> ! {
         machine_generation,
     );
     debug_state.install_root_entropy(root_entropy.clone());
+    // Settle the TPM-sealed machine seed early so `HibernateAuthKey` is
+    // available for the early-boot resume probe below without settling twice.
+    helios_kernel::settle_boot_signing_keys(&kernel, &debug_state);
     // Replace the bootstrap processor's early MTE tag-generator seed with
     // cryptographic output from the root DRBG, and draw an independent seed
     // for every secondary processor before any secondary starts.
@@ -1019,7 +1038,6 @@ extern "C" fn aarch64_kernel_main() -> ! {
             tracing::warn!("the platform describes no PL031; the wall clock reads as uptime");
         }
     }
-    helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
     let gic = platform_state.install_gic(gic::Gic::new(
         &platform.gic,
         platform_state.processor_mpidrs(),
@@ -1036,6 +1054,8 @@ extern "C" fn aarch64_kernel_main() -> ! {
     // and before any grant is published, which the registry enforces.
     device::install_hooks(gic);
 
+    let mut hibernate_devices =
+        hibernate::Aarch64HibernateDevices::new(cpu, debug_state.machine_generation_handle());
     let mut routes = DeviceInterruptRoutes::new();
     // The console UART is a device the kernel drives itself: its SPI is
     // routed to the bootstrap processor and enabled exactly like the
@@ -1058,6 +1078,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         &handoff,
         &debug_state,
     ) {
+        hibernate_devices.host_fs = Some(host_fs.transport.clone());
         gic.enable_device_interrupt(
             host_fs.interrupt,
             host_fs.trigger,
@@ -1073,6 +1094,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         &handoff,
         &debug_state,
     ) {
+        hibernate_devices.network = Some(network.device.device().clone());
         gic.enable_device_interrupt(
             network.interrupt,
             network.trigger,
@@ -1081,6 +1103,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         routes.add_network(network.interrupt, network.device);
     }
     if let Some(entropy) = entropy_device {
+        hibernate_devices.entropy = Some(entropy.device.device().clone());
         entropy::install(&kernel, &entropy, root_entropy.clone());
         gic.enable_device_interrupt(
             entropy.interrupt,
@@ -1096,6 +1119,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         &handoff,
         debug_state.machine_generation_handle(),
     ) {
+        hibernate_devices.balloon = Some(balloon.handler.device().clone());
         gic.enable_device_interrupt(
             balloon.interrupt,
             balloon.trigger,
@@ -1112,6 +1136,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         &handoff,
         &debug_state,
     ) {
+        hibernate_devices.vsock = Some(vsock.device.device().clone());
         gic.enable_device_interrupt(
             vsock.interrupt,
             vsock.trigger,
@@ -1127,6 +1152,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         &handoff,
         &debug_state,
     ) {
+        hibernate_devices.display = Some(display.device.device().clone());
         gic.enable_device_interrupt(
             display.interrupt,
             display.trigger,
@@ -1141,6 +1167,9 @@ extern "C" fn aarch64_kernel_main() -> ! {
         &handoff,
         &debug_state,
     ) {
+        hibernate_devices
+            .inputs
+            .push(device.device.device().clone());
         gic.enable_device_interrupt(
             device.interrupt,
             device.trigger,
@@ -1155,6 +1184,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         &handoff,
         &debug_state,
     ) {
+        hibernate_devices.sound = Some(sound.device.device().clone());
         gic.enable_device_interrupt(
             sound.interrupt,
             sound.trigger,
@@ -1169,8 +1199,9 @@ extern "C" fn aarch64_kernel_main() -> ! {
         physical_memory_offset,
         &handoff,
         &debug_state,
-        root_entropy,
+        root_entropy.clone(),
     ) {
+        hibernate_devices.blocks.push(block.device.device().clone());
         gic.enable_device_interrupt(
             block.interrupt,
             block.trigger,
@@ -1178,6 +1209,24 @@ extern "C" fn aarch64_kernel_main() -> ! {
         );
         routes.add_block(block.interrupt, block.device);
     }
+
+    // Early-boot hibernate resume probe: runs with IRQs still masked, BEFORE
+    // starting secondary processors, enabling swap/init, or unmasking IRQs.
+    // If a valid authenticated hibernate image is present on the
+    // `"helios-hibernate"` block device, this enters the restore trampoline
+    // and never returns.
+    hibernate::probe_and_resume_if_present(
+        &cpu,
+        &kernel,
+        &debug_state,
+        pool,
+        &root_entropy,
+        rtc.as_ref(),
+        &mut hibernate_devices,
+        physical_memory_offset,
+        &[],
+    );
+    helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
 
     // Everything the kernel drives itself has claimed its interrupt by
     // now, so what the firmware described and nobody took is exactly
@@ -1390,6 +1439,25 @@ impl Cpu for Aarch64Cpu {
             .restart(self.state.psci(), slot.mp_info.mpidr, self.state.timebase);
     }
 
+    fn wait_processor_stopped(&self, processor: ProcessorId) {
+        let slot = self.state.processor_slot(processor);
+        slot.power
+            .wait_stopped(self.state.psci(), slot.mp_info.mpidr, self.state.timebase);
+    }
+
+    fn restore_bsp_post_resume_state(&self) {
+        self.state.user_isolation.enable_on_current_processor();
+        #[cfg(feature = "native-users")]
+        native::enable_user_cache_maintenance();
+        enable_pmu_for_current_processor();
+        self.state
+            .gic()
+            .reinitialize_after_resume(self.state.bootstrap_mpidr());
+        // `FrozenMachine` still holds `Aarch64WakeOnlyMask`, so keep the GIC
+        // CPU interface priority mask at wake-only until `FrozenMachine` thaws.
+        let _ = gic::raise_priority_mask_to_wake_only();
+    }
+
     fn wake_processor(&self, processor: ProcessorId) {
         let slot = self.state.processor_slot(processor);
         // Publish before signalling: `park_current` masks interrupts
@@ -1503,12 +1571,30 @@ impl Cpu for Aarch64Cpu {
 
         // SAFETY: `&raw mut raw` is a valid, aligned `Aarch64SnapshotContext`
         // matching the field offsets pinned for `__helios_aarch64_capture_bsp_state`.
-        let status = unsafe { __helios_aarch64_capture_bsp_state(&raw mut raw) };
-        if status == 0 {
+        let result = unsafe { __helios_aarch64_capture_bsp_state(&raw mut raw) };
+        if result.status == 0 {
             *context = BspSnapshotContext::from_aarch64(&raw);
             Ok(SnapshotPoint::Captured)
         } else {
-            Ok(SnapshotPoint::Resumed)
+            let handoff_virt = (result.handoff_phys as usize)
+                .checked_add(self.state.physical_memory_offset)
+                .expect("AArch64 hibernate resume handoff overflows HHDM");
+            // SAFETY: the restore trampoline wrote a valid `ResumeHandoffWire`
+            // at `result.handoff_phys` on the safe trampoline page mapped via HHDM.
+            let wire = unsafe {
+                core::ptr::read(core::ptr::with_exposed_provenance::<ResumeHandoffWire>(
+                    handoff_virt,
+                ))
+            };
+            // Wipe the handoff copy (which contains fresh boot entropy) once consumed.
+            // SAFETY: `handoff_virt` is exclusively owned by this resuming BSP.
+            unsafe {
+                core::ptr::write_volatile(
+                    core::ptr::with_exposed_provenance_mut::<ResumeHandoffWire>(handoff_virt),
+                    ResumeHandoffWire::default(),
+                );
+            }
+            Ok(SnapshotPoint::Resumed(ResumeHandoff::from_wire(wire)))
         }
     }
 

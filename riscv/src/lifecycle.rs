@@ -199,10 +199,34 @@ extern "C" fn helios_hart_resume(hart_id: usize, context: &SavedContext) -> ! {
         asm!("csrc sip, {}", in(reg) 1usize << 1, options(nomem, nostack));
     }
     sbi_rt::set_timer(u64::MAX);
+    if let Some(runtime) = super::installed_hart_runtime()
+        && let Some(interrupts) = runtime.external_interrupts
+    {
+        interrupts.open();
+    }
     parked_slot(hart).store(0, Ordering::Release);
     // SAFETY: `context` is the one `__helios_hart_suspend` filled for
     // this hart.
     unsafe { __helios_hart_resume_return(context) }
+}
+
+pub(super) fn wait_hart_stopped(hart: ProcessorId) {
+    let slot = parked_slot(hart);
+    while slot.load(Ordering::Acquire) == 0 {
+        core::hint::spin_loop();
+    }
+    loop {
+        match hart_status(hart) {
+            sbi_spec::hsm::hart_state::STOPPED => return,
+            sbi_spec::hsm::hart_state::STARTED | sbi_spec::hsm::hart_state::STOP_PENDING => {
+                core::hint::spin_loop();
+            }
+            state => panic!(
+                "hart {} reported unexpected SBI HSM state {state} while stopping",
+                hart.id()
+            ),
+        }
+    }
 }
 
 pub(super) fn restart_processor(hart: ProcessorId) {

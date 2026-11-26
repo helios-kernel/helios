@@ -16,13 +16,19 @@ use helios_hal::io::IoError;
 use helios_kernel::{ExternalInterruptHandler, HardwareEntropySource, RootEntropyHandle};
 use triomphe::Arc;
 
-type Aarch64VirtioRngDevice = helios_virtio::VirtioRngDevice<
+pub(crate) type Aarch64VirtioRngDevice = helios_virtio::VirtioRngDevice<
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<crate::Aarch64DmaPool>>,
 >;
 
 #[derive(Clone)]
 pub(crate) struct VirtioEntropyDevice {
     device: Arc<Aarch64VirtioRngDevice>,
+}
+
+impl VirtioEntropyDevice {
+    pub(crate) fn device(&self) -> &Arc<Aarch64VirtioRngDevice> {
+        &self.device
+    }
 }
 
 /// The entropy device the bootstrap processor brought up, together with

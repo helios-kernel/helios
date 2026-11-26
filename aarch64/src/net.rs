@@ -10,9 +10,9 @@ use helios_kernel::{
 };
 use triomphe::Arc;
 
-type Aarch64VirtioNetTransport =
+pub(crate) type Aarch64VirtioNetTransport =
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<crate::Aarch64DmaPool>>;
-type Aarch64VirtioNetDevice = helios_virtio::VirtioNetDevice<Aarch64VirtioNetTransport>;
+pub(crate) type Aarch64VirtioNetDevice = helios_virtio::VirtioNetDevice<Aarch64VirtioNetTransport>;
 
 #[derive(Clone)]
 pub(crate) struct VirtioNetworkDevice {
@@ -24,6 +24,12 @@ pub(crate) struct VirtioNetworkDevice {
     /// whichever processor owns them. Waking the owners is the only
     /// steering a single-line transport can do.
     cpu: crate::Aarch64Cpu,
+}
+
+impl VirtioNetworkDevice {
+    pub(crate) fn device(&self) -> &Arc<Aarch64VirtioNetDevice> {
+        &self.inner
+    }
 }
 
 impl ExternalInterruptHandler for VirtioNetworkDevice {

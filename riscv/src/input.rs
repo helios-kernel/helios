@@ -32,6 +32,12 @@ pub(crate) struct VirtioInputDevice {
     inner: Arc<helios_virtio::VirtioMmioInputDevice>,
 }
 
+impl VirtioInputDevice {
+    pub(crate) fn device(&self) -> &Arc<helios_virtio::VirtioMmioInputDevice> {
+        &self.inner
+    }
+}
+
 /// One input device the bootstrap hart brought up, together with the
 /// PLIC line the device tree routes it to.
 pub(crate) struct InputInterrupt {
@@ -56,13 +62,14 @@ pub(crate) fn count_input_devices(fdt: &Fdt<'_>) -> usize {
 /// One call for every device rather than one per device: the kernel owns
 /// the machine's input devices as a set, because that is what a program
 /// asking "what can I read?" is answered from.
-pub(crate) fn install<WatchdogImpl>(
-    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl>,
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
+    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl, MeasuredBootImpl>,
     fdt: &Fdt<'_>,
     debug_state: &crate::debug_state::RuntimeState,
 ) -> Vec<InputInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let discovered = discover_input_devices(fdt);
     let service = helios_kernel::install_input_devices(

@@ -1149,16 +1149,26 @@ where
     }
 
     // The signing key is settled before any program can be admitted,
-    // with the measured-boot device the platform handed the kernel.
-    let mut measured_boot = kernel.take_measured_boot();
-    let settled = crate::signing_key::settle_signing_key_at_bring_up(
-        measured_boot.as_mut(),
-        debug_state.payload_body(),
-        debug_state.root_entropy(),
-    );
-    let cwasm_signing_key = settled.key;
-    debug_state.install_machine_identity_key(settled.machine_identity);
-    debug_state.install_hibernate_auth(settled.hibernate_auth, settled.source);
+    // with the measured-boot device the platform handed the kernel. Bare-metal
+    // backends settle it early during BSP bring-up (ahead of the hibernate
+    // resume probe); reuse that key directly instead of touching TPM again.
+    let cwasm_signing_key = if let Some(key) = debug_state.take_settled_cwasm_signing_key() {
+        assert!(
+            kernel.take_measured_boot().is_none(),
+            "the signing key was settled early without consuming the kernel's measured-boot device"
+        );
+        key
+    } else {
+        let mut measured_boot = kernel.take_measured_boot();
+        let settled = crate::signing_key::settle_signing_key_at_bring_up(
+            measured_boot.as_mut(),
+            debug_state.payload_body(),
+            debug_state.root_entropy(),
+        );
+        debug_state.install_machine_identity_key(settled.machine_identity);
+        debug_state.install_hibernate_auth(settled.hibernate_auth, settled.source);
+        settled.key
+    };
     // Selected by the backend when it built the runtime state, before any
     // secondary processor ran guest code, and logged once here: this is the
     // single place every backend's program service passes through, after the

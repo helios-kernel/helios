@@ -30,6 +30,12 @@ pub(crate) struct VirtioBlockDevice {
     inner: RiscvVirtioBlockDevice,
 }
 
+impl VirtioBlockDevice {
+    pub(crate) fn device(&self) -> &RiscvVirtioBlockDevice {
+        &self.inner
+    }
+}
+
 /// One block device the bootstrap hart brought up, together with the
 /// PLIC line the device tree routes it to.
 pub(crate) struct BlockInterrupt {
@@ -49,15 +55,16 @@ pub(crate) fn count_block_devices(fdt: &Fdt<'_>) -> usize {
 
 /// Brings up every block device on the platform bus and hands them to
 /// the kernel, which gives each the role its serial names.
-pub(crate) fn install<WatchdogImpl>(
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     cpu: &RiscvCpu,
-    kernel: &helios_kernel::Kernel<RiscvCpu, WatchdogImpl>,
+    kernel: &helios_kernel::Kernel<RiscvCpu, WatchdogImpl, MeasuredBootImpl>,
     fdt: &Fdt<'_>,
     debug_state: &RuntimeState,
     root: helios_kernel::RootEntropyHandle,
 ) -> Vec<BlockInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let discovered = discover_block_devices(cpu, fdt);
     let devices: Vec<_> = discovered

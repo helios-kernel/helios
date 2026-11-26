@@ -158,6 +158,10 @@ pub(crate) struct HostedMachine {
     /// nanosecond.
     timebase: Timebase,
     heap: HeapReservation,
+    #[cfg(test)]
+    next_resume_handoff: Mutex<Option<helios_hal::cpu::ResumeHandoff>>,
+    #[cfg(test)]
+    bsp_post_resume_restores: std::sync::atomic::AtomicUsize,
     slots: Box<[ProcessorSlot]>,
     timer_tx: Sender<TimerCommand>,
 }
@@ -274,6 +278,10 @@ impl HostedMachine {
             started_at,
             timebase: Timebase::new(NANOS_PER_SECOND),
             heap: HeapReservation::new(heap_bytes),
+            #[cfg(test)]
+            next_resume_handoff: Mutex::new(None),
+            #[cfg(test)]
+            bsp_post_resume_restores: std::sync::atomic::AtomicUsize::new(0),
             slots: (0..processor_count).map(|_| ProcessorSlot::new()).collect(),
             timer_tx,
         });
@@ -388,7 +396,10 @@ impl HostedMachine {
         let slot = self.slot(processor);
         let mut run = slot.run.lock().unwrap();
         match *run {
-            SlotRun::Running => *run = SlotRun::Stopped,
+            SlotRun::Running => {
+                *run = SlotRun::Stopped;
+                slot.restarted.notify_all();
+            }
             SlotRun::RestartPending => {
                 *run = SlotRun::Running;
                 return;
@@ -404,6 +415,35 @@ impl HostedMachine {
         // timer thread fired into a stopped processor, which takes no
         // interrupt: it comes back with a fresh deadline of its own.
         slot.timer_interrupt.store(false, Ordering::Release);
+    }
+
+    /// Blocks until `processor` has entered [`SlotRun::Stopped`].
+    pub(crate) fn wait_processor_stopped(&self, processor: ProcessorId) {
+        let slot = self.slot(processor);
+        let mut run = slot.run.lock().unwrap();
+        while *run == SlotRun::Running {
+            run = slot.restarted.wait(run).unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_next_resume_handoff(&self, handoff: helios_hal::cpu::ResumeHandoff) {
+        *self.next_resume_handoff.lock().unwrap() = Some(handoff);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_next_resume_handoff(&self) -> Option<helios_hal::cpu::ResumeHandoff> {
+        self.next_resume_handoff.lock().unwrap().take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_bsp_post_resume_restore(&self) {
+        self.bsp_post_resume_restores.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bsp_post_resume_restores(&self) -> usize {
+        self.bsp_post_resume_restores.load(Ordering::SeqCst)
     }
 
     /// Puts a stopped processor's thread back in service; one that has

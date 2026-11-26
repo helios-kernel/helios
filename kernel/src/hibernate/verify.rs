@@ -98,22 +98,14 @@ pub fn verify_identity(
     Ok(())
 }
 
-/// Verifies the hibernate header MAC, bounds, machine identity, and chunk
-/// table integrity, returning the authenticated header and descriptors.
-///
-/// No heap allocation is performed until the header HMAC-SHA256, bounds,
-/// identity, and chunk table SHA-256 have all verified.
-pub fn verify_image_header_and_table(
-    image: &[u8],
-    auth_key: &HibernateAuthKey,
-    expected_identity: &HibernateIdentity,
+/// Validates overflow-safe header bounds and layout offsets against
+/// `backing_bytes` (image slice length or disk capacity) and
+/// `machine_max_frames` without performing any heap allocation.
+pub(crate) fn validate_header_bounds(
+    header: &HibernateHeader,
+    backing_bytes: u64,
     machine_max_frames: u64,
-) -> Result<VerifiedHibernateImage, HibernateError> {
-    // Steps 1-2: length, magic, version, and constant-time HMAC-SHA256.
-    // ZERO allocations happen before or inside this call.
-    let header = HibernateHeader::decode_verified(image, auth_key)?;
-
-    // Step 3: overflow-safe bounds checks before any allocation.
+) -> Result<u64, HibernateError> {
     if header.total_frames > machine_max_frames || header.total_frames > header.machine_max_frames {
         return Err(HibernateError::FrameCountExceedsMachine {
             image_frames: header.total_frames,
@@ -160,27 +152,28 @@ pub fn verify_image_header_and_table(
             reason: "chunk table extends past total_image_bytes",
         });
     }
-    let image_len_u64 = image.len() as u64;
-    if table_end > image_len_u64 || header.total_image_bytes > image_len_u64 {
+    if table_end > backing_bytes || header.total_image_bytes > backing_bytes {
         return Err(HibernateError::TruncatedChunkTable);
     }
+    Ok(table_end)
+}
 
-    // Step 4: verify every identity field individually.
-    verify_identity(&header.identity, &header.identity_sha256, expected_identity)?;
-
-    // Step 5: verify chunk table SHA-256 BEFORE allocating or decoding entries.
-    let table_start = usize::try_from(header.chunk_table_offset)
-        .map_err(|_| HibernateError::TruncatedChunkTable)?;
-    let table_end_usize =
-        usize::try_from(table_end).map_err(|_| HibernateError::TruncatedChunkTable)?;
-    let table_bytes = &image[table_start..table_end_usize];
+/// Verifies `table_bytes` against `header.chunk_table_sha256` and parses +
+/// validates every [`ChunkDescriptor`].
+pub(crate) fn verify_and_parse_chunk_table(
+    header: &HibernateHeader,
+    table_bytes: &[u8],
+    machine_max_frames: u64,
+) -> Result<Vec<ChunkDescriptor>, HibernateError> {
+    if table_bytes.len() as u64 != header.chunk_table_len {
+        return Err(HibernateError::TruncatedChunkTable);
+    }
     let table_digest: [u8; 32] = Sha256::digest(table_bytes).into();
     if !constant_time_eq_32(&table_digest, &header.chunk_table_sha256) {
         return Err(HibernateError::ChunkTableChecksumMismatch);
     }
 
-    // Step 6: header MAC, bounds, identity, and chunk table digest are all
-    // authenticated; safe to allocate and parse chunk descriptors.
+    let header_bytes_u64 = HEADER_BYTES as u64;
     let chunk_count = header.chunk_count as usize;
     let mut chunks = Vec::with_capacity(chunk_count);
     let mut total_frames_acc = 0_u64;
@@ -277,6 +270,65 @@ pub fn verify_image_header_and_table(
         });
     }
 
+    Ok(chunks)
+}
+
+/// Verifies a compressed chunk's SHA-256 **before** bounded `zrip`
+/// decompression and checks that the decompressed length equals
+/// `desc.uncompressed_len`.
+pub(crate) fn verify_and_decompress_chunk<'a>(
+    decoder: &'a mut DecompressContext,
+    desc: &ChunkDescriptor,
+    chunk_index: u32,
+    compressed: &'a [u8],
+) -> Result<alloc::borrow::Cow<'a, [u8]>, HibernateError> {
+    let digest: [u8; 32] = Sha256::digest(compressed).into();
+    if !constant_time_eq_32(&digest, &desc.sha256) {
+        return Err(HibernateError::ChunkChecksumMismatch { chunk_index });
+    }
+    let expected_len = desc.uncompressed_len as usize;
+    let decompressed = decoder
+        .decompress_with_limit(compressed, expected_len)
+        .map_err(|_| HibernateError::DecompressFailed { chunk_index })?;
+    if decompressed.len() != expected_len {
+        return Err(HibernateError::DecompressedLengthMismatch {
+            chunk_index,
+            actual: decompressed.len(),
+            expected: expected_len,
+        });
+    }
+    Ok(decompressed)
+}
+
+/// Verifies the hibernate header MAC, bounds, machine identity, and chunk
+/// table integrity, returning the authenticated header and descriptors.
+///
+/// No heap allocation is performed until the header HMAC-SHA256, bounds,
+/// identity, and chunk table SHA-256 have all verified.
+pub fn verify_image_header_and_table(
+    image: &[u8],
+    auth_key: &HibernateAuthKey,
+    expected_identity: &HibernateIdentity,
+    machine_max_frames: u64,
+) -> Result<VerifiedHibernateImage, HibernateError> {
+    // Steps 1-2: length, magic, version, and constant-time HMAC-SHA256.
+    // ZERO allocations happen before or inside this call.
+    let header = HibernateHeader::decode_verified(image, auth_key)?;
+
+    // Step 3: overflow-safe bounds checks before any allocation.
+    let table_end = validate_header_bounds(&header, image.len() as u64, machine_max_frames)?;
+
+    // Step 4: verify every identity field individually.
+    verify_identity(&header.identity, &header.identity_sha256, expected_identity)?;
+
+    // Steps 5-6: verify chunk table SHA-256 BEFORE allocating or decoding entries.
+    let table_start = usize::try_from(header.chunk_table_offset)
+        .map_err(|_| HibernateError::TruncatedChunkTable)?;
+    let table_end_usize =
+        usize::try_from(table_end).map_err(|_| HibernateError::TruncatedChunkTable)?;
+    let table_bytes = &image[table_start..table_end_usize];
+    let chunks = verify_and_parse_chunk_table(&header, table_bytes, machine_max_frames)?;
+
     Ok(VerifiedHibernateImage { header, chunks })
 }
 
@@ -310,23 +362,8 @@ where
         let end = start + desc.compressed_len as usize;
         let compressed = &image[start..end];
 
-        // Verify chunk SHA-256 BEFORE handing bytes to zstd decompression.
-        let digest: [u8; 32] = Sha256::digest(compressed).into();
-        if !constant_time_eq_32(&digest, &desc.sha256) {
-            return Err(HibernateError::ChunkChecksumMismatch { chunk_index });
-        }
-
-        let expected_len = desc.uncompressed_len as usize;
-        let decompressed = decoder
-            .decompress_with_limit(compressed, expected_len)
-            .map_err(|_| HibernateError::DecompressFailed { chunk_index })?;
-        if decompressed.len() != expected_len {
-            return Err(HibernateError::DecompressedLengthMismatch {
-                chunk_index,
-                actual: decompressed.len(),
-                expected: expected_len,
-            });
-        }
+        let decompressed =
+            verify_and_decompress_chunk(&mut decoder, desc, chunk_index, compressed)?;
         write_chunk(desc.start_phys_frame, &decompressed)?;
     }
 

@@ -24,7 +24,7 @@ use crate::exceptions::INPUT_INTERRUPT_VECTORS;
 use crate::iommu::X86DmaPool;
 use crate::pci::{PciRoot, VirtioFunctions};
 
-type X86VirtioInputDevice = VirtioInputDevice<VirtioPciTransport<X86DmaPool>>;
+pub(crate) type X86VirtioInputDevice = VirtioInputDevice<VirtioPciTransport<X86DmaPool>>;
 
 /// The interrupt route's view of one input function.
 ///
@@ -34,6 +34,12 @@ type X86VirtioInputDevice = VirtioInputDevice<VirtioPciTransport<X86DmaPool>>;
 #[derive(Clone)]
 pub(crate) struct VirtioInputFunction {
     device: Arc<X86VirtioInputDevice>,
+}
+
+impl VirtioInputFunction {
+    pub(crate) fn device(&self) -> &Arc<X86VirtioInputDevice> {
+        &self.device
+    }
 }
 
 /// One input function the bootstrap processor brought up, together with

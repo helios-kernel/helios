@@ -21,7 +21,7 @@ use crate::RiscvCpu;
 use crate::debug_state::RuntimeState;
 
 type RiscvVirtioNetTransport = helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus>;
-type RiscvVirtioNetDevice = helios_virtio::VirtioNetDevice<RiscvVirtioNetTransport>;
+pub(crate) type RiscvVirtioNetDevice = helios_virtio::VirtioNetDevice<RiscvVirtioNetTransport>;
 
 #[derive(Clone)]
 pub(crate) struct VirtioNetworkDevice {
@@ -33,6 +33,12 @@ pub(crate) struct VirtioNetworkDevice {
     /// whichever hart owns the pair. Waking the owners is the only
     /// steering a single-source transport can do.
     cpu: RiscvCpu,
+}
+
+impl VirtioNetworkDevice {
+    pub(crate) fn device(&self) -> &Arc<RiscvVirtioNetDevice> {
+        &self.inner
+    }
 }
 
 /// The debug UART's route handler, keyed by the port's access type:
@@ -182,17 +188,18 @@ impl PlicInterrupt {
 /// PLIC line the device tree routes it to.
 pub(crate) struct NetworkInterrupt {
     line: PlicInterrupt,
-    device: VirtioNetworkDevice,
+    pub(crate) device: VirtioNetworkDevice,
 }
 
-pub(crate) fn install_network_service<WatchdogImpl>(
+pub(crate) fn install_network_service<WatchdogImpl, MeasuredBootImpl>(
     cpu: &RiscvCpu,
-    kernel: &Kernel<RiscvCpu, WatchdogImpl>,
+    kernel: &Kernel<RiscvCpu, WatchdogImpl, MeasuredBootImpl>,
     fdt: &Fdt<'_>,
     debug_state: &RuntimeState,
 ) -> Option<NetworkInterrupt>
 where
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     // The pair budget is the processor count: every activated pair is
     // drained by the one packet pump its owning hart runs, so a device
@@ -248,6 +255,7 @@ impl ExternalInterrupts {
     /// started it and before it sets `sie.SEIE`.
     fn open(&self) {
         for &source in &self.armed {
+            self.plic.set_priority(source, 1);
             self.set_source_enabled(source, true);
         }
         self.plic.set_threshold(self.context, 0);

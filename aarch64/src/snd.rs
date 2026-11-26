@@ -15,7 +15,7 @@ use arm_gic::{IntId, Trigger};
 use crate::platform::PlatformDescription;
 use helios_kernel::ExternalInterruptHandler;
 
-type Aarch64VirtioSndDevice = helios_virtio::VirtioSndDevice<
+pub(crate) type Aarch64VirtioSndDevice = helios_virtio::VirtioSndDevice<
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<crate::Aarch64DmaPool>>,
 >;
 
@@ -27,6 +27,12 @@ type Aarch64VirtioSndDevice = helios_virtio::VirtioSndDevice<
 #[derive(Clone)]
 pub(crate) struct VirtioSoundDevice {
     device: Arc<Aarch64VirtioSndDevice>,
+}
+
+impl VirtioSoundDevice {
+    pub(crate) fn device(&self) -> &Arc<Aarch64VirtioSndDevice> {
+        &self.device
+    }
 }
 
 /// The sound device the bootstrap processor brought up, together with

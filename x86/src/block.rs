@@ -33,6 +33,12 @@ pub(crate) struct VirtioBlockDevice {
     device: X86VirtioBlockDevice,
 }
 
+impl VirtioBlockDevice {
+    pub(crate) fn device(&self) -> &X86VirtioBlockDevice {
+        &self.device
+    }
+}
+
 /// One block function the bootstrap processor brought up, together with
 /// the IDT vector its messages are delivered on.
 pub(crate) struct BlockInterrupt {

@@ -24,6 +24,12 @@ pub(crate) struct VirtioBalloonInterrupt {
     inner: Arc<helios_virtio::VirtioMmioBalloonDevice>,
 }
 
+impl VirtioBalloonInterrupt {
+    pub(crate) fn device(&self) -> &Arc<helios_virtio::VirtioMmioBalloonDevice> {
+        &self.inner
+    }
+}
+
 impl ExternalInterruptHandler for VirtioBalloonInterrupt {
     fn handle_interrupt(&self) {
         self.inner.handle_interrupt();
@@ -44,13 +50,14 @@ pub(crate) fn has_balloon_device(fdt: &Fdt<'_>) -> bool {
 
 /// Brings up the platform's memory balloon and hands it to the kernel's
 /// balloon tasks.
-pub(crate) fn install<WatchdogImpl>(
-    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl>,
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
+    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl, MeasuredBootImpl>,
     fdt: &Fdt<'_>,
     generation: helios_kernel::MachineGenerationHandle,
 ) -> Option<BalloonInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let candidate = helios_virtio::mmio_candidates(fdt).find(|candidate| {
         crate::matches_virtio_mmio_device(candidate.base, helios_virtio::DeviceType::MemoryBalloon)

@@ -29,8 +29,9 @@
 //!    machine is thawed, and the typed error is returned to the caller.
 
 use alloc::vec;
+use core::time::Duration;
 
-use helios_hal::cpu::{BspSnapshotContext, Cpu, SnapshotPoint};
+use helios_hal::cpu::{BspSnapshotContext, Cpu, ResumeHandoff, SnapshotPoint};
 use helios_hal::fs::{BlockBuffer, BlockDevice};
 use helios_hal::io::IoError;
 use helios_hal::measured_boot::MeasuredBoot;
@@ -40,13 +41,15 @@ use helios_virtio::{PolledBlockError, QueueAffinity, VirtioBlockResource, Virtio
 use thiserror::Error;
 
 use super::HibernateError;
-use super::format::{HEADER_BYTES, HibernateHeader};
+use super::format::{DeviceFeatureRecord, HEADER_BYTES, HibernateHeader};
+use super::resume::build_machine_identity;
 use super::snapshot::{
-    AtomicSnapshotParams, EncodeParams, ReservationWriter, SnapshotSink,
+    AtomicSnapshotParams, EncodeParams, ReservationWriter, SnapshotConfig, SnapshotSink,
     collect_snapshot_physical_runs, encode_snapshot,
 };
-use crate::Kernel;
-use crate::memory::UserMemoryPool;
+use crate::machine::{AdvanceCause, MachineGeneration};
+use crate::memory::{RootEntropy, UserMemoryPool};
+use crate::{Kernel, RuntimeState};
 
 /// Canonical 512-byte sector size for the hibernate on-disk layout.
 pub const HIBERNATE_SECTOR_BYTES: usize = 512;
@@ -501,12 +504,103 @@ fn recover_devices_after_abort<Devices: HibernateDeviceController>(devices: &mut
     }
 }
 
+/// Kernel targets updated immediately inside the `SnapshotPoint::Resumed`
+/// continuation before the machine thaws.
+pub struct ResumeTargets<'a, ReseedWallClock>
+where
+    ReseedWallClock: FnOnce(u64, u64),
+{
+    pub machine_generation: &'a MachineGeneration,
+    pub root_entropy: &'a RootEntropy,
+    /// Callback `(current_ticks, rtc_unix_nanos)` updating the machine wall
+    /// clock from [`ResumeHandoff::rtc_unix_nanos`].
+    pub reseed_wall_clock: ReseedWallClock,
+}
+
+/// Applies the ordered post-resume continuation once the restore trampoline
+/// returns into [`SnapshotPoint::Resumed`]:
+///
+/// 1. Restore BSP architectural processor state (`cpu.restore_bsp_post_resume_state()`).
+/// 2. Advance [`MachineGeneration`] with `AdvanceCause::ImageRestored`, mix
+///    `handoff.fresh_entropy` into [`RootEntropy`], and reseed the wall clock
+///    from `handoff.rtc_unix_nanos`.
+/// 3. Reinitialize all platform devices (`virtio-iommu` strictly first).
+/// 4. Invalidate the hibernate image header on disk (`invalidate_hibernate_header`).
+/// 5. Drop reserved frames, restart stopped secondary processors, and thaw
+///    `frozen`.
+/// 6. Emit the resume diagnostic line naming `image_id` and `generation`.
+fn complete_resume_continuation<CpuImpl, WatchdogImpl, Storage, Devices, ReseedWallClock>(
+    cpu: &CpuImpl,
+    handoff: ResumeHandoff,
+    targets: ResumeTargets<'_, ReseedWallClock>,
+    storage: &mut Storage,
+    devices: &mut Devices,
+    writer: ReservationWriter<'_>,
+    frozen: crate::FrozenMachine<CpuImpl, WatchdogImpl>,
+) -> Result<HibernateOutcome, HibernateError>
+where
+    CpuImpl: Cpu + Clone,
+    WatchdogImpl: Watchdog,
+    Storage: HibernateStorage,
+    Devices: HibernateDeviceController,
+    ReseedWallClock: FnOnce(u64, u64),
+{
+    // 1. Restore BSP architectural processor state (APIC/IDT/XCR0/SMEP/SMAP/PAT/MTRR,
+    //    GICv3/PAC/MTE/PAN, PLIC/timer/trap vectors).
+    cpu.restore_bsp_post_resume_state();
+
+    // 2. Advance MachineGeneration, mix boot kernel's fresh entropy into
+    //    RootEntropy so draws immediately diverge from pre-hibernate output,
+    //    and reseed the wall clock from the boot kernel's RTC reading.
+    targets
+        .machine_generation
+        .advance(AdvanceCause::ImageRestored {
+            image_id: handoff.image_id,
+        });
+    targets
+        .root_entropy
+        .mix_resume_entropy(&handoff.fresh_entropy);
+    if let Some(rtc_unix_nanos) = handoff.rtc_unix_nanos {
+        (targets.reseed_wall_clock)(cpu.now().ticks(), rtc_unix_nanos);
+    }
+
+    // 3. Re-initialize all devices (`virtio-iommu` strictly FIRST when present).
+    let reinit_result = devices.reinitialize_all();
+
+    // 4. Invalidate the hibernate header on disk so a second boot from the same
+    //    disk cold-boots (only if device reinitialization succeeded so the disk
+    //    is online).
+    let invalidate_result = if reinit_result.is_ok() {
+        invalidate_hibernate_header(storage)
+    } else {
+        Ok(())
+    };
+
+    // 5. Release reserved frames, restart all stopped secondary processors
+    //    into their saved states, and thaw `FrozenMachine`.
+    drop(writer);
+    frozen.thaw();
+
+    reinit_result?;
+    invalidate_result?;
+
+    // 6. Emit the canonical post-resume log line.
+    let generation = targets.machine_generation.current().get();
+    tracing::info!(
+        image_id = format_args!("{:032x}", u128::from_be_bytes(handoff.image_id)),
+        generation,
+        "resumed from hibernate image"
+    );
+
+    Ok(HibernateOutcome::Resumed)
+}
+
 /// Orchestrates the complete hibernate-to-disk workflow and invokes `power_off`
 /// only after the final header flush succeeds while the machine is still frozen.
 ///
-/// Production callers should use [`hibernate_to_disk`], which passes
-/// `|| cpu.shutdown()`. Tests that cannot exit the host process use this
-/// entry point with a recording power-off hook.
+/// Production callers should use [`hibernate_to_disk`] or [`hibernate_machine`],
+/// which pass `|| cpu.shutdown()`. Tests that cannot exit the host process use
+/// this entry point with a recording power-off hook.
 #[expect(
     clippy::too_many_arguments,
     reason = "explicit static-dispatch dependencies keep the kernel free of global state and dynamic dispatch"
@@ -517,6 +611,7 @@ pub async fn hibernate_to_disk_with_power_off<
     MeasuredBootImpl,
     Storage,
     Devices,
+    ReseedWallClock,
     InterruptGuests,
     PowerOff,
 >(
@@ -524,6 +619,7 @@ pub async fn hibernate_to_disk_with_power_off<
     cpu: &CpuImpl,
     user_pool: &UserMemoryPool,
     params: AtomicSnapshotParams<'_>,
+    resume_targets: ResumeTargets<'_, ReseedWallClock>,
     storage: &mut Storage,
     devices: &mut Devices,
     interrupt_guests: InterruptGuests,
@@ -535,6 +631,7 @@ where
     MeasuredBootImpl: MeasuredBoot,
     Storage: HibernateStorage,
     Devices: HibernateDeviceController,
+    ReseedWallClock: FnOnce(u64, u64),
     InterruptGuests: FnOnce(),
     PowerOff: FnOnce(),
 {
@@ -554,7 +651,7 @@ where
         .ok_or(HibernateError::MissingBootMemoryMetadata)?;
 
     // 2. Pre-freeze disk capacity check: refuse an undersized disk BEFORE
-    //    reserving memory or calling `Kernel::freeze(...)`.
+    //    reserving memory or calling `Kernel::freeze_for_hibernate(...)`.
     let sector_size = storage.sector_size();
     let required_bytes = required_disk_bytes(reservation_bytes, sector_size)?;
     let disk_bytes = storage.capacity_bytes();
@@ -575,8 +672,11 @@ where
     let reservation_ranges = reservation.frame_ranges();
     let mut writer = ReservationWriter::new(reservation);
 
-    // 4. Freeze all processors at a scheduler boundary and quiesce all devices.
-    let frozen = kernel.freeze(arrival_deadline, interrupt_guests).await?;
+    // 4. Freeze all processors at a scheduler boundary, stop all online
+    //    secondaries into their saved resume contexts, and quiesce all devices.
+    let frozen = kernel
+        .freeze_for_hibernate(arrival_deadline, interrupt_guests)
+        .await?;
     if let Err(error) = devices.quiesce_all() {
         drop(writer);
         frozen.thaw();
@@ -594,15 +694,16 @@ where
             return Err(error.into());
         }
     };
-    if point == SnapshotPoint::Resumed {
-        // Resumed from a restored hibernate image: release reserved frames,
-        // reinitialize all devices (`virtio-iommu` first when present), then
-        // thaw all processors.
-        drop(writer);
-        let reinit_result = devices.reinitialize_all();
-        frozen.thaw();
-        reinit_result?;
-        return Ok(HibernateOutcome::Resumed);
+    if let SnapshotPoint::Resumed(handoff) = point {
+        return complete_resume_continuation(
+            cpu,
+            handoff,
+            resume_targets,
+            storage,
+            devices,
+            writer,
+            frozen,
+        );
     }
 
     // 6. Compress all reachable live frames into reserved user memory.
@@ -682,18 +783,24 @@ where
 /// Returns `Ok(HibernateOutcome::Resumed)` when execution resumes from the
 /// saved image on a future boot, or `Err(HibernateError)` if hibernation was
 /// refused or aborted cleanly without powering off.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit static-dispatch dependencies keep the kernel free of global state and dynamic dispatch"
+)]
 pub async fn hibernate_to_disk<
     CpuImpl,
     WatchdogImpl,
     MeasuredBootImpl,
     Storage,
     Devices,
+    ReseedWallClock,
     InterruptGuests,
 >(
     kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     cpu: &CpuImpl,
     user_pool: &UserMemoryPool,
     params: AtomicSnapshotParams<'_>,
+    resume_targets: ResumeTargets<'_, ReseedWallClock>,
     storage: &mut Storage,
     devices: &mut Devices,
     interrupt_guests: InterruptGuests,
@@ -704,6 +811,7 @@ where
     MeasuredBootImpl: MeasuredBoot,
     Storage: HibernateStorage,
     Devices: HibernateDeviceController,
+    ReseedWallClock: FnOnce(u64, u64),
     InterruptGuests: FnOnce(),
 {
     hibernate_to_disk_with_power_off(
@@ -711,10 +819,101 @@ where
         cpu,
         user_pool,
         params,
+        resume_targets,
         storage,
         devices,
         interrupt_guests,
         || cpu.shutdown(),
+    )
+    .await
+}
+
+/// High-level machine hibernate entry point wired directly to [`Kernel`] and
+/// [`RuntimeState`], ready for machine power-management callers.
+///
+/// Builds [`super::HibernateIdentity`] from the live kernel's `.text`/`.rodata`
+/// sections, firmware memory map, topology, device inventory, and negotiated
+/// `feature_records`, draws a fresh random 128-bit `image_id` from
+/// `runtime_state.root_entropy()`, and delegates to [`hibernate_to_disk`].
+///
+/// # Safety
+///
+/// `kernel.boot_memory()`'s immutable `.text` and `.rodata` descriptors must
+/// point to valid mapped kernel sections (always true on bare-metal boots).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit static-dispatch dependencies keep the kernel free of global state and dynamic dispatch"
+)]
+pub async unsafe fn hibernate_machine<
+    CpuImpl,
+    WatchdogImpl,
+    MeasuredBootImpl,
+    ProgramService,
+    NetworkService,
+    StorageImpl,
+    HibStorage,
+    Devices,
+    InterruptGuests,
+>(
+    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    cpu: &CpuImpl,
+    runtime_state: &RuntimeState<ProgramService, NetworkService, StorageImpl>,
+    user_pool: &UserMemoryPool,
+    feature_records: &[DeviceFeatureRecord],
+    reservation_bytes: usize,
+    arrival_deadline: Duration,
+    storage: &mut HibStorage,
+    devices: &mut Devices,
+    interrupt_guests: InterruptGuests,
+) -> Result<HibernateOutcome, HibernateError>
+where
+    CpuImpl: Cpu + Clone,
+    WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
+    ProgramService: Clone,
+    NetworkService: Clone,
+    StorageImpl: crate::Storage,
+    HibStorage: HibernateStorage,
+    Devices: HibernateDeviceController,
+    InterruptGuests: FnOnce(),
+{
+    let boot_memory = kernel
+        .boot_memory()
+        .ok_or(HibernateError::MissingBootMemoryMetadata)?;
+    // SAFETY: forwarded from `hibernate_machine`'s contract.
+    let identity = unsafe {
+        build_machine_identity(
+            boot_memory,
+            kernel.topology().configured_processors as u32,
+            kernel.devices(),
+            kernel.dma_model(),
+            feature_records,
+        )
+    }?;
+    let mut image_id = [0_u8; 16];
+    runtime_state.root_entropy().fill(&mut image_id);
+    let balloon = runtime_state.memory_balloon();
+
+    hibernate_to_disk(
+        kernel,
+        cpu,
+        user_pool,
+        AtomicSnapshotParams {
+            balloon: balloon.as_ref(),
+            auth_key: runtime_state.hibernate_auth_key(),
+            identity,
+            reservation_bytes,
+            arrival_deadline,
+            config: SnapshotConfig::new(image_id),
+        },
+        ResumeTargets {
+            machine_generation: runtime_state.machine_generation(),
+            root_entropy: runtime_state.root_entropy(),
+            reseed_wall_clock: |ticks, nanos| runtime_state.reseed_wall_clock_nanos(ticks, nanos),
+        },
+        storage,
+        devices,
+        interrupt_guests,
     )
     .await
 }

@@ -531,6 +531,42 @@ pub(crate) fn settle_signing_key_at_bring_up<Device: MeasuredBoot>(
     settled
 }
 
+/// Settles the boot's signing, machine-identity, and hibernate-authentication
+/// keys from the kernel's measured-boot device and installs them on
+/// `runtime_state`.
+///
+/// Bare-metal backends call this on the bootstrap processor immediately after
+/// seeding [`RootEntropy`] and before probing for a hibernate image on disk,
+/// so [`RuntimeState::hibernate_auth_key`] is available for early-boot resume
+/// verification without running TPM settlement a second time during program
+/// service installation.
+pub fn settle_boot_signing_keys<
+    CpuImpl,
+    WatchdogImpl,
+    MeasuredBootImpl,
+    ProgramService,
+    NetworkService,
+    StorageImpl,
+>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    runtime_state: &crate::RuntimeState<ProgramService, NetworkService, StorageImpl>,
+) where
+    CpuImpl: helios_hal::cpu::Cpu + Clone,
+    WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
+    ProgramService: Clone,
+    NetworkService: Clone,
+    StorageImpl: crate::Storage,
+{
+    let mut measured_boot = kernel.take_measured_boot();
+    let settled = settle_signing_key_at_bring_up(
+        measured_boot.as_mut(),
+        runtime_state.payload_body(),
+        runtime_state.root_entropy(),
+    );
+    runtime_state.install_settled_signing_key(settled);
+}
+
 /// A new seed from the root DRBG, written straight into the secret.
 fn draw_seed(entropy: &RootEntropy) -> SealedSecret {
     SealedSecret::filled_by(|bytes| entropy.fill(bytes))
