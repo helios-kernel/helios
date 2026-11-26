@@ -209,7 +209,8 @@ pub use limine_tpm_event_log::LimineTpmEventLogRequest;
 pub use linux_container::{
     ContainerConfig, ContainerError, ContainerFilesystem, ContainerId, ContainerMount,
     ContainerMountSharing, ContainerMountSnapshot, ContainerMountSpec, ContainerNodeInfo,
-    ContainerProcessGuard, ContainerResolved, LinuxContainer, LinuxContainerSnapshot,
+    ContainerOpenOutcome, ContainerProcessGuard, ContainerResolved, LinuxContainer,
+    LinuxContainerSnapshot,
 };
 pub use machine::{
     AdvanceCause, DeviceResets, GENERATION_PROBE_INTERVAL, Generation, MachineGeneration,
@@ -322,6 +323,12 @@ pub use vfs::{
     ROOT_LAYER_DEVICE, ReaderError, Resolved, RootFs, RootWrite, SharedOwner, Storage,
     UnixAttributes, XattrSetMode, object_identity, request_mount, request_unmount, symlink_target,
     within_directory,
+};
+#[cfg(feature = "linux")]
+pub use vfs::{
+    ContainerNetSnapshot, DevFs, FifoKey, FifoRegistry, NetIfSnapshot, NetRouteSnapshot,
+    ProcCaller, ProcFdEntry, ProcFs, ProcLimitEntry, ProcMapEntry, ProcMountEntry,
+    ProcProcessRecord, ProcRegistry, ProcThreadRecord, PtyRegistry, SharedUts, SysFs,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,

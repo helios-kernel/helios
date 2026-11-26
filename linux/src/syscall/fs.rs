@@ -30,6 +30,7 @@ pub const O_WRONLY: u64 = 1;
 pub const O_RDWR: u64 = 2;
 pub const O_CREAT: u64 = 1 << 6;
 pub const O_EXCL: u64 = 1 << 7;
+pub const O_NOCTTY: u64 = 1 << 8;
 pub const O_TRUNC: u64 = 1 << 9;
 pub const O_APPEND: u64 = 1 << 10;
 pub const O_NONBLOCK: u64 = 1 << 11;
@@ -185,6 +186,8 @@ pub struct OpenRequest {
     pub nofollow: bool,
     pub path_only: bool,
     pub append: bool,
+    pub nonblock: bool,
+    pub noctty: bool,
     pub sync: bool,
     pub dsync: bool,
     /// Raw creation permissions (`mode & 0o7777`) before applying `umask`.
@@ -192,6 +195,24 @@ pub struct OpenRequest {
     /// Calling process's `umask` (`0o777`), skipped when the parent directory
     /// carries a POSIX default ACL (`fs/posix_acl.c` `posix_acl_create`).
     pub umask: u32,
+}
+
+/// Result of [`Filesystem::open_descriptor`].
+pub enum OpenOutcome<R: Resources> {
+    /// Opened a file, pseudo device, named FIFO, or PTY master directly.
+    Descriptor(Descriptor<R>),
+    /// Opened `/proc/self/fd/<n>` (or `/dev/fd/<n>`, `/dev/stdin`..`stderr`):
+    /// duplicate/reopen the caller's existing descriptor `fd`.
+    ReopenFd { fd: i32 },
+    /// Opened `/dev/tty` or `/dev/console`: bind to the process's controlling
+    /// PTY if attached, else `fallback`, else `ENXIO`.
+    ControllingTty { fallback: Option<Descriptor<R>> },
+    /// Opened `/dev/pts/<n>` slave: attach as controlling PTY if the caller is
+    /// a session leader without one and `!noctty`.
+    PtySlave {
+        slave: helios_unix::PtySlave,
+        noctty: bool,
+    },
 }
 
 /// Timestamp update for `utimensat`.
@@ -363,6 +384,27 @@ pub trait Filesystem<R: Resources> {
 
     fn same_file(&self, _a: &R::File, _b: &R::File) -> bool {
         false
+    }
+
+    /// Whether standalone tests without a mounted `/dev` fall back to a
+    /// synthetic `/dev/null` on `NoEntry`. Real containers mount `DevFs` and
+    /// return `false`.
+    fn has_synthetic_dev_fallback(&self) -> bool {
+        true
+    }
+
+    /// Optional extended open hook returning rich descriptors (character
+    /// devices, PTYs, named FIFOs, `/proc/self/fd/<n>` reopens). Returning
+    /// `Ok(None)` falls back to [`Self::open`].
+    fn open_descriptor(
+        &mut self,
+        _base: Option<&R::File>,
+        _cwd: &str,
+        _path: &str,
+        _request: OpenRequest,
+        _creds: &Credentials,
+    ) -> impl Future<Output = Result<Option<OpenOutcome<R>>, FsOpError>> + Send {
+        async { Ok(None) }
     }
 
     fn open(
@@ -964,20 +1006,20 @@ fn read_xattr_name<M: UserMemory>(memory: &M, address: u64) -> Result<String, u6
     }
 }
 
-pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R>>(
+pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R> + tty::Tty>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &M,
     fs: &mut F,
-) -> u64 {
+) -> SyscallOutcome {
     let abi = process.shared.abi;
     let dirfd = args[0] as u32 as i32;
     let path = match read_user_path(memory, args[1]) {
         Ok(path) => path,
-        Err(err) => return err,
+        Err(err) => return SyscallOutcome::Return(err),
     };
     if path.is_empty() {
-        return errno(ENOENT);
+        return SyscallOutcome::Return(errno(ENOENT));
     }
     let flags = args[2] as u32 as u64;
     let raw_mode = args[3] as u32;
@@ -987,7 +1029,7 @@ pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R>>(
     let path_only = flags & O_PATH != 0;
     let accmode = flags & O_ACCMODE;
     if !path_only && accmode == 3 {
-        return errno(EINVAL);
+        return SyscallOutcome::Return(errno(EINVAL));
     }
     let read = !path_only && matches!(accmode, O_RDONLY | O_RDWR);
     let write = !path_only && matches!(accmode, O_WRONLY | O_RDWR);
@@ -1001,6 +1043,8 @@ pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         nofollow: flags & abi.o_nofollow() != 0,
         path_only,
         append: !path_only && (flags & O_APPEND != 0),
+        nonblock: !path_only && (flags & O_NONBLOCK != 0),
+        noctty: flags & O_NOCTTY != 0,
         sync: !path_only && (flags & O_SYNC_BIT != 0),
         dsync: !path_only && (flags & O_DSYNC != 0),
         mode,
@@ -1009,25 +1053,96 @@ pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R>>(
 
     let base = match dirfd_file(process, dirfd, &path, false, fs) {
         Ok(base) => base,
-        Err(err) => return err,
+        Err(err) => return SyscallOutcome::Return(err),
     };
     let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
     let cloexec = flags & O_CLOEXEC != 0;
-    let descriptor = match fs.open(base.as_ref(), &cwd, &path, request, &creds).await {
-        Ok(file) => FileDescriptor::File(OpenFile::new(file)),
+    let opened = match process
+        .signals
+        .interruptible(fs.open_descriptor(base.as_ref(), &cwd, &path, request, &creds))
+        .await
+    {
+        signal::WaitOutcome::Ready(Ok(Some(outcome))) => Ok(outcome),
+        signal::WaitOutcome::Ready(Ok(None)) => match process
+            .signals
+            .interruptible(fs.open(base.as_ref(), &cwd, &path, request, &creds))
+            .await
+        {
+            signal::WaitOutcome::Ready(result) => result
+                .map(|file| OpenOutcome::Descriptor(FileDescriptor::File(OpenFile::new(file)))),
+            signal::WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
+        },
+        signal::WaitOutcome::Ready(Err(error)) => Err(error),
+        signal::WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
+    };
+    let descriptor = match opened {
+        Ok(OpenOutcome::Descriptor(desc)) => desc,
+        Ok(OpenOutcome::ReopenFd { fd }) => {
+            let Some(existing) = process.shared.descriptors.lock().get_entry(fd).cloned() else {
+                return SyscallOutcome::Return(errno(ENOENT));
+            };
+            if existing.fdflags() & FDFLAG_PATH != 0 && !request.path_only {
+                return SyscallOutcome::Return(errno(EBADF));
+            }
+            // Re-open regular files through the filesystem so the new open
+            // description gets an independent offset; for pipes/FIFOs/sockets/
+            // PTYs/stdio/pseudo devices, clone the live descriptor handle.
+            match &existing.descriptor {
+                FileDescriptor::File(open) => {
+                    if let Some(target_path) = fs.file_path(open.node()) {
+                        let target_path = alloc::string::String::from(target_path);
+                        match fs.open(None, "/", &target_path, request, &creds).await {
+                            Ok(file) => FileDescriptor::File(OpenFile::new(file)),
+                            Err(error) => return SyscallOutcome::Return(fs_errno(error)),
+                        }
+                    } else {
+                        existing.descriptor
+                    }
+                }
+                _ => existing.descriptor,
+            }
+        }
+        Ok(OpenOutcome::ControllingTty { fallback }) => {
+            if let Some(ctty) = fs.controlling_pty() {
+                FileDescriptor::PtySlave(ctty)
+            } else if let Some(fb) = fallback {
+                fb
+            } else {
+                return SyscallOutcome::Return(errno(ENXIO));
+            }
+        }
+        Ok(OpenOutcome::PtySlave { slave, noctty }) => {
+            let sid = process
+                .shared
+                .pids
+                .sid(process.pid().get())
+                .map_or(process.pid().get(), core::num::NonZeroU32::get);
+            let pgid = process.shared.signals.pgid();
+            if !noctty
+                && process.pid().get() == sid
+                && fs.controlling_pty().is_none()
+                && slave.session_id().is_none()
+            {
+                slave.set_session_id(Some(sid));
+                slave.set_fg_pgrp(pgid);
+                fs.set_controlling_pty(Some(slave.clone()));
+            }
+            FileDescriptor::PtySlave(slave)
+        }
         Err(FsOpError::Fs(FsError::NoEntry))
-            if is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
+            if fs.has_synthetic_dev_fallback()
+                && is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
         {
             if path.ends_with('/') || request.directory {
-                return errno(ENOTDIR);
+                return SyscallOutcome::Return(errno(ENOTDIR));
             }
             if request.create && request.exclusive {
-                return errno(EEXIST);
+                return SyscallOutcome::Return(errno(EEXIST));
             }
             FileDescriptor::NullDevice
         }
-        Err(error) => return fs_errno(error),
+        Err(error) => return SyscallOutcome::Return(fs_errno(error)),
     };
     let entry = Entry::<R>::new(descriptor, cloexec);
     let mut fdflags = linux_to_fdflags(abi, flags);
@@ -1035,52 +1150,139 @@ pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         fdflags = FDFLAG_PATH;
     }
     entry.set_fdflags(fdflags);
-    process
-        .shared
-        .descriptors
-        .lock()
-        .insert_entry(entry)
-        .map_or_else(io::descriptor_errno, u64::from)
+    SyscallOutcome::Return(
+        process
+            .shared
+            .descriptors
+            .lock()
+            .insert_entry(entry)
+            .map_or_else(io::descriptor_errno, u64::from),
+    )
 }
 
-pub(super) async fn open<R: Resources, M: UserMemory, F: Filesystem<R>>(
-    process: &Process<R>,
-    args: [u64; 6],
-    memory: &M,
-    fs: &mut F,
-) -> u64 {
-    openat(
-        process,
-        [AT_FDCWD as u32 as u64, args[0], args[1], args[2], 0, 0],
-        memory,
-        fs,
-    )
-    .await
+pub(super) const fn open_to_openat_args(args: [u64; 6]) -> [u64; 6] {
+    [AT_FDCWD as u32 as u64, args[0], args[1], args[2], 0, 0]
 }
 
-pub(super) async fn creat<R: Resources, M: UserMemory, F: Filesystem<R>>(
-    process: &Process<R>,
-    args: [u64; 6],
-    memory: &M,
-    fs: &mut F,
-) -> u64 {
-    openat(
-        process,
-        [
-            AT_FDCWD as u32 as u64,
-            args[0],
-            O_CREAT | O_WRONLY | O_TRUNC,
-            args[1],
-            0,
-            0,
-        ],
-        memory,
-        fs,
-    )
-    .await
+pub(super) const fn creat_to_openat_args(args: [u64; 6]) -> [u64; 6] {
+    [
+        AT_FDCWD as u32 as u64,
+        args[0],
+        O_CREAT | O_WRONLY | O_TRUNC,
+        args[1],
+        0,
+        0,
+    ]
 }
 
 fn synthetic_stat<R: Resources, T: tty::Tty>(entry: &Entry<R>, tty: &T) -> FileStat {
+    match &entry.descriptor {
+        FileDescriptor::PseudoDevice(dev) => {
+            return FileStat {
+                dev: dev.dev,
+                ino: dev.ino,
+                kind: NodeKind::CharacterDevice,
+                permissions: dev.mode,
+                nlink: 1,
+                uid: dev.uid,
+                gid: dev.gid,
+                rdev: dev.rdev,
+                size: 0,
+                access_nanos: 0,
+                modified_nanos: 0,
+                status_nanos: 0,
+            };
+        }
+        FileDescriptor::FifoRead(r) => {
+            let attrs = r.inode().attrs();
+            return FileStat {
+                dev: attrs.dev,
+                ino: attrs.ino,
+                kind: NodeKind::Fifo,
+                permissions: attrs.mode,
+                nlink: 1,
+                uid: attrs.uid,
+                gid: attrs.gid,
+                rdev: 0,
+                size: 0,
+                access_nanos: 0,
+                modified_nanos: 0,
+                status_nanos: 0,
+            };
+        }
+        FileDescriptor::FifoWrite(w) => {
+            let attrs = w.inode().attrs();
+            return FileStat {
+                dev: attrs.dev,
+                ino: attrs.ino,
+                kind: NodeKind::Fifo,
+                permissions: attrs.mode,
+                nlink: 1,
+                uid: attrs.uid,
+                gid: attrs.gid,
+                rdev: 0,
+                size: 0,
+                access_nanos: 0,
+                modified_nanos: 0,
+                status_nanos: 0,
+            };
+        }
+        FileDescriptor::FifoReadWrite(rw) => {
+            let attrs = rw.inode().attrs();
+            return FileStat {
+                dev: attrs.dev,
+                ino: attrs.ino,
+                kind: NodeKind::Fifo,
+                permissions: attrs.mode,
+                nlink: 1,
+                uid: attrs.uid,
+                gid: attrs.gid,
+                rdev: 0,
+                size: 0,
+                access_nanos: 0,
+                modified_nanos: 0,
+                status_nanos: 0,
+            };
+        }
+        FileDescriptor::PtyMaster(master) => {
+            let (uid, gid, _) = master.attrs();
+            return FileStat {
+                dev: 1,
+                ino: 1,
+                kind: NodeKind::CharacterDevice,
+                permissions: 0o666,
+                nlink: 1,
+                uid,
+                gid,
+                rdev: helios_unix::encode_dev(helios_unix::CHAR_MAJOR_TTY, 2),
+                size: 0,
+                access_nanos: 0,
+                modified_nanos: 0,
+                status_nanos: 0,
+            };
+        }
+        FileDescriptor::PtySlave(slave) => {
+            let (uid, gid, mode) = slave.attrs();
+            return FileStat {
+                dev: 1,
+                ino: u64::from(slave.index()) + 3,
+                kind: NodeKind::CharacterDevice,
+                permissions: mode,
+                nlink: 1,
+                uid,
+                gid,
+                rdev: helios_unix::encode_dev(
+                    helios_unix::CHAR_MAJOR_UNIX98_PTY_SLAVE,
+                    slave.index(),
+                ),
+                size: 0,
+                access_nanos: 0,
+                modified_nanos: 0,
+                status_nanos: 0,
+            };
+        }
+        _ => {}
+    }
     let (kind, permissions, uid, gid) = match &entry.descriptor {
         FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } => {
             let attrs = inode.attrs();
@@ -1111,6 +1313,12 @@ fn synthetic_stat<R: Resources, T: tty::Tty>(entry: &Entry<R>, tty: &T) -> FileS
         FileDescriptor::Socket(_) => (NodeKind::Socket, 0o777, 0, 0),
         FileDescriptor::Event(_) | FileDescriptor::Epoll(_) => (NodeKind::File, 0o600, 0, 0),
         FileDescriptor::File(_) | FileDescriptor::Preopen { .. } => (NodeKind::File, 0o644, 0, 0),
+        FileDescriptor::PseudoDevice(_)
+        | FileDescriptor::FifoRead(_)
+        | FileDescriptor::FifoWrite(_)
+        | FileDescriptor::FifoReadWrite(_)
+        | FileDescriptor::PtyMaster(_)
+        | FileDescriptor::PtySlave(_) => unreachable!("handled above"),
     };
     FileStat {
         dev: 1,
@@ -1216,7 +1424,8 @@ pub(super) async fn newfstatat<R: Resources, M: UserMemory, F: Filesystem<R>, T:
         {
             Ok((stat, _)) => stat,
             Err(FsOpError::Fs(FsError::NoEntry))
-                if is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
+                if fs.has_synthetic_dev_fallback()
+                    && is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
             {
                 if path.ends_with('/') {
                     return errno(ENOTDIR);
@@ -1305,7 +1514,8 @@ pub(super) async fn statx<R: Resources, M: UserMemory, F: Filesystem<R>, T: tty:
         {
             Ok((stat, _)) => stat,
             Err(FsOpError::Fs(FsError::NoEntry))
-                if is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
+                if fs.has_synthetic_dev_fallback()
+                    && is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
             {
                 if path.ends_with('/') {
                     return errno(ENOTDIR);
@@ -1371,7 +1581,8 @@ pub(super) async fn faccessat<R: Resources, M: UserMemory, F: Filesystem<R>>(
     {
         Ok(()) => 0,
         Err(FsOpError::Fs(FsError::NoEntry))
-            if is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
+            if fs.has_synthetic_dev_fallback()
+                && is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
         {
             if path.ends_with('/') {
                 errno(ENOTDIR)
@@ -2196,11 +2407,66 @@ pub(super) async fn write_file<R: Resources, M: VirtualMemory, F: Filesystem<R>>
     written
 }
 
-pub(super) async fn pread64<R: Resources, M: UserMemory, F: Filesystem<R>>(
+fn is_seekable_mem_device<R: Resources>(entry: &Entry<R>) -> bool {
+    matches!(entry.descriptor, FileDescriptor::NullDevice)
+        || matches!(
+            entry.descriptor,
+            FileDescriptor::PseudoDevice(dev)
+                if matches!(
+                    dev.kind,
+                    helios_unix::PseudoDeviceKind::Null
+                        | helios_unix::PseudoDeviceKind::Zero
+                        | helios_unix::PseudoDeviceKind::Full
+                        | helios_unix::PseudoDeviceKind::Random
+                        | helios_unix::PseudoDeviceKind::Urandom
+                )
+        )
+}
+
+/// Rewrites `mmap(2)` arguments targeting `/dev/zero` into an anonymous
+/// zero-filled mapping after enforcing descriptor read/write permissions.
+pub(super) fn prepare_mmap_pseudo_zero<R: Resources>(
+    process: &Process<R>,
+    args: [u64; 6],
+) -> Result<[u64; 6], u64> {
+    const MAP_TYPE: u64 = 0x0f;
+    const MAP_SHARED: u64 = 0x01;
+    const MAP_SHARED_VALIDATE: u64 = 0x03;
+    const MAP_ANONYMOUS: u64 = 0x20;
+    const PROT_WRITE: u64 = 0x2;
+
+    let [hint, length, prot, flags, fd_raw, offset] = args;
+    if flags & MAP_ANONYMOUS != 0 {
+        return Ok(args);
+    }
+    let fd = fd_raw as u32 as i32;
+    let Some(entry) = process.shared.descriptors.lock().get_entry(fd).cloned() else {
+        return Ok(args);
+    };
+    if entry.fdflags() & FDFLAG_PATH != 0 {
+        return Ok(args);
+    }
+    let FileDescriptor::PseudoDevice(dev) = entry.descriptor else {
+        return Ok(args);
+    };
+    if dev.kind != helios_unix::PseudoDeviceKind::Zero {
+        return Ok(args);
+    }
+    if !dev.readable {
+        return Err(errno(EACCES));
+    }
+    let is_shared = matches!(flags & MAP_TYPE, MAP_SHARED | MAP_SHARED_VALIDATE);
+    if is_shared && (prot & PROT_WRITE != 0) && !dev.writable {
+        return Err(errno(EACCES));
+    }
+    Ok([hint, length, prot, flags | MAP_ANONYMOUS, fd_raw, offset])
+}
+
+pub(super) async fn pread64<R: Resources, M: UserMemory, O: Stdio + System + Filesystem<R>>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
-    fs: &mut F,
+    fs: &mut O,
 ) -> u64 {
     let Some(entry) = process
         .shared
@@ -2211,6 +2477,15 @@ pub(super) async fn pread64<R: Resources, M: UserMemory, F: Filesystem<R>>(
     else {
         return errno(EBADF);
     };
+    if is_seekable_mem_device::<R>(&entry) {
+        if (args[3] as i64) < 0 {
+            return errno(EINVAL);
+        }
+        return match io::read_resource::<R, _, _>(process, &entry, args, memory, fs).await {
+            SyscallOutcome::Return(n) => n,
+            _ => errno(EINTR),
+        };
+    }
     if entry_file::<R>(&entry).is_none() {
         return errno(ESPIPE);
     }
@@ -2226,11 +2501,11 @@ pub(super) async fn pread64<R: Resources, M: UserMemory, F: Filesystem<R>>(
     .await
 }
 
-pub(super) async fn pwrite64<R: Resources, M: VirtualMemory, F: Filesystem<R>>(
+pub(super) async fn pwrite64<R: Resources, M: VirtualMemory, O: Stdio + System + Filesystem<R>>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
-    fs: &mut F,
+    fs: &mut O,
 ) -> u64 {
     let Some(entry) = process
         .shared
@@ -2241,6 +2516,15 @@ pub(super) async fn pwrite64<R: Resources, M: VirtualMemory, F: Filesystem<R>>(
     else {
         return errno(EBADF);
     };
+    if is_seekable_mem_device::<R>(&entry) {
+        if (args[3] as i64) < 0 {
+            return errno(EINVAL);
+        }
+        return match io::write_resource::<R, _, _>(process, &entry, args, memory, fs).await {
+            SyscallOutcome::Return(n) => n,
+            _ => errno(EINTR),
+        };
+    }
     if entry_file::<R>(&entry).is_none() {
         return errno(ESPIPE);
     }
@@ -2294,7 +2578,7 @@ fn read_iovecs<M: UserMemory>(
 pub(super) async fn readv_common<
     R: Resources,
     M: UserMemory,
-    O: Stdio + Filesystem<R> + Network<R::Network>,
+    O: Stdio + System + Filesystem<R> + Network<R::Network>,
 >(
     process: &Process<R>,
     args: [u64; 6],
@@ -2315,7 +2599,10 @@ pub(super) async fn readv_common<
     else {
         return SyscallOutcome::Return(errno(EBADF));
     };
-    if explicit_offset.is_some() && entry_file::<R>(&entry).is_none() {
+    if explicit_offset.is_some()
+        && entry_file::<R>(&entry).is_none()
+        && !is_seekable_mem_device::<R>(&entry)
+    {
         return SyscallOutcome::Return(errno(ESPIPE));
     }
     if let Some(off) = explicit_offset
@@ -2421,7 +2708,7 @@ pub(super) async fn readv_common<
 pub(super) async fn writev_common<
     R: Resources,
     M: VirtualMemory,
-    O: Stdio + Filesystem<R> + Network<R::Network>,
+    O: Stdio + System + Filesystem<R> + Network<R::Network>,
 >(
     process: &Process<R>,
     args: [u64; 6],
@@ -2442,7 +2729,10 @@ pub(super) async fn writev_common<
     else {
         return SyscallOutcome::Return(errno(EBADF));
     };
-    if explicit_offset.is_some() && entry_file::<R>(&entry).is_none() {
+    if explicit_offset.is_some()
+        && entry_file::<R>(&entry).is_none()
+        && !is_seekable_mem_device::<R>(&entry)
+    {
         return SyscallOutcome::Return(errno(ESPIPE));
     }
     if let Some(off) = explicit_offset
@@ -2553,7 +2843,7 @@ pub(super) async fn lseek<R: Resources, F: Filesystem<R>>(
     if entry.fdflags() & FDFLAG_PATH != 0 {
         return errno(EBADF);
     }
-    if matches!(entry.descriptor, FileDescriptor::NullDevice) {
+    if is_seekable_mem_device::<R>(&entry) {
         return 0;
     }
     let Some(open) = entry_file::<R>(&entry) else {
@@ -2885,9 +3175,15 @@ pub(super) async fn fchmod<R: Resources, F: Filesystem<R>>(
         return errno(EBADF);
     }
     let creds = process_creds(process);
-    if let FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } =
-        &entry.descriptor
-    {
+    if let Some(inode) = match &entry.descriptor {
+        FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } => {
+            Some(inode)
+        }
+        FileDescriptor::FifoRead(r) => Some(r.inode()),
+        FileDescriptor::FifoWrite(w) => Some(w.inode()),
+        FileDescriptor::FifoReadWrite(rw) => Some(rw.inode()),
+        _ => None,
+    } {
         let attrs = inode.attrs();
         let meta = permissions::InodeMeta {
             kind: NodeKind::Fifo,
@@ -2898,6 +3194,22 @@ pub(super) async fn fchmod<R: Resources, F: Filesystem<R>>(
         return match permissions::check_chmod(&creds, meta, mode) {
             Ok(new_mode) => {
                 inode.set_mode(new_mode);
+                0
+            }
+            Err(error) => fs_errno(error),
+        };
+    }
+    if let FileDescriptor::PtySlave(slave) = &entry.descriptor {
+        let (uid, gid, cur_mode) = slave.attrs();
+        let meta = permissions::InodeMeta {
+            kind: NodeKind::CharacterDevice,
+            uid,
+            gid,
+            mode: cur_mode,
+        };
+        return match permissions::check_chmod(&creds, meta, mode) {
+            Ok(new_mode) => {
+                slave.set_mode(new_mode);
                 0
             }
             Err(error) => fs_errno(error),
@@ -2946,9 +3258,15 @@ pub(super) async fn fchownat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         let Some(entry) = process.shared.descriptors.lock().get_entry(dirfd).cloned() else {
             return errno(EBADF);
         };
-        if let FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } =
-            &entry.descriptor
-        {
+        if let Some(inode) = match &entry.descriptor {
+            FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } => {
+                Some(inode)
+            }
+            FileDescriptor::FifoRead(r) => Some(r.inode()),
+            FileDescriptor::FifoWrite(w) => Some(w.inode()),
+            FileDescriptor::FifoReadWrite(rw) => Some(rw.inode()),
+            _ => None,
+        } {
             return chown_pipe(inode, &creds, uid, gid);
         }
         let Some(open) = entry_file::<R>(&entry) else {
@@ -3041,10 +3359,32 @@ pub(super) async fn fchown<R: Resources, F: Filesystem<R>>(
         return errno(EBADF);
     }
     let creds = process_creds(process);
-    if let FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } =
-        &entry.descriptor
-    {
+    if let Some(inode) = match &entry.descriptor {
+        FileDescriptor::PipeRead { inode, .. } | FileDescriptor::PipeWrite { inode, .. } => {
+            Some(inode)
+        }
+        FileDescriptor::FifoRead(r) => Some(r.inode()),
+        FileDescriptor::FifoWrite(w) => Some(w.inode()),
+        FileDescriptor::FifoReadWrite(rw) => Some(rw.inode()),
+        _ => None,
+    } {
         return chown_pipe(inode, &creds, uid, gid);
+    }
+    if let FileDescriptor::PtySlave(slave) = &entry.descriptor {
+        let (cur_uid, cur_gid, cur_mode) = slave.attrs();
+        let meta = permissions::InodeMeta {
+            kind: NodeKind::CharacterDevice,
+            uid: cur_uid,
+            gid: cur_gid,
+            mode: cur_mode,
+        };
+        return match permissions::check_chown(&creds, meta, uid, gid) {
+            Ok(result) => {
+                slave.set_owner(result.uid, result.gid);
+                0
+            }
+            Err(error) => fs_errno(error),
+        };
     }
     let Some(open) = entry_file::<R>(&entry) else {
         return errno(EINVAL);

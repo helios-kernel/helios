@@ -36,7 +36,7 @@ pub use crate::abi::{Abi, Operation};
 pub use crate::signal_frame::SignalFrameError;
 pub use fs::{
     AccessCheck, DirListEntry, FileAccess, FileStat, Filesystem, FsOpError, LinkOptions,
-    OpenRequest, TimeUpdate, XattrSetMode,
+    OpenOutcome, OpenRequest, TimeUpdate, XattrSetMode,
 };
 pub use io::Clock;
 pub use netlink::{AF_NETLINK, NETLINK_ROUTE};
@@ -1119,14 +1119,14 @@ pub async fn dispatch<
             )
             .await
         }
-        Operation::Openat => {
-            SyscallOutcome::Return(fs::openat::<R, _, _>(process, arguments, memory, output).await)
-        }
-        Operation::Open => {
-            SyscallOutcome::Return(fs::open::<R, _, _>(process, arguments, memory, output).await)
-        }
-        Operation::Creat => {
-            SyscallOutcome::Return(fs::creat::<R, _, _>(process, arguments, memory, output).await)
+        op @ (Operation::Openat | Operation::Open | Operation::Creat) => {
+            let openat_args = match op {
+                Operation::Openat => arguments,
+                Operation::Open => fs::open_to_openat_args(arguments),
+                Operation::Creat => fs::creat_to_openat_args(arguments),
+                _ => unreachable!("matched Openat | Open | Creat"),
+            };
+            fs::openat::<R, _, _>(process, openat_args, memory, output).await
         }
         Operation::Close => SyscallOutcome::Return(
             process
@@ -1355,9 +1355,12 @@ pub async fn dispatch<
         Operation::Ppoll => poll::ppoll::<R, _, _>(process, arguments, memory, output).await,
         Operation::Select => poll::select::<R, _, _>(process, arguments, memory, output).await,
         Operation::Pselect6 => poll::pselect6::<R, _, _>(process, arguments, memory, output).await,
-        Operation::Mmap => {
-            SyscallOutcome::Return(memory::mmap(process, abi, arguments, memory, output).await)
-        }
+        Operation::Mmap => match fs::prepare_mmap_pseudo_zero(process, arguments) {
+            Ok(mmap_args) => {
+                SyscallOutcome::Return(memory::mmap(process, abi, mmap_args, memory, output).await)
+            }
+            Err(err) => SyscallOutcome::Return(err),
+        },
         Operation::Munmap => {
             SyscallOutcome::Return(memory::munmap(process, abi, arguments, memory, output).await)
         }
@@ -1418,7 +1421,13 @@ pub async fn dispatch<
         Operation::Setpgid => SyscallOutcome::Return(process::setpgid(process, arguments)),
         Operation::Getpgrp => SyscallOutcome::Return(process::getpgrp(process)),
         Operation::Getsid => SyscallOutcome::Return(process::getsid(process, arguments)),
-        Operation::Setsid => SyscallOutcome::Return(process::setsid(process)),
+        Operation::Setsid => {
+            let res = process::setsid(process);
+            if (res as i64) >= 0 {
+                output.set_controlling_pty(None);
+            }
+            SyscallOutcome::Return(res)
+        }
         Operation::Gettid => SyscallOutcome::Return(u64::from(process.tid.get())),
         Operation::SetTidAddress => {
             process.clear_child_tid = arguments[0];
@@ -1630,7 +1639,11 @@ pub async fn dispatch<
     ControlFlow::Continue(outcome)
 }
 
-async fn read<R: Resources, M: UserMemory, O: Stdio + Filesystem<R> + Network<R::Network>>(
+async fn read<
+    R: Resources,
+    M: UserMemory,
+    O: Stdio + System + Filesystem<R> + Network<R::Network>,
+>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -1723,7 +1736,7 @@ async fn read<R: Resources, M: UserMemory, O: Stdio + Filesystem<R> + Network<R:
         }
         return SyscallOutcome::Return(bytes.len() as u64);
     }
-    io::read_resource::<R, M>(&process.signals, &entry, args, memory).await
+    io::read_resource::<R, M, O>(process, &entry, args, memory, output).await
 }
 
 fn socket_context<R: Resources>(process: &Process<R>) -> socket::SocketContext {
@@ -1735,7 +1748,11 @@ fn socket_context<R: Resources>(process: &Process<R>) -> socket::SocketContext {
     }
 }
 
-async fn write<R: Resources, M: VirtualMemory, O: Stdio + Filesystem<R> + Network<R::Network>>(
+async fn write<
+    R: Resources,
+    M: VirtualMemory,
+    O: Stdio + System + Filesystem<R> + Network<R::Network>,
+>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -1776,7 +1793,7 @@ async fn write<R: Resources, M: VirtualMemory, O: Stdio + Filesystem<R> + Networ
     let stream = match &entry.descriptor {
         Descriptor::<R>::Stdout => Stream::Stdout,
         Descriptor::<R>::Stderr => Stream::Stderr,
-        _ => return io::write_resource::<R, M>(&process.signals, &entry, args, memory).await,
+        _ => return io::write_resource::<R, M, O>(process, &entry, args, memory, output).await,
     };
     let nonblock = entry.fdflags() & FDFLAG_NONBLOCK != 0;
     // Linux MAX_RW_COUNT is INT_MAX rounded down to PAGE_SIZE (x86-64: 4096).
