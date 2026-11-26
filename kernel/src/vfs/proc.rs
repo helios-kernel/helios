@@ -467,18 +467,18 @@ impl ProcFs {
     /// `(pid, fd)`.
     pub fn parse_proc_fd_path(path: FsPath<'_>) -> Option<(u32, i32)> {
         let mut parts = path.as_str().split('/');
-        let pid: u32 = parts.next()?.parse().ok()?;
+        let pid = parse_proc_pid(parts.next()?)?;
         let second = parts.next()?;
         if second == "fd" {
-            let fd: i32 = parts.next()?.parse().ok()?;
-            if parts.next().is_none() && fd >= 0 {
+            let fd = parse_proc_fd(parts.next()?)?;
+            if parts.next().is_none() {
                 return Some((pid, fd));
             }
         } else if second == "task" {
-            let _tid: u32 = parts.next()?.parse().ok()?;
+            let _tid = parse_proc_pid(parts.next()?)?;
             if parts.next()? == "fd" {
-                let fd: i32 = parts.next()?.parse().ok()?;
-                if parts.next().is_none() && fd >= 0 {
+                let fd = parse_proc_fd(parts.next()?)?;
+                if parts.next().is_none() {
                     return Some((pid, fd));
                 }
             }
@@ -709,7 +709,7 @@ impl ProcFs {
             Some((first, tail)) => (first, Some(tail)),
             None => (s, None),
         };
-        let pid: u32 = pid_str.parse().map_err(|_| FsError::NoEntry)?;
+        let pid = parse_proc_pid(pid_str).ok_or(FsError::NoEntry)?;
         let proc_rec = self.registry.process(pid).ok_or(FsError::NoEntry)?;
         self.resolve_process_node(&proc_rec, None, s, rest)
     }
@@ -969,7 +969,7 @@ impl ProcFs {
             }
             other => {
                 if let Some(fd_str) = other.strip_prefix("fd/") {
-                    let fd: i32 = fd_str.parse().map_err(|_| FsError::NoEntry)?;
+                    let fd = parse_proc_fd(fd_str).ok_or(FsError::NoEntry)?;
                     let entry = rec
                         .fds
                         .iter()
@@ -983,7 +983,7 @@ impl ProcFs {
                     });
                 }
                 if let Some(fd_str) = other.strip_prefix("fdinfo/") {
-                    let fd: i32 = fd_str.parse().map_err(|_| FsError::NoEntry)?;
+                    let fd = parse_proc_fd(fd_str).ok_or(FsError::NoEntry)?;
                     let entry = rec
                         .fds
                         .iter()
@@ -1008,7 +1008,7 @@ impl ProcFs {
                         Some((first, tail)) => (first, Some(tail)),
                         None => (task_rest, None),
                     };
-                    let tid: u32 = tid_str.parse().map_err(|_| FsError::NoEntry)?;
+                    let tid = parse_proc_pid(tid_str).ok_or(FsError::NoEntry)?;
                     let thread = rec.threads.get(&tid).ok_or(FsError::NoEntry)?;
                     return self.resolve_process_node(rec, Some(thread), full_path, task_sub);
                 }
@@ -1584,5 +1584,163 @@ impl FileSystem for ProcFs {
 
     async fn sync_data(&self, _path: FsPath<'_>) -> FsResult<()> {
         Ok(())
+    }
+}
+
+/// Parses a Linux `/proc/<pid>` or `/proc/<pid>/task/<tid>` path component,
+/// matching Linux `fs/proc/base.c` `name_to_int` (strict canonical decimal in
+/// `1..=i32::MAX`, rejecting leading zeroes and `'+'`).
+fn parse_proc_pid(s: &str) -> Option<u32> {
+    if s.is_empty() || s.starts_with('0') || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let val = s.parse::<u32>().ok()?;
+    (1..=(i32::MAX as u32)).contains(&val).then_some(val)
+}
+
+/// Parses a Linux `/proc/<pid>/fd/<n>` or `/proc/<pid>/fdinfo/<n>` path
+/// component (strict canonical decimal in `0..=i32::MAX`, rejecting leading
+/// zeroes on multi-digit values and `'+'`).
+fn parse_proc_fd(s: &str) -> Option<i32> {
+    if s != "0" && (s.is_empty() || s.starts_with('0') || !s.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    s.parse::<i32>().ok().filter(|&v| v >= 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spin::Mutex;
+
+    fn test_proc_fs() -> ProcFs {
+        let uts = Arc::new(Mutex::new(SharedUts {
+            hostname: UtsField::from_bytes(b"test").unwrap(),
+            domainname: UtsField::UNSET,
+        }));
+        let registry = ProcRegistry::new(uts, 1);
+        let mut rec = ProcProcessRecord::minimal(1, 0, "init", "/bin/init");
+        rec.fds.push(ProcFdEntry {
+            fd: 0,
+            target: String::from("/dev/null"),
+            pos: 0,
+            flags: 0,
+            mnt_id: 1,
+        });
+        rec.fds.push(ProcFdEntry {
+            fd: 3,
+            target: String::from("/tmp/a"),
+            pos: 0,
+            flags: 0,
+            mnt_id: 1,
+        });
+        registry.register_process(rec);
+        ProcFs::new(DeviceId::new(99), registry)
+    }
+
+    #[test]
+    fn strict_proc_pid_and_fd_name_parsing() {
+        assert_eq!(parse_proc_pid("1"), Some(1));
+        assert_eq!(parse_proc_pid("2147483647"), Some(i32::MAX as u32));
+        for bad in [
+            "",
+            "0",
+            "01",
+            "+1",
+            "-1",
+            "2147483648",
+            "4294967295",
+            "18446744073709551616",
+            "1a",
+        ] {
+            assert_eq!(parse_proc_pid(bad), None, "pid {bad:?} must be rejected");
+        }
+
+        assert_eq!(parse_proc_fd("0"), Some(0));
+        assert_eq!(parse_proc_fd("3"), Some(3));
+        assert_eq!(parse_proc_fd("2147483647"), Some(i32::MAX));
+        for bad in [
+            "",
+            "00",
+            "+0",
+            "-0",
+            "01",
+            "+1",
+            "2147483648",
+            "4294967295",
+            "18446744073709551616",
+        ] {
+            assert_eq!(parse_proc_fd(bad), None, "fd {bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn proc_fs_rejects_invalid_task_and_fd_names_with_no_entry() {
+        let fs = test_proc_fs();
+
+        // Valid paths resolve.
+        assert!(fs.stat_sync(FsPath::new("1").unwrap()).is_ok());
+        assert!(fs.stat_sync(FsPath::new("1/task/1").unwrap()).is_ok());
+        assert!(fs.stat_sync(FsPath::new("1/fd/0").unwrap()).is_ok());
+        assert!(fs.stat_sync(FsPath::new("1/fd/3").unwrap()).is_ok());
+        assert!(fs.stat_sync(FsPath::new("1/fdinfo/0").unwrap()).is_ok());
+        assert_eq!(
+            ProcFs::parse_proc_fd_path(FsPath::new("1/fd/0").unwrap()),
+            Some((1, 0))
+        );
+        assert_eq!(
+            ProcFs::parse_proc_fd_path(FsPath::new("1/task/1/fd/3").unwrap()),
+            Some((1, 3))
+        );
+
+        // Invalid PID, TID, and FD names must all return FsError::NoEntry.
+        for path in [
+            "0",
+            "01",
+            "+1",
+            "2147483648",
+            "4294967295",
+            "18446744073709551616",
+            "1/task/0",
+            "1/task/01",
+            "1/task/+1",
+            "1/task/2147483648",
+            "1/task/4294967295",
+            "1/task/18446744073709551616",
+            "1/fd/00",
+            "1/fd/+0",
+            "1/fd/03",
+            "1/fd/+3",
+            "1/fd/2147483648",
+            "1/fdinfo/00",
+            "1/fdinfo/+0",
+            "1/fdinfo/03",
+            "1/fdinfo/+3",
+        ] {
+            assert!(
+                matches!(
+                    fs.stat_sync(FsPath::new(path).unwrap()),
+                    Err(FsError::NoEntry)
+                ),
+                "expected NoEntry for /proc/{path}"
+            );
+        }
+
+        for path in [
+            "01/fd/0",
+            "+1/fd/0",
+            "2147483648/fd/0",
+            "1/fd/00",
+            "1/fd/+0",
+            "1/fd/03",
+            "1/task/01/fd/3",
+            "1/task/+1/fd/3",
+        ] {
+            assert_eq!(
+                ProcFs::parse_proc_fd_path(FsPath::new(path).unwrap()),
+                None,
+                "expected None for parse_proc_fd_path({path:?})"
+            );
+        }
     }
 }
