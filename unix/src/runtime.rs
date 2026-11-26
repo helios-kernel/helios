@@ -34,5 +34,14 @@ pub use open_file::*;
 mod resource;
 pub use resource::*;
 
+mod fifo;
+pub use fifo::*;
+
+mod pseudo;
+pub use pseudo::*;
+
+mod pty;
+pub use pty::*;
+
 mod socket;
 pub use socket::*;

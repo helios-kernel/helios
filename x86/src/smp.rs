@@ -326,6 +326,31 @@ pub(crate) struct BootContext {
     mtrrs: Mtrrs,
 }
 
+/// ACPI S5 soft-off register ports and sleep type values discovered from the
+/// FADT (`PM1a_CNT_BLK` / optional `PM1b_CNT_BLK`) and DSDT/AML `\_S5` package.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AcpiS5Shutdown {
+    pub(crate) pm1a_cnt_port: u16,
+    pub(crate) pm1b_cnt_port: Option<u16>,
+    pub(crate) slp_typ_a: u8,
+    pub(crate) slp_typ_b: u8,
+}
+
+impl AcpiS5Shutdown {
+    /// Bit shift of `SLP_TYP` in `PM1x_CNT` (ACPI 6.5 §4.8.3.2.1, bits 12:10).
+    const SLP_TYP_SHIFT: u16 = 10;
+    /// `SLP_EN` bit in `PM1x_CNT` (ACPI 6.5 §4.8.3.2.1, bit 13).
+    const SLP_EN: u16 = 1 << 13;
+
+    pub(crate) const fn pm1a_value(self) -> u16 {
+        (((self.slp_typ_a & 0x7) as u16) << Self::SLP_TYP_SHIFT) | Self::SLP_EN
+    }
+
+    pub(crate) const fn pm1b_value(self) -> u16 {
+        (((self.slp_typ_b & 0x7) as u16) << Self::SLP_TYP_SHIFT) | Self::SLP_EN
+    }
+}
+
 pub(crate) struct X86PlatformState {
     /// The bootstrap processor's kernel isolation, which every other
     /// processor matches (`isolation`). Immutable.
@@ -345,6 +370,8 @@ pub(crate) struct X86PlatformState {
     /// it, sends INIT/SIPI and holds this until the target has read the
     /// patched words, so two launches never overwrite each other's.
     wakeup_lock: spin::Mutex<()>,
+    /// ACPI S5 soft-off parameters discovered on the bootstrap processor.
+    acpi_s5: spin::Once<AcpiS5Shutdown>,
 }
 
 struct ProcessorSlot {
@@ -544,6 +571,7 @@ pub(crate) fn build_boot_context(
         wakeup_page,
         boot_context: AtomicPtr::new(core::ptr::null_mut()),
         wakeup_lock: spin::Mutex::new(()),
+        acpi_s5: spin::Once::new(),
     });
     if let Some(wakeup_page) = platform.wakeup_page.as_ref() {
         prepare_wakeup_page(&platform, wakeup_page);
@@ -1135,6 +1163,14 @@ impl X86PlatformState {
 
     pub(crate) fn debug_state(&self) -> debug_state::RuntimeState {
         self.debug_state.clone()
+    }
+
+    pub(crate) fn install_acpi_s5(&self, s5: AcpiS5Shutdown) {
+        self.acpi_s5.call_once(|| s5);
+    }
+
+    pub(crate) fn acpi_s5(&self) -> Option<AcpiS5Shutdown> {
+        self.acpi_s5.get().copied()
     }
 
     pub(crate) fn watchdog(&self) -> X86Watchdog {

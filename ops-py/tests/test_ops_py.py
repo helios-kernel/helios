@@ -128,6 +128,9 @@ async def test_live_session_all_operations_and_attenuation(tmp_path: Path) -> No
             stdin=b"input",
             grants=["dir:/tmp:rw", "net:tcp,dns"],
         )
+        assert child.instance_id == 99
+        await child.signal("TERM")
+        assert (99, 15) in guest.signals_sent
         out_chunk = await child.read_stdout()
         err_chunk = await child.read_stderr()
         spawn_res = await child.wait()
@@ -294,3 +297,26 @@ async def test_cli_entry_inline_script_and_repl(tmp_path: Path) -> None:
         )
         assert rc != 0
         assert "attenuation" in err.lower()
+
+        # 5. Resolve default target from targets.toml when HELIOS_TARGET is unset
+        store_path = tmp_path / "targets.toml"
+        store = helios.TargetStore.load(str(store_path))
+        store.upsert(helios.Target("local", guest.uri))
+        store.set_default("local")
+        store.save()
+
+        env_default = dict(os.environ)
+        env_default.pop("HELIOS_TARGET", None)
+        env_default["HELIOS_TARGETS_PATH"] = str(store_path)
+        rc, out, err = await _run_subproc(
+            [
+                sys.executable,
+                "-m",
+                "helios._cli_entry",
+                "-c",
+                "print(len(await ps()))",
+            ],
+            env=env_default,
+        )
+        assert rc == 0, err
+        assert out.strip() == "2"

@@ -48,16 +48,30 @@ use helios_hal::fs::{
 };
 use helios_linux::syscall::{
     AccessCheck, CAP_FSETID, CAP_FULL_SET, CAP_NET_ADMIN, CAP_NET_BIND_SERVICE, CAP_NET_RAW,
-    CAP_SYS_TIME, Credentials, FsOpError, OpenRequest, PidNamespace, TimeUpdate, UtsField,
-    XattrSetMode as LinuxXattrSetMode, permissions,
+    CAP_SYS_ADMIN, CAP_SYS_TIME, Credentials, FsOpError, OpenRequest, PidNamespace, TimeUpdate,
+    UtsField, XattrSetMode as LinuxXattrSetMode, permissions,
 };
-use helios_unix::FutexTable;
+use helios_unix::{
+    CHAR_MAJOR_MEM, CHAR_MAJOR_TTY, CHAR_MAJOR_UNIX98_PTY_SLAVE, FifoReadWrite, FifoReader,
+    FifoWriter, FutexTable, PseudoDevice, PseudoDeviceKind, PtyError, PtyMaster, PtySlave,
+};
+
+const CHAR_MINOR_NULL: u32 = 3;
+const CHAR_MINOR_ZERO: u32 = 5;
+const CHAR_MINOR_FULL: u32 = 7;
+const CHAR_MINOR_RANDOM: u32 = 8;
+const CHAR_MINOR_URANDOM: u32 = 9;
+const CHAR_MINOR_TTY: u32 = 0;
+const CHAR_MINOR_CONSOLE: u32 = 1;
+const CHAR_MINOR_PTMX: u32 = 2;
 use thiserror::Error;
+use triomphe::Arc as TriompheArc;
 
 use crate::vfs::{
-    FileContents, Follow, HeldPath, MAX_MOUNTS, MAX_SYMLINK_DEPTH, MemoryFs, MountFlags,
-    MountGrant, MountHold, MountSharing, MountedFs, Namespace, OverlayFs, PinnedLower,
-    PrivateMountClaim, PrivateMountClaimError, SharedOwner, Storage, UnixAttributes, UnixFsError,
+    DevFs, FifoKey, FifoRegistry, FileContents, Follow, HeldPath, MAX_MOUNTS, MAX_SYMLINK_DEPTH,
+    MemoryFs, MountFlags, MountGrant, MountHold, MountSharing, MountedFs, Namespace, OverlayFs,
+    PinnedLower, PrivateMountClaim, PrivateMountClaimError, ProcCaller, ProcFs, ProcMountEntry,
+    ProcRegistry, PtyRegistry, SharedOwner, SharedUts, Storage, SysFs, UnixAttributes, UnixFsError,
     XattrSetMode, join_fs_path, within_directory,
 };
 use crate::{
@@ -246,6 +260,7 @@ pub struct ContainerMount<S: Storage> {
     grant: MountGrant,
     authority_rights: DirectoryAuthorityRights,
     _private_claim: Option<PrivateMountClaim>,
+    is_pseudo: bool,
 }
 
 impl<S: Storage> ContainerMount<S> {
@@ -267,6 +282,12 @@ impl<S: Storage> ContainerMount<S> {
     /// Mount flags (`READ_ONLY`, `NO_SUID`, `NO_DEV`) visible inside this container.
     pub fn flags(&self) -> MountFlags {
         self.grant.flags()
+    }
+
+    /// Whether this mount is one of the default container-scoped pseudo
+    /// filesystems (`/dev`, `/dev/shm`, `/proc`, `/sys`).
+    pub const fn is_pseudo(&self) -> bool {
+        self.is_pseudo
     }
 }
 
@@ -513,12 +534,26 @@ impl<'a, S: Storage> ContainerResolved<'a, S> {
     }
 
     async fn describe(&self) -> FsResult<ContainerNodeInfo> {
-        let metadata = self.fs().stat(self.fs_path()).await?;
-        let unix_md = self
-            .fs()
-            .unix_metadata(self.fs_path())
-            .await
-            .map_err(UnixFsError::into_fs_error)?;
+        self.describe_for(None).await
+    }
+
+    async fn describe_for(&self, caller: Option<ProcCaller>) -> FsResult<ContainerNodeInfo> {
+        let mut metadata = self.fs().stat(self.fs_path()).await?;
+        if let MountedFs::Proc(proc_fs) = self.fs()
+            && metadata.kind == NodeKind::Symlink
+            && let Ok(target) = proc_fs.read_link_for(self.fs_path(), caller)
+        {
+            metadata.size = target.len() as u64;
+        }
+        let unix_md = match self.fs() {
+            MountedFs::Proc(proc_fs) => proc_fs
+                .unix_node_metadata(self.fs_path(), caller)
+                .map_err(UnixFsError::into_fs_error)?,
+            fs => fs
+                .unix_metadata(self.fs_path())
+                .await
+                .map_err(UnixFsError::into_fs_error)?,
+        };
         let unix = self.container_view(metadata.kind, unix_md.attributes);
         let rdev = if self.is_private() {
             u64::from(unix_md.rdev)
@@ -536,6 +571,44 @@ impl<'a, S: Storage> ContainerResolved<'a, S> {
     }
 }
 
+/// Result of opening a path inside a [`LinuxContainer`].
+pub enum ContainerOpenOutcome {
+    /// Regular file, directory, or `O_PATH` node backed by the container VFS.
+    Node {
+        info: ContainerNodeInfo,
+        container_path: String,
+        mount_hold: Option<MountHold>,
+    },
+    /// Pseudo character device (`1:3` null, `1:5` zero, `1:7` full, `1:8`
+    /// random, `1:9` urandom).
+    PseudoDevice(PseudoDevice),
+    /// Controlling terminal (`/dev/tty` `5:0` or `/dev/console` `5:1`).
+    ControllingTty {
+        is_console: bool,
+        dev: u64,
+        ino: u64,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+    },
+    /// Newly allocated UNIX98 PTY master (`/dev/ptmx` `5:2`).
+    PtyMaster(PtyMaster),
+    /// Opened UNIX98 PTY slave (`/dev/pts/<n>` `136:n`).
+    PtySlave { slave: PtySlave, noctty: bool },
+    /// Named FIFO read end (`O_RDONLY`).
+    FifoRead(FifoReader),
+    /// Named FIFO write end (`O_WRONLY`).
+    FifoWrite(FifoWriter),
+    /// Named FIFO read-write end (`O_RDWR`).
+    FifoReadWrite(FifoReadWrite),
+    /// Magic `/proc/<pid>/fd/<n>` descriptor reopen.
+    ProcFd {
+        pid: u32,
+        fd: i32,
+        container_path: String,
+    },
+}
+
 /// Container-visible description of a resolved filesystem node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContainerNodeInfo {
@@ -550,11 +623,15 @@ pub struct ContainerNodeInfo {
 }
 
 /// A container's isolated mount table: its own root `"/"` plus explicitly
-/// granted mounts, with no inherited host mounts.
+/// granted mounts and container-scoped pseudo-filesystems (`/dev`, `/dev/shm`,
+/// `/proc`, `/sys`), with no inherited host mounts.
 pub struct ContainerFilesystem<S: Storage> {
     /// Mounts visible inside the container; index 0 is always `"/"`.
     mounts: Vec<ContainerMount<S>>,
     shared_owner: SharedOwner,
+    ptys: PtyRegistry,
+    fifos: FifoRegistry,
+    proc_registry: ProcRegistry,
 }
 
 impl<S: Storage> ContainerFilesystem<S> {
@@ -566,6 +643,21 @@ impl<S: Storage> ContainerFilesystem<S> {
     /// Owner and group presented on every shared mount in this container.
     pub fn shared_owner(&self) -> SharedOwner {
         self.shared_owner
+    }
+
+    /// Per-container UNIX98 PTY registry (`/dev/ptmx`, `/dev/pts/<n>`).
+    pub fn ptys(&self) -> &PtyRegistry {
+        &self.ptys
+    }
+
+    /// Per-container named FIFO (`S_IFIFO`) rendezvous registry.
+    pub fn fifos(&self) -> &FifoRegistry {
+        &self.fifos
+    }
+
+    /// Per-container `/proc` process/mount/network registry.
+    pub fn proc_registry(&self) -> &ProcRegistry {
+        &self.proc_registry
     }
 
     /// Resolves `path` within this container's mount table without following a
@@ -796,6 +888,33 @@ impl<S: Storage> ContainerFilesystem<S> {
         follow_final: bool,
         creds: &Credentials,
     ) -> Result<(ContainerResolved<'_, S>, bool), FsOpError> {
+        self.walk_path_inner(base_dir, raw_path, follow_final, creds, None, false)
+            .await
+    }
+
+    /// Caller-aware variant of [`Self::walk_path_for`] that expands `/proc/self`
+    /// and `/proc/thread-self` using `caller`.
+    pub async fn walk_path_for_caller(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        follow_final: bool,
+        creds: &Credentials,
+        caller: Option<ProcCaller>,
+    ) -> Result<(ContainerResolved<'_, S>, bool), FsOpError> {
+        self.walk_path_inner(base_dir, raw_path, follow_final, creds, caller, false)
+            .await
+    }
+
+    async fn walk_path_inner(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        follow_final: bool,
+        creds: &Credentials,
+        caller: Option<ProcCaller>,
+        stop_at_proc_fd: bool,
+    ) -> Result<(ContainerResolved<'_, S>, bool), FsOpError> {
         if raw_path.is_empty() || raw_path.as_bytes().contains(&0) {
             return Err(FsError::Invalid.into());
         }
@@ -867,7 +986,12 @@ impl<S: Storage> ContainerFilesystem<S> {
                                 if symlink_expansions > MAX_SYMLINK_DEPTH {
                                     return Err(FsError::Loop.into());
                                 }
-                                let target = resolved.fs().read_link(resolved.fs_path()).await?;
+                                let target = match resolved.fs() {
+                                    MountedFs::Proc(proc_fs) => {
+                                        proc_fs.read_link_for(resolved.fs_path(), caller)?
+                                    }
+                                    fs => fs.read_link(resolved.fs_path()).await?,
+                                };
                                 if target.is_empty() || target.as_bytes().contains(&0) {
                                     return Err(FsError::Invalid.into());
                                 }
@@ -886,13 +1010,29 @@ impl<S: Storage> ContainerFilesystem<S> {
                             _ => return Err(FsError::NotDirectory.into()),
                         }
                     } else if follow_final || trailing_slash {
+                        if stop_at_proc_fd
+                            && !trailing_slash
+                            && matches!(resolved.fs(), MountedFs::Proc(_))
+                            && ProcFs::parse_proc_fd_path(resolved.fs_path()).is_some()
+                        {
+                            // Magic `/proc/<pid>/fd/<n>` symlink: leave at the
+                            // proc fd path so `open_descriptor_at` reopens the
+                            // target descriptor rather than following a synthetic
+                            // `"pipe:[...]"` string.
+                            break;
+                        }
                         match resolved.fs().stat(resolved.fs_path()).await {
                             Ok(meta) if meta.kind == NodeKind::Symlink => {
                                 symlink_expansions += 1;
                                 if symlink_expansions > MAX_SYMLINK_DEPTH {
                                     return Err(FsError::Loop.into());
                                 }
-                                let target = resolved.fs().read_link(resolved.fs_path()).await?;
+                                let target = match resolved.fs() {
+                                    MountedFs::Proc(proc_fs) => {
+                                        proc_fs.read_link_for(resolved.fs_path(), caller)?
+                                    }
+                                    fs => fs.read_link(resolved.fs_path()).await?,
+                                };
                                 if target.is_empty() || target.as_bytes().contains(&0) {
                                     return Err(FsError::Invalid.into());
                                 }
@@ -937,15 +1077,28 @@ impl<S: Storage> ContainerFilesystem<S> {
         follow_final: bool,
         creds: &Credentials,
     ) -> Result<(ContainerNodeInfo, String), FsOpError> {
+        self.stat_at_for(base_dir, raw_path, follow_final, creds, None)
+            .await
+    }
+
+    /// Caller-aware variant of [`Self::stat_at`].
+    pub async fn stat_at_for(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        follow_final: bool,
+        creds: &Credentials,
+        caller: Option<ProcCaller>,
+    ) -> Result<(ContainerNodeInfo, String), FsOpError> {
         let resolved = if raw_path.is_empty() {
             self.resolve(base_dir)?
         } else {
-            self.walk_path_for(base_dir, raw_path, follow_final, creds)
+            self.walk_path_for_caller(base_dir, raw_path, follow_final, creds, caller)
                 .await?
                 .0
         };
         resolved.require_read()?;
-        let info = resolved.describe().await?;
+        let info = resolved.describe_for(caller).await?;
         Ok((info, resolved.container_path().to_owned()))
     }
 
@@ -980,15 +1133,28 @@ impl<S: Storage> ContainerFilesystem<S> {
         check: AccessCheck,
         creds: &Credentials,
     ) -> Result<(), FsOpError> {
+        self.access_at_for(base_dir, raw_path, check, creds, None)
+            .await
+    }
+
+    /// Caller-aware variant of [`Self::access_at`].
+    pub async fn access_at_for(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        check: AccessCheck,
+        creds: &Credentials,
+        caller: Option<ProcCaller>,
+    ) -> Result<(), FsOpError> {
         let eff = if check.use_effective {
             creds.clone()
         } else {
             creds.for_real_access()
         };
         let (resolved, _) = self
-            .walk_path_for(base_dir, raw_path, check.follow, &eff)
+            .walk_path_for_caller(base_dir, raw_path, check.follow, &eff, caller)
             .await?;
-        let info = resolved.describe().await?;
+        let info = resolved.describe_for(caller).await?;
         if check.read {
             resolved.require_read()?;
         }
@@ -1023,7 +1189,10 @@ impl<S: Storage> ContainerFilesystem<S> {
         Ok(())
     }
 
-    /// Opens or creates a file or directory for Linux `open`/`openat`/`creat`.
+    /// Opens or creates a file or directory for Linux `open`/`openat`/`creat`,
+    /// returning a VFS node (`ContainerNodeInfo`). Callers supporting pseudo
+    /// character devices, PTYs, FIFOs, and `/proc/self/fd/<n>` should use
+    /// [`Self::open_descriptor_at`].
     pub async fn open_at(
         &self,
         base_dir: &str,
@@ -1033,10 +1202,65 @@ impl<S: Storage> ContainerFilesystem<S> {
         now: u64,
         payer: &crate::StoragePayer,
     ) -> Result<(ContainerNodeInfo, String, Option<MountHold>), FsOpError> {
+        match alloc::boxed::Box::pin(
+            self.open_descriptor_at(base_dir, raw_path, request, creds, None, now, payer),
+        )
+        .await?
+        {
+            ContainerOpenOutcome::Node {
+                info,
+                container_path,
+                mount_hold,
+            } => Ok((info, container_path, mount_hold)),
+            _ => Err(FsOpError::NoDevice),
+        }
+    }
+
+    /// Full Linux `open`/`openat`/`creat` path inside a container, dispatching
+    /// `(major, minor)` character devices on non-`MNT_NODEV` mounts, UNIX98
+    /// PTY master/slave opens, POSIX named FIFO rendezvous, `/proc/<pid>/fd/<n>`
+    /// magic descriptor reopens, and `/proc/sys/kernel/*` `CAP_SYS_ADMIN` gates.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors Linux openat container dispatch (base_dir, path, request, creds, caller, timestamp, storage payer)"
+    )]
+    pub async fn open_descriptor_at(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        request: OpenRequest,
+        creds: &Credentials,
+        caller: Option<ProcCaller>,
+        now: u64,
+        payer: &crate::StoragePayer,
+    ) -> Result<ContainerOpenOutcome, FsOpError> {
         let follow_final = !(request.nofollow || (request.create && request.exclusive));
+        let stop_at_proc_fd = !request.path_only && follow_final;
         let (resolved, trailing_slash) = self
-            .walk_path_for(base_dir, raw_path, follow_final, creds)
+            .walk_path_inner(
+                base_dir,
+                raw_path,
+                follow_final,
+                creds,
+                caller,
+                stop_at_proc_fd,
+            )
             .await?;
+
+        if stop_at_proc_fd
+            && !trailing_slash
+            && matches!(resolved.fs(), MountedFs::Proc(_))
+            && let Some((pid, fd)) = ProcFs::parse_proc_fd_path(resolved.fs_path())
+        {
+            // Verify the target `/proc/<pid>/fd/<fd>` entry exists.
+            let _ = resolved.fs().stat(resolved.fs_path()).await?;
+            return Ok(ContainerOpenOutcome::ProcFd {
+                pid,
+                fd,
+                container_path: resolved.container_path().to_owned(),
+            });
+        }
+
         let existing = resolved.fs().stat(resolved.fs_path()).await;
 
         if request.path_only {
@@ -1044,12 +1268,12 @@ impl<S: Storage> ContainerFilesystem<S> {
             if (request.directory || trailing_slash) && meta.kind != NodeKind::Directory {
                 return Err(FsError::NotDirectory.into());
             }
-            let info = resolved.describe().await?;
-            return Ok((
+            let info = resolved.describe_for(caller).await?;
+            return Ok(ContainerOpenOutcome::Node {
                 info,
-                resolved.container_path().to_owned(),
-                resolved.mount_hold(),
-            ));
+                container_path: resolved.container_path().to_owned(),
+                mount_hold: resolved.mount_hold(),
+            });
         }
 
         if request.create && request.exclusive && existing.is_ok() {
@@ -1072,18 +1296,141 @@ impl<S: Storage> ContainerFilesystem<S> {
                     if request.read {
                         resolved.require_read()?;
                     }
-                    if request.write || request.truncate {
+                    if request.write {
                         resolved.require_write()?;
                     }
                     let mut want = 0u32;
                     if request.read {
                         want |= permissions::MAY_READ;
                     }
-                    if request.write || request.truncate {
+                    if request.write {
                         want |= permissions::MAY_WRITE;
                     }
                     resolved.check_permission(creds, want).await?;
-                    return Err(FsOpError::NoDevice);
+                    if meta.kind == NodeKind::BlockDevice {
+                        return Err(FsOpError::NoDevice);
+                    }
+                    let info = resolved.describe_for(caller).await?;
+                    let dev_num = DeviceNumber::decode(info.rdev as u32);
+                    let dev = info.metadata.id.device.raw();
+                    let ino = info.metadata.id.inode;
+                    let uid = info.unix.uid;
+                    let gid = info.unix.gid;
+                    let mode = info.unix.permissions;
+                    let make_pseudo = |kind: PseudoDeviceKind| {
+                        let mut p = PseudoDevice::new(kind, request.read, request.write);
+                        p.dev = dev;
+                        p.ino = ino;
+                        p.rdev = info.rdev;
+                        p.uid = uid;
+                        p.gid = gid;
+                        p.mode = mode;
+                        ContainerOpenOutcome::PseudoDevice(p)
+                    };
+                    return match (dev_num.major(), dev_num.minor()) {
+                        (CHAR_MAJOR_MEM, CHAR_MINOR_NULL) => {
+                            Ok(make_pseudo(PseudoDeviceKind::Null))
+                        }
+                        (CHAR_MAJOR_MEM, CHAR_MINOR_ZERO) => {
+                            Ok(make_pseudo(PseudoDeviceKind::Zero))
+                        }
+                        (CHAR_MAJOR_MEM, CHAR_MINOR_FULL) => {
+                            Ok(make_pseudo(PseudoDeviceKind::Full))
+                        }
+                        (CHAR_MAJOR_MEM, CHAR_MINOR_RANDOM) => {
+                            Ok(make_pseudo(PseudoDeviceKind::Random))
+                        }
+                        (CHAR_MAJOR_MEM, CHAR_MINOR_URANDOM) => {
+                            Ok(make_pseudo(PseudoDeviceKind::Urandom))
+                        }
+                        (CHAR_MAJOR_TTY, CHAR_MINOR_TTY) => {
+                            Ok(ContainerOpenOutcome::ControllingTty {
+                                is_console: false,
+                                dev,
+                                ino,
+                                uid,
+                                gid,
+                                mode,
+                            })
+                        }
+                        (CHAR_MAJOR_TTY, CHAR_MINOR_CONSOLE) => {
+                            Ok(ContainerOpenOutcome::ControllingTty {
+                                is_console: true,
+                                dev,
+                                ino,
+                                uid,
+                                gid,
+                                mode,
+                            })
+                        }
+                        (CHAR_MAJOR_TTY, CHAR_MINOR_PTMX) => {
+                            let master = self
+                                .ptys
+                                .allocate(creds.user.effective, creds.group.effective)?;
+                            Ok(ContainerOpenOutcome::PtyMaster(master))
+                        }
+                        (CHAR_MAJOR_UNIX98_PTY_SLAVE, minor) => {
+                            let Some(pair) = self.ptys.get(minor) else {
+                                return Err(FsOpError::NoDevice);
+                            };
+                            match pair.open_slave() {
+                                Ok(slave) => Ok(ContainerOpenOutcome::PtySlave {
+                                    slave,
+                                    noctty: request.noctty,
+                                }),
+                                Err(PtyError::Locked | PtyError::Closed | PtyError::WouldBlock) => {
+                                    Err(FsError::Io.into())
+                                }
+                            }
+                        }
+                        _ => Err(FsOpError::NoDevice),
+                    };
+                }
+                if meta.kind == NodeKind::Fifo {
+                    if request.directory || trailing_slash {
+                        return Err(FsError::NotDirectory.into());
+                    }
+                    if request.read {
+                        resolved.require_read()?;
+                    }
+                    if request.write {
+                        resolved.require_write()?;
+                    }
+                    let mut want = 0u32;
+                    if request.read {
+                        want |= permissions::MAY_READ;
+                    }
+                    if request.write {
+                        want |= permissions::MAY_WRITE;
+                    }
+                    resolved.check_permission(creds, want).await?;
+                    let info = resolved.describe_for(caller).await?;
+                    let key = FifoKey::new(info.metadata.id.device, info.metadata.id.inode);
+                    let pipe = self.fifos.get_or_create(
+                        key,
+                        info.unix.uid,
+                        info.unix.gid,
+                        info.unix.permissions,
+                    );
+                    return match (request.read, request.write, request.nonblock) {
+                        (true, true, _) => {
+                            Ok(ContainerOpenOutcome::FifoReadWrite(pipe.open_rdwr()))
+                        }
+                        (true, false, true) => {
+                            Ok(ContainerOpenOutcome::FifoRead(pipe.open_read_nonblock()))
+                        }
+                        (true, false, false) => Ok(ContainerOpenOutcome::FifoRead(
+                            pipe.open_read_blocking().await,
+                        )),
+                        (false, true, true) => pipe
+                            .open_write_nonblock()
+                            .map(ContainerOpenOutcome::FifoWrite)
+                            .map_err(|_| FsOpError::NoDevice),
+                        (false, true, false) => Ok(ContainerOpenOutcome::FifoWrite(
+                            pipe.open_write_blocking().await,
+                        )),
+                        (false, false, _) => Err(FsError::Invalid.into()),
+                    };
                 }
                 if meta.kind == NodeKind::Directory {
                     if request.write || request.truncate {
@@ -1103,15 +1450,24 @@ impl<S: Storage> ContainerFilesystem<S> {
                     if request.write || request.truncate {
                         resolved.require_write()?;
                     }
-                    let mut want = 0u32;
-                    if request.read {
-                        want |= permissions::MAY_READ;
+                    let is_proc = matches!(resolved.fs(), MountedFs::Proc(_));
+                    if is_proc && (request.write || request.truncate) {
+                        if ProcFs::writable_sysctl(resolved.fs_path()).is_none()
+                            || !creds.capabilities.has_effective(CAP_SYS_ADMIN)
+                        {
+                            return Err(FsOpError::PermissionDenied);
+                        }
+                    } else {
+                        let mut want = 0u32;
+                        if request.read {
+                            want |= permissions::MAY_READ;
+                        }
+                        if request.write || request.truncate {
+                            want |= permissions::MAY_WRITE;
+                        }
+                        resolved.check_permission(creds, want).await?;
                     }
-                    if request.write || request.truncate {
-                        want |= permissions::MAY_WRITE;
-                    }
-                    resolved.check_permission(creds, want).await?;
-                    if request.truncate {
+                    if request.truncate && !is_proc {
                         resolved.strip_privs_on_write(creds, now, payer).await?;
                     }
                     let mut flags = OpenFlags::empty();
@@ -1179,12 +1535,12 @@ impl<S: Storage> ContainerFilesystem<S> {
             Err(error) => return Err(error.into()),
         }
 
-        let info = resolved.describe().await?;
-        Ok((
+        let info = resolved.describe_for(caller).await?;
+        Ok(ContainerOpenOutcome::Node {
             info,
-            resolved.container_path().to_owned(),
-            resolved.mount_hold(),
-        ))
+            container_path: resolved.container_path().to_owned(),
+            mount_hold: resolved.mount_hold(),
+        })
     }
 
     /// Reads up to `max_bytes` from `container_path` at `offset`.
@@ -1216,6 +1572,13 @@ impl<S: Storage> ContainerFilesystem<S> {
     ) -> Result<Landed, FsOpError> {
         let resolved = self.resolve(container_path)?;
         resolved.require_write()?;
+        let is_proc = matches!(resolved.fs(), MountedFs::Proc(_));
+        if is_proc
+            && (ProcFs::writable_sysctl(resolved.fs_path()).is_none()
+                || !creds.capabilities.has_effective(CAP_SYS_ADMIN))
+        {
+            return Err(FsOpError::PermissionDenied);
+        }
         let landed = write_with(
             resolved.fs(),
             resolved.fs_path(),
@@ -1228,7 +1591,7 @@ impl<S: Storage> ContainerFilesystem<S> {
             },
         )
         .await?;
-        if landed.len > 0 {
+        if landed.len > 0 && !is_proc {
             resolved.strip_privs_on_write(creds, now, payer).await?;
         }
         Ok(landed)
@@ -1245,7 +1608,16 @@ impl<S: Storage> ContainerFilesystem<S> {
     ) -> Result<(), FsOpError> {
         let resolved = self.resolve(container_path)?;
         resolved.require_write()?;
-        resolved.strip_privs_on_write(creds, now, payer).await?;
+        let is_proc = matches!(resolved.fs(), MountedFs::Proc(_));
+        if is_proc {
+            if ProcFs::writable_sysctl(resolved.fs_path()).is_none()
+                || !creds.capabilities.has_effective(CAP_SYS_ADMIN)
+            {
+                return Err(FsOpError::PermissionDenied);
+            }
+        } else {
+            resolved.strip_privs_on_write(creds, now, payer).await?;
+        }
         Ok(resolved
             .fs()
             .set_size(resolved.fs_path(), size, now, payer)
@@ -1264,10 +1636,19 @@ impl<S: Storage> ContainerFilesystem<S> {
     ) -> Result<(), FsOpError> {
         let (resolved, _) = self.walk_path_for(base_dir, raw_path, true, creds).await?;
         resolved.require_write()?;
-        resolved
-            .check_permission(creds, permissions::MAY_WRITE)
-            .await?;
-        resolved.strip_privs_on_write(creds, now, payer).await?;
+        let is_proc = matches!(resolved.fs(), MountedFs::Proc(_));
+        if is_proc {
+            if ProcFs::writable_sysctl(resolved.fs_path()).is_none()
+                || !creds.capabilities.has_effective(CAP_SYS_ADMIN)
+            {
+                return Err(FsOpError::PermissionDenied);
+            }
+        } else {
+            resolved
+                .check_permission(creds, permissions::MAY_WRITE)
+                .await?;
+            resolved.strip_privs_on_write(creds, now, payer).await?;
+        }
         Ok(resolved
             .fs()
             .set_size(resolved.fs_path(), size, now, payer)
@@ -1361,21 +1742,48 @@ impl<S: Storage> ContainerFilesystem<S> {
         raw_path: &str,
         creds: &Credentials,
     ) -> Result<String, FsOpError> {
-        let (resolved, trailing_slash) =
-            self.walk_path_for(base_dir, raw_path, false, creds).await?;
+        self.read_link_at_for(base_dir, raw_path, creds, None).await
+    }
+
+    /// Caller-aware variant of [`Self::read_link_at`].
+    pub async fn read_link_at_for(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        creds: &Credentials,
+        caller: Option<ProcCaller>,
+    ) -> Result<String, FsOpError> {
+        let (resolved, trailing_slash) = self
+            .walk_path_for_caller(base_dir, raw_path, false, creds, caller)
+            .await?;
         resolved.require_read()?;
         if trailing_slash {
             return Err(FsError::Invalid.into());
         }
-        Ok(resolved.fs().read_link(resolved.fs_path()).await?)
+        match resolved.fs() {
+            MountedFs::Proc(proc_fs) => Ok(proc_fs.read_link_for(resolved.fs_path(), caller)?),
+            fs => Ok(fs.read_link(resolved.fs_path()).await?),
+        }
     }
 
     /// Reads the symbolic link target for an already-resolved container path
     /// (used by `readlinkat(fd, "", ...)` on an `O_PATH | O_NOFOLLOW` symlink).
     pub async fn read_link_resolved(&self, container_path: &str) -> Result<String, FsOpError> {
+        self.read_link_resolved_for(container_path, None).await
+    }
+
+    /// Caller-aware variant of [`Self::read_link_resolved`].
+    pub async fn read_link_resolved_for(
+        &self,
+        container_path: &str,
+        caller: Option<ProcCaller>,
+    ) -> Result<String, FsOpError> {
         let resolved = self.resolve(container_path)?;
         resolved.require_read()?;
-        Ok(resolved.fs().read_link(resolved.fs_path()).await?)
+        match resolved.fs() {
+            MountedFs::Proc(proc_fs) => Ok(proc_fs.read_link_for(resolved.fs_path(), caller)?),
+            fs => Ok(fs.read_link(resolved.fs_path()).await?),
+        }
     }
 
     /// Creates a directory at `raw_path` relative to `base_dir`.
@@ -2258,11 +2666,6 @@ impl<S: Storage> ContainerFilesystem<S> {
     }
 }
 
-struct ContainerUts {
-    hostname: UtsField,
-    domainname: UtsField,
-}
-
 /// RAII guard holding one live process slot in a [`LinuxContainer`]'s
 /// [`PidNamespace`]. Dropped once every thread of the process has exited so
 /// its PID stays reserved for the full thread-group lifetime.
@@ -2378,10 +2781,140 @@ pub struct LinuxContainer<S: Storage> {
     filesystem: ContainerFilesystem<S>,
     shared_owner: SharedOwner,
     default_credentials: Credentials,
-    uts: spin::Mutex<ContainerUts>,
+    uts: TriompheArc<spin::Mutex<SharedUts>>,
     pids: PidNamespace,
     futex: FutexTable,
     shared_files: SharedFileCache,
+}
+
+fn attach_default_pseudo_mounts<S: Storage>(
+    mounts: &mut Vec<ContainerMount<S>>,
+    namespace: &Namespace<S>,
+    authority: &ProcessAuthority,
+    ptys: &PtyRegistry,
+    proc_registry: &ProcRegistry,
+) {
+    let has_dev = mounts.iter().any(|m| m.target == "/dev");
+    if !has_dev {
+        let dev_fs = DevFs::new(namespace.table().allocate_device(), ptys.clone());
+        let grant = MountGrant {
+            rights: FileSystemRights::READ | FileSystemRights::WRITE,
+            sharing: MountSharing::Private,
+        };
+        mounts.push(ContainerMount {
+            target: String::from("/dev"),
+            backing: HeldPath::from_dev(dev_fs, grant),
+            grant,
+            authority_rights: DirectoryAuthorityRights::READ | DirectoryAuthorityRights::WRITE,
+            _private_claim: None,
+            is_pseudo: true,
+        });
+        if !mounts.iter().any(|m| m.target == "/dev/shm") {
+            let shm = MemoryFs::with_budget(
+                namespace.table().allocate_device(),
+                namespace.table().memory_storage(),
+            );
+            let _ = shm.set_permissions(FsPath::ROOT, 0o1777, 0);
+            let shm_grant = MountGrant {
+                rights: FileSystemRights::READ | FileSystemRights::WRITE,
+                sharing: MountSharing::Private,
+            };
+            mounts.push(ContainerMount {
+                target: String::from("/dev/shm"),
+                backing: HeldPath::from_memory(shm, shm_grant),
+                grant: shm_grant,
+                authority_rights: DirectoryAuthorityRights::READ
+                    | DirectoryAuthorityRights::WRITE
+                    | DirectoryAuthorityRights::MUTATE_DIRECTORY,
+                _private_claim: None,
+                is_pseudo: true,
+            });
+        }
+    }
+    if !mounts.iter().any(|m| m.target == "/proc") {
+        let proc_fs = ProcFs::new(namespace.table().allocate_device(), proc_registry.clone());
+        let grant = MountGrant {
+            rights: FileSystemRights::READ | FileSystemRights::WRITE,
+            sharing: MountSharing::Private,
+        };
+        mounts.push(ContainerMount {
+            target: String::from("/proc"),
+            backing: HeldPath::from_proc(proc_fs, grant),
+            grant,
+            authority_rights: DirectoryAuthorityRights::READ | DirectoryAuthorityRights::WRITE,
+            _private_claim: None,
+            is_pseudo: true,
+        });
+    }
+    if !mounts.iter().any(|m| m.target == "/sys") {
+        let granted_devices = authority
+            .granted_devices()
+            .iter()
+            .map(|name| name.as_str().to_owned())
+            .collect();
+        let sys_fs = SysFs::new(
+            namespace.table().allocate_device(),
+            proc_registry.clone(),
+            ptys.clone(),
+            granted_devices,
+        );
+        let grant = MountGrant {
+            rights: FileSystemRights::READ,
+            sharing: MountSharing::Private,
+        };
+        mounts.push(ContainerMount {
+            target: String::from("/sys"),
+            backing: HeldPath::from_sys(sys_fs, grant),
+            grant,
+            authority_rights: DirectoryAuthorityRights::READ,
+            _private_claim: None,
+            is_pseudo: true,
+        });
+    }
+    proc_registry.set_mounts(build_proc_mount_entries(mounts));
+}
+
+fn build_proc_mount_entries<S: Storage>(mounts: &[ContainerMount<S>]) -> Vec<ProcMountEntry> {
+    mounts
+        .iter()
+        .enumerate()
+        .map(|(index, mount)| {
+            let fs = mount.backing.resolved().fs();
+            let fstype = match mount.target.as_str() {
+                "/dev/shm" if mount.is_pseudo => "tmpfs",
+                _ => fs.kind_name(),
+            };
+            let mut opts = Vec::new();
+            if mount.grant.flags().contains(MountFlags::READ_ONLY) {
+                opts.push("ro");
+            } else {
+                opts.push("rw");
+            }
+            if !mount.grant.flags().honours_exec_privileges() {
+                opts.push("nosuid");
+            }
+            if !mount.grant.flags().opens_devices() {
+                opts.push("nodev");
+            }
+            let source = if mount.is_pseudo {
+                String::from(fstype)
+            } else {
+                String::from(fs.kind_name())
+            };
+            let mnt_id = (index + 1) as u32;
+            let parent_id = if mount.target == "/" { 0 } else { 1 };
+            ProcMountEntry {
+                mnt_id,
+                parent_id,
+                dev_major: 0,
+                dev_minor: mnt_id,
+                source,
+                target: mount.target.clone(),
+                fstype: String::from(fstype),
+                options: opts.join(","),
+            }
+        })
+        .collect()
 }
 
 impl<S: Storage> LinuxContainer<S> {
@@ -2447,19 +2980,35 @@ impl<S: Storage> LinuxContainer<S> {
             .capabilities
             .clamp(authority_cap_ceiling_for(&authority));
 
+        let uts = TriompheArc::new(spin::Mutex::new(SharedUts {
+            hostname: config.hostname,
+            domainname: config.domainname,
+        }));
+        let ptys = PtyRegistry::new();
+        let fifos = FifoRegistry::new();
+        let proc_registry =
+            ProcRegistry::new(uts.clone(), crate::online_processor_count().max(1) as u32);
+        attach_default_pseudo_mounts(
+            &mut mounts,
+            caller_namespace,
+            &authority,
+            &ptys,
+            &proc_registry,
+        );
+
         Ok(Self {
             id,
             authority,
             filesystem: ContainerFilesystem {
                 mounts,
                 shared_owner: config.shared_owner,
+                ptys,
+                fifos,
+                proc_registry,
             },
             shared_owner: config.shared_owner,
             default_credentials,
-            uts: spin::Mutex::new(ContainerUts {
-                hostname: config.hostname,
-                domainname: config.domainname,
-            }),
+            uts,
             pids: PidNamespace::new(),
             futex: FutexTable::new(),
             shared_files: SharedFileCache::new(),
@@ -2519,6 +3068,7 @@ impl<S: Storage> LinuxContainer<S> {
                 },
                 authority_rights: root_rights,
                 _private_claim: None,
+                is_pseudo: false,
             }
         };
         let mut mounts = vec![root_mount];
@@ -2546,6 +3096,7 @@ impl<S: Storage> LinuxContainer<S> {
                     },
                     authority_rights: preopen.rights(),
                     _private_claim: None,
+                    is_pseudo: false,
                 });
             }
         }
@@ -2554,19 +3105,28 @@ impl<S: Storage> LinuxContainer<S> {
         default_credentials
             .capabilities
             .clamp(authority_cap_ceiling_for(&authority));
+        let uts = TriompheArc::new(spin::Mutex::new(SharedUts {
+            hostname: UtsField::UNSET,
+            domainname: UtsField::UNSET,
+        }));
+        let ptys = PtyRegistry::new();
+        let fifos = FifoRegistry::new();
+        let proc_registry =
+            ProcRegistry::new(uts.clone(), crate::online_processor_count().max(1) as u32);
+        attach_default_pseudo_mounts(&mut mounts, namespace, &authority, &ptys, &proc_registry);
         Self {
             id,
             authority,
             filesystem: ContainerFilesystem {
                 mounts,
                 shared_owner,
+                ptys,
+                fifos,
+                proc_registry,
             },
             shared_owner,
             default_credentials,
-            uts: spin::Mutex::new(ContainerUts {
-                hostname: UtsField::UNSET,
-                domainname: UtsField::UNSET,
-            }),
+            uts,
             pids: PidNamespace::new(),
             futex: FutexTable::new(),
             shared_files: SharedFileCache::new(),
@@ -2608,6 +3168,7 @@ impl<S: Storage> LinuxContainer<S> {
             grant: overlay_grant,
             authority_rights: DirectoryAuthorityRights::all(),
             _private_claim: None,
+            is_pseudo: false,
         };
         let mut mounts = vec![root_mount];
         for preopen in authority.directory_preopens() {
@@ -2634,6 +3195,7 @@ impl<S: Storage> LinuxContainer<S> {
                     },
                     authority_rights: preopen.rights(),
                     _private_claim: None,
+                    is_pseudo: false,
                 });
             }
         }
@@ -2642,19 +3204,28 @@ impl<S: Storage> LinuxContainer<S> {
         default_credentials
             .capabilities
             .clamp(authority_cap_ceiling_for(&authority));
+        let uts = TriompheArc::new(spin::Mutex::new(SharedUts {
+            hostname: UtsField::UNSET,
+            domainname: UtsField::UNSET,
+        }));
+        let ptys = PtyRegistry::new();
+        let fifos = FifoRegistry::new();
+        let proc_registry =
+            ProcRegistry::new(uts.clone(), crate::online_processor_count().max(1) as u32);
+        attach_default_pseudo_mounts(&mut mounts, namespace, &authority, &ptys, &proc_registry);
         Ok(Self {
             id,
             authority,
             filesystem: ContainerFilesystem {
                 mounts,
                 shared_owner,
+                ptys,
+                fifos,
+                proc_registry,
             },
             shared_owner,
             default_credentials,
-            uts: spin::Mutex::new(ContainerUts {
-                hostname: UtsField::UNSET,
-                domainname: UtsField::UNSET,
-            }),
+            uts,
             pids: PidNamespace::new(),
             futex: FutexTable::new(),
             shared_files: SharedFileCache::new(),
@@ -2692,6 +3263,21 @@ impl<S: Storage> LinuxContainer<S> {
     /// This container's isolated filesystem (root and mounts).
     pub fn filesystem(&self) -> &ContainerFilesystem<S> {
         &self.filesystem
+    }
+
+    /// This container's UNIX98 PTY registry (`/dev/ptmx`, `/dev/pts/<n>`).
+    pub fn ptys(&self) -> &PtyRegistry {
+        self.filesystem.ptys()
+    }
+
+    /// This container's named FIFO (`S_IFIFO`) rendezvous registry.
+    pub fn fifos(&self) -> &FifoRegistry {
+        self.filesystem.fifos()
+    }
+
+    /// This container's `/proc` process, mount, and network snapshot registry.
+    pub fn proc_registry(&self) -> &ProcRegistry {
+        self.filesystem.proc_registry()
     }
 
     /// The owner and group presented on every shared mount in this container.
@@ -2933,6 +3519,7 @@ async fn attach_container_mount<S: Storage>(
             grant,
             authority_rights: spec.rights,
             _private_claim: None,
+            is_pseudo: false,
         });
     }
 
@@ -3029,6 +3616,7 @@ async fn attach_container_mount<S: Storage>(
         grant,
         authority_rights: spec.rights,
         _private_claim: private_claim,
+        is_pseudo: false,
     })
 }
 
@@ -3147,7 +3735,7 @@ mod tests {
         &[],
     );
 
-    fn test_namespace() -> Namespace<UnsupportedStorage> {
+    pub(super) fn test_namespace() -> Namespace<UnsupportedStorage> {
         Namespace::new(MountTable::new(
             BootFs::new(TEST_BOOT_IMAGE, BOOT_DEVICE),
             4,
@@ -3172,7 +3760,7 @@ mod tests {
         }
     }
 
-    fn mount_memory(
+    pub(super) fn mount_memory(
         ns: &Namespace<UnsupportedStorage>,
         point: &str,
         rights: FileSystemRights,
@@ -3610,7 +4198,9 @@ mod tests {
             &host_ns,
         );
         for mount in container.filesystem().mounts() {
-            assert_eq!(mount.grant().sharing, MountSharing::Shared);
+            if !mount.is_pseudo() {
+                assert_eq!(mount.grant().sharing, MountSharing::Shared);
+            }
         }
         assert!(block_on(container.filesystem().read_executable("/opt/tool")).is_ok());
         assert!(matches!(
@@ -3725,6 +4315,8 @@ mod tests {
                 append: false,
                 sync: false,
                 dsync: false,
+                nonblock: false,
+                noctty: false,
                 mode: 0,
                 umask: 0,
             };
@@ -3762,6 +4354,8 @@ mod tests {
                 append: false,
                 sync: false,
                 dsync: false,
+                nonblock: false,
+                noctty: false,
                 mode: 0o644,
                 umask: 0,
             };
@@ -3997,6 +4591,8 @@ mod tests {
                 append: false,
                 sync: false,
                 dsync: false,
+                nonblock: false,
+                noctty: false,
                 mode: 0o644,
                 umask: 0,
             };
@@ -7150,6 +7746,1397 @@ mod private_btrfs_tests {
             };
 
             futures::future::join(Box::pin(client), Box::pin(service.run(timer))).await;
+        });
+    }
+
+    #[test]
+    fn container_dev_pseudo_devices_and_shm() {
+        use super::tests::{mount_memory, test_namespace};
+        use crate::test_support::UnsupportedStorage;
+        use helios_hal::vmm::PageFlags;
+        use helios_linux::abi::{Abi, Operation};
+        use helios_linux::syscall::{
+            Clock, Denied, DirListEntry, FileAccess, FileStat, Filesystem, MemoryTotals,
+            OpenOutcome, Process, Region, Stdio, Stream, SyscallOutcome, System, Thread, Tty,
+            UserMemory, VirtualMemory, WriteError, dispatch,
+        };
+        use helios_unix::{FileDescriptor, NoNetwork, OpenFile, PtySlave};
+
+        struct MemBacking;
+        impl helios_linux::syscall::Resources for MemBacking {
+            type File = (String, NodeKind, FileAccess);
+            type Network = NoNetwork;
+            type Data = u64;
+        }
+        struct FlatMem {
+            bytes: Vec<u8>,
+            next_map: u64,
+        }
+        impl FlatMem {
+            fn new() -> Self {
+                Self {
+                    bytes: vec![0u8; 0x30000],
+                    next_map: 0x10000,
+                }
+            }
+            fn write_cstr(&mut self, addr: u64, s: &str) {
+                let start = addr as usize;
+                self.bytes[start..start + s.len()].copy_from_slice(s.as_bytes());
+                self.bytes[start + s.len()] = 0;
+            }
+            fn read_bytes(&self, addr: u64, len: usize) -> Vec<u8> {
+                let start = addr as usize;
+                self.bytes[start..start + len].to_vec()
+            }
+            fn write_bytes(&mut self, addr: u64, data: &[u8]) {
+                let start = addr as usize;
+                self.bytes[start..start + data.len()].copy_from_slice(data);
+            }
+        }
+        impl UserMemory for FlatMem {
+            fn read(
+                &self,
+                addr: u64,
+                out: &mut [u8],
+            ) -> Result<(), helios_linux::syscall::MemoryFault> {
+                let start = addr as usize;
+                if start + out.len() > self.bytes.len() {
+                    return Err(helios_linux::syscall::MemoryFault);
+                }
+                out.copy_from_slice(&self.bytes[start..start + out.len()]);
+                Ok(())
+            }
+            fn check_writable(
+                &self,
+                addr: u64,
+                len: usize,
+            ) -> Result<(), helios_linux::syscall::MemoryFault> {
+                if (addr as usize) + len > self.bytes.len() {
+                    return Err(helios_linux::syscall::MemoryFault);
+                }
+                Ok(())
+            }
+            fn write(
+                &mut self,
+                addr: u64,
+                data: &[u8],
+            ) -> Result<(), helios_linux::syscall::MemoryFault> {
+                let start = addr as usize;
+                if start + data.len() > self.bytes.len() {
+                    return Err(helios_linux::syscall::MemoryFault);
+                }
+                self.bytes[start..start + data.len()].copy_from_slice(data);
+                Ok(())
+            }
+            fn atomic_load_u32(
+                &self,
+                addr: u64,
+            ) -> Result<u32, helios_linux::syscall::MemoryFault> {
+                let mut raw = [0u8; 4];
+                self.read(addr, &mut raw)?;
+                Ok(u32::from_le_bytes(raw))
+            }
+            fn atomic_store_u32(
+                &mut self,
+                addr: u64,
+                val: u32,
+            ) -> Result<(), helios_linux::syscall::MemoryFault> {
+                self.write(addr, &val.to_le_bytes())
+            }
+            fn atomic_compare_exchange_u32(
+                &mut self,
+                addr: u64,
+                expected: u32,
+                desired: u32,
+            ) -> Result<Result<u32, u32>, helios_linux::syscall::MemoryFault> {
+                let cur = self.atomic_load_u32(addr)?;
+                if cur == expected {
+                    self.atomic_store_u32(addr, desired)?;
+                    Ok(Ok(cur))
+                } else {
+                    Ok(Err(cur))
+                }
+            }
+        }
+        impl VirtualMemory for FlatMem {
+            fn lowest_address(&self) -> u64 {
+                0x1000
+            }
+            fn map_anywhere(
+                &mut self,
+                len: u64,
+                _align: u64,
+                _flags: PageFlags,
+            ) -> Result<u64, helios_linux::syscall::MapError> {
+                let addr = self.next_map;
+                self.next_map = self.next_map.saturating_add(len.max(4096));
+                let end = (addr + len) as usize;
+                if end > self.bytes.len() {
+                    self.bytes.resize(end, 0);
+                }
+                self.bytes[addr as usize..end].fill(0);
+                Ok(addr)
+            }
+            fn map_at(
+                &mut self,
+                addr: u64,
+                len: u64,
+                _flags: PageFlags,
+            ) -> Result<(), helios_linux::syscall::MapError> {
+                let end = (addr + len) as usize;
+                if end > self.bytes.len() {
+                    self.bytes.resize(end, 0);
+                }
+                self.bytes[addr as usize..end].fill(0);
+                Ok(())
+            }
+            fn unmap(&mut self, _: u64, _: u64) {}
+            fn protect(
+                &mut self,
+                _: u64,
+                _: u64,
+                _: PageFlags,
+            ) -> Result<(), helios_linux::syscall::MapError> {
+                Ok(())
+            }
+            fn discard(&mut self, _: u64, _: u64) {}
+            fn remap(
+                &mut self,
+                _: u64,
+                _: u64,
+                _: u64,
+                _: u64,
+            ) -> Result<(), helios_linux::syscall::MapError> {
+                Ok(())
+            }
+            fn region(&self, _: u64, _: u64) -> Option<Region> {
+                None
+            }
+            fn free_range(&self, _: u64, len: u64) -> Option<u64> {
+                Some(self.next_map.max(len))
+            }
+        }
+        struct DummyThread;
+        impl Thread<MemBacking> for DummyThread {
+            fn thread_pointer(&self) -> u64 {
+                0
+            }
+            fn set_thread_pointer(&mut self, _: u64) -> Result<(), Denied> {
+                Ok(())
+            }
+            fn spawn_thread(
+                &mut self,
+                _: Process<MemBacking>,
+                _: helios_linux::syscall::SpawnedThread,
+            ) -> Result<(), helios_linux::syscall::SpawnError> {
+                Err(helios_linux::syscall::SpawnError::Busy)
+            }
+        }
+        struct PseudoHost<'a> {
+            container: &'a LinuxContainer<UnsupportedStorage>,
+            caller: ProcCaller,
+            ctty: Option<PtySlave>,
+            rand_seed: u8,
+        }
+        impl Stdio for PseudoHost<'_> {
+            async fn read_input(&mut self, _: usize) -> Result<Bytes, Denied> {
+                Ok(Bytes::new())
+            }
+            async fn write(&mut self, _: Stream, bytes: &[u8]) -> Result<usize, WriteError> {
+                Ok(bytes.len())
+            }
+        }
+        impl Clock for PseudoHost<'_> {
+            fn now_nanos(&self) -> u64 {
+                1_000_000_000
+            }
+            async fn sleep_until(&self, _: u64) {}
+        }
+        impl System for PseudoHost<'_> {
+            fn realtime_nanos(&self) -> u64 {
+                1_000_000_000
+            }
+            fn set_realtime_nanos(&mut self, _: u64) -> Result<(), Denied> {
+                Err(Denied)
+            }
+            fn cpu_nanos(&self) -> u64 {
+                0
+            }
+            fn fill_random(&mut self, out: &mut [u8]) {
+                for b in out.iter_mut() {
+                    self.rand_seed = self.rand_seed.wrapping_add(37).max(1);
+                    *b = self.rand_seed;
+                }
+            }
+            fn memory(&self) -> MemoryTotals {
+                MemoryTotals {
+                    total_bytes: 64 * 1024 * 1024,
+                    free_bytes: 32 * 1024 * 1024,
+                }
+            }
+            fn process_count(&self) -> u32 {
+                1
+            }
+            fn kernel_version(&self) -> &str {
+                "helios-test"
+            }
+        }
+        impl Tty for PseudoHost<'_> {
+            fn controlling_pty(&self) -> Option<PtySlave> {
+                self.ctty.clone()
+            }
+            fn set_controlling_pty(&mut self, pty: Option<PtySlave>) {
+                self.ctty = pty;
+            }
+        }
+        impl helios_linux::syscall::Network<NoNetwork> for PseudoHost<'_> {
+            fn to_ip(&self, a: core::convert::Infallible) -> helios_linux::syscall::IpAddr {
+                match a {}
+            }
+            fn encode_ip(&self, _: helios_linux::syscall::IpAddr) -> core::convert::Infallible {
+                unreachable!()
+            }
+        }
+        impl Filesystem<MemBacking> for PseudoHost<'_> {
+            fn file_access(&self, file: &(String, NodeKind, FileAccess)) -> FileAccess {
+                file.2
+            }
+            fn file_is_directory(&self, file: &(String, NodeKind, FileAccess)) -> bool {
+                file.1 == NodeKind::Directory
+            }
+            fn file_path<'a>(&self, file: &'a (String, NodeKind, FileAccess)) -> Option<&'a str> {
+                Some(&file.0)
+            }
+            fn has_synthetic_dev_fallback(&self) -> bool {
+                false
+            }
+            async fn open_descriptor(
+                &mut self,
+                base: Option<&(String, NodeKind, FileAccess)>,
+                cwd: &str,
+                path: &str,
+                request: OpenRequest,
+                creds: &Credentials,
+            ) -> Result<Option<OpenOutcome<MemBacking>>, FsOpError> {
+                let base_dir = base.map_or(cwd, |f| f.0.as_str());
+                let payer = crate::StoragePayer::for_test();
+                let outcome = self
+                    .container
+                    .filesystem()
+                    .open_descriptor_at(
+                        base_dir,
+                        path,
+                        request,
+                        creds,
+                        Some(self.caller),
+                        100,
+                        &payer,
+                    )
+                    .await?;
+                let access = match (request.read, request.write) {
+                    (true, true) => FileAccess::ReadWrite,
+                    (true, false) => FileAccess::ReadOnly,
+                    (false, true) => FileAccess::WriteOnly,
+                    (false, false) => FileAccess::PathOnly,
+                };
+                Ok(Some(match outcome {
+                    ContainerOpenOutcome::Node {
+                        info,
+                        container_path,
+                        ..
+                    } => OpenOutcome::Descriptor(FileDescriptor::File(OpenFile::new((
+                        container_path,
+                        info.metadata.kind,
+                        access,
+                    )))),
+                    ContainerOpenOutcome::PseudoDevice(dev) => {
+                        OpenOutcome::Descriptor(FileDescriptor::PseudoDevice(dev))
+                    }
+                    ContainerOpenOutcome::ControllingTty { .. } => {
+                        OpenOutcome::ControllingTty { fallback: None }
+                    }
+                    ContainerOpenOutcome::PtyMaster(m) => {
+                        OpenOutcome::Descriptor(FileDescriptor::PtyMaster(m))
+                    }
+                    ContainerOpenOutcome::PtySlave { slave, noctty } => {
+                        OpenOutcome::PtySlave { slave, noctty }
+                    }
+                    ContainerOpenOutcome::FifoRead(r) => {
+                        OpenOutcome::Descriptor(FileDescriptor::FifoRead(r))
+                    }
+                    ContainerOpenOutcome::FifoWrite(w) => {
+                        OpenOutcome::Descriptor(FileDescriptor::FifoWrite(w))
+                    }
+                    ContainerOpenOutcome::FifoReadWrite(rw) => {
+                        OpenOutcome::Descriptor(FileDescriptor::FifoReadWrite(rw))
+                    }
+                    ContainerOpenOutcome::ProcFd { fd, .. } => OpenOutcome::ReopenFd { fd },
+                }))
+            }
+            async fn stat_path(
+                &self,
+                base: Option<&(String, NodeKind, FileAccess)>,
+                cwd: &str,
+                path: &str,
+                follow: bool,
+                creds: &Credentials,
+            ) -> Result<(FileStat, String), FsOpError> {
+                let base_dir = base.map_or(cwd, |f| f.0.as_str());
+                let (info, resolved) = self
+                    .container
+                    .filesystem()
+                    .stat_at_for(base_dir, path, follow, creds, Some(self.caller))
+                    .await?;
+                Ok((
+                    FileStat {
+                        dev: info.metadata.id.device.raw(),
+                        ino: info.metadata.id.inode,
+                        kind: info.metadata.kind,
+                        permissions: info.unix.permissions,
+                        nlink: info.metadata.link_count,
+                        uid: info.unix.uid,
+                        gid: info.unix.gid,
+                        rdev: info.rdev,
+                        size: info.metadata.size,
+                        access_nanos: info.metadata.access_nanos,
+                        modified_nanos: info.metadata.modified_nanos,
+                        status_nanos: info.metadata.status_nanos,
+                    },
+                    resolved,
+                ))
+            }
+            async fn read_at(
+                &self,
+                file: &(String, NodeKind, FileAccess),
+                offset: u64,
+                max_bytes: usize,
+            ) -> Result<Bytes, FsOpError> {
+                self.container
+                    .filesystem()
+                    .read_at(&file.0, offset, max_bytes)
+                    .await
+            }
+            async fn write_at(
+                &mut self,
+                file: &(String, NodeKind, FileAccess),
+                position: WritePosition,
+                bytes: &[u8],
+                creds: &Credentials,
+            ) -> Result<Landed, FsOpError> {
+                let payer = crate::StoragePayer::for_test();
+                self.container
+                    .filesystem()
+                    .write_at(&file.0, position, bytes, creds, 100, &payer)
+                    .await
+            }
+            async fn read_link(
+                &self,
+                base: Option<&(String, NodeKind, FileAccess)>,
+                cwd: &str,
+                path: &str,
+                creds: &Credentials,
+            ) -> Result<String, FsOpError> {
+                let base_dir = base.map_or(cwd, |f| f.0.as_str());
+                self.container
+                    .filesystem()
+                    .read_link_at_for(base_dir, path, creds, Some(self.caller))
+                    .await
+            }
+            async fn mknod(
+                &mut self,
+                base: Option<&(String, NodeKind, FileAccess)>,
+                cwd: &str,
+                path: &str,
+                kind: NodeKind,
+                mode: u32,
+                umask: u32,
+                rdev: u64,
+                creds: &Credentials,
+            ) -> Result<(), FsOpError> {
+                let base_dir = base.map_or(cwd, |f| f.0.as_str());
+                let payer = crate::StoragePayer::for_test();
+                self.container
+                    .filesystem()
+                    .mknod_at(base_dir, path, kind, mode, umask, rdev, creds, 100, &payer)
+                    .await
+            }
+            async fn list_dir(
+                &self,
+                file: &(String, NodeKind, FileAccess),
+            ) -> Result<(u64, u64, Vec<DirListEntry>), FsOpError> {
+                let (s, p, entries) = self
+                    .container
+                    .filesystem()
+                    .list_with_inodes(&file.0)
+                    .await?;
+                Ok((
+                    s,
+                    p,
+                    entries
+                        .into_iter()
+                        .map(|e| DirListEntry {
+                            name: e.name,
+                            kind: e.kind,
+                            inode: e.inode,
+                        })
+                        .collect(),
+                ))
+            }
+            async fn unlink(
+                &mut self,
+                base: Option<&(String, NodeKind, FileAccess)>,
+                cwd: &str,
+                path: &str,
+                remove_dir: bool,
+                creds: &Credentials,
+            ) -> Result<(), FsOpError> {
+                let base_dir = base.map_or(cwd, |f| f.0.as_str());
+                let payer = crate::StoragePayer::for_test();
+                self.container
+                    .filesystem()
+                    .unlink_at(base_dir, path, remove_dir, creds, 100, &payer)
+                    .await
+            }
+        }
+
+        async fn syscall_call(
+            proc: &mut Process<MemBacking>,
+            op: Operation,
+            args: [u64; 6],
+            mem: &mut FlatMem,
+            host: &mut PseudoHost<'_>,
+        ) -> u64 {
+            let num = syscall_num(Abi::X86_64, op);
+            let mut thread = DummyThread;
+            match Box::pin(dispatch(
+                proc,
+                helios_linux::syscall::Call {
+                    number: num,
+                    arguments: args,
+                },
+                mem,
+                &mut thread,
+                host,
+            ))
+            .await
+            {
+                ControlFlow::Continue(SyscallOutcome::Return(v)) => v,
+                other => panic!("unexpected syscall outcome: {other:?}"),
+            }
+        }
+
+        let host_ns = test_namespace();
+        let rw = FileSystemRights::READ | FileSystemRights::WRITE;
+        let _priv_fs = mount_memory(&host_ns, "/priv", rw, MountSharing::Private);
+        let shared_fs = mount_memory(&host_ns, "/shared", rw, MountSharing::Shared);
+        let payer = crate::StoragePayer::for_test();
+        let _ = shared_fs.create_special_unix(
+            FsPath::new("null_on_shared").unwrap(),
+            Special::CharDevice(DeviceNumber::new(1, 3).unwrap()),
+            BtrfsAttributes {
+                permissions: 0o666,
+                uid: 0,
+                gid: 0,
+                umask: 0,
+            },
+            1,
+        );
+
+        let mut caller_auth = ProcessAuthority::empty();
+        caller_auth.insert_directory_preopen(
+            DirectoryPreopen::new("/priv", "/priv", DirectoryAuthorityRights::all()).unwrap(),
+        );
+        caller_auth.insert_directory_preopen(
+            DirectoryPreopen::new("/shared", "/shared", DirectoryAuthorityRights::all()).unwrap(),
+        );
+        let container = block_on(LinuxContainer::create(
+            ContainerId::new(NonZeroU64::new(100).unwrap()),
+            &caller_auth,
+            &host_ns,
+            ProcessAuthority::empty(),
+            ContainerConfig {
+                root: ContainerMountSpec {
+                    source_path: String::from("/priv"),
+                    target_path: String::from("/"),
+                    rights: DirectoryAuthorityRights::all(),
+                    sharing: ContainerMountSharing::Private,
+                },
+                mounts: vec![ContainerMountSpec {
+                    source_path: String::from("/shared"),
+                    target_path: String::from("/mnt"),
+                    rights: DirectoryAuthorityRights::all(),
+                    sharing: ContainerMountSharing::Shared,
+                }],
+                shared_owner: SharedOwner { uid: 0, gid: 0 },
+                credentials: Credentials::root(),
+                hostname: UtsField::from_bytes(b"helios-box").unwrap(),
+                domainname: UtsField::from_bytes(b"local").unwrap(),
+            },
+        ))
+        .expect("container create");
+
+        let mut proc =
+            Process::<MemBacking>::new(Abi::X86_64, NonZeroU32::new(1).unwrap(), 0x40_0000);
+        let mut mem = FlatMem::new();
+        let mut host = PseudoHost {
+            container: &container,
+            caller: ProcCaller { pid: 1, tid: 1 },
+            ctty: None,
+            rand_seed: 1,
+        };
+        let at_fdcwd = (-100i64) as u64;
+        let err = |e: u64| e.wrapping_neg();
+
+        block_on(async {
+            // 1. /dev/null: write discards, read -> EOF, pread/pwrite/lseek allowed, epoll_ctl -> EPERM.
+            mem.write_cstr(0x100, "/dev/null");
+            let null_fd = syscall_call(
+                &mut proc,
+                Operation::Openat,
+                [at_fdcwd, 0x100, 2 | 0x200, 0, 0, 0],
+                &mut mem,
+                &mut host,
+            )
+            .await;
+            assert!(null_fd < 100);
+            mem.write_bytes(0x200, b"discard-me");
+            assert_eq!(
+                syscall_call(
+                    &mut proc,
+                    Operation::Write,
+                    [null_fd, 0x200, 10, 0, 0, 0],
+                    &mut mem,
+                    &mut host
+                )
+                .await,
+                10
+            );
+            assert_eq!(
+                syscall_call(
+                    &mut proc,
+                    Operation::Read,
+                    [null_fd, 0x300, 16, 0, 0, 0],
+                    &mut mem,
+                    &mut host
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+                syscall_call(
+                    &mut proc,
+                    Operation::Pread64,
+                    [null_fd, 0x300, 16, 42, 0, 0],
+                    &mut mem,
+                    &mut host
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+                syscall_call(
+                    &mut proc,
+                    Operation::Pwrite64,
+                    [null_fd, 0x200, 5, 42, 0, 0],
+                    &mut mem,
+                    &mut host
+                )
+                .await,
+                5
+            );
+            assert_eq!(
+                syscall_call(
+                    &mut proc,
+                    Operation::Lseek,
+                    [null_fd, 0, 0, 0, 0, 0],
+                    &mut mem,
+                    &mut host
+                )
+                .await,
+                0
+            );
+            let epfd = syscall_call(
+                &mut proc,
+                Operation::EpollCreate1,
+                [0, 0, 0, 0, 0, 0],
+                &mut mem,
+                &mut host,
+            )
+            .await;
+            mem.write_bytes(0x400, &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(
+                syscall_call(
+                    &mut proc,
+                    Operation::EpollCtl,
+                    [epfd, 1, null_fd, 0x400, 0, 0],
+                    &mut mem,
+                    &mut host
+                )
+                .await,
+                err(1)
+            ); // EPERM
+
+            // 2. /dev/zero: read returns zeros, write discards, mmap MAP_PRIVATE & MAP_SHARED succeed.
+            mem.write_cstr(0x120, "/dev/zero");
+            let zero_fd = syscall_call(
+                &mut proc,
+                Operation::Openat,
+                [at_fdcwd, 0x120, 2, 0, 0, 0],
+                &mut mem,
+                &mut host,
+            )
+            .await;
+            mem.write_bytes(0x300, &[0xAA; 16]);
+            assert_eq!(
+                syscall_call(
+                    &mut proc,
+                    Operation::Read,
+                    [zero_fd, 0x300, 16, 0, 0, 0],
+                    &mut mem,
+                    &mut host
+                )
+                .await,
+                16
+            );
+            assert_eq!(mem.read_bytes(0x300, 16), vec![0u8; 16]);
+            let map_priv = syscall_call(
+                &mut proc,
+                Operation::Mmap,
+                [0, 4096, 3, 0x02, zero_fd, 0],
+                &mut mem,
+                &mut host,
+            )
+            .await;
+            assert!(map_priv < (1u64 << 48));
+            let map_shared = syscall_call(
+                &mut proc,
+                Operation::Mmap,
+                [0, 4096, 3, 0x01, zero_fd, 0],
+                &mut mem,
+                &mut host,
+            )
+            .await;
+            assert!(map_shared < (1u64 << 48));
+
+            // 3. /dev/full: read zeros, write -> ENOSPC (28).
+            mem.write_cstr(0x140, "/dev/full");
+            let full_fd = syscall_call(
+                &mut proc,
+                Operation::Openat,
+                [at_fdcwd, 0x140, 2, 0, 0, 0],
+                &mut mem,
+                &mut host,
+            )
+            .await;
+            assert_eq!(
+                syscall_call(
+                    &mut proc,
+                    Operation::Write,
+                    [full_fd, 0x200, 4, 0, 0, 0],
+                    &mut mem,
+                    &mut host
+                )
+                .await,
+                err(28)
+            );
+
+            // 4. /dev/urandom & /dev/random: return non-zero entropy.
+            mem.write_cstr(0x160, "/dev/urandom");
+            let urand_fd = syscall_call(
+                &mut proc,
+                Operation::Openat,
+                [at_fdcwd, 0x160, 0, 0, 0, 0],
+                &mut mem,
+                &mut host,
+            )
+            .await;
+            assert_eq!(
+                syscall_call(
+                    &mut proc,
+                    Operation::Read,
+                    [urand_fd, 0x320, 16, 0, 0, 0],
+                    &mut mem,
+                    &mut host
+                )
+                .await,
+                16
+            );
+            assert!(mem.read_bytes(0x320, 16).iter().any(|&b| b != 0));
+
+            // 5. /dev/tty without controlling terminal -> ENXIO (6).
+            mem.write_cstr(0x180, "/dev/tty");
+            assert_eq!(
+                syscall_call(
+                    &mut proc,
+                    Operation::Openat,
+                    [at_fdcwd, 0x180, 2, 0, 0, 0],
+                    &mut mem,
+                    &mut host
+                )
+                .await,
+                err(6)
+            );
+
+            // 6. /dev/shm mode is 01777 and supports create/write/read/unlink.
+            let (shm_info, _) = container
+                .filesystem()
+                .stat_at("/", "/dev/shm", true, &Credentials::root())
+                .await
+                .unwrap();
+            assert_eq!(shm_info.unix.permissions, 0o1777);
+            mem.write_cstr(0x1a0, "/dev/shm/cjk.txt");
+            let shm_fd = syscall_call(
+                &mut proc,
+                Operation::Openat,
+                [at_fdcwd, 0x1a0, 2 | 0x40, 0o644, 0, 0],
+                &mut mem,
+                &mut host,
+            )
+            .await;
+            let payload = "日本語 한국어 中文".as_bytes();
+            mem.write_bytes(0x500, payload);
+            assert_eq!(
+                syscall_call(
+                    &mut proc,
+                    Operation::Write,
+                    [shm_fd, 0x500, payload.len() as u64, 0, 0, 0],
+                    &mut mem,
+                    &mut host
+                )
+                .await,
+                payload.len() as u64
+            );
+            assert_eq!(
+                syscall_call(
+                    &mut proc,
+                    Operation::Pread64,
+                    [shm_fd, 0x600, payload.len() as u64, 0, 0, 0],
+                    &mut mem,
+                    &mut host
+                )
+                .await,
+                payload.len() as u64
+            );
+            assert_eq!(mem.read_bytes(0x600, payload.len()), payload);
+
+            // 7. mknod char (1, 3) on private mount opens /dev/null; unknown (99, 1) -> ENXIO; Shared NO_DEV -> EACCES (13).
+            mem.write_cstr(0x1c0, "/custom_null");
+            assert_eq!(
+                syscall_call(
+                    &mut proc,
+                    Operation::Mknodat,
+                    [
+                        at_fdcwd,
+                        0x1c0,
+                        0o020_666,
+                        DeviceNumber::new(1, 3).unwrap().encode() as u64,
+                        0,
+                        0
+                    ],
+                    &mut mem,
+                    &mut host
+                )
+                .await,
+                0
+            );
+            let custom_null = syscall_call(
+                &mut proc,
+                Operation::Openat,
+                [at_fdcwd, 0x1c0, 2, 0, 0, 0],
+                &mut mem,
+                &mut host,
+            )
+            .await;
+            assert!(custom_null < 100);
+            assert_eq!(
+                syscall_call(
+                    &mut proc,
+                    Operation::Write,
+                    [custom_null, 0x200, 4, 0, 0, 0],
+                    &mut mem,
+                    &mut host
+                )
+                .await,
+                4
+            );
+
+            mem.write_cstr(0x1e0, "/custom_unknown");
+            assert_eq!(
+                syscall_call(
+                    &mut proc,
+                    Operation::Mknodat,
+                    [
+                        at_fdcwd,
+                        0x1e0,
+                        0o020_666,
+                        DeviceNumber::new(99, 1).unwrap().encode() as u64,
+                        0,
+                        0
+                    ],
+                    &mut mem,
+                    &mut host
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+                syscall_call(
+                    &mut proc,
+                    Operation::Openat,
+                    [at_fdcwd, 0x1e0, 0, 0, 0, 0],
+                    &mut mem,
+                    &mut host
+                )
+                .await,
+                err(6)
+            );
+
+            mem.write_cstr(0x240, "/mnt/null_on_shared");
+            assert_eq!(
+                syscall_call(
+                    &mut proc,
+                    Operation::Openat,
+                    [at_fdcwd, 0x240, 0, 0, 0, 0],
+                    &mut mem,
+                    &mut host
+                )
+                .await,
+                err(13)
+            );
+            let _ = payer;
+        });
+    }
+
+    #[test]
+    fn container_named_fifo_and_unix98_pty_semantics() {
+        use super::tests::{mount_memory, test_namespace};
+        let host_ns = test_namespace();
+        let rw = FileSystemRights::READ | FileSystemRights::WRITE;
+        let _priv_fs = mount_memory(&host_ns, "/priv", rw, MountSharing::Private);
+        let mut caller_auth = ProcessAuthority::empty();
+        caller_auth.insert_directory_preopen(
+            DirectoryPreopen::new("/priv", "/priv", DirectoryAuthorityRights::all()).unwrap(),
+        );
+        let container = block_on(LinuxContainer::create(
+            ContainerId::new(NonZeroU64::new(101).unwrap()),
+            &caller_auth,
+            &host_ns,
+            ProcessAuthority::empty(),
+            ContainerConfig {
+                root: ContainerMountSpec {
+                    source_path: String::from("/priv"),
+                    target_path: String::from("/"),
+                    rights: DirectoryAuthorityRights::all(),
+                    sharing: ContainerMountSharing::Private,
+                },
+                mounts: Vec::new(),
+                shared_owner: SharedOwner { uid: 0, gid: 0 },
+                credentials: Credentials::root(),
+                hostname: UtsField::from_bytes(b"pty-box").unwrap(),
+                domainname: UtsField::UNSET,
+            },
+        ))
+        .expect("container create");
+        let fs = container.filesystem();
+        let root = Credentials::root();
+        let payer = crate::StoragePayer::for_test();
+        let mk_req = |read, write, nonblock, noctty| OpenRequest {
+            read,
+            write,
+            create: false,
+            exclusive: false,
+            truncate: false,
+            directory: false,
+            nofollow: false,
+            path_only: false,
+            append: false,
+            sync: false,
+            dsync: false,
+            nonblock,
+            noctty,
+            mode: 0,
+            umask: 0,
+        };
+
+        block_on(async {
+            // --- 1. Named FIFO semantics ---
+            fs.mknod_at(
+                "/",
+                "/pipe.fifo",
+                NodeKind::Fifo,
+                0o644,
+                0,
+                0,
+                &root,
+                1,
+                &payer,
+            )
+            .await
+            .unwrap();
+
+            // O_WRONLY | O_NONBLOCK with no reader -> ENXIO (NoDevice).
+            assert!(matches!(
+                fs.open_descriptor_at(
+                    "/",
+                    "/pipe.fifo",
+                    mk_req(false, true, true, false),
+                    &root,
+                    None,
+                    2,
+                    &payer
+                )
+                .await,
+                Err(FsOpError::NoDevice)
+            ));
+
+            // O_RDONLY | O_NONBLOCK succeeds immediately and reads EOF before any writer.
+            let ContainerOpenOutcome::FifoRead(rd_nb) = fs
+                .open_descriptor_at(
+                    "/",
+                    "/pipe.fifo",
+                    mk_req(true, false, true, false),
+                    &root,
+                    None,
+                    3,
+                    &payer,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("expected FifoRead");
+            };
+            assert_eq!(rd_nb.try_read(16), helios_unix::FifoTryRead::Eof);
+
+            // O_WRONLY | O_NONBLOCK now succeeds because a reader is open.
+            let ContainerOpenOutcome::FifoWrite(wr_nb) = fs
+                .open_descriptor_at(
+                    "/",
+                    "/pipe.fifo",
+                    mk_req(false, true, true, false),
+                    &root,
+                    None,
+                    4,
+                    &payer,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("expected FifoWrite");
+            };
+            let msg = "FIFO 日本語 한국어 中文".as_bytes();
+            assert_eq!(
+                wr_nb.try_write(msg),
+                helios_unix::FifoTryWrite::Written(msg.len())
+            );
+            assert_eq!(
+                rd_nb.try_read(64),
+                helios_unix::FifoTryRead::Ready(Bytes::copy_from_slice(msg))
+            );
+            drop(wr_nb);
+            assert_eq!(rd_nb.try_read(16), helios_unix::FifoTryRead::Eof);
+            drop(rd_nb);
+
+            // Blocking O_RDONLY + O_WRONLY rendezvous concurrently.
+            let (r_res, w_res) = futures::future::join(
+                fs.open_descriptor_at(
+                    "/",
+                    "/pipe.fifo",
+                    mk_req(true, false, false, false),
+                    &root,
+                    None,
+                    5,
+                    &payer,
+                ),
+                fs.open_descriptor_at(
+                    "/",
+                    "/pipe.fifo",
+                    mk_req(false, true, false, false),
+                    &root,
+                    None,
+                    5,
+                    &payer,
+                ),
+            )
+            .await;
+            let ContainerOpenOutcome::FifoRead(rd_blk) = r_res.unwrap() else {
+                panic!("expected FifoRead");
+            };
+            let ContainerOpenOutcome::FifoWrite(wr_blk) = w_res.unwrap() else {
+                panic!("expected FifoWrite");
+            };
+            assert_eq!(wr_blk.write(b"rendezvous").await, Ok(10));
+            assert_eq!(rd_blk.read(32).await, Bytes::from_static(b"rendezvous"));
+            drop(rd_blk);
+            assert_eq!(
+                wr_blk.try_write(b"x"),
+                helios_unix::FifoTryWrite::BrokenPipe
+            );
+            drop(wr_blk);
+
+            // O_RDWR never blocks and never observes EOF.
+            let ContainerOpenOutcome::FifoReadWrite(rw_end) = fs
+                .open_descriptor_at(
+                    "/",
+                    "/pipe.fifo",
+                    mk_req(true, true, true, false),
+                    &root,
+                    None,
+                    6,
+                    &payer,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("expected FifoReadWrite");
+            };
+            assert_eq!(rw_end.try_read(16), helios_unix::FifoTryRead::WouldBlock);
+            assert_eq!(
+                rw_end.try_write(b"loop"),
+                helios_unix::FifoTryWrite::Written(4)
+            );
+            assert_eq!(
+                rw_end.try_read(16),
+                helios_unix::FifoTryRead::Ready(Bytes::from_static(b"loop"))
+            );
+            drop(rw_end);
+
+            // --- 2. UNIX98 PTY (/dev/ptmx + /dev/pts/<n>) ---
+            let ContainerOpenOutcome::PtyMaster(master) = fs
+                .open_descriptor_at(
+                    "/",
+                    "/dev/ptmx",
+                    mk_req(true, true, false, false),
+                    &root,
+                    None,
+                    7,
+                    &payer,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("expected PtyMaster");
+            };
+            assert_eq!(master.index(), 0);
+            let pts_entries = fs.list("/dev/pts").await.unwrap();
+            assert!(pts_entries.iter().any(|e| e.name == "0"));
+
+            // Locked slave returns EIO.
+            assert!(matches!(
+                fs.open_descriptor_at(
+                    "/",
+                    "/dev/pts/0",
+                    mk_req(true, true, false, false),
+                    &root,
+                    None,
+                    8,
+                    &payer
+                )
+                .await,
+                Err(FsOpError::Fs(FsError::Io))
+            ));
+
+            // Unlock and open slave.
+            master.set_locked(false);
+            let ContainerOpenOutcome::PtySlave { slave, noctty } = fs
+                .open_descriptor_at(
+                    "/",
+                    "/dev/pts/0",
+                    mk_req(true, true, false, true),
+                    &root,
+                    None,
+                    9,
+                    &payer,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("expected PtySlave");
+            };
+            assert!(noctty);
+            assert_eq!(slave.index(), 0);
+
+            // Canonical + echo line discipline.
+            let (written, sig) = master.write(b"hi\r");
+            assert_eq!(written, 3);
+            assert!(sig.is_none());
+            assert_eq!(
+                slave.try_read(32),
+                helios_unix::PtyTryRead::Ready(Bytes::from_static(b"hi\n"))
+            );
+            assert_eq!(
+                master.try_read(32),
+                helios_unix::PtyTryRead::Ready(Bytes::from_static(b"hi\r\n"))
+            );
+
+            // Closing last slave causes master HUP / EIO.
+            drop(slave);
+            assert!(master.is_slave_hung_up());
+            assert_eq!(master.try_read(16), helios_unix::PtyTryRead::Closed);
+        });
+    }
+
+    #[test]
+    fn container_proc_and_sys_isolation_and_sysctl() {
+        use super::tests::{mount_memory, test_namespace};
+        let host_ns = test_namespace();
+        let rw = FileSystemRights::READ | FileSystemRights::WRITE;
+        let _priv_a = mount_memory(&host_ns, "/priv_a", rw, MountSharing::Private);
+        let _priv_b = mount_memory(&host_ns, "/priv_b", rw, MountSharing::Private);
+        let mut auth = ProcessAuthority::empty();
+        auth.insert_directory_preopen(
+            DirectoryPreopen::new("/priv_a", "/priv_a", DirectoryAuthorityRights::all()).unwrap(),
+        );
+        auth.insert_directory_preopen(
+            DirectoryPreopen::new("/priv_b", "/priv_b", DirectoryAuthorityRights::all()).unwrap(),
+        );
+
+        let container_a = block_on(LinuxContainer::create(
+            ContainerId::new(NonZeroU64::new(201).unwrap()),
+            &auth,
+            &host_ns,
+            ProcessAuthority::empty(),
+            ContainerConfig {
+                root: ContainerMountSpec {
+                    source_path: String::from("/priv_a"),
+                    target_path: String::from("/"),
+                    rights: DirectoryAuthorityRights::all(),
+                    sharing: ContainerMountSharing::Private,
+                },
+                mounts: Vec::new(),
+                shared_owner: SharedOwner { uid: 0, gid: 0 },
+                credentials: Credentials::root(),
+                hostname: UtsField::from_bytes(b"node-a").unwrap(),
+                domainname: UtsField::from_bytes(b"domain-a").unwrap(),
+            },
+        ))
+        .unwrap();
+
+        let container_b = block_on(LinuxContainer::create(
+            ContainerId::new(NonZeroU64::new(202).unwrap()),
+            &auth,
+            &host_ns,
+            ProcessAuthority::empty(),
+            ContainerConfig {
+                root: ContainerMountSpec {
+                    source_path: String::from("/priv_b"),
+                    target_path: String::from("/"),
+                    rights: DirectoryAuthorityRights::all(),
+                    sharing: ContainerMountSharing::Private,
+                },
+                mounts: Vec::new(),
+                shared_owner: SharedOwner { uid: 0, gid: 0 },
+                credentials: Credentials::root(),
+                hostname: UtsField::from_bytes(b"node-b").unwrap(),
+                domainname: UtsField::UNSET,
+            },
+        ))
+        .unwrap();
+
+        let mut rec_a = crate::ProcProcessRecord::minimal(2, 1, "worker-a", "/bin/worker-a");
+        rec_a.argv = vec![String::from("/bin/worker-a"), String::from("--ok")];
+        rec_a.env = vec![String::from("LANG=C.UTF-8")];
+        rec_a.cwd = String::from("/work");
+        rec_a.fds.push(crate::ProcFdEntry {
+            fd: 3,
+            target: String::from("/hello.txt"),
+            pos: 7,
+            flags: 0,
+            mnt_id: 1,
+        });
+        rec_a.threads.insert(
+            5,
+            crate::ProcThreadRecord {
+                tid: 5,
+                comm: String::from("worker-a"),
+                state: 'R',
+                utime_ticks: 1,
+                stime_ticks: 0,
+            },
+        );
+        container_a.proc_registry().register_process(rec_a);
+
+        let rec_b = crate::ProcProcessRecord::minimal(1, 0, "secret-b", "/bin/secret-b");
+        container_b.proc_registry().register_process(rec_b);
+
+        let root = Credentials::root();
+        let unpriv = Credentials::for_ids(1000, 1000, Vec::new());
+        let caller_a = Some(ProcCaller { pid: 2, tid: 5 });
+        let payer = crate::StoragePayer::for_test();
+
+        block_on(async {
+            let fs_a = container_a.filesystem();
+            // Caller-sensitive /proc/self and /proc/thread-self.
+            assert_eq!(
+                fs_a.read_link_at_for("/", "/proc/self", &root, caller_a)
+                    .await
+                    .unwrap(),
+                "2"
+            );
+            assert_eq!(
+                fs_a.read_link_at_for("/", "/proc/thread-self", &root, caller_a)
+                    .await
+                    .unwrap(),
+                "2/task/5"
+            );
+            assert_eq!(
+                fs_a.read_link_at_for("/", "/proc/self/exe", &root, caller_a)
+                    .await
+                    .unwrap(),
+                "/bin/worker-a"
+            );
+            assert_eq!(
+                fs_a.read_link_at_for("/", "/proc/self/cwd", &root, caller_a)
+                    .await
+                    .unwrap(),
+                "/work"
+            );
+            assert_eq!(
+                fs_a.read_link_at_for("/", "/proc/self/fd/3", &root, caller_a)
+                    .await
+                    .unwrap(),
+                "/hello.txt"
+            );
+
+            // Opening /proc/self/fd/3 returns ProcFd { pid: 2, fd: 3 }.
+            let req_ro = OpenRequest {
+                read: true,
+                write: false,
+                create: false,
+                exclusive: false,
+                truncate: false,
+                directory: false,
+                nofollow: false,
+                path_only: false,
+                append: false,
+                sync: false,
+                dsync: false,
+                nonblock: false,
+                noctty: false,
+                mode: 0,
+                umask: 0,
+            };
+            assert!(matches!(
+                fs_a.open_descriptor_at(
+                    "/",
+                    "/proc/self/fd/3",
+                    req_ro,
+                    &root,
+                    caller_a,
+                    10,
+                    &payer
+                )
+                .await,
+                Ok(ContainerOpenOutcome::ProcFd { pid: 2, fd: 3, .. })
+            ));
+
+            // Cross-container /proc isolation: Container A does NOT see Container B's pid 1.
+            assert!(matches!(
+                fs_a.stat_at("/", "/proc/1", true, &root).await,
+                Err(FsOpError::Fs(FsError::NoEntry))
+            ));
+
+            // Per-process files render expected fields.
+            let (_, status_path) = fs_a
+                .stat_at_for("/", "/proc/self/status", true, &root, caller_a)
+                .await
+                .unwrap();
+            let status_txt =
+                String::from_utf8(fs_a.read_at(&status_path, 0, 4096).await.unwrap().to_vec())
+                    .unwrap();
+            assert!(status_txt.contains("Name:\tworker-a"));
+            assert!(status_txt.contains("Tgid:\t2"));
+            let (_, fdinfo_path) = fs_a
+                .stat_at_for("/", "/proc/self/fdinfo/3", true, &root, caller_a)
+                .await
+                .unwrap();
+            let fdinfo_txt =
+                String::from_utf8(fs_a.read_at(&fdinfo_path, 0, 1024).await.unwrap().to_vec())
+                    .unwrap();
+            assert!(fdinfo_txt.contains("pos:\t7"));
+
+            // Container-level /proc files & /proc/sys/kernel/* CAP_SYS_ADMIN writes.
+            let meminfo = String::from_utf8(
+                fs_a.read_at("/proc/meminfo", 0, 4096)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(meminfo.contains("MemTotal:"));
+            let mounts_txt = String::from_utf8(
+                fs_a.read_at("/proc/mounts", 0, 4096)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(mounts_txt.contains(" /dev devtmpfs "));
+            assert!(mounts_txt.contains(" /proc proc "));
+            assert!(mounts_txt.contains(" /sys sysfs "));
+            assert!(mounts_txt.contains(" /dev/shm tmpfs "));
+            let net_dev = String::from_utf8(
+                fs_a.read_at("/proc/net/dev", 0, 4096)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(net_dev.contains("lo:"));
+
+            // Unprivileged write to /proc/sys/kernel/hostname -> EPERM; CAP_SYS_ADMIN updates UTS.
+            assert!(matches!(
+                fs_a.write_at(
+                    "/proc/sys/kernel/hostname",
+                    WritePosition::At(0),
+                    b"denied\n",
+                    &unpriv,
+                    11,
+                    &payer
+                )
+                .await,
+                Err(FsOpError::PermissionDenied)
+            ));
+            fs_a.write_at(
+                "/proc/sys/kernel/hostname",
+                WritePosition::At(0),
+                b"renamed-a\n",
+                &root,
+                12,
+                &payer,
+            )
+            .await
+            .unwrap();
+            assert_eq!(container_a.hostname().as_bytes(), b"renamed-a");
+            assert_eq!(container_b.hostname().as_bytes(), b"node-b");
+
+            // /sys files & empty bus/pci/devices without device grants.
+            let cpu_online = String::from_utf8(
+                fs_a.read_at("/sys/devices/system/cpu/online", 0, 64)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(cpu_online.starts_with('0'));
+            let lo_mtu = String::from_utf8(
+                fs_a.read_at("/sys/class/net/lo/mtu", 0, 64)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert_eq!(lo_mtu.trim(), "65536");
+            let null_uevent = String::from_utf8(
+                fs_a.read_at("/sys/dev/char/1:3/uevent", 0, 128)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(null_uevent.contains("MAJOR=1"));
+            assert!(null_uevent.contains("MINOR=3"));
+            let pci_devs = fs_a.list("/sys/bus/pci/devices").await.unwrap();
+            assert!(pci_devs.is_empty());
         });
     }
 }

@@ -2154,9 +2154,10 @@ mod linux_tests {
                 core_module_cache: Mutex::new(ComponentCache::new(1 << 20)),
                 core_module_instance_pre_cache: Arc::new(Mutex::new(ComponentCache::new(1 << 20))),
                 next_provider_generation: core::sync::atomic::AtomicU64::new(1),
-                surface_provider: Mutex::new(None),
+                surface_install_lock: helios_sync::RawMutex::new(),
+                surface_provider: Arc::new(Mutex::new(None)),
                 http_provider: Mutex::new(None),
-                compiler_registration: Mutex::new(None),
+                compiler_registration: Arc::new(Mutex::new(None)),
                 cwasm_signing_key: crate::signing_key::CwasmSigningKey::from_seed(
                     &helios_hal::measured_boot::SealedSecret::new(
                         [0x42; helios_hal::measured_boot::SealedSecret::LEN],

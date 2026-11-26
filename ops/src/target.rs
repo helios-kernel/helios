@@ -722,7 +722,7 @@ impl IdentityProfile {
         toml::from_str(&content).map_err(|source| AuthError::ParseIdentity { path, source })
     }
 
-    /// Persist this identity profile to disk.
+    /// Persist this identity profile to disk with `0600` permissions on Unix.
     pub fn save(&self) -> Result<PathBuf, AuthError> {
         let path = Self::path_for(&self.name);
         if let Some(parent) = path.parent() {
@@ -733,11 +733,37 @@ impl IdentityProfile {
         }
         let encoded = toml::to_string_pretty(self)
             .map_err(|source| AuthError::SerializeIdentity { source })?;
-        fs::write(&path, encoded).map_err(|source| AuthError::WriteIdentity {
-            path: path.clone(),
-            source,
+        write_private_file(&path, encoded.as_bytes()).map_err(|source| {
+            AuthError::WriteIdentity {
+                path: path.clone(),
+                source,
+            }
         })?;
         Ok(path)
+    }
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        opts.mode(0o600);
+        let mut file = opts.open(path)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = opts.open(path)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        Ok(())
     }
 }
 
@@ -847,5 +873,66 @@ mod tests {
             .expect("label match");
         assert_eq!(prod.len(), 1);
         assert_eq!(prod[0].name, "prod-1");
+    }
+
+    #[test]
+    fn private_identity_file_uses_0600_and_decodes_postcard_cert() {
+        use helios_inspector_protocol::auth::{
+            AUTH_PROTOCOL_VERSION, CapabilityCert as ProtoCert, CapabilityCertPayload,
+            ClientIdentity, SessionGrants, TransportMask,
+        };
+
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("operator.toml");
+        write_private_file(&path, b"secret = true\n").expect("write private file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let client_seed = [0x44_u8; 32];
+        let client_pub = ClientIdentity::from_static_seed(client_seed).public_key();
+        let proto_cert = ProtoCert {
+            payload: CapabilityCertPayload {
+                version: AUTH_PROTOCOL_VERSION,
+                principal: "alice".to_owned(),
+                subject_public_key: client_pub,
+                node_public_key: None,
+                not_before_unix: 1,
+                expires_at_unix: u64::MAX,
+                grants: SessionGrants::full_worker_ceiling(),
+                allowed_transports: TransportMask::ALL,
+            },
+            ca_public_key: [0x11_u8; 32],
+            ca_signature: [0x22_u8; 64],
+        };
+        let cert_hex = proto_cert
+            .encode_postcard()
+            .expect("encode")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let seed_hex = client_seed
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+
+        let profile = IdentityProfile {
+            name: "alice".to_owned(),
+            principal: "alice".to_owned(),
+            authority_url: Some("https://auth.example".to_owned()),
+            cert: None,
+            secret_key_hex: Some(seed_hex),
+            capability_cert_postcard_hex: Some(cert_hex),
+            expected_machine_public_key_hex: None,
+        };
+        let security = profile.to_security_mode().expect("to_security_mode");
+        assert!(matches!(
+            security,
+            crate::SecurityMode::Authenticated { ref identity, .. }
+                if matches!(identity.as_ref(), ClientIdentity::CapabilityCert { .. })
+        ));
     }
 }

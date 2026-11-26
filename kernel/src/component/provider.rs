@@ -35,7 +35,6 @@
 
 extern crate alloc;
 
-use core::future::Future;
 use core::pin::pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -246,6 +245,10 @@ impl<M> Drop for ProviderReceiver<M> {
     }
 }
 
+struct ProviderSlotInner<M> {
+    sender: RwLock<Option<ProviderSender<M>>>,
+}
+
 /// Replaceable slot holding the sending half of a provider's work queue.
 ///
 /// # Concurrency contract
@@ -258,21 +261,31 @@ impl<M> Drop for ProviderReceiver<M> {
 ///   endpoint atomically and close any displaced queue outside the lock so
 ///   previous receivers exit promptly.
 pub struct ProviderSlot<M> {
-    sender: RwLock<Option<ProviderSender<M>>>,
+    inner: Arc<ProviderSlotInner<M>>,
+}
+
+impl<M> Clone for ProviderSlot<M> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl<M> ProviderSlot<M> {
     /// An empty slot. Every `send` reports [`ProviderError::Unavailable`]
     /// until a provider is installed.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            sender: RwLock::new(None),
+            inner: Arc::new(ProviderSlotInner {
+                sender: RwLock::new(None),
+            }),
         }
     }
 
     /// Whether a provider is currently installed.
     pub fn is_installed(&self) -> bool {
-        self.sender.read().is_some()
+        self.inner.sender.read().is_some()
     }
 
     /// Claim an empty slot for `sender`.
@@ -280,7 +293,7 @@ impl<M> ProviderSlot<M> {
     /// Returns [`ProviderAlreadyInstalled`] when the slot is already taken;
     /// callers that intentionally hot-swap an endpoint use [`Self::replace`].
     pub fn install(&self, sender: ProviderSender<M>) -> Result<(), ProviderAlreadyInstalled> {
-        let mut slot = self.sender.write();
+        let mut slot = self.inner.sender.write();
         if slot.is_some() {
             return Err(ProviderAlreadyInstalled);
         }
@@ -293,7 +306,7 @@ impl<M> ProviderSlot<M> {
     /// receiver drains and terminates cleanly.
     pub fn replace(&self, sender: ProviderSender<M>) -> Option<ProviderSender<M>> {
         let previous = {
-            let mut slot = self.sender.write();
+            let mut slot = self.inner.sender.write();
             slot.replace(sender)
         };
         if let Some(prev) = &previous {
@@ -306,7 +319,7 @@ impl<M> ProviderSlot<M> {
     /// [`ProviderError::Unavailable`], closing the removed queue.
     pub fn uninstall(&self) -> Option<ProviderSender<M>> {
         let previous = {
-            let mut slot = self.sender.write();
+            let mut slot = self.inner.sender.write();
             slot.take()
         };
         if let Some(prev) = &previous {
@@ -319,7 +332,7 @@ impl<M> ProviderSlot<M> {
     /// preventing a stale handle drop from displacing a newer provider.
     pub fn uninstall_if_same(&self, expected: &ProviderSender<M>) -> bool {
         let removed = {
-            let mut slot = self.sender.write();
+            let mut slot = self.inner.sender.write();
             if slot
                 .as_ref()
                 .is_some_and(|current| Arc::ptr_eq(&current.channel, &expected.channel))
@@ -342,15 +355,14 @@ impl<M> ProviderSlot<M> {
     /// Resolves as soon as the message is queued; the reply travels on
     /// whatever channel the message itself carries. An uninstalled slot fails
     /// immediately rather than parking forever.
-    pub fn send(&self, message: M) -> impl Future<Output = Result<(), ProviderError>> + Send + '_
-    where
-        M: Send,
-    {
-        let sender = self.sender.read().clone();
-        async move {
-            let sender = sender.ok_or(ProviderError::Unavailable)?;
-            sender.send(message).await
-        }
+    pub async fn send(&self, message: M) -> Result<(), ProviderError> {
+        let sender = self
+            .inner
+            .sender
+            .read()
+            .clone()
+            .ok_or(ProviderError::Unavailable)?;
+        sender.send(message).await
     }
 
     /// Hand `message` to the provider without waiting for room.
@@ -358,6 +370,7 @@ impl<M> ProviderSlot<M> {
     /// For the callers that cannot await, which is every `Drop`.
     pub fn try_send(&self, message: M) -> Result<(), ProviderError> {
         let sender = self
+            .inner
             .sender
             .read()
             .clone()
@@ -443,6 +456,15 @@ impl<M> Drop for PusherGuard<'_, M> {
     }
 }
 
+struct PerProcessorProviderInner<M> {
+    control: Mutex<()>,
+    installed: AtomicBool,
+    active: AtomicBool,
+    generation: AtomicU64,
+    changed: Notify,
+    shards: Once<PerProcessor<CachePadded<ProviderShard<M>>>>,
+}
+
 /// Container of NUMA-local, cache-line-padded provider shards, one per
 /// possible processor, with lock-free data paths and atomic generation-tracked
 /// activation/replacement for root-supervisor provider hot-swap.
@@ -459,52 +481,62 @@ impl<M> Drop for PusherGuard<'_, M> {
 ///   [`Self::activate_shard`], [`Self::redirect_shard`]) is lock-free and
 ///   never touches `control`.
 /// - Control plane ([`Self::install`], [`Self::install_or_activate`],
-///   [`Self::deactivate`]) serialises under `control` so `active` and
-///   `generation` advance atomically and broadcast `changed` to every shard
-///   supervisor.
+///   [`Self::install_or_activate_with`], [`Self::deactivate`],
+///   [`Self::deactivate_with`]) serialises under `control` so `active`,
+///   `generation`, and caller-supplied registration metadata advance atomically
+///   before broadcasting `changed` to every shard supervisor.
+/// - [`Self::deactivate`] pairs a `SeqCst` Dekker handshake (`active = false`
+///   vs each shard's `pushers` counter) with draining every shard queue so no
+///   message is pushed after deactivation begins and callers waiting on queued
+///   requests observe immediate channel closure instead of hanging.
 pub struct PerProcessorProvider<M> {
-    control: Mutex<()>,
-    installed: AtomicBool,
-    active: AtomicBool,
-    generation: AtomicU64,
-    changed: Notify,
-    shards: Once<PerProcessor<CachePadded<ProviderShard<M>>>>,
+    inner: Arc<PerProcessorProviderInner<M>>,
+}
+
+impl<M> Clone for PerProcessorProvider<M> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl<M> PerProcessorProvider<M> {
     /// An empty sharded provider. Every `send` reports
     /// [`ProviderError::Unavailable`] until [`Self::install`] or
     /// [`Self::install_or_activate`] claims it.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            control: Mutex::new(()),
-            installed: AtomicBool::new(false),
-            active: AtomicBool::new(false),
-            generation: AtomicU64::new(0),
-            changed: Notify::new(),
-            shards: Once::new(),
+            inner: Arc::new(PerProcessorProviderInner {
+                control: Mutex::new(()),
+                installed: AtomicBool::new(false),
+                active: AtomicBool::new(false),
+                generation: AtomicU64::new(0),
+                changed: Notify::new(),
+                shards: Once::new(),
+            }),
         }
     }
 
     /// Whether shards have been provisioned and are currently active.
     pub fn is_installed(&self) -> bool {
-        self.active.load(Ordering::Acquire) && self.shards.get().is_some()
+        self.inner.active.load(Ordering::Acquire) && self.inner.shards.get().is_some()
     }
 
     /// Current control-plane generation (bumped on every activation,
     /// replacement, or deactivation).
     pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+        self.inner.generation.load(Ordering::Acquire)
     }
 
     /// Broadcast notification fired whenever a provider generation is
     /// installed, replaced, or deactivated.
     pub fn changed(&self) -> crate::Notified<'_> {
-        self.changed.notified()
+        self.inner.changed.notified()
     }
 
     fn wake_all_shards(&self) {
-        if let Some(shards) = self.shards.get() {
+        if let Some(shards) = self.inner.shards.get() {
             for index in 0..shards.len() {
                 let processor = ProcessorId::new(
                     u16::try_from(index).expect("shard index fits in ProcessorId"),
@@ -529,16 +561,17 @@ impl<M> PerProcessorProvider<M> {
         capacity: usize,
     ) -> Result<(), ProviderAlreadyInstalled> {
         assert!(capacity > 0, "provider queue capacity must be non-zero");
-        let _guard = self.control.lock();
-        if self.installed.swap(true, Ordering::AcqRel) {
+        let _guard = self.inner.control.lock();
+        if self.inner.installed.swap(true, Ordering::AcqRel) {
             return Err(ProviderAlreadyInstalled);
         }
-        self.shards.call_once(|| {
+        self.inner.shards.call_once(|| {
             PerProcessor::new(pool, |_, _| CachePadded::new(ProviderShard::new(capacity)))
         });
-        self.active.store(true, Ordering::Release);
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        self.changed.notify_all();
+        let next = self.inner.generation.load(Ordering::Acquire) + 1;
+        self.inner.generation.store(next, Ordering::Release);
+        self.inner.active.store(true, Ordering::SeqCst);
+        self.inner.changed.notify_all();
         Ok(())
     }
 
@@ -550,33 +583,83 @@ impl<M> PerProcessorProvider<M> {
     ///
     /// Panics when `capacity` is zero.
     pub fn install_or_activate(&self, pool: &UserMemoryPool, capacity: usize) -> u64 {
+        self.install_or_activate_with(pool, capacity, |_| ()).0
+    }
+
+    /// Ensure shards are allocated on `pool`'s NUMA nodes, run `publish(next_generation)`
+    /// while holding the control-plane lock so registration metadata is visible
+    /// BEFORE `generation`/`active` advance and before `changed.notify_all()`
+    /// wakes remote shard supervisors, then activate and wake all shards.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `capacity` is zero.
+    pub fn install_or_activate_with<F, R>(
+        &self,
+        pool: &UserMemoryPool,
+        capacity: usize,
+        publish: F,
+    ) -> (u64, R)
+    where
+        F: FnOnce(u64) -> R,
+    {
         assert!(capacity > 0, "provider queue capacity must be non-zero");
-        let _guard = self.control.lock();
-        self.installed.store(true, Ordering::Release);
-        self.shards.call_once(|| {
+        let _guard = self.inner.control.lock();
+        self.inner.installed.store(true, Ordering::Release);
+        self.inner.shards.call_once(|| {
             PerProcessor::new(pool, |_, _| CachePadded::new(ProviderShard::new(capacity)))
         });
-        let next = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        self.active.store(true, Ordering::Release);
+        let next = self.inner.generation.load(Ordering::Acquire) + 1;
+        let published = publish(next);
+        self.inner.generation.store(next, Ordering::Release);
+        self.inner.active.store(true, Ordering::SeqCst);
         self.wake_all_shards();
-        self.changed.notify_all();
-        next
+        self.inner.changed.notify_all();
+        (next, published)
     }
 
     /// Deactivate the sharded provider if `expected_generation` is still the
-    /// live generation, causing subsequent sends to report
-    /// [`ProviderError::Unavailable`] and waking parked shards to tear down
-    /// their idle stores.
+    /// live generation, waiting for in-flight non-blocking pushers on every
+    /// shard to finish, draining queued messages so waiting callers observe
+    /// immediate closure, and waking parked senders and shard supervisors.
     pub fn deactivate(&self, expected_generation: u64) -> bool {
-        let _guard = self.control.lock();
-        if self.generation.load(Ordering::Acquire) != expected_generation {
-            return false;
+        self.deactivate_with(expected_generation, || ()).is_some()
+    }
+
+    /// Same as [`Self::deactivate`], additionally running `on_deactivate` under
+    /// the control-plane lock when `expected_generation` matches so caller
+    /// registration state stays strictly ordered with `active` and `generation`.
+    pub fn deactivate_with<F, R>(&self, expected_generation: u64, on_deactivate: F) -> Option<R>
+    where
+        F: FnOnce() -> R,
+    {
+        let _guard = self.inner.control.lock();
+        if self.inner.generation.load(Ordering::Acquire) != expected_generation {
+            return None;
         }
-        self.active.store(false, Ordering::Release);
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.inner.active.store(false, Ordering::SeqCst);
+        let next = expected_generation + 1;
+        self.inner.generation.store(next, Ordering::Release);
+        let outcome = on_deactivate();
+        if let Some(shards) = self.inner.shards.get() {
+            for index in 0..shards.len() {
+                let processor = ProcessorId::new(
+                    u16::try_from(index).expect("shard index fits in ProcessorId"),
+                );
+                let shard = &**shards.get(processor);
+                // Wait for any in-flight non-blocking pushers that checked
+                // `active` before our `SeqCst` store to finish before draining.
+                while shard.pushers.load(Ordering::SeqCst) != 0 {
+                    core::hint::spin_loop();
+                }
+                while let Ok(message) = shard.queue.pop() {
+                    drop(message);
+                }
+            }
+        }
         self.wake_all_shards();
-        self.changed.notify_all();
-        true
+        self.inner.changed.notify_all();
+        Some(outcome)
     }
 
     /// Walks redirect links from `start` up to `shards.len()` hops to find an
@@ -597,44 +680,39 @@ impl<M> PerProcessorProvider<M> {
 
     /// Hand `message` to the active shard serving `current_processor()`,
     /// waiting for queue room if full.
-    pub fn send(&self, message: M) -> impl Future<Output = Result<(), ProviderError>> + Send + '_
-    where
-        M: Send,
-    {
-        let mut message = message;
-        let active = self.active.load(Ordering::Acquire);
-        let shards = self.shards.get();
-        async move {
-            if !active {
+    pub async fn send(&self, mut message: M) -> Result<(), ProviderError> {
+        let shards = self.inner.shards.get().ok_or(ProviderError::Unavailable)?;
+        loop {
+            let target = Self::resolve_target(shards, current_processor());
+            let shard = &**shards.get(target);
+            // Armed before testing `active` or pushing so a concurrent
+            // `deactivate()` or consumer pop cannot lose a wake.
+            let room = shard.room.notified();
+            if !self.inner.active.load(Ordering::Acquire) {
                 return Err(ProviderError::Unavailable);
             }
-            let shards = shards.ok_or(ProviderError::Unavailable)?;
-            loop {
-                if !self.active.load(Ordering::Acquire) {
-                    return Err(ProviderError::Unavailable);
-                }
-                let target = Self::resolve_target(shards, current_processor());
-                let shard = &**shards.get(target);
-                let room = shard.room.notified();
-                shard.pushers.fetch_add(1, Ordering::SeqCst);
-                let guard = PusherGuard { shard };
-                if shard.redirect_target(Ordering::SeqCst).is_some() {
-                    drop(guard);
-                    continue;
-                }
-                let pushed = shard.queue.push(message);
+            shard.pushers.fetch_add(1, Ordering::SeqCst);
+            let guard = PusherGuard { shard };
+            if !self.inner.active.load(Ordering::SeqCst) {
                 drop(guard);
-                match pushed {
-                    Ok(()) => {
-                        shard.ready.notify_all();
-                        return Ok(());
-                    }
-                    Err(PushError::Full(returned)) => {
-                        message = returned;
-                        room.await;
-                    }
-                    Err(PushError::Closed(_)) => return Err(ProviderError::Closed),
+                return Err(ProviderError::Unavailable);
+            }
+            if shard.redirect_target(Ordering::SeqCst).is_some() {
+                drop(guard);
+                continue;
+            }
+            let pushed = shard.queue.push(message);
+            drop(guard);
+            match pushed {
+                Ok(()) => {
+                    shard.ready.notify_all();
+                    return Ok(());
                 }
+                Err(PushError::Full(returned)) => {
+                    message = returned;
+                    room.await;
+                }
+                Err(PushError::Closed(_)) => return Err(ProviderError::Closed),
             }
         }
     }
@@ -642,16 +720,20 @@ impl<M> PerProcessorProvider<M> {
     /// Queue `message` on the active shard serving `current_processor()`
     /// without waiting for room.
     pub fn try_send(&self, message: M) -> Result<(), ProviderError> {
-        if !self.active.load(Ordering::Acquire) {
+        if !self.inner.active.load(Ordering::Acquire) {
             return Err(ProviderError::Unavailable);
         }
-        let shards = self.shards.get().ok_or(ProviderError::Unavailable)?;
+        let shards = self.inner.shards.get().ok_or(ProviderError::Unavailable)?;
         let mut message = message;
         for _ in 0..=shards.len() {
             let target = Self::resolve_target(shards, current_processor());
             let shard = &**shards.get(target);
             shard.pushers.fetch_add(1, Ordering::SeqCst);
             let guard = PusherGuard { shard };
+            if !self.inner.active.load(Ordering::SeqCst) {
+                drop(guard);
+                return Err(ProviderError::Unavailable);
+            }
             if shard.redirect_target(Ordering::SeqCst).is_some() {
                 drop(guard);
                 continue;
@@ -676,7 +758,7 @@ impl<M> PerProcessorProvider<M> {
 
     /// Await the next queued message on `processor`'s shard.
     pub async fn recv_on(&self, processor: ProcessorId) -> Option<M> {
-        let shards = self.shards.get()?;
+        let shards = self.inner.shards.get()?;
         let shard = &**shards.get(processor);
         loop {
             let ready = shard.ready.notified();
@@ -701,13 +783,13 @@ impl<M> PerProcessorProvider<M> {
         processor: ProcessorId,
         expected_generation: u64,
     ) -> Option<M> {
-        let shards = self.shards.get()?;
+        let shards = self.inner.shards.get()?;
         let shard = &**shards.get(processor);
         loop {
             let ready = shard.ready.notified();
-            let changed = self.changed.notified();
-            if !self.active.load(Ordering::Acquire)
-                || self.generation.load(Ordering::Acquire) != expected_generation
+            let changed = self.inner.changed.notified();
+            if !self.inner.active.load(Ordering::Acquire)
+                || self.inner.generation.load(Ordering::Acquire) != expected_generation
             {
                 return None;
             }
@@ -726,7 +808,7 @@ impl<M> PerProcessorProvider<M> {
 
     /// Take the next queued message on `processor`'s shard without waiting.
     pub fn try_recv_on(&self, processor: ProcessorId) -> Result<M, ProviderError> {
-        let shards = self.shards.get().ok_or(ProviderError::Unavailable)?;
+        let shards = self.inner.shards.get().ok_or(ProviderError::Unavailable)?;
         let shard = &**shards.get(processor);
         match shard.queue.pop() {
             Ok(message) => {
@@ -740,7 +822,7 @@ impl<M> PerProcessorProvider<M> {
 
     /// Mark `processor`'s shard active again when that processor comes online.
     pub fn activate_shard(&self, processor: ProcessorId) {
-        let Some(shards) = self.shards.get() else {
+        let Some(shards) = self.inner.shards.get() else {
             return;
         };
         let shard = &**shards.get(processor);
@@ -749,11 +831,12 @@ impl<M> PerProcessorProvider<M> {
 
     /// Atomically mark `processor`'s shard redirected to `successor`, drain all
     /// already-queued items into the active successor shard (dropping any item
-    /// if the destination is full), and wake any parked producers.
+    /// if the destination is full or the provider is deactivated), and wake any
+    /// parked producers.
     ///
     /// Returns the number of queued messages forwarded.
     pub fn redirect_shard(&self, processor: ProcessorId, successor: ProcessorId) -> usize {
-        let Some(shards) = self.shards.get() else {
+        let Some(shards) = self.inner.shards.get() else {
             return 0;
         };
         let departing = &**shards.get(processor);
@@ -773,6 +856,11 @@ impl<M> PerProcessorProvider<M> {
                 let dest = &**shards.get(target);
                 dest.pushers.fetch_add(1, Ordering::SeqCst);
                 let guard = PusherGuard { shard: dest };
+                if !self.inner.active.load(Ordering::SeqCst) {
+                    drop(guard);
+                    drop(message);
+                    break;
+                }
                 if dest.redirect_target(Ordering::SeqCst).is_some() {
                     drop(guard);
                     continue;
@@ -797,7 +885,7 @@ impl<M> PerProcessorProvider<M> {
 
     /// How many processor shards exist once installed.
     pub fn shard_count(&self) -> Option<usize> {
-        self.shards.get().map(PerProcessor::len)
+        self.inner.shards.get().map(PerProcessor::len)
     }
 }
 
@@ -809,6 +897,8 @@ impl<M> Default for PerProcessorProvider<M> {
 
 #[cfg(test)]
 mod tests {
+    use core::future::Future;
+
     use super::*;
     use futures_lite::future::block_on;
 
@@ -1003,5 +1093,79 @@ mod tests {
         crate::test_processor_identity::set(ProcessorId::new(2));
         block_on(provider.send(25)).expect("reactivated shard 2 takes work again");
         assert_eq!(provider.try_recv_on(ProcessorId::new(2)), Ok(25));
+    }
+
+    #[test]
+    fn per_processor_provider_deactivate_wakes_full_queue_senders_and_drains_queued_items() {
+        let provider = PerProcessorProvider::<futures::channel::oneshot::Sender<u32>>::new();
+        let pool = test_three_core_pool();
+        let generation = provider.install_or_activate(pool, 1);
+        crate::test_processor_identity::set(ProcessorId::new(0));
+
+        // Fill shard 0 to capacity with a request carrying a reply channel.
+        let (tx_queued, rx_queued) = futures::channel::oneshot::channel::<u32>();
+        block_on(provider.send(tx_queued)).expect("first message fills capacity 1");
+
+        // Second sender parks on `shard.room` because the shard queue is full.
+        let (tx_parked, _rx_parked) = futures::channel::oneshot::channel::<u32>();
+        let mut parked_send = core::pin::pin!(provider.send(tx_parked));
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        assert!(
+            parked_send.as_mut().poll(&mut cx).is_pending(),
+            "second send must park while shard queue is full"
+        );
+
+        // Deactivating drains shard 0 (dropping `tx_queued` so `rx_queued`
+        // observes cancellation immediately) and wakes the parked sender with
+        // `ProviderError::Unavailable`.
+        assert!(provider.deactivate(generation));
+        assert!(
+            block_on(rx_queued).is_err(),
+            "queued request reply channel must close immediately on deactivate"
+        );
+        assert_eq!(
+            parked_send.as_mut().poll(&mut cx),
+            core::task::Poll::Ready(Err(ProviderError::Unavailable)),
+            "parked full-queue sender must wake and observe Unavailable on deactivate"
+        );
+        assert!(
+            matches!(
+                provider.try_recv_on(ProcessorId::new(0)),
+                Err(ProviderError::Unavailable)
+            ),
+            "shard queue must be drained by deactivate"
+        );
+    }
+
+    #[test]
+    fn install_or_activate_with_publishes_metadata_before_waking_waiters() {
+        let provider = PerProcessorProvider::<u32>::new();
+        let pool = test_three_core_pool();
+        let published_generation = AtomicU64::new(0);
+
+        let mut waiter = core::pin::pin!(provider.changed());
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        assert!(waiter.as_mut().poll(&mut cx).is_pending());
+
+        let (generation, seen_before_notify) =
+            provider.install_or_activate_with(pool, 2, |next_gen| {
+                // While `publish` runs, `changed` has not fired yet and `provider.generation()`
+                // still lags behind `next_gen`.
+                assert!(!provider.is_installed());
+                assert_eq!(provider.generation(), 0);
+                published_generation.store(next_gen, Ordering::Release);
+                next_gen
+            });
+        assert_eq!(generation, 1);
+        assert_eq!(seen_before_notify, 1);
+        assert_eq!(
+            waiter.as_mut().poll(&mut cx),
+            core::task::Poll::Ready(()),
+            "waiter armed before install_or_activate_with must wake"
+        );
+        // Once woken, both metadata and provider state agree on generation 1.
+        assert!(provider.is_installed());
+        assert_eq!(provider.generation(), 1);
+        assert_eq!(published_generation.load(Ordering::Acquire), 1);
     }
 }

@@ -212,6 +212,29 @@ pub(crate) enum ProviderSlotKind {
     Compiler { generation: u64 },
 }
 
+/// Non-generic teardown anchor embedded inside [`ProviderHandle`] so dropping
+/// the handle directly on store teardown (without `HostProviderHandle::drop`)
+/// still deactivates its kernel provider slot synchronously without dynamic
+/// dispatch.
+enum ProviderTeardown {
+    Surface {
+        generation: u64,
+        sender: ProviderSender<SurfaceRequest>,
+        slot: crate::ProviderSlot<SurfaceRequest>,
+        registration: Arc<Mutex<Option<SurfaceProviderRegistration>>>,
+        instance_registry: crate::InstanceRegistry,
+        interrupts: Arc<crate::wasmtime_adapter::preemption::GuestInterrupts>,
+    },
+    Http {
+        generation: u64,
+        provider: crate::PerProcessorProvider<crate::HttpExchange>,
+    },
+    Compiler {
+        generation: u64,
+        registration: Arc<Mutex<Option<CompilerProviderRegistration>>>,
+    },
+}
+
 /// Owned handle to a root-supervisor-installed kernel provider endpoint.
 ///
 /// Non-generic so `bindgen!` maps `helios:system/root-supervisor.provider-handle`
@@ -219,11 +242,20 @@ pub(crate) enum ProviderSlotKind {
 pub struct ProviderHandle {
     kind: ProviderSlotKind,
     control: Arc<ProviderControl>,
+    teardown: ProviderTeardown,
 }
 
 impl ProviderHandle {
-    pub(crate) fn new(kind: ProviderSlotKind, control: Arc<ProviderControl>) -> Self {
-        Self { kind, control }
+    fn new(
+        kind: ProviderSlotKind,
+        control: Arc<ProviderControl>,
+        teardown: ProviderTeardown,
+    ) -> Self {
+        Self {
+            kind,
+            control,
+            teardown,
+        }
     }
 
     pub(crate) fn kind(&self) -> ProviderSlotKind {
@@ -239,6 +271,64 @@ impl Drop for ProviderHandle {
     fn drop(&mut self) {
         self.control.request_stop();
         self.control.record_exit(ProviderExitReason::Stopped);
+        match &self.teardown {
+            ProviderTeardown::Surface {
+                generation,
+                sender,
+                slot,
+                registration,
+                instance_registry,
+                interrupts,
+            } => {
+                let removed = {
+                    let mut guard = registration.lock();
+                    if guard
+                        .as_ref()
+                        .is_some_and(|reg| reg.generation == *generation)
+                    {
+                        guard.take()
+                    } else {
+                        None
+                    }
+                };
+                slot.uninstall_if_same(sender);
+                if let Some(prev) = removed
+                    && let Some(id) = prev.control.instance_id()
+                {
+                    let residency = crate::wasmtime_adapter::store::user_residency();
+                    instance_registry.request_kill(
+                        id,
+                        crate::KillReason::SupervisorRestart,
+                        0,
+                        &residency,
+                    );
+                    interrupts.interrupt_instance(id);
+                }
+            }
+            ProviderTeardown::Http {
+                generation,
+                provider,
+            } => {
+                if provider.deactivate(*generation) {
+                    self.control.mark_done();
+                }
+            }
+            ProviderTeardown::Compiler {
+                generation,
+                registration,
+            } => {
+                let mut guard = registration.lock();
+                if guard
+                    .as_ref()
+                    .is_some_and(|reg| reg.generation == *generation)
+                    && let Some(prev) = guard.take()
+                {
+                    prev.control.request_stop();
+                    prev.control.record_exit(ProviderExitReason::Stopped);
+                    prev.control.mark_done();
+                }
+            }
+        }
     }
 }
 
@@ -264,6 +354,7 @@ where
     pub(super) authority: ProcessAuthority,
     pub(super) oom_policy: OomPolicy,
     pub(super) parent_instance_id: Option<InstanceId>,
+    pub(super) _root_instance: crate::RegisteredInstance,
     pub(super) precompiled: PreparedComponent<CpuImpl, Net, StorageImpl>,
     pub(super) control: Arc<ProviderControl>,
 }
@@ -278,6 +369,27 @@ pub(super) struct CompilerProviderRegistration {
     pub(super) oom_policy: OomPolicy,
     pub(super) parent_instance_id: Option<InstanceId>,
     pub(super) control: Arc<ProviderControl>,
+}
+
+async fn read_supervisor_program_source<CpuImpl, Net, StorageImpl, U>(
+    accessor: &Accessor<U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
+    path: &str,
+    caller_authority: &ProcessAuthority,
+) -> wasmtime::Result<Result<ProgramSource, rs_wit::SupervisorError>>
+where
+    U: 'static,
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    match read_program_source(accessor, path, caller_authority).await {
+        Ok(Ok(source)) => Ok(Ok(source)),
+        Ok(Err(error)) => Ok(Err(map_exec_error(error))),
+        Err(error) => match error.downcast::<ProgramExecError>() {
+            Ok(exec_error) => Ok(Err(map_exec_error(exec_error))),
+            Err(other) => Err(other),
+        },
+    }
 }
 
 fn supervisor_error(
@@ -518,18 +630,19 @@ where
 
 fn stop_provider_in_store<CpuImpl, Net, StorageImpl>(
     data: &StoreData<CpuImpl, Net, StorageImpl>,
-    handle: &ProviderHandle,
+    kind: ProviderSlotKind,
+    control: &ProviderControl,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    handle.control().request_stop();
-    handle.control().record_exit(ProviderExitReason::Stopped);
+    control.request_stop();
+    control.record_exit(ProviderExitReason::Stopped);
     let Some(service) = data.runtime_state.program_service() else {
         return;
     };
-    match handle.kind() {
+    match kind {
         ProviderSlotKind::Surface { generation } => {
             service.stop_surface_provider(&data.runtime_state, generation);
         }
@@ -557,13 +670,13 @@ where
         let provider = self.table.get(&handle)?;
         let kind = provider.kind();
         let control = provider.control().clone();
-        stop_provider_in_store(self, &ProviderHandle::new(kind, control));
+        stop_provider_in_store(self, kind, &control);
         Ok(())
     }
 
     fn drop(&mut self, handle: Resource<ProviderHandle>) -> wasmtime::Result<()> {
         let provider = self.table.delete(handle)?;
-        stop_provider_in_store(self, &provider);
+        stop_provider_in_store(self, provider.kind(), provider.control());
         Ok(())
     }
 }
@@ -612,6 +725,94 @@ where
     }
 }
 
+fn extract_inherited_sockets(
+    table: &mut wasmtime::component::ResourceTable,
+    sockets: Vec<program_bindings::helios::system::programs::InheritedSocket>,
+) -> wasmtime::Result<Result<crate::InheritedSockets, rs_wit::SupervisorError>> {
+    let mut extracted_sockets = Vec::with_capacity(sockets.len());
+    let mut first_error: Option<rs_wit::SupervisorError> = None;
+    // Always drain every owned socket resource handle from `table` so early
+    // validation or closed-socket errors never leak table entries.
+    for socket in sockets {
+        match socket {
+            program_bindings::helios::system::programs::InheritedSocket::Tcp(res) => {
+                let mut listener = table.delete(res)?;
+                if first_error.is_none() {
+                    match crate::InheritedSocket::from_tcp_listener(&mut listener) {
+                        Some(inherited) => extracted_sockets.push(inherited),
+                        None => {
+                            first_error = Some(supervisor_error(
+                                rs_wit::SupervisorErrorKind::Unavailable,
+                                "inherited TCP listener is closed",
+                            ));
+                        }
+                    }
+                }
+            }
+            program_bindings::helios::system::programs::InheritedSocket::Vsock(res) => {
+                let mut listener = table.delete(res)?;
+                if first_error.is_none() {
+                    match listener.take() {
+                        Some((vsock_service, id)) => {
+                            extracted_sockets.push(crate::InheritedSocket::from_vsock_listener(
+                                vsock_service,
+                                id,
+                            ));
+                        }
+                        None => {
+                            first_error = Some(supervisor_error(
+                                rs_wit::SupervisorErrorKind::Unavailable,
+                                "inherited vsock listener is closed",
+                            ));
+                        }
+                    }
+                }
+            }
+            program_bindings::helios::system::programs::InheritedSocket::TcpStream(res) => {
+                let mut stream = table.delete(res)?;
+                if first_error.is_none() {
+                    match crate::InheritedSocket::from_tcp_stream(&mut stream) {
+                        Some(inherited) => extracted_sockets.push(inherited),
+                        None => {
+                            first_error = Some(supervisor_error(
+                                rs_wit::SupervisorErrorKind::Unavailable,
+                                "inherited TCP stream is closed",
+                            ));
+                        }
+                    }
+                }
+            }
+            program_bindings::helios::system::programs::InheritedSocket::VsockStream(res) => {
+                let mut stream = table.delete(res)?;
+                if first_error.is_none() {
+                    match stream.take() {
+                        Some((vsock_service, id)) => {
+                            extracted_sockets
+                                .push(crate::InheritedSocket::from_vsock_stream(vsock_service, id));
+                        }
+                        None => {
+                            first_error = Some(supervisor_error(
+                                rs_wit::SupervisorErrorKind::Unavailable,
+                                "inherited vsock stream is closed",
+                            ));
+                        }
+                    }
+                }
+            }
+            program_bindings::helios::system::programs::InheritedSocket::Serial(res) => {
+                let port = table.delete(res)?;
+                if first_error.is_none() {
+                    extracted_sockets.push(crate::InheritedSocket::from_serial_port(port));
+                }
+            }
+        }
+    }
+    Ok(match first_error {
+        Some(error) => Err(error),
+        None => Ok(crate::InheritedSockets::from_vec(extracted_sockets)),
+    })
+}
+
 impl<CpuImpl, Net, StorageImpl, U> rs_wit::HostWithStore<U>
     for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
@@ -650,6 +851,11 @@ where
         let requested_policy = from_wit_oom_policy(oom_policy);
         let snapshot = accessor.with(|mut access| {
             let data = access.get();
+            // Always drain owned IPC and socket handles from the caller's
+            // resource table before any validation error can return early.
+            let (remaining_grants, ipc_grants, _had_ipc) =
+                extract_program_ipc_grants(&mut data.table, capability_grants)?;
+            let inherited_sockets = extract_inherited_sockets(&mut data.table, sockets)?;
             if let Err(error) = require_root_supervisor(data) {
                 return Ok::<_, wasmtime::Error>(Err(error));
             }
@@ -657,6 +863,14 @@ where
             if let Err(error) = check_oom_ceiling(caller_policy, requested_policy) {
                 return Ok(Err(error));
             }
+            let ipc_grants = match ipc_grants {
+                Ok(grants) => grants,
+                Err(error) => return Ok(Err(map_exec_error(error))),
+            };
+            let inherited_sockets = match inherited_sockets {
+                Ok(sockets) => sockets,
+                Err(error) => return Ok(Err(error)),
+            };
             let service = data.runtime_state.program_service();
             let context = ProgramExecContext::from_store(data);
             let caller_authority = data.process_authority().clone();
@@ -664,80 +878,6 @@ where
             let caller_filesystem = data.filesystem().clone();
             let caller_default_linux_image = data.default_linux_image();
             let runtime_state = data.runtime_state.clone();
-            let (remaining_grants, ipc_grants, _had_ipc) =
-                extract_program_ipc_grants(&mut data.table, capability_grants)?;
-            let ipc_grants = match ipc_grants {
-                Ok(grants) => grants,
-                Err(error) => return Ok(Err(map_exec_error(error))),
-            };
-            let mut extracted_sockets = Vec::with_capacity(sockets.len());
-            for socket in sockets {
-                match socket {
-                    program_bindings::helios::system::programs::InheritedSocket::Tcp(res) => {
-                        let mut listener = data.table.delete(res)?;
-                        match crate::InheritedSocket::from_tcp_listener(&mut listener) {
-                            Some(inherited) => extracted_sockets.push(inherited),
-                            None => {
-                                return Ok(Err(supervisor_error(
-                                    rs_wit::SupervisorErrorKind::Unavailable,
-                                    "inherited TCP listener is closed",
-                                )));
-                            }
-                        }
-                    }
-                    program_bindings::helios::system::programs::InheritedSocket::Vsock(res) => {
-                        let mut listener = data.table.delete(res)?;
-                        match listener.take() {
-                            Some((vsock_service, id)) => {
-                                extracted_sockets.push(
-                                    crate::InheritedSocket::from_vsock_listener(vsock_service, id),
-                                );
-                            }
-                            None => {
-                                return Ok(Err(supervisor_error(
-                                    rs_wit::SupervisorErrorKind::Unavailable,
-                                    "inherited vsock listener is closed",
-                                )));
-                            }
-                        }
-                    }
-                    program_bindings::helios::system::programs::InheritedSocket::TcpStream(res) => {
-                        let mut stream = data.table.delete(res)?;
-                        match crate::InheritedSocket::from_tcp_stream(&mut stream) {
-                            Some(inherited) => extracted_sockets.push(inherited),
-                            None => {
-                                return Ok(Err(supervisor_error(
-                                    rs_wit::SupervisorErrorKind::Unavailable,
-                                    "inherited TCP stream is closed",
-                                )));
-                            }
-                        }
-                    }
-                    program_bindings::helios::system::programs::InheritedSocket::VsockStream(
-                        res,
-                    ) => {
-                        let mut stream = data.table.delete(res)?;
-                        match stream.take() {
-                            Some((vsock_service, id)) => {
-                                extracted_sockets.push(crate::InheritedSocket::from_vsock_stream(
-                                    vsock_service,
-                                    id,
-                                ));
-                            }
-                            None => {
-                                return Ok(Err(supervisor_error(
-                                    rs_wit::SupervisorErrorKind::Unavailable,
-                                    "inherited vsock stream is closed",
-                                )));
-                            }
-                        }
-                    }
-                    program_bindings::helios::system::programs::InheritedSocket::Serial(res) => {
-                        let port = data.table.delete(res)?;
-                        extracted_sockets.push(crate::InheritedSocket::from_serial_port(port));
-                    }
-                }
-            }
             Ok(Ok((
                 service,
                 context,
@@ -748,7 +888,7 @@ where
                 runtime_state,
                 ipc_grants,
                 remaining_grants,
-                crate::InheritedSockets::from_vec(extracted_sockets),
+                inherited_sockets,
             )))
         })?;
         let (
@@ -800,10 +940,11 @@ where
         {
             return Ok(Err(error));
         }
-        let source = match read_program_source(accessor, &path, &caller_authority).await? {
-            Ok(source) => source,
-            Err(error) => return Ok(Err(map_exec_error(error))),
-        };
+        let source =
+            match read_supervisor_program_source(accessor, &path, &caller_authority).await? {
+                Ok(source) => source,
+                Err(error) => return Ok(Err(error)),
+            };
         let launch = ProgramLaunch::new(
             ProgramArgv::launched(name, args),
             env,
@@ -843,6 +984,7 @@ where
                 prepared.path,
                 prepared.authority,
                 prepared.oom_policy,
+                prepared.provider_instance,
                 prepared.precompiled,
             )
             .await
@@ -894,12 +1036,6 @@ where
             named_devices,
             oom_policy,
         } = request;
-        if name.is_empty() {
-            return Ok(Err(supervisor_error(
-                rs_wit::SupervisorErrorKind::InvalidArgument,
-                "provider name must not be empty",
-            )));
-        }
         let requested_policy = from_wit_oom_policy(oom_policy);
         let snapshot = accessor.with(|mut access| {
             let data = access.get();
@@ -907,8 +1043,14 @@ where
             // resource table so rejected requests never leak table entries.
             let (remaining_grants, ipc_grants, had_ipc) =
                 extract_program_ipc_grants(&mut data.table, capability_grants)?;
+            if name.is_empty() {
+                return Ok::<_, wasmtime::Error>(Err(supervisor_error(
+                    rs_wit::SupervisorErrorKind::InvalidArgument,
+                    "provider name must not be empty",
+                )));
+            }
             if let Err(error) = require_root_supervisor(data) {
-                return Ok::<_, wasmtime::Error>(Err(error));
+                return Ok(Err(error));
             }
             if let Err(error) = check_oom_ceiling(data.instance().oom_policy(), requested_policy) {
                 return Ok(Err(error));
@@ -938,10 +1080,11 @@ where
                 "program service is unavailable on this machine",
             )));
         };
-        let source = match read_program_source(accessor, &path, &caller_authority).await? {
-            Ok(source) => source,
-            Err(error) => return Ok(Err(map_exec_error(error))),
-        };
+        let source =
+            match read_supervisor_program_source(accessor, &path, &caller_authority).await? {
+                Ok(source) => source,
+                Err(error) => return Ok(Err(error)),
+            };
         let payload = match service.verify_compiler_provider_source(&source) {
             Ok(payload) => payload,
             Err(error) => return Ok(Err(map_exec_error(error))),
@@ -1115,6 +1258,7 @@ where
     path: String,
     authority: ProcessAuthority,
     oom_policy: OomPolicy,
+    provider_instance: crate::RegisteredInstance,
     precompiled: PreparedComponent<CpuImpl, Net, StorageImpl>,
 }
 
@@ -1137,28 +1281,25 @@ where
         named_devices,
         oom_policy,
     } = request;
-    if name.is_empty() {
-        return Ok(Err(supervisor_error(
-            rs_wit::SupervisorErrorKind::InvalidArgument,
-            "provider name must not be empty",
-        )));
-    }
     let requested_policy = from_wit_oom_policy(oom_policy);
     let snapshot = accessor.with(|mut access| {
         let data = access.get();
+        // Always drain owned IPC handles before any validation error returns so
+        // rejected provider requests never leak entries in the caller's table.
+        let (remaining_grants, ipc_grants, had_ipc) =
+            extract_program_ipc_grants(&mut data.table, capability_grants)?;
+        if name.is_empty() {
+            return Ok::<_, wasmtime::Error>(Err(supervisor_error(
+                rs_wit::SupervisorErrorKind::InvalidArgument,
+                "provider name must not be empty",
+            )));
+        }
         if let Err(error) = require_root_supervisor(data) {
-            return Ok::<_, wasmtime::Error>(Err(error));
+            return Ok(Err(error));
         }
         if let Err(error) = check_oom_ceiling(data.instance().oom_policy(), requested_policy) {
             return Ok(Err(error));
         }
-        let service = data.runtime_state.program_service();
-        let context = ProgramExecContext::from_store(data);
-        let caller_authority = data.process_authority().clone();
-        let caller_id = data.instance().id();
-        let runtime_state = data.runtime_state.clone();
-        let (remaining_grants, ipc_grants, had_ipc) =
-            extract_program_ipc_grants(&mut data.table, capability_grants)?;
         if let Err(error) = ipc_grants {
             return Ok(Err(map_exec_error(error)));
         }
@@ -1168,6 +1309,11 @@ where
                 "kernel provider endpoints do not accept IPC capability grants",
             )));
         }
+        let service = data.runtime_state.program_service();
+        let context = ProgramExecContext::from_store(data);
+        let caller_authority = data.process_authority().clone();
+        let caller_id = data.instance().id();
+        let runtime_state = data.runtime_state.clone();
         Ok(Ok((
             service,
             context,
@@ -1193,10 +1339,16 @@ where
         Err(error) => return Ok(Err(permission_denied(error.to_string()))),
     };
     let compile_authority = CompileAuthority::from(&spawn_authority);
+    let provider_instance = context.instance_registry().register_child_with_policy(
+        context.parent_instance_id(),
+        name.clone(),
+        context.now_uptime_nanos(),
+        requested_policy,
+    );
     let mut authority = match build_program_child_authority(
         &caller_authority,
         caller_id,
-        None,
+        Some(provider_instance.id()),
         context.instance_registry(),
         remaining_grants,
     ) {
@@ -1206,9 +1358,9 @@ where
     if let Err(error) = grant_named_devices(&runtime_state, &mut authority, &named_devices) {
         return Ok(Err(error));
     }
-    let source = match read_program_source(accessor, &path, &caller_authority).await? {
+    let source = match read_supervisor_program_source(accessor, &path, &caller_authority).await? {
         Ok(source) => source,
-        Err(error) => return Ok(Err(map_exec_error(error))),
+        Err(error) => return Ok(Err(error)),
     };
     let executable = match service
         .load_executable(
@@ -1237,6 +1389,7 @@ where
         path,
         authority,
         oom_policy: requested_policy,
+        provider_instance,
         precompiled,
     }))
 }
@@ -1319,7 +1472,14 @@ where
             prev.control.record_exit(ProviderExitReason::Replaced);
             prev.control.mark_done();
         }
-        ProviderHandle::new(ProviderSlotKind::Compiler { generation }, control)
+        ProviderHandle::new(
+            ProviderSlotKind::Compiler { generation },
+            control,
+            ProviderTeardown::Compiler {
+                generation,
+                registration: self.inner.compiler_registration.clone(),
+            },
+        )
     }
 
     pub(super) fn stop_compiler_provider(&self, generation: u64) {
@@ -1334,6 +1494,32 @@ where
                 prev.control.mark_done();
             }
             *self.inner.compiler_plugin.lock() = None;
+        }
+    }
+
+    pub(super) fn fault_compiler_provider(&self, generation: u64, detail: String) {
+        let removed = {
+            let mut slot = self.inner.compiler_registration.lock();
+            if slot
+                .as_ref()
+                .is_some_and(|reg| reg.generation == generation)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        {
+            let mut cached = self.inner.compiler_plugin.lock();
+            if cached
+                .as_ref()
+                .is_some_and(|plugin| plugin.generation == generation)
+            {
+                *cached = None;
+            }
+        }
+        if let Some(prev) = removed {
+            prev.control.finish_faulted(detail);
         }
     }
 
@@ -1352,36 +1538,60 @@ where
             path,
             authority,
             oom_policy,
+            provider_instance,
             precompiled,
         } = prepared;
-        let generation = context
-            .runtime_state
-            .http_client()
-            .install_or_activate(crate::memory::user_memory_pool(), HTTP_PROVIDER_QUEUE_DEPTH);
         let control = ProviderControl::new();
-        let registration = Arc::new(HttpProviderRegistration {
-            generation,
-            name,
-            path,
-            authority,
-            oom_policy,
-            parent_instance_id: context.parent_instance_id,
-            precompiled,
-            control: control.clone(),
-        });
-        let previous = self.inner.http_provider.lock().replace(registration);
+        let root_instance_id = provider_instance.id();
+        let provider = context.runtime_state.http_client().clone();
+        // Publish `self.inner.http_provider` inside `install_or_activate_with`
+        // BEFORE `generation`/`active` advance and before `changed.notify_all()`
+        // wakes remote shard supervisors, preventing lost wakeups on SMP.
+        let (generation, previous) = provider.install_or_activate_with(
+            crate::memory::user_memory_pool(),
+            HTTP_PROVIDER_QUEUE_DEPTH,
+            |generation| {
+                let registration = Arc::new(HttpProviderRegistration {
+                    generation,
+                    name,
+                    path,
+                    authority,
+                    oom_policy,
+                    parent_instance_id: Some(root_instance_id),
+                    _root_instance: provider_instance,
+                    precompiled,
+                    control: control.clone(),
+                });
+                self.inner.http_provider.lock().replace(registration)
+            },
+        );
         if let Some(prev) = previous {
             prev.control.request_stop();
             prev.control.record_exit(ProviderExitReason::Replaced);
             prev.control.mark_done();
         }
-        ProviderHandle::new(ProviderSlotKind::Http { generation }, control)
+        ProviderHandle::new(
+            ProviderSlotKind::Http { generation },
+            control,
+            ProviderTeardown::Http {
+                generation,
+                provider,
+            },
+        )
     }
 
     pub(super) fn http_provider_registration(
         &self,
     ) -> Option<Arc<HttpProviderRegistration<CpuImpl, Net, StorageImpl>>> {
-        self.inner.http_provider.lock().clone()
+        let mut slot = self.inner.http_provider.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|reg| reg.control.is_stop_requested())
+        {
+            *slot = None;
+            return None;
+        }
+        slot.clone()
     }
 
     pub(super) fn stop_http_provider(
@@ -1389,7 +1599,7 @@ where
         runtime_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
         generation: u64,
     ) {
-        let removed = {
+        let removed = runtime_state.http_client().deactivate_with(generation, || {
             let mut slot = self.inner.http_provider.lock();
             if slot
                 .as_ref()
@@ -1399,9 +1609,8 @@ where
             } else {
                 None
             }
-        };
-        if let Some(prev) = removed {
-            runtime_state.http_client().deactivate(generation);
+        });
+        if let Some(Some(prev)) = removed {
             prev.control.request_stop();
             prev.control.record_exit(ProviderExitReason::Stopped);
             prev.control.mark_done();
@@ -1414,7 +1623,7 @@ where
         generation: u64,
         detail: String,
     ) {
-        let removed = {
+        let removed = runtime_state.http_client().deactivate_with(generation, || {
             let mut slot = self.inner.http_provider.lock();
             if slot
                 .as_ref()
@@ -1424,13 +1633,16 @@ where
             } else {
                 None
             }
-        };
-        if let Some(prev) = removed {
-            runtime_state.http_client().deactivate(generation);
+        });
+        if let Some(Some(prev)) = removed {
             prev.control.finish_faulted(detail);
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "surface provider installation hands off prepared provider metadata, authority, pre-registered instance, and compiled component"
+    )]
     pub(super) async fn install_surface_provider(
         &self,
         exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
@@ -1438,6 +1650,7 @@ where
         path: String,
         authority: ProcessAuthority,
         oom_policy: OomPolicy,
+        provider_instance: crate::RegisteredInstance,
         precompiled: PreparedComponent<CpuImpl, Net, StorageImpl>,
     ) -> Result<ProviderHandle, rs_wit::SupervisorError> {
         if precompiled
@@ -1451,6 +1664,11 @@ where
                 format!("component `{path}` does not export helios:system/compositor@0.1.0"),
             ));
         }
+
+        // Serialise overlapping surface provider installations across async
+        // displacement/instantiation so two concurrent installs cannot both
+        // instantiate compositor stores holding exclusive display/input claims.
+        let _install_guard = self.inner.surface_install_lock.lock().await;
 
         // Displace any existing surface provider and wait for its store to
         // drop (releasing exclusive display/input claims) before starting the
@@ -1498,6 +1716,7 @@ where
                 authority,
                 oom_policy,
                 started_at,
+                registered_instance: Some(provider_instance),
             },
         );
         let turns = store.data().guest_turns();
@@ -1515,10 +1734,8 @@ where
         control.set_instance_id(instance_id);
         let registry = exec_context.runtime_state.surface_service();
         registry.set_compositor(instance_id);
-        exec_context
-            .runtime_state
-            .compositor()
-            .replace(sender.clone());
+        let compositor_slot = exec_context.runtime_state.compositor().clone();
+        compositor_slot.replace(sender.clone());
         *self.inner.surface_provider.lock() = Some(SurfaceProviderRegistration {
             generation,
             sender: sender.clone(),
@@ -1535,6 +1752,7 @@ where
         let service = self.clone();
         let run_control = control.clone();
         let runtime_state = exec_context.runtime_state.clone();
+        let handle_sender = sender.clone();
         spawner.spawn_local_detached(async move {
             let outcome = run_surface_provider_instance(
                 store,
@@ -1570,6 +1788,14 @@ where
         Ok(ProviderHandle::new(
             ProviderSlotKind::Surface { generation },
             control,
+            ProviderTeardown::Surface {
+                generation,
+                sender: handle_sender,
+                slot: compositor_slot,
+                registration: self.inner.surface_provider.clone(),
+                instance_registry: exec_context.instance_registry.clone(),
+                interrupts: self.inner.engine.interrupts().clone(),
+            },
         ))
     }
 
@@ -2559,6 +2785,338 @@ mod tests {
                 .get(&Resource::<crate::IpcEndpoint>::new_borrow(ipc_rep2))
                 .is_err(),
             "rejected component provider request must not leak IPC endpoint in resource table"
+        );
+    }
+
+    #[test]
+    fn compiler_fault_notifies_wait_exit_and_handle_drop_clears_slot() {
+        let backing: &'static mut [u8] =
+            alloc::boxed::Box::leak(alloc::vec![0u8; 64 * 1024 * 1024].into_boxed_slice());
+        // SAFETY: `backing` is an exclusively owned, leaked `'static` mutable slice for the test allocator region.
+        let region = unsafe {
+            helios_hal::memory::MemoryRegion::new(
+                core::ptr::NonNull::from(backing),
+                helios_hal::numa::NodeId::FIRST,
+            )
+        };
+        let bootstrap = ProcessorId::new(0);
+        crate::test_processor_identity::set(bootstrap);
+        crate::prime_bootstrap_allocator(core::iter::once(region), &SingleNode::new(1), bootstrap);
+
+        let cpu = TestCpu::with_entropy(0x91);
+        #[derive(Default)]
+        struct NullConsole;
+        impl core::fmt::Write for NullConsole {
+            fn write_str(&mut self, _: &str) -> core::fmt::Result {
+                Ok(())
+            }
+        }
+        let platform = Platform::new(NullConsole, cpu)
+            .with_topology(
+                ProcessorTopology::start_all_secondaries(bootstrap, 1)
+                    .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
+            )
+            .with_dma_model(DmaModel::Translated)
+            .with_devices(DeviceInventory::new());
+        let kernel = crate::init(platform);
+        let state: HostRuntimeState<TestCpu, TestNetworkService, UnsupportedStorage> =
+            crate::RuntimeState::new(
+                cpu.timebase(),
+                1,
+                0,
+                crate::BootPayload::for_tests(),
+                GuestIsa::for_build_target(cpu.native_feature_probe()),
+            );
+        let generation = crate::MachineGeneration::new(None);
+        state.install_machine_generation(generation.clone());
+        state.install_root_entropy(crate::seed_root_entropy(
+            &cpu,
+            None,
+            None::<&crate::NoEntropyDevice>,
+            generation,
+        ));
+
+        let service = install_program_service(
+            &kernel,
+            &cpu,
+            &state,
+            |_, _| {},
+            DebugSerialWriter::of::<test_store::DiscardPort>(),
+        );
+
+        let handle = service.install_compiler_provider(
+            String::from("compiler"),
+            String::from("/bin/compiler.cwasm"),
+            Bytes::from_static(b"v1"),
+            OomPolicy::KernelPlugin,
+            None,
+        );
+        let ProviderSlotKind::Compiler { generation: gen1 } = handle.kind() else {
+            panic!("expected compiler slot handle");
+        };
+        service.fault_compiler_provider(gen1, String::from("compiler trapped"));
+        assert!(service.compiler_provider_registration().is_none());
+        assert_eq!(
+            block_on(handle.control().wait_exit()),
+            ProviderExitReason::Faulted(String::from("compiler trapped"))
+        );
+        block_on(handle.control().wait_done());
+
+        // Dropping a live ProviderHandle directly (as on store teardown)
+        // deactivates the compiler slot synchronously.
+        let handle2 = service.install_compiler_provider(
+            String::from("compiler-v2"),
+            String::from("/bin/compiler-v2.cwasm"),
+            Bytes::from_static(b"v2"),
+            OomPolicy::KernelPlugin,
+            None,
+        );
+        assert!(service.compiler_provider_registration().is_some());
+        drop(handle2);
+        assert!(
+            service.compiler_provider_registration().is_none(),
+            "dropping ProviderHandle must clear compiler registration"
+        );
+    }
+
+    #[test]
+    fn install_http_provider_publishes_before_waking_and_drop_deactivates_and_subtree_none_succeeds()
+     {
+        use program_bindings::helios::system::programs as prog_wit;
+        use wasmtime::Store;
+        use wasmtime::component::HasSelf;
+
+        let backing: &'static mut [u8] =
+            alloc::boxed::Box::leak(alloc::vec![0u8; 64 * 1024 * 1024].into_boxed_slice());
+        // SAFETY: `backing` is an exclusively owned, leaked `'static` mutable slice for the test allocator region.
+        let region = unsafe {
+            helios_hal::memory::MemoryRegion::new(
+                core::ptr::NonNull::from(backing),
+                helios_hal::numa::NodeId::FIRST,
+            )
+        };
+        let bootstrap = ProcessorId::new(0);
+        crate::test_processor_identity::set(bootstrap);
+        crate::prime_bootstrap_allocator(core::iter::once(region), &SingleNode::new(1), bootstrap);
+
+        let cpu = TestCpu::with_entropy(0x92);
+        #[derive(Default)]
+        struct NullConsole;
+        impl core::fmt::Write for NullConsole {
+            fn write_str(&mut self, _: &str) -> core::fmt::Result {
+                Ok(())
+            }
+        }
+        let platform = Platform::new(NullConsole, cpu)
+            .with_topology(
+                ProcessorTopology::start_all_secondaries(bootstrap, 1)
+                    .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
+            )
+            .with_dma_model(DmaModel::Translated)
+            .with_devices(DeviceInventory::new());
+        let kernel = crate::init(platform);
+        let state: HostRuntimeState<TestCpu, TestNetworkService, UnsupportedStorage> =
+            crate::RuntimeState::new(
+                cpu.timebase(),
+                1,
+                0,
+                crate::BootPayload::for_tests(),
+                GuestIsa::for_build_target(cpu.native_feature_probe()),
+            );
+        let generation = crate::MachineGeneration::new(None);
+        state.install_machine_generation(generation.clone());
+        state.install_root_entropy(crate::seed_root_entropy(
+            &cpu,
+            None,
+            None::<&crate::NoEntropyDevice>,
+            generation,
+        ));
+        let service = install_program_service(
+            &kernel,
+            &cpu,
+            &state,
+            |_, _| {},
+            DebugSerialWriter::of::<test_store::DiscardPort>(),
+        );
+
+        // 1. `install_or_activate_with` publishes registration metadata before
+        //    waking `http_client().changed()`, and dropping `ProviderHandle`
+        //    deactivates both `Http` and `Surface` slots synchronously.
+        let mut changed = pin!(state.http_client().changed());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(changed.as_mut().poll(&mut cx).is_pending());
+
+        let http_control = ProviderControl::new();
+        let published_gen = AtomicU64::new(0);
+        let provider = state.http_client().clone();
+        let (http_gen, ()) = provider.install_or_activate_with(
+            crate::memory::user_memory_pool(),
+            HTTP_PROVIDER_QUEUE_DEPTH,
+            |next_gen| {
+                assert!(!state.http_client().is_installed());
+                published_gen.store(next_gen, Ordering::Release);
+            },
+        );
+        let http_handle = ProviderHandle::new(
+            ProviderSlotKind::Http {
+                generation: http_gen,
+            },
+            http_control.clone(),
+            ProviderTeardown::Http {
+                generation: http_gen,
+                provider,
+            },
+        );
+        assert!(
+            changed.as_mut().poll(&mut cx).is_ready(),
+            "install_or_activate_with must wake shard waiters"
+        );
+        assert!(state.http_client().is_installed());
+        assert_eq!(state.http_client().generation(), http_gen);
+        assert_eq!(published_gen.load(Ordering::Acquire), http_gen);
+
+        drop(http_handle);
+        assert!(
+            !state.http_client().is_installed(),
+            "dropping Http ProviderHandle must deactivate PerProcessorProvider"
+        );
+        assert_eq!(
+            block_on(http_control.wait_exit()),
+            ProviderExitReason::Stopped
+        );
+        block_on(http_control.wait_done());
+
+        let (surface_tx, _surface_rx) = provider_channel(SURFACE_REQUEST_QUEUE_DEPTH);
+        let surface_control = ProviderControl::new();
+        state.compositor().replace(surface_tx.clone());
+        *service.inner.surface_provider.lock() = Some(SurfaceProviderRegistration {
+            generation: 7,
+            sender: surface_tx.clone(),
+            control: surface_control.clone(),
+        });
+        let surface_handle = ProviderHandle::new(
+            ProviderSlotKind::Surface { generation: 7 },
+            surface_control,
+            ProviderTeardown::Surface {
+                generation: 7,
+                sender: surface_tx,
+                slot: state.compositor().clone(),
+                registration: service.inner.surface_provider.clone(),
+                instance_registry: state.instance_registry(),
+                interrupts: service.inner.engine.interrupts().clone(),
+            },
+        );
+        assert!(state.compositor().is_installed());
+        drop(surface_handle);
+        assert!(
+            !state.compositor().is_installed(),
+            "dropping Surface ProviderHandle must uninstall compositor slot"
+        );
+        assert!(service.inner.surface_provider.lock().is_none());
+
+        // 2. `Subtree(None)` grant succeeds on `prepare_component_provider`
+        //    (fails only later with `NotFound` on the nonexistent path rather
+        //    than `PermissionDenied` on authority derivation).
+        let mut root_auth = ProcessAuthority::root();
+        root_auth.grant_inspect_read(AuthorityScope::Machine);
+        root_auth.grant_root_supervisor();
+        let root_instance = state.instance_registry().register("root-supervisor", 0);
+        let root_spawner = kernel
+            .spawner()
+            .instance_spawner(crate::TaskFunding::Kernel, &root_instance);
+        let store_data = StoreData::new(
+            wasmtime::component::ResourceTable::new(),
+            cpu,
+            kernel.timer(),
+            root_spawner,
+            state.clone(),
+            state.instance_registry(),
+            root_instance,
+            state.root_namespace().descend(),
+            alloc::vec![String::from("/bin/init")],
+            Vec::new(),
+            root_auth,
+            OutputMode::Serial,
+            |_, _| {},
+            DebugSerialWriter::of::<test_store::DiscardPort>(),
+        );
+        let mut store = Store::new(service.engine().raw(), store_data);
+        let subtree_err = block_on(store.run_concurrent(async move |accessor| {
+            prepare_component_provider(
+                accessor,
+                rs_wit::ProviderRequest {
+                    name: String::from("http-client"),
+                    path: String::from("/bin/does-not-exist.wasm"),
+                    capability_grants: alloc::vec![prog_wit::CapabilityGrant::Diagnostics(
+                        prog_wit::DiagnosticsGrant::InspectRead(prog_wit::AuthorityScope::Subtree(
+                            None
+                        ))
+                    )],
+                    named_devices: Vec::new(),
+                    oom_policy: rs_wit::OomPolicy::UserProgram,
+                },
+            )
+            .await
+        }))
+        .unwrap()
+        .unwrap()
+        .err()
+        .expect("missing binary should fail with NotFound after Subtree(None) authority succeeds");
+        assert_eq!(
+            subtree_err.kind,
+            rs_wit::SupervisorErrorKind::NotFound,
+            "Subtree(None) grant must succeed against allocated provider InstanceId instead of failing PermissionDenied: {subtree_err:?}"
+        );
+
+        // 3. Early permission error in `spawn` drains owned IPC handles from
+        //    the caller's resource table.
+        let mut non_root = Store::new(
+            service.engine().raw(),
+            test_store::store_data_authorized(ProcessAuthority::root(), |_| {}),
+        );
+        let (ep_a, _ep_b) = crate::ipc_channel();
+        let ipc_res = non_root
+            .data_mut()
+            .table
+            .push(ep_a)
+            .expect("push ipc endpoint");
+        let ipc_rep = ipc_res.rep();
+        let spawn_err = block_on(non_root.run_concurrent(async move |accessor| {
+            <HasSelf<test_store::TestStoreData> as rs_wit::HostWithStore<_>>::spawn(
+                accessor,
+                rs_wit::ManagedSpawnRequest {
+                    name: String::from("child"),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    path: String::from("/bin/child"),
+                    cwd: None,
+                    sockets: Vec::new(),
+                    capability_grants: alloc::vec![prog_wit::CapabilityGrant::Ipc(
+                        prog_wit::IpcGrant {
+                            name: String::from("chan"),
+                            endpoint: ipc_res,
+                        }
+                    )],
+                    named_devices: Vec::new(),
+                    oom_policy: rs_wit::OomPolicy::UserProgram,
+                },
+            )
+            .await
+        }))
+        .unwrap()
+        .unwrap()
+        .expect_err("non-root caller must be denied spawn");
+        assert_eq!(
+            spawn_err.kind,
+            rs_wit::SupervisorErrorKind::PermissionDenied
+        );
+        assert!(
+            non_root
+                .data()
+                .table
+                .get(&Resource::<crate::IpcEndpoint>::new_borrow(ipc_rep))
+                .is_err(),
+            "early spawn error must drain owned IPC handle from resource table"
         );
     }
 }

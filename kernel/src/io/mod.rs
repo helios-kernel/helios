@@ -22,8 +22,8 @@ mod serial;
 pub use block::{
     BlockCache, BlockCacheError, BlockCacheLimits, BlockInstallError, BlockMut, BlockPages,
     BlockRef, BlockRouteError, BlockSelfCheckError, BlockService, BlockStats, CACHE_BLOCK_BYTES,
-    CacheLayoutError, CachedDisk, CachedDiskStats, DiskRefusal, DiskRole, SCRATCH_DISK_SERIAL,
-    ScratchDisk, ScratchDiskStats, admit_block_devices, install_block_devices,
+    CacheLayoutError, CachedDisk, CachedDiskStats, DiskRefusal, DiskRole, HIBERNATE_DISK_SERIAL,
+    SCRATCH_DISK_SERIAL, ScratchDisk, ScratchDiskStats, admit_block_devices, install_block_devices,
     install_scratch_swap,
 };
 pub use child::{

@@ -49,6 +49,9 @@ pub(super) struct ProviderStoreSpec<'a> {
     pub(super) authority: ProcessAuthority,
     pub(super) oom_policy: OomPolicy,
     pub(super) started_at: u64,
+    /// Pre-registered instance when `prepare_component_provider` allocated the
+    /// provider's [`crate::InstanceId`] upfront to resolve `Subtree(None)` grants.
+    pub(super) registered_instance: Option<crate::RegisteredInstance>,
 }
 
 /// Allocates a [`wasmtime::Store`] for a root-supervisor-managed provider with
@@ -69,12 +72,14 @@ where
     StorageImpl: crate::Storage,
 {
     let registry = exec_context.runtime_state.instance_registry();
-    let instance = registry.register_child_with_policy(
-        exec_context.parent_instance_id,
-        spec.instance_name,
-        spec.started_at,
-        spec.oom_policy,
-    );
+    let instance = spec.registered_instance.unwrap_or_else(|| {
+        registry.register_child_with_policy(
+            exec_context.parent_instance_id,
+            spec.instance_name,
+            spec.started_at,
+            spec.oom_policy,
+        )
+    });
     let instance_id = instance.id();
     let (store, interrupts) = crate::wasmtime_adapter::store_with_state(
         &service.inner.engine,
@@ -330,6 +335,7 @@ where
             authority: registration.authority.clone(),
             oom_policy: registration.oom_policy,
             started_at,
+            registered_instance: None,
         },
     );
 

@@ -471,12 +471,16 @@ where
     core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, Net, StorageImpl>,
     /// Monotonic generation counter for root-supervisor provider registrations.
     next_provider_generation: core::sync::atomic::AtomicU64,
+    /// Serialises concurrent `install_surface_provider` calls across async
+    /// teardown and store instantiation so overlapping installs cannot orphan
+    /// live compositor stores holding exclusive display/input claims.
+    surface_install_lock: helios_sync::RawMutex,
     /// Active singleton `surface` (compositor) provider installed by the root supervisor.
-    surface_provider: Mutex<Option<SurfaceProviderRegistration>>,
+    surface_provider: Arc<Mutex<Option<SurfaceProviderRegistration>>>,
     /// Active per-processor `wasi:http/client` provider installed by the root supervisor.
     http_provider: Mutex<Option<Arc<HttpProviderRegistration<CpuImpl, Net, StorageImpl>>>>,
     /// Active AOT `compiler` provider installed by the root supervisor.
-    compiler_registration: Mutex<Option<CompilerProviderRegistration>>,
+    compiler_registration: Arc<Mutex<Option<CompilerProviderRegistration>>>,
     /// The key the compiler plugin's output is signed with, and the only
     /// key a written `cwasm` verifies against. Settled at bring-up,
     /// before this service exists, and never replaced.
@@ -1197,9 +1201,10 @@ where
             core_module_cache: Mutex::new(ComponentCache::new(cache_budget)),
             core_module_instance_pre_cache: Arc::new(Mutex::new(ComponentCache::new(cache_budget))),
             next_provider_generation: core::sync::atomic::AtomicU64::new(1),
-            surface_provider: Mutex::new(None),
+            surface_install_lock: helios_sync::RawMutex::new(),
+            surface_provider: Arc::new(Mutex::new(None)),
             http_provider: Mutex::new(None),
-            compiler_registration: Mutex::new(None),
+            compiler_registration: Arc::new(Mutex::new(None)),
             cwasm_signing_key,
             guest_isa,
             compiler_plugin: Mutex::new(None),
@@ -3107,37 +3112,58 @@ where
             helios_hal::cpu::current_processor(),
         );
         let worker_threads = affinity_plan.worker_count();
-        let result = self
-            .invoke_compiler_inner(
+        let (result, mut thread_reports) = match self
+            .ensure_compiler_plugin(
                 exec_context,
                 compiler_generation,
                 &compiler_path,
                 &compiler_payload,
-                instance,
-                CompileRequest {
-                    wasm,
-                    guest_isa: self.inner.guest_isa,
-                    hint,
-                    profile,
-                    sink,
-                },
-                affinity_plan,
-                &mut phases,
+                worker_threads,
             )
-            .await;
-        // A failure of the main thread has condemned the compile
-        // (`end_main_part`), so the workers parked in the pool end and are
-        // joined; the first trap's error is the one reported.
-        let mut thread_reports = self.await_compiler_thread_tasks().await;
+            .await
+        {
+            Ok((plugin, plugin_cached)) => {
+                phases.plugin_cached = plugin_cached;
+                phases.plugin_ready_ns = if profile {
+                    monotonic_nanos(&exec_context.cpu)
+                } else {
+                    0
+                };
+                let result = self
+                    .invoke_compiler_inner(
+                        exec_context,
+                        &plugin,
+                        instance,
+                        CompileRequest {
+                            wasm,
+                            guest_isa: self.inner.guest_isa,
+                            hint,
+                            profile,
+                            sink,
+                        },
+                        affinity_plan,
+                        &mut phases,
+                    )
+                    .await;
+                // A failure of the main thread has condemned the compile
+                // (`end_main_part`), so the workers parked in the pool end and
+                // are joined directly through the `Arc` runtime this session
+                // started with — even if `self.inner.compiler_plugin` was
+                // cleared or replaced mid-compile.
+                let thread_reports = await_compiler_thread_tasks(&plugin).await;
+                (result, thread_reports)
+            }
+            Err(error) => (Err(error), CompilerThreadReports::new()),
+        };
         let result = first_trap_wins(result, &mut thread_reports);
         phases.tasks_joined_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
         } else {
             0
         };
-        // On a kill or fatal-state error, drop the cached runtime for this
-        // generation so the next compile rebuilds from the currently installed
-        // compiler provider artifact.
+        // On a kill or fatal-state error, drop the cached runtime and report
+        // the fault to the matching generation's `ProviderHandle::wait-exit`
+        // so the root supervisor observes compiler faults.
         if let Err(error) = &result
             && plugin_runtime_should_be_recycled(error)
         {
@@ -3145,15 +3171,9 @@ where
                 target: "helios_kernel::supervisor",
                 detail = %error.detail,
                 generation = compiler_generation,
-                "compiler plugin runtime invalidated; next compile rebuilds from scratch"
+                "compiler plugin runtime faulted; notifying root supervisor"
             );
-            let mut slot = self.inner.compiler_plugin.lock();
-            if slot
-                .as_ref()
-                .is_some_and(|cached| cached.generation == compiler_generation)
-            {
-                *slot = None;
-            }
+            self.fault_compiler_provider(compiler_generation, alloc::format!("{}", error.detail));
         }
         CompileEnd {
             result: result.map(|payload| (payload, thread_reports)),
@@ -3162,65 +3182,16 @@ where
         }
     }
 
-    async fn await_compiler_thread_tasks(&self) -> CompilerThreadReports {
-        let mut reports = CompilerThreadReports::new();
-        loop {
-            let tasks = self
-                .inner
-                .compiler_plugin
-                .lock()
-                .as_ref()
-                .map(|plugin| {
-                    plugin
-                        .shared
-                        .thread_tasks
-                        .lock()
-                        .drain(..)
-                        .collect::<CompilerThreadTasks>()
-                })
-                .unwrap_or_default();
-            if tasks.is_empty() {
-                break;
-            }
-            for task in tasks {
-                reports.push(task.await);
-            }
-        }
-        reports
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "internal compile-session handoff carries provider metadata and timing state"
-    )]
     async fn invoke_compiler_inner(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
-        compiler_generation: u64,
-        compiler_path: &str,
-        compiler_payload: &Bytes,
+        plugin: &CompilerPluginHandle<CpuImpl, Net, StorageImpl>,
         compiler_instance: crate::RegisteredInstance,
         request: CompileRequest<StorageImpl>,
         affinity_plan: CoreAffinityPlan,
         phases: &mut CompilerPhaseTimestamps,
     ) -> Result<CompileOutput, ProgramExecError> {
-        let profile = request.profile;
-        let (plugin, plugin_cached) = self
-            .ensure_compiler_plugin(
-                exec_context,
-                compiler_generation,
-                compiler_path,
-                compiler_payload,
-                affinity_plan.worker_count(),
-            )
-            .await?;
         plugin.shared.begin_session(&affinity_plan);
-        phases.plugin_cached = plugin_cached;
-        phases.plugin_ready_ns = if profile {
-            monotonic_nanos(&exec_context.cpu)
-        } else {
-            0
-        };
         let context = CompilerCompileContext {
             cpu: exec_context.cpu.clone(),
             spawner: exec_context.spawner.clone(),
@@ -3239,6 +3210,7 @@ where
             .spawn_pinned(&exec_context.spawner, main_core, {
                 let service = self.clone();
                 let exec_context = exec_context.clone();
+                let plugin = plugin.clone();
                 let context = context.clone();
                 let mut local_phases = *phases;
                 async move {
@@ -3596,9 +3568,43 @@ where
             main_thread_tls_base,
             _code: code,
         });
-        *self.inner.compiler_plugin.lock() = Some(plugin.clone());
+        if self
+            .inner
+            .compiler_registration
+            .lock()
+            .as_ref()
+            .is_some_and(|reg| reg.generation == compiler_generation)
+        {
+            *self.inner.compiler_plugin.lock() = Some(plugin.clone());
+        }
         Ok((plugin, false))
     }
+}
+
+async fn await_compiler_thread_tasks<CpuImpl, Net, StorageImpl>(
+    plugin: &CompilerPluginHandle<CpuImpl, Net, StorageImpl>,
+) -> CompilerThreadReports
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let mut reports = CompilerThreadReports::new();
+    loop {
+        let tasks = plugin
+            .shared
+            .thread_tasks
+            .lock()
+            .drain(..)
+            .collect::<CompilerThreadTasks>();
+        if tasks.is_empty() {
+            break;
+        }
+        for task in tasks {
+            reports.push(task.await);
+        }
+    }
+    reports
 }
 
 fn emit_compiler_phase_report(

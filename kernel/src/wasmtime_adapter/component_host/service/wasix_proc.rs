@@ -1986,7 +1986,7 @@ where
         .inspect_err(|error| trace.exit_error(error))
         .map_err(wasmtime::Error::new)?;
     let exec_context = caller.data().exec_context();
-    let authority = caller.data().effective_authority();
+    let authority = caller.data().effective_authority().exec_preserved();
     let descriptors = caller.data().descriptors.clone_for_exec();
     let filesystem = Some(caller.data().filesystem.clone());
     let signal_state = caller.data().signal_state.clone();
@@ -2191,7 +2191,7 @@ where
         if chroot {
             return Ok(launch_exit_errno(&trace, p1::errno::INVAL));
         }
-        caller.data().effective_authority()
+        caller.data().effective_authority().fork_inherited()
     } else {
         let preopen = match wasix_read_exec_string(&memory, preopen, preopen_len).await {
             Ok(preopen) => preopen,
@@ -2364,52 +2364,40 @@ where
 pub(super) fn wasix_proc_spawn_inherited_non_directory_authority(
     parent: &ProcessAuthority,
 ) -> ProcessAuthority {
+    let inherited = parent.fork_inherited();
     let mut authority = ProcessAuthority::empty();
-    authority.grant_network_rights(parent.network_rights());
-    authority.grant_clock_rights(parent.clock_rights());
-    authority.grant_terminal_rights(parent.terminal_rights());
-    authority.grant_process_rights(parent.process_rights());
-    authority.grant_link_rights(parent.link_rights());
-    authority.grant_mount_rights(parent.mount_rights());
+    authority.grant_network_rights(inherited.network_rights());
+    authority.grant_clock_rights(inherited.clock_rights());
+    authority.grant_terminal_rights(inherited.terminal_rights());
+    authority.grant_process_rights(inherited.process_rights());
+    authority.grant_link_rights(inherited.link_rights());
+    authority.grant_mount_rights(inherited.mount_rights());
     // Device classes follow the shell to the programs it runs. A named
     // device does not: it belongs to the driver instance it was granted
     // to, not to that instance's children.
-    authority.grant_device_classes(parent.device_class_rights());
-    // Subtree and machine observation/control scopes follow the shell so
-    // diagnostic and instance-control utilities run from it act within the
-    // launcher's scope; `Own` stays with the parent instance itself.
-    if let Some(scope) = parent
-        .inspect_read_scope()
-        .filter(|&scope| scope != crate::AuthorityScope::Own)
-    {
+    authority.grant_device_classes(inherited.device_class_rights());
+    // Subtree and machine observation/control scopes follow `fork_inherited()`
+    // so `Own` and `root_supervisor` are stripped consistently.
+    if let Some(scope) = inherited.inspect_read_scope() {
         authority.grant_inspect_read(scope);
     }
-    if let Some(scope) = parent
-        .trace_read_scope()
-        .filter(|&scope| scope != crate::AuthorityScope::Own)
-    {
+    if let Some(scope) = inherited.trace_read_scope() {
         authority.grant_trace_read(scope);
     }
-    if let Some(scope) = parent
-        .profile_read_scope()
-        .filter(|&scope| scope != crate::AuthorityScope::Own)
-    {
+    if let Some(scope) = inherited.profile_read_scope() {
         authority.grant_profile_read(scope);
     }
-    authority.grant_diagnostic_rights(parent.diagnostic_rights());
-    if let Some(scope) = parent
-        .instance_control_scope()
-        .filter(|&scope| scope != crate::AuthorityScope::Own)
-    {
+    authority.grant_diagnostic_rights(inherited.diagnostic_rights());
+    if let Some(scope) = inherited.instance_control_scope() {
         authority.grant_instance_control(scope);
     }
     // The settings-write right follows the shell the same way: the
     // programs a launcher runs through `dash` configure the machine as
     // it does.
-    authority.grant_settings_rights(parent.settings_rights());
+    authority.grant_settings_rights(inherited.settings_rights());
     // Machine control and identity rights follow the shell when the
     // launcher explicitly handed them down.
-    authority.grant_machine_rights(parent.machine_rights());
+    authority.grant_machine_rights(inherited.machine_rights());
     authority
 }
 
@@ -3104,7 +3092,7 @@ where
         .descriptors
         .snapshot()
         .for_new_process(child_limit);
-    let parent_authority = caller.data().effective_authority();
+    let parent_authority = caller.data().effective_authority().fork_inherited();
     let parent_cwd = caller.data().cwd.get();
     let mut snapshot =
         wasix_spawn_initial_snapshot(&parent_descriptors, &parent_authority, parent_cwd.as_ref());
@@ -3652,7 +3640,8 @@ where
     let runtime_state = caller.data().runtime_state.clone();
     let service = runtime_state.wait_for_program_service().await;
     let exec_context = caller.data().exec_context();
-    let authority = authority.unwrap_or_else(|| caller.data().effective_authority());
+    let authority =
+        authority.unwrap_or_else(|| caller.data().effective_authority().fork_inherited());
     let filesystem = Some(caller.data().filesystem.clone());
     let launch_started = p1_kernel_profile_start(caller.data());
     let mut child = service
@@ -4949,5 +4938,36 @@ mod spawn_descriptor_tests {
             child.descriptors.get_cloned(pipe_fd).is_none(),
             "proc_spawn must not inherit parent's pipe"
         );
+    }
+
+    #[test]
+    fn wasix_fork_and_spawn_strip_own_scope_and_root_supervisor_while_exec_preserves_own() {
+        let mut parent = ProcessAuthority::root();
+        parent.grant_inspect_read(crate::AuthorityScope::Own);
+        parent.grant_trace_read(crate::AuthorityScope::Own);
+        parent.grant_profile_read(crate::AuthorityScope::Own);
+        parent.grant_instance_control(crate::AuthorityScope::Own);
+        parent.grant_root_supervisor();
+
+        let fork_child = parent.fork_inherited();
+        assert_eq!(fork_child.inspect_read_scope(), None);
+        assert_eq!(fork_child.trace_read_scope(), None);
+        assert_eq!(fork_child.profile_read_scope(), None);
+        assert_eq!(fork_child.instance_control_scope(), None);
+        assert!(!fork_child.is_root_supervisor());
+
+        let non_dir = wasix_proc_spawn_inherited_non_directory_authority(&parent);
+        assert_eq!(non_dir.inspect_read_scope(), None);
+        assert_eq!(non_dir.trace_read_scope(), None);
+        assert_eq!(non_dir.profile_read_scope(), None);
+        assert_eq!(non_dir.instance_control_scope(), None);
+        assert!(!non_dir.is_root_supervisor());
+
+        let exec_child = parent.exec_preserved();
+        assert_eq!(
+            exec_child.inspect_read_scope(),
+            Some(crate::AuthorityScope::Own)
+        );
+        assert!(!exec_child.is_root_supervisor());
     }
 }
