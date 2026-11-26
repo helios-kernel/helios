@@ -64,6 +64,45 @@ const S_ISGID: u32 = 0o2000;
 /// `XATTR_NAME_MAX` and `XATTR_SIZE_MAX` in `include/uapi/linux/limits.h`.
 const XATTR_NAME_MAX: usize = 255;
 const XATTR_SIZE_MAX: usize = 65_536;
+/// Per-inode kernel-memory charge (`size_of::<Inode>()` plus `HashMap` bucket
+/// overhead) accounted against [`MemoryStorageBudget`] so empty files,
+/// directories, and special nodes cannot exhaust kernel heap outside the budget.
+const INODE_OVERHEAD_BYTES: u64 = core::mem::size_of::<Inode>() as u64 + 32;
+/// Per-path-entry kernel-memory charge for a `BTreeMap`/`BTreeSet` entry
+/// storing a path string, added to `path.len()`.
+const NAME_ENTRY_OVERHEAD_BYTES: u64 = 64;
+/// Per-xattr-entry kernel-memory charge for a `BTreeMap` entry storing an
+/// extended attribute, added to `name.len() + value.len()`.
+const XATTR_ENTRY_OVERHEAD_BYTES: u64 = 64;
+
+fn path_entry_bytes(path: &str) -> u64 {
+    NAME_ENTRY_OVERHEAD_BYTES.saturating_add(path.len() as u64)
+}
+
+fn xattr_entry_bytes(name: &str, value_len: usize) -> u64 {
+    XATTR_ENTRY_OVERHEAD_BYTES
+        .saturating_add(name.len() as u64)
+        .saturating_add(value_len as u64)
+}
+
+fn xattrs_metadata_bytes(xattrs: &BTreeMap<String, Bytes>) -> u64 {
+    xattrs.iter().fold(0u64, |acc, (name, value)| {
+        acc.saturating_add(xattr_entry_bytes(name, value.len()))
+    })
+}
+
+fn contents_metadata_bytes(contents: &InodeContents) -> u64 {
+    match contents {
+        InodeContents::Symlink(target) => target.len() as u64,
+        InodeContents::File(_) | InodeContents::Empty => 0,
+    }
+}
+
+fn inode_metadata_bytes(inode: &Inode) -> u64 {
+    INODE_OVERHEAD_BYTES
+        .saturating_add(contents_metadata_bytes(&inode.contents))
+        .saturating_add(xattrs_metadata_bytes(&inode.xattrs))
+}
 
 /// The Unix metadata an inode of a [`MemoryFs`] stores.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -464,6 +503,10 @@ struct Inode {
 }
 
 struct MemoryState {
+    budget: MemoryStorageBudget,
+    /// Total kernel-heap metadata bytes (inodes, names, symlink targets,
+    /// xattrs, and whiteouts) currently charged against `budget` by this tree.
+    metadata_bytes: u64,
     /// Every name but the root's, by path from the root.
     names: BTreeMap<String, u64>,
     inodes: HashMap<u64, Inode>,
@@ -473,6 +516,15 @@ struct MemoryState {
     whiteouts: BTreeSet<String>,
     /// Directories an overlay shows without the layer below merged in.
     opaque: HashSet<u64>,
+}
+
+impl Drop for MemoryState {
+    fn drop(&mut self) {
+        if self.metadata_bytes > 0 {
+            self.budget.release(self.metadata_bytes);
+            self.metadata_bytes = 0;
+        }
+    }
 }
 
 /// What a tree that is an overlay's upper layer holds at one path.
@@ -544,8 +596,10 @@ impl MemoryFs {
         );
         Self {
             device,
-            budget,
+            budget: budget.clone(),
             state: Arc::new(Mutex::new(MemoryState {
+                budget,
+                metadata_bytes: 0,
                 names: BTreeMap::new(),
                 inodes,
                 next_inode: ROOT_INODE + 1,
@@ -658,12 +712,27 @@ impl MemoryFs {
                 return Err(FsError::Invalid);
             }
         };
-        let number = state.insert(path, kind, unix, rdev, stored, original.modified_nanos);
+        let number = match state.insert_with_xattrs(
+            path,
+            kind,
+            unix,
+            rdev,
+            stored,
+            xattrs,
+            original.modified_nanos,
+        ) {
+            Ok(number) => number,
+            Err((error, returned)) => {
+                // Drop staged file frames outside the tree lock.
+                drop(state);
+                drop(returned);
+                return Err(error);
+            }
+        };
         let inode = state
             .inodes
             .get_mut(&number)
             .expect("the inode was just inserted");
-        inode.xattrs = xattrs;
         inode.access_nanos = original.access_nanos;
         inode.status_nanos = original.status_nanos;
         Ok(())
@@ -702,7 +771,7 @@ impl MemoryFs {
                 Arc::new(StorageShare::default()),
             )),
             now,
-        );
+        )?;
         state.metadata(self.device, path)
     }
 
@@ -724,7 +793,7 @@ impl MemoryFs {
             DeviceNumber::default(),
             InodeContents::Empty,
             now,
-        );
+        )?;
         Ok(())
     }
 
@@ -747,7 +816,7 @@ impl MemoryFs {
             DeviceNumber::default(),
             InodeContents::Symlink(Bytes::copy_from_slice(target.as_bytes())),
             now,
-        );
+        )?;
         Ok(())
     }
 
@@ -769,7 +838,7 @@ impl MemoryFs {
         };
         let mut state = self.state.lock();
         state.require_new_name(path)?;
-        state.insert(path, kind, unix, rdev, InodeContents::Empty, now);
+        state.insert(path, kind, unix, rdev, InodeContents::Empty, now)?;
         Ok(())
     }
 
@@ -804,11 +873,17 @@ impl MemoryFs {
         if let Some(gid) = gid {
             inode.unix.gid = gid;
         }
+        let mut removed_cap_bytes = 0u64;
         if inode.kind != NodeKind::Directory {
             inode.unix.permissions &= !(S_ISUID | S_ISGID);
-            inode.xattrs.remove("security.capability");
+            if let Some(removed) = inode.xattrs.remove("security.capability") {
+                removed_cap_bytes = xattr_entry_bytes("security.capability", removed.len());
+            }
         }
         inode.status_nanos = now;
+        if removed_cap_bytes > 0 {
+            state.release_metadata(removed_cap_bytes);
+        }
         Ok(())
     }
 
@@ -848,14 +923,27 @@ impl MemoryFs {
             return Err(FsError::Overflow);
         }
         let mut state = self.state.lock();
-        let inode = state.inode_mut(path)?;
-        validate_xattr_name(inode.kind, name, XattrOp::Set)?;
-        let exists = inode.xattrs.contains_key(name);
-        match (mode, exists) {
-            (XattrSetMode::Create, true) => return Err(FsError::Exists),
-            (XattrSetMode::Replace, false) => return Err(FsError::NoEntry),
-            _ => {}
-        }
+        let (number, kind, old_bytes) = {
+            let (number, inode) = state.inode(path)?;
+            validate_xattr_name(inode.kind, name, XattrOp::Set)?;
+            let old = inode
+                .xattrs
+                .get(name)
+                .map(|v| xattr_entry_bytes(name, v.len()));
+            match (mode, old.is_some()) {
+                (XattrSetMode::Create, true) => return Err(FsError::Exists),
+                (XattrSetMode::Replace, false) => return Err(FsError::NoEntry),
+                _ => {}
+            }
+            (number, inode.kind, old.unwrap_or(0))
+        };
+        let _ = kind;
+        let new_bytes = xattr_entry_bytes(name, value.len());
+        state.adjust_metadata(old_bytes, new_bytes)?;
+        let inode = state
+            .inodes
+            .get_mut(&number)
+            .expect("inode looked up under lock");
         inode.xattrs.insert(String::from(name), value);
         inode.status_nanos = now;
         Ok(())
@@ -865,13 +953,28 @@ impl MemoryFs {
     /// returning whether it was present.
     pub fn remove_xattr(&self, path: FsPath<'_>, name: &str, now: u64) -> FsResult<bool> {
         let mut state = self.state.lock();
-        let inode = state.inode_mut(path)?;
-        validate_xattr_name(inode.kind, name, XattrOp::Remove)?;
-        let removed = inode.xattrs.remove(name).is_some();
-        if removed {
-            inode.status_nanos = now;
+        let number = {
+            let (number, inode) = state.inode(path)?;
+            validate_xattr_name(inode.kind, name, XattrOp::Remove)?;
+            number
+        };
+        let removed = state
+            .inodes
+            .get_mut(&number)
+            .expect("inode looked up under lock")
+            .xattrs
+            .remove(name);
+        if let Some(old_val) = removed {
+            state
+                .inodes
+                .get_mut(&number)
+                .expect("inode looked up under lock")
+                .status_nanos = now;
+            state.release_metadata(xattr_entry_bytes(name, old_val.len()));
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(removed)
     }
 
     fn resolve_create_unix(
@@ -936,7 +1039,7 @@ impl MemoryFs {
                     DeviceNumber::default(),
                     InodeContents::File(PagedFile::new(self.budget.clone(), payer.share().clone())),
                     now,
-                );
+                )?;
                 state.metadata(self.device, path)?
             }
             Err(error) => return Err(error.into()),
@@ -981,7 +1084,7 @@ impl MemoryFs {
             DeviceNumber::default(),
             InodeContents::Empty,
             now,
-        );
+        )?;
         Ok(())
     }
 
@@ -1002,7 +1105,7 @@ impl MemoryFs {
             DeviceNumber::default(),
             InodeContents::Symlink(Bytes::copy_from_slice(target.as_bytes())),
             now,
-        );
+        )?;
         Ok(())
     }
 
@@ -1022,7 +1125,7 @@ impl MemoryFs {
         let mut state = self.state.lock();
         let unix = Self::resolve_create_unix(&state, path, kind, attributes)?;
         state.require_new_name(path)?;
-        state.insert(path, kind, unix, rdev, InodeContents::Empty, now);
+        state.insert(path, kind, unix, rdev, InodeContents::Empty, now)?;
         Ok(())
     }
 
@@ -1047,18 +1150,30 @@ impl MemoryFs {
             return Err(UnixFsError::ArgTooBig);
         }
         let mut state = self.state.lock();
-        let inode = state.inode_mut(path)?;
-        validate_xattr_name(inode.kind, name, XattrOp::Set).map_err(|e| match e {
-            FsError::NameTooLong => UnixFsError::Range,
-            FsError::NotPermitted => UnixFsError::PermissionDenied,
-            other => UnixFsError::Fs(other),
-        })?;
-        let exists = inode.xattrs.contains_key(name);
-        match (mode, exists) {
-            (XattrSetMode::Create, true) => return Err(FsError::Exists.into()),
-            (XattrSetMode::Replace, false) => return Err(UnixFsError::NoData),
-            _ => {}
-        }
+        let (number, old_bytes) = {
+            let (number, inode) = state.inode(path)?;
+            validate_xattr_name(inode.kind, name, XattrOp::Set).map_err(|e| match e {
+                FsError::NameTooLong => UnixFsError::Range,
+                FsError::NotPermitted => UnixFsError::PermissionDenied,
+                other => UnixFsError::Fs(other),
+            })?;
+            let old = inode
+                .xattrs
+                .get(name)
+                .map(|v| xattr_entry_bytes(name, v.len()));
+            match (mode, old.is_some()) {
+                (XattrSetMode::Create, true) => return Err(FsError::Exists.into()),
+                (XattrSetMode::Replace, false) => return Err(UnixFsError::NoData),
+                _ => {}
+            }
+            (number, old.unwrap_or(0))
+        };
+        let new_bytes = xattr_entry_bytes(name, value.len());
+        state.adjust_metadata(old_bytes, new_bytes)?;
+        let inode = state
+            .inodes
+            .get_mut(&number)
+            .expect("inode looked up under lock");
         inode.xattrs.insert(String::from(name), value);
         inode.status_nanos = now;
         Ok(())
@@ -1071,16 +1186,30 @@ impl MemoryFs {
         now: u64,
     ) -> Result<(), UnixFsError> {
         let mut state = self.state.lock();
-        let inode = state.inode_mut(path)?;
-        validate_xattr_name(inode.kind, name, XattrOp::Remove).map_err(|e| match e {
-            FsError::NameTooLong => UnixFsError::Range,
-            FsError::NotPermitted => UnixFsError::PermissionDenied,
-            other => UnixFsError::Fs(other),
-        })?;
-        if inode.xattrs.remove(name).is_none() {
+        let number = {
+            let (number, inode) = state.inode(path)?;
+            validate_xattr_name(inode.kind, name, XattrOp::Remove).map_err(|e| match e {
+                FsError::NameTooLong => UnixFsError::Range,
+                FsError::NotPermitted => UnixFsError::PermissionDenied,
+                other => UnixFsError::Fs(other),
+            })?;
+            number
+        };
+        let Some(old_val) = state
+            .inodes
+            .get_mut(&number)
+            .expect("inode looked up under lock")
+            .xattrs
+            .remove(name)
+        else {
             return Err(UnixFsError::NoData);
-        }
-        inode.status_nanos = now;
+        };
+        state
+            .inodes
+            .get_mut(&number)
+            .expect("inode looked up under lock")
+            .status_nanos = now;
+        state.release_metadata(xattr_entry_bytes(name, old_val.len()));
         Ok(())
     }
 
@@ -1105,6 +1234,7 @@ impl MemoryFs {
         }
         let mut _dropped: Option<Inode> = None;
         let mut state = self.state.lock();
+        let adding_whiteout = whiteout && !state.whiteouts.contains(path.as_str());
         match state.inode(path) {
             Ok((_, inode)) => {
                 match (directory, inode.kind == NodeKind::Directory) {
@@ -1126,16 +1256,23 @@ impl MemoryFs {
                 let parent = state.inodes.get_mut(&parent).expect("parent inode exists");
                 parent.modified_nanos = now;
                 parent.status_nanos = now;
-                _dropped = state.remove_name(path);
+                // Transfer the path entry charge directly to the whiteout when
+                // one is being created in place of the removed upper name.
+                _dropped = state.remove_name_keeping_charge(path, adding_whiteout);
+                if adding_whiteout {
+                    state.whiteouts.insert(path.as_str().to_string());
+                }
             }
-            Err(FsError::NoEntry) if whiteout && state.beneath(path) => {}
+            Err(FsError::NoEntry) if whiteout && state.beneath(path) => {
+                if adding_whiteout {
+                    state.reserve_metadata(path_entry_bytes(path.as_str()))?;
+                    state.whiteouts.insert(path.as_str().to_string());
+                }
+            }
             Err(error) => return Err(error),
         }
         if directory {
             state.drop_whiteouts_below(path);
-        }
-        if whiteout {
-            state.whiteouts.insert(path.as_str().to_string());
         }
         Ok(())
     }
@@ -1182,7 +1319,7 @@ impl MemoryFs {
         if state.inode(dest_parent)?.1.kind != NodeKind::Directory {
             return Err(FsError::NotDirectory);
         }
-        if let Ok((dest_inode, dest)) = state.inode(destination) {
+        let dest_replace = if let Ok((dest_inode, dest)) = state.inode(destination) {
             if mode == RenameMode::NoReplace {
                 return Err(FsError::Exists);
             }
@@ -1198,6 +1335,39 @@ impl MemoryFs {
                 }
                 _ => {}
             }
+            Some((dest_inode, dest_is_dir))
+        } else {
+            None
+        };
+        let moved: Vec<(String, u64)> =
+            core::iter::once((source.as_str().to_string(), source_inode))
+                .chain(
+                    state
+                        .descendants(source)
+                        .map(|(name, number)| (name.clone(), *number)),
+                )
+                .collect();
+        let moved_whiteouts = state.whiteouts_below(source);
+        let renamed = |name: &str| rebase(name, source, destination);
+        let mut old_bytes = 0u64;
+        let mut new_bytes = 0u64;
+        for (name, _) in &moved {
+            old_bytes = old_bytes.saturating_add(path_entry_bytes(name));
+            new_bytes = new_bytes.saturating_add(path_entry_bytes(&renamed(name)));
+        }
+        for name in &moved_whiteouts {
+            old_bytes = old_bytes.saturating_add(path_entry_bytes(name));
+            new_bytes = new_bytes.saturating_add(path_entry_bytes(&renamed(name)));
+        }
+        if state.whiteouts.contains(destination.as_str()) {
+            old_bytes = old_bytes.saturating_add(path_entry_bytes(destination.as_str()));
+        }
+        let add_source_whiteout = whiteout && !state.whiteouts.contains(source.as_str());
+        if add_source_whiteout {
+            new_bytes = new_bytes.saturating_add(path_entry_bytes(source.as_str()));
+        }
+        state.adjust_metadata(old_bytes, new_bytes)?;
+        if let Some((dest_inode, dest_is_dir)) = dest_replace {
             state
                 .inodes
                 .get_mut(&dest_inode)
@@ -1208,15 +1378,6 @@ impl MemoryFs {
                 state.drop_whiteouts_below(destination);
             }
         }
-        let moved: Vec<(String, u64)> =
-            core::iter::once((source.as_str().to_string(), source_inode))
-                .chain(
-                    state
-                        .descendants(source)
-                        .map(|(name, number)| (name.clone(), *number)),
-                )
-                .collect();
-        let renamed = |name: &str| rebase(name, source, destination);
         for (name, number) in moved {
             state.names.remove(&name);
             state.names.insert(renamed(&name), number);
@@ -1226,12 +1387,12 @@ impl MemoryFs {
                 .expect("every name refers to a live inode")
                 .status_nanos = now;
         }
-        for name in state.whiteouts_below(source) {
+        for name in moved_whiteouts {
             state.whiteouts.remove(&name);
             state.whiteouts.insert(renamed(&name));
         }
-        state.take_whiteout(destination, source_inode);
-        if whiteout {
+        state.take_whiteout_unaccounted(destination, source_inode);
+        if add_source_whiteout {
             state.whiteouts.insert(source.as_str().to_string());
         }
         Ok(())
@@ -1316,6 +1477,38 @@ fn rebase(name: &str, from: FsPath<'_>, to: FsPath<'_>) -> String {
 }
 
 impl MemoryState {
+    fn reserve_metadata(&mut self, bytes: u64) -> FsResult<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let reservation = self.budget.try_reserve(bytes)?;
+        reservation.commit(bytes);
+        self.metadata_bytes = self.metadata_bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    fn release_metadata(&mut self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        debug_assert!(
+            self.metadata_bytes >= bytes,
+            "MemoryFs metadata accounting underflowed: {} < {bytes}",
+            self.metadata_bytes
+        );
+        self.metadata_bytes = self.metadata_bytes.saturating_sub(bytes);
+        self.budget.release(bytes);
+    }
+
+    fn adjust_metadata(&mut self, old: u64, new: u64) -> FsResult<()> {
+        if new > old {
+            self.reserve_metadata(new - old)?;
+        } else if old > new {
+            self.release_metadata(old - new);
+        }
+        Ok(())
+    }
+
     /// Swaps the objects at `first` and `second`, each with whatever lies
     /// below it. Two names of one object stay as they are, and a directory
     /// with the other name below it is [`FsError::Invalid`].
@@ -1349,6 +1542,25 @@ impl MemoryState {
         let second_names = subtree(self, second, second_number);
         let first_whiteouts = self.whiteouts_below(first);
         let second_whiteouts = self.whiteouts_below(second);
+        let mut old_bytes = 0u64;
+        let mut new_bytes = 0u64;
+        for (name, _) in &first_names {
+            old_bytes = old_bytes.saturating_add(path_entry_bytes(name));
+            new_bytes = new_bytes.saturating_add(path_entry_bytes(&rebase(name, first, second)));
+        }
+        for (name, _) in &second_names {
+            old_bytes = old_bytes.saturating_add(path_entry_bytes(name));
+            new_bytes = new_bytes.saturating_add(path_entry_bytes(&rebase(name, second, first)));
+        }
+        for name in &first_whiteouts {
+            old_bytes = old_bytes.saturating_add(path_entry_bytes(name));
+            new_bytes = new_bytes.saturating_add(path_entry_bytes(&rebase(name, first, second)));
+        }
+        for name in &second_whiteouts {
+            old_bytes = old_bytes.saturating_add(path_entry_bytes(name));
+            new_bytes = new_bytes.saturating_add(path_entry_bytes(&rebase(name, second, first)));
+        }
+        self.adjust_metadata(old_bytes, new_bytes)?;
         for (name, _) in first_names.iter().chain(&second_names) {
             self.names.remove(name);
         }
@@ -1461,7 +1673,37 @@ impl MemoryState {
         rdev: DeviceNumber,
         contents: InodeContents,
         now: u64,
-    ) -> u64 {
+    ) -> FsResult<u64> {
+        self.insert_with_xattrs(path, kind, unix, rdev, contents, BTreeMap::new(), now)
+            .map_err(|(error, _)| error)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "inserts inode, name, symlink/file contents, and xattrs under one atomic metadata budget reservation"
+    )]
+    fn insert_with_xattrs(
+        &mut self,
+        path: FsPath<'_>,
+        kind: NodeKind,
+        unix: UnixAttributes,
+        rdev: DeviceNumber,
+        contents: InodeContents,
+        xattrs: BTreeMap<String, Bytes>,
+        now: u64,
+    ) -> Result<u64, (FsError, InodeContents)> {
+        let replaced_whiteout = if self.whiteouts.contains(path.as_str()) {
+            path_entry_bytes(path.as_str())
+        } else {
+            0
+        };
+        let added = INODE_OVERHEAD_BYTES
+            .saturating_add(contents_metadata_bytes(&contents))
+            .saturating_add(xattrs_metadata_bytes(&xattrs))
+            .saturating_add(path_entry_bytes(path.as_str()));
+        if let Err(error) = self.adjust_metadata(replaced_whiteout, added) {
+            return Err((error, contents));
+        }
         let number = self.next_inode;
         self.next_inode += 1;
         self.inodes.insert(
@@ -1471,7 +1713,7 @@ impl MemoryState {
                 unix,
                 rdev,
                 contents,
-                xattrs: BTreeMap::new(),
+                xattrs,
                 link_count: 1,
                 access_nanos: now,
                 modified_nanos: now,
@@ -1479,14 +1721,17 @@ impl MemoryState {
             },
         );
         self.names.insert(path.as_str().to_string(), number);
-        self.take_whiteout(path, number);
-        number
+        self.take_whiteout_unaccounted(path, number);
+        Ok(number)
     }
 
     /// A new name at `path` for inode `number` replaces any whiteout
     /// there. A directory that does is opaque: what the layer below had
     /// at that path stays removed, its contents included.
-    fn take_whiteout(&mut self, path: FsPath<'_>, number: u64) {
+    ///
+    /// Callers have already netted the replaced whiteout's metadata charge via
+    /// [`Self::adjust_metadata`].
+    fn take_whiteout_unaccounted(&mut self, path: FsPath<'_>, number: u64) {
         if self.whiteouts.remove(path.as_str()) && self.inodes[&number].kind == NodeKind::Directory
         {
             self.opaque.insert(number);
@@ -1528,28 +1773,52 @@ impl MemoryState {
 
     /// Forgets the whiteouts below a directory that is gone.
     fn drop_whiteouts_below(&mut self, path: FsPath<'_>) {
+        let mut released = 0u64;
         for name in self.whiteouts_below(path) {
-            self.whiteouts.remove(&name);
+            if self.whiteouts.remove(&name) {
+                released = released.saturating_add(path_entry_bytes(&name));
+            }
         }
+        self.release_metadata(released);
     }
 
     /// Drops the name at `path`, returning the inode when its last name goes
     /// so the caller frees any file frames outside the tree lock.
     fn remove_name(&mut self, path: FsPath<'_>) -> Option<Inode> {
+        self.remove_name_keeping_charge(path, false)
+    }
+
+    fn remove_name_keeping_charge(
+        &mut self,
+        path: FsPath<'_>,
+        keep_path_charge: bool,
+    ) -> Option<Inode> {
         let number = self
             .names
             .remove(path.as_str())
             .expect("a removed name was looked up first");
+        let mut released = if keep_path_charge {
+            0
+        } else {
+            path_entry_bytes(path.as_str())
+        };
         let inode = self
             .inodes
             .get_mut(&number)
             .expect("every name refers to a live inode");
         inode.link_count -= 1;
-        if inode.link_count == 0 {
+        let dropped = if inode.link_count == 0 {
             self.opaque.remove(&number);
-            return self.inodes.remove(&number);
-        }
-        None
+            let removed = self.inodes.remove(&number);
+            if let Some(ref removed_inode) = removed {
+                released = released.saturating_add(inode_metadata_bytes(removed_inode));
+            }
+            removed
+        } else {
+            None
+        };
+        self.release_metadata(released);
+        dropped
     }
 
     /// Every name below the directory at `path`, in order.
@@ -1799,7 +2068,7 @@ impl FileSystem for MemoryFs {
                     DeviceNumber::default(),
                     InodeContents::File(PagedFile::new(self.budget.clone(), payer.share().clone())),
                     now,
-                );
+                )?;
             }
             Err(error) => return Err(error),
         }
@@ -1900,7 +2169,7 @@ impl FileSystem for MemoryFs {
             DeviceNumber::default(),
             InodeContents::Empty,
             now,
-        );
+        )?;
         Ok(())
     }
 
@@ -1941,18 +2210,28 @@ impl FileSystem for MemoryFs {
         _payer: &crate::StoragePayer,
     ) -> FsResult<()> {
         let mut state = self.state.lock();
-        let (number, inode) = state.inode(existing)?;
-        if inode.kind == NodeKind::Directory {
-            return Err(FsError::NotPermitted);
-        }
+        let (number, next_links) = {
+            let (number, inode) = state.inode(existing)?;
+            if inode.kind == NodeKind::Directory {
+                return Err(FsError::NotPermitted);
+            }
+            let next_links = inode.link_count.checked_add(1).ok_or(FsError::Overflow)?;
+            (number, next_links)
+        };
         state.require_new_name(link)?;
+        let replaced_whiteout = if state.whiteouts.contains(link.as_str()) {
+            path_entry_bytes(link.as_str())
+        } else {
+            0
+        };
+        state.adjust_metadata(replaced_whiteout, path_entry_bytes(link.as_str()))?;
         state.names.insert(link.as_str().to_string(), number);
-        state.take_whiteout(link, number);
+        state.take_whiteout_unaccounted(link, number);
         let inode = state
             .inodes
             .get_mut(&number)
             .expect("every name refers to a live inode");
-        inode.link_count = inode.link_count.checked_add(1).ok_or(FsError::Overflow)?;
+        inode.link_count = next_links;
         inode.status_nanos = now;
         Ok(())
     }
@@ -1974,7 +2253,7 @@ impl FileSystem for MemoryFs {
             DeviceNumber::default(),
             InodeContents::Symlink(Bytes::copy_from_slice(target.as_bytes())),
             now,
-        );
+        )?;
         Ok(())
     }
 
@@ -2781,12 +3060,14 @@ pub(super) mod tests {
 
         block_on(first.open(path("sparse"), OpenFlags::CREATE, 1, &creator_payer))
             .expect("create sparse file");
+        let sparse_meta = budget.used_bytes();
+        assert!(sparse_meta > 0, "inode metadata is charged to budget");
         // Extending far past both budget and pool commits zero frames.
         let huge = 16 * 1024 * 1024_u64;
         block_on(first.set_size(path("sparse"), huge, 2, &creator_payer))
             .expect("sparse set_size succeeds");
         assert_eq!(block_on(first.stat(path("sparse"))).unwrap().size, huge);
-        assert_eq!(budget.used_bytes(), 0);
+        assert_eq!(budget.used_bytes(), sparse_meta);
         assert_eq!(creator.storage_bytes(), 0);
         assert_eq!(creator.memory_bytes(), 0);
         assert_eq!(pool.stats().allocated_bytes as u64, baseline);
@@ -2809,7 +3090,7 @@ pub(super) mod tests {
             |offset, dst| dst.copy_from_slice(&two_pages[offset..offset + dst.len()]),
         ))
         .expect("write within budget succeeds");
-        assert_eq!(budget.used_bytes(), 3 * page);
+        assert_eq!(budget.used_bytes(), sparse_meta + 3 * page);
         assert_eq!(creator.storage_bytes(), 3 * page);
         assert_eq!(writer.storage_bytes(), 0);
         assert_eq!(creator.memory_bytes(), 0);
@@ -2820,6 +3101,8 @@ pub(super) mod tests {
         // leaking budget or frames.
         block_on(second.open(path("other"), OpenFlags::CREATE, 4, &writer_payer))
             .expect("create second file");
+        let both_meta = budget.used_bytes() - 3 * page;
+        assert!(both_meta > sparse_meta);
         assert_eq!(
             block_on(helios_hal::fs::write_with(
                 &second,
@@ -2832,25 +3115,26 @@ pub(super) mod tests {
             )),
             Err(FsError::NoSpace)
         );
-        assert_eq!(budget.used_bytes(), 3 * page);
+        assert_eq!(budget.used_bytes(), both_meta + 3 * page);
         assert_eq!(writer.storage_bytes(), 0);
         assert_eq!(pool.stats().allocated_bytes as u64, baseline + 3 * page);
 
         // Hard-linking keeps frames charged until the last name is unlinked.
         block_on(first.link(path("sparse"), path("alias"), 6, &creator_payer)).expect("hard link");
         block_on(first.unlink(path("sparse"), 7, &creator_payer)).expect("unlink original");
-        assert_eq!(budget.used_bytes(), 3 * page);
+        let after_rename_meta = budget.used_bytes() - 3 * page;
         assert_eq!(creator.storage_bytes(), 3 * page);
 
         // Truncating down to 1 page releases both the dropped page and the
         // collapsed index root back to the pool and budget.
         block_on(first.set_size(path("alias"), page, 8, &creator_payer)).expect("truncate down");
-        assert_eq!(budget.used_bytes(), page);
+        assert_eq!(budget.used_bytes(), after_rename_meta + page);
         assert_eq!(creator.storage_bytes(), page);
         assert_eq!(pool.stats().allocated_bytes as u64, baseline + page);
 
-        // Unlinking the last name returns every remaining frame.
+        // Unlinking the last name and dropping the second tree return every byte.
         block_on(first.unlink(path("alias"), 9, &creator_payer)).expect("unlink last link");
+        drop(second);
         assert_eq!(budget.used_bytes(), 0);
         assert_eq!(creator.storage_bytes(), 0);
         assert_eq!(pool.stats().allocated_bytes as u64, baseline);
@@ -2882,6 +3166,8 @@ pub(super) mod tests {
         let payer = owner.storage_payer();
 
         block_on(fs.open(path("data"), OpenFlags::CREATE, 1, &payer)).expect("create");
+        let data_meta = budget.used_bytes();
+        assert!(data_meta > 0);
         let two_pages = alloc::vec![0xaa_u8; 2 * page as usize];
         // Refused by the 1-frame setting cap -> NoSpace.
         assert_eq!(
@@ -2896,7 +3182,7 @@ pub(super) mod tests {
             )),
             Err(FsError::NoSpace)
         );
-        assert_eq!(budget.used_bytes(), 0);
+        assert_eq!(budget.used_bytes(), data_meta);
 
         // Raising fs.memory-storage above the 2 free frames means a 2-page
         // write (which needs 3 frames: 2 data + 1 index) passes the setting
@@ -2915,7 +3201,7 @@ pub(super) mod tests {
             )),
             Err(FsError::OutOfMemory)
         );
-        assert_eq!(budget.used_bytes(), 0);
+        assert_eq!(budget.used_bytes(), data_meta);
         assert_eq!(owner.storage_bytes(), 0);
         assert_eq!(pool.stats().allocated_bytes as u64, drained_allocated);
 
@@ -2931,11 +3217,104 @@ pub(super) mod tests {
             |offset, dst| dst.copy_from_slice(&one_page[offset..offset + dst.len()]),
         ))
         .expect("1-page write succeeds");
-        assert_eq!(budget.used_bytes(), page);
+        assert_eq!(budget.used_bytes(), data_meta + page);
         assert_eq!(owner.storage_bytes(), page);
         drop(fs);
         assert_eq!(budget.used_bytes(), 0);
         assert_eq!(owner.storage_bytes(), 0);
         assert_eq!(pool.stats().allocated_bytes as u64, drained_allocated);
+    }
+
+    #[test]
+    fn metadata_symlinks_xattrs_and_whiteouts_respect_budget_and_refund_cleanly() {
+        let pool = isolated_user_pool(64);
+        let budget = super::MemoryStorageBudget::with_limit(pool, 2048);
+        let fs = MemoryFs::with_budget(DeviceId::new(13), budget.clone());
+        let payer = crate::StoragePayer::for_test();
+
+        // 1. Empty files exhaust the tight budget instead of growing kernel heap unboundedly.
+        let mut created = 0usize;
+        for i in 0..64 {
+            let name = alloc::format!("empty-{i}");
+            match block_on(fs.open(path(&name), OpenFlags::CREATE, 1, &payer)) {
+                Ok(_) => created += 1,
+                Err(FsError::NoSpace) => break,
+                Err(other) => panic!("unexpected error creating empty file: {other:?}"),
+            }
+        }
+        assert!(
+            created > 0 && created < 64,
+            "budget capped empty files at {created}"
+        );
+        assert!(budget.used_bytes() <= 2048);
+        for i in 0..created {
+            let name = alloc::format!("empty-{i}");
+            block_on(fs.unlink(path(&name), 2, &payer)).expect("unlink");
+        }
+        assert_eq!(
+            budget.used_bytes(),
+            0,
+            "unlinking refunds all inode/name bytes"
+        );
+
+        // 2. Symlink targets (including CJK bytes) are charged and refunded.
+        let target = "中文・日本語・한국어-".repeat(20);
+        let mut links = 0usize;
+        for i in 0..32 {
+            let name = alloc::format!("sym-{i}");
+            match block_on(fs.symlink(&target, path(&name), 3, &payer)) {
+                Ok(()) => links += 1,
+                Err(FsError::NoSpace) => break,
+                Err(other) => panic!("unexpected error creating symlink: {other:?}"),
+            }
+        }
+        assert!(links > 0 && links < 32, "budget capped symlinks at {links}");
+        for i in 0..links {
+            let name = alloc::format!("sym-{i}");
+            block_on(fs.unlink(path(&name), 4, &payer)).expect("unlink symlink");
+        }
+        assert_eq!(
+            budget.used_bytes(),
+            0,
+            "unlinking symlinks refunds target bytes"
+        );
+
+        // 3. Extended attributes are charged on set and refunded on remove/drop.
+        block_on(fs.open(path("attrs"), OpenFlags::CREATE, 5, &payer)).expect("create attrs");
+        let val = bytes::Bytes::from(alloc::vec![b'x'; 400]);
+        let mut xattrs = 0usize;
+        for i in 0..16 {
+            let key = alloc::format!("user.k{i}");
+            match fs.set_xattr(
+                path("attrs"),
+                &key,
+                val.clone(),
+                super::XattrSetMode::Create,
+                6,
+            ) {
+                Ok(()) => xattrs += 1,
+                Err(FsError::NoSpace) => break,
+                Err(other) => panic!("unexpected xattr error: {other:?}"),
+            }
+        }
+        assert!(
+            xattrs > 0 && xattrs < 16,
+            "budget capped xattrs at {xattrs}"
+        );
+        for i in 0..xattrs {
+            let key = alloc::format!("user.k{i}");
+            assert!(
+                fs.remove_xattr(path("attrs"), &key, 7)
+                    .expect("remove xattr")
+            );
+        }
+        let after_xattr_remove = budget.used_bytes();
+        assert!(after_xattr_remove > 0);
+        drop(fs);
+        assert_eq!(
+            budget.used_bytes(),
+            0,
+            "dropping MemoryFs refunds remaining metadata"
+        );
     }
 }

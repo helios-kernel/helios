@@ -282,6 +282,7 @@ fn recv<T>(receiver: &Receiver<T>) -> T {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DiskEvent {
     QuiesceAll,
+    ReinitializeIommu,
     ReinitializeHibernateDisk,
     WriteSectors { start_sector: u64, byte_len: usize },
     Flush,
@@ -418,7 +419,10 @@ impl HibernateStorage for MemoryHibernateDisk {
 struct RecordingDeviceController {
     events: Arc<Mutex<Vec<DiskEvent>>>,
     quiesce_count: usize,
+    reinit_iommu_count: usize,
     reinit_all_count: usize,
+    fail_quiesce: bool,
+    fail_reinit_iommu: bool,
 }
 
 impl RecordingDeviceController {
@@ -426,7 +430,10 @@ impl RecordingDeviceController {
         Self {
             events,
             quiesce_count: 0,
+            reinit_iommu_count: 0,
             reinit_all_count: 0,
+            fail_quiesce: false,
+            fail_reinit_iommu: false,
         }
     }
 }
@@ -435,6 +442,27 @@ impl HibernateDeviceController for RecordingDeviceController {
     fn quiesce_all(&mut self) -> Result<(), HibernateDeviceError> {
         self.quiesce_count += 1;
         self.events.lock().unwrap().push(DiskEvent::QuiesceAll);
+        if self.fail_quiesce {
+            return Err(HibernateDeviceError::Quiesce {
+                device: "virtio-net",
+                detail: "injected quiesce failure",
+            });
+        }
+        Ok(())
+    }
+
+    fn reinitialize_iommu(&mut self) -> Result<(), HibernateDeviceError> {
+        self.reinit_iommu_count += 1;
+        self.events
+            .lock()
+            .unwrap()
+            .push(DiskEvent::ReinitializeIommu);
+        if self.fail_reinit_iommu {
+            return Err(HibernateDeviceError::Reinitialize {
+                device: "virtio-iommu",
+                detail: "injected iommu reinitialize failure",
+            });
+        }
         Ok(())
     }
 
@@ -667,8 +695,9 @@ fn hibernate_full_write_path_orders_flushes_powers_off_and_round_trips() {
     );
 
     // Check strict event timeline (excluding the trailing invalidate write+flush):
-    // QuiesceAll -> ReinitializeHibernateDisk -> WriteSectors(sector >= 8)* ->
-    // Flush -> WriteSectors(sector 0, 4096B) -> Flush -> PowerOff
+    // QuiesceAll -> ReinitializeIommu -> ReinitializeHibernateDisk ->
+    // WriteSectors(sector >= 8)* -> Flush -> WriteSectors(sector 0, 4096B) ->
+    // Flush -> PowerOff
     let recorded = events.lock().unwrap().clone();
     let power_off_pos = recorded
         .iter()
@@ -677,11 +706,12 @@ fn hibernate_full_write_path_orders_flushes_powers_off_and_round_trips() {
     let pre_poweroff = &recorded[..=power_off_pos];
     let n = pre_poweroff.len();
     assert!(
-        n >= 7,
-        "expected quiesce, reinit, >=1 payload write, pre-header flush, header write, final flush, poweroff; got {pre_poweroff:?}"
+        n >= 8,
+        "expected quiesce, iommu reinit, disk reinit, >=1 payload write, pre-header flush, header write, final flush, poweroff; got {pre_poweroff:?}"
     );
     assert_eq!(pre_poweroff[0], DiskEvent::QuiesceAll);
-    assert_eq!(pre_poweroff[1], DiskEvent::ReinitializeHibernateDisk);
+    assert_eq!(pre_poweroff[1], DiskEvent::ReinitializeIommu);
+    assert_eq!(pre_poweroff[2], DiskEvent::ReinitializeHibernateDisk);
     assert_eq!(pre_poweroff[n - 1], DiskEvent::PowerOff);
     assert_eq!(pre_poweroff[n - 2], DiskEvent::Flush);
     assert_eq!(
@@ -692,7 +722,7 @@ fn hibernate_full_write_path_orders_flushes_powers_off_and_round_trips() {
         }
     );
     assert_eq!(pre_poweroff[n - 4], DiskEvent::Flush);
-    for event in &pre_poweroff[2..n - 4] {
+    for event in &pre_poweroff[3..n - 4] {
         match *event {
             DiskEvent::WriteSectors {
                 start_sector,
@@ -1536,4 +1566,165 @@ fn hibernate_resume_probe_refuses_tampered_or_mismatched_images_and_invalidates_
         ),
         ResumeProbe::NoImage
     ));
+}
+
+/// Verifies that `Cpu::continue_timebase(floor)` keeps `Cpu::now()` strictly
+/// monotonic even when the underlying hardware counter resets near zero on a
+/// new boot after hibernate/resume.
+#[test]
+fn monotonic_timebase_continues_strictly_across_counter_reset() {
+    let test_machine = HostedMachine::new(1, ProcessorId::new(0), 64 * 1024);
+    let cpu = HostedCpu::new(ProcessorId::new(0), test_machine.clone());
+
+    test_machine.set_raw_ticks_override(Some(5_000_000));
+    let pre_hibernate = cpu.now();
+    assert_eq!(pre_hibernate.ticks(), 5_000_000);
+
+    // Simulate a new boot whose raw counter starts near zero.
+    test_machine.set_raw_ticks_override(Some(42));
+    cpu.continue_timebase(pre_hibernate);
+    let immediately_after = cpu.now();
+    assert!(
+        immediately_after > pre_hibernate,
+        "Cpu::now() must advance strictly past pre-hibernate floor: before={}, after={}",
+        pre_hibernate.ticks(),
+        immediately_after.ticks(),
+    );
+    assert_eq!(immediately_after.ticks(), pre_hibernate.ticks() + 1);
+
+    // Subsequent counter ticks must continue advancing at 1:1 rate.
+    test_machine.set_raw_ticks_override(Some(100));
+    assert_eq!(cpu.now().ticks(), immediately_after.ticks() + 58);
+
+    // A second resume whose raw counter is already higher than floor must also
+    // stay monotonic without going backwards.
+    let second_floor = cpu.now();
+    test_machine.set_raw_ticks_override(Some(20_000_000));
+    cpu.continue_timebase(second_floor);
+    assert!(cpu.now() > second_floor);
+    assert_eq!(cpu.now().ticks(), 20_000_000);
+
+    test_machine.set_raw_ticks_override(None);
+    test_machine.reset_timebase_offset();
+}
+
+/// Verifies that a mid-way `quiesce_all` failure or `reinitialize_iommu`
+/// failure calls `reinitialize_all`, releases the frame reservation, thaws the
+/// machine without powering off, and returns the typed error.
+#[test]
+fn hibernate_device_failures_recover_and_thaw() {
+    let (machine, _turn) = machine();
+    let (stop, progress) = start_background_tasks(machine);
+    let identity = sample_identity();
+
+    for (fail_quiesce, fail_reinit_iommu) in [(true, false), (false, true)] {
+        let baseline: Vec<usize> = progress.iter().map(|c| c.load(Ordering::SeqCst)).collect();
+        let (tx, rx) = bounded(1);
+        machine.on(0, move |kernel, cpu| {
+            let cpu = cpu.clone();
+            kernel.spawn_local_detached(async move {
+                machine.pool.drain_all_frame_slabs();
+                let allocated_before = machine.pool.stats().allocated_bytes;
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let mut disk =
+                    MemoryHibernateDisk::new(8 * 1024 * 1024, 4096, events.clone(), None);
+                let mut devices = RecordingDeviceController::new(events.clone());
+                devices.fail_quiesce = fail_quiesce;
+                devices.fail_reinit_iommu = fail_reinit_iommu;
+                let generation = MachineGeneration::new(None);
+                let entropy = RootEntropy::from_platform(&cpu, None, None, generation.clone())
+                    .expect("hosted entropy");
+                let mut powered_off = false;
+                let outcome = hibernate_to_disk_with_power_off(
+                    kernel,
+                    &cpu,
+                    machine.pool,
+                    AtomicSnapshotParams {
+                        balloon: None,
+                        auth_key: Some(&machine.auth_key),
+                        identity,
+                        reservation_bytes: RESERVATION_BYTES,
+                        arrival_deadline: ARRIVAL_DEADLINE,
+                        config: SnapshotConfig::new([0x5a; 16]),
+                    },
+                    ResumeTargets {
+                        machine_generation: &generation,
+                        root_entropy: &entropy,
+                        reseed_wall_clock: |_, _| {},
+                    },
+                    &mut disk,
+                    &mut devices,
+                    || {},
+                    || powered_off = true,
+                )
+                .await;
+                machine.pool.drain_all_frame_slabs();
+                let allocated_after = machine.pool.stats().allocated_bytes;
+                let recorded = events.lock().unwrap().clone();
+                tx.send((
+                    outcome,
+                    powered_off,
+                    devices.reinit_all_count,
+                    devices.reinit_iommu_count,
+                    allocated_before,
+                    allocated_after,
+                    recorded,
+                ))
+                .unwrap();
+            });
+        });
+
+        let (
+            outcome,
+            powered_off,
+            reinit_all_count,
+            reinit_iommu_count,
+            allocated_before,
+            allocated_after,
+            recorded,
+        ) = recv(&rx);
+        assert!(
+            !powered_off,
+            "power_off must not run when device lifecycle fails"
+        );
+        assert_eq!(
+            reinit_all_count, 1,
+            "recover_devices_after_abort must call reinitialize_all"
+        );
+        if fail_quiesce {
+            assert!(matches!(
+                outcome,
+                Err(HibernateError::Device(HibernateDeviceError::Quiesce { .. }))
+            ));
+            assert_eq!(reinit_iommu_count, 0);
+            assert_eq!(
+                recorded,
+                vec![DiskEvent::QuiesceAll, DiskEvent::ReinitializeAll]
+            );
+        } else {
+            assert!(matches!(
+                outcome,
+                Err(HibernateError::Device(HibernateDeviceError::Reinitialize {
+                    device: "virtio-iommu",
+                    ..
+                }))
+            ));
+            assert_eq!(reinit_iommu_count, 1);
+            assert_eq!(
+                recorded,
+                vec![
+                    DiskEvent::QuiesceAll,
+                    DiskEvent::ReinitializeIommu,
+                    DiskEvent::ReinitializeAll,
+                ]
+            );
+        }
+        assert_eq!(
+            allocated_after, allocated_before,
+            "reservation must be released after device failure"
+        );
+        wait_for_all_tasks_to_advance(&progress, &baseline);
+    }
+
+    stop.store(true, Ordering::Release);
 }

@@ -307,11 +307,8 @@ impl HibernateDeviceController for X86HibernateDevices {
         Ok(())
     }
 
-    fn reinitialize_all(&mut self) -> Result<(), HibernateDeviceError> {
+    fn reinitialize_iommu(&mut self) -> Result<(), HibernateDeviceError> {
         let deadline = self.deadline();
-        // STRICT ORDERING CONTRACT: when `virtio-iommu` is present, its
-        // `reinitialize()` MUST complete BEFORE any other virtio driver calls
-        // `reinitialize()`.
         if let Some(iommu) = &self.iommu {
             let _reset = iommu.reinitialize(self.expired_fn(deadline)).map_err(|_| {
                 HibernateDeviceError::Reinitialize {
@@ -320,6 +317,15 @@ impl HibernateDeviceController for X86HibernateDevices {
                 }
             })?;
         }
+        Ok(())
+    }
+
+    fn reinitialize_all(&mut self) -> Result<(), HibernateDeviceError> {
+        // STRICT ORDERING CONTRACT: when `virtio-iommu` is present, its
+        // `reinitialize()` MUST complete BEFORE any other virtio driver calls
+        // `reinitialize()`.
+        self.reinitialize_iommu()?;
+        let deadline = self.deadline();
         if let Some(host_fs) = &self.host_fs {
             let _reset = host_fs.device().reinitialize().map_err(|_| {
                 HibernateDeviceError::Reinitialize {

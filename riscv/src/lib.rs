@@ -10,6 +10,7 @@ mod gpu;
 mod hibernate;
 mod host_fs;
 mod input;
+mod iommu;
 mod net;
 mod pci;
 mod rtc;
@@ -155,7 +156,7 @@ pub(crate) fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: DeviceType) -> 
 use core::arch::{asm, global_asm};
 use core::num::NonZeroUsize;
 use core::ops::Range;
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering, compiler_fence};
+use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering, compiler_fence};
 
 use arrayvec::ArrayVec;
 use fdt::Fdt;
@@ -214,6 +215,10 @@ static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionStat
     helios_hal::critical_section::CriticalSectionState::new();
 static DEBUG_STATE: Once<debug_state::RuntimeState> = Once::new();
 static WATCHDOG_STATE: Once<watchdog::RiscvWatchdog> = Once::new();
+/// Shared monotonic tick offset added to the RISC-V `time` CSR so [`Cpu::now`]
+/// continues strictly forward across hibernate/resume and [`Cpu::set_deadline`]
+/// translates deadlines back into raw `time` CSR ticks for `sbi_rt::set_timer`.
+static TIMEBASE_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 use core::ptr::NonNull;
 
@@ -669,7 +674,14 @@ impl Cpu for RiscvCpu {
     }
 
     fn now(&self) -> Instant {
-        Instant::new(riscv::register::time::read64())
+        let offset = TIMEBASE_OFFSET.load(Ordering::Acquire);
+        Instant::new(riscv::register::time::read64().saturating_add(offset))
+    }
+
+    fn continue_timebase(&self, floor: Instant) {
+        let raw = riscv::register::time::read64();
+        let new_offset = floor.ticks().saturating_add(1).saturating_sub(raw);
+        TIMEBASE_OFFSET.store(new_offset, Ordering::Release);
     }
 
     fn timebase(&self) -> Timebase {
@@ -677,7 +689,8 @@ impl Cpu for RiscvCpu {
     }
 
     fn set_deadline(&self, deadline: Instant) {
-        sbi_rt::set_timer(deadline.ticks());
+        let offset = TIMEBASE_OFFSET.load(Ordering::Acquire);
+        sbi_rt::set_timer(deadline.ticks().saturating_sub(offset));
     }
 
     fn publish_executable(&self, ptr: *const u8, len: usize) {
@@ -915,20 +928,21 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     unsafe {
         vmm::activate_paging();
     }
-    let bootstrap_pool = if current_hart == bootstrap_processor {
-        Some(helios_kernel::prime_bootstrap_allocator(
+    let user_pool = (current_hart == bootstrap_processor).then(|| {
+        helios_kernel::prime_bootstrap_allocator(
             memory_regions.iter().copied(),
             &numa,
             bootstrap_processor,
-        ))
-    } else {
-        None
-    };
+        )
+    });
 
     let debug_state = shared_debug_state(timebase, hart_count, initrd.clone());
     let has_debug_transport = publish_debug_transport(DebugTransport::discover(&fdt));
     let watchdog = shared_watchdog(&fdt);
-    let has_vsock = vsock::has_vsock_device(&fdt);
+    let pci = pci::PciHostController::discover(&fdt);
+    let pci_virtio = pci.as_ref().map(pci::PciHostController::virtio_functions);
+    let iommu_topology = pci.as_ref().and_then(pci::PciHostController::iommu);
+    let has_vsock = vsock::has_vsock_device(&fdt, pci_virtio.as_ref());
     // The boot UART carries kernel tracing when a vsock device is present for
     // inspector RPC framing, keeping the UART clear for binary serial RPC on
     // machines without vsock. A machine whose device tree describes no console
@@ -939,34 +953,28 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     if has_debug_transport {
         devices = devices.with_debug_serial();
     }
-    if net::has_network_device(&fdt) {
+    if net::has_network_device(&fdt, pci_virtio.as_ref()) {
         devices = devices.with_network();
     }
-    let block_device_count = block::count_block_devices(&fdt);
+    let block_device_count = block::count_block_devices(&fdt, pci_virtio.as_ref());
     if block_device_count != 0 {
         devices = devices.with_block_devices(block_device_count);
     }
-    if host_fs::has_9p_device(&fdt) {
+    if host_fs::has_9p_device(&fdt, pci_virtio.as_ref()) {
         devices = devices.with_host_share();
     }
-    if entropy::has_entropy_device(&fdt) {
+    if entropy::has_entropy_device(&fdt, pci_virtio.as_ref()) {
         devices = devices.with_entropy_device();
     }
-    if balloon::has_balloon_device(&fdt) {
+    if balloon::has_balloon_device(&fdt, pci_virtio.as_ref()) {
         devices = devices.with_memory_balloon();
     }
     if has_vsock {
         devices = devices.with_vsock();
     }
-    if !gpu::has_display_device(&fdt) {
-        tracing::info!("no virtio-gpu node in the device tree; this machine has no display");
-    }
-    if input::count_input_devices(&fdt) == 0 {
-        tracing::info!("no virtio-input node in the device tree; this machine has no input device");
-    }
-    if !snd::has_sound_device(&fdt) {
-        tracing::info!("no virtio-snd node in the device tree; this machine has no sound device");
-    }
+    let has_display = gpu::has_display_device(&fdt, pci_virtio.as_ref());
+    let input_count = input::count_input_devices(&fdt, pci_virtio.as_ref());
+    let has_sound = snd::has_sound_device(&fdt, pci_virtio.as_ref());
     let (measured_boot, measured_boot_discovery) = if current_hart == bootstrap_processor {
         tpm::discover(&fdt, cpu.clone())
     } else {
@@ -981,7 +989,11 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
                     .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
             )
             .with_timer_frequency_hz(timebase.frequency())
-            .with_dma_model(DmaModel::Identity)
+            .with_dma_model(if iommu_topology.is_some() {
+                DmaModel::Iommu
+            } else {
+                DmaModel::Identity
+            })
             .with_devices(devices)
             .with_measured_boot(measured_boot)
             .with_boot_memory(boot_memory),
@@ -993,33 +1005,67 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             tracing::info!("{measured_boot_discovery}");
         }
     }
-    // The root DRBG is seeded once, on the bootstrap hart, before
-    // anything can ask for random bytes. RISC-V has no unprivileged
-    // entropy instruction the kernel can rely on, so the seed OpenSBI
-    // leaves in `/chosen/rng-seed` is the platform's pre-boot source;
-    // the entropy device joins it as soon as the executor runs. This
-    // follows `init` so the source line reaches the log the kernel just
-    // installed.
-    // The entropy device comes up before the root DRBG is seeded,
-    // because riscv64 has no entropy instruction and a platform whose
-    // firmware leaves no `/chosen/rng-seed` has this device and nothing
-    // else. Its PLIC source is attached later, with every other
-    // device's; the bring-up read polls the used ring and needs none.
-    let entropy_device = (current_hart == bootstrap_processor)
-        .then(|| entropy::bring_up(&fdt))
-        .flatten();
-    let bootstrap_state = (current_hart == bootstrap_processor).then(|| {
+    // Only the bootstrap hart brings devices up.
+    if let Some(pool) = user_pool {
+        if !has_display {
+            tracing::info!("no virtio-gpu device discovered; this machine has no display");
+        }
+        if input_count == 0 {
+            tracing::info!("no virtio-input device discovered; this machine has no input device");
+        }
+        if !has_sound {
+            tracing::info!("no virtio-snd device discovered; this machine has no sound device");
+        }
+        if let Some(pci) = pci.as_ref() {
+            pci.reserve_assigned_memory_bars();
+        }
+        // Confine every virtio-PCI function in its own domain before any
+        // driver (including PCI virtio-rng) touches its queues.
+        let mut confinement = match (pci.as_ref(), pci_virtio.as_ref(), iommu_topology) {
+            (Some(pci), Some(pci_virtio), Some(topology)) => {
+                let confined = pci_virtio.addresses();
+                let confinement = iommu::confine_devices(pci, topology, &confined);
+                let report = confinement.report();
+                debug_state.install_iommu_report(report.clone());
+                kernel.spawn_detached(iommu::watch_faults(
+                    confinement.device(),
+                    report,
+                    kernel.timer(),
+                ));
+                Some(confinement)
+            }
+            _ => {
+                tracing::info!(
+                    "no virtio-iommu in the device tree topology; device DMA reaches physical \
+                     memory directly"
+                );
+                None
+            }
+        };
+        let mut dma_arenas = iommu::RiscvDmaArenas::new(helios_kernel::UserPoolChunks::new(pool));
+        // The entropy device comes up after IOMMU confinement (so a PCI
+        // virtio-rng is never touched unconfined) and before the root DRBG
+        // is seeded (so a platform whose firmware leaves no
+        // `/chosen/rng-seed` still seeds from hardware entropy).
+        let entropy_device = entropy::bring_up(
+            &fdt,
+            pci.as_ref(),
+            pci_virtio.as_ref(),
+            &mut dma_arenas,
+            confinement.as_mut(),
+            hart_count,
+        );
         // No VM generation ID window is discovered on this platform yet,
         // so the machine generation moves only through `advance`.
         let generation = helios_kernel::MachineGeneration::new(None);
         debug_state.install_machine_generation(generation.clone());
-        let root = helios_kernel::seed_root_entropy(
+        let root_entropy = helios_kernel::seed_root_entropy(
             &cpu,
             helios_hal::entropy::device_tree_seed(&fdt),
             entropy_device.as_ref().map(|entropy| &entropy.device),
             generation,
         );
-        debug_state.install_root_entropy(root.clone());
+        debug_state.install_root_entropy(root_entropy.clone());
         // Settle the TPM-sealed machine seed early so `HibernateAuthKey` is
         // available for the early-boot resume probe below without settling twice.
         helios_kernel::settle_boot_signing_keys(&kernel, &debug_state);
@@ -1038,15 +1084,12 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
                 );
             }
         }
-        (root, rtc)
-    });
-    // Only the bootstrap hart brings devices up, and it is the hart
-    // that holds the root DRBG handle.
-    if let Some((root_entropy, rtc)) = bootstrap_state {
         let mut hibernate_devices = hibernate::RiscvHibernateDevices::new(
             cpu.clone(),
             debug_state.machine_generation_handle(),
         );
+        hibernate_devices.iommu = confinement.as_ref().map(iommu::Confinement::device);
+
         // A machine may carry several PLICs — QEMU's `virt` gives every
         // socket its own and wires devices to different ones — so each
         // PLIC is its own domain, taken by one hart with a context in
@@ -1056,16 +1099,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         // The device path's platform surface comes up before any grant
         // is published, which the registry enforces.
         device::install_hooks();
-        // The boot UART is a device the kernel drives itself: its
-        // PLIC source is enabled and prioritised like the virtio
-        // devices'. The handler masks the receive line at the port
-        // and raises the debug console's receive signal; the waiter
-        // re-arms the line while it listens.
         if let Some(transport) = DEBUG_TRANSPORT.get().copied() {
-            // The debug console's readers park on the UART's interrupt,
-            // so a UART on a controller no hart takes interrupts from
-            // would hang every serial read; refuse it here rather than
-            // at the first parked reader.
             assert!(
                 domains.takes(transport.plic_line.controller),
                 "the device tree wires the debug UART to the interrupt controller at {:#x}, in \
@@ -1078,11 +1112,28 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
                 DebugTransport::console().interrupt_handler::<DebugTransport>(),
             );
         }
-        if let Some(network) = net::install_network_service(&cpu, &kernel, &fdt, &debug_state) {
+        if let Some(network) = net::install_network_service(
+            &cpu,
+            &kernel,
+            &fdt,
+            pci.as_ref(),
+            pci_virtio.as_ref(),
+            &mut dma_arenas,
+            confinement.as_mut(),
+            &debug_state,
+        ) {
             hibernate_devices.network = Some(network.device.device().clone());
             domains.attach_network(network);
         }
-        if let Some(host_fs) = host_fs::install(&cpu, &fdt, &debug_state) {
+        if let Some(host_fs) = host_fs::install(
+            &cpu,
+            &fdt,
+            pci.as_ref(),
+            pci_virtio.as_ref(),
+            &mut dma_arenas,
+            confinement.as_mut(),
+            &debug_state,
+        ) {
             hibernate_devices.host_fs = Some(host_fs.transport.clone());
             domains.attach_host_fs(host_fs);
         }
@@ -1091,35 +1142,92 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             entropy::install(&kernel, &entropy, root_entropy.clone());
             domains.attach_entropy(entropy);
         }
-        if let Some(balloon) =
-            balloon::install(&kernel, &fdt, debug_state.machine_generation_handle())
-        {
+        if let Some(balloon) = balloon::install(
+            &cpu,
+            &kernel,
+            &fdt,
+            pci.as_ref(),
+            pci_virtio.as_ref(),
+            &mut dma_arenas,
+            confinement.as_mut(),
+            debug_state.machine_generation_handle(),
+        ) {
             hibernate_devices.balloon = Some(balloon.handler.device().clone());
             debug_state.install_memory_balloon(balloon.handle.clone());
             domains.attach_balloon(balloon);
         }
-        if let Some(vsock) = vsock::install(&kernel, &cpu, &fdt, &debug_state) {
+        if let Some(vsock) = vsock::install(
+            &kernel,
+            &cpu,
+            &fdt,
+            pci.as_ref(),
+            pci_virtio.as_ref(),
+            &mut dma_arenas,
+            confinement.as_mut(),
+            &debug_state,
+        ) {
             hibernate_devices.vsock = Some(vsock.device.device().clone());
             domains.attach_vsock(vsock);
         }
-        if let Some(display) = gpu::install(&cpu, &kernel, &fdt, &debug_state) {
+        if let Some(display) = gpu::install(
+            &cpu,
+            &kernel,
+            &fdt,
+            pci.as_ref(),
+            pci_virtio.as_ref(),
+            &mut dma_arenas,
+            confinement.as_mut(),
+            &debug_state,
+        ) {
             hibernate_devices.display = Some(display.device.device().clone());
             domains.attach_display(display);
         }
-        for device in input::install(&kernel, &fdt, &debug_state) {
+        for device in input::install(
+            &cpu,
+            &kernel,
+            &fdt,
+            pci.as_ref(),
+            pci_virtio.as_ref(),
+            &mut dma_arenas,
+            confinement.as_mut(),
+            &debug_state,
+        ) {
             hibernate_devices
                 .inputs
                 .push(device.device.device().clone());
             domains.attach_input(device);
         }
-        if let Some(sound) = snd::install(&kernel, &fdt, &debug_state) {
+        if let Some(sound) = snd::install(
+            &cpu,
+            &kernel,
+            &fdt,
+            pci.as_ref(),
+            pci_virtio.as_ref(),
+            &mut dma_arenas,
+            confinement.as_mut(),
+            &debug_state,
+        ) {
             hibernate_devices.sound = Some(sound.device.device().clone());
             domains.attach_sound(sound);
         }
-        for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy.clone()) {
+        for block in block::install(
+            &cpu,
+            &kernel,
+            &fdt,
+            pci.as_ref(),
+            pci_virtio.as_ref(),
+            &mut dma_arenas,
+            confinement.as_mut(),
+            &debug_state,
+            root_entropy.clone(),
+        ) {
             hibernate_devices.blocks.push(block.device.device().clone());
             domains.attach_block(block);
         }
+        kernel.spawn_detached(helios_kernel::maintain_dma_arenas(
+            dma_arenas,
+            kernel.timer(),
+        ));
         // Early-boot hibernate resume probe: runs on the bootstrap hart with
         // interrupts disabled, BEFORE starting secondary harts, enabling
         // swap/init, or unmasking interrupts. If a valid authenticated
@@ -1130,30 +1238,18 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             &kernel,
             &watchdog,
             &debug_state,
-            bootstrap_pool.expect("bootstrap hart primed the memory pool"),
+            pool,
             &root_entropy,
             rtc.as_ref(),
             &mut hibernate_devices,
             &[],
         );
         helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
-        // Everything the kernel drives itself has claimed its
-        // source by now, so what the tree describes and nobody took
-        // is exactly what a driver plugin may be handed.
         let grants = device::publish_grants(&fdt, debug_state.device_grants(), &domains);
         for (line, route) in grants {
             domains.attach_device(line, route);
         }
-        // Every route is in place, and no secondary hart has been
-        // started: each takes its domains from the published table when
-        // it builds its runtime below.
         net::publish_interrupt_domains(domains);
-        // The Sv48 address space reserves and commits lazily, so a page
-        // could be taken away here — but the backend has not wired the
-        // other half: no `SwapVmHooks` table, so a not-present PTE
-        // carries no swap token and the fault handler has nothing to
-        // look the page up by. Extending swap to this backend is #25's
-        // follow-up to #59.
         helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapHooks);
         release_early_boot_harts();
     }

@@ -2185,7 +2185,7 @@ mod linux_tests {
             BootFs, ContainerConfig, ContainerMountSpec, DirectoryAuthorityRights,
             EmbeddedBootDirectory, EmbeddedBootFs, MountSharing, SharedOwner,
         };
-        use helios_hal::fs::FileSystemRights;
+        use helios_hal::fs::{FileSystemRights, FsPath};
         use helios_linux::syscall::{Credentials, UtsField};
 
         const BOOT_IMAGE: EmbeddedBootFs = EmbeddedBootFs::new(
@@ -2208,7 +2208,13 @@ mod linux_tests {
         let box_b = mount_container_memory(&host_ns, "/box-b", rw, MountSharing::Private);
         block_on(async {
             create_container_file(&box_a, "app", &minimal_x86_64_elf()).await;
+            box_a
+                .set_permissions(FsPath::new("app").unwrap(), 0o755, 0)
+                .unwrap();
             create_container_file(&box_b, "other", &minimal_x86_64_elf()).await;
+            box_b
+                .set_permissions(FsPath::new("other").unwrap(), 0o755, 0)
+                .unwrap();
         });
 
         let script = ScriptState::new(
@@ -3936,8 +3942,17 @@ mod linux_tests {
                 .await
                 .unwrap();
             create_container_file(&img_fs, "bin/interp", &minimal_x86_64_elf()).await;
+            img_fs
+                .set_permissions(FsPath::new("bin/interp").unwrap(), 0o755, 1)
+                .unwrap();
             create_container_file(&img_fs, "bin/run.sh", b"#!/bin/interp -x\necho ok\n").await;
+            img_fs
+                .set_permissions(FsPath::new("bin/run.sh").unwrap(), 0o755, 1)
+                .unwrap();
             create_container_file(&img_fs, "bin/loop.sh", b"#!/bin/loop.sh\n").await;
+            img_fs
+                .set_permissions(FsPath::new("bin/loop.sh").unwrap(), 0o755, 1)
+                .unwrap();
             create_container_file(&host_fs, "data.txt", b"host-visible").await;
             ns.mount(
                 &root_auth.derive_mount_cap("/img").unwrap(),
@@ -4018,6 +4033,7 @@ mod linux_tests {
         block_on(load_container_executable(
             &cpu,
             &container,
+            "/",
             "/bin/run.sh",
             &mut script_argv,
             &root_creds,
@@ -4033,6 +4049,7 @@ mod linux_tests {
         let loop_err = block_on(load_container_executable(
             &cpu,
             &container,
+            "/",
             "/bin/loop.sh",
             &mut loop_argv,
             &root_creds,
@@ -5210,5 +5227,147 @@ mod linux_tests {
             assert_eq!(st.entries[1], at_base + 0x1000);
             assert_eq!(st.execfns[1], "/bin/dyn_pie");
         });
+    }
+
+    #[test]
+    fn initial_container_launch_enforces_dac_setuid_and_cwd_relative_paths() {
+        use crate::vfs::{MemoryFs, MountGrant, MountSharing, MountedFs, Namespace};
+        use crate::{
+            BOOT_DEVICE, BootFs, ContainerConfig, ContainerMountSpec, EmbeddedBootDirectory,
+            EmbeddedBootFs,
+        };
+        use helios_hal::fs::{FileSystem, FileSystemRights, FsPath};
+        use helios_linux::syscall::{Credentials, UtsField};
+
+        const BOOT_IMAGE: EmbeddedBootFs =
+            EmbeddedBootFs::new(&[EmbeddedBootDirectory::new("root", 0)], &[]);
+        let ns = Namespace::<UnsupportedStorage>::new(crate::MountTable::new(
+            BootFs::new(BOOT_IMAGE, BOOT_DEVICE),
+            4,
+        ));
+        let root_auth = ProcessAuthority::root();
+        let payer = crate::StoragePayer::for_test();
+        let root_fs = MemoryFs::new(ns.table().allocate_device());
+        block_on(async {
+            root_fs
+                .create_directory(FsPath::new("work").unwrap(), 1, &payer)
+                .await
+                .unwrap();
+            root_fs
+                .create_directory(FsPath::new("work/sub").unwrap(), 1, &payer)
+                .await
+                .unwrap();
+            create_container_file(&root_fs, "work/noexec", &minimal_x86_64_elf()).await;
+            root_fs
+                .set_permissions(FsPath::new("work/noexec").unwrap(), 0o644, 1)
+                .unwrap();
+            create_container_file(&root_fs, "work/suid", &minimal_x86_64_elf()).await;
+            root_fs
+                .set_permissions(FsPath::new("work/suid").unwrap(), 0o4755, 1)
+                .unwrap();
+            create_container_file(&root_fs, "work/interp", &minimal_x86_64_elf()).await;
+            root_fs
+                .set_permissions(FsPath::new("work/interp").unwrap(), 0o755, 1)
+                .unwrap();
+            create_container_file(&root_fs, "work/sub/run.sh", b"#!./interp -q\n").await;
+            root_fs
+                .set_permissions(FsPath::new("work/sub/run.sh").unwrap(), 0o755, 1)
+                .unwrap();
+            ns.mount(
+                &root_auth.derive_mount_cap("/root").unwrap(),
+                MountedFs::Memory(root_fs),
+                MountGrant {
+                    rights: FileSystemRights::READ | FileSystemRights::WRITE,
+                    sharing: MountSharing::Private,
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let cpu = ScriptedLinuxCpu {
+            base: TestCpu::with_entropy(0x22),
+            script: ScriptState::new(Vec::new(), |_| {}),
+        };
+        let service = test_program_service(&cpu);
+        let rwx = DirectoryAuthorityRights::READ
+            | DirectoryAuthorityRights::WRITE
+            | DirectoryAuthorityRights::MUTATE_DIRECTORY
+            | DirectoryAuthorityRights::EXECUTE;
+        let container_handle = block_on(service.create_container(
+            &root_auth,
+            &ns,
+            ProcessAuthority::empty(),
+            ContainerConfig {
+                root: ContainerMountSpec {
+                    source_path: String::from("/root"),
+                    target_path: String::from("/"),
+                    rights: rwx,
+                    sharing: crate::ContainerMountSharing::Private,
+                },
+                mounts: Vec::new(),
+                shared_owner: crate::vfs::SharedOwner { uid: 0, gid: 0 },
+                credentials: Credentials::root(),
+                hostname: UtsField::from_configured("dac-test").unwrap(),
+                domainname: UtsField::UNSET,
+            },
+        ))
+        .expect("create container");
+        let container = service.get_container(&container_handle).unwrap();
+        let timeline = phases::Timeline::disabled();
+        let unpriv = Credentials::for_ids(1000, 1000, Vec::new());
+
+        // 1. Non-executable 0o644 binary on private mount is refused with PermissionDenied.
+        let mut noexec_argv = ProgramArgv::launched("noexec", Vec::new());
+        let err = block_on(load_container_executable(
+            &cpu,
+            &container,
+            "/work",
+            "noexec",
+            &mut noexec_argv,
+            &unpriv,
+            &timeline,
+        ))
+        .err()
+        .expect("0o644 file must be rejected");
+        assert_eq!(err.kind, ProgramExecErrorKind::PermissionDenied);
+
+        // 2. Setuid 0o4755 root-owned binary elevates effective/saved uid to 0 and sets AT_SECURE.
+        let mut suid_argv = ProgramArgv::launched("suid", Vec::new());
+        let (loaded_suid, next_creds) = block_on(load_container_executable(
+            &cpu,
+            &container,
+            "/work",
+            "./suid",
+            &mut suid_argv,
+            &unpriv,
+            &timeline,
+        ))
+        .expect("setuid binary loads");
+        assert_eq!(next_creds.user.real, 1000);
+        assert_eq!(next_creds.user.effective, 0);
+        assert_eq!(next_creds.user.saved, 0);
+        assert!(
+            loaded_suid.is_secure(),
+            "setuid transition must set AT_SECURE"
+        );
+
+        // 3. Relative launch path ("sub/run.sh") and relative #! interpreter ("#!./interp -q")
+        //    both resolve against cwd ("/work"), not "/".
+        let mut rel_argv = ProgramArgv::launched("run.sh", vec![String::from("arg1")]);
+        let (_, _) = block_on(load_container_executable(
+            &cpu,
+            &container,
+            "/work",
+            "sub/run.sh",
+            &mut rel_argv,
+            &unpriv,
+            &timeline,
+        ))
+        .expect("relative script and relative shebang resolve against cwd");
+        assert_eq!(
+            rel_argv.into_vec(),
+            vec!["./interp", "-q", "/work/sub/run.sh", "arg1"]
+        );
     }
 }

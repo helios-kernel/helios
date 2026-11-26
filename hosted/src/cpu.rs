@@ -156,6 +156,10 @@ impl Cpu for HostedCpu {
         self.machine.now()
     }
 
+    fn continue_timebase(&self, floor: Instant) {
+        self.machine.continue_timebase(floor);
+    }
+
     fn timebase(&self) -> Timebase {
         self.machine.timebase()
     }

@@ -195,7 +195,7 @@ enum Command {
     Bundle(BundleCommand),
     /// Export inspect metrics to Prometheus (`/metrics`) and/or OTLP/HTTP via `zenwave`.
     Bridge(BridgeCommand),
-    /// Execute a script inside the remote guest shell (`/bin/dash`).
+    /// Execute a script inside the remote guest shell (`/bin/nu`).
     Shell(ShellCommand),
     /// Stream tracing events until interrupted (legacy compatibility surface).
     Tracing(TracingCommand),
@@ -235,7 +235,7 @@ pub(crate) enum SessionCommand {
     Bundle(BundleCommand),
     /// Export inspect metrics to Prometheus and/or OTLP/HTTP via `zenwave`.
     Bridge(BridgeCommand),
-    /// Execute a shell script inside the remote guest shell program (`/bin/dash`).
+    /// Execute a shell script inside the remote guest shell program (`/bin/nu`).
     Shell(ShellCommand),
     /// Stream tracing events until interrupted.
     Tracing(TracingCommand),
@@ -245,7 +245,7 @@ pub(crate) enum SessionCommand {
 
 #[derive(Debug, Clone, ClapArgs)]
 pub(crate) struct ShellCommand {
-    /// Inline script passed to `/bin/dash -c`.
+    /// Inline script passed to `/bin/nu -c`.
     #[arg(short = 'c', long = "command", conflicts_with = "script")]
     command: Option<String>,
 
@@ -253,7 +253,7 @@ pub(crate) struct ShellCommand {
     #[arg(conflicts_with = "command")]
     script: Option<String>,
 
-    /// Guest shell binary to invoke (defaults to `/bin/dash`; pass `/bin/nu` for Nushell).
+    /// Guest shell binary to invoke (defaults to `/bin/nu`; pass `/bin/dash` for POSIX shell).
     #[arg(long = "shell", value_name = "PATH")]
     shell: Option<String>,
 

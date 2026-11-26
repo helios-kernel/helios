@@ -1121,6 +1121,21 @@ pub trait Cpu: Send + Sync + 'static {
     /// frozen.
     fn restore_bsp_post_resume_state(&self) {}
 
+    /// Advances the platform monotonic tick offset after a hibernate resume so
+    /// [`Cpu::now`] continues strictly above `floor` on every processor even
+    /// when the underlying hardware counter restarted near zero on the new
+    /// boot.
+    ///
+    /// Backends whose [`Cpu::set_deadline`] programs a hardware comparator
+    /// translate deadlines back into raw hardware ticks by subtracting the same
+    /// offset.
+    ///
+    /// Called on the bootstrap processor inside the
+    /// [`SnapshotPoint::Resumed`] continuation immediately after
+    /// [`Cpu::restore_bsp_post_resume_state`] while the machine is still
+    /// frozen.
+    fn continue_timebase(&self, _floor: Instant) {}
+
     /// Powers the machine off and never returns.
     fn shutdown(&self) -> !;
 

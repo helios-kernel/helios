@@ -46,9 +46,9 @@ use super::{
 };
 use crate::abi::Abi;
 use crate::signal_frame::{
-    self, FrameDeliveryInput, SA_NOCLDSTOP, SA_NOCLDWAIT, SA_NODEFER, SA_RESETHAND, SA_RESTART,
-    SIGINFO_SIZE, SS_AUTODISARM, SS_DISABLE, SS_ONSTACK, STACK_T_SIZE, SigAltStack, SigInfo,
-    SignalFrameError,
+    self, BUS_ADRERR, FrameDeliveryInput, SA_NOCLDSTOP, SA_NOCLDWAIT, SA_NODEFER, SA_RESETHAND,
+    SA_RESTART, SIGINFO_SIZE, SS_AUTODISARM, SS_DISABLE, SS_ONSTACK, STACK_T_SIZE, SigAltStack,
+    SigInfo, SigInfoPayload, SignalFrameError,
 };
 
 // Linux UAPI constants (`include/uapi/asm-generic/signal-defs.h`,
@@ -1055,6 +1055,56 @@ pub fn deliver_fault_signal<C: UserContext, M: UserMemory>(
     sigreturn_trampoline: u64,
 ) -> SignalDelivery {
     let (info, fault_address) = SigInfo::from_fault(fault);
+    deliver_forced_siginfo(
+        abi,
+        thread,
+        info,
+        fault_address,
+        context,
+        memory,
+        sigreturn_trampoline,
+    )
+}
+
+/// Delivers a synchronous `SIGBUS` (`BUS_ADRERR`) fault with `si_addr =
+/// fault_address` (such as accessing a whole page beyond a mapped file's end)
+/// using Linux `force_sig_fault` semantics.
+pub fn deliver_bus_fault_signal<C: UserContext, M: UserMemory>(
+    abi: Abi,
+    thread: &ThreadSignalSlot,
+    fault_address: u64,
+    context: &mut C,
+    memory: &mut M,
+    sigreturn_trampoline: u64,
+) -> SignalDelivery {
+    let info = SigInfo {
+        signo: Signal::SIGBUS,
+        errno: 0,
+        code: BUS_ADRERR,
+        payload: SigInfoPayload::Fault {
+            addr: fault_address,
+        },
+    };
+    deliver_forced_siginfo(
+        abi,
+        thread,
+        info,
+        fault_address,
+        context,
+        memory,
+        sigreturn_trampoline,
+    )
+}
+
+fn deliver_forced_siginfo<C: UserContext, M: UserMemory>(
+    abi: Abi,
+    thread: &ThreadSignalSlot,
+    info: SigInfo,
+    fault_address: u64,
+    context: &mut C,
+    memory: &mut M,
+    sigreturn_trampoline: u64,
+) -> SignalDelivery {
     let signal = info.signo;
     let active_mask = thread.current_mask();
 

@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant as StdInstant};
@@ -157,7 +157,12 @@ pub(crate) struct HostedMachine {
     /// The host's monotonic clock in nanoseconds: one tick is one
     /// nanosecond.
     timebase: Timebase,
+    /// Monotonic tick offset added to raw elapsed nanoseconds so [`Cpu::now`]
+    /// continues strictly forward across hibernate/resume.
+    timebase_offset: AtomicU64,
     heap: HeapReservation,
+    #[cfg(test)]
+    raw_ticks_override: Mutex<Option<u64>>,
     #[cfg(test)]
     next_resume_handoff: Mutex<Option<helios_hal::cpu::ResumeHandoff>>,
     #[cfg(test)]
@@ -277,7 +282,10 @@ impl HostedMachine {
             bootstrap_processor,
             started_at,
             timebase: Timebase::new(NANOS_PER_SECOND),
+            timebase_offset: AtomicU64::new(0),
             heap: HeapReservation::new(heap_bytes),
+            #[cfg(test)]
+            raw_ticks_override: Mutex::new(None),
             #[cfg(test)]
             next_resume_handoff: Mutex::new(None),
             #[cfg(test)]
@@ -299,6 +307,22 @@ impl HostedMachine {
 
     pub(crate) fn now(&self) -> Instant {
         Instant::new(self.now_ticks())
+    }
+
+    pub(crate) fn continue_timebase(&self, floor: Instant) {
+        let raw = self.raw_now_ticks();
+        let new_offset = floor.ticks().saturating_add(1).saturating_sub(raw);
+        self.timebase_offset.store(new_offset, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_raw_ticks_override(&self, ticks: Option<u64>) {
+        *self.raw_ticks_override.lock().unwrap() = ticks;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_timebase_offset(&self) {
+        self.timebase_offset.store(0, Ordering::Release);
     }
 
     pub(crate) fn timebase(&self) -> Timebase {
@@ -484,9 +508,18 @@ impl HostedMachine {
         core::iter::once(self.heap.as_memory_region())
     }
 
-    fn now_ticks(&self) -> u64 {
+    fn raw_now_ticks(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(override_ticks) = *self.raw_ticks_override.lock().unwrap() {
+            return override_ticks;
+        }
         u64::try_from(self.started_at.elapsed().as_nanos())
             .unwrap_or_else(|err| panic!("hosted uptime exceeds u64 nanos: {err}"))
+    }
+
+    fn now_ticks(&self) -> u64 {
+        self.raw_now_ticks()
+            .saturating_add(self.timebase_offset.load(Ordering::Acquire))
     }
 
     fn slot(&self, processor: ProcessorId) -> &ProcessorSlot {

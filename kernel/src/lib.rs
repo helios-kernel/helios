@@ -211,7 +211,8 @@ pub use limine_tpm_event_log::LimineTpmEventLogRequest;
 pub use linux_container::{
     ContainerConfig, ContainerError, ContainerFilesystem, ContainerId, ContainerMount,
     ContainerMountSharing, ContainerMountSnapshot, ContainerMountSpec, ContainerNodeInfo,
-    ContainerProcessGuard, ContainerResolved, LinuxContainer, LinuxContainerSnapshot,
+    ContainerOpenOutcome, ContainerProcessGuard, ContainerResolved, LinuxContainer,
+    LinuxContainerSnapshot,
 };
 pub use machine::{
     AdvanceCause, DeviceResets, GENERATION_PROBE_INTERVAL, Generation, MachineGeneration,
@@ -233,22 +234,22 @@ pub use memory::{
     NoCryptographicEntropy, NoEntropyDevice, NodeLocalArena, NodeMemory, NodeRun, PagedBytes,
     PerProcessor, ROOT_ENTROPY_MATERIAL_BYTES, RandomBytesLimitSetting, RegionShares,
     ReleasedReservation, ReservationLookup, ReservationTracker, ResidencyVmHooks, RootEntropy,
-    RootEntropyHandle, SWAP_BATCH_BYTES, SWAP_TICK, StackFault, StackReserveError, SwapDisabled,
-    SwapEntry, SwapFaultError, SwapFaultIn, SwapHandle, SwapLeafFormat, SwapSpace, SwapStats,
-    SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES,
-    UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, UserPoolChunks,
-    UserResidency, UserTranslation, VaCursor, allocate_user_frame_uninit_on,
-    allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
-    allocate_user_run_zeroed_on, claim_fiber_stack, classify_stack_fault,
-    commit_fiber_stack_reserve, configure_user_memory_owner_processors, current_user_memory_owner,
-    deallocate_user_frame, deallocate_user_frame_on, deallocate_user_run_on, disable_swap,
-    enter_user_memory_owner, fiber_stack_arena_stats, fiber_stack_reserve_commits_on,
-    install_entropy_device, install_fiber_stack_arena, install_fiber_stack_hooks,
-    install_memory_balloon, install_residency_hooks, install_swap, install_swap_hooks,
-    install_user_memory_pool, installed_swap_handle, installed_swap_hooks, kernel_reserve_for,
-    largest_servable_user_bytes, ranges_outside, residency_vm_hooks, seed_root_entropy,
-    swap_vm_hooks, swapped_token, task_arena_bytes_for, user_frame_node, user_heap_stats,
-    user_mapping_kernel_heap_bytes, user_node_stats, validate_range,
+    RootEntropyHandle, SWAP_BATCH_BYTES, SWAP_TICK, SharedPageObject, StackFault,
+    StackReserveError, SwapDisabled, SwapEntry, SwapFaultError, SwapFaultIn, SwapHandle,
+    SwapLeafFormat, SwapSpace, SwapStats, SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES,
+    USER_POOL_MIN_REGION_BYTES, UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners,
+    UserMemoryPool, UserPoolChunks, UserResidency, UserTranslation, VaCursor, WeakSharedPageObject,
+    allocate_user_frame_uninit_on, allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed,
+    allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, claim_fiber_stack,
+    classify_stack_fault, commit_fiber_stack_reserve, configure_user_memory_owner_processors,
+    current_user_memory_owner, deallocate_user_frame, deallocate_user_frame_on,
+    deallocate_user_run_on, disable_swap, enter_user_memory_owner, fiber_stack_arena_stats,
+    fiber_stack_reserve_commits_on, install_entropy_device, install_fiber_stack_arena,
+    install_fiber_stack_hooks, install_memory_balloon, install_residency_hooks, install_swap,
+    install_swap_hooks, install_user_memory_pool, installed_swap_handle, installed_swap_hooks,
+    kernel_reserve_for, largest_servable_user_bytes, ranges_outside, residency_vm_hooks,
+    seed_root_entropy, swap_vm_hooks, swapped_token, task_arena_bytes_for, user_frame_node,
+    user_heap_stats, user_mapping_kernel_heap_bytes, user_node_stats, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -326,6 +327,12 @@ pub use vfs::{
     ROOT_LAYER_DEVICE, ReaderError, Resolved, RootFs, RootWrite, SharedOwner, Storage,
     UnixAttributes, XattrSetMode, object_identity, request_mount, request_unmount, symlink_target,
     within_directory,
+};
+#[cfg(feature = "linux")]
+pub use vfs::{
+    ContainerNetSnapshot, DevFs, FifoKey, FifoRegistry, NetIfSnapshot, NetRouteSnapshot,
+    ProcCaller, ProcFdEntry, ProcFs, ProcLimitEntry, ProcMapEntry, ProcMountEntry,
+    ProcProcessRecord, ProcRegistry, ProcThreadRecord, PtyRegistry, SharedUts, SysFs,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,

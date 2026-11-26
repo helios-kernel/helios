@@ -7,7 +7,9 @@ use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 use alloc::boxed::Box;
 use arm_gic::IntId;
@@ -241,23 +243,19 @@ mod host_fs;
 #[cfg(feature = "hv")]
 pub mod hv;
 mod input;
+mod iommu;
 mod isolation;
 mod lifecycle;
 #[cfg(feature = "native-users")]
 mod native;
 mod net;
+mod pci;
 mod platform;
 mod rtc;
 mod snd;
 mod tagging;
 mod tpm;
 mod vsock;
-
-pub(crate) type Aarch64DmaPool = helios_virtio::OffsetDmaPool<tagging::Aarch64AllocationTags>;
-
-pub(crate) fn dma_pool() -> Aarch64DmaPool {
-    tagging::dma_pool()
-}
 
 mod debug_state {
     /// The network service this machine's virtio-net device backs.
@@ -483,6 +481,10 @@ struct Aarch64PlatformState {
     /// platform describes one.
     psci: Option<lifecycle::Psci>,
     timebase: Timebase,
+    /// Monotonic tick offset added to `CNTVCT_EL0` so [`Cpu::now`] continues
+    /// strictly forward across hibernate/resume and [`Cpu::set_deadline`]
+    /// translates deadlines back into hardware counter ticks.
+    timebase_offset: AtomicU64,
     physical_memory_offset: usize,
     /// Control-flow integrity capabilities probed on the bootstrap processor
     /// before any other starts and never written again (`cfi`).
@@ -548,6 +550,7 @@ impl Aarch64PlatformState {
             processors,
             psci: psci.map(lifecycle::Psci::new),
             timebase,
+            timebase_offset: AtomicU64::new(0),
             physical_memory_offset,
             control_flow_integrity: cfi::bootstrap_capability(),
             instruction_key: cfi::SharedInstructionKey::new(),
@@ -884,34 +887,30 @@ extern "C" fn aarch64_kernel_main() -> ! {
         read_counter,
         Some(DEBUG_SERIAL_WRITER),
     );
+    let pci = platform.pci.map(pci::PciRoot::new);
+    let pci_virtio = pci.as_ref().map(pci::PciRoot::virtio_functions);
+    let iommu_topology = platform.iommu;
+
     let mut devices = DeviceInventory::new().with_debug_serial();
-    if host_fs::has_9p_device(&platform) {
+    if host_fs::has_9p_device(&platform, pci_virtio.as_ref()) {
         devices = devices.with_host_share();
     }
-    if net::has_network_device(&platform) {
+    if net::has_network_device(&platform, pci_virtio.as_ref()) {
         devices = devices.with_network();
     }
-    if entropy::has_entropy_device(&platform) {
+    if entropy::has_entropy_device(&platform, pci_virtio.as_ref()) {
         devices = devices.with_entropy_device();
     }
-    if balloon::has_balloon_device(&platform) {
+    if balloon::has_balloon_device(&platform, pci_virtio.as_ref()) {
         devices = devices.with_memory_balloon();
     }
-    if vsock::has_vsock_device(&platform) {
+    if vsock::has_vsock_device(&platform, pci_virtio.as_ref()) {
         devices = devices.with_vsock();
     }
-    if !gpu::has_display_device(&platform) {
-        tracing::info!("no virtio-gpu node on the platform bus; this machine has no display");
-    }
-    if input::count_input_devices(&platform) == 0 {
-        tracing::info!(
-            "no virtio-input node on the platform bus; this machine has no input device"
-        );
-    }
-    if !snd::has_sound_device(&platform) {
-        tracing::info!("no virtio-snd node on the platform bus; this machine has no sound device");
-    }
-    let block_device_count = block::count_block_devices(&platform);
+    let has_display = gpu::has_display_device(&platform, pci_virtio.as_ref());
+    let input_count = input::count_input_devices(&platform, pci_virtio.as_ref());
+    let has_sound = snd::has_sound_device(&platform, pci_virtio.as_ref());
+    let block_device_count = block::count_block_devices(&platform, pci_virtio.as_ref());
     if block_device_count != 0 {
         devices = devices.with_block_devices(block_device_count);
     }
@@ -935,11 +934,24 @@ extern "C" fn aarch64_kernel_main() -> ! {
                 .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
             )
             .with_timer_frequency_hz(cpu.timebase().frequency())
-            .with_dma_model(DmaModel::Translated)
+            .with_dma_model(if iommu_topology.is_some() {
+                DmaModel::Iommu
+            } else {
+                DmaModel::Translated
+            })
             .with_devices(devices)
             .with_measured_boot(measured_boot)
             .with_boot_memory(boot_memory),
     );
+    if !has_display {
+        tracing::info!("no virtio-gpu device discovered; this machine has no display");
+    }
+    if input_count == 0 {
+        tracing::info!("no virtio-input device discovered; this machine has no input device");
+    }
+    if !has_sound {
+        tracing::info!("no virtio-snd device discovered; this machine has no sound device");
+    }
     if measured_boot_discovery.is_refusal() {
         tracing::warn!("{measured_boot_discovery}");
     } else {
@@ -954,13 +966,45 @@ extern "C" fn aarch64_kernel_main() -> ! {
         platform.virtio.len(),
         platform.rtc.is_some(),
     );
-    // The entropy device comes up before the root DRBG is seeded,
-    // because on this platform it can be the only source there is: an
-    // ACPI-described machine has no `/chosen/rng-seed`, and a processor
-    // without `FEAT_RNG` has no `RNDR`. Its interrupt is routed later,
-    // with every other device's; the bring-up read polls the used ring
-    // and needs none.
-    let entropy_device = entropy::bring_up(&platform, physical_memory_offset, &handoff);
+    // Confine every virtio-PCI function in its own domain before any driver
+    // (including PCI virtio-rng) touches its queues.
+    let mut confinement = match (pci.as_ref(), pci_virtio.as_ref(), iommu_topology) {
+        (Some(pci), Some(pci_virtio), Some(topology)) => {
+            let confined = pci_virtio.addresses();
+            let confinement =
+                iommu::confine_devices(pci, topology, physical_memory_offset, &confined);
+            let report = confinement.report();
+            debug_state.install_iommu_report(report.clone());
+            kernel.spawn_detached(iommu::watch_faults(
+                confinement.device(),
+                report,
+                kernel.timer(),
+            ));
+            Some(confinement)
+        }
+        _ => {
+            tracing::info!(
+                "no virtio-iommu in the {} topology; device DMA reaches physical memory directly",
+                platform.source
+            );
+            None
+        }
+    };
+    let mut dma_arenas = iommu::Aarch64DmaArenas::new(helios_kernel::UserPoolChunks::new(pool));
+    // The entropy device comes up after IOMMU confinement (so a PCI
+    // virtio-rng is never touched unconfined) and before the root DRBG is
+    // seeded (so an ACPI-described machine without `FEAT_RNG` still seeds
+    // from hardware entropy).
+    let entropy_device = entropy::bring_up(
+        &platform,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
+        physical_memory_offset,
+        &handoff,
+        cpu.processor_count(),
+    );
     // The root DRBG is seeded before any component can ask for random
     // bytes: `RNDR` where the processor implements it, whatever seed
     // the bootloader left behind, and a read of the entropy device.
@@ -1056,16 +1100,22 @@ extern "C" fn aarch64_kernel_main() -> ! {
 
     let mut hibernate_devices =
         hibernate::Aarch64HibernateDevices::new(cpu, debug_state.machine_generation_handle());
+    hibernate_devices.iommu = confinement.as_ref().map(iommu::Confinement::device);
     let mut routes = DeviceInterruptRoutes::new();
-    // The console UART is a device the kernel drives itself: its SPI is
-    // routed to the bootstrap processor and enabled exactly like the
-    // virtio transports'. The handler masks the receive line at the port
-    // and raises the debug console's receive signal; the waiter re-arms
-    // the line while it listens.
-    gic.enable_device_interrupt(
+    // Shared PCI INTx lines bind multiple virtio functions to the same
+    // GICv3 SPI; track enabled SPIs so each is configured once before being
+    // enabled in GICD_ICFGR/GICD_ISENABLER.
+    let mut enabled_spis = alloc::vec::Vec::new();
+    let bootstrap_mpidr = platform_state.bootstrap_mpidr();
+    let mut enable_spi = |intid: IntId, trigger: arm_gic::Trigger| {
+        if !enabled_spis.contains(&intid) {
+            gic.enable_device_interrupt(intid, trigger, bootstrap_mpidr);
+            enabled_spis.push(intid);
+        }
+    };
+    enable_spi(
         platform.console.interrupt.intid(),
         platform.console.interrupt.trigger,
-        platform_state.bootstrap_mpidr(),
     );
     routes.set_debug_serial(
         platform.console.interrupt.intid(),
@@ -1074,57 +1124,54 @@ extern "C" fn aarch64_kernel_main() -> ! {
     if let Some(host_fs) = host_fs::install(
         &cpu,
         &platform,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
         physical_memory_offset,
         &handoff,
         &debug_state,
     ) {
         hibernate_devices.host_fs = Some(host_fs.transport.clone());
-        gic.enable_device_interrupt(
-            host_fs.interrupt,
-            host_fs.trigger,
-            platform_state.bootstrap_mpidr(),
-        );
+        enable_spi(host_fs.interrupt, host_fs.trigger);
         routes.set_host_fs(host_fs.interrupt, host_fs.transport);
     }
     if let Some(network) = net::install(
         &cpu,
         &kernel,
         &platform,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
         physical_memory_offset,
         &handoff,
         &debug_state,
     ) {
         hibernate_devices.network = Some(network.device.device().clone());
-        gic.enable_device_interrupt(
-            network.interrupt,
-            network.trigger,
-            platform_state.bootstrap_mpidr(),
-        );
+        enable_spi(network.interrupt, network.trigger);
         routes.add_network(network.interrupt, network.device);
     }
     if let Some(entropy) = entropy_device {
         hibernate_devices.entropy = Some(entropy.device.device().clone());
         entropy::install(&kernel, &entropy, root_entropy.clone());
-        gic.enable_device_interrupt(
-            entropy.interrupt,
-            entropy.trigger,
-            platform_state.bootstrap_mpidr(),
-        );
+        enable_spi(entropy.interrupt, entropy.trigger);
         routes.set_entropy(entropy.interrupt, entropy.device);
     }
     if let Some(balloon) = balloon::install(
+        &cpu,
         &kernel,
         &platform,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
         physical_memory_offset,
         &handoff,
         debug_state.machine_generation_handle(),
     ) {
         hibernate_devices.balloon = Some(balloon.handler.device().clone());
-        gic.enable_device_interrupt(
-            balloon.interrupt,
-            balloon.trigger,
-            platform_state.bootstrap_mpidr(),
-        );
+        enable_spi(balloon.interrupt, balloon.trigger);
         debug_state.install_memory_balloon(balloon.handle);
         routes.set_balloon(balloon.interrupt, balloon.handler);
     }
@@ -1132,37 +1179,42 @@ extern "C" fn aarch64_kernel_main() -> ! {
         &kernel,
         &cpu,
         &platform,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
         physical_memory_offset,
         &handoff,
         &debug_state,
     ) {
         hibernate_devices.vsock = Some(vsock.device.device().clone());
-        gic.enable_device_interrupt(
-            vsock.interrupt,
-            vsock.trigger,
-            platform_state.bootstrap_mpidr(),
-        );
+        enable_spi(vsock.interrupt, vsock.trigger);
         routes.set_vsock(vsock.interrupt, vsock.device);
     }
     if let Some(display) = gpu::install(
         &cpu,
         &kernel,
         &platform,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
         physical_memory_offset,
         &handoff,
         &debug_state,
     ) {
         hibernate_devices.display = Some(display.device.device().clone());
-        gic.enable_device_interrupt(
-            display.interrupt,
-            display.trigger,
-            platform_state.bootstrap_mpidr(),
-        );
+        enable_spi(display.interrupt, display.trigger);
         routes.set_display(display.interrupt, display.device);
     }
     for device in input::install(
+        &cpu,
         &kernel,
         &platform,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
         physical_memory_offset,
         &handoff,
         &debug_state,
@@ -1170,45 +1222,46 @@ extern "C" fn aarch64_kernel_main() -> ! {
         hibernate_devices
             .inputs
             .push(device.device.device().clone());
-        gic.enable_device_interrupt(
-            device.interrupt,
-            device.trigger,
-            platform_state.bootstrap_mpidr(),
-        );
+        enable_spi(device.interrupt, device.trigger);
         routes.add_input(device.interrupt, device.device);
     }
     if let Some(sound) = snd::install(
+        &cpu,
         &kernel,
         &platform,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
         physical_memory_offset,
         &handoff,
         &debug_state,
     ) {
         hibernate_devices.sound = Some(sound.device.device().clone());
-        gic.enable_device_interrupt(
-            sound.interrupt,
-            sound.trigger,
-            platform_state.bootstrap_mpidr(),
-        );
+        enable_spi(sound.interrupt, sound.trigger);
         routes.set_sound(sound.interrupt, sound.device);
     }
     for block in block::install(
         &cpu,
         &kernel,
         &platform,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
         physical_memory_offset,
         &handoff,
         &debug_state,
         root_entropy.clone(),
     ) {
         hibernate_devices.blocks.push(block.device.device().clone());
-        gic.enable_device_interrupt(
-            block.interrupt,
-            block.trigger,
-            platform_state.bootstrap_mpidr(),
-        );
+        enable_spi(block.interrupt, block.trigger);
         routes.add_block(block.interrupt, block.device);
     }
+    kernel.spawn_detached(helios_kernel::maintain_dma_arenas(
+        dma_arenas,
+        kernel.timer(),
+    ));
 
     // Early-boot hibernate resume probe: runs with IRQs still masked, BEFORE
     // starting secondary processors, enabling swap/init, or unmasking IRQs.
@@ -1468,7 +1521,16 @@ impl Cpu for Aarch64Cpu {
     }
 
     fn now(&self) -> Instant {
-        Instant::new(read_counter())
+        let offset = self.state.timebase_offset.load(Ordering::Acquire);
+        Instant::new(read_counter().saturating_add(offset))
+    }
+
+    fn continue_timebase(&self, floor: Instant) {
+        let raw = read_counter();
+        let new_offset = floor.ticks().saturating_add(1).saturating_sub(raw);
+        self.state
+            .timebase_offset
+            .store(new_offset, Ordering::Release);
     }
 
     fn timebase(&self) -> Timebase {
@@ -1484,10 +1546,12 @@ impl Cpu for Aarch64Cpu {
     }
 
     fn set_deadline(&self, deadline: Instant) {
+        let offset = self.state.timebase_offset.load(Ordering::Acquire);
+        let raw_deadline = deadline.ticks().saturating_sub(offset);
         // SAFETY: writing `CNTV_CVAL_EL0` programs only this processor's
         // virtual timer comparator.
         unsafe {
-            asm!("msr cntv_cval_el0, {deadline}", deadline = in(reg) deadline.ticks(), options(nomem, nostack, preserves_flags));
+            asm!("msr cntv_cval_el0, {deadline}", deadline = in(reg) raw_deadline, options(nomem, nostack, preserves_flags));
         }
         // SAFETY: writing `1` to `CNTV_CTL_EL0` enables and unmasks this
         // processor's virtual timer.

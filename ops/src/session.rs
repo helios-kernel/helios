@@ -4,9 +4,9 @@ use std::future::Future;
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use helios_wit_rpc::RpcError;
+use helios_inspector_protocol::auth::ClientIdentity;
 use helios_wit_rpc::inspector::helios::system::{
     component_control::{self as rpc_cc, ComponentStatus},
     inspect::{self as rpc_inspect, Query, SnapshotResult},
@@ -18,10 +18,11 @@ use helios_wit_rpc::inspector::helios::system::{
         MetricFilter, MetricSample,
     },
     programs::{
-        self as rpc_programs, AuthorityScope, CapabilityGrant, ClockGrant, ClockRight, DeviceClass,
-        DeviceGrant, DiagnosticsGrant, DirectoryGrant, ExecRequest, ExecResult, FilesystemRight,
-        LinkGrant, LinkRight, MachineGrant, MachineRight, MountGrant, MountRight, NetworkGrant,
-        NetworkRight, ProcessGrant, ProcessRight, SettingsGrant, SettingsRight, TerminalGrant,
+        self as rpc_programs, AuthorityScope, CapabilityGrant, ChildTermination, ClockGrant,
+        ClockRight, DeviceClass, DeviceGrant, DiagnosticsGrant, DirectoryGrant, ExecOutput,
+        ExecRequest, ExecResult, FilesystemRight, LinkGrant, LinkRight, MachineGrant, MachineRight,
+        MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight,
+        SettingsGrant, SettingsRight, SpawnRequest as WireSpawnRequest, TerminalGrant,
         TerminalRight,
     },
     snapshot::{self as rpc_snapshot, SnapshotHold as RemoteSnapshotHold},
@@ -29,6 +30,7 @@ use helios_wit_rpc::inspector::helios::system::{
 };
 use helios_wit_rpc::inspector_fs::{self, EntryKind, MountBtrfsRequest};
 use helios_wit_rpc::inspector_snapshot::KernelSnapshot;
+use helios_wit_rpc::{RpcError, StreamReader};
 
 use crate::error::OpsError;
 use crate::target::{
@@ -59,6 +61,44 @@ impl Default for SessionOptions {
             identity: None,
             security: SecurityMode::Plain,
         }
+    }
+}
+
+impl SessionOptions {
+    /// Resolve identity profile and [`SecurityMode`] from an explicit identity
+    /// name/path, an optional `"default"` identity profile, or
+    /// `HELIOS_INSPECTOR_CLIENT_KEY` when `allow_ambient_auth` is `true`.
+    pub fn resolve_security(
+        identity_arg: Option<&str>,
+        allow_ambient_auth: bool,
+    ) -> Result<(Option<IdentityProfile>, SecurityMode), OpsError> {
+        let identity = match identity_arg {
+            Some(name_or_path) => Some(IdentityProfile::load(name_or_path)?),
+            None if allow_ambient_auth => IdentityProfile::load("default").ok(),
+            None => None,
+        };
+        let security =
+            if let Some(profile) = identity.as_ref().filter(|p| p.secret_key_hex.is_some()) {
+                profile.to_security_mode()?
+            } else if (identity_arg.is_some() || allow_ambient_auth)
+                && let Ok(key_path) = std::env::var("HELIOS_INSPECTOR_CLIENT_KEY")
+                && !key_path.trim().is_empty()
+            {
+                let client_identity = ClientIdentity::from_seed_file(Path::new(key_path.trim()))
+                    .map_err(|err| {
+                        OpsError::Auth(crate::error::AuthError::InvalidIdentity {
+                            name: key_path,
+                            detail: err.to_string(),
+                        })
+                    })?;
+                SecurityMode::Authenticated {
+                    identity: Box::new(client_identity),
+                    expected_machine_public_key: None,
+                }
+            } else {
+                SecurityMode::Plain
+            };
+        Ok((identity, security))
     }
 }
 
@@ -343,6 +383,17 @@ pub fn parse_grant_spec(
                 rights: vec![SettingsRight::Write],
             }))
         }
+        "virtualize" => {
+            if !target.is_empty() && !target.eq_ignore_ascii_case("virtualize") {
+                return Err(invalid("expected `virtualize`"));
+            }
+            if mode.is_some() {
+                return Err(invalid("`virtualize` grant takes no mode"));
+            }
+            Ok(CapabilityGrant::Machine(MachineGrant {
+                rights: vec![MachineRight::Virtualize],
+            }))
+        }
         "machine" => {
             let tokens = if target.is_empty() || target.eq_ignore_ascii_case("all") {
                 vec!["control", "identity", "virtualize"]
@@ -393,16 +444,140 @@ fn parse_authority_scope(raw: &str, spec: &str) -> Result<AuthorityScope, OpsErr
     }
 }
 
+/// Parse a POSIX signal name or number (`1..=64`) into its kernel signal number.
+pub fn parse_posix_signal(raw: &str) -> Result<u8, OpsError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(OpsError::InvalidSignal {
+            signal: raw.to_owned(),
+        });
+    }
+    if let Ok(num) = trimmed.parse::<u8>() {
+        if (1..=64).contains(&num) {
+            return Ok(num);
+        }
+        return Err(OpsError::InvalidSignal {
+            signal: raw.to_owned(),
+        });
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    let short = upper.strip_prefix("SIG").unwrap_or(&upper);
+    let num = match short {
+        "HUP" => 1,
+        "INT" => 2,
+        "QUIT" => 3,
+        "ILL" => 4,
+        "TRAP" => 5,
+        "ABRT" | "IOT" => 6,
+        "BUS" => 7,
+        "FPE" => 8,
+        "KILL" => 9,
+        "USR1" => 10,
+        "SEGV" => 11,
+        "USR2" => 12,
+        "PIPE" => 13,
+        "ALRM" => 14,
+        "TERM" => 15,
+        "STKFLT" => 16,
+        "CHLD" | "CLD" => 17,
+        "CONT" => 18,
+        "STOP" => 19,
+        "TSTP" => 20,
+        "TTIN" => 21,
+        "TTOU" => 22,
+        "URG" => 23,
+        "XCPU" => 24,
+        "XFSZ" => 25,
+        "VTALRM" => 26,
+        "PROF" => 27,
+        "WINCH" => 28,
+        "IO" | "POLL" => 29,
+        "PWR" => 30,
+        "SYS" => 31,
+        _ => {
+            return Err(OpsError::InvalidSignal {
+                signal: raw.to_owned(),
+            });
+        }
+    };
+    Ok(num)
+}
+
 /// Streaming handle to a remotely spawned program.
 pub struct Child {
     session: Session,
+    remote_child: rpc_programs::Child,
     instance_id: Arc<AtomicU64>,
     pub stdout: async_channel::Receiver<Result<Vec<u8>, OpsError>>,
     pub stderr: async_channel::Receiver<Result<Vec<u8>, OpsError>>,
-    completion: async_channel::Receiver<Result<ExecResult, OpsError>>,
+    stdin_task: Option<tokio::task::JoinHandle<()>>,
+    started_at: Instant,
 }
 
 impl Child {
+    pub(crate) async fn from_remote(
+        session: Session,
+        remote_child: rpc_programs::Child,
+        stdin_bytes: Vec<u8>,
+    ) -> Result<Self, OpsError> {
+        let started_at = Instant::now();
+        let id = session
+            .call(
+                "system.programs.child.instance-id",
+                remote_child.instance_id(),
+            )
+            .await?;
+        let instance_id = Arc::new(AtomicU64::new(id));
+
+        let (stdout_stream, stdout_done) = session
+            .call("system.programs.child.stdout", remote_child.stdout())
+            .await?;
+        let (stderr_stream, stderr_done) = session
+            .call("system.programs.child.stderr", remote_child.stderr())
+            .await?;
+
+        let (stdout_tx, stdout_rx) = async_channel::bounded(16);
+        let (stderr_tx, stderr_rx) = async_channel::bounded(16);
+
+        spawn_stream_pump(
+            "system.programs.child.stdout",
+            stdout_stream,
+            stdout_done,
+            stdout_tx,
+        );
+        spawn_stream_pump(
+            "system.programs.child.stderr",
+            stderr_stream,
+            stderr_done,
+            stderr_tx,
+        );
+
+        let stdin_reader = if stdin_bytes.is_empty() {
+            StreamReader::empty()
+        } else {
+            StreamReader::from_vec(stdin_bytes)
+        };
+        let stdin_done = session
+            .call(
+                "system.programs.child.stdin",
+                remote_child.stdin(stdin_reader),
+            )
+            .await?;
+        let stdin_task = Some(tokio::spawn(async move {
+            let _ = stdin_done.await;
+        }));
+
+        Ok(Self {
+            session,
+            remote_child,
+            instance_id,
+            stdout: stdout_rx,
+            stderr: stderr_rx,
+            stdin_task,
+            started_at,
+        })
+    }
+
     /// Live instance ID if reported by the guest.
     #[must_use]
     pub fn instance_id(&self) -> Option<u64> {
@@ -410,23 +585,89 @@ impl Child {
         (id != 0).then_some(id)
     }
 
-    /// Deliver a termination/signal request to this child instance.
-    pub async fn signal(&self, _signal: &str) -> Result<(), OpsError> {
-        if let Some(id) = self.instance_id() {
-            self.session.kill(id).await?;
+    /// Deliver a POSIX signal (`SIGINT`/`INT`/`2`, `SIGTERM`/`TERM`/`15`,
+    /// `SIGKILL`/`KILL`/`9`, etc.) to this live child instance.
+    pub async fn signal(&self, signal: &str) -> Result<(), OpsError> {
+        let sig_num = parse_posix_signal(signal)?;
+        match self
+            .session
+            .call(
+                "system.programs.child.signal",
+                self.remote_child.signal(sig_num),
+            )
+            .await?
+        {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                if sig_num == 9
+                    && let Some(id) = self.instance_id()
+                    && self
+                        .session
+                        .options()
+                        .attenuation
+                        .allows(GrantRight::InstanceControl)
+                    && self.session.kill(id).await.is_ok()
+                {
+                    return Ok(());
+                }
+                Err(OpsError::from(err))
+            }
         }
-        Ok(())
     }
 
-    /// Await completion of the remote execution and return its full [`ExecResult`].
-    pub async fn wait(self) -> Result<ExecResult, OpsError> {
-        self.completion
-            .recv()
-            .await
-            .map_err(|_| OpsError::TimedOut {
-                operation: "child completion",
-            })?
+    /// Await completion of the remote execution and return its [`ExecResult`].
+    pub async fn wait(mut self) -> Result<ExecResult, OpsError> {
+        let status = self
+            .session
+            .call("system.programs.child.wait", self.remote_child.wait())
+            .await?
+            .map_err(OpsError::from)?;
+        if let Some(task) = self.stdin_task.take() {
+            let _ = task.await;
+        }
+        self.instance_id
+            .store(status.instance_id, Ordering::Release);
+        let exit_code = match status.termination {
+            ChildTermination::Exited(code) => code,
+            ChildTermination::Signaled(sig) => 128 + u32::from(sig.signal),
+            ChildTermination::Trapped => 134,
+            ChildTermination::Killed => 137,
+        };
+        Ok(ExecResult {
+            instance_id: status.instance_id,
+            exit_code,
+            output: ExecOutput {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+            launch_nanos: u64::try_from(self.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        })
     }
+}
+
+fn spawn_stream_pump(
+    operation: &'static str,
+    mut stream: StreamReader<u8>,
+    done: helios_wit_rpc::FutureReader<Result<(), ()>>,
+    tx: async_channel::Sender<Result<Vec<u8>, OpsError>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match stream.next_batch().await {
+                Ok(Some(chunk)) => {
+                    if !chunk.is_empty() && tx.send(Ok(chunk)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(source) => {
+                    let _ = tx.send(Err(OpsError::Rpc { operation, source })).await;
+                    break;
+                }
+            }
+        }
+        let _ = done.await;
+    });
 }
 
 /// Snapshot readiness flags reported by `helios:system/snapshot.snapshot-hold`.
@@ -550,7 +791,7 @@ impl Session {
         format!("local@{}", self.target.name)
     }
 
-    fn require_right(&self, right: GrantRight) -> Result<(), OpsError> {
+    pub(crate) fn require_right(&self, right: GrantRight) -> Result<(), OpsError> {
         if self.options.attenuation.allows(right) {
             Ok(())
         } else {
@@ -561,7 +802,7 @@ impl Session {
         }
     }
 
-    async fn call<T>(
+    pub(crate) async fn call<T>(
         &self,
         operation: &'static str,
         fut: impl Future<Output = Result<T, RpcError>>,
@@ -1008,54 +1249,28 @@ impl Session {
         Ok(store.get(&self.whoami())?.cloned())
     }
 
-    /// Spawn a remote program and expose async stdout, stderr, signal, and wait handles.
+    /// Spawn a remote program via `helios:system/programs.spawn` and expose live
+    /// async stdout, stderr, signal, and wait handles.
     pub async fn spawn(&self, request: SpawnRequest) -> Result<Child, OpsError> {
         self.require_right(GrantRight::Exec)?;
         let path = normalize_absolute_path(&request.path)?;
-        let (stdout_tx, stdout_rx) = async_channel::bounded(16);
-        let (stderr_tx, stderr_rx) = async_channel::bounded(16);
-        let (done_tx, done_rx) = async_channel::bounded(1);
-        let instance_id = Arc::new(AtomicU64::new(0));
-
-        let session = self.clone();
-        let instance_slot = Arc::clone(&instance_id);
-        tokio::spawn(async move {
-            let req = ExecRequest {
-                name: path.clone(),
-                args: request.args,
-                env: request.env,
-                path,
-                cwd: request.cwd,
-                stdin: request.stdin,
-                hint: None,
-                capability_grants: request.capability_grants,
-            };
-            let outcome = session.exec_request(req).await;
-
-            match outcome {
-                Ok(res) => {
-                    instance_slot.store(res.instance_id, Ordering::Release);
-                    if !res.output.stdout.is_empty() {
-                        let _ = stdout_tx.send(Ok(res.output.stdout.clone())).await;
-                    }
-                    if !res.output.stderr.is_empty() {
-                        let _ = stderr_tx.send(Ok(res.output.stderr.clone())).await;
-                    }
-                    let _ = done_tx.send(Ok(res)).await;
-                }
-                Err(err) => {
-                    let _ = done_tx.send(Err(err)).await;
-                }
-            }
-        });
-
-        Ok(Child {
-            session: self.clone(),
-            instance_id,
-            stdout: stdout_rx,
-            stderr: stderr_rx,
-            completion: done_rx,
-        })
+        let client = rpc_programs::RpcClient::new(self.connection.client().clone());
+        let remote_child = self
+            .call(
+                "system.programs.spawn",
+                client.spawn(WireSpawnRequest {
+                    name: path.clone(),
+                    args: request.args,
+                    env: request.env,
+                    path,
+                    cwd: request.cwd,
+                    sockets: Vec::new(),
+                    capability_grants: request.capability_grants,
+                }),
+            )
+            .await?
+            .map_err(OpsError::from)?;
+        Child::from_remote(self.clone(), remote_child, request.stdin).await
     }
 
     /// Prepare the guest for a VMM snapshot and return an RAII [`SnapshotHold`].
@@ -1543,5 +1758,291 @@ mod tests {
             parse_capability_grant("dir:/tmp:badmode"),
             Err(OpsError::InvalidGrant { .. })
         ));
+        assert!(matches!(
+            parse_capability_grant("virtualize").expect("virtualize"),
+            CapabilityGrant::Machine(MachineGrant { ref rights })
+                if rights.contains(&MachineRight::Virtualize)
+        ));
+        assert!(matches!(
+            parse_capability_grant("machine:virtualize").expect("machine:virtualize"),
+            CapabilityGrant::Machine(MachineGrant { ref rights })
+                if rights.contains(&MachineRight::Virtualize)
+        ));
+    }
+
+    #[test]
+    fn parse_posix_signal_handles_names_and_numbers() {
+        assert_eq!(parse_posix_signal("SIGINT").expect("SIGINT"), 2);
+        assert_eq!(parse_posix_signal("int").expect("int"), 2);
+        assert_eq!(parse_posix_signal("2").expect("2"), 2);
+        assert_eq!(parse_posix_signal("SIGTERM").expect("SIGTERM"), 15);
+        assert_eq!(parse_posix_signal("term").expect("term"), 15);
+        assert_eq!(parse_posix_signal("SIGKILL").expect("SIGKILL"), 9);
+        assert_eq!(parse_posix_signal("SIGHUP").expect("SIGHUP"), 1);
+        assert_eq!(parse_posix_signal("SIGQUIT").expect("SIGQUIT"), 3);
+        assert_eq!(parse_posix_signal("SIGUSR1").expect("SIGUSR1"), 10);
+        assert_eq!(parse_posix_signal("SIGUSR2").expect("SIGUSR2"), 12);
+        assert_eq!(parse_posix_signal("64").expect("64"), 64);
+        assert!(matches!(
+            parse_posix_signal("SIGBOGUS"),
+            Err(OpsError::InvalidSignal { .. })
+        ));
+        assert!(matches!(
+            parse_posix_signal("0"),
+            Err(OpsError::InvalidSignal { .. })
+        ));
+        assert!(matches!(
+            parse_posix_signal("65"),
+            Err(OpsError::InvalidSignal { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn plain_tcp_uri_rejects_authenticated_security_mode() {
+        let client_identity =
+            helios_inspector_protocol::auth::ClientIdentity::from_static_seed([0x55; 32]);
+        let uri = TargetUri::parse("tcp://127.0.0.1:9443").expect("parse tcp");
+        let err = RpcConnection::connect(
+            &uri,
+            &SecurityMode::Authenticated {
+                identity: Box::new(client_identity),
+                expected_machine_public_key: None,
+            },
+        )
+        .await
+        .err()
+        .expect("tcp:// must refuse Authenticated mode");
+        assert!(matches!(
+            err,
+            crate::error::TransportError::PlainTcpAuthUnsupported { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_spawn_streams_stdio_populates_id_and_delivers_signal() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        use helios_wit_rpc::inspector::helios::system::programs::{
+            AotRequest, AotResult, ChildTermination, ContainerConfig, ContainerExecRequest,
+            ContainerSpawnRequest, DefaultLinuxImage, ExecError, ExecOutput, ExecRequest,
+            ExecResult, ExitStatus, InheritedSocket, SpawnError, SpawnRequest as WireSpawnRequest,
+        };
+        use helios_wit_rpc::{Endpoint, FutureReader, StreamReader};
+
+        struct FakeChild {
+            id: u64,
+            stdin_len: Arc<AtomicU8>,
+            last_signal: Arc<AtomicU8>,
+        }
+
+        struct FakePrograms {
+            last_signal: Arc<AtomicU8>,
+            stdin_len: Arc<AtomicU8>,
+        }
+
+        impl rpc_programs::RpcHandler for FakePrograms {
+            type Child = FakeChild;
+            type Container = ();
+            type Endpoint = ();
+            type TcpListener = ();
+            type TcpStream = ();
+            type SerialPort = ();
+            type VsockListener = ();
+            type VsockStream = ();
+
+            async fn child_stdin(
+                &self,
+                self_: &Self::Child,
+                data: StreamReader<u8>,
+            ) -> FutureReader<Result<(), ()>> {
+                let bytes = data.collect_all().await.unwrap_or_default();
+                self_.stdin_len.store(bytes.len() as u8, Ordering::Release);
+                FutureReader::ready(Ok(()))
+            }
+
+            async fn child_stdout(
+                &self,
+                _self_: &Self::Child,
+            ) -> (StreamReader<u8>, FutureReader<Result<(), ()>>) {
+                (
+                    StreamReader::from_vec(b"live-stdout".to_vec()),
+                    FutureReader::ready(Ok(())),
+                )
+            }
+
+            async fn child_stderr(
+                &self,
+                _self_: &Self::Child,
+            ) -> (StreamReader<u8>, FutureReader<Result<(), ()>>) {
+                (
+                    StreamReader::from_vec(b"live-stderr".to_vec()),
+                    FutureReader::ready(Ok(())),
+                )
+            }
+
+            async fn child_instance_id(&self, self_: &Self::Child) -> u64 {
+                self_.id
+            }
+
+            async fn child_signal(
+                &self,
+                self_: &Self::Child,
+                signal: u8,
+            ) -> Result<(), SpawnError> {
+                self_.last_signal.store(signal, Ordering::Release);
+                Ok(())
+            }
+
+            async fn child_wait(&self, self_: &Self::Child) -> Result<ExitStatus, SpawnError> {
+                Ok(ExitStatus {
+                    instance_id: self_.id,
+                    termination: ChildTermination::Exited(0),
+                })
+            }
+
+            async fn container_spawn(
+                &self,
+                _self_: &Self::Container,
+                _request: ContainerSpawnRequest<
+                    Self::TcpListener,
+                    Self::VsockListener,
+                    Self::TcpStream,
+                    Self::VsockStream,
+                    Self::SerialPort,
+                >,
+            ) -> Result<Self::Child, SpawnError> {
+                unreachable!()
+            }
+
+            async fn container_exec(
+                &self,
+                _self_: &Self::Container,
+                _request: ContainerExecRequest,
+            ) -> Result<ExecResult, ExecError> {
+                unreachable!()
+            }
+
+            async fn set_default_image(
+                &self,
+                _image: Option<DefaultLinuxImage>,
+            ) -> Result<(), SpawnError> {
+                Ok(())
+            }
+
+            async fn get_default_image(&self) -> Option<DefaultLinuxImage> {
+                None
+            }
+
+            async fn take_inherited_sockets(
+                &self,
+            ) -> Vec<
+                InheritedSocket<
+                    Self::TcpListener,
+                    Self::VsockListener,
+                    Self::TcpStream,
+                    Self::VsockStream,
+                    Self::SerialPort,
+                >,
+            > {
+                Vec::new()
+            }
+
+            async fn create_container(
+                &self,
+                _config: ContainerConfig<Self::Endpoint>,
+            ) -> Result<Self::Container, SpawnError> {
+                Ok(())
+            }
+
+            async fn spawn(
+                &self,
+                _request: WireSpawnRequest<
+                    Self::TcpListener,
+                    Self::VsockListener,
+                    Self::TcpStream,
+                    Self::VsockStream,
+                    Self::SerialPort,
+                    Self::Endpoint,
+                >,
+            ) -> Result<Self::Child, SpawnError> {
+                Ok(FakeChild {
+                    id: 77,
+                    stdin_len: Arc::clone(&self.stdin_len),
+                    last_signal: Arc::clone(&self.last_signal),
+                })
+            }
+
+            async fn exec(
+                &self,
+                _request: ExecRequest<Self::Endpoint>,
+            ) -> Result<ExecResult, ExecError> {
+                Ok(ExecResult {
+                    instance_id: 1,
+                    exit_code: 0,
+                    output: ExecOutput {
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    },
+                    launch_nanos: 0,
+                })
+            }
+
+            async fn aot(&self, _request: AotRequest) -> Result<AotResult, ExecError> {
+                unreachable!()
+            }
+        }
+
+        let (host, guest) = UnixStream::pair().expect("socket pair");
+        host.set_nonblocking(true).expect("host nonblocking");
+        guest.set_nonblocking(true).expect("guest nonblocking");
+        let host_read = host.try_clone().expect("clone");
+        let guest_read = guest.try_clone().expect("clone");
+        let conn = RpcConnection::from_split(
+            Box::new(Async::new(host_read).expect("async")),
+            Box::new(Async::new(host).expect("async")),
+        );
+        let target = Target::new("spawn-test", "serial:///tmp/spawn.sock").expect("target");
+        let session = Session::from_connection(target, conn, SessionOptions::default());
+
+        let last_signal = Arc::new(AtomicU8::new(0));
+        let stdin_len = Arc::new(AtomicU8::new(0));
+        let ep = Endpoint::new(
+            Async::new(guest_read).expect("async"),
+            Async::new(guest).expect("async"),
+            rpc_programs::RpcServer::new(FakePrograms {
+                last_signal: Arc::clone(&last_signal),
+                stdin_len: Arc::clone(&stdin_len),
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            let _ = ep.drive().await;
+        });
+
+        let mut req = SpawnRequest::new("/bin/demo", vec!["--flag".to_owned()]);
+        req.stdin = b"abcde".to_vec();
+        let child = session.spawn(req).await.expect("spawn");
+        assert_eq!(child.instance_id(), Some(77));
+
+        let mut out = Vec::new();
+        while let Ok(chunk) = child.stdout.recv().await {
+            out.extend_from_slice(&chunk.expect("ok"));
+        }
+        assert_eq!(out, b"live-stdout");
+        let mut err = Vec::new();
+        while let Ok(chunk) = child.stderr.recv().await {
+            err.extend_from_slice(&chunk.expect("ok"));
+        }
+        assert_eq!(err, b"live-stderr");
+
+        child.signal("SIGTERM").await.expect("signal");
+        assert_eq!(last_signal.load(Ordering::Acquire), 15);
+
+        let res = child.wait().await.expect("wait");
+        assert_eq!(res.instance_id, 77);
+        assert_eq!(res.exit_code, 0);
+        assert_eq!(stdin_len.load(Ordering::Acquire), 5);
+
+        server_task.abort();
     }
 }

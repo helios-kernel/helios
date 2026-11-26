@@ -14,8 +14,10 @@
 //! 1. Pre-freeze capacity check rejects an undersized disk **before** freezing
 //!    the machine or reserving user memory.
 //! 2. After freezing, quiescing all devices, and capturing the compressed
-//!    snapshot into reserved user frames, **only** the hibernate disk is
-//!    brought back online (`HibernateStorage::reinitialize_for_write`).
+//!    snapshot into reserved user frames, `virtio-iommu` (when present) is
+//!    brought back online first (`HibernateDeviceController::reinitialize_iommu`)
+//!    and then **only** the hibernate disk is brought back online
+//!    (`HibernateStorage::reinitialize_for_write`).
 //! 3. All compressed chunks and the chunk descriptor table (offsets `>= 4096`)
 //!    are written in sector-aligned batches while petting the hardware watchdog
 //!    between writes.
@@ -31,7 +33,7 @@
 use alloc::vec;
 use core::time::Duration;
 
-use helios_hal::cpu::{BspSnapshotContext, Cpu, ResumeHandoff, SnapshotPoint};
+use helios_hal::cpu::{BspSnapshotContext, Cpu, Instant, ResumeHandoff, SnapshotPoint};
 use helios_hal::fs::{BlockBuffer, BlockDevice};
 use helios_hal::io::IoError;
 use helios_hal::measured_boot::MeasuredBoot;
@@ -202,6 +204,14 @@ pub trait HibernateDeviceController {
     /// Quiesces every platform device while the machine is frozen, draining
     /// in-flight DMA request queues before RAM is snapshotted.
     fn quiesce_all(&mut self) -> Result<(), HibernateDeviceError>;
+
+    /// Reinitializes only the platform `virtio-iommu` (when present) before
+    /// bringing up the hibernate block device to write the snapshot to disk,
+    /// restoring DMA domains and IOVA translations without waking any other
+    /// endpoint device.
+    fn reinitialize_iommu(&mut self) -> Result<(), HibernateDeviceError> {
+        Ok(())
+    }
 
     /// Reinitializes every platform device while the machine is still frozen
     /// (`virtio-iommu` first when present), before thawing.
@@ -520,7 +530,9 @@ where
 /// Applies the ordered post-resume continuation once the restore trampoline
 /// returns into [`SnapshotPoint::Resumed`]:
 ///
-/// 1. Restore BSP architectural processor state (`cpu.restore_bsp_post_resume_state()`).
+/// 1. Restore BSP architectural processor state (`cpu.restore_bsp_post_resume_state()`)
+///    and continue the monotonic timebase above `pre_hibernate_now`
+///    (`cpu.continue_timebase(pre_hibernate_now)`).
 /// 2. Advance [`MachineGeneration`] with `AdvanceCause::ImageRestored`, mix
 ///    `handoff.fresh_entropy` into [`RootEntropy`], and reseed the wall clock
 ///    from `handoff.rtc_unix_nanos`.
@@ -529,8 +541,13 @@ where
 /// 5. Drop reserved frames, restart stopped secondary processors, and thaw
 ///    `frozen`.
 /// 6. Emit the resume diagnostic line naming `image_id` and `generation`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "post-resume continuation takes explicit static-dispatch resume dependencies"
+)]
 fn complete_resume_continuation<CpuImpl, WatchdogImpl, Storage, Devices, ReseedWallClock>(
     cpu: &CpuImpl,
+    pre_hibernate_now: Instant,
     handoff: ResumeHandoff,
     targets: ResumeTargets<'_, ReseedWallClock>,
     storage: &mut Storage,
@@ -546,8 +563,10 @@ where
     ReseedWallClock: FnOnce(u64, u64),
 {
     // 1. Restore BSP architectural processor state (APIC/IDT/XCR0/SMEP/SMAP/PAT/MTRR,
-    //    GICv3/PAC/MTE/PAN, PLIC/timer/trap vectors).
+    //    GICv3/PAC/MTE/PAN, PLIC/timer/trap vectors) and advance the monotonic
+    //    timebase offset above `pre_hibernate_now` before anything reads `cpu.now()`.
     cpu.restore_bsp_post_resume_state();
+    cpu.continue_timebase(pre_hibernate_now);
 
     // 2. Advance MachineGeneration, mix boot kernel's fresh entropy into
     //    RootEntropy so draws immediately diverge from pre-hibernate output,
@@ -679,11 +698,15 @@ where
         .await?;
     if let Err(error) = devices.quiesce_all() {
         drop(writer);
+        recover_devices_after_abort(devices);
         frozen.thaw();
         return Err(error.into());
     }
 
-    // 5. Double-return BSP snapshot point.
+    // 5. Double-return BSP snapshot point. Record `pre_hibernate_now` right
+    //    before capture so the resumed continuation can advance the monotonic
+    //    timebase strictly above it.
+    let pre_hibernate_now = cpu.now();
     let mut bsp_context = BspSnapshotContext::empty();
     let point = match cpu.capture_bsp_state(&mut bsp_context) {
         Ok(point) => point,
@@ -697,6 +720,7 @@ where
     if let SnapshotPoint::Resumed(handoff) = point {
         return complete_resume_continuation(
             cpu,
+            pre_hibernate_now,
             handoff,
             resume_targets,
             storage,
@@ -748,9 +772,17 @@ where
         }
     };
 
-    // 7. Bring only the hibernate disk back up, write compressed chunks + table,
-    //    flush, write sector 0 header, flush again. On ANY failure, drop the
-    //    reservation, reinitialize all devices, thaw, and return the error.
+    // 7. Reinitialize `virtio-iommu` (when present) before bringing up the
+    //    hibernate disk so confined DMA domains are active, then write
+    //    compressed chunks + table, flush, write sector 0 header, flush again.
+    //    On ANY failure, drop the reservation, reinitialize all devices, thaw,
+    //    and return the error.
+    if let Err(error) = devices.reinitialize_iommu() {
+        drop(writer);
+        recover_devices_after_abort(devices);
+        frozen.thaw();
+        return Err(error.into());
+    }
     let written_bytes = match write_image_to_storage(&header, &writer, storage, || {
         frozen.pet_watchdog();
     }) {

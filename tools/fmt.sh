@@ -27,4 +27,5 @@ if [[ ${#packages[@]} -eq 0 ]]; then
     exit 1
 fi
 
-exec cargo fmt "${packages[@]}" "$@"
+cargo fmt "${packages[@]}" "$@"
+exec cargo fmt --manifest-path ops-py/Cargo.toml "$@"

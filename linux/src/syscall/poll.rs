@@ -7,7 +7,10 @@ use alloc::vec::Vec;
 use core::future::{Future, poll_fn};
 use core::task::{Context, Poll};
 use helios_sync::{ByteReadWait, ByteReader, ByteWriteWait, ByteWriter, NotifyWaiter};
-use helios_unix::{Epoll, EventFd, SignalSet};
+use helios_unix::{
+    Epoll, EventFd, FifoReadWrite, FifoReader, FifoWriter, PseudoDeviceKind, PtyMaster, PtySlave,
+    SignalSet,
+};
 
 // Linux UAPI `include/uapi/asm-generic/poll.h` and `eventpoll.h`.
 pub(super) const POLLIN: u32 = 0x0001;
@@ -32,6 +35,11 @@ pub(super) enum Wait {
     Event(EventFd, NotifyWaiter),
     Read(ByteReader, ByteReadWait),
     Write(ByteWriter, ByteWriteWait),
+    FifoRead(FifoReader, NotifyWaiter),
+    FifoWrite(FifoWriter, NotifyWaiter),
+    FifoReadWrite(FifoReadWrite, NotifyWaiter),
+    PtyMaster(PtyMaster, NotifyWaiter),
+    PtySlave(PtySlave, NotifyWaiter),
 }
 
 impl Wait {
@@ -44,6 +52,21 @@ impl Wait {
             FileDescriptor::PipeWrite { writer, .. } if events & (POLLOUT | POLLWRNORM) != 0 => {
                 Some(Self::Write(writer.clone(), writer.wait_state()))
             }
+            FileDescriptor::FifoRead(reader) => {
+                Some(Self::FifoRead(reader.clone(), reader.wait_state()))
+            }
+            FileDescriptor::FifoWrite(writer) => {
+                Some(Self::FifoWrite(writer.clone(), writer.wait_state()))
+            }
+            FileDescriptor::FifoReadWrite(rw) => {
+                Some(Self::FifoReadWrite(rw.clone(), rw.wait_state()))
+            }
+            FileDescriptor::PtyMaster(master) => {
+                Some(Self::PtyMaster(master.clone(), master.wait_state()))
+            }
+            FileDescriptor::PtySlave(slave) => {
+                Some(Self::PtySlave(slave.clone(), slave.wait_state()))
+            }
             _ => None,
         }
     }
@@ -53,6 +76,11 @@ impl Wait {
             Self::Event(event, wait) => event.poll_changed(cx, wait),
             Self::Read(reader, wait) => reader.poll_readable(cx, wait),
             Self::Write(writer, wait) => writer.poll_writable(cx, wait),
+            Self::FifoRead(reader, wait) => reader.poll_changed(cx, wait),
+            Self::FifoWrite(writer, wait) => writer.poll_changed(cx, wait),
+            Self::FifoReadWrite(rw, wait) => rw.poll_changed(cx, wait),
+            Self::PtyMaster(master, wait) => master.poll_changed(cx, wait),
+            Self::PtySlave(slave, wait) => slave.poll_changed(cx, wait),
         }
     }
 }
@@ -135,6 +163,88 @@ pub(super) fn ready_mask<R: Resources, O: Stdio>(
                 0
             }
         }
+        FileDescriptor::FifoRead(reader) => {
+            (if reader.has_buffered_data() {
+                POLLIN | POLLRDNORM
+            } else {
+                0
+            }) | (if reader.is_writer_closed() {
+                POLLHUP
+            } else {
+                0
+            })
+        }
+        FileDescriptor::FifoWrite(writer) => {
+            if writer.is_reader_closed() {
+                POLLERR
+            } else if writer.is_writable() {
+                POLLOUT | POLLWRNORM
+            } else {
+                0
+            }
+        }
+        FileDescriptor::FifoReadWrite(rw) => {
+            (if rw.has_buffered_data() {
+                POLLIN | POLLRDNORM
+            } else {
+                0
+            }) | (if rw.is_writable() {
+                POLLOUT | POLLWRNORM
+            } else {
+                0
+            })
+        }
+        FileDescriptor::PtyMaster(master) => {
+            (if master.readable_bytes() > 0 {
+                POLLIN | POLLRDNORM
+            } else {
+                0
+            }) | (if master.is_slave_hung_up() {
+                POLLHUP
+            } else {
+                POLLOUT | POLLWRNORM
+            })
+        }
+        FileDescriptor::PtySlave(slave) => {
+            (if slave.readable_bytes() > 0 {
+                POLLIN | POLLRDNORM
+            } else {
+                0
+            }) | (if slave.is_master_closed() {
+                POLLHUP
+            } else {
+                POLLOUT | POLLWRNORM
+            })
+        }
+        FileDescriptor::PseudoDevice(dev) => match dev.kind {
+            PseudoDeviceKind::Null | PseudoDeviceKind::Zero | PseudoDeviceKind::Full => {
+                if for_epoll {
+                    0
+                } else {
+                    POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM
+                }
+            }
+            PseudoDeviceKind::Random | PseudoDeviceKind::Urandom => {
+                POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM
+            }
+            PseudoDeviceKind::Tty | PseudoDeviceKind::Console => {
+                let mut mask = if !process.shared.stdin_carry.lock().is_empty() {
+                    POLLIN
+                } else {
+                    0
+                };
+                mask |= stdio.stdin_ready_mask();
+                if mask & POLLIN != 0 {
+                    mask |= POLLRDNORM;
+                }
+                let out_mask = stdio.stdout_ready_mask(Stream::Stdout);
+                mask |= out_mask;
+                if out_mask & POLLOUT != 0 {
+                    mask |= POLLWRNORM;
+                }
+                mask
+            }
+        },
         FileDescriptor::File(_) | FileDescriptor::Preopen { .. } | FileDescriptor::NullDevice => {
             if for_epoll {
                 0
@@ -167,6 +277,14 @@ pub(super) fn arm_entry_wait<R: Resources, O: Stdio>(
             // even if the caller only asked for `POLLOUT`.
             let current = ready_mask::<R, O>(process, entry, table, stdio, false);
             if current & (POLLIN | POLLHUP | POLLERR) == 0 {
+                *watch_stdin = true;
+            }
+        }
+        FileDescriptor::PseudoDevice(dev)
+            if matches!(dev.kind, PseudoDeviceKind::Tty | PseudoDeviceKind::Console) =>
+        {
+            let current = ready_mask::<R, O>(process, entry, table, stdio, false);
+            if events & (POLLIN | POLLRDNORM) != 0 && current & (POLLIN | POLLHUP | POLLERR) == 0 {
                 *watch_stdin = true;
             }
         }

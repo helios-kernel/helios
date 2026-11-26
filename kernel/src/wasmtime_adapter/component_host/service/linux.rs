@@ -41,8 +41,8 @@ use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use helios_hal::fs::{FileSystem, FsError, Landed, NodeKind, RenameMode, WritePosition};
 use helios_hal::native::{
-    FaultKind, NativeError, NativeExecution, NativeUnavailable, Stop, UserContext, UserFault,
-    UserSpace,
+    FaultKind, NativeError, NativeExecution, NativeUnavailable, RegionKind, Stop, UserContext,
+    UserFault, UserSpace,
 };
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
@@ -51,11 +51,11 @@ use helios_linux::elf::{self, Image};
 use helios_linux::syscall::{
     self, AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, AccessCheck, Call, Denied, Descriptors, DirListEntry,
     EpollData, ExecError, ExecSpec, Exit, FileAccess, FileStat, Filesystem, LinkOptions, MapError,
-    MemoryFault, MemoryTotals, OpenRequest, Process, ProcessSignals, READY_ERR, READY_HUP,
-    READY_IN, READY_OUT, Region, Resource, Resources, SignalDelivery, SpawnError, SpawnedProcess,
-    SpawnedThread, Start, StdinTryRead, Stdio, Stream, SyscallOutcome, SyscallRestart, System,
-    Termios, TermiosAction, Thread, TimeUpdate, Tty, TtyError, TtyStream, UserMemory,
-    VirtualMemory, Winsize, WriteError,
+    MemoryFault, MemoryTotals, OpenOutcome, OpenRequest, Process, ProcessSignals, READY_ERR,
+    READY_HUP, READY_IN, READY_OUT, Region, Resource, Resources, SignalDelivery, SpawnError,
+    SpawnedProcess, SpawnedThread, Start, StdinTryRead, Stdio, Stream, SyscallOutcome,
+    SyscallRestart, System, Termios, TermiosAction, Thread, TimeUpdate, Tty, TtyError, TtyStream,
+    UserMemory, VirtualMemory, Winsize, WriteError,
 };
 use helios_sync::{TryRead, TryWrite};
 
@@ -76,9 +76,19 @@ pub(super) struct LinuxExecutable {
     interpreter: Option<Bytes>,
     path: Option<String>,
     abi: Abi,
+    secure: bool,
 }
 
 impl LinuxExecutable {
+    pub(super) fn set_secure(&mut self, secure: bool) {
+        self.secure = secure;
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_secure(&self) -> bool {
+        self.secure
+    }
+
     /// Validates `image` for this platform. Refused when the platform has
     /// no native execution or its processor lacks a protection the
     /// isolation contract requires, when no Linux ABI is decoded for its
@@ -98,6 +108,7 @@ impl LinuxExecutable {
             interpreter: None,
             path: None,
             abi,
+            secure: false,
         })
     }
 
@@ -214,7 +225,7 @@ async fn read_interpreter_in_container<StorageImpl: crate::Storage>(
     })
 }
 
-fn map_fs_op_error_to_program(error: syscall::FsOpError) -> ProgramExecError {
+pub(super) fn map_fs_op_error_to_program(error: syscall::FsOpError) -> ProgramExecError {
     let fs_err = match error {
         syscall::FsOpError::Fs(err) => err,
         syscall::FsOpError::PermissionDenied => FsError::NotPermitted,
@@ -292,6 +303,7 @@ struct LinuxTtyState {
     stderr_tty: bool,
     termios: Termios,
     winsize: Winsize,
+    controlling_pty: Option<helios_unix::PtySlave>,
 }
 
 impl LinuxTtyState {
@@ -319,6 +331,7 @@ impl LinuxTtyState {
             stderr_tty,
             termios: Termios::from_flags(stdin_tty, stdin_tty, true),
             winsize: Winsize::DEFAULT,
+            controlling_pty: None,
         }
     }
 
@@ -382,6 +395,245 @@ impl EpollData for EpollUserData {
     }
 }
 
+/// One active `MAP_SHARED` mapping bound to a [`crate::SharedPageObject`] inside
+/// a Linux process, cloned across `fork(2)` so parent and child share the exact
+/// same underlying physical frames even for lazily committed pages.
+#[derive(Clone)]
+struct SharedVma {
+    start: u64,
+    len: u64,
+    object_id: u64,
+    object: crate::SharedPageObject,
+    object_offset: u64,
+    file_key: Option<(u64, u64)>,
+}
+
+impl SharedVma {
+    fn end(&self) -> u64 {
+        self.start.saturating_add(self.len)
+    }
+}
+
+/// One entry in [`SharedMemoryTable::objects`]. `staging_refs` protects an
+/// in-flight `mmap`/`shmat` object across `MAP_FIXED`/`SHM_REMAP` unmaps until
+/// its VMA is installed, while entries with `staging_refs == 0` and zero active
+/// VMAs are dropped immediately to reclaim `UserMemoryPool` frames.
+struct SharedObjectEntry {
+    object: crate::SharedPageObject,
+    file_key: Option<(u64, u64)>,
+    staging_refs: usize,
+}
+
+/// Process-local table of [`crate::SharedPageObject`]s and active shared VMAs.
+struct SharedMemoryTable {
+    next_id: u64,
+    objects: alloc::collections::BTreeMap<u64, SharedObjectEntry>,
+    vmas: Vec<SharedVma>,
+}
+
+impl Clone for SharedMemoryTable {
+    fn clone(&self) -> Self {
+        let objects = self
+            .objects
+            .iter()
+            .map(|(&id, entry)| {
+                (
+                    id,
+                    SharedObjectEntry {
+                        object: entry.object.clone(),
+                        file_key: entry.file_key,
+                        staging_refs: 0,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            next_id: self.next_id,
+            objects,
+            vmas: self.vmas.clone(),
+        }
+    }
+}
+
+impl SharedMemoryTable {
+    fn new() -> Self {
+        Self {
+            next_id: 1,
+            objects: alloc::collections::BTreeMap::new(),
+            vmas: Vec::new(),
+        }
+    }
+
+    fn insert_object(
+        &mut self,
+        object: crate::SharedPageObject,
+        file_key: Option<(u64, u64)>,
+    ) -> u64 {
+        if let Some(key) = file_key {
+            for (&id, entry) in &mut self.objects {
+                if entry.file_key == Some(key) {
+                    entry.staging_refs = entry.staging_refs.saturating_add(1);
+                    return id;
+                }
+            }
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.objects.insert(
+            id,
+            SharedObjectEntry {
+                object,
+                file_key,
+                staging_refs: 1,
+            },
+        );
+        id
+    }
+
+    fn consume_staging(&mut self, id: u64) {
+        if let Some(entry) = self.objects.get_mut(&id) {
+            entry.staging_refs = entry.staging_refs.saturating_sub(1);
+        }
+    }
+
+    fn prune_if_unused(&mut self, id: u64) {
+        let has_vma = self.vmas.iter().any(|vma| vma.object_id == id);
+        if !has_vma
+            && self
+                .objects
+                .get(&id)
+                .is_some_and(|entry| entry.staging_refs == 0)
+        {
+            self.objects.remove(&id);
+        }
+    }
+
+    fn release_object(&mut self, id: u64) {
+        self.consume_staging(id);
+        self.prune_if_unused(id);
+    }
+
+    fn get_object(&self, id: u64) -> Option<crate::SharedPageObject> {
+        self.objects.get(&id).map(|entry| entry.object.clone())
+    }
+
+    fn get_entry(&self, id: u64) -> Option<(crate::SharedPageObject, Option<(u64, u64)>)> {
+        self.objects
+            .get(&id)
+            .map(|entry| (entry.object.clone(), entry.file_key))
+    }
+
+    fn remove_vma_range(&mut self, start: u64, end: u64) {
+        let mut next = Vec::with_capacity(self.vmas.len());
+        let mut touched_ids = Vec::new();
+        for vma in self.vmas.drain(..) {
+            let v_end = vma.end();
+            if v_end <= start || vma.start >= end {
+                next.push(vma);
+                continue;
+            }
+            if !touched_ids.contains(&vma.object_id) {
+                touched_ids.push(vma.object_id);
+            }
+            if vma.start < start {
+                next.push(SharedVma {
+                    start: vma.start,
+                    len: start - vma.start,
+                    object_id: vma.object_id,
+                    object: vma.object.clone(),
+                    object_offset: vma.object_offset,
+                    file_key: vma.file_key,
+                });
+            }
+            if v_end > end {
+                let delta = end - vma.start;
+                next.push(SharedVma {
+                    start: end,
+                    len: v_end - end,
+                    object_id: vma.object_id,
+                    object: vma.object,
+                    object_offset: vma.object_offset.saturating_add(delta),
+                    file_key: vma.file_key,
+                });
+            }
+        }
+        self.vmas = next;
+        for id in touched_ids {
+            self.prune_if_unused(id);
+        }
+    }
+
+    fn remap_vma_range(&mut self, from: u64, old_len: u64, to: u64, new_len: u64) {
+        let from_end = from.saturating_add(old_len);
+        let mut next = Vec::with_capacity(self.vmas.len() + 2);
+        for vma in self.vmas.drain(..) {
+            let v_end = vma.end();
+            if v_end <= from || vma.start >= from_end {
+                next.push(vma);
+                continue;
+            }
+            if vma.start < from {
+                next.push(SharedVma {
+                    start: vma.start,
+                    len: from - vma.start,
+                    object_id: vma.object_id,
+                    object: vma.object.clone(),
+                    object_offset: vma.object_offset,
+                    file_key: vma.file_key,
+                });
+            }
+            let ov_start = vma.start.max(from);
+            let ov_end = v_end.min(from_end);
+            let mut moved_len = ov_end - ov_start;
+            if ov_end == from_end && new_len > old_len {
+                moved_len = moved_len.saturating_add(new_len - old_len);
+            }
+            next.push(SharedVma {
+                start: to + (ov_start - from),
+                len: moved_len,
+                object_id: vma.object_id,
+                object: vma.object.clone(),
+                object_offset: vma.object_offset.saturating_add(ov_start - vma.start),
+                file_key: vma.file_key,
+            });
+            if v_end > from_end {
+                next.push(SharedVma {
+                    start: from_end,
+                    len: v_end - from_end,
+                    object_id: vma.object_id,
+                    object: vma.object,
+                    object_offset: vma.object_offset.saturating_add(from_end - vma.start),
+                    file_key: vma.file_key,
+                });
+            }
+        }
+        self.vmas = next;
+    }
+
+    /// Returns `(vma_page_start, vma_page_end)` ranges belonging to `file_key`
+    /// whose file offset lies at or beyond `eof_page` so the caller can discard
+    /// their hardware PTEs after `ftruncate`.
+    fn pages_beyond_eof(&self, file_key: (u64, u64), eof_page: u64) -> Vec<(u64, u64)> {
+        let mut ranges = Vec::new();
+        for vma in &self.vmas {
+            if vma.file_key != Some(file_key) {
+                continue;
+            }
+            let map_file_end = vma.object_offset.saturating_add(vma.len);
+            if map_file_end <= eof_page {
+                continue;
+            }
+            let trim_start_off = eof_page.max(vma.object_offset);
+            let addr_start = vma.start + (trim_start_off - vma.object_offset);
+            let addr_end = vma.end();
+            if addr_start < addr_end {
+                ranges.push((addr_start, addr_end));
+            }
+        }
+        ranges
+    }
+}
+
 /// A process's address space as the system-call decoder sees it.
 struct LinuxMemory<'a, Space> {
     space: &'a Space,
@@ -393,9 +645,68 @@ struct LinuxMemory<'a, Space> {
     /// (`setup_signal_frame`) or syscall outputs into a fresh stack page
     /// expand the initial stack on demand just as Linux `copy_to_user` does.
     stack_growth: Option<VirtRange>,
+    /// Process-wide table of shared memory objects and `MAP_SHARED` VMAs.
+    shared_mem: Option<&'a spin::Mutex<SharedMemoryTable>>,
+    /// Container-wide cache of file-backed `SharedPageObject`s.
+    shared_files: Option<&'a crate::linux_container::SharedFileCache>,
 }
 
 impl<Space: UserSpace> LinuxMemory<'_, Space> {
+    /// Ensures any `MAP_SHARED` page overlapping `[address, address + length)`
+    /// has its [`crate::SharedPageObject`] frame attached in `self.space`
+    /// before a kernel read, write, or atomic operation touches it.
+    fn ensure_shared_attached(&self, address: u64, length: usize, allocate: bool) {
+        let Some(shared_mem) = self.shared_mem else {
+            return;
+        };
+        if length == 0 {
+            return;
+        }
+        let Some(end) = address.checked_add(length as u64) else {
+            return;
+        };
+        let page_size = PhysFrame::SIZE as u64;
+        let first_page = address & !(page_size - 1);
+        let last_page = end.next_multiple_of(page_size);
+        let hits: Vec<(u64, u64, crate::SharedPageObject, u64)> = {
+            let guard = shared_mem.lock();
+            guard
+                .vmas
+                .iter()
+                .filter_map(|vma| {
+                    let ov_start = vma.start.max(first_page);
+                    let ov_end = vma.end().min(last_page);
+                    (ov_start < ov_end).then(|| {
+                        (
+                            ov_start,
+                            ov_end,
+                            vma.object.clone(),
+                            vma.object_offset.saturating_add(ov_start - vma.start),
+                        )
+                    })
+                })
+                .collect()
+        };
+        for (ov_start, ov_end, object, mut obj_off) in hits {
+            let mut base = ov_start;
+            while base < ov_end {
+                let page_idx = obj_off / page_size;
+                let frame = if allocate {
+                    object.get_or_alloc_frame(page_idx).ok()
+                } else {
+                    object.get_frame(page_idx)
+                };
+                if let Some(frame) = frame {
+                    let _ = self
+                        .space
+                        .attach_shared_frame(VirtAddr::new(base as usize), frame);
+                }
+                base += page_size;
+                obj_off += page_size;
+            }
+        }
+    }
+
     fn expand_stack_for(&self, address: u64, length: usize) -> bool {
         let Some(growth) = self.stack_growth else {
             return false;
@@ -433,8 +744,16 @@ impl<Space: UserSpace> LinuxMemory<'_, Space> {
 
 impl<Space: UserSpace> UserMemory for LinuxMemory<'_, Space> {
     fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+        self.ensure_shared_attached(address, output.len(), false);
         self.space
             .read(VirtAddr::new(address as usize), output)
+            .map_err(|_| MemoryFault)
+    }
+
+    fn read_unrestricted(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+        self.ensure_shared_attached(address, output.len(), false);
+        self.space
+            .read_unrestricted(VirtAddr::new(address as usize), output)
             .map_err(|_| MemoryFault)
     }
 
@@ -453,6 +772,7 @@ impl<Space: UserSpace> UserMemory for LinuxMemory<'_, Space> {
     }
 
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
+        self.ensure_shared_attached(address, bytes.len(), true);
         match self.space.write(VirtAddr::new(address as usize), bytes) {
             Ok(()) => Ok(()),
             Err(NativeError::NotMapped) if self.expand_stack_for(address, bytes.len()) => self
@@ -464,12 +784,14 @@ impl<Space: UserSpace> UserMemory for LinuxMemory<'_, Space> {
     }
 
     fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+        self.ensure_shared_attached(address, 4, false);
         self.space
             .atomic_load_u32(VirtAddr::new(address as usize))
             .map_err(|_| MemoryFault)
     }
 
     fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+        self.ensure_shared_attached(address, 4, true);
         self.space
             .atomic_store_u32(VirtAddr::new(address as usize), value)
             .map_err(|_| MemoryFault)
@@ -481,6 +803,7 @@ impl<Space: UserSpace> UserMemory for LinuxMemory<'_, Space> {
         expected: u32,
         desired: u32,
     ) -> Result<Result<u32, u32>, MemoryFault> {
+        self.ensure_shared_attached(address, 4, true);
         self.space
             .atomic_compare_exchange_u32(VirtAddr::new(address as usize), expected, desired)
             .map_err(|_| MemoryFault)
@@ -488,6 +811,24 @@ impl<Space: UserSpace> UserMemory for LinuxMemory<'_, Space> {
 
     fn is_page_shared(&self, address: u64) -> bool {
         self.space.is_page_shared(VirtAddr::new(address as usize))
+    }
+
+    fn collect_shared_dirty(
+        &self,
+        object_id: u64,
+        file_offset: u64,
+        valid_len: u64,
+    ) -> Option<Vec<(u64, Vec<u8>)>> {
+        let object = self.shared_mem?.lock().get_object(object_id)?;
+        Some(object.collect_dirty_runs(file_offset, valid_len))
+    }
+
+    fn mark_shared_clean(&self, object_id: u64, file_offset: u64, bytes: &[u8]) {
+        if let Some(shared_mem) = self.shared_mem
+            && let Some(object) = shared_mem.lock().get_object(object_id)
+        {
+            object.mark_clean(file_offset, bytes);
+        }
     }
 }
 
@@ -503,7 +844,7 @@ fn map_error(error: NativeError) -> MapError {
         NativeError::OutOfMemory => MapError::OutOfMemory,
         NativeError::Address => MapError::Address,
         NativeError::Overlap => MapError::Occupied,
-        error @ (NativeError::NotMapped | NativeError::Register) => {
+        error @ (NativeError::NotMapped | NativeError::BackingFault | NativeError::Register) => {
             panic!("a validated Linux memory-map call was refused: {error}")
         }
     }
@@ -571,14 +912,288 @@ impl<Space: UserSpace> VirtualMemory for LinuxMemory<'_, Space> {
     }
 
     fn populate(&mut self, address: u64, bytes: &[u8]) -> Result<(), MapError> {
+        self.ensure_shared_attached(address, bytes.len(), true);
         match self.space.populate(VirtAddr::new(address as usize), bytes) {
             Ok(()) => Ok(()),
             Err(NativeError::OutOfMemory) => Err(MapError::OutOfMemory),
-            Err(NativeError::Address | NativeError::NotMapped) => Err(MapError::Address),
+            Err(NativeError::Address | NativeError::NotMapped | NativeError::BackingFault) => {
+                Err(MapError::Address)
+            }
             Err(error @ (NativeError::Overlap | NativeError::Register)) => {
                 panic!("populating a validated Linux mapping was refused: {error}")
             }
         }
+    }
+
+    fn create_shared_anonymous(&mut self) -> u64 {
+        let Some(shared_mem) = self.shared_mem else {
+            return 0;
+        };
+        shared_mem
+            .lock()
+            .insert_object(crate::SharedPageObject::new_anonymous(), None)
+    }
+
+    fn acquire_shared_file(&mut self, dev: u64, ino: u64) -> u64 {
+        let Some(shared_mem) = self.shared_mem else {
+            return 0;
+        };
+        let object = match self.shared_files {
+            Some(cache) => cache.get_or_create(dev, ino),
+            None => crate::SharedPageObject::new_file_backed(),
+        };
+        shared_mem.lock().insert_object(object, Some((dev, ino)))
+    }
+
+    fn acquire_sysv_shm(&mut self, shmid: i32) -> u64 {
+        let Some(shared_mem) = self.shared_mem else {
+            return 0;
+        };
+        let Some(object) = self
+            .shared_files
+            .and_then(|cache| cache.get_sysv_shm(shmid))
+        else {
+            return 0;
+        };
+        shared_mem.lock().insert_object(object, None)
+    }
+
+    fn load_shared_page(
+        &mut self,
+        object_id: u64,
+        page_index: u64,
+        bytes: &[u8],
+    ) -> Result<(), MapError> {
+        let Some(shared_mem) = self.shared_mem else {
+            return Ok(());
+        };
+        let Some(object) = shared_mem.lock().get_object(object_id) else {
+            return Err(MapError::Address);
+        };
+        object
+            .load_file_page(page_index, bytes)
+            .map(|_| ())
+            .map_err(map_error)
+    }
+
+    fn release_shared_object(&mut self, object_id: u64) {
+        if let Some(shared_mem) = self.shared_mem {
+            shared_mem.lock().release_object(object_id);
+        }
+    }
+
+    fn map_shared_at(
+        &mut self,
+        address: u64,
+        length: u64,
+        access: PageFlags,
+        object_id: u64,
+        object_offset: u64,
+        attach_len: u64,
+    ) -> Result<(), MapError> {
+        let Some(shared_mem) = self.shared_mem else {
+            return self.map_at(address, length, access);
+        };
+        self.space
+            .map_region(page_range(address, length), access, RegionKind::Shared)
+            .map_err(map_error)?;
+        let entry = shared_mem.lock().get_entry(object_id);
+        if let Some((object, file_key)) = entry {
+            if let Err(err) =
+                self.attach_object_range(address, &object, object_offset, attach_len.min(length))
+            {
+                let _ = self.space.unmap(page_range(address, length));
+                return Err(err);
+            }
+            let mut guard = shared_mem.lock();
+            guard.consume_staging(object_id);
+            guard.vmas.push(SharedVma {
+                start: address,
+                len: length,
+                object_id,
+                object,
+                object_offset,
+                file_key,
+            });
+        }
+        Ok(())
+    }
+
+    fn map_shared_anywhere(
+        &mut self,
+        hint: u64,
+        length: u64,
+        access: PageFlags,
+        object_id: u64,
+        object_offset: u64,
+        attach_len: u64,
+    ) -> Result<u64, MapError> {
+        let Some(shared_mem) = self.shared_mem else {
+            return self.map_anywhere(hint, length, access);
+        };
+        let range = self
+            .space
+            .map_region_anywhere(
+                VirtAddr::new(hint as usize),
+                length as usize,
+                access,
+                RegionKind::Shared,
+            )
+            .map_err(map_error)?;
+        let address = range.start.raw() as u64;
+        let entry = shared_mem.lock().get_entry(object_id);
+        if let Some((object, file_key)) = entry {
+            if let Err(err) =
+                self.attach_object_range(address, &object, object_offset, attach_len.min(length))
+            {
+                let _ = self.space.unmap(range);
+                return Err(err);
+            }
+            let mut guard = shared_mem.lock();
+            guard.consume_staging(object_id);
+            guard.vmas.push(SharedVma {
+                start: address,
+                len: length,
+                object_id,
+                object,
+                object_offset,
+                file_key,
+            });
+        }
+        Ok(address)
+    }
+
+    fn map_private_file_at(
+        &mut self,
+        address: u64,
+        length: u64,
+        access: PageFlags,
+        stage_id: u64,
+        staged_len: u64,
+    ) -> Result<(), MapError> {
+        self.space
+            .map_region(page_range(address, length), access, RegionKind::PrivateFile)
+            .map_err(map_error)?;
+        if stage_id != 0
+            && staged_len > 0
+            && let Err(err) = self.install_staged_private(address, stage_id)
+        {
+            let _ = self.space.unmap(page_range(address, length));
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn map_private_file_anywhere(
+        &mut self,
+        hint: u64,
+        length: u64,
+        access: PageFlags,
+        stage_id: u64,
+        staged_len: u64,
+    ) -> Result<u64, MapError> {
+        let range = self
+            .space
+            .map_region_anywhere(
+                VirtAddr::new(hint as usize),
+                length as usize,
+                access,
+                RegionKind::PrivateFile,
+            )
+            .map_err(map_error)?;
+        let address = range.start.raw() as u64;
+        if stage_id != 0
+            && staged_len > 0
+            && let Err(err) = self.install_staged_private(address, stage_id)
+        {
+            let _ = self.space.unmap(range);
+            return Err(err);
+        }
+        Ok(address)
+    }
+
+    fn apply_shared_file_write(&mut self, object_id: u64, file_offset: u64, bytes: &[u8]) -> bool {
+        let Some(shared_mem) = self.shared_mem else {
+            return false;
+        };
+        let Some(object) = shared_mem.lock().get_object(object_id) else {
+            return false;
+        };
+        object.apply_file_write(file_offset, bytes);
+        true
+    }
+
+    fn unmap_shared_vma(&mut self, start: u64, end: u64) {
+        if let Some(shared_mem) = self.shared_mem {
+            shared_mem.lock().remove_vma_range(start, end);
+        }
+    }
+
+    fn remap_shared_vma(&mut self, from: u64, old_len: u64, to: u64, new_len: u64) {
+        if let Some(shared_mem) = self.shared_mem {
+            shared_mem
+                .lock()
+                .remap_vma_range(from, old_len, to, new_len);
+        }
+    }
+
+    fn attach_shared_tail(
+        &mut self,
+        address: u64,
+        object_id: u64,
+        object_offset: u64,
+        attach_len: u64,
+    ) -> Result<(), MapError> {
+        let Some(shared_mem) = self.shared_mem else {
+            return Ok(());
+        };
+        let Some(object) = shared_mem.lock().get_object(object_id) else {
+            return Ok(());
+        };
+        self.attach_object_range(address, &object, object_offset, attach_len)
+    }
+}
+
+impl<Space: UserSpace> LinuxMemory<'_, Space> {
+    fn attach_object_range(
+        &self,
+        address: u64,
+        object: &crate::SharedPageObject,
+        object_offset: u64,
+        attach_len: u64,
+    ) -> Result<(), MapError> {
+        let page_size = PhysFrame::SIZE as u64;
+        let pages = attach_len.div_ceil(page_size);
+        for index in 0..pages {
+            let page_idx = (object_offset / page_size) + index;
+            if let Some(frame) = object.get_frame(page_idx) {
+                let va = VirtAddr::new((address + index * page_size) as usize);
+                self.space
+                    .attach_shared_frame(va, frame)
+                    .map_err(map_error)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn install_staged_private(&self, address: u64, stage_id: u64) -> Result<(), MapError> {
+        let Some(shared_mem) = self.shared_mem else {
+            return Ok(());
+        };
+        let Some(SharedObjectEntry {
+            object: stage_obj, ..
+        }) = shared_mem.lock().objects.remove(&stage_id)
+        else {
+            return Ok(());
+        };
+        let page_size = PhysFrame::SIZE as u64;
+        for (rel_idx, frame) in stage_obj.drain_unique_frames() {
+            let va = VirtAddr::new((address + rel_idx * page_size) as usize);
+            self.space
+                .install_private_frame(va, frame)
+                .map_err(map_error)?;
+        }
+        Ok(())
     }
 }
 
@@ -656,6 +1271,7 @@ where
 {
     Linux {
         executable: LinuxExecutable,
+        exe_path: String,
         argv: Vec<String>,
         env: Vec<String>,
         credentials: syscall::Credentials,
@@ -695,6 +1311,15 @@ where
     signal_state: WasixSignalState,
     container: Arc<crate::LinuxContainer<StorageImpl>>,
     grants: LinuxGrants,
+    pid: NonZeroU32,
+    ppid: u32,
+    exe_path: String,
+    argv: Vec<String>,
+    env: Vec<String>,
+    cwd_handle: Arc<spin::Mutex<String>>,
+    descriptors_handle: Arc<spin::Mutex<Descriptors<LinuxResources<Net>>>>,
+    credentials_handle: Arc<spin::Mutex<syscall::Credentials>>,
+    proc_signals: Arc<ProcessSignals>,
     /// Process-wide terminal state (`termios`, window size, stream TTY flags).
     /// Never held across `.await`.
     tty: spin::Mutex<LinuxTtyState>,
@@ -715,6 +1340,10 @@ where
     /// (AArch64), or `0` on ABIs that require `SA_RESTORER` (x86-64).
     sigreturn_trampoline: u64,
     space: Arc<Space>,
+    /// Shared memory objects and active `MAP_SHARED` VMA bindings for this
+    /// address space (shared on `CLONE_VM`, cloned on `fork` so parent and
+    /// child share the underlying `SharedPageObject`s).
+    shared_mem: Arc<spin::Mutex<SharedMemoryTable>>,
     /// Summed user-slice ticks across every thread of the process
     /// (`CLOCK_PROCESS_CPUTIME_ID`).
     process_cpu_ticks: AtomicU64,
@@ -882,6 +1511,7 @@ where
     StorageImpl: crate::Storage,
 {
     shared: Arc<LinuxShared<CpuImpl, Net, StorageImpl, Space>>,
+    tid: NonZeroU32,
     entropy: crate::EntropyPool,
     thread_cpu_ticks: u64,
     thread_sys_ticks: u64,
@@ -899,9 +1529,111 @@ where
             crate::EntropyPool::derive(shared.runtime_state.root_entropy(), personalization);
         Self {
             shared,
+            tid,
             entropy,
             thread_cpu_ticks: 0,
             thread_sys_ticks: 0,
+        }
+    }
+
+    fn caller(&self) -> crate::ProcCaller {
+        crate::ProcCaller {
+            pid: self.shared.pid.get(),
+            tid: self.tid.get(),
+        }
+    }
+
+    async fn refresh_proc_if_needed(&self, base_dir: &str, path: &str) {
+        let touches_pseudo = path.starts_with("/proc")
+            || path.starts_with("/sys")
+            || path.starts_with("/dev")
+            || base_dir.starts_with("/proc")
+            || base_dir.starts_with("/sys");
+        if !touches_pseudo {
+            return;
+        }
+        let registry = self.shared.container.proc_registry();
+        self.shared.container.sysv_shm().refresh_proc();
+        registry.set_cpu_count(crate::online_processor_count().max(1) as u32);
+        registry.set_uptime_nanos(
+            self.shared
+                .runtime_state
+                .uptime_nanos(self.shared.cpu.now().ticks()),
+        );
+
+        let pid = self.shared.pid.get();
+        let cwd = self.shared.cwd_handle.lock().clone();
+        let creds = self.shared.credentials_handle.lock().clone();
+        let pgid = self.shared.proc_signals.pgid();
+        let fds = snapshot_process_fds(&self.shared.descriptors_handle.lock());
+        let ticks_ns = self
+            .shared
+            .cpu
+            .timebase()
+            .ticks_to_nanos(self.shared.process_cpu_ticks.load(Ordering::Relaxed));
+        let utime_ticks = ticks_ns / 10_000_000;
+        registry.update_process(pid, |record| {
+            record.cwd = cwd;
+            record.credentials = creds;
+            record.pgid = pgid;
+            record.fds = fds;
+            record.utime_ticks = utime_ticks;
+        });
+
+        if let Some(service) = self.shared.runtime_state.network_service() {
+            let mut snapshot = crate::ContainerNetSnapshot::default();
+            if let Ok(mac) = service.mac_address(NetworkPortId::new(0)).await {
+                let ipv4 = service
+                    .list_addresses(NetworkPortId::new(0))
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|cidr| (cidr.address().octets(), cidr.prefix_len()))
+                    .collect();
+                snapshot.interfaces.push(crate::NetIfSnapshot {
+                    name: String::from("eth0"),
+                    ifindex: 2,
+                    mac: mac.octets(),
+                    mtu: 1500,
+                    flags: 0x1043, // IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST
+                    operstate: String::from("up"),
+                    arp_type: 1, // ARPHRD_ETHER
+                    ipv4,
+                    rx_bytes: 0,
+                    rx_packets: 0,
+                    rx_errors: 0,
+                    rx_dropped: 0,
+                    tx_bytes: 0,
+                    tx_packets: 0,
+                    tx_errors: 0,
+                    tx_dropped: 0,
+                });
+                if let Ok(routes) = service.list_routes(NetworkPortId::new(0)).await {
+                    for route in routes {
+                        let prefix = route.destination().prefix_len();
+                        let mask = if prefix == 0 {
+                            [0; 4]
+                        } else {
+                            (!0u32 << (32 - prefix.min(32))).to_be_bytes()
+                        };
+                        let gw = route.gateway().octets();
+                        let mut flags = 0x0001u16; // RTF_UP
+                        if gw != [0, 0, 0, 0] {
+                            flags |= 0x0002; // RTF_GATEWAY
+                        }
+                        snapshot.routes.push(crate::NetRouteSnapshot {
+                            iface: String::from("eth0"),
+                            destination: route.destination().address().octets(),
+                            gateway: gw,
+                            mask,
+                            flags,
+                            metric: 0,
+                            mtu: 1500,
+                        });
+                    }
+                }
+            }
+            registry.set_net_snapshot(snapshot);
         }
     }
 
@@ -988,6 +1720,89 @@ where
             last_ts = Some(event.timestamp);
         }
         (out.into_bytes(), last_ts)
+    }
+}
+
+fn process_comm_from_exe(exe: &str) -> String {
+    let base = exe.rsplit('/').next().unwrap_or(exe);
+    let base = if base.is_empty() { "linux" } else { base };
+    base.chars().take(15).collect()
+}
+
+fn snapshot_process_fds<Net: ComponentHostNetwork>(
+    descriptors: &Descriptors<LinuxResources<Net>>,
+) -> Vec<crate::ProcFdEntry> {
+    let mut out = Vec::new();
+    for (idx, slot) in descriptors.entries.iter().enumerate() {
+        let Some(entry) = slot else {
+            continue;
+        };
+        let target = match &entry.descriptor {
+            helios_unix::FileDescriptor::Stdin { .. }
+            | helios_unix::FileDescriptor::Stdout
+            | helios_unix::FileDescriptor::Stderr => String::from("/dev/console"),
+            helios_unix::FileDescriptor::File(open) => open.node().path.clone(),
+            helios_unix::FileDescriptor::Preopen { descriptor, .. } => descriptor.path.clone(),
+            helios_unix::FileDescriptor::PipeRead { inode, .. } => {
+                alloc::format!("pipe:[{}]", inode.attrs().ino)
+            }
+            helios_unix::FileDescriptor::PipeWrite { inode, .. } => {
+                alloc::format!("pipe:[{}]", inode.attrs().ino)
+            }
+            helios_unix::FileDescriptor::FifoRead(r) => {
+                alloc::format!("pipe:[{}]", r.inode().attrs().ino)
+            }
+            helios_unix::FileDescriptor::FifoWrite(w) => {
+                alloc::format!("pipe:[{}]", w.inode().attrs().ino)
+            }
+            helios_unix::FileDescriptor::FifoReadWrite(rw) => {
+                alloc::format!("pipe:[{}]", rw.inode().attrs().ino)
+            }
+            helios_unix::FileDescriptor::PseudoDevice(dev) => String::from(dev.kind.default_path()),
+            helios_unix::FileDescriptor::NullDevice => String::from("/dev/null"),
+            helios_unix::FileDescriptor::PtyMaster(_) => String::from("/dev/ptmx"),
+            helios_unix::FileDescriptor::PtySlave(s) => alloc::format!("/dev/pts/{}", s.index()),
+            helios_unix::FileDescriptor::Socket(_) => alloc::format!("socket:[{idx}]"),
+            helios_unix::FileDescriptor::Event(_) => String::from("anon_inode:[eventfd]"),
+            helios_unix::FileDescriptor::Epoll(_) => String::from("anon_inode:[eventpoll]"),
+        };
+        let pos = match &entry.descriptor {
+            helios_unix::FileDescriptor::File(open) => {
+                open.try_lock_position().map_or(0, |p| p.get())
+            }
+            _ => 0,
+        };
+        out.push(crate::ProcFdEntry {
+            fd: idx as i32,
+            target,
+            pos,
+            flags: u32::from(entry.fdflags()),
+            mnt_id: 1,
+        });
+    }
+    out
+}
+
+struct ProcProcessGuard {
+    registry: crate::ProcRegistry,
+    pid: u32,
+}
+
+impl Drop for ProcProcessGuard {
+    fn drop(&mut self) {
+        self.registry.unregister_process(self.pid);
+    }
+}
+
+struct ProcThreadGuard {
+    registry: crate::ProcRegistry,
+    pid: u32,
+    tid: u32,
+}
+
+impl Drop for ProcThreadGuard {
+    fn drop(&mut self) {
+        self.registry.unregister_thread(self.pid, self.tid);
     }
 }
 
@@ -1476,6 +2291,14 @@ where
         state.winsize = winsize;
         Ok(())
     }
+
+    fn controlling_pty(&self) -> Option<helios_unix::PtySlave> {
+        self.shared.tty.lock().controlling_pty.clone()
+    }
+
+    fn set_controlling_pty(&mut self, pty: Option<helios_unix::PtySlave>) {
+        self.shared.tty.lock().controlling_pty = pty;
+    }
 }
 
 impl<CpuImpl, Net, StorageImpl, Space: UserSpace> Filesystem<LinuxResources<Net>>
@@ -1505,6 +2328,11 @@ where
     }
 
     fn can_exec_file(&self, file: &FsDescriptor) -> bool {
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            return true;
+        }
         self.shared.container.filesystem().can_exec(&file.path)
     }
 
@@ -1512,6 +2340,182 @@ where
         match (a.identity, b.identity) {
             (Some(ia), Some(ib)) => ia == ib,
             _ => a.path == b.path,
+        }
+    }
+
+    fn has_synthetic_dev_fallback(&self) -> bool {
+        false
+    }
+
+    async fn open_descriptor(
+        &mut self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        request: OpenRequest,
+        creds: &syscall::Credentials,
+    ) -> Result<Option<OpenOutcome<LinuxResources<Net>>>, syscall::FsOpError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        self.refresh_proc_if_needed(base_dir, path).await;
+        let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
+        let opened = alloc::boxed::Box::pin(self.shared.container.filesystem().open_descriptor_at(
+            base_dir,
+            path,
+            request,
+            creds,
+            Some(self.caller()),
+            now,
+            &payer,
+        ))
+        .await;
+        match opened {
+            Ok(crate::ContainerOpenOutcome::Node {
+                info,
+                container_path,
+                mount_hold,
+            }) => {
+                let mut flags = FsDescriptorFlags::empty();
+                if request.read {
+                    flags |= FsDescriptorFlags::READ;
+                }
+                if request.write {
+                    flags |= FsDescriptorFlags::WRITE;
+                }
+                if request.sync {
+                    flags |= FsDescriptorFlags::FILE_INTEGRITY_SYNC;
+                }
+                if request.dsync {
+                    flags |= FsDescriptorFlags::DATA_INTEGRITY_SYNC;
+                }
+                if info.metadata.kind == NodeKind::Directory {
+                    flags |= FsDescriptorFlags::MUTATE_DIRECTORY;
+                }
+                let desc = FsDescriptor {
+                    path: container_path,
+                    kind: node_kind_to_component(info.metadata.kind),
+                    flags,
+                    identity: Some(crate::vfs::object_identity(&info.metadata)),
+                    mount: mount_hold,
+                    open: None,
+                };
+                Ok(Some(OpenOutcome::Descriptor(
+                    helios_unix::FileDescriptor::File(helios_unix::OpenFile::new(desc)),
+                )))
+            }
+            Ok(crate::ContainerOpenOutcome::PseudoDevice(dev)) => Ok(Some(
+                OpenOutcome::Descriptor(helios_unix::FileDescriptor::PseudoDevice(dev)),
+            )),
+            Ok(crate::ContainerOpenOutcome::ControllingTty {
+                is_console,
+                dev,
+                ino,
+                uid,
+                gid,
+                mode,
+            }) => {
+                let has_rights = self.shared.grants.terminal_input.is_some()
+                    || self.shared.grants.terminal_output.is_some();
+                let tty = self.shared.tty.lock();
+                let has_stdio_tty = has_rights
+                    && (tty.stdin_tty || (is_console && (tty.stdout_tty || tty.stderr_tty)));
+                drop(tty);
+                let fallback = if has_stdio_tty {
+                    let kind = if is_console {
+                        helios_unix::PseudoDeviceKind::Console
+                    } else {
+                        helios_unix::PseudoDeviceKind::Tty
+                    };
+                    let mut p = helios_unix::PseudoDevice::new(kind, request.read, request.write);
+                    p.dev = dev;
+                    p.ino = ino;
+                    p.uid = uid;
+                    p.gid = gid;
+                    p.mode = mode;
+                    Some(helios_unix::FileDescriptor::PseudoDevice(p))
+                } else {
+                    None
+                };
+                Ok(Some(OpenOutcome::ControllingTty { fallback }))
+            }
+            Ok(crate::ContainerOpenOutcome::PtyMaster(master)) => Ok(Some(
+                OpenOutcome::Descriptor(helios_unix::FileDescriptor::PtyMaster(master)),
+            )),
+            Ok(crate::ContainerOpenOutcome::PtySlave { slave, noctty }) => {
+                Ok(Some(OpenOutcome::PtySlave { slave, noctty }))
+            }
+            Ok(crate::ContainerOpenOutcome::FifoRead(reader)) => Ok(Some(OpenOutcome::Descriptor(
+                helios_unix::FileDescriptor::FifoRead(reader),
+            ))),
+            Ok(crate::ContainerOpenOutcome::FifoWrite(writer)) => Ok(Some(
+                OpenOutcome::Descriptor(helios_unix::FileDescriptor::FifoWrite(writer)),
+            )),
+            Ok(crate::ContainerOpenOutcome::FifoReadWrite(rw)) => Ok(Some(
+                OpenOutcome::Descriptor(helios_unix::FileDescriptor::FifoReadWrite(rw)),
+            )),
+            Ok(crate::ContainerOpenOutcome::ProcFd { pid, fd, .. }) => {
+                if pid == self.shared.pid.get() {
+                    Ok(Some(OpenOutcome::ReopenFd { fd }))
+                } else if let Some(memfd_id) =
+                    self.shared.container.memfds().lookup_process_fd(pid, fd)
+                {
+                    let target_uid = self
+                        .shared
+                        .container
+                        .proc_registry()
+                        .process(pid)
+                        .map(|rec| rec.credentials.user.effective);
+                    let allowed = target_uid.is_some_and(|uid| {
+                        creds.user.effective == uid
+                            || creds.capabilities.has_effective(syscall::CAP_DAC_OVERRIDE)
+                    });
+                    if !allowed {
+                        return Err(syscall::FsOpError::Fs(FsError::NotPermitted));
+                    }
+                    let (id, memfd_path, handle) = self
+                        .shared
+                        .container
+                        .memfds()
+                        .reopen(memfd_id, request, creds, now)?;
+                    let mut flags = FsDescriptorFlags::empty();
+                    if request.read {
+                        flags |= FsDescriptorFlags::READ;
+                    }
+                    if request.write {
+                        flags |= FsDescriptorFlags::WRITE;
+                    }
+                    let desc = FsDescriptor {
+                        path: memfd_path,
+                        kind: ComponentFsNodeKind::File,
+                        flags,
+                        identity: Some(id),
+                        mount: None,
+                        open: None,
+                    };
+                    Ok(Some(OpenOutcome::Descriptor(
+                        helios_unix::FileDescriptor::File(helios_unix::OpenFile::with_memfd_hold(
+                            desc,
+                            handle.acquire_hold(),
+                        )),
+                    )))
+                } else {
+                    Err(syscall::FsOpError::PermissionDenied)
+                }
+            }
+            Err(syscall::FsOpError::Fs(FsError::NoEntry)) => {
+                let servers = self
+                    .shared
+                    .runtime_state
+                    .network_service()
+                    .map(|service| service.dns_servers())
+                    .unwrap_or_default();
+                let desc =
+                    synthetic_etc_open(&self.shared.container, base_dir, path, &servers, request)?;
+                Ok(Some(OpenOutcome::Descriptor(
+                    helios_unix::FileDescriptor::File(helios_unix::OpenFile::new(desc)),
+                )))
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -1546,7 +2550,10 @@ where
             None => cwd,
         };
         let fs = self.shared.container.filesystem();
-        match fs.walk_path_for(effective_cwd, path, true, creds).await {
+        match fs
+            .walk_path_for_caller(effective_cwd, path, true, creds, Some(self.caller()))
+            .await
+        {
             Ok((resolved, _)) => Ok(container_resolved_fs_stat(&resolved)),
             Err(syscall::FsOpError::Fs(FsError::NoEntry)) => {
                 let servers = self
@@ -1571,6 +2578,11 @@ where
         &self,
         file: &FsDescriptor,
     ) -> Result<syscall::FsStat, syscall::FsOpError> {
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            return Ok(syscall::FsStat::synthetic_virtual(syscall::TMPFS_MAGIC));
+        }
         let fs = self.shared.container.filesystem();
         match fs.resolve(&file.path) {
             Ok(resolved) => Ok(container_resolved_fs_stat(&resolved)),
@@ -1595,6 +2607,11 @@ where
     }
 
     async fn sync_fs(&self, file: &FsDescriptor) -> Result<(), syscall::FsOpError> {
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            return Ok(());
+        }
         let fs = self.shared.container.filesystem();
         match fs.sync(&file.path, false).await {
             Ok(()) | Err(syscall::FsOpError::Fs(FsError::ReadOnly | FsError::Unsupported)) => {
@@ -1613,6 +2630,7 @@ where
         creds: &syscall::Credentials,
     ) -> Result<FsDescriptor, syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        self.refresh_proc_if_needed(base_dir, path).await;
         let now = self.shared.clock.lock().system_time_nanos();
         let payer = self.shared.launched_instance.storage_payer();
         let opened = self
@@ -1676,11 +2694,12 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(FileStat, String), syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        self.refresh_proc_if_needed(base_dir, path).await;
         match self
             .shared
             .container
             .filesystem()
-            .stat_at(base_dir, path, follow, creds)
+            .stat_at_for(base_dir, path, follow, creds, Some(self.caller()))
             .await
         {
             Ok((info, resolved_path)) => Ok((container_info_to_stat(&info), resolved_path)),
@@ -1699,6 +2718,11 @@ where
     }
 
     async fn stat_file(&self, file: &FsDescriptor) -> Result<FileStat, syscall::FsOpError> {
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            return self.shared.container.memfds().stat(id);
+        }
         match self
             .shared
             .container
@@ -1736,11 +2760,12 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        self.refresh_proc_if_needed(base_dir, path).await;
         match self
             .shared
             .container
             .filesystem()
-            .access_at(base_dir, path, check, creds)
+            .access_at_for(base_dir, path, check, creds, Some(self.caller()))
             .await
         {
             Ok(()) => Ok(()),
@@ -1776,6 +2801,16 @@ where
         offset: u64,
         max_bytes: usize,
     ) -> Result<Bytes, syscall::FsOpError> {
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            return self
+                .shared
+                .container
+                .memfds()
+                .read_at(id, offset, max_bytes);
+        }
+        self.refresh_proc_if_needed(&file.path, "").await;
         match self
             .shared
             .container
@@ -1783,7 +2818,27 @@ where
             .read_at(&file.path, offset, max_bytes)
             .await
         {
-            Ok(bytes) => Ok(bytes),
+            Ok(bytes) => {
+                if !bytes.is_empty()
+                    && let Some(id) = file.identity
+                    && self
+                        .shared
+                        .container
+                        .shared_files()
+                        .get(id.domain().raw(), id.local())
+                        .is_some()
+                {
+                    let mut buf = bytes.to_vec();
+                    self.shared.container.shared_files().overlay_file_read(
+                        id.domain().raw(),
+                        id.local(),
+                        offset,
+                        &mut buf,
+                    );
+                    return Ok(Bytes::from(buf));
+                }
+                Ok(bytes)
+            }
             Err(syscall::FsOpError::Fs(FsError::NoEntry)) => {
                 let servers = self
                     .shared
@@ -1816,6 +2871,26 @@ where
         creds: &syscall::Credentials,
     ) -> Result<Landed, syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            let result = self
+                .shared
+                .container
+                .memfds()
+                .write_at(id, position, bytes, now);
+            if matches!(result, Err(syscall::FsOpError::Fs(FsError::OutOfMemory))) {
+                crate::wasmtime_adapter::store::request_oom_kill(
+                    &self.shared.runtime_state,
+                    &self.shared.runtime_state.instance_registry(),
+                    &self.shared.cpu,
+                    self.shared.launched_instance.id(),
+                    crate::MemoryPool::User,
+                    bytes.len().max(helios_hal::pmm::PhysFrame::SIZE),
+                );
+            }
+            return result;
+        }
         let payer = self.shared.launched_instance.storage_payer();
         let result = self
             .shared
@@ -1823,6 +2898,17 @@ where
             .filesystem()
             .write_at(&file.path, position, bytes, creds, now, &payer)
             .await;
+        if let Ok(landed) = &result
+            && landed.len > 0
+            && let Some(id) = file.identity
+        {
+            self.shared.container.shared_files().apply_file_write(
+                id.domain().raw(),
+                id.local(),
+                landed.offset,
+                &bytes[..landed.len],
+            );
+        }
         if matches!(result, Err(syscall::FsOpError::Fs(FsError::OutOfMemory))) {
             crate::wasmtime_adapter::store::request_oom_kill(
                 &self.shared.runtime_state,
@@ -1840,6 +2926,7 @@ where
         &self,
         file: &FsDescriptor,
     ) -> Result<(u64, u64, Vec<DirListEntry>), syscall::FsOpError> {
+        self.refresh_proc_if_needed(&file.path, "").await;
         let (self_ino, parent_ino, entries) = self
             .shared
             .container
@@ -1864,12 +2951,45 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            self.shared.container.memfds().set_size(id, size, now)?;
+            let key = (id.domain().raw(), id.local());
+            let eof_page = size.div_ceil(PhysFrame::SIZE as u64) * PhysFrame::SIZE as u64;
+            let discard_ranges = self
+                .shared
+                .shared_mem
+                .lock()
+                .pages_beyond_eof(key, eof_page);
+            for (start, end) in discard_ranges {
+                let _ = self.shared.space.discard(page_range(start, end - start));
+            }
+            return Ok(());
+        }
         let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
             .filesystem()
             .set_size(&file.path, size, creds, now, &payer)
-            .await
+            .await?;
+        if let Some(id) = file.identity {
+            let key = (id.domain().raw(), id.local());
+            self.shared
+                .container
+                .shared_files()
+                .truncate(key.0, key.1, size);
+            let eof_page = size.div_ceil(PhysFrame::SIZE as u64) * PhysFrame::SIZE as u64;
+            let discard_ranges = self
+                .shared
+                .shared_mem
+                .lock()
+                .pages_beyond_eof(key, eof_page);
+            for (start, end) in discard_ranges {
+                let _ = self.shared.space.discard(page_range(start, end - start));
+            }
+        }
+        Ok(())
     }
 
     async fn set_size_path(
@@ -1881,14 +3001,43 @@ where
     ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
         let payer = self.shared.launched_instance.storage_payer();
+        let file_key = self
+            .shared
+            .container
+            .filesystem()
+            .stat_at(cwd, path, true, creds)
+            .await
+            .ok()
+            .map(|(info, _)| (info.metadata.id.device.raw(), info.metadata.id.inode));
         self.shared
             .container
             .filesystem()
             .set_size_at(cwd, path, size, creds, now, &payer)
-            .await
+            .await?;
+        if let Some(key) = file_key {
+            self.shared
+                .container
+                .shared_files()
+                .truncate(key.0, key.1, size);
+            let eof_page = size.div_ceil(PhysFrame::SIZE as u64) * PhysFrame::SIZE as u64;
+            let discard_ranges = self
+                .shared
+                .shared_mem
+                .lock()
+                .pages_beyond_eof(key, eof_page);
+            for (start, end) in discard_ranges {
+                let _ = self.shared.space.discard(page_range(start, end - start));
+            }
+        }
+        Ok(())
     }
 
     async fn sync(&self, file: &FsDescriptor, data_only: bool) -> Result<(), syscall::FsOpError> {
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            return Ok(());
+        }
         self.shared
             .container
             .filesystem()
@@ -1910,18 +3059,20 @@ where
             let Some(file) = base else {
                 return Err(FsError::NoEntry.into());
             };
+            self.refresh_proc_if_needed(&file.path, "").await;
             return self
                 .shared
                 .container
                 .filesystem()
-                .read_link_resolved(&file.path)
+                .read_link_resolved_for(&file.path, Some(self.caller()))
                 .await;
         }
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        self.refresh_proc_if_needed(base_dir, path).await;
         self.shared
             .container
             .filesystem()
-            .read_link_at(base_dir, path, creds)
+            .read_link_at_for(base_dir, path, creds, Some(self.caller()))
             .await
     }
 
@@ -2089,6 +3240,15 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            return self
+                .shared
+                .container
+                .memfds()
+                .set_times(id, access, modified, creds, now);
+        }
         let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
@@ -2123,6 +3283,11 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            return self.shared.container.memfds().chmod(id, mode, creds, now);
+        }
         let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
@@ -2159,6 +3324,15 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
+        if let Some(id) = file.identity
+            && self.shared.container.memfds().owns_identity(id)
+        {
+            return self
+                .shared
+                .container
+                .memfds()
+                .chown(id, uid, gid, creds, now);
+        }
         let payer = self.shared.launched_instance.storage_payer();
         self.shared
             .container
@@ -2287,6 +3461,241 @@ where
             .filesystem()
             .remove_xattr_resolved(&file.path, name, creds, now, &payer)
             .await
+    }
+
+    fn create_memfd(
+        &mut self,
+        name: &str,
+        flags: u32,
+        creds: &syscall::Credentials,
+    ) -> Result<(FsDescriptor, helios_unix::MemfdHandle), syscall::FsOpError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        let (id, path, handle) = self
+            .shared
+            .container
+            .memfds()
+            .create(name, flags, creds, now);
+        let desc = FsDescriptor {
+            path,
+            kind: ComponentFsNodeKind::File,
+            flags: FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
+            identity: Some(id),
+            mount: None,
+            open: None,
+        };
+        Ok((desc, handle))
+    }
+
+    fn reopen_memfd(
+        &mut self,
+        file: &FsDescriptor,
+        request: OpenRequest,
+        creds: &syscall::Credentials,
+    ) -> Result<Option<(FsDescriptor, helios_unix::MemfdHandle)>, syscall::FsOpError> {
+        let Some(id) = file.identity else {
+            return Ok(None);
+        };
+        if !self.shared.container.memfds().owns_identity(id) {
+            return Ok(None);
+        }
+        let now = self.shared.clock.lock().system_time_nanos();
+        let (reopened_id, path, handle) = self
+            .shared
+            .container
+            .memfds()
+            .reopen(id, request, creds, now)?;
+        let mut flags = FsDescriptorFlags::empty();
+        if request.read {
+            flags |= FsDescriptorFlags::READ;
+        }
+        if request.write {
+            flags |= FsDescriptorFlags::WRITE;
+        }
+        let desc = FsDescriptor {
+            path,
+            kind: ComponentFsNodeKind::File,
+            flags,
+            identity: Some(reopened_id),
+            mount: None,
+            open: None,
+        };
+        Ok(Some((desc, handle)))
+    }
+
+    fn memfd_handle(&self, file: &FsDescriptor) -> Option<helios_unix::MemfdHandle> {
+        let id = file.identity?;
+        self.shared.container.memfds().handle(id)
+    }
+
+    fn memfd_get_seals(&self, file: &FsDescriptor) -> Option<u32> {
+        let id = file.identity?;
+        self.shared.container.memfds().get_seals(id)
+    }
+
+    fn memfd_add_seals(
+        &mut self,
+        file: &FsDescriptor,
+        seals: u32,
+    ) -> Result<(), syscall::FsOpError> {
+        let Some(id) = file.identity else {
+            return Err(syscall::FsOpError::Fs(FsError::Invalid));
+        };
+        self.shared.container.memfds().add_seals(id, seals)
+    }
+
+    fn memfd_acquire_writable_map(
+        &self,
+        file: &FsDescriptor,
+    ) -> Result<Option<helios_unix::MemfdWritableMapHold>, syscall::FsOpError> {
+        let Some(id) = file.identity else {
+            return Ok(None);
+        };
+        self.shared.container.memfds().acquire_writable_map(id)
+    }
+
+    fn reap_memfds(&self) {
+        self.shared.container.memfds().reap_unreferenced();
+    }
+
+    fn sync_process_memfds(&self, pid: u32, fds: &[(i32, FsDescriptor)]) {
+        let memfds = self.shared.container.memfds();
+        let mapped: Vec<(i32, u64)> = fds
+            .iter()
+            .filter_map(|(fd, desc)| {
+                let id = desc.identity?;
+                memfds.owns_identity(id).then_some((*fd, id.local()))
+            })
+            .collect();
+        memfds.set_process_fds(pid, mapped);
+        if pid == self.shared.pid.get() {
+            let snapshot = snapshot_process_fds(&self.shared.descriptors_handle.lock());
+            self.shared
+                .container
+                .proc_registry()
+                .update_process(pid, |rec| rec.fds = snapshot);
+        } else {
+            self.shared
+                .container
+                .proc_registry()
+                .update_process(pid, |rec| {
+                    rec.fds.retain(|entry| !entry.target.starts_with("/memfd:"));
+                    for (fd, desc) in fds {
+                        rec.fds.push(crate::ProcFdEntry {
+                            fd: *fd,
+                            target: desc.path.clone(),
+                            pos: 0,
+                            flags: 0,
+                            mnt_id: 1,
+                        });
+                    }
+                });
+        }
+    }
+
+    fn shm_get(
+        &mut self,
+        key: i32,
+        size: u64,
+        flags: u32,
+        pid: u32,
+        creds: &syscall::Credentials,
+        now_secs: i64,
+    ) -> Result<i32, u64> {
+        self.shared
+            .container
+            .sysv_shm()
+            .shmget(key, size, flags, pid, creds, now_secs)
+    }
+
+    fn shm_prepare_attach(
+        &mut self,
+        shmid: i32,
+        read_only: bool,
+        exec: bool,
+        creds: &syscall::Credentials,
+    ) -> Result<u64, u64> {
+        self.shared
+            .container
+            .sysv_shm()
+            .prepare_attach(shmid, read_only, exec, creds)
+    }
+
+    fn shm_commit_attach(&mut self, shmid: i32, pid: u32, now_secs: i64) {
+        self.shared
+            .container
+            .sysv_shm()
+            .commit_attach(shmid, pid, now_secs);
+    }
+
+    fn shm_detach(&mut self, shmid: i32, pid: u32, now_secs: i64) {
+        self.shared
+            .container
+            .sysv_shm()
+            .detach(shmid, pid, now_secs);
+    }
+
+    fn shm_fork_attach(&mut self, shmid: i32) {
+        self.shared.container.sysv_shm().fork_attach(shmid);
+    }
+
+    fn shm_fork_rollback(&mut self, shmid: i32) {
+        self.shared.container.sysv_shm().fork_rollback(shmid);
+    }
+
+    fn shm_ctl_stat(
+        &self,
+        shmid: i32,
+        by_index: bool,
+        check_perms: bool,
+        creds: &syscall::Credentials,
+    ) -> Result<(i32, syscall::ShmStat), u64> {
+        self.shared
+            .container
+            .sysv_shm()
+            .ctl_stat(shmid, by_index, check_perms, creds)
+    }
+
+    fn shm_ctl_set(
+        &mut self,
+        shmid: i32,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        creds: &syscall::Credentials,
+        now_secs: i64,
+    ) -> Result<(), u64> {
+        self.shared
+            .container
+            .sysv_shm()
+            .ctl_set(shmid, uid, gid, mode, creds, now_secs)
+    }
+
+    fn shm_ctl_rmid(
+        &mut self,
+        shmid: i32,
+        creds: &syscall::Credentials,
+        now_secs: i64,
+    ) -> Result<(), u64> {
+        self.shared
+            .container
+            .sysv_shm()
+            .ctl_rmid(shmid, creds, now_secs)
+    }
+
+    fn shm_ctl_lock(
+        &mut self,
+        shmid: i32,
+        lock: bool,
+        creds: &syscall::Credentials,
+    ) -> Result<(), u64> {
+        self.shared
+            .container
+            .sysv_shm()
+            .ctl_lock(shmid, lock, creds)
+    }
+
+    fn shm_ctl_info(&self) -> (i32, syscall::ShmUsageInfo) {
+        self.shared.container.sysv_shm().ctl_info()
     }
 }
 
@@ -2643,7 +4052,8 @@ where
         ),
         u64,
     > {
-        self.check_tcp_open()?;
+        // Possessing a pre-bound TCP listener descriptor (e.g. inherited at
+        // `fd = 3+`) is itself the capability to accept connections on it.
         let service = self
             .shared
             .runtime_state
@@ -2797,7 +4207,6 @@ where
         timeout_nanos: u64,
         peek: bool,
     ) -> Result<Option<Bytes>, u64> {
-        self.check_tcp_open()?;
         let service = self
             .shared
             .runtime_state
@@ -2838,7 +4247,6 @@ where
         bytes: Bytes,
         timeout_nanos: u64,
     ) -> Result<usize, u64> {
-        self.check_tcp_open()?;
         if bytes.is_empty() {
             return Ok(0);
         }
@@ -2877,7 +4285,6 @@ where
     }
 
     async fn tcp_shutdown_send(&self, stream: Net::TcpStream) -> Result<(), u64> {
-        self.check_tcp_open()?;
         let service = self
             .shared
             .runtime_state
@@ -3753,10 +5160,18 @@ where
         let fs = shared.container.filesystem();
         let (resolved, trailing_slash) = match &target {
             ExecTarget::Resolved(path) => (fs.resolve(path).map_err(map_fs_error_to_exec)?, false),
-            ExecTarget::Path { base_dir, raw_path } => fs
-                .walk_path_for(base_dir, raw_path, !nofollow, &current_creds)
-                .await
-                .map_err(map_fs_op_error_to_exec)?,
+            ExecTarget::Path { base_dir, raw_path } => Box::pin(fs.walk_path_for_caller(
+                base_dir,
+                raw_path,
+                !nofollow,
+                &current_creds,
+                Some(crate::ProcCaller {
+                    pid: shared.pid.get(),
+                    tid: shared.pid.get(),
+                }),
+            ))
+            .await
+            .map_err(map_fs_op_error_to_exec)?,
         };
         let meta = resolved
             .fs()
@@ -3802,7 +5217,7 @@ where
             }
             argv = next_argv;
             target = ExecTarget::Path {
-                base_dir: String::from("/"),
+                base_dir: cwd.lock().clone(),
                 raw_path: apply_chroot_to_exec_path(&root_dir, &interp),
             };
             continue;
@@ -3853,11 +5268,13 @@ where
                     .await
                     .map_err(map_fs_op_error_to_exec)?;
                 let secure = syscall::permissions::exec_is_secure(&current_creds, &next_creds);
+                let exe_path = current_path.clone();
                 if argv.is_empty() {
                     argv.push(current_path);
                 }
                 return Ok(PreparedExec::Linux {
                     executable,
+                    exe_path,
                     argv,
                     env: envp,
                     credentials: next_creds,
@@ -3971,6 +5388,24 @@ where
         child_context
             .set_register(self.shared.registers.result, 0)
             .expect("the ABI names registers of this instruction set");
+        let child_tid = child.tid().get();
+        let child_pid = self.shared.pid.get();
+        let comm = process_comm_from_exe(&self.shared.exe_path);
+        self.shared.container.proc_registry().register_thread(
+            child_pid,
+            crate::ProcThreadRecord {
+                tid: child_tid,
+                comm,
+                state: 'R',
+                utime_ticks: 0,
+                stime_ticks: 0,
+            },
+        );
+        let thread_proc_guard = ProcThreadGuard {
+            registry: self.shared.container.proc_registry().clone(),
+            pid: child_pid,
+            tid: child_tid,
+        };
         let child_platform = LinuxThreadPlatform::new(self.shared.clone(), child.tid());
         let shared = self.shared.clone();
         let spawner = shared.spawner.clone();
@@ -3978,8 +5413,9 @@ where
         let guard = TaskDrainGuard(shared.clone());
         spawner
             .try_spawn_detached(async move {
+                let _thread_proc_guard = thread_proc_guard;
                 if let ThreadRunEnd::Exec(prepared, exec_proc) =
-                    drive_linux_thread(child_context, child, child_platform).await
+                    drive_linux_thread_boxed(child_context, child, child_platform).await
                 {
                     let observer = exec_proc.observer();
                     let mut slot = shared.exec_handoff.lock();
@@ -4056,6 +5492,11 @@ where
         let child_spawner = exec_context
             .spawner
             .instance_spawner(crate::TaskFunding::Instance, &child_instance);
+        let child_shared_mem = if spawned.share_vm {
+            self.shared.shared_mem.clone()
+        } else {
+            Arc::new(spin::Mutex::new(self.shared.shared_mem.lock().clone()))
+        };
         let child_signal_state = WasixSignalState::new();
         let child_shared = Arc::new(LinuxShared {
             cpu: self.shared.cpu.clone(),
@@ -4070,6 +5511,15 @@ where
             signal_state: child_signal_state,
             container: self.shared.container.clone(),
             grants: LinuxGrants::derive(self.shared.container.authority()),
+            pid: spawned.child.pid(),
+            ppid: self.shared.pid.get(),
+            exe_path: self.shared.exe_path.clone(),
+            argv: self.shared.argv.clone(),
+            env: self.shared.env.clone(),
+            cwd_handle: spawned.child.cwd_handle(),
+            descriptors_handle: spawned.child.descriptors_handle(),
+            credentials_handle: spawned.child.credentials_handle(),
+            proc_signals: spawned.child.process_signals(),
             tty: spin::Mutex::new(self.shared.tty.lock().clone()),
             serial_peek: spin::Mutex::new(Vec::new()),
             clock: spin::Mutex::new(crate::KernelClock::new(
@@ -4084,6 +5534,7 @@ where
             image_end: self.shared.image_end,
             sigreturn_trampoline: self.shared.sigreturn_trampoline,
             space: child_space,
+            shared_mem: child_shared_mem,
             process_cpu_ticks: AtomicU64::new(0),
             process_sys_ticks: AtomicU64::new(0),
             peak_rss_kib: AtomicU64::new(0),
@@ -4105,13 +5556,13 @@ where
                     pid: child_pid,
                     completed: false,
                 };
-                let outcome = Box::pin(drive_linux_process_lifecycle(
+                let outcome = drive_linux_process_lifecycle_boxed(
                     child_context,
                     child_proc,
                     child_shared,
                     None,
                     phases::Timeline::disabled(),
-                ))
+                )
                 .await;
                 let termination = match outcome {
                     Ok(exit) => exit.termination,
@@ -4134,18 +5585,50 @@ where
     }
 
     async fn prepare_exec(&mut self, spec: ExecSpec) -> Result<(), ExecError> {
-        let prepared = Box::pin(prepare_exec_in_container(
+        let prepared = prepare_exec_in_container_boxed(
             self.shared,
             &self.cwd,
             &self.root,
             &self.descriptors,
             &self.credentials,
             spec,
-        ))
+        )
         .await?;
         *self.prepared_exec = Some(Box::new(prepared));
         Ok(())
     }
+}
+
+type PreparedExecResult<CpuImpl, Net, StorageImpl> =
+    Result<PreparedExec<CpuImpl, Net, StorageImpl>, ExecError>;
+
+#[inline(never)]
+fn prepare_exec_in_container_boxed<'a, CpuImpl, Net, StorageImpl>(
+    shared: &'a LinuxShared<CpuImpl, Net, StorageImpl, <CpuImpl::Native as NativeExecution>::Space>,
+    cwd: &'a Arc<spin::Mutex<String>>,
+    root: &'a Arc<spin::Mutex<String>>,
+    descriptors: &'a Arc<spin::Mutex<syscall::Descriptors<LinuxResources<Net>>>>,
+    credentials: &'a Arc<spin::Mutex<syscall::Credentials>>,
+    spec: ExecSpec,
+) -> core::pin::Pin<
+    Box<
+        impl core::future::Future<Output = PreparedExecResult<CpuImpl, Net, StorageImpl>>
+        + use<'a, CpuImpl, Net, StorageImpl>,
+    >,
+>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    Box::pin(prepare_exec_in_container(
+        shared,
+        cwd,
+        root,
+        descriptors,
+        credentials,
+        spec,
+    ))
 }
 
 /// Safety net ensuring a forked child process transitions to exited state even
@@ -4294,6 +5777,8 @@ where
         space: &*shared.space,
         user: shared.user,
         stack_growth: Some(shared.stack_growth(process.limit(Resource::Stack).current)),
+        shared_mem: Some(&shared.shared_mem),
+        shared_files: Some(shared.container.shared_files()),
     };
     match process.deliver_pending_signals(
         context,
@@ -4356,6 +5841,8 @@ where
         space: &*shared.space,
         user: shared.user,
         stack_growth: Some(shared.stack_growth(process.limit(Resource::Stack).current)),
+        shared_mem: Some(&shared.shared_mem),
+        shared_files: Some(shared.container.shared_files()),
     };
     match process.deliver_fault_signal(fault, context, &mut memory, shared.sigreturn_trampoline) {
         SignalDelivery::Delivered => false,
@@ -4378,6 +5865,312 @@ where
         }
         SignalDelivery::None | SignalDelivery::Stopped(_) => false,
     }
+}
+
+/// Delivers `SIGBUS` (`BUS_ADRERR`) for an access beyond the backing file's end.
+/// Returns `true` when the thread group terminated.
+fn handle_bus_fault<CpuImpl, Net, StorageImpl, Context>(
+    process: &mut Process<LinuxResources<Net>>,
+    context: &mut Context,
+    shared: &LinuxShared<CpuImpl, Net, StorageImpl, Context::Space>,
+    instance_id: crate::InstanceId,
+    address: VirtAddr,
+) -> bool
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+    Context: UserContext,
+{
+    let mut memory = LinuxMemory {
+        space: &*shared.space,
+        user: shared.user,
+        stack_growth: Some(shared.stack_growth(process.limit(Resource::Stack).current)),
+        shared_mem: Some(&shared.shared_mem),
+        shared_files: Some(shared.container.shared_files()),
+    };
+    match process.deliver_bus_fault(
+        address.raw() as u64,
+        context,
+        &mut memory,
+        shared.sigreturn_trampoline,
+    ) {
+        SignalDelivery::Delivered => false,
+        SignalDelivery::Terminated { signal, .. } => {
+            tracing::debug!(
+                target: "helios_kernel::linux",
+                instance = ?instance_id,
+                tid = process.tid().get(),
+                ?address,
+                signal = signal.raw(),
+                "Linux thread received SIGBUS"
+            );
+            process.terminate_group(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: signal.raw(),
+                    core_dumped: false,
+                },
+            ));
+            true
+        }
+        SignalDelivery::None | SignalDelivery::Stopped(_) => false,
+    }
+}
+
+/// Resolves a demand-backing fault (`NativeError::BackingFault`) on an
+/// uncommitted `MAP_SHARED` or file-backed VMA page, delivering `SIGBUS` when
+/// the page lies beyond the backing file's end. Returns `true` when the thread
+/// group terminated.
+async fn handle_backing_fault<CpuImpl, Net, StorageImpl>(
+    process: &mut Process<LinuxResources<Net>>,
+    context: &mut <CpuImpl::Native as NativeExecution>::Context,
+    shared: &LinuxShared<CpuImpl, Net, StorageImpl, <CpuImpl::Native as NativeExecution>::Space>,
+    platform: &LinuxThreadPlatform<
+        CpuImpl,
+        Net,
+        StorageImpl,
+        <CpuImpl::Native as NativeExecution>::Space,
+    >,
+    instance_id: crate::InstanceId,
+    fault: UserFault,
+    address: VirtAddr,
+) -> bool
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let page_va = address.page_floor();
+    match process.lookup_vma(address.raw() as u64) {
+        Some(syscall::VmaBacking::SharedAnon {
+            start,
+            object_id,
+            object_offset,
+        }) => {
+            let obj = shared.shared_mem.lock().get_object(object_id);
+            let Some(obj) = obj else {
+                return handle_unresolvable_fault(process, context, shared, instance_id, fault);
+            };
+            let page_idx =
+                object_offset.saturating_add(page_va.raw() as u64 - start) / PhysFrame::SIZE as u64;
+            match obj.get_or_alloc_frame(page_idx) {
+                Ok(frame) => match shared.space.attach_shared_frame(page_va, frame) {
+                    Ok(()) => false,
+                    Err(NativeError::OutOfMemory) => {
+                        shared.record_fatal(native_error(NativeError::OutOfMemory));
+                        process.terminate_group(helios_unix::ChildTermination::Killed);
+                        true
+                    }
+                    Err(NativeError::NotMapped) => {
+                        handle_unresolvable_fault(process, context, shared, instance_id, fault)
+                    }
+                    Err(error) => {
+                        panic!("attaching shared anonymous frame at {page_va:?}: {error}")
+                    }
+                },
+                Err(NativeError::OutOfMemory) => {
+                    shared.record_fatal(native_error(NativeError::OutOfMemory));
+                    process.terminate_group(helios_unix::ChildTermination::Killed);
+                    true
+                }
+                Err(error) => panic!("allocating shared anonymous frame at {page_va:?}: {error}"),
+            }
+        }
+        Some(syscall::VmaBacking::File(vma)) => {
+            let page_file_off = vma
+                .file_offset
+                .saturating_add(page_va.raw() as u64 - vma.start);
+            let Ok(meta) = syscall::Filesystem::stat_file(platform, &vma.file).await else {
+                return handle_bus_fault(process, context, shared, instance_id, address);
+            };
+            let eof_page = meta
+                .size
+                .checked_add(PhysFrame::SIZE as u64 - 1)
+                .map_or(u64::MAX, |n| n & !(PhysFrame::SIZE as u64 - 1));
+            if meta.size == 0 || page_file_off >= eof_page {
+                return handle_bus_fault(process, context, shared, instance_id, address);
+            }
+            if vma.is_shared {
+                let obj = shared.shared_mem.lock().get_object(vma.shared_object);
+                let Some(obj) = obj else {
+                    return handle_bus_fault(process, context, shared, instance_id, address);
+                };
+                let page_idx = page_file_off / PhysFrame::SIZE as u64;
+                let frame_res = if let Some(frame) = obj.get_frame(page_idx) {
+                    Ok(frame)
+                } else {
+                    match syscall::Filesystem::read_at(
+                        platform,
+                        &vma.file,
+                        page_file_off,
+                        PhysFrame::SIZE,
+                    )
+                    .await
+                    {
+                        Ok(bytes) => obj.load_file_page(page_idx, &bytes),
+                        Err(_) => {
+                            return handle_bus_fault(
+                                process,
+                                context,
+                                shared,
+                                instance_id,
+                                address,
+                            );
+                        }
+                    }
+                };
+                match frame_res {
+                    Ok(frame) => match shared.space.attach_shared_frame(page_va, frame) {
+                        Ok(()) => false,
+                        Err(NativeError::OutOfMemory) => {
+                            shared.record_fatal(native_error(NativeError::OutOfMemory));
+                            process.terminate_group(helios_unix::ChildTermination::Killed);
+                            true
+                        }
+                        Err(NativeError::NotMapped) => {
+                            handle_unresolvable_fault(process, context, shared, instance_id, fault)
+                        }
+                        Err(error) => {
+                            panic!("attaching shared file frame at {page_va:?}: {error}")
+                        }
+                    },
+                    Err(NativeError::OutOfMemory) => {
+                        shared.record_fatal(native_error(NativeError::OutOfMemory));
+                        process.terminate_group(helios_unix::ChildTermination::Killed);
+                        true
+                    }
+                    Err(error) => panic!("loading shared file frame at {page_va:?}: {error}"),
+                }
+            } else {
+                let Ok(bytes) = syscall::Filesystem::read_at(
+                    platform,
+                    &vma.file,
+                    page_file_off,
+                    PhysFrame::SIZE,
+                )
+                .await
+                else {
+                    return handle_bus_fault(process, context, shared, instance_id, address);
+                };
+                match crate::SharedPageObject::allocate_frame_from_bytes(&bytes)
+                    .and_then(|frame| shared.space.install_private_frame(page_va, frame))
+                {
+                    Ok(()) => false,
+                    Err(NativeError::OutOfMemory) => {
+                        shared.record_fatal(native_error(NativeError::OutOfMemory));
+                        process.terminate_group(helios_unix::ChildTermination::Killed);
+                        true
+                    }
+                    Err(NativeError::NotMapped) => {
+                        handle_unresolvable_fault(process, context, shared, instance_id, fault)
+                    }
+                    Err(error) => panic!("installing private file frame at {page_va:?}: {error}"),
+                }
+            }
+        }
+        None => handle_unresolvable_fault(process, context, shared, instance_id, fault),
+    }
+}
+
+#[inline(never)]
+fn handle_backing_fault_boxed<'a, CpuImpl, Net, StorageImpl>(
+    process: &'a mut Process<LinuxResources<Net>>,
+    context: &'a mut <CpuImpl::Native as NativeExecution>::Context,
+    shared: &'a LinuxShared<CpuImpl, Net, StorageImpl, <CpuImpl::Native as NativeExecution>::Space>,
+    platform: &'a LinuxThreadPlatform<
+        CpuImpl,
+        Net,
+        StorageImpl,
+        <CpuImpl::Native as NativeExecution>::Space,
+    >,
+    instance_id: crate::InstanceId,
+    fault: UserFault,
+    address: VirtAddr,
+) -> core::pin::Pin<
+    Box<impl core::future::Future<Output = bool> + use<'a, CpuImpl, Net, StorageImpl>>,
+>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    Box::pin(handle_backing_fault(
+        process,
+        context,
+        shared,
+        platform,
+        instance_id,
+        fault,
+        address,
+    ))
+}
+
+#[inline(never)]
+fn flush_shared_mappings_boxed<'a, CpuImpl, Net, StorageImpl>(
+    process: &'a Process<LinuxResources<Net>>,
+    memory: &'a LinuxMemory<'a, <CpuImpl::Native as NativeExecution>::Space>,
+    platform: &'a mut LinuxThreadPlatform<
+        CpuImpl,
+        Net,
+        StorageImpl,
+        <CpuImpl::Native as NativeExecution>::Space,
+    >,
+) -> core::pin::Pin<Box<impl core::future::Future<Output = ()> + use<'a, CpuImpl, Net, StorageImpl>>>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    Box::pin(process.flush_shared_mappings(memory, platform))
+}
+
+#[inline(never)]
+fn drive_linux_thread_boxed<CpuImpl, Net, StorageImpl>(
+    context: <CpuImpl::Native as NativeExecution>::Context,
+    process: Process<LinuxResources<Net>>,
+    platform: LinuxThreadPlatform<
+        CpuImpl,
+        Net,
+        StorageImpl,
+        <CpuImpl::Native as NativeExecution>::Space,
+    >,
+) -> core::pin::Pin<
+    Box<
+        impl core::future::Future<Output = ThreadRunEnd<CpuImpl, Net, StorageImpl>>
+        + use<CpuImpl, Net, StorageImpl>,
+    >,
+>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    Box::pin(drive_linux_thread(context, process, platform))
+}
+
+#[inline(never)]
+fn drive_linux_process_lifecycle_boxed<CpuImpl, Net, StorageImpl>(
+    context: <CpuImpl::Native as NativeExecution>::Context,
+    process: Process<LinuxResources<Net>>,
+    shared: Arc<
+        LinuxShared<CpuImpl, Net, StorageImpl, <CpuImpl::Native as NativeExecution>::Space>,
+    >,
+    root_guard: Option<crate::ContainerProcessGuard>,
+    timeline: phases::Timeline,
+) -> core::pin::Pin<
+    Box<
+        impl core::future::Future<Output = Result<ChildExit, ProgramExecError>>
+        + use<CpuImpl, Net, StorageImpl>,
+    >,
+>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    Box::pin(drive_linux_process_lifecycle(
+        context, process, shared, root_guard, timeline,
+    ))
 }
 
 /// Drives one Linux thread (`main` or a `clone`-spawned worker) until that
@@ -4460,6 +6253,8 @@ where
                         stack_growth: Some(
                             shared.stack_growth(process.limit(Resource::Stack).current),
                         ),
+                        shared_mem: Some(&shared.shared_mem),
+                        shared_files: Some(shared.container.shared_files()),
                     };
                     let mut thread = ContextThread {
                         context: &mut context,
@@ -4544,6 +6339,8 @@ where
                             space: &*shared.space,
                             user: shared.user,
                             stack_growth: None,
+                            shared_mem: Some(&shared.shared_mem),
+                            shared_files: Some(shared.container.shared_files()),
                         };
                         if process.restore_signal_frame(&mut context, &memory).is_err() {
                             process.terminate_group(helios_unix::ChildTermination::Signaled(
@@ -4560,8 +6357,10 @@ where
                             space: &*shared.space,
                             user: shared.user,
                             stack_growth: None,
+                            shared_mem: Some(&shared.shared_mem),
+                            shared_files: Some(shared.container.shared_files()),
                         };
-                        process.flush_shared_mappings(&memory, &mut platform).await;
+                        flush_shared_mappings_boxed(&process, &memory, &mut platform).await;
                         let prepared = prepared_exec
                             .expect("SyscallOutcome::Exec follows Thread::prepare_exec");
                         return ThreadRunEnd::Exec(prepared, process);
@@ -4641,6 +6440,21 @@ where
                                 }
                             }
                         }
+                        Err(NativeError::BackingFault) => {
+                            if handle_backing_fault_boxed(
+                                &mut process,
+                                &mut context,
+                                &shared,
+                                &platform,
+                                instance_id,
+                                fault,
+                                address,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                        }
                         Err(NativeError::NotMapped) => {
                             if handle_unresolvable_fault(
                                 &mut process,
@@ -4673,8 +6487,14 @@ where
         space: &*shared.space,
         user: shared.user,
         stack_growth: None,
+        shared_mem: Some(&shared.shared_mem),
+        shared_files: Some(shared.container.shared_files()),
     };
-    process.flush_shared_mappings(&memory, &mut platform).await;
+    flush_shared_mappings_boxed(&process, &memory, &mut platform).await;
+    if process.observer().all_threads_exited() {
+        let now_secs = (syscall::System::realtime_nanos(&platform) / 1_000_000_000) as i64;
+        process.cleanup_ipc_on_exit(now_secs, &mut platform);
+    }
     ThreadRunEnd::Exited
 }
 
@@ -4920,9 +6740,30 @@ where
     StorageImpl: crate::Storage,
 {
     let _root_guard = root_guard;
+    let _proc_guard = ProcProcessGuard {
+        registry: shared.container.proc_registry().clone(),
+        pid: process.pid().get(),
+    };
     loop {
         let cpu = shared.cpu.clone();
         let pid = process.pid();
+        {
+            let comm = process_comm_from_exe(&shared.exe_path);
+            let mut rec = crate::ProcProcessRecord::minimal(
+                pid.get(),
+                shared.ppid,
+                comm,
+                shared.exe_path.clone(),
+            );
+            rec.pgid = shared.proc_signals.pgid();
+            rec.sid = pid.get();
+            rec.argv = shared.argv.clone();
+            rec.env = shared.env.clone();
+            rec.cwd = shared.cwd_handle.lock().clone();
+            rec.credentials = shared.credentials_handle.lock().clone();
+            rec.fds = snapshot_process_fds(&shared.descriptors_handle.lock());
+            shared.container.proc_registry().register_process(rec);
+        }
         let observer = process.observer();
         let proc_signals = process.process_signals();
         let main_platform = LinuxThreadPlatform::new(shared.clone(), pid);
@@ -4935,7 +6776,7 @@ where
         );
         let mut main_exec: Option<ExecHandoff<CpuImpl, Net, StorageImpl>> = None;
         let main_and_siblings = async {
-            match Box::pin(drive_linux_thread(context, process, main_platform)).await {
+            match drive_linux_thread_boxed(context, process, main_platform).await {
                 ThreadRunEnd::Exec(prepared, exec_proc) => {
                     // Condemn any sibling threads so they drain before the
                     // address space is replaced.
@@ -5002,6 +6843,7 @@ where
             match *prepared {
                 PreparedExec::Linux {
                     executable,
+                    exe_path,
                     argv,
                     env,
                     credentials,
@@ -5017,7 +6859,15 @@ where
                         &credentials,
                         secure,
                     )?;
+                    let mut exec_platform =
+                        LinuxThreadPlatform::new(shared.clone(), exec_proc.pid());
+                    let now_secs =
+                        (syscall::System::realtime_nanos(&exec_platform) / 1_000_000_000) as i64;
+                    exec_proc.detach_sysv_shm(now_secs, &mut exec_platform);
                     exec_proc.commit_linux_exec(mapped.program_break, credentials);
+                    exec_proc.sync_memfds(&exec_platform);
+                    shared.container.memfds().reap_unreferenced();
+                    drop(exec_platform);
                     let next_shared = Arc::new(LinuxShared {
                         cpu: shared.cpu.clone(),
                         timer: shared.timer.clone(),
@@ -5031,6 +6881,15 @@ where
                         signal_state: shared.signal_state.clone(),
                         container: shared.container.clone(),
                         grants: LinuxGrants::derive(shared.container.authority()),
+                        pid: exec_proc.pid(),
+                        ppid: shared.ppid,
+                        exe_path,
+                        argv,
+                        env,
+                        cwd_handle: exec_proc.cwd_handle(),
+                        descriptors_handle: exec_proc.descriptors_handle(),
+                        credentials_handle: exec_proc.credentials_handle(),
+                        proc_signals: exec_proc.process_signals(),
                         tty: spin::Mutex::new(shared.tty.lock().clone()),
                         serial_peek: spin::Mutex::new(core::mem::take(
                             &mut *shared.serial_peek.lock(),
@@ -5047,6 +6906,7 @@ where
                         image_end: mapped.image_end,
                         sigreturn_trampoline: mapped.sigreturn_trampoline,
                         space: mapped.space,
+                        shared_mem: Arc::new(spin::Mutex::new(SharedMemoryTable::new())),
                         process_cpu_ticks: AtomicU64::new(
                             shared.process_cpu_ticks.load(Ordering::Relaxed),
                         ),
@@ -5077,7 +6937,18 @@ where
                     argv,
                     env,
                 } => {
+                    let mut exec_platform =
+                        LinuxThreadPlatform::new(shared.clone(), exec_proc.pid());
+                    let now_secs =
+                        (syscall::System::realtime_nanos(&exec_platform) / 1_000_000_000) as i64;
+                    exec_proc.detach_sysv_shm(now_secs, &mut exec_platform);
                     let (surviving_slots, ignored) = exec_proc.commit_wasm_exec();
+                    shared
+                        .container
+                        .memfds()
+                        .remove_process_fds(exec_proc.pid().get());
+                    shared.container.memfds().reap_unreferenced();
+                    drop(exec_platform);
                     let thread_signals = exec_proc.thread_signals().clone();
                     let descriptors = Preview1DescriptorTable::from_slots(surviving_slots);
                     let signal_dispositions: Vec<WasixSignalDisposition> = ignored
@@ -5103,74 +6974,23 @@ where
                     let wasm_runtime = exec_runtime
                         .wasm
                         .expect("PreparedExec::Wasm requires a Wasm runtime");
-                    let wasm_signal_state = WasixSignalState::new();
-                    let wasm_run = Box::pin(run_program_executable(
-                        exec_runtime.exec_context,
+                    return exec_wasm_handoff_boxed(WasmExecHandoff {
+                        exec_context: exec_runtime.exec_context,
                         argv,
                         env,
                         authority,
-                        crate::IpcEndpointGrants::new(),
-                        None,
-                        crate::InheritedSockets::new(),
-                        None,
-                        wasm_runtime.filesystem,
-                        // Exec keeps the process, so it keeps the process's limit.
-                        DescriptorOrigin::SameProcess(descriptors),
-                        wasm_signal_state.clone(),
+                        descriptors,
                         signal_dispositions,
-                        None,
                         spawner,
-                        wasm_runtime.progress,
                         executable,
-                        &wasm_runtime.engine,
-                        &wasm_runtime.runtime,
-                        wasm_runtime.preview1_core_linker,
-                        wasm_runtime.shared_memory_pool,
-                        wasm_runtime.core_module_instance_pre_cache,
+                        wasm_runtime,
                         launched_instance,
                         output_mode,
                         timeline,
-                    ));
-                    // Bridge container Linux signals (`kill(pid, sig)` /
-                    // `kill(-pgid, sig)`) and parent external signals into the
-                    // replacement Wasm/WASIX process while it runs.
-                    let mut wasm_run = wasm_run;
-                    let mut linux_sig_wait = thread_signals.signal_waiter();
-                    let mut ext_sig_wait = external_signal_state.wait_state();
-                    let outcome = core::future::poll_fn(|cx| {
-                        while let Some(sig) = thread_signals.take_pending_signal() {
-                            wasm_signal_state.raise(sig);
-                        }
-                        while let Some(sig) = external_signal_state.take_pending() {
-                            wasm_signal_state.raise(sig);
-                        }
-                        if let Poll::Ready(result) = wasm_run.as_mut().poll(cx) {
-                            return Poll::Ready(result);
-                        }
-                        if thread_signals
-                            .poll_signal_waiter(cx, &mut linux_sig_wait)
-                            .is_ready()
-                        {
-                            while let Some(sig) = thread_signals.take_pending_signal() {
-                                wasm_signal_state.raise(sig);
-                            }
-                            linux_sig_wait = thread_signals.signal_waiter();
-                            let _ = thread_signals.poll_signal_waiter(cx, &mut linux_sig_wait);
-                        }
-                        if external_signal_state
-                            .poll_changed(cx, &mut ext_sig_wait)
-                            .is_ready()
-                        {
-                            while let Some(sig) = external_signal_state.take_pending() {
-                                wasm_signal_state.raise(sig);
-                            }
-                            ext_sig_wait = external_signal_state.wait_state();
-                            let _ = external_signal_state.poll_changed(cx, &mut ext_sig_wait);
-                        }
-                        Poll::Pending
+                        thread_signals,
+                        external_signal_state,
                     })
                     .await;
-                    return outcome;
                 }
             }
         }
@@ -5183,9 +7003,12 @@ where
         let instance_id = shared.launched_instance.id();
         let fatal = shared.take_fatal();
         let termination = observer.termination();
+        let container = shared.container.clone();
         drop(observer);
         drop(proc_signals);
         drop(shared);
+        container.memfds().remove_process_fds(pid.get());
+        container.memfds().reap_unreferenced();
 
         return match fatal {
             Some(error) => Err(error),
@@ -5196,6 +7019,156 @@ where
             }),
         };
     }
+}
+
+struct WasmExecHandoff<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
+    argv: ProgramArgv,
+    env: Vec<(String, String)>,
+    authority: crate::ProcessAuthority,
+    descriptors: Preview1DescriptorTable<Net>,
+    signal_dispositions: Vec<WasixSignalDisposition>,
+    spawner: crate::InstanceSpawner<CpuImpl>,
+    executable: ProgramExecutable<CpuImpl, Net, StorageImpl>,
+    wasm_runtime: LinuxWasmRuntime<CpuImpl, Net, StorageImpl>,
+    launched_instance: crate::RegisteredInstance,
+    output_mode: OutputMode,
+    timeline: phases::Timeline,
+    thread_signals: Arc<syscall::ThreadSignalSlot>,
+    external_signal_state: WasixSignalState,
+}
+
+#[inline(never)]
+fn exec_wasm_handoff_boxed<CpuImpl, Net, StorageImpl>(
+    handoff: WasmExecHandoff<CpuImpl, Net, StorageImpl>,
+) -> core::pin::Pin<
+    Box<
+        impl core::future::Future<Output = Result<ChildExit, ProgramExecError>>
+        + use<CpuImpl, Net, StorageImpl>,
+    >,
+>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    Box::pin(async move {
+        let WasmExecHandoff {
+            exec_context,
+            argv,
+            env,
+            authority,
+            descriptors,
+            signal_dispositions,
+            spawner,
+            executable,
+            wasm_runtime,
+            launched_instance,
+            output_mode,
+            timeline,
+            thread_signals,
+            external_signal_state,
+        } = handoff;
+        let wasm_signal_state = WasixSignalState::new();
+        let mut wasm_run = Box::pin(run_program_executable(
+            exec_context,
+            argv,
+            env,
+            authority,
+            crate::IpcEndpointGrants::new(),
+            None,
+            crate::InheritedSockets::new(),
+            None,
+            wasm_runtime.filesystem,
+            // Exec keeps the process, so it keeps the process's limit.
+            DescriptorOrigin::SameProcess(descriptors),
+            wasm_signal_state.clone(),
+            signal_dispositions,
+            None,
+            spawner,
+            wasm_runtime.progress,
+            executable,
+            &wasm_runtime.engine,
+            &wasm_runtime.runtime,
+            wasm_runtime.preview1_core_linker,
+            wasm_runtime.shared_memory_pool,
+            wasm_runtime.core_module_instance_pre_cache,
+            launched_instance,
+            output_mode,
+            timeline,
+        ));
+        // Bridge container Linux signals (`kill(pid, sig)` / `kill(-pgid, sig)`)
+        // and parent external signals into the replacement Wasm/WASIX process
+        // while it runs.
+        let mut linux_sig_wait = thread_signals.signal_waiter();
+        let mut ext_sig_wait = external_signal_state.wait_state();
+        core::future::poll_fn(|cx| {
+            while let Some(sig) = thread_signals.take_pending_signal() {
+                wasm_signal_state.raise(sig);
+            }
+            while let Some(sig) = external_signal_state.take_pending() {
+                wasm_signal_state.raise(sig);
+            }
+            if let Poll::Ready(result) = wasm_run.as_mut().poll(cx) {
+                return Poll::Ready(result);
+            }
+            if thread_signals
+                .poll_signal_waiter(cx, &mut linux_sig_wait)
+                .is_ready()
+            {
+                while let Some(sig) = thread_signals.take_pending_signal() {
+                    wasm_signal_state.raise(sig);
+                }
+                linux_sig_wait = thread_signals.signal_waiter();
+                let _ = thread_signals.poll_signal_waiter(cx, &mut linux_sig_wait);
+            }
+            if external_signal_state
+                .poll_changed(cx, &mut ext_sig_wait)
+                .is_ready()
+            {
+                while let Some(sig) = external_signal_state.take_pending() {
+                    wasm_signal_state.raise(sig);
+                }
+                ext_sig_wait = external_signal_state.wait_state();
+                let _ = external_signal_state.poll_changed(cx, &mut ext_sig_wait);
+            }
+            Poll::Pending
+        })
+        .await
+    })
+}
+
+#[inline(never)]
+fn load_in_container_boxed<'a, CpuImpl, StorageImpl>(
+    cpu: &'a CpuImpl,
+    container: &'a crate::LinuxContainer<StorageImpl>,
+    base_dir: &'a str,
+    image: Bytes,
+    path: Option<String>,
+    credentials: &'a syscall::Credentials,
+) -> core::pin::Pin<
+    Box<
+        impl core::future::Future<Output = Result<LinuxExecutable, ProgramExecError>>
+        + use<'a, CpuImpl, StorageImpl>,
+    >,
+>
+where
+    CpuImpl: Cpu,
+    StorageImpl: crate::Storage,
+{
+    Box::pin(LinuxExecutable::load_in_container(
+        cpu,
+        container,
+        base_dir,
+        image,
+        path,
+        credentials,
+    ))
 }
 
 /// Runs a Linux process inside `container` to its end: maps `executable`,
@@ -5247,24 +7220,29 @@ where
     container.clamp_credentials(&mut credentials);
     let executable =
         if executable.interpreter.is_none() && executable.interpreter_path(&cpu)?.is_some() {
-            let base_dir = container
-                .authority()
-                .cwd()
-                .map(|preopen| preopen.guest_name())
+            let base_dir = cwd
+                .as_deref()
+                .or_else(|| {
+                    container
+                        .authority()
+                        .cwd()
+                        .map(|preopen| preopen.guest_name())
+                })
                 .unwrap_or("/");
-            Box::pin(LinuxExecutable::load_in_container(
+            load_in_container_boxed(
                 &cpu,
                 &container,
                 base_dir,
                 executable.image,
                 executable.path,
                 &credentials,
-            ))
+            )
             .await?
         } else {
             executable
         };
-    let initial_secure = credentials.user.effective != credentials.user.real
+    let initial_secure = executable.secure
+        || credentials.user.effective != credentials.user.real
         || credentials.group.effective != credentials.group.real;
     let mapped = map_linux_image(
         native,
@@ -5335,6 +7313,11 @@ where
             ..Start::default()
         },
     );
+    let exe_path = executable
+        .path
+        .clone()
+        .or_else(|| argv.first().cloned())
+        .unwrap_or_else(|| String::from("/"));
     let grants = LinuxGrants::derive(container.authority());
     let tty = LinuxTtyState::new(container.authority(), &output_mode, instance_id);
     let shared = Arc::new(LinuxShared {
@@ -5350,6 +7333,15 @@ where
         signal_state,
         container,
         grants,
+        pid,
+        ppid: 0,
+        exe_path,
+        argv,
+        env: environment,
+        cwd_handle: process.cwd_handle(),
+        descriptors_handle: process.descriptors_handle(),
+        credentials_handle: process.credentials_handle(),
+        proc_signals: process.process_signals(),
         tty: spin::Mutex::new(tty),
         serial_peek: spin::Mutex::new(Vec::new()),
         clock: spin::Mutex::new(crate::KernelClock::new(
@@ -5364,6 +7356,7 @@ where
         image_end: mapped.image_end,
         sigreturn_trampoline: mapped.sigreturn_trampoline,
         space: mapped.space,
+        shared_mem: Arc::new(spin::Mutex::new(SharedMemoryTable::new())),
         process_cpu_ticks: AtomicU64::new(0),
         process_sys_ticks: AtomicU64::new(0),
         peak_rss_kib: AtomicU64::new(0),
@@ -5376,13 +7369,13 @@ where
     });
 
     timeline.record(&cpu, LaunchPhase::GuestBegin);
-    Box::pin(drive_linux_process_lifecycle(
+    drive_linux_process_lifecycle_boxed(
         mapped.context,
         process,
         shared,
         Some(process_guard),
         timeline.clone(),
-    ))
+    )
     .await
 }
 
@@ -5438,6 +7431,8 @@ mod tests {
             space: &space,
             user,
             stack_growth: None,
+            shared_mem: None,
+            shared_files: None,
         };
 
         let rw_addr = 0x10_000u64;
@@ -5578,6 +7573,8 @@ mod tests {
             space: &space,
             user,
             stack_growth: None,
+            shared_mem: None,
+            shared_files: None,
         };
         let mut process = Process::new(Abi::X86_64, NonZeroU32::new(1).unwrap(), 0x50_0000);
         let mut call = |number: u64, arguments: [u64; 6]| -> u64 {
@@ -5748,6 +7745,8 @@ mod tests {
             space: &arm_space,
             user,
             stack_growth: None,
+            shared_mem: None,
+            shared_files: None,
         };
         let mut process = Process::new(Abi::Aarch64, NonZeroU32::new(1).unwrap(), image_end as u64);
         let (mut thread, mut output) = (DummyThread, DummyOutput);
@@ -5830,6 +7829,8 @@ mod tests {
             append: false,
             sync: false,
             dsync: false,
+            nonblock: false,
+            noctty: false,
             mode: 0o644,
             umask: 0,
         };
@@ -6297,6 +8298,8 @@ mod tests {
             space: &space,
             user,
             stack_growth: None,
+            shared_mem: None,
+            shared_files: None,
         };
         let mut call = |number: u64,
                         arguments: [u64; 6],
@@ -6691,5 +8694,386 @@ mod tests {
                 ProgramExecErrorDetail::LinuxImageInvalid(crate::LinuxImageRefusal::Interpreter)
             );
         }
+    }
+
+    #[test]
+    fn map_shared_coherence_vm_mayexec_madvise_and_sigbus_beyond_eof() {
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
+        use helios_linux::syscall::{
+            Clock, Denied, FileAccess, FileStat, Filesystem, MemoryTotals, OpenRequest, Process,
+            Resources, Start, Stdio, Stream, SyscallOutcome, System, Thread, Tty, WriteError,
+            dispatch,
+        };
+
+        fn poll_ready<F: Future>(future: F) -> F::Output {
+            let mut fut = core::pin::pin!(future);
+            match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(v) => v,
+                Poll::Pending => panic!("in-memory test future unexpectedly yielded"),
+            }
+        }
+
+        #[derive(Clone)]
+        struct SharedTestFile {
+            ino: u64,
+            data: Arc<spin::Mutex<Vec<u8>>>,
+            access: FileAccess,
+            exec_allowed: bool,
+            shared_files: Arc<crate::linux_container::SharedFileCache>,
+        }
+        struct SharedTestRes;
+        impl Resources for SharedTestRes {
+            type File = SharedTestFile;
+            type Network = helios_unix::NoNetwork;
+            type Data = u64;
+        }
+        struct SharedTestThread;
+        impl Thread<SharedTestRes> for SharedTestThread {
+            fn thread_pointer(&self) -> u64 {
+                0
+            }
+            fn set_thread_pointer(&mut self, _: u64) -> Result<(), Denied> {
+                Err(Denied)
+            }
+            fn spawn_thread(
+                &mut self,
+                _: Process<SharedTestRes>,
+                _: syscall::SpawnedThread,
+            ) -> Result<(), syscall::SpawnError> {
+                unreachable!()
+            }
+        }
+        struct SharedTestHost;
+        impl syscall::Network<helios_unix::NoNetwork> for SharedTestHost {
+            fn to_ip(&self, a: core::convert::Infallible) -> syscall::IpAddr {
+                match a {}
+            }
+            fn encode_ip(&self, _: syscall::IpAddr) -> core::convert::Infallible {
+                unreachable!()
+            }
+        }
+        impl Stdio for SharedTestHost {
+            async fn write(&mut self, _: Stream, bytes: &[u8]) -> Result<usize, WriteError> {
+                Ok(bytes.len())
+            }
+            async fn read_input(&mut self, _: usize) -> Result<Bytes, Denied> {
+                Err(Denied)
+            }
+        }
+        impl Clock for SharedTestHost {
+            fn now_nanos(&self) -> u64 {
+                0
+            }
+            async fn sleep_until(&self, _: u64) {}
+        }
+        impl System for SharedTestHost {
+            fn realtime_nanos(&self) -> u64 {
+                0
+            }
+            fn set_realtime_nanos(&mut self, _: u64) -> Result<(), Denied> {
+                Err(Denied)
+            }
+            fn cpu_nanos(&self) -> u64 {
+                0
+            }
+            fn fill_random(&mut self, _: &mut [u8]) {}
+            fn memory(&self) -> MemoryTotals {
+                MemoryTotals {
+                    total_bytes: 0,
+                    free_bytes: 0,
+                }
+            }
+            fn process_count(&self) -> u32 {
+                1
+            }
+            fn kernel_version(&self) -> &str {
+                "test"
+            }
+        }
+        impl Tty for SharedTestHost {}
+        impl Filesystem<SharedTestRes> for SharedTestHost {
+            fn file_access(&self, file: &SharedTestFile) -> FileAccess {
+                file.access
+            }
+            fn can_exec_file(&self, file: &SharedTestFile) -> bool {
+                file.exec_allowed
+            }
+            fn same_file(&self, a: &SharedTestFile, b: &SharedTestFile) -> bool {
+                a.ino == b.ino
+            }
+            async fn stat_file(
+                &self,
+                file: &SharedTestFile,
+            ) -> Result<FileStat, syscall::FsOpError> {
+                Ok(FileStat {
+                    dev: 7,
+                    ino: file.ino,
+                    kind: NodeKind::File,
+                    permissions: if file.exec_allowed { 0o755 } else { 0o644 },
+                    nlink: 1,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                    size: file.data.lock().len() as u64,
+                    access_nanos: 0,
+                    modified_nanos: 0,
+                    status_nanos: 0,
+                })
+            }
+            async fn read_at(
+                &self,
+                file: &SharedTestFile,
+                offset: u64,
+                max_bytes: usize,
+            ) -> Result<Bytes, syscall::FsOpError> {
+                let guard = file.data.lock();
+                let start = (offset as usize).min(guard.len());
+                let end = start.saturating_add(max_bytes).min(guard.len());
+                let mut out = guard[start..end].to_vec();
+                drop(guard);
+                file.shared_files
+                    .overlay_file_read(7, file.ino, offset, &mut out);
+                Ok(Bytes::from(out))
+            }
+            async fn write_at(
+                &mut self,
+                file: &SharedTestFile,
+                position: helios_hal::fs::WritePosition,
+                bytes: &[u8],
+                _: &syscall::Credentials,
+            ) -> Result<helios_hal::fs::Landed, syscall::FsOpError> {
+                let mut guard = file.data.lock();
+                let at = match position {
+                    helios_hal::fs::WritePosition::At(off) => off as usize,
+                    helios_hal::fs::WritePosition::End => guard.len(),
+                };
+                if at + bytes.len() > guard.len() {
+                    guard.resize(at + bytes.len(), 0);
+                }
+                guard[at..at + bytes.len()].copy_from_slice(bytes);
+                drop(guard);
+                file.shared_files
+                    .apply_file_write(7, file.ino, at as u64, bytes);
+                Ok(helios_hal::fs::Landed {
+                    offset: at as u64,
+                    len: bytes.len(),
+                })
+            }
+            async fn sync(&self, _: &SharedTestFile, _: bool) -> Result<(), syscall::FsOpError> {
+                Ok(())
+            }
+            async fn open(
+                &mut self,
+                _: Option<&SharedTestFile>,
+                _: &str,
+                _: &str,
+                _: OpenRequest,
+                _: &syscall::Credentials,
+            ) -> Result<SharedTestFile, syscall::FsOpError> {
+                Err(syscall::FsOpError::Fs(helios_hal::fs::FsError::NoEntry))
+            }
+        }
+
+        ensure_pool();
+        let page = PhysFrame::SIZE as u64;
+        let start = PhysFrame::SIZE;
+        let end = 1usize << 32;
+        let space = NativeSpace::new(DummyTables, start as u64, end as u64);
+        let user = VirtRange::new(VirtAddr::new(start), end - start);
+        let shared_mem = spin::Mutex::new(SharedMemoryTable::new());
+        let shared_files = Arc::new(crate::linux_container::SharedFileCache::new());
+
+        let backing = Arc::new(spin::Mutex::new(b"AAAA----BBBB----CCCC".to_vec()));
+        let rw_file = SharedTestFile {
+            ino: 101,
+            data: backing.clone(),
+            access: FileAccess::ReadWrite,
+            exec_allowed: false,
+            shared_files: shared_files.clone(),
+        };
+        let mut descs = syscall::standard_streams::<SharedTestRes>();
+        let fd = descs
+            .insert_entry(helios_unix::FileDescriptorEntry::new(
+                helios_unix::FileDescriptor::File(helios_unix::OpenFile::new(rw_file.clone())),
+                false,
+            ))
+            .expect("insert fd") as u64;
+
+        let mut process = Process::with_descriptors(
+            Abi::X86_64,
+            NonZeroU32::new(1).unwrap(),
+            0x50_0000,
+            descs,
+            Start::default(),
+        );
+        let mut host = SharedTestHost;
+        let mut memory = LinuxMemory {
+            space: &space,
+            user,
+            stack_growth: None,
+            shared_mem: Some(&shared_mem),
+            shared_files: Some(&shared_files),
+        };
+        let mut call = |number: u64,
+                        arguments: [u64; 6],
+                        memory: &mut LinuxMemory<'_, NativeSpace<DummyTables>>|
+         -> u64 {
+            let mut thread = SharedTestThread;
+            match poll_ready(dispatch(
+                &mut process,
+                Call { number, arguments },
+                memory,
+                &mut thread,
+                &mut host,
+            )) {
+                ControlFlow::Continue(SyscallOutcome::Return(v)) => v,
+                other => panic!("unexpected syscall outcome: {other:?}"),
+            }
+        };
+
+        const SYS_MMAP: u64 = 9;
+        const SYS_MPROTECT: u64 = 10;
+        const SYS_MSYNC: u64 = 26;
+        const SYS_MADVISE: u64 = 28;
+        const PROT_NONE: u64 = 0;
+        const PROT_READ: u64 = 1;
+        const PROT_RW: u64 = 3;
+        const PROT_RX: u64 = 5;
+        const MAP_SHARED: u64 = 0x01;
+        const MAP_PRIVATE: u64 = 0x02;
+        const MS_SYNC: u64 = 4;
+        const MADV_DONTNEED: u64 = 4;
+        const MADV_FREE: u64 = 8;
+        const EACCES_NEG: u64 = (-13i64) as u64;
+        const EINVAL_NEG: u64 = (-22i64) as u64;
+
+        // 1. Two MAP_SHARED mappings of the same file share the exact underlying frame,
+        //    and a 2-page mapping leaves page 1 beyond EOF (BackingFault -> SIGBUS).
+        let map_a = call(
+            SYS_MMAP,
+            [0x100_0000, 2 * page, PROT_RW, MAP_SHARED, fd, 0],
+            &mut memory,
+        );
+        let map_b = call(
+            SYS_MMAP,
+            [0x200_0000, page, PROT_RW, MAP_SHARED, fd, 0],
+            &mut memory,
+        );
+        assert_eq!(map_a, 0x100_0000);
+        assert_eq!(map_b, 0x200_0000);
+        space.write(VirtAddr::new(map_a as usize), b"1111").unwrap();
+        let mut seen = [0u8; 20];
+        space
+            .read(VirtAddr::new(map_b as usize), &mut seen)
+            .unwrap();
+        assert_eq!(&seen, b"1111----BBBB----CCCC");
+
+        // 2. Concurrent write(2) updates bytes 8..12 without clobbering mmap's dirty 0..4;
+        //    mprotect(PROT_NONE) preserves dirty bytes for msync!
+        poll_ready(SharedTestHost.write_at(
+            &rw_file,
+            helios_hal::fs::WritePosition::At(8),
+            b"2222",
+            &syscall::Credentials::root(),
+        ))
+        .expect("write(2) succeeds");
+        assert_eq!(
+            call(SYS_MPROTECT, [map_a, page, PROT_NONE, 0, 0, 0], &mut memory),
+            0
+        );
+        assert_eq!(
+            call(SYS_MSYNC, [map_a, page, MS_SYNC, 0, 0, 0], &mut memory),
+            0
+        );
+        assert_eq!(
+            backing.lock().as_slice(),
+            b"1111----2222----CCCC",
+            "msync after PROT_NONE writes only dirty mmap bytes without clobbering write(2)"
+        );
+
+        // 3. VM_MAYEXEC: mmap(PROT_READ) on a non-executable file + mprotect(PROT_EXEC) -> EACCES.
+        let ro_noexec = call(
+            SYS_MMAP,
+            [0x300_0000, 2 * page, PROT_READ, MAP_PRIVATE, fd, 0],
+            &mut memory,
+        );
+        assert_eq!(ro_noexec, 0x300_0000);
+        assert_eq!(
+            call(
+                SYS_MPROTECT,
+                [ro_noexec, page, PROT_RX, 0, 0, 0],
+                &mut memory
+            ),
+            EACCES_NEG,
+            "mprotect(PROT_EXEC) must fail with EACCES when VM_MAYEXEC is false"
+        );
+
+        // 4. madvise(MADV_DONTNEED) on file-backed MAP_PRIVATE reloads file bytes,
+        //    on MAP_SHARED preserves shared bytes, and MADV_FREE returns EINVAL.
+        let priv_rw = call(
+            SYS_MMAP,
+            [0x400_0000, page, PROT_RW, MAP_PRIVATE, fd, 0],
+            &mut memory,
+        );
+        assert_eq!(priv_rw, 0x400_0000);
+        space
+            .write(VirtAddr::new(priv_rw as usize), b"DIRTY-PRIV")
+            .unwrap();
+        assert_eq!(
+            call(
+                SYS_MADVISE,
+                [priv_rw, page, MADV_FREE, 0, 0, 0],
+                &mut memory
+            ),
+            EINVAL_NEG
+        );
+        assert_eq!(
+            call(
+                SYS_MADVISE,
+                [priv_rw, page, MADV_DONTNEED, 0, 0, 0],
+                &mut memory
+            ),
+            0
+        );
+        space
+            .read(VirtAddr::new(priv_rw as usize), &mut seen)
+            .unwrap();
+        assert_eq!(
+            &seen, b"1111----2222----CCCC",
+            "MADV_DONTNEED on file-backed MAP_PRIVATE reloads from file instead of zeroing"
+        );
+        assert_eq!(
+            call(
+                SYS_MADVISE,
+                [map_b, page, MADV_DONTNEED, 0, 0, 0],
+                &mut memory
+            ),
+            0
+        );
+        space
+            .read(VirtAddr::new(map_b as usize), &mut seen)
+            .unwrap();
+        assert_eq!(
+            &seen, b"1111----2222----CCCC",
+            "MADV_DONTNEED on MAP_SHARED preserves shared contents"
+        );
+
+        // 5. Beyond-EOF page (map_a + page) triggers BackingFault and delivers SIGBUS.
+        assert_eq!(
+            space.resolve_fault(VirtAddr::new((map_a + page) as usize), PageFlags::READ),
+            Err(NativeError::BackingFault)
+        );
+        let mut ctx = NativeTestContext {
+            entry: VirtAddr::new(0x40_0000),
+            stack: VirtAddr::new(0x50_0000),
+        };
+        assert_eq!(
+            process.deliver_bus_fault(map_a + page, &mut ctx, &mut memory, 0),
+            SignalDelivery::Terminated {
+                signal: helios_unix::Signal::SIGBUS,
+                core_dumped: true,
+            }
+        );
     }
 }

@@ -761,24 +761,27 @@ fn map_container_error(error: crate::ContainerError) -> ProgramExecError {
 async fn load_container_executable<CpuImpl, StorageImpl>(
     cpu: &CpuImpl,
     container: &crate::LinuxContainer<StorageImpl>,
+    base_dir: &str,
     path: &str,
     argv: &mut ProgramArgv,
     creds: &helios_linux::syscall::Credentials,
     timeline: &phases::Timeline,
-) -> Result<LinuxExecutable, ProgramExecError>
+) -> Result<(LinuxExecutable, helios_linux::syscall::Credentials), ProgramExecError>
 where
     CpuImpl: Cpu,
     StorageImpl: crate::Storage,
 {
     let mut current_path = path.to_owned();
-    let bytes = {
+    let (final_path, bytes) = {
         let mut resolved = None;
         for depth in 0..=MAX_SHEBANG_DEPTH {
-            let contents = container
-                .filesystem()
-                .read_executable(&current_path)
-                .await
-                .map_err(ProgramExecError::from_source_read_error)?;
+            let (resolved_path, contents) = Box::pin(container.filesystem().read_executable_at(
+                base_dir,
+                &current_path,
+                creds,
+            ))
+            .await
+            .map_err(map_fs_op_error_to_program)?;
             let bytes = match contents {
                 FileContents::Boot(boot) => Bytes::copy_from_slice(boot.as_slice()),
                 FileContents::Written(written) => written,
@@ -790,11 +793,11 @@ where
                         detail: ProgramExecErrorDetail::InvalidProgramPath,
                     });
                 }
-                argv.rewrite_shebang(interp.clone(), opt_arg, current_path);
+                argv.rewrite_shebang(interp.clone(), opt_arg, resolved_path);
                 current_path = interp;
                 continue;
             }
-            resolved = Some(bytes);
+            resolved = Some((resolved_path, bytes));
             break;
         }
         resolved.ok_or(ProgramExecError {
@@ -810,17 +813,29 @@ where
         });
     }
     timeline.record(cpu, LaunchPhase::LoadBegin);
-    let loaded = LinuxExecutable::load_in_container(
+    let mut loaded = Box::pin(LinuxExecutable::load_in_container(
         cpu,
         container,
-        "/",
+        base_dir,
         bytes,
-        Some(path.to_owned()),
+        Some(final_path.clone()),
         creds,
-    )
+    ))
     .await?;
+    // Apply setuid/sgid/file-capability transitions strictly for the final
+    // executable binary (never an intermediate `#!` script), bounded by the
+    // container's authority ceiling and mount `NO_SUID`.
+    let next_creds = Box::pin(container.filesystem().exec_credentials_resolved(
+        &final_path,
+        creds,
+        container.authority_cap_ceiling(),
+    ))
+    .await
+    .map_err(map_fs_op_error_to_program)?;
+    let secure = helios_linux::syscall::permissions::exec_is_secure(creds, &next_creds);
+    loaded.set_secure(secure);
     timeline.record(cpu, LaunchPhase::LoadComplete);
-    Ok(loaded)
+    Ok((loaded, next_creds))
 }
 
 #[cfg(feature = "linux")]
@@ -2060,15 +2075,29 @@ where
             .unwrap_or_else(|| container.default_credentials().clone());
         container.clamp_credentials(&mut creds);
         launch.cwd = validate_container_cwd(&container, launch.cwd.as_deref()).await?;
-        let executable = load_container_executable(
+        let base_dir = launch
+            .cwd
+            .clone()
+            .or_else(|| {
+                container
+                    .authority()
+                    .cwd()
+                    .map(|preopen| String::from(preopen.guest_name()))
+            })
+            .unwrap_or_else(|| String::from("/"));
+        let (executable, next_creds) = Box::pin(load_container_executable(
             &exec_context.cpu,
             &container,
+            &base_dir,
             path,
             &mut launch.argv,
             &creds,
             &launch.timeline,
-        )
+        ))
         .await?;
+        if let Some(container_launch) = launch.container.as_mut() {
+            container_launch.credentials = Some(next_creds);
+        }
         self.spawn_loaded(exec_context, ProgramExecutable::Linux(executable), launch)
     }
 
@@ -2093,15 +2122,29 @@ where
             .unwrap_or_else(|| container.default_credentials().clone());
         container.clamp_credentials(&mut creds);
         launch.cwd = validate_container_cwd(&container, launch.cwd.as_deref()).await?;
-        let executable = load_container_executable(
+        let base_dir = launch
+            .cwd
+            .clone()
+            .or_else(|| {
+                container
+                    .authority()
+                    .cwd()
+                    .map(|preopen| String::from(preopen.guest_name()))
+            })
+            .unwrap_or_else(|| String::from("/"));
+        let (executable, next_creds) = Box::pin(load_container_executable(
             &exec_context.cpu,
             &container,
+            &base_dir,
             path,
             &mut launch.argv,
             &creds,
             &launch.timeline,
-        )
+        ))
         .await?;
+        if let Some(container_launch) = launch.container.as_mut() {
+            container_launch.credentials = Some(next_creds);
+        }
         self.exec_loaded_buffered(
             exec_context,
             ProgramExecutable::Linux(executable),
@@ -2113,38 +2156,50 @@ where
     }
 
     #[cfg(feature = "linux")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "overlay launch takes cpu, container, cwd, path, optional fallback bytes, argv, credentials, and timeline"
+    )]
     async fn load_overlay_executable(
         cpu: &CpuImpl,
         container: &crate::LinuxContainer<StorageImpl>,
+        base_dir: &str,
         path: &str,
         fallback_bytes: Option<Bytes>,
         argv: &mut ProgramArgv,
         creds: &helios_linux::syscall::Credentials,
         timeline: &phases::Timeline,
-    ) -> Result<LinuxExecutable, ProgramExecError> {
-        match load_container_executable(cpu, container, path, argv, creds, timeline).await {
-            Ok(executable) => Ok(executable),
+    ) -> Result<(LinuxExecutable, helios_linux::syscall::Credentials), ProgramExecError> {
+        match Box::pin(load_container_executable(
+            cpu, container, base_dir, path, argv, creds, timeline,
+        ))
+        .await
+        {
+            Ok(loaded) => Ok(loaded),
             Err(error)
                 if error.kind == ProgramExecErrorKind::NotFound && fallback_bytes.is_some() =>
             {
                 let bytes = fallback_bytes.expect("checked is_some above");
                 if let Some((interp, opt_arg)) = parse_shebang(&bytes) {
                     argv.rewrite_shebang(interp.clone(), opt_arg, path.to_owned());
-                    load_container_executable(cpu, container, &interp, argv, creds, timeline).await
+                    Box::pin(load_container_executable(
+                        cpu, container, base_dir, &interp, argv, creds, timeline,
+                    ))
+                    .await
                 } else if is_linux_elf(&bytes) {
                     timeline.record(cpu, LaunchPhase::SourceRead);
                     timeline.record(cpu, LaunchPhase::LoadBegin);
-                    let loaded = LinuxExecutable::load_in_container(
+                    let loaded = Box::pin(LinuxExecutable::load_in_container(
                         cpu,
                         container,
-                        "/",
+                        base_dir,
                         bytes,
                         Some(path.to_owned()),
                         creds,
-                    )
+                    ))
                     .await?;
                     timeline.record(cpu, LaunchPhase::LoadComplete);
-                    Ok(loaded)
+                    Ok((loaded, creds.clone()))
                 } else {
                     Err(error)
                 }
@@ -2175,9 +2230,20 @@ where
             .unwrap_or_else(|| container.default_credentials().clone());
         container.clamp_credentials(&mut creds);
         launch.cwd = validate_container_cwd(&container, launch.cwd.as_deref()).await?;
-        let executable = Self::load_overlay_executable(
+        let base_dir = launch
+            .cwd
+            .clone()
+            .or_else(|| {
+                container
+                    .authority()
+                    .cwd()
+                    .map(|preopen| String::from(preopen.guest_name()))
+            })
+            .unwrap_or_else(|| String::from("/"));
+        let (executable, next_creds) = Self::load_overlay_executable(
             &exec_context.cpu,
             &container,
+            &base_dir,
             path,
             fallback_bytes,
             &mut launch.argv,
@@ -2185,6 +2251,9 @@ where
             &launch.timeline,
         )
         .await?;
+        if let Some(container_launch) = launch.container.as_mut() {
+            container_launch.credentials = Some(next_creds);
+        }
         self.spawn_loaded(exec_context, ProgramExecutable::Linux(executable), launch)
     }
 
@@ -2210,9 +2279,20 @@ where
             .unwrap_or_else(|| container.default_credentials().clone());
         container.clamp_credentials(&mut creds);
         launch.cwd = validate_container_cwd(&container, launch.cwd.as_deref()).await?;
-        let executable = Self::load_overlay_executable(
+        let base_dir = launch
+            .cwd
+            .clone()
+            .or_else(|| {
+                container
+                    .authority()
+                    .cwd()
+                    .map(|preopen| String::from(preopen.guest_name()))
+            })
+            .unwrap_or_else(|| String::from("/"));
+        let (executable, next_creds) = Self::load_overlay_executable(
             &exec_context.cpu,
             &container,
+            &base_dir,
             path,
             fallback_bytes,
             &mut launch.argv,
@@ -2220,6 +2300,9 @@ where
             &launch.timeline,
         )
         .await?;
+        if let Some(container_launch) = launch.container.as_mut() {
+            container_launch.credentials = Some(next_creds);
+        }
         self.exec_loaded_buffered(
             exec_context,
             ProgramExecutable::Linux(executable),

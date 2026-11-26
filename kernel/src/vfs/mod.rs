@@ -38,13 +38,21 @@ extern crate alloc;
 
 mod btrfs;
 mod btrfs_management;
+#[cfg(feature = "linux")]
+mod dev;
 mod erofs;
+#[cfg(feature = "linux")]
+mod fifo;
 mod host;
 mod memory;
 mod node;
+#[cfg(feature = "linux")]
+mod proc;
 mod request;
 mod root;
 mod storage;
+#[cfg(feature = "linux")]
+mod sys;
 mod unix;
 
 use btrfs::WritableMount;
@@ -52,7 +60,11 @@ pub use btrfs::{
     BtrfsFs, BtrfsMountError, BtrfsOpenHandle, BtrfsService, BtrfsWriteOptions, CommitPolicy,
 };
 pub use btrfs_management::{BtrfsManagementError, BtrfsVolumeRequest};
+#[cfg(feature = "linux")]
+pub use dev::{DevFs, PtyRegistry};
 pub use erofs::{DiskImage, ErofsError, ErofsFs, ReaderError};
+#[cfg(feature = "linux")]
+pub use fifo::{FifoKey, FifoRegistry};
 pub use host::{HostShare, HostShareWrite};
 pub(crate) use memory::default_memory_storage_pool;
 pub use memory::{
@@ -60,11 +72,19 @@ pub use memory::{
     XattrSetMode,
 };
 pub use node::{FsDescriptor, FsDescriptorFlags};
+#[cfg(feature = "linux")]
+pub use proc::{
+    ContainerNetSnapshot, NetIfSnapshot, NetRouteSnapshot, ProcCaller, ProcFdEntry, ProcFs,
+    ProcLimitEntry, ProcMapEntry, ProcMountEntry, ProcProcessRecord, ProcRegistry,
+    ProcThreadRecord, SharedUts,
+};
 pub use request::{
     AttachedStorage, MountRequest, MountRequestError, MountSource, request_mount, request_unmount,
 };
 pub use root::{OverlayLower, RootFs, RootWrite};
 pub use storage::{NoDisks, Storage};
+#[cfg(feature = "linux")]
+pub use sys::SysFs;
 pub use unix::{
     MountFlags, MountGrant, MountSharing, SharedOwner, UnixAttributes, UnixFsError,
     UnixNodeMetadata,
@@ -701,6 +721,10 @@ impl<S: Storage> PinnedLower<S> {
             MountedFs::Erofs(fs) => LowerFs::Erofs(fs.clone()),
             MountedFs::Btrfs(fs) => LowerFs::Btrfs(fs.clone()),
             MountedFs::Overlay(_) => return Err(FsError::Unsupported),
+            #[cfg(feature = "linux")]
+            MountedFs::Dev(_) | MountedFs::Proc(_) | MountedFs::Sys(_) => {
+                return Err(FsError::Unsupported);
+            }
         };
         Ok(Self {
             fs,
@@ -745,15 +769,19 @@ impl<S: Storage> OverlayLower for PinnedLower<S> {
     ) -> FsResult<Opened<OwnedFsPath>> {
         let inner = self.resolve_inner(path)?;
         let handle = OwnedFsPath::from(path);
+        // Pinned lower layers are strictly read-only: strip create/exclusive/
+        // truncate flags so opening a lower entry can never mutate or truncate
+        // the underlying mount.
+        let read_only = flags & OpenFlags::DIRECTORY;
         alloc::boxed::Box::pin(async move {
             let p = inner.as_path();
             let metadata = match &self.fs {
-                LowerFs::Root(fs) => fs.open(p, flags, now, payer).await?.metadata,
-                LowerFs::Boot(fs) => fs.open(p, flags, now, payer).await?.metadata,
-                LowerFs::Memory(fs) => fs.open(p, flags, now, payer).await?.metadata,
-                LowerFs::Host(fs) => fs.open(p, flags, now, payer).await?.metadata,
-                LowerFs::Erofs(fs) => fs.open(p, flags, now, payer).await?.metadata,
-                LowerFs::Btrfs(fs) => fs.open(p, flags, now, payer).await?.metadata,
+                LowerFs::Root(fs) => fs.open(p, read_only, now, payer).await?.metadata,
+                LowerFs::Boot(fs) => fs.open(p, read_only, now, payer).await?.metadata,
+                LowerFs::Memory(fs) => fs.open(p, read_only, now, payer).await?.metadata,
+                LowerFs::Host(fs) => fs.open(p, read_only, now, payer).await?.metadata,
+                LowerFs::Erofs(fs) => fs.open(p, read_only, now, payer).await?.metadata,
+                LowerFs::Btrfs(fs) => fs.open(p, read_only, now, payer).await?.metadata,
             };
             Ok(Opened { metadata, handle })
         })
@@ -921,35 +949,15 @@ impl<S: Storage> OverlayLower for PinnedLower<S> {
     }
 
     async fn lower_sync<'a>(&'a self, path: FsPath<'a>) -> FsResult<()> {
-        let inner = self.resolve_inner(path)?;
-        alloc::boxed::Box::pin(async move {
-            let p = inner.as_path();
-            match &self.fs {
-                LowerFs::Root(fs) => fs.sync(p).await,
-                LowerFs::Boot(fs) => fs.sync(p).await,
-                LowerFs::Memory(fs) => fs.sync(p).await,
-                LowerFs::Host(fs) => fs.sync(p).await,
-                LowerFs::Erofs(fs) => fs.sync(p).await,
-                LowerFs::Btrfs(fs) => fs.sync(p).await,
-            }
-        })
-        .await
+        // Pinned lower layers are read-only; syncing them is a no-op once the
+        // path resolves within the pinned subtree.
+        let _ = self.resolve_inner(path)?;
+        Ok(())
     }
 
     async fn lower_sync_data<'a>(&'a self, path: FsPath<'a>) -> FsResult<()> {
-        let inner = self.resolve_inner(path)?;
-        alloc::boxed::Box::pin(async move {
-            let p = inner.as_path();
-            match &self.fs {
-                LowerFs::Root(fs) => fs.sync_data(p).await,
-                LowerFs::Boot(fs) => fs.sync_data(p).await,
-                LowerFs::Memory(fs) => fs.sync_data(p).await,
-                LowerFs::Host(fs) => fs.sync_data(p).await,
-                LowerFs::Erofs(fs) => fs.sync_data(p).await,
-                LowerFs::Btrfs(fs) => fs.sync_data(p).await,
-            }
-        })
-        .await
+        let _ = self.resolve_inner(path)?;
+        Ok(())
     }
 }
 
@@ -958,23 +966,41 @@ impl<S: Storage> OverlayLower for PinnedLower<S> {
 /// ([`PinnedLower`]).
 pub type OverlayFs<S> = RootFs<PinnedLower<S>>;
 
-mount_kinds! {
-    /// A namespace's root: its own tree over the boot image. Only the
-    /// table's root is of this kind; [`MountTable::mount`] refuses it.
-    Root(RootFs => OwnedFsPath),
-    /// An ephemeral container root overlay over a pinned read-only lower tree.
-    /// Lives exclusively inside a container's mount table; [`MountTable::mount`] refuses it.
-    Overlay(OverlayFs<S> => OwnedFsPath),
-    /// The boot image on its own, read-only.
-    Boot(BootFs => OwnedFsPath),
-    /// A tree in kernel memory, shared by every namespace that sees it.
-    Memory(MemoryFs => OwnedFsPath),
-    /// The host share over 9p.
-    Host(HostShare<S::HostShare> => OwnedFsPath),
-    /// An EROFS image on a mount-source disk, read-only.
-    Erofs(ErofsFs<S::Disk> => OwnedFsPath),
-    /// A btrfs image on a mount-source disk.
-    Btrfs(BtrfsFs<S::Disk> => BtrfsOpenHandle),
+macro_rules! define_mounted_fs {
+    ($($extra:tt)*) => {
+        mount_kinds! {
+            /// A namespace's root: its own tree over the boot image. Only the
+            /// table's root is of this kind; [`MountTable::mount`] refuses it.
+            Root(RootFs => OwnedFsPath),
+            /// An ephemeral container root overlay over a pinned read-only lower tree.
+            /// Lives exclusively inside a container's mount table; [`MountTable::mount`] refuses it.
+            Overlay(OverlayFs<S> => OwnedFsPath),
+            /// The boot image on its own, read-only.
+            Boot(BootFs => OwnedFsPath),
+            /// A tree in kernel memory, shared by every namespace that sees it.
+            Memory(MemoryFs => OwnedFsPath),
+            /// The host share over 9p.
+            Host(HostShare<S::HostShare> => OwnedFsPath),
+            /// An EROFS image on a mount-source disk, read-only.
+            Erofs(ErofsFs<S::Disk> => OwnedFsPath),
+            /// A btrfs image on a mount-source disk.
+            Btrfs(BtrfsFs<S::Disk> => BtrfsOpenHandle),
+            $($extra)*
+        }
+    };
+}
+
+#[cfg(not(feature = "linux"))]
+define_mounted_fs! {}
+
+#[cfg(feature = "linux")]
+define_mounted_fs! {
+    /// A container-private `/dev` pseudo-filesystem (`devtmpfs` + `/dev/pts`).
+    Dev(DevFs => OwnedFsPath),
+    /// A container-isolated `/proc` pseudo-filesystem (`procfs`).
+    Proc(ProcFs => OwnedFsPath),
+    /// A container-isolated `/sys` pseudo-filesystem (`sysfs`).
+    Sys(SysFs => OwnedFsPath),
 }
 
 impl<S: Storage> MountedFs<S> {
@@ -988,6 +1014,12 @@ impl<S: Storage> MountedFs<S> {
             Self::Host(_) => "host",
             Self::Erofs(_) => "erofs",
             Self::Btrfs(_) => "btrfs",
+            #[cfg(feature = "linux")]
+            Self::Dev(_) => "devtmpfs",
+            #[cfg(feature = "linux")]
+            Self::Proc(_) => "proc",
+            #[cfg(feature = "linux")]
+            Self::Sys(_) => "sysfs",
         }
     }
 
@@ -999,6 +1031,8 @@ impl<S: Storage> MountedFs<S> {
             Self::Overlay(fs) => fs.upper().telemetry().overlay_pages,
             Self::Memory(fs) => fs.telemetry().overlay_pages,
             Self::Boot(_) | Self::Host(_) | Self::Erofs(_) | Self::Btrfs(_) => 0,
+            #[cfg(feature = "linux")]
+            Self::Dev(_) | Self::Proc(_) | Self::Sys(_) => 0,
         }
     }
 
@@ -1049,6 +1083,12 @@ impl<S: Storage> MountedFs<S> {
                     rdev: 0,
                 })
             }
+            #[cfg(feature = "linux")]
+            Self::Dev(fs) => fs.unix_node_metadata(path),
+            #[cfg(feature = "linux")]
+            Self::Proc(fs) => fs.unix_node_metadata(path, None),
+            #[cfg(feature = "linux")]
+            Self::Sys(fs) => fs.unix_node_metadata(path),
         }
     }
 
@@ -1106,6 +1146,14 @@ impl<S: Storage> MountedFs<S> {
                     rdev: 0,
                 })
             }
+            #[cfg(feature = "linux")]
+            (Self::Dev(fs), MountedOpenHandle::Dev(p)) => fs.unix_node_metadata(p.as_path()),
+            #[cfg(feature = "linux")]
+            (Self::Proc(fs), MountedOpenHandle::Proc(p)) => {
+                fs.unix_node_metadata(p.as_path(), None)
+            }
+            #[cfg(feature = "linux")]
+            (Self::Sys(fs), MountedOpenHandle::Sys(p)) => fs.unix_node_metadata(p.as_path()),
             _ => Err(FsError::CrossDevice.into()),
         }
     }
@@ -1171,6 +1219,33 @@ impl<S: Storage> MountedFs<S> {
                     handle: MountedOpenHandle::Erofs(o.handle),
                 })
                 .map_err(UnixFsError::Fs),
+            #[cfg(feature = "linux")]
+            Self::Dev(fs) => fs
+                .open(path, flags, now, payer)
+                .await
+                .map(|o| Opened {
+                    metadata: o.metadata,
+                    handle: MountedOpenHandle::Dev(o.handle),
+                })
+                .map_err(UnixFsError::Fs),
+            #[cfg(feature = "linux")]
+            Self::Proc(fs) => fs
+                .open(path, flags, now, payer)
+                .await
+                .map(|o| Opened {
+                    metadata: o.metadata,
+                    handle: MountedOpenHandle::Proc(o.handle),
+                })
+                .map_err(UnixFsError::Fs),
+            #[cfg(feature = "linux")]
+            Self::Sys(fs) => fs
+                .open(path, flags, now, payer)
+                .await
+                .map(|o| Opened {
+                    metadata: o.metadata,
+                    handle: MountedOpenHandle::Sys(o.handle),
+                })
+                .map_err(UnixFsError::Fs),
         }
     }
 
@@ -1200,6 +1275,8 @@ impl<S: Storage> MountedFs<S> {
                 .create_directory(path, now, payer)
                 .await
                 .map_err(UnixFsError::Fs),
+            #[cfg(feature = "linux")]
+            Self::Dev(_) | Self::Proc(_) | Self::Sys(_) => Err(FsError::ReadOnly.into()),
         }
     }
 
@@ -1230,6 +1307,8 @@ impl<S: Storage> MountedFs<S> {
                 .symlink(target, path, now, payer)
                 .await
                 .map_err(UnixFsError::Fs),
+            #[cfg(feature = "linux")]
+            Self::Dev(_) | Self::Proc(_) | Self::Sys(_) => Err(FsError::ReadOnly.into()),
         }
     }
 
@@ -1248,6 +1327,8 @@ impl<S: Storage> MountedFs<S> {
                 alloc::boxed::Box::pin(fs.create_special_unix(path, special, attributes, now)).await
             }
             Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
+            #[cfg(feature = "linux")]
+            Self::Dev(_) | Self::Proc(_) | Self::Sys(_) => Err(FsError::ReadOnly.into()),
             Self::Host(_) => Err(FsError::Unsupported.into()),
         }
     }
@@ -1266,7 +1347,11 @@ impl<S: Storage> MountedFs<S> {
             Self::Overlay(fs) => {
                 alloc::boxed::Box::pin(fs.set_permissions(path, permissions, now, payer)).await
             }
+            #[cfg(feature = "linux")]
+            Self::Dev(fs) => fs.set_permissions(path, permissions),
             Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
+            #[cfg(feature = "linux")]
+            Self::Proc(_) | Self::Sys(_) => Err(FsError::ReadOnly.into()),
             Self::Host(_) => Err(FsError::Unsupported.into()),
         }
     }
@@ -1293,8 +1378,15 @@ impl<S: Storage> MountedFs<S> {
                 alloc::boxed::Box::pin(fs.set_permissions(p.as_path(), permissions, now, payer))
                     .await
             }
+            #[cfg(feature = "linux")]
+            (Self::Dev(fs), MountedOpenHandle::Dev(p)) => {
+                fs.set_permissions(p.as_path(), permissions)
+            }
             (Self::Boot(_), MountedOpenHandle::Boot(_))
             | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
+            #[cfg(feature = "linux")]
+            (Self::Proc(_), MountedOpenHandle::Proc(_))
+            | (Self::Sys(_), MountedOpenHandle::Sys(_)) => Err(FsError::ReadOnly.into()),
             (Self::Host(_), MountedOpenHandle::Host(_)) => Err(FsError::Unsupported.into()),
             _ => Err(FsError::CrossDevice.into()),
         }
@@ -1315,7 +1407,11 @@ impl<S: Storage> MountedFs<S> {
             Self::Overlay(fs) => {
                 alloc::boxed::Box::pin(fs.set_owner(path, uid, gid, now, payer)).await
             }
+            #[cfg(feature = "linux")]
+            Self::Dev(fs) => fs.set_owner(path, uid, gid),
             Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
+            #[cfg(feature = "linux")]
+            Self::Proc(_) | Self::Sys(_) => Err(FsError::ReadOnly.into()),
             Self::Host(_) => Err(FsError::Unsupported.into()),
         }
     }
@@ -1341,8 +1437,13 @@ impl<S: Storage> MountedFs<S> {
             (Self::Overlay(fs), MountedOpenHandle::Overlay(p)) => {
                 alloc::boxed::Box::pin(fs.set_owner(p.as_path(), uid, gid, now, payer)).await
             }
+            #[cfg(feature = "linux")]
+            (Self::Dev(fs), MountedOpenHandle::Dev(p)) => fs.set_owner(p.as_path(), uid, gid),
             (Self::Boot(_), MountedOpenHandle::Boot(_))
             | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
+            #[cfg(feature = "linux")]
+            (Self::Proc(_), MountedOpenHandle::Proc(_))
+            | (Self::Sys(_), MountedOpenHandle::Sys(_)) => Err(FsError::ReadOnly.into()),
             (Self::Host(_), MountedOpenHandle::Host(_)) => Err(FsError::Unsupported.into()),
             _ => Err(FsError::CrossDevice.into()),
         }
@@ -1355,6 +1456,8 @@ impl<S: Storage> MountedFs<S> {
             Self::Root(fs) => fs.xattr(path, name).await,
             Self::Overlay(fs) => alloc::boxed::Box::pin(fs.xattr(path, name)).await,
             Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => Err(FsError::Unsupported.into()),
+            #[cfg(feature = "linux")]
+            Self::Dev(_) | Self::Proc(_) | Self::Sys(_) => Err(FsError::Unsupported.into()),
         }
     }
 
@@ -1373,6 +1476,10 @@ impl<S: Storage> MountedFs<S> {
             (Self::Boot(_), MountedOpenHandle::Boot(_))
             | (Self::Host(_), MountedOpenHandle::Host(_))
             | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::Unsupported.into()),
+            #[cfg(feature = "linux")]
+            (Self::Dev(_), MountedOpenHandle::Dev(_))
+            | (Self::Proc(_), MountedOpenHandle::Proc(_))
+            | (Self::Sys(_), MountedOpenHandle::Sys(_)) => Err(FsError::Unsupported.into()),
             _ => Err(FsError::CrossDevice.into()),
         }
     }
@@ -1384,6 +1491,8 @@ impl<S: Storage> MountedFs<S> {
             Self::Root(fs) => fs.list_xattrs(path).await,
             Self::Overlay(fs) => alloc::boxed::Box::pin(fs.list_xattrs(path)).await,
             Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => Err(FsError::Unsupported.into()),
+            #[cfg(feature = "linux")]
+            Self::Dev(_) | Self::Proc(_) | Self::Sys(_) => Err(FsError::Unsupported.into()),
         }
     }
 
@@ -1401,6 +1510,10 @@ impl<S: Storage> MountedFs<S> {
             (Self::Boot(_), MountedOpenHandle::Boot(_))
             | (Self::Host(_), MountedOpenHandle::Host(_))
             | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::Unsupported.into()),
+            #[cfg(feature = "linux")]
+            (Self::Dev(_), MountedOpenHandle::Dev(_))
+            | (Self::Proc(_), MountedOpenHandle::Proc(_))
+            | (Self::Sys(_), MountedOpenHandle::Sys(_)) => Err(FsError::Unsupported.into()),
             _ => Err(FsError::CrossDevice.into()),
         }
     }
@@ -1422,6 +1535,8 @@ impl<S: Storage> MountedFs<S> {
                 alloc::boxed::Box::pin(fs.set_xattr(path, name, value, mode, now, payer)).await
             }
             Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
+            #[cfg(feature = "linux")]
+            Self::Dev(_) | Self::Proc(_) | Self::Sys(_) => Err(FsError::ReadOnly.into()),
             Self::Host(_) => Err(FsError::Unsupported.into()),
         }
     }
@@ -1452,6 +1567,10 @@ impl<S: Storage> MountedFs<S> {
             }
             (Self::Boot(_), MountedOpenHandle::Boot(_))
             | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
+            #[cfg(feature = "linux")]
+            (Self::Dev(_), MountedOpenHandle::Dev(_))
+            | (Self::Proc(_), MountedOpenHandle::Proc(_))
+            | (Self::Sys(_), MountedOpenHandle::Sys(_)) => Err(FsError::ReadOnly.into()),
             (Self::Host(_), MountedOpenHandle::Host(_)) => Err(FsError::Unsupported.into()),
             _ => Err(FsError::CrossDevice.into()),
         }
@@ -1472,6 +1591,8 @@ impl<S: Storage> MountedFs<S> {
                 alloc::boxed::Box::pin(fs.remove_xattr(path, name, now, payer)).await
             }
             Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
+            #[cfg(feature = "linux")]
+            Self::Dev(_) | Self::Proc(_) | Self::Sys(_) => Err(FsError::ReadOnly.into()),
             Self::Host(_) => Err(FsError::Unsupported.into()),
         }
     }
@@ -1498,6 +1619,10 @@ impl<S: Storage> MountedFs<S> {
             }
             (Self::Boot(_), MountedOpenHandle::Boot(_))
             | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
+            #[cfg(feature = "linux")]
+            (Self::Dev(_), MountedOpenHandle::Dev(_))
+            | (Self::Proc(_), MountedOpenHandle::Proc(_))
+            | (Self::Sys(_), MountedOpenHandle::Sys(_)) => Err(FsError::ReadOnly.into()),
             (Self::Host(_), MountedOpenHandle::Host(_)) => Err(FsError::Unsupported.into()),
             _ => Err(FsError::CrossDevice.into()),
         }
@@ -2326,8 +2451,36 @@ impl<S: Storage> HeldPath<S> {
     /// The overlay's [`PinnedLower`] already holds the backing lower mount
     /// against unmount.
     pub fn from_overlay(overlay: OverlayFs<S>, grant: MountGrant) -> Self {
+        Self::standalone(MountedFs::Overlay(overlay), grant)
+    }
+
+    /// Wraps a standalone container [`MemoryFs`] (e.g., `/dev/shm`) mounted at
+    /// its own root `"/"`.
+    pub fn from_memory(memory: MemoryFs, grant: MountGrant) -> Self {
+        Self::standalone(MountedFs::Memory(memory), grant)
+    }
+
+    /// Wraps a standalone container [`DevFs`] mounted at its own root `"/"`.
+    #[cfg(feature = "linux")]
+    pub fn from_dev(dev: DevFs, grant: MountGrant) -> Self {
+        Self::standalone(MountedFs::Dev(dev), grant)
+    }
+
+    /// Wraps a standalone container [`ProcFs`] mounted at its own root `"/"`.
+    #[cfg(feature = "linux")]
+    pub fn from_proc(proc: ProcFs, grant: MountGrant) -> Self {
+        Self::standalone(MountedFs::Proc(proc), grant)
+    }
+
+    /// Wraps a standalone container [`SysFs`] mounted at its own root `"/"`.
+    #[cfg(feature = "linux")]
+    pub fn from_sys(sys: SysFs, grant: MountGrant) -> Self {
+        Self::standalone(MountedFs::Sys(sys), grant)
+    }
+
+    fn standalone(fs: MountedFs<S>, grant: MountGrant) -> Self {
         Self(Arc::new(HeldInner {
-            fs: MountedFs::Overlay(overlay),
+            fs,
             grant,
             absolute: String::from("/"),
             point_len: 0,
@@ -2454,6 +2607,12 @@ impl<S: Storage> MountedFs<S> {
             Self::Host(fs) => read_all(fs, path).await.map(FileContents::Written),
             Self::Erofs(fs) => read_all(fs, path).await.map(FileContents::Written),
             Self::Btrfs(fs) => read_all(fs, path).await.map(FileContents::Written),
+            #[cfg(feature = "linux")]
+            Self::Dev(fs) => read_all(fs, path).await.map(FileContents::Written),
+            #[cfg(feature = "linux")]
+            Self::Proc(fs) => read_all(fs, path).await.map(FileContents::Written),
+            #[cfg(feature = "linux")]
+            Self::Sys(fs) => read_all(fs, path).await.map(FileContents::Written),
         }
     }
 
@@ -2473,6 +2632,21 @@ impl<S: Storage> MountedFs<S> {
                 let meta = self.stat(path).await?;
                 Ok(root::BOOT_UNIX.inherited(meta.kind))
             }
+            #[cfg(feature = "linux")]
+            Self::Dev(fs) => Ok(fs
+                .unix_node_metadata(path)
+                .map_err(|_| FsError::NoEntry)?
+                .attributes),
+            #[cfg(feature = "linux")]
+            Self::Proc(fs) => Ok(fs
+                .unix_node_metadata(path, None)
+                .map_err(|_| FsError::NoEntry)?
+                .attributes),
+            #[cfg(feature = "linux")]
+            Self::Sys(fs) => Ok(fs
+                .unix_node_metadata(path)
+                .map_err(|_| FsError::NoEntry)?
+                .attributes),
         }
     }
 
@@ -2492,6 +2666,8 @@ impl<S: Storage> MountedFs<S> {
                 let _ = overlay.upper().set_permissions(path, mode, now);
             }
             Self::Boot(_) | Self::Host(_) | Self::Erofs(_) | Self::Btrfs(_) => {}
+            #[cfg(feature = "linux")]
+            Self::Dev(_) | Self::Proc(_) | Self::Sys(_) => {}
         }
     }
 

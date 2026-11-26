@@ -36,8 +36,8 @@ pub use stream::{FutureReader, FutureWriter, StreamReader, StreamWriter, future,
 pub mod __private {
     pub use crate::codec::{
         Decoder, Encoder, PendingInboundSubpath, PendingOutboundSubpath, RpcDecode, RpcEncode,
-        activate_inbound_subpaths, activate_outbound_subpaths, decode_client_value,
-        encode_client_value,
+        SubpathSpawner, activate_inbound_subpaths, activate_outbound_subpaths, decode_client_value,
+        encode_client_value, send_client_value,
     };
     pub use crate::endpoint::{Dispatcher, ServerInvocation, Service};
     pub use crate::error::{Result, RpcError};

@@ -10,12 +10,14 @@ use helios_wit_rpc::inspector::helios::system::programs::{
     self as rpc_programs, CapabilityGrant, ContainerConfig as WireContainerConfig,
     ContainerCredentials, ContainerExecRequest, ContainerIdentity,
     ContainerMount as WireContainerMount, ContainerMountSharing as WireContainerMountSharing,
-    ExecResult, FilesystemRight,
+    ContainerSpawnRequest, ExecResult, FilesystemRight,
 };
+use tokio::sync::OnceCell;
 
 use crate::error::OpsError;
 use crate::grants::NonFsGrants;
-use crate::session::Session;
+use crate::session::{Child, Session};
+use crate::target::GrantRight;
 
 /// How a container mount accesses its backing directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -302,14 +304,27 @@ impl ContainerBuilder {
         Container {
             session,
             config: self.build(),
+            remote: OnceCell::new(),
         }
+    }
+
+    /// Create the remote container immediately and return a [`Container`] handle.
+    pub async fn create(self, session: Session) -> Result<Container, OpsError> {
+        let container = self.attach(session);
+        let _ = container.ensure_container().await?;
+        Ok(container)
     }
 }
 
 /// Remote Linux container handle bound to a [`Session`].
+///
+/// Lazily creates and holds one live `helios:system/programs.container` resource
+/// so multiple [`Self::exec`] and [`Self::spawn`] calls share the same ephemeral
+/// overlay `/`, `/tmp`, UTS, and PID namespace.
 pub struct Container {
     session: Session,
     config: ContainerConfig,
+    remote: OnceCell<rpc_programs::Container>,
 }
 
 impl Container {
@@ -327,14 +342,51 @@ impl Container {
         &self.config
     }
 
-    /// Execute `path` with `args` inside this container over the remote `Session`
-    /// using `helios:system/programs.create-container` + `container.exec`.
-    pub async fn exec(
-        &self,
-        path: &str,
-        args: &[String],
-        extra_env: &[(String, String)],
-    ) -> Result<ExecResult, OpsError> {
+    async fn ensure_container(&self) -> Result<&rpc_programs::Container, OpsError> {
+        self.session.require_right(GrantRight::Exec)?;
+        self.remote
+            .get_or_try_init(|| async {
+                let map_mount = |m: &ContainerMount| WireContainerMount {
+                    source_path: m.source_path.clone(),
+                    target_path: m.target_path.clone(),
+                    rights: m.rights.clone(),
+                    sharing: match m.sharing {
+                        ContainerMountSharing::Private => WireContainerMountSharing::Private,
+                        ContainerMountSharing::Shared => WireContainerMountSharing::Shared,
+                        ContainerMountSharing::EphemeralOverlay => {
+                            WireContainerMountSharing::EphemeralOverlay
+                        }
+                    },
+                };
+                let wire_cfg = WireContainerConfig {
+                    root: map_mount(&self.config.root),
+                    mounts: self.config.mounts.iter().map(map_mount).collect(),
+                    shared_owner: ContainerIdentity {
+                        uid: self.config.shared_owner_uid,
+                        gid: self.config.shared_owner_gid,
+                    },
+                    credentials: ContainerCredentials {
+                        uid: self.config.credentials.uid,
+                        gid: self.config.credentials.gid,
+                        supplementary_groups: self.config.credentials.supplementary_groups.clone(),
+                    },
+                    hostname: self.config.hostname.clone(),
+                    domainname: self.config.domainname.clone(),
+                    capability_grants: self.config.grants.clone().into_capability_grants(),
+                };
+                let client = rpc_programs::RpcClient::new(self.session.protocol_client().clone());
+                self.session
+                    .call(
+                        "system.programs.create-container",
+                        client.create_container(wire_cfg),
+                    )
+                    .await?
+                    .map_err(OpsError::from)
+            })
+            .await
+    }
+
+    fn merged_env(&self, extra_env: &[(String, String)]) -> Vec<(String, String)> {
         let mut env = self.config.default_env.clone();
         for (k, v) in extra_env {
             if let Some(slot) = env.iter_mut().find(|(ek, _)| ek == k) {
@@ -343,61 +395,58 @@ impl Container {
                 env.push((k.clone(), v.clone()));
             }
         }
-        let map_mount = |m: &ContainerMount| WireContainerMount {
-            source_path: m.source_path.clone(),
-            target_path: m.target_path.clone(),
-            rights: m.rights.clone(),
-            sharing: match m.sharing {
-                ContainerMountSharing::Private => WireContainerMountSharing::Private,
-                ContainerMountSharing::Shared => WireContainerMountSharing::Shared,
-                ContainerMountSharing::EphemeralOverlay => {
-                    WireContainerMountSharing::EphemeralOverlay
-                }
-            },
-        };
-        let wire_cfg = WireContainerConfig {
-            root: map_mount(&self.config.root),
-            mounts: self.config.mounts.iter().map(map_mount).collect(),
-            shared_owner: ContainerIdentity {
-                uid: self.config.shared_owner_uid,
-                gid: self.config.shared_owner_gid,
-            },
-            credentials: ContainerCredentials {
-                uid: self.config.credentials.uid,
-                gid: self.config.credentials.gid,
-                supplementary_groups: self.config.credentials.supplementary_groups.clone(),
-            },
-            hostname: self.config.hostname.clone(),
-            domainname: self.config.domainname.clone(),
-            capability_grants: self.config.grants.clone().into_capability_grants(),
-        };
+        env
+    }
+
+    /// Execute `path` with `args` inside this shared container over the remote `Session`.
+    pub async fn exec(
+        &self,
+        path: &str,
+        args: &[String],
+        extra_env: &[(String, String)],
+    ) -> Result<ExecResult, OpsError> {
+        let container = self.ensure_container().await?;
         let exec_req = ContainerExecRequest {
             name: path.to_owned(),
             args: args.to_vec(),
-            env,
+            env: self.merged_env(extra_env),
             path: path.to_owned(),
             cwd: self.config.default_cwd.clone(),
             stdin: Vec::new(),
             credentials: None,
         };
-        let client = rpc_programs::RpcClient::new(self.session.protocol_client().clone());
-        let container = client
-            .create_container(wire_cfg)
-            .await
-            .map_err(|source| OpsError::Rpc {
-                operation: "system.programs.create-container",
-                source,
-            })?
+        self.session
+            .call("system.programs.container.exec", container.exec(exec_req))
+            .await?
+            .map_err(OpsError::from)
+    }
+
+    /// Spawn `path` with `args` inside this shared container and return a streaming [`Child`].
+    pub async fn spawn(
+        &self,
+        path: &str,
+        args: &[String],
+        extra_env: &[(String, String)],
+    ) -> Result<Child, OpsError> {
+        let container = self.ensure_container().await?;
+        let spawn_req = ContainerSpawnRequest {
+            name: path.to_owned(),
+            args: args.to_vec(),
+            env: self.merged_env(extra_env),
+            path: path.to_owned(),
+            cwd: self.config.default_cwd.clone(),
+            sockets: Vec::new(),
+            credentials: None,
+        };
+        let remote_child = self
+            .session
+            .call(
+                "system.programs.container.spawn",
+                container.spawn(spawn_req),
+            )
+            .await?
             .map_err(OpsError::from)?;
-        let res = container
-            .exec(exec_req)
-            .await
-            .map_err(|source| OpsError::Rpc {
-                operation: "system.programs.container.exec",
-                source,
-            })?
-            .map_err(OpsError::from)?;
-        Ok(res)
+        Child::from_remote(self.session.clone(), remote_child, Vec::new()).await
     }
 
     /// Execute the container's OCI `Entrypoint` / `Cmd` (with optional `override_args`).
@@ -482,5 +531,246 @@ mod tests {
                 .iter()
                 .any(|g| matches!(g, CapabilityGrant::Directory(_)))
         );
+    }
+
+    #[tokio::test]
+    async fn ops_container_reuses_one_remote_container_across_exec_and_spawn() {
+        use std::os::unix::net::UnixStream;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use async_io::Async;
+        use helios_wit_rpc::inspector::helios::system::programs::{
+            AotRequest, AotResult, ChildTermination, ContainerConfig as WireContainerConfig,
+            DefaultLinuxImage, ExecError, ExecOutput, ExecRequest, ExitStatus, InheritedSocket,
+            SpawnError, SpawnRequest,
+        };
+        use helios_wit_rpc::{Endpoint, FutureReader, StreamReader};
+
+        use crate::session::SessionOptions;
+        use crate::target::{Attenuation, Target};
+        use crate::transport::RpcConnection;
+
+        struct FakeChild(u64);
+
+        struct FakePrograms {
+            create_calls: Arc<AtomicUsize>,
+            exec_calls: Arc<AtomicUsize>,
+            spawn_calls: Arc<AtomicUsize>,
+        }
+
+        impl rpc_programs::RpcHandler for FakePrograms {
+            type Child = FakeChild;
+            type Container = u64;
+            type Endpoint = ();
+            type TcpListener = ();
+            type TcpStream = ();
+            type SerialPort = ();
+            type VsockListener = ();
+            type VsockStream = ();
+
+            async fn child_stdin(
+                &self,
+                _self_: &Self::Child,
+                data: StreamReader<u8>,
+            ) -> FutureReader<Result<(), ()>> {
+                let _ = data.collect_all().await;
+                FutureReader::ready(Ok(()))
+            }
+
+            async fn child_stdout(
+                &self,
+                _self_: &Self::Child,
+            ) -> (StreamReader<u8>, FutureReader<Result<(), ()>>) {
+                (
+                    StreamReader::from_vec(b"container-child".to_vec()),
+                    FutureReader::ready(Ok(())),
+                )
+            }
+
+            async fn child_stderr(
+                &self,
+                _self_: &Self::Child,
+            ) -> (StreamReader<u8>, FutureReader<Result<(), ()>>) {
+                (StreamReader::empty(), FutureReader::ready(Ok(())))
+            }
+
+            async fn child_instance_id(&self, self_: &Self::Child) -> u64 {
+                self_.0
+            }
+
+            async fn child_signal(&self, _self_: &Self::Child, _sig: u8) -> Result<(), SpawnError> {
+                Ok(())
+            }
+
+            async fn child_wait(&self, self_: &Self::Child) -> Result<ExitStatus, SpawnError> {
+                Ok(ExitStatus {
+                    instance_id: self_.0,
+                    termination: ChildTermination::Exited(0),
+                })
+            }
+
+            async fn container_spawn(
+                &self,
+                self_: &Self::Container,
+                _request: ContainerSpawnRequest<
+                    Self::TcpListener,
+                    Self::VsockListener,
+                    Self::TcpStream,
+                    Self::VsockStream,
+                    Self::SerialPort,
+                >,
+            ) -> Result<Self::Child, SpawnError> {
+                let n = self.spawn_calls.fetch_add(1, Ordering::AcqRel) + 1;
+                Ok(FakeChild(*self_ * 10 + n as u64))
+            }
+
+            async fn container_exec(
+                &self,
+                _self_: &Self::Container,
+                _request: ContainerExecRequest,
+            ) -> Result<ExecResult, ExecError> {
+                let n = self.exec_calls.fetch_add(1, Ordering::AcqRel) + 1;
+                Ok(ExecResult {
+                    instance_id: n as u64,
+                    exit_code: 0,
+                    output: ExecOutput {
+                        stdout: format!("exec-{n}").into_bytes(),
+                        stderr: Vec::new(),
+                    },
+                    launch_nanos: 1,
+                })
+            }
+
+            async fn set_default_image(
+                &self,
+                _image: Option<DefaultLinuxImage>,
+            ) -> Result<(), SpawnError> {
+                Ok(())
+            }
+
+            async fn get_default_image(&self) -> Option<DefaultLinuxImage> {
+                None
+            }
+
+            async fn take_inherited_sockets(
+                &self,
+            ) -> Vec<
+                InheritedSocket<
+                    Self::TcpListener,
+                    Self::VsockListener,
+                    Self::TcpStream,
+                    Self::VsockStream,
+                    Self::SerialPort,
+                >,
+            > {
+                Vec::new()
+            }
+
+            async fn create_container(
+                &self,
+                _config: WireContainerConfig<Self::Endpoint>,
+            ) -> Result<Self::Container, SpawnError> {
+                let id = self.create_calls.fetch_add(1, Ordering::AcqRel) + 1;
+                Ok(id as u64)
+            }
+
+            async fn spawn(
+                &self,
+                _request: SpawnRequest<
+                    Self::TcpListener,
+                    Self::VsockListener,
+                    Self::TcpStream,
+                    Self::VsockStream,
+                    Self::SerialPort,
+                    Self::Endpoint,
+                >,
+            ) -> Result<Self::Child, SpawnError> {
+                unreachable!()
+            }
+
+            async fn exec(
+                &self,
+                _request: ExecRequest<Self::Endpoint>,
+            ) -> Result<ExecResult, ExecError> {
+                unreachable!()
+            }
+
+            async fn aot(&self, _request: AotRequest) -> Result<AotResult, ExecError> {
+                unreachable!()
+            }
+        }
+
+        let (host, guest) = UnixStream::pair().expect("pair");
+        host.set_nonblocking(true).expect("nonblocking");
+        guest.set_nonblocking(true).expect("nonblocking");
+        let host_read = host.try_clone().expect("clone");
+        let guest_read = guest.try_clone().expect("clone");
+        let conn = RpcConnection::from_split(
+            Box::new(Async::new(host_read).expect("async")),
+            Box::new(Async::new(host).expect("async")),
+        );
+        let session = Session::from_connection(
+            Target::new("ctr", "serial:///tmp/ctr.sock").expect("target"),
+            conn,
+            SessionOptions::default(),
+        );
+
+        let create_calls = Arc::new(AtomicUsize::new(0));
+        let exec_calls = Arc::new(AtomicUsize::new(0));
+        let spawn_calls = Arc::new(AtomicUsize::new(0));
+        let ep = Endpoint::new(
+            Async::new(guest_read).expect("async"),
+            Async::new(guest).expect("async"),
+            rpc_programs::RpcServer::new(FakePrograms {
+                create_calls: Arc::clone(&create_calls),
+                exec_calls: Arc::clone(&exec_calls),
+                spawn_calls: Arc::clone(&spawn_calls),
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            let _ = ep.drive().await;
+        });
+
+        let ctr = Container::ephemeral("/rootfs")
+            .create(session.clone())
+            .await
+            .expect("create container");
+        let r1 = ctr
+            .exec("/bin/echo", &["one".to_owned()], &[])
+            .await
+            .expect("exec 1");
+        let r2 = ctr
+            .exec("/bin/echo", &["two".to_owned()], &[])
+            .await
+            .expect("exec 2");
+        assert_eq!(r1.output.stdout, b"exec-1");
+        assert_eq!(r2.output.stdout, b"exec-2");
+
+        let child = ctr
+            .spawn("/bin/cat", &[], &[])
+            .await
+            .expect("spawn in container");
+        assert_eq!(child.instance_id(), Some(11));
+        let wait_res = child.wait().await.expect("wait");
+        assert_eq!(wait_res.exit_code, 0);
+
+        assert_eq!(create_calls.load(Ordering::Acquire), 1);
+        assert_eq!(exec_calls.load(Ordering::Acquire), 2);
+        assert_eq!(spawn_calls.load(Ordering::Acquire), 1);
+
+        // Attenuated session without Exec right must be refused.
+        let read_only = session
+            .attenuated(Attenuation {
+                scope: None,
+                only: std::collections::BTreeSet::from([GrantRight::Inspect]),
+            })
+            .expect("attenuate");
+        assert!(matches!(
+            Container::ephemeral("/rootfs").create(read_only).await,
+            Err(OpsError::AttenuationDenied { .. })
+        ));
+
+        server_task.abort();
     }
 }

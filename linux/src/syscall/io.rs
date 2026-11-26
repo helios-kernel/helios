@@ -5,9 +5,12 @@ use alloc::vec::Vec;
 use core::future::{Future, poll_fn};
 use helios_sync::{TryRead, TryWrite, byte_channel};
 use helios_unix::{
-    DescriptorTableError, Epoll, EventError, EventFd, FDFLAG_NONBLOCK, FDFLAG_PATH, Interest,
-    InterestError, Signal, SignalSet,
+    DescriptorTableError, Epoll, EventError, EventFd, FDFLAG_NONBLOCK, FDFLAG_PATH, FifoTryRead,
+    FifoTryWrite, Interest, InterestError, PseudoDeviceKind, PtyError, PtyTryRead, Signal,
+    SignalSet,
 };
+
+const ENOSPC: u64 = 28;
 
 /// Monotonic time and async deadline waits supplied by the execution owner.
 pub trait Clock {
@@ -142,10 +145,19 @@ pub(super) fn duplicate<R: Resources, F: fs::Filesystem<R>>(
                     FileDescriptor::Preopen { descriptor, .. } => {
                         fs.file_access(descriptor).linux_accmode()
                     }
-                    FileDescriptor::PipeRead { .. } | FileDescriptor::Stdin { .. } => fs::O_RDONLY,
+                    FileDescriptor::PipeRead { .. }
+                    | FileDescriptor::FifoRead(_)
+                    | FileDescriptor::Stdin { .. } => fs::O_RDONLY,
                     FileDescriptor::PipeWrite { .. }
+                    | FileDescriptor::FifoWrite(_)
                     | FileDescriptor::Stdout
                     | FileDescriptor::Stderr => fs::O_WRONLY,
+                    FileDescriptor::PseudoDevice(dev) => match (dev.readable, dev.writable) {
+                        (true, true) => fs::O_RDWR,
+                        (true, false) => fs::O_RDONLY,
+                        (false, true) => fs::O_WRONLY,
+                        (false, false) => fs::O_RDONLY,
+                    },
                     FileDescriptor::Socket(sock) => {
                         if sock.is_nonblocking() {
                             fdflags |= FDFLAG_NONBLOCK;
@@ -193,12 +205,14 @@ pub(super) fn duplicate<R: Resources, F: fs::Filesystem<R>>(
         _ => unreachable!("only duplication syscalls reach this dispatcher"),
     }
 }
-pub(super) async fn write_resource<R: Resources, M: UserMemory>(
-    signals: &ThreadSignalSlot,
+pub(super) async fn write_resource<R: Resources, M: UserMemory, O: Stdio + System>(
+    process: &Process<R>,
     entry: &Entry<R>,
     args: [u64; 6],
     memory: &M,
+    io: &mut O,
 ) -> SyscallOutcome {
+    let signals = &process.signals;
     match &entry.descriptor {
         FileDescriptor::Event(event) => {
             if args[2] < 8 {
@@ -289,16 +303,241 @@ pub(super) async fn write_resource<R: Resources, M: UserMemory>(
             }
             SyscallOutcome::Return(total)
         }
+        FileDescriptor::FifoWrite(writer) => {
+            write_fifo_common(
+                signals,
+                entry.fdflags(),
+                args,
+                memory,
+                FifoWriteEnd::Write(writer),
+            )
+            .await
+        }
+        FileDescriptor::FifoReadWrite(rw) => {
+            write_fifo_common(
+                signals,
+                entry.fdflags(),
+                args,
+                memory,
+                FifoWriteEnd::ReadWrite(rw),
+            )
+            .await
+        }
+        FileDescriptor::PtyMaster(master) => {
+            let count = args[2].min(MAX_RW_COUNT);
+            let mut total = 0u64;
+            let mut bytes = [0u8; 4096];
+            while total < count {
+                let size = (count - total).min(bytes.len() as u64) as usize;
+                if memory
+                    .read(args[1].wrapping_add(total), &mut bytes[..size])
+                    .is_err()
+                {
+                    return SyscallOutcome::Return(if total == 0 { errno(EFAULT) } else { total });
+                }
+                let (written, pending_sig) = master.write(&bytes[..size]);
+                if let Some((pgid, sig)) = pending_sig {
+                    let _ = super::signal::kill(
+                        &process.shared.pids,
+                        process.pid(),
+                        process.shared.signals.pgid(),
+                        &Credentials::root(),
+                        [(-(pgid as i64)) as u64, u64::from(sig.raw()), 0, 0, 0, 0],
+                    );
+                }
+                total += written as u64;
+            }
+            SyscallOutcome::Return(total)
+        }
+        FileDescriptor::PtySlave(slave) => {
+            let count = args[2].min(MAX_RW_COUNT);
+            let mut total = 0u64;
+            let mut bytes = [0u8; 4096];
+            while total < count {
+                let size = (count - total).min(bytes.len() as u64) as usize;
+                if memory
+                    .read(args[1].wrapping_add(total), &mut bytes[..size])
+                    .is_err()
+                {
+                    return SyscallOutcome::Return(if total == 0 { errno(EFAULT) } else { total });
+                }
+                match slave.write(&bytes[..size]) {
+                    Ok(written) => total += written as u64,
+                    Err(PtyError::Closed | PtyError::Locked) => {
+                        return SyscallOutcome::Return(if total == 0 { errno(EIO) } else { total });
+                    }
+                    Err(PtyError::WouldBlock) => {
+                        return SyscallOutcome::Return(if total == 0 {
+                            errno(EAGAIN)
+                        } else {
+                            total
+                        });
+                    }
+                }
+            }
+            SyscallOutcome::Return(total)
+        }
         FileDescriptor::NullDevice => SyscallOutcome::Return(args[2].min(MAX_RW_COUNT)),
+        FileDescriptor::PseudoDevice(dev) => {
+            if !dev.writable {
+                return SyscallOutcome::Return(errno(EBADF));
+            }
+            match dev.kind {
+                PseudoDeviceKind::Null
+                | PseudoDeviceKind::Zero
+                | PseudoDeviceKind::Random
+                | PseudoDeviceKind::Urandom => SyscallOutcome::Return(args[2].min(MAX_RW_COUNT)),
+                PseudoDeviceKind::Full => SyscallOutcome::Return(errno(ENOSPC)),
+                PseudoDeviceKind::Tty | PseudoDeviceKind::Console => {
+                    let nonblock = entry.fdflags() & FDFLAG_NONBLOCK != 0;
+                    let count = args[2].min(MAX_RW_COUNT);
+                    if args[1].checked_add(count).is_none() {
+                        return SyscallOutcome::Return(errno(EFAULT));
+                    }
+                    let mut buffer = [0u8; 4096];
+                    let mut written = 0u64;
+                    while written < count {
+                        let addr = args[1] + written;
+                        let page_rem = buffer.len() - (addr as usize & (buffer.len() - 1));
+                        let size = (count - written).min(page_rem as u64) as usize;
+                        if memory.read(addr, &mut buffer[..size]).is_err() {
+                            return SyscallOutcome::Return(if written == 0 {
+                                errno(EFAULT)
+                            } else {
+                                written
+                            });
+                        }
+                        let step = if nonblock {
+                            io.try_write(Stream::Stdout, &buffer[..size])
+                        } else {
+                            io.write(Stream::Stdout, &buffer[..size]).await
+                        };
+                        match step {
+                            Ok(n) => {
+                                written += n as u64;
+                                if n < size {
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                return SyscallOutcome::Return(if written != 0 {
+                                    written
+                                } else {
+                                    errno(match error {
+                                        WriteError::Interrupted => EINTR,
+                                        WriteError::Io => EIO,
+                                        WriteError::Denied => EACCES,
+                                        WriteError::WouldBlock => EAGAIN,
+                                    })
+                                });
+                            }
+                        }
+                    }
+                    SyscallOutcome::Return(written)
+                }
+            }
+        }
         _ => SyscallOutcome::Return(errno(EBADF)),
     }
 }
-pub(super) async fn read_resource<R: Resources, M: UserMemory>(
+
+enum FifoWriteEnd<'a> {
+    Write(&'a helios_unix::FifoWriter),
+    ReadWrite(&'a helios_unix::FifoReadWrite),
+}
+
+async fn write_fifo_common<M: UserMemory>(
     signals: &ThreadSignalSlot,
+    fdflags: u16,
+    args: [u64; 6],
+    memory: &M,
+    target: FifoWriteEnd<'_>,
+) -> SyscallOutcome {
+    let nonblock = fdflags & FDFLAG_NONBLOCK != 0;
+    let count = args[2].min(MAX_RW_COUNT);
+    let mut total = 0u64;
+    let mut bytes = [0u8; 4096];
+    while total < count {
+        let size = (count - total).min(bytes.len() as u64) as usize;
+        if memory
+            .read(args[1].wrapping_add(total), &mut bytes[..size])
+            .is_err()
+        {
+            return SyscallOutcome::Return(if total == 0 { errno(EFAULT) } else { total });
+        }
+        let mut offset = 0usize;
+        while offset < size {
+            let chunk = &bytes[offset..size];
+            let step = match target {
+                FifoWriteEnd::Write(writer) => {
+                    if nonblock {
+                        match writer.try_write(chunk) {
+                            FifoTryWrite::Written(n) => Ok(n),
+                            FifoTryWrite::WouldBlock => Err(Some(EAGAIN)),
+                            FifoTryWrite::BrokenPipe => Err(Some(EPIPE)),
+                        }
+                    } else {
+                        match signals.interruptible(writer.write(chunk)).await {
+                            WaitOutcome::Ready(Ok(n)) => Ok(n),
+                            WaitOutcome::Ready(Err(_)) => Err(Some(EPIPE)),
+                            WaitOutcome::Interrupted => Err(None),
+                        }
+                    }
+                }
+                FifoWriteEnd::ReadWrite(rw) => {
+                    if nonblock {
+                        match rw.try_write(chunk) {
+                            FifoTryWrite::Written(n) => Ok(n),
+                            FifoTryWrite::WouldBlock => Err(Some(EAGAIN)),
+                            FifoTryWrite::BrokenPipe => Err(Some(EPIPE)),
+                        }
+                    } else {
+                        match signals.interruptible(rw.write(chunk)).await {
+                            WaitOutcome::Ready(Ok(n)) => Ok(n),
+                            WaitOutcome::Ready(Err(_)) => Err(Some(EPIPE)),
+                            WaitOutcome::Interrupted => Err(None),
+                        }
+                    }
+                }
+            };
+            match step {
+                Ok(n) => {
+                    offset += n;
+                    total += n as u64;
+                    if n == 0 {
+                        return SyscallOutcome::Return(total);
+                    }
+                }
+                Err(Some(EPIPE)) => {
+                    signals
+                        .process()
+                        .raise_thread(signals, SigInfo::from_kernel(Signal::SIGPIPE));
+                    return SyscallOutcome::Return(if total == 0 { errno(EPIPE) } else { total });
+                }
+                Err(Some(error)) => {
+                    return SyscallOutcome::Return(if total == 0 { errno(error) } else { total });
+                }
+                Err(None) => {
+                    return if total == 0 {
+                        SyscallOutcome::RestartSys
+                    } else {
+                        SyscallOutcome::Return(total)
+                    };
+                }
+            }
+        }
+    }
+    SyscallOutcome::Return(total)
+}
+
+pub(super) async fn read_resource<R: Resources, M: UserMemory, O: Stdio + System>(
+    process: &Process<R>,
     entry: &Entry<R>,
     args: [u64; 6],
     memory: &mut M,
+    io: &mut O,
 ) -> SyscallOutcome {
+    let signals = &process.signals;
     let nonblock = entry.fdflags() & FDFLAG_NONBLOCK != 0;
     match &entry.descriptor {
         FileDescriptor::Event(event) => {
@@ -350,7 +589,214 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory>(
             }
             SyscallOutcome::Return(bytes.len() as u64)
         }
+        FileDescriptor::FifoRead(reader) => {
+            let limit = args[2].min(MAX_RW_COUNT) as usize;
+            if limit == 0 {
+                return SyscallOutcome::Return(0);
+            }
+            if memory.check_writable(args[1], limit).is_err() {
+                return SyscallOutcome::Return(errno(EFAULT));
+            }
+            let bytes = if nonblock {
+                match reader.try_read(limit) {
+                    FifoTryRead::Ready(bytes) => bytes,
+                    FifoTryRead::Eof => return SyscallOutcome::Return(0),
+                    FifoTryRead::WouldBlock => return SyscallOutcome::Return(errno(EAGAIN)),
+                }
+            } else {
+                match signals.interruptible(reader.read(limit)).await {
+                    WaitOutcome::Ready(bytes) => bytes,
+                    WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
+                }
+            };
+            if !bytes.is_empty() && memory.write(args[1], &bytes).is_err() {
+                return SyscallOutcome::Return(errno(EFAULT));
+            }
+            SyscallOutcome::Return(bytes.len() as u64)
+        }
+        FileDescriptor::FifoReadWrite(rw) => {
+            let limit = args[2].min(MAX_RW_COUNT) as usize;
+            if limit == 0 {
+                return SyscallOutcome::Return(0);
+            }
+            if memory.check_writable(args[1], limit).is_err() {
+                return SyscallOutcome::Return(errno(EFAULT));
+            }
+            let bytes = if nonblock {
+                match rw.try_read(limit) {
+                    FifoTryRead::Ready(bytes) => bytes,
+                    FifoTryRead::Eof => return SyscallOutcome::Return(0),
+                    FifoTryRead::WouldBlock => return SyscallOutcome::Return(errno(EAGAIN)),
+                }
+            } else {
+                match signals.interruptible(rw.read(limit)).await {
+                    WaitOutcome::Ready(bytes) => bytes,
+                    WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
+                }
+            };
+            if !bytes.is_empty() && memory.write(args[1], &bytes).is_err() {
+                return SyscallOutcome::Return(errno(EFAULT));
+            }
+            SyscallOutcome::Return(bytes.len() as u64)
+        }
+        FileDescriptor::PtyMaster(master) => {
+            let limit = args[2].min(MAX_RW_COUNT) as usize;
+            if limit == 0 {
+                return SyscallOutcome::Return(0);
+            }
+            if memory.check_writable(args[1], limit).is_err() {
+                return SyscallOutcome::Return(errno(EFAULT));
+            }
+            let bytes = if nonblock {
+                match master.try_read(limit) {
+                    PtyTryRead::Ready(bytes) => bytes,
+                    PtyTryRead::Eof => return SyscallOutcome::Return(0),
+                    PtyTryRead::Closed => return SyscallOutcome::Return(errno(EIO)),
+                    PtyTryRead::WouldBlock => return SyscallOutcome::Return(errno(EAGAIN)),
+                }
+            } else {
+                match signals.interruptible(master.read(limit)).await {
+                    WaitOutcome::Ready(Ok(bytes)) => bytes,
+                    WaitOutcome::Ready(Err(PtyError::Closed | PtyError::Locked)) => {
+                        return SyscallOutcome::Return(errno(EIO));
+                    }
+                    WaitOutcome::Ready(Err(PtyError::WouldBlock)) => {
+                        return SyscallOutcome::Return(errno(EAGAIN));
+                    }
+                    WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
+                }
+            };
+            if !bytes.is_empty() && memory.write(args[1], &bytes).is_err() {
+                return SyscallOutcome::Return(errno(EFAULT));
+            }
+            SyscallOutcome::Return(bytes.len() as u64)
+        }
+        FileDescriptor::PtySlave(slave) => {
+            let limit = args[2].min(MAX_RW_COUNT) as usize;
+            if limit == 0 {
+                return SyscallOutcome::Return(0);
+            }
+            if memory.check_writable(args[1], limit).is_err() {
+                return SyscallOutcome::Return(errno(EFAULT));
+            }
+            let bytes = if nonblock {
+                match slave.try_read(limit) {
+                    PtyTryRead::Ready(bytes) => bytes,
+                    PtyTryRead::Eof | PtyTryRead::Closed => return SyscallOutcome::Return(0),
+                    PtyTryRead::WouldBlock => return SyscallOutcome::Return(errno(EAGAIN)),
+                }
+            } else {
+                match signals.interruptible(slave.read(limit)).await {
+                    WaitOutcome::Ready(bytes) => bytes,
+                    WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
+                }
+            };
+            if !bytes.is_empty() && memory.write(args[1], &bytes).is_err() {
+                return SyscallOutcome::Return(errno(EFAULT));
+            }
+            SyscallOutcome::Return(bytes.len() as u64)
+        }
         FileDescriptor::NullDevice => SyscallOutcome::Return(0),
+        FileDescriptor::PseudoDevice(dev) => {
+            if !dev.readable {
+                return SyscallOutcome::Return(errno(EBADF));
+            }
+            let count = args[2].min(MAX_RW_COUNT);
+            match dev.kind {
+                PseudoDeviceKind::Null => SyscallOutcome::Return(0),
+                PseudoDeviceKind::Zero | PseudoDeviceKind::Full => {
+                    let zeros = [0u8; 4096];
+                    let mut done = 0u64;
+                    while done < count {
+                        let step = (count - done).min(zeros.len() as u64) as usize;
+                        if memory
+                            .write(args[1].wrapping_add(done), &zeros[..step])
+                            .is_err()
+                        {
+                            return SyscallOutcome::Return(if done == 0 {
+                                errno(EFAULT)
+                            } else {
+                                done
+                            });
+                        }
+                        done += step as u64;
+                    }
+                    SyscallOutcome::Return(done)
+                }
+                PseudoDeviceKind::Random | PseudoDeviceKind::Urandom => {
+                    let mut buf = [0u8; 4096];
+                    let mut done = 0u64;
+                    while done < count {
+                        let step = (count - done).min(buf.len() as u64) as usize;
+                        io.fill_random(&mut buf[..step]);
+                        if memory
+                            .write(args[1].wrapping_add(done), &buf[..step])
+                            .is_err()
+                        {
+                            return SyscallOutcome::Return(if done == 0 {
+                                errno(EFAULT)
+                            } else {
+                                done
+                            });
+                        }
+                        done += step as u64;
+                    }
+                    SyscallOutcome::Return(done)
+                }
+                PseudoDeviceKind::Tty | PseudoDeviceKind::Console => {
+                    let limit = count as usize;
+                    if limit == 0 {
+                        return SyscallOutcome::Return(0);
+                    }
+                    if memory.check_writable(args[1], limit).is_err() {
+                        return SyscallOutcome::Return(errno(EFAULT));
+                    }
+                    let stdin_guard = match signals
+                        .interruptible(process.shared.stdin_lock.lock())
+                        .await
+                    {
+                        WaitOutcome::Ready(guard) => guard,
+                        WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
+                    };
+                    if process.shared.stdin_carry.lock().is_empty() {
+                        if nonblock {
+                            match io.try_read_input(limit) {
+                                StdinTryRead::Ready(bytes) => {
+                                    *process.shared.stdin_carry.lock() = bytes;
+                                }
+                                StdinTryRead::Eof => return SyscallOutcome::Return(0),
+                                StdinTryRead::WouldBlock => {
+                                    return SyscallOutcome::Return(errno(EAGAIN));
+                                }
+                                StdinTryRead::Denied => {
+                                    return SyscallOutcome::Return(errno(EACCES));
+                                }
+                            }
+                        } else {
+                            match signals.interruptible(io.read_input(limit)).await {
+                                WaitOutcome::Ready(Ok(bytes)) => {
+                                    *process.shared.stdin_carry.lock() = bytes;
+                                }
+                                WaitOutcome::Ready(Err(Denied)) => {
+                                    return SyscallOutcome::Return(errno(EACCES));
+                                }
+                                WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
+                            }
+                        }
+                    }
+                    let bytes = {
+                        let mut carry = process.shared.stdin_carry.lock();
+                        let take = carry.len().min(limit);
+                        carry.split_to(take)
+                    };
+                    drop(stdin_guard);
+                    if memory.write(args[1], &bytes).is_err() {
+                        return SyscallOutcome::Return(errno(EFAULT));
+                    }
+                    SyscallOutcome::Return(bytes.len() as u64)
+                }
+            }
+        }
         _ => SyscallOutcome::Return(errno(EBADF)),
     }
 }
@@ -395,11 +841,15 @@ pub(super) fn epoll_ctl<R: Resources, M: UserMemory>(
     if fd == epfd {
         return errno(EINVAL);
     }
-    // Regular files, directories and `/dev/null` cannot be monitored by epoll
-    // (`EPERM`), whereas standard streams (pipes or terminals) can.
+    // Regular files, directories, and `/dev/{null,zero,full}` cannot be
+    // monitored by epoll (`EPERM`), whereas pipes, FIFOs, sockets, PTYs,
+    // random devices, and standard streams can.
     if matches!(
         target.descriptor,
         FileDescriptor::File(_) | FileDescriptor::Preopen { .. } | FileDescriptor::NullDevice
+    ) || matches!(
+        target.descriptor,
+        FileDescriptor::PseudoDevice(dev) if dev.kind.refuses_epoll()
     ) {
         return errno(EPERM);
     }

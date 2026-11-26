@@ -3,11 +3,16 @@
 //!
 //! # Ordering contract
 //!
-//! - [`Aarch64HibernateDevices::quiesce_all`] quiesces every live virtio device
-//!   before the restore trampoline overwrites memory.
-//! - [`Aarch64HibernateDevices::reinitialize_all`] reinitializes every live
-//!   virtio device after resuming from a hibernate image (and records resets
-//!   for host-share and memory-balloon devices).
+//! - [`Aarch64HibernateDevices::quiesce_all`] quiesces every DMA-capable
+//!   endpoint device BEFORE quiescing `virtio-iommu`.
+//! - [`Aarch64HibernateDevices::reinitialize_iommu`] reinitializes
+//!   `virtio-iommu` alone (when present) before the hibernate block device
+//!   writes the snapshot to disk.
+//! - [`Aarch64HibernateDevices::reinitialize_all`] MUST reinitialize
+//!   `virtio-iommu` FIRST (when present) before any other virtio device calls
+//!   `reinitialize()`, so every DMA domain and IOVA mapping is restored before
+//!   any endpoint resumes DMA (and records resets for host-share and
+//!   memory-balloon devices).
 
 extern crate alloc;
 
@@ -44,6 +49,7 @@ use crate::entropy::Aarch64VirtioRngDevice;
 use crate::gpu::Aarch64VirtioGpuDevice;
 use crate::host_fs::HostFsTransportService;
 use crate::input::Aarch64VirtioInputDevice;
+use crate::iommu::Aarch64VirtioIommuDevice;
 use crate::net::Aarch64VirtioNetDevice;
 use crate::platform::PsciConduit;
 use crate::rtc::Pl031Rtc;
@@ -109,11 +115,13 @@ const _: () = {
 };
 
 /// Static-dispatch registry of every live AArch64 virtio device brought up at
-/// boot.
+/// boot, holding `virtio-iommu` first so [`HibernateDeviceController`] enforces
+/// the IOMMU-first reinitialization invariant.
 #[derive(Clone)]
 pub(crate) struct Aarch64HibernateDevices {
     cpu: Aarch64Cpu,
     generation: MachineGenerationHandle,
+    pub(crate) iommu: Option<Arc<Aarch64VirtioIommuDevice>>,
     pub(crate) host_fs: Option<HostFsTransportService>,
     pub(crate) network: Option<triomphe::Arc<Aarch64VirtioNetDevice>>,
     pub(crate) entropy: Option<triomphe::Arc<Aarch64VirtioRngDevice>>,
@@ -130,6 +138,7 @@ impl Aarch64HibernateDevices {
         Self {
             cpu,
             generation,
+            iommu: None,
             host_fs: None,
             network: None,
             entropy: None,
@@ -146,6 +155,13 @@ impl Aarch64HibernateDevices {
     /// virtio device for [`helios_kernel::hibernate::HibernateIdentity`].
     pub(crate) fn feature_records(&self) -> Vec<DeviceFeatureRecord> {
         let mut records = Vec::new();
+        if let Some(iommu) = &self.iommu {
+            records.push(DeviceFeatureRecord {
+                device_kind: DeviceType::Iommu as u32,
+                instance_index: 0,
+                features: iommu.features().bits(),
+            });
+        }
         if let Some(host_fs) = &self.host_fs {
             records.push(DeviceFeatureRecord {
                 device_kind: DeviceType::_9P as u32,
@@ -301,10 +317,36 @@ impl HibernateDeviceController for Aarch64HibernateDevices {
                 }
             })?;
         }
+        // Quiesce virtio-iommu LAST after every confined endpoint has drained DMA.
+        if let Some(iommu) = &self.iommu {
+            iommu.quiesce(self.expired_fn(deadline)).map_err(|_| {
+                HibernateDeviceError::Quiesce {
+                    device: "virtio-iommu",
+                    detail: "quiesce failed",
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    fn reinitialize_iommu(&mut self) -> Result<(), HibernateDeviceError> {
+        let deadline = self.deadline();
+        if let Some(iommu) = &self.iommu {
+            let _reset = iommu.reinitialize(self.expired_fn(deadline)).map_err(|_| {
+                HibernateDeviceError::Reinitialize {
+                    device: "virtio-iommu",
+                    detail: "reinitialize failed",
+                }
+            })?;
+        }
         Ok(())
     }
 
     fn reinitialize_all(&mut self) -> Result<(), HibernateDeviceError> {
+        // STRICT ORDERING CONTRACT: when `virtio-iommu` is present, its
+        // `reinitialize()` MUST complete BEFORE any other virtio driver calls
+        // `reinitialize()`.
+        self.reinitialize_iommu()?;
         let deadline = self.deadline();
         if let Some(host_fs) = &self.host_fs {
             let _reset = host_fs.device().reinitialize().map_err(|_| {

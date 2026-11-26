@@ -68,7 +68,8 @@ pub(crate) fn ops_err_to_py(err: OpsError) -> PyErr {
         | OpsError::Bundle(_)
         | OpsError::InvalidPath { .. }
         | OpsError::NotFound { .. }
-        | OpsError::InvalidGrant { .. } => HeliosError::new_err(err.to_string()),
+        | OpsError::InvalidGrant { .. }
+        | OpsError::InvalidSignal { .. } => HeliosError::new_err(err.to_string()),
     }
 }
 

@@ -138,7 +138,7 @@ Its backend is `vhost-vsock`, which QEMU implements only against the host
 kernel's `/dev/vhost-vsock`: there is no user-space vsock backend, so on
 a host without that device node — every macOS host, and any Linux host
 without the `vhost_vsock` module — no guest can have the device at all.
-`helios-inspector vm --rpc-transport vsock` therefore checks the host
+`helios vm --rpc-transport vsock` therefore checks the host
 before it builds anything and refuses with an explanation rather than
 booting a guest whose device is silently absent. The default transport
 stays the serial line; see `docs/inspector-vsock.md`.
@@ -234,7 +234,7 @@ and `uuid=` are the negotiated feature bits after it
 (`VIRTIO_GPU_F_RESOURCE_BLOB`, `VIRTIO_GPU_F_CONTEXT_INIT` and
 `VIRTIO_GPU_F_RESOURCE_UUID`), each `on` or `off` for the same reason.
 
-A renderer is a host property, not a guest one. `helios-inspector vm`
+A renderer is a host property, not a guest one. `helios vm`
 attaches the plain 2D device unless a session asks for one with
 `--renderer virtio-gpu-gl` (Venus through virglrenderer) or
 `--renderer virtio-gpu-rutabaga` (Venus and gfxstream through
@@ -397,7 +397,7 @@ belongs to whatever produces the audio.
 
 The device is on the platform's own bus: virtio-pci on x86-64 (`-device
 virtio-sound-pci`) and virtio-mmio on aarch64 and riscv64 (`-device
-virtio-sound-device`). `helios-inspector vm --audiodev` is what attaches
+virtio-sound-device`). `helios vm --audiodev` is what attaches
 it, and `docs/desktop.md` describes the backends. Each backend reports it
 on one line:
 
@@ -408,7 +408,7 @@ virtio-snd online transport=pci streams=1 jacks=1 rates=5512..192000 formats=S16
 virtio-net is the one device whose capabilities are decided outside the
 guest: multiqueue, segmentation offload and checksum offload are all
 properties of the host packet path QEMU is given, so what the driver can
-negotiate depends on `helios-inspector vm --net-backend`. The driver logs
+negotiate depends on `helios vm --net-backend`. The driver logs
 its device-class result as `virtio-net online` next to the generic
 feature line above. See `docs/networking.md`.
 
@@ -480,7 +480,7 @@ block device online, self check passed capacity_bytes=268435456 …
 Every inspector profile attaches that disk: `virtio-blk-device` on the
 MMIO platforms (aarch64, riscv64) and `virtio-blk-pci` on x86, always
 with `serial=helios-data`, backed by a `data.img` in the VM's runtime
-directory whose size `--data-disk-size` controls. `helios-inspector
+directory whose size `--data-disk-size` controls. `helios
 stats` shows the device the guest kernel ended up with, its geometry, its
 queues and the requests the kernel has issued.
 
@@ -516,9 +516,11 @@ it follows are in `kernel/src/io/block/cache.rs`.
 
 Without a translation unit a virtio device reads and writes physical
 memory directly: the descriptor rings carry physical addresses, and
-every device on the bus can reach every byte of the machine. The x86
-platform can put its devices behind a virtio-iommu instead, and then a
-device reaches only the ranges the kernel mapped into its own domain.
+every device on the bus can reach every byte of the machine. All three
+bare-metal backends (`x86_64`, `aarch64`, and `riscv64`) can put their
+virtio-PCI devices behind a `virtio-iommu-pci` unit instead, and then
+each device reaches only the ranges the kernel mapped into its own
+domain.
 
 The layering follows the usual one:
 
@@ -527,49 +529,60 @@ The layering follows the usual one:
   `DmaTranslation`, the value that turns a physical address into the
   address a device has to issue for it. `DmaModel::Iommu` is the platform
   fact that says a machine has one.
+- `firmware/src/iommu.rs` parses the platform topology once: ACPI `VIOT`
+  (used by `x86_64` and ACPI `aarch64`) and Devicetree `iommu-map` /
+  `iommu-map-mask` on `pci-host-ecam-generic` (used by Devicetree
+  `aarch64` and `riscv64`). Both decode into the same
+  `VirtioIommuTopology` naming the `virtio-iommu-pci` function and its
+  PCI requester-id ranges.
 - `virtio/src/iommu.rs` drives the device (id 23): the request queue
   carries `ATTACH`/`DETACH`/`MAP`/`UNMAP`/`PROBE`, the event queue
   carries translation faults. Requests are issued from bring-up and
   teardown, never from a data path.
-- `kernel/src/io/iommu.rs` decides the policy: one domain per device,
-  one slot of the I/O virtual address space per domain, placed above
-  every interrupt doorbell each domain identity-maps. A firmware memory
-  map with more runs than a domain has windows is folded down by merging
-  across the smallest gaps first.
-- `x86/src/iommu.rs` finds the unit. q35 publishes the topology in the
-  ACPI VIOT table: one node names the PCI function the virtio-iommu sits
-  on, and PCI range nodes map bus/device/function numbers onto endpoint
-  identities. The vendored `acpi` crate has no VIOT support and cannot
-  be given one — its `Signature` type has no public constructor — so the
-  table is located by walking the SDT headers and parsed here.
+- `kernel/src/io/iommu.rs` and `kernel/src/io/dma.rs` decide the policy:
+  one domain per device, one disjoint slot of the I/O virtual address
+  space per domain placed above every identity-mapped interrupt doorbell
+  (and never at IOVA 0), backed by elastic per-device `DmaArena` chunks
+  that map on demand and unmap when retired.
+- `x86/src/iommu.rs`, `aarch64/src/iommu.rs`, and `riscv/src/iommu.rs`
+  bring up the `virtio-iommu-pci` unit, confine every discovered
+  virtio-PCI endpoint before any driver touches its queues, register
+  `IommuReport`, and spawn `watch_faults` and `maintain_dma_arenas`.
 
-Every driver publishes its addresses through a `PlatformDmaPool`, which
-wraps the backend's ordinary pool with the domain's `DmaTranslation`. A
-driver never knows the difference; a buffer whose physical address the
-domain does not map is refused by name at submission instead of faulting
-inside the device. Because the addresses on the wire are no longer
-physical, the device has to be told: `negotiate` adds
-`VIRTIO_F_ACCESS_PLATFORM` for any device whose pool hands out
-translated addresses, refuses a device that cannot support the feature,
-and refuses the mirror case — a device that demands the feature on a
-machine where the kernel built it no domain.
+Every driver publishes its addresses through its per-device
+`SharedDmaArena` (wrapping `DeviceChunkDomain::Confined` for PCI
+endpoints behind the translation unit, or `DeviceChunkDomain::Direct`
+when no translation unit is active or for MMIO devices). A driver never
+knows the difference; a buffer whose physical address the domain does
+not map is refused by name at submission instead of faulting inside the
+device. Because the addresses on the wire are no longer physical, the
+device has to be told: `negotiate` adds `VIRTIO_F_ACCESS_PLATFORM` for
+any device whose pool hands out translated addresses, refuses a device
+that cannot support the feature, and refuses the mirror case — a device
+that demands the feature on a machine where the kernel built it no
+domain.
 
 Each domain's slot starts at a nonzero I/O virtual address, so this is
 not identity mapping under another name: if the kernel published a
 physical address anywhere the device would fault on its first fetch.
 
-Only PCI endpoints can be confined. virtio-iommu translates the DMA of
-functions on a PCI bus; a memory-mapped virtio device is not an endpoint
-of anything, so the aarch64 and riscv64 `virt` profiles — whose virtio
-devices are on the MMIO transport — have no translation unit and their
-devices keep reaching all of memory. `helios-inspector vm --iommu`
-refuses those architectures by name rather than accepting the flag and
-doing nothing. This is a property of the transport, not a gap in the
-driver: putting those platforms behind a unit means moving their devices
-onto PCI first.
+Only PCI endpoints can be confined. `virtio-iommu-pci` translates the
+DMA of functions on a PCI bus; a memory-mapped virtio device is not an
+endpoint of anything. On `aarch64` and `riscv64`, default non-`--iommu`
+boots keep their virtio-mmio layout, while passing `--iommu` to
+`helios vm` attaches `virtio-iommu-pci` first and promotes all
+virtio devices onto PCI (`virtio-*-pci` / `vhost-vsock-pci`) with
+`disable-legacy=on,iommu_platform=on` (over both Devicetree and `--acpi`
+on `aarch64`, and Devicetree on `riscv64`).
 
 ```bash
 cargo run -p helios-inspector -- vm --arch x86-64 --iommu \
+    --boot-program dash --boot-program debugger --no-compiler-plugin \
+    shell -c 'echo ok'
+cargo run -p helios-inspector -- vm --arch aarch64 --iommu \
+    --boot-program dash --boot-program debugger --no-compiler-plugin \
+    shell -c 'echo ok'
+cargo run -p helios-inspector -- vm --arch riscv64 --iommu \
     --boot-program dash --boot-program debugger --no-compiler-plugin \
     shell -c 'echo ok'
 ```
@@ -586,16 +599,16 @@ The boot log shows one line per confined device, and the feature line of
 each device then reports `access_platform=true`:
 
 ```
-virtio-iommu online function=00:01.0 msix_vector=55 global_bypass=true
+virtio-iommu online function=00:01.0 global_bypass=true
 virtio device confined to its own IOMMU domain endpoint=0x10 domain=0
   iova_base=… mapped_bytes=… granule=…
 virtio features negotiated device=_9P … access_platform=true
 ```
 
-`helios-inspector stats` carries the same facts in its IOMMU panel: the
+`helios stats` carries the same facts in its IOMMU panel: the
 unit's granule, whether endpoints outside every domain still reach
 memory, the running fault count, and the domain and mapped bytes of each
-confined device. Faults arrive on the unit's own MSI-X vector, so a
+confined device. Faults are drained periodically by `watch_faults`, so a
 device that issues an address its domain does not map is reported with
 the endpoint and the address that caused it rather than failing
 silently.

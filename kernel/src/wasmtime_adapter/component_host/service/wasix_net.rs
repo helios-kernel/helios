@@ -1933,8 +1933,11 @@ where
     written
 }
 
-/// Accepts a connection on the listening socket `fd` and installs it as a
-/// descriptor: its number, and the address and port of its peer.
+/// Accepts a connection on the listening socket `fd` (TCP or inherited vsock)
+/// and installs it as a descriptor: its number, and the address and port of
+/// its peer. Possessing a pre-bound listening descriptor (e.g. inherited at
+/// `fd = 3+`) is itself the capability to accept connections on it without
+/// requiring ambient socket-creation authority.
 async fn wasix_sock_accepted<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
@@ -1946,51 +1949,116 @@ where
     StorageImpl: crate::Storage,
 {
     let descriptor = caller.data().descriptors.get_cloned(fd);
-    let authority = wasix_sock_listen_authority(descriptor.as_ref())?;
-    let status = caller.data().require_socket_authority(authority);
-    if status != p1::errno::SUCCESS {
-        return Err(status);
-    }
-    let (listener, accept_timeout, family) = match descriptor {
-        Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
-            Some(UnixTcpSocket::Listening {
-                listener,
-                options,
-                family,
-                ..
-            }) => (
-                listener.id(),
-                options.time(SocketTime::AcceptTimeout),
-                family,
-            ),
-            _ => return Err(p1::errno::INVAL),
-        },
+    let socket = match descriptor {
+        Some(Preview1Descriptor::Socket(socket)) => socket,
         Some(_) => return Err(p1::errno::NOTSOCK),
         None => return Err(p1::errno::BADF),
     };
-    let Some(service) = caller.data().runtime_state.network_service() else {
-        return Err(p1::errno::NETDOWN);
-    };
-    let fdflags = caller.data().descriptors.fdflags(fd)?;
-    let timeout = wasix_effective_socket_timeout(accept_timeout, fdflags);
-    let accepted = service
-        .tcp_accept(listener, timeout)
-        .await
-        .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))?;
-    let peer_address = accepted.address;
-    let descriptor = Preview1Descriptor::Socket(UnixSocket::from_tcp(UnixTcpSocket::Connected {
+    if let Some(UnixTcpSocket::Listening {
+        listener,
+        options,
         family,
-        stream: OwnedTcpStream::new(crate::UnixNetwork::new(service.clone()), accepted.stream),
-        peer_address,
-        peer_port: accepted.port,
-        options: unix_socket_options::<Net>(),
-    }));
-    let accepted_fd =
-        caller
-            .data_mut()
-            .descriptors
-            .insert_with_fdflags(descriptor, false, accepted_fdflags)?;
-    Ok((accepted_fd, peer_address, accepted.port))
+        ..
+    }) = socket.tcp_state()
+    {
+        let Some(service) = caller.data().runtime_state.network_service() else {
+            return Err(p1::errno::NETDOWN);
+        };
+        let fdflags = caller.data().descriptors.fdflags(fd)?;
+        let timeout =
+            wasix_effective_socket_timeout(options.time(SocketTime::AcceptTimeout), fdflags);
+        let accepted = service
+            .tcp_accept(listener.id(), timeout)
+            .await
+            .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))?;
+        let peer_address = accepted.address;
+        let descriptor =
+            Preview1Descriptor::Socket(UnixSocket::from_tcp(UnixTcpSocket::Connected {
+                family,
+                stream: OwnedTcpStream::new(
+                    crate::UnixNetwork::new(service.clone()),
+                    accepted.stream,
+                ),
+                peer_address,
+                peer_port: accepted.port,
+                options: unix_socket_options::<Net>(),
+            }));
+        let accepted_fd = caller.data_mut().descriptors.insert_with_fdflags(
+            descriptor,
+            false,
+            accepted_fdflags,
+        )?;
+        return Ok((accepted_fd, peer_address, accepted.port));
+    }
+    if let Some(VsockSocket::Listening {
+        listener, options, ..
+    }) = socket.vsock_state()
+    {
+        let Some(vsock) = caller.data().runtime_state.vsock_service() else {
+            return Err(p1::errno::NETDOWN);
+        };
+        let fdflags = caller.data().descriptors.fdflags(fd)?;
+        let timeout =
+            wasix_effective_socket_timeout(options.time(SocketTime::AcceptTimeout), fdflags);
+        let listener_id = crate::VsockListenerId::from_u64(listener.id());
+        let stream_id = if timeout == 0 {
+            vsock
+                .try_accept(listener_id)
+                .map_err(p1_errno_from_vsock_error)?
+                .ok_or(p1::errno::AGAIN)?
+        } else {
+            vsock
+                .accept(listener_id, timeout)
+                .await
+                .map_err(|error| p1_errno_from_vsock_error_for_fdflags(error, fdflags))?
+        };
+        let local = vsock.local(stream_id).map_err(p1_errno_from_vsock_error)?;
+        let peer = vsock.peer(stream_id).map_err(p1_errno_from_vsock_error)?;
+        let net = crate::UnixNetwork::with_vsock(
+            caller.data().runtime_state.network_service(),
+            Some(vsock),
+        );
+        let descriptor =
+            Preview1Descriptor::Socket(UnixSocket::from_vsock(VsockSocket::Connected {
+                stream: helios_unix::OwnedVsockStream::new(net, stream_id.as_u64()),
+                local_cid: local.cid as u32,
+                local_port: local.port,
+                peer_cid: peer.cid as u32,
+                peer_port: peer.port,
+                options: unix_socket_options::<Net>(),
+            }));
+        let accepted_fd = caller.data_mut().descriptors.insert_with_fdflags(
+            descriptor,
+            false,
+            accepted_fdflags,
+        )?;
+        return Ok((
+            accepted_fd,
+            crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+            peer.port as u16,
+        ));
+    }
+    Err(p1::errno::INVAL)
+}
+
+fn p1_errno_from_vsock_error(error: crate::VsockError) -> i32 {
+    match error {
+        crate::VsockError::Timeout => p1::errno::TIMEDOUT,
+        crate::VsockError::ConnectionRefused | crate::VsockError::ConnectionReset => {
+            p1::errno::CONNRESET
+        }
+        crate::VsockError::Closed | crate::VsockError::UnknownHandle => p1::errno::CONNABORTED,
+        crate::VsockError::Unavailable => p1::errno::NETDOWN,
+        _ => p1::errno::IO,
+    }
+}
+
+fn p1_errno_from_vsock_error_for_fdflags(error: crate::VsockError, fdflags: u16) -> i32 {
+    if matches!(error, crate::VsockError::Timeout) && p1_fdflags_nonblocking(fdflags) {
+        p1::errno::AGAIN
+    } else {
+        p1_errno_from_vsock_error(error)
+    }
 }
 
 pub(super) async fn wasix_sock_connect<CpuImpl, Net, StorageImpl>(
@@ -2202,9 +2270,13 @@ where
         Ok(authority) => authority,
         Err(errno) => return Ok(errno),
     };
-    let status = caller.data().require_socket_authority(authority);
-    if status != p1::errno::SUCCESS {
-        return Ok(status);
+    // Possessing an already-connected TCP stream (e.g. accepted from an
+    // inherited `fd = 3+` listener) is itself the capability for I/O on it.
+    if authority != WasixSocketAuthority::Tcp {
+        let status = caller.data().require_socket_authority(authority);
+        if status != p1::errno::SUCCESS {
+            return Ok(status);
+        }
     }
     let Some(Preview1Descriptor::Socket(socket)) = descriptor else {
         return Ok(p1::errno::BADF);
@@ -2376,9 +2448,13 @@ where
         Ok(authority) => authority,
         Err(errno) => return Ok(errno),
     };
-    let status = caller.data().require_socket_authority(authority);
-    if status != p1::errno::SUCCESS {
-        return Ok(status);
+    // Possessing an already-connected TCP stream (e.g. accepted from an
+    // inherited `fd = 3+` listener) is itself the capability for I/O on it.
+    if authority != WasixSocketAuthority::Tcp {
+        let status = caller.data().require_socket_authority(authority);
+        if status != p1::errno::SUCCESS {
+            return Ok(status);
+        }
     }
     let Some(Preview1Descriptor::Socket(socket)) = descriptor else {
         return Ok(p1::errno::BADF);
@@ -2573,12 +2649,6 @@ where
                     UnixTcpSocket::Connected {
                         stream, options, ..
                     } => {
-                        let status = caller
-                            .data()
-                            .require_socket_authority(WasixSocketAuthority::Tcp);
-                        if status != p1::errno::SUCCESS {
-                            return Err(status);
-                        }
                         let Some(service) = caller.data().runtime_state.network_service() else {
                             return Err(p1::errno::NETDOWN);
                         };

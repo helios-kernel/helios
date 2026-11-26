@@ -565,13 +565,13 @@ impl<E: HeliosEnv> AsyncCommand<E> for WithInstructionProfile {
         )
         .await;
 
-        let summary = ctx
-            .env
-            .end_instruction_profile(&handle)
-            .await
+        let summary_res = ctx.env.end_instruction_profile(&handle).await;
+        let output_value = match eval_result {
+            Ok(data) => data.into_value_async(head).await?,
+            Err(err) => return Err(err),
+        };
+        let summary = summary_res
             .map_err(|e| e.into_shell_error("failed to finish instruction profile", head))?;
-
-        let output_value = eval_result?.into_value_async(head).await?;
 
         let mut rec = Record::new();
         rec.push("result", output_value);

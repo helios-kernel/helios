@@ -3,11 +3,16 @@
 //!
 //! # Ordering contract
 //!
-//! - [`RiscvHibernateDevices::quiesce_all`] quiesces every live virtio device
-//!   before the restore trampoline overwrites memory.
-//! - [`RiscvHibernateDevices::reinitialize_all`] reinitializes every live
-//!   virtio device after resuming from a hibernate image (and records resets
-//!   for host-share and memory-balloon devices).
+//! - [`RiscvHibernateDevices::quiesce_all`] quiesces every DMA-capable
+//!   endpoint device BEFORE quiescing `virtio-iommu`.
+//! - [`RiscvHibernateDevices::reinitialize_iommu`] reinitializes
+//!   `virtio-iommu` alone (when present) before the hibernate block device
+//!   writes the snapshot to disk.
+//! - [`RiscvHibernateDevices::reinitialize_all`] MUST reinitialize
+//!   `virtio-iommu` FIRST (when present) before any other virtio device calls
+//!   `reinitialize()`, so every DMA domain and IOVA mapping is restored before
+//!   any endpoint resumes DMA (and records resets for host-share and
+//!   memory-balloon devices).
 
 extern crate alloc;
 
@@ -36,10 +41,17 @@ use helios_kernel::{
 use helios_virtio::DeviceType;
 
 use crate::RiscvCpu;
+use crate::balloon::RiscvVirtioBalloonDevice;
 use crate::block::RiscvVirtioBlockDevice;
+use crate::entropy::RiscvVirtioRngDevice;
+use crate::gpu::RiscvVirtioGpuDevice;
 use crate::host_fs::HostFsTransportService;
+use crate::input::RiscvVirtioInputDevice;
+use crate::iommu::RiscvVirtioIommuDevice;
 use crate::net::RiscvVirtioNetDevice;
 use crate::rtc::GoldfishRtc;
+use crate::snd::RiscvVirtioSndDevice;
+use crate::vsock::RiscvVirtioVsockDevice;
 
 global_asm!(include_str!("restore.S"));
 
@@ -86,19 +98,21 @@ const _: () = {
 };
 
 /// Static-dispatch registry of every live RISC-V virtio device brought up at
-/// boot.
+/// boot, holding `virtio-iommu` first so [`HibernateDeviceController`] enforces
+/// the IOMMU-first reinitialization invariant.
 #[derive(Clone)]
 pub(crate) struct RiscvHibernateDevices {
     cpu: RiscvCpu,
     generation: MachineGenerationHandle,
+    pub(crate) iommu: Option<Arc<RiscvVirtioIommuDevice>>,
     pub(crate) host_fs: Option<HostFsTransportService>,
     pub(crate) network: Option<Arc<RiscvVirtioNetDevice>>,
-    pub(crate) entropy: Option<Arc<helios_virtio::VirtioMmioRngDevice>>,
-    pub(crate) balloon: Option<Arc<helios_virtio::VirtioMmioBalloonDevice>>,
-    pub(crate) vsock: Option<Arc<helios_virtio::VirtioMmioVsockDevice>>,
-    pub(crate) display: Option<Arc<helios_virtio::VirtioMmioGpuDevice>>,
-    pub(crate) inputs: Vec<Arc<helios_virtio::VirtioMmioInputDevice>>,
-    pub(crate) sound: Option<Arc<helios_virtio::VirtioMmioSndDevice>>,
+    pub(crate) entropy: Option<Arc<RiscvVirtioRngDevice>>,
+    pub(crate) balloon: Option<Arc<RiscvVirtioBalloonDevice>>,
+    pub(crate) vsock: Option<Arc<RiscvVirtioVsockDevice>>,
+    pub(crate) display: Option<Arc<RiscvVirtioGpuDevice>>,
+    pub(crate) inputs: Vec<Arc<RiscvVirtioInputDevice>>,
+    pub(crate) sound: Option<Arc<RiscvVirtioSndDevice>>,
     pub(crate) blocks: Vec<RiscvVirtioBlockDevice>,
 }
 
@@ -107,6 +121,7 @@ impl RiscvHibernateDevices {
         Self {
             cpu,
             generation,
+            iommu: None,
             host_fs: None,
             network: None,
             entropy: None,
@@ -123,6 +138,13 @@ impl RiscvHibernateDevices {
     /// virtio device for [`helios_kernel::hibernate::HibernateIdentity`].
     pub(crate) fn feature_records(&self) -> Vec<DeviceFeatureRecord> {
         let mut records = Vec::new();
+        if let Some(iommu) = &self.iommu {
+            records.push(DeviceFeatureRecord {
+                device_kind: DeviceType::Iommu as u32,
+                instance_index: 0,
+                features: iommu.features().bits(),
+            });
+        }
         if let Some(host_fs) = &self.host_fs {
             records.push(DeviceFeatureRecord {
                 device_kind: DeviceType::_9P as u32,
@@ -278,10 +300,36 @@ impl HibernateDeviceController for RiscvHibernateDevices {
                 }
             })?;
         }
+        // Quiesce virtio-iommu LAST after every confined endpoint has drained DMA.
+        if let Some(iommu) = &self.iommu {
+            iommu.quiesce(self.expired_fn(deadline)).map_err(|_| {
+                HibernateDeviceError::Quiesce {
+                    device: "virtio-iommu",
+                    detail: "quiesce failed",
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    fn reinitialize_iommu(&mut self) -> Result<(), HibernateDeviceError> {
+        let deadline = self.deadline();
+        if let Some(iommu) = &self.iommu {
+            let _reset = iommu.reinitialize(self.expired_fn(deadline)).map_err(|_| {
+                HibernateDeviceError::Reinitialize {
+                    device: "virtio-iommu",
+                    detail: "reinitialize failed",
+                }
+            })?;
+        }
         Ok(())
     }
 
     fn reinitialize_all(&mut self) -> Result<(), HibernateDeviceError> {
+        // STRICT ORDERING CONTRACT: when `virtio-iommu` is present, its
+        // `reinitialize()` MUST complete BEFORE any other virtio driver calls
+        // `reinitialize()`.
+        self.reinitialize_iommu()?;
         let deadline = self.deadline();
         if let Some(host_fs) = &self.host_fs {
             let _reset = host_fs.device().reinitialize().map_err(|_| {

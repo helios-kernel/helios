@@ -28,6 +28,7 @@ mod packet;
 pub mod permissions;
 mod poll;
 mod process;
+pub mod shm;
 mod signal;
 mod socket;
 mod system;
@@ -39,15 +40,24 @@ pub use crate::signal_frame::SignalFrameError;
 pub use fs::{
     ANON_INODE_FS_MAGIC, AccessCheck, BTRFS_SUPER_MAGIC, DirListEntry, EROFS_SUPER_MAGIC_V1,
     FileAccess, FileStat, Filesystem, FsOpError, FsStat, LinkOptions, OVERLAYFS_SUPER_MAGIC,
-    OpenRequest, PIPEFS_MAGIC, PROC_SUPER_MAGIC, SOCKFS_MAGIC, ST_NODEV, ST_NOEXEC, ST_NOSUID,
-    ST_RDONLY, ST_VALID, SYSFS_MAGIC, TMPFS_MAGIC, TimeUpdate, V9FS_MAGIC, XattrSetMode,
+    OpenOutcome, OpenRequest, PIPEFS_MAGIC, PROC_SUPER_MAGIC, SOCKFS_MAGIC, ST_NODEV, ST_NOEXEC,
+    ST_NOSUID, ST_RDONLY, ST_VALID, SYSFS_MAGIC, TMPFS_MAGIC, TimeUpdate, V9FS_MAGIC, XattrSetMode,
 };
 pub use icmp::{IPPROTO_ICMP, IPPROTO_ICMPV6, IcmpDatagram};
 pub use io::Clock;
+pub use memory::{FileVmaLookup, VmaBacking};
 pub use netlink::{AF_NETLINK, NETLINK_ROUTE};
 pub use packet::AF_PACKET;
 pub use process::{
     AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, ExecError, ExecSpec, SpawnedProcess, VforkDone,
+};
+pub use shm::{
+    CAP_IPC_LOCK, CAP_IPC_OWNER, IPC_64, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_NOWAIT, IPC_PRIVATE,
+    IPC_RMID, IPC_SET, IPC_STAT, MFD_ALLOW_SEALING, MFD_CLOEXEC, MFD_EXEC, MFD_HUGETLB,
+    MFD_NOEXEC_SEAL, SHM_DEST, SHM_EXEC, SHM_HUGETLB, SHM_INFO, SHM_INFO_BYTES, SHM_LOCK,
+    SHM_LOCKED, SHM_NORESERVE, SHM_RDONLY, SHM_REMAP, SHM_RND, SHM_STAT, SHM_STAT_ANY, SHM_UNLOCK,
+    SHMALL, SHMID64_DS_BYTES, SHMINFO64_BYTES, SHMLBA, SHMMAX, SHMMIN, SHMMNI, SHMSEG, ShmPerm,
+    ShmStat, ShmUsageInfo, check_ipc_owner_or_admin, check_ipc_perms, encode_shminfo64,
 };
 pub use signal::{ProcessSignals, SignalDelivery, SyscallRestart, ThreadSignalSlot};
 pub use socket::{
@@ -154,6 +164,25 @@ pub trait UserMemory {
     fn is_page_shared(&self, _address: u64) -> bool {
         false
     }
+    /// Reads mapped bytes regardless of user `PageFlags::READ` permission
+    /// (e.g. after `mprotect(PROT_NONE)`), defaulting to [`Self::read`].
+    fn read_unrestricted(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+        self.read(address, output)
+    }
+    /// Collects dirty `(file_offset, bytes)` runs from a file-backed
+    /// `MAP_SHARED` object over `[file_offset, file_offset + valid_len)`.
+    /// Returns `None` when the backing memory does not track shared objects.
+    fn collect_shared_dirty(
+        &self,
+        _object_id: u64,
+        _file_offset: u64,
+        _valid_len: u64,
+    ) -> Option<Vec<(u64, Vec<u8>)>> {
+        None
+    }
+    /// Updates the clean baseline of shared object `object_id` after `bytes`
+    /// at `file_offset` have been written back to the backing file.
+    fn mark_shared_clean(&self, _object_id: u64, _file_offset: u64, _bytes: &[u8]) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -218,6 +247,124 @@ pub trait VirtualMemory: UserMemory {
     /// exhaustion.
     fn populate(&mut self, address: u64, bytes: &[u8]) -> Result<(), MapError> {
         self.write(address, bytes).map_err(|_| MapError::Address)
+    }
+
+    /// Creates a fresh anonymous shared memory object and returns its
+    /// process-local ID (`0` when unsupported by a lightweight test mock).
+    fn create_shared_anonymous(&mut self) -> u64 {
+        0
+    }
+
+    /// Acquires or creates the container-wide shared memory object for a
+    /// regular file identified by `(dev, ino)` (`0` when unsupported).
+    fn acquire_shared_file(&mut self, _dev: u64, _ino: u64) -> u64 {
+        0
+    }
+
+    /// Acquires the container-wide shared memory object for SysV shared memory
+    /// segment `shmid` (`0` when unsupported by a lightweight test mock).
+    fn acquire_sysv_shm(&mut self, _shmid: i32) -> u64 {
+        0
+    }
+
+    /// Populates `page_index` inside shared object `object_id` with initial
+    /// file `bytes` if absent, preserving any existing resident frame.
+    fn load_shared_page(
+        &mut self,
+        _object_id: u64,
+        _page_index: u64,
+        _bytes: &[u8],
+    ) -> Result<(), MapError> {
+        Ok(())
+    }
+
+    /// Releases an unused temporary shared object (e.g. when staging fails).
+    fn release_shared_object(&mut self, _object_id: u64) {}
+
+    /// Maps `[address, address + length)` backed by shared object `object_id`
+    /// starting at `object_offset`, attaching resident pages covering
+    /// `attach_len` bytes.
+    fn map_shared_at(
+        &mut self,
+        address: u64,
+        length: u64,
+        access: PageFlags,
+        _object_id: u64,
+        _object_offset: u64,
+        _attach_len: u64,
+    ) -> Result<(), MapError> {
+        self.map_at(address, length, access)
+    }
+
+    /// Same as [`Self::map_shared_at`] at the first free range at or above `hint`.
+    fn map_shared_anywhere(
+        &mut self,
+        hint: u64,
+        length: u64,
+        access: PageFlags,
+        _object_id: u64,
+        _object_offset: u64,
+        _attach_len: u64,
+    ) -> Result<u64, MapError> {
+        self.map_anywhere(hint, length, access)
+    }
+
+    /// Maps a file-backed `MAP_PRIVATE` range at `address` and transfers any
+    /// staged frames from `stage_id` (consuming `stage_id`), leaving pages
+    /// beyond `staged_len` uncommitted so beyond-EOF touches raise `SIGBUS`.
+    fn map_private_file_at(
+        &mut self,
+        address: u64,
+        length: u64,
+        access: PageFlags,
+        _stage_id: u64,
+        _staged_len: u64,
+    ) -> Result<(), MapError> {
+        self.map_at(address, length, access)
+    }
+
+    /// Same as [`Self::map_private_file_at`] at the first free range at or above `hint`.
+    fn map_private_file_anywhere(
+        &mut self,
+        hint: u64,
+        length: u64,
+        access: PageFlags,
+        _stage_id: u64,
+        _staged_len: u64,
+    ) -> Result<u64, MapError> {
+        self.map_anywhere(hint, length, access)
+    }
+
+    /// Applies a `write(2)` / `pwrite(2)` update to shared object `object_id`
+    /// (updating live shared frames and clean baselines). Returns `true` when
+    /// handled through the shared object.
+    fn apply_shared_file_write(
+        &mut self,
+        _object_id: u64,
+        _file_offset: u64,
+        _bytes: &[u8],
+    ) -> bool {
+        false
+    }
+
+    /// Notifies the address space that `[start, end)` was unmapped so shared
+    /// VMA metadata stays synchronized.
+    fn unmap_shared_vma(&mut self, _start: u64, _end: u64) {}
+
+    /// Notifies the address space that `[from, from + old_len)` was remapped
+    /// to `[to, to + new_len)` so shared VMA metadata stays synchronized.
+    fn remap_shared_vma(&mut self, _from: u64, _old_len: u64, _to: u64, _new_len: u64) {}
+
+    /// Attaches resident pages from `object_id` covering `[address, address + attach_len)`
+    /// starting at `object_offset` (used when `mremap` grows a `MAP_SHARED` mapping).
+    fn attach_shared_tail(
+        &mut self,
+        _address: u64,
+        _object_id: u64,
+        _object_offset: u64,
+        _attach_len: u64,
+    ) -> Result<(), MapError> {
+        Ok(())
     }
 }
 
@@ -473,6 +620,7 @@ struct ProcessShared<R: Resources> {
     cwd: Arc<spin::Mutex<String>>,
     root: Arc<spin::Mutex<String>>,
     shared_mappings: Arc<spin::Mutex<Vec<memory::SharedFileMapping<R::File>>>>,
+    next_shm_attach_id: AtomicU64,
     stdin_lock: RawMutex,
     stdin_carry: spin::Mutex<Bytes>,
     attributes: spin::Mutex<system::Attributes>,
@@ -592,6 +740,7 @@ impl<R: Resources> Process<R> {
                 cwd: Arc::new(spin::Mutex::new(initial_cwd)),
                 root: Arc::new(spin::Mutex::new(String::from("/"))),
                 shared_mappings: Arc::new(spin::Mutex::new(Vec::new())),
+                next_shm_attach_id: AtomicU64::new(1),
                 stdin_lock: RawMutex::new(),
                 stdin_carry: spin::Mutex::new(initial_stdin_carry),
                 attributes: spin::Mutex::new(system::Attributes::new(start, open_files)),
@@ -619,6 +768,36 @@ impl<R: Resources> Process<R> {
         fs: &mut F,
     ) {
         memory::flush_all_shared_mappings(self, memory, fs).await;
+    }
+
+    /// Detaches all remaining SysV shared memory segments and drops any sole-
+    /// owner `memfd` mappings/descriptors on `execve` or final process exit.
+    pub fn detach_sysv_shm<F: Filesystem<R>>(&self, now_secs: i64, fs: &mut F) {
+        let shmids = memory::drain_sysv_shm_for_detach(self);
+        let pid = self.pid().get();
+        for shmid in shmids {
+            fs.shm_detach(shmid, pid, now_secs);
+        }
+    }
+
+    /// Releases sole-owner VMAs, SysV shared memory attachments, and `memfd`
+    /// descriptors on final process exit (called after the last thread ends).
+    pub fn cleanup_ipc_on_exit<F: Filesystem<R>>(&self, now_secs: i64, fs: &mut F) {
+        self.detach_sysv_shm(now_secs, fs);
+        if Arc::strong_count(&self.shared.shared_mappings) == 1 {
+            self.shared.shared_mappings.lock().clear();
+        }
+        if Arc::strong_count(&self.shared.descriptors) == 1 {
+            *self.shared.descriptors.lock() = DescriptorSlots::from_entries(Vec::new());
+        }
+        fs.sync_process_memfds(self.pid().get(), &[]);
+        fs.reap_memfds();
+    }
+
+    /// Synchronises this process's live `memfd` descriptor slots with `fs`
+    /// (for cross-process `/proc/<pid>/fd/<n>` reopen after `execve`).
+    pub fn sync_memfds<F: Filesystem<R>>(&self, fs: &F) {
+        shm::sync_process_memfds(self, fs);
     }
 
     /// Process-wide signal and interval-timer state shared across all threads
@@ -683,6 +862,32 @@ impl<R: Resources> Process<R> {
             memory,
             sigreturn_trampoline,
         )
+    }
+
+    /// Delivers a synchronous `SIGBUS` (`BUS_ADRERR`) fault with `si_addr =
+    /// fault_address` (e.g. accessing a page beyond a mapped file's end).
+    pub fn deliver_bus_fault<C: UserContext, M: UserMemory>(
+        &self,
+        fault_address: u64,
+        context: &mut C,
+        memory: &mut M,
+        sigreturn_trampoline: u64,
+    ) -> SignalDelivery {
+        signal::deliver_bus_fault_signal(
+            self.shared.abi,
+            &self.signals,
+            fault_address,
+            context,
+            memory,
+            sigreturn_trampoline,
+        )
+    }
+
+    /// Looks up the tracked file or shared-anonymous VMA covering `address`,
+    /// used on demand page faults (`NativeError::BackingFault`) to check file
+    /// EOF (`SIGBUS`) or load/attach the backing page.
+    pub fn lookup_vma(&self, address: u64) -> Option<VmaBacking<R::File>> {
+        memory::lookup_vma(self, address)
     }
 
     /// Restores user registers, extended state, signal mask, and alternate
@@ -902,6 +1107,7 @@ impl<R: Resources> Process<R> {
             cwd: Arc::new(spin::Mutex::new(self.shared.cwd.lock().clone())),
             root: Arc::new(spin::Mutex::new(self.shared.root.lock().clone())),
             shared_mappings: Arc::new(spin::Mutex::new(Vec::new())),
+            next_shm_attach_id: AtomicU64::new(1),
             stdin_lock: RawMutex::new(),
             stdin_carry: spin::Mutex::new(self.shared.stdin_carry.lock().clone()),
             attributes: spin::Mutex::new(self.shared.attributes.lock().clone()),
@@ -976,9 +1182,9 @@ impl<R: Resources> Process<R> {
         }
     }
 
-    fn finish_syscall_exit(&mut self, exit: Exit) {
+    fn finish_syscall_exit(&mut self, exit: Exit) -> bool {
         if self.exited {
-            return;
+            return false;
         }
         self.exited = true;
         self.shared.signals.unregister_thread(self.tid);
@@ -993,6 +1199,7 @@ impl<R: Resources> Process<R> {
                 .release_posix_for_process(self.shared.identity);
             self.signal_vfork_done();
         }
+        all_exited
     }
 }
 
@@ -1034,18 +1241,143 @@ pub async fn dispatch<
 ) -> ControlFlow<Exit, SyscallOutcome> {
     let abi = process.shared.abi;
     let arguments = call.arguments;
-    let outcome = match abi.operation(call.number) {
-        operation @ (Operation::Exit | Operation::ExitGroup) => {
-            memory::flush_all_shared_mappings(process, memory, output).await;
-            futex::exit_thread(process, memory);
-            let status = arguments[0] as u8;
-            let exit = if operation == Operation::ExitGroup {
-                Exit::Group(status)
-            } else {
-                Exit::Thread(status)
-            };
-            process.finish_syscall_exit(exit);
-            return ControlFlow::Break(exit);
+    let operation = abi.operation(call.number);
+    let outcome = match operation {
+        Operation::Exit
+        | Operation::ExitGroup
+        | Operation::Mmap
+        | Operation::Munmap
+        | Operation::Msync
+        | Operation::Mremap
+        | Operation::Madvise
+        | Operation::Shmat
+        | Operation::SchedYield
+        | Operation::Clone
+        | Operation::Clone3
+        | Operation::Fork
+        | Operation::Vfork
+        | Operation::Execve
+        | Operation::Execveat
+        | Operation::Wait4
+        | Operation::Waitid
+        | Operation::Getrandom => {
+            return dispatch_proc_mem(operation, process, abi, arguments, memory, thread, output)
+                .await;
+        }
+        Operation::RtSigsuspend
+        | Operation::RtSigtimedwait
+        | Operation::Pause
+        | Operation::EpollWait
+        | Operation::EpollPwait
+        | Operation::Poll
+        | Operation::Ppoll
+        | Operation::Select
+        | Operation::Pselect6
+        | Operation::Nanosleep
+        | Operation::ClockNanosleep
+        | Operation::Futex => {
+            dispatch_wait_signal(operation, process, abi, arguments, memory, output).await
+        }
+        Operation::Read
+        | Operation::Write
+        | Operation::Readv
+        | Operation::Writev
+        | Operation::Pread64
+        | Operation::Pwrite64
+        | Operation::Preadv
+        | Operation::Pwritev
+        | Operation::Preadv2
+        | Operation::Pwritev2
+        | Operation::Openat
+        | Operation::Open
+        | Operation::Creat
+        | Operation::Lseek
+        | Operation::Getdents64
+        | Operation::Ftruncate
+        | Operation::Truncate
+        | Operation::Fsync
+        | Operation::Fdatasync => {
+            dispatch_fs_io(operation, process, arguments, memory, output).await
+        }
+        Operation::Statfs
+        | Operation::Fstatfs
+        | Operation::Flock
+        | Operation::Fallocate
+        | Operation::Sync
+        | Operation::Syncfs
+        | Operation::Chroot
+        | Operation::CopyFileRange
+        | Operation::Splice
+        | Operation::Tee => dispatch_fs_extra(operation, process, arguments, memory, output).await,
+        Operation::Fstat
+        | Operation::Newfstatat
+        | Operation::Stat
+        | Operation::Lstat
+        | Operation::Statx
+        | Operation::Faccessat
+        | Operation::Faccessat2
+        | Operation::Access
+        | Operation::Readlinkat
+        | Operation::Readlink
+        | Operation::Mkdirat
+        | Operation::Mkdir
+        | Operation::Mknodat
+        | Operation::Mknod
+        | Operation::Chmod
+        | Operation::Fchmod
+        | Operation::Fchmodat
+        | Operation::Fchmodat2
+        | Operation::Chown
+        | Operation::Lchown
+        | Operation::Fchown
+        | Operation::Fchownat => {
+            dispatch_fs_meta(operation, process, arguments, memory, output).await
+        }
+        Operation::Setxattr
+        | Operation::Lsetxattr
+        | Operation::Fsetxattr
+        | Operation::Getxattr
+        | Operation::Lgetxattr
+        | Operation::Fgetxattr
+        | Operation::Listxattr
+        | Operation::Llistxattr
+        | Operation::Flistxattr
+        | Operation::Removexattr
+        | Operation::Lremovexattr
+        | Operation::Fremovexattr
+        | Operation::Unlinkat
+        | Operation::Unlink
+        | Operation::Rmdir
+        | Operation::Renameat2
+        | Operation::Renameat
+        | Operation::Rename
+        | Operation::Linkat
+        | Operation::Link
+        | Operation::Symlinkat
+        | Operation::Symlink
+        | Operation::Utimensat
+        | Operation::Chdir
+        | Operation::Fchdir => {
+            dispatch_fs_xattr_links(operation, process, arguments, memory, output).await
+        }
+        Operation::Bind
+        | Operation::Listen
+        | Operation::Accept
+        | Operation::Accept4
+        | Operation::Connect
+        | Operation::Getsockname
+        | Operation::Getpeername
+        | Operation::Sendto
+        | Operation::Recvfrom
+        | Operation::Sendmsg
+        | Operation::Recvmsg
+        | Operation::Sendmmsg
+        | Operation::Recvmmsg
+        | Operation::Shutdown
+        | Operation::Sendfile
+        | Operation::Setsockopt
+        | Operation::Getsockopt => {
+            dispatch_socket(operation, process, arguments, memory, output).await
         }
         Operation::RtSigreturn => SyscallOutcome::SigReturn,
         Operation::RtSigaction => SyscallOutcome::Return(signal::rt_sigaction(
@@ -1058,10 +1390,6 @@ pub async fn dispatch<
         }
         Operation::RtSigpending => {
             SyscallOutcome::Return(signal::rt_sigpending(&process.signals, arguments, memory))
-        }
-        Operation::RtSigsuspend => signal::rt_sigsuspend(&process.signals, arguments, memory).await,
-        Operation::RtSigtimedwait => {
-            signal::rt_sigtimedwait(&process.signals, arguments, memory, output).await
         }
         Operation::Sigaltstack => SyscallOutcome::Return(signal::sigaltstack(
             abi,
@@ -1098,7 +1426,6 @@ pub async fn dispatch<
                 arguments,
             ))
         }
-        Operation::Pause => signal::pause(&process.signals).await,
         Operation::Alarm => {
             SyscallOutcome::Return(signal::alarm(&process.shared.signals, arguments, output))
         }
@@ -1114,6 +1441,438 @@ pub async fn dispatch<
             memory,
             output,
         )),
+        Operation::Close => {
+            let fd = arguments[0] as u32 as i32;
+            let (result, closed) = match process.shared.descriptors.lock().close(fd) {
+                Ok(entry) => (0, Some(entry)),
+                Err(err) => (io::descriptor_errno(err), None),
+            };
+            if let Some(entry) = closed {
+                let is_memfd = matches!(&entry.descriptor, Descriptor::<R>::File(open) if output.memfd_handle(open.node()).is_some());
+                fs_extra::release_posix_locks_for_entry(process, &entry, output);
+                drop(entry);
+                if is_memfd {
+                    output.reap_memfds();
+                    shm::sync_process_memfds(process, output);
+                }
+            }
+            SyscallOutcome::Return(result)
+        }
+        Operation::CloseRange => {
+            SyscallOutcome::Return(fs::close_range::<R, _>(process, arguments, output))
+        }
+        Operation::Readahead => {
+            SyscallOutcome::Return(fs_extra::readahead::<R, _>(process, arguments, output))
+        }
+        Operation::Getcwd => SyscallOutcome::Return(fs::getcwd::<R, _>(process, arguments, memory)),
+        Operation::Pipe | Operation::Pipe2 => {
+            let (uid, gid) = {
+                let creds = process.credentials.lock();
+                (creds.user.effective, creds.group.effective)
+            };
+            SyscallOutcome::Return(io::pipe::<R, _>(
+                &mut process.shared.descriptors.lock(),
+                arguments,
+                memory,
+                operation == Operation::Pipe2,
+                uid,
+                gid,
+            ))
+        }
+        Operation::Dup | Operation::Dup2 | Operation::Dup3 => {
+            let (result, overwritten, src_is_memfd) = {
+                let mut table = process.shared.descriptors.lock();
+                let src_memfd = table
+                    .get_entry(arguments[0] as u32 as i32)
+                    .is_some_and(|e| {
+                        matches!(&e.descriptor, Descriptor::<R>::File(open) if output.memfd_handle(open.node()).is_some())
+                    });
+                let prev = if matches!(operation, Operation::Dup2 | Operation::Dup3)
+                    && arguments[0] as u32 != arguments[1] as u32
+                {
+                    table.get_entry(arguments[1] as u32 as i32).cloned()
+                } else {
+                    None
+                };
+                let res = io::duplicate::<R, _>(abi, &mut table, operation, arguments, output);
+                (res, prev, src_memfd)
+            };
+            let mut touched_memfd = src_is_memfd && result <= i32::MAX as u64;
+            if result <= i32::MAX as u64
+                && let Some(entry) = overwritten
+            {
+                if matches!(&entry.descriptor, Descriptor::<R>::File(open) if output.memfd_handle(open.node()).is_some())
+                {
+                    touched_memfd = true;
+                }
+                fs_extra::release_posix_locks_for_entry(process, &entry, output);
+                drop(entry);
+            }
+            if touched_memfd {
+                output.reap_memfds();
+                shm::sync_process_memfds(process, output);
+            }
+            SyscallOutcome::Return(result)
+        }
+        Operation::Fcntl => {
+            let cmd = arguments[1] as u32;
+            if matches!(cmd, 5..=7) {
+                dispatch_fs_extra(operation, process, arguments, memory, output).await
+            } else if matches!(cmd, shm::F_ADD_SEALS | shm::F_GET_SEALS) {
+                SyscallOutcome::Return(shm::fcntl_seals(
+                    process,
+                    arguments[0] as u32 as i32,
+                    cmd,
+                    arguments[2],
+                    output,
+                ))
+            } else {
+                let res = io::duplicate::<R, _>(
+                    abi,
+                    &mut process.shared.descriptors.lock(),
+                    Operation::Fcntl,
+                    arguments,
+                    output,
+                );
+                if matches!(cmd, 0 | 1030) && res <= i32::MAX as u64 {
+                    let is_memfd = process
+                        .shared
+                        .descriptors
+                        .lock()
+                        .get_entry(res as i32)
+                        .is_some_and(|e| {
+                            matches!(&e.descriptor, Descriptor::<R>::File(open) if output.memfd_handle(open.node()).is_some())
+                        });
+                    if is_memfd {
+                        shm::sync_process_memfds(process, output);
+                    }
+                }
+                SyscallOutcome::Return(res)
+            }
+        }
+        Operation::Eventfd | Operation::Eventfd2 => SyscallOutcome::Return(io::event::<R>(
+            &mut process.shared.descriptors.lock(),
+            arguments,
+            operation == Operation::Eventfd2,
+        )),
+        Operation::EpollCreate | Operation::EpollCreate1 => {
+            SyscallOutcome::Return(io::epoll_create::<R>(
+                &mut process.shared.descriptors.lock(),
+                arguments,
+                operation == Operation::EpollCreate1,
+            ))
+        }
+        Operation::EpollCtl => SyscallOutcome::Return(io::epoll_ctl::<R, _>(
+            abi,
+            &mut process.shared.descriptors.lock(),
+            arguments,
+            memory,
+        )),
+        Operation::Mprotect => {
+            SyscallOutcome::Return(memory::mprotect(process, abi, arguments, memory))
+        }
+        Operation::Brk => SyscallOutcome::Return(process.shared.program_break.lock().set(
+            abi,
+            arguments[0],
+            memory,
+        )),
+        Operation::MemfdCreate => {
+            SyscallOutcome::Return(shm::memfd_create(process, arguments, memory, output))
+        }
+        Operation::Shmget => SyscallOutcome::Return(shm::shmget(process, arguments, output)),
+        Operation::Shmdt => SyscallOutcome::Return(shm::shmdt(process, arguments, memory, output)),
+        Operation::Shmctl => {
+            SyscallOutcome::Return(shm::shmctl(process, arguments, memory, output))
+        }
+        Operation::SchedGetaffinity => SyscallOutcome::Return(thread::sched_getaffinity(
+            process, arguments, memory, output,
+        )),
+        Operation::SchedSetaffinity => SyscallOutcome::Return(thread::sched_setaffinity(
+            process, arguments, memory, output,
+        )),
+        Operation::SchedGetscheduler => {
+            SyscallOutcome::Return(thread::sched_getscheduler(process, arguments))
+        }
+        Operation::SchedSetscheduler => {
+            SyscallOutcome::Return(thread::sched_setscheduler(process, arguments, memory))
+        }
+        Operation::SchedGetparam => {
+            SyscallOutcome::Return(thread::sched_getparam(process, arguments, memory))
+        }
+        Operation::SchedSetparam => {
+            SyscallOutcome::Return(thread::sched_setparam(process, arguments, memory))
+        }
+        Operation::SchedGetPriorityMax => {
+            SyscallOutcome::Return(thread::sched_get_priority_max(arguments))
+        }
+        Operation::SchedGetPriorityMin => {
+            SyscallOutcome::Return(thread::sched_get_priority_min(arguments))
+        }
+        Operation::IoprioSet => SyscallOutcome::Return(thread::ioprio_set(process, arguments)),
+        Operation::IoprioGet => SyscallOutcome::Return(thread::ioprio_get(process, arguments)),
+        Operation::Times => {
+            SyscallOutcome::Return(system::times::<R, _, _>(process, arguments, memory, output))
+        }
+        Operation::Getrusage => SyscallOutcome::Return(system::getrusage::<R, _, _>(
+            process, arguments, memory, output,
+        )),
+        Operation::Personality => SyscallOutcome::Return(process.personality(arguments)),
+        Operation::Syslog => SyscallOutcome::Return(system::syslog::<R, _, _>(
+            process, arguments, memory, output,
+        )),
+        Operation::SetRobustList => {
+            SyscallOutcome::Return(futex::set_robust_list(process, arguments))
+        }
+        Operation::GetRobustList => {
+            SyscallOutcome::Return(futex::get_robust_list(process, arguments, memory))
+        }
+        Operation::Getpid => SyscallOutcome::Return(process.shared.identity.id().get()),
+        Operation::Getppid => SyscallOutcome::Return(process::getppid(process)),
+        Operation::Getpgid => SyscallOutcome::Return(process::getpgid(process, arguments)),
+        Operation::Setpgid => SyscallOutcome::Return(process::setpgid(process, arguments)),
+        Operation::Getpgrp => SyscallOutcome::Return(process::getpgrp(process)),
+        Operation::Getsid => SyscallOutcome::Return(process::getsid(process, arguments)),
+        Operation::Setsid => {
+            let res = process::setsid(process);
+            if (res as i64) >= 0 {
+                output.set_controlling_pty(None);
+            }
+            SyscallOutcome::Return(res)
+        }
+        Operation::Gettid => SyscallOutcome::Return(u64::from(process.tid.get())),
+        Operation::SetTidAddress => {
+            process.clear_child_tid = arguments[0];
+            SyscallOutcome::Return(u64::from(process.tid.get()))
+        }
+        Operation::Prctl => SyscallOutcome::Return(process.prctl(arguments, memory)),
+        Operation::ArchPrctl => SyscallOutcome::Return(arch_prctl(abi, arguments, memory, thread)),
+        Operation::Ioctl => {
+            let is_socket = process
+                .shared
+                .descriptors
+                .lock()
+                .get_entry(arguments[0] as u32 as i32)
+                .is_some_and(|e| matches!(e.descriptor, Descriptor::<R>::Socket(_)));
+            if is_socket {
+                dispatch_socket(operation, process, arguments, memory, output).await
+            } else {
+                SyscallOutcome::Return(tty::ioctl::<R, _, _>(process, arguments, memory, output))
+            }
+        }
+        Operation::ClockGettime => {
+            SyscallOutcome::Return(system::clock_gettime(arguments, memory, output))
+        }
+        Operation::ClockGetres => SyscallOutcome::Return(system::clock_getres(arguments, memory)),
+        Operation::ClockSettime => {
+            let has_cap = process
+                .credentials
+                .lock()
+                .capabilities
+                .has_effective(CAP_SYS_TIME);
+            SyscallOutcome::Return(system::clock_settime(arguments, has_cap, memory, output))
+        }
+        Operation::Gettimeofday => {
+            SyscallOutcome::Return(system::gettimeofday(arguments, memory, output))
+        }
+        Operation::Time => SyscallOutcome::Return(system::time(arguments, memory, output)),
+        Operation::Uname => SyscallOutcome::Return(system::uname(abi, arguments, memory, output)),
+        Operation::Sethostname | Operation::Setdomainname => {
+            let has_cap = process
+                .credentials
+                .lock()
+                .capabilities
+                .has_effective(CAP_SYS_ADMIN);
+            SyscallOutcome::Return(system::set_uts_name(
+                operation, has_cap, arguments, memory, output,
+            ))
+        }
+        Operation::Sysinfo => SyscallOutcome::Return(system::sysinfo(arguments, memory, output)),
+        Operation::Getuid | Operation::Geteuid | Operation::Getgid | Operation::Getegid => {
+            SyscallOutcome::Return(process.credentials.lock().id(operation))
+        }
+        Operation::Getgroups => {
+            SyscallOutcome::Return(process.credentials.lock().getgroups(arguments, memory))
+        }
+        Operation::Getresuid | Operation::Getresgid => {
+            let credentials = process.credentials.lock().clone();
+            SyscallOutcome::Return(credentials.resolve(operation, arguments, memory))
+        }
+        Operation::Setuid => SyscallOutcome::Return(process.credentials.lock().setuid(arguments)),
+        Operation::Setgid => SyscallOutcome::Return(process.credentials.lock().setgid(arguments)),
+        Operation::Setreuid => {
+            SyscallOutcome::Return(process.credentials.lock().setreuid(arguments))
+        }
+        Operation::Setregid => {
+            SyscallOutcome::Return(process.credentials.lock().setregid(arguments))
+        }
+        Operation::Setresuid => {
+            SyscallOutcome::Return(process.credentials.lock().setresuid(arguments))
+        }
+        Operation::Setresgid => {
+            SyscallOutcome::Return(process.credentials.lock().setresgid(arguments))
+        }
+        Operation::Setgroups => {
+            SyscallOutcome::Return(process.credentials.lock().setgroups(arguments, memory))
+        }
+        Operation::Capget => SyscallOutcome::Return(process.capget(arguments, memory)),
+        Operation::Capset => SyscallOutcome::Return(process.capset(arguments, memory)),
+        Operation::Prlimit64 | Operation::Getrlimit | Operation::Setrlimit => {
+            SyscallOutcome::Return(process.rlimit(operation, arguments, memory))
+        }
+        Operation::Umask => SyscallOutcome::Return(process.umask(arguments)),
+        Operation::Getpriority => SyscallOutcome::Return(process.getpriority(arguments)),
+        Operation::Setpriority => SyscallOutcome::Return(process.setpriority(arguments)),
+        Operation::Socket => SyscallOutcome::Return(socket::socket::<R, _>(
+            &process.shared.descriptors,
+            arguments,
+            socket_context(process),
+            output,
+        )),
+        Operation::Socketpair => SyscallOutcome::Return(socket::socketpair::<R, _>(
+            &process.shared.descriptors,
+            arguments,
+            memory,
+        )),
+        Operation::Unknown => SyscallOutcome::Return(errno(ENOSYS)),
+    };
+    ControlFlow::Continue(outcome)
+}
+
+#[inline(never)]
+async fn dispatch_proc_mem<
+    R: Resources,
+    M: VirtualMemory,
+    T: Thread<R>,
+    O: Stdio + Clock + System + Filesystem<R> + Tty + Network<R::Network>,
+>(
+    operation: Operation,
+    process: &mut Process<R>,
+    abi: Abi,
+    arguments: [u64; 6],
+    memory: &mut M,
+    thread: &mut T,
+    output: &mut O,
+) -> ControlFlow<Exit, SyscallOutcome> {
+    let outcome = match operation {
+        Operation::Exit | Operation::ExitGroup => {
+            memory::flush_all_shared_mappings(process, memory, output).await;
+            futex::exit_thread(process, memory);
+            let status = arguments[0] as u8;
+            let exit = if operation == Operation::ExitGroup {
+                Exit::Group(status)
+            } else {
+                Exit::Thread(status)
+            };
+            if process.finish_syscall_exit(exit) {
+                let now_secs = (output.realtime_nanos() / 1_000_000_000) as i64;
+                process.cleanup_ipc_on_exit(now_secs, output);
+            }
+            return ControlFlow::Break(exit);
+        }
+        Operation::Mmap => match fs::prepare_mmap_pseudo_zero(process, arguments) {
+            Ok(mmap_args) => SyscallOutcome::Return(
+                memory::mmap_boxed(process, abi, mmap_args, memory, output).await,
+            ),
+            Err(err) => SyscallOutcome::Return(err),
+        },
+        Operation::Munmap => SyscallOutcome::Return(
+            memory::munmap_boxed(process, abi, arguments, memory, output).await,
+        ),
+        Operation::Msync => SyscallOutcome::Return(
+            memory::msync_boxed(process, abi, arguments, memory, output).await,
+        ),
+        Operation::Mremap => SyscallOutcome::Return(
+            memory::mremap_boxed(process, abi, arguments, memory, output).await,
+        ),
+        Operation::Madvise => {
+            SyscallOutcome::Return(memory::madvise_boxed(process, arguments, memory, output).await)
+        }
+        Operation::Shmat => {
+            SyscallOutcome::Return(shm::shmat(process, abi, arguments, memory, output).await)
+        }
+        Operation::SchedYield => SyscallOutcome::Return(thread::sched_yield().await),
+        Operation::Clone => {
+            SyscallOutcome::Return(thread::clone(process, arguments, memory, thread, output).await)
+        }
+        Operation::Clone3 => {
+            SyscallOutcome::Return(thread::clone3(process, arguments, memory, thread, output).await)
+        }
+        Operation::Fork => {
+            SyscallOutcome::Return(process::fork(process, memory, thread, output).await)
+        }
+        Operation::Vfork => {
+            SyscallOutcome::Return(process::vfork(process, memory, thread, output).await)
+        }
+        Operation::Execve => process::execve(arguments, memory, thread).await,
+        Operation::Execveat => process::execveat(arguments, memory, thread).await,
+        Operation::Wait4 => process::wait4(process, arguments, memory).await,
+        Operation::Waitid => process::waitid(process, arguments, memory).await,
+        Operation::Getrandom => {
+            SyscallOutcome::Return(system::getrandom(arguments, memory, output).await)
+        }
+        _ => unreachable!("dispatched non-proc-mem operation"),
+    };
+    ControlFlow::Continue(outcome)
+}
+
+#[inline(never)]
+async fn dispatch_wait_signal<
+    R: Resources,
+    M: VirtualMemory,
+    O: Stdio + Clock + System + Filesystem<R> + Tty + Network<R::Network>,
+>(
+    operation: Operation,
+    process: &mut Process<R>,
+    abi: Abi,
+    arguments: [u64; 6],
+    memory: &mut M,
+    output: &mut O,
+) -> SyscallOutcome {
+    match operation {
+        Operation::RtSigsuspend => signal::rt_sigsuspend(&process.signals, arguments, memory).await,
+        Operation::RtSigtimedwait => {
+            signal::rt_sigtimedwait(&process.signals, arguments, memory, output).await
+        }
+        Operation::Pause => signal::pause(&process.signals).await,
+        Operation::EpollWait | Operation::EpollPwait => {
+            io::epoll_wait::<R, _, _>(
+                abi,
+                process,
+                arguments,
+                memory,
+                output,
+                operation == Operation::EpollPwait,
+            )
+            .await
+        }
+        Operation::Poll => poll::poll::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Ppoll => poll::ppoll::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Select => poll::select::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Pselect6 => poll::pselect6::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Nanosleep => SyscallOutcome::Return(
+            thread::nanosleep(&process.signals, arguments, memory, output).await,
+        ),
+        Operation::ClockNanosleep => SyscallOutcome::Return(
+            thread::clock_nanosleep(&process.signals, arguments, memory, output).await,
+        ),
+        Operation::Futex => futex::futex(process, arguments, memory, output).await,
+        _ => unreachable!("dispatched non-wait-signal operation"),
+    }
+}
+
+#[inline(never)]
+async fn dispatch_fs_io<
+    R: Resources,
+    M: VirtualMemory,
+    O: Stdio + Clock + System + Filesystem<R> + Tty + Network<R::Network>,
+>(
+    operation: Operation,
+    process: &mut Process<R>,
+    arguments: [u64; 6],
+    memory: &mut M,
+    output: &mut O,
+) -> SyscallOutcome {
+    match operation {
         Operation::Read => read::<R, _, _>(process, arguments, memory, output).await,
         Operation::Write => write::<R, _, _>(process, arguments, memory, output).await,
         Operation::Readv => {
@@ -1174,84 +1933,103 @@ pub async fn dispatch<
             )
             .await
         }
-        Operation::Openat => {
-            SyscallOutcome::Return(fs::openat::<R, _, _>(process, arguments, memory, output).await)
-        }
-        Operation::Open => {
-            SyscallOutcome::Return(fs::open::<R, _, _>(process, arguments, memory, output).await)
-        }
-        Operation::Creat => {
-            SyscallOutcome::Return(fs::creat::<R, _, _>(process, arguments, memory, output).await)
-        }
-        Operation::Close => {
-            let fd = arguments[0] as u32 as i32;
-            let (result, closed) = match process.shared.descriptors.lock().close(fd) {
-                Ok(entry) => (0, Some(entry)),
-                Err(err) => (io::descriptor_errno(err), None),
+        op @ (Operation::Openat | Operation::Open | Operation::Creat) => {
+            let openat_args = match op {
+                Operation::Openat => arguments,
+                Operation::Open => fs::open_to_openat_args(arguments),
+                Operation::Creat => fs::creat_to_openat_args(arguments),
+                _ => unreachable!("matched Openat | Open | Creat"),
             };
-            if let Some(entry) = closed {
-                fs_extra::release_posix_locks_for_entry(process, &entry, output);
-            }
-            SyscallOutcome::Return(result)
-        }
-        Operation::CloseRange => {
-            SyscallOutcome::Return(fs::close_range::<R, _>(process, arguments, output))
-        }
-        Operation::Statfs => SyscallOutcome::Return(
-            alloc::boxed::Box::pin(fs_extra::statfs::<R, _, _>(
-                process, arguments, memory, output,
-            ))
-            .await,
-        ),
-        Operation::Fstatfs => SyscallOutcome::Return(
-            alloc::boxed::Box::pin(fs_extra::fstatfs::<R, _, _>(
-                process, arguments, memory, output,
-            ))
-            .await,
-        ),
-        Operation::Flock => {
-            alloc::boxed::Box::pin(fs_extra::flock::<R, _>(process, arguments, output)).await
-        }
-        Operation::Fallocate => SyscallOutcome::Return(
-            alloc::boxed::Box::pin(fs_extra::fallocate::<R, _, _>(
-                process, arguments, memory, output,
-            ))
-            .await,
-        ),
-        Operation::Sync => SyscallOutcome::Return(
-            alloc::boxed::Box::pin(fs_extra::sync::<R, _, _>(process, memory, output)).await,
-        ),
-        Operation::Syncfs => SyscallOutcome::Return(
-            alloc::boxed::Box::pin(fs_extra::syncfs::<R, _, _>(
-                process, arguments, memory, output,
-            ))
-            .await,
-        ),
-        Operation::Chroot => SyscallOutcome::Return(
-            alloc::boxed::Box::pin(fs_extra::chroot::<R, _, _>(
-                process, arguments, memory, output,
-            ))
-            .await,
-        ),
-        Operation::CopyFileRange => SyscallOutcome::Return(
-            alloc::boxed::Box::pin(fs_extra::copy_file_range::<R, _, _>(
-                process, arguments, memory, output,
-            ))
-            .await,
-        ),
-        Operation::Splice => {
-            alloc::boxed::Box::pin(fs_extra::splice::<R, _, _>(
-                process, arguments, memory, output,
-            ))
-            .await
-        }
-        Operation::Tee => alloc::boxed::Box::pin(fs_extra::tee::<R>(process, arguments)).await,
-        Operation::Readahead => {
-            SyscallOutcome::Return(fs_extra::readahead::<R, _>(process, arguments, output))
+            fs::openat::<R, _, _>(process, openat_args, memory, output).await
         }
         Operation::Lseek => {
             SyscallOutcome::Return(fs::lseek::<R, _>(process, arguments, output).await)
         }
+        Operation::Getdents64 => SyscallOutcome::Return(
+            fs::getdents64::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Ftruncate => {
+            SyscallOutcome::Return(fs::ftruncate::<R, _>(process, arguments, output).await)
+        }
+        Operation::Truncate => SyscallOutcome::Return(
+            fs::truncate::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Fsync => SyscallOutcome::Return(
+            fs::fsync::<R, _, _>(process, arguments, false, memory, output).await,
+        ),
+        Operation::Fdatasync => SyscallOutcome::Return(
+            fs::fsync::<R, _, _>(process, arguments, true, memory, output).await,
+        ),
+        _ => unreachable!("dispatched non-fs-io operation"),
+    }
+}
+
+#[inline(never)]
+async fn dispatch_fs_extra<
+    R: Resources,
+    M: VirtualMemory,
+    O: Stdio + Clock + System + Filesystem<R> + Tty + Network<R::Network>,
+>(
+    operation: Operation,
+    process: &mut Process<R>,
+    arguments: [u64; 6],
+    memory: &mut M,
+    output: &mut O,
+) -> SyscallOutcome {
+    match operation {
+        Operation::Statfs => SyscallOutcome::Return(
+            fs_extra::statfs::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Fstatfs => SyscallOutcome::Return(
+            fs_extra::fstatfs::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Flock => fs_extra::flock::<R, _>(process, arguments, output).await,
+        Operation::Fallocate => SyscallOutcome::Return(
+            fs_extra::fallocate::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Sync => {
+            SyscallOutcome::Return(fs_extra::sync::<R, _, _>(process, memory, output).await)
+        }
+        Operation::Syncfs => SyscallOutcome::Return(
+            fs_extra::syncfs::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Chroot => SyscallOutcome::Return(
+            fs_extra::chroot::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::CopyFileRange => SyscallOutcome::Return(
+            fs_extra::copy_file_range::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Splice => fs_extra::splice::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Tee => fs_extra::tee::<R>(process, arguments).await,
+        Operation::Fcntl => {
+            let cmd = arguments[1] as u32;
+            fs_extra::fcntl_lock::<R, _, _>(
+                process,
+                arguments[0] as u32 as i32,
+                cmd,
+                arguments[2],
+                memory,
+                output,
+            )
+            .await
+        }
+        _ => unreachable!("dispatched non-fs-extra operation"),
+    }
+}
+
+#[inline(never)]
+async fn dispatch_fs_meta<
+    R: Resources,
+    M: VirtualMemory,
+    O: Stdio + Clock + System + Filesystem<R> + Tty + Network<R::Network>,
+>(
+    operation: Operation,
+    process: &mut Process<R>,
+    arguments: [u64; 6],
+    memory: &mut M,
+    output: &mut O,
+) -> SyscallOutcome {
+    match operation {
         Operation::Fstat => SyscallOutcome::Return(
             fs::fstat::<R, _, _, _>(process, arguments, memory, output, output).await,
         ),
@@ -1318,6 +2096,23 @@ pub async fn dispatch<
         Operation::Fchownat => SyscallOutcome::Return(
             fs::fchownat::<R, _, _>(process, arguments, memory, output).await,
         ),
+        _ => unreachable!("dispatched non-fs-meta operation"),
+    }
+}
+
+#[inline(never)]
+async fn dispatch_fs_xattr_links<
+    R: Resources,
+    M: VirtualMemory,
+    O: Stdio + Clock + System + Filesystem<R> + Tty + Network<R::Network>,
+>(
+    operation: Operation,
+    process: &mut Process<R>,
+    arguments: [u64; 6],
+    memory: &mut M,
+    output: &mut O,
+) -> SyscallOutcome {
+    match operation {
         Operation::Setxattr => SyscallOutcome::Return(
             fs::setxattr_path::<R, _, _>(process, arguments, true, memory, output).await,
         ),
@@ -1393,325 +2188,23 @@ pub async fn dispatch<
         Operation::Fchdir => {
             SyscallOutcome::Return(fs::fchdir::<R, _>(process, arguments, output).await)
         }
-        Operation::Getcwd => SyscallOutcome::Return(fs::getcwd::<R, _>(process, arguments, memory)),
-        Operation::Getdents64 => SyscallOutcome::Return(
-            fs::getdents64::<R, _, _>(process, arguments, memory, output).await,
-        ),
-        Operation::Ftruncate => {
-            SyscallOutcome::Return(fs::ftruncate::<R, _>(process, arguments, output).await)
-        }
-        Operation::Truncate => SyscallOutcome::Return(
-            fs::truncate::<R, _, _>(process, arguments, memory, output).await,
-        ),
-        Operation::Fsync => SyscallOutcome::Return(
-            fs::fsync::<R, _, _>(process, arguments, false, memory, output).await,
-        ),
-        Operation::Fdatasync => SyscallOutcome::Return(
-            fs::fsync::<R, _, _>(process, arguments, true, memory, output).await,
-        ),
-        operation @ (Operation::Pipe | Operation::Pipe2) => {
-            let (uid, gid) = {
-                let creds = process.credentials.lock();
-                (creds.user.effective, creds.group.effective)
-            };
-            SyscallOutcome::Return(io::pipe::<R, _>(
-                &mut process.shared.descriptors.lock(),
-                arguments,
-                memory,
-                operation == Operation::Pipe2,
-                uid,
-                gid,
-            ))
-        }
-        operation @ (Operation::Dup | Operation::Dup2 | Operation::Dup3) => {
-            let (result, overwritten) = {
-                let mut table = process.shared.descriptors.lock();
-                let prev = if matches!(operation, Operation::Dup2 | Operation::Dup3)
-                    && arguments[0] as u32 != arguments[1] as u32
-                {
-                    table.get_entry(arguments[1] as u32 as i32).cloned()
-                } else {
-                    None
-                };
-                let res = io::duplicate::<R, _>(abi, &mut table, operation, arguments, output);
-                (res, prev)
-            };
-            if result <= i32::MAX as u64
-                && let Some(entry) = overwritten
-            {
-                fs_extra::release_posix_locks_for_entry(process, &entry, output);
-            }
-            SyscallOutcome::Return(result)
-        }
-        Operation::Fcntl => {
-            let cmd = arguments[1] as u32;
-            if matches!(cmd, 5..=7) {
-                alloc::boxed::Box::pin(fs_extra::fcntl_lock::<R, _, _>(
-                    process,
-                    arguments[0] as u32 as i32,
-                    cmd,
-                    arguments[2],
-                    memory,
-                    output,
-                ))
-                .await
-            } else {
-                SyscallOutcome::Return(io::duplicate::<R, _>(
-                    abi,
-                    &mut process.shared.descriptors.lock(),
-                    Operation::Fcntl,
-                    arguments,
-                    output,
-                ))
-            }
-        }
-        operation @ (Operation::Eventfd | Operation::Eventfd2) => {
-            SyscallOutcome::Return(io::event::<R>(
-                &mut process.shared.descriptors.lock(),
-                arguments,
-                operation == Operation::Eventfd2,
-            ))
-        }
-        operation @ (Operation::EpollCreate | Operation::EpollCreate1) => {
-            SyscallOutcome::Return(io::epoll_create::<R>(
-                &mut process.shared.descriptors.lock(),
-                arguments,
-                operation == Operation::EpollCreate1,
-            ))
-        }
-        Operation::EpollCtl => SyscallOutcome::Return(io::epoll_ctl::<R, _>(
-            abi,
-            &mut process.shared.descriptors.lock(),
-            arguments,
-            memory,
-        )),
-        operation @ (Operation::EpollWait | Operation::EpollPwait) => {
-            io::epoll_wait::<R, _, _>(
-                abi,
-                process,
-                arguments,
-                memory,
-                output,
-                operation == Operation::EpollPwait,
-            )
-            .await
-        }
-        Operation::Poll => poll::poll::<R, _, _>(process, arguments, memory, output).await,
-        Operation::Ppoll => poll::ppoll::<R, _, _>(process, arguments, memory, output).await,
-        Operation::Select => poll::select::<R, _, _>(process, arguments, memory, output).await,
-        Operation::Pselect6 => poll::pselect6::<R, _, _>(process, arguments, memory, output).await,
-        Operation::Mmap => {
-            SyscallOutcome::Return(memory::mmap(process, abi, arguments, memory, output).await)
-        }
-        Operation::Munmap => {
-            SyscallOutcome::Return(memory::munmap(process, abi, arguments, memory, output).await)
-        }
-        Operation::Msync => {
-            SyscallOutcome::Return(memory::msync(process, abi, arguments, memory, output).await)
-        }
-        Operation::Mprotect => {
-            SyscallOutcome::Return(memory::mprotect(process, abi, arguments, memory))
-        }
-        Operation::Mremap => {
-            SyscallOutcome::Return(memory::mremap(process, abi, arguments, memory, output).await)
-        }
-        Operation::Madvise => {
-            let _mm = process.shared.program_break.lock();
-            SyscallOutcome::Return(memory::madvise(arguments, memory))
-        }
-        Operation::Brk => SyscallOutcome::Return(process.shared.program_break.lock().set(
-            abi,
-            arguments[0],
-            memory,
-        )),
-        Operation::SchedYield => SyscallOutcome::Return(thread::sched_yield().await),
-        Operation::SchedGetaffinity => SyscallOutcome::Return(thread::sched_getaffinity(
-            process, arguments, memory, output,
-        )),
-        Operation::SchedSetaffinity => SyscallOutcome::Return(thread::sched_setaffinity(
-            process, arguments, memory, output,
-        )),
-        Operation::SchedGetscheduler => {
-            SyscallOutcome::Return(thread::sched_getscheduler(process, arguments))
-        }
-        Operation::SchedSetscheduler => {
-            SyscallOutcome::Return(thread::sched_setscheduler(process, arguments, memory))
-        }
-        Operation::SchedGetparam => {
-            SyscallOutcome::Return(thread::sched_getparam(process, arguments, memory))
-        }
-        Operation::SchedSetparam => {
-            SyscallOutcome::Return(thread::sched_setparam(process, arguments, memory))
-        }
-        Operation::SchedGetPriorityMax => {
-            SyscallOutcome::Return(thread::sched_get_priority_max(arguments))
-        }
-        Operation::SchedGetPriorityMin => {
-            SyscallOutcome::Return(thread::sched_get_priority_min(arguments))
-        }
-        Operation::IoprioSet => SyscallOutcome::Return(thread::ioprio_set(process, arguments)),
-        Operation::IoprioGet => SyscallOutcome::Return(thread::ioprio_get(process, arguments)),
-        Operation::Times => {
-            SyscallOutcome::Return(system::times::<R, _, _>(process, arguments, memory, output))
-        }
-        Operation::Getrusage => SyscallOutcome::Return(system::getrusage::<R, _, _>(
-            process, arguments, memory, output,
-        )),
-        Operation::Personality => SyscallOutcome::Return(process.personality(arguments)),
-        Operation::Syslog => SyscallOutcome::Return(system::syslog::<R, _, _>(
-            process, arguments, memory, output,
-        )),
-        Operation::Nanosleep => SyscallOutcome::Return(
-            thread::nanosleep(&process.signals, arguments, memory, output).await,
-        ),
-        Operation::ClockNanosleep => SyscallOutcome::Return(
-            thread::clock_nanosleep(&process.signals, arguments, memory, output).await,
-        ),
-        Operation::Clone => {
-            SyscallOutcome::Return(thread::clone(process, arguments, memory, thread, output).await)
-        }
-        Operation::Clone3 => {
-            SyscallOutcome::Return(thread::clone3(process, arguments, memory, thread, output).await)
-        }
-        Operation::Fork => {
-            SyscallOutcome::Return(process::fork(process, memory, thread, output).await)
-        }
-        Operation::Vfork => {
-            SyscallOutcome::Return(process::vfork(process, memory, thread, output).await)
-        }
-        Operation::Execve => process::execve(arguments, memory, thread).await,
-        Operation::Execveat => process::execveat(arguments, memory, thread).await,
-        Operation::Wait4 => process::wait4(process, arguments, memory).await,
-        Operation::Waitid => process::waitid(process, arguments, memory).await,
-        Operation::Futex => futex::futex(process, arguments, memory, output).await,
-        Operation::SetRobustList => {
-            SyscallOutcome::Return(futex::set_robust_list(process, arguments))
-        }
-        Operation::GetRobustList => {
-            SyscallOutcome::Return(futex::get_robust_list(process, arguments, memory))
-        }
-        Operation::Getpid => SyscallOutcome::Return(process.shared.identity.id().get()),
-        Operation::Getppid => SyscallOutcome::Return(process::getppid(process)),
-        Operation::Getpgid => SyscallOutcome::Return(process::getpgid(process, arguments)),
-        Operation::Setpgid => SyscallOutcome::Return(process::setpgid(process, arguments)),
-        Operation::Getpgrp => SyscallOutcome::Return(process::getpgrp(process)),
-        Operation::Getsid => SyscallOutcome::Return(process::getsid(process, arguments)),
-        Operation::Setsid => SyscallOutcome::Return(process::setsid(process)),
-        Operation::Gettid => SyscallOutcome::Return(u64::from(process.tid.get())),
-        Operation::SetTidAddress => {
-            process.clear_child_tid = arguments[0];
-            SyscallOutcome::Return(u64::from(process.tid.get()))
-        }
-        Operation::Prctl => SyscallOutcome::Return(process.prctl(arguments, memory)),
-        Operation::ArchPrctl => SyscallOutcome::Return(arch_prctl(abi, arguments, memory, thread)),
-        Operation::Ioctl => SyscallOutcome::Return({
-            let is_socket = process
-                .shared
-                .descriptors
-                .lock()
-                .get_entry(arguments[0] as u32 as i32)
-                .is_some_and(|e| matches!(e.descriptor, Descriptor::<R>::Socket(_)));
-            if is_socket {
-                let ctx = socket_context(process);
-                match netlink::socket_ioctl::<R::Network, _, _>(
-                    arguments[1] as u32,
-                    arguments[2],
-                    ctx,
-                    memory,
-                    output,
-                )
-                .await
-                {
-                    Ok(Some(ret)) => ret,
-                    Ok(None) => tty::ioctl::<R, _, _>(process, arguments, memory, output),
-                    Err(err) => errno(err),
-                }
-            } else {
-                tty::ioctl::<R, _, _>(process, arguments, memory, output)
-            }
-        }),
-        Operation::ClockGettime => {
-            SyscallOutcome::Return(system::clock_gettime(arguments, memory, output))
-        }
-        Operation::ClockGetres => SyscallOutcome::Return(system::clock_getres(arguments, memory)),
-        Operation::ClockSettime => {
-            let has_cap = process
-                .credentials
-                .lock()
-                .capabilities
-                .has_effective(CAP_SYS_TIME);
-            SyscallOutcome::Return(system::clock_settime(arguments, has_cap, memory, output))
-        }
-        Operation::Gettimeofday => {
-            SyscallOutcome::Return(system::gettimeofday(arguments, memory, output))
-        }
-        Operation::Time => SyscallOutcome::Return(system::time(arguments, memory, output)),
-        Operation::Getrandom => {
-            SyscallOutcome::Return(system::getrandom(arguments, memory, output).await)
-        }
-        Operation::Uname => SyscallOutcome::Return(system::uname(abi, arguments, memory, output)),
-        operation @ (Operation::Sethostname | Operation::Setdomainname) => {
-            let has_cap = process
-                .credentials
-                .lock()
-                .capabilities
-                .has_effective(CAP_SYS_ADMIN);
-            SyscallOutcome::Return(system::set_uts_name(
-                operation, has_cap, arguments, memory, output,
-            ))
-        }
-        Operation::Sysinfo => SyscallOutcome::Return(system::sysinfo(arguments, memory, output)),
-        operation @ (Operation::Getuid
-        | Operation::Geteuid
-        | Operation::Getgid
-        | Operation::Getegid) => SyscallOutcome::Return(process.credentials.lock().id(operation)),
-        Operation::Getgroups => {
-            SyscallOutcome::Return(process.credentials.lock().getgroups(arguments, memory))
-        }
-        Operation::Getresuid | Operation::Getresgid => {
-            let credentials = process.credentials.lock().clone();
-            SyscallOutcome::Return(credentials.resolve(
-                abi.operation(call.number),
-                arguments,
-                memory,
-            ))
-        }
-        Operation::Setuid => SyscallOutcome::Return(process.credentials.lock().setuid(arguments)),
-        Operation::Setgid => SyscallOutcome::Return(process.credentials.lock().setgid(arguments)),
-        Operation::Setreuid => {
-            SyscallOutcome::Return(process.credentials.lock().setreuid(arguments))
-        }
-        Operation::Setregid => {
-            SyscallOutcome::Return(process.credentials.lock().setregid(arguments))
-        }
-        Operation::Setresuid => {
-            SyscallOutcome::Return(process.credentials.lock().setresuid(arguments))
-        }
-        Operation::Setresgid => {
-            SyscallOutcome::Return(process.credentials.lock().setresgid(arguments))
-        }
-        Operation::Setgroups => {
-            SyscallOutcome::Return(process.credentials.lock().setgroups(arguments, memory))
-        }
-        Operation::Capget => SyscallOutcome::Return(process.capget(arguments, memory)),
-        Operation::Capset => SyscallOutcome::Return(process.capset(arguments, memory)),
-        operation @ (Operation::Prlimit64 | Operation::Getrlimit | Operation::Setrlimit) => {
-            SyscallOutcome::Return(process.rlimit(operation, arguments, memory))
-        }
-        Operation::Umask => SyscallOutcome::Return(process.umask(arguments)),
-        Operation::Getpriority => SyscallOutcome::Return(process.getpriority(arguments)),
-        Operation::Setpriority => SyscallOutcome::Return(process.setpriority(arguments)),
-        Operation::Socket => SyscallOutcome::Return(socket::socket::<R, _>(
-            &process.shared.descriptors,
-            arguments,
-            socket_context(process),
-            output,
-        )),
-        Operation::Socketpair => SyscallOutcome::Return(socket::socketpair::<R, _>(
-            &process.shared.descriptors,
-            arguments,
-            memory,
-        )),
+        _ => unreachable!("dispatched non-fs-xattr-links operation"),
+    }
+}
+
+#[inline(never)]
+async fn dispatch_socket<
+    R: Resources,
+    M: VirtualMemory,
+    O: Stdio + Clock + System + Filesystem<R> + Tty + Network<R::Network>,
+>(
+    operation: Operation,
+    process: &mut Process<R>,
+    arguments: [u64; 6],
+    memory: &mut M,
+    output: &mut O,
+) -> SyscallOutcome {
+    match operation {
         Operation::Bind => SyscallOutcome::Return(
             socket::bind::<R, _, _>(
                 &process.shared.descriptors,
@@ -1725,7 +2218,7 @@ pub async fn dispatch<
         Operation::Listen => SyscallOutcome::Return(
             socket::listen::<R, _>(&process.shared.descriptors, arguments, output).await,
         ),
-        operation @ (Operation::Accept | Operation::Accept4) => SyscallOutcome::Return(
+        Operation::Accept | Operation::Accept4 => SyscallOutcome::Return(
             socket::accept::<R, _, _>(
                 &process.shared.descriptors,
                 arguments,
@@ -1803,12 +2296,31 @@ pub async fn dispatch<
             socket::getsockopt::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
                 .await,
         ),
-        Operation::Unknown => SyscallOutcome::Return(errno(ENOSYS)),
-    };
-    ControlFlow::Continue(outcome)
+        Operation::Ioctl => SyscallOutcome::Return({
+            let ctx = socket_context(process);
+            match netlink::socket_ioctl::<R::Network, _, _>(
+                arguments[1] as u32,
+                arguments[2],
+                ctx,
+                memory,
+                output,
+            )
+            .await
+            {
+                Ok(Some(ret)) => ret,
+                Ok(None) => tty::ioctl::<R, _, _>(process, arguments, memory, output),
+                Err(err) => errno(err),
+            }
+        }),
+        _ => unreachable!("dispatched non-socket operation"),
+    }
 }
 
-async fn read<R: Resources, M: UserMemory, O: Stdio + Filesystem<R> + Network<R::Network>>(
+async fn read<
+    R: Resources,
+    M: UserMemory,
+    O: Stdio + System + Filesystem<R> + Network<R::Network>,
+>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -1901,7 +2413,7 @@ async fn read<R: Resources, M: UserMemory, O: Stdio + Filesystem<R> + Network<R:
         }
         return SyscallOutcome::Return(bytes.len() as u64);
     }
-    io::read_resource::<R, M>(&process.signals, &entry, args, memory).await
+    io::read_resource::<R, M, O>(process, &entry, args, memory, output).await
 }
 
 fn socket_context<R: Resources>(process: &Process<R>) -> socket::SocketContext {
@@ -1913,7 +2425,11 @@ fn socket_context<R: Resources>(process: &Process<R>) -> socket::SocketContext {
     }
 }
 
-async fn write<R: Resources, M: VirtualMemory, O: Stdio + Filesystem<R> + Network<R::Network>>(
+async fn write<
+    R: Resources,
+    M: VirtualMemory,
+    O: Stdio + System + Filesystem<R> + Network<R::Network>,
+>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -1954,7 +2470,7 @@ async fn write<R: Resources, M: VirtualMemory, O: Stdio + Filesystem<R> + Networ
     let stream = match &entry.descriptor {
         Descriptor::<R>::Stdout => Stream::Stdout,
         Descriptor::<R>::Stderr => Stream::Stderr,
-        _ => return io::write_resource::<R, M>(&process.signals, &entry, args, memory).await,
+        _ => return io::write_resource::<R, M, O>(process, &entry, args, memory, output).await,
     };
     let nonblock = entry.fdflags() & FDFLAG_NONBLOCK != 0;
     // Linux MAX_RW_COUNT is INT_MAX rounded down to PAGE_SIZE (x86-64: 4096).
