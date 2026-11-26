@@ -788,6 +788,50 @@ impl<S: Storage> ContainerFilesystem<S> {
         resolved.fs().read_whole(resolved.fs_path()).await
     }
 
+    /// Resolves `raw_path` relative to `base_dir` for `creds`, enforcing
+    /// directory search (`MAY_EXEC`), mount `READ | EXECUTE` authority, and
+    /// private-mount DAC/ACL `MAY_EXEC` on regular files (`fs/exec.c`
+    /// `do_open_execat`), and returns `(normalized_container_path, contents)`.
+    pub async fn read_executable_at(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        creds: &Credentials,
+    ) -> Result<(String, FileContents), FsOpError> {
+        let (resolved, trailing_slash) =
+            self.walk_path_for(base_dir, raw_path, true, creds).await?;
+        let meta = resolved.fs().stat(resolved.fs_path()).await?;
+        if meta.kind == NodeKind::Symlink {
+            return Err(FsError::Loop.into());
+        }
+        if meta.kind == NodeKind::Directory {
+            return Err(FsError::NotPermitted.into());
+        }
+        if trailing_slash {
+            return Err(FsError::NotDirectory.into());
+        }
+        if meta.kind != NodeKind::File {
+            return Err(FsError::NotPermitted.into());
+        }
+        let path = resolved.container_path().to_owned();
+        let contents = resolved.check_exec_and_read(creds).await?;
+        Ok((path, contents))
+    }
+
+    /// Computes post-exec credentials (setuid/sgid/file capabilities clamped
+    /// by `authority_cap_ceiling`) for an already-resolved container path.
+    pub async fn exec_credentials_resolved(
+        &self,
+        container_path: &str,
+        creds: &Credentials,
+        authority_cap_ceiling: u64,
+    ) -> Result<Credentials, FsOpError> {
+        let resolved = self.resolve(container_path)?;
+        resolved
+            .exec_credentials(creds, authority_cap_ceiling)
+            .await
+    }
+
     /// Whether the container's mount for `container_path` grants execute rights.
     pub fn can_exec(&self, container_path: &str) -> bool {
         self.resolve(container_path).is_ok_and(|resolved| {
@@ -2666,6 +2710,69 @@ pub struct LinuxContainerSnapshot {
     pub mounts: Vec<ContainerMountSnapshot>,
 }
 
+/// Container-wide cache of active `MAP_SHARED` file page objects keyed by
+/// `(st_dev, st_ino)`. Entries hold weak references so frames are reclaimed
+/// automatically as soon as the last mapping in the container drops.
+pub struct SharedFileCache {
+    entries: spin::Mutex<alloc::collections::BTreeMap<(u64, u64), crate::WeakSharedPageObject>>,
+}
+
+impl SharedFileCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: spin::Mutex::new(alloc::collections::BTreeMap::new()),
+        }
+    }
+
+    /// Returns the live [`crate::SharedPageObject`] for `(dev, ino)`, creating
+    /// a fresh file-backed object if no mapping is currently active.
+    pub fn get_or_create(&self, dev: u64, ino: u64) -> crate::SharedPageObject {
+        let mut guard = self.entries.lock();
+        if let Some(weak) = guard.get(&(dev, ino))
+            && let Some(live) = weak.upgrade()
+        {
+            return live;
+        }
+        guard.retain(|_, weak| weak.upgrade().is_some());
+        let obj = crate::SharedPageObject::new_file_backed();
+        guard.insert((dev, ino), obj.downgrade());
+        obj
+    }
+
+    /// Returns the live [`crate::SharedPageObject`] for `(dev, ino)` if any
+    /// process in the container currently maps it `MAP_SHARED`.
+    pub fn get(&self, dev: u64, ino: u64) -> Option<crate::SharedPageObject> {
+        self.entries
+            .lock()
+            .get(&(dev, ino))
+            .and_then(crate::WeakSharedPageObject::upgrade)
+    }
+
+    /// Applies a `write(2)` / `pwrite(2)` update to any active shared page
+    /// object for `(dev, ino)`.
+    pub fn apply_file_write(&self, dev: u64, ino: u64, offset: u64, bytes: &[u8]) {
+        if let Some(obj) = self.get(dev, ino) {
+            obj.apply_file_write(offset, bytes);
+        }
+    }
+
+    /// Overlays resident live `MAP_SHARED` bytes onto a `read(2)` buffer so
+    /// cross-process `read(2)` sees unflushed `MAP_SHARED` writes immediately.
+    pub fn overlay_file_read(&self, dev: u64, ino: u64, offset: u64, out: &mut [u8]) {
+        if let Some(obj) = self.get(dev, ino) {
+            obj.overlay_file_read(offset, out);
+        }
+    }
+
+    /// Reflects file truncation to `new_size` into any active shared page
+    /// object for `(dev, ino)`.
+    pub fn truncate(&self, dev: u64, ino: u64, new_size: u64) {
+        if let Some(obj) = self.get(dev, ino) {
+            obj.truncate(new_size);
+        }
+    }
+}
+
 /// A kernel Linux container: the bounded Linux system every native Linux
 /// process runs inside.
 pub struct LinuxContainer<S: Storage> {
@@ -2677,6 +2784,7 @@ pub struct LinuxContainer<S: Storage> {
     uts: TriompheArc<spin::Mutex<SharedUts>>,
     pids: PidNamespace,
     futex: FutexTable,
+    shared_files: SharedFileCache,
 }
 
 fn attach_default_pseudo_mounts<S: Storage>(
@@ -2903,6 +3011,7 @@ impl<S: Storage> LinuxContainer<S> {
             uts,
             pids: PidNamespace::new(),
             futex: FutexTable::new(),
+            shared_files: SharedFileCache::new(),
         })
     }
 
@@ -3020,6 +3129,7 @@ impl<S: Storage> LinuxContainer<S> {
             uts,
             pids: PidNamespace::new(),
             futex: FutexTable::new(),
+            shared_files: SharedFileCache::new(),
         }
     }
 
@@ -3118,11 +3228,17 @@ impl<S: Storage> LinuxContainer<S> {
             uts,
             pids: PidNamespace::new(),
             futex: FutexTable::new(),
+            shared_files: SharedFileCache::new(),
         })
     }
 
     pub const fn id(&self) -> ContainerId {
         self.id
+    }
+
+    /// Container-wide page cache for coherent file-backed `MAP_SHARED` mappings.
+    pub fn shared_files(&self) -> &SharedFileCache {
+        &self.shared_files
     }
 
     /// The authority ceiling of every process running in this container.
