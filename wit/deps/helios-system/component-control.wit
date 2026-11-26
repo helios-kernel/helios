@@ -25,6 +25,18 @@ interface component-control {
     restarts: u64,
   }
 
+  /// Guest directory holding a `component.toml` subtree to mount dynamically.
+  record dynamic-dir-source {
+    subtree-name: string,
+    path: string,
+  }
+
+  /// Source for mounting a dynamic component subtree under an opted-in parent realm.
+  variant dynamic-subtree-source {
+    guest-dir(dynamic-dir-source),
+    manifests(list<tuple<string, string>>),
+  }
+
   /// Lists live and configured components under the caller's authorized scope.
   list-components: async func() -> result<list<component-status>, control-error>;
 
@@ -36,4 +48,11 @@ interface component-control {
 
   /// Restarts a configured component by moniker.
   restart: async func(moniker: string) -> result<component-status, control-error>;
+
+  /// Mounts a validated dynamic component subtree under `parent-moniker`,
+  /// returning the mounted subtree root moniker.
+  mount-dynamic: async func(parent-moniker: string, source: dynamic-subtree-source) -> result<string, control-error>;
+
+  /// Gracefully stops and unmounts a previously mounted dynamic subtree.
+  unmount-dynamic: async func(moniker: string) -> result<_, control-error>;
 }

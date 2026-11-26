@@ -47,6 +47,62 @@ pub const THREE_PART_MANIFEST_FILE: &str = "image-manifest.json";
 /// Schema version of [`ThreePartImageManifest`].
 pub const THREE_PART_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
+/// Why parsing, validating, and rendering a `component.toml` tree into Rust failed.
+#[derive(Debug, Error)]
+pub enum TopologyCodegenError {
+    #[error(transparent)]
+    Manifest(#[from] ManifestError),
+    #[error("failed to render component topology template: {source}")]
+    RenderTemplate {
+        #[source]
+        source: askama::Error,
+    },
+    #[error("failed to create directory `{path}`: {source}")]
+    CreateDir {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to write `{path}`: {source}")]
+    Write {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to resolve `{path}`: {source}")]
+    Resolve {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// Parses, statically validates, and renders a `component.toml` directory tree into
+/// `out_path`, returning the canonicalized output path.
+pub(crate) fn render_components_dir_to_file(
+    workspace_root: &WorkspaceRoot,
+    components_dir: &Path,
+    out_path: &Path,
+) -> Result<PathBuf, TopologyCodegenError> {
+    let resolved_dir = resolve_path(workspace_root, components_dir);
+    let topology = load_tree_from_dir(&resolved_dir)?;
+    let rendered = render_topology_rust(&topology)?;
+    if let Some(parent) = out_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|source| TopologyCodegenError::CreateDir {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    fs::write(out_path, rendered).map_err(|source| TopologyCodegenError::Write {
+        path: out_path.display().to_string(),
+        source,
+    })?;
+    fs::canonicalize(out_path).map_err(|source| TopologyCodegenError::Resolve {
+        path: out_path.display().to_string(),
+        source,
+    })
+}
+
 /// Why component codegen or three-part image packaging failed.
 #[derive(Debug, Error)]
 pub enum ComponentBuildError {
@@ -55,14 +111,11 @@ pub enum ComponentBuildError {
     #[error(transparent)]
     Manifest(#[from] ManifestError),
     #[error(transparent)]
+    Codegen(#[from] TopologyCodegenError),
+    #[error(transparent)]
     Prebuild(#[from] PrebuildError),
     #[error(transparent)]
     WasmBuild(#[from] WasmBuildError),
-    #[error("failed to render component topology template: {source}")]
-    RenderTemplate {
-        #[source]
-        source: askama::Error,
-    },
     #[error("failed to read `{path}`: {source}")]
     Read {
         path: String,
@@ -536,13 +589,13 @@ pub(crate) fn run_image_build(
 
 /// Renders a validated [`ComponentTopology`] into static native Rust source code
 /// through the compile-time `askama` template (`cli/templates/component_topology.rs.askama`).
-pub fn render_topology_rust(topology: &ComponentTopology) -> Result<String, ComponentBuildError> {
+pub fn render_topology_rust(topology: &ComponentTopology) -> Result<String, TopologyCodegenError> {
     let template = ComponentTopologyTemplate {
         nodes: topology.nodes.as_ref(),
     };
     let mut rendered = template
         .render()
-        .map_err(|source| ComponentBuildError::RenderTemplate { source })?;
+        .map_err(|source| TopologyCodegenError::RenderTemplate { source })?;
     if !rendered.ends_with('\n') {
         rendered.push('\n');
     }

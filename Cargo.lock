@@ -3032,6 +3032,7 @@ dependencies = [
  "helios-tpm",
  "helios-virtio",
  "limine 0.6.5",
+ "pci_types",
  "r-efi 7.1.0",
  "smccc",
  "spin 0.12.3",
@@ -3311,6 +3312,7 @@ dependencies = [
  "arrayvec",
  "fdt",
  "helios-hal",
+ "pci_types",
  "thiserror 2.0.21",
 ]
 
@@ -3463,10 +3465,13 @@ dependencies = [
 name = "helios-inspector-host"
 version = "0.1.0"
 dependencies = [
+ "askama",
+ "ed25519-dalek",
  "futures-io",
  "futures-lite",
  "futures-util",
  "helios-api",
+ "helios-component-manager",
  "helios-inspector-protocol",
  "helios-wit-rpc",
 ]

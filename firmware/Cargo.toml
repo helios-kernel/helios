@@ -15,6 +15,7 @@ acpi = { workspace = true, optional = true }
 arrayvec = { version = "0.7.6", default-features = false }
 fdt = { version = "0.1.5", default-features = false, optional = true }
 helios-hal.workspace = true
+pci_types = { version = "0.10.1", default-features = false }
 thiserror = { version = "2.0.20", default-features = false }
 
 [dev-dependencies]

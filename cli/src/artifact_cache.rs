@@ -549,7 +549,15 @@ pub fn workspace_inputs(
             if resolved.starts_with(excluded) {
                 continue;
             }
-            if let Ok(relative) = resolved.strip_prefix(workspace_root) {
+            if resolved.is_dir() {
+                if resolved.starts_with(workspace_root) {
+                    let walk_error = |source| CacheError::Walk {
+                        path: resolved.display().to_string(),
+                        source,
+                    };
+                    inputs.extend(package_files(&resolved, workspace_root, walk_error)?);
+                }
+            } else if let Ok(relative) = resolved.strip_prefix(workspace_root) {
                 inputs.insert(relative.to_path_buf());
             }
         }
@@ -1250,6 +1258,40 @@ mod tests {
                 "link.x",
                 "programs/date/src/main.rs",
                 "src/main.rs"
+            ]
+            .map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn a_directory_dep_info_entry_expands_to_its_files() {
+        let fixture = Fixture::new();
+        let root = fixture.workspace();
+        let components_dir = root.join("components");
+        fs::create_dir_all(components_dir.join("inspector")).expect("components/inspector dir");
+        fs::write(components_dir.join("component.toml"), "name = \"root\"\n").expect("root toml");
+        fs::write(
+            components_dir.join("inspector/component.toml"),
+            "name = \"inspector\"\n",
+        )
+        .expect("inspector toml");
+        let dep_info = root.join("inspector.d");
+        fs::write(
+            &dep_info,
+            format!(
+                "{target}: {dir}\n\n{dir}:\n",
+                target = root.join("target/inspector.wasm").display(),
+                dir = components_dir.display(),
+            ),
+        )
+        .expect("dep-info file");
+        let inputs = workspace_inputs(&[dep_info], &root, &root.join("target"), &[])
+            .expect("directory dep-info expands cleanly");
+        assert_eq!(
+            inputs,
+            [
+                "components/component.toml",
+                "components/inspector/component.toml"
             ]
             .map(PathBuf::from)
         );

@@ -1,15 +1,8 @@
-//! virtio-input over the platform MMIO bus for the AArch64 backend.
+//! virtio-input over PCI or MMIO for the AArch64 backend.
 //!
-//! A machine with a desktop presents several input devices at once — a
-//! keyboard, a relative pointer, an absolute tablet — so every slot the
-//! platform describes that answers as one is brought up here and handed
-//! to the kernel.
-//!
-//! Concurrency contract: the devices are discovered and programmed on
-//! the bootstrap processor before IRQs are unmasked. Afterwards each
-//! reports on the SPI the firmware names, delivered to that same
-//! processor, which is why the kernel task that drains a device is
-//! local to it.
+//! Concurrency contract: the devices are discovered and programmed on the
+//! bootstrap processor before IRQs are unmasked. Afterwards each reports on
+//! the SPI the firmware names, delivered to that same processor.
 
 extern crate alloc;
 
@@ -17,19 +10,17 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use arm_gic::{IntId, Trigger};
-
-use crate::platform::PlatformDescription;
+use helios_hal::cpu::Cpu;
 use helios_kernel::ExternalInterruptHandler;
+use helios_virtio::{DeviceType, VirtioBusTransport, VirtioInputDevice as RawVirtioInputDevice};
 
-type Aarch64VirtioInputDevice = helios_virtio::VirtioInputDevice<
-    helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<crate::Aarch64DmaPool>>,
->;
+use crate::iommu::{self, Aarch64DmaArenas, Aarch64VirtioTransport, Confinement};
+use crate::pci::{PciRoot, VirtioFunctions};
+use crate::platform::PlatformDescription;
+
+type Aarch64VirtioInputDevice = RawVirtioInputDevice<Aarch64VirtioTransport>;
 
 /// The interrupt route's view of one input device.
-///
-/// The kernel's reader holds the same `Arc`, which satisfies the input
-/// contract through hal's shared-handle impl; this newtype exists only
-/// to give the route an interrupt handler to dispatch to.
 #[derive(Clone)]
 pub(crate) struct VirtioInputDevice {
     inner: Arc<Aarch64VirtioInputDevice>,
@@ -49,20 +40,25 @@ impl ExternalInterruptHandler for VirtioInputDevice {
     }
 }
 
-pub(crate) fn count_input_devices(platform: &PlatformDescription) -> usize {
-    crate::count_virtio_mmio_devices(platform, helios_virtio::DeviceType::Input)
+pub(crate) fn count_input_devices(
+    platform: &PlatformDescription,
+    pci_virtio: Option<&VirtioFunctions>,
+) -> usize {
+    pci_virtio.map_or(0, |v| v.count(DeviceType::Input))
+        + crate::count_virtio_mmio_devices(platform, DeviceType::Input)
 }
 
-/// Brings up every input device on the platform bus, hands them all to
-/// the kernel, and publishes the service `helios:system/input` is served
-/// from.
-///
-/// One call for every device rather than one per device: the kernel owns
-/// the machine's input devices as a set, because that is what a program
-/// asking "what can I read?" is answered from.
+/// Brings up every input device on the PCI and platform buses, hands them
+/// all to the kernel, and publishes `helios:system/input`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
+    cpu: &crate::Aarch64Cpu,
     kernel: &helios_kernel::Kernel<crate::Aarch64Cpu, WatchdogImpl, MeasuredBootImpl>,
     platform: &PlatformDescription,
+    pci: Option<&PciRoot>,
+    pci_virtio: Option<&VirtioFunctions>,
+    arenas: &mut Aarch64DmaArenas,
+    confinement: Option<&mut Confinement>,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
     debug_state: &crate::debug_state::RuntimeState,
@@ -71,7 +67,16 @@ where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
     MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
-    let discovered = discover_input_devices(platform, physical_memory_offset, handoff);
+    let discovered = discover_input_devices(
+        cpu,
+        platform,
+        pci,
+        pci_virtio,
+        arenas,
+        confinement,
+        physical_memory_offset,
+        handoff,
+    );
     let service = helios_kernel::install_input_devices(
         kernel,
         discovered
@@ -82,18 +87,57 @@ where
     discovered
 }
 
+#[allow(clippy::too_many_arguments)]
 fn discover_input_devices(
+    cpu: &crate::Aarch64Cpu,
     platform: &PlatformDescription,
+    pci: Option<&PciRoot>,
+    pci_virtio: Option<&VirtioFunctions>,
+    arenas: &mut Aarch64DmaArenas,
+    mut confinement: Option<&mut Confinement>,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
 ) -> Vec<InputInterrupt> {
-    crate::virtio_slots(
-        platform,
-        physical_memory_offset,
-        handoff,
-        helios_virtio::DeviceType::Input,
-    )
-    .map(|candidate| {
+    let mut devices = Vec::new();
+    if let (Some(pci), Some(pci_virtio)) = (pci, pci_virtio) {
+        for function in pci_virtio.of_type(DeviceType::Input) {
+            pci.assign_unassigned_memory_bars(function.address);
+            let dma = iommu::dma_pool(
+                arenas,
+                confinement.as_deref_mut(),
+                Some(function.address),
+                physical_memory_offset,
+                iommu::SMALL_DMA_CHUNK_BYTES,
+                cpu.processor_count(),
+            );
+            let transport =
+                VirtioBusTransport::pci(&pci.access(), function.address, pci, dma, None)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "failed to initialize virtio-input PCI transport at {}: {error}",
+                            function.address
+                        )
+                    });
+            let device =
+                helios_virtio::input_from_bus_transport(transport).unwrap_or_else(|error| {
+                    panic!(
+                        "failed to initialize virtio-input PCI device at {}: {error}",
+                        function.address
+                    )
+                });
+            devices.push(InputInterrupt {
+                interrupt: function.interrupt,
+                trigger: function.trigger,
+                device: VirtioInputDevice {
+                    inner: Arc::new(device),
+                },
+            });
+        }
+    }
+
+    for candidate in
+        crate::virtio_slots(platform, physical_memory_offset, handoff, DeviceType::Input)
+    {
         let (interrupt, trigger) = (candidate.interrupt.intid(), candidate.interrupt.trigger);
         assert!(
             candidate.region.size != 0,
@@ -112,26 +156,39 @@ fn discover_input_devices(
         );
         let header = core::ptr::NonNull::new(virtual_base as *mut u8)
             .unwrap_or_else(|| panic!("virtio MMIO base {virtual_base:#x} was unexpectedly null"));
-        let dma = crate::dma_pool();
+        let dma = iommu::dma_pool(
+            arenas,
+            None,
+            None,
+            physical_memory_offset,
+            iommu::SMALL_DMA_CHUNK_BYTES,
+            cpu.processor_count(),
+        );
         // SAFETY: `map_mmio_range` mapped `header..header + candidate.region.size`
         // as Device-nGnRnE, the device is brought up on the bootstrap processor
         // before IRQs are unmasked with exclusive register access, and `dma`
         // translates using the kernel's direct-map offset.
-        let device =
-            unsafe { helios_virtio::input_from_mmio_with_dma(header, candidate.region.size, dma) }
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "failed to initialize virtio-input device at {:#x}: {error}",
-                        candidate.region.base
-                    )
-                });
-        InputInterrupt {
+        let transport = unsafe { VirtioBusTransport::mmio(header, candidate.region.size, dma) }
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to initialize virtio-input MMIO transport at {:#x}: {error}",
+                    candidate.region.base
+                )
+            });
+        let device = helios_virtio::input_from_bus_transport(transport).unwrap_or_else(|error| {
+            panic!(
+                "failed to initialize virtio-input device at {:#x}: {error}",
+                candidate.region.base
+            )
+        });
+        devices.push(InputInterrupt {
             interrupt,
             trigger,
             device: VirtioInputDevice {
                 inner: Arc::new(device),
             },
-        }
-    })
-    .collect()
+        });
+    }
+
+    devices
 }

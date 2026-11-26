@@ -1,0 +1,18 @@
+description = "Run guest btrfs write and readback smoke script"
+name = "btrfs-write"
+runner = "exec"
+program = "/bin/python3"
+args = ["/etc/btrfs-write.py", "write", "/btrfs"]
+after = ["/cat-btrfs-cjk"]
+startup = "eager"
+lifecycle = "oneshot"
+restart = "never"
+critical = "system"
+escalation = "halt"
+oom_tier = "user"
+
+[capabilities]
+directories = [
+  { source = "/", guest = "/", rights = ["read", "write", "mutate-directory", "execute"] },
+]
+link = ["source", "target-directory", "symlink-create", "symlink-read"]
