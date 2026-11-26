@@ -759,8 +759,8 @@ fn timespec(nanos: u64) -> [u8; 16] {
     bytes
 }
 
-fn write_result<M: UserMemory>(memory: &mut M, address: u64, bytes: &[u8]) -> u64 {
-    match memory.write(address, bytes) {
+async fn write_result<M: UserMemory>(memory: &mut M, address: u64, bytes: &[u8]) -> u64 {
+    match memory.write(address, bytes).await {
         Ok(()) => 0,
         Err(_) => errno(EFAULT),
     }
@@ -792,7 +792,7 @@ fn clock_source(id: u64) -> Option<ClockSource> {
     }
 }
 
-pub(super) fn clock_gettime<M: UserMemory, O: Clock + System>(
+pub(super) async fn clock_gettime<M: UserMemory, O: Clock + System>(
     args: [u64; 6],
     memory: &mut M,
     output: &O,
@@ -806,10 +806,10 @@ pub(super) fn clock_gettime<M: UserMemory, O: Clock + System>(
         Some(ClockSource::ProcessCpuTime) => output.process_cpu_nanos(),
         Some(ClockSource::ThreadCpuTime) => output.cpu_nanos(),
     };
-    write_result(memory, args[1], &timespec(nanos))
+    write_result(memory, args[1], &timespec(nanos)).await
 }
 
-pub(super) fn clock_getres<M: UserMemory>(args: [u64; 6], memory: &mut M) -> u64 {
+pub(super) async fn clock_getres<M: UserMemory>(args: [u64; 6], memory: &mut M) -> u64 {
     if clock_source(args[0]).is_none() {
         return errno(EINVAL);
     }
@@ -821,10 +821,10 @@ pub(super) fn clock_getres<M: UserMemory>(args: [u64; 6], memory: &mut M) -> u64
     // answers hrtimer_resolution, which Linux reports as 1 ns with
     // high-resolution timers; the coarse clocks are read as finely as the
     // others.
-    write_result(memory, args[1], &timespec(1))
+    write_result(memory, args[1], &timespec(1)).await
 }
 
-pub(super) fn clock_settime<M: UserMemory, O: System>(
+pub(super) async fn clock_settime<M: UserMemory, O: System>(
     args: [u64; 6],
     has_cap_sys_time: bool,
     memory: &mut M,
@@ -836,7 +836,7 @@ pub(super) fn clock_settime<M: UserMemory, O: System>(
         return errno(EINVAL);
     }
     let mut bytes = [0; 16];
-    if memory.read(args[1], &mut bytes).is_err() {
+    if memory.read(args[1], &mut bytes).await.is_err() {
         return errno(EFAULT);
     }
     let seconds = i64::from_le_bytes(bytes[..8].try_into().unwrap());
@@ -862,7 +862,7 @@ pub(super) fn clock_settime<M: UserMemory, O: System>(
     }
 }
 
-pub(super) fn gettimeofday<M: UserMemory, O: System>(
+pub(super) async fn gettimeofday<M: UserMemory, O: System>(
     args: [u64; 6],
     memory: &mut M,
     output: &O,
@@ -872,21 +872,25 @@ pub(super) fn gettimeofday<M: UserMemory, O: System>(
         let mut bytes = [0; 16];
         bytes[..8].copy_from_slice(&(nanos / NANOS_PER_SECOND).to_le_bytes());
         bytes[8..].copy_from_slice(&(nanos % NANOS_PER_SECOND / 1000).to_le_bytes());
-        if memory.write(args[0], &bytes).is_err() {
+        if memory.write(args[0], &bytes).await.is_err() {
             return errno(EFAULT);
         }
     }
     if args[1] != 0 {
         // `sys_tz`: zero minutes west and no daylight-saving correction
         // until something sets the zone, which no call here does.
-        return write_result(memory, args[1], &[0; 8]);
+        return write_result(memory, args[1], &[0; 8]).await;
     }
     0
 }
 
-pub(super) fn time<M: UserMemory, O: System>(args: [u64; 6], memory: &mut M, output: &O) -> u64 {
+pub(super) async fn time<M: UserMemory, O: System>(
+    args: [u64; 6],
+    memory: &mut M,
+    output: &O,
+) -> u64 {
     let seconds = output.realtime_nanos() / NANOS_PER_SECOND;
-    if args[0] != 0 && memory.write(args[0], &seconds.to_le_bytes()).is_err() {
+    if args[0] != 0 && memory.write(args[0], &seconds.to_le_bytes()).await.is_err() {
         return errno(EFAULT);
     }
     seconds
@@ -939,7 +943,7 @@ pub(super) async fn getrandom<M: UserMemory, O: System>(
         let page_remaining = buffer.len() - (address as usize & (buffer.len() - 1));
         let size = (count - written).min(page_remaining as u64) as usize;
         output.fill_random(&mut buffer[..size]);
-        if memory.write(address, &buffer[..size]).is_err() {
+        if memory.write(address, &buffer[..size]).await.is_err() {
             // The bytes already copied stand; EFAULT only when none were.
             return if written == 0 { errno(EFAULT) } else { written };
         }
@@ -953,7 +957,7 @@ pub(super) async fn getrandom<M: UserMemory, O: System>(
     written
 }
 
-pub(super) fn uname<M: UserMemory, O: System>(
+pub(super) async fn uname<M: UserMemory, O: System>(
     abi: Abi,
     args: [u64; 6],
     memory: &mut M,
@@ -984,11 +988,11 @@ pub(super) fn uname<M: UserMemory, O: System>(
         let length = value.len().min(FIELD - 1);
         slot[..length].copy_from_slice(&value[..length]);
     }
-    write_result(memory, args[0], &bytes)
+    write_result(memory, args[0], &bytes).await
 }
 
 /// `sethostname` and `setdomainname` (`kernel/sys.c`).
-pub(super) fn set_uts_name<M: UserMemory, O: System>(
+pub(super) async fn set_uts_name<M: UserMemory, O: System>(
     operation: Operation,
     has_cap_sys_admin: bool,
     args: [u64; 6],
@@ -1004,7 +1008,7 @@ pub(super) fn set_uts_name<M: UserMemory, O: System>(
     }
     let mut buf = [0u8; UTS_FIELD_MAX];
     let len = len as usize;
-    if len > 0 && memory.read(args[0], &mut buf[..len]).is_err() {
+    if len > 0 && memory.read(args[0], &mut buf[..len]).await.is_err() {
         return errno(EFAULT);
     }
     let field = UtsField::from_bytes(&buf[..len]).expect("len <= UTS_FIELD_MAX");
@@ -1019,7 +1023,7 @@ pub(super) fn set_uts_name<M: UserMemory, O: System>(
     }
 }
 
-pub(super) fn sysinfo<M: UserMemory, O: Clock + System>(
+pub(super) async fn sysinfo<M: UserMemory, O: Clock + System>(
     args: [u64; 6],
     memory: &mut M,
     output: &O,
@@ -1044,7 +1048,7 @@ pub(super) fn sysinfo<M: UserMemory, O: Clock + System>(
             .to_le_bytes(),
     );
     bytes[104..108].copy_from_slice(&1_u32.to_le_bytes());
-    write_result(memory, args[0], &bytes)
+    write_result(memory, args[0], &bytes).await
 }
 
 impl Credentials {
@@ -1060,7 +1064,7 @@ impl Credentials {
 
     /// kernel/sys.c `getresuid` and `getresgid`: three `put_user`s that
     /// stop at the first fault.
-    pub(super) fn resolve<M: UserMemory>(
+    pub(super) async fn resolve<M: UserMemory>(
         &self,
         operation: Operation,
         args: [u64; 6],
@@ -1071,7 +1075,7 @@ impl Credentials {
             _ => self.group,
         };
         for (address, value) in args[..3].iter().zip([ids.real, ids.effective, ids.saved]) {
-            if memory.write(*address, &value.to_le_bytes()).is_err() {
+            if memory.write(*address, &value.to_le_bytes()).await.is_err() {
                 return errno(EFAULT);
             }
         }
@@ -1079,7 +1083,7 @@ impl Credentials {
     }
 
     /// kernel/groups.c `getgroups`.
-    pub(super) fn getgroups<M: UserMemory>(&self, args: [u64; 6], memory: &mut M) -> u64 {
+    pub(super) async fn getgroups<M: UserMemory>(&self, args: [u64; 6], memory: &mut M) -> u64 {
         let size = args[0] as u32 as i32;
         if size < 0 {
             return errno(EINVAL);
@@ -1094,7 +1098,7 @@ impl Credentials {
                 .iter()
                 .flat_map(|group| group.to_le_bytes())
                 .collect();
-            if !bytes.is_empty() && memory.write(args[1], &bytes).is_err() {
+            if !bytes.is_empty() && memory.write(args[1], &bytes).await.is_err() {
                 return errno(EFAULT);
             }
         }
@@ -1244,36 +1248,44 @@ impl Credentials {
         };
         0
     }
+}
 
-    /// `kernel/groups.c` `setgroups`.
-    pub(super) fn setgroups<M: UserMemory>(&mut self, args: [u64; 6], memory: &M) -> u64 {
-        if !self.capabilities.has_effective(CAP_SETGID) {
-            return errno(EPERM);
-        }
-        let size = args[0] as u32 as i32;
-        if size < 0 || size as usize > NGROUPS_MAX {
+/// `kernel/groups.c` `setgroups`.
+pub(super) async fn setgroups<M: UserMemory>(
+    credentials: &spin::Mutex<Credentials>,
+    args: [u64; 6],
+    memory: &M,
+) -> u64 {
+    if !credentials.lock().capabilities.has_effective(CAP_SETGID) {
+        return errno(EPERM);
+    }
+    let size = args[0] as u32 as i32;
+    if size < 0 || size as usize > NGROUPS_MAX {
+        return errno(EINVAL);
+    }
+    let count = size as usize;
+    if count == 0 {
+        credentials.lock().supplementary_groups.clear();
+        return 0;
+    }
+    let mut raw = alloc::vec![0u8; count * 4];
+    if memory.read(args[1], &mut raw).await.is_err() {
+        return errno(EFAULT);
+    }
+    let mut groups = Vec::with_capacity(count);
+    for &chunk in raw.as_chunks::<4>().0 {
+        let gid = u32::from_le_bytes(chunk);
+        if gid == u32::MAX {
             return errno(EINVAL);
         }
-        let count = size as usize;
-        if count == 0 {
-            self.supplementary_groups.clear();
-            return 0;
-        }
-        let mut raw = alloc::vec![0u8; count * 4];
-        if memory.read(args[1], &mut raw).is_err() {
-            return errno(EFAULT);
-        }
-        let mut groups = Vec::with_capacity(count);
-        for &chunk in raw.as_chunks::<4>().0 {
-            let gid = u32::from_le_bytes(chunk);
-            if gid == u32::MAX {
-                return errno(EINVAL);
-            }
-            groups.push(gid);
-        }
-        self.supplementary_groups = groups;
-        0
+        groups.push(gid);
     }
+    let mut creds = credentials.lock();
+    if !creds.capabilities.has_effective(CAP_SETGID) {
+        return errno(EPERM);
+    }
+    creds.supplementary_groups = groups;
+    0
 }
 
 // `include/uapi/linux/capability.h` (Linux v6.12).
@@ -1281,9 +1293,12 @@ const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
 const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 
-fn cap_validate_magic<M: UserMemory>(hdr_addr: u64, memory: &mut M) -> Result<(usize, i32), u64> {
+async fn cap_validate_magic<M: UserMemory>(
+    hdr_addr: u64,
+    memory: &mut M,
+) -> Result<(usize, i32), u64> {
     let mut raw = [0u8; 8];
-    if memory.read(hdr_addr, &mut raw).is_err() {
+    if memory.read(hdr_addr, &mut raw).await.is_err() {
         return Err(errno(EFAULT));
     }
     let version = u32::from_le_bytes(raw[0..4].try_into().unwrap());
@@ -1294,6 +1309,7 @@ fn cap_validate_magic<M: UserMemory>(hdr_addr: u64, memory: &mut M) -> Result<(u
         _ => {
             if memory
                 .write(hdr_addr, &LINUX_CAPABILITY_VERSION_3.to_le_bytes())
+                .await
                 .is_err()
             {
                 return Err(errno(EFAULT));
@@ -1306,10 +1322,10 @@ fn cap_validate_magic<M: UserMemory>(hdr_addr: u64, memory: &mut M) -> Result<(u
 
 impl<R: Resources> Process<R> {
     /// `kernel/capability.c` `sys_capget` (Linux v6.12).
-    pub(super) fn capget<M: UserMemory>(&self, args: [u64; 6], memory: &mut M) -> u64 {
+    pub(super) async fn capget<M: UserMemory>(&self, args: [u64; 6], memory: &mut M) -> u64 {
         let hdr_addr = args[0];
         let data_addr = args[1];
-        let (tocopy, pid) = match cap_validate_magic(hdr_addr, memory) {
+        let (tocopy, pid) = match cap_validate_magic(hdr_addr, memory).await {
             Ok(pair) => pair,
             Err(err) => {
                 // `sys_capget`: probing version with `dataptr == NULL` succeeds
@@ -1349,15 +1365,15 @@ impl<R: Resources> Process<R> {
             buf[base + 4..base + 8].copy_from_slice(&triple[1].to_le_bytes());
             buf[base + 8..base + 12].copy_from_slice(&triple[2].to_le_bytes());
         }
-        write_result(memory, data_addr, &buf[..tocopy * 12])
+        write_result(memory, data_addr, &buf[..tocopy * 12]).await
     }
 
     /// `kernel/capability.c` `sys_capset` + `security/commoncap.c` `cap_capset`
     /// (Linux v6.12).
-    pub(super) fn capset<M: UserMemory>(&mut self, args: [u64; 6], memory: &mut M) -> u64 {
+    pub(super) async fn capset<M: UserMemory>(&mut self, args: [u64; 6], memory: &mut M) -> u64 {
         let hdr_addr = args[0];
         let data_addr = args[1];
-        let (tocopy, pid) = match cap_validate_magic(hdr_addr, memory) {
+        let (tocopy, pid) = match cap_validate_magic(hdr_addr, memory).await {
             Ok(pair) => pair,
             Err(err) => return err,
         };
@@ -1368,7 +1384,11 @@ impl<R: Resources> Process<R> {
             return errno(EFAULT);
         }
         let mut buf = [0u8; 24];
-        if memory.read(data_addr, &mut buf[..tocopy * 12]).is_err() {
+        if memory
+            .read(data_addr, &mut buf[..tocopy * 12])
+            .await
+            .is_err()
+        {
             return errno(EFAULT);
         }
         let read_u32 = |off: usize| u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
@@ -1415,20 +1435,12 @@ impl<R: Resources> Process<R> {
 
 impl<R: Resources> Process<R> {
     /// kernel/sys.c `prlimit64`, `getrlimit` and `setrlimit`.
-    pub(super) fn rlimit<M: UserMemory>(
+    pub(super) async fn rlimit<M: UserMemory>(
         &mut self,
         operation: Operation,
         args: [u64; 6],
         memory: &mut M,
     ) -> u64 {
-        let read = |memory: &M, address: u64| -> Result<Rlimit, ()> {
-            let mut bytes = [0; 16];
-            memory.read(address, &mut bytes).map_err(|_| ())?;
-            Ok(Rlimit {
-                current: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-                maximum: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
-            })
-        };
         let (resource, new_pointer, old_pointer) = match operation {
             // prlimit64(pid, resource, new_rlim, old_rlim).
             Operation::Prlimit64 => (args[1] as u32, args[2], args[3]),
@@ -1438,10 +1450,14 @@ impl<R: Resources> Process<R> {
         let new = if new_pointer == 0 {
             None
         } else {
-            match read(memory, new_pointer) {
-                Ok(limit) => Some(limit),
-                Err(()) => return errno(EFAULT),
+            let mut bytes = [0; 16];
+            if memory.read(new_pointer, &mut bytes).await.is_err() {
+                return errno(EFAULT);
             }
+            Some(Rlimit {
+                current: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                maximum: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+            })
         };
         if operation == Operation::Prlimit64 && !self.names_self(args[0] as u32 as i32) {
             return errno(ESRCH);
@@ -1457,7 +1473,7 @@ impl<R: Resources> Process<R> {
         bytes[..8].copy_from_slice(&old.current.to_le_bytes());
         bytes[8..].copy_from_slice(&old.maximum.to_le_bytes());
         // The new limit stands when this write fails, as it does on Linux.
-        write_result(memory, old_pointer, &bytes)
+        write_result(memory, old_pointer, &bytes).await
     }
 
     /// kernel/sys.c `umask`: the previous mask, bits above the permission
@@ -1518,7 +1534,7 @@ impl<R: Resources> Process<R> {
 
     /// `prctl(option, arg2, arg3, arg4, arg5)` (`kernel/sys.c` `sys_prctl`,
     /// Linux v6.12).
-    pub(super) fn prctl<M: UserMemory>(&mut self, args: [u64; 6], memory: &mut M) -> u64 {
+    pub(super) async fn prctl<M: UserMemory>(&mut self, args: [u64; 6], memory: &mut M) -> u64 {
         // `include/uapi/linux/prctl.h`, Linux v6.12.
         const PR_SET_PDEATHSIG: i32 = 1;
         const PR_GET_PDEATHSIG: i32 = 2;
@@ -1561,7 +1577,7 @@ impl<R: Resources> Process<R> {
                     .pids
                     .get_pdeathsig(self.pid())
                     .map_or(0, |s| i32::from(s.raw()));
-                write_result(memory, args[1], &val.to_le_bytes())
+                write_result(memory, args[1], &val.to_le_bytes()).await
             }
             PR_GET_DUMPABLE => u64::from(self.shared.attributes.lock().dumpable),
             PR_SET_DUMPABLE => {
@@ -1585,6 +1601,7 @@ impl<R: Resources> Process<R> {
                     let mut byte = [0u8; 1];
                     if memory
                         .read(args[1].wrapping_add(i as u64), &mut byte)
+                        .await
                         .is_err()
                     {
                         return errno(EFAULT);
@@ -1599,7 +1616,7 @@ impl<R: Resources> Process<R> {
             }
             PR_GET_NAME => {
                 let comm = self.sched.lock().comm;
-                write_result(memory, args[1], &comm)
+                write_result(memory, args[1], &comm).await
             }
             PR_CAPBSET_READ => {
                 let cap = args[1];
@@ -1629,7 +1646,7 @@ impl<R: Resources> Process<R> {
             }
             PR_GET_CHILD_SUBREAPER => {
                 let val: i32 = i32::from(self.shared.pids.get_child_subreaper(self.pid()));
-                write_result(memory, args[1], &val.to_le_bytes())
+                write_result(memory, args[1], &val.to_le_bytes()).await
             }
             PR_SET_NO_NEW_PRIVS => {
                 if args[1] != 1 || args[2] != 0 || args[3] != 0 || args[4] != 0 {
@@ -1708,7 +1725,7 @@ impl<R: Resources> Process<R> {
 }
 
 /// `times(buf)` (`kernel/sys.c`, `USER_HZ = 100`).
-pub(super) fn times<R: Resources, M: UserMemory, O: Clock + System>(
+pub(super) async fn times<R: Resources, M: UserMemory, O: Clock + System>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -1728,7 +1745,7 @@ pub(super) fn times<R: Resources, M: UserMemory, O: Clock + System>(
         out[8..16].copy_from_slice(&stime.to_le_bytes());
         out[16..24].copy_from_slice(&cutime.to_le_bytes());
         out[24..32].copy_from_slice(&cstime.to_le_bytes());
-        if memory.write(buf, &out).is_err() {
+        if memory.write(buf, &out).await.is_err() {
             return errno(EFAULT);
         }
     }
@@ -1736,7 +1753,7 @@ pub(super) fn times<R: Resources, M: UserMemory, O: Clock + System>(
 }
 
 /// `getrusage(who, usage)` (`kernel/sys.c`, `include/uapi/linux/resource.h`).
-pub(super) fn getrusage<R: Resources, M: UserMemory, O: System>(
+pub(super) async fn getrusage<R: Resources, M: UserMemory, O: System>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -1760,11 +1777,11 @@ pub(super) fn getrusage<R: Resources, M: UserMemory, O: System>(
         },
         _ => return errno(EINVAL),
     };
-    write_result(memory, args[1], &usage.encode_rusage())
+    write_result(memory, args[1], &usage.encode_rusage()).await
 }
 
 /// `syslog(type, bufp, len)` (`kernel/printk/printk.c` `do_syslog`).
-pub(super) fn syslog<R: Resources, M: UserMemory, O: System>(
+pub(super) async fn syslog<R: Resources, M: UserMemory, O: System>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -1826,7 +1843,7 @@ pub(super) fn syslog<R: Resources, M: UserMemory, O: System>(
                 return errno(EINVAL);
             }
             let max_bytes = len as usize;
-            if memory.check_writable(buf_ptr, max_bytes).is_err() {
+            if memory.check_writable(buf_ptr, max_bytes).await.is_err() {
                 return errno(EFAULT);
             }
             let all = matches!(action, SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR);
@@ -1834,7 +1851,7 @@ pub(super) fn syslog<R: Resources, M: UserMemory, O: System>(
             match output.syslog_read(all, clear, max_bytes) {
                 Ok(data) => {
                     let count = data.len().min(max_bytes);
-                    if count > 0 && memory.write(buf_ptr, &data[..count]).is_err() {
+                    if count > 0 && memory.write(buf_ptr, &data[..count]).await.is_err() {
                         return errno(EFAULT);
                     }
                     count as u64

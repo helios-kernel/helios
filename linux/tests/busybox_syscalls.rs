@@ -174,9 +174,6 @@ impl Mem {
         let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
         String::from_utf8(raw[..end].to_vec()).unwrap()
     }
-}
-
-impl UserMemory for Mem {
     fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
         let off = address.checked_sub(self.base).ok_or(MemoryFault)? as usize;
         let end = off.checked_add(length).ok_or(MemoryFault)?;
@@ -208,26 +205,44 @@ impl UserMemory for Mem {
         guard[off..end].copy_from_slice(bytes);
         Ok(())
     }
+}
 
-    fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+impl UserMemory for Mem {
+    async fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
+        Self::check_writable(self, address, length)
+    }
+
+    async fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+        Self::read(self, address, output)
+    }
+
+    async fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
+        Self::write(self, address, bytes)
+    }
+
+    async fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+        self.try_atomic_load_u32(address)?.ok_or(MemoryFault)
+    }
+
+    fn try_atomic_load_u32(&self, address: u64) -> Result<Option<u32>, MemoryFault> {
         let mut raw = [0u8; 4];
-        self.read(address, &mut raw)?;
-        Ok(u32::from_le_bytes(raw))
+        Self::read(self, address, &mut raw)?;
+        Ok(Some(u32::from_le_bytes(raw)))
     }
 
-    fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
-        self.write(address, &value.to_le_bytes())
+    async fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+        Self::write(self, address, &value.to_le_bytes())
     }
 
-    fn atomic_compare_exchange_u32(
+    async fn atomic_compare_exchange_u32(
         &mut self,
         address: u64,
         expected: u32,
         desired: u32,
     ) -> Result<Result<u32, u32>, MemoryFault> {
-        let cur = self.atomic_load_u32(address)?;
+        let cur = self.atomic_load_u32(address).await?;
         if cur == expected {
-            self.atomic_store_u32(address, desired)?;
+            self.atomic_store_u32(address, desired).await?;
             Ok(Ok(cur))
         } else {
             Ok(Err(cur))
@@ -976,7 +991,7 @@ impl Thread<TestRes> for TestThread {
         self.spawned_threads.push(child);
         Ok(())
     }
-    fn spawn_process(&mut self, child: SpawnedProcess<TestRes>) -> Result<(), SpawnError> {
+    async fn spawn_process(&mut self, child: SpawnedProcess<TestRes>) -> Result<(), SpawnError> {
         self.spawned_processes.push(child);
         Ok(())
     }

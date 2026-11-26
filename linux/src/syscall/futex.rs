@@ -45,7 +45,7 @@ const ETIMEDOUT: u64 = 110;
 /// Private keys need no page-table walk unless the operation itself reads
 /// `*uaddr`; shared keys validate that `uaddr` is mapped readable, as
 /// `get_user_pages_fast` does on Linux.
-fn futex_key<M: UserMemory>(
+async fn futex_key<M: UserMemory>(
     abi: Abi,
     memory_id: ProcessMemoryIdentity,
     uaddr: u64,
@@ -61,7 +61,7 @@ fn futex_key<M: UserMemory>(
     let scope = if private {
         FutexScope::Private
     } else {
-        memory.atomic_load_u32(uaddr).map_err(|_| EFAULT)?;
+        memory.atomic_load_u32(uaddr).await.map_err(|_| EFAULT)?;
         FutexScope::Shared
     };
     Ok(FutexKey::with_scope(
@@ -71,9 +71,9 @@ fn futex_key<M: UserMemory>(
     ))
 }
 
-fn read_timespec<M: UserMemory>(address: u64, memory: &M) -> Result<(u64, u64), u64> {
+async fn read_timespec<M: UserMemory>(address: u64, memory: &M) -> Result<(u64, u64), u64> {
     let mut bytes = [0u8; 16];
-    memory.read(address, &mut bytes).map_err(|_| EFAULT)?;
+    memory.read(address, &mut bytes).await.map_err(|_| EFAULT)?;
     let sec = i64::from_le_bytes(bytes[..8].try_into().unwrap());
     let nsec = i64::from_le_bytes(bytes[8..].try_into().unwrap());
     if sec < 0 || !(0..NANOS_PER_SECOND as i64).contains(&nsec) {
@@ -104,7 +104,7 @@ pub(super) async fn futex<R: Resources, M: UserMemory, O: Clock + System>(
     match cmd {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             let timeout = if args[3] != 0 {
-                match read_timespec(args[3], memory) {
+                match read_timespec(args[3], memory).await {
                     Ok((sec, nsec)) => {
                         Some(sec.saturating_mul(NANOS_PER_SECOND).saturating_add(nsec))
                     }
@@ -121,14 +121,14 @@ pub(super) async fn futex<R: Resources, M: UserMemory, O: Clock + System>(
             if bitset == 0 {
                 return SyscallOutcome::Return(errno(EINVAL));
             }
-            let key = match futex_key(abi, memory_id, args[0], private, memory) {
+            let key = match futex_key(abi, memory_id, args[0], private, memory).await {
                 Ok(key) => key,
                 Err(err) => return SyscallOutcome::Return(errno(err)),
             };
             // Arm the wait before loading `*uaddr`, so no wake between the
             // load and parking can be missed.
             let mut registration = table.prepare_wait_bitset(key, bitset);
-            let Ok(current) = memory.atomic_load_u32(args[0]) else {
+            let Ok(current) = memory.atomic_load_u32(args[0]).await else {
                 return SyscallOutcome::Return(errno(EFAULT));
             };
             if current != args[2] as u32 {
@@ -213,7 +213,7 @@ pub(super) async fn futex<R: Resources, M: UserMemory, O: Clock + System>(
             if bitset == 0 {
                 return SyscallOutcome::Return(errno(EINVAL));
             }
-            let key = match futex_key(abi, memory_id, args[0], private, memory) {
+            let key = match futex_key(abi, memory_id, args[0], private, memory).await {
                 Ok(key) => key,
                 Err(err) => return SyscallOutcome::Return(errno(err)),
             };
@@ -229,31 +229,49 @@ pub(super) async fn futex<R: Resources, M: UserMemory, O: Clock + System>(
             if nr_wake < 0 || nr_requeue < 0 {
                 return SyscallOutcome::Return(errno(EINVAL));
             }
-            let source = match futex_key(abi, memory_id, args[0], private, memory) {
+            let source = match futex_key(abi, memory_id, args[0], private, memory).await {
                 Ok(key) => key,
                 Err(err) => return SyscallOutcome::Return(errno(err)),
             };
-            let target = match futex_key(abi, memory_id, args[4], private, memory) {
+            let target = match futex_key(abi, memory_id, args[4], private, memory).await {
                 Ok(key) => key,
                 Err(err) => return SyscallOutcome::Return(errno(err)),
             };
             let expected = (cmd == FUTEX_CMP_REQUEUE).then_some(args[5] as u32);
-            let outcome = table.requeue_if(
-                source,
-                target,
-                nr_wake as usize,
-                nr_requeue as usize,
-                || match expected {
-                    None => Ok(()),
-                    Some(val3) => {
-                        let current = memory.atomic_load_u32(args[0]).map_err(|_| EFAULT)?;
-                        if current != val3 {
-                            return Err(EAGAIN);
-                        }
-                        Ok(())
+            enum RequeueCheck {
+                Err(u64),
+                RetrySwap,
+            }
+            let outcome = loop {
+                if let Some(val3) = expected {
+                    let pre = match memory.atomic_load_u32(args[0]).await {
+                        Ok(value) => value,
+                        Err(_) => return SyscallOutcome::Return(errno(EFAULT)),
+                    };
+                    if pre != val3 {
+                        return SyscallOutcome::Return(errno(EAGAIN));
                     }
-                },
-            );
+                }
+                match table.requeue_if(
+                    source,
+                    target,
+                    nr_wake as usize,
+                    nr_requeue as usize,
+                    || match expected {
+                        None => Ok(()),
+                        Some(val3) => match memory.try_atomic_load_u32(args[0]) {
+                            Ok(Some(current)) if current == val3 => Ok(()),
+                            Ok(Some(_)) => Err(RequeueCheck::Err(EAGAIN)),
+                            Ok(None) => Err(RequeueCheck::RetrySwap),
+                            Err(_) => Err(RequeueCheck::Err(EFAULT)),
+                        },
+                    },
+                ) {
+                    Ok(outcome) => break Ok(outcome),
+                    Err(RequeueCheck::Err(err)) => break Err(err),
+                    Err(RequeueCheck::RetrySwap) => continue,
+                }
+            };
             // Both `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE` delegate to
             // `futex_requeue` (`kernel/futex/requeue.c`), which returns
             // `task_count` (woken + requeued).
@@ -278,7 +296,7 @@ pub(super) fn set_robust_list<R: Resources>(process: &Process<R>, args: [u64; 6]
 }
 
 /// `get_robust_list(pid, head_ptr, len_ptr)` (`kernel/futex/syscalls.c`).
-pub(super) fn get_robust_list<R: Resources, M: UserMemory>(
+pub(super) async fn get_robust_list<R: Resources, M: UserMemory>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -299,11 +317,12 @@ pub(super) fn get_robust_list<R: Resources, M: UserMemory>(
     };
     if memory
         .write(args[2], &ROBUST_LIST_HEAD_BYTES.to_le_bytes())
+        .await
         .is_err()
     {
         return errno(EFAULT);
     }
-    if memory.write(args[1], &head.to_le_bytes()).is_err() {
+    if memory.write(args[1], &head.to_le_bytes()).await.is_err() {
         return errno(EFAULT);
     }
     0
@@ -311,7 +330,7 @@ pub(super) fn get_robust_list<R: Resources, M: UserMemory>(
 
 /// Cleans up a dying thread's robust futex list and clears/wakes its
 /// `clear_child_tid` (`kernel/exit.c` `do_exit` -> `mm_release`).
-pub(super) fn exit_thread<R: Resources, M: UserMemory>(process: &Process<R>, memory: &mut M) {
+pub(super) async fn exit_thread<R: Resources, M: UserMemory>(process: &Process<R>, memory: &mut M) {
     let head = process
         .robust_list
         .swap(0, core::sync::atomic::Ordering::AcqRel);
@@ -322,25 +341,26 @@ pub(super) fn exit_thread<R: Resources, M: UserMemory>(process: &Process<R>, mem
             process.shared.memory_id,
             &process.shared.futex,
             memory,
-        );
+        )
+        .await;
     }
     if process.clear_child_tid != 0 {
         let address = process.clear_child_tid;
         if address & 3 == 0 {
-            let _ = memory.atomic_store_u32(address, 0);
+            let _ = memory.atomic_store_u32(address, 0).await;
             process.shared.futex.wake(
                 FutexKey::shared(process.shared.memory_id, GuestAddress::new(address)),
                 1,
             );
         } else {
-            let _ = memory.write(address, &0u32.to_le_bytes());
+            let _ = memory.write(address, &0u32.to_le_bytes()).await;
         }
     }
 }
 
 /// Walks a dying thread's `struct robust_list_head` (`kernel/futex/core.c`
 /// `exit_robust_list`).
-fn exit_robust_list<M: UserMemory>(
+async fn exit_robust_list<M: UserMemory>(
     head: u64,
     tid: u32,
     memory_id: ProcessMemoryIdentity,
@@ -348,7 +368,7 @@ fn exit_robust_list<M: UserMemory>(
     memory: &mut M,
 ) {
     let mut header = [0u8; 24];
-    if memory.read(head, &mut header).is_err() {
+    if memory.read(head, &mut header).await.is_err() {
         return;
     }
     let mut entry = u64::from_le_bytes(header[..8].try_into().unwrap());
@@ -360,7 +380,7 @@ fn exit_robust_list<M: UserMemory>(
         let current = entry & !FUTEX_ROBUST_MOD_MASK;
         let mut next_bytes = [0u8; 8];
         // Read `next` before waking a waiter that may reuse or unmap the lock.
-        if memory.read(current, &mut next_bytes).is_err() {
+        if memory.read(current, &mut next_bytes).await.is_err() {
             return;
         }
         let next_entry = u64::from_le_bytes(next_bytes);
@@ -373,6 +393,7 @@ fn exit_robust_list<M: UserMemory>(
                 table,
                 memory,
             )
+            .await
             .is_err()
         {
             return;
@@ -385,14 +406,14 @@ fn exit_robust_list<M: UserMemory>(
     }
     if pending != 0 {
         let pending_addr = (pending & !FUTEX_ROBUST_MOD_MASK).wrapping_add(futex_offset as u64);
-        let _ = handle_futex_death(pending_addr, tid, true, memory_id, table, memory);
+        let _ = handle_futex_death(pending_addr, tid, true, memory_id, table, memory).await;
     }
 }
 
 /// Marks a robust futex `FUTEX_OWNER_DIED` when owned by `tid` and wakes one
 /// shared waiter if `FUTEX_WAITERS` was set (`kernel/futex/core.c`
 /// `handle_futex_death`).
-fn handle_futex_death<M: UserMemory>(
+async fn handle_futex_death<M: UserMemory>(
     uaddr: u64,
     tid: u32,
     pending_op: bool,
@@ -404,7 +425,7 @@ fn handle_futex_death<M: UserMemory>(
         return Err(());
     }
     loop {
-        let uval = memory.atomic_load_u32(uaddr).map_err(|_| ())?;
+        let uval = memory.atomic_load_u32(uaddr).await.map_err(|_| ())?;
         let owner = uval & FUTEX_TID_MASK;
         if pending_op && owner == 0 {
             return Ok(());
@@ -415,6 +436,7 @@ fn handle_futex_death<M: UserMemory>(
         let nval = (uval & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
         match memory
             .atomic_compare_exchange_u32(uaddr, uval, nval)
+            .await
             .map_err(|_| ())?
         {
             Ok(_) => {

@@ -378,7 +378,7 @@ pub(super) async fn wait_once<O: Stdio + Clock>(
     .await
 }
 
-fn read_timespec_timeout<M: UserMemory, C: Clock>(
+async fn read_timespec_timeout<M: UserMemory, C: Clock>(
     memory: &M,
     ptr: u64,
     clock: &C,
@@ -387,7 +387,7 @@ fn read_timespec_timeout<M: UserMemory, C: Clock>(
         return Ok(None);
     }
     let mut raw = [0u8; 16];
-    if memory.read(ptr, &mut raw).is_err() {
+    if memory.read(ptr, &mut raw).await.is_err() {
         return Err(errno(EFAULT));
     }
     let sec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
@@ -401,7 +401,7 @@ fn read_timespec_timeout<M: UserMemory, C: Clock>(
     Ok(Some(clock.now_nanos().saturating_add(delta)))
 }
 
-fn read_sigmask<M: UserMemory>(
+async fn read_sigmask<M: UserMemory>(
     memory: &M,
     ptr: u64,
     sigsetsize: u64,
@@ -413,7 +413,7 @@ fn read_sigmask<M: UserMemory>(
         return Err(errno(EINVAL));
     }
     let mut mask = [0u8; 8];
-    if memory.read(ptr, &mut mask).is_err() {
+    if memory.read(ptr, &mut mask).await.is_err() {
         return Err(errno(EFAULT));
     }
     Ok(Some(SignalSet::from_bits(u64::from_le_bytes(mask))))
@@ -447,11 +447,11 @@ pub(super) async fn ppoll<
     memory: &mut M,
     io: &O,
 ) -> SyscallOutcome {
-    let temp_mask = match read_sigmask(memory, args[3], args[4]) {
+    let temp_mask = match read_sigmask(memory, args[3], args[4]).await {
         Ok(m) => m,
         Err(err) => return SyscallOutcome::Return(err),
     };
-    let deadline = match read_timespec_timeout(memory, args[2], io) {
+    let deadline = match read_timespec_timeout(memory, args[2], io).await {
         Ok(d) => d,
         Err(err) => return SyscallOutcome::Return(err),
     };
@@ -483,7 +483,7 @@ async fn poll_common<
             Some(a) => a,
             None => return SyscallOutcome::Return(errno(EFAULT)),
         };
-        if memory.read(addr, &mut raw).is_err() {
+        if memory.read(addr, &mut raw).await.is_err() {
             return SyscallOutcome::Return(errno(EFAULT));
         }
         let fd = i32::from_le_bytes(raw[0..4].try_into().unwrap());
@@ -569,7 +569,7 @@ async fn poll_common<
             }
             for (idx, &rev) in revents.iter().enumerate() {
                 let addr = fds_ptr + (idx as u64) * 8 + 6;
-                if memory.write(addr, &rev.to_le_bytes()).is_err() {
+                if memory.write(addr, &rev.to_le_bytes()).await.is_err() {
                     return SyscallOutcome::Return(errno(EFAULT));
                 }
             }
@@ -589,12 +589,12 @@ async fn poll_common<
     }
 }
 
-fn read_fd_set<M: UserMemory>(memory: &M, ptr: u64, byte_len: usize) -> Result<Vec<u8>, u64> {
+async fn read_fd_set<M: UserMemory>(memory: &M, ptr: u64, byte_len: usize) -> Result<Vec<u8>, u64> {
     if ptr == 0 || byte_len == 0 {
         return Ok(Vec::new());
     }
     let mut buf = alloc::vec![0u8; byte_len];
-    if memory.read(ptr, &mut buf).is_err() {
+    if memory.read(ptr, &mut buf).await.is_err() {
         return Err(errno(EFAULT));
     }
     Ok(buf)
@@ -627,7 +627,7 @@ pub(super) async fn select<
         None
     } else {
         let mut raw = [0u8; 16];
-        if memory.read(timeout_ptr, &mut raw).is_err() {
+        if memory.read(timeout_ptr, &mut raw).await.is_err() {
             return SyscallOutcome::Return(errno(EFAULT));
         }
         let sec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
@@ -665,7 +665,7 @@ pub(super) async fn select<
         let mut out = [0u8; 16];
         out[0..8].copy_from_slice(&sec.to_le_bytes());
         out[8..16].copy_from_slice(&usec.to_le_bytes());
-        if memory.write(timeout_ptr, &out).is_err() {
+        if memory.write(timeout_ptr, &out).await.is_err() {
             return SyscallOutcome::Return(errno(EFAULT));
         }
     }
@@ -685,19 +685,19 @@ pub(super) async fn pselect6<
     let sig_arg = args[5];
     let temp_mask = if sig_arg != 0 {
         let mut raw = [0u8; 16];
-        if memory.read(sig_arg, &mut raw).is_err() {
+        if memory.read(sig_arg, &mut raw).await.is_err() {
             return SyscallOutcome::Return(errno(EFAULT));
         }
         let sig_ptr = u64::from_le_bytes(raw[0..8].try_into().unwrap());
         let sig_len = u64::from_le_bytes(raw[8..16].try_into().unwrap());
-        match read_sigmask(memory, sig_ptr, sig_len) {
+        match read_sigmask(memory, sig_ptr, sig_len).await {
             Ok(m) => m,
             Err(err) => return SyscallOutcome::Return(err),
         }
     } else {
         None
     };
-    let deadline = match read_timespec_timeout(memory, args[4], io) {
+    let deadline = match read_timespec_timeout(memory, args[4], io).await {
         Ok(d) => d,
         Err(err) => return SyscallOutcome::Return(err),
     };
@@ -742,15 +742,15 @@ async fn select_common<
         return SyscallOutcome::Return(errno(EINVAL));
     }
     let byte_len = nfds_usize.div_ceil(64) * 8;
-    let in_read = match read_fd_set(memory, read_ptr, byte_len) {
+    let in_read = match read_fd_set(memory, read_ptr, byte_len).await {
         Ok(v) => v,
         Err(err) => return SyscallOutcome::Return(err),
     };
-    let in_write = match read_fd_set(memory, write_ptr, byte_len) {
+    let in_write = match read_fd_set(memory, write_ptr, byte_len).await {
         Ok(v) => v,
         Err(err) => return SyscallOutcome::Return(err),
     };
-    let in_except = match read_fd_set(memory, except_ptr, byte_len) {
+    let in_except = match read_fd_set(memory, except_ptr, byte_len).await {
         Ok(v) => v,
         Err(err) => return SyscallOutcome::Return(err),
     };
@@ -877,18 +877,21 @@ async fn select_common<
             if installed_mask {
                 process.signals.restore_temp_mask();
             }
-            if read_ptr != 0 && !out_read.is_empty() && memory.write(read_ptr, &out_read).is_err() {
+            if read_ptr != 0
+                && !out_read.is_empty()
+                && memory.write(read_ptr, &out_read).await.is_err()
+            {
                 return SyscallOutcome::Return(errno(EFAULT));
             }
             if write_ptr != 0
                 && !out_write.is_empty()
-                && memory.write(write_ptr, &out_write).is_err()
+                && memory.write(write_ptr, &out_write).await.is_err()
             {
                 return SyscallOutcome::Return(errno(EFAULT));
             }
             if except_ptr != 0
                 && !out_except.is_empty()
-                && memory.write(except_ptr, &out_except).is_err()
+                && memory.write(except_ptr, &out_except).await.is_err()
             {
                 return SyscallOutcome::Return(errno(EFAULT));
             }

@@ -682,6 +682,9 @@ fn parse_and_runtime_errors_surface_typed() {
             stream: out_rx,
             stderr: Some(err_rx),
             exit_code: Some(code_rx),
+            upstream_exits: Vec::new(),
+            is_external: true,
+            merge_stderr: false,
             span: nu_protocol::Span::test_data(),
             stream_type: nu_protocol::ByteStreamType::Unknown,
             metadata: None,
@@ -900,6 +903,455 @@ fn save_unknown_extension_stderr_redirection_do_env_tilde_and_cancellation() {
             working_set.compile_errors.is_empty(),
             "{rel} compile errors: {:?}",
             working_set.compile_errors
+        );
+    });
+}
+
+#[test]
+fn pipeline_redirection_stderr_pipe_upstream_exit_and_stdout_file_on_failure() {
+    block_on(async {
+        let env = TestHeliosEnv::new();
+        let mut session = ShellSession::new(env.clone()).await;
+
+        // 1. `^cmd e>| ...` preserves and forwards captured stderr on exit 0.
+        let err_piped = session
+            .eval(r#"run-external "ok-err-ext" "你好 こんにちは 안녕하세요" e>| str trim"#)
+            .await
+            .unwrap();
+        assert_eq!(err_piped.as_str().unwrap(), "stderr-on-zero");
+        assert!(
+            env.recorded_stdout().contains("你好 こんにちは 안녕하세요"),
+            "stdout must stay inherited when only stderr is piped via e>|"
+        );
+
+        // `e>|` inside a subexpression / `let` binding must still forward stderr, not stdout.
+        let err_let = session
+            .eval(r#"let e = (run-external "ok-err-ext" e>| str trim); $e"#)
+            .await
+            .unwrap();
+        assert_eq!(err_let.as_str().unwrap(), "stderr-on-zero");
+
+        // `e>|` piped directly into another external command.
+        let err_to_ext = session
+            .eval(r#"run-external "ok-err-ext" e>| run-external "upper-pipe" | str trim"#)
+            .await
+            .unwrap();
+        assert_eq!(err_to_ext.as_str().unwrap(), "STDERR-ON-ZERO");
+
+        // `o+e>|` merges stdout and stderr on exit 0.
+        let merged = session
+            .eval(r#"run-external "ok-err-ext" "hello" o+e>| str trim"#)
+            .await
+            .unwrap();
+        let merged_text = merged.as_str().unwrap();
+        assert!(
+            merged_text.contains("hello") && merged_text.contains("stderr-on-zero"),
+            "o+e>| must merge stdout and stderr, got: {merged_text:?}"
+        );
+
+        // `o> file e>| ...` writes stdout to file and forwards stderr downstream.
+        let split_err = session
+            .eval(r#"run-external "ok-err-ext" "cjk:中文日本語한국어" o> /tmp/split-out.txt e>| str trim"#)
+            .await
+            .unwrap();
+        assert_eq!(split_err.as_str().unwrap(), "stderr-on-zero");
+        assert_eq!(
+            String::from_utf8(env.read_vfs_bytes("/tmp/split-out.txt").unwrap()).unwrap(),
+            "cjk:中文日本語한국어\n"
+        );
+
+        // 2. `^a | ^b` propagates upstream non-zero exit codes.
+        let upstream_fail = session
+            .eval(r#"run-external "fail-ext" | run-external "upper-pipe""#)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                upstream_fail,
+                NuError::Eval(ref err)
+                    if matches!(
+                        err.as_ref(),
+                        nu_protocol::ShellError::NonZeroExitCode { exit_code, .. }
+                            if exit_code.get() == 7
+                    )
+            ),
+            "expected upstream NonZeroExitCode(7), got: {upstream_fail}"
+        );
+
+        // `^a | ^b | complete` surfaces upstream non-zero exit code in `exit_code`.
+        let completed = session
+            .eval(r#"run-external "fail-ext" | run-external "upper-pipe" | complete"#)
+            .await
+            .unwrap();
+        let rec = completed.as_record().unwrap();
+        assert_eq!(rec.get("exit_code").unwrap().as_int().unwrap(), 7);
+        assert_eq!(rec.get("stdout").unwrap().as_str().unwrap(), "PARTIAL-OUT");
+
+        // Upstream spawn/RPC error also propagates through `^a | ^b`.
+        let upstream_err = session
+            .eval(r#"run-external "async-missing" | run-external "upper-pipe""#)
+            .await
+            .unwrap_err();
+        assert!(
+            upstream_err.to_string().contains("not found"),
+            "expected upstream async spawn error, got: {upstream_err}"
+        );
+
+        // Healthy `^a | ^b` still succeeds cleanly.
+        let healthy = session
+            .eval(r#"run-external "echo-ext" "pipeline-ok" | run-external "upper-pipe" | str trim"#)
+            .await
+            .unwrap();
+        assert_eq!(healthy.as_str().unwrap(), "PIPELINE-OK");
+
+        // 3. `o>` writes captured stdout to the file BEFORE surfacing the non-zero exit error.
+        let redir_fail = session
+            .eval(r#"run-external "fail-ext" o> /tmp/fail-stdout.txt"#)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                redir_fail,
+                NuError::Eval(ref err)
+                    if matches!(
+                        err.as_ref(),
+                        nu_protocol::ShellError::NonZeroExitCode { exit_code, .. }
+                            if exit_code.get() == 7
+                    )
+            ),
+            "expected NonZeroExitCode(7) after writing stdout file, got: {redir_fail}"
+        );
+        assert_eq!(
+            env.read_vfs_bytes("/tmp/fail-stdout.txt").as_deref(),
+            Some(b"partial-out".as_slice()),
+            "o> must flush captured stdout to file even on non-zero exit"
+        );
+    });
+}
+
+#[test]
+fn linux_image_component_oci_container_storage_and_vm_commands() {
+    block_on(async {
+        let env = TestHeliosEnv::new();
+        let mut session = ShellSession::new(env.clone()).await;
+
+        // 1. `linux image {get, set, clear}`
+        let initial = session.eval("linux image get").await.unwrap();
+        let initial_rec = initial.as_record().unwrap();
+        assert_eq!(
+            initial_rec.get("default_ref").unwrap().as_str().unwrap(),
+            "alpine"
+        );
+        assert!(!initial_rec.get("active").unwrap().as_bool().unwrap());
+
+        let set_res = session
+            .eval("linux image set ubuntu:24.04 --arch arm64")
+            .await
+            .unwrap();
+        let set_rec = set_res.as_record().unwrap();
+        assert!(set_rec.get("active").unwrap().as_bool().unwrap());
+        assert!(set_rec.get("persisted").unwrap().as_bool().unwrap());
+        assert_eq!(
+            set_rec.get("image_ref").unwrap().as_str().unwrap(),
+            "docker.io/library/ubuntu:24.04"
+        );
+
+        let cleared = session.eval("linux image clear").await.unwrap();
+        let cleared_rec = cleared.as_record().unwrap();
+        assert!(cleared_rec.get("cleared").unwrap().as_bool().unwrap());
+        assert_eq!(
+            cleared_rec.get("previous_ref").unwrap().as_str().unwrap(),
+            "docker.io/library/ubuntu:24.04"
+        );
+        let after_clear = session.eval("linux image get").await.unwrap();
+        assert!(
+            after_clear
+                .as_record()
+                .unwrap()
+                .get("image_ref")
+                .unwrap()
+                .is_nothing()
+        );
+
+        // 2. `component {ls, status, start, stop, restart, add, rm}`
+        let comps = session.eval("component ls | length").await.unwrap();
+        assert_eq!(comps.as_int().unwrap(), 2);
+
+        let status = session
+            .eval("component status /plugins/http-client | get state")
+            .await
+            .unwrap();
+        assert_eq!(status.as_str().unwrap(), "running");
+
+        let _ = session
+            .eval("component stop /plugins/http-client")
+            .await
+            .unwrap();
+        let stopped = session
+            .eval("component status /plugins/http-client | get state")
+            .await
+            .unwrap();
+        assert_eq!(stopped.as_str().unwrap(), "stopped");
+
+        let started = session
+            .eval("component start /plugins/http-client | get state")
+            .await
+            .unwrap();
+        assert_eq!(started.as_str().unwrap(), "running");
+
+        let restarts = session
+            .eval("component restart /plugins/http-client | get restarts")
+            .await
+            .unwrap();
+        assert_eq!(restarts.as_int().unwrap(), 1);
+
+        let added = session
+            .eval(r#"component add /services /tmp/app-dir --name worker | get moniker"#)
+            .await
+            .unwrap();
+        assert_eq!(added.as_str().unwrap(), "/services/worker");
+        let _ = session.eval("component rm /services/worker").await.unwrap();
+        assert!(
+            session
+                .eval("component status /services/worker")
+                .await
+                .is_err()
+        );
+
+        let added_inline = session
+            .eval(r#"component add /services --manifests { "demo.toml": "name = 'demo'" } | get moniker"#)
+            .await
+            .unwrap();
+        assert_eq!(added_inline.as_str().unwrap(), "/services/demo");
+        let _ = session.eval("component rm /services/demo").await.unwrap();
+
+        // 3. `oci {pull, ls, inspect, rm}`
+        let pulled = session
+            .eval("oci pull busybox:1.36 --arch amd64")
+            .await
+            .unwrap();
+        assert_eq!(
+            pulled
+                .as_record()
+                .unwrap()
+                .get("reference")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "docker.io/library/busybox:1.36"
+        );
+        let oci_count = session.eval("oci ls | length").await.unwrap();
+        assert!(oci_count.as_int().unwrap() >= 3);
+
+        let inspected = session.eval("oci inspect busybox:1.36").await.unwrap();
+        assert_eq!(
+            inspected
+                .as_record()
+                .unwrap()
+                .get("os")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "linux"
+        );
+        let _ = session.eval("oci rm busybox:1.36").await.unwrap();
+        assert!(session.eval("oci inspect busybox:1.36").await.is_err());
+
+        // 4. `container {create, ls, exec, spawn, rm}` & `with-container`
+        let ctr = session
+            .eval(r#"container create alpine --hostname cjk-box --cwd /work --user 1000:1000 --mount "/tmp:/work:rw:shared""#)
+            .await
+            .unwrap();
+        let handle = ctr
+            .as_record()
+            .unwrap()
+            .get("handle")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let ctr_count = session.eval("container ls | length").await.unwrap();
+        assert_eq!(ctr_count.as_int().unwrap(), 1);
+
+        let exec_out = session
+            .eval(&format!(
+                r#"container exec "{handle}" /bin/echo "你好 こんにちは 안녕하세요""#
+            ))
+            .await
+            .unwrap();
+        let exec_rec = exec_out.as_record().unwrap();
+        assert_eq!(exec_rec.get("exit_code").unwrap().as_int().unwrap(), 0);
+        assert_eq!(
+            exec_rec.get("stdout").unwrap().as_str().unwrap(),
+            "cjk-box:/bin/echo 你好 こんにちは 안녕하세요"
+        );
+
+        let spawn_out = session
+            .eval(&format!(
+                r#""piped-中文日本語한국어" | container spawn "{handle}" /bin/cat | str trim"#
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            spawn_out.as_str().unwrap(),
+            format!("[{handle}] piped-中文日本語한국어")
+        );
+
+        let scoped_out = session
+            .eval(&format!(
+                r#"with-container "{handle}" {{ run-external "/bin/uname" "-a" | str trim }}"#
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            scoped_out.as_str().unwrap(),
+            format!("[{handle}] /bin/uname -a")
+        );
+        assert!(
+            session.runtime_scope().current_container().is_none(),
+            "with-container must not leak container frame after closure completes"
+        );
+
+        let _ = session
+            .eval(&format!(r#"container rm "{handle}""#))
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .eval("container ls | length")
+                .await
+                .unwrap()
+                .as_int()
+                .unwrap(),
+            0
+        );
+
+        // 5. `mount`, `umount`, and `btrfs subvolume ...`
+        let _ = session
+            .eval("mount btrfs:disk0 /mnt/data --compress zstd:3 --commit 15 --max-inline 2048")
+            .await
+            .unwrap();
+        let mnt_rows = session
+            .eval("mount | where path == /mnt/data | length")
+            .await
+            .unwrap();
+        assert_eq!(mnt_rows.as_int().unwrap(), 1);
+        let _ = session.eval("umount /mnt/data").await.unwrap();
+        let mnt_after = session
+            .eval("mount | where path == /mnt/data | length")
+            .await
+            .unwrap();
+        assert_eq!(mnt_after.as_int().unwrap(), 0);
+
+        let sub = session
+            .eval("btrfs subvolume create /data/app")
+            .await
+            .unwrap();
+        assert!(
+            !sub.as_record()
+                .unwrap()
+                .get("read_only")
+                .unwrap()
+                .as_bool()
+                .unwrap()
+        );
+        let snap = session
+            .eval("btrfs subvolume snapshot -r /data/app /data/app-snap")
+            .await
+            .unwrap();
+        assert!(
+            snap.as_record()
+                .unwrap()
+                .get("read_only")
+                .unwrap()
+                .as_bool()
+                .unwrap()
+        );
+        let shown = session
+            .eval("btrfs subvolume show /data/app-snap | get read_only")
+            .await
+            .unwrap();
+        assert!(shown.as_bool().unwrap());
+
+        let recv = session
+            .eval("btrfs subvolume send /data/app-snap | btrfs subvolume receive /data/app-recv")
+            .await
+            .unwrap();
+        assert!(
+            recv.as_record()
+                .unwrap()
+                .get("read_only")
+                .unwrap()
+                .as_bool()
+                .unwrap()
+        );
+        let sub_list_len = session
+            .eval("btrfs subvolume list /data | length")
+            .await
+            .unwrap();
+        assert_eq!(sub_list_len.as_int().unwrap(), 4);
+
+        let _ = session
+            .eval("btrfs subvolume set-ro /data/app-snap false")
+            .await
+            .unwrap();
+        let _ = session
+            .eval("btrfs subvolume delete /data/app-snap")
+            .await
+            .unwrap();
+
+        // 6. `vm run [--oci <ref>]` & `vm ls`
+        let vm = session
+            .eval(r#"vm run --oci alpine --cpus 2 --memory-mib 256 --name alpine-vm --share-dir "work:/tmp:rw""#)
+            .await
+            .unwrap();
+        let vm_rec = vm.as_record().unwrap();
+        assert_eq!(vm_rec.get("name").unwrap().as_str().unwrap(), "alpine-vm");
+        assert_eq!(vm_rec.get("cpus").unwrap().as_int().unwrap(), 2);
+        assert_eq!(vm_rec.get("memory_mib").unwrap().as_int().unwrap(), 256);
+        assert_eq!(vm_rec.get("oci_ref").unwrap().as_str().unwrap(), "alpine");
+
+        let vm_count = session.eval("vm ls | length").await.unwrap();
+        assert_eq!(vm_count.as_int().unwrap(), 1);
+
+        // 7. Completion coverage for new commands, 3-word subcommands, monikers, OCI refs, and container handles
+        let linux_subs = session.complete("linux image ", 12).await;
+        assert!(linux_subs.iter().any(|c| c.value == "get"));
+        assert!(linux_subs.iter().any(|c| c.value == "set"));
+        assert!(linux_subs.iter().any(|c| c.value == "clear"));
+
+        let btrfs_subs = session.complete("btrfs subvolume ", 16).await;
+        assert!(btrfs_subs.iter().any(|c| c.value == "create"));
+        assert!(btrfs_subs.iter().any(|c| c.value == "snapshot"));
+        assert!(btrfs_subs.iter().any(|c| c.value == "send"));
+        assert!(btrfs_subs.iter().any(|c| c.value == "receive"));
+
+        let comp_monikers = session.complete("component status /p", 19).await;
+        assert!(
+            comp_monikers
+                .iter()
+                .any(|c| c.value == "/plugins/http-client" && c.kind == CompletionKind::Moniker)
+        );
+
+        let oci_refs = session.complete("oci inspect docker", 18).await;
+        assert!(oci_refs.iter().any(
+            |c| c.value == "docker.io/library/alpine:3.21" && c.kind == CompletionKind::OciRef
+        ));
+
+        let c2 = session.eval("container create alpine").await.unwrap();
+        let h2 = c2
+            .as_record()
+            .unwrap()
+            .get("handle")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let ctr_completions = session.complete("with-container c", 16).await;
+        assert!(
+            ctr_completions
+                .iter()
+                .any(|c| c.value == h2 && c.kind == CompletionKind::ContainerHandle)
         );
     });
 }

@@ -679,7 +679,7 @@ fn get_socket<R: Resources>(
     }
 }
 
-fn parse_sockaddr<M: UserMemory>(
+async fn parse_sockaddr<M: UserMemory>(
     memory: &M,
     addr: u64,
     addrlen: u32,
@@ -688,7 +688,10 @@ fn parse_sockaddr<M: UserMemory>(
         return Err(EINVAL);
     }
     let mut family_bytes = [0u8; 2];
-    memory.read(addr, &mut family_bytes).map_err(|_| EFAULT)?;
+    memory
+        .read(addr, &mut family_bytes)
+        .await
+        .map_err(|_| EFAULT)?;
     let family = u16::from_le_bytes(family_bytes);
     match family {
         AF_UNSPEC => Ok(None),
@@ -697,7 +700,7 @@ fn parse_sockaddr<M: UserMemory>(
                 return Err(EINVAL);
             }
             let mut raw = [0u8; SOCKADDR_IN_LEN];
-            memory.read(addr, &mut raw).map_err(|_| EFAULT)?;
+            memory.read(addr, &mut raw).await.map_err(|_| EFAULT)?;
             let port = u16::from_be_bytes([raw[2], raw[3]]);
             let ip = IpAddr::V4([raw[4], raw[5], raw[6], raw[7]]);
             Ok(Some(SocketAddr { ip, port }))
@@ -707,7 +710,7 @@ fn parse_sockaddr<M: UserMemory>(
                 return Err(EINVAL);
             }
             let mut raw = [0u8; SOCKADDR_IN6_LEN];
-            memory.read(addr, &mut raw).map_err(|_| EFAULT)?;
+            memory.read(addr, &mut raw).await.map_err(|_| EFAULT)?;
             let port = u16::from_be_bytes([raw[2], raw[3]]);
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&raw[8..24]);
@@ -738,7 +741,7 @@ fn encode_sockaddr(addr: SocketAddr, out: &mut [u8; SOCKADDR_IN6_LEN]) -> usize 
     }
 }
 
-fn write_sockaddr_bytes<M: UserMemory>(
+async fn write_sockaddr_bytes<M: UserMemory>(
     memory: &mut M,
     addr_ptr: u64,
     addrlen_ptr: u64,
@@ -753,6 +756,7 @@ fn write_sockaddr_bytes<M: UserMemory>(
     let mut len_bytes = [0u8; 4];
     memory
         .read(addrlen_ptr, &mut len_bytes)
+        .await
         .map_err(|_| EFAULT)?;
     let raw_len = i32::from_le_bytes(len_bytes);
     if raw_len < 0 {
@@ -762,10 +766,12 @@ fn write_sockaddr_bytes<M: UserMemory>(
     if copy_len > 0 {
         memory
             .write(addr_ptr, &encoded[..copy_len])
+            .await
             .map_err(|_| EFAULT)?;
     }
     memory
         .write(addrlen_ptr, &(encoded.len() as u32).to_le_bytes())
+        .await
         .map_err(|_| EFAULT)?;
     Ok(())
 }
@@ -777,7 +783,7 @@ fn encode_sockaddr_vm(cid: u32, port: u32, out: &mut [u8; SOCKADDR_VM_LEN]) {
     out[8..12].copy_from_slice(&cid.to_ne_bytes());
 }
 
-fn write_sockaddr_vm<M: UserMemory>(
+async fn write_sockaddr_vm<M: UserMemory>(
     memory: &mut M,
     addr_ptr: u64,
     addrlen_ptr: u64,
@@ -786,10 +792,10 @@ fn write_sockaddr_vm<M: UserMemory>(
 ) -> Result<(), u64> {
     let mut buf = [0u8; SOCKADDR_VM_LEN];
     encode_sockaddr_vm(cid, port, &mut buf);
-    write_sockaddr_bytes(memory, addr_ptr, addrlen_ptr, &buf)
+    write_sockaddr_bytes(memory, addr_ptr, addrlen_ptr, &buf).await
 }
 
-fn write_sockaddr<M: UserMemory>(
+async fn write_sockaddr<M: UserMemory>(
     memory: &mut M,
     addr_ptr: u64,
     addrlen_ptr: u64,
@@ -797,7 +803,7 @@ fn write_sockaddr<M: UserMemory>(
 ) -> Result<(), u64> {
     let mut buf = [0u8; SOCKADDR_IN6_LEN];
     let len = encode_sockaddr(addr, &mut buf);
-    write_sockaddr_bytes(memory, addr_ptr, addrlen_ptr, &buf[..len])
+    write_sockaddr_bytes(memory, addr_ptr, addrlen_ptr, &buf[..len]).await
 }
 
 fn effective_timeout(configured: Option<u64>, nonblocking: bool) -> u64 {
@@ -1009,7 +1015,7 @@ pub(crate) fn socket<R: Resources, Net: Network<R::Network>>(
     }
 }
 
-pub(crate) fn socketpair<R: Resources, M: UserMemory>(
+pub(crate) async fn socketpair<R: Resources, M: UserMemory>(
     descriptors: &spin::Mutex<Descriptors<R>>,
     args: [u64; 6],
     memory: &mut M,
@@ -1036,7 +1042,7 @@ pub(crate) fn socketpair<R: Resources, M: UserMemory>(
     if protocol != 0 {
         return errno(EPROTONOSUPPORT);
     }
-    if memory.check_writable(sv_ptr, 8).is_err() {
+    if memory.check_writable(sv_ptr, 8).await.is_err() {
         return errno(EFAULT);
     }
     let nonblocking = flags & SOCK_NONBLOCK != 0;
@@ -1052,22 +1058,26 @@ pub(crate) fn socketpair<R: Resources, M: UserMemory>(
         entry0.set_fdflags(helios_unix::FDFLAG_NONBLOCK);
         entry1.set_fdflags(helios_unix::FDFLAG_NONBLOCK);
     }
-    let mut table = descriptors.lock();
-    let fd0 = match table.insert_entry(entry0) {
-        Ok(fd) => fd,
-        Err(err) => return descriptor_errno(err),
-    };
-    let fd1 = match table.insert_entry(entry1) {
-        Ok(fd) => fd,
-        Err(err) => {
-            let _ = table.close(fd0 as i32);
-            return descriptor_errno(err);
-        }
+    let (fd0, fd1) = {
+        let mut table = descriptors.lock();
+        let fd0 = match table.insert_entry(entry0) {
+            Ok(fd) => fd,
+            Err(err) => return descriptor_errno(err),
+        };
+        let fd1 = match table.insert_entry(entry1) {
+            Ok(fd) => fd,
+            Err(err) => {
+                let _ = table.close(fd0 as i32);
+                return descriptor_errno(err);
+            }
+        };
+        (fd0, fd1)
     };
     let mut out = [0u8; 8];
     out[0..4].copy_from_slice(&(fd0 as i32).to_le_bytes());
     out[4..8].copy_from_slice(&(fd1 as i32).to_le_bytes());
-    if memory.write(sv_ptr, &out).is_err() {
+    if memory.write(sv_ptr, &out).await.is_err() {
+        let mut table = descriptors.lock();
         let _ = table.close(fd0 as i32);
         let _ = table.close(fd1 as i32);
         return errno(EFAULT);
@@ -1090,18 +1100,18 @@ pub(crate) async fn bind<R: Resources, M: UserMemory, Net: Network<R::Network>>(
         Err(err) => return errno(err),
     };
     if sock.is_netlink() {
-        return match netlink::bind(&sock, addr_ptr, addrlen, ctx, memory) {
+        return match netlink::bind(&sock, addr_ptr, addrlen, ctx, memory).await {
             Ok(()) => 0,
             Err(err) => errno(err),
         };
     }
     if sock.is_packet() {
-        return match packet::bind(&sock, addr_ptr, addrlen, memory, net) {
+        return match packet::bind(&sock, addr_ptr, addrlen, memory, net).await {
             Ok(()) => 0,
             Err(err) => errno(err),
         };
     }
-    let Some(target) = (match parse_sockaddr(memory, addr_ptr, addrlen) {
+    let Some(target) = (match parse_sockaddr(memory, addr_ptr, addrlen).await {
         Ok(target) => target,
         Err(err) => return errno(err),
     }) else {
@@ -1286,7 +1296,9 @@ pub(crate) async fn accept<R: Resources, M: UserMemory, Net: Network<R::Network>
             addrlen_ptr,
             accepted.peer_cid,
             accepted.peer_port,
-        ) {
+        )
+        .await
+        {
             return errno(err);
         }
         let accepted = Socket::<R::Network>::from_vsock(VsockSocket::Connected {
@@ -1329,7 +1341,7 @@ pub(crate) async fn accept<R: Resources, M: UserMemory, Net: Network<R::Network>
         Err(ETIMEDOUT) => return errno(EAGAIN),
         Err(err) => return errno(err),
     };
-    if let Err(err) = write_sockaddr(memory, addr_ptr, addrlen_ptr, peer) {
+    if let Err(err) = write_sockaddr(memory, addr_ptr, addrlen_ptr, peer).await {
         return errno(err);
     }
     let peer_address = net.encode_ip(peer.ip);
@@ -1401,7 +1413,7 @@ pub(crate) async fn connect<R: Resources, M: UserMemory, Net: Network<R::Network
     if sock.is_pair() {
         return errno(EISCONN);
     }
-    let parsed = match parse_sockaddr(memory, addr_ptr, addrlen) {
+    let parsed = match parse_sockaddr(memory, addr_ptr, addrlen).await {
         Ok(parsed) => parsed,
         Err(err) => return errno(err),
     };
@@ -1580,13 +1592,15 @@ pub(crate) async fn getsockname<R: Resources, M: UserMemory, Net: Network<R::Net
         Err(err) => return errno(err),
     };
     if sock.is_pair() || sock.is_unix_unbound() {
-        return match write_sockaddr_bytes(memory, addr_ptr, addrlen_ptr, &AF_UNIX.to_le_bytes()) {
+        return match write_sockaddr_bytes(memory, addr_ptr, addrlen_ptr, &AF_UNIX.to_le_bytes())
+            .await
+        {
             Ok(()) => 0,
             Err(err) => errno(err),
         };
     }
     if sock.is_netlink() {
-        return match netlink::getsockname(&sock, addr_ptr, addrlen_ptr, memory) {
+        return match netlink::getsockname(&sock, addr_ptr, addrlen_ptr, memory).await {
             Ok(()) => 0,
             Err(err) => errno(err),
         };
@@ -1598,9 +1612,11 @@ pub(crate) async fn getsockname<R: Resources, M: UserMemory, Net: Network<R::Net
         };
     }
     if sock.is_icmp() {
-        return match icmp::getsockname(&sock, net)
-            .and_then(|addr| write_sockaddr(memory, addr_ptr, addrlen_ptr, addr))
-        {
+        let addr = match icmp::getsockname(&sock, net) {
+            Ok(addr) => addr,
+            Err(err) => return errno(err),
+        };
+        return match write_sockaddr(memory, addr_ptr, addrlen_ptr, addr).await {
             Ok(()) => 0,
             Err(err) => errno(err),
         };
@@ -1618,7 +1634,7 @@ pub(crate) async fn getsockname<R: Resources, M: UserMemory, Net: Network<R::Net
                 ..
             } => (local_cid, local_port),
         };
-        return match write_sockaddr_vm(memory, addr_ptr, addrlen_ptr, cid, port) {
+        return match write_sockaddr_vm(memory, addr_ptr, addrlen_ptr, cid, port).await {
             Ok(()) => 0,
             Err(err) => errno(err),
         };
@@ -1672,7 +1688,7 @@ pub(crate) async fn getsockname<R: Resources, M: UserMemory, Net: Network<R::Net
     } else {
         return errno(ENOTSOCK);
     };
-    match write_sockaddr(memory, addr_ptr, addrlen_ptr, addr) {
+    match write_sockaddr(memory, addr_ptr, addrlen_ptr, addr).await {
         Ok(()) => 0,
         Err(err) => errno(err),
     }
@@ -1692,15 +1708,19 @@ pub(crate) async fn getpeername<R: Resources, M: UserMemory, Net: Network<R::Net
         Err(err) => return errno(err),
     };
     if sock.is_pair() {
-        return match write_sockaddr_bytes(memory, addr_ptr, addrlen_ptr, &AF_UNIX.to_le_bytes()) {
+        return match write_sockaddr_bytes(memory, addr_ptr, addrlen_ptr, &AF_UNIX.to_le_bytes())
+            .await
+        {
             Ok(()) => 0,
             Err(err) => errno(err),
         };
     }
     if sock.is_icmp() {
-        return match icmp::getpeername(&sock, net)
-            .and_then(|addr| write_sockaddr(memory, addr_ptr, addrlen_ptr, addr))
-        {
+        let addr = match icmp::getpeername(&sock, net) {
+            Ok(addr) => addr,
+            Err(err) => return errno(err),
+        };
+        return match write_sockaddr(memory, addr_ptr, addrlen_ptr, addr).await {
             Ok(()) => 0,
             Err(err) => errno(err),
         };
@@ -1711,10 +1731,12 @@ pub(crate) async fn getpeername<R: Resources, M: UserMemory, Net: Network<R::Net
                 peer_cid,
                 peer_port,
                 ..
-            } => match write_sockaddr_vm(memory, addr_ptr, addrlen_ptr, peer_cid, peer_port) {
-                Ok(()) => 0,
-                Err(err) => errno(err),
-            },
+            } => {
+                match write_sockaddr_vm(memory, addr_ptr, addrlen_ptr, peer_cid, peer_port).await {
+                    Ok(()) => 0,
+                    Err(err) => errno(err),
+                }
+            }
             VsockSocket::Listening { .. } => errno(ENOTCONN),
         };
     }
@@ -1747,7 +1769,7 @@ pub(crate) async fn getpeername<R: Resources, M: UserMemory, Net: Network<R::Net
     } else {
         return errno(ENOTSOCK);
     };
-    match write_sockaddr(memory, addr_ptr, addrlen_ptr, addr) {
+    match write_sockaddr(memory, addr_ptr, addrlen_ptr, addr).await {
         Ok(()) => 0,
         Err(err) => errno(err),
     }
@@ -2259,7 +2281,7 @@ async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
     Err(ENOTSOCK)
 }
 
-fn parse_send_dest<N: SocketNetwork, M: UserMemory>(
+async fn parse_send_dest<N: SocketNetwork, M: UserMemory>(
     sock: &Socket<N>,
     memory: &M,
     addr: u64,
@@ -2269,31 +2291,31 @@ fn parse_send_dest<N: SocketNetwork, M: UserMemory>(
         return Ok(None);
     }
     if sock.is_netlink() {
-        let _ = netlink::read_sockaddr_nl(memory, addr, addrlen)?;
+        let _ = netlink::read_sockaddr_nl(memory, addr, addrlen).await?;
         return Ok(Some(SendDest::Netlink));
     }
     if sock.is_packet() {
-        let sll = packet::read_sockaddr_ll(memory, addr, addrlen)?;
+        let sll = packet::read_sockaddr_ll(memory, addr, addrlen).await?;
         return Ok(Some(SendDest::Packet(sll)));
     }
-    match parse_sockaddr(memory, addr, addrlen)? {
+    match parse_sockaddr(memory, addr, addrlen).await? {
         Some(a) => Ok(Some(SendDest::Inet(a))),
         None => Err(EAFNOSUPPORT),
     }
 }
 
-fn write_recv_peer<M: UserMemory>(
+async fn write_recv_peer<M: UserMemory>(
     memory: &mut M,
     addr: u64,
     addrlen_ptr: u64,
     peer: RecvPeer,
 ) -> Result<(), u64> {
     match peer {
-        RecvPeer::Inet(a) => write_sockaddr(memory, addr, addrlen_ptr, a),
+        RecvPeer::Inet(a) => write_sockaddr(memory, addr, addrlen_ptr, a).await,
         RecvPeer::Netlink { pid, groups } => {
-            netlink::write_sockaddr_nl(memory, addr, addrlen_ptr, pid, groups)
+            netlink::write_sockaddr_nl(memory, addr, addrlen_ptr, pid, groups).await
         }
-        RecvPeer::Packet(sll) => packet::write_sockaddr_ll(memory, addr, addrlen_ptr, sll),
+        RecvPeer::Packet(sll) => packet::write_sockaddr_ll(memory, addr, addrlen_ptr, sll).await,
     }
 }
 
@@ -2315,12 +2337,12 @@ pub(crate) async fn sendto<R: Resources, M: UserMemory, Net: Network<R::Network>
         Ok(sock) => sock,
         Err(err) => return errno(err),
     };
-    let dest = match parse_send_dest(&sock, memory, dest_ptr, addrlen) {
+    let dest = match parse_send_dest(&sock, memory, dest_ptr, addrlen).await {
         Ok(dest) => dest,
         Err(err) => return errno(err),
     };
     let mut data = vec![0u8; len];
-    if len > 0 && memory.read(buf_ptr, &mut data).is_err() {
+    if len > 0 && memory.read(buf_ptr, &mut data).await.is_err() {
         return errno(EFAULT);
     }
     match socket_send(&sock, data, flags, dest, ctx, net).await {
@@ -2346,18 +2368,18 @@ pub(crate) async fn recvfrom<R: Resources, M: UserMemory, Net: Network<R::Networ
         Ok(sock) => sock,
         Err(err) => return errno(err),
     };
-    if len > 0 && memory.check_writable(buf_ptr, len).is_err() {
+    if len > 0 && memory.check_writable(buf_ptr, len).await.is_err() {
         return errno(EFAULT);
     }
     let result = match socket_recv(&sock, len, flags, net).await {
         Ok(result) => result,
         Err(err) => return errno(err),
     };
-    if !result.data.is_empty() && memory.write(buf_ptr, &result.data).is_err() {
+    if !result.data.is_empty() && memory.write(buf_ptr, &result.data).await.is_err() {
         return errno(EFAULT);
     }
     if let Some(peer) = result.peer
-        && let Err(err) = write_recv_peer(memory, src_ptr, addrlen_ptr, peer)
+        && let Err(err) = write_recv_peer(memory, src_ptr, addrlen_ptr, peer).await
     {
         return errno(err);
     }
@@ -2379,9 +2401,9 @@ struct MsgHdr {
     msg_flags: u32,
 }
 
-fn read_msghdr<M: UserMemory>(memory: &M, ptr: u64) -> Result<MsgHdr, u64> {
+async fn read_msghdr<M: UserMemory>(memory: &M, ptr: u64) -> Result<MsgHdr, u64> {
     let mut raw = [0u8; MSGHDR_LEN];
-    memory.read(ptr, &mut raw).map_err(|_| EFAULT)?;
+    memory.read(ptr, &mut raw).await.map_err(|_| EFAULT)?;
     let msg_name = u64::from_le_bytes(raw[0..8].try_into().unwrap());
     let msg_namelen = u32::from_le_bytes(raw[8..12].try_into().unwrap());
     let msg_iov = u64::from_le_bytes(raw[16..24].try_into().unwrap());
@@ -2403,7 +2425,7 @@ fn read_msghdr<M: UserMemory>(memory: &M, ptr: u64) -> Result<MsgHdr, u64> {
     })
 }
 
-fn read_iovecs<M: UserMemory>(
+async fn read_iovecs<M: UserMemory>(
     memory: &M,
     iov_ptr: u64,
     iovlen: usize,
@@ -2416,7 +2438,7 @@ fn read_iovecs<M: UserMemory>(
             .checked_mul(IOVEC_LEN as u64)
             .and_then(|o| iov_ptr.checked_add(o))
             .ok_or(EFAULT)?;
-        memory.read(offset, &mut raw).map_err(|_| EFAULT)?;
+        memory.read(offset, &mut raw).await.map_err(|_| EFAULT)?;
         let base = u64::from_le_bytes(raw[0..8].try_into().unwrap());
         let len = u64::from_le_bytes(raw[8..16].try_into().unwrap());
         let len = usize::try_from(len).map_err(|_| EINVAL)?;
@@ -2437,9 +2459,9 @@ async fn sendmsg_one<N: SocketNetwork, M: UserMemory, Net: Network<N>>(
     memory: &M,
     net: &Net,
 ) -> Result<usize, u64> {
-    let hdr = read_msghdr(memory, msg_ptr)?;
-    let dest = parse_send_dest(sock, memory, hdr.msg_name, hdr.msg_namelen)?;
-    let iovecs = read_iovecs(memory, hdr.msg_iov, hdr.msg_iovlen)?;
+    let hdr = read_msghdr(memory, msg_ptr).await?;
+    let dest = parse_send_dest(sock, memory, hdr.msg_name, hdr.msg_namelen).await?;
+    let iovecs = read_iovecs(memory, hdr.msg_iov, hdr.msg_iovlen).await?;
     let total: usize = iovecs.iter().map(|(_, len)| *len).sum();
     let mut data = Vec::with_capacity(total);
     for (base, len) in iovecs {
@@ -2448,7 +2470,10 @@ async fn sendmsg_one<N: SocketNetwork, M: UserMemory, Net: Network<N>>(
         }
         let start = data.len();
         data.resize(start + len, 0);
-        memory.read(base, &mut data[start..]).map_err(|_| EFAULT)?;
+        memory
+            .read(base, &mut data[start..])
+            .await
+            .map_err(|_| EFAULT)?;
     }
     socket_send(sock, data, flags, dest, ctx, net).await
 }
@@ -2461,11 +2486,11 @@ async fn recvmsg_one<N: SocketNetwork, M: UserMemory, Net: Network<N>>(
     memory: &mut M,
     net: &Net,
 ) -> Result<usize, u64> {
-    let hdr = read_msghdr(memory, msg_ptr)?;
-    let iovecs = read_iovecs(memory, hdr.msg_iov, hdr.msg_iovlen)?;
+    let hdr = read_msghdr(memory, msg_ptr).await?;
+    let iovecs = read_iovecs(memory, hdr.msg_iov, hdr.msg_iovlen).await?;
     let total: usize = iovecs.iter().map(|(_, len)| *len).sum();
     for &(base, len) in &iovecs {
-        if len > 0 && memory.check_writable(base, len).is_err() {
+        if len > 0 && memory.check_writable(base, len).await.is_err() {
             return Err(EFAULT);
         }
     }
@@ -2480,6 +2505,7 @@ async fn recvmsg_one<N: SocketNetwork, M: UserMemory, Net: Network<N>>(
         if take > 0 {
             memory
                 .write(base, &result.data[offset..offset + take])
+                .await
                 .map_err(|_| EFAULT)?;
             offset += take;
         }
@@ -2510,6 +2536,7 @@ async fn recvmsg_one<N: SocketNetwork, M: UserMemory, Net: Network<N>>(
             if copy > 0 {
                 memory
                     .write(hdr.msg_name, &encoded[..copy])
+                    .await
                     .map_err(|_| EFAULT)?;
             }
             full as u32
@@ -2537,7 +2564,10 @@ async fn recvmsg_one<N: SocketNetwork, M: UserMemory, Net: Network<N>>(
             cmsg[8..12].copy_from_slice(&level.to_le_bytes());
             cmsg[12..16].copy_from_slice(&ty.to_le_bytes());
             cmsg[16..20].copy_from_slice(&i32::from(ttl).to_le_bytes());
-            memory.write(hdr.msg_control, &cmsg).map_err(|_| EFAULT)?;
+            memory
+                .write(hdr.msg_control, &cmsg)
+                .await
+                .map_err(|_| EFAULT)?;
             out_controllen = CMSG_SPACE_I32;
         } else {
             out_flags |= MSG_CTRUNC;
@@ -2546,12 +2576,15 @@ async fn recvmsg_one<N: SocketNetwork, M: UserMemory, Net: Network<N>>(
     // Write back `msg_namelen`, `msg_controllen`, and `msg_flags`.
     memory
         .write(msg_ptr + 8, &out_namelen.to_le_bytes())
+        .await
         .map_err(|_| EFAULT)?;
     memory
         .write(msg_ptr + 40, &out_controllen.to_le_bytes())
+        .await
         .map_err(|_| EFAULT)?;
     memory
         .write(msg_ptr + 48, &out_flags.to_le_bytes())
+        .await
         .map_err(|_| EFAULT)?;
     let _ = hdr.msg_flags;
     Ok(if flags & MSG_TRUNC != 0 {
@@ -2631,6 +2664,7 @@ pub(crate) async fn sendmmsg<R: Resources, M: UserMemory, Net: Network<R::Networ
             Ok(bytes) => {
                 if memory
                     .write(entry_ptr + 56, &(bytes as u32).to_le_bytes())
+                    .await
                     .is_err()
                 {
                     return if sent_count > 0 {
@@ -2670,7 +2704,7 @@ pub(crate) async fn recvmmsg<
     let timeout_ptr = args[4];
     let deadline = if timeout_ptr != 0 {
         let mut raw = [0u8; 16];
-        if memory.read(timeout_ptr, &mut raw).is_err() {
+        if memory.read(timeout_ptr, &mut raw).await.is_err() {
             return errno(EFAULT);
         }
         let sec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
@@ -2721,6 +2755,7 @@ pub(crate) async fn recvmmsg<
             Ok(bytes) => {
                 if memory
                     .write(entry_ptr + 56, &(bytes as u32).to_le_bytes())
+                    .await
                     .is_err()
                 {
                     return if recv_count > 0 {
@@ -2890,11 +2925,11 @@ pub(crate) async fn sendfile<
     };
 
     let explicit_offset = if offset_ptr != 0 {
-        if memory.check_writable(offset_ptr, 8).is_err() {
+        if memory.check_writable(offset_ptr, 8).await.is_err() {
             return errno(EFAULT);
         }
         let mut raw = [0u8; 8];
-        if memory.read(offset_ptr, &mut raw).is_err() {
+        if memory.read(offset_ptr, &mut raw).await.is_err() {
             return errno(EFAULT);
         }
         let off = i64::from_le_bytes(raw);
@@ -3064,7 +3099,8 @@ pub(crate) async fn sendfile<
                         &chunk[..landed.len],
                         memory,
                         output,
-                    );
+                    )
+                    .await;
                 }
                 landed.len
             }
@@ -3082,52 +3118,63 @@ pub(crate) async fn sendfile<
 
     if let Some(base) = explicit_offset {
         let updated = base.saturating_add(total_sent as u64) as i64;
-        if memory.write(offset_ptr, &updated.to_le_bytes()).is_err() {
+        if memory
+            .write(offset_ptr, &updated.to_le_bytes())
+            .await
+            .is_err()
+        {
             return errno(EFAULT);
         }
     }
     total_sent as u64
 }
 
-fn read_opt_i32<M: UserMemory>(memory: &M, ptr: u64, len: u32) -> Result<i32, u64> {
+async fn read_opt_i32<M: UserMemory>(memory: &M, ptr: u64, len: u32) -> Result<i32, u64> {
     if (len as usize) < 4 {
         return Err(EINVAL);
     }
     let mut raw = [0u8; 4];
-    memory.read(ptr, &mut raw).map_err(|_| EFAULT)?;
+    memory.read(ptr, &mut raw).await.map_err(|_| EFAULT)?;
     Ok(i32::from_le_bytes(raw))
 }
 
 /// Reads an option value that Linux (`ip(7)`) accepts as either a 1-byte
 /// `unsigned char` (`optlen == 1`) or a 4-byte `int` (`optlen >= 4`).
-fn read_opt_i32_or_u8<M: UserMemory>(memory: &M, ptr: u64, len: u32) -> Result<i32, u64> {
+async fn read_opt_i32_or_u8<M: UserMemory>(memory: &M, ptr: u64, len: u32) -> Result<i32, u64> {
     if len == 1 {
         let mut raw = [0u8; 1];
-        memory.read(ptr, &mut raw).map_err(|_| EFAULT)?;
+        memory.read(ptr, &mut raw).await.map_err(|_| EFAULT)?;
         Ok(i32::from(raw[0]))
     } else {
-        read_opt_i32(memory, ptr, len)
+        read_opt_i32(memory, ptr, len).await
     }
 }
 
-fn write_opt_bytes<M: UserMemory>(
+async fn write_opt_bytes<M: UserMemory>(
     memory: &mut M,
     val_ptr: u64,
     len_ptr: u64,
     bytes: &[u8],
 ) -> Result<(), u64> {
     let mut len_raw = [0u8; 4];
-    memory.read(len_ptr, &mut len_raw).map_err(|_| EFAULT)?;
+    memory
+        .read(len_ptr, &mut len_raw)
+        .await
+        .map_err(|_| EFAULT)?;
     let avail = i32::from_le_bytes(len_raw);
     if avail < 0 {
         return Err(EINVAL);
     }
     let copy = (avail as usize).min(bytes.len());
     if copy > 0 {
-        memory.write(val_ptr, &bytes[..copy]).map_err(|_| EFAULT)?;
+        memory
+            .write(val_ptr, &bytes[..copy])
+            .await
+            .map_err(|_| EFAULT)?;
     }
     memory
         .write(len_ptr, &(copy as u32).to_le_bytes())
+        .await
         .map_err(|_| EFAULT)?;
     Ok(())
 }
@@ -3192,9 +3239,9 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
                 return errno(EOPNOTSUPP);
             }
             let raw_val = if (level, optname) == (IPPROTO_IP, IP_MULTICAST_LOOP) {
-                read_opt_i32_or_u8(memory, optval, optlen)
+                read_opt_i32_or_u8(memory, optval, optlen).await
             } else {
-                read_opt_i32(memory, optval, optlen)
+                read_opt_i32(memory, optval, optlen).await
             };
             let val = match raw_val {
                 Ok(v) => v != 0,
@@ -3224,7 +3271,7 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
             } else {
                 let len = (optlen as usize).min(16);
                 let mut name = vec![0u8; len];
-                if memory.read(optval, &mut name).is_err() {
+                if memory.read(optval, &mut name).await.is_err() {
                     return errno(EFAULT);
                 }
                 let nul = name.iter().position(|&b| b == 0).unwrap_or(name.len());
@@ -3261,7 +3308,7 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
             }
         }
         (IPPROTO_IP, IP_RECVTTL) if sock.is_icmp() => {
-            let val = match read_opt_i32(memory, optval, optlen) {
+            let val = match read_opt_i32(memory, optval, optlen).await {
                 Ok(v) => v != 0,
                 Err(err) => return errno(err),
             };
@@ -3269,23 +3316,23 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
             0
         }
         (IPPROTO_IPV6, IPV6_RECVHOPLIMIT) if sock.is_icmp() => {
-            let val = match read_opt_i32(memory, optval, optlen) {
+            let val = match read_opt_i32(memory, optval, optlen).await {
                 Ok(v) => v != 0,
                 Err(err) => return errno(err),
             };
             let _ = sock.with_icmp_mut(|slot| slot.recv_ttl = val);
             0
         }
-        (IPPROTO_IP, IP_TOS) => match read_opt_i32_or_u8(memory, optval, optlen) {
+        (IPPROTO_IP, IP_TOS) => match read_opt_i32_or_u8(memory, optval, optlen).await {
             Ok(_) => 0,
             Err(err) => errno(err),
         },
-        (SOL_SOCKET, SO_TIMESTAMP) => match read_opt_i32(memory, optval, optlen) {
+        (SOL_SOCKET, SO_TIMESTAMP) => match read_opt_i32(memory, optval, optlen).await {
             Ok(_) => 0,
             Err(err) => errno(err),
         },
         (IPPROTO_IPV6, IPV6_CHECKSUM) if sock.is_icmp() => {
-            match read_opt_i32(memory, optval, optlen) {
+            match read_opt_i32(memory, optval, optlen).await {
                 Ok(_) => 0,
                 Err(err) => errno(err),
             }
@@ -3294,6 +3341,7 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
             if optlen > 0
                 && memory
                     .read(optval, &mut vec![0u8; (optlen as usize).min(64)])
+                    .await
                     .is_err()
             {
                 return errno(EFAULT);
@@ -3301,7 +3349,7 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
             0
         }
         (SOL_PACKET, PACKET_AUXDATA) if sock.is_packet() => {
-            let val = match read_opt_i32(memory, optval, optlen) {
+            let val = match read_opt_i32(memory, optval, optlen).await {
                 Ok(v) => v,
                 Err(err) => return errno(err),
             };
@@ -3311,7 +3359,7 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
         | (SOL_SOCKET, SO_SNDBUF)
         | (SOL_SOCKET, SO_RCVLOWAT)
         | (SOL_SOCKET, SO_SNDLOWAT) => {
-            let val = match read_opt_i32(memory, optval, optlen) {
+            let val = match read_opt_i32(memory, optval, optlen).await {
                 Ok(v) if v >= 0 => v as u64,
                 Ok(_) => return errno(EINVAL),
                 Err(err) => return errno(err),
@@ -3329,7 +3377,7 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
             }
         }
         (IPPROTO_IP, IP_TTL) | (IPPROTO_IPV6, IPV6_UNICAST_HOPS) => {
-            let val = match read_opt_i32(memory, optval, optlen) {
+            let val = match read_opt_i32(memory, optval, optlen).await {
                 Ok(-1) => 64u64,
                 Ok(v) if (1..=255).contains(&v) => v as u64,
                 Ok(_) => return errno(EINVAL),
@@ -3344,7 +3392,7 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
             }
         }
         (IPPROTO_IP, IP_MULTICAST_TTL) => {
-            let val = match read_opt_i32_or_u8(memory, optval, optlen) {
+            let val = match read_opt_i32_or_u8(memory, optval, optlen).await {
                 Ok(-1) => 1u64,
                 Ok(v) if (0..=255).contains(&v) => v as u64,
                 Ok(_) => return errno(EINVAL),
@@ -3360,7 +3408,7 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
                 return errno(EINVAL);
             }
             let mut raw = [0u8; 16];
-            if memory.read(optval, &mut raw).is_err() {
+            if memory.read(optval, &mut raw).await.is_err() {
                 return errno(EFAULT);
             }
             let sec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
@@ -3390,7 +3438,7 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
                 return errno(EINVAL);
             }
             let mut raw = [0u8; 8];
-            if memory.read(optval, &mut raw).is_err() {
+            if memory.read(optval, &mut raw).await.is_err() {
                 return errno(EFAULT);
             }
             let onoff = i32::from_le_bytes(raw[0..4].try_into().unwrap());
@@ -3414,7 +3462,7 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
                 return errno(EINVAL);
             }
             let mut raw = [0u8; 8];
-            if memory.read(optval, &mut raw).is_err() {
+            if memory.read(optval, &mut raw).await.is_err() {
                 return errno(EFAULT);
             }
             let group = [raw[0], raw[1], raw[2], raw[3]];
@@ -3437,7 +3485,7 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
                 return errno(EINVAL);
             }
             let mut raw = [0u8; 20];
-            if memory.read(optval, &mut raw).is_err() {
+            if memory.read(optval, &mut raw).await.is_err() {
                 return errno(EFAULT);
             }
             match net.check_multicast_v6() {
@@ -3471,7 +3519,7 @@ pub(crate) async fn getsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
         (SOL_SOCKET, SO_ERROR) => {
             let _ = poll_connecting(&sock, net).await;
             let err = sock.take_pending_error();
-            match write_opt_bytes(memory, optval, optlen_ptr, &err.to_le_bytes()) {
+            match write_opt_bytes(memory, optval, optlen_ptr, &err.to_le_bytes()).await {
                 Ok(()) => 0,
                 Err(e) => errno(e),
             }
@@ -3482,7 +3530,7 @@ pub(crate) async fn getsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
                 SocketKind::Datagram => SOCK_DGRAM as i32,
                 SocketKind::Raw => SOCK_RAW as i32,
             };
-            match write_opt_bytes(memory, optval, optlen_ptr, &ty.to_le_bytes()) {
+            match write_opt_bytes(memory, optval, optlen_ptr, &ty.to_le_bytes()).await {
                 Ok(()) => 0,
                 Err(e) => errno(e),
             }
@@ -3503,7 +3551,7 @@ pub(crate) async fn getsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
                     None => 0,
                 }
             };
-            match write_opt_bytes(memory, optval, optlen_ptr, &proto.to_le_bytes()) {
+            match write_opt_bytes(memory, optval, optlen_ptr, &proto.to_le_bytes()).await {
                 Ok(()) => 0,
                 Err(e) => errno(e),
             }
@@ -3522,7 +3570,7 @@ pub(crate) async fn getsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
                     None => i32::from(AF_UNIX),
                 }
             };
-            match write_opt_bytes(memory, optval, optlen_ptr, &domain.to_le_bytes()) {
+            match write_opt_bytes(memory, optval, optlen_ptr, &domain.to_le_bytes()).await {
                 Ok(()) => 0,
                 Err(e) => errno(e),
             }
@@ -3532,7 +3580,7 @@ pub(crate) async fn getsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
                 matches!(sock.tcp_state(), Some(TcpSocket::Listening { .. }))
                     || matches!(sock.vsock_state(), Some(VsockSocket::Listening { .. })),
             );
-            match write_opt_bytes(memory, optval, optlen_ptr, &listening.to_le_bytes()) {
+            match write_opt_bytes(memory, optval, optlen_ptr, &listening.to_le_bytes()).await {
                 Ok(()) => 0,
                 Err(e) => errno(e),
             }
@@ -3564,7 +3612,7 @@ pub(crate) async fn getsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
                 _ => unreachable!(),
             };
             let val: i32 = i32::from(options.flag(flag));
-            match write_opt_bytes(memory, optval, optlen_ptr, &val.to_le_bytes()) {
+            match write_opt_bytes(memory, optval, optlen_ptr, &val.to_le_bytes()).await {
                 Ok(()) => 0,
                 Err(e) => errno(e),
             }
@@ -3586,7 +3634,7 @@ pub(crate) async fn getsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
                 _ => unreachable!(),
             };
             let val = options.size(size).min(i32::MAX as u64) as i32;
-            match write_opt_bytes(memory, optval, optlen_ptr, &val.to_le_bytes()) {
+            match write_opt_bytes(memory, optval, optlen_ptr, &val.to_le_bytes()).await {
                 Ok(()) => 0,
                 Err(e) => errno(e),
             }
@@ -3603,7 +3651,7 @@ pub(crate) async fn getsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
             let mut raw = [0u8; 16];
             raw[0..8].copy_from_slice(&sec.to_le_bytes());
             raw[8..16].copy_from_slice(&usec.to_le_bytes());
-            match write_opt_bytes(memory, optval, optlen_ptr, &raw) {
+            match write_opt_bytes(memory, optval, optlen_ptr, &raw).await {
                 Ok(()) => 0,
                 Err(e) => errno(e),
             }
@@ -3615,7 +3663,9 @@ pub(crate) async fn getsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
                 optval,
                 optlen_ptr,
                 &i32::from(enabled).to_le_bytes(),
-            ) {
+            )
+            .await
+            {
                 Ok(()) => 0,
                 Err(e) => errno(e),
             }
@@ -3626,7 +3676,7 @@ pub(crate) async fn getsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
                 raw[0..4].copy_from_slice(&1i32.to_le_bytes());
                 raw[4..8].copy_from_slice(&((nanos / 1_000_000_000) as i32).to_le_bytes());
             }
-            match write_opt_bytes(memory, optval, optlen_ptr, &raw) {
+            match write_opt_bytes(memory, optval, optlen_ptr, &raw).await {
                 Ok(()) => 0,
                 Err(e) => errno(e),
             }

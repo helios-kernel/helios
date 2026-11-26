@@ -10,13 +10,19 @@ command = "nu"
 [dependencies]
 async-channel = { version = "2.5.0", default-features = false }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+futures-io = { version = "0.3.34", default-features = false, features = ["std"] }
 futures-lite = { version = "2.6.1", default-features = false, features = ["alloc"] }
 helios-api = { path = "../../api", default-features = false, features = [
+    "btrfs",
     "fs",
     "http",
+    "hv",
     "inspect",
     "instances",
     "io",
+    "ipc",
+    "mounts",
+    "oci",
     "processors",
     "profiling",
     "programs",
@@ -24,7 +30,11 @@ helios-api = { path = "../../api", default-features = false, features = [
     "task",
 ] }
 helios-nu = { workspace = true }
+helios-oci = { workspace = true }
+helios-vmm = { workspace = true }
+helios-wit-rpc = { workspace = true, default-features = false, features = ["inspector-rpc"] }
 nu-protocol = { version = "=0.117.0", default-features = false }
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
 thiserror = { version = "2.0.21", default-features = false }
 tracing = { workspace = true }
 

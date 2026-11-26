@@ -3676,10 +3676,15 @@ version = "0.1.0"
 dependencies = [
  "async-channel",
  "chrono",
+ "futures-io",
  "futures-lite",
  "helios-api",
  "helios-nu",
+ "helios-oci",
+ "helios-vmm",
+ "helios-wit-rpc",
  "nu-protocol",
+ "serde_json",
  "thiserror 2.0.21",
  "tracing",
 ]

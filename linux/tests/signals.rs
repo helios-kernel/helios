@@ -95,36 +95,39 @@ impl Mem {
 }
 
 impl UserMemory for Mem {
-    fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+    async fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
         let r = self.range(address, output.len())?;
         output.copy_from_slice(&self.bytes.lock().unwrap()[r]);
         Ok(())
     }
-    fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
+    async fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
         self.range(address, length).map(|_| ())
     }
-    fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
+    async fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
         let r = self.range(address, bytes.len())?;
         self.bytes.lock().unwrap()[r].copy_from_slice(bytes);
         Ok(())
     }
-    fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
-        let mut b = [0; 4];
-        self.read(address, &mut b)?;
-        Ok(u32::from_le_bytes(b))
+    async fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+        self.try_atomic_load_u32(address)?.ok_or(MemoryFault)
     }
-    fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
-        self.write(address, &value.to_le_bytes())
+    fn try_atomic_load_u32(&self, address: u64) -> Result<Option<u32>, MemoryFault> {
+        let r = self.range(address, 4)?;
+        let b: [u8; 4] = self.bytes.lock().unwrap()[r].try_into().unwrap();
+        Ok(Some(u32::from_le_bytes(b)))
     }
-    fn atomic_compare_exchange_u32(
+    async fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+        self.write(address, &value.to_le_bytes()).await
+    }
+    async fn atomic_compare_exchange_u32(
         &mut self,
         address: u64,
         expected: u32,
         desired: u32,
     ) -> Result<Result<u32, u32>, MemoryFault> {
-        let cur = self.atomic_load_u32(address)?;
+        let cur = self.atomic_load_u32(address).await?;
         if cur == expected {
-            self.atomic_store_u32(address, desired)?;
+            self.atomic_store_u32(address, desired).await?;
             Ok(Ok(cur))
         } else {
             Ok(Err(cur))
@@ -370,6 +373,14 @@ unsafe impl UserContext for FakeContext {
 
 fn poll_once<F: Future>(fut: &mut core::pin::Pin<&mut F>) -> Poll<F::Output> {
     fut.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+}
+
+fn ready<F: Future>(fut: F) -> F::Output {
+    let mut fut = core::pin::pin!(fut);
+    match poll_once(&mut fut) {
+        Poll::Ready(out) => out,
+        Poll::Pending => panic!("expected Ready"),
+    }
 }
 
 fn call_now(
@@ -733,12 +744,12 @@ fn restart_vs_eintr_sigsuspend_and_fault_delivery_both_abis() {
         let mut ctx = FakeContext::new(abi, 0x10_8000, 0x40_1004);
         proc.raise_external_signal(Signal::SIGUSR1);
         assert_eq!(
-            proc.deliver_pending_signals(
+            ready(proc.deliver_pending_signals(
                 &mut ctx,
                 &mut mem,
                 Some(SyscallRestart::RestartSys { orig_reg: 99 }),
                 0x70_0000
-            ),
+            )),
             SignalDelivery::Delivered
         );
         // Simulate handler returning via rt_sigreturn.
@@ -746,7 +757,7 @@ fn restart_vs_eintr_sigsuspend_and_fault_delivery_both_abis() {
             let sp = ctx.register(RegisterId::X86Gpr(4)).unwrap();
             ctx.set_register(RegisterId::X86Gpr(4), sp + 8).unwrap();
         }
-        proc.restore_signal_frame(&mut ctx, &mem).unwrap();
+        ready(proc.restore_signal_frame(&mut ctx, &mem)).unwrap();
         assert_eq!(
             ctx.register(abi.program_counter_register()).unwrap(),
             0x40_1004 - abi.syscall_instruction_bytes()
@@ -760,19 +771,19 @@ fn restart_vs_eintr_sigsuspend_and_fault_delivery_both_abis() {
         let mut ctx = FakeContext::new(abi, 0x10_8000, 0x40_2004);
         proc.raise_external_signal(Signal::SIGUSR2);
         assert_eq!(
-            proc.deliver_pending_signals(
+            ready(proc.deliver_pending_signals(
                 &mut ctx,
                 &mut mem,
                 Some(SyscallRestart::RestartSys { orig_reg: 77 }),
                 0x70_0000
-            ),
+            )),
             SignalDelivery::Delivered
         );
         if abi == Abi::X86_64 {
             let sp = ctx.register(RegisterId::X86Gpr(4)).unwrap();
             ctx.set_register(RegisterId::X86Gpr(4), sp + 8).unwrap();
         }
-        proc.restore_signal_frame(&mut ctx, &mem).unwrap();
+        ready(proc.restore_signal_frame(&mut ctx, &mem)).unwrap();
         assert_eq!(
             ctx.register(abi.program_counter_register()).unwrap(),
             0x40_2004
@@ -786,19 +797,19 @@ fn restart_vs_eintr_sigsuspend_and_fault_delivery_both_abis() {
         let mut ctx = FakeContext::new(abi, 0x10_8000, 0x40_3004);
         proc.raise_external_signal(Signal::SIGUSR1);
         assert_eq!(
-            proc.deliver_pending_signals(
+            ready(proc.deliver_pending_signals(
                 &mut ctx,
                 &mut mem,
                 Some(SyscallRestart::RestartNoHand { orig_reg: 34 }),
                 0x70_0000
-            ),
+            )),
             SignalDelivery::Delivered
         );
         if abi == Abi::X86_64 {
             let sp = ctx.register(RegisterId::X86Gpr(4)).unwrap();
             ctx.set_register(RegisterId::X86Gpr(4), sp + 8).unwrap();
         }
-        proc.restore_signal_frame(&mut ctx, &mem).unwrap();
+        ready(proc.restore_signal_frame(&mut ctx, &mem)).unwrap();
         assert_eq!(
             ctx.register(abi.system_call_registers().result).unwrap(),
             err(EINTR)
@@ -833,7 +844,7 @@ fn restart_vs_eintr_sigsuspend_and_fault_delivery_both_abis() {
         };
         let mut ctx = FakeContext::new(abi, 0x10_8000, 0x40_4000);
         assert_eq!(
-            proc.deliver_fault_signal(fault, &mut ctx, &mut mem, 0x70_0000),
+            ready(proc.deliver_fault_signal(fault, &mut ctx, &mut mem, 0x70_0000)),
             SignalDelivery::Delivered
         );
         // Check `siginfo_t` carries `SEGV_ACCERR` and `si_addr = 0x12_3456`.
@@ -847,7 +858,7 @@ fn restart_vs_eintr_sigsuspend_and_fault_delivery_both_abis() {
 
         // SA_RESETHAND reset SIGSEGV to SIG_DFL -> second fault terminates!
         assert_eq!(
-            proc.deliver_fault_signal(fault, &mut ctx, &mut mem, 0x70_0000),
+            ready(proc.deliver_fault_signal(fault, &mut ctx, &mut mem, 0x70_0000)),
             SignalDelivery::Terminated {
                 signal: Signal::SIGSEGV,
                 core_dumped: true,

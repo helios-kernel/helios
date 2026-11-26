@@ -1240,7 +1240,7 @@ pub(super) async fn clone<
         if let Err(err) = validate_thread_flag_combinations(flags) {
             return errno(err);
         }
-        spawn_parsed_clone(process, parsed, memory, thread)
+        spawn_parsed_clone(process, parsed, memory, thread).await
     } else {
         let exit_signal = match super::process::validate_process_clone_flags(flags, exit_signal_raw)
         {
@@ -1277,7 +1277,7 @@ pub(super) async fn clone3<
     }
     let known = (size as usize).min(CLONE_ARGS_SIZE_VER2);
     let mut raw = [0u8; CLONE_ARGS_SIZE_VER2];
-    if memory.read(uargs, &mut raw[..known]).is_err() {
+    if memory.read(uargs, &mut raw[..known]).await.is_err() {
         return errno(EFAULT);
     }
     if size as usize > CLONE_ARGS_SIZE_VER2 {
@@ -1285,6 +1285,7 @@ pub(super) async fn clone3<
         let mut tail = vec![0u8; extra];
         if memory
             .read(uargs + CLONE_ARGS_SIZE_VER2 as u64, &mut tail)
+            .await
             .is_err()
         {
             return errno(EFAULT);
@@ -1335,7 +1336,7 @@ pub(super) async fn clone3<
         if let Err(err) = validate_thread_flag_combinations(flags) {
             return errno(err);
         }
-        spawn_parsed_clone(process, parsed, memory, thread)
+        spawn_parsed_clone(process, parsed, memory, thread).await
     } else {
         let exit_sig = match super::process::validate_process_clone_flags(flags, exit_signal) {
             Ok(sig) => sig,
@@ -1345,19 +1346,19 @@ pub(super) async fn clone3<
     }
 }
 
-pub(super) fn write_tid<M: UserMemory>(
+pub(super) async fn write_tid<M: UserMemory>(
     address: u64,
     tid: u32,
     memory: &mut M,
 ) -> Result<(), MemoryFault> {
     if address & 3 == 0 {
-        memory.atomic_store_u32(address, tid)
+        memory.atomic_store_u32(address, tid).await
     } else {
-        memory.write(address, &tid.to_le_bytes())
+        memory.write(address, &tid.to_le_bytes()).await
     }
 }
 
-fn spawn_parsed_clone<R: Resources, M: UserMemory, T: Thread<R>>(
+async fn spawn_parsed_clone<R: Resources, M: UserMemory, T: Thread<R>>(
     process: &Process<R>,
     parsed: ParsedClone,
     memory: &mut M,
@@ -1384,13 +1385,15 @@ fn spawn_parsed_clone<R: Resources, M: UserMemory, T: Thread<R>>(
             Err(err) => return errno(err),
         };
     if parsed.flags & CLONE_PARENT_SETTID != 0
-        && write_tid(parsed.parent_tid, tid.get(), memory).is_err()
+        && write_tid(parsed.parent_tid, tid.get(), memory)
+            .await
+            .is_err()
     {
         process.shared.threads.lock().withdraw(tid);
         return errno(EFAULT);
     }
     if parsed.flags & CLONE_CHILD_SETTID != 0 {
-        let _ = write_tid(parsed.child_tid, tid.get(), memory);
+        let _ = write_tid(parsed.child_tid, tid.get(), memory).await;
     }
     // Child thread inherits the caller's signal mask and starts with an empty
     // private pending set and disabled alternate stack (`kernel/fork.c`).
@@ -1484,7 +1487,7 @@ fn resolve_sched_target<R: Resources>(
 ///
 /// Raw kernel syscall returns the byte length written to `mask` (a multiple
 /// of `sizeof(unsigned long)`), which libc uses to zero any trailing bytes.
-pub(super) fn sched_getaffinity<R: Resources, M: UserMemory, O: System>(
+pub(super) async fn sched_getaffinity<R: Resources, M: UserMemory, O: System>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -1520,14 +1523,14 @@ pub(super) fn sched_getaffinity<R: Resources, M: UserMemory, O: System>(
             mask[i * 8..(i + 1) * 8].copy_from_slice(&w.to_le_bytes());
         }
     }
-    if memory.write(args[2], &mask).is_err() {
+    if memory.write(args[2], &mask).await.is_err() {
         return errno(EFAULT);
     }
     required as u64
 }
 
 /// `sched_setaffinity(pid, cpusetsize, mask)` (`kernel/sched/syscalls.c`).
-pub(super) fn sched_setaffinity<R: Resources, M: UserMemory, O: System>(
+pub(super) async fn sched_setaffinity<R: Resources, M: UserMemory, O: System>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &M,
@@ -1543,7 +1546,7 @@ pub(super) fn sched_setaffinity<R: Resources, M: UserMemory, O: System>(
     let words = cpus.div_ceil(64);
     let read_len = len.min(words * 8);
     let mut raw = vec![0u8; read_len];
-    if memory.read(mask_ptr, &mut raw).is_err() {
+    if memory.read(mask_ptr, &mut raw).await.is_err() {
         return errno(EFAULT);
     }
     if pid < 0 {
@@ -1628,7 +1631,7 @@ pub(super) fn sched_getscheduler<R: Resources>(process: &Process<R>, args: [u64;
 }
 
 /// `sched_setscheduler(pid, policy, param)` (`kernel/sched/syscalls.c`).
-pub(super) fn sched_setscheduler<R: Resources, M: UserMemory>(
+pub(super) async fn sched_setscheduler<R: Resources, M: UserMemory>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &M,
@@ -1640,7 +1643,7 @@ pub(super) fn sched_setscheduler<R: Resources, M: UserMemory>(
         return errno(EINVAL);
     }
     let mut raw = [0u8; 4];
-    if memory.read(param_ptr, &mut raw).is_err() {
+    if memory.read(param_ptr, &mut raw).await.is_err() {
         return errno(EFAULT);
     }
     let prio = i32::from_le_bytes(raw);
@@ -1674,7 +1677,7 @@ pub(super) fn sched_setscheduler<R: Resources, M: UserMemory>(
 }
 
 /// `sched_getparam(pid, param)` (`kernel/sched/syscalls.c`).
-pub(super) fn sched_getparam<R: Resources, M: UserMemory>(
+pub(super) async fn sched_getparam<R: Resources, M: UserMemory>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -1689,14 +1692,14 @@ pub(super) fn sched_getparam<R: Resources, M: UserMemory>(
         Err(err) => return errno(err),
     };
     let prio = sched_arc.lock().priority;
-    if memory.write(param_ptr, &prio.to_le_bytes()).is_err() {
+    if memory.write(param_ptr, &prio.to_le_bytes()).await.is_err() {
         return errno(EFAULT);
     }
     0
 }
 
 /// `sched_setparam(pid, param)` (`kernel/sched/syscalls.c`).
-pub(super) fn sched_setparam<R: Resources, M: UserMemory>(
+pub(super) async fn sched_setparam<R: Resources, M: UserMemory>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &M,
@@ -1707,7 +1710,7 @@ pub(super) fn sched_setparam<R: Resources, M: UserMemory>(
         return errno(EINVAL);
     }
     let mut raw = [0u8; 4];
-    if memory.read(param_ptr, &mut raw).is_err() {
+    if memory.read(param_ptr, &mut raw).await.is_err() {
         return errno(EFAULT);
     }
     let prio = i32::from_le_bytes(raw);
@@ -1964,7 +1967,7 @@ pub(super) async fn clock_nanosleep<M: UserMemory, O: Clock + System>(
         _ => return errno(EINVAL),
     };
     let mut bytes = [0u8; 16];
-    if memory.read(args[2], &mut bytes).is_err() {
+    if memory.read(args[2], &mut bytes).await.is_err() {
         return errno(EFAULT);
     }
     let sec = i64::from_le_bytes(bytes[..8].try_into().unwrap());
@@ -2005,7 +2008,7 @@ pub(super) async fn clock_nanosleep<M: UserMemory, O: Clock + System>(
                 let mut out = [0u8; 16];
                 out[..8].copy_from_slice(&(remaining / NANOS_PER_SECOND).to_le_bytes());
                 out[8..].copy_from_slice(&(remaining % NANOS_PER_SECOND).to_le_bytes());
-                if memory.write(rem_ptr, &out).is_err() {
+                if memory.write(rem_ptr, &out).await.is_err() {
                     return errno(EFAULT);
                 }
             }

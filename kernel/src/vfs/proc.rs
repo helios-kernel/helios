@@ -196,6 +196,8 @@ pub struct ProcProcessRecord {
     pub stime_ticks: u64,
     pub vm_size_bytes: u64,
     pub vm_rss_bytes: u64,
+    pub vm_swap_bytes: u64,
+    pub swap_space_id: u64,
     pub maps: Vec<ProcMapEntry>,
     pub limits: Vec<ProcLimitEntry>,
     pub fds: Vec<ProcFdEntry>,
@@ -235,6 +237,8 @@ impl ProcProcessRecord {
             stime_ticks: 0,
             vm_size_bytes: 0,
             vm_rss_bytes: 0,
+            vm_swap_bytes: 0,
+            swap_space_id: 0,
             maps: Vec::new(),
             limits: default_proc_limits(),
             fds: Vec::new(),
@@ -386,6 +390,12 @@ impl ProcRegistry {
 
     pub fn update_process(&self, pid: u32, update: impl FnOnce(&mut ProcProcessRecord)) {
         if let Some(record) = self.inner.processes.lock().get_mut(&pid) {
+            update(record);
+        }
+    }
+
+    pub fn update_all_processes(&self, mut update: impl FnMut(&mut ProcProcessRecord)) {
+        for record in self.inner.processes.lock().values_mut() {
             update(record);
         }
     }
@@ -1374,6 +1384,7 @@ fn render_pid_status(rec: &ProcProcessRecord, thread: Option<&ProcThreadRecord>)
     let creds = &rec.credentials;
     let vm_size_kb = rec.vm_size_bytes / 1024;
     let vm_rss_kb = rec.vm_rss_bytes / 1024;
+    let vm_swap_kb = rec.vm_swap_bytes / 1024;
     let mut out = String::new();
     let _ = writeln!(out, "Name:\t{comm}");
     let _ = writeln!(out, "Umask:\t{:04o}", rec.umask);
@@ -1406,6 +1417,7 @@ fn render_pid_status(rec: &ProcProcessRecord, thread: Option<&ProcThreadRecord>)
     let _ = writeln!(out, "VmPeak:\t{:>8} kB", vm_size_kb);
     let _ = writeln!(out, "VmSize:\t{:>8} kB", vm_size_kb);
     let _ = writeln!(out, "VmRSS:\t{:>8} kB", vm_rss_kb);
+    let _ = writeln!(out, "VmSwap:\t{:>8} kB", vm_swap_kb);
     let _ = writeln!(out, "Threads:\t{}", rec.threads.len().max(1));
     let _ = writeln!(out, "CapInh:\t{:016x}", creds.capabilities.inheritable);
     let _ = writeln!(out, "CapPrm:\t{:016x}", creds.capabilities.permitted);
@@ -1886,6 +1898,23 @@ mod tests {
                 "expected None for parse_proc_fd_path({path:?})"
             );
         }
+    }
+
+    #[test]
+    fn proc_pid_status_renders_vm_swap_kb() {
+        let mut rec = ProcProcessRecord::minimal(42, 1, "worker", "/bin/worker");
+        rec.vm_size_bytes = 256 * 1024;
+        rec.vm_rss_bytes = 64 * 1024;
+        rec.vm_swap_bytes = 32 * 1024;
+        let status = render_pid_status(&rec, None);
+        assert!(
+            status.contains("VmRSS:\t      64 kB\n"),
+            "status:\n{status}"
+        );
+        assert!(
+            status.contains("VmSwap:\t      32 kB\n"),
+            "status:\n{status}"
+        );
     }
 
     #[test]

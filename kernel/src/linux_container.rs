@@ -5866,42 +5866,47 @@ mod private_btrfs_tests {
         }
     }
     impl UserMemory for TestMem {
-        fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+        async fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
             for (i, slot) in output.iter_mut().enumerate() {
                 *slot = *self.0.get(&(address + i as u64)).ok_or(MemoryFault)?;
             }
             Ok(())
         }
-        fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
+        async fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
             if address == 0 && length > 0 {
                 return Err(MemoryFault);
             }
             Ok(())
         }
-        fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
+        async fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
             if address == 0 {
                 return Err(MemoryFault);
             }
             self.write_bytes(address, bytes);
             Ok(())
         }
-        fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+        async fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+            self.try_atomic_load_u32(address)?.ok_or(MemoryFault)
+        }
+        fn try_atomic_load_u32(&self, address: u64) -> Result<Option<u32>, MemoryFault> {
             let mut raw = [0u8; 4];
-            self.read(address, &mut raw)?;
-            Ok(u32::from_le_bytes(raw))
+            for (i, slot) in raw.iter_mut().enumerate() {
+                *slot = *self.0.get(&(address + i as u64)).ok_or(MemoryFault)?;
+            }
+            Ok(Some(u32::from_le_bytes(raw)))
         }
-        fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
-            self.write(address, &value.to_le_bytes())
+        async fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+            self.write(address, &value.to_le_bytes()).await
         }
-        fn atomic_compare_exchange_u32(
+        async fn atomic_compare_exchange_u32(
             &mut self,
             address: u64,
             expected: u32,
             desired: u32,
         ) -> Result<Result<u32, u32>, MemoryFault> {
-            let cur = self.atomic_load_u32(address)?;
+            let cur = self.atomic_load_u32(address).await?;
             if cur == expected {
-                self.atomic_store_u32(address, desired)?;
+                self.atomic_store_u32(address, desired).await?;
                 Ok(Ok(cur))
             } else {
                 Ok(Err(cur))
@@ -8175,7 +8180,7 @@ mod private_btrfs_tests {
                     0
                 );
                 let mut cap_data = [0u8; 24];
-                mem.read(0x4710, &mut cap_data).unwrap();
+                mem.read(0x4710, &mut cap_data).await.unwrap();
                 let eff_lo = u32::from_le_bytes(cap_data[0..4].try_into().unwrap()) as u64;
                 let eff_hi = u32::from_le_bytes(cap_data[12..16].try_into().unwrap()) as u64;
                 let perm_lo = u32::from_le_bytes(cap_data[4..8].try_into().unwrap()) as u64;
@@ -8774,7 +8779,7 @@ mod private_btrfs_tests {
             }
         }
         impl UserMemory for FlatMem {
-            fn read(
+            async fn read(
                 &self,
                 addr: u64,
                 out: &mut [u8],
@@ -8786,7 +8791,7 @@ mod private_btrfs_tests {
                 out.copy_from_slice(&self.bytes[start..start + out.len()]);
                 Ok(())
             }
-            fn check_writable(
+            async fn check_writable(
                 &self,
                 addr: u64,
                 len: usize,
@@ -8796,7 +8801,7 @@ mod private_btrfs_tests {
                 }
                 Ok(())
             }
-            fn write(
+            async fn write(
                 &mut self,
                 addr: u64,
                 data: &[u8],
@@ -8808,30 +8813,41 @@ mod private_btrfs_tests {
                 self.bytes[start..start + data.len()].copy_from_slice(data);
                 Ok(())
             }
-            fn atomic_load_u32(
+            async fn atomic_load_u32(
                 &self,
                 addr: u64,
             ) -> Result<u32, helios_linux::syscall::MemoryFault> {
-                let mut raw = [0u8; 4];
-                self.read(addr, &mut raw)?;
-                Ok(u32::from_le_bytes(raw))
+                self.try_atomic_load_u32(addr)?
+                    .ok_or(helios_linux::syscall::MemoryFault)
             }
-            fn atomic_store_u32(
+            fn try_atomic_load_u32(
+                &self,
+                addr: u64,
+            ) -> Result<Option<u32>, helios_linux::syscall::MemoryFault> {
+                let start = addr as usize;
+                if start + 4 > self.bytes.len() {
+                    return Err(helios_linux::syscall::MemoryFault);
+                }
+                Ok(Some(u32::from_le_bytes(
+                    self.bytes[start..start + 4].try_into().unwrap(),
+                )))
+            }
+            async fn atomic_store_u32(
                 &mut self,
                 addr: u64,
                 val: u32,
             ) -> Result<(), helios_linux::syscall::MemoryFault> {
-                self.write(addr, &val.to_le_bytes())
+                self.write(addr, &val.to_le_bytes()).await
             }
-            fn atomic_compare_exchange_u32(
+            async fn atomic_compare_exchange_u32(
                 &mut self,
                 addr: u64,
                 expected: u32,
                 desired: u32,
             ) -> Result<Result<u32, u32>, helios_linux::syscall::MemoryFault> {
-                let cur = self.atomic_load_u32(addr)?;
+                let cur = self.atomic_load_u32(addr).await?;
                 if cur == expected {
-                    self.atomic_store_u32(addr, desired)?;
+                    self.atomic_store_u32(addr, desired).await?;
                     Ok(Ok(cur))
                 } else {
                     Ok(Err(cur))

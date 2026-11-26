@@ -125,7 +125,7 @@ unsafe impl Send for X86Tables {}
 pub type X86Space = NativeSpace<X86Tables>;
 
 fn page_table_flags(flags: PageFlags) -> PageTableFlags {
-    let mut table = PageTableFlags::PRESENT;
+    let mut table = PageTableFlags::PRESENT | PageTableFlags::ACCESSED;
     if !flags.is_empty() {
         table |= PageTableFlags::USER_ACCESSIBLE;
     }
@@ -143,6 +143,33 @@ impl X86Tables {
         // SAFETY: the root and every lower-half table are owned by this
         // space, and the kernel direct map reaches each of them.
         unsafe { OffsetPageTable::new(&mut self.root, X86VirtAddr::new(self.tables.offset as u64)) }
+    }
+
+    fn leaf_entry_atomic(&self, base: u64) -> Option<&AtomicU64> {
+        const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+        let present = PageTableFlags::PRESENT.bits();
+        let huge = PageTableFlags::HUGE_PAGE.bits();
+        let mut table = (&*self.root as *const PageTable).cast::<AtomicU64>();
+        for shift in [39_u32, 30, 21] {
+            let index = ((base >> shift) & 0x1ff) as usize;
+            // SAFETY: `table` points to a 512-entry `PageTable` and `index < 512`.
+            let slot = unsafe { table.add(index) };
+            // SAFETY: `slot` is an aligned entry in a live `PageTable` owned by
+            // this space under its lock.
+            let entry = unsafe { &*slot };
+            let bits = entry.load(Ordering::Acquire);
+            if bits & present == 0 || bits & huge != 0 {
+                return None;
+            }
+            let phys = (bits & ADDR_MASK) as usize;
+            table = (phys + self.tables.offset) as *const AtomicU64;
+        }
+        let index = ((base >> 12) & 0x1ff) as usize;
+        // SAFETY: `table` points to a 512-entry L1 `PageTable` and `index < 512`.
+        let slot = unsafe { table.add(index) };
+        // SAFETY: `slot` is an aligned entry in a live L1 `PageTable` owned by
+        // this space under its lock.
+        Some(unsafe { &*slot })
     }
 }
 
@@ -234,6 +261,20 @@ unsafe impl UserTranslation for X86Tables {
         };
         tables.sync_kernel_half();
         Ok(tables)
+    }
+
+    fn test_and_clear_accessed(&mut self, base: u64) -> bool {
+        let Some(entry) = self.leaf_entry_atomic(base) else {
+            return false;
+        };
+        let bits = entry.load(Ordering::Acquire);
+        if bits & PageTableFlags::PRESENT.bits() == 0 {
+            return false;
+        }
+        // Hardware may concurrently set `ACCESSED` or `DIRTY`; an atomic AND
+        // clears only `ACCESSED` without losing `DIRTY`.
+        let previous = entry.fetch_and(!PageTableFlags::ACCESSED.bits(), Ordering::AcqRel);
+        previous & PageTableFlags::ACCESSED.bits() != 0
     }
 }
 
