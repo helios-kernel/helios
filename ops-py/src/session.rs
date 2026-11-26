@@ -3,10 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use helios_wit_rpc::inspector::helios::system::tracing as sys_tracing;
 use helios_ops::{
     Attenuation, DiagnosticBundle, GrantRight, OpsError, Session, SpawnRequest, TargetStore,
 };
+use helios_wit_rpc::inspector::helios::system::tracing as sys_tracing;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -49,7 +49,18 @@ impl PySession {
                 store.resolve(None).map_err(target_err_to_py)?
             }
         };
-        let options = build_session_options(timeout_secs, scope, only, identity)?;
+        let effective_identity = identity.or_else(|| resolved_target.identity.clone());
+        let allow_ambient_auth = !matches!(
+            resolved_target.parsed_uri(),
+            Ok(helios_ops::TargetUri::Helios { tls: false, .. })
+        );
+        let options = build_session_options(
+            timeout_secs,
+            scope,
+            only,
+            effective_identity,
+            allow_ambient_auth,
+        )?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let session = Session::connect(&resolved_target, options)
                 .await

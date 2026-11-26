@@ -207,29 +207,13 @@ impl RpcConnection {
                     })?;
                     Ok(Self::from_split(Box::new(read), Box::new(write)))
                 } else {
-                    let (mut read, mut write) = open_tcp(host, *port).await?;
-                    if let SecurityMode::Authenticated {
-                        identity,
-                        expected_machine_public_key,
-                    } = security
-                    {
-                        client_handshake(
-                            &mut read,
-                            &mut write,
-                            TransportKind::Vsock,
-                            identity,
-                            *expected_machine_public_key,
-                            None,
-                            None,
-                        )
-                        .await
-                        .map_err(|source| {
-                            TransportError::AuthHandshake {
-                                endpoint: uri.to_uri_string(),
-                                source,
-                            }
-                        })?;
+                    if matches!(security, SecurityMode::Authenticated { .. }) {
+                        return Err(TransportError::PlainTcpAuthUnsupported {
+                            host: host.clone(),
+                            port: *port,
+                        });
                     }
+                    let (read, write) = open_tcp(host, *port).await?;
                     Ok(Self::from_split(read, write))
                 }
             }

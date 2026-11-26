@@ -111,6 +111,17 @@ async def _open_context(cfg: CliContextConfig) -> tuple[helios.Session | None, h
         )
         return session, None
 
+    store = helios.TargetStore.load(cfg.targets_path)
+    if store.default_target_name is not None:
+        session = await helios.connect(
+            None,
+            scope=cfg.scope,
+            only=cfg.only,
+            identity=cfg.identity,
+            targets_path=cfg.targets_path,
+        )
+        return session, None
+
     return None, None
 
 
@@ -175,9 +186,7 @@ def _run_code_sync_or_async(
         asyncio.run(_run_code_async(source, filename, cfg, argv))
         return 0
 
-    session, fleet_obj = (None, None)
-    if cfg.target is not None or cfg.labels:
-        session, fleet_obj = asyncio.run(_open_context(cfg))
+    session, fleet_obj = asyncio.run(_open_context(cfg))
     ns = _build_namespace(session, fleet_obj, cfg)
     if filename != "<string>":
         ns["__file__"] = filename
