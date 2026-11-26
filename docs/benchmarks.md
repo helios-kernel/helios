@@ -331,16 +331,16 @@ either on `vm` (before the session action runs) or on `tracing`
 (before the stream starts):
 
 ```bash
-helios-inspector vm --arch x86-64 --release --accel kvm \
+helios vm --arch x86-64 --release --accel kvm \
     --boot-program dash --boot-program debugger --boot-program python3 \
     --no-compiler-plugin \
     --enable-target helios_kernel::exec::phases \
-    shell -c 'python3 -c "print(1)"; python3 -c "print(2)"'
+    shell --shell /bin/dash -c 'python3 -c "print(1)"; python3 -c "print(2)"'
 ```
 
 The lines land on the debug serial line, so `<runtime>/debug-serial.log`
 (docs/debug-serial.md) holds them — it carries console escape bytes, so
-grep it with `-a`. The same target streamed live is `helios-inspector
+grep it with `-a`. The same target streamed live is `helios
 tracing --enable-target helios_kernel::exec::phases --min-level debug
 --target-prefix helios_kernel::exec::phases`.
 
@@ -816,7 +816,7 @@ boot.
 
 Two checkouts that turn out to be one build are refused before the first
 boot: the suite asks the inspector for each image's guest artifact
-(`helios-inspector vm --arch … kernel-path`, so the mapping from
+(`helios vm --arch … kernel-path`, so the mapping from
 architecture and profile to Cargo target and artifact name has one
 definition), digests both, and fails the run when they match. There is
 nothing for a comparison between one build and itself to say.

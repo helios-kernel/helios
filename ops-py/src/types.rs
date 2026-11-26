@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use helios_ops::{
-    Attenuation, BundleManifest, Child, DiagnosticBundle, GrantRight, IdentityProfile, OpsError,
-    RemoteEntry, RemoteStat, SecurityMode, SessionOptions, Target, TargetStore, TargetUri,
+    Attenuation, BundleManifest, Child, DiagnosticBundle, GrantRight, OpsError, RemoteEntry,
+    RemoteStat, SessionOptions, Target, TargetStore, TargetUri,
 };
 use helios_wit_rpc::inspector::helios::system::{
     inspect::{
@@ -34,6 +34,7 @@ pub(crate) fn build_session_options(
     scope: Option<String>,
     only: Option<Vec<String>>,
     identity: Option<String>,
+    allow_ambient_auth: bool,
 ) -> PyResult<SessionOptions> {
     let mut rights = BTreeSet::new();
     if let Some(items) = only {
@@ -49,22 +50,9 @@ pub(crate) fn build_session_options(
         }
     }
 
-    let profile = match identity {
-        Some(name_or_path) => {
-            let loaded = IdentityProfile::load(&name_or_path)
-                .map_err(|err| ops_err_to_py(OpsError::from(err)))?;
-            Some(loaded)
-        }
-        None => None,
-    };
-
-    let security = if let Some(profile) = profile.as_ref().filter(|p| p.secret_key_hex.is_some()) {
-        profile
-            .to_security_mode()
-            .map_err(|err| ops_err_to_py(OpsError::from(err)))?
-    } else {
-        SecurityMode::Plain
-    };
+    let (profile, security) =
+        SessionOptions::resolve_security(identity.as_deref(), allow_ambient_auth)
+            .map_err(ops_err_to_py)?;
 
     let timeout = match timeout_secs {
         Some(secs) if secs.is_finite() && secs > 0.0 => Duration::from_secs_f64(secs),

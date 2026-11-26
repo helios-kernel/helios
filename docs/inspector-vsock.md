@@ -37,7 +37,7 @@ which is the host kernel carrying the packets, and it needs
   `vhost-vsock-device` nor `vhost-vsock-pci` — so a macOS host runs its
   sessions on the serial transport.
 
-`helios-inspector vm` checks this before it builds or boots anything, so
+`helios vm` checks this before it builds or boots anything, so
 an unusable request fails immediately rather than as a QEMU device error
 several minutes into a kernel build.
 
@@ -57,7 +57,7 @@ sudo modprobe vhost_vsock
 ./target/release/helios vm --arch riscv64 --release --memory 2G \
     --rpc-transport vsock \
     --boot-program dash --boot-program debugger --no-compiler-plugin \
-    shell -c 'echo ok'
+    shell --shell /bin/dash -c 'echo ok'
 ```
 
 The same selection is available in a VM config file as `rpc_transport`

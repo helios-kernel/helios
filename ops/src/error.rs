@@ -95,6 +95,8 @@ pub enum OpsError {
     AttenuationDenied { capability: String, scope: String },
     #[error("invalid capability grant `{spec}`: {reason}")]
     InvalidGrant { spec: String, reason: String },
+    #[error("invalid POSIX signal `{signal}`")]
+    InvalidSignal { signal: String },
 }
 
 impl OpsError {
@@ -229,6 +231,11 @@ pub enum TransportError {
          via `--identity` or `SecurityMode::Authenticated`"
     )]
     AuthRequired { host: String, port: u16 },
+    #[error(
+        "authenticated connections over plain `tcp://{host}:{port}` are unsupported \
+         (the inspector protocol requires TLS channel binding on TCP); use `helios://{host}:{port}`"
+    )]
+    PlainTcpAuthUnsupported { host: String, port: u16 },
     #[error("TLS 1.3 handshake to `{address}` failed: {source}")]
     TlsHandshake {
         address: String,
