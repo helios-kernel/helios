@@ -97,6 +97,7 @@ pub fn item_to_suggestion(item: CompletionItem) -> Suggestion {
         | CompletionKind::Moniker
         | CompletionKind::DiagnosticTarget
         | CompletionKind::OciRef
+        | CompletionKind::ContainerHandle
         | CompletionKind::Variable => true,
     };
     let style = match item.kind {
@@ -108,7 +109,9 @@ pub fn item_to_suggestion(item: CompletionItem) -> Suggestion {
             Some(Style::new().fg(Color::Blue))
         }
         CompletionKind::Path => Some(Style::new().fg(Color::LightCyan)),
-        CompletionKind::OciRef | CompletionKind::Variable => Some(Style::new().fg(Color::Purple)),
+        CompletionKind::OciRef | CompletionKind::ContainerHandle | CompletionKind::Variable => {
+            Some(Style::new().fg(Color::Purple))
+        }
     };
     Suggestion {
         value: item.value,

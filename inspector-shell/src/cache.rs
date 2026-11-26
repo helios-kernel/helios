@@ -46,6 +46,7 @@ struct CacheState {
     monikers: Option<CacheEntry<Vec<String>>>,
     diagnostic_targets: Option<CacheEntry<Vec<String>>>,
     executables: Option<CacheEntry<Vec<String>>>,
+    oci_refs: Option<CacheEntry<Vec<String>>>,
     dirs: HashMap<String, CacheEntry<Vec<FileMetadata>>>,
 }
 
@@ -174,8 +175,10 @@ impl RemoteCompletionCache {
         {
             return entry.value.clone();
         }
+        let mut set = BTreeSet::new();
+        let mut fetched = false;
         if let Some(instances) = self.fetch_bounded(session.instances()).await {
-            let mut set = BTreeSet::new();
+            fetched = true;
             for inst in instances {
                 if !inst.name.is_empty() {
                     if inst.name.starts_with('/') {
@@ -185,9 +188,46 @@ impl RemoteCompletionCache {
                     }
                 }
             }
+        }
+        if let Some(components) = self.fetch_bounded(session.components().list()).await {
+            fetched = true;
+            for comp in components {
+                if !comp.moniker.is_empty() {
+                    set.insert(comp.moniker);
+                }
+            }
+        }
+        if fetched {
             let list: Vec<String> = set.into_iter().collect();
             let mut guard = self.state.write().await;
             guard.monikers = Some(CacheEntry {
+                value: list.clone(),
+                fetched_at: Instant::now(),
+            });
+            return list;
+        }
+        cached.map_or_else(Vec::new, |c| c.value)
+    }
+
+    /// Fetch pulled OCI image references from the remote guest store, cached for `ttl` and bounded by `timeout`.
+    pub async fn oci_refs(&self, session: &Session) -> Vec<String> {
+        let cached = {
+            let guard = self.state.read().await;
+            guard.oci_refs.clone()
+        };
+        if let Some(entry) = cached.as_ref()
+            && entry.is_fresh(self.ttl)
+        {
+            return entry.value.clone();
+        }
+        if let Some(images) = self.fetch_bounded(session.oci().list()).await {
+            let mut set = BTreeSet::new();
+            for img in images {
+                set.insert(img.reference.canonical());
+            }
+            let list: Vec<String> = set.into_iter().collect();
+            let mut guard = self.state.write().await;
+            guard.oci_refs = Some(CacheEntry {
                 value: list.clone(),
                 fetched_at: Instant::now(),
             });

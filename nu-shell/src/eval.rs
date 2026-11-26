@@ -36,7 +36,10 @@ use nu_protocol::{
 
 use crate::command::{AsyncCommandContext, AsyncCommandRegistry, EvalRuntime, RuntimeScope};
 use crate::env::{HeliosEnv, normalize_vfs_path};
-use crate::pipeline::{AsyncExecutionData, AsyncPipelineData, collect_byte_receiver};
+use crate::pipeline::{
+    AsyncExecutionData, AsyncPipelineData, collect_byte_receiver, collect_byte_stream_with_status,
+    non_zero_exit_error,
+};
 
 /// Open redirection file slot backed by [`HeliosEnv`] rather than ambient host `std::fs`.
 #[derive(Debug, Clone)]
@@ -949,7 +952,7 @@ async fn eval_instruction_inner<E: HeliosEnv>(
         }
         Instruction::CheckErrRedirected { src } => match ctx.borrow_reg(*src) {
             AsyncPipelineData::ByteStream {
-                stderr: Some(_), ..
+                is_external: true, ..
             } => Ok(Continue),
             _ => Err(ShellError::Generic(GenericError::new(
                 "Can't redirect stderr of internal command output",
@@ -989,6 +992,39 @@ async fn eval_instruction_inner<E: HeliosEnv>(
                 .written;
             if matches!(src.body, AsyncPipelineData::Empty) && already_written {
                 ctx.put_reg(*src_reg, AsyncExecutionData::empty());
+                return Ok(Continue);
+            }
+            if let AsyncPipelineData::ByteStream {
+                stream,
+                stderr,
+                exit_code,
+                upstream_exits,
+                merge_stderr,
+                span: stream_span,
+                ..
+            } = src.body
+            {
+                let (bytes, stderr_bytes, status) = collect_byte_stream_with_status(
+                    stream,
+                    stderr,
+                    exit_code,
+                    upstream_exits,
+                    merge_stderr,
+                    stream_span,
+                )
+                .await?;
+                write_redirect_slot(ctx, *file_num, &bytes, *span).await?;
+                ctx.put_reg(*src_reg, AsyncExecutionData::empty());
+                if let Some((code, err_span)) = status {
+                    ctx.stack.set_last_exit_code(code, err_span);
+                    if let Some(non_zero) = core::num::NonZeroI32::new(code) {
+                        return Err(non_zero_exit_error(
+                            non_zero,
+                            if merge_stderr { &[] } else { &stderr_bytes },
+                            err_span,
+                        ));
+                    }
+                }
                 return Ok(Continue);
             }
             let bytes = src.body.into_bytes_async(*span).await?;
@@ -1611,8 +1647,21 @@ async fn eval_call_inner<E: HeliosEnv>(
     let out_file_num = ctx.redirect_out_file.take();
     let err_file_num = ctx.redirect_err_file.take();
 
+    let out_is_pipe = matches!(
+        redir_out.as_ref(),
+        Some(Redirection::Pipe(OutDest::Pipe | OutDest::PipeRaw))
+    ) && out_file_num.is_none();
+    let err_is_pipe = matches!(redir_err.as_ref(), Some(Redirection::Pipe(OutDest::Pipe)))
+        && err_file_num.is_none();
+    let stderr_piped_alone = err_is_pipe && !out_is_pipe && out_file_num.is_none();
+    let effective_redir_out = if stderr_piped_alone {
+        Some(Redirection::Pipe(OutDest::Inherit))
+    } else {
+        redir_out
+    };
+
     let result = {
-        let mut caller_stack = ctx.stack.push_redirection(redir_out, redir_err);
+        let mut caller_stack = ctx.stack.push_redirection(effective_redir_out, redir_err);
         let mut rt = EvalRuntime {
             env: ctx.env,
             registry: ctx.registry,
@@ -1642,6 +1691,48 @@ async fn eval_call_inner<E: HeliosEnv>(
     }?;
 
     if out_file_num.is_none() && err_file_num.is_none() {
+        if err_is_pipe
+            && let AsyncPipelineData::ByteStream {
+                stream,
+                stderr,
+                exit_code,
+                upstream_exits,
+                is_external,
+                span,
+                stream_type,
+                metadata,
+                ..
+            } = result
+        {
+            if out_is_pipe {
+                return Ok(AsyncPipelineData::ByteStream {
+                    stream,
+                    stderr,
+                    exit_code,
+                    upstream_exits,
+                    is_external,
+                    merge_stderr: true,
+                    span,
+                    stream_type,
+                    metadata,
+                });
+            }
+            let forwarded_stderr = stderr.unwrap_or_else(|| {
+                let (_, rx) = async_channel::bounded(1);
+                rx
+            });
+            return Ok(AsyncPipelineData::ByteStream {
+                stream: forwarded_stderr,
+                stderr: None,
+                exit_code,
+                upstream_exits,
+                is_external,
+                merge_stderr: false,
+                span,
+                stream_type,
+                metadata,
+            });
+        }
         return Ok(result);
     }
 
@@ -1650,6 +1741,7 @@ async fn eval_call_inner<E: HeliosEnv>(
         result,
         out_file_num,
         err_file_num,
+        err_is_pipe,
         head,
     ))
     .await
@@ -1660,6 +1752,7 @@ async fn apply_file_redirections_async<E: HeliosEnv>(
     result: AsyncPipelineData,
     out_file_num: Option<u32>,
     err_file_num: Option<u32>,
+    err_is_pipe: bool,
     head: Span,
 ) -> Result<AsyncPipelineData, ShellError> {
     // Handle file redirections (`o>`, `o>>`, `e>`, `e>>`, `o+e>`, `o+e>>`) through HeliosEnv.
@@ -1669,6 +1762,7 @@ async fn apply_file_redirections_async<E: HeliosEnv>(
                 stream,
                 stderr,
                 exit_code,
+                upstream_exits,
                 ..
             } = result
             {
@@ -1682,6 +1776,13 @@ async fn apply_file_redirections_async<E: HeliosEnv>(
                     .await;
                 let mut combined = out_res?;
                 combined.extend_from_slice(&err_res?);
+                for upstream in upstream_exits {
+                    if let Ok(status) = upstream.exit_code.recv().await {
+                        let _ = status.map_err(|err| {
+                            err.into_shell_error("external command failed", upstream.span)
+                        })?;
+                    }
+                }
                 if let Some(exit_rx) = exit_code
                     && let Ok(status) = exit_rx.recv().await
                 {
@@ -1701,6 +1802,9 @@ async fn apply_file_redirections_async<E: HeliosEnv>(
                 stream,
                 stderr,
                 exit_code,
+                upstream_exits,
+                is_external,
+                merge_stderr,
                 span,
                 stream_type,
                 metadata,
@@ -1717,6 +1821,13 @@ async fn apply_file_redirections_async<E: HeliosEnv>(
                         .await;
                     let out_bytes = out_res?;
                     let err_bytes = err_res?;
+                    for upstream in upstream_exits {
+                        if let Ok(status) = upstream.exit_code.recv().await {
+                            let _ = status.map_err(|err| {
+                                err.into_shell_error("external command failed", upstream.span)
+                            })?;
+                        }
+                    }
                     if let Some(exit_rx) = exit_code
                         && let Ok(status) = exit_rx.recv().await
                     {
@@ -1750,6 +1861,9 @@ async fn apply_file_redirections_async<E: HeliosEnv>(
                         stream: out_rx,
                         stderr: None,
                         exit_code,
+                        upstream_exits,
+                        is_external,
+                        merge_stderr: false,
                         span,
                         stream_type,
                         metadata,
@@ -1759,6 +1873,9 @@ async fn apply_file_redirections_async<E: HeliosEnv>(
                     stream,
                     stderr: None,
                     exit_code,
+                    upstream_exits,
+                    is_external,
+                    merge_stderr,
                     span,
                     stream_type,
                     metadata,
@@ -1773,6 +1890,71 @@ async fn apply_file_redirections_async<E: HeliosEnv>(
             Ok(result)
         }
         (Some(out_num), None) => {
+            if let AsyncPipelineData::ByteStream {
+                stream,
+                stderr,
+                exit_code,
+                upstream_exits,
+                is_external,
+                merge_stderr,
+                span,
+                stream_type,
+                metadata,
+            } = result
+            {
+                if err_is_pipe {
+                    let (out_res, err_res) =
+                        futures_lite::future::zip(collect_byte_receiver(stream), async move {
+                            match stderr {
+                                Some(rx) => collect_byte_receiver(rx).await,
+                                None => Ok(Vec::new()),
+                            }
+                        })
+                        .await;
+                    let out_bytes = out_res?;
+                    let err_bytes = err_res?;
+                    write_redirect_slot(ctx, out_num, &out_bytes, head).await?;
+                    let (err_tx, err_rx) = async_channel::bounded(1);
+                    if !err_bytes.is_empty() {
+                        let _ = err_tx.send(Ok(err_bytes)).await;
+                    }
+                    drop(err_tx);
+                    return Ok(AsyncPipelineData::ByteStream {
+                        stream: err_rx,
+                        stderr: None,
+                        exit_code,
+                        upstream_exits,
+                        is_external,
+                        merge_stderr: false,
+                        span,
+                        stream_type,
+                        metadata,
+                    });
+                }
+
+                let (out_bytes, stderr_bytes, status) = collect_byte_stream_with_status(
+                    stream,
+                    stderr,
+                    exit_code,
+                    upstream_exits,
+                    merge_stderr,
+                    span,
+                )
+                .await?;
+                // Write captured stdout to the redirect target BEFORE surfacing any non-zero exit error.
+                write_redirect_slot(ctx, out_num, &out_bytes, head).await?;
+                if let Some((code, err_span)) = status {
+                    ctx.stack.set_last_exit_code(code, err_span);
+                    if let Some(non_zero) = core::num::NonZeroI32::new(code) {
+                        return Err(non_zero_exit_error(
+                            non_zero,
+                            if merge_stderr { &[] } else { &stderr_bytes },
+                            err_span,
+                        ));
+                    }
+                }
+                return Ok(AsyncPipelineData::Empty);
+            }
             let bytes = result.into_bytes_async(head).await?;
             write_redirect_slot(ctx, out_num, &bytes, head).await?;
             Ok(AsyncPipelineData::Empty)
