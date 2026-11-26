@@ -19,6 +19,17 @@ impl Colour {
         Self { red, green, blue }
     }
 
+    /// Pack this colour as little-endian `bgrx8888` (`[blue, green, red, 0]`).
+    pub const fn to_bgrx_u32(self) -> u32 {
+        u32::from_le_bytes([self.blue, self.green, self.red, 0])
+    }
+
+    /// Unpack a little-endian `bgrx8888` (`[blue, green, red, _]`) pixel.
+    pub const fn from_bgrx_u32(pixel: u32) -> Self {
+        let [blue, green, red, _] = pixel.to_le_bytes();
+        Self { red, green, blue }
+    }
+
     /// Write this colour into one four-byte pixel.
     ///
     /// # Panics
@@ -80,5 +91,12 @@ mod tests {
     fn a_half_blend_is_halfway_between_and_the_same_on_every_target() {
         let mixed = blend(Colour::new(0, 100, 200), Colour::new(200, 100, 0), 128);
         assert_eq!(mixed, Colour::new(100, 100, 100));
+    }
+
+    #[test]
+    fn bgrx_u32_roundtrips_channels() {
+        let sun = Colour::new(0xFF, 0x6A, 0x00);
+        assert_eq!(sun.to_bgrx_u32(), 0x00FF_6A00);
+        assert_eq!(Colour::from_bgrx_u32(0x00FF_6A00), sun);
     }
 }
