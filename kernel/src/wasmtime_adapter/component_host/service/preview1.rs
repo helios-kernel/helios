@@ -2486,11 +2486,18 @@ where
         let filetype = match descriptor {
             Preview1Descriptor::Stdin { .. } => 2,
             Preview1Descriptor::Stdout | Preview1Descriptor::Stderr => 2,
-            Preview1Descriptor::PipeRead { .. } | Preview1Descriptor::PipeWrite { .. } => 2,
+            Preview1Descriptor::PipeRead { .. }
+            | Preview1Descriptor::PipeWrite { .. }
+            | Preview1Descriptor::FifoRead(_)
+            | Preview1Descriptor::FifoWrite(_)
+            | Preview1Descriptor::FifoReadWrite(_) => 2,
             Preview1Descriptor::Event(_) | Preview1Descriptor::Epoll(_) => 2,
             Preview1Descriptor::Preopen { .. } => 3,
             Preview1Descriptor::File(file) => p1_filetype(file.node().kind),
-            Preview1Descriptor::NullDevice => 2,
+            Preview1Descriptor::NullDevice
+            | Preview1Descriptor::PseudoDevice(_)
+            | Preview1Descriptor::PtyMaster(_)
+            | Preview1Descriptor::PtySlave(_) => 2,
             Preview1Descriptor::Socket(_) => 6,
         };
         let fdflags = descriptors.fdflags(fd).unwrap_or(0);
