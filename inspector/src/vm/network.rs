@@ -928,7 +928,13 @@ impl VmNetwork {
         }
         match profile {
             VmNetworkProfile::VirtioMmio => ring.apply(&mut device),
-            VmNetworkProfile::VirtioPci => ring.apply_pci(&mut device),
+            VmNetworkProfile::VirtioPci => {
+                // Guests never PXE-boot from virtio-net; suppressing the
+                // default iPXE option ROM avoids requiring `efi-virtio.rom`
+                // on hosts (such as ARM64 Linux) that do not ship it.
+                device.set("romfile", "");
+                ring.apply_pci(&mut device);
+            }
         }
 
         // The dump filter sits on the netdev, so it records both
@@ -1975,7 +1981,7 @@ mod tests {
             )
             .expect("the user backend renders on every host");
         assert_eq!(rendered.netdev(), "user,id=net0");
-        assert_eq!(rendered.device(), "virtio-net-pci,netdev=net0");
+        assert_eq!(rendered.device(), "virtio-net-pci,netdev=net0,romfile=");
         assert_eq!(rendered.queue_pairs(), 1);
         assert!(rendered.launcher().is_none());
     }
@@ -2106,7 +2112,7 @@ mod tests {
             rendered.netdev(),
             "tap,id=net0,ifname=helios0,script=no,downscript=no,vhost=on"
         );
-        assert_eq!(rendered.device(), "virtio-net-pci,netdev=net0");
+        assert_eq!(rendered.device(), "virtio-net-pci,netdev=net0,romfile=");
         network.pcap = Some(PathBuf::from("/tmp/helios.pcap"));
         let capture = network
             .render(
@@ -2121,7 +2127,7 @@ mod tests {
             "tap,id=net0,ifname=helios0,script=no,downscript=no,vhost=off"
         );
         assert_eq!(capture.queue_pairs(), 1);
-        assert_eq!(capture.device(), "virtio-net-pci,netdev=net0");
+        assert_eq!(capture.device(), "virtio-net-pci,netdev=net0,romfile=");
         assert!(capture.packet_dump().is_some());
     }
 
@@ -2212,7 +2218,7 @@ mod tests {
             )
             .expect("vmnet-shared renders on macOS");
         assert_eq!(rendered.netdev(), "vmnet-shared,id=net0");
-        assert_eq!(rendered.device(), "virtio-net-pci,netdev=net0");
+        assert_eq!(rendered.device(), "virtio-net-pci,netdev=net0,romfile=");
         assert_eq!(rendered.queue_pairs(), 1);
     }
 
@@ -2363,7 +2369,7 @@ mod tests {
             .expect("the user backend renders with any ring layout");
         assert_eq!(
             rendered.device(),
-            "virtio-net-pci,netdev=net0,packed=on,in_order=on"
+            "virtio-net-pci,netdev=net0,romfile=,packed=on,in_order=on"
         );
     }
 
@@ -2381,7 +2387,7 @@ mod tests {
             .expect("the user backend renders behind an IOMMU");
         assert_eq!(
             rendered.device(),
-            "virtio-net-pci,netdev=net0,disable-legacy=on,iommu_platform=on"
+            "virtio-net-pci,netdev=net0,romfile=,disable-legacy=on,iommu_platform=on"
         );
     }
 
@@ -2404,7 +2410,7 @@ mod tests {
             .expect("known properties render");
         assert_eq!(
             rendered.device(),
-            "virtio-net-pci,netdev=net0,csum=off,host_tso4=on"
+            "virtio-net-pci,netdev=net0,csum=off,host_tso4=on,romfile="
         );
     }
 

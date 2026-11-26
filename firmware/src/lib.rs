@@ -12,6 +12,7 @@ mod acpi;
 #[cfg(feature = "devicetree")]
 mod devicetree;
 mod error;
+mod iommu;
 
 #[cfg(feature = "acpi")]
 pub use self::acpi::{
@@ -21,6 +22,11 @@ pub use self::acpi::{
 #[cfg(feature = "devicetree")]
 pub use devicetree::{DeviceTreeMemory, DeviceTreeNuma};
 pub use error::{FirmwareNumaError, NodeName};
+#[cfg(feature = "devicetree")]
+pub use iommu::parse_devicetree_pci_iommu;
+pub use iommu::{FirmwareIommuError, MAX_PCI_IOMMU_RANGES, PciIommuRange, VirtioIommuTopology};
+#[cfg(feature = "acpi")]
+pub use iommu::{VIOT_SIGNATURE, parse_viot};
 
 use helios_hal::cpu::ProcessorId;
 
