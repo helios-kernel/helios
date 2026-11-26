@@ -102,6 +102,9 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// kernel identified them. Empty on a machine with none, where a
     /// disk mount is refused as unavailable.
     mount_sources: Once<BlockCache<StorageImpl::Disk>>,
+    /// The dedicated hibernate image disk (`helios-hibernate`), once the
+    /// kernel identified it. Empty on a machine with none.
+    hibernate_disk: Once<StorageImpl::Disk>,
     /// True while the asynchronous block-discovery task is identifying disks
     /// and opening mount sources; cleared once `install_mount_sources` has
     /// published them so early mount requests wait instead of racing boot.
@@ -417,6 +420,7 @@ where
                 http_client: PerProcessorProvider::new(),
                 host_fs_service: Mutex::new(None),
                 mount_sources: Once::new(),
+                hibernate_disk: Once::new(),
                 block_discovery_pending: AtomicBool::new(false),
                 block_discovery_ready: Notify::new(),
                 block_service: Once::new(),
@@ -1246,6 +1250,24 @@ where
     /// machine with none.
     pub fn mount_sources(&self) -> Option<BlockCache<StorageImpl::Disk>> {
         self.inner.mount_sources.get().cloned()
+    }
+
+    /// Publishes the dedicated hibernate image disk (`helios-hibernate`),
+    /// classified by [`crate::DiskRole::Hibernate`].
+    ///
+    /// Called from the task that identified every disk, once.
+    pub fn install_hibernate_disk(&self, disk: StorageImpl::Disk) {
+        let mut installed = false;
+        self.inner.hibernate_disk.call_once(|| {
+            installed = true;
+            disk
+        });
+        assert!(installed, "hibernate disk was installed more than once");
+    }
+
+    /// The dedicated hibernate image disk, or `None` on a machine with none.
+    pub fn hibernate_disk(&self) -> Option<&StorageImpl::Disk> {
+        self.inner.hibernate_disk.get()
     }
 
     /// Marks asynchronous block-device discovery as in flight so disk mounts
