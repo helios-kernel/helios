@@ -4202,6 +4202,16 @@ where
         Ok(self.tcp_socket(socket)?.local_endpoint())
     }
 
+    /// Returns the remote endpoint bound to `socket`, if any.
+    pub fn tcp_remote_endpoint(&self, socket: SocketId) -> Result<Option<TcpEndpoint>, StackError> {
+        Ok(self.tcp_socket(socket)?.remote_endpoint())
+    }
+
+    /// Returns the RFC 9293 connection state of `socket`.
+    pub fn tcp_state(&self, socket: SocketId) -> Result<crate::TcpState, StackError> {
+        Ok(self.tcp_socket(socket)?.state())
+    }
+
     /// The receive state of one socket, for a caller that has to report
     /// why it made no progress.
     ///

@@ -22,17 +22,19 @@ const POOLING_MAX_UNUSED_WARM_SLOTS: u32 = 100;
 const FIBER_STACK_RETAIN_FRACTION: usize = 64;
 /// Elements one pooled table slot holds.
 ///
-/// Set here rather than inherited, and set from measurement: the largest
-/// table any component in this tree declares is `python3`'s 5,895-entry
-/// indirect-call table, against 168 for the curl program and 87 for
-/// `hello`. Wasmtime's default is 20,000, and every one of those entries
-/// is user memory the engine commits per slot whether a component uses
-/// it or not, so the default was paying three and a half times over.
+/// Set here rather than inherited, and set from measurement across every
+/// component this tree builds: `helios_nu_shell.wasm` declares two core
+/// tables of 13,930 and 121 entries in `release` (14,127 and 121 in
+/// `debug`), against 5,895 for `python3`, 3,376 for `gpu-test`, 336 for
+/// `init`, 168 for `curl`, and 87 for `hello`. Wasmtime's default is
+/// 20,000, and every entry is user memory the engine commits per slot
+/// whether a component uses it or not.
 ///
 /// A slot is this count times `NOMINAL_MAX_TABLE_ELEM_SIZE`, which is
-/// `size_of::<Option<SendSyncPtr<VMFuncRef>>>()` — one pointer — so 8192
-/// entries is exactly 64 KiB and needs no page rounding.
-const POOLING_TABLE_ELEMENTS: usize = 8_192;
+/// `size_of::<Option<SendSyncPtr<VMFuncRef>>>()` — one pointer — so
+/// 16,384 entries is exactly 128 KiB (32 4-KiB pages) and needs no page
+/// rounding.
+const POOLING_TABLE_ELEMENTS: usize = 16_384;
 
 #[derive(Debug, Error)]
 enum WasiCliRunResolveError {
@@ -208,24 +210,9 @@ impl PoolingBudget {
     }
 }
 
-/// Configures the instance pools and reports the budget they were built
-/// from, which is also the number of fiber stacks the arena has to hold.
-fn apply_pooling_config(config: &mut wasmtime::Config) -> PoolingBudget {
-    use wasmtime::{InstanceAllocationStrategy, PoolingAllocationConfig};
-    let budget = PoolingBudget::of_kernel_policy();
-    // The pools are reserved out of the one window every backend hands
-    // the runtime; a budget that does not fit it is a boot failure on
-    // three targets, so it fails here where the number is written.
-    assert!(
-        budget.reserved_address_space() <= MAX_POOLED_ADDRESS_SPACE,
-        "the instance pools reserve more address space than the kernel allows"
-    );
-    // And the table pool is paid in pages, here, before a program runs.
-    assert!(
-        budget.committed_user_bytes() <= MAX_POOLED_USER_MEMORY,
-        "the instance pools commit more user memory than the kernel allows"
-    );
-    let mut pooling = PoolingAllocationConfig::default();
+/// Builds the `PoolingAllocationConfig` implied by `budget`.
+fn pooling_allocation_config(budget: &PoolingBudget) -> wasmtime::PoolingAllocationConfig {
+    let mut pooling = wasmtime::PoolingAllocationConfig::default();
     pooling.max_unused_warm_slots(POOLING_MAX_UNUSED_WARM_SLOTS);
     pooling.total_component_instances(budget.component_instances);
     pooling.total_core_instances(budget.core_instances);
@@ -240,6 +227,27 @@ fn apply_pooling_config(config: &mut wasmtime::Config) -> PoolingBudget {
     pooling.max_memories_per_component(MAX_MEMORIES_PER_COMPONENT);
     pooling.max_tables_per_component(MAX_TABLES_PER_COMPONENT);
     pooling.table_elements(POOLING_TABLE_ELEMENTS);
+    pooling
+}
+
+/// Configures the instance pools and reports the budget they were built
+/// from, which is also the number of fiber stacks the arena has to hold.
+fn apply_pooling_config(config: &mut wasmtime::Config) -> PoolingBudget {
+    use wasmtime::InstanceAllocationStrategy;
+    let budget = PoolingBudget::of_kernel_policy();
+    // The pools are reserved out of the one window every backend hands
+    // the runtime; a budget that does not fit it is a boot failure on
+    // three targets, so it fails here where the number is written.
+    assert!(
+        budget.reserved_address_space() <= MAX_POOLED_ADDRESS_SPACE,
+        "the instance pools reserve more address space than the kernel allows"
+    );
+    // And the table pool is paid in pages, here, before a program runs.
+    assert!(
+        budget.committed_user_bytes() <= MAX_POOLED_USER_MEMORY,
+        "the instance pools commit more user memory than the kernel allows"
+    );
+    let pooling = pooling_allocation_config(&budget);
     config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));
     config.async_stack_zeroing(false);
     budget
@@ -357,9 +365,12 @@ mod tests {
     /// The table pool is paid in user pages when the engine is built,
     /// and that is what made the first draft of this budget a
     /// regression: four tables per component at Wasmtime's default of
-    /// 20,000 elements committed 655 MiB per engine, and the kernel
-    /// builds two, so `cpython-json` was refused 40 MiB out of a
-    /// 1.44 GiB guest (run 34224973216).
+    /// 20,000 elements committed 655 MiB per engine, and when the kernel
+    /// built two engines `cpython-json` was refused 40 MiB out of a
+    /// 1.44 GiB guest (run 34224973216). With one shared component
+    /// engine, 16,384-element slots cover `nu`'s 14,127-entry debug
+    /// table while staying below the two-engine upstream default and
+    /// committing less per served component.
     #[test]
     fn the_table_pool_commits_less_than_the_default_it_replaces() {
         let budget = PoolingBudget::of_kernel_policy();
@@ -369,17 +380,76 @@ mod tests {
             committed <= MAX_POOLED_USER_MEMORY,
             "pools commit {committed} bytes, budget is {MAX_POOLED_USER_MEMORY}"
         );
-        // What Wasmtime's default would have committed for the same
-        // engine: 1000 tables of 20,000 pointers. Serving three times
-        // the instances for less memory than that is the whole claim.
-        let upstream_default = 1000 * 20_000 * size_of::<usize>() as u64;
+        const {
+            assert!(
+                POOLING_TABLE_ELEMENTS >= 14_127,
+                "table slot capacity must cover helios_nu_shell debug table (14,127 entries)"
+            );
+        }
+        // What Wasmtime's default would have committed for the two
+        // engines the shared component engine replaces: 2 × 1000 tables
+        // of 20,000 pointers.
+        let single_engine_upstream_default = 1000 * 20_000 * size_of::<usize>() as u64;
+        let two_engine_upstream_default = 2 * single_engine_upstream_default;
         assert!(
-            committed < upstream_default,
-            "{committed} against the default's {upstream_default}"
+            committed < two_engine_upstream_default,
+            "{committed} against the two-engine default's {two_engine_upstream_default}"
         );
-        // And it serves more programs than the default did: 1000 core
-        // instances is 250 components at four apiece.
+        // And per served component it commits less than a single default
+        // engine did (1000 core instances is 250 components at four apiece).
+        let per_component_committed = committed / u64::from(budget.component_instances);
+        let upstream_per_component = single_engine_upstream_default / 250;
+        assert!(
+            per_component_committed < upstream_per_component,
+            "{per_component_committed} bytes/component against upstream default's {upstream_per_component}"
+        );
         assert!(budget.component_instances > 1000 / 4);
+    }
+
+    #[test]
+    fn engine_accepts_nu_sized_funcref_table() {
+        use wasm_encoder::{Module, RefType, TableSection, TableType};
+
+        let engine = build_component_engine_for_platform(&TestCpu::without_entropy())
+            .expect("component engine should build on the lazy-commit profile");
+        assert!(
+            engine.pooling_allocator_metrics().is_some(),
+            "component engine must use the pooling allocator"
+        );
+
+        let mut tables = TableSection::new();
+        tables.table(TableType {
+            element_type: RefType::FUNCREF,
+            minimum: 14_127,
+            maximum: None,
+            table64: false,
+            shared: false,
+        });
+        tables.table(TableType {
+            element_type: RefType::FUNCREF,
+            minimum: 121,
+            maximum: None,
+            table64: false,
+            shared: false,
+        });
+
+        let mut module = Module::new();
+        module.section(&tables);
+        let wasm = module.finish();
+
+        wasmtime::Module::validate(&engine, &wasm)
+            .expect("module with nu-sized 14,127- and 121-entry funcref tables must validate");
+        let pooling = pooling_allocation_config(&PoolingBudget::of_kernel_policy());
+        assert!(
+            pooling.get_table_elements() >= 14_127,
+            "pooling table slot capacity {} must fit nu's 14,127-entry debug table",
+            pooling.get_table_elements()
+        );
+        assert!(
+            pooling.get_max_tables_per_component() >= 2,
+            "pooling component table limit {} must fit nu's two core tables",
+            pooling.get_max_tables_per_component()
+        );
     }
 
     #[test]

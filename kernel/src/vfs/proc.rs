@@ -101,6 +101,8 @@ pub struct NetRouteSnapshot {
 pub struct ContainerNetSnapshot {
     pub interfaces: Vec<NetIfSnapshot>,
     pub routes: Vec<NetRouteSnapshot>,
+    pub tcp_sockets: Vec<crate::InetTcpSocket>,
+    pub udp_sockets: Vec<crate::InetUdpSocket>,
 }
 
 impl Default for ContainerNetSnapshot {
@@ -125,6 +127,8 @@ impl Default for ContainerNetSnapshot {
                 tx_dropped: 0,
             }],
             routes: Vec::new(),
+            tcp_sockets: Vec::new(),
+            udp_sockets: Vec::new(),
         }
     }
 }
@@ -623,14 +627,18 @@ impl ProcFs {
                         ),
                         (String::from("route"), NodeKind::File, path_ino("net/route")),
                         (String::from("tcp"), NodeKind::File, path_ino("net/tcp")),
+                        (String::from("tcp6"), NodeKind::File, path_ino("net/tcp6")),
                         (String::from("udp"), NodeKind::File, path_ino("net/udp")),
+                        (String::from("udp6"), NodeKind::File, path_ino("net/udp6")),
                         (String::from("unix"), NodeKind::File, path_ino("net/unix")),
                     ],
                 });
             }
             "net/dev" => return Ok(self.ro_file(s, self.render_net_dev().into_bytes())),
-            "net/tcp" => return Ok(self.ro_file(s, render_net_tcp().into_bytes())),
-            "net/udp" => return Ok(self.ro_file(s, render_net_udp().into_bytes())),
+            "net/tcp" => return Ok(self.ro_file(s, self.render_net_tcp().into_bytes())),
+            "net/tcp6" => return Ok(self.ro_file(s, render_net_tcp6().into_bytes())),
+            "net/udp" => return Ok(self.ro_file(s, self.render_net_udp().into_bytes())),
+            "net/udp6" => return Ok(self.ro_file(s, render_net_udp6().into_bytes())),
             "net/unix" => return Ok(self.ro_file(s, render_net_unix().into_bytes())),
             "net/route" => return Ok(self.ro_file(s, self.render_net_route().into_bytes())),
             "net/arp" => return Ok(self.ro_file(s, render_net_arp().into_bytes())),
@@ -819,6 +827,11 @@ impl ProcFs {
                     path_ino(&format!("{full_path}/root")),
                 ),
                 (
+                    String::from("smaps"),
+                    NodeKind::File,
+                    path_ino(&format!("{full_path}/smaps")),
+                ),
+                (
                     String::from("stat"),
                     NodeKind::File,
                     path_ino(&format!("{full_path}/stat")),
@@ -933,6 +946,13 @@ impl ProcFs {
                 uid,
                 gid,
                 content: render_pid_maps(rec).into_bytes(),
+            }),
+            "smaps" => Ok(ProcNode::File {
+                ino: path_ino(full_path),
+                mode: 0o444,
+                uid,
+                gid,
+                content: render_pid_smaps(rec).into_bytes(),
             }),
             "limits" => Ok(ProcNode::File {
                 ino: path_ino(full_path),
@@ -1244,6 +1264,42 @@ impl ProcFs {
         }
         out
     }
+
+    /// Renders `/proc/net/tcp` matching Linux `net/ipv4/tcp_ipv4.c` `get_tcp4_sock`.
+    fn render_net_tcp(&self) -> String {
+        let net = self.registry.inner.net.lock();
+        let mut out = String::from(
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+        );
+        for (slot, sock) in net.tcp_sockets.iter().enumerate() {
+            let local = u32::from_le_bytes(sock.local_addr);
+            let remote = u32::from_le_bytes(sock.remote_addr);
+            let _ = writeln!(
+                out,
+                "{slot:>4}: {local:08X}:{:04X} {remote:08X}:{:04X} {:02X} 00000000:00000000 00:00000000 00000000 {:>5}        0 {} 1 0000000000000000 100 0 0 10 0",
+                sock.local_port, sock.remote_port, sock.state, sock.uid, sock.inode
+            );
+        }
+        out
+    }
+
+    /// Renders `/proc/net/udp` matching Linux `net/ipv4/udp.c` `udp4_format_sock`.
+    fn render_net_udp(&self) -> String {
+        let net = self.registry.inner.net.lock();
+        let mut out = String::from(
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n",
+        );
+        for (slot, sock) in net.udp_sockets.iter().enumerate() {
+            let local = u32::from_le_bytes(sock.local_addr);
+            let remote = u32::from_le_bytes(sock.remote_addr);
+            let _ = writeln!(
+                out,
+                "{slot:>4}: {local:08X}:{:04X} {remote:08X}:{:04X} {:02X} 00000000:00000000 00:00000000 00000000 {:>5}        0 {} 2 0000000000000000 0",
+                sock.local_port, sock.remote_port, sock.state, sock.uid, sock.inode
+            );
+        }
+        out
+    }
     fn stat_sync(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         let node = self.resolve_node(path, None)?;
         let (ino, kind, size) = match node {
@@ -1276,15 +1332,15 @@ fn render_filesystems() -> String {
     )
 }
 
-fn render_net_tcp() -> String {
+fn render_net_tcp6() -> String {
     String::from(
-        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+        "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
     )
 }
 
-fn render_net_udp() -> String {
+fn render_net_udp6() -> String {
     String::from(
-        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n",
+        "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n",
     )
 }
 
@@ -1378,26 +1434,59 @@ fn render_pid_statm(rec: &ProcProcessRecord) -> String {
     format!("{size} {resident} 0 0 0 {resident} 0\n")
 }
 
+fn format_map_line(out: &mut String, m: &ProcMapEntry) {
+    let r = if m.readable { 'r' } else { '-' };
+    let w = if m.writable { 'w' } else { '-' };
+    let x = if m.executable { 'x' } else { '-' };
+    let p = if m.shared { 's' } else { 'p' };
+    if m.pathname.is_empty() {
+        let _ = writeln!(
+            out,
+            "{:08x}-{:08x} {r}{w}{x}{p} {:08x} 00:00 0",
+            m.start, m.end, m.offset
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "{:08x}-{:08x} {r}{w}{x}{p} {:08x} 00:00 0          {}",
+            m.start, m.end, m.offset, m.pathname
+        );
+    }
+}
+
 fn render_pid_maps(rec: &ProcProcessRecord) -> String {
     let mut out = String::new();
     for m in &rec.maps {
-        let r = if m.readable { 'r' } else { '-' };
-        let w = if m.writable { 'w' } else { '-' };
-        let x = if m.executable { 'x' } else { '-' };
-        let p = if m.shared { 's' } else { 'p' };
-        if m.pathname.is_empty() {
-            let _ = writeln!(
-                out,
-                "{:08x}-{:08x} {r}{w}{x}{p} {:08x} 00:00 0",
-                m.start, m.end, m.offset
-            );
-        } else {
-            let _ = writeln!(
-                out,
-                "{:08x}-{:08x} {r}{w}{x}{p} {:08x} 00:00 0          {}",
-                m.start, m.end, m.offset, m.pathname
-            );
-        }
+        format_map_line(&mut out, m);
+    }
+    out
+}
+
+/// Renders `/proc/<pid>/smaps` matching Linux `fs/proc/task_mmu.c` `show_smap`.
+fn render_pid_smaps(rec: &ProcProcessRecord) -> String {
+    let mut out = String::new();
+    for m in &rec.maps {
+        format_map_line(&mut out, m);
+        let size_kb = m.end.saturating_sub(m.start) / 1024;
+        let is_anon = m.pathname.is_empty() || m.pathname.starts_with('[');
+        let anon_kb = if is_anon { size_kb } else { 0 };
+        let shared_clean = if m.shared && !m.writable { size_kb } else { 0 };
+        let shared_dirty = if m.shared && m.writable { size_kb } else { 0 };
+        let private_clean = if !m.shared && !m.writable { size_kb } else { 0 };
+        let private_dirty = if !m.shared && m.writable { size_kb } else { 0 };
+        let _ = writeln!(out, "Size:           {size_kb:>8} kB");
+        let _ = writeln!(out, "KernelPageSize:        4 kB");
+        let _ = writeln!(out, "MMUPageSize:           4 kB");
+        let _ = writeln!(out, "Rss:            {size_kb:>8} kB");
+        let _ = writeln!(out, "Pss:            {size_kb:>8} kB");
+        let _ = writeln!(out, "Shared_Clean:   {shared_clean:>8} kB");
+        let _ = writeln!(out, "Shared_Dirty:   {shared_dirty:>8} kB");
+        let _ = writeln!(out, "Private_Clean:  {private_clean:>8} kB");
+        let _ = writeln!(out, "Private_Dirty:  {private_dirty:>8} kB");
+        let _ = writeln!(out, "Referenced:     {size_kb:>8} kB");
+        let _ = writeln!(out, "Anonymous:      {anon_kb:>8} kB");
+        let _ = writeln!(out, "Swap:                  0 kB");
+        let _ = writeln!(out, "Locked:                0 kB");
     }
     out
 }
@@ -1879,5 +1968,78 @@ mod tests {
                 "10", "0", "5", "4096", "0"
             ]
         );
+    }
+
+    #[test]
+    fn proc_pid_smaps_and_net_sockets_render_linux_format() {
+        let fs = test_proc_fs();
+        let mut rec = ProcProcessRecord::minimal(7, 1, "busybox", "/linux/busybox");
+        rec.maps = alloc::vec![
+            ProcMapEntry {
+                start: 0x0040_0000,
+                end: 0x0041_0000,
+                readable: true,
+                writable: false,
+                executable: true,
+                shared: false,
+                offset: 0,
+                pathname: String::from("/linux/busybox"),
+            },
+            ProcMapEntry {
+                start: 0x7fff_f000,
+                end: 0x8000_1000,
+                readable: true,
+                writable: true,
+                executable: false,
+                shared: false,
+                offset: 0,
+                pathname: String::from("[stack]"),
+            },
+        ];
+        fs.registry().register_process(rec);
+
+        assert_eq!(
+            fs.stat_sync(FsPath::new("7/smaps").unwrap()).unwrap().kind,
+            NodeKind::File
+        );
+        let smaps = match fs
+            .resolve_node(FsPath::new("7/smaps").unwrap(), None)
+            .unwrap()
+        {
+            ProcNode::File { content, .. } => String::from_utf8(content).unwrap(),
+            _ => panic!("expected smaps file"),
+        };
+        assert!(smaps.contains("00400000-00410000 r-xp 00000000 00:00 0          /linux/busybox"));
+        assert!(smaps.contains("Size:                 64 kB"));
+        assert!(smaps.contains("Private_Clean:        64 kB"));
+        assert!(smaps.contains("7ffff000-80001000 rw-p 00000000 00:00 0          [stack]"));
+        assert!(smaps.contains("Private_Dirty:         8 kB"));
+        assert!(smaps.contains("Anonymous:             8 kB"));
+
+        let mut net = ContainerNetSnapshot::default();
+        net.tcp_sockets.push(crate::InetTcpSocket {
+            local_addr: [127, 0, 0, 1],
+            local_port: 8080,
+            remote_addr: [0, 0, 0, 0],
+            remote_port: 0,
+            state: 0x0A,
+            uid: 0,
+            inode: 42,
+        });
+        net.udp_sockets.push(crate::InetUdpSocket {
+            local_addr: [0, 0, 0, 0],
+            local_port: 5353,
+            remote_addr: [0, 0, 0, 0],
+            remote_port: 0,
+            state: 0x07,
+            uid: 0,
+            inode: 43,
+        });
+        fs.registry().set_net_snapshot(net);
+
+        let tcp = fs.render_net_tcp();
+        assert!(tcp.contains("0100007F:1F90 00000000:0000 0A"));
+        let udp = fs.render_net_udp();
+        assert!(udp.contains("00000000:14E9 00000000:0000 07"));
     }
 }

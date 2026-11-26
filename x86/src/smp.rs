@@ -15,6 +15,7 @@ use core::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, compiler_fence,
 };
 use helios_artifact::ProbeAnswers;
+use helios_hal::DeviceInventory;
 use helios_hal::cpu::{GUEST_STACK_LIMIT_OFFSET, ProcessorId, Timebase};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::watchdog::Watchdog;
@@ -376,6 +377,9 @@ pub(crate) struct X86PlatformState {
     wakeup_lock: spin::Mutex<()>,
     /// ACPI S5 soft-off parameters discovered on the bootstrap processor.
     acpi_s5: spin::Once<AcpiS5Shutdown>,
+    /// Platform device inventory discovered on the bootstrap processor before
+    /// any secondary processor starts.
+    devices: Once<DeviceInventory>,
 }
 
 struct ProcessorSlot {
@@ -577,6 +581,7 @@ pub(crate) fn build_boot_context(
         boot_context: AtomicPtr::new(core::ptr::null_mut()),
         wakeup_lock: spin::Mutex::new(()),
         acpi_s5: spin::Once::new(),
+        devices: Once::new(),
     });
     if let Some(wakeup_page) = platform.wakeup_page.as_ref() {
         prepare_wakeup_page(&platform, wakeup_page);
@@ -1189,6 +1194,17 @@ impl X86PlatformState {
 
     pub(crate) fn acpi_s5(&self) -> Option<AcpiS5Shutdown> {
         self.acpi_s5.get().copied()
+    }
+
+    pub(crate) fn install_devices(&self, devices: DeviceInventory) {
+        self.devices.call_once(|| devices);
+    }
+
+    pub(crate) fn devices(&self) -> DeviceInventory {
+        *self
+            .devices
+            .get()
+            .expect("x86 secondary started before bootstrap installed DeviceInventory")
     }
 
     pub(crate) fn watchdog(&self) -> X86Watchdog {

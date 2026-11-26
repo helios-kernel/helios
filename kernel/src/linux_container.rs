@@ -1171,6 +1171,7 @@ impl<S: Storage> ContainerFilesystem<S> {
             resolved.require_write()?;
         }
         if check.exec
+            && info.metadata.kind != NodeKind::Directory
             && !resolved
                 .authority_rights()
                 .contains(DirectoryAuthorityRights::EXECUTE)
@@ -10433,5 +10434,44 @@ mod private_btrfs_tests {
         assert_eq!(info.used_ids, 0);
         assert_eq!(info.shm_tot, 0);
         assert_eq!(pool.stats().available_bytes(), avail_before);
+    }
+
+    #[test]
+    fn access_exec_allows_proc_directory_traversal_and_denies_file_exec() {
+        use super::tests::test_namespace;
+        let host_ns = test_namespace();
+        let container = LinuxContainer::ephemeral(
+            ContainerId::new(NonZeroU64::new(304).unwrap()),
+            ProcessAuthority::empty(),
+            &host_ns,
+        );
+        let creds = Credentials::root();
+        let exec_check = AccessCheck {
+            read: false,
+            write: false,
+            exec: true,
+            follow: true,
+            use_effective: true,
+        };
+        futures_lite::future::block_on(async {
+            // Directory traversal (`chdir("/proc/sys")` / `access(X_OK)`) must
+            // succeed even on mounts without `DirectoryAuthorityRights::EXECUTE`.
+            container
+                .filesystem()
+                .access_at("/", "/proc/sys", exec_check, &creds)
+                .await
+                .expect("chdir/X_OK on /proc/sys directory must succeed");
+            // Executing a regular file on a no-exec mount must still be denied.
+            assert!(
+                matches!(
+                    container
+                        .filesystem()
+                        .access_at("/", "/proc/version", exec_check, &creds)
+                        .await,
+                    Err(FsOpError::Fs(FsError::NotPermitted))
+                ),
+                "X_OK on regular file /proc/version must be denied"
+            );
+        });
     }
 }

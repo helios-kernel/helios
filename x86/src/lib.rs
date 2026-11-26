@@ -349,6 +349,7 @@ fn x86_kernel_main() -> ! {
     if !block_functions.is_empty() {
         devices = devices.with_block_devices(block_functions.len());
     }
+    cpu.platform_state().install_devices(devices);
     let boot_memory = collect_boot_memory_metadata(
         &handoff,
         physical_memory_offset,
@@ -1739,11 +1740,10 @@ extern "C" fn secondary_start_rust(
     let debug_state = boot.platform().debug_state();
     let console = serial_console(debug_state.clone());
     let cpu = X86Cpu::new(boot.platform());
-    let kernel = helios_kernel::init_with_watchdog(Platform::with_watchdog(
-        console,
-        cpu.clone(),
-        cpu.watchdog(),
-    ));
+    let kernel = helios_kernel::init_with_watchdog(
+        Platform::with_watchdog(console, cpu.clone(), cpu.watchdog())
+            .with_devices(cpu.platform_state().devices()),
+    );
     smp::current_runtime().install_timer(kernel.timer());
     smp::join_shootdown_targets();
     x86_64::instructions::interrupts::enable();

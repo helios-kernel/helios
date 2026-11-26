@@ -5,7 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ipc.h>
 #include <sys/mman.h>
+#include <sys/shm.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
 #include <unistd.h>
@@ -301,6 +303,12 @@ static void reservation(void) {
 
 int main(int argc, char **argv) {
     if (argc != 2) return 100;
+    if (!strcmp(argv[1], "shm-create")) {
+        int id = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+        if (id < 0) return 1;
+        printf("%d\n", id);
+        return 0;
+    }
     page = sysconf(_SC_PAGESIZE);
     program_break();
     allocator();

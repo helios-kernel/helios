@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Builds a minimal static musl non-PIE (ET_EXEC) `busybox` binary containing
-# `ip` and `udhcpc` from the pinned upstream 1.36.1 source tarball for
+# Builds a full static musl non-PIE (ET_EXEC) `busybox` binary from the pinned
+# upstream 1.36.1 source tarball (`make defconfig` + `CONFIG_STATIC=y`) for
 # `x86_64` or `aarch64` using `zig cc`, caching the verified tarball and
 # per-architecture binary under `target/linux-busybox-cache/`.
 # Usage: build-busybox.sh <output binary path> [x86_64|aarch64]
@@ -20,7 +20,7 @@ BUSYBOX_SHA256="b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314
 
 cache_dir="target/linux-busybox-cache"
 tarball="${cache_dir}/busybox-${BUSYBOX_VERSION}.tar.bz2"
-cached_bin="${cache_dir}/busybox-${BUSYBOX_VERSION}-${arch}"
+cached_bin="${cache_dir}/busybox-${BUSYBOX_VERSION}-defconfig-${arch}"
 
 mkdir -p "$cache_dir" "$(dirname "$output")"
 
@@ -86,7 +86,10 @@ chmod +x "$cc_wrapper"
     cd "$work_dir/src"
     export ZIG_LOCAL_CACHE_DIR="$work_dir/zig-local-cache"
     mkdir -p "$ZIG_LOCAL_CACHE_DIR"
-    # Strip GNU-ld-only flags that zig/lld rejects.
+    # Strip GNU-ld-only flags that zig/lld rejects, and guard CBQ decoding in
+    # `networking/tc.c` behind `#ifdef TCA_CBQ_MAX` so BusyBox 1.36.1 builds
+    # with unmodified `defconfig` against Linux >= 6.8 UAPI headers (e.g. newer
+    # Zig toolchains) as well as Zig 0.13.
     python3 - <<'PY'
 from pathlib import Path
 p = Path("scripts/trylink")
@@ -94,24 +97,28 @@ text = p.read_text()
 for flag in ("-Wl,--warn-common", "-Wl,--verbose", "-Wl,-Map,$EXE.map"):
     text = text.replace(flag, "")
 p.write_text(text)
+
+tc = Path("networking/tc.c")
+tc_text = tc.read_text()
+needle = "static int cbq_print_opt(struct rtattr *opt)\n{\n"
+end_needle = " done:\n\treturn 0;\n}\n"
+start = tc_text.index(needle)
+end = tc_text.index(end_needle, start) + len(end_needle)
+body = tc_text[start + len(needle):end - 2]
+replacement = (
+    needle
+    + "#ifdef TCA_CBQ_MAX\n"
+    + body
+    + "#else\n\t(void)opt;\n\treturn 0;\n#endif\n}\n"
+)
+tc.write_text(tc_text[:start] + replacement + tc_text[end:])
 PY
-    make allnoconfig HOSTCC="$host_cc" >/dev/null
+    make defconfig HOSTCC="$host_cc" >/dev/null
     python3 - <<'PY'
 from pathlib import Path
 p = Path(".config")
 text = p.read_text()
-for sym in (
-    "CONFIG_STATIC",
-    "CONFIG_SHOW_USAGE",
-    "CONFIG_IP",
-    "CONFIG_FEATURE_IP_ADDRESS",
-    "CONFIG_FEATURE_IP_LINK",
-    "CONFIG_FEATURE_IP_ROUTE",
-    "CONFIG_UDHCPC",
-    "CONFIG_FEATURE_UDHCP_RFC3397",
-):
-    text = text.replace(f"# {sym} is not set", f"{sym}=y")
-text = text.replace("CONFIG_FEATURE_UDHCPC_ARPING=y", "# CONFIG_FEATURE_UDHCPC_ARPING is not set")
+text = text.replace("# CONFIG_STATIC is not set", "CONFIG_STATIC=y")
 p.write_text(text)
 PY
     # `yes` exits with SIGPIPE once `make oldconfig` closes stdin.
@@ -122,7 +129,7 @@ PY
         AR="zig ar" \
         LD="$cc_wrapper" \
         SKIP_STRIP=y \
-        EXTRA_CFLAGS="-Os -fno-PIE -Wno-ignored-optimization-argument" \
+        EXTRA_CFLAGS="-Os -fno-PIE -DBB_GLOBAL_CONST= -Wno-ignored-optimization-argument" \
         EXTRA_LDFLAGS="-static -no-pie -s -Wl,--build-id=none" \
         busybox >/dev/null
 )
