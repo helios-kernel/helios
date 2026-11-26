@@ -209,6 +209,13 @@ impl Psci {
             PsciConduit::Smc => psci::affinity_info::<Smc>(mpidr, LowestAffinityLevel::All),
         }
     }
+
+    pub(crate) fn system_off(self) -> Result<(), psci::Error> {
+        match self.conduit {
+            PsciConduit::Hvc => psci::system_off::<Hvc>(),
+            PsciConduit::Smc => psci::system_off::<Smc>(),
+        }
+    }
 }
 
 /// One processor's power state and the context it resumes from.
