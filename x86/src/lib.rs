@@ -62,9 +62,14 @@ use core::sync::atomic::{AtomicU8, Ordering, compiler_fence};
 use helios_artifact::{ProbeAnswers, cwasm_target_isa_levels};
 use helios_firmware::{AcpiNuma, LocalApicKey, ProcessorIdentities};
 use helios_hal::boot::{
-    BootMemoryMap, BootReservedRanges, usable_node_regions, usable_region_segments,
+    BootMemoryKind, BootMemoryMap, BootMemoryMetadata, BootModules, BootPayloadMetadata,
+    BootPhysicalRange, BootReservedRanges, KernelImageSections, KernelSectionRange,
+    usable_node_regions, usable_region_segments,
 };
-use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt, current_processor};
+use helios_hal::cpu::{
+    BspSnapshotContext, Cpu, Instant, ProcessorId, SnapshotPoint, SnapshotUnsupported, Timebase,
+    TimerInterrupt, X86_64SnapshotContext, current_processor,
+};
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
@@ -342,6 +347,11 @@ fn x86_kernel_main() -> ! {
     if !block_functions.is_empty() {
         devices = devices.with_block_devices(block_functions.len());
     }
+    let boot_memory = collect_boot_memory_metadata(
+        &handoff,
+        physical_memory_offset,
+        &debug_state.payload_digest(),
+    );
     let kernel = helios_kernel::init_with_watchdog(
         Platform::with_watchdog(console, cpu.clone(), cpu.watchdog())
             .with_topology(
@@ -357,7 +367,8 @@ fn x86_kernel_main() -> ! {
                 DmaModel::Translated
             })
             .with_devices(devices)
-            .with_measured_boot(measured_boot),
+            .with_measured_boot(measured_boot)
+            .with_boot_memory(boot_memory),
     );
     smp::current_runtime().install_timer(kernel.timer());
     // The first line the logger can carry. The bootloader decides where
@@ -894,6 +905,151 @@ impl ProcessorIdentities for MadtProcessors {
     }
 }
 
+#[cfg(target_os = "none")]
+global_asm!(include_str!("snapshot.S"));
+
+unsafe extern "C" {
+    static __helios_text_start: u8;
+    static __helios_text_end: u8;
+    static __helios_rodata_start: u8;
+    static __helios_rodata_end: u8;
+    static __helios_data_start: u8;
+    static __helios_data_end: u8;
+    static __helios_bss_start: u8;
+    static __helios_bss_end: u8;
+    fn helios_x86_capture_bsp_state(ctx: *mut X86_64SnapshotContext) -> u64;
+}
+
+const _: () = {
+    assert!(core::mem::offset_of!(X86_64SnapshotContext, rbx) == 0x00);
+    assert!(core::mem::offset_of!(X86_64SnapshotContext, rbp) == 0x08);
+    assert!(core::mem::offset_of!(X86_64SnapshotContext, r12) == 0x10);
+    assert!(core::mem::offset_of!(X86_64SnapshotContext, r13) == 0x18);
+    assert!(core::mem::offset_of!(X86_64SnapshotContext, r14) == 0x20);
+    assert!(core::mem::offset_of!(X86_64SnapshotContext, r15) == 0x28);
+    assert!(core::mem::offset_of!(X86_64SnapshotContext, rsp) == 0x30);
+    assert!(core::mem::offset_of!(X86_64SnapshotContext, rip) == 0x38);
+    assert!(core::mem::offset_of!(X86_64SnapshotContext, rflags) == 0x40);
+    assert!(core::mem::offset_of!(X86_64SnapshotContext, cr3) == 0x48);
+    assert!(core::mem::offset_of!(X86_64SnapshotContext, cr0) == 0x50);
+    assert!(core::mem::offset_of!(X86_64SnapshotContext, cr4) == 0x58);
+    assert!(core::mem::offset_of!(X86_64SnapshotContext, efer) == 0x60);
+    assert!(core::mem::offset_of!(X86_64SnapshotContext, fs_base) == 0x68);
+    assert!(core::mem::offset_of!(X86_64SnapshotContext, gs_base) == 0x70);
+    assert!(core::mem::offset_of!(X86_64SnapshotContext, mxcsr) == 0x78);
+    assert!(core::mem::offset_of!(X86_64SnapshotContext, fcw) == 0x7c);
+};
+
+fn x86_section_range(
+    start_sym: *const u8,
+    end_sym: *const u8,
+    handoff: &boot::LimineBootHandoff,
+) -> KernelSectionRange {
+    let vstart = start_sym.addr() as u64;
+    let vend = end_sym.addr() as u64;
+    let len = vend
+        .checked_sub(vstart)
+        .unwrap_or_else(|| panic!("x86 kernel section end {vend:#x} precedes start {vstart:#x}"));
+    let offset = vstart
+        .checked_sub(handoff.kernel.virtual_base)
+        .unwrap_or_else(|| {
+            panic!(
+                "x86 kernel section {vstart:#x} precedes virtual base {:#x}",
+                handoff.kernel.virtual_base
+            )
+        });
+    let pstart = handoff
+        .kernel
+        .physical_base
+        .checked_add(offset)
+        .expect("x86 kernel section physical address overflow");
+    KernelSectionRange::new(pstart, vstart, len)
+}
+
+fn collect_boot_memory_metadata(
+    handoff: &boot::LimineBootHandoff,
+    physical_memory_offset: usize,
+    payload_sha256: &[u8; 32],
+) -> BootMemoryMetadata {
+    let mut metadata = BootMemoryMetadata {
+        kernel_sections: KernelImageSections {
+            text: x86_section_range(
+                &raw const __helios_text_start,
+                &raw const __helios_text_end,
+                handoff,
+            ),
+            rodata: x86_section_range(
+                &raw const __helios_rodata_start,
+                &raw const __helios_rodata_end,
+                handoff,
+            ),
+            data: x86_section_range(
+                &raw const __helios_data_start,
+                &raw const __helios_data_end,
+                handoff,
+            ),
+            bss: x86_section_range(
+                &raw const __helios_bss_start,
+                &raw const __helios_bss_end,
+                handoff,
+            ),
+            uninit: None,
+            stack: None,
+        },
+        physical_memory_offset,
+        ..BootMemoryMetadata::default()
+    };
+
+    for region in handoff.memory_map.regions() {
+        let _ = metadata.firmware_memory_map.try_push(region);
+        if region.kind == BootMemoryKind::BootloaderReclaimable {
+            let _ = metadata
+                .bootloader_reclaimable
+                .try_push(BootPhysicalRange::new(region.start, region.end));
+        }
+    }
+
+    if let Some(dtb_addr) = handoff.tables.device_tree_blob {
+        // Flattened Device Tree header starts with big-endian magic 0xd00dfeed
+        // followed by big-endian totalsize at byte offset 4.
+        // SAFETY: Limine provided a mapped readable DTB header at `dtb_addr`.
+        let header = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, 8) };
+        let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        if magic == 0xd00d_feed {
+            let total_size = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+            let phys = dtb_addr
+                .checked_sub(physical_memory_offset)
+                .unwrap_or(dtb_addr) as u64;
+            metadata.device_tree_blob = Some(BootPhysicalRange::from_start_len(
+                phys,
+                u64::from(total_size),
+            ));
+        }
+    }
+
+    for module in handoff.modules.modules() {
+        let is_bootfs = module
+            .path
+            .rsplit(|&byte| byte == b'/')
+            .next()
+            .is_some_and(|name| name == b"helios-bootfs");
+        if is_bootfs {
+            let phys = module
+                .address
+                .checked_sub(physical_memory_offset)
+                .unwrap_or(module.address) as u64;
+            metadata.boot_payload = Some(BootPayloadMetadata {
+                physical_address: phys,
+                len: module.size as u64,
+                sha256: *payload_sha256,
+            });
+            break;
+        }
+    }
+
+    metadata
+}
+
 fn boot_reserved_ranges(handoff: &boot::LimineBootHandoff) -> BootReservedRanges {
     let executable_bytes = align_up(
         usize::try_from(handoff.kernel.size).unwrap_or_else(|_| {
@@ -1270,6 +1426,36 @@ impl Cpu for X86Cpu {
         }
         fill_with_rdrand(buffer);
         Ok(EntropyQuality::Cryptographic)
+    }
+
+    fn capture_bsp_state(
+        &self,
+        context: &mut BspSnapshotContext,
+    ) -> Result<SnapshotPoint, SnapshotUnsupported> {
+        const IA32_EFER: u32 = 0xc000_0080;
+        const IA32_FS_BASE: u32 = 0xc000_0100;
+        const IA32_GS_BASE: u32 = 0xc000_0101;
+        // SAFETY: `IA32_EFER` is always present in 64-bit long mode and reading it has no side effects.
+        let efer = unsafe { x86_64::registers::model_specific::Msr::new(IA32_EFER).read() };
+        // SAFETY: `IA32_FS_BASE` is always present in 64-bit long mode and reading it has no side effects.
+        let fs_base = unsafe { x86_64::registers::model_specific::Msr::new(IA32_FS_BASE).read() };
+        // SAFETY: `IA32_GS_BASE` is always present in 64-bit long mode and reading it has no side effects.
+        let gs_base = unsafe { x86_64::registers::model_specific::Msr::new(IA32_GS_BASE).read() };
+        let mut raw = X86_64SnapshotContext {
+            efer,
+            fs_base,
+            gs_base,
+            ..X86_64SnapshotContext::default()
+        };
+        // SAFETY: `&raw mut raw` is a valid, aligned `X86_64SnapshotContext`
+        // matching the offsets pinned for `helios_x86_capture_bsp_state`.
+        let status = unsafe { helios_x86_capture_bsp_state(&raw mut raw) };
+        if status == 0 {
+            *context = BspSnapshotContext::from_x86_64(&raw);
+            Ok(SnapshotPoint::Captured)
+        } else {
+            Ok(SnapshotPoint::Resumed)
+        }
     }
 
     fn shutdown(&self) -> ! {

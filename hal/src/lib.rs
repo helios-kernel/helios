@@ -216,6 +216,9 @@ pub struct Platform<
     /// The platform's measured-boot device, present only when the chain
     /// that loaded the kernel measured it into that device.
     pub measured_boot: Option<MeasuredBootImpl>,
+    /// Boot-time kernel image section boundaries, firmware memory map,
+    /// bootloader-reclaimable ranges, DTB range, and payload metadata.
+    pub boot_memory: Option<boot::BootMemoryMetadata>,
 }
 
 impl<Console: Write + Send + 'static, Cpu: cpu::Cpu> Platform<Console, Cpu> {
@@ -244,6 +247,7 @@ where
             devices: DeviceInventory::new(),
             watchdog,
             measured_boot: None,
+            boot_memory: None,
         }
     }
 }
@@ -270,6 +274,7 @@ where
             devices,
             watchdog,
             measured_boot: _,
+            boot_memory,
         } = self;
         Platform {
             console,
@@ -280,6 +285,14 @@ where
             devices,
             watchdog,
             measured_boot,
+            boot_memory,
+        }
+    }
+
+    pub fn with_boot_memory(self, boot_memory: boot::BootMemoryMetadata) -> Self {
+        Self {
+            boot_memory: Some(boot_memory),
+            ..self
         }
     }
 

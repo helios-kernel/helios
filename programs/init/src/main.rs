@@ -43,19 +43,20 @@ use helios_api::programs::{
     TerminalRight,
 };
 use helios_api::root_supervisor::{
-    self, EscalationAction as ApiEscalationAction, FatalReport, HardwareInventory,
+    self, DeviceGrantInfo, EscalationAction as ApiEscalationAction, FatalReport, HardwareInventory,
     ManagedSpawnRequest, OomPolicy, ProviderExit, ProviderHandle, ProviderRequest,
 };
 use helios_api::task;
 use helios_api::vsock::VsockListener;
 use helios_component_manager::{
     AuthorityScopeSpec, BoundSocket, CapabilityCeiling, ChildProcess, ClockRights, ComponentNode,
-    ComponentStateRecord, ContainerMountSharingSpec, DeviceClasses, EscalationAction, ExitOutcome,
-    FatalEscalation, FsRights, HardwareInventorySnapshot, IpAddrSpec, IpcChannelEnd, LinkRights,
-    MachineRights, MountRights, MountSharingSpec, MountSourceSpec, MountSpec, NameCeiling,
-    NetRights, OciRunnerSpec, OomTier, ProcessRights, ProviderEndpoint, ProviderOutcome,
-    ProviderSlot, RunnerSpec, RuntimeError, SpawnComponentArgs, Supervisor, SupervisorRuntime,
-    TcpSocketListener, TerminalRights, VmRunnerSpec, VsockSocketListener,
+    ComponentStateRecord, ContainerMountSharingSpec, DEFAULT_OCI_STORE_PATH, DeviceClasses,
+    EscalationAction, ExitOutcome, FatalEscalation, FsRights, HardwareInventorySnapshot,
+    IpAddrSpec, IpcChannelEnd, LinkRights, MachineRights, MountRights, MountSharingSpec,
+    MountSourceSpec, MountSpec, NameCeiling, NetRights, OciRunnerSpec, OomTier, ProcessRights,
+    ProviderEndpoint, ProviderOutcome, ProviderSlot, RunnerSpec, RuntimeError, SpawnComponentArgs,
+    Supervisor, SupervisorRuntime, TcpSocketListener, TerminalRights, VmRunnerSpec,
+    VsockSocketListener, directory_covered_by, normalize_abs_path, path_is_prefix,
 };
 
 const FSTAB: &str = "/etc/fstab";
@@ -612,7 +613,7 @@ impl SupervisorRuntime for HeliosRuntime {
         } else {
             (
                 build_capability_grants(&node.capabilities),
-                extract_named_devices(&node.capabilities.named_devices),
+                extract_named_devices(&node.capabilities.named_devices)?,
             )
         };
         let request = ProviderRequest {
@@ -672,7 +673,7 @@ impl SupervisorRuntime for HeliosRuntime {
                     cwd: wasm.cwd.as_deref().map(str::to_owned),
                     sockets,
                     capability_grants: grants,
-                    named_devices: extract_named_devices(&args.node.capabilities.named_devices),
+                    named_devices: extract_named_devices(&args.node.capabilities.named_devices)?,
                     oom_policy: map_oom_policy(args.node.oom_tier),
                 })
                 .await
@@ -707,7 +708,7 @@ impl SupervisorRuntime for HeliosRuntime {
                     cwd: exec.cwd.as_deref().map(str::to_owned),
                     sockets,
                     capability_grants: grants,
-                    named_devices: extract_named_devices(&args.node.capabilities.named_devices),
+                    named_devices: extract_named_devices(&args.node.capabilities.named_devices)?,
                     oom_policy: map_oom_policy(args.node.oom_tier),
                 })
                 .await
@@ -774,14 +775,168 @@ impl SupervisorRuntime for HeliosRuntime {
     }
 }
 
+fn validate_oci_runtime_authority(
+    node: &ComponentNode,
+    oci: &OciRunnerSpec,
+) -> Result<Option<String>, RuntimeError> {
+    if node.oom_tier != OomTier::User {
+        return Err(RuntimeError::PermissionDenied {
+            detail: format!(
+                "oci component `{}` requested unsupported oom_tier `{}` (only `user` is supported)",
+                node.moniker,
+                node.oom_tier.as_str()
+            ),
+        });
+    }
+    if !node.capabilities.named_devices.is_empty() {
+        return Err(RuntimeError::PermissionDenied {
+            detail: format!(
+                "oci component `{}` cannot receive raw `named_devices` grants",
+                node.moniker
+            ),
+        });
+    }
+    let store_root = if oci.image.is_some() {
+        let raw_store = oci.store.as_deref().unwrap_or(DEFAULT_OCI_STORE_PATH);
+        let normalized_store =
+            normalize_abs_path(raw_store).map_err(|reason| RuntimeError::PermissionDenied {
+                detail: format!(
+                    "oci component `{}` has invalid store path `{raw_store}`: {reason}",
+                    node.moniker
+                ),
+            })?;
+        if !directory_covered_by(
+            node.capabilities.directories.as_ref(),
+            &normalized_store,
+            FsRights::READ,
+        ) {
+            return Err(RuntimeError::PermissionDenied {
+                detail: format!(
+                    "oci component `{}` lacks read authority for store `{normalized_store}`",
+                    node.moniker
+                ),
+            });
+        }
+        Some(normalized_store)
+    } else if let Some(raw_store) = &oci.store {
+        let normalized_store = normalize_abs_path(raw_store.as_ref()).map_err(|reason| {
+            RuntimeError::PermissionDenied {
+                detail: format!(
+                    "oci component `{}` has invalid store path `{raw_store}`: {reason}",
+                    node.moniker
+                ),
+            }
+        })?;
+        if !directory_covered_by(
+            node.capabilities.directories.as_ref(),
+            &normalized_store,
+            FsRights::READ,
+        ) {
+            return Err(RuntimeError::PermissionDenied {
+                detail: format!(
+                    "oci component `{}` lacks read authority for store `{normalized_store}`",
+                    node.moniker
+                ),
+            });
+        }
+        Some(normalized_store)
+    } else {
+        None
+    };
+
+    if let Some(rootfs) = &oci.rootfs {
+        let normalized_rootfs = normalize_abs_path(rootfs.as_ref()).map_err(|reason| {
+            RuntimeError::PermissionDenied {
+                detail: format!(
+                    "oci component `{}` has invalid rootfs path `{rootfs}`: {reason}",
+                    node.moniker
+                ),
+            }
+        })?;
+        if !directory_covered_by(
+            node.capabilities.directories.as_ref(),
+            &normalized_rootfs,
+            FsRights::READ.union(FsRights::EXECUTE),
+        ) {
+            return Err(RuntimeError::PermissionDenied {
+                detail: format!(
+                    "oci component `{}` lacks read+execute authority for rootfs `{normalized_rootfs}`",
+                    node.moniker
+                ),
+            });
+        }
+    }
+
+    for mount in oci.mounts.iter() {
+        let normalized_source = normalize_abs_path(mount.source.as_ref()).map_err(|reason| {
+            RuntimeError::PermissionDenied {
+                detail: format!(
+                    "oci component `{}` has invalid mount source `{}`: {reason}",
+                    node.moniker, mount.source
+                ),
+            }
+        })?;
+        normalize_abs_path(mount.target.as_ref()).map_err(|reason| {
+            RuntimeError::PermissionDenied {
+                detail: format!(
+                    "oci component `{}` has invalid mount target `{}`: {reason}",
+                    node.moniker, mount.target
+                ),
+            }
+        })?;
+        if !directory_covered_by(
+            node.capabilities.directories.as_ref(),
+            &normalized_source,
+            mount.rights,
+        ) {
+            return Err(RuntimeError::PermissionDenied {
+                detail: format!(
+                    "oci component `{}` mount source `{normalized_source}` exceeds directory ceiling",
+                    node.moniker
+                ),
+            });
+        }
+    }
+
+    Ok(store_root)
+}
+
+fn validate_oci_resolved_rootfs(
+    moniker: &str,
+    store_root: &str,
+    rootfs_path: &Path,
+) -> Result<String, RuntimeError> {
+    let raw = rootfs_path
+        .to_str()
+        .ok_or_else(|| RuntimeError::PermissionDenied {
+            detail: format!("oci component `{moniker}` resolved non-UTF-8 image rootfs path"),
+        })?;
+    let normalized = normalize_abs_path(raw).map_err(|reason| RuntimeError::PermissionDenied {
+        detail: format!(
+            "oci component `{moniker}` resolved invalid image rootfs path `{raw}`: {reason}"
+        ),
+    })?;
+    if !path_is_prefix(store_root, &normalized) {
+        return Err(RuntimeError::PermissionDenied {
+            detail: format!(
+                "oci component `{moniker}` resolved image rootfs `{normalized}` escapes store `{store_root}`"
+            ),
+        });
+    }
+    Ok(normalized)
+}
+
 async fn spawn_oci_component(
     node: &ComponentNode,
     oci: &OciRunnerSpec,
     sockets: Vec<InheritedSocket>,
     ipc_channels: Vec<(String, HeliosIpcEnd)>,
 ) -> Result<HeliosChild, RuntimeError> {
+    let verified_store_root = validate_oci_runtime_authority(node, oci)?;
     let mut builder = if let Some(image_ref) = &oci.image {
-        let store_root = oci.store.as_deref().unwrap_or("/var/lib/oci");
+        let store_root = verified_store_root
+            .as_deref()
+            .unwrap_or(DEFAULT_OCI_STORE_PATH);
         let store = open_image_store(store_root).map_err(|error| RuntimeError::Other {
             detail: format!("opening OCI store `{store_root}`: {error}"),
         })?;
@@ -797,6 +952,7 @@ async fn spawn_oci_component(
             .ok_or_else(|| RuntimeError::NotFound {
                 detail: format!("OCI image `{image_ref}` not present in `{store_root}`"),
             })?;
+        validate_oci_resolved_rootfs(node.moniker.as_ref(), store_root, pulled.rootfs_path())?;
         ContainerBuilder::from_image(&pulled).map_err(|error| RuntimeError::Other {
             detail: format!("configuring container from OCI image `{image_ref}`: {error}"),
         })?
@@ -924,7 +1080,7 @@ async fn spawn_vm_component(
         cwd: None,
         sockets,
         capability_grants: grants,
-        named_devices: extract_named_devices(&node.capabilities.named_devices),
+        named_devices: extract_named_devices(&node.capabilities.named_devices)?,
         oom_policy: map_oom_policy(node.oom_tier),
     })
     .await
@@ -983,10 +1139,23 @@ fn map_scope(scope: AuthorityScopeSpec) -> Option<AuthorityScope> {
     }
 }
 
-fn extract_named_devices(ceiling: &NameCeiling) -> Vec<String> {
+fn resolve_named_devices(ceiling: &NameCeiling, discovered: &[DeviceGrantInfo]) -> Vec<String> {
     match ceiling {
-        NameCeiling::Any => Vec::new(),
+        NameCeiling::Any => discovered.iter().map(|d| d.name.clone()).collect(),
         NameCeiling::Set(names) => names.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn extract_named_devices(ceiling: &NameCeiling) -> Result<Vec<String>, RuntimeError> {
+    match ceiling {
+        NameCeiling::Any => {
+            let inv =
+                root_supervisor::hardware_inventory().map_err(|error| RuntimeError::Other {
+                    detail: format!("reading hardware inventory for named devices: {error}"),
+                })?;
+            Ok(resolve_named_devices(ceiling, &inv.devices))
+        }
+        NameCeiling::Set(_) => Ok(resolve_named_devices(ceiling, &[])),
     }
 }
 
@@ -1244,9 +1413,21 @@ async fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use helios_api::mounts::MountSharing;
+    use std::borrow::Cow;
+    use std::path::Path;
 
-    use super::{commit_seconds, generated_topology, max_inline_bytes, parse_fstab};
+    use helios_api::mounts::MountSharing;
+    use helios_api::root_supervisor::DeviceGrantInfo;
+    use helios_component_manager::{
+        CapabilityCeiling, ComponentNode, Criticality, DirectoryGrantSpec, EscalationAction,
+        FsRights, HardwarePredicates, LifecycleKind, NameCeiling, OciRunnerSpec, OomTier,
+        RestartPolicy, RunnerSpec, RuntimeError, StartupPolicy,
+    };
+
+    use super::{
+        commit_seconds, generated_topology, max_inline_bytes, parse_fstab, resolve_named_devices,
+        validate_oci_resolved_rootfs, validate_oci_runtime_authority,
+    };
 
     #[test]
     fn default_generated_topology_is_valid_and_contains_core_components() {
@@ -1394,5 +1575,138 @@ host-share /한국어 ro,shared
         }
         let twice = parse_fstab("memory /tmp shared,shared\n").unwrap();
         assert_eq!(twice[0].sharing, MountSharing::Shared);
+    }
+
+    #[test]
+    fn resolve_named_devices_expands_any_ceiling_and_preserves_explicit_set() {
+        let discovered = vec![
+            DeviceGrantInfo {
+                name: "pci:00:02.0".to_owned(),
+                regions: 1,
+                interrupt_count: 1,
+                dma_budget_bytes: 4096,
+                confined: true,
+                claimed: false,
+            },
+            DeviceGrantInfo {
+                name: "pci:00:03.0".to_owned(),
+                regions: 2,
+                interrupt_count: 2,
+                dma_budget_bytes: 8192,
+                confined: true,
+                claimed: false,
+            },
+        ];
+        assert_eq!(
+            resolve_named_devices(&NameCeiling::Any, &discovered),
+            vec!["pci:00:02.0".to_owned(), "pci:00:03.0".to_owned()]
+        );
+        assert_eq!(
+            resolve_named_devices(
+                &NameCeiling::Set(Cow::Borrowed(&[Cow::Borrowed("pci:00:02.0")])),
+                &discovered
+            ),
+            vec!["pci:00:02.0".to_owned()]
+        );
+    }
+
+    #[test]
+    fn oci_runtime_authority_and_resolved_rootfs_enforce_ceilings() {
+        let oci = OciRunnerSpec {
+            image: Some(Cow::Borrowed("alpine:3.20")),
+            rootfs: None,
+            store: Some(Cow::Borrowed("/var/lib/oci")),
+            hostname: Cow::Borrowed("app"),
+            uid: 0,
+            gid: 0,
+            entrypoint: Cow::Borrowed(&[]),
+            cmd: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            mounts: Cow::Borrowed(&[]),
+        };
+        let mut node = ComponentNode {
+            moniker: Cow::Borrowed("/apps/web"),
+            instance_name: Cow::Borrowed("web"),
+            parent_index: Some(0),
+            children_indices: Cow::Borrowed(&[]),
+            runner: RunnerSpec::Oci(oci.clone()),
+            startup: StartupPolicy::Lazy,
+            lifecycle: LifecycleKind::Service,
+            requires: HardwarePredicates::NONE,
+            after: Cow::Borrowed(&[]),
+            mounts: Cow::Borrowed(&[]),
+            restart: RestartPolicy::Never,
+            restart_backoff_ms: 250,
+            restart_backoff_max_ms: 30_000,
+            burst_limit: 5,
+            burst_window_ms: 60_000,
+            stop_timeout_ms: 5_000,
+            critical: Criticality::None,
+            escalation: EscalationAction::Halt,
+            oom_tier: OomTier::User,
+            dynamic_mount: false,
+            capabilities: CapabilityCeiling::EMPTY,
+            exposes: Cow::Borrowed(&[]),
+            routes: Cow::Borrowed(&[]),
+            sockets: Cow::Borrowed(&[]),
+        };
+
+        // Missing directory read grant for `/var/lib/oci` -> denied.
+        assert!(matches!(
+            validate_oci_runtime_authority(&node, &oci),
+            Err(RuntimeError::PermissionDenied { .. })
+        ));
+
+        // Grant read on `/var/lib/oci` -> accepted.
+        node.capabilities.directories = Cow::Owned(vec![DirectoryGrantSpec {
+            source: Cow::Borrowed("/var/lib/oci"),
+            guest: Cow::Borrowed("/var/lib/oci"),
+            rights: FsRights::READ,
+        }]);
+        assert_eq!(
+            validate_oci_runtime_authority(&node, &oci).expect("authorized store"),
+            Some("/var/lib/oci".to_owned())
+        );
+
+        // Elevated oom_tier or named_devices -> denied.
+        node.oom_tier = OomTier::Plugin;
+        assert!(matches!(
+            validate_oci_runtime_authority(&node, &oci),
+            Err(RuntimeError::PermissionDenied { .. })
+        ));
+        node.oom_tier = OomTier::User;
+        node.capabilities.named_devices = NameCeiling::Any;
+        assert!(matches!(
+            validate_oci_runtime_authority(&node, &oci),
+            Err(RuntimeError::PermissionDenied { .. })
+        ));
+
+        // Resolved rootfs inside store -> accepted; sibling prefix or escape -> denied.
+        assert_eq!(
+            validate_oci_resolved_rootfs(
+                "/apps/web",
+                "/var/lib/oci",
+                Path::new("/var/lib/oci/images/abc/rootfs")
+            )
+            .expect("inside store"),
+            "/var/lib/oci/images/abc/rootfs"
+        );
+        assert!(matches!(
+            validate_oci_resolved_rootfs(
+                "/apps/web",
+                "/var/lib/oci",
+                Path::new("/var/lib/oci2/evil")
+            ),
+            Err(RuntimeError::PermissionDenied { .. })
+        ));
+        assert!(matches!(
+            validate_oci_resolved_rootfs(
+                "/apps/web",
+                "/var/lib/oci",
+                Path::new("/var/lib/oci/../etc")
+            ),
+            Err(RuntimeError::PermissionDenied { .. })
+        ));
     }
 }

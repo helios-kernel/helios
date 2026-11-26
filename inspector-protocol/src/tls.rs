@@ -259,8 +259,20 @@ struct TlsIo<R, W, C> {
     conn: C,
     pending_ciphertext: Vec<u8>,
     pending_offset: usize,
+    /// `true` while an `AsyncWrite` call (`poll_write`/`poll_flush`/`poll_close`)
+    /// returned `Poll::Pending` on `self.write` so `poll_read_plaintext` never
+    /// polls `self.write` with the reader's `Context` and overwrites the writer
+    /// task's registered waker.
+    writer_waiting: bool,
     read_eof: bool,
     scratch: [u8; 16 * 1024],
+    rx_cipher_offset: usize,
+    rx_cipher_len: usize,
+}
+
+enum CipherReadStep {
+    Progress,
+    Eof,
 }
 
 impl<R, W, S, C> TlsIo<R, W, C>
@@ -277,8 +289,11 @@ where
             conn,
             pending_ciphertext: Vec::new(),
             pending_offset: 0,
+            writer_waiting: false,
             read_eof: false,
             scratch: [0u8; 16 * 1024],
+            rx_cipher_offset: 0,
+            rx_cipher_len: 0,
         }
     }
 
@@ -321,24 +336,78 @@ where
         Pin::new(&mut self.write).poll_flush(cx)
     }
 
-    fn poll_read_ciphertext_step(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+    fn feed_buffered_ciphertext(&mut self) -> io::Result<usize> {
+        let mut total_consumed = 0usize;
+        while self.rx_cipher_offset < self.rx_cipher_len {
+            let mut cursor = &self.scratch[self.rx_cipher_offset..self.rx_cipher_len];
+            let consumed = self.conn.read_tls(&mut cursor)?;
+            if consumed == 0 {
+                break;
+            }
+            self.rx_cipher_offset += consumed;
+            total_consumed += consumed;
+            self.conn
+                .process_new_packets()
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        }
+        if self.rx_cipher_offset >= self.rx_cipher_len {
+            self.rx_cipher_offset = 0;
+            self.rx_cipher_len = 0;
+        }
+        Ok(total_consumed)
+    }
+
+    fn poll_read_ciphertext_step(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<CipherReadStep>> {
+        if self.rx_cipher_offset < self.rx_cipher_len {
+            let consumed = match self.feed_buffered_ciphertext() {
+                Ok(n) => n,
+                Err(err) => return Poll::Ready(Err(err)),
+            };
+            if consumed > 0 {
+                return Poll::Ready(Ok(CipherReadStep::Progress));
+            }
+            let io_state = match self.conn.process_new_packets() {
+                Ok(state) => state,
+                Err(err) => {
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, err)));
+                }
+            };
+            if io_state.plaintext_bytes_to_read() > 0 {
+                return Poll::Ready(Ok(CipherReadStep::Progress));
+            }
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS deframer stalled with unconsumed ciphertext buffered",
+            )));
+        }
+
         match Pin::new(&mut self.read).poll_read(cx, &mut self.scratch) {
             Poll::Ready(Ok(0)) => {
                 self.read_eof = true;
-                Poll::Ready(Ok(0))
+                Poll::Ready(Ok(CipherReadStep::Eof))
             }
             Poll::Ready(Ok(n)) => {
-                let mut cursor = &self.scratch[..n];
-                while !cursor.is_empty() {
-                    let consumed = self.conn.read_tls(&mut cursor)?;
-                    if consumed == 0 {
-                        break;
-                    }
-                    self.conn
-                        .process_new_packets()
-                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+                self.rx_cipher_offset = 0;
+                self.rx_cipher_len = n;
+                match self.feed_buffered_ciphertext() {
+                    Ok(consumed) if consumed > 0 => Poll::Ready(Ok(CipherReadStep::Progress)),
+                    Ok(_) => match self.conn.process_new_packets() {
+                        Ok(io_state) if io_state.plaintext_bytes_to_read() > 0 => {
+                            Poll::Ready(Ok(CipherReadStep::Progress))
+                        }
+                        Ok(_) => Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "TLS deframer rejected newly read ciphertext without making progress",
+                        ))),
+                        Err(err) => {
+                            Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, err)))
+                        }
+                    },
+                    Err(err) => Poll::Ready(Err(err)),
                 }
-                Poll::Ready(Ok(n))
             }
             Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
             Poll::Pending => Poll::Pending,
@@ -357,15 +426,15 @@ where
             if !self.conn.is_handshaking() {
                 return Poll::Ready(Ok(()));
             }
-            if self.conn.wants_read() {
+            if self.conn.wants_read() || self.rx_cipher_offset < self.rx_cipher_len {
                 match self.poll_read_ciphertext_step(cx) {
-                    Poll::Ready(Ok(0)) => {
+                    Poll::Ready(Ok(CipherReadStep::Eof)) => {
                         return Poll::Ready(Err(TlsError::Io(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "EOF during TLS 1.3 handshake",
                         ))));
                     }
-                    Poll::Ready(Ok(_)) => continue,
+                    Poll::Ready(Ok(CipherReadStep::Progress)) => continue,
                     Poll::Ready(Err(err)) => return Poll::Ready(Err(TlsError::Io(err))),
                     Poll::Pending => return Poll::Pending,
                 }
@@ -383,8 +452,15 @@ where
             return Poll::Ready(Ok(0));
         }
         loop {
-            // Flush any TLS post-handshake messages (e.g. session tickets / close_notify).
-            if (self.conn.wants_write() || self.pending_offset < self.pending_ciphertext.len())
+            // Queue any TLS post-handshake control messages (e.g. KeyUpdate /
+            // alert). Only flush through `self.write` when no split writer task
+            // is parked on `self.write`, so we never overwrite the writer's waker.
+            if self.writer_waiting {
+                if self.conn.wants_write() {
+                    self.drain_tls_outbox();
+                }
+            } else if (self.conn.wants_write()
+                || self.pending_offset < self.pending_ciphertext.len())
                 && let Poll::Ready(Err(err)) = self.poll_flush_ciphertext(cx)
             {
                 return Poll::Ready(Err(err));
@@ -393,12 +469,12 @@ where
                 Ok(n) if n > 0 => return Poll::Ready(Ok(n)),
                 Ok(_) => return Poll::Ready(Ok(0)),
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    if self.read_eof {
+                    if self.rx_cipher_offset == self.rx_cipher_len && self.read_eof {
                         return Poll::Ready(Ok(0));
                     }
                     match self.poll_read_ciphertext_step(cx) {
-                        Poll::Ready(Ok(0)) => return Poll::Ready(Ok(0)),
-                        Poll::Ready(Ok(_)) => continue,
+                        Poll::Ready(Ok(CipherReadStep::Eof)) => return Poll::Ready(Ok(0)),
+                        Poll::Ready(Ok(CipherReadStep::Progress)) => continue,
                         Poll::Ready(Err(io_err)) => return Poll::Ready(Err(io_err)),
                         Poll::Pending => return Poll::Pending,
                     }
@@ -414,32 +490,75 @@ where
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         if buf.is_empty() {
+            self.writer_waiting = false;
             return Poll::Ready(Ok(0));
         }
         if self.pending_offset < self.pending_ciphertext.len() {
             match self.poll_flush_ciphertext(cx) {
                 Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(err)) => {
+                    self.writer_waiting = false;
+                    return Poll::Ready(Err(err));
+                }
+                Poll::Pending => {
+                    self.writer_waiting = true;
+                    return Poll::Pending;
+                }
             }
         }
         let written = self.conn.writer().write(buf)?;
         self.drain_tls_outbox();
-        let _ = self.poll_flush_ciphertext(cx)?;
-        Poll::Ready(Ok(written))
+        match self.poll_flush_ciphertext(cx) {
+            Poll::Ready(Ok(())) => {
+                self.writer_waiting = false;
+                Poll::Ready(Ok(written))
+            }
+            Poll::Ready(Err(err)) => {
+                self.writer_waiting = false;
+                Poll::Ready(Err(err))
+            }
+            Poll::Pending => {
+                self.writer_waiting = false;
+                Poll::Ready(Ok(written))
+            }
+        }
     }
 
     fn poll_flush_tls(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.conn.writer().flush()?;
-        self.poll_flush_ciphertext(cx)
+        match self.poll_flush_ciphertext(cx) {
+            Poll::Ready(res) => {
+                self.writer_waiting = false;
+                Poll::Ready(res)
+            }
+            Poll::Pending => {
+                self.writer_waiting = true;
+                Poll::Pending
+            }
+        }
     }
 
     fn poll_close_tls(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.conn.send_close_notify();
         match self.poll_flush_ciphertext(cx) {
-            Poll::Ready(Ok(())) => Pin::new(&mut self.write).poll_close(cx),
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => match Pin::new(&mut self.write).poll_close(cx) {
+                Poll::Ready(res) => {
+                    self.writer_waiting = false;
+                    Poll::Ready(res)
+                }
+                Poll::Pending => {
+                    self.writer_waiting = true;
+                    Poll::Pending
+                }
+            },
+            Poll::Ready(Err(err)) => {
+                self.writer_waiting = false;
+                Poll::Ready(Err(err))
+            }
+            Poll::Pending => {
+                self.writer_waiting = true;
+                Poll::Pending
+            }
         }
     }
 }
@@ -775,14 +894,15 @@ mod tests {
                 let sign_req: TlsControlRequest = read_auth_message(&mut host_ctrl_r)
                     .await
                     .expect("host read SignHandshake");
-                let (channel_binding, tls_spki_sha256, server_nonce) = match sign_req {
+                let (channel_binding, tls_spki_sha256) = match sign_req {
                     TlsControlRequest::SignHandshake {
                         channel_binding,
                         tls_spki_sha256,
-                        server_nonce,
-                    } => (channel_binding, tls_spki_sha256, server_nonce),
+                    } => (channel_binding, tls_spki_sha256),
                     other => panic!("unexpected first control request: {other:?}"),
                 };
+                // Host generates server_nonce itself (never supplied by inspector-tls).
+                let server_nonce = random_32().expect("host server_nonce");
                 let now_unix = 1_700_000_000;
                 let challenge = compute_handshake_challenge(
                     AUTH_PROTOCOL_VERSION,
@@ -823,6 +943,10 @@ mod tests {
                     } => (server_hello, channel_binding, client_auth),
                     other => panic!("unexpected second control request: {other:?}"),
                 };
+                assert_eq!(
+                    server_hello.server_nonce, server_nonce,
+                    "authenticated ServerHello must carry host-generated server_nonce"
+                );
                 let verified = verify_client_auth(
                     &policy,
                     &SessionGrants::full_worker_ceiling(),
@@ -844,7 +968,7 @@ mod tests {
                 // inspector-host now exits the session completely!
                 drop(host_ctrl_r);
                 drop(host_ctrl_w);
-                verified
+                (verified, server_nonce)
             };
 
             // 2. inspector-tls: ZERO policy, ZERO machine key. Relays handshake via control,
@@ -866,7 +990,6 @@ mod tests {
                     &TlsControlRequest::SignHandshake {
                         channel_binding: binding.channel_binding,
                         tls_spki_sha256: binding.peer_cert_sha256,
-                        server_nonce: [0x24; 32],
                     },
                 )
                 .await
@@ -961,7 +1084,7 @@ mod tests {
                         .expect("client TLS connect");
                 let binding = tls.binding();
                 let (mut r, mut w) = futures_util::AsyncReadExt::split(&mut tls);
-                let (_hello, grants, session_id) = client_handshake(
+                let (hello, grants, session_id) = client_handshake(
                     &mut r,
                     &mut w,
                     TransportKind::TcpTls,
@@ -978,16 +1101,277 @@ mod tests {
                 let mut reply = [0u8; 10];
                 r.read_exact(&mut reply).await.expect("client read reply");
                 assert_eq!(&reply, b"rpc-reply1");
-                grants
+                (hello.server_nonce, grants)
             };
 
-            let ((verified, ()), ((), grants)) = futures_lite::future::zip(
-                futures_lite::future::zip(host_fut, tls_fut),
-                futures_lite::future::zip(worker_fut, client_fut),
-            )
-            .await;
+            let (((verified, host_nonce), ()), ((), (client_nonce, grants))) =
+                futures_lite::future::zip(
+                    futures_lite::future::zip(host_fut, tls_fut),
+                    futures_lite::future::zip(worker_fut, client_fut),
+                )
+                .await;
             assert_eq!(verified.principal, "ops-tls");
             assert_eq!(verified.granted, grants);
+            assert_eq!(
+                client_nonce, host_nonce,
+                "client must observe the server_nonce generated by inspector-host"
+            );
         });
+    }
+
+    #[test]
+    fn tls_io_retains_unconsumed_ciphertext_across_lagging_bursts() {
+        futures_lite::future::block_on(async {
+            let (server_cfg, leaf_sha) =
+                build_ephemeral_server_config().expect("build ephemeral server config");
+            let client_cfg = build_client_config().expect("build client config");
+
+            // Use an in-memory bounded channel pair so the sender can fill the
+            // wire with >128 KiB of TLS ciphertext (many records) before the
+            // receiver begins draining plaintext slowly in tiny chunks, forcing
+            // rustls's deframer buffer to fill (`read_tls == 0`) mid-`scratch`.
+            let (c2s_tx, c2s_rx) = async_channel::bounded::<Vec<u8>>(64);
+            let (s2c_tx, s2c_rx) = async_channel::bounded::<Vec<u8>>(64);
+
+            struct ChanReader {
+                rx: Pin<Box<async_channel::Receiver<Vec<u8>>>>,
+                buf: Vec<u8>,
+                pos: usize,
+            }
+            impl AsyncRead for ChanReader {
+                fn poll_read(
+                    mut self: Pin<&mut Self>,
+                    cx: &mut Context<'_>,
+                    out: &mut [u8],
+                ) -> Poll<io::Result<usize>> {
+                    if out.is_empty() {
+                        return Poll::Ready(Ok(0));
+                    }
+                    loop {
+                        if self.pos < self.buf.len() {
+                            let n = (self.buf.len() - self.pos).min(out.len());
+                            out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+                            self.pos += n;
+                            if self.pos == self.buf.len() {
+                                self.buf.clear();
+                                self.pos = 0;
+                            }
+                            return Poll::Ready(Ok(n));
+                        }
+                        match futures_core::Stream::poll_next(self.rx.as_mut(), cx) {
+                            Poll::Ready(Some(chunk)) => {
+                                if !chunk.is_empty() {
+                                    self.buf = chunk;
+                                    self.pos = 0;
+                                }
+                            }
+                            Poll::Ready(None) => return Poll::Ready(Ok(0)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                }
+            }
+
+            struct ChanWriter {
+                tx: async_channel::Sender<Vec<u8>>,
+            }
+            impl AsyncWrite for ChanWriter {
+                fn poll_write(
+                    self: Pin<&mut Self>,
+                    _cx: &mut Context<'_>,
+                    buf: &[u8],
+                ) -> Poll<io::Result<usize>> {
+                    match self.tx.try_send(buf.to_vec()) {
+                        Ok(()) => Poll::Ready(Ok(buf.len())),
+                        Err(async_channel::TrySendError::Full(_)) => Poll::Pending,
+                        Err(async_channel::TrySendError::Closed(_)) => {
+                            Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")))
+                        }
+                    }
+                }
+                fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                    Poll::Ready(Ok(()))
+                }
+                fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                    self.tx.close();
+                    Poll::Ready(Ok(()))
+                }
+            }
+
+            let client_r = ChanReader {
+                rx: Box::pin(s2c_rx),
+                buf: Vec::new(),
+                pos: 0,
+            };
+            let client_w = ChanWriter { tx: c2s_tx };
+            let server_r = ChanReader {
+                rx: Box::pin(c2s_rx),
+                buf: Vec::new(),
+                pos: 0,
+            };
+            let server_w = ChanWriter { tx: s2c_tx };
+
+            let (mut server_tls, mut client_tls) = futures_lite::future::zip(
+                async {
+                    TlsServerStream::accept(server_r, server_w, server_cfg, leaf_sha)
+                        .await
+                        .expect("server accept")
+                },
+                async {
+                    TlsClientStream::connect(client_r, client_w, client_cfg, "helios.local")
+                        .await
+                        .expect("client connect")
+                },
+            )
+            .await;
+
+            // Burst 160 KiB of deterministic non-trivial payload (including CJK
+            // UTF-8 bytes) into TLS records BEFORE the server drains any plaintext.
+            let mut payload = Vec::with_capacity(160 * 1024);
+            let pattern = "中文日本語한국어-tls-burst-".as_bytes();
+            while payload.len() < 160 * 1024 {
+                let remaining = (160 * 1024) - payload.len();
+                let take = remaining.min(pattern.len());
+                payload.extend_from_slice(&pattern[..take]);
+            }
+
+            // Write 20 x 8 KiB chunks (160 KiB total) so multiple TLS records
+            // coalesce inside a single 16 KiB `TlsIo::scratch` read and force
+            // `conn.read_tls` to return `0` when rustls's deframer fills.
+            for chunk in payload.chunks(8 * 1024) {
+                client_tls
+                    .write_all(chunk)
+                    .await
+                    .expect("client write burst");
+            }
+            client_tls.flush().await.expect("client flush burst");
+            client_tls.close().await.expect("client close");
+
+            // Drain plaintext in small 257-byte reads so rustls's plaintext buffer
+            // stays populated across multiple `poll_read` iterations.
+            let mut received = Vec::with_capacity(payload.len());
+            let mut small_buf = [0u8; 257];
+            loop {
+                let n = server_tls
+                    .read(&mut small_buf)
+                    .await
+                    .expect("server read lagged burst");
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&small_buf[..n]);
+            }
+            assert_eq!(received.len(), payload.len());
+            assert_eq!(received, payload);
+        });
+    }
+
+    #[test]
+    fn tls_io_split_read_never_steals_parked_writer_waker() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        struct GatedWriter {
+            inner: Vec<u8>,
+            blocked: Arc<AtomicBool>,
+            saved_waker: Arc<std::sync::Mutex<Option<Waker>>>,
+        }
+        impl AsyncWrite for GatedWriter {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                if self.blocked.load(Ordering::Acquire) {
+                    *self.saved_waker.lock().expect("waker lock") = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+                self.inner.extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        struct PendingReader;
+        impl AsyncRead for PendingReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut [u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Pending
+            }
+        }
+
+        let (server_cfg, _leaf_sha) = build_ephemeral_server_config().expect("server config");
+        let conn = ServerConnection::new(server_cfg).expect("server conn");
+        let blocked = Arc::new(AtomicBool::new(true));
+        let saved_waker = Arc::new(std::sync::Mutex::new(None::<Waker>));
+        let mut io = TlsIo::new(
+            PendingReader,
+            GatedWriter {
+                inner: Vec::new(),
+                blocked: Arc::clone(&blocked),
+                saved_waker: Arc::clone(&saved_waker),
+            },
+            conn,
+        );
+
+        // Seed pending ciphertext so flush parks the writer task on GatedWriter.
+        io.pending_ciphertext.extend_from_slice(b"ciphertext-bytes");
+        let writer_wake_state = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let reader_wake_state = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let writer_waker = Waker::from(Arc::clone(&writer_wake_state));
+        let reader_waker = Waker::from(Arc::clone(&reader_wake_state));
+        let mut writer_cx = Context::from_waker(&writer_waker);
+        let mut reader_cx = Context::from_waker(&reader_waker);
+
+        // Writer parks on flush.
+        assert!(matches!(io.poll_flush_tls(&mut writer_cx), Poll::Pending));
+        assert!(io.writer_waiting);
+
+        // Reader polls while writer is parked: MUST NOT overwrite GatedWriter's saved waker.
+        let mut read_buf = [0u8; 64];
+        assert!(matches!(
+            io.poll_read_plaintext(&mut reader_cx, &mut read_buf),
+            Poll::Pending
+        ));
+
+        // Unblock writer and fire saved waker: MUST wake writer, NOT reader!
+        blocked.store(false, Ordering::Release);
+        saved_waker
+            .lock()
+            .expect("waker lock")
+            .take()
+            .expect("writer waker must be stored")
+            .wake();
+        assert_eq!(writer_wake_state.0.load(Ordering::Acquire), 1);
+        assert_eq!(
+            reader_wake_state.0.load(Ordering::Acquire),
+            0,
+            "poll_read_plaintext must not steal the parked writer's waker"
+        );
+
+        // Writer resumes and flushes cleanly.
+        assert!(matches!(
+            io.poll_flush_tls(&mut writer_cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(!io.writer_waiting);
     }
 }

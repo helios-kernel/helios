@@ -25,7 +25,7 @@ use helios_api::net::TcpStream;
 use helios_api::programs::{InheritedSocket, take_inherited_sockets};
 use helios_inspector_protocol::auth::{
     AUTH_PROTOCOL_VERSION, ClientAuth, ClientHello, ServerAuthResult, TlsControlRequest,
-    TlsControlResponse, random_32, read_auth_message, write_auth_message,
+    TlsControlResponse, read_auth_message, write_auth_message,
 };
 use helios_inspector_protocol::tls::{TlsServerStream, build_ephemeral_server_config};
 
@@ -55,7 +55,6 @@ async fn main() -> Result<(), String> {
         .await
         .map_err(|err| format!("TLS 1.3 accept failed: {err}"))?;
     let binding = tls.binding();
-    let server_nonce = random_32().map_err(|err| format!("random_32 failed: {err}"))?;
 
     let control = Arc::new(control);
     let (mut ctrl_read, mut ctrl_write) = split_ipc(Arc::clone(&control));
@@ -74,12 +73,12 @@ async fn main() -> Result<(), String> {
 
     // Step 1: Request domain-separated `MachineIdentity` signature over the
     // RFC 8446 `tls-exporter` channel binding and ephemeral cert digest.
+    // `inspector-host` generates the fresh CSPRNG `server_nonce` itself.
     write_auth_message(
         &mut ctrl_write,
         &TlsControlRequest::SignHandshake {
             channel_binding: binding.channel_binding,
             tls_spki_sha256: binding.peer_cert_sha256,
-            server_nonce,
         },
     )
     .await
@@ -150,18 +149,21 @@ async fn main() -> Result<(), String> {
 
     let net_to_worker = async {
         let mut buf = vec![0u8; IO_CHUNK_BYTES];
-        loop {
+        let res = loop {
             match tls_read.read(&mut buf).await {
-                Ok(0) => {
-                    data.close_write();
-                    return Ok::<(), io::Error>(());
-                }
+                Ok(0) => break Ok::<(), io::Error>(()),
                 Ok(n) => {
-                    ipc_write.write_all(&buf[..n]).await?;
+                    if let Err(err) = ipc_write.write_all(&buf[..n]).await {
+                        break Err(err);
+                    }
                 }
-                Err(err) => return Err(err),
+                Err(err) => break Err(err),
             }
-        }
+        };
+        // Always signal EOF to `inspector-worker` on both clean TCP EOF and
+        // read/write errors so the worker never hangs waiting for input.
+        data.close_write();
+        res
     };
 
     let worker_to_net = async {
@@ -189,11 +191,14 @@ async fn main() -> Result<(), String> {
         futures_util::future::Either::Right((_, _)) => {
             data.close_write();
         }
-        // Client reached EOF/error: finish draining any final worker reply
-        // through TLS before tearing down.
-        futures_util::future::Either::Left((_, remaining_worker_to_net)) => {
+        // Clean client EOF: `data.close_write()` has notified the worker, so
+        // drain any final worker reply through TLS before tearing down.
+        futures_util::future::Either::Left((Ok(()), remaining_worker_to_net)) => {
             let _ = remaining_worker_to_net.await;
         }
+        // TCP/TLS read error: `data.close_write()` already closed IPC write;
+        // tear down immediately without hanging on the broken socket.
+        futures_util::future::Either::Left((Err(_), _)) => {}
     }
     Ok(())
 }

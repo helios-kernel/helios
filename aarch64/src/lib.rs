@@ -15,12 +15,14 @@ use helios_artifact::{ProbeAnswers, cwasm_target_isa_levels};
 use helios_firmware::ProcessorIdentities;
 use helios_hal::boot::{
     BootFirmwareTables, BootHandoff, BootKernelImage, BootMemoryKind, BootMemoryMap,
-    BootMemoryRegion, BootModule, BootModules, BootReservedRanges, FirmwareKind,
+    BootMemoryMetadata, BootMemoryRegion, BootModule, BootModules, BootPayloadMetadata,
+    BootPhysicalRange, BootReservedRanges, FirmwareKind, KernelImageSections, KernelSectionRange,
     usable_node_regions,
 };
 use helios_hal::cpu::{
-    ControlFlowIntegrity, Cpu, GUEST_STACK_LIMIT_OFFSET, HardwarePerfCounters, Instant,
-    ProcessorId, Timebase, TimerInterrupt,
+    Aarch64SnapshotContext, BspSnapshotContext, ControlFlowIntegrity, Cpu,
+    GUEST_STACK_LIMIT_OFFSET, HardwarePerfCounters, Instant, ProcessorId, SnapshotPoint,
+    SnapshotUnsupported, Timebase, TimerInterrupt,
 };
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
@@ -39,7 +41,7 @@ use limine::file::File;
 use limine::firmware::{
     FIRMWARE_TYPE_EFI32, FIRMWARE_TYPE_EFI64, FIRMWARE_TYPE_SBI, FIRMWARE_TYPE_X86BIOS,
 };
-use limine::memmap::{Entry, MEMMAP_USABLE};
+use limine::memmap::{Entry, MEMMAP_BOOTLOADER_RECLAIMABLE, MEMMAP_USABLE};
 use limine::mp::MpInfo;
 use limine::request::{
     DtbRequest, EfiRequest, ExecutableAddressRequest, ExecutableCmdlineRequest,
@@ -112,9 +114,21 @@ global_asm!(
     native_users = const cfg!(feature = "native-users") as u8,
 );
 
+#[cfg(target_os = "none")]
+global_asm!(include_str!("snapshot.S"));
+
 unsafe extern "C" {
     static __helios_aarch64_exception_vectors: u8;
     static __helios_aarch64_boot_exception_stack_top: u8;
+    static __helios_text_start: u8;
+    static __helios_text_end: u8;
+    static __helios_rodata_start: u8;
+    static __helios_rodata_end: u8;
+    static __helios_data_start: u8;
+    static __helios_data_end: u8;
+    static __helios_bss_start: u8;
+    static __helios_bss_end: u8;
+    fn __helios_aarch64_capture_bsp_state(ctx: *mut Aarch64SnapshotContext) -> u64;
     /// Returns to a context saved by the synchronous-exception entry,
     /// from kernel code running on the interrupted stack.
     ///
@@ -125,6 +139,28 @@ unsafe extern "C" {
     /// caller must be running on that same stack. Diverges.
     fn __helios_aarch64_swap_fault_resume(frame: *mut SyncTrapFrame) -> !;
 }
+
+macro_rules! read_aarch64_sysreg {
+    ($name:literal) => {{
+        let value: u64;
+        // SAFETY: reading an EL1 architectural system register has no side effects.
+        unsafe {
+            asm!(
+                concat!("mrs {value}, ", $name),
+                value = out(reg) value,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        value
+    }};
+}
+
+const _: () = {
+    assert!(core::mem::offset_of!(Aarch64SnapshotContext, callee_saved) == 0x00);
+    assert!(core::mem::offset_of!(Aarch64SnapshotContext, sp) == 0x60);
+    assert!(core::mem::offset_of!(Aarch64SnapshotContext, fp_callee_saved) == 0x68);
+    assert!(core::mem::offset_of!(Aarch64SnapshotContext, fpcr) == 0xa8);
+};
 
 /// The interrupted context a synchronous exception saved.
 ///
@@ -855,6 +891,11 @@ extern "C" fn aarch64_kernel_main() -> ! {
     // outcome is reported once the logger is up.
     let (measured_boot, measured_boot_discovery) =
         tpm::discover(&platform, physical_memory_offset, &handoff, cpu);
+    let boot_memory = collect_boot_memory_metadata(
+        &handoff,
+        physical_memory_offset,
+        &debug_state.payload_digest(),
+    );
     let kernel = helios_kernel::init(
         Platform::new(console, cpu)
             .with_topology(
@@ -871,7 +912,8 @@ extern "C" fn aarch64_kernel_main() -> ! {
                 DmaModel::Translated
             })
             .with_devices(devices)
-            .with_measured_boot(measured_boot),
+            .with_measured_boot(measured_boot)
+            .with_boot_memory(boot_memory),
     );
     if !has_display {
         tracing::info!("no virtio-gpu device discovered; this machine has no display");
@@ -1473,6 +1515,41 @@ impl Cpu for Aarch64Cpu {
     fn fill_entropy(&self, buffer: &mut [u8]) -> Result<EntropyQuality, EntropyUnavailable> {
         fill_with_rndr(buffer)?;
         Ok(EntropyQuality::Cryptographic)
+    }
+
+    fn capture_bsp_state(
+        &self,
+        context: &mut BspSnapshotContext,
+    ) -> Result<SnapshotPoint, SnapshotUnsupported> {
+        let (mte_enabled, gcr_el1, rgsr_el1) = tagging::save_registers();
+        let mut raw = Aarch64SnapshotContext {
+            tpidr_el1: read_aarch64_sysreg!("tpidr_el1"),
+            sp_el0: read_aarch64_sysreg!("sp_el0"),
+            ttbr0_el1: read_aarch64_sysreg!("ttbr0_el1"),
+            ttbr1_el1: read_aarch64_sysreg!("ttbr1_el1"),
+            mair_el1: read_aarch64_sysreg!("mair_el1"),
+            tcr_el1: read_aarch64_sysreg!("tcr_el1"),
+            sctlr_el1: read_aarch64_sysreg!("sctlr_el1"),
+            vbar_el1: read_aarch64_sysreg!("vbar_el1"),
+            cpacr_el1: read_aarch64_sysreg!("cpacr_el1"),
+            daif: read_daif(),
+            apia_lo: arm_sysregs::el1::accessors::read_apiakeylo_el1().bits(),
+            apia_hi: arm_sysregs::el1::accessors::read_apiakeyhi_el1().bits(),
+            mte_enabled: u64::from(mte_enabled),
+            gcr_el1,
+            rgsr_el1,
+            ..Aarch64SnapshotContext::default()
+        };
+
+        // SAFETY: `&raw mut raw` is a valid, aligned `Aarch64SnapshotContext`
+        // matching the field offsets pinned for `__helios_aarch64_capture_bsp_state`.
+        let status = unsafe { __helios_aarch64_capture_bsp_state(&raw mut raw) };
+        if status == 0 {
+            *context = BspSnapshotContext::from_aarch64(&raw);
+            Ok(SnapshotPoint::Captured)
+        } else {
+            Ok(SnapshotPoint::Resumed)
+        }
     }
 
     fn shutdown(&self) -> ! {
@@ -2994,10 +3071,105 @@ fn convert_memory_region(entry: &'static Entry) -> BootMemoryRegion {
         end: entry.base + entry.length,
         kind: if entry.type_ == MEMMAP_USABLE {
             BootMemoryKind::Usable
+        } else if entry.type_ == MEMMAP_BOOTLOADER_RECLAIMABLE {
+            BootMemoryKind::BootloaderReclaimable
         } else {
             BootMemoryKind::Reserved
         },
     }
+}
+
+fn kernel_section_range(
+    start_sym: *const u8,
+    end_sym: *const u8,
+    handoff: &LimineBootHandoff,
+) -> KernelSectionRange {
+    let vstart = start_sym.addr();
+    let vend = end_sym.addr();
+    let len = vend.checked_sub(vstart).unwrap_or_else(|| {
+        panic!("AArch64 kernel section end {vend:#x} precedes start {vstart:#x}")
+    });
+    let pstart = kernel_virtual_to_physical(vstart, handoff) as u64;
+    KernelSectionRange::new(pstart, vstart as u64, len as u64)
+}
+
+fn collect_boot_memory_metadata(
+    handoff: &LimineBootHandoff,
+    physical_memory_offset: usize,
+    payload_sha256: &[u8; 32],
+) -> BootMemoryMetadata {
+    let mut metadata = BootMemoryMetadata {
+        kernel_sections: KernelImageSections {
+            text: kernel_section_range(
+                &raw const __helios_text_start,
+                &raw const __helios_text_end,
+                handoff,
+            ),
+            rodata: kernel_section_range(
+                &raw const __helios_rodata_start,
+                &raw const __helios_rodata_end,
+                handoff,
+            ),
+            data: kernel_section_range(
+                &raw const __helios_data_start,
+                &raw const __helios_data_end,
+                handoff,
+            ),
+            bss: kernel_section_range(
+                &raw const __helios_bss_start,
+                &raw const __helios_bss_end,
+                handoff,
+            ),
+            uninit: None,
+            stack: None,
+        },
+        physical_memory_offset,
+        ..BootMemoryMetadata::default()
+    };
+
+    for region in handoff.memory_map.regions() {
+        let _ = metadata.firmware_memory_map.try_push(region);
+        if region.kind == BootMemoryKind::BootloaderReclaimable {
+            let _ = metadata
+                .bootloader_reclaimable
+                .try_push(BootPhysicalRange::new(region.start, region.end));
+        }
+    }
+
+    if let Some(dtb_addr) = handoff.tables.device_tree_blob {
+        // SAFETY: Limine provided a mapped readable device tree blob at `dtb_addr`.
+        if let Ok(fdt) = unsafe { fdt::Fdt::from_ptr(dtb_addr as *const u8) } {
+            let phys = dtb_addr
+                .checked_sub(physical_memory_offset)
+                .unwrap_or(dtb_addr) as u64;
+            metadata.device_tree_blob = Some(BootPhysicalRange::from_start_len(
+                phys,
+                fdt.total_size() as u64,
+            ));
+        }
+    }
+
+    for module in handoff.modules.modules() {
+        let is_bootfs = module
+            .path
+            .rsplit(|&byte| byte == b'/')
+            .next()
+            .is_some_and(|name| name == b"helios-bootfs");
+        if is_bootfs {
+            let phys = module
+                .address
+                .checked_sub(physical_memory_offset)
+                .unwrap_or(module.address) as u64;
+            metadata.boot_payload = Some(BootPayloadMetadata {
+                physical_address: phys,
+                len: module.size as u64,
+                sha256: *payload_sha256,
+            });
+            break;
+        }
+    }
+
+    metadata
 }
 
 fn convert_module(file: &'static File) -> BootModule<'static> {

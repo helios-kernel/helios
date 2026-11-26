@@ -24,6 +24,7 @@ SECTIONS
 
     . = ALIGN(PAGE_SIZE);
     __helios_text_end = .;
+    __helios_rodata_start = .;
     .rodata : AT(ADDR(.rodata) - KERNEL_VMA + KERNEL_LMA) {
         *(.rodata .rodata.*)
         *(.srodata .srodata.*)
@@ -32,6 +33,8 @@ SECTIONS
     } :rodata
 
     . = ALIGN(PAGE_SIZE);
+    __helios_rodata_end = .;
+    __helios_data_start = .;
     .data.rel.ro : AT(ADDR(.data.rel.ro) - KERNEL_VMA + KERNEL_LMA) {
         *(.data.rel.ro.local*) *(.data.rel.ro .data.rel.ro.*)
     } :data
@@ -54,11 +57,15 @@ SECTIONS
     } :data
 
     . = ALIGN(PAGE_SIZE);
+    __helios_data_end = .;
+    __helios_bss_start = .;
     .bss (NOLOAD) : AT(ADDR(.bss) - KERNEL_VMA + KERNEL_LMA) {
         *(COMMON)
         *(.bss .bss.*)
         *(.sbss .sbss.*)
     } :data
+    . = ALIGN(PAGE_SIZE);
+    __helios_bss_end = .;
 
     /DISCARD/ : {
         *(.comment)

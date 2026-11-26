@@ -7,8 +7,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use core::cmp::Reverse;
+use core::fmt;
 use core::hash::BuildHasher;
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::{Context, Poll};
 
 use arrayvec::{ArrayString, ArrayVec};
 use hashbrown::{DefaultHashBuilder, HashTable};
@@ -16,6 +18,8 @@ use helios_hal::cpu::HardwarePerfCounterDelta;
 use spin::Mutex;
 use triomphe::Arc;
 
+use super::{Notify, NotifyWaiter};
+use crate::memory::IrqSafeMutex;
 use crate::{InstanceId, InstanceRegistry};
 
 pub const DEFAULT_TRACE_HISTORY_CAPACITY: usize = 512;
@@ -377,52 +381,85 @@ pub struct TraceHistory {
     events: VecDeque<(u64, Arc<TraceEvent>)>,
 }
 
+/// The outcome of scanning up to `TRACE_STREAM_POLL_BATCHES` batches past a
+/// stream cursor.
+enum NextAfterScan {
+    Found(Arc<TraceEvent>),
+    /// All events currently retained past the cursor were examined without a match.
+    Exhausted,
+    /// The per-poll batch budget was reached while further retained events may
+    /// remain past the cursor.
+    MorePending,
+}
+
 /// The kernel's recent trace events and how they are read.
 ///
-/// Concurrency contract: any processor records and any processor reads.
-/// Every operation takes the one history lock for a bounded, allocation-free
-/// copy and does everything else outside it.
+/// Concurrency contract: any processor records (including from interrupt
+/// context) and any processor reads.
+/// Every operation takes the one [`IrqSafeMutex`] history lock for a bounded,
+/// allocation-free copy and does everything else outside it.
 /// - Recording builds each event's [`Arc`] before locking, so the lock
-///   covers one `push_back`, and an evicted event is moved out under the
-///   lock and dropped after it, so no allocation or free happens under the
-///   lock.
+///   covers one `push_back`, an evicted event is moved out under the
+///   lock and dropped after it, and parked stream readers are woken after the
+///   lock is released via [`Notify::notify_all`] (lock-free, allocation-free,
+///   IRQ-safe).
 /// - [`Self::recent`] reserves its snapshot before locking, clones at most
 ///   the history's capacity of pointers under the lock, and filters,
 ///   limits and lowers after it.
-/// - [`Self::next_after`] keeps no buffer: each lock hold copies at most
-///   [`TRACE_STREAM_BATCH`] pointers after the caller's cursor into a stack
-///   array, and the filter runs after the lock is released, in at most
-///   `TRACE_STREAM_POLL_BATCHES` holds.
+/// - [`Self::next_after`] and [`Self::poll_next_after`] keep no buffer: each
+///   lock hold copies at most [`TRACE_STREAM_BATCH`] pointers after the
+///   caller's cursor into a stack array, and the filter runs after the lock is
+///   released, in at most `TRACE_STREAM_POLL_BATCHES` holds.
+/// - Stream readers arm a [`NotifyWaiter`] via [`Self::waiter`] before testing
+///   the history in [`Self::poll_next_after`], so an event recorded between a
+///   scan and parking cannot lose its wake.
 ///
 /// Nothing a reader does under the lock can re-enter it: the filter runs
 /// on pointers the reader already owns.
-#[derive(Debug)]
 pub struct TraceLog {
     /// The history's capacity, kept outside the lock so a reader can size
     /// its snapshot before taking it.
     capacity: usize,
-    history: Mutex<TraceHistory>,
+    history: IrqSafeMutex<TraceHistory>,
+    /// Broadcast signal fired whenever one or more events are appended to
+    /// `history`, waking every parked tracing stream reader.
+    recorded: Notify,
+}
+
+impl fmt::Debug for TraceLog {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TraceLog")
+            .field("capacity", &self.capacity)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TraceLog {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
-            history: Mutex::new(TraceHistory::new(capacity)),
+            history: IrqSafeMutex::new(TraceHistory::new(capacity)),
+            recorded: Notify::new(),
         }
     }
 
     /// Records every non-empty line of `text` as one event stamped
     /// `timestamp` and attributed to `origin` (`None` for the kernel's own
-    /// console), each pushed as it is parsed.
+    /// console), each pushed as it is parsed, then wakes parked stream
+    /// readers.
     pub fn record_console_text(&self, timestamp: u64, origin: Option<InstanceId>, text: &str) {
+        let mut recorded = false;
         parse_console_text(timestamp, origin, text, |event| {
             let event = Arc::new(event);
-            let evicted = self.history.lock().push(event);
+            let evicted = self.history.with(|history| history.push(event));
+            recorded = true;
             // The oldest event's last reference may free it; that happens
             // here, with the lock released.
             drop(evicted);
         });
+        if recorded {
+            self.recorded.notify_all();
+        }
     }
 
     /// The newest `limit` events `scope` admits and `filter` matches,
@@ -434,13 +471,37 @@ impl TraceLog {
         limit: u32,
     ) -> Vec<Arc<TraceEvent>> {
         let mut events = Vec::with_capacity(self.capacity);
-        self.history.lock().copy_into(&mut events);
+        self.history.with(|history| history.copy_into(&mut events));
         events.retain(|event| scope.admits(event.origin) && matches_trace_filter(event, filter));
         let keep = limit as usize;
         if events.len() > keep {
             events.drain(..events.len() - keep);
         }
         events
+    }
+
+    fn scan_next_after(
+        &self,
+        scope: &impl ObservationScope,
+        cursor: &mut u64,
+        filter: &TraceFilter,
+    ) -> NextAfterScan {
+        for _ in 0..TRACE_STREAM_POLL_BATCHES {
+            let mut batch = ArrayVec::<(u64, Arc<TraceEvent>), TRACE_STREAM_BATCH>::new();
+            self.history
+                .with(|history| history.copy_after_into(*cursor, &mut batch));
+            let exhausted = batch.len() < TRACE_STREAM_BATCH;
+            for (seq, event) in batch {
+                *cursor = seq;
+                if scope.admits(event.origin) && matches_trace_filter(&event, filter) {
+                    return NextAfterScan::Found(event);
+                }
+            }
+            if exhausted {
+                return NextAfterScan::Exhausted;
+            }
+        }
+        NextAfterScan::MorePending
     }
 
     /// The first event after `*cursor` that `scope` admits and `filter`
@@ -454,21 +515,50 @@ impl TraceLog {
         cursor: &mut u64,
         filter: &TraceFilter,
     ) -> Option<Arc<TraceEvent>> {
-        for _ in 0..TRACE_STREAM_POLL_BATCHES {
-            let mut batch = ArrayVec::<(u64, Arc<TraceEvent>), TRACE_STREAM_BATCH>::new();
-            self.history.lock().copy_after_into(*cursor, &mut batch);
-            let exhausted = batch.len() < TRACE_STREAM_BATCH;
-            for (seq, event) in batch {
-                *cursor = seq;
-                if scope.admits(event.origin) && matches_trace_filter(&event, filter) {
-                    return Some(event);
+        match self.scan_next_after(scope, cursor, filter) {
+            NextAfterScan::Found(event) => Some(event),
+            NextAfterScan::Exhausted | NextAfterScan::MorePending => None,
+        }
+    }
+
+    /// Arms a reusable wait for newly recorded trace events.
+    pub fn waiter(&self) -> NotifyWaiter {
+        self.recorded.waiter()
+    }
+
+    /// Polls for the first event after `*cursor` that `scope` admits and
+    /// `filter` matches, advancing `*cursor` as [`Self::next_after`] does.
+    ///
+    /// `waiter` must have been created by [`Self::waiter`] before the stream
+    /// started scanning so that an event recorded between a scan and parking
+    /// moves the broadcast generation past the waiter's mark and immediately
+    /// triggers a re-scan rather than losing its wake.
+    pub fn poll_next_after(
+        &self,
+        cx: &mut Context<'_>,
+        waiter: &mut NotifyWaiter,
+        scope: &impl ObservationScope,
+        cursor: &mut u64,
+        filter: &TraceFilter,
+    ) -> Poll<Arc<TraceEvent>> {
+        loop {
+            match self.scan_next_after(scope, cursor, filter) {
+                NextAfterScan::Found(event) => return Poll::Ready(event),
+                NextAfterScan::MorePending => {
+                    // The per-poll batch budget ran out before reaching the
+                    // tail of the history; yield to the executor while staying
+                    // runnable so scanning continues on the next turn.
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
                 }
+                NextAfterScan::Exhausted => {}
             }
-            if exhausted {
-                return None;
+
+            match self.recorded.poll_notified(cx, waiter) {
+                Poll::Ready(()) => continue,
+                Poll::Pending => return Poll::Pending,
             }
         }
-        None
     }
 }
 
@@ -1551,9 +1641,9 @@ mod tests {
         let log = TraceLog::new(capacity);
         for number in 0..count {
             let target = if number % 2 == 0 { "even" } else { "odd" };
-            let mut history = log.history.lock();
-            let evicted = history.push(Arc::new(event(target, &number.to_string())));
-            drop(history);
+            let evicted = log
+                .history
+                .with(|history| history.push(Arc::new(event(target, &number.to_string()))));
             drop(evicted);
         }
         log
@@ -1662,13 +1752,14 @@ mod tests {
     #[test]
     fn push_hands_back_the_evicted_event() {
         let log = TraceLog::new(2);
-        let mut history = log.history.lock();
-        assert!(history.push(Arc::new(event("t", "a"))).is_none());
-        assert!(history.push(Arc::new(event("t", "b"))).is_none());
-        let evicted = history
-            .push(Arc::new(event("t", "c")))
-            .expect("a full history gives up its oldest event");
-        assert_eq!(message(&evicted), "a");
+        log.history.with(|history| {
+            assert!(history.push(Arc::new(event("t", "a"))).is_none());
+            assert!(history.push(Arc::new(event("t", "b"))).is_none());
+            let evicted = history
+                .push(Arc::new(event("t", "c")))
+                .expect("a full history gives up its oldest event");
+            assert_eq!(message(&evicted), "a");
+        });
     }
 
     /// Drains a log through the stream poll, returning the messages in
@@ -1720,8 +1811,7 @@ mod tests {
             let target = if number % 100 == 99 { "keep" } else { "skip" };
             let evicted = log
                 .history
-                .lock()
-                .push(Arc::new(event(target, &number.to_string())));
+                .with(|history| history.push(Arc::new(event(target, &number.to_string()))));
             drop(evicted);
         }
         let mut cursor = 0;
@@ -2602,5 +2692,136 @@ mod tests {
         assert!(set.admits("kernel;executor"));
         assert!(set.admits("user;dash"));
         assert!(!set.admits("other;dash"));
+    }
+
+    fn counting_waker() -> (
+        core::task::Waker,
+        alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
+    ) {
+        use alloc::sync::Arc as StdArc;
+        use alloc::task::Wake;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use core::task::Waker;
+
+        struct CountingWake(StdArc<AtomicUsize>);
+
+        impl Wake for CountingWake {
+            fn wake(self: StdArc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+
+            fn wake_by_ref(self: &StdArc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let wakes = StdArc::new(AtomicUsize::new(0));
+        let waker = Waker::from(StdArc::new(CountingWake(StdArc::clone(&wakes))));
+        (waker, wakes)
+    }
+
+    #[test]
+    fn poll_next_after_parks_and_wakes_registered_waker_when_matching_event_arrives() {
+        use core::sync::atomic::Ordering;
+        use core::task::{Context, Poll};
+
+        let log = TraceLog::new(16);
+        log.record_console_text(1, None, "INFO [alpha] first\n");
+
+        let filter = only("alpha");
+        let mut cursor = 0;
+        let mut waiter = log.waiter();
+        let (waker, wakes) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // Drain the initial event.
+        match log.poll_next_after(&mut cx, &mut waiter, &machine(), &mut cursor, &filter) {
+            Poll::Ready(ev) => {
+                assert_eq!(ev.target, "alpha");
+                assert_eq!(message(&ev), "first");
+            }
+            Poll::Pending => panic!("initial event must be ready immediately"),
+        }
+
+        // Next poll has no further events and must park without self-waking.
+        assert!(
+            log.poll_next_after(&mut cx, &mut waiter, &machine(), &mut cursor, &filter)
+                .is_pending()
+        );
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+
+        // A non-matching event wakes the stream, which advances its cursor and
+        // re-registers its waker cleanly before parking again.
+        log.record_console_text(2, None, "INFO [beta] ignored\n");
+        assert!(
+            wakes.load(Ordering::SeqCst) >= 1,
+            "recording an event must wake parked waiters"
+        );
+        assert!(
+            log.poll_next_after(&mut cx, &mut waiter, &machine(), &mut cursor, &filter)
+                .is_pending()
+        );
+        assert_eq!(cursor, 2);
+
+        let wakes_before = wakes.load(Ordering::SeqCst);
+
+        // A matching event recorded while parked must fire the registered waker
+        // and be delivered on the very next poll.
+        log.record_console_text(3, None, "INFO [alpha] second\n");
+        assert!(
+            wakes.load(Ordering::SeqCst) > wakes_before,
+            "recording a matching event must fire the registered waker"
+        );
+
+        match log.poll_next_after(&mut cx, &mut waiter, &machine(), &mut cursor, &filter) {
+            Poll::Ready(ev) => {
+                assert_eq!(ev.target, "alpha");
+                assert_eq!(message(&ev), "second");
+                assert_eq!(cursor, 3);
+            }
+            Poll::Pending => panic!("matching event must be delivered after wake"),
+        }
+    }
+
+    #[test]
+    fn poll_next_after_keeps_task_runnable_when_batch_budget_is_exhausted() {
+        use core::sync::atomic::Ordering;
+        use core::task::{Context, Poll};
+
+        let skipped = TRACE_STREAM_BATCH * super::TRACE_STREAM_POLL_BATCHES;
+        let log = TraceLog::new(skipped + 4);
+        for idx in 0..skipped {
+            let evicted = log
+                .history
+                .with(|history| history.push(Arc::new(event("skip", &idx.to_string()))));
+            drop(evicted);
+        }
+        log.record_console_text(99, None, "INFO [keep] past-budget\n");
+
+        let filter = only("keep");
+        let mut cursor = 0;
+        let mut waiter = log.waiter();
+        let (waker, wakes) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // First poll hits the batch budget and yields with a self-wake so the
+        // executor continues scanning rather than parking forever.
+        assert!(
+            log.poll_next_after(&mut cx, &mut waiter, &machine(), &mut cursor, &filter)
+                .is_pending()
+        );
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "exhausting the per-poll batch budget must wake the waker to continue scanning"
+        );
+
+        match log.poll_next_after(&mut cx, &mut waiter, &machine(), &mut cursor, &filter) {
+            Poll::Ready(ev) => {
+                assert_eq!(ev.target, "keep");
+                assert_eq!(message(&ev), "past-budget");
+            }
+            Poll::Pending => panic!("event past the first batch budget must be delivered next"),
+        }
     }
 }

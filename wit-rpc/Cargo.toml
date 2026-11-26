@@ -8,18 +8,18 @@ default = []
 inspector-rpc = []
 
 [dependencies]
-async-lock = "3.4.2"
-event-listener = "5.4.2"
-futures-core = "0.3.31"
-futures-io = "0.3.34"
-futures-lite = "2.6.1"
+async-channel = { version = "2.5.0", default-features = false }
+async-lock = { version = "3.4.2", default-features = false }
+event-listener = { version = "5.4.2", default-features = false, features = ["std"] }
+futures-core = { version = "0.3.31", default-features = false, features = ["std"] }
+futures-io = { version = "0.3.34", default-features = false, features = ["std"] }
+futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
 helios-inspector-protocol = { workspace = true, default-features = false }
 helios-wit-rpc-macro = { workspace = true }
-thiserror = "2.0.20"
+thiserror = { version = "2.0.20", default-features = false, features = ["std"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
-async-channel = "2.5.0"
 futures-util = { version = "0.3.31", default-features = false, features = ["std", "async-await", "io"] }
 
 [lints]
