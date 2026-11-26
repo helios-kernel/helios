@@ -11,8 +11,9 @@ mod http;
 mod service;
 
 pub use control::{
-    Ipv4Cidr, Ipv4Route, MacAddress, NetworkAdminBackend, NetworkBridgeRequest,
-    NetworkBridgeSecurity, NetworkControl, NetworkControlError, NetworkPortId,
+    InetTcpSocket, InetUdpSocket, Ipv4Cidr, Ipv4Route, MacAddress, NetworkAdminBackend,
+    NetworkBridgeRequest, NetworkBridgeSecurity, NetworkControl, NetworkControlError,
+    NetworkPortId,
 };
 pub use http::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,

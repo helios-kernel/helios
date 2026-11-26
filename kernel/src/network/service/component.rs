@@ -902,6 +902,109 @@ where
         NetworkService::stats(self)
     }
 
+    fn list_inet_sockets(&self) -> (Vec<crate::InetTcpSocket>, Vec<crate::InetUdpSocket>) {
+        let mut tcp = Vec::new();
+        let mut udp = Vec::new();
+        let mut next_inode = 1u64;
+
+        // Listeners and UDP sockets are replicated across shards, so shard 0
+        // holds the complete set without duplicates.
+        {
+            let shard = self.inner.state.shard_at(DEFAULT_SHARD_IDX).lock();
+            for listener in shard.tcp_listeners.iter() {
+                let local_addr = match shard.stack.tcp_local_endpoint(listener.stack_socket) {
+                    Ok(Some(ep)) => match ep.address {
+                        IpAddress::Ipv4(v4) => v4.octets(),
+                        IpAddress::Ipv6(_) => continue,
+                    },
+                    _ => [0, 0, 0, 0],
+                };
+                tcp.push(crate::InetTcpSocket {
+                    local_addr,
+                    local_port: listener.local_port,
+                    remote_addr: [0, 0, 0, 0],
+                    remote_port: 0,
+                    // Linux `include/net/tcp_states.h`: `TCP_LISTEN = 10`.
+                    state: 0x0A,
+                    uid: 0,
+                    inode: next_inode,
+                });
+                next_inode += 1;
+            }
+            for sock in shard.udp_sockets.iter() {
+                let local_addr = match sock.bound_local_address.or(sock.binding.local_address) {
+                    Some(IpAddress::Ipv4(v4)) => v4.octets(),
+                    Some(IpAddress::Ipv6(_)) => continue,
+                    None => [0, 0, 0, 0],
+                };
+                let (remote_addr, remote_port, state) = match sock.binding.remote {
+                    Some(ep) => match ep.address {
+                        IpAddress::Ipv4(v4) => (v4.octets(), ep.port, 0x01),
+                        IpAddress::Ipv6(_) => continue,
+                    },
+                    None => ([0, 0, 0, 0], 0, 0x07),
+                };
+                udp.push(crate::InetUdpSocket {
+                    local_addr,
+                    local_port: sock.binding.local_port,
+                    remote_addr,
+                    remote_port,
+                    state,
+                    uid: 0,
+                    inode: next_inode,
+                });
+                next_inode += 1;
+            }
+        }
+
+        // Connected/active TCP streams are partitioned across shards.
+        self.inner.state.for_each(|shard| {
+            for &stack_socket in shard.tcp_streams.iter() {
+                let Ok(Some(local_ep)) = shard.stack.tcp_local_endpoint(stack_socket) else {
+                    continue;
+                };
+                let IpAddress::Ipv4(local_v4) = local_ep.address else {
+                    continue;
+                };
+                let (remote_addr, remote_port) = match shard.stack.tcp_remote_endpoint(stack_socket)
+                {
+                    Ok(Some(ep)) => match ep.address {
+                        IpAddress::Ipv4(v4) => (v4.octets(), ep.port),
+                        IpAddress::Ipv6(_) => continue,
+                    },
+                    _ => ([0, 0, 0, 0], 0),
+                };
+                let state = match shard.stack.tcp_state(stack_socket) {
+                    // Linux `include/net/tcp_states.h`.
+                    Ok(helios_netstack::TcpState::Established) => 0x01,
+                    Ok(helios_netstack::TcpState::SynSent) => 0x02,
+                    Ok(helios_netstack::TcpState::SynReceived) => 0x03,
+                    Ok(helios_netstack::TcpState::FinWait1) => 0x04,
+                    Ok(helios_netstack::TcpState::FinWait2) => 0x05,
+                    Ok(helios_netstack::TcpState::TimeWait) => 0x06,
+                    Ok(helios_netstack::TcpState::Closed) => 0x07,
+                    Ok(helios_netstack::TcpState::CloseWait) => 0x08,
+                    Ok(helios_netstack::TcpState::LastAck) => 0x09,
+                    Ok(helios_netstack::TcpState::Listen) => 0x0A,
+                    Ok(helios_netstack::TcpState::Closing) => 0x0B,
+                    Err(_) => continue,
+                };
+                tcp.push(crate::InetTcpSocket {
+                    local_addr: local_v4.octets(),
+                    local_port: local_ep.port,
+                    remote_addr,
+                    remote_port,
+                    state,
+                    uid: 0,
+                    inode: next_inode,
+                });
+                next_inode += 1;
+            }
+        });
+
+        (tcp, udp)
+    }
+
     async fn bridge_port(
         &self,
         port: NetworkPortId,

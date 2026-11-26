@@ -912,6 +912,16 @@ pub trait Filesystem<R: Resources> {
     /// `/proc/<pid>/fd/<n>` inspection and reopening.
     fn sync_process_memfds(&self, _pid: u32, _fds: &[(i32, R::File)]) {}
 
+    /// Synchronizes `pid`'s full open descriptor table snapshot in `/proc/<pid>/fd`
+    /// so cross-process inspection (`lsof`, `/proc/<other>/fd`) observes newly
+    /// opened, duplicated, or closed descriptors immediately.
+    fn sync_process_fds(&self, _pid: u32) {}
+
+    /// Synchronizes `pid`'s working directory in `/proc/<pid>/cwd` immediately
+    /// after `chdir(2)` / `fchdir(2)` so cross-process inspection (`pwdx`)
+    /// observes the new path without waiting for the target to touch `/proc`.
+    fn sync_process_cwd(&self, _pid: u32, _cwd: &str) {}
+
     /// SysV `shmget(2)`.
     fn shm_get(
         &mut self,
@@ -1554,6 +1564,8 @@ pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R> + tty::
         } else {
             fs.reap_memfds();
         }
+    } else if result <= i32::MAX as u64 {
+        fs.sync_process_fds(process.pid().get());
     }
     SyscallOutcome::Return(result)
 }
@@ -2645,6 +2657,7 @@ pub(super) async fn chdir<R: Resources, M: UserMemory, F: Filesystem<R>>(
     {
         return fs_errno(error);
     }
+    fs.sync_process_cwd(process.pid().get(), &canonical);
     *process.shared.cwd.lock() = canonical;
     0
 }
@@ -2672,6 +2685,7 @@ pub(super) async fn fchdir<R: Resources, F: Filesystem<R>>(
     let Some(path) = fs.file_path(open.node()) else {
         return errno(ENOENT);
     };
+    fs.sync_process_cwd(process.pid().get(), path);
     *process.shared.cwd.lock() = String::from(path);
     0
 }
@@ -3189,9 +3203,14 @@ pub(super) async fn readv_common<
                 break;
             }
         }
-        let recv = match super::socket::socket_recv(sock, total, 0, output).await {
-            Ok(recv) => recv,
-            Err(err) => return SyscallOutcome::Return(errno(err)),
+        let recv = match process
+            .signals
+            .interruptible(super::socket::socket_recv(sock, total, 0, output))
+            .await
+        {
+            signal::WaitOutcome::Ready(Ok(recv)) => recv,
+            signal::WaitOutcome::Ready(Err(err)) => return SyscallOutcome::Return(errno(err)),
+            signal::WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
         };
         let mut offset = 0usize;
         for (base, len) in iovs {
@@ -3329,12 +3348,15 @@ pub(super) async fn writev_common<
             }
         }
         let ctx = super::socket_context(process);
-        return SyscallOutcome::Return(
-            match super::socket::socket_send(sock, data, 0, None, ctx, output).await {
-                Ok(written) => written as u64,
-                Err(err) => errno(err),
-            },
-        );
+        return match process
+            .signals
+            .interruptible(super::socket::socket_send(sock, data, 0, None, ctx, output))
+            .await
+        {
+            signal::WaitOutcome::Ready(Ok(written)) => SyscallOutcome::Return(written as u64),
+            signal::WaitOutcome::Ready(Err(err)) => SyscallOutcome::Return(errno(err)),
+            signal::WaitOutcome::Interrupted => SyscallOutcome::RestartSys,
+        };
     }
     let mut done = 0u64;
     let mut cur_off = explicit_offset;
@@ -3436,6 +3458,9 @@ pub(super) async fn lseek<R: Resources, F: Filesystem<R>>(
     if next < 0 {
         return errno(EINVAL);
     }
+    if next == 0 {
+        pos.set_dir_snapshot(None);
+    }
     pos.set(next as u64);
     next as u64
 }
@@ -3450,6 +3475,32 @@ fn node_d_type(kind: NodeKind) -> u8 {
         NodeKind::Symlink => DT_LNK,
         NodeKind::Socket => DT_SOCK,
     }
+}
+
+async fn capture_dir_snapshot<R: Resources, F: Filesystem<R>>(
+    open: &OpenFile<R::File>,
+    fs: &F,
+) -> Result<alloc::sync::Arc<[helios_unix::DirCursorEntry]>, FsOpError> {
+    let (self_ino, parent_ino, listed) = fs.list_dir(open.node()).await?;
+    let mut entries = Vec::with_capacity(2 + listed.len());
+    entries.push(helios_unix::DirCursorEntry {
+        inode: self_ino,
+        d_type: DT_DIR,
+        name: String::from("."),
+    });
+    entries.push(helios_unix::DirCursorEntry {
+        inode: parent_ino,
+        d_type: DT_DIR,
+        name: String::from(".."),
+    });
+    for entry in listed {
+        entries.push(helios_unix::DirCursorEntry {
+            inode: entry.inode,
+            d_type: node_d_type(entry.kind),
+            name: entry.name,
+        });
+    }
+    Ok(entries.into())
 }
 
 pub(super) async fn getdents64<R: Resources, M: UserMemory, F: Filesystem<R>>(
@@ -3476,13 +3527,26 @@ pub(super) async fn getdents64<R: Resources, M: UserMemory, F: Filesystem<R>>(
     if !fs.file_is_directory(open.node()) {
         return errno(ENOTDIR);
     }
-    let (self_ino, parent_ino, listed) = match fs.list_dir(open.node()).await {
-        Ok(res) => res,
-        Err(error) => return fs_errno(error),
-    };
     let mut pos = open.lock_position().await;
     let start_index = pos.get() as usize;
-    let total_entries = 2 + listed.len();
+    let snapshot = if start_index == 0 {
+        let fresh = match capture_dir_snapshot(&open, fs).await {
+            Ok(res) => res,
+            Err(error) => return fs_errno(error),
+        };
+        pos.set_dir_snapshot(Some(alloc::sync::Arc::clone(&fresh)));
+        fresh
+    } else if let Some(cached) = pos.dir_snapshot() {
+        cached
+    } else {
+        let fresh = match capture_dir_snapshot(&open, fs).await {
+            Ok(res) => res,
+            Err(error) => return fs_errno(error),
+        };
+        pos.set_dir_snapshot(Some(alloc::sync::Arc::clone(&fresh)));
+        fresh
+    };
+    let total_entries = snapshot.len();
     if start_index >= total_entries {
         return 0;
     }
@@ -3490,14 +3554,10 @@ pub(super) async fn getdents64<R: Resources, M: UserMemory, F: Filesystem<R>>(
     let mut written = 0usize;
     let mut idx = start_index;
     while idx < total_entries {
-        let (ino, d_type, name): (u64, u8, &[u8]) = if idx == 0 {
-            (self_ino, DT_DIR, b".")
-        } else if idx == 1 {
-            (parent_ino, DT_DIR, b"..")
-        } else {
-            let e = &listed[idx - 2];
-            (e.inode, node_d_type(e.kind), e.name.as_bytes())
-        };
+        let e = &snapshot[idx];
+        let ino = e.inode;
+        let d_type = e.d_type;
+        let name = e.name.as_bytes();
         // struct linux_dirent64: d_ino (8) + d_off (8) + d_reclen (2) + d_type (1) + name + NUL,
         // padded to 8-byte alignment.
         let raw_len = 19 + name.len() + 1;
@@ -3662,10 +3722,13 @@ pub(super) fn close_range<R: Resources, F: Filesystem<R>>(
         }
         super::fs_extra::release_posix_locks_for_entry(process, entry, fs);
     }
+    let closed_any = !closed_entries.is_empty();
     drop(closed_entries);
     if closed_memfd {
         fs.reap_memfds();
         super::shm::sync_process_memfds(process, fs);
+    } else if closed_any {
+        fs.sync_process_fds(process.pid().get());
     }
     0
 }
