@@ -1,0 +1,18 @@
+description = "Read CJK UTF-8 files from /btrfs/docs"
+name = "cat-btrfs-cjk"
+runner = "exec"
+program = "/bin/cat"
+args = ["/btrfs/docs/中文.txt", "/btrfs/docs/日本語.txt", "/btrfs/docs/한국어.txt"]
+after = ["/ls-btrfs-docs"]
+startup = "eager"
+lifecycle = "oneshot"
+restart = "never"
+critical = "system"
+escalation = "halt"
+oom_tier = "user"
+
+[capabilities]
+directories = [
+  { source = "/", guest = "/", rights = ["read", "execute"] },
+]
+link = ["symlink-read"]

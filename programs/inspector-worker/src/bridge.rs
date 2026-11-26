@@ -1756,6 +1756,30 @@ impl rpc_cc::RpcHandler for ComponentControlBridge {
                 detail: err.to_string(),
             })?
     }
+
+    async fn mount_dynamic(
+        &self,
+        parent_moniker: String,
+        source: rpc_cc::DynamicSubtreeSource,
+    ) -> Result<String, rpc_cc::ControlError> {
+        self.client()?
+            .mount_dynamic(parent_moniker, source)
+            .await
+            .map_err(|err| rpc_cc::ControlError {
+                kind: rpc_cc::ControlErrorKind::Unavailable,
+                detail: err.to_string(),
+            })?
+    }
+
+    async fn unmount_dynamic(&self, moniker: String) -> Result<(), rpc_cc::ControlError> {
+        self.client()?
+            .unmount_dynamic(moniker)
+            .await
+            .map_err(|err| rpc_cc::ControlError {
+                kind: rpc_cc::ControlErrorKind::Unavailable,
+                detail: err.to_string(),
+            })?
+    }
 }
 
 // ---------------------------------------------------------------------------

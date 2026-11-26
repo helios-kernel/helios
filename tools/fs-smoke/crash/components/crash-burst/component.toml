@@ -1,0 +1,17 @@
+description = "Run guest btrfs crash-burst writer or readback verifier before inspector boots"
+name = "crash-burst"
+runner = "exec"
+program = "/bin/python3"
+args = ["/etc/crash-burst.py", "guest", "/btrfs/crash", "/host"]
+startup = "eager"
+lifecycle = "oneshot"
+restart = "never"
+critical = "system"
+escalation = "halt"
+oom_tier = "user"
+
+[capabilities]
+directories = [
+  { source = "/", guest = "/", rights = ["read", "write", "mutate-directory", "execute"] },
+]
+link = ["source", "target-directory", "symlink-create", "symlink-read"]
