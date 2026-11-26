@@ -4,8 +4,9 @@
 
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -39,6 +40,9 @@ pub struct HostEnv {
     fleet: Option<Fleet>,
     cwd: Arc<RwLock<String>>,
     scope_stack: Arc<RwLock<Vec<String>>>,
+    snapshots: Arc<tokio::sync::Mutex<BTreeMap<String, helios_ops::SnapshotHold>>>,
+    active_profiles: Arc<tokio::sync::Mutex<BTreeSet<String>>>,
+    next_id: Arc<AtomicU64>,
     completion_cache: RemoteCompletionCache,
     /// When `true`, `list_dir` and completion probes go through `completion_cache`
     /// with the 150ms latency ceiling.
@@ -49,14 +53,7 @@ impl HostEnv {
     /// Create a [`HostEnv`] connected to `session` (and optional multi-node `fleet`).
     #[must_use]
     pub fn new(session: Session, fleet: Option<Fleet>) -> Self {
-        Self {
-            session,
-            fleet,
-            cwd: Arc::new(RwLock::new(String::from("/"))),
-            scope_stack: Arc::new(RwLock::new(Vec::new())),
-            completion_cache: RemoteCompletionCache::default(),
-            completion_mode: false,
-        }
+        Self::with_cache(session, fleet, RemoteCompletionCache::default())
     }
 
     /// Create a [`HostEnv`] with a custom [`RemoteCompletionCache`] (e.g. for tests).
@@ -71,8 +68,32 @@ impl HostEnv {
             fleet,
             cwd: Arc::new(RwLock::new(String::from("/"))),
             scope_stack: Arc::new(RwLock::new(Vec::new())),
+            snapshots: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            active_profiles: Arc::new(tokio::sync::Mutex::new(BTreeSet::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
             completion_cache,
             completion_mode: false,
+        }
+    }
+
+    /// Release any held snapshot leases or active instruction sampling sessions
+    /// (e.g. after `Ctrl+C` cancellation of `with-snapshot` or `with-instruction-profile`).
+    pub async fn cleanup_active(&self) {
+        let holds: Vec<helios_ops::SnapshotHold> = {
+            let mut guard = self.snapshots.lock().await;
+            std::mem::take(&mut *guard).into_values().collect()
+        };
+        for hold in holds {
+            let _ = hold.release().await;
+        }
+        let had_profiles = {
+            let mut guard = self.active_profiles.lock().await;
+            let non_empty = !guard.is_empty();
+            guard.clear();
+            non_empty
+        };
+        if had_profiles {
+            let _ = self.session.profile_set_instruction_sampling(false).await;
         }
     }
 
@@ -147,10 +168,22 @@ impl HeliosEnv for HostEnv {
         &self,
         request: ExternalSpawnRequest,
     ) -> Result<ExternalProcess, EnvError> {
-        let program_path = if request.program.starts_with('/') {
-            request.program.clone()
-        } else {
-            format!("/bin/{}", request.program)
+        let path_env: Vec<String> = request
+            .env
+            .get("PATH")
+            .map(|raw| {
+                raw.split(':')
+                    .filter(|s| !s.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .filter(|v: &Vec<String>| !v.is_empty())
+            .unwrap_or_else(|| vec![String::from("/bin")]);
+
+        let program_path = match self.resolve_executable(&request.program, &path_env).await? {
+            Some(found) => found.path,
+            None if request.program.starts_with('/') => request.program.clone(),
+            None => format!("/bin/{}", request.program),
         };
 
         let mut stdin_bytes = Vec::new();
@@ -178,7 +211,7 @@ impl HeliosEnv for HostEnv {
             capability_grants.push(translated);
         }
 
-        let cwd = (!capability_grants.is_empty() && !request.cwd.is_empty()).then_some(request.cwd);
+        let cwd = (!request.cwd.is_empty()).then_some(request.cwd);
         let spawn_req = SpawnRequest {
             path: program_path,
             args: request.args,
@@ -193,42 +226,86 @@ impl HeliosEnv for HostEnv {
             .await
             .map_err(ops_to_env_err)?;
 
-        let (stdout_tx, stdout_rx) = async_channel::bounded(STREAM_CHANNEL_CAPACITY);
-        let (stderr_tx, stderr_rx) = async_channel::bounded(STREAM_CHANNEL_CAPACITY);
         let (exit_tx, exit_rx) = async_channel::bounded(1);
 
         let child_stdout = child.stdout.clone();
         let child_stderr = child.stderr.clone();
-        tokio::spawn(async move {
-            while let Ok(item) = child_stdout.recv().await {
-                let mapped = item.map_err(|err| {
-                    ShellError::Generic(GenericError::new(
-                        "remote stdout error",
-                        err.to_string(),
-                        Span::unknown(),
-                    ))
-                });
-                if stdout_tx.send(mapped).await.is_err() {
-                    break;
+
+        let (stdout, stdout_inherited_done) = if request.capture_stdout {
+            let (stdout_tx, stdout_rx) = async_channel::bounded(STREAM_CHANNEL_CAPACITY);
+            tokio::spawn(async move {
+                while let Ok(item) = child_stdout.recv().await {
+                    let mapped = item.map_err(|err| {
+                        ShellError::Generic(GenericError::new(
+                            "remote stdout error",
+                            err.to_string(),
+                            Span::unknown(),
+                        ))
+                    });
+                    if stdout_tx.send(mapped).await.is_err() {
+                        break;
+                    }
                 }
-            }
-        });
-        tokio::spawn(async move {
-            while let Ok(item) = child_stderr.recv().await {
-                let mapped = item.map_err(|err| {
-                    ShellError::Generic(GenericError::new(
-                        "remote stderr error",
-                        err.to_string(),
-                        Span::unknown(),
-                    ))
-                });
-                if stderr_tx.send(mapped).await.is_err() {
-                    break;
+            });
+            (Some(stdout_rx), None)
+        } else {
+            let (done_tx, done_rx) = async_channel::bounded(1);
+            tokio::spawn(async move {
+                use std::io::Write as _;
+                while let Ok(item) = child_stdout.recv().await {
+                    if let Ok(bytes) = item {
+                        let mut out = std::io::stdout().lock();
+                        let _ = out.write_all(&bytes);
+                        let _ = out.flush();
+                    }
                 }
-            }
-        });
+                let _ = done_tx.send(()).await;
+            });
+            (None, Some(done_rx))
+        };
+
+        let (stderr, stderr_inherited_done) = if request.capture_stderr {
+            let (stderr_tx, stderr_rx) = async_channel::bounded(STREAM_CHANNEL_CAPACITY);
+            tokio::spawn(async move {
+                while let Ok(item) = child_stderr.recv().await {
+                    let mapped = item.map_err(|err| {
+                        ShellError::Generic(GenericError::new(
+                            "remote stderr error",
+                            err.to_string(),
+                            Span::unknown(),
+                        ))
+                    });
+                    if stderr_tx.send(mapped).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            (Some(stderr_rx), None)
+        } else {
+            let (done_tx, done_rx) = async_channel::bounded(1);
+            tokio::spawn(async move {
+                use std::io::Write as _;
+                while let Ok(item) = child_stderr.recv().await {
+                    if let Ok(bytes) = item {
+                        let mut err = std::io::stderr().lock();
+                        let _ = err.write_all(&bytes);
+                        let _ = err.flush();
+                    }
+                }
+                let _ = done_tx.send(()).await;
+            });
+            (None, Some(done_rx))
+        };
+
         tokio::spawn(async move {
-            let status = match child.wait().await {
+            let wait_res = child.wait().await;
+            if let Some(rx) = stdout_inherited_done {
+                let _ = rx.recv().await;
+            }
+            if let Some(rx) = stderr_inherited_done {
+                let _ = rx.recv().await;
+            }
+            let status = match wait_res {
                 Ok(res) => Ok(i32::try_from(res.exit_code).unwrap_or(1)),
                 Err(err) => Err(ops_to_env_err(err)),
             };
@@ -236,8 +313,8 @@ impl HeliosEnv for HostEnv {
         });
 
         Ok(ExternalProcess {
-            stdout: request.capture_stdout.then_some(stdout_rx),
-            stderr: request.capture_stderr.then_some(stderr_rx),
+            stdout,
+            stderr,
             exit_code: exit_rx,
         })
     }
@@ -492,6 +569,26 @@ impl HeliosEnv for HostEnv {
         Ok(())
     }
 
+    async fn write_stdout(&self, bytes: &[u8]) -> Result<(), EnvError> {
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        out.write_all(bytes)
+            .and_then(|()| out.flush())
+            .map_err(|err| EnvError::Io {
+                detail: err.to_string(),
+            })
+    }
+
+    async fn write_stderr(&self, bytes: &[u8]) -> Result<(), EnvError> {
+        use std::io::Write as _;
+        let mut err = std::io::stderr().lock();
+        err.write_all(bytes)
+            .and_then(|()| err.flush())
+            .map_err(|e| EnvError::Io {
+                detail: e.to_string(),
+            })
+    }
+
     async fn enter_scope(&self, scope: &str) -> Result<String, EnvError> {
         let current = self.active_scope().await;
         let normalized = helios_ops::target::normalize_scope(scope);
@@ -522,39 +619,55 @@ impl HeliosEnv for HostEnv {
     ) -> Result<SnapshotInfo, EnvError> {
         let hold = self.session.snapshot_hold().await.map_err(ops_to_env_err)?;
         let readiness = hold.readiness();
-        hold.release().await.map_err(ops_to_env_err)?;
+        let seq = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = format!(
+            "snap-{name}-{seq}-gen{}",
+            usize::from(readiness.has_generation_id)
+        );
+        self.snapshots.lock().await.insert(id.clone(), hold);
         Ok(SnapshotInfo {
-            id: format!(
-                "snap-{}-gen{}",
-                name,
-                usize::from(readiness.has_generation_id)
-            ),
+            id,
             name: name.to_owned(),
             moniker: moniker.map(ToOwned::to_owned),
         })
     }
 
+    async fn release_snapshot(&self, id: &str) -> Result<(), EnvError> {
+        let hold = self.snapshots.lock().await.remove(id);
+        if let Some(hold) = hold {
+            hold.release().await.map_err(ops_to_env_err)?;
+        }
+        Ok(())
+    }
+
     async fn begin_instruction_profile(&self, target: Option<&str>) -> Result<String, EnvError> {
+        let target_name = target.unwrap_or("kernel");
         self.session
             .profile_set_instruction_sampling(true)
             .await
             .map_err(ops_to_env_err)?;
-        Ok(target.unwrap_or("kernel").to_owned())
+        let seq = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let handle = format!("{target_name}#{seq}");
+        self.active_profiles.lock().await.insert(handle.clone());
+        Ok(handle)
     }
 
     async fn end_instruction_profile(
         &self,
         handle: &str,
     ) -> Result<InstructionProfileSummary, EnvError> {
-        let profile = self
-            .session
-            .profile_instruction_samples()
-            .await
-            .map_err(ops_to_env_err)?;
-        let _ = self.session.profile_set_instruction_sampling(false).await;
-        let samples = profile.samples.len() as u64;
+        self.active_profiles.lock().await.remove(handle);
+        let profile_res = self.session.profile_instruction_samples().await;
+        let stop_res = self.session.profile_set_instruction_sampling(false).await;
+        let profile = profile_res.map_err(ops_to_env_err)?;
+        stop_res.map_err(ops_to_env_err)?;
+        let samples: u64 = profile.samples.iter().map(|s| s.count).sum();
+        let target = handle
+            .rsplit_once('#')
+            .map_or(handle, |(name, _)| name)
+            .to_owned();
         Ok(InstructionProfileSummary {
-            target: handle.to_owned(),
+            target,
             instructions: samples,
             cycles: samples,
             samples,
@@ -1559,4 +1672,856 @@ pub fn format_labels(labels: &BTreeMap<String, String>) -> String {
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use async_io::Async;
+    use helios_ops::{RpcConnection, Session, SessionOptions, Target};
+    use helios_wit_rpc::inspector::helios::system::{
+        filters::FilterError,
+        ipc as rpc_ipc, net as rpc_net,
+        profiling::{
+            self as rpc_profiling, ControlError, Filter as ProfileFilter, FoldedSample,
+            InstructionProfile, InstructionProfileError, InstructionSample, MetricFilter,
+            MetricSample, RawProfileError, SampledCode,
+        },
+        programs::{
+            self as rpc_programs, AotRequest, AotResult, ChildTermination, ContainerConfig,
+            ContainerExecRequest, ContainerSpawnRequest, DefaultLinuxImage, ExecError, ExecOutput,
+            ExecRequest, ExecResult, ExitStatus, InheritedSocket, SpawnError, SpawnRequest,
+        },
+        serial as rpc_serial,
+        snapshot::{self as rpc_snapshot, SnapshotError},
+        vsock as rpc_vsock,
+    };
+    use helios_wit_rpc::inspector::wasi::filesystem::{
+        preopens as rpc_preopens,
+        types::{
+            self as rpc_fs, Advice, DescriptorFlags, DescriptorStat, DescriptorType,
+            DirectoryEntry, ErrorCode, Filesize, MetadataHashValue, NewTimestamp, OpenFlags,
+            PathFlags,
+        },
+    };
+    use helios_wit_rpc::{
+        Dispatcher, Endpoint, FutureReader, ResourceEntry, ResourceSlotAccess, ServerInvocation,
+        StreamReader, WireError,
+    };
+
+    use super::*;
+    use crate::{OutputFormat, eval_command};
+
+    struct DropCounter(Arc<AtomicUsize>);
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    enum TestResource {
+        Snapshot(Arc<DropCounter>),
+        Sampling(Arc<DropCounter>),
+        Child(Arc<String>),
+        Dir(Arc<()>),
+        Unit(Arc<()>),
+    }
+
+    impl ResourceEntry for TestResource {
+        fn kind_name(&self) -> &'static str {
+            match self {
+                Self::Snapshot(_) => "snapshot-hold",
+                Self::Sampling(_) => "sampling-session",
+                Self::Child(_) => "child",
+                Self::Dir(_) => "descriptor",
+                Self::Unit(_) => "unit",
+            }
+        }
+    }
+
+    macro_rules! impl_unit_slot {
+        ($($marker:ty),* $(,)?) => {
+            $(
+                impl ResourceSlotAccess<$marker, ()> for TestResource {
+                    fn into_entry(arc: Arc<()>) -> Self {
+                        Self::Unit(arc)
+                    }
+                    fn borrow_entry(&self) -> Option<&Arc<()>> {
+                        match self {
+                            Self::Unit(u) => Some(u),
+                            _ => None,
+                        }
+                    }
+                    fn take_entry(self) -> Result<Arc<()>, Self> {
+                        match self {
+                            Self::Unit(u) => Ok(u),
+                            other => Err(other),
+                        }
+                    }
+                }
+            )*
+        };
+    }
+
+    impl_unit_slot!(
+        rpc_ipc::Endpoint,
+        rpc_programs::Container,
+        rpc_net::TcpListener,
+        rpc_net::TcpStream,
+        rpc_serial::SerialPort,
+        rpc_vsock::VsockListener,
+        rpc_vsock::VsockStream,
+    );
+
+    impl ResourceSlotAccess<rpc_snapshot::SnapshotHold, DropCounter> for TestResource {
+        fn into_entry(arc: Arc<DropCounter>) -> Self {
+            Self::Snapshot(arc)
+        }
+        fn borrow_entry(&self) -> Option<&Arc<DropCounter>> {
+            match self {
+                Self::Snapshot(c) => Some(c),
+                _ => None,
+            }
+        }
+        fn take_entry(self) -> Result<Arc<DropCounter>, Self> {
+            match self {
+                Self::Snapshot(c) => Ok(c),
+                other => Err(other),
+            }
+        }
+    }
+
+    impl ResourceSlotAccess<rpc_profiling::SamplingSession, DropCounter> for TestResource {
+        fn into_entry(arc: Arc<DropCounter>) -> Self {
+            Self::Sampling(arc)
+        }
+        fn borrow_entry(&self) -> Option<&Arc<DropCounter>> {
+            match self {
+                Self::Sampling(c) => Some(c),
+                _ => None,
+            }
+        }
+        fn take_entry(self) -> Result<Arc<DropCounter>, Self> {
+            match self {
+                Self::Sampling(c) => Ok(c),
+                other => Err(other),
+            }
+        }
+    }
+
+    impl ResourceSlotAccess<rpc_programs::Child, String> for TestResource {
+        fn into_entry(arc: Arc<String>) -> Self {
+            Self::Child(arc)
+        }
+        fn borrow_entry(&self) -> Option<&Arc<String>> {
+            match self {
+                Self::Child(s) => Some(s),
+                _ => None,
+            }
+        }
+        fn take_entry(self) -> Result<Arc<String>, Self> {
+            match self {
+                Self::Child(s) => Ok(s),
+                other => Err(other),
+            }
+        }
+    }
+
+    impl ResourceSlotAccess<rpc_fs::Descriptor, ()> for TestResource {
+        fn into_entry(arc: Arc<()>) -> Self {
+            Self::Dir(arc)
+        }
+        fn borrow_entry(&self) -> Option<&Arc<()>> {
+            match self {
+                Self::Dir(d) => Some(d),
+                _ => None,
+            }
+        }
+        fn take_entry(self) -> Result<Arc<()>, Self> {
+            match self {
+                Self::Dir(d) => Ok(d),
+                other => Err(other),
+            }
+        }
+    }
+
+    struct TestSnapshot {
+        live_holds: Arc<AtomicUsize>,
+    }
+
+    impl rpc_snapshot::RpcHandler for TestSnapshot {
+        type SnapshotHold = DropCounter;
+
+        async fn prepare(&self) -> Result<Self::SnapshotHold, SnapshotError> {
+            self.live_holds.fetch_add(1, Ordering::AcqRel);
+            Ok(DropCounter(Arc::clone(&self.live_holds)))
+        }
+
+        async fn snapshot_hold_has_generation_id(&self, _self_: &Self::SnapshotHold) -> bool {
+            true
+        }
+    }
+
+    struct TestProfiling {
+        live_sampling: Arc<AtomicUsize>,
+        fail_read: Arc<AtomicBool>,
+    }
+
+    impl rpc_profiling::RpcHandler for TestProfiling {
+        type SamplingSession = DropCounter;
+
+        async fn set_enabled(&self, _enabled: bool) -> Result<(), ControlError> {
+            Ok(())
+        }
+
+        async fn clear(&self) -> Result<(), ControlError> {
+            Ok(())
+        }
+
+        async fn folded(
+            &self,
+            _filter: ProfileFilter,
+            _limit: u32,
+        ) -> Result<Vec<FoldedSample>, FilterError> {
+            Ok(Vec::new())
+        }
+
+        async fn metrics(
+            &self,
+            _filter: MetricFilter,
+            _limit: u32,
+        ) -> Result<Vec<MetricSample>, FilterError> {
+            Ok(Vec::new())
+        }
+
+        async fn start_instruction_sampling(
+            &self,
+        ) -> Result<Self::SamplingSession, InstructionProfileError> {
+            self.live_sampling.fetch_add(1, Ordering::AcqRel);
+            Ok(DropCounter(Arc::clone(&self.live_sampling)))
+        }
+
+        async fn instruction_samples(&self) -> Result<InstructionProfile, InstructionProfileError> {
+            if self.fail_read.load(Ordering::Acquire) {
+                return Err(InstructionProfileError::Denied);
+            }
+            Ok(InstructionProfile {
+                period_nanos: 1_000,
+                kernel_image_base: 0,
+                samples: vec![
+                    InstructionSample {
+                        code: SampledCode::Native(0x1000),
+                        count: 3,
+                    },
+                    InstructionSample {
+                        code: SampledCode::Native(0x2000),
+                        count: 7,
+                    },
+                ],
+                dropped: 0,
+            })
+        }
+
+        async fn raw_profile_size(&self) -> Result<u64, RawProfileError> {
+            Ok(0)
+        }
+
+        async fn raw_profile_read(
+            &self,
+            _offset: u64,
+            _len: u32,
+        ) -> Result<Vec<u8>, RawProfileError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct TestPrograms {
+        seen_cwd: Arc<tokio::sync::Mutex<Option<String>>>,
+        seen_path: Arc<tokio::sync::Mutex<Option<String>>>,
+    }
+
+    impl rpc_programs::RpcHandler for TestPrograms {
+        type Child = String;
+        type Container = ();
+        type Endpoint = ();
+        type TcpListener = ();
+        type TcpStream = ();
+        type SerialPort = ();
+        type VsockListener = ();
+        type VsockStream = ();
+
+        async fn child_stdin(
+            &self,
+            _self_: &Self::Child,
+            data: StreamReader<u8>,
+        ) -> FutureReader<Result<(), ()>> {
+            let _ = data.collect_all().await;
+            FutureReader::ready(Ok(()))
+        }
+
+        async fn child_stdout(
+            &self,
+            self_: &Self::Child,
+        ) -> (StreamReader<u8>, FutureReader<Result<(), ()>>) {
+            (
+                StreamReader::from_vec(self_.as_bytes().to_vec()),
+                FutureReader::ready(Ok(())),
+            )
+        }
+
+        async fn child_stderr(
+            &self,
+            _self_: &Self::Child,
+        ) -> (StreamReader<u8>, FutureReader<Result<(), ()>>) {
+            (StreamReader::empty(), FutureReader::ready(Ok(())))
+        }
+
+        async fn child_instance_id(&self, _self_: &Self::Child) -> u64 {
+            55
+        }
+
+        async fn child_signal(&self, _self_: &Self::Child, _sig: u8) -> Result<(), SpawnError> {
+            Ok(())
+        }
+
+        async fn child_wait(&self, _self_: &Self::Child) -> Result<ExitStatus, SpawnError> {
+            Ok(ExitStatus {
+                instance_id: 55,
+                termination: ChildTermination::Exited(0),
+            })
+        }
+
+        async fn container_spawn(
+            &self,
+            _self_: &Self::Container,
+            _request: ContainerSpawnRequest<
+                Self::TcpListener,
+                Self::VsockListener,
+                Self::TcpStream,
+                Self::VsockStream,
+                Self::SerialPort,
+            >,
+        ) -> Result<Self::Child, SpawnError> {
+            unreachable!()
+        }
+
+        async fn container_exec(
+            &self,
+            _self_: &Self::Container,
+            _request: ContainerExecRequest,
+        ) -> Result<ExecResult, ExecError> {
+            unreachable!()
+        }
+
+        async fn set_default_image(
+            &self,
+            _image: Option<DefaultLinuxImage>,
+        ) -> Result<(), SpawnError> {
+            Ok(())
+        }
+
+        async fn get_default_image(&self) -> Option<DefaultLinuxImage> {
+            None
+        }
+
+        async fn take_inherited_sockets(
+            &self,
+        ) -> Vec<
+            InheritedSocket<
+                Self::TcpListener,
+                Self::VsockListener,
+                Self::TcpStream,
+                Self::VsockStream,
+                Self::SerialPort,
+            >,
+        > {
+            Vec::new()
+        }
+
+        async fn create_container(
+            &self,
+            _config: ContainerConfig<Self::Endpoint>,
+        ) -> Result<Self::Container, SpawnError> {
+            Ok(())
+        }
+
+        async fn spawn(
+            &self,
+            request: SpawnRequest<
+                Self::TcpListener,
+                Self::VsockListener,
+                Self::TcpStream,
+                Self::VsockStream,
+                Self::SerialPort,
+                Self::Endpoint,
+            >,
+        ) -> Result<Self::Child, SpawnError> {
+            *self.seen_cwd.lock().await = request.cwd.clone();
+            *self.seen_path.lock().await = Some(request.path.clone());
+            Ok(format!("ran:{}", request.path))
+        }
+
+        async fn exec(
+            &self,
+            _request: ExecRequest<Self::Endpoint>,
+        ) -> Result<ExecResult, ExecError> {
+            Ok(ExecResult {
+                instance_id: 1,
+                exit_code: 0,
+                output: ExecOutput {
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
+                launch_nanos: 0,
+            })
+        }
+
+        async fn aot(&self, _request: AotRequest) -> Result<AotResult, ExecError> {
+            unreachable!()
+        }
+    }
+
+    struct TestPreopens;
+    impl rpc_preopens::RpcHandler for TestPreopens {
+        type Descriptor = ();
+        async fn get_directories(&self) -> Vec<(Self::Descriptor, String)> {
+            vec![((), "/".to_owned())]
+        }
+    }
+
+    struct TestFs;
+    impl rpc_fs::RpcHandler for TestFs {
+        type Descriptor = ();
+        async fn descriptor_read_via_stream(
+            &self,
+            _self_: &Self::Descriptor,
+            _offset: Filesize,
+        ) -> (StreamReader<u8>, FutureReader<Result<(), ErrorCode>>) {
+            (StreamReader::empty(), FutureReader::ready(Ok(())))
+        }
+        async fn descriptor_write_via_stream(
+            &self,
+            _self_: &Self::Descriptor,
+            _data: StreamReader<u8>,
+            _offset: Filesize,
+        ) -> FutureReader<Result<(), ErrorCode>> {
+            FutureReader::ready(Ok(()))
+        }
+        async fn descriptor_append_via_stream(
+            &self,
+            _self_: &Self::Descriptor,
+            _data: StreamReader<u8>,
+        ) -> FutureReader<Result<(), ErrorCode>> {
+            FutureReader::ready(Ok(()))
+        }
+        async fn descriptor_advise(
+            &self,
+            _self_: &Self::Descriptor,
+            _offset: Filesize,
+            _length: Filesize,
+            _advice: Advice,
+        ) -> Result<(), ErrorCode> {
+            Ok(())
+        }
+        async fn descriptor_sync_data(&self, _self_: &Self::Descriptor) -> Result<(), ErrorCode> {
+            Ok(())
+        }
+        async fn descriptor_get_flags(
+            &self,
+            _self_: &Self::Descriptor,
+        ) -> Result<DescriptorFlags, ErrorCode> {
+            Ok(DescriptorFlags::READ)
+        }
+        async fn descriptor_get_type(
+            &self,
+            _self_: &Self::Descriptor,
+        ) -> Result<DescriptorType, ErrorCode> {
+            Ok(DescriptorType::Directory)
+        }
+        async fn descriptor_set_size(
+            &self,
+            _self_: &Self::Descriptor,
+            _size: Filesize,
+        ) -> Result<(), ErrorCode> {
+            Ok(())
+        }
+        async fn descriptor_set_times(
+            &self,
+            _self_: &Self::Descriptor,
+            _a: NewTimestamp,
+            _m: NewTimestamp,
+        ) -> Result<(), ErrorCode> {
+            Ok(())
+        }
+        async fn descriptor_read_directory(
+            &self,
+            _self_: &Self::Descriptor,
+        ) -> (
+            StreamReader<DirectoryEntry>,
+            FutureReader<Result<(), ErrorCode>>,
+        ) {
+            (
+                StreamReader::from_vec(vec![DirectoryEntry {
+                    r#type: DescriptorType::RegularFile,
+                    name: "demo".to_owned(),
+                }]),
+                FutureReader::ready(Ok(())),
+            )
+        }
+        async fn descriptor_sync(&self, _self_: &Self::Descriptor) -> Result<(), ErrorCode> {
+            Ok(())
+        }
+        async fn descriptor_create_directory_at(
+            &self,
+            _self_: &Self::Descriptor,
+            _path: String,
+        ) -> Result<(), ErrorCode> {
+            Ok(())
+        }
+        async fn descriptor_stat(
+            &self,
+            _self_: &Self::Descriptor,
+        ) -> Result<DescriptorStat, ErrorCode> {
+            Ok(DescriptorStat {
+                r#type: DescriptorType::RegularFile,
+                link_count: 1,
+                size: 4,
+                data_access_timestamp: None,
+                data_modification_timestamp: None,
+                status_change_timestamp: None,
+            })
+        }
+        async fn descriptor_stat_at(
+            &self,
+            _self_: &Self::Descriptor,
+            _path_flags: PathFlags,
+            path: String,
+        ) -> Result<DescriptorStat, ErrorCode> {
+            if path == "demo" || path == "usr/bin/demo" || path == "/usr/bin/demo" {
+                Ok(DescriptorStat {
+                    r#type: DescriptorType::RegularFile,
+                    link_count: 1,
+                    size: 4,
+                    data_access_timestamp: None,
+                    data_modification_timestamp: None,
+                    status_change_timestamp: None,
+                })
+            } else {
+                Err(ErrorCode::NoEntry)
+            }
+        }
+        async fn descriptor_set_times_at(
+            &self,
+            _self_: &Self::Descriptor,
+            _path_flags: PathFlags,
+            _path: String,
+            _a: NewTimestamp,
+            _m: NewTimestamp,
+        ) -> Result<(), ErrorCode> {
+            Ok(())
+        }
+        async fn descriptor_link_at(
+            &self,
+            _self_: &Self::Descriptor,
+            _old_path_flags: PathFlags,
+            _old_path: String,
+            _new_descriptor: &Self::Descriptor,
+            _new_path: String,
+        ) -> Result<(), ErrorCode> {
+            Ok(())
+        }
+        async fn descriptor_open_at(
+            &self,
+            _self_: &Self::Descriptor,
+            _path_flags: PathFlags,
+            _path: String,
+            _open_flags: OpenFlags,
+            _flags: DescriptorFlags,
+        ) -> Result<Self::Descriptor, ErrorCode> {
+            Ok(())
+        }
+        async fn descriptor_readlink_at(
+            &self,
+            _self_: &Self::Descriptor,
+            _path: String,
+        ) -> Result<String, ErrorCode> {
+            Err(ErrorCode::Invalid)
+        }
+        async fn descriptor_remove_directory_at(
+            &self,
+            _self_: &Self::Descriptor,
+            _path: String,
+        ) -> Result<(), ErrorCode> {
+            Ok(())
+        }
+        async fn descriptor_rename_at(
+            &self,
+            _self_: &Self::Descriptor,
+            _old_path: String,
+            _new_descriptor: &Self::Descriptor,
+            _new_path: String,
+        ) -> Result<(), ErrorCode> {
+            Ok(())
+        }
+        async fn descriptor_symlink_at(
+            &self,
+            _self_: &Self::Descriptor,
+            _old_path: String,
+            _new_path: String,
+        ) -> Result<(), ErrorCode> {
+            Ok(())
+        }
+        async fn descriptor_unlink_file_at(
+            &self,
+            _self_: &Self::Descriptor,
+            _path: String,
+        ) -> Result<(), ErrorCode> {
+            Ok(())
+        }
+        async fn descriptor_is_same_object(
+            &self,
+            _self_: &Self::Descriptor,
+            _other: &Self::Descriptor,
+        ) -> bool {
+            true
+        }
+        async fn descriptor_metadata_hash(
+            &self,
+            _self_: &Self::Descriptor,
+        ) -> Result<MetadataHashValue, ErrorCode> {
+            Ok(MetadataHashValue { lower: 0, upper: 0 })
+        }
+        async fn descriptor_metadata_hash_at(
+            &self,
+            _self_: &Self::Descriptor,
+            _path_flags: PathFlags,
+            _path: String,
+        ) -> Result<MetadataHashValue, ErrorCode> {
+            Ok(MetadataHashValue { lower: 0, upper: 0 })
+        }
+    }
+
+    struct TestDispatcher {
+        snapshot: rpc_snapshot::RpcServer<TestSnapshot>,
+        profiling: rpc_profiling::RpcServer<TestProfiling>,
+        programs: rpc_programs::RpcServer<TestPrograms>,
+        preopens: rpc_preopens::RpcServer<TestPreopens>,
+        fs: rpc_fs::RpcServer<TestFs>,
+    }
+
+    impl Dispatcher for TestDispatcher {
+        type Resource = TestResource;
+
+        fn supports(&self, instance: &str, func: &str) -> bool {
+            self.snapshot.supports_call(instance, func)
+                || self.profiling.supports_call(instance, func)
+                || self.programs.supports_call(instance, func)
+                || self.preopens.supports_call(instance, func)
+                || self.fs.supports_call(instance, func)
+        }
+
+        async fn dispatch<'a>(
+            &'a self,
+            ctx: ServerInvocation<'a, Self::Resource>,
+            instance: &'a str,
+            func: &'a str,
+        ) -> Result<(), WireError> {
+            if self.snapshot.supports_call(instance, func) {
+                self.snapshot.dispatch_with(ctx, instance, func).await
+            } else if self.profiling.supports_call(instance, func) {
+                self.profiling.dispatch_with(ctx, instance, func).await
+            } else if self.programs.supports_call(instance, func) {
+                self.programs.dispatch_with(ctx, instance, func).await
+            } else if self.preopens.supports_call(instance, func) {
+                self.preopens.dispatch_with(ctx, instance, func).await
+            } else if self.fs.supports_call(instance, func) {
+                self.fs.dispatch_with(ctx, instance, func).await
+            } else {
+                Err(WireError::MalformedPayload {
+                    context: "TestDispatcher".to_owned(),
+                    detail: format!("unsupported {instance}.{func}"),
+                })
+            }
+        }
+    }
+
+    struct EnvFixture {
+        env: HostEnv,
+        live_holds: Arc<AtomicUsize>,
+        live_sampling: Arc<AtomicUsize>,
+        fail_read: Arc<AtomicBool>,
+        seen_cwd: Arc<tokio::sync::Mutex<Option<String>>>,
+        seen_path: Arc<tokio::sync::Mutex<Option<String>>>,
+        server_task: tokio::task::JoinHandle<()>,
+    }
+
+    fn spawn_env_fixture() -> EnvFixture {
+        let (host, guest) = UnixStream::pair().expect("pair");
+        host.set_nonblocking(true).expect("nonblocking");
+        guest.set_nonblocking(true).expect("nonblocking");
+        let host_read = host.try_clone().expect("clone");
+        let guest_read = guest.try_clone().expect("clone");
+        let conn = RpcConnection::from_split(
+            Box::new(Async::new(host_read).expect("async")),
+            Box::new(Async::new(host).expect("async")),
+        );
+        let session = Session::from_connection(
+            Target::new("env-test", "serial:///tmp/env.sock").expect("target"),
+            conn,
+            SessionOptions::default(),
+        );
+        let live_holds = Arc::new(AtomicUsize::new(0));
+        let live_sampling = Arc::new(AtomicUsize::new(0));
+        let fail_read = Arc::new(AtomicBool::new(false));
+        let seen_cwd = Arc::new(tokio::sync::Mutex::new(None));
+        let seen_path = Arc::new(tokio::sync::Mutex::new(None));
+
+        let dispatcher = TestDispatcher {
+            snapshot: rpc_snapshot::RpcServer::new(TestSnapshot {
+                live_holds: Arc::clone(&live_holds),
+            }),
+            profiling: rpc_profiling::RpcServer::new(TestProfiling {
+                live_sampling: Arc::clone(&live_sampling),
+                fail_read: Arc::clone(&fail_read),
+            }),
+            programs: rpc_programs::RpcServer::new(TestPrograms {
+                seen_cwd: Arc::clone(&seen_cwd),
+                seen_path: Arc::clone(&seen_path),
+            }),
+            preopens: rpc_preopens::RpcServer::new(TestPreopens),
+            fs: rpc_fs::RpcServer::new(TestFs),
+        };
+        let ep = Endpoint::new(
+            Async::new(guest_read).expect("async"),
+            Async::new(guest).expect("async"),
+            dispatcher,
+        );
+        let server_task = tokio::spawn(async move {
+            let _ = ep.drive().await;
+        });
+        EnvFixture {
+            env: HostEnv::new(session, None),
+            live_holds,
+            live_sampling,
+            fail_read,
+            seen_cwd,
+            seen_path,
+            server_task,
+        }
+    }
+
+    async fn assert_eventually_zero(counter: &AtomicUsize, label: &str) {
+        for _ in 0..100 {
+            if counter.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(counter.load(Ordering::Acquire), 0, "{label}");
+    }
+
+    #[tokio::test]
+    async fn host_env_holds_snapshots_cleans_up_on_errors_sums_samples_and_preserves_cwd() {
+        let EnvFixture {
+            env,
+            live_holds,
+            live_sampling,
+            fail_read,
+            seen_cwd,
+            seen_path,
+            server_task,
+        } = spawn_env_fixture();
+
+        // 1. Snapshot hold stays live across take_snapshot until release_snapshot.
+        let snap = env.take_snapshot("s1", None).await.expect("take_snapshot");
+        assert_eq!(live_holds.load(Ordering::Acquire), 1);
+        env.release_snapshot(&snap.id)
+            .await
+            .expect("release_snapshot");
+        assert_eventually_zero(
+            &live_holds,
+            "release_snapshot must drop remote SnapshotHold",
+        )
+        .await;
+
+        // 2. with-snapshot and with-instruction-profile release/stop even when closure fails.
+        let snap_err = eval_command(
+            env.clone(),
+            r#"with-snapshot failing { error make { msg: "boom" } }"#,
+            OutputFormat::Json,
+        )
+        .await;
+        assert!(snap_err.is_err());
+        assert_eventually_zero(&live_holds, "with-snapshot must release hold on error").await;
+
+        let prof_err = eval_command(
+            env.clone(),
+            r#"with-instruction-profile { error make { msg: "boom" } }"#,
+            OutputFormat::Json,
+        )
+        .await;
+        assert!(prof_err.is_err());
+        assert_eventually_zero(
+            &live_sampling,
+            "with-instruction-profile must stop sampling on error",
+        )
+        .await;
+
+        // 3. end_instruction_profile sums sample.count and stops sampling even on read failure.
+        let handle = env
+            .begin_instruction_profile(None)
+            .await
+            .expect("begin profile");
+        assert_eq!(live_sampling.load(Ordering::Acquire), 1);
+        let summary = env
+            .end_instruction_profile(&handle)
+            .await
+            .expect("end profile");
+        assert_eq!(summary.samples, 10);
+        assert_eventually_zero(&live_sampling, "end_instruction_profile must stop sampling").await;
+
+        fail_read.store(true, Ordering::Release);
+        let handle2 = env
+            .begin_instruction_profile(None)
+            .await
+            .expect("begin profile 2");
+        assert!(env.end_instruction_profile(&handle2).await.is_err());
+        assert_eventually_zero(
+            &live_sampling,
+            "end_instruction_profile must stop sampling on read error",
+        )
+        .await;
+
+        // 4. cleanup_active clears dangling snapshots & active profiles (Ctrl+C safety).
+        let _dangling = env.take_snapshot("ctrlc", None).await.expect("snap");
+        let _dangling_prof = env.begin_instruction_profile(None).await.expect("prof");
+        assert_eq!(live_holds.load(Ordering::Acquire), 1);
+        assert_eq!(live_sampling.load(Ordering::Acquire), 1);
+        env.cleanup_active().await;
+        assert_eventually_zero(&live_holds, "cleanup_active must drop snapshots").await;
+        assert_eventually_zero(&live_sampling, "cleanup_active must stop sampling").await;
+
+        // 5. spawn_external preserves non-empty cwd with empty grants & resolves PATH binary.
+        let proc = env
+            .spawn_external(ExternalSpawnRequest {
+                program: "demo".to_owned(),
+                args: Vec::new(),
+                env: BTreeMap::from([("PATH".to_owned(), "/usr/bin:/bin".to_owned())]),
+                cwd: "/work".to_owned(),
+                scope: None,
+                stdin: None,
+                capture_stdout: true,
+                capture_stderr: true,
+                grants: Vec::new(),
+            })
+            .await
+            .expect("spawn_external");
+        let _ = proc.exit_code.recv().await;
+        assert_eq!(seen_cwd.lock().await.as_deref(), Some("/work"));
+        assert_eq!(seen_path.lock().await.as_deref(), Some("/usr/bin/demo"));
+
+        server_task.abort();
+    }
 }

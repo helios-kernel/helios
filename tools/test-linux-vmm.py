@@ -48,7 +48,7 @@ def main():
     # serial side channel is needed to guess when its shell becomes ready.
     script = Path(__file__).with_name("linux-vmm-commands").read_text()
     shell = (
-        f'with-grants ["dir:/:rw"] {{ {json.dumps(script)} '
+        f'with-grants ["dir:/:rx", "dir:/host:rwx", "virtualize"] {{ {json.dumps(script)} '
         f"| ^/bin/vmm --kernel /host/Image --initramfs /host/initramfs.gz "
         f"--disk /host/disk.raw --cpus {args.cpus} }}"
     )

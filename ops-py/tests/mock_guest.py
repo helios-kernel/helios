@@ -157,7 +157,10 @@ class MockHeliosGuest:
         }
         self.dirs: set[str] = {"/", "/bin", "/etc", "/tmp"}
         self.killed_ids: list[int] = []
+        self.signals_sent: list[tuple[int, int]] = []
         self.exec_calls: list[tuple[str, list[str]]] = []
+        self.spawn_calls: list[tuple[str, list[str]]] = []
+        self._children: dict[int, list[Any]] = {}
         self._server: asyncio.AbstractServer | None = None
         self._writers: set[asyncio.StreamWriter] = set()
         self.port: int = 0
@@ -201,8 +204,8 @@ class MockHeliosGuest:
         active: dict[int, tuple[str, str, bytearray]] = {}
         # Pending server->client subpaths waiting for Credit: (inv, sub_id) -> list[bytes]
         pending_out: dict[tuple[int, int], list[bytes]] = {}
-        # Active client->server write streams: (inv, sub_id) -> (path, offset_or_none, bytearray, done_sub_id)
-        pending_in: dict[tuple[int, int], tuple[str, int | None, bytearray, int]] = {}
+        # Active client->server write streams: (inv, sub_id) -> (sink_kind, target_key, offset_or_none, bytearray, done_sub_id)
+        pending_in: dict[tuple[int, int], tuple[str, Any, int | None, bytearray, int]] = {}
         # Credits received before a done future was ready: set[(inv, sub_id)]
         early_credits: set[tuple[int, int]] = set()
 
@@ -249,7 +252,7 @@ class MockHeliosGuest:
                         if key in pending_in:
                             # `stream<u8>` item batches are encoded as `u32(len) + raw bytes`.
                             batch_len, bpos = dec_u32(chunk, 0)
-                            pending_in[key][2].extend(chunk[bpos : bpos + batch_len])
+                            pending_in[key][3].extend(chunk[bpos : bpos + batch_len])
                 elif tag == 4:  # Close
                     (invocation,) = struct.unpack_from("<I", body, 0)
                     path, _ = _decode_path(body, 4)
@@ -266,9 +269,10 @@ class MockHeliosGuest:
                                 early_credits.discard((invocation, sub_id))
                                 await flush_subpath(invocation, sub_id)
                         if in_stream is not None:
-                            in_sub_id, fpath, offset, done_sub_id = in_stream
+                            in_sub_id, sink_kind, target_key, offset, done_sub_id = in_stream
                             pending_in[(invocation, in_sub_id)] = (
-                                fpath,
+                                sink_kind,
+                                target_key,
                                 offset,
                                 bytearray(),
                                 done_sub_id,
@@ -279,16 +283,20 @@ class MockHeliosGuest:
                         key = (invocation, path[1])
                         entry = pending_in.pop(key, None)
                         if entry is not None:
-                            fpath, offset, data, done_sub_id = entry
-                            if offset is None:
-                                self.files[fpath] = self.files.get(fpath, b"") + bytes(data)
+                            sink_kind, target_key, offset, data, done_sub_id = entry
+                            if sink_kind == "stdin":
+                                child_state = self._children.get(target_key)
+                                if child_state is not None:
+                                    child_state[2].extend(data)
+                            elif offset is None:
+                                self.files[target_key] = self.files.get(target_key, b"") + bytes(data)
                             else:
-                                existing = bytearray(self.files.get(fpath, b""))
+                                existing = bytearray(self.files.get(target_key, b""))
                                 end = offset + len(data)
                                 if len(existing) < end:
                                     existing.extend(b"\x00" * (end - len(existing)))
                                 existing[offset:end] = data
-                                self.files[fpath] = bytes(existing)
+                                self.files[target_key] = bytes(existing)
                             pending_out[(invocation, done_sub_id)] = [b"\x00"]
                             if (invocation, done_sub_id) in early_credits:
                                 early_credits.discard((invocation, done_sub_id))
@@ -319,7 +327,7 @@ class MockHeliosGuest:
         payload: bytes,
         handles: dict[int, tuple[str, bool]],
         alloc_handle: Any,
-    ) -> tuple[bytes, dict[int, list[bytes]], tuple[int, str, int | None, int] | None]:
+    ) -> tuple[bytes, dict[int, list[bytes]], tuple[int, str, Any, int | None, int] | None]:
         if instance == INSPECT_INSTANCE and func == "snapshot":
             return self._encode_inspect_snapshot(), {}, None
         if instance == INSTANCES_INSTANCE and func == "snapshot":
@@ -345,6 +353,59 @@ class MockHeliosGuest:
             if "-c" in args and "2" in args:
                 return self._encode_exec_result(99, 0, b"spawned ok\n", b"warn line\n"), {}, None
             return self._encode_exec_result(42, 0, b"exec ok\n", b""), {}, None
+        if instance == PROGRAMS_INSTANCE and func == "spawn":
+            name, pos = dec_str(payload, 0)
+            argc, pos = dec_u32(payload, pos)
+            args = []
+            for _ in range(argc):
+                arg, pos = dec_str(payload, pos)
+                args.append(arg)
+            self.spawn_calls.append((name, args))
+            if "-c" in args and "2" in args:
+                inst_id, stdout, stderr = 99, b"spawned ok\n", b"warn line\n"
+            else:
+                inst_id, stdout, stderr = 42, b"exec ok\n", b""
+            child_h = alloc_handle(f"/proc/{inst_id}", False)
+            self._children[child_h] = [inst_id, 0, bytearray(), stdout, stderr]
+            return b"\x00" + enc_u32(child_h), {}, None
+        if instance == PROGRAMS_INSTANCE and func == "[method]child.instance-id":
+            child_h, _ = dec_u32(payload, 0)
+            inst_id = int(self._children[child_h][0])
+            return enc_u64(inst_id), {}, None
+        if instance == PROGRAMS_INSTANCE and func == "[method]child.stdout":
+            child_h, _ = dec_u32(payload, 0)
+            data = self._children[child_h][3]
+            self._children[child_h][3] = b""
+            subpaths = {
+                1: [enc_bytes(data)] if data else [],
+                2: [b"\x00"],
+            }
+            return enc_u32(1) + enc_u32(2), subpaths, None
+        if instance == PROGRAMS_INSTANCE and func == "[method]child.stderr":
+            child_h, _ = dec_u32(payload, 0)
+            data = self._children[child_h][4]
+            self._children[child_h][4] = b""
+            subpaths = {
+                1: [enc_bytes(data)] if data else [],
+                2: [b"\x00"],
+            }
+            return enc_u32(1) + enc_u32(2), subpaths, None
+        if instance == PROGRAMS_INSTANCE and func == "[method]child.stdin":
+            child_h, pos = dec_u32(payload, 0)
+            in_sub_id, _ = dec_u32(payload, pos)
+            done_sub_id = 1
+            return enc_u32(done_sub_id), {}, (in_sub_id, "stdin", child_h, None, done_sub_id)
+        if instance == PROGRAMS_INSTANCE and func == "[method]child.signal":
+            child_h, pos = dec_u32(payload, 0)
+            sig = payload[pos]
+            inst_id = int(self._children[child_h][0])
+            self.signals_sent.append((inst_id, sig))
+            return b"\x00", {}, None
+        if instance == PROGRAMS_INSTANCE and func == "[method]child.wait":
+            child_h, _ = dec_u32(payload, 0)
+            inst_id = int(self._children[child_h][0])
+            exit_code = int(self._children[child_h][1])
+            return b"\x00" + enc_u64(inst_id) + b"\x00" + enc_u32(exit_code), {}, None
         if instance == WASI_PREOPENS_INSTANCE and func == "get-directories":
             # list<tuple<own<descriptor>, string>>
             return enc_u32(1) + enc_u32(1) + enc_str("/"), {}, None
@@ -358,7 +419,7 @@ class MockHeliosGuest:
         payload: bytes,
         handles: dict[int, tuple[str, bool]],
         alloc_handle: Any,
-    ) -> tuple[bytes, dict[int, list[bytes]], tuple[int, str, int | None, int] | None]:
+    ) -> tuple[bytes, dict[int, list[bytes]], tuple[int, str, Any, int | None, int] | None]:
         if func == "[method]descriptor.open-at":
             base_h, pos = dec_u32(payload, 0)
             _path_flags, pos = dec_u32(payload, pos)
@@ -426,14 +487,14 @@ class MockHeliosGuest:
             offset, _ = dec_u64(payload, pos)
             path, _ = handles.get(h, ("/", False))
             done_sub_id = 1
-            return enc_u32(done_sub_id), {}, (in_sub_id, path, offset, done_sub_id)
+            return enc_u32(done_sub_id), {}, (in_sub_id, "file", path, offset, done_sub_id)
 
         if func == "[method]descriptor.append-via-stream":
             h, pos = dec_u32(payload, 0)
             in_sub_id, _ = dec_u32(payload, pos)
             path, _ = handles.get(h, ("/", False))
             done_sub_id = 1
-            return enc_u32(done_sub_id), {}, (in_sub_id, path, None, done_sub_id)
+            return enc_u32(done_sub_id), {}, (in_sub_id, "file", path, None, done_sub_id)
 
         if func == "[method]descriptor.create-directory-at":
             base_h, pos = dec_u32(payload, 0)

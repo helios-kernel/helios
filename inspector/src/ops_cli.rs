@@ -3,18 +3,21 @@
 //! `inspect`, `ps`, `kill`, `trace`, `profile`, `spawn`, `bundle`, `bridge`).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
-use helios_inspector_protocol::auth::ClientIdentity;
+use helios_inspector_protocol::auth::{
+    CapabilityCert as ProtocolCapabilityCert, ClientIdentity, random_32,
+};
 use helios_inspector_shell::{HostEnv, OutputFormat as ShellOutputFormat, ReplError};
 use helios_ops::{
     Attenuation, CapabilityCert, DEFAULT_FLEET_CONCURRENCY, DiagnosticBundle, Fleet, GrantRight,
     IdentityProfile, OpsError, Session, SessionOptions, SpawnRequest, Target, TargetError,
-    TargetStore, http,
+    TargetStore, TargetUri, http,
 };
 use helios_wit_rpc::inspector::helios::system::{
     inspect as proto_inspect,
@@ -366,6 +369,14 @@ pub(crate) enum OpsCliError {
 
 /// Build [`SessionOptions`] from global CLI flags (`--identity`, `--scope`, `--only`).
 pub(crate) fn build_session_options(flags: &GlobalOpsFlags) -> Result<SessionOptions, OpsCliError> {
+    build_session_options_for_target(flags, None, true)
+}
+
+fn build_session_options_for_target(
+    flags: &GlobalOpsFlags,
+    target_identity: Option<&str>,
+    allow_ambient_auth: bool,
+) -> Result<SessionOptions, OpsCliError> {
     let mut only = BTreeSet::new();
     for raw in &flags.only {
         if raw.trim().is_empty() {
@@ -375,29 +386,8 @@ pub(crate) fn build_session_options(flags: &GlobalOpsFlags) -> Result<SessionOpt
             .ok_or_else(|| OpsCliError::UnknownCapability { raw: raw.clone() })?;
         only.insert(right);
     }
-    let identity = match &flags.identity {
-        Some(name_or_path) => Some(IdentityProfile::load(name_or_path).map_err(OpsError::from)?),
-        None => IdentityProfile::load("default").ok(),
-    };
-    let security = if let Some(profile) = identity.as_ref().filter(|p| p.secret_key_hex.is_some()) {
-        profile.to_security_mode().map_err(OpsError::from)?
-    } else if let Ok(key_path) = std::env::var("HELIOS_INSPECTOR_CLIENT_KEY")
-        && !key_path.trim().is_empty()
-    {
-        let client_identity = ClientIdentity::from_seed_file(std::path::Path::new(&key_path))
-            .map_err(|err| {
-                OpsError::Auth(helios_ops::AuthError::InvalidIdentity {
-                    name: key_path,
-                    detail: err.to_string(),
-                })
-            })?;
-        helios_ops::SecurityMode::Authenticated {
-            identity: Box::new(client_identity),
-            expected_machine_public_key: None,
-        }
-    } else {
-        helios_ops::SecurityMode::Plain
-    };
+    let identity_arg = flags.identity.as_deref().or(target_identity);
+    let (identity, security) = SessionOptions::resolve_security(identity_arg, allow_ambient_auth)?;
     Ok(SessionOptions {
         attenuation: Attenuation {
             scope: flags.scope.clone(),
@@ -409,17 +399,28 @@ pub(crate) fn build_session_options(flags: &GlobalOpsFlags) -> Result<SessionOpt
     })
 }
 
+fn allows_ambient_auth(target: &Target) -> bool {
+    !matches!(
+        target.parsed_uri(),
+        Ok(TargetUri::Helios { tls: false, .. })
+    )
+}
+
 /// Resolve a connected [`Session`] (and optional [`Fleet`]) from global CLI flags or `--device`.
 pub(crate) async fn connect_from_flags(
     flags: &GlobalOpsFlags,
     legacy_device: Option<&str>,
     legacy_baud: u32,
 ) -> Result<(Session, Option<Fleet>), OpsCliError> {
-    let options = build_session_options(flags)?;
     if !flags.labels.is_empty() {
         let store = TargetStore::load_default()?;
         let targets = store.select_by_labels(&flags.labels)?;
         let primary = targets[0].clone();
+        let options = build_session_options_for_target(
+            flags,
+            primary.identity.as_deref(),
+            allows_ambient_auth(&primary),
+        )?;
         let fleet = Fleet::new(targets, flags.concurrency, options.clone());
         let session = Session::connect(&primary, options).await?;
         return Ok((session, Some(fleet)));
@@ -427,11 +428,17 @@ pub(crate) async fn connect_from_flags(
     if let Some(dev) = legacy_device {
         let uri = format!("serial://{dev}?baud={legacy_baud}");
         let target = Target::from_uri(uri)?;
+        let options = build_session_options_for_target(flags, None, true)?;
         let session = Session::connect(&target, options).await?;
         return Ok((session, None));
     }
     let store = TargetStore::load_default()?;
     let target = store.resolve(flags.target.as_deref())?;
+    let options = build_session_options_for_target(
+        flags,
+        target.identity.as_deref(),
+        allows_ambient_auth(&target),
+    )?;
     let session = Session::connect(&target, options).await?;
     Ok((session, None))
 }
@@ -548,11 +555,26 @@ pub(crate) async fn run_login(cmd: &LoginCommand) -> Result<(), OpsCliError> {
         .or_else(|| std::env::var("USER").ok())
         .unwrap_or_else(|| "operator".to_owned());
 
-    let cert = if let Some(authority) = &cmd.authority {
+    let seed = random_32().map_err(|err| {
+        OpsError::Auth(helios_ops::AuthError::InvalidIdentity {
+            name: cmd.name.clone(),
+            detail: err.to_string(),
+        })
+    })?;
+    let client_identity = ClientIdentity::from_static_seed(seed);
+    let public_key_hex = encode_hex(&client_identity.public_key());
+    let secret_key_hex = encode_hex(&seed);
+
+    let mut cert: Option<CapabilityCert> = None;
+    let mut capability_cert_postcard_hex: Option<String> = None;
+    let mut expected_machine_public_key_hex: Option<String> = None;
+
+    if let Some(authority) = &cmd.authority {
         let endpoint = format!("{}/v1/issue", authority.trim_end_matches('/'));
         let req_body = serde_json::json!({
             "principal": principal,
             "profile": cmd.name,
+            "public_key_hex": public_key_hex,
         });
         let mut headers = Vec::new();
         let auth_header;
@@ -568,29 +590,110 @@ pub(crate) async fn run_login(cmd: &LoginCommand) -> Result<(), OpsCliError> {
         )
         .await
         .map_err(OpsError::from)?;
-        let cert: CapabilityCert = serde_json::from_slice(&bytes)?;
-        Some(cert)
-    } else {
-        None
-    };
+        let parsed = parse_issued_credentials(&bytes, &cmd.name)?;
+        cert = parsed.cert;
+        capability_cert_postcard_hex = parsed.capability_cert_postcard_hex;
+        expected_machine_public_key_hex = parsed.expected_machine_public_key_hex;
+    }
 
     let profile = IdentityProfile {
         name: cmd.name.clone(),
         principal: principal.clone(),
         authority_url: cmd.authority.clone(),
         cert,
-        secret_key_hex: None,
-        capability_cert_postcard_hex: None,
-        expected_machine_public_key_hex: None,
+        secret_key_hex: Some(secret_key_hex),
+        capability_cert_postcard_hex,
+        expected_machine_public_key_hex,
     };
     let saved_path = profile.save().map_err(OpsError::from)?;
     println!(
-        "saved identity `{}` (principal `{}`) to {}",
+        "saved identity `{}` (principal `{}`, public key `{}`) to {}",
         profile.name,
         principal,
+        public_key_hex,
         saved_path.display()
     );
     Ok(())
+}
+
+struct IssuedCredentials {
+    cert: Option<CapabilityCert>,
+    capability_cert_postcard_hex: Option<String>,
+    expected_machine_public_key_hex: Option<String>,
+}
+
+fn parse_issued_credentials(
+    bytes: &[u8],
+    profile_name: &str,
+) -> Result<IssuedCredentials, OpsCliError> {
+    let raw: serde_json::Value = serde_json::from_slice(bytes)?;
+    if let Some(obj) = raw.as_object()
+        && (obj.contains_key("capability_cert_postcard_hex")
+            || obj.contains_key("capability_cert")
+            || obj.contains_key("cert")
+            || obj.contains_key("expected_machine_public_key_hex"))
+    {
+        let cert = obj
+            .get("cert")
+            .map(|v| serde_json::from_value::<CapabilityCert>(v.clone()))
+            .transpose()?;
+        let capability_cert_postcard_hex = if let Some(hex_val) = obj
+            .get("capability_cert_postcard_hex")
+            .and_then(|v| v.as_str())
+        {
+            Some(hex_val.to_owned())
+        } else if let Some(proto_val) = obj.get("capability_cert") {
+            let proto: ProtocolCapabilityCert = serde_json::from_value(proto_val.clone())?;
+            Some(encode_protocol_cert(&proto, profile_name)?)
+        } else {
+            None
+        };
+        let expected_machine_public_key_hex = obj
+            .get("expected_machine_public_key_hex")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned);
+        return Ok(IssuedCredentials {
+            cert,
+            capability_cert_postcard_hex,
+            expected_machine_public_key_hex,
+        });
+    }
+
+    if let Ok(proto) = serde_json::from_value::<ProtocolCapabilityCert>(raw.clone()) {
+        return Ok(IssuedCredentials {
+            cert: None,
+            capability_cert_postcard_hex: Some(encode_protocol_cert(&proto, profile_name)?),
+            expected_machine_public_key_hex: None,
+        });
+    }
+
+    let cert: CapabilityCert = serde_json::from_value(raw)?;
+    Ok(IssuedCredentials {
+        cert: Some(cert),
+        capability_cert_postcard_hex: None,
+        expected_machine_public_key_hex: None,
+    })
+}
+
+fn encode_protocol_cert(
+    cert: &ProtocolCapabilityCert,
+    profile_name: &str,
+) -> Result<String, OpsCliError> {
+    let encoded = cert.encode_postcard().map_err(|err| {
+        OpsError::Auth(helios_ops::AuthError::InvalidIdentity {
+            name: profile_name.to_owned(),
+            detail: format!("failed to encode issued capability certificate: {err}"),
+        })
+    })?;
+    Ok(encode_hex(&encoded))
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 /// Run `helios whoami`.
@@ -612,7 +715,7 @@ pub(crate) fn run_whoami(flags: &GlobalOpsFlags) -> Result<(), OpsCliError> {
         .map(|r| r.as_str())
         .collect();
     match flags.output {
-        CliOutputFormat::Json | CliOutputFormat::Jsonl => {
+        CliOutputFormat::Json | CliOutputFormat::Jsonl | CliOutputFormat::Nuon => {
             let doc = serde_json::json!({
                 "principal": principal,
                 "target": target,
@@ -621,7 +724,7 @@ pub(crate) fn run_whoami(flags: &GlobalOpsFlags) -> Result<(), OpsCliError> {
             });
             println!("{}", serde_json::to_string_pretty(&doc)?);
         }
-        CliOutputFormat::Table | CliOutputFormat::Nuon => {
+        CliOutputFormat::Table => {
             println!("principal : {principal}");
             println!(
                 "target    : {}",
@@ -668,7 +771,7 @@ pub(crate) fn run_target_command(
         TargetCommand::Ls => {
             let default_name = store.default_target_name().map(ToOwned::to_owned);
             match output {
-                CliOutputFormat::Json => {
+                CliOutputFormat::Json | CliOutputFormat::Nuon => {
                     println!("{}", serde_json::to_string_pretty(store.list())?);
                 }
                 CliOutputFormat::Jsonl => {
@@ -676,7 +779,7 @@ pub(crate) fn run_target_command(
                         println!("{}", serde_json::to_string(t)?);
                     }
                 }
-                CliOutputFormat::Table | CliOutputFormat::Nuon => {
+                CliOutputFormat::Table => {
                     if store.list().is_empty() {
                         println!("no targets configured ({})", store.path().display());
                     } else {
@@ -760,7 +863,7 @@ fn render_inspect_entries(
     output: CliOutputFormat,
 ) -> Result<(), OpsCliError> {
     match output {
-        CliOutputFormat::Json => {
+        CliOutputFormat::Json | CliOutputFormat::Nuon => {
             let rows: Vec<serde_json::Value> = entries
                 .iter()
                 .map(|e| {
@@ -781,7 +884,7 @@ fn render_inspect_entries(
                 println!("{}", serde_json::to_string(&row)?);
             }
         }
-        CliOutputFormat::Table | CliOutputFormat::Nuon => {
+        CliOutputFormat::Table => {
             for e in entries {
                 println!("{:<56} {}", e.path, render_inspect_value(&e.value));
             }
@@ -798,7 +901,7 @@ pub(crate) async fn run_ps(
 ) -> Result<(), OpsCliError> {
     let instances = session.ps().await?;
     match output {
-        CliOutputFormat::Json => {
+        CliOutputFormat::Json | CliOutputFormat::Nuon => {
             let rows: Vec<serde_json::Value> = instances
                 .iter()
                 .map(|inst| {
@@ -825,7 +928,7 @@ pub(crate) async fn run_ps(
                 println!("{}", serde_json::to_string(&row)?);
             }
         }
-        CliOutputFormat::Table | CliOutputFormat::Nuon => {
+        CliOutputFormat::Table => {
             if cmd.tree {
                 println!("/ (helios)");
                 for (idx, inst) in instances.iter().enumerate() {
@@ -922,7 +1025,7 @@ pub(crate) async fn run_trace(
                 continue;
             }
             match output {
-                CliOutputFormat::Json | CliOutputFormat::Jsonl => {
+                CliOutputFormat::Json | CliOutputFormat::Jsonl | CliOutputFormat::Nuon => {
                     let row = serde_json::json!({
                         "timestamp": ev.timestamp,
                         "level": format!("{:?}", ev.level),
@@ -931,7 +1034,7 @@ pub(crate) async fn run_trace(
                     });
                     println!("{}", serde_json::to_string(&row)?);
                 }
-                CliOutputFormat::Table | CliOutputFormat::Nuon => {
+                CliOutputFormat::Table => {
                     let rendered = crate::system::render_tracing_event(&ev)
                         .unwrap_or_else(|_| format!("{:?} {}", ev.level, ev.target));
                     println!("{rendered}");
@@ -961,14 +1064,17 @@ pub(crate) async fn run_profile(
                 session.profile_set_instruction_sampling(true).await?;
                 tokio::time::sleep(Duration::from_millis(*duration_ms)).await;
             }
-            let profile = session.profile_instruction_samples().await?;
+            let profile_res = session.profile_instruction_samples().await;
             if *duration_ms > 0 {
                 let _ = session.profile_set_instruction_sampling(false).await;
             }
+            let profile = profile_res?;
+            let sample_count: u64 = profile.samples.iter().map(|s| s.count).sum();
             let doc = serde_json::json!({
                 "period_nanos": profile.period_nanos,
                 "kernel_image_base": format!("{:#x}", profile.kernel_image_base),
-                "sample_count": profile.samples.len(),
+                "sample_count": sample_count,
+                "unique_pcs": profile.samples.len(),
             });
             println!("{}", serde_json::to_string_pretty(&doc)?);
         }
@@ -982,7 +1088,7 @@ pub(crate) async fn run_profile(
             };
             let samples = session.profile_folded(&filter, *limit).await?;
             match output {
-                CliOutputFormat::Json => {
+                CliOutputFormat::Json | CliOutputFormat::Nuon => {
                     let rows: Vec<serde_json::Value> = samples
                         .iter()
                         .map(|s| {
@@ -995,7 +1101,17 @@ pub(crate) async fn run_profile(
                         .collect();
                     println!("{}", serde_json::to_string_pretty(&rows)?);
                 }
-                CliOutputFormat::Jsonl | CliOutputFormat::Table | CliOutputFormat::Nuon => {
+                CliOutputFormat::Jsonl => {
+                    for s in samples {
+                        let row = serde_json::json!({
+                            "scope": format!("{:?}", s.scope),
+                            "stack": s.stack,
+                            "weight": s.weight,
+                        });
+                        println!("{}", serde_json::to_string(&row)?);
+                    }
+                }
+                CliOutputFormat::Table => {
                     for s in samples {
                         println!("{} {}", s.stack, s.weight);
                     }
@@ -1008,7 +1124,7 @@ pub(crate) async fn run_profile(
             };
             let metrics = session.profile_metrics(&filter, *limit).await?;
             match output {
-                CliOutputFormat::Json => {
+                CliOutputFormat::Json | CliOutputFormat::Nuon => {
                     let rows: Vec<serde_json::Value> = metrics
                         .iter()
                         .map(|m| {
@@ -1025,7 +1141,21 @@ pub(crate) async fn run_profile(
                         .collect();
                     println!("{}", serde_json::to_string_pretty(&rows)?);
                 }
-                CliOutputFormat::Jsonl | CliOutputFormat::Table | CliOutputFormat::Nuon => {
+                CliOutputFormat::Jsonl => {
+                    for m in metrics {
+                        let row = serde_json::json!({
+                            "scope": format!("{:?}", m.scope),
+                            "name": m.name,
+                            "count": m.count,
+                            "total_events": m.total_events,
+                            "total_nanos": m.total_nanos,
+                            "min_nanos": m.min_nanos,
+                            "max_nanos": m.max_nanos,
+                        });
+                        println!("{}", serde_json::to_string(&row)?);
+                    }
+                }
+                CliOutputFormat::Table => {
                     for m in metrics {
                         println!(
                             "{:<40} count={:<8} total_ns={:<12} min_ns={:<10} max_ns={}",
@@ -1137,18 +1267,43 @@ pub(crate) async fn run_bridge(session: &Session, cmd: &BridgeCommand) -> Result
                 };
                 let s = prom_session.clone();
                 tokio::spawn(async move {
-                    let mut req_buf = [0_u8; 1024];
-                    let _ = stream.read(&mut req_buf).await;
-                    let body = match s.inspect(&["/kernel/"], 0).await {
-                        Ok(snap) => render_prometheus(&snap.entries),
-                        Err(err) => format!("# error fetching inspect metrics: {err}\n"),
+                    let mut req_buf = [0_u8; 2048];
+                    let n = stream.read(&mut req_buf).await.unwrap_or(0);
+                    let request_line = std::str::from_utf8(&req_buf[..n])
+                        .ok()
+                        .and_then(|s| s.lines().next())
+                        .unwrap_or("");
+                    let (method, raw_path) = parse_http_request_line(request_line);
+                    let (status_line, content_type, body) = match (method, raw_path) {
+                        ("GET", "/metrics" | "/") => match s.inspect(&["/kernel/"], 0).await {
+                            Ok(snap) => (
+                                "HTTP/1.1 200 OK",
+                                "text/plain; version=0.0.4; charset=utf-8",
+                                render_prometheus(&snap.entries),
+                            ),
+                            Err(err) => (
+                                "HTTP/1.1 503 Service Unavailable",
+                                "text/plain; charset=utf-8",
+                                format!("inspect query failed: {err}\n"),
+                            ),
+                        },
+                        ("GET", _) => (
+                            "HTTP/1.1 404 Not Found",
+                            "text/plain; charset=utf-8",
+                            "not found; try /metrics\n".to_owned(),
+                        ),
+                        _ => (
+                            "HTTP/1.1 405 Method Not Allowed",
+                            "text/plain; charset=utf-8",
+                            "method not allowed\n".to_owned(),
+                        ),
                     };
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
+                    let header = format!(
+                        "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
                     );
-                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(body.as_bytes()).await;
                     let _ = stream.shutdown().await;
                 });
             }
@@ -1192,25 +1347,73 @@ pub(crate) async fn run_bridge(session: &Session, cmd: &BridgeCommand) -> Result
     Ok(())
 }
 
+fn parse_http_request_line(line: &str) -> (&str, &str) {
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let raw_target = parts.next().unwrap_or("");
+    let path = raw_target.split('?').next().unwrap_or(raw_target);
+    (method, path)
+}
+
+fn sanitize_prometheus_metric_name(path: &str) -> Option<String> {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut name = String::with_capacity("helios_".len() + trimmed.len());
+    name.push_str("helios_");
+    for ch in trimmed.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' {
+            name.push(ch);
+        } else {
+            name.push('_');
+        }
+    }
+    Some(name)
+}
+
+fn write_prometheus_escaped_label(out: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+}
+
 fn render_prometheus(entries: &[proto_inspect::Entry]) -> String {
     let mut out = String::new();
     for entry in entries {
-        let numeric = match entry.value {
-            proto_inspect::Value::Unsigned64(v) => Some(v.to_string()),
-            proto_inspect::Value::Signed64(v) => Some(v.to_string()),
-            proto_inspect::Value::Float64(v) => Some(v.to_string()),
-            proto_inspect::Value::Boolean(b) => Some(if b { "1" } else { "0" }.to_owned()),
-            _ => None,
+        let Some(metric_name) = sanitize_prometheus_metric_name(&entry.path) else {
+            continue;
         };
-        if let Some(num) = numeric {
-            let metric_name: String = entry
-                .path
-                .trim_start_matches('/')
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect();
-            out.push_str(&format!("helios_{metric_name} {num}\n"));
+        let mut rendered_value = String::new();
+        match entry.value {
+            proto_inspect::Value::Unsigned64(v) => {
+                let _ = write!(&mut rendered_value, "{v}");
+            }
+            proto_inspect::Value::Signed64(v) => {
+                let _ = write!(&mut rendered_value, "{v}");
+            }
+            proto_inspect::Value::Float64(v) => {
+                if v.is_nan() {
+                    rendered_value.push_str("NaN");
+                } else if v.is_infinite() {
+                    rendered_value.push_str(if v.is_sign_positive() { "+Inf" } else { "-Inf" });
+                } else {
+                    let _ = write!(&mut rendered_value, "{v}");
+                }
+            }
+            proto_inspect::Value::Boolean(b) => {
+                rendered_value.push(if b { '1' } else { '0' });
+            }
+            _ => continue,
         }
+        let _ = write!(&mut out, "{metric_name}{{path=\"");
+        write_prometheus_escaped_label(&mut out, &entry.path);
+        let _ = writeln!(&mut out, "\"}} {rendered_value}");
     }
     out
 }
@@ -1279,5 +1482,115 @@ fn inspect_value_json(value: &proto_inspect::Value) -> serde_json::Value {
         proto_inspect::Value::Float64(v) => serde_json::json!(v),
         proto_inspect::Value::Text(v) => serde_json::Value::String(v.clone()),
         proto_inspect::Value::Blob(v) => serde_json::json!(v),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ed25519_dalek::SigningKey;
+    use helios_inspector_protocol::auth::{
+        AUTH_PROTOCOL_VERSION, CapabilityCert as ProtoCert, CapabilityCertPayload, SessionGrants,
+        TransportMask,
+    };
+
+    use super::*;
+
+    #[test]
+    fn parse_issued_credentials_handles_protocol_and_legacy_cert_formats() {
+        let ca_key = SigningKey::from_bytes(&[0x12_u8; 32]);
+        let client_pub = ClientIdentity::from_static_seed([0x34_u8; 32]).public_key();
+        let proto_cert = ProtoCert::issue(
+            &ca_key,
+            CapabilityCertPayload {
+                version: AUTH_PROTOCOL_VERSION,
+                principal: "alice".to_owned(),
+                subject_public_key: client_pub,
+                node_public_key: None,
+                not_before_unix: 0,
+                expires_at_unix: u64::MAX,
+                grants: SessionGrants::full_worker_ceiling(),
+                allowed_transports: TransportMask::ALL,
+            },
+        )
+        .expect("issue");
+        let proto_json = serde_json::to_vec(&proto_cert).expect("serialize");
+        let parsed = parse_issued_credentials(&proto_json, "op").expect("parse proto cert");
+        assert!(parsed.cert.is_none());
+        let decoded_bytes = decode_hex_for_test(
+            parsed
+                .capability_cert_postcard_hex
+                .as_deref()
+                .expect("postcard hex present"),
+        );
+        assert_eq!(
+            ProtoCert::decode_postcard(&decoded_bytes).expect("decode postcard"),
+            proto_cert
+        );
+
+        let legacy = CapabilityCert {
+            principal: "bob".to_owned(),
+            issuer: "ca".to_owned(),
+            public_key_hex: "00".repeat(32),
+            scope: "/".to_owned(),
+            rights: vec![GrantRight::Inspect],
+            expires_at_unix: 9999,
+            signature_hex: "11".repeat(64),
+        };
+        let legacy_json = serde_json::to_vec(&legacy).expect("serialize legacy");
+        let parsed_legacy = parse_issued_credentials(&legacy_json, "op").expect("parse legacy");
+        assert_eq!(parsed_legacy.cert, Some(legacy));
+    }
+
+    #[test]
+    fn render_prometheus_sanitizes_metric_names_escapes_labels_and_formats_floats() {
+        let entries = vec![
+            proto_inspect::Entry {
+                path: "/kernel/processors/online".to_owned(),
+                value: proto_inspect::Value::Unsigned64(4),
+            },
+            proto_inspect::Entry {
+                path: "/core/http-client/bad\"path\\line\n1".to_owned(),
+                value: proto_inspect::Value::Float64(f64::NAN),
+            },
+            proto_inspect::Entry {
+                path: "/core/inf".to_owned(),
+                value: proto_inspect::Value::Float64(f64::INFINITY),
+            },
+            proto_inspect::Entry {
+                path: "/core/text".to_owned(),
+                value: proto_inspect::Value::Text("ignored".to_owned()),
+            },
+        ];
+        let rendered = render_prometheus(&entries);
+        assert!(
+            rendered.contains(
+                "helios_kernel_processors_online{path=\"/kernel/processors/online\"} 4\n"
+            )
+        );
+        assert!(rendered.contains(
+            "helios_core_http_client_bad_path_line_1{path=\"/core/http-client/bad\\\"path\\\\line\\n1\"} NaN\n"
+        ));
+        assert!(rendered.contains("helios_core_inf{path=\"/core/inf\"} +Inf\n"));
+        assert!(!rendered.contains("ignored"));
+    }
+
+    #[test]
+    fn parse_http_request_line_strips_query_and_extracts_method_and_path() {
+        assert_eq!(
+            parse_http_request_line("GET /metrics?format=prom HTTP/1.1"),
+            ("GET", "/metrics")
+        );
+        assert_eq!(parse_http_request_line("POST / HTTP/1.1"), ("POST", "/"));
+    }
+
+    fn decode_hex_for_test(raw: &str) -> Vec<u8> {
+        raw.as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                u8::from_str_radix(std::str::from_utf8(pair).expect("utf8"), 16).expect("hex")
+            })
+            .collect()
     }
 }

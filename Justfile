@@ -57,6 +57,7 @@ fmt-check:
 # Refuse the dependencies deny.toml bans (anyhow, per AGENTS.md §3.2).
 deny-check:
     cargo deny --workspace check bans
+    cargo deny --manifest-path ops-py/Cargo.toml --config deny.toml check bans
 
 # Reformat this workspace's own crates.
 fmt:
@@ -99,6 +100,7 @@ clippy-host:
         --exclude helios-sched-tasks --exclude helios-stack-test --exclude helios-surface-test \
         --exclude helios-sysctl --exclude helios-vmm-program --exclude helios-webgpu-provider \
         -- -D warnings
+    cargo clippy --manifest-path ops-py/Cargo.toml --all-targets -- -D warnings
 
 # Clippy each guest program on its own, denying warnings.
 clippy-programs:
@@ -226,12 +228,17 @@ test-host-tools:
         exit 1
     fi
     HELIOS_COMPILER_PLUGIN_WASM="$plugin" cargo nextest run {{ host_tool_packages }}
+    cargo nextest run --manifest-path ops-py/Cargo.toml --no-tests=pass
+    if python3 -m pytest --version >/dev/null 2>&1; then
+        python3 -m pytest ops-py/tests
+    fi
 
 # Compile every test binary `test-host-tools` runs and run none of them; CI
 # runs it while the compiler plugin is still building, which only the
 # compiler-host test reads, when it runs.
 warm-test-host-tools:
     cargo nextest run --no-run {{ host_tool_packages }}
+    cargo nextest run --manifest-path ops-py/Cargo.toml --no-run --no-tests=pass
 
 # Mount the images `mkfs.btrfs --rootdir` builds, one per checksum type and
 # node size. Needs btrfs-progs on PATH; CI's test-libraries lane installs it.
@@ -355,6 +362,7 @@ check-host:
     cargo check -p helios-nu
     cargo check -p helios-wit-rpc
     cargo check -p helios-compositor-render -p helios-desktop-text-check
+    cargo check --manifest-path ops-py/Cargo.toml --all-targets
 
 # Run hosted embedded-debugger smoke test.
 test-embedded-debugger:

@@ -211,7 +211,7 @@ impl VmNetworkBackend {
     const fn interface_name(self) -> InterfaceNameUse {
         match self {
             Self::Tap => InterfaceNameUse::Required(
-                "the multi-queue tap device created by `helios-inspector vm net-setup`",
+                "the multi-queue tap device created by `helios vm net-setup`",
             ),
             Self::VmnetBridged => {
                 InterfaceNameUse::Required("the host interface vmnet bridges onto, such as `en0`")
@@ -481,13 +481,13 @@ pub(crate) enum VmNetworkError {
 
     #[error(
         "tap interface `{ifname}` does not exist; create it with \
-         `helios-inspector vm net-setup --net-backend tap --net-ifname {ifname}`"
+         `helios vm net-setup --net-backend tap --net-ifname {ifname}`"
     )]
     TapInterfaceMissing { ifname: String },
 
     #[error(
         "the `tap` backend drives its queues through {VHOST_NET_DEVICE}, which this account \
-         cannot open: {source}; provision it with `helios-inspector vm net-setup --net-backend tap`"
+         cannot open: {source}; provision it with `helios vm net-setup --net-backend tap`"
     )]
     VhostNetUnusable {
         #[source]
