@@ -22,7 +22,12 @@ use pci_types::PciAddress;
 use crate::iommu::X86DmaPool;
 use crate::pci::{PciRoot, VirtioFunctions};
 
-type X86VirtioBalloonDevice = VirtioBalloonDevice<VirtioPciTransport<X86DmaPool>>;
+pub(crate) type X86VirtioBalloonDevice = VirtioBalloonDevice<VirtioPciTransport<X86DmaPool>>;
+
+pub(crate) struct InstalledBalloon {
+    pub(crate) handle: BalloonHandle,
+    pub(crate) device: Arc<X86VirtioBalloonDevice>,
+}
 
 /// How often the function's interrupt status is read.
 ///
@@ -47,7 +52,7 @@ pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     address: PciAddress,
     dma: X86DmaPool,
     generation: helios_kernel::MachineGenerationHandle,
-) -> BalloonHandle
+) -> InstalledBalloon
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
     MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
@@ -60,12 +65,12 @@ where
     let handle = helios_kernel::install_memory_balloon(kernel, device.clone(), generation);
     // Local, like the balloon tasks it wakes: `install_memory_balloon`
     // keeps those on the processor that brought the device up.
-    kernel.spawn_local_detached(poll_interrupt_status(device, kernel.timer()));
+    kernel.spawn_local_detached(poll_interrupt_status(device.clone(), kernel.timer()));
     tracing::info!(
         "virtio balloon online transport=pci function={address} interrupt=polled \
          every {INTERRUPT_POLL_INTERVAL:?}"
     );
-    handle
+    InstalledBalloon { handle, device }
 }
 
 /// Stands in for the interrupt the function cannot deliver.

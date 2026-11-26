@@ -18,12 +18,18 @@ use crate::iommu::{self, Aarch64DmaArenas, Aarch64VirtioTransport, Confinement};
 use crate::pci::{PciRoot, VirtioFunctions};
 use crate::platform::PlatformDescription;
 
-type Aarch64VirtioBalloonDevice = VirtioBalloonDevice<Aarch64VirtioTransport>;
+pub(crate) type Aarch64VirtioBalloonDevice = VirtioBalloonDevice<Aarch64VirtioTransport>;
 
 /// The interrupt half of the balloon: what the GIC dispatches to.
 #[derive(Clone)]
 pub(crate) struct VirtioBalloonInterrupt {
     device: Arc<Aarch64VirtioBalloonDevice>,
+}
+
+impl VirtioBalloonInterrupt {
+    pub(crate) fn device(&self) -> &Arc<Aarch64VirtioBalloonDevice> {
+        &self.device
+    }
 }
 
 impl ExternalInterruptHandler for VirtioBalloonInterrupt {

@@ -18,12 +18,18 @@ use crate::iommu::{self, Aarch64DmaArenas, Aarch64VirtioTransport, Confinement};
 use crate::pci::{PciRoot, VirtioFunctions};
 use crate::platform::PlatformDescription;
 
-type Aarch64VirtioSndDevice = VirtioSndDevice<Aarch64VirtioTransport>;
+pub(crate) type Aarch64VirtioSndDevice = VirtioSndDevice<Aarch64VirtioTransport>;
 
 /// The interrupt route's view of the machine's sound device.
 #[derive(Clone)]
 pub(crate) struct VirtioSoundDevice {
     device: Arc<Aarch64VirtioSndDevice>,
+}
+
+impl VirtioSoundDevice {
+    pub(crate) fn device(&self) -> &Arc<Aarch64VirtioSndDevice> {
+        &self.device
+    }
 }
 
 /// The sound device the bootstrap processor brought up, together with

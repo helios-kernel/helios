@@ -17,7 +17,7 @@ use pci_types::PciAddress;
 use crate::iommu::X86DmaPool;
 use crate::pci::{PciRoot, VirtioFunctions};
 
-type X86VirtioVsockDevice = VirtioVsockDevice<VirtioPciTransport<X86DmaPool>>;
+pub(crate) type X86VirtioVsockDevice = VirtioVsockDevice<VirtioPciTransport<X86DmaPool>>;
 
 /// The interrupt route's view of the platform's vsock function.
 ///
@@ -27,6 +27,12 @@ type X86VirtioVsockDevice = VirtioVsockDevice<VirtioPciTransport<X86DmaPool>>;
 #[derive(Clone)]
 pub(crate) struct VirtioVsockFunction {
     device: Arc<X86VirtioVsockDevice>,
+}
+
+impl VirtioVsockFunction {
+    pub(crate) fn device(&self) -> &Arc<X86VirtioVsockDevice> {
+        &self.device
+    }
 }
 
 impl ExternalInterruptHandler for VirtioVsockFunction {

@@ -22,6 +22,7 @@ helios-firmware = { workspace = true, features = ["devicetree"] }
 helios-hal.workspace = true
 i6300esb.workspace = true
 helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-bare-metal"] }
+helios-tpm.workspace = true
 helios-virtio = { path = "../virtio" }
 tracing.workspace = true
 

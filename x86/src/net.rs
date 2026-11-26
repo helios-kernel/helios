@@ -34,7 +34,7 @@ use crate::debug_state::RuntimeState;
 use crate::iommu::X86DmaPool;
 use crate::pci::{MsixMessage, MsixTable, PciRoot, VirtioFunctions};
 
-type X86VirtioNetDevice = VirtioNetDevice<VirtioPciTransport<X86DmaPool>>;
+pub(crate) type X86VirtioNetDevice = VirtioNetDevice<VirtioPciTransport<X86DmaPool>>;
 
 #[derive(Clone)]
 pub(crate) struct VirtioNetworkDevice {
@@ -48,6 +48,12 @@ pub(crate) struct VirtioNetworkDevice {
     role: InterruptRole,
     /// Where each queue pair's message is delivered, for steering.
     messages: PairMessages,
+}
+
+impl VirtioNetworkDevice {
+    pub(crate) fn device(&self) -> &Arc<X86VirtioNetDevice> {
+        &self.inner
+    }
 }
 
 /// The MSI-X entries the queue pairs raise, and how to point one at a

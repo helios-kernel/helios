@@ -19,10 +19,18 @@ use crate::iommu::{self, Confinement, RiscvDmaArenas, RiscvVirtioTransport};
 use crate::net::PlicInterrupt;
 use crate::pci::{PciHostController, VirtioFunctions};
 
+pub(crate) type RiscvVirtioVsockDevice = RawVirtioVsockDevice<RiscvVirtioTransport>;
+
 /// The interrupt route's view of the platform's vsock device.
 #[derive(Clone)]
 pub(crate) struct VirtioVsockDevice {
-    inner: Arc<RawVirtioVsockDevice<RiscvVirtioTransport>>,
+    inner: Arc<RiscvVirtioVsockDevice>,
+}
+
+impl VirtioVsockDevice {
+    pub(crate) fn device(&self) -> &Arc<RiscvVirtioVsockDevice> {
+        &self.inner
+    }
 }
 
 /// The vsock device the bootstrap hart brought up, together with the
@@ -45,8 +53,8 @@ pub(crate) fn has_vsock_device(fdt: &Fdt<'_>, pci_virtio: Option<&VirtioFunction
 
 /// Brings up the vsock device and publishes it as the machine's host link.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn install<WatchdogImpl>(
-    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl>,
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
+    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl, MeasuredBootImpl>,
     cpu: &crate::RiscvCpu,
     fdt: &Fdt<'_>,
     pci: Option<&PciHostController>,
@@ -57,6 +65,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> Option<VsockInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let (device, line) = discover_vsock_device(cpu, fdt, pci, pci_virtio, arenas, confinement)?;
     let service = helios_kernel::install_vsock_device(kernel, cpu, device.inner.clone());

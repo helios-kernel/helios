@@ -20,11 +20,17 @@ use crate::iommu::{self, Aarch64DmaArenas, Aarch64VirtioTransport, Confinement};
 use crate::pci::{PciRoot, VirtioFunctions};
 use crate::platform::PlatformDescription;
 
-type Aarch64VirtioRngDevice = VirtioRngDevice<Aarch64VirtioTransport>;
+pub(crate) type Aarch64VirtioRngDevice = VirtioRngDevice<Aarch64VirtioTransport>;
 
 #[derive(Clone)]
 pub(crate) struct VirtioEntropyDevice {
     device: Arc<Aarch64VirtioRngDevice>,
+}
+
+impl VirtioEntropyDevice {
+    pub(crate) fn device(&self) -> &Arc<Aarch64VirtioRngDevice> {
+        &self.device
+    }
 }
 
 /// The entropy device the bootstrap processor brought up, together with

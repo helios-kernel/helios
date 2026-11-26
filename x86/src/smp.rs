@@ -12,7 +12,7 @@ use core::arch::global_asm;
 use core::ops::Range;
 use core::ptr::NonNull;
 use core::sync::atomic::{
-    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicUsize, Ordering, compiler_fence,
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, compiler_fence,
 };
 use helios_artifact::ProbeAnswers;
 use helios_hal::DeviceInventory;
@@ -356,7 +356,11 @@ pub(crate) struct X86PlatformState {
     /// The bootstrap processor's kernel isolation, which every other
     /// processor matches (`isolation`). Immutable.
     user_isolation: UserIsolation,
-    tsc_base: u64,
+    /// TSC reading anchored at boot (or re-anchored at hibernate resume).
+    tsc_base: AtomicU64,
+    /// Monotonic tick offset added to `read_tsc().saturating_sub(tsc_base)` so
+    /// [`Cpu::now`] continues strictly forward across hibernate/resume.
+    timebase_offset: AtomicU64,
     timebase: Timebase,
     physical_memory_offset: usize,
     debug_state: debug_state::RuntimeState,
@@ -565,7 +569,8 @@ pub(crate) fn build_boot_context(
     publish_anchor_identities(&processors);
     let platform = Arc::new(X86PlatformState {
         user_isolation,
-        tsc_base: handler.tsc_base,
+        tsc_base: AtomicU64::new(handler.tsc_base),
+        timebase_offset: AtomicU64::new(0),
         timebase: handler.timebase,
         physical_memory_offset: handler.physical_memory_offset,
         debug_state,
@@ -1153,7 +1158,20 @@ impl BootContext {
 
 impl X86PlatformState {
     pub(crate) fn tsc_base(&self) -> u64 {
-        self.tsc_base
+        self.tsc_base.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn timebase_offset(&self) -> u64 {
+        self.timebase_offset.load(Ordering::Acquire)
+    }
+
+    /// Re-anchors the TSC origin and advances the monotonic tick offset on
+    /// resume so [`Cpu::now`] continues strictly above `floor_ticks` without
+    /// stalling when the new boot's TSC starts below the pre-hibernate base.
+    pub(crate) fn continue_timebase(&self, raw_tsc: u64, floor_ticks: u64) {
+        self.tsc_base.store(raw_tsc, Ordering::Relaxed);
+        self.timebase_offset
+            .store(floor_ticks.saturating_add(1), Ordering::Release);
     }
 
     /// The kernel isolation every processor of the machine runs with.
@@ -1275,6 +1293,39 @@ impl X86PlatformState {
         let runtime = &self.processor_slot(processor).runtime;
         !runtime.started.load(Ordering::Acquire)
             || runtime.stop_state.load(Ordering::Acquire) == STOP_STOPPED
+    }
+
+    /// The higher-half direct-map offset established by the bootloader.
+    pub(crate) fn physical_memory_offset(&self) -> usize {
+        self.processor_slot(self.bootstrap_processor())
+            .runtime
+            .physical_memory_offset
+    }
+
+    /// Restores bootstrap-processor architectural state that does not survive
+    /// power-off and the restore trampoline transition: XCR0, SMEP/SMAP, PAT,
+    /// MTRRs, local APIC, GDT/TSS/IDT, and COM1 I/O APIC redirection.
+    ///
+    /// Leaves `CR8` raised to [`crate::exceptions::WAKE_ONLY_TASK_PRIORITY`]
+    /// and re-enables `IF` so `FrozenMachine`'s wake-only interrupt mask holds
+    /// until thaw.
+    pub(crate) fn restore_bsp_post_resume_state(&self) {
+        // SAFETY: `boot_context_ptr` points to the immutable leaked `'static`
+        // `BootContext` created at boot.
+        let boot = unsafe { &*(self.boot_context_ptr() as *const BootContext) };
+        crate::extended_state::enable_on_secondary_processor(boot.xcr0());
+        boot.user_isolation().enable_on_secondary_processor();
+        crate::memory_type::program_page_attribute_table();
+        boot.mtrrs().apply();
+        let runtime = current_runtime();
+        runtime.reset_local_apic_state();
+        runtime.attach_local_apic();
+        crate::exceptions::install_for_current_processor();
+        self.io_apics().program_redirection(
+            crate::ioapic::COM1,
+            crate::exceptions::DEBUG_SERIAL_INTERRUPT_VECTOR,
+            self.processor_slot(self.bootstrap_processor()).apic_id,
+        );
     }
 
     /// How long a processor the kernel has published as stopping may take

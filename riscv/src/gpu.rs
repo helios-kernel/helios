@@ -18,10 +18,18 @@ use crate::iommu::{self, Confinement, RiscvDmaArenas, RiscvVirtioTransport};
 use crate::net::PlicInterrupt;
 use crate::pci::{PciHostController, VirtioFunctions};
 
+pub(crate) type RiscvVirtioGpuDevice = VirtioGpuDevice<RiscvVirtioTransport>;
+
 /// The interrupt route's view of the platform's display engine.
 #[derive(Clone)]
 pub(crate) struct VirtioDisplayDevice {
-    inner: Arc<VirtioGpuDevice<RiscvVirtioTransport>>,
+    inner: Arc<RiscvVirtioGpuDevice>,
+}
+
+impl VirtioDisplayDevice {
+    pub(crate) fn device(&self) -> &Arc<RiscvVirtioGpuDevice> {
+        &self.inner
+    }
 }
 
 /// The display device the bootstrap hart brought up, together with the
@@ -44,9 +52,9 @@ pub(crate) fn has_display_device(fdt: &Fdt<'_>, pci_virtio: Option<&VirtioFuncti
 
 /// Brings the platform's display engine up and hands it to the kernel.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn install<WatchdogImpl>(
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     cpu: &crate::RiscvCpu,
-    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl>,
+    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl, MeasuredBootImpl>,
     fdt: &Fdt<'_>,
     pci: Option<&PciHostController>,
     pci_virtio: Option<&VirtioFunctions>,
@@ -56,6 +64,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> Option<DisplayInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let (device, line) = discover_display_device(cpu, fdt, pci, pci_virtio, arenas, confinement)?;
     let service = helios_kernel::install_display_device(kernel, cpu, device.inner.clone());

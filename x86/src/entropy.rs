@@ -19,11 +19,17 @@ use pci_types::PciAddress;
 use crate::iommu::X86DmaPool;
 use crate::pci::{PciRoot, VirtioFunctions};
 
-type X86VirtioRngDevice = VirtioRngDevice<VirtioPciTransport<X86DmaPool>>;
+pub(crate) type X86VirtioRngDevice = VirtioRngDevice<VirtioPciTransport<X86DmaPool>>;
 
 #[derive(Clone)]
 pub(crate) struct VirtioEntropyDevice {
     device: Arc<X86VirtioRngDevice>,
+}
+
+impl VirtioEntropyDevice {
+    pub(crate) fn device(&self) -> &Arc<X86VirtioRngDevice> {
+        &self.device
+    }
 }
 
 impl ExternalInterruptHandler for VirtioEntropyDevice {

@@ -81,6 +81,10 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// This boot's hibernate authentication key (present only when the
     /// signing seed came from a TPM-sealed slot) and the seed's provenance.
     hibernate_auth: Once<(Option<crate::HibernateAuthKey>, crate::SeedSource)>,
+    /// Compiler-signing key settled early during BSP bring-up so the
+    /// hibernate boot probe can read `hibernate_auth` before program service
+    /// installation; consumed once by `install_component_host_program_service`.
+    settled_cwasm_signing_key: Mutex<Option<crate::CwasmSigningKey>>,
     /// Nonzero token of the active `snapshot-hold` keeping the 9p share quiet
     /// for a VM snapshot, or `0` when no hold is in force.
     snapshot_hold_token: AtomicU64,
@@ -414,6 +418,7 @@ where
                 machine_generation: Once::new(),
                 machine_identity: Once::new(),
                 hibernate_auth: Once::new(),
+                settled_cwasm_signing_key: Mutex::new(None),
                 snapshot_hold_token: AtomicU64::new(0),
                 next_snapshot_hold_token: AtomicU64::new(1),
                 wall_clock: crate::exec::WallClock::new(),
@@ -850,6 +855,19 @@ where
             .reseed(self.offset_for(current_ticks, wall));
     }
 
+    /// Moves the wall clock to `wall_nanos` nanoseconds since the Unix epoch
+    /// sampled at `current_ticks` (used immediately on hibernate resume).
+    pub fn reseed_wall_clock_nanos(&self, current_ticks: u64, wall_nanos: u64) {
+        let offset = i128::from(wall_nanos) - i128::from(self.uptime_nanos(current_ticks));
+        let offset = i64::try_from(offset).unwrap_or_else(|_| {
+            panic!(
+                "hibernate resume wall clock {wall_nanos} ns is beyond what a 64-bit \
+                 nanosecond wall-clock offset carries"
+            )
+        });
+        self.inner.wall_clock.reseed(offset);
+    }
+
     /// One reading of `rtc`, fatal when the device cannot answer: the
     /// same fault whether it is the boot read or a read after a restore.
     pub(crate) fn read_rtc<Rtc: RealTimeClock>(rtc: &Rtc) -> UnixSeconds {
@@ -1159,6 +1177,29 @@ where
     /// Where this boot's signing seed came from, once settled.
     pub fn signing_seed_source(&self) -> Option<crate::SeedSource> {
         self.inner.hibernate_auth.get().map(|(_, source)| *source)
+    }
+
+    /// Installs all keys derived from one [`crate::SettledSigningKey`] during
+    /// early BSP bring-up so [`Self::hibernate_auth_key`] is available before
+    /// the early-boot hibernate resume probe and the program service later
+    /// consumes the already-settled [`crate::CwasmSigningKey`] without
+    /// re-running TPM settlement.
+    pub fn install_settled_signing_key(&self, settled: crate::SettledSigningKey) {
+        self.install_machine_identity_key(settled.machine_identity);
+        self.install_hibernate_auth(settled.hibernate_auth, settled.source);
+        let mut slot = self.inner.settled_cwasm_signing_key.lock();
+        assert!(
+            slot.is_none(),
+            "settled compiler-signing key was installed more than once"
+        );
+        *slot = Some(settled.key);
+    }
+
+    /// Consumes the [`crate::CwasmSigningKey`] settled early during bring-up,
+    /// if the backend called [`crate::settle_boot_signing_keys`] ahead of
+    /// program service installation.
+    pub fn take_settled_cwasm_signing_key(&self) -> Option<crate::CwasmSigningKey> {
+        self.inner.settled_cwasm_signing_key.lock().take()
     }
 
     /// Acquires the exclusive snapshot hold and quiets the 9p host share

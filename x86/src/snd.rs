@@ -17,7 +17,7 @@ use pci_types::PciAddress;
 use crate::iommu::X86DmaPool;
 use crate::pci::{PciRoot, VirtioFunctions};
 
-type X86VirtioSndDevice = VirtioSndDevice<VirtioPciTransport<X86DmaPool>>;
+pub(crate) type X86VirtioSndDevice = VirtioSndDevice<VirtioPciTransport<X86DmaPool>>;
 
 /// The interrupt route's view of the machine's sound device.
 ///
@@ -27,6 +27,12 @@ type X86VirtioSndDevice = VirtioSndDevice<VirtioPciTransport<X86DmaPool>>;
 #[derive(Clone)]
 pub(crate) struct VirtioSoundDevice {
     device: Arc<X86VirtioSndDevice>,
+}
+
+impl VirtioSoundDevice {
+    pub(crate) fn device(&self) -> &Arc<X86VirtioSndDevice> {
+        &self.device
+    }
 }
 
 impl ExternalInterruptHandler for VirtioSoundDevice {

@@ -19,10 +19,18 @@ use crate::iommu::{self, Confinement, RiscvDmaArenas, RiscvVirtioTransport};
 use crate::net::PlicInterrupt;
 use crate::pci::{PciHostController, VirtioFunctions};
 
+pub(crate) type RiscvVirtioInputDevice = RawVirtioInputDevice<RiscvVirtioTransport>;
+
 /// The interrupt route's view of one input device.
 #[derive(Clone)]
 pub(crate) struct VirtioInputDevice {
-    inner: Arc<RawVirtioInputDevice<RiscvVirtioTransport>>,
+    inner: Arc<RiscvVirtioInputDevice>,
+}
+
+impl VirtioInputDevice {
+    pub(crate) fn device(&self) -> &Arc<RiscvVirtioInputDevice> {
+        &self.inner
+    }
 }
 
 /// One input device the bootstrap hart brought up, together with the
@@ -46,9 +54,9 @@ pub(crate) fn count_input_devices(fdt: &Fdt<'_>, pci_virtio: Option<&VirtioFunct
 /// Brings up every input device on the PCI and platform buses, hands them
 /// all to the kernel, and publishes `helios:system/input`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn install<WatchdogImpl>(
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     cpu: &crate::RiscvCpu,
-    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl>,
+    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl, MeasuredBootImpl>,
     fdt: &Fdt<'_>,
     pci: Option<&PciHostController>,
     pci_virtio: Option<&VirtioFunctions>,
@@ -58,6 +66,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> Vec<InputInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let discovered = discover_input_devices(cpu, fdt, pci, pci_virtio, arenas, confinement);
     let service = helios_kernel::install_input_devices(

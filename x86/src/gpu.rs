@@ -17,11 +17,17 @@ use pci_types::PciAddress;
 use crate::iommu::X86DmaPool;
 use crate::pci::{PciRoot, VirtioFunctions};
 
-type X86VirtioGpuDevice = VirtioGpuDevice<VirtioPciTransport<X86DmaPool>>;
+pub(crate) type X86VirtioGpuDevice = VirtioGpuDevice<VirtioPciTransport<X86DmaPool>>;
 
 #[derive(Clone)]
 pub(crate) struct VirtioDisplayDevice {
     device: Arc<X86VirtioGpuDevice>,
+}
+
+impl VirtioDisplayDevice {
+    pub(crate) fn device(&self) -> &Arc<X86VirtioGpuDevice> {
+        &self.device
+    }
 }
 
 impl ExternalInterruptHandler for VirtioDisplayDevice {

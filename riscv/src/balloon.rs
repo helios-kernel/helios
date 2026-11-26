@@ -19,10 +19,18 @@ use crate::iommu::{self, Confinement, RiscvDmaArenas, RiscvVirtioTransport};
 use crate::net::PlicInterrupt;
 use crate::pci::{PciHostController, VirtioFunctions};
 
+pub(crate) type RiscvVirtioBalloonDevice = VirtioBalloonDevice<RiscvVirtioTransport>;
+
 /// The interrupt half of the balloon: what the PLIC dispatches to.
 #[derive(Clone)]
 pub(crate) struct VirtioBalloonInterrupt {
-    inner: Arc<VirtioBalloonDevice<RiscvVirtioTransport>>,
+    inner: Arc<RiscvVirtioBalloonDevice>,
+}
+
+impl VirtioBalloonInterrupt {
+    pub(crate) fn device(&self) -> &Arc<RiscvVirtioBalloonDevice> {
+        &self.inner
+    }
 }
 
 impl ExternalInterruptHandler for VirtioBalloonInterrupt {
@@ -47,9 +55,9 @@ pub(crate) fn has_balloon_device(fdt: &Fdt<'_>, pci_virtio: Option<&VirtioFuncti
 /// Brings up the platform's memory balloon and hands it to the kernel's
 /// balloon tasks.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn install<WatchdogImpl>(
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     cpu: &crate::RiscvCpu,
-    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl>,
+    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl, MeasuredBootImpl>,
     fdt: &Fdt<'_>,
     pci: Option<&PciHostController>,
     pci_virtio: Option<&VirtioFunctions>,
@@ -59,6 +67,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> Option<BalloonInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let (device, line) = discover_balloon_device(cpu, fdt, pci, pci_virtio, arenas, confinement)?;
     let device = Arc::new(device);

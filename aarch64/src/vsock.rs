@@ -19,12 +19,18 @@ use crate::iommu::{self, Aarch64DmaArenas, Aarch64VirtioTransport, Confinement};
 use crate::pci::{PciRoot, VirtioFunctions};
 use crate::platform::PlatformDescription;
 
-type Aarch64VirtioVsockDevice = RawVirtioVsockDevice<Aarch64VirtioTransport>;
+pub(crate) type Aarch64VirtioVsockDevice = RawVirtioVsockDevice<Aarch64VirtioTransport>;
 
 /// The interrupt route's view of the platform's vsock device.
 #[derive(Clone)]
 pub(crate) struct VirtioVsockDevice {
     device: Arc<Aarch64VirtioVsockDevice>,
+}
+
+impl VirtioVsockDevice {
+    pub(crate) fn device(&self) -> &Arc<Aarch64VirtioVsockDevice> {
+        &self.device
+    }
 }
 
 /// The vsock device the bootstrap processor brought up, together with
