@@ -109,10 +109,13 @@ where
         kernel,
         root,
         devices,
-        move |service, scratch, mount_sources| {
+        move |service, scratch, mount_sources, hibernate| {
             state.install_block_service(service);
             if let Some(cache) = mount_sources {
                 state.install_mount_sources(cache);
+            }
+            if let Some(hibernate) = hibernate {
+                state.install_hibernate_disk(hibernate);
             }
             state.finish_block_discovery();
             if let Some(swap) = helios_kernel::install_scratch_swap(
