@@ -620,7 +620,7 @@ mod tests {
         }
 
         struct FlatMemory(Vec<u8>);
-        impl UserMemory for FlatMemory {
+        impl FlatMemory {
             fn read(&self, address: u64, into: &mut [u8]) -> Result<(), MemoryFault> {
                 let start = usize::try_from(address).map_err(|_| MemoryFault)?;
                 let end = start.checked_add(into.len()).ok_or(MemoryFault)?;
@@ -645,23 +645,41 @@ mod tests {
                     .copy_from_slice(from);
                 Ok(())
             }
-            fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+        }
+        impl UserMemory for FlatMemory {
+            async fn read(&self, address: u64, into: &mut [u8]) -> Result<(), MemoryFault> {
+                Self::read(self, address, into)
+            }
+            async fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
+                Self::check_writable(self, address, length)
+            }
+            async fn write(&mut self, address: u64, from: &[u8]) -> Result<(), MemoryFault> {
+                Self::write(self, address, from)
+            }
+            async fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+                self.try_atomic_load_u32(address)?.ok_or(MemoryFault)
+            }
+            fn try_atomic_load_u32(&self, address: u64) -> Result<Option<u32>, MemoryFault> {
                 let mut raw = [0; 4];
-                self.read(address, &mut raw)?;
-                Ok(u32::from_le_bytes(raw))
+                Self::read(self, address, &mut raw)?;
+                Ok(Some(u32::from_le_bytes(raw)))
             }
-            fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
-                self.write(address, &value.to_le_bytes())
+            async fn atomic_store_u32(
+                &mut self,
+                address: u64,
+                value: u32,
+            ) -> Result<(), MemoryFault> {
+                Self::write(self, address, &value.to_le_bytes())
             }
-            fn atomic_compare_exchange_u32(
+            async fn atomic_compare_exchange_u32(
                 &mut self,
                 address: u64,
                 expected: u32,
                 desired: u32,
             ) -> Result<Result<u32, u32>, MemoryFault> {
-                let cur = self.atomic_load_u32(address)?;
+                let cur = self.atomic_load_u32(address).await?;
                 if cur == expected {
-                    self.atomic_store_u32(address, desired)?;
+                    self.atomic_store_u32(address, desired).await?;
                     Ok(Ok(cur))
                 } else {
                     Ok(Err(cur))

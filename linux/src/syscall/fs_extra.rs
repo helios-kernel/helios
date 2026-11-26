@@ -107,7 +107,7 @@ pub(super) async fn statfs<R: Resources, M: UserMemory, F: Filesystem<R>>(
     memory: &mut M,
     fs: &F,
 ) -> u64 {
-    let path = match read_user_path(memory, args[0]) {
+    let path = match read_user_path(memory, args[0]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -124,7 +124,7 @@ pub(super) async fn statfs<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(stat) => stat,
         Err(error) => return fs_errno(error),
     };
-    match memory.write(args[1], &stat.write_statfs()) {
+    match memory.write(args[1], &stat.write_statfs()).await {
         Ok(()) => 0,
         Err(_) => errno(EFAULT),
     }
@@ -175,7 +175,7 @@ pub(super) async fn fstatfs<R: Resources, M: UserMemory, F: Filesystem<R>>(
             ..FsStat::synthetic_virtual(TMPFS_MAGIC)
         },
     };
-    match memory.write(args[1], &stat.write_statfs()) {
+    match memory.write(args[1], &stat.write_statfs()).await {
         Ok(()) => 0,
         Err(_) => errno(EFAULT),
     }
@@ -249,9 +249,9 @@ struct LinuxFlock {
 }
 
 impl LinuxFlock {
-    fn read<M: UserMemory>(memory: &M, addr: u64) -> Result<Self, u64> {
+    async fn read<M: UserMemory>(memory: &M, addr: u64) -> Result<Self, u64> {
         let mut raw = [0u8; 32];
-        memory.read(addr, &mut raw).map_err(|_| EFAULT)?;
+        memory.read(addr, &mut raw).await.map_err(|_| EFAULT)?;
         Ok(Self {
             l_type: i16::from_le_bytes(raw[0..2].try_into().unwrap()),
             l_whence: i16::from_le_bytes(raw[2..4].try_into().unwrap()),
@@ -261,14 +261,14 @@ impl LinuxFlock {
         })
     }
 
-    fn write<M: UserMemory>(self, memory: &mut M, addr: u64) -> Result<(), u64> {
+    async fn write<M: UserMemory>(self, memory: &mut M, addr: u64) -> Result<(), u64> {
         let mut raw = [0u8; 32];
         raw[0..2].copy_from_slice(&self.l_type.to_le_bytes());
         raw[2..4].copy_from_slice(&self.l_whence.to_le_bytes());
         raw[8..16].copy_from_slice(&self.l_start.to_le_bytes());
         raw[16..24].copy_from_slice(&self.l_len.to_le_bytes());
         raw[24..28].copy_from_slice(&self.l_pid.to_le_bytes());
-        memory.write(addr, &raw).map_err(|_| EFAULT)
+        memory.write(addr, &raw).await.map_err(|_| EFAULT)
     }
 }
 
@@ -324,7 +324,7 @@ pub(super) async fn fcntl_lock<R: Resources, M: UserMemory, F: Filesystem<R>>(
     if entry.fdflags() & FDFLAG_PATH != 0 {
         return SyscallOutcome::Return(errno(EBADF));
     }
-    let fl = match LinuxFlock::read(memory, flock_ptr) {
+    let fl = match LinuxFlock::read(memory, flock_ptr).await {
         Ok(fl) => fl,
         Err(err) => return SyscallOutcome::Return(errno(err)),
     };
@@ -369,7 +369,7 @@ pub(super) async fn fcntl_lock<R: Resources, M: UserMemory, F: Filesystem<R>>(
                     ..fl
                 },
             };
-            match out.write(memory, flock_ptr) {
+            match out.write(memory, flock_ptr).await {
                 Ok(()) => SyscallOutcome::Return(0),
                 Err(err) => SyscallOutcome::Return(errno(err)),
             }
@@ -526,7 +526,8 @@ pub(super) async fn fallocate<R: Resources, M: VirtualMemory, F: Filesystem<R>>(
                                     &zeros[..landed.len],
                                     memory,
                                     fs,
-                                );
+                                )
+                                .await;
                             }
                             cursor = cursor.saturating_add(step as u64);
                         }
@@ -594,7 +595,7 @@ pub(super) async fn chroot<R: Resources, M: UserMemory, F: Filesystem<R>>(
     memory: &M,
     fs: &F,
 ) -> u64 {
-    let path = match read_user_path(memory, args[0]) {
+    let path = match read_user_path(memory, args[0]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -639,15 +640,15 @@ pub(super) async fn chroot<R: Resources, M: UserMemory, F: Filesystem<R>>(
     0
 }
 
-fn read_optional_offset<M: UserMemory>(memory: &M, ptr: u64) -> Result<Option<u64>, u64> {
+async fn read_optional_offset<M: UserMemory>(memory: &M, ptr: u64) -> Result<Option<u64>, u64> {
     if ptr == 0 {
         return Ok(None);
     }
-    if memory.check_writable(ptr, 8).is_err() {
+    if memory.check_writable(ptr, 8).await.is_err() {
         return Err(EFAULT);
     }
     let mut raw = [0u8; 8];
-    memory.read(ptr, &mut raw).map_err(|_| EFAULT)?;
+    memory.read(ptr, &mut raw).await.map_err(|_| EFAULT)?;
     let off = i64::from_le_bytes(raw);
     if off < 0 {
         return Err(EINVAL);
@@ -655,12 +656,17 @@ fn read_optional_offset<M: UserMemory>(memory: &M, ptr: u64) -> Result<Option<u6
     Ok(Some(off as u64))
 }
 
-fn write_optional_offset<M: UserMemory>(memory: &mut M, ptr: u64, value: u64) -> Result<(), u64> {
+async fn write_optional_offset<M: UserMemory>(
+    memory: &mut M,
+    ptr: u64,
+    value: u64,
+) -> Result<(), u64> {
     if ptr == 0 {
         return Ok(());
     }
     memory
         .write(ptr, &(value as i64).to_le_bytes())
+        .await
         .map_err(|_| EFAULT)
 }
 
@@ -712,11 +718,11 @@ pub(super) async fn copy_file_range<R: Resources, M: VirtualMemory, F: Filesyste
     if fs.file_is_directory(in_open.node()) || fs.file_is_directory(out_open.node()) {
         return errno(EISDIR);
     }
-    let explicit_in = match read_optional_offset(memory, off_in_ptr) {
+    let explicit_in = match read_optional_offset(memory, off_in_ptr).await {
         Ok(v) => v,
         Err(err) => return errno(err),
     };
-    let explicit_out = match read_optional_offset(memory, off_out_ptr) {
+    let explicit_out = match read_optional_offset(memory, off_out_ptr).await {
         Ok(v) => v,
         Err(err) => return errno(err),
     };
@@ -784,7 +790,8 @@ pub(super) async fn copy_file_range<R: Resources, M: VirtualMemory, F: Filesyste
                 &chunk[..landed.len],
                 memory,
                 fs,
-            );
+            )
+            .await;
         }
         total += landed.len;
         if landed.len < chunk.len() {
@@ -795,14 +802,14 @@ pub(super) async fn copy_file_range<R: Resources, M: VirtualMemory, F: Filesyste
     let next_in = start_in.saturating_add(total as u64);
     let next_out = start_out.saturating_add(total as u64);
     if explicit_in.is_some() {
-        if let Err(err) = write_optional_offset(memory, off_in_ptr, next_in) {
+        if let Err(err) = write_optional_offset(memory, off_in_ptr, next_in).await {
             return errno(err);
         }
     } else if total > 0 {
         in_open.lock_position().await.set(next_in);
     }
     if explicit_out.is_some() {
-        if let Err(err) = write_optional_offset(memory, off_out_ptr, next_out) {
+        if let Err(err) = write_optional_offset(memory, off_out_ptr, next_out).await {
             return errno(err);
         }
     } else if total > 0 {
@@ -911,11 +918,11 @@ pub(super) async fn splice<
         _ => return SyscallOutcome::Return(errno(EBADF)),
     }
 
-    let explicit_in = match read_optional_offset(memory, off_in_ptr) {
+    let explicit_in = match read_optional_offset(memory, off_in_ptr).await {
         Ok(v) => v,
         Err(err) => return SyscallOutcome::Return(errno(err)),
     };
-    let explicit_out = match read_optional_offset(memory, off_out_ptr) {
+    let explicit_out = match read_optional_offset(memory, off_out_ptr).await {
         Ok(v) => v,
         Err(err) => return SyscallOutcome::Return(errno(err)),
     };
@@ -1037,11 +1044,12 @@ pub(super) async fn splice<
                     &data[..landed.len],
                     memory,
                     output,
-                );
+                )
+                .await;
             }
             let next_out = out_pos.saturating_add(landed.len as u64);
             if explicit_out.is_some() {
-                if let Err(err) = write_optional_offset(memory, off_out_ptr, next_out) {
+                if let Err(err) = write_optional_offset(memory, off_out_ptr, next_out).await {
                     return SyscallOutcome::Return(errno(err));
                 }
             } else if landed.len > 0 {
@@ -1094,7 +1102,7 @@ pub(super) async fn splice<
     if let (Descriptor::<R>::File(in_open), Some(pos)) = (&in_entry.descriptor, in_read_pos) {
         let next_in = pos.saturating_add(written as u64);
         if explicit_in.is_some() {
-            if let Err(err) = write_optional_offset(memory, off_in_ptr, next_in) {
+            if let Err(err) = write_optional_offset(memory, off_in_ptr, next_in).await {
                 return SyscallOutcome::Return(errno(err));
             }
         } else if written > 0 {

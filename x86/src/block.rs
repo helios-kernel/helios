@@ -101,6 +101,7 @@ where
     let state = debug_state.clone();
     let spawner = kernel.spawner();
     let timer = kernel.timer();
+    let native_spaces = kernel.native_spaces();
     let swap_cpu = cpu.clone();
     if !devices.is_empty() {
         debug_state.begin_block_discovery();
@@ -120,6 +121,7 @@ where
             state.finish_block_discovery();
             if let Some(swap) = helios_kernel::install_scratch_swap(
                 state.instance_registry(),
+                native_spaces,
                 scratch,
                 spawner,
                 timer,

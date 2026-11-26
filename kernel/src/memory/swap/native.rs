@@ -156,6 +156,27 @@ impl<Space> NativeSpaceRegistry<Space> {
         out
     }
 
+    /// Snapshots `(space_id, resident_bytes, swapped_bytes)` for every live
+    /// registered native address space so `/proc/<pid>/status` reports live
+    /// `VmRSS` and `VmSwap` even for sleeping or idle processes.
+    pub fn space_memory_stats(&self) -> Vec<(u64, u64, u64)>
+    where
+        Space: UserSpace,
+    {
+        let live: Vec<(u64, Arc<Space>)> = {
+            let guard = self.inner.spaces.lock();
+            guard
+                .iter()
+                .filter_map(|(&space_id, entry)| {
+                    entry.space.upgrade().map(|space| (space_id, space))
+                })
+                .collect()
+        };
+        live.into_iter()
+            .map(|(space_id, space)| (space_id, space.resident_bytes(), space.swapped_bytes()))
+            .collect()
+    }
+
     /// Drains all swap tokens queued by torn-down spaces as well as orphan
     /// tokens from every live space into `out`.
     pub(crate) fn drain_all_orphans(&self, out: &mut Vec<SwapToken>)

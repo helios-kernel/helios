@@ -676,43 +676,17 @@ pub fn disable_swap(reason: SwapDisabled) {
     );
 }
 
-/// Spawns the task that owns swap, and publishes its handle.
+/// Spawns the task that owns swap watching both Wasm `registry` and native
+/// Linux `native_spaces`, and publishes its handle.
 ///
 /// The task is local to the calling processor because the swap device's
 /// completions are: a backend brings the scratch disk up on one
 /// processor and routes its interrupt there.
-pub fn install_swap<CpuImpl, Backend>(
-    spawner: Spawner<CpuImpl>,
-    timer: Timer<CpuImpl>,
-    cpu: CpuImpl,
-    registry: InstanceRegistry,
-    backend: Backend,
-    backend_name: &'static str,
-    capacity_bytes: u64,
-) -> Result<SwapHandle, Backend::Error>
-where
-    CpuImpl: Cpu + Clone + Send + Sync + 'static,
-    Backend: SwapBackend,
-{
-    install_swap_with_native_spaces(
-        spawner,
-        timer,
-        cpu,
-        registry,
-        NativeSpaceRegistry::new(),
-        backend,
-        backend_name,
-        capacity_bytes,
-    )
-}
-
-/// Spawns the swap service watching both Wasm `registry` and native Linux
-/// `native_spaces`, publishing its [`SwapHandle`].
 #[expect(
     clippy::too_many_arguments,
-    reason = "install_swap_with_native_spaces passes explicit runtime handles without global state"
+    reason = "install_swap passes explicit runtime handles without global state"
 )]
-pub fn install_swap_with_native_spaces<CpuImpl, Backend>(
+pub fn install_swap<CpuImpl, Backend>(
     spawner: Spawner<CpuImpl>,
     timer: Timer<CpuImpl>,
     cpu: CpuImpl,
@@ -1950,5 +1924,331 @@ mod tests {
         let reply = SwapFaultReply::new();
         reply.settle(FAULT_BACKEND);
         assert_eq!(reply.read(), Some(Err(SwapFaultError::Backend)));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod native_test_harness {
+    use alloc::boxed::Box;
+    use alloc::collections::BTreeMap;
+    use alloc::sync::Arc;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use core::future::Future;
+    use core::marker::PhantomData;
+    use core::task::{Context, Poll, Waker};
+    use std::sync::Mutex;
+
+    use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt};
+    use helios_hal::dma::{BufError, BufResult};
+    use helios_hal::hv::RegisterId;
+    use helios_hal::native::{
+        ExtendedState, InstructionSet, NativeError, NativeExecution, NativeUnavailable, Stop,
+        UserContext, UserSpace,
+    };
+    use helios_hal::vmm::{AddressSpaceError, SwapBackend, VirtAddr};
+
+    use super::{
+        InstanceRegistry, NativeSpaceRegistry, PhysFrame, SwapClock, SwapHandle, SwapMap,
+        SwapReport, SwapService, SwapStats, SwapVmHooks,
+    };
+
+    const PAGE: usize = PhysFrame::SIZE;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("in-memory test swap backend error")]
+    pub(crate) struct TestBackendError;
+
+    #[derive(Default)]
+    struct InMemState {
+        next_token: u64,
+        extents: BTreeMap<u64, Vec<u8>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct InMemBackend {
+        state: Arc<Mutex<InMemState>>,
+    }
+
+    impl SwapBackend for InMemBackend {
+        type Token = u64;
+        type Buffer = Box<[u8]>;
+        type Error = TestBackendError;
+
+        fn buffer(&self, bytes: usize) -> Result<Self::Buffer, Self::Error> {
+            Ok(vec![0_u8; bytes].into_boxed_slice())
+        }
+
+        async fn swap_out(
+            &self,
+            page: Self::Buffer,
+        ) -> BufResult<Self::Token, Self::Buffer, Self::Error> {
+            let mut state = self.state.lock().expect("test swap state");
+            state.next_token += 1;
+            let token = state.next_token;
+            state.extents.insert(token, page.to_vec());
+            Ok((token, page))
+        }
+
+        async fn swap_in(
+            &self,
+            token: Self::Token,
+            mut page: Self::Buffer,
+        ) -> BufResult<(), Self::Buffer, Self::Error> {
+            let mut state = self.state.lock().expect("test swap state");
+            let Some(bytes) = state.extents.remove(&token) else {
+                return Err(BufError {
+                    buffers: Some(page),
+                    error: TestBackendError,
+                });
+            };
+            page.copy_from_slice(&bytes);
+            Ok(((), page))
+        }
+
+        async fn release(&self, token: Self::Token) {
+            self.state
+                .lock()
+                .expect("test swap state")
+                .extents
+                .remove(&token);
+        }
+    }
+
+    struct NeverContext<Space>(PhantomData<fn() -> Space>);
+
+    // SAFETY: never constructed or resumed; only satisfies `NativeExecution::Context` in tests.
+    unsafe impl<Space: UserSpace> UserContext for NeverContext<Space> {
+        type Space = Space;
+
+        fn register(&self, _: RegisterId) -> Result<u64, NativeError> {
+            unreachable!()
+        }
+
+        fn set_register(&mut self, _: RegisterId, _: u64) -> Result<(), NativeError> {
+            unreachable!()
+        }
+
+        fn thread_pointer(&self) -> VirtAddr {
+            unreachable!()
+        }
+
+        fn set_thread_pointer(&mut self, _: VirtAddr) -> Result<(), NativeError> {
+            unreachable!()
+        }
+
+        fn extended_state(&self) -> ExtendedState {
+            unreachable!()
+        }
+
+        fn set_extended_state(&mut self, _: &ExtendedState) -> Result<(), NativeError> {
+            unreachable!()
+        }
+
+        fn try_clone(&self) -> Result<Self, NativeError> {
+            unreachable!()
+        }
+
+        fn resume(&mut self, _: &Self::Space) -> Stop {
+            unreachable!()
+        }
+    }
+
+    struct HarnessCpu<Space>(PhantomData<fn() -> Space>);
+
+    impl<Space> Clone for HarnessCpu<Space> {
+        fn clone(&self) -> Self {
+            Self(PhantomData)
+        }
+    }
+
+    impl<Space: UserSpace + 'static> NativeExecution for HarnessCpu<Space> {
+        type Space = Space;
+        type Context = NeverContext<Space>;
+
+        fn instruction_set(&self) -> InstructionSet {
+            InstructionSet::X86_64
+        }
+
+        fn user_range(&self) -> helios_hal::vmm::VirtRange {
+            helios_hal::vmm::VirtRange::new(VirtAddr::new(PAGE), 0x1_0000_0000 - PAGE)
+        }
+
+        fn create_space(&self) -> Result<Self::Space, NativeError> {
+            unreachable!()
+        }
+
+        fn create_context(&self, _: VirtAddr, _: VirtAddr) -> Result<Self::Context, NativeError> {
+            unreachable!()
+        }
+    }
+
+    impl<Space: UserSpace + 'static> Cpu for HarnessCpu<Space> {
+        type Hypervisor = core::convert::Infallible;
+        type Native = Self;
+        const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
+        fn has_lazy_commit_virtual_memory(&self) -> bool {
+            true
+        }
+
+        fn processor_count(&self) -> usize {
+            1
+        }
+
+        fn bootstrap_processor(&self) -> ProcessorId {
+            ProcessorId::new(0)
+        }
+
+        fn park_current(&self) {}
+
+        type WakeOnlyMask = ();
+
+        fn mask_to_wake_only(&self) {
+            panic!("test harness CPU never freezes")
+        }
+
+        fn park_wake_only(&self, _: &core::sync::atomic::AtomicU8, _: u8) {
+            panic!("test harness CPU never freezes")
+        }
+
+        fn start_processor(&self, _: ProcessorId) {}
+
+        fn wake_processor(&self, _: ProcessorId) {}
+
+        fn stop_current(&self) {
+            panic!("test harness CPU never stops")
+        }
+
+        fn restart_processor(&self, _: ProcessorId) {
+            panic!("test harness CPU never restarts")
+        }
+
+        fn now(&self) -> Instant {
+            Instant::new(0)
+        }
+
+        fn timebase(&self) -> Timebase {
+            Timebase::new(1_000_000_000)
+        }
+
+        fn set_deadline(&self, _: Instant) {}
+
+        fn publish_executable(&self, _: *const u8, _: usize) {}
+
+        fn unpublish_executable(&self, _: *const u8, _: usize) {}
+
+        fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
+            None
+        }
+
+        fn shutdown(&self) -> ! {
+            panic!("test harness CPU never shuts down")
+        }
+
+        fn reboot(&self) -> ! {
+            panic!("test harness CPU never reboots")
+        }
+
+        fn native(&self) -> Result<&Self::Native, NativeUnavailable> {
+            Ok(self)
+        }
+    }
+
+    static NOOP_HOOKS: SwapVmHooks = SwapVmHooks {
+        swap_out_page: |_, _, _| Err(AddressSpaceError::NotCommitted),
+        swap_in_page: |_, _| Err(AddressSpaceError::NotSwapped),
+        swapped_token: |_| None,
+        scan_committed_pages: |_, _, _| 0,
+        owned_resident_bytes: |_| 0,
+        drain_orphaned_swap_tokens: |_, _| 0,
+        now_ticks: || 0,
+    };
+
+    fn poll_now<F: Future>(future: F) -> F::Output {
+        let mut future = core::pin::pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => out,
+            Poll::Pending => panic!("in-memory swap harness future unexpectedly pending"),
+        }
+    }
+
+    pub(crate) struct NativeSwapTestHarness<Space: UserSpace + 'static> {
+        service: SwapService<InMemBackend, HarnessCpu<Space>>,
+        handle: SwapHandle,
+        backend: InMemBackend,
+        registry: NativeSpaceRegistry<Space>,
+    }
+
+    impl<Space: UserSpace + 'static> NativeSwapTestHarness<Space> {
+        pub(crate) fn new() -> Self {
+            let backend = InMemBackend::default();
+            let handle = SwapHandle::new(
+                "native-linux-test",
+                64 * PAGE as u64,
+                SwapClock {
+                    timebase: Timebase::new(1_000_000_000),
+                    now_ticks: NOOP_HOOKS.now_ticks,
+                },
+            );
+            let registry = NativeSpaceRegistry::new();
+            registry.attach_swap_handle(handle.clone());
+            let service = SwapService {
+                backend: backend.clone(),
+                handle: handle.clone(),
+                hooks: &NOOP_HOOKS,
+                registry: InstanceRegistry::new(),
+                native_spaces: registry.clone(),
+                cpu: HarnessCpu(PhantomData),
+                map: SwapMap::new(),
+                page: Some(vec![0_u8; PAGE].into_boxed_slice()),
+                report: SwapReport::default(),
+            };
+            Self {
+                service,
+                handle,
+                backend,
+                registry,
+            }
+        }
+
+        pub(crate) fn handle(&self) -> SwapHandle {
+            self.handle.clone()
+        }
+
+        pub(crate) fn registry(&self) -> NativeSpaceRegistry<Space> {
+            self.registry.clone()
+        }
+
+        pub(crate) fn evict_idle(
+            &mut self,
+            now_nanos: u64,
+            idle_after: u64,
+            budget: usize,
+        ) -> usize {
+            poll_now(self.service.evict_idle_pass(now_nanos, idle_after, budget))
+        }
+
+        pub(crate) fn serve_faults(&mut self) {
+            poll_now(self.service.serve_faults());
+        }
+
+        pub(crate) fn release_orphans(&mut self) {
+            poll_now(self.service.release_orphaned_tokens());
+        }
+
+        pub(crate) fn live_extents(&self) -> usize {
+            self.backend
+                .state
+                .lock()
+                .expect("test swap state")
+                .extents
+                .len()
+        }
+
+        pub(crate) fn stats(&self) -> SwapStats {
+            self.handle.stats()
+        }
     }
 }

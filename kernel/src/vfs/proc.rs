@@ -193,6 +193,7 @@ pub struct ProcProcessRecord {
     pub vm_size_bytes: u64,
     pub vm_rss_bytes: u64,
     pub vm_swap_bytes: u64,
+    pub swap_space_id: u64,
     pub maps: Vec<ProcMapEntry>,
     pub limits: Vec<ProcLimitEntry>,
     pub fds: Vec<ProcFdEntry>,
@@ -233,6 +234,7 @@ impl ProcProcessRecord {
             vm_size_bytes: 0,
             vm_rss_bytes: 0,
             vm_swap_bytes: 0,
+            swap_space_id: 0,
             maps: Vec::new(),
             limits: default_proc_limits(),
             fds: Vec::new(),
@@ -384,6 +386,12 @@ impl ProcRegistry {
 
     pub fn update_process(&self, pid: u32, update: impl FnOnce(&mut ProcProcessRecord)) {
         if let Some(record) = self.inner.processes.lock().get_mut(&pid) {
+            update(record);
+        }
+    }
+
+    pub fn update_all_processes(&self, mut update: impl FnMut(&mut ProcProcessRecord)) {
+        for record in self.inner.processes.lock().values_mut() {
             update(record);
         }
     }

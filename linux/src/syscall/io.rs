@@ -65,8 +65,8 @@ pub(super) fn event<R: Resources>(
         flags,
     )
 }
-pub(super) fn pipe<R: Resources, M: UserMemory>(
-    table: &mut Descriptors<R>,
+pub(super) async fn pipe<R: Resources, M: UserMemory>(
+    descriptors: &spin::Mutex<Descriptors<R>>,
     args: [u64; 6],
     memory: &mut M,
     has_flags: bool,
@@ -79,26 +79,35 @@ pub(super) fn pipe<R: Resources, M: UserMemory>(
     }
     let (writer, reader) = byte_channel();
     let inode = helios_unix::PipeInode::new(uid, gid);
-    let read = insert::<R>(
-        table,
-        FileDescriptor::PipeRead {
-            reader,
-            inode: inode.clone(),
-        },
-        flags,
-    );
-    if read > i32::MAX as u64 {
-        return read;
-    }
-    let write = insert::<R>(table, FileDescriptor::PipeWrite { writer, inode }, flags);
-    if write > i32::MAX as u64 {
-        let _ = table.close(read as i32);
-        return write;
-    }
+    let (read, write) = {
+        let mut table = descriptors.lock();
+        let read = insert::<R>(
+            &mut table,
+            FileDescriptor::PipeRead {
+                reader,
+                inode: inode.clone(),
+            },
+            flags,
+        );
+        if read > i32::MAX as u64 {
+            return read;
+        }
+        let write = insert::<R>(
+            &mut table,
+            FileDescriptor::PipeWrite { writer, inode },
+            flags,
+        );
+        if write > i32::MAX as u64 {
+            let _ = table.close(read as i32);
+            return write;
+        }
+        (read, write)
+    };
     let mut fds = [0; 8];
     fds[..4].copy_from_slice(&(read as u32).to_le_bytes());
     fds[4..].copy_from_slice(&(write as u32).to_le_bytes());
-    if memory.write(args[0], &fds).is_err() {
+    if memory.write(args[0], &fds).await.is_err() {
+        let mut table = descriptors.lock();
         let _ = table.close(read as i32);
         let _ = table.close(write as i32);
         return errno(EFAULT);
@@ -219,7 +228,7 @@ pub(super) async fn write_resource<R: Resources, M: UserMemory, O: Stdio + Syste
                 return SyscallOutcome::Return(errno(EINVAL));
             }
             let mut bytes = [0; 8];
-            if memory.read(args[1], &mut bytes).is_err() {
+            if memory.read(args[1], &mut bytes).await.is_err() {
                 return SyscallOutcome::Return(errno(EFAULT));
             }
             let value = u64::from_le_bytes(bytes);
@@ -253,6 +262,7 @@ pub(super) async fn write_resource<R: Resources, M: UserMemory, O: Stdio + Syste
                 let size = (args[2].min(MAX_RW_COUNT) - total).min(bytes.len() as u64) as usize;
                 if memory
                     .read(args[1].wrapping_add(total), &mut bytes[..size])
+                    .await
                     .is_err()
                 {
                     return SyscallOutcome::Return(if total == 0 { errno(EFAULT) } else { total });
@@ -331,6 +341,7 @@ pub(super) async fn write_resource<R: Resources, M: UserMemory, O: Stdio + Syste
                 let size = (count - total).min(bytes.len() as u64) as usize;
                 if memory
                     .read(args[1].wrapping_add(total), &mut bytes[..size])
+                    .await
                     .is_err()
                 {
                     return SyscallOutcome::Return(if total == 0 { errno(EFAULT) } else { total });
@@ -357,6 +368,7 @@ pub(super) async fn write_resource<R: Resources, M: UserMemory, O: Stdio + Syste
                 let size = (count - total).min(bytes.len() as u64) as usize;
                 if memory
                     .read(args[1].wrapping_add(total), &mut bytes[..size])
+                    .await
                     .is_err()
                 {
                     return SyscallOutcome::Return(if total == 0 { errno(EFAULT) } else { total });
@@ -400,7 +412,7 @@ pub(super) async fn write_resource<R: Resources, M: UserMemory, O: Stdio + Syste
                         let addr = args[1] + written;
                         let page_rem = buffer.len() - (addr as usize & (buffer.len() - 1));
                         let size = (count - written).min(page_rem as u64) as usize;
-                        if memory.read(addr, &mut buffer[..size]).is_err() {
+                        if memory.read(addr, &mut buffer[..size]).await.is_err() {
                             return SyscallOutcome::Return(if written == 0 {
                                 errno(EFAULT)
                             } else {
@@ -461,6 +473,7 @@ async fn write_fifo_common<M: UserMemory>(
         let size = (count - total).min(bytes.len() as u64) as usize;
         if memory
             .read(args[1].wrapping_add(total), &mut bytes[..size])
+            .await
             .is_err()
         {
             return SyscallOutcome::Return(if total == 0 { errno(EFAULT) } else { total });
@@ -545,7 +558,7 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory, O: Stdio + System
                 return SyscallOutcome::Return(errno(EINVAL));
             }
             // Validate the destination before consuming the counter.
-            if memory.check_writable(args[1], 8).is_err() {
+            if memory.check_writable(args[1], 8).await.is_err() {
                 return SyscallOutcome::Return(errno(EFAULT));
             }
             let value = if nonblock {
@@ -559,14 +572,14 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory, O: Stdio + System
                     WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
                 }
             };
-            if memory.write(args[1], &value.to_le_bytes()).is_err() {
+            if memory.write(args[1], &value.to_le_bytes()).await.is_err() {
                 return SyscallOutcome::Return(errno(EFAULT));
             }
             SyscallOutcome::Return(8)
         }
         FileDescriptor::PipeRead { reader, .. } => {
             let limit = args[2].min(MAX_RW_COUNT) as usize;
-            if memory.check_writable(args[1], limit).is_err() {
+            if memory.check_writable(args[1], limit).await.is_err() {
                 return SyscallOutcome::Return(errno(EFAULT));
             }
             let next = if nonblock {
@@ -584,7 +597,7 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory, O: Stdio + System
             let Some(bytes) = next else {
                 return SyscallOutcome::Return(0);
             };
-            if memory.write(args[1], &bytes).is_err() {
+            if memory.write(args[1], &bytes).await.is_err() {
                 return SyscallOutcome::Return(errno(EFAULT));
             }
             SyscallOutcome::Return(bytes.len() as u64)
@@ -594,7 +607,7 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory, O: Stdio + System
             if limit == 0 {
                 return SyscallOutcome::Return(0);
             }
-            if memory.check_writable(args[1], limit).is_err() {
+            if memory.check_writable(args[1], limit).await.is_err() {
                 return SyscallOutcome::Return(errno(EFAULT));
             }
             let bytes = if nonblock {
@@ -609,7 +622,7 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory, O: Stdio + System
                     WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
                 }
             };
-            if !bytes.is_empty() && memory.write(args[1], &bytes).is_err() {
+            if !bytes.is_empty() && memory.write(args[1], &bytes).await.is_err() {
                 return SyscallOutcome::Return(errno(EFAULT));
             }
             SyscallOutcome::Return(bytes.len() as u64)
@@ -619,7 +632,7 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory, O: Stdio + System
             if limit == 0 {
                 return SyscallOutcome::Return(0);
             }
-            if memory.check_writable(args[1], limit).is_err() {
+            if memory.check_writable(args[1], limit).await.is_err() {
                 return SyscallOutcome::Return(errno(EFAULT));
             }
             let bytes = if nonblock {
@@ -634,7 +647,7 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory, O: Stdio + System
                     WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
                 }
             };
-            if !bytes.is_empty() && memory.write(args[1], &bytes).is_err() {
+            if !bytes.is_empty() && memory.write(args[1], &bytes).await.is_err() {
                 return SyscallOutcome::Return(errno(EFAULT));
             }
             SyscallOutcome::Return(bytes.len() as u64)
@@ -644,7 +657,7 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory, O: Stdio + System
             if limit == 0 {
                 return SyscallOutcome::Return(0);
             }
-            if memory.check_writable(args[1], limit).is_err() {
+            if memory.check_writable(args[1], limit).await.is_err() {
                 return SyscallOutcome::Return(errno(EFAULT));
             }
             let bytes = if nonblock {
@@ -666,7 +679,7 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory, O: Stdio + System
                     WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
                 }
             };
-            if !bytes.is_empty() && memory.write(args[1], &bytes).is_err() {
+            if !bytes.is_empty() && memory.write(args[1], &bytes).await.is_err() {
                 return SyscallOutcome::Return(errno(EFAULT));
             }
             SyscallOutcome::Return(bytes.len() as u64)
@@ -676,7 +689,7 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory, O: Stdio + System
             if limit == 0 {
                 return SyscallOutcome::Return(0);
             }
-            if memory.check_writable(args[1], limit).is_err() {
+            if memory.check_writable(args[1], limit).await.is_err() {
                 return SyscallOutcome::Return(errno(EFAULT));
             }
             let bytes = if nonblock {
@@ -691,7 +704,7 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory, O: Stdio + System
                     WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
                 }
             };
-            if !bytes.is_empty() && memory.write(args[1], &bytes).is_err() {
+            if !bytes.is_empty() && memory.write(args[1], &bytes).await.is_err() {
                 return SyscallOutcome::Return(errno(EFAULT));
             }
             SyscallOutcome::Return(bytes.len() as u64)
@@ -711,6 +724,7 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory, O: Stdio + System
                         let step = (count - done).min(zeros.len() as u64) as usize;
                         if memory
                             .write(args[1].wrapping_add(done), &zeros[..step])
+                            .await
                             .is_err()
                         {
                             return SyscallOutcome::Return(if done == 0 {
@@ -731,6 +745,7 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory, O: Stdio + System
                         io.fill_random(&mut buf[..step]);
                         if memory
                             .write(args[1].wrapping_add(done), &buf[..step])
+                            .await
                             .is_err()
                         {
                             return SyscallOutcome::Return(if done == 0 {
@@ -748,7 +763,7 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory, O: Stdio + System
                     if limit == 0 {
                         return SyscallOutcome::Return(0);
                     }
-                    if memory.check_writable(args[1], limit).is_err() {
+                    if memory.check_writable(args[1], limit).await.is_err() {
                         return SyscallOutcome::Return(errno(EFAULT));
                     }
                     let stdin_guard = match signals
@@ -790,7 +805,7 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory, O: Stdio + System
                         carry.split_to(take)
                     };
                     drop(stdin_guard);
-                    if memory.write(args[1], &bytes).is_err() {
+                    if memory.write(args[1], &bytes).await.is_err() {
                         return SyscallOutcome::Return(errno(EFAULT));
                     }
                     SyscallOutcome::Return(bytes.len() as u64)
@@ -818,14 +833,89 @@ pub(super) fn epoll_create<R: Resources>(
     }
     insert::<R>(table, FileDescriptor::Epoll(Epoll::new()), flags)
 }
-pub(super) fn epoll_ctl<R: Resources, M: UserMemory>(
+pub(super) async fn epoll_ctl<R: Resources, M: UserMemory>(
     abi: Abi,
-    table: &mut Descriptors<R>,
+    descriptors: &spin::Mutex<Descriptors<R>>,
     args: [u64; 6],
     memory: &M,
 ) -> u64 {
     let epfd = args[0] as u32 as i32;
+    let op = args[1] as u32;
     let fd = args[2] as u32 as i32;
+    let parsed_interest = if op == 2 {
+        None
+    } else {
+        if op != 1 && op != 3 {
+            return errno(EINVAL);
+        }
+        // Validate descriptor preconditions before reading user memory, then
+        // release the descriptor lock while awaiting user memory access.
+        {
+            let table = descriptors.lock();
+            let Some(entry) = table.get_entry(epfd) else {
+                return errno(EBADF);
+            };
+            let FileDescriptor::Epoll(epoll) = &entry.descriptor else {
+                return errno(EINVAL);
+            };
+            let Some(target) = table.get_entry(fd) else {
+                return errno(EBADF);
+            };
+            if target.fdflags() & FDFLAG_PATH != 0 {
+                return errno(EBADF);
+            }
+            if fd == epfd {
+                return errno(EINVAL);
+            }
+            if matches!(
+                target.descriptor,
+                FileDescriptor::File(_)
+                    | FileDescriptor::Preopen { .. }
+                    | FileDescriptor::NullDevice
+            ) || matches!(
+                target.descriptor,
+                FileDescriptor::PseudoDevice(dev) if dev.kind.refuses_epoll()
+            ) {
+                return errno(EPERM);
+            }
+            if let FileDescriptor::Epoll(target) = &target.descriptor {
+                if target.same_object(epoll) {
+                    return errno(EINVAL);
+                }
+                if op == 1 && !valid_nesting::<R>(target, epoll, &table, 1) {
+                    return errno(40); // ELOOP
+                }
+            }
+        }
+        let data = abi.epoll_data_offset();
+        let mut event = [0; 16];
+        let bytes = &mut event[..data + 8];
+        if memory.read(args[3], bytes).await.is_err() {
+            return errno(EFAULT);
+        }
+        let events = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        if events
+            & !(EPOLLIN
+                | EPOLLOUT
+                | EPOLLERR
+                | EPOLLHUP
+                | EPOLLRDNORM
+                | EPOLLWRNORM
+                | EPOLLRDHUP
+                | EPOLLONESHOT)
+            != 0
+        {
+            return errno(EINVAL);
+        }
+        Some(Interest {
+            fd,
+            events: events & !EPOLLONESHOT,
+            one_shot: events & EPOLLONESHOT != 0,
+            data: R::Data::from_linux(u64::from_le_bytes(bytes[data..].try_into().unwrap())),
+        })
+    };
+
+    let table = descriptors.lock();
     let Some(entry) = table.get_entry(epfd) else {
         return errno(EBADF);
     };
@@ -853,47 +943,18 @@ pub(super) fn epoll_ctl<R: Resources, M: UserMemory>(
     ) {
         return errno(EPERM);
     }
-    let op = args[1] as u32;
     if let FileDescriptor::Epoll(target) = &target.descriptor {
         if target.same_object(epoll) {
             return errno(EINVAL);
         }
-        if op == 1 && !valid_nesting::<R>(target, epoll, table, 1) {
+        if op == 1 && !valid_nesting::<R>(target, epoll, &table, 1) {
             return errno(40);
         } // ELOOP
     }
     let result = if op == 2 {
         epoll.remove(fd)
     } else {
-        if op != 1 && op != 3 {
-            return errno(EINVAL);
-        }
-        let data = abi.epoll_data_offset();
-        let mut event = [0; 16];
-        let bytes = &mut event[..data + 8];
-        if memory.read(args[3], bytes).is_err() {
-            return errno(EFAULT);
-        }
-        let events = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-        if events
-            & !(EPOLLIN
-                | EPOLLOUT
-                | EPOLLERR
-                | EPOLLHUP
-                | EPOLLRDNORM
-                | EPOLLWRNORM
-                | EPOLLRDHUP
-                | EPOLLONESHOT)
-            != 0
-        {
-            return errno(EINVAL);
-        }
-        let interest = Interest {
-            fd,
-            events: events & !EPOLLONESHOT,
-            one_shot: events & EPOLLONESHOT != 0,
-            data: R::Data::from_linux(u64::from_le_bytes(bytes[data..].try_into().unwrap())),
-        };
+        let interest = parsed_interest.expect("interest decoded for EPOLL_CTL_ADD/MOD");
         if op == 1 {
             match epoll.add(interest) {
                 Ok(()) => {
@@ -904,7 +965,7 @@ pub(super) fn epoll_ctl<R: Resources, M: UserMemory>(
                         root.registrations().iter().all(|interest| {
                             match table.get_entry(interest.fd).map(|entry| &entry.descriptor) {
                                 Some(FileDescriptor::Epoll(child)) => {
-                                    valid_nesting::<R>(child, root, table, 1)
+                                    valid_nesting::<R>(child, root, &table, 1)
                                 }
                                 _ => true,
                             }
@@ -980,7 +1041,7 @@ pub(super) async fn epoll_wait<
             return SyscallOutcome::Return(errno(EINVAL));
         }
         let mut mask_bytes = [0u8; 8];
-        if memory.read(args[4], &mut mask_bytes).is_err() {
+        if memory.read(args[4], &mut mask_bytes).await.is_err() {
             return SyscallOutcome::Return(errno(EFAULT));
         }
         process
@@ -1046,6 +1107,7 @@ pub(super) async fn epoll_wait<
             bytes[data..].copy_from_slice(&interest.data.to_linux().to_le_bytes());
             if memory
                 .write(args[1].wrapping_add(count * size as u64), bytes)
+                .await
                 .is_err()
             {
                 if installed_mask {
@@ -1096,7 +1158,7 @@ mod tests {
 
     struct Memory([u8; 64]);
     impl UserMemory for Memory {
-        fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
+        async fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
             let end = address.checked_add(length as u64).ok_or(MemoryFault)?;
             if end <= self.0.len() as u64 {
                 Ok(())
@@ -1104,33 +1166,42 @@ mod tests {
                 Err(MemoryFault)
             }
         }
-        fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
-            self.check_writable(address, output.len())?;
+        async fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+            self.check_writable(address, output.len()).await?;
             output.copy_from_slice(&self.0[address as usize..address as usize + output.len()]);
             Ok(())
         }
-        fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
-            self.check_writable(address, bytes.len())?;
+        async fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
+            self.check_writable(address, bytes.len()).await?;
             self.0[address as usize..address as usize + bytes.len()].copy_from_slice(bytes);
             Ok(())
         }
-        fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+        async fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
             let mut bytes = [0; 4];
-            self.read(address, &mut bytes)?;
+            self.read(address, &mut bytes).await?;
             Ok(u32::from_le_bytes(bytes))
         }
-        fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
-            self.write(address, &value.to_le_bytes())
+        fn try_atomic_load_u32(&self, address: u64) -> Result<Option<u32>, MemoryFault> {
+            let end = address.checked_add(4).ok_or(MemoryFault)?;
+            if end > self.0.len() as u64 {
+                return Err(MemoryFault);
+            }
+            let mut bytes = [0; 4];
+            bytes.copy_from_slice(&self.0[address as usize..address as usize + 4]);
+            Ok(Some(u32::from_le_bytes(bytes)))
         }
-        fn atomic_compare_exchange_u32(
+        async fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+            self.write(address, &value.to_le_bytes()).await
+        }
+        async fn atomic_compare_exchange_u32(
             &mut self,
             address: u64,
             expected: u32,
             desired: u32,
         ) -> Result<Result<u32, u32>, MemoryFault> {
-            let current = self.atomic_load_u32(address)?;
+            let current = self.atomic_load_u32(address).await?;
             if current == expected {
-                self.atomic_store_u32(address, desired)?;
+                self.atomic_store_u32(address, desired).await?;
                 Ok(Ok(current))
             } else {
                 Ok(Err(current))

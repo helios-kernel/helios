@@ -247,11 +247,10 @@ pub use memory::{
     enter_user_memory_owner, fiber_stack_arena_stats, fiber_stack_reserve_commits_on,
     install_entropy_device, install_fiber_stack_arena, install_fiber_stack_hooks,
     install_memory_balloon, install_residency_hooks, install_swap, install_swap_hooks,
-    install_swap_with_native_spaces, install_user_memory_pool, installed_swap_handle,
-    installed_swap_hooks, kernel_reserve_for, largest_servable_user_bytes, ranges_outside,
-    residency_vm_hooks, seed_root_entropy, swap_vm_hooks, swapped_token, task_arena_bytes_for,
-    user_frame_node, user_heap_stats, user_mapping_kernel_heap_bytes, user_node_stats,
-    validate_range,
+    install_user_memory_pool, installed_swap_handle, installed_swap_hooks, kernel_reserve_for,
+    largest_servable_user_bytes, ranges_outside, residency_vm_hooks, seed_root_entropy,
+    swap_vm_hooks, swapped_token, task_arena_bytes_for, user_frame_node, user_heap_stats,
+    user_mapping_kernel_heap_bytes, user_node_stats, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -1003,6 +1002,8 @@ pub struct Kernel<
     dma_model: DmaModel,
     devices: DeviceInventory,
     boot_memory: Option<helios_hal::boot::BootMemoryMetadata>,
+    native_spaces:
+        NativeSpaceRegistry<<CpuImpl::Native as helios_hal::native::NativeExecution>::Space>,
 }
 
 impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: MeasuredBoot>
@@ -1036,6 +1037,12 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
 
     pub fn boot_memory(&self) -> Option<&helios_hal::boot::BootMemoryMetadata> {
         self.boot_memory.as_ref()
+    }
+
+    pub fn native_spaces(
+        &self,
+    ) -> NativeSpaceRegistry<<CpuImpl::Native as helios_hal::native::NativeExecution>::Space> {
+        self.native_spaces.clone()
     }
 
     pub fn spawn<Fut>(&self, future: Fut) -> JoinHandle<Fut::Output>
@@ -1457,6 +1464,7 @@ where
         dma_model,
         devices,
         boot_memory,
+        native_spaces: NativeSpaceRegistry::new(),
     };
     #[cfg(helios_watchdog_self_test)]
     assert!(

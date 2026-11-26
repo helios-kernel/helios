@@ -75,12 +75,12 @@ async fn process_dispatch(
 #[derive(Clone)]
 struct Memory(Vec<u8>);
 impl UserMemory for Memory {
-    fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
+    async fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
         let start = usize::try_from(address).map_err(|_| MemoryFault)?;
         let end = start.checked_add(length).ok_or(MemoryFault)?;
         self.0.get(start..end).map(|_| ()).ok_or(MemoryFault)
     }
-    fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
+    async fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
         let start = usize::try_from(address).map_err(|_| MemoryFault)?;
         let end = start.checked_add(bytes.len()).ok_or(MemoryFault)?;
         self.0
@@ -89,35 +89,44 @@ impl UserMemory for Memory {
             .copy_from_slice(bytes);
         Ok(())
     }
-    fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+    async fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
         let start = usize::try_from(address).map_err(|_| MemoryFault)?;
         let end = start.checked_add(output.len()).ok_or(MemoryFault)?;
         output.copy_from_slice(self.0.get(start..end).ok_or(MemoryFault)?);
         Ok(())
     }
-    fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+    async fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+        self.try_atomic_load_u32(address)?.ok_or(MemoryFault)
+    }
+    fn try_atomic_load_u32(&self, address: u64) -> Result<Option<u32>, MemoryFault> {
         if address & 3 != 0 {
             return Err(MemoryFault);
         }
-        let mut bytes = [0; 4];
-        self.read(address, &mut bytes)?;
-        Ok(u32::from_le_bytes(bytes))
+        let start = usize::try_from(address).map_err(|_| MemoryFault)?;
+        let end = start.checked_add(4).ok_or(MemoryFault)?;
+        let bytes: [u8; 4] = self
+            .0
+            .get(start..end)
+            .ok_or(MemoryFault)?
+            .try_into()
+            .unwrap();
+        Ok(Some(u32::from_le_bytes(bytes)))
     }
-    fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+    async fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
         if address & 3 != 0 {
             return Err(MemoryFault);
         }
-        self.write(address, &value.to_le_bytes())
+        self.write(address, &value.to_le_bytes()).await
     }
-    fn atomic_compare_exchange_u32(
+    async fn atomic_compare_exchange_u32(
         &mut self,
         address: u64,
         expected: u32,
         desired: u32,
     ) -> Result<Result<u32, u32>, MemoryFault> {
-        let current = self.atomic_load_u32(address)?;
+        let current = self.atomic_load_u32(address).await?;
         if current == expected {
-            self.atomic_store_u32(address, desired)?;
+            self.atomic_store_u32(address, desired).await?;
             Ok(Ok(current))
         } else {
             Ok(Err(current))

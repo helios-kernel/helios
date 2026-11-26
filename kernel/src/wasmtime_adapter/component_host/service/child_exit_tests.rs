@@ -1282,6 +1282,7 @@ mod linux_tests {
         let mut fut = core::pin::pin!(run_linux_process(
             LinuxExecRuntime {
                 exec_context,
+                native_spaces: crate::NativeSpaceRegistry::new(),
                 wasm: None,
             },
             argv,
@@ -1743,6 +1744,7 @@ mod linux_tests {
             run_linux_process(
                 LinuxExecRuntime {
                     exec_context,
+                    native_spaces: crate::NativeSpaceRegistry::new(),
                     wasm: None,
                 },
                 argv,
@@ -2173,6 +2175,7 @@ mod linux_tests {
                 next_container_id: core::sync::atomic::AtomicU64::new(1),
                 containers: Mutex::new(alloc::collections::BTreeMap::new()),
                 retired_containers: Arc::new(Mutex::new(Vec::new())),
+                native_spaces: crate::NativeSpaceRegistry::new(),
                 _marker: core::marker::PhantomData,
             }),
         }
@@ -3443,6 +3446,7 @@ mod linux_tests {
                         let exit = Box::pin(run_linux_process(
                             LinuxExecRuntime {
                                 exec_context,
+                                native_spaces: crate::NativeSpaceRegistry::new(),
                                 wasm: None,
                             },
                             ProgramArgv::launched("exec-test", Vec::new()),
@@ -4126,6 +4130,7 @@ mod linux_tests {
         let exit = block_on(run_linux_process(
             LinuxExecRuntime {
                 exec_context,
+                native_spaces: crate::NativeSpaceRegistry::new(),
                 wasm: None,
             },
             ProgramArgv::launched("interp", Vec::new()),
@@ -4584,6 +4589,7 @@ mod linux_tests {
         let exit = block_on(run_linux_process(
             LinuxExecRuntime {
                 exec_context,
+                native_spaces: crate::NativeSpaceRegistry::new(),
                 wasm: None,
             },
             ProgramArgv::launched("vsock-srv", Vec::new()),
@@ -5181,6 +5187,7 @@ mod linux_tests {
             let exit = Box::pin(run_linux_process(
                 LinuxExecRuntime {
                     exec_context,
+                    native_spaces: crate::NativeSpaceRegistry::new(),
                     wasm: None,
                 },
                 ProgramArgv::launched("initial-static", Vec::new()),

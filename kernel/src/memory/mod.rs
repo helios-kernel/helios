@@ -87,11 +87,10 @@ pub use swap::{
     AGE_BATCH_PAGES, GuestResidency, IDLE_SWAP_AFTER, InstalledAddressSpace, NativeSpaceRegistry,
     RegisteredNativeSpace, SWAP_BATCH_BYTES, SWAP_TICK, SwapDisabled, SwapFaultError, SwapFaultIn,
     SwapHandle, SwapLeafFormat, SwapSpace, SwapStats, SwapVmHooks, disable_swap, install_swap,
-    install_swap_hooks, install_swap_with_native_spaces, installed_swap_handle,
-    installed_swap_hooks, swap_vm_hooks, swapped_token,
+    install_swap_hooks, installed_swap_handle, installed_swap_hooks, swap_vm_hooks, swapped_token,
 };
 #[cfg(test)]
-pub(crate) use swap::{GUEST_SWAP_PAGE, GuestSwap};
+pub(crate) use swap::{GUEST_SWAP_PAGE, GuestSwap, native_test_harness::NativeSwapTestHarness};
 pub use user::{
     HibernateReservation, MemoryNodeStats, UserHeapStats, UserMemoryPool, UserPoolChunks,
     allocate_user_frame_uninit_on, allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed,

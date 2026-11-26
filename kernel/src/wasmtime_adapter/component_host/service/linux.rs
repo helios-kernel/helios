@@ -649,9 +649,37 @@ struct LinuxMemory<'a, Space> {
     shared_mem: Option<&'a spin::Mutex<SharedMemoryTable>>,
     /// Container-wide cache of file-backed `SharedPageObject`s.
     shared_files: Option<&'a crate::linux_container::SharedFileCache>,
+    /// Live swap service handle and registered native space ID for async
+    /// fault-in of swapped-out private pages during syscall memory accesses.
+    swap: Option<(crate::SwapHandle, u64)>,
 }
 
 impl<Space: UserSpace> LinuxMemory<'_, Space> {
+    async fn fault_in_range(
+        &self,
+        address: u64,
+        length: usize,
+    ) -> Result<(), Option<crate::SwapFaultError>> {
+        if length == 0 {
+            return Ok(());
+        }
+        let Some((swap, space_id)) = &self.swap else {
+            return Err(Some(crate::SwapFaultError::NotConfigured));
+        };
+        let start = usize::try_from(address).map_err(|_| None)?;
+        let end = start.checked_add(length).ok_or(None)?;
+        let first_page = VirtAddr::new(start).page_floor();
+        let span = end
+            .next_multiple_of(PhysFrame::SIZE)
+            .saturating_sub(first_page.raw());
+        let Some(page) = self
+            .space
+            .first_swapped_in(VirtRange::new(first_page, span))
+        else {
+            return Ok(());
+        };
+        swap.fault_in_native(*space_id, page).await.map_err(Some)
+    }
     /// Ensures any `MAP_SHARED` page overlapping `[address, address + length)`
     /// has its [`crate::SharedPageObject`] frame attached in `self.space`
     /// before a kernel read, write, or atomic operation touches it.
@@ -743,70 +771,140 @@ impl<Space: UserSpace> LinuxMemory<'_, Space> {
 }
 
 impl<Space: UserSpace> UserMemory for LinuxMemory<'_, Space> {
-    fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+    async fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
         self.ensure_shared_attached(address, output.len(), false);
-        self.space
-            .read(VirtAddr::new(address as usize), output)
-            .map_err(|_| MemoryFault)
+        loop {
+            match self.space.read(VirtAddr::new(address as usize), output) {
+                Ok(()) => return Ok(()),
+                Err(NativeError::Swapped) => self
+                    .fault_in_range(address, output.len())
+                    .await
+                    .map_err(|_| MemoryFault)?,
+                Err(_) => return Err(MemoryFault),
+            }
+        }
     }
 
-    fn read_unrestricted(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+    async fn read_unrestricted(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
         self.ensure_shared_attached(address, output.len(), false);
-        self.space
-            .read_unrestricted(VirtAddr::new(address as usize), output)
-            .map_err(|_| MemoryFault)
+        loop {
+            match self
+                .space
+                .read_unrestricted(VirtAddr::new(address as usize), output)
+            {
+                Ok(()) => return Ok(()),
+                Err(NativeError::Swapped) => self
+                    .fault_in_range(address, output.len())
+                    .await
+                    .map_err(|_| MemoryFault)?,
+                Err(_) => return Err(MemoryFault),
+            }
+        }
     }
 
-    fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
-        match self
-            .space
-            .check_writable(VirtAddr::new(address as usize), length)
-        {
-            Ok(()) => Ok(()),
-            Err(NativeError::NotMapped) if self.expand_stack_for(address, length) => self
+    async fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
+        let mut expanded = false;
+        loop {
+            match self
                 .space
                 .check_writable(VirtAddr::new(address as usize), length)
-                .map_err(|_| MemoryFault),
-            Err(_) => Err(MemoryFault),
+            {
+                Ok(()) => return Ok(()),
+                Err(NativeError::Swapped) => self
+                    .fault_in_range(address, length)
+                    .await
+                    .map_err(|_| MemoryFault)?,
+                Err(NativeError::NotMapped)
+                    if !expanded && self.expand_stack_for(address, length) =>
+                {
+                    expanded = true;
+                }
+                Err(_) => return Err(MemoryFault),
+            }
         }
     }
 
-    fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
+    async fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
         self.ensure_shared_attached(address, bytes.len(), true);
-        match self.space.write(VirtAddr::new(address as usize), bytes) {
-            Ok(()) => Ok(()),
-            Err(NativeError::NotMapped) if self.expand_stack_for(address, bytes.len()) => self
-                .space
-                .write(VirtAddr::new(address as usize), bytes)
-                .map_err(|_| MemoryFault),
+        let mut expanded = false;
+        loop {
+            match self.space.write(VirtAddr::new(address as usize), bytes) {
+                Ok(()) => return Ok(()),
+                Err(NativeError::Swapped) => self
+                    .fault_in_range(address, bytes.len())
+                    .await
+                    .map_err(|_| MemoryFault)?,
+                Err(NativeError::NotMapped)
+                    if !expanded && self.expand_stack_for(address, bytes.len()) =>
+                {
+                    expanded = true;
+                }
+                Err(_) => return Err(MemoryFault),
+            }
+        }
+    }
+
+    async fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+        self.ensure_shared_attached(address, 4, false);
+        loop {
+            match self.space.atomic_load_u32(VirtAddr::new(address as usize)) {
+                Ok(value) => return Ok(value),
+                Err(NativeError::Swapped) => self
+                    .fault_in_range(address, 4)
+                    .await
+                    .map_err(|_| MemoryFault)?,
+                Err(_) => return Err(MemoryFault),
+            }
+        }
+    }
+
+    fn try_atomic_load_u32(&self, address: u64) -> Result<Option<u32>, MemoryFault> {
+        self.ensure_shared_attached(address, 4, false);
+        match self.space.atomic_load_u32(VirtAddr::new(address as usize)) {
+            Ok(value) => Ok(Some(value)),
+            Err(NativeError::Swapped) => Ok(None),
             Err(_) => Err(MemoryFault),
         }
     }
 
-    fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
-        self.ensure_shared_attached(address, 4, false);
-        self.space
-            .atomic_load_u32(VirtAddr::new(address as usize))
-            .map_err(|_| MemoryFault)
-    }
-
-    fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+    async fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
         self.ensure_shared_attached(address, 4, true);
-        self.space
-            .atomic_store_u32(VirtAddr::new(address as usize), value)
-            .map_err(|_| MemoryFault)
+        loop {
+            match self
+                .space
+                .atomic_store_u32(VirtAddr::new(address as usize), value)
+            {
+                Ok(()) => return Ok(()),
+                Err(NativeError::Swapped) => self
+                    .fault_in_range(address, 4)
+                    .await
+                    .map_err(|_| MemoryFault)?,
+                Err(_) => return Err(MemoryFault),
+            }
+        }
     }
 
-    fn atomic_compare_exchange_u32(
+    async fn atomic_compare_exchange_u32(
         &mut self,
         address: u64,
         expected: u32,
         desired: u32,
     ) -> Result<Result<u32, u32>, MemoryFault> {
         self.ensure_shared_attached(address, 4, true);
-        self.space
-            .atomic_compare_exchange_u32(VirtAddr::new(address as usize), expected, desired)
-            .map_err(|_| MemoryFault)
+        loop {
+            match self.space.atomic_compare_exchange_u32(
+                VirtAddr::new(address as usize),
+                expected,
+                desired,
+            ) {
+                Ok(result) => return Ok(result),
+                Err(NativeError::Swapped) => self
+                    .fault_in_range(address, 4)
+                    .await
+                    .map_err(|_| MemoryFault)?,
+                Err(_) => return Err(MemoryFault),
+            }
+        }
     }
 
     fn is_page_shared(&self, address: u64) -> bool {
@@ -872,9 +970,15 @@ impl<Space: UserSpace> VirtualMemory for LinuxMemory<'_, Space> {
     }
 
     fn unmap(&mut self, address: u64, length: u64) {
+        let swapped_before = self.space.swapped_bytes();
         self.space
             .unmap(page_range(address, length))
             .unwrap_or_else(|error| panic!("unmapping a validated Linux range: {error}"));
+        if self.space.swapped_bytes() < swapped_before
+            && let Some((swap, _)) = &self.swap
+        {
+            swap.poke();
+        }
     }
 
     fn protect(&mut self, address: u64, length: u64, access: PageFlags) -> Result<(), MapError> {
@@ -884,9 +988,15 @@ impl<Space: UserSpace> VirtualMemory for LinuxMemory<'_, Space> {
     }
 
     fn discard(&mut self, address: u64, length: u64) {
+        let swapped_before = self.space.swapped_bytes();
         self.space
             .discard(page_range(address, length))
             .unwrap_or_else(|error| panic!("discarding a validated Linux range: {error}"));
+        if self.space.swapped_bytes() < swapped_before
+            && let Some((swap, _)) = &self.swap
+        {
+            swap.poke();
+        }
     }
 
     fn remap(&mut self, from: u64, length: u64, to: u64, new_length: u64) -> Result<(), MapError> {
@@ -914,19 +1024,26 @@ impl<Space: UserSpace> VirtualMemory for LinuxMemory<'_, Space> {
             .map(|start| start.raw() as u64)
     }
 
-    fn populate(&mut self, address: u64, bytes: &[u8]) -> Result<(), MapError> {
+    async fn populate(&mut self, address: u64, bytes: &[u8]) -> Result<(), MapError> {
         self.ensure_shared_attached(address, bytes.len(), true);
-        match self.space.populate(VirtAddr::new(address as usize), bytes) {
-            Ok(()) => Ok(()),
-            Err(NativeError::OutOfMemory) => Err(MapError::OutOfMemory),
-            Err(
-                NativeError::Address
-                | NativeError::NotMapped
-                | NativeError::BackingFault
-                | NativeError::Swapped,
-            ) => Err(MapError::Address),
-            Err(error @ (NativeError::Overlap | NativeError::Register)) => {
-                panic!("populating a validated Linux mapping was refused: {error}")
+        loop {
+            match self.space.populate(VirtAddr::new(address as usize), bytes) {
+                Ok(()) => return Ok(()),
+                Err(NativeError::Swapped) => {
+                    self.fault_in_range(address, bytes.len())
+                        .await
+                        .map_err(|err| match err {
+                            Some(crate::SwapFaultError::AddressSpace) => MapError::OutOfMemory,
+                            _ => MapError::Address,
+                        })?;
+                }
+                Err(NativeError::OutOfMemory) => return Err(MapError::OutOfMemory),
+                Err(NativeError::Address | NativeError::NotMapped | NativeError::BackingFault) => {
+                    return Err(MapError::Address);
+                }
+                Err(error @ (NativeError::Overlap | NativeError::Register)) => {
+                    panic!("populating a validated Linux mapping was refused: {error}")
+                }
             }
         }
     }
@@ -1250,6 +1367,8 @@ where
     StorageImpl: crate::Storage,
 {
     pub(super) exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
+    pub(super) native_spaces:
+        crate::NativeSpaceRegistry<<CpuImpl::Native as NativeExecution>::Space>,
     pub(super) wasm: Option<LinuxWasmRuntime<CpuImpl, Net, StorageImpl>>,
 }
 
@@ -1262,6 +1381,7 @@ where
     fn clone(&self) -> Self {
         Self {
             exec_context: self.exec_context.clone(),
+            native_spaces: self.native_spaces.clone(),
             wasm: self.wasm.clone(),
         }
     }
@@ -1346,6 +1466,11 @@ where
     /// (AArch64), or `0` on ABIs that require `SA_RESTORER` (x86-64).
     sigreturn_trampoline: u64,
     space: Arc<Space>,
+    /// Live registration of `space` in [`crate::NativeSpaceRegistry`] for swap
+    /// eviction, activity aging, async fault-in, and teardown orphan cleanup.
+    /// Shared across `CLONE_VM` processes via `Arc` and replaced on `execve`.
+    swap_registration:
+        Arc<crate::RegisteredNativeSpace<<CpuImpl::Native as NativeExecution>::Space>>,
     /// Shared memory objects and active `MAP_SHARED` VMA bindings for this
     /// address space (shared on `CLONE_VM`, cloned on `fork` so parent and
     /// child share the underlying `SharedPageObject`s).
@@ -1391,6 +1516,28 @@ where
             VirtAddr::new(lowest),
             self.stack_base.saturating_sub(lowest),
         )
+    }
+
+    fn record_activity(&self) {
+        self.swap_registration
+            .record_activity(crate::exec::monotonic_nanos(&self.cpu));
+    }
+
+    fn swap_pair(&self) -> Option<(crate::SwapHandle, u64)> {
+        self.swap_registration
+            .swap_handle()
+            .map(|handle| (handle, self.swap_registration.space_id()))
+    }
+
+    fn linux_memory(&self, stack_growth: Option<VirtRange>) -> LinuxMemory<'_, Space> {
+        LinuxMemory {
+            space: &*self.space,
+            user: self.user,
+            stack_growth,
+            shared_mem: Some(&self.shared_mem),
+            shared_files: Some(self.container.shared_files()),
+            swap: self.swap_pair(),
+        }
     }
 
     fn record_fatal(&self, error: ProgramExecError) {
@@ -1578,6 +1725,17 @@ where
             .timebase()
             .ticks_to_nanos(self.shared.process_cpu_ticks.load(Ordering::Relaxed));
         let utime_ticks = ticks_ns / 10_000_000;
+        let space_stats = self.shared.exec_runtime.native_spaces.space_memory_stats();
+        registry.update_all_processes(|record| {
+            if record.swap_space_id != 0
+                && let Some(&(_, rss, swap)) = space_stats
+                    .iter()
+                    .find(|&&(id, _, _)| id == record.swap_space_id)
+            {
+                record.vm_rss_bytes = rss;
+                record.vm_swap_bytes = swap;
+            }
+        });
         registry.update_process(pid, |record| {
             record.cwd = cwd;
             record.credentials = creds;
@@ -5444,7 +5602,7 @@ where
             })
     }
 
-    fn spawn_process(
+    async fn spawn_process(
         &mut self,
         spawned: SpawnedProcess<LinuxResources<Net>>,
     ) -> Result<(), SpawnError> {
@@ -5469,19 +5627,47 @@ where
         let child_space = if spawned.share_vm {
             self.shared.space.clone()
         } else {
-            Arc::new(
-                self.shared
-                    .space
-                    .clone_cow()
-                    .map_err(|_| SpawnError::OutOfMemory)?,
-            )
+            loop {
+                while let Some(page) = self.shared.space.first_swapped_page() {
+                    let Some(swap) = self.shared.swap_registration.swap_handle() else {
+                        return Err(SpawnError::OutOfMemory);
+                    };
+                    swap.fault_in_native(self.shared.swap_registration.space_id(), page)
+                        .await
+                        .map_err(|_| SpawnError::OutOfMemory)?;
+                }
+                match self.shared.space.clone_cow() {
+                    Ok(space) => break Arc::new(space),
+                    Err(NativeError::Swapped) => continue,
+                    Err(_) => return Err(SpawnError::OutOfMemory),
+                }
+            }
         };
         if let Some(addr) = spawned.child_tid_addr {
             let pid_val = spawned.child.pid().get();
-            if addr & 3 == 0 {
-                let _ = child_space.atomic_store_u32(VirtAddr::new(addr as usize), pid_val);
-            } else {
-                let _ = child_space.write(VirtAddr::new(addr as usize), &pid_val.to_le_bytes());
+            loop {
+                let res = if addr & 3 == 0 {
+                    child_space.atomic_store_u32(VirtAddr::new(addr as usize), pid_val)
+                } else {
+                    child_space.write(VirtAddr::new(addr as usize), &pid_val.to_le_bytes())
+                };
+                match res {
+                    Ok(()) => break,
+                    Err(NativeError::Swapped) if spawned.share_vm => {
+                        let Some(swap) = self.shared.swap_registration.swap_handle() else {
+                            break;
+                        };
+                        let page = VirtAddr::new(addr as usize).page_floor();
+                        if swap
+                            .fault_in_native(self.shared.swap_registration.space_id(), page)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
             }
         }
 
@@ -5502,6 +5688,15 @@ where
             self.shared.shared_mem.clone()
         } else {
             Arc::new(spin::Mutex::new(self.shared.shared_mem.lock().clone()))
+        };
+        let child_swap_registration = if spawned.share_vm {
+            self.shared.swap_registration.clone()
+        } else {
+            Arc::new(self.shared.exec_runtime.native_spaces.register(
+                child_space.clone(),
+                crate::MemoryOwner::new(child_instance.id().raw()),
+                crate::exec::monotonic_nanos(&self.shared.cpu),
+            ))
         };
         let child_signal_state = WasixSignalState::new();
         let child_shared = Arc::new(LinuxShared {
@@ -5540,6 +5735,7 @@ where
             image_end: self.shared.image_end,
             sigreturn_trampoline: self.shared.sigreturn_trampoline,
             space: child_space,
+            swap_registration: child_swap_registration,
             shared_mem: child_shared_mem,
             process_cpu_ticks: AtomicU64::new(0),
             process_sys_ticks: AtomicU64::new(0),
@@ -5552,42 +5748,14 @@ where
             tasks_drained: helios_sync::Notify::new(),
         });
 
-        let child_proc = spawned.child;
-        let child_pid = child_proc.pid();
-        let container = self.shared.container.clone();
-        child_spawner
-            .try_spawn_detached(async move {
-                let mut guard = ChildExitSafetyGuard {
-                    pids: container.pid_namespace().clone(),
-                    pid: child_pid,
-                    completed: false,
-                };
-                let outcome = drive_linux_process_lifecycle_boxed(
-                    child_context,
-                    child_proc,
-                    child_shared,
-                    None,
-                    phases::Timeline::disabled(),
-                )
-                .await;
-                let termination = match outcome {
-                    Ok(exit) => exit.termination,
-                    Err(_) => helios_unix::ChildTermination::Killed,
-                };
-                guard.completed = true;
-                container
-                    .pid_namespace()
-                    .mark_exited(child_pid, termination);
-            })
-            .map_err(|error| {
-                tracing::warn!(
-                    target: "helios_kernel::linux",
-                    instance = ?self.shared.launched_instance.id(),
-                    %error,
-                    "refused a forked Linux child: the executor's instance share is full"
-                );
-                SpawnError::Busy
-            })
+        spawn_forked_child_task(
+            child_spawner,
+            self.shared.container.clone(),
+            self.shared.launched_instance.id(),
+            child_context,
+            spawned.child,
+            child_shared,
+        )
     }
 
     async fn prepare_exec(&mut self, spec: ExecSpec) -> Result<(), ExecError> {
@@ -5603,6 +5771,59 @@ where
         *self.prepared_exec = Some(Box::new(prepared));
         Ok(())
     }
+}
+
+/// Spawns the forked child's root lifecycle task outside `async fn spawn_process`
+/// so rustc does not form an RPITIT type cycle through `drive_linux_process_lifecycle_boxed`.
+fn spawn_forked_child_task<CpuImpl, Net, StorageImpl>(
+    child_spawner: crate::InstanceSpawner<CpuImpl>,
+    container: Arc<crate::LinuxContainer<StorageImpl>>,
+    parent_instance_id: crate::InstanceId,
+    child_context: <CpuImpl::Native as NativeExecution>::Context,
+    child_proc: Process<LinuxResources<Net>>,
+    child_shared: Arc<
+        LinuxShared<CpuImpl, Net, StorageImpl, <CpuImpl::Native as NativeExecution>::Space>,
+    >,
+) -> Result<(), SpawnError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let child_pid = child_proc.pid();
+    child_spawner
+        .try_spawn_detached(async move {
+            let mut guard = ChildExitSafetyGuard {
+                pids: container.pid_namespace().clone(),
+                pid: child_pid,
+                completed: false,
+            };
+            let outcome = drive_linux_process_lifecycle_boxed(
+                child_context,
+                child_proc,
+                child_shared,
+                None,
+                phases::Timeline::disabled(),
+            )
+            .await;
+            let termination = match outcome {
+                Ok(exit) => exit.termination,
+                Err(_) => helios_unix::ChildTermination::Killed,
+            };
+            guard.completed = true;
+            container
+                .pid_namespace()
+                .mark_exited(child_pid, termination);
+        })
+        .map_err(|error| {
+            tracing::warn!(
+                target: "helios_kernel::linux",
+                instance = ?parent_instance_id,
+                %error,
+                "refused a forked Linux child: the executor's instance share is full"
+            );
+            SpawnError::Busy
+        })
 }
 
 type PreparedExecResult<CpuImpl, Net, StorageImpl> =
@@ -5767,7 +5988,7 @@ where
 
 /// Applies signal delivery on return to user mode. Returns `true` when the
 /// thread group was terminated and the driving loop should exit.
-fn deliver_and_apply<CpuImpl, Net, StorageImpl, Context>(
+async fn deliver_and_apply<CpuImpl, Net, StorageImpl, Context>(
     process: &mut Process<LinuxResources<Net>>,
     context: &mut Context,
     shared: &LinuxShared<CpuImpl, Net, StorageImpl, Context::Space>,
@@ -5779,19 +6000,13 @@ where
     StorageImpl: crate::Storage,
     Context: UserContext,
 {
-    let mut memory = LinuxMemory {
-        space: &*shared.space,
-        user: shared.user,
-        stack_growth: Some(shared.stack_growth(process.limit(Resource::Stack).current)),
-        shared_mem: Some(&shared.shared_mem),
-        shared_files: Some(shared.container.shared_files()),
-    };
-    match process.deliver_pending_signals(
-        context,
-        &mut memory,
-        restart,
-        shared.sigreturn_trampoline,
-    ) {
+    let mut memory = shared.linux_memory(Some(
+        shared.stack_growth(process.limit(Resource::Stack).current),
+    ));
+    match process
+        .deliver_pending_signals(context, &mut memory, restart, shared.sigreturn_trampoline)
+        .await
+    {
         SignalDelivery::None | SignalDelivery::Delivered => false,
         SignalDelivery::Stopped(signal) => {
             process.mark_stopped(signal);
@@ -5813,7 +6028,7 @@ where
 
 /// Delivers an unresolvable hardware fault as a Linux signal (`force_sig_fault`
 /// semantics). Returns `true` when the thread group terminated.
-fn handle_unresolvable_fault<CpuImpl, Net, StorageImpl, Context>(
+async fn handle_unresolvable_fault<CpuImpl, Net, StorageImpl, Context>(
     process: &mut Process<LinuxResources<Net>>,
     context: &mut Context,
     shared: &LinuxShared<CpuImpl, Net, StorageImpl, Context::Space>,
@@ -5843,14 +6058,13 @@ where
     {
         *present = true;
     }
-    let mut memory = LinuxMemory {
-        space: &*shared.space,
-        user: shared.user,
-        stack_growth: Some(shared.stack_growth(process.limit(Resource::Stack).current)),
-        shared_mem: Some(&shared.shared_mem),
-        shared_files: Some(shared.container.shared_files()),
-    };
-    match process.deliver_fault_signal(fault, context, &mut memory, shared.sigreturn_trampoline) {
+    let mut memory = shared.linux_memory(Some(
+        shared.stack_growth(process.limit(Resource::Stack).current),
+    ));
+    match process
+        .deliver_fault_signal(fault, context, &mut memory, shared.sigreturn_trampoline)
+        .await
+    {
         SignalDelivery::Delivered => false,
         SignalDelivery::Terminated { signal, .. } => {
             tracing::debug!(
@@ -5875,7 +6089,7 @@ where
 
 /// Delivers `SIGBUS` (`BUS_ADRERR`) for an access beyond the backing file's end.
 /// Returns `true` when the thread group terminated.
-fn handle_bus_fault<CpuImpl, Net, StorageImpl, Context>(
+async fn handle_bus_fault<CpuImpl, Net, StorageImpl, Context>(
     process: &mut Process<LinuxResources<Net>>,
     context: &mut Context,
     shared: &LinuxShared<CpuImpl, Net, StorageImpl, Context::Space>,
@@ -5888,19 +6102,18 @@ where
     StorageImpl: crate::Storage,
     Context: UserContext,
 {
-    let mut memory = LinuxMemory {
-        space: &*shared.space,
-        user: shared.user,
-        stack_growth: Some(shared.stack_growth(process.limit(Resource::Stack).current)),
-        shared_mem: Some(&shared.shared_mem),
-        shared_files: Some(shared.container.shared_files()),
-    };
-    match process.deliver_bus_fault(
-        address.raw() as u64,
-        context,
-        &mut memory,
-        shared.sigreturn_trampoline,
-    ) {
+    let mut memory = shared.linux_memory(Some(
+        shared.stack_growth(process.limit(Resource::Stack).current),
+    ));
+    match process
+        .deliver_bus_fault(
+            address.raw() as u64,
+            context,
+            &mut memory,
+            shared.sigreturn_trampoline,
+        )
+        .await
+    {
         SignalDelivery::Delivered => false,
         SignalDelivery::Terminated { signal, .. } => {
             tracing::debug!(
@@ -5955,7 +6168,8 @@ where
         }) => {
             let obj = shared.shared_mem.lock().get_object(object_id);
             let Some(obj) = obj else {
-                return handle_unresolvable_fault(process, context, shared, instance_id, fault);
+                return handle_unresolvable_fault(process, context, shared, instance_id, fault)
+                    .await;
             };
             let page_idx =
                 object_offset.saturating_add(page_va.raw() as u64 - start) / PhysFrame::SIZE as u64;
@@ -5969,6 +6183,7 @@ where
                     }
                     Err(NativeError::NotMapped) => {
                         handle_unresolvable_fault(process, context, shared, instance_id, fault)
+                            .await
                     }
                     Err(error) => {
                         panic!("attaching shared anonymous frame at {page_va:?}: {error}")
@@ -5987,19 +6202,19 @@ where
                 .file_offset
                 .saturating_add(page_va.raw() as u64 - vma.start);
             let Ok(meta) = syscall::Filesystem::stat_file(platform, &vma.file).await else {
-                return handle_bus_fault(process, context, shared, instance_id, address);
+                return handle_bus_fault(process, context, shared, instance_id, address).await;
             };
             let eof_page = meta
                 .size
                 .checked_add(PhysFrame::SIZE as u64 - 1)
                 .map_or(u64::MAX, |n| n & !(PhysFrame::SIZE as u64 - 1));
             if meta.size == 0 || page_file_off >= eof_page {
-                return handle_bus_fault(process, context, shared, instance_id, address);
+                return handle_bus_fault(process, context, shared, instance_id, address).await;
             }
             if vma.is_shared {
                 let obj = shared.shared_mem.lock().get_object(vma.shared_object);
                 let Some(obj) = obj else {
-                    return handle_bus_fault(process, context, shared, instance_id, address);
+                    return handle_bus_fault(process, context, shared, instance_id, address).await;
                 };
                 let page_idx = page_file_off / PhysFrame::SIZE as u64;
                 let frame_res = if let Some(frame) = obj.get_frame(page_idx) {
@@ -6021,7 +6236,8 @@ where
                                 shared,
                                 instance_id,
                                 address,
-                            );
+                            )
+                            .await;
                         }
                     }
                 };
@@ -6035,6 +6251,7 @@ where
                         }
                         Err(NativeError::NotMapped) => {
                             handle_unresolvable_fault(process, context, shared, instance_id, fault)
+                                .await
                         }
                         Err(error) => {
                             panic!("attaching shared file frame at {page_va:?}: {error}")
@@ -6056,7 +6273,7 @@ where
                 )
                 .await
                 else {
-                    return handle_bus_fault(process, context, shared, instance_id, address);
+                    return handle_bus_fault(process, context, shared, instance_id, address).await;
                 };
                 match crate::SharedPageObject::allocate_frame_from_bytes(&bytes)
                     .and_then(|frame| shared.space.install_private_frame(page_va, frame))
@@ -6069,12 +6286,13 @@ where
                     }
                     Err(NativeError::NotMapped) => {
                         handle_unresolvable_fault(process, context, shared, instance_id, fault)
+                            .await
                     }
                     Err(error) => panic!("installing private file frame at {page_va:?}: {error}"),
                 }
             }
         }
-        None => handle_unresolvable_fault(process, context, shared, instance_id, fault),
+        None => handle_unresolvable_fault(process, context, shared, instance_id, fault).await,
     }
 }
 
@@ -6093,7 +6311,7 @@ fn handle_backing_fault_boxed<'a, CpuImpl, Net, StorageImpl>(
     fault: UserFault,
     address: VirtAddr,
 ) -> core::pin::Pin<
-    Box<impl core::future::Future<Output = bool> + use<'a, CpuImpl, Net, StorageImpl>>,
+    Box<impl core::future::Future<Output = bool> + Send + use<'a, CpuImpl, Net, StorageImpl>>,
 >
 where
     CpuImpl: Cpu + Clone,
@@ -6143,6 +6361,7 @@ fn drive_linux_thread_boxed<CpuImpl, Net, StorageImpl>(
 ) -> core::pin::Pin<
     Box<
         impl core::future::Future<Output = ThreadRunEnd<CpuImpl, Net, StorageImpl>>
+        + Send
         + use<CpuImpl, Net, StorageImpl>,
     >,
 >
@@ -6210,12 +6429,13 @@ where
         if process.is_stopped() && wait_while_stopped(&mut process, &shared, &observer).await {
             break;
         }
-        if deliver_and_apply(&mut process, &mut context, &shared, None) {
+        if deliver_and_apply(&mut process, &mut context, &shared, None).await {
             break;
         }
         if process.is_stopped() {
             continue;
         }
+        shared.record_activity();
         let slice_began = shared.cpu.now().ticks();
         let stop = context.resume(&shared.space);
         let elapsed = shared.cpu.now().ticks().saturating_sub(slice_began);
@@ -6253,15 +6473,9 @@ where
                 let syscall_began = shared.cpu.now().ticks();
                 let mut prepared_exec = None;
                 let ended = {
-                    let mut memory = LinuxMemory {
-                        space: &*shared.space,
-                        user: shared.user,
-                        stack_growth: Some(
-                            shared.stack_growth(process.limit(Resource::Stack).current),
-                        ),
-                        shared_mem: Some(&shared.shared_mem),
-                        shared_files: Some(shared.container.shared_files()),
-                    };
+                    let mut memory = shared.linux_memory(Some(
+                        shared.stack_growth(process.limit(Resource::Stack).current),
+                    ));
                     let mut thread = ContextThread {
                         context: &mut context,
                         shared: &shared,
@@ -6314,6 +6528,7 @@ where
                     .fetch_add(sys_elapsed, Ordering::Relaxed);
                 let sys_ns = shared.cpu.timebase().ticks_to_nanos(sys_elapsed);
                 process.account_cpu_timers(0, sys_ns);
+                shared.record_activity();
                 match ended {
                     CallEnd::Done(ControlFlow::Continue(SyscallOutcome::Return(result))) => {
                         context
@@ -6326,7 +6541,9 @@ where
                             &mut context,
                             &shared,
                             Some(SyscallRestart::RestartSys { orig_reg }),
-                        ) {
+                        )
+                        .await
+                        {
                             break;
                         }
                     }
@@ -6336,19 +6553,19 @@ where
                             &mut context,
                             &shared,
                             Some(SyscallRestart::RestartNoHand { orig_reg }),
-                        ) {
+                        )
+                        .await
+                        {
                             break;
                         }
                     }
                     CallEnd::Done(ControlFlow::Continue(SyscallOutcome::SigReturn)) => {
-                        let memory = LinuxMemory {
-                            space: &*shared.space,
-                            user: shared.user,
-                            stack_growth: None,
-                            shared_mem: Some(&shared.shared_mem),
-                            shared_files: Some(shared.container.shared_files()),
-                        };
-                        if process.restore_signal_frame(&mut context, &memory).is_err() {
+                        let memory = shared.linux_memory(None);
+                        if process
+                            .restore_signal_frame(&mut context, &memory)
+                            .await
+                            .is_err()
+                        {
                             process.terminate_group(helios_unix::ChildTermination::Signaled(
                                 helios_unix::SignalTermination {
                                     signal: helios_unix::Signal::SIGSEGV.raw(),
@@ -6359,13 +6576,7 @@ where
                         }
                     }
                     CallEnd::Done(ControlFlow::Continue(SyscallOutcome::Exec)) => {
-                        let memory = LinuxMemory {
-                            space: &*shared.space,
-                            user: shared.user,
-                            stack_growth: None,
-                            shared_mem: Some(&shared.shared_mem),
-                            shared_files: Some(shared.container.shared_files()),
-                        };
+                        let memory = shared.linux_memory(None);
                         flush_shared_mappings_boxed(&process, &memory, &mut platform).await;
                         let prepared = prepared_exec
                             .expect("SyscallOutcome::Exec follows Thread::prepare_exec");
@@ -6378,8 +6589,9 @@ where
             Stop::Preempted | Stop::Interrupted => crate::yield_now().await,
             Stop::Fault(fault) => match fault.kind {
                 // An uncommitted page's first touch, a translation older than
-                // the page's current access, or growth of the initial stack:
-                // resolved atomically against concurrent sibling VM ops.
+                // the page's current access, a swapped-out private page, or
+                // growth of the initial stack: resolved atomically against
+                // concurrent sibling VM ops.
                 FaultKind::Page {
                     address,
                     access,
@@ -6387,6 +6599,76 @@ where
                 } if shared.user.contains(address) => {
                     match shared.space.resolve_fault(address, access) {
                         Ok(()) => {}
+                        Err(NativeError::Swapped) => {
+                            let page = address.page_floor();
+                            let Some(swap) = shared.swap_registration.swap_handle() else {
+                                if handle_bus_fault(
+                                    &mut process,
+                                    &mut context,
+                                    &shared,
+                                    instance_id,
+                                    address,
+                                )
+                                .await
+                                {
+                                    break;
+                                }
+                                continue;
+                            };
+                            match swap
+                                .fault_in_native(shared.swap_registration.space_id(), page)
+                                .await
+                            {
+                                Ok(()) => match shared.space.resolve_fault(address, access) {
+                                    Ok(()) | Err(NativeError::Swapped) => {}
+                                    Err(NativeError::OutOfMemory) => {
+                                        shared.record_fatal(native_error(NativeError::OutOfMemory));
+                                        process
+                                            .terminate_group(helios_unix::ChildTermination::Killed);
+                                        break;
+                                    }
+                                    Err(NativeError::NotMapped) => {
+                                        if handle_unresolvable_fault(
+                                            &mut process,
+                                            &mut context,
+                                            &shared,
+                                            instance_id,
+                                            fault,
+                                        )
+                                        .await
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(error) => panic!(
+                                        "resolving swapped page fault at {address:?}: {error}"
+                                    ),
+                                },
+                                Err(crate::SwapFaultError::AddressSpace) => {
+                                    shared.record_fatal(native_error(NativeError::OutOfMemory));
+                                    process.terminate_group(helios_unix::ChildTermination::Killed);
+                                    break;
+                                }
+                                Err(
+                                    crate::SwapFaultError::Backend
+                                    | crate::SwapFaultError::NotConfigured
+                                    | crate::SwapFaultError::UnknownToken
+                                    | crate::SwapFaultError::PageLost,
+                                ) => {
+                                    if handle_bus_fault(
+                                        &mut process,
+                                        &mut context,
+                                        &shared,
+                                        instance_id,
+                                        address,
+                                    )
+                                    .await
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         Err(NativeError::OutOfMemory) => {
                             shared.record_fatal(native_error(NativeError::OutOfMemory));
                             process.terminate_group(helios_unix::ChildTermination::Killed);
@@ -6410,7 +6692,7 @@ where
                                 // mapped or grew this page concurrently.
                                 Ok(()) | Err(NativeError::Overlap) => {
                                     match shared.space.resolve_fault(address, access) {
-                                        Ok(()) => {}
+                                        Ok(()) | Err(NativeError::Swapped) => {}
                                         Err(NativeError::OutOfMemory) => {
                                             shared.record_fatal(native_error(
                                                 NativeError::OutOfMemory,
@@ -6427,7 +6709,9 @@ where
                                                 &shared,
                                                 instance_id,
                                                 fault,
-                                            ) {
+                                            )
+                                            .await
+                                            {
                                                 break;
                                             }
                                         }
@@ -6468,7 +6752,9 @@ where
                                 &shared,
                                 instance_id,
                                 fault,
-                            ) {
+                            )
+                            .await
+                            {
                                 break;
                             }
                         }
@@ -6482,20 +6768,16 @@ where
                         &shared,
                         instance_id,
                         fault,
-                    ) {
+                    )
+                    .await
+                    {
                         break;
                     }
                 }
             },
         }
     }
-    let memory = LinuxMemory {
-        space: &*shared.space,
-        user: shared.user,
-        stack_growth: None,
-        shared_mem: Some(&shared.shared_mem),
-        shared_files: Some(shared.container.shared_files()),
-    };
+    let memory = shared.linux_memory(None);
     flush_shared_mappings_boxed(&process, &memory, &mut platform).await;
     if process.observer().all_threads_exited() {
         let now_secs = (syscall::System::realtime_nanos(&platform) / 1_000_000_000) as i64;
@@ -6768,6 +7050,9 @@ where
             rec.cwd = shared.cwd_handle.lock().clone();
             rec.credentials = shared.credentials_handle.lock().clone();
             rec.fds = snapshot_process_fds(&shared.descriptors_handle.lock());
+            rec.vm_rss_bytes = shared.space.resident_bytes();
+            rec.vm_swap_bytes = shared.space.swapped_bytes();
+            rec.swap_space_id = shared.swap_registration.space_id();
             shared.container.proc_registry().register_process(rec);
         }
         let observer = process.observer();
@@ -6874,6 +7159,12 @@ where
                     exec_proc.sync_memfds(&exec_platform);
                     shared.container.memfds().reap_unreferenced();
                     drop(exec_platform);
+                    let next_swap_registration =
+                        Arc::new(shared.exec_runtime.native_spaces.register(
+                            mapped.space.clone(),
+                            crate::MemoryOwner::new(shared.launched_instance.id().raw()),
+                            crate::exec::monotonic_nanos(&shared.cpu),
+                        ));
                     let next_shared = Arc::new(LinuxShared {
                         cpu: shared.cpu.clone(),
                         timer: shared.timer.clone(),
@@ -6912,6 +7203,7 @@ where
                         image_end: mapped.image_end,
                         sigreturn_trampoline: mapped.sigreturn_trampoline,
                         space: mapped.space,
+                        swap_registration: next_swap_registration,
                         shared_mem: Arc::new(spin::Mutex::new(SharedMemoryTable::new())),
                         process_cpu_ticks: AtomicU64::new(
                             shared.process_cpu_ticks.load(Ordering::Relaxed),
@@ -7326,6 +7618,11 @@ where
         .unwrap_or_else(|| String::from("/"));
     let grants = LinuxGrants::derive(container.authority());
     let tty = LinuxTtyState::new(container.authority(), &output_mode, instance_id);
+    let swap_registration = Arc::new(exec_runtime.native_spaces.register(
+        mapped.space.clone(),
+        crate::MemoryOwner::new(instance_id.raw()),
+        crate::exec::monotonic_nanos(&cpu),
+    ));
     let shared = Arc::new(LinuxShared {
         cpu: cpu.clone(),
         timer: exec_context.timer.clone(),
@@ -7362,6 +7659,7 @@ where
         image_end: mapped.image_end,
         sigreturn_trampoline: mapped.sigreturn_trampoline,
         space: mapped.space,
+        swap_registration,
         shared_mem: Arc::new(spin::Mutex::new(SharedMemoryTable::new())),
         process_cpu_ticks: AtomicU64::new(0),
         process_sys_ticks: AtomicU64::new(0),
@@ -7439,6 +7737,7 @@ mod tests {
             stack_growth: None,
             shared_mem: None,
             shared_files: None,
+            swap: None,
         };
 
         let rw_addr = 0x10_000u64;
@@ -7449,35 +7748,44 @@ mod tests {
                 PageFlags::READ | PageFlags::WRITE,
             )
             .unwrap();
-        assert_eq!(memory.atomic_load_u32(rw_addr + 2), Err(MemoryFault));
-        assert_eq!(memory.atomic_load_u32(0x20_000), Err(MemoryFault));
-        assert_eq!(memory.atomic_load_u32(rw_addr), Ok(0));
+        assert_eq!(
+            poll_ready(memory.atomic_load_u32(rw_addr + 2)),
+            Err(MemoryFault)
+        );
+        assert_eq!(
+            poll_ready(memory.atomic_load_u32(0x20_000)),
+            Err(MemoryFault)
+        );
+        assert_eq!(poll_ready(memory.atomic_load_u32(rw_addr)), Ok(0));
 
         // Discard leaves a zero-fill-on-demand page; atomic store commits a
         // fresh frame and writes the word.
         memory.discard(rw_addr, PhysFrame::SIZE as u64);
-        assert_eq!(memory.atomic_load_u32(rw_addr), Ok(0));
-        memory.atomic_store_u32(rw_addr, 0x1234_5678).unwrap();
-        assert_eq!(memory.atomic_load_u32(rw_addr), Ok(0x1234_5678));
+        assert_eq!(poll_ready(memory.atomic_load_u32(rw_addr)), Ok(0));
+        poll_ready(memory.atomic_store_u32(rw_addr, 0x1234_5678)).unwrap();
+        assert_eq!(poll_ready(memory.atomic_load_u32(rw_addr)), Ok(0x1234_5678));
         assert_eq!(
-            memory.atomic_compare_exchange_u32(rw_addr, 9, 10),
+            poll_ready(memory.atomic_compare_exchange_u32(rw_addr, 9, 10)),
             Ok(Err(0x1234_5678))
         );
         assert_eq!(
-            memory.atomic_compare_exchange_u32(rw_addr, 0x1234_5678, 0xdead_beef),
+            poll_ready(memory.atomic_compare_exchange_u32(rw_addr, 0x1234_5678, 0xdead_beef)),
             Ok(Ok(0x1234_5678))
         );
-        assert_eq!(memory.atomic_load_u32(rw_addr), Ok(0xdead_beef));
+        assert_eq!(poll_ready(memory.atomic_load_u32(rw_addr)), Ok(0xdead_beef));
 
         // Narrowing to read-only keeps atomic loads working and refuses atomic
         // stores and CAS.
         memory
             .protect(rw_addr, PhysFrame::SIZE as u64, PageFlags::READ)
             .unwrap();
-        assert_eq!(memory.atomic_load_u32(rw_addr), Ok(0xdead_beef));
-        assert_eq!(memory.atomic_store_u32(rw_addr, 1), Err(MemoryFault));
+        assert_eq!(poll_ready(memory.atomic_load_u32(rw_addr)), Ok(0xdead_beef));
         assert_eq!(
-            memory.atomic_compare_exchange_u32(rw_addr, 0xdead_beef, 1),
+            poll_ready(memory.atomic_store_u32(rw_addr, 1)),
+            Err(MemoryFault)
+        );
+        assert_eq!(
+            poll_ready(memory.atomic_compare_exchange_u32(rw_addr, 0xdead_beef, 1)),
             Err(MemoryFault)
         );
     }
@@ -7581,6 +7889,7 @@ mod tests {
             stack_growth: None,
             shared_mem: None,
             shared_files: None,
+            swap: None,
         };
         let mut process = Process::new(Abi::X86_64, NonZeroU32::new(1).unwrap(), 0x50_0000);
         let mut call = |number: u64, arguments: [u64; 6]| -> u64 {
@@ -7753,6 +8062,7 @@ mod tests {
             stack_growth: None,
             shared_mem: None,
             shared_files: None,
+            swap: None,
         };
         let mut process = Process::new(Abi::Aarch64, NonZeroU32::new(1).unwrap(), image_end as u64);
         let (mut thread, mut output) = (DummyThread, DummyOutput);
@@ -8306,6 +8616,7 @@ mod tests {
             stack_growth: None,
             shared_mem: None,
             shared_files: None,
+            swap: None,
         };
         let mut call = |number: u64,
                         arguments: [u64; 6],
@@ -8920,6 +9231,7 @@ mod tests {
             stack_growth: None,
             shared_mem: Some(&shared_mem),
             shared_files: Some(&shared_files),
+            swap: None,
         };
         let mut call = |number: u64,
                         arguments: [u64; 6],
@@ -9075,11 +9387,412 @@ mod tests {
             stack: VirtAddr::new(0x50_0000),
         };
         assert_eq!(
-            process.deliver_bus_fault(map_a + page, &mut ctx, &mut memory, 0),
+            poll_ready(process.deliver_bus_fault(map_a + page, &mut ctx, &mut memory, 0)),
             SignalDelivery::Terminated {
                 signal: helios_unix::Signal::SIGBUS,
                 core_dumped: true,
             }
         );
+    }
+
+    #[test]
+    fn linux_memory_and_post_wakeup_pipe_read_fault_in_swapped_pages_with_zero_block_on() {
+        ensure_pool();
+        let page = PhysFrame::SIZE as u64;
+        let start = PhysFrame::SIZE;
+        let end = 1usize << 32;
+        let space = Arc::new(NativeSpace::new(DummyTables, start as u64, end as u64));
+        let user = VirtRange::new(VirtAddr::new(start), end - start);
+
+        let mut harness = crate::memory::NativeSwapTestHarness::<NativeSpace<DummyTables>>::new();
+        let reg = harness
+            .registry()
+            .register(Arc::clone(&space), crate::MemoryOwner::new(701), 0);
+        let swap_pair = (harness.handle(), reg.space_id());
+
+        let rw = PageFlags::READ | PageFlags::WRITE;
+        let base = 0x20_000u64;
+        space
+            .map(
+                VirtRange::new(VirtAddr::new(base as usize), 4 * PhysFrame::SIZE),
+                &[],
+                rw,
+            )
+            .unwrap();
+
+        let cjk_page0 = "中文 日本語 한국어 pre-swap-page-0".as_bytes();
+        let pipe_payload = "中文 日本語 한국어 post-wakeup pipe payload".as_bytes();
+        space
+            .write(VirtAddr::new(base as usize), cjk_page0)
+            .unwrap();
+        space
+            .write(VirtAddr::new((base + page) as usize), &[0xaa; 64])
+            .unwrap();
+        space
+            .atomic_store_u32(VirtAddr::new((base + 2 * page) as usize), 0x1122_3344)
+            .unwrap();
+        space
+            .write(VirtAddr::new((base + 3 * page) as usize), b"discard-me")
+            .unwrap();
+
+        let mut process = Process::<helios_linux::syscall::NoBacking>::new(
+            Abi::X86_64,
+            NonZeroU32::new(10).unwrap(),
+            0x50_0000,
+        );
+        let (mut thread, mut output) = (DummyThread, DummyOutput);
+        let pipe_fds_addr = base + page + 0x400;
+        const SYS_PIPE2: u64 = 293;
+        const SYS_READ: u64 = 0;
+        {
+            let mut memory = LinuxMemory {
+                space: &*space,
+                user,
+                stack_growth: None,
+                shared_mem: None,
+                shared_files: None,
+                swap: Some(swap_pair.clone()),
+            };
+            let ret = poll_ready(syscall::dispatch(
+                &mut process,
+                Call {
+                    number: SYS_PIPE2,
+                    arguments: [pipe_fds_addr, 0, 0, 0, 0, 0],
+                },
+                &mut memory,
+                &mut thread,
+                &mut output,
+            ));
+            assert_eq!(ret, ControlFlow::Continue(SyscallOutcome::Return(0)));
+        }
+        let mut fd_bytes = [0u8; 8];
+        space
+            .read(VirtAddr::new(pipe_fds_addr as usize), &mut fd_bytes)
+            .unwrap();
+        let rfd = u64::from(u32::from_le_bytes(fd_bytes[0..4].try_into().unwrap()));
+        let wfd = u32::from_le_bytes(fd_bytes[4..8].try_into().unwrap()) as i32;
+        let pipe_writer = match process
+            .descriptor_entry(wfd)
+            .expect("pipe write fd must exist")
+            .descriptor
+        {
+            helios_unix::FileDescriptor::PipeWrite { writer, .. } => writer,
+            _ => panic!("expected PipeWrite descriptor"),
+        };
+
+        // 1. Start a blocking `read(rfd, base + page, pipe_payload.len())` while page 1 is resident.
+        let mut read_memory = LinuxMemory {
+            space: &*space,
+            user,
+            stack_growth: None,
+            shared_mem: None,
+            shared_files: None,
+            swap: Some(swap_pair.clone()),
+        };
+        let mut read_thread = DummyThread;
+        let mut read_output = DummyOutput;
+        {
+            let mut read_fut = core::pin::pin!(syscall::dispatch(
+                &mut process,
+                Call {
+                    number: SYS_READ,
+                    arguments: [rfd, base + page, pipe_payload.len() as u64, 0, 0, 0],
+                },
+                &mut read_memory,
+                &mut read_thread,
+                &mut read_output,
+            ));
+            let mut cx = Context::from_waker(core::task::Waker::noop());
+            assert!(
+                matches!(read_fut.as_mut().poll(&mut cx), Poll::Pending),
+                "blocking pipe read must park when pipe is empty"
+            );
+
+            // 2. While `read` is parked, evict ALL 4 private pages under Yellow idle pressure!
+            let now = crate::IDLE_SWAP_AFTER.as_nanos() as u64 + 1_000_000;
+            let moved = harness.evict_idle(
+                now,
+                crate::IDLE_SWAP_AFTER.as_nanos() as u64,
+                crate::SWAP_BATCH_BYTES,
+            );
+            assert_eq!(moved, 4 * PhysFrame::SIZE);
+            assert_eq!(space.swapped_bytes(), 4 * page);
+            assert!(
+                space
+                    .swapped_token(VirtAddr::new((base + page) as usize))
+                    .is_some()
+            );
+            assert_eq!(harness.live_extents(), 4);
+            assert_eq!(harness.stats().pages_out, 4);
+
+            // 3. Push the CJK payload into the pipe, waking the parked `read` syscall.
+            assert!(matches!(
+                pipe_writer.try_write(Bytes::copy_from_slice(pipe_payload)),
+                helios_sync::TryWrite::Written
+            ));
+
+            // 4. First poll after wakeup drains the pipe, hits NativeError::Swapped on
+            //    `memory.write(base + page, ...)` and parks on `SwapHandle::fault_in_native`
+            //    with zero `block_on`!
+            assert!(
+                matches!(read_fut.as_mut().poll(&mut cx), Poll::Pending),
+                "post-wakeup write into swapped buffer must park asynchronously on SwapFaultIn"
+            );
+
+            // 5. Drive `SwapService::serve_faults`, then poll `read` to completion.
+            harness.serve_faults();
+            match read_fut.as_mut().poll(&mut cx) {
+                Poll::Ready(ControlFlow::Continue(SyscallOutcome::Return(n))) => {
+                    assert_eq!(n, pipe_payload.len() as u64);
+                }
+                other => panic!("unexpected post-wakeup read outcome: {other:?}"),
+            }
+        }
+
+        // Verify post-wakeup CJK payload landed byte-exact with zero lost bytes.
+        let mut recv_out = vec![0u8; pipe_payload.len()];
+        space
+            .read(VirtAddr::new((base + page) as usize), &mut recv_out)
+            .unwrap();
+        assert_eq!(recv_out, pipe_payload);
+
+        // 6. Non-blocking `try_atomic_load_u32` returns Ok(None) on swapped page 2,
+        //    while async `atomic_compare_exchange_u32` faults it in asynchronously.
+        let mut memory = LinuxMemory {
+            space: &*space,
+            user,
+            stack_growth: None,
+            shared_mem: None,
+            shared_files: None,
+            swap: Some(swap_pair),
+        };
+        assert_eq!(memory.try_atomic_load_u32(base + 2 * page), Ok(None));
+        {
+            let mut cas_fut = core::pin::pin!(memory.atomic_compare_exchange_u32(
+                base + 2 * page,
+                0x1122_3344,
+                0x5566_7788
+            ));
+            let mut cx = Context::from_waker(core::task::Waker::noop());
+            assert!(matches!(cas_fut.as_mut().poll(&mut cx), Poll::Pending));
+            harness.serve_faults();
+            assert_eq!(
+                cas_fut.as_mut().poll(&mut cx),
+                Poll::Ready(Ok(Ok(0x1122_3344)))
+            );
+        }
+        assert_eq!(
+            memory.try_atomic_load_u32(base + 2 * page),
+            Ok(Some(0x5566_7788))
+        );
+
+        // 7. Async `UserMemory::read` on swapped page 0 faults in byte-exact CJK contents.
+        let mut page0_out = vec![0u8; cjk_page0.len()];
+        {
+            let mut read0_fut = core::pin::pin!(memory.read(base, &mut page0_out));
+            let mut cx = Context::from_waker(core::task::Waker::noop());
+            assert!(matches!(read0_fut.as_mut().poll(&mut cx), Poll::Pending));
+            harness.serve_faults();
+            assert_eq!(read0_fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        }
+        assert_eq!(page0_out, cjk_page0);
+
+        // 8. `MADV_DONTNEED` (`discard`) on swapped page 3 orphans its token; `release_orphans`
+        //    frees 100% of swap extents (zero leaks!).
+        assert!(
+            space
+                .swapped_token(VirtAddr::new((base + 3 * page) as usize))
+                .is_some()
+        );
+        memory.discard(base + 3 * page, page);
+        assert_eq!(space.swapped_bytes(), 0);
+        harness.release_orphans();
+        assert_eq!(harness.live_extents(), 0);
+        assert_eq!(harness.stats().used_bytes, 0);
+
+        drop(reg);
+        harness.release_orphans();
+        assert_eq!(harness.live_extents(), 0);
+    }
+
+    #[test]
+    fn native_swap_fork_prefaults_swapped_parent_preserves_cow_and_reports_proc_vmswap() {
+        ensure_pool();
+        let page = PhysFrame::SIZE as u64;
+        let start = PhysFrame::SIZE;
+        let end = 1usize << 32;
+        let parent_space = Arc::new(NativeSpace::new(DummyTables, start as u64, end as u64));
+
+        let mut harness = crate::memory::NativeSwapTestHarness::<NativeSpace<DummyTables>>::new();
+        let parent_reg =
+            harness
+                .registry()
+                .register(Arc::clone(&parent_space), crate::MemoryOwner::new(801), 0);
+
+        let rw = PageFlags::READ | PageFlags::WRITE;
+        let base = 0x30_000u64;
+        parent_space
+            .map(
+                VirtRange::new(VirtAddr::new(base as usize), 2 * PhysFrame::SIZE),
+                &[],
+                rw,
+            )
+            .unwrap();
+        let p0_data = "中文 日本語 한국어 fork-parent-page-0".as_bytes();
+        let p1_data = "中文 日本語 한국어 fork-parent-page-1".as_bytes();
+        parent_space
+            .write(VirtAddr::new(base as usize), p0_data)
+            .unwrap();
+        parent_space
+            .write(VirtAddr::new((base + page) as usize), p1_data)
+            .unwrap();
+
+        // Register in ProcRegistry and evict both pages under Yellow pressure.
+        let uts = triomphe::Arc::new(spin::Mutex::new(crate::vfs::SharedUts {
+            hostname: helios_linux::syscall::UtsField::UNSET,
+            domainname: helios_linux::syscall::UtsField::UNSET,
+        }));
+        let proc_reg = crate::ProcRegistry::new(uts, 2);
+        let mut rec = crate::ProcProcessRecord::minimal(42, 1, "swapper", "/linux/native-swap");
+        rec.swap_space_id = parent_reg.space_id();
+        rec.vm_rss_bytes = parent_space.resident_bytes();
+        rec.vm_swap_bytes = parent_space.swapped_bytes();
+        proc_reg.register_process(rec);
+
+        let now = crate::IDLE_SWAP_AFTER.as_nanos() as u64 + 1_000_000;
+        let moved = harness.evict_idle(
+            now,
+            crate::IDLE_SWAP_AFTER.as_nanos() as u64,
+            crate::SWAP_BATCH_BYTES,
+        );
+        assert_eq!(moved, 2 * PhysFrame::SIZE);
+        assert_eq!(parent_space.swapped_bytes(), 2 * page);
+
+        // Refresh ProcRegistry from `NativeSpaceRegistry::space_memory_stats` (same path as `/proc`).
+        let stats_before = harness.registry().space_memory_stats();
+        proc_reg.update_all_processes(|record| {
+            if let Some(&(_, rss, swap)) = stats_before
+                .iter()
+                .find(|&&(id, _, _)| id == record.swap_space_id)
+            {
+                record.vm_rss_bytes = rss;
+                record.vm_swap_bytes = swap;
+            }
+        });
+        let snap = proc_reg.process(42).expect("process record");
+        assert_eq!(snap.vm_swap_bytes, 2 * page);
+        let proc_fs = crate::ProcFs::new(helios_hal::fs::DeviceId::new(1), proc_reg.clone());
+        let status_before = poll_ready(helios_hal::fs::FileSystem::read_at(
+            &proc_fs,
+            helios_hal::fs::FsPath::new("42/status").unwrap(),
+            0,
+            8192,
+        ))
+        .expect("read /proc/42/status");
+        let status_before = core::str::from_utf8(&status_before).unwrap();
+        assert!(
+            status_before.contains("VmSwap:\t       8 kB\n"),
+            "status_before:\n{status_before}"
+        );
+
+        // `clone_cow` refuses while swapped pages remain, then succeeds after async pre-fault.
+        assert_eq!(parent_space.clone_cow().err(), Some(NativeError::Swapped));
+        let swap_handle = harness.handle();
+        let parent_id = parent_reg.space_id();
+        while let Some(swapped_page) = parent_space.first_swapped_page() {
+            let mut fut = core::pin::pin!(swap_handle.fault_in_native(parent_id, swapped_page));
+            let mut cx = Context::from_waker(core::task::Waker::noop());
+            assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+            harness.serve_faults();
+            assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        }
+        let child_space = Arc::new(parent_space.clone_cow().expect("clone_cow after pre-fault"));
+        let child_reg =
+            harness
+                .registry()
+                .register(Arc::clone(&child_space), crate::MemoryOwner::new(802), 0);
+
+        // Both parent and child read byte-exact CJK contents; child write triggers CoW isolation.
+        let mut child_p0 = vec![0u8; p0_data.len()];
+        let mut child_p1 = vec![0u8; p1_data.len()];
+        child_space
+            .read(VirtAddr::new(base as usize), &mut child_p0)
+            .unwrap();
+        child_space
+            .read(VirtAddr::new((base + page) as usize), &mut child_p1)
+            .unwrap();
+        assert_eq!(child_p0, p0_data);
+        assert_eq!(child_p1, p1_data);
+
+        let child_private = "中文 日本語 한국어 child-private-cow".as_bytes();
+        child_space
+            .write(VirtAddr::new(base as usize), child_private)
+            .unwrap();
+        let mut parent_p0 = vec![0u8; p0_data.len()];
+        parent_space
+            .read(VirtAddr::new(base as usize), &mut parent_p0)
+            .unwrap();
+        assert_eq!(parent_p0, p0_data);
+
+        // Evict child's now-private page 0 (CoW page 1 stays resident!), then resolve via Stop::Fault path.
+        parent_reg.record_activity(now);
+        let moved_child = harness.evict_idle(
+            now,
+            crate::IDLE_SWAP_AFTER.as_nanos() as u64,
+            crate::SWAP_BATCH_BYTES,
+        );
+        assert_eq!(moved_child, PhysFrame::SIZE);
+        assert_eq!(
+            child_space.resolve_fault(VirtAddr::new(base as usize), PageFlags::READ),
+            Err(NativeError::Swapped)
+        );
+        {
+            let mut fut = core::pin::pin!(
+                swap_handle.fault_in_native(child_reg.space_id(), VirtAddr::new(base as usize))
+            );
+            let mut cx = Context::from_waker(core::task::Waker::noop());
+            assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+            harness.serve_faults();
+            assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        }
+        child_space
+            .resolve_fault(VirtAddr::new(base as usize), PageFlags::READ)
+            .unwrap();
+        let mut child_after = vec![0u8; child_private.len()];
+        child_space
+            .read(VirtAddr::new(base as usize), &mut child_after)
+            .unwrap();
+        assert_eq!(child_after, child_private);
+
+        // `/proc/42/status` now reports `VmSwap: 0 kB`.
+        let stats_after = harness.registry().space_memory_stats();
+        proc_reg.update_all_processes(|record| {
+            if let Some(&(_, rss, swap)) = stats_after
+                .iter()
+                .find(|&&(id, _, _)| id == record.swap_space_id)
+            {
+                record.vm_rss_bytes = rss;
+                record.vm_swap_bytes = swap;
+            }
+        });
+        let status_after = poll_ready(helios_hal::fs::FileSystem::read_at(
+            &proc_fs,
+            helios_hal::fs::FsPath::new("42/status").unwrap(),
+            0,
+            8192,
+        ))
+        .expect("read /proc/42/status");
+        let status_after = core::str::from_utf8(&status_after).unwrap();
+        assert!(
+            status_after.contains("VmSwap:\t       0 kB\n"),
+            "status_after:\n{status_after}"
+        );
+
+        // Drop both registrations (simulating execve/exit) and verify zero leaked swap extents.
+        drop(child_reg);
+        drop(parent_reg);
+        harness.release_orphans();
+        assert_eq!(harness.live_extents(), 0);
+        assert_eq!(harness.stats().used_bytes, 0);
     }
 }

@@ -78,7 +78,7 @@ impl Default for PageMem {
     }
 }
 
-impl UserMemory for PageMem {
+impl PageMem {
     fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
         for (i, byte) in output.iter_mut().enumerate() {
             let a = address.checked_add(i as u64).ok_or(MemoryFault)?;
@@ -112,23 +112,38 @@ impl UserMemory for PageMem {
         }
         Ok(())
     }
-    fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+}
+
+impl UserMemory for PageMem {
+    async fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+        Self::read(self, address, output)
+    }
+    async fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
+        Self::check_writable(self, address, length)
+    }
+    async fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
+        Self::write(self, address, bytes)
+    }
+    async fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+        self.try_atomic_load_u32(address)?.ok_or(MemoryFault)
+    }
+    fn try_atomic_load_u32(&self, address: u64) -> Result<Option<u32>, MemoryFault> {
         let mut raw = [0; 4];
-        self.read(address, &mut raw)?;
-        Ok(u32::from_le_bytes(raw))
+        Self::read(self, address, &mut raw)?;
+        Ok(Some(u32::from_le_bytes(raw)))
     }
-    fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
-        self.write(address, &value.to_le_bytes())
+    async fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+        Self::write(self, address, &value.to_le_bytes())
     }
-    fn atomic_compare_exchange_u32(
+    async fn atomic_compare_exchange_u32(
         &mut self,
         address: u64,
         expected: u32,
         desired: u32,
     ) -> Result<Result<u32, u32>, MemoryFault> {
-        let cur = self.atomic_load_u32(address)?;
+        let cur = self.atomic_load_u32(address).await?;
         if cur == expected {
-            self.atomic_store_u32(address, desired)?;
+            self.atomic_store_u32(address, desired).await?;
             Ok(Ok(cur))
         } else {
             Ok(Err(cur))
@@ -232,7 +247,7 @@ impl VirtualMemory for PageMem {
             None
         }
     }
-    fn populate(&mut self, address: u64, bytes: &[u8]) -> Result<(), MapError> {
+    async fn populate(&mut self, address: u64, bytes: &[u8]) -> Result<(), MapError> {
         for i in 0..bytes.len() {
             let a = address.checked_add(i as u64).ok_or(MapError::Address)?;
             if !self.pages.contains_key(&(a & !(PAGE - 1))) {
@@ -1586,7 +1601,7 @@ fn file_backed_mmap_private_eof_zero_tail_fixed_noreplace_and_oom() {
         inner: PageMem,
         fail_populate_oom: bool,
     }
-    impl UserMemory for OomPageMem {
+    impl OomPageMem {
         fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
             self.inner.read(address, output)
         }
@@ -1596,13 +1611,27 @@ fn file_backed_mmap_private_eof_zero_tail_fixed_noreplace_and_oom() {
         fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
             self.inner.write(address, bytes)
         }
-        fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
-            self.inner.atomic_load_u32(address)
+    }
+    impl UserMemory for OomPageMem {
+        async fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+            Self::read(self, address, output)
         }
-        fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
-            self.inner.atomic_store_u32(address, value)
+        async fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
+            Self::check_writable(self, address, length)
         }
-        fn atomic_compare_exchange_u32(
+        async fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
+            Self::write(self, address, bytes)
+        }
+        async fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+            self.inner.atomic_load_u32(address).await
+        }
+        fn try_atomic_load_u32(&self, address: u64) -> Result<Option<u32>, MemoryFault> {
+            self.inner.try_atomic_load_u32(address)
+        }
+        async fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+            self.inner.atomic_store_u32(address, value).await
+        }
+        async fn atomic_compare_exchange_u32(
             &mut self,
             address: u64,
             expected: u32,
@@ -1610,6 +1639,7 @@ fn file_backed_mmap_private_eof_zero_tail_fixed_noreplace_and_oom() {
         ) -> Result<Result<u32, u32>, MemoryFault> {
             self.inner
                 .atomic_compare_exchange_u32(address, expected, desired)
+                .await
         }
     }
     impl VirtualMemory for OomPageMem {
@@ -1656,11 +1686,11 @@ fn file_backed_mmap_private_eof_zero_tail_fixed_noreplace_and_oom() {
         fn free_range(&self, hint: u64, length: u64) -> Option<u64> {
             self.inner.free_range(hint, length)
         }
-        fn populate(&mut self, address: u64, bytes: &[u8]) -> Result<(), MapError> {
+        async fn populate(&mut self, address: u64, bytes: &[u8]) -> Result<(), MapError> {
             if self.fail_populate_oom {
                 return Err(MapError::OutOfMemory);
             }
-            self.inner.populate(address, bytes)
+            self.inner.populate(address, bytes).await
         }
     }
 
