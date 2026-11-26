@@ -510,6 +510,23 @@ pub fn parse_posix_signal(raw: &str) -> Result<u8, OpsError> {
     Ok(num)
 }
 
+enum ChildStdinState {
+    /// No pre-buffered stdin was supplied and `write_stdin` has not opened an
+    /// interactive stream yet. Deferring the `child.stdin` RPC until the first
+    /// `write_stdin` or `close_stdin`/`wait` avoids holding an open stream when
+    /// a caller only waits on the child.
+    Lazy,
+    /// Interactive stdin stream opened by `write_stdin`.
+    Open {
+        writer: StreamWriter<u8>,
+        done_task: tokio::task::JoinHandle<()>,
+    },
+    /// Pre-buffered stdin was already sent, or `close_stdin` already closed it.
+    Closed {
+        done_task: Option<tokio::task::JoinHandle<()>>,
+    },
+}
+
 /// Streaming handle to a remotely spawned program.
 pub struct Child {
     session: Session,
@@ -517,8 +534,7 @@ pub struct Child {
     instance_id: Arc<AtomicU64>,
     pub stdout: async_channel::Receiver<Result<Vec<u8>, OpsError>>,
     pub stderr: async_channel::Receiver<Result<Vec<u8>, OpsError>>,
-    stdin_tx: Arc<tokio::sync::Mutex<Option<StreamWriter<u8>>>>,
-    stdin_task: Option<tokio::task::JoinHandle<()>>,
+    stdin_state: Arc<tokio::sync::Mutex<ChildStdinState>>,
     started_at: Instant,
 }
 
@@ -560,15 +576,8 @@ impl Child {
             stderr_tx,
         );
 
-        let (stdin_tx, stdin_task) = if stdin_bytes.is_empty() {
-            let (tx, rx) = rpc_stream::<u8>();
-            let stdin_done = session
-                .call("system.programs.child.stdin", remote_child.stdin(rx))
-                .await?;
-            let task = tokio::spawn(async move {
-                let _ = stdin_done.await;
-            });
-            (Arc::new(tokio::sync::Mutex::new(Some(tx))), Some(task))
+        let stdin_state = if stdin_bytes.is_empty() {
+            ChildStdinState::Lazy
         } else {
             let stdin_reader = StreamReader::from_vec(stdin_bytes);
             let stdin_done = session
@@ -580,7 +589,9 @@ impl Child {
             let task = tokio::spawn(async move {
                 let _ = stdin_done.await;
             });
-            (Arc::new(tokio::sync::Mutex::new(None)), Some(task))
+            ChildStdinState::Closed {
+                done_task: Some(task),
+            }
         };
 
         Ok(Self {
@@ -589,8 +600,7 @@ impl Child {
             instance_id,
             stdout: stdout_rx,
             stderr: stderr_rx,
-            stdin_tx,
-            stdin_task,
+            stdin_state: Arc::new(tokio::sync::Mutex::new(stdin_state)),
             started_at,
         })
     }
@@ -604,14 +614,33 @@ impl Child {
 
     /// Write a chunk of bytes into the running child's stdin stream.
     pub async fn write_stdin(&self, data: &[u8]) -> Result<(), OpsError> {
-        let mut guard = self.stdin_tx.lock().await;
-        let Some(tx) = guard.as_mut() else {
-            return Err(OpsError::StdinClosed);
-        };
+        let mut guard = self.stdin_state.lock().await;
+        match &mut *guard {
+            ChildStdinState::Closed { .. } => return Err(OpsError::StdinClosed),
+            ChildStdinState::Lazy => {
+                let (tx, rx) = rpc_stream::<u8>();
+                let stdin_done = self
+                    .session
+                    .call("system.programs.child.stdin", self.remote_child.stdin(rx))
+                    .await?;
+                let done_task = tokio::spawn(async move {
+                    let _ = stdin_done.await;
+                });
+                *guard = ChildStdinState::Open {
+                    writer: tx,
+                    done_task,
+                };
+            }
+            ChildStdinState::Open { .. } => {}
+        }
         if data.is_empty() {
             return Ok(());
         }
-        tx.send_batch(data.to_vec())
+        let ChildStdinState::Open { writer, .. } = &mut *guard else {
+            return Err(OpsError::StdinClosed);
+        };
+        writer
+            .send_batch(data.to_vec())
             .await
             .map_err(|source| OpsError::Rpc {
                 operation: "system.programs.child.stdin",
@@ -621,9 +650,33 @@ impl Child {
 
     /// Close the child's stdin stream and deliver EOF.
     pub async fn close_stdin(&self) -> Result<(), OpsError> {
-        let tx = self.stdin_tx.lock().await.take();
-        if let Some(tx) = tx {
-            let _ = tx.close().await;
+        let mut guard = self.stdin_state.lock().await;
+        let prev = std::mem::replace(&mut *guard, ChildStdinState::Closed { done_task: None });
+        match prev {
+            ChildStdinState::Lazy => {
+                let stdin_done = self
+                    .session
+                    .call(
+                        "system.programs.child.stdin",
+                        self.remote_child.stdin(StreamReader::empty()),
+                    )
+                    .await?;
+                let done_task = tokio::spawn(async move {
+                    let _ = stdin_done.await;
+                });
+                *guard = ChildStdinState::Closed {
+                    done_task: Some(done_task),
+                };
+            }
+            ChildStdinState::Open { writer, done_task } => {
+                let _ = writer.close().await;
+                *guard = ChildStdinState::Closed {
+                    done_task: Some(done_task),
+                };
+            }
+            ChildStdinState::Closed { done_task } => {
+                *guard = ChildStdinState::Closed { done_task };
+            }
         }
         Ok(())
     }
@@ -659,14 +712,18 @@ impl Child {
     }
 
     /// Await completion of the remote execution and return its [`ExecResult`].
-    pub async fn wait(mut self) -> Result<ExecResult, OpsError> {
+    pub async fn wait(self) -> Result<ExecResult, OpsError> {
         let _ = self.close_stdin().await;
         let status = self
             .session
             .call("system.programs.child.wait", self.remote_child.wait())
             .await?
             .map_err(OpsError::from)?;
-        if let Some(task) = self.stdin_task.take() {
+        let done_task = match &mut *self.stdin_state.lock().await {
+            ChildStdinState::Closed { done_task } => done_task.take(),
+            ChildStdinState::Lazy | ChildStdinState::Open { .. } => None,
+        };
+        if let Some(task) = done_task {
             let _ = task.await;
         }
         self.instance_id
