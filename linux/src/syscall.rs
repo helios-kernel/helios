@@ -44,6 +44,7 @@ pub use fs::{
 };
 pub use icmp::{IPPROTO_ICMP, IPPROTO_ICMPV6, IcmpDatagram};
 pub use io::Clock;
+pub use memory::{FileVmaLookup, VmaBacking};
 pub use netlink::{AF_NETLINK, NETLINK_ROUTE};
 pub use packet::AF_PACKET;
 pub use process::{
@@ -154,6 +155,25 @@ pub trait UserMemory {
     fn is_page_shared(&self, _address: u64) -> bool {
         false
     }
+    /// Reads mapped bytes regardless of user `PageFlags::READ` permission
+    /// (e.g. after `mprotect(PROT_NONE)`), defaulting to [`Self::read`].
+    fn read_unrestricted(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+        self.read(address, output)
+    }
+    /// Collects dirty `(file_offset, bytes)` runs from a file-backed
+    /// `MAP_SHARED` object over `[file_offset, file_offset + valid_len)`.
+    /// Returns `None` when the backing memory does not track shared objects.
+    fn collect_shared_dirty(
+        &self,
+        _object_id: u64,
+        _file_offset: u64,
+        _valid_len: u64,
+    ) -> Option<Vec<(u64, Vec<u8>)>> {
+        None
+    }
+    /// Updates the clean baseline of shared object `object_id` after `bytes`
+    /// at `file_offset` have been written back to the backing file.
+    fn mark_shared_clean(&self, _object_id: u64, _file_offset: u64, _bytes: &[u8]) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -218,6 +238,118 @@ pub trait VirtualMemory: UserMemory {
     /// exhaustion.
     fn populate(&mut self, address: u64, bytes: &[u8]) -> Result<(), MapError> {
         self.write(address, bytes).map_err(|_| MapError::Address)
+    }
+
+    /// Creates a fresh anonymous shared memory object and returns its
+    /// process-local ID (`0` when unsupported by a lightweight test mock).
+    fn create_shared_anonymous(&mut self) -> u64 {
+        0
+    }
+
+    /// Acquires or creates the container-wide shared memory object for a
+    /// regular file identified by `(dev, ino)` (`0` when unsupported).
+    fn acquire_shared_file(&mut self, _dev: u64, _ino: u64) -> u64 {
+        0
+    }
+
+    /// Populates `page_index` inside shared object `object_id` with initial
+    /// file `bytes` if absent, preserving any existing resident frame.
+    fn load_shared_page(
+        &mut self,
+        _object_id: u64,
+        _page_index: u64,
+        _bytes: &[u8],
+    ) -> Result<(), MapError> {
+        Ok(())
+    }
+
+    /// Releases an unused temporary shared object (e.g. when staging fails).
+    fn release_shared_object(&mut self, _object_id: u64) {}
+
+    /// Maps `[address, address + length)` backed by shared object `object_id`
+    /// starting at `object_offset`, attaching resident pages covering
+    /// `attach_len` bytes.
+    fn map_shared_at(
+        &mut self,
+        address: u64,
+        length: u64,
+        access: PageFlags,
+        _object_id: u64,
+        _object_offset: u64,
+        _attach_len: u64,
+    ) -> Result<(), MapError> {
+        self.map_at(address, length, access)
+    }
+
+    /// Same as [`Self::map_shared_at`] at the first free range at or above `hint`.
+    fn map_shared_anywhere(
+        &mut self,
+        hint: u64,
+        length: u64,
+        access: PageFlags,
+        _object_id: u64,
+        _object_offset: u64,
+        _attach_len: u64,
+    ) -> Result<u64, MapError> {
+        self.map_anywhere(hint, length, access)
+    }
+
+    /// Maps a file-backed `MAP_PRIVATE` range at `address` and transfers any
+    /// staged frames from `stage_id` (consuming `stage_id`), leaving pages
+    /// beyond `staged_len` uncommitted so beyond-EOF touches raise `SIGBUS`.
+    fn map_private_file_at(
+        &mut self,
+        address: u64,
+        length: u64,
+        access: PageFlags,
+        _stage_id: u64,
+        _staged_len: u64,
+    ) -> Result<(), MapError> {
+        self.map_at(address, length, access)
+    }
+
+    /// Same as [`Self::map_private_file_at`] at the first free range at or above `hint`.
+    fn map_private_file_anywhere(
+        &mut self,
+        hint: u64,
+        length: u64,
+        access: PageFlags,
+        _stage_id: u64,
+        _staged_len: u64,
+    ) -> Result<u64, MapError> {
+        self.map_anywhere(hint, length, access)
+    }
+
+    /// Applies a `write(2)` / `pwrite(2)` update to shared object `object_id`
+    /// (updating live shared frames and clean baselines). Returns `true` when
+    /// handled through the shared object.
+    fn apply_shared_file_write(
+        &mut self,
+        _object_id: u64,
+        _file_offset: u64,
+        _bytes: &[u8],
+    ) -> bool {
+        false
+    }
+
+    /// Notifies the address space that `[start, end)` was unmapped so shared
+    /// VMA metadata stays synchronized.
+    fn unmap_shared_vma(&mut self, _start: u64, _end: u64) {}
+
+    /// Notifies the address space that `[from, from + old_len)` was remapped
+    /// to `[to, to + new_len)` so shared VMA metadata stays synchronized.
+    fn remap_shared_vma(&mut self, _from: u64, _old_len: u64, _to: u64, _new_len: u64) {}
+
+    /// Attaches resident pages from `object_id` covering `[address, address + attach_len)`
+    /// starting at `object_offset` (used when `mremap` grows a `MAP_SHARED` mapping).
+    fn attach_shared_tail(
+        &mut self,
+        _address: u64,
+        _object_id: u64,
+        _object_offset: u64,
+        _attach_len: u64,
+    ) -> Result<(), MapError> {
+        Ok(())
     }
 }
 
@@ -683,6 +815,32 @@ impl<R: Resources> Process<R> {
             memory,
             sigreturn_trampoline,
         )
+    }
+
+    /// Delivers a synchronous `SIGBUS` (`BUS_ADRERR`) fault with `si_addr =
+    /// fault_address` (e.g. accessing a page beyond a mapped file's end).
+    pub fn deliver_bus_fault<C: UserContext, M: UserMemory>(
+        &self,
+        fault_address: u64,
+        context: &mut C,
+        memory: &mut M,
+        sigreturn_trampoline: u64,
+    ) -> SignalDelivery {
+        signal::deliver_bus_fault_signal(
+            self.shared.abi,
+            &self.signals,
+            fault_address,
+            context,
+            memory,
+            sigreturn_trampoline,
+        )
+    }
+
+    /// Looks up the tracked file or shared-anonymous VMA covering `address`,
+    /// used on demand page faults (`NativeError::BackingFault`) to check file
+    /// EOF (`SIGBUS`) or load/attach the backing page.
+    pub fn lookup_vma(&self, address: u64) -> Option<VmaBacking<R::File>> {
+        memory::lookup_vma(self, address)
     }
 
     /// Restores user registers, extended state, signal mask, and alternate
@@ -1519,8 +1677,7 @@ pub async fn dispatch<
             SyscallOutcome::Return(memory::mremap(process, abi, arguments, memory, output).await)
         }
         Operation::Madvise => {
-            let _mm = process.shared.program_break.lock();
-            SyscallOutcome::Return(memory::madvise(arguments, memory))
+            SyscallOutcome::Return(memory::madvise(process, arguments, memory, output).await)
         }
         Operation::Brk => SyscallOutcome::Return(process.shared.program_break.lock().set(
             abi,
