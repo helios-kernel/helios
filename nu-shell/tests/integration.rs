@@ -885,22 +885,21 @@ fn save_unknown_extension_stderr_redirection_do_env_tilde_and_cancellation() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap();
-        for rel in ["tools/cpu-lifecycle/guest.nu"] {
-            let source = std::fs::read_to_string(root.join(rel))
-                .unwrap_or_else(|e| panic!("failed to read {rel}: {e}"));
-            let (engine_state, _) = helios_nu::create_helios_context();
-            let mut working_set = nu_protocol::engine::StateWorkingSet::new(&engine_state);
-            let _ = nu_parser::parse(&mut working_set, Some(rel), source.as_bytes(), false);
-            assert!(
-                working_set.parse_errors.is_empty(),
-                "{rel} parse errors: {:?}",
-                working_set.parse_errors
-            );
-            assert!(
-                working_set.compile_errors.is_empty(),
-                "{rel} compile errors: {:?}",
-                working_set.compile_errors
-            );
-        }
+        let rel = "tools/cpu-lifecycle/guest.nu";
+        let source = std::fs::read_to_string(root.join(rel))
+            .unwrap_or_else(|e| panic!("failed to read {rel}: {e}"));
+        let (engine_state, _) = helios_nu::create_helios_context();
+        let mut working_set = nu_protocol::engine::StateWorkingSet::new(&engine_state);
+        let _ = nu_parser::parse(&mut working_set, Some(rel), source.as_bytes(), false);
+        assert!(
+            working_set.parse_errors.is_empty(),
+            "{rel} parse errors: {:?}",
+            working_set.parse_errors
+        );
+        assert!(
+            working_set.compile_errors.is_empty(),
+            "{rel} compile errors: {:?}",
+            working_set.compile_errors
+        );
     });
 }
