@@ -30,6 +30,16 @@ pub enum SubvolumeError {
         path: PathBuf,
         detail: String,
     },
+    /// Kernel returned a malformed subvolume UUID (expected 16 bytes).
+    #[error(
+        "malformed {field} for subvolume `{path}` during `{operation}`: expected 16 bytes, got {actual_len}"
+    )]
+    MalformedUuid {
+        operation: &'static str,
+        path: PathBuf,
+        field: &'static str,
+        actual_len: usize,
+    },
 }
 
 /// Top-level error returned by OCI distribution, unpacking, storage, and VM rootfs helpers.
@@ -87,6 +97,12 @@ pub enum OciError {
     },
     #[error("failed to unpack tar layer `{digest}`: {detail}")]
     Tar { digest: String, detail: String },
+    #[error("layer `{digest}` exceeds {kind} limit ({limit})")]
+    LayerTooLarge {
+        digest: String,
+        kind: &'static str,
+        limit: u64,
+    },
     #[error("layer `{digest}` contains unsafe path `{path}`: {reason}")]
     UnsafePath {
         digest: String,

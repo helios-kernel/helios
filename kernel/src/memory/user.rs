@@ -731,6 +731,145 @@ impl UserMemoryPool {
         }
     }
 
+    /// Drains every processor's frame-slab cache on every node back into
+    /// its owning buddy pool.
+    ///
+    /// Calling this while the machine is frozen (`FrozenMachine`) ensures
+    /// cached free frames are marked free in each [`FramePool`] occupancy
+    /// bitmap and are omitted from a hibernate snapshot.
+    pub fn drain_all_frame_slabs(&self) {
+        for (index, pool) in self.nodes.iter().enumerate() {
+            let Some(pool) = pool.as_ref() else {
+                continue;
+            };
+            let node = NodeId::new(index);
+            pool.heap.with(|heap| {
+                self.frame_slab.drain(node, |ptr| {
+                    // SAFETY: every cached frame on `node`'s frame slab was
+                    // allocated as a single `PhysFrame::SIZE` block from
+                    // `node`'s buddy and is exclusively owned by this drain.
+                    unsafe { heap.deallocate(ptr, PhysFrame::SIZE) };
+                });
+            });
+        }
+    }
+
+    /// Enumerates every allocated direct-map byte range `[start, end)`
+    /// across all NUMA node pools (including buddy metadata, live user
+    /// frames, per-processor `NodeArenas`, and lent chunks), after
+    /// draining all per-processor frame slabs and subtracting every range
+    /// in `excluded_runs` (such as balloon-inflated runs and pre-freeze
+    /// hibernate reservation blocks).
+    ///
+    /// Intended to be called while the machine is frozen so no concurrent
+    /// allocation or free races with the scan.
+    pub fn allocated_ranges(&self, excluded_runs: &[PhysFrameRange]) -> Vec<Range<usize>> {
+        self.drain_all_frame_slabs();
+        let mut ranges = Vec::new();
+        for pool in self.nodes.iter().filter_map(|node| node.as_ref()) {
+            let mut cursor = 0_usize;
+            loop {
+                let mut batch = ArrayVec::<Range<usize>, 128>::new();
+                let more = pool
+                    .heap
+                    .with(|heap| heap.scan_allocated_runs(&mut cursor, &mut batch));
+                ranges.extend(batch);
+                if !more {
+                    break;
+                }
+            }
+        }
+        if excluded_runs.is_empty() || ranges.is_empty() {
+            return ranges;
+        }
+        let mut exclusions: Vec<Range<usize>> = excluded_runs
+            .iter()
+            .filter(|run| !run.is_empty())
+            .map(|run| {
+                let start = run.start.phys_addr();
+                start..start + run.byte_size()
+            })
+            .collect();
+        exclusions.sort_unstable_by_key(|range| range.start);
+        subtract_sorted_ranges(ranges, &exclusions)
+    }
+
+    /// Reserves `target_bytes` (rounded up to whole frames) of free user
+    /// memory before freezing the machine so a hibernate snapshot can write
+    /// its compressed image without allocating during the freeze.
+    ///
+    /// Fails with [`ProgramOutOfMemory`] (releasing all partially acquired
+    /// blocks on drop) if the pool cannot provide `target_bytes`.
+    pub fn reserve_hibernate_frames(
+        &self,
+        target_bytes: usize,
+    ) -> Result<HibernateReservation<'_>, ProgramOutOfMemory> {
+        let wanted = target_bytes.next_multiple_of(PhysFrame::SIZE);
+        let mut reservation = HibernateReservation {
+            pool: self,
+            blocks: Vec::new(),
+            total_bytes: 0,
+        };
+        let processor = current_processor();
+        let mut remaining = wanted;
+        // Try buddy chunks up to 2 MiB first, halving down to single 4 KiB
+        // frames so fragmented pools still yield every free frame.
+        let mut block_bytes =
+            (2 * 1024 * 1024).min(previous_power_of_two(remaining).max(PhysFrame::SIZE));
+        while remaining > 0 {
+            block_bytes = block_bytes.min(previous_power_of_two(remaining).max(PhysFrame::SIZE));
+            let layout = Layout::from_size_align(block_bytes, PhysFrame::SIZE)
+                .expect("hibernate reservation layout is valid");
+            match self.allocate_raw(layout, processor) {
+                Ok((ptr, size, _node)) => {
+                    reservation.blocks.push((ptr, size));
+                    reservation.total_bytes += size;
+                    remaining = remaining.saturating_sub(size);
+                }
+                Err(_) if block_bytes > PhysFrame::SIZE => {
+                    block_bytes /= 2;
+                }
+                Err(oom) => {
+                    // `reservation` drops here and returns all acquired blocks.
+                    return Err(oom);
+                }
+            }
+        }
+        Ok(reservation)
+    }
+
+    /// Reserves up to `max_bytes` (rounded up to whole frames) of free user
+    /// memory, stopping early if the pool runs dry.
+    pub fn reserve_hibernate_frames_up_to(&self, max_bytes: usize) -> HibernateReservation<'_> {
+        let wanted = max_bytes.next_multiple_of(PhysFrame::SIZE);
+        let mut reservation = HibernateReservation {
+            pool: self,
+            blocks: Vec::new(),
+            total_bytes: 0,
+        };
+        let processor = current_processor();
+        let mut remaining = wanted;
+        let mut block_bytes =
+            (2 * 1024 * 1024).min(previous_power_of_two(remaining).max(PhysFrame::SIZE));
+        while remaining > 0 {
+            block_bytes = block_bytes.min(previous_power_of_two(remaining).max(PhysFrame::SIZE));
+            let layout = Layout::from_size_align(block_bytes, PhysFrame::SIZE)
+                .expect("hibernate reservation layout is valid");
+            match self.allocate_raw(layout, processor) {
+                Ok((ptr, size, _node)) => {
+                    reservation.blocks.push((ptr, size));
+                    reservation.total_bytes += size;
+                    remaining = remaining.saturating_sub(size);
+                }
+                Err(_) if block_bytes > PhysFrame::SIZE => {
+                    block_bytes /= 2;
+                }
+                Err(_) => break,
+            }
+        }
+        reservation
+    }
+
     /// Returns a byte allocation to the node it lies on. A single frame
     /// goes onto `processor`'s list for that node; anything larger goes
     /// back to the node's buddy.
@@ -756,6 +895,84 @@ impl UserMemoryPool {
         });
         self.note_returned();
     }
+}
+
+/// Free user-memory blocks reserved ahead of freezing the machine to hold
+/// a compressed hibernate image in RAM.
+///
+/// Every block is returned to its owning [`UserMemoryPool`] automatically
+/// when this reservation drops (on error, thaw, or completion).
+pub struct HibernateReservation<'a> {
+    pool: &'a UserMemoryPool,
+    blocks: Vec<(NonNull<u8>, usize)>,
+    total_bytes: usize,
+}
+
+impl HibernateReservation<'_> {
+    /// Total reserved capacity across all backing blocks, in bytes.
+    pub fn capacity_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    /// Reserved `(direct_map_ptr, byte_len)` backing blocks.
+    pub fn blocks(&self) -> &[(NonNull<u8>, usize)] {
+        &self.blocks
+    }
+
+    /// Direct-map [`PhysFrameRange`] list covering every reserved block, so
+    /// the snapshot inventory can exclude the destination buffer itself.
+    pub fn frame_ranges(&self) -> Vec<PhysFrameRange> {
+        self.blocks
+            .iter()
+            .map(|&(ptr, size)| PhysFrameRange::from_phys_addr(ptr.as_ptr() as usize, size))
+            .collect()
+    }
+}
+
+impl Drop for HibernateReservation<'_> {
+    fn drop(&mut self) {
+        let processor = current_processor();
+        for (ptr, size) in self.blocks.drain(..) {
+            let layout = Layout::from_size_align(size, PhysFrame::SIZE)
+                .expect("reserved block size is a valid frame layout");
+            self.pool.deallocate_bytes_on(processor, ptr, layout);
+        }
+    }
+}
+
+/// Subtracts sorted `exclusions` from `ranges`, returning sorted disjoint
+/// remaining ranges.
+fn subtract_sorted_ranges(
+    mut ranges: Vec<Range<usize>>,
+    exclusions: &[Range<usize>],
+) -> Vec<Range<usize>> {
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut out = Vec::with_capacity(ranges.len());
+    let mut ex_idx = 0_usize;
+    for range in ranges {
+        let mut cursor = range.start;
+        while ex_idx < exclusions.len() && exclusions[ex_idx].end <= cursor {
+            ex_idx += 1;
+        }
+        let mut scan = ex_idx;
+        while scan < exclusions.len() && exclusions[scan].start < range.end {
+            let ex = &exclusions[scan];
+            if ex.start > cursor {
+                out.push(cursor..ex.start);
+            }
+            if ex.end > cursor {
+                cursor = ex.end;
+            }
+            if cursor >= range.end {
+                break;
+            }
+            scan += 1;
+        }
+        if cursor < range.end {
+            out.push(cursor..range.end);
+        }
+    }
+    out
 }
 
 /// The user memory pool as an arena's [`ChunkSource`]: a chunk is one buddy

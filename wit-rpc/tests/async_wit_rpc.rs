@@ -1836,3 +1836,293 @@ fn resource_take_restores_slot_on_extra_arc_and_writer_closed_does_not_block_is_
         .await;
     });
 }
+
+#[test]
+fn immediate_client_drop_after_borrow_rpc_never_races_resource_borrowed() {
+    block_on(async {
+        let ((a_read, a_write), (b_read, b_write)) = duplex_pipe(32);
+        let endpoint_a = Endpoint::new(a_read, a_write, ());
+        let handle_a = endpoint_a.handle();
+
+        let telemetry = Arc::new(LabTelemetry::default());
+        let (service, bg_rx) = LabService::new("borrow-race", Arc::clone(&telemetry));
+        let endpoint_b = Endpoint::new(b_read, b_write, lab::Server::new(service));
+        let handle_b = endpoint_b.handle();
+
+        let drive_server = async {
+            let res = endpoint_b.drive().await;
+            assert!(
+                res.is_ok(),
+                "server mux must never abort with WireError::ResourceBorrowed: {res:?}"
+            );
+        };
+
+        let check = async {
+            for i in 0..100_i64 {
+                let acc = Accumulator::new(&handle_a, i)
+                    .await
+                    .expect("create accumulator");
+                let sum = acc.add(5).await.expect("borrow method add");
+                assert_eq!(sum, i + 5);
+                // Immediately drop the client resource handle upon return so
+                // `Frame::ResourceDrop` races straight behind the response.
+                drop(acc);
+            }
+            // Confirm the connection is still healthy after 100 borrow+drop cycles.
+            let final_acc = Accumulator::new(&handle_a, 999)
+                .await
+                .expect("connection must remain healthy");
+            assert_eq!(final_acc.snapshot().await.expect("snapshot"), 999);
+            drop(final_acc);
+            // Wait until all 101 server accumulators are dropped cleanly.
+            while telemetry.live_accumulators.load(Ordering::Acquire) > 0 {
+                let listener = telemetry.resource_dropped.listen();
+                if telemetry.live_accumulators.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                listener.await;
+            }
+            handle_a.close();
+            handle_b.close();
+        };
+
+        let ((), ((), _)) = zip(
+            check,
+            or(
+                zip(drive_server, async {
+                    let _ = endpoint_a.drive().await;
+                }),
+                async {
+                    pump_bg_tasks(bg_rx).await;
+                    ((), ())
+                },
+            ),
+        )
+        .await;
+    });
+}
+
+#[test]
+fn cancelled_encode_server_response_rolls_back_own_handles() {
+    use helios_wit_rpc::{Dispatcher, ResourceEntry, ResourceSlotAccess, ServerInvocation};
+
+    struct TrackedResource {
+        live: Arc<AtomicUsize>,
+    }
+    impl Drop for TrackedResource {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    enum TrackedEntry {
+        Tracked(Arc<TrackedResource>),
+    }
+    impl ResourceEntry for TrackedEntry {
+        fn kind_name(&self) -> &'static str {
+            "tracked"
+        }
+    }
+    struct TrackedMarker;
+    impl ResourceSlotAccess<TrackedMarker, TrackedResource> for TrackedEntry {
+        fn into_entry(arc: Arc<TrackedResource>) -> Self {
+            Self::Tracked(arc)
+        }
+        fn borrow_entry(&self) -> Option<&Arc<TrackedResource>> {
+            let Self::Tracked(arc) = self;
+            Some(arc)
+        }
+        fn take_entry(self) -> Result<Arc<TrackedResource>, Self> {
+            let Self::Tracked(arc) = self;
+            Ok(arc)
+        }
+    }
+
+    struct OwnTracked(TrackedResource);
+    impl helios_wit_rpc::RpcEncode<TrackedEntry> for OwnTracked {
+        fn rpc_encode(
+            self,
+            enc: &mut helios_wit_rpc::Encoder<'_, TrackedEntry>,
+        ) -> Result<(), WireError> {
+            let handle = enc.insert_resource(TrackedEntry::into_entry(Arc::new(self.0)))?;
+            enc.write_u32(handle);
+            Ok(())
+        }
+    }
+
+    /// Dispatcher that exports an `own<TrackedResource>` alongside a large
+    /// payload whose transmission parks on a full pipe so caller cancellation
+    /// drops `encode_response` mid-`.await`.
+    struct RollbackDispatcher {
+        live: Arc<AtomicUsize>,
+        encoding_started: Arc<Event>,
+        table_len_after_cancel: Arc<AtomicUsize>,
+        checked_after_cancel: Arc<Event>,
+    }
+
+    impl Dispatcher for RollbackDispatcher {
+        type Resource = TrackedEntry;
+
+        fn supports(&self, instance: &str, func: &str) -> bool {
+            instance == "test:rollback" && matches!(func, "export-large" | "probe")
+        }
+
+        async fn dispatch<'a>(
+            &'a self,
+            ctx: ServerInvocation<'a, Self::Resource>,
+            _instance: &'a str,
+            func: &'a str,
+        ) -> Result<(), WireError> {
+            ctx.decode_request::<()>().await?;
+            if func == "probe" {
+                self.table_len_after_cancel
+                    .store(ctx.resources().len().await, Ordering::Release);
+                self.checked_after_cancel.notify(usize::MAX);
+                return ctx.encode_response(()).await;
+            }
+            self.live.fetch_add(1, Ordering::AcqRel);
+            self.encoding_started.notify(usize::MAX);
+            // Multi-chunk response (>128 KiB) parks `send_root_response().await`
+            // on a 1-slot duplex pipe while the client cancels the call.
+            let big = vec![0xab_u8; 256 * 1024];
+            ctx.encode_response((
+                OwnTracked(TrackedResource {
+                    live: Arc::clone(&self.live),
+                }),
+                big,
+            ))
+            .await
+        }
+    }
+
+    block_on(async {
+        // Use a 1-slot pipe with a raw peer that stops draining response chunks
+        // after the first chunk so the server's `send_root_response().await` is
+        // deterministically parked mid-send when `Frame::Close { path: [] }`
+        // cancels the invocation.
+        let ((mut raw_read, mut raw_write), (s_r, s_w)) = duplex_pipe(1);
+        let live = Arc::new(AtomicUsize::new(0));
+        let encoding_started = Arc::new(Event::new());
+        let table_len_after_cancel = Arc::new(AtomicUsize::new(usize::MAX));
+        let checked_after_cancel = Arc::new(Event::new());
+
+        let server_ep = Endpoint::new(
+            s_r,
+            s_w,
+            RollbackDispatcher {
+                live: Arc::clone(&live),
+                encoding_started: Arc::clone(&encoding_started),
+                table_len_after_cancel: Arc::clone(&table_len_after_cancel),
+                checked_after_cancel: Arc::clone(&checked_after_cancel),
+            },
+        );
+        let server_handle = server_ep.handle();
+
+        let raw_peer = async {
+            let started = encoding_started.listen();
+            write_frame(
+                &mut raw_write,
+                &Frame::Open {
+                    invocation: 1,
+                    instance: "test:rollback".to_owned(),
+                    func: "export-large".to_owned(),
+                },
+            )
+            .await
+            .expect("open export-large");
+            assert_eq!(
+                read_frame(&mut raw_read).await.expect("accept 1"),
+                Some(Frame::Accept { invocation: 1 })
+            );
+            write_frame(
+                &mut raw_write,
+                &Frame::Close {
+                    invocation: 1,
+                    path: vec![0],
+                },
+            )
+            .await
+            .expect("close req 1");
+            started.await;
+
+            // Read ONLY the first response Data chunk while leaving subsequent
+            // chunks unread so `send_root_response().await` parks on pipe
+            // backpressure with the `own<R>` handle already inserted.
+            match read_frame(&mut raw_read).await.expect("first chunk") {
+                Some(Frame::Data {
+                    invocation: 1,
+                    path,
+                    ..
+                }) if path == vec![1] => {}
+                other => panic!("expected first response chunk for inv 1, got {other:?}"),
+            }
+            for _ in 0..4 {
+                yield_now().await;
+            }
+            assert_eq!(
+                live.load(Ordering::Acquire),
+                1,
+                "own<R> resource must be live in table while send_root_response is parked"
+            );
+
+            // Cancel invocation 1 mid-send!
+            write_frame(
+                &mut raw_write,
+                &Frame::Close {
+                    invocation: 1,
+                    path: Vec::new(),
+                },
+            )
+            .await
+            .expect("cancel inv 1");
+
+            // Open invocation 2 (`probe`) on the SAME live connection and drain
+            // any already-in-flight frame from inv 1 until inv 2 completes.
+            write_frame(
+                &mut raw_write,
+                &Frame::Open {
+                    invocation: 2,
+                    instance: "test:rollback".to_owned(),
+                    func: "probe".to_owned(),
+                },
+            )
+            .await
+            .expect("open probe");
+            write_frame(
+                &mut raw_write,
+                &Frame::Close {
+                    invocation: 2,
+                    path: vec![0],
+                },
+            )
+            .await
+            .expect("close req 2");
+
+            loop {
+                match read_frame(&mut raw_read).await.expect("drain frame") {
+                    Some(Frame::Close {
+                        invocation: 2,
+                        path,
+                    }) if path == vec![1] => break,
+                    Some(_) => {}
+                    None => panic!("unexpected EOF before probe completed"),
+                }
+            }
+
+            assert_eq!(
+                table_len_after_cancel.load(Ordering::Acquire),
+                0,
+                "cancelled encode_response must roll back newly inserted own<R> handles"
+            );
+            assert_eq!(
+                live.load(Ordering::Acquire),
+                0,
+                "rolled-back own<R> resource must be dropped"
+            );
+            server_handle.close();
+        };
+
+        let ((), server_res) = zip(raw_peer, server_ep.drive()).await;
+        assert!(server_res.is_ok(), "server drive failed: {server_res:?}");
+    });
+}

@@ -1,9 +1,14 @@
 #![cfg(feature = "manifest")]
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use helios_component_manager::{
-    ManifestError, ValidationError, load_tree_from_dir, load_tree_from_map,
+    CapabilityCeiling, ComponentNode, ComponentTopology, Criticality, DirectoryGrantSpec,
+    EscalationAction, FsRights, HardwarePredicates, LifecycleKind, MachineRights, ManifestError,
+    NameCeiling, OciRunnerSpec, OomTier, ProviderSlot, RestartPolicy, RunnerSpec, StartupPolicy,
+    ValidationError, VmRunnerSpec, VmShareSpec, WasmRunnerSpec, WasmSharding, load_tree_from_dir,
+    load_tree_from_map, validate_dynamic_subtree, validate_topology,
 };
 
 fn root_manifest_full() -> String {
@@ -450,4 +455,484 @@ fn loads_default_repository_components_directory_cleanly() {
             .contains(helios_component_manager::MachineRights::IDENTITY),
         "/inspector/worker must never hold machine.identity"
     );
+}
+
+#[test]
+fn rejects_traversal_and_uncovered_paths_for_oci_and_vm_runners() {
+    // 1. Manifest rejects `..` and relative paths in OCI and VM fields.
+    let bad_manifests: &[(&str, &str)] = &[
+        (
+            "oci.store traversal",
+            r#"
+runner = "oci"
+[oci]
+image = "alpine:3.20"
+store = "/var/lib/oci/../secret"
+[capabilities]
+directories = [{ source = "/", guest = "/", rights = ["read", "write", "execute"] }]
+"#,
+        ),
+        (
+            "oci.rootfs relative",
+            r#"
+runner = "oci"
+[oci]
+rootfs = "relative/rootfs"
+[capabilities]
+directories = [{ source = "/", guest = "/", rights = ["read", "write", "execute"] }]
+"#,
+        ),
+        (
+            "vm.kernel traversal",
+            r#"
+runner = "vm"
+[vm]
+kernel = "/boot/../etc/passwd"
+[capabilities]
+machine = ["virtualize"]
+directories = [{ source = "/", guest = "/", rights = ["read", "write", "execute"] }]
+"#,
+        ),
+        (
+            "vm.initramfs traversal",
+            r#"
+runner = "vm"
+[vm]
+kernel = "/boot/Image"
+initramfs = "/boot/../initrd"
+[capabilities]
+machine = ["virtualize"]
+directories = [{ source = "/", guest = "/", rights = ["read", "write", "execute"] }]
+"#,
+        ),
+        (
+            "vm.disk traversal",
+            r#"
+runner = "vm"
+[vm]
+kernel = "/boot/Image"
+disk = "/var/vm/../disk.raw"
+[capabilities]
+machine = ["virtualize"]
+directories = [{ source = "/", guest = "/", rights = ["read", "write", "execute"] }]
+"#,
+        ),
+        (
+            "vm.rootfs_dir relative",
+            r#"
+runner = "vm"
+[vm]
+kernel = "/boot/Image"
+rootfs_dir = "vm/rootfs"
+[capabilities]
+machine = ["virtualize"]
+directories = [{ source = "/", guest = "/", rights = ["read", "write", "execute"] }]
+"#,
+        ),
+        (
+            "vm.share_dirs traversal",
+            r#"
+runner = "vm"
+[vm]
+kernel = "/boot/Image"
+share_dirs = ["work:/srv/work/../../etc"]
+[capabilities]
+machine = ["virtualize"]
+directories = [{ source = "/", guest = "/", rights = ["read", "write", "execute"] }]
+"#,
+        ),
+    ];
+
+    for (label, manifest) in bad_manifests {
+        let err = load_tree_from_map(tree(&[("/", &root_manifest_full()), ("/app", manifest)]))
+            .expect_err(&format!("{label} must be rejected"));
+        assert!(
+            matches!(err, ManifestError::InvalidField { .. }),
+            "{label}: expected InvalidField, got {err:?}"
+        );
+    }
+
+    // 2. Authority enforces directory ceilings for OCI default store, custom store, and VM paths.
+    let ceiling_cases: &[(&str, &str, &str)] = &[
+        (
+            "oci default store missing read",
+            r#"
+runner = "oci"
+[oci]
+image = "alpine:3.20"
+[capabilities]
+directories = [{ source = "/data", guest = "/data", rights = ["read"] }]
+"#,
+            "oci.store",
+        ),
+        (
+            "oci explicit store missing read",
+            r#"
+runner = "oci"
+[oci]
+image = "alpine:3.20"
+store = "/srv/oci"
+[capabilities]
+directories = [{ source = "/var/lib/oci", guest = "/var/lib/oci", rights = ["read"] }]
+"#,
+            "oci.store",
+        ),
+        (
+            "vm kernel missing read",
+            r#"
+runner = "vm"
+[vm]
+kernel = "/boot/Image"
+[capabilities]
+machine = ["virtualize"]
+"#,
+            "vm.kernel",
+        ),
+        (
+            "vm initramfs missing read",
+            r#"
+runner = "vm"
+[vm]
+kernel = "/boot/Image"
+initramfs = "/images/initrd"
+[capabilities]
+machine = ["virtualize"]
+directories = [{ source = "/boot", guest = "/boot", rights = ["read"] }]
+"#,
+            "vm.initramfs",
+        ),
+        (
+            "vm disk requires read+write",
+            r#"
+runner = "vm"
+[vm]
+kernel = "/boot/Image"
+disk = "/vm/disk.raw"
+[capabilities]
+machine = ["virtualize"]
+directories = [
+  { source = "/boot", guest = "/boot", rights = ["read"] },
+  { source = "/vm", guest = "/vm", rights = ["read"] },
+]
+"#,
+            "vm.disk",
+        ),
+        (
+            "vm rootfs_dir requires read+write",
+            r#"
+runner = "vm"
+[vm]
+kernel = "/boot/Image"
+rootfs_dir = "/vm/rootfs"
+[capabilities]
+machine = ["virtualize"]
+directories = [
+  { source = "/boot", guest = "/boot", rights = ["read"] },
+  { source = "/vm", guest = "/vm", rights = ["read"] },
+]
+"#,
+            "vm.rootfs_dir",
+        ),
+        (
+            "vm share_dirs requires read+write",
+            r#"
+runner = "vm"
+[vm]
+kernel = "/boot/Image"
+share_dirs = ["data:/srv/data"]
+[capabilities]
+machine = ["virtualize"]
+directories = [
+  { source = "/boot", guest = "/boot", rights = ["read"] },
+  { source = "/srv/data", guest = "/srv/data", rights = ["read"] },
+]
+"#,
+            "vm.share_dirs",
+        ),
+    ];
+
+    for (label, manifest, expected_dim) in ceiling_cases {
+        let err = load_tree_from_map(tree(&[("/", &root_manifest_full()), ("/app", manifest)]))
+            .expect_err(&format!("{label} must fail directory ceiling validation"));
+        assert!(
+            matches!(
+                err,
+                ManifestError::Validation(ValidationError::CapabilityEscalation { dimension, .. })
+                if dimension == *expected_dim
+            ),
+            "{label}: expected CapabilityEscalation({expected_dim}), got {err:?}"
+        );
+    }
+
+    // 3. OCI rejects elevated oom_tier and named_devices, and accepts valid ceilings.
+    let oci_elevated_oom = r#"
+runner = "oci"
+oom_tier = "plugin"
+[oci]
+image = "alpine:3.20"
+[capabilities]
+directories = [{ source = "/var/lib/oci", guest = "/var/lib/oci", rights = ["read"] }]
+"#;
+    assert!(matches!(
+        load_tree_from_map(tree(&[
+            ("/", &root_manifest_full()),
+            ("/app", oci_elevated_oom)
+        ])),
+        Err(ManifestError::Validation(
+            ValidationError::InvalidRunnerConfig { .. }
+        ))
+    ));
+
+    let oci_named_devices = r#"
+runner = "oci"
+[oci]
+image = "alpine:3.20"
+[capabilities]
+directories = [{ source = "/var/lib/oci", guest = "/var/lib/oci", rights = ["read"] }]
+named_devices = ["pci:00:01.0"]
+"#;
+    assert!(matches!(
+        load_tree_from_map(tree(&[
+            ("/", &root_manifest_full()),
+            ("/app", oci_named_devices)
+        ])),
+        Err(ManifestError::Validation(
+            ValidationError::InvalidRunnerConfig { .. }
+        ))
+    ));
+
+    let valid_vm = r#"
+runner = "vm"
+[vm]
+kernel = "/boot/Image"
+initramfs = "/boot/initrd"
+disk = "/vm/disk.raw"
+rootfs_dir = "/vm/rootfs"
+share_dirs = ["work:/srv/work"]
+[capabilities]
+machine = ["virtualize"]
+directories = [
+  { source = "/boot", guest = "/boot", rights = ["read"] },
+  { source = "/vm", guest = "/vm", rights = ["read", "write"] },
+  { source = "/srv/work", guest = "/srv/work", rights = ["read", "write"] },
+]
+"#;
+    load_tree_from_map(tree(&[("/", &root_manifest_full()), ("/vm", valid_vm)]))
+        .expect("valid VM runner with covered paths must succeed");
+
+    // 4. Statically constructed topologies are also checked for `..` in authority::validate_topology.
+    let mut root_node = make_node("/", None, RunnerSpec::Realm);
+    root_node.children_indices = Cow::Borrowed(&[1]);
+    root_node.oom_tier = OomTier::Protected;
+    root_node.capabilities.directories = Cow::Owned(vec![DirectoryGrantSpec {
+        source: Cow::Borrowed("/"),
+        guest: Cow::Borrowed("/"),
+        rights: FsRights::ALL,
+    }]);
+    root_node.capabilities.machine = MachineRights::VIRTUALIZE;
+
+    let mut static_bad_vm = make_node(
+        "/vm",
+        Some(0),
+        RunnerSpec::Vm(VmRunnerSpec {
+            kernel: Cow::Borrowed("/boot/Image"),
+            initramfs: None,
+            disk: None,
+            memory_mib: 64,
+            cpus: 1,
+            cmdline: None,
+            rootfs_dir: None,
+            share_dirs: Cow::Owned(vec![VmShareSpec {
+                tag: Cow::Borrowed("escape"),
+                host_path: Cow::Borrowed("/srv/../etc"),
+            }]),
+        }),
+    );
+    static_bad_vm.capabilities.machine = MachineRights::VIRTUALIZE;
+    static_bad_vm.capabilities.directories = Cow::Owned(vec![DirectoryGrantSpec {
+        source: Cow::Borrowed("/"),
+        guest: Cow::Borrowed("/"),
+        rights: FsRights::ALL,
+    }]);
+    assert!(matches!(
+        validate_topology(&ComponentTopology {
+            nodes: Cow::Owned(vec![root_node.clone(), static_bad_vm]),
+        }),
+        Err(ValidationError::InvalidRunnerConfig { .. })
+    ));
+
+    let mut static_bad_oci = make_node(
+        "/oci",
+        Some(0),
+        RunnerSpec::Oci(OciRunnerSpec {
+            image: Some(Cow::Borrowed("alpine:3.20")),
+            rootfs: None,
+            store: Some(Cow::Borrowed("/var/lib/oci/../../etc")),
+            hostname: Cow::Borrowed("oci"),
+            uid: 0,
+            gid: 0,
+            entrypoint: Cow::Borrowed(&[]),
+            cmd: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            mounts: Cow::Borrowed(&[]),
+        }),
+    );
+    static_bad_oci.capabilities.directories = Cow::Owned(vec![DirectoryGrantSpec {
+        source: Cow::Borrowed("/"),
+        guest: Cow::Borrowed("/"),
+        rights: FsRights::ALL,
+    }]);
+    assert!(matches!(
+        validate_topology(&ComponentTopology {
+            nodes: Cow::Owned(vec![root_node, static_bad_oci]),
+        }),
+        Err(ValidationError::InvalidRunnerConfig { .. })
+    ));
+}
+
+#[test]
+fn validate_dynamic_subtree_forbids_system_criticality_root_parent_criticality_and_providers() {
+    let mut parent = make_node("/sandbox", Some(0), RunnerSpec::Realm);
+    parent.dynamic_mount = true;
+    parent.oom_tier = OomTier::Plugin;
+    parent.capabilities.directories = Cow::Owned(vec![DirectoryGrantSpec {
+        source: Cow::Borrowed("/"),
+        guest: Cow::Borrowed("/"),
+        rights: FsRights::ALL,
+    }]);
+    parent.capabilities.named_devices = NameCeiling::EMPTY;
+
+    let wasm_spec = || {
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/app"),
+            sharding: WasmSharding::Singleton,
+            provider: None,
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        })
+    };
+
+    // 1. `critical = "system"` denied in dynamic subtree.
+    let mut sys_node = make_node("/sandbox/sys", None, wasm_spec());
+    sys_node.critical = Criticality::System;
+    assert!(matches!(
+        validate_dynamic_subtree(
+            &parent,
+            &ComponentTopology {
+                nodes: Cow::Owned(vec![sys_node]),
+            },
+        ),
+        Err(ValidationError::DynamicCriticalityDenied {
+            setting: "critical = \"system\"",
+            ..
+        })
+    ));
+
+    // 2. `escalation = "reboot"` denied in dynamic subtree.
+    let mut reboot_node = make_node("/sandbox/reboot", None, wasm_spec());
+    reboot_node.escalation = EscalationAction::Reboot;
+    assert!(matches!(
+        validate_dynamic_subtree(
+            &parent,
+            &ComponentTopology {
+                nodes: Cow::Owned(vec![reboot_node]),
+            },
+        ),
+        Err(ValidationError::DynamicCriticalityDenied {
+            setting: "escalation = \"reboot\"",
+            ..
+        })
+    ));
+
+    // 3. `critical = "parent"` denied on dynamic subtree root.
+    let mut root_parent_crit = make_node("/sandbox/app", None, wasm_spec());
+    root_parent_crit.critical = Criticality::Parent;
+    assert!(matches!(
+        validate_dynamic_subtree(
+            &parent,
+            &ComponentTopology {
+                nodes: Cow::Owned(vec![root_parent_crit]),
+            },
+        ),
+        Err(ValidationError::DynamicCriticalityDenied {
+            setting: "critical = \"parent\"",
+            ..
+        })
+    ));
+
+    // 4. `critical = "parent"` ALLOWED on a descendant whose parent is inside the dynamic subtree.
+    let mut dyn_realm = make_node("/sandbox/app", None, RunnerSpec::Realm);
+    dyn_realm.children_indices = Cow::Borrowed(&[1]);
+    let mut dyn_child = make_node("/sandbox/app/worker", Some(0), wasm_spec());
+    dyn_child.critical = Criticality::Parent;
+    validate_dynamic_subtree(
+        &parent,
+        &ComponentTopology {
+            nodes: Cow::Owned(vec![dyn_realm.clone(), dyn_child]),
+        },
+    )
+    .expect("descendant critical=parent inside dynamic realm must be allowed");
+
+    // 5. Kernel provider slots forbidden in dynamic subtree (root or descendant).
+    let provider_child = make_node(
+        "/sandbox/app/http",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/http-client"),
+            sharding: WasmSharding::PerProcessor,
+            provider: Some(ProviderSlot::HttpClient),
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    assert!(matches!(
+        validate_dynamic_subtree(
+            &parent,
+            &ComponentTopology {
+                nodes: Cow::Owned(vec![dyn_realm, provider_child]),
+            },
+        ),
+        Err(ValidationError::DynamicProviderDenied {
+            slot: "http-client",
+            ..
+        })
+    ));
+}
+
+fn make_node(
+    moniker: &'static str,
+    parent_index: Option<usize>,
+    runner: RunnerSpec,
+) -> ComponentNode {
+    ComponentNode {
+        moniker: Cow::Borrowed(moniker),
+        instance_name: Cow::Borrowed(moniker.trim_start_matches('/')),
+        parent_index,
+        children_indices: Cow::Borrowed(&[]),
+        runner,
+        startup: StartupPolicy::Lazy,
+        lifecycle: LifecycleKind::Service,
+        requires: HardwarePredicates::NONE,
+        after: Cow::Borrowed(&[]),
+        mounts: Cow::Borrowed(&[]),
+        restart: RestartPolicy::Never,
+        restart_backoff_ms: 100,
+        restart_backoff_max_ms: 500,
+        burst_limit: 3,
+        burst_window_ms: 10_000,
+        stop_timeout_ms: 200,
+        critical: Criticality::None,
+        escalation: EscalationAction::Halt,
+        oom_tier: OomTier::User,
+        dynamic_mount: false,
+        capabilities: CapabilityCeiling::EMPTY,
+        exposes: Cow::Borrowed(&[]),
+        routes: Cow::Borrowed(&[]),
+        sockets: Cow::Borrowed(&[]),
+    }
 }

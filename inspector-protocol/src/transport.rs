@@ -10,15 +10,16 @@ use async_channel::{Receiver, Sender};
 use async_lock::Mutex;
 use bytes::Bytes;
 use event_listener::{Event, EventListener};
-use futures_core::Stream;
 use futures_io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite};
 #[cfg(feature = "host")]
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::error::{TransportError, WireError};
+#[cfg(any(not(feature = "host"), test))]
+use crate::wire::read_frame;
 #[cfg(feature = "host")]
 use crate::wire::read_frame_with_echo;
-use crate::wire::{Frame, read_frame, write_frame};
+use crate::wire::{Frame, write_frame};
 
 /// Transport-level result with structured error provenance.
 ///
@@ -28,8 +29,6 @@ use crate::wire::{Frame, read_frame, write_frame};
 pub type Result<T> = core::result::Result<T, TransportError>;
 
 type IoFuture<T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'static>>;
-type ServeFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
-type InvocationAccept<R, W> = Result<((), Outgoing<R, W>, Incoming<R, W>)>;
 pub(crate) const RAW_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Most undelivered inbound payload bytes one invocation holds before the
@@ -168,15 +167,10 @@ impl InboundBuffers {
     }
 }
 
-enum InvocationOwner<R, W> {
-    Client(Weak<ClientInner<R, W>>),
-    Server(Weak<ServerInner<R, W>>),
-}
-
 /// One call in flight, and the only place its answer is ever filed.
 pub struct Invocation<R, W> {
     id: u32,
-    owner: InvocationOwner<R, W>,
+    owner: Weak<ClientInner<R, W>>,
     pub(crate) inbound: Mutex<InboundBuffers>,
     outbound_credits: Mutex<HashMap<Vec<usize>, u32>>,
     accepted: AtomicBool,
@@ -233,36 +227,6 @@ impl<R, W> Drop for ClientDriverGuard<R, W> {
     }
 }
 
-#[derive(Clone)]
-pub struct Server<R, W> {
-    inner: Arc<ServerInner<R, W>>,
-}
-
-type MethodKey = (String, String);
-type DispatchMap<R, W> = HashMap<MethodKey, Registration<R, W>>;
-
-struct ServerInner<R, W> {
-    read: Arc<Mutex<R>>,
-    write: Arc<Mutex<W>>,
-    dispatch: Arc<Mutex<DispatchMap<R, W>>>,
-    register_tx: Sender<(MethodKey, Registration<R, W>)>,
-    register_rx: Receiver<(MethodKey, Registration<R, W>)>,
-    active: Mutex<HashMap<u32, Weak<Invocation<R, W>>>>,
-    closed: AtomicBool,
-}
-
-struct Registration<R, W> {
-    tx: Sender<InvocationAccept<R, W>>,
-}
-
-impl<R, W> Clone for Registration<R, W> {
-    fn clone(&self) -> Self {
-        Self {
-            tx: self.tx.clone(),
-        }
-    }
-}
-
 enum Reply {
     Accept,
     Reject(String),
@@ -311,12 +275,6 @@ pub struct Outgoing<R, W> {
     pending_write: Option<(usize, IoFuture<()>)>,
     pending_close: Option<IoFuture<()>>,
     closed: bool,
-}
-
-pub struct InvocationStream<R, W> {
-    server: Arc<ServerInner<R, W>>,
-    rx: Pin<Box<Receiver<InvocationAccept<R, W>>>>,
-    pending: Option<ServeFuture>,
 }
 
 enum EitherClientFrame {
@@ -577,68 +535,14 @@ where
     }
 }
 
-impl<R, W> Server<R, W>
-where
-    R: FuturesAsyncRead + Send + Unpin + 'static,
-    W: FuturesAsyncWrite + Send + Unpin + 'static,
-{
-    pub fn new(read: R, write: W) -> Self {
-        let (register_tx, register_rx) = async_channel::unbounded();
-        Self {
-            inner: Arc::new(ServerInner {
-                read: Arc::new(Mutex::new(read)),
-                write: Arc::new(Mutex::new(write)),
-                dispatch: Arc::new(Mutex::new(HashMap::new())),
-                register_tx,
-                register_rx,
-                active: Mutex::new(HashMap::new()),
-                closed: AtomicBool::new(false),
-            }),
-        }
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.inner.closed.load(Ordering::Acquire)
-    }
-
-    pub fn serve(&self, instance: &str, func: &str) -> Result<InvocationStream<R, W>> {
-        let key = (instance.to_owned(), func.to_owned());
-        let (tx, rx) = async_channel::bounded(8);
-        self.inner
-            .register_tx
-            .try_send((key, Registration { tx }))
-            .map_err(|_| TransportError::Closed)?;
-        Ok(InvocationStream {
-            server: self.inner.clone(),
-            rx: Box::pin(rx),
-            pending: None,
-        })
-    }
-}
-
 impl<R, W> Invocation<R, W> {
     async fn new_client(id: u32, inner: &Arc<ClientInner<R, W>>) -> Arc<Self> {
         let invocation = Arc::new(Self {
             id,
-            owner: InvocationOwner::Client(Arc::downgrade(inner)),
+            owner: Arc::downgrade(inner),
             inbound: Mutex::new(InboundBuffers::default()),
             outbound_credits: Mutex::new(HashMap::new()),
             accepted: AtomicBool::new(false),
-            cancelled: AtomicBool::new(false),
-            reply: Mutex::new(None),
-            progress: Progress::new(),
-        });
-        register_invocation(&inner.active, &invocation).await;
-        invocation
-    }
-
-    async fn new_server(id: u32, inner: &Arc<ServerInner<R, W>>) -> Arc<Self> {
-        let invocation = Arc::new(Self {
-            id,
-            owner: InvocationOwner::Server(Arc::downgrade(inner)),
-            inbound: Mutex::new(InboundBuffers::default()),
-            outbound_credits: Mutex::new(HashMap::new()),
-            accepted: AtomicBool::new(true),
             cancelled: AtomicBool::new(false),
             reply: Mutex::new(None),
             progress: Progress::new(),
@@ -708,9 +612,6 @@ impl<R, W> Invocation<R, W> {
     }
 
     async fn mark_closed(&self, path: Vec<usize>) {
-        if path.is_empty() && matches!(self.owner, InvocationOwner::Server(_)) {
-            self.cancelled.store(true, Ordering::Release);
-        }
         {
             let mut inbound = self.inbound.lock().await;
             if inbound.error.is_some() {
@@ -854,48 +755,29 @@ where
 {
     async fn read_until_ready(self: Arc<Self>, path: Vec<usize>) -> io::Result<()> {
         loop {
-            match &self.owner {
-                InvocationOwner::Client(inner) => {
-                    let inv_mark = self.progress.mark();
-                    let Some(inner) = inner.upgrade() else {
-                        return Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "client transport disappeared",
-                        ));
-                    };
-                    let drv_mark = inner.driver_progress.mark();
+            let inv_mark = self.progress.mark();
+            let Some(inner) = self.owner.upgrade() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "client transport disappeared",
+                ));
+            };
+            let drv_mark = inner.driver_progress.mark();
 
-                    if let Some(state) = self.ready_state(&path).await {
-                        return state;
-                    }
-                    if inner.closed.load(Ordering::Acquire) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "client transport closed",
-                        ));
-                    }
-                    futures_lite::future::or(
-                        self.progress.changed(inv_mark),
-                        inner.driver_progress.changed(drv_mark),
-                    )
-                    .await;
-                }
-                InvocationOwner::Server(inner) => {
-                    if let Some(state) = self.ready_state(&path).await {
-                        return state;
-                    }
-                    let inner = inner.upgrade().ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "server transport disappeared")
-                    })?;
-                    if inner.closed.load(Ordering::Acquire) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "server transport closed",
-                        ));
-                    }
-                    pump_server_once(inner).await.map_err(io::Error::other)?;
-                }
+            if let Some(state) = self.ready_state(&path).await {
+                return state;
             }
+            if inner.closed.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "client transport closed",
+                ));
+            }
+            futures_lite::future::or(
+                self.progress.changed(inv_mark),
+                inner.driver_progress.changed(drv_mark),
+            )
+            .await;
         }
     }
 
@@ -914,55 +796,32 @@ where
                     return Ok(());
                 }
             }
-            match &self.owner {
-                InvocationOwner::Client(inner) => {
-                    let Some(inner) = inner.upgrade() else {
-                        return Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "client transport disappeared",
-                        ));
-                    };
-                    let drv_mark = inner.driver_progress.mark();
-                    if inner.closed.load(Ordering::Acquire) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "client transport closed",
-                        ));
-                    }
-                    futures_lite::future::or(
-                        self.progress.changed(inv_mark),
-                        inner.driver_progress.changed(drv_mark),
-                    )
-                    .await;
-                }
-                InvocationOwner::Server(inner) => {
-                    let inner = inner.upgrade().ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "server transport disappeared")
-                    })?;
-                    if inner.closed.load(Ordering::Acquire) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "server transport closed",
-                        ));
-                    }
-                    pump_server_once(inner).await.map_err(io::Error::other)?;
-                }
+            let Some(inner) = self.owner.upgrade() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "client transport disappeared",
+                ));
+            };
+            let drv_mark = inner.driver_progress.mark();
+            if inner.closed.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "client transport closed",
+                ));
             }
+            futures_lite::future::or(
+                self.progress.changed(inv_mark),
+                inner.driver_progress.changed(drv_mark),
+            )
+            .await;
         }
     }
 
     async fn send_frame(&self, frame: Frame) -> io::Result<()> {
-        match &self.owner {
-            InvocationOwner::Client(inner) => {
-                let inner = inner.upgrade().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "client transport disappeared")
-                })?;
-                enqueue_client_frame(&inner, frame).await
-            }
-            InvocationOwner::Server(inner) => {
-                write_owned_frame(&inner.upgrade(), &frame, "server transport disappeared").await
-            }
-        }
+        let inner = self.owner.upgrade().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "client transport disappeared")
+        })?;
+        enqueue_client_frame(&inner, frame).await
     }
 
     async fn write_data(
@@ -1347,48 +1206,6 @@ where
     }
 }
 
-impl<R, W> Stream for InvocationStream<R, W>
-where
-    R: FuturesAsyncRead + Send + Unpin + 'static,
-    W: FuturesAsyncWrite + Send + Unpin + 'static,
-{
-    type Item = Result<((), Outgoing<R, W>, Incoming<R, W>)>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        loop {
-            match this.rx.as_mut().poll_next(cx) {
-                Poll::Ready(Some(item)) => return Poll::Ready(Some(item)),
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => {}
-            }
-
-            if this.server.closed.load(Ordering::Acquire) {
-                return Poll::Ready(None);
-            }
-
-            if this.pending.is_none() {
-                this.pending = Some(Box::pin(pump_server_once(this.server.clone())));
-            }
-
-            let future = this
-                .pending
-                .as_mut()
-                .expect("server pump future must exist");
-            match future.as_mut().poll(cx) {
-                Poll::Ready(Ok(())) => {
-                    this.pending = None;
-                }
-                Poll::Ready(Err(error)) => {
-                    this.pending = None;
-                    return Poll::Ready(Some(Err(error)));
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-}
-
 async fn register_invocation<R, W>(
     active: &Mutex<HashMap<u32, Weak<Invocation<R, W>>>>,
     invocation: &Arc<Invocation<R, W>>,
@@ -1513,178 +1330,6 @@ async fn close_client<R, W>(client: &Arc<ClientInner<R, W>>, reason: &str) {
     client.driver_progress.signal();
 }
 
-async fn pump_server_once<R, W>(server: Arc<ServerInner<R, W>>) -> Result<()>
-where
-    R: FuturesAsyncRead + Send + Unpin + 'static,
-    W: FuturesAsyncWrite + Send + Unpin + 'static,
-{
-    if server.closed.load(Ordering::Acquire) {
-        return Ok(());
-    }
-
-    let handoff = {
-        let mut registrations = server.dispatch.lock().await;
-        while let Ok((key, reg)) = server.register_rx.try_recv() {
-            let previous = registrations.insert(key.clone(), reg);
-            assert!(
-                previous.is_none(),
-                "duplicate handler registration for {}.{}",
-                key.0,
-                key.1
-            );
-        }
-
-        let frame = {
-            let mut io = server.read.lock().await;
-            match read_frame(&mut *io)
-                .await
-                .map_err(|source| TransportError::io("read server transport frame", source))?
-            {
-                Some(frame) => frame,
-                None => {
-                    mark_server_closed(&server, &mut registrations).await;
-                    return Ok(());
-                }
-            }
-        };
-
-        match frame {
-            Frame::Open {
-                invocation,
-                instance,
-                func,
-            } => {
-                let registration = registrations
-                    .get(&(instance.clone(), func.clone()))
-                    .cloned();
-
-                match registration {
-                    Some(registration) => {
-                        {
-                            let mut io = server.write.lock().await;
-                            write_frame(&mut *io, &Frame::Accept { invocation })
-                                .await
-                                .map_err(|source| {
-                                    TransportError::io("accept remote invocation", source)
-                                })?;
-                        }
-
-                        let invocation = Invocation::new_server(invocation, &server).await;
-                        Some((
-                            registration,
-                            Ok((
-                                (),
-                                Outgoing::root(invocation.clone()),
-                                Incoming::root(invocation),
-                            )),
-                            instance,
-                            func,
-                        ))
-                    }
-                    None => {
-                        let mut io = server.write.lock().await;
-                        write_frame(
-                            &mut *io,
-                            &Frame::Reject {
-                                invocation,
-                                message: format!("no handler registered for {instance}.{func}"),
-                            },
-                        )
-                        .await
-                        .map_err(|source| TransportError::io("reject remote invocation", source))?;
-                        None
-                    }
-                }
-            }
-            Frame::Data {
-                invocation,
-                path,
-                payload,
-            } => {
-                if let Some(target) = resolve_invocation(&server.active, invocation).await {
-                    let decoded = decode_path(&path).map_err(|source| {
-                        TransportError::io("decode incoming data path", source)
-                    })?;
-                    target.push_payload(decoded, Bytes::from(payload)).await;
-                }
-                None
-            }
-            Frame::Close { invocation, path } => {
-                if let Some(target) = resolve_invocation(&server.active, invocation).await {
-                    let decoded = decode_path(&path).map_err(|source| {
-                        TransportError::io("decode incoming close path", source)
-                    })?;
-                    target.mark_closed(decoded).await;
-                }
-                None
-            }
-            Frame::Credit {
-                invocation,
-                path,
-                credits,
-            } => {
-                if let Some(target) = resolve_invocation(&server.active, invocation).await {
-                    let decoded = decode_path(&path).map_err(|source| {
-                        TransportError::io("decode incoming credit path", source)
-                    })?;
-                    target.grant_outbound_credit(decoded, credits).await;
-                }
-                None
-            }
-            Frame::ResourceDrop { .. } => None,
-            Frame::Accept { .. } | Frame::Reject { .. } | Frame::Fault { .. } => {
-                return Err(TransportError::UnexpectedReply);
-            }
-        }
-    };
-
-    if let Some((registration, invocation, instance, func)) = handoff {
-        registration
-            .tx
-            .send(invocation)
-            .await
-            .map_err(|_| TransportError::HandoffClosed { instance, func })?;
-    }
-
-    Ok(())
-}
-
-async fn mark_server_closed<R, W>(
-    server: &ServerInner<R, W>,
-    registrations: &mut HashMap<(String, String), Registration<R, W>>,
-) {
-    server.closed.store(true, Ordering::Release);
-    server.register_rx.close();
-    registrations.clear();
-    server.active.lock().await.clear();
-}
-
-async fn write_owned_frame<W, I>(
-    owner: &Option<Arc<I>>,
-    frame: &Frame,
-    disappeared: &'static str,
-) -> io::Result<()>
-where
-    W: FuturesAsyncWrite + Send + Unpin + 'static,
-    I: FrameWriter<W>,
-{
-    let owner = owner
-        .as_ref()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, disappeared))?;
-    let mut io = owner.write().lock().await;
-    write_frame(&mut *io, frame).await
-}
-
-trait FrameWriter<W> {
-    fn write(&self) -> &Arc<Mutex<W>>;
-}
-
-impl<R, W> FrameWriter<W> for ServerInner<R, W> {
-    fn write(&self) -> &Arc<Mutex<W>> {
-        &self.write
-    }
-}
-
 fn encode_path(path: &[usize]) -> io::Result<Vec<u32>> {
     path.iter()
         .map(|index| {
@@ -1705,311 +1350,232 @@ fn decode_path(path: &[u32]) -> io::Result<Vec<usize>> {
 
 #[cfg(all(test, feature = "host"))]
 mod tests {
-    use super::{Client, MAX_INBOUND_PATHS, MAX_UNDELIVERED_BYTES, RAW_UPLOAD_CHUNK_BYTES, Server};
+    use super::{Client, MAX_INBOUND_PATHS, MAX_UNDELIVERED_BYTES, RAW_UPLOAD_CHUNK_BYTES};
     use crate::error::WireError;
     use bytes::Bytes;
-    use futures_lite::StreamExt as _;
     use futures_lite::future::poll_once;
     use futures_util::future::join;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream, ReadHalf, WriteHalf};
-    use tokio::sync::Notify;
     use tokio::time::{Duration, timeout};
     use tokio_util::compat::{Compat, TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
     const CONCURRENT_DEADLINE: Duration = Duration::from_secs(5);
 
+    async fn read_request_until_close(read: &mut TestRead, expected_inv: u32) -> Vec<u8> {
+        let mut req = Vec::new();
+        loop {
+            match super::read_frame(read)
+                .await
+                .unwrap_or_else(|error| panic!("failed reading request frame: {error}"))
+            {
+                Some(super::Frame::Data {
+                    invocation,
+                    path,
+                    payload,
+                }) => {
+                    assert_eq!(invocation, expected_inv);
+                    assert!(path.is_empty());
+                    req.extend_from_slice(&payload);
+                }
+                Some(super::Frame::Close { invocation, path }) => {
+                    assert_eq!(invocation, expected_inv);
+                    assert!(path.is_empty());
+                    return req;
+                }
+                other => panic!("unexpected frame waiting for request close: {other:?}"),
+            }
+        }
+    }
+
+    async fn write_chunked_response(write: &mut TestWrite, invocation: u32, payload: &[u8]) {
+        for chunk in payload.chunks(RAW_UPLOAD_CHUNK_BYTES) {
+            super::write_frame(
+                write,
+                &super::Frame::Data {
+                    invocation,
+                    path: Vec::new(),
+                    payload: chunk.to_vec(),
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("failed writing response data: {error}"));
+        }
+        super::write_frame(
+            write,
+            &super::Frame::Close {
+                invocation,
+                path: Vec::new(),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("failed writing response close: {error}"));
+    }
+
     #[test]
     fn sequential_empty_invocations_do_not_stall() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap_or_else(|error| panic!("failed to build test runtime: {error}"))
-            .block_on(async {
-                let (host, peer) = tokio::io::duplex(4096);
-                let (host_read, host_write) = tokio::io::split(host);
-                let server = Server::new(host_read.compat(), host_write.compat_write());
-                let (peer_read, peer_write) = tokio::io::split(peer);
-                let client = Client::new(peer_read.compat(), peer_write.compat_write());
-                let driver = client.clone();
-                tokio::spawn(async move { driver.route_frames().await });
-
-                let mut invocations = server
-                    .serve("transport:test", "ping")
-                    .unwrap_or_else(|error| panic!("failed to register server handler: {error}"));
-                let server_task = tokio::spawn(async move {
-                    for response in ["one", "two"] {
-                        let (_, mut outgoing, mut incoming) = invocations
-                            .next()
-                            .await
-                            .unwrap_or_else(|| panic!("server invocation stream ended early"))
-                            .unwrap_or_else(|error| {
-                                panic!("failed to accept server invocation: {error}")
-                            });
-                        let mut request = Vec::new();
-                        incoming
-                            .read_to_end(&mut request)
-                            .await
-                            .unwrap_or_else(|error| {
-                                panic!("failed to read request payload: {error}")
-                            });
-                        assert!(
-                            request.is_empty(),
-                            "unexpected request payload: {request:?}"
-                        );
-                        outgoing
-                            .write_all(response.as_bytes())
-                            .await
-                            .unwrap_or_else(|error| {
-                                panic!("failed to write response payload: {error}")
-                            });
-                        outgoing.shutdown().await.unwrap_or_else(|error| {
-                            panic!("failed to close response stream: {error}")
-                        });
+        block_on_test(async {
+            let mut peer = RawPeer::new();
+            let client = peer.client.clone();
+            let server_task = async {
+                for (id, response) in [(1_u32, b"one".as_slice()), (2, b"two")] {
+                    match super::read_frame(&mut peer.read).await.unwrap() {
+                        Some(super::Frame::Open {
+                            invocation,
+                            instance,
+                            func,
+                        }) => {
+                            assert_eq!(invocation, id);
+                            assert_eq!(instance, "transport:test");
+                            assert_eq!(func, "ping");
+                        }
+                        other => panic!("unexpected open frame: {other:?}"),
                     }
-                });
-
+                    super::write_frame(&mut peer.write, &super::Frame::Accept { invocation: id })
+                        .await
+                        .unwrap();
+                    let req = read_request_until_close(&mut peer.read, id).await;
+                    assert!(req.is_empty());
+                    write_chunked_response(&mut peer.write, id, response).await;
+                }
+            };
+            let client_task = async {
                 assert_eq!(
                     client
                         .invoke_raw("transport:test", "ping", Vec::new())
                         .await
-                        .unwrap_or_else(|error| panic!("first raw invocation failed: {error}")),
+                        .unwrap(),
                     b"one"
                 );
                 assert_eq!(
                     client
                         .invoke_raw("transport:test", "ping", Vec::new())
                         .await
-                        .unwrap_or_else(|error| panic!("second raw invocation failed: {error}")),
+                        .unwrap(),
                     b"two"
                 );
-
-                server_task
-                    .await
-                    .unwrap_or_else(|error| panic!("server task panicked: {error}"));
-            });
+            };
+            join(client_task, server_task).await;
+        });
     }
 
     #[test]
     fn active_invocation_does_not_block_next_call() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap_or_else(|error| panic!("failed to build test runtime: {error}"))
-            .block_on(async {
-                let (host, peer) = tokio::io::duplex(4096);
-                let (host_read, host_write) = tokio::io::split(host);
-                let server = Server::new(host_read.compat(), host_write.compat_write());
-                let (peer_read, peer_write) = tokio::io::split(peer);
-                let client = Client::new(peer_read.compat(), peer_write.compat_write());
-                let driver = client.clone();
-                tokio::spawn(async move { driver.route_frames().await });
-                let released = std::sync::Arc::new(Notify::new());
+        block_on_test(async {
+            let mut peer = RawPeer::new();
+            let (mut first_outgoing, mut first_incoming) = peer.open("stream", 1).await;
+            first_outgoing.shutdown().await.unwrap();
+            let req1 = read_request_until_close(&mut peer.read, 1).await;
+            assert!(req1.is_empty());
+            super::write_frame(
+                &mut peer.write,
+                &super::Frame::Data {
+                    invocation: 1,
+                    path: Vec::new(),
+                    payload: b"stream".to_vec(),
+                },
+            )
+            .await
+            .unwrap();
 
-                let mut stream_calls = server
-                    .serve("transport:test", "stream")
-                    .unwrap_or_else(|error| panic!("failed to register stream handler: {error}"));
-                let stream_release = released.clone();
-                let stream_task = tokio::spawn(async move {
-                    let (_, mut outgoing, mut incoming) = stream_calls
-                        .next()
-                        .await
-                        .unwrap_or_else(|| panic!("stream invocation stream ended early"))
-                        .unwrap_or_else(|error| {
-                            panic!("failed to accept stream invocation: {error}")
-                        });
-                    let mut request = Vec::new();
-                    incoming
-                        .read_to_end(&mut request)
-                        .await
-                        .unwrap_or_else(|error| panic!("failed to read stream request: {error}"));
-                    assert!(
-                        request.is_empty(),
-                        "unexpected stream request payload: {request:?}"
-                    );
-                    outgoing
-                        .write_all(b"stream")
-                        .await
-                        .unwrap_or_else(|error| panic!("failed to write stream response: {error}"));
-                    stream_release.notified().await;
-                    outgoing
-                        .shutdown()
-                        .await
-                        .unwrap_or_else(|error| panic!("failed to close stream response: {error}"));
-                });
-
-                let mut ping_calls = server
-                    .serve("transport:test", "ping")
-                    .unwrap_or_else(|error| panic!("failed to register ping handler: {error}"));
-                let ping_release = released.clone();
-                let ping_task =
-                    tokio::spawn(async move {
-                        let (_, mut outgoing, mut incoming) = ping_calls
-                            .next()
-                            .await
-                            .unwrap_or_else(|| panic!("ping invocation stream ended early"))
-                            .unwrap_or_else(|error| {
-                                panic!("failed to accept ping invocation: {error}")
-                            });
-                        let mut request = Vec::new();
-                        incoming
-                            .read_to_end(&mut request)
-                            .await
-                            .unwrap_or_else(|error| panic!("failed to read ping request: {error}"));
-                        assert!(
-                            request.is_empty(),
-                            "unexpected ping request payload: {request:?}"
-                        );
-                        outgoing.write_all(b"pong").await.unwrap_or_else(|error| {
-                            panic!("failed to write ping response: {error}")
-                        });
-                        outgoing.shutdown().await.unwrap_or_else(|error| {
-                            panic!("failed to close ping response: {error}")
-                        });
-                        ping_release.notify_one();
-                    });
-
-                let (mut first_outgoing, mut first_incoming) = client
-                    .open_invocation("transport:test", "stream", Bytes::new())
+            let client = peer.client.clone();
+            let ping_call = client.invoke_raw("transport:test", "ping", Vec::new());
+            let server_ping = async {
+                match super::read_frame(&mut peer.read).await.unwrap() {
+                    Some(super::Frame::Open {
+                        invocation: 2,
+                        func,
+                        ..
+                    }) => assert_eq!(func, "ping"),
+                    other => panic!("unexpected open frame for ping: {other:?}"),
+                }
+                super::write_frame(&mut peer.write, &super::Frame::Accept { invocation: 2 })
                     .await
-                    .unwrap_or_else(|error| panic!("failed to open stream invocation: {error}"));
-                first_outgoing.shutdown().await.unwrap_or_else(|error| {
-                    panic!("failed to close stream request channel: {error}")
-                });
+                    .unwrap();
+                let req2 = read_request_until_close(&mut peer.read, 2).await;
+                assert!(req2.is_empty());
+                write_chunked_response(&mut peer.write, 2, b"pong").await;
+                super::write_frame(
+                    &mut peer.write,
+                    &super::Frame::Close {
+                        invocation: 1,
+                        path: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            };
+            let (ping_resp, ()) = join(ping_call, server_ping).await;
+            assert_eq!(ping_resp.unwrap(), b"pong");
 
-                assert_eq!(
-                    client
-                        .invoke_raw("transport:test", "ping", Vec::new())
-                        .await
-                        .unwrap_or_else(|error| panic!("ping invocation failed: {error}")),
-                    b"pong"
-                );
-
-                let mut response = Vec::new();
-                first_incoming
-                    .read_to_end(&mut response)
-                    .await
-                    .unwrap_or_else(|error| panic!("failed to read stream response: {error}"));
-                assert_eq!(response, b"stream");
-
-                stream_task
-                    .await
-                    .unwrap_or_else(|error| panic!("stream task panicked: {error}"));
-                ping_task
-                    .await
-                    .unwrap_or_else(|error| panic!("ping task panicked: {error}"));
-            });
+            let mut response = Vec::new();
+            first_incoming.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, b"stream");
+        });
     }
 
     #[test]
     fn accepted_invocation_can_fail_without_tearing_down_transport() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap_or_else(|error| panic!("failed to build test runtime: {error}"))
-            .block_on(async {
-                let (host, peer) = tokio::io::duplex(4096);
-                let (host_read, host_write) = tokio::io::split(host);
-                let server = Server::new(host_read.compat(), host_write.compat_write());
-                let (peer_read, peer_write) = tokio::io::split(peer);
-                let client = Client::new(peer_read.compat(), peer_write.compat_write());
-                let driver = client.clone();
-                tokio::spawn(async move { driver.route_frames().await });
-
-                let mut calls = server
-                    .serve("transport:test", "fail")
-                    .unwrap_or_else(|error| panic!("failed to register fail handler: {error}"));
-                let server_task = tokio::spawn(async move {
-                    let (_, _outgoing, mut incoming) = calls
-                        .next()
-                        .await
-                        .unwrap_or_else(|| panic!("fail invocation stream ended early"))
-                        .unwrap_or_else(|error| {
-                            panic!("failed to accept fail invocation: {error}")
-                        });
-                    let mut request = Vec::new();
-                    incoming
-                        .read_to_end(&mut request)
-                        .await
-                        .unwrap_or_else(|error| panic!("failed to read fail request: {error}"));
-                    assert_eq!(request, b"request");
-
-                    let mut io = server.inner.write.lock().await;
-                    super::write_frame(
-                        &mut *io,
-                        &super::Frame::Reject {
-                            invocation: 1,
-                            message: "remote failure".to_owned(),
-                        },
-                    )
+        block_on_test(async {
+            let mut peer = RawPeer::new();
+            let client = peer.client.clone();
+            let server_task = async {
+                match super::read_frame(&mut peer.read).await.unwrap() {
+                    Some(super::Frame::Open {
+                        invocation: 1,
+                        func,
+                        ..
+                    }) => assert_eq!(func, "fail"),
+                    other => panic!("unexpected open frame: {other:?}"),
+                }
+                super::write_frame(&mut peer.write, &super::Frame::Accept { invocation: 1 })
                     .await
-                    .unwrap_or_else(|error| panic!("failed to write reject frame: {error}"));
-                });
-
-                let error = client
-                    .invoke_raw("transport:test", "fail", b"request".to_vec())
-                    .await
-                    .expect_err("accepted invocation must surface remote failure");
-                assert!(
-                    format!("{error:#}").contains("remote failure"),
-                    "unexpected error: {error:#}"
-                );
-
-                server_task
-                    .await
-                    .unwrap_or_else(|error| panic!("fail server task panicked: {error}"));
-            });
+                    .unwrap();
+                let req = read_request_until_close(&mut peer.read, 1).await;
+                assert_eq!(req, b"request");
+                super::write_frame(
+                    &mut peer.write,
+                    &super::Frame::Reject {
+                        invocation: 1,
+                        message: "remote failure".to_owned(),
+                    },
+                )
+                .await
+                .unwrap();
+            };
+            let (res, ()) = join(
+                client.invoke_raw("transport:test", "fail", b"request".to_vec()),
+                server_task,
+            )
+            .await;
+            let error = res.expect_err("accepted invocation must surface remote failure");
+            assert!(
+                format!("{error:#}").contains("remote failure"),
+                "unexpected error: {error:#}"
+            );
+        });
     }
 
     fn round_trip(func: &'static str, responses: &[&'static [u8]]) -> Vec<Vec<u8>> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap_or_else(|error| panic!("failed to build test runtime: {error}"))
-            .block_on(async move {
-                let (host, peer) = tokio::io::duplex(4096);
-                let (host_read, host_write) = tokio::io::split(host);
-                let server = Server::new(host_read.compat(), host_write.compat_write());
-                let (peer_read, peer_write) = tokio::io::split(peer);
-                let client = Client::new(peer_read.compat(), peer_write.compat_write());
-                let driver = client.clone();
-                tokio::spawn(async move { driver.route_frames().await });
-
-                let mut invocations =
-                    server
-                        .serve("transport:test", func)
-                        .unwrap_or_else(|error| {
-                            panic!("failed to register the {func} handler: {error}")
-                        });
-                let answers = responses.to_vec();
-                let server_task = tokio::spawn(async move {
-                    for response in answers {
-                        let (_, mut outgoing, mut incoming) = invocations
-                            .next()
-                            .await
-                            .unwrap_or_else(|| panic!("the {func} stream ended early"))
-                            .unwrap_or_else(|error| {
-                                panic!("failed to accept a {func} invocation: {error}")
-                            });
-                        let mut request = Vec::new();
-                        incoming
-                            .read_to_end(&mut request)
-                            .await
-                            .unwrap_or_else(|error| {
-                                panic!("failed to read the {func} request: {error}")
-                            });
-                        assert!(
-                            request.is_empty(),
-                            "unexpected {func} request payload: {request:?}"
-                        );
-                        outgoing.write_all(response).await.unwrap_or_else(|error| {
-                            panic!("failed to write the {func} response: {error}")
-                        });
-                        outgoing.shutdown().await.unwrap_or_else(|error| {
-                            panic!("failed to close the {func} response stream: {error}")
-                        });
+        block_on_test(async move {
+            let mut peer = RawPeer::new();
+            let client = peer.client.clone();
+            let answers = responses.to_vec();
+            let server_task = async {
+                for (idx, response) in answers.into_iter().enumerate() {
+                    let id = u32::try_from(idx + 1).expect("u32 id");
+                    match super::read_frame(&mut peer.read).await.unwrap() {
+                        Some(super::Frame::Open { invocation, .. }) => assert_eq!(invocation, id),
+                        other => panic!("unexpected open frame: {other:?}"),
                     }
-                });
-
+                    super::write_frame(&mut peer.write, &super::Frame::Accept { invocation: id })
+                        .await
+                        .unwrap();
+                    let req = read_request_until_close(&mut peer.read, id).await;
+                    assert!(req.is_empty());
+                    write_chunked_response(&mut peer.write, id, response).await;
+                }
+            };
+            let client_task = async {
                 let mut read = Vec::new();
                 for _ in responses {
                     read.push(
@@ -2021,11 +1587,11 @@ mod tests {
                             }),
                     );
                 }
-                server_task
-                    .await
-                    .unwrap_or_else(|error| panic!("the {func} server task panicked: {error}"));
                 read
-            })
+            };
+            let (read, ()) = join(client_task, server_task).await;
+            read
+        })
     }
 
     #[test]
@@ -2059,328 +1625,84 @@ mod tests {
 
     #[test]
     fn large_raw_response_is_chunked_across_frames() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap_or_else(|error| panic!("failed to build test runtime: {error}"))
-            .block_on(async {
-                let (host, peer) = tokio::io::duplex(4096);
-                let (host_read, host_write) = tokio::io::split(host);
-                let server = Server::new(host_read.compat(), host_write.compat_write());
-                let (peer_read, peer_write) = tokio::io::split(peer);
-                let client = Client::new(peer_read.compat(), peer_write.compat_write());
-                let driver = client.clone();
-                tokio::spawn(async move { driver.route_frames().await });
-
-                let expected = vec![0x5a; RAW_UPLOAD_CHUNK_BYTES * 3 + 17];
-                let mut calls = server
-                    .serve("transport:test", "large-response")
-                    .unwrap_or_else(|error| {
-                        panic!("failed to register large-response handler: {error}")
-                    });
-                let expected_response = expected.clone();
-                let server_task = tokio::spawn(async move {
-                    let (_, mut outgoing, mut incoming) = calls
-                        .next()
-                        .await
-                        .unwrap_or_else(|| panic!("large-response invocation stream ended early"))
-                        .unwrap_or_else(|error| {
-                            panic!("failed to accept large-response invocation: {error}")
-                        });
-                    let mut request = Vec::new();
-                    incoming
-                        .read_to_end(&mut request)
-                        .await
-                        .unwrap_or_else(|error| {
-                            panic!("failed to read large-response request: {error}")
-                        });
-                    assert!(
-                        request.is_empty(),
-                        "unexpected request payload: {request:?}"
-                    );
-                    outgoing
-                        .write_all(&expected_response)
-                        .await
-                        .unwrap_or_else(|error| {
-                            panic!("failed to write large-response payload: {error}")
-                        });
-                    outgoing.shutdown().await.unwrap_or_else(|error| {
-                        panic!("failed to close large-response stream: {error}")
-                    });
-                });
-
-                let actual = client
-                    .invoke_raw("transport:test", "large-response", Vec::new())
-                    .await
-                    .unwrap_or_else(|error| panic!("large-response invocation failed: {error}"));
-                assert_eq!(actual, expected);
-
-                server_task
-                    .await
-                    .unwrap_or_else(|error| panic!("large-response server task panicked: {error}"));
-            });
-    }
-
-    #[test]
-    fn queued_open_does_not_block_active_invocation_progress() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap_or_else(|error| panic!("failed to build test runtime: {error}"))
-            .block_on(async {
-                let (host, peer) = tokio::io::duplex(4096);
-                let (host_read, host_write) = tokio::io::split(host);
-                let server = Server::new(host_read.compat(), host_write.compat_write());
-                let (peer_read, peer_write) = tokio::io::split(peer);
-                let mut peer_read = peer_read.compat();
-                let mut peer_write = peer_write.compat_write();
-
-                let mut invocations = server
-                    .serve("transport:test", "queue")
-                    .unwrap_or_else(|error| panic!("failed to register queue handler: {error}"));
-
-                super::write_frame(
-                    &mut peer_write,
-                    &super::Frame::Open {
-                        invocation: 1,
-                        instance: "transport:test".to_owned(),
-                        func: "queue".to_owned(),
-                    },
-                )
-                .await
-                .unwrap_or_else(|error| panic!("failed to write first open frame: {error}"));
-                super::pump_server_once(server.inner.clone())
-                    .await
-                    .unwrap_or_else(|error| panic!("failed to accept first invocation: {error}"));
-                match super::read_frame(&mut peer_read)
-                    .await
-                    .unwrap_or_else(|error| panic!("failed to read first accept frame: {error}"))
-                {
-                    Some(super::Frame::Accept { invocation }) => assert_eq!(invocation, 1),
-                    other => panic!("unexpected first accept frame: {other:?}"),
+        block_on_test(async {
+            let mut peer = RawPeer::new();
+            let client = peer.client.clone();
+            let expected = vec![0x5a; RAW_UPLOAD_CHUNK_BYTES * 3 + 17];
+            let expected_response = expected.clone();
+            let server_task = async {
+                match super::read_frame(&mut peer.read).await.unwrap() {
+                    Some(super::Frame::Open { invocation: 1, .. }) => {}
+                    other => panic!("unexpected open frame: {other:?}"),
                 }
-
-                let (_, _first_outgoing, mut first_incoming) = invocations
-                    .next()
+                super::write_frame(&mut peer.write, &super::Frame::Accept { invocation: 1 })
                     .await
-                    .unwrap_or_else(|| panic!("first invocation stream ended early"))
-                    .unwrap_or_else(|error| panic!("failed to receive first invocation: {error}"));
-
-                for invocation in 2..=9 {
-                    super::write_frame(
-                        &mut peer_write,
-                        &super::Frame::Open {
-                            invocation,
-                            instance: "transport:test".to_owned(),
-                            func: "queue".to_owned(),
-                        },
-                    )
-                    .await
-                    .unwrap_or_else(|error| {
-                        panic!("failed to write queued open frame {invocation}: {error}")
-                    });
-                    super::pump_server_once(server.inner.clone())
-                        .await
-                        .unwrap_or_else(|error| {
-                            panic!("failed to pump queued open frame {invocation}: {error}")
-                        });
-                    match super::read_frame(&mut peer_read)
-                        .await
-                        .unwrap_or_else(|error| {
-                            panic!("failed to read queued accept frame {invocation}: {error}")
-                        }) {
-                        Some(super::Frame::Accept {
-                            invocation: accepted,
-                        }) => {
-                            assert_eq!(accepted, invocation);
-                        }
-                        other => panic!(
-                            "unexpected queued accept frame for invocation {invocation}: {other:?}"
-                        ),
-                    }
-                }
-
-                super::write_frame(
-                    &mut peer_write,
-                    &super::Frame::Open {
-                        invocation: 10,
-                        instance: "transport:test".to_owned(),
-                        func: "queue".to_owned(),
-                    },
-                )
-                .await
-                .unwrap_or_else(|error| panic!("failed to write blocked open frame: {error}"));
-
-                let blocked_pump = tokio::spawn({
-                    let server = server.inner.clone();
-                    async move { super::pump_server_once(server).await }
-                });
-
-                match super::read_frame(&mut peer_read)
-                    .await
-                    .unwrap_or_else(|error| panic!("failed to read blocked accept frame: {error}"))
-                {
-                    Some(super::Frame::Accept { invocation }) => assert_eq!(invocation, 10),
-                    other => panic!("unexpected blocked accept frame: {other:?}"),
-                }
-
-                tokio::task::yield_now().await;
-
-                super::write_frame(
-                    &mut peer_write,
-                    &super::Frame::Data {
-                        invocation: 1,
-                        path: Vec::new(),
-                        payload: b"request".to_vec(),
-                    },
-                )
-                .await
-                .unwrap_or_else(|error| panic!("failed to write active request data: {error}"));
-                super::write_frame(
-                    &mut peer_write,
-                    &super::Frame::Close {
-                        invocation: 1,
-                        path: Vec::new(),
-                    },
-                )
-                .await
-                .unwrap_or_else(|error| panic!("failed to write active request close: {error}"));
-
-                let mut request = Vec::new();
-                timeout(
-                    Duration::from_millis(100),
-                    first_incoming.read_to_end(&mut request),
-                )
-                .await
-                .unwrap_or_else(|_| panic!("active invocation stalled behind queued open"))
-                .unwrap_or_else(|error| {
-                    panic!("failed to read active invocation payload: {error}")
-                });
-                assert_eq!(request, b"request");
-
-                let _ = invocations
-                    .next()
-                    .await
-                    .unwrap_or_else(|| panic!("queued invocation stream ended unexpectedly"))
-                    .unwrap_or_else(|error| panic!("failed to release queued invocation: {error}"));
-
-                blocked_pump
-                    .await
-                    .unwrap_or_else(|error| panic!("blocked pump task panicked: {error}"))
-                    .unwrap_or_else(|error| panic!("blocked pump failed: {error}"));
-            });
+                    .unwrap();
+                let req = read_request_until_close(&mut peer.read, 1).await;
+                assert!(req.is_empty());
+                write_chunked_response(&mut peer.write, 1, &expected_response).await;
+            };
+            let (actual, ()) = join(
+                client.invoke_raw("transport:test", "large-response", Vec::new()),
+                server_task,
+            )
+            .await;
+            assert_eq!(actual.unwrap(), expected);
+        });
     }
 
     #[test]
     fn concurrently_held_invocations_both_complete() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap_or_else(|error| panic!("failed to build test runtime: {error}"))
-            .block_on(async {
-                let (host, peer) = tokio::io::duplex(4096);
-                let (host_read, host_write) = tokio::io::split(host);
-                let server = Server::new(host_read.compat(), host_write.compat_write());
-                let (peer_read, peer_write) = tokio::io::split(peer);
-                let client = Client::new(peer_read.compat(), peer_write.compat_write());
-                let driver = client.clone();
-                tokio::spawn(async move { driver.route_frames().await });
-                let release = std::sync::Arc::new(Notify::new());
+        block_on_test(async {
+            let mut peer = RawPeer::new();
+            let (mut slow_outgoing, mut slow_incoming) = peer.open("slow", 1).await;
+            slow_outgoing.shutdown().await.unwrap();
+            let slow_req = read_request_until_close(&mut peer.read, 1).await;
+            assert!(slow_req.is_empty());
 
-                let mut slow_calls = server
-                    .serve("transport:test", "slow")
-                    .unwrap_or_else(|error| panic!("failed to register slow handler: {error}"));
-                let slow_release = release.clone();
-                let slow_task =
-                    tokio::spawn(async move {
-                        let (_, mut outgoing, mut incoming) = slow_calls
-                            .next()
-                            .await
-                            .unwrap_or_else(|| panic!("slow invocation stream ended early"))
-                            .unwrap_or_else(|error| {
-                                panic!("failed to accept slow invocation: {error}")
-                            });
-                        let mut request = Vec::new();
-                        incoming
-                            .read_to_end(&mut request)
-                            .await
-                            .unwrap_or_else(|error| panic!("failed to read slow request: {error}"));
-                        slow_release.notified().await;
-                        outgoing.write_all(b"slow").await.unwrap_or_else(|error| {
-                            panic!("failed to write slow response: {error}")
-                        });
-                        outgoing.shutdown().await.unwrap_or_else(|error| {
-                            panic!("failed to close slow response: {error}")
-                        });
-                    });
-
-                let mut probe_calls = server
-                    .serve("transport:test", "probe")
-                    .unwrap_or_else(|error| panic!("failed to register probe handler: {error}"));
-                let probe_task = tokio::spawn(async move {
-                    let (_, mut outgoing, mut incoming) = probe_calls
-                        .next()
-                        .await
-                        .unwrap_or_else(|| panic!("probe invocation stream ended early"))
-                        .unwrap_or_else(|error| {
-                            panic!("failed to accept probe invocation: {error}")
-                        });
-                    let mut request = Vec::new();
-                    incoming
-                        .read_to_end(&mut request)
-                        .await
-                        .unwrap_or_else(|error| panic!("failed to read probe request: {error}"));
-                    outgoing
-                        .write_all(b"pong")
-                        .await
-                        .unwrap_or_else(|error| panic!("failed to write probe response: {error}"));
-                    outgoing
-                        .shutdown()
-                        .await
-                        .unwrap_or_else(|error| panic!("failed to close probe response: {error}"));
-                });
-
-                let (mut slow_outgoing, mut slow_incoming) = client
-                    .open_invocation("transport:test", "slow", Bytes::new())
+            let client = peer.client.clone();
+            let held = async {
+                let mut response = Vec::new();
+                slow_incoming
+                    .read_to_end(&mut response)
                     .await
-                    .unwrap_or_else(|error| panic!("failed to open slow invocation: {error}"));
-                slow_outgoing.shutdown().await.unwrap_or_else(|error| {
-                    panic!("failed to close slow request channel: {error}")
-                });
-
-                let held = async {
-                    let mut response = Vec::new();
-                    slow_incoming
-                        .read_to_end(&mut response)
-                        .await
-                        .unwrap_or_else(|error| panic!("failed to read slow response: {error}"));
-                    assert_eq!(response, b"slow");
-                };
-                let concurrent = async {
-                    let answer = timeout(
-                        CONCURRENT_DEADLINE,
-                        client.invoke_raw("transport:test", "probe", Vec::new()),
+                    .unwrap_or_else(|error| panic!("failed to read slow response: {error}"));
+                assert_eq!(response, b"slow");
+            };
+            let concurrent = async {
+                let answer = timeout(
+                    CONCURRENT_DEADLINE,
+                    client.invoke_raw("transport:test", "probe", Vec::new()),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "the second invocation went unanswered for {CONCURRENT_DEADLINE:?} \
+                         while the first was held open"
                     )
+                })
+                .unwrap_or_else(|error| panic!("probe invocation failed: {error}"));
+                assert_eq!(answer, b"pong");
+            };
+            let server_task = async {
+                match super::read_frame(&mut peer.read).await.unwrap() {
+                    Some(super::Frame::Open {
+                        invocation: 2,
+                        func,
+                        ..
+                    }) => assert_eq!(func, "probe"),
+                    other => panic!("unexpected probe open: {other:?}"),
+                }
+                super::write_frame(&mut peer.write, &super::Frame::Accept { invocation: 2 })
                     .await
-                    .unwrap_or_else(|_| {
-                        panic!(
-                            "the second invocation went unanswered for {CONCURRENT_DEADLINE:?} \
-                             while the first was held open"
-                        )
-                    })
-                    .unwrap_or_else(|error| panic!("probe invocation failed: {error}"));
-                    assert_eq!(answer, b"pong");
-                    release.notify_one();
-                };
-                join(held, concurrent).await;
-
-                slow_task
-                    .await
-                    .unwrap_or_else(|error| panic!("slow server task panicked: {error}"));
-                probe_task
-                    .await
-                    .unwrap_or_else(|error| panic!("probe server task panicked: {error}"));
-            });
+                    .unwrap();
+                let req = read_request_until_close(&mut peer.read, 2).await;
+                assert!(req.is_empty());
+                write_chunked_response(&mut peer.write, 2, b"pong").await;
+                write_chunked_response(&mut peer.write, 1, b"slow").await;
+            };
+            join(join(held, concurrent), server_task).await;
+        });
     }
 
     #[test]

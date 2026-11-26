@@ -7,7 +7,9 @@ use helios_inspector_protocol::mux::{
     MuxDriverChannels, PeerHandle, create_mux, drive_mux,
 };
 
-use crate::codec::{RpcDecode, RpcEncode, decode_server_request, encode_server_response};
+use crate::codec::{
+    RpcDecode, RpcEncode, activate_outbound_subpaths, decode_server_request, encode_server_response,
+};
 use crate::error::RpcError;
 use crate::resource::{HandleAllocator, ResourceEntry, ResourceTable};
 
@@ -62,8 +64,44 @@ impl<'a, R: ResourceEntry> ServerInvocation<'a, R> {
     }
 
     pub async fn encode_response<T: RpcEncode<R>>(&self, value: T) -> Result<(), WireError> {
-        let bytes = encode_server_response(&self.call, self.resources, value).await?;
-        let _ = self.call.send_root_response(&bytes).await;
+        struct HandleRollbackGuard<'r, R: ResourceEntry> {
+            resources: &'r ResourceTable<R>,
+            handles: Vec<u32>,
+        }
+
+        impl<R: ResourceEntry> HandleRollbackGuard<'_, R> {
+            fn disarm(&mut self) {
+                self.handles.clear();
+            }
+
+            fn take(&mut self) -> Vec<u32> {
+                std::mem::take(&mut self.handles)
+            }
+        }
+
+        impl<R: ResourceEntry> Drop for HandleRollbackGuard<'_, R> {
+            fn drop(&mut self) {
+                if !self.handles.is_empty() {
+                    let handles = std::mem::take(&mut self.handles);
+                    self.resources.rollback_handles_sync(handles);
+                }
+            }
+        }
+
+        let encoded = encode_server_response(&self.call, self.resources, value).await?;
+        let mut rollback = HandleRollbackGuard {
+            resources: self.resources,
+            handles: encoded.inserted_handles,
+        };
+        let handle = self.call.call_handle();
+        activate_outbound_subpaths(&handle, encoded.subpaths).await;
+        match self.call.send_root_response(&encoded.bytes).await {
+            Ok(()) => rollback.disarm(),
+            Err(_) => {
+                let handles = rollback.take();
+                self.resources.rollback_handles(&handles).await;
+            }
+        }
         Ok(())
     }
 }
