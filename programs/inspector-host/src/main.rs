@@ -36,6 +36,7 @@ use helios_api::programs::{
 };
 use helios_api::serial::{self, DebugPort};
 use helios_api::vsock::{self, VsockListener, VsockStream};
+use helios_component_manager::OomTier;
 use helios_inspector_protocol::VSOCK_RPC_PORT;
 use helios_inspector_protocol::auth::{
     AUTH_PROTOCOL_VERSION, AuthError, AuthPolicy, DEFAULT_INSPECTOR_TCP_PORT,
@@ -45,7 +46,10 @@ use helios_inspector_protocol::auth::{
     verify_client_auth, write_auth_message,
 };
 
-use crate::grants::session_grants_to_kernel;
+use crate::grants::{
+    compiled_tls_ceiling, compiled_tls_oom_tier, compiled_worker_ceiling, compiled_worker_oom_tier,
+    session_grants_to_kernel,
+};
 use crate::transport_io::{IpcIo, UnbufferedSerialIo, UnbufferedVsockIo};
 
 const INSPECTOR_TLS_PATH: &str = "/bin/inspector-tls";
@@ -158,6 +162,7 @@ where
 
 struct HostContext {
     policy: AuthPolicy,
+    tls_ceiling: SessionGrants,
     worker_ceiling: SessionGrants,
     machine_public_key: [u8; 32],
     next_session_id: AtomicU64,
@@ -241,9 +246,23 @@ async fn main() -> Result<(), String> {
         None
     };
 
+    if compiled_tls_oom_tier() != OomTier::User {
+        return Err(format!(
+            "unsupported /inspector/tls oom_tier `{}` (expected `user`)",
+            compiled_tls_oom_tier().as_str()
+        ));
+    }
+    if compiled_worker_oom_tier() != OomTier::User {
+        return Err(format!(
+            "unsupported /inspector/worker oom_tier `{}` (expected `user`)",
+            compiled_worker_oom_tier().as_str()
+        ));
+    }
+
     let ctx = Arc::new(HostContext {
         policy,
-        worker_ceiling: SessionGrants::full_worker_ceiling(),
+        tls_ceiling: compiled_tls_ceiling(),
+        worker_ceiling: compiled_worker_ceiling(),
         machine_public_key,
         next_session_id: AtomicU64::new(1),
         handshake_limiter: HandshakeLimiter::new(MAX_CONCURRENT_HANDSHAKES),
@@ -458,11 +477,12 @@ async fn run_tcp_control_handshake(
                     now,
                 ) {
                     Ok(verified) => {
-                        let mut grants = session_grants_to_kernel(&verified.granted);
+                        let effective = verified.granted.intersect(&ctx.worker_ceiling);
+                        let mut grants = session_grants_to_kernel(&effective);
                         grants.push(ipc_grant("rpc", worker_data));
                         let cc_task = attach_component_control(
                             ctx,
-                            &verified.granted.component_control,
+                            &effective.component_control,
                             &mut grants,
                         );
                         match programs::spawn(SpawnRequest {
@@ -478,7 +498,7 @@ async fn run_tcp_control_handshake(
                         {
                             Ok(worker) => {
                                 let decision = ServerAuthResult::Accepted {
-                                    granted: verified.granted,
+                                    granted: effective,
                                     session_id,
                                 };
                                 let _ = write_auth_message(
@@ -537,8 +557,12 @@ async fn handle_tcp_session(
     let (host_ctrl, tls_ctrl) = ipc::channel();
     let (tls_data, worker_data) = ipc::channel();
 
-    // Spawn zero-authority `inspector-tls` (`ProcessAuthority::empty()`):
-    // holds ONLY the accepted TCP stream plus `control` and `data` IPC endpoints.
+    // Spawn `inspector-tls` strictly bounded by the compiled `/inspector/tls`
+    // manifest ceiling (empty authority by default) plus only the session's
+    // accepted TCP stream and `control`/`data` IPC endpoints.
+    let mut tls_grants = session_grants_to_kernel(&ctx.tls_ceiling);
+    tls_grants.push(ipc_grant("control", tls_ctrl));
+    tls_grants.push(ipc_grant("data", tls_data));
     let tls_child = match programs::spawn(SpawnRequest {
         name: format!("inspector-tls-{session_id}"),
         args: Vec::new(),
@@ -546,7 +570,7 @@ async fn handle_tcp_session(
         path: INSPECTOR_TLS_PATH.to_owned(),
         cwd: None,
         sockets: vec![InheritedSocket::TcpStream(stream.into_raw())],
-        capability_grants: vec![ipc_grant("control", tls_ctrl), ipc_grant("data", tls_data)],
+        capability_grants: tls_grants,
     })
     .await
     {
@@ -726,8 +750,9 @@ async fn handle_vsock_session(
     // Hand the connected `VsockStream` directly to the attenuated worker and
     // exit the post-handshake data path completely.
     let stream = io.into_inner();
-    let mut grants = session_grants_to_kernel(&verified.granted);
-    let cc_task = attach_component_control(&ctx, &verified.granted.component_control, &mut grants);
+    let effective = verified.granted.intersect(&ctx.worker_ceiling);
+    let mut grants = session_grants_to_kernel(&effective);
+    let cc_task = attach_component_control(&ctx, &effective.component_control, &mut grants);
     match programs::spawn(SpawnRequest {
         name: format!("inspector-worker-{session_id}"),
         args: Vec::new(),
@@ -790,8 +815,9 @@ async fn handle_serial_session(ctx: Arc<HostContext>, port: DebugPort) {
     // Move `DebugPort` straight into the attenuated `inspector-worker` so
     // `inspector-host` exits the post-handshake data path.
     let port = io.into_inner();
-    let mut grants = session_grants_to_kernel(&verified.granted);
-    let cc_task = attach_component_control(&ctx, &verified.granted.component_control, &mut grants);
+    let effective = verified.granted.intersect(&ctx.worker_ceiling);
+    let mut grants = session_grants_to_kernel(&effective);
+    let cc_task = attach_component_control(&ctx, &effective.component_control, &mut grants);
     match programs::spawn(SpawnRequest {
         name: format!("inspector-worker-{session_id}"),
         args: Vec::new(),

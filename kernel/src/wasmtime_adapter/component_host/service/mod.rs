@@ -513,6 +513,9 @@ where
     >,
     #[cfg(feature = "linux")]
     retired_containers: Arc<Mutex<Vec<NonZeroU64>>>,
+    #[cfg(feature = "linux")]
+    native_spaces:
+        crate::NativeSpaceRegistry<<CpuImpl::Native as helios_hal::native::NativeExecution>::Space>,
     _marker: core::marker::PhantomData<fn() -> StorageImpl>,
 }
 
@@ -1229,6 +1232,8 @@ where
             containers: Mutex::new(alloc::collections::BTreeMap::new()),
             #[cfg(feature = "linux")]
             retired_containers: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(feature = "linux")]
+            native_spaces: kernel.native_spaces(),
             _marker: core::marker::PhantomData,
         }),
     };
@@ -1903,6 +1908,14 @@ where
             .engine
             .interrupts()
             .preempt_overdue(self.inner.clock_cpu.now());
+    }
+
+    #[cfg(feature = "linux")]
+    pub(super) fn native_spaces(
+        &self,
+    ) -> crate::NativeSpaceRegistry<<CpuImpl::Native as helios_hal::native::NativeExecution>::Space>
+    {
+        self.inner.native_spaces.clone()
     }
 
     /// Interrupts every guest that is running on any processor now,

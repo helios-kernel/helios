@@ -180,6 +180,27 @@ impl Aarch64Tables {
         (table as usize + self.offset) as *mut u64
     }
 
+    /// The last-level entry of `base` if every table level above it already exists.
+    fn lookup_leaf(&self, base: u64) -> Option<*mut u64> {
+        let mut table = self.root.as_ptr() as u64 - self.offset as u64;
+        for level in 0..3 {
+            let index = (base >> (39 - 9 * level)) as usize & (ENTRIES - 1);
+            // SAFETY: `table` is a table of this space under its lock, reached
+            // through the direct map, and `index` is below its 512 entries.
+            let entry = unsafe { self.entries(table).add(index) };
+            // SAFETY: as above; the space's lock excludes every other writer.
+            let descriptor = unsafe { entry.read_volatile() };
+            if descriptor & TABLE != TABLE {
+                return None;
+            }
+            table = descriptor & ADDRESS;
+        }
+        let index = (base >> 12) as usize & (ENTRIES - 1);
+        // SAFETY: `table` is the last-level table of `base`, reached through
+        // the direct map, and `index` is below its 512 entries.
+        Some(unsafe { self.entries(table).add(index) })
+    }
+
     /// The last-level entry of `base`, creating the tables above it.
     fn leaf(&mut self, base: u64) -> Result<*mut u64, NativeError> {
         let mut table = self.root.as_ptr() as u64 - self.offset as u64;
@@ -395,6 +416,26 @@ unsafe impl UserTranslation for Aarch64Tables {
 
     fn new_empty(&self) -> Result<Self, NativeError> {
         Self::new()
+    }
+
+    fn test_and_clear_accessed(&mut self, base: u64) -> bool {
+        let Some(leaf) = self.lookup_leaf(base) else {
+            return false;
+        };
+        // SAFETY: `leaf` is an aligned level-3 descriptor owned by this space
+        // under its lock.
+        let descriptor = unsafe { AtomicU64::from_ptr(leaf) };
+        let current = descriptor.load(Ordering::Acquire);
+        if current & PAGE_DESCRIPTOR != PAGE_DESCRIPTOR {
+            return false;
+        }
+        let previous = descriptor.fetch_and(!AF, Ordering::AcqRel);
+        if previous & AF != 0 {
+            publish();
+            true
+        } else {
+            false
+        }
     }
 }
 

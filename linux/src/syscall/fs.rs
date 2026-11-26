@@ -1091,7 +1091,7 @@ pub(super) fn apply_setfl(abi: Abi, current: u16, linux_flags: u64) -> u16 {
 /// Reads a NUL-terminated path string from user memory, stopping at page
 /// boundaries so a NUL byte near the end of a mapped page never reads into an
 /// adjacent unmapped page.
-pub(super) fn read_user_path<M: UserMemory>(memory: &M, address: u64) -> Result<String, u64> {
+pub(super) async fn read_user_path<M: UserMemory>(memory: &M, address: u64) -> Result<String, u64> {
     if address == 0 {
         return Err(errno(EFAULT));
     }
@@ -1106,7 +1106,7 @@ pub(super) fn read_user_path<M: UserMemory>(memory: &M, address: u64) -> Result<
         let max_len = (PATH_MAX - bytes.len()).min(chunk.len()).min(page_rem);
         // Probe incrementally if a larger read crosses into an unmapped sub-range.
         let mut read_len = max_len;
-        while memory.read(cursor, &mut chunk[..read_len]).is_err() {
+        while memory.read(cursor, &mut chunk[..read_len]).await.is_err() {
             if read_len == 1 {
                 return Err(errno(EFAULT));
             }
@@ -1346,7 +1346,7 @@ pub(super) fn process_creds<R: Resources>(process: &Process<R>) -> Credentials {
 
 /// Reads a NUL-terminated xattr name from user memory (`fs/xattr.c`: empty or
 /// `> XATTR_NAME_MAX` returns `ERANGE`).
-fn read_xattr_name<M: UserMemory>(memory: &M, address: u64) -> Result<String, u64> {
+async fn read_xattr_name<M: UserMemory>(memory: &M, address: u64) -> Result<String, u64> {
     if address == 0 {
         return Err(errno(EFAULT));
     }
@@ -1362,7 +1362,7 @@ fn read_xattr_name<M: UserMemory>(memory: &M, address: u64) -> Result<String, u6
             .min(chunk.len())
             .min(page_rem);
         let mut read_len = max_len;
-        while memory.read(cursor, &mut chunk[..read_len]).is_err() {
+        while memory.read(cursor, &mut chunk[..read_len]).await.is_err() {
             if read_len == 1 {
                 return Err(errno(EFAULT));
             }
@@ -1388,7 +1388,7 @@ pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R> + tty::
 ) -> SyscallOutcome {
     let abi = process.shared.abi;
     let dirfd = args[0] as u32 as i32;
-    let path = match read_user_path(memory, args[1]) {
+    let path = match read_user_path(memory, args[1]).await {
         Ok(path) => path,
         Err(err) => return SyscallOutcome::Return(err),
     };
@@ -1769,7 +1769,7 @@ pub(super) async fn fstat<R: Resources, M: UserMemory, F: Filesystem<R>, T: tty:
     };
     let mut buf = [0u8; 144];
     let len = stat.write_stat(process.shared.abi, &mut buf);
-    match memory.write(args[1], &buf[..len]) {
+    match memory.write(args[1], &buf[..len]).await {
         Ok(()) => 0,
         Err(_) => errno(EFAULT),
     }
@@ -1787,7 +1787,7 @@ pub(super) async fn newfstatat<R: Resources, M: UserMemory, F: Filesystem<R>, T:
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT) != 0 {
         return errno(EINVAL);
     }
-    let path = match read_user_path(memory, args[1]) {
+    let path = match read_user_path(memory, args[1]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -1844,7 +1844,7 @@ pub(super) async fn newfstatat<R: Resources, M: UserMemory, F: Filesystem<R>, T:
     };
     let mut buf = [0u8; 144];
     let len = stat.write_stat(process.shared.abi, &mut buf);
-    match memory.write(args[2], &buf[..len]) {
+    match memory.write(args[2], &buf[..len]).await {
         Ok(()) => 0,
         Err(_) => errno(EFAULT),
     }
@@ -1886,7 +1886,7 @@ pub(super) async fn statx<R: Resources, M: UserMemory, F: Filesystem<R>, T: tty:
     if (flags & AT_STATX_SYNC_TYPE) == AT_STATX_SYNC_TYPE {
         return errno(EINVAL);
     }
-    let path = match read_user_path(memory, args[1]) {
+    let path = match read_user_path(memory, args[1]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -1942,7 +1942,7 @@ pub(super) async fn statx<R: Resources, M: UserMemory, F: Filesystem<R>, T: tty:
         }
     };
     let encoded = stat.write_statx();
-    match memory.write(statxbuf, &encoded) {
+    match memory.write(statxbuf, &encoded).await {
         Ok(()) => 0,
         Err(_) => errno(EFAULT),
     }
@@ -1964,7 +1964,7 @@ pub(super) async fn faccessat<R: Resources, M: UserMemory, F: Filesystem<R>>(
     if flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW) != 0 {
         return errno(EINVAL);
     }
-    let path = match read_user_path(memory, args[1]) {
+    let path = match read_user_path(memory, args[1]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -2048,7 +2048,7 @@ pub(super) async fn readlinkat<R: Resources, M: UserMemory, F: Filesystem<R>>(
     if bufsiz <= 0 {
         return errno(EINVAL);
     }
-    let path = match read_user_path(memory, args[1]) {
+    let path = match read_user_path(memory, args[1]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -2079,7 +2079,7 @@ pub(super) async fn readlinkat<R: Resources, M: UserMemory, F: Filesystem<R>>(
     };
     let bytes = target.as_bytes();
     let take = bytes.len().min(bufsiz as usize);
-    match memory.write(args[2], &bytes[..take]) {
+    match memory.write(args[2], &bytes[..take]).await {
         Ok(()) => take as u64,
         Err(_) => errno(EFAULT),
     }
@@ -2107,7 +2107,7 @@ pub(super) async fn mkdirat<R: Resources, M: UserMemory, F: Filesystem<R>>(
     fs: &mut F,
 ) -> u64 {
     let dirfd = args[0] as u32 as i32;
-    let path = match read_user_path(memory, args[1]) {
+    let path = match read_user_path(memory, args[1]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -2167,7 +2167,7 @@ pub(super) async fn unlinkat<R: Resources, M: UserMemory, F: Filesystem<R>>(
     if flags & !AT_REMOVEDIR != 0 {
         return errno(EINVAL);
     }
-    let path = match read_user_path(memory, args[1]) {
+    let path = match read_user_path(memory, args[1]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -2237,11 +2237,11 @@ pub(super) async fn renameat2<R: Resources, M: UserMemory, F: Filesystem<R>>(
         RENAME_EXCHANGE => RenameMode::Exchange,
         _ => return errno(EINVAL),
     };
-    let old_path = match read_user_path(memory, args[1]) {
+    let old_path = match read_user_path(memory, args[1]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
-    let new_path = match read_user_path(memory, args[3]) {
+    let new_path = match read_user_path(memory, args[3]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -2329,11 +2329,11 @@ pub(super) async fn linkat<R: Resources, M: UserMemory, F: Filesystem<R>>(
     if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
         return errno(EINVAL);
     }
-    let old_path = match read_user_path(memory, args[1]) {
+    let old_path = match read_user_path(memory, args[1]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
-    let new_path = match read_user_path(memory, args[3]) {
+    let new_path = match read_user_path(memory, args[3]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -2431,12 +2431,12 @@ pub(super) async fn symlinkat<R: Resources, M: UserMemory, F: Filesystem<R>>(
     memory: &M,
     fs: &mut F,
 ) -> u64 {
-    let target = match read_user_path(memory, args[0]) {
+    let target = match read_user_path(memory, args[0]).await {
         Ok(target) => target,
         Err(err) => return err,
     };
     let new_dirfd = args[1] as u32 as i32;
-    let link_path = match read_user_path(memory, args[2]) {
+    let link_path = match read_user_path(memory, args[2]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -2516,7 +2516,7 @@ pub(super) async fn utimensat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         (TimeUpdate::Now, TimeUpdate::Now)
     } else {
         let mut raw = [0u8; 32];
-        if memory.read(times_ptr, &mut raw).is_err() {
+        if memory.read(times_ptr, &mut raw).await.is_err() {
             return errno(EFAULT);
         }
         let asec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
@@ -2561,7 +2561,7 @@ pub(super) async fn utimensat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         };
     }
 
-    let path = match read_user_path(memory, path_ptr) {
+    let path = match read_user_path(memory, path_ptr).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -2607,7 +2607,7 @@ pub(super) async fn chdir<R: Resources, M: UserMemory, F: Filesystem<R>>(
     memory: &M,
     fs: &F,
 ) -> u64 {
-    let path = match read_user_path(memory, args[0]) {
+    let path = match read_user_path(memory, args[0]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -2676,7 +2676,7 @@ pub(super) async fn fchdir<R: Resources, F: Filesystem<R>>(
     0
 }
 
-pub(super) fn getcwd<R: Resources, M: UserMemory>(
+pub(super) async fn getcwd<R: Resources, M: UserMemory>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -2701,7 +2701,7 @@ pub(super) fn getcwd<R: Resources, M: UserMemory>(
     let mut out = Vec::with_capacity(needed);
     out.extend_from_slice(visible.as_bytes());
     out.push(0);
-    match memory.write(buf, &out) {
+    match memory.write(buf, &out).await {
         Ok(()) => needed as u64,
         Err(_) => errno(EFAULT),
     }
@@ -2764,7 +2764,7 @@ pub(super) async fn read_file<R: Resources, M: UserMemory, F: Filesystem<R>>(
             if bytes.is_empty() {
                 break;
             }
-            if memory.write(buf + done as u64, &bytes).is_err() {
+            if memory.write(buf + done as u64, &bytes).await.is_err() {
                 return if done == 0 {
                     errno(EFAULT)
                 } else {
@@ -2796,7 +2796,7 @@ pub(super) async fn read_file<R: Resources, M: UserMemory, F: Filesystem<R>>(
             if bytes.is_empty() {
                 break;
             }
-            if memory.write(buf + done as u64, &bytes).is_err() {
+            if memory.write(buf + done as u64, &bytes).await.is_err() {
                 return if done == 0 {
                     errno(EFAULT)
                 } else {
@@ -2861,7 +2861,7 @@ pub(super) async fn write_file<R: Resources, M: VirtualMemory, F: Filesystem<R>>
             let addr = buf + written;
             let page_rem = chunk.len() - (addr as usize & (chunk.len() - 1));
             let size = (total_req - written).min(page_rem as u64) as usize;
-            if memory.read(addr, &mut chunk[..size]).is_err() {
+            if memory.read(addr, &mut chunk[..size]).await.is_err() {
                 return if written == 0 { errno(EFAULT) } else { written };
             }
             let position = if append {
@@ -2890,7 +2890,8 @@ pub(super) async fn write_file<R: Resources, M: VirtualMemory, F: Filesystem<R>>
                     &chunk[..landed.len],
                     memory,
                     fs,
-                );
+                )
+                .await;
             }
             written += landed.len as u64;
             if landed.len < size {
@@ -2903,7 +2904,7 @@ pub(super) async fn write_file<R: Resources, M: VirtualMemory, F: Filesystem<R>>
             let addr = buf + written;
             let page_rem = chunk.len() - (addr as usize & (chunk.len() - 1));
             let size = (total_req - written).min(page_rem as u64) as usize;
-            if memory.read(addr, &mut chunk[..size]).is_err() {
+            if memory.read(addr, &mut chunk[..size]).await.is_err() {
                 return if written == 0 { errno(EFAULT) } else { written };
             }
             let position = if append {
@@ -2935,7 +2936,8 @@ pub(super) async fn write_file<R: Resources, M: VirtualMemory, F: Filesystem<R>>
                     &chunk[..landed.len],
                     memory,
                     fs,
-                );
+                )
+                .await;
             }
             written += landed.len as u64;
             if landed.len < size {
@@ -3092,7 +3094,7 @@ pub(super) async fn pwrite64<R: Resources, M: VirtualMemory, O: Stdio + System +
     .await
 }
 
-fn read_iovecs<M: UserMemory>(
+async fn read_iovecs<M: UserMemory>(
     memory: &M,
     iov_ptr: u64,
     iovcnt: u64,
@@ -3112,6 +3114,7 @@ fn read_iovecs<M: UserMemory>(
     for index in 0..count {
         if memory
             .read(iov_ptr + u64::from(index) * 16, &mut raw)
+            .await
             .is_err()
         {
             return Err(errno(EFAULT));
@@ -3161,7 +3164,7 @@ pub(super) async fn readv_common<
     {
         return SyscallOutcome::Return(errno(EINVAL));
     }
-    let iovs = match read_iovecs(memory, args[1], args[2]) {
+    let iovs = match read_iovecs(memory, args[1], args[2]).await {
         Ok(iovs) => iovs,
         Err(err) => return SyscallOutcome::Return(err),
     };
@@ -3181,7 +3184,7 @@ pub(super) async fn readv_common<
         let mut total = 0usize;
         for &(base, len) in &iovs {
             let take = len.min(MAX_RW_COUNT - total as u64) as usize;
-            if take > 0 && memory.check_writable(base, take).is_err() {
+            if take > 0 && memory.check_writable(base, take).await.is_err() {
                 return SyscallOutcome::Return(errno(EFAULT));
             }
             total = total.saturating_add(take);
@@ -3202,6 +3205,7 @@ pub(super) async fn readv_common<
             if take > 0 {
                 if memory
                     .write(base, &recv.data[offset..offset + take])
+                    .await
                     .is_err()
                 {
                     return SyscallOutcome::Return(if offset == 0 {
@@ -3291,7 +3295,7 @@ pub(super) async fn writev_common<
     {
         return SyscallOutcome::Return(errno(EINVAL));
     }
-    let iovs = match read_iovecs(memory, args[1], args[2]) {
+    let iovs = match read_iovecs(memory, args[1], args[2]).await {
         Ok(iovs) => iovs,
         Err(err) => return SyscallOutcome::Return(err),
     };
@@ -3321,7 +3325,7 @@ pub(super) async fn writev_common<
                 let Some(addr) = base.checked_add(copied as u64) else {
                     return SyscallOutcome::Return(errno(EFAULT));
                 };
-                if memory.read(addr, &mut chunk[..step]).is_err() {
+                if memory.read(addr, &mut chunk[..step]).await.is_err() {
                     return SyscallOutcome::Return(errno(EFAULT));
                 }
                 data.extend_from_slice(&chunk[..step]);
@@ -3517,6 +3521,7 @@ pub(super) async fn getdents64<R: Resources, M: UserMemory, F: Filesystem<R>>(
         record[19..19 + name.len()].copy_from_slice(name);
         if memory
             .write(dirp.wrapping_add(written as u64), &record)
+            .await
             .is_err()
         {
             return if written == 0 {
@@ -3572,7 +3577,7 @@ pub(super) async fn truncate<R: Resources, M: UserMemory, F: Filesystem<R>>(
     if length < 0 {
         return errno(EINVAL);
     }
-    let path = match read_user_path(memory, args[0]) {
+    let path = match read_user_path(memory, args[0]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -3683,7 +3688,7 @@ pub(super) async fn fchmodat2<R: Resources, M: UserMemory, F: Filesystem<R>>(
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return errno(EINVAL);
     }
-    let path = match read_user_path(memory, args[1]) {
+    let path = match read_user_path(memory, args[1]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -3828,7 +3833,7 @@ pub(super) async fn fchownat<R: Resources, M: UserMemory, F: Filesystem<R>>(
     }
     let uid = (uid_raw != u32::MAX).then_some(uid_raw);
     let gid = (gid_raw != u32::MAX).then_some(gid_raw);
-    let path = match read_user_path(memory, args[1]) {
+    let path = match read_user_path(memory, args[1]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -4000,7 +4005,7 @@ pub(super) async fn mknodat<R: Resources, M: UserMemory, F: Filesystem<R>>(
     fs: &mut F,
 ) -> u64 {
     let dirfd = args[0] as u32 as i32;
-    let path = match read_user_path(memory, args[1]) {
+    let path = match read_user_path(memory, args[1]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -4079,7 +4084,7 @@ pub(super) async fn setxattr_path<R: Resources, M: UserMemory, F: Filesystem<R>>
     memory: &M,
     fs: &mut F,
 ) -> u64 {
-    let path = match read_user_path(memory, args[0]) {
+    let path = match read_user_path(memory, args[0]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -4091,7 +4096,7 @@ pub(super) async fn setxattr_path<R: Resources, M: UserMemory, F: Filesystem<R>>
         Ok(mode) => mode,
         Err(err) => return err,
     };
-    let name = match read_xattr_name(memory, args[1]) {
+    let name = match read_xattr_name(memory, args[1]).await {
         Ok(name) => name,
         Err(err) => return err,
     };
@@ -4100,7 +4105,7 @@ pub(super) async fn setxattr_path<R: Resources, M: UserMemory, F: Filesystem<R>>
         return errno(E2BIG);
     }
     let mut value = alloc::vec![0u8; size as usize];
-    if !value.is_empty() && memory.read(args[2], &mut value).is_err() {
+    if !value.is_empty() && memory.read(args[2], &mut value).await.is_err() {
         return errno(EFAULT);
     }
     let creds = process_creds(process);
@@ -4130,7 +4135,7 @@ pub(super) async fn fsetxattr<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(mode) => mode,
         Err(err) => return err,
     };
-    let name = match read_xattr_name(memory, args[1]) {
+    let name = match read_xattr_name(memory, args[1]).await {
         Ok(name) => name,
         Err(err) => return err,
     };
@@ -4139,7 +4144,7 @@ pub(super) async fn fsetxattr<R: Resources, M: UserMemory, F: Filesystem<R>>(
         return errno(E2BIG);
     }
     let mut value = alloc::vec![0u8; size as usize];
-    if !value.is_empty() && memory.read(args[2], &mut value).is_err() {
+    if !value.is_empty() && memory.read(args[2], &mut value).await.is_err() {
         return errno(EFAULT);
     }
     let Some(entry) = process.shared.descriptors.lock().get_entry(fd).cloned() else {
@@ -4161,14 +4166,14 @@ pub(super) async fn fsetxattr<R: Resources, M: UserMemory, F: Filesystem<R>>(
     }
 }
 
-fn finish_xattr_read<M: UserMemory>(memory: &mut M, buf: u64, size: u64, data: &[u8]) -> u64 {
+async fn finish_xattr_read<M: UserMemory>(memory: &mut M, buf: u64, size: u64, data: &[u8]) -> u64 {
     if size == 0 {
         return data.len() as u64;
     }
     if (data.len() as u64) > size {
         return errno(ERANGE);
     }
-    if !data.is_empty() && memory.write(buf, data).is_err() {
+    if !data.is_empty() && memory.write(buf, data).await.is_err() {
         return errno(EFAULT);
     }
     data.len() as u64
@@ -4181,14 +4186,14 @@ pub(super) async fn getxattr_path<R: Resources, M: UserMemory, F: Filesystem<R>>
     memory: &mut M,
     fs: &F,
 ) -> u64 {
-    let path = match read_user_path(memory, args[0]) {
+    let path = match read_user_path(memory, args[0]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
     if path.is_empty() {
         return errno(ENOENT);
     }
-    let name = match read_xattr_name(memory, args[1]) {
+    let name = match read_xattr_name(memory, args[1]).await {
         Ok(name) => name,
         Err(err) => return err,
     };
@@ -4202,7 +4207,7 @@ pub(super) async fn getxattr_path<R: Resources, M: UserMemory, F: Filesystem<R>>
         .get_xattr_path(&cwd, &resolved_path, follow, &name, &creds)
         .await
     {
-        Ok(data) => finish_xattr_read(memory, args[2], args[3], &data),
+        Ok(data) => finish_xattr_read(memory, args[2], args[3], &data).await,
         Err(error) => fs_errno(error),
     }
 }
@@ -4214,7 +4219,7 @@ pub(super) async fn fgetxattr<R: Resources, M: UserMemory, F: Filesystem<R>>(
     fs: &F,
 ) -> u64 {
     let fd = args[0] as u32 as i32;
-    let name = match read_xattr_name(memory, args[1]) {
+    let name = match read_xattr_name(memory, args[1]).await {
         Ok(name) => name,
         Err(err) => return err,
     };
@@ -4229,7 +4234,7 @@ pub(super) async fn fgetxattr<R: Resources, M: UserMemory, F: Filesystem<R>>(
     };
     let creds = process_creds(process);
     match fs.get_xattr_file(open.node(), &name, &creds).await {
-        Ok(data) => finish_xattr_read(memory, args[2], args[3], &data),
+        Ok(data) => finish_xattr_read(memory, args[2], args[3], &data).await,
         Err(error) => fs_errno(error),
     }
 }
@@ -4254,7 +4259,7 @@ pub(super) async fn listxattr_path<R: Resources, M: UserMemory, F: Filesystem<R>
     memory: &mut M,
     fs: &F,
 ) -> u64 {
-    let path = match read_user_path(memory, args[0]) {
+    let path = match read_user_path(memory, args[0]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -4278,7 +4283,7 @@ pub(super) async fn listxattr_path<R: Resources, M: UserMemory, F: Filesystem<R>
         Ok(packed) => packed,
         Err(err) => return err,
     };
-    finish_xattr_read(memory, args[1], args[2], &packed)
+    finish_xattr_read(memory, args[1], args[2], &packed).await
 }
 
 pub(super) async fn flistxattr<R: Resources, M: UserMemory, F: Filesystem<R>>(
@@ -4306,7 +4311,7 @@ pub(super) async fn flistxattr<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(packed) => packed,
         Err(err) => return err,
     };
-    finish_xattr_read(memory, args[1], args[2], &packed)
+    finish_xattr_read(memory, args[1], args[2], &packed).await
 }
 
 pub(super) async fn removexattr_path<R: Resources, M: UserMemory, F: Filesystem<R>>(
@@ -4316,14 +4321,14 @@ pub(super) async fn removexattr_path<R: Resources, M: UserMemory, F: Filesystem<
     memory: &M,
     fs: &mut F,
 ) -> u64 {
-    let path = match read_user_path(memory, args[0]) {
+    let path = match read_user_path(memory, args[0]).await {
         Ok(path) => path,
         Err(err) => return err,
     };
     if path.is_empty() {
         return errno(ENOENT);
     }
-    let name = match read_xattr_name(memory, args[1]) {
+    let name = match read_xattr_name(memory, args[1]).await {
         Ok(name) => name,
         Err(err) => return err,
     };
@@ -4349,7 +4354,7 @@ pub(super) async fn fremovexattr<R: Resources, M: UserMemory, F: Filesystem<R>>(
     fs: &mut F,
 ) -> u64 {
     let fd = args[0] as u32 as i32;
-    let name = match read_xattr_name(memory, args[1]) {
+    let name = match read_xattr_name(memory, args[1]).await {
         Ok(name) => name,
         Err(err) => return err,
     };

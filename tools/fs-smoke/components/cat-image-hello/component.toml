@@ -1,0 +1,17 @@
+description = "Read /image/hello.txt from the EROFS smoke mount"
+name = "cat-image-hello"
+runner = "exec"
+program = "/bin/cat"
+args = ["/image/hello.txt"]
+startup = "eager"
+lifecycle = "oneshot"
+restart = "never"
+critical = "system"
+escalation = "halt"
+oom_tier = "user"
+
+[capabilities]
+directories = [
+  { source = "/", guest = "/", rights = ["read", "execute"] },
+]
+link = ["symlink-read"]

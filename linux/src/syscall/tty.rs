@@ -283,7 +283,7 @@ fn tty_errno(error: TtyError) -> u64 {
     })
 }
 
-pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
+pub(super) async fn ioctl<R: Resources, M: UserMemory, T: Tty>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -327,7 +327,7 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
 
     if request == FIONBIO {
         let mut raw = [0u8; 4];
-        if memory.read(arg, &mut raw).is_err() {
+        if memory.read(arg, &mut raw).await.is_err() {
             return errno(EFAULT);
         }
         let enable = i32::from_le_bytes(raw) != 0;
@@ -356,7 +356,7 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
         };
         if let Some(bytes) = available {
             let count = i32::try_from(bytes).unwrap_or(i32::MAX);
-            return match memory.write(arg, &count.to_le_bytes()) {
+            return match memory.write(arg, &count.to_le_bytes()).await {
                 Ok(()) => 0,
                 Err(_) => errno(EFAULT),
             };
@@ -366,13 +366,13 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
 
     if let FileDescriptor::PtyMaster(master) = &entry.descriptor {
         return match request {
-            TIOCGPTN => match memory.write(arg, &master.index().to_le_bytes()) {
+            TIOCGPTN => match memory.write(arg, &master.index().to_le_bytes()).await {
                 Ok(()) => 0,
                 Err(_) => errno(EFAULT),
             },
             TIOCSPTLCK => {
                 let mut raw = [0u8; 4];
-                if memory.read(arg, &mut raw).is_err() {
+                if memory.read(arg, &mut raw).await.is_err() {
                     return errno(EFAULT);
                 }
                 master.set_locked(i32::from_le_bytes(raw) != 0);
@@ -380,21 +380,21 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
             }
             TIOCGPTLCK => {
                 let locked = i32::from(master.is_locked());
-                match memory.write(arg, &locked.to_le_bytes()) {
+                match memory.write(arg, &locked.to_le_bytes()).await {
                     Ok(()) => 0,
                     Err(_) => errno(EFAULT),
                 }
             }
             TCGETS => {
                 let termios = Termios::from_pty(master.termios());
-                match memory.write(arg, &termios.to_bytes()) {
+                match memory.write(arg, &termios.to_bytes()).await {
                     Ok(()) => 0,
                     Err(_) => errno(EFAULT),
                 }
             }
             TCSETS | TCSETSW | TCSETSF => {
                 let mut raw = [0u8; TERMIOS_SIZE];
-                if memory.read(arg, &mut raw).is_err() {
+                if memory.read(arg, &mut raw).await.is_err() {
                     return errno(EFAULT);
                 }
                 master.set_termios(Termios::from_bytes(&raw).into_pty(), request == TCSETSF);
@@ -402,14 +402,14 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
             }
             TIOCGWINSZ => {
                 let ws = Winsize::from_pty(master.winsize());
-                match memory.write(arg, &ws.to_bytes()) {
+                match memory.write(arg, &ws.to_bytes()).await {
                     Ok(()) => 0,
                     Err(_) => errno(EFAULT),
                 }
             }
             TIOCSWINSZ => {
                 let mut raw = [0u8; WINSIZE_SIZE];
-                if memory.read(arg, &mut raw).is_err() {
+                if memory.read(arg, &mut raw).await.is_err() {
                     return errno(EFAULT);
                 }
                 master.set_winsize(Winsize::from_bytes(&raw).into_pty());
@@ -417,14 +417,14 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
             }
             TIOCGPGRP => {
                 let pgrp = master.fg_pgrp() as i32;
-                match memory.write(arg, &pgrp.to_le_bytes()) {
+                match memory.write(arg, &pgrp.to_le_bytes()).await {
                     Ok(()) => 0,
                     Err(_) => errno(EFAULT),
                 }
             }
             TIOCSPGRP => {
                 let mut raw = [0u8; 4];
-                if memory.read(arg, &mut raw).is_err() {
+                if memory.read(arg, &mut raw).await.is_err() {
                     return errno(EFAULT);
                 }
                 let pgrp = i32::from_le_bytes(raw);
@@ -435,7 +435,7 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
                 0
             }
             TIOCGSID => match master.session_id() {
-                Some(sid) => match memory.write(arg, &(sid as i32).to_le_bytes()) {
+                Some(sid) => match memory.write(arg, &(sid as i32).to_le_bytes()).await {
                     Ok(()) => 0,
                     Err(_) => errno(EFAULT),
                 },
@@ -449,14 +449,14 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
         return match request {
             TCGETS => {
                 let termios = Termios::from_pty(slave.termios());
-                match memory.write(arg, &termios.to_bytes()) {
+                match memory.write(arg, &termios.to_bytes()).await {
                     Ok(()) => 0,
                     Err(_) => errno(EFAULT),
                 }
             }
             TCSETS | TCSETSW | TCSETSF => {
                 let mut raw = [0u8; TERMIOS_SIZE];
-                if memory.read(arg, &mut raw).is_err() {
+                if memory.read(arg, &mut raw).await.is_err() {
                     return errno(EFAULT);
                 }
                 slave.set_termios(Termios::from_bytes(&raw).into_pty(), request == TCSETSF);
@@ -464,14 +464,14 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
             }
             TIOCGWINSZ => {
                 let ws = Winsize::from_pty(slave.winsize());
-                match memory.write(arg, &ws.to_bytes()) {
+                match memory.write(arg, &ws.to_bytes()).await {
                     Ok(()) => 0,
                     Err(_) => errno(EFAULT),
                 }
             }
             TIOCSWINSZ => {
                 let mut raw = [0u8; WINSIZE_SIZE];
-                if memory.read(arg, &mut raw).is_err() {
+                if memory.read(arg, &mut raw).await.is_err() {
                     return errno(EFAULT);
                 }
                 slave.set_winsize(Winsize::from_bytes(&raw).into_pty());
@@ -537,14 +537,14 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
                 } else {
                     process.shared.signals.pgid() as i32
                 };
-                match memory.write(arg, &reported.to_le_bytes()) {
+                match memory.write(arg, &reported.to_le_bytes()).await {
                     Ok(()) => 0,
                     Err(_) => errno(EFAULT),
                 }
             }
             TIOCSPGRP => {
                 let mut raw = [0u8; 4];
-                if memory.read(arg, &mut raw).is_err() {
+                if memory.read(arg, &mut raw).await.is_err() {
                     return errno(EFAULT);
                 }
                 let pgrp = i32::from_le_bytes(raw);
@@ -555,7 +555,7 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
                 0
             }
             TIOCGSID => match slave.session_id() {
-                Some(sid) => match memory.write(arg, &(sid as i32).to_le_bytes()) {
+                Some(sid) => match memory.write(arg, &(sid as i32).to_le_bytes()).await {
                     Ok(()) => 0,
                     Err(_) => errno(EFAULT),
                 },
@@ -586,7 +586,7 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
                 return errno(ENOTTY);
             }
             let pgrp = process.shared.signals.pgid() as i32;
-            match memory.write(arg, &pgrp.to_le_bytes()) {
+            match memory.write(arg, &pgrp.to_le_bytes()).await {
                 Ok(()) => 0,
                 Err(_) => errno(EFAULT),
             }
@@ -596,7 +596,7 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
                 return errno(ENOTTY);
             }
             let mut raw = [0u8; 4];
-            if memory.read(arg, &mut raw).is_err() {
+            if memory.read(arg, &mut raw).await.is_err() {
                 return errno(EFAULT);
             }
             if i32::from_le_bytes(raw) <= 0 {
@@ -605,7 +605,7 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
             0
         }
         TCGETS => match tty.get_termios(stream) {
-            Ok(termios) => match memory.write(arg, &termios.to_bytes()) {
+            Ok(termios) => match memory.write(arg, &termios.to_bytes()).await {
                 Ok(()) => 0,
                 Err(_) => errno(EFAULT),
             },
@@ -616,7 +616,7 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
                 return errno(ENOTTY);
             }
             let mut raw = [0u8; TERMIOS_SIZE];
-            if memory.read(arg, &mut raw).is_err() {
+            if memory.read(arg, &mut raw).await.is_err() {
                 return errno(EFAULT);
             }
             let action = match request {
@@ -636,7 +636,7 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
             }
         }
         TIOCGWINSZ => match tty.get_winsize(stream) {
-            Ok(winsize) => match memory.write(arg, &winsize.to_bytes()) {
+            Ok(winsize) => match memory.write(arg, &winsize.to_bytes()).await {
                 Ok(()) => 0,
                 Err(_) => errno(EFAULT),
             },
@@ -647,7 +647,7 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
                 return errno(ENOTTY);
             }
             let mut raw = [0u8; WINSIZE_SIZE];
-            if memory.read(arg, &mut raw).is_err() {
+            if memory.read(arg, &mut raw).await.is_err() {
                 return errno(EFAULT);
             }
             match tty.set_winsize(stream, Winsize::from_bytes(&raw)) {

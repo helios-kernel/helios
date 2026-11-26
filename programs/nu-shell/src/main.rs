@@ -6,6 +6,7 @@
 //! - `nu` (no arguments): interactive REPL reading incrementally from `wasi:cli/stdin`
 //!   so terminals such as `programs/compositor` receive immediate responses per line.
 
+mod control;
 mod env;
 
 use helios_api::bindings::wasi::cli::{environment, exit, stdin};
@@ -295,6 +296,8 @@ async fn render_pipeline_output(
             stream,
             stderr: err_rx,
             exit_code,
+            upstream_exits,
+            merge_stderr,
             ..
         } => {
             let out_task = async move {
@@ -312,25 +315,48 @@ async fn render_pipeline_output(
                         if let Ok(bytes) = chunk
                             && !bytes.is_empty()
                         {
-                            let _ = stderr.write_all(&bytes).await;
+                            if merge_stderr {
+                                let _ = stdout.write_all(&bytes).await;
+                            } else {
+                                let _ = stderr.write_all(&bytes).await;
+                            }
                         }
                     }
                 }
             };
             let ((), ()) = futures_lite::future::zip(out_task, err_task).await;
 
+            let mut upstream_non_zero = None;
+            for upstream in upstream_exits {
+                if let Ok(code) = upstream.exit_code.recv().await {
+                    match code {
+                        Ok(status) if status != 0 && upstream_non_zero.is_none() => {
+                            upstream_non_zero = Some(status);
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            stderr.writeln(&format!("nu: {err}")).await?;
+                            return Ok(1);
+                        }
+                    }
+                }
+            }
             if let Some(code_rx) = exit_code
                 && let Ok(code) = code_rx.recv().await
             {
                 return match code {
-                    Ok(status) => Ok(status),
+                    Ok(status) => Ok(if status != 0 {
+                        status
+                    } else {
+                        upstream_non_zero.unwrap_or(0)
+                    }),
                     Err(err) => {
                         stderr.writeln(&format!("nu: {err}")).await?;
                         Ok(1)
                     }
                 };
             }
-            Ok(0)
+            Ok(upstream_non_zero.unwrap_or(0))
         }
         other => match other.into_value_async(Span::unknown()).await {
             Ok(val) => {

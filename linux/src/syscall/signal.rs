@@ -913,7 +913,7 @@ fn set_eintr<C: UserContext>(abi: Abi, context: &mut C) {
 /// mode, handling `SA_RESTART`, `SA_RESETHAND`, `SA_NODEFER`, `SA_ONSTACK`,
 /// `SS_AUTODISARM`, `TIF_RESTORE_SIGMASK`, stop/continue, and default fatal
 /// actions (`kernel/signal.c` `get_signal` + arch `do_signal`).
-pub fn deliver_pending_signals<C: UserContext, M: UserMemory>(
+pub async fn deliver_pending_signals<C: UserContext, M: UserMemory>(
     abi: Abi,
     thread: &ThreadSignalSlot,
     context: &mut C,
@@ -1021,7 +1021,9 @@ pub fn deliver_pending_signals<C: UserContext, M: UserMemory>(
                         sigreturn_trampoline,
                         fault_address: 0,
                     },
-                ) {
+                )
+                .await
+                {
                     Ok(used_altstack) => {
                         if used_altstack && (altstack.flags & SS_AUTODISARM != 0) {
                             *thread.altstack.lock() = SigAltStack::disabled();
@@ -1046,7 +1048,7 @@ pub fn deliver_pending_signals<C: UserContext, M: UserMemory>(
 /// is masked, ignored, or set to `SIG_DFL` (or writing the signal frame
 /// faults), the process is forcefully terminated (`kernel/signal.c`
 /// `force_sig_info_to_task`).
-pub fn deliver_fault_signal<C: UserContext, M: UserMemory>(
+pub async fn deliver_fault_signal<C: UserContext, M: UserMemory>(
     abi: Abi,
     thread: &ThreadSignalSlot,
     fault: UserFault,
@@ -1064,12 +1066,13 @@ pub fn deliver_fault_signal<C: UserContext, M: UserMemory>(
         memory,
         sigreturn_trampoline,
     )
+    .await
 }
 
 /// Delivers a synchronous `SIGBUS` (`BUS_ADRERR`) fault with `si_addr =
 /// fault_address` (such as accessing a whole page beyond a mapped file's end)
 /// using Linux `force_sig_fault` semantics.
-pub fn deliver_bus_fault_signal<C: UserContext, M: UserMemory>(
+pub async fn deliver_bus_fault_signal<C: UserContext, M: UserMemory>(
     abi: Abi,
     thread: &ThreadSignalSlot,
     fault_address: u64,
@@ -1094,9 +1097,10 @@ pub fn deliver_bus_fault_signal<C: UserContext, M: UserMemory>(
         memory,
         sigreturn_trampoline,
     )
+    .await
 }
 
-fn deliver_forced_siginfo<C: UserContext, M: UserMemory>(
+async fn deliver_forced_siginfo<C: UserContext, M: UserMemory>(
     abi: Abi,
     thread: &ThreadSignalSlot,
     info: SigInfo,
@@ -1155,7 +1159,9 @@ fn deliver_forced_siginfo<C: UserContext, M: UserMemory>(
             sigreturn_trampoline,
             fault_address,
         },
-    ) {
+    )
+    .await
+    {
         Ok(used_altstack) => {
             if used_altstack && (altstack.flags & SS_AUTODISARM != 0) {
                 *thread.altstack.lock() = SigAltStack::disabled();
@@ -1172,13 +1178,13 @@ fn deliver_forced_siginfo<C: UserContext, M: UserMemory>(
 
 /// Restores register context, extended state, signal mask, and alternate stack
 /// from the user signal frame on `rt_sigreturn`.
-pub fn restore_from_sigreturn<C: UserContext, M: UserMemory>(
+pub async fn restore_from_sigreturn<C: UserContext, M: UserMemory>(
     abi: Abi,
     thread: &ThreadSignalSlot,
     context: &mut C,
     memory: &M,
 ) -> Result<(), SignalFrameError> {
-    let restored = signal_frame::restore_signal_frame(abi, context, memory)?;
+    let restored = signal_frame::restore_signal_frame(abi, context, memory).await?;
     *thread.saved_mask.lock() = None;
     thread.set_mask(restored.sigmask);
 
@@ -1211,7 +1217,7 @@ pub fn restore_from_sigreturn<C: UserContext, M: UserMemory>(
 
 /// `rt_sigaction(signum, act, oldact, sigsetsize)` (`kernel/signal.c`
 /// `do_sigaction`).
-pub(super) fn rt_sigaction<M: UserMemory>(
+pub(super) async fn rt_sigaction<M: UserMemory>(
     signals: &ProcessSignals,
     args: [u64; 6],
     memory: &mut M,
@@ -1232,7 +1238,7 @@ pub(super) fn rt_sigaction<M: UserMemory>(
 
     let new_bytes = if act_ptr != 0 {
         let mut buf = [0u8; KERNEL_SIGACTION_BYTES];
-        if memory.read(act_ptr, &mut buf).is_err() {
+        if memory.read(act_ptr, &mut buf).await.is_err() {
             return errno(EFAULT);
         }
         Some(buf)
@@ -1248,7 +1254,7 @@ pub(super) fn rt_sigaction<M: UserMemory>(
         (old, ignored)
     };
 
-    if oldact_ptr != 0 && memory.write(oldact_ptr, &old_bytes).is_err() {
+    if oldact_ptr != 0 && memory.write(oldact_ptr, &old_bytes).await.is_err() {
         // Writing oldact failed; on Linux the read/write order checks oldact
         // before mutating, so restore if we changed it.
         if new_bytes.is_some() {
@@ -1267,7 +1273,7 @@ pub(super) fn rt_sigaction<M: UserMemory>(
 
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)` (`kernel/signal.c`
 /// `SYSCALL_DEFINE4(rt_sigprocmask)`).
-pub(super) fn rt_sigprocmask<M: UserMemory>(
+pub(super) async fn rt_sigprocmask<M: UserMemory>(
     thread: &ThreadSignalSlot,
     args: [u64; 6],
     memory: &mut M,
@@ -1283,7 +1289,7 @@ pub(super) fn rt_sigprocmask<M: UserMemory>(
     let old_mask = thread.current_mask();
     let new_mask = if set_ptr != 0 {
         let mut buf = [0u8; 8];
-        if memory.read(set_ptr, &mut buf).is_err() {
+        if memory.read(set_ptr, &mut buf).await.is_err() {
             return errno(EFAULT);
         }
         let requested = SignalSet::from_bits(u64::from_le_bytes(buf));
@@ -1300,6 +1306,7 @@ pub(super) fn rt_sigprocmask<M: UserMemory>(
     if oldset_ptr != 0
         && memory
             .write(oldset_ptr, &old_mask.bits().to_le_bytes())
+            .await
             .is_err()
     {
         return errno(EFAULT);
@@ -1312,7 +1319,7 @@ pub(super) fn rt_sigprocmask<M: UserMemory>(
 }
 
 /// `rt_sigpending(set, sigsetsize)` (`kernel/signal.c` `do_sigpending`).
-pub(super) fn rt_sigpending<M: UserMemory>(
+pub(super) async fn rt_sigpending<M: UserMemory>(
     thread: &ThreadSignalSlot,
     args: [u64; 6],
     memory: &mut M,
@@ -1323,7 +1330,7 @@ pub(super) fn rt_sigpending<M: UserMemory>(
         return errno(EINVAL);
     }
     let pending = thread.pending_set().bits().to_le_bytes();
-    if memory.write(set_ptr, &pending).is_err() {
+    if memory.write(set_ptr, &pending).await.is_err() {
         return errno(EFAULT);
     }
     0
@@ -1342,7 +1349,7 @@ pub(super) async fn rt_sigsuspend<M: UserMemory>(
         return SyscallOutcome::Return(errno(EINVAL));
     }
     let mut buf = [0u8; 8];
-    if memory.read(set_ptr, &mut buf).is_err() {
+    if memory.read(set_ptr, &mut buf).await.is_err() {
         return SyscallOutcome::Return(errno(EFAULT));
     }
     let temp_mask = SignalSet::from_bits(u64::from_le_bytes(buf)).without_uncatchable();
@@ -1384,14 +1391,14 @@ pub(super) async fn rt_sigtimedwait<M: UserMemory, C: Clock>(
         return SyscallOutcome::Return(errno(EINVAL));
     }
     let mut mask_buf = [0u8; 8];
-    if memory.read(uthese, &mut mask_buf).is_err() {
+    if memory.read(uthese, &mut mask_buf).await.is_err() {
         return SyscallOutcome::Return(errno(EFAULT));
     }
     let wanted = SignalSet::from_bits(u64::from_le_bytes(mask_buf)).without_uncatchable();
 
     let timeout_ns = if uts != 0 {
         let mut ts = [0u8; TIMESPEC_BYTES];
-        if memory.read(uts, &mut ts).is_err() {
+        if memory.read(uts, &mut ts).await.is_err() {
             return SyscallOutcome::Return(errno(EFAULT));
         }
         let sec = i64::from_le_bytes(ts[0..8].try_into().unwrap());
@@ -1409,7 +1416,7 @@ pub(super) async fn rt_sigtimedwait<M: UserMemory, C: Clock>(
     };
 
     if let Some(info) = thread.take_any_matching(wanted) {
-        return SyscallOutcome::Return(write_sigtimedwait_info(memory, uinfo, info));
+        return SyscallOutcome::Return(write_sigtimedwait_info(memory, uinfo, info).await);
     }
     if timeout_ns == Some(0) {
         return SyscallOutcome::Return(errno(EAGAIN));
@@ -1424,7 +1431,7 @@ pub(super) async fn rt_sigtimedwait<M: UserMemory, C: Clock>(
     loop {
         let mut wake = thread.wake_notify.waiter();
         if let Some(info) = thread.take_any_matching(wanted) {
-            return SyscallOutcome::Return(write_sigtimedwait_info(memory, uinfo, info));
+            return SyscallOutcome::Return(write_sigtimedwait_info(memory, uinfo, info).await);
         }
         // An unmasked deliverable signal NOT in `wanted` interrupts
         // `rt_sigtimedwait` with `-EINTR` (`sigtimedwait(2)`).
@@ -1469,10 +1476,10 @@ fn has_non_ignored_signal(process: &ProcessSignals, mut set: SignalSet) -> bool 
     false
 }
 
-fn write_sigtimedwait_info<M: UserMemory>(memory: &mut M, uinfo: u64, info: SigInfo) -> u64 {
+async fn write_sigtimedwait_info<M: UserMemory>(memory: &mut M, uinfo: u64, info: SigInfo) -> u64 {
     if uinfo != 0 {
         let encoded: [u8; SIGINFO_SIZE] = info.encode();
-        if memory.write(uinfo, &encoded).is_err() {
+        if memory.write(uinfo, &encoded).await.is_err() {
             return errno(EFAULT);
         }
     }
@@ -1480,7 +1487,7 @@ fn write_sigtimedwait_info<M: UserMemory>(memory: &mut M, uinfo: u64, info: SigI
 }
 
 /// `sigaltstack(uss, oss)` (`kernel/signal.c` `do_sigaltstack`).
-pub(super) fn sigaltstack<M: UserMemory>(
+pub(super) async fn sigaltstack<M: UserMemory>(
     abi: Abi,
     thread: &ThreadSignalSlot,
     current_sp: u64,
@@ -1494,7 +1501,7 @@ pub(super) fn sigaltstack<M: UserMemory>(
 
     let parsed_new = if uss_ptr != 0 {
         let mut buf = [0u8; STACK_T_SIZE];
-        if memory.read(uss_ptr, &mut buf).is_err() {
+        if memory.read(uss_ptr, &mut buf).await.is_err() {
             return errno(EFAULT);
         }
         let (ss_sp, ss_flags, ss_size) = SigAltStack::decode_stack_t(&buf);
@@ -1521,7 +1528,7 @@ pub(super) fn sigaltstack<M: UserMemory>(
         None
     };
 
-    if oss_ptr != 0 && memory.write(oss_ptr, &old_encoded).is_err() {
+    if oss_ptr != 0 && memory.write(oss_ptr, &old_encoded).await.is_err() {
         return errno(EFAULT);
     }
     if let Some(updated) = parsed_new {
@@ -1760,7 +1767,7 @@ pub(super) fn alarm<C: Clock>(signals: &ProcessSignals, args: [u64; 6], clock: &
 }
 
 /// `getitimer(which, curr_value)` (`kernel/time/itimer.c` `do_getitimer`).
-pub(super) fn getitimer<M: UserMemory, C: Clock>(
+pub(super) async fn getitimer<M: UserMemory, C: Clock>(
     signals: &ProcessSignals,
     args: [u64; 6],
     memory: &mut M,
@@ -1784,7 +1791,7 @@ pub(super) fn getitimer<M: UserMemory, C: Clock>(
         }
     };
     let encoded = encode_itimerval(interval_ns, value_ns);
-    if memory.write(curr_ptr, &encoded).is_err() {
+    if memory.write(curr_ptr, &encoded).await.is_err() {
         return errno(EFAULT);
     }
     0
@@ -1792,7 +1799,7 @@ pub(super) fn getitimer<M: UserMemory, C: Clock>(
 
 /// `setitimer(which, new_value, old_value)` (`kernel/time/itimer.c`
 /// `do_setitimer`).
-pub(super) fn setitimer<M: UserMemory, C: Clock>(
+pub(super) async fn setitimer<M: UserMemory, C: Clock>(
     signals: &ProcessSignals,
     args: [u64; 6],
     memory: &mut M,
@@ -1805,13 +1812,18 @@ pub(super) fn setitimer<M: UserMemory, C: Clock>(
         return errno(EINVAL);
     }
     let mut raw = [0u8; ITIMERVAL_BYTES];
-    if memory.read(new_ptr, &mut raw).is_err() {
+    if memory.read(new_ptr, &mut raw).await.is_err() {
         return errno(EFAULT);
     }
     let Some((new_interval_ns, new_value_ns)) = decode_itimerval(&raw) else {
         return errno(EINVAL);
     };
-    if old_ptr != 0 && memory.check_writable(old_ptr, ITIMERVAL_BYTES).is_err() {
+    if old_ptr != 0
+        && memory
+            .check_writable(old_ptr, ITIMERVAL_BYTES)
+            .await
+            .is_err()
+    {
         return errno(EFAULT);
     }
 
@@ -1866,7 +1878,7 @@ pub(super) fn setitimer<M: UserMemory, C: Clock>(
     }
     if old_ptr != 0 {
         let encoded = encode_itimerval(old.0, old.1);
-        if memory.write(old_ptr, &encoded).is_err() {
+        if memory.write(old_ptr, &encoded).await.is_err() {
             return errno(EFAULT);
         }
     }

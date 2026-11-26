@@ -89,19 +89,18 @@ impl SharedMemory {
     }
 
     fn u32_at(&self, address: u64) -> u32 {
-        self.atomic_load_u32(address).unwrap()
+        self.try_atomic_load_u32(address).unwrap().unwrap()
     }
 
     fn set_u32(&mut self, address: u64, value: u32) {
-        self.atomic_store_u32(address, value).unwrap();
+        let start = usize::try_from(address).unwrap();
+        self.0.lock().unwrap()[start..start + 4].copy_from_slice(&value.to_le_bytes());
     }
 
     fn set_u64(&mut self, address: u64, value: u64) {
-        self.write(address, &value.to_le_bytes()).unwrap();
+        let start = usize::try_from(address).unwrap();
+        self.0.lock().unwrap()[start..start + 8].copy_from_slice(&value.to_le_bytes());
     }
-}
-
-impl UserMemory for SharedMemory {
     fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
         let start = usize::try_from(address).map_err(|_| MemoryFault)?;
         let end = start.checked_add(length).ok_or(MemoryFault)?;
@@ -133,24 +132,42 @@ impl UserMemory for SharedMemory {
         bytes[start..end].copy_from_slice(input);
         Ok(())
     }
+}
 
-    fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+impl UserMemory for SharedMemory {
+    async fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
+        Self::check_writable(self, address, length)
+    }
+
+    async fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+        Self::read(self, address, output)
+    }
+
+    async fn write(&mut self, address: u64, input: &[u8]) -> Result<(), MemoryFault> {
+        Self::write(self, address, input)
+    }
+
+    async fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+        self.try_atomic_load_u32(address)?.ok_or(MemoryFault)
+    }
+
+    fn try_atomic_load_u32(&self, address: u64) -> Result<Option<u32>, MemoryFault> {
         if address & 3 != 0 {
             return Err(MemoryFault);
         }
         let mut word = [0; 4];
-        self.read(address, &mut word)?;
-        Ok(u32::from_le_bytes(word))
+        Self::read(self, address, &mut word)?;
+        Ok(Some(u32::from_le_bytes(word)))
     }
 
-    fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+    async fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
         if address & 3 != 0 {
             return Err(MemoryFault);
         }
-        self.write(address, &value.to_le_bytes())
+        Self::write(self, address, &value.to_le_bytes())
     }
 
-    fn atomic_compare_exchange_u32(
+    async fn atomic_compare_exchange_u32(
         &mut self,
         address: u64,
         expected: u32,

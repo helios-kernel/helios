@@ -123,42 +123,46 @@ impl Mem {
 }
 
 impl UserMemory for Mem {
-    fn read(&self, addr: u64, out: &mut [u8]) -> Result<(), MemoryFault> {
+    async fn read(&self, addr: u64, out: &mut [u8]) -> Result<(), MemoryFault> {
         let r = self.range(addr, out.len())?;
         out.copy_from_slice(&self.bytes.lock().unwrap()[r]);
         Ok(())
     }
 
-    fn check_writable(&self, addr: u64, len: usize) -> Result<(), MemoryFault> {
+    async fn check_writable(&self, addr: u64, len: usize) -> Result<(), MemoryFault> {
         let _ = self.range(addr, len)?;
         Ok(())
     }
 
-    fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), MemoryFault> {
+    async fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), MemoryFault> {
         let r = self.range(addr, data.len())?;
         self.bytes.lock().unwrap()[r].copy_from_slice(data);
         Ok(())
     }
 
-    fn atomic_load_u32(&self, addr: u64) -> Result<u32, MemoryFault> {
-        let mut buf = [0u8; 4];
-        self.read(addr, &mut buf)?;
-        Ok(u32::from_le_bytes(buf))
+    async fn atomic_load_u32(&self, addr: u64) -> Result<u32, MemoryFault> {
+        self.try_atomic_load_u32(addr)?.ok_or(MemoryFault)
     }
 
-    fn atomic_store_u32(&mut self, addr: u64, value: u32) -> Result<(), MemoryFault> {
-        self.write(addr, &value.to_le_bytes())
+    fn try_atomic_load_u32(&self, addr: u64) -> Result<Option<u32>, MemoryFault> {
+        let r = self.range(addr, 4)?;
+        let buf: [u8; 4] = self.bytes.lock().unwrap()[r].try_into().unwrap();
+        Ok(Some(u32::from_le_bytes(buf)))
     }
 
-    fn atomic_compare_exchange_u32(
+    async fn atomic_store_u32(&mut self, addr: u64, value: u32) -> Result<(), MemoryFault> {
+        self.write(addr, &value.to_le_bytes()).await
+    }
+
+    async fn atomic_compare_exchange_u32(
         &mut self,
         addr: u64,
         expected: u32,
         desired: u32,
     ) -> Result<Result<u32, u32>, MemoryFault> {
-        let cur = self.atomic_load_u32(addr)?;
+        let cur = self.atomic_load_u32(addr).await?;
         if cur == expected {
-            self.atomic_store_u32(addr, desired)?;
+            self.atomic_store_u32(addr, desired).await?;
             Ok(Ok(cur))
         } else {
             Ok(Err(cur))
@@ -222,7 +226,10 @@ impl Thread<NoBacking> for MockHost {
     fn spawn_thread(&mut self, _: Process<NoBacking>, _: SpawnedThread) -> Result<(), SpawnError> {
         Err(SpawnError::Busy)
     }
-    fn spawn_process(&mut self, process: SpawnedProcess<NoBacking>) -> Result<(), SpawnError> {
+    async fn spawn_process(
+        &mut self,
+        process: SpawnedProcess<NoBacking>,
+    ) -> Result<(), SpawnError> {
         self.spawned.lock().unwrap().push(process);
         Ok(())
     }
@@ -1110,17 +1117,17 @@ fn fork_cow_map_shared_untouched_child_does_not_clobber_post_fork_writes() {
             }
             Ok(start..end)
         }
-    }
 
-    impl UserMemory for CowMem {
         fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
             let range = self.slice(address, output.len())?;
             output.copy_from_slice(&self.bytes[range]);
             Ok(())
         }
+
         fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
             self.slice(address, length).map(|_| ())
         }
+
         fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
             let range = self.slice(address, bytes.len())?;
             self.bytes[range].copy_from_slice(bytes);
@@ -1133,23 +1140,38 @@ fn fork_cow_map_shared_untouched_child_does_not_clobber_post_fork_writes() {
             }
             Ok(())
         }
-        fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+    }
+
+    impl UserMemory for CowMem {
+        async fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+            Self::read(self, address, output)
+        }
+        async fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
+            Self::check_writable(self, address, length)
+        }
+        async fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
+            Self::write(self, address, bytes)
+        }
+        async fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+            self.try_atomic_load_u32(address)?.ok_or(MemoryFault)
+        }
+        fn try_atomic_load_u32(&self, address: u64) -> Result<Option<u32>, MemoryFault> {
             let mut buf = [0u8; 4];
-            self.read(address, &mut buf)?;
-            Ok(u32::from_le_bytes(buf))
+            Self::read(self, address, &mut buf)?;
+            Ok(Some(u32::from_le_bytes(buf)))
         }
-        fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
-            self.write(address, &value.to_le_bytes())
+        async fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+            Self::write(self, address, &value.to_le_bytes())
         }
-        fn atomic_compare_exchange_u32(
+        async fn atomic_compare_exchange_u32(
             &mut self,
             address: u64,
             expected: u32,
             desired: u32,
         ) -> Result<Result<u32, u32>, MemoryFault> {
-            let cur = self.atomic_load_u32(address)?;
+            let cur = self.atomic_load_u32(address).await?;
             if cur == expected {
-                self.atomic_store_u32(address, desired)?;
+                self.atomic_store_u32(address, desired).await?;
                 Ok(Ok(cur))
             } else {
                 Ok(Err(cur))
@@ -1203,7 +1225,10 @@ fn fork_cow_map_shared_untouched_child_does_not_clobber_post_fork_writes() {
         ) -> Result<(), SpawnError> {
             Err(SpawnError::Busy)
         }
-        fn spawn_process(&mut self, p: SpawnedProcess<FileBacking>) -> Result<(), SpawnError> {
+        async fn spawn_process(
+            &mut self,
+            p: SpawnedProcess<FileBacking>,
+        ) -> Result<(), SpawnError> {
             self.spawned.push(p);
             Ok(())
         }

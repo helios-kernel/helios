@@ -54,42 +54,47 @@ impl FlatMem {
 }
 
 impl UserMemory for FlatMem {
-    fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+    async fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
         for (i, slot) in output.iter_mut().enumerate() {
             *slot = *self.0.get(&(address + i as u64)).ok_or(MemoryFault)?;
         }
         Ok(())
     }
-    fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
+    async fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
         if address == 0 && length > 0 {
             return Err(MemoryFault);
         }
         Ok(())
     }
-    fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
+    async fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
         if address == 0 {
             return Err(MemoryFault);
         }
         self.write_bytes(address, bytes);
         Ok(())
     }
-    fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+    async fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+        self.try_atomic_load_u32(address)?.ok_or(MemoryFault)
+    }
+    fn try_atomic_load_u32(&self, address: u64) -> Result<Option<u32>, MemoryFault> {
         let mut raw = [0u8; 4];
-        self.read(address, &mut raw)?;
-        Ok(u32::from_le_bytes(raw))
+        for (i, slot) in raw.iter_mut().enumerate() {
+            *slot = *self.0.get(&(address + i as u64)).ok_or(MemoryFault)?;
+        }
+        Ok(Some(u32::from_le_bytes(raw)))
     }
-    fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
-        self.write(address, &value.to_le_bytes())
+    async fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+        self.write(address, &value.to_le_bytes()).await
     }
-    fn atomic_compare_exchange_u32(
+    async fn atomic_compare_exchange_u32(
         &mut self,
         address: u64,
         expected: u32,
         desired: u32,
     ) -> Result<Result<u32, u32>, MemoryFault> {
-        let cur = self.atomic_load_u32(address)?;
+        let cur = self.atomic_load_u32(address).await?;
         if cur == expected {
-            self.atomic_store_u32(address, desired)?;
+            self.atomic_store_u32(address, desired).await?;
             Ok(Ok(cur))
         } else {
             Ok(Err(cur))

@@ -22,12 +22,15 @@ use helios_hal::fs::{
     BlockDevice, BlockDeviceCapabilities, BlockGeometry, BlockQueueTopology, BlockRange,
     BlockSerial, IoError, IoResult, OwnedBlockBuffer,
 };
+use helios_hal::native::NativeExecution;
 use helios_hal::vmm::SwapBackend;
 
 use crate::Timer;
 use crate::exec::Spawner;
 use crate::instance::InstanceRegistry;
-use crate::memory::{RootEntropyHandle, SwapDisabled, SwapHandle, disable_swap, install_swap};
+use crate::memory::{
+    NativeSpaceRegistry, RootEntropyHandle, SwapDisabled, SwapHandle, disable_swap, install_swap,
+};
 
 /// Bytes the boot self-check round-trips through the device.
 const SELF_CHECK_BYTES: usize = 4096;
@@ -129,8 +132,13 @@ impl ScratchDiskStats {
 ///
 /// The task is local to the calling processor, because the disk's
 /// completions are (see [`install_swap`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "install_scratch_swap passes explicit runtime handles without global state"
+)]
 pub fn install_scratch_swap<CpuImpl, Device, Backend, Error, Make>(
     registry: InstanceRegistry,
+    native_spaces: NativeSpaceRegistry<<CpuImpl::Native as NativeExecution>::Space>,
     scratch: ScratchDisk<Device>,
     spawner: Spawner<CpuImpl>,
     timer: Timer<CpuImpl>,
@@ -168,6 +176,7 @@ where
         timer,
         cpu,
         registry,
+        native_spaces,
         backend,
         backend_name,
         (swap_blocks * block_bytes) as u64,

@@ -10,7 +10,7 @@ use helios_wit_rpc::inspector::helios::system::programs::{
     self as rpc_programs, CapabilityGrant, ContainerConfig as WireContainerConfig,
     ContainerCredentials, ContainerExecRequest, ContainerIdentity,
     ContainerMount as WireContainerMount, ContainerMountSharing as WireContainerMountSharing,
-    ContainerSpawnRequest, ExecResult, FilesystemRight,
+    ContainerSpawnRequest, DefaultLinuxImage, ExecResult, FilesystemRight,
 };
 use tokio::sync::OnceCell;
 
@@ -405,14 +405,29 @@ impl Container {
         args: &[String],
         extra_env: &[(String, String)],
     ) -> Result<ExecResult, OpsError> {
+        self.exec_with_options(path, args, extra_env, None, Vec::new())
+            .await
+    }
+
+    /// Execute `path` inside this shared container with optional `cwd` override and `stdin`.
+    pub async fn exec_with_options(
+        &self,
+        path: &str,
+        args: &[String],
+        extra_env: &[(String, String)],
+        cwd: Option<&str>,
+        stdin: Vec<u8>,
+    ) -> Result<ExecResult, OpsError> {
         let container = self.ensure_container().await?;
         let exec_req = ContainerExecRequest {
             name: path.to_owned(),
             args: args.to_vec(),
             env: self.merged_env(extra_env),
             path: path.to_owned(),
-            cwd: self.config.default_cwd.clone(),
-            stdin: Vec::new(),
+            cwd: cwd
+                .map(ToOwned::to_owned)
+                .or_else(|| self.config.default_cwd.clone()),
+            stdin,
             credentials: None,
         };
         self.session
@@ -428,13 +443,28 @@ impl Container {
         args: &[String],
         extra_env: &[(String, String)],
     ) -> Result<Child, OpsError> {
+        self.spawn_with_options(path, args, extra_env, None, Vec::new())
+            .await
+    }
+
+    /// Spawn `path` inside this shared container with optional `cwd` override and initial `stdin`.
+    pub async fn spawn_with_options(
+        &self,
+        path: &str,
+        args: &[String],
+        extra_env: &[(String, String)],
+        cwd: Option<&str>,
+        stdin: Vec<u8>,
+    ) -> Result<Child, OpsError> {
         let container = self.ensure_container().await?;
         let spawn_req = ContainerSpawnRequest {
             name: path.to_owned(),
             args: args.to_vec(),
             env: self.merged_env(extra_env),
             path: path.to_owned(),
-            cwd: self.config.default_cwd.clone(),
+            cwd: cwd
+                .map(ToOwned::to_owned)
+                .or_else(|| self.config.default_cwd.clone()),
             sockets: Vec::new(),
             credentials: None,
         };
@@ -446,7 +476,7 @@ impl Container {
             )
             .await?
             .map_err(OpsError::from)?;
-        Child::from_remote(self.session.clone(), remote_child, Vec::new()).await
+        Child::from_remote(self.session.clone(), remote_child, stdin).await
     }
 
     /// Execute the container's OCI `Entrypoint` / `Cmd` (with optional `override_args`).
@@ -463,6 +493,29 @@ impl Container {
         };
         self.exec(&program, &args, extra_env).await
     }
+
+    /// Release the remote container resource explicitly.
+    pub fn close(self) {
+        drop(self);
+    }
+}
+
+/// Convert a materialized [`PulledImage`] into a wire [`DefaultLinuxImage`] for
+/// [`Session::set_default_image`].
+pub fn default_linux_image_from_oci(image: &PulledImage) -> Result<DefaultLinuxImage, OciError> {
+    let user = image
+        .config
+        .config
+        .resolve_user(Some(image.rootfs_path()))?;
+    Ok(DefaultLinuxImage {
+        root_path: image.rootfs_path().to_string_lossy().into_owned(),
+        env: image.config.config.env_pairs(),
+        credentials: Some(ContainerCredentials {
+            uid: user.uid,
+            gid: user.gid,
+            supplementary_groups: user.supplementary_groups,
+        }),
+    })
 }
 
 #[cfg(test)]
@@ -574,8 +627,12 @@ mod tests {
                 _self_: &Self::Child,
                 data: StreamReader<u8>,
             ) -> FutureReader<Result<(), ()>> {
-                let _ = data.collect_all().await;
-                FutureReader::ready(Ok(()))
+                let (tx, rx) = helios_wit_rpc::future::<Result<(), ()>>();
+                tokio::spawn(async move {
+                    let _ = data.collect_all().await;
+                    let _ = tx.resolve(Ok(())).await;
+                });
+                rx
             }
 
             async fn child_stdout(

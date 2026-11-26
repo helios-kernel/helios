@@ -1,0 +1,18 @@
+description = "List /image/docs from the EROFS smoke mount"
+name = "ls-image-docs"
+runner = "exec"
+program = "/bin/ls"
+args = ["/image/docs"]
+after = ["/cat-image-hello"]
+startup = "eager"
+lifecycle = "oneshot"
+restart = "never"
+critical = "system"
+escalation = "halt"
+oom_tier = "user"
+
+[capabilities]
+directories = [
+  { source = "/", guest = "/", rights = ["read", "execute"] },
+]
+link = ["symlink-read"]

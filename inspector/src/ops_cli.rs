@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -14,14 +14,18 @@ use helios_inspector_protocol::auth::{
     CapabilityCert as ProtocolCapabilityCert, ClientIdentity, random_32,
 };
 use helios_inspector_shell::{HostEnv, OutputFormat as ShellOutputFormat, ReplError};
+use helios_ops::helios_oci::{Arch as OciArch, PulledImage};
+use helios_ops::linux::{ContainerBuilder, ContainerMount, ContainerMountSharing};
 use helios_ops::{
     Attenuation, CapabilityCert, DEFAULT_FLEET_CONCURRENCY, DiagnosticBundle, Fleet, GrantRight,
-    IdentityProfile, OpsError, Session, SessionOptions, SpawnRequest, Target, TargetError,
-    TargetStore, TargetUri, http,
+    IdentityProfile, OpsError, PullOptions, Session, SessionOptions, SpawnRequest, Target,
+    TargetError, TargetStore, TargetUri, http,
 };
 use helios_wit_rpc::inspector::helios::system::{
+    component_control::ComponentStatus,
     inspect as proto_inspect,
     profiling::{Filter as ProfileFilter, MetricFilter},
+    programs::{CapabilityGrant, ExecRequest, FilesystemRight},
     tracing as proto_tracing,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -248,11 +252,17 @@ pub(crate) struct TraceCommand {
 /// Profiling inspection & collection (`profile`).
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum ProfileOpsCommand {
-    /// Capture kernel instruction samples for a duration (ms) and print summary.
+    /// Capture kernel instruction samples for a duration (ms) and print summary (or symbolized folded output).
     Instructions {
         /// Sampling duration in milliseconds (0 reads existing samples without toggling).
         #[arg(long, default_value_t = 500)]
         duration_ms: u64,
+        /// Optional kernel ELF image for ELF/DWARF symbolization.
+        #[arg(long = "kernel", value_name = "ELF")]
+        kernel: Option<PathBuf>,
+        /// Optional output path for flamegraph folded stacks (requires `--kernel`).
+        #[arg(long = "out", value_name = "PATH")]
+        out: Option<PathBuf>,
     },
     /// Fetch folded stack samples.
     Folded {
@@ -276,23 +286,217 @@ pub(crate) enum ProfileOpsCommand {
     },
 }
 
-/// Spawn or execute a remote Wasm/Linux binary (`spawn`).
+/// Spawn a remote Wasm/Linux binary with streaming stdio (`spawn`).
 #[derive(Debug, Clone, ClapArgs)]
 pub(crate) struct SpawnCommand {
     /// Remote executable path (e.g. `/bin/ping`).
     pub path: String,
 
     /// Arguments passed to the remote program.
-    #[arg(trailing_var_arg = true)]
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
 
     /// Explicit environment entries `KEY=VAL` (repeatable).
     #[arg(short = 'e', long = "env", value_name = "K=V")]
     pub env: Vec<String>,
 
+    /// Optional working directory for the remote process.
+    #[arg(long = "cwd", value_name = "DIR")]
+    pub cwd: Option<String>,
+
     /// Explicit capability grant specs (repeatable).
     #[arg(long = "grant", value_name = "SPEC")]
     pub grants: Vec<String>,
+}
+
+/// Execute a remote Wasm/Linux binary to completion (`exec`).
+#[derive(Debug, Clone, ClapArgs)]
+pub(crate) struct ExecCommand {
+    /// Remote executable path (e.g. `/bin/ping` or `/bin/echo`).
+    pub path: String,
+
+    /// Arguments passed to the remote program.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub args: Vec<String>,
+
+    /// Explicit environment entries `KEY=VAL` (repeatable).
+    #[arg(short = 'e', long = "env", value_name = "K=V")]
+    pub env: Vec<String>,
+
+    /// Optional working directory for the remote process.
+    #[arg(long = "cwd", value_name = "DIR")]
+    pub cwd: Option<String>,
+
+    /// Explicit capability grant specs (repeatable).
+    #[arg(long = "grant", value_name = "SPEC")]
+    pub grants: Vec<String>,
+
+    /// Optional UTF-8 text piped to the program's stdin.
+    #[arg(long = "stdin", value_name = "TEXT")]
+    pub stdin: Option<String>,
+}
+
+/// Component-topology lifecycle commands (`component`).
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum ComponentCommand {
+    /// List configured and live components.
+    Ls,
+    /// Show the status of one component by moniker.
+    Status { moniker: String },
+    /// Start a configured component by moniker.
+    Start { moniker: String },
+    /// Stop a running component by moniker.
+    Stop { moniker: String },
+    /// Restart a configured component by moniker.
+    Restart { moniker: String },
+    /// Mount a dynamic component subtree under an opted-in parent realm.
+    MountDynamic {
+        /// Parent realm moniker (e.g. `/apps`).
+        parent_moniker: String,
+        /// Guest directory holding a `component.toml` subtree to mount.
+        #[arg(
+            long = "guest-dir",
+            value_name = "GUEST_DIR",
+            conflicts_with = "manifest_dir"
+        )]
+        guest_dir: Option<String>,
+        /// Subtree name under `parent_moniker` (defaults to `--guest-dir` basename).
+        #[arg(long = "name", value_name = "SUBTREE")]
+        subtree_name: Option<String>,
+        /// Host directory containing `component.toml` manifests to upload inline.
+        #[arg(
+            long = "manifest-dir",
+            value_name = "HOST_DIR",
+            conflicts_with = "guest_dir"
+        )]
+        manifest_dir: Option<PathBuf>,
+    },
+    /// Gracefully stop and unmount a previously mounted dynamic subtree.
+    UnmountDynamic {
+        /// Mounted dynamic subtree moniker (e.g. `/apps/worker`).
+        moniker: String,
+    },
+}
+
+/// Remote OCI image store commands (`oci`).
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum OciCommand {
+    /// Pull an OCI image into the remote guest store.
+    Pull {
+        /// OCI image reference (e.g. `alpine:latest` or `ghcr.io/org/app:v1`).
+        reference: String,
+        /// Target architecture (`x86-64` / `aarch64`); inferred from guest if omitted.
+        #[arg(long, value_parser = ["x86_64", "x86-64", "amd64", "aarch64", "arm64"])]
+        arch: Option<String>,
+        /// Custom guest OCI store root path.
+        #[arg(long = "store-root", value_name = "DIR")]
+        store_root: Option<String>,
+    },
+    /// List pulled OCI images in the remote guest store.
+    Ls {
+        /// Custom guest OCI store root path.
+        #[arg(long = "store-root", value_name = "DIR")]
+        store_root: Option<String>,
+    },
+    /// Inspect a pulled OCI image in the remote guest store.
+    Inspect {
+        /// OCI image reference.
+        reference: String,
+        /// Custom guest OCI store root path.
+        #[arg(long = "store-root", value_name = "DIR")]
+        store_root: Option<String>,
+    },
+    /// Remove a pulled OCI image from the remote guest store.
+    Rm {
+        /// OCI image reference.
+        reference: String,
+        /// Custom guest OCI store root path.
+        #[arg(long = "store-root", value_name = "DIR")]
+        store_root: Option<String>,
+    },
+}
+
+/// Shared Linux container creation options for `helios container {create, exec, spawn}`.
+#[derive(Debug, Clone, Default, ClapArgs)]
+pub(crate) struct ContainerTargetArgs {
+    /// Pulled OCI image reference to use as the ephemeral overlay rootfs.
+    #[arg(long, conflicts_with = "root")]
+    pub image: Option<String>,
+
+    /// Remote directory path to use as the ephemeral overlay rootfs.
+    #[arg(long, conflicts_with = "image")]
+    pub root: Option<String>,
+
+    /// Custom guest OCI store root path (used with `--image`).
+    #[arg(long = "store-root", value_name = "DIR")]
+    pub store_root: Option<String>,
+
+    /// Container UTS hostname.
+    #[arg(long)]
+    pub hostname: Option<String>,
+
+    /// Container UTS domainname.
+    #[arg(long)]
+    pub domainname: Option<String>,
+
+    /// Bind mount specs (`SRC:DST[:ro|rx|rw|rwx][:shared|private|overlay]`, repeatable).
+    #[arg(short = 'm', long = "mount", value_name = "SPEC")]
+    pub mounts: Vec<String>,
+
+    /// Non-filesystem capability grant specs (repeatable).
+    #[arg(long = "grant", value_name = "SPEC")]
+    pub grants: Vec<String>,
+
+    /// Explicit environment entries `KEY=VAL` (repeatable).
+    #[arg(short = 'e', long = "env", value_name = "K=V")]
+    pub env: Vec<String>,
+
+    /// Working directory inside the container.
+    #[arg(long = "cwd", value_name = "DIR")]
+    pub cwd: Option<String>,
+}
+
+/// Linux container lifecycle commands (`container`).
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum ContainerCommand {
+    /// Create a Linux container (optionally running a command or holding until Ctrl+C).
+    Create {
+        #[command(flatten)]
+        config: ContainerTargetArgs,
+        /// Hold the container resource open until Ctrl+C when no command is provided.
+        #[arg(long, default_value_t = false)]
+        hold: bool,
+        /// Optional command and arguments to run inside the newly created container.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// List live Linux containers reported by `/kernel/containers/*`.
+    Ls,
+    /// Execute a Linux command to completion inside a container.
+    Exec {
+        #[command(flatten)]
+        config: ContainerTargetArgs,
+        /// Executable path inside the container.
+        path: String,
+        /// Arguments passed to the executable.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Spawn a streaming Linux command inside a container.
+    Spawn {
+        #[command(flatten)]
+        config: ContainerTargetArgs,
+        /// Executable path inside the container.
+        path: String,
+        /// Arguments passed to the executable.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Remove / stop a live Linux container by numeric ID.
+    Rm {
+        /// Container ID from `helios container ls`.
+        id: u64,
+    },
 }
 
 /// Collect a `.tar.zst` diagnostic bundle (`bundle`).
@@ -333,6 +537,14 @@ pub(crate) enum OpsCliError {
     UnknownCapability { raw: String },
     #[error("invalid environment variable `{raw}`; expected `KEY=VALUE`")]
     InvalidEnvVar { raw: String },
+    #[error("invalid mount specification `{raw}`: {reason}")]
+    InvalidMountSpec { raw: String, reason: String },
+    #[error("container requires either `--image <ref>` or `--root <path>`")]
+    ContainerNeedsRoot,
+    #[error("no live Linux container with id {id}")]
+    ContainerNotFound { id: u64 },
+    #[error("{0}")]
+    InvalidArgument(String),
     #[error("invalid tracing level `{level}`")]
     UnknownTraceLevel { level: String },
     #[error("failed to locate Python interpreter (`HELIOS_PYTHON`, active venv, or `python3`)")]
@@ -1059,22 +1271,50 @@ pub(crate) async fn run_profile(
     output: CliOutputFormat,
 ) -> Result<(), OpsCliError> {
     match cmd {
-        ProfileOpsCommand::Instructions { duration_ms } => {
-            if *duration_ms > 0 {
-                session.profile_set_instruction_sampling(true).await?;
+        ProfileOpsCommand::Instructions {
+            duration_ms,
+            kernel,
+            out,
+        } => {
+            let profile = if *duration_ms > 0 {
+                let guard = session.start_instruction_sampling().await?;
                 tokio::time::sleep(Duration::from_millis(*duration_ms)).await;
+                guard.stop_and_collect().await?
+            } else {
+                session.profile_instruction_samples().await?
+            };
+            if let Some(kernel_path) = kernel {
+                let symbolized = helios_ops::symbolize_instruction_profile(profile, kernel_path)
+                    .await
+                    .map_err(OpsError::from)?;
+                if let Some(out_path) = out {
+                    let folded = helios_ops::symbolize::render_folded_samples(&symbolized.samples);
+                    tokio::fs::write(out_path, folded).await?;
+                }
+                match output {
+                    CliOutputFormat::Json | CliOutputFormat::Nuon => {
+                        println!("{}", serde_json::to_string_pretty(&symbolized)?);
+                    }
+                    CliOutputFormat::Jsonl => {
+                        for sample in &symbolized.samples {
+                            println!("{}", serde_json::to_string(sample)?);
+                        }
+                    }
+                    CliOutputFormat::Table => {
+                        for sample in &symbolized.samples {
+                            println!("{} {}", sample.stack, sample.count);
+                        }
+                    }
+                }
+                return Ok(());
             }
-            let profile_res = session.profile_instruction_samples().await;
-            if *duration_ms > 0 {
-                let _ = session.profile_set_instruction_sampling(false).await;
-            }
-            let profile = profile_res?;
             let sample_count: u64 = profile.samples.iter().map(|s| s.count).sum();
             let doc = serde_json::json!({
                 "period_nanos": profile.period_nanos,
                 "kernel_image_base": format!("{:#x}", profile.kernel_image_base),
                 "sample_count": sample_count,
                 "unique_pcs": profile.samples.len(),
+                "dropped": profile.dropped,
             });
             println!("{}", serde_json::to_string_pretty(&doc)?);
         }
@@ -1176,28 +1416,793 @@ pub(crate) async fn run_profile(
 
 /// Run `helios spawn`.
 pub(crate) async fn run_spawn(session: &Session, cmd: &SpawnCommand) -> Result<(), OpsCliError> {
-    let mut env = Vec::with_capacity(cmd.env.len());
-    for pair in &cmd.env {
-        let Some((k, v)) = pair.split_once('=') else {
-            return Err(OpsCliError::InvalidEnvVar { raw: pair.clone() });
-        };
-        env.push((k.to_owned(), v.to_owned()));
-    }
-    let mut capability_grants = Vec::with_capacity(cmd.grants.len());
-    for spec in &cmd.grants {
-        capability_grants.push(helios_ops::session::parse_capability_grant(spec)?);
-    }
+    let env = parse_env_pairs(&cmd.env)?;
+    let capability_grants = parse_cli_grants(&cmd.grants)?;
     let child = session
         .spawn(SpawnRequest {
             path: cmd.path.clone(),
             args: cmd.args.clone(),
             env,
-            cwd: None,
+            cwd: cmd.cwd.clone(),
             stdin: Vec::new(),
             capability_grants,
         })
         .await?;
+    stream_child_to_stdio(child).await
+}
 
+/// Run `helios exec`.
+pub(crate) async fn run_exec(
+    session: &Session,
+    fleet: Option<&Fleet>,
+    cmd: &ExecCommand,
+    output: CliOutputFormat,
+) -> Result<(), OpsCliError> {
+    let env = parse_env_pairs(&cmd.env)?;
+    let capability_grants = parse_cli_grants(&cmd.grants)?;
+    let stdin = cmd
+        .stdin
+        .as_deref()
+        .map_or_else(Vec::new, |s| s.as_bytes().to_vec());
+
+    if let Some(fleet) = fleet
+        && env.is_empty()
+        && cmd.cwd.is_none()
+        && capability_grants.is_empty()
+        && stdin.is_empty()
+    {
+        let outcomes = fleet.exec(cmd.path.clone(), cmd.args.clone()).await;
+        for outcome in outcomes {
+            match outcome.result {
+                Ok(res) => match output {
+                    CliOutputFormat::Json | CliOutputFormat::Jsonl | CliOutputFormat::Nuon => {
+                        let row = serde_json::json!({
+                            "target": outcome.target.name,
+                            "exit_code": res.exit_code,
+                            "stdout": String::from_utf8_lossy(&res.output.stdout),
+                            "stderr": String::from_utf8_lossy(&res.output.stderr),
+                        });
+                        println!("{}", serde_json::to_string(&row)?);
+                    }
+                    CliOutputFormat::Table => {
+                        println!("[{}] exit={}", outcome.target.name, res.exit_code);
+                        std::io::stdout().write_all(&res.output.stdout)?;
+                        std::io::stderr().write_all(&res.output.stderr)?;
+                    }
+                },
+                Err(err) => {
+                    eprintln!("[{}] error: {err}", outcome.target.name);
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let normalized = helios_ops::session::normalize_absolute_path(&cmd.path)?;
+    let result = session
+        .exec_request(ExecRequest {
+            name: normalized.clone(),
+            args: cmd.args.clone(),
+            env,
+            path: normalized,
+            cwd: cmd.cwd.clone(),
+            stdin,
+            hint: None,
+            capability_grants,
+        })
+        .await?;
+    std::io::stdout().write_all(&result.output.stdout)?;
+    std::io::stderr().write_all(&result.output.stderr)?;
+    if result.exit_code != 0 {
+        return Err(OpsCliError::RemoteExited {
+            code: result.exit_code,
+        });
+    }
+    Ok(())
+}
+
+/// Run `helios component {ls, status, start, stop, restart}`.
+pub(crate) async fn run_component(
+    session: &Session,
+    fleet: Option<&Fleet>,
+    cmd: &ComponentCommand,
+    output: CliOutputFormat,
+) -> Result<(), OpsCliError> {
+    if let Some(fleet) = fleet {
+        let fc = fleet.components();
+        match cmd {
+            ComponentCommand::Ls => {
+                for outcome in fc.list().await {
+                    match outcome.result {
+                        Ok(list) => {
+                            println!("=== {} ===", outcome.target.name);
+                            render_components(&list, output)?;
+                        }
+                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                    }
+                }
+            }
+            ComponentCommand::Status { moniker } => {
+                for outcome in fc.status(moniker.clone()).await {
+                    match outcome.result {
+                        Ok(st) => {
+                            println!("=== {} ===", outcome.target.name);
+                            render_components(&[st], output)?;
+                        }
+                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                    }
+                }
+            }
+            ComponentCommand::Start { moniker } => {
+                for outcome in fc.start(moniker.clone()).await {
+                    match outcome.result {
+                        Ok(st) => {
+                            println!("=== {} ===", outcome.target.name);
+                            render_components(&[st], output)?;
+                        }
+                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                    }
+                }
+            }
+            ComponentCommand::Stop { moniker } => {
+                for outcome in fc.stop(moniker.clone()).await {
+                    match outcome.result {
+                        Ok(()) => println!("[{}] stopped {moniker}", outcome.target.name),
+                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                    }
+                }
+            }
+            ComponentCommand::Restart { moniker } => {
+                for outcome in fc.restart(moniker.clone()).await {
+                    match outcome.result {
+                        Ok(st) => {
+                            println!("=== {} ===", outcome.target.name);
+                            render_components(&[st], output)?;
+                        }
+                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                    }
+                }
+            }
+            ComponentCommand::MountDynamic {
+                parent_moniker,
+                guest_dir,
+                subtree_name,
+                manifest_dir,
+            } => {
+                let source = build_dynamic_subtree_source(
+                    guest_dir.as_deref(),
+                    subtree_name.as_deref(),
+                    manifest_dir.as_deref(),
+                )?;
+                for outcome in fc.mount_dynamic(parent_moniker.clone(), source).await {
+                    match outcome.result {
+                        Ok(mounted) => println!("[{}] mounted {mounted}", outcome.target.name),
+                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                    }
+                }
+            }
+            ComponentCommand::UnmountDynamic { moniker } => {
+                for outcome in fc.unmount_dynamic(moniker.clone()).await {
+                    match outcome.result {
+                        Ok(()) => println!("[{}] unmounted {moniker}", outcome.target.name),
+                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let components = session.components();
+    match cmd {
+        ComponentCommand::Ls => {
+            let list = components.list().await?;
+            render_components(&list, output)?;
+        }
+        ComponentCommand::Status { moniker } => {
+            let st = components.status(moniker).await?;
+            render_components(&[st], output)?;
+        }
+        ComponentCommand::Start { moniker } => {
+            let st = components.start(moniker).await?;
+            render_components(&[st], output)?;
+        }
+        ComponentCommand::Stop { moniker } => {
+            components.stop(moniker).await?;
+            println!("stopped component `{moniker}`");
+        }
+        ComponentCommand::Restart { moniker } => {
+            let st = components.restart(moniker).await?;
+            render_components(&[st], output)?;
+        }
+        ComponentCommand::MountDynamic {
+            parent_moniker,
+            guest_dir,
+            subtree_name,
+            manifest_dir,
+        } => {
+            let source = build_dynamic_subtree_source(
+                guest_dir.as_deref(),
+                subtree_name.as_deref(),
+                manifest_dir.as_deref(),
+            )?;
+            let mounted = components.mount_dynamic(parent_moniker, source).await?;
+            match output {
+                CliOutputFormat::Json | CliOutputFormat::Nuon | CliOutputFormat::Jsonl => {
+                    println!("{}", serde_json::json!({ "moniker": mounted }));
+                }
+                CliOutputFormat::Table => println!("mounted dynamic subtree `{mounted}`"),
+            }
+        }
+        ComponentCommand::UnmountDynamic { moniker } => {
+            components.unmount_dynamic(moniker).await?;
+            println!("unmounted dynamic subtree `{moniker}`");
+        }
+    }
+    Ok(())
+}
+
+fn build_dynamic_subtree_source(
+    guest_dir: Option<&str>,
+    subtree_name: Option<&str>,
+    manifest_dir: Option<&Path>,
+) -> Result<helios_ops::DynamicSubtreeSource, OpsCliError> {
+    match (guest_dir, manifest_dir) {
+        (Some(path), None) => {
+            let name = match subtree_name {
+                Some(explicit) if !explicit.trim().is_empty() => explicit.trim().to_owned(),
+                _ => Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        OpsCliError::InvalidArgument(format!(
+                            "cannot infer subtree name from `--guest-dir {path}`; pass `--name`"
+                        ))
+                    })?
+                    .to_owned(),
+            };
+            Ok(helios_ops::DynamicSubtreeSource::GuestDir(
+                helios_ops::DynamicDirSource {
+                    subtree_name: name,
+                    path: path.to_owned(),
+                },
+            ))
+        }
+        (None, Some(root)) => {
+            let mut manifests = Vec::new();
+            collect_dynamic_manifests(root, root, &mut manifests)?;
+            if manifests.is_empty() {
+                return Err(OpsCliError::InvalidArgument(format!(
+                    "no `component.toml` files found under `{}`",
+                    root.display()
+                )));
+            }
+            manifests.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(helios_ops::DynamicSubtreeSource::Manifests(manifests))
+        }
+        _ => Err(OpsCliError::InvalidArgument(
+            "component mount-dynamic requires either `--guest-dir <GUEST_DIR>` or `--manifest-dir <HOST_DIR>`"
+                .to_owned(),
+        )),
+    }
+}
+
+fn collect_dynamic_manifests(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, String)>,
+) -> Result<(), OpsCliError> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_dynamic_manifests(root, &path, out)?;
+        } else if file_type.is_file() && entry.file_name() == "component.toml" {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|err| OpsCliError::InvalidArgument(err.to_string()))?;
+            let rel_posix = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            let content = std::fs::read_to_string(&path)?;
+            out.push((rel_posix, content));
+        }
+    }
+    Ok(())
+}
+
+fn render_components(
+    components: &[ComponentStatus],
+    output: CliOutputFormat,
+) -> Result<(), OpsCliError> {
+    let to_json = |c: &ComponentStatus| {
+        serde_json::json!({
+            "moniker": c.moniker,
+            "program": c.program,
+            "state": c.state,
+            "instance_id": c.instance_id,
+            "restarts": c.restarts,
+        })
+    };
+    match output {
+        CliOutputFormat::Json | CliOutputFormat::Nuon => {
+            let rows: Vec<serde_json::Value> = components.iter().map(to_json).collect();
+            println!("{}", serde_json::to_string_pretty(&rows)?);
+        }
+        CliOutputFormat::Jsonl => {
+            for c in components {
+                println!("{}", serde_json::to_string(&to_json(c))?);
+            }
+        }
+        CliOutputFormat::Table => {
+            for c in components {
+                let id = c
+                    .instance_id
+                    .map_or_else(|| "-".to_owned(), |id| id.to_string());
+                println!(
+                    "{:<28} {:<12} id={:<8} restarts={:<4} {}",
+                    c.moniker, c.state, id, c.restarts, c.program
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run `helios oci {pull, ls, inspect, rm}`.
+pub(crate) async fn run_oci(
+    session: &Session,
+    fleet: Option<&Fleet>,
+    cmd: &OciCommand,
+    output: CliOutputFormat,
+) -> Result<(), OpsCliError> {
+    let parse_arch = |raw: Option<&str>| -> Option<OciArch> {
+        match raw {
+            Some("x86_64" | "x86-64" | "amd64") => Some(OciArch::X86_64),
+            Some("aarch64" | "arm64") => Some(OciArch::Aarch64),
+            _ => None,
+        }
+    };
+
+    if let Some(fleet) = fleet {
+        let oci_for = |store_root: &Option<String>| {
+            let base = fleet.oci();
+            match store_root {
+                Some(root) => base.with_store_root(root),
+                None => base,
+            }
+        };
+        match cmd {
+            OciCommand::Pull {
+                reference,
+                arch,
+                store_root,
+            } => {
+                let opts = PullOptions {
+                    arch: parse_arch(arch.as_deref()),
+                    ..PullOptions::default()
+                };
+                for outcome in oci_for(store_root)
+                    .pull_with_options(reference.clone(), opts)
+                    .await
+                {
+                    match outcome.result {
+                        Ok(img) => {
+                            println!("=== {} ===", outcome.target.name);
+                            render_oci_images(&[img], output)?;
+                        }
+                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                    }
+                }
+            }
+            OciCommand::Ls { store_root } => {
+                for outcome in oci_for(store_root).list().await {
+                    match outcome.result {
+                        Ok(imgs) => {
+                            println!("=== {} ===", outcome.target.name);
+                            render_oci_images(&imgs, output)?;
+                        }
+                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                    }
+                }
+            }
+            OciCommand::Inspect {
+                reference,
+                store_root,
+            } => {
+                for outcome in oci_for(store_root).inspect(reference.clone()).await {
+                    match outcome.result {
+                        Ok(img) => {
+                            println!("=== {} ===", outcome.target.name);
+                            println!("{}", serde_json::to_string_pretty(&img)?);
+                        }
+                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                    }
+                }
+            }
+            OciCommand::Rm {
+                reference,
+                store_root,
+            } => {
+                for outcome in oci_for(store_root).remove(reference.clone()).await {
+                    match outcome.result {
+                        Ok(img) => println!("[{}] removed {}", outcome.target.name, img.reference),
+                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let make_client = |store_root: &Option<String>| -> Result<helios_ops::OciClient, OpsCliError> {
+        match store_root {
+            Some(root) => Ok(session.oci_with_store_root(root)?),
+            None => Ok(session.oci()),
+        }
+    };
+
+    match cmd {
+        OciCommand::Pull {
+            reference,
+            arch,
+            store_root,
+        } => {
+            let client = make_client(store_root)?;
+            let img = client
+                .pull_with_options(
+                    reference,
+                    PullOptions {
+                        arch: parse_arch(arch.as_deref()),
+                        ..PullOptions::default()
+                    },
+                )
+                .await?;
+            render_oci_images(&[img], output)?;
+        }
+        OciCommand::Ls { store_root } => {
+            let imgs = make_client(store_root)?.list().await?;
+            render_oci_images(&imgs, output)?;
+        }
+        OciCommand::Inspect {
+            reference,
+            store_root,
+        } => {
+            let img = make_client(store_root)?.inspect(reference).await?;
+            println!("{}", serde_json::to_string_pretty(&img)?);
+        }
+        OciCommand::Rm {
+            reference,
+            store_root,
+        } => {
+            let removed = make_client(store_root)?.remove(reference).await?;
+            println!("removed image `{}`", removed.reference);
+        }
+    }
+    Ok(())
+}
+
+fn render_oci_images(images: &[PulledImage], output: CliOutputFormat) -> Result<(), OpsCliError> {
+    match output {
+        CliOutputFormat::Json | CliOutputFormat::Nuon => {
+            println!("{}", serde_json::to_string_pretty(images)?);
+        }
+        CliOutputFormat::Jsonl => {
+            for img in images {
+                println!("{}", serde_json::to_string(img)?);
+            }
+        }
+        CliOutputFormat::Table => {
+            for img in images {
+                println!(
+                    "{:<36} {:<8} layers={:<3} btrfs={:<5} {}",
+                    img.reference.to_string(),
+                    img.arch.oci_arch(),
+                    img.layer_chain_ids.len(),
+                    img.btrfs_backed,
+                    img.rootfs_path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run `helios container {create, ls, exec, spawn, rm}`.
+pub(crate) async fn run_container(
+    session: &Session,
+    cmd: &ContainerCommand,
+    output: CliOutputFormat,
+) -> Result<(), OpsCliError> {
+    match cmd {
+        ContainerCommand::Ls => {
+            let snap = session.kernel_snapshot().await?;
+            let to_json = |c: &helios_wit_rpc::inspector_snapshot::LinuxContainer| {
+                serde_json::json!({
+                    "id": c.id,
+                    "hostname": c.hostname,
+                    "domainname": c.domainname,
+                    "live_processes": c.live_processes,
+                    "allocated_pids": c.allocated_pids,
+                    "live_threads": c.live_threads,
+                    "overlay_pages": c.overlay_pages,
+                    "mounts": c.mounts.len(),
+                })
+            };
+            match output {
+                CliOutputFormat::Json | CliOutputFormat::Nuon => {
+                    let rows: Vec<serde_json::Value> =
+                        snap.containers.iter().map(to_json).collect();
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                }
+                CliOutputFormat::Jsonl => {
+                    for c in &snap.containers {
+                        println!("{}", serde_json::to_string(&to_json(c))?);
+                    }
+                }
+                CliOutputFormat::Table => {
+                    for c in &snap.containers {
+                        println!(
+                            "{:>6}  {:<20} procs={:<4} threads={:<4} overlay_pages={:<6} mounts={}",
+                            c.id,
+                            c.hostname,
+                            c.live_processes,
+                            c.live_threads,
+                            c.overlay_pages,
+                            c.mounts.len()
+                        );
+                    }
+                }
+            }
+        }
+        ContainerCommand::Create {
+            config,
+            hold,
+            command,
+        } => {
+            let builder = build_container_from_args(session, config).await?;
+            let container = builder.create(session.clone()).await?;
+            if let Some((prog, args)) = command.split_first() {
+                let res = container
+                    .exec_with_options(prog, args, &[], config.cwd.as_deref(), Vec::new())
+                    .await?;
+                std::io::stdout().write_all(&res.output.stdout)?;
+                std::io::stderr().write_all(&res.output.stderr)?;
+                if res.exit_code != 0 {
+                    return Err(OpsCliError::RemoteExited {
+                        code: res.exit_code,
+                    });
+                }
+            } else {
+                let info = serde_json::json!({
+                    "hostname": container.config().hostname,
+                    "root": container.config().root.source_path,
+                    "mounts": container.config().mounts.len(),
+                });
+                match output {
+                    CliOutputFormat::Json | CliOutputFormat::Jsonl | CliOutputFormat::Nuon => {
+                        println!("{}", serde_json::to_string_pretty(&info)?);
+                    }
+                    CliOutputFormat::Table => {
+                        println!(
+                            "created container `{}` (root={})",
+                            container.config().hostname,
+                            container.config().root.source_path
+                        );
+                    }
+                }
+                if *hold {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+            container.close();
+        }
+        ContainerCommand::Exec { config, path, args } => {
+            let builder = build_container_from_args(session, config).await?;
+            let container = builder.create(session.clone()).await?;
+            let res = container
+                .exec_with_options(path, args, &[], config.cwd.as_deref(), Vec::new())
+                .await?;
+            std::io::stdout().write_all(&res.output.stdout)?;
+            std::io::stderr().write_all(&res.output.stderr)?;
+            container.close();
+            if res.exit_code != 0 {
+                return Err(OpsCliError::RemoteExited {
+                    code: res.exit_code,
+                });
+            }
+        }
+        ContainerCommand::Spawn { config, path, args } => {
+            let builder = build_container_from_args(session, config).await?;
+            let container = builder.create(session.clone()).await?;
+            let child = container
+                .spawn_with_options(path, args, &[], config.cwd.as_deref(), Vec::new())
+                .await?;
+            let status = stream_child_to_stdio(child).await;
+            container.close();
+            status?;
+        }
+        ContainerCommand::Rm { id } => {
+            let snap = session.kernel_snapshot().await?;
+            let Some(ctr) = snap.containers.iter().find(|c| c.id == *id) else {
+                return Err(OpsCliError::ContainerNotFound { id: *id });
+            };
+            let live = session.ps().await?;
+            let mut killed = 0usize;
+            for inst in live {
+                if inst.id == *id || (!ctr.hostname.is_empty() && inst.name.contains(&ctr.hostname))
+                {
+                    let _ = session.kill(inst.id).await;
+                    killed += 1;
+                }
+            }
+            println!("removed container {id} (stopped {killed} instance(s))");
+        }
+    }
+    Ok(())
+}
+
+async fn build_container_from_args(
+    session: &Session,
+    args: &ContainerTargetArgs,
+) -> Result<ContainerBuilder, OpsCliError> {
+    let mut builder = if let Some(image_ref) = &args.image {
+        let oci = match &args.store_root {
+            Some(root) => session.oci_with_store_root(root)?,
+            None => session.oci(),
+        };
+        let pulled = oci.inspect(image_ref).await?;
+        ContainerBuilder::from_image(&pulled).map_err(OpsError::from)?
+    } else if let Some(root) = &args.root {
+        ContainerBuilder::ephemeral(root)
+    } else {
+        return Err(OpsCliError::ContainerNeedsRoot);
+    };
+
+    if let Some(hostname) = &args.hostname {
+        builder = builder.hostname(hostname);
+    }
+    if let Some(domainname) = &args.domainname {
+        builder = builder.domainname(domainname);
+    }
+    if let Some(cwd) = &args.cwd {
+        builder = builder.working_dir(cwd);
+    }
+    for (k, v) in parse_env_pairs(&args.env)? {
+        builder = builder.env(k, v);
+    }
+    for spec in &args.mounts {
+        builder = builder.mount(parse_container_mount_spec(spec)?);
+    }
+    let mut non_fs = helios_ops::NonFsGrants::new();
+    for spec in &args.grants {
+        let parsed = helios_ops::session::parse_capability_grant(spec)?;
+        match parsed {
+            CapabilityGrant::Directory(_) => {
+                return Err(OpsError::InvalidGrant {
+                    spec: spec.clone(),
+                    reason: "directory grants are not allowed on containers; use `--mount`"
+                        .to_owned(),
+                }
+                .into());
+            }
+            CapabilityGrant::Network(g) => {
+                non_fs = non_fs.grant(helios_ops::NonFsGrant::Network(g))
+            }
+            CapabilityGrant::Clock(g) => non_fs = non_fs.grant(helios_ops::NonFsGrant::Clock(g)),
+            CapabilityGrant::Terminal(g) => {
+                non_fs = non_fs.grant(helios_ops::NonFsGrant::Terminal(g))
+            }
+            CapabilityGrant::Process(g) => {
+                non_fs = non_fs.grant(helios_ops::NonFsGrant::Process(g))
+            }
+            CapabilityGrant::Link(g) => non_fs = non_fs.grant(helios_ops::NonFsGrant::Link(g)),
+            CapabilityGrant::Mount(g) => non_fs = non_fs.grant(helios_ops::NonFsGrant::Mount(g)),
+            CapabilityGrant::Device(g) => non_fs = non_fs.grant(helios_ops::NonFsGrant::Device(g)),
+            CapabilityGrant::Diagnostics(g) => {
+                non_fs = non_fs.grant(helios_ops::NonFsGrant::Diagnostics(g))
+            }
+            CapabilityGrant::InstanceControl(s) => {
+                non_fs = non_fs.grant(helios_ops::NonFsGrant::InstanceControl(s))
+            }
+            CapabilityGrant::Settings(g) => {
+                non_fs = non_fs.grant(helios_ops::NonFsGrant::Settings(g))
+            }
+            CapabilityGrant::Machine(g) => {
+                non_fs = non_fs.grant(helios_ops::NonFsGrant::Machine(g))
+            }
+            CapabilityGrant::Ipc(_) => {
+                return Err(OpsError::InvalidGrant {
+                    spec: spec.clone(),
+                    reason: "IPC endpoint grants cannot be parsed from CLI strings".to_owned(),
+                }
+                .into());
+            }
+        }
+    }
+    builder = builder.grants(non_fs);
+    Ok(builder)
+}
+
+fn parse_container_mount_spec(raw: &str) -> Result<ContainerMount, OpsCliError> {
+    let parts: Vec<&str> = raw.split(':').collect();
+    if parts.len() < 2 || parts.len() > 4 {
+        return Err(OpsCliError::InvalidMountSpec {
+            raw: raw.to_owned(),
+            reason: "expected `SRC:DST[:ro|rx|rw|rwx][:shared|private|overlay]`".to_owned(),
+        });
+    }
+    let source_path = helios_ops::session::normalize_absolute_path(parts[0])?;
+    let target_path = helios_ops::session::normalize_absolute_path(parts[1])?;
+    let rights = match parts.get(2).copied().unwrap_or("ro") {
+        "ro" | "r" => vec![FilesystemRight::Read],
+        "rx" => vec![FilesystemRight::Read, FilesystemRight::Execute],
+        "rw" => vec![
+            FilesystemRight::Read,
+            FilesystemRight::Write,
+            FilesystemRight::MutateDirectory,
+        ],
+        "rwx" => vec![
+            FilesystemRight::Read,
+            FilesystemRight::Write,
+            FilesystemRight::MutateDirectory,
+            FilesystemRight::Execute,
+        ],
+        other => {
+            return Err(OpsCliError::InvalidMountSpec {
+                raw: raw.to_owned(),
+                reason: format!("unknown mode `{other}`; expected ro|rx|rw|rwx"),
+            });
+        }
+    };
+    let sharing = match parts.get(3).copied().unwrap_or("shared") {
+        "shared" => ContainerMountSharing::Shared,
+        "private" => ContainerMountSharing::Private,
+        "overlay" | "ephemeral-overlay" => ContainerMountSharing::EphemeralOverlay,
+        other => {
+            return Err(OpsCliError::InvalidMountSpec {
+                raw: raw.to_owned(),
+                reason: format!("unknown sharing `{other}`; expected shared|private|overlay"),
+            });
+        }
+    };
+    Ok(ContainerMount {
+        source_path,
+        target_path,
+        rights,
+        sharing,
+    })
+}
+
+fn parse_env_pairs(raw: &[String]) -> Result<Vec<(String, String)>, OpsCliError> {
+    let mut env = Vec::with_capacity(raw.len());
+    for pair in raw {
+        let Some((k, v)) = pair.split_once('=') else {
+            return Err(OpsCliError::InvalidEnvVar { raw: pair.clone() });
+        };
+        env.push((k.to_owned(), v.to_owned()));
+    }
+    Ok(env)
+}
+
+fn parse_cli_grants(
+    raw: &[String],
+) -> Result<
+    Vec<CapabilityGrant<helios_wit_rpc::inspector::helios::system::ipc::Endpoint>>,
+    OpsCliError,
+> {
+    let mut grants = Vec::with_capacity(raw.len());
+    for spec in raw {
+        grants.push(helios_ops::session::parse_capability_grant(spec)?);
+    }
+    Ok(grants)
+}
+
+async fn stream_child_to_stdio(child: helios_ops::Child) -> Result<(), OpsCliError> {
     let stdout_rx = child.stdout.clone();
     let stderr_rx = child.stderr.clone();
     let out_task = tokio::spawn(async move {

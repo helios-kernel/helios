@@ -346,7 +346,10 @@ async fn flush_one_range<R: Resources, M: UserMemory, F: fs::Filesystem<R>>(
         let page_rem = (4096 - into_page) as u64;
         let step = (valid_len - done).min(page_rem) as usize;
         if !memory.is_page_shared(page_base)
-            && memory.read_unrestricted(addr, &mut buf[..step]).is_ok()
+            && memory
+                .read_unrestricted(addr, &mut buf[..step])
+                .await
+                .is_ok()
         {
             let _ = fs
                 .write_at(
@@ -609,7 +612,7 @@ pub(super) async fn flush_all_shared_mappings<R: Resources, M: UserMemory, F: fs
 /// the live shared frame (visible across all mappings and processes) and the
 /// clean baseline once per object; falls back to per-mapping `populate` for
 /// lightweight test mocks.
-pub(super) fn sync_write_to_shared_mappings<
+pub(super) async fn sync_write_to_shared_mappings<
     R: Resources,
     M: VirtualMemory,
     F: fs::Filesystem<R>,
@@ -660,28 +663,36 @@ pub(super) fn sync_write_to_shared_mappings<
     if fallback_targets.is_empty() {
         return;
     }
-    let _mm = process.shared.program_break.lock();
-    for (addr, src_off, len) in fallback_targets {
-        let end = addr.saturating_add(len);
-        let query_end = page_align(end);
-        let mut pos = addr;
-        while pos < end {
-            let query_start = pos & !(PAGE - 1);
-            let Some(region) = memory.region(query_start, query_end) else {
-                break;
-            };
-            if region.start >= end {
-                break;
+    let mut pending_populates: Vec<(u64, usize, usize)> = Vec::new();
+    {
+        let _mm = process.shared.program_break.lock();
+        for (addr, src_off, len) in fallback_targets {
+            let end = addr.saturating_add(len);
+            let query_end = page_align(end);
+            let mut pos = addr;
+            while pos < end {
+                let query_start = pos & !(PAGE - 1);
+                let Some(region) = memory.region(query_start, query_end) else {
+                    break;
+                };
+                if region.start >= end {
+                    break;
+                }
+                let copy_start = region.start.max(pos);
+                let copy_end = region.end.min(end);
+                if copy_start < copy_end {
+                    let slice_start = (src_off + (copy_start - addr)) as usize;
+                    let slice_end = slice_start + (copy_end - copy_start) as usize;
+                    pending_populates.push((copy_start, slice_start, slice_end));
+                }
+                pos = copy_end.max(region.end);
             }
-            let copy_start = region.start.max(pos);
-            let copy_end = region.end.min(end);
-            if copy_start < copy_end {
-                let slice_start = (src_off + (copy_start - addr)) as usize;
-                let slice_end = slice_start + (copy_end - copy_start) as usize;
-                let _ = memory.populate(copy_start, &bytes[slice_start..slice_end]);
-            }
-            pos = copy_end.max(region.end);
         }
+    }
+    for (copy_start, slice_start, slice_end) in pending_populates {
+        let _ = memory
+            .populate(copy_start, &bytes[slice_start..slice_end])
+            .await;
     }
 }
 
@@ -1135,9 +1146,10 @@ pub(super) async fn mmap<R: Resources, M: VirtualMemory, O: System + fs::Filesys
         }
     };
 
-    // Perform the entire VA reservation, replacement, frame installation, and
-    // VMA registration atomically under `program_break.lock()`.
-    let (result, detached_shmids, dropped_memfd) = {
+    // Perform the VA reservation, replacement, frame installation, and VMA
+    // registration atomically under `program_break.lock()`, deferring any
+    // mock-only async fallback `populate` until after the spin lock drops.
+    let (mut result, pending_fallback, detached_shmids, dropped_memfd) = {
         let _mm = process.shared.program_break.lock();
         let mut detached_shmids = Vec::new();
         let mut dropped_memfd = false;
@@ -1167,7 +1179,7 @@ pub(super) async fn mmap<R: Resources, M: VirtualMemory, O: System + fs::Filesys
             }
         }
 
-        let res = match plan {
+        let (res, pending_fallback) = match plan {
             StagedPlan::PrivateAnon => {
                 let mapped = if is_fixed {
                     memory.map_at(hint, length, access).map(|()| hint)
@@ -1175,8 +1187,8 @@ pub(super) async fn mmap<R: Resources, M: VirtualMemory, O: System + fs::Filesys
                     memory.map_anywhere(unfixed_hint, length, access)
                 };
                 match mapped {
-                    Ok(addr) => addr,
-                    Err(error) => map_errno(error),
+                    Ok(addr) => (addr, None),
+                    Err(error) => (map_errno(error), None),
                 }
             }
             StagedPlan::SharedAnon { object_id } => {
@@ -1206,13 +1218,13 @@ pub(super) async fn mmap<R: Resources, M: VirtualMemory, O: System + fs::Filesys
                                 memfd_hold: None,
                                 memfd_write_hold: None,
                             });
-                        mapped_addr
+                        (mapped_addr, None)
                     }
                     Err(error) => {
                         if object_id != 0 {
                             memory.release_shared_object(object_id);
                         }
-                        map_errno(error)
+                        (map_errno(error), None)
                     }
                 }
             }
@@ -1242,42 +1254,32 @@ pub(super) async fn mmap<R: Resources, M: VirtualMemory, O: System + fs::Filesys
                 };
                 match mapped {
                     Ok(mapped_addr) => {
-                        if object_id == 0
-                            && !fallback_bytes.is_empty()
-                            && let Err(error) = memory.populate(mapped_addr, &fallback_bytes)
-                        {
-                            memory.unmap(mapped_addr, length);
-                            match error {
-                                MapError::OutOfMemory => errno(ENOMEM),
-                                MapError::Address | MapError::Occupied => errno(EFAULT),
-                            }
+                        let vma = SharedFileMapping {
+                            start: mapped_addr,
+                            len: length,
+                            backing: MappingBacking::SharedFile {
+                                file,
+                                file_offset: offset,
+                                object_id,
+                            },
+                            may_write,
+                            may_exec,
+                            writable: access.contains(PageFlags::WRITE),
+                            memfd_hold,
+                            memfd_write_hold,
+                        };
+                        if object_id == 0 && !fallback_bytes.is_empty() {
+                            (mapped_addr, Some((mapped_addr, fallback_bytes, vma)))
                         } else {
-                            process
-                                .shared
-                                .shared_mappings
-                                .lock()
-                                .push(SharedFileMapping {
-                                    start: mapped_addr,
-                                    len: length,
-                                    backing: MappingBacking::SharedFile {
-                                        file,
-                                        file_offset: offset,
-                                        object_id,
-                                    },
-                                    may_write,
-                                    may_exec,
-                                    writable: access.contains(PageFlags::WRITE),
-                                    memfd_hold,
-                                    memfd_write_hold,
-                                });
-                            mapped_addr
+                            process.shared.shared_mappings.lock().push(vma);
+                            (mapped_addr, None)
                         }
                     }
                     Err(error) => {
                         if object_id != 0 {
                             memory.release_shared_object(object_id);
                         }
-                        map_errno(error)
+                        (map_errno(error), None)
                     }
                 }
             }
@@ -1304,47 +1306,52 @@ pub(super) async fn mmap<R: Resources, M: VirtualMemory, O: System + fs::Filesys
                 };
                 match mapped {
                     Ok(mapped_addr) => {
-                        if stage_id == 0
-                            && !fallback_bytes.is_empty()
-                            && let Err(error) = memory.populate(mapped_addr, &fallback_bytes)
-                        {
-                            memory.unmap(mapped_addr, length);
-                            match error {
-                                MapError::OutOfMemory => errno(ENOMEM),
-                                MapError::Address | MapError::Occupied => errno(EFAULT),
-                            }
+                        let vma = SharedFileMapping {
+                            start: mapped_addr,
+                            len: length,
+                            backing: MappingBacking::PrivateFile {
+                                file,
+                                file_offset: offset,
+                            },
+                            may_write: true,
+                            may_exec,
+                            writable: access.contains(PageFlags::WRITE),
+                            memfd_hold,
+                            memfd_write_hold: None,
+                        };
+                        if stage_id == 0 && !fallback_bytes.is_empty() {
+                            (mapped_addr, Some((mapped_addr, fallback_bytes, vma)))
                         } else {
-                            process
-                                .shared
-                                .shared_mappings
-                                .lock()
-                                .push(SharedFileMapping {
-                                    start: mapped_addr,
-                                    len: length,
-                                    backing: MappingBacking::PrivateFile {
-                                        file,
-                                        file_offset: offset,
-                                    },
-                                    may_write: true,
-                                    may_exec,
-                                    writable: access.contains(PageFlags::WRITE),
-                                    memfd_hold,
-                                    memfd_write_hold: None,
-                                });
-                            mapped_addr
+                            process.shared.shared_mappings.lock().push(vma);
+                            (mapped_addr, None)
                         }
                     }
                     Err(error) => {
                         if stage_id != 0 {
                             memory.release_shared_object(stage_id);
                         }
-                        map_errno(error)
+                        (map_errno(error), None)
                     }
                 }
             }
         };
-        (res, detached_shmids, dropped_memfd)
+        (res, pending_fallback, detached_shmids, dropped_memfd)
     };
+    if let Some((mapped_addr, fallback_bytes, vma)) = pending_fallback {
+        match memory.populate(mapped_addr, &fallback_bytes).await {
+            Ok(()) => {
+                process.shared.shared_mappings.lock().push(vma);
+            }
+            Err(error) => {
+                let _mm = process.shared.program_break.lock();
+                memory.unmap(mapped_addr, length);
+                result = match error {
+                    MapError::OutOfMemory => errno(ENOMEM),
+                    MapError::Address | MapError::Occupied => errno(EFAULT),
+                };
+            }
+        }
+    }
     if !detached_shmids.is_empty() {
         let now_secs = (fs.realtime_nanos() / 1_000_000_000) as i64;
         let pid = process.pid().get();
@@ -1631,12 +1638,14 @@ pub(super) async fn madvise<R: Resources, M: VirtualMemory, F: fs::Filesystem<R>
                     }
                     _ => None,
                 };
-                let _mm = process.shared.program_break.lock();
-                memory.discard(start, len);
+                {
+                    let _mm = process.shared.program_break.lock();
+                    memory.discard(start, len);
+                }
                 if let Some(bytes) = reloaded
                     && !bytes.is_empty()
                 {
-                    let _ = memory.populate(start, &bytes);
+                    let _ = memory.populate(start, &bytes).await;
                 }
             }
         }
@@ -1800,8 +1809,7 @@ async fn populate_grown_shared_tail<R: Resources, M: VirtualMemory, F: fs::Files
             stage_file_into_vec(&tail.file, tail.tail_file_offset, to_load, fs).await
             && !bytes.is_empty()
         {
-            let _mm = process.shared.program_break.lock();
-            let _ = memory.populate(tail.tail_addr, &bytes);
+            let _ = memory.populate(tail.tail_addr, &bytes).await;
         }
     }
     let mut guard = process.shared.shared_mappings.lock();

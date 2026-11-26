@@ -96,27 +96,58 @@ impl<E: HeliosEnv> AsyncCommand<E> for RunExternal {
         let cwd = current_cwd_async(ctx.engine_state, ctx.stack, ctx.env).await;
         let env_map = collect_env_strings(ctx.engine_state, ctx.stack);
         let scope = ctx.runtime_scope.current_scope().map(ToOwned::to_owned);
-        let stdin = input.into_byte_receiver_async(head).await?;
+        let (stdin, upstream_exits) = input.into_external_stdin_async(head).await?;
 
-        let capture_stdout = ctx.runtime_scope.capture_inherited_stdout
-            || !matches!(ctx.stack.stdout(), OutDest::Inherit | OutDest::Print);
+        let stderr_piped_alone = matches!(ctx.stack.stderr(), OutDest::Pipe)
+            && matches!(
+                ctx.stack.stdout(),
+                OutDest::Inherit | OutDest::Print | OutDest::Null
+            );
+        let capture_stdout = !stderr_piped_alone
+            && (ctx.runtime_scope.capture_inherited_stdout
+                || !matches!(ctx.stack.stdout(), OutDest::Inherit | OutDest::Print));
         let capture_stderr = !matches!(ctx.stack.stderr(), OutDest::Inherit | OutDest::Print);
 
-        let process = ctx
-            .env
-            .spawn_external(ExternalSpawnRequest {
-                program: program.clone(),
-                args,
-                cwd,
-                env: env_map,
-                grants,
-                scope,
-                stdin,
-                capture_stdout,
-                capture_stderr,
-            })
-            .await
-            .map_err(|err| err.into_shell_error(&format!("failed to spawn `{program}`"), head))?;
+        let process = if let Some(container_handle) = ctx.runtime_scope.current_container() {
+            let handle = container_handle.to_owned();
+            ctx.env
+                .container_spawn(
+                    &handle,
+                    crate::env::ContainerSpawnRequest {
+                        program: program.clone(),
+                        args,
+                        env: env_map,
+                        cwd: (!cwd.is_empty()).then_some(cwd),
+                        stdin,
+                        capture_stdout,
+                        capture_stderr,
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    err.into_shell_error(
+                        &format!("failed to spawn `{program}` in container `{handle}`"),
+                        head,
+                    )
+                })?
+        } else {
+            ctx.env
+                .spawn_external(ExternalSpawnRequest {
+                    program: program.clone(),
+                    args,
+                    cwd,
+                    env: env_map,
+                    grants,
+                    scope,
+                    stdin,
+                    capture_stdout,
+                    capture_stderr,
+                })
+                .await
+                .map_err(|err| {
+                    err.into_shell_error(&format!("failed to spawn `{program}`"), head)
+                })?
+        };
 
         let stdout = match process.stdout {
             Some(rx) => rx,
@@ -130,6 +161,9 @@ impl<E: HeliosEnv> AsyncCommand<E> for RunExternal {
             stream: stdout,
             stderr: process.stderr,
             exit_code: Some(process.exit_code),
+            upstream_exits,
+            is_external: true,
+            merge_stderr: false,
             span: head,
             stream_type: ByteStreamType::Unknown,
             metadata: None,

@@ -37,8 +37,8 @@ pub(crate) enum ImageCommand {
 #[derive(Debug, Clone, ClapArgs)]
 pub(crate) struct ImageBuildArgs {
     /// Root directory of the `component.toml` component tree.
-    #[arg(long, default_value = "components")]
-    pub components: PathBuf,
+    #[arg(value_name = "TREE_DIR")]
+    pub tree_dir: PathBuf,
 
     /// Output directory for the three-part image artifacts and `image-manifest.json`.
     #[arg(long)]
@@ -118,7 +118,7 @@ pub(crate) fn build_cli_args(args: &ImageBuildArgs) -> Vec<String> {
     let mut out = vec![
         "image-build".to_owned(),
         "--components".to_owned(),
-        args.components.display().to_string(),
+        args.tree_dir.display().to_string(),
         "--out-dir".to_owned(),
         args.out_dir.display().to_string(),
         "--profile".to_owned(),
