@@ -220,6 +220,42 @@ impl ByteQueue {
         (chunks.pop(), was_full)
     }
 
+    /// Copies up to `limit` buffered bytes without consuming them (for `tee(2)`).
+    fn peek_limit(&self, limit: usize) -> Option<Bytes> {
+        let chunks = self.chunks.lock();
+        if chunks.is_empty() {
+            return None;
+        }
+        let front = if !chunks.inline.is_empty() {
+            chunks.inline.front()
+        } else {
+            chunks.overflow.as_ref().and_then(VecDeque::front)
+        };
+        if let Some(front) = front
+            && front.len() >= limit
+        {
+            return Some(front.slice(..limit));
+        }
+        let mut out = Vec::new();
+        for chunk in chunks.inline.iter() {
+            let take = (limit - out.len()).min(chunk.len());
+            out.extend_from_slice(&chunk[..take]);
+            if out.len() == limit {
+                return Some(Bytes::from(out));
+            }
+        }
+        if let Some(overflow) = chunks.overflow.as_ref() {
+            for chunk in overflow.iter() {
+                let take = (limit - out.len()).min(chunk.len());
+                out.extend_from_slice(&chunk[..take]);
+                if out.len() == limit {
+                    break;
+                }
+            }
+        }
+        Some(Bytes::from(out))
+    }
+
     fn is_empty(&self) -> bool {
         self.chunks.lock().is_empty()
     }
@@ -900,6 +936,40 @@ impl ByteReader {
         core::future::poll_fn(|cx| {
             loop {
                 match self.try_read_limit(limit) {
+                    TryRead::Ready(bytes) => return Poll::Ready(Some(bytes)),
+                    TryRead::Eof => return Poll::Ready(None),
+                    TryRead::Pending => {
+                        match self.channel.readable.poll_notified(cx, &mut wait.wait) {
+                            Poll::Ready(()) => continue,
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                }
+            }
+        })
+        .await
+    }
+
+    /// Peeks up to `limit` buffered bytes without consuming them from the channel.
+    pub fn try_peek_limit(&self, limit: usize) -> TryRead {
+        if limit == 0 {
+            return TryRead::Ready(Bytes::new());
+        }
+        let closed = self.channel.is_closed();
+        match self.channel.queue.peek_limit(limit) {
+            Some(bytes) => TryRead::Ready(bytes),
+            None if closed => TryRead::Eof,
+            None => TryRead::Pending,
+        }
+    }
+
+    /// Waits until bytes are available or the writer closes, then peeks up to
+    /// `limit` bytes without consuming them.
+    pub async fn peek_limit(&self, limit: usize) -> Option<Bytes> {
+        let mut wait = self.wait_state();
+        core::future::poll_fn(|cx| {
+            loop {
+                match self.try_peek_limit(limit) {
                     TryRead::Ready(bytes) => return Poll::Ready(Some(bytes)),
                     TryRead::Eof => return Poll::Ready(None),
                     TryRead::Pending => {

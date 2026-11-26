@@ -218,6 +218,7 @@ pub(super) struct WaitEvent {
     pub pid: u32,
     pub uid: u32,
     pub kind: WaitEventKind,
+    pub usage: super::system::CpuUsage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -328,16 +329,23 @@ pub(super) enum TryWaitResult {
 }
 
 /// Metadata stored per process in [`PidNamespace`] for parent/child tracking,
-/// job control (`pgid`/`sid`), and `wait4`/`waitid`.
+/// job control (`pgid`/`sid`), `wait4`/`waitid`, `PR_SET_PDEATHSIG`,
+/// `PR_SET_CHILD_SUBREAPER`, and child resource usage accounting.
 pub(super) struct ProcessTreeRecord {
     pub ppid: u32,
+    /// TID of the parent thread that forked/cloned this process (for `PR_SET_PDEATHSIG`).
+    pub parent_tid: u32,
     pub pgid: NonZeroU32,
     pub sid: NonZeroU32,
     pub exit_signal: Option<Signal>,
     pub has_execed: bool,
+    pub is_child_subreaper: bool,
+    pub pdeathsig: Option<Signal>,
+    pub usage: super::system::CpuUsage,
     pub state: ChildWaitState,
     pub signals: Arc<ProcessSignals>,
     pub credentials: Arc<spin::Mutex<Credentials>>,
+    pub sched: Arc<spin::Mutex<super::thread::ThreadSchedState>>,
 }
 
 impl ProcessTreeRecord {
@@ -345,16 +353,22 @@ impl ProcessTreeRecord {
         pid: NonZeroU32,
         signals: Arc<ProcessSignals>,
         credentials: Arc<spin::Mutex<Credentials>>,
+        sched: Arc<spin::Mutex<super::thread::ThreadSchedState>>,
     ) -> Self {
         Self {
             ppid: 0,
+            parent_tid: 0,
             pgid: pid,
             sid: pid,
             exit_signal: Some(Signal::SIGCHLD),
             has_execed: false,
+            is_child_subreaper: false,
+            pdeathsig: None,
+            usage: super::system::CpuUsage::default(),
             state: ChildWaitState::Running,
             signals,
             credentials,
+            sched,
         }
     }
 
@@ -553,6 +567,7 @@ pub(super) async fn clone_process<
     };
 
     let child_creds = Arc::new(spin::Mutex::new(process.credentials.lock().clone()));
+    let child_sched = Arc::new(spin::Mutex::new(process.sched.lock().clone_for_fork()));
     let child_attrs = process.shared.attributes.lock().clone();
     let child_stdin_carry = process.shared.stdin_carry.lock().clone();
     let share_sighand = parsed.flags & CLONE_SIGHAND != 0;
@@ -567,19 +582,27 @@ pub(super) async fn clone_process<
         child_signals.register_thread(child_pid, process.signals.current_mask());
     child_thread_signals.set_altstack(process.signals.clone_altstack());
 
+    let parent_tid_val = if parsed.flags & CLONE_PARENT != 0 {
+        ppid
+    } else {
+        process.tid.get()
+    };
     process.shared.pids.register_child_process(
         child_pid,
         ppid,
+        parent_tid_val,
         pgid,
         sid,
         exit_signal,
         child_signals.clone(),
         child_creds.clone(),
+        child_sched.clone(),
     );
     process.shared.pids.register_thread(
         child_pid,
         child_thread_signals.clone(),
         child_creds.clone(),
+        child_sched.clone(),
     );
 
     let robust_list = Arc::new(AtomicU64::new(0));
@@ -592,10 +615,13 @@ pub(super) async fn clone_process<
         changed: Notify::new(),
     });
 
-    let child_cwd = if parsed.flags & CLONE_FS != 0 {
-        process.shared.cwd.clone()
+    let (child_cwd, child_root) = if parsed.flags & CLONE_FS != 0 {
+        (process.shared.cwd.clone(), process.shared.root.clone())
     } else {
-        Arc::new(spin::Mutex::new(process.shared.cwd.lock().clone()))
+        (
+            Arc::new(spin::Mutex::new(process.shared.cwd.lock().clone())),
+            Arc::new(spin::Mutex::new(process.shared.root.lock().clone())),
+        )
     };
     let child_shared_mappings = if share_vm {
         process.shared.shared_mappings.clone()
@@ -614,10 +640,12 @@ pub(super) async fn clone_process<
             futex: process.shared.futex.clone(),
             descriptors: child_descriptors,
             cwd: child_cwd,
+            root: child_root,
             shared_mappings: child_shared_mappings,
             stdin_lock: helios_sync::RawMutex::new(),
             stdin_carry: spin::Mutex::new(child_stdin_carry),
             attributes: spin::Mutex::new(child_attrs),
+            children_usage: spin::Mutex::new(super::system::CpuUsage::default()),
             program_break: child_program_break,
             signals: child_signals,
             threads: lifecycle,
@@ -626,6 +654,7 @@ pub(super) async fn clone_process<
         tid: child_pid,
         signals: child_thread_signals,
         credentials: child_creds,
+        sched: child_sched,
         clear_child_tid: if parsed.flags & CLONE_CHILD_CLEARTID != 0 {
             parsed.child_tid
         } else {
@@ -865,6 +894,9 @@ pub(super) async fn wait4<R: Resources, M: UserMemory>(
             false,
         ) {
             TryWaitResult::Event(event) => {
+                if matches!(event.kind, WaitEventKind::Exited(_)) {
+                    process.shared.children_usage.lock().accumulate(event.usage);
+                }
                 if wstatus_ptr != 0
                     && memory
                         .write(wstatus_ptr, &event.encode_wstatus().to_le_bytes())
@@ -872,7 +904,11 @@ pub(super) async fn wait4<R: Resources, M: UserMemory>(
                 {
                     return SyscallOutcome::Return(errno(EFAULT));
                 }
-                if rusage_ptr != 0 && memory.write(rusage_ptr, &[0u8; RUSAGE_BYTES]).is_err() {
+                if rusage_ptr != 0
+                    && memory
+                        .write(rusage_ptr, &event.usage.encode_rusage())
+                        .is_err()
+                {
                     return SyscallOutcome::Return(errno(EFAULT));
                 }
                 return SyscallOutcome::Return(u64::from(event.pid));
@@ -977,13 +1013,20 @@ pub(super) async fn waitid<R: Resources, M: UserMemory>(
             nowait,
         ) {
             TryWaitResult::Event(event) => {
+                if !nowait && matches!(event.kind, WaitEventKind::Exited(_)) {
+                    process.shared.children_usage.lock().accumulate(event.usage);
+                }
                 if infop != 0 {
                     let encoded = event.encode_siginfo().encode();
                     if memory.write(infop, &encoded).is_err() {
                         return SyscallOutcome::Return(errno(EFAULT));
                     }
                 }
-                if rusage_ptr != 0 && memory.write(rusage_ptr, &[0u8; RUSAGE_BYTES]).is_err() {
+                if rusage_ptr != 0
+                    && memory
+                        .write(rusage_ptr, &event.usage.encode_rusage())
+                        .is_err()
+                {
                     return SyscallOutcome::Return(errno(EFAULT));
                 }
                 return SyscallOutcome::Return(0);
