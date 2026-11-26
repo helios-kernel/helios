@@ -31,6 +31,8 @@ pub enum OpsError {
     #[error("{0}")]
     Auth(#[from] AuthError),
     #[error("{0}")]
+    Account(#[from] AccountError),
+    #[error("{0}")]
     Http(#[from] HttpError),
     #[error("{0}")]
     Bundle(#[from] BundleError),
@@ -325,6 +327,69 @@ pub enum AuthError {
         url: String,
         status: u16,
         detail: String,
+    },
+}
+
+/// Errors creating, storing, signing with, or removing operator accounts.
+#[derive(Debug, thiserror::Error)]
+pub enum AccountError {
+    #[error(
+        "invalid operator username `{username}`: expected POSIX name `[a-z_][a-z0-9_-]{{0,31}}`"
+    )]
+    InvalidUsername { username: String },
+    #[error("operator account `{username}` already exists at {path}")]
+    AlreadyExists { username: String, path: PathBuf },
+    #[error("operator account `{username}` not found at {path}")]
+    NotFound { username: String, path: PathBuf },
+    #[error("failed to read account file {path}: {source}")]
+    ReadAccount {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to write account file {path}: {source}")]
+    WriteAccount {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to remove account file {path}: {source}")]
+    RemoveAccount {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to parse account file {path}: {source}")]
+    ParseAccount {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("failed to serialize account file: {source}")]
+    SerializeAccount {
+        #[source]
+        source: toml::ser::Error,
+    },
+    #[error("invalid account `{username}` configuration: {detail}")]
+    InvalidAccount { username: String, detail: String },
+    #[error("Touch ID is only supported on macOS; use `--fido2` for hardware security keys")]
+    TouchIdUnsupported,
+    #[error("Touch ID authentication failed: {detail}")]
+    TouchIdFailed { detail: String },
+    #[error("macOS Keychain operation `{operation}` failed: {detail}")]
+    Keychain {
+        operation: &'static str,
+        detail: String,
+    },
+    #[error("FIDO2 operation `{operation}` failed: {detail}")]
+    Fido2 {
+        operation: &'static str,
+        detail: String,
+    },
+    #[error("account verification failed: {source}")]
+    Protocol {
+        #[from]
+        source: ProtocolAuthError,
     },
 }
 

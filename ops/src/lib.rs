@@ -19,6 +19,7 @@ pub use helios_oci;
 pub use helios_wit_rpc;
 pub use zenwave;
 
+pub mod account;
 pub mod bundle;
 pub mod components;
 pub mod error;
@@ -34,9 +35,16 @@ pub mod target;
 pub mod transport;
 pub mod vm;
 
+pub use account::{
+    AccountAuthenticatorChoice, AccountStore, AuthenticatorSpec, CreateAccountRequest, Fido2Alg,
+    Fido2Enrollment, Fido2Provider, OpenSshFido2Provider, OperatorAccount,
+    TOUCH_ID_KEYCHAIN_SERVICE, TouchIdProvider, session_grants_from_attenuation, validate_username,
+};
 pub use bundle::{BundleEntry, BundleManifest, DiagnosticBundle};
 pub use components::{ComponentsClient, DynamicDirSource, DynamicSubtreeSource};
-pub use error::{AuthError, BundleError, HttpError, OpsError, TargetError, TransportError};
+pub use error::{
+    AccountError, AuthError, BundleError, HttpError, OpsError, TargetError, TransportError,
+};
 pub use fleet::{DEFAULT_FLEET_CONCURRENCY, Fleet, FleetComponents, FleetOci, NodeOutcome};
 pub use grants::{Command, NonFsGrant, NonFsGrants, ProcessGrants};
 pub use oci::{DEFAULT_REMOTE_OCI_STORE, OciClient, PullOptions};
