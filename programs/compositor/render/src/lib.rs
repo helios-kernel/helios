@@ -11,9 +11,11 @@
 //! disagree with the desktop about a glyph, a colour or a cell because
 //! it renders the expected pixels with these very modules.
 
+pub mod console;
 pub mod damage;
 pub mod desktop;
 pub mod font;
 pub mod keys;
 pub mod paint;
+pub mod splash;
 pub mod term;
