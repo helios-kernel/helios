@@ -47,7 +47,9 @@ pub use iommu::{
     DeviceChunkDomain, DeviceForeignMapping, DirectChunkDomain, IommuChunkDomain, IommuDomains,
     IommuEndpointStats, IommuForeignMapping, IommuReport, IommuStats, MAX_IOMMU_ENDPOINTS,
 };
-pub use panic_console::{PanicSerial, emit_panic_report};
+pub use panic_console::{
+    PanicSerial, attach_panic_framebuffer, detach_panic_framebuffer, emit_panic_report,
+};
 pub use poll_registry::{
     PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
 };

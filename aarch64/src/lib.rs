@@ -16,10 +16,10 @@ use arm_gic::IntId;
 use helios_artifact::{ProbeAnswers, cwasm_target_isa_levels};
 use helios_firmware::ProcessorIdentities;
 use helios_hal::boot::{
-    BootFirmwareTables, BootHandoff, BootKernelImage, BootMemoryKind, BootMemoryMap,
-    BootMemoryMetadata, BootMemoryRegion, BootModule, BootModules, BootPayloadMetadata,
-    BootPhysicalRange, BootReservedRanges, FirmwareKind, KernelImageSections, KernelSectionRange,
-    usable_node_regions,
+    BootFirmwareTables, BootFramebuffer, BootHandoff, BootKernelImage, BootMemoryKind,
+    BootMemoryMap, BootMemoryMetadata, BootMemoryRegion, BootModule, BootModules,
+    BootPayloadMetadata, BootPhysicalRange, BootPixelChannel, BootPixelLayout, BootReservedRanges,
+    FirmwareKind, KernelImageSections, KernelSectionRange, usable_node_regions,
 };
 use helios_hal::cpu::{
     Aarch64SnapshotContext, BspSnapshotContext, ControlFlowIntegrity, Cpu,
@@ -43,12 +43,13 @@ use limine::file::File;
 use limine::firmware::{
     FIRMWARE_TYPE_EFI32, FIRMWARE_TYPE_EFI64, FIRMWARE_TYPE_SBI, FIRMWARE_TYPE_X86BIOS,
 };
+use limine::framebuffer::FRAMEBUFFER_RGB;
 use limine::memmap::{Entry, MEMMAP_BOOTLOADER_RECLAIMABLE, MEMMAP_USABLE};
 use limine::mp::MpInfo;
 use limine::request::{
     DtbRequest, EfiRequest, ExecutableAddressRequest, ExecutableCmdlineRequest,
-    ExecutableFileRequest, FirmwareTypeRequest, HhdmRequest, MemmapRequest, ModulesRequest,
-    MpRequest, RsdpRequest, StackSizeRequest,
+    ExecutableFileRequest, FirmwareTypeRequest, FlantermParamsRequest, FramebufferRequest,
+    HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, RsdpRequest, StackSizeRequest,
 };
 use r_efi::efi::SystemTable;
 use spin::Once;
@@ -316,6 +317,13 @@ static FIRMWARE_TYPE_REQUEST: FirmwareTypeRequest = FirmwareTypeRequest::new();
 static DEVICE_TREE_BLOB_REQUEST: DtbRequest = DtbRequest::new();
 #[used]
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
+#[used]
+static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+/// Advertising `FlantermParamsRequest` instructs Limine v12 to preserve the
+/// bootloader splash pixels on the linear GOP framebuffer across kernel entry
+/// rather than clearing the screen before `_start`.
+#[used]
+static FLANTERM_PARAMS_REQUEST: FlantermParamsRequest = FlantermParamsRequest::new();
 /// The UEFI system table, whose configuration table names the firmware's
 /// own device tree (`platform::efi`).
 #[used]
@@ -825,6 +833,12 @@ extern "C" fn aarch64_kernel_main() -> ! {
     install_exception_vectors();
     install_memory_attributes();
     let handoff = limine_boot_handoff();
+    // Publish the firmware linear framebuffer for early panic output without
+    // writing a pixel during normal bring-up so Limine's splash remains on
+    // screen until `virtio-gpu` claims scanout.
+    if let Some(framebuffer) = handoff.framebuffer {
+        helios_kernel::attach_panic_framebuffer(framebuffer);
+    }
     let physical_memory_offset = physical_memory_offset();
     // The firmware description comes up before anything else, because
     // the console is part of it and a panic from here on should reach a
@@ -3179,7 +3193,34 @@ fn limine_boot_handoff() -> LimineBootHandoff {
                 .map(|response| response.dtb_ptr as usize),
             measurement_log: TPM_EVENT_LOG_REQUEST.measurement_log(),
         },
+        framebuffer: limine_framebuffer(),
     }
+}
+
+fn limine_framebuffer() -> Option<BootFramebuffer> {
+    let response = FRAMEBUFFER_REQUEST.response()?;
+    response.framebuffers().iter().copied().find_map(|fb| {
+        if fb.memory_model != FRAMEBUFFER_RGB {
+            return None;
+        }
+        let base = NonNull::new(fb.address().cast::<u8>())?;
+        let width = u32::try_from(fb.width).ok()?;
+        let height = u32::try_from(fb.height).ok()?;
+        let pitch = u32::try_from(fb.pitch).ok()?;
+        let framebuffer = BootFramebuffer {
+            base,
+            width,
+            height,
+            pitch,
+            bpp: fb.bpp,
+            layout: BootPixelLayout::new(
+                BootPixelChannel::new(fb.red_mask_size, fb.red_mask_shift),
+                BootPixelChannel::new(fb.green_mask_size, fb.green_mask_shift),
+                BootPixelChannel::new(fb.blue_mask_size, fb.blue_mask_shift),
+            ),
+        };
+        framebuffer.is_valid().then_some(framebuffer)
+    })
 }
 
 fn convert_memory_region(entry: &'static Entry) -> BootMemoryRegion {

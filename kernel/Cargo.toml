@@ -56,6 +56,7 @@ erofs-rs = { git = "https://github.com/lexoliu/erofs-rs", branch = "no-std-bare-
 futures = { version = "0.3.31", default-features = false, features = ["alloc"] }
 hashbrown = { version = "0.16.1", default-features = false, features = ["allocator-api2", "default-hasher", "equivalent", "inline-more"] }
 heapless = { version = "0.7.17", default-features = false }
+noto-sans-mono-bitmap = { version = "0.3.2", default-features = false, features = ["regular", "size_16", "unicode-basic-latin"] }
 nu-ansi-term = { version = "0.50.3", default-features = false }
 pin-project-lite = "0.2.17"
 objectpool = { version = "0.1.0", default-features = false, features = ["alloc"] }
