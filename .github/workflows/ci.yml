@@ -1817,14 +1817,14 @@ jobs:
 
           # Boot 1: establish live RAM state + entropy sample, then hibernate.
           ./target/release/helios vm --arch aarch64 --release --memory 2G --acpi \
-            --accel tcg --tpm swtpm --hibernate-disk-size 256M \
+            --accel tcg --tpm swtpm --hibernate-disk-size 512M \
             --runtime-dir "$hib_dir" --keep-runtime-dir \
-            --boot-program dash --boot-program cat --boot-program head --boot-program date \
+            --boot-program dash --boot-program cat --boot-program date --boot-program python3 \
             --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --no-compiler-plugin \
             hibernate --power-off-timeout-seconds 180 \
             --before-shell /bin/dash \
-            -c 'echo hib-ram-state-ok > /tmp/hib-live; head -c 64 /dev/urandom > /tmp/entropy-before; printf "head -c 64 /dev/urandom\n" > /tmp/read-entropy.sh' \
+            -c 'echo hib-ram-state-ok > /hib-live; /bin/python3 -c "import os; print(os.urandom(32).hex())" > /entropy-before; printf "/bin/python3 -c \"import os; print(os.urandom(32).hex())\"\n" > /read-entropy.sh' \
             2>&1 | tee "$hib_dir/inspector.hibernate.log"
 
           bootfs_saved="$hib_dir/helios-bootfs.saved"
@@ -1842,7 +1842,7 @@ jobs:
           # Boot 2: resume once and verify RAM state, generation, entropy, and wall clock.
           # shellcheck disable=SC2016
           ./target/release/helios vm --resume "$hib_dir" \
-            nu -c 'let gen = (fleet inspect /kernel/machine/generation | first | get value); let live = (fleet exec /bin/cat /tmp/hib-live | first | get stdout | str trim); let wall = (fleet exec /bin/date | first | get stdout | str trim); let e1 = (fleet exec /bin/cat /tmp/entropy-before | first | get stdout); let e2 = (fleet exec /bin/dash /tmp/read-entropy.sh | first | get stdout); if ($e1 | is-empty) or ($e2 | is-empty) or ($e1 == $e2) { error make { msg: "entropy did not change across hibernate/resume" } }; print $"generation=($gen)"; print $"live=($live)"; print $"wall=($wall)"; print "entropy=changed"' \
+            nu -c 'let gen = (fleet inspect /kernel/machine/generation | first | get value); let live = (fleet exec /bin/cat /hib-live | first | get stdout | str trim); let wall = (fleet exec /bin/date | first | get stdout | str trim); let e1 = (fleet exec /bin/cat /entropy-before | first | get stdout | str trim); let e2 = (fleet exec /bin/dash /read-entropy.sh | first | get stdout | str trim); if ($e1 | is-empty) or ($e2 | is-empty) or ($e1 == $e2) { error make { msg: "entropy did not change across hibernate/resume" } }; print $"generation=($gen)"; print $"live=($live)"; print $"wall=($wall)"; print "entropy=changed"' \
             2>&1 > "$hib_dir/resume.out" | tee "$hib_dir/inspector.resume.log"
           host_after="$(date +%s)"
           cat "$hib_dir/resume.out"
@@ -1904,7 +1904,7 @@ jobs:
             --accel tcg --tpm swtpm --tpm-state "$changed_dir/tpm" \
             --disk "$changed_dir/hibernate.img,serial=helios-hibernate" \
             --runtime-dir "$changed_dir" --keep-runtime-dir \
-            --boot-program dash --boot-program cat --boot-program head --boot-program date --boot-program ls \
+            --boot-program dash --boot-program cat --boot-program date --boot-program python3 --boot-program ls \
             --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --no-compiler-plugin \
             shell --shell /bin/dash -c 'echo changed:cold' \
@@ -2471,13 +2471,13 @@ jobs:
 
           # Boot 1: establish live RAM state + entropy sample, then hibernate.
           ./target/release/helios vm --arch x86-64 --release --memory 2G \
-            --accel kvm --tpm swtpm --hibernate-disk-size 256M \
+            --accel kvm --tpm swtpm --hibernate-disk-size 512M \
             --runtime-dir "$hib_dir" --keep-runtime-dir \
-            --boot-program dash --boot-program cat --boot-program head --boot-program date \
+            --boot-program dash --boot-program cat --boot-program date --boot-program python3 \
             --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --no-compiler-plugin \
             hibernate --before-shell /bin/dash \
-            -c 'echo hib-ram-state-ok > /tmp/hib-live; head -c 64 /dev/urandom > /tmp/entropy-before; printf "head -c 64 /dev/urandom\n" > /tmp/read-entropy.sh' \
+            -c 'echo hib-ram-state-ok > /hib-live; /bin/python3 -c "import os; print(os.urandom(32).hex())" > /entropy-before; printf "/bin/python3 -c \"import os; print(os.urandom(32).hex())\"\n" > /read-entropy.sh' \
             2>&1 | tee "$hib_dir/inspector.hibernate.log"
 
           bootfs_saved="$hib_dir/helios-bootfs.saved"
@@ -2495,7 +2495,7 @@ jobs:
           # Boot 2: resume once and verify RAM state, generation, entropy, and wall clock.
           # shellcheck disable=SC2016
           ./target/release/helios vm --resume "$hib_dir" \
-            nu -c 'let gen = (fleet inspect /kernel/machine/generation | first | get value); let live = (fleet exec /bin/cat /tmp/hib-live | first | get stdout | str trim); let wall = (fleet exec /bin/date | first | get stdout | str trim); let e1 = (fleet exec /bin/cat /tmp/entropy-before | first | get stdout); let e2 = (fleet exec /bin/dash /tmp/read-entropy.sh | first | get stdout); if ($e1 | is-empty) or ($e2 | is-empty) or ($e1 == $e2) { error make { msg: "entropy did not change across hibernate/resume" } }; print $"generation=($gen)"; print $"live=($live)"; print $"wall=($wall)"; print "entropy=changed"' \
+            nu -c 'let gen = (fleet inspect /kernel/machine/generation | first | get value); let live = (fleet exec /bin/cat /hib-live | first | get stdout | str trim); let wall = (fleet exec /bin/date | first | get stdout | str trim); let e1 = (fleet exec /bin/cat /entropy-before | first | get stdout | str trim); let e2 = (fleet exec /bin/dash /read-entropy.sh | first | get stdout | str trim); if ($e1 | is-empty) or ($e2 | is-empty) or ($e1 == $e2) { error make { msg: "entropy did not change across hibernate/resume" } }; print $"generation=($gen)"; print $"live=($live)"; print $"wall=($wall)"; print "entropy=changed"' \
             2>&1 > "$hib_dir/resume.out" | tee "$hib_dir/inspector.resume.log"
           host_after="$(date +%s)"
           cat "$hib_dir/resume.out"
@@ -2557,7 +2557,7 @@ jobs:
             --accel kvm --tpm swtpm --tpm-state "$changed_dir/tpm" \
             --disk "$changed_dir/hibernate.img,serial=helios-hibernate" \
             --runtime-dir "$changed_dir" --keep-runtime-dir \
-            --boot-program dash --boot-program cat --boot-program head --boot-program date --boot-program ls \
+            --boot-program dash --boot-program cat --boot-program date --boot-program python3 --boot-program ls \
             --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --no-compiler-plugin \
             shell --shell /bin/dash -c 'echo changed:cold' \
