@@ -380,6 +380,7 @@ class MockHeliosGuest:
         pending_out: dict[tuple[int, int], list[bytes]] = {}
         pending_in: dict[tuple[int, int], tuple[str, Any, int | None, bytearray, int]] = {}
         early_credits: set[tuple[int, int]] = set()
+        early_in_closes: set[tuple[int, int]] = set()
 
         async def flush_subpath(inv: int, sub_id: int) -> None:
             chunks = pending_out.pop((inv, sub_id), None)
@@ -389,6 +390,32 @@ class MockHeliosGuest:
                 writer.write(encode_data(inv, [DIR_CALLEE_TO_CALLER, sub_id], chunk))
             writer.write(encode_close(inv, [DIR_CALLEE_TO_CALLER, sub_id]))
             await writer.drain()
+
+        async def finish_in_stream(
+            inv: int,
+            entry: tuple[str, Any, int | None, bytearray, int],
+        ) -> None:
+            sink_kind, target_key, offset, data, done_sub_id = entry
+            if sink_kind == "stdin":
+                child_state = self._children.get(target_key)
+                if child_state is not None:
+                    child_state[2].extend(data)
+                self.child_stdin_received[target_key] = bytes(
+                    child_state[2] if child_state is not None else data
+                )
+            elif offset is None:
+                self.files[target_key] = self.files.get(target_key, b"") + bytes(data)
+            else:
+                existing = bytearray(self.files.get(target_key, b""))
+                end = offset + len(data)
+                if len(existing) < end:
+                    existing.extend(b"\x00" * (end - len(existing)))
+                existing[offset:end] = data
+                self.files[target_key] = bytes(existing)
+            pending_out[(inv, done_sub_id)] = [b"\x00"]
+            if (inv, done_sub_id) in early_credits:
+                early_credits.discard((inv, done_sub_id))
+                await flush_subpath(inv, done_sub_id)
 
         def alloc_handle(path: str, is_dir: bool) -> int:
             nonlocal next_handle
@@ -449,40 +476,30 @@ class MockHeliosGuest:
                                 await flush_subpath(invocation, sub_id)
                         if in_stream is not None:
                             in_sub_id, sink_kind, target_key, offset, done_sub_id = in_stream
-                            pending_in[(invocation, in_sub_id)] = (
+                            key = (invocation, in_sub_id)
+                            entry = (
                                 sink_kind,
                                 target_key,
                                 offset,
                                 bytearray(),
                                 done_sub_id,
                             )
-                            writer.write(encode_credit(invocation, [DIR_CALLER_TO_CALLEE, in_sub_id], 8))
+                            if key in early_in_closes:
+                                early_in_closes.discard(key)
+                                await finish_in_stream(invocation, entry)
+                            else:
+                                pending_in[key] = entry
+                                writer.write(
+                                    encode_credit(invocation, [DIR_CALLER_TO_CALLEE, in_sub_id], 8)
+                                )
                         await writer.drain()
                     elif len(path) == 2 and path[0] == DIR_CALLER_TO_CALLEE:
                         key = (invocation, path[1])
                         entry = pending_in.pop(key, None)
                         if entry is not None:
-                            sink_kind, target_key, offset, data, done_sub_id = entry
-                            if sink_kind == "stdin":
-                                child_state = self._children.get(target_key)
-                                if child_state is not None:
-                                    child_state[2].extend(data)
-                                self.child_stdin_received[target_key] = bytes(
-                                    child_state[2] if child_state is not None else data
-                                )
-                            elif offset is None:
-                                self.files[target_key] = self.files.get(target_key, b"") + bytes(data)
-                            else:
-                                existing = bytearray(self.files.get(target_key, b""))
-                                end = offset + len(data)
-                                if len(existing) < end:
-                                    existing.extend(b"\x00" * (end - len(existing)))
-                                existing[offset:end] = data
-                                self.files[target_key] = bytes(existing)
-                            pending_out[(invocation, done_sub_id)] = [b"\x00"]
-                            if (invocation, done_sub_id) in early_credits:
-                                early_credits.discard((invocation, done_sub_id))
-                                await flush_subpath(invocation, done_sub_id)
+                            await finish_in_stream(invocation, entry)
+                        else:
+                            early_in_closes.add(key)
                 elif tag == 5:  # Credit
                     (invocation,) = struct.unpack_from("<I", body, 0)
                     path, _ = _decode_path(body, 4)
