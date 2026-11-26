@@ -1882,6 +1882,16 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
+    /// Borrows the shared component runtime owned by this program service.
+    pub(super) fn runtime(&self) -> &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> {
+        &self.inner.runtime
+    }
+
+    /// Borrows the shared component engine owned by this program service.
+    pub(super) fn engine(&self) -> &crate::wasmtime_adapter::WasmtimeEngine {
+        &self.inner.engine
+    }
+
     /// Preempts every guest, on any processor, that has held its
     /// processor for at least one [`crate::GUEST_TIME_SLICE`].
     ///

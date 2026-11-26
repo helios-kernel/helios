@@ -1400,10 +1400,6 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    pub(super) fn engine(&self) -> &crate::wasmtime_adapter::WasmtimeEngine {
-        &self.inner.engine
-    }
-
     pub(super) fn verify_compiler_provider_source(
         &self,
         source: &ProgramSource,
