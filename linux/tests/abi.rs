@@ -554,9 +554,9 @@ fn aarch64_numbers_reach_the_same_operations_and_legacy_numbers_do_not() {
         unix_call(&mut process, 172, [0; 6], &mut memory, &mut sink),
         5
     );
-    // x86-64's write (1), epoll_create (213) and eventfd (284) are no aarch64
-    // calls this decoder serves (1 is io_destroy, 213 readahead, 284 seccomp).
-    for number in [1, 213, 284] {
+    // x86-64's write (1), open (2) and eventfd (284) are no aarch64 calls this
+    // decoder serves (1 is io_destroy, 2 io_submit, 284 seccomp).
+    for number in [1, 2, 284] {
         assert_eq!(
             unix_call(&mut process, number, [0; 6], &mut memory, &mut sink),
             38u64.wrapping_neg()

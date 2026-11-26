@@ -4,8 +4,10 @@
 use core::future::Future;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::BufReader;
+use std::hash::{BuildHasher as _, RandomState};
+use std::io::{self, BufReader, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
@@ -20,8 +22,97 @@ use crate::registry::RegistryClient;
 use crate::spec::{Arch, ImageConfig, LayerCompression};
 use crate::unpack::{
     EntryUnixMetadata, LayerMetadataIndex, copy_tree_recursive, encode_layer_as_btrfs_send,
-    mark_tree_read_only, remove_path_recursive, unpack_layer_into_dir,
+    mark_tree_read_only, remove_path_recursive, set_writable_for_unpack, unpack_layer_into_dir,
 };
+
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn next_unique_suffix() -> String {
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let rand = RandomState::new().hash_one(seq);
+    #[cfg(not(target_os = "wasi"))]
+    let pid = std::process::id();
+    #[cfg(target_os = "wasi")]
+    let pid = 0u32;
+    format!("{pid}-{seq}-{rand:016x}")
+}
+
+pub(crate) fn create_unique_temp_file(
+    dir: &Path,
+    prefix: &str,
+    suffix: &str,
+    operation: &'static str,
+) -> Result<(PathBuf, File)> {
+    fs::create_dir_all(dir).map_err(|source| OciError::Io {
+        operation: "create temporary parent directory",
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    for _ in 0..64 {
+        let candidate = dir.join(format!("{prefix}.{}.{suffix}", next_unique_suffix()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(OciError::Io {
+                    operation,
+                    path: candidate,
+                    source,
+                });
+            }
+        }
+    }
+    Err(OciError::Io {
+        operation,
+        path: dir.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "exhausted unique temporary filename attempts",
+        ),
+    })
+}
+
+pub(crate) fn atomic_write_file(
+    target: &Path,
+    payload: &[u8],
+    write_op: &'static str,
+    commit_op: &'static str,
+) -> Result<()> {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("record");
+    let prefix = format!(".{file_name}");
+    let (tmp_path, mut file) = create_unique_temp_file(parent, &prefix, "tmp", write_op)?;
+    let write_res = (|| -> io::Result<()> {
+        file.write_all(payload)?;
+        file.flush()?;
+        drop(file);
+        Ok(())
+    })();
+    if let Err(source) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(OciError::Io {
+            operation: write_op,
+            path: tmp_path,
+            source,
+        });
+    }
+    if let Err(source) = fs::rename(&tmp_path, target) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(OciError::Io {
+            operation: commit_op,
+            path: target.to_path_buf(),
+            source,
+        });
+    }
+    Ok(())
+}
 
 /// Metadata about a materialized btrfs subvolume.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -326,24 +417,22 @@ impl<B: SubvolumeBackend> ImageStore<B> {
             }
 
             let compression = LayerCompression::from_media_type(&layer_desc.media_type)?;
-            let staged_blob = self
-                .root
-                .join("staging")
-                .join(format!("{}.blob", chain_id.hex()));
+            let staging_dir = self.root.join("staging");
+            let (staged_blob, mut blob_file) = create_unique_temp_file(
+                &staging_dir,
+                chain_id.hex(),
+                "blob",
+                "create staging blob file",
+            )?;
+            if let Err(err) = client
+                .stream_verified_blob(reference, &layer_desc.digest, &mut blob_file)
+                .await
             {
-                let mut blob_file = File::create(&staged_blob).map_err(|source| OciError::Io {
-                    operation: "create staging blob file",
-                    path: staged_blob.clone(),
-                    source,
-                })?;
-                if let Err(err) = client
-                    .stream_verified_blob(reference, &layer_desc.digest, &mut blob_file)
-                    .await
-                {
-                    let _ = fs::remove_file(&staged_blob);
-                    return Err(err);
-                }
+                drop(blob_file);
+                let _ = fs::remove_file(&staged_blob);
+                return Err(err);
             }
+            drop(blob_file);
 
             let materialize_res = self
                 .materialize_layer_from_blob(LayerMaterializeParams {
@@ -371,7 +460,23 @@ impl<B: SubvolumeBackend> ImageStore<B> {
                 // Scratch image with zero layers: materialize an empty read-only directory/subvolume.
                 let empty_id = Digest::sha256(b"empty-oci-scratch-layer");
                 let empty_dir = self.layer_path(&empty_id);
-                if !empty_dir.is_dir() {
+                if empty_dir.is_dir() {
+                    btrfs_backed = match self.backend.subvolume_info(&empty_dir).await {
+                        Ok(Some(info)) => {
+                            if !info.read_only {
+                                self.backend
+                                    .set_subvolume_read_only(&empty_dir, true)
+                                    .await?;
+                            }
+                            true
+                        }
+                        Ok(None)
+                        | Err(
+                            SubvolumeError::NotBtrfs { .. } | SubvolumeError::NotSubvolume { .. },
+                        ) => false,
+                        Err(err) => return Err(OciError::Subvolume(err)),
+                    };
+                } else {
                     let is_btrfs = match self.backend.create_subvolume(&empty_dir).await {
                         Ok(_) => {
                             self.backend
@@ -380,12 +485,28 @@ impl<B: SubvolumeBackend> ImageStore<B> {
                             true
                         }
                         Err(SubvolumeError::NotBtrfs { .. }) => {
-                            fs::create_dir_all(&empty_dir).map_err(|source| OciError::Io {
+                            let staged_empty = self.root.join("staging").join(format!(
+                                "{}.{}",
+                                empty_id.hex(),
+                                next_unique_suffix()
+                            ));
+                            fs::create_dir_all(&staged_empty).map_err(|source| OciError::Io {
                                 operation: "create empty scratch rootfs",
-                                path: empty_dir.clone(),
+                                path: staged_empty.clone(),
                                 source,
                             })?;
-                            mark_tree_read_only(&empty_dir);
+                            if let Err(source) = fs::rename(&staged_empty, &empty_dir) {
+                                let _ = remove_path_recursive(&staged_empty);
+                                if !empty_dir.is_dir() {
+                                    return Err(OciError::Io {
+                                        operation: "commit empty scratch rootfs",
+                                        path: empty_dir.clone(),
+                                        source,
+                                    });
+                                }
+                            } else {
+                                mark_tree_read_only(&empty_dir);
+                            }
                             false
                         }
                         Err(err) => return Err(OciError::Subvolume(err)),
@@ -430,10 +551,11 @@ impl<B: SubvolumeBackend> ImageStore<B> {
             compression,
         } = params;
         let final_dir = self.layer_path(chain_id);
-        // Clean any partial leftover from an interrupted prior run.
-        if final_dir.exists() {
-            let _ = self.backend.delete_subvolume(&final_dir).await;
-            let _ = remove_path_recursive(&final_dir);
+        // If a concurrent pull already completed this layer while we downloaded its blob, reuse it.
+        if let Some(cached) = self.load_layer_metadata(chain_id)?
+            && final_dir.is_dir()
+        {
+            return Ok(cached);
         }
 
         // First try atomic btrfs send/receive when the backend supports `receive_subvolume`
@@ -468,17 +590,37 @@ impl<B: SubvolumeBackend> ImageStore<B> {
         }
 
         // Standard subvolume path: create_subvolume / snapshot_subvolume -> unpack -> set_subvolume_read_only,
-        // transparently falling back to read-only directories when `SubvolumeError::NotBtrfs`.
-        let btrfs_backed = match parent_chain {
+        // transparently falling back to staging + atomic rename into read-only directories when
+        // `SubvolumeError::NotBtrfs`.
+        let staged_dir = self.root.join("staging").join(format!(
+            "{}.{}.dir",
+            chain_id.hex(),
+            next_unique_suffix()
+        ));
+        let (work_dir, btrfs_backed) = match parent_chain {
             None => match self.backend.create_subvolume(&final_dir).await {
-                Ok(_) => true,
+                Ok(_) => (final_dir.clone(), true),
+                Err(SubvolumeError::AlreadyExists { .. }) => {
+                    if let Some(cached) = self.load_layer_metadata(chain_id)?
+                        && final_dir.is_dir()
+                    {
+                        return Ok(cached);
+                    }
+                    let _ = self.backend.delete_subvolume(&final_dir).await;
+                    let _ = remove_path_recursive(&final_dir);
+                    self.backend
+                        .create_subvolume(&final_dir)
+                        .await
+                        .map_err(OciError::Subvolume)?;
+                    (final_dir.clone(), true)
+                }
                 Err(SubvolumeError::NotBtrfs { .. }) => {
-                    fs::create_dir_all(&final_dir).map_err(|source| OciError::Io {
-                        operation: "create fallback layer directory",
-                        path: final_dir.clone(),
+                    fs::create_dir_all(&staged_dir).map_err(|source| OciError::Io {
+                        operation: "create fallback staging layer directory",
+                        path: staged_dir.clone(),
                         source,
                     })?;
-                    false
+                    (staged_dir, false)
                 }
                 Err(err) => return Err(OciError::Subvolume(err)),
             },
@@ -489,10 +631,27 @@ impl<B: SubvolumeBackend> ImageStore<B> {
                     .snapshot_subvolume(&parent_dir, &final_dir, false)
                     .await
                 {
-                    Ok(_) => true,
+                    Ok(_) => (final_dir.clone(), true),
+                    Err(SubvolumeError::AlreadyExists { .. }) => {
+                        if let Some(cached) = self.load_layer_metadata(chain_id)?
+                            && final_dir.is_dir()
+                        {
+                            return Ok(cached);
+                        }
+                        let _ = self.backend.delete_subvolume(&final_dir).await;
+                        let _ = remove_path_recursive(&final_dir);
+                        self.backend
+                            .snapshot_subvolume(&parent_dir, &final_dir, false)
+                            .await
+                            .map_err(OciError::Subvolume)?;
+                        (final_dir.clone(), true)
+                    }
                     Err(SubvolumeError::NotBtrfs { .. }) => {
-                        copy_tree_recursive(&parent_dir, &final_dir)?;
-                        false
+                        if let Err(err) = copy_tree_recursive(&parent_dir, &staged_dir) {
+                            let _ = remove_path_recursive(&staged_dir);
+                            return Err(err);
+                        }
+                        (staged_dir, false)
                     }
                     Err(err) => return Err(OciError::Subvolume(err)),
                 }
@@ -509,7 +668,7 @@ impl<B: SubvolumeBackend> ImageStore<B> {
             let mut hashing = HashingReader::new(decoder);
             let entries = unpack_layer_into_dir(
                 &mut hashing,
-                &final_dir,
+                &work_dir,
                 &compressed_digest.as_str(),
                 parent_meta,
             )?;
@@ -533,18 +692,53 @@ impl<B: SubvolumeBackend> ImageStore<B> {
             Ok(entries) => entries,
             Err(err) => {
                 if btrfs_backed {
-                    let _ = self.backend.delete_subvolume(&final_dir).await;
+                    let _ = self.backend.delete_subvolume(&work_dir).await;
                 }
-                let _ = remove_path_recursive(&final_dir);
+                let _ = remove_path_recursive(&work_dir);
                 return Err(err);
             }
         };
 
         if btrfs_backed {
             self.backend
-                .set_subvolume_read_only(&final_dir, true)
+                .set_subvolume_read_only(&work_dir, true)
                 .await?;
         } else {
+            // Ensure the staged root itself is writable so `rename` can update `..` across dirs.
+            set_writable_for_unpack(&work_dir);
+            if let Err(source) = fs::rename(&work_dir, &final_dir) {
+                // Another concurrent pull may have committed `final_dir` first, or an incomplete
+                // leftover directory without metadata was sitting at `final_dir`.
+                if let Some(cached) = self.load_layer_metadata(chain_id)?
+                    && final_dir.is_dir()
+                {
+                    let _ = remove_path_recursive(&work_dir);
+                    return Ok(cached);
+                }
+                if final_dir.exists() {
+                    let _ = remove_path_recursive(&final_dir);
+                    if let Err(retry_err) = fs::rename(&work_dir, &final_dir) {
+                        let _ = remove_path_recursive(&work_dir);
+                        if let Some(cached) = self.load_layer_metadata(chain_id)?
+                            && final_dir.is_dir()
+                        {
+                            return Ok(cached);
+                        }
+                        return Err(OciError::Io {
+                            operation: "commit materialized layer directory",
+                            path: final_dir,
+                            source: retry_err,
+                        });
+                    }
+                } else {
+                    let _ = remove_path_recursive(&work_dir);
+                    return Err(OciError::Io {
+                        operation: "commit materialized layer directory",
+                        path: final_dir,
+                        source,
+                    });
+                }
+            }
             mark_tree_read_only(&final_dir);
         }
 
@@ -636,17 +830,12 @@ impl<B: SubvolumeBackend> ImageStore<B> {
             subject: "layer metadata",
             source,
         })?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, payload).map_err(|source| OciError::Io {
-            operation: "write temporary layer metadata",
-            path: tmp.clone(),
-            source,
-        })?;
-        fs::rename(&tmp, &path).map_err(|source| OciError::Io {
-            operation: "commit layer metadata",
-            path,
-            source,
-        })
+        atomic_write_file(
+            &path,
+            &payload,
+            "write temporary layer metadata",
+            "commit layer metadata",
+        )
     }
 
     fn image_record_path(&self, reference: &ImageReference) -> PathBuf {
@@ -661,16 +850,11 @@ impl<B: SubvolumeBackend> ImageStore<B> {
             subject: "pulled image record",
             source,
         })?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, payload).map_err(|source| OciError::Io {
-            operation: "write temporary image record",
-            path: tmp.clone(),
-            source,
-        })?;
-        fs::rename(&tmp, &path).map_err(|source| OciError::Io {
-            operation: "commit image record",
-            path,
-            source,
-        })
+        atomic_write_file(
+            &path,
+            &payload,
+            "write temporary image record",
+            "commit image record",
+        )
     }
 }

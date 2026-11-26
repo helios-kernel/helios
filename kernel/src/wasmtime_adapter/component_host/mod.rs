@@ -803,11 +803,10 @@ macro_rules! impl_program_bindings {
                 }
             }
 
-            #[allow(unused_mut)]
             fn stdin(
                 mut access: Access<'_, U, Self>,
                 child: wasmtime::component::Resource<ChildHandle>,
-                mut data: StreamReader<u8>,
+                data: StreamReader<u8>,
             ) -> wasmtime::Result<FutureReader<core::result::Result<(), ()>>> {
                 use futures::channel::oneshot;
                 let handle = access
@@ -2090,7 +2089,6 @@ fn map_ipc_grant_error(error: IpcGrantError) -> ProgramExecError {
 
 macro_rules! impl_authority_conversion {
     ($extract_name:ident, $name:ident, $bindings:ident) => {
-        #[allow(clippy::type_complexity)]
         fn $extract_name(
             table: &mut ResourceTable,
             grants: Vec<$bindings::helios::system::programs::CapabilityGrant>,
@@ -5329,24 +5327,27 @@ where
                 return Ok((Err(program_wit::filters::FilterError::from(refusal)),));
             }
         };
-        // The stream fixes its scope here and keeps it for its life.
+        // The stream fixes its scope here and keeps it for its life, arming its
+        // trace waiter before any poll so no event recorded after subscribe can
+        // lose its wake.
         let visibility = Visibility::trace_of(caller.data());
+        let waiter = caller.data().runtime_state.trace_waiter();
         let reader = match visibility {
             Visibility::None(scope) => StreamReader::new(
                 &mut caller,
-                ProgramTracingStreamProducer::new(filter, scope),
+                ProgramTracingStreamProducer::new(filter, scope, waiter),
             )?,
             Visibility::Own(scope) => StreamReader::new(
                 &mut caller,
-                ProgramTracingStreamProducer::new(filter, scope),
+                ProgramTracingStreamProducer::new(filter, scope, waiter),
             )?,
             Visibility::Subtree(scope) => StreamReader::new(
                 &mut caller,
-                ProgramTracingStreamProducer::new(filter, scope),
+                ProgramTracingStreamProducer::new(filter, scope, waiter),
             )?,
             Visibility::Machine(scope) => StreamReader::new(
                 &mut caller,
-                ProgramTracingStreamProducer::new(filter, scope),
+                ProgramTracingStreamProducer::new(filter, scope, waiter),
             )?,
         };
         Ok((Ok(reader),))
@@ -5968,14 +5969,16 @@ struct ProgramTracingStreamProducer<Scope> {
     scope: Scope,
     filter: TraceFilter,
     cursor: u64,
+    waiter: crate::NotifyWaiter,
 }
 
 impl<Scope> ProgramTracingStreamProducer<Scope> {
-    fn new(filter: TraceFilter, scope: Scope) -> Self {
+    fn new(filter: TraceFilter, scope: Scope, waiter: crate::NotifyWaiter) -> Self {
         Self {
             scope,
             filter,
             cursor: 0,
+            waiter,
         }
     }
 }
@@ -5993,7 +5996,7 @@ where
 
     fn poll_produce<'a>(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         store: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
         mut destination: Destination<'a, Self::Item, Self::Buffer>,
         finish: bool,
@@ -6003,16 +6006,18 @@ where
         }
 
         let this = &mut *self;
-        match store
-            .data()
-            .runtime_state
-            .next_after(&this.scope, &mut this.cursor, &this.filter)
-        {
-            Some(event) => {
+        match store.data().runtime_state.poll_next_after(
+            cx,
+            &mut this.waiter,
+            &this.scope,
+            &mut this.cursor,
+            &this.filter,
+        ) {
+            Poll::Ready(event) => {
                 destination.set_buffer(Some(convert_program_event(&event)));
                 Poll::Ready(Ok(StreamResult::Completed))
             }
-            None => Poll::Pending,
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -6415,5 +6420,196 @@ mod tests {
                 .unwrap();
         }))
         .unwrap();
+    }
+
+    #[test]
+    fn tracing_stream_producer_registers_waker_and_delivers_events_after_parking() {
+        use alloc::sync::Arc as StdArc;
+        use alloc::task::Wake;
+        use alloc::vec::Vec;
+        use core::future::Future;
+        use core::pin::Pin;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use core::task::{Context, Poll, Waker};
+
+        use super::ProgramTracingStreamProducer;
+        use crate::wasmtime_adapter::component_host::service::test_store::{
+            TestStoreData, store_data_authorized,
+        };
+        use crate::wasmtime_adapter::engine::build_component_engine_for_platform;
+        use crate::{AuthorityScope, MachineObservation, PrefixSet, ProcessAuthority, TraceFilter};
+        use futures::channel::oneshot;
+        use spin::Mutex;
+        use wasmtime::component::{Source, StreamConsumer, StreamReader, StreamResult};
+        use wasmtime::{Store, StoreContextMut};
+
+        struct CountingWake(StdArc<AtomicUsize>);
+
+        impl Wake for CountingWake {
+            fn wake(self: StdArc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+
+            fn wake_by_ref(self: &StdArc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        struct EventCollectorConsumer {
+            received: StdArc<Mutex<Vec<super::program_wit::tracing::Event>>>,
+            target_count: usize,
+            done: Option<oneshot::Sender<()>>,
+        }
+
+        impl StreamConsumer<TestStoreData> for EventCollectorConsumer {
+            type Item = super::program_wit::tracing::Event;
+
+            fn poll_consume(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                mut store: StoreContextMut<TestStoreData>,
+                mut source: Source<'_, Self::Item>,
+                finish: bool,
+            ) -> Poll<wasmtime::Result<StreamResult>> {
+                if finish {
+                    return Poll::Ready(Ok(StreamResult::Cancelled));
+                }
+                let mut batch = Vec::with_capacity(4);
+                source.read(&mut store, &mut batch)?;
+                let this = self.get_mut();
+                let len = {
+                    let mut guard = this.received.lock();
+                    guard.extend(batch);
+                    guard.len()
+                };
+                if len >= this.target_count {
+                    if let Some(done) = this.done.take() {
+                        let _ = done.send(());
+                    }
+                    Poll::Ready(Ok(StreamResult::Dropped))
+                } else {
+                    Poll::Ready(Ok(StreamResult::Completed))
+                }
+            }
+        }
+
+        let wakes = StdArc::new(AtomicUsize::new(0));
+        let waker = Waker::from(StdArc::new(CountingWake(StdArc::clone(&wakes))));
+        let mut cx = Context::from_waker(&waker);
+
+        let engine =
+            build_component_engine_for_platform(&crate::test_support::TestCpu::with_entropy(0x77))
+                .unwrap();
+
+        let mut authority = ProcessAuthority::empty();
+        authority.grant_trace_read(AuthorityScope::Machine);
+        let store_data = store_data_authorized(authority, |state| {
+            state.record_console_text(1, None, "INFO [stream-test] initial\n");
+        });
+        let runtime_state = store_data.runtime_state.clone();
+        let mut store = Store::new(&engine, store_data);
+
+        let filter = TraceFilter {
+            min_level: None,
+            target_prefixes: PrefixSet::from_prefixes(["stream-test"]).unwrap(),
+        };
+        let received = StdArc::new(Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = oneshot::channel();
+        let consumer = EventCollectorConsumer {
+            received: StdArc::clone(&received),
+            target_count: 2,
+            done: Some(done_tx),
+        };
+
+        let run = store.run_concurrent(async move |accessor| {
+            accessor
+                .with(|mut access| {
+                    let waiter = access.get().runtime_state.trace_waiter();
+                    StreamReader::new(
+                        &mut access,
+                        ProgramTracingStreamProducer::new(filter, MachineObservation, waiter),
+                    )?
+                    .pipe(access, consumer)
+                })
+                .expect("connect tracing stream reader");
+            done_rx.await.expect("tracing stream delivered all events");
+        });
+        let mut run = core::pin::pin!(run);
+
+        fn poll_until_parked<F: Future>(
+            run: &mut Pin<&mut F>,
+            cx: &mut Context<'_>,
+            wakes: &AtomicUsize,
+        ) {
+            for _ in 0..8 {
+                let before = wakes.load(Ordering::SeqCst);
+                assert!(
+                    matches!(run.as_mut().poll(cx), Poll::Pending),
+                    "stream task must stay pending before the second matching event"
+                );
+                if wakes.load(Ordering::SeqCst) == before {
+                    return;
+                }
+            }
+            panic!("stream task kept self-waking instead of parking cleanly");
+        }
+
+        // Drain the initial event and settle into a quiescent parked state.
+        poll_until_parked(&mut run, &mut cx, &wakes);
+        assert_eq!(received.lock().len(), 1);
+
+        // A non-matching event wakes the stream, which skips it and re-parks.
+        let wakes_before_unrelated = wakes.load(Ordering::SeqCst);
+        runtime_state.record_console_text(2, None, "INFO [unrelated] filtered-out\n");
+        assert!(
+            wakes.load(Ordering::SeqCst) > wakes_before_unrelated,
+            "recording an event must wake the parked tracing stream task"
+        );
+        poll_until_parked(&mut run, &mut cx, &wakes);
+        assert_eq!(received.lock().len(), 1);
+
+        let wakes_before = wakes.load(Ordering::SeqCst);
+
+        // Record a matching event with nothing else polling the stream task.
+        runtime_state.record_console_text(3, None, "INFO [stream-test] after-park\n");
+        assert!(
+            wakes.load(Ordering::SeqCst) > wakes_before,
+            "recording a matching trace event must wake the parked tracing stream task"
+        );
+
+        let mut completed = false;
+        for _ in 0..8 {
+            match run.as_mut().poll(&mut cx) {
+                Poll::Ready(result) => {
+                    result.expect("run_concurrent succeeded");
+                    completed = true;
+                    break;
+                }
+                Poll::Pending => {
+                    // `run_concurrent` may wake once between producer delivery
+                    // and `done_rx` completion.
+                    assert!(
+                        wakes.load(Ordering::SeqCst) > wakes_before,
+                        "stream task parked without delivering the new event"
+                    );
+                }
+            }
+        }
+        assert!(
+            completed,
+            "woken tracing stream must deliver the new event and complete"
+        );
+
+        let events = received.lock();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].target, "stream-test");
+        assert_eq!(events[1].target, "stream-test");
+        assert!(events[1].fields.iter().any(|field| {
+            field.key == "message"
+                && matches!(
+                    &field.value,
+                    super::program_wit::tracing::Value::Text(text) if text == "after-park"
+                )
+        }));
     }
 }

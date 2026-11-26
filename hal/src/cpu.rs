@@ -311,6 +311,409 @@ pub struct ReturnAddressSigning {
     pub faults_at_authentication: bool,
 }
 
+/// Result of capturing the bootstrap processor's architectural state at a
+/// double-return snapshot point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotPoint {
+    /// Initial capture: the processor's architectural registers have been
+    /// written into [`BspSnapshotContext`] and execution continues to
+    /// finalize the snapshot.
+    Captured,
+    /// Resume path: control was restored by jumping back into the saved
+    /// context, so execution is now running in the restored machine.
+    Resumed,
+}
+
+/// Architecture tag carried inside [`BspSnapshotContext`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum SnapshotArch {
+    None = 0,
+    X86_64 = 1,
+    Aarch64 = 2,
+    Riscv64 = 3,
+    Hosted = 4,
+}
+
+impl SnapshotArch {
+    pub const fn from_u32(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::None),
+            1 => Some(Self::X86_64),
+            2 => Some(Self::Aarch64),
+            3 => Some(Self::Riscv64),
+            4 => Some(Self::Hosted),
+            _ => None,
+        }
+    }
+}
+
+/// Returned by [`Cpu::capture_bsp_state`] when a backend does not support
+/// capturing bootstrap processor snapshot state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("this CPU backend does not support bootstrap processor snapshot capture")]
+pub struct SnapshotUnsupported;
+
+/// Fixed byte capacity of [`BspSnapshotContext::data`], large enough for
+/// any supported architecture's serialized register state.
+pub const BSP_SNAPSHOT_CONTEXT_BYTES: usize = 512;
+
+/// x86-64 bootstrap processor architectural state saved at the snapshot
+/// point.
+///
+/// Layout is `#[repr(C)]` and pinned by offset assertions in `helios-x86`
+/// so the assembly capture and restore stubs can index fields directly.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct X86_64SnapshotContext {
+    pub rbx: u64,
+    pub rbp: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rsp: u64,
+    pub rip: u64,
+    pub rflags: u64,
+    pub cr3: u64,
+    pub cr0: u64,
+    pub cr4: u64,
+    pub efer: u64,
+    pub fs_base: u64,
+    pub gs_base: u64,
+    pub mxcsr: u32,
+    pub fcw: u16,
+    pub reserved: u16,
+}
+
+impl X86_64SnapshotContext {
+    pub const SERIALIZED_BYTES: usize = 16 * 8;
+
+    pub fn encode_into(&self, dst: &mut [u8]) -> usize {
+        assert!(dst.len() >= Self::SERIALIZED_BYTES);
+        let words = [
+            self.rbx,
+            self.rbp,
+            self.r12,
+            self.r13,
+            self.r14,
+            self.r15,
+            self.rsp,
+            self.rip,
+            self.rflags,
+            self.cr3,
+            self.cr0,
+            self.cr4,
+            self.efer,
+            self.fs_base,
+            self.gs_base,
+        ];
+        for (i, word) in words.iter().enumerate() {
+            dst[i * 8..(i + 1) * 8].copy_from_slice(&word.to_le_bytes());
+        }
+        let tail = words.len() * 8;
+        dst[tail..tail + 4].copy_from_slice(&self.mxcsr.to_le_bytes());
+        dst[tail + 4..tail + 6].copy_from_slice(&self.fcw.to_le_bytes());
+        dst[tail + 6..tail + 8].copy_from_slice(&0u16.to_le_bytes());
+        Self::SERIALIZED_BYTES
+    }
+
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() != Self::SERIALIZED_BYTES {
+            return None;
+        }
+        let word =
+            |i: usize| -> u64 { u64::from_le_bytes(src[i * 8..(i + 1) * 8].try_into().unwrap()) };
+        let tail = 15 * 8;
+        Some(Self {
+            rbx: word(0),
+            rbp: word(1),
+            r12: word(2),
+            r13: word(3),
+            r14: word(4),
+            r15: word(5),
+            rsp: word(6),
+            rip: word(7),
+            rflags: word(8),
+            cr3: word(9),
+            cr0: word(10),
+            cr4: word(11),
+            efer: word(12),
+            fs_base: word(13),
+            gs_base: word(14),
+            mxcsr: u32::from_le_bytes(src[tail..tail + 4].try_into().unwrap()),
+            fcw: u16::from_le_bytes(src[tail + 4..tail + 6].try_into().unwrap()),
+            reserved: 0,
+        })
+    }
+}
+
+/// AArch64 bootstrap processor architectural state saved at the snapshot
+/// point.
+///
+/// Layout is `#[repr(C)]` and pinned by offset assertions in
+/// `helios-aarch64`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Aarch64SnapshotContext {
+    /// `x19`-`x30`.
+    pub callee_saved: [u64; 12],
+    pub sp: u64,
+    /// `d8`-`d15`.
+    pub fp_callee_saved: [u64; 8],
+    pub fpcr: u64,
+    pub tpidr_el1: u64,
+    pub sp_el0: u64,
+    pub ttbr0_el1: u64,
+    pub ttbr1_el1: u64,
+    pub mair_el1: u64,
+    pub tcr_el1: u64,
+    pub sctlr_el1: u64,
+    pub vbar_el1: u64,
+    pub cpacr_el1: u64,
+    pub daif: u64,
+    pub apia_lo: u64,
+    pub apia_hi: u64,
+    pub mte_enabled: u64,
+    pub gcr_el1: u64,
+    pub rgsr_el1: u64,
+}
+
+impl Aarch64SnapshotContext {
+    pub const WORD_COUNT: usize = 12 + 1 + 8 + 16;
+    pub const SERIALIZED_BYTES: usize = Self::WORD_COUNT * 8;
+
+    pub fn encode_into(&self, dst: &mut [u8]) -> usize {
+        assert!(dst.len() >= Self::SERIALIZED_BYTES);
+        let mut cursor = 0usize;
+        let mut push = |value: u64| {
+            dst[cursor..cursor + 8].copy_from_slice(&value.to_le_bytes());
+            cursor += 8;
+        };
+        for word in self.callee_saved {
+            push(word);
+        }
+        push(self.sp);
+        for word in self.fp_callee_saved {
+            push(word);
+        }
+        for word in [
+            self.fpcr,
+            self.tpidr_el1,
+            self.sp_el0,
+            self.ttbr0_el1,
+            self.ttbr1_el1,
+            self.mair_el1,
+            self.tcr_el1,
+            self.sctlr_el1,
+            self.vbar_el1,
+            self.cpacr_el1,
+            self.daif,
+            self.apia_lo,
+            self.apia_hi,
+            self.mte_enabled,
+            self.gcr_el1,
+            self.rgsr_el1,
+        ] {
+            push(word);
+        }
+        debug_assert_eq!(cursor, Self::SERIALIZED_BYTES);
+        cursor
+    }
+
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() != Self::SERIALIZED_BYTES {
+            return None;
+        }
+        let word =
+            |i: usize| -> u64 { u64::from_le_bytes(src[i * 8..(i + 1) * 8].try_into().unwrap()) };
+        let callee_saved = core::array::from_fn(&word);
+        let sp = word(12);
+        let fp_callee_saved = core::array::from_fn(|i| word(13 + i));
+        let base = 21;
+        Some(Self {
+            callee_saved,
+            sp,
+            fp_callee_saved,
+            fpcr: word(base),
+            tpidr_el1: word(base + 1),
+            sp_el0: word(base + 2),
+            ttbr0_el1: word(base + 3),
+            ttbr1_el1: word(base + 4),
+            mair_el1: word(base + 5),
+            tcr_el1: word(base + 6),
+            sctlr_el1: word(base + 7),
+            vbar_el1: word(base + 8),
+            cpacr_el1: word(base + 9),
+            daif: word(base + 10),
+            apia_lo: word(base + 11),
+            apia_hi: word(base + 12),
+            mte_enabled: word(base + 13),
+            gcr_el1: word(base + 14),
+            rgsr_el1: word(base + 15),
+        })
+    }
+}
+
+/// RISC-V 64-bit bootstrap processor architectural state saved at the
+/// snapshot point.
+///
+/// Layout is `#[repr(C)]` and pinned by offset assertions in
+/// `helios-riscv`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Riscv64SnapshotContext {
+    pub ra: u64,
+    pub sp: u64,
+    pub gp: u64,
+    pub tp: u64,
+    /// `s0`-`s11`.
+    pub s: [u64; 12],
+    /// `fs0`-`fs11`.
+    pub fs: [u64; 12],
+    pub fcsr: u64,
+    pub sscratch: u64,
+    pub sie: u64,
+    pub satp: u64,
+    pub stvec: u64,
+    pub sstatus: u64,
+}
+
+impl Riscv64SnapshotContext {
+    pub const WORD_COUNT: usize = 4 + 12 + 12 + 6;
+    pub const SERIALIZED_BYTES: usize = Self::WORD_COUNT * 8;
+
+    pub fn encode_into(&self, dst: &mut [u8]) -> usize {
+        assert!(dst.len() >= Self::SERIALIZED_BYTES);
+        let mut cursor = 0usize;
+        let mut push = |value: u64| {
+            dst[cursor..cursor + 8].copy_from_slice(&value.to_le_bytes());
+            cursor += 8;
+        };
+        push(self.ra);
+        push(self.sp);
+        push(self.gp);
+        push(self.tp);
+        for word in self.s {
+            push(word);
+        }
+        for word in self.fs {
+            push(word);
+        }
+        for word in [
+            self.fcsr,
+            self.sscratch,
+            self.sie,
+            self.satp,
+            self.stvec,
+            self.sstatus,
+        ] {
+            push(word);
+        }
+        debug_assert_eq!(cursor, Self::SERIALIZED_BYTES);
+        cursor
+    }
+
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() != Self::SERIALIZED_BYTES {
+            return None;
+        }
+        let word =
+            |i: usize| -> u64 { u64::from_le_bytes(src[i * 8..(i + 1) * 8].try_into().unwrap()) };
+        Some(Self {
+            ra: word(0),
+            sp: word(1),
+            gp: word(2),
+            tp: word(3),
+            s: core::array::from_fn(|i| word(4 + i)),
+            fs: core::array::from_fn(|i| word(16 + i)),
+            fcsr: word(28),
+            sscratch: word(29),
+            sie: word(30),
+            satp: word(31),
+            stvec: word(32),
+            sstatus: word(33),
+        })
+    }
+}
+
+/// Architecture-neutral container for the bootstrap processor's saved
+/// snapshot state, serialized in deterministic little-endian byte order
+/// with zero uninitialized padding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BspSnapshotContext {
+    pub arch: SnapshotArch,
+    pub len: u32,
+    pub data: [u8; BSP_SNAPSHOT_CONTEXT_BYTES],
+}
+
+impl Default for BspSnapshotContext {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl BspSnapshotContext {
+    pub const fn empty() -> Self {
+        Self {
+            arch: SnapshotArch::None,
+            len: 0,
+            data: [0; BSP_SNAPSHOT_CONTEXT_BYTES],
+        }
+    }
+
+    pub fn from_x86_64(ctx: &X86_64SnapshotContext) -> Self {
+        let mut out = Self::empty();
+        out.arch = SnapshotArch::X86_64;
+        out.len = ctx.encode_into(&mut out.data) as u32;
+        out
+    }
+
+    pub fn from_aarch64(ctx: &Aarch64SnapshotContext) -> Self {
+        let mut out = Self::empty();
+        out.arch = SnapshotArch::Aarch64;
+        out.len = ctx.encode_into(&mut out.data) as u32;
+        out
+    }
+
+    pub fn from_riscv64(ctx: &Riscv64SnapshotContext) -> Self {
+        let mut out = Self::empty();
+        out.arch = SnapshotArch::Riscv64;
+        out.len = ctx.encode_into(&mut out.data) as u32;
+        out
+    }
+
+    pub fn hosted(token: u64) -> Self {
+        let mut out = Self::empty();
+        out.arch = SnapshotArch::Hosted;
+        out.len = 8;
+        out.data[..8].copy_from_slice(&token.to_le_bytes());
+        out
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data[..self.len as usize]
+    }
+
+    pub fn as_x86_64(&self) -> Option<X86_64SnapshotContext> {
+        (self.arch == SnapshotArch::X86_64)
+            .then(|| X86_64SnapshotContext::decode(self.as_bytes()))
+            .flatten()
+    }
+
+    pub fn as_aarch64(&self) -> Option<Aarch64SnapshotContext> {
+        (self.arch == SnapshotArch::Aarch64)
+            .then(|| Aarch64SnapshotContext::decode(self.as_bytes()))
+            .flatten()
+    }
+
+    pub fn as_riscv64(&self) -> Option<Riscv64SnapshotContext> {
+        (self.arch == SnapshotArch::Riscv64)
+            .then(|| Riscv64SnapshotContext::decode(self.as_bytes()))
+            .flatten()
+    }
+}
+
 pub trait Cpu: Send + Sync + 'static {
     type Hypervisor: crate::hv::Hypervisor;
 
@@ -608,6 +1011,21 @@ pub trait Cpu: Send + Sync + 'static {
         unsafe {
             core::ptr::write_bytes(ptr.as_ptr(), 0, size);
         }
+    }
+
+    /// Captures the bootstrap processor's architectural state at a
+    /// double-return snapshot point.
+    ///
+    /// On the initial capture call, this saves the calling processor's
+    /// architectural context into `context` and returns
+    /// `Ok(SnapshotPoint::Captured)`. When a restore stub later restores
+    /// memory and jumps back into `context`, execution returns from this
+    /// call a second time with `Ok(SnapshotPoint::Resumed)`.
+    fn capture_bsp_state(
+        &self,
+        _context: &mut BspSnapshotContext,
+    ) -> Result<SnapshotPoint, SnapshotUnsupported> {
+        Err(SnapshotUnsupported)
     }
 
     /// Powers the machine off and never returns.

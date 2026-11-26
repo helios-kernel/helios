@@ -343,6 +343,79 @@ impl FileStat {
     }
 }
 
+// Linux UAPI `include/uapi/linux/magic.h` filesystem magic numbers.
+pub const BTRFS_SUPER_MAGIC: i64 = 0x9123_683e;
+pub const TMPFS_MAGIC: i64 = 0x0102_1994;
+pub const EROFS_SUPER_MAGIC_V1: i64 = 0xe0f5_e1e2;
+pub const V9FS_MAGIC: i64 = 0x0102_1997;
+pub const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c_7630;
+pub const PROC_SUPER_MAGIC: i64 = 0x9fa0;
+pub const SYSFS_MAGIC: i64 = 0x6265_6572;
+pub const PIPEFS_MAGIC: i64 = 0x5049_5045;
+pub const SOCKFS_MAGIC: i64 = 0x534f_434b;
+pub const ANON_INODE_FS_MAGIC: i64 = 0x0904_1934;
+
+// Linux UAPI `include/linux/statfs.h` `ST_*` mount flags.
+pub const ST_RDONLY: i64 = 0x0001;
+pub const ST_NOSUID: i64 = 0x0002;
+pub const ST_NODEV: i64 = 0x0004;
+pub const ST_NOEXEC: i64 = 0x0008;
+pub const ST_VALID: i64 = 0x0020;
+
+/// Filesystem statistics for `statfs(2)` / `fstatfs(2)`
+/// (`include/uapi/asm-generic/statfs.h` LP64 `struct statfs`, 120 bytes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FsStat {
+    pub f_type: i64,
+    pub f_bsize: i64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_fsid: [i32; 2],
+    pub f_namelen: i64,
+    pub f_frsize: i64,
+    pub f_flags: i64,
+}
+
+impl FsStat {
+    pub const fn synthetic_virtual(f_type: i64) -> Self {
+        Self {
+            f_type,
+            f_bsize: 4096,
+            f_blocks: 0,
+            f_bfree: 0,
+            f_bavail: 0,
+            f_files: 0,
+            f_ffree: 0,
+            f_fsid: [0, 0],
+            f_namelen: 255,
+            f_frsize: 4096,
+            f_flags: ST_VALID,
+        }
+    }
+
+    /// Encodes LP64 `struct statfs` (120 bytes, identical on x86-64 and aarch64).
+    pub fn write_statfs(self) -> [u8; 120] {
+        let mut out = [0u8; 120];
+        out[0..8].copy_from_slice(&self.f_type.to_le_bytes());
+        out[8..16].copy_from_slice(&self.f_bsize.to_le_bytes());
+        out[16..24].copy_from_slice(&self.f_blocks.to_le_bytes());
+        out[24..32].copy_from_slice(&self.f_bfree.to_le_bytes());
+        out[32..40].copy_from_slice(&self.f_bavail.to_le_bytes());
+        out[40..48].copy_from_slice(&self.f_files.to_le_bytes());
+        out[48..56].copy_from_slice(&self.f_ffree.to_le_bytes());
+        out[56..60].copy_from_slice(&self.f_fsid[0].to_le_bytes());
+        out[60..64].copy_from_slice(&self.f_fsid[1].to_le_bytes());
+        out[64..72].copy_from_slice(&self.f_namelen.to_le_bytes());
+        out[72..80].copy_from_slice(&self.f_frsize.to_le_bytes());
+        out[80..88].copy_from_slice(&self.f_flags.to_le_bytes());
+        // `f_spare[4]` at 88..120 stays zeroed.
+        out
+    }
+}
+
 /// Container-bounded filesystem operations provided by the kernel's Linux host.
 pub trait Filesystem<R: Resources> {
     fn file_access(&self, _file: &R::File) -> FileAccess {
@@ -363,6 +436,41 @@ pub trait Filesystem<R: Resources> {
 
     fn same_file(&self, _a: &R::File, _b: &R::File) -> bool {
         false
+    }
+
+    /// Stable `(dev, ino)` key identifying the underlying file for `flock(2)`
+    /// and POSIX `fcntl(2)` record locks.
+    fn file_lock_key(&self, _file: &R::File) -> Option<helios_unix::FileLockKey> {
+        None
+    }
+
+    /// Filesystem statistics for `path` (`statfs(2)`).
+    fn statfs_path(
+        &self,
+        _base: Option<&R::File>,
+        _cwd: &str,
+        _path: &str,
+        _creds: &Credentials,
+    ) -> impl Future<Output = Result<FsStat, FsOpError>> + Send {
+        async { Err(FsOpError::Fs(FsError::Unsupported)) }
+    }
+
+    /// Filesystem statistics for open file descriptor `file` (`fstatfs(2)`).
+    fn statfs_file(
+        &self,
+        _file: &R::File,
+    ) -> impl Future<Output = Result<FsStat, FsOpError>> + Send {
+        async { Err(FsOpError::Fs(FsError::Unsupported)) }
+    }
+
+    /// Flushes all writable mounts in the container (`sync(2)`).
+    fn sync_all(&self) -> impl Future<Output = Result<(), FsOpError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Flushes the mount containing `file` (`syncfs(2)`).
+    fn sync_fs(&self, _file: &R::File) -> impl Future<Output = Result<(), FsOpError>> + Send {
+        async { Ok(()) }
     }
 
     fn open(
@@ -874,12 +982,144 @@ fn dirfd_file<R: Resources, F: Filesystem<R>>(
     Ok(Some(file))
 }
 
-fn entry_file<R: Resources>(entry: &Entry<R>) -> Option<OpenFile<R::File>> {
+pub(super) fn entry_file<R: Resources>(entry: &Entry<R>) -> Option<OpenFile<R::File>> {
     match &entry.descriptor {
         FileDescriptor::File(open) => Some(open.clone()),
         FileDescriptor::Preopen { descriptor, .. } => Some(OpenFile::new(descriptor.clone())),
         _ => None,
     }
+}
+
+/// Checks whether normalized container path `path` is equal to or strictly
+/// inside normalized chroot prefix `root`.
+fn path_within_root(path: &str, root: &str) -> bool {
+    if root == "/" {
+        return true;
+    }
+    path == root
+        || (path.len() > root.len()
+            && path.starts_with(root)
+            && path.as_bytes()[root.len()] == b'/')
+}
+
+/// Clamps `path` relative to `base_dir` within `root` when `root != "/"`,
+/// resolving symlinks strictly inside `root` so neither `..` nor absolute
+/// symlink targets can escape the chroot boundary (`fs/namei.c`).
+///
+/// When `root == "/"`, returns `(cwd, path)` directly with zero extra I/O.
+pub(super) async fn resolve_in_chroot<R: Resources, F: Filesystem<R>>(
+    process: &Process<R>,
+    base: Option<&R::File>,
+    raw_path: &str,
+    follow_final: bool,
+    creds: &Credentials,
+    fs: &F,
+) -> Result<(String, String), u64> {
+    let cwd = process.shared.cwd.lock().clone();
+    let root = process.shared.root.lock().clone();
+    if root == "/" {
+        return Ok((cwd, String::from(raw_path)));
+    }
+    let base_dir = String::from(base.and_then(|f| fs.file_path(f)).unwrap_or(cwd.as_str()));
+    alloc::boxed::Box::pin(resolve_in_chroot_slow(
+        cwd,
+        root,
+        base_dir,
+        raw_path,
+        follow_final,
+        creds,
+        fs,
+    ))
+    .await
+}
+
+async fn resolve_in_chroot_slow<R: Resources, F: Filesystem<R>>(
+    cwd: String,
+    root: String,
+    base_dir: String,
+    raw_path: &str,
+    follow_final: bool,
+    creds: &Credentials,
+    fs: &F,
+) -> Result<(String, String), u64> {
+    const MAX_SYMLINK_DEPTH: usize = 40;
+    let root_segs: Vec<&str> = root.split('/').filter(|s| !s.is_empty()).collect();
+    let clamp_at_root = raw_path.starts_with('/') || path_within_root(&base_dir, &root);
+    let min_depth = if clamp_at_root { root_segs.len() } else { 0 };
+    let trailing_slash = raw_path.ends_with('/') && raw_path != "/";
+
+    let mut current: Vec<String> = if raw_path.starts_with('/') {
+        root_segs.iter().map(|s| String::from(*s)).collect()
+    } else {
+        base_dir
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect()
+    };
+    let mut pending: Vec<String> = raw_path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .rev()
+        .map(String::from)
+        .collect();
+    let mut symlinks_followed = 0usize;
+
+    while let Some(seg) = pending.pop() {
+        if seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            if current.len() > min_depth {
+                current.pop();
+            }
+            continue;
+        }
+        current.push(seg);
+        let is_last = pending.is_empty();
+        let should_follow = !is_last || follow_final || trailing_slash;
+        if should_follow {
+            let candidate = join_segments(&current);
+            if let Ok((stat, _)) = fs.stat_path(None, "/", &candidate, false, creds).await
+                && stat.kind == NodeKind::Symlink
+            {
+                symlinks_followed += 1;
+                if symlinks_followed > MAX_SYMLINK_DEPTH {
+                    return Err(errno(ELOOP));
+                }
+                let target = fs
+                    .read_link(None, "/", &candidate, creds)
+                    .await
+                    .map_err(fs_errno)?;
+                if target.starts_with('/') {
+                    current = root_segs.iter().map(|s| String::from(*s)).collect();
+                } else {
+                    current.pop();
+                }
+                for tseg in target.split('/').filter(|s| !s.is_empty()).rev() {
+                    pending.push(String::from(tseg));
+                }
+            }
+        }
+    }
+
+    let mut resolved = join_segments(&current);
+    if trailing_slash && resolved != "/" {
+        resolved.push('/');
+    }
+    Ok((cwd, resolved))
+}
+
+fn join_segments(segs: &[String]) -> String {
+    if segs.is_empty() {
+        return String::from("/");
+    }
+    let mut out = String::new();
+    for seg in segs {
+        out.push('/');
+        out.push_str(seg);
+    }
+    out
 }
 
 fn is_dev_null_path<R: Resources, F: Filesystem<R>>(
@@ -924,7 +1164,7 @@ fn synthetic_dev_null_stat() -> FileStat {
     }
 }
 
-fn process_creds<R: Resources>(process: &Process<R>) -> Credentials {
+pub(super) fn process_creds<R: Resources>(process: &Process<R>) -> Credentials {
     process.credentials.lock().clone()
 }
 
@@ -1011,13 +1251,26 @@ pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, base.as_ref(), &path, !request.nofollow, &creds, fs).await
+        {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let open_base = if resolved_path.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
     let cloexec = flags & O_CLOEXEC != 0;
-    let descriptor = match fs.open(base.as_ref(), &cwd, &path, request, &creds).await {
+    let descriptor = match fs
+        .open(open_base, &cwd, &resolved_path, request, &creds)
+        .await
+    {
         Ok(file) => FileDescriptor::File(OpenFile::new(file)),
         Err(FsOpError::Fs(FsError::NoEntry))
-            if is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
+            if is_dev_null_path(open_base, &cwd, &resolved_path, fs) =>
         {
             if path.ends_with('/') || request.directory {
                 return errno(ENOTDIR);
@@ -1207,16 +1460,25 @@ pub(super) async fn newfstatat<R: Resources, M: UserMemory, F: Filesystem<R>, T:
             Ok(base) => base,
             Err(err) => return err,
         };
-        let cwd = process.shared.cwd.lock().clone();
         let creds = process_creds(process);
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        let (cwd, resolved_path) =
+            match resolve_in_chroot(process, base.as_ref(), &path, follow, &creds, fs).await {
+                Ok(pair) => pair,
+                Err(err) => return err,
+            };
+        let stat_base = if resolved_path.starts_with('/') {
+            None
+        } else {
+            base.as_ref()
+        };
         match fs
-            .stat_path(base.as_ref(), &cwd, &path, follow, &creds)
+            .stat_path(stat_base, &cwd, &resolved_path, follow, &creds)
             .await
         {
             Ok((stat, _)) => stat,
             Err(FsOpError::Fs(FsError::NoEntry))
-                if is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
+                if is_dev_null_path(stat_base, &cwd, &resolved_path, fs) =>
             {
                 if path.ends_with('/') {
                     return errno(ENOTDIR);
@@ -1296,16 +1558,25 @@ pub(super) async fn statx<R: Resources, M: UserMemory, F: Filesystem<R>, T: tty:
             Ok(base) => base,
             Err(err) => return err,
         };
-        let cwd = process.shared.cwd.lock().clone();
         let creds = process_creds(process);
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        let (cwd, resolved_path) =
+            match resolve_in_chroot(process, base.as_ref(), &path, follow, &creds, fs).await {
+                Ok(pair) => pair,
+                Err(err) => return err,
+            };
+        let stat_base = if resolved_path.starts_with('/') {
+            None
+        } else {
+            base.as_ref()
+        };
         match fs
-            .stat_path(base.as_ref(), &cwd, &path, follow, &creds)
+            .stat_path(stat_base, &cwd, &resolved_path, follow, &creds)
             .await
         {
             Ok((stat, _)) => stat,
             Err(FsOpError::Fs(FsError::NoEntry))
-                if is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
+                if is_dev_null_path(stat_base, &cwd, &resolved_path, fs) =>
             {
                 if path.ends_with('/') {
                     return errno(ENOTDIR);
@@ -1349,15 +1620,24 @@ pub(super) async fn faccessat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
     let use_effective = flags & AT_EACCESS != 0;
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, base.as_ref(), &path, follow, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_base = if resolved_path.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
     match fs
         .access_path(
-            base.as_ref(),
+            eff_base,
             &cwd,
-            &path,
+            &resolved_path,
             AccessCheck {
                 read: mode & 4 != 0,
                 write: mode & 2 != 0,
@@ -1371,7 +1651,7 @@ pub(super) async fn faccessat<R: Resources, M: UserMemory, F: Filesystem<R>>(
     {
         Ok(()) => 0,
         Err(FsOpError::Fs(FsError::NoEntry))
-            if is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
+            if is_dev_null_path(eff_base, &cwd, &resolved_path, fs) =>
         {
             if path.ends_with('/') {
                 errno(ENOTDIR)
@@ -1423,9 +1703,21 @@ pub(super) async fn readlinkat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
-    let target = match fs.read_link(base.as_ref(), &cwd, &path, &creds).await {
+    let (cwd, resolved_path) = if path.is_empty() {
+        (process.shared.cwd.lock().clone(), path)
+    } else {
+        match resolve_in_chroot(process, base.as_ref(), &path, false, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        }
+    };
+    let eff_base = if resolved_path.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
+    let target = match fs.read_link(eff_base, &cwd, &resolved_path, &creds).await {
         Ok(target) => target,
         Err(error) => return fs_errno(error),
     };
@@ -1473,10 +1765,19 @@ pub(super) async fn mkdirat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, base.as_ref(), &path, false, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_base = if resolved_path.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
     match fs
-        .mkdir(base.as_ref(), &cwd, &path, mode, umask, &creds)
+        .mkdir(eff_base, &cwd, &resolved_path, mode, umask, &creds)
         .await
     {
         Ok(()) => 0,
@@ -1521,13 +1822,22 @@ pub(super) async fn unlinkat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, base.as_ref(), &path, false, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_base = if resolved_path.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
     match fs
         .unlink(
-            base.as_ref(),
+            eff_base,
             &cwd,
-            &path,
+            &resolved_path,
             flags & AT_REMOVEDIR != 0,
             &creds,
         )
@@ -1590,14 +1900,33 @@ pub(super) async fn renameat2<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
+    let (cwd, resolved_old) =
+        match resolve_in_chroot(process, old_base.as_ref(), &old_path, false, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let (_, resolved_new) =
+        match resolve_in_chroot(process, new_base.as_ref(), &new_path, false, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_old = if resolved_old.starts_with('/') {
+        None
+    } else {
+        old_base.as_ref()
+    };
+    let eff_new = if resolved_new.starts_with('/') {
+        None
+    } else {
+        new_base.as_ref()
+    };
     match fs
         .rename(
-            old_base.as_ref(),
-            &old_path,
-            new_base.as_ref(),
-            &new_path,
+            eff_old,
+            &resolved_old,
+            eff_new,
+            &resolved_new,
             &cwd,
             mode,
             &creds,
@@ -1664,17 +1993,49 @@ pub(super) async fn linkat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
-    match fs
-        .link(
+    let follow_old = flags & AT_SYMLINK_FOLLOW != 0;
+    let (cwd, resolved_old) = if old_path.is_empty() {
+        (process.shared.cwd.lock().clone(), old_path)
+    } else {
+        match resolve_in_chroot(
+            process,
             old_base.as_ref(),
             &old_path,
-            new_base.as_ref(),
-            &new_path,
+            follow_old,
+            &creds,
+            fs,
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        }
+    };
+    let (_, resolved_new) =
+        match resolve_in_chroot(process, new_base.as_ref(), &new_path, false, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_old = if resolved_old.starts_with('/') {
+        None
+    } else {
+        old_base.as_ref()
+    };
+    let eff_new = if resolved_new.starts_with('/') {
+        None
+    } else {
+        new_base.as_ref()
+    };
+    match fs
+        .link(
+            eff_old,
+            &resolved_old,
+            eff_new,
+            &resolved_new,
             &cwd,
             LinkOptions {
-                follow: flags & AT_SYMLINK_FOLLOW != 0,
+                follow: follow_old,
                 empty_path,
             },
             &creds,
@@ -1730,10 +2091,19 @@ pub(super) async fn symlinkat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
+    let (cwd, resolved_link) =
+        match resolve_in_chroot(process, base.as_ref(), &link_path, false, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_base = if resolved_link.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
     match fs
-        .symlink(&target, base.as_ref(), &cwd, &link_path, &creds)
+        .symlink(&target, eff_base, &cwd, &resolved_link, &creds)
         .await
     {
         Ok(()) => 0,
@@ -1846,11 +2216,28 @@ pub(super) async fn utimensat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, base.as_ref(), &path, follow, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_base = if resolved_path.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
     match fs
-        .set_times_path(base.as_ref(), &cwd, &path, follow, access, modified, &creds)
+        .set_times_path(
+            eff_base,
+            &cwd,
+            &resolved_path,
+            follow,
+            access,
+            modified,
+            &creds,
+        )
         .await
     {
         Ok(()) => 0,
@@ -1871,9 +2258,13 @@ pub(super) async fn chdir<R: Resources, M: UserMemory, F: Filesystem<R>>(
     if path.is_empty() {
         return errno(ENOENT);
     }
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
-    let (stat, canonical) = match fs.stat_path(None, &cwd, &path, true, &creds).await {
+    let (cwd, resolved_path) = match resolve_in_chroot(process, None, &path, true, &creds, fs).await
+    {
+        Ok(pair) => pair,
+        Err(err) => return err,
+    };
+    let (stat, canonical) = match fs.stat_path(None, &cwd, &resolved_path, true, &creds).await {
         Ok(pair) => pair,
         Err(error) => return fs_errno(error),
     };
@@ -1884,7 +2275,7 @@ pub(super) async fn chdir<R: Resources, M: UserMemory, F: Filesystem<R>>(
         .access_path(
             None,
             &cwd,
-            &path,
+            &resolved_path,
             AccessCheck {
                 read: false,
                 write: false,
@@ -1937,12 +2328,22 @@ pub(super) fn getcwd<R: Resources, M: UserMemory>(
     let buf = args[0];
     let size = args[1] as usize;
     let cwd = process.shared.cwd.lock().clone();
-    let needed = cwd.len() + 1;
+    let root = process.shared.root.lock().clone();
+    let visible = if root == "/" {
+        cwd
+    } else if cwd == root {
+        String::from("/")
+    } else if path_within_root(&cwd, &root) {
+        String::from(&cwd[root.len()..])
+    } else {
+        alloc::format!("(unreachable){cwd}")
+    };
+    let needed = visible.len() + 1;
     if size < needed {
         return errno(ERANGE);
     }
     let mut out = Vec::with_capacity(needed);
-    out.extend_from_slice(cwd.as_bytes());
+    out.extend_from_slice(visible.as_bytes());
     out.push(0);
     match memory.write(buf, &out) {
         Ok(()) => needed as u64,
@@ -2738,9 +3139,16 @@ pub(super) async fn truncate<R: Resources, M: UserMemory, F: Filesystem<R>>(
     if path.is_empty() {
         return errno(ENOENT);
     }
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
-    match fs.set_size_path(&cwd, &path, length as u64, &creds).await {
+    let (cwd, resolved_path) = match resolve_in_chroot(process, None, &path, true, &creds, fs).await
+    {
+        Ok(pair) => pair,
+        Err(err) => return err,
+    };
+    match fs
+        .set_size_path(&cwd, &resolved_path, length as u64, &creds)
+        .await
+    {
         Ok(()) => 0,
         Err(error) => fs_errno(error),
     }
@@ -2770,32 +3178,43 @@ pub(super) async fn fsync<R: Resources, M: UserMemory, F: Filesystem<R>>(
     }
 }
 
-pub(super) fn close_range<R: Resources>(process: &Process<R>, args: [u64; 6]) -> u64 {
+pub(super) fn close_range<R: Resources, F: Filesystem<R>>(
+    process: &Process<R>,
+    args: [u64; 6],
+    fs: &F,
+) -> u64 {
     let first = args[0] as u32;
     let last = args[1] as u32;
     let flags = args[2] as u32 as u64;
     if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || first > last {
         return errno(EINVAL);
     }
-    let mut table = process.shared.descriptors.lock();
-    let len = table.entries.len();
-    let start = (first as usize).min(len);
-    let end = (last as usize).min(len.saturating_sub(1));
-    if start >= len {
-        return 0;
+    let mut closed_entries = Vec::new();
+    {
+        let mut table = process.shared.descriptors.lock();
+        let len = table.entries.len();
+        let start = (first as usize).min(len);
+        let end = (last as usize).min(len.saturating_sub(1));
+        if start >= len {
+            return 0;
+        }
+        if flags & CLOSE_RANGE_CLOEXEC != 0 {
+            for slot in &mut table.entries[start..=end] {
+                if let Some(entry) = slot.as_mut() {
+                    entry.close_on_exec = true;
+                }
+            }
+        } else {
+            for fd in start..=end {
+                if let Some(entry) = table.entries[fd].clone() {
+                    let _ = table.close(fd as i32);
+                    closed_entries.push(entry);
+                }
+            }
+        }
     }
-    if flags & CLOSE_RANGE_CLOEXEC != 0 {
-        for slot in &mut table.entries[start..=end] {
-            if let Some(entry) = slot.as_mut() {
-                entry.close_on_exec = true;
-            }
-        }
-    } else {
-        for fd in start..=end {
-            if table.entries[fd].is_some() {
-                let _ = table.close(fd as i32);
-            }
-        }
+    for entry in &closed_entries {
+        super::fs_extra::release_posix_locks_for_entry(process, entry, fs);
     }
     0
 }
@@ -2844,10 +3263,19 @@ pub(super) async fn fchmodat2<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, base.as_ref(), &path, follow, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_base = if resolved_path.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
     match fs
-        .chmod_path(base.as_ref(), &cwd, &path, follow, mode, &creds)
+        .chmod_path(eff_base, &cwd, &resolved_path, follow, mode, &creds)
         .await
     {
         Ok(()) => 0,
@@ -2963,10 +3391,19 @@ pub(super) async fn fchownat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, base.as_ref(), &path, follow, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_base = if resolved_path.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
     match fs
-        .chown_path(base.as_ref(), &cwd, &path, follow, uid, gid, &creds)
+        .chown_path(eff_base, &cwd, &resolved_path, follow, uid, gid, &creds)
         .await
     {
         Ok(()) => 0,
@@ -3082,9 +3519,27 @@ pub(super) async fn mknodat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(base) => base,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, base.as_ref(), &path, false, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let eff_base = if resolved_path.starts_with('/') {
+        None
+    } else {
+        base.as_ref()
+    };
     match fs
-        .mknod(base.as_ref(), &cwd, &path, kind, mode, umask, rdev, &creds)
+        .mknod(
+            eff_base,
+            &cwd,
+            &resolved_path,
+            kind,
+            mode,
+            umask,
+            rdev,
+            &creds,
+        )
         .await
     {
         Ok(()) => 0,
@@ -3147,10 +3602,14 @@ pub(super) async fn setxattr_path<R: Resources, M: UserMemory, F: Filesystem<R>>
     if !value.is_empty() && memory.read(args[2], &mut value).is_err() {
         return errno(EFAULT);
     }
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, None, &path, follow, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
     match fs
-        .set_xattr_path(&cwd, &path, follow, &name, &value, mode, &creds)
+        .set_xattr_path(&cwd, &resolved_path, follow, &name, &value, mode, &creds)
         .await
     {
         Ok(()) => 0,
@@ -3232,9 +3691,16 @@ pub(super) async fn getxattr_path<R: Resources, M: UserMemory, F: Filesystem<R>>
         Ok(name) => name,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
-    match fs.get_xattr_path(&cwd, &path, follow, &name, &creds).await {
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, None, &path, follow, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    match fs
+        .get_xattr_path(&cwd, &resolved_path, follow, &name, &creds)
+        .await
+    {
         Ok(data) => finish_xattr_read(memory, args[2], args[3], &data),
         Err(error) => fs_errno(error),
     }
@@ -3294,9 +3760,16 @@ pub(super) async fn listxattr_path<R: Resources, M: UserMemory, F: Filesystem<R>
     if path.is_empty() {
         return errno(ENOENT);
     }
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
-    let names = match fs.list_xattrs_path(&cwd, &path, follow, &creds).await {
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, None, &path, follow, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+    let names = match fs
+        .list_xattrs_path(&cwd, &resolved_path, follow, &creds)
+        .await
+    {
         Ok(names) => names,
         Err(error) => return fs_errno(error),
     };
@@ -3353,10 +3826,14 @@ pub(super) async fn removexattr_path<R: Resources, M: UserMemory, F: Filesystem<
         Ok(name) => name,
         Err(err) => return err,
     };
-    let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
+    let (cwd, resolved_path) =
+        match resolve_in_chroot(process, None, &path, follow, &creds, fs).await {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
     match fs
-        .remove_xattr_path(&cwd, &path, follow, &name, &creds)
+        .remove_xattr_path(&cwd, &resolved_path, follow, &name, &creds)
         .await
     {
         Ok(()) => 0,

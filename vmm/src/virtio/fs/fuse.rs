@@ -8,8 +8,8 @@ use tracing::debug;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use super::backend::{
-    DT_DIR, EBADF, EINVAL, ENODATA, ENOENT, ENOSYS, ENOTDIR, ENXIO, EROFS, FsBackend, FsMetadata,
-    FsOpenOptions, FsResult, FsTimeUpdate, validate_name,
+    DT_DIR, EBADF, EINVAL, EMFILE, ENODATA, ENOENT, ENOMEM, ENOSYS, ENOTDIR, ENXIO, EOVERFLOW,
+    EROFS, FsBackend, FsMetadata, FsOpenOptions, FsResult, FsTimeUpdate, validate_name,
 };
 
 pub const FUSE_KERNEL_VERSION: u32 = 7;
@@ -84,9 +84,34 @@ const O_TRUNC: u32 = 0o1000;
 const RENAME_NOREPLACE: u32 = 1 << 0;
 const W_OK: u32 = 2;
 
-const MAX_WRITE_BYTES: u32 = 64 * 1024;
+pub const MAX_WRITE_BYTES: u32 = 64 * 1024;
 const MAX_PAGES: u16 = 32;
 pub const MAX_READ_BYTES: u32 = (MAX_PAGES as u32) * 4096;
+/// Maximum byte length of a single FUSE request buffer (write payload plus headers/paths).
+pub const MAX_REQUEST_BYTES: usize = (MAX_WRITE_BYTES as usize) + 4096;
+
+/// Default capacity limits for one `virtio-fs` FUSE session.
+pub const DEFAULT_MAX_INODES: usize = 65_536;
+pub const DEFAULT_MAX_OPEN_FILES: usize = 4_096;
+pub const DEFAULT_MAX_OPEN_DIRS: usize = 1_024;
+
+/// Explicit capacity bounds for a [`FuseSession`]'s tracked tables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FuseLimits {
+    pub max_inodes: usize,
+    pub max_open_files: usize,
+    pub max_open_dirs: usize,
+}
+
+impl Default for FuseLimits {
+    fn default() -> Self {
+        Self {
+            max_inodes: DEFAULT_MAX_INODES,
+            max_open_files: DEFAULT_MAX_OPEN_FILES,
+            max_open_dirs: DEFAULT_MAX_OPEN_DIRS,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
@@ -392,7 +417,9 @@ const _: () = {
 };
 
 struct InodeEntry {
-    path: Vec<String>,
+    /// All live share-relative paths referencing this inode (empty once unlinked
+    /// or overwritten while open).
+    paths: Vec<Vec<String>>,
     lookup_count: u64,
     open_handles: u64,
 }
@@ -416,6 +443,7 @@ struct OpenDir {
 /// Stateful FUSE 7.31 session driving an [`FsBackend`].
 pub struct FuseSession<B: FsBackend> {
     backend: B,
+    limits: FuseLimits,
     initialized: bool,
     next_inode: u64,
     next_fh: u64,
@@ -427,11 +455,16 @@ pub struct FuseSession<B: FsBackend> {
 
 impl<B: FsBackend> FuseSession<B> {
     pub fn new(backend: B) -> Self {
+        Self::with_limits(backend, FuseLimits::default())
+    }
+
+    pub fn with_limits(backend: B, mut limits: FuseLimits) -> Self {
+        limits.max_inodes = limits.max_inodes.max(1);
         let mut inodes = BTreeMap::new();
         inodes.insert(
             FUSE_ROOT_ID,
             InodeEntry {
-                path: Vec::new(),
+                paths: vec![Vec::new()],
                 lookup_count: 1,
                 open_handles: 0,
             },
@@ -440,6 +473,7 @@ impl<B: FsBackend> FuseSession<B> {
         path_to_inode.insert(Vec::new(), FUSE_ROOT_ID);
         Self {
             backend,
+            limits,
             initialized: false,
             next_inode: FUSE_ROOT_ID + 1,
             next_fh: 1,
@@ -465,7 +499,7 @@ impl<B: FsBackend> FuseSession<B> {
         self.inodes.insert(
             FUSE_ROOT_ID,
             InodeEntry {
-                path: Vec::new(),
+                paths: vec![Vec::new()],
                 lookup_count: 1,
                 open_handles: 0,
             },
@@ -476,6 +510,16 @@ impl<B: FsBackend> FuseSession<B> {
     /// Number of tracked inodes (including root), exposed for unit tests.
     pub fn inode_count(&self) -> usize {
         self.inodes.len()
+    }
+
+    /// Number of open file handles, exposed for unit tests.
+    pub fn open_file_count(&self) -> usize {
+        self.open_files.len()
+    }
+
+    /// Number of open directory handles, exposed for unit tests.
+    pub fn open_dir_count(&self) -> usize {
+        self.open_dirs.len()
     }
 
     /// Dispatches one FUSE request buffer bounded by the writable reply buffer
@@ -495,7 +539,7 @@ impl<B: FsBackend> FuseSession<B> {
         let opcode = u32::from_le(header.opcode);
         let unique = u64::from_le(header.unique);
         let nodeid = u64::from_le(header.nodeid);
-        if header_len < in_hdr_len || header_len > request.len() {
+        if header_len < in_hdr_len || header_len > request.len() || header_len > MAX_REQUEST_BYTES {
             return Some(error_reply(unique, EINVAL));
         }
         let body = &request[in_hdr_len..header_len];
@@ -573,7 +617,8 @@ impl<B: FsBackend> FuseSession<B> {
     fn inode_path(&self, nodeid: u64) -> FsResult<Vec<String>> {
         self.inodes
             .get(&nodeid)
-            .map(|entry| entry.path.clone())
+            .and_then(|entry| entry.paths.first())
+            .cloned()
             .ok_or(ENOENT)
     }
 
@@ -584,28 +629,93 @@ impl<B: FsBackend> FuseSession<B> {
         Ok(path)
     }
 
-    fn intern_inode(&mut self, path: Vec<String>, add_lookup: u64) -> u64 {
+    fn evict_inode_entry(&mut self, nodeid: u64) {
+        if let Some(removed) = self.inodes.remove(&nodeid) {
+            for p in removed.paths {
+                if self.path_to_inode.get(&p) == Some(&nodeid) {
+                    self.path_to_inode.remove(&p);
+                }
+            }
+        }
+    }
+
+    fn evict_one_unreferenced_inode(&mut self) -> bool {
+        let victim = self.inodes.iter().find_map(|(&id, entry)| {
+            (id != FUSE_ROOT_ID && entry.lookup_count == 0 && entry.open_handles == 0).then_some(id)
+        });
+        if let Some(id) = victim {
+            self.evict_inode_entry(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn ensure_inode_capacity(&mut self, path: &[String]) -> FsResult<()> {
+        if self.path_to_inode.contains_key(path) {
+            return Ok(());
+        }
+        if self.inodes.len() >= self.limits.max_inodes && !self.evict_one_unreferenced_inode() {
+            return Err(ENOMEM);
+        }
+        Ok(())
+    }
+
+    fn intern_inode(&mut self, path: Vec<String>, add_lookup: u64) -> FsResult<u64> {
         if let Some(&existing) = self.path_to_inode.get(&path) {
             if let Some(entry) = self.inodes.get_mut(&existing) {
                 entry.lookup_count = entry.lookup_count.saturating_add(add_lookup);
             }
-            return existing;
+            return Ok(existing);
+        }
+        if self.inodes.len() >= self.limits.max_inodes && !self.evict_one_unreferenced_inode() {
+            return Err(ENOMEM);
         }
         let id = self.next_inode;
-        self.next_inode = self
-            .next_inode
-            .checked_add(1)
-            .expect("inode space exhausted");
+        self.next_inode = self.next_inode.checked_add(1).ok_or(ENOMEM)?;
         self.path_to_inode.insert(path.clone(), id);
         self.inodes.insert(
             id,
             InodeEntry {
-                path,
+                paths: vec![path],
                 lookup_count: add_lookup,
                 open_handles: 0,
             },
         );
-        id
+        Ok(id)
+    }
+
+    /// Detaches `path` from the live path table without disturbing any open
+    /// handles or remaining hardlink paths for that inode.
+    fn detach_path(&mut self, path: &[String]) {
+        if let Some(id) = self.path_to_inode.remove(path) {
+            let should_evict = if let Some(entry) = self.inodes.get_mut(&id) {
+                entry.paths.retain(|p| p != path);
+                id != FUSE_ROOT_ID && entry.lookup_count == 0 && entry.open_handles == 0
+            } else {
+                false
+            };
+            if should_evict {
+                self.evict_inode_entry(id);
+            }
+        }
+    }
+
+    /// Registers a new hardlink path pointing at an existing `nodeid`,
+    /// preserving POSIX/FUSE inode identity and bumping its lookup count.
+    fn attach_hardlink(&mut self, nodeid: u64, new_path: Vec<String>) -> FsResult<()> {
+        if !self.inodes.contains_key(&nodeid) {
+            return Err(ENOENT);
+        }
+        self.detach_path(&new_path);
+        if let Some(entry) = self.inodes.get_mut(&nodeid) {
+            entry.lookup_count = entry.lookup_count.saturating_add(1);
+            if !entry.paths.contains(&new_path) {
+                entry.paths.push(new_path.clone());
+            }
+        }
+        self.path_to_inode.insert(new_path, nodeid);
+        Ok(())
     }
 
     fn forget_inode(&mut self, nodeid: u64, nlookup: u64) {
@@ -618,11 +728,8 @@ impl<B: FsBackend> FuseSession<B> {
         } else {
             false
         };
-        if should_evict
-            && let Some(removed) = self.inodes.remove(&nodeid)
-            && self.path_to_inode.get(&removed.path) == Some(&nodeid)
-        {
-            self.path_to_inode.remove(&removed.path);
+        if should_evict {
+            self.evict_inode_entry(nodeid);
         }
     }
 
@@ -636,18 +743,15 @@ impl<B: FsBackend> FuseSession<B> {
         } else {
             false
         };
-        if should_evict
-            && let Some(removed) = self.inodes.remove(&nodeid)
-            && self.path_to_inode.get(&removed.path) == Some(&nodeid)
-        {
-            self.path_to_inode.remove(&removed.path);
+        if should_evict {
+            self.evict_inode_entry(nodeid);
         }
     }
 
-    fn alloc_fh(&mut self) -> u64 {
+    fn alloc_fh(&mut self) -> FsResult<u64> {
         let fh = self.next_fh;
-        self.next_fh = self.next_fh.checked_add(1).expect("file handle overflow");
-        fh
+        self.next_fh = self.next_fh.checked_add(1).ok_or(EMFILE)?;
+        Ok(fh)
     }
 
     fn op_init(&mut self, body: &[u8]) -> FsResult<Vec<u8>> {
@@ -688,19 +792,25 @@ impl<B: FsBackend> FuseSession<B> {
         let name = read_cstr(body)?;
         let path = self.child_path(parent, name)?;
         let meta = self.backend.stat(&path).await?;
-        let nodeid = self.intern_inode(path, 1);
+        let nodeid = self.intern_inode(path, 1)?;
         Ok(entry_out(nodeid, meta).as_bytes().to_vec())
     }
 
     async fn op_getattr(&self, nodeid: u64, body: &[u8]) -> FsResult<Vec<u8>> {
         let meta = if let Ok((req, _)) = FuseGetattrIn::read_from_prefix(body)
             && (u32::from_le(req.getattr_flags) & 1 != 0)
-            && let Some(open) = self.open_files.get(&u64::from_le(req.fh))
+            && let Some(open) = self
+                .open_files
+                .get(&u64::from_le(req.fh))
+                .filter(|open| open.nodeid == nodeid)
         {
             self.backend.stat_handle(&open.handle).await?
-        } else {
-            let path = self.inode_path(nodeid)?;
+        } else if let Ok(path) = self.inode_path(nodeid) {
             self.backend.stat(&path).await?
+        } else if let Some(open) = self.open_files.values().find(|open| open.nodeid == nodeid) {
+            self.backend.stat_handle(&open.handle).await?
+        } else {
+            return Err(ENOENT);
         };
         Ok(attr_out(nodeid, meta).as_bytes().to_vec())
     }
@@ -711,20 +821,38 @@ impl<B: FsBackend> FuseSession<B> {
         }
         let (req, _) = FuseSetattrIn::read_from_prefix(body).map_err(|_| EINVAL)?;
         let valid = u32::from_le(req.valid);
-        let path = self.inode_path(nodeid)?;
+        let live_path = self.inode_path(nodeid).ok();
+        let fh_open = if valid & FATTR_FH != 0 {
+            self.open_files
+                .get(&u64::from_le(req.fh))
+                .filter(|open| open.nodeid == nodeid)
+        } else {
+            None
+        };
+        let open_handle = fh_open.or_else(|| {
+            if live_path.is_none() {
+                self.open_files.values().find(|open| open.nodeid == nodeid)
+            } else {
+                None
+            }
+        });
+        if live_path.is_none() && open_handle.is_none() {
+            return Err(ENOENT);
+        }
 
         if valid & FATTR_SIZE != 0 {
             let new_size = u64::from_le(req.size);
-            if valid & FATTR_FH != 0
-                && let Some(open) = self.open_files.get(&u64::from_le(req.fh))
-            {
+            if let Some(open) = open_handle {
                 self.backend.set_size_handle(&open.handle, new_size).await?;
+            } else if let Some(path) = live_path.as_deref() {
+                self.backend.set_size_path(path, new_size).await?;
             } else {
-                self.backend.set_size_path(&path, new_size).await?;
+                return Err(ENOENT);
             }
         }
         if valid & FATTR_MODE != 0 {
-            self.backend.set_mode(&path, u32::from_le(req.mode)).await?;
+            let path = live_path.as_deref().ok_or(ENOENT)?;
+            self.backend.set_mode(path, u32::from_le(req.mode)).await?;
         }
         let atime = if valid & FATTR_ATIME_NOW != 0 {
             FsTimeUpdate::Now
@@ -747,16 +875,17 @@ impl<B: FsBackend> FuseSession<B> {
             FsTimeUpdate::Unchanged
         };
         if !matches!(atime, FsTimeUpdate::Unchanged) || !matches!(mtime, FsTimeUpdate::Unchanged) {
-            self.backend.set_times(&path, atime, mtime).await?;
+            let path = live_path.as_deref().ok_or(ENOENT)?;
+            self.backend.set_times(path, atime, mtime).await?;
         }
         let _ = (valid & FATTR_UID, valid & FATTR_GID);
 
-        let meta = if valid & FATTR_FH != 0
-            && let Some(open) = self.open_files.get(&u64::from_le(req.fh))
-        {
+        let meta = if let Some(open) = open_handle {
             self.backend.stat_handle(&open.handle).await?
+        } else if let Some(path) = live_path.as_deref() {
+            self.backend.stat(path).await?
         } else {
-            self.backend.stat(&path).await?
+            return Err(ENOENT);
         };
         Ok(attr_out(nodeid, meta).as_bytes().to_vec())
     }
@@ -771,8 +900,9 @@ impl<B: FsBackend> FuseSession<B> {
         let (name, rest) = split_cstr(body)?;
         let target = read_cstr(rest)?;
         let path = self.child_path(parent, name)?;
+        self.ensure_inode_capacity(&path)?;
         let meta = self.backend.symlink(&path, target).await?;
-        let nodeid = self.intern_inode(path, 1);
+        let nodeid = self.intern_inode(path, 1)?;
         Ok(entry_out(nodeid, meta).as_bytes().to_vec())
     }
 
@@ -780,9 +910,10 @@ impl<B: FsBackend> FuseSession<B> {
         let (req, rest) = FuseMkdirIn::read_from_prefix(body).map_err(|_| EINVAL)?;
         let name = read_cstr(rest)?;
         let path = self.child_path(parent, name)?;
+        self.ensure_inode_capacity(&path)?;
         let mode = u32::from_le(req.mode) & !u32::from_le(req.umask);
         let meta = self.backend.mkdir(&path, mode).await?;
-        let nodeid = self.intern_inode(path, 1);
+        let nodeid = self.intern_inode(path, 1)?;
         Ok(entry_out(nodeid, meta).as_bytes().to_vec())
     }
 
@@ -790,7 +921,7 @@ impl<B: FsBackend> FuseSession<B> {
         let name = read_cstr(body)?;
         let path = self.child_path(parent, name)?;
         self.backend.unlink(&path).await?;
-        self.path_to_inode.remove(&path);
+        self.detach_path(&path);
         Ok(Vec::new())
     }
 
@@ -798,7 +929,7 @@ impl<B: FsBackend> FuseSession<B> {
         let name = read_cstr(body)?;
         let path = self.child_path(parent, name)?;
         self.backend.rmdir(&path).await?;
-        self.path_to_inode.remove(&path);
+        self.detach_path(&path);
         Ok(Vec::new())
     }
 
@@ -820,30 +951,38 @@ impl<B: FsBackend> FuseSession<B> {
         self.backend
             .rename(&old_path, &new_path, flags & RENAME_NOREPLACE != 0)
             .await?;
+        if old_path == new_path {
+            return Ok(Vec::new());
+        }
 
-        // Detach any overwritten target path entry, then rewrite moved inode and descendants.
-        self.path_to_inode.remove(&new_path);
-        let moved: Vec<(u64, Vec<String>, Vec<String>)> = self
-            .inodes
+        // Detach any overwritten target path entry, then rewrite only live paths
+        // rooted at `old_path` so unlinked open inodes are never mutated.
+        self.detach_path(&new_path);
+        let moved: Vec<(Vec<String>, u64, Vec<String>)> = self
+            .path_to_inode
             .iter()
-            .filter_map(|(&id, entry)| {
-                if entry.path.starts_with(&old_path) {
+            .filter_map(|(path, &id)| {
+                if path.starts_with(&old_path) {
                     let mut updated = new_path.clone();
-                    updated.extend_from_slice(&entry.path[old_path.len()..]);
-                    Some((id, entry.path.clone(), updated))
+                    updated.extend_from_slice(&path[old_path.len()..]);
+                    Some((path.clone(), id, updated))
                 } else {
                     None
                 }
             })
             .collect();
-        for (id, prev, updated) in moved {
-            if self.path_to_inode.get(&prev) == Some(&id) {
-                self.path_to_inode.remove(&prev);
-            }
+        for (prev, _, _) in &moved {
+            self.path_to_inode.remove(prev);
+        }
+        for (prev, id, updated) in moved {
+            self.path_to_inode.insert(updated.clone(), id);
             if let Some(entry) = self.inodes.get_mut(&id) {
-                entry.path = updated.clone();
+                for existing in &mut entry.paths {
+                    if existing == &prev {
+                        *existing = updated.clone();
+                    }
+                }
             }
-            self.path_to_inode.insert(updated, id);
         }
         Ok(Vec::new())
     }
@@ -851,19 +990,23 @@ impl<B: FsBackend> FuseSession<B> {
     async fn op_link(&mut self, new_parent: u64, body: &[u8]) -> FsResult<Vec<u8>> {
         let (req, rest) = FuseLinkIn::read_from_prefix(body).map_err(|_| EINVAL)?;
         let name = read_cstr(rest)?;
-        let old_path = self.inode_path(u64::from_le(req.oldnodeid))?;
+        let oldnodeid = u64::from_le(req.oldnodeid);
+        let old_path = self.inode_path(oldnodeid)?;
         let new_path = self.child_path(new_parent, name)?;
         let meta = self.backend.link(&old_path, &new_path).await?;
-        let nodeid = self.intern_inode(new_path, 1);
-        Ok(entry_out(nodeid, meta).as_bytes().to_vec())
+        self.attach_hardlink(oldnodeid, new_path)?;
+        Ok(entry_out(oldnodeid, meta).as_bytes().to_vec())
     }
 
     async fn op_open(&mut self, nodeid: u64, body: &[u8]) -> FsResult<Vec<u8>> {
         let (req, _) = FuseOpenIn::read_from_prefix(body).map_err(|_| EINVAL)?;
+        if self.open_files.len() >= self.limits.max_open_files {
+            return Err(EMFILE);
+        }
         let path = self.inode_path(nodeid)?;
         let options = open_options_from_flags(u32::from_le(req.flags), 0);
         let (handle, _) = self.backend.open_file(&path, options).await?;
-        let fh = self.alloc_fh();
+        let fh = self.alloc_fh()?;
         if let Some(entry) = self.inodes.get_mut(&nodeid) {
             entry.open_handles = entry.open_handles.saturating_add(1);
         }
@@ -879,13 +1022,16 @@ impl<B: FsBackend> FuseSession<B> {
     async fn op_create(&mut self, parent: u64, body: &[u8]) -> FsResult<Vec<u8>> {
         let (req, rest) = FuseCreateIn::read_from_prefix(body).map_err(|_| EINVAL)?;
         let name = read_cstr(rest)?;
+        if self.open_files.len() >= self.limits.max_open_files {
+            return Err(EMFILE);
+        }
         let path = self.child_path(parent, name)?;
+        self.ensure_inode_capacity(&path)?;
         let mode = u32::from_le(req.mode) & !u32::from_le(req.umask);
-        let mut options = open_options_from_flags(u32::from_le(req.flags) | O_CREAT, mode);
-        options.write = true;
+        let options = open_options_from_flags(u32::from_le(req.flags) | O_CREAT, mode);
         let (handle, meta) = self.backend.open_file(&path, options).await?;
-        let nodeid = self.intern_inode(path, 1);
-        let fh = self.alloc_fh();
+        let nodeid = self.intern_inode(path, 1)?;
+        let fh = self.alloc_fh()?;
         if let Some(entry) = self.inodes.get_mut(&nodeid) {
             entry.open_handles = entry.open_handles.saturating_add(1);
         }
@@ -919,7 +1065,7 @@ impl<B: FsBackend> FuseSession<B> {
         let (req, data) = FuseWriteIn::read_from_prefix(body).map_err(|_| EINVAL)?;
         let open = self.open_files.get(&u64::from_le(req.fh)).ok_or(EBADF)?;
         let declared = u32::from_le(req.size) as usize;
-        if data.len() < declared {
+        if declared > MAX_WRITE_BYTES as usize || data.len() < declared {
             return Err(EINVAL);
         }
         let written = self
@@ -958,13 +1104,16 @@ impl<B: FsBackend> FuseSession<B> {
     }
 
     async fn op_opendir(&mut self, nodeid: u64) -> FsResult<Vec<u8>> {
+        if self.open_dirs.len() >= self.limits.max_open_dirs {
+            return Err(EMFILE);
+        }
         let path = self.inode_path(nodeid)?;
         let meta = self.backend.stat(&path).await?;
         if !meta.is_dir() {
             return Err(ENOTDIR);
         }
         let entries = self.snapshot_dir(&path).await?;
-        let fh = self.alloc_fh();
+        let fh = self.alloc_fh()?;
         if let Some(entry) = self.inodes.get_mut(&nodeid) {
             entry.open_handles = entry.open_handles.saturating_add(1);
         }
@@ -1030,17 +1179,15 @@ impl<B: FsBackend> FuseSession<B> {
             }
         }
 
-        let parent_nodeid = {
-            let dir_path = self.inode_path(dir_nodeid)?;
-            if dir_path.is_empty() {
-                FUSE_ROOT_ID
-            } else {
+        let parent_nodeid = match self.inode_path(dir_nodeid) {
+            Ok(dir_path) if !dir_path.is_empty() => {
                 let parent_path = &dir_path[..dir_path.len() - 1];
                 self.path_to_inode
                     .get(parent_path)
                     .copied()
                     .unwrap_or(FUSE_ROOT_ID)
             }
+            _ => FUSE_ROOT_ID,
         };
 
         let snapshot: Vec<(String, u32, Option<Vec<String>>)> = {
@@ -1062,8 +1209,13 @@ impl<B: FsBackend> FuseSession<B> {
             } else {
                 core::mem::size_of::<FuseDirent>()
             };
-            let padded_len = (header_len + name_bytes.len() + 7) & !7;
-            if out.len() + padded_len > max_bytes {
+            let entry_raw = header_len.checked_add(name_bytes.len()).ok_or(EOVERFLOW)?;
+            let padded_len = entry_raw.checked_add(7).map(|n| n & !7).ok_or(EOVERFLOW)?;
+            if out
+                .len()
+                .checked_add(padded_len)
+                .is_none_or(|n| n > max_bytes)
+            {
                 break;
             }
             let next_off = (offset + rel_idx + 1) as u64;
@@ -1072,7 +1224,11 @@ impl<B: FsBackend> FuseSession<B> {
                     let Ok(meta) = self.backend.stat(&child_path).await else {
                         continue;
                     };
-                    let child_id = self.intern_inode(child_path, 1);
+                    let child_id = match self.intern_inode(child_path, 1) {
+                        Ok(id) => id,
+                        Err(err) if out.is_empty() => return Err(err),
+                        Err(_) => break,
+                    };
                     (entry_out(child_id, meta), child_id)
                 } else {
                     // Per Linux FUSE spec, `.` and `..` carry `nodeid = 0` in READDIRPLUS

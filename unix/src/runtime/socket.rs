@@ -75,6 +75,11 @@ pub trait SocketNetwork: Clone + Send + Sync + 'static {
     fn vsock_stream_close(&self, stream: u64) {
         let _ = stream;
     }
+
+    /// Retires an ICMP / ICMPv6 echo socket handle.
+    fn icmp_close(&self, socket: u64) {
+        let _ = socket;
+    }
 }
 
 /// The per-socket facts of a network stack that options report.
@@ -345,6 +350,44 @@ pub struct NetlinkSocket {
     pub options: SocketOptions,
 }
 
+/// An ICMP / ICMPv6 echo socket handle retired when its last owner drops.
+pub struct OwnedIcmpSocket<Net: SocketNetwork> {
+    network: Net,
+    socket: u64,
+}
+
+impl<Net: SocketNetwork> OwnedIcmpSocket<Net> {
+    pub fn new(network: Net, socket: u64) -> Arc<Self> {
+        Arc::new(Self { network, socket })
+    }
+
+    pub fn id(&self) -> u64 {
+        self.socket
+    }
+}
+
+impl<Net: SocketNetwork> Drop for OwnedIcmpSocket<Net> {
+    fn drop(&mut self) {
+        self.network.icmp_close(self.socket);
+    }
+}
+
+/// Shared state of an `IPPROTO_ICMP` / `IPPROTO_ICMPV6` echo socket
+/// (`SOCK_DGRAM` unprivileged ping socket or `SOCK_RAW` with `CAP_NET_RAW`).
+#[derive(Clone)]
+pub struct IcmpSocket<Net: SocketNetwork> {
+    pub family: SocketFamily,
+    pub is_raw: bool,
+    pub protocol: i32,
+    pub handle: Arc<OwnedIcmpSocket<Net>>,
+    pub local_address: Option<Net::Address>,
+    /// Assigned ICMP echo identifier (`SOCK_DGRAM` local port / id).
+    pub local_id: u16,
+    pub peer: Option<Net::Address>,
+    pub recv_ttl: bool,
+    pub options: SocketOptions,
+}
+
 /// Shared state of a link-layer packet socket (`AF_PACKET`).
 #[derive(Clone)]
 pub struct PacketSocket<Net: SocketNetwork> {
@@ -428,6 +471,7 @@ enum SocketBody<Net: SocketNetwork> {
     },
     Netlink(Mutex<NetlinkSocket>),
     Packet(Mutex<PacketSocket<Net>>),
+    Icmp(Mutex<IcmpSocket<Net>>),
     Vsock(Mutex<VsockSocket<Net>>),
     UnixUnbound {
         options: Mutex<SocketOptions>,
@@ -487,6 +531,7 @@ pub enum SocketHandle<Net: SocketNetwork> {
     TcpListener(Net::TcpListener),
     UdpSocket(Net::UdpSocket),
     PacketSocket(Net::PacketSocket),
+    IcmpSocket(u64),
     VsockListener(u64),
     VsockStream(u64),
 }
@@ -512,6 +557,7 @@ where
             (Self::TcpListener(a), Self::TcpListener(b)) => a == b,
             (Self::UdpSocket(a), Self::UdpSocket(b)) => a == b,
             (Self::PacketSocket(a), Self::PacketSocket(b)) => a == b,
+            (Self::IcmpSocket(a), Self::IcmpSocket(b)) => a == b,
             (Self::VsockListener(a), Self::VsockListener(b)) => a == b,
             (Self::VsockStream(a), Self::VsockStream(b)) => a == b,
             _ => false,
@@ -546,6 +592,7 @@ where
             Self::PacketSocket(socket) => {
                 formatter.debug_tuple("PacketSocket").field(socket).finish()
             }
+            Self::IcmpSocket(socket) => formatter.debug_tuple("IcmpSocket").field(socket).finish(),
             Self::VsockListener(listener) => formatter
                 .debug_tuple("VsockListener")
                 .field(listener)
@@ -721,6 +768,60 @@ impl<Net: SocketNetwork> Socket<Net> {
         }))
     }
 
+    /// An ICMP / ICMPv6 echo socket (`SOCK_DGRAM` ping socket or `SOCK_RAW`).
+    pub fn icmp(
+        family: SocketFamily,
+        is_raw: bool,
+        protocol: i32,
+        handle: Arc<OwnedIcmpSocket<Net>>,
+        local_id: u16,
+    ) -> Self {
+        Self(Arc::new(SharedSocket {
+            kind: if is_raw {
+                SocketKind::Raw
+            } else {
+                SocketKind::Datagram
+            },
+            protocol: None,
+            nonblocking: AtomicBool::new(false),
+            pending_error: AtomicI32::new(0),
+            shutdown_read: AtomicBool::new(false),
+            shutdown_write: AtomicBool::new(false),
+            body: SocketBody::Icmp(Mutex::new(IcmpSocket {
+                family,
+                is_raw,
+                protocol,
+                handle,
+                local_address: None,
+                local_id,
+                peer: None,
+                recv_ttl: false,
+                options: SocketOptions::for_network::<Net>(),
+            })),
+        }))
+    }
+
+    /// Whether this socket is an ICMP / ICMPv6 echo socket.
+    pub fn is_icmp(&self) -> bool {
+        matches!(self.0.body, SocketBody::Icmp(_))
+    }
+
+    /// Snapshot of the ICMP socket state, or `None` if not an ICMP socket.
+    pub fn icmp_state(&self) -> Option<IcmpSocket<Net>> {
+        match &self.0.body {
+            SocketBody::Icmp(icmp) => Some(icmp.lock().clone()),
+            _ => None,
+        }
+    }
+
+    /// Runs `f` synchronously against the ICMP socket state under the short lock.
+    pub fn with_icmp_mut<R>(&self, f: impl FnOnce(&mut IcmpSocket<Net>) -> R) -> Option<R> {
+        match &self.0.body {
+            SocketBody::Icmp(icmp) => Some(f(&mut icmp.lock())),
+            _ => None,
+        }
+    }
+
     /// Wraps an existing vsock socket state in a shared open description.
     pub fn from_vsock(vsock: VsockSocket<Net>) -> Self {
         Self(Arc::new(SharedSocket {
@@ -843,6 +944,7 @@ impl<Net: SocketNetwork> Socket<Net> {
         match &self.0.body {
             SocketBody::Tcp(tcp) => Some(tcp.lock().family()),
             SocketBody::Udp(udp) => Some(udp.lock().family()),
+            SocketBody::Icmp(icmp) => Some(icmp.lock().family),
             SocketBody::RawIp { family, .. } => Some(*family),
             SocketBody::Pair { .. }
             | SocketBody::Netlink(_)
@@ -995,6 +1097,7 @@ impl<Net: SocketNetwork> Socket<Net> {
             | SocketBody::RawIp { options, .. } => *options.lock(),
             SocketBody::Netlink(nl) => nl.lock().options,
             SocketBody::Packet(pkt) => pkt.lock().options,
+            SocketBody::Icmp(icmp) => icmp.lock().options,
             SocketBody::Vsock(vsock) => *vsock.lock().options(),
         }
     }
@@ -1008,6 +1111,7 @@ impl<Net: SocketNetwork> Socket<Net> {
             | SocketBody::RawIp { options, .. } => f(&mut options.lock()),
             SocketBody::Netlink(nl) => f(&mut nl.lock().options),
             SocketBody::Packet(pkt) => f(&mut pkt.lock().options),
+            SocketBody::Icmp(icmp) => f(&mut icmp.lock().options),
             SocketBody::Vsock(vsock) => f(vsock.lock().options_mut()),
         }
     }
@@ -1043,6 +1147,7 @@ impl<Net: SocketNetwork> Socket<Net> {
             | SocketBody::UnixUnbound { .. }
             | SocketBody::RawIp { .. } => None,
             SocketBody::Packet(pkt) => Some(SocketHandle::PacketSocket(pkt.lock().handle.id())),
+            SocketBody::Icmp(icmp) => Some(SocketHandle::IcmpSocket(icmp.lock().handle.id())),
             SocketBody::Vsock(vsock) => match &*vsock.lock() {
                 VsockSocket::Listening { listener, .. } => {
                     Some(SocketHandle::VsockListener(listener.id()))

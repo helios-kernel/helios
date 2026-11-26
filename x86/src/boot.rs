@@ -157,6 +157,8 @@ fn convert_memory_region(entry: &'static Entry) -> BootMemoryRegion {
 fn convert_memory_kind(entry_type: EntryType) -> BootMemoryKind {
     if entry_type == EntryType::USABLE {
         BootMemoryKind::Usable
+    } else if entry_type == EntryType::BOOTLOADER_RECLAIMABLE {
+        BootMemoryKind::BootloaderReclaimable
     } else {
         BootMemoryKind::Reserved
     }
@@ -197,6 +199,10 @@ mod tests {
         );
         assert_eq!(
             convert_memory_kind(EntryType::BOOTLOADER_RECLAIMABLE),
+            BootMemoryKind::BootloaderReclaimable
+        );
+        assert_eq!(
+            convert_memory_kind(EntryType::RESERVED),
             BootMemoryKind::Reserved
         );
     }
