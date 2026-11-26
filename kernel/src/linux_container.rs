@@ -34,6 +34,8 @@
 extern crate alloc;
 
 use alloc::borrow::ToOwned;
+use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -43,17 +45,24 @@ use core::num::{NonZeroU32, NonZeroU64};
 use helios_btrfs::DeviceNumber;
 use helios_btrfs::write::{Attributes as BtrfsAttributes, Special};
 use helios_hal::fs::{
-    DirCookie, DirEntry, DirStream, FileSystem, FileSystemRights, FsError, FsPath, FsResult,
-    Landed, Metadata, NodeKind, OpenFlags, RenameMode, WritePosition, write_with,
+    DeviceId, DirCookie, DirEntry, DirStream, FileSystem, FileSystemRights, FsError, FsPath,
+    FsResult, Landed, Metadata, NodeKind, OpenFlags, RenameMode, WritePosition, write_with,
 };
+use helios_hal::native::NativeError;
+use helios_hal::pmm::PhysFrame;
+use helios_linux::syscall::shm::{EEXIST, ENOENT, ENOSPC};
 use helios_linux::syscall::{
-    AccessCheck, CAP_FSETID, CAP_FULL_SET, CAP_NET_ADMIN, CAP_NET_BIND_SERVICE, CAP_NET_RAW,
-    CAP_SYS_ADMIN, CAP_SYS_TIME, Credentials, FsOpError, OpenRequest, PidNamespace, TimeUpdate,
-    UtsField, XattrSetMode as LinuxXattrSetMode, permissions,
+    AccessCheck, CAP_FSETID, CAP_FULL_SET, CAP_IPC_LOCK, CAP_NET_ADMIN, CAP_NET_BIND_SERVICE,
+    CAP_NET_RAW, CAP_SYS_ADMIN, CAP_SYS_TIME, Credentials, FileStat, FsOpError, IPC_CREAT,
+    IPC_EXCL, IPC_PRIVATE, MFD_ALLOW_SEALING, MFD_NOEXEC_SEAL, OpenRequest, PidNamespace, SHM_DEST,
+    SHM_LOCKED, SHMMAX, SHMMIN, SHMMNI, ShmPerm, ShmStat, ShmUsageInfo, TimeUpdate, UtsField,
+    XattrSetMode as LinuxXattrSetMode, check_ipc_owner_or_admin, check_ipc_perms, permissions,
 };
 use helios_unix::{
-    CHAR_MAJOR_MEM, CHAR_MAJOR_TTY, CHAR_MAJOR_UNIX98_PTY_SLAVE, FifoReadWrite, FifoReader,
-    FifoWriter, FutexTable, PseudoDevice, PseudoDeviceKind, PtyError, PtyMaster, PtySlave,
+    CHAR_MAJOR_MEM, CHAR_MAJOR_TTY, CHAR_MAJOR_UNIX98_PTY_SLAVE, F_SEAL_EXEC, F_SEAL_FUTURE_WRITE,
+    F_SEAL_GROW, F_SEAL_SEAL, F_SEAL_SHRINK, F_SEAL_WRITE, FifoReadWrite, FifoReader, FifoWriter,
+    FutexTable, MemfdHandle, MemfdWritableMapHold, PseudoDevice, PseudoDeviceKind, PtyError,
+    PtyMaster, PtySlave,
 };
 
 const CHAR_MINOR_NULL: u32 = 3;
@@ -75,8 +84,8 @@ use crate::vfs::{
     XattrSetMode, join_fs_path, within_directory,
 };
 use crate::{
-    ClockAuthorityRights, DirectoryAuthorityRights, DirectoryPreopen, NetworkAuthorityRights,
-    ProcessAuthority, ProcessAuthorityError,
+    AuthorityDomain, ClockAuthorityRights, DirectoryAuthorityRights, DirectoryPreopen,
+    NetworkAuthorityRights, ObjectIdentity, ProcessAuthority, ProcessAuthorityError,
 };
 
 fn authority_cap_ceiling_for(authority: &ProcessAuthority) -> u64 {
@@ -2710,23 +2719,955 @@ pub struct LinuxContainerSnapshot {
     pub mounts: Vec<ContainerMountSnapshot>,
 }
 
+struct MemfdMeta {
+    size: u64,
+    seals: u32,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    atime_nanos: u64,
+    mtime_nanos: u64,
+    ctime_nanos: u64,
+}
+
+struct MemfdInode {
+    ino: u64,
+    path: String,
+    handle: MemfdHandle,
+    object: crate::SharedPageObject,
+    meta: spin::Mutex<MemfdMeta>,
+}
+
+struct MemfdRegistryInner {
+    next_ino: u64,
+    entries: BTreeMap<u64, TriompheArc<MemfdInode>>,
+    proc_fds: BTreeMap<u32, Vec<(i32, u64)>>,
+}
+
+/// Container-isolated registry of `memfd_create(2)` anonymous memory files
+/// backed by `UserMemoryPool`-accounted [`crate::SharedPageObject`]s.
+///
+/// # Concurrency contract
+///
+/// - Registry table lookups/inserts and per-inode metadata updates use short,
+///   non-awaiting `spin::Mutex` locks.
+/// - Lock order when both locks are taken is strictly `MemfdRegistry ->
+///   MemfdInode::meta -> SharedPageObject`; `NativeSpace` never acquires
+///   `MemfdRegistry` or `MemfdInode::meta`.
+/// - Live reference counts (`MemfdHold`) and writable shared-mapping counts
+///   (`MemfdWritableMapHold`) live on lock-free atomics inside [`MemfdHandle`];
+///   [`Self::reap_unreferenced`] drops any inode with zero live holds so every
+///   physical frame returns immediately to `UserMemoryPool`.
+#[derive(Clone)]
+pub struct MemfdRegistry {
+    device: DeviceId,
+    inner: TriompheArc<spin::Mutex<MemfdRegistryInner>>,
+}
+
+impl MemfdRegistry {
+    pub fn new(device: DeviceId) -> Self {
+        Self {
+            device,
+            inner: TriompheArc::new(spin::Mutex::new(MemfdRegistryInner {
+                next_ino: 1,
+                entries: BTreeMap::new(),
+                proc_fds: BTreeMap::new(),
+            })),
+        }
+    }
+
+    pub const fn device_id(&self) -> u64 {
+        self.device.raw()
+    }
+
+    pub const fn owns_identity(&self, id: ObjectIdentity) -> bool {
+        id.domain().raw() == self.device.raw()
+    }
+
+    fn lookup(&self, id: ObjectIdentity) -> Option<TriompheArc<MemfdInode>> {
+        if !self.owns_identity(id) {
+            return None;
+        }
+        self.inner.lock().entries.get(&id.local()).cloned()
+    }
+
+    /// Creates a fresh `memfd_create(2)` inode owned by `creds`.
+    pub fn create(
+        &self,
+        name: &str,
+        flags: u32,
+        creds: &Credentials,
+        now_nanos: u64,
+    ) -> (ObjectIdentity, String, MemfdHandle) {
+        self.reap_unreferenced();
+        let mode = if flags & MFD_NOEXEC_SEAL != 0 {
+            0o666
+        } else {
+            0o777
+        };
+        let mut seals = 0u32;
+        if flags & MFD_ALLOW_SEALING == 0 {
+            seals |= F_SEAL_SEAL;
+        }
+        if flags & MFD_NOEXEC_SEAL != 0 {
+            seals |= F_SEAL_EXEC;
+        }
+        let path = format!("/memfd:{name} (deleted)");
+        let handle = MemfdHandle::new();
+        let mut guard = self.inner.lock();
+        let ino = guard.next_ino;
+        guard.next_ino = guard.next_ino.wrapping_add(1).max(1);
+        let inode = TriompheArc::new(MemfdInode {
+            ino,
+            path: path.clone(),
+            handle: handle.clone(),
+            object: crate::SharedPageObject::new_anonymous(),
+            meta: spin::Mutex::new(MemfdMeta {
+                size: 0,
+                seals,
+                mode,
+                uid: creds.user.effective,
+                gid: creds.group.effective,
+                atime_nanos: now_nanos,
+                mtime_nanos: now_nanos,
+                ctime_nanos: now_nanos,
+            }),
+        });
+        guard.entries.insert(ino, inode);
+        let id = ObjectIdentity::new(AuthorityDomain::new(self.device.raw()), ino);
+        (id, path, handle)
+    }
+
+    /// Returns the underlying `UserMemoryPool`-backed [`crate::SharedPageObject`]
+    /// for `(dev, ino)` if it belongs to this container's memfds.
+    pub fn shared_object(&self, dev: u64, ino: u64) -> Option<crate::SharedPageObject> {
+        if dev != self.device.raw() {
+            return None;
+        }
+        self.inner
+            .lock()
+            .entries
+            .get(&ino)
+            .map(|inode| inode.object.clone())
+    }
+
+    pub fn handle(&self, id: ObjectIdentity) -> Option<MemfdHandle> {
+        self.lookup(id).map(|inode| inode.handle.clone())
+    }
+
+    pub fn get_seals(&self, id: ObjectIdentity) -> Option<u32> {
+        self.lookup(id).map(|inode| inode.meta.lock().seals)
+    }
+
+    /// Adds `seals` atomically (`mm/memfd.c` `memfd_add_seals`).
+    pub fn add_seals(&self, id: ObjectIdentity, mut new_seals: u32) -> Result<(), FsOpError> {
+        let Some(inode) = self.lookup(id) else {
+            return Err(FsOpError::Fs(FsError::Invalid));
+        };
+        let mut meta = inode.meta.lock();
+        if meta.seals & F_SEAL_SEAL != 0 {
+            return Err(FsOpError::PermissionDenied);
+        }
+        // Linux v6.12 `mm/memfd.c`: sealing exec on an executable memfd locks
+        // down size and content mutation to preserve W^X.
+        if (new_seals & F_SEAL_EXEC != 0) && (meta.mode & 0o111 != 0) {
+            new_seals |= F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE;
+        }
+        if (new_seals & F_SEAL_WRITE != 0)
+            && (meta.seals & F_SEAL_WRITE == 0)
+            && inode.handle.writable_shared_maps() > 0
+        {
+            return Err(FsOpError::Fs(FsError::Busy));
+        }
+        meta.seals |= new_seals;
+        Ok(())
+    }
+
+    /// Atomically verifies write seals and acquires a writable `MAP_SHARED`
+    /// hold under the inode's seal lock so concurrent `F_ADD_SEALS(F_SEAL_WRITE)`
+    /// cannot race `mmap`.
+    pub fn acquire_writable_map(
+        &self,
+        id: ObjectIdentity,
+    ) -> Result<Option<MemfdWritableMapHold>, FsOpError> {
+        let Some(inode) = self.lookup(id) else {
+            return Ok(None);
+        };
+        let meta = inode.meta.lock();
+        if meta.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
+            return Err(FsOpError::PermissionDenied);
+        }
+        Ok(Some(inode.handle.acquire_writable_map()))
+    }
+
+    pub fn stat(&self, id: ObjectIdentity) -> Result<FileStat, FsOpError> {
+        let Some(inode) = self.lookup(id) else {
+            return Err(FsOpError::Fs(FsError::NoEntry));
+        };
+        let meta = inode.meta.lock();
+        Ok(FileStat {
+            dev: self.device.raw(),
+            ino: inode.ino,
+            kind: NodeKind::File,
+            permissions: meta.mode,
+            nlink: 1,
+            uid: meta.uid,
+            gid: meta.gid,
+            rdev: 0,
+            size: meta.size,
+            access_nanos: meta.atime_nanos,
+            modified_nanos: meta.mtime_nanos,
+            status_nanos: meta.ctime_nanos,
+        })
+    }
+
+    pub fn read_at(
+        &self,
+        id: ObjectIdentity,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<Bytes, FsOpError> {
+        let Some(inode) = self.lookup(id) else {
+            return Err(FsOpError::Fs(FsError::NoEntry));
+        };
+        let size = inode.meta.lock().size;
+        if offset >= size || max_bytes == 0 {
+            return Ok(Bytes::new());
+        }
+        let to_read = (size - offset).min(max_bytes as u64) as usize;
+        let mut buf = vec![0u8; to_read];
+        inode.object.overlay_file_read(offset, &mut buf);
+        Ok(Bytes::from(buf))
+    }
+
+    pub fn write_at(
+        &self,
+        id: ObjectIdentity,
+        position: WritePosition,
+        bytes: &[u8],
+        now_nanos: u64,
+    ) -> Result<Landed, FsOpError> {
+        let Some(inode) = self.lookup(id) else {
+            return Err(FsOpError::Fs(FsError::NoEntry));
+        };
+        let mut meta = inode.meta.lock();
+        if meta.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
+            return Err(FsOpError::PermissionDenied);
+        }
+        let write_offset = match position {
+            WritePosition::At(off) => off,
+            WritePosition::End => meta.size,
+        };
+        let write_end = write_offset
+            .checked_add(bytes.len() as u64)
+            .ok_or(FsOpError::Fs(FsError::Overflow))?;
+        if write_end > meta.size && (meta.seals & F_SEAL_GROW != 0) {
+            return Err(FsOpError::PermissionDenied);
+        }
+        if !bytes.is_empty() {
+            let page_size = PhysFrame::SIZE as u64;
+            let first_page = write_offset / page_size;
+            let last_page = (write_end - 1) / page_size;
+            for page_index in first_page..=last_page {
+                inode
+                    .object
+                    .get_or_alloc_frame(page_index)
+                    .map_err(|err| match err {
+                        NativeError::OutOfMemory => FsOpError::Fs(FsError::OutOfMemory),
+                        _ => FsOpError::Fs(FsError::Io),
+                    })?;
+            }
+            inode.object.apply_file_write(write_offset, bytes);
+        }
+        if write_end > meta.size {
+            meta.size = write_end;
+        }
+        meta.mtime_nanos = now_nanos;
+        meta.ctime_nanos = now_nanos;
+        Ok(Landed {
+            offset: write_offset,
+            len: bytes.len(),
+        })
+    }
+
+    /// Resizes a memfd (`mm/shmem.c` `shmem_setattr`), enforcing `F_SEAL_SHRINK`
+    /// and `F_SEAL_GROW` and truncating frames beyond EOF.
+    pub fn set_size(
+        &self,
+        id: ObjectIdentity,
+        new_size: u64,
+        now_nanos: u64,
+    ) -> Result<(), FsOpError> {
+        let Some(inode) = self.lookup(id) else {
+            return Err(FsOpError::Fs(FsError::NoEntry));
+        };
+        let mut meta = inode.meta.lock();
+        if new_size < meta.size && (meta.seals & F_SEAL_SHRINK != 0) {
+            return Err(FsOpError::PermissionDenied);
+        }
+        if new_size > meta.size && (meta.seals & F_SEAL_GROW != 0) {
+            return Err(FsOpError::PermissionDenied);
+        }
+        if new_size < meta.size {
+            inode.object.truncate(new_size);
+        }
+        meta.size = new_size;
+        meta.mtime_nanos = now_nanos;
+        meta.ctime_nanos = now_nanos;
+        Ok(())
+    }
+
+    pub fn chmod(
+        &self,
+        id: ObjectIdentity,
+        mode: u32,
+        creds: &Credentials,
+        now_nanos: u64,
+    ) -> Result<(), FsOpError> {
+        let Some(inode) = self.lookup(id) else {
+            return Err(FsOpError::Fs(FsError::NoEntry));
+        };
+        let mut meta = inode.meta.lock();
+        let inode_meta = permissions::InodeMeta {
+            kind: NodeKind::File,
+            mode: meta.mode,
+            uid: meta.uid,
+            gid: meta.gid,
+        };
+        let new_mode = permissions::check_chmod(creds, inode_meta, mode)?;
+        if (meta.seals & F_SEAL_EXEC != 0) && ((new_mode & 0o111) != (meta.mode & 0o111)) {
+            return Err(FsOpError::PermissionDenied);
+        }
+        meta.mode = new_mode;
+        meta.ctime_nanos = now_nanos;
+        Ok(())
+    }
+
+    pub fn chown(
+        &self,
+        id: ObjectIdentity,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        creds: &Credentials,
+        now_nanos: u64,
+    ) -> Result<(), FsOpError> {
+        let Some(inode) = self.lookup(id) else {
+            return Err(FsOpError::Fs(FsError::NoEntry));
+        };
+        let mut meta = inode.meta.lock();
+        let inode_meta = permissions::InodeMeta {
+            kind: NodeKind::File,
+            mode: meta.mode,
+            uid: meta.uid,
+            gid: meta.gid,
+        };
+        let plan = permissions::check_chown(creds, inode_meta, uid, gid)?;
+        if let Some(new_uid) = plan.uid {
+            meta.uid = new_uid;
+        }
+        if let Some(new_gid) = plan.gid {
+            meta.gid = new_gid;
+        }
+        if plan.kill_privs {
+            meta.mode &= !(permissions::S_ISUID | permissions::S_ISGID);
+        }
+        meta.ctime_nanos = now_nanos;
+        Ok(())
+    }
+
+    pub fn set_times(
+        &self,
+        id: ObjectIdentity,
+        access: TimeUpdate,
+        modified: TimeUpdate,
+        creds: &Credentials,
+        now_nanos: u64,
+    ) -> Result<(), FsOpError> {
+        let Some(inode) = self.lookup(id) else {
+            return Err(FsOpError::Fs(FsError::NoEntry));
+        };
+        let mut meta = inode.meta.lock();
+        let inode_meta = permissions::InodeMeta {
+            kind: NodeKind::File,
+            mode: meta.mode,
+            uid: meta.uid,
+            gid: meta.gid,
+        };
+        permissions::check_utimens(creds, inode_meta, None, access, modified)?;
+        if let Some(ts) = resolve_time_update(access, now_nanos) {
+            meta.atime_nanos = ts;
+        }
+        if let Some(ts) = resolve_time_update(modified, now_nanos) {
+            meta.mtime_nanos = ts;
+        }
+        meta.ctime_nanos = now_nanos;
+        Ok(())
+    }
+
+    /// Reopens an existing memfd inode (e.g. via `/proc/<pid>/fd/<n>`), checking
+    /// DAC permissions and `O_TRUNC` seals.
+    pub fn reopen(
+        &self,
+        id: ObjectIdentity,
+        request: OpenRequest,
+        creds: &Credentials,
+        now_nanos: u64,
+    ) -> Result<(ObjectIdentity, String, MemfdHandle), FsOpError> {
+        let Some(inode) = self.lookup(id) else {
+            return Err(FsOpError::Fs(FsError::NoEntry));
+        };
+        if request.directory {
+            return Err(FsOpError::Fs(FsError::NotDirectory));
+        }
+        let mut meta = inode.meta.lock();
+        if !request.path_only {
+            let mut want = 0u32;
+            if request.read {
+                want |= permissions::MAY_READ;
+            }
+            if request.write {
+                want |= permissions::MAY_WRITE;
+            }
+            let inode_meta = permissions::InodeMeta {
+                kind: NodeKind::File,
+                mode: meta.mode,
+                uid: meta.uid,
+                gid: meta.gid,
+            };
+            permissions::generic_permission(creds, inode_meta, None, want)?;
+        }
+        if request.truncate {
+            if meta.size > 0 && (meta.seals & F_SEAL_SHRINK != 0) {
+                return Err(FsOpError::PermissionDenied);
+            }
+            inode.object.truncate(0);
+            meta.size = 0;
+            meta.mtime_nanos = now_nanos;
+            meta.ctime_nanos = now_nanos;
+        }
+        Ok((id, inode.path.clone(), inode.handle.clone()))
+    }
+
+    /// Drops every memfd inode whose last open file description and mapping
+    /// have been released, immediately returning all physical frames to
+    /// `UserMemoryPool`.
+    pub fn reap_unreferenced(&self) {
+        let mut dropped = Vec::new();
+        {
+            let mut guard = self.inner.lock();
+            let dead: Vec<u64> = guard
+                .entries
+                .iter()
+                .filter_map(|(&ino, inode)| (inode.handle.live_holds() == 0).then_some(ino))
+                .collect();
+            for ino in dead {
+                if let Some(inode) = guard.entries.remove(&ino) {
+                    dropped.push(inode);
+                }
+            }
+        }
+        drop(dropped);
+    }
+
+    pub fn set_process_fds(&self, pid: u32, fds: Vec<(i32, u64)>) {
+        let mut guard = self.inner.lock();
+        if fds.is_empty() {
+            guard.proc_fds.remove(&pid);
+        } else {
+            guard.proc_fds.insert(pid, fds);
+        }
+    }
+
+    pub fn remove_process_fds(&self, pid: u32) {
+        self.inner.lock().proc_fds.remove(&pid);
+    }
+
+    pub fn lookup_process_fd(&self, pid: u32, fd: i32) -> Option<ObjectIdentity> {
+        let guard = self.inner.lock();
+        let ino = guard
+            .proc_fds
+            .get(&pid)?
+            .iter()
+            .find_map(|&(slot, ino)| (slot == fd).then_some(ino))?;
+        guard
+            .entries
+            .contains_key(&ino)
+            .then(|| ObjectIdentity::new(AuthorityDomain::new(self.device.raw()), ino))
+    }
+
+    #[cfg(test)]
+    pub fn active_count(&self) -> usize {
+        self.inner.lock().entries.len()
+    }
+}
+
+const SYSV_SHM_SEQ_SHIFT: u32 = 15;
+const SYSV_SHM_SEQ_MASK: u16 = (1u16 << SYSV_SHM_SEQ_SHIFT) - 1;
+const SYSV_SHM_INDEX_MASK: i32 = (1i32 << SYSV_SHM_SEQ_SHIFT) - 1;
+
+struct SysvShmSegment {
+    shmid: i32,
+    perm: ShmPerm,
+    size: u64,
+    atime: i64,
+    dtime: i64,
+    ctime: i64,
+    cpid: u32,
+    lpid: u32,
+    nattch: u64,
+    destroyed: bool,
+    object: crate::SharedPageObject,
+}
+
+impl SysvShmSegment {
+    fn to_stat(&self) -> ShmStat {
+        ShmStat {
+            perm: self.perm,
+            segsz: self.size,
+            atime: self.atime,
+            dtime: self.dtime,
+            ctime: self.ctime,
+            cpid: self.cpid,
+            lpid: self.lpid,
+            nattch: self.nattch,
+        }
+    }
+
+    fn resident_pages(&self) -> u64 {
+        let total_pages = self.size.div_ceil(PhysFrame::SIZE as u64);
+        let limit = total_pages.min(16_384);
+        let mut count = 0u64;
+        for page_idx in 0..limit {
+            if self.object.get_frame(page_idx).is_some() {
+                count += 1;
+            }
+        }
+        count
+    }
+}
+
+struct SysvShmRegistryInner {
+    slots: Vec<Option<SysvShmSegment>>,
+    next_seq: u16,
+    key_map: BTreeMap<i32, usize>,
+}
+
+/// Container-isolated System V shared memory registry (`shmget`, `shmat`,
+/// `shmdt`, `shmctl`, and `/proc/sysvipc/shm`).
+///
+/// # Concurrency contract
+///
+/// Segment metadata lives behind a short, non-awaiting `spin::Mutex` that is
+/// always released before pushing `/proc/sysvipc/shm` snapshots into
+/// [`ProcRegistry`] or dropping removed [`crate::SharedPageObject`]s.
+#[derive(Clone)]
+pub struct SysvShmRegistry {
+    inner: TriompheArc<spin::Mutex<SysvShmRegistryInner>>,
+    proc_registry: ProcRegistry,
+}
+
+impl SysvShmRegistry {
+    pub fn new(proc_registry: ProcRegistry) -> Self {
+        Self {
+            inner: TriompheArc::new(spin::Mutex::new(SysvShmRegistryInner {
+                slots: Vec::new(),
+                next_seq: 0,
+                key_map: BTreeMap::new(),
+            })),
+            proc_registry,
+        }
+    }
+
+    fn find_slot_mut(
+        slots: &mut [Option<SysvShmSegment>],
+        shmid: i32,
+    ) -> Option<(usize, &mut SysvShmSegment)> {
+        if shmid < 0 {
+            return None;
+        }
+        let idx = (shmid & SYSV_SHM_INDEX_MASK) as usize;
+        let seg = slots.get_mut(idx)?.as_mut()?;
+        (seg.shmid == shmid).then_some((idx, seg))
+    }
+
+    fn find_slot(slots: &[Option<SysvShmSegment>], shmid: i32) -> Option<(usize, &SysvShmSegment)> {
+        if shmid < 0 {
+            return None;
+        }
+        let idx = (shmid & SYSV_SHM_INDEX_MASK) as usize;
+        let seg = slots.get(idx)?.as_ref()?;
+        (seg.shmid == shmid).then_some((idx, seg))
+    }
+
+    fn build_proc_snapshot(inner: &SysvShmRegistryInner) -> Vec<(i32, ShmStat, u64, u64)> {
+        inner
+            .slots
+            .iter()
+            .flatten()
+            .map(|seg| {
+                let rss_bytes = seg.resident_pages().saturating_mul(PhysFrame::SIZE as u64);
+                (seg.shmid, seg.to_stat(), rss_bytes, 0)
+            })
+            .collect()
+    }
+
+    pub fn refresh_proc(&self) {
+        let snapshot = {
+            let guard = self.inner.lock();
+            Self::build_proc_snapshot(&guard)
+        };
+        self.proc_registry.set_sysvipc_shm(snapshot);
+    }
+
+    /// `shmget(key, size, shmflg)` (`ipc/shm.c` `ksys_shmget`).
+    pub fn shmget(
+        &self,
+        key: i32,
+        size: u64,
+        shmflg: u32,
+        pid: u32,
+        creds: &Credentials,
+        now_secs: i64,
+    ) -> Result<i32, u64> {
+        let (result, snapshot) = {
+            let mut guard = self.inner.lock();
+            if key != IPC_PRIVATE
+                && let Some(&idx) = guard.key_map.get(&key)
+                && let Some(existing) = guard.slots.get(idx).and_then(Option::as_ref)
+            {
+                if (shmflg & (IPC_CREAT | IPC_EXCL)) == (IPC_CREAT | IPC_EXCL) {
+                    return Err(EEXIST);
+                }
+                if size > existing.size {
+                    return Err(22); // EINVAL
+                }
+                check_ipc_perms(creds, existing.perm, shmflg & 0o777)?;
+                return Ok(existing.shmid);
+            }
+            if key != IPC_PRIVATE && (shmflg & IPC_CREAT) == 0 {
+                return Err(ENOENT);
+            }
+            if !(SHMMIN..=SHMMAX).contains(&size) {
+                return Err(22); // EINVAL
+            }
+            let used = guard.slots.iter().filter(|s| s.is_some()).count() as u64;
+            if used >= SHMMNI {
+                return Err(ENOSPC);
+            }
+            let idx = if let Some(free_idx) = guard.slots.iter().position(Option::is_none) {
+                free_idx
+            } else {
+                let idx = guard.slots.len();
+                guard.slots.push(None);
+                idx
+            };
+            let seq = guard.next_seq & SYSV_SHM_SEQ_MASK;
+            guard.next_seq = guard.next_seq.wrapping_add(1) & SYSV_SHM_SEQ_MASK;
+            let shmid = (i32::from(seq) << SYSV_SHM_SEQ_SHIFT) | (idx as i32);
+            let seg = SysvShmSegment {
+                shmid,
+                perm: ShmPerm {
+                    key,
+                    uid: creds.user.effective,
+                    gid: creds.group.effective,
+                    cuid: creds.user.effective,
+                    cgid: creds.group.effective,
+                    mode: shmflg & 0o777,
+                    seq,
+                },
+                size,
+                atime: 0,
+                dtime: 0,
+                ctime: now_secs,
+                cpid: pid,
+                lpid: 0,
+                nattch: 0,
+                destroyed: false,
+                object: crate::SharedPageObject::new_anonymous(),
+            };
+            guard.slots[idx] = Some(seg);
+            if key != IPC_PRIVATE {
+                guard.key_map.insert(key, idx);
+            }
+            let snapshot = Self::build_proc_snapshot(&guard);
+            (shmid, snapshot)
+        };
+        self.proc_registry.set_sysvipc_shm(snapshot);
+        Ok(result)
+    }
+
+    /// Validates `shmat(2)` permissions and returns segment size in bytes.
+    pub fn prepare_attach(
+        &self,
+        shmid: i32,
+        read_only: bool,
+        exec: bool,
+        creds: &Credentials,
+    ) -> Result<u64, u64> {
+        let guard = self.inner.lock();
+        let Some((_, seg)) = Self::find_slot(&guard.slots, shmid) else {
+            return Err(22); // EINVAL
+        };
+        let mut req = 0o4;
+        if !read_only {
+            req |= 0o2;
+        }
+        if exec {
+            req |= 0o1;
+        }
+        check_ipc_perms(creds, seg.perm, req)?;
+        Ok(seg.size)
+    }
+
+    /// Returns the `UserMemoryPool`-backed [`crate::SharedPageObject`] of `shmid`.
+    pub fn shared_object(&self, shmid: i32) -> Option<crate::SharedPageObject> {
+        let guard = self.inner.lock();
+        Self::find_slot(&guard.slots, shmid).map(|(_, seg)| seg.object.clone())
+    }
+
+    /// Records a completed `shmat(2)` attachment (`shm_nattch += 1`, `atime`, `lpid`).
+    pub fn commit_attach(&self, shmid: i32, pid: u32, now_secs: i64) {
+        let snapshot = {
+            let mut guard = self.inner.lock();
+            if let Some((_, seg)) = Self::find_slot_mut(&mut guard.slots, shmid) {
+                seg.nattch = seg.nattch.saturating_add(1);
+                seg.atime = now_secs;
+                seg.lpid = pid;
+            }
+            Self::build_proc_snapshot(&guard)
+        };
+        self.proc_registry.set_sysvipc_shm(snapshot);
+    }
+
+    /// Increments `shm_nattch` on `fork(2)` without altering `atime` or `lpid`.
+    pub fn fork_attach(&self, shmid: i32) {
+        let snapshot = {
+            let mut guard = self.inner.lock();
+            if let Some((_, seg)) = Self::find_slot_mut(&mut guard.slots, shmid) {
+                seg.nattch = seg.nattch.saturating_add(1);
+            }
+            Self::build_proc_snapshot(&guard)
+        };
+        self.proc_registry.set_sysvipc_shm(snapshot);
+    }
+
+    /// Rolls back [`Self::fork_attach`] if spawning the forked child fails.
+    pub fn fork_rollback(&self, shmid: i32) {
+        let (dropped, snapshot) = {
+            let mut guard = self.inner.lock();
+            let mut dropped = None;
+            if let Some((idx, seg)) = Self::find_slot_mut(&mut guard.slots, shmid) {
+                seg.nattch = seg.nattch.saturating_sub(1);
+                if seg.destroyed && seg.nattch == 0 {
+                    dropped = guard.slots[idx].take();
+                }
+            }
+            (dropped, Self::build_proc_snapshot(&guard))
+        };
+        drop(dropped);
+        self.proc_registry.set_sysvipc_shm(snapshot);
+    }
+
+    /// Detaches one mapping (`shm_nattch -= 1`, `dtime`, `lpid`), immediately
+    /// destroying the segment and reclaiming all frames when `SHM_DEST && nattch == 0`.
+    pub fn detach(&self, shmid: i32, pid: u32, now_secs: i64) {
+        let (dropped, snapshot) = {
+            let mut guard = self.inner.lock();
+            let mut dropped = None;
+            if let Some((idx, seg)) = Self::find_slot_mut(&mut guard.slots, shmid) {
+                seg.nattch = seg.nattch.saturating_sub(1);
+                seg.dtime = now_secs;
+                seg.lpid = pid;
+                if seg.destroyed && seg.nattch == 0 {
+                    dropped = guard.slots[idx].take();
+                }
+            }
+            (dropped, Self::build_proc_snapshot(&guard))
+        };
+        drop(dropped);
+        self.proc_registry.set_sysvipc_shm(snapshot);
+    }
+
+    /// `shmctl(IPC_STAT | SHM_STAT | SHM_STAT_ANY)`.
+    pub fn ctl_stat(
+        &self,
+        id_or_idx: i32,
+        by_index: bool,
+        check_perms: bool,
+        creds: &Credentials,
+    ) -> Result<(i32, ShmStat), u64> {
+        let guard = self.inner.lock();
+        let seg = if by_index {
+            if id_or_idx < 0 {
+                return Err(22); // EINVAL
+            }
+            guard
+                .slots
+                .get(id_or_idx as usize)
+                .and_then(Option::as_ref)
+                .ok_or(22u64)?
+        } else {
+            Self::find_slot(&guard.slots, id_or_idx)
+                .map(|(_, seg)| seg)
+                .ok_or(22u64)?
+        };
+        if check_perms {
+            check_ipc_perms(creds, seg.perm, 0o4)?;
+        }
+        Ok((seg.shmid, seg.to_stat()))
+    }
+
+    /// `shmctl(IPC_SET)`.
+    pub fn ctl_set(
+        &self,
+        shmid: i32,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        creds: &Credentials,
+        now_secs: i64,
+    ) -> Result<(), u64> {
+        let snapshot = {
+            let mut guard = self.inner.lock();
+            let Some((_, seg)) = Self::find_slot_mut(&mut guard.slots, shmid) else {
+                return Err(22); // EINVAL
+            };
+            check_ipc_owner_or_admin(creds, seg.perm)?;
+            seg.perm.uid = uid;
+            seg.perm.gid = gid;
+            seg.perm.mode = (seg.perm.mode & !0o777) | (mode & 0o777);
+            seg.ctime = now_secs;
+            Self::build_proc_snapshot(&guard)
+        };
+        self.proc_registry.set_sysvipc_shm(snapshot);
+        Ok(())
+    }
+
+    /// `shmctl(IPC_RMID)`: marks `SHM_DEST`, unlinks the key, and destroys the
+    /// segment immediately if `shm_nattch == 0`.
+    pub fn ctl_rmid(&self, shmid: i32, creds: &Credentials, now_secs: i64) -> Result<(), u64> {
+        let (dropped, snapshot) = {
+            let mut guard = self.inner.lock();
+            let Some((idx, seg)) = Self::find_slot_mut(&mut guard.slots, shmid) else {
+                return Err(22); // EINVAL
+            };
+            check_ipc_owner_or_admin(creds, seg.perm)?;
+            let key = seg.perm.key;
+            seg.destroyed = true;
+            seg.perm.mode |= SHM_DEST;
+            seg.ctime = now_secs;
+            let should_drop = seg.nattch == 0;
+            if key != IPC_PRIVATE && guard.key_map.get(&key) == Some(&idx) {
+                guard.key_map.remove(&key);
+            }
+            let dropped = if should_drop {
+                guard.slots[idx].take()
+            } else {
+                None
+            };
+            (dropped, Self::build_proc_snapshot(&guard))
+        };
+        drop(dropped);
+        self.proc_registry.set_sysvipc_shm(snapshot);
+        Ok(())
+    }
+
+    /// `shmctl(SHM_LOCK | SHM_UNLOCK)`.
+    pub fn ctl_lock(&self, shmid: i32, lock: bool, creds: &Credentials) -> Result<(), u64> {
+        let snapshot = {
+            let mut guard = self.inner.lock();
+            let Some((_, seg)) = Self::find_slot_mut(&mut guard.slots, shmid) else {
+                return Err(22); // EINVAL
+            };
+            let euid = creds.user.effective;
+            if euid != seg.perm.uid
+                && euid != seg.perm.cuid
+                && !creds.capabilities.has_effective(CAP_IPC_LOCK)
+                && !creds.capabilities.has_effective(CAP_SYS_ADMIN)
+            {
+                return Err(1); // EPERM
+            }
+            if lock {
+                seg.perm.mode |= SHM_LOCKED;
+            } else {
+                seg.perm.mode &= !SHM_LOCKED;
+            }
+            Self::build_proc_snapshot(&guard)
+        };
+        self.proc_registry.set_sysvipc_shm(snapshot);
+        Ok(())
+    }
+
+    /// `shmctl(IPC_INFO | SHM_INFO)`: returns `(max_index, ShmUsageInfo)`.
+    pub fn ctl_info(&self) -> (i32, ShmUsageInfo) {
+        let guard = self.inner.lock();
+        let mut max_index = 0i32;
+        let mut used_ids = 0i32;
+        let mut shm_tot = 0u64;
+        let mut shm_rss = 0u64;
+        for (idx, slot) in guard.slots.iter().enumerate() {
+            if let Some(seg) = slot {
+                max_index = idx as i32;
+                used_ids += 1;
+                shm_tot = shm_tot.saturating_add(seg.size.div_ceil(PhysFrame::SIZE as u64));
+                shm_rss = shm_rss.saturating_add(seg.resident_pages());
+            }
+        }
+        (
+            max_index,
+            ShmUsageInfo {
+                used_ids,
+                shm_tot,
+                shm_rss,
+                shm_swp: 0,
+                swap_attempts: 0,
+                swap_successes: 0,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub fn active_count(&self) -> usize {
+        self.inner.lock().slots.iter().flatten().count()
+    }
+}
+
 /// Container-wide cache of active `MAP_SHARED` file page objects keyed by
 /// `(st_dev, st_ino)`. Entries hold weak references so frames are reclaimed
 /// automatically as soon as the last mapping in the container drops.
 pub struct SharedFileCache {
     entries: spin::Mutex<alloc::collections::BTreeMap<(u64, u64), crate::WeakSharedPageObject>>,
+    memfds: Option<MemfdRegistry>,
+    sysv_shm: Option<SysvShmRegistry>,
 }
 
 impl SharedFileCache {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self {
             entries: spin::Mutex::new(alloc::collections::BTreeMap::new()),
+            memfds: None,
+            sysv_shm: None,
         }
     }
 
-    /// Returns the live [`crate::SharedPageObject`] for `(dev, ino)`, creating
-    /// a fresh file-backed object if no mapping is currently active.
+    pub(crate) fn with_ipc(memfds: MemfdRegistry, sysv_shm: SysvShmRegistry) -> Self {
+        Self {
+            entries: spin::Mutex::new(alloc::collections::BTreeMap::new()),
+            memfds: Some(memfds),
+            sysv_shm: Some(sysv_shm),
+        }
+    }
+
+    /// Returns the live [`crate::SharedPageObject`] for `(dev, ino)`, returning
+    /// the container's `memfd` object directly when `(dev, ino)` names a memfd,
+    /// or creating a fresh file-backed object for a regular file.
     pub fn get_or_create(&self, dev: u64, ino: u64) -> crate::SharedPageObject {
+        if let Some(memfds) = &self.memfds
+            && let Some(obj) = memfds.shared_object(dev, ino)
+        {
+            return obj;
+        }
         let mut guard = self.entries.lock();
         if let Some(weak) = guard.get(&(dev, ino))
             && let Some(live) = weak.upgrade()
@@ -2739,9 +3680,20 @@ impl SharedFileCache {
         obj
     }
 
+    /// Returns the live [`crate::SharedPageObject`] for SysV shared memory
+    /// segment `shmid` inside this container, if any.
+    pub fn get_sysv_shm(&self, shmid: i32) -> Option<crate::SharedPageObject> {
+        self.sysv_shm.as_ref()?.shared_object(shmid)
+    }
+
     /// Returns the live [`crate::SharedPageObject`] for `(dev, ino)` if any
     /// process in the container currently maps it `MAP_SHARED`.
     pub fn get(&self, dev: u64, ino: u64) -> Option<crate::SharedPageObject> {
+        if let Some(memfds) = &self.memfds
+            && let Some(obj) = memfds.shared_object(dev, ino)
+        {
+            return Some(obj);
+        }
         self.entries
             .lock()
             .get(&(dev, ino))
@@ -2784,6 +3736,8 @@ pub struct LinuxContainer<S: Storage> {
     uts: TriompheArc<spin::Mutex<SharedUts>>,
     pids: PidNamespace,
     futex: FutexTable,
+    memfds: MemfdRegistry,
+    sysv_shm: SysvShmRegistry,
     shared_files: SharedFileCache,
 }
 
@@ -2996,6 +3950,9 @@ impl<S: Storage> LinuxContainer<S> {
             &proc_registry,
         );
 
+        let memfds = MemfdRegistry::new(caller_namespace.table().allocate_device());
+        let sysv_shm = SysvShmRegistry::new(proc_registry.clone());
+        let shared_files = SharedFileCache::with_ipc(memfds.clone(), sysv_shm.clone());
         Ok(Self {
             id,
             authority,
@@ -3011,7 +3968,9 @@ impl<S: Storage> LinuxContainer<S> {
             uts,
             pids: PidNamespace::new(),
             futex: FutexTable::new(),
-            shared_files: SharedFileCache::new(),
+            memfds,
+            sysv_shm,
+            shared_files,
         })
     }
 
@@ -3114,6 +4073,9 @@ impl<S: Storage> LinuxContainer<S> {
         let proc_registry =
             ProcRegistry::new(uts.clone(), crate::online_processor_count().max(1) as u32);
         attach_default_pseudo_mounts(&mut mounts, namespace, &authority, &ptys, &proc_registry);
+        let memfds = MemfdRegistry::new(namespace.table().allocate_device());
+        let sysv_shm = SysvShmRegistry::new(proc_registry.clone());
+        let shared_files = SharedFileCache::with_ipc(memfds.clone(), sysv_shm.clone());
         Self {
             id,
             authority,
@@ -3129,7 +4091,9 @@ impl<S: Storage> LinuxContainer<S> {
             uts,
             pids: PidNamespace::new(),
             futex: FutexTable::new(),
-            shared_files: SharedFileCache::new(),
+            memfds,
+            sysv_shm,
+            shared_files,
         }
     }
 
@@ -3213,6 +4177,9 @@ impl<S: Storage> LinuxContainer<S> {
         let proc_registry =
             ProcRegistry::new(uts.clone(), crate::online_processor_count().max(1) as u32);
         attach_default_pseudo_mounts(&mut mounts, namespace, &authority, &ptys, &proc_registry);
+        let memfds = MemfdRegistry::new(namespace.table().allocate_device());
+        let sysv_shm = SysvShmRegistry::new(proc_registry.clone());
+        let shared_files = SharedFileCache::with_ipc(memfds.clone(), sysv_shm.clone());
         Ok(Self {
             id,
             authority,
@@ -3228,7 +4195,9 @@ impl<S: Storage> LinuxContainer<S> {
             uts,
             pids: PidNamespace::new(),
             futex: FutexTable::new(),
-            shared_files: SharedFileCache::new(),
+            memfds,
+            sysv_shm,
+            shared_files,
         })
     }
 
@@ -3239,6 +4208,16 @@ impl<S: Storage> LinuxContainer<S> {
     /// Container-wide page cache for coherent file-backed `MAP_SHARED` mappings.
     pub fn shared_files(&self) -> &SharedFileCache {
         &self.shared_files
+    }
+
+    /// Container-isolated `memfd_create(2)` registry.
+    pub fn memfds(&self) -> &MemfdRegistry {
+        &self.memfds
+    }
+
+    /// Container-isolated SysV shared memory registry.
+    pub fn sysv_shm(&self) -> &SysvShmRegistry {
+        &self.sysv_shm
     }
 
     /// The authority ceiling of every process running in this container.
@@ -9138,5 +10117,305 @@ mod private_btrfs_tests {
             let pci_devs = fs_a.list("/sys/bus/pci/devices").await.unwrap();
             assert!(pci_devs.is_empty());
         });
+    }
+
+    fn ensure_test_user_pool() {
+        const POOL_BYTES: usize = 4 * 1024 * 1024;
+        if crate::memory::installed_user_memory_pool().is_some() {
+            return;
+        }
+        let layout = alloc::alloc::Layout::from_size_align(POOL_BYTES, PhysFrame::SIZE)
+            .expect("test user pool layout");
+        // SAFETY: non-zero aligned allocation leaked for the test process lifetime.
+        let base = unsafe { alloc::alloc::alloc_zeroed(layout) } as usize;
+        assert!(base != 0, "test user pool backing");
+        crate::memory::install_user_memory_pool(crate::memory::UserMemoryPool::single_node(
+            1,
+            &[(base, base + POOL_BYTES)],
+        ));
+    }
+
+    #[test]
+    fn memfd_shared_page_coherence_seals_reopen_and_reclamation() {
+        use super::tests::test_namespace;
+        ensure_test_user_pool();
+        let pool = crate::memory::installed_user_memory_pool().unwrap();
+        let avail_before = pool.stats().available_bytes();
+        let host_ns = test_namespace();
+        let container = LinuxContainer::ephemeral(
+            ContainerId::new(NonZeroU64::new(301).unwrap()),
+            ProcessAuthority::empty(),
+            &host_ns,
+        );
+        let memfds = container.memfds();
+        let creds = Credentials::for_ids(1000, 1000, Vec::new());
+
+        // CJK name covers Chinese, Japanese, and Korean.
+        let (id, path, handle) = memfds.create(
+            "中文 日本語 한국어",
+            helios_linux::syscall::MFD_ALLOW_SEALING | helios_linux::syscall::MFD_NOEXEC_SEAL,
+            &creds,
+            100,
+        );
+        assert_eq!(path, "/memfd:中文 日本語 한국어 (deleted)");
+        assert_eq!(memfds.active_count(), 1);
+        assert_eq!(memfds.get_seals(id), Some(helios_unix::F_SEAL_EXEC));
+
+        let hold1 = handle.acquire_hold();
+        let stat = memfds.stat(id).unwrap();
+        assert_eq!(stat.permissions, 0o666);
+        assert_eq!(stat.size, 0);
+
+        // Write through MemfdRegistry and observe the exact same bytes through
+        // the backing SharedPageObject (shared with MAP_SHARED VMAs).
+        let payload = b"memfd coherence: \xe4\xb8\xad\xe6\x96\x87 \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e \xed\x95\x9c\xea\xb5\xad\xec\x96\xb4";
+        memfds
+            .write_at(id, WritePosition::At(0), payload, 101)
+            .unwrap();
+        let obj = container.shared_files().get_or_create(stat.dev, stat.ino);
+        assert!(obj.get_frame(0).is_some(), "page 0 resident after write");
+        let mut via_obj = vec![0u8; payload.len()];
+        obj.overlay_file_read(0, &mut via_obj);
+        assert_eq!(&via_obj, payload);
+
+        // Mutating the shared object directly is immediately visible via read_at.
+        obj.apply_file_write(0, b"M");
+        let read_back = memfds.read_at(id, 0, payload.len()).unwrap();
+        assert_eq!(read_back[0], b'M');
+        assert_eq!(&read_back[1..], &payload[1..]);
+
+        // F_SEAL_EXEC blocks chmod changes to executable bits while allowing
+        // non-exec mode changes.
+        assert!(matches!(
+            memfds.chmod(id, 0o755, &creds, 102),
+            Err(FsOpError::PermissionDenied)
+        ));
+        memfds.chmod(id, 0o640, &creds, 103).unwrap();
+        assert_eq!(memfds.stat(id).unwrap().permissions, 0o640);
+
+        // F_SEAL_WRITE returns EBUSY while a writable MAP_SHARED hold exists,
+        // and succeeds once that mapping drops.
+        let write_map = handle.acquire_writable_map();
+        assert!(matches!(
+            memfds.add_seals(id, helios_unix::F_SEAL_WRITE),
+            Err(FsOpError::Fs(FsError::Busy))
+        ));
+        // F_SEAL_FUTURE_WRITE succeeds even with an existing writable map.
+        memfds
+            .add_seals(id, helios_unix::F_SEAL_FUTURE_WRITE)
+            .unwrap();
+        assert!(matches!(
+            memfds.write_at(id, WritePosition::At(0), b"x", 104),
+            Err(FsOpError::PermissionDenied)
+        ));
+        drop(write_map);
+        memfds.add_seals(id, helios_unix::F_SEAL_WRITE).unwrap();
+
+        // F_SEAL_SHRINK / F_SEAL_GROW enforcement on set_size.
+        memfds.add_seals(id, helios_unix::F_SEAL_SHRINK).unwrap();
+        assert!(matches!(
+            memfds.set_size(id, 4, 105),
+            Err(FsOpError::PermissionDenied)
+        ));
+        memfds.set_size(id, 8192, 106).unwrap();
+        memfds.add_seals(id, helios_unix::F_SEAL_GROW).unwrap();
+        assert!(matches!(
+            memfds.set_size(id, 16384, 107),
+            Err(FsOpError::PermissionDenied)
+        ));
+
+        // Cross-process /proc/<pid>/fd/<n> lookup and reopen share the same inode.
+        memfds.set_process_fds(7, vec![(3, stat.ino)]);
+        assert_eq!(memfds.lookup_process_fd(7, 3), Some(id));
+        let req_ro = OpenRequest {
+            read: true,
+            write: false,
+            create: false,
+            exclusive: false,
+            truncate: false,
+            directory: false,
+            nofollow: false,
+            path_only: false,
+            append: false,
+            sync: false,
+            dsync: false,
+            nonblock: false,
+            noctty: false,
+            mode: 0,
+            umask: 0,
+        };
+        let (reopened_id, reopened_path, reopened_handle) =
+            memfds.reopen(id, req_ro, &creds, 108).unwrap();
+        assert_eq!(reopened_id, id);
+        assert_eq!(reopened_path, path);
+        let hold2 = reopened_handle.acquire_hold();
+
+        // F_SEAL_SEAL permanently freezes seals.
+        memfds.add_seals(id, helios_unix::F_SEAL_SEAL).unwrap();
+        assert!(matches!(
+            memfds.add_seals(id, helios_unix::F_SEAL_EXEC),
+            Err(FsOpError::PermissionDenied)
+        ));
+
+        // Dropping all holds + reaping removes the inode and drops its SharedPageObject,
+        // returning every allocated page back to UserMemoryPool.
+        drop(obj);
+        drop(hold1);
+        memfds.reap_unreferenced();
+        assert_eq!(memfds.active_count(), 1);
+        assert!(pool.stats().available_bytes() < avail_before);
+        drop(hold2);
+        memfds.remove_process_fds(7);
+        memfds.reap_unreferenced();
+        assert_eq!(memfds.active_count(), 0);
+        assert!(memfds.stat(id).is_err());
+        assert_eq!(pool.stats().available_bytes(), avail_before);
+    }
+
+    #[test]
+    fn sysv_shm_container_isolation_proc_sysvipc_and_frame_reclamation() {
+        use super::tests::test_namespace;
+        ensure_test_user_pool();
+        let pool = crate::memory::installed_user_memory_pool().unwrap();
+        let avail_before = pool.stats().available_bytes();
+        let host_ns = test_namespace();
+        let container_a = LinuxContainer::ephemeral(
+            ContainerId::new(NonZeroU64::new(302).unwrap()),
+            ProcessAuthority::empty(),
+            &host_ns,
+        );
+        let container_b = LinuxContainer::ephemeral(
+            ContainerId::new(NonZeroU64::new(303).unwrap()),
+            ProcessAuthority::empty(),
+            &host_ns,
+        );
+        let creds = Credentials::for_ids(1000, 1000, Vec::new());
+
+        let key = 0x1234_5678;
+        let shmid_a = container_a
+            .sysv_shm()
+            .shmget(
+                key,
+                8192,
+                helios_linux::syscall::IPC_CREAT | helios_linux::syscall::IPC_EXCL | 0o600,
+                10,
+                &creds,
+                1000,
+            )
+            .unwrap();
+        // Container B can allocate the exact same key independently.
+        let shmid_b = container_b
+            .sysv_shm()
+            .shmget(
+                key,
+                12288,
+                helios_linux::syscall::IPC_CREAT | helios_linux::syscall::IPC_EXCL | 0o600,
+                20,
+                &creds,
+                1001,
+            )
+            .unwrap();
+
+        // Attach in Container A, fault a page into its SharedPageObject, and verify
+        // coherence through SharedFileCache::get_sysv_shm.
+        let seg_size = container_a
+            .sysv_shm()
+            .prepare_attach(shmid_a, false, false, &creds)
+            .unwrap();
+        assert_eq!(seg_size, 8192);
+        let obj_a = container_a
+            .shared_files()
+            .get_sysv_shm(shmid_a)
+            .expect("SysV shm SharedPageObject");
+        let frame_a = obj_a.get_or_alloc_frame(0).unwrap();
+        obj_a.apply_file_write(0, b"SHMA");
+        let mut check_a = [0u8; 4];
+        obj_a.overlay_file_read(0, &mut check_a);
+        assert_eq!(&check_a, b"SHMA");
+        container_a.sysv_shm().commit_attach(shmid_a, 10, 1002);
+
+        // Container B's object is completely separate.
+        let obj_b = container_b
+            .shared_files()
+            .get_sysv_shm(shmid_b)
+            .expect("Container B SharedPageObject");
+        assert!(obj_b.get_frame(0).is_none());
+
+        // /proc/sysvipc/shm exposes only each container's own segments.
+        block_on(async {
+            container_a.sysv_shm().refresh_proc();
+            container_b.sysv_shm().refresh_proc();
+            let proc_a = String::from_utf8(
+                container_a
+                    .filesystem()
+                    .read_at("/proc/sysvipc/shm", 0, 4096)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            let proc_b = String::from_utf8(
+                container_b
+                    .filesystem()
+                    .read_at("/proc/sysvipc/shm", 0, 4096)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(proc_a.contains("key      shmid perms"));
+            assert!(proc_a.contains("8192"));
+            assert!(proc_a.contains("4096"));
+            assert!(!proc_a.contains("12288"));
+            assert!(proc_b.contains("12288"));
+            assert!(!proc_b.contains("8192"));
+        });
+
+        // IPC_RMID unlinks the key immediately while keeping the attached segment
+        // alive until the final detach.
+        container_a
+            .sysv_shm()
+            .ctl_rmid(shmid_a, &creds, 1003)
+            .unwrap();
+        assert_eq!(
+            container_a
+                .sysv_shm()
+                .shmget(key, 8192, 0o600, 10, &creds, 1004),
+            Err(ENOENT)
+        );
+        let (_, stat) = container_a
+            .sysv_shm()
+            .ctl_stat(shmid_a, false, true, &creds)
+            .unwrap();
+        assert_eq!(stat.nattch, 1);
+        assert_ne!(stat.perm.mode & helios_linux::syscall::SHM_DEST, 0);
+
+        // Fork increments nattch to 2; detaching once leaves it alive; detaching
+        // the second time destroys it immediately.
+        container_a.sysv_shm().fork_attach(shmid_a);
+        container_a.sysv_shm().detach(shmid_a, 11, 1005);
+        assert_eq!(
+            container_a
+                .sysv_shm()
+                .ctl_stat(shmid_a, false, true, &creds)
+                .unwrap()
+                .1
+                .nattch,
+            1
+        );
+        drop(frame_a);
+        drop(obj_a);
+        container_a.sysv_shm().detach(shmid_a, 10, 1006);
+        assert!(
+            container_a
+                .sysv_shm()
+                .ctl_stat(shmid_a, false, true, &creds)
+                .is_err()
+        );
+        assert!(container_a.sysv_shm().shared_object(shmid_a).is_none());
+        let (_, info) = container_a.sysv_shm().ctl_info();
+        assert_eq!(info.used_ids, 0);
+        assert_eq!(info.shm_tot, 0);
+        assert_eq!(pool.stats().available_bytes(), avail_before);
     }
 }
