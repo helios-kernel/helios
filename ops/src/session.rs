@@ -85,7 +85,7 @@ impl SessionOptions {
             None => None,
         };
         let security =
-            if let Some(profile) = identity.as_ref().filter(|p| p.secret_key_hex.is_some()) {
+            if let Some(profile) = identity.as_ref().filter(|p| p.has_client_credentials()) {
                 profile.to_security_mode()?
             } else if (identity_arg.is_some() || allow_ambient_auth)
                 && let Ok(key_path) = std::env::var("HELIOS_INSPECTOR_CLIENT_KEY")
