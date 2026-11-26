@@ -845,6 +845,52 @@ where
     fn packet_close(&self, socket: u64) {
         NetworkService::packet_close(self, socket);
     }
+
+    fn icmp_open(&self, ipv6: bool, is_raw: bool) -> Result<(u64, u16), UdpError> {
+        NetworkService::icmp_open(self, ipv6, is_raw)
+    }
+
+    fn icmp_bind(&self, socket: u64, requested_id: u16) -> Result<u16, UdpError> {
+        NetworkService::icmp_bind(self, socket, requested_id)
+    }
+
+    async fn icmp_send<'a>(
+        &'a self,
+        socket: u64,
+        destination: NetworkIpAddress,
+        identifier: u16,
+        sequence: u16,
+        payload: &'a [u8],
+        hop_limit: u8,
+    ) -> Result<(), UdpError> {
+        NetworkService::icmp_send(
+            self,
+            socket,
+            destination,
+            identifier,
+            sequence,
+            payload,
+            hop_limit,
+        )
+        .await
+    }
+
+    async fn icmp_receive(
+        &self,
+        socket: u64,
+        timeout_nanos: u64,
+        peek: bool,
+    ) -> Result<Option<crate::IcmpEchoDatagram>, UdpError> {
+        NetworkService::icmp_receive(self, socket, timeout_nanos, peek).await
+    }
+
+    async fn icmp_readiness(&self, socket: u64) -> Result<SocketReadiness, UdpError> {
+        NetworkService::icmp_readiness(self, socket).await
+    }
+
+    fn icmp_close(&self, socket: u64) {
+        NetworkService::icmp_close(self, socket);
+    }
 }
 
 impl<CpuImpl, DeviceImpl> NetworkAdminBackend for NetworkService<CpuImpl, DeviceImpl>

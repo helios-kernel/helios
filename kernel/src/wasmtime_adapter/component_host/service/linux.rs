@@ -30,10 +30,11 @@
 
 use super::*;
 use crate::{
-    ComponentFsNodeKind, Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route, LinkSourceCap,
-    MulticastCap, NetworkAdminCap, NetworkControlError, NetworkPortId, PrivilegedBindCap,
-    SetWallClockCap, SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights,
-    TerminalInputCap, TerminalOutputCap, TtyControlCap, UdpCap,
+    ComponentFsNodeKind, DiagnosticsControlCap, Ipv4Cidr as KernelIpv4Cidr,
+    Ipv4Route as KernelIpv4Route, LinkSourceCap, MulticastCap, NetworkAdminCap,
+    NetworkControlError, NetworkPortId, PrivilegedBindCap, SetWallClockCap, SymlinkCreateCap,
+    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap,
+    TraceReadCap, TtyControlCap, UdpCap,
 };
 use core::num::NonZeroU32;
 use core::ops::ControlFlow;
@@ -256,6 +257,8 @@ struct LinuxGrants {
     privileged_bind: Option<PrivilegedBindCap>,
     multicast: Option<MulticastCap>,
     network_admin: Option<NetworkAdminCap>,
+    trace_read: Option<TraceReadCap>,
+    diagnostics_control: Option<DiagnosticsControlCap>,
 }
 
 impl LinuxGrants {
@@ -273,6 +276,8 @@ impl LinuxGrants {
             privileged_bind: authority.derive_privileged_bind_cap().ok(),
             multicast: authority.derive_multicast_cap().ok(),
             network_admin: authority.derive_network_admin_cap().ok(),
+            trace_read: authority.derive_trace_read_cap().ok(),
+            diagnostics_control: authority.derive_diagnostics_control_cap().ok(),
         }
     }
 }
@@ -713,6 +718,16 @@ where
     /// Summed user-slice ticks across every thread of the process
     /// (`CLOCK_PROCESS_CPUTIME_ID`).
     process_cpu_ticks: AtomicU64,
+    /// Summed kernel syscall ticks across every thread of the process
+    /// (`times(2)` `tms_stime` and `getrusage(2)` `ru_stime`).
+    process_sys_ticks: AtomicU64,
+    /// High-water mark of mapped user address space in KiB (`ru_maxrss`).
+    peak_rss_kib: AtomicU64,
+    /// Cursor of the last syslog trace event consumed by `SYSLOG_ACTION_READ`.
+    syslog_cursor: spin::Mutex<u64>,
+    /// Minimum trace timestamp admitted after `SYSLOG_ACTION_CLEAR` /
+    /// `SYSLOG_ACTION_READ_CLEAR`.
+    syslog_clear_after: AtomicU64,
     /// First host-level failure (user memory exhaustion or instance kill)
     /// observed on any thread of the process.
     fatal_error: spin::Mutex<Option<ProgramExecError>>,
@@ -798,6 +813,42 @@ where
     }
 }
 
+impl<CpuImpl, Net, StorageImpl, Space: UserSpace> LinuxShared<CpuImpl, Net, StorageImpl, Space>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn current_rss_kib(&self) -> u64 {
+        let mut cursor = self.user.start.raw() as u64;
+        let end = self.user.end().raw() as u64;
+        let mut bytes = 0u64;
+        while cursor < end {
+            let range = page_range(cursor, end - cursor);
+            let Some(mapping) = self.space.mapping(range) else {
+                break;
+            };
+            bytes = bytes.saturating_add(mapping.range.byte_len as u64);
+            let next = mapping.range.end().raw() as u64;
+            if next <= cursor {
+                break;
+            }
+            cursor = next;
+        }
+        let kib = bytes.div_ceil(1024);
+        self.peak_rss_kib.fetch_max(kib, Ordering::Relaxed).max(kib)
+    }
+
+    fn snapshot_usage(&self) -> syscall::CpuUsage {
+        let tb = self.cpu.timebase();
+        syscall::CpuUsage {
+            user_nanos: tb.ticks_to_nanos(self.process_cpu_ticks.load(Ordering::Relaxed)),
+            sys_nanos: tb.ticks_to_nanos(self.process_sys_ticks.load(Ordering::Relaxed)),
+            max_rss_kib: self.current_rss_kib(),
+        }
+    }
+}
+
 /// Decrements [`LinuxShared::running_tasks`] after a spawned thread task has
 /// finished [`drive_linux_thread`] and dropped its `Process`, `UserContext`
 /// and `LinuxThreadPlatform`.
@@ -833,6 +884,7 @@ where
     shared: Arc<LinuxShared<CpuImpl, Net, StorageImpl, Space>>,
     entropy: crate::EntropyPool,
     thread_cpu_ticks: u64,
+    thread_sys_ticks: u64,
 }
 
 impl<CpuImpl, Net, StorageImpl, Space> LinuxThreadPlatform<CpuImpl, Net, StorageImpl, Space>
@@ -849,7 +901,93 @@ where
             shared,
             entropy,
             thread_cpu_ticks: 0,
+            thread_sys_ticks: 0,
         }
+    }
+
+    fn recent_syslog_events(&self) -> Vec<triomphe::Arc<crate::TraceEvent>> {
+        let filter = crate::TraceFilter {
+            min_level: None,
+            target_prefixes: crate::PrefixSet::from_prefixes(core::iter::empty())
+                .expect("empty prefix set fits"),
+        };
+        if self.shared.grants.diagnostics_control.is_some() {
+            return self
+                .shared
+                .runtime_state
+                .recent(&crate::MachineObservation, &filter, 256);
+        }
+        let Some(cap) = self.shared.grants.trace_read.as_ref() else {
+            return Vec::new();
+        };
+        match cap.scope() {
+            crate::AuthorityScope::Own => self.shared.runtime_state.recent(
+                &crate::OwnInstance::new(self.shared.launched_instance.id()),
+                &filter,
+                256,
+            ),
+            crate::AuthorityScope::Subtree(root) => self.shared.runtime_state.recent(
+                &crate::SubtreeObservation::new(
+                    root,
+                    self.shared
+                        .exec_runtime
+                        .exec_context
+                        .instance_registry
+                        .clone(),
+                ),
+                &filter,
+                256,
+            ),
+            crate::AuthorityScope::Machine => {
+                self.shared
+                    .runtime_state
+                    .recent(&crate::MachineObservation, &filter, 256)
+            }
+        }
+    }
+
+    fn format_syslog_events(&self, min_ts: u64, max_len: usize) -> (Vec<u8>, Option<u64>) {
+        use core::fmt::Write as _;
+        let events = self.recent_syslog_events();
+        let mut out = String::new();
+        let mut last_ts = None;
+        for event in events {
+            if event.timestamp <= min_ts {
+                continue;
+            }
+            let level = match event.level {
+                crate::TraceLevel::Error => 3,
+                crate::TraceLevel::Warn => 4,
+                crate::TraceLevel::Info => 6,
+                crate::TraceLevel::Debug | crate::TraceLevel::Trace => 7,
+            };
+            let secs = event.timestamp / 1_000_000_000;
+            let usecs = (event.timestamp % 1_000_000_000) / 1_000;
+            let mut line = String::new();
+            let _ = write!(line, "<{level}>[{secs:5}.{usecs:06}] {}:", event.target);
+            for field in &event.fields {
+                let _ = match &field.value {
+                    crate::TraceValue::Boolean(v) => write!(line, " {}={v}", field.key),
+                    crate::TraceValue::Signed64(v) => write!(line, " {}={v}", field.key),
+                    crate::TraceValue::Unsigned64(v) => write!(line, " {}={v}", field.key),
+                    crate::TraceValue::Float64(v) => write!(line, " {}={v}", field.key),
+                    crate::TraceValue::Text(v) => write!(line, " {}={v}", field.key),
+                    crate::TraceValue::Blob(v) => write!(line, " {}=<{}B>", field.key, v.len()),
+                };
+            }
+            line.push('\n');
+            if out.len().saturating_add(line.len()) > max_len {
+                if out.is_empty() && max_len > 0 {
+                    let cut = line.floor_char_boundary(max_len);
+                    out.push_str(&line[..cut]);
+                    last_ts = Some(event.timestamp);
+                }
+                break;
+            }
+            out.push_str(&line);
+            last_ts = Some(event.timestamp);
+        }
+        (out.into_bytes(), last_ts)
     }
 }
 
@@ -1192,6 +1330,93 @@ fn container_info_to_stat(info: &crate::ContainerNodeInfo) -> FileStat {
     }
 }
 
+fn synthetic_tmpfs_stat(read_only: bool) -> syscall::FsStat {
+    let machine = crate::machine_memory();
+    let total_blocks = (machine.usable_bytes as u64) / 4096;
+    let free_blocks = if read_only {
+        0
+    } else {
+        (machine.free_bytes as u64) / 4096
+    };
+    let mut flags = syscall::ST_VALID | syscall::ST_NOSUID | syscall::ST_NODEV;
+    if read_only {
+        flags |= syscall::ST_RDONLY;
+    }
+    syscall::FsStat {
+        f_type: syscall::TMPFS_MAGIC,
+        f_bsize: 4096,
+        f_blocks: total_blocks.max(1),
+        f_bfree: free_blocks,
+        f_bavail: free_blocks,
+        f_files: 65_536,
+        f_ffree: if read_only { 0 } else { 65_500 },
+        f_fsid: [0x4845_4c49, 0x4f53_544d],
+        f_namelen: 255,
+        f_frsize: 4096,
+        f_flags: flags,
+    }
+}
+
+fn container_resolved_fs_stat<S: crate::Storage>(
+    resolved: &crate::ContainerResolved<'_, S>,
+) -> syscall::FsStat {
+    let f_type = match resolved.fs().kind_name() {
+        "btrfs" => syscall::BTRFS_SUPER_MAGIC,
+        "memory" => syscall::TMPFS_MAGIC,
+        "erofs" | "boot" => syscall::EROFS_SUPER_MAGIC_V1,
+        "host" => syscall::V9FS_MAGIC,
+        "overlay" | "root" => syscall::OVERLAYFS_SUPER_MAGIC,
+        "proc" => syscall::PROC_SUPER_MAGIC,
+        "sysfs" => syscall::SYSFS_MAGIC,
+        _ => syscall::TMPFS_MAGIC,
+    };
+    let read_only = !resolved
+        .authority_rights()
+        .contains(crate::DirectoryAuthorityRights::WRITE)
+        || resolved.flags().contains(crate::MountFlags::READ_ONLY);
+    let mut flags = syscall::ST_VALID;
+    if read_only {
+        flags |= syscall::ST_RDONLY;
+    }
+    if resolved.flags().contains(crate::MountFlags::NO_SUID) {
+        flags |= syscall::ST_NOSUID;
+    }
+    if resolved.flags().contains(crate::MountFlags::NO_DEV) {
+        flags |= syscall::ST_NODEV;
+    }
+    if !resolved
+        .authority_rights()
+        .contains(crate::DirectoryAuthorityRights::EXECUTE)
+    {
+        flags |= syscall::ST_NOEXEC;
+    }
+    let machine = crate::machine_memory();
+    let total_blocks = ((machine.usable_bytes as u64) / 4096).max(1);
+    let free_blocks = if read_only {
+        0
+    } else {
+        (machine.free_bytes as u64) / 4096
+    };
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in resolved.mount_point().as_bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    syscall::FsStat {
+        f_type,
+        f_bsize: 4096,
+        f_blocks: total_blocks,
+        f_bfree: free_blocks,
+        f_bavail: free_blocks,
+        f_files: 65_536,
+        f_ffree: if read_only { 0 } else { 65_500 },
+        f_fsid: [hash as i32, (hash >> 32) as i32],
+        f_namelen: 255,
+        f_frsize: 4096,
+        f_flags: flags,
+    }
+}
+
 impl<CpuImpl, Net, StorageImpl, Space: UserSpace> Tty
     for LinuxThreadPlatform<CpuImpl, Net, StorageImpl, Space>
 where
@@ -1287,6 +1512,95 @@ where
         match (a.identity, b.identity) {
             (Some(ia), Some(ib)) => ia == ib,
             _ => a.path == b.path,
+        }
+    }
+
+    fn file_lock_key(&self, file: &FsDescriptor) -> Option<helios_unix::FileLockKey> {
+        if let Some(id) = file.identity {
+            Some(helios_unix::FileLockKey {
+                dev: id.domain().raw(),
+                ino: id.local(),
+            })
+        } else {
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for &b in file.path.as_bytes() {
+                hash ^= u64::from(b);
+                hash = hash.wrapping_mul(0x0100_0000_01b3);
+            }
+            Some(helios_unix::FileLockKey {
+                dev: u64::MAX,
+                ino: hash,
+            })
+        }
+    }
+
+    async fn statfs_path(
+        &self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        creds: &syscall::Credentials,
+    ) -> Result<syscall::FsStat, syscall::FsOpError> {
+        let effective_cwd = match base {
+            Some(dir) => dir.path.as_str(),
+            None => cwd,
+        };
+        let fs = self.shared.container.filesystem();
+        match fs.walk_path_for(effective_cwd, path, true, creds).await {
+            Ok((resolved, _)) => Ok(container_resolved_fs_stat(&resolved)),
+            Err(syscall::FsOpError::Fs(FsError::NoEntry)) => {
+                let servers = self
+                    .shared
+                    .runtime_state
+                    .network_service()
+                    .map(|service| service.dns_servers())
+                    .unwrap_or_default();
+                if synthetic_etc_stat_lookup(&self.shared.container, effective_cwd, path, &servers)
+                    .is_ok()
+                {
+                    Ok(synthetic_tmpfs_stat(true))
+                } else {
+                    Err(syscall::FsOpError::Fs(FsError::NoEntry))
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn statfs_file(
+        &self,
+        file: &FsDescriptor,
+    ) -> Result<syscall::FsStat, syscall::FsOpError> {
+        let fs = self.shared.container.filesystem();
+        match fs.resolve(&file.path) {
+            Ok(resolved) => Ok(container_resolved_fs_stat(&resolved)),
+            Err(_) => Ok(synthetic_tmpfs_stat(
+                !file.flags.contains(FsDescriptorFlags::WRITE),
+            )),
+        }
+    }
+
+    async fn sync_all(&self) -> Result<(), syscall::FsOpError> {
+        let fs = self.shared.container.filesystem();
+        for mount in fs.mounts() {
+            if mount
+                .authority_rights()
+                .contains(crate::DirectoryAuthorityRights::WRITE)
+                && !mount.flags().contains(crate::MountFlags::READ_ONLY)
+            {
+                let _ = fs.sync(mount.target(), false).await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn sync_fs(&self, file: &FsDescriptor) -> Result<(), syscall::FsOpError> {
+        let fs = self.shared.container.filesystem();
+        match fs.sync(&file.path, false).await {
+            Ok(()) | Err(syscall::FsOpError::Fs(FsError::ReadOnly | FsError::Unsupported)) => {
+                Ok(())
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -2029,6 +2343,95 @@ where
             .cpu
             .timebase()
             .ticks_to_nanos(self.shared.process_cpu_ticks.load(Ordering::Relaxed))
+    }
+
+    fn thread_sys_nanos(&self) -> u64 {
+        self.shared
+            .cpu
+            .timebase()
+            .ticks_to_nanos(self.thread_sys_ticks)
+    }
+
+    fn process_sys_nanos(&self) -> u64 {
+        self.shared
+            .cpu
+            .timebase()
+            .ticks_to_nanos(self.shared.process_sys_ticks.load(Ordering::Relaxed))
+    }
+
+    fn max_rss_kib(&self) -> u64 {
+        self.shared.current_rss_kib()
+    }
+
+    fn syslog_check_authority(&self) -> Result<(), Denied> {
+        if self.shared.grants.trace_read.is_some()
+            || self.shared.grants.diagnostics_control.is_some()
+        {
+            Ok(())
+        } else {
+            Err(Denied)
+        }
+    }
+
+    fn syslog_buffer_size(&self) -> usize {
+        65_536
+    }
+
+    fn syslog_unread_size(&self) -> usize {
+        let min_ts = self
+            .shared
+            .syslog_clear_after
+            .load(Ordering::Relaxed)
+            .max(*self.shared.syslog_cursor.lock());
+        self.format_syslog_events(min_ts, usize::MAX).0.len()
+    }
+
+    fn syslog_read(&mut self, all: bool, clear: bool, max_bytes: usize) -> Result<Vec<u8>, Denied> {
+        if clear {
+            if self.shared.grants.diagnostics_control.is_none() {
+                return Err(Denied);
+            }
+        } else {
+            self.syslog_check_authority()?;
+        }
+        let clear_after = self.shared.syslog_clear_after.load(Ordering::Relaxed);
+        let min_ts = if all {
+            clear_after
+        } else {
+            clear_after.max(*self.shared.syslog_cursor.lock())
+        };
+        let (bytes, last_ts) = self.format_syslog_events(min_ts, max_bytes);
+        if let Some(ts) = last_ts {
+            if !all {
+                let mut cursor = self.shared.syslog_cursor.lock();
+                if ts > *cursor {
+                    *cursor = ts;
+                }
+            }
+            if clear {
+                self.shared
+                    .syslog_clear_after
+                    .fetch_max(ts, Ordering::Relaxed);
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn syslog_clear(&mut self) -> Result<(), Denied> {
+        if self.shared.grants.diagnostics_control.is_none() {
+            return Err(Denied);
+        }
+        let (_, last_ts) = self.format_syslog_events(0, usize::MAX);
+        if let Some(ts) = last_ts {
+            self.shared
+                .syslog_clear_after
+                .fetch_max(ts, Ordering::Relaxed);
+            let mut cursor = self.shared.syslog_cursor.lock();
+            if ts > *cursor {
+                *cursor = ts;
+            }
+        }
+        Ok(())
     }
 
     fn processor_count(&self) -> u32 {
@@ -2916,6 +3319,126 @@ where
         })
     }
 
+    fn check_icmp_open(&self, is_raw: bool) -> Result<(), u64> {
+        const EPERM: u64 = 1;
+        const EACCES: u64 = 13;
+        if is_raw {
+            if self.shared.grants.network_admin.is_none() {
+                return Err(EPERM);
+            }
+        } else if self.shared.grants.udp.is_none() {
+            return Err(EACCES);
+        }
+        if self.shared.runtime_state.network_service().is_none() {
+            return Err(syscall::ENETDOWN);
+        }
+        Ok(())
+    }
+
+    fn icmp_open(
+        &self,
+        family: helios_unix::SocketFamily,
+        is_raw: bool,
+    ) -> Result<
+        (
+            Arc<helios_unix::OwnedIcmpSocket<crate::UnixNetwork<Net>>>,
+            u16,
+        ),
+        u64,
+    > {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let ipv6 = family == helios_unix::SocketFamily::Ipv6;
+        let (id, local_id) = service
+            .icmp_open(ipv6, is_raw)
+            .map_err(linux_errno_from_udp_error)?;
+        Ok((
+            helios_unix::OwnedIcmpSocket::new(crate::UnixNetwork::new(service), id),
+            local_id,
+        ))
+    }
+
+    fn icmp_bind(&self, socket: u64, requested_id: u16) -> Result<u16, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .icmp_bind(socket, requested_id)
+            .map_err(linux_errno_from_udp_error)
+    }
+
+    async fn icmp_send<'a>(
+        &'a self,
+        socket: u64,
+        destination: syscall::IpAddr,
+        identifier: u16,
+        sequence: u16,
+        payload: &'a [u8],
+        hop_limit: u8,
+    ) -> Result<(), u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .icmp_send(
+                socket,
+                linux_to_network_ip(destination),
+                identifier,
+                sequence,
+                payload,
+                hop_limit,
+            )
+            .await
+            .map_err(linux_errno_from_udp_error)
+    }
+
+    async fn icmp_receive(
+        &self,
+        socket: u64,
+        timeout_nanos: u64,
+        peek: bool,
+    ) -> Result<Option<syscall::IcmpDatagram>, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let datagram = service
+            .icmp_receive(socket, timeout_nanos, peek)
+            .await
+            .map_err(linux_errno_from_udp_error)?;
+        Ok(datagram.map(|d| syscall::IcmpDatagram {
+            source: network_to_linux_ip(d.source),
+            destination: network_to_linux_ip(d.destination),
+            ttl: d.ttl,
+            payload: d.payload,
+        }))
+    }
+
+    async fn icmp_readiness(&self, socket: u64) -> Result<syscall::SocketReady, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let ready = service
+            .icmp_readiness(socket)
+            .await
+            .map_err(linux_errno_from_udp_error)?;
+        Ok(syscall::SocketReady {
+            readable: ready.readable,
+            writable: ready.writable,
+            hangup: ready.hangup,
+        })
+    }
+
     async fn vsock_accept(
         &self,
         listener: u64,
@@ -3126,16 +3649,40 @@ fn map_fs_op_error_to_exec(error: syscall::FsOpError) -> ExecError {
     }
 }
 
+fn apply_chroot_to_exec_path(root: &str, raw_path: &str) -> String {
+    if root == "/" || !raw_path.starts_with('/') {
+        return String::from(raw_path);
+    }
+    let mut rel: Vec<&str> = Vec::new();
+    for seg in raw_path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                let _ = rel.pop();
+            }
+            part => rel.push(part),
+        }
+    }
+    let trimmed = root.trim_end_matches('/');
+    if rel.is_empty() {
+        String::from(trimmed)
+    } else {
+        alloc::format!("{trimmed}/{}", rel.join("/"))
+    }
+}
+
 fn resolve_exec_spec_base<Net: ComponentHostNetwork>(
     spec: &ExecSpec,
     cwd: &Arc<spin::Mutex<String>>,
+    root: &Arc<spin::Mutex<String>>,
     descriptors: &Arc<spin::Mutex<Descriptors<LinuxResources<Net>>>>,
 ) -> Result<ExecTarget, ExecError> {
     const AT_FDCWD: i32 = -100;
     if spec.path.starts_with('/') {
+        let root_dir = root.lock().clone();
         return Ok(ExecTarget::Path {
             base_dir: String::from("/"),
-            raw_path: spec.path.clone(),
+            raw_path: apply_chroot_to_exec_path(&root_dir, &spec.path),
         });
     }
     if spec.dirfd == AT_FDCWD {
@@ -3184,6 +3731,7 @@ fn resolve_exec_spec_base<Net: ComponentHostNetwork>(
 async fn prepare_exec_in_container<CpuImpl, Net, StorageImpl>(
     shared: &LinuxShared<CpuImpl, Net, StorageImpl, <CpuImpl::Native as NativeExecution>::Space>,
     cwd: &Arc<spin::Mutex<String>>,
+    root: &Arc<spin::Mutex<String>>,
     descriptors: &Arc<spin::Mutex<Descriptors<LinuxResources<Net>>>>,
     credentials: &Arc<spin::Mutex<syscall::Credentials>>,
     spec: ExecSpec,
@@ -3195,7 +3743,8 @@ where
 {
     const MAX_SHEBANG_DEPTH: usize = 4;
     let current_creds = credentials.lock().clone();
-    let mut target = resolve_exec_spec_base(&spec, cwd, descriptors)?;
+    let root_dir = root.lock().clone();
+    let mut target = resolve_exec_spec_base(&spec, cwd, root, descriptors)?;
     let mut argv = spec.argv;
     let envp = spec.envp;
     let mut nofollow = spec.flags & AT_SYMLINK_NOFOLLOW != 0;
@@ -3254,7 +3803,7 @@ where
             argv = next_argv;
             target = ExecTarget::Path {
                 base_dir: String::from("/"),
-                raw_path: interp,
+                raw_path: apply_chroot_to_exec_path(&root_dir, &interp),
             };
             continue;
         }
@@ -3269,11 +3818,12 @@ where
                     .map_err(|error| map_program_error_to_exec(&error))?;
                 let interpreter = if let Some(interp_path) = interp_path {
                     let interp_base_dir = cwd.lock().clone();
+                    let chroot_interp = apply_chroot_to_exec_path(&root_dir, &interp_path);
                     Some(
                         Box::pin(read_interpreter_in_container(
                             fs,
                             &interp_base_dir,
-                            &interp_path,
+                            &chroot_interp,
                             &current_creds,
                         ))
                         .await
@@ -3370,6 +3920,7 @@ where
     context: &'a mut Context,
     shared: &'a Arc<LinuxShared<CpuImpl, Net, StorageImpl, Context::Space>>,
     cwd: Arc<spin::Mutex<String>>,
+    root: Arc<spin::Mutex<String>>,
     descriptors: Arc<spin::Mutex<Descriptors<LinuxResources<Net>>>>,
     credentials: Arc<spin::Mutex<syscall::Credentials>>,
     prepared_exec: &'a mut Option<Box<PreparedExec<CpuImpl, Net, StorageImpl>>>,
@@ -3534,6 +4085,10 @@ where
             sigreturn_trampoline: self.shared.sigreturn_trampoline,
             space: child_space,
             process_cpu_ticks: AtomicU64::new(0),
+            process_sys_ticks: AtomicU64::new(0),
+            peak_rss_kib: AtomicU64::new(0),
+            syslog_cursor: spin::Mutex::new(0),
+            syslog_clear_after: AtomicU64::new(0),
             fatal_error: spin::Mutex::new(None),
             exec_handoff: spin::Mutex::new(None),
             running_tasks: AtomicUsize::new(0),
@@ -3582,6 +4137,7 @@ where
         let prepared = Box::pin(prepare_exec_in_container(
             self.shared,
             &self.cwd,
+            &self.root,
             &self.descriptors,
             &self.credentials,
             spec,
@@ -3909,6 +4465,7 @@ where
                         context: &mut context,
                         shared: &shared,
                         cwd: process.cwd_handle(),
+                        root: process.root_handle(),
                         descriptors: process.descriptors_handle(),
                         credentials: process.credentials_handle(),
                         prepared_exec: &mut prepared_exec,
@@ -3950,6 +4507,10 @@ where
                     .await
                 };
                 let sys_elapsed = shared.cpu.now().ticks().saturating_sub(syscall_began);
+                platform.thread_sys_ticks += sys_elapsed;
+                shared
+                    .process_sys_ticks
+                    .fetch_add(sys_elapsed, Ordering::Relaxed);
                 let sys_ns = shared.cpu.timebase().ticks_to_nanos(sys_elapsed);
                 process.account_cpu_timers(0, sys_ns);
                 match ended {
@@ -4489,6 +5050,14 @@ where
                         process_cpu_ticks: AtomicU64::new(
                             shared.process_cpu_ticks.load(Ordering::Relaxed),
                         ),
+                        process_sys_ticks: AtomicU64::new(
+                            shared.process_sys_ticks.load(Ordering::Relaxed),
+                        ),
+                        peak_rss_kib: AtomicU64::new(shared.current_rss_kib()),
+                        syslog_cursor: spin::Mutex::new(*shared.syslog_cursor.lock()),
+                        syslog_clear_after: AtomicU64::new(
+                            shared.syslog_clear_after.load(Ordering::Relaxed),
+                        ),
                         fatal_error: spin::Mutex::new(None),
                         exec_handoff: spin::Mutex::new(None),
                         running_tasks: AtomicUsize::new(0),
@@ -4607,6 +5176,10 @@ where
         }
 
         timeline.record(&cpu, LaunchPhase::GuestEnd);
+        shared
+            .container
+            .pid_namespace()
+            .record_usage(pid, shared.snapshot_usage());
         let instance_id = shared.launched_instance.id();
         let fatal = shared.take_fatal();
         let termination = observer.termination();
@@ -4792,6 +5365,10 @@ where
         sigreturn_trampoline: mapped.sigreturn_trampoline,
         space: mapped.space,
         process_cpu_ticks: AtomicU64::new(0),
+        process_sys_ticks: AtomicU64::new(0),
+        peak_rss_kib: AtomicU64::new(0),
+        syslog_cursor: spin::Mutex::new(0),
+        syslog_clear_after: AtomicU64::new(0),
         fatal_error: spin::Mutex::new(None),
         exec_handoff: spin::Mutex::new(None),
         running_tasks: AtomicUsize::new(0),

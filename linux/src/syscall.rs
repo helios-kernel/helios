@@ -18,7 +18,9 @@ use helios_unix::{
 };
 
 mod fs;
+mod fs_extra;
 mod futex;
+mod icmp;
 mod io;
 mod memory;
 mod netlink;
@@ -35,9 +37,12 @@ mod tty;
 pub use crate::abi::{Abi, Operation};
 pub use crate::signal_frame::SignalFrameError;
 pub use fs::{
-    AccessCheck, DirListEntry, FileAccess, FileStat, Filesystem, FsOpError, LinkOptions,
-    OpenRequest, TimeUpdate, XattrSetMode,
+    ANON_INODE_FS_MAGIC, AccessCheck, BTRFS_SUPER_MAGIC, DirListEntry, EROFS_SUPER_MAGIC_V1,
+    FileAccess, FileStat, Filesystem, FsOpError, FsStat, LinkOptions, OVERLAYFS_SUPER_MAGIC,
+    OpenRequest, PIPEFS_MAGIC, PROC_SUPER_MAGIC, SOCKFS_MAGIC, ST_NODEV, ST_NOEXEC, ST_NOSUID,
+    ST_RDONLY, ST_VALID, SYSFS_MAGIC, TMPFS_MAGIC, TimeUpdate, V9FS_MAGIC, XattrSetMode,
 };
+pub use icmp::{IPPROTO_ICMP, IPPROTO_ICMPV6, IcmpDatagram};
 pub use io::Clock;
 pub use netlink::{AF_NETLINK, NETLINK_ROUTE};
 pub use packet::AF_PACKET;
@@ -56,9 +61,9 @@ pub use system::{
     CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, CAP_FULL_SET,
     CAP_KILL, CAP_LAST_CAP, CAP_MKNOD, CAP_NET_ADMIN, CAP_NET_BIND_SERVICE, CAP_NET_BROADCAST,
     CAP_NET_RAW, CAP_SETFCAP, CAP_SETGID, CAP_SETPCAP, CAP_SETUID, CAP_SYS_ADMIN, CAP_SYS_CHROOT,
-    CAP_SYS_NICE, CAP_SYS_RESOURCE, CAP_SYS_TIME, Credentials, CredentialsError, Ids,
-    LinuxCapabilities, MemoryTotals, NGROUPS_MAX, NR_OPEN_DEFAULT, RELEASE, RLIM_INFINITY,
-    Resource, Rlimit, Start, System, UTS_FIELD_MAX, UtsField, UtsNameError,
+    CAP_SYS_NICE, CAP_SYS_RESOURCE, CAP_SYS_TIME, CAP_SYSLOG, CpuUsage, Credentials,
+    CredentialsError, Ids, LinuxCapabilities, MemoryTotals, NGROUPS_MAX, NR_OPEN_DEFAULT, RELEASE,
+    RLIM_INFINITY, Resource, Rlimit, Start, System, UTS_FIELD_MAX, UtsField, UtsNameError,
 };
 pub use thread::{PidNamespace, PidNamespaceTelemetry};
 pub use tty::{Termios, TermiosAction, Tty, TtyError, TtyStream, Winsize};
@@ -466,10 +471,12 @@ struct ProcessShared<R: Resources> {
     futex: FutexTable,
     descriptors: Arc<spin::Mutex<Descriptors<R>>>,
     cwd: Arc<spin::Mutex<String>>,
+    root: Arc<spin::Mutex<String>>,
     shared_mappings: Arc<spin::Mutex<Vec<memory::SharedFileMapping<R::File>>>>,
     stdin_lock: RawMutex,
     stdin_carry: spin::Mutex<Bytes>,
     attributes: spin::Mutex<system::Attributes>,
+    children_usage: spin::Mutex<system::CpuUsage>,
     program_break: Arc<spin::Mutex<memory::ProgramBreak>>,
     signals: Arc<ProcessSignals>,
     threads: Arc<GroupLifecycle>,
@@ -491,15 +498,16 @@ impl core::ops::Deref for GroupLifecycle {
 ///
 /// Each thread task exclusively owns its `Process<R>` handle while
 /// dispatching a syscall. Shared process structures synchronize internally
-/// with bounded non-awaiting critical sections (`descriptors`, `cwd`,
-/// `shared_mappings`, `attributes`, `program_break`, `signals`,
-/// `threads`, `futex`) or an async mutex (`stdin_carry`); no spin lock is ever
-/// held across an `.await`.
+/// with bounded non-awaiting critical sections (`descriptors`, `cwd`, `root`,
+/// `shared_mappings`, `attributes`, `children_usage`, `program_break`,
+/// `signals`, `threads`, `futex`) or an async mutex (`stdin_carry`); no spin
+/// lock is ever held across an `.await`.
 pub struct Process<R: Resources> {
     shared: Arc<ProcessShared<R>>,
     tid: NonZeroU32,
     signals: Arc<ThreadSignalSlot>,
     credentials: Arc<spin::Mutex<Credentials>>,
+    sched: Arc<spin::Mutex<thread::ThreadSchedState>>,
     clear_child_tid: u64,
     robust_list: Arc<AtomicU64>,
     exited: bool,
@@ -552,8 +560,19 @@ impl<R: Resources> Process<R> {
         let robust_list = Arc::new(AtomicU64::new(0));
         let process_signals = ProcessSignals::new(id);
         let thread_signals = process_signals.register_thread(id, SignalSet::EMPTY);
-        pids.register_process(id, process_signals.clone(), credentials.clone());
-        pids.register_thread(id, thread_signals.clone(), credentials.clone());
+        let sched = Arc::new(spin::Mutex::new(thread::ThreadSchedState::default()));
+        pids.register_process(
+            id,
+            process_signals.clone(),
+            credentials.clone(),
+            sched.clone(),
+        );
+        pids.register_thread(
+            id,
+            thread_signals.clone(),
+            credentials.clone(),
+            sched.clone(),
+        );
         let lifecycle = Arc::new(GroupLifecycle {
             threads: spin::Mutex::new(thread::ThreadGroup::new(
                 id,
@@ -571,10 +590,12 @@ impl<R: Resources> Process<R> {
                 futex,
                 descriptors: Arc::new(spin::Mutex::new(descriptors)),
                 cwd: Arc::new(spin::Mutex::new(initial_cwd)),
+                root: Arc::new(spin::Mutex::new(String::from("/"))),
                 shared_mappings: Arc::new(spin::Mutex::new(Vec::new())),
                 stdin_lock: RawMutex::new(),
                 stdin_carry: spin::Mutex::new(initial_stdin_carry),
                 attributes: spin::Mutex::new(system::Attributes::new(start, open_files)),
+                children_usage: spin::Mutex::new(system::CpuUsage::default()),
                 program_break: Arc::new(spin::Mutex::new(memory::ProgramBreak::new(program_break))),
                 signals: process_signals,
                 threads: lifecycle,
@@ -583,6 +604,7 @@ impl<R: Resources> Process<R> {
             tid: id,
             signals: thread_signals,
             credentials,
+            sched,
             clear_child_tid: 0,
             robust_list,
             exited: false,
@@ -722,10 +744,20 @@ impl<R: Resources> Process<R> {
         }
     }
 
+    /// Records final CPU/memory usage for this process so its parent's
+    /// `wait4`/`waitid` and `getrusage(RUSAGE_CHILDREN)` observe it.
+    pub fn record_usage(&self, usage: system::CpuUsage) {
+        self.shared.pids.record_usage(self.pid(), usage);
+    }
+
     /// Transitions this process into exited/zombie state inside its container's
     /// [`PidNamespace`], waking any parent blocked in `wait4`/`waitid` and
     /// raising its exit signal (`SIGCHLD`), and unblocks any `vfork` parent.
     pub fn mark_exited(&self, termination: ChildTermination) {
+        self.shared
+            .pids
+            .file_locks()
+            .release_posix_for_process(self.shared.identity);
         self.signal_vfork_done();
         self.shared.pids.mark_exited(self.pid(), termination);
     }
@@ -770,6 +802,12 @@ impl<R: Resources> Process<R> {
         self.shared.cwd.clone()
     }
 
+    /// Shared handle to this process's chroot root directory (for host
+    /// `execve`/`execveat` path resolution).
+    pub fn root_handle(&self) -> Arc<spin::Mutex<String>> {
+        self.shared.root.clone()
+    }
+
     /// Shared handle to this thread's credentials (for host `execve`/`execveat`
     /// permission checks and set-id / file-capability transitions without
     /// holding a borrow on `Process`).
@@ -787,9 +825,12 @@ impl<R: Resources> Process<R> {
             self.shared.pids.release_tid(self.tid);
             self.tid = pid;
             self.signals = self.shared.signals.register_thread(pid, old_mask);
-            self.shared
-                .pids
-                .register_thread(pid, self.signals.clone(), self.credentials.clone());
+            self.shared.pids.register_thread(
+                pid,
+                self.signals.clone(),
+                self.credentials.clone(),
+                self.sched.clone(),
+            );
             self.shared
                 .pids
                 .update_process_credentials(pid, self.credentials.clone());
@@ -859,10 +900,12 @@ impl<R: Resources> Process<R> {
             futex: self.shared.futex.clone(),
             descriptors: Arc::new(spin::Mutex::new(surviving)),
             cwd: Arc::new(spin::Mutex::new(self.shared.cwd.lock().clone())),
+            root: Arc::new(spin::Mutex::new(self.shared.root.lock().clone())),
             shared_mappings: Arc::new(spin::Mutex::new(Vec::new())),
             stdin_lock: RawMutex::new(),
             stdin_carry: spin::Mutex::new(self.shared.stdin_carry.lock().clone()),
             attributes: spin::Mutex::new(self.shared.attributes.lock().clone()),
+            children_usage: spin::Mutex::new(*self.shared.children_usage.lock()),
             program_break: Arc::new(spin::Mutex::new(memory::ProgramBreak::new(
                 new_program_break,
             ))),
@@ -925,6 +968,10 @@ impl<R: Resources> Process<R> {
             self.shared.threads.changed.notify_all();
         }
         if self.shared.threads.lock().all_exited() {
+            self.shared
+                .pids
+                .file_locks()
+                .release_posix_for_process(self.shared.identity);
             self.signal_vfork_done();
         }
     }
@@ -940,6 +987,10 @@ impl<R: Resources> Process<R> {
             self.shared.threads.changed.notify_all();
         }
         if all_exited {
+            self.shared
+                .pids
+                .file_locks()
+                .release_posix_for_process(self.shared.identity);
             self.signal_vfork_done();
         }
     }
@@ -953,6 +1004,10 @@ impl<R: Resources> Drop for Process<R> {
             let all_exited = self.shared.threads.lock().withdraw(self.tid);
             if all_exited {
                 self.shared.threads.changed.notify_all();
+                self.shared
+                    .pids
+                    .file_locks()
+                    .release_posix_for_process(self.shared.identity);
                 self.signal_vfork_done();
             }
         }
@@ -1128,15 +1183,72 @@ pub async fn dispatch<
         Operation::Creat => {
             SyscallOutcome::Return(fs::creat::<R, _, _>(process, arguments, memory, output).await)
         }
-        Operation::Close => SyscallOutcome::Return(
-            process
-                .shared
-                .descriptors
-                .lock()
-                .close(arguments[0] as u32 as i32)
-                .map_or_else(io::descriptor_errno, |_| 0),
+        Operation::Close => {
+            let fd = arguments[0] as u32 as i32;
+            let (result, closed) = match process.shared.descriptors.lock().close(fd) {
+                Ok(entry) => (0, Some(entry)),
+                Err(err) => (io::descriptor_errno(err), None),
+            };
+            if let Some(entry) = closed {
+                fs_extra::release_posix_locks_for_entry(process, &entry, output);
+            }
+            SyscallOutcome::Return(result)
+        }
+        Operation::CloseRange => {
+            SyscallOutcome::Return(fs::close_range::<R, _>(process, arguments, output))
+        }
+        Operation::Statfs => SyscallOutcome::Return(
+            alloc::boxed::Box::pin(fs_extra::statfs::<R, _, _>(
+                process, arguments, memory, output,
+            ))
+            .await,
         ),
-        Operation::CloseRange => SyscallOutcome::Return(fs::close_range::<R>(process, arguments)),
+        Operation::Fstatfs => SyscallOutcome::Return(
+            alloc::boxed::Box::pin(fs_extra::fstatfs::<R, _, _>(
+                process, arguments, memory, output,
+            ))
+            .await,
+        ),
+        Operation::Flock => {
+            alloc::boxed::Box::pin(fs_extra::flock::<R, _>(process, arguments, output)).await
+        }
+        Operation::Fallocate => SyscallOutcome::Return(
+            alloc::boxed::Box::pin(fs_extra::fallocate::<R, _, _>(
+                process, arguments, memory, output,
+            ))
+            .await,
+        ),
+        Operation::Sync => SyscallOutcome::Return(
+            alloc::boxed::Box::pin(fs_extra::sync::<R, _, _>(process, memory, output)).await,
+        ),
+        Operation::Syncfs => SyscallOutcome::Return(
+            alloc::boxed::Box::pin(fs_extra::syncfs::<R, _, _>(
+                process, arguments, memory, output,
+            ))
+            .await,
+        ),
+        Operation::Chroot => SyscallOutcome::Return(
+            alloc::boxed::Box::pin(fs_extra::chroot::<R, _, _>(
+                process, arguments, memory, output,
+            ))
+            .await,
+        ),
+        Operation::CopyFileRange => SyscallOutcome::Return(
+            alloc::boxed::Box::pin(fs_extra::copy_file_range::<R, _, _>(
+                process, arguments, memory, output,
+            ))
+            .await,
+        ),
+        Operation::Splice => {
+            alloc::boxed::Box::pin(fs_extra::splice::<R, _, _>(
+                process, arguments, memory, output,
+            ))
+            .await
+        }
+        Operation::Tee => alloc::boxed::Box::pin(fs_extra::tee::<R>(process, arguments)).await,
+        Operation::Readahead => {
+            SyscallOutcome::Return(fs_extra::readahead::<R, _>(process, arguments, output))
+        }
         Operation::Lseek => {
             SyscallOutcome::Return(fs::lseek::<R, _>(process, arguments, output).await)
         }
@@ -1311,14 +1423,47 @@ pub async fn dispatch<
                 gid,
             ))
         }
-        operation @ (Operation::Dup | Operation::Dup2 | Operation::Dup3 | Operation::Fcntl) => {
-            SyscallOutcome::Return(io::duplicate::<R, _>(
-                abi,
-                &mut process.shared.descriptors.lock(),
-                operation,
-                arguments,
-                output,
-            ))
+        operation @ (Operation::Dup | Operation::Dup2 | Operation::Dup3) => {
+            let (result, overwritten) = {
+                let mut table = process.shared.descriptors.lock();
+                let prev = if matches!(operation, Operation::Dup2 | Operation::Dup3)
+                    && arguments[0] as u32 != arguments[1] as u32
+                {
+                    table.get_entry(arguments[1] as u32 as i32).cloned()
+                } else {
+                    None
+                };
+                let res = io::duplicate::<R, _>(abi, &mut table, operation, arguments, output);
+                (res, prev)
+            };
+            if result <= i32::MAX as u64
+                && let Some(entry) = overwritten
+            {
+                fs_extra::release_posix_locks_for_entry(process, &entry, output);
+            }
+            SyscallOutcome::Return(result)
+        }
+        Operation::Fcntl => {
+            let cmd = arguments[1] as u32;
+            if matches!(cmd, 5..=7) {
+                alloc::boxed::Box::pin(fs_extra::fcntl_lock::<R, _, _>(
+                    process,
+                    arguments[0] as u32 as i32,
+                    cmd,
+                    arguments[2],
+                    memory,
+                    output,
+                ))
+                .await
+            } else {
+                SyscallOutcome::Return(io::duplicate::<R, _>(
+                    abi,
+                    &mut process.shared.descriptors.lock(),
+                    Operation::Fcntl,
+                    arguments,
+                    output,
+                ))
+            }
         }
         operation @ (Operation::Eventfd | Operation::Eventfd2) => {
             SyscallOutcome::Return(io::event::<R>(
@@ -1383,6 +1528,39 @@ pub async fn dispatch<
         Operation::SchedGetaffinity => SyscallOutcome::Return(thread::sched_getaffinity(
             process, arguments, memory, output,
         )),
+        Operation::SchedSetaffinity => SyscallOutcome::Return(thread::sched_setaffinity(
+            process, arguments, memory, output,
+        )),
+        Operation::SchedGetscheduler => {
+            SyscallOutcome::Return(thread::sched_getscheduler(process, arguments))
+        }
+        Operation::SchedSetscheduler => {
+            SyscallOutcome::Return(thread::sched_setscheduler(process, arguments, memory))
+        }
+        Operation::SchedGetparam => {
+            SyscallOutcome::Return(thread::sched_getparam(process, arguments, memory))
+        }
+        Operation::SchedSetparam => {
+            SyscallOutcome::Return(thread::sched_setparam(process, arguments, memory))
+        }
+        Operation::SchedGetPriorityMax => {
+            SyscallOutcome::Return(thread::sched_get_priority_max(arguments))
+        }
+        Operation::SchedGetPriorityMin => {
+            SyscallOutcome::Return(thread::sched_get_priority_min(arguments))
+        }
+        Operation::IoprioSet => SyscallOutcome::Return(thread::ioprio_set(process, arguments)),
+        Operation::IoprioGet => SyscallOutcome::Return(thread::ioprio_get(process, arguments)),
+        Operation::Times => {
+            SyscallOutcome::Return(system::times::<R, _, _>(process, arguments, memory, output))
+        }
+        Operation::Getrusage => SyscallOutcome::Return(system::getrusage::<R, _, _>(
+            process, arguments, memory, output,
+        )),
+        Operation::Personality => SyscallOutcome::Return(process.personality(arguments)),
+        Operation::Syslog => SyscallOutcome::Return(system::syslog::<R, _, _>(
+            process, arguments, memory, output,
+        )),
         Operation::Nanosleep => SyscallOutcome::Return(
             thread::nanosleep(&process.signals, arguments, memory, output).await,
         ),
@@ -1424,7 +1602,7 @@ pub async fn dispatch<
             process.clear_child_tid = arguments[0];
             SyscallOutcome::Return(u64::from(process.tid.get()))
         }
-        Operation::Prctl => SyscallOutcome::Return(process.prctl(arguments)),
+        Operation::Prctl => SyscallOutcome::Return(process.prctl(arguments, memory)),
         Operation::ArchPrctl => SyscallOutcome::Return(arch_prctl(abi, arguments, memory, thread)),
         Operation::Ioctl => SyscallOutcome::Return({
             let is_socket = process
