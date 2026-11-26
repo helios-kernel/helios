@@ -441,9 +441,14 @@ vendored revision moves, rather than pointing bindgen at the sibling tree.
 
 ## Cranelift x86 vector-state properties
 
-The x86 backend preserves no vector state beyond FXSAVE at interrupts and the
-`preserve_all` trampoline's 128-bit xmm0-xmm15 save at stack-limit checks
-(`x86/src/extended_state.rs`). That is sound only while the fork's x64
+The x86 backend preserves legacy x87/SSE via `FXSAVE64`/`FXRSTOR64` at
+ordinary interrupts and exceptions and 128-bit `xmm0`–`xmm15` at
+stack-limit checks (`x86/src/extended_state.rs`). A page fault on a
+swapped-out page interrupts guest code at an arbitrary instruction and
+suspends the fiber, so its trampoline saves every enabled `XCR0`
+component with `XSAVE64` before entering Rust and restores it with
+`XRSTOR64` before `iretq`. Keeping `FXSAVE64` on ordinary interrupts and
+stack-limit checks is sound only while the fork's x64
 Cranelift backend keeps three properties, which hold at
 `56131f786d90a136fec6e80e143de18e5b38e8de` and which every move of the fork
 must keep:
@@ -510,8 +515,11 @@ Sv48 rather than falling back to a profile the compiled code does not match.
 
 Swap (#25) rides on the same reservations but needs a second piece from each
 backend: a not-present page-table encoding that carries a swap token, installed
-as a `SwapVmHooks` table. Only aarch64 has that today; riscv64 and x86_64 call
-`disable_swap(SwapDisabled::NoSwapHooks)` until they do.
+as a `SwapVmHooks` table. Both `aarch64` and `x86_64` install swap hooks and
+back swap on the `helios-data` scratch disk (`x86_64` uses an L1TF-safe
+inverted-PFN encoding with hardware `ACCESSED` ageing and an `XSAVE64`/`XRSTOR64`
+fault trampoline); `riscv64` still calls `disable_swap(SwapDisabled::NoSwapHooks)`
+until it gains its own encoding.
 
 ## Fiber stacks
 

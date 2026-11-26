@@ -5,7 +5,10 @@ use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 
 use helios_hal::vmm::VirtAddr as UserVirtAddr;
-use helios_kernel::{KernelException, KernelExceptionCause, KernelExceptionDispatch, StackFault};
+use helios_kernel::{
+    KernelException, KernelExceptionCause, KernelExceptionDispatch, StackFault, UserPageFault,
+};
+use spin::Once;
 use x86_64::VirtAddr;
 use x86_64::instructions::segmentation::{CS, DS, ES, SS, Segment};
 use x86_64::instructions::tables::load_tss;
@@ -16,9 +19,22 @@ use x86_64::structures::tss::TaskStateSegment;
 
 use crate::smp;
 
+const PAGE_FAULT_PRESENT: u64 = 1 << 0;
 const PAGE_FAULT_INSTRUCTION_FETCH: u64 = 1 << 4;
 const DOUBLE_FAULT_VECTOR: u64 = 8;
 const PAGE_FAULT_VECTOR: u64 = 14;
+/// System V red zone kept untouched below an interrupted stack pointer when
+/// placing a swap-fault frame and XSAVE area on the faulting stack.
+const RED_ZONE_BYTES: usize = 128;
+/// `XSAVE64` and `XRSTOR64` require a 64-byte-aligned buffer (Intel SDM Vol. 2C).
+const XSAVE_ALIGNMENT: usize = 64;
+/// Offset and length of the XSAVE header (`XSTATE_BV`, `XCOMP_BV`, reserved);
+/// zeroed before `XSAVE64` so `XRSTOR64` never faults on stack garbage.
+const XSAVE_HEADER_OFFSET: usize = 512;
+const XSAVE_HEADER_BYTES: usize = 64;
+/// Active `XCR0` XSAVE area size, rounded up to [`XSAVE_ALIGNMENT`], recorded
+/// once at processor bring-up so swap faults avoid a `CPUID` VM exit.
+static XSAVE_AREA_BYTES: Once<usize> = Once::new();
 /// Interrupt-stack-table slots, as `set_stack_index` counts them.
 const PAGE_FAULT_IST_INDEX: u16 = 0;
 const DOUBLE_FAULT_IST_INDEX: u16 = 1;
@@ -157,6 +173,8 @@ global_asm!(
     include_str!("exceptions.S"),
     wake_vector = const WAKE_INTERRUPT_VECTOR,
     tlb_shootdown_vector = const TLB_SHOOTDOWN_INTERRUPT_VECTOR,
+    rflags_offset = const EXCEPTION_FRAME_RFLAGS_OFFSET,
+    rflags_if = const RFLAGS_INTERRUPT_FLAG,
     native_users = const cfg!(feature = "native-users") as u8,
 );
 
@@ -214,6 +232,8 @@ unsafe extern "C" {
     fn helios_x86_interrupt_block_3();
     fn helios_x86_interrupt_debug_serial();
     fn helios_x86_interrupt_sci();
+    fn helios_x86_swap_fault_entry();
+    fn helios_x86_swap_fault_resume(frame: *mut ExceptionFrame, xsave_area: *const u8) -> !;
 }
 
 pub(crate) struct ProcessorIdt {
@@ -583,6 +603,18 @@ impl ProcessorSegments {
 }
 
 pub(crate) fn install_for_current_processor() {
+    let raw_xsave = usize::try_from(crate::extended_state::xsave_sizes().0)
+        .expect("x86 XSAVE area size fits in usize");
+    assert!(
+        raw_xsave >= XSAVE_HEADER_OFFSET + XSAVE_HEADER_BYTES,
+        "x86 XSAVE area size {raw_xsave} is smaller than the 576-byte XSAVE header"
+    );
+    let aligned_xsave = (raw_xsave + XSAVE_ALIGNMENT - 1) & !(XSAVE_ALIGNMENT - 1);
+    let recorded = *XSAVE_AREA_BYTES.call_once(|| aligned_xsave);
+    assert_eq!(
+        recorded, aligned_xsave,
+        "x86 processor XSAVE area size {aligned_xsave} differs from bootstrap {recorded}"
+    );
     let runtime = smp::current_runtime();
     runtime.segments.install();
     runtime.exception_idt.install();
@@ -767,7 +799,18 @@ pub(crate) struct ExceptionFrame {
     ss: u64,
 }
 
-const RFLAGS_INTERRUPT_FLAG: u64 = 1 << 9;
+/// Byte offset of `rflags` within [`ExceptionFrame`], pinned by the const
+/// assertion below and kept as a literal for `x86/tests/interrupt_state.py`.
+const EXCEPTION_FRAME_RFLAGS_OFFSET: usize = 152;
+/// `RFLAGS.IF` (bit 9), kept as a hex literal for `x86/tests/interrupt_state.py`.
+const RFLAGS_INTERRUPT_FLAG: u64 = 0x200;
+const RFLAGS_DIRECTION_FLAG: u64 = 1 << 10;
+
+const _: () = {
+    assert!(core::mem::size_of::<ExceptionFrame>().is_multiple_of(16));
+    assert!(core::mem::offset_of!(ExceptionFrame, rflags) == EXCEPTION_FRAME_RFLAGS_OFFSET);
+    assert!(RFLAGS_INTERRUPT_FLAG == 1 << 9);
+};
 
 /// Puts the interrupted context's interrupt flag back before an
 /// exception is handed to the runtime's trap handler.
@@ -820,8 +863,25 @@ extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) {
         }
         // Fiber stacks commit ahead of the guest through the stack-reserve
         // callback; a fault on an uncommitted page inside one fails fast
-        // here, and the guard page below one stays a stack-overflow fault.
-        stack_fault = helios_kernel::classify_stack_fault(UserVirtAddr::new(faulting_address));
+        // inside `classify_user_page_fault`, and a not-present fault on a
+        // swapped-out page redirects onto the faulting fiber's stack.
+        if frame.error_code & PAGE_FAULT_PRESENT == 0 {
+            match helios_kernel::classify_user_page_fault(UserVirtAddr::new(faulting_address)) {
+                UserPageFault::Swapped => {
+                    // SAFETY: `frame` is the complete exception frame on this
+                    // processor's IST stack, and `enter_swap_fault_trampoline`
+                    // copies it onto the faulting stack and rewrites it to land
+                    // in `helios_x86_swap_fault_entry`.
+                    unsafe {
+                        enter_swap_fault_trampoline(frame, faulting_address);
+                    }
+                    return;
+                }
+                UserPageFault::Unclaimed(fault) => stack_fault = fault,
+            }
+        } else {
+            stack_fault = helios_kernel::classify_stack_fault(UserVirtAddr::new(faulting_address));
+        }
     }
     if frame.vector == DOUBLE_FAULT_VECTOR {
         panic!(
@@ -847,6 +907,106 @@ extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) {
         "unhandled x86 kernel exception vector={} rip={:#x} error_code={:#x}",
         frame.vector, frame.rip, frame.error_code
     );
+}
+
+/// Rewrites a page-fault frame so the exception epilogue returns into
+/// [`helios_x86_swap_fault_entry`] on the faulting stack instead of retrying
+/// the faulting instruction.
+///
+/// Leaves the 128-byte SysV red zone untouched below `frame.rsp`, places a
+/// 64-byte-aligned XSAVE area below it (with its 64-byte XSAVE header zeroed
+/// so `XRSTOR64` never faults on stack garbage), and copies the complete
+/// interrupted [`ExceptionFrame`] immediately below that so `landing` is
+/// 16-byte aligned regardless of the interrupted `RSP`. Clears `IF` and `DF`
+/// in the return `RFLAGS` so the assembly entry captures every enabled `XCR0`
+/// component before restoring the interrupted context's `IF` and calling Rust.
+///
+/// # Safety
+///
+/// `frame` must be the complete exception frame written by
+/// `helios_x86_exception_common`, and `frame.rsp` must point into a live
+/// writable stack with room below it for the red zone, XSAVE area, and copied
+/// frame.
+unsafe fn enter_swap_fault_trampoline(frame: &mut ExceptionFrame, faulting_address: usize) {
+    let xsave_size = *XSAVE_AREA_BYTES
+        .get()
+        .expect("x86 swap fault taken before XSAVE area size was recorded");
+    let interrupted_rsp = frame.rsp as usize;
+    let xsave_top = interrupted_rsp
+        .checked_sub(RED_ZONE_BYTES)
+        .and_then(|top| top.checked_sub(xsave_size))
+        .unwrap_or_else(|| {
+            panic!(
+                "x86 swap fault interrupted stack {interrupted_rsp:#x} has no room for \
+                 {xsave_size}-byte XSAVE area"
+            )
+        });
+    let xsave_addr = xsave_top & !(XSAVE_ALIGNMENT - 1);
+    let landing = xsave_addr
+        .checked_sub(core::mem::size_of::<ExceptionFrame>())
+        .unwrap_or_else(|| {
+            panic!("x86 swap fault interrupted stack {interrupted_rsp:#x} underflowed frame")
+        });
+    // SAFETY: `xsave_addr + 512..xsave_addr + 576` is the XSAVE header inside
+    // the faulting stack's live space below `interrupted_rsp`, disjoint from
+    // `frame` on the IST stack.
+    unsafe {
+        core::ptr::write_bytes(
+            (xsave_addr + XSAVE_HEADER_OFFSET) as *mut u8,
+            0,
+            XSAVE_HEADER_BYTES,
+        );
+    }
+    // SAFETY: `landing` is 16-byte aligned inside the faulting stack below
+    // `xsave_addr` and disjoint from `frame` on the IST stack.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            core::ptr::from_ref(frame),
+            landing as *mut ExceptionFrame,
+            1,
+        );
+    }
+    frame.rdi = landing as u64;
+    frame.rsi = xsave_addr as u64;
+    frame.rdx = faulting_address as u64;
+    frame.rcx = helios_x86_swap_fault_trampoline as *const () as usize as u64;
+    frame.rip = helios_x86_swap_fault_entry as *const () as usize as u64;
+    frame.rsp = landing as u64;
+    frame.rflags &= !(RFLAGS_INTERRUPT_FLAG | RFLAGS_DIRECTION_FLAG);
+}
+
+/// Resolves a swapped-out page from the faulting context's own stack.
+///
+/// Entered from `helios_x86_swap_fault_entry` after every enabled `XCR0`
+/// extended-state component has been saved to `xsave_area` and the
+/// interrupted context's `IF` has been restored.
+extern "C" fn helios_x86_swap_fault_trampoline(
+    frame: *mut ExceptionFrame,
+    xsave_area: *const u8,
+    faulting_address: usize,
+) -> ! {
+    // SAFETY: `frame` is the complete copy `enter_swap_fault_trampoline`
+    // placed on this stack, readable for the lifetime of this trampoline.
+    let saved = unsafe { &*frame };
+    let cause = if saved.error_code & PAGE_FAULT_INSTRUCTION_FETCH != 0 {
+        KernelExceptionCause::InstructionFault
+    } else {
+        KernelExceptionCause::DataFault
+    };
+    let interrupted = KernelException {
+        cause,
+        instruction_pointer: saved.rip as usize,
+        frame_pointer: saved.rbp as usize,
+        faulting_address: Some(faulting_address),
+    };
+    helios_kernel::run_swap_fault_trampoline(
+        UserVirtAddr::new(faulting_address),
+        interrupted,
+        // SAFETY: `frame` and `xsave_area` are the saved context and XSAVE
+        // image placed on this fiber's stack by `enter_swap_fault_trampoline`
+        // and `helios_x86_swap_fault_entry`.
+        || unsafe { helios_x86_swap_fault_resume(frame, xsave_area) },
+    )
 }
 
 #[unsafe(no_mangle)]
