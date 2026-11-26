@@ -1209,6 +1209,62 @@ struct VmProfile {
     release_kernel_profile: bool,
 }
 
+impl VmProfile {
+    /// Promotes every memory-mapped virtio device in this profile onto the
+    /// PCI bus when `--iommu` is enabled.
+    ///
+    /// `virtio-iommu-pci` translates PCI endpoints only: default non-IOMMU
+    /// boots on aarch64 and riscv64 keep their existing virtio-mmio layout,
+    /// while `--iommu` moves every virtio device onto PCI with
+    /// `disable-legacy=on,iommu_platform=on`.
+    const fn for_iommu(self, iommu: bool) -> Self {
+        if !iommu {
+            return self;
+        }
+        Self {
+            network: match self.network {
+                Some(VmNetworkProfile::VirtioMmio) => Some(VmNetworkProfile::VirtioPci),
+                other => other,
+            },
+            data_disk: match self.data_disk {
+                VmDataDiskProfile::VirtioMmio => VmDataDiskProfile::VirtioPci,
+                VmDataDiskProfile::VirtioPci => VmDataDiskProfile::VirtioPci,
+            },
+            host_share: match self.host_share {
+                Some(VmHostShareProfile::Virtio9pMmio) => Some(VmHostShareProfile::Virtio9pPci),
+                other => other,
+            },
+            entropy: match self.entropy {
+                VmEntropyProfile::VirtioRngMmio => VmEntropyProfile::VirtioRngPci,
+                VmEntropyProfile::VirtioRngPci => VmEntropyProfile::VirtioRngPci,
+            },
+            balloon: match self.balloon {
+                VmBalloonProfile::VirtioBalloonMmio => VmBalloonProfile::VirtioBalloonPci,
+                VmBalloonProfile::VirtioBalloonPci => VmBalloonProfile::VirtioBalloonPci,
+            },
+            display: match self.display {
+                VmDisplayProfile::Mmio => VmDisplayProfile::Pci,
+                VmDisplayProfile::GlMmio => VmDisplayProfile::GlPci,
+                VmDisplayProfile::RutabagaMmio => VmDisplayProfile::RutabagaPci,
+                other => other,
+            },
+            input: match self.input {
+                VmInputProfile::VirtioInputMmio => VmInputProfile::VirtioInputPci,
+                VmInputProfile::VirtioInputPci => VmInputProfile::VirtioInputPci,
+            },
+            sound: match self.sound {
+                VmSoundProfile::VirtioSoundMmio => VmSoundProfile::VirtioSoundPci,
+                VmSoundProfile::VirtioSoundPci => VmSoundProfile::VirtioSoundPci,
+            },
+            vsock: match self.vsock {
+                VmVsockProfile::VhostVsockMmio => VmVsockProfile::VhostVsockPci,
+                VmVsockProfile::VhostVsockPci => VmVsockProfile::VhostVsockPci,
+            },
+            ..self
+        }
+    }
+}
+
 /// The `virt` machine as the aarch64 kernel boots it by default: EDK2
 /// installs the FDT configuration table only when it is not also
 /// publishing ACPI tables, so the device-tree description needs ACPI
@@ -1241,11 +1297,8 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngMmio,
     vm_generation_id: false,
-    // The virtio devices of the `virt` machines are memory-mapped, and
-    // virtio-iommu translates PCI endpoints only, so there is nothing
-    // here it could confine.
     acpi_machine: Some(AARCH64_VIRT_ACPI_MACHINE),
-    iommu: None,
+    iommu: Some(VmIommuProfile::VirtioIommuPci),
     balloon: VmBalloonProfile::VirtioBalloonMmio,
     display: VmDisplayProfile::Mmio,
     input: VmInputProfile::VirtioInputMmio,
@@ -1277,11 +1330,8 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngMmio,
     vm_generation_id: false,
-    // The virtio devices of the `virt` machines are memory-mapped, and
-    // virtio-iommu translates PCI endpoints only, so there is nothing
-    // here it could confine.
     acpi_machine: Some(AARCH64_VIRT_ACPI_MACHINE),
-    iommu: None,
+    iommu: Some(VmIommuProfile::VirtioIommuPci),
     balloon: VmBalloonProfile::VirtioBalloonMmio,
     display: VmDisplayProfile::Mmio,
     input: VmInputProfile::VirtioInputMmio,
@@ -1312,11 +1362,8 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngMmio,
     vm_generation_id: false,
-    // The virtio devices of the `virt` machines are memory-mapped, and
-    // virtio-iommu translates PCI endpoints only, so there is nothing
-    // here it could confine.
     acpi_machine: None,
-    iommu: None,
+    iommu: Some(VmIommuProfile::VirtioIommuPci),
     balloon: VmBalloonProfile::VirtioBalloonMmio,
     display: VmDisplayProfile::Mmio,
     input: VmInputProfile::VirtioInputMmio,
@@ -3373,8 +3420,9 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         },
     };
 
+    let effective_profile = profile.for_iommu(iommu);
     let network = VmNetwork::resolve(command.network, file.network);
-    let qemu_net = profile
+    let qemu_net = effective_profile
         .network
         .map(|device| network.render(device, virtio_devices, smp, HostPlatform::current()))
         .transpose()?;
@@ -6495,73 +6543,7 @@ impl VmRuntime {
             }
             VmBootArtifactKind::LimineUefiDiskImage => {}
         }
-        // The unit has to be realised before the functions it protects:
-        // QEMU binds a PCI function to its address space when the
-        // function is created, and one created first would keep the
-        // untranslated one.
-        if command.iommu {
-            configure_iommu(&mut qemu, command.profile.iommu, command.virtio_devices);
-        }
-        if let Some(qemu_net) = &command.qemu_net {
-            qemu_net.apply(&mut qemu);
-        }
-        if let Some(boot_disk) = command.profile.boot_disk {
-            configure_boot_disk(&mut qemu, boot_disk, &artifact, command.virtio_devices);
-        }
-        configure_data_disk(
-            &mut qemu,
-            command.profile.data_disk,
-            &data_disk,
-            command.virtio_devices,
-        );
-        configure_disks(
-            &mut qemu,
-            command.profile.data_disk,
-            &command.disks,
-            command.virtio_devices,
-        );
-        if let Some(host_share) = command.profile.host_share
-            && let Some(shared_dir) = &command.shared_dir
-        {
-            configure_host_share(
-                &mut qemu,
-                host_share,
-                shared_dir,
-                command.shared_dir_access,
-                command.virtio_devices,
-            );
-        }
-        if let Some(watchdog) = command.profile.watchdog {
-            configure_watchdog(&mut qemu, watchdog);
-        }
-        configure_entropy_device(&mut qemu, command.profile.entropy, command.virtio_devices);
-        if command.profile.vm_generation_id {
-            configure_vm_generation_id(&mut qemu);
-        }
-        configure_balloon(&mut qemu, command.profile.balloon, command.virtio_devices);
-        if command.desktop {
-            configure_display(
-                &mut qemu,
-                command.profile.display,
-                command.renderer.as_ref(),
-                command.virtio_devices,
-            );
-            configure_input(&mut qemu, command.profile.input, command.virtio_devices);
-        }
-        configure_sound(
-            &mut qemu,
-            command.profile.sound,
-            &command.audiodev,
-            command.virtio_devices,
-        );
-        if command.rpc_transport == VmRpcTransport::Vsock {
-            configure_vsock_device(
-                &mut qemu,
-                command.profile.vsock,
-                command.vsock_cid,
-                command.virtio_devices,
-            );
-        }
+        configure_machine_devices(&mut qemu, command, &artifact, &data_disk);
         if let (Some(tpm), Some(swtpm)) = (&command.tpm, &swtpm) {
             tpm.apply(&mut qemu, &qemu_option_value(swtpm.socket())?);
         }
@@ -7313,6 +7295,79 @@ fn machine_options(command: &ResolvedVmCommand) -> QemuOptions {
 fn guest_ram_backend(command: &ResolvedVmCommand) -> Option<QemuOptions> {
     let backing = GuestRamBacking::of(command);
     (!backing.is_qemu_default()).then(|| backing.backend(GUEST_RAM_ID, &command.memory))
+}
+
+/// Attaches the IOMMU (when enabled) followed by all virtio and platform
+/// devices for `command`.
+fn configure_machine_devices(
+    qemu: &mut Command,
+    command: &ResolvedVmCommand,
+    artifact: &Path,
+    data_disk: &Path,
+) {
+    let effective = command.profile.for_iommu(command.iommu);
+    // The unit has to be realised before the functions it protects:
+    // QEMU binds a PCI function to its address space when the
+    // function is created, and one created first would keep the
+    // untranslated one.
+    if command.iommu {
+        configure_iommu(qemu, effective.iommu, command.virtio_devices);
+    }
+    if let Some(qemu_net) = &command.qemu_net {
+        qemu_net.apply(qemu);
+    }
+    if let Some(boot_disk) = effective.boot_disk {
+        configure_boot_disk(qemu, boot_disk, artifact, command.virtio_devices);
+    }
+    configure_data_disk(qemu, effective.data_disk, data_disk, command.virtio_devices);
+    configure_disks(
+        qemu,
+        effective.data_disk,
+        &command.disks,
+        command.virtio_devices,
+    );
+    if let Some(host_share) = effective.host_share
+        && let Some(shared_dir) = &command.shared_dir
+    {
+        configure_host_share(
+            qemu,
+            host_share,
+            shared_dir,
+            command.shared_dir_access,
+            command.virtio_devices,
+        );
+    }
+    if let Some(watchdog) = effective.watchdog {
+        configure_watchdog(qemu, watchdog);
+    }
+    configure_entropy_device(qemu, effective.entropy, command.virtio_devices);
+    if effective.vm_generation_id {
+        configure_vm_generation_id(qemu);
+    }
+    configure_balloon(qemu, effective.balloon, command.virtio_devices);
+    if command.desktop {
+        configure_display(
+            qemu,
+            effective.display,
+            command.renderer.as_ref(),
+            command.virtio_devices,
+        );
+        configure_input(qemu, effective.input, command.virtio_devices);
+    }
+    configure_sound(
+        qemu,
+        effective.sound,
+        &command.audiodev,
+        command.virtio_devices,
+    );
+    if command.rpc_transport == VmRpcTransport::Vsock {
+        configure_vsock_device(
+            qemu,
+            effective.vsock,
+            command.vsock_cid,
+            command.virtio_devices,
+        );
+    }
 }
 
 /// Attaches the machine's translation unit.
@@ -9917,37 +9972,148 @@ mod tests {
     }
 
     #[test]
-    fn iommu_is_refused_on_a_memory_mapped_machine() {
+    fn iommu_enables_virtio_iommu_and_promotes_virtio_devices_to_pci() {
         let tempdir =
             tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
         let config = tempdir.path().join("missing-vm.json");
+        let shared = tempdir.path().join("share");
+        fs::create_dir(&shared).expect("shared dir");
+        let artifact = tempdir.path().join("boot.img");
+        let data_disk = tempdir.path().join("data.img");
 
-        for arch in [VmArch::Aarch64, VmArch::Riscv64] {
-            let error = resolve(VmCommand {
+        for (arch, acpi) in [
+            (VmArch::Aarch64, false),
+            (VmArch::Aarch64, true),
+            (VmArch::Riscv64, false),
+            (VmArch::X86_64, false),
+        ] {
+            let resolved = resolve(VmCommand {
                 arch,
+                acpi,
                 iommu: true,
+                desktop: true,
+                shared_dir: Some(shared.clone()),
                 config: Some(config.clone()),
                 ..minimal_command()
             })
-            .expect_err("a memory-mapped machine cannot confine its devices");
-            assert!(
-                error.to_string().contains("--iommu is not available"),
-                "unexpected error for {arch:?}: {error}"
+            .unwrap_or_else(|error| {
+                panic!("--iommu must resolve on {arch:?} (acpi={acpi}): {error}")
+            });
+            assert!(resolved.iommu);
+            assert_eq!(
+                resolved.virtio_devices.access,
+                VirtioPlatformAccess::Confined
             );
+            if acpi {
+                assert!(
+                    machine_options(&resolved).to_string().contains("acpi=on"),
+                    "expected acpi=on for {arch:?}"
+                );
+            }
+
+            let mut qemu = Command::new("qemu");
+            configure_machine_devices(&mut qemu, &resolved, &artifact, &data_disk);
+            let args: Vec<String> = qemu
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect();
+            let device_args: Vec<&str> = args
+                .windows(2)
+                .filter(|pair| pair[0] == "-device")
+                .map(|pair| pair[1].as_str())
+                .collect();
+
+            assert_eq!(
+                device_args.first().copied(),
+                Some("virtio-iommu-pci"),
+                "virtio-iommu-pci must be realised before any confined PCI device ({arch:?})"
+            );
+            for device in &device_args[1..] {
+                if device.starts_with("virtio-") || device.starts_with("vhost-vsock-") {
+                    assert!(
+                        device.contains("-pci,"),
+                        "expected PCI virtio device under --iommu for {arch:?}, got {device}"
+                    );
+                    assert!(
+                        device.contains("disable-legacy=on")
+                            && device.contains("iommu_platform=on"),
+                        "expected disable-legacy=on,iommu_platform=on on {device} ({arch:?})"
+                    );
+                }
+            }
+            assert!(
+                device_args
+                    .iter()
+                    .any(|device| device.starts_with("virtio-net-pci,")),
+                "expected virtio-net-pci for {arch:?}: {device_args:?}"
+            );
+            assert!(
+                device_args
+                    .iter()
+                    .any(|device| device.starts_with("virtio-blk-pci,")
+                        && device.contains("serial=helios-data")),
+                "expected PCI scratch disk for {arch:?}: {device_args:?}"
+            );
+            assert!(
+                device_args
+                    .iter()
+                    .any(|device| device.starts_with("virtio-9p-pci,")),
+                "expected virtio-9p-pci for {arch:?}: {device_args:?}"
+            );
+            assert!(
+                device_args
+                    .iter()
+                    .any(|device| device.starts_with("virtio-rng-pci,")),
+                "expected virtio-rng-pci for {arch:?}: {device_args:?}"
+            );
+            assert!(
+                device_args
+                    .iter()
+                    .any(|device| device.starts_with("virtio-balloon-pci,")),
+                "expected virtio-balloon-pci for {arch:?}: {device_args:?}"
+            );
+            assert!(
+                device_args
+                    .iter()
+                    .any(|device| device.starts_with("virtio-gpu-pci,")),
+                "expected virtio-gpu-pci for {arch:?}: {device_args:?}"
+            );
+            if arch == VmArch::Aarch64 {
+                assert!(
+                    device_args
+                        .iter()
+                        .any(|device| device.starts_with("virtio-blk-pci,")
+                            && device.contains("drive=bootdisk")
+                            && device.contains("iommu_platform=on")),
+                    "expected confined PCI bootdisk on aarch64: {device_args:?}"
+                );
+            }
         }
 
-        let resolved = resolve(VmCommand {
-            arch: VmArch::X86_64,
-            iommu: true,
-            config: Some(config),
-            ..minimal_command()
-        })
-        .expect("q35 carries its virtio devices on PCI");
-        assert!(resolved.iommu);
-        assert_eq!(
-            resolved.virtio_devices.access,
-            VirtioPlatformAccess::Confined
-        );
+        // Default non-IOMMU boots on aarch64 and riscv64 stay on MMIO.
+        for arch in [VmArch::Aarch64, VmArch::Riscv64] {
+            let resolved = resolve(VmCommand {
+                arch,
+                iommu: false,
+                config: Some(config.clone()),
+                ..minimal_command()
+            })
+            .expect("default non-IOMMU boot resolves");
+            let mut qemu = Command::new("qemu");
+            configure_machine_devices(&mut qemu, &resolved, &artifact, &data_disk);
+            let args: Vec<String> = qemu
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                args.iter().any(|arg| arg.starts_with("virtio-net-device")),
+                "expected default non-IOMMU {arch:?} to stay on virtio-mmio: {args:?}"
+            );
+            assert!(
+                !args.iter().any(|arg| arg == "virtio-iommu-pci"),
+                "non-IOMMU boot must not attach virtio-iommu-pci"
+            );
+        }
     }
 
     /// `--tpm swtpm` and `--tpm-state` as a command line spells them, and

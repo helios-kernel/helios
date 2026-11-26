@@ -9,12 +9,13 @@
 use arm_gic::Trigger;
 use fdt::Fdt;
 use fdt::node::FdtNode;
+use helios_firmware::VirtioIommuTopology;
 use helios_virtio::{InterruptTrigger, MmioInterrupt};
 
 use super::{
     ConsoleDescription, GicDescription, GrantableDevice, MAX_GRANTABLE_DEVICES, MmioRegion,
-    PlatformDescription, PlatformError, PlatformSource, PsciConduit, Slots, SpiInterrupt,
-    VirtioMmioSlot,
+    PciHostDescription, PciMemoryWindowDesc, PlatformDescription, PlatformError, PlatformSource,
+    PsciConduit, Slots, SpiInterrupt, VirtioMmioSlot,
 };
 
 /// `compatible` string of the interrupt controller this backend drives.
@@ -28,10 +29,17 @@ const PL031: &str = "arm,pl031";
 /// `compatible` string of a virtio transport slot, which the virtio
 /// walk already claims.
 const VIRTIO_MMIO: &str = "virtio,mmio";
+/// `compatible` string of the generic ECAM PCIe host bridge.
+const PCI_HOST_ECAM: &str = "pci-host-ecam-generic";
 /// `compatible` string of a TPM's FIFO interface over MMIO, the one
 /// QEMU writes for its `tpm-tis-device` (`hw/core/sysbus-fdt.c`,
 /// `add_tpm_tis_fdt_node`).
 const TPM_TIS_MMIO: &str = "tcg,tpm-tis-mmio";
+
+const PCI_RANGE_IO_SPACE: u8 = 0x01;
+const PCI_RANGE_MEMORY32_SPACE: u8 = 0x02;
+const PCI_RANGE_MEMORY64_SPACE: u8 = 0x03;
+const GIC_SPI_TYPE: u32 = 0;
 
 /// The mapping granule a grant's region has to respect.
 const FRAME: usize = helios_hal::pmm::PhysFrame::SIZE;
@@ -78,6 +86,7 @@ pub(super) fn describe(
             "virtio-mmio transports",
         );
     }
+    let (pci, iommu) = pci_and_iommu(fdt)?;
     Ok(PlatformDescription {
         source: PlatformSource::DeviceTree,
         console,
@@ -87,6 +96,8 @@ pub(super) fn describe(
             .map(|node| first_region(&node, PL031))
             .transpose()?,
         virtio,
+        pci,
+        iommu,
         grantable: grantable(fdt),
         tpm: tpm(fdt)?,
         boot_entropy_seed: helios_hal::entropy::device_tree_seed(fdt),
@@ -257,10 +268,266 @@ fn described_region(node: &FdtNode<'_, '_>) -> Option<MmioRegion> {
 /// Whether the kernel drives this node itself.
 fn drives_itself(node: &FdtNode<'_, '_>) -> bool {
     node.compatible().is_some_and(|entries| {
-        entries
-            .all()
-            .any(|entry| matches!(entry, GIC_V3 | PL011 | PL031 | VIRTIO_MMIO | TPM_TIS_MMIO))
+        entries.all().any(|entry| {
+            matches!(
+                entry,
+                GIC_V3 | PL011 | PL031 | VIRTIO_MMIO | PCI_HOST_ECAM | TPM_TIS_MMIO
+            )
+        })
     })
+}
+
+fn pci_and_iommu(
+    fdt: &Fdt<'static>,
+) -> Result<(Option<PciHostDescription>, Option<VirtioIommuTopology>), PlatformError> {
+    let Some(node) = find_compatible(fdt, PCI_HOST_ECAM) else {
+        return Ok((None, None));
+    };
+    let ecam = first_region(&node, PCI_HOST_ECAM)?;
+    let segment = match node.property("linux,pci-domain") {
+        None => 0,
+        Some(prop) => {
+            let value = be_u32(prop.value).ok_or(PlatformError::DeviceTree(
+                "PCI `linux,pci-domain` is not a single 32-bit cell",
+            ))?;
+            u16::try_from(value).map_err(|_| {
+                PlatformError::DeviceTree("PCI `linux,pci-domain` does not fit in u16")
+            })?
+        }
+    };
+    let (bus_start, bus_end) = match node.property("bus-range") {
+        None => (0, 255),
+        Some(prop) => {
+            if prop.value.len() != 8 {
+                return Err(PlatformError::DeviceTree(
+                    "PCI `bus-range` must contain two 32-bit cells",
+                ));
+            }
+            let start = be_u32(&prop.value[0..4]).ok_or(PlatformError::DeviceTree(
+                "PCI `bus-range` start cell is malformed",
+            ))?;
+            let end = be_u32(&prop.value[4..8]).ok_or(PlatformError::DeviceTree(
+                "PCI `bus-range` end cell is malformed",
+            ))?;
+            let start = u8::try_from(start).map_err(|_| {
+                PlatformError::DeviceTree("PCI `bus-range` start does not fit in u8")
+            })?;
+            let end = u8::try_from(end)
+                .map_err(|_| PlatformError::DeviceTree("PCI `bus-range` end does not fit in u8"))?;
+            if start > end {
+                return Err(PlatformError::DeviceTree(
+                    "PCI `bus-range` start exceeds end",
+                ));
+            }
+            (start, end)
+        }
+    };
+
+    let parent_address_cells = fdt.root().cell_sizes().address_cells;
+    let memory_windows = pci_memory_windows(&node, parent_address_cells)?;
+    let intx = pci_interrupt_map(fdt, &node, bus_start)?;
+    let iommu = helios_firmware::parse_devicetree_pci_iommu(fdt, &node, segment)?;
+
+    Ok((
+        Some(PciHostDescription {
+            ecam_base: ecam.base,
+            segment,
+            bus_start,
+            bus_end,
+            memory_windows,
+            intx,
+        }),
+        iommu,
+    ))
+}
+
+fn pci_memory_windows(
+    node: &FdtNode<'_, '_>,
+    parent_address_cells: usize,
+) -> Result<Slots<PciMemoryWindowDesc, { super::MAX_PCI_MEMORY_WINDOWS }>, PlatformError> {
+    let ranges = node.property("ranges").ok_or(PlatformError::DeviceTree(
+        "PCI host node is missing `ranges`",
+    ))?;
+    let child_cells = node.cell_sizes();
+    if child_cells.address_cells != 3 {
+        return Err(PlatformError::DeviceTree(
+            "PCI host `#address-cells` must be 3",
+        ));
+    }
+    let entry_cells = child_cells.address_cells + parent_address_cells + child_cells.size_cells;
+    let entry_bytes = entry_cells * 4;
+    if entry_bytes == 0 || !ranges.value.len().is_multiple_of(entry_bytes) {
+        return Err(PlatformError::DeviceTree(
+            "PCI host `ranges` length is not a whole number of entries",
+        ));
+    }
+
+    let mut windows = Slots::new();
+    for entry in ranges.value.chunks_exact(entry_bytes) {
+        let child_hi = be_u32(&entry[0..4])
+            .ok_or(PlatformError::DeviceTree("PCI `ranges` entry is truncated"))?;
+        let space = (child_hi >> 24) as u8;
+        if space == PCI_RANGE_IO_SPACE {
+            continue;
+        }
+        if space != PCI_RANGE_MEMORY32_SPACE && space != PCI_RANGE_MEMORY64_SPACE {
+            return Err(PlatformError::DeviceTree(
+                "PCI `ranges` declares an unsupported address space code",
+            ));
+        }
+        let pci_base = (u64::from(be_u32(&entry[4..8]).unwrap_or(0)) << 32)
+            | u64::from(be_u32(&entry[8..12]).unwrap_or(0));
+        let parent_offset = child_cells.address_cells * 4;
+        let cpu_base =
+            be_cells_u64(&entry[parent_offset..parent_offset + parent_address_cells * 4]).ok_or(
+                PlatformError::DeviceTree("PCI `ranges` parent address cell count is unsupported"),
+            )?;
+        let size_offset = parent_offset + parent_address_cells * 4;
+        let size = be_cells_u64(&entry[size_offset..size_offset + child_cells.size_cells * 4])
+            .ok_or(PlatformError::DeviceTree(
+                "PCI `ranges` size cell count is unsupported",
+            ))?;
+        if size == 0 {
+            return Err(PlatformError::DeviceTree(
+                "PCI `ranges` memory window has zero size",
+            ));
+        }
+        windows.push(
+            PciMemoryWindowDesc {
+                pci_base,
+                cpu_base,
+                size,
+            },
+            "PCI memory windows",
+        );
+    }
+    if windows.len() == 0 {
+        return Err(PlatformError::DeviceTree(
+            "PCI host `ranges` exposes no memory-mapped apertures",
+        ));
+    }
+    Ok(windows)
+}
+
+fn pci_interrupt_map(
+    fdt: &Fdt<'_>,
+    node: &FdtNode<'_, '_>,
+    bus_start: u8,
+) -> Result<[[Option<SpiInterrupt>; 4]; 32], PlatformError> {
+    let mut table = [[None; 4]; 32];
+    let (Some(map_prop), Some(mask_prop)) = (
+        node.property("interrupt-map"),
+        node.property("interrupt-map-mask"),
+    ) else {
+        return Ok(table);
+    };
+    if mask_prop.value.len() != 16 {
+        return Err(PlatformError::DeviceTree(
+            "PCI `interrupt-map-mask` must be 4 cells (16 bytes)",
+        ));
+    }
+    let mask_hi = be_u32(&mask_prop.value[0..4]).unwrap_or(0);
+    let mask_pin = be_u32(&mask_prop.value[12..16]).unwrap_or(0);
+
+    let bytes = map_prop.value;
+    if !bytes.len().is_multiple_of(4) {
+        return Err(PlatformError::DeviceTree(
+            "PCI `interrupt-map` length is not a multiple of 4 bytes",
+        ));
+    }
+
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if offset + 20 > bytes.len() {
+            return Err(PlatformError::DeviceTree(
+                "PCI `interrupt-map` entry is truncated",
+            ));
+        }
+        let entry_hi = be_u32(&bytes[offset..offset + 4]).unwrap_or(0);
+        let entry_pin = be_u32(&bytes[offset + 12..offset + 16]).unwrap_or(0);
+        let parent_phandle = be_u32(&bytes[offset + 16..offset + 20]).unwrap_or(0);
+        offset += 20;
+
+        let parent = fdt
+            .find_phandle(parent_phandle)
+            .ok_or(PlatformError::DeviceTree(
+                "PCI `interrupt-map` references an unknown interrupt-parent phandle",
+            ))?;
+        // Per DTSpec §2.4.3.1, the interrupt-parent's `#address-cells`
+        // defaults to 0 when omitted.
+        let parent_address_cells = parent
+            .property("#address-cells")
+            .and_then(|prop| be_u32(prop.value))
+            .unwrap_or(0) as usize;
+        let parent_irq_cells = parent
+            .property("#interrupt-cells")
+            .and_then(|prop| be_u32(prop.value))
+            .ok_or(PlatformError::DeviceTree(
+                "PCI interrupt parent is missing `#interrupt-cells`",
+            ))? as usize;
+        let tail_bytes = (parent_address_cells + parent_irq_cells) * 4;
+        if offset + tail_bytes > bytes.len() {
+            return Err(PlatformError::DeviceTree(
+                "PCI `interrupt-map` parent interrupt specifier is truncated",
+            ));
+        }
+        offset += parent_address_cells * 4;
+        if parent_irq_cells != 3 {
+            return Err(PlatformError::DeviceTree(
+                "AArch64 PCI interrupt parent does not use the 3-cell GICv3 specifier",
+            ));
+        }
+        let irq_type = be_u32(&bytes[offset..offset + 4]).unwrap_or(u32::MAX);
+        let irq_number = be_u32(&bytes[offset + 4..offset + 8]).unwrap_or(0);
+        let irq_flags = be_u32(&bytes[offset + 8..offset + 12]).unwrap_or(0);
+        offset += 12;
+
+        if irq_type != GIC_SPI_TYPE {
+            return Err(PlatformError::DeviceTree(
+                "AArch64 PCI `interrupt-map` maps to a non-SPI GIC interrupt",
+            ));
+        }
+        let trigger = match irq_flags & 0xf {
+            0x1 | 0x2 => Trigger::Edge,
+            0x4 | 0x8 => Trigger::Level,
+            _ => {
+                return Err(PlatformError::DeviceTree(
+                    "AArch64 PCI `interrupt-map` declares an unknown trigger mode",
+                ));
+            }
+        };
+        let interrupt = SpiInterrupt {
+            number: irq_number,
+            trigger,
+        };
+
+        for dev in 0_u8..32 {
+            let child_hi = (u32::from(bus_start) << 16) | (u32::from(dev) << 11);
+            if (child_hi & mask_hi) != (entry_hi & mask_hi) {
+                continue;
+            }
+            for pin in 1_u8..=4 {
+                if (u32::from(pin) & mask_pin) == (entry_pin & mask_pin) {
+                    table[usize::from(dev)][usize::from(pin - 1)] = Some(interrupt);
+                }
+            }
+        }
+    }
+
+    Ok(table)
+}
+
+fn be_u32(bytes: &[u8]) -> Option<u32> {
+    let arr: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+    Some(u32::from_be_bytes(arr))
+}
+
+fn be_cells_u64(bytes: &[u8]) -> Option<u64> {
+    match bytes.len() {
+        4 => Some(u64::from(be_u32(bytes)?)),
+        8 => Some((u64::from(be_u32(&bytes[0..4])?) << 32) | u64::from(be_u32(&bytes[4..8])?)),
+        _ => None,
+    }
 }
 
 fn gic(fdt: &Fdt<'_>) -> Result<GicDescription, PlatformError> {
