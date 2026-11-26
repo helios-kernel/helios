@@ -645,8 +645,9 @@ impl<I: Iommu> IommuDomains<I> {
         }
         let doorbells = windows_of(doorbells.as_slice());
 
-        // The domain slots start above every identity-mapped doorbell so
-        // a domain address can never collide with one.
+        // The domain slots start above every identity-mapped doorbell and
+        // never at zero, so a domain address can neither collide with a
+        // doorbell nor look like a null DMA address.
         let doorbell_end = doorbells
             .iter()
             .flatten()
@@ -655,13 +656,14 @@ impl<I: Iommu> IommuDomains<I> {
             .map(|last| last.checked_add(1).ok_or(IommuError::OutOfRange))
             .transpose()?
             .unwrap_or(0);
-        let first_base = geometry.align_up(doorbell_end.max(*geometry.input_range.start()));
+        let granule = geometry.granule();
+        let first_base =
+            geometry.align_up(doorbell_end.max(*geometry.input_range.start()).max(granule));
         let input_end = *geometry.input_range.end();
         if first_base > input_end {
             return Err(IommuError::OutOfRange);
         }
         let available = u128::from(input_end) - u128::from(first_base) + 1;
-        let granule = geometry.granule();
         let raw_slot = u64::try_from(available / MAX_IOMMU_ENDPOINTS as u128).unwrap_or(u64::MAX);
         let slot_span = raw_slot & !(granule - 1);
         if slot_span < granule {
@@ -1247,6 +1249,36 @@ mod tests {
         assert_eq!(
             domains.confine(EndpointId::new(0xffff)).err(),
             Some(IommuError::OutOfResources)
+        );
+    }
+
+    /// INTx-driven platforms (aarch64/riscv64 virt) have no MSI doorbell
+    /// ranges; even with an empty doorbell list, domain 0 must never issue
+    /// a zero IOVA.
+    #[test]
+    fn empty_doorbells_keep_domain_iova_nonzero() {
+        let sim = SimulatingIommu::new(u32::MAX);
+        let mut domains =
+            IommuDomains::new(sim.clone(), &[], 0, false).expect("layout builds without doorbells");
+        let ep = EndpointId::new(0x08);
+        let dom = domains.confine(ep).expect("confine");
+
+        let mapping = dom
+            .map_foreign(PhysicalRange::new(0x8000_0000, 0x1000), DmaAccess::READ)
+            .expect("foreign mapping");
+        assert!(
+            mapping.device_address().get() >= 0x1000,
+            "domain 0 must never hand out a zero IOVA, got {:#x}",
+            mapping.device_address().get()
+        );
+        assert_eq!(
+            sim.dma_access(
+                ep,
+                mapping.device_address().get(),
+                DmaAccess::READ,
+                &domains.report(),
+            ),
+            Ok(0x8000_0000)
         );
     }
 }

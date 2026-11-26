@@ -151,6 +151,7 @@ pub(crate) struct GrantableDevice {
 /// for.
 const KERNEL_DRIVEN: &[&str] = &[
     "virtio,mmio",
+    "pci-host-ecam-generic",
     "riscv,plic0",
     "sifive,plic-1.0.0",
     "ns16550a",

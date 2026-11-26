@@ -440,6 +440,79 @@ impl Aarch64UserAddressSpace {
         )
     }
 
+    /// Maps `physical_base..physical_base + size` as Device-nGnRnE 2 MiB
+    /// blocks in the higher-half direct map using heap-allocated page tables,
+    /// returning the virtual address of `physical_base`.
+    ///
+    /// Used for PCI ECAM and BAR windows whose addresses sit outside the
+    /// early static MMIO table pool.
+    fn map_device_mmio(&self, physical_base: usize, size: usize) -> usize {
+        assert!(size != 0, "AArch64 device MMIO range has zero size");
+        let end = physical_base.checked_add(size).unwrap_or_else(|| {
+            panic!("AArch64 device MMIO range overflow at {physical_base:#x}+{size:#x}")
+        });
+        let _state = self.state.lock();
+        let l0 = self.root();
+        let device_attr = crate::PAGE_ATTR_DEVICE_INDEX << crate::PAGE_ATTR_INDEX_SHIFT;
+        let attr = device_attr | AF | PXN | UXN;
+        let mut mapped_any = false;
+        let mut block = physical_base & !(BLOCK_2M - 1);
+        while block < end {
+            let virt = block
+                .checked_add(self.physical_memory_offset)
+                .unwrap_or_else(|| {
+                    panic!("AArch64 device MMIO HHDM address overflow at {block:#x}")
+                });
+            assert!(
+                virt < USER_VA_BASE,
+                "AArch64 device MMIO {block:#x} mapped at {virt:#x} collides with user VA window"
+            );
+            let l1 = self.ensure_table(l0, (virt >> 39) & 0x1ff);
+            let l2 = self.ensure_table(l1, (virt >> 30) & 0x1ff);
+            let l2_index = (virt >> 21) & 0x1ff;
+            // SAFETY: `l2` is a live 512-entry level-2 table frame in HHDM
+            // and `l2_index` is masked to `0..512`.
+            let slot = unsafe { l2.add(l2_index) };
+            // SAFETY: `slot` points to an aligned 64-bit descriptor in `l2`
+            // and `self.state` is held.
+            let existing = unsafe { slot.read_volatile() };
+            if existing & VALID != 0 {
+                assert!(
+                    existing & 0b11 == BLOCK_DESCRIPTOR,
+                    "AArch64 device MMIO 2 MiB block at {virt:#x} collided with a page table ({existing:#x})"
+                );
+                assert!(
+                    (existing & PT_ADDR_MASK) as usize == block
+                        && (existing & ATTR_INDEX_MASK) == device_attr,
+                    "AArch64 device MMIO 2 MiB block at {virt:#x} collided with {existing:#x}"
+                );
+            } else {
+                // SAFETY: `slot` is an invalid level-2 slot in `l2`, `self.state`
+                // is held, and `dsb ishst; isb` orders the store before use.
+                unsafe {
+                    slot.write_volatile((block as u64) | attr | BLOCK_DESCRIPTOR);
+                }
+                mapped_any = true;
+            }
+            block = block.checked_add(BLOCK_2M).unwrap_or_else(|| {
+                panic!("AArch64 device MMIO block iteration overflow at {block:#x}")
+            });
+        }
+        if mapped_any {
+            // SAFETY: orders all newly installed valid block descriptors
+            // before any subsequent MMIO access; every modified slot went
+            // from invalid to valid so no TLBI is required.
+            unsafe {
+                asm!("dsb ishst", "isb", options(nostack, preserves_flags));
+            }
+        }
+        physical_base
+            .checked_add(self.physical_memory_offset)
+            .unwrap_or_else(|| {
+                panic!("AArch64 device MMIO virtual address overflow at {physical_base:#x}")
+            })
+    }
+
     fn map_4k_no_flush(
         &self,
         virt: usize,
@@ -1757,6 +1830,12 @@ unsafe fn flush_tlb_pages(start: usize, pages: usize) {
 /// the AS is in BSS until the first `call_once`, after which every
 /// access is a single atomic load.
 static USER_AS: Once<Aarch64UserAddressSpace> = Once::new();
+
+/// Maps a physical MMIO region as Device-nGnRnE in the higher-half direct
+/// map using heap-backed page tables and returns its virtual base address.
+pub(crate) fn map_device_mmio(physical_base: usize, size: usize) -> usize {
+    user_as().map_device_mmio(physical_base, size)
+}
 
 /// Initialise the boot-time user address space and register its
 /// runtime custom-virtual-memory hooks. Must be called once on the
