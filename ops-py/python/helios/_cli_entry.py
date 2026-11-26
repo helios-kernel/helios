@@ -1,4 +1,4 @@
-"""Entrypoint invoked by ``helios python`` and ``helios vm ... python``.
+"""Entrypoint invoked by ``helios python``, ``helios vm ... python``, and ``python -m helios``.
 
 Reads target, fleet, identity, and attenuation context from environment
 variables set by the ``helios`` CLI:
@@ -12,8 +12,9 @@ variables set by the ``helios`` CLI:
 - ``HELIOS_TARGETS_PATH``: optional path overriding ``targets.toml``
 
 Supports inline code (``-c <code>``), scripts (``<script.py> [args...]``), and
-an interactive async-capable REPL with top-level ``await`` and ``rlcompleter``
-``<Tab>`` completion.
+an interactive async-capable REPL with top-level ``await`` (IPython with
+``autoawait`` when installed on a TTY, otherwise ``AsyncInteractiveConsole``
+with ``rlcompleter`` ``<Tab>`` completion) and clean session teardown on exit.
 """
 
 from __future__ import annotations
@@ -90,6 +91,7 @@ async def _open_context(cfg: CliContextConfig) -> tuple[helios.Session | None, h
             identity=cfg.identity,
             targets_path=cfg.targets_path,
         )
+        await fleet_obj.__aenter__()
         primary_session: helios.Session | None = None
         if fleet_obj.targets:
             primary_session = await helios.connect(
@@ -99,6 +101,7 @@ async def _open_context(cfg: CliContextConfig) -> tuple[helios.Session | None, h
                 identity=cfg.identity,
                 targets_path=cfg.targets_path,
             )
+            await primary_session.__aenter__()
         return primary_session, fleet_obj
 
     if cfg.target is not None:
@@ -109,6 +112,7 @@ async def _open_context(cfg: CliContextConfig) -> tuple[helios.Session | None, h
             identity=cfg.identity,
             targets_path=cfg.targets_path,
         )
+        await session.__aenter__()
         return session, None
 
     store = helios.TargetStore.load(cfg.targets_path)
@@ -120,9 +124,20 @@ async def _open_context(cfg: CliContextConfig) -> tuple[helios.Session | None, h
             identity=cfg.identity,
             targets_path=cfg.targets_path,
         )
+        await session.__aenter__()
         return session, None
 
     return None, None
+
+
+async def _close_context(
+    session: helios.Session | None,
+    fleet_obj: helios.Fleet | None,
+) -> None:
+    if session is not None:
+        await session.__aexit__(None, None, None)
+    if fleet_obj is not None:
+        await fleet_obj.__aexit__(None, None, None)
 
 
 def _build_namespace(
@@ -137,8 +152,14 @@ def _build_namespace(
         "sys": sys,
         "helios": helios,
         "session": session,
+        "s": session,
         "fleet": fleet_obj,
         "helios_config": cfg,
+        "Grants": helios.Grants,
+        "MountSpec": helios.MountSpec,
+        "VmDisk": helios.VmDisk,
+        "VmShare": helios.VmShare,
+        "InspectNode": helios.InspectNode,
     }
     if session is not None:
         ns["inspect"] = session.inspect
@@ -147,9 +168,17 @@ def _build_namespace(
         ns["kill"] = session.kill
         ns["trace"] = session.trace_recent
         ns["bundle"] = session.bundle
+        ns["components"] = session.components
+        ns["oci"] = session.oci
+        ns["linux"] = session.linux
+        ns["mounts"] = session.mounts
+        ns["btrfs"] = session.btrfs
+        ns["vm"] = session.vm
     elif fleet_obj is not None:
         ns["inspect"] = fleet_obj.inspect
         ns["ps"] = fleet_obj.ps
+        ns["components"] = fleet_obj.components
+        ns["oci"] = fleet_obj.oci
     return ns
 
 
@@ -164,14 +193,17 @@ async def _run_code_async(
     argv: list[str],
 ) -> None:
     session, fleet_obj = await _open_context(cfg)
-    ns = _build_namespace(session, fleet_obj, cfg)
-    if filename != "<string>":
-        ns["__file__"] = filename
-    sys.argv = argv
-    compiled = _compile_with_top_level_await(source, filename, "exec")
-    result = eval(compiled, ns)
-    if py_inspect.iscoroutine(result):
-        await result
+    try:
+        ns = _build_namespace(session, fleet_obj, cfg)
+        if filename != "<string>":
+            ns["__file__"] = filename
+        sys.argv = argv
+        compiled = _compile_with_top_level_await(source, filename, "exec")
+        result = eval(compiled, ns)
+        if py_inspect.iscoroutine(result):
+            await result
+    finally:
+        await _close_context(session, fleet_obj)
 
 
 def _run_code_sync_or_async(
@@ -186,13 +218,23 @@ def _run_code_sync_or_async(
         asyncio.run(_run_code_async(source, filename, cfg, argv))
         return 0
 
-    session, fleet_obj = asyncio.run(_open_context(cfg))
-    ns = _build_namespace(session, fleet_obj, cfg)
-    if filename != "<string>":
-        ns["__file__"] = filename
-    sys.argv = argv
-    exec(compiled, ns)
-    return 0
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    session: helios.Session | None = None
+    fleet_obj: helios.Fleet | None = None
+    try:
+        session, fleet_obj = loop.run_until_complete(_open_context(cfg))
+        ns = _build_namespace(session, fleet_obj, cfg)
+        if filename != "<string>":
+            ns["__file__"] = filename
+        sys.argv = argv
+        exec(compiled, ns)
+        return 0
+    finally:
+        try:
+            loop.run_until_complete(_close_context(session, fleet_obj))
+        finally:
+            loop.close()
 
 
 def _configure_readline(namespace: dict[str, Any]) -> None:
@@ -207,6 +249,25 @@ def _configure_readline(namespace: dict[str, Any]) -> None:
         readline.parse_and_bind("bind ^I rl_complete")
     else:
         readline.parse_and_bind("tab: complete")
+
+
+def _try_run_ipython(namespace: dict[str, Any], banner: str) -> int | None:
+    """Launch an embedded IPython shell with ``autoawait`` enabled when available."""
+    if os.environ.get("HELIOS_NO_IPYTHON"):
+        return None
+    try:
+        from IPython.terminal.embed import InteractiveShellEmbed
+        from traitlets.config import Config
+    except ImportError:
+        return None
+
+    cfg = Config()
+    cfg.InteractiveShell.autoawait = True
+    cfg.InteractiveShell.loop_runner = "asyncio"
+    cfg.TerminalInteractiveShell.confirm_exit = False
+    shell = InteractiveShellEmbed(config=cfg, user_ns=namespace, banner1=banner)
+    shell()
+    return 0
 
 
 class AsyncInteractiveConsole:
@@ -284,15 +345,17 @@ def _read_non_tty_line() -> str:
 def _run_repl(cfg: CliContextConfig) -> int:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    session: helios.Session | None = None
+    fleet_obj: helios.Fleet | None = None
     try:
         session, fleet_obj = loop.run_until_complete(_open_context(cfg))
         ns = _build_namespace(session, fleet_obj, cfg)
         if session is not None:
             target_desc = f"{session.target.name} ({session.target.uri})"
-            bound = "session, inspect, ps, helios"
+            bound = "session, s, inspect, ps, components, oci, linux, mounts, btrfs, vm, helios"
         elif fleet_obj is not None:
             target_desc = f"fleet ({len(fleet_obj.targets)} targets)"
-            bound = "fleet, inspect, ps, helios"
+            bound = "fleet, inspect, ps, components, oci, helios"
         else:
             target_desc = "disconnected (use `await helios.connect(...)`)"
             bound = "helios, asyncio, sys"
@@ -300,10 +363,17 @@ def _run_repl(cfg: CliContextConfig) -> int:
             f"Helios Python async REPL [{target_desc}]\n"
             f"Pre-bound: {bound}. Top-level `await` and <Tab> completion enabled."
         )
+        if sys.stdin.isatty():
+            ip_rc = _try_run_ipython(ns, banner)
+            if ip_rc is not None:
+                return ip_rc
         console = AsyncInteractiveConsole(ns, loop)
         return console.interact(banner)
     finally:
-        loop.close()
+        try:
+            loop.run_until_complete(_close_context(session, fleet_obj))
+        finally:
+            loop.close()
 
 
 def _parse_args(argv: list[str]) -> tuple[str | None, Path | None, list[str]]:
@@ -315,7 +385,7 @@ def _parse_args(argv: list[str]) -> tuple[str | None, Path | None, list[str]]:
         return argv[1], None, ["-c", *argv[2:]]
     if argv[0] in ("-h", "--help"):
         print(
-            "usage: python -m helios._cli_entry [-c CODE | SCRIPT [ARGS...]]\n"
+            "usage: python -m helios [-c CODE | SCRIPT [ARGS...]]\n"
             "Starts an async Helios Python REPL when neither -c nor SCRIPT is given."
         )
         raise SystemExit(0)

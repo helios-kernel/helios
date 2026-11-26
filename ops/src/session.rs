@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use helios_inspector_protocol::auth::ClientIdentity;
 use helios_wit_rpc::inspector::helios::system::{
-    component_control::{self as rpc_cc, ComponentStatus},
+    component_control::ComponentStatus,
     inspect::{self as rpc_inspect, Query, SnapshotResult},
     instances::{self as rpc_instances, Instance},
     ipc::Endpoint as WireIpcEndpoint,
@@ -19,24 +19,31 @@ use helios_wit_rpc::inspector::helios::system::{
     },
     programs::{
         self as rpc_programs, AuthorityScope, CapabilityGrant, ChildTermination, ClockGrant,
-        ClockRight, DeviceClass, DeviceGrant, DiagnosticsGrant, DirectoryGrant, ExecOutput,
-        ExecRequest, ExecResult, FilesystemRight, LinkGrant, LinkRight, MachineGrant, MachineRight,
-        MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight,
-        SettingsGrant, SettingsRight, SpawnRequest as WireSpawnRequest, TerminalGrant,
-        TerminalRight,
+        ClockRight, DefaultLinuxImage, DeviceClass, DeviceGrant, DiagnosticsGrant, DirectoryGrant,
+        ExecOutput, ExecRequest, ExecResult, FilesystemRight, LinkGrant, LinkRight, MachineGrant,
+        MachineRight, MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant,
+        ProcessRight, SettingsGrant, SettingsRight, SpawnRequest as WireSpawnRequest,
+        TerminalGrant, TerminalRight,
     },
     snapshot::{self as rpc_snapshot, SnapshotHold as RemoteSnapshotHold},
     tracing as rpc_tracing,
 };
 use helios_wit_rpc::inspector_fs::{self, EntryKind, MountBtrfsRequest};
 use helios_wit_rpc::inspector_snapshot::KernelSnapshot;
-use helios_wit_rpc::{RpcError, StreamReader};
+use helios_wit_rpc::{RpcError, StreamReader, StreamWriter, stream as rpc_stream};
 
+use crate::components::ComponentsClient;
 use crate::error::OpsError;
+use crate::oci::OciClient;
+use crate::storage::{BtrfsClient, MountsClient};
+use crate::symbolize::{
+    SymbolizedInstructionProfile, render_folded_instruction_profile, symbolize_instruction_profile,
+};
 use crate::target::{
     Attenuation, GrantRight, IdentityProfile, Target, normalize_scope, scope_contains,
 };
 use crate::transport::{ProtocolClient, RpcConnection, SecurityMode};
+use crate::vm::VmClient;
 
 /// Default per-RPC timeout when none is configured on [`SessionOptions`].
 pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(180);
@@ -503,6 +510,23 @@ pub fn parse_posix_signal(raw: &str) -> Result<u8, OpsError> {
     Ok(num)
 }
 
+enum ChildStdinState {
+    /// No pre-buffered stdin was supplied and `write_stdin` has not opened an
+    /// interactive stream yet. Deferring the `child.stdin` RPC until the first
+    /// `write_stdin` or `close_stdin`/`wait` avoids holding an open stream when
+    /// a caller only waits on the child.
+    Lazy,
+    /// Interactive stdin stream opened by `write_stdin`.
+    Open {
+        writer: StreamWriter<u8>,
+        done_task: tokio::task::JoinHandle<()>,
+    },
+    /// Pre-buffered stdin was already sent, or `close_stdin` already closed it.
+    Closed {
+        done_task: Option<tokio::task::JoinHandle<()>>,
+    },
+}
+
 /// Streaming handle to a remotely spawned program.
 pub struct Child {
     session: Session,
@@ -510,7 +534,7 @@ pub struct Child {
     instance_id: Arc<AtomicU64>,
     pub stdout: async_channel::Receiver<Result<Vec<u8>, OpsError>>,
     pub stderr: async_channel::Receiver<Result<Vec<u8>, OpsError>>,
-    stdin_task: Option<tokio::task::JoinHandle<()>>,
+    stdin_state: Arc<tokio::sync::Mutex<ChildStdinState>>,
     started_at: Instant,
 }
 
@@ -552,20 +576,23 @@ impl Child {
             stderr_tx,
         );
 
-        let stdin_reader = if stdin_bytes.is_empty() {
-            StreamReader::empty()
+        let stdin_state = if stdin_bytes.is_empty() {
+            ChildStdinState::Lazy
         } else {
-            StreamReader::from_vec(stdin_bytes)
+            let stdin_reader = StreamReader::from_vec(stdin_bytes);
+            let stdin_done = session
+                .call(
+                    "system.programs.child.stdin",
+                    remote_child.stdin(stdin_reader),
+                )
+                .await?;
+            let task = tokio::spawn(async move {
+                let _ = stdin_done.await;
+            });
+            ChildStdinState::Closed {
+                done_task: Some(task),
+            }
         };
-        let stdin_done = session
-            .call(
-                "system.programs.child.stdin",
-                remote_child.stdin(stdin_reader),
-            )
-            .await?;
-        let stdin_task = Some(tokio::spawn(async move {
-            let _ = stdin_done.await;
-        }));
 
         Ok(Self {
             session,
@@ -573,7 +600,7 @@ impl Child {
             instance_id,
             stdout: stdout_rx,
             stderr: stderr_rx,
-            stdin_task,
+            stdin_state: Arc::new(tokio::sync::Mutex::new(stdin_state)),
             started_at,
         })
     }
@@ -583,6 +610,75 @@ impl Child {
     pub fn instance_id(&self) -> Option<u64> {
         let id = self.instance_id.load(Ordering::Acquire);
         (id != 0).then_some(id)
+    }
+
+    /// Write a chunk of bytes into the running child's stdin stream.
+    pub async fn write_stdin(&self, data: &[u8]) -> Result<(), OpsError> {
+        let mut guard = self.stdin_state.lock().await;
+        match &mut *guard {
+            ChildStdinState::Closed { .. } => return Err(OpsError::StdinClosed),
+            ChildStdinState::Lazy => {
+                let (tx, rx) = rpc_stream::<u8>();
+                let stdin_done = self
+                    .session
+                    .call("system.programs.child.stdin", self.remote_child.stdin(rx))
+                    .await?;
+                let done_task = tokio::spawn(async move {
+                    let _ = stdin_done.await;
+                });
+                *guard = ChildStdinState::Open {
+                    writer: tx,
+                    done_task,
+                };
+            }
+            ChildStdinState::Open { .. } => {}
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let ChildStdinState::Open { writer, .. } = &mut *guard else {
+            return Err(OpsError::StdinClosed);
+        };
+        writer
+            .send_batch(data.to_vec())
+            .await
+            .map_err(|source| OpsError::Rpc {
+                operation: "system.programs.child.stdin",
+                source,
+            })
+    }
+
+    /// Close the child's stdin stream and deliver EOF.
+    pub async fn close_stdin(&self) -> Result<(), OpsError> {
+        let mut guard = self.stdin_state.lock().await;
+        let prev = std::mem::replace(&mut *guard, ChildStdinState::Closed { done_task: None });
+        match prev {
+            ChildStdinState::Lazy => {
+                let stdin_done = self
+                    .session
+                    .call(
+                        "system.programs.child.stdin",
+                        self.remote_child.stdin(StreamReader::empty()),
+                    )
+                    .await?;
+                let done_task = tokio::spawn(async move {
+                    let _ = stdin_done.await;
+                });
+                *guard = ChildStdinState::Closed {
+                    done_task: Some(done_task),
+                };
+            }
+            ChildStdinState::Open { writer, done_task } => {
+                let _ = writer.close().await;
+                *guard = ChildStdinState::Closed {
+                    done_task: Some(done_task),
+                };
+            }
+            ChildStdinState::Closed { done_task } => {
+                *guard = ChildStdinState::Closed { done_task };
+            }
+        }
+        Ok(())
     }
 
     /// Deliver a POSIX signal (`SIGINT`/`INT`/`2`, `SIGTERM`/`TERM`/`15`,
@@ -616,13 +712,18 @@ impl Child {
     }
 
     /// Await completion of the remote execution and return its [`ExecResult`].
-    pub async fn wait(mut self) -> Result<ExecResult, OpsError> {
+    pub async fn wait(self) -> Result<ExecResult, OpsError> {
+        let _ = self.close_stdin().await;
         let status = self
             .session
             .call("system.programs.child.wait", self.remote_child.wait())
             .await?
             .map_err(OpsError::from)?;
-        if let Some(task) = self.stdin_task.take() {
+        let done_task = match &mut *self.stdin_state.lock().await {
+            ChildStdinState::Closed { done_task } => done_task.take(),
+            ChildStdinState::Lazy | ChildStdinState::Open { .. } => None,
+        };
+        if let Some(task) = done_task {
             let _ = task.await;
         }
         self.instance_id
@@ -695,6 +796,44 @@ impl SnapshotHold {
 
     /// End the snapshot hold on the guest so its host share re-attaches.
     pub async fn release(mut self) -> Result<(), OpsError> {
+        drop(self.handle.take());
+        Ok(())
+    }
+}
+
+/// Standalone RAII lease holding a live `helios:system/profiling.sampling-session`
+/// resource on the remote guest.
+///
+/// Dropping this handle non-blockingly emits `Frame::ResourceDrop` to the
+/// remote `inspector-worker` (zero `block_on`), restoring normal processor
+/// timer periods while keeping collected samples readable via
+/// [`Session::profile_instruction_samples`].
+pub struct SamplingSession {
+    session: Session,
+    handle: Option<rpc_profiling::SamplingSession>,
+}
+
+impl SamplingSession {
+    /// Returns `true` while the remote sampling lease is still held.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.handle.is_some()
+    }
+
+    /// Read collected instruction samples while sampling remains active.
+    pub async fn samples(&self) -> Result<InstructionProfile, OpsError> {
+        self.session.profile_instruction_samples().await
+    }
+
+    /// Read collected instruction samples and release the sampling lease.
+    pub async fn stop_and_collect(mut self) -> Result<InstructionProfile, OpsError> {
+        let profile = self.session.profile_instruction_samples().await;
+        drop(self.handle.take());
+        profile
+    }
+
+    /// Stop instruction sampling cleanly without blocking.
+    pub async fn stop(mut self) -> Result<(), OpsError> {
         drop(self.handle.take());
         Ok(())
     }
@@ -916,56 +1055,64 @@ impl Session {
         Ok(id)
     }
 
+    /// Component-topology control client (`list`, `status`, `start`, `stop`, `restart`).
+    #[must_use]
+    pub fn components(&self) -> ComponentsClient {
+        ComponentsClient::new(self.clone())
+    }
+
+    /// Remote OCI image store client (`pull`, `list`, `inspect`, `remove`).
+    #[must_use]
+    pub fn oci(&self) -> OciClient {
+        OciClient::new(self.clone())
+    }
+
+    /// Remote OCI image store client targeting a custom guest `store_root`.
+    pub fn oci_with_store_root(&self, store_root: impl AsRef<str>) -> Result<OciClient, OpsError> {
+        OciClient::with_store_root(self.clone(), store_root)
+    }
+
+    /// Remote mount-table client (`list`, `mount`, `mount_btrfs`, `unmount`).
+    #[must_use]
+    pub fn mounts(&self) -> MountsClient {
+        MountsClient::new(self.clone())
+    }
+
+    /// Remote `helios:system/btrfs` subvolume, extent, device, and quota client.
+    #[must_use]
+    pub fn btrfs(&self) -> BtrfsClient {
+        BtrfsClient::new(self.clone())
+    }
+
+    /// Remote custom Linux `MicroVm` orchestration client (`list`, `spawn`, `builder`).
+    #[must_use]
+    pub fn vm(&self) -> VmClient {
+        VmClient::new(self.clone())
+    }
+
     /// List configured components via opt-in `helios:system/component-control`.
     pub async fn list_components(&self) -> Result<Vec<ComponentStatus>, OpsError> {
-        self.require_right(GrantRight::InstanceRead)?;
-        let client = rpc_cc::RpcClient::new(self.connection.client().clone());
-        let answer = self
-            .call(
-                "system.component-control.list-components",
-                client.list_components(),
-            )
-            .await?;
-        answer.map_err(|err| OpsError::from_component_control("list-components", err))
+        self.components().list().await
+    }
+
+    /// Query the status of one component by moniker.
+    pub async fn component_status(&self, moniker: &str) -> Result<ComponentStatus, OpsError> {
+        self.components().status(moniker).await
     }
 
     /// Start a component by moniker via opt-in `helios:system/component-control`.
     pub async fn start_component(&self, moniker: &str) -> Result<ComponentStatus, OpsError> {
-        self.require_right(GrantRight::InstanceControl)?;
-        let client = rpc_cc::RpcClient::new(self.connection.client().clone());
-        let answer = self
-            .call(
-                "system.component-control.start",
-                client.start(moniker.to_owned()),
-            )
-            .await?;
-        answer.map_err(|err| OpsError::from_component_control("start", err))
+        self.components().start(moniker).await
     }
 
     /// Stop a component by moniker via opt-in `helios:system/component-control`.
     pub async fn stop_component(&self, moniker: &str) -> Result<(), OpsError> {
-        self.require_right(GrantRight::InstanceControl)?;
-        let client = rpc_cc::RpcClient::new(self.connection.client().clone());
-        let answer = self
-            .call(
-                "system.component-control.stop",
-                client.stop(moniker.to_owned()),
-            )
-            .await?;
-        answer.map_err(|err| OpsError::from_component_control("stop", err))
+        self.components().stop(moniker).await
     }
 
     /// Restart a component by moniker via opt-in `helios:system/component-control`.
     pub async fn restart_component(&self, moniker: &str) -> Result<ComponentStatus, OpsError> {
-        self.require_right(GrantRight::InstanceControl)?;
-        let client = rpc_cc::RpcClient::new(self.connection.client().clone());
-        let answer = self
-            .call(
-                "system.component-control.restart",
-                client.restart(moniker.to_owned()),
-            )
-            .await?;
-        answer.map_err(|err| OpsError::from_component_control("restart", err))
+        self.components().restart(moniker).await
     }
 
     /// Fetch recent guest tracing events matching `filter`.
@@ -1072,6 +1219,27 @@ impl Session {
         })
     }
 
+    /// Start periodic kernel instruction sampling and return a standalone RAII
+    /// [`SamplingSession`] guard whose drop stops sampling non-blockingly.
+    pub async fn start_instruction_sampling(&self) -> Result<SamplingSession, OpsError> {
+        self.require_right(GrantRight::Profile)?;
+        let client = rpc_profiling::RpcClient::new(self.connection.client().clone());
+        let lease = self
+            .call(
+                "system.profiling.start-instruction-sampling",
+                client.start_instruction_sampling(),
+            )
+            .await?
+            .map_err(|error| OpsError::InstructionProfileRefused {
+                operation: "start-instruction-sampling",
+                error,
+            })?;
+        Ok(SamplingSession {
+            session: self.clone(),
+            handle: Some(lease),
+        })
+    }
+
     /// Start or stop kernel instruction sampling via the RAII `sampling-session` resource.
     pub async fn profile_set_instruction_sampling(&self, enabled: bool) -> Result<(), OpsError> {
         self.require_right(GrantRight::Profile)?;
@@ -1112,6 +1280,30 @@ impl Session {
             operation: "instruction-samples",
             error,
         })
+    }
+
+    /// Retrieve collected kernel instruction samples and symbolize them against the
+    /// local kernel ELF/DWARF image at `kernel_image`.
+    pub async fn profile_instruction_samples_symbolized(
+        &self,
+        kernel_image: &Path,
+    ) -> Result<SymbolizedInstructionProfile, OpsError> {
+        let raw = self.profile_instruction_samples().await?;
+        symbolize_instruction_profile(raw, kernel_image)
+            .await
+            .map_err(OpsError::from)
+    }
+
+    /// Retrieve collected kernel instruction samples, symbolize them against
+    /// `kernel_image` (requiring DWARF), and render flamegraph folded stacks.
+    pub async fn render_instruction_profile_folded(
+        &self,
+        kernel_image: &Path,
+    ) -> Result<String, OpsError> {
+        let raw = self.profile_instruction_samples().await?;
+        render_folded_instruction_profile(raw, kernel_image)
+            .await
+            .map_err(OpsError::from)
     }
 
     /// Read the complete LLVM raw profile buffer from an instrumented kernel.
@@ -1221,6 +1413,62 @@ impl Session {
     #[must_use]
     pub fn command(&self, path: impl Into<String>) -> crate::grants::Command {
         crate::grants::Command::new(path)
+    }
+
+    /// Install or clear the session's inherited default Linux root image on the
+    /// remote `inspector-worker` (`helios:system/programs.set-default-image`).
+    ///
+    /// Passing `None` restores bare-syscall Linux execution without a default overlay root.
+    pub async fn set_default_image(
+        &self,
+        image: Option<DefaultLinuxImage>,
+    ) -> Result<(), OpsError> {
+        self.require_right(GrantRight::Exec)?;
+        let normalized = match image {
+            Some(mut img) => {
+                img.root_path = normalize_absolute_path(&img.root_path)?;
+                Some(img)
+            }
+            None => None,
+        };
+        let client = rpc_programs::RpcClient::new(self.connection.client().clone());
+        self.call(
+            "system.programs.set-default-image",
+            client.set_default_image(normalized),
+        )
+        .await?
+        .map_err(OpsError::from)
+    }
+
+    /// Query the session's current inherited default Linux root image on the
+    /// remote `inspector-worker` (`helios:system/programs.get-default-image`).
+    pub async fn get_default_image(&self) -> Result<Option<DefaultLinuxImage>, OpsError> {
+        self.require_right(GrantRight::Exec)?;
+        let client = rpc_programs::RpcClient::new(self.connection.client().clone());
+        self.call(
+            "system.programs.get-default-image",
+            client.get_default_image(),
+        )
+        .await
+    }
+
+    /// Install a pulled OCI image as the session's remote default Linux root image.
+    pub async fn set_default_image_from_oci(
+        &self,
+        image: &helios_oci::PulledImage,
+    ) -> Result<(), OpsError> {
+        let default_img = crate::linux::default_linux_image_from_oci(image)?;
+        self.set_default_image(Some(default_img)).await
+    }
+
+    /// Install a guest root directory path as the session's remote default Linux root image.
+    pub async fn set_default_image_path(&self, root_path: &str) -> Result<(), OpsError> {
+        self.set_default_image(Some(DefaultLinuxImage {
+            root_path: root_path.to_owned(),
+            env: Vec::new(),
+            credentials: None,
+        }))
+        .await
     }
 
     /// Persist this authenticated session principal's default Linux image preference
@@ -2042,6 +2290,375 @@ mod tests {
         assert_eq!(res.instance_id, 77);
         assert_eq!(res.exit_code, 0);
         assert_eq!(stdin_len.load(Ordering::Acquire), 5);
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn session_default_image_and_live_child_stdin_round_trip() {
+        use std::sync::{Arc, Mutex};
+
+        use helios_wit_rpc::inspector::helios::system::programs::{
+            AotRequest, AotResult, ChildTermination, ContainerConfig, ContainerExecRequest,
+            ContainerSpawnRequest, DefaultLinuxImage, ExecError, ExecOutput, ExecRequest,
+            ExecResult, ExitStatus, InheritedSocket, SpawnError, SpawnRequest as WireSpawnRequest,
+        };
+        use helios_wit_rpc::{Endpoint, FutureReader, StreamReader};
+
+        struct LivePrograms {
+            default_image: Arc<Mutex<Option<DefaultLinuxImage>>>,
+            received_stdin: Arc<Mutex<Vec<u8>>>,
+        }
+
+        struct LiveChild {
+            received_stdin: Arc<Mutex<Vec<u8>>>,
+        }
+
+        impl rpc_programs::RpcHandler for LivePrograms {
+            type Child = LiveChild;
+            type Container = ();
+            type Endpoint = ();
+            type TcpListener = ();
+            type TcpStream = ();
+            type SerialPort = ();
+            type VsockListener = ();
+            type VsockStream = ();
+
+            async fn child_stdin(
+                &self,
+                self_: &Self::Child,
+                data: StreamReader<u8>,
+            ) -> FutureReader<Result<(), ()>> {
+                let (tx, rx) = helios_wit_rpc::future::<Result<(), ()>>();
+                let received = Arc::clone(&self_.received_stdin);
+                tokio::spawn(async move {
+                    let bytes = data.collect_all().await.unwrap_or_default();
+                    received.lock().expect("lock").extend_from_slice(&bytes);
+                    let _ = tx.resolve(Ok(())).await;
+                });
+                rx
+            }
+
+            async fn child_stdout(
+                &self,
+                _self_: &Self::Child,
+            ) -> (StreamReader<u8>, FutureReader<Result<(), ()>>) {
+                (
+                    StreamReader::from_vec(Vec::new()),
+                    FutureReader::ready(Ok(())),
+                )
+            }
+
+            async fn child_stderr(
+                &self,
+                _self_: &Self::Child,
+            ) -> (StreamReader<u8>, FutureReader<Result<(), ()>>) {
+                (
+                    StreamReader::from_vec(Vec::new()),
+                    FutureReader::ready(Ok(())),
+                )
+            }
+
+            async fn child_instance_id(&self, _self_: &Self::Child) -> u64 {
+                88
+            }
+
+            async fn child_signal(
+                &self,
+                _self_: &Self::Child,
+                _signal: u8,
+            ) -> Result<(), SpawnError> {
+                Ok(())
+            }
+
+            async fn child_wait(&self, _self_: &Self::Child) -> Result<ExitStatus, SpawnError> {
+                Ok(ExitStatus {
+                    instance_id: 88,
+                    termination: ChildTermination::Exited(0),
+                })
+            }
+
+            async fn container_spawn(
+                &self,
+                _self_: &Self::Container,
+                _request: ContainerSpawnRequest<
+                    Self::TcpListener,
+                    Self::VsockListener,
+                    Self::TcpStream,
+                    Self::VsockStream,
+                    Self::SerialPort,
+                >,
+            ) -> Result<Self::Child, SpawnError> {
+                unreachable!()
+            }
+
+            async fn container_exec(
+                &self,
+                _self_: &Self::Container,
+                _request: ContainerExecRequest,
+            ) -> Result<ExecResult, ExecError> {
+                unreachable!()
+            }
+
+            async fn set_default_image(
+                &self,
+                image: Option<DefaultLinuxImage>,
+            ) -> Result<(), SpawnError> {
+                *self.default_image.lock().expect("lock") = image;
+                Ok(())
+            }
+
+            async fn get_default_image(&self) -> Option<DefaultLinuxImage> {
+                self.default_image.lock().expect("lock").clone()
+            }
+
+            async fn take_inherited_sockets(
+                &self,
+            ) -> Vec<
+                InheritedSocket<
+                    Self::TcpListener,
+                    Self::VsockListener,
+                    Self::TcpStream,
+                    Self::VsockStream,
+                    Self::SerialPort,
+                >,
+            > {
+                Vec::new()
+            }
+
+            async fn create_container(
+                &self,
+                _config: ContainerConfig<Self::Endpoint>,
+            ) -> Result<Self::Container, SpawnError> {
+                Ok(())
+            }
+
+            async fn spawn(
+                &self,
+                _request: WireSpawnRequest<
+                    Self::TcpListener,
+                    Self::VsockListener,
+                    Self::TcpStream,
+                    Self::VsockStream,
+                    Self::SerialPort,
+                    Self::Endpoint,
+                >,
+            ) -> Result<Self::Child, SpawnError> {
+                Ok(LiveChild {
+                    received_stdin: Arc::clone(&self.received_stdin),
+                })
+            }
+
+            async fn exec(
+                &self,
+                _request: ExecRequest<Self::Endpoint>,
+            ) -> Result<ExecResult, ExecError> {
+                Ok(ExecResult {
+                    instance_id: 1,
+                    exit_code: 0,
+                    output: ExecOutput {
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    },
+                    launch_nanos: 0,
+                })
+            }
+
+            async fn aot(&self, _request: AotRequest) -> Result<AotResult, ExecError> {
+                unreachable!()
+            }
+        }
+
+        let default_image = Arc::new(Mutex::new(None));
+        let received_stdin = Arc::new(Mutex::new(Vec::new()));
+        let (host, guest) = UnixStream::pair().expect("pair");
+        host.set_nonblocking(true).expect("host nb");
+        guest.set_nonblocking(true).expect("guest nb");
+        let host_r = host.try_clone().expect("clone");
+        let guest_r = guest.try_clone().expect("clone");
+        let conn = RpcConnection::from_split(
+            Box::new(Async::new(host_r).expect("async")),
+            Box::new(Async::new(host).expect("async")),
+        );
+        let session = Session::from_connection(
+            Target::new("live-test", "serial:///tmp/live.sock").expect("target"),
+            conn,
+            SessionOptions::default(),
+        );
+        let ep = Endpoint::new(
+            Async::new(guest_r).expect("async"),
+            Async::new(guest).expect("async"),
+            rpc_programs::RpcServer::new(LivePrograms {
+                default_image: Arc::clone(&default_image),
+                received_stdin: Arc::clone(&received_stdin),
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            let _ = ep.drive().await;
+        });
+
+        assert!(
+            session
+                .get_default_image()
+                .await
+                .expect("get none")
+                .is_none()
+        );
+        session
+            .set_default_image_path("/var/lib/alpine")
+            .await
+            .expect("set path");
+        let fetched = session
+            .get_default_image()
+            .await
+            .expect("get some")
+            .expect("some");
+        assert_eq!(fetched.root_path, "/var/lib/alpine");
+        session.set_default_image(None).await.expect("clear");
+        assert!(
+            session
+                .get_default_image()
+                .await
+                .expect("cleared")
+                .is_none()
+        );
+
+        // Interactive live write_stdin with CJK bytes.
+        let child = session
+            .spawn(SpawnRequest::new("/bin/cat", Vec::new()))
+            .await
+            .expect("spawn");
+        let payload = "你好世界 こんにちは 세계\n".as_bytes();
+        child.write_stdin(payload).await.expect("write_stdin");
+        child.close_stdin().await.expect("close_stdin");
+        assert!(matches!(
+            child.write_stdin(b"after-close").await,
+            Err(OpsError::StdinClosed)
+        ));
+        let res = child.wait().await.expect("wait");
+        assert_eq!(res.exit_code, 0);
+        assert_eq!(received_stdin.lock().expect("lock").as_slice(), payload);
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn sampling_session_raii_drop_stops_sampling_non_blockingly() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use helios_wit_rpc::Endpoint;
+        use helios_wit_rpc::inspector::helios::system::filters::FilterError;
+        use helios_wit_rpc::inspector::helios::system::profiling::{
+            ControlError, Filter, FoldedSample, InstructionProfile, InstructionProfileError,
+            InstructionSample, MetricFilter, MetricSample, RawProfileError, SampledCode,
+        };
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        struct FakeProfiling {
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl rpc_profiling::RpcHandler for FakeProfiling {
+            type SamplingSession = DropFlag;
+
+            async fn set_enabled(&self, _enabled: bool) -> Result<(), ControlError> {
+                Ok(())
+            }
+            async fn clear(&self) -> Result<(), ControlError> {
+                Ok(())
+            }
+            async fn folded(
+                &self,
+                _filter: Filter,
+                _limit: u32,
+            ) -> Result<Vec<FoldedSample>, FilterError> {
+                Ok(Vec::new())
+            }
+            async fn metrics(
+                &self,
+                _filter: MetricFilter,
+                _limit: u32,
+            ) -> Result<Vec<MetricSample>, FilterError> {
+                Ok(Vec::new())
+            }
+            async fn start_instruction_sampling(
+                &self,
+            ) -> Result<Self::SamplingSession, InstructionProfileError> {
+                Ok(DropFlag(Arc::clone(&self.dropped)))
+            }
+            async fn instruction_samples(
+                &self,
+            ) -> Result<InstructionProfile, InstructionProfileError> {
+                Ok(InstructionProfile {
+                    period_nanos: 500_000,
+                    kernel_image_base: 0xffff_8000_0000_0000,
+                    samples: vec![InstructionSample {
+                        code: SampledCode::Native(0xffff_8000_0000_1000),
+                        count: 7,
+                    }],
+                    dropped: 0,
+                })
+            }
+            async fn raw_profile_size(&self) -> Result<u64, RawProfileError> {
+                Ok(0)
+            }
+            async fn raw_profile_read(
+                &self,
+                _offset: u64,
+                _len: u32,
+            ) -> Result<Vec<u8>, RawProfileError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (host, guest) = UnixStream::pair().expect("pair");
+        host.set_nonblocking(true).expect("host nb");
+        guest.set_nonblocking(true).expect("guest nb");
+        let host_r = host.try_clone().expect("clone");
+        let guest_r = guest.try_clone().expect("clone");
+        let conn = RpcConnection::from_split(
+            Box::new(Async::new(host_r).expect("async")),
+            Box::new(Async::new(host).expect("async")),
+        );
+        let session = Session::from_connection(
+            Target::new("prof-test", "serial:///tmp/prof.sock").expect("target"),
+            conn,
+            SessionOptions::default(),
+        );
+        let ep = Endpoint::new(
+            Async::new(guest_r).expect("async"),
+            Async::new(guest).expect("async"),
+            rpc_profiling::RpcServer::new(FakeProfiling {
+                dropped: Arc::clone(&dropped),
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            let _ = ep.drive().await;
+        });
+
+        let sampling = session
+            .start_instruction_sampling()
+            .await
+            .expect("start sampling");
+        assert!(sampling.is_active());
+        let profile = sampling.stop_and_collect().await.expect("stop_and_collect");
+        assert_eq!(profile.period_nanos, 500_000);
+        assert_eq!(profile.samples.len(), 1);
+
+        // Give the background multiplexer a brief slice to deliver `ResourceDrop`.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "dropping SamplingSession must release remote sampling-session resource"
+        );
 
         server_task.abort();
     }

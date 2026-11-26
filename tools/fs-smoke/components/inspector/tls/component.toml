@@ -1,0 +1,12 @@
+description = "Zero-authority TLS 1.3 terminator for inbound inspector TCP sessions (ProcessAuthority::empty())"
+name = "inspector-tls"
+runner = "wasm"
+sharding = "singleton"
+program = "/bin/inspector-tls"
+optional = true
+startup = "lazy"
+lifecycle = "service"
+restart = "never"
+oom_tier = "user"
+
+[capabilities]

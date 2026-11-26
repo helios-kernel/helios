@@ -2108,11 +2108,21 @@ pub(crate) struct VmCommand {
     no_compiler_plugin: bool,
 
     /// The directory whose files the boot image carries beside the
-    /// programs: `init.txt`, and the `etc/fstab` and `etc/rc` init
-    /// reads. Defaults to `programs/init/bootfs`; a relative path is
-    /// relative to the repository root.
+    /// programs (such as `init.txt` and guest scripts). Defaults to
+    /// `programs/init/bootfs`; a relative path is relative to the
+    /// repository root.
     #[arg(long, value_name = "DIR")]
     bootfs_root: Option<PathBuf>,
+
+    /// Prebuilt `wasm32-wasip3` root `init` (`component-manager`) wasm
+    /// module to package into bootfs instead of the default `helios_init.wasm`.
+    #[arg(long, value_name = "PATH", conflicts_with = "components")]
+    init_wasm: Option<PathBuf>,
+
+    /// Compile `programs/init` against this `component.toml` directory tree
+    /// instead of the default `components/` topology.
+    #[arg(long, value_name = "DIR", conflicts_with = "init_wasm")]
+    components: Option<PathBuf>,
 
     /// Directory for VM sockets, logs, and generated boot artifacts.
     #[arg(long)]
@@ -2235,6 +2245,15 @@ enum VmSessionCommand {
     Nu(crate::ops_cli::NuCommand),
     /// Run the symmetric Python entrypoint against this VM.
     Python(crate::ops_cli::PythonCommand),
+    /// Inspect and control configured components (`ls`, `status`, `start`, `stop`, `restart`, `mount-dynamic`, `unmount-dynamic`).
+    #[command(subcommand)]
+    Component(crate::ops_cli::ComponentCommand),
+    /// Manage pulled OCI images in the remote guest store (`pull`, `ls`, `inspect`, `rm`).
+    #[command(subcommand)]
+    Oci(crate::ops_cli::OciCommand),
+    /// Manage Linux containers on the remote guest (`create`, `ls`, `exec`, `spawn`, `rm`).
+    #[command(subcommand)]
+    Container(crate::ops_cli::ContainerCommand),
     /// Query `/kernel/*` and component inspect state (`--watch`, `--diff`).
     Inspect(crate::ops_cli::InspectCommand),
     /// List running instances / components (`--tree`).
@@ -2243,6 +2262,8 @@ enum VmSessionCommand {
     Kill(crate::ops_cli::KillCommand),
     /// Fetch or stream (`--follow`) guest tracing events.
     Trace(crate::ops_cli::TraceCommand),
+    /// Execute a remote program to completion.
+    Exec(crate::ops_cli::ExecCommand),
     /// Spawn or execute a remote program with streaming stdio.
     Spawn(crate::ops_cli::SpawnCommand),
     /// Collect a `.tar.zst` diagnostic bundle.
@@ -2811,6 +2832,10 @@ struct KernelBuildSpec {
     root_secret_key: Option<PathBuf>,
     /// The boot image's file tree, when not the prebuild's default.
     bootfs_root: Option<PathBuf>,
+    /// Prebuilt root `init` wasm override passed to `kernel-prebuild --init-wasm`.
+    init_wasm: Option<PathBuf>,
+    /// Alternate `component.toml` directory passed to `kernel-prebuild --components`.
+    components: Option<PathBuf>,
 }
 
 /// Which profile a `profile-use` kernel reads, and what that makes of
@@ -3057,6 +3082,8 @@ fn resolve_build(
         no_compiler_plugin,
         root_secret_key,
         bootfs_root: command.bootfs_root.clone(),
+        init_wasm: command.init_wasm.clone(),
+        components: command.components.clone(),
     })
 }
 
@@ -4022,6 +4049,12 @@ fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
     }
     if let Some(root) = &command.bootfs_root {
         prebuild.arg("--bootfs-root").arg(root);
+    }
+    if let Some(init_wasm) = &command.init_wasm {
+        prebuild.arg("--init-wasm").arg(init_wasm);
+    }
+    if let Some(components) = &command.components {
+        prebuild.arg("--components").arg(components);
     }
     run_step("prebuilding kernel bootfs", &mut prebuild)?;
     Ok(())
@@ -7572,10 +7605,18 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
         match value {
             VmSessionCommand::Nu(command) => Self::Session(SessionCommand::Nu(command)),
             VmSessionCommand::Python(command) => Self::Session(SessionCommand::Python(command)),
+            VmSessionCommand::Component(command) => {
+                Self::Session(SessionCommand::Component(command))
+            }
+            VmSessionCommand::Oci(command) => Self::Session(SessionCommand::Oci(command)),
+            VmSessionCommand::Container(command) => {
+                Self::Session(SessionCommand::Container(command))
+            }
             VmSessionCommand::Inspect(command) => Self::Session(SessionCommand::Inspect(command)),
             VmSessionCommand::Ps(command) => Self::Session(SessionCommand::Ps(command)),
             VmSessionCommand::Kill(command) => Self::Session(SessionCommand::Kill(command)),
             VmSessionCommand::Trace(command) => Self::Session(SessionCommand::Trace(command)),
+            VmSessionCommand::Exec(command) => Self::Session(SessionCommand::Exec(command)),
             VmSessionCommand::Spawn(command) => Self::Session(SessionCommand::Spawn(command)),
             VmSessionCommand::Bundle(command) => Self::Session(SessionCommand::Bundle(command)),
             VmSessionCommand::Bridge(command) => Self::Session(SessionCommand::Bridge(command)),
@@ -7590,7 +7631,10 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Balloon(command) => Self::Balloon(command),
             VmSessionCommand::Screendump(command) => Self::Screendump(command),
             VmSessionCommand::Input(command) => Self::Input(command),
-            VmSessionCommand::Profile(command) => Self::Profile(command),
+            VmSessionCommand::Profile(command) => match command.subcommand {
+                Some(ops_profile) => Self::Session(SessionCommand::Profile(ops_profile)),
+                None => Self::Profile(command),
+            },
             VmSessionCommand::LinuxSuite(command) => Self::LinuxSuite(command),
             VmSessionCommand::Build
             | VmSessionCommand::KernelPath
@@ -8835,6 +8879,8 @@ mod tests {
             no_compiler_plugin: true,
             root_secret_key: None,
             bootfs_root: None,
+            init_wasm: None,
+            components: None,
         };
         let root = Path::new("/checkout");
         for kind in [
@@ -8887,6 +8933,8 @@ mod tests {
                     no_compiler_plugin: true,
                     root_secret_key: None,
                     bootfs_root: None,
+                    init_wasm: None,
+                    components: None,
                 };
                 let arguments = cargo_arguments(&kernel_build_command(root, &build));
                 assert_eq!(
@@ -9414,6 +9462,8 @@ mod tests {
             no_compiler_plugin: false,
             root_secret_key: Some(PathBuf::from("/run/release/root.key")),
             bootfs_root: None,
+            init_wasm: None,
+            components: None,
         };
         for root_secret_key in [None, build.root_secret_key.clone()] {
             build.root_secret_key = root_secret_key;
@@ -9490,6 +9540,8 @@ mod tests {
             guest_programs_profile: None,
             no_compiler_plugin: false,
             bootfs_root: None,
+            init_wasm: None,
+            components: None,
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,
@@ -9569,6 +9621,8 @@ mod tests {
             guest_programs_profile: None,
             no_compiler_plugin: false,
             bootfs_root: None,
+            init_wasm: None,
+            components: None,
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,
@@ -10368,6 +10422,8 @@ mod tests {
             guest_programs_profile: None,
             no_compiler_plugin: false,
             bootfs_root: None,
+            init_wasm: None,
+            components: None,
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,
@@ -10588,6 +10644,8 @@ mod tests {
             no_compiler_plugin: true,
             root_secret_key: None,
             bootfs_root: None,
+            init_wasm: None,
+            components: None,
         };
         ResolvedVmCommand {
             profile,
@@ -10813,6 +10871,8 @@ mod tests {
             no_compiler_plugin: false,
             root_secret_key: None,
             bootfs_root: None,
+            init_wasm: None,
+            components: None,
         };
         ResolvedVmCommand {
             profile,
@@ -11264,6 +11324,8 @@ mod tests {
             no_compiler_plugin: true,
             root_secret_key: None,
             bootfs_root: None,
+            init_wasm: None,
+            components: None,
         };
         assert_eq!(build.guest_programs_profile(), "release");
         build.guest_programs_profile = Some(GuestProgramsProfile::Debug);

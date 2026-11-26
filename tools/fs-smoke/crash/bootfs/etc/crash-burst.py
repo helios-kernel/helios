@@ -7,7 +7,7 @@ while this runs, so the ledger is what it knows completed: a file with a
 ledger line was synced before the kill and must hold exactly the bytes
 the line names. A file without one may be absent, short or whole.
 
-    guest <directory> <share>   run inside the guest, as /etc/rc does
+    guest <directory> <share>   run inside the guest as the /crash-burst oneshot component
     verify <directory> <ledger> check every ledger line against its file
     kill-point <seed>           print how many ledger lines the host waits for
     total                       print how many files a whole burst writes

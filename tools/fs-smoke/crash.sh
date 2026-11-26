@@ -32,6 +32,20 @@ truncate -s 128M "$runtime/image.btrfs"
 mkfs.btrfs -q -f --rootdir "$runtime/tree" "$runtime/image.btrfs"
 ledger="$runtime/share/ledger"
 
+init_args=()
+if [[ -n "${HELIOS_PREBUILT_WASM:-}" ]]; then
+  if [[ -f "${HELIOS_PREBUILT_WASM}/release/helios_fs_crash_init.wasm" ]]; then
+    init_args=(--init-wasm "${HELIOS_PREBUILT_WASM}/release/helios_fs_crash_init.wasm")
+  elif [[ -f "${HELIOS_PREBUILT_WASM}/helios_fs_crash_init.wasm" ]]; then
+    init_args=(--init-wasm "${HELIOS_PREBUILT_WASM}/helios_fs_crash_init.wasm")
+  else
+    echo "btrfs-crash: missing prebuilt helios_fs_crash_init.wasm under HELIOS_PREBUILT_WASM=${HELIOS_PREBUILT_WASM}" >&2
+    exit 1
+  fi
+else
+  init_args=(--components tools/fs-smoke/crash/components)
+fi
+
 # One guest boot on the shared image. The inspector's own arguments follow
 # the boot's name; the output lands in $runtime/<name>.out and .log.
 boot() {
@@ -43,6 +57,7 @@ boot() {
     --accel "$accel" \
     --runtime-dir "$runtime/$name" --keep-runtime-dir \
     --bootfs-root "$runtime/bootfs" \
+    "${init_args[@]}" \
     --disk "$runtime/image.btrfs,serial=btrfs-smoke" \
     --shared-dir "$runtime/share" --shared-dir-writable \
     --boot-program nu --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \

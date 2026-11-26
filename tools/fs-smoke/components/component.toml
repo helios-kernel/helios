@@ -1,0 +1,39 @@
+description = "Helios filesystem smoke root component realm"
+runner = "realm"
+oom_tier = "protected"
+
+[[mounts]]
+source = "disk:erofs-smoke"
+path = "/image"
+sharing = "shared"
+read_only = true
+
+[[mounts]]
+source = "btrfs:btrfs-smoke"
+path = "/btrfs"
+sharing = "shared"
+read_only = false
+compress = "zstd:3"
+
+[capabilities]
+directories = [
+  { source = "/", guest = "/", rights = ["read", "write", "mutate-directory", "execute"] },
+]
+network = ["tcp", "udp", "dns", "privileged-bind", "multicast", "admin"]
+allow_all_tcp_ports = true
+allow_all_vsock_ports = true
+clock = ["set-wall-clock"]
+terminal = ["input", "output", "control"]
+process = ["spawn", "exec", "fork", "join", "signal"]
+link = ["source", "target-directory", "symlink-create", "symlink-read"]
+mount = ["mount", "unmount"]
+devices = ["display", "input", "gpu", "audio"]
+allow_all_named_devices = true
+inspect_read = "machine"
+trace_read = "machine"
+profile_read = "machine"
+diagnostics_control = true
+instance_control = "machine"
+settings_write = true
+machine = ["control", "identity", "virtualize"]
+allow_all_wit_interfaces = true
