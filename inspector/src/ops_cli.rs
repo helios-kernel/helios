@@ -11,15 +11,19 @@ use std::time::Duration;
 
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use helios_inspector_protocol::auth::{
-    CapabilityCert as ProtocolCapabilityCert, ClientIdentity, random_32,
+    CapabilityCert as ProtocolCapabilityCert, ClientIdentity, DEFAULT_FIDO2_APPLICATION, random_32,
 };
 use helios_inspector_shell::{HostEnv, OutputFormat as ShellOutputFormat, ReplError};
+use helios_ops::account::{
+    AccountAuthenticatorChoice, AccountStore, AuthenticatorSpec, CreateAccountRequest,
+    OperatorAccount, encode_hex as account_encode_hex, session_grants_from_attenuation,
+};
 use helios_ops::helios_oci::{Arch as OciArch, PulledImage};
 use helios_ops::linux::{ContainerBuilder, ContainerMount, ContainerMountSharing};
 use helios_ops::{
-    Attenuation, CapabilityCert, DEFAULT_FLEET_CONCURRENCY, DiagnosticBundle, Fleet, GrantRight,
-    IdentityProfile, OpsError, PullOptions, Session, SessionOptions, SpawnRequest, Target,
-    TargetError, TargetStore, TargetUri, http,
+    AccountError, Attenuation, CapabilityCert, DEFAULT_FLEET_CONCURRENCY, DiagnosticBundle, Fleet,
+    GrantRight, IdentityProfile, OpsError, PullOptions, Session, SessionOptions, SpawnRequest,
+    Target, TargetError, TargetStore, TargetUri, http,
 };
 use helios_wit_rpc::inspector::helios::system::{
     component_control::ComponentStatus,
@@ -148,6 +152,42 @@ pub(crate) struct LoginCommand {
     /// Optional bearer token presented to the Authority CA `/v1/issue` endpoint.
     #[arg(long = "token", env = "HELIOS_AUTH_TOKEN")]
     pub token: Option<String>,
+}
+
+/// Manage Touch ID, FIDO2, and software operator accounts (`account`).
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum AccountCommand {
+    /// Enroll a new operator account under `~/.config/helios/accounts/<username>.toml`.
+    Create {
+        /// POSIX-safe operator username (`[a-z_][a-z0-9_-]{0,31}`).
+        username: String,
+        /// Enroll a macOS Touch ID account (LocalAuthentication + Keychain-sealed P-256 key).
+        #[arg(long = "touch-id", conflicts_with_all = ["fido2", "p256", "ed25519"])]
+        touch_id: bool,
+        /// Enroll a FIDO2 hardware security key via OpenSSH (`ed25519-sk` / `ecdsa-sk`).
+        #[arg(long = "fido2", conflicts_with_all = ["touch_id", "p256", "ed25519"])]
+        fido2: bool,
+        /// Enroll a software NIST P-256 account (stored with `0600` permissions).
+        #[arg(long = "p256", conflicts_with_all = ["touch_id", "fido2", "ed25519"])]
+        p256: bool,
+        /// Enroll a software Ed25519 account (stored with `0600` permissions).
+        #[arg(long = "ed25519", conflicts_with_all = ["touch_id", "fido2", "p256"])]
+        ed25519: bool,
+        /// Require FIDO2 User Verification (PIN or biometric on the hardware token).
+        #[arg(long = "require-uv")]
+        require_uv: bool,
+        /// Custom FIDO2 application string (defaults to `ssh:helios`).
+        #[arg(long = "application", default_value = DEFAULT_FIDO2_APPLICATION)]
+        application: String,
+    },
+    /// List enrolled operator accounts.
+    Ls,
+    /// Show detailed public-key and capability metadata for one operator account.
+    Inspect { username: String },
+    /// Run a local challenge-response verification test against an operator account.
+    Verify { username: String },
+    /// Remove an operator account and clean up its Keychain / FIDO2 key handle.
+    Rm { username: String },
 }
 
 /// Manage named Helios targets in `targets.toml`.
@@ -530,6 +570,8 @@ pub(crate) enum OpsCliError {
     #[error("{0}")]
     Target(#[from] TargetError),
     #[error("{0}")]
+    Account(#[from] AccountError),
+    #[error("{0}")]
     Repl(#[from] ReplError),
     #[error("{0}")]
     Terminal(#[from] crate::tui::TerminalError),
@@ -816,6 +858,7 @@ pub(crate) async fn run_login(cmd: &LoginCommand) -> Result<(), OpsCliError> {
         secret_key_hex: Some(secret_key_hex),
         capability_cert_postcard_hex,
         expected_machine_public_key_hex,
+        account: None,
     };
     let saved_path = profile.save().map_err(OpsError::from)?;
     println!(
@@ -954,6 +997,253 @@ pub(crate) fn run_whoami(flags: &GlobalOpsFlags) -> Result<(), OpsCliError> {
         }
     }
     Ok(())
+}
+
+/// Run `helios account {create, ls, inspect, verify, rm}`.
+pub(crate) fn run_account_command(
+    cmd: &AccountCommand,
+    flags: &GlobalOpsFlags,
+) -> Result<(), OpsCliError> {
+    let store = AccountStore::default_store();
+    run_account_command_in(&store, cmd, flags)
+}
+
+fn run_account_command_in(
+    store: &AccountStore,
+    cmd: &AccountCommand,
+    flags: &GlobalOpsFlags,
+) -> Result<(), OpsCliError> {
+    match cmd {
+        AccountCommand::Create {
+            username,
+            touch_id,
+            fido2,
+            p256,
+            ed25519,
+            require_uv,
+            application,
+        } => {
+            let authenticator = if *touch_id {
+                AccountAuthenticatorChoice::TouchId
+            } else if *fido2 {
+                AccountAuthenticatorChoice::Fido2
+            } else if *p256 {
+                AccountAuthenticatorChoice::SoftwareP256
+            } else if *ed25519 {
+                AccountAuthenticatorChoice::SoftwareEd25519
+            } else {
+                AccountAuthenticatorChoice::platform_default()
+            };
+
+            let mut only = BTreeSet::new();
+            for raw in &flags.only {
+                if raw.trim().is_empty() {
+                    continue;
+                }
+                let right = GrantRight::parse(raw)
+                    .ok_or_else(|| OpsCliError::UnknownCapability { raw: raw.clone() })?;
+                only.insert(right);
+            }
+            let grants = session_grants_from_attenuation(&Attenuation {
+                scope: flags.scope.clone(),
+                only,
+            })?;
+
+            eprintln!(
+                "enrolling operator account `{username}` with authenticator `{}`...",
+                authenticator.label()
+            );
+            let mut req = CreateAccountRequest::new(username.clone(), authenticator);
+            req.require_uv = *require_uv;
+            req.application = application.clone();
+            req.grants = grants;
+            let account = store.create(req)?;
+            let summary = account_summary_json(&account)?;
+            match flags.output {
+                CliOutputFormat::Json | CliOutputFormat::Nuon => {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                }
+                CliOutputFormat::Jsonl => {
+                    println!("{}", serde_json::to_string(&summary)?);
+                }
+                CliOutputFormat::Table => {
+                    let pub_key = account.public_key()?;
+                    println!(
+                        "created account `{}` ({}, {}, fingerprint {}) at {}",
+                        account.username,
+                        account.authenticator.kind_label(),
+                        pub_key.algorithm_name(),
+                        account_encode_hex(&pub_key.fingerprint_sha256()),
+                        store.path_for(&account.username).display()
+                    );
+                }
+            }
+        }
+        AccountCommand::Ls => {
+            let accounts = store.list()?;
+            match flags.output {
+                CliOutputFormat::Json | CliOutputFormat::Nuon => {
+                    let rows: Vec<serde_json::Value> = accounts
+                        .iter()
+                        .map(account_summary_json)
+                        .collect::<Result<_, _>>()?;
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                }
+                CliOutputFormat::Jsonl => {
+                    for acct in &accounts {
+                        println!("{}", serde_json::to_string(&account_summary_json(acct)?)?);
+                    }
+                }
+                CliOutputFormat::Table => {
+                    if accounts.is_empty() {
+                        println!("no accounts configured ({})", store.dir().display());
+                    } else {
+                        for acct in &accounts {
+                            let pub_key = acct.public_key()?;
+                            let fp = account_encode_hex(&pub_key.fingerprint_sha256());
+                            println!(
+                                "{:<20} {:<10} {:<15} {}",
+                                acct.username,
+                                acct.authenticator.kind_label(),
+                                pub_key.algorithm_name(),
+                                &fp[..16],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        AccountCommand::Inspect { username } => {
+            let account = store.load(username)?;
+            let pub_key = account.public_key()?;
+            let summary = account_summary_json(&account)?;
+            match flags.output {
+                CliOutputFormat::Json | CliOutputFormat::Nuon => {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                }
+                CliOutputFormat::Jsonl => {
+                    println!("{}", serde_json::to_string(&summary)?);
+                }
+                CliOutputFormat::Table => {
+                    println!("username      : {}", account.username);
+                    println!("authenticator : {}", account.authenticator.kind_label());
+                    println!("algorithm     : {}", pub_key.algorithm_name());
+                    println!(
+                        "public_key    : {}",
+                        account_encode_hex(pub_key.raw_key_bytes())
+                    );
+                    println!(
+                        "fingerprint   : {}",
+                        account_encode_hex(&pub_key.fingerprint_sha256())
+                    );
+                    println!("created_at    : {}", account.created_at_unix);
+                    match &account.authenticator {
+                        AuthenticatorSpec::TouchId {
+                            keychain_service,
+                            keychain_account,
+                            ..
+                        } => {
+                            println!("keychain      : {keychain_service} / {keychain_account}");
+                        }
+                        AuthenticatorSpec::Fido2 {
+                            application,
+                            require_uv,
+                            key_handle_path,
+                            ..
+                        } => {
+                            println!("application   : {application}");
+                            println!("require_uv    : {require_uv}");
+                            println!("key_handle    : {}", key_handle_path.display());
+                        }
+                        AuthenticatorSpec::SoftwareP256 { .. }
+                        | AuthenticatorSpec::SoftwareEd25519 { .. } => {}
+                    }
+                    println!(
+                        "path          : {}",
+                        store.path_for(&account.username).display()
+                    );
+                }
+            }
+        }
+        AccountCommand::Verify { username } => {
+            let account = store.load(username)?;
+            let verified = account.verify_self()?;
+            let fp = account_encode_hex(&verified.public_key.fingerprint_sha256());
+            match flags.output {
+                CliOutputFormat::Json | CliOutputFormat::Nuon => {
+                    let doc = serde_json::json!({
+                        "verified": true,
+                        "username": verified.username,
+                        "algorithm": verified.public_key.algorithm_name(),
+                        "fingerprint_sha256": fp,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&doc)?);
+                }
+                CliOutputFormat::Jsonl => {
+                    let doc = serde_json::json!({
+                        "verified": true,
+                        "username": verified.username,
+                        "algorithm": verified.public_key.algorithm_name(),
+                        "fingerprint_sha256": fp,
+                    });
+                    println!("{}", serde_json::to_string(&doc)?);
+                }
+                CliOutputFormat::Table => {
+                    println!(
+                        "verified account `{}` ({}, fingerprint {})",
+                        verified.username,
+                        verified.public_key.algorithm_name(),
+                        fp
+                    );
+                }
+            }
+        }
+        AccountCommand::Rm { username } => {
+            let removed = store.remove(username)?;
+            println!(
+                "removed account `{}` ({})",
+                removed.username,
+                removed.authenticator.kind_label()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn account_summary_json(account: &OperatorAccount) -> Result<serde_json::Value, OpsCliError> {
+    let pub_key = account.public_key()?;
+    let (application, require_uv, key_handle_path, keychain_service) = match &account.authenticator
+    {
+        AuthenticatorSpec::TouchId {
+            keychain_service, ..
+        } => (None, None, None, Some(keychain_service.as_str())),
+        AuthenticatorSpec::Fido2 {
+            application,
+            require_uv,
+            key_handle_path,
+            ..
+        } => (
+            Some(application.as_str()),
+            Some(*require_uv),
+            Some(key_handle_path.display().to_string()),
+            None,
+        ),
+        AuthenticatorSpec::SoftwareP256 { .. } | AuthenticatorSpec::SoftwareEd25519 { .. } => {
+            (None, None, None, None)
+        }
+    };
+    Ok(serde_json::json!({
+        "username": account.username,
+        "authenticator": account.authenticator.kind_label(),
+        "algorithm": pub_key.algorithm_name(),
+        "public_key_hex": account_encode_hex(pub_key.raw_key_bytes()),
+        "fingerprint_sha256": account_encode_hex(&pub_key.fingerprint_sha256()),
+        "created_at_unix": account.created_at_unix,
+        "application": application,
+        "require_uv": require_uv,
+        "key_handle_path": key_handle_path,
+        "keychain_service": keychain_service,
+    }))
 }
 
 /// Run `helios target {add, ls, use, rm}`.
@@ -2586,6 +2876,59 @@ mod tests {
             ("GET", "/metrics")
         );
         assert_eq!(parse_http_request_line("POST / HTTP/1.1"), ("POST", "/"));
+    }
+
+    #[test]
+    fn run_account_command_in_covers_create_ls_inspect_verify_and_rm() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = AccountStore::new(dir.path().join("accounts"));
+        let flags = GlobalOpsFlags {
+            scope: Some("/core/http".to_owned()),
+            only: vec!["inspect".to_owned(), "trace".to_owned()],
+            output: CliOutputFormat::Json,
+            ..GlobalOpsFlags::default()
+        };
+
+        run_account_command_in(
+            &store,
+            &AccountCommand::Create {
+                username: "ci_operator".to_owned(),
+                touch_id: false,
+                fido2: false,
+                p256: true,
+                ed25519: false,
+                require_uv: false,
+                application: DEFAULT_FIDO2_APPLICATION.to_owned(),
+            },
+            &flags,
+        )
+        .expect("create account");
+        run_account_command_in(&store, &AccountCommand::Ls, &flags).expect("ls accounts");
+        run_account_command_in(
+            &store,
+            &AccountCommand::Inspect {
+                username: "ci_operator".to_owned(),
+            },
+            &flags,
+        )
+        .expect("inspect account");
+        run_account_command_in(
+            &store,
+            &AccountCommand::Verify {
+                username: "ci_operator".to_owned(),
+            },
+            &flags,
+        )
+        .expect("verify account");
+        run_account_command_in(
+            &store,
+            &AccountCommand::Rm {
+                username: "ci_operator".to_owned(),
+            },
+            &flags,
+        )
+        .expect("rm account");
+        assert!(store.list().expect("list after rm").is_empty());
     }
 
     fn decode_hex_for_test(raw: &str) -> Vec<u8> {
