@@ -707,31 +707,12 @@ impl<B: SubvolumeBackend> ImageStore<B> {
             // Ensure the staged root itself is writable so `rename` can update `..` across dirs.
             set_writable_for_unpack(&work_dir);
             if let Err(source) = fs::rename(&work_dir, &final_dir) {
-                // Another concurrent pull may have committed `final_dir` first, or an incomplete
-                // leftover directory without metadata was sitting at `final_dir`.
-                if let Some(cached) = self.load_layer_metadata(chain_id)?
-                    && final_dir.is_dir()
-                {
-                    let _ = remove_path_recursive(&work_dir);
-                    return Ok(cached);
-                }
-                if final_dir.exists() {
-                    let _ = remove_path_recursive(&final_dir);
-                    if let Err(retry_err) = fs::rename(&work_dir, &final_dir) {
-                        let _ = remove_path_recursive(&work_dir);
-                        if let Some(cached) = self.load_layer_metadata(chain_id)?
-                            && final_dir.is_dir()
-                        {
-                            return Ok(cached);
-                        }
-                        return Err(OciError::Io {
-                            operation: "commit materialized layer directory",
-                            path: final_dir,
-                            source: retry_err,
-                        });
-                    }
-                } else {
-                    let _ = remove_path_recursive(&work_dir);
+                // Directory-backed layers are only renamed into `final_dir` after full unpack
+                // and `diff_id` verification, so an existing `final_dir` belongs to a concurrent
+                // pull that won the commit race (and may not have written layer metadata yet).
+                // Never delete `final_dir` on a rename collision.
+                let _ = remove_path_recursive(&work_dir);
+                if !final_dir.is_dir() {
                     return Err(OciError::Io {
                         operation: "commit materialized layer directory",
                         path: final_dir,
