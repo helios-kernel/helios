@@ -771,11 +771,13 @@ where
     let (final_path, bytes) = {
         let mut resolved = None;
         for depth in 0..=MAX_SHEBANG_DEPTH {
-            let (resolved_path, contents) = container
-                .filesystem()
-                .read_executable_at(base_dir, &current_path, creds)
-                .await
-                .map_err(map_fs_op_error_to_program)?;
+            let (resolved_path, contents) = Box::pin(container.filesystem().read_executable_at(
+                base_dir,
+                &current_path,
+                creds,
+            ))
+            .await
+            .map_err(map_fs_op_error_to_program)?;
             let bytes = match contents {
                 FileContents::Boot(boot) => Bytes::copy_from_slice(boot.as_slice()),
                 FileContents::Written(written) => written,
@@ -807,23 +809,25 @@ where
         });
     }
     timeline.record(cpu, LaunchPhase::LoadBegin);
-    let mut loaded = LinuxExecutable::load_in_container(
+    let mut loaded = Box::pin(LinuxExecutable::load_in_container(
         cpu,
         container,
         base_dir,
         bytes,
         Some(final_path.clone()),
         creds,
-    )
+    ))
     .await?;
     // Apply setuid/sgid/file-capability transitions strictly for the final
     // executable binary (never an intermediate `#!` script), bounded by the
     // container's authority ceiling and mount `NO_SUID`.
-    let next_creds = container
-        .filesystem()
-        .exec_credentials_resolved(&final_path, creds, container.authority_cap_ceiling())
-        .await
-        .map_err(map_fs_op_error_to_program)?;
+    let next_creds = Box::pin(container.filesystem().exec_credentials_resolved(
+        &final_path,
+        creds,
+        container.authority_cap_ceiling(),
+    ))
+    .await
+    .map_err(map_fs_op_error_to_program)?;
     let secure = helios_linux::syscall::permissions::exec_is_secure(creds, &next_creds);
     loaded.set_secure(secure);
     timeline.record(cpu, LaunchPhase::LoadComplete);
@@ -2066,7 +2070,7 @@ where
                     .map(|preopen| String::from(preopen.guest_name()))
             })
             .unwrap_or_else(|| String::from("/"));
-        let (executable, next_creds) = load_container_executable(
+        let (executable, next_creds) = Box::pin(load_container_executable(
             &exec_context.cpu,
             &container,
             &base_dir,
@@ -2074,7 +2078,7 @@ where
             &mut launch.argv,
             &creds,
             &launch.timeline,
-        )
+        ))
         .await?;
         if let Some(container_launch) = launch.container.as_mut() {
             container_launch.credentials = Some(next_creds);
@@ -2113,7 +2117,7 @@ where
                     .map(|preopen| String::from(preopen.guest_name()))
             })
             .unwrap_or_else(|| String::from("/"));
-        let (executable, next_creds) = load_container_executable(
+        let (executable, next_creds) = Box::pin(load_container_executable(
             &exec_context.cpu,
             &container,
             &base_dir,
@@ -2121,7 +2125,7 @@ where
             &mut launch.argv,
             &creds,
             &launch.timeline,
-        )
+        ))
         .await?;
         if let Some(container_launch) = launch.container.as_mut() {
             container_launch.credentials = Some(next_creds);
@@ -2151,7 +2155,10 @@ where
         creds: &helios_linux::syscall::Credentials,
         timeline: &phases::Timeline,
     ) -> Result<(LinuxExecutable, helios_linux::syscall::Credentials), ProgramExecError> {
-        match load_container_executable(cpu, container, base_dir, path, argv, creds, timeline).await
+        match Box::pin(load_container_executable(
+            cpu, container, base_dir, path, argv, creds, timeline,
+        ))
+        .await
         {
             Ok(loaded) => Ok(loaded),
             Err(error)
@@ -2160,21 +2167,21 @@ where
                 let bytes = fallback_bytes.expect("checked is_some above");
                 if let Some((interp, opt_arg)) = parse_shebang(&bytes) {
                     argv.rewrite_shebang(interp.clone(), opt_arg, path.to_owned());
-                    load_container_executable(
+                    Box::pin(load_container_executable(
                         cpu, container, base_dir, &interp, argv, creds, timeline,
-                    )
+                    ))
                     .await
                 } else if is_linux_elf(&bytes) {
                     timeline.record(cpu, LaunchPhase::SourceRead);
                     timeline.record(cpu, LaunchPhase::LoadBegin);
-                    let loaded = LinuxExecutable::load_in_container(
+                    let loaded = Box::pin(LinuxExecutable::load_in_container(
                         cpu,
                         container,
                         base_dir,
                         bytes,
                         Some(path.to_owned()),
                         creds,
-                    )
+                    ))
                     .await?;
                     timeline.record(cpu, LaunchPhase::LoadComplete);
                     Ok((loaded, creds.clone()))
