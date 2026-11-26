@@ -1,35 +1,13 @@
-//! Writing the guest's instruction-address samples as a folded profile.
-//!
-//! The kernel samples the instruction each processor's periodic timer
-//! interrupted and names the wasm ones itself, because only it knows
-//! which programs were loaded where. Everything else it hands back as a
-//! bare address: the kernel image carries no symbol table at runtime,
-//! and this host holds the exact ELF it booted. So the folded file is
-//! assembled here, with the native addresses named against that image
-//! at the base the guest reports it was loaded at.
-//!
-//! Each line is one location and its sample count: `wasm;<program>;<function>`,
-//! `wasm;<program>;[trampoline]`, `kernel;<outermost>;…;<innermost>`, or
-//! `unknown` for an address in neither. A kernel location is the chain of
-//! functions inlined at the address, read from the image's DWARF: the
-//! function whose symbol contains it first, the one the instruction
-//! belongs to last. Where no DWARF function covers the address, the chain
-//! is the containing symbol alone.
+//! Writing the guest's instruction-address samples as a folded profile,
+//! delegating ELF/DWARF symbolization to `helios_ops::symbolize`.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use askama::Template as _;
+use helios_ops::symbolize::{KernelImageSymbolizer, KernelSymbolsError};
 use helios_wit_rpc::inspector::helios::system::profiling::{
-    self as system_profiling, InstructionProfile, InstructionProfileError, SampledCode,
-    SamplingSession,
+    self as system_profiling, InstructionProfile, InstructionProfileError, SamplingSession,
 };
 
-use super::kernel_image::{
-    KernelDebugInfo, KernelSymbols, KernelSymbolsError, LoadedKernelSymbols, parse_image,
-    read_image,
-};
-use super::{FoldedProfileLine, FoldedProfileTemplate};
 use crate::serial::RpcClient;
 
 /// Why the instruction profile a run asked for was not written.
@@ -82,12 +60,6 @@ fn refusal_reason(refusal: InstructionProfileError) -> &'static str {
 }
 
 /// Starts the guest's instruction sampling for the workload that follows.
-///
-/// Sampling is its own control, separate from the scoped profiler, because
-/// it shortens every guest processor's timer period and so perturbs the
-/// timings it runs under: only a run that asked for an instruction profile
-/// starts it. Starting discards the samples of any earlier run, and dropping
-/// the returned [`SamplingSession`] stops sampling.
 pub(crate) async fn start(
     client: &RpcClient,
 ) -> Result<SamplingSession, InstructionProfileOutputError> {
@@ -101,9 +73,8 @@ pub(crate) async fn start(
         .map_err(|refusal| InstructionProfileOutputError::Refused { refusal })
 }
 
-/// Reads the guest's instruction samples, taken while the [`SamplingSession`]
-/// was held, and writes them to `output`, naming native addresses against
-/// the kernel image at `kernel`.
+/// Reads the guest's instruction samples and writes them to `output`, naming
+/// native addresses against the kernel ELF/DWARF image at `kernel`.
 pub(crate) async fn collect(
     client: &RpcClient,
     kernel: &Path,
@@ -116,8 +87,6 @@ pub(crate) async fn collect(
         .map_err(|refusal| InstructionProfileOutputError::Refused { refusal })?;
     let kernel = kernel.to_path_buf();
     let output = output.to_path_buf();
-    // The kernel image is tens of megabytes; reading and indexing it
-    // does not belong on the executor thread.
     blocking::unblock(move || write(&profile, &kernel, &output)).await
 }
 
@@ -129,18 +98,8 @@ fn write(
     use std::io::Write as _;
 
     let symbols = |source| InstructionProfileOutputError::Symbols { source };
-    let bytes = read_image(kernel).map_err(symbols)?;
-    let image = parse_image(kernel, &bytes).map_err(symbols)?;
-    let table = KernelSymbols::from_image(kernel, &image).map_err(symbols)?;
-    let debug = KernelDebugInfo::from_image(kernel, &image).map_err(symbols)?;
-    let folded = render(
-        profile,
-        &KernelNames {
-            symbols: table.loaded_at(profile.kernel_image_base),
-            debug: &debug,
-        },
-    )
-    .map_err(symbols)?;
+    let symbolizer = KernelImageSymbolizer::from_path(kernel).map_err(symbols)?;
+    let folded = symbolizer.render_folded(profile).map_err(symbols)?;
     std::fs::write(output, folded).map_err(|source| InstructionProfileOutputError::Write {
         path: output.display().to_string(),
         source,
@@ -161,76 +120,6 @@ fn write(
     .map_err(|source| InstructionProfileOutputError::Report { source })
 }
 
-/// What the kernel's addresses are named with: its symbols, at the base
-/// the guest reported, and its DWARF.
-struct KernelNames<'table> {
-    symbols: LoadedKernelSymbols<'table>,
-    debug: &'table KernelDebugInfo,
-}
-
-/// The folded text of `profile`, heaviest location first.
-fn render(
-    profile: &InstructionProfile,
-    kernel: &KernelNames<'_>,
-) -> Result<String, KernelSymbolsError> {
-    let mut stacks = BTreeMap::<String, u64>::new();
-    for sample in &profile.samples {
-        *stacks.entry(stack(&sample.code, kernel)?).or_insert(0) += sample.count;
-    }
-    let mut lines = stacks
-        .into_iter()
-        .map(|(stack, weight)| FoldedProfileLine { stack, weight })
-        .collect::<Vec<_>>();
-    lines.sort_by(|left, right| {
-        right
-            .weight
-            .cmp(&left.weight)
-            .then_with(|| left.stack.cmp(&right.stack))
-    });
-    Ok(FoldedProfileTemplate { lines }
-        .render()
-        .expect("folded profile template rendering is infallible"))
-}
-
-fn stack(code: &SampledCode, kernel: &KernelNames<'_>) -> Result<String, KernelSymbolsError> {
-    Ok(match code {
-        SampledCode::Wasm(function) => {
-            let name = match &function.name {
-                // A Rust program's name section may carry mangled
-                // symbols; anything else demangles to itself.
-                Some(name) => frame(&format!("{:#}", rustc_demangle::demangle(name))),
-                None => format!("func[{}:{}]", function.static_module, function.index),
-            };
-            format!("wasm;{};{name}", frame(&function.module))
-        }
-        SampledCode::WasmTrampoline(module) => format!("wasm;{};[trampoline]", frame(module)),
-        SampledCode::Native(address) if kernel.symbols.contains_text(*address) => {
-            let chain = kernel
-                .debug
-                .inline_chain(kernel.symbols.link_address(*address))?;
-            if chain.is_empty() {
-                match kernel.symbols.symbolize(*address) {
-                    Some(symbol) => format!("kernel;{}", frame(&symbol.function)),
-                    None => "kernel;[unsymbolized]".to_owned(),
-                }
-            } else {
-                let frames = chain
-                    .iter()
-                    .map(|function| frame(function))
-                    .collect::<Vec<_>>();
-                format!("kernel;{}", frames.join(";"))
-            }
-        }
-        SampledCode::Native(_) => "unknown".to_owned(),
-    })
-}
-
-/// One frame of a folded stack: `;` separates frames and a line ends the
-/// sample, so neither may appear inside one.
-fn frame(name: &str) -> String {
-    name.replace([';', '\n', '\r'], "_")
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -238,16 +127,17 @@ mod tests {
 
     use gimli::write::{Address, AttributeValue, DwarfUnit, EndianVec, Sections, UnitEntryId};
     use gimli::{Encoding, Format, LittleEndian, RunTimeEndian};
+    use helios_ops::symbolize::{
+        KernelImageSymbolizer, render_folded_samples, symbolize_with_parts,
+    };
     use helios_wit_rpc::inspector::helios::system::profiling::{
         InstructionProfile, InstructionSample, SampledCode, WasmFunction,
     };
 
-    use super::{KernelNames, render};
     use crate::vm::kernel_image::{DwarfReader, Function, KernelDebugInfo, KernelSymbols};
 
     const PARK: u64 = 0xffff_ffff_8000_1000;
 
-    /// A subprogram DIE under `parent` with the given names.
     fn function(
         dwarf: &mut DwarfUnit,
         parent: UnitEntryId,
@@ -269,7 +159,6 @@ mod tests {
         id
     }
 
-    /// Gives the DIE `id` the code range `start..start + length`.
     fn code_range(dwarf: &mut DwarfUnit, id: UnitEntryId, start: u64, length: u64) {
         let entry = dwarf.unit.get_mut(id);
         entry.set(
@@ -279,8 +168,6 @@ mod tests {
         entry.set(gimli::DW_AT_high_pc, AttributeValue::Udata(length));
     }
 
-    /// An inlined call of `origin` under `parent`, over
-    /// `start..start + length`.
     fn inlined(
         dwarf: &mut DwarfUnit,
         parent: UnitEntryId,
@@ -297,10 +184,6 @@ mod tests {
         id
     }
 
-    /// The DWARF an optimised build gives `park`: `wait` inlined over its
-    /// first eight bytes, and `relax`, which carries only its short name,
-    /// inlined into `wait` over two of them. `rdtsc_now`, past `park`, has
-    /// a symbol and no DWARF, as code assembled without debuginfo does.
     fn debug_info() -> KernelDebugInfo {
         let mut dwarf = DwarfUnit::new(Encoding {
             format: Format::Dwarf32,
@@ -380,7 +263,6 @@ mod tests {
                     code: function(Some("_PyEval_EvalFrameDefault"), 7),
                     count: 40,
                 },
-                // Inside `relax`, inlined into `wait`, inlined into `park`.
                 InstructionSample {
                     code: SampledCode::Native(0xffff_ffff_8120_1004),
                     count: 12,
@@ -389,12 +271,10 @@ mod tests {
                     code: SampledCode::Native(0xffff_ffff_8120_1005),
                     count: 4,
                 },
-                // Inside `wait`, past `relax`.
                 InstructionSample {
                     code: SampledCode::Native(0xffff_ffff_8120_1006),
                     count: 6,
                 },
-                // `park`'s own code, one past the end of `wait`.
                 InstructionSample {
                     code: SampledCode::Native(0xffff_ffff_8120_1008),
                     count: 3,
@@ -403,7 +283,6 @@ mod tests {
                     code: SampledCode::Native(0xffff_ffff_8120_1104),
                     count: 5,
                 },
-                // Text, but in no symbol and no DWARF function.
                 InstructionSample {
                     code: SampledCode::Native(0xffff_ffff_8120_1800),
                     count: 1,
@@ -424,14 +303,17 @@ mod tests {
             dropped: 0,
         };
 
-        let folded = render(
+        let symbolized = symbolize_with_parts(
             &profile,
-            &KernelNames {
-                symbols: symbols.loaded_at(profile.kernel_image_base),
-                debug: &debug,
-            },
+            symbols.loaded_at(profile.kernel_image_base),
+            Some(&debug),
         )
         .expect("every address resolves against the test DWARF");
+        let folded = render_folded_samples(&symbolized.samples);
+        let via_symbolizer = KernelImageSymbolizer::from_parts(symbols, Some(debug))
+            .render_folded(&profile)
+            .expect("symbolizer renders identically");
+        assert_eq!(folded, via_symbolizer);
 
         assert_eq!(
             folded,

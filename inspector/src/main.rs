@@ -20,9 +20,9 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use crate::ops_cli::{
-    BridgeCommand, BundleCommand, GlobalOpsFlags, InspectCommand, KillCommand, LoginCommand,
-    NuCommand, OpsCliError, ProfileOpsCommand, PsCommand, PythonCommand, SpawnCommand,
-    TargetCommand, TraceCommand,
+    BridgeCommand, BundleCommand, ComponentCommand, ContainerCommand, ExecCommand, GlobalOpsFlags,
+    InspectCommand, KillCommand, LoginCommand, NuCommand, OciCommand, OpsCliError,
+    ProfileOpsCommand, PsCommand, PythonCommand, SpawnCommand, TargetCommand, TraceCommand,
 };
 use crate::ready::BootError;
 use crate::repl::ShellScriptError;
@@ -176,6 +176,15 @@ enum Command {
     /// Manage named targets in `targets.toml`.
     #[command(subcommand)]
     Target(TargetCommand),
+    /// Inspect and control configured components (`ls`, `status`, `start`, `stop`, `restart`).
+    #[command(subcommand)]
+    Component(ComponentCommand),
+    /// Manage pulled OCI images in the remote guest store (`pull`, `ls`, `inspect`, `rm`).
+    #[command(subcommand)]
+    Oci(OciCommand),
+    /// Manage Linux containers on the remote guest (`create`, `ls`, `exec`, `spawn`, `rm`).
+    #[command(subcommand)]
+    Container(ContainerCommand),
     /// Query `/kernel/*` and component inspect state (`--watch`, `--diff`).
     Inspect(InspectCommand),
     /// Open the live system monitor TUI.
@@ -189,7 +198,9 @@ enum Command {
     /// Inspect or collect profiling data (`instructions`, `folded`, `metrics`, `llvm-raw`).
     #[command(subcommand)]
     Profile(ProfileOpsCommand),
-    /// Spawn or execute a remote program with streaming stdio.
+    /// Execute a remote program to completion.
+    Exec(ExecCommand),
+    /// Spawn a remote program with streaming stdio.
     Spawn(SpawnCommand),
     /// Collect a `.tar.zst` diagnostic bundle.
     Bundle(BundleCommand),
@@ -219,6 +230,15 @@ pub(crate) enum SessionCommand {
     Nu(NuCommand),
     /// Launch the symmetric Python entrypoint against this connected target.
     Python(PythonCommand),
+    /// Inspect and control configured components (`ls`, `status`, `start`, `stop`, `restart`).
+    #[command(subcommand)]
+    Component(ComponentCommand),
+    /// Manage pulled OCI images in the remote guest store (`pull`, `ls`, `inspect`, `rm`).
+    #[command(subcommand)]
+    Oci(OciCommand),
+    /// Manage Linux containers on the remote guest (`create`, `ls`, `exec`, `spawn`, `rm`).
+    #[command(subcommand)]
+    Container(ContainerCommand),
     /// Query `/kernel/*` and component inspect state (`--watch`, `--diff`).
     Inspect(InspectCommand),
     /// Open the live system monitor TUI.
@@ -229,7 +249,12 @@ pub(crate) enum SessionCommand {
     Kill(KillCommand),
     /// Fetch or stream (`--follow`) guest tracing events.
     Trace(TraceCommand),
-    /// Spawn or execute a remote program with streaming stdio.
+    /// Inspect or collect profiling data (`instructions`, `folded`, `metrics`, `llvm-raw`).
+    #[command(subcommand)]
+    Profile(ProfileOpsCommand),
+    /// Execute a remote program to completion.
+    Exec(ExecCommand),
+    /// Spawn a remote program with streaming stdio.
     Spawn(SpawnCommand),
     /// Collect a `.tar.zst` diagnostic bundle.
     Bundle(BundleCommand),
@@ -336,11 +361,15 @@ fn main() -> Result<(), InspectorError> {
         other => {
             let session_cmd = match other {
                 Some(Command::Nu(cmd)) => SessionCommand::Nu(cmd),
+                Some(Command::Component(cmd)) => SessionCommand::Component(cmd),
+                Some(Command::Oci(cmd)) => SessionCommand::Oci(cmd),
+                Some(Command::Container(cmd)) => SessionCommand::Container(cmd),
                 Some(Command::Inspect(cmd)) => SessionCommand::Inspect(cmd),
                 Some(Command::Stats) => SessionCommand::Stats,
                 Some(Command::Ps(cmd)) => SessionCommand::Ps(cmd),
                 Some(Command::Kill(cmd)) => SessionCommand::Kill(cmd),
                 Some(Command::Trace(cmd)) => SessionCommand::Trace(cmd),
+                Some(Command::Exec(cmd)) => SessionCommand::Exec(cmd),
                 Some(Command::Spawn(cmd)) => SessionCommand::Spawn(cmd),
                 Some(Command::Bundle(cmd)) => SessionCommand::Bundle(cmd),
                 Some(Command::Bridge(cmd)) => SessionCommand::Bridge(cmd),
@@ -415,10 +444,21 @@ async fn run_ops_session_command(
             let uri = session.target().uri.clone();
             ops_cli::run_python_command(ops, cmd, Some(&uri))
         }
+        SessionCommand::Component(cmd) => {
+            ops_cli::run_component(&session, fleet.as_ref(), cmd, ops.output).await
+        }
+        SessionCommand::Oci(cmd) => {
+            ops_cli::run_oci(&session, fleet.as_ref(), cmd, ops.output).await
+        }
+        SessionCommand::Container(cmd) => ops_cli::run_container(&session, cmd, ops.output).await,
         SessionCommand::Inspect(cmd) => ops_cli::run_inspect(&session, cmd, ops.output).await,
         SessionCommand::Ps(cmd) => ops_cli::run_ps(&session, cmd, ops.output).await,
         SessionCommand::Kill(cmd) => ops_cli::run_kill(&session, cmd).await,
         SessionCommand::Trace(cmd) => ops_cli::run_trace(&session, cmd, ops.output).await,
+        SessionCommand::Profile(cmd) => ops_cli::run_profile(&session, cmd, ops.output).await,
+        SessionCommand::Exec(cmd) => {
+            ops_cli::run_exec(&session, fleet.as_ref(), cmd, ops.output).await
+        }
         SessionCommand::Spawn(cmd) => ops_cli::run_spawn(&session, cmd).await,
         SessionCommand::Bundle(cmd) => ops_cli::run_bundle(&session, cmd).await,
         SessionCommand::Bridge(cmd) => ops_cli::run_bridge(&session, cmd).await,
@@ -562,6 +602,24 @@ pub(crate) fn run_connected(
             drop(client);
             Ok(ops_cli::run_python_command(ops, &cmd, target_uri)?)
         }
+        SessionCommand::Component(cmd) => {
+            let session = wrap_vm_session(&client, ops, target_uri)?;
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|source| SessionError::Runtime { source })?;
+            Ok(rt.block_on(ops_cli::run_component(&session, None, &cmd, ops.output))?)
+        }
+        SessionCommand::Oci(cmd) => {
+            let session = wrap_vm_session(&client, ops, target_uri)?;
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|source| SessionError::Runtime { source })?;
+            Ok(rt.block_on(ops_cli::run_oci(&session, None, &cmd, ops.output))?)
+        }
+        SessionCommand::Container(cmd) => {
+            let session = wrap_vm_session(&client, ops, target_uri)?;
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|source| SessionError::Runtime { source })?;
+            Ok(rt.block_on(ops_cli::run_container(&session, &cmd, ops.output))?)
+        }
         SessionCommand::Inspect(cmd) => {
             let session = wrap_vm_session(&client, ops, target_uri)?;
             let rt = tokio::runtime::Runtime::new()
@@ -585,6 +643,18 @@ pub(crate) fn run_connected(
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|source| SessionError::Runtime { source })?;
             Ok(rt.block_on(ops_cli::run_trace(&session, &cmd, ops.output))?)
+        }
+        SessionCommand::Profile(cmd) => {
+            let session = wrap_vm_session(&client, ops, target_uri)?;
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|source| SessionError::Runtime { source })?;
+            Ok(rt.block_on(ops_cli::run_profile(&session, &cmd, ops.output))?)
+        }
+        SessionCommand::Exec(cmd) => {
+            let session = wrap_vm_session(&client, ops, target_uri)?;
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|source| SessionError::Runtime { source })?;
+            Ok(rt.block_on(ops_cli::run_exec(&session, None, &cmd, ops.output))?)
         }
         SessionCommand::Spawn(cmd) => {
             let session = wrap_vm_session(&client, ops, target_uri)?;
@@ -806,7 +876,6 @@ mod tests {
             "helios",
             "image",
             "build",
-            "--components",
             "components",
             "--out-dir",
             "/tmp/out",
@@ -817,19 +886,39 @@ mod tests {
             "inspector-host",
             "--no-compiler-plugin",
         ])
-        .expect("`helios image build` must parse");
+        .expect("`helios image build <tree-dir>` must parse");
         match build.command {
             Some(Command::Image(image::ImageCommand::Build(args))) => {
+                assert_eq!(args.tree_dir, std::path::PathBuf::from("components"));
                 assert!(args.dynamic_components);
                 assert_eq!(args.profile, "release");
                 assert_eq!(args.boot_programs, vec!["inspector-host"]);
                 let forwarded = image::build_cli_args(&args);
                 assert!(forwarded.contains(&"image-build".to_owned()));
+                assert!(
+                    forwarded
+                        .windows(2)
+                        .any(|w| w == ["--components", "components"])
+                );
                 assert!(forwarded.contains(&"--dynamic-components".to_owned()));
                 assert!(forwarded.contains(&"--no-compiler-plugin".to_owned()));
             }
             other => panic!("expected Image::Build, got {other:?}"),
         }
+
+        // Legacy `--components` flag on `helios image build` must be rejected (positional `<tree-dir>` only).
+        assert!(
+            Args::try_parse_from([
+                "helios",
+                "image",
+                "build",
+                "--components",
+                "components",
+                "--out-dir",
+                "/tmp/out",
+            ])
+            .is_err()
+        );
 
         let codegen = Args::try_parse_from([
             "helios",
@@ -850,6 +939,206 @@ mod tests {
                 assert!(forwarded.contains(&"--verify-matches".to_owned()));
             }
             other => panic!("expected Image::Codegen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_component_oci_container_exec_cwd_and_vm_profile_subcommands() {
+        for argv in [
+            vec!["helios", "component", "ls"],
+            vec!["helios", "component", "status", "/core/http"],
+            vec!["helios", "component", "start", "/core/http"],
+            vec!["helios", "component", "stop", "/core/http"],
+            vec!["helios", "component", "restart", "/core/http"],
+            vec![
+                "helios",
+                "component",
+                "mount-dynamic",
+                "/apps",
+                "--guest-dir",
+                "/data/worker",
+                "--name",
+                "worker",
+            ],
+            vec![
+                "helios",
+                "component",
+                "mount-dynamic",
+                "/apps",
+                "--manifest-dir",
+                "/tmp/worker",
+            ],
+            vec!["helios", "component", "unmount-dynamic", "/apps/worker"],
+            vec!["helios", "oci", "pull", "alpine:latest", "--arch", "x86-64"],
+            vec!["helios", "oci", "ls"],
+            vec!["helios", "oci", "inspect", "alpine:latest"],
+            vec!["helios", "oci", "rm", "alpine:latest"],
+            vec!["helios", "container", "ls"],
+            vec![
+                "helios",
+                "container",
+                "create",
+                "--root",
+                "/rootfs",
+                "--hostname",
+                "demo",
+            ],
+            vec![
+                "helios",
+                "container",
+                "exec",
+                "--root",
+                "/rootfs",
+                "--cwd",
+                "/work",
+                "/bin/echo",
+                "hi",
+            ],
+            vec![
+                "helios",
+                "container",
+                "spawn",
+                "--image",
+                "alpine:latest",
+                "/bin/sh",
+            ],
+            vec!["helios", "container", "rm", "7"],
+            vec![
+                "helios",
+                "exec",
+                "--cwd",
+                "/tmp",
+                "-e",
+                "A=1",
+                "--grant",
+                "dir:/tmp:rw",
+                "/bin/echo",
+                "hi",
+            ],
+            vec!["helios", "spawn", "--cwd", "/tmp", "/bin/ping", "-c", "1"],
+            vec![
+                "helios",
+                "vm",
+                "--arch",
+                "x86-64",
+                "--no-build",
+                "component",
+                "ls",
+            ],
+            vec![
+                "helios",
+                "vm",
+                "--arch",
+                "x86-64",
+                "--no-build",
+                "component",
+                "mount-dynamic",
+                "/apps",
+                "--guest-dir",
+                "/data/worker",
+            ],
+            vec![
+                "helios",
+                "vm",
+                "--arch",
+                "x86-64",
+                "--no-build",
+                "component",
+                "unmount-dynamic",
+                "/apps/worker",
+            ],
+            vec![
+                "helios",
+                "vm",
+                "--arch",
+                "x86-64",
+                "--no-build",
+                "oci",
+                "ls",
+            ],
+            vec![
+                "helios",
+                "vm",
+                "--arch",
+                "x86-64",
+                "--no-build",
+                "container",
+                "ls",
+            ],
+            vec![
+                "helios",
+                "vm",
+                "--arch",
+                "x86-64",
+                "--no-build",
+                "exec",
+                "--cwd",
+                "/tmp",
+                "/bin/echo",
+            ],
+            vec![
+                "helios",
+                "vm",
+                "--arch",
+                "x86-64",
+                "--no-build",
+                "spawn",
+                "--cwd",
+                "/tmp",
+                "/bin/echo",
+            ],
+            vec![
+                "helios",
+                "vm",
+                "--arch",
+                "x86-64",
+                "--no-build",
+                "profile",
+                "instructions",
+                "--duration-ms",
+                "100",
+            ],
+            vec![
+                "helios",
+                "vm",
+                "--arch",
+                "x86-64",
+                "--no-build",
+                "profile",
+                "folded",
+            ],
+            vec![
+                "helios",
+                "vm",
+                "--arch",
+                "x86-64",
+                "--no-build",
+                "profile",
+                "metrics",
+            ],
+            vec![
+                "helios",
+                "vm",
+                "--arch",
+                "x86-64",
+                "--no-build",
+                "profile",
+                "llvm-raw",
+                "--out",
+                "/tmp/k.profraw",
+            ],
+            vec![
+                "helios",
+                "vm",
+                "--arch",
+                "x86-64",
+                "--no-build",
+                "profile",
+                "/tmp/boot.profraw",
+            ],
+        ] {
+            Args::try_parse_from(&argv)
+                .unwrap_or_else(|err| panic!("failed to parse {argv:?}: {err}"));
         }
     }
 

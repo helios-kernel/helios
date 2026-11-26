@@ -7,15 +7,19 @@ use helios_inspector_protocol::auth::AuthError as ProtocolAuthError;
 use helios_inspector_protocol::tls::TlsError;
 use helios_wit_rpc::RpcError;
 use helios_wit_rpc::inspector::helios::system::{
+    btrfs::{BtrfsError, BtrfsErrorKind},
     component_control::ControlError as ComponentControlError,
     filters::FilterError,
     instances::KillError,
+    mounts::{MountError, MountErrorKind},
     processors::{OfflineError, OnlineError},
     profiling::{ControlError, InstructionProfileError, RawProfileError},
     programs::{ExecError, ExecErrorKind},
     tracing::TargetError as TraceTargetError,
 };
 use helios_wit_rpc::inspector_fs::FsRpcError;
+
+use crate::symbolize::KernelSymbolsError;
 
 /// Top-level error returned by [`crate::Session`], [`crate::Fleet`], and SDK helpers.
 #[derive(Debug, thiserror::Error)]
@@ -85,8 +89,28 @@ pub enum OpsError {
         kind: helios_wit_rpc::inspector::helios::system::component_control::ControlErrorKind,
         detail: String,
     },
+    #[error("mount `{operation}` on `{path}` refused ({kind:?}): {detail}")]
+    MountRefused {
+        operation: &'static str,
+        path: String,
+        kind: MountErrorKind,
+        detail: String,
+    },
+    #[error("btrfs `{operation}` on `{path}` refused ({kind:?}): {detail}")]
+    BtrfsRefused {
+        operation: &'static str,
+        path: String,
+        kind: BtrfsErrorKind,
+        detail: String,
+    },
+    #[error("{0}")]
+    Symbolize(#[from] KernelSymbolsError),
     #[error("program execution refused ({kind:?}): {detail}")]
     ExecRefused { kind: ExecErrorKind, detail: String },
+    #[error("child stdin stream is already closed")]
+    StdinClosed,
+    #[error("MicroVm configuration error: {detail}")]
+    InvalidVmConfig { detail: String },
     #[error("path `{path}` is invalid: {reason}")]
     InvalidPath { path: String, reason: &'static str },
     #[error("remote path not found: {path}")]
@@ -113,6 +137,24 @@ impl OpsError {
     pub fn from_component_control(operation: &'static str, err: ComponentControlError) -> Self {
         Self::ComponentControlRefused {
             operation,
+            kind: err.kind,
+            detail: err.detail,
+        }
+    }
+
+    pub fn from_mount(operation: &'static str, path: String, err: MountError) -> Self {
+        Self::MountRefused {
+            operation,
+            path,
+            kind: err.kind,
+            detail: err.detail,
+        }
+    }
+
+    pub fn from_btrfs(operation: &'static str, path: String, err: BtrfsError) -> Self {
+        Self::BtrfsRefused {
+            operation,
+            path,
             kind: err.kind,
             detail: err.detail,
         }

@@ -4,13 +4,16 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use helios_oci::PulledImage;
 use helios_wit_rpc::inspector::helios::system::{
-    inspect::SnapshotResult, instances::Instance, programs::ExecResult,
+    component_control::ComponentStatus, inspect::SnapshotResult, instances::Instance,
+    programs::ExecResult,
 };
 use tokio::sync::Semaphore;
 
 use crate::bundle::DiagnosticBundle;
 use crate::error::OpsError;
+use crate::oci::{DEFAULT_REMOTE_OCI_STORE, PullOptions};
 use crate::session::{Session, SessionOptions};
 use crate::target::Target;
 
@@ -166,6 +169,197 @@ impl Fleet {
     /// Collect diagnostic bundles from every node in the fleet.
     pub async fn collect_bundles(&self) -> Vec<NodeOutcome<DiagnosticBundle>> {
         self.run(|session| async move { DiagnosticBundle::collect(&session).await })
+            .await
+    }
+
+    /// Component-control fan-out helpers (`fleet.components()`).
+    #[must_use]
+    pub fn components(&self) -> FleetComponents {
+        FleetComponents {
+            fleet: self.clone(),
+        }
+    }
+
+    /// OCI image management fan-out helpers (`fleet.oci()`).
+    #[must_use]
+    pub fn oci(&self) -> FleetOci {
+        FleetOci {
+            fleet: self.clone(),
+            store_root: DEFAULT_REMOTE_OCI_STORE.to_owned(),
+        }
+    }
+}
+
+/// Bounded-concurrency component-control fan-out over a [`Fleet`].
+#[derive(Clone)]
+pub struct FleetComponents {
+    fleet: Fleet,
+}
+
+impl FleetComponents {
+    /// List components across every node in the fleet.
+    pub async fn list(&self) -> Vec<NodeOutcome<Vec<ComponentStatus>>> {
+        self.fleet
+            .run(|session| async move { session.components().list().await })
+            .await
+    }
+
+    /// Fetch the status of `moniker` across every node in the fleet.
+    pub async fn status(&self, moniker: String) -> Vec<NodeOutcome<ComponentStatus>> {
+        self.fleet
+            .run(move |session| {
+                let moniker = moniker.clone();
+                async move { session.components().status(&moniker).await }
+            })
+            .await
+    }
+
+    /// Start `moniker` across every node in the fleet.
+    pub async fn start(&self, moniker: String) -> Vec<NodeOutcome<ComponentStatus>> {
+        self.fleet
+            .run(move |session| {
+                let moniker = moniker.clone();
+                async move { session.components().start(&moniker).await }
+            })
+            .await
+    }
+
+    /// Stop `moniker` across every node in the fleet.
+    pub async fn stop(&self, moniker: String) -> Vec<NodeOutcome<()>> {
+        self.fleet
+            .run(move |session| {
+                let moniker = moniker.clone();
+                async move { session.components().stop(&moniker).await }
+            })
+            .await
+    }
+
+    /// Restart `moniker` across every node in the fleet.
+    pub async fn restart(&self, moniker: String) -> Vec<NodeOutcome<ComponentStatus>> {
+        self.fleet
+            .run(move |session| {
+                let moniker = moniker.clone();
+                async move { session.components().restart(&moniker).await }
+            })
+            .await
+    }
+
+    /// Mount a dynamic component subtree under `parent_moniker` across every node in the fleet.
+    pub async fn mount_dynamic(
+        &self,
+        parent_moniker: String,
+        source: helios_wit_rpc::inspector::helios::system::component_control::DynamicSubtreeSource,
+    ) -> Vec<NodeOutcome<String>> {
+        self.fleet
+            .run(move |session| {
+                let parent_moniker = parent_moniker.clone();
+                let source = source.clone();
+                async move {
+                    session
+                        .components()
+                        .mount_dynamic(&parent_moniker, source)
+                        .await
+                }
+            })
+            .await
+    }
+
+    /// Gracefully stop and unmount a previously mounted dynamic subtree across every node in the fleet.
+    pub async fn unmount_dynamic(&self, moniker: String) -> Vec<NodeOutcome<()>> {
+        self.fleet
+            .run(move |session| {
+                let moniker = moniker.clone();
+                async move { session.components().unmount_dynamic(&moniker).await }
+            })
+            .await
+    }
+}
+
+/// Bounded-concurrency OCI image management fan-out over a [`Fleet`].
+#[derive(Clone)]
+pub struct FleetOci {
+    fleet: Fleet,
+    store_root: String,
+}
+
+impl FleetOci {
+    /// Target a custom guest OCI store root path on every node.
+    #[must_use]
+    pub fn with_store_root(mut self, store_root: impl Into<String>) -> Self {
+        self.store_root = store_root.into();
+        self
+    }
+
+    /// Pull `reference` onto every node in the fleet.
+    pub async fn pull(&self, reference: String) -> Vec<NodeOutcome<PulledImage>> {
+        self.pull_with_options(reference, PullOptions::default())
+            .await
+    }
+
+    /// Pull `reference` with explicit [`PullOptions`] onto every node in the fleet.
+    pub async fn pull_with_options(
+        &self,
+        reference: String,
+        options: PullOptions,
+    ) -> Vec<NodeOutcome<PulledImage>> {
+        let store_root = self.store_root.clone();
+        self.fleet
+            .run(move |session| {
+                let reference = reference.clone();
+                let options = options.clone();
+                let store_root = store_root.clone();
+                async move {
+                    session
+                        .oci_with_store_root(&store_root)?
+                        .pull_with_options(&reference, options)
+                        .await
+                }
+            })
+            .await
+    }
+
+    /// List pulled OCI images on every node in the fleet.
+    pub async fn list(&self) -> Vec<NodeOutcome<Vec<PulledImage>>> {
+        let store_root = self.store_root.clone();
+        self.fleet
+            .run(move |session| {
+                let store_root = store_root.clone();
+                async move { session.oci_with_store_root(&store_root)?.list().await }
+            })
+            .await
+    }
+
+    /// Inspect `reference` on every node in the fleet.
+    pub async fn inspect(&self, reference: String) -> Vec<NodeOutcome<PulledImage>> {
+        let store_root = self.store_root.clone();
+        self.fleet
+            .run(move |session| {
+                let reference = reference.clone();
+                let store_root = store_root.clone();
+                async move {
+                    session
+                        .oci_with_store_root(&store_root)?
+                        .inspect(&reference)
+                        .await
+                }
+            })
+            .await
+    }
+
+    /// Remove `reference` from every node in the fleet.
+    pub async fn remove(&self, reference: String) -> Vec<NodeOutcome<PulledImage>> {
+        let store_root = self.store_root.clone();
+        self.fleet
+            .run(move |session| {
+                let reference = reference.clone();
+                let store_root = store_root.clone();
+                async move {
+                    session
+                        .oci_with_store_root(&store_root)?
+                        .remove(&reference)
+                        .await
+                }
+            })
             .await
     }
 }
