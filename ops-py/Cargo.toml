@@ -17,6 +17,7 @@ extension-module = ["pyo3/extension-module"]
 [dependencies]
 async-channel = { version = "2.5.0", default-features = false }
 helios-inspector-protocol = { path = "../inspector-protocol" }
+helios-oci = { path = "../oci" }
 helios-ops = { path = "../ops" }
 helios-wit-rpc = { path = "../wit-rpc", features = ["inspector-rpc"] }
 pyo3 = { version = "0.30.1", default-features = false, features = ["abi3-py311", "macros"] }

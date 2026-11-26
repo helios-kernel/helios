@@ -2245,6 +2245,15 @@ enum VmSessionCommand {
     Nu(crate::ops_cli::NuCommand),
     /// Run the symmetric Python entrypoint against this VM.
     Python(crate::ops_cli::PythonCommand),
+    /// Inspect and control configured components (`ls`, `status`, `start`, `stop`, `restart`, `mount-dynamic`, `unmount-dynamic`).
+    #[command(subcommand)]
+    Component(crate::ops_cli::ComponentCommand),
+    /// Manage pulled OCI images in the remote guest store (`pull`, `ls`, `inspect`, `rm`).
+    #[command(subcommand)]
+    Oci(crate::ops_cli::OciCommand),
+    /// Manage Linux containers on the remote guest (`create`, `ls`, `exec`, `spawn`, `rm`).
+    #[command(subcommand)]
+    Container(crate::ops_cli::ContainerCommand),
     /// Query `/kernel/*` and component inspect state (`--watch`, `--diff`).
     Inspect(crate::ops_cli::InspectCommand),
     /// List running instances / components (`--tree`).
@@ -2253,6 +2262,8 @@ enum VmSessionCommand {
     Kill(crate::ops_cli::KillCommand),
     /// Fetch or stream (`--follow`) guest tracing events.
     Trace(crate::ops_cli::TraceCommand),
+    /// Execute a remote program to completion.
+    Exec(crate::ops_cli::ExecCommand),
     /// Spawn or execute a remote program with streaming stdio.
     Spawn(crate::ops_cli::SpawnCommand),
     /// Collect a `.tar.zst` diagnostic bundle.
@@ -7594,10 +7605,18 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
         match value {
             VmSessionCommand::Nu(command) => Self::Session(SessionCommand::Nu(command)),
             VmSessionCommand::Python(command) => Self::Session(SessionCommand::Python(command)),
+            VmSessionCommand::Component(command) => {
+                Self::Session(SessionCommand::Component(command))
+            }
+            VmSessionCommand::Oci(command) => Self::Session(SessionCommand::Oci(command)),
+            VmSessionCommand::Container(command) => {
+                Self::Session(SessionCommand::Container(command))
+            }
             VmSessionCommand::Inspect(command) => Self::Session(SessionCommand::Inspect(command)),
             VmSessionCommand::Ps(command) => Self::Session(SessionCommand::Ps(command)),
             VmSessionCommand::Kill(command) => Self::Session(SessionCommand::Kill(command)),
             VmSessionCommand::Trace(command) => Self::Session(SessionCommand::Trace(command)),
+            VmSessionCommand::Exec(command) => Self::Session(SessionCommand::Exec(command)),
             VmSessionCommand::Spawn(command) => Self::Session(SessionCommand::Spawn(command)),
             VmSessionCommand::Bundle(command) => Self::Session(SessionCommand::Bundle(command)),
             VmSessionCommand::Bridge(command) => Self::Session(SessionCommand::Bridge(command)),
@@ -7612,7 +7631,10 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Balloon(command) => Self::Balloon(command),
             VmSessionCommand::Screendump(command) => Self::Screendump(command),
             VmSessionCommand::Input(command) => Self::Input(command),
-            VmSessionCommand::Profile(command) => Self::Profile(command),
+            VmSessionCommand::Profile(command) => match command.subcommand {
+                Some(ops_profile) => Self::Session(SessionCommand::Profile(ops_profile)),
+                None => Self::Profile(command),
+            },
             VmSessionCommand::LinuxSuite(command) => Self::LinuxSuite(command),
             VmSessionCommand::Build
             | VmSessionCommand::KernelPath

@@ -4,13 +4,14 @@ use helios_ops::{DEFAULT_FLEET_CONCURRENCY, Fleet, NodeOutcome, TargetStore};
 use pyo3::IntoPyObjectExt as _;
 use pyo3::prelude::*;
 
+use crate::clients::{PyFleetComponents, PyFleetOci};
 use crate::error::target_err_to_py;
 use crate::types::{
     OutcomeErrorKind, PyDiagnosticBundle, PyExecResult, PyInspectSnapshot, PyInstance,
     PyNodeOutcome, PyTarget, build_session_options, extract_target_arg,
 };
 
-fn convert_outcome<T, F>(
+pub(crate) fn convert_outcome<T, F>(
     py: Python<'_>,
     outcome: NodeOutcome<T>,
     convert_ok: F,
@@ -121,6 +122,20 @@ impl PyFleet {
     #[getter]
     fn concurrency(&self) -> usize {
         self.inner.concurrency()
+    }
+
+    #[getter]
+    fn components(&self) -> PyFleetComponents {
+        PyFleetComponents {
+            inner: self.inner.components(),
+        }
+    }
+
+    #[getter]
+    fn oci(&self) -> PyFleetOci {
+        PyFleetOci {
+            inner: self.inner.oci(),
+        }
     }
 
     fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {

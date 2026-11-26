@@ -61,11 +61,16 @@ pub(crate) fn ops_err_to_py(err: OpsError) -> PyErr {
         | OpsError::ProcessorOnlineRefused { .. }
         | OpsError::SnapshotRefused { .. }
         | OpsError::ComponentControlRefused { .. }
+        | OpsError::MountRefused { .. }
+        | OpsError::BtrfsRefused { .. }
         | OpsError::ExecRefused { .. } => RpcError::new_err(err.to_string()),
         OpsError::Auth(_)
         | OpsError::Http(_)
         | OpsError::Oci(_)
         | OpsError::Bundle(_)
+        | OpsError::Symbolize(_)
+        | OpsError::StdinClosed
+        | OpsError::InvalidVmConfig { .. }
         | OpsError::InvalidPath { .. }
         | OpsError::NotFound { .. }
         | OpsError::InvalidGrant { .. }

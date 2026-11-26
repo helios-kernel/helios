@@ -3722,6 +3722,8 @@ dependencies = [
 name = "helios-ops"
 version = "0.1.0"
 dependencies = [
+ "addr2line",
+ "askama",
  "async-channel",
  "async-io",
  "async-net",
@@ -3729,9 +3731,12 @@ dependencies = [
  "futures-io",
  "futures-lite",
  "futures-util",
+ "gimli",
  "helios-inspector-protocol",
  "helios-oci",
  "helios-wit-rpc",
+ "object 0.39.1",
+ "rustc-demangle",
  "serde",
  "serde_json",
  "serialport",
