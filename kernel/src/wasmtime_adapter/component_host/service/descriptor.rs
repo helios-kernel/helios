@@ -1019,26 +1019,43 @@ where
         P1Probe::Local(readiness) => return Ok(readiness),
         P1Probe::Network(probe) => probe,
     };
-    let Some(service) = caller.data().runtime_state.network_service() else {
-        return Err(p1::errno::NETDOWN);
-    };
     let readiness = match probe {
-        UnixSocketHandle::<Net>::TcpStream(stream) => service
-            .tcp_readiness(stream)
-            .await
-            .map_err(p1_errno_from_tcp_error)?,
-        UnixSocketHandle::<Net>::TcpListener(listener) => service
-            .tcp_listener_readiness(listener)
-            .await
-            .map_err(p1_errno_from_tcp_error)?,
-        UnixSocketHandle::<Net>::UdpSocket(socket) => service
-            .udp_readiness(socket)
-            .await
-            .map_err(p1_errno_from_udp_error)?,
-        UnixSocketHandle::<Net>::PacketSocket(socket) => service
-            .packet_readiness(socket)
-            .await
-            .map_err(p1_errno_from_udp_error)?,
+        UnixSocketHandle::<Net>::TcpStream(stream) => {
+            let Some(service) = caller.data().runtime_state.network_service() else {
+                return Err(p1::errno::NETDOWN);
+            };
+            service
+                .tcp_readiness(stream)
+                .await
+                .map_err(p1_errno_from_tcp_error)?
+        }
+        UnixSocketHandle::<Net>::TcpListener(listener) => {
+            let Some(service) = caller.data().runtime_state.network_service() else {
+                return Err(p1::errno::NETDOWN);
+            };
+            service
+                .tcp_listener_readiness(listener)
+                .await
+                .map_err(p1_errno_from_tcp_error)?
+        }
+        UnixSocketHandle::<Net>::UdpSocket(socket) => {
+            let Some(service) = caller.data().runtime_state.network_service() else {
+                return Err(p1::errno::NETDOWN);
+            };
+            service
+                .udp_readiness(socket)
+                .await
+                .map_err(p1_errno_from_udp_error)?
+        }
+        UnixSocketHandle::<Net>::PacketSocket(socket) => {
+            let Some(service) = caller.data().runtime_state.network_service() else {
+                return Err(p1::errno::NETDOWN);
+            };
+            service
+                .packet_readiness(socket)
+                .await
+                .map_err(p1_errno_from_udp_error)?
+        }
         UnixSocketHandle::<Net>::VsockListener(listener) => {
             let Some(vsock) = caller.data().runtime_state.vsock_service() else {
                 return Err(p1::errno::NETDOWN);

@@ -745,15 +745,19 @@ impl<S: Storage> OverlayLower for PinnedLower<S> {
     ) -> FsResult<Opened<OwnedFsPath>> {
         let inner = self.resolve_inner(path)?;
         let handle = OwnedFsPath::from(path);
+        // Pinned lower layers are strictly read-only: strip create/exclusive/
+        // truncate flags so opening a lower entry can never mutate or truncate
+        // the underlying mount.
+        let read_only = flags & OpenFlags::DIRECTORY;
         alloc::boxed::Box::pin(async move {
             let p = inner.as_path();
             let metadata = match &self.fs {
-                LowerFs::Root(fs) => fs.open(p, flags, now, payer).await?.metadata,
-                LowerFs::Boot(fs) => fs.open(p, flags, now, payer).await?.metadata,
-                LowerFs::Memory(fs) => fs.open(p, flags, now, payer).await?.metadata,
-                LowerFs::Host(fs) => fs.open(p, flags, now, payer).await?.metadata,
-                LowerFs::Erofs(fs) => fs.open(p, flags, now, payer).await?.metadata,
-                LowerFs::Btrfs(fs) => fs.open(p, flags, now, payer).await?.metadata,
+                LowerFs::Root(fs) => fs.open(p, read_only, now, payer).await?.metadata,
+                LowerFs::Boot(fs) => fs.open(p, read_only, now, payer).await?.metadata,
+                LowerFs::Memory(fs) => fs.open(p, read_only, now, payer).await?.metadata,
+                LowerFs::Host(fs) => fs.open(p, read_only, now, payer).await?.metadata,
+                LowerFs::Erofs(fs) => fs.open(p, read_only, now, payer).await?.metadata,
+                LowerFs::Btrfs(fs) => fs.open(p, read_only, now, payer).await?.metadata,
             };
             Ok(Opened { metadata, handle })
         })
@@ -921,35 +925,15 @@ impl<S: Storage> OverlayLower for PinnedLower<S> {
     }
 
     async fn lower_sync<'a>(&'a self, path: FsPath<'a>) -> FsResult<()> {
-        let inner = self.resolve_inner(path)?;
-        alloc::boxed::Box::pin(async move {
-            let p = inner.as_path();
-            match &self.fs {
-                LowerFs::Root(fs) => fs.sync(p).await,
-                LowerFs::Boot(fs) => fs.sync(p).await,
-                LowerFs::Memory(fs) => fs.sync(p).await,
-                LowerFs::Host(fs) => fs.sync(p).await,
-                LowerFs::Erofs(fs) => fs.sync(p).await,
-                LowerFs::Btrfs(fs) => fs.sync(p).await,
-            }
-        })
-        .await
+        // Pinned lower layers are read-only; syncing them is a no-op once the
+        // path resolves within the pinned subtree.
+        let _ = self.resolve_inner(path)?;
+        Ok(())
     }
 
     async fn lower_sync_data<'a>(&'a self, path: FsPath<'a>) -> FsResult<()> {
-        let inner = self.resolve_inner(path)?;
-        alloc::boxed::Box::pin(async move {
-            let p = inner.as_path();
-            match &self.fs {
-                LowerFs::Root(fs) => fs.sync_data(p).await,
-                LowerFs::Boot(fs) => fs.sync_data(p).await,
-                LowerFs::Memory(fs) => fs.sync_data(p).await,
-                LowerFs::Host(fs) => fs.sync_data(p).await,
-                LowerFs::Erofs(fs) => fs.sync_data(p).await,
-                LowerFs::Btrfs(fs) => fs.sync_data(p).await,
-            }
-        })
-        .await
+        let _ = self.resolve_inner(path)?;
+        Ok(())
     }
 }
 

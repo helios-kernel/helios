@@ -120,8 +120,10 @@
 //!   stays mapped and no page-table isolation separates it.
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::convert::Infallible;
+use core::ptr::NonNull;
 
 use thiserror::Error;
 
@@ -181,8 +183,76 @@ pub enum NativeError {
     OutOfMemory,
     #[error("an address in the range is not mapped with the required access")]
     NotMapped,
+    #[error("the mapped page has no resident frame and requires backing resolution")]
+    BackingFault,
     #[error("the register does not exist on this instruction set")]
     Register,
+}
+
+/// Backing semantics of a mapped user region inside a [`UserSpace`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegionKind {
+    /// Private anonymous mapping: uncommitted pages zero-fill on fault and
+    /// copy-on-write on [`UserSpace::clone_cow`].
+    PrivateAnonymous,
+    /// Private file-backed mapping: uncommitted pages return
+    /// [`NativeError::BackingFault`] from [`UserSpace::resolve_fault`] so the
+    /// caller can check file EOF (`SIGBUS`) or load file contents; committed
+    /// frames copy-on-write on [`UserSpace::clone_cow`].
+    PrivateFile,
+    /// Shared mapping (`MAP_SHARED`, anonymous or file-backed): attached
+    /// [`SharedFrame`]s stay writable in hardware across
+    /// [`UserSpace::clone_cow`], `protect`, and `remap`; uncommitted pages
+    /// return [`NativeError::BackingFault`] from [`UserSpace::resolve_fault`]
+    /// so the caller attaches the shared object's frame (or raises `SIGBUS`
+    /// past EOF).
+    Shared,
+}
+
+/// A reference-counted 4 KiB user frame backed by a static deallocator.
+/// Dropping the last [`Arc<SharedFrame>`] returns the frame to its pool.
+#[derive(Debug)]
+pub struct SharedFrame {
+    ptr: NonNull<u8>,
+    dealloc: fn(NonNull<u8>),
+}
+
+// SAFETY: `SharedFrame` owns a 4 KiB direct-mapped user frame freed once its
+// last owner drops; concurrent accesses follow the memory model of the spaces
+// mapping it.
+unsafe impl Send for SharedFrame {}
+// SAFETY: `SharedFrame` exposes only its immutable base pointer and static
+// deallocator.
+unsafe impl Sync for SharedFrame {}
+
+impl SharedFrame {
+    /// Wraps a 4 KiB user frame released by `dealloc` on drop.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point to a valid, page-aligned 4 KiB direct-mapped user
+    /// frame that remains live until `dealloc(ptr)` is called on drop.
+    pub const unsafe fn new(ptr: NonNull<u8>, dealloc: fn(NonNull<u8>)) -> Self {
+        Self { ptr, dealloc }
+    }
+
+    pub const fn as_ptr(&self) -> NonNull<u8> {
+        self.ptr
+    }
+
+    /// Consumes this handle without running its deallocator, returning the raw
+    /// direct-map pointer to the caller.
+    pub fn into_raw(self) -> NonNull<u8> {
+        let ptr = self.ptr;
+        core::mem::forget(self);
+        ptr
+    }
+}
+
+impl Drop for SharedFrame {
+    fn drop(&mut self) {
+        (self.dealloc)(self.ptr);
+    }
 }
 
 /// What a user slice ran into when it ended.
@@ -404,6 +474,57 @@ pub unsafe trait UserSpace: Send + Sync + 'static {
     fn is_page_shared(&self, _address: VirtAddr) -> bool {
         false
     }
+
+    /// Reserves page-aligned `range` with `flags` and backing `kind` without
+    /// committing frames.
+    fn map_region(
+        &self,
+        range: VirtRange,
+        flags: PageFlags,
+        _kind: RegionKind,
+    ) -> Result<(), NativeError> {
+        self.map(range, &[], flags)
+    }
+
+    /// Reserves `byte_len` bytes (a page multiple) with `flags` and backing
+    /// `kind` at the first free range at or above `hint`, else anywhere.
+    fn map_region_anywhere(
+        &self,
+        hint: VirtAddr,
+        byte_len: usize,
+        flags: PageFlags,
+        _kind: RegionKind,
+    ) -> Result<VirtRange, NativeError> {
+        self.map_anywhere(hint, byte_len, flags)
+    }
+
+    /// Installs `frame` as a shared writable frame at mapped page `base`,
+    /// preserving the region's user flags (including `WRITE` when set) and
+    /// keeping the frame shared across [`Self::clone_cow`].
+    fn attach_shared_frame(
+        &self,
+        _base: VirtAddr,
+        _frame: Arc<SharedFrame>,
+    ) -> Result<(), NativeError> {
+        Err(NativeError::NotMapped)
+    }
+
+    /// Installs `frame` as a privately owned frame at mapped uncommitted page
+    /// `base` (for staged private file population without extra copies).
+    fn install_private_frame(
+        &self,
+        _base: VirtAddr,
+        _frame: SharedFrame,
+    ) -> Result<(), NativeError> {
+        Err(NativeError::NotMapped)
+    }
+
+    /// Copies `output.len()` bytes from mapped pages starting at `address`
+    /// through the kernel direct map regardless of user [`PageFlags::READ`]
+    /// permission (e.g., after `mprotect(PROT_NONE)`).
+    fn read_unrestricted(&self, address: VirtAddr, output: &mut [u8]) -> Result<(), NativeError> {
+        self.read(address, output)
+    }
 }
 
 /// A run of pages mapped with one access, as [`UserSpace::mapping`]
@@ -550,6 +671,32 @@ unsafe impl UserSpace for Infallible {
     }
 
     fn clone_cow(&self) -> Result<Self, NativeError> {
+        match *self {}
+    }
+
+    fn map_region(&self, _: VirtRange, _: PageFlags, _: RegionKind) -> Result<(), NativeError> {
+        match *self {}
+    }
+
+    fn map_region_anywhere(
+        &self,
+        _: VirtAddr,
+        _: usize,
+        _: PageFlags,
+        _: RegionKind,
+    ) -> Result<VirtRange, NativeError> {
+        match *self {}
+    }
+
+    fn attach_shared_frame(&self, _: VirtAddr, _: Arc<SharedFrame>) -> Result<(), NativeError> {
+        match *self {}
+    }
+
+    fn install_private_frame(&self, _: VirtAddr, _: SharedFrame) -> Result<(), NativeError> {
+        match *self {}
+    }
+
+    fn read_unrestricted(&self, _: VirtAddr, _: &mut [u8]) -> Result<(), NativeError> {
         match *self {}
     }
 }

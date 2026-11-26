@@ -820,11 +820,17 @@ impl<L: OverlayLower> FileSystem for RootFs<L> {
                 Ok(found) if found.layer == Layer::Upper => {
                     self.upper.open(path, flags, now, payer).await
                 }
+                Ok(_) if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) => {
+                    Err(FsError::Exists)
+                }
                 Ok(_) if flags.contains(OpenFlags::TRUNCATE) => {
                     self.copy_up(path, true, payer).await?;
                     self.upper.open(path, flags, now, payer).await
                 }
-                Ok(_) => self.lower.lower_open(path, flags, now, payer).await,
+                Ok(_) => {
+                    let read_only = flags & OpenFlags::DIRECTORY;
+                    self.lower.lower_open(path, read_only, now, payer).await
+                }
                 Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
                     self.creatable(path).await?;
                     self.upper.open(path, flags, now, payer).await
@@ -1558,6 +1564,11 @@ mod tests {
         );
 
         // 4. Write 1 page into the upper file -> charges budget, instance, and UserMemoryPool.
+        let upper_meta = budget.used_bytes();
+        assert!(
+            upper_meta > 0,
+            "copied-up inode and xattrs are charged to budget"
+        );
         let one_page = alloc::vec![0xcd_u8; page as usize];
         block_on(helios_hal::fs::write_with(
             &overlay,
@@ -1569,7 +1580,7 @@ mod tests {
             |offset, dst| dst.copy_from_slice(&one_page[offset..offset + dst.len()]),
         ))
         .expect("1-page upper write succeeds");
-        assert_eq!(budget.used_bytes(), page);
+        assert_eq!(budget.used_bytes(), upper_meta + page);
         assert_eq!(inst.storage_bytes(), page);
 
         // 5. Lower file is completely untouched; dropping the overlay reclaims all frames.
@@ -1662,5 +1673,79 @@ mod tests {
         );
         // Lower still intact.
         assert!(block_on(lower_mem.stat(path("dir/old"))).is_ok());
+    }
+
+    #[test]
+    fn pinned_lower_strips_mutating_open_flags_and_makes_sync_noop() {
+        use crate::test_support::UnsupportedStorage;
+        use crate::vfs::{
+            MountGrant, MountSharing, MountTable, MountedFs, Namespace, OverlayFs, OverlayLower,
+            PinnedLower, write_bytes,
+        };
+        use helios_hal::fs::FileSystemRights;
+
+        let lower_mem = MemoryFs::new(DeviceId::new(41));
+        let payer = crate::StoragePayer::for_test();
+        block_on(lower_mem.open(path("data"), OpenFlags::CREATE, 1, &payer)).expect("create");
+        block_on(write_bytes(
+            &lower_mem,
+            path("data"),
+            WritePosition::At(0),
+            b"immutable-lower-bytes",
+            2,
+        ))
+        .expect("write lower");
+
+        const LOWER_BOOT: EmbeddedBootFs =
+            EmbeddedBootFs::new(&[EmbeddedBootDirectory::new("lower", 0)], &[]);
+        let boot_fs = BootFs::new(LOWER_BOOT, DeviceId::new(1));
+        let ns = Namespace::<UnsupportedStorage>::new(MountTable::new(boot_fs, 4));
+        block_on(
+            ns.mount(
+                &crate::ProcessAuthority::root()
+                    .derive_mount_cap("/lower")
+                    .unwrap(),
+                MountedFs::Memory(lower_mem.clone()),
+                MountGrant {
+                    rights: FileSystemRights::READ,
+                    sharing: MountSharing::Shared,
+                },
+            ),
+        )
+        .expect("mount");
+        let pinned = PinnedLower::from_held(ns.resolve("/lower").unwrap().held()).unwrap();
+
+        // Direct lower_open with TRUNCATE/CREATE strips write/truncate flags and preserves lower.
+        let opened = block_on(pinned.lower_open(
+            path("data"),
+            OpenFlags::CREATE | OpenFlags::TRUNCATE,
+            3,
+            &payer,
+        ))
+        .expect("lower_open strips mutating flags");
+        assert_eq!(opened.metadata.size, 21);
+        assert_eq!(
+            block_on(lower_mem.read_at(path("data"), 0, 64)).expect("lower intact"),
+            &b"immutable-lower-bytes"[..]
+        );
+        // sync / sync_data on read-only pinned lower are no-ops.
+        block_on(pinned.lower_sync(path("data"))).expect("lower_sync noop");
+        block_on(pinned.lower_sync_data(path("data"))).expect("lower_sync_data noop");
+
+        // Overlay open with CREATE|EXCLUSIVE on an existing lower file returns Exists without mutating lower.
+        let overlay = OverlayFs::new(MemoryFs::new(DeviceId::new(42)), pinned);
+        assert!(matches!(
+            block_on(overlay.open(
+                path("data"),
+                OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                4,
+                &payer,
+            )),
+            Err(FsError::Exists)
+        ));
+        assert_eq!(
+            block_on(lower_mem.read_at(path("data"), 0, 64)).expect("lower still intact"),
+            &b"immutable-lower-bytes"[..]
+        );
     }
 }
