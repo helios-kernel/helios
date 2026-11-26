@@ -30,7 +30,9 @@ use core::ptr::NonNull;
 
 use arm_gic::{IntId, Trigger};
 pub(crate) use helios_firmware::MPIDR_AFFINITY_MASK;
-use helios_firmware::{DeviceTreeNuma, FirmwareNumaError, ProcessorIdentities};
+use helios_firmware::{
+    DeviceTreeNuma, FirmwareIommuError, FirmwareNumaError, ProcessorIdentities, VirtioIommuTopology,
+};
 use helios_hal::numa::NumaTopology;
 use r_efi::efi::SystemTable;
 use thiserror::Error;
@@ -231,6 +233,30 @@ impl fmt::Display for PlatformSource {
     }
 }
 
+/// Maximum PCI memory-mapped BAR windows one host bridge may declare.
+pub(crate) const MAX_PCI_MEMORY_WINDOWS: usize = 4;
+
+/// One PCI MMIO aperture (32-bit or 64-bit) exported by the host bridge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PciMemoryWindowDesc {
+    pub(crate) pci_base: u64,
+    pub(crate) cpu_base: u64,
+    pub(crate) size: u64,
+}
+
+/// The PCIe ECAM host bridge as described by either Devicetree
+/// (`pci-host-ecam-generic`) or ACPI (`MCFG` + `PNP0A08`/`PNP0A03` `_CRS`/`_PRT`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PciHostDescription {
+    pub(crate) ecam_base: usize,
+    pub(crate) segment: u16,
+    pub(crate) bus_start: u8,
+    pub(crate) bus_end: u8,
+    pub(crate) memory_windows: Slots<PciMemoryWindowDesc, MAX_PCI_MEMORY_WINDOWS>,
+    /// Root-bus INTx routing table indexed by `[device (0..32)][pin - 1 (0..4)]`.
+    pub(crate) intx: [[Option<SpiInterrupt>; 4]; 32],
+}
+
 /// The machine, as its firmware describes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PlatformDescription {
@@ -246,6 +272,11 @@ pub(crate) struct PlatformDescription {
     /// without one leaves the kernel's wall clock reading as uptime.
     pub(crate) rtc: Option<MmioRegion>,
     pub(crate) virtio: Slots<VirtioMmioSlot, MAX_VIRTIO_MMIO_SLOTS>,
+    /// The PCIe ECAM host bridge, when the firmware describes one.
+    pub(crate) pci: Option<PciHostDescription>,
+    /// The `virtio-iommu-pci` translation topology, from Devicetree
+    /// `iommu-map` or ACPI `VIOT`, when present.
+    pub(crate) iommu: Option<VirtioIommuTopology>,
     /// Hardware no kernel driver claims, offered to driver plugins.
     pub(crate) grantable: Slots<GrantableDevice, MAX_GRANTABLE_DEVICES>,
     /// The TPM 2.0, when the firmware describes one: the ACPI TPM2
@@ -320,6 +351,8 @@ pub(crate) enum PlatformError {
     Acpi(#[from] AcpiError),
     #[error("the firmware's NUMA description is refused: {0}")]
     Numa(#[from] FirmwareNumaError),
+    #[error("the firmware's IOMMU description is refused: {0}")]
+    Iommu(#[from] FirmwareIommuError),
     #[error("the firmware's own device tree cannot be read: {0}")]
     FirmwareTree(#[from] FirmwareTreeError),
     #[error(

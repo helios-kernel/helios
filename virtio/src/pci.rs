@@ -1114,6 +1114,297 @@ where
     crate::vsock::VirtioVsockDevice::new(transport)
 }
 
+/// Static transport dispatch over either VirtIO MMIO or VirtIO PCI.
+///
+/// Backends that drive both MMIO virtio devices (default non-IOMMU boots)
+/// and PCI virtio devices (boots behind `virtio-iommu-pci`) select a single
+/// concrete transport type without dynamic dispatch.
+pub enum VirtioBusTransport<P: DmaMemory> {
+    Mmio(crate::transport::VirtioMmioTransport<crate::bus::MmioBus<P>>),
+    Pci(alloc::boxed::Box<VirtioPciTransport<P>>),
+}
+
+impl<P: DmaMemory> VirtioBusTransport<P> {
+    /// Builds an MMIO transport over a permanently mapped register block.
+    ///
+    /// # Safety
+    ///
+    /// `header..header + mmio_size` must refer to a valid, permanently mapped
+    /// VirtIO MMIO register block, and no other code may violate the
+    /// transport's register access invariants while the returned transport is
+    /// alive.
+    pub unsafe fn mmio(header: NonNull<u8>, mmio_size: usize, dma: P) -> IoResult<Self> {
+        // SAFETY: the caller guarantees `header..header + mmio_size` is a
+        // valid, permanently mapped VirtIO MMIO register block.
+        let bus = unsafe { crate::bus::MmioBus::new(header, mmio_size, dma) }?;
+        let transport = crate::transport::VirtioMmioTransport::new(bus)?;
+        Ok(Self::Mmio(transport))
+    }
+
+    /// Builds a modern VirtIO PCI transport for `address`.
+    pub fn pci<A, M>(
+        access: &A,
+        address: PciAddress,
+        mapper: &M,
+        dma: P,
+        msix: Option<MsixBinding>,
+    ) -> IoResult<Self>
+    where
+        A: ConfigRegionAccess,
+        M: PciMmioMapper,
+    {
+        Ok(Self::Pci(alloc::boxed::Box::new(VirtioPciTransport::new(
+            access, address, mapper, dma, msix,
+        )?)))
+    }
+
+    /// Human-readable transport label (`"mmio"` or `"pci"`).
+    pub const fn transport_name(&self) -> &'static str {
+        match self {
+            Self::Mmio(_) => "mmio",
+            Self::Pci(_) => "pci",
+        }
+    }
+}
+
+impl<P: DmaMemory> DeviceBus for VirtioBusTransport<P> {
+    type DmaPool = P;
+
+    fn read_u8(&self, offset: usize) -> u8 {
+        match self {
+            Self::Mmio(transport) => transport.bus().read_u8(offset),
+            Self::Pci(transport) => transport.bus().read_u8(offset),
+        }
+    }
+
+    fn read_u16(&self, offset: usize) -> u16 {
+        match self {
+            Self::Mmio(transport) => transport.bus().read_u16(offset),
+            Self::Pci(transport) => transport.bus().read_u16(offset),
+        }
+    }
+
+    fn read_u32(&self, offset: usize) -> u32 {
+        match self {
+            Self::Mmio(transport) => transport.bus().read_u32(offset),
+            Self::Pci(transport) => transport.bus().read_u32(offset),
+        }
+    }
+
+    fn write_u8(&self, offset: usize, value: u8) {
+        match self {
+            Self::Mmio(transport) => transport.bus().write_u8(offset, value),
+            Self::Pci(transport) => transport.bus().write_u8(offset, value),
+        }
+    }
+
+    fn write_u32(&self, offset: usize, value: u32) {
+        match self {
+            Self::Mmio(transport) => transport.bus().write_u32(offset, value),
+            Self::Pci(transport) => transport.bus().write_u32(offset, value),
+        }
+    }
+
+    fn dma(&self) -> &Self::DmaPool {
+        match self {
+            Self::Mmio(transport) => transport.bus().dma(),
+            Self::Pci(transport) => transport.bus().dma(),
+        }
+    }
+}
+
+impl<P: DmaMemory> VirtioTransport for VirtioBusTransport<P> {
+    type Bus = Self;
+
+    fn bus(&self) -> &Self::Bus {
+        self
+    }
+
+    fn device_type(&self) -> DeviceType {
+        match self {
+            Self::Mmio(transport) => transport.device_type(),
+            Self::Pci(transport) => transport.device_type(),
+        }
+    }
+
+    fn reset(&self) {
+        match self {
+            Self::Mmio(transport) => transport.reset(),
+            Self::Pci(transport) => transport.reset(),
+        }
+    }
+
+    fn status(&self) -> DeviceStatus {
+        match self {
+            Self::Mmio(transport) => transport.status(),
+            Self::Pci(transport) => transport.status(),
+        }
+    }
+
+    fn set_status(&self, status: DeviceStatus) {
+        match self {
+            Self::Mmio(transport) => transport.set_status(status),
+            Self::Pci(transport) => transport.set_status(status),
+        }
+    }
+
+    fn device_features(&self) -> u64 {
+        match self {
+            Self::Mmio(transport) => transport.device_features(),
+            Self::Pci(transport) => transport.device_features(),
+        }
+    }
+
+    fn set_driver_features(&self, features: u64) {
+        match self {
+            Self::Mmio(transport) => transport.set_driver_features(features),
+            Self::Pci(transport) => transport.set_driver_features(features),
+        }
+    }
+
+    fn queue_max_size(&self, index: u16) -> u16 {
+        match self {
+            Self::Mmio(transport) => transport.queue_max_size(index),
+            Self::Pci(transport) => transport.queue_max_size(index),
+        }
+    }
+
+    fn presented_queue_count(&self) -> Option<u16> {
+        match self {
+            Self::Mmio(transport) => transport.presented_queue_count(),
+            Self::Pci(transport) => transport.presented_queue_count(),
+        }
+    }
+
+    fn set_queue(
+        &self,
+        index: u16,
+        size: u16,
+        descriptor_area: u64,
+        driver_area: u64,
+        device_area: u64,
+    ) {
+        match self {
+            Self::Mmio(transport) => {
+                transport.set_queue(index, size, descriptor_area, driver_area, device_area);
+            }
+            Self::Pci(transport) => {
+                transport.set_queue(index, size, descriptor_area, driver_area, device_area);
+            }
+        }
+    }
+
+    fn notify_queue(&self, index: u16) {
+        match self {
+            Self::Mmio(transport) => transport.notify_queue(index),
+            Self::Pci(transport) => transport.notify_queue(index),
+        }
+    }
+
+    fn notify_queue_with_data(&self, index: u16, data: u32) {
+        match self {
+            Self::Mmio(transport) => transport.notify_queue_with_data(index, data),
+            Self::Pci(transport) => transport.notify_queue_with_data(index, data),
+        }
+    }
+
+    fn supports_queue_reset(&self) -> bool {
+        match self {
+            Self::Mmio(transport) => transport.supports_queue_reset(),
+            Self::Pci(transport) => transport.supports_queue_reset(),
+        }
+    }
+
+    fn reset_queue(&self, index: u16) -> IoResult<()> {
+        match self {
+            Self::Mmio(transport) => transport.reset_queue(index),
+            Self::Pci(transport) => transport.reset_queue(index),
+        }
+    }
+
+    fn ack_interrupt(&self) -> InterruptStatus {
+        match self {
+            Self::Mmio(transport) => transport.ack_interrupt(),
+            Self::Pci(transport) => transport.ack_interrupt(),
+        }
+    }
+
+    fn read_config_u16(&self, offset: usize) -> u16 {
+        match self {
+            Self::Mmio(transport) => transport.read_config_u16(offset),
+            Self::Pci(transport) => transport.read_config_u16(offset),
+        }
+    }
+
+    fn read_config_u32(&self, offset: usize) -> u32 {
+        match self {
+            Self::Mmio(transport) => transport.read_config_u32(offset),
+            Self::Pci(transport) => transport.read_config_u32(offset),
+        }
+    }
+
+    fn write_config_u32(&self, offset: usize, value: u32) {
+        match self {
+            Self::Mmio(transport) => transport.write_config_u32(offset, value),
+            Self::Pci(transport) => transport.write_config_u32(offset, value),
+        }
+    }
+
+    fn write_config_u8(&self, offset: usize, value: u8) {
+        match self {
+            Self::Mmio(transport) => transport.write_config_u8(offset, value),
+            Self::Pci(transport) => transport.write_config_u8(offset, value),
+        }
+    }
+
+    fn read_config_u8(&self, offset: usize) -> u8 {
+        match self {
+            Self::Mmio(transport) => transport.read_config_u8(offset),
+            Self::Pci(transport) => transport.read_config_u8(offset),
+        }
+    }
+
+    fn shared_memory_region(&self, id: u8) -> Option<PhysicalRange> {
+        match self {
+            Self::Mmio(transport) => transport.shared_memory_region(id),
+            Self::Pci(transport) => transport.shared_memory_region(id),
+        }
+    }
+}
+
+/// Builds a virtio-gpu driver on top of a [`VirtioBusTransport`] and logs its
+/// display topology.
+pub fn gpu_from_bus_transport<P: DmaMemory>(
+    transport: VirtioBusTransport<P>,
+) -> IoResult<VirtioGpuDevice<VirtioBusTransport<P>>> {
+    let label = transport.transport_name();
+    let device = VirtioGpuDevice::new(transport)?;
+    report_gpu_online(&device, label)?;
+    Ok(device)
+}
+
+/// Builds a virtio-input driver on top of a [`VirtioBusTransport`] and logs its
+/// identity.
+pub fn input_from_bus_transport<P: DmaMemory>(
+    transport: VirtioBusTransport<P>,
+) -> IoResult<crate::input::VirtioInputDevice<VirtioBusTransport<P>>> {
+    let label = transport.transport_name();
+    let device = crate::input::VirtioInputDevice::new(transport)?;
+    crate::input::report_input_online(&device, label);
+    Ok(device)
+}
+
+/// Builds a virtio-snd driver on top of a [`VirtioBusTransport`] and logs its
+/// PCM capabilities.
+pub fn snd_from_bus_transport<P: DmaMemory>(
+    transport: VirtioBusTransport<P>,
+) -> IoResult<crate::snd::VirtioSndDevice<VirtioBusTransport<P>>> {
+    let label = transport.transport_name();
+    let device = crate::snd::VirtioSndDevice::new(transport)?;
+    crate::snd::report_snd_online(&device, label);
+    Ok(device)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MODERN_DEVICE_ID_BASE, MsixBinding, device_type_from_ids, interrupt_status};

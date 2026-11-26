@@ -64,9 +64,10 @@ pub use net::{
 };
 pub use p9::Virtio9pDevice;
 pub use pci::{
-    MsixBinding, PciMmioMapper, VIRTIO_PCI_VENDOR_ID, VirtioPciBus, VirtioPciTransport,
-    balloon_from_pci, block_from_pci, gpu_from_pci, input_from_pci, iommu_from_pci, net_from_pci,
-    p9_from_pci, rng_from_pci, snd_from_pci, virtio_pci_device_type, vsock_from_pci,
+    MsixBinding, PciMmioMapper, VIRTIO_PCI_VENDOR_ID, VirtioBusTransport, VirtioPciBus,
+    VirtioPciTransport, balloon_from_pci, block_from_pci, gpu_from_bus_transport, gpu_from_pci,
+    input_from_bus_transport, input_from_pci, iommu_from_pci, net_from_pci, p9_from_pci,
+    rng_from_pci, snd_from_bus_transport, snd_from_pci, virtio_pci_device_type, vsock_from_pci,
 };
 pub use queue::{MAX_CHAIN_BUFFERS, TransportBuffer, VirtQueue, VirtqueueError};
 pub use resume::{DeviceReset, QuiesceError, ReinitError};

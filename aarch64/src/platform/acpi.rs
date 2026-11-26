@@ -29,7 +29,8 @@ use acpi::address::AddressSpace;
 use acpi::aml::AmlError;
 use acpi::aml::namespace::{AmlName, NamespaceLevel};
 use acpi::aml::object::Object;
-use acpi::aml::resource::{self, MemoryRangeDescriptor, Resource};
+use acpi::aml::resource::{self, AddressSpaceResourceType, MemoryRangeDescriptor, Resource};
+use acpi::platform::PciConfigRegions;
 use acpi::sdt::Signature;
 use acpi::sdt::fadt::Fadt;
 use acpi::sdt::madt::{Madt, MadtEntry};
@@ -39,14 +40,18 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use arm_gic::Trigger;
 use core::str::FromStr;
-use helios_firmware::{AcpiNuma, FirmwareNumaError, GiccUidKey, ProcessorIdentities};
+use helios_firmware::{
+    AcpiNuma, FirmwareIommuError, FirmwareNumaError, GiccUidKey, ProcessorIdentities,
+    VIOT_SIGNATURE, VirtioIommuTopology, parse_viot,
+};
 use helios_hal::cpu::Timebase;
 use helios_tpm::{AcpiTpm2, AcpiTpm2Locality, InterfaceDescription};
 use thiserror::Error;
 
 use super::{
-    ConsoleDescription, GicDescription, MmioRegion, PlatformDescription, PlatformSource,
-    PsciConduit, RedistributorAffinity, Slots, SpiInterrupt, TpmDescription, VirtioMmioSlot,
+    ConsoleDescription, GicDescription, MmioRegion, PciHostDescription, PciMemoryWindowDesc,
+    PlatformDescription, PlatformSource, PsciConduit, RedistributorAffinity, Slots, SpiInterrupt,
+    TpmDescription, VirtioMmioSlot,
 };
 
 /// The first 32 INTIDs are software-generated and private peripheral
@@ -56,6 +61,10 @@ const FIRST_SPI_INTID: u32 = 32;
 
 /// `_HID` of QEMU's virtio-mmio transport, an ARM Linaro identifier.
 const VIRTIO_MMIO_HID: &str = "LNRO0005";
+
+/// `_HID` of a PCI Express / PCI root host bridge.
+const PCI_EXPRESS_ROOT_HID: &str = "PNP0A08";
+const PCI_ROOT_HID: &str = "PNP0A03";
 
 /// `_HID` of a TPM 2.0 device object (TCG ACPI Specification, "TPM 2.0
 /// device object"; QEMU's `TPM0`).
@@ -104,6 +113,8 @@ pub(crate) enum AcpiError {
          _CRS says where it is"
     )]
     Tpm2WithoutDevice,
+    #[error("the ACPI VIOT table is invalid: {0}")]
+    Viot(#[from] FirmwareIommuError),
 }
 
 /// The AML interpreter this backend builds.
@@ -202,6 +213,7 @@ pub(super) fn describe(
     let interpreter = load_namespace(tables)?;
     let mut virtio = Slots::new();
     let mut tpm_device = None;
+    let mut pci_root_device = None;
     for (name, hid) in devices(&interpreter)? {
         if hid == VIRTIO_MMIO_HID {
             let (region, interrupt) = memory_and_interrupt_resource(&interpreter, &name)?;
@@ -211,8 +223,13 @@ pub(super) fn describe(
             );
         } else if hid == TPM_HID {
             tpm_device = Some(name);
+        } else if (hid == PCI_EXPRESS_ROOT_HID || hid == PCI_ROOT_HID) && pci_root_device.is_none()
+        {
+            pci_root_device = Some(name);
         }
     }
+    let pci = pci_host(tables, &interpreter, pci_root_device.as_ref())?;
+    let iommu = viot(tables)?;
     let tpm = tpm(tables, &interpreter, tpm_device.as_ref())?;
     Ok(PlatformDescription {
         source: PlatformSource::Acpi,
@@ -224,6 +241,8 @@ pub(super) fn describe(
         // path finds.
         rtc: None,
         virtio,
+        pci,
+        iommu,
         // The AML walk above looks for virtio transports specifically,
         // by their hardware id. Naming every other device in the
         // namespace, deciding which the kernel does not drive, and
@@ -239,6 +258,225 @@ pub(super) fn describe(
         // device joins it.
         boot_entropy_seed: None,
     })
+}
+
+/// Discovers the PCIe ECAM host bridge from `MCFG` together with the root
+/// bridge device's `_CRS` memory windows and `_PRT` INTx routing table.
+fn pci_host(
+    tables: &AcpiPlatformTables,
+    interpreter: &Interpreter,
+    bridge: Option<&AmlName>,
+) -> Result<Option<PciHostDescription>, AcpiError> {
+    let Some(bridge) = bridge else {
+        return Ok(None);
+    };
+    let config_regions = match PciConfigRegions::new(&tables.tables) {
+        Ok(regions) => regions,
+        Err(acpi::AcpiError::TableNotFound(_)) => return Ok(None),
+        Err(error) => return Err(AcpiError::Tables(error)),
+    };
+    let segment = match interpreter
+        .evaluate_if_present(child(bridge, "_SEG")?, Vec::new())
+        .map_err(AcpiError::Aml)?
+    {
+        Some(object) => match *object {
+            Object::Integer(value) => value as u16,
+            _ => 0,
+        },
+        None => 0,
+    };
+    let Some(region) = config_regions
+        .regions
+        .iter()
+        .find(|entry| entry.pci_segment_group == segment)
+    else {
+        return Ok(None);
+    };
+
+    let mut memory_windows = Slots::new();
+    for entry in current_resources(interpreter, bridge)? {
+        if let Resource::AddressSpace(descriptor) = entry
+            && descriptor.resource_type == AddressSpaceResourceType::MemoryRange
+        {
+            let pci_base = descriptor.address_range.0;
+            let size = if descriptor.length != 0 {
+                descriptor.length
+            } else {
+                descriptor
+                    .address_range
+                    .1
+                    .saturating_sub(descriptor.address_range.0)
+                    .saturating_add(1)
+            };
+            if size == 0 {
+                continue;
+            }
+            let cpu_base = pci_base.wrapping_add(descriptor.translation_offset);
+            memory_windows.push(
+                PciMemoryWindowDesc {
+                    pci_base,
+                    cpu_base,
+                    size,
+                },
+                "PCI memory windows",
+            );
+        }
+    }
+    if memory_windows.len() == 0 {
+        return Err(AcpiError::ResourceMissing(
+            alloc::format!("{bridge}"),
+            "PCI memory window",
+        ));
+    }
+
+    let mut intx = [[None; 4]; 32];
+    let prt_path = child(bridge, "_PRT")?;
+    if let Some(prt) = interpreter
+        .evaluate_if_present(prt_path.clone(), Vec::new())
+        .map_err(AcpiError::Aml)?
+    {
+        decode_prt(&prt, &prt_path, interpreter, &mut intx)?;
+    }
+
+    Ok(Some(PciHostDescription {
+        ecam_base: region.base_address as usize,
+        segment: region.pci_segment_group,
+        bus_start: region.bus_number_start,
+        bus_end: region.bus_number_end,
+        memory_windows,
+        intx,
+    }))
+}
+
+/// Decodes an evaluated `_PRT` package (ACPI 6.5 §6.2.13) into the root-bus
+/// `[device][pin]` GICv3 SPI routing table, supporting both direct GSIs and
+/// PCI interrupt link objects.
+fn decode_prt(
+    prt: &Object,
+    prt_path: &AmlName,
+    interpreter: &Interpreter,
+    intx: &mut [[Option<SpiInterrupt>; 4]; 32],
+) -> Result<(), AcpiError> {
+    let Object::Package(entries) = prt else {
+        return Err(AcpiError::Aml(AmlError::PrtInvalidAddress));
+    };
+    for entry in entries {
+        let Object::Package(fields) = &**entry else {
+            return Err(AcpiError::Aml(AmlError::PrtInvalidAddress));
+        };
+        if fields.len() < 4 {
+            return Err(AcpiError::Aml(AmlError::PrtInvalidAddress));
+        }
+        let Object::Integer(address) = *fields[0] else {
+            return Err(AcpiError::Aml(AmlError::PrtInvalidAddress));
+        };
+        let device = ((address >> 16) & 0xffff) as usize;
+        let function = (address & 0xffff) as u16;
+        if device >= 32 || (function != 0xffff && function != 0) {
+            continue;
+        }
+        let Object::Integer(pin) = *fields[1] else {
+            return Err(AcpiError::Aml(AmlError::PrtInvalidPin));
+        };
+        let Ok(pin_index) = usize::try_from(pin) else {
+            return Err(AcpiError::Aml(AmlError::PrtInvalidPin));
+        };
+        if pin_index >= 4 {
+            return Err(AcpiError::Aml(AmlError::PrtInvalidPin));
+        }
+
+        let source = fields[2].clone().unwrap_reference();
+        let link_object = match &*source {
+            Object::NamePath { name, scope } => Some(
+                interpreter
+                    .namespace
+                    .lock()
+                    .search_for_level(name, scope)
+                    .map_err(AcpiError::Aml)?,
+            ),
+            Object::String(name) => {
+                let parsed = AmlName::from_str(name).map_err(AcpiError::Aml)?;
+                Some(
+                    interpreter
+                        .namespace
+                        .lock()
+                        .search_for_level(&parsed, prt_path)
+                        .map_err(AcpiError::Aml)?,
+                )
+            }
+            _ => None,
+        };
+
+        let interrupt = match link_object {
+            Some(link_name) => {
+                let resources = current_resources(interpreter, &link_name)?;
+                let irq = resources
+                    .iter()
+                    .find_map(|item| match item {
+                        Resource::Irq(irq) => Some(irq),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        AcpiError::ResourceMissing(alloc::format!("{link_name}"), "interrupt")
+                    })?;
+                let &[gsiv] = irq.irqs.as_slice() else {
+                    return Err(AcpiError::InterruptCount(
+                        alloc::format!("{link_name}"),
+                        irq.irqs.len(),
+                    ));
+                };
+                SpiInterrupt {
+                    number: spi_from_gsiv(gsiv)?,
+                    trigger: match irq.trigger {
+                        resource::InterruptTrigger::Edge => Trigger::Edge,
+                        resource::InterruptTrigger::Level => Trigger::Level,
+                    },
+                }
+            }
+            None => {
+                if !matches!(*source, Object::Integer(0)) {
+                    return Err(AcpiError::Aml(AmlError::PrtInvalidSource));
+                }
+                let Object::Integer(gsi) = *fields[3] else {
+                    return Err(AcpiError::Aml(AmlError::PrtInvalidGsi));
+                };
+                let gsiv =
+                    u32::try_from(gsi).map_err(|_| AcpiError::Aml(AmlError::PrtInvalidGsi))?;
+                SpiInterrupt {
+                    number: spi_from_gsiv(gsiv)?,
+                    trigger: Trigger::Level,
+                }
+            }
+        };
+        intx[device][pin_index] = Some(interrupt);
+    }
+    Ok(())
+}
+
+/// Parses the ACPI `VIOT` table into a [`VirtioIommuTopology`], if present.
+fn viot(tables: &AcpiPlatformTables) -> Result<Option<VirtioIommuTopology>, AcpiError> {
+    let Some((physical_address, header)) = tables
+        .tables
+        .table_headers()
+        .find(|(_, header)| header.signature.as_str() == VIOT_SIGNATURE)
+    else {
+        return Ok(None);
+    };
+    let length = header.length as usize;
+    // SAFETY: `physical_address` and `length` come from the RSDT entry the
+    // firmware published, and firmware tables sit in the direct map.
+    let mapping = unsafe {
+        tables
+            .handler
+            .map_physical_region::<u8>(physical_address, length)
+    };
+    // SAFETY: `bytes` below only reads from `virtual_start` through an
+    // immutable slice of the static ACPI table, creating no mutable alias.
+    let virtual_start = unsafe { mapping.virtual_start() };
+    // SAFETY: `mapping` covers `length` bytes of the static ACPI table in the
+    // direct map and `unmap_physical_region` is a no-op.
+    let bytes = unsafe { core::slice::from_raw_parts(virtual_start.as_ptr(), length) };
+    Ok(Some(parse_viot(bytes)?))
 }
 
 /// The TPM the TPM2 table describes, when there is one.
@@ -391,14 +629,39 @@ fn devices(interpreter: &Interpreter) -> Result<Vec<(AmlName, String)>, AcpiErro
         else {
             continue;
         };
-        // The two devices this backend looks for both spell their `_HID`
-        // as a string. An integer `_HID` is a compressed EISA id, which
-        // no QEMU or SBBR platform uses for these devices.
-        if let Object::String(hid) = &*object {
-            devices.push((name, hid.clone()));
+        match &*object {
+            Object::String(hid) => devices.push((name, hid.clone())),
+            // PCI root bridges (e.g. QEMU's `PCI0`) spell `_HID` as a
+            // compressed EISA integer (`EISAID("PNP0A08")`).
+            Object::Integer(raw) => {
+                if let Some(hid) = decode_eisa_id(*raw) {
+                    devices.push((name, hid));
+                }
+            }
+            _ => {}
         }
     }
     Ok(devices)
+}
+
+/// Decodes an ACPI compressed 32-bit EISA ID (`EISAID("PNP0A08")`) into its
+/// 7-character ASCII identifier.
+fn decode_eisa_id(raw: u64) -> Option<String> {
+    let bytes = u32::try_from(raw).ok()?.to_le_bytes();
+    let c0 = ((bytes[0] >> 2) & 0x1f) + b'@';
+    let c1 = (((bytes[0] & 0x03) << 3) | ((bytes[1] >> 5) & 0x07)) + b'@';
+    let c2 = (bytes[1] & 0x1f) + b'@';
+    if !c0.is_ascii_uppercase() || !c1.is_ascii_uppercase() || !c2.is_ascii_uppercase() {
+        return None;
+    }
+    let product = u16::from_be_bytes([bytes[2], bytes[3]]);
+    Some(alloc::format!(
+        "{}{}{}{:04X}",
+        c0 as char,
+        c1 as char,
+        c2 as char,
+        product
+    ))
 }
 
 /// The single fixed memory range a device's `_CRS` declares.
