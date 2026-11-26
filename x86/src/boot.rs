@@ -1,17 +1,55 @@
+use core::cell::UnsafeCell;
+use core::ptr::NonNull;
+
 use helios_hal::boot::{
-    BootFirmwareTables, BootHandoff, BootKernelImage, BootMemoryKind, BootMemoryMap,
-    BootMemoryRegion, BootModule, BootModules, FirmwareKind,
+    BootFirmwareTables, BootFramebuffer, BootHandoff, BootKernelImage, BootMemoryKind,
+    BootMemoryMap, BootMemoryRegion, BootModule, BootModules, BootPixelChannel, BootPixelLayout,
+    FirmwareKind,
 };
 use limine::BaseRevision;
 use limine::firmware_type::FirmwareType;
+use limine::framebuffer::MemoryModel;
 use limine::memory_map::{Entry, EntryType};
 use limine::request::{
     DeviceTreeBlobRequest, ExecutableAddressRequest, ExecutableCmdlineRequest,
-    ExecutableFileRequest, FirmwareTypeRequest, HhdmRequest, MemoryMapRequest, ModuleRequest,
-    RsdpRequest, StackSizeRequest,
+    ExecutableFileRequest, FirmwareTypeRequest, FramebufferRequest, HhdmRequest, MemoryMapRequest,
+    ModuleRequest, RsdpRequest, StackSizeRequest,
 };
 
 use crate::KERNEL_STACK_BYTES;
+
+/// Limine `LIMINE_FLANTERM_FB_INIT_PARAMS_REQUEST_ID` request, declared
+/// directly because `limine = "0.5.0"` does not expose a binding for it.
+///
+/// Advertising this request causes Limine v12 (`common/protos/limine.c`) to
+/// set `preserve_screen = true` before `fb_init`, keeping the bootloader
+/// splash wallpaper intact on the linear GOP framebuffer across kernel entry
+/// rather than clearing it to black.
+#[repr(C)]
+struct LimineFlantermParamsRequest {
+    id: [u64; 4],
+    revision: u64,
+    response: UnsafeCell<*const ()>,
+}
+
+// SAFETY: Limine writes the response pointer before kernel entry and nothing
+// mutates it afterwards.
+unsafe impl Sync for LimineFlantermParamsRequest {}
+
+impl LimineFlantermParamsRequest {
+    const fn new() -> Self {
+        Self {
+            id: [
+                0xc7b1_dd30_df4c_8b88,
+                0x0a82_e883_a194_f07b,
+                0x3259_399f_e7c5_f126,
+                0xe01c_1c8c_5db9_d1a9,
+            ],
+            revision: 0,
+            response: UnsafeCell::new(core::ptr::null()),
+        }
+    }
+}
 
 #[used]
 static BASE_REVISION: BaseRevision = BaseRevision::new();
@@ -33,6 +71,10 @@ static FIRMWARE_TYPE_REQUEST: FirmwareTypeRequest = FirmwareTypeRequest::new();
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 #[used]
 static DEVICE_TREE_BLOB_REQUEST: DeviceTreeBlobRequest = DeviceTreeBlobRequest::new();
+#[used]
+static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+#[used]
+static FLANTERM_PARAMS_REQUEST: LimineFlantermParamsRequest = LimineFlantermParamsRequest::new();
 #[used]
 static STACK_SIZE_REQUEST: StackSizeRequest =
     StackSizeRequest::new().with_size(KERNEL_STACK_BYTES as u64);
@@ -143,7 +185,34 @@ pub(crate) fn limine_boot_handoff() -> LimineBootHandoff {
             device_tree_blob,
             measurement_log: TPM_EVENT_LOG_REQUEST.measurement_log(),
         },
+        framebuffer: limine_framebuffer(),
     }
+}
+
+fn limine_framebuffer() -> Option<BootFramebuffer> {
+    let response = FRAMEBUFFER_REQUEST.get_response()?;
+    response.framebuffers().find_map(|fb| {
+        if fb.memory_model() != MemoryModel::RGB {
+            return None;
+        }
+        let base = NonNull::new(fb.addr())?;
+        let width = u32::try_from(fb.width()).ok()?;
+        let height = u32::try_from(fb.height()).ok()?;
+        let pitch = u32::try_from(fb.pitch()).ok()?;
+        let framebuffer = BootFramebuffer {
+            base,
+            width,
+            height,
+            pitch,
+            bpp: fb.bpp(),
+            layout: BootPixelLayout::new(
+                BootPixelChannel::new(fb.red_mask_size(), fb.red_mask_shift()),
+                BootPixelChannel::new(fb.green_mask_size(), fb.green_mask_shift()),
+                BootPixelChannel::new(fb.blue_mask_size(), fb.blue_mask_shift()),
+            ),
+        };
+        framebuffer.is_valid().then_some(framebuffer)
+    })
 }
 
 fn convert_memory_region(entry: &'static Entry) -> BootMemoryRegion {
