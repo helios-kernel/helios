@@ -1433,7 +1433,7 @@ jobs:
             --accel tcg --iommu \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
-            shell -c 'echo ok' 2>&1 > boot-iommu-dt.out | tee "$runtime/inspector.log"
+            shell --shell /bin/dash -c 'echo ok' 2>&1 > boot-iommu-dt.out | tee "$runtime/inspector.log"
           cat boot-iommu-dt.out
           grep -Fqx ok boot-iommu-dt.out
           grep -F 'platform described by device-tree' "$runtime/inspector.log"
@@ -1456,7 +1456,7 @@ jobs:
             --accel tcg --iommu \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
-            shell -c 'echo ok' 2>&1 > boot-iommu-acpi.out | tee "$runtime/inspector.log"
+            shell --shell /bin/dash -c 'echo ok' 2>&1 > boot-iommu-acpi.out | tee "$runtime/inspector.log"
           cat boot-iommu-acpi.out
           grep -Fqx ok boot-iommu-acpi.out
           grep -F 'platform described by acpi' "$runtime/inspector.log"
