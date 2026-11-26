@@ -3,7 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
 
-use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt, current_processor};
+use helios_hal::cpu::{
+    BspSnapshotContext, Cpu, Instant, ProcessorId, SnapshotPoint, SnapshotUnsupported, Timebase,
+    TimerInterrupt, current_processor,
+};
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_kernel::Timer;
 
@@ -180,6 +183,14 @@ impl Cpu for HostedCpu {
         // such as the Wasmtime pooling allocator can pre-reserve
         // 4 GiB+ per instance without burning RAM.
         true
+    }
+
+    fn capture_bsp_state(
+        &self,
+        context: &mut BspSnapshotContext,
+    ) -> Result<SnapshotPoint, SnapshotUnsupported> {
+        *context = BspSnapshotContext::hosted(u64::from(current_processor().id()));
+        Ok(SnapshotPoint::Captured)
     }
 
     fn shutdown(&self) -> ! {

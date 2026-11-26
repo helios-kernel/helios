@@ -260,6 +260,10 @@ impl<R: ResourceEntry> ResourceTableInner<R> {
             .value)
     }
 
+    pub(crate) fn remove_unconditional(&mut self, handle: u32) -> Option<R> {
+        self.slots.remove(&handle).map(|slot| slot.value)
+    }
+
     fn take_all(&mut self) -> Vec<R> {
         std::mem::take(&mut self.slots)
             .into_values()
@@ -270,10 +274,12 @@ impl<R: ResourceEntry> ResourceTableInner<R> {
 
 /// Connection-scoped resource handle table.
 ///
-///Synchronized via `async_lock::Mutex` whose guard is never held across an
+/// Synchronized via `async_lock::Mutex` whose guard is never held across an
 /// `.await` point; resource `Drop` destructors always execute outside the lock.
 pub struct ResourceTable<R: ResourceEntry> {
     inner: Mutex<ResourceTableInner<R>>,
+    rollback_tx: async_channel::Sender<u32>,
+    rollback_rx: async_channel::Receiver<u32>,
 }
 
 impl<R: ResourceEntry> Default for ResourceTable<R> {
@@ -288,35 +294,96 @@ impl<R: ResourceEntry> ResourceTable<R> {
     }
 
     pub fn with_allocator(allocator: HandleAllocator) -> Self {
+        let (rollback_tx, rollback_rx) = async_channel::unbounded();
         Self {
             inner: Mutex::new(ResourceTableInner::with_allocator(allocator)),
+            rollback_tx,
+            rollback_rx,
         }
     }
 
+    fn drain_deferred_rollbacks(&self, inner: &mut ResourceTableInner<R>) -> Vec<R> {
+        let mut removed = Vec::new();
+        while let Ok(handle) = self.rollback_rx.try_recv() {
+            if let Some(entry) = inner.remove_unconditional(handle) {
+                removed.push(entry);
+            }
+        }
+        removed
+    }
+
     pub async fn lock(&self) -> MutexGuard<'_, ResourceTableInner<R>> {
-        self.inner.lock().await
+        let mut guard = self.inner.lock().await;
+        let deferred = self.drain_deferred_rollbacks(&mut guard);
+        if !deferred.is_empty() {
+            drop(guard);
+            drop(deferred);
+            return self.inner.lock().await;
+        }
+        guard
     }
 
     pub async fn contains(&self, handle: u32) -> bool {
-        self.inner.lock().await.contains(handle)
+        self.lock().await.contains(handle)
     }
 
     pub async fn len(&self) -> usize {
-        self.inner.lock().await.len()
+        self.lock().await.len()
     }
 
     pub async fn is_empty(&self) -> bool {
-        self.inner.lock().await.is_empty()
+        self.lock().await.is_empty()
     }
 
     pub async fn insert(&self, value: R) -> Result<u32, WireError> {
-        self.inner.lock().await.insert(value)
+        self.lock().await.insert(value)
+    }
+
+    /// Removes newly inserted response handles if transmitting the response
+    /// fails, dropping removed entries outside the lock.
+    pub(crate) async fn rollback_handles(&self, handles: &[u32]) {
+        if handles.is_empty() {
+            return;
+        }
+        let removed = {
+            let mut inner = self.inner.lock().await;
+            let mut removed = self.drain_deferred_rollbacks(&mut inner);
+            for &handle in handles {
+                if let Some(entry) = inner.remove_unconditional(handle) {
+                    removed.push(entry);
+                }
+            }
+            removed
+        };
+        drop(removed);
+    }
+
+    /// Synchronous rollback path invoked from an RAII `Drop` guard when an
+    /// in-flight `encode_response` future is cancelled mid-`.await`.
+    pub(crate) fn rollback_handles_sync(&self, handles: Vec<u32>) {
+        if handles.is_empty() {
+            return;
+        }
+        if let Some(mut inner) = self.inner.try_lock() {
+            let mut removed = self.drain_deferred_rollbacks(&mut inner);
+            for handle in handles {
+                if let Some(entry) = inner.remove_unconditional(handle) {
+                    removed.push(entry);
+                }
+            }
+            drop(inner);
+            drop(removed);
+        } else {
+            for handle in handles {
+                let _ = self.rollback_tx.try_send(handle);
+            }
+        }
     }
 
     /// Removes and drops a single connection-local handle in response to
     /// `Frame::ResourceDrop`.
     pub async fn drop_handle(&self, handle: u32) -> Result<(), WireError> {
-        let removed = self.inner.lock().await.remove_for_drop(handle)?;
+        let removed = self.lock().await.remove_for_drop(handle)?;
         drop(removed);
         Ok(())
     }
@@ -324,6 +391,7 @@ impl<R: ResourceEntry> ResourceTable<R> {
     /// Drops every remaining resource on the connection when the transport
     /// disconnects, returning how many live resources were cleaned up.
     pub async fn clear(&self) -> usize {
+        while self.rollback_rx.try_recv().is_ok() {}
         let entries = self.inner.lock().await.take_all();
         let count = entries.len();
         drop(entries);
