@@ -21,10 +21,11 @@ use helios_kernel::runtime_memory::{
     default_memory_image_new, default_page_size,
 };
 use helios_kernel::{
-    AllocationTagHooks, FiberStackVmHooks, MemoryOwner, ResidencyVmHooks,
+    AllocationTagHooks, FiberStackVmHooks, MemoryOwner, ResidencyVmHooks, SwapVmHooks,
     allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on,
     current_user_memory_owner, deallocate_user_frame_on, deallocate_user_run_on,
-    install_fiber_stack_hooks, install_residency_hooks, residency_vm_hooks, user_frame_node,
+    install_fiber_stack_hooks, install_residency_hooks, install_swap_hooks, residency_vm_hooks,
+    swap_vm_hooks, user_frame_node,
 };
 use helios_x86_vmm::{InstalledMachine, Machine};
 use spin::Once;
@@ -139,6 +140,9 @@ impl InstalledMachine for HhdmMachine {
     }
 }
 
+/// The kernel's view of this backend's swap surface.
+static X86_SWAP_HOOKS: SwapVmHooks = swap_vm_hooks::<X86UserAddressSpace>(crate::read_tsc);
+
 /// The kernel's view of how much of the user pool each instance holds.
 static X86_RESIDENCY_HOOKS: ResidencyVmHooks = residency_vm_hooks::<X86UserAddressSpace>();
 
@@ -158,6 +162,7 @@ pub fn install_user_address_space(physical_memory_offset: usize, processor_count
         )
     });
     runtime_memory::install_hooks(&X86_VMM_HOOKS);
+    install_swap_hooks(&X86_SWAP_HOOKS);
     install_residency_hooks(&X86_RESIDENCY_HOOKS);
     install_fiber_stack_hooks(&X86_FIBER_STACK_HOOKS);
 }
