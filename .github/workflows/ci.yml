@@ -631,7 +631,7 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: ghcr.io/helios-kernel/helios-ci:38a8eb115b6780e8c1615466bfc90cdb3f6c5b7d86f9e2985406a8341573cc62
-    timeout-minutes: 15
+    timeout-minutes: 35
     permissions:
       contents: read
       actions: read
@@ -3055,6 +3055,25 @@ jobs:
             desktop-scanout/*.wav
           if-no-files-found: warn
           retention-days: 7
+      - name: Swap out an idle guest and fault every page back byte-exact
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/swap-cycle"
+          mkdir -p "$runtime"
+          ./target/release/helios vm --arch x86-64 --release --memory 2G \
+            --accel kvm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
+            --boot-program procbench --no-compiler-plugin \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/procbench swap-cycle --mib 64 /bin/procbench' \
+            2>&1 > swap-cycle.out | tee "$runtime/inspector.log"
+          cat swap-cycle.out
+          grep -Fqx swap-cycle:16384 swap-cycle.out
+          ! grep -Fq 'Kernel panic' "$runtime/debug-serial.log"
       # The host keeps its own copy of the debug serial, written by the
       # QEMU chardev before the inspector frames a byte of it. A stage
       # marker broken in that copy was lost inside QEMU's transmit
