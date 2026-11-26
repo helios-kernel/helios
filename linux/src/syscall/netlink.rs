@@ -119,7 +119,7 @@ const RTF_GATEWAY: u16 = 0x0002;
 const RTF_HOST: u16 = 0x0004;
 
 /// Decodes a `struct sockaddr_nl` from user memory.
-pub(crate) fn read_sockaddr_nl<M: UserMemory>(
+pub(crate) async fn read_sockaddr_nl<M: UserMemory>(
     memory: &M,
     addr: u64,
     addrlen: u32,
@@ -128,7 +128,7 @@ pub(crate) fn read_sockaddr_nl<M: UserMemory>(
         return Err(EINVAL);
     }
     let mut buf = [0u8; SOCKADDR_NL_LEN];
-    memory.read(addr, &mut buf).map_err(|_| EFAULT)?;
+    memory.read(addr, &mut buf).await.map_err(|_| EFAULT)?;
     let family = u16::from_ne_bytes([buf[0], buf[1]]);
     if family != AF_NETLINK {
         return Err(EINVAL);
@@ -139,7 +139,7 @@ pub(crate) fn read_sockaddr_nl<M: UserMemory>(
 }
 
 /// Encodes a `struct sockaddr_nl` into user memory and updates `*addrlen`.
-pub(crate) fn write_sockaddr_nl<M: UserMemory>(
+pub(crate) async fn write_sockaddr_nl<M: UserMemory>(
     memory: &mut M,
     addr: u64,
     addrlen_ptr: u64,
@@ -152,6 +152,7 @@ pub(crate) fn write_sockaddr_nl<M: UserMemory>(
     let mut len_bytes = [0u8; 4];
     memory
         .read(addrlen_ptr, &mut len_bytes)
+        .await
         .map_err(|_| EFAULT)?;
     let cap = u32::from_ne_bytes(len_bytes) as usize;
     let mut buf = [0u8; SOCKADDR_NL_LEN];
@@ -160,23 +161,24 @@ pub(crate) fn write_sockaddr_nl<M: UserMemory>(
     buf[8..12].copy_from_slice(&nl_groups.to_ne_bytes());
     let copy = cap.min(SOCKADDR_NL_LEN);
     if copy > 0 {
-        memory.write(addr, &buf[..copy]).map_err(|_| EFAULT)?;
+        memory.write(addr, &buf[..copy]).await.map_err(|_| EFAULT)?;
     }
     memory
         .write(addrlen_ptr, &(SOCKADDR_NL_LEN as u32).to_ne_bytes())
+        .await
         .map_err(|_| EFAULT)?;
     Ok(())
 }
 
 /// Handles `bind()` on an `AF_NETLINK` socket.
-pub(crate) fn bind<N: SocketNetwork, M: UserMemory>(
+pub(crate) async fn bind<N: SocketNetwork, M: UserMemory>(
     sock: &Socket<N>,
     addr: u64,
     addrlen: u32,
     ctx: SocketContext,
     memory: &M,
 ) -> Result<(), u64> {
-    let (nl_pid, nl_groups) = read_sockaddr_nl(memory, addr, addrlen)?;
+    let (nl_pid, nl_groups) = read_sockaddr_nl(memory, addr, addrlen).await?;
     let assigned_pid = if nl_pid == 0 { ctx.pid } else { nl_pid };
     let _ = sock.with_netlink_mut(|nl| {
         nl.port_id = assigned_pid;
@@ -186,14 +188,14 @@ pub(crate) fn bind<N: SocketNetwork, M: UserMemory>(
 }
 
 /// Handles `getsockname()` on an `AF_NETLINK` socket.
-pub(crate) fn getsockname<N: SocketNetwork, M: UserMemory>(
+pub(crate) async fn getsockname<N: SocketNetwork, M: UserMemory>(
     sock: &Socket<N>,
     addr: u64,
     addrlen_ptr: u64,
     memory: &mut M,
 ) -> Result<(), u64> {
     let nl = sock.netlink_state().ok_or(EINVAL)?;
-    write_sockaddr_nl(memory, addr, addrlen_ptr, nl.port_id, nl.groups)
+    write_sockaddr_nl(memory, addr, addrlen_ptr, nl.port_id, nl.groups).await
 }
 
 /// Processes a `NETLINK_ROUTE` request datagram and queues the reply on `sock`.
@@ -311,7 +313,7 @@ pub(crate) async fn socket_ioctl<N: SocketNetwork, M: UserMemory, Net: Network<N
     match request {
         SIOCGIFNAME => {
             let mut req = [0u8; IFREQ_LEN];
-            memory.read(arg, &mut req).map_err(|_| EFAULT)?;
+            memory.read(arg, &mut req).await.map_err(|_| EFAULT)?;
             let ifindex = i32::from_ne_bytes([req[16], req[17], req[18], req[19]]);
             let name: &[u8] = match ifindex as u32 {
                 IFINDEX_LO => b"lo",
@@ -320,28 +322,28 @@ pub(crate) async fn socket_ioctl<N: SocketNetwork, M: UserMemory, Net: Network<N
             };
             req[0..16].fill(0);
             req[..name.len()].copy_from_slice(name);
-            memory.write(arg, &req).map_err(|_| EFAULT)?;
+            memory.write(arg, &req).await.map_err(|_| EFAULT)?;
             Ok(Some(0))
         }
         SIOCGIFINDEX => {
             let mut req = [0u8; IFREQ_LEN];
-            memory.read(arg, &mut req).map_err(|_| EFAULT)?;
+            memory.read(arg, &mut req).await.map_err(|_| EFAULT)?;
             let ifindex = lookup_ifindex(&req[0..16])?;
             req[16..20].copy_from_slice(&(ifindex as i32).to_ne_bytes());
-            memory.write(arg, &req).map_err(|_| EFAULT)?;
+            memory.write(arg, &req).await.map_err(|_| EFAULT)?;
             Ok(Some(0))
         }
         SIOCGIFTXQLEN => {
             let mut req = [0u8; IFREQ_LEN];
-            memory.read(arg, &mut req).map_err(|_| EFAULT)?;
+            memory.read(arg, &mut req).await.map_err(|_| EFAULT)?;
             let _ifindex = lookup_ifindex(&req[0..16])?;
             req[16..20].copy_from_slice(&DEFAULT_TXQLEN.to_ne_bytes());
-            memory.write(arg, &req).map_err(|_| EFAULT)?;
+            memory.write(arg, &req).await.map_err(|_| EFAULT)?;
             Ok(Some(0))
         }
         SIOCGIFFLAGS => {
             let mut req = [0u8; IFREQ_LEN];
-            memory.read(arg, &mut req).map_err(|_| EFAULT)?;
+            memory.read(arg, &mut req).await.map_err(|_| EFAULT)?;
             let ifindex = lookup_ifindex(&req[0..16])?;
             let flags = if ifindex == IFINDEX_LO {
                 LO_FLAGS as i16
@@ -349,13 +351,13 @@ pub(crate) async fn socket_ioctl<N: SocketNetwork, M: UserMemory, Net: Network<N
                 ETH0_FLAGS as i16
             };
             req[16..18].copy_from_slice(&flags.to_ne_bytes());
-            memory.write(arg, &req).map_err(|_| EFAULT)?;
+            memory.write(arg, &req).await.map_err(|_| EFAULT)?;
             Ok(Some(0))
         }
         SIOCSIFFLAGS => {
             require_admin(ctx, net)?;
             let mut req = [0u8; IFREQ_LEN];
-            memory.read(arg, &mut req).map_err(|_| EFAULT)?;
+            memory.read(arg, &mut req).await.map_err(|_| EFAULT)?;
             let ifindex = lookup_ifindex(&req[0..16])?;
             let requested = u32::from(u16::from_ne_bytes([req[16], req[17]]));
             let current = if ifindex == IFINDEX_LO {
@@ -372,7 +374,7 @@ pub(crate) async fn socket_ioctl<N: SocketNetwork, M: UserMemory, Net: Network<N
         }
         SIOCGIFMTU => {
             let mut req = [0u8; IFREQ_LEN];
-            memory.read(arg, &mut req).map_err(|_| EFAULT)?;
+            memory.read(arg, &mut req).await.map_err(|_| EFAULT)?;
             let ifindex = lookup_ifindex(&req[0..16])?;
             let mtu = if ifindex == IFINDEX_LO {
                 LO_MTU as i32
@@ -380,13 +382,13 @@ pub(crate) async fn socket_ioctl<N: SocketNetwork, M: UserMemory, Net: Network<N
                 ETH0_MTU as i32
             };
             req[16..20].copy_from_slice(&mtu.to_ne_bytes());
-            memory.write(arg, &req).map_err(|_| EFAULT)?;
+            memory.write(arg, &req).await.map_err(|_| EFAULT)?;
             Ok(Some(0))
         }
         SIOCSIFMTU => {
             require_admin(ctx, net)?;
             let mut req = [0u8; IFREQ_LEN];
-            memory.read(arg, &mut req).map_err(|_| EFAULT)?;
+            memory.read(arg, &mut req).await.map_err(|_| EFAULT)?;
             let ifindex = lookup_ifindex(&req[0..16])?;
             let mtu = i32::from_ne_bytes([req[16], req[17], req[18], req[19]]);
             if !(68..=65_536).contains(&mtu) {
@@ -404,7 +406,7 @@ pub(crate) async fn socket_ioctl<N: SocketNetwork, M: UserMemory, Net: Network<N
         }
         SIOCGIFHWADDR => {
             let mut req = [0u8; IFREQ_LEN];
-            memory.read(arg, &mut req).map_err(|_| EFAULT)?;
+            memory.read(arg, &mut req).await.map_err(|_| EFAULT)?;
             let ifindex = lookup_ifindex(&req[0..16])?;
             req[16..32].fill(0);
             if ifindex == IFINDEX_LO {
@@ -414,40 +416,40 @@ pub(crate) async fn socket_ioctl<N: SocketNetwork, M: UserMemory, Net: Network<N
                 req[16..18].copy_from_slice(&ARPHRD_ETHER.to_ne_bytes());
                 req[18..24].copy_from_slice(&mac);
             }
-            memory.write(arg, &req).map_err(|_| EFAULT)?;
+            memory.write(arg, &req).await.map_err(|_| EFAULT)?;
             Ok(Some(0))
         }
         SIOCGIFADDR => {
             let mut req = [0u8; IFREQ_LEN];
-            memory.read(arg, &mut req).map_err(|_| EFAULT)?;
+            memory.read(arg, &mut req).await.map_err(|_| EFAULT)?;
             let ifindex = lookup_ifindex(&req[0..16])?;
             let ip = primary_ipv4_for(ifindex, net).await?;
             write_sockaddr_in_slice(&mut req[16..32], ip.address);
-            memory.write(arg, &req).map_err(|_| EFAULT)?;
+            memory.write(arg, &req).await.map_err(|_| EFAULT)?;
             Ok(Some(0))
         }
         SIOCGIFNETMASK => {
             let mut req = [0u8; IFREQ_LEN];
-            memory.read(arg, &mut req).map_err(|_| EFAULT)?;
+            memory.read(arg, &mut req).await.map_err(|_| EFAULT)?;
             let ifindex = lookup_ifindex(&req[0..16])?;
             let ip = primary_ipv4_for(ifindex, net).await?;
             write_sockaddr_in_slice(&mut req[16..32], prefix_to_netmask(ip.prefix));
-            memory.write(arg, &req).map_err(|_| EFAULT)?;
+            memory.write(arg, &req).await.map_err(|_| EFAULT)?;
             Ok(Some(0))
         }
         SIOCGIFBRDADDR => {
             let mut req = [0u8; IFREQ_LEN];
-            memory.read(arg, &mut req).map_err(|_| EFAULT)?;
+            memory.read(arg, &mut req).await.map_err(|_| EFAULT)?;
             let ifindex = lookup_ifindex(&req[0..16])?;
             let ip = primary_ipv4_for(ifindex, net).await?;
             write_sockaddr_in_slice(&mut req[16..32], broadcast_ipv4(ip.address, ip.prefix));
-            memory.write(arg, &req).map_err(|_| EFAULT)?;
+            memory.write(arg, &req).await.map_err(|_| EFAULT)?;
             Ok(Some(0))
         }
         SIOCSIFADDR => {
             require_admin(ctx, net)?;
             let mut req = [0u8; IFREQ_LEN];
-            memory.read(arg, &mut req).map_err(|_| EFAULT)?;
+            memory.read(arg, &mut req).await.map_err(|_| EFAULT)?;
             let ifindex = lookup_ifindex(&req[0..16])?;
             if ifindex != IFINDEX_ETH0 {
                 return Err(EOPNOTSUPP);
@@ -470,7 +472,7 @@ pub(crate) async fn socket_ioctl<N: SocketNetwork, M: UserMemory, Net: Network<N
         SIOCSIFNETMASK => {
             require_admin(ctx, net)?;
             let mut req = [0u8; IFREQ_LEN];
-            memory.read(arg, &mut req).map_err(|_| EFAULT)?;
+            memory.read(arg, &mut req).await.map_err(|_| EFAULT)?;
             let ifindex = lookup_ifindex(&req[0..16])?;
             if ifindex != IFINDEX_ETH0 {
                 return Err(EOPNOTSUPP);
@@ -494,7 +496,7 @@ pub(crate) async fn socket_ioctl<N: SocketNetwork, M: UserMemory, Net: Network<N
         SIOCSIFBRDADDR => {
             require_admin(ctx, net)?;
             let mut req = [0u8; IFREQ_LEN];
-            memory.read(arg, &mut req).map_err(|_| EFAULT)?;
+            memory.read(arg, &mut req).await.map_err(|_| EFAULT)?;
             let ifindex = lookup_ifindex(&req[0..16])?;
             if ifindex != IFINDEX_ETH0 {
                 return Err(EOPNOTSUPP);
@@ -508,7 +510,7 @@ pub(crate) async fn socket_ioctl<N: SocketNetwork, M: UserMemory, Net: Network<N
         }
         SIOCGIFCONF => {
             let mut ifc = [0u8; IFCONF_LEN];
-            memory.read(arg, &mut ifc).map_err(|_| EFAULT)?;
+            memory.read(arg, &mut ifc).await.map_err(|_| EFAULT)?;
             let ifc_len = i32::from_ne_bytes([ifc[0], ifc[1], ifc[2], ifc[3]]);
             let ifc_buf = u64::from_ne_bytes([
                 ifc[8], ifc[9], ifc[10], ifc[11], ifc[12], ifc[13], ifc[14], ifc[15],
@@ -522,7 +524,7 @@ pub(crate) async fn socket_ioctl<N: SocketNetwork, M: UserMemory, Net: Network<N
             let total_bytes = entries.len().saturating_mul(IFREQ_LEN);
             if ifc_buf == 0 {
                 ifc[0..4].copy_from_slice(&(total_bytes as i32).to_ne_bytes());
-                memory.write(arg, &ifc).map_err(|_| EFAULT)?;
+                memory.write(arg, &ifc).await.map_err(|_| EFAULT)?;
                 return Ok(Some(0));
             }
             if ifc_len < 0 {
@@ -535,17 +537,17 @@ pub(crate) async fn socket_ioctl<N: SocketNetwork, M: UserMemory, Net: Network<N
                 req[..name.len()].copy_from_slice(name);
                 write_sockaddr_in_slice(&mut req[16..32], ip);
                 let dst = ifc_buf.checked_add((i * IFREQ_LEN) as u64).ok_or(EFAULT)?;
-                memory.write(dst, &req).map_err(|_| EFAULT)?;
+                memory.write(dst, &req).await.map_err(|_| EFAULT)?;
             }
             let written_bytes = (count * IFREQ_LEN) as i32;
             ifc[0..4].copy_from_slice(&written_bytes.to_ne_bytes());
-            memory.write(arg, &ifc).map_err(|_| EFAULT)?;
+            memory.write(arg, &ifc).await.map_err(|_| EFAULT)?;
             Ok(Some(0))
         }
         SIOCADDRT | SIOCDELRT => {
             require_admin(ctx, net)?;
             let mut rt = [0u8; RTENTRY_LEN];
-            memory.read(arg, &mut rt).map_err(|_| EFAULT)?;
+            memory.read(arg, &mut rt).await.map_err(|_| EFAULT)?;
             let dst = read_sockaddr_in_slice(&rt[8..24])?;
             let flags = u16::from_ne_bytes([rt[56], rt[57]]);
             let gateway = if flags & RTF_GATEWAY != 0 {

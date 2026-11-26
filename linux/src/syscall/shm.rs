@@ -247,7 +247,7 @@ pub(super) fn sync_process_memfds<R: Resources, F: Filesystem<R>>(process: &Proc
 
 /// Reads a NUL-terminated `memfd_create` name (at most 249 bytes excluding NUL)
 /// from user memory (`mm/memfd.c` `SYSCALL_DEFINE2(memfd_create)`).
-fn read_memfd_name<M: UserMemory>(memory: &M, mut ptr: u64) -> Result<String, u64> {
+async fn read_memfd_name<M: UserMemory>(memory: &M, mut ptr: u64) -> Result<String, u64> {
     if ptr == 0 {
         return Err(EFAULT);
     }
@@ -259,11 +259,11 @@ fn read_memfd_name<M: UserMemory>(memory: &M, mut ptr: u64) -> Result<String, u6
             return Err(EINVAL);
         }
         let to_read = chunk.len().min(remaining);
-        let slice = if memory.read(ptr, &mut chunk[..to_read]).is_ok() {
+        let slice = if memory.read(ptr, &mut chunk[..to_read]).await.is_ok() {
             &chunk[..to_read]
         } else {
             let mut byte = [0u8; 1];
-            memory.read(ptr, &mut byte).map_err(|_| EFAULT)?;
+            memory.read(ptr, &mut byte).await.map_err(|_| EFAULT)?;
             chunk[0] = byte[0];
             &chunk[..1]
         };
@@ -281,7 +281,7 @@ fn read_memfd_name<M: UserMemory>(memory: &M, mut ptr: u64) -> Result<String, u6
 }
 
 /// `memfd_create(name, flags)` (`mm/memfd.c`, x86-64: 319, aarch64: 279).
-pub(super) fn memfd_create<R: Resources, M: UserMemory, F: Filesystem<R>>(
+pub(super) async fn memfd_create<R: Resources, M: UserMemory, F: Filesystem<R>>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &M,
@@ -294,7 +294,7 @@ pub(super) fn memfd_create<R: Resources, M: UserMemory, F: Filesystem<R>>(
     {
         return errno(EINVAL);
     }
-    let name = match read_memfd_name(memory, args[0]) {
+    let name = match read_memfd_name(memory, args[0]).await {
         Ok(name) => name,
         Err(err) => return errno(err),
     };
@@ -466,7 +466,7 @@ pub(super) fn shmdt<R: Resources, M: VirtualMemory, O: System + Filesystem<R>>(
 }
 
 /// `shmctl(shmid, cmd, buf)` (`ipc/shm.c` `ksys_shmctl`, x86-64: 31, aarch64: 195).
-pub(super) fn shmctl<R: Resources, M: UserMemory, O: System + Filesystem<R>>(
+pub(super) async fn shmctl<R: Resources, M: UserMemory, O: System + Filesystem<R>>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -485,7 +485,7 @@ pub(super) fn shmctl<R: Resources, M: UserMemory, O: System + Filesystem<R>>(
             }
             let (max_idx, _) = output.shm_ctl_info();
             let raw = encode_shminfo64();
-            if memory.write(buf, &raw).is_err() {
+            if memory.write(buf, &raw).await.is_err() {
                 return errno(EFAULT);
             }
             max_idx as u64
@@ -496,7 +496,7 @@ pub(super) fn shmctl<R: Resources, M: UserMemory, O: System + Filesystem<R>>(
             }
             let (max_idx, info) = output.shm_ctl_info();
             let raw = info.encode_shm_info();
-            if memory.write(buf, &raw).is_err() {
+            if memory.write(buf, &raw).await.is_err() {
                 return errno(EFAULT);
             }
             max_idx as u64
@@ -513,7 +513,7 @@ pub(super) fn shmctl<R: Resources, M: UserMemory, O: System + Filesystem<R>>(
                     Err(err) => return errno(err),
                 };
             let raw = stat.encode_shmid64_ds();
-            if memory.write(buf, &raw).is_err() {
+            if memory.write(buf, &raw).await.is_err() {
                 return errno(EFAULT);
             }
             if by_index { resolved_id as u64 } else { 0 }
@@ -523,7 +523,7 @@ pub(super) fn shmctl<R: Resources, M: UserMemory, O: System + Filesystem<R>>(
                 return errno(EFAULT);
             }
             let mut raw = [0u8; SHMID64_DS_BYTES];
-            if memory.read(buf, &mut raw).is_err() {
+            if memory.read(buf, &mut raw).await.is_err() {
                 return errno(EFAULT);
             }
             let (uid, gid, mode) = ShmStat::decode_ipc_set(&raw);

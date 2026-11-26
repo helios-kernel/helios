@@ -492,8 +492,14 @@ where
         #[cfg(feature = "linux")]
         ProgramExecutable::Linux(executable) => {
             let launch = container.expect("every Linux launch carries a container");
+            let native_spaces = exec_context
+                .runtime_state
+                .program_service()
+                .map(|service| service.native_spaces())
+                .unwrap_or_default();
             let exec_runtime = LinuxExecRuntime {
                 exec_context: exec_context.clone(),
+                native_spaces,
                 wasm: Some(LinuxWasmRuntime {
                     filesystem,
                     progress,

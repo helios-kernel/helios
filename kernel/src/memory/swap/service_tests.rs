@@ -300,6 +300,7 @@ impl Harness {
             handle: handle.clone(),
             hooks: &TEST_HOOKS,
             registry,
+            native_spaces: NativeSpaceRegistry::new(),
             cpu: TestCpu::with_entropy(0),
             map: SwapMap::new(),
             page: Some(vec![0_u8; PAGE].into_boxed_slice()),
@@ -952,3 +953,481 @@ impl Drop for GuestSwap {
 
 /// The page size [`GuestSwap`] works in.
 pub(crate) const GUEST_SWAP_PAGE: usize = PAGE;
+
+mod native_swap_tests {
+    use core::ptr::NonNull;
+
+    use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt};
+    use helios_hal::hv::RegisterId;
+    use helios_hal::native::{
+        ExtendedState, InstructionSet, NativeError, NativeExecution, NativeUnavailable, Stop,
+        UserContext, UserSpace,
+    };
+
+    use super::*;
+    use crate::memory::{NativeSpace, UserTranslation};
+
+    #[derive(Clone, Copy)]
+    struct ModelPte {
+        _physical: u64,
+        flags: PageFlags,
+        accessed: bool,
+    }
+
+    #[derive(Clone)]
+    struct ModelTables {
+        ptes: Arc<spin::Mutex<BTreeMap<u64, ModelPte>>>,
+        fail_next_install: Arc<core::sync::atomic::AtomicU32>,
+    }
+
+    impl ModelTables {
+        fn new() -> Self {
+            Self {
+                ptes: Arc::new(spin::Mutex::new(BTreeMap::new())),
+                fail_next_install: Arc::new(core::sync::atomic::AtomicU32::new(0)),
+            }
+        }
+    }
+
+    // SAFETY: host-only model tables for unit-testing `SwapService` with `NativeSpace`.
+    unsafe impl UserTranslation for ModelTables {
+        fn install(
+            &mut self,
+            base: u64,
+            physical: u64,
+            flags: PageFlags,
+        ) -> Result<(), NativeError> {
+            let remaining = self.fail_next_install.load(Ordering::Acquire);
+            if remaining > 0 {
+                self.fail_next_install
+                    .store(remaining - 1, Ordering::Release);
+                return Err(NativeError::OutOfMemory);
+            }
+            let prev = self.ptes.lock().insert(
+                base,
+                ModelPte {
+                    _physical: physical,
+                    flags,
+                    accessed: true,
+                },
+            );
+            assert!(prev.is_none(), "double install at {base:#x}");
+            Ok(())
+        }
+
+        fn uninstall(&mut self, base: u64) {
+            let prev = self.ptes.lock().remove(&base);
+            assert!(prev.is_some(), "uninstall missing page {base:#x}");
+        }
+
+        fn protect(&mut self, base: u64, flags: PageFlags) {
+            let mut ptes = self.ptes.lock();
+            let entry = ptes.get_mut(&base).expect("protect on mapped page");
+            entry.flags = flags;
+            entry.accessed = true;
+        }
+
+        fn invalidate(&self, _first: u64, _last: u64) {}
+
+        fn physical(&self, frame: NonNull<u8>) -> u64 {
+            frame.as_ptr() as u64
+        }
+
+        fn new_empty(&self) -> Result<Self, NativeError> {
+            Ok(Self::new())
+        }
+
+        fn test_and_clear_accessed(&mut self, base: u64) -> bool {
+            let mut ptes = self.ptes.lock();
+            let Some(entry) = ptes.get_mut(&base) else {
+                return false;
+            };
+            let hot = entry.accessed;
+            entry.accessed = false;
+            hot
+        }
+    }
+
+    struct DummyContext;
+
+    // SAFETY: never enters hardware user mode; only satisfies `NativeExecution::Context`.
+    unsafe impl UserContext for DummyContext {
+        type Space = NativeSpace<ModelTables>;
+
+        fn register(&self, _: RegisterId) -> Result<u64, NativeError> {
+            Err(NativeError::Register)
+        }
+        fn set_register(&mut self, _: RegisterId, _: u64) -> Result<(), NativeError> {
+            Err(NativeError::Register)
+        }
+        fn thread_pointer(&self) -> VirtAddr {
+            VirtAddr::new(0)
+        }
+        fn set_thread_pointer(&mut self, _: VirtAddr) -> Result<(), NativeError> {
+            Ok(())
+        }
+        fn extended_state(&self) -> ExtendedState {
+            ExtendedState::X86Xsave(Vec::new())
+        }
+        fn set_extended_state(&mut self, _: &ExtendedState) -> Result<(), NativeError> {
+            Ok(())
+        }
+        fn try_clone(&self) -> Result<Self, NativeError> {
+            Ok(Self)
+        }
+        fn resume(&mut self, _: &Self::Space) -> Stop {
+            Stop::Preempted
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct NativeTestCpu;
+
+    impl NativeExecution for NativeTestCpu {
+        type Space = NativeSpace<ModelTables>;
+        type Context = DummyContext;
+
+        fn instruction_set(&self) -> InstructionSet {
+            InstructionSet::X86_64
+        }
+
+        fn user_range(&self) -> VirtRange {
+            VirtRange::new(VirtAddr::new(PAGE), 0x1_0000_0000)
+        }
+
+        fn create_space(&self) -> Result<Self::Space, NativeError> {
+            Ok(NativeSpace::new(
+                ModelTables::new(),
+                PAGE as u64,
+                0x1_0000_0000,
+            ))
+        }
+
+        fn create_context(&self, _: VirtAddr, _: VirtAddr) -> Result<Self::Context, NativeError> {
+            Ok(DummyContext)
+        }
+    }
+
+    impl Cpu for NativeTestCpu {
+        type Hypervisor = core::convert::Infallible;
+        type Native = Self;
+        const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
+        fn has_lazy_commit_virtual_memory(&self) -> bool {
+            true
+        }
+
+        fn processor_count(&self) -> usize {
+            1
+        }
+
+        fn bootstrap_processor(&self) -> ProcessorId {
+            ProcessorId::new(0)
+        }
+
+        fn park_current(&self) {}
+
+        type WakeOnlyMask = ();
+
+        fn mask_to_wake_only(&self) {
+            panic!("test CPU never freezes")
+        }
+
+        fn park_wake_only(&self, _: &core::sync::atomic::AtomicU8, _: u8) {
+            panic!("test CPU never freezes")
+        }
+
+        fn start_processor(&self, _: ProcessorId) {}
+
+        fn wake_processor(&self, _: ProcessorId) {}
+
+        fn stop_current(&self) {
+            panic!("test CPU never stops a processor")
+        }
+
+        fn restart_processor(&self, _: ProcessorId) {
+            panic!("test CPU never restarts a processor")
+        }
+
+        fn now(&self) -> Instant {
+            Instant::new(CLOCK_NANOS.with(Cell::get))
+        }
+
+        fn timebase(&self) -> Timebase {
+            Timebase::new(1_000_000_000)
+        }
+
+        fn set_deadline(&self, _: Instant) {}
+
+        fn publish_executable(&self, _: *const u8, _: usize) {}
+
+        fn unpublish_executable(&self, _: *const u8, _: usize) {}
+
+        fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
+            None
+        }
+
+        fn shutdown(&self) -> ! {
+            panic!("test CPU should not shut down")
+        }
+
+        fn reboot(&self) -> ! {
+            panic!("test CPU should not reboot")
+        }
+
+        fn native(&self) -> Result<&Self::Native, NativeUnavailable> {
+            Ok(self)
+        }
+    }
+
+    fn ensure_pool() {
+        const POOL_BYTES: usize = 4 * 1024 * 1024;
+        if crate::memory::installed_user_memory_pool().is_some() {
+            return;
+        }
+        let layout = alloc::alloc::Layout::from_size_align(POOL_BYTES, PAGE).expect("pool layout");
+        // SAFETY: nonzero size, leaked for the lifetime of the test process pool.
+        let base = unsafe { alloc::alloc::alloc_zeroed(layout) } as usize;
+        assert!(base != 0);
+        crate::memory::install_user_memory_pool(crate::memory::UserMemoryPool::single_node(
+            1,
+            &[(base, base + POOL_BYTES)],
+        ));
+    }
+
+    struct NativeHarness {
+        service: SwapService<FlakyBackend, NativeTestCpu>,
+        handle: SwapHandle,
+        backend: FlakyBackend,
+        native_spaces: NativeSpaceRegistry<NativeSpace<ModelTables>>,
+    }
+
+    impl NativeHarness {
+        fn new() -> Self {
+            ensure_pool();
+            with_space(|space| *space = FakeSpace::default());
+            set_clock(0);
+            let backend = FlakyBackend::default();
+            let handle = SwapHandle::new(
+                "native-test",
+                64 * PAGE as u64,
+                SwapClock {
+                    timebase: Timebase::new(1_000_000_000),
+                    now_ticks: TEST_HOOKS.now_ticks,
+                },
+            );
+            let native_spaces = NativeSpaceRegistry::new();
+            native_spaces.attach_swap_handle(handle.clone());
+            let service = SwapService {
+                backend: backend.clone(),
+                handle: handle.clone(),
+                hooks: &TEST_HOOKS,
+                registry: InstanceRegistry::new(),
+                native_spaces: native_spaces.clone(),
+                cpu: NativeTestCpu,
+                map: SwapMap::new(),
+                page: Some(vec![0_u8; PAGE].into_boxed_slice()),
+                report: SwapReport::default(),
+            };
+            Self {
+                service,
+                handle,
+                backend,
+                native_spaces,
+            }
+        }
+
+        fn fault_native(&mut self, space_id: u64, base: VirtAddr) -> Result<(), SwapFaultError> {
+            let mut fault = Box::pin(self.handle.fault_in_native(space_id, base));
+            assert!(
+                poll(&mut fault).is_none(),
+                "native fault-in parks until service runs"
+            );
+            block_on(self.service.serve_faults());
+            poll(&mut fault).expect("service settled native fault")
+        }
+    }
+
+    #[test]
+    fn native_yellow_idle_and_red_aging_eviction_fault_in_and_zero_leaks() {
+        let mut harness = NativeHarness::new();
+        let rw = PageFlags::READ | PageFlags::WRITE;
+        let tables_idle = ModelTables::new();
+        let space_idle = Arc::new(NativeSpace::new(
+            tables_idle.clone(),
+            PAGE as u64,
+            0x1_0000_0000,
+        ));
+        let tables_active = ModelTables::new();
+        let space_active = Arc::new(NativeSpace::new(
+            tables_active.clone(),
+            PAGE as u64,
+            0x1_0000_0000,
+        ));
+
+        let payload_a = "中文 日本語 한국어 page-a".as_bytes();
+        let payload_b = "中文 日本語 한국어 page-b".as_bytes();
+        space_idle
+            .map(VirtRange::new(VirtAddr::new(0x10_000), 2 * PAGE), &[], rw)
+            .unwrap();
+        space_idle
+            .write(VirtAddr::new(0x10_000), payload_a)
+            .unwrap();
+        space_idle
+            .write(VirtAddr::new(0x11_000), payload_b)
+            .unwrap();
+
+        space_active
+            .map(VirtRange::new(VirtAddr::new(0x20_000), 2 * PAGE), &[], rw)
+            .unwrap();
+        space_active
+            .write(VirtAddr::new(0x20_000), b"hot-page")
+            .unwrap();
+        space_active
+            .write(VirtAddr::new(0x21_000), b"cold-page")
+            .unwrap();
+
+        let reg_idle =
+            harness
+                .native_spaces
+                .register(Arc::clone(&space_idle), MemoryOwner::new(101), 0);
+        let reg_active =
+            harness
+                .native_spaces
+                .register(Arc::clone(&space_active), MemoryOwner::new(102), 0);
+
+        // Advance clock past IDLE_SWAP_AFTER; touch `reg_active` so only `reg_idle` is idle.
+        let now = IDLE_SWAP_AFTER.as_nanos() as u64 + 1_000_000;
+        set_clock(now);
+        reg_active.record_activity(now);
+
+        // Yellow pass evicts `reg_idle`'s 2 pages and leaves `reg_active` untouched.
+        let moved = block_on(harness.service.evict_idle_pass(
+            now,
+            IDLE_SWAP_AFTER.as_nanos() as u64,
+            SWAP_BATCH_BYTES,
+        ));
+        assert_eq!(moved, 2 * PAGE);
+        assert_eq!(space_idle.swapped_bytes(), 2 * PAGE as u64);
+        assert_eq!(space_active.swapped_bytes(), 0);
+        let stats = harness.handle.stats();
+        assert_eq!(stats.pages_out, 2);
+        assert_eq!(stats.used_bytes, 2 * PAGE as u64);
+
+        // Async fault-in restores page 0x10_000 byte-exact.
+        harness
+            .fault_native(reg_idle.space_id(), VirtAddr::new(0x10_000))
+            .unwrap();
+        let mut readback = vec![0u8; payload_a.len()];
+        space_idle
+            .read(VirtAddr::new(0x10_000), &mut readback)
+            .unwrap();
+        assert_eq!(readback, payload_a);
+        assert_eq!(space_idle.swapped_bytes(), PAGE as u64);
+        assert_eq!(harness.handle.stats().pages_in, 1);
+        assert_eq!(harness.handle.stats().used_bytes, PAGE as u64);
+
+        // Red pass 1 on `reg_active`: both pages start Hot -> clears ACCESSED, evicts 0.
+        let red1 = block_on(harness.service.evict_cold_pass(now, SWAP_BATCH_BYTES));
+        assert_eq!(red1, 0);
+        assert_eq!(space_active.swapped_bytes(), 0);
+
+        // Touch 0x20_000 (AF fault restores ACCESSED), leave 0x21_000 untouched.
+        space_active
+            .resolve_fault(VirtAddr::new(0x20_000), PageFlags::READ)
+            .unwrap();
+
+        // Red pass 2: evicts ONLY cold 0x21_000 (and 0x10_000 which was cleared in red1).
+        let red2 = block_on(harness.service.evict_cold_pass(now, SWAP_BATCH_BYTES));
+        assert!(red2 >= PAGE);
+        assert_eq!(space_active.swapped_token(VirtAddr::new(0x20_000)), None);
+        assert!(
+            space_active
+                .swapped_token(VirtAddr::new(0x21_000))
+                .is_some()
+        );
+
+        // Fault back in 0x21_000 and verify byte-exact content.
+        harness
+            .fault_native(reg_active.space_id(), VirtAddr::new(0x21_000))
+            .unwrap();
+        let mut cold_back = [0u8; 9];
+        space_active
+            .read(VirtAddr::new(0x21_000), &mut cold_back)
+            .unwrap();
+        assert_eq!(&cold_back, b"cold-page");
+
+        // Unmap one swapped page, then drop both registrations (exit/execve):
+        // release_orphaned_tokens must free 100% of backend extents (zero leaks!).
+        space_idle
+            .unmap(VirtRange::new(VirtAddr::new(0x11_000), PAGE))
+            .unwrap();
+        drop(reg_idle);
+        drop(reg_active);
+        block_on(harness.service.release_orphaned_tokens());
+        assert!(
+            harness.backend.extents().is_empty(),
+            "all swap extents must be released on unmap and space teardown"
+        );
+        assert_eq!(harness.handle.stats().used_bytes, 0);
+    }
+
+    #[test]
+    fn native_swap_handles_backend_refusal_and_concurrent_unmap_during_fault_in() {
+        let mut harness = NativeHarness::new();
+        let rw = PageFlags::READ | PageFlags::WRITE;
+        let tables = ModelTables::new();
+        let space = Arc::new(NativeSpace::new(tables.clone(), PAGE as u64, 0x1_0000_0000));
+        space
+            .map(VirtRange::new(VirtAddr::new(0x10_000), 2 * PAGE), &[], rw)
+            .unwrap();
+        space
+            .write(VirtAddr::new(0x10_000), b"rollback-ok")
+            .unwrap();
+        space
+            .write(VirtAddr::new(0x11_000), b"unmap-race!")
+            .unwrap();
+        let reg = harness
+            .native_spaces
+            .register(Arc::clone(&space), MemoryOwner::new(201), 0);
+
+        // Backend refuses write -> SwapService puts the page back into NativeSpace cleanly.
+        harness.backend.refuse_writes(1);
+        let moved = block_on(harness.service.evict_native_space(
+            reg.space_id(),
+            PAGE,
+            EvictionAge::Any,
+        ));
+        assert_eq!(moved, 0);
+        assert_eq!(space.swapped_bytes(), 0);
+        let mut check = [0u8; 11];
+        space.read(VirtAddr::new(0x10_000), &mut check).unwrap();
+        assert_eq!(&check, b"rollback-ok");
+
+        // Evict both pages successfully, then simulate reinstatement OOM failure ->
+        // rehomes back to backend and later succeeds.
+        let moved = block_on(harness.service.evict_native_space(
+            reg.space_id(),
+            2 * PAGE,
+            EvictionAge::Any,
+        ));
+        assert_eq!(moved, 2 * PAGE);
+        tables.fail_next_install.store(1, Ordering::Release);
+        assert_eq!(
+            harness.fault_native(reg.space_id(), VirtAddr::new(0x10_000)),
+            Err(SwapFaultError::AddressSpace)
+        );
+        assert!(space.swapped_token(VirtAddr::new(0x10_000)).is_some());
+        harness
+            .fault_native(reg.space_id(), VirtAddr::new(0x10_000))
+            .unwrap();
+        space.read(VirtAddr::new(0x10_000), &mut check).unwrap();
+        assert_eq!(&check, b"rollback-ok");
+
+        // Teardown releases remaining swapped page 0x11_000 cleanly.
+        drop(reg);
+        block_on(harness.service.release_orphaned_tokens());
+        assert!(harness.backend.extents().is_empty());
+        assert_eq!(harness.handle.stats().used_bytes, 0);
+    }
+}

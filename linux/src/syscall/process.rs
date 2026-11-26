@@ -526,7 +526,9 @@ pub(super) async fn clone_process<
     };
 
     if parsed.flags & CLONE_PARENT_SETTID != 0
-        && write_tid(parsed.parent_tid, child_pid.get(), memory).is_err()
+        && write_tid(parsed.parent_tid, child_pid.get(), memory)
+            .await
+            .is_err()
     {
         process.shared.pids.release_process(child_pid);
         return errno(EFAULT);
@@ -690,13 +692,16 @@ pub(super) async fn clone_process<
     };
 
     let child_tid_addr = (parsed.flags & CLONE_CHILD_SETTID != 0).then_some(parsed.child_tid);
-    match thread.spawn_process(SpawnedProcess {
-        child,
-        share_vm,
-        stack: parsed.stack,
-        tls,
-        child_tid_addr,
-    }) {
+    match thread
+        .spawn_process(SpawnedProcess {
+            child,
+            share_vm,
+            stack: parsed.stack,
+            tls,
+            child_tid_addr,
+        })
+        .await
+    {
         Ok(()) => {
             if !child_memfds.is_empty() {
                 fs.sync_process_memfds(child_pid.get(), &child_memfds);
@@ -721,7 +726,7 @@ pub(super) async fn clone_process<
 }
 
 /// Reads a NUL-terminated UTF-8 string up to `max_bytes` from user memory.
-fn read_c_string<M: UserMemory>(
+async fn read_c_string<M: UserMemory>(
     memory: &M,
     mut ptr: u64,
     max_bytes: usize,
@@ -737,11 +742,11 @@ fn read_c_string<M: UserMemory>(
         let to_read = chunk.len().min(remaining);
         // Try reading a chunk; if the tail straddles an unmapped page boundary,
         // fall back to byte-by-byte until the NUL terminator or fault.
-        let slice = if memory.read(ptr, &mut chunk[..to_read]).is_ok() {
+        let slice = if memory.read(ptr, &mut chunk[..to_read]).await.is_ok() {
             &chunk[..to_read]
         } else {
             let mut byte = [0u8; 1];
-            memory.read(ptr, &mut byte).map_err(|_| EFAULT)?;
+            memory.read(ptr, &mut byte).await.map_err(|_| EFAULT)?;
             chunk[0] = byte[0];
             &chunk[..1]
         };
@@ -758,7 +763,7 @@ fn read_c_string<M: UserMemory>(
 }
 
 /// Reads a NULL-terminated array of C-string pointers (`argv` or `envp`).
-fn read_c_string_array<M: UserMemory>(
+async fn read_c_string_array<M: UserMemory>(
     memory: &M,
     mut array_ptr: u64,
     total_bytes: &mut usize,
@@ -769,7 +774,7 @@ fn read_c_string_array<M: UserMemory>(
     let mut out = Vec::new();
     let mut raw = [0u8; 8];
     loop {
-        memory.read(array_ptr, &mut raw).map_err(|_| EFAULT)?;
+        memory.read(array_ptr, &mut raw).await.map_err(|_| EFAULT)?;
         let item_ptr = u64::from_le_bytes(raw);
         if item_ptr == 0 {
             return Ok(out);
@@ -778,7 +783,7 @@ fn read_c_string_array<M: UserMemory>(
             return Err(E2BIG);
         }
         let budget = MAX_EXEC_BYTES.saturating_sub(*total_bytes);
-        let value = read_c_string(memory, item_ptr, budget, E2BIG)?;
+        let value = read_c_string(memory, item_ptr, budget, E2BIG).await?;
         *total_bytes = total_bytes.saturating_add(value.len() + 1);
         if *total_bytes > MAX_EXEC_BYTES {
             return Err(E2BIG);
@@ -833,7 +838,7 @@ async fn execve_common<R: Resources, M: UserMemory, T: Thread<R>>(
     if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
         return SyscallOutcome::Return(errno(EINVAL));
     }
-    let path = match read_c_string(memory, path_ptr, PATH_MAX, ENAMETOOLONG) {
+    let path = match read_c_string(memory, path_ptr, PATH_MAX, ENAMETOOLONG).await {
         Ok(path) => path,
         Err(err) => return SyscallOutcome::Return(errno(err)),
     };
@@ -841,11 +846,11 @@ async fn execve_common<R: Resources, M: UserMemory, T: Thread<R>>(
         return SyscallOutcome::Return(errno(ENOENT));
     }
     let mut total_bytes = 0usize;
-    let argv = match read_c_string_array(memory, argv_ptr, &mut total_bytes) {
+    let argv = match read_c_string_array(memory, argv_ptr, &mut total_bytes).await {
         Ok(argv) => argv,
         Err(err) => return SyscallOutcome::Return(errno(err)),
     };
-    let envp = match read_c_string_array(memory, envp_ptr, &mut total_bytes) {
+    let envp = match read_c_string_array(memory, envp_ptr, &mut total_bytes).await {
         Ok(envp) => envp,
         Err(err) => return SyscallOutcome::Return(errno(err)),
     };
@@ -880,10 +885,15 @@ pub(super) async fn wait4<R: Resources, M: UserMemory>(
     if options & !allowed != 0 {
         return SyscallOutcome::Return(errno(EINVAL));
     }
-    if wstatus_ptr != 0 && memory.check_writable(wstatus_ptr, 4).is_err() {
+    if wstatus_ptr != 0 && memory.check_writable(wstatus_ptr, 4).await.is_err() {
         return SyscallOutcome::Return(errno(EFAULT));
     }
-    if rusage_ptr != 0 && memory.check_writable(rusage_ptr, RUSAGE_BYTES).is_err() {
+    if rusage_ptr != 0
+        && memory
+            .check_writable(rusage_ptr, RUSAGE_BYTES)
+            .await
+            .is_err()
+    {
         return SyscallOutcome::Return(errno(EFAULT));
     }
 
@@ -931,6 +941,7 @@ pub(super) async fn wait4<R: Resources, M: UserMemory>(
                 if wstatus_ptr != 0
                     && memory
                         .write(wstatus_ptr, &event.encode_wstatus().to_le_bytes())
+                        .await
                         .is_err()
                 {
                     return SyscallOutcome::Return(errno(EFAULT));
@@ -938,6 +949,7 @@ pub(super) async fn wait4<R: Resources, M: UserMemory>(
                 if rusage_ptr != 0
                     && memory
                         .write(rusage_ptr, &event.usage.encode_rusage())
+                        .await
                         .is_err()
                 {
                     return SyscallOutcome::Return(errno(EFAULT));
@@ -1015,10 +1027,15 @@ pub(super) async fn waitid<R: Resources, M: UserMemory>(
         _ => return SyscallOutcome::Return(errno(EINVAL)),
     };
 
-    if infop != 0 && memory.check_writable(infop, SIGINFO_SIZE).is_err() {
+    if infop != 0 && memory.check_writable(infop, SIGINFO_SIZE).await.is_err() {
         return SyscallOutcome::Return(errno(EFAULT));
     }
-    if rusage_ptr != 0 && memory.check_writable(rusage_ptr, RUSAGE_BYTES).is_err() {
+    if rusage_ptr != 0
+        && memory
+            .check_writable(rusage_ptr, RUSAGE_BYTES)
+            .await
+            .is_err()
+    {
         return SyscallOutcome::Return(errno(EFAULT));
     }
 
@@ -1049,13 +1066,14 @@ pub(super) async fn waitid<R: Resources, M: UserMemory>(
                 }
                 if infop != 0 {
                     let encoded = event.encode_siginfo().encode();
-                    if memory.write(infop, &encoded).is_err() {
+                    if memory.write(infop, &encoded).await.is_err() {
                         return SyscallOutcome::Return(errno(EFAULT));
                     }
                 }
                 if rusage_ptr != 0
                     && memory
                         .write(rusage_ptr, &event.usage.encode_rusage())
+                        .await
                         .is_err()
                 {
                     return SyscallOutcome::Return(errno(EFAULT));
@@ -1064,7 +1082,7 @@ pub(super) async fn waitid<R: Resources, M: UserMemory>(
             }
             TryWaitResult::NoChildren => return SyscallOutcome::Return(errno(ECHILD)),
             TryWaitResult::Pending if nohang => {
-                if infop != 0 && memory.write(infop, &[0u8; SIGINFO_SIZE]).is_err() {
+                if infop != 0 && memory.write(infop, &[0u8; SIGINFO_SIZE]).await.is_err() {
                     return SyscallOutcome::Return(errno(EFAULT));
                 }
                 return SyscallOutcome::Return(0);

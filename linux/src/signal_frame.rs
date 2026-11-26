@@ -385,28 +385,28 @@ pub struct RestoredFrame {
 ///
 /// Returns `true` if delivery switched onto the alternate stack (so the caller
 /// can apply `SS_AUTODISARM` when set).
-pub fn setup_signal_frame<C: UserContext, M: UserMemory>(
+pub async fn setup_signal_frame<C: UserContext, M: UserMemory>(
     context: &mut C,
     memory: &mut M,
     input: FrameDeliveryInput,
 ) -> Result<bool, SignalFrameError> {
     match input.abi {
-        Abi::X86_64 => setup_x86_64_frame(context, memory, input),
-        Abi::Aarch64 => setup_aarch64_frame(context, memory, input),
+        Abi::X86_64 => setup_x86_64_frame(context, memory, input).await,
+        Abi::Aarch64 => setup_aarch64_frame(context, memory, input).await,
     }
 }
 
 /// Restores `context`'s general and extended registers from the signal frame
 /// currently on the user stack (`rt_sigreturn`), returning the saved signal
 /// mask and `uc_stack` for the caller to reinstall.
-pub fn restore_signal_frame<C: UserContext, M: UserMemory>(
+pub async fn restore_signal_frame<C: UserContext, M: UserMemory>(
     abi: Abi,
     context: &mut C,
     memory: &M,
 ) -> Result<RestoredFrame, SignalFrameError> {
     match abi {
-        Abi::X86_64 => restore_x86_64_frame(context, memory),
-        Abi::Aarch64 => restore_aarch64_frame(context, memory),
+        Abi::X86_64 => restore_x86_64_frame(context, memory).await,
+        Abi::Aarch64 => restore_aarch64_frame(context, memory).await,
     }
 }
 
@@ -421,34 +421,33 @@ fn choose_stack(current_sp: u64, flags: u64, altstack: SigAltStack) -> (u64, boo
     (current_sp, false)
 }
 
-fn setup_x86_64_frame<C: UserContext, M: UserMemory>(
+async fn setup_x86_64_frame<C: UserContext, M: UserMemory>(
     context: &mut C,
     memory: &mut M,
     input: FrameDeliveryInput,
 ) -> Result<bool, SignalFrameError> {
-    let reg = |id| {
-        context
-            .register(id)
+    let reg = |ctx: &C, id| {
+        ctx.register(id)
             .map_err(|_| SignalFrameError::InvalidContext)
     };
-    let old_rax = reg(RegisterId::X86Gpr(0))?;
-    let old_rcx = reg(RegisterId::X86Gpr(1))?;
-    let old_rdx = reg(RegisterId::X86Gpr(2))?;
-    let old_rbx = reg(RegisterId::X86Gpr(3))?;
-    let old_rsp = reg(RegisterId::X86Gpr(4))?;
-    let old_rbp = reg(RegisterId::X86Gpr(5))?;
-    let old_rsi = reg(RegisterId::X86Gpr(6))?;
-    let old_rdi = reg(RegisterId::X86Gpr(7))?;
-    let old_r8 = reg(RegisterId::X86Gpr(8))?;
-    let old_r9 = reg(RegisterId::X86Gpr(9))?;
-    let old_r10 = reg(RegisterId::X86Gpr(10))?;
-    let old_r11 = reg(RegisterId::X86Gpr(11))?;
-    let old_r12 = reg(RegisterId::X86Gpr(12))?;
-    let old_r13 = reg(RegisterId::X86Gpr(13))?;
-    let old_r14 = reg(RegisterId::X86Gpr(14))?;
-    let old_r15 = reg(RegisterId::X86Gpr(15))?;
-    let old_rip = reg(RegisterId::X86Rip)?;
-    let old_rflags = reg(RegisterId::X86Rflags)?;
+    let old_rax = reg(context, RegisterId::X86Gpr(0))?;
+    let old_rcx = reg(context, RegisterId::X86Gpr(1))?;
+    let old_rdx = reg(context, RegisterId::X86Gpr(2))?;
+    let old_rbx = reg(context, RegisterId::X86Gpr(3))?;
+    let old_rsp = reg(context, RegisterId::X86Gpr(4))?;
+    let old_rbp = reg(context, RegisterId::X86Gpr(5))?;
+    let old_rsi = reg(context, RegisterId::X86Gpr(6))?;
+    let old_rdi = reg(context, RegisterId::X86Gpr(7))?;
+    let old_r8 = reg(context, RegisterId::X86Gpr(8))?;
+    let old_r9 = reg(context, RegisterId::X86Gpr(9))?;
+    let old_r10 = reg(context, RegisterId::X86Gpr(10))?;
+    let old_r11 = reg(context, RegisterId::X86Gpr(11))?;
+    let old_r12 = reg(context, RegisterId::X86Gpr(12))?;
+    let old_r13 = reg(context, RegisterId::X86Gpr(13))?;
+    let old_r14 = reg(context, RegisterId::X86Gpr(14))?;
+    let old_r15 = reg(context, RegisterId::X86Gpr(15))?;
+    let old_rip = reg(context, RegisterId::X86Rip)?;
+    let old_rflags = reg(context, RegisterId::X86Rflags)?;
 
     let ExtendedState::X86Xsave(mut xstate) = context.extended_state() else {
         return Err(SignalFrameError::InvalidExtendedState);
@@ -557,9 +556,11 @@ fn setup_x86_64_frame<C: UserContext, M: UserMemory>(
 
     memory
         .write(fpstate_addr, &fp_buf)
+        .await
         .map_err(|_| SignalFrameError::MemoryFault)?;
     memory
         .write(frame_sp, &frame)
+        .await
         .map_err(|_| SignalFrameError::MemoryFault)?;
 
     let uc_addr = frame_sp + X86_FRAME_UC_OFFSET as u64;
@@ -587,7 +588,7 @@ fn setup_x86_64_frame<C: UserContext, M: UserMemory>(
     Ok(used_altstack)
 }
 
-fn restore_x86_64_frame<C: UserContext, M: UserMemory>(
+async fn restore_x86_64_frame<C: UserContext, M: UserMemory>(
     context: &mut C,
     memory: &M,
 ) -> Result<RestoredFrame, SignalFrameError> {
@@ -599,6 +600,7 @@ fn restore_x86_64_frame<C: UserContext, M: UserMemory>(
     let mut uc = [0u8; X86_UCONTEXT_ALLOC_SIZE];
     memory
         .read(uc_addr, &mut uc)
+        .await
         .map_err(|_| SignalFrameError::MemoryFault)?;
 
     let stack_bytes: [u8; STACK_T_SIZE] = uc
@@ -638,6 +640,7 @@ fn restore_x86_64_frame<C: UserContext, M: UserMemory>(
         let mut legacy = [0u8; X86_FXSAVE_SIZE];
         memory
             .read(fpstate_addr, &mut legacy)
+            .await
             .map_err(|_| SignalFrameError::MemoryFault)?;
         let magic1 = read_u32(&legacy, X86_SW_RESERVED_OFFSET);
         let xstate_bytes = if magic1 == X86_FP_XSTATE_MAGIC1 {
@@ -652,6 +655,7 @@ fn restore_x86_64_frame<C: UserContext, M: UserMemory>(
             let mut full = vec![0u8; xstate_size];
             memory
                 .read(fpstate_addr, &mut full)
+                .await
                 .map_err(|_| SignalFrameError::MemoryFault)?;
             let mut magic2_bytes = [0u8; 4];
             memory
@@ -661,6 +665,7 @@ fn restore_x86_64_frame<C: UserContext, M: UserMemory>(
                         .ok_or(SignalFrameError::MemoryFault)?,
                     &mut magic2_bytes,
                 )
+                .await
                 .map_err(|_| SignalFrameError::MemoryFault)?;
             if u32::from_le_bytes(magic2_bytes) != X86_FP_XSTATE_MAGIC2 {
                 return Err(SignalFrameError::InvalidExtendedState);
@@ -708,7 +713,7 @@ fn restore_x86_64_frame<C: UserContext, M: UserMemory>(
     })
 }
 
-fn setup_aarch64_frame<C: UserContext, M: UserMemory>(
+async fn setup_aarch64_frame<C: UserContext, M: UserMemory>(
     context: &mut C,
     memory: &mut M,
     input: FrameDeliveryInput,
@@ -777,6 +782,7 @@ fn setup_aarch64_frame<C: UserContext, M: UserMemory>(
 
     memory
         .write(frame_sp, &frame)
+        .await
         .map_err(|_| SignalFrameError::MemoryFault)?;
 
     let info_addr = frame_sp + AARCH64_FRAME_INFO_OFFSET as u64;
@@ -807,7 +813,7 @@ fn setup_aarch64_frame<C: UserContext, M: UserMemory>(
     Ok(used_altstack)
 }
 
-fn restore_aarch64_frame<C: UserContext, M: UserMemory>(
+async fn restore_aarch64_frame<C: UserContext, M: UserMemory>(
     context: &mut C,
     memory: &M,
 ) -> Result<RestoredFrame, SignalFrameError> {
@@ -823,6 +829,7 @@ fn restore_aarch64_frame<C: UserContext, M: UserMemory>(
     let mut uc = vec![0u8; AARCH64_UCONTEXT_SIZE];
     memory
         .read(uc_addr, &mut uc)
+        .await
         .map_err(|_| SignalFrameError::MemoryFault)?;
 
     let stack_bytes: [u8; STACK_T_SIZE] = uc
@@ -967,36 +974,40 @@ mod tests {
     }
 
     impl UserMemory for FlatMemory {
-        fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
+        async fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
             self.range(address, length).map(|_| ())
         }
-        fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+        async fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
             let r = self.range(address, output.len())?;
             output.copy_from_slice(&self.bytes[r]);
             Ok(())
         }
-        fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
+        async fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
             let r = self.range(address, bytes.len())?;
             self.bytes[r].copy_from_slice(bytes);
             Ok(())
         }
-        fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+        async fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
             let mut b = [0; 4];
-            self.read(address, &mut b)?;
+            self.read(address, &mut b).await?;
             Ok(u32::from_le_bytes(b))
         }
-        fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
-            self.write(address, &value.to_le_bytes())
+        fn try_atomic_load_u32(&self, address: u64) -> Result<Option<u32>, MemoryFault> {
+            let r = self.range(address, 4)?;
+            Ok(Some(u32::from_le_bytes(self.bytes[r].try_into().unwrap())))
         }
-        fn atomic_compare_exchange_u32(
+        async fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+            self.write(address, &value.to_le_bytes()).await
+        }
+        async fn atomic_compare_exchange_u32(
             &mut self,
             address: u64,
             expected: u32,
             desired: u32,
         ) -> Result<Result<u32, u32>, MemoryFault> {
-            let current = self.atomic_load_u32(address)?;
+            let current = self.atomic_load_u32(address).await?;
             if current == expected {
-                self.atomic_store_u32(address, desired)?;
+                self.atomic_store_u32(address, desired).await?;
                 Ok(Ok(current))
             } else {
                 Ok(Err(current))
@@ -1136,190 +1147,216 @@ mod tests {
         }
     }
 
+    fn block_on<F: core::future::Future>(future: F) -> F::Output {
+        let mut future = core::pin::pin!(future);
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            core::task::Poll::Ready(out) => out,
+            core::task::Poll::Pending => panic!("signal_frame test future unexpectedly pending"),
+        }
+    }
+
     #[test]
     fn x86_64_signal_frame_preserves_gprs_xsave_red_zone_and_roundtrips() {
-        let mut memory = FlatMemory::new(0x10_0000, 0x1_0000);
-        let initial_sp = 0x10_8000;
-        let initial_rip = 0x40_1234;
-        // Fill the 128-byte red zone with a sentinel to prove delivery never touches it.
-        let red_sentinel = [0xabu8; 128];
-        memory.write(initial_sp - 128, &red_sentinel).unwrap();
+        block_on(async {
+            let mut memory = FlatMemory::new(0x10_0000, 0x1_0000);
+            let initial_sp = 0x10_8000;
+            let initial_rip = 0x40_1234;
+            // Fill the 128-byte red zone with a sentinel to prove delivery never touches it.
+            let red_sentinel = [0xabu8; 128];
+            memory.write(initial_sp - 128, &red_sentinel).await.unwrap();
 
-        let original = FakeContext::new_x86(initial_sp, initial_rip);
-        let mut ctx = original.clone();
-        let saved_mask = SignalSet::EMPTY.with(Signal::SIGUSR2);
+            let original = FakeContext::new_x86(initial_sp, initial_rip);
+            let mut ctx = original.clone();
+            let saved_mask = SignalSet::EMPTY.with(Signal::SIGUSR2);
 
-        let used_alt = setup_signal_frame(
-            &mut ctx,
-            &mut memory,
-            FrameDeliveryInput {
-                abi: Abi::X86_64,
-                info: SigInfo::from_kill(Signal::SIGUSR1, 42, 1000),
-                handler: 0x40_5000,
-                restorer: 0x40_6000,
-                flags: SA_SIGINFO | SA_RESTORER,
-                saved_mask,
-                altstack: SigAltStack::disabled(),
-                sigreturn_trampoline: 0,
-                fault_address: 0,
-            },
-        )
-        .unwrap();
-        assert!(!used_alt);
+            let used_alt = setup_signal_frame(
+                &mut ctx,
+                &mut memory,
+                FrameDeliveryInput {
+                    abi: Abi::X86_64,
+                    info: SigInfo::from_kill(Signal::SIGUSR1, 42, 1000),
+                    handler: 0x40_5000,
+                    restorer: 0x40_6000,
+                    flags: SA_SIGINFO | SA_RESTORER,
+                    saved_mask,
+                    altstack: SigAltStack::disabled(),
+                    sigreturn_trampoline: 0,
+                    fault_address: 0,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!used_alt);
 
-        // Red zone untouched.
-        let mut red_after = [0u8; 128];
-        memory.read(initial_sp - 128, &mut red_after).unwrap();
-        assert_eq!(red_after, red_sentinel);
+            // Red zone untouched.
+            let mut red_after = [0u8; 128];
+            memory.read(initial_sp - 128, &mut red_after).await.unwrap();
+            assert_eq!(red_after, red_sentinel);
 
-        // Handler entry ABI: RSP % 16 == 8, RDI = signo, RSI = &info, RDX = &uc, DF cleared.
-        let frame_sp = ctx.register(RegisterId::X86Gpr(4)).unwrap();
-        assert_eq!(frame_sp % 16, 8);
-        assert_eq!(ctx.register(RegisterId::X86Rip).unwrap(), 0x40_5000);
-        assert_eq!(ctx.register(RegisterId::X86Gpr(7)).unwrap(), 10);
-        assert_eq!(
-            ctx.register(RegisterId::X86Rflags).unwrap() & X86_RFLAGS_DF,
-            0
-        );
+            // Handler entry ABI: RSP % 16 == 8, RDI = signo, RSI = &info, RDX = &uc, DF cleared.
+            let frame_sp = ctx.register(RegisterId::X86Gpr(4)).unwrap();
+            assert_eq!(frame_sp % 16, 8);
+            assert_eq!(ctx.register(RegisterId::X86Rip).unwrap(), 0x40_5000);
+            assert_eq!(ctx.register(RegisterId::X86Gpr(7)).unwrap(), 10);
+            assert_eq!(
+                ctx.register(RegisterId::X86Rflags).unwrap() & X86_RFLAGS_DF,
+                0
+            );
 
-        // Pretcode sits at [RSP].
-        let mut pretcode = [0u8; 8];
-        memory.read(frame_sp, &mut pretcode).unwrap();
-        assert_eq!(u64::from_le_bytes(pretcode), 0x40_6000);
+            // Pretcode sits at [RSP].
+            let mut pretcode = [0u8; 8];
+            memory.read(frame_sp, &mut pretcode).await.unwrap();
+            assert_eq!(u64::from_le_bytes(pretcode), 0x40_6000);
 
-        // Simulate handler clobbering every GPR and XSAVE, then `ret` popping pretcode.
-        for i in 0..16 {
-            ctx.set_register(RegisterId::X86Gpr(i), 0xbad0 + u64::from(i))
+            // Simulate handler clobbering every GPR and XSAVE, then `ret` popping pretcode.
+            for i in 0..16 {
+                ctx.set_register(RegisterId::X86Gpr(i), 0xbad0 + u64::from(i))
+                    .unwrap();
+            }
+            ctx.set_extended_state(&ExtendedState::X86Xsave(vec![0; 832]))
                 .unwrap();
-        }
-        ctx.set_extended_state(&ExtendedState::X86Xsave(vec![0; 832]))
-            .unwrap();
-        ctx.set_register(RegisterId::X86Gpr(4), frame_sp + 8)
-            .unwrap();
+            ctx.set_register(RegisterId::X86Gpr(4), frame_sp + 8)
+                .unwrap();
 
-        let restored = restore_signal_frame(Abi::X86_64, &mut ctx, &memory).unwrap();
-        assert_eq!(restored.sigmask, saved_mask);
-        assert_eq!(ctx.gprs[..16], original.gprs[..16]);
-        assert_eq!(ctx.pc, original.pc);
-        assert_eq!(ctx.flags, original.flags);
-        assert_eq!(ctx.ext, original.ext);
+            let restored = restore_signal_frame(Abi::X86_64, &mut ctx, &memory)
+                .await
+                .unwrap();
+            assert_eq!(restored.sigmask, saved_mask);
+            assert_eq!(ctx.gprs[..16], original.gprs[..16]);
+            assert_eq!(ctx.pc, original.pc);
+            assert_eq!(ctx.flags, original.flags);
+            assert_eq!(ctx.ext, original.ext);
+        });
     }
 
     #[test]
     fn x86_64_signal_frame_rejects_partial_xsave_header_size() {
-        let mut memory = FlatMemory::new(0x10_0000, 0x1_0000);
-        let mut ctx = FakeContext::new_x86(0x10_8000, 0x40_1234);
-        setup_signal_frame(
-            &mut ctx,
-            &mut memory,
-            FrameDeliveryInput {
-                abi: Abi::X86_64,
-                info: SigInfo::from_kill(Signal::SIGUSR1, 1, 0),
-                handler: 0x40_5000,
-                restorer: 0x40_6000,
-                flags: SA_SIGINFO | SA_RESTORER,
-                saved_mask: SignalSet::EMPTY,
-                altstack: SigAltStack::disabled(),
-                sigreturn_trampoline: 0,
-                fault_address: 0,
-            },
-        )
-        .unwrap();
-        let frame_sp = ctx.register(RegisterId::X86Gpr(4)).unwrap();
-        let uc_addr = frame_sp + X86_FRAME_UC_OFFSET as u64;
-        let mut fp_ptr_bytes = [0u8; 8];
-        memory
-            .read(
-                uc_addr + (X86_UC_MCONTEXT_OFFSET + 23 * 8) as u64,
-                &mut fp_ptr_bytes,
+        block_on(async {
+            let mut memory = FlatMemory::new(0x10_0000, 0x1_0000);
+            let mut ctx = FakeContext::new_x86(0x10_8000, 0x40_1234);
+            setup_signal_frame(
+                &mut ctx,
+                &mut memory,
+                FrameDeliveryInput {
+                    abi: Abi::X86_64,
+                    info: SigInfo::from_kill(Signal::SIGUSR1, 1, 0),
+                    handler: 0x40_5000,
+                    restorer: 0x40_6000,
+                    flags: SA_SIGINFO | SA_RESTORER,
+                    saved_mask: SignalSet::EMPTY,
+                    altstack: SigAltStack::disabled(),
+                    sigreturn_trampoline: 0,
+                    fault_address: 0,
+                },
             )
+            .await
             .unwrap();
-        let fpstate_addr = u64::from_le_bytes(fp_ptr_bytes);
-        // Tamper `_fpx_sw_bytes.xstate_size` to 540 (strictly between 512 and 576)
-        // with matching `extended_size = 544` and `FP_XSTATE_MAGIC2` at +540.
-        memory
-            .write(
-                fpstate_addr + (X86_SW_RESERVED_OFFSET + 4) as u64,
-                &544_u32.to_le_bytes(),
-            )
-            .unwrap();
-        memory
-            .write(
-                fpstate_addr + (X86_SW_RESERVED_OFFSET + 16) as u64,
-                &540_u32.to_le_bytes(),
-            )
-            .unwrap();
-        memory
-            .write(fpstate_addr + 540, &X86_FP_XSTATE_MAGIC2.to_le_bytes())
-            .unwrap();
-        ctx.set_register(RegisterId::X86Gpr(4), frame_sp + 8)
-            .unwrap();
-        assert_eq!(
-            restore_signal_frame(Abi::X86_64, &mut ctx, &memory),
-            Err(SignalFrameError::InvalidExtendedState)
-        );
+            let frame_sp = ctx.register(RegisterId::X86Gpr(4)).unwrap();
+            let uc_addr = frame_sp + X86_FRAME_UC_OFFSET as u64;
+            let mut fp_ptr_bytes = [0u8; 8];
+            memory
+                .read(
+                    uc_addr + (X86_UC_MCONTEXT_OFFSET + 23 * 8) as u64,
+                    &mut fp_ptr_bytes,
+                )
+                .await
+                .unwrap();
+            let fpstate_addr = u64::from_le_bytes(fp_ptr_bytes);
+            // Tamper `_fpx_sw_bytes.xstate_size` to 540 (strictly between 512 and 576)
+            // with matching `extended_size = 544` and `FP_XSTATE_MAGIC2` at +540.
+            memory
+                .write(
+                    fpstate_addr + (X86_SW_RESERVED_OFFSET + 4) as u64,
+                    &544_u32.to_le_bytes(),
+                )
+                .await
+                .unwrap();
+            memory
+                .write(
+                    fpstate_addr + (X86_SW_RESERVED_OFFSET + 16) as u64,
+                    &540_u32.to_le_bytes(),
+                )
+                .await
+                .unwrap();
+            memory
+                .write(fpstate_addr + 540, &X86_FP_XSTATE_MAGIC2.to_le_bytes())
+                .await
+                .unwrap();
+            ctx.set_register(RegisterId::X86Gpr(4), frame_sp + 8)
+                .unwrap();
+            assert_eq!(
+                restore_signal_frame(Abi::X86_64, &mut ctx, &memory).await,
+                Err(SignalFrameError::InvalidExtendedState)
+            );
+        });
     }
 
     #[test]
     fn aarch64_signal_frame_preserves_gprs_neon_altstack_and_trampoline() {
-        let mut memory = FlatMemory::new(0x20_0000, 0x2_0000);
-        let initial_sp = 0x20_8000;
-        let initial_pc = 0x40_2000;
-        let altstack = SigAltStack {
-            sp: 0x21_0000,
-            size: 0x4000,
-            flags: SS_AUTODISARM,
-        };
-        let original = FakeContext::new_aarch64(initial_sp, initial_pc);
-        let mut ctx = original.clone();
-        let saved_mask = SignalSet::EMPTY.with(Signal::SIGALRM);
+        block_on(async {
+            let mut memory = FlatMemory::new(0x20_0000, 0x2_0000);
+            let initial_sp = 0x20_8000;
+            let initial_pc = 0x40_2000;
+            let altstack = SigAltStack {
+                sp: 0x21_0000,
+                size: 0x4000,
+                flags: SS_AUTODISARM,
+            };
+            let original = FakeContext::new_aarch64(initial_sp, initial_pc);
+            let mut ctx = original.clone();
+            let saved_mask = SignalSet::EMPTY.with(Signal::SIGALRM);
 
-        let used_alt = setup_signal_frame(
-            &mut ctx,
-            &mut memory,
-            FrameDeliveryInput {
-                abi: Abi::Aarch64,
-                info: SigInfo::from_timer(Signal::SIGALRM),
-                handler: 0x40_7000,
-                restorer: 0,
-                flags: SA_SIGINFO | SA_ONSTACK,
-                saved_mask,
-                altstack,
-                sigreturn_trampoline: 0x70_0000,
-                fault_address: 0xdead_0000,
-            },
-        )
-        .unwrap();
-        assert!(used_alt);
+            let used_alt = setup_signal_frame(
+                &mut ctx,
+                &mut memory,
+                FrameDeliveryInput {
+                    abi: Abi::Aarch64,
+                    info: SigInfo::from_timer(Signal::SIGALRM),
+                    handler: 0x40_7000,
+                    restorer: 0,
+                    flags: SA_SIGINFO | SA_ONSTACK,
+                    saved_mask,
+                    altstack,
+                    sigreturn_trampoline: 0x70_0000,
+                    fault_address: 0xdead_0000,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(used_alt);
 
-        let frame_sp = ctx.register(RegisterId::Aarch64Sp).unwrap();
-        assert_eq!(frame_sp % 16, 0);
-        assert!(altstack.on_stack(frame_sp));
-        assert_eq!(ctx.register(RegisterId::Aarch64Pc).unwrap(), 0x40_7000);
-        assert_eq!(ctx.register(RegisterId::Aarch64X(0)).unwrap(), 14);
-        assert_eq!(ctx.register(RegisterId::Aarch64X(30)).unwrap(), 0x70_0000);
+            let frame_sp = ctx.register(RegisterId::Aarch64Sp).unwrap();
+            assert_eq!(frame_sp % 16, 0);
+            assert!(altstack.on_stack(frame_sp));
+            assert_eq!(ctx.register(RegisterId::Aarch64Pc).unwrap(), 0x40_7000);
+            assert_eq!(ctx.register(RegisterId::Aarch64X(0)).unwrap(), 14);
+            assert_eq!(ctx.register(RegisterId::Aarch64X(30)).unwrap(), 0x70_0000);
 
-        // Clobber every register and NEON vector, keeping SP at frame_sp as `ret` does.
-        for i in 0..31 {
-            ctx.set_register(RegisterId::Aarch64X(i), 0xbad0 + u64::from(i))
+            // Clobber every register and NEON vector, keeping SP at frame_sp as `ret` does.
+            for i in 0..31 {
+                ctx.set_register(RegisterId::Aarch64X(i), 0xbad0 + u64::from(i))
+                    .unwrap();
+            }
+            ctx.set_extended_state(&ExtendedState::Aarch64FpSimd(Box::new(Aarch64FpSimd {
+                vregs: [0; 32],
+                fpsr: 0,
+                fpcr: 0,
+            })))
+            .unwrap();
+
+            let restored = restore_signal_frame(Abi::Aarch64, &mut ctx, &memory)
+                .await
                 .unwrap();
-        }
-        ctx.set_extended_state(&ExtendedState::Aarch64FpSimd(Box::new(Aarch64FpSimd {
-            vregs: [0; 32],
-            fpsr: 0,
-            fpcr: 0,
-        })))
-        .unwrap();
-
-        let restored = restore_signal_frame(Abi::Aarch64, &mut ctx, &memory).unwrap();
-        assert_eq!(restored.sigmask, saved_mask);
-        assert_eq!(restored.uc_stack_sp, altstack.sp);
-        assert_eq!(restored.uc_stack_size, altstack.size);
-        assert_eq!(restored.uc_stack_flags, SS_AUTODISARM);
-        assert_eq!(ctx.gprs, original.gprs);
-        assert_eq!(ctx.sp, original.sp);
-        assert_eq!(ctx.pc, original.pc);
-        assert_eq!(ctx.flags, original.flags);
-        assert_eq!(ctx.ext, original.ext);
+            assert_eq!(restored.sigmask, saved_mask);
+            assert_eq!(restored.uc_stack_sp, altstack.sp);
+            assert_eq!(restored.uc_stack_size, altstack.size);
+            assert_eq!(restored.uc_stack_flags, SS_AUTODISARM);
+            assert_eq!(ctx.gprs, original.gprs);
+            assert_eq!(ctx.sp, original.sp);
+            assert_eq!(ctx.pc, original.pc);
+            assert_eq!(ctx.flags, original.flags);
+            assert_eq!(ctx.ext, original.ext);
+        });
     }
 }

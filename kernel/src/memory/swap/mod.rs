@@ -105,6 +105,7 @@ use core::time::Duration;
 
 use concurrent_queue::ConcurrentQueue;
 use helios_hal::cpu::{Cpu, Timebase};
+use helios_hal::native::{NativeError, NativeExecution, UserSpace};
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{
     AddressSpaceError, PageAge, PageFlags, SwapBackend, SwapToken, VirtAddr, VirtRange,
@@ -117,15 +118,17 @@ use crate::exec::{NotifyWaiter, PressureLevel, monotonic_nanos};
 use crate::instance::{InstanceId, InstanceRegistry, OffProcessor};
 use crate::{Notify, Timer};
 
-use super::owner::MemoryOwner;
+use super::owner::{MemoryOwner, enter_user_memory_owner};
 use super::user::user_heap_stats;
 
 mod hooks;
 mod leaf;
+mod native;
 mod space;
 
 pub use hooks::{InstalledAddressSpace, swap_vm_hooks};
 pub use leaf::{AGE_BATCH_PAGES, SwapLeafFormat};
+pub use native::{NativeSpaceRegistry, RegisteredNativeSpace};
 pub use space::SwapSpace;
 
 /// How long an instance has to have been off every processor before a
@@ -329,8 +332,22 @@ struct SwapCounters {
     fault_latency_total_nanos: AtomicU64,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SwapTarget {
+    Wasm(VirtAddr),
+    Native { space_id: u64, base: VirtAddr },
+}
+
+impl SwapTarget {
+    fn addr(self) -> VirtAddr {
+        match self {
+            Self::Wasm(addr) | Self::Native { base: addr, .. } => addr,
+        }
+    }
+}
+
 struct SwapFaultRequest {
-    addr: VirtAddr,
+    target: SwapTarget,
     reply: Arc<SwapFaultReply>,
     /// When the fault was issued, on [`SwapShared::clock`]. Its latency is
     /// measured from here, so time spent queued counts.
@@ -443,7 +460,21 @@ impl SwapHandle {
             // A fault reports the address the instruction touched, not
             // the page it lives in; everything below this point works in
             // pages.
-            addr: addr.page_floor(),
+            target: SwapTarget::Wasm(addr.page_floor()),
+            issued: None,
+        }
+    }
+
+    /// Reads a swapped-out page at `base` inside registered native address
+    /// space `space_id` back into memory, waiting asynchronously for the swap
+    /// device without blocking the executor.
+    pub fn fault_in_native(&self, space_id: u64, base: VirtAddr) -> SwapFaultIn {
+        SwapFaultIn {
+            shared: self.shared.clone(),
+            target: SwapTarget::Native {
+                space_id,
+                base: base.page_floor(),
+            },
             issued: None,
         }
     }
@@ -455,7 +486,8 @@ impl SwapHandle {
     }
 }
 
-/// A page being read back in for [`SwapHandle::fault_in`].
+/// A page being read back in for [`SwapHandle::fault_in`] or
+/// [`SwapHandle::fault_in_native`].
 ///
 /// One waiter: whoever polls it. The swap service settles the reply from
 /// whatever processor it runs on, and the settle stores a permit, so the
@@ -463,7 +495,7 @@ impl SwapHandle {
 #[must_use = "a fault-in is queued when it is first polled"]
 pub struct SwapFaultIn {
     shared: Arc<SwapShared>,
-    addr: VirtAddr,
+    target: SwapTarget,
     /// The request once it is queued, and the wait on its reply.
     issued: Option<IssuedFault>,
 }
@@ -483,7 +515,7 @@ impl Future for SwapFaultIn {
             None => {
                 let reply = Arc::new(SwapFaultReply::new());
                 let request = SwapFaultRequest {
-                    addr: this.addr,
+                    target: this.target,
                     reply: reply.clone(),
                     issued_nanos: this.shared.clock.now_nanos(),
                 };
@@ -644,16 +676,22 @@ pub fn disable_swap(reason: SwapDisabled) {
     );
 }
 
-/// Spawns the task that owns swap, and publishes its handle.
+/// Spawns the task that owns swap watching both Wasm `registry` and native
+/// Linux `native_spaces`, and publishes its handle.
 ///
 /// The task is local to the calling processor because the swap device's
 /// completions are: a backend brings the scratch disk up on one
 /// processor and routes its interrupt there.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "install_swap passes explicit runtime handles without global state"
+)]
 pub fn install_swap<CpuImpl, Backend>(
     spawner: Spawner<CpuImpl>,
     timer: Timer<CpuImpl>,
     cpu: CpuImpl,
     registry: InstanceRegistry,
+    native_spaces: NativeSpaceRegistry<<CpuImpl::Native as NativeExecution>::Space>,
     backend: Backend,
     backend_name: &'static str,
     capacity_bytes: u64,
@@ -674,6 +712,7 @@ where
         now_ticks: hooks.now_ticks,
     };
     let handle = SwapHandle::new(backend_name, capacity_bytes, clock);
+    native_spaces.attach_swap_handle(handle.clone());
     let mut published = false;
     HANDLE.call_once(|| {
         published = true;
@@ -686,6 +725,7 @@ where
         handle: handle.clone(),
         hooks,
         registry,
+        native_spaces,
         cpu,
         map: SwapMap::new(),
         page: Some(page),
@@ -824,11 +864,12 @@ impl<Token: Copy> SwapMap<Token> {
     }
 }
 
-struct SwapService<Backend: SwapBackend, CpuImpl> {
+struct SwapService<Backend: SwapBackend, CpuImpl: Cpu> {
     backend: Backend,
     handle: SwapHandle,
     hooks: &'static SwapVmHooks,
     registry: InstanceRegistry,
+    native_spaces: NativeSpaceRegistry<<CpuImpl::Native as NativeExecution>::Space>,
     cpu: CpuImpl,
     map: SwapMap<Backend::Token>,
     /// The one staging buffer every transfer goes through. Owning it
@@ -891,7 +932,10 @@ where
 
     async fn serve_faults(&mut self) {
         while let Ok(request) = self.handle.shared.faults.pop() {
-            let outcome = self.swap_in(request.addr).await;
+            let outcome = match request.target {
+                SwapTarget::Wasm(addr) => self.swap_in(addr).await,
+                SwapTarget::Native { space_id, base } => self.swap_in_native(space_id, base).await,
+            };
             // From the fault's issue, not from the moment this loop got
             // to it: the guest has been stopped the whole time.
             let elapsed = self
@@ -905,11 +949,12 @@ where
             counters
                 .fault_latency_total_nanos
                 .fetch_add(elapsed, Ordering::AcqRel);
+            let addr = request.target.addr();
             match outcome {
                 Ok(()) => {
                     tracing::debug!(
                         target: "helios_kernel::swap",
-                        addr = request.addr.raw(),
+                        addr = addr.raw(),
                         latency_nanos = elapsed,
                         "swap in"
                     );
@@ -918,7 +963,7 @@ where
                 Err(error) => {
                     tracing::warn!(
                         target: "helios_kernel::swap",
-                        addr = request.addr.raw(),
+                        addr = addr.raw(),
                         %error,
                         "swap in failed"
                     );
@@ -1041,6 +1086,97 @@ where
         Ok(())
     }
 
+    async fn swap_in_native(
+        &mut self,
+        space_id: u64,
+        addr: VirtAddr,
+    ) -> Result<(), SwapFaultError> {
+        let Some((space, owner)) = self.native_spaces.get(space_id) else {
+            return Err(SwapFaultError::AddressSpace);
+        };
+        let Some(handle) = space.swapped_token(addr) else {
+            return Ok(());
+        };
+        let token = match self.map.lookup(handle) {
+            Lookup::Filled(token) => token,
+            Lookup::Lost => return Err(SwapFaultError::PageLost),
+            Lookup::Vacant => return Err(SwapFaultError::UnknownToken),
+        };
+        let page = self.take_page().map_err(|error| {
+            tracing::warn!(
+                target: "helios_kernel::swap",
+                space_id,
+                addr = addr.raw(),
+                %error,
+                "swap backend could not supply a staging page for native swap-in"
+            );
+            SwapFaultError::Backend
+        })?;
+        let page = match self.backend.swap_in(token, page).await {
+            Ok(((), page)) => page,
+            Err(failure) => {
+                tracing::warn!(
+                    target: "helios_kernel::swap",
+                    space_id,
+                    addr = addr.raw(),
+                    error = %failure.error,
+                    "swap backend could not read a native page back"
+                );
+                self.page = failure.buffers;
+                return Err(SwapFaultError::Backend);
+            }
+        };
+        self.map.vacate(handle);
+        let reinstate = {
+            let _owner_scope = enter_user_memory_owner(helios_hal::cpu::current_processor(), owner);
+            space.swap_in_private_page(addr, &page.as_ref()[..PhysFrame::SIZE])
+        };
+        match reinstate {
+            Ok(installed_token) => {
+                debug_assert_eq!(installed_token, handle);
+                self.page = Some(page);
+                self.map.free(handle);
+                let counters = &self.handle.shared.counters;
+                counters.pages_in.fetch_add(1, Ordering::AcqRel);
+                counters
+                    .used_bytes
+                    .fetch_sub(PhysFrame::SIZE as u64, Ordering::AcqRel);
+                Ok(())
+            }
+            Err(error) => {
+                if space.swapped_token(addr) != Some(handle) {
+                    // The page was unmapped, discarded, or the space tore down
+                    // while the read was in flight; `handle` is already queued
+                    // in orphan tokens. Keep the index reserved as `Lost` until
+                    // `release_orphaned_tokens` consumes it.
+                    self.page = Some(page);
+                    self.map.mark_lost(handle);
+                    self.handle
+                        .shared
+                        .counters
+                        .used_bytes
+                        .fetch_sub(PhysFrame::SIZE as u64, Ordering::AcqRel);
+                    return Ok(());
+                }
+                tracing::warn!(
+                    target: "helios_kernel::swap",
+                    space_id,
+                    addr = addr.raw(),
+                    ?error,
+                    "native space refused to reinstate a page; returning it to the swap backend"
+                );
+                if self.rehome(handle, addr, page).await.is_err() {
+                    self.handle
+                        .shared
+                        .counters
+                        .used_bytes
+                        .fetch_sub(PhysFrame::SIZE as u64, Ordering::AcqRel);
+                }
+                Err(SwapFaultError::AddressSpace)
+            }
+        }
+    }
+
     /// Writes `page`, the staging buffer holding the only copy of the page
     /// whose page-table entry carries `handle`, back to the backend under
     /// that same index. The buffer comes back to `self.page` whenever the
@@ -1088,6 +1224,7 @@ where
                 orphans.push(token);
             },
         );
+        self.native_spaces.drain_all_orphans(&mut orphans);
         for handle in orphans {
             // A lost page holds no extent and no `used_bytes`: both were
             // given up when it was lost, and only its reservation is
@@ -1118,63 +1255,250 @@ where
 
         let now = monotonic_nanos(&self.cpu);
         let idle_after = IDLE_SWAP_AFTER.as_nanos() as u64;
-        let mut candidates = self.registry.idle_instances(now, idle_after);
-        // Largest resident first: one pass over the biggest idle
-        // instance frees more than several passes over small ones, and
-        // resident bytes come from the address space rather than from
-        // what the instance thinks it grew to.
-        candidates
-            .sort_by_key(|id| core::cmp::Reverse((self.hooks.owned_resident_bytes)(id.raw())));
-
-        let mut moved = 0_usize;
-        for id in &candidates {
-            if moved >= SWAP_BATCH_BYTES {
-                break;
-            }
-            moved += self
-                .evict_owner(*id, SWAP_BATCH_BYTES - moved, EvictionAge::Any)
-                .await;
-        }
+        let moved = self
+            .evict_idle_pass(now, idle_after, SWAP_BATCH_BYTES)
+            .await;
 
         if pressure != PressureLevel::Red {
             tracing::debug!(
                 target: "helios_kernel::swap",
                 bytes = moved,
-                idle_instances = candidates.len(),
-                "swapped idle instances out under yellow pressure"
+                "swapped idle instances and native spaces out under yellow pressure"
             );
             return;
         }
 
-        // Red: ten seconds of idleness was not enough of a bar. Drop it
-        // to "not on a processor right now" and take only the pages the
-        // hardware has not seen since the last pass. A pass that frees
-        // nothing is the signal the OOM killer acts on — it is not this
-        // task's job to condemn anything.
-        //
-        // The bar stays at "not executing" rather than dropping to
-        // "anything": while an instance is on a processor it may be
-        // inside a host call, whose frame already holds that fiber's
-        // blocking context and so cannot block again to fault a page
-        // back in. Never detaching a page from an executing instance is
-        // what keeps the kernel out of that corner, and it is why the
-        // pre-fault accessor is a contract for kernel paths that hold
-        // guest pointers rather than a thing every host call must do.
-        // The list below only nominates; each detach re-establishes the
-        // bar for itself (`evict_owner`).
-        for id in self.registry.idle_instances(now, 0) {
-            if moved >= SWAP_BATCH_BYTES {
-                break;
-            }
-            moved += self
-                .evict_owner(id, SWAP_BATCH_BYTES - moved, EvictionAge::ColdOnly)
+        let moved = moved
+            + self
+                .evict_cold_pass(now, SWAP_BATCH_BYTES.saturating_sub(moved))
                 .await;
-        }
         tracing::debug!(
             target: "helios_kernel::swap",
             bytes = moved,
             "swap pass under red pressure"
         );
+    }
+
+    async fn evict_idle_pass(&mut self, now: u64, idle_after: u64, budget: usize) -> usize {
+        enum IdleCandidate {
+            Wasm(InstanceId),
+            Native(u64),
+        }
+
+        let mut candidates: Vec<(u64, IdleCandidate)> = self
+            .registry
+            .idle_instances(now, idle_after)
+            .into_iter()
+            .map(|id| {
+                (
+                    (self.hooks.owned_resident_bytes)(id.raw()),
+                    IdleCandidate::Wasm(id),
+                )
+            })
+            .collect();
+        for (space_id, space, _) in self.native_spaces.idle_spaces(now, idle_after) {
+            candidates.push((space.resident_bytes(), IdleCandidate::Native(space_id)));
+        }
+        // Largest resident first: one pass over the biggest idle consumer
+        // frees more than several passes over small ones.
+        candidates.sort_by_key(|(bytes, _)| core::cmp::Reverse(*bytes));
+
+        let mut moved = 0_usize;
+        for (_, candidate) in candidates {
+            if moved >= budget || !self.handle.shared.faults.is_empty() {
+                break;
+            }
+            let remaining = budget - moved;
+            moved += match candidate {
+                IdleCandidate::Wasm(id) => self.evict_owner(id, remaining, EvictionAge::Any).await,
+                IdleCandidate::Native(space_id) => {
+                    self.evict_native_space(space_id, remaining, EvictionAge::Any)
+                        .await
+                }
+            };
+        }
+        moved
+    }
+
+    async fn evict_cold_pass(&mut self, now: u64, budget: usize) -> usize {
+        let mut moved = 0_usize;
+        for id in self.registry.idle_instances(now, 0) {
+            if moved >= budget || !self.handle.shared.faults.is_empty() {
+                break;
+            }
+            moved += self
+                .evict_owner(id, budget - moved, EvictionAge::ColdOnly)
+                .await;
+        }
+        for (space_id, _, _) in self.native_spaces.live_spaces() {
+            if moved >= budget || !self.handle.shared.faults.is_empty() {
+                break;
+            }
+            moved += self
+                .evict_native_space(space_id, budget - moved, EvictionAge::ColdOnly)
+                .await;
+        }
+        moved
+    }
+
+    async fn evict_native_space(
+        &mut self,
+        space_id: u64,
+        budget: usize,
+        age: EvictionAge,
+    ) -> usize {
+        let max_pages = budget / PhysFrame::SIZE;
+        if max_pages == 0 {
+            return 0;
+        }
+        let Some((space, owner)) = self.native_spaces.get(space_id) else {
+            return 0;
+        };
+        let mut plan = Vec::new();
+        space.scan_private_pages_for_swap(
+            SCAN_BUDGET_PAGES,
+            age == EvictionAge::ColdOnly,
+            max_pages,
+            &mut plan,
+        );
+        let mut moved = 0_usize;
+        for addr in plan {
+            if !self.handle.shared.faults.is_empty() {
+                break;
+            }
+            match self.swap_out_native(space_id, &space, owner, addr).await {
+                Ok(()) => moved += PhysFrame::SIZE,
+                Err(NativeEvictStop::SkipPage) => continue,
+                Err(NativeEvictStop::StopSpace) => break,
+            }
+        }
+        if moved != 0 {
+            tracing::debug!(
+                target: "helios_kernel::swap",
+                space_id,
+                owner = owner.raw(),
+                pages = moved / PhysFrame::SIZE,
+                "swap out native space"
+            );
+        }
+        moved
+    }
+
+    async fn swap_out_native(
+        &mut self,
+        space_id: u64,
+        space: &<CpuImpl::Native as NativeExecution>::Space,
+        owner: MemoryOwner,
+        addr: VirtAddr,
+    ) -> Result<(), NativeEvictStop> {
+        if !self.native_spaces.contains(space_id) {
+            return Err(NativeEvictStop::StopSpace);
+        }
+        let Some(handle) = self.map.reserve() else {
+            tracing::warn!(
+                target: "helios_kernel::swap",
+                space_id,
+                addr = addr.raw(),
+                "swap map is full"
+            );
+            return Err(NativeEvictStop::StopSpace);
+        };
+        let mut page = match self.take_page() {
+            Ok(page) => page,
+            Err(error) => {
+                tracing::warn!(
+                    target: "helios_kernel::swap",
+                    space_id,
+                    addr = addr.raw(),
+                    %error,
+                    "swap backend could not supply a staging page for native swap-out"
+                );
+                self.map.free(handle);
+                return Err(NativeEvictStop::StopSpace);
+            }
+        };
+        match space.swap_out_private_page(addr, handle, &mut page.as_mut()[..PhysFrame::SIZE]) {
+            Ok(()) => {}
+            Err(NativeError::Overlap) => {
+                // Active user slice running on this space; leave it alone.
+                self.page = Some(page);
+                self.map.free(handle);
+                return Err(NativeEvictStop::StopSpace);
+            }
+            Err(_) => {
+                self.page = Some(page);
+                self.map.free(handle);
+                if !self.native_spaces.contains(space_id) {
+                    return Err(NativeEvictStop::StopSpace);
+                }
+                return Err(NativeEvictStop::SkipPage);
+            }
+        }
+        match self.backend.swap_out(page).await {
+            Ok((token, page)) => {
+                self.page = Some(page);
+                self.map.fill(handle, token);
+            }
+            Err(failure) => {
+                let Some(page) = failure.buffers else {
+                    self.map.mark_lost(handle);
+                    tracing::error!(
+                        target: "helios_kernel::swap",
+                        space_id,
+                        addr = addr.raw(),
+                        index = handle.raw(),
+                        error = %failure.error,
+                        "swap device stopped answering while it held a native page; the page is lost"
+                    );
+                    return Err(NativeEvictStop::StopSpace);
+                };
+                tracing::warn!(
+                    target: "helios_kernel::swap",
+                    space_id,
+                    addr = addr.raw(),
+                    error = %failure.error,
+                    "swap backend refused a native page; putting it back"
+                );
+                let reinstate = {
+                    let _owner_scope =
+                        enter_user_memory_owner(helios_hal::cpu::current_processor(), owner);
+                    space.swap_in_private_page(addr, &page.as_ref()[..PhysFrame::SIZE])
+                };
+                match reinstate {
+                    Ok(_) => {
+                        self.page = Some(page);
+                        self.map.free(handle);
+                        return Err(NativeEvictStop::StopSpace);
+                    }
+                    Err(error) => {
+                        if space.swapped_token(addr) != Some(handle) {
+                            // Unmapped, discarded, or torn down while the write
+                            // failed; `handle` is already queued in orphan tokens.
+                            self.page = Some(page);
+                            self.map.mark_lost(handle);
+                            return Err(NativeEvictStop::StopSpace);
+                        }
+                        tracing::warn!(
+                            target: "helios_kernel::swap",
+                            space_id,
+                            addr = addr.raw(),
+                            ?error,
+                            "native space refused a page put back after a refused write; \
+                             offering it to the swap backend again"
+                        );
+                        if self.rehome(handle, addr, page).await.is_err() {
+                            return Err(NativeEvictStop::StopSpace);
+                        }
+                    }
+                }
+            }
+        }
+        let counters = &self.handle.shared.counters;
+        counters.pages_out.fetch_add(1, Ordering::AcqRel);
+        counters
+            .used_bytes
+            .fetch_add(PhysFrame::SIZE as u64, Ordering::AcqRel);
+        Ok(())
     }
 
     /// Swaps up to `budget` bytes of `instance`'s pages out, and reports
@@ -1364,6 +1688,12 @@ where
             .fetch_add(PhysFrame::SIZE as u64, Ordering::AcqRel);
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeEvictStop {
+    SkipPage,
+    StopSpace,
 }
 
 /// Which pages an eviction pass is allowed to take.
@@ -1594,5 +1924,331 @@ mod tests {
         let reply = SwapFaultReply::new();
         reply.settle(FAULT_BACKEND);
         assert_eq!(reply.read(), Some(Err(SwapFaultError::Backend)));
+    }
+}
+
+#[cfg(all(test, feature = "linux"))]
+pub(crate) mod native_test_harness {
+    use alloc::boxed::Box;
+    use alloc::collections::BTreeMap;
+    use alloc::sync::Arc;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use core::future::Future;
+    use core::marker::PhantomData;
+    use core::task::{Context, Poll, Waker};
+    use std::sync::Mutex;
+
+    use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt};
+    use helios_hal::dma::{BufError, BufResult};
+    use helios_hal::hv::RegisterId;
+    use helios_hal::native::{
+        ExtendedState, InstructionSet, NativeError, NativeExecution, NativeUnavailable, Stop,
+        UserContext, UserSpace,
+    };
+    use helios_hal::vmm::{AddressSpaceError, SwapBackend, VirtAddr};
+
+    use super::{
+        InstanceRegistry, NativeSpaceRegistry, PhysFrame, SwapClock, SwapHandle, SwapMap,
+        SwapReport, SwapService, SwapStats, SwapVmHooks,
+    };
+
+    const PAGE: usize = PhysFrame::SIZE;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("in-memory test swap backend error")]
+    pub(crate) struct TestBackendError;
+
+    #[derive(Default)]
+    struct InMemState {
+        next_token: u64,
+        extents: BTreeMap<u64, Vec<u8>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct InMemBackend {
+        state: Arc<Mutex<InMemState>>,
+    }
+
+    impl SwapBackend for InMemBackend {
+        type Token = u64;
+        type Buffer = Box<[u8]>;
+        type Error = TestBackendError;
+
+        fn buffer(&self, bytes: usize) -> Result<Self::Buffer, Self::Error> {
+            Ok(vec![0_u8; bytes].into_boxed_slice())
+        }
+
+        async fn swap_out(
+            &self,
+            page: Self::Buffer,
+        ) -> BufResult<Self::Token, Self::Buffer, Self::Error> {
+            let mut state = self.state.lock().expect("test swap state");
+            state.next_token += 1;
+            let token = state.next_token;
+            state.extents.insert(token, page.to_vec());
+            Ok((token, page))
+        }
+
+        async fn swap_in(
+            &self,
+            token: Self::Token,
+            mut page: Self::Buffer,
+        ) -> BufResult<(), Self::Buffer, Self::Error> {
+            let mut state = self.state.lock().expect("test swap state");
+            let Some(bytes) = state.extents.remove(&token) else {
+                return Err(BufError {
+                    buffers: Some(page),
+                    error: TestBackendError,
+                });
+            };
+            page.copy_from_slice(&bytes);
+            Ok(((), page))
+        }
+
+        async fn release(&self, token: Self::Token) {
+            self.state
+                .lock()
+                .expect("test swap state")
+                .extents
+                .remove(&token);
+        }
+    }
+
+    struct NeverContext<Space>(PhantomData<fn() -> Space>);
+
+    // SAFETY: never constructed or resumed; only satisfies `NativeExecution::Context` in tests.
+    unsafe impl<Space: UserSpace> UserContext for NeverContext<Space> {
+        type Space = Space;
+
+        fn register(&self, _: RegisterId) -> Result<u64, NativeError> {
+            unreachable!()
+        }
+
+        fn set_register(&mut self, _: RegisterId, _: u64) -> Result<(), NativeError> {
+            unreachable!()
+        }
+
+        fn thread_pointer(&self) -> VirtAddr {
+            unreachable!()
+        }
+
+        fn set_thread_pointer(&mut self, _: VirtAddr) -> Result<(), NativeError> {
+            unreachable!()
+        }
+
+        fn extended_state(&self) -> ExtendedState {
+            unreachable!()
+        }
+
+        fn set_extended_state(&mut self, _: &ExtendedState) -> Result<(), NativeError> {
+            unreachable!()
+        }
+
+        fn try_clone(&self) -> Result<Self, NativeError> {
+            unreachable!()
+        }
+
+        fn resume(&mut self, _: &Self::Space) -> Stop {
+            unreachable!()
+        }
+    }
+
+    struct HarnessCpu<Space>(PhantomData<fn() -> Space>);
+
+    impl<Space> Clone for HarnessCpu<Space> {
+        fn clone(&self) -> Self {
+            Self(PhantomData)
+        }
+    }
+
+    impl<Space: UserSpace + 'static> NativeExecution for HarnessCpu<Space> {
+        type Space = Space;
+        type Context = NeverContext<Space>;
+
+        fn instruction_set(&self) -> InstructionSet {
+            InstructionSet::X86_64
+        }
+
+        fn user_range(&self) -> helios_hal::vmm::VirtRange {
+            helios_hal::vmm::VirtRange::new(VirtAddr::new(PAGE), 0x1_0000_0000 - PAGE)
+        }
+
+        fn create_space(&self) -> Result<Self::Space, NativeError> {
+            unreachable!()
+        }
+
+        fn create_context(&self, _: VirtAddr, _: VirtAddr) -> Result<Self::Context, NativeError> {
+            unreachable!()
+        }
+    }
+
+    impl<Space: UserSpace + 'static> Cpu for HarnessCpu<Space> {
+        type Hypervisor = core::convert::Infallible;
+        type Native = Self;
+        const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
+        fn has_lazy_commit_virtual_memory(&self) -> bool {
+            true
+        }
+
+        fn processor_count(&self) -> usize {
+            1
+        }
+
+        fn bootstrap_processor(&self) -> ProcessorId {
+            ProcessorId::new(0)
+        }
+
+        fn park_current(&self) {}
+
+        type WakeOnlyMask = ();
+
+        fn mask_to_wake_only(&self) {
+            panic!("test harness CPU never freezes")
+        }
+
+        fn park_wake_only(&self, _: &core::sync::atomic::AtomicU8, _: u8) {
+            panic!("test harness CPU never freezes")
+        }
+
+        fn start_processor(&self, _: ProcessorId) {}
+
+        fn wake_processor(&self, _: ProcessorId) {}
+
+        fn stop_current(&self) {
+            panic!("test harness CPU never stops")
+        }
+
+        fn restart_processor(&self, _: ProcessorId) {
+            panic!("test harness CPU never restarts")
+        }
+
+        fn now(&self) -> Instant {
+            Instant::new(0)
+        }
+
+        fn timebase(&self) -> Timebase {
+            Timebase::new(1_000_000_000)
+        }
+
+        fn set_deadline(&self, _: Instant) {}
+
+        fn publish_executable(&self, _: *const u8, _: usize) {}
+
+        fn unpublish_executable(&self, _: *const u8, _: usize) {}
+
+        fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
+            None
+        }
+
+        fn shutdown(&self) -> ! {
+            panic!("test harness CPU never shuts down")
+        }
+
+        fn reboot(&self) -> ! {
+            panic!("test harness CPU never reboots")
+        }
+
+        fn native(&self) -> Result<&Self::Native, NativeUnavailable> {
+            Ok(self)
+        }
+    }
+
+    static NOOP_HOOKS: SwapVmHooks = SwapVmHooks {
+        swap_out_page: |_, _, _| Err(AddressSpaceError::NotCommitted),
+        swap_in_page: |_, _| Err(AddressSpaceError::NotSwapped),
+        swapped_token: |_| None,
+        scan_committed_pages: |_, _, _| 0,
+        owned_resident_bytes: |_| 0,
+        drain_orphaned_swap_tokens: |_, _| 0,
+        now_ticks: || 0,
+    };
+
+    fn poll_now<F: Future>(future: F) -> F::Output {
+        let mut future = core::pin::pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => out,
+            Poll::Pending => panic!("in-memory swap harness future unexpectedly pending"),
+        }
+    }
+
+    pub(crate) struct NativeSwapTestHarness<Space: UserSpace + 'static> {
+        service: SwapService<InMemBackend, HarnessCpu<Space>>,
+        handle: SwapHandle,
+        backend: InMemBackend,
+        registry: NativeSpaceRegistry<Space>,
+    }
+
+    impl<Space: UserSpace + 'static> NativeSwapTestHarness<Space> {
+        pub(crate) fn new() -> Self {
+            let backend = InMemBackend::default();
+            let handle = SwapHandle::new(
+                "native-linux-test",
+                64 * PAGE as u64,
+                SwapClock {
+                    timebase: Timebase::new(1_000_000_000),
+                    now_ticks: NOOP_HOOKS.now_ticks,
+                },
+            );
+            let registry = NativeSpaceRegistry::new();
+            registry.attach_swap_handle(handle.clone());
+            let service = SwapService {
+                backend: backend.clone(),
+                handle: handle.clone(),
+                hooks: &NOOP_HOOKS,
+                registry: InstanceRegistry::new(),
+                native_spaces: registry.clone(),
+                cpu: HarnessCpu(PhantomData),
+                map: SwapMap::new(),
+                page: Some(vec![0_u8; PAGE].into_boxed_slice()),
+                report: SwapReport::default(),
+            };
+            Self {
+                service,
+                handle,
+                backend,
+                registry,
+            }
+        }
+
+        pub(crate) fn handle(&self) -> SwapHandle {
+            self.handle.clone()
+        }
+
+        pub(crate) fn registry(&self) -> NativeSpaceRegistry<Space> {
+            self.registry.clone()
+        }
+
+        pub(crate) fn evict_idle(
+            &mut self,
+            now_nanos: u64,
+            idle_after: u64,
+            budget: usize,
+        ) -> usize {
+            poll_now(self.service.evict_idle_pass(now_nanos, idle_after, budget))
+        }
+
+        pub(crate) fn serve_faults(&mut self) {
+            poll_now(self.service.serve_faults());
+        }
+
+        pub(crate) fn release_orphans(&mut self) {
+            poll_now(self.service.release_orphaned_tokens());
+        }
+
+        pub(crate) fn live_extents(&self) -> usize {
+            self.backend
+                .state
+                .lock()
+                .expect("test swap state")
+                .extents
+                .len()
+        }
+
+        pub(crate) fn stats(&self) -> SwapStats {
+            self.handle.stats()
+        }
     }
 }

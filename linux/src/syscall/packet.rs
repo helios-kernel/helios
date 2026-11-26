@@ -35,7 +35,7 @@ pub(crate) struct SockaddrLl {
 }
 
 /// Decodes a `struct sockaddr_ll` from user memory.
-pub(crate) fn read_sockaddr_ll<M: UserMemory>(
+pub(crate) async fn read_sockaddr_ll<M: UserMemory>(
     memory: &M,
     addr: u64,
     addrlen: u32,
@@ -44,7 +44,7 @@ pub(crate) fn read_sockaddr_ll<M: UserMemory>(
         return Err(EINVAL);
     }
     let mut buf = [0u8; SOCKADDR_LL_LEN];
-    memory.read(addr, &mut buf).map_err(|_| EFAULT)?;
+    memory.read(addr, &mut buf).await.map_err(|_| EFAULT)?;
     let family = u16::from_ne_bytes([buf[0], buf[1]]);
     if family != AF_PACKET {
         return Err(EINVAL);
@@ -70,7 +70,7 @@ pub(crate) fn read_sockaddr_ll<M: UserMemory>(
 }
 
 /// Encodes a `struct sockaddr_ll` into user memory and updates `*addrlen`.
-pub(crate) fn write_sockaddr_ll<M: UserMemory>(
+pub(crate) async fn write_sockaddr_ll<M: UserMemory>(
     memory: &mut M,
     addr: u64,
     addrlen_ptr: u64,
@@ -82,6 +82,7 @@ pub(crate) fn write_sockaddr_ll<M: UserMemory>(
     let mut len_bytes = [0u8; 4];
     memory
         .read(addrlen_ptr, &mut len_bytes)
+        .await
         .map_err(|_| EFAULT)?;
     let cap = u32::from_ne_bytes(len_bytes) as usize;
     let mut buf = [0u8; SOCKADDR_LL_LEN];
@@ -94,23 +95,24 @@ pub(crate) fn write_sockaddr_ll<M: UserMemory>(
     buf[12..20].copy_from_slice(&sll.addr);
     let copy = cap.min(SOCKADDR_LL_LEN);
     if copy > 0 {
-        memory.write(addr, &buf[..copy]).map_err(|_| EFAULT)?;
+        memory.write(addr, &buf[..copy]).await.map_err(|_| EFAULT)?;
     }
     memory
         .write(addrlen_ptr, &(SOCKADDR_LL_LEN as u32).to_ne_bytes())
+        .await
         .map_err(|_| EFAULT)?;
     Ok(())
 }
 
 /// Handles `bind()` on an `AF_PACKET` socket.
-pub(crate) fn bind<N: SocketNetwork, M: UserMemory, Net: Network<N>>(
+pub(crate) async fn bind<N: SocketNetwork, M: UserMemory, Net: Network<N>>(
     sock: &Socket<N>,
     addr: u64,
     addrlen: u32,
     memory: &M,
     net: &Net,
 ) -> Result<(), u64> {
-    let sll = read_sockaddr_ll(memory, addr, addrlen)?;
+    let sll = read_sockaddr_ll(memory, addr, addrlen).await?;
     if sll.ifindex != 0 && sll.ifindex != IFINDEX_LO && sll.ifindex != IFINDEX_ETH0 {
         return Err(ENODEV);
     }
@@ -166,6 +168,7 @@ pub(crate) async fn getsockname<N: SocketNetwork, M: UserMemory, Net: Network<N>
             addr: hwaddr,
         },
     )
+    .await
 }
 
 /// Sends a raw Ethernet frame (`SOCK_RAW`) or L3 packet (`SOCK_DGRAM`, synthesizing
