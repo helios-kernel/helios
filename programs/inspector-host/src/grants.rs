@@ -14,10 +14,188 @@ use helios_api::programs::{
     link_grant, machine_grant, mount_grant, network_grant, process_grant, settings_grant,
     terminal_grant,
 };
-use helios_inspector_protocol::auth::{
-    ClockRightsMask, DeviceClassMask, DirectoryRightsMask, LinkRightsMask, MountRightsMask,
-    NetworkRightsMask, ProcessRightsMask, ScopeRule, SessionGrants, TerminalRightsMask,
+use helios_component_manager::{
+    AuthorityScopeSpec, CapabilityCeiling, ClockRights, DeviceClasses, FsRights, LinkRights,
+    MachineRights, MountRights, NetRights, OomTier, ProcessRights, TerminalRights,
 };
+use helios_inspector_protocol::auth::{
+    ClockRightsMask, DeviceClassMask, DirectoryRightsMask, DirectoryRule, LinkRightsMask,
+    MountRightsMask, NetworkRightsMask, ProcessRightsMask, ScopeRule, SessionGrants,
+    TerminalRightsMask,
+};
+
+mod compiled_ceilings {
+    include!(concat!(env!("OUT_DIR"), "/inspector_ceilings.rs"));
+}
+
+/// Compile-time validated OOM tier declared in `components/inspector/tls/component.toml`.
+pub const fn compiled_tls_oom_tier() -> OomTier {
+    compiled_ceilings::INSPECTOR_TLS_OOM_TIER
+}
+
+/// Compile-time validated OOM tier declared in `components/inspector/worker/component.toml`.
+pub const fn compiled_worker_oom_tier() -> OomTier {
+    compiled_ceilings::INSPECTOR_WORKER_OOM_TIER
+}
+
+/// Compile-time validated capability ceiling declared in `components/inspector/tls/component.toml`.
+pub fn compiled_tls_ceiling() -> SessionGrants {
+    capability_ceiling_to_session_grants(&compiled_ceilings::INSPECTOR_TLS_CEILING)
+}
+
+/// Compile-time validated capability ceiling declared in `components/inspector/worker/component.toml`.
+pub fn compiled_worker_ceiling() -> SessionGrants {
+    capability_ceiling_to_session_grants(&compiled_ceilings::INSPECTOR_WORKER_CEILING)
+}
+
+/// Converts a compile-time validated [`CapabilityCeiling`] into [`SessionGrants`].
+///
+/// `MachineRights::IDENTITY` is never representable in [`SessionGrants`] and is
+/// asserted absent so child components can never receive machine identity signing rights.
+pub fn capability_ceiling_to_session_grants(cap: &CapabilityCeiling) -> SessionGrants {
+    debug_assert!(
+        !cap.machine.contains(MachineRights::IDENTITY),
+        "inspector child ceiling must never carry MachineRights::IDENTITY"
+    );
+
+    let directories = cap
+        .directories
+        .iter()
+        .map(|d| {
+            let mut rights = DirectoryRightsMask::EMPTY;
+            if d.rights.contains(FsRights::READ) {
+                rights = rights.union(DirectoryRightsMask::READ);
+            }
+            if d.rights.contains(FsRights::WRITE) {
+                rights = rights.union(DirectoryRightsMask::WRITE);
+            }
+            if d.rights.contains(FsRights::MUTATE_DIRECTORY) {
+                rights = rights.union(DirectoryRightsMask::MUTATE_DIRECTORY);
+            }
+            if d.rights.contains(FsRights::EXECUTE) {
+                rights = rights.union(DirectoryRightsMask::EXECUTE);
+            }
+            DirectoryRule::new(d.source.as_ref(), d.guest.as_ref(), rights)
+        })
+        .collect();
+
+    let mut network = NetworkRightsMask::EMPTY;
+    if cap.network.contains(NetRights::TCP) {
+        network = network.union(NetworkRightsMask::TCP);
+    }
+    if cap.network.contains(NetRights::UDP) {
+        network = network.union(NetworkRightsMask::UDP);
+    }
+    if cap.network.contains(NetRights::DNS) {
+        network = network.union(NetworkRightsMask::DNS);
+    }
+    if cap.network.contains(NetRights::PRIVILEGED_BIND) {
+        network = network.union(NetworkRightsMask::PRIVILEGED_BIND);
+    }
+    if cap.network.contains(NetRights::MULTICAST) {
+        network = network.union(NetworkRightsMask::MULTICAST);
+    }
+    if cap.network.contains(NetRights::ADMIN) {
+        network = network.union(NetworkRightsMask::ADMIN);
+    }
+
+    let mut clock = ClockRightsMask::EMPTY;
+    if cap.clock.contains(ClockRights::SET_WALL_CLOCK) {
+        clock = clock.union(ClockRightsMask::SET_WALL_CLOCK);
+    }
+
+    let mut terminal = TerminalRightsMask::EMPTY;
+    if cap.terminal.contains(TerminalRights::INPUT) {
+        terminal = terminal.union(TerminalRightsMask::INPUT);
+    }
+    if cap.terminal.contains(TerminalRights::OUTPUT) {
+        terminal = terminal.union(TerminalRightsMask::OUTPUT);
+    }
+    if cap.terminal.contains(TerminalRights::CONTROL) {
+        terminal = terminal.union(TerminalRightsMask::CONTROL);
+    }
+
+    let mut process = ProcessRightsMask::EMPTY;
+    if cap.process.contains(ProcessRights::SPAWN) {
+        process = process.union(ProcessRightsMask::SPAWN);
+    }
+    if cap.process.contains(ProcessRights::EXEC) {
+        process = process.union(ProcessRightsMask::EXEC);
+    }
+    if cap.process.contains(ProcessRights::FORK) {
+        process = process.union(ProcessRightsMask::FORK);
+    }
+    if cap.process.contains(ProcessRights::JOIN) {
+        process = process.union(ProcessRightsMask::JOIN);
+    }
+    if cap.process.contains(ProcessRights::SIGNAL) {
+        process = process.union(ProcessRightsMask::SIGNAL);
+    }
+
+    let mut link = LinkRightsMask::EMPTY;
+    if cap.link.contains(LinkRights::SOURCE) {
+        link = link.union(LinkRightsMask::SOURCE);
+    }
+    if cap.link.contains(LinkRights::TARGET_DIRECTORY) {
+        link = link.union(LinkRightsMask::TARGET_DIRECTORY);
+    }
+    if cap.link.contains(LinkRights::SYMLINK_CREATE) {
+        link = link.union(LinkRightsMask::SYMLINK_CREATE);
+    }
+    if cap.link.contains(LinkRights::SYMLINK_READ) {
+        link = link.union(LinkRightsMask::SYMLINK_READ);
+    }
+
+    let mut mount = MountRightsMask::EMPTY;
+    if cap.mount.contains(MountRights::MOUNT) {
+        mount = mount.union(MountRightsMask::MOUNT);
+    }
+    if cap.mount.contains(MountRights::UNMOUNT) {
+        mount = mount.union(MountRightsMask::UNMOUNT);
+    }
+
+    let mut devices = DeviceClassMask::EMPTY;
+    if cap.devices.contains(DeviceClasses::DISPLAY) {
+        devices = devices.union(DeviceClassMask::DISPLAY);
+    }
+    if cap.devices.contains(DeviceClasses::INPUT) {
+        devices = devices.union(DeviceClassMask::INPUT);
+    }
+    if cap.devices.contains(DeviceClasses::GPU) {
+        devices = devices.union(DeviceClassMask::GPU);
+    }
+    if cap.devices.contains(DeviceClasses::AUDIO) {
+        devices = devices.union(DeviceClassMask::AUDIO);
+    }
+
+    let map_ceiling_scope = |scope: AuthorityScopeSpec| match scope {
+        AuthorityScopeSpec::None => None,
+        AuthorityScopeSpec::Own => Some(ScopeRule::Own),
+        AuthorityScopeSpec::Subtree => Some(ScopeRule::Subtree("/".to_owned())),
+        AuthorityScopeSpec::Machine => Some(ScopeRule::Machine),
+    };
+
+    let instance_control = map_ceiling_scope(cap.instance_control);
+    SessionGrants {
+        directories,
+        network,
+        clock,
+        terminal,
+        process,
+        link,
+        mount,
+        devices,
+        inspect_read: map_ceiling_scope(cap.inspect_read),
+        trace_read: map_ceiling_scope(cap.trace_read),
+        profile_read: map_ceiling_scope(cap.profile_read),
+        diagnostics_control: cap.diagnostics_control,
+        instance_control: instance_control.clone(),
+        settings_write: cap.settings_write,
+        machine_control: cap.machine.contains(MachineRights::CONTROL),
+        virtualize: cap.machine.contains(MachineRights::VIRTUALIZE),
+        component_control: instance_control,
+    }
+}
 
 /// Maximum entries read from `/components/` when resolving live subtree
 /// component monikers to kernel `InstanceId`s.
@@ -436,5 +614,158 @@ mod tests {
                 assert!(grant.rights.contains(&MachineRight::Virtualize));
             }
         }
+    }
+
+    #[test]
+    fn compiled_tls_ceiling_is_empty_and_user_oom_tier() {
+        assert_eq!(compiled_tls_oom_tier(), OomTier::User);
+        assert_eq!(
+            compiled_ceilings::INSPECTOR_TLS_CEILING,
+            CapabilityCeiling::EMPTY
+        );
+        let tls = compiled_tls_ceiling();
+        assert_eq!(tls, SessionGrants::empty());
+        assert!(tls.directories.is_empty());
+        assert!(tls.network.is_empty());
+        assert!(tls.clock.is_empty());
+        assert!(tls.terminal.is_empty());
+        assert!(tls.process.is_empty());
+        assert!(tls.link.is_empty());
+        assert!(tls.mount.is_empty());
+        assert!(tls.devices.is_empty());
+        assert!(tls.inspect_read.is_none());
+        assert!(tls.trace_read.is_none());
+        assert!(tls.profile_read.is_none());
+        assert!(!tls.diagnostics_control);
+        assert!(tls.instance_control.is_none());
+        assert!(!tls.settings_write);
+        assert!(!tls.machine_control);
+        assert!(!tls.virtualize);
+        assert!(tls.component_control.is_none());
+        assert!(session_grants_to_kernel_with_lookup(&tls, |_| None).is_empty());
+    }
+
+    #[test]
+    fn compiled_worker_ceiling_matches_manifest_excludes_identity_and_bounds_certs() {
+        use ed25519_dalek::SigningKey;
+        use helios_inspector_protocol::auth::{
+            AUTH_PROTOCOL_VERSION, AuthError, AuthPolicy, CapabilityCert, CapabilityCertPayload,
+            ClientIdentity, MACHINE_IDENTITY_HANDSHAKE_DOMAIN, ServerHello, TransportKind,
+            TransportMask, TrustedAuthorityCa, compute_handshake_challenge,
+            sign_machine_identity_seed, verify_client_auth,
+        };
+
+        assert_eq!(compiled_worker_oom_tier(), OomTier::User);
+        assert!(
+            !compiled_ceilings::INSPECTOR_WORKER_CEILING
+                .machine
+                .contains(MachineRights::IDENTITY),
+            "/inspector/worker manifest must never carry MachineRights::IDENTITY"
+        );
+        let worker = compiled_worker_ceiling();
+        assert_eq!(worker, SessionGrants::full_worker_ceiling());
+
+        let kernel_grants = session_grants_to_kernel_with_lookup(&worker, |_| None);
+        for g in &kernel_grants {
+            if let CapabilityGrant::Machine(grant) = g {
+                assert!(
+                    !grant.rights.contains(&MachineRight::Identity),
+                    "worker kernel grants must never include MachineRight::Identity"
+                );
+            }
+        }
+
+        // Verify that a CapabilityCert requesting rights outside a compiled
+        // worker ceiling is rejected by `verify_client_auth` and attenuated by
+        // `intersect`, never escalated.
+        let mut restricted_cap = compiled_ceilings::INSPECTOR_WORKER_CEILING.clone();
+        restricted_cap.machine = MachineRights::CONTROL; // drop VIRTUALIZE
+        restricted_cap.settings_write = false;
+        let restricted_ceiling = capability_ceiling_to_session_grants(&restricted_cap);
+        assert!(!restricted_ceiling.virtualize);
+        assert!(!restricted_ceiling.settings_write);
+        assert!(restricted_ceiling.machine_control);
+
+        let ca_signing = SigningKey::from_bytes(&[0x10; 32]);
+        let client_seed = [0x20; 32];
+        let client_pub = SigningKey::from_bytes(&client_seed)
+            .verifying_key()
+            .to_bytes();
+        let machine_seed = [0x30; 32];
+        let machine_pub = ClientIdentity::from_static_seed(machine_seed).public_key();
+        let now = 1_700_000_000;
+
+        let policy = AuthPolicy {
+            version: AUTH_PROTOCOL_VERSION,
+            static_keys: Vec::new(),
+            trusted_cas: vec![TrustedAuthorityCa {
+                label: "test-ca".to_owned(),
+                public_key: ca_signing.verifying_key().to_bytes(),
+                max_ttl_secs: 3600,
+                allowed_transports: TransportMask::ALL,
+                ceiling: SessionGrants::full_worker_ceiling(),
+            }],
+        };
+
+        let mut requested = restricted_ceiling.clone();
+        requested.virtualize = true; // exceeds `restricted_ceiling`!
+        let cert = CapabilityCert::issue(
+            &ca_signing,
+            CapabilityCertPayload {
+                version: AUTH_PROTOCOL_VERSION,
+                principal: "operator".to_owned(),
+                subject_public_key: client_pub,
+                node_public_key: Some(machine_pub),
+                not_before_unix: now - 60,
+                expires_at_unix: now + 600,
+                allowed_transports: TransportMask::VSOCK,
+                grants: requested.clone(),
+            },
+        )
+        .expect("issue cert");
+
+        let server_nonce = [0x55; 32];
+        let client_nonce = [0x66; 32];
+        let challenge = compute_handshake_challenge(
+            AUTH_PROTOCOL_VERSION,
+            TransportKind::Vsock,
+            server_nonce,
+            now,
+            None,
+            None,
+        );
+        let hello = ServerHello {
+            protocol_version: AUTH_PROTOCOL_VERSION,
+            transport: TransportKind::Vsock,
+            machine_public_key: machine_pub,
+            server_nonce,
+            server_unix_time: now,
+            tls_binding_required: false,
+            machine_signature: sign_machine_identity_seed(
+                &machine_seed,
+                MACHINE_IDENTITY_HANDSHAKE_DOMAIN,
+                &challenge,
+            ),
+        };
+        let identity = ClientIdentity::from_capability_cert(client_seed, cert, Vec::new());
+        let auth = identity
+            .build_client_auth(&hello, None, client_nonce)
+            .expect("build client auth");
+
+        let err = verify_client_auth(&policy, &restricted_ceiling, &hello, None, &auth, now)
+            .expect_err("cert exceeding compiled worker ceiling must be rejected");
+        assert!(matches!(
+            err,
+            AuthError::CapabilityEscalation {
+                dimension: "virtualize",
+                ..
+            }
+        ));
+
+        // Intersection also strictly drops rights outside the compiled ceiling.
+        let intersected = requested.intersect(&restricted_ceiling);
+        assert!(!intersected.virtualize);
+        assert!(!intersected.settings_write);
+        assert!(intersected.machine_control);
     }
 }

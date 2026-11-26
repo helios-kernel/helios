@@ -3463,10 +3463,13 @@ dependencies = [
 name = "helios-inspector-host"
 version = "0.1.0"
 dependencies = [
+ "askama",
+ "ed25519-dalek",
  "futures-io",
  "futures-lite",
  "futures-util",
  "helios-api",
+ "helios-component-manager",
  "helios-inspector-protocol",
  "helios-wit-rpc",
 ]

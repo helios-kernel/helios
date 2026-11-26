@@ -1,0 +1,18 @@
+description = "List /btrfs/docs on the btrfs smoke mount"
+name = "ls-btrfs-docs"
+runner = "exec"
+program = "/bin/ls"
+args = ["/btrfs/docs"]
+after = ["/cat-btrfs-link"]
+startup = "eager"
+lifecycle = "oneshot"
+restart = "never"
+critical = "system"
+escalation = "halt"
+oom_tier = "user"
+
+[capabilities]
+directories = [
+  { source = "/", guest = "/", rights = ["read", "execute"] },
+]
+link = ["symlink-read"]

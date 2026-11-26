@@ -1,0 +1,18 @@
+description = "Read /btrfs/hello-link through the btrfs symlink"
+name = "cat-btrfs-link"
+runner = "exec"
+program = "/bin/cat"
+args = ["/btrfs/hello-link"]
+after = ["/ls-image-docs"]
+startup = "eager"
+lifecycle = "oneshot"
+restart = "never"
+critical = "system"
+escalation = "halt"
+oom_tier = "user"
+
+[capabilities]
+directories = [
+  { source = "/", guest = "/", rights = ["read", "execute"] },
+]
+link = ["symlink-read"]

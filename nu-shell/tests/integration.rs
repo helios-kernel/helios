@@ -885,11 +885,7 @@ fn save_unknown_extension_stderr_redirection_do_env_tilde_and_cancellation() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap();
-        for rel in [
-            "tools/fs-smoke/bootfs/etc/rc.nu",
-            "tools/fs-smoke/crash/bootfs/etc/rc.nu",
-            "tools/cpu-lifecycle/guest.nu",
-        ] {
+        for rel in ["tools/cpu-lifecycle/guest.nu"] {
             let source = std::fs::read_to_string(root.join(rel))
                 .unwrap_or_else(|e| panic!("failed to read {rel}: {e}"));
             let (engine_state, _) = helios_nu::create_helios_context();

@@ -584,6 +584,7 @@ jobs:
         working-directory: helios
         env:
           WASM_PROGRAMS: ${{ matrix.programs }}
+          WASM_PROFILE: ${{ matrix.profile }}
         run: |
           set -euo pipefail
           args=()
@@ -591,6 +592,12 @@ jobs:
             while IFS= read -r program; do
               args+=(--program "${program}")
             done < <(jq -r '.[]' <<< "${WASM_PROGRAMS}")
+          fi
+          if [[ "${WASM_PROFILE}" == "release" && "${WASM_PROGRAMS}" == "all" ]]; then
+            args+=(
+              --extra-init helios_fs_smoke_init.wasm=tools/fs-smoke/components
+              --extra-init helios_fs_crash_init.wasm=tools/fs-smoke/crash/components
+            )
           fi
           "$HELIOS_CLI_BIN" \
             wasm-build --out-dir "${RUNNER_TEMP}/wasm-programs" \

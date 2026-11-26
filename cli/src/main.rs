@@ -93,6 +93,8 @@ enum WasmProgramsError {
     #[error("{0}")]
     WasmBuild(#[from] WasmBuildError),
     #[error("{0}")]
+    TopologyCodegen(#[from] components::TopologyCodegenError),
+    #[error("{0}")]
     Cache(#[from] CacheError),
     #[error("the host does not report its available parallelism: {source}")]
     Parallelism {
@@ -162,6 +164,8 @@ pub(crate) enum PrebuildError {
     BootArtifacts(#[from] BootArtifactsError),
     #[error("{0}")]
     WasmBuild(#[from] WasmBuildError),
+    #[error("{0}")]
+    TopologyCodegen(#[from] components::TopologyCodegenError),
     #[error("{0}")]
     Bootfs(#[from] BootfsError),
     #[error("{0}")]
@@ -854,6 +858,18 @@ struct KernelPrebuildCommand {
     boot_artifacts_manifest: PathBuf,
     #[arg(long = "no-compiler-plugin", default_value_t = false)]
     no_compiler_plugin: bool,
+    /// Use this prebuilt `wasm32-wasip3` root `init` (`component-manager`)
+    /// module instead of building or loading the default `helios_init.wasm`.
+    ///
+    /// Compatible with `--prebuilt-wasm` so smoke suites with custom declarative
+    /// `component.toml` topologies can supply their own compiled `init` artifact
+    /// while reusing every other prebuilt guest program.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["init_manifest", "components"])]
+    init_wasm: Option<PathBuf>,
+    /// Compile `programs/init` against this `component.toml` directory tree
+    /// instead of the default `components/` topology.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["init_manifest", "init_wasm"])]
+    components: Option<PathBuf>,
     /// Take the guest wasm from this directory, as `wasm-build` wrote it,
     /// instead of building it.
     ///
@@ -904,6 +920,40 @@ struct KernelPrebuildCommand {
     cache: CacheArgs,
 }
 
+/// An additional declarative `init` (`component-manager`) wasm artifact built
+/// by `wasm-build --extra-init <ARTIFACT_NAME>=<COMPONENTS_DIR>`.
+#[derive(Clone, Debug)]
+struct ExtraInitSpec {
+    artifact_name: String,
+    components_dir: PathBuf,
+}
+
+impl std::str::FromStr for ExtraInitSpec {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let Some((artifact_name, dir)) = raw.split_once('=') else {
+            return Err(format!(
+                "expected `<artifact.wasm>=<components-dir>`, got `{raw}`"
+            ));
+        };
+        if artifact_name.is_empty()
+            || artifact_name.contains('/')
+            || artifact_name == "."
+            || artifact_name == ".."
+        {
+            return Err(format!("invalid artifact file name `{artifact_name}`"));
+        }
+        if dir.is_empty() {
+            return Err(format!("components directory must not be empty in `{raw}`"));
+        }
+        Ok(Self {
+            artifact_name: artifact_name.to_owned(),
+            components_dir: PathBuf::from(dir),
+        })
+    }
+}
+
 #[derive(Parser)]
 struct WasmBuildCommand {
     /// Directory the wasm lands in, under `<DIR>/<profile>/`.
@@ -920,6 +970,10 @@ struct WasmBuildCommand {
     /// automatically.
     #[arg(long = "program", value_name = "NAME")]
     programs: Vec<String>,
+    /// Build additional declarative `programs/init` wasm variants from alternate
+    /// `component.toml` trees, named `<ARTIFACT_NAME>=<COMPONENTS_DIR>`.
+    #[arg(long = "extra-init", value_name = "ARTIFACT=DIR")]
+    extra_init: Vec<ExtraInitSpec>,
     #[command(flatten)]
     cache: CacheArgs,
 }
@@ -1348,7 +1402,46 @@ fn run_kernel_prebuild(
         }),
     };
     let precompile_cache = cache.as_ref().map(PrecompileCache::new).transpose()?;
-    let init_component = wasm.component(&init_manifest, INIT_WASM)?;
+    let init_component = match (&command.init_wasm, &command.components) {
+        (Some(path), _) => {
+            let resolved = if path.is_absolute() {
+                path.clone()
+            } else {
+                workspace_root.join(path)
+            };
+            if !resolved.is_file() {
+                return Err(PrebuildError::WasmBuild(WasmBuildError::PrebuiltMissing {
+                    path: resolved.display().to_string(),
+                    profile: command.profile.clone(),
+                }));
+            }
+            resolved
+        }
+        (None, Some(components_dir)) => {
+            let topology_out = command.out_dir.join("generated_topology.rs");
+            let topology_abs = components::render_components_dir_to_file(
+                &workspace_root,
+                components_dir,
+                &topology_out,
+            )?;
+            let init_builder = WasmBuilder {
+                cargo: &command.cargo,
+                profile: &command.profile,
+                out_dir: &command.out_dir,
+                workspace_root: &workspace_root,
+                cache: None,
+            };
+            init_builder.component_with_options(
+                &init_manifest,
+                INIT_WASM,
+                ComponentBuildProfile {
+                    extra_features: &[],
+                    generated_topology_rs: Some(&topology_abs),
+                },
+            )?
+        }
+        (None, None) => wasm.component(&init_manifest, INIT_WASM)?,
+    };
     let init_cwasm = command.out_dir.join("init_component.cwasm");
     let init_component_bytes = encode_component(&init_component)?;
     // The boot payload stays at the floor level: every processor the target
@@ -2313,6 +2406,46 @@ fn run_wasm_build(
             to: to.display().to_string(),
             source,
         })?;
+    }
+
+    if !command.extra_init.is_empty() {
+        let init_manifest = workspace_root.join(Path::new("programs/init/Cargo.toml"));
+        let extra_builder = WasmBuilder {
+            cargo: &command.cargo,
+            profile: &command.profile,
+            out_dir: &scratch,
+            workspace_root,
+            cache: None,
+        };
+        for extra in &command.extra_init {
+            if !names.insert(std::ffi::OsString::from(&extra.artifact_name)) {
+                return Err(WasmProgramsError::DuplicateArtifact {
+                    artifact: extra.artifact_name.clone(),
+                    first: "programs/init/Cargo.toml".to_owned(),
+                    second: extra.components_dir.display().to_string(),
+                });
+            }
+            let topology_path = scratch.join(format!("{}.topology.rs", extra.artifact_name));
+            let topology_abs = components::render_components_dir_to_file(
+                workspace_root,
+                &extra.components_dir,
+                &topology_path,
+            )?;
+            let built_wasm = extra_builder.component_with_options(
+                &init_manifest,
+                INIT_WASM,
+                ComponentBuildProfile {
+                    extra_features: &[],
+                    generated_topology_rs: Some(&topology_abs),
+                },
+            )?;
+            let to = dest.join(&extra.artifact_name);
+            fs::copy(&built_wasm, &to).map_err(|source| WasmProgramsError::Copy {
+                from: built_wasm.display().to_string(),
+                to: to.display().to_string(),
+                source,
+            })?;
+        }
     }
     let manifest = PrebuiltManifest {
         schema_version: PREBUILT_SCHEMA_VERSION,

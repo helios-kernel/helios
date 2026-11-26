@@ -14,10 +14,24 @@ mkfs.erofs -zlz4 "$runtime/image.erofs" "$runtime/tree"
 # mkfs.btrfs' default single-device geometry requires at least 114294784 bytes.
 truncate -s 128M "$runtime/image.btrfs"
 mkfs.btrfs -q -f --rootdir "$runtime/tree" "$runtime/image.btrfs"
+init_args=()
+if [[ -n "${HELIOS_PREBUILT_WASM:-}" ]]; then
+  if [[ -f "${HELIOS_PREBUILT_WASM}/release/helios_fs_smoke_init.wasm" ]]; then
+    init_args=(--init-wasm "${HELIOS_PREBUILT_WASM}/release/helios_fs_smoke_init.wasm")
+  elif [[ -f "${HELIOS_PREBUILT_WASM}/helios_fs_smoke_init.wasm" ]]; then
+    init_args=(--init-wasm "${HELIOS_PREBUILT_WASM}/helios_fs_smoke_init.wasm")
+  else
+    echo "fs-smoke: missing prebuilt helios_fs_smoke_init.wasm under HELIOS_PREBUILT_WASM=${HELIOS_PREBUILT_WASM}" >&2
+    exit 1
+  fi
+else
+  init_args=(--components tools/fs-smoke/components)
+fi
 ./target/release/helios vm --arch "$arch" --release --memory 2G \
   --accel "$accel" \
   --runtime-dir "$runtime" --keep-runtime-dir \
   --bootfs-root "$runtime/bootfs" \
+  "${init_args[@]}" \
   --disk "$runtime/image.erofs,serial=erofs-smoke,readonly" \
   --disk "$runtime/image.btrfs,serial=btrfs-smoke" \
   --boot-program nu --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
@@ -32,7 +46,7 @@ grep -Fqx 'helios init: mounted btrfs:btrfs-smoke at /btrfs' "$runtime/guest.out
 grep -Fqx 'helios init: listing /image' "$runtime/guest.out"
 grep -Fqx 'helios init: listing /btrfs' "$runtime/guest.out"
 # Both filesystems must supply their own listing and data, including the
-# btrfs symlink followed by the VFS from /etc/rc under init's namespace.
+# btrfs symlink followed by the VFS from declarative oneshot components under init's namespace.
 for line in 'dir docs' 'file hello.txt' 'filesystem:ok' '中文.txt' '日本語.txt' '한국어.txt'; do
   test "$(grep -Fxc "$line" "$runtime/guest.out")" -eq 2
 done

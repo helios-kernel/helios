@@ -9,8 +9,16 @@ futures-io = { version = "0.3.34", default-features = false, features = ["std"] 
 futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
 futures-util = { version = "0.3.31", default-features = false, features = ["std", "async-await"] }
 helios-api = { path = "../../api", default-features = false, features = ["channel", "fs", "inspect", "ipc", "machine-identity", "net", "programs", "serial", "task", "vsock"] }
+helios-component-manager = { workspace = true }
 helios-inspector-protocol = { path = "../../inspector-protocol", default-features = false, features = ["auth"] }
 helios-wit-rpc = { workspace = true, default-features = false, features = ["inspector-rpc"] }
+
+[build-dependencies]
+askama = "0.15.6"
+helios-component-manager = { path = "../../component-manager", default-features = false, features = ["manifest"] }
+
+[dev-dependencies]
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["alloc"] }
 
 [lib]
 name = "helios_inspector_host"
