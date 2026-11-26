@@ -152,9 +152,11 @@ impl X86Tables {
         let mut table = (&*self.root as *const PageTable).cast::<AtomicU64>();
         for shift in [39_u32, 30, 21] {
             let index = ((base >> shift) & 0x1ff) as usize;
-            // SAFETY: `table` points to a live 512-entry aligned `PageTable`
-            // owned by this space under its lock, and `index < 512`.
-            let entry = unsafe { &*table.add(index) };
+            // SAFETY: `table` points to a 512-entry `PageTable` and `index < 512`.
+            let slot = unsafe { table.add(index) };
+            // SAFETY: `slot` is an aligned entry in a live `PageTable` owned by
+            // this space under its lock.
+            let entry = unsafe { &*slot };
             let bits = entry.load(Ordering::Acquire);
             if bits & present == 0 || bits & huge != 0 {
                 return None;
@@ -163,9 +165,11 @@ impl X86Tables {
             table = (phys + self.tables.offset) as *const AtomicU64;
         }
         let index = ((base >> 12) & 0x1ff) as usize;
-        // SAFETY: `table` points to a live 512-entry aligned L1 `PageTable`
-        // owned by this space under its lock, and `index < 512`.
-        Some(unsafe { &*table.add(index) })
+        // SAFETY: `table` points to a 512-entry L1 `PageTable` and `index < 512`.
+        let slot = unsafe { table.add(index) };
+        // SAFETY: `slot` is an aligned entry in a live L1 `PageTable` owned by
+        // this space under its lock.
+        Some(unsafe { &*slot })
     }
 }
 

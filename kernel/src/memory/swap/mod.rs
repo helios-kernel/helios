@@ -1927,7 +1927,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "linux"))]
 pub(crate) mod native_test_harness {
     use alloc::boxed::Box;
     use alloc::collections::BTreeMap;

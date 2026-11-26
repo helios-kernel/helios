@@ -83,6 +83,8 @@ pub use reservations::{
     ReservationLookup, ReservationTracker, SwapEntry, VaCursor, ranges_outside, validate_range,
 };
 pub use residency::{ResidencyVmHooks, UserResidency, install_residency_hooks, residency_vm_hooks};
+#[cfg(all(test, feature = "linux"))]
+pub(crate) use swap::native_test_harness::NativeSwapTestHarness;
 pub use swap::{
     AGE_BATCH_PAGES, GuestResidency, IDLE_SWAP_AFTER, InstalledAddressSpace, NativeSpaceRegistry,
     RegisteredNativeSpace, SWAP_BATCH_BYTES, SWAP_TICK, SwapDisabled, SwapFaultError, SwapFaultIn,
@@ -90,7 +92,7 @@ pub use swap::{
     install_swap_hooks, installed_swap_handle, installed_swap_hooks, swap_vm_hooks, swapped_token,
 };
 #[cfg(test)]
-pub(crate) use swap::{GUEST_SWAP_PAGE, GuestSwap, native_test_harness::NativeSwapTestHarness};
+pub(crate) use swap::{GUEST_SWAP_PAGE, GuestSwap};
 pub use user::{
     HibernateReservation, MemoryNodeStats, UserHeapStats, UserMemoryPool, UserPoolChunks,
     allocate_user_frame_uninit_on, allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed,
