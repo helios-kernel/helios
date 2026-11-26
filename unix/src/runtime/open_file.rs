@@ -1,6 +1,26 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use helios_sync::{RawMutex, RawMutexLease};
+use spin::Mutex;
+
+use crate::FileLockTable;
+
+static NEXT_OPEN_FILE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Unique identifier of one POSIX open file description ([`OpenFile`]), shared
+/// across `dup`/`dup2`/`fork` duplicates and distinct across separate `open`s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OpenFileId(u64);
+
+impl OpenFileId {
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
 
 /// The POSIX open file description of a filesystem object: the node handle
 /// the platform opened and the file offset every read, write and seek
@@ -25,9 +45,19 @@ use helios_sync::{RawMutex, RawMutexLease};
 pub struct OpenFile<Node>(Arc<OpenFileDescription<Node>>);
 
 struct OpenFileDescription<Node> {
+    id: OpenFileId,
     node: Node,
     offset: AtomicU64,
     position_lock: RawMutex,
+    flock_table: Mutex<Option<FileLockTable>>,
+}
+
+impl<Node> Drop for OpenFileDescription<Node> {
+    fn drop(&mut self) {
+        if let Some(table) = self.flock_table.get_mut().take() {
+            table.release_all_flocks_for(self.id);
+        }
+    }
 }
 
 /// Exclusive async lease over an [`OpenFile`]'s current file offset.
@@ -63,11 +93,28 @@ impl<Node> OpenFile<Node> {
 
     /// A new open file description of `node`, starting at `offset`.
     pub fn new_at(node: Node, offset: u64) -> Self {
+        let id = OpenFileId(NEXT_OPEN_FILE_ID.fetch_add(1, Ordering::Relaxed));
         Self(Arc::new(OpenFileDescription {
+            id,
             node,
             offset: AtomicU64::new(offset),
             position_lock: RawMutex::new(),
+            flock_table: Mutex::new(None),
         }))
+    }
+
+    /// Unique identifier of this open file description (shared across `dup`/`fork`).
+    pub fn id(&self) -> OpenFileId {
+        self.0.id
+    }
+
+    /// Registers `table` so any BSD `flock` held by this open file description
+    /// is released automatically when its last duplicate descriptor drops.
+    pub fn attach_flock_table(&self, table: &FileLockTable) {
+        let mut slot = self.0.flock_table.lock();
+        if slot.is_none() {
+            *slot = Some(table.clone());
+        }
     }
 
     /// The node handle the description was opened on.

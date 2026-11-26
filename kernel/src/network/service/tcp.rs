@@ -1670,6 +1670,9 @@ where
         {
             self.inner.state.any_arrival.signal();
         }
+        if self.inner.icmp_sockets.tap_rx_frame(frame.bytes.as_ref()) {
+            self.inner.state.any_arrival.signal();
+        }
         match self
             .inner
             .state

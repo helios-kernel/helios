@@ -2,6 +2,8 @@ mod address;
 use address::*;
 mod error;
 use error::*;
+mod icmp;
+use icmp::*;
 mod packet;
 use packet::*;
 mod pump;
@@ -183,6 +185,7 @@ where
     /// its own.
     link_up: AtomicBool,
     packet_taps: PacketTapRegistry,
+    icmp_sockets: IcmpSocketRegistry,
 }
 
 struct NetworkControlPlane {
@@ -793,6 +796,7 @@ where
                 stack_rx_budget,
                 link_up: AtomicBool::new(device.link_state().is_up()),
                 packet_taps: PacketTapRegistry::new(),
+                icmp_sockets: IcmpSocketRegistry::new(),
                 device,
             }),
         }
