@@ -19,6 +19,7 @@ mod table;
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::future::{Future, poll_fn};
@@ -74,6 +75,12 @@ where
     timer: Timer<CpuImpl>,
     device: Device,
     table: SpinMutex<VsockTable>,
+    /// Outgoing `VSOCK_OP_RST` packets queued by synchronous [`VsockService::close_sync`]
+    /// drop paths so [`VsockService::run_forever`] transmits them to the peer.
+    pending_resets: SpinMutex<VecDeque<VsockPacketHeader>>,
+    /// Wakes [`VsockService::run_forever`] when [`VsockService::close_sync`] queues
+    /// a reset packet while the pump is parked waiting for inbound frames.
+    reset_notify: helios_sync::Notify,
     /// Signalled whenever a packet arrived, so every parked reader,
     /// writer and accepter re-tests what it was waiting for.
     ///
@@ -103,6 +110,8 @@ where
                 timer,
                 device,
                 table: SpinMutex::new(table),
+                pending_resets: SpinMutex::new(VecDeque::new()),
+                reset_notify: helios_sync::Notify::new(),
                 progress: ProgressSignal::new(),
             }),
         }
@@ -124,7 +133,45 @@ where
         let mut payload = vec![0_u8; self.inner.device.max_payload_bytes()].into_boxed_slice();
         tracing::info!(guest_cid = self.guest_cid(), "vsock receive pump started");
         loop {
-            match self.inner.device.receive_into(&mut payload).await {
+            loop {
+                let reset = self.inner.pending_resets.lock().pop_front();
+                let Some(reset) = reset else {
+                    break;
+                };
+                if let Err(error) = self.transmit(reset, &[]).await {
+                    tracing::warn!(?error, "vsock queued reset could not be transmitted");
+                }
+            }
+            let next = {
+                // Arm reset_notify before checking pending_resets so a reset
+                // queued concurrently cannot be missed.
+                let mut reset_wait = self.inner.reset_notify.waiter();
+                if !self.inner.pending_resets.lock().is_empty() {
+                    None
+                } else {
+                    let mut recv = pin!(self.inner.device.receive_into(&mut payload));
+                    poll_fn(|cx| {
+                        if let Poll::Ready(result) = recv.as_mut().poll(cx) {
+                            return Poll::Ready(Some(result));
+                        }
+                        if self
+                            .inner
+                            .reset_notify
+                            .poll_notified(cx, &mut reset_wait)
+                            .is_ready()
+                            || !self.inner.pending_resets.lock().is_empty()
+                        {
+                            return Poll::Ready(None);
+                        }
+                        Poll::Pending
+                    })
+                    .await
+                }
+            };
+            let Some(delivery) = next else {
+                continue;
+            };
+            match delivery {
                 Ok(VsockDelivery::Packet(received)) => {
                     // Connection lifecycle is worth a line each: the
                     // packets that carry it are a handful per session,
@@ -399,9 +446,15 @@ where
         Ok(())
     }
 
-    /// Synchronously retires a connection slot when owned by a `Drop` path.
+    /// Synchronously retires a connection slot when owned by a `Drop` path and
+    /// queues its `VSOCK_OP_RST` packet for [`Self::run_forever`] to transmit.
     pub fn close_sync(&self, stream: VsockStreamId) {
-        let _ = self.inner.table.lock().close(stream);
+        let reset = self.inner.table.lock().close(stream).ok().flatten();
+        if let Some(reset) = reset {
+            self.inner.pending_resets.lock().push_back(reset);
+            self.inner.reset_notify.notify_all();
+            self.inner.progress.signal();
+        }
     }
 
     async fn transmit(&self, header: VsockPacketHeader, payload: &[u8]) -> Result<(), VsockError> {
@@ -784,5 +837,109 @@ impl ComponentHostVsockService {
 
     pub fn close_sync(&self, stream: VsockStreamId) {
         self.inner.close_sync(stream);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::collections::VecDeque;
+    use core::task::{Context, Waker};
+    use helios_hal::io::IoResult;
+    use helios_hal::vsock::{VsockOp, VsockReceived};
+
+    struct RecordingVsockDevice {
+        inbound: SpinMutex<VecDeque<VsockDelivery>>,
+        sent: Arc<SpinMutex<Vec<VsockPacketHeader>>>,
+    }
+
+    impl VsockDevice for RecordingVsockDevice {
+        fn guest_cid(&self) -> u64 {
+            3
+        }
+
+        fn max_payload_bytes(&self) -> usize {
+            4096
+        }
+
+        async fn receive_into(&self, _payload: &mut [u8]) -> IoResult<VsockDelivery> {
+            poll_fn(|_| {
+                if let Some(delivery) = self.inbound.lock().pop_front() {
+                    Poll::Ready(Ok(delivery))
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await
+        }
+
+        async fn send(&self, header: VsockPacketHeader, _payload: &[u8]) -> IoResult<()> {
+            self.sent.lock().push(header);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn close_sync_queues_and_transmits_rst_on_wire() {
+        let sent = Arc::new(SpinMutex::new(Vec::new()));
+        let inbound = SpinMutex::new(VecDeque::new());
+        let device = RecordingVsockDevice {
+            inbound,
+            sent: sent.clone(),
+        };
+        let cpu = crate::test_support::TestCpu::without_entropy();
+        let executor = crate::Executor::isolated(
+            crate::ProgressCounter::new(),
+            crate::test_support::single_node_pool(1),
+            helios_hal::cpu::ProcessorId::new(0),
+        );
+        let timer = executor.timer(cpu);
+        let service = VsockService::new(cpu, timer, device);
+        let listener = service.listen(5000, 4).expect("listen");
+
+        // Feed an inbound connection request so the pump accepts it into the table.
+        let req = VsockPacketHeader {
+            source: VsockAddress::new(2, 40000),
+            destination: VsockAddress::new(3, 5000),
+            op: VsockOp::Request,
+            flags: 0,
+            payload_len: 0,
+            buf_alloc: 65536,
+            fwd_cnt: 0,
+        };
+        service
+            .inner
+            .device
+            .inbound
+            .lock()
+            .push_back(VsockDelivery::Packet(VsockReceived {
+                header: req,
+                payload_len: 0,
+            }));
+
+        let mut pump = pin!(service.clone().run_forever());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(pump.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            sent.lock()
+                .iter()
+                .any(|hdr| hdr.op == VsockOp::Response && hdr.destination.port == 40000),
+            "handshake response transmitted"
+        );
+        sent.lock().clear();
+
+        let stream = service
+            .try_accept(listener)
+            .expect("try_accept")
+            .expect("connected stream");
+        // Synchronous close must queue VSOCK_OP_RST and wake run_forever to send it.
+        service.close_sync(stream);
+        assert!(pump.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            sent.lock().iter().any(|hdr| hdr.op == VsockOp::Reset
+                && hdr.source.port == 5000
+                && hdr.destination.port == 40000),
+            "close_sync must transmit VSOCK_OP_RST on the wire"
+        );
     }
 }

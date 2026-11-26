@@ -455,12 +455,15 @@ fn collect_own_handles(
                 collect_own_handles(resolve, err, seen, out);
             }
         }
+        TypeDefKind::Future(Some(inner)) | TypeDefKind::Stream(Some(inner)) => {
+            collect_own_handles(resolve, *inner, seen, out);
+        }
         TypeDefKind::Resource
         | TypeDefKind::Handle(Handle::Borrow(_))
         | TypeDefKind::Flags(_)
         | TypeDefKind::Enum(_)
-        | TypeDefKind::Future(_)
-        | TypeDefKind::Stream(_)
+        | TypeDefKind::Future(None)
+        | TypeDefKind::Stream(None)
         | TypeDefKind::Unknown => {}
     }
 }
@@ -742,13 +745,11 @@ fn render_type_id(ctx: &IfaceContext<'_>, id: TypeId, mode: TypeMode<'_>) -> Tok
             quote!(::core::result::Result<#ok_ts, #err_ts>)
         }
         TypeDefKind::Stream(payload) => {
-            let inner_ts =
-                payload.map_or_else(|| quote!(()), |t| render_type(ctx, t, TypeMode::Client));
+            let inner_ts = payload.map_or_else(|| quote!(()), |t| render_type(ctx, t, mode));
             quote!(#rt::StreamReader<#inner_ts>)
         }
         TypeDefKind::Future(payload) => {
-            let inner_ts =
-                payload.map_or_else(|| quote!(()), |t| render_type(ctx, t, TypeMode::Client));
+            let inner_ts = payload.map_or_else(|| quote!(()), |t| render_type(ctx, t, mode));
             quote!(#rt::FutureReader<#inner_ts>)
         }
         TypeDefKind::Type(inner) => render_type(ctx, *inner, mode),
@@ -854,10 +855,22 @@ fn generate_typedef(ctx: &IfaceContext<'_>, wit_name: &str, ty_id: TypeId) -> To
         let default_ty = &ctx.resource_meta(cid).client_path;
         param_map.insert(cid.index(), p_ident.clone());
         decl_generics.push(quote!(#p_ident = #default_ty));
-        impl_encode_bounds.push(quote!(#p_ident: #rt::__private::RpcEncode<__R>));
-        impl_decode_bounds.push(quote!(#p_ident: #rt::__private::RpcDecode<__R>));
+        impl_encode_bounds.push(
+            quote!(#p_ident: #rt::__private::RpcEncode<__R> + #rt::__private::MaybeSend + 'static),
+        );
+        impl_decode_bounds.push(
+            quote!(#p_ident: #rt::__private::RpcDecode<__R> + #rt::__private::MaybeSend + 'static),
+        );
         ty_param_idents.push(p_ident);
     }
+
+    let contains_resources_const = if own_res.is_empty() {
+        quote!()
+    } else {
+        quote!(
+            const CONTAINS_RESOURCES: bool = true;
+        )
+    };
 
     let decl_gen_tokens = if decl_generics.is_empty() {
         quote!()
@@ -901,6 +914,8 @@ fn generate_typedef(ctx: &IfaceContext<'_>, wit_name: &str, ty_id: TypeId) -> To
                 }
 
                 impl<__R: #rt::__private::ResourceEntry #(, #impl_encode_bounds)*> #rt::__private::RpcEncode<__R> for #ident #use_gen_tokens {
+                    #contains_resources_const
+
                     fn rpc_encode(self, __enc: &mut #rt::__private::Encoder<'_, __R>) -> ::core::result::Result<(), #rt::__private::WireError> {
                         #(#encode_fields)*
                         ::core::result::Result::Ok(())
@@ -908,6 +923,8 @@ fn generate_typedef(ctx: &IfaceContext<'_>, wit_name: &str, ty_id: TypeId) -> To
                 }
 
                 impl<__R: #rt::__private::ResourceEntry #(, #impl_decode_bounds)*> #rt::__private::RpcDecode<__R> for #ident #use_gen_tokens {
+                    #contains_resources_const
+
                     fn rpc_decode(__dec: &mut #rt::__private::Decoder<'_, __R>) -> ::core::result::Result<Self, #rt::__private::WireError> {
                         ::core::result::Result::Ok(Self {
                             #(#decode_fields,)*
@@ -1037,6 +1054,8 @@ fn generate_typedef(ctx: &IfaceContext<'_>, wit_name: &str, ty_id: TypeId) -> To
                 }
 
                 impl<__R: #rt::__private::ResourceEntry #(, #impl_encode_bounds)*> #rt::__private::RpcEncode<__R> for #ident #use_gen_tokens {
+                    #contains_resources_const
+
                     fn rpc_encode(self, __enc: &mut #rt::__private::Encoder<'_, __R>) -> ::core::result::Result<(), #rt::__private::WireError> {
                         match self {
                             #(#encode_arms)*
@@ -1046,6 +1065,8 @@ fn generate_typedef(ctx: &IfaceContext<'_>, wit_name: &str, ty_id: TypeId) -> To
                 }
 
                 impl<__R: #rt::__private::ResourceEntry #(, #impl_decode_bounds)*> #rt::__private::RpcDecode<__R> for #ident #use_gen_tokens {
+                    #contains_resources_const
+
                     fn rpc_decode(__dec: &mut #rt::__private::Decoder<'_, __R>) -> ::core::result::Result<Self, #rt::__private::WireError> {
                         match #read_tag {
                             #(#decode_arms,)*
@@ -1269,6 +1290,7 @@ fn generate_resource_proxy(ctx: &IfaceContext<'_>, ident: &Ident) -> TokenStream
 
         impl<__R: #rt::__private::ResourceEntry> #rt::__private::RpcEncode<__R> for #ident {
             const MIN_WIRE_SIZE: usize = 4;
+            const CONTAINS_RESOURCES: bool = true;
 
             fn rpc_encode(self, __enc: &mut #rt::__private::Encoder<'_, __R>) -> ::core::result::Result<(), #rt::__private::WireError> {
                 self.inner.rpc_encode(__enc)
@@ -1285,6 +1307,7 @@ fn generate_resource_proxy(ctx: &IfaceContext<'_>, ident: &Ident) -> TokenStream
 
         impl<__R: #rt::__private::ResourceEntry> #rt::__private::RpcDecode<__R> for #ident {
             const MIN_WIRE_SIZE: usize = 4;
+            const CONTAINS_RESOURCES: bool = true;
 
             fn rpc_decode(__dec: &mut #rt::__private::Decoder<'_, __R>) -> ::core::result::Result<Self, #rt::__private::WireError> {
                 #rt::__private::RemoteResource::rpc_decode(__dec).map(Self::from_remote)
@@ -1329,8 +1352,7 @@ fn generate_client_resource_methods(
                         #(#sig_params),*
                     ) -> #rt::__private::Result<#ret_ty> {
                         let mut __call = __peer.open_call(#instance_name, #wire_func).await?;
-                        let __req = #rt::__private::encode_client_value(&__call, #encode_expr).await?;
-                        __call.send_root_request(&__req).await?;
+                        #rt::__private::send_client_value(&__call, #encode_expr).await?;
                         let __resp = __call.recv_root_response().await?;
                         #rt::__private::decode_client_value::<#ret_ty>(&__call, &__resp).await
                     }
@@ -1348,8 +1370,7 @@ fn generate_client_resource_methods(
                         #(#sig_params),*
                     ) -> #rt::__private::Result<#ret_ty> {
                         let mut __call = __peer.open_call(#instance_name, #wire_func).await?;
-                        let __req = #rt::__private::encode_client_value(&__call, #encode_expr).await?;
-                        __call.send_root_request(&__req).await?;
+                        #rt::__private::send_client_value(&__call, #encode_expr).await?;
                         let __resp = __call.recv_root_response().await?;
                         #rt::__private::decode_client_value::<#ret_ty>(&__call, &__resp).await
                     }
@@ -1368,8 +1389,7 @@ fn generate_client_resource_methods(
                         #(#sig_params),*
                     ) -> #rt::__private::Result<#ret_ty> {
                         let mut __call = self.rpc_peer().open_call(#instance_name, #wire_func).await?;
-                        let __req = #rt::__private::encode_client_value(&__call, #encode_expr).await?;
-                        __call.send_root_request(&__req).await?;
+                        #rt::__private::send_client_value(&__call, #encode_expr).await?;
                         let __resp = __call.recv_root_response().await?;
                         #rt::__private::decode_client_value::<#ret_ty>(&__call, &__resp).await
                     }
@@ -1428,8 +1448,7 @@ fn generate_client_struct(
                         #(#sig_params),*
                     ) -> #rt::__private::Result<#ret_ty> {
                         let mut __call = self.peer.open_call(#instance_name, #wire_func).await?;
-                        let __req = #rt::__private::encode_client_value(&__call, #encode_expr).await?;
-                        __call.send_root_request(&__req).await?;
+                        #rt::__private::send_client_value(&__call, #encode_expr).await?;
                         let __resp = __call.recv_root_response().await?;
                         #rt::__private::decode_client_value::<#ret_ty>(&__call, &__resp).await
                     }
@@ -1449,8 +1468,7 @@ fn generate_client_struct(
                         #(#sig_params),*
                     ) -> #rt::__private::Result<#ret_ty> {
                         let mut __call = self.peer.open_call(#instance_name, #wire_func).await?;
-                        let __req = #rt::__private::encode_client_value(&__call, #encode_expr).await?;
-                        __call.send_root_request(&__req).await?;
+                        #rt::__private::send_client_value(&__call, #encode_expr).await?;
                         let __resp = __call.recv_root_response().await?;
                         #rt::__private::decode_client_value::<#ret_ty>(&__call, &__resp).await
                     }
@@ -1816,6 +1834,7 @@ fn generate_server_resource_enum(ctx: &IfaceContext<'_>) -> TokenStream {
                 __R: #rt::__private::ResourceSlotAccess<#marker, __H::#assoc>,
             {
                 const MIN_WIRE_SIZE: usize = 4;
+                const CONTAINS_RESOURCES: bool = true;
 
                 fn rpc_encode(
                     self,
@@ -1836,6 +1855,7 @@ fn generate_server_resource_enum(ctx: &IfaceContext<'_>) -> TokenStream {
                 __R: #rt::__private::ResourceSlotAccess<#marker, __H::#assoc>,
             {
                 const MIN_WIRE_SIZE: usize = 4;
+                const CONTAINS_RESOURCES: bool = true;
 
                 fn rpc_decode(
                     __dec: &mut #rt::__private::Decoder<'_, __R>,
@@ -1920,10 +1940,13 @@ fn contains_any_handle(resolve: &Resolve, ty: Type) -> bool {
             res.ok.is_some_and(|t| contains_any_handle(resolve, t))
                 || res.err.is_some_and(|t| contains_any_handle(resolve, t))
         }
+        TypeDefKind::Future(Some(inner)) | TypeDefKind::Stream(Some(inner)) => {
+            contains_any_handle(resolve, *inner)
+        }
         TypeDefKind::Flags(_)
         | TypeDefKind::Enum(_)
-        | TypeDefKind::Future(_)
-        | TypeDefKind::Stream(_)
+        | TypeDefKind::Future(None)
+        | TypeDefKind::Stream(None)
         | TypeDefKind::Unknown => false,
     }
 }
@@ -2009,6 +2032,14 @@ fn wire_to_server_expr(ctx: &IfaceContext<'_>, ty: Type, expr: TokenStream) -> T
                 }
             });
             quote!(match #expr { #(#arms),* })
+        }
+        TypeDefKind::Stream(Some(inner)) => {
+            let body = wire_to_server_expr(ctx, *inner, quote!(__v));
+            quote!(#expr.__map_inbound(|__v| #body))
+        }
+        TypeDefKind::Future(Some(inner)) => {
+            let body = wire_to_server_expr(ctx, *inner, quote!(__v));
+            quote!(#expr.__map_inbound(|__v| #body))
         }
         _ => expr,
     }
@@ -2101,6 +2132,14 @@ fn server_to_wire_expr(ctx: &IfaceContext<'_>, ty: Type, expr: TokenStream) -> T
                 }
             });
             quote!(match #expr { #(#arms),* })
+        }
+        TypeDefKind::Stream(Some(inner)) => {
+            let body = server_to_wire_expr(ctx, *inner, quote!(__v));
+            quote!(#expr.__map_outbound(|__v| #body))
+        }
+        TypeDefKind::Future(Some(inner)) => {
+            let body = server_to_wire_expr(ctx, *inner, quote!(__v));
+            quote!(#expr.__map_outbound(|__v| #body))
         }
         _ => expr,
     }

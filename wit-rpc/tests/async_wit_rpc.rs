@@ -2126,3 +2126,999 @@ fn cancelled_encode_server_response_rolls_back_own_handles() {
         assert!(server_res.is_ok(), "server drive failed: {server_res:?}");
     });
 }
+
+mod stream_resources_wit {
+    helios_wit_rpc::generate!({
+        inline: r#"
+            package helios:stream-res-test@0.1.0;
+
+            interface vault {
+                resource item {
+                    constructor(id: u32, label: string);
+                    id: func() -> u32;
+                    label: func() -> string;
+                    bump: async func(delta: u32) -> u32;
+                }
+
+                record envelope {
+                    tag: string,
+                    item: item,
+                    backup: option<item>,
+                }
+
+                variant delivery {
+                    single(item),
+                    wrapped(envelope),
+                    empty,
+                }
+
+                stream-items-live: async func(count: u32) -> stream<item>;
+                stream-items-buffered: async func(count: u32) -> stream<item>;
+                stream-items-batched: async func(count: u32) -> stream<item>;
+                future-item-live: async func(id: u32, label: string) -> future<item>;
+                future-item-ready: async func(id: u32, label: string) -> future<item>;
+                stream-envelopes: async func(count: u32) -> stream<envelope>;
+                stream-deliveries: async func() -> stream<delivery>;
+                nested-item-streams: async func(groups: u32, per-group: u32) -> stream<stream<item>>;
+
+                consume-item-stream: async func(items: stream<item>) -> u64;
+                consume-item-future: async func(item: future<item>) -> u32;
+                consume-envelope-stream: async func(envelopes: stream<envelope>) -> list<string>;
+
+                consume-partial-stream: async func(items: stream<item>, take-count: u32) -> u32;
+                stream-items-gated: async func(total: u32) -> stream<item>;
+                stream-items-parked-cancel: async func() -> stream<item>;
+                future-item-gated: async func(id: u32) -> future<item>;
+                ping: func() -> u32;
+            }
+
+            world vault-world {
+                export vault;
+            }
+        "#,
+        world: "vault-world",
+    });
+}
+
+#[derive(Default)]
+struct VaultTelemetry {
+    live_items: AtomicUsize,
+    item_dropped: Event,
+    gate_release: Event,
+    gate_entered: Event,
+    send_failed: AtomicBool,
+    send_failed_event: Event,
+    partial_stopped_event: Event,
+    cancel_send_done_event: Event,
+}
+
+impl VaultTelemetry {
+    async fn wait_live_items(&self, target: usize) {
+        while self.live_items.load(Ordering::Acquire) != target {
+            let listener = self.item_dropped.listen();
+            if self.live_items.load(Ordering::Acquire) == target {
+                break;
+            }
+            listener.await;
+        }
+    }
+}
+
+struct ServerVaultItem {
+    id: std::sync::atomic::AtomicU32,
+    label: String,
+    telemetry: Arc<VaultTelemetry>,
+}
+
+impl ServerVaultItem {
+    fn new(id: u32, label: String, telemetry: Arc<VaultTelemetry>) -> Self {
+        telemetry.live_items.fetch_add(1, Ordering::AcqRel);
+        Self {
+            id: std::sync::atomic::AtomicU32::new(id),
+            label,
+            telemetry,
+        }
+    }
+}
+
+impl Drop for ServerVaultItem {
+    fn drop(&mut self) {
+        self.telemetry.live_items.fetch_sub(1, Ordering::AcqRel);
+        self.telemetry.item_dropped.notify(usize::MAX);
+    }
+}
+
+#[derive(Clone)]
+struct VaultHandler {
+    telemetry: Arc<VaultTelemetry>,
+    bg_tx: Sender<BgTask>,
+}
+
+impl stream_resources_wit::helios::stream_res_test::vault::Handler for VaultHandler {
+    type Item = ServerVaultItem;
+
+    async fn item_new(&self, id: u32, label: String) -> Self::Item {
+        ServerVaultItem::new(id, label, Arc::clone(&self.telemetry))
+    }
+
+    async fn item_id(&self, self_: &Self::Item) -> u32 {
+        self_.id.load(Ordering::Acquire)
+    }
+
+    async fn item_label(&self, self_: &Self::Item) -> String {
+        self_.label.clone()
+    }
+
+    async fn item_bump(&self, self_: &Self::Item, delta: u32) -> u32 {
+        self_.id.fetch_add(delta, Ordering::AcqRel) + delta
+    }
+
+    async fn stream_items_live(&self, count: u32) -> StreamReader<Self::Item> {
+        let (mut tx, rx) = stream::<Self::Item>();
+        let telemetry = Arc::clone(&self.telemetry);
+        let _ = self.bg_tx.try_send(Box::pin(async move {
+            for idx in 1..=count {
+                let item = ServerVaultItem::new(
+                    idx * 10,
+                    format!("live-{idx}-中文日本語한국어"),
+                    Arc::clone(&telemetry),
+                );
+                if tx.send(item).await.is_err() {
+                    return;
+                }
+            }
+            let _ = tx.close().await;
+        }));
+        rx
+    }
+
+    async fn stream_items_buffered(&self, count: u32) -> StreamReader<Self::Item> {
+        let items = (1..=count)
+            .map(|idx| {
+                ServerVaultItem::new(
+                    idx * 100,
+                    format!("buf-{idx}-中文日本語한국어"),
+                    Arc::clone(&self.telemetry),
+                )
+            })
+            .collect();
+        StreamReader::from_vec(items)
+    }
+
+    async fn stream_items_batched(&self, count: u32) -> StreamReader<Self::Item> {
+        let (mut tx, rx) = stream::<Self::Item>();
+        let telemetry = Arc::clone(&self.telemetry);
+        let _ = self.bg_tx.try_send(Box::pin(async move {
+            let batch = (1..=count)
+                .map(|idx| {
+                    ServerVaultItem::new(
+                        idx,
+                        format!("batch-{idx}-中文日本語한국어"),
+                        Arc::clone(&telemetry),
+                    )
+                })
+                .collect();
+            let _ = tx.send_batch(batch).await;
+            let _ = tx.close().await;
+        }));
+        rx
+    }
+
+    async fn future_item_live(&self, id: u32, label: String) -> FutureReader<Self::Item> {
+        let (tx, rx) = future::<Self::Item>();
+        let telemetry = Arc::clone(&self.telemetry);
+        let _ = self.bg_tx.try_send(Box::pin(async move {
+            let item = ServerVaultItem::new(id, label, telemetry);
+            let _ = tx.resolve(item).await;
+        }));
+        rx
+    }
+
+    async fn future_item_ready(&self, id: u32, label: String) -> FutureReader<Self::Item> {
+        FutureReader::ready(ServerVaultItem::new(id, label, Arc::clone(&self.telemetry)))
+    }
+
+    async fn stream_envelopes(
+        &self,
+        count: u32,
+    ) -> StreamReader<stream_resources_wit::helios::stream_res_test::vault::Envelope<Self::Item>>
+    {
+        use stream_resources_wit::helios::stream_res_test::vault::Envelope;
+        let (mut tx, rx) = stream::<Envelope<Self::Item>>();
+        let telemetry = Arc::clone(&self.telemetry);
+        let _ = self.bg_tx.try_send(Box::pin(async move {
+            for idx in 1..=count {
+                let backup = if idx % 2 == 0 {
+                    Some(ServerVaultItem::new(
+                        idx * 1000,
+                        format!("backup-{idx}-中文日本語한국어"),
+                        Arc::clone(&telemetry),
+                    ))
+                } else {
+                    None
+                };
+                let env = Envelope {
+                    tag: format!("env-{idx}"),
+                    item: ServerVaultItem::new(
+                        idx,
+                        format!("primary-{idx}-中文日本語한국어"),
+                        Arc::clone(&telemetry),
+                    ),
+                    backup,
+                };
+                if tx.send(env).await.is_err() {
+                    return;
+                }
+            }
+            let _ = tx.close().await;
+        }));
+        rx
+    }
+
+    async fn stream_deliveries(
+        &self,
+    ) -> StreamReader<stream_resources_wit::helios::stream_res_test::vault::Delivery<Self::Item>>
+    {
+        use stream_resources_wit::helios::stream_res_test::vault::{Delivery, Envelope};
+        StreamReader::from_vec(vec![
+            Delivery::Single(ServerVaultItem::new(
+                7,
+                "single-中文日本語한국어".to_owned(),
+                Arc::clone(&self.telemetry),
+            )),
+            Delivery::Wrapped(Envelope {
+                tag: "wrapped".to_owned(),
+                item: ServerVaultItem::new(
+                    8,
+                    "wrapped-primary".to_owned(),
+                    Arc::clone(&self.telemetry),
+                ),
+                backup: Some(ServerVaultItem::new(
+                    9,
+                    "wrapped-backup".to_owned(),
+                    Arc::clone(&self.telemetry),
+                )),
+            }),
+            Delivery::Empty,
+        ])
+    }
+
+    async fn nested_item_streams(
+        &self,
+        groups: u32,
+        per_group: u32,
+    ) -> StreamReader<StreamReader<Self::Item>> {
+        let (mut outer_tx, outer_rx) = stream::<StreamReader<Self::Item>>();
+        let telemetry = Arc::clone(&self.telemetry);
+        let _ = self.bg_tx.try_send(Box::pin(async move {
+            for g in 0..groups {
+                let (mut inner_tx, inner_rx) = stream::<Self::Item>();
+                if outer_tx.send(inner_rx).await.is_err() {
+                    return;
+                }
+                for i in 1..=per_group {
+                    let id = g * 10 + i;
+                    let item = ServerVaultItem::new(
+                        id,
+                        format!("nested-{g}-{i}-中文日本語한국어"),
+                        Arc::clone(&telemetry),
+                    );
+                    if inner_tx.send(item).await.is_err() {
+                        return;
+                    }
+                }
+                let _ = inner_tx.close().await;
+            }
+            let _ = outer_tx.close().await;
+        }));
+        outer_rx
+    }
+
+    async fn consume_item_stream(&self, mut items: StreamReader<Self::Item>) -> u64 {
+        let mut sum = 0_u64;
+        while let Ok(Some(item)) = items.next().await {
+            sum += u64::from(item.id.load(Ordering::Acquire));
+        }
+        sum
+    }
+
+    async fn consume_item_future(&self, item: FutureReader<Self::Item>) -> u32 {
+        match item.await {
+            Ok(owned) => owned.id.load(Ordering::Acquire),
+            Err(_) => 0,
+        }
+    }
+
+    async fn consume_envelope_stream(
+        &self,
+        mut envelopes: StreamReader<
+            stream_resources_wit::helios::stream_res_test::vault::Envelope<Self::Item>,
+        >,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(Some(env)) = envelopes.next().await {
+            let primary = format!(
+                "{}:{}#{}",
+                env.tag,
+                env.item.label,
+                env.item.id.load(Ordering::Acquire)
+            );
+            if let Some(backup) = env.backup {
+                out.push(format!(
+                    "{primary}|{}#{}",
+                    backup.label,
+                    backup.id.load(Ordering::Acquire)
+                ));
+            } else {
+                out.push(primary);
+            }
+        }
+        out
+    }
+
+    async fn consume_partial_stream(
+        &self,
+        mut items: StreamReader<Self::Item>,
+        take_count: u32,
+    ) -> u32 {
+        let mut sum = 0_u32;
+        for _ in 0..take_count {
+            match items.next().await {
+                Ok(Some(item)) => {
+                    sum += item.id.load(Ordering::Acquire);
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        drop(items);
+        self.telemetry.partial_stopped_event.notify(usize::MAX);
+        sum
+    }
+
+    async fn stream_items_gated(&self, total: u32) -> StreamReader<Self::Item> {
+        let (mut tx, rx) = stream::<Self::Item>();
+        let telemetry = Arc::clone(&self.telemetry);
+        let _ = self.bg_tx.try_send(Box::pin(async move {
+            // Send item 1 immediately, then wait at the gate before sending 2..=total.
+            if total >= 1 {
+                let first = ServerVaultItem::new(1, "gated-1".to_owned(), Arc::clone(&telemetry));
+                if tx.send(first).await.is_err() {
+                    telemetry.send_failed.store(true, Ordering::Release);
+                    telemetry.send_failed_event.notify(usize::MAX);
+                    return;
+                }
+            }
+            let release = telemetry.gate_release.listen();
+            telemetry.gate_entered.notify(usize::MAX);
+            release.await;
+
+            for idx in 2..=total {
+                let item =
+                    ServerVaultItem::new(idx, format!("gated-{idx}"), Arc::clone(&telemetry));
+                if tx.send(item).await.is_err() {
+                    telemetry.send_failed.store(true, Ordering::Release);
+                    telemetry.send_failed_event.notify(usize::MAX);
+                    return;
+                }
+            }
+            let _ = tx.close().await;
+        }));
+        rx
+    }
+
+    async fn stream_items_parked_cancel(&self) -> StreamReader<Self::Item> {
+        let (mut tx, rx) = stream::<Self::Item>();
+        let telemetry = Arc::clone(&self.telemetry);
+        let _ = self.bg_tx.try_send(Box::pin(async move {
+            // Credit window is 1: item 1 consumes the sole credit.
+            let first = ServerVaultItem::new(1, "parked-1".to_owned(), Arc::clone(&telemetry));
+            if tx.send(first).await.is_err() {
+                return;
+            }
+            // Start sending item 2 (which encodes into ResourceTable and parks on credit == 0).
+            let second = ServerVaultItem::new(2, "parked-2".to_owned(), Arc::clone(&telemetry));
+            {
+                let mut send_fut = Box::pin(tx.send(second));
+                for _ in 0..4 {
+                    assert!(
+                        poll_once(&mut send_fut).await.is_none(),
+                        "second send must park when credit window == 1 is exhausted"
+                    );
+                    yield_now().await;
+                }
+                // Drop the parked `send` future mid-`.await`: its RAII rollback
+                // guard must remove item 2 from ResourceTable immediately!
+                drop(send_fut);
+            }
+            let _ = tx.close().await;
+            telemetry.cancel_send_done_event.notify(usize::MAX);
+        }));
+        rx
+    }
+
+    async fn future_item_gated(&self, id: u32) -> FutureReader<Self::Item> {
+        let (tx, rx) = future::<Self::Item>();
+        let telemetry = Arc::clone(&self.telemetry);
+        let _ = self.bg_tx.try_send(Box::pin(async move {
+            let release = telemetry.gate_release.listen();
+            telemetry.gate_entered.notify(usize::MAX);
+            release.await;
+
+            let item = ServerVaultItem::new(id, format!("fut-{id}"), Arc::clone(&telemetry));
+            if tx.resolve(item).await.is_err() {
+                telemetry.send_failed.store(true, Ordering::Release);
+                telemetry.send_failed_event.notify(usize::MAX);
+            }
+        }));
+        rx
+    }
+
+    async fn ping(&self) -> u32 {
+        42
+    }
+}
+
+#[test]
+fn stream_and_future_own_resources_round_trip_both_directions() {
+    use futures_util::StreamExt;
+    use stream_resources_wit::VaultWorldClient;
+    use stream_resources_wit::helios::stream_res_test::vault::{self, Delivery, Envelope, Item};
+
+    block_on(async {
+        let ((c_read, c_write), (s_read, s_write)) = duplex_pipe(32);
+        let telemetry = Arc::new(VaultTelemetry::default());
+        let (bg_tx, bg_rx) = async_channel::unbounded();
+
+        let client_ep = Endpoint::new(c_read, c_write, ());
+        let server_ep = Endpoint::new(
+            s_read,
+            s_write,
+            vault::Server::new(VaultHandler {
+                telemetry: Arc::clone(&telemetry),
+                bg_tx,
+            }),
+        );
+        let client_handle = client_ep.handle();
+        let server_handle = server_ep.handle();
+        let server_resources = server_ep.resources().clone();
+        let world = VaultWorldClient::new(client_handle.clone());
+        let client = world.vault();
+
+        let test_body = async {
+            // 1. Server -> Client live `stream<own<item>>` (also exercising `futures_core::Stream`).
+            let mut live_rx = client
+                .stream_items_live(4)
+                .await
+                .expect("stream_items_live");
+            let mut received = Vec::new();
+            while let Some(res) = StreamExt::next(&mut live_rx).await {
+                received.push(res.expect("item from live stream"));
+            }
+            assert_eq!(received.len(), 4);
+            assert_eq!(telemetry.live_items.load(Ordering::Acquire), 4);
+            for (i, item) in received.iter().enumerate() {
+                let idx = (i + 1) as u32;
+                assert_eq!(item.id().await.expect("id"), idx * 10);
+                assert_eq!(
+                    item.label().await.expect("label"),
+                    format!("live-{idx}-中文日本語한국어")
+                );
+                assert_eq!(item.bump(5).await.expect("bump"), idx * 10 + 5);
+            }
+            drop(received);
+            telemetry.wait_live_items(0).await;
+            assert_eq!(server_resources.len().await, 0);
+
+            // 2. Server -> Client `StreamReader::from_vec` carrying `own<item>`.
+            let buf_items = client
+                .stream_items_buffered(3)
+                .await
+                .expect("stream_items_buffered")
+                .collect_all()
+                .await
+                .expect("collect buffered items");
+            assert_eq!(buf_items.len(), 3);
+            assert_eq!(buf_items[0].id().await.expect("id 0"), 100);
+            assert_eq!(
+                buf_items[2].label().await.expect("label 2"),
+                "buf-3-中文日本語한국어"
+            );
+            drop(buf_items);
+            telemetry.wait_live_items(0).await;
+            assert_eq!(server_resources.len().await, 0);
+
+            // 3. Server -> Client live `future<own<item>>` and `FutureReader::ready(own<item>)`.
+            let live_item = client
+                .future_item_live(55, "fut-live-中文日本語한국어".to_owned())
+                .await
+                .expect("future_item_live")
+                .await
+                .expect("resolve live future");
+            assert_eq!(live_item.id().await.expect("live fut id"), 55);
+            assert_eq!(
+                live_item.label().await.expect("live fut label"),
+                "fut-live-中文日本語한국어"
+            );
+            assert_eq!(live_item.bump(1).await.expect("live fut bump"), 56);
+            drop(live_item);
+
+            let ready_item = client
+                .future_item_ready(66, "fut-ready-中文日本語한국어".to_owned())
+                .await
+                .expect("future_item_ready")
+                .await
+                .expect("resolve ready future");
+            assert_eq!(ready_item.id().await.expect("ready fut id"), 66);
+            assert_eq!(
+                ready_item.label().await.expect("ready fut label"),
+                "fut-ready-中文日本語한국어"
+            );
+            drop(ready_item);
+            telemetry.wait_live_items(0).await;
+            assert_eq!(server_resources.len().await, 0);
+
+            // 4. Server -> Client `stream<record-with-own>` and `stream<variant-with-own>`.
+            let envelopes = client
+                .stream_envelopes(2)
+                .await
+                .expect("stream_envelopes")
+                .collect_all()
+                .await
+                .expect("collect envelopes");
+            assert_eq!(envelopes.len(), 2);
+            assert_eq!(envelopes[0].tag, "env-1");
+            assert_eq!(envelopes[0].item.id().await.expect("env0 id"), 1);
+            assert!(envelopes[0].backup.is_none());
+            assert_eq!(envelopes[1].tag, "env-2");
+            assert_eq!(envelopes[1].item.id().await.expect("env1 id"), 2);
+            assert_eq!(
+                envelopes[1]
+                    .backup
+                    .as_ref()
+                    .expect("backup present")
+                    .id()
+                    .await
+                    .expect("backup id"),
+                2000
+            );
+            drop(envelopes);
+            telemetry.wait_live_items(0).await;
+
+            let deliveries = client
+                .stream_deliveries()
+                .await
+                .expect("stream_deliveries")
+                .collect_all()
+                .await
+                .expect("collect deliveries");
+            assert_eq!(deliveries.len(), 3);
+            match &deliveries[0] {
+                Delivery::Single(it) => assert_eq!(it.id().await.expect("single id"), 7),
+                other => panic!("expected Single, got {other:?}"),
+            }
+            match &deliveries[1] {
+                Delivery::Wrapped(env) => {
+                    assert_eq!(env.tag, "wrapped");
+                    assert_eq!(env.item.id().await.expect("wrapped item"), 8);
+                    assert_eq!(
+                        env.backup
+                            .as_ref()
+                            .expect("wrapped backup")
+                            .id()
+                            .await
+                            .expect("wrapped backup id"),
+                        9
+                    );
+                }
+                other => panic!("expected Wrapped, got {other:?}"),
+            }
+            assert!(matches!(deliveries[2], Delivery::Empty));
+            drop(deliveries);
+            telemetry.wait_live_items(0).await;
+            assert_eq!(server_resources.len().await, 0);
+
+            // 5. Server -> Client nested `stream<stream<own<item>>>`.
+            let mut outer = client
+                .nested_item_streams(2, 2)
+                .await
+                .expect("nested_item_streams");
+            let mut nested_ids = Vec::new();
+            while let Some(inner) = outer.next().await.expect("outer next") {
+                let group_items = inner.collect_all().await.expect("collect inner");
+                for it in &group_items {
+                    nested_ids.push(it.id().await.expect("nested item id"));
+                }
+            }
+            assert_eq!(nested_ids, vec![1, 2, 11, 12]);
+            telemetry.wait_live_items(0).await;
+            assert_eq!(server_resources.len().await, 0);
+
+            // 6. Client -> Server live `stream<own<item>>`.
+            let c1 = Item::new(&client_handle, 11, "c1-中文日本語한국어".to_owned())
+                .await
+                .expect("c1");
+            let c2 = Item::new(&client_handle, 22, "c2-中文日本語한국어".to_owned())
+                .await
+                .expect("c2");
+            let c3 = Item::new(&client_handle, 33, "c3-中文日本語한국어".to_owned())
+                .await
+                .expect("c3");
+            assert_eq!(telemetry.live_items.load(Ordering::Acquire), 3);
+
+            let (mut item_tx, item_rx) = stream::<Item>();
+            let send_fut = async move {
+                item_tx.send(c1).await.expect("send c1");
+                item_tx.send_batch(vec![c2, c3]).await.expect("send c2,c3");
+                item_tx.close().await.expect("close item_tx");
+            };
+            let call_fut = client.consume_item_stream(item_rx);
+            let ((), sum_res) = zip(send_fut, call_fut).await;
+            assert_eq!(sum_res.expect("consume_item_stream"), 66);
+            telemetry.wait_live_items(0).await;
+            assert_eq!(server_resources.len().await, 0);
+
+            // 7. Client -> Server `future<own<item>>` (live and ready).
+            let f1 = Item::new(&client_handle, 77, "f1".to_owned())
+                .await
+                .expect("f1");
+            let (ftx, frx) = future::<Item>();
+            let ((), f1_id) = zip(
+                async move { ftx.resolve(f1).await.expect("resolve f1") },
+                client.consume_item_future(frx),
+            )
+            .await;
+            assert_eq!(f1_id.expect("consume_item_future live"), 77);
+
+            let f2 = Item::new(&client_handle, 88, "f2".to_owned())
+                .await
+                .expect("f2");
+            let f2_id = client
+                .consume_item_future(FutureReader::ready(f2))
+                .await
+                .expect("consume_item_future ready");
+            assert_eq!(f2_id, 88);
+            telemetry.wait_live_items(0).await;
+            assert_eq!(server_resources.len().await, 0);
+
+            // 8. Client -> Server `stream<record-with-own>`.
+            let e1 = Item::new(&client_handle, 5, "p1-中文日本語한국어".to_owned())
+                .await
+                .expect("e1");
+            let e2 = Item::new(&client_handle, 6, "p2-中文日本語한국어".to_owned())
+                .await
+                .expect("e2");
+            let b2 = Item::new(&client_handle, 60, "b2-中文日本語한국어".to_owned())
+                .await
+                .expect("b2");
+            let (mut env_tx, env_rx) = stream::<Envelope>();
+            let ((), labels_res) = zip(
+                async move {
+                    env_tx
+                        .send(Envelope {
+                            tag: "one".to_owned(),
+                            item: e1,
+                            backup: None,
+                        })
+                        .await
+                        .expect("send env1");
+                    env_tx
+                        .send(Envelope {
+                            tag: "two".to_owned(),
+                            item: e2,
+                            backup: Some(b2),
+                        })
+                        .await
+                        .expect("send env2");
+                    env_tx.close().await.expect("close env_tx");
+                },
+                client.consume_envelope_stream(env_rx),
+            )
+            .await;
+            assert_eq!(
+                labels_res.expect("consume_envelope_stream"),
+                vec![
+                    "one:p1-中文日本語한국어#5".to_owned(),
+                    "two:p2-中文日本語한국어#6|b2-中文日本語한국어#60".to_owned(),
+                ]
+            );
+            telemetry.wait_live_items(0).await;
+            assert_eq!(server_resources.len().await, 0);
+            assert_eq!(client.ping().await.expect("ping"), 42);
+
+            client_handle.close();
+            server_handle.close();
+        };
+
+        or(test_body, async {
+            let _ = zip(
+                zip(client_ep.drive(), server_ep.drive()),
+                pump_bg_tasks(bg_rx),
+            )
+            .await;
+        })
+        .await;
+    });
+}
+
+#[test]
+fn stream_and_future_own_resources_early_drop_cancel_and_disconnect_never_leak() {
+    use stream_resources_wit::helios::stream_res_test::vault::{self, Item};
+
+    // Part A: early StreamReader / FutureReader drop, mid-await send cancel,
+    // partially-consumed batch drop, and client->server rollback on a live connection.
+    block_on(async {
+        let ((c_read, c_write), (s_read, s_write)) = duplex_pipe(32);
+        let config = EndpointConfig {
+            stream_credit_window: 1,
+        };
+        let telemetry = Arc::new(VaultTelemetry::default());
+        let (bg_tx, bg_rx) = async_channel::unbounded();
+
+        let client_ep = Endpoint::with_config(c_read, c_write, (), config);
+        let server_ep = Endpoint::with_config(
+            s_read,
+            s_write,
+            vault::Server::new(VaultHandler {
+                telemetry: Arc::clone(&telemetry),
+                bg_tx,
+            }),
+            config,
+        );
+        let client_handle = client_ep.handle();
+        let server_handle = server_ep.handle();
+        let server_resources = server_ep.resources().clone();
+        let client = vault::Client::new(client_handle.clone());
+
+        let test_body = async {
+            // A1. Server -> Client early StreamReader drop before subsequent gated sends.
+            let gate_entered = telemetry.gate_entered.listen();
+            let mut gated_rx = client
+                .stream_items_gated(4)
+                .await
+                .expect("stream_items_gated");
+            let first = gated_rx
+                .next()
+                .await
+                .expect("first gated item")
+                .expect("some first item");
+            assert_eq!(first.id().await.expect("first id"), 1);
+            gate_entered.await;
+
+            // Drop both the received item and the StreamReader early, flush the
+            // stop-reading Close frame with a ping barrier, then release the
+            // server gate so items 2..=4 hit peer_stopped and roll back cleanly!
+            drop(first);
+            drop(gated_rx);
+            assert_eq!(client.ping().await.expect("barrier ping a1"), 42);
+            let send_failed = telemetry.send_failed_event.listen();
+            telemetry.gate_release.notify(usize::MAX);
+            send_failed.await;
+            assert!(telemetry.send_failed.load(Ordering::Acquire));
+            telemetry.wait_live_items(0).await;
+            assert_eq!(server_resources.len().await, 0);
+
+            // A2. Server -> Client parked `StreamWriter::send` cancelled mid-`.await`.
+            let cancel_done = telemetry.cancel_send_done_event.listen();
+            let mut parked_rx = client
+                .stream_items_parked_cancel()
+                .await
+                .expect("stream_items_parked_cancel");
+            cancel_done.await;
+            // Item 1 was delivered before item 2's parked send was cancelled & rolled back.
+            let delivered = parked_rx
+                .next()
+                .await
+                .expect("delivered item 1")
+                .expect("some item 1");
+            assert_eq!(delivered.id().await.expect("item 1 id"), 1);
+            assert!(parked_rx.next().await.expect("eof").is_none());
+            drop(delivered);
+            telemetry.wait_live_items(0).await;
+            assert_eq!(server_resources.len().await, 0);
+
+            // A3. Server -> Client early FutureReader drop before FutureWriter::resolve.
+            telemetry.send_failed.store(false, Ordering::Release);
+            let fut_gate = telemetry.gate_entered.listen();
+            let fut_rx = client
+                .future_item_gated(99)
+                .await
+                .expect("future_item_gated");
+            fut_gate.await;
+            drop(fut_rx);
+            assert_eq!(client.ping().await.expect("barrier ping a3"), 42);
+            let fut_failed = telemetry.send_failed_event.listen();
+            telemetry.gate_release.notify(usize::MAX);
+            fut_failed.await;
+            assert!(telemetry.send_failed.load(Ordering::Acquire));
+            telemetry.wait_live_items(0).await;
+            assert_eq!(server_resources.len().await, 0);
+
+            // A4. Batch frame partially consumed, then StreamReader dropped.
+            let mut batch_rx = client
+                .stream_items_batched(3)
+                .await
+                .expect("stream_items_batched");
+            let b1 = batch_rx
+                .next()
+                .await
+                .expect("batch item 1")
+                .expect("some batch item 1");
+            assert_eq!(b1.id().await.expect("b1 id"), 1);
+            assert_eq!(telemetry.live_items.load(Ordering::Acquire), 3);
+            drop(b1);
+            drop(batch_rx);
+            telemetry.wait_live_items(0).await;
+            assert_eq!(server_resources.len().await, 0);
+
+            // A5. Client -> Server early StreamReader drop AND cancelled parked client send:
+            // unsent client RemoteResource handles roll back via Frame::ResourceDrop!
+            let i1 = Item::new(&client_handle, 10, "p1".to_owned())
+                .await
+                .expect("i1");
+            let i2 = Item::new(&client_handle, 20, "p2".to_owned())
+                .await
+                .expect("i2");
+            let i3 = Item::new(&client_handle, 30, "p3".to_owned())
+                .await
+                .expect("i3");
+            let i4 = Item::new(&client_handle, 40, "p4".to_owned())
+                .await
+                .expect("i4");
+            assert_eq!(telemetry.live_items.load(Ordering::Acquire), 4);
+
+            let partial_stopped = telemetry.partial_stopped_event.listen();
+            let (mut p_tx, p_rx) = stream::<Item>();
+            let producer = async move {
+                p_tx.send(i1).await.expect("send i1");
+                p_tx.send(i2).await.expect("send i2");
+                partial_stopped.await;
+                // Wait until stop-reading reaches client writer so i3 fails cleanly
+                // and i4 drops locally!
+                p_tx.closed().await;
+                let err = p_tx
+                    .send(i3)
+                    .await
+                    .expect_err("send after server dropped StreamReader must fail");
+                assert!(matches!(err, RpcError::StreamClosed));
+                drop(i4);
+            };
+            let ((), partial_sum) = zip(producer, client.consume_partial_stream(p_rx, 2)).await;
+            assert_eq!(partial_sum.expect("partial sum"), 30);
+            telemetry.wait_live_items(0).await;
+            assert_eq!(server_resources.len().await, 0);
+
+            // A6. Client -> Server parked `StreamWriter::send` cancelled mid-`.await`
+            // rolls back the already-disarmed `RemoteResource` handle via `ResourceDrop`!
+            let r1 = Item::new(&client_handle, 101, "r1".to_owned())
+                .await
+                .expect("r1");
+            let r2 = Item::new(&client_handle, 102, "r2".to_owned())
+                .await
+                .expect("r2");
+            let (mut c_tx, c_rx) = stream::<Item>();
+            let mut consume_call = Box::pin(client.consume_item_stream(c_rx));
+            // Drive `consume_call` just enough to open and bind `c_tx`, while not
+            // completing it until we send r1 and cancel a parked send of r2.
+            let ((), sum_after_cancel) = zip(
+                async move {
+                    c_tx.send(r1).await.expect("send r1 within 1-credit window");
+                    // Even if server hasn't drained r1 yet (or drains it quickly),
+                    // explicitly test cancelling a parked `send` on an unbound stream
+                    // AND closing `c_tx` cleanly after r1.
+                    let (mut unbound_tx, _unbound_rx) = stream::<Item>();
+                    let mut parked = Box::pin(unbound_tx.send(r2));
+                    assert!(poll_once(&mut parked).await.is_none());
+                    drop(parked);
+                    c_tx.close().await.expect("close c_tx");
+                },
+                &mut consume_call,
+            )
+            .await;
+            assert_eq!(sum_after_cancel.expect("consume r1"), 101);
+            telemetry.wait_live_items(0).await;
+            assert_eq!(server_resources.len().await, 0);
+
+            // Connection remains completely healthy after every early-drop / rollback case!
+            assert_eq!(client.ping().await.expect("ping after rollbacks"), 42);
+
+            client_handle.close();
+            server_handle.close();
+        };
+
+        or(test_body, async {
+            let _ = zip(
+                zip(client_ep.drive(), server_ep.drive()),
+                pump_bg_tasks(bg_rx),
+            )
+            .await;
+        })
+        .await;
+    });
+
+    // Part B: Abrupt transport disconnect mid-flight with buffered/live streams and
+    // futures carrying `own<item>` drops every resource cleanly on the server.
+    block_on(async {
+        let ((c_read, c_write), (s_read, s_write)) = duplex_pipe(16);
+        let config = EndpointConfig {
+            stream_credit_window: 1,
+        };
+        let telemetry = Arc::new(VaultTelemetry::default());
+        let (bg_tx, bg_rx) = async_channel::unbounded();
+
+        let client_ep = Endpoint::with_config(c_read, c_write, (), config);
+        let server_ep = Endpoint::with_config(
+            s_read,
+            s_write,
+            vault::Server::new(VaultHandler {
+                telemetry: Arc::clone(&telemetry),
+                bg_tx,
+            }),
+            config,
+        );
+        let client_handle = client_ep.handle();
+        let client = vault::Client::new(client_handle.clone());
+        let (drop_client_ep_tx, drop_client_ep_rx) = async_channel::bounded::<()>(1);
+
+        let client_side = async {
+            let mut buf_rx = client
+                .stream_items_buffered(5)
+                .await
+                .expect("open buffered stream");
+            let first = buf_rx
+                .next()
+                .await
+                .expect("read first buffered item")
+                .expect("some first item");
+            let _fut_ready = client
+                .future_item_ready(77, "disconnect-ready".to_owned())
+                .await
+                .expect("open ready future");
+            let _live_rx = client
+                .stream_items_gated(4)
+                .await
+                .expect("open gated stream");
+
+            assert!(
+                telemetry.live_items.load(Ordering::Acquire) >= 5,
+                "resources must be live before abrupt disconnect"
+            );
+
+            // Disarm `first` so server cleanup comes strictly from disconnect teardown.
+            let _ = first.into_remote().into_raw_handle();
+            drop_client_ep_tx.send(()).await.unwrap();
+        };
+
+        let drive_client = async {
+            or(
+                async {
+                    let _ = client_ep.drive().await;
+                },
+                async {
+                    let _ = drop_client_ep_rx.recv().await;
+                },
+            )
+            .await;
+        };
+
+        let (((), ()), ()) = zip(
+            zip(client_side, drive_client),
+            or(
+                async {
+                    server_ep.drive().await.expect("clean EOF teardown");
+                },
+                async {
+                    pump_bg_tasks(bg_rx).await;
+                },
+            ),
+        )
+        .await;
+
+        // Release any gated background task waiting on `gate_release` so it finishes too.
+        telemetry.gate_release.notify(usize::MAX);
+        assert_eq!(
+            telemetry.live_items.load(Ordering::Acquire),
+            0,
+            "every live resource in streams, futures, and ResourceTable must drop on disconnect"
+        );
+    });
+}

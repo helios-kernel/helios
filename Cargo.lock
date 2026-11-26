@@ -4071,6 +4071,7 @@ dependencies = [
 name = "helios-x86-vmm"
 version = "0.1.0"
 dependencies = [
+ "critical-section",
  "helios-hal",
  "helios-kernel",
  "spin 0.9.9",
