@@ -51,11 +51,11 @@ use helios_linux::elf::{self, Image};
 use helios_linux::syscall::{
     self, AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, AccessCheck, Call, Denied, Descriptors, DirListEntry,
     EpollData, ExecError, ExecSpec, Exit, FileAccess, FileStat, Filesystem, LinkOptions, MapError,
-    MemoryFault, MemoryTotals, OpenRequest, Process, ProcessSignals, READY_ERR, READY_HUP,
-    READY_IN, READY_OUT, Region, Resource, Resources, SignalDelivery, SpawnError, SpawnedProcess,
-    SpawnedThread, Start, StdinTryRead, Stdio, Stream, SyscallOutcome, SyscallRestart, System,
-    Termios, TermiosAction, Thread, TimeUpdate, Tty, TtyError, TtyStream, UserMemory,
-    VirtualMemory, Winsize, WriteError,
+    MemoryFault, MemoryTotals, OpenOutcome, OpenRequest, Process, ProcessSignals, READY_ERR,
+    READY_HUP, READY_IN, READY_OUT, Region, Resource, Resources, SignalDelivery, SpawnError,
+    SpawnedProcess, SpawnedThread, Start, StdinTryRead, Stdio, Stream, SyscallOutcome,
+    SyscallRestart, System, Termios, TermiosAction, Thread, TimeUpdate, Tty, TtyError, TtyStream,
+    UserMemory, VirtualMemory, Winsize, WriteError,
 };
 use helios_sync::{TryRead, TryWrite};
 
@@ -292,6 +292,7 @@ struct LinuxTtyState {
     stderr_tty: bool,
     termios: Termios,
     winsize: Winsize,
+    controlling_pty: Option<helios_unix::PtySlave>,
 }
 
 impl LinuxTtyState {
@@ -319,6 +320,7 @@ impl LinuxTtyState {
             stderr_tty,
             termios: Termios::from_flags(stdin_tty, stdin_tty, true),
             winsize: Winsize::DEFAULT,
+            controlling_pty: None,
         }
     }
 
@@ -656,6 +658,7 @@ where
 {
     Linux {
         executable: LinuxExecutable,
+        exe_path: String,
         argv: Vec<String>,
         env: Vec<String>,
         credentials: syscall::Credentials,
@@ -695,6 +698,15 @@ where
     signal_state: WasixSignalState,
     container: Arc<crate::LinuxContainer<StorageImpl>>,
     grants: LinuxGrants,
+    pid: NonZeroU32,
+    ppid: u32,
+    exe_path: String,
+    argv: Vec<String>,
+    env: Vec<String>,
+    cwd_handle: Arc<spin::Mutex<String>>,
+    descriptors_handle: Arc<spin::Mutex<Descriptors<LinuxResources<Net>>>>,
+    credentials_handle: Arc<spin::Mutex<syscall::Credentials>>,
+    proc_signals: Arc<ProcessSignals>,
     /// Process-wide terminal state (`termios`, window size, stream TTY flags).
     /// Never held across `.await`.
     tty: spin::Mutex<LinuxTtyState>,
@@ -882,6 +894,7 @@ where
     StorageImpl: crate::Storage,
 {
     shared: Arc<LinuxShared<CpuImpl, Net, StorageImpl, Space>>,
+    tid: NonZeroU32,
     entropy: crate::EntropyPool,
     thread_cpu_ticks: u64,
     thread_sys_ticks: u64,
@@ -899,9 +912,110 @@ where
             crate::EntropyPool::derive(shared.runtime_state.root_entropy(), personalization);
         Self {
             shared,
+            tid,
             entropy,
             thread_cpu_ticks: 0,
             thread_sys_ticks: 0,
+        }
+    }
+
+    fn caller(&self) -> crate::ProcCaller {
+        crate::ProcCaller {
+            pid: self.shared.pid.get(),
+            tid: self.tid.get(),
+        }
+    }
+
+    async fn refresh_proc_if_needed(&self, base_dir: &str, path: &str) {
+        let touches_pseudo = path.starts_with("/proc")
+            || path.starts_with("/sys")
+            || path.starts_with("/dev")
+            || base_dir.starts_with("/proc")
+            || base_dir.starts_with("/sys");
+        if !touches_pseudo {
+            return;
+        }
+        let registry = self.shared.container.proc_registry();
+        registry.set_cpu_count(crate::online_processor_count().max(1) as u32);
+        registry.set_uptime_nanos(
+            self.shared
+                .runtime_state
+                .uptime_nanos(self.shared.cpu.now().ticks()),
+        );
+
+        let pid = self.shared.pid.get();
+        let cwd = self.shared.cwd_handle.lock().clone();
+        let creds = self.shared.credentials_handle.lock().clone();
+        let pgid = self.shared.proc_signals.pgid();
+        let fds = snapshot_process_fds(&self.shared.descriptors_handle.lock());
+        let ticks_ns = self
+            .shared
+            .cpu
+            .timebase()
+            .ticks_to_nanos(self.shared.process_cpu_ticks.load(Ordering::Relaxed));
+        let utime_ticks = ticks_ns / 10_000_000;
+        registry.update_process(pid, |record| {
+            record.cwd = cwd;
+            record.credentials = creds;
+            record.pgid = pgid;
+            record.fds = fds;
+            record.utime_ticks = utime_ticks;
+        });
+
+        if let Some(service) = self.shared.runtime_state.network_service() {
+            let mut snapshot = crate::ContainerNetSnapshot::default();
+            if let Ok(mac) = service.mac_address(NetworkPortId::new(0)).await {
+                let ipv4 = service
+                    .list_addresses(NetworkPortId::new(0))
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|cidr| (cidr.address().octets(), cidr.prefix_len()))
+                    .collect();
+                snapshot.interfaces.push(crate::NetIfSnapshot {
+                    name: String::from("eth0"),
+                    ifindex: 2,
+                    mac: mac.octets(),
+                    mtu: 1500,
+                    flags: 0x1043, // IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST
+                    operstate: String::from("up"),
+                    arp_type: 1, // ARPHRD_ETHER
+                    ipv4,
+                    rx_bytes: 0,
+                    rx_packets: 0,
+                    rx_errors: 0,
+                    rx_dropped: 0,
+                    tx_bytes: 0,
+                    tx_packets: 0,
+                    tx_errors: 0,
+                    tx_dropped: 0,
+                });
+                if let Ok(routes) = service.list_routes(NetworkPortId::new(0)).await {
+                    for route in routes {
+                        let prefix = route.destination().prefix_len();
+                        let mask = if prefix == 0 {
+                            [0; 4]
+                        } else {
+                            (!0u32 << (32 - prefix.min(32))).to_be_bytes()
+                        };
+                        let gw = route.gateway().octets();
+                        let mut flags = 0x0001u16; // RTF_UP
+                        if gw != [0, 0, 0, 0] {
+                            flags |= 0x0002; // RTF_GATEWAY
+                        }
+                        snapshot.routes.push(crate::NetRouteSnapshot {
+                            iface: String::from("eth0"),
+                            destination: route.destination().address().octets(),
+                            gateway: gw,
+                            mask,
+                            flags,
+                            metric: 0,
+                            mtu: 1500,
+                        });
+                    }
+                }
+            }
+            registry.set_net_snapshot(snapshot);
         }
     }
 
@@ -988,6 +1102,89 @@ where
             last_ts = Some(event.timestamp);
         }
         (out.into_bytes(), last_ts)
+    }
+}
+
+fn process_comm_from_exe(exe: &str) -> String {
+    let base = exe.rsplit('/').next().unwrap_or(exe);
+    let base = if base.is_empty() { "linux" } else { base };
+    base.chars().take(15).collect()
+}
+
+fn snapshot_process_fds<Net: ComponentHostNetwork>(
+    descriptors: &Descriptors<LinuxResources<Net>>,
+) -> Vec<crate::ProcFdEntry> {
+    let mut out = Vec::new();
+    for (idx, slot) in descriptors.entries.iter().enumerate() {
+        let Some(entry) = slot else {
+            continue;
+        };
+        let target = match &entry.descriptor {
+            helios_unix::FileDescriptor::Stdin { .. }
+            | helios_unix::FileDescriptor::Stdout
+            | helios_unix::FileDescriptor::Stderr => String::from("/dev/console"),
+            helios_unix::FileDescriptor::File(open) => open.node().path.clone(),
+            helios_unix::FileDescriptor::Preopen { descriptor, .. } => descriptor.path.clone(),
+            helios_unix::FileDescriptor::PipeRead { inode, .. } => {
+                alloc::format!("pipe:[{}]", inode.attrs().ino)
+            }
+            helios_unix::FileDescriptor::PipeWrite { inode, .. } => {
+                alloc::format!("pipe:[{}]", inode.attrs().ino)
+            }
+            helios_unix::FileDescriptor::FifoRead(r) => {
+                alloc::format!("pipe:[{}]", r.inode().attrs().ino)
+            }
+            helios_unix::FileDescriptor::FifoWrite(w) => {
+                alloc::format!("pipe:[{}]", w.inode().attrs().ino)
+            }
+            helios_unix::FileDescriptor::FifoReadWrite(rw) => {
+                alloc::format!("pipe:[{}]", rw.inode().attrs().ino)
+            }
+            helios_unix::FileDescriptor::PseudoDevice(dev) => String::from(dev.kind.default_path()),
+            helios_unix::FileDescriptor::NullDevice => String::from("/dev/null"),
+            helios_unix::FileDescriptor::PtyMaster(_) => String::from("/dev/ptmx"),
+            helios_unix::FileDescriptor::PtySlave(s) => alloc::format!("/dev/pts/{}", s.index()),
+            helios_unix::FileDescriptor::Socket(_) => alloc::format!("socket:[{idx}]"),
+            helios_unix::FileDescriptor::Event(_) => String::from("anon_inode:[eventfd]"),
+            helios_unix::FileDescriptor::Epoll(_) => String::from("anon_inode:[eventpoll]"),
+        };
+        let pos = match &entry.descriptor {
+            helios_unix::FileDescriptor::File(open) => {
+                open.try_lock_position().map_or(0, |p| p.get())
+            }
+            _ => 0,
+        };
+        out.push(crate::ProcFdEntry {
+            fd: idx as i32,
+            target,
+            pos,
+            flags: u32::from(entry.fdflags()),
+            mnt_id: 1,
+        });
+    }
+    out
+}
+
+struct ProcProcessGuard {
+    registry: crate::ProcRegistry,
+    pid: u32,
+}
+
+impl Drop for ProcProcessGuard {
+    fn drop(&mut self) {
+        self.registry.unregister_process(self.pid);
+    }
+}
+
+struct ProcThreadGuard {
+    registry: crate::ProcRegistry,
+    pid: u32,
+    tid: u32,
+}
+
+impl Drop for ProcThreadGuard {
+    fn drop(&mut self) {
+        self.registry.unregister_thread(self.pid, self.tid);
     }
 }
 
@@ -1476,6 +1673,14 @@ where
         state.winsize = winsize;
         Ok(())
     }
+
+    fn controlling_pty(&self) -> Option<helios_unix::PtySlave> {
+        self.shared.tty.lock().controlling_pty.clone()
+    }
+
+    fn set_controlling_pty(&mut self, pty: Option<helios_unix::PtySlave>) {
+        self.shared.tty.lock().controlling_pty = pty;
+    }
 }
 
 impl<CpuImpl, Net, StorageImpl, Space: UserSpace> Filesystem<LinuxResources<Net>>
@@ -1515,6 +1720,140 @@ where
         }
     }
 
+    fn has_synthetic_dev_fallback(&self) -> bool {
+        false
+    }
+
+    async fn open_descriptor(
+        &mut self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        request: OpenRequest,
+        creds: &syscall::Credentials,
+    ) -> Result<Option<OpenOutcome<LinuxResources<Net>>>, syscall::FsOpError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        self.refresh_proc_if_needed(base_dir, path).await;
+        let now = self.shared.clock.lock().system_time_nanos();
+        let payer = self.shared.launched_instance.storage_payer();
+        let opened = alloc::boxed::Box::pin(self.shared.container.filesystem().open_descriptor_at(
+            base_dir,
+            path,
+            request,
+            creds,
+            Some(self.caller()),
+            now,
+            &payer,
+        ))
+        .await;
+        match opened {
+            Ok(crate::ContainerOpenOutcome::Node {
+                info,
+                container_path,
+                mount_hold,
+            }) => {
+                let mut flags = FsDescriptorFlags::empty();
+                if request.read {
+                    flags |= FsDescriptorFlags::READ;
+                }
+                if request.write {
+                    flags |= FsDescriptorFlags::WRITE;
+                }
+                if request.sync {
+                    flags |= FsDescriptorFlags::FILE_INTEGRITY_SYNC;
+                }
+                if request.dsync {
+                    flags |= FsDescriptorFlags::DATA_INTEGRITY_SYNC;
+                }
+                if info.metadata.kind == NodeKind::Directory {
+                    flags |= FsDescriptorFlags::MUTATE_DIRECTORY;
+                }
+                let desc = FsDescriptor {
+                    path: container_path,
+                    kind: node_kind_to_component(info.metadata.kind),
+                    flags,
+                    identity: Some(crate::vfs::object_identity(&info.metadata)),
+                    mount: mount_hold,
+                    open: None,
+                };
+                Ok(Some(OpenOutcome::Descriptor(
+                    helios_unix::FileDescriptor::File(helios_unix::OpenFile::new(desc)),
+                )))
+            }
+            Ok(crate::ContainerOpenOutcome::PseudoDevice(dev)) => Ok(Some(
+                OpenOutcome::Descriptor(helios_unix::FileDescriptor::PseudoDevice(dev)),
+            )),
+            Ok(crate::ContainerOpenOutcome::ControllingTty {
+                is_console,
+                dev,
+                ino,
+                uid,
+                gid,
+                mode,
+            }) => {
+                let has_rights = self.shared.grants.terminal_input.is_some()
+                    || self.shared.grants.terminal_output.is_some();
+                let tty = self.shared.tty.lock();
+                let has_stdio_tty = has_rights
+                    && (tty.stdin_tty || (is_console && (tty.stdout_tty || tty.stderr_tty)));
+                drop(tty);
+                let fallback = if has_stdio_tty {
+                    let kind = if is_console {
+                        helios_unix::PseudoDeviceKind::Console
+                    } else {
+                        helios_unix::PseudoDeviceKind::Tty
+                    };
+                    let mut p = helios_unix::PseudoDevice::new(kind, request.read, request.write);
+                    p.dev = dev;
+                    p.ino = ino;
+                    p.uid = uid;
+                    p.gid = gid;
+                    p.mode = mode;
+                    Some(helios_unix::FileDescriptor::PseudoDevice(p))
+                } else {
+                    None
+                };
+                Ok(Some(OpenOutcome::ControllingTty { fallback }))
+            }
+            Ok(crate::ContainerOpenOutcome::PtyMaster(master)) => Ok(Some(
+                OpenOutcome::Descriptor(helios_unix::FileDescriptor::PtyMaster(master)),
+            )),
+            Ok(crate::ContainerOpenOutcome::PtySlave { slave, noctty }) => {
+                Ok(Some(OpenOutcome::PtySlave { slave, noctty }))
+            }
+            Ok(crate::ContainerOpenOutcome::FifoRead(reader)) => Ok(Some(OpenOutcome::Descriptor(
+                helios_unix::FileDescriptor::FifoRead(reader),
+            ))),
+            Ok(crate::ContainerOpenOutcome::FifoWrite(writer)) => Ok(Some(
+                OpenOutcome::Descriptor(helios_unix::FileDescriptor::FifoWrite(writer)),
+            )),
+            Ok(crate::ContainerOpenOutcome::FifoReadWrite(rw)) => Ok(Some(
+                OpenOutcome::Descriptor(helios_unix::FileDescriptor::FifoReadWrite(rw)),
+            )),
+            Ok(crate::ContainerOpenOutcome::ProcFd { pid, fd, .. }) => {
+                if pid == self.shared.pid.get() {
+                    Ok(Some(OpenOutcome::ReopenFd { fd }))
+                } else {
+                    Err(syscall::FsOpError::PermissionDenied)
+                }
+            }
+            Err(syscall::FsOpError::Fs(FsError::NoEntry)) => {
+                let servers = self
+                    .shared
+                    .runtime_state
+                    .network_service()
+                    .map(|service| service.dns_servers())
+                    .unwrap_or_default();
+                let desc =
+                    synthetic_etc_open(&self.shared.container, base_dir, path, &servers, request)?;
+                Ok(Some(OpenOutcome::Descriptor(
+                    helios_unix::FileDescriptor::File(helios_unix::OpenFile::new(desc)),
+                )))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn file_lock_key(&self, file: &FsDescriptor) -> Option<helios_unix::FileLockKey> {
         if let Some(id) = file.identity {
             Some(helios_unix::FileLockKey {
@@ -1546,7 +1885,10 @@ where
             None => cwd,
         };
         let fs = self.shared.container.filesystem();
-        match fs.walk_path_for(effective_cwd, path, true, creds).await {
+        match fs
+            .walk_path_for_caller(effective_cwd, path, true, creds, Some(self.caller()))
+            .await
+        {
             Ok((resolved, _)) => Ok(container_resolved_fs_stat(&resolved)),
             Err(syscall::FsOpError::Fs(FsError::NoEntry)) => {
                 let servers = self
@@ -1613,6 +1955,7 @@ where
         creds: &syscall::Credentials,
     ) -> Result<FsDescriptor, syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        self.refresh_proc_if_needed(base_dir, path).await;
         let now = self.shared.clock.lock().system_time_nanos();
         let payer = self.shared.launched_instance.storage_payer();
         let opened = self
@@ -1676,11 +2019,12 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(FileStat, String), syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        self.refresh_proc_if_needed(base_dir, path).await;
         match self
             .shared
             .container
             .filesystem()
-            .stat_at(base_dir, path, follow, creds)
+            .stat_at_for(base_dir, path, follow, creds, Some(self.caller()))
             .await
         {
             Ok((info, resolved_path)) => Ok((container_info_to_stat(&info), resolved_path)),
@@ -1736,11 +2080,12 @@ where
         creds: &syscall::Credentials,
     ) -> Result<(), syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        self.refresh_proc_if_needed(base_dir, path).await;
         match self
             .shared
             .container
             .filesystem()
-            .access_at(base_dir, path, check, creds)
+            .access_at_for(base_dir, path, check, creds, Some(self.caller()))
             .await
         {
             Ok(()) => Ok(()),
@@ -1776,6 +2121,7 @@ where
         offset: u64,
         max_bytes: usize,
     ) -> Result<Bytes, syscall::FsOpError> {
+        self.refresh_proc_if_needed(&file.path, "").await;
         match self
             .shared
             .container
@@ -1840,6 +2186,7 @@ where
         &self,
         file: &FsDescriptor,
     ) -> Result<(u64, u64, Vec<DirListEntry>), syscall::FsOpError> {
+        self.refresh_proc_if_needed(&file.path, "").await;
         let (self_ino, parent_ino, entries) = self
             .shared
             .container
@@ -1910,18 +2257,20 @@ where
             let Some(file) = base else {
                 return Err(FsError::NoEntry.into());
             };
+            self.refresh_proc_if_needed(&file.path, "").await;
             return self
                 .shared
                 .container
                 .filesystem()
-                .read_link_resolved(&file.path)
+                .read_link_resolved_for(&file.path, Some(self.caller()))
                 .await;
         }
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        self.refresh_proc_if_needed(base_dir, path).await;
         self.shared
             .container
             .filesystem()
-            .read_link_at(base_dir, path, creds)
+            .read_link_at_for(base_dir, path, creds, Some(self.caller()))
             .await
     }
 
@@ -3754,7 +4103,16 @@ where
         let (resolved, trailing_slash) = match &target {
             ExecTarget::Resolved(path) => (fs.resolve(path).map_err(map_fs_error_to_exec)?, false),
             ExecTarget::Path { base_dir, raw_path } => fs
-                .walk_path_for(base_dir, raw_path, !nofollow, &current_creds)
+                .walk_path_for_caller(
+                    base_dir,
+                    raw_path,
+                    !nofollow,
+                    &current_creds,
+                    Some(crate::ProcCaller {
+                        pid: shared.pid.get(),
+                        tid: shared.pid.get(),
+                    }),
+                )
                 .await
                 .map_err(map_fs_op_error_to_exec)?,
         };
@@ -3853,11 +4211,13 @@ where
                     .await
                     .map_err(map_fs_op_error_to_exec)?;
                 let secure = syscall::permissions::exec_is_secure(&current_creds, &next_creds);
+                let exe_path = current_path.clone();
                 if argv.is_empty() {
                     argv.push(current_path);
                 }
                 return Ok(PreparedExec::Linux {
                     executable,
+                    exe_path,
                     argv,
                     env: envp,
                     credentials: next_creds,
@@ -3971,6 +4331,24 @@ where
         child_context
             .set_register(self.shared.registers.result, 0)
             .expect("the ABI names registers of this instruction set");
+        let child_tid = child.tid().get();
+        let child_pid = self.shared.pid.get();
+        let comm = process_comm_from_exe(&self.shared.exe_path);
+        self.shared.container.proc_registry().register_thread(
+            child_pid,
+            crate::ProcThreadRecord {
+                tid: child_tid,
+                comm,
+                state: 'R',
+                utime_ticks: 0,
+                stime_ticks: 0,
+            },
+        );
+        let thread_proc_guard = ProcThreadGuard {
+            registry: self.shared.container.proc_registry().clone(),
+            pid: child_pid,
+            tid: child_tid,
+        };
         let child_platform = LinuxThreadPlatform::new(self.shared.clone(), child.tid());
         let shared = self.shared.clone();
         let spawner = shared.spawner.clone();
@@ -3978,6 +4356,7 @@ where
         let guard = TaskDrainGuard(shared.clone());
         spawner
             .try_spawn_detached(async move {
+                let _thread_proc_guard = thread_proc_guard;
                 if let ThreadRunEnd::Exec(prepared, exec_proc) =
                     drive_linux_thread(child_context, child, child_platform).await
                 {
@@ -4070,6 +4449,15 @@ where
             signal_state: child_signal_state,
             container: self.shared.container.clone(),
             grants: LinuxGrants::derive(self.shared.container.authority()),
+            pid: spawned.child.pid(),
+            ppid: self.shared.pid.get(),
+            exe_path: self.shared.exe_path.clone(),
+            argv: self.shared.argv.clone(),
+            env: self.shared.env.clone(),
+            cwd_handle: spawned.child.cwd_handle(),
+            descriptors_handle: spawned.child.descriptors_handle(),
+            credentials_handle: spawned.child.credentials_handle(),
+            proc_signals: spawned.child.process_signals(),
             tty: spin::Mutex::new(self.shared.tty.lock().clone()),
             serial_peek: spin::Mutex::new(Vec::new()),
             clock: spin::Mutex::new(crate::KernelClock::new(
@@ -4920,9 +5308,30 @@ where
     StorageImpl: crate::Storage,
 {
     let _root_guard = root_guard;
+    let _proc_guard = ProcProcessGuard {
+        registry: shared.container.proc_registry().clone(),
+        pid: process.pid().get(),
+    };
     loop {
         let cpu = shared.cpu.clone();
         let pid = process.pid();
+        {
+            let comm = process_comm_from_exe(&shared.exe_path);
+            let mut rec = crate::ProcProcessRecord::minimal(
+                pid.get(),
+                shared.ppid,
+                comm,
+                shared.exe_path.clone(),
+            );
+            rec.pgid = shared.proc_signals.pgid();
+            rec.sid = pid.get();
+            rec.argv = shared.argv.clone();
+            rec.env = shared.env.clone();
+            rec.cwd = shared.cwd_handle.lock().clone();
+            rec.credentials = shared.credentials_handle.lock().clone();
+            rec.fds = snapshot_process_fds(&shared.descriptors_handle.lock());
+            shared.container.proc_registry().register_process(rec);
+        }
         let observer = process.observer();
         let proc_signals = process.process_signals();
         let main_platform = LinuxThreadPlatform::new(shared.clone(), pid);
@@ -5002,6 +5411,7 @@ where
             match *prepared {
                 PreparedExec::Linux {
                     executable,
+                    exe_path,
                     argv,
                     env,
                     credentials,
@@ -5031,6 +5441,15 @@ where
                         signal_state: shared.signal_state.clone(),
                         container: shared.container.clone(),
                         grants: LinuxGrants::derive(shared.container.authority()),
+                        pid: exec_proc.pid(),
+                        ppid: shared.ppid,
+                        exe_path,
+                        argv,
+                        env,
+                        cwd_handle: exec_proc.cwd_handle(),
+                        descriptors_handle: exec_proc.descriptors_handle(),
+                        credentials_handle: exec_proc.credentials_handle(),
+                        proc_signals: exec_proc.process_signals(),
                         tty: spin::Mutex::new(shared.tty.lock().clone()),
                         serial_peek: spin::Mutex::new(core::mem::take(
                             &mut *shared.serial_peek.lock(),
@@ -5335,6 +5754,11 @@ where
             ..Start::default()
         },
     );
+    let exe_path = executable
+        .path
+        .clone()
+        .or_else(|| argv.first().cloned())
+        .unwrap_or_else(|| String::from("/"));
     let grants = LinuxGrants::derive(container.authority());
     let tty = LinuxTtyState::new(container.authority(), &output_mode, instance_id);
     let shared = Arc::new(LinuxShared {
@@ -5350,6 +5774,15 @@ where
         signal_state,
         container,
         grants,
+        pid,
+        ppid: 0,
+        exe_path,
+        argv,
+        env: environment,
+        cwd_handle: process.cwd_handle(),
+        descriptors_handle: process.descriptors_handle(),
+        credentials_handle: process.credentials_handle(),
+        proc_signals: process.process_signals(),
         tty: spin::Mutex::new(tty),
         serial_peek: spin::Mutex::new(Vec::new()),
         clock: spin::Mutex::new(crate::KernelClock::new(
@@ -5830,6 +6263,8 @@ mod tests {
             append: false,
             sync: false,
             dsync: false,
+            nonblock: false,
+            noctty: false,
             mode: 0o644,
             umask: 0,
         };
