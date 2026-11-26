@@ -427,13 +427,14 @@ impl SupervisorRuntime for HeliosRuntime {
         &self,
         slot: ProviderSlot,
         node: &ComponentNode,
+        ipc_channels: Vec<(String, Self::IpcEnd)>,
     ) -> Result<Self::Provider, RuntimeError> {
         let RunnerSpec::Wasm(wasm) = &node.runner else {
             return Err(RuntimeError::Other {
                 detail: format!("provider `{}` must use wasm runner", node.moniker),
             });
         };
-        let (capability_grants, named_devices) = if slot == ProviderSlot::Compiler {
+        let (mut capability_grants, named_devices) = if slot == ProviderSlot::Compiler {
             (Vec::new(), Vec::new())
         } else {
             (
@@ -441,6 +442,11 @@ impl SupervisorRuntime for HeliosRuntime {
                 extract_named_devices(&node.capabilities.named_devices)?,
             )
         };
+        if slot != ProviderSlot::Compiler {
+            for (name, HeliosIpcEnd(endpoint)) in ipc_channels {
+                capability_grants.push(programs::ipc_grant(name, endpoint));
+            }
+        }
         let request = ProviderRequest {
             name: node.instance_name.to_string(),
             path: wasm.program.to_string(),

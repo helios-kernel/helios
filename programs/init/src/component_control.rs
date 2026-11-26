@@ -580,6 +580,7 @@ mod tests {
             &self,
             _slot: ProviderSlot,
             _node: &ComponentNode,
+            _ipc_channels: Vec<(String, Self::IpcEnd)>,
         ) -> Result<Self::Provider, RuntimeError> {
             Ok(MockProvider)
         }

@@ -972,7 +972,7 @@ where
         accessor: &Accessor<U, Self>,
         request: rs_wit::ProviderRequest,
     ) -> wasmtime::Result<Result<Resource<ProviderHandle>, rs_wit::SupervisorError>> {
-        let prepared = match prepare_component_provider(accessor, request).await? {
+        let prepared = match prepare_component_provider(accessor, request, true).await? {
             Ok(prepared) => prepared,
             Err(error) => return Ok(Err(error)),
         };
@@ -985,6 +985,7 @@ where
                 prepared.authority,
                 prepared.oom_policy,
                 prepared.provider_instance,
+                prepared.ipc_grants,
                 prepared.precompiled,
             )
             .await
@@ -1000,7 +1001,7 @@ where
         accessor: &Accessor<U, Self>,
         request: rs_wit::ProviderRequest,
     ) -> wasmtime::Result<Result<Resource<ProviderHandle>, rs_wit::SupervisorError>> {
-        let prepared = match prepare_component_provider(accessor, request).await? {
+        let prepared = match prepare_component_provider(accessor, request, false).await? {
             Ok(prepared) => prepared,
             Err(error) => return Ok(Err(error)),
         };
@@ -1259,12 +1260,14 @@ where
     authority: ProcessAuthority,
     oom_policy: OomPolicy,
     provider_instance: crate::RegisteredInstance,
+    ipc_grants: crate::IpcEndpointGrants,
     precompiled: PreparedComponent<CpuImpl, Net, StorageImpl>,
 }
 
 async fn prepare_component_provider<CpuImpl, Net, StorageImpl, U>(
     accessor: &Accessor<U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     request: rs_wit::ProviderRequest,
+    allow_ipc: bool,
 ) -> wasmtime::Result<
     Result<PreparedComponentProvider<CpuImpl, Net, StorageImpl>, rs_wit::SupervisorError>,
 >
@@ -1300,13 +1303,14 @@ where
         if let Err(error) = check_oom_ceiling(data.instance().oom_policy(), requested_policy) {
             return Ok(Err(error));
         }
-        if let Err(error) = ipc_grants {
-            return Ok(Err(map_exec_error(error)));
-        }
-        if had_ipc {
+        let ipc_grants = match ipc_grants {
+            Ok(grants) => grants,
+            Err(error) => return Ok(Err(map_exec_error(error))),
+        };
+        if had_ipc && !allow_ipc {
             return Ok(Err(supervisor_error(
                 rs_wit::SupervisorErrorKind::InvalidArgument,
-                "kernel provider endpoints do not accept IPC capability grants",
+                "sharded kernel provider endpoints do not accept IPC capability grants",
             )));
         }
         let service = data.runtime_state.program_service();
@@ -1320,14 +1324,22 @@ where
             caller_authority,
             caller_id,
             runtime_state,
+            ipc_grants,
             remaining_grants,
         )))
     })?;
-    let (service, context, caller_authority, caller_id, runtime_state, remaining_grants) =
-        match snapshot {
-            Ok(values) => values,
-            Err(error) => return Ok(Err(error)),
-        };
+    let (
+        service,
+        context,
+        caller_authority,
+        caller_id,
+        runtime_state,
+        ipc_grants,
+        remaining_grants,
+    ) = match snapshot {
+        Ok(values) => values,
+        Err(error) => return Ok(Err(error)),
+    };
     let Some(service) = service else {
         return Ok(Err(supervisor_error(
             rs_wit::SupervisorErrorKind::Unavailable,
@@ -1390,6 +1402,7 @@ where
         authority,
         oom_policy: requested_policy,
         provider_instance,
+        ipc_grants,
         precompiled,
     }))
 }
@@ -1535,6 +1548,7 @@ where
             authority,
             oom_policy,
             provider_instance,
+            ipc_grants: _,
             precompiled,
         } = prepared;
         let control = ProviderControl::new();
@@ -1637,7 +1651,7 @@ where
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "surface provider installation hands off prepared provider metadata, authority, pre-registered instance, and compiled component"
+        reason = "surface provider installation hands off prepared provider metadata, authority, pre-registered instance, IPC grants, and compiled component"
     )]
     pub(super) async fn install_surface_provider(
         &self,
@@ -1647,6 +1661,7 @@ where
         authority: ProcessAuthority,
         oom_policy: OomPolicy,
         provider_instance: crate::RegisteredInstance,
+        ipc_grants: crate::IpcEndpointGrants,
         precompiled: PreparedComponent<CpuImpl, Net, StorageImpl>,
     ) -> Result<ProviderHandle, rs_wit::SupervisorError> {
         if precompiled
@@ -1713,6 +1728,7 @@ where
                 oom_policy,
                 started_at,
                 registered_instance: Some(provider_instance),
+                ipc_grants,
             },
         );
         let turns = store.data().guest_turns();
@@ -2741,7 +2757,7 @@ mod tests {
             rs_wit::SupervisorErrorKind::InvalidArgument
         );
 
-        // 3. Component providers (http/surface) reject IPC grants and drain the handle.
+        // 3. Per-processor HTTP provider rejects IPC grants and drains the handle.
         let (ep_c, _ep_d) = crate::ipc_channel();
         let ipc_res2 = store
             .data_mut()
@@ -2769,7 +2785,7 @@ mod tests {
         }))
         .unwrap()
         .unwrap()
-        .expect_err("component provider must reject IPC grants");
+        .expect_err("http provider must reject IPC grants");
         assert_eq!(
             http_ipc_err.kind,
             rs_wit::SupervisorErrorKind::InvalidArgument
@@ -2780,7 +2796,52 @@ mod tests {
                 .table
                 .get(&Resource::<crate::IpcEndpoint>::new_borrow(ipc_rep2))
                 .is_err(),
-            "rejected component provider request must not leak IPC endpoint in resource table"
+            "rejected http provider request must not leak IPC endpoint in resource table"
+        );
+
+        // 4. Singleton surface provider accepts valid IPC grants (failing only
+        //    on the unavailable program service / missing path, NOT InvalidArgument)
+        //    and drains the owned handle from the caller's resource table.
+        let (ep_e, _ep_f) = crate::ipc_channel();
+        let ipc_res3 = store
+            .data_mut()
+            .table
+            .push(ep_e)
+            .expect("push surface ipc endpoint");
+        let ipc_rep3 = ipc_res3.rep();
+        let surface_ipc_err = block_on(store.run_concurrent(async move |accessor| {
+            <HasSelf<test_store::TestStoreData> as rs_wit::HostWithStore<_>>::install_surface_provider(
+                accessor,
+                rs_wit::ProviderRequest {
+                    name: String::from("compositor"),
+                    path: String::from("/bin/compositor"),
+                    capability_grants: alloc::vec![prog_wit::CapabilityGrant::Ipc(
+                        prog_wit::IpcGrant {
+                            name: String::from("console-srv"),
+                            endpoint: ipc_res3,
+                        }
+                    )],
+                    named_devices: Vec::new(),
+                    oom_policy: rs_wit::OomPolicy::UserProgram,
+                },
+            )
+            .await
+        }))
+        .unwrap()
+        .unwrap()
+        .expect_err("test store has no program service");
+        assert_eq!(
+            surface_ipc_err.kind,
+            rs_wit::SupervisorErrorKind::Unavailable,
+            "surface provider must accept valid IPC grants instead of rejecting with InvalidArgument: {surface_ipc_err:?}"
+        );
+        assert!(
+            store
+                .data()
+                .table
+                .get(&Resource::<crate::IpcEndpoint>::new_borrow(ipc_rep3))
+                .is_err(),
+            "surface provider request must drain owned IPC endpoint from caller resource table"
         );
     }
 
@@ -3051,6 +3112,7 @@ mod tests {
                     named_devices: Vec::new(),
                     oom_policy: rs_wit::OomPolicy::UserProgram,
                 },
+                false,
             )
             .await
         }))
@@ -3062,6 +3124,75 @@ mod tests {
             subtree_err.kind,
             rs_wit::SupervisorErrorKind::NotFound,
             "Subtree(None) grant must succeed against allocated provider InstanceId instead of failing PermissionDenied: {subtree_err:?}"
+        );
+
+        // 2b. `prepare_component_provider(..., true)` accepts IPC grants (failing
+        //     only on the missing path `NotFound`), and `open_provider_store`
+        //     attaches `ProviderStoreSpec::ipc_grants` to the provider store.
+        let (ipc_srv, ipc_cli) = crate::ipc_channel();
+        let surface_ipc_res = store
+            .data_mut()
+            .table
+            .push(ipc_srv)
+            .expect("push surface ipc endpoint");
+        let surface_prep_err = block_on(store.run_concurrent(async move |accessor| {
+            prepare_component_provider(
+                accessor,
+                rs_wit::ProviderRequest {
+                    name: String::from("compositor"),
+                    path: String::from("/bin/does-not-exist-compositor.wasm"),
+                    capability_grants: alloc::vec![prog_wit::CapabilityGrant::Ipc(
+                        prog_wit::IpcGrant {
+                            name: String::from("console-srv"),
+                            endpoint: surface_ipc_res,
+                        }
+                    )],
+                    named_devices: Vec::new(),
+                    oom_policy: rs_wit::OomPolicy::UserProgram,
+                },
+                true,
+            )
+            .await
+        }))
+        .unwrap()
+        .unwrap()
+        .err()
+        .expect("missing binary should fail with NotFound after IPC grant validation succeeds");
+        assert_eq!(
+            surface_prep_err.kind,
+            rs_wit::SupervisorErrorKind::NotFound,
+            "surface provider prepare must allow IPC grants: {surface_prep_err:?}"
+        );
+        drop(ipc_cli);
+
+        let (provider_ep, peer_ep) = crate::ipc_channel();
+        let mut provider_grants = crate::IpcEndpointGrants::new();
+        provider_grants
+            .insert("console-srv", provider_ep)
+            .expect("insert provider IPC grant");
+        let exec_context = ProgramExecContext::from_store(store.data());
+        let (provider_store, _interrupts, _provider_id) = open_provider_store(
+            &service,
+            &exec_context,
+            ProviderStoreSpec {
+                instance_name: "compositor",
+                bootfs_path: "/bin/compositor",
+                authority: ProcessAuthority::empty(),
+                oom_policy: OomPolicy::KernelPlugin,
+                started_at: 0,
+                registered_instance: None,
+                ipc_grants: provider_grants,
+            },
+        );
+        let taken = provider_store
+            .data()
+            .ipc_grants()
+            .take("console-srv")
+            .expect("provider store must expose granted IPC endpoint");
+        block_on(peer_ep.write(b"surface-ipc-ok")).expect("peer write");
+        assert_eq!(
+            block_on(taken.read(64)).expect("provider read"),
+            Some(Bytes::from_static(b"surface-ipc-ok"))
         );
 
         // 3. Early permission error in `spawn` drains owned IPC handles from
