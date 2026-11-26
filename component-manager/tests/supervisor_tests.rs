@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -98,11 +98,23 @@ impl IpcChannelEnd for MockIpcEnd {
     }
 }
 
+struct PortLease<P: Ord + Copy> {
+    port: P,
+    active: Rc<RefCell<BTreeSet<P>>>,
+}
+
+impl<P: Ord + Copy> Drop for PortLease<P> {
+    fn drop(&mut self) {
+        self.active.borrow_mut().remove(&self.port);
+    }
+}
+
 #[derive(Clone)]
 struct MockTcpListener {
     port: u16,
     ready_rx: Receiver<()>,
     queued_packets: Rc<RefCell<VecDeque<Vec<u8>>>>,
+    lease: Rc<RefCell<Option<PortLease<u16>>>>,
 }
 
 impl TcpSocketListener for MockTcpListener {
@@ -121,6 +133,7 @@ struct MockVsockListener {
     port: u32,
     ready_rx: Receiver<()>,
     queued_packets: Rc<RefCell<VecDeque<Vec<u8>>>>,
+    lease: Rc<RefCell<Option<PortLease<u32>>>>,
 }
 
 impl VsockSocketListener for MockVsockListener {
@@ -140,6 +153,25 @@ struct MockChild {
     exit_rx: Receiver<ExitOutcome>,
     exit_tx: Sender<ExitOutcome>,
     honors_sigterm: bool,
+    tcp_leases: Vec<Rc<RefCell<Option<PortLease<u16>>>>>,
+    vsock_leases: Vec<Rc<RefCell<Option<PortLease<u32>>>>>,
+}
+
+impl MockChild {
+    fn release_sockets(&self) {
+        for lease in &self.tcp_leases {
+            lease.borrow_mut().take();
+        }
+        for lease in &self.vsock_leases {
+            lease.borrow_mut().take();
+        }
+    }
+}
+
+impl Drop for MockChild {
+    fn drop(&mut self) {
+        self.release_sockets();
+    }
 }
 
 impl ChildProcess for MockChild {
@@ -150,15 +182,18 @@ impl ChildProcess for MockChild {
     fn signal(&self, signal: u8) -> Result<(), RuntimeError> {
         self.signals.borrow_mut().push(signal);
         if (signal == SIGTERM && self.honors_sigterm) || signal == SIGKILL {
+            self.release_sockets();
             let _ = self.exit_tx.try_send(ExitOutcome::Signaled(signal));
         }
         Ok(())
     }
 
     async fn wait(&self) -> Result<ExitOutcome, RuntimeError> {
-        self.exit_rx.recv().await.map_err(|_| RuntimeError::Other {
+        let res = self.exit_rx.recv().await.map_err(|_| RuntimeError::Other {
             detail: "child wait channel closed".to_owned(),
-        })
+        });
+        self.release_sockets();
+        res
     }
 }
 
@@ -210,6 +245,10 @@ struct MockState {
     inspect_snapshots: Vec<Vec<ComponentStateRecord>>,
     tcp_triggers: BTreeMap<u16, SocketTrigger>,
     vsock_triggers: BTreeMap<u32, SocketTrigger>,
+    bound_tcp_ports: Rc<RefCell<BTreeSet<u16>>>,
+    bound_vsock_ports: Rc<RefCell<BTreeSet<u32>>>,
+    tcp_bind_count: usize,
+    vsock_bind_count: usize,
     spawned: Vec<SpawnedRecord>,
     providers: Vec<(ProviderSlot, String, Sender<ProviderOutcome>)>,
     ignore_sigterm_monikers: Vec<String>,
@@ -231,6 +270,10 @@ impl Default for MockState {
             inspect_snapshots: Vec::new(),
             tcp_triggers: BTreeMap::new(),
             vsock_triggers: BTreeMap::new(),
+            bound_tcp_ports: Rc::new(RefCell::new(BTreeSet::new())),
+            bound_vsock_ports: Rc::new(RefCell::new(BTreeSet::new())),
+            tcp_bind_count: 0,
+            vsock_bind_count: 0,
             spawned: Vec::new(),
             providers: Vec::new(),
             ignore_sigterm_monikers: Vec::new(),
@@ -371,16 +414,27 @@ impl SupervisorRuntime for MockRuntime {
         port: u16,
         _backlog: u16,
     ) -> Result<Self::TcpListener, RuntimeError> {
+        let active_ports = self.state.borrow().bound_tcp_ports.clone();
+        if !active_ports.borrow_mut().insert(port) {
+            return Err(RuntimeError::Other {
+                detail: format!("AddrInUse: TCP port {port} is already bound"),
+            });
+        }
         let (tx, rx) = async_channel::unbounded();
         let queue = Rc::new(RefCell::new(VecDeque::new()));
-        self.state
-            .borrow_mut()
-            .tcp_triggers
-            .insert(port, (tx, queue.clone()));
+        {
+            let mut st = self.state.borrow_mut();
+            st.tcp_bind_count += 1;
+            st.tcp_triggers.insert(port, (tx, queue.clone()));
+        }
         Ok(MockTcpListener {
             port,
             ready_rx: rx,
             queued_packets: queue,
+            lease: Rc::new(RefCell::new(Some(PortLease {
+                port,
+                active: active_ports,
+            }))),
         })
     }
 
@@ -389,16 +443,27 @@ impl SupervisorRuntime for MockRuntime {
         port: u32,
         _backlog: u32,
     ) -> Result<Self::VsockListener, RuntimeError> {
+        let active_ports = self.state.borrow().bound_vsock_ports.clone();
+        if !active_ports.borrow_mut().insert(port) {
+            return Err(RuntimeError::Other {
+                detail: format!("AddrInUse: vsock port {port} is already bound"),
+            });
+        }
         let (tx, rx) = async_channel::unbounded();
         let queue = Rc::new(RefCell::new(VecDeque::new()));
-        self.state
-            .borrow_mut()
-            .vsock_triggers
-            .insert(port, (tx, queue.clone()));
+        {
+            let mut st = self.state.borrow_mut();
+            st.vsock_bind_count += 1;
+            st.vsock_triggers.insert(port, (tx, queue.clone()));
+        }
         Ok(MockVsockListener {
             port,
             ready_rx: rx,
             queued_packets: queue,
+            lease: Rc::new(RefCell::new(Some(PortLease {
+                port,
+                active: active_ports,
+            }))),
         })
     }
 
@@ -438,6 +503,14 @@ impl SupervisorRuntime for MockRuntime {
         let moniker = args.node.moniker.to_string();
         let honors_sigterm = !st.ignore_sigterm_monikers.contains(&moniker);
         st.events_log.push(format!("spawn:{moniker}"));
+        let mut tcp_leases = Vec::new();
+        let mut vsock_leases = Vec::new();
+        for sock in &args.sockets {
+            match sock {
+                BoundSocket::Tcp(tcp) => tcp_leases.push(tcp.lease.clone()),
+                BoundSocket::Vsock(vsock) => vsock_leases.push(vsock.lease.clone()),
+            }
+        }
         let ipc: BTreeMap<String, MockIpcEnd> = args.ipc_channels.into_iter().collect();
         st.spawned.push(SpawnedRecord {
             moniker,
@@ -454,6 +527,8 @@ impl SupervisorRuntime for MockRuntime {
             exit_rx,
             exit_tx,
             honors_sigterm,
+            tcp_leases,
+            vsock_leases,
         })
     }
 
@@ -901,6 +976,11 @@ fn restart_exponential_backoff_burst_circuit_breaker_and_critical_system_escalat
         }),
     );
     drv.capabilities.machine = MachineRights::VIRTUALIZE;
+    drv.capabilities.directories = Cow::Owned(vec![helios_component_manager::DirectoryGrantSpec {
+        source: Cow::Borrowed("/boot"),
+        guest: Cow::Borrowed("/boot"),
+        rights: FsRights::READ,
+    }]);
     drv.startup = StartupPolicy::Eager;
     drv.restart = RestartPolicy::OnFailure;
     drv.restart_backoff_ms = 100;
@@ -1055,6 +1135,7 @@ fn dynamic_components_mounts_bounded_subtree_rejects_escalation_and_unmounts_cle
     root.capabilities = full_root_ceiling();
 
     let mut sandbox = base_node("/sandbox", Some(0), RunnerSpec::Realm);
+    sandbox.children_indices = Cow::Borrowed(&[3]);
     sandbox.oom_tier = OomTier::User;
     sandbox.dynamic_mount = true;
     sandbox.capabilities.network = NetRights::TCP;
@@ -1063,12 +1144,29 @@ fn dynamic_components_mounts_bounded_subtree_rejects_escalation_and_unmounts_cle
     let mut locked = base_node("/locked", Some(0), RunnerSpec::Realm);
     locked.dynamic_mount = false;
 
+    let mut static_trigger = base_node(
+        "/sandbox/static-trigger",
+        Some(1),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/trigger"),
+            sharding: WasmSharding::Singleton,
+            provider: None,
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    static_trigger.startup = StartupPolicy::Lazy;
+    static_trigger.restart = RestartPolicy::Never;
+    static_trigger.critical = Criticality::Parent;
+
     let rt = MockRuntime::new(HardwareInventorySnapshot::default());
     let tasks = rt.tasks.clone();
     let mut sup = Supervisor::new(
         rt.clone(),
         ComponentTopology {
-            nodes: Cow::Owned(vec![root, sandbox, locked]),
+            nodes: Cow::Owned(vec![root, sandbox, locked, static_trigger]),
         },
     )
     .expect("valid topology");
@@ -1236,13 +1334,14 @@ port = 9000
         .expect_err("duplicate TCP socket against active component must fail");
     assert!(clash_err.to_string().contains("duplicate socket binding"));
 
-    // Unmount `/sandbox/plugin`, then trigger a `critical = "parent"` failure on a sibling
-    // inside `/sandbox` to prove parent realm reset does NOT revive the unmounted subtree!
+    // Unmount `/sandbox/plugin`, verify dynamic root `critical = "parent"` is REJECTED,
+    // then trigger a `critical = "parent"` failure on the static sibling `/sandbox/static-trigger`
+    // to prove parent realm reset does NOT revive the unmounted dynamic subtree!
     tasks
         .run_to_completion(sup.unmount_dynamic("/sandbox/plugin"))
         .expect("second unmount succeeds");
-    let mut trigger_map = BTreeMap::new();
-    trigger_map.insert(
+    let mut forbidden_parent_crit = BTreeMap::new();
+    forbidden_parent_crit.insert(
         "/sandbox/trigger".to_owned(),
         r#"
 runner = "wasm"
@@ -1253,10 +1352,49 @@ critical = "parent"
 "#
         .to_owned(),
     );
+    let err = tasks
+        .run_to_completion(sup.mount_dynamic_map("/sandbox", forbidden_parent_crit))
+        .expect_err("dynamic subtree root must not declare critical = \"parent\"");
+    assert!(err.to_string().contains("critical = \"parent\""));
+
+    // Dynamic subtree child `critical = "parent"` resets ONLY its dynamic realm, never `/sandbox`.
+    let mut bounded_realm_map = BTreeMap::new();
+    bounded_realm_map.insert(
+        "/sandbox/sub".to_owned(),
+        r#"
+runner = "realm"
+"#
+        .to_owned(),
+    );
+    bounded_realm_map.insert(
+        "/sandbox/sub/worker".to_owned(),
+        r#"
+runner = "wasm"
+program = "/bin/worker"
+startup = "eager"
+restart = "never"
+critical = "parent"
+"#
+        .to_owned(),
+    );
     tasks
-        .run_to_completion(sup.mount_dynamic_map("/sandbox", trigger_map))
-        .expect("mount trigger");
-    rt.finish_child("/sandbox/trigger", ExitOutcome::Trapped);
+        .run_to_completion(sup.mount_dynamic_map("/sandbox", bounded_realm_map))
+        .expect("descendant critical=parent inside dynamic realm mounts");
+    rt.finish_child("/sandbox/sub/worker", ExitOutcome::Trapped);
+    tasks
+        .run_to_completion(sup.step_once())
+        .expect("dynamic realm reset succeeds");
+    assert_eq!(sup.restarts_of("/sandbox/sub"), Some(1));
+    assert_eq!(sup.restarts_of("/sandbox"), Some(0));
+    tasks
+        .run_to_completion(sup.unmount_dynamic("/sandbox/sub"))
+        .expect("unmount dynamic sub realm");
+
+    // Static sibling `/sandbox/static-trigger` resets `/sandbox` without reviving unmounted `/sandbox/plugin`.
+    tasks
+        .run_to_completion(sup.start_component("/sandbox/static-trigger"))
+        .expect("start static trigger");
+    rt.finish_child("/sandbox/static-trigger", ExitOutcome::Trapped);
     tasks
         .run_to_completion(sup.step_once())
         .expect("parent realm reset succeeds");
@@ -1544,4 +1682,529 @@ fn cancel_safe_event_loop_handles_control_and_exits_when_inactive() {
     });
     assert!(!sup.has_active_work());
     assert_eq!(sup.status_of("/svc"), Some(ComponentStatus::Completed));
+}
+
+#[test]
+fn ipc_routes_deliver_to_already_running_eager_and_lazy_providers_and_concurrent_consumers() {
+    let mut root = base_node("/", None, RunnerSpec::Realm);
+    root.children_indices = Cow::Borrowed(&[1, 2, 3, 4]);
+    root.oom_tier = OomTier::Protected;
+    root.capabilities = full_root_ceiling();
+
+    // 1. Eager provider started BEFORE its consumer.
+    let mut eager_provider = base_node(
+        "/svc/eager-kv",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/kv"),
+            sharding: WasmSharding::Singleton,
+            provider: None,
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    eager_provider.startup = StartupPolicy::Eager;
+    eager_provider.exposes = Cow::Borrowed(&[ExposeSpec {
+        interface: Cow::Borrowed("helios:demo/eager-kv"),
+        channel: Cow::Borrowed("kv-srv"),
+    }]);
+
+    // 2. Lazy consumer connecting AFTER `/svc/eager-kv` is already Running.
+    let mut late_consumer = base_node(
+        "/app/late",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/late"),
+            sharding: WasmSharding::Singleton,
+            provider: None,
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    late_consumer.startup = StartupPolicy::Lazy;
+    late_consumer.capabilities.wit_interfaces =
+        NameCeiling::Set(Cow::Borrowed(&[Cow::Borrowed("helios:demo/eager-kv")]));
+    late_consumer.routes = Cow::Borrowed(&[RouteSpec {
+        interface: Cow::Borrowed("helios:demo/eager-kv"),
+        provider_index: 1,
+        provider_moniker: Cow::Borrowed("/svc/eager-kv"),
+        provider_channel: Cow::Borrowed("kv-srv"),
+        consumer_channel: Cow::Borrowed("kv-cli"),
+    }]);
+
+    // 3. Lazy provider with two concurrent consumers.
+    let mut lazy_provider = base_node(
+        "/svc/lazy-kv",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/lazy-kv"),
+            sharding: WasmSharding::Singleton,
+            provider: None,
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    lazy_provider.startup = StartupPolicy::Lazy;
+    lazy_provider.exposes = Cow::Borrowed(&[ExposeSpec {
+        interface: Cow::Borrowed("helios:demo/lazy-kv"),
+        channel: Cow::Borrowed("lazy-srv"),
+    }]);
+
+    let mut consumer_a = base_node(
+        "/app/c1",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/c1"),
+            sharding: WasmSharding::Singleton,
+            provider: None,
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    consumer_a.startup = StartupPolicy::Eager;
+    consumer_a.capabilities.wit_interfaces =
+        NameCeiling::Set(Cow::Borrowed(&[Cow::Borrowed("helios:demo/lazy-kv")]));
+    consumer_a.routes = Cow::Borrowed(&[RouteSpec {
+        interface: Cow::Borrowed("helios:demo/lazy-kv"),
+        provider_index: 3,
+        provider_moniker: Cow::Borrowed("/svc/lazy-kv"),
+        provider_channel: Cow::Borrowed("lazy-srv"),
+        consumer_channel: Cow::Borrowed("c-ep"),
+    }]);
+
+    let mut consumer_b = consumer_a.clone();
+    consumer_b.moniker = Cow::Borrowed("/app/c2");
+    consumer_b.instance_name = Cow::Borrowed("app/c2");
+    consumer_b.startup = StartupPolicy::Lazy;
+    root.children_indices = Cow::Borrowed(&[1, 2, 3, 4, 5]);
+
+    let rt = MockRuntime::new(HardwareInventorySnapshot::default());
+    let tasks = rt.tasks.clone();
+    let mut sup = Supervisor::new(
+        rt.clone(),
+        ComponentTopology {
+            nodes: Cow::Owned(vec![
+                root,
+                eager_provider,
+                late_consumer,
+                lazy_provider,
+                consumer_a,
+                consumer_b,
+            ]),
+        },
+    )
+    .expect("valid topology");
+
+    tasks.run_to_completion(sup.boot()).expect("boot");
+
+    // Eager provider is already Running; now start `/app/late` and verify zero hang!
+    assert_eq!(
+        sup.status_of("/svc/eager-kv"),
+        Some(ComponentStatus::Running)
+    );
+    tasks
+        .run_to_completion(sup.start_component("/app/late"))
+        .expect("start late consumer");
+    let late_cli = rt.state.borrow().spawned[rt.last_spawned_for("/app/late")]
+        .ipc
+        .get("kv-cli")
+        .unwrap()
+        .clone();
+    let eager_srv = rt.state.borrow().spawned[rt.last_spawned_for("/svc/eager-kv")]
+        .ipc
+        .get("kv-srv")
+        .unwrap()
+        .clone();
+    tasks
+        .run_to_completion(late_cli.write(b"HELLO-EAGER\n".to_vec()))
+        .unwrap();
+    let got = tasks.run_to_completion(eager_srv.read(1024)).unwrap();
+    assert_eq!(got.as_deref(), Some(&b"HELLO-EAGER\n"[..]));
+    tasks
+        .run_to_completion(eager_srv.write(b"ACK-EAGER\n".to_vec()))
+        .unwrap();
+    let reply = tasks.run_to_completion(late_cli.read(1024)).unwrap();
+    assert_eq!(reply.as_deref(), Some(&b"ACK-EAGER\n"[..]));
+
+    // Start `/app/c2` while `/svc/lazy-kv` is still Unstarted; both c1 and c2 write concurrently!
+    tasks
+        .run_to_completion(sup.start_component("/app/c2"))
+        .expect("start c2");
+    assert_eq!(rt.spawn_count("/svc/lazy-kv"), 0);
+    let c1_ep = rt.state.borrow().spawned[rt.last_spawned_for("/app/c1")]
+        .ipc
+        .get("c-ep")
+        .unwrap()
+        .clone();
+    let c2_ep = rt.state.borrow().spawned[rt.last_spawned_for("/app/c2")]
+        .ipc
+        .get("c-ep")
+        .unwrap()
+        .clone();
+    tasks
+        .run_to_completion(c1_ep.write(b"FROM-C1\n".to_vec()))
+        .unwrap();
+    tasks
+        .run_to_completion(c2_ep.write(b"FROM-C2\n".to_vec()))
+        .unwrap();
+    tasks.run_to_completion(sup.step_once()).unwrap();
+    assert_eq!(rt.spawn_count("/svc/lazy-kv"), 1);
+
+    let lazy_srv = rt.state.borrow().spawned[rt.last_spawned_for("/svc/lazy-kv")]
+        .ipc
+        .get("lazy-srv")
+        .unwrap()
+        .clone();
+    let f1 = tasks.run_to_completion(lazy_srv.read(1024)).unwrap();
+    let f2 = tasks.run_to_completion(lazy_srv.read(1024)).unwrap();
+    assert_eq!(f1.as_deref(), Some(&b"FROM-C1\n"[..]));
+    assert_eq!(f2.as_deref(), Some(&b"FROM-C2\n"[..]));
+
+    // Restart `/app/c2` while `/svc/lazy-kv` is ALREADY Running -> new consumer endpoint works!
+    tasks
+        .run_to_completion(sup.restart_component("/app/c2"))
+        .expect("restart c2");
+    let c2_ep_new = rt.state.borrow().spawned[rt.last_spawned_for("/app/c2")]
+        .ipc
+        .get("c-ep")
+        .unwrap()
+        .clone();
+    tasks
+        .run_to_completion(c2_ep_new.write(b"LIVE-REQ\n".to_vec()))
+        .unwrap();
+    let f3 = tasks.run_to_completion(lazy_srv.read(1024)).unwrap();
+    assert_eq!(f3.as_deref(), Some(&b"LIVE-REQ\n"[..]));
+    tasks
+        .run_to_completion(lazy_srv.write(b"LIVE-RESP\n".to_vec()))
+        .unwrap();
+    let r3 = tasks.run_to_completion(c2_ep_new.read(1024)).unwrap();
+    assert_eq!(r3.as_deref(), Some(&b"LIVE-RESP\n"[..]));
+
+    // Clean exit of lazy provider -> subsequent consumer frame re-activates it with zero loss!
+    rt.finish_child("/svc/lazy-kv", ExitOutcome::Exited(0));
+    tasks.run_to_completion(sup.step_once()).unwrap();
+    assert_eq!(
+        sup.status_of("/svc/lazy-kv"),
+        Some(ComponentStatus::Completed)
+    );
+    tasks
+        .run_to_completion(c2_ep_new.write(b"REACTIVATE\n".to_vec()))
+        .unwrap();
+    tasks.run_to_completion(sup.step_once()).unwrap();
+    assert_eq!(rt.spawn_count("/svc/lazy-kv"), 2);
+    let lazy_srv2 = rt.state.borrow().spawned[rt.last_spawned_for("/svc/lazy-kv")]
+        .ipc
+        .get("lazy-srv")
+        .unwrap()
+        .clone();
+    let f4 = tasks.run_to_completion(lazy_srv2.read(1024)).unwrap();
+    assert_eq!(f4.as_deref(), Some(&b"REACTIVATE\n"[..]));
+}
+
+#[test]
+fn activating_socket_armed_component_via_start_or_ipc_reclaims_sockets_without_addr_in_use() {
+    let mut root = base_node("/", None, RunnerSpec::Realm);
+    root.children_indices = Cow::Borrowed(&[1, 2, 3]);
+    root.oom_tier = OomTier::Protected;
+    root.capabilities = full_root_ceiling();
+
+    // 1. Lazy socket component activated explicitly via `start_component`.
+    let mut http_svc = base_node(
+        "/svc/http",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/http"),
+            sharding: WasmSharding::Singleton,
+            provider: None,
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    http_svc.startup = StartupPolicy::Lazy;
+    http_svc.capabilities.network = NetRights::TCP;
+    http_svc.capabilities.tcp_ports = PortCeiling::Set(Cow::Borrowed(&[8080]));
+    http_svc.sockets = Cow::Borrowed(&[SocketActivationSpec::Tcp {
+        address: IpAddrSpec::V4([0, 0, 0, 0]),
+        port: 8080,
+        backlog: 64,
+    }]);
+
+    // 2. Lazy component with BOTH a vsock socket AND an exposed IPC channel, activated via IPC!
+    let mut dual_svc = base_node(
+        "/svc/dual",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/dual"),
+            sharding: WasmSharding::Singleton,
+            provider: None,
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    dual_svc.startup = StartupPolicy::Lazy;
+    dual_svc.capabilities.vsock_ports = PortCeiling::Set(Cow::Borrowed(&[7000]));
+    dual_svc.sockets = Cow::Borrowed(&[SocketActivationSpec::Vsock {
+        port: 7000,
+        backlog: 32,
+    }]);
+    dual_svc.exposes = Cow::Borrowed(&[ExposeSpec {
+        interface: Cow::Borrowed("helios:demo/dual"),
+        channel: Cow::Borrowed("dual-srv"),
+    }]);
+
+    let mut caller = base_node(
+        "/app/caller",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/caller"),
+            sharding: WasmSharding::Singleton,
+            provider: None,
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    caller.startup = StartupPolicy::Eager;
+    caller.capabilities.wit_interfaces =
+        NameCeiling::Set(Cow::Borrowed(&[Cow::Borrowed("helios:demo/dual")]));
+    caller.routes = Cow::Borrowed(&[RouteSpec {
+        interface: Cow::Borrowed("helios:demo/dual"),
+        provider_index: 2,
+        provider_moniker: Cow::Borrowed("/svc/dual"),
+        provider_channel: Cow::Borrowed("dual-srv"),
+        consumer_channel: Cow::Borrowed("dual-cli"),
+    }]);
+
+    let rt = MockRuntime::new(HardwareInventorySnapshot::default());
+    let tasks = rt.tasks.clone();
+    let mut sup = Supervisor::new(
+        rt.clone(),
+        ComponentTopology {
+            nodes: Cow::Owned(vec![root, http_svc, dual_svc, caller]),
+        },
+    )
+    .expect("valid topology");
+
+    tasks.run_to_completion(sup.boot()).expect("boot");
+    assert_eq!(rt.state.borrow().tcp_bind_count, 1);
+    assert_eq!(rt.state.borrow().vsock_bind_count, 1);
+
+    // Explicit `start_component` on socket-armed `/svc/http` MUST reclaim without rebinding!
+    tasks
+        .run_to_completion(sup.start_component("/svc/http"))
+        .expect("start_component must reclaim armed TCP socket without AddrInUse");
+    assert_eq!(rt.state.borrow().tcp_bind_count, 1);
+    assert_eq!(sup.status_of("/svc/http"), Some(ComponentStatus::Running));
+    assert_eq!(
+        rt.state.borrow().spawned[rt.last_spawned_for("/svc/http")]
+            .sockets
+            .len(),
+        1
+    );
+
+    // IPC activation on socket-armed `/svc/dual` MUST reclaim vsock socket without AddrInUse!
+    let cli = rt.state.borrow().spawned[rt.last_spawned_for("/app/caller")]
+        .ipc
+        .get("dual-cli")
+        .unwrap()
+        .clone();
+    tasks
+        .run_to_completion(cli.write(b"WAKE-BY-IPC".to_vec()))
+        .unwrap();
+    tasks
+        .run_to_completion(sup.step_once())
+        .expect("IpcActivated must reclaim armed vsock socket without AddrInUse");
+    assert_eq!(rt.state.borrow().vsock_bind_count, 1);
+    assert_eq!(sup.status_of("/svc/dual"), Some(ComponentStatus::Running));
+    assert_eq!(
+        rt.state.borrow().spawned[rt.last_spawned_for("/svc/dual")]
+            .sockets
+            .len(),
+        1
+    );
+    let srv = rt.state.borrow().spawned[rt.last_spawned_for("/svc/dual")]
+        .ipc
+        .get("dual-srv")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        tasks.run_to_completion(srv.read(1024)).unwrap().as_deref(),
+        Some(&b"WAKE-BY-IPC"[..])
+    );
+}
+
+#[test]
+fn consecutive_failures_resets_after_burst_window_uptime() {
+    let mut root = base_node("/", None, RunnerSpec::Realm);
+    root.children_indices = Cow::Borrowed(&[1]);
+    root.oom_tier = OomTier::Protected;
+    root.capabilities = full_root_ceiling();
+
+    let mut svc = base_node(
+        "/svc/worker",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/worker"),
+            sharding: WasmSharding::Singleton,
+            provider: None,
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    svc.startup = StartupPolicy::Eager;
+    svc.restart = RestartPolicy::OnFailure;
+    svc.restart_backoff_ms = 100;
+    svc.restart_backoff_max_ms = 1_000;
+    svc.burst_limit = 5;
+    svc.burst_window_ms = 10_000;
+
+    let rt = MockRuntime::new(HardwareInventorySnapshot::default());
+    let tasks = rt.tasks.clone();
+    let mut sup = Supervisor::new(
+        rt.clone(),
+        ComponentTopology {
+            nodes: Cow::Owned(vec![root, svc]),
+        },
+    )
+    .expect("valid topology");
+
+    tasks.run_to_completion(sup.boot()).expect("boot");
+
+    // Two immediate crashes escalate backoff: 100ms, 200ms.
+    for _ in 0..2 {
+        rt.finish_child("/svc/worker", ExitOutcome::Exited(1));
+        tasks.run_to_completion(sup.step_once()).unwrap();
+        tasks.run_to_completion(sup.step_once()).unwrap();
+    }
+    assert_eq!(rt.state.borrow().sleeps_ms, vec![100, 200]);
+
+    // Simulate healthy uptime >= burst_window_ms (10_000ms) -> backoff MUST reset to 100ms!
+    rt.state.borrow_mut().now_ms += 10_000;
+    rt.finish_child("/svc/worker", ExitOutcome::Exited(1));
+    tasks.run_to_completion(sup.step_once()).unwrap();
+    tasks.run_to_completion(sup.step_once()).unwrap();
+    assert_eq!(rt.state.borrow().sleeps_ms, vec![100, 200, 100]);
+}
+
+#[test]
+fn has_active_work_stays_true_for_lazy_providers_and_lazy_ipc_routes() {
+    // 1. Topology with ONLY a lazy kernel provider (`compiler`).
+    let mut root = base_node("/", None, RunnerSpec::Realm);
+    root.children_indices = Cow::Borrowed(&[1]);
+    root.oom_tier = OomTier::Protected;
+    root.capabilities = full_root_ceiling();
+
+    let mut compiler = base_node(
+        "/compiler",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/compiler.cwasm"),
+            sharding: WasmSharding::Singleton,
+            provider: Some(ProviderSlot::Compiler),
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    compiler.startup = StartupPolicy::Lazy;
+
+    let rt = MockRuntime::new(HardwareInventorySnapshot::default());
+    let tasks = rt.tasks.clone();
+    let mut sup = Supervisor::new(
+        rt.clone(),
+        ComponentTopology {
+            nodes: Cow::Owned(vec![root.clone(), compiler]),
+        },
+    )
+    .expect("valid topology");
+
+    tasks.run_to_completion(sup.boot()).expect("boot");
+    assert!(
+        sup.has_active_work(),
+        "installed lazy provider slot must keep has_active_work() true"
+    );
+    tasks.run_to_completion(sup.shutdown_all());
+    assert!(
+        !sup.has_active_work(),
+        "shutdown_all() must clear has_active_work()"
+    );
+
+    // 2. Topology with lazy IPC provider targeted by an active route (no eager components).
+    root.children_indices = Cow::Borrowed(&[1, 2]);
+    let mut lazy_srv = base_node(
+        "/svc/kv",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/kv"),
+            sharding: WasmSharding::Singleton,
+            provider: None,
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    lazy_srv.startup = StartupPolicy::Lazy;
+    lazy_srv.exposes = Cow::Borrowed(&[ExposeSpec {
+        interface: Cow::Borrowed("helios:demo/kv"),
+        channel: Cow::Borrowed("kv-srv"),
+    }]);
+
+    let mut lazy_cli = base_node(
+        "/app/cli",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/cli"),
+            sharding: WasmSharding::Singleton,
+            provider: None,
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    lazy_cli.startup = StartupPolicy::Lazy;
+    lazy_cli.capabilities.wit_interfaces =
+        NameCeiling::Set(Cow::Borrowed(&[Cow::Borrowed("helios:demo/kv")]));
+    lazy_cli.routes = Cow::Borrowed(&[RouteSpec {
+        interface: Cow::Borrowed("helios:demo/kv"),
+        provider_index: 1,
+        provider_moniker: Cow::Borrowed("/svc/kv"),
+        provider_channel: Cow::Borrowed("kv-srv"),
+        consumer_channel: Cow::Borrowed("kv-cli"),
+    }]);
+
+    let rt2 = MockRuntime::new(HardwareInventorySnapshot::default());
+    let tasks2 = rt2.tasks.clone();
+    let mut sup2 = Supervisor::new(
+        rt2,
+        ComponentTopology {
+            nodes: Cow::Owned(vec![root, lazy_srv, lazy_cli]),
+        },
+    )
+    .expect("valid topology");
+
+    tasks2.run_to_completion(sup2.boot()).expect("boot");
+    assert!(
+        sup2.has_active_work(),
+        "lazy IPC route target must keep has_active_work() true"
+    );
+    tasks2.run_to_completion(sup2.shutdown_all());
+    assert!(!sup2.has_active_work());
 }

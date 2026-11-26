@@ -1,4 +1,7 @@
+use alloc::vec;
+use alloc::vec::Vec;
 use core::num::NonZeroUsize;
+use core::ops::Range;
 use core::ptr::{NonNull, with_exposed_provenance_mut};
 
 use arrayvec::ArrayVec;
@@ -12,6 +15,7 @@ use crate::MAX_BOOT_MEMORY_REGIONS;
 
 const FRAME_ORDERS: usize = 32 - PhysFrame::SIZE.ilog2() as usize;
 const BASE_FRAME: PageSize = PageSize::from_log2(PhysFrame::SIZE.ilog2() as u8);
+const BITS_PER_WORD: usize = u64::BITS as usize;
 
 struct PoolProvenance;
 
@@ -33,6 +37,15 @@ pub(super) struct FramePool {
     allocator: SummaryBuddyAllocator<FRAME_ORDERS, PoolProvenance>,
     pub(super) total_bytes: usize,
     pub(super) allocated_bytes: usize,
+    /// First direct-map frame index covered by `allocated_bitmap`.
+    base_frame: usize,
+    /// Number of frames covered by `allocated_bitmap`.
+    span_frames: usize,
+    /// One bit per frame in `[base_frame, base_frame + span_frames)`: `1`
+    /// while the frame is allocated out of `allocator` (including buddy
+    /// metadata frames, live user allocations, lent chunks, and slab-cached
+    /// frames before a slab drain).
+    allocated_bitmap: Vec<u64>,
 }
 
 impl FramePool {
@@ -41,6 +54,9 @@ impl FramePool {
             allocator: SummaryBuddyAllocator::new(BASE_FRAME),
             total_bytes: 0,
             allocated_bytes: 0,
+            base_frame: 0,
+            span_frames: 0,
+            allocated_bitmap: Vec::new(),
         }
     }
 
@@ -85,8 +101,20 @@ impl FramePool {
         // direct-mapped RAM owned exclusively by this user frame pool.
         unsafe { self.allocator.try_init(first, span, &usable) }
             .unwrap_or_else(|error| panic!("invalid user frame map: {error:?}"));
+        let reserved_frames = self.allocator.reserved_frames();
+        let reserved_bytes = reserved_frames * PhysFrame::SIZE;
         self.total_bytes = total_bytes;
-        self.allocated_bytes = self.allocator.reserved_frames() * PhysFrame::SIZE;
+        self.allocated_bytes = reserved_bytes;
+        self.base_frame = first / PhysFrame::SIZE;
+        self.span_frames = span / PhysFrame::SIZE;
+        self.allocated_bitmap = vec![0_u64; self.span_frames.div_ceil(BITS_PER_WORD)];
+        if reserved_bytes > 0 {
+            let host = usable
+                .iter()
+                .find(|range| range.len >= reserved_bytes)
+                .expect("validated buddy allocator placed metadata in a usable region");
+            self.mark_range(host.base, reserved_bytes, true);
+        }
     }
 
     pub(super) fn allocate(&mut self, bytes: usize) -> Result<NonNull<u8>, AllocError> {
@@ -97,6 +125,7 @@ impl FramePool {
         let page = PageSize::from_log2(bytes.ilog2() as u8);
         let address = self.allocator.allocate_physical(page, NonZeroUsize::MIN)?;
         self.allocated_bytes += bytes;
+        self.mark_range(address, bytes, true);
         Ok(NonNull::new(with_exposed_provenance_mut(address))
             .expect("user frame allocation is null"))
     }
@@ -114,19 +143,95 @@ impl FramePool {
             "invalid user frame block size {bytes}"
         );
         let page = PageSize::from_log2(bytes.ilog2() as u8);
+        let address = ptr.as_ptr().expose_provenance();
         // SAFETY: the caller guarantees `ptr` is an exclusively owned, live
         // block of size `bytes` previously allocated from `self.allocator`.
         unsafe {
-            self.allocator.deallocate_physical(
-                page,
-                NonZeroUsize::MIN,
-                ptr.as_ptr().expose_provenance(),
-            )
+            self.allocator
+                .deallocate_physical(page, NonZeroUsize::MIN, address)
         };
+        self.mark_range(address, bytes, false);
         self.allocated_bytes = self
             .allocated_bytes
             .checked_sub(bytes)
             .expect("user frame accounting underflow");
+    }
+
+    /// Scans allocated frame runs starting from `*cursor` (relative frame
+    /// index within this pool's span), appending contiguous `[start, end)`
+    /// direct-map byte ranges into `out` without allocating.
+    ///
+    /// Returns `true` when more frames remain past `*cursor`.
+    pub(super) fn scan_allocated_runs<const N: usize>(
+        &self,
+        cursor: &mut usize,
+        out: &mut ArrayVec<Range<usize>, N>,
+    ) -> bool {
+        let mut frame = *cursor;
+        let total = self.span_frames;
+        while frame < total && !out.is_full() {
+            // Skip zero words in bulk.
+            let word_idx = frame / BITS_PER_WORD;
+            let bit_idx = frame % BITS_PER_WORD;
+            let shifted = self.allocated_bitmap[word_idx] >> bit_idx;
+            if shifted == 0 {
+                frame = (word_idx + 1) * BITS_PER_WORD;
+                continue;
+            }
+            frame += shifted.trailing_zeros() as usize;
+            if frame >= total {
+                break;
+            }
+            let run_start = frame;
+            // Advance across contiguous 1-bits.
+            while frame < total {
+                let w = frame / BITS_PER_WORD;
+                let b = frame % BITS_PER_WORD;
+                let inv = (!self.allocated_bitmap[w]) >> b;
+                if inv == 0 {
+                    frame = ((w + 1) * BITS_PER_WORD).min(total);
+                } else {
+                    frame = (frame + inv.trailing_zeros() as usize).min(total);
+                    break;
+                }
+            }
+            let start_addr = (self.base_frame + run_start) * PhysFrame::SIZE;
+            let end_addr = (self.base_frame + frame) * PhysFrame::SIZE;
+            out.push(start_addr..end_addr);
+        }
+        *cursor = frame.min(total);
+        *cursor < total
+    }
+
+    fn mark_range(&mut self, start_addr: usize, bytes: usize, allocated: bool) {
+        let first = start_addr / PhysFrame::SIZE;
+        let count = bytes / PhysFrame::SIZE;
+        let rel_start = first
+            .checked_sub(self.base_frame)
+            .expect("frame pool address precedes pool base");
+        let rel_end = rel_start + count;
+        assert!(
+            rel_end <= self.span_frames,
+            "frame pool range exceeds pool span"
+        );
+        let mut idx = rel_start;
+        while idx < rel_end {
+            let word_idx = idx / BITS_PER_WORD;
+            let bit_idx = idx % BITS_PER_WORD;
+            let remaining = rel_end - idx;
+            let take = remaining.min(BITS_PER_WORD - bit_idx);
+            let mask = if take == BITS_PER_WORD {
+                u64::MAX
+            } else {
+                ((1_u64 << take) - 1) << bit_idx
+            };
+            if allocated {
+                self.allocated_bitmap[word_idx] |= mask;
+            } else {
+                self.allocated_bitmap[word_idx] &= !mask;
+            }
+            idx += take;
+        }
     }
 }
 
@@ -216,6 +321,17 @@ mod tests {
         }
         assert_eq!(pool.allocated_bytes, metadata);
         assert_eq!(pool.allocator.free_bytes(), available);
+        let mut cursor = 0;
+        let mut scanned = 0;
+        loop {
+            let mut batch = ArrayVec::<Range<usize>, 16>::new();
+            let more = pool.scan_allocated_runs(&mut cursor, &mut batch);
+            scanned += batch.iter().map(|r| r.end - r.start).sum::<usize>();
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(scanned, metadata);
     }
 
     #[test]

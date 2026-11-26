@@ -17,6 +17,8 @@ pub const DEFAULT_BURST_WINDOW_MS: u64 = 60_000;
 pub const DEFAULT_STOP_TIMEOUT_MS: u64 = 5_000;
 /// Default TCP / vsock listen backlog when not overridden in `component.toml`.
 pub const DEFAULT_SOCKET_BACKLOG: u16 = 128;
+/// Default OCI image store directory when `oci.store` is omitted.
+pub const DEFAULT_OCI_STORE_PATH: &str = "/var/lib/oci";
 
 /// Filesystem rights bitmask matching `helios:system/programs.filesystem-right`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

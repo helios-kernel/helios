@@ -80,7 +80,9 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 
 use arrayvec::ArrayVec;
@@ -193,6 +195,13 @@ struct BalloonShared {
     /// not happened yet, so the service's next park would return
     /// immediately and its loop would stop yielding to the executor.
     work: Notify,
+    /// Seqlock generation counter guarding `inflated_len`,
+    /// `inflated_starts`, and `inflated_counts`. Odd while the single
+    /// writer (`BalloonService`) updates the mirror, even when quiescent.
+    inflated_seq: AtomicU64,
+    inflated_len: AtomicUsize,
+    inflated_starts: Box<[AtomicUsize; MAX_INFLATED_RUNS]>,
+    inflated_counts: Box<[AtomicUsize; MAX_INFLATED_RUNS]>,
 }
 
 impl BalloonHandle {
@@ -206,7 +215,49 @@ impl BalloonHandle {
                 resync_requested: AtomicBool::new(false),
                 reports_forgotten: AtomicU64::new(0),
                 work: Notify::new(),
+                inflated_seq: AtomicU64::new(0),
+                inflated_len: AtomicUsize::new(0),
+                inflated_starts: Box::new(core::array::from_fn(|_| AtomicUsize::new(0))),
+                inflated_counts: Box::new(core::array::from_fn(|_| AtomicUsize::new(0))),
             }),
+        }
+    }
+
+    /// Lock-free read-only snapshot of every inflated [`PhysFrameRange`]
+    /// currently held by the balloon service.
+    ///
+    /// Uses a seqlock mirrored by the single owning task (`BalloonService`),
+    /// avoiding any `Mutex` behind the async balloon API. When called under
+    /// `FrozenMachine`, the writer is parked and the first pass always
+    /// succeeds without retrying.
+    pub fn inflated_runs(&self) -> Vec<PhysFrameRange> {
+        let mut out = Vec::new();
+        loop {
+            let seq1 = self.shared.inflated_seq.load(Ordering::Acquire);
+            if seq1 & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let len = self
+                .shared
+                .inflated_len
+                .load(Ordering::Acquire)
+                .min(MAX_INFLATED_RUNS);
+            out.clear();
+            out.reserve(len);
+            for i in 0..len {
+                let start = self.shared.inflated_starts[i].load(Ordering::Relaxed);
+                let frame_count = self.shared.inflated_counts[i].load(Ordering::Relaxed);
+                out.push(PhysFrameRange {
+                    start: PhysFrame::from_phys_addr(start),
+                    frame_count,
+                });
+            }
+            core::sync::atomic::fence(Ordering::Acquire);
+            let seq2 = self.shared.inflated_seq.load(Ordering::Acquire);
+            if seq1 == seq2 {
+                return out;
+            }
         }
     }
 
@@ -470,6 +521,7 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
         for run in self.runs.drain(..) {
             PhysFrameAllocator::deallocate_reported(self.pool, run);
         }
+        self.publish_inflated_clear();
         self.synced_resets = resets;
         self.floor_notice = None;
         self.handle
@@ -485,6 +537,44 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
             returned_frames = returned,
             "memory balloon resynchronised with its reset device"
         );
+    }
+
+    fn publish_inflated_push(&self, index: usize, run: PhysFrameRange) {
+        let seq = self.handle.shared.inflated_seq.load(Ordering::Relaxed);
+        self.handle
+            .shared
+            .inflated_seq
+            .store(seq + 1, Ordering::Release);
+        self.handle.shared.inflated_starts[index].store(run.start.phys_addr(), Ordering::Relaxed);
+        self.handle.shared.inflated_counts[index].store(run.frame_count, Ordering::Relaxed);
+        self.handle
+            .shared
+            .inflated_len
+            .store(index + 1, Ordering::Release);
+        self.handle
+            .shared
+            .inflated_seq
+            .store(seq + 2, Ordering::Release);
+    }
+
+    fn publish_inflated_pop(&self, new_len: usize) {
+        let seq = self.handle.shared.inflated_seq.load(Ordering::Relaxed);
+        self.handle
+            .shared
+            .inflated_seq
+            .store(seq + 1, Ordering::Release);
+        self.handle
+            .shared
+            .inflated_len
+            .store(new_len, Ordering::Release);
+        self.handle
+            .shared
+            .inflated_seq
+            .store(seq + 2, Ordering::Release);
+    }
+
+    fn publish_inflated_clear(&self) {
+        self.publish_inflated_pop(0);
     }
 
     fn publish_actual(&self) {
@@ -572,7 +662,9 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
                 break;
             }
             wanted -= range.frame_count;
+            let idx = self.runs.len();
             self.runs.push(range);
+            self.publish_inflated_push(idx, range);
             if self.runs.len().is_multiple_of(ACTUAL_PUBLISH_RUNS) && !self.device_reset_unsynced()
             {
                 self.publish_actual();
@@ -608,6 +700,7 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
             // VIRTIO_BALLOON_F_MUST_TELL_HOST: the frames go back into
             // the pool only after the host has been told, never before.
             self.runs.pop();
+            self.publish_inflated_pop(self.runs.len());
             PhysFrameAllocator::deallocate(self.pool, run);
             released += run.frame_count;
             if self.runs.len().is_multiple_of(ACTUAL_PUBLISH_RUNS) && !self.device_reset_unsynced()
