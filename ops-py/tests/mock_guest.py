@@ -204,7 +204,8 @@ class MockHeliosGuest:
         active: dict[int, tuple[str, str, bytearray]] = {}
         # Pending server->client subpaths waiting for Credit: (inv, sub_id) -> list[bytes]
         pending_out: dict[tuple[int, int], list[bytes]] = {}
-        # Active client->server write streams: (inv, sub_id) -> (sink_kind, target_key, offset_or_none, bytearray, done_sub_id)
+        # Active client->server write streams:
+        # (inv, sub_id) -> (sink_kind, target_key, offset_or_none, bytearray, done_sub_id)
         pending_in: dict[tuple[int, int], tuple[str, Any, int | None, bytearray, int]] = {}
         # Credits received before a done future was ready: set[(inv, sub_id)]
         early_credits: set[tuple[int, int]] = set()
