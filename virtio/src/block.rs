@@ -107,6 +107,7 @@ use helios_hal::fs::{
     BlockGeometry, BlockQueueTopology, BlockRange, BlockSerial, OwnedBlockBuffer,
 };
 use helios_hal::io::{IoError, IoResult};
+use helios_hal::iommu::DmaAccess;
 use helios_hal::pmm::PhysFrame;
 use helios_hal::resource::KernelResource;
 use helios_hal::vmm::SwapBackend;
@@ -396,6 +397,20 @@ pub struct BlockRequestCounts {
     pub flushes: u64,
     pub discards: u64,
     pub write_zeroes: u64,
+}
+
+/// Why a synchronous polled block request failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PolledBlockError {
+    /// The block device or DMA layer rejected or faulted on the request.
+    #[error(transparent)]
+    Io(#[from] IoError),
+    /// Queue 0's lock was held while the machine was supposed to be frozen.
+    #[error("virtio-blk queue 0 is locked by a task that was not stopped")]
+    QueueBusy,
+    /// The caller's deadline expired before the device answered the command.
+    #[error("virtio-blk polled command timed out waiting for device completion")]
+    TimedOut,
 }
 
 /// The request shapes the device accepts, decoded from its configuration.
@@ -1116,6 +1131,320 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockDevice<T, 
             return Err(changed("queue count"));
         }
         Ok(())
+    }
+
+    /// Total capacity of the device in 512-byte sectors.
+    fn capacity_sectors(&self) -> u64 {
+        (self.geometry.capacity_blocks as u64) * (self.limits.sectors_per_block as u64)
+    }
+
+    /// Validates that a polled sector transfer is aligned to the device's
+    /// 512-byte sector and logical block geometry and fits within capacity.
+    fn validate_polled_sector_range(
+        &self,
+        start_sector: u64,
+        len: usize,
+    ) -> Result<(), PolledBlockError> {
+        if self.state.load(Ordering::SeqCst) != RUNNING {
+            return Err(IoError::DeviceFault.into());
+        }
+        if len == 0 || !len.is_multiple_of(SECTOR_SIZE) {
+            return Err(IoError::InvalidBufferLength {
+                required_multiple: SECTOR_SIZE,
+                actual: len,
+            }
+            .into());
+        }
+        let logical_block_bytes = self.geometry.logical_block_bytes;
+        if logical_block_bytes > SECTOR_SIZE {
+            if !len.is_multiple_of(logical_block_bytes) {
+                return Err(IoError::InvalidBufferLength {
+                    required_multiple: logical_block_bytes,
+                    actual: len,
+                }
+                .into());
+            }
+            if !start_sector.is_multiple_of(self.limits.sectors_per_block as u64) {
+                return Err(IoError::OutOfBounds.into());
+            }
+        }
+        let sectors = (len / SECTOR_SIZE) as u64;
+        let end_sector = start_sector
+            .checked_add(sectors)
+            .ok_or(IoError::OutOfBounds)?;
+        if end_sector > self.capacity_sectors() {
+            return Err(IoError::OutOfBounds.into());
+        }
+        Ok(())
+    }
+
+    /// Synchronously reads sectors starting at 512-byte `start_sector` into
+    /// `dst` by polling queue 0's used ring.
+    ///
+    /// Designed for contexts where no executor task or device interrupt runs
+    /// (while `FrozenMachine` holds wake-only interrupt masking, or during
+    /// early-boot hibernate resume before interrupts are enabled).
+    ///
+    /// Uses fresh DMA buffers from the device's DMA memory rather than the
+    /// queue's per-descriptor control slots, so any quiesced async completion
+    /// still waiting in a request slot is untouched.
+    pub fn read_sectors_polled(
+        &self,
+        start_sector: u64,
+        dst: &mut [u8],
+        mut expired: impl FnMut() -> bool,
+    ) -> Result<(), PolledBlockError> {
+        self.validate_polled_sector_range(start_sector, dst.len())?;
+        let max_transfer = self.geometry.max_transfer_bytes;
+        let mut sector = start_sector;
+        let mut offset = 0;
+        while offset < dst.len() {
+            let chunk_len = (dst.len() - offset).min(max_transfer);
+            self.polled_read_chunk(sector, &mut dst[offset..offset + chunk_len], &mut expired)?;
+            sector += (chunk_len / SECTOR_SIZE) as u64;
+            offset += chunk_len;
+        }
+        Ok(())
+    }
+
+    /// Synchronously writes `data` starting at 512-byte `start_sector` by
+    /// polling queue 0's used ring.
+    ///
+    /// See [`Self::read_sectors_polled`] for the frozen/early-boot contract.
+    pub fn write_sectors_polled(
+        &self,
+        start_sector: u64,
+        data: &[u8],
+        mut expired: impl FnMut() -> bool,
+    ) -> Result<(), PolledBlockError> {
+        if self.readonly {
+            return Err(IoError::ReadOnly.into());
+        }
+        self.validate_polled_sector_range(start_sector, data.len())?;
+        let max_transfer = self.geometry.max_transfer_bytes;
+        let mut sector = start_sector;
+        let mut offset = 0;
+        while offset < data.len() {
+            let chunk_len = (data.len() - offset).min(max_transfer);
+            self.polled_write_chunk(sector, &data[offset..offset + chunk_len], &mut expired)?;
+            sector += (chunk_len / SECTOR_SIZE) as u64;
+            offset += chunk_len;
+        }
+        Ok(())
+    }
+
+    /// Synchronously flushes the device's volatile write cache by polling
+    /// queue 0's used ring.
+    ///
+    /// Per virtio 1.2 §5.2.5, a device without `VIRTIO_BLK_F_FLUSH` has no
+    /// volatile write cache and returns `Ok(())` without submitting a command.
+    pub fn flush_polled(&self, mut expired: impl FnMut() -> bool) -> Result<(), PolledBlockError> {
+        if self.state.load(Ordering::SeqCst) != RUNNING {
+            return Err(IoError::DeviceFault.into());
+        }
+        if !self.capabilities.contains(BlockDeviceCapabilities::FLUSH) {
+            return Ok(());
+        }
+        let dma = self.transport.bus().dma();
+        let req_layout =
+            Layout::array::<u8>(size_of::<BlkReq>()).map_err(|_| IoError::OutOfBounds)?;
+        let mut req_buf = dma
+            .allocate(req_layout, DmaAccess::READ)
+            .map_err(IoError::from)?;
+        let header = BlkReq::new(ReqType::Flush, 0);
+        req_buf.as_mut()[..size_of::<BlkReq>()].copy_from_slice(as_bytes(&header));
+
+        let status_layout = Layout::array::<u8>(1).map_err(|_| IoError::OutOfBounds)?;
+        let mut status_buf = dma
+            .allocate(status_layout, DmaAccess::WRITE)
+            .map_err(IoError::from)?;
+        status_buf.as_mut()[0] = STATUS_UNWRITTEN;
+
+        let queue = &self.queues[0];
+        let token = {
+            let mut ring = queue.ring.try_lock().ok_or(PolledBlockError::QueueBusy)?;
+            let inputs = [&req_buf.as_ref()[..size_of::<BlkReq>()]];
+            let mut outputs = [&mut status_buf.as_mut()[..1]];
+            let token = ring.submit(&self.transport, &inputs, &mut outputs)?;
+            ring.notify(&self.transport);
+            token
+        };
+
+        let written = match self.poll_used_token(queue, token, &mut expired) {
+            Ok(written) => written,
+            Err(error) => {
+                // The device may still hold the chain; never free its DMA buffers.
+                core::mem::forget(req_buf);
+                core::mem::forget(status_buf);
+                return Err(error);
+            }
+        };
+        self.transport.ack_interrupt();
+        map_block_status(status_buf.as_ref()[0])?;
+        if usize::try_from(written).map_err(|_| IoError::DeviceFault)? < size_of::<u8>() {
+            return Err(IoError::DeviceFault.into());
+        }
+        self.counters.count(ReqType::Flush);
+        Ok(())
+    }
+
+    fn polled_read_chunk(
+        &self,
+        sector: u64,
+        dst: &mut [u8],
+        expired: &mut impl FnMut() -> bool,
+    ) -> Result<(), PolledBlockError> {
+        let dma = self.transport.bus().dma();
+        let req_layout =
+            Layout::array::<u8>(size_of::<BlkReq>()).map_err(|_| IoError::OutOfBounds)?;
+        let mut req_buf = dma
+            .allocate(req_layout, DmaAccess::READ)
+            .map_err(IoError::from)?;
+        let header = BlkReq::new(ReqType::In, sector);
+        req_buf.as_mut()[..size_of::<BlkReq>()].copy_from_slice(as_bytes(&header));
+
+        let data_layout = Layout::from_size_align(dst.len(), PhysFrame::SIZE)
+            .map_err(|_| IoError::OutOfBounds)?;
+        let mut data_buf = dma
+            .allocate_overwritten(data_layout, DmaAccess::WRITE)
+            .map_err(IoError::from)?;
+
+        let status_layout = Layout::array::<u8>(1).map_err(|_| IoError::OutOfBounds)?;
+        let mut status_buf = dma
+            .allocate(status_layout, DmaAccess::WRITE)
+            .map_err(IoError::from)?;
+        status_buf.as_mut()[0] = STATUS_UNWRITTEN;
+
+        let stride = self.segment_stride();
+        let queue = &self.queues[0];
+        let token = {
+            let mut ring = queue.ring.try_lock().ok_or(PolledBlockError::QueueBusy)?;
+            let inputs = [&req_buf.as_ref()[..size_of::<BlkReq>()]];
+            let mut outputs: ArrayVec<&mut [u8], MAX_CHAIN_BUFFERS> = ArrayVec::new();
+            for segment in data_buf.as_mut()[..dst.len()].chunks_mut(stride) {
+                outputs
+                    .try_push(segment)
+                    .map_err(|_| IoError::OutOfBounds)?;
+            }
+            outputs
+                .try_push(&mut status_buf.as_mut()[..1])
+                .map_err(|_| IoError::OutOfBounds)?;
+            let token = ring.submit(&self.transport, &inputs, &mut outputs)?;
+            ring.notify(&self.transport);
+            token
+        };
+
+        let written = match self.poll_used_token(queue, token, expired) {
+            Ok(written) => written,
+            Err(error) => {
+                // The device may still DMA into these buffers; leak rather than reuse.
+                core::mem::forget(req_buf);
+                core::mem::forget(data_buf);
+                core::mem::forget(status_buf);
+                return Err(error);
+            }
+        };
+        self.transport.ack_interrupt();
+        map_block_status(status_buf.as_ref()[0])?;
+        let payload_written = usize::try_from(written)
+            .map_err(|_| IoError::DeviceFault)?
+            .checked_sub(size_of::<u8>())
+            .ok_or(IoError::DeviceFault)?;
+        if payload_written != dst.len() {
+            return Err(IoError::DeviceFault.into());
+        }
+        dst.copy_from_slice(&data_buf.as_ref()[..dst.len()]);
+        self.counters.count(ReqType::In);
+        Ok(())
+    }
+
+    fn polled_write_chunk(
+        &self,
+        sector: u64,
+        data: &[u8],
+        expired: &mut impl FnMut() -> bool,
+    ) -> Result<(), PolledBlockError> {
+        let dma = self.transport.bus().dma();
+        let req_layout =
+            Layout::array::<u8>(size_of::<BlkReq>()).map_err(|_| IoError::OutOfBounds)?;
+        let mut req_buf = dma
+            .allocate(req_layout, DmaAccess::READ)
+            .map_err(IoError::from)?;
+        let header = BlkReq::new(ReqType::Out, sector);
+        req_buf.as_mut()[..size_of::<BlkReq>()].copy_from_slice(as_bytes(&header));
+
+        let data_layout = Layout::from_size_align(data.len(), PhysFrame::SIZE)
+            .map_err(|_| IoError::OutOfBounds)?;
+        let mut data_buf = dma
+            .allocate_overwritten(data_layout, DmaAccess::READ)
+            .map_err(IoError::from)?;
+        data_buf.as_mut()[..data.len()].copy_from_slice(data);
+
+        let status_layout = Layout::array::<u8>(1).map_err(|_| IoError::OutOfBounds)?;
+        let mut status_buf = dma
+            .allocate(status_layout, DmaAccess::WRITE)
+            .map_err(IoError::from)?;
+        status_buf.as_mut()[0] = STATUS_UNWRITTEN;
+
+        let stride = self.segment_stride();
+        let queue = &self.queues[0];
+        let token = {
+            let mut ring = queue.ring.try_lock().ok_or(PolledBlockError::QueueBusy)?;
+            let mut inputs: ArrayVec<&[u8], MAX_CHAIN_BUFFERS> = ArrayVec::new();
+            inputs
+                .try_push(&req_buf.as_ref()[..size_of::<BlkReq>()])
+                .map_err(|_| IoError::OutOfBounds)?;
+            for segment in data_buf.as_ref()[..data.len()].chunks(stride) {
+                inputs.try_push(segment).map_err(|_| IoError::OutOfBounds)?;
+            }
+            let mut outputs = [&mut status_buf.as_mut()[..1]];
+            let token = ring.submit(&self.transport, &inputs, &mut outputs)?;
+            ring.notify(&self.transport);
+            token
+        };
+
+        let written = match self.poll_used_token(queue, token, expired) {
+            Ok(written) => written,
+            Err(error) => {
+                // The device may still read or write these buffers; leak rather than reuse.
+                core::mem::forget(req_buf);
+                core::mem::forget(data_buf);
+                core::mem::forget(status_buf);
+                return Err(error);
+            }
+        };
+        self.transport.ack_interrupt();
+        map_block_status(status_buf.as_ref()[0])?;
+        if usize::try_from(written).map_err(|_| IoError::DeviceFault)? < size_of::<u8>() {
+            return Err(IoError::DeviceFault.into());
+        }
+        self.counters.count(ReqType::Out);
+        Ok(())
+    }
+
+    /// Spins on `queue`'s used ring until `token` completes or `expired` fires.
+    ///
+    /// Releases `queue.ring` before calling `expired` so callers (and unit
+    /// tests) may inspect the queue or pet a watchdog between polls.
+    fn poll_used_token(
+        &self,
+        queue: &BlockQueue<T, B>,
+        token: u16,
+        expired: &mut impl FnMut() -> bool,
+    ) -> Result<u32, PolledBlockError> {
+        loop {
+            let popped = queue
+                .ring
+                .try_lock()
+                .ok_or(PolledBlockError::QueueBusy)?
+                .pop_used_with_len()?;
+            match popped {
+                Some((completed, written)) if completed == token => return Ok(written),
+                Some(_) => return Err(IoError::DeviceFault.into()),
+                None if expired() => return Err(PolledBlockError::TimedOut),
+                None => spin_loop(),
+            }
+        }
     }
 
     /// The first sector of a logical block.
@@ -2023,6 +2352,45 @@ impl<T: VirtioTransport, C: QueueAffinity, B: BlockBuffer> VirtioBlockResource<T
     /// Brings a reset device back. See [`VirtioBlockDevice::reinitialize`].
     pub fn reinitialize(&self) -> Result<DeviceReset, ReinitError> {
         self.object().reinitialize()
+    }
+
+    /// Synchronously reads sectors by polling queue 0. See
+    /// [`VirtioBlockDevice::read_sectors_polled`].
+    pub fn read_sectors_polled(
+        &self,
+        start_sector: u64,
+        dst: &mut [u8],
+        expired: impl FnMut() -> bool,
+    ) -> Result<(), PolledBlockError> {
+        if !self.rights().contains(BlockDeviceRights::READ) {
+            return Err(IoError::PermissionDenied.into());
+        }
+        self.object()
+            .read_sectors_polled(start_sector, dst, expired)
+    }
+
+    /// Synchronously writes sectors by polling queue 0. See
+    /// [`VirtioBlockDevice::write_sectors_polled`].
+    pub fn write_sectors_polled(
+        &self,
+        start_sector: u64,
+        data: &[u8],
+        expired: impl FnMut() -> bool,
+    ) -> Result<(), PolledBlockError> {
+        if !self.rights().contains(BlockDeviceRights::WRITE) {
+            return Err(IoError::PermissionDenied.into());
+        }
+        self.object()
+            .write_sectors_polled(start_sector, data, expired)
+    }
+
+    /// Synchronously flushes volatile write caches by polling queue 0. See
+    /// [`VirtioBlockDevice::flush_polled`].
+    pub fn flush_polled(&self, expired: impl FnMut() -> bool) -> Result<(), PolledBlockError> {
+        if !self.rights().contains(BlockDeviceRights::WRITE) {
+            return Err(IoError::PermissionDenied.into());
+        }
+        self.object().flush_polled(expired)
     }
 
     /// The feature set the underlying device negotiated.

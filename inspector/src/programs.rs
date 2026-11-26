@@ -14,7 +14,7 @@ use helios_wit_rpc::inspector_fs;
 
 use crate::serial::RpcClient;
 
-pub(crate) const REMOTE_SHELL_PATH: &str = "/bin/dash";
+pub(crate) const REMOTE_SHELL_PATH: &str = "/bin/nu";
 
 /// One container mount specification passed to [`exec_in_container`].
 #[derive(Debug, Clone)]

@@ -591,6 +591,11 @@ impl Aarch64PlatformState {
         })
     }
 
+    /// The PSCI service when the platform describes one.
+    fn psci_optional(&self) -> Option<lifecycle::Psci> {
+        self.psci
+    }
+
     fn bootstrap_mpidr(&self) -> u64 {
         self.processors.get(ProcessorId::new(0)).mp_info.mpidr
     }
@@ -1508,6 +1513,13 @@ impl Cpu for Aarch64Cpu {
     }
 
     fn shutdown(&self) -> ! {
+        if let Some(psci) = self.state.psci_optional() {
+            if let Err(error) = psci.system_off() {
+                tracing::error!(?error, "PSCI SYSTEM_OFF returned an error");
+            }
+        } else {
+            tracing::warn!("AArch64 shutdown requested without a PSCI conduit");
+        }
         loop {
             self.park_current();
         }

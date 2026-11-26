@@ -100,7 +100,13 @@ pub async fn eval_command(
     format: OutputFormat,
 ) -> Result<String, ReplError> {
     let mut session = Box::pin(ShellSession::new(env)).await;
-    let value = Box::pin(session.eval(source)).await?;
+    let value = match Box::pin(session.eval(source)).await {
+        Ok(val) => val,
+        Err(err) => {
+            session.env().cleanup_active().await;
+            return Err(err.into());
+        }
+    };
     format_value(session.engine_state(), session.stack(), &value, format).await
 }
 
@@ -128,11 +134,22 @@ pub async fn eval_script(
     );
     let file_name = script_path.display().to_string();
     let out =
-        Box::pin(session.eval_source(&source, Some(&file_name), AsyncPipelineData::Empty)).await?;
-    let value = out
-        .into_value_async(Span::unknown())
-        .await
-        .map_err(helios_nu::NuError::from)?;
+        match Box::pin(session.eval_source(&source, Some(&file_name), AsyncPipelineData::Empty))
+            .await
+        {
+            Ok(out) => out,
+            Err(err) => {
+                session.env().cleanup_active().await;
+                return Err(err.into());
+            }
+        };
+    let value = match out.into_value_async(Span::unknown()).await {
+        Ok(val) => val,
+        Err(err) => {
+            session.env().cleanup_active().await;
+            return Err(helios_nu::NuError::from(err).into());
+        }
+    };
     format_value(session.engine_state(), session.stack(), &value, format).await
 }
 
@@ -333,13 +350,17 @@ async fn eval_interruptible(
     source: &str,
     interrupt_flag: &AtomicBool,
 ) -> EvalOutcome {
-    tokio::select! {
+    let outcome = tokio::select! {
         res = Box::pin(session.eval(source)) => EvalOutcome::Completed(res),
         _ = tokio::signal::ctrl_c() => {
             interrupt_flag.store(true, std::sync::atomic::Ordering::Release);
             EvalOutcome::Interrupted
         }
+    };
+    if matches!(outcome, EvalOutcome::Interrupted) {
+        session.env().cleanup_active().await;
     }
+    outcome
 }
 
 /// Render a Nushell [`Value`] in the requested [`OutputFormat`].

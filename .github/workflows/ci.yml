@@ -871,7 +871,7 @@ jobs:
             --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
-            shell -c 'echo ok' 2>&1 > boot-smoke.out | tee "$runtime/inspector.log"
+            shell --shell /bin/dash -c 'echo ok' 2>&1 > boot-smoke.out | tee "$runtime/inspector.log"
           cat boot-smoke.out
           grep -Fqx ok boot-smoke.out
       # Verified boot needs no TPM (#602): the payload the boot above
@@ -894,7 +894,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --bootfs "$runtime/helios-bootfs" \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
-            shell -c 'echo ok' > "$runtime/shell.out" 2> "$runtime/inspector.log"; then
+            shell --shell /bin/dash -c 'echo ok' > "$runtime/shell.out" 2> "$runtime/inspector.log"; then
             echo 'the inspector booted a payload whose signature does not match'
             exit 1
           fi
@@ -920,7 +920,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --boot-program date \
             --no-compiler-plugin \
-            shell -c '/bin/date' > wall-clock-smoke.out 2>&1
+            shell --shell /bin/dash -c '/bin/date' > wall-clock-smoke.out 2>&1
           cat wall-clock-smoke.out
           guest_epoch="$(sed -n 's/^unix_seconds=\([0-9][0-9]*\).*$/\1/p' wall-clock-smoke.out | tail -n 1)"
           host_epoch="$(date +%s)"
@@ -948,7 +948,7 @@ jobs:
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --boot-program ls --boot-program mkdir --boot-program cat \
             --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c 'mkdir /d; echo coreutils:ok > /d/f; cat /d/f; ls /' \
             2>&1 > coreutils-smoke.out | tee "$runtime/inspector.log"
           cat coreutils-smoke.out
@@ -980,7 +980,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --boot-program python3 \
             --no-compiler-plugin \
-            shell -c 'python3 -c "import json, pathlib; print(json.dumps({\"ok\": pathlib.PurePosixPath(\"/a\").name}, separators=(\",\",\":\")))"' \
+            shell --shell /bin/dash -c 'python3 -c "import json, pathlib; print(json.dumps({\"ok\": pathlib.PurePosixPath(\"/a\").name}, separators=(\",\",\":\")))"' \
             2>&1 > cpython-smoke.out | tee "$runtime/inspector.log"
           cat cpython-smoke.out
           grep -Fqx '{"ok":"a"}' cpython-smoke.out
@@ -1009,7 +1009,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --boot-program oob-load \
             --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c '/bin/oob-load; echo guest-alive' \
             2>&1 > oob-load-smoke.out | tee "$runtime/inspector.log"
           cat oob-load-smoke.out
@@ -1030,7 +1030,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --boot-program stack-test \
             --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c '/bin/stack-test host-call && /bin/stack-test large-frame && (/bin/stack-test recurse; echo after-recurse) && (/bin/stack-test large-frame-overflow; echo after-large-frame-overflow)' \
             2>&1 > stack-test-smoke.out | tee "$runtime/inspector.log"
           cat stack-test-smoke.out
@@ -1054,7 +1054,7 @@ jobs:
             --accel tcg \
             --rpc-transport vsock \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
-            shell -c 'echo ok' > vsock-smoke.out
+            shell --shell /bin/dash -c 'echo ok' > vsock-smoke.out
           cat vsock-smoke.out
           grep -Fqx ok vsock-smoke.out
       - name: Boot riscv64 guest on two NUMA nodes
@@ -1078,7 +1078,7 @@ jobs:
             --rpc-transport vsock \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
-            shell -c 'echo ok' 2>&1 > boot-numa.out | tee "$runtime/inspector.log"
+            shell --shell /bin/dash -c 'echo ok' 2>&1 > boot-numa.out | tee "$runtime/inspector.log"
           cat boot-numa.out
           grep -Fqx ok boot-numa.out
           grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
@@ -1284,7 +1284,7 @@ jobs:
             --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
-            shell -c 'echo ok' 2>&1 > boot-dt.out | tee "$runtime/inspector.log"
+            shell --shell /bin/dash -c 'echo ok' 2>&1 > boot-dt.out | tee "$runtime/inspector.log"
           cat boot-dt.out
           grep -Fqx ok boot-dt.out
           grep -F 'platform described by device-tree' "$runtime/inspector.log"
@@ -1322,7 +1322,7 @@ jobs:
             --accel tcg --smp 4 --numa-nodes 2 --numa-distance 20 \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
-            shell -c 'echo ok' 2>&1 > boot-numa.out | tee "$runtime/inspector.log"
+            shell --shell /bin/dash -c 'echo ok' 2>&1 > boot-numa.out | tee "$runtime/inspector.log"
           cat boot-numa.out
           grep -Fqx ok boot-numa.out
           grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
@@ -1346,7 +1346,7 @@ jobs:
             --accel tcg --smp 4 --numa-nodes 2 --numa-distance 20 \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
-            shell -c 'echo ok' 2>&1 > boot-acpi-numa.out | tee "$runtime/inspector.log"
+            shell --shell /bin/dash -c 'echo ok' 2>&1 > boot-acpi-numa.out | tee "$runtime/inspector.log"
           cat boot-acpi-numa.out
           grep -Fqx ok boot-acpi-numa.out
           grep -F 'platform described by acpi' "$runtime/inspector.log"
@@ -1376,7 +1376,7 @@ jobs:
             --accel tcg \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
-            shell -c 'echo ok' 2>&1 > boot-acpi.out | tee "$runtime/inspector.log"
+            shell --shell /bin/dash -c 'echo ok' 2>&1 > boot-acpi.out | tee "$runtime/inspector.log"
           cat boot-acpi.out
           grep -Fqx ok boot-acpi.out
           grep -F 'platform described by acpi' "$runtime/inspector.log"
@@ -1407,7 +1407,7 @@ jobs:
             --accel tcg --mte off \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
-            shell -c 'echo ok' 2>&1 > boot-mte-off.out | tee "$runtime/inspector.log"
+            shell --shell /bin/dash -c 'echo ok' 2>&1 > boot-mte-off.out | tee "$runtime/inspector.log"
           cat boot-mte-off.out
           grep -Fqx ok boot-mte-off.out
           grep -F 'memory tagging not enabled by this backend' "$runtime/inspector.log"
@@ -1453,7 +1453,7 @@ jobs:
             --bootfs-root "$runtime/bootfs" \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --boot-program cat --boot-program wasix-port-list \
             --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1; /linux/sockets; /linux/netconfig; /bin/dash /linux/check-busybox-netconfig.sh /linux/busybox /linux/udhcpc-script.sh /bin/wasix-port-list; /linux/files; printf "from-wasix: 中文 日本語 한국어\n" > /tmp/cross.txt && /linux/files cross /tmp/cross.txt && cat /tmp/cross.txt /tmp/cross.txt.mmap; /linux/readiness hold-open | /linux/readiness stdin-quiet; /linux/readiness stdin-epoll >/dev/null && echo "stdin-epoll: ok"; /linux/tty; /linux/permissions; /linux/process; /linux/process mixed /bin/cat; /bin/dash /linux/check-dash.sh /linux/dash /linux/hello /linux/args /bin/cat; echo "dash:$?"; /linux/curl -fsS --max-time 30 http://10.0.2.2:'"$curl_port"'/hello' \
+            shell --shell /bin/dash -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1; /linux/sockets; /linux/netconfig; /bin/dash /linux/check-busybox-netconfig.sh /linux/busybox /linux/udhcpc-script.sh /bin/wasix-port-list; /linux/files; printf "from-wasix: 中文 日本語 한국어\n" > /tmp/cross.txt && /linux/files cross /tmp/cross.txt && cat /tmp/cross.txt /tmp/cross.txt.mmap; /linux/readiness hold-open | /linux/readiness stdin-quiet; /linux/readiness stdin-epoll >/dev/null && echo "stdin-epoll: ok"; /linux/tty; /linux/permissions; /linux/process; /linux/process mixed /bin/cat; /bin/dash /linux/check-dash.sh /linux/dash /linux/hello /linux/args /bin/cat; echo "dash:$?"; /linux/curl -fsS --max-time 30 http://10.0.2.2:'"$curl_port"'/hello' \
             2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
           cat linux-smoke.out
           grep -Fqx 'arg1=3' linux-smoke.out
@@ -1521,7 +1521,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --boot-program oob-load \
             --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c '/bin/oob-load; echo guest-alive' \
             2>&1 > oob-load-smoke.out | tee "$runtime/inspector.log"
           cat oob-load-smoke.out
@@ -1542,7 +1542,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --boot-program stack-test \
             --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c '/bin/stack-test host-call && /bin/stack-test large-frame && (/bin/stack-test recurse; echo after-recurse) && (/bin/stack-test large-frame-overflow; echo after-large-frame-overflow)' \
             2>&1 > stack-test-smoke.out | tee "$runtime/inspector.log"
           cat stack-test-smoke.out
@@ -1585,7 +1585,7 @@ jobs:
             ./target/release/helios vm --arch aarch64 --release --memory 2G --acpi \
               --accel tcg --tpm swtpm --tpm-state "$state" \
               --runtime-dir "$runtime" --keep-runtime-dir "$@" \
-              shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+              shell --shell /bin/dash -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
             grep -Fqx ok "$runtime/shell.out"
           }
           boot acpi-retention-1 --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin
@@ -1621,7 +1621,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --bootfs "$runtime/helios-bootfs" \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
-            shell -c 'echo ok' > "$runtime/shell.out" 2> "$runtime/inspector.log"; then
+            shell --shell /bin/dash -c 'echo ok' > "$runtime/shell.out" 2> "$runtime/inspector.log"; then
             echo 'the inspector booted a payload whose signature does not match'
             exit 1
           fi
@@ -1650,7 +1650,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --boot-program date \
             --no-compiler-plugin \
-            shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+            shell --shell /bin/dash -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
           grep -Fqx ok "$runtime/shell.out"
           changed="$("$check" settled "$runtime/debug-serial.log" provisioned-and-sealed state-changed)"
           retained="$(cat "$RUNNER_TEMP/tpm-signer-aarch64-acpi")"
@@ -1684,7 +1684,7 @@ jobs:
               --accel tcg --tpm swtpm --tpm-state "$state" \
               --runtime-dir "$runtime" --keep-runtime-dir \
               --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
-              shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+              shell --shell /bin/dash -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
             grep -Fqx ok "$runtime/shell.out"
             grep -F 'platform described by device-tree' "$runtime/inspector.log"
           }
@@ -2049,7 +2049,7 @@ jobs:
             --disk "$runtime/src-a.img,serial=src-a" \
             --disk "$runtime/src-b.img,serial=src-b,readonly" \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
-            shell -c 'echo ok' 2>&1 > boot-smoke.out | tee "$runtime/inspector.log"
+            shell --shell /bin/dash -c 'echo ok' 2>&1 > boot-smoke.out | tee "$runtime/inspector.log"
           cat boot-smoke.out
           grep -Fqx ok boot-smoke.out
           # The kernel writes its boot lines to the one UART the guest
@@ -2076,7 +2076,7 @@ jobs:
             --accel kvm --iommu --desktop --audiodev none \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
-            shell -c 'echo ok' 2>&1 > boot-iommu.out | tee "$runtime/inspector.log"
+            shell --shell /bin/dash -c 'echo ok' 2>&1 > boot-iommu.out | tee "$runtime/inspector.log"
           cat boot-iommu.out
           grep -Fqx ok boot-iommu.out
           grep -aF 'virtio-iommu online' "$runtime/debug-serial.log"
@@ -2102,7 +2102,7 @@ jobs:
             --accel kvm --smp 4 --numa-nodes 2 --numa-distance 20 \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
-            shell -c 'echo ok' 2>&1 > boot-numa.out | tee "$runtime/inspector.log"
+            shell --shell /bin/dash -c 'echo ok' 2>&1 > boot-numa.out | tee "$runtime/inspector.log"
           cat boot-numa.out
           grep -Fqx ok boot-numa.out
           grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
@@ -2133,7 +2133,7 @@ jobs:
             ./target/release/helios vm --arch x86-64 --release --memory 2G \
               --accel kvm --tpm swtpm --tpm-state "$state" \
               --runtime-dir "$runtime" --keep-runtime-dir "$@" \
-              shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+              shell --shell /bin/dash -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
             grep -Fqx ok "$runtime/shell.out"
           }
           boot retention-1 --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin
@@ -2165,7 +2165,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --bootfs "$runtime/helios-bootfs" \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
-            shell -c 'echo ok' > "$runtime/shell.out" 2> "$runtime/inspector.log"; then
+            shell --shell /bin/dash -c 'echo ok' > "$runtime/shell.out" 2> "$runtime/inspector.log"; then
             echo 'the inspector booted a payload whose signature does not match'
             exit 1
           fi
@@ -2190,7 +2190,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --boot-program date \
             --no-compiler-plugin \
-            shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+            shell --shell /bin/dash -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
           grep -Fqx ok "$runtime/shell.out"
           changed="$("$check" settled "$runtime/debug-serial.log" provisioned-and-sealed state-changed)"
           retained="$(cat "$RUNNER_TEMP/tpm-signer-x86-64")"
@@ -2219,7 +2219,7 @@ jobs:
             --boot-program ls --boot-program mkdir --boot-program cat \
             --boot-program date \
             --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c 'mkdir /d; echo coreutils:ok > /d/f; cat /d/f; ls /; echo "sub:$(date)"; date | cat; echo "suberr:$(date x 2>&1)"; date x 2>&1; echo after:ok' \
             2>&1 > coreutils-smoke.out | tee "$runtime/inspector.log"
           cat coreutils-smoke.out
@@ -2271,7 +2271,7 @@ jobs:
             --bootfs-root "$runtime/bootfs" \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --boot-program cat --boot-program wasix-port-list \
             --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1; /linux/sockets; /linux/netconfig; /bin/dash /linux/check-busybox-netconfig.sh /linux/busybox /linux/udhcpc-script.sh /bin/wasix-port-list; /linux/files; printf "from-wasix: 中文 日本語 한국어\n" > /tmp/cross.txt && /linux/files cross /tmp/cross.txt && cat /tmp/cross.txt /tmp/cross.txt.mmap; /linux/readiness hold-open | /linux/readiness stdin-quiet; /linux/readiness stdin-epoll >/dev/null && echo "stdin-epoll: ok"; /linux/tty; /linux/permissions; /linux/process; /linux/process mixed /bin/cat; /bin/dash /linux/check-dash.sh /linux/dash /linux/hello /linux/args /bin/cat; echo "dash:$?"; /linux/curl -fsS --max-time 30 http://10.0.2.2:'"$curl_port"'/hello' \
+            shell --shell /bin/dash -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1; /linux/sockets; /linux/netconfig; /bin/dash /linux/check-busybox-netconfig.sh /linux/busybox /linux/udhcpc-script.sh /bin/wasix-port-list; /linux/files; printf "from-wasix: 中文 日本語 한국어\n" > /tmp/cross.txt && /linux/files cross /tmp/cross.txt && cat /tmp/cross.txt /tmp/cross.txt.mmap; /linux/readiness hold-open | /linux/readiness stdin-quiet; /linux/readiness stdin-epoll >/dev/null && echo "stdin-epoll: ok"; /linux/tty; /linux/permissions; /linux/process; /linux/process mixed /bin/cat; /bin/dash /linux/check-dash.sh /linux/dash /linux/hello /linux/args /bin/cat; echo "dash:$?"; /linux/curl -fsS --max-time 30 http://10.0.2.2:'"$curl_port"'/hello' \
             2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
           cat linux-smoke.out
           grep -Fqx 'arg1=3' linux-smoke.out
@@ -2343,7 +2343,7 @@ jobs:
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --boot-program python3 \
             --no-compiler-plugin \
             --enable-target helios_kernel::exec::phases \
-            shell -c 'python3 -c "print(1)"; python3 -c "print(2)"' \
+            shell --shell /bin/dash -c 'python3 -c "print(1)"; python3 -c "print(2)"' \
             2>&1 > cpython-phases-smoke.out | tee "$runtime/inspector.log"
           cat cpython-phases-smoke.out
           # debug-serial.log carries console escape bytes, so grep reads
@@ -2404,7 +2404,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --boot-program oob-load \
             --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c '/bin/oob-load; echo guest-alive' \
             2>&1 > oob-load-smoke.out | tee "$runtime/inspector.log"
           cat oob-load-smoke.out
@@ -2425,7 +2425,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --boot-program stack-test \
             --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c '/bin/stack-test host-call && /bin/stack-test large-frame && (/bin/stack-test recurse; echo after-recurse) && (/bin/stack-test large-frame-overflow; echo after-large-frame-overflow)' \
             2>&1 > stack-test-smoke.out | tee "$runtime/inspector.log"
           cat stack-test-smoke.out
@@ -2453,7 +2453,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c 'echo guest-alive' \
             2>&1 > maxcpus-smoke.out | tee "$runtime/inspector.log"
           cat maxcpus-smoke.out
@@ -2496,7 +2496,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --boot-program python3 \
             --boot-program wasix-atomic-wait-timeout --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c 'python3 -c "import pathlib; b = pathlib.Path(\"/bin/wasix-atomic-wait-timeout\").read_bytes(); pathlib.Path(\"/copy\").write_bytes(b); f = bytearray(b); f[-13] ^= 1; pathlib.Path(\"/forged\").write_bytes(bytes(f))" && echo cwasm:written; /bin/wasix-atomic-wait-timeout && echo original:ran; /copy && echo copy:ran || echo copy:refused; /forged && echo forged:ran || echo forged:refused' \
             2>&1 > unsigned-cwasm-smoke.out | tee "$runtime/inspector.log"
           cat unsigned-cwasm-smoke.out
@@ -2529,7 +2529,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --boot-program wasix-atomic-wait-timeout --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c '/bin/wasix-atomic-wait-timeout' \
             2>&1 > atomic-wait-timeout-smoke.out | tee "$runtime/inspector.log"
           cat atomic-wait-timeout-smoke.out
@@ -2555,7 +2555,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --boot-program wasix-atomic-wait-kill --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c '/bin/wasix-atomic-wait-kill' \
             2>&1 > "$runtime/guest.log" | tee "$runtime/inspector.log"
           cat "$runtime/guest.log"
@@ -2584,7 +2584,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --boot-program wasix-orphan-threads --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c '/bin/wasix-orphan-threads; echo orphan-threads:exit=$?' \
             2>&1 > "$runtime/guest.log" | tee "$runtime/inspector.log"
           cat "$runtime/guest.log"
@@ -2612,7 +2612,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --boot-program wasix-thread-proc-exit --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c '/bin/wasix-thread-proc-exit; echo thread-proc-exit:exit=$?' \
             2>&1 > "$runtime/guest.log" | tee "$runtime/inspector.log"
           cat "$runtime/guest.log"
@@ -2644,7 +2644,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --boot-program wasix-thread-exec --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c '/bin/wasix-thread-exec; echo thread-exec:exit=$?' \
             2>&1 > "$runtime/guest.log" | tee "$runtime/inspector.log"
           cat "$runtime/guest.log"
@@ -2677,7 +2677,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --boot-program wasix-thread-trap --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c '/bin/wasix-thread-trap main; echo main-trap:exit=$?; /bin/wasix-thread-trap; echo thread-trap:exit=$?' \
             2>&1 > "$runtime/guest.log" | tee "$runtime/inspector.log"
           cat "$runtime/guest.log"
@@ -3008,7 +3008,7 @@ jobs:
             --audiodev "wav:$evidence/tone.wav" \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --boot-program audio-test --no-compiler-plugin \
-            shell -c '/bin/audio-test --seconds 2' \
+            shell --shell /bin/dash -c '/bin/audio-test --seconds 2' \
             2>&1 > audio-smoke.out | tee "$runtime/inspector.log"
           cat audio-smoke.out
           # The driver answered its bring-up queries before any of this.
@@ -3061,7 +3061,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --boot-program procbench --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c '/bin/procbench swap-cycle --mib 64 /bin/procbench' \
             2>&1 > swap-cycle.out | tee "$runtime/inspector.log"
           cat swap-cycle.out
@@ -3546,7 +3546,7 @@ jobs:
             --display egl-headless \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --boot-program gpu-test --no-compiler-plugin \
-            shell -c 'gpu-test --expect-renderer && echo gpu-ok' \
+            shell --shell /bin/dash -c 'gpu-test --expect-renderer && echo gpu-ok' \
             2>&1 > venus-smoke.out | tee "$runtime/inspector.log"
           cat venus-smoke.out
           grep -Fqx gpu-ok venus-smoke.out
@@ -4023,13 +4023,17 @@ jobs:
                 api \
                 api-macro \
                 artifact \
+                component-manager \
                 hal \
                 inspector \
                 inspector-protocol \
                 inspector-shell \
                 nu-shell \
+                oci \
                 ops \
                 profdata \
+                wit-rpc \
+                wit-rpc-macro \
                 workspace-root \
                 wit \
                 Cargo.toml \

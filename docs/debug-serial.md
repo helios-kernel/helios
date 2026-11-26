@@ -1,6 +1,6 @@
 # The debug serial line
 
-Every Helios guest under `helios-inspector vm` gets one 16550 bound to a
+Every Helios guest under `helios vm` gets one 16550 bound to a
 Unix socket in the VM's runtime directory. It carries three things at
 once: the kernel console mirror, the embedded debugger's `[KDBG …]`
 stage markers, and — under `--rpc-transport serial`, the default — the
