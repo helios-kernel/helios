@@ -6,16 +6,19 @@
 //! carry no global namespace and enter another instance only through explicit
 //! `programs.spawn` / `programs.exec` `capability-grants`.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use helios_hal::cpu::Cpu;
-use wasmtime::component::{Accessor, HasSelf, Linker, Resource};
+use wasmtime::component::{Accessor, HasSelf, Linker, Resource, WasmList};
 
 use crate::ComponentHostNetwork;
 use crate::wasmtime_adapter::bindings::ipc::bindings::helios::system::ipc as ipc_wit;
 
 use super::{StoreData, lower_bytes_to_vec};
+
+const IPC_INSTANCE: &str = "helios:system/ipc@0.1.0";
 
 pub(super) fn add_ipc_to_linker<CpuImpl, Net, StorageImpl>(
     linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
@@ -27,7 +30,47 @@ where
 {
     ipc_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(linker, |state| {
         state
-    })
+    })?;
+    // Shadow `[method]endpoint.write` with a zero-copy `WasmList<u8>` view and
+    // copy at most `IPC_MAX_CHUNK_BYTES` at a time from guest linear memory so
+    // an arbitrary-sized guest slice cannot force an unbounded kernel-heap
+    // allocation before bounded-channel backpressure engages.
+    let mut instance = linker.instance(IPC_INSTANCE)?;
+    instance.func_wrap_concurrent(
+        "[method]endpoint.write",
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+         (endpoint, bytes): (Resource<crate::IpcEndpoint>, WasmList<u8>)| {
+            Box::pin(async move {
+                let shared = accessor.with(|mut access| {
+                    Ok::<_, wasmtime::Error>(access.get().table.get(&endpoint)?.shared())
+                })?;
+                let total_len = bytes.len();
+                if total_len == 0 {
+                    let response = shared
+                        .write(&[])
+                        .await
+                        .map_err(|crate::IpcError::Closed| ipc_wit::IpcError::Closed);
+                    return Ok::<_, wasmtime::Error>((response,));
+                }
+                let mut offset = 0usize;
+                let mut scratch = Vec::with_capacity(total_len.min(crate::IPC_MAX_CHUNK_BYTES));
+                while offset < total_len {
+                    let end = (offset + crate::IPC_MAX_CHUNK_BYTES).min(total_len);
+                    accessor.with(|access| {
+                        let slice = bytes.as_le_slice(&access);
+                        scratch.clear();
+                        scratch.extend_from_slice(&slice[offset..end]);
+                    });
+                    if let Err(crate::IpcError::Closed) = shared.write(&scratch).await {
+                        return Ok((Err(ipc_wit::IpcError::Closed),));
+                    }
+                    offset = end;
+                }
+                Ok((Ok(()),))
+            })
+        },
+    )?;
+    Ok(())
 }
 
 impl<CpuImpl, Net, StorageImpl> ipc_wit::Host for StoreData<CpuImpl, Net, StorageImpl>
@@ -237,6 +280,15 @@ mod tests {
         .unwrap();
 
         ipc_wit::HostEndpoint::drop(store.data_mut(), claimed).unwrap();
+    }
+
+    #[test]
+    fn add_ipc_to_linker_shadows_endpoint_write_with_chunked_wasm_list() {
+        let engine = build_component_engine_for_platform(&TestCpu::with_entropy(0x33)).unwrap();
+        let mut linker = wasmtime::component::Linker::<TestStoreData>::new(&engine);
+        linker.allow_shadowing(true);
+        super::add_ipc_to_linker(&mut linker)
+            .expect("add_ipc_to_linker must register and shadow endpoint.write");
     }
 
     mod resource_borrow {
