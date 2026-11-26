@@ -136,13 +136,20 @@ impl From<RawProfileError> for GuestProfileRefusal {
 /// per window.
 const WINDOW_BYTES: u32 = 256 * 1024;
 
-/// Writes the guest kernel's LLVM raw profile, then merges it.
+/// Inspect or collect profiling data (`instructions`, `folded`, `metrics`, `llvm-raw`),
+/// or collect the guest kernel's LLVM raw profile directly to `<output>`.
 #[derive(Debug, Clone, ClapArgs)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub(super) struct ProfileCommand {
+    /// Unified profiling subcommand (`instructions`, `folded`, `metrics`, `llvm-raw`).
+    #[command(subcommand)]
+    pub(super) subcommand: Option<crate::ops_cli::ProfileOpsCommand>,
+
     /// Path the raw profile is written to. The merged profile is written
     /// beside it with a `.profdata` extension unless `--profdata` names
     /// another path.
-    pub(super) output: PathBuf,
+    #[arg(id = "raw_profile_output", value_name = "OUTPUT", required = true)]
+    pub(super) output: Option<PathBuf>,
 
     /// Path for the merged profile `-C profile-use` reads.
     #[arg(long)]
@@ -150,10 +157,16 @@ pub(super) struct ProfileCommand {
 }
 
 impl ProfileCommand {
+    fn raw_output_path(&self) -> &Path {
+        self.output
+            .as_deref()
+            .expect("clap requires `output` when no profile subcommand is selected")
+    }
+
     fn profdata_path(&self) -> PathBuf {
         self.profdata
             .clone()
-            .unwrap_or_else(|| self.output.with_extension("profdata"))
+            .unwrap_or_else(|| self.raw_output_path().with_extension("profdata"))
     }
 }
 
@@ -162,7 +175,7 @@ pub(super) async fn run(
     client: &RpcClient,
     command: &ProfileCommand,
 ) -> Result<(), RawProfileCollectError> {
-    collect(client, &command.output, &command.profdata_path()).await
+    collect(client, command.raw_output_path(), &command.profdata_path()).await
 }
 
 /// Collects into `raw`, then merges into `raw` with a `.profdata`

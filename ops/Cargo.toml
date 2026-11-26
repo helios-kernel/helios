@@ -4,6 +4,8 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+addr2line = { version = "0.26.1", default-features = false, features = ["std"] }
+askama = { version = "0.15.6", default-features = false, features = ["std", "derive"] }
 async-channel = { version = "2.5.0", default-features = false }
 async-io = { version = "2.6.0", default-features = false }
 async-net = { version = "2.0.0", default-features = false }
@@ -11,13 +13,17 @@ directories = { version = "6.0.0", default-features = false }
 futures-io = { version = "0.3.34", default-features = false, features = ["std"] }
 futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
 futures-util = { version = "0.3.31", default-features = false, features = ["std", "io"] }
+gimli = { version = "0.33.0", default-features = false, features = ["read", "endian-reader", "std"] }
 helios-inspector-protocol = { workspace = true }
 helios-oci = { workspace = true }
 helios-wit-rpc = { workspace = true, features = ["inspector-rpc"] }
+object = { version = "0.39", default-features = false, features = ["elf", "read", "std"] }
+rustc-demangle = { version = "0.1.28", default-features = false }
 serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
 serialport = { version = "4.10.1", default-features = false }
 tar = { version = "0.4.46", default-features = false }
+tempfile = { workspace = true }
 thiserror = { version = "2.0.21", default-features = false }
 time = { version = "0.3.47", default-features = false, features = ["formatting", "std"] }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
@@ -30,7 +36,7 @@ zstd = { version = "0.13.5", default-features = false }
 vsock = { version = "0.5.1", default-features = false }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+gimli = { version = "0.33.0", default-features = false, features = ["read", "endian-reader", "std", "write"] }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [lints]

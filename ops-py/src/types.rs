@@ -26,6 +26,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tokio::sync::Mutex;
 
+use crate::clients::PyByteStream;
 use crate::error::{HeliosError, ops_err_to_py, target_err_to_py};
 
 /// Build [`SessionOptions`] from optional Python keyword arguments.
@@ -462,6 +463,15 @@ impl PyInspectSnapshot {
         Ok(dict.unbind())
     }
 
+    /// Build a dynamic tab-completable `InspectNode` tree from this snapshot.
+    fn tree(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let module = py.import("helios._inspect")?;
+        let cls = module.getattr("InspectNode")?;
+        let entries = self.to_dict(py)?;
+        let node = cls.call_method1("from_snapshot", (entries,))?;
+        Ok(node.unbind())
+    }
+
     fn __len__(&self) -> usize {
         self.inner.entries.len()
     }
@@ -661,6 +671,67 @@ impl PyChild {
             .try_lock()
             .ok()
             .and_then(|guard| guard.as_ref().and_then(Child::instance_id))
+    }
+
+    /// `AsyncIterator[bytes]` yielding stdout chunks until EOF.
+    #[getter]
+    fn stdout(&self) -> PyByteStream {
+        PyByteStream::new(self.stdout.clone())
+    }
+
+    /// `AsyncIterator[bytes]` yielding stderr chunks until EOF.
+    #[getter]
+    fn stderr(&self) -> PyByteStream {
+        PyByteStream::new(self.stderr.clone())
+    }
+
+    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(slf) })
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _exc_type: Option<&Bound<'py, PyAny>>,
+        _exc_val: Option<&Bound<'py, PyAny>>,
+        _exc_tb: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let holder = Arc::clone(&self.child);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let child = holder.lock().await.take();
+            if let Some(child) = child {
+                let _ = child.close_stdin().await;
+                let _ = child.signal("TERM").await;
+                drop(child);
+            }
+            Ok(false)
+        })
+    }
+
+    /// Write raw bytes into the running child's stdin stream.
+    fn write_stdin<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+        let holder = Arc::clone(&self.child);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = holder.lock().await;
+            let child = guard
+                .as_ref()
+                .ok_or_else(|| HeliosError::new_err("Child has already exited"))?;
+            child.write_stdin(&data).await.map_err(ops_err_to_py)?;
+            Ok(())
+        })
+    }
+
+    /// Close the running child's stdin stream to deliver EOF.
+    fn close_stdin<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let holder = Arc::clone(&self.child);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = holder.lock().await;
+            if let Some(child) = guard.as_ref() {
+                child.close_stdin().await.map_err(ops_err_to_py)?;
+            }
+            Ok(())
+        })
     }
 
     /// Read the next stdout chunk asynchronously, returning `None` on EOF.
@@ -914,7 +985,11 @@ impl OutcomeErrorKind {
             | OpsError::RawProfileRefused { .. }
             | OpsError::ProcessorOfflineRefused { .. }
             | OpsError::ProcessorOnlineRefused { .. }
-            | OpsError::ExecRefused { .. } => Self::Rpc,
+            | OpsError::ExecRefused { .. }
+            | OpsError::ComponentControlRefused { .. }
+            | OpsError::SnapshotRefused { .. }
+            | OpsError::MountRefused { .. }
+            | OpsError::BtrfsRefused { .. } => Self::Rpc,
             _ => Self::Other,
         }
     }

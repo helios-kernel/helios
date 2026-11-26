@@ -6,11 +6,15 @@ use std::path::PathBuf;
 use helios_ops::{
     Attenuation, DiagnosticBundle, GrantRight, OpsError, Session, SpawnRequest, TargetStore,
 };
-use helios_wit_rpc::inspector::helios::system::tracing as sys_tracing;
+use helios_wit_rpc::inspector::helios::system::{programs::ExecRequest, tracing as sys_tracing};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+use crate::clients::{
+    PyBtrfsClient, PyComponentsClient, PyInstructionProfile, PyLinuxClient, PyMountsClient,
+    PyOciClient, PySamplingSession, PyVmClient, extract_path_and_args, extract_process_grants,
+};
 use crate::error::{ops_err_to_py, target_err_to_py};
 use crate::types::{
     PyChild, PyDiagnosticBundle, PyExecResult, PyInspectSnapshot, PyInstance, PyRemoteEntry,
@@ -95,6 +99,60 @@ impl PySession {
     #[getter]
     fn whoami(&self) -> String {
         self.inner.whoami()
+    }
+
+    #[getter]
+    fn components(&self) -> PyComponentsClient {
+        PyComponentsClient::new(self.inner.clone())
+    }
+
+    #[getter]
+    fn oci(&self) -> PyOciClient {
+        PyOciClient::new(self.inner.clone())
+    }
+
+    #[getter]
+    fn linux(&self) -> PyLinuxClient {
+        PyLinuxClient::new(self.inner.clone())
+    }
+
+    #[getter]
+    fn mounts(&self) -> PyMountsClient {
+        PyMountsClient::new(self.inner.clone())
+    }
+
+    #[getter]
+    fn btrfs(&self) -> PyBtrfsClient {
+        PyBtrfsClient::new(self.inner.clone())
+    }
+
+    #[getter]
+    fn vm(&self) -> PyVmClient {
+        PyVmClient::new(self.inner.clone())
+    }
+
+    /// Start periodic kernel instruction sampling, returning an async context manager [`SamplingSession`].
+    fn start_instruction_sampling<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let session = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let lease = session
+                .start_instruction_sampling()
+                .await
+                .map_err(ops_err_to_py)?;
+            Ok(PySamplingSession::new(lease))
+        })
+    }
+
+    /// Fetch collected kernel instruction samples.
+    fn instruction_samples<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let session = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let profile = session
+                .profile_instruction_samples()
+                .await
+                .map_err(ops_err_to_py)?;
+            Ok(PyInstructionProfile { inner: profile })
+        })
     }
 
     fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -252,46 +310,72 @@ impl PySession {
         })
     }
 
-    /// Execute a program by path via `helios:system/programs.exec`.
-    #[pyo3(signature = (path, args=None))]
+    /// Execute a program by path or argv via `helios:system/programs.exec`.
+    #[pyo3(signature = (command, args=None, *, cwd=None, env=None, stdin=None, grants=None))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the typed Python Session.exec(argv, *, cwd, env, stdin, grants) surface"
+    )]
     fn exec<'py>(
         &self,
         py: Python<'py>,
-        path: String,
+        command: &Bound<'py, PyAny>,
         args: Option<Vec<String>>,
+        cwd: Option<String>,
+        env: Option<BTreeMap<String, String>>,
+        stdin: Option<Vec<u8>>,
+        grants: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let (path, argv) = extract_path_and_args(command, args)?;
+        let capability_grants = extract_process_grants(grants)?;
         let session = self.inner.clone();
-        let args = args.unwrap_or_default();
+        if cwd.is_none() && env.is_none() && stdin.is_none() && capability_grants.is_empty() {
+            return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                let result = session.exec(&path, &argv).await.map_err(ops_err_to_py)?;
+                Ok(PyExecResult { inner: result })
+            });
+        }
+        let normalized =
+            helios_ops::session::normalize_absolute_path(&path).map_err(ops_err_to_py)?;
+        let request = ExecRequest {
+            name: normalized.clone(),
+            args: argv,
+            env: env.unwrap_or_default().into_iter().collect(),
+            path: normalized,
+            cwd,
+            stdin: stdin.unwrap_or_default(),
+            hint: None,
+            capability_grants,
+        };
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let result = session.exec(&path, &args).await.map_err(ops_err_to_py)?;
+            let result = session.exec_request(request).await.map_err(ops_err_to_py)?;
             Ok(PyExecResult { inner: result })
         })
     }
 
-    /// Spawn a remote program with optional env, stdin, and capability grants, returning a streaming [`PyChild`].
-    #[pyo3(signature = (path, args=None, *, env=None, stdin=None, grants=None))]
+    /// Spawn a remote program with optional cwd, env, stdin, and capability grants, returning a streaming [`PyChild`].
+    #[pyo3(signature = (command, args=None, *, cwd=None, env=None, stdin=None, grants=None))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the typed Python Session.spawn(argv, *, cwd, env, stdin, grants) surface"
+    )]
     fn spawn<'py>(
         &self,
         py: Python<'py>,
-        path: String,
+        command: &Bound<'py, PyAny>,
         args: Option<Vec<String>>,
+        cwd: Option<String>,
         env: Option<BTreeMap<String, String>>,
         stdin: Option<Vec<u8>>,
-        grants: Option<Vec<String>>,
+        grants: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mut capability_grants = Vec::new();
-        if let Some(specs) = grants {
-            for spec in specs {
-                let parsed =
-                    helios_ops::session::parse_capability_grant(&spec).map_err(ops_err_to_py)?;
-                capability_grants.push(parsed);
-            }
-        }
+        let (path, argv) = extract_path_and_args(command, args)?;
+        let capability_grants = extract_process_grants(grants)?;
         let request = SpawnRequest {
             path,
-            args: args.unwrap_or_default(),
+            args: argv,
             env: env.unwrap_or_default().into_iter().collect(),
-            cwd: None,
+            cwd,
             stdin: stdin.unwrap_or_default(),
             capability_grants,
         };
