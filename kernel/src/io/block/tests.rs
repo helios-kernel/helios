@@ -524,6 +524,7 @@ fn disks_take_their_role_from_their_serial() {
     let disks = alloc::vec![
         MemoryDisk::new(""),
         MemoryDisk::new(SCRATCH_DISK_SERIAL),
+        MemoryDisk::new(HIBERNATE_DISK_SERIAL),
         MemoryDisk::new("images"),
     ];
 
@@ -535,12 +536,37 @@ fn disks_take_their_role_from_their_serial() {
             .as_str(),
         Some(SCRATCH_DISK_SERIAL)
     );
+    let hibernate = identified
+        .hibernate
+        .expect("the hibernate disk is classified separately");
+    assert_eq!(
+        block_on(hibernate.serial()).expect("serial").as_str(),
+        Some(HIBERNATE_DISK_SERIAL)
+    );
     let mount_sources: Vec<_> = identified
         .mount_sources
         .iter()
         .map(|(serial, _)| serial.as_str())
         .collect();
-    assert_eq!(mount_sources, [Some("images")]);
+    assert_eq!(
+        mount_sources,
+        [Some("images")],
+        "the hibernate disk must never be routed into mount sources"
+    );
+}
+
+#[test]
+fn two_hibernate_disks_are_a_boot_failure() {
+    let disks = alloc::vec![
+        MemoryDisk::new(SCRATCH_DISK_SERIAL),
+        MemoryDisk::new(HIBERNATE_DISK_SERIAL),
+        MemoryDisk::new(HIBERNATE_DISK_SERIAL),
+    ];
+
+    assert!(matches!(
+        block_on(identify(disks)),
+        Err(BlockInstallError::DuplicateHibernateDisk)
+    ));
 }
 
 #[test]

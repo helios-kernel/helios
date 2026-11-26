@@ -101,7 +101,7 @@ its own rate, and one device-wide setting would make an idle pair pay
 the busy pair's delay. Without it the same budget is set once for every
 receive queue and once for every transmit queue.
 
-`helios-inspector vm` echoes every guest boot line it reads before the
+`helios vm` echoes every guest boot line it reads before the
 debugger comes up as `guest serial: …` on stderr, so capturing the
 inspector's stderr is enough to record which offloads a run actually had.
 
@@ -119,7 +119,7 @@ QEMU can drive that from the HMP monitor the inspector already exposes,
 which is the cheapest way to exercise the path on any backend:
 
 ```bash
-helios-inspector vm --arch aarch64 --release \
+helios vm --arch aarch64 --release \
     --monitor unix:/tmp/helios-hmp.sock,server=on,wait=off tracing &
 printf 'set_link net0 off\n' | nc -U /tmp/helios-hmp.sock
 printf 'set_link net0 on\n' | nc -U /tmp/helios-hmp.sock
@@ -139,7 +139,7 @@ guest driver actually sent and received rather than what the host end
 saw:
 
 ```bash
-helios-inspector vm --arch aarch64 --release \
+helios vm --arch aarch64 --release \
     --net-pcap /tmp/helios-net.pcap \
     workload-bench --workload tcp-throughput --iterations 1
 ```
@@ -203,17 +203,17 @@ checks the node before building the kernel.
 
 ```bash
 # once per host, prints every privileged command before running it
-helios-inspector vm net-setup \
+helios vm net-setup \
     --net-backend tap --net-ifname helios0 --net-bridge helios-br0 --net-dhcp
 
 # per run
-helios-inspector vm --arch aarch64 --release \
+helios vm --arch aarch64 --release \
     --net-backend tap --net-ifname helios0 --net-bridge helios-br0 \
     --net-queues "$(nproc)" \
     workload-bench --workload tcp-throughput
 
 # when the host state is no longer wanted
-helios-inspector vm net-teardown \
+helios vm net-teardown \
     --net-backend tap --net-ifname helios0 --net-bridge helios-br0
 ```
 
@@ -260,7 +260,7 @@ After the plan runs, the helper re-reads
 (`0x0100`) is set: a tap that silently came up single-queue would turn
 every later multiqueue measurement into a measurement of one queue.
 
-`helios-inspector vm --net-backend tap` performs the same checks before
+`helios vm --net-backend tap` performs the same checks before
 building anything — the interface exists, it is multi-queue when more
 than one queue pair was asked for, and, when `--net-bridge` is given, it
 is enslaved to that bridge — so a missing tap costs seconds instead of a
@@ -322,7 +322,7 @@ processes a connected unix socket. QEMU is exec'd under its client
 launcher, which passes the socket as file descriptor 3:
 
 ```bash
-helios-inspector vm --arch aarch64 --net-backend socket-vmnet
+helios vm --arch aarch64 --net-backend socket-vmnet
 ```
 
 `--socket-vmnet-path` names the daemon endpoint (default
@@ -356,7 +356,7 @@ halfway through machine construction:
 Turning an offload off is how its contribution is measured:
 
 ```bash
-helios-inspector vm --arch aarch64 --release \
+helios vm --arch aarch64 --release \
     --net-backend tap --net-ifname helios0 --net-queues 8 \
     --net-device-prop host_tso4=off --net-device-prop host_tso6=off \
     workload-bench --workload tcp-throughput

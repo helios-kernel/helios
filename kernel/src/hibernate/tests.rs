@@ -915,3 +915,188 @@ fn atomic_snapshot_reservation_exhaustion_thaws_and_releases_frames() {
     // installs a `'static` user pool referencing it.
     core::mem::forget(backing);
 }
+
+#[test]
+fn write_image_to_storage_orders_payload_flush_before_header_and_invalidation_clears_sector_zero() {
+    use super::storage::{
+        HIBERNATE_HEADER_SECTORS, HIBERNATE_SECTOR_BYTES, HibernateStorage, HibernateStorageError,
+        invalidate_hibernate_header, write_image_to_storage,
+    };
+    use helios_hal::io::IoError;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Event {
+        Reinit,
+        Write { start_sector: u64, byte_len: usize },
+        Flush,
+    }
+
+    struct VecStorage {
+        data: Vec<u8>,
+        events: Vec<Event>,
+        max_write: usize,
+    }
+
+    impl VecStorage {
+        fn new(bytes: usize, max_write: usize) -> Self {
+            Self {
+                data: vec![0xaa; bytes],
+                events: Vec::new(),
+                max_write,
+            }
+        }
+    }
+
+    impl HibernateStorage for VecStorage {
+        fn capacity_bytes(&self) -> u64 {
+            self.data.len() as u64
+        }
+        fn sector_size(&self) -> usize {
+            HIBERNATE_SECTOR_BYTES
+        }
+        fn max_write_bytes(&self) -> usize {
+            self.max_write
+        }
+        fn reinitialize_for_write(&mut self) -> Result<(), HibernateStorageError> {
+            self.events.push(Event::Reinit);
+            Ok(())
+        }
+        fn write_sectors(
+            &mut self,
+            start_sector: u64,
+            data: &[u8],
+        ) -> Result<(), HibernateStorageError> {
+            let offset = (start_sector as usize) * HIBERNATE_SECTOR_BYTES;
+            if offset + data.len() > self.data.len() {
+                return Err(HibernateStorageError::Write {
+                    start_sector,
+                    byte_len: data.len(),
+                    error: IoError::OutOfBounds,
+                });
+            }
+            self.data[offset..offset + data.len()].copy_from_slice(data);
+            self.events.push(Event::Write {
+                start_sector,
+                byte_len: data.len(),
+            });
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<(), HibernateStorageError> {
+            self.events.push(Event::Flush);
+            Ok(())
+        }
+        fn read_sectors(
+            &mut self,
+            start_sector: u64,
+            dst: &mut [u8],
+        ) -> Result<(), HibernateStorageError> {
+            let offset = (start_sector as usize) * HIBERNATE_SECTOR_BYTES;
+            dst.copy_from_slice(&self.data[offset..offset + dst.len()]);
+            Ok(())
+        }
+    }
+
+    let backing = AlignedPoolBacking::new(8 * 1024 * 1024);
+    let (start, end) = backing.range();
+    let pool = UserMemoryPool::new(
+        &SingleNode::new(1),
+        ProcessorId::new(0),
+        &[NodeRun {
+            start,
+            end,
+            node: NodeId::FIRST,
+        }],
+    );
+    let reservation = pool
+        .reserve_hibernate_frames(512 * 1024)
+        .expect("reserve 512 KiB");
+    let mut writer = ReservationWriter::new(reservation);
+
+    let key = auth_key(0x7e);
+    let identity = sample_identity();
+    let mut frames = vec![0_u8; 8 * PhysFrame::SIZE];
+    for (idx, byte) in frames.iter_mut().enumerate() {
+        *byte = ((idx * 131) ^ (idx >> 4)) as u8;
+    }
+    let header = encode_snapshot(
+        EncodeParams {
+            auth_key: Some(&key),
+            identity,
+            machine_max_frames: 64,
+            bsp_context: BspSnapshotContext::hosted(0x576),
+            config: SnapshotConfig::new([0x5a; 16]),
+        },
+        &[FrameRun::new(0, 8)],
+        &mut writer,
+        |phys_frame, dst| {
+            let off = (phys_frame as usize) * PhysFrame::SIZE;
+            dst.copy_from_slice(&frames[off..off + PhysFrame::SIZE]);
+        },
+        || {},
+    )
+    .expect("encode snapshot");
+
+    let mut storage = VecStorage::new(1024 * 1024, 2048);
+    let mut pets = 0_usize;
+    let written = write_image_to_storage(&header, &writer, &mut storage, || pets += 1)
+        .expect("write image to storage");
+    assert!(pets >= 3);
+    assert!(written >= header.total_image_bytes);
+    assert_eq!(written % HIBERNATE_SECTOR_BYTES as u64, 0);
+
+    // Check strict crash-consistent ordering:
+    // Reinit -> payload writes (sector >= 8) -> Flush -> Header write (sector 0, 4096B) -> Flush
+    assert_eq!(storage.events[0], Event::Reinit);
+    let n = storage.events.len();
+    assert_eq!(storage.events[n - 1], Event::Flush);
+    assert_eq!(
+        storage.events[n - 2],
+        Event::Write {
+            start_sector: 0,
+            byte_len: HEADER_BYTES,
+        }
+    );
+    assert_eq!(storage.events[n - 3], Event::Flush);
+    for event in &storage.events[1..n - 3] {
+        match *event {
+            Event::Write {
+                start_sector,
+                byte_len,
+            } => {
+                assert!(start_sector >= HIBERNATE_HEADER_SECTORS);
+                assert_eq!(byte_len % HIBERNATE_SECTOR_BYTES, 0);
+            }
+            other => panic!("unexpected event before pre-header flush: {other:?}"),
+        }
+    }
+
+    // Verify sector-padding tail is zeroed.
+    let unpadded = header.total_image_bytes as usize;
+    let padded = written as usize;
+    assert!(storage.data[unpadded..padded].iter().all(|&b| b == 0));
+
+    // Full decode round-trip directly from disk bytes.
+    let mut restored = vec![0_u8; frames.len()];
+    let decoded_header = decode_image_into(
+        &storage.data[..padded],
+        &key,
+        &identity,
+        64,
+        |start_frame, bytes| {
+            let off = (start_frame as usize) * PhysFrame::SIZE;
+            restored[off..off + bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        },
+    )
+    .expect("written disk bytes must verify and decode cleanly");
+    assert_eq!(decoded_header, header);
+    assert_eq!(restored, frames);
+
+    // Invalidate header zeroes sector 0..8 and causes decode to reject with InvalidMagic.
+    invalidate_hibernate_header(&mut storage).expect("invalidate header");
+    assert!(storage.data[..HEADER_BYTES].iter().all(|&b| b == 0));
+    assert_eq!(
+        HibernateHeader::decode_verified(&storage.data[..HEADER_BYTES], &key),
+        Err(HibernateError::InvalidMagic)
+    );
+}

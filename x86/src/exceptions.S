@@ -264,6 +264,71 @@ helios_x86_exception_common:
     add rsp, 16
     iretq
 
+// Entered on the faulting fiber's stack via `iretq` from
+// `helios_x86_exception_common` with interrupts masked (`IF = 0`) and `DF = 0`.
+// `fxrstor64` in the exception epilogue restored the interrupted legacy x87/SSE
+// state, and the kernel executes no VEX/EVEX instructions, so every enabled
+// `XCR0` extended-state component holds the interrupted context's exact values.
+//
+// rdi: pointer to the copied `ExceptionFrame` on this stack (16-byte aligned)
+// rsi: pointer to the 64-byte-aligned XSAVE area (bytes 512..576 zeroed)
+// rdx: faulting virtual address
+// rcx: Rust trampoline entry (`helios_x86_swap_fault_trampoline`)
+// rsp: equals `rdi` (16-byte aligned, ready for `call`)
+.global helios_x86_swap_fault_entry
+helios_x86_swap_fault_entry:
+    mov r8, rdx
+    mov eax, -1
+    mov edx, -1
+    xsave64 [rsi]
+    // Reset x87 and MXCSR to the ABI defaults before entering Rust.
+    sub rsp, 16
+    mov dword ptr [rsp], 0x1f80
+    fninit
+    ldmxcsr [rsp]
+    add rsp, 16
+    // Restore the interrupted context's interrupt flag now that extended state
+    // is saved on the fiber stack and we have left the IST stack.
+    test qword ptr [rdi + {rflags_offset}], {rflags_if}
+    jz 1f
+    sti
+1:
+    mov rdx, r8
+    call rcx
+    ud2
+
+// Restores the interrupted context saved on the faulting fiber's stack — every
+// enabled `XCR0` component via `xrstor64`, every GPR, and the original `RIP`,
+// `CS`, `RFLAGS`, `RSP`, and `SS` via `iretq` — retrying the faulting
+// instruction.
+//
+// rdi: pointer to the copied `ExceptionFrame` on this stack
+// rsi: pointer to the 64-byte-aligned XSAVE image on this stack
+.global helios_x86_swap_fault_resume
+helios_x86_swap_fault_resume:
+    cli
+    mov eax, -1
+    mov edx, -1
+    xrstor64 [rsi]
+    mov rsp, rdi
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbp
+    pop rbx
+    pop rdx
+    pop rcx
+    pop rax
+    add rsp, 16
+    iretq
+
 helios_x86_interrupt_common:
     push rax
     push rcx

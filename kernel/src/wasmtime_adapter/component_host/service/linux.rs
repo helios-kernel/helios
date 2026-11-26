@@ -5160,19 +5160,18 @@ where
         let fs = shared.container.filesystem();
         let (resolved, trailing_slash) = match &target {
             ExecTarget::Resolved(path) => (fs.resolve(path).map_err(map_fs_error_to_exec)?, false),
-            ExecTarget::Path { base_dir, raw_path } => fs
-                .walk_path_for_caller(
-                    base_dir,
-                    raw_path,
-                    !nofollow,
-                    &current_creds,
-                    Some(crate::ProcCaller {
-                        pid: shared.pid.get(),
-                        tid: shared.pid.get(),
-                    }),
-                )
-                .await
-                .map_err(map_fs_op_error_to_exec)?,
+            ExecTarget::Path { base_dir, raw_path } => Box::pin(fs.walk_path_for_caller(
+                base_dir,
+                raw_path,
+                !nofollow,
+                &current_creds,
+                Some(crate::ProcCaller {
+                    pid: shared.pid.get(),
+                    tid: shared.pid.get(),
+                }),
+            ))
+            .await
+            .map_err(map_fs_op_error_to_exec)?,
         };
         let meta = resolved
             .fs()
@@ -5416,7 +5415,7 @@ where
             .try_spawn_detached(async move {
                 let _thread_proc_guard = thread_proc_guard;
                 if let ThreadRunEnd::Exec(prepared, exec_proc) =
-                    drive_linux_thread(child_context, child, child_platform).await
+                    drive_linux_thread_boxed(child_context, child, child_platform).await
                 {
                     let observer = exec_proc.observer();
                     let mut slot = shared.exec_handoff.lock();
@@ -5557,13 +5556,13 @@ where
                     pid: child_pid,
                     completed: false,
                 };
-                let outcome = Box::pin(drive_linux_process_lifecycle(
+                let outcome = drive_linux_process_lifecycle_boxed(
                     child_context,
                     child_proc,
                     child_shared,
                     None,
                     phases::Timeline::disabled(),
-                ))
+                )
                 .await;
                 let termination = match outcome {
                     Ok(exit) => exit.termination,
@@ -5586,18 +5585,50 @@ where
     }
 
     async fn prepare_exec(&mut self, spec: ExecSpec) -> Result<(), ExecError> {
-        let prepared = Box::pin(prepare_exec_in_container(
+        let prepared = prepare_exec_in_container_boxed(
             self.shared,
             &self.cwd,
             &self.root,
             &self.descriptors,
             &self.credentials,
             spec,
-        ))
+        )
         .await?;
         *self.prepared_exec = Some(Box::new(prepared));
         Ok(())
     }
+}
+
+type PreparedExecResult<CpuImpl, Net, StorageImpl> =
+    Result<PreparedExec<CpuImpl, Net, StorageImpl>, ExecError>;
+
+#[inline(never)]
+fn prepare_exec_in_container_boxed<'a, CpuImpl, Net, StorageImpl>(
+    shared: &'a LinuxShared<CpuImpl, Net, StorageImpl, <CpuImpl::Native as NativeExecution>::Space>,
+    cwd: &'a Arc<spin::Mutex<String>>,
+    root: &'a Arc<spin::Mutex<String>>,
+    descriptors: &'a Arc<spin::Mutex<syscall::Descriptors<LinuxResources<Net>>>>,
+    credentials: &'a Arc<spin::Mutex<syscall::Credentials>>,
+    spec: ExecSpec,
+) -> core::pin::Pin<
+    Box<
+        impl core::future::Future<Output = PreparedExecResult<CpuImpl, Net, StorageImpl>>
+        + use<'a, CpuImpl, Net, StorageImpl>,
+    >,
+>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    Box::pin(prepare_exec_in_container(
+        shared,
+        cwd,
+        root,
+        descriptors,
+        credentials,
+        spec,
+    ))
 }
 
 /// Safety net ensuring a forked child process transitions to exited state even
@@ -5886,6 +5917,262 @@ where
     }
 }
 
+/// Resolves a demand-backing fault (`NativeError::BackingFault`) on an
+/// uncommitted `MAP_SHARED` or file-backed VMA page, delivering `SIGBUS` when
+/// the page lies beyond the backing file's end. Returns `true` when the thread
+/// group terminated.
+async fn handle_backing_fault<CpuImpl, Net, StorageImpl>(
+    process: &mut Process<LinuxResources<Net>>,
+    context: &mut <CpuImpl::Native as NativeExecution>::Context,
+    shared: &LinuxShared<CpuImpl, Net, StorageImpl, <CpuImpl::Native as NativeExecution>::Space>,
+    platform: &LinuxThreadPlatform<
+        CpuImpl,
+        Net,
+        StorageImpl,
+        <CpuImpl::Native as NativeExecution>::Space,
+    >,
+    instance_id: crate::InstanceId,
+    fault: UserFault,
+    address: VirtAddr,
+) -> bool
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let page_va = address.page_floor();
+    match process.lookup_vma(address.raw() as u64) {
+        Some(syscall::VmaBacking::SharedAnon {
+            start,
+            object_id,
+            object_offset,
+        }) => {
+            let obj = shared.shared_mem.lock().get_object(object_id);
+            let Some(obj) = obj else {
+                return handle_unresolvable_fault(process, context, shared, instance_id, fault);
+            };
+            let page_idx =
+                object_offset.saturating_add(page_va.raw() as u64 - start) / PhysFrame::SIZE as u64;
+            match obj.get_or_alloc_frame(page_idx) {
+                Ok(frame) => match shared.space.attach_shared_frame(page_va, frame) {
+                    Ok(()) => false,
+                    Err(NativeError::OutOfMemory) => {
+                        shared.record_fatal(native_error(NativeError::OutOfMemory));
+                        process.terminate_group(helios_unix::ChildTermination::Killed);
+                        true
+                    }
+                    Err(NativeError::NotMapped) => {
+                        handle_unresolvable_fault(process, context, shared, instance_id, fault)
+                    }
+                    Err(error) => {
+                        panic!("attaching shared anonymous frame at {page_va:?}: {error}")
+                    }
+                },
+                Err(NativeError::OutOfMemory) => {
+                    shared.record_fatal(native_error(NativeError::OutOfMemory));
+                    process.terminate_group(helios_unix::ChildTermination::Killed);
+                    true
+                }
+                Err(error) => panic!("allocating shared anonymous frame at {page_va:?}: {error}"),
+            }
+        }
+        Some(syscall::VmaBacking::File(vma)) => {
+            let page_file_off = vma
+                .file_offset
+                .saturating_add(page_va.raw() as u64 - vma.start);
+            let Ok(meta) = syscall::Filesystem::stat_file(platform, &vma.file).await else {
+                return handle_bus_fault(process, context, shared, instance_id, address);
+            };
+            let eof_page = meta
+                .size
+                .checked_add(PhysFrame::SIZE as u64 - 1)
+                .map_or(u64::MAX, |n| n & !(PhysFrame::SIZE as u64 - 1));
+            if meta.size == 0 || page_file_off >= eof_page {
+                return handle_bus_fault(process, context, shared, instance_id, address);
+            }
+            if vma.is_shared {
+                let obj = shared.shared_mem.lock().get_object(vma.shared_object);
+                let Some(obj) = obj else {
+                    return handle_bus_fault(process, context, shared, instance_id, address);
+                };
+                let page_idx = page_file_off / PhysFrame::SIZE as u64;
+                let frame_res = if let Some(frame) = obj.get_frame(page_idx) {
+                    Ok(frame)
+                } else {
+                    match syscall::Filesystem::read_at(
+                        platform,
+                        &vma.file,
+                        page_file_off,
+                        PhysFrame::SIZE,
+                    )
+                    .await
+                    {
+                        Ok(bytes) => obj.load_file_page(page_idx, &bytes),
+                        Err(_) => {
+                            return handle_bus_fault(
+                                process,
+                                context,
+                                shared,
+                                instance_id,
+                                address,
+                            );
+                        }
+                    }
+                };
+                match frame_res {
+                    Ok(frame) => match shared.space.attach_shared_frame(page_va, frame) {
+                        Ok(()) => false,
+                        Err(NativeError::OutOfMemory) => {
+                            shared.record_fatal(native_error(NativeError::OutOfMemory));
+                            process.terminate_group(helios_unix::ChildTermination::Killed);
+                            true
+                        }
+                        Err(NativeError::NotMapped) => {
+                            handle_unresolvable_fault(process, context, shared, instance_id, fault)
+                        }
+                        Err(error) => {
+                            panic!("attaching shared file frame at {page_va:?}: {error}")
+                        }
+                    },
+                    Err(NativeError::OutOfMemory) => {
+                        shared.record_fatal(native_error(NativeError::OutOfMemory));
+                        process.terminate_group(helios_unix::ChildTermination::Killed);
+                        true
+                    }
+                    Err(error) => panic!("loading shared file frame at {page_va:?}: {error}"),
+                }
+            } else {
+                let Ok(bytes) = syscall::Filesystem::read_at(
+                    platform,
+                    &vma.file,
+                    page_file_off,
+                    PhysFrame::SIZE,
+                )
+                .await
+                else {
+                    return handle_bus_fault(process, context, shared, instance_id, address);
+                };
+                match crate::SharedPageObject::allocate_frame_from_bytes(&bytes)
+                    .and_then(|frame| shared.space.install_private_frame(page_va, frame))
+                {
+                    Ok(()) => false,
+                    Err(NativeError::OutOfMemory) => {
+                        shared.record_fatal(native_error(NativeError::OutOfMemory));
+                        process.terminate_group(helios_unix::ChildTermination::Killed);
+                        true
+                    }
+                    Err(NativeError::NotMapped) => {
+                        handle_unresolvable_fault(process, context, shared, instance_id, fault)
+                    }
+                    Err(error) => panic!("installing private file frame at {page_va:?}: {error}"),
+                }
+            }
+        }
+        None => handle_unresolvable_fault(process, context, shared, instance_id, fault),
+    }
+}
+
+#[inline(never)]
+fn handle_backing_fault_boxed<'a, CpuImpl, Net, StorageImpl>(
+    process: &'a mut Process<LinuxResources<Net>>,
+    context: &'a mut <CpuImpl::Native as NativeExecution>::Context,
+    shared: &'a LinuxShared<CpuImpl, Net, StorageImpl, <CpuImpl::Native as NativeExecution>::Space>,
+    platform: &'a LinuxThreadPlatform<
+        CpuImpl,
+        Net,
+        StorageImpl,
+        <CpuImpl::Native as NativeExecution>::Space,
+    >,
+    instance_id: crate::InstanceId,
+    fault: UserFault,
+    address: VirtAddr,
+) -> core::pin::Pin<
+    Box<impl core::future::Future<Output = bool> + use<'a, CpuImpl, Net, StorageImpl>>,
+>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    Box::pin(handle_backing_fault(
+        process,
+        context,
+        shared,
+        platform,
+        instance_id,
+        fault,
+        address,
+    ))
+}
+
+#[inline(never)]
+fn flush_shared_mappings_boxed<'a, CpuImpl, Net, StorageImpl>(
+    process: &'a Process<LinuxResources<Net>>,
+    memory: &'a LinuxMemory<'a, <CpuImpl::Native as NativeExecution>::Space>,
+    platform: &'a mut LinuxThreadPlatform<
+        CpuImpl,
+        Net,
+        StorageImpl,
+        <CpuImpl::Native as NativeExecution>::Space,
+    >,
+) -> core::pin::Pin<Box<impl core::future::Future<Output = ()> + use<'a, CpuImpl, Net, StorageImpl>>>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    Box::pin(process.flush_shared_mappings(memory, platform))
+}
+
+#[inline(never)]
+fn drive_linux_thread_boxed<CpuImpl, Net, StorageImpl>(
+    context: <CpuImpl::Native as NativeExecution>::Context,
+    process: Process<LinuxResources<Net>>,
+    platform: LinuxThreadPlatform<
+        CpuImpl,
+        Net,
+        StorageImpl,
+        <CpuImpl::Native as NativeExecution>::Space,
+    >,
+) -> core::pin::Pin<
+    Box<
+        impl core::future::Future<Output = ThreadRunEnd<CpuImpl, Net, StorageImpl>>
+        + use<CpuImpl, Net, StorageImpl>,
+    >,
+>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    Box::pin(drive_linux_thread(context, process, platform))
+}
+
+#[inline(never)]
+fn drive_linux_process_lifecycle_boxed<CpuImpl, Net, StorageImpl>(
+    context: <CpuImpl::Native as NativeExecution>::Context,
+    process: Process<LinuxResources<Net>>,
+    shared: Arc<
+        LinuxShared<CpuImpl, Net, StorageImpl, <CpuImpl::Native as NativeExecution>::Space>,
+    >,
+    root_guard: Option<crate::ContainerProcessGuard>,
+    timeline: phases::Timeline,
+) -> core::pin::Pin<
+    Box<
+        impl core::future::Future<Output = Result<ChildExit, ProgramExecError>>
+        + use<CpuImpl, Net, StorageImpl>,
+    >,
+>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    Box::pin(drive_linux_process_lifecycle(
+        context, process, shared, root_guard, timeline,
+    ))
+}
+
 /// Drives one Linux thread (`main` or a `clone`-spawned worker) until that
 /// thread exits (`exit`), condemns the group (`exit_group`, unhandled fault,
 /// OOM), commits an `execve`/`execveat` replacement, or observes condemnation
@@ -6073,7 +6360,7 @@ where
                             shared_mem: Some(&shared.shared_mem),
                             shared_files: Some(shared.container.shared_files()),
                         };
-                        process.flush_shared_mappings(&memory, &mut platform).await;
+                        flush_shared_mappings_boxed(&process, &memory, &mut platform).await;
                         let prepared = prepared_exec
                             .expect("SyscallOutcome::Exec follows Thread::prepare_exec");
                         return ThreadRunEnd::Exec(prepared, process);
@@ -6154,266 +6441,18 @@ where
                             }
                         }
                         Err(NativeError::BackingFault) => {
-                            let page_va = address.page_floor();
-                            match process.lookup_vma(address.raw() as u64) {
-                                Some(syscall::VmaBacking::SharedAnon {
-                                    start,
-                                    object_id,
-                                    object_offset,
-                                }) => {
-                                    let obj = shared.shared_mem.lock().get_object(object_id);
-                                    let Some(obj) = obj else {
-                                        if handle_unresolvable_fault(
-                                            &mut process,
-                                            &mut context,
-                                            &shared,
-                                            instance_id,
-                                            fault,
-                                        ) {
-                                            break;
-                                        }
-                                        continue;
-                                    };
-                                    let page_idx = object_offset
-                                        .saturating_add(page_va.raw() as u64 - start)
-                                        / PhysFrame::SIZE as u64;
-                                    match obj.get_or_alloc_frame(page_idx) {
-                                        Ok(frame) => {
-                                            match shared.space.attach_shared_frame(page_va, frame) {
-                                                Ok(()) => {}
-                                                Err(NativeError::OutOfMemory) => {
-                                                    shared.record_fatal(native_error(
-                                                        NativeError::OutOfMemory,
-                                                    ));
-                                                    process.terminate_group(
-                                                        helios_unix::ChildTermination::Killed,
-                                                    );
-                                                    break;
-                                                }
-                                                Err(NativeError::NotMapped) => {
-                                                    if handle_unresolvable_fault(
-                                                        &mut process,
-                                                        &mut context,
-                                                        &shared,
-                                                        instance_id,
-                                                        fault,
-                                                    ) {
-                                                        break;
-                                                    }
-                                                }
-                                                Err(error) => panic!(
-                                                    "attaching shared anonymous frame at {page_va:?}: {error}"
-                                                ),
-                                            }
-                                        }
-                                        Err(NativeError::OutOfMemory) => {
-                                            shared.record_fatal(native_error(
-                                                NativeError::OutOfMemory,
-                                            ));
-                                            process.terminate_group(
-                                                helios_unix::ChildTermination::Killed,
-                                            );
-                                            break;
-                                        }
-                                        Err(error) => panic!(
-                                            "allocating shared anonymous frame at {page_va:?}: {error}"
-                                        ),
-                                    }
-                                }
-                                Some(syscall::VmaBacking::File(vma)) => {
-                                    let page_file_off = vma
-                                        .file_offset
-                                        .saturating_add(page_va.raw() as u64 - vma.start);
-                                    match syscall::Filesystem::stat_file(&platform, &vma.file).await
-                                    {
-                                        Ok(meta) => {
-                                            let eof_page = meta
-                                                .size
-                                                .checked_add(PhysFrame::SIZE as u64 - 1)
-                                                .map_or(u64::MAX, |n| {
-                                                    n & !(PhysFrame::SIZE as u64 - 1)
-                                                });
-                                            if meta.size == 0 || page_file_off >= eof_page {
-                                                if handle_bus_fault(
-                                                    &mut process,
-                                                    &mut context,
-                                                    &shared,
-                                                    instance_id,
-                                                    address,
-                                                ) {
-                                                    break;
-                                                }
-                                            } else if vma.is_shared {
-                                                let obj = shared
-                                                    .shared_mem
-                                                    .lock()
-                                                    .get_object(vma.shared_object);
-                                                let Some(obj) = obj else {
-                                                    if handle_bus_fault(
-                                                        &mut process,
-                                                        &mut context,
-                                                        &shared,
-                                                        instance_id,
-                                                        address,
-                                                    ) {
-                                                        break;
-                                                    }
-                                                    continue;
-                                                };
-                                                let page_idx =
-                                                    page_file_off / PhysFrame::SIZE as u64;
-                                                let frame_res =
-                                                    if let Some(frame) = obj.get_frame(page_idx) {
-                                                        Ok(frame)
-                                                    } else {
-                                                        match syscall::Filesystem::read_at(
-                                                            &platform,
-                                                            &vma.file,
-                                                            page_file_off,
-                                                            PhysFrame::SIZE,
-                                                        )
-                                                        .await
-                                                        {
-                                                            Ok(bytes) => {
-                                                                obj.load_file_page(page_idx, &bytes)
-                                                            }
-                                                            Err(_) => {
-                                                                if handle_bus_fault(
-                                                                    &mut process,
-                                                                    &mut context,
-                                                                    &shared,
-                                                                    instance_id,
-                                                                    address,
-                                                                ) {
-                                                                    break;
-                                                                }
-                                                                continue;
-                                                            }
-                                                        }
-                                                    };
-                                                match frame_res {
-                                                    Ok(frame) => match shared
-                                                        .space
-                                                        .attach_shared_frame(page_va, frame)
-                                                    {
-                                                        Ok(()) => {}
-                                                        Err(NativeError::OutOfMemory) => {
-                                                            shared.record_fatal(native_error(
-                                                                NativeError::OutOfMemory,
-                                                            ));
-                                                            process.terminate_group(
-                                                                helios_unix::ChildTermination::Killed,
-                                                            );
-                                                            break;
-                                                        }
-                                                        Err(NativeError::NotMapped) => {
-                                                            if handle_unresolvable_fault(
-                                                                &mut process,
-                                                                &mut context,
-                                                                &shared,
-                                                                instance_id,
-                                                                fault,
-                                                            ) {
-                                                                break;
-                                                            }
-                                                        }
-                                                        Err(error) => panic!(
-                                                            "attaching shared file frame at {page_va:?}: {error}"
-                                                        ),
-                                                    },
-                                                    Err(NativeError::OutOfMemory) => {
-                                                        shared.record_fatal(native_error(
-                                                            NativeError::OutOfMemory,
-                                                        ));
-                                                        process.terminate_group(
-                                                            helios_unix::ChildTermination::Killed,
-                                                        );
-                                                        break;
-                                                    }
-                                                    Err(error) => panic!(
-                                                        "loading shared file frame at {page_va:?}: {error}"
-                                                    ),
-                                                }
-                                            } else {
-                                                match syscall::Filesystem::read_at(
-                                                    &platform,
-                                                    &vma.file,
-                                                    page_file_off,
-                                                    PhysFrame::SIZE,
-                                                )
-                                                .await
-                                                {
-                                                    Ok(bytes) => {
-                                                        match crate::SharedPageObject::allocate_frame_from_bytes(&bytes)
-                                                            .and_then(|frame| {
-                                                                shared
-                                                                    .space
-                                                                    .install_private_frame(page_va, frame)
-                                                            }) {
-                                                            Ok(()) => {}
-                                                            Err(NativeError::OutOfMemory) => {
-                                                                shared.record_fatal(native_error(
-                                                                    NativeError::OutOfMemory,
-                                                                ));
-                                                                process.terminate_group(
-                                                                    helios_unix::ChildTermination::Killed,
-                                                                );
-                                                                break;
-                                                            }
-                                                            Err(NativeError::NotMapped) => {
-                                                                if handle_unresolvable_fault(
-                                                                    &mut process,
-                                                                    &mut context,
-                                                                    &shared,
-                                                                    instance_id,
-                                                                    fault,
-                                                                ) {
-                                                                    break;
-                                                                }
-                                                            }
-                                                            Err(error) => panic!(
-                                                                "installing private file frame at {page_va:?}: {error}"
-                                                            ),
-                                                        }
-                                                    }
-                                                    Err(_) => {
-                                                        if handle_bus_fault(
-                                                            &mut process,
-                                                            &mut context,
-                                                            &shared,
-                                                            instance_id,
-                                                            address,
-                                                        ) {
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(_) => {
-                                            if handle_bus_fault(
-                                                &mut process,
-                                                &mut context,
-                                                &shared,
-                                                instance_id,
-                                                address,
-                                            ) {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                None => {
-                                    if handle_unresolvable_fault(
-                                        &mut process,
-                                        &mut context,
-                                        &shared,
-                                        instance_id,
-                                        fault,
-                                    ) {
-                                        break;
-                                    }
-                                }
+                            if handle_backing_fault_boxed(
+                                &mut process,
+                                &mut context,
+                                &shared,
+                                &platform,
+                                instance_id,
+                                fault,
+                                address,
+                            )
+                            .await
+                            {
+                                break;
                             }
                         }
                         Err(NativeError::NotMapped) => {
@@ -6451,7 +6490,7 @@ where
         shared_mem: Some(&shared.shared_mem),
         shared_files: Some(shared.container.shared_files()),
     };
-    process.flush_shared_mappings(&memory, &mut platform).await;
+    flush_shared_mappings_boxed(&process, &memory, &mut platform).await;
     if process.observer().all_threads_exited() {
         let now_secs = (syscall::System::realtime_nanos(&platform) / 1_000_000_000) as i64;
         process.cleanup_ipc_on_exit(now_secs, &mut platform);
@@ -6737,7 +6776,7 @@ where
         );
         let mut main_exec: Option<ExecHandoff<CpuImpl, Net, StorageImpl>> = None;
         let main_and_siblings = async {
-            match Box::pin(drive_linux_thread(context, process, main_platform)).await {
+            match drive_linux_thread_boxed(context, process, main_platform).await {
                 ThreadRunEnd::Exec(prepared, exec_proc) => {
                     // Condemn any sibling threads so they drain before the
                     // address space is replaced.
@@ -6935,74 +6974,23 @@ where
                     let wasm_runtime = exec_runtime
                         .wasm
                         .expect("PreparedExec::Wasm requires a Wasm runtime");
-                    let wasm_signal_state = WasixSignalState::new();
-                    let wasm_run = Box::pin(run_program_executable(
-                        exec_runtime.exec_context,
+                    return exec_wasm_handoff_boxed(WasmExecHandoff {
+                        exec_context: exec_runtime.exec_context,
                         argv,
                         env,
                         authority,
-                        crate::IpcEndpointGrants::new(),
-                        None,
-                        crate::InheritedSockets::new(),
-                        None,
-                        wasm_runtime.filesystem,
-                        // Exec keeps the process, so it keeps the process's limit.
-                        DescriptorOrigin::SameProcess(descriptors),
-                        wasm_signal_state.clone(),
+                        descriptors,
                         signal_dispositions,
-                        None,
                         spawner,
-                        wasm_runtime.progress,
                         executable,
-                        &wasm_runtime.engine,
-                        &wasm_runtime.runtime,
-                        wasm_runtime.preview1_core_linker,
-                        wasm_runtime.shared_memory_pool,
-                        wasm_runtime.core_module_instance_pre_cache,
+                        wasm_runtime,
                         launched_instance,
                         output_mode,
                         timeline,
-                    ));
-                    // Bridge container Linux signals (`kill(pid, sig)` /
-                    // `kill(-pgid, sig)`) and parent external signals into the
-                    // replacement Wasm/WASIX process while it runs.
-                    let mut wasm_run = wasm_run;
-                    let mut linux_sig_wait = thread_signals.signal_waiter();
-                    let mut ext_sig_wait = external_signal_state.wait_state();
-                    let outcome = core::future::poll_fn(|cx| {
-                        while let Some(sig) = thread_signals.take_pending_signal() {
-                            wasm_signal_state.raise(sig);
-                        }
-                        while let Some(sig) = external_signal_state.take_pending() {
-                            wasm_signal_state.raise(sig);
-                        }
-                        if let Poll::Ready(result) = wasm_run.as_mut().poll(cx) {
-                            return Poll::Ready(result);
-                        }
-                        if thread_signals
-                            .poll_signal_waiter(cx, &mut linux_sig_wait)
-                            .is_ready()
-                        {
-                            while let Some(sig) = thread_signals.take_pending_signal() {
-                                wasm_signal_state.raise(sig);
-                            }
-                            linux_sig_wait = thread_signals.signal_waiter();
-                            let _ = thread_signals.poll_signal_waiter(cx, &mut linux_sig_wait);
-                        }
-                        if external_signal_state
-                            .poll_changed(cx, &mut ext_sig_wait)
-                            .is_ready()
-                        {
-                            while let Some(sig) = external_signal_state.take_pending() {
-                                wasm_signal_state.raise(sig);
-                            }
-                            ext_sig_wait = external_signal_state.wait_state();
-                            let _ = external_signal_state.poll_changed(cx, &mut ext_sig_wait);
-                        }
-                        Poll::Pending
+                        thread_signals,
+                        external_signal_state,
                     })
                     .await;
-                    return outcome;
                 }
             }
         }
@@ -7031,6 +7019,156 @@ where
             }),
         };
     }
+}
+
+struct WasmExecHandoff<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
+    argv: ProgramArgv,
+    env: Vec<(String, String)>,
+    authority: crate::ProcessAuthority,
+    descriptors: Preview1DescriptorTable<Net>,
+    signal_dispositions: Vec<WasixSignalDisposition>,
+    spawner: crate::InstanceSpawner<CpuImpl>,
+    executable: ProgramExecutable<CpuImpl, Net, StorageImpl>,
+    wasm_runtime: LinuxWasmRuntime<CpuImpl, Net, StorageImpl>,
+    launched_instance: crate::RegisteredInstance,
+    output_mode: OutputMode,
+    timeline: phases::Timeline,
+    thread_signals: Arc<syscall::ThreadSignalSlot>,
+    external_signal_state: WasixSignalState,
+}
+
+#[inline(never)]
+fn exec_wasm_handoff_boxed<CpuImpl, Net, StorageImpl>(
+    handoff: WasmExecHandoff<CpuImpl, Net, StorageImpl>,
+) -> core::pin::Pin<
+    Box<
+        impl core::future::Future<Output = Result<ChildExit, ProgramExecError>>
+        + use<CpuImpl, Net, StorageImpl>,
+    >,
+>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    Box::pin(async move {
+        let WasmExecHandoff {
+            exec_context,
+            argv,
+            env,
+            authority,
+            descriptors,
+            signal_dispositions,
+            spawner,
+            executable,
+            wasm_runtime,
+            launched_instance,
+            output_mode,
+            timeline,
+            thread_signals,
+            external_signal_state,
+        } = handoff;
+        let wasm_signal_state = WasixSignalState::new();
+        let mut wasm_run = Box::pin(run_program_executable(
+            exec_context,
+            argv,
+            env,
+            authority,
+            crate::IpcEndpointGrants::new(),
+            None,
+            crate::InheritedSockets::new(),
+            None,
+            wasm_runtime.filesystem,
+            // Exec keeps the process, so it keeps the process's limit.
+            DescriptorOrigin::SameProcess(descriptors),
+            wasm_signal_state.clone(),
+            signal_dispositions,
+            None,
+            spawner,
+            wasm_runtime.progress,
+            executable,
+            &wasm_runtime.engine,
+            &wasm_runtime.runtime,
+            wasm_runtime.preview1_core_linker,
+            wasm_runtime.shared_memory_pool,
+            wasm_runtime.core_module_instance_pre_cache,
+            launched_instance,
+            output_mode,
+            timeline,
+        ));
+        // Bridge container Linux signals (`kill(pid, sig)` / `kill(-pgid, sig)`)
+        // and parent external signals into the replacement Wasm/WASIX process
+        // while it runs.
+        let mut linux_sig_wait = thread_signals.signal_waiter();
+        let mut ext_sig_wait = external_signal_state.wait_state();
+        core::future::poll_fn(|cx| {
+            while let Some(sig) = thread_signals.take_pending_signal() {
+                wasm_signal_state.raise(sig);
+            }
+            while let Some(sig) = external_signal_state.take_pending() {
+                wasm_signal_state.raise(sig);
+            }
+            if let Poll::Ready(result) = wasm_run.as_mut().poll(cx) {
+                return Poll::Ready(result);
+            }
+            if thread_signals
+                .poll_signal_waiter(cx, &mut linux_sig_wait)
+                .is_ready()
+            {
+                while let Some(sig) = thread_signals.take_pending_signal() {
+                    wasm_signal_state.raise(sig);
+                }
+                linux_sig_wait = thread_signals.signal_waiter();
+                let _ = thread_signals.poll_signal_waiter(cx, &mut linux_sig_wait);
+            }
+            if external_signal_state
+                .poll_changed(cx, &mut ext_sig_wait)
+                .is_ready()
+            {
+                while let Some(sig) = external_signal_state.take_pending() {
+                    wasm_signal_state.raise(sig);
+                }
+                ext_sig_wait = external_signal_state.wait_state();
+                let _ = external_signal_state.poll_changed(cx, &mut ext_sig_wait);
+            }
+            Poll::Pending
+        })
+        .await
+    })
+}
+
+#[inline(never)]
+fn load_in_container_boxed<'a, CpuImpl, StorageImpl>(
+    cpu: &'a CpuImpl,
+    container: &'a crate::LinuxContainer<StorageImpl>,
+    base_dir: &'a str,
+    image: Bytes,
+    path: Option<String>,
+    credentials: &'a syscall::Credentials,
+) -> core::pin::Pin<
+    Box<
+        impl core::future::Future<Output = Result<LinuxExecutable, ProgramExecError>>
+        + use<'a, CpuImpl, StorageImpl>,
+    >,
+>
+where
+    CpuImpl: Cpu,
+    StorageImpl: crate::Storage,
+{
+    Box::pin(LinuxExecutable::load_in_container(
+        cpu,
+        container,
+        base_dir,
+        image,
+        path,
+        credentials,
+    ))
 }
 
 /// Runs a Linux process inside `container` to its end: maps `executable`,
@@ -7091,14 +7229,14 @@ where
                         .map(|preopen| preopen.guest_name())
                 })
                 .unwrap_or("/");
-            Box::pin(LinuxExecutable::load_in_container(
+            load_in_container_boxed(
                 &cpu,
                 &container,
                 base_dir,
                 executable.image,
                 executable.path,
                 &credentials,
-            ))
+            )
             .await?
         } else {
             executable
@@ -7231,13 +7369,13 @@ where
     });
 
     timeline.record(&cpu, LaunchPhase::GuestBegin);
-    Box::pin(drive_linux_process_lifecycle(
+    drive_linux_process_lifecycle_boxed(
         mapped.context,
         process,
         shared,
         Some(process_guard),
         timeline.clone(),
-    ))
+    )
     .await
 }
 

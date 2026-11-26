@@ -24,6 +24,7 @@
 
 pub mod format;
 pub mod snapshot;
+pub mod storage;
 pub mod verify;
 
 #[cfg(test)]
@@ -39,6 +40,12 @@ pub use snapshot::{
     AtomicSnapshotParams, CapturedSnapshot, EncodeParams, FrameRun, ReservationWriter,
     SnapshotConfig, SnapshotOutcome, SnapshotSink, capture_atomic_snapshot,
     collect_snapshot_physical_runs, encode_snapshot, normalize_physical_runs,
+};
+pub use storage::{
+    HIBERNATE_HEADER_SECTORS, HIBERNATE_SECTOR_BYTES, HibernateDeviceController,
+    HibernateDeviceError, HibernateOutcome, HibernateStorage, HibernateStorageError,
+    VirtioBlockHibernateStorage, hibernate_to_disk, hibernate_to_disk_with_power_off,
+    invalidate_hibernate_header, required_disk_bytes, validate_sector_size, write_image_to_storage,
 };
 pub use verify::{
     VerifiedHibernateImage, decode_image_into, verify_identity, verify_image_header_and_table,
@@ -199,4 +206,21 @@ pub enum HibernateError {
         actual: usize,
         expected: usize,
     },
+
+    /// The hibernate disk is smaller than the required image size.
+    #[error(
+        "hibernate disk too small: required {required_bytes} bytes, disk has {disk_bytes} bytes"
+    )]
+    DiskTooSmall {
+        required_bytes: u64,
+        disk_bytes: u64,
+    },
+
+    /// A synchronous hibernate storage operation failed.
+    #[error("hibernate storage error: {0}")]
+    Storage(#[from] HibernateStorageError),
+
+    /// Quiescing or reinitializing platform devices failed.
+    #[error("hibernate device lifecycle error: {0}")]
+    Device(#[from] HibernateDeviceError),
 }

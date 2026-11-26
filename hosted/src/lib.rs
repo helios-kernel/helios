@@ -10,6 +10,7 @@ mod executor_storm_tests;
 #[cfg(test)]
 mod fiber_stack_tests;
 mod freeze_tests;
+mod hibernate_tests;
 mod host_fs;
 #[cfg(test)]
 mod init_program;

@@ -138,7 +138,7 @@ Its backend is `vhost-vsock`, which QEMU implements only against the host
 kernel's `/dev/vhost-vsock`: there is no user-space vsock backend, so on
 a host without that device node — every macOS host, and any Linux host
 without the `vhost_vsock` module — no guest can have the device at all.
-`helios-inspector vm --rpc-transport vsock` therefore checks the host
+`helios vm --rpc-transport vsock` therefore checks the host
 before it builds anything and refuses with an explanation rather than
 booting a guest whose device is silently absent. The default transport
 stays the serial line; see `docs/inspector-vsock.md`.
@@ -234,7 +234,7 @@ and `uuid=` are the negotiated feature bits after it
 (`VIRTIO_GPU_F_RESOURCE_BLOB`, `VIRTIO_GPU_F_CONTEXT_INIT` and
 `VIRTIO_GPU_F_RESOURCE_UUID`), each `on` or `off` for the same reason.
 
-A renderer is a host property, not a guest one. `helios-inspector vm`
+A renderer is a host property, not a guest one. `helios vm`
 attaches the plain 2D device unless a session asks for one with
 `--renderer virtio-gpu-gl` (Venus through virglrenderer) or
 `--renderer virtio-gpu-rutabaga` (Venus and gfxstream through
@@ -397,7 +397,7 @@ belongs to whatever produces the audio.
 
 The device is on the platform's own bus: virtio-pci on x86-64 (`-device
 virtio-sound-pci`) and virtio-mmio on aarch64 and riscv64 (`-device
-virtio-sound-device`). `helios-inspector vm --audiodev` is what attaches
+virtio-sound-device`). `helios vm --audiodev` is what attaches
 it, and `docs/desktop.md` describes the backends. Each backend reports it
 on one line:
 
@@ -408,7 +408,7 @@ virtio-snd online transport=pci streams=1 jacks=1 rates=5512..192000 formats=S16
 virtio-net is the one device whose capabilities are decided outside the
 guest: multiqueue, segmentation offload and checksum offload are all
 properties of the host packet path QEMU is given, so what the driver can
-negotiate depends on `helios-inspector vm --net-backend`. The driver logs
+negotiate depends on `helios vm --net-backend`. The driver logs
 its device-class result as `virtio-net online` next to the generic
 feature line above. See `docs/networking.md`.
 
@@ -480,7 +480,7 @@ block device online, self check passed capacity_bytes=268435456 …
 Every inspector profile attaches that disk: `virtio-blk-device` on the
 MMIO platforms (aarch64, riscv64) and `virtio-blk-pci` on x86, always
 with `serial=helios-data`, backed by a `data.img` in the VM's runtime
-directory whose size `--data-disk-size` controls. `helios-inspector
+directory whose size `--data-disk-size` controls. `helios
 stats` shows the device the guest kernel ended up with, its geometry, its
 queues and the requests the kernel has issued.
 
@@ -562,7 +562,7 @@ Only PCI endpoints can be confined. virtio-iommu translates the DMA of
 functions on a PCI bus; a memory-mapped virtio device is not an endpoint
 of anything, so the aarch64 and riscv64 `virt` profiles — whose virtio
 devices are on the MMIO transport — have no translation unit and their
-devices keep reaching all of memory. `helios-inspector vm --iommu`
+devices keep reaching all of memory. `helios vm --iommu`
 refuses those architectures by name rather than accepting the flag and
 doing nothing. This is a property of the transport, not a gap in the
 driver: putting those platforms behind a unit means moving their devices
@@ -592,7 +592,7 @@ virtio device confined to its own IOMMU domain endpoint=0x10 domain=0
 virtio features negotiated device=_9P … access_platform=true
 ```
 
-`helios-inspector stats` carries the same facts in its IOMMU panel: the
+`helios stats` carries the same facts in its IOMMU panel: the
 unit's granule, whether endpoints outside every domain still reach
 memory, the running fault count, and the domain and mapped bytes of each
 confined device. Faults arrive on the unit's own MSI-X vector, so a

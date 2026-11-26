@@ -10,7 +10,10 @@
 //! kernel's `mm/` directory.
 
 use super::*;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
 use helios_hal::fs::{NodeKind, WritePosition};
 use helios_unix::FDFLAG_PATH;
 
@@ -334,7 +337,7 @@ async fn flush_one_range<R: Resources, M: UserMemory, F: fs::Filesystem<R>>(
     }
 
     // Fallback for lightweight unit-test mocks without `SharedPageObject`.
-    let mut buf = [0u8; 4096];
+    let mut buf = alloc::vec![0u8; 4096];
     let mut done = 0u64;
     while done < valid_len {
         let addr = start + done;
@@ -783,6 +786,64 @@ async fn stage_file_into_vec<R: Resources, F: fs::Filesystem<R>>(
         }
     }
     Ok(staged)
+}
+
+/// Concrete heap-pinned wrappers for the cold async memory-map syscalls.
+/// Keeping each construction inside a non-inlined frame prevents debug builds
+/// from reserving stack slots for every VM future simultaneously inside
+/// `syscall::dispatch`.
+#[inline(never)]
+pub(super) fn mmap_boxed<'a, R: Resources, M: VirtualMemory, F: System + fs::Filesystem<R>>(
+    process: &'a Process<R>,
+    abi: Abi,
+    args: [u64; 6],
+    memory: &'a mut M,
+    fs: &'a mut F,
+) -> Pin<Box<impl Future<Output = u64> + use<'a, R, M, F>>> {
+    Box::pin(mmap(process, abi, args, memory, fs))
+}
+
+#[inline(never)]
+pub(super) fn munmap_boxed<'a, R: Resources, M: VirtualMemory, F: System + fs::Filesystem<R>>(
+    process: &'a Process<R>,
+    abi: Abi,
+    args: [u64; 6],
+    memory: &'a mut M,
+    fs: &'a mut F,
+) -> Pin<Box<impl Future<Output = u64> + use<'a, R, M, F>>> {
+    Box::pin(munmap(process, abi, args, memory, fs))
+}
+
+#[inline(never)]
+pub(super) fn msync_boxed<'a, R: Resources, M: VirtualMemory, F: fs::Filesystem<R>>(
+    process: &'a Process<R>,
+    abi: Abi,
+    args: [u64; 6],
+    memory: &'a M,
+    fs: &'a mut F,
+) -> Pin<Box<impl Future<Output = u64> + use<'a, R, M, F>>> {
+    Box::pin(msync(process, abi, args, memory, fs))
+}
+
+#[inline(never)]
+pub(super) fn mremap_boxed<'a, R: Resources, M: VirtualMemory, F: System + fs::Filesystem<R>>(
+    process: &'a Process<R>,
+    abi: Abi,
+    args: [u64; 6],
+    memory: &'a mut M,
+    fs: &'a mut F,
+) -> Pin<Box<impl Future<Output = u64> + use<'a, R, M, F>>> {
+    Box::pin(mremap(process, abi, args, memory, fs))
+}
+
+#[inline(never)]
+pub(super) fn madvise_boxed<'a, R: Resources, M: VirtualMemory, F: fs::Filesystem<R>>(
+    process: &'a Process<R>,
+    args: [u64; 6],
+    memory: &'a mut M,
+    fs: &'a F,
+) -> Pin<Box<impl Future<Output = u64> + use<'a, R, M, F>>> {
+    Box::pin(madvise(process, args, memory, fs))
 }
 
 /// `mmap(addr, length, prot, flags, fd, offset)` for anonymous and file-backed

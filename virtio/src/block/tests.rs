@@ -2111,3 +2111,165 @@ fn every_way_a_request_ends_gives_its_run_back() {
     drop(answered(block_on(device.read(2, TestBuffer::host(512)))));
     assert_eq!(live_runs(&device), 0);
 }
+
+/// Polled virtio-blk I/O round-trips after `quiesce()` + reset + `reinitialize()`
+/// without relying on interrupts or an async executor.
+#[test]
+fn polled_write_flush_and_read_work_after_quiesce_and_reinitialize() {
+    use core::cell::RefCell;
+
+    let device = device_with(BLK_F_FLUSH | BLK_F_SEG_MAX | BLK_F_SIZE_MAX, |transport| {
+        transport.set_config_u32(CFG_SEG_MAX, 4);
+        transport.set_config_u32(CFG_SIZE_MAX, 1024);
+    });
+    // Drain any in-flight requests, simulate host reset, and bring the disk back up.
+    device.quiesce(|| false).expect("idle device quiesces");
+    device.object().transport.reset_behind_the_driver();
+    assert_eq!(
+        device.reinitialize(),
+        Ok(DeviceReset {
+            device: DeviceType::Block,
+        })
+    );
+
+    // Backing store emulating the host virtio-blk device model.
+    let backing = RefCell::new(vec![0_u8; TEST_CAPACITY_SECTORS as usize * SECTOR_SIZE]);
+    let flushes = RefCell::new(0_usize);
+    let writes = RefCell::new(0_usize);
+
+    // Helper servicing one pending chain on queue 0 when polled by `expired`.
+    let service_queue = |backing: &RefCell<Vec<u8>>,
+                         writes: &RefCell<usize>,
+                         flushes: &RefCell<usize>|
+     -> bool {
+        let ring = ring(&device);
+        let heads = ring.device_in_flight_heads();
+        if let Some(&head) = heads.first() {
+            let chain = ring.device_chain(head);
+            let (hdr_addr, hdr_len, _) = chain[0];
+            assert!(hdr_len as usize >= size_of::<BlkReq>());
+            // SAFETY: `hdr_addr` is a host-backed DMA address from `ConfinedTransport`
+            // pointing to the driver's readable `BlkReq` header for this in-flight chain.
+            let hdr_slice = unsafe {
+                core::slice::from_raw_parts(hdr_addr as usize as *const u8, size_of::<BlkReq>())
+            };
+            let req_type = u32::from_le_bytes(hdr_slice[0..4].try_into().unwrap());
+            let sector = u64::from_le_bytes(hdr_slice[8..16].try_into().unwrap());
+            match req_type {
+                1 => {
+                    // ReqType::Out
+                    let mut offset = sector as usize * SECTOR_SIZE;
+                    let mut disk = backing.borrow_mut();
+                    for &(addr, len, writable) in &chain[1..chain.len() - 1] {
+                        assert!(!writable);
+                        // SAFETY: `addr..addr + len` is a host-backed readable DMA buffer
+                        // owned by the in-flight write request.
+                        let bytes = unsafe {
+                            core::slice::from_raw_parts(addr as usize as *const u8, len as usize)
+                        };
+                        disk[offset..offset + bytes.len()].copy_from_slice(bytes);
+                        offset += bytes.len();
+                    }
+                    *writes.borrow_mut() += 1;
+                    ring.device_respond(head, &[0_u8]);
+                    ring.device_complete(head, 1);
+                }
+                0 => {
+                    // ReqType::In
+                    let mut offset = sector as usize * SECTOR_SIZE;
+                    let disk = backing.borrow();
+                    let mut total = 0_usize;
+                    let mut response = Vec::new();
+                    for &(_, len, writable) in &chain[1..chain.len() - 1] {
+                        assert!(writable);
+                        let len = len as usize;
+                        response.extend_from_slice(&disk[offset..offset + len]);
+                        offset += len;
+                        total += len;
+                    }
+                    response.push(0_u8);
+                    ring.device_respond(head, &response);
+                    ring.device_complete(head, (total + 1) as u32);
+                }
+                4 => {
+                    // ReqType::Flush
+                    *flushes.borrow_mut() += 1;
+                    ring.device_respond(head, &[0_u8]);
+                    ring.device_complete(head, 1);
+                }
+                other => panic!("unexpected polled virtio-blk request type {other}"),
+            }
+        }
+        false
+    };
+
+    // Write 6 KiB (12 sectors > 4 KiB max_transfer_bytes, exercising multi-transfer
+    // AND multi-segment splitting at 1024-byte stride).
+    let payload: Vec<u8> = (0..6144).map(|i| ((i * 37) ^ (i >> 5)) as u8).collect();
+    device
+        .write_sectors_polled(8, &payload, || service_queue(&backing, &writes, &flushes))
+        .expect("polled write should succeed");
+    assert_eq!(*writes.borrow(), 2, "6 KiB splits into two transfers");
+    assert_eq!(
+        live_runs(&device),
+        0,
+        "polled write frees every DMA buffer on completion"
+    );
+
+    device
+        .flush_polled(|| service_queue(&backing, &writes, &flushes))
+        .expect("polled flush should succeed");
+    assert_eq!(*flushes.borrow(), 1);
+    assert_eq!(live_runs(&device), 0);
+
+    // Read the 6 KiB back via polled read and verify bit-for-bit equality.
+    let mut readback = vec![0_u8; payload.len()];
+    device
+        .read_sectors_polled(8, &mut readback, || {
+            service_queue(&backing, &writes, &flushes)
+        })
+        .expect("polled read should succeed");
+    assert_eq!(readback, payload);
+    assert_eq!(live_runs(&device), 0);
+}
+
+#[test]
+fn polled_io_reports_validation_errors_and_timeouts() {
+    let device = device_with(BLK_F_FLUSH, |_| {});
+
+    // Unaligned length.
+    assert_eq!(
+        device.write_sectors_polled(0, &[0_u8; 100], || false),
+        Err(PolledBlockError::Io(IoError::InvalidBufferLength {
+            required_multiple: SECTOR_SIZE,
+            actual: 100,
+        }))
+    );
+
+    // Out-of-bounds sector.
+    assert_eq!(
+        device.read_sectors_polled(u64::from(TEST_CAPACITY_SECTORS), &mut [0_u8; 512], || {
+            false
+        }),
+        Err(PolledBlockError::Io(IoError::OutOfBounds))
+    );
+
+    // Read-only handle refuses writes and flushes.
+    let ro = device
+        .derive(BlockDeviceRights::READ)
+        .expect("derive read-only");
+    assert_eq!(
+        ro.write_sectors_polled(0, &[0_u8; 512], || false),
+        Err(PolledBlockError::Io(IoError::PermissionDenied))
+    );
+    assert_eq!(
+        ro.flush_polled(|| false),
+        Err(PolledBlockError::Io(IoError::PermissionDenied))
+    );
+
+    // Immediate timeout on an unanswered flush returns TimedOut without panicking.
+    assert_eq!(
+        device.flush_polled(|| true),
+        Err(PolledBlockError::TimedOut)
+    );
+}

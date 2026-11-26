@@ -1,4 +1,6 @@
 use std::future::Future;
+use std::sync::Arc;
+use std::task::Poll;
 
 use futures_io::{AsyncRead, AsyncWrite};
 use helios_inspector_protocol::WireError;
@@ -8,7 +10,8 @@ use helios_inspector_protocol::mux::{
 };
 
 use crate::codec::{
-    RpcDecode, RpcEncode, activate_outbound_subpaths, decode_server_request, encode_server_response,
+    EncodedHandlesRollback, RpcDecode, RpcEncode, SendRollbackGuard, SubpathSpawner, SubpathTask,
+    activate_outbound_subpaths_tracked, decode_server_request, encode_server_response,
 };
 use crate::error::RpcError;
 use crate::resource::{HandleAllocator, ResourceEntry, ResourceTable};
@@ -33,6 +36,7 @@ impl Default for EndpointConfig {
 pub struct ServerInvocation<'a, R: ResourceEntry> {
     call: InboundCall,
     resources: &'a ResourceTable<R>,
+    spawner: Option<&'a SubpathSpawner>,
 }
 
 impl<'a, R: ResourceEntry> ServerInvocation<'a, R> {
@@ -60,46 +64,24 @@ impl<'a, R: ResourceEntry> ServerInvocation<'a, R> {
                     detail: err.to_string(),
                 },
             })?;
-        decode_server_request(&self.call, self.resources, &raw).await
+        decode_server_request(&self.call, self.resources, self.spawner, &raw).await
     }
 
     pub async fn encode_response<T: RpcEncode<R>>(&self, value: T) -> Result<(), WireError> {
-        struct HandleRollbackGuard<'r, R: ResourceEntry> {
-            resources: &'r ResourceTable<R>,
-            handles: Vec<u32>,
-        }
-
-        impl<R: ResourceEntry> HandleRollbackGuard<'_, R> {
-            fn disarm(&mut self) {
-                self.handles.clear();
-            }
-
-            fn take(&mut self) -> Vec<u32> {
-                std::mem::take(&mut self.handles)
-            }
-        }
-
-        impl<R: ResourceEntry> Drop for HandleRollbackGuard<'_, R> {
-            fn drop(&mut self) {
-                if !self.handles.is_empty() {
-                    let handles = std::mem::take(&mut self.handles);
-                    self.resources.rollback_handles_sync(handles);
-                }
-            }
-        }
-
-        let encoded = encode_server_response(&self.call, self.resources, value).await?;
-        let mut rollback = HandleRollbackGuard {
-            resources: self.resources,
-            handles: encoded.inserted_handles,
-        };
+        let encoded =
+            encode_server_response(&self.call, self.resources, self.spawner, value).await?;
+        let mut rollback = SendRollbackGuard::new(EncodedHandlesRollback::with_table(
+            Arc::new(self.resources.clone()),
+            encoded.inserted_handles,
+            encoded.remote_handles,
+        ));
         let handle = self.call.call_handle();
-        activate_outbound_subpaths(&handle, encoded.subpaths).await;
+        let cancels = activate_outbound_subpaths_tracked(&handle, encoded.subpaths).await;
+        rollback.add_cancels(cancels);
         match self.call.send_root_response(&encoded.bytes).await {
             Ok(()) => rollback.disarm(),
             Err(_) => {
-                let handles = rollback.take();
-                self.resources.rollback_handles(&handles).await;
+                rollback.rollback_now().await;
             }
         }
         Ok(())
@@ -130,6 +112,14 @@ pub trait Service: MaybeSend + MaybeSync + 'static {
     type Bound: MuxDispatcher;
 
     fn bind(self, allocator: &HandleAllocator) -> Self::Bound;
+
+    #[doc(hidden)]
+    fn bind_with_spawner(self, allocator: &HandleAllocator, _spawner: SubpathSpawner) -> Self::Bound
+    where
+        Self: Sized,
+    {
+        self.bind(allocator)
+    }
 }
 
 pub struct EmptyBoundService;
@@ -169,6 +159,7 @@ impl Service for () {
 pub struct BoundDispatcher<D: Dispatcher> {
     dispatcher: D,
     resources: ResourceTable<D::Resource>,
+    spawner: Option<SubpathSpawner>,
 }
 
 impl<D: Dispatcher> BoundDispatcher<D> {
@@ -191,6 +182,7 @@ impl<D: Dispatcher> MuxDispatcher for BoundDispatcher<D> {
         let ctx = ServerInvocation {
             call,
             resources: &self.resources,
+            spawner: self.spawner.as_ref(),
         };
         self.dispatcher.dispatch(ctx, &instance, &func).await
     }
@@ -218,6 +210,19 @@ impl<D: Dispatcher> Service for D {
         BoundDispatcher {
             dispatcher: self,
             resources: ResourceTable::with_allocator(allocator.clone()),
+            spawner: None,
+        }
+    }
+
+    fn bind_with_spawner(
+        self,
+        allocator: &HandleAllocator,
+        spawner: SubpathSpawner,
+    ) -> Self::Bound {
+        BoundDispatcher {
+            dispatcher: self,
+            resources: ResourceTable::with_allocator(allocator.clone()),
+            spawner: Some(spawner),
         }
     }
 }
@@ -267,6 +272,17 @@ impl<A: Service, B: Service> Service for (A, B) {
             right: self.1.bind(allocator),
         }
     }
+
+    fn bind_with_spawner(
+        self,
+        allocator: &HandleAllocator,
+        spawner: SubpathSpawner,
+    ) -> Self::Bound {
+        BoundPair {
+            left: self.0.bind_with_spawner(allocator, spawner.clone()),
+            right: self.1.bind_with_spawner(allocator, spawner),
+        }
+    }
 }
 
 /// Symmetric peer-to-peer WIT-RPC connection over any `AsyncRead + AsyncWrite`
@@ -277,6 +293,8 @@ pub struct Endpoint<R, W, S: Service> {
     peer: PeerHandle,
     channels: MuxDriverChannels,
     bound: S::Bound,
+    spawner: SubpathSpawner,
+    subpath_rx: async_channel::Receiver<SubpathTask>,
 }
 
 impl<R, W, S> Endpoint<R, W, S>
@@ -298,13 +316,16 @@ where
         };
         let (peer, channels) = create_mux(mux_config);
         let allocator = HandleAllocator::new();
-        let bound = service.bind(&allocator);
+        let (spawner, subpath_rx) = SubpathSpawner::new();
+        let bound = service.bind_with_spawner(&allocator, spawner.clone());
         Self {
             read,
             write,
             peer,
             channels,
             bound,
+            spawner,
+            subpath_rx,
         }
     }
 
@@ -324,10 +345,25 @@ where
             peer: _,
             channels,
             bound,
+            spawner,
+            subpath_rx,
         } = self;
-        drive_mux(read, write, channels, &bound)
-            .await
-            .map_err(RpcError::from)
+        let mut mux_fut = Box::pin(drive_mux(read, write, channels, &bound));
+        let mut tasks_fut = Box::pin(pump_subpath_tasks(subpath_rx));
+        let outcome = std::future::poll_fn(|cx| {
+            let _ = tasks_fut.as_mut().poll(cx);
+            match mux_fut.as_mut().poll(cx) {
+                Poll::Ready(res) => Poll::Ready(res),
+                Poll::Pending => {
+                    let _ = tasks_fut.as_mut().poll(cx);
+                    Poll::Pending
+                }
+            }
+        })
+        .await;
+        drop(tasks_fut);
+        drop(spawner);
+        outcome.map_err(RpcError::from)
     }
 }
 
@@ -342,4 +378,53 @@ where
     pub fn resources(&self) -> &ResourceTable<D::Resource> {
         self.bound.resources()
     }
+}
+
+async fn pump_subpath_tasks(rx: async_channel::Receiver<SubpathTask>) {
+    let mut rx = Box::pin(rx);
+    let mut tasks: Vec<SubpathTask> = Vec::new();
+    let mut rx_closed = false;
+
+    std::future::poll_fn(|cx| {
+        loop {
+            let mut progressed = false;
+
+            if !rx_closed {
+                loop {
+                    match futures_core::Stream::poll_next(rx.as_mut(), cx) {
+                        Poll::Ready(Some(task)) => {
+                            tasks.push(task);
+                            progressed = true;
+                        }
+                        Poll::Ready(None) => {
+                            rx_closed = true;
+                            break;
+                        }
+                        Poll::Pending => break,
+                    }
+                }
+            }
+
+            let mut idx = 0;
+            while idx < tasks.len() {
+                match tasks[idx].as_mut().poll(cx) {
+                    Poll::Ready(()) => {
+                        drop(tasks.swap_remove(idx));
+                        progressed = true;
+                    }
+                    Poll::Pending => {
+                        idx += 1;
+                    }
+                }
+            }
+
+            if !progressed {
+                if rx_closed && tasks.is_empty() {
+                    return Poll::Ready(());
+                }
+                return Poll::Pending;
+            }
+        }
+    })
+    .await;
 }

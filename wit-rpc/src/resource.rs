@@ -272,14 +272,29 @@ impl<R: ResourceEntry> ResourceTableInner<R> {
     }
 }
 
+struct ResourceTableShared<R: ResourceEntry> {
+    inner: Mutex<ResourceTableInner<R>>,
+    rollback_tx: async_channel::Sender<u32>,
+    rollback_rx: async_channel::Receiver<u32>,
+}
+
 /// Connection-scoped resource handle table.
 ///
 /// Synchronized via `async_lock::Mutex` whose guard is never held across an
 /// `.await` point; resource `Drop` destructors always execute outside the lock.
+/// Cheaply cloneable (`Arc`-backed) so long-lived `stream<T>` and `future<T>`
+/// sub-paths can lower and lift `own<R>` handles after the root invocation
+/// returns.
 pub struct ResourceTable<R: ResourceEntry> {
-    inner: Mutex<ResourceTableInner<R>>,
-    rollback_tx: async_channel::Sender<u32>,
-    rollback_rx: async_channel::Receiver<u32>,
+    shared: Arc<ResourceTableShared<R>>,
+}
+
+impl<R: ResourceEntry> Clone for ResourceTable<R> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
 }
 
 impl<R: ResourceEntry> Default for ResourceTable<R> {
@@ -296,15 +311,17 @@ impl<R: ResourceEntry> ResourceTable<R> {
     pub fn with_allocator(allocator: HandleAllocator) -> Self {
         let (rollback_tx, rollback_rx) = async_channel::unbounded();
         Self {
-            inner: Mutex::new(ResourceTableInner::with_allocator(allocator)),
-            rollback_tx,
-            rollback_rx,
+            shared: Arc::new(ResourceTableShared {
+                inner: Mutex::new(ResourceTableInner::with_allocator(allocator)),
+                rollback_tx,
+                rollback_rx,
+            }),
         }
     }
 
     fn drain_deferred_rollbacks(&self, inner: &mut ResourceTableInner<R>) -> Vec<R> {
         let mut removed = Vec::new();
-        while let Ok(handle) = self.rollback_rx.try_recv() {
+        while let Ok(handle) = self.shared.rollback_rx.try_recv() {
             if let Some(entry) = inner.remove_unconditional(handle) {
                 removed.push(entry);
             }
@@ -313,12 +330,12 @@ impl<R: ResourceEntry> ResourceTable<R> {
     }
 
     pub async fn lock(&self) -> MutexGuard<'_, ResourceTableInner<R>> {
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.shared.inner.lock().await;
         let deferred = self.drain_deferred_rollbacks(&mut guard);
         if !deferred.is_empty() {
             drop(guard);
             drop(deferred);
-            return self.inner.lock().await;
+            return self.shared.inner.lock().await;
         }
         guard
     }
@@ -346,7 +363,7 @@ impl<R: ResourceEntry> ResourceTable<R> {
             return;
         }
         let removed = {
-            let mut inner = self.inner.lock().await;
+            let mut inner = self.shared.inner.lock().await;
             let mut removed = self.drain_deferred_rollbacks(&mut inner);
             for &handle in handles {
                 if let Some(entry) = inner.remove_unconditional(handle) {
@@ -359,12 +376,12 @@ impl<R: ResourceEntry> ResourceTable<R> {
     }
 
     /// Synchronous rollback path invoked from an RAII `Drop` guard when an
-    /// in-flight `encode_response` future is cancelled mid-`.await`.
+    /// in-flight `encode_response` or stream/future send is cancelled mid-`.await`.
     pub(crate) fn rollback_handles_sync(&self, handles: Vec<u32>) {
         if handles.is_empty() {
             return;
         }
-        if let Some(mut inner) = self.inner.try_lock() {
+        if let Some(mut inner) = self.shared.inner.try_lock() {
             let mut removed = self.drain_deferred_rollbacks(&mut inner);
             for handle in handles {
                 if let Some(entry) = inner.remove_unconditional(handle) {
@@ -375,7 +392,7 @@ impl<R: ResourceEntry> ResourceTable<R> {
             drop(removed);
         } else {
             for handle in handles {
-                let _ = self.rollback_tx.try_send(handle);
+                let _ = self.shared.rollback_tx.try_send(handle);
             }
         }
     }
@@ -391,8 +408,8 @@ impl<R: ResourceEntry> ResourceTable<R> {
     /// Drops every remaining resource on the connection when the transport
     /// disconnects, returning how many live resources were cleaned up.
     pub async fn clear(&self) -> usize {
-        while self.rollback_rx.try_recv().is_ok() {}
-        let entries = self.inner.lock().await.take_all();
+        while self.shared.rollback_rx.try_recv().is_ok() {}
+        let entries = self.shared.inner.lock().await.take_all();
         let count = entries.len();
         drop(entries);
         count
@@ -450,6 +467,12 @@ impl RemoteResource {
     pub fn into_raw_handle(mut self) -> u32 {
         self.owned = false;
         self.handle
+    }
+
+    pub(crate) fn into_raw_handle_checked(mut self) -> (PeerHandle, u32, bool) {
+        let was_owned = self.owned;
+        self.owned = false;
+        (self.peer.clone(), self.handle, was_owned)
     }
 }
 

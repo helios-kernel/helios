@@ -104,6 +104,40 @@ impl<'a> ReservationWriter<'a> {
             remaining -= take;
         }
     }
+
+    /// Copies up to `dst.len()` bytes starting at `byte_offset` from the
+    /// assembled image (`0..self.written`) into `dst`, returning the number of
+    /// bytes copied.
+    pub fn copy_range(&self, byte_offset: usize, dst: &mut [u8]) -> usize {
+        if byte_offset >= self.written || dst.is_empty() {
+            return 0;
+        }
+        let available = self.written - byte_offset;
+        let to_copy = dst.len().min(available);
+        let mut skip = byte_offset;
+        let mut copied = 0;
+        for &(ptr, size) in self.reservation.blocks() {
+            if copied == to_copy {
+                break;
+            }
+            if skip >= size {
+                skip -= size;
+                continue;
+            }
+            let block_avail = size - skip;
+            let take = block_avail.min(to_copy - copied);
+            // SAFETY: `skip < size` and the block is exclusively owned by
+            // `self.reservation`.
+            let src_ptr = unsafe { ptr.as_ptr().add(skip) };
+            // SAFETY: `skip + take <= size` and bytes up to `self.written` are
+            // initialized and exclusively owned by `self.reservation`.
+            let src = unsafe { core::slice::from_raw_parts(src_ptr, take) };
+            dst[copied..copied + take].copy_from_slice(src);
+            copied += take;
+            skip = 0;
+        }
+        copied
+    }
 }
 
 impl SnapshotSink for ReservationWriter<'_> {
