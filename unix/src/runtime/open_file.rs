@@ -1,3 +1,4 @@
+use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use helios_sync::{RawMutex, RawMutexLease};
@@ -6,6 +7,16 @@ use spin::Mutex;
 use crate::{FileLockTable, MemfdHold};
 
 static NEXT_OPEN_FILE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// One cached directory entry captured when a directory stream begins reading
+/// at offset 0 (`getdents64`), keeping multi-call iteration stable when entries
+/// are unlinked between calls (POSIX `readdir(3)` / `rm -rf`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirCursorEntry {
+    pub inode: u64,
+    pub d_type: u8,
+    pub name: String,
+}
 
 /// Unique identifier of one POSIX open file description ([`OpenFile`]), shared
 /// across `dup`/`dup2`/`fork` duplicates and distinct across separate `open`s.
@@ -49,6 +60,7 @@ struct OpenFileDescription<Node> {
     node: Node,
     offset: AtomicU64,
     position_lock: RawMutex,
+    dir_snapshot: Mutex<Option<Arc<[DirCursorEntry]>>>,
     flock_table: Mutex<Option<FileLockTable>>,
     memfd_hold: Option<MemfdHold>,
 }
@@ -69,6 +81,7 @@ impl<Node> Drop for OpenFileDescription<Node> {
 pub struct OpenFilePosition<'a> {
     _lease: RawMutexLease<'a>,
     offset: &'a AtomicU64,
+    dir_snapshot: &'a Mutex<Option<Arc<[DirCursorEntry]>>>,
 }
 
 impl OpenFilePosition<'_> {
@@ -83,6 +96,17 @@ impl OpenFilePosition<'_> {
     /// to where a seek placed it.
     pub fn set(&mut self, offset: u64) {
         self.offset.store(offset, Ordering::Relaxed);
+    }
+
+    /// Returns the cached directory listing snapshot for this open file
+    /// description, if `getdents64` has already started iterating it.
+    pub fn dir_snapshot(&self) -> Option<Arc<[DirCursorEntry]>> {
+        self.dir_snapshot.lock().clone()
+    }
+
+    /// Replaces or clears the cached directory listing snapshot.
+    pub fn set_dir_snapshot(&mut self, snapshot: Option<Arc<[DirCursorEntry]>>) {
+        *self.dir_snapshot.lock() = snapshot;
     }
 }
 
@@ -100,6 +124,7 @@ impl<Node> OpenFile<Node> {
             node,
             offset: AtomicU64::new(offset),
             position_lock: RawMutex::new(),
+            dir_snapshot: Mutex::new(None),
             flock_table: Mutex::new(None),
             memfd_hold: None,
         }))
@@ -115,6 +140,7 @@ impl<Node> OpenFile<Node> {
             node,
             offset: AtomicU64::new(0),
             position_lock: RawMutex::new(),
+            dir_snapshot: Mutex::new(None),
             flock_table: Mutex::new(None),
             memfd_hold: Some(hold),
         }))
@@ -151,6 +177,7 @@ impl<Node> OpenFile<Node> {
         OpenFilePosition {
             _lease: self.0.position_lock.lock().await,
             offset: &self.0.offset,
+            dir_snapshot: &self.0.dir_snapshot,
         }
     }
 
@@ -163,6 +190,7 @@ impl<Node> OpenFile<Node> {
             .map(|lease| OpenFilePosition {
                 _lease: lease,
                 offset: &self.0.offset,
+                dir_snapshot: &self.0.dir_snapshot,
             })
     }
 
@@ -284,5 +312,51 @@ mod tests {
         pos.set(9);
         drop(pos);
         assert_eq!(block_on(file.lock_position()).get(), 9);
+    }
+
+    #[test]
+    fn directory_snapshot_persists_across_clones_and_clears_on_rewind() {
+        use super::DirCursorEntry;
+        use alloc::string::String;
+        use alloc::sync::Arc;
+
+        let dir = OpenFile::new("dir");
+        let dup = dir.clone();
+        let entries: Arc<[DirCursorEntry]> = alloc::vec![
+            DirCursorEntry {
+                inode: 1,
+                d_type: 4,
+                name: String::from("."),
+            },
+            DirCursorEntry {
+                inode: 2,
+                d_type: 8,
+                name: String::from("alpha"),
+            },
+        ]
+        .into();
+
+        {
+            let mut pos = dir.try_lock_position().expect("lock free");
+            assert!(pos.dir_snapshot().is_none());
+            pos.set_dir_snapshot(Some(Arc::clone(&entries)));
+            pos.set(1);
+        }
+
+        {
+            let mut pos = dup.try_lock_position().expect("lock free");
+            let cached = pos.dir_snapshot().expect("snapshot shared across clones");
+            assert_eq!(cached.len(), 2);
+            assert_eq!(cached[1].name, "alpha");
+            pos.set_dir_snapshot(None);
+            pos.set(0);
+        }
+
+        assert!(
+            dir.try_lock_position()
+                .expect("lock free")
+                .dir_snapshot()
+                .is_none()
+        );
     }
 }

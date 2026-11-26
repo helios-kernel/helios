@@ -32,6 +32,7 @@ cp linux/tests/check-memory.sh "$out/linux/check-memory.sh"
 cp linux/tests/check-pthreads.sh "$out/linux/check-pthreads.sh"
 cp linux/tests/check-signals.sh "$out/linux/check-signals.sh"
 cp linux/tests/check-dash.sh "$out/linux/check-dash.sh"
+cp linux/tests/check-busybox.sh "$out/linux/check-busybox.sh"
 cp linux/tests/check-busybox-netconfig.sh "$out/linux/check-busybox-netconfig.sh"
 cp linux/tests/udhcpc-script.sh "$out/linux/udhcpc-script.sh"
 chmod +x "$out/linux/udhcpc-script.sh"
@@ -73,4 +74,5 @@ if [[ "$(uname -s)" == Linux && "$(uname -m)" == "$arch" ]]; then
     "$out/linux/process"
     "$out/linux/native-swap"
     HELIOS_PROCESS_ID=1 sh "$out/linux/check-dash.sh" "$out/linux/dash" "$out/linux/hello" "$out/linux/args" "$(command -v cat)"
+    sh "$out/linux/check-busybox.sh" "$out/linux/busybox" "$out/linux/memory"
 fi

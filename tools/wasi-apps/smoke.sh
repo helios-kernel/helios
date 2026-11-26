@@ -179,7 +179,7 @@ run_wall_clock_smoke() {
         --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
         --boot-program date \
         --no-compiler-plugin \
-        shell -c '/bin/date' 2>&1)"; then
+        shell --shell /bin/dash -c '/bin/date' 2>&1)"; then
         printf '%s\n' "${output}" >&2
         printf 'smoke wall-clock failed before expected output check\n' >&2
         return 1

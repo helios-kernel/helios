@@ -176,6 +176,35 @@ pub enum NetworkControlError {
     BackendFault,
 }
 
+/// One IPv4 TCP socket row exposed via [`NetworkAdminBackend::list_inet_sockets`]
+/// for `/proc/net/tcp`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InetTcpSocket {
+    pub local_addr: [u8; 4],
+    pub local_port: u16,
+    pub remote_addr: [u8; 4],
+    pub remote_port: u16,
+    /// Linux `include/net/tcp_states.h` state code (`0x01` = ESTABLISHED,
+    /// `0x0A` = LISTEN, etc.).
+    pub state: u8,
+    pub uid: u32,
+    pub inode: u64,
+}
+
+/// One IPv4 UDP socket row exposed via [`NetworkAdminBackend::list_inet_sockets`]
+/// for `/proc/net/udp`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InetUdpSocket {
+    pub local_addr: [u8; 4],
+    pub local_port: u16,
+    pub remote_addr: [u8; 4],
+    pub remote_port: u16,
+    /// Linux UDP state (`0x01` = ESTABLISHED, `0x07` = CLOSE/UNCONN).
+    pub state: u8,
+    pub uid: u32,
+    pub inode: u64,
+}
+
 pub trait NetworkAdminBackend: Clone + Send + 'static {
     /// Per-shard frame and interrupt counters, one entry per processor.
     ///
@@ -184,6 +213,12 @@ pub trait NetworkAdminBackend: Clone + Send + 'static {
     /// whether the device is steering flows across processors or piling
     /// them on one.
     fn network_stats(&self) -> crate::NetworkStats;
+
+    /// Active IPv4 TCP and UDP sockets across the network service for
+    /// `/proc/net/tcp` and `/proc/net/udp` inspection.
+    fn list_inet_sockets(&self) -> (Vec<InetTcpSocket>, Vec<InetUdpSocket>) {
+        (Vec::new(), Vec::new())
+    }
 
     fn bridge_port(
         &self,

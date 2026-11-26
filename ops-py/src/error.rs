@@ -65,6 +65,7 @@ pub(crate) fn ops_err_to_py(err: OpsError) -> PyErr {
         | OpsError::BtrfsRefused { .. }
         | OpsError::ExecRefused { .. } => RpcError::new_err(err.to_string()),
         OpsError::Auth(_)
+        | OpsError::Account(_)
         | OpsError::Http(_)
         | OpsError::Oci(_)
         | OpsError::Bundle(_)

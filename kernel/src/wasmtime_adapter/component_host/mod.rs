@@ -3750,21 +3750,16 @@ where
     let component = init.component();
     let component_name = component.name();
     let argv0 = init.argv0();
-    let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu.clone());
 
     write_serial.emit_stage_marker("engine:new");
     tracing::info!(
         component = component_name,
         argv0,
-        "creating root supervisor component engine"
+        "borrowing shared component engine for root supervisor"
     );
-    let engine =
-        <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as ComponentRuntimeFactory<
-            CpuImpl,
-            HostRuntimeState<CpuImpl, Net, StorageImpl>,
-            StorageImpl,
-        >>::create_engine(&runtime)
-        .map_err(RootComponentError::CreateEngine)?;
+    let program_service = debug_state.wait_for_program_service().await;
+    let runtime = program_service.runtime();
+    let engine = program_service.engine();
     write_serial.emit_stage_marker("engine:ok");
 
     tracing::info!(
@@ -3818,7 +3813,7 @@ where
         write_serial,
     );
 
-    let executor = runtime.instantiate(&engine, &compiled, ComponentWorld::RootSupervisor, context);
+    let executor = runtime.instantiate(engine, &compiled, ComponentWorld::RootSupervisor, context);
     let instantiate_started_at = monotonic_nanos(&instantiate_cpu);
     let instantiate_heartbeat = spawn_component_phase_heartbeat(
         &instantiate_spawner,
@@ -6090,8 +6085,6 @@ fn emit_program_stage_marker(write_serial: crate::DebugSerialWriter, stage: &str
 
 #[derive(Debug, Error)]
 pub enum RootComponentError {
-    #[error("failed to initialize Wasmtime engine: {0:#}")]
-    CreateEngine(wasmtime::Error),
     #[error("failed to load root supervisor component: {0:#}")]
     LoadComponent(wasmtime::Error),
     #[error("failed to instantiate root supervisor component: {0:#}")]

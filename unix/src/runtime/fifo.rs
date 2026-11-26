@@ -52,6 +52,14 @@ struct FifoState {
     buf: VecDeque<u8>,
     readers: usize,
     writers: usize,
+    /// Monotonic count of reader opens (`fs/pipe.c` `pipe_inode_info::r_counter`),
+    /// so a blocked `open(O_WRONLY)` wakes even if the reader opens and closes
+    /// before the writer is re-polled.
+    r_counter: u64,
+    /// Monotonic count of writer opens (`fs/pipe.c` `pipe_inode_info::w_counter`),
+    /// so a blocked `open(O_RDONLY)` wakes even if the writer opens, writes,
+    /// and closes before the reader is re-polled.
+    w_counter: u64,
 }
 
 struct FifoInner {
@@ -68,6 +76,8 @@ impl FifoInner {
                 buf: VecDeque::new(),
                 readers: 0,
                 writers: 0,
+                r_counter: 0,
+                w_counter: 0,
             }),
             changed: Notify::new(),
             inode,
@@ -203,25 +213,34 @@ impl FifoPipe {
         {
             let mut state = self.inner.state.lock();
             state.readers += 1;
+            state.r_counter = state.r_counter.wrapping_add(1);
         }
         self.inner.changed.notify_all();
         FifoReader(Arc::new(FifoReaderGuard(self.inner.clone())))
     }
 
-    /// `open(O_RDONLY)`: increments reader count and awaits at least one writer.
+    /// `open(O_RDONLY)`: increments reader count and awaits at least one writer
+    /// (matching Linux `fs/pipe.c` `fifo_open` `w_counter` rendezvous so a
+    /// short-lived writer that opens, writes, and closes before the reader is
+    /// re-polled still completes the open).
     /// Dropping the future before completion (e.g. signal interruption) decrements
     /// the reader count cleanly.
     pub async fn open_read_blocking(&self) -> FifoReader {
         let guard = FifoReader(Arc::new(FifoReaderGuard(self.inner.clone())));
-        {
+        let w_counter_before = {
             let mut state = self.inner.state.lock();
             state.readers += 1;
-        }
+            state.r_counter = state.r_counter.wrapping_add(1);
+            state.w_counter
+        };
         self.inner.changed.notify_all();
         loop {
             let mut wait = self.inner.changed.waiter();
-            if self.inner.state.lock().writers > 0 {
-                return guard;
+            {
+                let state = self.inner.state.lock();
+                if state.writers > 0 || state.w_counter != w_counter_before {
+                    return guard;
+                }
             }
             poll_fn(|cx| self.inner.changed.poll_notified(cx, &mut wait)).await;
         }
@@ -236,24 +255,31 @@ impl FifoPipe {
                 return Err(FifoError::NoReader);
             }
             state.writers += 1;
+            state.w_counter = state.w_counter.wrapping_add(1);
         }
         self.inner.changed.notify_all();
         Ok(FifoWriter(Arc::new(FifoWriterGuard(self.inner.clone()))))
     }
 
-    /// `open(O_WRONLY)`: increments writer count and awaits at least one reader.
+    /// `open(O_WRONLY)`: increments writer count and awaits at least one reader
+    /// (matching Linux `fs/pipe.c` `fifo_open` `r_counter` rendezvous).
     /// Dropping the future before completion decrements the writer count cleanly.
     pub async fn open_write_blocking(&self) -> FifoWriter {
         let guard = FifoWriter(Arc::new(FifoWriterGuard(self.inner.clone())));
-        {
+        let r_counter_before = {
             let mut state = self.inner.state.lock();
             state.writers += 1;
-        }
+            state.w_counter = state.w_counter.wrapping_add(1);
+            state.r_counter
+        };
         self.inner.changed.notify_all();
         loop {
             let mut wait = self.inner.changed.waiter();
-            if self.inner.state.lock().readers > 0 {
-                return guard;
+            {
+                let state = self.inner.state.lock();
+                if state.readers > 0 || state.r_counter != r_counter_before {
+                    return guard;
+                }
             }
             poll_fn(|cx| self.inner.changed.poll_notified(cx, &mut wait)).await;
         }
@@ -266,6 +292,8 @@ impl FifoPipe {
             let mut state = self.inner.state.lock();
             state.readers += 1;
             state.writers += 1;
+            state.r_counter = state.r_counter.wrapping_add(1);
+            state.w_counter = state.w_counter.wrapping_add(1);
         }
         self.inner.changed.notify_all();
         FifoReadWrite(Arc::new(FifoReadWriteGuard(self.inner.clone())))
@@ -433,5 +461,57 @@ impl FifoReadWrite {
 
     pub fn poll_changed(&self, cx: &mut Context<'_>, wait: &mut NotifyWaiter) -> Poll<()> {
         self.0.0.poll_changed(cx, wait)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::future::Future;
+    use core::pin::pin;
+    use core::task::{Context, Poll, Waker};
+    use futures_lite::future::block_on;
+
+    #[test]
+    fn open_read_blocking_wakes_when_writer_writes_and_closes_before_reader_polls() {
+        let fifo = FifoPipe::new(PipeInode::new(0, 0));
+        let mut reader_open = pin!(fifo.open_read_blocking());
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        // Reader enters blocking open and parks before any writer arrives.
+        assert!(matches!(reader_open.as_mut().poll(&mut cx), Poll::Pending));
+
+        // Short-lived writer opens, writes payload, and drops before reader is re-polled.
+        let writer = block_on(fifo.open_write_blocking());
+        assert_eq!(block_on(writer.write(b"locked\n")).unwrap(), 7);
+        drop(writer);
+
+        // Reader must still complete `open_read_blocking` via `w_counter` and read
+        // the buffered payload followed by EOF.
+        let reader = match reader_open.as_mut().poll(&mut cx) {
+            Poll::Ready(r) => r,
+            Poll::Pending => panic!("reader stayed parked after writer opened and closed"),
+        };
+        assert_eq!(&block_on(reader.read(64))[..], b"locked\n");
+        assert!(block_on(reader.read(64)).is_empty());
+    }
+
+    #[test]
+    fn open_write_blocking_wakes_when_reader_opens_and_closes_before_writer_polls() {
+        let fifo = FifoPipe::new(PipeInode::new(0, 0));
+        let mut writer_open = pin!(fifo.open_write_blocking());
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        assert!(matches!(writer_open.as_mut().poll(&mut cx), Poll::Pending));
+
+        let reader = block_on(fifo.open_read_blocking());
+        drop(reader);
+
+        assert!(
+            matches!(writer_open.as_mut().poll(&mut cx), Poll::Ready(_)),
+            "writer stayed parked after reader opened and closed"
+        );
     }
 }

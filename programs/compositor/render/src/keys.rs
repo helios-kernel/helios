@@ -81,12 +81,25 @@ const LAYOUT: [(char, char); (LAST_CODE - FIRST_CODE + 1) as usize] = [
     ('/', '?'),
 ];
 
+/// High-level action produced by translating an `EV_KEY` event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyAction {
+    Char(char),
+    Escape,
+    PageUp,
+    PageDown,
+    ScrollLineUp,
+    ScrollLineDown,
+    SwitchVt(u8),
+}
+
 /// The modifiers a keyboard is holding, and what a press means under
 /// them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Keyboard {
     shift: bool,
     control: bool,
+    alt: bool,
     capitals: bool,
 }
 
@@ -95,6 +108,7 @@ impl Keyboard {
         Self {
             shift: false,
             control: false,
+            alt: false,
             capitals: false,
         }
     }
@@ -105,6 +119,14 @@ impl Keyboard {
     /// an auto-repeat, which produces the same bytes a press does
     /// because that is what repeating a key is for.
     pub fn press(&mut self, code: u16, value: i32) -> Option<char> {
+        match self.translate(code, value) {
+            Some(KeyAction::Char(character)) => Some(character),
+            _ => None,
+        }
+    }
+
+    /// Translates one `EV_KEY` event into a terminal character or navigation action.
+    pub fn translate(&mut self, code: u16, value: i32) -> Option<KeyAction> {
         let held = value != 0;
         match code {
             codes::KEY_LEFTSHIFT | codes::KEY_RIGHTSHIFT => {
@@ -113,6 +135,10 @@ impl Keyboard {
             }
             codes::KEY_LEFTCTRL | codes::KEY_RIGHTCTRL => {
                 self.control = held;
+                return None;
+            }
+            codes::KEY_LEFTALT | codes::KEY_RIGHTALT => {
+                self.alt = held;
                 return None;
             }
             codes::KEY_CAPSLOCK => {
@@ -127,6 +153,16 @@ impl Keyboard {
         }
         if !held {
             return None;
+        }
+        match code {
+            codes::KEY_ESC => return Some(KeyAction::Escape),
+            codes::KEY_PAGEUP => return Some(KeyAction::PageUp),
+            codes::KEY_PAGEDOWN => return Some(KeyAction::PageDown),
+            codes::KEY_UP if self.shift => return Some(KeyAction::ScrollLineUp),
+            codes::KEY_DOWN if self.shift => return Some(KeyAction::ScrollLineDown),
+            codes::KEY_F1 if self.alt => return Some(KeyAction::SwitchVt(1)),
+            codes::KEY_F2 if self.alt => return Some(KeyAction::SwitchVt(2)),
+            _ => {}
         }
         let character = match code {
             codes::KEY_SPACE => ' ',
@@ -154,9 +190,9 @@ impl Keyboard {
             // end of file.
             return character
                 .is_ascii_alphabetic()
-                .then(|| char::from(character.to_ascii_uppercase() as u8 & 0x1f));
+                .then(|| KeyAction::Char(char::from(character.to_ascii_uppercase() as u8 & 0x1f)));
         }
-        Some(character)
+        Some(KeyAction::Char(character))
     }
 }
 
@@ -227,5 +263,50 @@ mod tests {
         let mut keyboard = Keyboard::new();
         assert_eq!(typed(&mut keyboard, codes::KEY_F1), None);
         assert_eq!(typed(&mut keyboard, codes::KEY_LEFTALT), None);
+    }
+
+    #[test]
+    fn translate_decodes_navigation_and_vt_switch_chords() {
+        let mut keyboard = Keyboard::new();
+        assert_eq!(
+            keyboard.translate(codes::KEY_ESC, 1),
+            Some(KeyAction::Escape)
+        );
+        assert_eq!(keyboard.press(codes::KEY_ESC, 1), None);
+        assert_eq!(
+            keyboard.translate(codes::KEY_PAGEUP, 1),
+            Some(KeyAction::PageUp)
+        );
+        assert_eq!(
+            keyboard.translate(codes::KEY_PAGEDOWN, 1),
+            Some(KeyAction::PageDown)
+        );
+
+        // Plain arrows do not trigger scroll actions; Shift+Up/Down do.
+        assert_eq!(keyboard.translate(codes::KEY_UP, 1), None);
+        keyboard.translate(codes::KEY_LEFTSHIFT, 1);
+        assert_eq!(
+            keyboard.translate(codes::KEY_UP, 1),
+            Some(KeyAction::ScrollLineUp)
+        );
+        assert_eq!(
+            keyboard.translate(codes::KEY_DOWN, 2),
+            Some(KeyAction::ScrollLineDown)
+        );
+        keyboard.translate(codes::KEY_LEFTSHIFT, 0);
+
+        // Alt+F1 / Alt+F2 switch virtual terminals.
+        assert_eq!(keyboard.translate(codes::KEY_F1, 1), None);
+        keyboard.translate(codes::KEY_LEFTALT, 1);
+        assert_eq!(
+            keyboard.translate(codes::KEY_F1, 1),
+            Some(KeyAction::SwitchVt(1))
+        );
+        assert_eq!(
+            keyboard.translate(codes::KEY_F2, 1),
+            Some(KeyAction::SwitchVt(2))
+        );
+        keyboard.translate(codes::KEY_LEFTALT, 0);
+        assert_eq!(keyboard.translate(codes::KEY_F2, 1), None);
     }
 }

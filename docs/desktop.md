@@ -15,7 +15,7 @@ uses for its other virtio devices:
 
 | Device | PCI machine (x86-64) | MMIO machine (aarch64, riscv64) |
 | --- | --- | --- |
-| Display | `virtio-gpu-pci` | `virtio-gpu-device` |
+| Display | `virtio-vga` (non-IOMMU 2D), `virtio-gpu-pci` (`--iommu`) | `virtio-gpu-device` |
 | Keyboard | `virtio-keyboard-pci` | `virtio-keyboard-device` |
 | Absolute pointer | `virtio-tablet-pci` | `virtio-tablet-device` |
 | Relative pointer | `virtio-mouse-pci` | `virtio-mouse-device` |
@@ -25,26 +25,54 @@ modes of one: an absolute position moves the tablet, a relative offset
 moves the mouse, and a guest given only one of them ignores half of an
 input script.
 
-On the PCI machine the same step passes `-vga none`. The machine would
-otherwise create a VGA adapter of its own, and QEMU's console 0 — the one
-`screendump` captures — would be that adapter's rather than the guest's.
-A capture of a display the guest never drove looks exactly like one the
-guest failed to draw into, which is the one thing a capture must not do.
+On the PCI machine (`x86-64`), non-IOMMU 2D sessions pass `-vga none`
+and attach `-device virtio-vga` on console 0. Pure `virtio-gpu-pci`
+exposes no linear framebuffer BAR, so EDK2 OVMF's `VirtioGpuDxe`
+publishes a `PixelBltOnly` GOP (`FrameBufferBase = 0`) and early boot
+stages before the kernel's `virtio-gpu` driver attaches have no linear
+framebuffer to draw into. `virtio-vga` combines the linear VGA/GOP
+framebuffer BAR and the modern `virtio-gpu` PCI device on the same
+single console 0, preserving firmware GOP-to-`virtio-gpu` continuity,
+while `-vga none` still prevents `q35` from creating a duplicate default
+VGA adapter that `screendump` or a host window would read instead of the
+guest's display. When `--iommu` is enabled, legacy VGA regions cannot sit
+behind `iommu_platform=on,disable-legacy=on`, so `x86-64` keeps
+`virtio-gpu-pci`.
 
-Without `--desktop` nothing changes: the machine is the machine every
-existing lane boots.
+Without `--desktop` (or `--gui`, or `--renderer`), nothing changes: the
+machine is the machine every existing lane boots.
 
 ## `--display`
 
-`--display <none|cocoa|gtk|sdl>` is the host display backend QEMU opens.
-The default is `none`, which is what every lane boots and what the
-capture recipe below uses: the guest still has its display device, and
-QEMU still holds its surface, so `screendump` returns exactly what a
-window would have shown.
+`--display <none|cocoa|gtk|sdl|egl-headless>` is the host display
+backend QEMU opens.
+The default when using `--desktop` alone is `none`, which is what every
+lane boots and what the capture recipe below uses: the guest still has
+its display device, and QEMU still holds its surface, so `screendump`
+returns exactly what a window would have shown.
 
 A backend this host's QEMU was not built with is refused by QEMU, naming
 itself. Nothing substitutes another one — the same rule the accelerator
 follows.
+
+## `--gui`
+
+`--gui` is the interactive on-screen mode for `helios vm`, whereas
+`--desktop` attaches the desktop devices while staying headless by
+default (`--display none`):
+
+- `--gui` implies `--desktop` and selects the host's native window
+  backend (`cocoa` on macOS, `gtk` on Linux and other hosts) when
+  `--display` is omitted. Passing an explicit windowed backend such as
+  `--display sdl` overrides that choice; combining `--gui` with
+  `--display none` fails at config resolution because `--display none`
+  suppresses the host window `--gui` asked for.
+- When no session subcommand is given, `helios vm --gui` prints a
+  readiness line and waits until the user closes the QEMU window or
+  presses `Ctrl-C`, instead of opening the host `nu` REPL on stdio.
+  Explicit subcommands (such as `helios vm --gui shell`,
+  `helios vm --gui stats`, or `helios vm --gui repl`) still run as
+  normal.
 
 ## `--renderer`
 

@@ -3,12 +3,12 @@ use std::path::{Component, Path};
 use helios_wit_rpc::RpcError;
 use helios_wit_rpc::inspector::helios::system::ipc::Endpoint;
 use helios_wit_rpc::inspector::helios::system::programs::{
-    self as rpc_programs, AuthorityScope, CapabilityGrant, ClockGrant, ClockRight, ContainerConfig,
-    ContainerCredentials, ContainerExecRequest, ContainerIdentity, ContainerMount,
-    ContainerMountSharing, DeviceClass, DeviceGrant, DiagnosticsGrant, DirectoryGrant, ExecError,
-    ExecErrorKind, ExecRequest, ExecResult, FilesystemRight, LinkGrant, LinkRight, MachineGrant,
-    MachineRight, MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight,
-    SettingsGrant, SettingsRight, TerminalGrant, TerminalRight,
+    self as rpc_programs, AuthorityScope, CapabilityGrant, ContainerConfig, ContainerCredentials,
+    ContainerExecRequest, ContainerIdentity, ContainerMount, ContainerMountSharing, DeviceClass,
+    DeviceGrant, DiagnosticsGrant, DirectoryGrant, ExecError, ExecErrorKind, ExecRequest,
+    ExecResult, FilesystemRight, LinkGrant, LinkRight, MachineGrant, MachineRight, MountGrant,
+    MountRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight, SettingsGrant,
+    SettingsRight, TerminalGrant, TerminalRight,
 };
 use helios_wit_rpc::inspector_fs;
 
@@ -96,6 +96,8 @@ impl From<ExecError> for ProgramError {
 ///
 /// The guest `inspector-worker` never synthesizes ambient grants; the kernel
 /// strictly checks every entry against the worker's attenuated `ProcessAuthority`.
+/// Wall-clock mutation (`ClockRight::SetWallClock`) is intentionally omitted so
+/// shells and default containers run without `CAP_SYS_TIME`.
 fn default_operator_grants() -> Vec<CapabilityGrant<Endpoint>> {
     vec![
         CapabilityGrant::Directory(DirectoryGrant {
@@ -117,9 +119,6 @@ fn default_operator_grants() -> Vec<CapabilityGrant<Endpoint>> {
                 NetworkRight::Multicast,
                 NetworkRight::Admin,
             ],
-        }),
-        CapabilityGrant::Clock(ClockGrant {
-            rights: vec![ClockRight::SetWallClock],
         }),
         CapabilityGrant::Terminal(TerminalGrant {
             rights: vec![
@@ -181,9 +180,6 @@ fn default_container_non_fs_grants() -> Vec<CapabilityGrant<Endpoint>> {
                 NetworkRight::Multicast,
                 NetworkRight::Admin,
             ],
-        }),
-        CapabilityGrant::Clock(ClockGrant {
-            rights: vec![ClockRight::SetWallClock],
         }),
         CapabilityGrant::Terminal(TerminalGrant {
             rights: vec![
@@ -345,7 +341,10 @@ fn normalize_absolute(input: &str) -> Result<String, ProgramError> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_absolute;
+    use super::{
+        CapabilityGrant, default_container_non_fs_grants, default_operator_grants,
+        normalize_absolute,
+    };
 
     #[test]
     fn normalizes_relative_paths_from_root() {
@@ -366,5 +365,21 @@ mod tests {
     #[test]
     fn rejects_parent_traversal() {
         assert!(normalize_absolute("../bin/dash").is_err());
+    }
+
+    #[test]
+    fn default_grants_omit_set_wall_clock() {
+        assert!(
+            !default_operator_grants()
+                .iter()
+                .any(|grant| matches!(grant, CapabilityGrant::Clock(_))),
+            "operator shell grants must not include wall-clock mutation by default"
+        );
+        assert!(
+            !default_container_non_fs_grants()
+                .iter()
+                .any(|grant| matches!(grant, CapabilityGrant::Clock(_))),
+            "default container grants must not include wall-clock mutation by default"
+        );
     }
 }

@@ -1515,6 +1515,8 @@ pub async fn dispatch<
                 if is_memfd {
                     output.reap_memfds();
                     shm::sync_process_memfds(process, output);
+                } else {
+                    output.sync_process_fds(process.pid().get());
                 }
             }
             SyscallOutcome::Return(result)
@@ -1557,6 +1559,8 @@ pub async fn dispatch<
             if touched_memfd {
                 output.reap_memfds();
                 shm::sync_process_memfds(process, output);
+            } else if result <= i32::MAX as u64 {
+                output.sync_process_fds(process.pid().get());
             }
             SyscallOutcome::Return(result)
         }
@@ -1591,22 +1595,34 @@ pub async fn dispatch<
                         });
                     if is_memfd {
                         shm::sync_process_memfds(process, output);
+                    } else {
+                        output.sync_process_fds(process.pid().get());
                     }
                 }
                 SyscallOutcome::Return(res)
             }
         }
-        Operation::Eventfd | Operation::Eventfd2 => SyscallOutcome::Return(io::event::<R>(
-            &mut process.shared.descriptors.lock(),
-            arguments,
-            operation == Operation::Eventfd2,
-        )),
+        Operation::Eventfd | Operation::Eventfd2 => {
+            let res = io::event::<R>(
+                &mut process.shared.descriptors.lock(),
+                arguments,
+                operation == Operation::Eventfd2,
+            );
+            if res <= i32::MAX as u64 {
+                output.sync_process_fds(process.pid().get());
+            }
+            SyscallOutcome::Return(res)
+        }
         Operation::EpollCreate | Operation::EpollCreate1 => {
-            SyscallOutcome::Return(io::epoll_create::<R>(
+            let res = io::epoll_create::<R>(
                 &mut process.shared.descriptors.lock(),
                 arguments,
                 operation == Operation::EpollCreate1,
-            ))
+            );
+            if res <= i32::MAX as u64 {
+                output.sync_process_fds(process.pid().get());
+            }
+            SyscallOutcome::Return(res)
         }
         Operation::Mprotect => {
             SyscallOutcome::Return(memory::mprotect(process, abi, arguments, memory))
@@ -1685,12 +1701,18 @@ pub async fn dispatch<
         Operation::Umask => SyscallOutcome::Return(process.umask(arguments)),
         Operation::Getpriority => SyscallOutcome::Return(process.getpriority(arguments)),
         Operation::Setpriority => SyscallOutcome::Return(process.setpriority(arguments)),
-        Operation::Socket => SyscallOutcome::Return(socket::socket::<R, _>(
-            &process.shared.descriptors,
-            arguments,
-            socket_context(process),
-            output,
-        )),
+        Operation::Socket => {
+            let res = socket::socket::<R, _>(
+                &process.shared.descriptors,
+                arguments,
+                socket_context(process),
+                output,
+            );
+            if res <= i32::MAX as u64 {
+                output.sync_process_fds(process.pid().get());
+            }
+            SyscallOutcome::Return(res)
+        }
         Operation::Unknown => SyscallOutcome::Return(errno(ENOSYS)),
     };
     ControlFlow::Continue(outcome)
@@ -1745,17 +1767,19 @@ async fn dispatch_signal_ipc<
                 let creds = process.credentials.lock();
                 (creds.user.effective, creds.group.effective)
             };
-            SyscallOutcome::Return(
-                io::pipe::<R, _>(
-                    &process.shared.descriptors,
-                    arguments,
-                    memory,
-                    operation == Operation::Pipe2,
-                    uid,
-                    gid,
-                )
-                .await,
+            let res = io::pipe::<R, _>(
+                &process.shared.descriptors,
+                arguments,
+                memory,
+                operation == Operation::Pipe2,
+                uid,
+                gid,
             )
+            .await;
+            if res == 0 {
+                output.sync_process_fds(process.pid().get());
+            }
+            SyscallOutcome::Return(res)
         }
         Operation::EpollCtl => SyscallOutcome::Return(
             io::epoll_ctl::<R, _>(abi, &process.shared.descriptors, arguments, memory).await,
@@ -1769,9 +1793,14 @@ async fn dispatch_signal_ipc<
         Operation::GetRobustList => {
             SyscallOutcome::Return(futex::get_robust_list(process, arguments, memory).await)
         }
-        Operation::Socketpair => SyscallOutcome::Return(
-            socket::socketpair::<R, _>(&process.shared.descriptors, arguments, memory).await,
-        ),
+        Operation::Socketpair => {
+            let res =
+                socket::socketpair::<R, _>(&process.shared.descriptors, arguments, memory).await;
+            if res == 0 {
+                output.sync_process_fds(process.pid().get());
+            }
+            SyscallOutcome::Return(res)
+        }
         _ => unreachable!("dispatched non-signal/ipc operation"),
     }
 }
@@ -2357,20 +2386,42 @@ async fn dispatch_socket<
         Operation::Listen => SyscallOutcome::Return(
             socket::listen::<R, _>(&process.shared.descriptors, arguments, output).await,
         ),
-        Operation::Accept | Operation::Accept4 => SyscallOutcome::Return(
-            socket::accept::<R, _, _>(
-                &process.shared.descriptors,
-                arguments,
-                memory,
-                output,
-                operation == Operation::Accept4,
-            )
-            .await,
-        ),
-        Operation::Connect => SyscallOutcome::Return(
-            socket::connect::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
-                .await,
-        ),
+        Operation::Accept | Operation::Accept4 => {
+            match process
+                .signals
+                .interruptible(socket::accept::<R, _, _>(
+                    &process.shared.descriptors,
+                    arguments,
+                    memory,
+                    output,
+                    operation == Operation::Accept4,
+                ))
+                .await
+            {
+                signal::WaitOutcome::Ready(res) => {
+                    if res <= i32::MAX as u64 {
+                        output.sync_process_fds(process.pid().get());
+                    }
+                    SyscallOutcome::Return(res)
+                }
+                signal::WaitOutcome::Interrupted => SyscallOutcome::RestartSys,
+            }
+        }
+        Operation::Connect => {
+            match process
+                .signals
+                .interruptible(socket::connect::<R, _, _>(
+                    &process.shared.descriptors,
+                    arguments,
+                    memory,
+                    output,
+                ))
+                .await
+            {
+                signal::WaitOutcome::Ready(res) => SyscallOutcome::Return(res),
+                signal::WaitOutcome::Interrupted => SyscallOutcome::RestartNoHand,
+            }
+        }
         Operation::Getsockname => SyscallOutcome::Return(
             socket::getsockname::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
                 .await,
@@ -2379,34 +2430,70 @@ async fn dispatch_socket<
             socket::getpeername::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
                 .await,
         ),
-        Operation::Sendto => SyscallOutcome::Return(
-            socket::sendto::<R, _, _>(
-                &process.shared.descriptors,
-                arguments,
-                socket_context(process),
-                memory,
-                output,
-            )
-            .await,
-        ),
-        Operation::Recvfrom => SyscallOutcome::Return(
-            socket::recvfrom::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
-                .await,
-        ),
-        Operation::Sendmsg => SyscallOutcome::Return(
-            socket::sendmsg::<R, _, _>(
-                &process.shared.descriptors,
-                arguments,
-                socket_context(process),
-                memory,
-                output,
-            )
-            .await,
-        ),
-        Operation::Recvmsg => SyscallOutcome::Return(
-            socket::recvmsg::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
-                .await,
-        ),
+        Operation::Sendto => {
+            let ctx = socket_context(process);
+            match process
+                .signals
+                .interruptible(socket::sendto::<R, _, _>(
+                    &process.shared.descriptors,
+                    arguments,
+                    ctx,
+                    memory,
+                    output,
+                ))
+                .await
+            {
+                signal::WaitOutcome::Ready(res) => SyscallOutcome::Return(res),
+                signal::WaitOutcome::Interrupted => SyscallOutcome::RestartSys,
+            }
+        }
+        Operation::Recvfrom => {
+            match process
+                .signals
+                .interruptible(socket::recvfrom::<R, _, _>(
+                    &process.shared.descriptors,
+                    arguments,
+                    memory,
+                    output,
+                ))
+                .await
+            {
+                signal::WaitOutcome::Ready(res) => SyscallOutcome::Return(res),
+                signal::WaitOutcome::Interrupted => SyscallOutcome::RestartSys,
+            }
+        }
+        Operation::Sendmsg => {
+            let ctx = socket_context(process);
+            match process
+                .signals
+                .interruptible(socket::sendmsg::<R, _, _>(
+                    &process.shared.descriptors,
+                    arguments,
+                    ctx,
+                    memory,
+                    output,
+                ))
+                .await
+            {
+                signal::WaitOutcome::Ready(res) => SyscallOutcome::Return(res),
+                signal::WaitOutcome::Interrupted => SyscallOutcome::RestartSys,
+            }
+        }
+        Operation::Recvmsg => {
+            match process
+                .signals
+                .interruptible(socket::recvmsg::<R, _, _>(
+                    &process.shared.descriptors,
+                    arguments,
+                    memory,
+                    output,
+                ))
+                .await
+            {
+                signal::WaitOutcome::Ready(res) => SyscallOutcome::Return(res),
+                signal::WaitOutcome::Interrupted => SyscallOutcome::RestartSys,
+            }
+        }
         Operation::Sendmmsg => SyscallOutcome::Return(
             socket::sendmmsg::<R, _, _>(
                 &process.shared.descriptors,

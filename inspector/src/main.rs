@@ -20,8 +20,8 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use crate::ops_cli::{
-    BridgeCommand, BundleCommand, ComponentCommand, ContainerCommand, ExecCommand, GlobalOpsFlags,
-    InspectCommand, KillCommand, LoginCommand, NuCommand, OciCommand, OpsCliError,
+    AccountCommand, BridgeCommand, BundleCommand, ComponentCommand, ContainerCommand, ExecCommand,
+    GlobalOpsFlags, InspectCommand, KillCommand, LoginCommand, NuCommand, OciCommand, OpsCliError,
     ProfileOpsCommand, PsCommand, PythonCommand, SpawnCommand, TargetCommand, TraceCommand,
 };
 use crate::ready::BootError;
@@ -173,6 +173,9 @@ enum Command {
     Login(LoginCommand),
     /// Display the active principal, resolved target, scope, and capability attenuation.
     Whoami,
+    /// Manage Touch ID, FIDO2, and software operator accounts (`create`, `ls`, `inspect`, `verify`, `rm`).
+    #[command(subcommand)]
+    Account(AccountCommand),
     /// Manage named targets in `targets.toml`.
     #[command(subcommand)]
     Target(TargetCommand),
@@ -339,6 +342,7 @@ fn main() -> Result<(), InspectorError> {
         Some(Command::Image(cmd)) => Ok(image::run(&cmd)?),
         Some(Command::Python(cmd)) => Ok(ops_cli::run_python_command(&args.ops, &cmd, None)?),
         Some(Command::Whoami) => Ok(ops_cli::run_whoami(&args.ops)?),
+        Some(Command::Account(cmd)) => Ok(ops_cli::run_account_command(&cmd, &args.ops)?),
         Some(Command::Target(cmd)) => Ok(ops_cli::run_target_command(&cmd, args.ops.output)?),
         Some(Command::Login(cmd)) => {
             let rt = tokio::runtime::Runtime::new()
@@ -383,6 +387,7 @@ fn main() -> Result<(), InspectorError> {
                     | Command::Python(_)
                     | Command::Login(_)
                     | Command::Whoami
+                    | Command::Account(_)
                     | Command::Target(_)
                     | Command::Profile(_),
                 ) => unreachable!("handled above"),
@@ -857,6 +862,95 @@ mod tests {
         ])
         .expect("`helios bridge` must parse");
         assert!(matches!(bridge.command, Some(Command::Bridge(_))));
+    }
+
+    #[test]
+    fn parses_account_subcommands_and_flags() {
+        use crate::ops_cli::AccountCommand;
+
+        let create_touch = Args::try_parse_from([
+            "helios",
+            "account",
+            "create",
+            "lexo",
+            "--touch-id",
+            "--scope",
+            "/core/http",
+            "--only",
+            "inspect,trace",
+        ])
+        .expect("`helios account create --touch-id` must parse");
+        assert_eq!(create_touch.ops.scope.as_deref(), Some("/core/http"));
+        assert_eq!(create_touch.ops.only, vec!["inspect", "trace"]);
+        match create_touch.command {
+            Some(Command::Account(AccountCommand::Create {
+                username,
+                touch_id,
+                fido2,
+                p256,
+                ed25519,
+                require_uv,
+                ..
+            })) => {
+                assert_eq!(username, "lexo");
+                assert!(touch_id);
+                assert!(!fido2 && !p256 && !ed25519 && !require_uv);
+            }
+            other => panic!("expected Account::Create, got {other:?}"),
+        }
+
+        let create_fido = Args::try_parse_from([
+            "helios",
+            "account",
+            "create",
+            "ops_key",
+            "--fido2",
+            "--require-uv",
+            "--application",
+            "ssh:helios-prod",
+        ])
+        .expect("`helios account create --fido2 --require-uv` must parse");
+        match create_fido.command {
+            Some(Command::Account(AccountCommand::Create {
+                username,
+                fido2,
+                require_uv,
+                application,
+                ..
+            })) => {
+                assert_eq!(username, "ops_key");
+                assert!(fido2);
+                assert!(require_uv);
+                assert_eq!(application, "ssh:helios-prod");
+            }
+            other => panic!("expected Account::Create --fido2, got {other:?}"),
+        }
+
+        for argv in [
+            vec!["helios", "account", "create", "ci_p256", "--p256"],
+            vec!["helios", "account", "create", "ci_ed", "--ed25519"],
+            vec!["helios", "account", "create", "default_auth"],
+            vec!["helios", "-o", "json", "account", "ls"],
+            vec!["helios", "account", "inspect", "lexo"],
+            vec!["helios", "account", "verify", "lexo"],
+            vec!["helios", "account", "rm", "lexo"],
+        ] {
+            Args::try_parse_from(&argv)
+                .unwrap_or_else(|err| panic!("failed to parse {argv:?}: {err}"));
+        }
+
+        // Conflicting authenticator flags must be rejected by clap.
+        assert!(
+            Args::try_parse_from([
+                "helios",
+                "account",
+                "create",
+                "lexo",
+                "--touch-id",
+                "--fido2",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

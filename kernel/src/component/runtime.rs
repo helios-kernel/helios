@@ -137,7 +137,8 @@ pub const MAX_TABLES_PER_COMPONENT: u32 = 4;
 /// runtime adapter asserts the derived pools fit.
 pub const MAX_POOLED_ADDRESS_SPACE: u64 = 16 << 40;
 
-/// The user memory one engine's instance pools may commit up front.
+/// The user memory the kernel's component engine may commit up front
+/// for its instance pools.
 ///
 /// Reserved address space is not the only thing a pool costs, and the
 /// exception is what made the first draft of the instance budget a
@@ -151,10 +152,12 @@ pub const MAX_POOLED_ADDRESS_SPACE: u64 = 16 << 40;
 /// `available=34942976 of 1510993920`, because a fourfold table budget
 /// had committed 1.3 GiB of the 1.44 GiB the guest had.
 ///
-/// It is per *engine*, and the kernel builds one per component-host
-/// consumer — two today, the host and its service path — so the figure
-/// to compare against a guest's budget is twice this.
-pub const MAX_POOLED_USER_MEMORY: u64 = 128 << 20;
+/// The kernel builds **one** component engine — owned by the program
+/// service and shared by the root supervisor and every launched program
+/// — rather than two, so this constant is the whole guest's upfront
+/// table-pool budget and keeps total boot-committed user memory
+/// unchanged at 256 MiB (`2048` table slots × `128 KiB`).
+pub const MAX_POOLED_USER_MEMORY: u64 = 256 << 20;
 
 /// The kernel heap one wasm store costs the kernel.
 ///

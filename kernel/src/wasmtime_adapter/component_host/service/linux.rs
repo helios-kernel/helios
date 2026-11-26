@@ -1465,6 +1465,9 @@ where
     /// User-executable `rt_sigreturn` trampoline page on ABIs that supply one
     /// (AArch64), or `0` on ABIs that require `SA_RESTORER` (x86-64).
     sigreturn_trampoline: u64,
+    /// Mapped virtual memory regions exposed via `/proc/<pid>/maps` and `smaps`.
+    /// Never held across `.await`.
+    maps: spin::Mutex<Vec<crate::ProcMapEntry>>,
     space: Arc<Space>,
     /// Live registration of `space` in [`crate::NativeSpaceRegistry`] for swap
     /// eviction, activity aging, async fault-in, and teardown orphan cleanup.
@@ -1719,6 +1722,7 @@ where
         let creds = self.shared.credentials_handle.lock().clone();
         let pgid = self.shared.proc_signals.pgid();
         let fds = snapshot_process_fds(&self.shared.descriptors_handle.lock());
+        let maps = self.shared.maps.lock().clone();
         let ticks_ns = self
             .shared
             .cpu
@@ -1742,10 +1746,14 @@ where
             record.pgid = pgid;
             record.fds = fds;
             record.utime_ticks = utime_ticks;
+            populate_proc_maps(record, maps);
         });
 
         if let Some(service) = self.shared.runtime_state.network_service() {
             let mut snapshot = crate::ContainerNetSnapshot::default();
+            let (tcp_sockets, udp_sockets) = service.list_inet_sockets();
+            snapshot.tcp_sockets = tcp_sockets;
+            snapshot.udp_sockets = udp_sockets;
             if let Ok(mac) = service.mac_address(NetworkPortId::new(0)).await {
                 let ipv4 = service
                     .list_addresses(NetworkPortId::new(0))
@@ -3756,6 +3764,24 @@ where
         }
     }
 
+    fn sync_process_fds(&self, pid: u32) {
+        if pid == self.shared.pid.get() {
+            let snapshot = snapshot_process_fds(&self.shared.descriptors_handle.lock());
+            self.shared
+                .container
+                .proc_registry()
+                .update_process(pid, |rec| rec.fds = snapshot);
+        }
+    }
+
+    fn sync_process_cwd(&self, pid: u32, cwd: &str) {
+        let cwd = String::from(cwd);
+        self.shared
+            .container
+            .proc_registry()
+            .update_process(pid, |rec| rec.cwd = cwd);
+    }
+
     fn shm_get(
         &mut self,
         key: i32,
@@ -5734,6 +5760,7 @@ where
             stack_base: self.shared.stack_base,
             image_end: self.shared.image_end,
             sigreturn_trampoline: self.shared.sigreturn_trampoline,
+            maps: spin::Mutex::new(self.shared.maps.lock().clone()),
             space: child_space,
             swap_registration: child_swap_registration,
             shared_mem: child_shared_mem,
@@ -6881,13 +6908,26 @@ struct MappedLinuxImage<Native: NativeExecution> {
     image_end: usize,
     sigreturn_trampoline: u64,
     program_break: u64,
+    maps: Vec<crate::ProcMapEntry>,
+}
+
+fn populate_proc_maps(record: &mut crate::ProcProcessRecord, maps: Vec<crate::ProcMapEntry>) {
+    let total_bytes: u64 = maps.iter().fold(0u64, |acc, m| {
+        acc.saturating_add(m.end.saturating_sub(m.start))
+    });
+    record.vm_size_bytes = total_bytes;
+    record.maps = maps;
 }
 
 fn map_elf_segments<Space: UserSpace>(
     space: &Space,
     image: &Image<'_>,
     load_bias: u64,
+    pathname: &str,
+    maps: &mut Vec<crate::ProcMapEntry>,
 ) -> Result<(), ProgramExecError> {
+    let page_size = PhysFrame::SIZE as u64;
+    let mask = page_size - 1;
     for segment in image.segments_at(load_bias) {
         let mut flags = PageFlags::READ;
         flags.set(PageFlags::WRITE, segment.writable);
@@ -6899,6 +6939,21 @@ fn map_elf_segments<Space: UserSpace>(
         space
             .map(range, segment.bytes, flags)
             .map_err(native_error)?;
+        let start = segment.address & !mask;
+        let end = segment
+            .address
+            .saturating_add(segment.memory_size)
+            .next_multiple_of(page_size);
+        maps.push(crate::ProcMapEntry {
+            start,
+            end,
+            readable: true,
+            writable: segment.writable,
+            executable: segment.executable,
+            shared: false,
+            offset: 0,
+            pathname: String::from(pathname),
+        });
     }
     Ok(())
 }
@@ -6941,9 +6996,21 @@ fn map_linux_image<Native: NativeExecution>(
     )
     .map_err(image_error)?;
 
-    map_elf_segments(&*space, &image, placement.main_bias)?;
+    let mut maps = Vec::new();
+    let exe_map_name = executable
+        .path
+        .as_deref()
+        .or_else(|| argv.first().map(String::as_str))
+        .unwrap_or("");
+    map_elf_segments(
+        &*space,
+        &image,
+        placement.main_bias,
+        exe_map_name,
+        &mut maps,
+    )?;
     if let (Some(interp), Some(interp_bias)) = (&interp_image, placement.interpreter_bias) {
-        map_elf_segments(&*space, interp, interp_bias)?;
+        map_elf_segments(&*space, interp, interp_bias, "[interp]", &mut maps)?;
     }
 
     let arguments: Vec<&[u8]> = argv.iter().map(String::as_bytes).collect();
@@ -6992,6 +7059,28 @@ fn map_linux_image<Native: NativeExecution>(
             PageFlags::READ | PageFlags::WRITE,
         )
         .map_err(native_error)?;
+    maps.push(crate::ProcMapEntry {
+        start: stack.base,
+        end: stack.base.saturating_add(stack.bytes.len() as u64),
+        readable: true,
+        writable: true,
+        executable: false,
+        shared: false,
+        offset: 0,
+        pathname: String::from("[stack]"),
+    });
+    if sigreturn_trampoline != 0 {
+        maps.push(crate::ProcMapEntry {
+            start: sigreturn_trampoline,
+            end: sigreturn_trampoline.saturating_add(page_size),
+            readable: true,
+            writable: false,
+            executable: true,
+            shared: false,
+            offset: 0,
+            pathname: String::from("[vdso]"),
+        });
+    }
     let context = native
         .create_context(
             VirtAddr::new(placement.initial_pc as usize),
@@ -7007,6 +7096,7 @@ fn map_linux_image<Native: NativeExecution>(
         image_end: placement.image_end as usize,
         sigreturn_trampoline,
         program_break: placement.program_break,
+        maps,
     })
 }
 
@@ -7050,6 +7140,7 @@ where
             rec.cwd = shared.cwd_handle.lock().clone();
             rec.credentials = shared.credentials_handle.lock().clone();
             rec.fds = snapshot_process_fds(&shared.descriptors_handle.lock());
+            populate_proc_maps(&mut rec, shared.maps.lock().clone());
             rec.vm_rss_bytes = shared.space.resident_bytes();
             rec.vm_swap_bytes = shared.space.swapped_bytes();
             rec.swap_space_id = shared.swap_registration.space_id();
@@ -7202,6 +7293,7 @@ where
                         stack_base: mapped.stack_base,
                         image_end: mapped.image_end,
                         sigreturn_trampoline: mapped.sigreturn_trampoline,
+                        maps: spin::Mutex::new(mapped.maps),
                         space: mapped.space,
                         swap_registration: next_swap_registration,
                         shared_mem: Arc::new(spin::Mutex::new(SharedMemoryTable::new())),
@@ -7658,6 +7750,7 @@ where
         stack_base: mapped.stack_base,
         image_end: mapped.image_end,
         sigreturn_trampoline: mapped.sigreturn_trampoline,
+        maps: spin::Mutex::new(mapped.maps),
         space: mapped.space,
         swap_registration,
         shared_mem: Arc::new(spin::Mutex::new(SharedMemoryTable::new())),

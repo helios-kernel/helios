@@ -149,6 +149,8 @@ pub(crate) enum VcpuStateCommandError {
 pub(crate) enum VmConfigError {
     #[error("--release and --kernel-debug cannot be used together")]
     ReleaseWithKernelDebug,
+    #[error("--gui asks for a host window and --display none suppresses it")]
+    GuiWithDisplayNone,
     #[error(
         "--max-processors {max_processors} is below --smp {smp}: QEMU cannot bring online \
          more processors than it can hold"
@@ -1742,6 +1744,28 @@ impl VmDisplayBackend {
             Self::EglHeadless => "egl-headless",
         }
     }
+
+    /// The host window backend `--gui` opens when `--display` is omitted.
+    fn native_for_host(host_os: &str) -> Self {
+        match host_os {
+            "macos" => Self::Cocoa,
+            _ => Self::Gtk,
+        }
+    }
+}
+
+/// Resolves the QEMU `-display` backend from `--gui` and `--display`.
+fn resolve_display_backend(
+    gui: bool,
+    explicit: Option<VmDisplayBackend>,
+    host_os: &str,
+) -> Result<VmDisplayBackend, VmConfigError> {
+    match (gui, explicit) {
+        (true, Some(VmDisplayBackend::None)) => Err(VmConfigError::GuiWithDisplayNone),
+        (true, Some(backend)) => Ok(backend),
+        (true, None) => Ok(VmDisplayBackend::native_for_host(host_os)),
+        (false, explicit) => Ok(explicit.unwrap_or_default()),
+    }
 }
 
 /// The host audio backend the guest's sound device plays into.
@@ -1922,6 +1946,8 @@ pub(crate) struct VmConfigFile {
     pub(crate) virtio_in_order: Option<bool>,
     #[serde(default)]
     pub(crate) desktop: Option<bool>,
+    #[serde(default)]
+    pub(crate) gui: Option<bool>,
     #[serde(default)]
     pub(crate) display: Option<VmDisplayBackend>,
     #[serde(default)]
@@ -2292,6 +2318,16 @@ pub(crate) struct VmCommand {
     /// host window.
     #[arg(long, default_value_t = false)]
     desktop: bool,
+
+    /// Open an interactive on-screen QEMU window for the guest desktop.
+    ///
+    /// Implies `--desktop`, selects the host's native window backend
+    /// (`cocoa` on macOS, `gtk` on Linux) unless `--display` names
+    /// another (refusing `--display none`), and keeps the VM running
+    /// until the window is closed or `Ctrl-C` is pressed when no
+    /// session subcommand is given.
+    #[arg(long, default_value_t = false)]
+    pub(crate) gui: bool,
 
     /// Host display backend QEMU opens for the guest's scanout.
     ///
@@ -2773,6 +2809,7 @@ struct ResolvedVmCommand {
     /// architecture and the accelerator.
     mte: bool,
     desktop: bool,
+    gui: bool,
     display: VmDisplayBackend,
     renderer: Option<VmRendererConfig>,
     audiodev: VmAudioDev,
@@ -3352,6 +3389,8 @@ struct HibernateVmManifest {
     iommu: bool,
     mte: bool,
     desktop: bool,
+    #[serde(default)]
+    gui: bool,
     display: VmDisplayBackend,
     renderer: Option<VmRendererConfig>,
     audiodev: VmAudioDev,
@@ -3408,6 +3447,7 @@ impl HibernateVmManifest {
             iommu: command.iommu,
             mte: command.mte,
             desktop: command.desktop,
+            gui: command.gui,
             display: command.display,
             renderer: command.renderer.clone(),
             audiodev: command.audiodev.clone(),
@@ -3565,6 +3605,7 @@ fn resolve_resume(
         iommu: manifest.iommu,
         mte: manifest.mte,
         desktop: manifest.desktop,
+        gui: manifest.gui,
         display: manifest.display,
         renderer: manifest.renderer,
         audiodev: manifest.audiodev,
@@ -3832,10 +3873,13 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         (None, None) => None,
         (None, Some(_)) => return Err(VmConfigError::RendererHostmemWithoutRenderer),
     };
+    let gui = command.gui || file.gui.unwrap_or(false);
     // A named renderer is a property of the desktop's display device,
-    // so asking for one is asking for the desktop it lives on.
-    let desktop = command.desktop || file.desktop.unwrap_or(false) || renderer.is_some();
-    let display = command.display.or(file.display).unwrap_or_default();
+    // so asking for one is asking for the desktop it lives on; `--gui`
+    // opens a window onto that desktop, so it implies `--desktop` too.
+    let desktop = command.desktop || file.desktop.unwrap_or(false) || renderer.is_some() || gui;
+    let display =
+        resolve_display_backend(gui, command.display.or(file.display), std::env::consts::OS)?;
     let audiodev = match command.audiodev.or(file.audiodev) {
         Some(text) => VmAudioDev::parse(&text)?,
         None => VmAudioDev::default(),
@@ -3914,6 +3958,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         iommu,
         mte,
         desktop,
+        gui,
         display,
         renderer,
         audiodev,
@@ -4717,7 +4762,39 @@ fn connect_and_run(
             ops,
             target_uri.as_deref(),
         )?),
+        None if command.gui => run_gui_session(client, runtime),
         None => Ok(run_connected(client, None, ops, target_uri.as_deref())?),
+    }
+}
+
+const GUI_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Keeps a `--gui` session running without opening the host terminal REPL.
+///
+/// `client` stays alive across the wait so its background RPC driver keeps
+/// draining the guest transport while the user interacts with the QEMU window.
+/// Returns cleanly when QEMU exits (window closed) or on `Ctrl-C`.
+fn run_gui_session(client: RpcClient, runtime: &mut VmRuntime) -> Result<(), VmSessionError> {
+    println!(
+        "{} guest ready; close the QEMU window or press Ctrl-C to stop",
+        style("gui").green()
+    );
+    crate::run_interruptible(async move {
+        let _client = client;
+        wait_for_child_exit(&mut runtime.child).await
+    })
+}
+
+async fn wait_for_child_exit(child: &mut Child) -> Result<(), VmSessionError> {
+    loop {
+        if child
+            .try_wait()
+            .map_err(|source| VmRuntimeError::PollQemu { source })?
+            .is_some()
+        {
+            return Ok(());
+        }
+        async_io::Timer::after(GUI_EXIT_POLL_INTERVAL).await;
     }
 }
 
@@ -8167,6 +8244,14 @@ fn configure_vsock_device(
 /// guest's. A capture of a
 /// display device the guest never drove is worse than no capture: it
 /// looks exactly like one the guest failed to draw into.
+///
+/// For non-IOMMU 2D PCI displays (`x86-64` without `--iommu` or
+/// `--renderer`), QEMU's `virtio-vga` exposes both the linear VGA/GOP
+/// framebuffer BAR for firmware boot graphics and the modern
+/// `virtio-gpu` PCI device on the same single console 0, while
+/// `-vga none` still prevents q35 from creating a separate default VGA
+/// adapter. Under `--iommu`, legacy VGA regions cannot sit behind
+/// `iommu_platform=on,disable-legacy=on`, so `virtio-gpu-pci` is kept.
 fn configure_display(
     qemu: &mut Command,
     display: VmDisplayProfile,
@@ -8182,6 +8267,7 @@ fn configure_display(
     }
     let mut device = QemuOptions::new(match display {
         VmDisplayProfile::Mmio => "virtio-gpu-device",
+        VmDisplayProfile::Pci if queues.access == VirtioPlatformAccess::Direct => "virtio-vga",
         VmDisplayProfile::Pci => "virtio-gpu-pci",
         VmDisplayProfile::GlMmio => "virtio-gpu-gl-device",
         VmDisplayProfile::GlPci => "virtio-gpu-gl-pci",
@@ -8560,6 +8646,10 @@ mod tests {
     /// A capture is only evidence if it is a capture of the guest's own
     /// display, so the PCI machine's default VGA adapter goes away with
     /// the same call that attaches the virtio-GPU.
+    ///
+    /// Non-IOMMU 2D PCI sessions attach `virtio-vga` so firmware GOP and
+    /// `virtio-gpu` share console 0; `--iommu` keeps `virtio-gpu-pci`
+    /// because legacy VGA regions cannot sit behind `virtio-iommu`.
     #[test]
     fn the_desktop_display_is_the_only_adapter_the_machine_has() {
         assert_eq!(
@@ -8578,7 +8668,24 @@ mod tests {
                 None,
                 VirtioDeviceProfile::default()
             )),
-            ["-vga", "none", "-device", "virtio-gpu-pci"]
+            ["-vga", "none", "-device", "virtio-vga"]
+        );
+        assert_eq!(
+            rendered(|qemu| configure_display(
+                qemu,
+                VmDisplayProfile::Pci,
+                None,
+                VirtioDeviceProfile {
+                    access: VirtioPlatformAccess::Confined,
+                    ..VirtioDeviceProfile::default()
+                }
+            )),
+            [
+                "-vga",
+                "none",
+                "-device",
+                "virtio-gpu-pci,disable-legacy=on,iommu_platform=on"
+            ]
         );
     }
 
@@ -10224,6 +10331,7 @@ mod tests {
             virtio_packed: false,
             virtio_in_order: false,
             desktop: false,
+            gui: false,
             display: None,
             renderer: None,
             renderer_hostmem: None,
@@ -10307,6 +10415,7 @@ mod tests {
             virtio_packed: false,
             virtio_in_order: false,
             desktop: false,
+            gui: false,
             display: None,
             renderer: None,
             renderer_hostmem: None,
@@ -10323,6 +10432,9 @@ mod tests {
         assert_eq!(resolved.smp, DEFAULT_X86_SMP);
         assert_eq!(resolved.memory, DEFAULT_X86_MEMORY);
         assert_eq!(resolved.bios, None);
+        assert!(!resolved.desktop);
+        assert!(!resolved.gui);
+        assert_eq!(resolved.display, VmDisplayBackend::None);
         assert_eq!(
             resolved.kernel,
             repo_root()
@@ -10332,6 +10444,244 @@ mod tests {
                 .join("debug")
                 .join(X86_64_VM_PROFILE.kernel_artifact_name)
         );
+    }
+
+    #[test]
+    fn resolve_display_backend_respects_gui_host_defaults_and_rejects_none() {
+        assert_eq!(
+            resolve_display_backend(false, None, "macos").expect("headless default"),
+            VmDisplayBackend::None
+        );
+        assert_eq!(
+            resolve_display_backend(false, Some(VmDisplayBackend::Sdl), "linux")
+                .expect("explicit display without --gui"),
+            VmDisplayBackend::Sdl
+        );
+        assert_eq!(
+            resolve_display_backend(true, None, "macos").expect("macOS --gui default"),
+            VmDisplayBackend::Cocoa
+        );
+        assert_eq!(
+            resolve_display_backend(true, None, "linux").expect("Linux --gui default"),
+            VmDisplayBackend::Gtk
+        );
+        assert_eq!(
+            resolve_display_backend(true, Some(VmDisplayBackend::Sdl), "macos")
+                .expect("--gui honours explicit --display sdl"),
+            VmDisplayBackend::Sdl
+        );
+        assert_eq!(
+            resolve_display_backend(true, Some(VmDisplayBackend::Gtk), "macos")
+                .expect("--gui honours explicit --display gtk"),
+            VmDisplayBackend::Gtk
+        );
+        let error = resolve_display_backend(true, Some(VmDisplayBackend::None), "macos")
+            .expect_err("--gui must reject --display none");
+        assert!(
+            matches!(error, VmConfigError::GuiWithDisplayNone),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn gui_flag_and_config_imply_desktop_and_reject_display_none() {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser)]
+        struct VmLine {
+            #[command(flatten)]
+            command: VmCommand,
+        }
+
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let missing_config = tempdir.path().join("missing-vm.json");
+
+        let parsed = VmLine::try_parse_from(["helios", "--accel", "tcg", "--gui"])
+            .expect("`vm --gui` must parse");
+        let resolved = resolve(VmCommand {
+            config: Some(missing_config.clone()),
+            ..parsed.command
+        })
+        .expect("--gui resolves");
+        assert!(resolved.gui);
+        assert!(resolved.desktop);
+        assert!(resolved.command.is_none());
+        assert_eq!(
+            resolved.display,
+            VmDisplayBackend::native_for_host(std::env::consts::OS)
+        );
+
+        let parsed_shell =
+            VmLine::try_parse_from(["helios", "--accel", "tcg", "--gui", "shell", "-c", "ls"])
+                .expect("`vm --gui shell` must parse");
+        let resolved_shell = resolve(VmCommand {
+            config: Some(missing_config.clone()),
+            ..parsed_shell.command
+        })
+        .expect("--gui shell resolves");
+        assert!(resolved_shell.gui);
+        assert!(resolved_shell.desktop);
+        assert!(matches!(
+            resolved_shell.command,
+            Some(ResolvedVmSessionCommand::Session(SessionCommand::Shell(_)))
+        ));
+
+        let parsed_sdl =
+            VmLine::try_parse_from(["helios", "--accel", "tcg", "--gui", "--display", "sdl"])
+                .expect("`vm --gui --display sdl` must parse");
+        let resolved_sdl = resolve(VmCommand {
+            config: Some(missing_config.clone()),
+            ..parsed_sdl.command
+        })
+        .expect("--gui --display sdl resolves");
+        assert!(resolved_sdl.gui);
+        assert!(resolved_sdl.desktop);
+        assert_eq!(resolved_sdl.display, VmDisplayBackend::Sdl);
+
+        let parsed_none =
+            VmLine::try_parse_from(["helios", "--accel", "tcg", "--gui", "--display", "none"])
+                .expect("`vm --gui --display none` must parse");
+        let error = resolve(VmCommand {
+            config: Some(missing_config.clone()),
+            ..parsed_none.command
+        })
+        .expect_err("--gui --display none must fail");
+        assert!(
+            matches!(error, VmConfigError::GuiWithDisplayNone),
+            "{error}"
+        );
+
+        // Config file `gui: true` combined with `display: "none"` is rejected too.
+        let config_path = tempdir.path().join("vm.json");
+        fs::write(&config_path, r#"{"gui": true, "display": "none"}"#).expect("write config file");
+        let error = resolve(VmCommand {
+            config: Some(config_path),
+            ..minimal_command()
+        })
+        .expect_err("config gui=true with display=none must fail");
+        assert!(
+            matches!(error, VmConfigError::GuiWithDisplayNone),
+            "{error}"
+        );
+
+        // Without --gui, --desktop keeps --display none by default.
+        let desktop_only = resolve(VmCommand {
+            desktop: true,
+            config: Some(missing_config),
+            ..minimal_command()
+        })
+        .expect("--desktop resolves");
+        assert!(!desktop_only.gui);
+        assert!(desktop_only.desktop);
+        assert_eq!(desktop_only.display, VmDisplayBackend::None);
+    }
+
+    #[test]
+    fn configure_machine_devices_selects_virtio_vga_or_gpu_by_arch_iommu_and_renderer() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM device test must exist");
+        let missing_config = tempdir.path().join("missing-vm.json");
+        let artifact = tempdir.path().join("boot.img");
+        let data_disk = tempdir.path().join("data.img");
+
+        let device_args_for = |command: VmCommand| {
+            let resolved = resolve(VmCommand {
+                config: Some(missing_config.clone()),
+                ..command
+            })
+            .expect("VM command must resolve");
+            let mut qemu = Command::new("qemu");
+            configure_machine_devices(&mut qemu, &resolved, &artifact, &data_disk, None);
+            qemu.get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        for (label, command) in [
+            (
+                "x86-64 --desktop",
+                VmCommand {
+                    arch: VmArch::X86_64,
+                    desktop: true,
+                    ..minimal_command()
+                },
+            ),
+            (
+                "x86-64 --gui",
+                VmCommand {
+                    arch: VmArch::X86_64,
+                    gui: true,
+                    ..minimal_command()
+                },
+            ),
+        ] {
+            let args = device_args_for(command);
+            assert!(
+                args.windows(2).any(|pair| pair == ["-vga", "none"]),
+                "{label}: expected -vga none in {args:?}"
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["-device", "virtio-vga"]),
+                "{label}: expected -device virtio-vga in {args:?}"
+            );
+        }
+
+        let x86_iommu_args = device_args_for(VmCommand {
+            arch: VmArch::X86_64,
+            desktop: true,
+            iommu: true,
+            ..minimal_command()
+        });
+        assert!(
+            x86_iommu_args
+                .windows(2)
+                .any(|pair| pair == ["-vga", "none"]),
+            "x86-64 --iommu: expected -vga none in {x86_iommu_args:?}"
+        );
+        assert!(
+            x86_iommu_args.windows(2).any(|pair| {
+                pair == [
+                    "-device",
+                    "virtio-gpu-pci,disable-legacy=on,iommu_platform=on",
+                ]
+            }),
+            "x86-64 --iommu: expected virtio-gpu-pci in {x86_iommu_args:?}"
+        );
+
+        let x86_gl_args = device_args_for(VmCommand {
+            arch: VmArch::X86_64,
+            renderer: Some(VmGpuRenderer::Gl),
+            ..minimal_command()
+        });
+        assert!(
+            x86_gl_args
+                .windows(2)
+                .any(|pair| pair == ["-device", "virtio-gpu-gl-pci,venus=on,blob=on,hostmem=256M"]),
+            "x86-64 --renderer virtio-gpu-gl: expected virtio-gpu-gl-pci in {x86_gl_args:?}"
+        );
+
+        let aarch64_args = device_args_for(VmCommand {
+            arch: VmArch::Aarch64,
+            desktop: true,
+            ..minimal_command()
+        });
+        assert!(
+            aarch64_args
+                .windows(2)
+                .any(|pair| pair == ["-device", "virtio-gpu-device"]),
+            "aarch64 --desktop: expected virtio-gpu-device in {aarch64_args:?}"
+        );
+    }
+
+    #[test]
+    fn wait_for_child_exit_returns_when_child_exits() {
+        let mut child = Command::new("true")
+            .spawn()
+            .expect("`true` must spawn for exit-wait test");
+        crate::runtime::block_on(wait_for_child_exit(&mut child))
+            .expect("waiting on exiting child must succeed");
     }
 
     /// virtio-iommu can only confine PCI endpoints, so asking for it on
@@ -11099,6 +11449,7 @@ mod tests {
             virtio_packed: false,
             virtio_in_order: false,
             desktop: false,
+            gui: false,
             display: None,
             renderer: None,
             renderer_hostmem: None,
@@ -11363,6 +11714,7 @@ mod tests {
             iommu: false,
             mte: false,
             desktop: false,
+            gui: false,
             display: VmDisplayBackend::None,
             renderer: None,
             audiodev: VmAudioDev::None,
@@ -11592,6 +11944,7 @@ mod tests {
             iommu: false,
             mte: false,
             desktop: false,
+            gui: false,
             display: VmDisplayBackend::None,
             renderer: None,
             audiodev: VmAudioDev::None,
